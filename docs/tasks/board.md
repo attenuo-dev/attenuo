@@ -13,9 +13,13 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 - [ ] `onbehalf-proxy`: streamable-HTTP interception of `tools/call` for one upstream server; forward on permit, JSON-RPC error on deny.
 - [ ] `onbehalf-audit`: append-only SQLite log, `prev_hash`/`hash` chaining, `onbehalf-audit verify` command.
 - [ ] Scenario test: GitHub MCP over-privileged-PAT reproduction, blocked by a `repo` constraint; recorded as an integration test.
+- [ ] Security SR-08 (high): AuthZEN without a bearer trusts an unsigned body chain whose lease ids are public; require the bearer by default, gate body chains behind config plus PEP auth, bind leases to chain digest ([review](../research/security-review-2026-10-22.md)).
+- [ ] Security SR-09 (high): revoked tokens still pass `authenticate`; check leases on every proxied HTTP request (GET/DELETE, `tools/list`, all methods), not only in `tools/call` decisions. Method coverage is on `feat/leases-and-coverage`.
+- [ ] Security SR-10 (high): `actor` on exchange is unauthenticated, so agent ids in policy and audit are spoofable; verify `actor_token`/`may_act`, reject duplicate agent ids at exchange.
 
 ## Next
 
+- [ ] Security review follow-ups ([review](../research/security-review-2026-10-22.md)): SR-11 bind `Mcp-Session-Id` to the token's subject and root lease; SR-12 deny tools missing from the catalog (or default them to `sensitive`); SR-15 refuse the example admin token on a non-loopback bind; SR-13 server-scoped actions or documented `resource in Server::` pinning; SR-14 domain-separate `ou_sig` and bind it to `iss` and hop 0; SR-16 `validate_at` checks for `issued_at`, duplicate leases/agents, empty ids; SR-17 reason codes only in client-facing errors; SR-18 escape untrusted log fields; SR-19 require `public_url` off loopback; SR-20 RFC 8785 canonicalization (`preserve_order` is on workspace-wide); SR-22 move SQLite off the async workers; SR-23 filter `tools/list` over SSE; SR-24 exchange rate limits per lease; SR-25 name normalization; SR-26 resolve the `cargo deny` licence failure (`webpki-roots`, CDLA-Permissive-2.0) and add `cargo audit` to CI.
 - [ ] Token claims: proposed extensions from RFC-0001 section 3.1: `evidence` on the originating user (how the IdP credential was verified), a stable `chain_id`, `may_act` and a verified `actor_token`, numeric and time-range constraints. Reconcile or drop each.
 - [ ] Hop 0 from an OIDC ID token (JWKS fetch, `iss`/`aud`/`exp` checks) and from an ID-JAG assertion.
 - [ ] Leases: `/lease/{id}/renew`, `/revoke` by user, session, chain (revoke by lease id with descendant cascade is done in the server); proxy cache bounded by TTL.
@@ -39,6 +43,7 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 
 ## Done
 
+- [x] Security review pass 1: SR-01 to SR-07 fixed with regression tests (proxy re-encodes screened messages, no upstream redirects, non-object arguments rejected; Cedar action hierarchy; integral floats as Long; TTL overflow; root-grant attributes).
 - [x] Repository skeleton: workspace, CI, licence, docs vault.
 - [x] RFC-0001, threat model, ADR-0001 to ADR-0004, research notes (standards, incidents, related work).
 - [x] `onbehalf-server`: config, `/token` (RFC 8693), JWKS endpoint, dev root mint, proxy with real authorizer, admin leases/audit endpoints ([design](../design/server.md)).
