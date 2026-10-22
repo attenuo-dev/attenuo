@@ -53,9 +53,9 @@
 //! `session_id` is **absent** when the call carries none (Cedar has no `null`); test it with
 //! `context has session_id`. The same goes for every `null` inside `input` and
 //! `originating_user.attributes`: null-valued members are dropped, so write
-//! `context.input has repo && context.input.repo like "acme/*"`. Integers are Cedar `Long`,
-//! floats are Cedar `decimal`, and argument keys beginning with `__` are rejected (Cedar
-//! reserves them for escapes).
+//! `context.input has repo && context.input.repo like "acme/*"`. Integers (and floats with no
+//! fractional part, so `5.0` is `5`) are Cedar `Long`, other floats are Cedar `decimal`, and
+//! argument keys beginning with `__` are rejected (Cedar reserves them for escapes).
 //!
 //! ## Entities
 //!
