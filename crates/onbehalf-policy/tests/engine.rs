@@ -664,3 +664,63 @@ fn github_mcp_over_privileged_token_is_narrowed_by_policy() {
     );
     assert_eq!(out.decision, Decision::Deny);
 }
+
+// ---- Regression tests from the 2026-10-22 security review --------------------------------
+
+/// SR-04: `action in Action::"invoke"` is the documented way to target every tool. The action
+/// hierarchy was missing from the entity store, so such a `forbid` silently never matched.
+#[test]
+fn forbid_on_generic_invoke_action_applies_to_every_tool() {
+    let engine = PolicyEngineBuilder::new()
+        .with_catalog(catalog())
+        .with_policies_str(
+            r#"@id("allow_all") permit(principal, action, resource);
+               @id("no_dangerous_flag")
+               forbid(principal, action in Action::"invoke", resource)
+               when { context.input has dangerous };"#,
+        )
+        .build()
+        .unwrap();
+    for tool in ["read_file", "not_in_catalog", "invoke"] {
+        let call = ToolCall::new("github", tool, json!({"dangerous": true}));
+        let o = engine.authorize(&chain(), &call, now());
+        assert_eq!(o.reason, REASON_POLICY_DENY, "{tool}: {o:?}");
+        assert_eq!(o.policy_ids, vec!["no_dangerous_flag"], "{tool}");
+        let ok = ToolCall::new("github", tool, json!({}));
+        assert!(
+            engine.authorize(&chain(), &ok, now()).decision.is_allow(),
+            "{tool}"
+        );
+    }
+    // and a permit scoped the same way matches too
+    let engine = PolicyEngineBuilder::new()
+        .with_catalog(catalog())
+        .with_policies_str(r#"permit(principal, action in Action::"invoke", resource);"#)
+        .build()
+        .unwrap();
+    let call = ToolCall::new("github", "read_file", json!({}));
+    assert!(engine.authorize(&chain(), &call, now()).decision.is_allow());
+}
+
+/// SR-05: `0.0` used to become the Cedar decimal `0.0000`, which is not `== 0`, so an
+/// equality `forbid` on a Long could be bypassed by sending the same JSON value as a float.
+#[test]
+fn integral_floats_are_longs_so_equality_forbids_hold() {
+    let engine = PolicyEngineBuilder::new()
+        .with_catalog(catalog())
+        .with_policies_str(
+            r#"permit(principal, action, resource);
+               @id("no_zero_limit")
+               forbid(principal, action, resource)
+               when { context.input has limit && context.input.limit == 0 };"#,
+        )
+        .build()
+        .unwrap();
+    for v in [json!(0), json!(0.0), json!(-0.0)] {
+        let call = ToolCall::new("github", "read_file", json!({ "limit": v }));
+        let o = engine.authorize(&chain(), &call, now());
+        assert_eq!(o.reason, REASON_POLICY_DENY, "{v}: {o:?}");
+    }
+    let call = ToolCall::new("github", "read_file", json!({ "limit": 0.5 }));
+    assert!(engine.authorize(&chain(), &call, now()).decision.is_allow());
+}

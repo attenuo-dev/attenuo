@@ -9,6 +9,7 @@ use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
 
 use crate::catalog::ToolCatalog;
+use crate::schema::GENERIC_ACTION;
 
 /// Largest magnitude a Cedar `decimal` can hold.
 // Cedar decimal range is +/-922337203685477.5807; stay a little inside it.
@@ -30,7 +31,8 @@ impl std::fmt::Display for TranslationError {
 /// - `null` has no Cedar equivalent: object members that are `null` are dropped (policies test
 ///   presence with `has`), `null` array elements are dropped.
 /// - Integers become `Long`; integers that do not fit in `i64` become strings.
-/// - Floats become `decimal` when representable (four fractional digits), otherwise strings.
+/// - Floats with no fractional part (`5.0`) become `Long`, like integers.
+/// - Other floats become `decimal` when representable (four fractional digits), otherwise strings.
 /// - Object keys beginning with `__` are rejected, because Cedar interprets `__entity`,
 ///   `__extn` and `__expr` as escapes. Accepting them would let a caller forge an entity
 ///   reference inside `context.input`.
@@ -43,7 +45,13 @@ pub(crate) fn to_cedar_json(value: &Value, path: &str) -> Result<Value, Translat
             if let Some(i) = n.as_i64() {
                 json!(i)
             } else if let Some(f) = n.as_f64() {
-                if f.is_finite() && f.abs() <= DECIMAL_MAX {
+                if f.is_finite() && f.fract() == 0.0 && f.abs() <= DECIMAL_MAX {
+                    // JSON has one number type: `0.0` is the value `0` to most consumers
+                    // (JavaScript, Python's `==`), so it must be the Cedar `Long` 0 too.
+                    // Otherwise `forbid ... when { context.input.n == 0 }` is bypassed by
+                    // sending `0.0`. |f| <= DECIMAL_MAX < 2^63, so the cast is exact.
+                    json!(f as i64)
+                } else if f.is_finite() && f.abs() <= DECIMAL_MAX {
                     json!({ "__extn": { "fn": "decimal", "arg": format!("{f:.4}") } })
                 } else {
                     Value::String(n.to_string())
@@ -206,6 +214,21 @@ pub(crate) fn build(
         },
         "parents": [uid_json("Server", &call.server)],
     }));
+    // The action hierarchy. Evaluation is schema-free, so Cedar only knows that
+    // `Action::"<tool>"` is `in Action::"invoke"` if the entity store says so; without these
+    // entries `action in Action::"invoke"` is false and a `forbid` written that way never fires.
+    entities.push(json!({
+        "uid": uid_json("Action", GENERIC_ACTION),
+        "attrs": {},
+        "parents": [],
+    }));
+    if call.tool != GENERIC_ACTION {
+        entities.push(json!({
+            "uid": uid_json("Action", &call.tool),
+            "attrs": {},
+            "parents": [uid_json("Action", GENERIC_ACTION)],
+        }));
+    }
     let entities = Entities::from_json_value(Value::Array(entities), None)
         .map_err(|e| TranslationError(format!("entities: {e}")))?;
 

@@ -578,3 +578,21 @@ fn exchange_request_response_shapes() {
         Err(TokenError::Chain(ChainError::AttenuationViolated { .. }))
     ));
 }
+
+/// SR-06: `requested_ttl_seconds` = u64::MAX used to panic inside the exchange (`now + ttl`
+/// overflow). It must be clamped to the parent's expiry like any other long TTL.
+#[test]
+fn exchange_with_maximal_requested_ttl_is_clamped_not_a_panic() {
+    let issuer = issuer();
+    let parent = root(&issuer);
+    let req = ExchangeRequest {
+        subject_token: parent.token.clone(),
+        actor: AgentId::new("agent:coder"),
+        requested: caps([Capability::new("github", "read_file")]),
+        ttl_seconds: Some(u64::MAX),
+    };
+    let resp = req.execute(&issuer, t0()).unwrap();
+    let child = issuer.verifier().verify(&resp.access_token, t0()).unwrap();
+    assert_eq!(child.chain.hops[1].expires_at, parent.expires_at);
+    assert_eq!(resp.expires_in, 3600);
+}

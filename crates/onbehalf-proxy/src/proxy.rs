@@ -66,7 +66,7 @@ pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
         .collect();
     let state = Arc::new(AppState {
         upstreams,
-        client: reqwest::Client::new(),
+        client: upstream_client(),
         authorizer,
     });
     Router::new()
@@ -78,6 +78,19 @@ pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
         )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// The HTTP client used for upstream requests.
+///
+/// Redirects are never followed: the upstream is untrusted (threat model, A3), and a followed
+/// `307`/`308` would replay an already-authorized `tools/call` body to a host of the upstream's
+/// choosing (including internal addresses only the proxy can reach). A redirect response is
+/// returned to the client as-is, without its `Location` header.
+fn upstream_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("reqwest client with static configuration builds")
 }
 
 /// Bind `config.listen` and serve the proxy until the task is cancelled.
@@ -350,14 +363,28 @@ async fn handle_post_inner(
         return resp;
     }
 
-    // Forward. A single message goes upstream byte-for-byte; a batch is re-encoded without
-    // the messages the proxy answered itself.
-    let upstream_body: Bytes = if is_batch {
+    // Forward exactly what was screened, re-encoded. The original bytes are never sent: JSON
+    // with duplicate member names parses differently across implementations (serde_json keeps
+    // the last, others keep the first), so forwarding the raw body would let a client get
+    // `{"method":"ping",...,"method":"tools/call"}`-style messages past screening. A batch also
+    // drops the messages the proxy answered itself.
+    let encoded = if is_batch {
         serde_json::to_vec(&screened.forward)
-            .map(Bytes::from)
-            .unwrap_or_default()
     } else {
-        body
+        serde_json::to_vec(&screened.forward[0])
+    };
+    let upstream_body = match encoded {
+        Ok(v) => Bytes::from(v),
+        Err(e) => {
+            tracing::error!(error = %e, "re-encoding the screened request failed");
+            let body = error_response(
+                Value::Null,
+                CODE_INVALID_REQUEST,
+                "onbehalf: invalid request",
+                None,
+            );
+            return json_response(StatusCode::BAD_REQUEST, &body);
+        }
     };
     let mut req_headers = forward_headers(headers, FORWARD_REQUEST_HEADERS);
     if !req_headers.contains_key(header::CONTENT_TYPE) {
@@ -431,10 +458,22 @@ async fn screen_message(
                 ));
                 return;
             };
-            let arguments = params
-                .and_then(|p| p.get("arguments"))
-                .cloned()
-                .unwrap_or_else(|| Value::Object(Default::default()));
+            let arguments = match params.and_then(|p| p.get("arguments")) {
+                None | Some(Value::Null) => Value::Object(Default::default()),
+                Some(v @ Value::Object(_)) => v.clone(),
+                Some(_) => {
+                    // `ToolCall` would read a non-object as "no arguments", so policy would see
+                    // something other than what the upstream receives. Refuse it.
+                    tracing::warn!("tools/call with non-object params.arguments rejected");
+                    out.replies.push(error_response(
+                        id,
+                        CODE_INVALID_PARAMS,
+                        "onbehalf: invalid params: tools/call params.arguments must be an object",
+                        None,
+                    ));
+                    return;
+                }
+            };
             let mut call = ToolCall::new(server, name.clone(), arguments);
             if let Some(sid) = session_id {
                 call = call.with_session(sid);
