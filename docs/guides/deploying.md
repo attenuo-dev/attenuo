@@ -1,0 +1,257 @@
+# Deploying
+
+This guide covers what to change between "it runs on my laptop" and "other people and other machines depend on it". Read the limits first. They decide whether v0 fits your situation.
+
+## What v0 is and is not
+
+onbehalf is pre-alpha. Do not treat this guide as a statement that it is ready for production. It is a list of what you would have to do if you ran it anyway, for example in a staging environment or a closed pilot.
+
+- **One node.** There is no clustering, no replication and no leader election. One server process owns one SQLite file.
+- **SQLite only.** The audit log and the lease registry live in the same SQLite file. Access is serialised behind a mutex, and the calls run on the async worker threads. That is fine at demo load. It has not been load tested. The only numbers are micro-benchmarks, in [design/performance.md](../design/performance.md).
+- **No high availability.** If the process is down, every call through the proxy fails. That is by design: onbehalf fails closed. Do not start a second replica against the same file, or against a copy. Each process would keep its own idea of which leases are revoked.
+- **No TLS.** The server speaks plain HTTP. Terminate TLS in front of it.
+- **One static admin token.** There are no operator accounts, roles or admin audit trail beyond the log lines the server writes.
+- **No metrics endpoint.** You monitor it through logs and the audit log. See [What to monitor](#what-to-monitor).
+- **Manual key rotation with no overlap.** See [Key rotation](#key-rotation).
+
+The full list of known gaps is at the end of [design/server.md](../design/server.md#known-limits-v0). The open security findings are in [the security review](../research/security-review-2026-10-22.md) and on the [task board](../tasks/board.md).
+
+## Production checklist
+
+Go through this before pointing anything real at the server.
+
+- [ ] `[dev] allow_root_mint` is `false` or absent. With it on, anyone holding the admin token can mint a root token for any user.
+- [ ] Root tokens come from a real identity provider: `[[idps]]`, `[[agents]]`, `[[root_grants]]`. See [Identity providers](identity-providers.md).
+- [ ] `[admin] token` is a long random value that is not in any example, not in version control and not shared with agents. Generate it with `openssl rand -hex 32`. The server does not refuse the example token from `config/example.toml`, even on a public bind, so this check is yours to make.
+- [ ] `/admin/*` is not reachable from the networks agents live on. See [Network exposure](#network-exposure).
+- [ ] TLS terminates in front of onbehalf, and agents reach it over HTTPS only.
+- [ ] `[issuer] private_key_pem_path` is set, the file is mode 0600, owned by the service user, and backed up somewhere safe. Without the setting the server makes a new key at every start and every token dies on restart.
+- [ ] `[audit] sqlite_path` is a real path on durable storage. The default is `:memory:`, which loses the audit log and every lease on exit. The server logs a warning when it is in memory.
+- [ ] `[issuer] issuer` is the URL clients will use, for example `https://onbehalf.example.com`. It becomes the `iss` of every token, and changing it later invalidates tokens. `[server] public_url` is set to the same base URL so the AuthZEN discovery document points at the right host.
+- [ ] `[policy] policies_path` points at your policy, and the catalog lists every tool a policy names.
+- [ ] Every tool on the upstream that matters is in the catalog. A tool missing from the catalog is neither `readonly` nor `sensitive`, so rules that depend on those attributes do not see it.
+- [ ] The config file is mode 0600. It holds the admin token. There is no environment-variable substitution, so inject the file at deploy time.
+- [ ] You have read the [threat model](../spec/threat-model.md) section "What onbehalf does not prevent" and have decided how the agents' other routes (direct API keys, local STDIO servers) are closed.
+- [ ] Something checks `onbehalf audit verify` on a schedule, and something copies `/admin/audit/checkpoint` off the host.
+
+## Network exposure
+
+The default bind is `127.0.0.1:8080`. Keep it that way and put a reverse proxy in front, unless you have a reason not to.
+
+The routes fall into three groups:
+
+| Routes | Who should reach them |
+| --- | --- |
+| `POST /mcp/{server}`, `GET`/`DELETE /mcp/{server}` | Agents and MCP clients |
+| `POST /token`, `POST /token/renew`, `POST /access/v1/evaluation`, `GET /.well-known/*` | Agents, and PEPs for AuthZEN |
+| `/admin/*` | Operators only |
+| `GET /healthz` | Your health checker |
+
+Binding to `0.0.0.0` puts `/admin` on the same listener as everything else. The static admin token is then the only thing between the network and "revoke any lease, reload policy, read the audit log". Route `/admin` away from the public listener at the reverse proxy, or give operators a separate path to a loopback-only port by running the CLI on the host or over an SSH tunnel.
+
+Two other exposure points to think about:
+
+- **`POST /access/v1/evaluation` without a bearer** accepts a delegation chain from the request body. The signatures are not in the body, so the server cannot check them, but every lease in the chain must still be live in this server's registry. Reach it only from PEPs you trust, or have PEPs send the delegation token as a bearer. See [Integrating MCP clients](integrating-mcp-clients.md#using-the-authzen-endpoint-from-a-non-mcp-pep).
+- **`POST /token` for hop 0** does an outbound fetch to your identity provider's discovery and JWKS URLs, but only after the agent has authenticated. Unknown issuers are rejected without a network call.
+
+## TLS and a reverse proxy
+
+Put anything that terminates TLS in front: Caddy, nginx, Envoy, a cloud load balancer. Two things matter for MCP:
+
+- **Do not buffer responses.** Streamable HTTP can answer with `text/event-stream`. A proxy that buffers will hold events back.
+- **Keep read timeouts long** enough for slow tools.
+
+A minimal Caddy file. Untested, but small enough to check by eye:
+
+```text
+onbehalf.example.com {
+    @admin path /admin/*
+    respond @admin 404
+    reverse_proxy 127.0.0.1:8080 {
+        flush_interval -1
+    }
+}
+```
+
+This hides `/admin` from the public name. Operators reach it on `127.0.0.1:8080` directly.
+
+For nginx, the equivalent pieces are `proxy_pass http://127.0.0.1:8080;`, `proxy_buffering off;`, `proxy_http_version 1.1;` and a `location /admin/ { return 404; }` block. Untested.
+
+onbehalf reads the request's `Host` header only to build the AuthZEN discovery document, and only when `public_url` is unset. It does not use `X-Forwarded-*` headers.
+
+## Admin token handling
+
+- The token is compared in constant time, and a missing token disables `/admin` (403) rather than opening it.
+- It sits in the config file in clear text. Treat the file as a secret: mode 0600, not in the image, not in the repository, not in a CI log. In Docker or Kubernetes, mount the whole file from a secret.
+- Operators pass it to the CLI with `ONBEHALF_ADMIN_TOKEN` or `--admin-token`. Prefer the environment variable, since command-line arguments show up in process listings.
+- Rotating it means editing the file and restarting. There is no overlap window and no way to have two tokens.
+- Do not hand the admin token to agents. It can revoke any lease and read all audit entries. Agents use delegation tokens only.
+
+This is the weakest part of v0. Real operator authentication is on the [task board](../tasks/board.md).
+
+## Key rotation
+
+The server signs every token with one Ed25519 key, named by `[issuer] private_key_pem_path`. Its public half is served at `/.well-known/jwks.json`. Tokens carry no `kid`, and the JWKS holds exactly one key. That means there is no overlap period: the moment the server loads a new key, every token signed with the old one fails verification.
+
+To rotate:
+
+1. Generate the new key: `openssl genpkey -algorithm ed25519 -out /etc/onbehalf/issuer-2.pem`, then `chmod 600` it. The server also generates a key itself if the path does not exist, so you can just point the setting at a new path.
+2. Stop the server.
+3. Change `private_key_pem_path` to the new file.
+4. Start the server. It logs the new public key.
+5. Agents get 401 on their next call. They re-run their login and exchange steps to get new tokens.
+
+Expect every in-flight run to need a new root token. Rotate in a quiet period, or on a compromise, where that cost is the point. Anything that verified onbehalf tokens offline against the old public key has to re-fetch the JWKS.
+
+The audit log does not depend on the issuer key. It is a plain SHA-256 hash chain, so rotation does not break `audit verify`. Old leases stay in the database but belong to tokens that no longer verify.
+
+The PEM is the most sensitive file onbehalf owns. Whoever has it can mint any token for any user. Back it up apart from the database, with the same care as any signing key.
+
+## SQLite file: placement and backup
+
+`[audit] sqlite_path` holds two things in one file: the hash-chained audit log and the lease registry. The server creates the parent directory if it is missing.
+
+Placement:
+
+- Put it on local, durable storage that the service user owns. SQLite over NFS or other network file systems is a known source of locking trouble.
+- Keep it away from anything agents can reach. Whoever can write the file can rewrite the log and un-revoke leases.
+- In a container, mount a volume. The image's working directory is `/var/lib/onbehalf`, owned by the `onbehalf` user (uid 10001).
+- Watch free disk space. An audit append that fails turns the decision into a deny with reason `audit_error`, so a full disk stops all calls and token issuance. That is the fail-closed rule working as designed.
+
+Backup:
+
+- Use SQLite's own backup, not a plain file copy, while the server runs: `sqlite3 /var/lib/onbehalf/onbehalf.sqlite ".backup '/backups/onbehalf-$(date +%F).sqlite'"`. This needs the `sqlite3` command-line tool. Untested here.
+- Keep the PEM and the config separately from the database backup.
+- Know what a restore does. Restoring an old backup rewinds the lease registry, so a lease revoked after the backup is live again, and it cuts the audit log back to that point. After a restore, revoke anything that was revoked since, and note the gap.
+- Copy `GET /admin/audit/checkpoint` (`{seq, hash}`) somewhere the server's host cannot write, such as a ticket system or a separate log store. A hash chain proves the log was not edited in the middle. It does not prove nobody truncated the end. An off-host checkpoint does: if `audit verify` later shows fewer entries than the checkpoint's `seq`, or a different hash at that `seq`, someone changed it. The server does not sign or ship checkpoints in v0, so this is a cron job you write.
+
+## Leases: tuning the interval
+
+Every hop's token is bound to a lease. A call is refused if any lease in the chain is revoked, unknown or expired. A holder keeps its lease alive with `POST /token/renew`. The setting is:
+
+```toml
+[issuer]
+default_ttl_seconds    = 900   # token lifetime
+lease_interval_seconds = 300   # how long a lease lives after issue or renewal
+```
+
+What the interval controls:
+
+- **An explicit revoke** is immediate, at any interval. It does not wait for expiry.
+- **An agent that dies or stops renewing** keeps working until its lease runs out, at most one interval, and never past the token's `exp`.
+
+Shorter is safer and busier. Agents should renew at about a third of the interval, so a 300 second interval means a renewal every 100 seconds per live hop. Each renewal is one row in the audit log. At 60 seconds, a hop renews every 20 seconds, which is 180 rows an hour per hop just for renewals. Longer is quieter and leaves a crashed agent's access open longer.
+
+Tokens still end at `default_ttl_seconds` whatever the lease says, and an exchange can ask for less. Start with the defaults. Move the interval down for high-risk tools, and measure the renewal traffic before you do.
+
+If the lease interval is longer than the token lifetime, the lease is capped by the token, so the interval has no extra effect.
+
+## Logging
+
+The server logs through `tracing` to standard output. Control it with `RUST_LOG`.
+
+| Level | What you get |
+| --- | --- |
+| `info` (default) | Startup, config path, issuer public key, policy ids, one line per authorization decision, token issuance, lease revocations |
+| `warn` | Also shown at `info`: the dev root mint is on, the audit log is in memory, the key is ephemeral, rejected requests |
+| `debug` | Per-request detail, for diagnosing a client. Noisy. Do not leave it on |
+
+Examples: `RUST_LOG=info`, `RUST_LOG=onbehalf_server=debug,info`.
+
+Output has ANSI colour codes by default. Set `NO_COLOR=1` to switch them off for log shippers.
+
+Log lines name the agent, the user subject, the chain depth, the tool and the decision. They are an operational aid and are not the audit record. The audit log is the record. Do not rely on stdout for forensics.
+
+## Docker and Compose
+
+The repository has a `Dockerfile` and a `docker-compose.yml`. Both are marked untested in the repository, and the compose file is the leak demo, not a production layout.
+
+The image:
+
+- builds `onbehalf-server`, the `onbehalf` CLI and the fake MCP server from source;
+- runs as uid 10001 (`onbehalf`), working directory `/var/lib/onbehalf`;
+- expects a config at `/etc/onbehalf/config.toml` (the default `CMD` is `--config /etc/onbehalf/config.toml`);
+- exposes 8080 and has a `HEALTHCHECK` that calls `/healthz`;
+- includes `curl` for that check.
+
+```sh
+docker build -t onbehalf:dev .
+```
+
+For anything beyond the demo, start from the demo's compose file and change these things:
+
+```yaml
+services:
+  onbehalf:
+    image: onbehalf:dev
+    command: ["--config", "/etc/onbehalf/config.toml"]
+    ports:
+      - "127.0.0.1:8080:8080"        # reverse proxy on the host or in another container
+    volumes:
+      - ./onbehalf.toml:/etc/onbehalf/config.toml:ro
+      - ./policy.cedar:/etc/onbehalf/policy.cedar:ro
+      - ./issuer.pem:/etc/onbehalf/issuer.pem:ro
+      - onbehalf-data:/var/lib/onbehalf
+    stop_signal: SIGINT
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  onbehalf-data:
+```
+
+Matching settings in `onbehalf.toml`: `policies_path = "/etc/onbehalf/policy.cedar"`, `private_key_pem_path = "/etc/onbehalf/issuer.pem"`, `sqlite_path = "/var/lib/onbehalf/onbehalf.sqlite"`, `listen = "0.0.0.0:8080"` (inside the container only; the published port stays on loopback). This layout is untested.
+
+Notes:
+
+- **Signals.** The server shuts down gracefully on SIGINT (Ctrl-C) only. It installs no SIGTERM handler. As PID 1 in a container, SIGTERM is then ignored and `docker stop` waits for its timeout and kills the process. `stop_signal: SIGINT` avoids that. SQLite writes are transactional, so a kill does not corrupt the log, but a graceful stop is cleaner.
+- **Read-only root.** The server only writes under the data directory and, when the key file is missing, to the key path. Keep the key file in the read-only mount, so a missing key is an error you see, not a new key you did not plan.
+- **Upstreams** must be reachable from the container. `127.0.0.1` in `[[upstreams]]` means the container itself.
+
+## Health and readiness
+
+`GET /healthz` returns `{"status":"ok","version":"..."}` with HTTP 200. It is a liveness check only. It does not open the database, check disk space or contact an identity provider. A server whose SQLite file is read-only or full still answers `ok`, and then denies every call.
+
+There is no readiness endpoint. For a deeper check, call an admin route that reads the database:
+
+```sh
+curl -fsS http://127.0.0.1:8080/admin/audit/checkpoint -H "Authorization: Bearer $ONBEHALF_ADMIN_TOKEN"
+```
+
+That proves the process is up, the token works and SQLite is readable. Do not put the admin token in a load balancer's config. Run this one from a monitor on the host.
+
+Startup is quick: parse config, load the key, open SQLite, load policy. Config, policy or catalog errors stop the process with a message instead of starting a half-working server.
+
+Reloading policy does not need a restart: `onbehalf policy reload`. A bad policy file leaves the old policy in force. Changing the config file, the catalog or the key does need a restart.
+
+## What to monitor
+
+There are no metrics yet. Here is what to watch with the tools that exist.
+
+From the process and the host:
+
+- The process is alive, and `/healthz` answers.
+- Disk space under the SQLite directory.
+- The file size of the SQLite database, as a trend.
+
+From the logs:
+
+- `warn` lines. A rise in rejections can mean a misconfigured client or an attack.
+- `503` answers from `POST /token` with `jwks_unavailable`. That is your identity provider or the network path to it.
+
+From the audit log (`GET /admin/audit`, `onbehalf audit tail`):
+
+- The count of denies by reason. A jump in `capability_denied` or `policy_deny` for one agent often means a prompt-injected agent. A jump in `lease_expired` means agents that stopped renewing.
+- Any `audit_error`, `lease_error` or `policy_error`. These are internal failures and every one denied a call.
+- `token.root` rows per user and agent. Root mints are the entry point of every chain.
+- `audit verify` on a schedule. It exits 1 on a broken chain.
+- The checkpoint `seq` should only grow. Compare each reading with the last.
+
+If you run a second system that needs to react to revocations, such as an AuthZEN PEP, remember it learns only by asking. There is no push channel in v0.
+
+## Upgrades
+
+Until 1.0, minor versions can change the config, the token format and the database layout. Read the [CHANGELOG](../../CHANGELOG.md) before every upgrade, and back up the database and the key first. Tokens issued by one version may not verify on the next. Plan to re-mint.
