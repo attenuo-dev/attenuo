@@ -11,7 +11,7 @@ Rust is the implementation language because the pieces being composed are Rust (
 
 ## Decision
 
-A Cargo workspace with six crates, dependencies pointing only downward in this list.
+A Cargo workspace with seven crates, dependencies pointing only downward in this list.
 
 | Crate | Responsibility | Key dependencies | Notes |
 |---|---|---|---|
@@ -21,6 +21,7 @@ A Cargo workspace with six crates, dependencies pointing only downward in this l
 | `onbehalf-audit` | Hash-chained append-only log, checkpoints, verifier, SQLite backend behind a `LogSink` trait. | `core`, `rusqlite` (bundled), `sha2` | Verifier is a separate binary entry point so an auditor can run it without the server. |
 | `onbehalf-proxy` | MCP streamable-HTTP interception: parse JSON-RPC, extract `tools/call`, enforce decision, forward or reject, propagate session ids; lease renewal client. | `core`, `token`, `policy`, `audit`, `axum`/`hyper`, `tower` | Only crate that understands MCP framing. Must not interpret tool results. |
 | `onbehalf-server` | The binary: config, wiring, `/token`, `/access/v1/evaluation`, `/lease/*`, `/revoke`, health, metrics, the proxy routes. | all of the above, `axum`, `tokio`, `clap`, `tracing` | No logic beyond wiring and config. |
+| `onbehalf-cli` | The `onbehalf` binary: a thin HTTP client for a running server (token root/exchange/inspect, call, lease, audit, policy, AuthZEN eval). | `core`, `token`, `reqwest`, `clap` | Holds no keys and decides nothing; `token inspect` decodes locally and `--verify` uses the server's JWKS. |
 
 Conventions:
 
@@ -33,7 +34,7 @@ Conventions:
 
 - Positive: the trusted base (`core` + `audit`) is auditable in an afternoon; gateways can depend on `policy` + `token` as a library or call the server's AuthZEN endpoint.
 - Positive: attenuation has one implementation and one test suite.
-- Negative: six crates means some type duplication at boundaries (AuthZEN JSON vs. core types) and more `Cargo.toml` upkeep.
+- Negative: seven crates means some type duplication at boundaries (AuthZEN JSON vs. core types) and more `Cargo.toml` upkeep.
 - Negative: `proxy` depends on MCP framing details that will change with spec revisions; it is isolated for that reason.
 
 ## Alternatives considered

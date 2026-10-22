@@ -33,3 +33,7 @@ uuid = { workspace = true }
 # Enables the `testing` module for this crate's own integration tests.
 onbehalf-proxy = { path = ".", features = ["testing"] }
 tracing-subscriber = { workspace = true }
+
+[[example]]
+name = "fake_mcp"
+required-features = ["testing"]

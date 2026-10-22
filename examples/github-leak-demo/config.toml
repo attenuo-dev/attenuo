@@ -1,0 +1,45 @@
+# onbehalf-server config for the GitHub MCP leak demo (see README.md).
+#
+# run.sh copies this file, rewrites the two ports and the relative paths, and starts the
+# server from the copy. config.docker.toml is the docker-compose variant.
+
+[server]
+listen = "127.0.0.1:18080"
+
+[issuer]
+issuer = "http://127.0.0.1:18080"
+audience = "onbehalf"
+default_ttl_seconds = 900
+# No key path: an ephemeral key per start, which is what a throwaway demo wants.
+
+[policy]
+policies_path = "examples/github-leak-demo/policy.cedar"
+
+# Every action a policy names must be in the catalog, with the argument types it tests.
+[policy.catalog.github.read_file]
+readonly = true
+inputs = { repo = "string", path = "string" }
+
+[policy.catalog.github.create_issue]
+inputs = { repo = "string", title = "string" }
+
+[policy.catalog.github.delete_repo]
+sensitive = true
+inputs = { repo = "string" }
+
+[audit]
+sqlite_path = ":memory:"
+
+[[upstreams]]
+name = "github"
+url = "http://127.0.0.1:13001/mcp"
+
+[admin]
+token = "demo-admin-token"
+
+# Alice's assistant holds a broad token, like the over-privileged PAT in the real incident.
+[[root_grants]]
+subject = "alice"
+issuer = "https://idp.example"
+agent = "assistant"
+capabilities = ["github:*"]

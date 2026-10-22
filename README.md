@@ -13,6 +13,7 @@ Delegated authorization for software agents. onbehalf lets a principal hand an a
 
 - [RFC-0001: onbehalf](docs/spec/rfc-0001-onbehalf.md): what the system is, the token model, the policy and audit design.
 - [docs/](docs/README.md): specifications, architecture decisions, research notes, task board and engineering log.
+- [examples/github-leak-demo](examples/github-leak-demo/README.md): the May 2025 GitHub MCP prompt-injection leak, replayed and stopped (`run.sh`, about a minute).
 - [CONTRIBUTING.md](CONTRIBUTING.md): how to build, test and submit changes.
 - [SECURITY.md](SECURITY.md): how to report a vulnerability. Please do not file security issues publicly.
 - [CHANGELOG.md](CHANGELOG.md), [GOVERNANCE.md](GOVERNANCE.md), [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
@@ -27,6 +28,7 @@ Delegated authorization for software agents. onbehalf lets a principal hand an a
 | `onbehalf-audit` | Append-only, hash-chained audit log |
 | `onbehalf-proxy` | Enforcement in front of upstream services |
 | `onbehalf-server` | The standalone server binary |
+| `onbehalf-cli` | The `onbehalf` command line for a running server |
 
 ## Building
 
@@ -131,6 +133,28 @@ ROOT_TOKEN=$(echo "$ROOT" | jq -r .access_token); ROOT_LEASE=$(echo "$ROOT" | jq
 ```
 
 Other endpoints: `POST /access/v1/evaluation` (AuthZEN; send the delegation token as bearer), `GET /.well-known/jwks.json`, `GET /.well-known/authzen-configuration`, `POST /admin/policies/reload`, `GET /admin/leases/{id}`, `GET /admin/audit/checkpoint`, `GET /healthz`. The request pipeline is described in [docs/design/server.md](docs/design/server.md). Set `RUST_LOG=debug` for more logging.
+
+## Command line
+
+`onbehalf` (crate `onbehalf-cli`) talks HTTP to a running server, so the quick start above becomes:
+
+```sh
+cargo build -p onbehalf-cli
+export ONBEHALF_SERVER=http://127.0.0.1:8080 ONBEHALF_ADMIN_TOKEN=dev-admin-token-change-me
+alias onbehalf=target/debug/onbehalf
+
+onbehalf token root --subject alice --issuer https://idp.example --agent planner --cap 'github:*'
+onbehalf token exchange --subject-token "$ROOT_TOKEN" --actor coder --cap github:read_file
+onbehalf token inspect "$CHILD_TOKEN" --verify      # the chain as a tree; --verify checks it against the server's JWKS
+onbehalf call --token "$CHILD_TOKEN" --server github --tool read_file --arg repo=acme/api
+onbehalf lease revoke "$ROOT_LEASE" --reason demo
+onbehalf audit tail -n 10 --follow
+onbehalf audit verify
+```
+
+Other subcommands: `tools` (`tools/list`), `lease show`, `policy reload`, `authzen eval`. Output is for people by default and JSON with `--json`; `--print token|lease` on `token root` and `token exchange` prints one value for scripts. `--server` before the subcommand is the onbehalf URL; after `call` or `tools` it names the MCP upstream. Exit status is 0 on success, 1 on an error and 2 when the server said no (a denied call, a negative AuthZEN decision, a broken audit chain). `ONBEHALF_TOKEN` can stand in for `--token` and `--subject-token`.
+
+A scripted end-to-end run of the GitHub leak scenario, with a fake MCP server, is in [examples/github-leak-demo](examples/github-leak-demo/README.md). A `Dockerfile` and `docker-compose.yml` run the same pair of servers in containers (untested).
 
 ## License
 

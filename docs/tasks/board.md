@@ -50,4 +50,6 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 - [x] AuthZEN `POST /access/v1/evaluation` served by the same pipeline as the proxy; bearer or body chain.
 - [x] Lease revocation cascade: integration test that revoking the root lease denies the child's next call (`lease_revoked`).
 - [x] Hop 0 from an OIDC ID token and from an ID-JAG: trusted `[[idps]]`, JWKS discovery and cache, `[[agents]]` client auth, root grants; dev root mint off by default ([design](../design/server.md#hop-0-intake-from-an-identity-provider)).
+- [x] `onbehalf-cli`: the `onbehalf` binary for tokens, calls, leases, audit and policy, with unit-tested arguments and tree rendering.
+- [x] GitHub MCP leak demo: `examples/github-leak-demo/run.sh` with a transcript; the integration-test form of the scenario (first item under Now) is still open.
 - [x] Policy hot reload with schema validation (`POST /admin/policies/reload`); invalid set rejected with 422, last good set kept.
