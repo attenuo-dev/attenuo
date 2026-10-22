@@ -194,6 +194,26 @@ pub enum AuditCmd {
 pub enum PolicyCmd {
     /// Re-read the policy file on the server.
     Reload,
+    /// Run YAML policy test files offline. Exit 0 if every case passes, 2 if any fails,
+    /// 1 if a file cannot be run.
+    Test {
+        /// Test files (format documented in docs/guides/writing-policies.md).
+        #[arg(required = true)]
+        files: Vec<std::path::PathBuf>,
+    },
+    /// Parse a Cedar policy file and validate it against the generated schema, printing
+    /// errors with line and column. Exit 0 if clean, 2 if it has errors.
+    Lint {
+        /// The Cedar policy file.
+        policy: std::path::PathBuf,
+        /// Server config whose `[policy.catalog]` declares the tools (or a JSON catalog).
+        /// Without it the catalog is empty and any policy naming an action fails validation.
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+        /// Also print the generated schema the policy was validated against.
+        #[arg(long)]
+        schema: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
