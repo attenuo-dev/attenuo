@@ -17,9 +17,9 @@ Cedar alone has known gaps for agents. AWS needed a second language, Dogwood, fo
 
 Use Cedar (`cedar-policy` 4.x) as the only policy language exposed to policy authors. Address the gaps outside the language rather than by adding a second one:
 
-- **Delegation and attenuation** are enforced by `onbehalf-core` before policy runs, as a predicate over the token lineage; policy can further restrict by `context.chain_depth` but cannot widen.
-- **Originating user** arrives as a signed claim in the token and is projected into `context.originating_user`; no detached signature.
-- **Temporal and session constraints** are expressed with Cedar's `datetime`/`duration` extension and `context.session`, plus leases for liveness; if that proves insufficient the fallback is a small set of built-in temporal predicates in the request builder, not a new language.
+- **Delegation and attenuation** are enforced by `onbehalf-core` before policy runs, as a predicate over the token lineage; policy can further restrict by `context.chain.depth` but cannot widen.
+- **Originating user** arrives in the token's `chain.originating_user` claim, covered by the issuer's `ou_sig` signature (checked by `onbehalf-token` before policy runs), and is projected into `context.originating_user`.
+- **Temporal and session constraints** are expressed with Cedar's `datetime`/`duration` extension and `context.session_id` and `context.now_unix`, plus leases for liveness; if that proves insufficient the fallback is a small set of built-in temporal predicates in the request builder, not a new language.
 - **Revocation** is a lease check outside policy ([RFC-0001 §6](../spec/rfc-0001-onbehalf.md#6-revocation-via-leases)).
 - **Request shape** follows AuthZEN so the same evaluation is reachable by external PEPs ([Cerbos](https://www.cerbos.dev/blog/mcp-authorization-standards)).
 

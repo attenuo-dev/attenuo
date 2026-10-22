@@ -7,8 +7,8 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 - [ ] `onbehalf-core`: `Capability`, `CapabilitySet`, constraint types (set, numeric range, time range), `⊑` predicate.
 - [ ] `onbehalf-core`: proptest suite for `⊑` (reflexive, transitive, empty-set minimal, adding a key narrows, removing a value narrows, widening fails).
 - [ ] `onbehalf-core`: `DelegationChain`, `Hop`, `OriginatingUser`, canonical JSON (RFC 8785) for hashing.
-- [ ] `onbehalf-token`: mint and verify JWT with `act`, `obo`, `cap`, `chain_id`, `depth`, `lease` claims; Ed25519 keys; JWKS endpoint.
-- [ ] `onbehalf-token`: RFC 8693 `/token` endpoint for hop n+1 (parent onbehalf token as `subject_token`), rejecting any request where `requested ⋢ parent.cap`, depth or expiry widen, or `obo` is missing.
+- [ ] `onbehalf-token`: mint and verify JWT with `act`, `chain` (originating user, hops with capabilities and leases), `ou_sig` claims; Ed25519 keys; JWKS endpoint.
+- [ ] `onbehalf-token`: RFC 8693 `/token` endpoint for hop n+1 (parent onbehalf token as `subject_token`), rejecting any request where requested capabilities are not covered by the parent's last hop, or depth or expiry widen.
 - [ ] `onbehalf-policy`: Cedar wrapper, schema for `Agent`, `Tool`, `Action`, request builder from (token, `tools/call`), capability match and lease check before evaluation.
 - [ ] `onbehalf-proxy`: streamable-HTTP interception of `tools/call` for one upstream server; forward on permit, JSON-RPC error on deny.
 - [ ] `onbehalf-audit`: append-only SQLite log, `prev_hash`/`hash` chaining, `onbehalf-audit verify` command.
@@ -16,6 +16,7 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 
 ## Next
 
+- [ ] Token claims: proposed extensions from RFC-0001 section 3.1: `evidence` on the originating user (how the IdP credential was verified), a stable `chain_id`, `may_act` and a verified `actor_token`, numeric and time-range constraints. Reconcile or drop each.
 - [ ] Hop 0 from an OIDC ID token (JWKS fetch, `iss`/`aud`/`exp` checks) and from an ID-JAG assertion.
 - [ ] Leases: `/lease/{id}/renew`, `/revoke` by user, session, chain, token; descendant revocation; proxy cache bounded by TTL; integration test that a revoked parent denies the child's next call within one TTL.
 - [ ] Multi-hop demo: planner agent → coder sub-agent → GitHub tool, three exchanges, attenuated at each.

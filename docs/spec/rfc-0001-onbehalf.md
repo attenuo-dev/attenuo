@@ -1,14 +1,14 @@
 # RFC-0001: onbehalf, an authorization and enforcement plane for AI agents
 
-- Status: draft
+- Status: draft (implementation v0 in progress)
 - Date: 2026-10-22
 - Related: [threat model](threat-model.md), [standards](../research/standards.md), [incidents](../research/incidents-2025-2026.md), [ADR-0001](../decisions/0001-separate-enforcement-layer.md), [ADR-0002](../decisions/0002-cedar-for-policy.md)
 
 ## 1. Problem
 
-The MCP `2026-07-28` revision settles the transport layer: servers are OAuth 2.1 resource servers, clients send resource indicators, registration uses Client ID Metadata Documents ([WorkOS](https://workos.com/blog/mcp-2026-spec-agent-authentication)). It does not settle what happens after the token. The token is issued to the agent and "has no slot for the human the agent acts for"; scopes are coarse and fixed at issue time and cannot see call arguments; "no widely adopted standard slot reliably carries 'which human is this agent acting for' across every hop of a delegation chain" ([Cerbos](https://www.cerbos.dev/blog/mcp-authorization-standards)). Servers "see user or service tokens, not which agent acted for which user, so audit logs can't distinguish agent actions from user actions" ([Archestra](https://archestra.ai/blog/state-of-mcp-2026)). Withdrawal of in-flight decisions is "not addressed by most implementations" ([Cerbos](https://www.cerbos.dev/blog/mcp-authorization-standards)).
+The MCP `2026-07-28` revision settles the transport layer: servers are OAuth 2.1 resource servers, clients send resource indicators, registration uses Client ID Metadata Documents ([WorkOS](https://workos.com/blog/mcp-2026-spec-agent-authentication)). It does not settle what happens after the token. The token is issued to the agent and "has no slot for the human the agent acts for"; scopes are coarse and fixed at issue time and cannot see call arguments; "no widely adopted standard slot reliably carries 'which human is this agent acting for' across every hop of a delegation chain" ([Cerbos](https://www.cerbos.dev/blog/mcp-authorization-standards)). Audit logs "can't distinguish agent actions from user actions" ([Archestra](https://archestra.ai/blog/state-of-mcp-2026)), and withdrawal of in-flight decisions is "not addressed by most implementations" ([Cerbos](https://www.cerbos.dev/blog/mcp-authorization-standards)).
 
-The 2025-2026 incident record is mostly over-privilege, missing isolation and missing audit, not model failure: the May 2025 GitHub MCP leak paired prompt injection with an over-privileged PAT; Smithery leaked a platform token controlling 3,000+ apps; the WhatsApp MCP server exfiltrated message history while "evading DLP tooling" ([AuthZed](https://authzed.com/blog/timeline-mcp-breaches)). See the [incident list](../research/incidents-2025-2026.md).
+The 2025-2026 incident record is mostly over-privilege, missing isolation and missing audit, not model failure: the May 2025 GitHub MCP leak paired prompt injection with an over-privileged PAT ([AuthZed](https://authzed.com/blog/timeline-mcp-breaches)). See the [incident list](../research/incidents-2025-2026.md).
 
 onbehalf is a self-hosted, IdP-neutral reference monitor that sits between agent clients and MCP tool servers. It issues attenuated delegation tokens, authorizes every tool call against a policy that sees the arguments, revokes in-flight runs, and records every decision in a tamper-evident log.
 
@@ -16,8 +16,8 @@ onbehalf is a self-hosted, IdP-neutral reference monitor that sits between agent
 
 Let a *run* be a tree of hops rooted at an originating user `u`. Hop `h_n` is an agent acting with capability set `C_n`.
 
-- **P1. Verified originating user on every hop.** Every token onbehalf issues carries an `obo` block naming `u`, derived only from a credential verified against the user's IdP (ID token, ID-JAG, or a parent onbehalf token whose `obo` was itself verified). A request without a verifiable `obo` is rejected, never defaulted.
-- **P2. Monotonic attenuation.** For every parent/child pair, `C_{n+1} ⊑ C_n`, `exp_{n+1} ≤ exp_n`, and `depth_{n+1} = depth_n + 1 ≤ max_depth`. Exchange requests that would widen any dimension fail closed. This is checked at issue time and re-checked at call time against the full lineage.
+- **P1. Verified originating user on every hop.** Every token onbehalf issues carries the originating user in `chain.originating_user` (mirrored in `sub`), protected by `ou_sig` and copied unchanged through every exchange. A token whose user block fails `ou_sig` is rejected, never defaulted. Deriving the block from a verified IdP credential (ID token, ID-JAG) is not yet implemented, see section 3.1.
+- **P2. Monotonic attenuation.** For every parent/child pair, `C_{n+1} ⊑ C_n` (section 3), `exp_{n+1} ≤ exp_n`, and hop count `≤ max_depth`. Exchange requests that would widen any dimension fail closed. This is checked at issue time and re-checked at call time against the full lineage.
 - **P3. Argument-aware per-call authorization.** Every `tools/call` is evaluated as an AuthZEN-shaped request whose context contains the call arguments, the originating user, chain depth, and session/time. A call is forwarded only on an explicit `permit`. Deny is the default.
 - **P4. Tamper-evident audit and in-flight revocation.** Every decision, token issuance, lease renewal and revocation is appended to a hash-chained log. Every token is bound to a lease; a revoked lease (or any ancestor lease) causes the next call to be denied within one lease interval.
 
@@ -25,98 +25,137 @@ P2 and P4 are the invariants that must carry property tests, not only unit tests
 
 ## 3. Delegation-chain data model
 
+The authoritative object is the `DelegationChain` (`onbehalf-core`): the originating user plus one `Hop` per agent, root first. It is embedded whole in every token as the `chain` claim.
+
 ```json
 {
-  "chain_id": "dc_01JAXK3V9P",
   "originating_user": {
-    "iss": "https://idp.example.com",
-    "sub": "u_8f2a",
-    "email": "alice@example.com",
-    "auth_time": 1761134400,
-    "amr": ["pwd", "mfa"],
-    "evidence": { "type": "id-jag", "jti": "jag_7c1d", "digest": "sha256:9b1e…" }
+    "subject": "user:alice",
+    "issuer": "https://idp.example.com",
+    "authenticated_at": "2026-10-22T20:00:00Z",
+    "attributes": { "amr": ["pwd", "mfa"], "tenant": "acme" }
   },
-  "max_depth": 3,
   "hops": [
     {
-      "depth": 0,
-      "actor": "spiffe://example.com/agent/planner",
-      "jti": "tok_a1",
-      "lease_id": "lease_a1",
-      "exp": 1761138000,
-      "caps": [
-        { "server": "github", "tool": "*", "constraints": { "repo": ["acme/public-site", "acme/docs"] } },
-        { "server": "mail", "tool": "send", "constraints": { "to_domain": ["acme.com"] } }
-      ]
+      "agent": "agent:planner",
+      "capabilities": [
+        { "server": "github", "tool": "*", "constraints": { "repo": { "op": "prefix", "value": "acme/" } } }
+      ],
+      "issued_at": "2026-10-22T21:00:00Z",
+      "expires_at": "2026-10-22T22:00:00Z",
+      "lease": "5b0c6f0e-0d54-4d0e-9a53-0c1f6a9c2a11"
     },
     {
-      "depth": 1,
-      "actor": "spiffe://example.com/agent/coder",
-      "parent_jti": "tok_a1",
-      "jti": "tok_b7",
-      "lease_id": "lease_b7",
-      "exp": 1761137400,
-      "caps": [
-        { "server": "github", "tool": "create_issue", "constraints": { "repo": ["acme/public-site"] } }
-      ]
+      "agent": "agent:coder",
+      "capabilities": [
+        { "server": "github", "tool": "create_issue", "constraints": { "repo": { "op": "equals", "value": "acme/api" } } }
+      ],
+      "issued_at": "2026-10-22T21:05:00Z",
+      "expires_at": "2026-10-22T21:35:00Z",
+      "lease": "e2a41c7b-31f0-4b63-8d1a-77c0a54c9d02"
     }
   ]
 }
 ```
 
-**Capability.** `(server, tool, constraints)`. `tool` is a name or `*`. `constraints` is a map from argument name to an allowed set (or range, for numeric and time types).
+`attributes` is an optional map of verified facts for policy (roles, MFA level, tenant). A hop's `lease` is the id revoked to deny that hop and everything delegated from it.
 
-**Attenuation rule (`⊑`).** `C_{n+1} ⊑ C_n` iff every `c' ∈ C_{n+1}` is dominated by some `c ∈ C_n`, where `c ⊑' c'` holds when:
-1. `c'.server == c.server`;
-2. `c.tool == "*"` or `c'.tool == c.tool`;
-3. for every key `k` in `c.constraints`, `k` is present in `c'.constraints` and `c'.constraints[k] ⊆ c.constraints[k]`;
-4. `c'` may add keys that `c` lacks (adding a constraint only narrows).
+**Capability.** `{server, tool, constraints}`. `server` and `tool` are an exact name, `*`, or a `prefix*` glob. `constraints` maps an argument name to `{op, value}` with `op` one of `equals` (a JSON value), `one_of` (a list of JSON values) or `prefix` (a string). Arguments not mentioned are unconstrained; a call that omits a constrained argument is denied.
 
-The empty capability set is valid. A child can never gain a server, tool, or argument value its parent lacked. The same rule is applied as a policy predicate at call time, so a forged or replayed child token still cannot exceed its lineage. This is the "permissions can only be narrowed" discipline AgentGate formalizes for single-session chains ([NeurIPS 2026](https://neurips.cc/virtual/2026/168219)) and the `containsAll` subset check in AWS's Cedar sample ([AWS Security Blog](https://aws.amazon.com/blogs/security/enforce-least-privilege-authorization-in-multi-agent-ai-chains-using-cedar/)), applied here across hops and services.
+**Attenuation rule.** `parent.covers(child)` holds when:
+1. server and tool patterns are covered: `*` covers anything; `p*` covers `q*` iff `q` starts with `p`, and covers an exact name starting with `p`; an exact parent covers only the identical exact name, never a glob;
+2. every argument the parent constrains is also constrained by the child, and the child's constraint *implies* the parent's. The child may add constraints.
+
+Constraint implication (child implies parent):
+
+| child \ parent | `equals b` | `one_of bs` | `prefix q` |
+|---|---|---|---|
+| `equals a` | `a == b` | `a ∈ bs` | `a` is a string starting with `q` |
+| `one_of as` | `as` non-empty, all `== b` | `as` non-empty, `as ⊆ bs` | `as` non-empty, every `a` a string starting with `q` |
+| `prefix p` | never | never | `p` starts with `q` |
+
+A set `P` covers a set `C` only if each `c ∈ C` is covered by a *single* `p ∈ P`. A child covered only by the union of several parent capabilities is rejected: sound, linear, explainable. `CapabilitySet::attenuate` applies this and also rejects an empty request. A chain is valid at time `t` only if every hop is unexpired, no hop's `expires_at` exceeds its parent's, every hop's capabilities are covered by its parent's and non-empty, and the hop count is at most `max_depth` (`validate_at`). `Issuer::exchange` clamps the child's expiry to the parent's instead of failing on it.
+
+### 3.1 Not yet implemented / proposed
+
+These parts of the original design have no counterpart in the code. They are tracked in [the task board](../tasks/board.md) (Next: "Token claims: proposed extensions").
+
+- **`evidence`** on the originating user (type, `jti` and digest of the ID token or ID-JAG it came from), so audit can show how the user was verified. Hop 0 from an IdP credential does not exist yet; `ou_sig` is onbehalf's own signature. TODO: [board](../tasks/board.md).
+- **`chain_id`**, a stable id for a whole run, for revoking by chain and correlating audit. TODO: [board](../tasks/board.md).
+- **`may_act`** and a verified `actor_token` (for example a SPIFFE JWT-SVID). In v0 the actor is a name the caller asserts.
+- **Numeric and time-range constraints.**
 
 ## 4. Token exchange
 
-onbehalf exposes an RFC 8693 token-exchange endpoint. Each hop is one exchange.
-
-**Hop 0: entering from the IdP.** The agent client presents a user credential as `subject_token`: an OIDC ID token, or an ID-JAG issued by the enterprise IdP under the Cross-App Access profile that Okta's Agent SSO and Descope ship today ([Forkast](https://forkast.news/six-vendors-are-shipping-agent-identity-products-the-ietf-has-not-finished-the-standard/)). onbehalf verifies it against the IdP's JWKS, extracts `originating_user`, and mints a hop-0 token whose `caps` are the intersection of the requested capabilities, the user's policy-derived ceiling, and the client's registration.
-
-**Hop n+1: agent to sub-agent.**
-
-```http
-POST /token
-Content-Type: application/x-www-form-urlencoded
-
-grant_type=urn:ietf:params:oauth:grant-type:token-exchange
-&subject_token=<parent onbehalf token tok_a1>
-&subject_token_type=urn:ietf:params:oauth:token-type:jwt
-&actor_token=<sub-agent workload credential, e.g. SPIFFE JWT-SVID>
-&actor_token_type=urn:ietf:params:oauth:token-type:jwt
-&authorization_details=[{"type":"mcp_tool","server":"github","tool":"create_issue","constraints":{"repo":["acme/public-site"]}}]
-```
-
-`authorization_details` uses the RAR (RFC 9396) shape so requested capabilities are structured, not scope strings ([QCon London](https://qconlondon.com/presentation/mar2026/your-agent-sandbox-doesnt-know-my-authz-model-standard-shaped-hole)). onbehalf checks `requested ⊑ parent.caps`, that `parent.obo` is present and verified, that depth and expiry narrow, and that the parent's lease is live. The response is a JWT:
+A delegation token is a compact JWS, EdDSA (Ed25519), with header `typ` = `onbehalf+jwt`. Its claims (`onbehalf-token::Claims`):
 
 ```json
 {
   "iss": "https://onbehalf.example.com",
-  "sub": "spiffe://example.com/agent/coder",
   "aud": "https://onbehalf.example.com/proxy",
-  "jti": "tok_b7",
-  "exp": 1761137400,
-  "act": { "sub": "spiffe://example.com/agent/planner", "jti": "tok_a1" },
-  "obo": { "iss": "https://idp.example.com", "sub": "u_8f2a", "amr": ["pwd","mfa"], "auth_time": 1761134400 },
-  "chain_id": "dc_01JAXK3V9P",
-  "depth": 1,
-  "lease": { "id": "lease_b7", "ttl": 30 },
-  "cap": [
-    { "server": "github", "tool": "create_issue", "constraints": { "repo": ["acme/public-site"] } }
-  ]
+  "sub": "user:alice",
+  "act": { "sub": "agent:coder", "act": { "sub": "agent:planner" } },
+  "jti": "0f8c1d52-9b0e-4a8e-bb43-5d61f3a1c7e0",
+  "iat": 1761167100,
+  "exp": 1761168900,
+  "typ": "onbehalf+jwt",
+  "chain": { "originating_user": { "...": "as in section 3" }, "hops": [ "...planner...", "...coder..." ] },
+  "ou_sig": "<base64url Ed25519 signature over canonical JSON of chain.originating_user>"
 }
 ```
 
-`act` nests per RFC 8693 so the full actor chain is recoverable from the token alone. `may_act` on a token restricts which workloads may later present it as `subject_token`; when present, onbehalf enforces it against `actor_token`. The `obo` block is signed with the token, which replaces the detached HMAC side-channel AWS uses for `context.originating_user` ([AWS Security Blog](https://aws.amazon.com/blogs/security/enforce-least-privilege-authorization-in-multi-agent-ai-chains-using-cedar/)).
+- `sub` is the originating user. `act` is the RFC 8693 §4.1 actor chain: outermost is the agent currently acting, innermost the root agent (no `act`). Both are derived from `chain` so generic consumers can read who acts for whom without parsing it; the verifier requires them to agree.
+- `exp` always equals the last hop's `expires_at`. Leases are not a top-level claim; each hop carries its own inside `chain`.
+- `ou_sig` is made once at root issuance and copied unchanged through every exchange, so the user block is verifiable independently of the outer signature.
+
+**Root issuance** (`Issuer::issue_root`) builds the chain, signs the user block and mints. Verifying the user's IdP credential first is the caller's job today.
+
+**Exchange request** (JSON body; RFC 8693 with RFC 9396 `authorization_details`):
+
+```json
+{
+  "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+  "subject_token": "<parent onbehalf jwt>",
+  "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+  "actor": "agent:coder",
+  "authorization_details": [
+    { "type": "onbehalf_capabilities",
+      "capabilities": [ { "server": "github", "tool": "create_issue",
+                          "constraints": { "repo": { "op": "equals", "value": "acme/api" } } } ] }
+  ],
+  "requested_ttl_seconds": 600
+}
+```
+
+Any other `grant_type` or `subject_token_type` is rejected. Capabilities from every `onbehalf_capabilities` entry are merged; `requested_ttl_seconds` is optional. `actor` is the agent identifier of the new hop.
+
+**Exchange response:**
+
+```json
+{
+  "access_token": "<child jwt>",
+  "issued_token_type": "urn:ietf:params:oauth:token-type:jwt",
+  "token_type": "Bearer",
+  "expires_in": 600,
+  "lease": "e2a41c7b-31f0-4b63-8d1a-77c0a54c9d02"
+}
+```
+
+**Exchange** (`Issuer::exchange`) verifies the parent at `now`, then calls `DelegationChain::extend`: the requested set must be non-empty and covered per section 3, the new depth must not exceed `max_depth`, and the child's expiry is `min(now + ttl, parent.expires_at)` (default TTL from issuer config). The child gets a fresh lease and `jti`, and the parent's `ou_sig`.
+
+**Verification order** (`Verifier::verify`; `now` is supplied by the caller, never read from the system clock):
+1. EdDSA signature and algorithm;
+2. header and claim `typ` equal `onbehalf+jwt`;
+3. `iss`, then 4. `aud`, then 5. `exp > now`;
+6. `sub` equals `chain.originating_user.subject`, and `act` equals the actor chain rebuilt from `chain.hops`;
+7. `exp` equals the last hop's `expires_at`;
+8. `ou_sig` over the canonical user block (compact `serde_json`, `BTreeMap` key order);
+9. `chain.validate_at(now, max_depth)`: non-empty subject, at least one hop, depth, per-hop expiry, expiry monotonicity, attenuation.
+
 
 ## 5. Per-call authorization
+
+The shape below is the design target. The implemented wire shape is in `onbehalf-policy::authzen`: `subject.properties.chain` carries the whole `DelegationChain`, `context.input` the call arguments, and `context.session_id` the session. The Cedar context exposes `input`, `originating_user`, `chain{depth, agents, root_agent, leases}`, `session_id` and `now_unix`. `chain_id` and `lease_state` below are proposed (section 3.1, section 6).
 
 The proxy intercepts MCP `tools/call` over streamable HTTP, validates the bearer token, and builds an AuthZEN-shaped request ([Cerbos](https://www.cerbos.dev/blog/mcp-authorization-standards)):
 
@@ -138,7 +177,7 @@ The proxy intercepts MCP `tools/call` over streamable HTTP, validates the bearer
 }
 ```
 
-The same request is served on `POST /access/v1/evaluation` so an external PEP (for example a gateway) can use onbehalf as a PDP. Internally it maps to Cedar: `principal = Agent::"spiffe://…"`, `action = Action::"github/create_issue"`, `resource = Tool::"github/create_issue"`, and the context above as `context`, following the request shape AgentCore uses where arguments are `context.input` and "the model's text is not an input" ([Ajay Kumar](https://www.ajayk.sh/blog/policy-as-code-guardrails-ai-agents-2026/)). Two checks run before policy and cannot be overridden by it: capability match (`arguments` must satisfy some `cap` in the token, and that cap must be dominated by the lineage) and lease liveness.
+The same request is served on `POST /access/v1/evaluation` so an external PEP (for example a gateway) can use onbehalf as a PDP. Internally it maps to Cedar with arguments in `context.input` and "the model's text is not an input" ([Ajay Kumar](https://www.ajayk.sh/blog/policy-as-code-guardrails-ai-agents-2026/)). Two checks run before policy and cannot be overridden by it: capability match (`arguments` must satisfy some capability of the last hop, and the chain must validate) and lease liveness.
 
 ```cedar
 forbid (principal, action == Action::"github/create_issue", resource)
@@ -147,13 +186,11 @@ forbid (principal, action == Action::"github/create_issue", resource)
 forbid (principal, action, resource)
   when { context.chain_depth > 2 && resource.sensitivity == "high" };
 
-permit (principal, action, resource)
-  when { context.originating_user.amr.contains("mfa") };
 ```
 
 ## 6. Revocation via leases
 
-Every token carries a `lease` with a short TTL (default 30 s). The holder renews with `POST /lease/{id}/renew`; the proxy caches lease state for at most one TTL. Revocation targets a user, a session, a chain, or a single token; it marks that lease and all descendant leases revoked. The next call on any affected hop is denied within one TTL, and renewal fails. Because leases form a tree that mirrors `act`, revoking the originating user's session stops every sub-agent of every agent in that run, which is the "withdrawal of in-flight decisions" gap ([Cerbos](https://www.cerbos.dev/blog/mcp-authorization-standards)). Long human-in-the-loop waits expire the lease; resumption requires a fresh exchange, so a resumed run cannot hold broader authority than policy grants at resume time.
+Every hop in a token's `chain` carries a `lease` id, and each lease has a short TTL (default 30 s). The holder renews with `POST /lease/{id}/renew`; the proxy caches lease state for at most one TTL. Revocation targets a user, a session, a chain, or a single token; it marks that lease and all descendant leases revoked. The next call on any affected hop is denied within one TTL, and renewal fails. Because leases form a tree that mirrors `act`, revoking the originating user's session stops every sub-agent of every agent in that run, which is the "withdrawal of in-flight decisions" gap ([Cerbos](https://www.cerbos.dev/blog/mcp-authorization-standards)).
 
 ## 7. Audit record and hash chaining
 
@@ -177,7 +214,7 @@ Every token carries a `lease` with a short TTL (default 30 s). The holder renews
 }
 ```
 
-`hash = SHA-256(prev_hash || canonical_json(record \ {hash}))` using RFC 8785 canonicalization. The log stores argument digests, not arguments, by default; a per-server policy can opt into storing redacted arguments. A signed checkpoint `(seq, hash)` is emitted every N records and can be anchored externally. Verification is a single pass. Record kinds: `issue`, `decision`, `renew`, `revoke`, `checkpoint`. Every record names the agent and the originating user separately, which is the attribution OWASP MCP08 and Archestra say is missing ([Equixly](https://equixly.com/blog/2026/06/04/mapping-nsa-s-mcp-guidance-to-the-owasp-mcp-top-10-how-to-test-for-the-risks/), [Archestra](https://archestra.ai/blog/state-of-mcp-2026)).
+`hash = SHA-256(prev_hash || canonical_json(record \ {hash}))` using RFC 8785 canonicalization. The log stores argument digests, not arguments, by default. A signed checkpoint `(seq, hash)` is emitted every N records and can be anchored externally. Record kinds: `issue`, `decision`, `renew`, `revoke`, `checkpoint`. Every record names the agent and the originating user separately, the attribution OWASP MCP08 says is missing ([Equixly](https://equixly.com/blog/2026/06/04/mapping-nsa-s-mcp-guidance-to-the-owasp-mcp-top-10-how-to-test-for-the-risks/)). Field names here are illustrative (`chain_id` is proposed, section 3.1); the implemented record is in `onbehalf-audit`.
 
 ## 8. Non-goals
 
@@ -189,8 +226,17 @@ Every token carries a `lease` with a short TTL (default 30 s). The holder renews
 ## 9. Open questions
 
 1. **Token binding.** Should hop tokens be sender-constrained (`cnf` with DPoP or mTLS/SPIFFE), and at what cost to clients that cannot do either?
-2. **Cross-organization chains.** How does `obo` survive when hop n+1 is in another trust domain? ID-JAG and the "crossing-the-trustee problem" are unresolved ([Cerbos](https://www.cerbos.dev/blog/mcp-authorization-standards)).
+2. **Cross-organization chains.** How does the originating-user block survive when hop n+1 is in another trust domain? ID-JAG and the "crossing-the-trustee problem" are unresolved ([Cerbos](https://www.cerbos.dev/blog/mcp-authorization-standards)).
 3. **Constraint algebra.** Sets and ranges cover most tool arguments; nested objects, globs and regexes make `⊑` undecidable or expensive. Where is the line?
 4. **ReBAC composition.** Relationship facts (who owns which repo) are consulted via an external graph (SpiceDB/OpenFGA-style) and projected into Cedar entities; cache consistency with revocation is unsettled ([ADR-0002](../decisions/0002-cedar-for-policy.md)).
-5. **Information flow.** Labelling tool outputs as untrusted and forbidding flow into destructive tools without approval would address the WhatsApp/GitHub class directly; it is out of scope for v0.1.
+5. **Information flow.** Labelling tool outputs as untrusted is out of scope for v0.1.
 6. **Lease TTL vs. load.** 30 s renewals at agent call rates may need batching or push-based revocation.
+
+## 10. Implementation status
+
+| Property | Enforced by | Tests | Gap |
+|---|---|---|---|
+| P1 | `onbehalf-token` (`Verifier::verify`, `ou_sig`) | `token_exchange.rs`: `originating_user_tamper_is_caught_by_ou_sig`, `inconsistent_sub_or_act_is_rejected` | No hop 0 from an IdP credential; no `evidence` |
+| P2 | `onbehalf-core` (`Capability::covers`, `CapabilitySet::attenuate`, `DelegationChain::extend`/`validate_at`), `onbehalf-token` (`Issuer::exchange`) | core: `set_attenuation_only_narrows`, `union_coverage_is_rejected_conservatively`, `extend_cannot_widen`, `expiry_and_depth`; token: `exchange_cannot_widen_capabilities`, `exchange_ttl_is_clamped_to_parent_expiry`, `max_depth_exceeded_is_rejected` | No proptest suite for `covers` yet |
+| P3 | `onbehalf-policy` (capability stage, then Cedar), `onbehalf-proxy` | policy `engine.rs`: `capability_stage_denies_before_cedar`, `create_issue_argument_rule_allows_acme_and_denies_others`, `github_mcp_over_privileged_token_is_narrowed_by_policy`; proxy: `denied_tools_call_returns_32003_and_never_reaches_upstream`, `github_leak_scenario_repo_prefix_constraint` | Proxy tests use the stub authorizer, not the token verifier |
+| P4 | `onbehalf-audit` (hash chain, `LeaseStore`) | `audit.rs`: `tamper_every_byte_of_record_json_is_detected`, `delete_middle_row_is_detected`, `reordered_rows_are_detected`; `leases.rs`: `revoke_cascades_to_descendants_only` | Proxy does not consult leases per call; no renew endpoint |
