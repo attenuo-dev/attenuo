@@ -72,6 +72,7 @@ pub struct RecordedCall {
 pub struct FakeMcpServer {
     tools: Vec<Value>,
     calls: Arc<Mutex<Vec<RecordedCall>>>,
+    methods: Arc<Mutex<Vec<String>>>,
     /// When set, every response is sent as a single `text/event-stream` event instead of JSON.
     sse: bool,
     session_id: String,
@@ -92,6 +93,7 @@ impl FakeMcpServer {
                 })
                 .collect(),
             calls: Arc::new(Mutex::new(Vec::new())),
+            methods: Arc::new(Mutex::new(Vec::new())),
             sse: false,
             session_id: "fake-session-1".into(),
         }
@@ -117,6 +119,12 @@ impl FakeMcpServer {
         self.calls.lock().expect("calls mutex").clone()
     }
 
+    /// The method of every JSON-RPC message received so far (requests and notifications), in
+    /// order. Lets a test assert that a denied request never reached the upstream.
+    pub fn recorded_methods(&self) -> Vec<String> {
+        self.methods.lock().expect("methods mutex").clone()
+    }
+
     pub fn router(&self) -> Router {
         Router::new()
             .route("/mcp", post(fake_handle))
@@ -130,6 +138,10 @@ impl FakeMcpServer {
     fn respond_one(&self, msg: &Value, session_id: Option<&str>) -> Option<Value> {
         let id = id_of(msg);
         let method = method_of(msg)?;
+        self.methods
+            .lock()
+            .expect("methods mutex")
+            .push(method.to_owned());
         if !is_request(msg) {
             // notification: no response
             return None;
@@ -164,6 +176,14 @@ impl FakeMcpServer {
                 })
             }
             "ping" => json!({}),
+            "resources/read" => json!({
+                "contents": [{"uri": msg["params"]["uri"], "text": "fake resource"}]
+            }),
+            "resources/subscribe" => json!({}),
+            "prompts/get" => json!({
+                "messages": [{"role": "user", "content": {"type": "text", "text": "fake prompt"}}]
+            }),
+            "completion/complete" => json!({"completion": {"values": ["a"]}}),
             other => {
                 return Some(error_response(
                     id,
@@ -249,6 +269,7 @@ async fn fake_handle(
 #[derive(Default)]
 pub struct StaticAuthorizer {
     chains: HashMap<String, DelegationChain>,
+    revoked: Arc<Mutex<std::collections::HashSet<String>>>,
     decisions: Arc<Mutex<Vec<DecisionRecord>>>,
 }
 
@@ -267,6 +288,22 @@ impl StaticAuthorizer {
 
     pub fn insert(&mut self, bearer: impl Into<String>, chain: DelegationChain) {
         self.chains.insert(bearer.into(), chain);
+    }
+
+    /// Mark a bearer's lease revoked: `check_active` fails for it from now on, and so does
+    /// `authorize` (reason `lease_revoked`), like the real pipeline.
+    pub fn revoke(&self, bearer: &str) {
+        self.revoked
+            .lock()
+            .expect("revoked mutex")
+            .insert(bearer.to_owned());
+    }
+
+    fn is_revoked(&self, chain: &DelegationChain) -> bool {
+        let revoked = self.revoked.lock().expect("revoked mutex");
+        self.chains
+            .iter()
+            .any(|(bearer, c)| c == chain && revoked.contains(bearer))
     }
 
     /// Every decision recorded so far, in order.
@@ -292,18 +329,34 @@ impl Authorizer for StaticAuthorizer {
         Ok(chain.clone())
     }
 
+    async fn check_active(
+        &self,
+        chain: &DelegationChain,
+        _now: OffsetDateTime,
+    ) -> Result<(), AuthError> {
+        if self.is_revoked(chain) {
+            Err(AuthError::LeaseInactive("lease_revoked".into()))
+        } else {
+            Ok(())
+        }
+    }
+
     async fn authorize(
         &self,
         chain: &DelegationChain,
         call: &ToolCall,
         now: OffsetDateTime,
     ) -> AuthDecision {
-        let allowed = chain
-            .effective_capabilities()
-            .map(|caps| caps.permits(call))
-            .unwrap_or(false);
+        let revoked = self.is_revoked(chain);
+        let allowed = !revoked
+            && chain
+                .effective_capabilities()
+                .map(|caps| caps.permits(call))
+                .unwrap_or(false);
         let (decision, reason) = if allowed {
             (onbehalf_core::Decision::Allow, Self::REASON_ALLOW)
+        } else if revoked {
+            (onbehalf_core::Decision::Deny, "lease_revoked")
         } else {
             (onbehalf_core::Decision::Deny, Self::REASON_DENY)
         };

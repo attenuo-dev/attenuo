@@ -499,3 +499,277 @@ async fn expired_chain_is_rejected_at_authentication() -> anyhow::Result<()> {
         .contains("expired"));
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------------
+// Coverage beyond tools/call
+// ---------------------------------------------------------------------------------------------
+
+fn rpc_msg(id: u64, method: &str, params: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+}
+
+fn resource_reader_chain() -> DelegationChain {
+    test_chain(
+        "user:alice",
+        "agent:reader",
+        [Capability::new(SERVER, "resources/read")
+            .with_constraint("uri", ArgConstraint::Prefix("file:///public/".into()))],
+    )
+}
+
+#[tokio::test]
+async fn resources_read_allow_and_deny_by_uri() -> anyhow::Result<()> {
+    let h = Harness::start(
+        &["read_file"],
+        false,
+        vec![("tok", resource_reader_chain())],
+    )
+    .await?;
+
+    let ok = h
+        .rpc(
+            Some("tok"),
+            &rpc_msg(1, "resources/read", json!({"uri": "file:///public/a.txt"})),
+        )
+        .await?;
+    assert_eq!(ok.status(), 200);
+    assert!(ok.headers().contains_key(DECISION_ID_HEADER));
+    let body: Value = ok.json().await?;
+    assert!(body.get("error").is_none(), "{body}");
+    assert_eq!(body["result"]["contents"][0]["uri"], "file:///public/a.txt");
+
+    let no = h
+        .rpc(
+            Some("tok"),
+            &rpc_msg(2, "resources/read", json!({"uri": "file:///etc/passwd"})),
+        )
+        .await?;
+    let body: Value = no.json().await?;
+    assert_eq!(body["error"]["code"], CODE_DENIED, "{body}");
+    assert_eq!(body["error"]["data"]["reason"], "capability_denied");
+
+    // Only the allowed read reached the upstream; both were decided and recorded.
+    assert_eq!(h.upstream.recorded_methods(), vec!["resources/read"]);
+    let decisions = h.authorizer.decisions();
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(decisions[0].tool, "resources/read");
+    assert_eq!(decisions[1].tool, "resources/read");
+    Ok(())
+}
+
+#[tokio::test]
+async fn resources_subscribe_is_authorized_and_requires_uri() -> anyhow::Result<()> {
+    let chain = test_chain(
+        "user:alice",
+        "agent:sub",
+        [Capability::new(SERVER, "resources/subscribe")],
+    );
+    let h = Harness::start(&[], false, vec![("tok", chain), ("reader", reader_chain())]).await?;
+    let ok = h
+        .rpc(
+            Some("tok"),
+            &rpc_msg(1, "resources/subscribe", json!({"uri": "file:///x"})),
+        )
+        .await?;
+    assert!(ok.json::<Value>().await?.get("error").is_none());
+    let no = h
+        .rpc(
+            Some("reader"),
+            &rpc_msg(2, "resources/subscribe", json!({"uri": "file:///x"})),
+        )
+        .await?;
+    assert_eq!(no.json::<Value>().await?["error"]["code"], CODE_DENIED);
+    let bad = h
+        .rpc(Some("tok"), &rpc_msg(3, "resources/subscribe", json!({})))
+        .await?;
+    assert_eq!(bad.json::<Value>().await?["error"]["code"], -32602);
+    assert_eq!(h.upstream.recorded_methods(), vec!["resources/subscribe"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn prompts_get_is_denied_without_capability_and_allowed_with_one() -> anyhow::Result<()> {
+    let prompter = test_chain(
+        "user:alice",
+        "agent:prompter",
+        [Capability::new(SERVER, "prompts/get")
+            .with_constraint("name", ArgConstraint::Prefix("safe-".into()))],
+    );
+    let h = Harness::start(
+        &["read_file"],
+        false,
+        vec![("reader", reader_chain()), ("prompter", prompter)],
+    )
+    .await?;
+    let call = rpc_msg(
+        1,
+        "prompts/get",
+        json!({"name": "safe-summary", "arguments": {"topic": "x"}}),
+    );
+
+    // `read_*` on the server does not cover a prompt.
+    let denied = h.rpc(Some("reader"), &call).await?;
+    let body: Value = denied.json().await?;
+    assert_eq!(body["error"]["code"], CODE_DENIED, "{body}");
+    assert!(h.upstream.recorded_methods().is_empty());
+
+    let ok = h.rpc(Some("prompter"), &call).await?;
+    assert!(ok.json::<Value>().await?.get("error").is_none());
+    let wrong_name = h
+        .rpc(
+            Some("prompter"),
+            &rpc_msg(2, "prompts/get", json!({"name": "admin-reset"})),
+        )
+        .await?;
+    assert_eq!(
+        wrong_name.json::<Value>().await?["error"]["code"],
+        CODE_DENIED
+    );
+    assert_eq!(h.upstream.recorded_methods(), vec!["prompts/get"]);
+
+    // The decision saw the mapped tool name and arguments.
+    let rec = &h.authorizer.decisions()[0];
+    assert_eq!(rec.tool, "prompts/get");
+    assert_eq!(
+        rec.arguments_digest,
+        onbehalf_core::ToolCall::new(
+            SERVER,
+            "prompts/get",
+            json!({"name": "safe-summary", "arguments": {"topic": "x"}})
+        )
+        .arguments_digest()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn completion_complete_is_authorized() -> anyhow::Result<()> {
+    let h = Harness::start(&[], false, vec![("reader", reader_chain())]).await?;
+    let resp = h
+        .rpc(
+            Some("reader"),
+            &rpc_msg(
+                1,
+                "completion/complete",
+                json!({"ref": {"type": "ref/prompt", "name": "p"},
+                       "argument": {"name": "a", "value": "x"}}),
+            ),
+        )
+        .await?;
+    assert_eq!(resp.json::<Value>().await?["error"]["code"], CODE_DENIED);
+    assert!(h.upstream.recorded_methods().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn unknown_methods_are_denied_by_default() -> anyhow::Result<()> {
+    let h = Harness::start(
+        &["read_file"],
+        false,
+        vec![
+            ("reader", reader_chain()),
+            (
+                "sampler",
+                test_chain(
+                    "user:alice",
+                    "agent:sampler",
+                    [Capability::new(SERVER, "sampling/createMessage")],
+                ),
+            ),
+        ],
+    )
+    .await?;
+    for method in ["sampling/createMessage", "vendor/exfiltrate", "tools/typo"] {
+        let resp = h
+            .rpc(Some("reader"), &rpc_msg(1, method, json!({"x": 1})))
+            .await?;
+        let body: Value = resp.json().await?;
+        assert_eq!(body["error"]["code"], CODE_DENIED, "{method}: {body}");
+    }
+    assert!(h.upstream.recorded_methods().is_empty());
+    assert_eq!(h.authorizer.decisions()[0].tool, "sampling/createMessage");
+
+    // An explicit capability opts a method in (the fake upstream then answers -32601).
+    let resp = h
+        .rpc(
+            Some("sampler"),
+            &rpc_msg(2, "sampling/createMessage", json!({})),
+        )
+        .await?;
+    let body: Value = resp.json().await?;
+    assert_eq!(body["error"]["code"], -32601, "{body}");
+    assert_eq!(
+        h.upstream.recorded_methods(),
+        vec!["sampling/createMessage"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn allowlisted_methods_and_notifications_still_pass() -> anyhow::Result<()> {
+    let h = Harness::start(&["read_file"], false, vec![("tok", reader_chain())]).await?;
+    for (i, method) in ["initialize", "ping", "tools/list"].iter().enumerate() {
+        let resp = h
+            .rpc(Some("tok"), &rpc_msg(i as u64, method, json!({})))
+            .await?;
+        assert_eq!(resp.status(), 200, "{method}");
+        assert!(resp.json::<Value>().await?.get("error").is_none());
+    }
+    let resp = h
+        .rpc(
+            Some("tok"),
+            &json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        )
+        .await?;
+    assert_eq!(resp.status(), 202);
+    assert!(h.authorizer.decisions().is_empty(), "no per-call decisions");
+    Ok(())
+}
+
+#[tokio::test]
+async fn revoked_token_cannot_list_tools_or_use_session_requests() -> anyhow::Result<()> {
+    let h = Harness::start(&["read_file"], false, vec![("tok", reader_chain())]).await?;
+    let list = rpc_msg(1, "tools/list", json!({}));
+    assert_eq!(h.rpc(Some("tok"), &list).await?.status(), 200);
+
+    h.authorizer.revoke("tok");
+
+    let resp = h.rpc(Some("tok"), &list).await?;
+    assert_eq!(resp.status(), 401);
+    let body: Value = resp.json().await?;
+    assert_eq!(body["error"]["code"], CODE_UNAUTHORIZED);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("lease_revoked"));
+
+    // Other allowlisted methods too.
+    let resp = h.rpc(Some("tok"), &rpc_msg(2, "ping", json!({}))).await?;
+    assert_eq!(resp.status(), 401);
+
+    // GET (listen stream) and DELETE (end session) are checked as well.
+    for method in [reqwest::Method::GET, reqwest::Method::DELETE] {
+        let resp = h
+            .client
+            .request(method.clone(), h.proxy.url(&format!("/mcp/{SERVER}")))
+            .bearer_auth("tok")
+            .send()
+            .await?;
+        assert_eq!(resp.status(), 401, "{method}");
+    }
+
+    // A batch mixing a decided call with a list: the call is denied (and recorded), the list
+    // is refused, nothing reaches the upstream.
+    let batch = json!([
+        tools_call(3, "read_file", json!({})),
+        rpc_msg(4, "tools/list", json!({}))
+    ]);
+    let resp = h.rpc(Some("tok"), &batch).await?;
+    assert_eq!(resp.status(), 200);
+    let items: Vec<Value> = resp.json().await?;
+    let by_id = |id: u64| items.iter().find(|m| m["id"] == id).unwrap().clone();
+    assert_eq!(by_id(3)["error"]["code"], CODE_DENIED);
+    assert_eq!(by_id(4)["error"]["code"], CODE_UNAUTHORIZED);
+    assert_eq!(h.upstream.recorded_methods(), vec!["tools/list"]);
+    Ok(())
+}

@@ -3,6 +3,7 @@
 pub mod admin;
 pub mod authzen;
 pub mod dev_root;
+pub mod renew;
 pub mod token;
 pub mod wellknown;
 
@@ -20,6 +21,8 @@ use crate::state::AppState;
 pub const AUDIT_SERVER: &str = "onbehalf";
 /// Audit `reason` for a successful token issuance (root mint or exchange).
 pub const REASON_TOKEN_ISSUED: &str = "token_issued";
+/// Audit `reason` for a successful lease renewal.
+pub const REASON_LEASE_RENEWED: &str = "lease_renewed";
 
 pub(crate) fn now() -> OffsetDateTime {
     OffsetDateTime::now_utc()
@@ -71,15 +74,21 @@ pub(crate) fn audit_issuance(
     arguments: Value,
     now: OffsetDateTime,
 ) -> Result<uuid::Uuid, ApiError> {
+    audit_event(state, REASON_TOKEN_ISSUED, tool, chain, arguments, now)
+}
+
+/// Record a server-performed event (issuance, lease renewal) as an `allow` decision record
+/// with the given `reason`, server `onbehalf` and `tool` naming the event.
+pub(crate) fn audit_event(
+    state: &AppState,
+    reason: &str,
+    tool: &str,
+    chain: &DelegationChain,
+    arguments: Value,
+    now: OffsetDateTime,
+) -> Result<uuid::Uuid, ApiError> {
     let call = ToolCall::new(AUDIT_SERVER, tool, arguments);
-    let record = DecisionRecord::new(
-        now,
-        Decision::Allow,
-        REASON_TOKEN_ISSUED,
-        chain,
-        &call,
-        Vec::new(),
-    );
+    let record = DecisionRecord::new(now, Decision::Allow, reason, chain, &call, Vec::new());
     let id = record.id;
     onbehalf_audit::AuditSink::append(state.audit.as_ref(), record)?;
     Ok(id)

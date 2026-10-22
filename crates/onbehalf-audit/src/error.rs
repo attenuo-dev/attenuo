@@ -20,6 +20,9 @@ pub enum AuditError {
     /// A lease operation referred to an id the store has never seen.
     #[error("unknown lease `{0}`")]
     UnknownLease(String),
+    /// A lease cannot be renewed because it has been revoked.
+    #[error("lease `{0}` is revoked")]
+    LeaseRevoked(String),
 }
 
 impl<T> From<std::sync::PoisonError<T>> for AuditError {

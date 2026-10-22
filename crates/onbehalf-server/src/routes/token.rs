@@ -68,9 +68,11 @@ pub async fn exchange(
         .last()
         .ok_or_else(|| ApiError::internal("issued token has no hops"))?;
     let parent_lease = parent.chain.hops.last().map(|h| &h.lease);
-    state
-        .leases
-        .register(&resp.lease, parent_lease, hop.expires_at)?;
+    state.leases.register(
+        &resp.lease,
+        parent_lease,
+        state.initial_lease_expiry(now, hop.expires_at),
+    )?;
 
     let args = json!({
         "actor": req.actor,

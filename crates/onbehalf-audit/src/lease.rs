@@ -39,6 +39,18 @@ pub trait LeaseStore: Send + Sync {
     fn revoke(&self, lease: &LeaseId, reason: &str, now: OffsetDateTime)
         -> Result<u64, AuditError>;
 
+    /// Set the expiry of `lease` to `new_expires_at` (a heartbeat). The caller computes the
+    /// new value and is responsible for capping it (token expiry, parent lease); the store
+    /// only refuses leases it must not revive: an unknown id is [`AuditError::UnknownLease`]
+    /// and a revoked one is [`AuditError::LeaseRevoked`]. An expired but unrevoked lease may
+    /// be renewed. Revocation state and the parent link are untouched.
+    fn renew(
+        &self,
+        lease: &LeaseId,
+        new_expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<(), AuditError>;
+
     /// Known, not revoked, and `expires_at > now`.
     fn is_active(&self, lease: &LeaseId, now: OffsetDateTime) -> Result<bool, AuditError>;
 
@@ -154,6 +166,23 @@ impl LeaseStore for MemoryLeaseStore {
             );
         }
         Ok(revoked)
+    }
+
+    fn renew(
+        &self,
+        lease: &LeaseId,
+        new_expires_at: OffsetDateTime,
+        _now: OffsetDateTime,
+    ) -> Result<(), AuditError> {
+        let mut rows = self.rows.lock()?;
+        let row = rows
+            .get_mut(lease)
+            .ok_or_else(|| AuditError::UnknownLease(lease.0.clone()))?;
+        if row.revoked_at.is_some() {
+            return Err(AuditError::LeaseRevoked(lease.0.clone()));
+        }
+        row.expires_at = new_expires_at;
+        Ok(())
     }
 
     fn is_active(&self, lease: &LeaseId, now: OffsetDateTime) -> Result<bool, AuditError> {

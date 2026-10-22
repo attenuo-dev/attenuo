@@ -49,6 +49,9 @@ pub enum AuthError {
     MissingToken,
     #[error("invalid token: {0}")]
     InvalidToken(String),
+    /// The token is valid but a lease in its chain is revoked, expired or unknown.
+    #[error("lease inactive: {0}")]
+    LeaseInactive(String),
 }
 
 /// Authentication and authorization, as the proxy sees it.
@@ -61,6 +64,16 @@ pub trait Authorizer: Send + Sync {
         bearer: &str,
         now: OffsetDateTime,
     ) -> Result<DelegationChain, AuthError>;
+
+    /// Is every lease of `chain` live at `now`? Called for requests that are forwarded
+    /// without a per-call decision (`tools/list`, `initialize`, `ping`, `GET`/`DELETE` session
+    /// requests), so a revoked or lapsed token cannot use them either. `Err` carries the
+    /// reason (for example `lease_revoked`). Implementations must fail closed.
+    async fn check_active(
+        &self,
+        chain: &DelegationChain,
+        now: OffsetDateTime,
+    ) -> Result<(), AuthError>;
 
     /// Decide one call. Implementations must also record the decision (audit) and return the
     /// record's id in [`AuthDecision::decision_id`].

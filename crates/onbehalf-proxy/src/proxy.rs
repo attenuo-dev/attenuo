@@ -22,8 +22,9 @@ use crate::auth::{AuthError, Authorizer};
 use crate::config::ProxyConfig;
 use crate::filter::filter_tools_response;
 use crate::jsonrpc::{
-    self, denied_response, error_response, id_of, is_request, method_of, CODE_INVALID_PARAMS,
-    CODE_INVALID_REQUEST, CODE_PARSE_ERROR, CODE_UNAUTHORIZED, CODE_UNKNOWN_SERVER, CODE_UPSTREAM,
+    self, denied_response, error_response, id_of, is_passthrough_method, is_request, method_of,
+    CODE_INVALID_PARAMS, CODE_INVALID_REQUEST, CODE_PARSE_ERROR, CODE_UNAUTHORIZED,
+    CODE_UNKNOWN_SERVER, CODE_UPSTREAM,
 };
 
 /// Response header carrying the decision record id(s) of every `tools/call` in the request,
@@ -205,6 +206,9 @@ async fn handle_passthrough(
         Ok(c) => c,
         Err(e) => return unauthorized(e),
     };
+    if let Err(e) = state.authorizer.check_active(&chain, now).await {
+        return unauthorized(e);
+    }
     let session_id = header_str(&headers, HEADER_MCP_SESSION_ID).map(str::to_owned);
     let span = request_span(&server, &chain, session_id.as_deref());
     async move {
@@ -249,6 +253,9 @@ struct Screened {
     decision_ids: Vec<Uuid>,
     /// Ids of `tools/list` requests, whose responses must be filtered.
     tools_list_ids: Vec<Value>,
+    /// Result of the lease check made for messages forwarded without a per-call decision;
+    /// made at most once per HTTP request.
+    lease_check: Option<Result<(), AuthError>>,
 }
 
 async fn handle_post(
@@ -334,6 +341,14 @@ async fn handle_post_inner(
         screen_message(state, chain, server, session_id, msg, now, &mut screened).await;
     }
 
+    // A single message that was refused only because the token's lease is inactive is an
+    // authentication failure for the whole request.
+    if !is_batch && screened.forward.is_empty() && screened.decision_ids.is_empty() {
+        if let Some(Err(e)) = screened.lease_check.take() {
+            return unauthorized(e);
+        }
+    }
+
     // Nothing left to forward: answer locally.
     if screened.forward.is_empty() {
         let body = if is_batch {
@@ -402,7 +417,12 @@ async fn handle_post_inner(
     response
 }
 
-/// Classify one JSON-RPC message: authorize `tools/call`, note `tools/list`, forward the rest.
+/// Classify one JSON-RPC message and route it. See the method table in the crate docs.
+///
+/// - `tools/call`, `resources/read`, `resources/subscribe`, `prompts/get`,
+///   `completion/complete` and every unrecognised non-notification method get an
+///   authorization decision; only an allow is forwarded.
+/// - Allowlisted methods and `notifications/*` are forwarded, after a lease check.
 async fn screen_message(
     state: &AppState,
     chain: &DelegationChain,
@@ -413,55 +433,136 @@ async fn screen_message(
     out: &mut Screened,
 ) {
     let method = method_of(&msg).map(str::to_owned);
-    match method.as_deref() {
-        Some(jsonrpc::METHOD_TOOLS_CALL) => {
-            let id = id_of(&msg);
-            let params = msg.get("params");
-            let Some(name) = params
-                .and_then(|p| p.get("name"))
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-            else {
-                tracing::warn!("tools/call without params.name rejected");
-                out.replies.push(error_response(
-                    id,
-                    CODE_INVALID_PARAMS,
-                    "onbehalf: invalid params: tools/call requires params.name",
-                    None,
-                ));
+    let Some(method) = method else {
+        // A response to a server-initiated request, or something malformed: the upstream
+        // decides. Still requires a live lease.
+        if lease_live(state, chain, &msg, now, out).await {
+            out.forward.push(msg);
+        }
+        return;
+    };
+
+    if is_passthrough_method(&method) {
+        if !lease_live(state, chain, &msg, now, out).await {
+            return;
+        }
+        if method == jsonrpc::METHOD_TOOLS_LIST && is_request(&msg) {
+            out.tools_list_ids.push(id_of(&msg));
+        }
+        out.forward.push(msg);
+        return;
+    }
+
+    // Everything else needs a decision. Work out the ToolCall.
+    let id = id_of(&msg);
+    let params = msg.get("params");
+    let str_param = |key: &str| {
+        params
+            .and_then(|p| p.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    let invalid = |detail: &str| {
+        tracing::warn!(%method, "{detail}");
+        error_response(
+            id.clone(),
+            CODE_INVALID_PARAMS,
+            format!("onbehalf: invalid params: {detail}"),
+            None,
+        )
+    };
+    let (tool, arguments) = match method.as_str() {
+        jsonrpc::METHOD_TOOLS_CALL => {
+            let Some(name) = str_param("name") else {
+                out.replies.push(invalid("tools/call requires params.name"));
                 return;
             };
             let arguments = params
                 .and_then(|p| p.get("arguments"))
                 .cloned()
                 .unwrap_or_else(|| Value::Object(Default::default()));
-            let mut call = ToolCall::new(server, name.clone(), arguments);
-            if let Some(sid) = session_id {
-                call = call.with_session(sid);
-            }
-            let verdict = state.authorizer.authorize(chain, &call, now).await;
-            tracing::info!(
-                tool = %name,
-                decision = ?verdict.decision,
-                reason = %verdict.reason,
-                decision_id = %verdict.decision_id,
-                "tools/call authorized"
-            );
-            out.decision_ids.push(verdict.decision_id);
-            if verdict.is_allow() {
-                out.forward.push(msg);
-            } else {
+            (name, arguments)
+        }
+        jsonrpc::METHOD_RESOURCES_READ | jsonrpc::METHOD_RESOURCES_SUBSCRIBE => {
+            let Some(uri) = str_param("uri") else {
                 out.replies
-                    .push(denied_response(id, &verdict.reason, verdict.decision_id));
-            }
+                    .push(invalid(&format!("{method} requires params.uri")));
+                return;
+            };
+            (method.clone(), serde_json::json!({ "uri": uri }))
         }
-        Some(jsonrpc::METHOD_TOOLS_LIST) => {
-            if is_request(&msg) {
-                out.tools_list_ids.push(id_of(&msg));
-            }
-            out.forward.push(msg);
+        jsonrpc::METHOD_PROMPTS_GET => {
+            let Some(name) = str_param("name") else {
+                out.replies
+                    .push(invalid("prompts/get requires params.name"));
+                return;
+            };
+            let arguments = params
+                .and_then(|p| p.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Default::default()));
+            (
+                method.clone(),
+                serde_json::json!({ "name": name, "arguments": arguments }),
+            )
         }
-        _ => out.forward.push(msg),
+        // `completion/complete` and unknown methods: the whole params object is the input.
+        _ => (
+            method.clone(),
+            params
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Default::default())),
+        ),
+    };
+
+    let mut call = ToolCall::new(server, tool.clone(), arguments);
+    if let Some(sid) = session_id {
+        call = call.with_session(sid);
+    }
+    let verdict = state.authorizer.authorize(chain, &call, now).await;
+    tracing::info!(
+        %method,
+        tool = %tool,
+        decision = ?verdict.decision,
+        reason = %verdict.reason,
+        decision_id = %verdict.decision_id,
+        "request authorized"
+    );
+    out.decision_ids.push(verdict.decision_id);
+    if verdict.is_allow() {
+        out.forward.push(msg);
+    } else {
+        out.replies
+            .push(denied_response(id, &verdict.reason, verdict.decision_id));
+    }
+}
+
+/// Lease check for a message forwarded without a decision. On failure, a request gets a
+/// `-32001` reply and a notification is dropped; returns whether to forward.
+async fn lease_live(
+    state: &AppState,
+    chain: &DelegationChain,
+    msg: &Value,
+    now: OffsetDateTime,
+    out: &mut Screened,
+) -> bool {
+    if out.lease_check.is_none() {
+        out.lease_check = Some(state.authorizer.check_active(chain, now).await);
+    }
+    match out.lease_check.as_ref() {
+        Some(Err(e)) => {
+            tracing::warn!(error = %e, "request refused: lease inactive");
+            if is_request(msg) {
+                out.replies.push(error_response(
+                    id_of(msg),
+                    CODE_UNAUTHORIZED,
+                    format!("onbehalf: unauthorized: {e}"),
+                    None,
+                ));
+            }
+            false
+        }
+        _ => true,
     }
 }
 
