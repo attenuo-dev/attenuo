@@ -18,11 +18,11 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 
 - [ ] Token claims: proposed extensions from RFC-0001 section 3.1: `evidence` on the originating user (how the IdP credential was verified), a stable `chain_id`, `may_act` and a verified `actor_token`, numeric and time-range constraints. Reconcile or drop each.
 - [ ] Hop 0 from an OIDC ID token (JWKS fetch, `iss`/`aud`/`exp` checks) and from an ID-JAG assertion.
-- [ ] Leases: `/lease/{id}/renew`, `/revoke` by user, session, chain, token; descendant revocation; proxy cache bounded by TTL; integration test that a revoked parent denies the child's next call within one TTL.
+- [ ] Leases: `/lease/{id}/renew`, `/revoke` by user, session, chain (revoke by lease id with descendant cascade is done in the server); proxy cache bounded by TTL.
 - [ ] Multi-hop demo: planner agent → coder sub-agent → GitHub tool, three exchanges, attenuated at each.
-- [ ] AuthZEN `POST /access/v1/evaluation` with the request shape in RFC-0001 §5; conformance fixtures.
+- [ ] AuthZEN conformance fixtures (the endpoint itself is done).
 - [ ] Audit: signed checkpoints every N records; `kind` for `issue`, `decision`, `renew`, `revoke`, `checkpoint`.
-- [ ] Policy hot reload with schema validation; reject reload on validation failure, keep last good set.
+- [ ] Server: real admin authentication, `actor_token` verification on exchange, `kid` in token headers, audit failed exchanges.
 - [ ] CI: fmt, clippy `-D warnings`, tests, proptest with fixed seed in CI and random locally.
 - [ ] AgentDojo / InjecAgent harness: run a no-policy baseline and an onbehalf-enforced run; report attack success and utility.
 
@@ -41,3 +41,7 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 
 - [x] Repository skeleton: workspace, CI, licence, docs vault.
 - [x] RFC-0001, threat model, ADR-0001 to ADR-0004, research notes (standards, incidents, related work).
+- [x] `onbehalf-server`: config, `/token` (RFC 8693), JWKS endpoint, dev root mint, proxy with real authorizer, admin leases/audit endpoints ([design](../design/server.md)).
+- [x] AuthZEN `POST /access/v1/evaluation` served by the same pipeline as the proxy; bearer or body chain.
+- [x] Lease revocation cascade: integration test that revoking the root lease denies the child's next call (`lease_revoked`).
+- [x] Policy hot reload with schema validation (`POST /admin/policies/reload`); invalid set rejected with 422, last good set kept.
