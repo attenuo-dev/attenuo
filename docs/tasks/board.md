@@ -17,6 +17,8 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 - [ ] Security SR-09 (high): revoked tokens still pass `authenticate`; check leases on every proxied HTTP request (GET/DELETE, `tools/list`, all methods), not only in `tools/call` decisions. Method coverage is on `feat/leases-and-coverage`.
 - [ ] Security SR-10 (high): `actor` on exchange is unauthenticated, so agent ids in policy and audit are spoofable; verify `actor_token`/`may_act`, reject duplicate agent ids at exchange.
 
+- [x] Policy test harness: `onbehalf policy test` (YAML cases through the real `PolicyEngine`) and `onbehalf policy lint`; guide in [guides/writing-policies.md](../guides/writing-policies.md).
+
 ## Next
 
 - [ ] Security review follow-ups ([review](../research/security-review-2026-10-22.md)): SR-11 bind `Mcp-Session-Id` to the token's subject and root lease; SR-12 deny tools missing from the catalog (or default them to `sensitive`); SR-15 refuse the example admin token on a non-loopback bind; SR-13 server-scoped actions or documented `resource in Server::` pinning; SR-14 domain-separate `ou_sig` and bind it to `iss` and hop 0; SR-16 `validate_at` checks for `issued_at`, duplicate leases/agents, empty ids; SR-17 reason codes only in client-facing errors; SR-18 escape untrusted log fields; SR-19 require `public_url` off loopback; SR-20 RFC 8785 canonicalization (`preserve_order` is on workspace-wide); SR-22 move SQLite off the async workers; SR-23 filter `tools/list` over SSE; SR-24 exchange rate limits per lease; SR-25 name normalization; SR-26 resolve the `cargo deny` licence failure (`webpki-roots`, CDLA-Permissive-2.0) and add `cargo audit` to CI.
@@ -27,6 +29,7 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 - [ ] Leases: revoke by user, session, chain (revoke by lease id with descendant cascade and `POST /token/renew` are done); optional proxy cache bounded by TTL; audit failed renewals.
 - [ ] Proxy: filter `resources/list`, `resources/templates/list` and `prompts/list` results by capability; decide whether `resources/unsubscribe` joins the allowlist.
 - [ ] Multi-hop demo: planner agent → coder sub-agent → GitHub tool, three exchanges, attenuated at each.
+- [ ] Policy harness follow-ups: report which policies no case exercised, run cases through the AuthZEN endpoint too, a `--schema-file` for custom base schemas, `onbehalf policy test --watch`.
 - [ ] AuthZEN conformance fixtures (the endpoint itself is done).
 - [ ] Audit: signed checkpoints every N records; `kind` for `issue`, `decision`, `renew`, `revoke`, `checkpoint`.
 - [ ] Server: real admin authentication, `actor_token` verification on exchange, `kid` in token headers, audit failed exchanges.

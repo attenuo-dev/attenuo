@@ -104,6 +104,8 @@ export ONBEHALF_ADMIN_TOKEN="demo-admin-token"
 say "Setup"
 note "onbehalf at $ONBEHALF_SERVER proxies a fake GitHub MCP server at port $MCP_PORT as 'github'."
 note "Policy: read_file only when repo like \"alice/public-*\". See policy.cedar."
+note "The policy has its own tests (policy_test.yaml). They run offline, before any server traffic."
+step 0 'onbehalf policy test examples/github-leak-demo/policy_test.yaml'
 
 say "1. Alice's assistant gets a broad token (any github tool), like the over-privileged PAT"
 step 0 'onbehalf token root --subject alice --agent assistant --cap "github:*"'

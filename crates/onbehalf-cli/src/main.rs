@@ -6,6 +6,7 @@
 mod cli;
 mod client;
 mod jwt;
+mod policy_cmd;
 mod render;
 
 use std::io::Read;
@@ -40,6 +41,17 @@ async fn main() -> ExitCode {
             eprintln!("error: {e:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Print an offline command's output and map its status to the exit code.
+fn finish(run: policy_cmd::Run, error: &str) -> Result<Outcome> {
+    print!("{}", run.stdout);
+    eprint!("{}", run.stderr);
+    match run.status {
+        policy_cmd::Status::Ok => Ok(Outcome::Ok),
+        policy_cmd::Status::Failed => Ok(Outcome::No),
+        policy_cmd::Status::Error => Err(anyhow::anyhow!("{error}")),
     }
 }
 
@@ -173,6 +185,17 @@ async fn run(cli: Cli) -> Result<Outcome> {
             }
             Ok(if ok { Outcome::Ok } else { Outcome::No })
         }
+        Command::Policy(PolicyCmd::Test { files }) => {
+            finish(policy_cmd::test(&files, json), "policy test failed to run")
+        }
+        Command::Policy(PolicyCmd::Lint {
+            policy,
+            config,
+            schema,
+        }) => finish(
+            policy_cmd::lint(&policy, config.as_deref(), schema, json),
+            "policy lint failed to run",
+        ),
         Command::Policy(PolicyCmd::Reload) => {
             let resp = client?
                 .admin_post("/admin/policies/reload", &json!({}))

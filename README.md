@@ -14,6 +14,7 @@ Delegated authorization for software agents. onbehalf lets a principal hand an a
 - [RFC-0001: onbehalf](docs/spec/rfc-0001-onbehalf.md): what the system is, the token model, the policy and audit design.
 - [docs/](docs/README.md): specifications, architecture decisions, research notes, task board and engineering log.
 - [examples/github-leak-demo](examples/github-leak-demo/README.md): the May 2025 GitHub MCP prompt-injection leak, replayed and stopped (`run.sh`, about a minute).
+- [docs/guides/writing-policies.md](docs/guides/writing-policies.md): writing Cedar policies for agents and testing them offline with `onbehalf policy test` and `onbehalf policy lint`, including a CI recipe.
 - [CONTRIBUTING.md](CONTRIBUTING.md): how to build, test and submit changes.
 - [SECURITY.md](SECURITY.md): how to report a vulnerability. Please do not file security issues publicly.
 - [CHANGELOG.md](CHANGELOG.md), [GOVERNANCE.md](GOVERNANCE.md), [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).

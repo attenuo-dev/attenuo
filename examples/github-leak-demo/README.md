@@ -14,6 +14,15 @@ examples/github-leak-demo/run.sh
 
 It needs a Rust toolchain, `curl` and `python3`. The first run compiles the workspace. Ports are picked at random, everything lives in a temp directory, and an exit trap stops both servers and removes the directory (`KEEP=1` keeps it for the logs). The script exits non-zero if any step does not come out as described below, so it can also run in CI. A real run is in [transcript.md](transcript.md).
 
+The policy has its own tests, which need no server (`run.sh` runs them first):
+
+```sh
+cargo run -q -p onbehalf-cli -- policy test examples/github-leak-demo/policy_test.yaml
+cargo run -q -p onbehalf-cli -- policy lint examples/github-leak-demo/policy.cedar --config examples/github-leak-demo/config.toml
+```
+
+See [writing-policies](../../docs/guides/writing-policies.md#testing-policies).
+
 ## What happens
 
 | Step | Call | Result | Why |
@@ -33,7 +42,8 @@ At the end the script prints what the fake GitHub server received: one `tools/ca
 ## Files
 
 - `config.toml`: server config with the catalog, the upstream, the admin token and alice's root grant. `run.sh` rewrites the ports and the policy path in a copy.
-- `policy.cedar`: the one permit rule, `read_file` only when `repo like "alice/public-*"`.
+- `policy.cedar`: the one permit rule, `read_file` only when `repo like "alice/public-*"`, plus two guard-rail forbids (sensitive tools without MFA, chains deeper than three).
+- `policy_test.yaml`: nine cases for that policy, run by `onbehalf policy test`.
 - `config.docker.toml`: the same, for `docker-compose.yml` at the repository root (untested).
 - `run.sh`, `transcript.md`.
 
