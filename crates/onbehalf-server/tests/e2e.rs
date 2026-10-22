@@ -568,8 +568,8 @@ async fn authzen_matches_proxy_decisions() {
 
     // A chain this server never issued has unknown leases.
     let mut forged = chain.clone();
-    for hop in &mut forged.hops {
-        hop.lease = onbehalf_core::LeaseId::new("forged");
+    for (i, hop) in forged.hops.iter_mut().enumerate() {
+        hop.lease = onbehalf_core::LeaseId::new(format!("forged-{i}"));
     }
     let body = serde_json::to_value(authzen::to_request(&forged, &call)).unwrap();
     let az: Value = h.authzen(None, body).await.json().await.unwrap();
