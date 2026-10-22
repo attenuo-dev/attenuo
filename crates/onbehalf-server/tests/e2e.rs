@@ -817,3 +817,311 @@ async fn jwks_verifies_issued_tokens_and_health_is_ok() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Scenario 7: lease renewal and expiry.
+// ---------------------------------------------------------------------------------------------
+
+use onbehalf_audit::LeaseStore;
+use onbehalf_core::LeaseId;
+use time::{Duration, OffsetDateTime};
+
+impl Harness {
+    fn lease_expiry(&self, lease: &str) -> OffsetDateTime {
+        self.state
+            .leases
+            .get(&LeaseId::new(lease))
+            .unwrap()
+            .unwrap()
+            .expires_at
+    }
+
+    /// Force a lease's expiry, as if time had passed since the last renewal.
+    fn set_lease_expiry(&self, lease: &str, at: OffsetDateTime) {
+        self.state
+            .leases
+            .renew(&LeaseId::new(lease), at, OffsetDateTime::now_utc())
+            .unwrap();
+    }
+
+    async fn renew_raw(&self, token: Option<&str>) -> reqwest::Response {
+        let mut req = self.client.post(self.url("/token/renew"));
+        if let Some(t) = token {
+            req = req.bearer_auth(t);
+        }
+        req.send().await.unwrap()
+    }
+}
+
+fn near(a: OffsetDateTime, b: OffsetDateTime) -> bool {
+    (a - b).abs() < Duration::seconds(5)
+}
+
+#[tokio::test]
+async fn leases_are_issued_with_the_lease_interval_not_the_token_ttl() {
+    let h = Harness::start().await;
+    let now = OffsetDateTime::now_utc();
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    // Default token TTL is 900 s, default lease interval 300 s.
+    assert!(near(
+        h.lease_expiry(&root.lease),
+        now + Duration::seconds(300)
+    ));
+    let child = h
+        .exchange(&root.token, "coder", &["github:read_file"])
+        .await;
+    assert!(near(
+        h.lease_expiry(&child.lease),
+        now + Duration::seconds(300)
+    ));
+}
+
+#[tokio::test]
+async fn renew_extends_by_the_interval_and_is_audited() {
+    let h = Harness::start().await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let soon = OffsetDateTime::now_utc() + Duration::seconds(20);
+    h.set_lease_expiry(&root.lease, soon);
+
+    let resp = h.renew_raw(Some(&root.token)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["lease"], json!(root.lease));
+    let expires_at = OffsetDateTime::parse(
+        v["expires_at"].as_str().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    assert!(near(
+        expires_at,
+        OffsetDateTime::now_utc() + Duration::seconds(300)
+    ));
+    assert_eq!(h.lease_expiry(&root.lease), expires_at);
+    assert!((298..=300).contains(&v["expires_in"].as_i64().unwrap()));
+
+    let entries = h.audit_entries().await;
+    let last = entries.last().unwrap();
+    assert_eq!(last["record"]["tool"], "lease.renew");
+    assert_eq!(last["record"]["reason"], "lease_renewed");
+    assert_eq!(last["record"]["server"], "onbehalf");
+}
+
+#[tokio::test]
+async fn renew_never_goes_beyond_token_expiry() {
+    let h = Harness::start().await;
+    let resp = h
+        .admin_post(
+            "/admin/root-token",
+            json!({"subject": "alice", "issuer": "https://idp.example", "agent": "planner",
+                   "capabilities": ["github:*"], "ttl_seconds": 100}),
+        )
+        .await;
+    let v: Value = resp.json().await.unwrap();
+    let token = v["access_token"].as_str().unwrap();
+    let lease = v["lease"].as_str().unwrap();
+    // Issued lease is capped by the 100 s token, not the 300 s interval.
+    let issued_exp = h.lease_expiry(lease);
+    assert!(near(
+        issued_exp,
+        OffsetDateTime::now_utc() + Duration::seconds(100)
+    ));
+    h.set_lease_expiry(lease, OffsetDateTime::now_utc() + Duration::seconds(10));
+
+    let resp = h.renew_raw(Some(token)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let renewed = h.lease_expiry(lease);
+    assert!(
+        near(renewed, issued_exp) && renewed <= issued_exp + Duration::seconds(1),
+        "{renewed} vs token exp {issued_exp}"
+    );
+}
+
+#[tokio::test]
+async fn renew_never_goes_beyond_the_parent_lease() {
+    let h = Harness::start().await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let child = h
+        .exchange(&root.token, "coder", &["github:read_file"])
+        .await;
+    let parent_exp = OffsetDateTime::now_utc() + Duration::seconds(60);
+    h.set_lease_expiry(&root.lease, parent_exp);
+    h.set_lease_expiry(
+        &child.lease,
+        OffsetDateTime::now_utc() + Duration::seconds(5),
+    );
+
+    let resp = h.renew_raw(Some(&child.token)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(h.lease_expiry(&child.lease), parent_exp);
+    // Renewing the child did not touch the parent.
+    assert_eq!(h.lease_expiry(&root.lease), parent_exp);
+}
+
+#[tokio::test]
+async fn unrenewed_lease_denies_even_though_the_jwt_is_valid() {
+    let h = Harness::start().await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let args = json!({"repo": "alice/public-site"});
+    assert!(allowed(
+        &h.call(&root.token, "read_file", args.clone()).await
+    ));
+
+    // The agent stops renewing: the lease lapses while the token is still good for minutes.
+    h.set_lease_expiry(
+        &root.lease,
+        OffsetDateTime::now_utc() - Duration::seconds(1),
+    );
+    let denied = h.call(&root.token, "read_file", args.clone()).await;
+    assert_eq!(denied_reason(&denied), "lease_expired");
+    assert_eq!(h.upstream.recorded_calls().len(), 1);
+
+    // tools/list needs a live lease as well.
+    let resp = h
+        .client
+        .post(h.url("/mcp/github"))
+        .bearer_auth(&root.token)
+        .json(&json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Renewing revives it (the lease lapsed but was not revoked).
+    assert_eq!(
+        h.renew_raw(Some(&root.token)).await.status(),
+        StatusCode::OK
+    );
+    assert!(allowed(&h.call(&root.token, "read_file", args).await));
+}
+
+#[tokio::test]
+async fn expired_parent_blocks_child_renewal_and_calls() {
+    let h = Harness::start().await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let child = h
+        .exchange(&root.token, "coder", &["github:read_file"])
+        .await;
+    h.set_lease_expiry(
+        &root.lease,
+        OffsetDateTime::now_utc() - Duration::seconds(1),
+    );
+
+    let resp = h.renew_raw(Some(&child.token)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err: Value = resp.json().await.unwrap();
+    assert_eq!(err["error"], "invalid_grant");
+    assert!(err["detail"].as_str().unwrap().contains("lease_expired"));
+
+    let denied = h
+        .call(&child.token, "read_file", json!({"repo": "alice/public-x"}))
+        .await;
+    assert_eq!(denied_reason(&denied), "lease_expired");
+
+    // Renewing the parent restores both.
+    assert_eq!(
+        h.renew_raw(Some(&root.token)).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.renew_raw(Some(&child.token)).await.status(),
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn revoked_lease_cannot_be_renewed_and_token_problems_are_401() {
+    let h = Harness::start().await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let child = h
+        .exchange(&root.token, "coder", &["github:read_file"])
+        .await;
+    h.admin_post(
+        &format!("/admin/leases/{}/revoke", root.lease),
+        json!({"reason": "logout"}),
+    )
+    .await;
+    let before = h.lease_expiry(&child.lease);
+
+    for token in [&root.token, &child.token] {
+        let resp = h.renew_raw(Some(token)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err: Value = resp.json().await.unwrap();
+        assert_eq!(err["error"], "invalid_grant");
+        assert!(err["detail"].as_str().unwrap().contains("lease_revoked"));
+    }
+    assert_eq!(h.lease_expiry(&child.lease), before, "no extension");
+
+    assert_eq!(
+        h.renew_raw(None).await.status(),
+        StatusCode::UNAUTHORIZED,
+        "no bearer"
+    );
+    assert_eq!(
+        h.renew_raw(Some("not.a.jwt")).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // The admin token is not a delegation token.
+    assert_eq!(
+        h.renew_raw(Some(ADMIN)).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn revoked_token_cannot_list_tools_over_the_proxy() {
+    let h = Harness::start().await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    assert!(!h.list_tools(&root.token).await.is_empty());
+    h.admin_post(
+        &format!("/admin/leases/{}/revoke", root.lease),
+        json!({"reason": "x"}),
+    )
+    .await;
+    let resp = h
+        .client
+        .post(h.url("/mcp/github"))
+        .bearer_auth(&root.token)
+        .json(&json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = h
+        .client
+        .get(h.url("/mcp/github"))
+        .bearer_auth(&root.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn resources_and_unknown_methods_are_authorized_through_the_pipeline() {
+    let h = Harness::start().await;
+    let root = h.mint_root("alice", "planner", &["github:read_file"]).await;
+    let denied = h
+        .rpc(
+            &root.token,
+            json!({"jsonrpc": "2.0", "id": 3, "method": "resources/read",
+                   "params": {"uri": "file:///etc/passwd"}}),
+        )
+        .await;
+    assert_eq!(denied_reason(&denied), "capability_denied");
+    let denied = h
+        .rpc(
+            &root.token,
+            json!({"jsonrpc": "2.0", "id": 4, "method": "vendor/x", "params": {}}),
+        )
+        .await;
+    assert_eq!(denied_reason(&denied), "capability_denied");
+    assert!(h.upstream.recorded_methods().is_empty());
+    // Both decisions are in the audit log under the method name.
+    let entries = h.audit_entries().await;
+    let tools: Vec<&str> = entries
+        .iter()
+        .filter_map(|e| e["record"]["tool"].as_str())
+        .collect();
+    assert!(tools.contains(&"resources/read") && tools.contains(&"vendor/x"));
+}

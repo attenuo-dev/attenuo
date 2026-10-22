@@ -16,6 +16,9 @@ issuer = "http://127.0.0.1:8080"
 audience = "onbehalf"
 max_depth = 8
 default_ttl_seconds = 900
+# How long a hop's lease lives after issuance or POST /token/renew (capped by the token's
+# expiry). An agent that stops renewing is denied after this long; revocation is immediate.
+lease_interval_seconds = 300
 # Ed25519 PKCS#8 key. Generated (mode 0600) on first start if missing; the public key is
 # logged and served at /.well-known/jwks.json. Omit to use an ephemeral key.
 private_key_pem_path = "data/issuer.pem"

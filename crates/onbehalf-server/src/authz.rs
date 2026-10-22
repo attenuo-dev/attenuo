@@ -201,6 +201,19 @@ impl Authorizer for ServerAuthorizer {
             .map_err(|e| AuthError::InvalidToken(e.to_string()))
     }
 
+    async fn check_active(
+        &self,
+        chain: &DelegationChain,
+        now: OffsetDateTime,
+    ) -> Result<(), AuthError> {
+        self.pipeline
+            .check_leases(chain, now)
+            .map_err(|(reason, detail)| {
+                tracing::warn!(reason, detail = %detail.join("; "), "lease check failed");
+                AuthError::LeaseInactive(reason.to_string())
+            })
+    }
+
     async fn authorize(
         &self,
         chain: &DelegationChain,
@@ -282,6 +295,45 @@ mod tests {
         );
         leases.revoke(&LeaseId::new("l1"), "test", now).unwrap();
         assert_eq!(p.decide(&chain, &ok, now).reason, REASON_LEASE_REVOKED);
+    }
+
+    #[test]
+    fn any_hop_with_an_unrenewed_lease_denies() {
+        let (p, leases, _audit, root) = setup();
+        let now = OffsetDateTime::now_utc();
+        let child = root
+            .extend(
+                AgentId::new("coder"),
+                CapabilitySet::from_iter([Capability::new("github", "read_file")]),
+                now,
+                Duration::minutes(30),
+                LeaseId::new("l2"),
+                8,
+            )
+            .unwrap();
+        leases
+            .register(&LeaseId::new("l1"), None, now + Duration::minutes(5))
+            .unwrap();
+        leases
+            .register(
+                &LeaseId::new("l2"),
+                Some(&LeaseId::new("l1")),
+                now + Duration::minutes(5),
+            )
+            .unwrap();
+        let call = ToolCall::new("github", "read_file", json!({}));
+        assert!(p.decide(&child, &call, now).is_allow());
+
+        // Parent lapses, child's own lease is fine: deny.
+        leases
+            .renew(&LeaseId::new("l1"), now - Duration::seconds(1), now)
+            .unwrap();
+        assert_eq!(p.decide(&child, &call, now).reason, REASON_LEASE_EXPIRED);
+        // Renewing the parent restores access; the audit trail has all three decisions.
+        leases
+            .renew(&LeaseId::new("l1"), now + Duration::minutes(5), now)
+            .unwrap();
+        assert!(p.decide(&child, &call, now).is_allow());
     }
 
     #[test]

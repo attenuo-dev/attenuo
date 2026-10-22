@@ -69,9 +69,11 @@ pub async fn mint_root(
         ttl,
         now,
     )?;
-    state
-        .leases
-        .register(&issued.lease, None, issued.expires_at)?;
+    state.leases.register(
+        &issued.lease,
+        None,
+        state.initial_lease_expiry(now, issued.expires_at),
+    )?;
     let args = json!({ "agent": req.agent, "requested": issued.chain.hops[0].capabilities });
     if let Err(e) = audit_issuance(&state, "token.root", &issued.chain, args, now) {
         let _ = state.leases.revoke(&issued.lease, "audit_error", now);

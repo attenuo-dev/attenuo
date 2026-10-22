@@ -9,6 +9,7 @@
 //! |---|---|---|
 //! | `POST /token` | client credentials + IdP credential | hop 0 from an OIDC ID token or ID-JAG ([`idp`]) |
 //! | `POST /token` | subject token in body | RFC 8693 exchange, hop n to n+1 |
+//! | `POST /token/renew` | delegation token (bearer) | extend the last hop's lease |
 //! | `POST /access/v1/evaluation` | optional bearer | AuthZEN evaluation |
 //! | `GET /.well-known/authzen-configuration` | none | AuthZEN metadata |
 //! | `GET /.well-known/jwks.json` | none | issuer public key |
@@ -49,7 +50,7 @@ pub fn build(config: &Config) -> anyhow::Result<(Router, Arc<AppState>)> {
 
 /// The full router over an existing state.
 pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Config) -> Router {
-    use routes::{admin, authzen, dev_root, token, wellknown};
+    use routes::{admin, authzen, dev_root, renew, token, wellknown};
 
     let mut admin_routes = Router::new()
         .route("/admin/leases/{lease_id}", get(admin::lease_status))
@@ -74,6 +75,7 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
             get(wellknown::authzen_configuration),
         )
         .route("/token", post(token::exchange))
+        .route("/token/renew", post(renew::renew))
         .route("/access/v1/evaluation", post(authzen::evaluation))
         .merge(admin_routes)
         .with_state(state.clone())

@@ -202,3 +202,40 @@ fn sqlite_leases_persist_across_reopen() {
     // Cascade still works on the reopened tree.
     assert_eq!(s.revoke(&id("root"), "r2", t0()).unwrap(), 4);
 }
+
+#[test]
+fn renew_extends_and_revives_an_expired_lease() {
+    for (name, store) in stores() {
+        let exp = t0() + Duration::minutes(5);
+        store.register(&id("r"), None, exp).unwrap();
+        let later = t0() + Duration::minutes(10);
+        assert!(!store.is_active(&id("r"), later).unwrap(), "{name}");
+        store
+            .renew(&id("r"), later + Duration::minutes(5), later)
+            .unwrap();
+        assert!(store.is_active(&id("r"), later).unwrap(), "{name}");
+        assert!(!store
+            .is_active(&id("r"), later + Duration::minutes(5))
+            .unwrap());
+    }
+}
+
+#[test]
+fn renew_rejects_unknown_and_revoked() {
+    for (name, store) in stores() {
+        let exp = t0() + Duration::minutes(5);
+        let err = store.renew(&id("ghost"), exp, t0()).unwrap_err();
+        assert!(matches!(err, AuditError::UnknownLease(_)), "{name}: {err}");
+
+        store.register(&id("p"), None, exp).unwrap();
+        store.register(&id("c"), Some(&id("p")), exp).unwrap();
+        store.revoke(&id("p"), "r", t0()).unwrap();
+        for l in ["p", "c"] {
+            let err = store
+                .renew(&id(l), exp + Duration::hours(1), t0())
+                .unwrap_err();
+            assert!(matches!(err, AuditError::LeaseRevoked(_)), "{name}: {l}");
+            assert!(!store.is_active(&id(l), t0()).unwrap(), "{name}: {l}");
+        }
+    }
+}

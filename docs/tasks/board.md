@@ -23,6 +23,9 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 - [ ] Token claims: proposed extensions from RFC-0001 section 3.1: `evidence` on the originating user (how the IdP credential was verified), a stable `chain_id`, `may_act` and a verified `actor_token`, numeric and time-range constraints. Reconcile or drop each.
 - [ ] Hop-0 hardening: `jti` replay cache for ID tokens and ID-JAGs, `private_key_jwt` client authentication, `evidence` in the user block; track ID-JAG drafts after -04.
 - [ ] Leases: `/lease/{id}/renew`, `/revoke` by user, session, chain (revoke by lease id with descendant cascade is done in the server); proxy cache bounded by TTL.
+- [ ] Hop 0 from an OIDC ID token (JWKS fetch, `iss`/`aud`/`exp` checks) and from an ID-JAG assertion.
+- [ ] Leases: revoke by user, session, chain (revoke by lease id with descendant cascade and `POST /token/renew` are done); optional proxy cache bounded by TTL; audit failed renewals.
+- [ ] Proxy: filter `resources/list`, `resources/templates/list` and `prompts/list` results by capability; decide whether `resources/unsubscribe` joins the allowlist.
 - [ ] Multi-hop demo: planner agent → coder sub-agent → GitHub tool, three exchanges, attenuated at each.
 - [ ] AuthZEN conformance fixtures (the endpoint itself is done).
 - [ ] Audit: signed checkpoints every N records; `kind` for `issue`, `decision`, `renew`, `revoke`, `checkpoint`.
@@ -39,11 +42,14 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 - [ ] Machine-checked statement of the attenuation invariant (Lean or Dafny sketch mirroring the proptest properties).
 - [ ] Output labelling: mark tool results as untrusted and forbid flow into destructive tools without approval (design note first).
 - [ ] Measurement study of delegation and credential patterns across public MCP servers.
-- [ ] Benchmarks: p50/p99 added latency per call, exchange throughput, lease renewal load.
+- [ ] Benchmarks: p50/p99 added latency per call through the proxy, exchange throughput, lease renewal load (micro-benchmarks for `authorize` and `covers` are done; see [performance](../design/performance.md)).
 
 ## Done
 
 - [x] Security review pass 1: SR-01 to SR-07 fixed with regression tests (proxy re-encodes screened messages, no upstream redirects, non-object arguments rejected; Cedar action hierarchy; integral floats as Long; TTL overflow; root-grant attributes).
+- [x] Lease renewal: `POST /token/renew`, `LeaseStore::renew`, lease expiry enforced for every hop, ADR-0006.
+- [x] Proxy coverage: `resources/read`, `resources/subscribe`, `prompts/get`, `completion/complete` authorized; unknown methods denied by default; `tools/list` and session requests lease-checked.
+- [x] Criterion benchmarks for `PolicyEngine::authorize` and `CapabilitySet::covers`.
 - [x] Repository skeleton: workspace, CI, licence, docs vault.
 - [x] RFC-0001, threat model, ADR-0001 to ADR-0004, research notes (standards, incidents, related work).
 - [x] `onbehalf-server`: config, `/token` (RFC 8693), JWKS endpoint, dev root mint, proxy with real authorizer, admin leases/audit endpoints ([design](../design/server.md)).

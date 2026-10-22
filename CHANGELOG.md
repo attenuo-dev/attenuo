@@ -19,10 +19,18 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 - `examples/github-leak-demo`: scripted replay of the May 2025 GitHub MCP prompt-injection leak (`run.sh`, config, policy, transcript), with `fake_mcp`, a runnable fake GitHub MCP server in `onbehalf-proxy`'s examples.
 - `Dockerfile`, `docker-compose.yml` and `.dockerignore` (untested).
 
+- `POST /token/renew`: the holder of a delegation token extends its last hop's lease by `[issuer] lease_interval_seconds` (new, default 300), never beyond the token's `exp` or the parent lease's expiry. `LeaseStore::renew` on both stores. Renewals are audited as `lease.renew`. See ADR-0006.
+- Proxy enforcement coverage: `resources/read`, `resources/subscribe`, `prompts/get` and `completion/complete` are authorized as tool calls, and any other non-notification method outside the allowlist is denied unless a capability and the policy permit a tool named after the method. Mapping documented in `onbehalf-proxy` and `docs/design/server.md`.
+- Criterion benchmarks for `PolicyEngine::authorize` and `CapabilitySet::covers`; numbers in `docs/design/performance.md`.
+- ADR-0006: lease-based in-flight revocation.
+
 ### Changed
 
 - BREAKING: `POST /admin/root-token` is mounted only when `[dev] allow_root_mint = true` (default `false`); otherwise it answers 404.
 - `[[root_grants]]` entries no longer need a `subject`: without one an entry applies to every user of its `issuer`. The same list now caps IdP intake.
+- BREAKING: `LeaseStore` has a new required method `renew`; `onbehalf_proxy::Authorizer` has a new required method `check_active`, and `AuthError` a new variant `LeaseInactive`.
+- Leases are registered with `expires_at = min(now + lease_interval, token exp)` instead of the token's expiry, so a holder that stops renewing is denied (`lease_expired`) within one interval while its JWT is still valid.
+- `tools/list`, `initialize`, `ping`, the other allowlisted methods and `GET`/`DELETE` session requests are now lease-checked; a revoked token gets 401 instead of being served.
 
 ### Deprecated
 

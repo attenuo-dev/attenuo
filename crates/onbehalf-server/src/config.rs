@@ -89,6 +89,11 @@ pub struct IssuerSection {
     pub max_depth: usize,
     #[serde(default = "default_ttl")]
     pub default_ttl_seconds: u64,
+    /// How long a hop's lease lives after issuance or renewal (default 300). Revocation takes
+    /// effect immediately; this bounds how long a lease the holder stopped renewing (for
+    /// example a crashed agent) keeps authorizing calls. Always capped by the token's `exp`.
+    #[serde(default = "default_lease_interval")]
+    pub lease_interval_seconds: u64,
     /// PKCS#8 Ed25519 private key. Generated (and written with mode 0600) if the file does not
     /// exist. When unset, an ephemeral key is generated at every start.
     #[serde(default)]
@@ -102,6 +107,7 @@ impl Default for IssuerSection {
             audience: default_audience(),
             max_depth: default_max_depth(),
             default_ttl_seconds: default_ttl(),
+            lease_interval_seconds: default_lease_interval(),
             private_key_pem_path: None,
         }
     }
@@ -118,6 +124,9 @@ fn default_max_depth() -> usize {
 }
 fn default_ttl() -> u64 {
     900
+}
+fn default_lease_interval() -> u64 {
+    300
 }
 
 /// `[policy]`

@@ -442,6 +442,29 @@ impl LeaseStore for SqliteLeaseStore {
         Ok(changed as u64)
     }
 
+    fn renew(
+        &self,
+        lease: &LeaseId,
+        new_expires_at: OffsetDateTime,
+        _now: OffsetDateTime,
+    ) -> Result<(), AuditError> {
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        match get_in(&tx, lease)? {
+            None => return Err(AuditError::UnknownLease(lease.0.clone())),
+            Some(row) if row.revoked_at.is_some() => {
+                return Err(AuditError::LeaseRevoked(lease.0.clone()))
+            }
+            Some(_) => {}
+        }
+        tx.execute(
+            "UPDATE leases SET expires_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
+            params![lease.0, fmt_time(new_expires_at)?],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn is_active(&self, lease: &LeaseId, now: OffsetDateTime) -> Result<bool, AuditError> {
         let conn = self.conn.lock()?;
         Ok(get_in(&conn, lease)?.is_some_and(|r| r.is_active(now)))

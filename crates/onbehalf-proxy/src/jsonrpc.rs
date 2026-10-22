@@ -22,6 +22,29 @@ pub const CODE_UPSTREAM: i64 = -32005;
 /// MCP method names the proxy understands.
 pub const METHOD_TOOLS_CALL: &str = "tools/call";
 pub const METHOD_TOOLS_LIST: &str = "tools/list";
+pub const METHOD_RESOURCES_READ: &str = "resources/read";
+pub const METHOD_RESOURCES_SUBSCRIBE: &str = "resources/subscribe";
+pub const METHOD_PROMPTS_GET: &str = "prompts/get";
+pub const METHOD_COMPLETION_COMPLETE: &str = "completion/complete";
+
+/// Methods forwarded without a per-call authorization decision. They are still authenticated
+/// and lease-checked (`Authorizer::check_active`). Everything else that is not a notification
+/// is authorized with `tool = method name`.
+pub const PASSTHROUGH_METHODS: &[&str] = &[
+    "initialize",
+    "ping",
+    METHOD_TOOLS_LIST,
+    "resources/list",
+    "resources/templates/list",
+    "prompts/list",
+    "logging/setLevel",
+];
+
+/// Is `method` forwarded without a per-call decision? True for [`PASSTHROUGH_METHODS`] and
+/// every `notifications/*`.
+pub fn is_passthrough_method(method: &str) -> bool {
+    PASSTHROUGH_METHODS.contains(&method) || method.starts_with("notifications/")
+}
 
 /// Build a JSON-RPC error response.
 pub fn error_response(
@@ -76,6 +99,27 @@ mod tests {
         assert_eq!(v["error"]["message"], "onbehalf: denied: capability_denied");
         assert_eq!(v["error"]["data"]["reason"], "capability_denied");
         assert_eq!(v["error"]["data"]["decision_id"], id.to_string());
+    }
+
+    #[test]
+    fn passthrough_allowlist() {
+        for m in PASSTHROUGH_METHODS {
+            assert!(is_passthrough_method(m), "{m}");
+        }
+        assert!(is_passthrough_method("notifications/cancelled"));
+        for m in [
+            "tools/call",
+            "resources/read",
+            "resources/subscribe",
+            "prompts/get",
+            "completion/complete",
+            "sampling/createMessage",
+            "resources/unsubscribe",
+            "notification/typo",
+            "",
+        ] {
+            assert!(!is_passthrough_method(m), "{m}");
+        }
     }
 
     #[test]

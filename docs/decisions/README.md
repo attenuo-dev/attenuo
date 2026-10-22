@@ -40,5 +40,11 @@ Only the `status` and `date` fields and the More Information section of an accep
 | ADR | Title | Status |
 | --- | --- | --- |
 | 0000 | ADR template | n/a |
+| [0001](0001-separate-enforcement-layer.md) | Enforce delegation and per-call authorization in a separate layer | accepted |
+| [0002](0002-cedar-for-policy.md) | Cedar as the policy language, with ReBAC composed from outside | accepted |
+| [0003](0003-apache-2-license.md) | Apache License 2.0 | accepted |
+| [0004](0004-rust-workspace-layout.md) | Rust workspace layout | accepted |
+| [0005](0005-policy-decision-point.md) | Policy decision point: capabilities first, then Cedar with a generated schema | proposed |
+| [0006](0006-lease-based-in-flight-revocation.md) | Lease-based in-flight revocation | proposed |
 
 Add a row for each new ADR.
