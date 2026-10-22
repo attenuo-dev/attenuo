@@ -43,3 +43,8 @@ subject = "alice"
 issuer = "https://idp.example"
 agent = "assistant"
 capabilities = ["github:*"]
+
+# Demo only: mounts POST /admin/root-token so step 1 works without an identity provider.
+# Real deployments leave this off and mint root tokens from an OIDC ID token or ID-JAG.
+[dev]
+allow_root_mint = true

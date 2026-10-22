@@ -1,5 +1,7 @@
 # GitHub MCP leak demo
 
+> The demo config sets `[dev] allow_root_mint = true` so step 1 can mint Alice's root token without an identity provider. Real deployments leave that off and mint root tokens from an OIDC ID token or ID-JAG (see the top-level README).
+
 In May 2025 researchers showed that an AI assistant wired to the official GitHub MCP server could be turned against its user. A malicious issue in a public repository carried instructions; the assistant read them while triaging issues, followed them, pulled files out of the user's private repositories with the user's broad access token, and published the contents in a public pull request ([Invariant Labs write-up](https://invariantlabs.ai/blog/mcp-github-vulnerability)). Nothing was exploited in GitHub or in the MCP server. The agent held more authority than the task needed, and nothing checked each call against what the user had actually delegated.
 
 This demo replays that shape against onbehalf, with a fake GitHub MCP server so it runs offline.
