@@ -91,17 +91,30 @@ This is the weakest part of v0. Real operator authentication is on the [task boa
 
 ## Key rotation
 
-The server signs every token with one Ed25519 key, named by `[issuer] private_key_pem_path`. Its public half is served at `/.well-known/jwks.json`. Tokens carry no `kid`, and the JWKS holds exactly one key. That means there is no overlap period: the moment the server loads a new key, every token signed with the old one fails verification.
+The server signs every token with the Ed25519 key named by `[issuer] private_key_pem_path`. Each token's JOSE header carries a `kid`: the first 16 bytes of the SHA-256 of the key's SubjectPublicKeyInfo DER, base64url-encoded (22 characters). `/.well-known/jwks.json` lists every key the server trusts, signing key first, each with its `kid`.
+
+Rotation has an overlap period. Retired keys listed in `[issuer] previous_key_paths` stay trusted for verification and in the JWKS, but never sign. Tokens signed before the switch keep working until they expire, and can still be exchanged for children.
+
+```toml
+[issuer]
+private_key_pem_path = "/etc/onbehalf/issuer-2.pem"          # signs from now on
+previous_key_paths   = ["/etc/onbehalf/issuer-1.pem"]        # verify only
+```
 
 To rotate:
 
-1. Generate the new key: `openssl genpkey -algorithm ed25519 -out /etc/onbehalf/issuer-2.pem`, then `chmod 600` it. The server also generates a key itself if the path does not exist, so you can just point the setting at a new path.
-2. Stop the server.
-3. Change `private_key_pem_path` to the new file.
-4. Start the server. It logs the new public key.
-5. Agents get 401 on their next call. They re-run their login and exchange steps to get new tokens.
+1. Generate the new key: `openssl genpkey -algorithm ed25519 -out /etc/onbehalf/issuer-2.pem`, then `chmod 600` it. (The server also generates a key if the path does not exist.)
+2. Edit the config: point `private_key_pem_path` at the new file and add the old file to `previous_key_paths`. A previous key file may be the old private key or just its public key (`openssl pkey -in issuer-1.pem -pubout -out issuer-1.pub`); only the public half is used, so prefer the public file and archive the private one.
+3. Restart the server. It logs the new `kid` and how many previous keys it trusts. Check `/.well-known/jwks.json` lists both.
+4. Wait at least the longest token lifetime (`default_ttl_seconds`, or the largest `ttl_seconds` you allow) plus `clock_skew`. By then every token signed by the old key has expired.
+5. Remove `previous_key_paths`, restart, and destroy the old private key.
 
-Expect every in-flight run to need a new root token. Rotate in a quiet period, or on a compromise, where that cost is the point. Anything that verified onbehalf tokens offline against the old public key has to re-fetch the JWKS.
+Notes:
+
+- The originating-user block of a token (`ou_sig`) is signed once, at the root, and copied to every child. A child minted after the switch is signed by the new key but still carries an old-key `ou_sig`, so the old key must stay trusted until the whole chain has expired. That is why step 4 waits for the longest chain, not for one token.
+- A token whose `kid` is not in the trusted set is rejected with `invalid_grant`, whatever its signature. Tokens issued by a version before `kid` existed carry no `kid` and are tried against every trusted key.
+- Third parties that verify onbehalf tokens offline should select the key by `kid` and refresh the JWKS when they see an unknown one. `onbehalf token inspect --verify` fetches the JWKS and trusts every key in it.
+- In an emergency (key compromise), skip the overlap: replace the key and leave `previous_key_paths` empty. Every outstanding token stops verifying; agents re-run login and exchange.
 
 The audit log does not depend on the issuer key. It is a plain SHA-256 hash chain, so rotation does not break `audit verify`. Old leases stay in the database but belong to tokens that no longer verify.
 

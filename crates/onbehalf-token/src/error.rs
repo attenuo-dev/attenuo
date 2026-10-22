@@ -18,6 +18,9 @@ pub enum TokenError {
     /// signature (`ou_sig`) does not verify.
     #[error("token signature is invalid")]
     InvalidSignature,
+    /// The header names a `kid` that is not among the trusted keys.
+    #[error("token was signed with an unknown key id `{0}`")]
+    UnknownKeyId(String),
     /// `iss` does not match the configured issuer.
     #[error("token issuer is not trusted")]
     WrongIssuer,

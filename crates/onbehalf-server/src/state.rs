@@ -45,7 +45,7 @@ impl AppState {
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
         let issuer = load_issuer(config)?;
         let verifier = issuer.verifier();
-        let jwks = crate::jwks::jwks_from_public_pem(&issuer.public_key_pem())?;
+        let jwks = crate::jwks::jwks_from_keys(&issuer.trusted_public_keys())?;
 
         let engine = build_engine(config)?;
         let policy = Arc::new(RwLock::new(engine));
@@ -124,7 +124,7 @@ fn issuer_config(config: &Config) -> anyhow::Result<IssuerConfig> {
 /// Read the issuer key, or generate it (and write it if a path is configured).
 fn load_issuer(config: &Config) -> anyhow::Result<Issuer> {
     let ic = issuer_config(config)?;
-    let issuer = match &config.issuer.private_key_pem_path {
+    let mut issuer = match &config.issuer.private_key_pem_path {
         Some(path) if path.exists() => {
             let pem = std::fs::read_to_string(path)
                 .with_context(|| format!("reading issuer key {}", path.display()))?;
@@ -145,7 +145,19 @@ fn load_issuer(config: &Config) -> anyhow::Result<Issuer> {
             Issuer::generate(ic)
         }
     };
-    tracing::info!(public_key = %issuer.public_key_pem().trim(), "issuer public key");
+    for path in &config.issuer.previous_key_paths {
+        let pem = std::fs::read_to_string(path)
+            .with_context(|| format!("reading previous issuer key {}", path.display()))?;
+        issuer
+            .trust_previous_key(&pem)
+            .with_context(|| format!("parsing previous issuer key {}", path.display()))?;
+    }
+    tracing::info!(
+        public_key = %issuer.public_key_pem().trim(),
+        kid = %issuer.key_id(),
+        previous_keys = issuer.trusted_public_keys().len() - 1,
+        "issuer public key"
+    );
     Ok(issuer)
 }
 

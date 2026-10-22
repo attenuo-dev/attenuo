@@ -781,7 +781,7 @@ async fn jwks_verifies_issued_tokens_and_health_is_ok() {
     assert_eq!(key["kty"], "OKP");
     assert_eq!(key["crv"], "Ed25519");
     assert_eq!(key["alg"], "EdDSA");
-    assert_eq!(key["kid"].as_str().unwrap().len(), 16);
+    assert_eq!(key["kid"].as_str().unwrap().len(), 22);
 
     // Rebuild a PEM from the JWK alone and verify a token with it, as a third party would.
     use base64::Engine;

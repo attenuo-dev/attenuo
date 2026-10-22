@@ -100,6 +100,11 @@ pub struct IssuerSection {
     /// exist. When unset, an ephemeral key is generated at every start.
     #[serde(default)]
     pub private_key_pem_path: Option<PathBuf>,
+    /// Retired signing keys (PEM files, private or public) that stay trusted for verification
+    /// and are published in the JWKS, so tokens signed before a rotation keep working until
+    /// they expire. They never sign. Remove an entry once its tokens have expired.
+    #[serde(default)]
+    pub previous_key_paths: Vec<PathBuf>,
 }
 
 impl Default for IssuerSection {
@@ -111,6 +116,7 @@ impl Default for IssuerSection {
             default_ttl_seconds: default_ttl(),
             lease_interval_seconds: default_lease_interval(),
             private_key_pem_path: None,
+            previous_key_paths: Vec::new(),
         }
     }
 }

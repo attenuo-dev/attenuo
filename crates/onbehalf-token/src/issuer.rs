@@ -6,7 +6,7 @@ use time::{Duration, OffsetDateTime};
 
 use crate::claims::{canonical_user_bytes, ActClaim, Claims, TOKEN_TYPE};
 use crate::error::TokenError;
-use crate::keys::SigningKey;
+use crate::keys::{PublicKey, SigningKey};
 use crate::verifier::Verifier;
 
 /// Static configuration of an [`Issuer`].
@@ -43,6 +43,8 @@ pub struct IssuedToken {
 /// enforced by the same code that verifiers run.
 pub struct Issuer {
     key: SigningKey,
+    /// Retired public keys that still verify (rotation overlap); never used to sign.
+    previous: Vec<PublicKey>,
     encoding_key: EncodingKey,
     config: IssuerConfig,
 }
@@ -76,9 +78,40 @@ impl Issuer {
         let encoding_key = EncodingKey::from_ed_der(key.pkcs8_der());
         Self {
             key,
+            previous: Vec::new(),
             encoding_key,
             config,
         }
+    }
+
+    /// Also trust tokens signed by a retired key, given as a `PUBLIC KEY` or `PRIVATE KEY` PEM
+    /// (only the public half is used). The key never signs. Use this during a rotation, so
+    /// tokens minted before the switch keep verifying (and can still be exchanged) until they
+    /// expire. Adding the current key again is a no-op.
+    pub fn trust_previous_key(&mut self, pem: &str) -> Result<(), TokenError> {
+        let key = if pem.contains("-----BEGIN PRIVATE KEY-----") {
+            SigningKey::from_pem(pem)?.public_key()
+        } else {
+            PublicKey::from_pem(pem)?
+        };
+        if key != self.key.public_key() && !self.previous.contains(&key) {
+            self.previous.push(key);
+        }
+        Ok(())
+    }
+
+    /// `kid` of the current signing key, as put in every token's header.
+    pub fn key_id(&self) -> String {
+        self.key.public_key().kid()
+    }
+
+    /// The `kid` and `PUBLIC KEY` PEM of every trusted key: the signing key first, then the
+    /// retired ones. This is what a JWKS endpoint publishes.
+    pub fn trusted_public_keys(&self) -> Vec<(String, String)> {
+        std::iter::once(self.key.public_key())
+            .chain(self.previous.iter().cloned())
+            .map(|k| (k.kid(), k.to_pem()))
+            .collect()
     }
 
     /// The configuration this issuer was built with.
@@ -96,14 +129,19 @@ impl Issuer {
         self.key.private_pem()
     }
 
-    /// A verifier holding only the public key and this issuer's `iss`/`aud`/`max_depth`.
+    /// A verifier holding only public keys (the current one and any retired ones added with
+    /// [`Issuer::trust_previous_key`]) and this issuer's `iss`/`aud`/`max_depth`.
     pub fn verifier(&self) -> Verifier {
-        Verifier::new(
+        let mut v = Verifier::new(
             self.key.public_key(),
             self.config.issuer.clone(),
             self.config.audience.clone(),
             self.config.max_depth,
-        )
+        );
+        for k in &self.previous {
+            v.add_key(k.clone());
+        }
+        v
     }
 
     /// Mint the root token: `agent` acts for `user` with `capabilities` for `ttl`
@@ -190,6 +228,7 @@ impl Issuer {
         };
         let mut header = Header::new(Algorithm::EdDSA);
         header.typ = Some(TOKEN_TYPE.to_owned());
+        header.kid = Some(self.key.public_key().kid());
         let token = jsonwebtoken::encode(&header, &claims, &self.encoding_key)?;
         Ok(IssuedToken {
             token,

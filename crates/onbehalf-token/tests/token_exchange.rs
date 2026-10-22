@@ -321,9 +321,10 @@ fn token_signed_by_another_key_is_rejected() {
     let a = issuer();
     let b = issuer();
     let from_b = root(&b);
+    // The token names b's kid, which a does not trust.
     assert!(matches!(
         a.verifier().verify(&from_b.token, t0()),
-        Err(TokenError::InvalidSignature)
+        Err(TokenError::UnknownKeyId(_))
     ));
     assert!(matches!(
         a.exchange(
@@ -333,8 +334,120 @@ fn token_signed_by_another_key_is_rejected() {
             None,
             t0(),
         ),
+        Err(TokenError::UnknownKeyId(_))
+    ));
+    // Without a kid the signature itself is what fails.
+    let payload = decode_payload(&from_b.token);
+    let resigned = resign_with_issuer_key(&b, &payload);
+    assert!(matches!(
+        a.verifier().verify(&resigned, t0()),
         Err(TokenError::InvalidSignature)
     ));
+}
+
+fn header_of(token: &str) -> serde_json::Value {
+    let h = token.split('.').next().unwrap();
+    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(h).unwrap()).unwrap()
+}
+
+#[test]
+fn tokens_carry_a_kid_derived_from_the_public_key() {
+    let a = issuer();
+    let t = root(&a);
+    let kid = header_of(&t.token)["kid"].as_str().unwrap().to_string();
+    assert_eq!(kid, a.key_id());
+    assert_eq!(kid.len(), 22);
+    assert_eq!(a.verifier().key_ids(), vec![kid]);
+    assert_ne!(a.key_id(), issuer().key_id());
+}
+
+/// `new` replaces `old` as the signing key; `old` stays trusted for verification only.
+fn rotated(old: &Issuer) -> Issuer {
+    let mut new = issuer();
+    new.trust_previous_key(&old.public_key_pem()).unwrap();
+    new
+}
+
+#[test]
+fn token_from_the_retired_key_still_verifies_during_overlap() {
+    let old = issuer();
+    let from_old = root(&old);
+    let new = rotated(&old);
+    let v = new.verifier();
+    assert_eq!(v.key_ids().len(), 2);
+    assert!(v.verify(&from_old.token, t0()).is_ok());
+    // New tokens use the new kid.
+    let from_new = root(&new);
+    assert_eq!(header_of(&from_new.token)["kid"], new.key_id());
+    assert!(v.verify(&from_new.token, t0()).is_ok());
+    // The old issuer does not trust the new key (rotation is one-way).
+    assert!(old.verifier().verify(&from_new.token, t0()).is_err());
+}
+
+#[test]
+fn exchange_of_an_old_key_parent_is_signed_by_the_new_key_and_verifies() {
+    let old = issuer();
+    let from_old = root(&old);
+    let new = rotated(&old);
+    let child = new
+        .exchange(
+            &from_old.token,
+            AgentId::new("agent:coder"),
+            caps([Capability::new("github", "read_file")]),
+            None,
+            t0(),
+        )
+        .unwrap();
+    assert_eq!(header_of(&child.token)["kid"], new.key_id());
+    // ou_sig was made by the old key; the verifier accepts it because that key is trusted.
+    assert!(new.verifier().verify(&child.token, t0()).is_ok());
+    // A verifier that dropped the old key rejects the child's user block.
+    let only_new = Verifier::from_public_pem(ISS, AUD, 4, &new.public_key_pem()).unwrap();
+    assert!(matches!(
+        only_new.verify(&child.token, t0()),
+        Err(TokenError::InvalidSignature)
+    ));
+}
+
+#[test]
+fn retired_key_is_dropped_when_not_listed_and_kid_mismatch_is_rejected() {
+    let old = issuer();
+    let from_old = root(&old);
+    let new = issuer();
+    assert!(matches!(
+        new.verifier().verify(&from_old.token, t0()),
+        Err(TokenError::UnknownKeyId(k)) if k == old.key_id()
+    ));
+    // A forged kid pointing at a trusted key does not help: the signature must match it.
+    let new_with_old = rotated(&old);
+    let mut payload = decode_payload(&from_old.token);
+    payload["sub"] = json!("user:mudit");
+    let mut header = Header::new(Algorithm::EdDSA);
+    header.typ = Some(TOKEN_TYPE.into());
+    header.kid = Some(old.key_id());
+    let key = EncodingKey::from_ed_pem(new.private_key_pem().as_bytes()).unwrap();
+    let forged = jsonwebtoken::encode(&header, &payload, &key).unwrap();
+    assert!(matches!(
+        new_with_old.verifier().verify(&forged, t0()),
+        Err(TokenError::InvalidSignature)
+    ));
+}
+
+#[test]
+fn trust_previous_key_accepts_private_or_public_pem_and_ignores_the_current_key() {
+    let old = issuer();
+    let mut new = issuer();
+    new.trust_previous_key(&old.private_key_pem()).unwrap();
+    new.trust_previous_key(&old.public_key_pem()).unwrap();
+    new.trust_previous_key(&new.public_key_pem()).unwrap();
+    assert_eq!(new.trusted_public_keys().len(), 2);
+    assert_eq!(new.trusted_public_keys()[0].0, new.key_id());
+    assert!(new.trust_previous_key("garbage").is_err());
+    let pem_only = Verifier::from_public_pem(ISS, AUD, 4, &new.public_key_pem())
+        .unwrap()
+        .with_public_pem(&old.public_key_pem())
+        .unwrap();
+    assert_eq!(pem_only.key_ids().len(), 2);
 }
 
 #[test]

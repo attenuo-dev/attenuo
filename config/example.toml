@@ -22,6 +22,9 @@ lease_interval_seconds = 300
 # Ed25519 PKCS#8 key. Generated (mode 0600) on first start if missing; the public key is
 # logged and served at /.well-known/jwks.json. Omit to use an ephemeral key.
 private_key_pem_path = "data/issuer.pem"
+# Key rotation: keep retired keys (PEM, private or public) trusted for verification and in the
+# JWKS until their tokens expire. They never sign. See docs/guides/deploying.md.
+# previous_key_paths = ["data/issuer-old.pem"]
 
 [policy]
 # Cedar policies. POST /admin/policies/reload re-reads this file.

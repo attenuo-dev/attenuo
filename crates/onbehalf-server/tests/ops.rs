@@ -235,3 +235,112 @@ async fn metrics_are_not_served_on_the_api_port() {
     let h = Harness::start().await;
     assert_eq!(h.get("/metrics").await.status(), StatusCode::NOT_FOUND);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Key rotation
+// ---------------------------------------------------------------------------------------------
+
+fn server_with_keys(
+    dir: &std::path::Path,
+    key: &str,
+    previous: &[&str],
+) -> (axum::Router, Arc<AppState>) {
+    let mut cfg = Config::default();
+    cfg.issuer.private_key_pem_path = Some(dir.join(key));
+    cfg.issuer.previous_key_paths = previous.iter().map(|p| dir.join(p)).collect();
+    cfg.admin.token = Some("admin".into());
+    cfg.dev.allow_root_mint = true;
+    onbehalf_server::build(&cfg).unwrap()
+}
+
+async fn mint_root(server: &Spawned) -> String {
+    let r: Value = reqwest::Client::new()
+        .post(server.url("/admin/root-token"))
+        .bearer_auth("admin")
+        .json(&json!({"subject": "alice", "issuer": "https://idp.example",
+                      "agent": "planner", "capabilities": ["github:*"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    r["access_token"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn rotation_keeps_old_tokens_valid_and_publishes_both_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let (old_router, old_state) = server_with_keys(dir.path(), "old.pem", &[]);
+    let old_server = spawn_router(old_router).await.unwrap();
+    let old_token = mint_root(&old_server).await;
+    let old_kid = old_state.issuer.key_id();
+
+    // Rotate: a new signing key, the old one verify-only.
+    let (new_router, new_state) = server_with_keys(dir.path(), "new.pem", &["old.pem"]);
+    let new_server = spawn_router(new_router).await.unwrap();
+    assert_ne!(new_state.issuer.key_id(), old_kid);
+
+    // Same issuer/audience defaults, so the new server verifies the old token.
+    let now = time::OffsetDateTime::now_utc();
+    assert!(new_state.verifier.verify(&old_token, now).is_ok());
+
+    // And it can be exchanged for a child, which is signed with the new key.
+    let child: Value = reqwest::Client::new()
+        .post(new_server.url("/token"))
+        .json(&json!({
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "subject_token": old_token,
+            "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+            "actor": "coder",
+            "authorization_details": [{"type": "onbehalf_capabilities",
+                "capabilities": [{"server": "github", "tool": "read_file"}]}],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // The old token's lease is unknown to the new server's (empty) store, but the token
+    // itself was accepted: the failure, if any, is about the lease, not the signature.
+    let err = child["error_description"].as_str().unwrap_or_default();
+    assert!(
+        !err.contains("signature") && !err.contains("key id"),
+        "{child}"
+    );
+
+    // The JWKS lists the new key first, then the old one.
+    let jwks: Value = reqwest::get(new_server.url("/.well-known/jwks.json"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let kids: Vec<&str> = jwks["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k["kid"].as_str().unwrap())
+        .collect();
+    assert_eq!(kids, [new_state.issuer.key_id(), old_kid.clone()]);
+
+    // Without previous_key_paths the old token is rejected by kid.
+    let (_r, solo) = server_with_keys(dir.path(), "new.pem", &[]);
+    let err = solo.verifier.verify(&old_token, now).unwrap_err();
+    assert!(
+        matches!(err, onbehalf_token::TokenError::UnknownKeyId(ref k) if *k == old_kid),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn previous_key_path_errors_are_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::default();
+    cfg.issuer.previous_key_paths = vec![dir.path().join("missing.pem")];
+    assert!(onbehalf_server::build(&cfg).is_err());
+    std::fs::write(dir.path().join("bad.pem"), "not a pem").unwrap();
+    cfg.issuer.previous_key_paths = vec![dir.path().join("bad.pem")];
+    assert!(onbehalf_server::build(&cfg).is_err());
+}

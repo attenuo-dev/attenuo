@@ -96,11 +96,22 @@ impl PublicKey {
         Ok(Self { raw })
     }
 
-    /// SubjectPublicKeyInfo `PUBLIC KEY` PEM.
-    pub(crate) fn to_pem(&self) -> String {
+    fn spki_der(&self) -> Vec<u8> {
         let mut der = SPKI_ED25519_PREFIX.to_vec();
         der.extend_from_slice(&self.raw);
-        pem_encode(&der, "PUBLIC KEY")
+        der
+    }
+
+    /// SubjectPublicKeyInfo `PUBLIC KEY` PEM.
+    pub(crate) fn to_pem(&self) -> String {
+        pem_encode(&self.spki_der(), "PUBLIC KEY")
+    }
+
+    /// Key id (`kid`): base64url (no padding) of the first 16 bytes of SHA-256 over the
+    /// SubjectPublicKeyInfo DER.
+    pub(crate) fn kid(&self) -> String {
+        let digest = ring::digest::digest(&ring::digest::SHA256, &self.spki_der());
+        URL_SAFE_NO_PAD.encode(&digest.as_ref()[..16])
     }
 
     /// Raw 32-byte key, as `jsonwebtoken::DecodingKey::from_ed_der` expects it.
@@ -164,6 +175,22 @@ mod tests {
         assert_eq!(PublicKey::from_pem(&pem).unwrap(), pk);
         // jsonwebtoken's own PEM parser accepts it too
         jsonwebtoken::DecodingKey::from_ed_pem(pem.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn kid_is_22_chars_and_stable_per_key() {
+        let k = SigningKey::generate().unwrap();
+        let other = SigningKey::generate().unwrap();
+        let kid = k.public_key().kid();
+        assert_eq!(kid.len(), 22);
+        assert!(kid
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert_eq!(
+            kid,
+            PublicKey::from_pem(&k.public_key().to_pem()).unwrap().kid()
+        );
+        assert_ne!(kid, other.public_key().kid());
     }
 
     #[test]
