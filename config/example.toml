@@ -1,0 +1,65 @@
+# onbehalf-server example configuration.
+#
+#   cargo run -p onbehalf-server -- --config config/example.toml
+#   # or: ONBEHALF_CONFIG=config/example.toml cargo run -p onbehalf-server
+#
+# Relative paths are resolved against the working directory. Unknown keys are rejected.
+
+[server]
+listen = "127.0.0.1:8080"
+# Externally visible base URL, used in /.well-known/authzen-configuration.
+# Defaults to http://<Host header>.
+# public_url = "https://onbehalf.example.com"
+
+[issuer]
+issuer = "http://127.0.0.1:8080"
+audience = "onbehalf"
+max_depth = 8
+default_ttl_seconds = 900
+# Ed25519 PKCS#8 key. Generated (mode 0600) on first start if missing; the public key is
+# logged and served at /.well-known/jwks.json. Omit to use an ephemeral key.
+private_key_pem_path = "data/issuer.pem"
+
+[policy]
+# Cedar policies. POST /admin/policies/reload re-reads this file.
+policies_path = "config/policies/default.cedar"
+# Tool catalog: attributes policies can test (resource.readonly, resource.sensitive) and the
+# argument types used to validate `context.input.*`. Every action a policy names must be here.
+# Alternatively (or additionally) point catalog_path at a JSON file of the same shape:
+# { "github": { "read_file": { "readonly": true, "inputs": { "repo": "string" } } } }
+# catalog_path = "config/catalog.json"
+
+[policy.catalog.github.read_file]
+readonly = true
+inputs = { repo = "string", path = "string" }
+
+[policy.catalog.github.create_issue]
+inputs = { repo = "string", title = "string" }
+
+[policy.catalog.github.delete_repo]
+sensitive = true
+inputs = { repo = "string" }
+
+[audit]
+# Audit log and lease registry. ":memory:" keeps both in memory (lost on exit).
+sqlite_path = "data/onbehalf.sqlite"
+
+# MCP servers (Streamable HTTP), mounted at /mcp/<name>. `name` is the server part of
+# capabilities, e.g. "github:read_file".
+[[upstreams]]
+name = "github"
+url = "http://127.0.0.1:3001/mcp"
+
+[admin]
+# Static bearer for /admin/*. v0 only: change it, and do not expose /admin publicly.
+token = "dev-admin-token-change-me"
+
+# Development stand-in for IdP intake (OIDC / ID-JAG is not implemented yet).
+# POST /admin/root-token may only mint for these (subject, issuer, agent) triples, and only
+# capabilities covered by the listed ones. Remove every entry to let the admin mint anything.
+[[root_grants]]
+subject = "alice"
+issuer = "https://idp.example"
+agent = "planner"
+capabilities = ["github:*"]
+attributes = { mfa = false }

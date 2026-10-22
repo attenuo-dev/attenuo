@@ -1,10 +1,46 @@
 [package]
 name = "onbehalf-server"
+description = "The onbehalf server: token exchange, AuthZEN PDP, MCP proxy and audit log in one process"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "onbehalf-server"
+path = "src/main.rs"
+
 [dependencies]
 onbehalf-core = { workspace = true }
+onbehalf-token = { workspace = true }
+onbehalf-policy = { workspace = true }
+onbehalf-audit = { workspace = true }
+onbehalf-proxy = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+onbehalf-proxy = { workspace = true, features = ["testing"] }
+reqwest = { workspace = true }
+rusqlite = { workspace = true }
+tempfile = { workspace = true }

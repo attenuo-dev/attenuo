@@ -37,6 +37,60 @@ cargo test --workspace
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full set of checks CI runs.
 
+## Quick start
+
+Run the server with the example config. It generates an issuer key in `data/` on first start, keeps the audit log and lease registry in `data/onbehalf.sqlite`, and proxies an MCP server expected at `http://127.0.0.1:3001/mcp` as `github` (edit `[[upstreams]]` to point at yours).
+
+```sh
+cargo build -p onbehalf-server
+cargo run -p onbehalf-server -- --config config/example.toml   # or ONBEHALF_CONFIG=config/example.toml
+```
+
+The flow below uses `curl` and `jq`. The root token comes from a development endpoint that stands in for IdP intake (OIDC / ID-JAG), which is not implemented yet; it requires the admin token and is limited to the `[[root_grants]]` in the config.
+
+```sh
+OB=http://127.0.0.1:8080
+ADMIN=dev-admin-token-change-me
+
+# 1. Mint a root token: alice's "planner" agent may call any github tool.
+ROOT=$(curl -s -X POST $OB/admin/root-token -H "Authorization: Bearer $ADMIN" \
+  -H 'content-type: application/json' \
+  -d '{"subject":"alice","issuer":"https://idp.example","agent":"planner","capabilities":["github:*"]}')
+ROOT_TOKEN=$(echo "$ROOT" | jq -r .access_token); ROOT_LEASE=$(echo "$ROOT" | jq -r .lease)
+
+# 2. RFC 8693 exchange: planner delegates read_file only to a "coder" sub-agent.
+CHILD_TOKEN=$(curl -s -X POST $OB/token \
+  --data-urlencode grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+  --data-urlencode subject_token=$ROOT_TOKEN \
+  --data-urlencode subject_token_type=urn:ietf:params:oauth:token-type:jwt \
+  --data-urlencode actor=coder \
+  --data-urlencode scope=github:read_file | jq -r .access_token)
+
+# 3. Call through the proxy: read_file is allowed (forwarded upstream).
+mcp() { curl -s -X POST $OB/mcp/github -H "Authorization: Bearer $CHILD_TOKEN" \
+  -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d "$1"; }
+mcp '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"repo":"acme/api"}}}'
+
+# 4. See a denial: the coder was never delegated create_issue.
+mcp '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_issue","arguments":{"repo":"acme/api","title":"x"}}}'
+# {"jsonrpc":"2.0","id":2,"error":{"code":-32003,"message":"onbehalf: denied: capability_denied",...}}
+
+# 5. Revoke the ROOT lease; the revocation cascades to the coder's lease.
+curl -s -X POST $OB/admin/leases/$ROOT_LEASE/revoke -H "Authorization: Bearer $ADMIN" \
+  -H 'content-type: application/json' -d '{"reason":"demo"}'
+# {"lease_id":"...","revoked":2,"reason":"demo"}
+
+# 6. The coder's next call is denied.
+mcp '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"repo":"acme/api"}}}'
+# ... "message":"onbehalf: denied: lease_revoked" ...
+
+# Every decision and issuance is in the hash-chained audit log.
+curl -s $OB/admin/audit/verify -H "Authorization: Bearer $ADMIN"   # {"entries":5,"ok":true,"first_bad_seq":null}
+curl -s "$OB/admin/audit?from=1&limit=20" -H "Authorization: Bearer $ADMIN" | jq '.entries[].record | {decision,reason,tool,agents}'
+```
+
+Other endpoints: `POST /access/v1/evaluation` (AuthZEN; send the delegation token as bearer), `GET /.well-known/jwks.json`, `GET /.well-known/authzen-configuration`, `POST /admin/policies/reload`, `GET /admin/leases/{id}`, `GET /admin/audit/checkpoint`, `GET /healthz`. The request pipeline is described in [docs/design/server.md](docs/design/server.md). Set `RUST_LOG=debug` for more logging.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
