@@ -3,6 +3,47 @@
 - Date: 2026-10-22
 - Related: [RFC-0001](../spec/rfc-0001-onbehalf.md), [standards](standards.md), [ADR-0002](../decisions/0002-cedar-for-policy.md)
 
+## Positioning table
+
+How onbehalf compares with the things people usually ask about. This is a quick orientation, not a benchmark. It is built from public documentation and the sources cited in this file as of 2026-10-22, not from hands-on testing, and the other products change. Where we are not sure, the cell says `?`. Corrections are welcome.
+
+Legend: **Yes** is a built-in feature. **No** means the product does not do this by design or by scope. **Partial** means some of it, or it depends on configuration. **n/a** means the question does not apply to that kind of tool. **Varies** means the answer differs between products in the category. **?** means we are not confident.
+
+Columns:
+
+- **Delegation chain**: a token or record carries the verified user plus every agent between the user and the caller.
+- **Per-call attenuation**: each hop's authority can only shrink, and it is checked on every call against the call's arguments.
+- **In-flight revocation**: authority can be withdrawn while a run is in progress, and the next call is refused.
+- **Tamper-evident audit**: the log can show that entries were changed or removed.
+- **Self-hosted**: you can run it on your own infrastructure.
+- **IdP-neutral**: it works with the identity provider you already have.
+
+| | Delegation chain | Per-call attenuation | In-flight revocation | Tamper-evident audit | Self-hosted | IdP-neutral |
+| --- | --- | --- | --- | --- | --- | --- |
+| **onbehalf** (v0) | Yes | Yes | Yes (leases) | Yes (hash chain; needs an off-host checkpoint to catch truncation) | Yes | Yes (any OIDC issuer; tested only with locally signed tokens) |
+| OAuth 2.1 scopes alone | No | No | Partial (short expiry, token revocation where the server supports it) | No | n/a | Yes |
+| API gateways (Kong, Envoy `ext_authz`) | No | No | ? (depends on the external authorizer) | No | Yes | Yes |
+| OpenFGA, SpiceDB | No | No | Partial (a deleted relationship applies at the next check; no notion of a run) | ? | Yes | Yes |
+| Cerbos, OPA | No | No | No | ? (decision logs exist; tamper evidence not known) | Yes | Yes |
+| Teleport Machine ID | No | ? | Partial (short-lived credentials) | ? | Yes | Yes (OIDC and SAML connectors for users) |
+| SPIRE | No | No | Partial (short-lived SVIDs) | No | Yes | n/a (workload identity, not user login) |
+| Microsoft Entra Agent ID | ? | ? | ? | ? | No | No (Entra) |
+| Okta, Auth0 for AI agents | ? | ? | ? | ? | No | No (their own IdP) |
+| AgentGateway | No | ? (RBAC with CEL per request; no per-hop narrowing known) | ? | ? | Yes | Yes (JWT and OAuth) |
+| MCP guardrail products | Varies | Varies | Varies | Varies | Varies | Varies |
+
+Notes:
+
+- **onbehalf** is the only row that claims all of the first four columns, and it does so for MCP tool calls through its proxy or AuthZEN endpoint. "Yes" means implemented in this repository, with the gaps in [RFC-0001 section 10](../spec/rfc-0001-onbehalf.md#10-implementation-status) and [design/server.md](../design/server.md#known-limits-v0): the `actor` of an exchange is asserted not proven, revocation is checked per request but not pushed to external PEPs, and none of it has been load tested.
+- **OAuth scopes alone** can carry a delegation chain with RFC 8693 `act` claims, but scopes themselves say nothing about hops or arguments.
+- **Gateways** can call an external authorizer on each request, so they can enforce what onbehalf decides. onbehalf speaks AuthZEN, not Envoy's `ext_authz` protocol, so an adapter would be needed. We have not built or tried one.
+- **OpenFGA and SpiceDB** are relationship-based (Zanzibar-style) engines. They are a good source of facts such as "who owns this repo" and onbehalf plans to consume them ([ADR-0002](../decisions/0002-cedar-for-policy.md), task board "Later"). They do not issue tokens or sit in the request path.
+- **Cerbos and OPA** are policy decision points. onbehalf uses Cedar for the same job. They do not issue delegation tokens.
+- **Teleport Machine ID and SPIRE** identify machines and workloads. They complement onbehalf, which identifies the delegation, and could supply the proven `actor` identity that v0 lacks. We do not know how far Teleport goes at the level of an individual MCP tool call.
+- **Microsoft Entra Agent ID and Okta or Auth0 for AI agents** are hosted identity products. They issue and manage agent identities. As of the sources in [standards.md](standards.md), Okta ships ID-JAG and Entra Agent ID does not. We did not confirm what any of them enforce per call or how they revoke mid-run, hence the `?`.
+- **AgentGateway** is a Linux Foundation MCP and A2A proxy with CEL-based RBAC and OpenTelemetry. The relationship is complementary: see the section below.
+- **MCP guardrail products** vary too much to put in one row. A vendor-written survey, cited below under "Other open-source MCP gateways" and to be treated as a claim, found none of the five it covers carrying an originating user across hops or attenuating per hop.
+
 ## Research systems
 
 ### AgentGate (NeurIPS 2026)

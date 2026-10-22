@@ -39,6 +39,13 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ### Fixed
 
+### Documentation
+
+- Guides in `docs/guides/`: getting started, deploying (with the v0 limits stated plainly), integrating MCP clients, and identity providers (Keycloak, Auth0, Okta, Entra ID, Google; provider recipes marked untested). Index in `docs/guides/README.md`.
+- `docs/faq.md`: fifteen launch-day questions.
+- Positioning table in `docs/research/related-work.md`.
+- RFC-0001 section 7 now says what the audit log implements today (hash over `(seq, prev_hash, record)`, no automatic checkpoints, no `kind` field) next to the design target.
+
 ### Security
 
 [Unreleased]: https://github.com/7Mudit/onbehalf/compare/main...HEAD

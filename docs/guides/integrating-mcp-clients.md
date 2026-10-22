@@ -1,0 +1,261 @@
+# Integrating MCP clients
+
+This guide is for the person writing the agent side: an agent framework, an MCP client library, or a script. It covers how to send the onbehalf token, how a token passes from one agent to the next, what to do with a denial, how to keep a lease alive, and how a client that does not speak MCP can ask onbehalf for a decision.
+
+The examples use `curl` so you can see the wire format. Every request and response shape below was run against a local server.
+
+## The model in one paragraph
+
+An agent holds a **delegation token**: a signed JWT that names the user the agent acts for, every agent between the user and this one, what each of them may do, and a lease id for each hop. The agent sends it as a bearer on every request to the proxy. The proxy checks it and decides each call. When the agent wants a sub-agent to do part of the work, it exchanges its own token for a narrower one and hands that over. Nobody ever gets more than the hop above them had.
+
+## Sending the bearer to the proxy
+
+onbehalf mounts each configured upstream at `/mcp/<name>` and speaks MCP Streamable HTTP on it. To use an upstream through onbehalf:
+
+1. Change the MCP server URL in your client from the upstream's URL to `https://<onbehalf host>/mcp/<name>`.
+2. Send `Authorization: Bearer <delegation token>` on every request, including `initialize`, `tools/list` and the `GET` and `DELETE` session requests. Without it, or with a bad one, you get HTTP 401 and JSON-RPC error `-32001`.
+3. Keep sending `Accept: application/json, text/event-stream` and `Content-Type: application/json` as MCP requires. The proxy forwards `Accept`, `Content-Type`, `Mcp-Session-Id`, `Mcp-Protocol-Version` and `Last-Event-ID` to the upstream.
+
+```sh
+curl -s -X POST https://onbehalf.example.com/mcp/github \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -H 'accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"repo":"acme/api","path":"README.md"}}}'
+```
+
+Things that are different from a plain MCP server:
+
+- **The bearer is not forwarded.** The upstream never sees the onbehalf token. If the upstream needs its own credential, onbehalf has no setting for injecting one in v0. Today that means the upstream must trust the proxy by network placement, or hold its own static credential.
+- **No OAuth discovery.** onbehalf does not serve Protected Resource Metadata (RFC 9728) or an authorization server. A 401 carries `WWW-Authenticate: Bearer realm="onbehalf"` and nothing else. An MCP client that tries to discover an authorization server will not find one. Configure the bearer yourself, as a static header or through a token provider you write.
+- **Whether your MCP client lets you set a header** (and refresh it) depends on the client. Most Streamable HTTP clients take custom headers. Which ones support changing the header between requests is untested here. If yours cannot, run a small local forwarder that adds a fresh bearer.
+- **`tools/list` is filtered.** You see only the tools the token may call. A tool missing from the list is not necessarily missing upstream.
+- **Resources and prompts are authorized like tool calls.** `resources/read`, `resources/subscribe`, `prompts/get` and `completion/complete` need a capability with the method name as the tool, for example `github:resources/read`. Any other method outside a short allowlist is denied unless a capability and the policy permit it. `resources/list` and `prompts/list` are not filtered in v0. See [design/server.md](../design/server.md#mcp-method-coverage).
+
+Every response to a request that was decided carries the header `X-Onbehalf-Decision-Id`, a comma-separated list in request order when the body is a batch.
+
+## Getting the first token
+
+The first token in a chain is the **root token**. It binds one user to one agent. How you get it depends on the deployment:
+
+- **Production.** The agent authenticates itself to `POST /token` with its client id and secret and presents a credential the user's identity provider issued: an OIDC ID token or an ID-JAG. onbehalf checks the credential and builds the user block from it. Details are in [Identity providers](identity-providers.md).
+- **Development.** An operator mints it with `onbehalf token root`, which needs `[dev] allow_root_mint = true`. See [Getting started](getting-started.md).
+
+A root token request, from a registered agent:
+
+```sh
+curl -s -X POST https://onbehalf.example.com/token \
+  -u planner:$PLANNER_SECRET \
+  --data-urlencode grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+  --data-urlencode subject_token=$ID_TOKEN \
+  --data-urlencode subject_token_type=urn:ietf:params:oauth:token-type:id_token \
+  --data-urlencode scope='github:*'
+```
+
+The response:
+
+```json
+{
+  "access_token": "<jwt>",
+  "issued_token_type": "urn:ietf:params:oauth:token-type:jwt",
+  "token_type": "Bearer",
+  "expires_in": 900,
+  "lease": "5b0c6f0e-0d54-4d0e-9a53-0c1f6a9c2a11"
+}
+```
+
+Keep `access_token` and `lease`. You need the token for every call and the lease id if your orchestration wants to show or revoke it.
+
+## How exchange works, hop to hop
+
+Take a run with a planner, a coder and a tester. Alice asks the planner to fix a bug.
+
+1. **Hop 0.** The planner trades Alice's login for a root token. The token says: Alice, acting through `planner`, may call `github:*`.
+2. **Hop 1.** The planner decides the coder should read files and open issues in one repository. It sends its own token to `POST /token` as the `subject_token`, names `coder` as the `actor`, and asks for `github:read_file` and `github:create_issue` limited to `acme/api`. The server checks that the request fits inside what the planner holds. It returns a new token for the coder. The planner passes it to the coder.
+3. **Hop 2.** The coder wants the tester to read files only. It repeats step 2 with its token and asks for `github:read_file`. The result is a token for the tester.
+
+At every step the rule is the same: the requested capabilities must be covered by the token you present, the new token cannot outlive its parent, and the chain cannot be deeper than `max_depth` (default 8). A request that breaks any of these fails with 400 and nothing is issued.
+
+The exchange request, with a constraint, as JSON:
+
+```sh
+curl -s -X POST https://onbehalf.example.com/token \
+  -H 'content-type: application/json' \
+  -d '{
+    "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+    "subject_token": "'"$PLANNER_TOKEN"'",
+    "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+    "actor": "coder",
+    "requested_ttl_seconds": 600,
+    "authorization_details": [
+      { "type": "onbehalf_capabilities",
+        "capabilities": [
+          { "server": "github", "tool": "create_issue",
+            "constraints": { "repo": { "op": "prefix", "value": "acme/" } } }
+        ] }
+    ]
+  }'
+```
+
+The form encoding takes `scope` instead, a space-separated list of `server:tool` with no constraints:
+
+```sh
+curl -s -X POST https://onbehalf.example.com/token \
+  --data-urlencode grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+  --data-urlencode subject_token=$PLANNER_TOKEN \
+  --data-urlencode subject_token_type=urn:ietf:params:oauth:token-type:jwt \
+  --data-urlencode actor=coder \
+  --data-urlencode scope='github:read_file github:create_issue'
+```
+
+Rules to know:
+
+- Capabilities are `{server, tool, constraints}`. `server` and `tool` are an exact name, `*`, or a prefix glob such as `read_*`. A constraint is `equals`, `one_of` or `prefix` on one argument. A call that leaves out a constrained argument is denied.
+- A child must constrain every argument its parent constrains, at least as tightly. It may add constraints.
+- A child is covered only by a single parent capability, not by a combination of several. If you need to split authority, ask for each piece separately.
+- A parent whose lease is revoked, expired or unknown cannot delegate. The exchange fails with `invalid_grant`.
+- `actor` is a name you choose and the server records. In v0 it is asserted by the caller and not proven, so do not use agent ids as a security boundary between agents that share a runtime. The `[[agents]]` secrets protect hop 0 only.
+- Failed exchanges answer `{"error": "...", "detail": "..."}`. `invalid_scope` means you asked for too much. `invalid_grant` means the parent token or one of its leases is no good.
+
+Each hop gets its own lease. Revoking a lease revokes its whole subtree. So if the tester misbehaves, revoke the tester's lease and only the tester stops. If the planner's lease is revoked, all three stop.
+
+To see what a token carries:
+
+```sh
+onbehalf token inspect "$TOKEN" --verify
+```
+
+## Handling `DENIED` responses
+
+A denied `tools/call` comes back as HTTP 200 with a JSON-RPC error. The MCP request was understood and answered. The answer is no.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "error": {
+    "code": -32003,
+    "message": "onbehalf: denied: capability_denied",
+    "data": {
+      "reason": "capability_denied",
+      "decision_id": "98849dc3-f053-4649-9b1a-fae0c2f11426"
+    }
+  }
+}
+```
+
+Code on `-32003`. Branch on `error.data.reason`, not on the message text. The `decision_id` is the id of the audit record for this decision. It is also in the `X-Onbehalf-Decision-Id` header.
+
+What each reason means for the agent:
+
+| `reason` | Meaning | What the client should do |
+| --- | --- | --- |
+| `capability_denied` | The token does not allow this tool or these arguments | Do not retry. Tell the model the tool is unavailable. Ask the parent for a wider token only if the task truly needs it |
+| `policy_deny` | The token allows it but the Cedar policy does not | Do not retry with the same arguments. A different argument value may pass |
+| `lease_revoked` | The hop, or an ancestor, was revoked | Stop the run. This is the user or an operator pulling the plug. Do not renew or re-exchange. Surface it |
+| `lease_expired` | The lease ran out before it was renewed | Call `POST /token/renew`, then retry once. If renewal fails, stop |
+| `lease_unknown` | The server does not know a lease in the chain | Treat as fatal. The token was not issued by this server, or the database was reset |
+| `audit_error`, `lease_error`, `policy_error` | Internal failure. The server fails closed | Retry with backoff a few times, then give up and alert an operator |
+
+A request with no valid token is different: HTTP 401, JSON-RPC `-32001`, and `"id": null` when the proxy could not read the request id. The message ends in the cause, for example `lease inactive: lease_revoked` on a request that carries no per-call decision, such as `tools/list`. An expired or malformed token is a 401 as well. On a 401, a client that holds a fresh credential can re-run its exchange. One that does not should stop.
+
+Other proxy errors: `-32004` (HTTP 404) for an unknown upstream name, `-32005` (HTTP 502) when the upstream cannot be reached, `-32602` for a request missing a field the proxy needs.
+
+Good client behaviour:
+
+- Return the denial to the model as a plain tool error that says what was denied and why, in your words. Do not paste raw server output into the model's context, and do not invite it to try other routes.
+- Log the `decision_id` next to your own request id. When a user asks "why did the agent not do X", an operator can look it up. Over HTTP: `GET /admin/audit?from=1&limit=1000`, then pick the entry where `record.id` matches. With the CLI and `jq`: `onbehalf --json audit tail -n 1000 | jq '.entries[] | select(.record.id == "<decision id>")'`. Untested against a large log.
+- Do not loop on a denial. A denial is a decision, not a glitch.
+
+## Renewing leases
+
+A lease is short-lived. When it expires, calls on that hop are denied with `lease_expired` even if the token itself is still valid. The agent that holds the token keeps its lease alive.
+
+```sh
+curl -s -X POST https://onbehalf.example.com/token/renew \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{
+  "lease": "a94b3c66-5c93-4ea3-a847-10f75757d95b",
+  "expires_at": "2026-10-22T22:22:40.733780689Z",
+  "expires_in": 299
+}
+```
+
+How to use it:
+
+- Renew your own hop only. The bearer is your token, and only the last hop's lease is extended. A parent's lease is the parent's job.
+- Renew at about a third of `lease_interval_seconds` (default 300, so about every 100 seconds). The response's `expires_in` tells you the real window. Use it instead of a hard-coded number.
+- The new expiry is the shortest of now plus the interval, the token's own `exp`, and the parent lease's expiry. It never shortens an existing lease. When the token itself is about to expire, renewing cannot help. Ask for a new token through an exchange.
+- Renewal fails with `400 invalid_grant` and `detail` `lease_revoked`, `lease_expired` or `lease_unknown` when the lease or an ancestor is in that state. A revoked lease is final. Stop.
+- An expired token gets 401. Mint a new one.
+- Every renewal is one audit row. Do not renew faster than you need to.
+
+A client that has finished should simply stop renewing. The lease lapses on its own. There is no "release" call in v0. The operator can revoke at once if needed with `onbehalf lease revoke <id>`.
+
+A sub-agent that crashes and stops renewing is denied within one interval. A revoke is immediate.
+
+## Using the AuthZEN endpoint from a non-MCP PEP
+
+You do not need MCP to use onbehalf. `POST /access/v1/evaluation` is an [OpenID AuthZEN](https://openid.net/wg/authzen/) Authorization API endpoint. Anything that enforces policy, such as an API gateway, a sidecar, a function wrapper or a service that guards its own routes, can send it a question and enforce the answer. The same pipeline decides, so you get the same lease check, the same capability check, the same Cedar policy and the same audit record as the proxy path.
+
+The discovery document is at `/.well-known/authzen-configuration`.
+
+The simplest form sends the delegation token as the bearer and describes the call in the body:
+
+```sh
+curl -s -X POST https://onbehalf.example.com/access/v1/evaluation \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{
+    "subject":  { "type": "agent", "id": "" },
+    "action":   { "name": "create_issue", "properties": { "server": "github" } },
+    "resource": { "type": "tool", "id": "github/create_issue",
+                  "properties": { "server": "github", "tool": "create_issue" } },
+    "context":  { "input": { "repo": "acme/api", "title": "x" } }
+  }'
+```
+
+An allow:
+
+```json
+{
+  "decision": true,
+  "context": {
+    "reason": "policy_allow",
+    "policy_ids": ["permit_create_issue_in_acme"],
+    "diagnostics": [],
+    "decision_id": "97474e21-9d8a-4d2d-bd55-5ee4b9eb278f"
+  }
+}
+```
+
+A deny has `"decision": false` and a `reason` from the same list as above, with `diagnostics` explaining it in prose. Prose may change between versions, so branch on `reason`.
+
+Field notes:
+
+- `subject.type` must be `agent`. An empty `subject.id` is filled from the token's current agent.
+- `action.name` is the tool name. The server name comes from `action.properties.server` or `resource.properties.server`. `resource.type` is `tool`.
+- Tool arguments go in `context.input`. An optional `context.session_id` is passed to policy.
+- The chain comes from the verified token. If you also send `subject.properties.chain`, it must equal the token's chain, or you get 400 `chain_mismatch`.
+- The call is audited as an ordinary decision, so the `decision_id` points at a real row.
+- Each question is a decision, and it is logged. Ask once per action you will enforce.
+
+The CLI does the same: `onbehalf authzen eval --token "$TOKEN" --server github --tool create_issue --arg repo=acme/api --arg title=x`. It exits 2 on a negative decision.
+
+**Without a bearer.** A PEP that cannot carry the token can send the chain in `subject.properties.chain`. The server then trusts the chain as asserted by the PEP. It still checks that the chain is well-formed and that every lease in it is live in its registry, so a chain it never issued is denied with `lease_unknown`. The signatures are not in the body, so this is only as trustworthy as the network path. Allow it only from PEPs you control. Prefer the bearer.
+
+**Enforcing the answer.** onbehalf only answers. The PEP has to refuse the action on `false`, and refuse it when the call to onbehalf fails. A PEP that fails open turns onbehalf off. Revocation reaches a PEP only when it asks, since there is no push channel in v0. Do not cache an allow for longer than you are willing to leave a revoked agent running.
+
+## A checklist for client authors
+
+- Send the bearer on every request to `/mcp/<name>`.
+- Keep the token and its lease id together, per agent.
+- Treat `-32003` as a decision. Branch on `data.reason`. Never retry blindly.
+- Log `decision_id`.
+- Renew your lease at a third of the interval, and stop on `lease_revoked`.
+- Refresh the root token before it expires. Tokens last `default_ttl_seconds` (900 by default).
+- Hand sub-agents the narrowest token that does the job, with the shortest TTL that does the job.
+- Keep tokens out of prompts, tool arguments and logs. A token in a model's context can be leaked by the model.
