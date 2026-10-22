@@ -1,0 +1,86 @@
+# Tests for policy.cedar, run offline by `onbehalf policy test` (and by run.sh).
+# The catalog is read from the demo's server config, so the tests see the same tools as the
+# server does. Hops without `capabilities` get exactly the call's server:tool.
+policies: ./policy.cedar
+catalog: ./config.toml
+
+cases:
+  - name: coder may read a public repo
+    user: { subject: alice, attributes: { mfa: true } }
+    chain: [assistant, coder]
+    call:
+      server: github
+      tool: read_file
+      arguments: { repo: alice/public-docs, path: README.md }
+    expect: allow
+    reason: policy_allow
+    policy_ids: [read_file_public_repos_only]
+
+  - name: the injected read of a private repo is denied
+    chain: [assistant, coder]
+    call:
+      server: github
+      tool: read_file
+      arguments: { repo: alice/private-salaries, path: 2025.csv }
+    expect: deny
+    reason: policy_deny
+
+  - name: read_file without a repo argument is denied
+    chain: [assistant, coder]
+    call: { server: github, tool: read_file, arguments: { path: README.md } }
+    expect: deny
+    reason: policy_deny
+
+  - name: create_issue is denied by capability when coder was only given read_file
+    chain:
+      - { agent: assistant, capabilities: ["github:*"] }
+      - { agent: coder, capabilities: ["github:read_file"] }
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: alice/public-docs, title: leak }
+    expect: deny
+    reason: capability_denied
+
+  - name: the assistant's own broad token still gets no permit for create_issue
+    chain:
+      - { agent: assistant, capabilities: ["github:*"] }
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: alice/public-docs, title: hi }
+    expect: deny
+    reason: policy_deny
+
+  - name: delete_repo without MFA is denied by the forbid
+    user: { subject: alice }
+    chain: [assistant]
+    call: { server: github, tool: delete_repo, arguments: { repo: alice/public-docs } }
+    expect: deny
+    reason: policy_deny
+    policy_ids: [forbid_sensitive_without_mfa]
+
+  - name: delete_repo with MFA is still denied, because nothing permits it
+    user: { subject: alice, attributes: { mfa: true } }
+    chain: [assistant]
+    call: { server: github, tool: delete_repo, arguments: { repo: alice/public-docs } }
+    expect: deny
+    reason: policy_deny
+    policy_ids: []
+
+  - name: a four-agent chain is forbidden even for a public read
+    chain: [assistant, planner, helper, coder]
+    call:
+      server: github
+      tool: read_file
+      arguments: { repo: alice/public-docs, path: README.md }
+    expect: deny
+    policy_ids: [forbid_deep_chains]
+
+  - name: a three-agent chain is fine
+    chain: [assistant, planner, coder]
+    call:
+      server: github
+      tool: read_file
+      arguments: { repo: alice/public-docs, path: README.md }
+    expect: allow

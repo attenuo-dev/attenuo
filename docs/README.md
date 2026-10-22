@@ -3,6 +3,7 @@
 This folder is an Obsidian vault (open it with "Open folder as vault") and the project's public-safe knowledge base.
 
 - [spec/](spec/) — the RFC, threat model, and protocol/API specifications
+- [guides/](guides/) — how-to guides for operators, starting with [writing and testing policies](guides/writing-policies.md)
 - [design/](design/) — architecture notes and component designs
 - [decisions/](decisions/) — Architecture Decision Records (ADRs), numbered
 - [research/](research/) — technical research with citations (standards, papers, incidents)

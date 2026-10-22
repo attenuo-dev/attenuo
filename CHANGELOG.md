@@ -23,6 +23,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 - Proxy enforcement coverage: `resources/read`, `resources/subscribe`, `prompts/get` and `completion/complete` are authorized as tool calls, and any other non-notification method outside the allowlist is denied unless a capability and the policy permit a tool named after the method. Mapping documented in `onbehalf-proxy` and `docs/design/server.md`.
 - Criterion benchmarks for `PolicyEngine::authorize` and `CapabilitySet::covers`; numbers in `docs/design/performance.md`.
 - ADR-0006: lease-based in-flight revocation.
+- Policy test harness: `onbehalf_policy::testing` loads YAML test files (user, agent chain, call, expected decision, reason and deciding policy ids), builds real delegation chains, runs them through `PolicyEngine::authorize` and returns a report. `onbehalf policy test <file>... [--json]` runs them offline (exit 0 pass, 1 error, 2 failures). `onbehalf policy lint <policy.cedar> [--config server.toml] [--schema]` parses and validates a policy file against the schema generated from the catalog, with line and column. `onbehalf_policy::lint` exposes the same check as a library. Example: `examples/github-leak-demo/policy_test.yaml`, run by `run.sh`. Guide: `docs/guides/writing-policies.md`.
 
 ### Changed
 
