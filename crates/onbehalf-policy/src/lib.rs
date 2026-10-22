@@ -134,8 +134,10 @@
 
 pub mod authzen;
 mod catalog;
+mod lint;
 mod request;
 mod schema;
+pub mod testing;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -149,6 +151,7 @@ use onbehalf_core::{Decision, DelegationChain, ToolCall};
 use time::OffsetDateTime;
 
 pub use catalog::{ArgType, ToolAttrs, ToolCatalog};
+pub use lint::{lint, LintIssue, LintReport, LintSeverity};
 pub use schema::{default_user_attrs, DEFAULT_SCHEMA, GENERIC_ACTION};
 
 /// The starter policy set shipped with the crate (`policies/default.cedar`).
