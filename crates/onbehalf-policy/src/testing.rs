@@ -74,7 +74,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::{Duration, OffsetDateTime};
 
-use crate::{Outcome, PolicyEngine, PolicyEngineBuilder, PolicyError, ToolAttrs, ToolCatalog};
+use crate::{
+    ArgType, Outcome, PolicyEngine, PolicyEngineBuilder, PolicyError, ToolAttrs, ToolCatalog,
+};
 
 /// The evaluation time used when a test file does not set `now`: 2025-10-09T08:53:20Z.
 pub const DEFAULT_NOW_UNIX: i64 = 1_760_000_000;
@@ -152,6 +154,31 @@ pub fn load_catalog_from_config(path: &Path) -> Result<ToolCatalog, HarnessError
         }
     }
     Ok(catalog)
+}
+
+/// Read `[policy] user_attributes` (`name = "string" | "long" | "bool" | "set<...>"`) from a
+/// server config, the extra `originating_user.attributes` the schema should declare. A JSON
+/// file or a config without the table yields an empty map.
+pub fn load_user_attrs(path: &Path) -> Result<BTreeMap<String, ArgType>, HarnessError> {
+    if path.extension().and_then(|e| e.to_str()) == Some("json") {
+        return Ok(BTreeMap::new());
+    }
+    let what = format!("user_attributes in {}", path.display());
+    let doc: toml::Table = read(path)?
+        .parse()
+        .map_err(|e: toml::de::Error| HarnessError::invalid(&what, e))?;
+    let Some(decls) = doc
+        .get("policy")
+        .and_then(|p| p.as_table())
+        .and_then(|p| p.get("user_attributes"))
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let decls: BTreeMap<String, String> = decls
+        .clone()
+        .try_into()
+        .map_err(|e: toml::de::Error| HarnessError::invalid(&what, e))?;
+    crate::parse_user_attributes(&decls).map_err(|e| HarnessError::invalid(&what, e))
 }
 
 /// Read a JSON catalog file: `{ "<server>": { "<tool>": { "readonly": true, ... } } }`.
@@ -412,6 +439,11 @@ impl TestFile {
     /// Cedar denies everything.
     pub fn build_engine(&self) -> Result<PolicyEngine, HarnessError> {
         let mut builder = PolicyEngineBuilder::new().with_catalog(self.load_catalog()?);
+        if let Some(CatalogSpec::Path(p)) = &self.catalog {
+            for (name, ty) in load_user_attrs(&self.resolve(p))? {
+                builder = builder.with_user_attr(name, ty);
+            }
+        }
         if let Some(p) = &self.policies {
             builder = builder.with_policies_file(self.resolve(p));
         }
@@ -729,6 +761,24 @@ catalog:
         for c in &r.cases {
             assert!(c.passed, "{}: {:?} {:?}", c.name, c.failures, c.error);
         }
+    }
+
+    #[test]
+    fn user_attributes_are_read_from_a_server_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("server.toml");
+        std::fs::write(
+            &cfg,
+            "[policy.user_attributes]\ngroups = \"set<string>\"\ndepartment = \"string\"\n",
+        )
+        .unwrap();
+        let attrs = load_user_attrs(&cfg).unwrap();
+        assert_eq!(attrs["groups"], ArgType::Set(Box::new(ArgType::String)));
+        assert_eq!(attrs["department"], ArgType::String);
+        std::fs::write(&cfg, "[policy.user_attributes]\ngroups = \"nope\"\n").unwrap();
+        assert!(load_user_attrs(&cfg).is_err());
+        std::fs::write(&cfg, "[server]\n").unwrap();
+        assert!(load_user_attrs(&cfg).unwrap().is_empty());
     }
 
     #[test]

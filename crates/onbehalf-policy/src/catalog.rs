@@ -22,6 +22,42 @@ pub enum ArgType {
     Set(Box<ArgType>),
 }
 
+impl std::str::FromStr for ArgType {
+    type Err = String;
+
+    /// Parse `string`, `long`, `bool` or `set<T>` (case-insensitive, spaces ignored), the
+    /// notation used by `[policy] user_attributes` in the server config.
+    fn from_str(s: &str) -> Result<Self, String> {
+        let t = s.trim().to_ascii_lowercase();
+        match t.as_str() {
+            "string" => Ok(ArgType::String),
+            "long" => Ok(ArgType::Long),
+            "bool" => Ok(ArgType::Bool),
+            _ => match t.strip_prefix("set<").and_then(|r| r.strip_suffix('>')) {
+                Some(inner) => Ok(ArgType::Set(Box::new(inner.parse()?))),
+                None => Err(format!(
+                    "unknown type `{}`: expected string, long, bool or set<...>",
+                    s.trim()
+                )),
+            },
+        }
+    }
+}
+
+/// Parse a `{ name = "type" }` table of user attribute declarations.
+pub fn parse_user_attributes(
+    decls: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, ArgType>, String> {
+    decls
+        .iter()
+        .map(|(name, ty)| {
+            ty.parse()
+                .map(|t| (name.clone(), t))
+                .map_err(|e| format!("user_attributes.{name}: {e}"))
+        })
+        .collect()
+}
+
 impl ArgType {
     /// Render as Cedar schema syntax.
     pub(crate) fn cedar(&self) -> String {

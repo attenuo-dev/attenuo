@@ -35,6 +35,12 @@ policies_path = "config/policies/default.cedar"
 # { "github": { "read_file": { "readonly": true, "inputs": { "repo": "string" } } } }
 # catalog_path = "config/catalog.json"
 
+# Extra originating_user.attributes the Cedar schema should know, so policies that test them
+# validate. Types: string, long, bool, set<string> (any scalar inside set<>). The built-in four
+# (mfa: bool, roles: set<string>, tenant: string, email: string) are always declared.
+# The values come from the IdP token claims listed in [[idps]] attribute_claims.
+user_attributes = { groups = "set<string>", department = "string" }
+
 [policy.catalog.github.read_file]
 readonly = true
 inputs = { repo = "string", path = "string" }

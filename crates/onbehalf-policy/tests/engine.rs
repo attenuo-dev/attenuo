@@ -724,3 +724,98 @@ fn integral_floats_are_longs_so_equality_forbids_hold() {
     let call = ToolCall::new("github", "read_file", json!({ "limit": 0.5 }));
     assert!(engine.authorize(&chain(), &call, now()).decision.is_allow());
 }
+
+// ---------------------------------------------------------------------------------------------
+// Extra user attributes declared in the schema
+// ---------------------------------------------------------------------------------------------
+
+const GROUP_POLICY: &str = r#"
+@id("eng_reads")
+permit(principal, action == Action::"read_file", resource)
+when {
+    context.originating_user.attributes has groups &&
+    context.originating_user.attributes.groups.contains("eng") &&
+    context.originating_user.attributes has department &&
+    context.originating_user.attributes.department == "platform"
+};
+"#;
+
+#[test]
+fn undeclared_user_attribute_warns_and_declared_one_validates_and_matches() {
+    let call = ToolCall::new("github", "read_file", json!({"repo": "a/b", "path": "x"}));
+    let eng_user = || {
+        user_with(&[
+            ("groups", json!(["eng", "oncall"])),
+            ("department", json!("platform")),
+        ])
+    };
+
+    // `groups` is not one of the built-in attributes, so the validator reports the policy as
+    // impossible. (Evaluation is schema-free, so it would still run; the warning is what tells
+    // the operator the schema does not know the attribute.)
+    let undeclared = PolicyEngineBuilder::new()
+        .with_catalog(catalog())
+        .with_policies_str(GROUP_POLICY)
+        .build()
+        .unwrap();
+    assert!(
+        undeclared
+            .validation_warnings()
+            .iter()
+            .any(|w| w.contains("eng_reads")),
+        "expected an impossible-policy warning, got {:?}",
+        undeclared.validation_warnings()
+    );
+
+    let engine = PolicyEngineBuilder::new()
+        .with_catalog(catalog())
+        .with_user_attr("groups", "set<string>".parse().unwrap())
+        .with_user_attr("department", ArgType::String)
+        .with_policies_str(GROUP_POLICY)
+        .build()
+        .expect("declared attributes validate");
+    assert!(engine.validation_warnings().is_empty());
+    let c = chain_for(
+        eng_user(),
+        "coder",
+        caps(vec![Capability::new("github", "*")]),
+    );
+    let out = engine.authorize(&c, &call, now());
+    assert_eq!(out.decision, Decision::Allow, "{out:?}");
+    assert_eq!(out.policy_ids, vec!["eng_reads"]);
+
+    let wrong_group = user_with(&[
+        ("groups", json!(["sales"])),
+        ("department", json!("platform")),
+    ]);
+    let c = chain_for(
+        wrong_group,
+        "coder",
+        caps(vec![Capability::new("github", "*")]),
+    );
+    assert_eq!(engine.authorize(&c, &call, now()).decision, Decision::Deny);
+
+    // No groups at all: the `has` guard keeps it a clean deny, not an evaluation error.
+    let c = chain_for(user(), "coder", caps(vec![Capability::new("github", "*")]));
+    let out = engine.authorize(&c, &call, now());
+    assert_eq!(out.decision, Decision::Deny);
+    assert_eq!(out.reason, REASON_POLICY_DENY);
+}
+
+#[test]
+fn arg_type_notation_parses() {
+    assert_eq!("string".parse::<ArgType>().unwrap(), ArgType::String);
+    assert_eq!(" Long ".parse::<ArgType>().unwrap(), ArgType::Long);
+    assert_eq!("bool".parse::<ArgType>().unwrap(), ArgType::Bool);
+    assert_eq!(
+        "set<string>".parse::<ArgType>().unwrap(),
+        ArgType::Set(Box::new(ArgType::String))
+    );
+    assert_eq!(
+        "set<set<long>>".parse::<ArgType>().unwrap(),
+        ArgType::Set(Box::new(ArgType::Set(Box::new(ArgType::Long))))
+    );
+    for bad in ["", "str", "set<>", "set<nope>", "set<string", "record"] {
+        assert!(bad.parse::<ArgType>().is_err(), "{bad}");
+    }
+}

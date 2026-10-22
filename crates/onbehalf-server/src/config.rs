@@ -153,6 +153,12 @@ pub struct PolicySection {
     /// Merged over the inline catalog.
     #[serde(default)]
     pub catalog_path: Option<PathBuf>,
+    /// Extra attributes of `originating_user.attributes` to declare in the Cedar schema, as
+    /// `name = "string" | "long" | "bool" | "set<string>"` (any scalar inside `set<...>`).
+    /// Merged over the built-in `mfa`, `roles`, `tenant` and `email`. Without a declaration, a
+    /// policy that tests an attribute fails validation instead of silently never matching.
+    #[serde(default)]
+    pub user_attributes: BTreeMap<String, String>,
 }
 
 impl PolicySection {

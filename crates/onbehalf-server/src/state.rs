@@ -181,7 +181,12 @@ fn write_private_key(path: &Path, pem: &str) -> anyhow::Result<()> {
 
 fn build_engine(config: &Config) -> anyhow::Result<PolicyEngine> {
     let catalog = config.policy.load_catalog()?;
-    let builder = PolicyEngineBuilder::new().with_catalog(catalog);
+    let mut builder = PolicyEngineBuilder::new().with_catalog(catalog);
+    let user_attrs = onbehalf_policy::parse_user_attributes(&config.policy.user_attributes)
+        .map_err(|e| anyhow::anyhow!("[policy] {e}"))?;
+    for (name, ty) in user_attrs {
+        builder = builder.with_user_attr(name, ty);
+    }
     let builder = match &config.policy.policies_path {
         Some(path) => builder.with_policies_file(path),
         None => {
@@ -257,6 +262,51 @@ mod tests {
         );
         cfg.issuer.lease_interval_seconds = 0;
         assert!(AppState::from_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn declared_user_attributes_extend_the_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = dir.path().join("p.cedar");
+        std::fs::write(
+            &policy,
+            r#"@id("eng") permit(principal, action, resource)
+               when { context.originating_user.attributes has groups &&
+                      context.originating_user.attributes.groups.contains("eng") &&
+                      context.originating_user.attributes has department &&
+                      context.originating_user.attributes.department == "platform" };"#,
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cfg.policy.policies_path = Some(policy);
+
+        let warnings = |cfg: &Config| {
+            let state = AppState::from_config(cfg).unwrap();
+            let engine = state.pipeline.policy().read().unwrap();
+            engine.validation_warnings().to_vec()
+        };
+        assert!(!warnings(&cfg).is_empty(), "undeclared attributes warn");
+
+        cfg.policy.user_attributes = [
+            ("groups".to_string(), "set<string>".to_string()),
+            ("department".to_string(), "string".to_string()),
+        ]
+        .into();
+        assert!(warnings(&cfg).is_empty());
+        let state = AppState::from_config(&cfg).unwrap();
+        let schema = state
+            .pipeline
+            .policy()
+            .read()
+            .unwrap()
+            .schema_text()
+            .to_string();
+        assert!(schema.contains("\"groups\"?: Set<String>"), "{schema}");
+        assert!(schema.contains("\"department\"?: String"), "{schema}");
+
+        cfg.policy.user_attributes = [("groups".to_string(), "list".to_string())].into();
+        let err = AppState::from_config(&cfg).err().unwrap().to_string();
+        assert!(err.contains("user_attributes.groups"), "{err}");
     }
 
     #[test]

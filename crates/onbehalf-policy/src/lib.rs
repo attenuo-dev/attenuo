@@ -150,7 +150,7 @@ use cedar_policy::{
 use onbehalf_core::{Decision, DelegationChain, ToolCall};
 use time::OffsetDateTime;
 
-pub use catalog::{ArgType, ToolAttrs, ToolCatalog};
+pub use catalog::{parse_user_attributes, ArgType, ToolAttrs, ToolCatalog};
 pub use lint::{lint, LintIssue, LintReport, LintSeverity};
 pub use schema::{default_user_attrs, DEFAULT_SCHEMA, GENERIC_ACTION};
 

@@ -16,7 +16,7 @@ Every call becomes one Cedar request.
 | `action` | `Action::"<tool name>"`, a member of `Action::"invoke"` |
 | `resource` | `Tool::"<server>/<tool>"`, which is `in Server::"<server>"` |
 | `context.input` | the call's arguments, verbatim |
-| `context.originating_user` | `subject`, `issuer`, `authenticated_at_unix`, `attributes` (roles, `mfa`, tenant, ...) |
+| `context.originating_user` | `subject`, `issuer`, `authenticated_at_unix`, `attributes` (`mfa`, `roles`, `tenant`, `email`, plus whatever `[policy] user_attributes` declares) |
 | `context.chain` | `depth`, `agents` (root first), `root_agent`, `leases` |
 | `context.session_id` | present only if the call carries one |
 | `context.now_unix` | evaluation time, unix seconds |
@@ -52,6 +52,30 @@ It does two jobs:
 
 1. **Tool attributes** (`readonly`, `sensitive`) become `resource.readonly` and `resource.sensitive`. A tool that is not in the catalog is neither, so a `forbid` keyed on `sensitive` silently skips it. Register every tool the server exposes (MCP `tools/list` is the natural source).
 2. **Schema generation.** Each tool becomes a declared action and each `inputs` entry a typed, optional attribute of `context.input`. Policies are validated against this schema at load time, so a typo in an argument name or a comparison of a string to a number fails the load instead of misbehaving on a call. A policy that names `Action::"x"` validates only if some catalog entry has a tool `x`. Argument types are `string`, `long`, `bool`, or `{ set = "string" }`.
+
+### User attributes
+
+The schema declares four optional attributes of `context.originating_user.attributes`: `mfa` (bool), `roles` (set of strings), `tenant` (string) and `email` (string). A policy that tests any other attribute, `groups` for example, is reported as impossible when it loads (a validation warning in the server log and in `onbehalf policy lint`), because the validator has no such attribute to type-check. Declare the extra attributes in the config:
+
+```toml
+[policy]
+user_attributes = { groups = "set<string>", department = "string" }
+```
+
+Types are `string`, `long`, `bool` and `set<T>` (for example `set<string>`). The declarations are merged over the built-in four, so you can also re-type one of them. Then guard every use, since attributes are optional:
+
+```cedar
+@id("platform_engineers_may_deploy")
+permit(principal, action == Action::"create_deployment", resource)
+when {
+    context.originating_user.attributes has groups &&
+    context.originating_user.attributes.groups.contains("platform") &&
+    context.originating_user.attributes has department &&
+    context.originating_user.attributes.department == "eng"
+};
+```
+
+Declaring an attribute does not make it appear. The value comes from the verified IdP token: add the claim to `attribute_claims` in the `[[idps]]` entry (`groups` is there by default). If a token carries a value of a different type than declared, for example a string where you declared `set<string>`, the policy errors at evaluation time and onbehalf denies the call with `policy_error`. `onbehalf policy lint --config server.toml` and `onbehalf policy test` (when the test file's `catalog:` points at the server config) read `user_attributes` too, so tests and lint see the same schema as the server.
 
 ## Patterns
 
