@@ -47,6 +47,8 @@ pub struct Config {
     pub root_grants: Vec<RootGrant>,
     #[serde(default)]
     pub dev: DevSection,
+    #[serde(default)]
+    pub metrics: MetricsSection,
 }
 
 /// `[server]`
@@ -210,6 +212,33 @@ pub struct DevSection {
     /// Default `false`; when `true` the server logs a warning at startup.
     #[serde(default)]
     pub allow_root_mint: bool,
+}
+
+/// `[metrics]`: the Prometheus endpoint, on its own listener so it is never reachable on the
+/// proxy port by accident.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsSection {
+    /// Serve `GET /metrics` on `listen`. Default `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Address of the metrics listener. Default `127.0.0.1:9100`. There is no authentication:
+    /// keep it on loopback or a private network.
+    #[serde(default = "default_metrics_listen")]
+    pub listen: SocketAddr,
+}
+
+impl Default for MetricsSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: default_metrics_listen(),
+        }
+    }
+}
+
+fn default_metrics_listen() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 9100))
 }
 
 /// Default `[[idps]] allowed_algs`.

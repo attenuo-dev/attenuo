@@ -16,6 +16,7 @@ use serde_json::Value;
 use time::OffsetDateTime;
 
 use crate::error::ApiError;
+use crate::metrics::TokenKind;
 use crate::state::AppState;
 
 /// Logical server name used in audit records for events the server itself performs.
@@ -75,7 +76,13 @@ pub(crate) fn audit_issuance(
     arguments: Value,
     now: OffsetDateTime,
 ) -> Result<uuid::Uuid, ApiError> {
-    audit_event(state, REASON_TOKEN_ISSUED, tool, chain, arguments, now)
+    let id = audit_event(state, REASON_TOKEN_ISSUED, tool, chain, arguments, now)?;
+    state.metrics.token_issued(if tool == "token.root" {
+        TokenKind::Root
+    } else {
+        TokenKind::Exchange
+    });
+    Ok(id)
 }
 
 /// Record a server-performed event (issuance, lease renewal) as an `allow` decision record
@@ -91,6 +98,9 @@ pub(crate) fn audit_event(
     let call = ToolCall::new(AUDIT_SERVER, tool, arguments);
     let record = DecisionRecord::new(now, Decision::Allow, reason, chain, &call, Vec::new());
     let id = record.id;
-    onbehalf_audit::AuditSink::append(state.audit.as_ref(), record)?;
+    if let Err(e) = onbehalf_audit::AuditSink::append(state.audit.as_ref(), record) {
+        state.metrics.audit_append_error();
+        return Err(e.into());
+    }
     Ok(id)
 }

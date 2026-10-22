@@ -24,6 +24,8 @@ use onbehalf_token::Verifier;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::metrics::Metrics;
+
 /// Reason code: a lease in the chain (or an ancestor of one) was revoked.
 pub const REASON_LEASE_REVOKED: &str = "lease_revoked";
 /// Reason code: a lease in the chain has expired.
@@ -59,6 +61,7 @@ pub struct Pipeline {
     policy: Arc<RwLock<PolicyEngine>>,
     leases: Arc<dyn LeaseStore>,
     audit: Arc<dyn AuditSink>,
+    metrics: Arc<Metrics>,
 }
 
 impl Pipeline {
@@ -71,7 +74,14 @@ impl Pipeline {
             policy,
             leases,
             audit,
+            metrics: Metrics::new(),
         }
+    }
+
+    /// Report decisions and audit failures to a shared [`Metrics`] instead of a private one.
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// The shared policy engine (for hot reload).
@@ -81,6 +91,20 @@ impl Pipeline {
 
     /// Decide `call` for the agent at the end of `chain`, and record the decision.
     pub fn decide(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        now: OffsetDateTime,
+    ) -> PipelineDecision {
+        let started = std::time::Instant::now();
+        let out = self.decide_inner(chain, call, now);
+        self.metrics.observe_authorize(started.elapsed());
+        self.metrics
+            .decision(if out.is_allow() { "allow" } else { "deny" }, &out.reason);
+        out
+    }
+
+    fn decide_inner(
         &self,
         chain: &DelegationChain,
         call: &ToolCall,
@@ -127,6 +151,7 @@ impl Pipeline {
             }
             Err(e) => {
                 tracing::error!(error = %e, "audit append failed; denying");
+                self.metrics.audit_append_error();
                 let mut diagnostics = diagnostics;
                 diagnostics.push(format!("audit append failed: {e}"));
                 PipelineDecision {

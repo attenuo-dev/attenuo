@@ -14,6 +14,7 @@
 //! | `GET /.well-known/authzen-configuration` | none | AuthZEN metadata |
 //! | `GET /.well-known/jwks.json` | none | issuer public key |
 //! | `GET /healthz` | none | liveness |
+//! | `GET /metrics` | none | Prometheus metrics, on `[metrics] listen` only (separate port) |
 //! | `GET /readyz` | none | readiness: audit store and lease store answer |
 //! | `POST/GET/DELETE /mcp/{server}` | delegation token | MCP proxy |
 //! | `POST /admin/root-token` | admin | dev-only hop-0 mint ([`routes::dev_root`]), mounted only with `[dev] allow_root_mint = true` |
@@ -28,6 +29,7 @@ pub mod config;
 pub mod error;
 pub mod idp;
 pub mod jwks;
+pub mod metrics;
 pub mod routes;
 pub mod state;
 
@@ -91,7 +93,10 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
         ProxyConfig::new(config.server.listen, upstreams),
         authorizer,
     );
-    api.merge(proxy)
+    api.merge(proxy).layer(axum::middleware::from_fn_with_state(
+        state.metrics.clone(),
+        metrics::track_http,
+    ))
 }
 
 /// How long in-flight requests get to finish after a shutdown signal.
@@ -99,10 +104,22 @@ pub const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 
 /// Bind `[server] listen` and serve until SIGINT or SIGTERM, then drain for [`DRAIN_TIMEOUT`].
 pub async fn serve(config: Config) -> anyhow::Result<()> {
-    let (app, _state) = build(&config)?;
+    let (app, state) = build(&config)?;
     let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
     tracing::info!(addr = %listener.local_addr()?, upstreams = config.upstreams.len(), "onbehalf server listening");
-    serve_until(listener, app, shutdown_signal(), DRAIN_TIMEOUT).await
+    let metrics_task = if config.metrics.enabled {
+        let l = tokio::net::TcpListener::bind(config.metrics.listen).await?;
+        tracing::info!(addr = %l.local_addr()?, "metrics listening (unauthenticated)");
+        let app = metrics::router(state.metrics.clone());
+        Some(tokio::spawn(async move { axum::serve(l, app).await }))
+    } else {
+        None
+    };
+    let res = serve_until(listener, app, shutdown_signal(), DRAIN_TIMEOUT).await;
+    if let Some(t) = metrics_task {
+        t.abort();
+    }
+    res
 }
 
 /// Serve `app` on `listener` until `shutdown` resolves, then stop accepting connections and

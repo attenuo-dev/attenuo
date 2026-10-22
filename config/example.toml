@@ -95,3 +95,9 @@ attributes = { mfa = false }
 # DEVELOPMENT ONLY. Mounts POST /admin/root-token, which mints root tokens for a user nobody
 # verified (admin bearer + [[root_grants]] only). The server logs a warning when this is on.
 allow_root_mint = false
+
+[metrics]
+# Prometheus text endpoint on its OWN listener (GET /metrics), never on the proxy port.
+# No authentication: keep it on loopback or a private network.
+enabled = false
+# listen = "127.0.0.1:9100"

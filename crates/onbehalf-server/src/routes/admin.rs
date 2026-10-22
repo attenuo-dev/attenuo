@@ -86,6 +86,7 @@ pub async fn revoke_lease(
         .unwrap_or_else(|| "revoked by admin".to_string());
     let lease = LeaseId::new(lease_id);
     let revoked = state.leases.revoke(&lease, &reason, now())?;
+    state.metrics.leases_revoked(revoked);
     tracing::warn!(lease = %lease.0, reason = %reason, revoked, "lease revoked");
     Ok(Json(
         json!({ "lease_id": lease, "revoked": revoked, "reason": reason }),

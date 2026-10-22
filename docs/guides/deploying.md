@@ -223,7 +223,28 @@ Reloading policy does not need a restart: `onbehalf policy reload`. A bad policy
 
 ## What to monitor
 
-There are no metrics yet. Here is what to watch with the tools that exist.
+Enable the Prometheus endpoint with a separate listener, so it is never exposed on the proxy port by accident:
+
+```toml
+[metrics]
+enabled = true
+listen = "127.0.0.1:9100"
+```
+
+`GET http://127.0.0.1:9100/metrics` has no authentication. Keep it on loopback or a private network and scrape it from there. The API port does not serve `/metrics`. Series (all prefixed `onbehalf_`):
+
+| Series | Type | Labels |
+|---|---|---|
+| `decisions_total` | counter | `decision` (`allow`/`deny`), `reason` |
+| `tokens_issued_total` | counter | `kind` (`root`/`exchange`) |
+| `leases_revoked_total` | counter | none (counts cascaded descendants too) |
+| `audit_append_errors_total` | counter | none |
+| `http_requests_total` | counter | `route` (template, e.g. `/mcp/{server}`), `status` |
+| `authorize_duration_seconds` | histogram | none (lease check, policy and audit append) |
+
+Alert on any increase of `audit_append_errors_total`, on a rising share of `reason="lease_expired"` and on `readyz` returning 503.
+
+Beyond the metrics, watch these:
 
 From the process and the host:
 

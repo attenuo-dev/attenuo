@@ -13,6 +13,7 @@ use time::{Duration, OffsetDateTime};
 use crate::authz::Pipeline;
 use crate::config::{AgentConfig, Config, RootGrant};
 use crate::idp::IdpRegistry;
+use crate::metrics::Metrics;
 
 /// Everything the handlers share.
 pub struct AppState {
@@ -36,6 +37,7 @@ pub struct AppState {
     pub lease_interval: Duration,
     /// Precomputed `/.well-known/jwks.json` body.
     pub jwks: Value,
+    pub metrics: Arc<Metrics>,
 }
 
 impl AppState {
@@ -49,7 +51,10 @@ impl AppState {
         let policy = Arc::new(RwLock::new(engine));
 
         let (audit, leases) = open_storage(&config.audit.sqlite_path)?;
-        let pipeline = Arc::new(Pipeline::new(policy, leases.clone(), audit.clone()));
+        let metrics = Metrics::new();
+        let pipeline = Arc::new(
+            Pipeline::new(policy, leases.clone(), audit.clone()).with_metrics(metrics.clone()),
+        );
         let idps = IdpRegistry::from_config(&config.idps, &config.issuer.issuer)?;
         let agents = crate::idp::intake::validate_agents(&config.agents)?;
         if config.dev.allow_root_mint {
@@ -79,6 +84,7 @@ impl AppState {
             public_url: config.server.public_url.clone(),
             lease_interval: lease_interval(config)?,
             jwks,
+            metrics,
         })
     }
 
