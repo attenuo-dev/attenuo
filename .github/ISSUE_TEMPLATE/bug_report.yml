@@ -1,0 +1,72 @@
+name: Bug report
+description: Something behaves differently from what the docs or the RFC say.
+title: "bug: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. If this is a security problem (an allow that should have been a deny, a token that should have been rejected, an audit record that can be altered), **do not file it here**. Follow [SECURITY.md](https://github.com/7Mudit/onbehalf/blob/main/SECURITY.md) instead.
+  - type: checkboxes
+    id: not-security
+    attributes:
+      label: This is not a security vulnerability
+      options:
+        - label: I have read SECURITY.md and this issue does not describe an authorization bypass, attenuation violation, audit-chain tamper or other security weakness.
+          required: true
+  - type: dropdown
+    id: crate
+    attributes:
+      label: Affected crate
+      multiple: true
+      options:
+        - onbehalf-core
+        - onbehalf-token
+        - onbehalf-policy
+        - onbehalf-audit
+        - onbehalf-proxy
+        - onbehalf-server
+        - docs
+        - other / not sure
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: Output of `onbehalf-server --version`, the crate version, or the git SHA.
+      placeholder: "0.1.0 / 252f73c"
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What should have happened? Cite the RFC or doc section if you can.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: What happened instead? Include error output.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps, a failing test, or a small program. Redact any real tokens, keys or policies.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, architecture, Rust version (`rustc --version`), how the server was built or installed.
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Logs (with `RUST_LOG=debug`), configuration, related issues.

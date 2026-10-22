@@ -1,0 +1,80 @@
+# DRAFT release workflow. Not yet exercised: no tag has been pushed.
+#
+# Trigger: pushing a tag `vX.Y.Z` (see "Releases" in CONTRIBUTING.md).
+# What it does:
+#   1. creates a GitHub release from the matching CHANGELOG.md section
+#   2. builds `onbehalf-server` for Linux x86_64, Linux aarch64 and macOS arm64
+#   3. attaches a .tar.gz and a .sha256 per target to the release
+#
+# Before relying on it:
+#   - confirm the binary name matches `[[bin]]` in crates/onbehalf-server
+#   - run it once against a `v0.0.0-test` tag on a fork and delete the tag
+#   - decide whether to sign archives (cosign / sigstore) before 1.0
+#   - crates.io publishing is intentionally not here yet (see CONTRIBUTING.md)
+
+name: Release
+
+permissions:
+  contents: read
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+
+jobs:
+  create-release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          changelog: CHANGELOG.md
+          # The action marks tags with a pre-release suffix (-rc.1, -beta) as
+          # pre-releases on its own. Releases are created as published, not
+          # draft, because the asset upload below looks the release up by tag.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  upload-assets:
+    name: Build and upload (${{ matrix.target }})
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install cross toolchain (Linux cross builds)
+        if: startsWith(matrix.os, 'ubuntu') && matrix.target != 'x86_64-unknown-linux-gnu'
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+          runner: none
+      - name: Build and upload
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: onbehalf-server
+          target: ${{ matrix.target }}
+          # archive name: onbehalf-server-<target>.tar.gz
+          archive: $bin-$target
+          tar: unix
+          checksum: sha256
+          token: ${{ secrets.GITHUB_TOKEN }}

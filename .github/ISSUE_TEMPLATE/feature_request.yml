@@ -1,0 +1,55 @@
+name: Feature request
+description: Propose new behaviour or a change to existing behaviour.
+title: "feat: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Changes to the token format, policy request shape, audit schema or public API go through an RFC (see [docs/spec/README.md](https://github.com/7Mudit/onbehalf/blob/main/docs/spec/README.md)). This issue is the right place to get agreement that an RFC is worth writing.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what stops you today? Describe the situation, not the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What you would like to see. Sketches, API shapes and examples are welcome.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other ways to solve it, including doing nothing, and why they are worse.
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Does this change a specified surface?
+      description: If yes, an RFC will be needed before implementation.
+      options:
+        - "No, internal or additive without format changes"
+        - "Yes: token format"
+        - "Yes: policy request shape"
+        - "Yes: audit schema"
+        - "Yes: public API (HTTP, crate, CLI, config)"
+        - "Not sure"
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security considerations
+      description: Could this widen what an agent can do, weaken attenuation or revocation, or change what is audited? Say so, even if the answer is "no, because ...".
+    validations:
+      required: true
+  - type: checkboxes
+    id: willing
+    attributes:
+      label: Contribution
+      options:
+        - label: I am willing to write the RFC and/or implement this.
