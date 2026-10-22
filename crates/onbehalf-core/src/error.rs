@@ -31,4 +31,7 @@ pub enum ChainError {
     TooDeep { depth: usize, max: usize },
     #[error("originating user subject is empty")]
     EmptySubject,
+    /// The requested lifetime does not give a representable expiry time.
+    #[error("requested lifetime is out of range")]
+    TtlOutOfRange,
 }

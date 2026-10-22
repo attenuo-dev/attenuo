@@ -106,7 +106,7 @@ impl DelegationChain {
                 agent,
                 capabilities,
                 issued_at: now,
-                expires_at: now + ttl,
+                expires_at: now.checked_add(ttl).ok_or(ChainError::TtlOutOfRange)?,
                 lease,
             }],
         })
@@ -143,7 +143,13 @@ impl DelegationChain {
                 parent: parent_index,
                 source,
             })?;
-        let expires_at = std::cmp::min(now + ttl, parent.expires_at);
+        // `now + ttl` panics on overflow, and `ttl` can come straight from a request body
+        // (`requested_ttl_seconds`). An unrepresentable expiry is simply "later than the
+        // parent's", so clamp it like any other.
+        let expires_at = match now.checked_add(ttl) {
+            Some(t) => std::cmp::min(t, parent.expires_at),
+            None => parent.expires_at,
+        };
         let mut next = self.clone();
         next.hops.push(Hop {
             agent,
@@ -409,6 +415,45 @@ mod tests {
             ),
             Err(ChainError::TooDeep { depth: 9, max: 8 })
         ));
+    }
+
+    /// SR-06: a huge TTL used to panic in `now + ttl` (reachable from `POST /token` with
+    /// `requested_ttl_seconds` = u64::MAX). It must clamp on extend and fail cleanly on root.
+    #[test]
+    fn huge_ttl_does_not_panic() {
+        let root = DelegationChain::root(
+            user(),
+            AgentId::new("a"),
+            caps(vec![Capability::new("github", "read_*")]),
+            t0(),
+            Duration::hours(1),
+            LeaseId::new("l1"),
+        )
+        .unwrap();
+        for ttl in [Duration::MAX, Duration::seconds(i64::MAX)] {
+            let child = root
+                .extend(
+                    AgentId::new("b"),
+                    caps(vec![Capability::new("github", "read_file")]),
+                    t0(),
+                    ttl,
+                    LeaseId::new("l2"),
+                    DEFAULT_MAX_DEPTH,
+                )
+                .unwrap();
+            assert_eq!(child.hops[1].expires_at, root.hops[0].expires_at);
+            assert_eq!(
+                DelegationChain::root(
+                    user(),
+                    AgentId::new("a"),
+                    caps(vec![Capability::new("github", "read_*")]),
+                    t0(),
+                    ttl,
+                    LeaseId::new("l1"),
+                ),
+                Err(ChainError::TtlOutOfRange)
+            );
+        }
     }
 
     #[test]
