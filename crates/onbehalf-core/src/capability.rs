@@ -56,20 +56,18 @@ impl ArgConstraint {
                 .as_str()
                 .map(|s| s.starts_with(p.as_str()))
                 .unwrap_or(false),
-            (ArgConstraint::OneOf(as_), ArgConstraint::Equals(b)) => {
-                !as_.is_empty() && as_.iter().all(|a| a == b)
-            }
+            // An empty `OneOf` is satisfied by no value, so it vacuously implies every
+            // constraint (`all` over an empty set is true). That is sound: a capability
+            // carrying it permits nothing, and it can still be re-delegated unchanged.
+            (ArgConstraint::OneOf(as_), ArgConstraint::Equals(b)) => as_.iter().all(|a| a == b),
             (ArgConstraint::OneOf(as_), ArgConstraint::OneOf(bs)) => {
-                !as_.is_empty() && as_.iter().all(|a| bs.contains(a))
+                as_.iter().all(|a| bs.contains(a))
             }
-            (ArgConstraint::OneOf(as_), ArgConstraint::Prefix(p)) => {
-                !as_.is_empty()
-                    && as_.iter().all(|a| {
-                        a.as_str()
-                            .map(|s| s.starts_with(p.as_str()))
-                            .unwrap_or(false)
-                    })
-            }
+            (ArgConstraint::OneOf(as_), ArgConstraint::Prefix(p)) => as_.iter().all(|a| {
+                a.as_str()
+                    .map(|s| s.starts_with(p.as_str()))
+                    .unwrap_or(false)
+            }),
             (ArgConstraint::Prefix(p), ArgConstraint::Prefix(q)) => p.starts_with(q.as_str()),
             // A prefix admits infinitely many values; it cannot imply an exact or finite set.
             (ArgConstraint::Prefix(_), ArgConstraint::Equals(_))
@@ -283,8 +281,10 @@ mod tests {
         assert!(!pre.implies(&one));
         assert!(ArgConstraint::Prefix("acme/a".into()).implies(&pre));
         assert!(!pre.implies(&ArgConstraint::Prefix("acme/a".into())));
-        // empty OneOf permits nothing, but we refuse to treat it as implying anything useful
-        assert!(!ArgConstraint::OneOf(vec![]).implies(&eq));
+        // empty OneOf permits nothing, so it vacuously implies everything (and itself)
+        assert!(ArgConstraint::OneOf(vec![]).implies(&eq));
+        assert!(ArgConstraint::OneOf(vec![]).implies(&ArgConstraint::OneOf(vec![])));
+        assert!(!ArgConstraint::OneOf(vec![]).satisfied_by(&json!("acme/api")));
     }
 
     #[test]
