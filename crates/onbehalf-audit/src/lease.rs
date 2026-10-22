@@ -54,6 +54,20 @@ pub trait LeaseStore: Send + Sync {
     /// Known, not revoked, and `expires_at > now`.
     fn is_active(&self, lease: &LeaseId, now: OffsetDateTime) -> Result<bool, AuditError>;
 
+    /// Record which chain `lease` was issued for: the digest of the chain up to and including
+    /// the hop that holds the lease (`DelegationChain::prefix_digest`). Write-once: binding a
+    /// lease again to the same value is a no-op, to a different value is
+    /// [`AuditError::BindingConflict`], and an unknown lease is [`AuditError::UnknownLease`].
+    ///
+    /// The issuer binds every lease it registers. A chain presented without its signed token
+    /// (an AuthZEN body chain) is accepted only if every hop's prefix digest equals its lease's
+    /// binding, so lease ids alone, which are not secret, cannot be stitched into a forged
+    /// chain.
+    fn bind(&self, lease: &LeaseId, binding: &str) -> Result<(), AuditError>;
+
+    /// The binding recorded by [`bind`](Self::bind), or `None` (unknown or never bound).
+    fn binding(&self, lease: &LeaseId) -> Result<Option<String>, AuditError>;
+
     /// Classify every lease. A lease that is both revoked and expired is reported as revoked.
     fn check_all(
         &self,
@@ -101,6 +115,7 @@ pub(crate) fn classify(
 #[derive(Debug, Default)]
 pub struct MemoryLeaseStore {
     rows: Mutex<BTreeMap<LeaseId, LeaseRow>>,
+    bindings: Mutex<BTreeMap<LeaseId, String>>,
 }
 
 impl MemoryLeaseStore {
@@ -191,6 +206,25 @@ impl LeaseStore for MemoryLeaseStore {
             .lock()?
             .get(lease)
             .is_some_and(|r| r.is_active(now)))
+    }
+
+    fn bind(&self, lease: &LeaseId, binding: &str) -> Result<(), AuditError> {
+        if !self.rows.lock()?.contains_key(lease) {
+            return Err(AuditError::UnknownLease(lease.0.clone()));
+        }
+        let mut bindings = self.bindings.lock()?;
+        match bindings.get(lease) {
+            Some(b) if b == binding => Ok(()),
+            Some(_) => Err(AuditError::BindingConflict(lease.0.clone())),
+            None => {
+                bindings.insert(lease.clone(), binding.to_owned());
+                Ok(())
+            }
+        }
+    }
+
+    fn binding(&self, lease: &LeaseId) -> Result<Option<String>, AuditError> {
+        Ok(self.bindings.lock()?.get(lease).cloned())
     }
 
     fn check_all(

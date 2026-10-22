@@ -36,7 +36,7 @@ use onbehalf_audit::LeaseStore;
 use onbehalf_token::{ExchangeRequest, AUTHORIZATION_DETAILS_TYPE};
 use serde_json::{json, Map, Value};
 
-use super::{audit_issuance, no_store, now, parse_json};
+use super::{audit_issuance, no_store, now, parse_json, register_issued};
 use crate::config::{capability_set, CapSpec};
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -81,10 +81,13 @@ pub async fn exchange(
         .last()
         .ok_or_else(|| ApiError::internal("issued token has no hops"))?;
     let parent_lease = parent.chain.hops.last().map(|h| &h.lease);
-    state.leases.register(
+    register_issued(
+        &state,
+        &resp.access_token,
         &resp.lease,
         parent_lease,
-        state.initial_lease_expiry(now, hop.expires_at),
+        hop.expires_at,
+        now,
     )?;
 
     let args = json!({

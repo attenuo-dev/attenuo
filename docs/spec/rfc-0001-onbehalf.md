@@ -157,7 +157,7 @@ Any other `grant_type` or `subject_token_type` is rejected. Capabilities from ev
 
 ## 5. Per-call authorization
 
-The shape below is the design target. The implemented wire shape is in `onbehalf-policy::authzen`: `subject.properties.chain` carries the whole `DelegationChain`, `context.input` the call arguments, and `context.session_id` the session. The Cedar context exposes `input`, `originating_user`, `chain{depth, agents, root_agent, leases}`, `session_id` and `now_unix`. `chain_id` and `lease_state` below are proposed (section 3.1, section 6).
+The shape below is the design target. The implemented wire shape is in `onbehalf-policy::authzen`: `subject.properties.chain` carries the whole `DelegationChain`, `context.input` the call arguments, and `context.session_id` the session. The Cedar context exposes `input`, `originating_user`, `chain{depth, agents, root_agent, leases}`, `session_id` and `now_unix`. `chain_id` and `lease_state` below are proposed (section 3.1, section 6). The endpoint requires the delegation token as bearer, and the chain is taken from it. A deployment may set `[authzen] allow_unsigned_chain = true` to let authenticated PEPs (`[[peps]]`) send the chain in the body instead; every hop of such a chain must then equal what the server issued for its lease (each lease is bound to the digest of the chain prefix ending at its hop), otherwise the request is refused with `chain_not_issued`.
 
 The proxy intercepts MCP `tools/call` over streamable HTTP, validates the bearer token, and builds an AuthZEN-shaped request ([Cerbos](https://www.cerbos.dev/blog/mcp-authorization-standards)):
 

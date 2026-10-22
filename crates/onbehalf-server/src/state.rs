@@ -32,6 +32,10 @@ pub struct AppState {
     pub agents: Vec<AgentConfig>,
     /// `[dev] allow_root_mint`.
     pub dev_allow_root_mint: bool,
+    /// `[authzen] allow_unsigned_chain`.
+    pub authzen_allow_unsigned_chain: bool,
+    /// PEPs allowed to send unsigned chains (`[[peps]]`, validated).
+    pub peps: Vec<AgentConfig>,
     pub public_url: Option<String>,
     /// `[issuer] lease_interval_seconds`: lifetime of a lease after issuance or renewal.
     pub lease_interval: Duration,
@@ -57,6 +61,18 @@ impl AppState {
         );
         let idps = IdpRegistry::from_config(&config.idps, &config.issuer.issuer)?;
         let agents = crate::idp::intake::validate_agents(&config.agents)?;
+        let peps = crate::clientauth::validate_clients("[[peps]]", &config.peps)?;
+        if config.authzen.allow_unsigned_chain {
+            if peps.is_empty() {
+                anyhow::bail!(
+                    "[authzen] allow_unsigned_chain = true needs at least one [[peps]] entry"
+                );
+            }
+            tracing::warn!(
+                "[authzen] allow_unsigned_chain = true: authenticated [[peps]] may send \
+                 delegation chains without the signed token"
+            );
+        }
         if config.dev.allow_root_mint {
             tracing::warn!(
                 "!!! [dev] allow_root_mint = true: POST /admin/root-token mints root tokens for \
@@ -81,6 +97,8 @@ impl AppState {
             idps,
             agents,
             dev_allow_root_mint: config.dev.allow_root_mint,
+            authzen_allow_unsigned_chain: config.authzen.allow_unsigned_chain,
+            peps,
             public_url: config.server.public_url.clone(),
             lease_interval: lease_interval(config)?,
             jwks,
@@ -262,6 +280,15 @@ mod tests {
         );
         cfg.issuer.lease_interval_seconds = 0;
         assert!(AppState::from_config(&cfg).is_err());
+    }
+
+    /// SR-08: unsigned AuthZEN chains cannot be switched on without a PEP to authenticate.
+    #[test]
+    fn unsigned_authzen_chains_need_peps() {
+        let mut cfg = Config::default();
+        cfg.authzen.allow_unsigned_chain = true;
+        let err = AppState::from_config(&cfg).err().unwrap();
+        assert!(err.to_string().contains("[[peps]]"), "{err}");
     }
 
     #[test]

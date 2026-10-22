@@ -85,7 +85,7 @@ sequenceDiagram
     end
 ```
 
-`POST /access/v1/evaluation` takes the same path from step 3 onward. With a bearer token, the chain comes from the verified token (a chain also present in the body must match it). Without one, the chain in `subject.properties.chain` is taken as asserted by the calling PEP, checked structurally, and still has to pass the lease check, so a chain this server never issued is denied with `lease_unknown`. The body chain carries no signatures, so the endpoint should only be reachable by trusted PEPs unless they send the bearer.
+`POST /access/v1/evaluation` takes the same path from step 3 onward. By default it requires a bearer token, and the chain comes from the verified token (a chain also present in the body must match it); without a bearer the answer is 401. With `[authzen] allow_unsigned_chain = true`, a request without a bearer may carry the chain in `subject.properties.chain` if it authenticates as a `[[peps]]` entry (HTTP Basic, or `pep_id`/`pep_secret`). Such a chain is checked structurally (`validate_at`) and then hop by hop against what was issued: at issuance every lease is bound to the digest of the chain up to its hop (`LeaseStore::bind`), and each hop of the body chain must reproduce that digest. A mismatch is a 403 `chain_not_issued` and writes no audit record, so lease ids, which every token prints, are not enough to forge a user, attributes, capabilities or an agent (SR-08).
 
 ## Token issuance
 

@@ -303,6 +303,26 @@ impl DelegationChain {
     pub fn digest(&self) -> String {
         sha256_json(self)
     }
+
+    /// Digest of the chain cut after hop `index` (the chain as it was when that hop was
+    /// issued). `prefix_digest(depth - 1)` equals [`digest`](Self::digest). `None` when `index`
+    /// is out of range.
+    ///
+    /// The issuer records this per lease (`LeaseStore::bind`), so a chain received without its
+    /// signature can be matched hop by hop against what was actually issued.
+    pub fn prefix_digest(&self, index: usize) -> Option<String> {
+        if index >= self.hops.len() {
+            return None;
+        }
+        if index + 1 == self.hops.len() {
+            return Some(self.digest());
+        }
+        let prefix = DelegationChain {
+            originating_user: self.originating_user.clone(),
+            hops: self.hops[..=index].to_vec(),
+        };
+        Some(prefix.digest())
+    }
 }
 
 #[cfg(test)]
@@ -683,5 +703,18 @@ mod tests {
         let s = serde_json::to_string(&root).unwrap();
         let back: DelegationChain = serde_json::from_str(&s).unwrap();
         assert_eq!(back.digest(), d1);
+    }
+
+    #[test]
+    fn prefix_digest_is_the_digest_at_issuance() {
+        let child = two_hops();
+        let root = DelegationChain {
+            originating_user: child.originating_user.clone(),
+            hops: child.hops[..1].to_vec(),
+        };
+        assert_eq!(child.prefix_digest(0), Some(root.digest()));
+        assert_eq!(child.prefix_digest(1), Some(child.digest()));
+        assert_eq!(child.prefix_digest(2), None);
+        assert_ne!(child.prefix_digest(0), child.prefix_digest(1));
     }
 }

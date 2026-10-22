@@ -23,6 +23,9 @@ pub enum AuditError {
     /// A lease cannot be renewed because it has been revoked.
     #[error("lease `{0}` is revoked")]
     LeaseRevoked(String),
+    /// A lease already carries a different chain binding (bindings are write-once).
+    #[error("lease `{0}` is already bound to a different chain")]
+    BindingConflict(String),
 }
 
 impl<T> From<std::sync::PoisonError<T>> for AuditError {

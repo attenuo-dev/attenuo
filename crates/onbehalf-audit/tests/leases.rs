@@ -32,6 +32,33 @@ fn tree(store: &dyn LeaseStore) {
     store.register(&id("b"), Some(&id("root")), exp).unwrap();
 }
 
+/// SR-08 defence in depth: bindings are write-once and only for known leases.
+#[test]
+fn bindings_are_write_once() {
+    for (name, store) in stores() {
+        tree(store.as_ref());
+        assert_eq!(store.binding(&id("a")).unwrap(), None, "{name}");
+        store.bind(&id("a"), "d1").unwrap();
+        store.bind(&id("a"), "d1").unwrap();
+        assert_eq!(store.binding(&id("a")).unwrap().as_deref(), Some("d1"));
+        assert!(
+            matches!(
+                store.bind(&id("a"), "d2"),
+                Err(AuditError::BindingConflict(_))
+            ),
+            "{name}"
+        );
+        assert_eq!(store.binding(&id("a")).unwrap().as_deref(), Some("d1"));
+        assert!(matches!(
+            store.bind(&id("nope"), "d1"),
+            Err(AuditError::UnknownLease(_))
+        ));
+        // Revocation does not touch the binding.
+        store.revoke(&id("root"), "x", t0()).unwrap();
+        assert_eq!(store.binding(&id("a")).unwrap().as_deref(), Some("d1"));
+    }
+}
+
 #[test]
 fn register_then_active() {
     for (name, store) in stores() {

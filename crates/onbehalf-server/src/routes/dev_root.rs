@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use time::Duration;
 
-use super::{audit_issuance, no_store, now, parse_json};
+use super::{audit_issuance, no_store, now, parse_json, register_issued};
 use crate::config::{capability_set, CapSpec, RootGrant};
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -69,10 +69,13 @@ pub async fn mint_root(
         ttl,
         now,
     )?;
-    state.leases.register(
+    register_issued(
+        &state,
+        &issued.token,
         &issued.lease,
         None,
-        state.initial_lease_expiry(now, issued.expires_at),
+        issued.expires_at,
+        now,
     )?;
     let args = json!({ "agent": req.agent, "requested": issued.chain.hops[0].capabilities });
     if let Err(e) = audit_issuance(&state, "token.root", &issued.chain, args, now) {

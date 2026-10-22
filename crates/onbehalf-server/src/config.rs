@@ -49,7 +49,29 @@ pub struct Config {
     pub dev: DevSection,
     #[serde(default)]
     pub metrics: MetricsSection,
+    #[serde(default)]
+    pub authzen: AuthzenSection,
+    /// Policy enforcement points allowed to send unsigned chains to the AuthZEN endpoint when
+    /// `[authzen] allow_unsigned_chain = true`. Same shape as `[[agents]]`.
+    #[serde(default)]
+    pub peps: Vec<PepConfig>,
 }
+
+/// `[authzen]`
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthzenSection {
+    /// Accept `subject.properties.chain` from the request body when there is no bearer token.
+    /// Default `false`: `POST /access/v1/evaluation` requires `Authorization: Bearer <onbehalf
+    /// token>`. When `true`, a body-only request must also authenticate as a `[[peps]]` entry
+    /// (HTTP Basic, or `pep_id` / `pep_secret` in the body), and every hop of the body chain
+    /// must match what this server issued for its lease.
+    #[serde(default)]
+    pub allow_unsigned_chain: bool,
+}
+
+/// One `[[peps]]` entry: `{ id, secret_sha256 }`, as for [`AgentConfig`].
+pub type PepConfig = AgentConfig;
 
 /// `[server]`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -456,6 +478,10 @@ mod tests {
             "the dev root mint is off by default"
         );
         assert!(cfg.idps.is_empty() && cfg.agents.is_empty());
+        assert!(
+            !cfg.authzen.allow_unsigned_chain && cfg.peps.is_empty(),
+            "unsigned AuthZEN chains are off by default"
+        );
     }
 
     #[test]

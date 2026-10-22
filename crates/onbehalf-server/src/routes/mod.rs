@@ -10,7 +10,8 @@ pub mod wellknown;
 
 use axum::body::Bytes;
 use axum::http::{header, HeaderMap, HeaderValue};
-use onbehalf_core::{Decision, DecisionRecord, DelegationChain, ToolCall};
+use onbehalf_audit::LeaseStore;
+use onbehalf_core::{Decision, DecisionRecord, DelegationChain, LeaseId, ToolCall};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -61,6 +62,31 @@ pub(crate) fn parse_json<T: DeserializeOwned>(body: &Bytes) -> Result<T, ApiErro
 pub(crate) fn no_store(headers: &mut HeaderMap) {
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+}
+
+/// Register the lease of a token this server just minted, and bind it to the token's chain.
+///
+/// The lease expiry is [`AppState::initial_lease_expiry`]. The binding is the digest of the
+/// chain exactly as the signed token carries it (`LeaseStore::bind`), so an AuthZEN body chain
+/// can later be matched against what was issued (SR-08).
+pub(crate) fn register_issued(
+    state: &AppState,
+    token: &str,
+    lease: &LeaseId,
+    parent: Option<&LeaseId>,
+    token_exp: OffsetDateTime,
+    now: OffsetDateTime,
+) -> Result<(), ApiError> {
+    let chain = state
+        .verifier
+        .verify(token, now)
+        .map_err(|e| ApiError::internal(format!("cannot re-verify an issued token: {e}")))?
+        .chain;
+    state
+        .leases
+        .register(lease, parent, state.initial_lease_expiry(now, token_exp))?;
+    state.leases.bind(lease, &chain.digest())?;
+    Ok(())
 }
 
 /// Record a token issuance in the audit log.

@@ -100,6 +100,18 @@ capabilities = ["github:*"]
 # Only the dev root mint copies `attributes`; IdP intake takes attributes from the verified token.
 attributes = { mfa = false }
 
+[authzen]
+# POST /access/v1/evaluation requires `Authorization: Bearer <onbehalf token>` by default.
+# Set to true to also accept a chain in subject.properties.chain without the token, from a
+# PEP listed in [[peps]] (HTTP Basic, or pep_id/pep_secret in the body). Each hop of such a
+# chain must match what this server issued for its lease, or the request gets 403.
+allow_unsigned_chain = false
+
+# Policy enforcement points for allow_unsigned_chain, same shape as [[agents]].
+# [[peps]]
+# id = "gateway"
+# secret_sha256 = "<printf %s \"$SECRET\" | sha256sum>"
+
 [dev]
 # DEVELOPMENT ONLY. Mounts POST /admin/root-token, which mints root tokens for a user nobody
 # verified (admin bearer + [[root_grants]] only). The server logs a warning when this is on.

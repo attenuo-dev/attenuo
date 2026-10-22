@@ -57,6 +57,11 @@ impl Harness {
 
     /// `file_db`: back the audit log with a file in a temp dir instead of `:memory:`.
     async fn start_with(file_db: bool) -> Self {
+        Self::start_tweaked(file_db, |_| {}).await
+    }
+
+    /// As [`start_with`](Self::start_with), with a last chance to change the config.
+    async fn start_tweaked(file_db: bool, tweak: impl FnOnce(&mut Config)) -> Self {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_test_writer()
@@ -90,6 +95,7 @@ impl Harness {
         cfg.upstreams = vec![UpstreamConfig::new("github", upstream_task.url("/mcp"))];
         cfg.admin.token = Some(ADMIN.into());
         cfg.dev.allow_root_mint = true;
+        tweak(&mut cfg);
 
         let (router, state) = onbehalf_server::build(&cfg).unwrap();
         assert!(dir.path().join("keys/issuer.pem").exists());
@@ -553,7 +559,7 @@ async fn authzen_matches_proxy_decisions() {
         assert!(az["context"]["decision_id"].is_string());
     }
 
-    // Without a bearer, a PEP can send the chain itself; it is still lease-checked.
+    // Without a bearer the endpoint refuses by default, even for a genuine chain (SR-08).
     let chain = h
         .state
         .verifier
@@ -563,20 +569,15 @@ async fn authzen_matches_proxy_decisions() {
     let call =
         onbehalf_core::ToolCall::new("github", "read_file", json!({"repo": "alice/public-site"}));
     let body = serde_json::to_value(authzen::to_request(&chain, &call)).unwrap();
-    let az: Value = h.authzen(None, body).await.json().await.unwrap();
-    assert_eq!(az["decision"], true);
+    let resp = h.authzen(None, body).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(resp.headers().contains_key("www-authenticate"));
 
-    // A chain this server never issued has unknown leases.
+    // A body chain that disagrees with the bearer is rejected.
     let mut forged = chain.clone();
     for (i, hop) in forged.hops.iter_mut().enumerate() {
         hop.lease = onbehalf_core::LeaseId::new(format!("forged-{i}"));
     }
-    let body = serde_json::to_value(authzen::to_request(&forged, &call)).unwrap();
-    let az: Value = h.authzen(None, body).await.json().await.unwrap();
-    assert_eq!(az["decision"], false);
-    assert_eq!(az["context"]["reason"], "lease_unknown");
-
-    // A body chain that disagrees with the bearer is rejected.
     let body = serde_json::to_value(authzen::to_request(&forged, &call)).unwrap();
     let resp = h.authzen(Some(&child.token), body).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -587,7 +588,7 @@ async fn authzen_matches_proxy_decisions() {
 
     // No bearer and no chain.
     let resp = h.authzen(None, authzen_body("read_file", json!({}))).await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     // A bad bearer.
     let resp = h
         .authzen(Some("garbage"), authzen_body("read_file", json!({})))
@@ -608,6 +609,152 @@ async fn authzen_matches_proxy_decisions() {
         cfg["access_evaluation_endpoint"],
         h.url("/access/v1/evaluation")
     );
+}
+
+const PEP_SECRET: &str = "pep-secret-for-tests";
+
+fn sha256_hex(s: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(s.as_bytes()))
+}
+
+/// SR-08: with `allow_unsigned_chain`, a body chain needs PEP credentials and must match, hop by
+/// hop, a chain this server issued. Lease ids alone (they are printed in every token) are not
+/// enough to forge a user, attributes or capabilities, and a refused chain leaves no audit
+/// record in the victim's name.
+#[tokio::test]
+async fn unsigned_authzen_chains_need_a_pep_and_an_issued_chain() {
+    let h = Harness::start_tweaked(false, |cfg| {
+        cfg.authzen.allow_unsigned_chain = true;
+        cfg.peps = vec![onbehalf_server::config::PepConfig {
+            id: "gateway".into(),
+            secret_sha256: sha256_hex(PEP_SECRET),
+        }];
+    })
+    .await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let child = h
+        .exchange(&root.token, "coder", &["github:read_file"])
+        .await;
+    let chain = h
+        .state
+        .verifier
+        .verify(&child.token, time::OffsetDateTime::now_utc())
+        .unwrap()
+        .chain;
+    let read =
+        onbehalf_core::ToolCall::new("github", "read_file", json!({"repo": "alice/public-site"}));
+    let with_pep = |chain: &onbehalf_core::DelegationChain,
+                    call: &onbehalf_core::ToolCall,
+                    secret: Option<&str>| {
+        let mut body = serde_json::to_value(authzen::to_request(chain, call)).unwrap();
+        if let Some(s) = secret {
+            body["pep_id"] = json!("gateway");
+            body["pep_secret"] = json!(s);
+        }
+        body
+    };
+    let audit_len = |entries: Vec<Value>| entries.len();
+
+    // The genuine chain from an authenticated PEP: decided and audited.
+    let before = audit_len(h.audit_entries().await);
+    let az: Value = h
+        .authzen(None, with_pep(&chain, &read, Some(PEP_SECRET)))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(az["decision"], true, "{az}");
+    assert_eq!(audit_len(h.audit_entries().await), before + 1);
+    // The root chain alone is a genuine chain too.
+    let root_chain = onbehalf_core::DelegationChain {
+        originating_user: chain.originating_user.clone(),
+        hops: chain.hops[..1].to_vec(),
+    };
+    let az: Value = h
+        .authzen(None, with_pep(&root_chain, &read, Some(PEP_SECRET)))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(az["decision"], true, "{az}");
+
+    // PEP credentials are required: none, wrong, and HTTP Basic.
+    let resp = h.authzen(None, with_pep(&chain, &read, None)).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["error"],
+        "invalid_client"
+    );
+    let resp = h
+        .authzen(None, with_pep(&chain, &read, Some("wrong")))
+        .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = h
+        .client
+        .post(h.url("/access/v1/evaluation"))
+        .basic_auth("gateway", Some(PEP_SECRET))
+        .json(&with_pep(&chain, &read, None))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Forgeries built from real, live lease ids. None of them is decided or audited.
+    let before = audit_len(h.audit_entries().await);
+    let mut other_user = chain.clone();
+    other_user.originating_user.subject = "bob".into();
+    let mut mfa = chain.clone();
+    mfa.originating_user
+        .attributes
+        .insert("mfa".into(), json!(true));
+    let mut wider = chain.clone();
+    wider.hops[1].capabilities = root_chain.hops[0].capabilities.clone();
+    let mut other_agent = chain.clone();
+    other_agent.hops[1].agent = onbehalf_core::AgentId::new("release-bot");
+    let mut root_lease_twice = chain.clone();
+    root_lease_twice.hops[1].lease = chain.hops[0].lease.clone();
+    let mut swapped = root_chain.clone();
+    swapped.hops[0].lease = chain.hops[1].lease.clone();
+    for (name, forged, status) in [
+        ("other user", &other_user, StatusCode::FORBIDDEN),
+        ("mfa attribute", &mfa, StatusCode::FORBIDDEN),
+        ("wider child", &wider, StatusCode::FORBIDDEN),
+        ("other agent", &other_agent, StatusCode::FORBIDDEN),
+        (
+            "child lease on the root hop",
+            &swapped,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "root lease twice",
+            &root_lease_twice,
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let resp = h
+            .authzen(None, with_pep(forged, &read, Some(PEP_SECRET)))
+            .await;
+        assert_eq!(resp.status(), status, "{name}");
+        let err: Value = resp.json().await.unwrap();
+        if status == StatusCode::FORBIDDEN {
+            assert_eq!(err["error"], "chain_not_issued", "{name}: {err}");
+        }
+    }
+    assert_eq!(
+        audit_len(h.audit_entries().await),
+        before,
+        "refused chains write no audit records"
+    );
+
+    // The bearer path still works alongside.
+    let resp = h
+        .authzen(
+            Some(&child.token),
+            authzen_body("read_file", json!({"repo": "alice/public-site"})),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 // ---------------------------------------------------------------------------------------------
