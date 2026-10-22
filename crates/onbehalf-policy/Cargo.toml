@@ -1,5 +1,6 @@
 [package]
 name = "onbehalf-policy"
+description = "Policy decision point for onbehalf: capability check plus Cedar policies over delegation chains"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,3 +9,10 @@ rust-version.workspace = true
 
 [dependencies]
 onbehalf-core = { workspace = true }
+cedar-policy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
