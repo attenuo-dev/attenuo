@@ -1,4 +1,6 @@
-//! JSON error responses: `{"error": "<code>", "detail": "<human-readable text>"}`.
+//! JSON error responses: `{"error": "<code>", "detail": "<human-readable text>"}`, plus a
+//! stable machine-readable sub-code in `error_description` where one is defined (IdP intake at
+//! `POST /token`, see [`crate::idp::IntakeError`]).
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -11,6 +13,8 @@ pub struct ApiError {
     pub status: StatusCode,
     pub code: String,
     pub detail: String,
+    /// Stable sub-code, sent as `error_description` (RFC 6749 §5.2) when set.
+    pub description: Option<&'static str>,
 }
 
 impl ApiError {
@@ -19,7 +23,14 @@ impl ApiError {
             status,
             code: code.into(),
             detail: detail.into(),
+            description: None,
         }
+    }
+
+    /// Attach a stable `error_description` sub-code.
+    pub fn with_description(mut self, description: &'static str) -> Self {
+        self.description = Some(description);
+        self
     }
 
     pub fn bad_request(code: impl Into<String>, detail: impl Into<String>) -> Self {
@@ -50,12 +61,22 @@ impl IntoResponse for ApiError {
         } else {
             tracing::debug!(status = %self.status, code = %self.code, detail = %self.detail, "request rejected");
         }
-        let body = Json(json!({ "error": self.code, "detail": self.detail }));
-        let mut resp = (self.status, body).into_response();
+        let mut body = json!({ "error": self.code, "detail": self.detail });
+        if let Some(d) = self.description {
+            body["error_description"] = d.into();
+        }
+        let mut resp = (self.status, Json(body)).into_response();
         resp.headers_mut().insert(
             axum::http::header::CACHE_CONTROL,
             axum::http::HeaderValue::from_static("no-store"),
         );
+        if self.status == StatusCode::UNAUTHORIZED && self.code == "invalid_client" {
+            // RFC 6749 §5.2: a 401 for client authentication names the scheme.
+            resp.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static("Basic realm=\"onbehalf\""),
+            );
+        }
         resp
     }
 }

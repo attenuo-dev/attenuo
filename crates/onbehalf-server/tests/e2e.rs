@@ -89,6 +89,7 @@ impl Harness {
         };
         cfg.upstreams = vec![UpstreamConfig::new("github", upstream_task.url("/mcp"))];
         cfg.admin.token = Some(ADMIN.into());
+        cfg.dev.allow_root_mint = true;
 
         let (router, state) = onbehalf_server::build(&cfg).unwrap();
         assert!(dir.path().join("keys/issuer.pem").exists());

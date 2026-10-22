@@ -7,13 +7,14 @@
 //!
 //! | Route | Auth | Purpose |
 //! |---|---|---|
+//! | `POST /token` | client credentials + IdP credential | hop 0 from an OIDC ID token or ID-JAG ([`idp`]) |
 //! | `POST /token` | subject token in body | RFC 8693 exchange, hop n to n+1 |
 //! | `POST /access/v1/evaluation` | optional bearer | AuthZEN evaluation |
 //! | `GET /.well-known/authzen-configuration` | none | AuthZEN metadata |
 //! | `GET /.well-known/jwks.json` | none | issuer public key |
 //! | `GET /healthz` | none | liveness |
 //! | `POST/GET/DELETE /mcp/{server}` | delegation token | MCP proxy |
-//! | `POST /admin/root-token` | admin | dev-only hop-0 mint ([`routes::dev_root`]) |
+//! | `POST /admin/root-token` | admin | dev-only hop-0 mint ([`routes::dev_root`]), mounted only with `[dev] allow_root_mint = true` |
 //! | `POST /admin/leases/{id}/revoke`, `GET /admin/leases/{id}` | admin | leases |
 //! | `GET /admin/audit`, `/admin/audit/verify`, `/admin/audit/checkpoint` | admin | audit |
 //! | `POST /admin/policies/reload` | admin | hot-reload the Cedar policy file |
@@ -23,6 +24,7 @@
 pub mod authz;
 pub mod config;
 pub mod error;
+pub mod idp;
 pub mod jwks;
 pub mod routes;
 pub mod state;
@@ -49,18 +51,20 @@ pub fn build(config: &Config) -> anyhow::Result<(Router, Arc<AppState>)> {
 pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Config) -> Router {
     use routes::{admin, authzen, dev_root, token, wellknown};
 
-    let admin_routes = Router::new()
-        .route("/admin/root-token", post(dev_root::mint_root))
+    let mut admin_routes = Router::new()
         .route("/admin/leases/{lease_id}", get(admin::lease_status))
         .route("/admin/leases/{lease_id}/revoke", post(admin::revoke_lease))
         .route("/admin/audit", get(admin::audit_range))
         .route("/admin/audit/verify", get(admin::audit_verify))
         .route("/admin/audit/checkpoint", get(admin::audit_checkpoint))
-        .route("/admin/policies/reload", post(admin::reload_policies))
-        .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            admin::require_admin,
-        ));
+        .route("/admin/policies/reload", post(admin::reload_policies));
+    if state.dev_allow_root_mint {
+        admin_routes = admin_routes.route("/admin/root-token", post(dev_root::mint_root));
+    }
+    let admin_routes = admin_routes.route_layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        admin::require_admin,
+    ));
 
     let api = Router::new()
         .route("/healthz", get(wellknown::healthz))
