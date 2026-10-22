@@ -48,6 +48,7 @@ tempfile = "3"
 async-trait = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 bytes = "1"
+proptest = "1"
 
 [profile.release]
 lto = "thin"
