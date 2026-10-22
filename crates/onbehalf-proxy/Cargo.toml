@@ -1,10 +1,35 @@
 [package]
 name = "onbehalf-proxy"
+description = "Policy enforcement point for onbehalf: an MCP reverse proxy that authorizes every tools/call"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Test doubles (FakeMcpServer, StaticAuthorizer) for downstream crates' tests.
+testing = []
+
 [dependencies]
 onbehalf-core = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+# Enables the `testing` module for this crate's own integration tests.
+onbehalf-proxy = { path = ".", features = ["testing"] }
+tracing-subscriber = { workspace = true }
