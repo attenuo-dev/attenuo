@@ -34,9 +34,19 @@ pub struct Config {
     pub upstreams: Vec<UpstreamConfig>,
     #[serde(default)]
     pub admin: AdminSection,
-    /// Development-only allowlist for `POST /admin/root-token`. See [`RootGrant`].
+    /// Trusted identity providers for hop-0 intake (OIDC ID tokens and ID-JAG). See [`IdpConfig`].
+    #[serde(default)]
+    pub idps: Vec<IdpConfig>,
+    /// Agents (OAuth clients) that may present user credentials at `POST /token`. When empty,
+    /// every IdP intake request is rejected with `invalid_client`.
+    #[serde(default)]
+    pub agents: Vec<AgentConfig>,
+    /// The ceiling of what a root token may carry, per (IdP issuer, agent[, subject]). Used by
+    /// IdP intake and by the dev root mint. See [`RootGrant`].
     #[serde(default)]
     pub root_grants: Vec<RootGrant>,
+    #[serde(default)]
+    pub dev: DevSection,
 }
 
 /// `[server]`
@@ -183,21 +193,121 @@ pub struct AdminSection {
     pub token: Option<String>,
 }
 
-/// One `[[root_grants]]` entry: who the dev root-mint endpoint may mint for, and the ceiling
-/// of what it may grant.
+/// `[dev]`: development-only switches. Everything here defaults to off.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DevSection {
+    /// Mount `POST /admin/root-token`, which mints hop-0 tokens for a user nobody verified.
+    /// Default `false`; when `true` the server logs a warning at startup.
+    #[serde(default)]
+    pub allow_root_mint: bool,
+}
+
+/// Default `[[idps]] allowed_algs`.
+pub const DEFAULT_IDP_ALGS: &[&str] = &["RS256", "ES256", "EdDSA"];
+/// Default `[[idps]] attribute_claims`.
+pub const DEFAULT_ATTRIBUTE_CLAIMS: &[&str] = &["email", "groups", "amr"];
+
+/// One `[[idps]]` entry: an identity provider whose ID tokens and ID-JAGs are trusted for
+/// hop 0.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdpConfig {
+    /// Exact `iss` value of the IdP's tokens (and of its discovery document).
+    pub issuer: String,
+    /// `aud` an OIDC ID token must carry: the client id onbehalf (or the agent platform) is
+    /// registered under at the IdP. Not used for ID-JAG, whose `aud` must be `[issuer] issuer`.
+    pub audience: String,
+    /// JWKS location. When absent, `jwks_uri` from `<issuer>/.well-known/openid-configuration`.
+    #[serde(default)]
+    pub jwks_url: Option<String>,
+    /// JWS algorithms accepted from this IdP. Only asymmetric algorithms are allowed.
+    #[serde(default = "default_idp_algs")]
+    pub allowed_algs: Vec<String>,
+    /// Claims copied verbatim into `originating_user.attributes` when present.
+    #[serde(default = "default_attribute_claims")]
+    pub attribute_claims: Vec<String>,
+    /// How long a fetched JWKS is used before it is fetched again. Default 300.
+    #[serde(default = "default_jwks_ttl")]
+    pub jwks_ttl_seconds: u64,
+    /// Allowed clock skew for `exp`, `iat` and `nbf`. Default 60.
+    #[serde(default = "default_clock_skew")]
+    pub clock_skew_seconds: u64,
+}
+
+fn default_idp_algs() -> Vec<String> {
+    DEFAULT_IDP_ALGS.iter().map(|s| s.to_string()).collect()
+}
+fn default_attribute_claims() -> Vec<String> {
+    DEFAULT_ATTRIBUTE_CLAIMS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+fn default_jwks_ttl() -> u64 {
+    300
+}
+fn default_clock_skew() -> u64 {
+    60
+}
+
+/// One `[[agents]]` entry: an OAuth client that may exchange user credentials for root tokens.
 ///
-/// When the list is empty, `POST /admin/root-token` mints whatever the admin asks for. When it
-/// is non-empty, a request must match an entry on `subject`, `issuer` and `agent`, and the
-/// requested capabilities must be covered by the entry's (omitting them takes the entry's).
+/// `id` is the `client_id` and becomes the root hop's agent id. `secret_sha256` is the
+/// lowercase hex SHA-256 of the client secret (`printf %s "$SECRET" | sha256sum`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentConfig {
+    pub id: String,
+    pub secret_sha256: String,
+}
+
+/// One `[[root_grants]]` entry: the ceiling of what a root token for users of `issuer`, held
+/// by `agent`, may carry.
+///
+/// IdP intake picks the entry matching the verified token's `iss`, the authenticated agent and,
+/// if the entry names one, the `subject` (an entry with a `subject` wins over one without).
+/// No match means no root token. The requested capabilities are attenuated against the entry's.
+///
+/// The dev root mint (`[dev] allow_root_mint`) uses the same list; there, an empty list lets
+/// the admin mint anything, and `attributes` are copied into the user block. IdP intake
+/// ignores `attributes`: user attributes come only from the verified token.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RootGrant {
-    pub subject: String,
+    /// Pin the grant to one user. When absent, the grant applies to every user of `issuer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
     pub issuer: String,
     pub agent: String,
     pub capabilities: Vec<CapSpec>,
     #[serde(default)]
     pub attributes: BTreeMap<String, Value>,
+}
+
+impl RootGrant {
+    /// Does this grant apply to `subject` of `issuer` acting through `agent`?
+    pub fn matches(&self, issuer: &str, agent: &str, subject: &str) -> bool {
+        self.issuer == issuer
+            && self.agent == agent
+            && self.subject.as_deref().is_none_or(|s| s == subject)
+    }
+
+    /// The most specific grant for (issuer, agent, subject): a subject-pinned entry first,
+    /// then one without a subject, in file order.
+    pub fn find<'a>(
+        grants: &'a [RootGrant],
+        issuer: &str,
+        agent: &str,
+        subject: &str,
+    ) -> Option<&'a RootGrant> {
+        let mut matching = grants.iter().filter(|g| g.matches(issuer, agent, subject));
+        let first = matching.next()?;
+        if first.subject.is_some() {
+            return Some(first);
+        }
+        matching.find(|g| g.subject.is_some()).or(Some(first))
+    }
 }
 
 /// A capability written either as shorthand `"server:tool"` (globs allowed, e.g. `"github:*"`)
@@ -260,6 +370,10 @@ mod tests {
         assert!(catalog.get("github", "read_file").readonly);
         assert!(!cfg.root_grants.is_empty());
         capability_set(&cfg.root_grants[0].capabilities).unwrap();
+        assert_eq!(cfg.idps.len(), 1);
+        assert_eq!(cfg.idps[0].allowed_algs, DEFAULT_IDP_ALGS);
+        assert_eq!(cfg.agents.len(), 1);
+        assert!(!cfg.dev.allow_root_mint);
     }
 
     #[test]
@@ -268,6 +382,31 @@ mod tests {
         assert_eq!(cfg.audit.sqlite_path, ":memory:");
         assert_eq!(cfg.issuer.default_ttl_seconds, 900);
         assert!(cfg.admin.token.is_none());
+        assert!(
+            !cfg.dev.allow_root_mint,
+            "the dev root mint is off by default"
+        );
+        assert!(cfg.idps.is_empty() && cfg.agents.is_empty());
+    }
+
+    #[test]
+    fn root_grant_matching_prefers_a_pinned_subject() {
+        let grant = |subject: Option<&str>, cap: &str| RootGrant {
+            subject: subject.map(Into::into),
+            issuer: "idp".into(),
+            agent: "planner".into(),
+            capabilities: vec![CapSpec::Short(cap.into())],
+            attributes: BTreeMap::new(),
+        };
+        let grants = vec![
+            grant(None, "github:read_*"),
+            grant(Some("alice"), "github:*"),
+        ];
+        let pick = |sub: &str| RootGrant::find(&grants, "idp", "planner", sub);
+        assert_eq!(pick("alice").unwrap().subject.as_deref(), Some("alice"));
+        assert_eq!(pick("bob").unwrap().subject, None);
+        assert!(RootGrant::find(&grants, "other", "planner", "alice").is_none());
+        assert!(RootGrant::find(&grants, "idp", "coder", "alice").is_none());
     }
 
     #[test]

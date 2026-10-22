@@ -1,4 +1,13 @@
-//! `POST /token`: RFC 8693 token exchange (hop n to hop n+1).
+//! `POST /token`: RFC 8693 token exchange.
+//!
+//! Two kinds of request share this endpoint:
+//!
+//! - **Hop 0 (IdP intake).** `subject_token_type` is `...:token-type:id_token` or
+//!   `...:token-type:id-jag` (or `grant_type` is `...:grant-type:jwt-bearer`): the subject token
+//!   is a user credential from a trusted IdP, and the agent authenticates with its client
+//!   credentials. Handled by [`crate::idp::intake`].
+//! - **Hop n to n+1.** `subject_token_type` is `...:token-type:jwt` and the subject token is an
+//!   onbehalf token. Described below.
 //!
 //! Accepts `application/x-www-form-urlencoded` (RFC 8693 §2.1) or `application/json`. Fields:
 //!
@@ -37,14 +46,18 @@ pub async fn exchange(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let req = parse_request(&headers, &body)?;
+    let value = parse_body(&headers, &body)?;
+    let now = now();
+    if crate::idp::intake::is_intake(&value) {
+        return crate::idp::intake::handle(&state, &headers, value, now).await;
+    }
+    let req = parse_request(value)?;
     if req.requested.is_empty() {
         return Err(ApiError::bad_request(
             "invalid_request",
             format!("authorization_details must contain a `{AUTHORIZATION_DETAILS_TYPE}` entry with at least one capability"),
         ));
     }
-    let now = now();
     let parent = state.verifier.verify(&req.subject_token, now)?;
     state
         .pipeline
@@ -108,12 +121,16 @@ fn is_form(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-fn parse_request(headers: &HeaderMap, body: &Bytes) -> Result<ExchangeRequest, ApiError> {
-    let value = if is_form(headers) {
-        form_to_json(body)?
+/// The request body as JSON, from either encoding.
+fn parse_body(headers: &HeaderMap, body: &Bytes) -> Result<Value, ApiError> {
+    if is_form(headers) {
+        form_to_json(body)
     } else {
-        parse_json::<Value>(body)?
-    };
+        parse_json::<Value>(body)
+    }
+}
+
+fn parse_request(value: Value) -> Result<ExchangeRequest, ApiError> {
     serde_json::from_value(value).map_err(|e| {
         let msg = e.to_string();
         let code = if msg.contains("unsupported grant_type") {

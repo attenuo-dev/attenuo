@@ -1,10 +1,11 @@
 //! `POST /admin/root-token`: mint a hop-0 token directly. **Development only.**
 //!
-//! RFC-0001 §4 says hop 0 is minted from a verified user credential (an OIDC ID token or an
-//! ID-JAG assertion checked against the IdP's JWKS). That intake is not implemented yet. This
-//! endpoint stands in for it: an operator holding the admin token asserts who the user is and
-//! which agent acts for them. Nothing about the user is verified, so the endpoint sits behind
-//! the admin bearer and, when `[[root_grants]]` is configured, is limited to those grants.
+//! Real hop-0 intake verifies a user credential from a trusted IdP (an OIDC ID token or an
+//! ID-JAG) at `POST /token`; see [`crate::idp`]. This endpoint skips that: an operator holding
+//! the admin token asserts who the user is and which agent acts for them. Nothing about the
+//! user is verified, so the route is mounted only when `[dev] allow_root_mint = true` (the
+//! server logs a warning at startup when it is), sits behind the admin bearer and, when
+//! `[[root_grants]]` is configured, is limited to those grants.
 //!
 //! Body: `{ subject, issuer, agent, capabilities?, ttl_seconds?, attributes? }`, where
 //! `capabilities` is a list of `"server:tool"` strings or capability objects. The response has
@@ -104,10 +105,8 @@ fn resolve_grant(
             .ok_or_else(|| ApiError::bad_request("invalid_request", "capabilities are required"))?;
         return Ok((caps, BTreeMap::new()));
     }
-    let grant = grants
-        .iter()
-        .find(|g| g.subject == req.subject && g.issuer == req.issuer && g.agent == req.agent)
-        .ok_or_else(|| {
+    let grant =
+        RootGrant::find(grants, &req.issuer, &req.agent, &req.subject).ok_or_else(|| {
             ApiError::new(
                 axum::http::StatusCode::FORBIDDEN,
                 "no_root_grant",
@@ -169,7 +168,7 @@ mod tests {
     #[test]
     fn grants_cap_what_can_be_minted() {
         let grants = vec![RootGrant {
-            subject: "alice".into(),
+            subject: Some("alice".into()),
             issuer: "idp".into(),
             agent: "planner".into(),
             capabilities: vec![CapSpec::Short("github:read_*".into())],

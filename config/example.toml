@@ -54,12 +54,41 @@ url = "http://127.0.0.1:3001/mcp"
 # Static bearer for /admin/*. v0 only: change it, and do not expose /admin publicly.
 token = "dev-admin-token-change-me"
 
-# Development stand-in for IdP intake (OIDC / ID-JAG is not implemented yet).
-# POST /admin/root-token may only mint for these (subject, issuer, agent) triples, and only
-# capabilities covered by the listed ones. Remove every entry to let the admin mint anything.
+# Trusted identity providers for hop 0. POST /token accepts an OIDC ID token
+# (subject_token_type = urn:ietf:params:oauth:token-type:id_token) or an ID-JAG
+# (urn:ietf:params:oauth:token-type:id-jag) from these issuers only. Any OIDC-compliant IdP
+# works (Okta, Entra ID, Google, Auth0, Keycloak, Dex, ...).
+[[idps]]
+issuer = "https://idp.example"
+# `aud` an ID token must carry: the client id registered at the IdP. (An ID-JAG's `aud` must be
+# [issuer] issuer instead.)
+audience = "onbehalf"
+# Optional; when absent, jwks_uri from <issuer>/.well-known/openid-configuration.
+# jwks_url = "https://idp.example/oauth2/v1/keys"
+allowed_algs = ["RS256", "ES256", "EdDSA"]
+# Claims copied into originating_user.attributes. `mfa` (bool) is always derived from `amr`.
+attribute_claims = ["email", "groups", "amr"]
+# jwks_ttl_seconds = 300
+# clock_skew_seconds = 60
+
+# Agents (OAuth clients) that may present user credentials at POST /token, authenticated with
+# client_id/client_secret (form or HTTP Basic). secret_sha256 = `printf %s "$SECRET" | sha256sum`.
+# With no [[agents]], every IdP intake request is rejected.
+[[agents]]
+id = "planner"
+secret_sha256 = "a93d472e76b73bffcef69973eb463fb679b1365377e183a459d7f33c2ee97b7a"   # "planner-secret-change-me"
+
+# The most a root token may carry: for users of `issuer`, held by `agent`. Add `subject = "..."`
+# to pin an entry to one user (a pinned entry wins over an unpinned one). The capabilities
+# requested at /token are attenuated against the matching entry; no entry, no root token.
 [[root_grants]]
-subject = "alice"
 issuer = "https://idp.example"
 agent = "planner"
 capabilities = ["github:*"]
+# Only the dev root mint copies `attributes`; IdP intake takes attributes from the verified token.
 attributes = { mfa = false }
+
+[dev]
+# DEVELOPMENT ONLY. Mounts POST /admin/root-token, which mints root tokens for a user nobody
+# verified (admin bearer + [[root_grants]] only). The server logs a warning when this is on.
+allow_root_mint = false

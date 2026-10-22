@@ -11,7 +11,8 @@ use serde_json::Value;
 use time::Duration;
 
 use crate::authz::Pipeline;
-use crate::config::{Config, RootGrant};
+use crate::config::{AgentConfig, Config, RootGrant};
+use crate::idp::IdpRegistry;
 
 /// Everything the handlers share.
 pub struct AppState {
@@ -24,6 +25,12 @@ pub struct AppState {
     pub policies_path: Option<PathBuf>,
     pub admin_token: Option<String>,
     pub root_grants: Vec<RootGrant>,
+    /// Trusted IdPs for hop-0 intake.
+    pub idps: IdpRegistry,
+    /// Agents allowed to present IdP credentials (`[[agents]]`, validated).
+    pub agents: Vec<AgentConfig>,
+    /// `[dev] allow_root_mint`.
+    pub dev_allow_root_mint: bool,
     pub public_url: Option<String>,
     /// Precomputed `/.well-known/jwks.json` body.
     pub jwks: Value,
@@ -41,6 +48,19 @@ impl AppState {
 
         let (audit, leases) = open_storage(&config.audit.sqlite_path)?;
         let pipeline = Arc::new(Pipeline::new(policy, leases.clone(), audit.clone()));
+        let idps = IdpRegistry::from_config(&config.idps, &config.issuer.issuer)?;
+        let agents = crate::idp::intake::validate_agents(&config.agents)?;
+        if config.dev.allow_root_mint {
+            tracing::warn!(
+                "!!! [dev] allow_root_mint = true: POST /admin/root-token mints root tokens for \
+                 users nobody has verified. Development only; never enable this in a deployment. !!!"
+            );
+        }
+        if !idps.is_empty() && agents.is_empty() {
+            tracing::warn!(
+                "[[idps]] are configured but [[agents]] is empty; IdP intake rejects every request"
+            );
+        }
 
         Ok(Self {
             issuer,
@@ -51,6 +71,9 @@ impl AppState {
             policies_path: config.policy.policies_path.clone(),
             admin_token: config.admin.token.clone(),
             root_grants: config.root_grants.clone(),
+            idps,
+            agents,
+            dev_allow_root_mint: config.dev.allow_root_mint,
             public_url: config.server.public_url.clone(),
             jwks,
         })

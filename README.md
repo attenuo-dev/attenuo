@@ -46,18 +46,48 @@ cargo build -p onbehalf-server
 cargo run -p onbehalf-server -- --config config/example.toml   # or ONBEHALF_CONFIG=config/example.toml
 ```
 
-The flow below uses `curl` and `jq`. The root token comes from a development endpoint that stands in for IdP intake (OIDC / ID-JAG), which is not implemented yet; it requires the admin token and is limited to the `[[root_grants]]` in the config.
+The flows below use `curl` and `jq`.
+
+### Hop 0 from your identity provider
+
+The first token in a chain is minted from a credential the user's IdP issued: an OIDC ID token, or an ID-JAG (draft-ietf-oauth-identity-assertion-authz-grant). Any OIDC issuer works. List it under `[[idps]]` (its JWKS is found through `/.well-known/openid-configuration` unless you set `jwks_url`), register the agent under `[[agents]]`, and cap what the agent may get for those users under `[[root_grants]]`:
+
+```toml
+[[idps]]
+issuer = "https://your-tenant.example.com"   # exact `iss`
+audience = "your-client-id"                  # `aud` of the ID tokens
+
+[[agents]]
+id = "planner"
+secret_sha256 = "..."                        # printf %s "$SECRET" | sha256sum
+
+[[root_grants]]
+issuer = "https://your-tenant.example.com"
+agent = "planner"
+capabilities = ["github:*"]
+```
+
+The agent exchanges the user's ID token for a root delegation token (RFC 8693), authenticating with its own client credentials. The token's originating user comes from the verified ID token: `sub`, `iss`, `auth_time`, the configured `attribute_claims`, and an `mfa` flag derived from `amr`.
 
 ```sh
 OB=http://127.0.0.1:8080
 ADMIN=dev-admin-token-change-me
+ID_TOKEN=...   # from your IdP's login flow
 
-# 1. Mint a root token: alice's "planner" agent may call any github tool.
-ROOT=$(curl -s -X POST $OB/admin/root-token -H "Authorization: Bearer $ADMIN" \
-  -H 'content-type: application/json' \
-  -d '{"subject":"alice","issuer":"https://idp.example","agent":"planner","capabilities":["github:*"]}')
+# 1. Exchange the user's ID token for a root token held by "planner".
+ROOT=$(curl -s -X POST $OB/token -u planner:planner-secret-change-me \
+  --data-urlencode grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+  --data-urlencode subject_token=$ID_TOKEN \
+  --data-urlencode subject_token_type=urn:ietf:params:oauth:token-type:id_token \
+  --data-urlencode scope=github:*)
 ROOT_TOKEN=$(echo "$ROOT" | jq -r .access_token); ROOT_LEASE=$(echo "$ROOT" | jq -r .lease)
+```
 
+For an ID-JAG, send `subject_token_type=urn:ietf:params:oauth:token-type:id-jag` (or `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` with `assertion=`). Its `aud` must be `[issuer] issuer` and its `client_id` must be the authenticated agent. Failures come back as `invalid_client` (401), or as `invalid_grant` or `invalid_scope` (400), each with a stable `error_description` code such as `audience_mismatch`, `expired`, `unknown_kid` or `scope_exceeds_grant`.
+
+### Delegate, call, revoke
+
+```sh
 # 2. RFC 8693 exchange: planner delegates read_file only to a "coder" sub-agent.
 CHILD_TOKEN=$(curl -s -X POST $OB/token \
   --data-urlencode grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
@@ -87,6 +117,17 @@ mcp '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file",
 # Every decision and issuance is in the hash-chained audit log.
 curl -s $OB/admin/audit/verify -H "Authorization: Bearer $ADMIN"   # {"entries":5,"ok":true,"first_bad_seq":null}
 curl -s "$OB/admin/audit?from=1&limit=20" -H "Authorization: Bearer $ADMIN" | jq '.entries[].record | {decision,reason,tool,agents}'
+```
+
+### Development only: a root token without an IdP
+
+To try the flow without an identity provider, set `[dev] allow_root_mint = true`. This mounts `POST /admin/root-token`, which mints a root token for whichever user the admin names. Nothing about that user is verified, so the server logs a warning at startup. With the setting off (the default) the route does not exist and answers 404. Use it in place of step 1:
+
+```sh
+ROOT=$(curl -s -X POST $OB/admin/root-token -H "Authorization: Bearer $ADMIN" \
+  -H 'content-type: application/json' \
+  -d '{"subject":"alice","issuer":"https://idp.example","agent":"planner","capabilities":["github:*"]}')
+ROOT_TOKEN=$(echo "$ROOT" | jq -r .access_token); ROOT_LEASE=$(echo "$ROOT" | jq -r .lease)
 ```
 
 Other endpoints: `POST /access/v1/evaluation` (AuthZEN; send the delegation token as bearer), `GET /.well-known/jwks.json`, `GET /.well-known/authzen-configuration`, `POST /admin/policies/reload`, `GET /admin/leases/{id}`, `GET /admin/audit/checkpoint`, `GET /healthz`. The request pipeline is described in [docs/design/server.md](docs/design/server.md). Set `RUST_LOG=debug` for more logging.
