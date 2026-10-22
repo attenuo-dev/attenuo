@@ -14,6 +14,7 @@
 //! | `GET /.well-known/authzen-configuration` | none | AuthZEN metadata |
 //! | `GET /.well-known/jwks.json` | none | issuer public key |
 //! | `GET /healthz` | none | liveness |
+//! | `GET /readyz` | none | readiness: audit store and lease store answer |
 //! | `POST/GET/DELETE /mcp/{server}` | delegation token | MCP proxy |
 //! | `POST /admin/root-token` | admin | dev-only hop-0 mint ([`routes::dev_root`]), mounted only with `[dev] allow_root_mint = true` |
 //! | `POST /admin/leases/{id}/revoke`, `GET /admin/leases/{id}` | admin | leases |
@@ -69,6 +70,7 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
 
     let api = Router::new()
         .route("/healthz", get(wellknown::healthz))
+        .route("/readyz", get(routes::ops::readyz))
         .route("/.well-known/jwks.json", get(wellknown::jwks))
         .route(
             "/.well-known/authzen-configuration",

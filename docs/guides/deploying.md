@@ -215,13 +215,7 @@ Notes:
 
 `GET /healthz` returns `{"status":"ok","version":"..."}` with HTTP 200. It is a liveness check only. It does not open the database, check disk space or contact an identity provider. A server whose SQLite file is read-only or full still answers `ok`, and then denies every call.
 
-There is no readiness endpoint. For a deeper check, call an admin route that reads the database:
-
-```sh
-curl -fsS http://127.0.0.1:8080/admin/audit/checkpoint -H "Authorization: Bearer $ONBEHALF_ADMIN_TOKEN"
-```
-
-That proves the process is up, the token works and SQLite is readable. Do not put the admin token in a load balancer's config. Run this one from a monitor on the host.
+`GET /readyz` is the readiness check. It reads the head of the audit log and one row of the lease store. It answers 200 `{"status":"ready","checks":{...}}` when both work, and 503 with `"status":"unavailable"` and the failing check's error when either does not. Point a load balancer or Kubernetes `readinessProbe` at it; keep `/healthz` for the liveness probe so a full disk takes the instance out of rotation instead of restarting it. It needs no credentials and discloses only the storage error text.
 
 Startup is quick: parse config, load the key, open SQLite, load policy. Config, policy or catalog errors stop the process with a message instead of starting a half-working server.
 
