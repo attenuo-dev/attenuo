@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/7Mudit/onbehalf/security/advisories/new
+    about: Please report security issues privately. See SECURITY.md. Never file them as public issues.
+  - name: Ask a question or propose a design
+    url: https://github.com/7Mudit/onbehalf/discussions
+    about: For questions and early-stage design ideas before they become an RFC.
