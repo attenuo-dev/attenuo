@@ -95,8 +95,9 @@ For an ID-JAG, send `subject_token_type=urn:ietf:params:oauth:token-type:id-jag`
 ### Delegate, call, revoke
 
 ```sh
-# 2. RFC 8693 exchange: planner delegates read_file only to a "coder" sub-agent.
-CHILD_TOKEN=$(curl -s -X POST $OB/token \
+# 2. RFC 8693 exchange: planner delegates read_file only to a "coder" sub-agent. The coder
+#    authenticates as itself ([[agents]]); only it can receive a token in its name.
+CHILD_TOKEN=$(curl -s -X POST $OB/token -u coder:coder-secret-change-me \
   --data-urlencode grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
   --data-urlencode subject_token=$ROOT_TOKEN \
   --data-urlencode subject_token_type=urn:ietf:params:oauth:token-type:jwt \
@@ -149,7 +150,7 @@ export ONBEHALF_SERVER=http://127.0.0.1:8080 ONBEHALF_ADMIN_TOKEN=dev-admin-toke
 alias onbehalf=target/debug/onbehalf
 
 onbehalf token root --subject alice --issuer https://idp.example --agent planner --cap 'github:*'
-onbehalf token exchange --subject-token "$ROOT_TOKEN" --actor coder --cap github:read_file
+onbehalf token exchange --subject-token "$ROOT_TOKEN" --actor coder --client-secret coder-secret-change-me --cap github:read_file
 onbehalf token inspect "$CHILD_TOKEN" --verify      # the chain as a tree; --verify checks it against the server's JWKS
 onbehalf call --token "$CHILD_TOKEN" --server github --tool read_file --arg repo=acme/api
 onbehalf lease revoke "$ROOT_LEASE" --reason demo
@@ -157,7 +158,7 @@ onbehalf audit tail -n 10 --follow
 onbehalf audit verify
 ```
 
-Other subcommands: `tools` (`tools/list`), `lease show`, `policy reload`, `authzen eval`. Output is for people by default and JSON with `--json`; `--print token|lease` on `token root` and `token exchange` prints one value for scripts. `--server` before the subcommand is the onbehalf URL; after `call` or `tools` it names the MCP upstream. Exit status is 0 on success, 1 on an error and 2 when the server said no (a denied call, a negative AuthZEN decision, a broken audit chain). `ONBEHALF_TOKEN` can stand in for `--token` and `--subject-token`.
+Other subcommands: `tools` (`tools/list`), `lease show`, `policy reload`, `authzen eval`. Output is for people by default and JSON with `--json`; `--print token|lease` on `token root` and `token exchange` prints one value for scripts. `--server` before the subcommand is the onbehalf URL; after `call` or `tools` it names the MCP upstream. Exit status is 0 on success, 1 on an error and 2 when the server said no (a denied call, a negative AuthZEN decision, a broken audit chain). `ONBEHALF_TOKEN` can stand in for `--token` and `--subject-token`, and `ONBEHALF_CLIENT_SECRET` for `--client-secret`.
 
 A scripted end-to-end run of the GitHub leak scenario, with a fake MCP server, is in [examples/github-leak-demo](examples/github-leak-demo/README.md). A `Dockerfile` and `docker-compose.yml` run the same pair of servers in containers (untested).
 

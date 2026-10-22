@@ -102,6 +102,10 @@ impl From<onbehalf_token::TokenError> for ApiError {
         use onbehalf_core::ChainError;
         use onbehalf_token::TokenError;
         let code = match &e {
+            TokenError::Chain(ChainError::DuplicateAgent { .. }) => {
+                return ApiError::bad_request("invalid_request", e.to_string())
+                    .with_description("duplicate_actor")
+            }
             TokenError::Chain(ChainError::AttenuationViolated { .. })
             | TokenError::Chain(ChainError::TooDeep { .. }) => "invalid_scope",
             TokenError::Key(_) => return ApiError::internal(e),

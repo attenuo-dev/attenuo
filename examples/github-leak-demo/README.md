@@ -28,7 +28,7 @@ See [writing-policies](../../docs/guides/writing-policies.md#testing-policies).
 | Step | Call | Result | Why |
 | --- | --- | --- | --- |
 | 1 | `token root` for alice's `assistant`, `github:*` | token | The broad grant, like the over-privileged PAT. |
-| 2 | `token exchange` to `coder`, `github:read_file` | token | The sub-agent gets one tool, not all of them. |
+| 2 | `token exchange` to `coder`, `github:read_file`, authenticated with coder's client secret | token | The sub-agent gets one tool, not all of them, and only an agent that proves it is `coder` can receive it. |
 | 3 | `token inspect --verify` | tree: alice, assistant, coder | The chain and capabilities are in the token and can be checked against the server's JWKS. |
 | 4 | `read_file alice/public-docs` | allowed, reaches upstream | Intended use. |
 | 5 | `read_file alice/private-salaries` (the injected call) | denied, `policy_deny` | The token allows `read_file`, but `policy.cedar` only permits repos matching `alice/public-*`. This is the leak, stopped. |
@@ -51,4 +51,4 @@ The fake server is `crates/onbehalf-proxy/examples/fake_mcp.rs`: the proxy crate
 
 ## What this does not show
 
-The root token comes from the server's development endpoint, which trusts the admin to say who alice is. Real user authentication (OIDC, ID-JAG) is not built yet. The `actor` of an exchange is asserted by the caller, not proven. See the [task board](../../docs/tasks/board.md).
+The root token comes from the server's development endpoint, which trusts the admin to say who alice is. Real deployments mint it from an OIDC ID token or ID-JAG instead. The `actor` of the exchange authenticates with a client secret from `[[agents]]`; workload identity (an `actor_token` such as a SPIFFE JWT-SVID) is not built yet. See the [task board](../../docs/tasks/board.md).

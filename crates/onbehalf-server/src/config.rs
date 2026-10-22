@@ -51,6 +51,8 @@ pub struct Config {
     pub metrics: MetricsSection,
     #[serde(default)]
     pub authzen: AuthzenSection,
+    #[serde(default)]
+    pub token: TokenSection,
     /// Policy enforcement points allowed to send unsigned chains to the AuthZEN endpoint when
     /// `[authzen] allow_unsigned_chain = true`. Same shape as `[[agents]]`.
     #[serde(default)]
@@ -68,6 +70,30 @@ pub struct AuthzenSection {
     /// must match what this server issued for its lease.
     #[serde(default)]
     pub allow_unsigned_chain: bool,
+}
+
+/// `[token]`: the `POST /token` exchange endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenSection {
+    /// Require the caller of an exchange (hop n to n+1) to authenticate as the `actor` it
+    /// names, with `[[agents]]` client credentials. Default `true`. When `false` the actor is
+    /// asserted, not authenticated (the server logs a warning at startup), though credentials
+    /// that are presented are still checked.
+    #[serde(default = "default_true")]
+    pub require_actor_auth: bool,
+}
+
+impl Default for TokenSection {
+    fn default() -> Self {
+        Self {
+            require_actor_auth: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// One `[[peps]]` entry: `{ id, secret_sha256 }`, as for [`AgentConfig`].
@@ -444,7 +470,8 @@ mod tests {
         capability_set(&cfg.root_grants[0].capabilities).unwrap();
         assert_eq!(cfg.idps.len(), 1);
         assert_eq!(cfg.idps[0].allowed_algs, DEFAULT_IDP_ALGS);
-        assert_eq!(cfg.agents.len(), 1);
+        assert_eq!(cfg.agents.len(), 2);
+        assert!(cfg.token.require_actor_auth);
         assert!(!cfg.dev.allow_root_mint);
     }
 
@@ -482,6 +509,7 @@ mod tests {
             !cfg.authzen.allow_unsigned_chain && cfg.peps.is_empty(),
             "unsigned AuthZEN chains are off by default"
         );
+        assert!(cfg.token.require_actor_auth, "actor auth is on by default");
     }
 
     #[test]

@@ -15,6 +15,12 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 
 const ADMIN: &str = "test-admin-token";
+/// Agents registered in `[[agents]]`; each one's secret is [`agent_secret`].
+const AGENTS: &[&str] = &["coder", "sneaky", "x", "reviewer"];
+
+fn agent_secret(id: &str) -> String {
+    format!("{id}-secret")
+}
 const TOOLS: &[&str] = &["read_file", "create_issue", "delete_repo"];
 
 const POLICY_PUBLIC_READS: &str = r#"
@@ -95,6 +101,13 @@ impl Harness {
         cfg.upstreams = vec![UpstreamConfig::new("github", upstream_task.url("/mcp"))];
         cfg.admin.token = Some(ADMIN.into());
         cfg.dev.allow_root_mint = true;
+        cfg.agents = AGENTS
+            .iter()
+            .map(|id| onbehalf_server::config::AgentConfig {
+                id: (*id).into(),
+                secret_sha256: sha256_hex(&agent_secret(id)),
+            })
+            .collect();
         tweak(&mut cfg);
 
         let (router, state) = onbehalf_server::build(&cfg).unwrap();
@@ -158,7 +171,20 @@ impl Harness {
         }
     }
 
+    /// Exchange, authenticating as `actor` with its client secret.
     async fn exchange_raw(&self, parent: &str, actor: &str, caps: &[&str]) -> reqwest::Response {
+        self.exchange_as(parent, actor, caps, Some((actor, &agent_secret(actor))))
+            .await
+    }
+
+    /// Exchange with explicit client credentials (sent as `client_id` / `client_secret`).
+    async fn exchange_as(
+        &self,
+        parent: &str,
+        actor: &str,
+        caps: &[&str],
+        client: Option<(&str, &str)>,
+    ) -> reqwest::Response {
         let caps: Vec<Value> = caps
             .iter()
             .map(|c| {
@@ -174,6 +200,8 @@ impl Harness {
                 "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
                 "actor": actor,
                 "authorization_details": [{"type": "onbehalf_capabilities", "capabilities": caps}],
+                "client_id": client.map(|c| c.0),
+                "client_secret": client.map(|c| c.1),
             }))
             .send()
             .await
@@ -407,6 +435,8 @@ async fn exchange_accepts_rfc8693_form_encoding() {
         ("subject_token", root.token.as_str()),
         ("subject_token_type", "urn:ietf:params:oauth:token-type:jwt"),
         ("actor", "coder"),
+        ("client_id", "coder"),
+        ("client_secret", "coder-secret"),
         ("authorization_details", details.as_str()),
         ("requested_ttl_seconds", "120"),
     ];
@@ -471,6 +501,104 @@ fn enc(s: &str) -> String {
             _ => format!("%{b:02X}"),
         })
         .collect()
+}
+
+/// SR-10: the actor of an exchange is authenticated, and an agent cannot appear twice.
+#[tokio::test]
+async fn exchange_actor_must_authenticate_as_itself() {
+    let h = Harness::start().await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let caps = &["github:read_file"];
+    let error = |v: &Value| {
+        (
+            v["error"].as_str().unwrap_or_default().to_string(),
+            v["error_description"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        )
+    };
+
+    // No credentials: 401 invalid_client.
+    let resp = h.exchange_as(&root.token, "coder", caps, None).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        error(&resp.json().await.unwrap()),
+        ("invalid_client".into(), "client_auth_missing".into())
+    );
+    // Wrong secret, unknown client.
+    for client in [("coder", "nope"), ("ghost", "ghost-secret")] {
+        let resp = h
+            .exchange_as(&root.token, "coder", caps, Some(client))
+            .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{client:?}");
+    }
+    // A compromised sub-agent with its own valid credentials cannot name another agent.
+    let resp = h
+        .exchange_as(
+            &root.token,
+            "release-bot",
+            caps,
+            Some(("coder", "coder-secret")),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error(&resp.json().await.unwrap()),
+        ("invalid_request".into(), "actor_mismatch".into())
+    );
+    // HTTP Basic works too.
+    let resp = h
+        .client
+        .post(h.url("/token"))
+        .basic_auth("coder", Some("coder-secret"))
+        .json(&json!({
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "subject_token": root.token,
+            "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+            "actor": "coder",
+            "authorization_details": [{"type": "onbehalf_capabilities",
+                "capabilities": [{"server": "github", "tool": "read_file"}]}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let child: Value = resp.json().await.unwrap();
+
+    // coder -> reviewer -> coder again is refused with a clear error.
+    let reviewer = h
+        .exchange(child["access_token"].as_str().unwrap(), "reviewer", caps)
+        .await;
+    let resp = h.exchange_raw(&reviewer.token, "coder", caps).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err: Value = resp.json().await.unwrap();
+    assert_eq!(
+        error(&err),
+        ("invalid_request".into(), "duplicate_actor".into())
+    );
+    assert!(err["detail"].as_str().unwrap().contains("coder"), "{err}");
+}
+
+/// SR-10: `[token] require_actor_auth = false` restores asserted actors (with a startup
+/// warning), but credentials that are sent are still checked.
+#[tokio::test]
+async fn actor_auth_can_be_switched_off_explicitly() {
+    let h = Harness::start_tweaked(false, |cfg| cfg.token.require_actor_auth = false).await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let resp = h
+        .exchange_as(&root.token, "anyone", &["github:read_file"], None)
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = h
+        .exchange_as(
+            &root.token,
+            "coder",
+            &["github:read_file"],
+            Some(("coder", "wrong")),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 // ---------------------------------------------------------------------------------------------

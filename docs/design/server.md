@@ -99,16 +99,21 @@ sequenceDiagram
     participant I as Issuer
     participant G as AuditSink
 
-    C->>T: RFC 8693 exchange (form or JSON): subject_token, actor, authorization_details
+    C->>T: RFC 8693 exchange (form or JSON): subject_token, actor, authorization_details, client credentials
+    T->>T: authenticate client against [[agents]]; client id must equal actor
+    alt no or wrong credentials / other actor
+        T-->>C: 401 invalid_client, or 400 invalid_request actor_mismatch
+    end
     T->>V: verify(subject_token)
     V-->>T: parent chain (or 400 invalid_grant)
     T->>L: check_all(parent leases)
     alt parent lease inactive
         T-->>C: 400 invalid_grant "subject token cannot delegate: lease_revoked"
     end
+    T->>T: actor already in the parent chain? 400 invalid_request duplicate_actor
     T->>I: ExchangeRequest::execute (attenuation, depth, expiry clamp)
     I-->>T: child token (or 400 invalid_scope / invalid_grant)
-    T->>L: register(child lease, parent = parent's last lease, expires_at)
+    T->>L: register(child lease, parent = parent's last lease, expires_at), bind(child lease, chain digest)
     T->>G: append(allow, token_issued, onbehalf / token.exchange)
     T-->>C: {access_token, issued_token_type, token_type, expires_in, lease}
 ```
@@ -185,7 +190,7 @@ One cache per IdP. The JWKS location is `jwks_url`, or `jwks_uri` from `<issuer>
 | `error` | Status | `error_description` |
 |---|---|---|
 | `invalid_client` | 401 | `client_auth_missing`, `client_authentication_failed`, `malformed_client_auth`, `no_agents_configured` |
-| `invalid_request` | 400 | `actor_mismatch`, `multiple_client_auth`, `no_capabilities_requested`, `unsupported_token_type`, `malformed_request` |
+| `invalid_request` | 400 | `actor_mismatch`, `duplicate_actor` (exchange), `multiple_client_auth`, `no_capabilities_requested`, `unsupported_token_type`, `malformed_request` |
 | `invalid_grant` | 400 | `malformed_token`, `typ_mismatch`, `untrusted_issuer`, `unsupported_alg`, `missing_kid`, `unknown_kid`, `bad_signature`, `audience_mismatch`, `expired`, `not_yet_valid`, `missing_claim`, `client_id_mismatch` |
 | `invalid_scope` | 400 | `no_root_grant`, `scope_exceeds_grant` |
 | `temporarily_unavailable` | 503 | `jwks_unavailable` |

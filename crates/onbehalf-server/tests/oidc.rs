@@ -849,7 +849,7 @@ async fn id_token_to_root_to_exchange_to_proxy() {
                 ("actor", "coder"),
                 ("scope", "github:read_file"),
             ],
-            None,
+            Some(("coder", CODER_SECRET)),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{child}");

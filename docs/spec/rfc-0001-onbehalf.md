@@ -82,7 +82,7 @@ These parts of the original design have no counterpart in the code. They are tra
 
 - **`evidence`** on the originating user (type, `jti` and digest of the ID token or ID-JAG it came from), so audit can show how the user was verified. Hop 0 is minted from an IdP credential (section 4), but the credential itself is not referenced from the token; `ou_sig` is onbehalf's own signature. TODO: [board](../tasks/board.md).
 - **`chain_id`**, a stable id for a whole run, for revoking by chain and correlating audit. TODO: [board](../tasks/board.md).
-- **`may_act`** and a verified `actor_token` (for example a SPIFFE JWT-SVID). In v0 the actor is a name the caller asserts.
+- **`may_act`** and a verified `actor_token` (for example a SPIFFE JWT-SVID). In v0 the actor authenticates with client credentials from `[[agents]]` (`[token] require_actor_auth`, on by default): the caller of an exchange must prove it is the `actor` it names, and an agent id may appear only once in a chain. A workload credential (`actor_token`) would replace the shared secret.
 - **Numeric and time-range constraints.**
 
 ## 4. Token exchange

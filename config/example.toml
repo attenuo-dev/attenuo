@@ -90,6 +90,17 @@ attribute_claims = ["email", "groups", "amr"]
 id = "planner"
 secret_sha256 = "a93d472e76b73bffcef69973eb463fb679b1365377e183a459d7f33c2ee97b7a"   # "planner-secret-change-me"
 
+# Agents also authenticate on every token exchange (hop n to n+1) as the `actor` they name.
+[[agents]]
+id = "coder"
+secret_sha256 = "c0a83cbb212848e0615711bb006be7edb88db29def8c4dae01c7465c6f64e99e"   # "coder-secret-change-me"
+
+[token]
+# Require the caller of an exchange to authenticate as its `actor` ([[agents]] credentials,
+# HTTP Basic or client_id/client_secret). Setting this to false makes `actor` an unverified
+# assertion again; the server warns at startup.
+require_actor_auth = true
+
 # The most a root token may carry: for users of `issuer`, held by `agent`. Add `subject = "..."`
 # to pin an entry to one user (a pinned entry wins over an unpinned one). The capabilities
 # requested at /token are attenuated against the matching entry; no entry, no root token.

@@ -103,9 +103,17 @@ pub struct ExchangeArgs {
     /// The parent token.
     #[arg(long, env = "ONBEHALF_TOKEN", hide_env_values = true)]
     pub subject_token: String,
-    /// The sub-agent that will hold the new token.
+    /// The sub-agent that will hold the new token. The request authenticates as this agent.
     #[arg(long)]
     pub actor: String,
+    /// Client id to authenticate with (an `[[agents]]` entry). Defaults to `--actor`; the server
+    /// requires the two to match.
+    #[arg(long)]
+    pub client_id: Option<String>,
+    /// The agent's client secret. Required by servers with `[token] require_actor_auth`
+    /// (the default).
+    #[arg(long, env = "ONBEHALF_CLIENT_SECRET", hide_env_values = true)]
+    pub client_secret: Option<String>,
     /// Capability `server:tool`, or a full capability as a JSON object. Repeatable; plain
     /// `server:tool` values may also be comma-separated. Must be covered by the parent's capabilities.
     #[arg(long = "cap", required = true)]
@@ -368,6 +376,24 @@ mod tests {
         };
         assert_eq!(e.caps.len(), 2);
         assert_eq!(parse_caps(&e.caps).unwrap().len(), 3);
+        assert_eq!(e.client_id, None);
+        let cli = parse(&[
+            "token",
+            "exchange",
+            "--subject-token",
+            "J",
+            "--actor",
+            "coder",
+            "--client-secret",
+            "s3cret",
+            "--cap",
+            "github:search",
+        ])
+        .unwrap();
+        let Command::Token(TokenCmd::Exchange(e)) = cli.command else {
+            panic!("not exchange")
+        };
+        assert_eq!(e.client_secret.as_deref(), Some("s3cret"));
         assert!(parse(&["token", "exchange", "--subject-token", "J", "--actor", "c"]).is_err());
     }
 

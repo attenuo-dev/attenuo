@@ -32,6 +32,8 @@ pub struct AppState {
     pub agents: Vec<AgentConfig>,
     /// `[dev] allow_root_mint`.
     pub dev_allow_root_mint: bool,
+    /// `[token] require_actor_auth`.
+    pub require_actor_auth: bool,
     /// `[authzen] allow_unsigned_chain`.
     pub authzen_allow_unsigned_chain: bool,
     /// PEPs allowed to send unsigned chains (`[[peps]]`, validated).
@@ -62,6 +64,18 @@ impl AppState {
         let idps = IdpRegistry::from_config(&config.idps, &config.issuer.issuer)?;
         let agents = crate::idp::intake::validate_agents(&config.agents)?;
         let peps = crate::clientauth::validate_clients("[[peps]]", &config.peps)?;
+        if !config.token.require_actor_auth {
+            tracing::warn!(
+                "[token] require_actor_auth = false: POST /token exchanges accept any `actor` \
+                 without authenticating it, so agent identity in policies and audit records is \
+                 only asserted"
+            );
+        } else if agents.is_empty() {
+            tracing::warn!(
+                "[[agents]] is empty and [token] require_actor_auth = true: every token \
+                 exchange will be rejected"
+            );
+        }
         if config.authzen.allow_unsigned_chain {
             if peps.is_empty() {
                 anyhow::bail!(
@@ -98,6 +112,7 @@ impl AppState {
             agents,
             dev_allow_root_mint: config.dev.allow_root_mint,
             authzen_allow_unsigned_chain: config.authzen.allow_unsigned_chain,
+            require_actor_auth: config.token.require_actor_auth,
             peps,
             public_url: config.server.public_url.clone(),
             lease_interval: lease_interval(config)?,
