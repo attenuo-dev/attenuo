@@ -48,8 +48,8 @@ pub async fn mint_root(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let req: RootTokenRequest = parse_json(&body)?;
-    let (capabilities, mut attributes) = resolve_grant(&state.root_grants, &req)?;
-    attributes.extend(req.attributes.clone());
+    let (capabilities, grant_attributes) = resolve_grant(&state.root_grants, &req)?;
+    let attributes = merge_attributes(grant_attributes, &req.attributes)?;
 
     let now = now();
     let ttl = req
@@ -127,6 +127,30 @@ fn resolve_grant(
     Ok((caps, grant.attributes.clone()))
 }
 
+/// Request attributes may add to a grant's attributes but never replace one: a grant that says
+/// `mfa = false` is a ceiling, like its capabilities, and policies key on these attributes.
+fn merge_attributes(
+    mut grant: BTreeMap<String, Value>,
+    requested: &BTreeMap<String, Value>,
+) -> Result<BTreeMap<String, Value>, ApiError> {
+    for (k, v) in requested {
+        match grant.get(k) {
+            Some(fixed) if fixed != v => {
+                return Err(ApiError::new(
+                    axum::http::StatusCode::FORBIDDEN,
+                    "attribute_fixed_by_grant",
+                    format!("attribute `{k}` is fixed by the [[root_grants]] entry"),
+                ))
+            }
+            Some(_) => {}
+            None => {
+                grant.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    Ok(grant)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +185,23 @@ mod tests {
             resolve_grant(&grants, &other).unwrap_err().code,
             "no_root_grant"
         );
+    }
+
+    /// SR-07: request attributes used to override the grant's (`mfa = false` -> `true`).
+    #[test]
+    fn request_cannot_override_grant_attributes() {
+        let grant = BTreeMap::from([("mfa".to_string(), json!(false))]);
+        let lie = BTreeMap::from([("mfa".to_string(), json!(true))]);
+        let err = merge_attributes(grant.clone(), &lie).unwrap_err();
+        assert_eq!(err.code, "attribute_fixed_by_grant");
+        // restating the same value and adding new keys is fine
+        let ok = BTreeMap::from([
+            ("mfa".to_string(), json!(false)),
+            ("tenant".to_string(), json!("acme")),
+        ]);
+        let merged = merge_attributes(grant, &ok).unwrap();
+        assert_eq!(merged["mfa"], json!(false));
+        assert_eq!(merged["tenant"], json!("acme"));
     }
 
     #[test]
