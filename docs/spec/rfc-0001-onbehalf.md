@@ -16,7 +16,7 @@ onbehalf is a self-hosted, IdP-neutral reference monitor that sits between agent
 
 Let a *run* be a tree of hops rooted at an originating user `u`. Hop `h_n` is an agent acting with capability set `C_n`.
 
-- **P1. Verified originating user on every hop.** Every token onbehalf issues carries the originating user in `chain.originating_user` (mirrored in `sub`), protected by `ou_sig` and copied unchanged through every exchange. A token whose user block fails `ou_sig` is rejected, never defaulted. Deriving the block from a verified IdP credential (ID token, ID-JAG) is not yet implemented, see section 3.1.
+- **P1. Verified originating user on every hop.** Every token onbehalf issues carries the originating user in `chain.originating_user` (mirrored in `sub`), protected by `ou_sig` and copied unchanged through every exchange. A token whose user block fails `ou_sig` is rejected, never defaulted. At hop 0 the block is derived from a verified IdP credential (OIDC ID token or ID-JAG, section 4); the development-only root mint, off by default, is the one exception.
 - **P2. Monotonic attenuation.** For every parent/child pair, `C_{n+1} ⊑ C_n` (section 3), `exp_{n+1} ≤ exp_n`, and hop count `≤ max_depth`. Exchange requests that would widen any dimension fail closed. This is checked at issue time and re-checked at call time against the full lineage.
 - **P3. Argument-aware per-call authorization.** Every `tools/call` is evaluated as an AuthZEN-shaped request whose context contains the call arguments, the originating user, chain depth, and session/time. A call is forwarded only on an explicit `permit`. Deny is the default.
 - **P4. Tamper-evident audit and in-flight revocation.** Every decision, token issuance, lease renewal and revocation is appended to a hash-chained log. Every token is bound to a lease; a revoked lease (or any ancestor lease) causes the next call to be denied within one lease interval.
@@ -80,7 +80,7 @@ A set `P` covers a set `C` only if each `c ∈ C` is covered by a *single* `p �
 
 These parts of the original design have no counterpart in the code. They are tracked in [the task board](../tasks/board.md) (Next: "Token claims: proposed extensions").
 
-- **`evidence`** on the originating user (type, `jti` and digest of the ID token or ID-JAG it came from), so audit can show how the user was verified. Hop 0 from an IdP credential does not exist yet; `ou_sig` is onbehalf's own signature. TODO: [board](../tasks/board.md).
+- **`evidence`** on the originating user (type, `jti` and digest of the ID token or ID-JAG it came from), so audit can show how the user was verified. Hop 0 is minted from an IdP credential (section 4), but the credential itself is not referenced from the token; `ou_sig` is onbehalf's own signature. TODO: [board](../tasks/board.md).
 - **`chain_id`**, a stable id for a whole run, for revoking by chain and correlating audit. TODO: [board](../tasks/board.md).
 - **`may_act`** and a verified `actor_token` (for example a SPIFFE JWT-SVID). In v0 the actor is a name the caller asserts.
 - **Numeric and time-range constraints.**
@@ -108,7 +108,9 @@ A delegation token is a compact JWS, EdDSA (Ed25519), with header `typ` = `onbeh
 - `exp` always equals the last hop's `expires_at`. Leases are not a top-level claim; each hop carries its own inside `chain`.
 - `ou_sig` is made once at root issuance and copied unchanged through every exchange, so the user block is verifiable independently of the outer signature.
 
-**Root issuance** (`Issuer::issue_root`) builds the chain, signs the user block and mints. Verifying the user's IdP credential first is the caller's job today.
+**Root issuance** (`Issuer::issue_root`) builds the chain, signs the user block and mints. The server calls it only after verifying a user credential (hop 0):
+
+**Hop 0** is a `POST /token` exchange whose subject token is a user credential from a configured IdP: an OIDC ID token (`subject_token_type` `urn:ietf:params:oauth:token-type:id_token`) or an ID-JAG (`urn:ietf:params:oauth:token-type:id-jag`, header `typ` `oauth-id-jag+jwt`, draft -04). The agent authenticates with its client credentials and becomes the root hop's agent. The credential is verified against the IdP's JWKS (`kid`, allowed asymmetric `alg`, `iss`, `aud`, `exp`, `iat`, `sub`; `nonce` ignored), the user block is built from `sub`, `iss`, `auth_time` and selected claims plus a derived `mfa`, and the requested capabilities are attenuated against the configured root grant. Details and error codes: [design/server.md](../design/server.md#hop-0-intake-from-an-identity-provider).
 
 **Exchange request** (JSON body; RFC 8693 with RFC 9396 `authorization_details`):
 
@@ -236,7 +238,7 @@ Every hop in a token's `chain` carries a `lease` id, and each lease has a short 
 
 | Property | Enforced by | Tests | Gap |
 |---|---|---|---|
-| P1 | `onbehalf-token` (`Verifier::verify`, `ou_sig`) | `token_exchange.rs`: `originating_user_tamper_is_caught_by_ou_sig`, `inconsistent_sub_or_act_is_rejected` | No hop 0 from an IdP credential; no `evidence` |
+| P1 | `onbehalf-token` (`Verifier::verify`, `ou_sig`); `onbehalf-server` `idp` (hop-0 ID token / ID-JAG verification) | `token_exchange.rs`: `originating_user_tamper_is_caught_by_ou_sig`, `inconsistent_sub_or_act_is_rejected`; server `oidc.rs`: `valid_id_token_yields_root_token_for_the_verified_user`, `bad_id_tokens_are_rejected_with_stable_codes`, `id_jag_yields_root_token_and_typ_is_enforced` | No `evidence` linking the token to the credential; no `jti` replay cache for ID tokens |
 | P2 | `onbehalf-core` (`Capability::covers`, `CapabilitySet::attenuate`, `DelegationChain::extend`/`validate_at`), `onbehalf-token` (`Issuer::exchange`) | core: `set_attenuation_only_narrows`, `union_coverage_is_rejected_conservatively`, `extend_cannot_widen`, `expiry_and_depth`; token: `exchange_cannot_widen_capabilities`, `exchange_ttl_is_clamped_to_parent_expiry`, `max_depth_exceeded_is_rejected` | No proptest suite for `covers` yet |
 | P3 | `onbehalf-policy` (capability stage, then Cedar), `onbehalf-proxy` | policy `engine.rs`: `capability_stage_denies_before_cedar`, `create_issue_argument_rule_allows_acme_and_denies_others`, `github_mcp_over_privileged_token_is_narrowed_by_policy`; proxy: `denied_tools_call_returns_32003_and_never_reaches_upstream`, `github_leak_scenario_repo_prefix_constraint` | Proxy tests use the stub authorizer, not the token verifier |
 | P4 | `onbehalf-audit` (hash chain, `LeaseStore`) | `audit.rs`: `tamper_every_byte_of_record_json_is_detected`, `delete_middle_row_is_detected`, `reordered_rows_are_detected`; `leases.rs`: `revoke_cascades_to_descendants_only` | Proxy does not consult leases per call; no renew endpoint |

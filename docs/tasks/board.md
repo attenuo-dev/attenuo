@@ -17,7 +17,7 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 ## Next
 
 - [ ] Token claims: proposed extensions from RFC-0001 section 3.1: `evidence` on the originating user (how the IdP credential was verified), a stable `chain_id`, `may_act` and a verified `actor_token`, numeric and time-range constraints. Reconcile or drop each.
-- [ ] Hop 0 from an OIDC ID token (JWKS fetch, `iss`/`aud`/`exp` checks) and from an ID-JAG assertion.
+- [ ] Hop-0 hardening: `jti` replay cache for ID tokens and ID-JAGs, `private_key_jwt` client authentication, `evidence` in the user block; track ID-JAG drafts after -04.
 - [ ] Leases: `/lease/{id}/renew`, `/revoke` by user, session, chain (revoke by lease id with descendant cascade is done in the server); proxy cache bounded by TTL.
 - [ ] Multi-hop demo: planner agent → coder sub-agent → GitHub tool, three exchanges, attenuated at each.
 - [ ] AuthZEN conformance fixtures (the endpoint itself is done).
@@ -44,4 +44,5 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 - [x] `onbehalf-server`: config, `/token` (RFC 8693), JWKS endpoint, dev root mint, proxy with real authorizer, admin leases/audit endpoints ([design](../design/server.md)).
 - [x] AuthZEN `POST /access/v1/evaluation` served by the same pipeline as the proxy; bearer or body chain.
 - [x] Lease revocation cascade: integration test that revoking the root lease denies the child's next call (`lease_revoked`).
+- [x] Hop 0 from an OIDC ID token and from an ID-JAG: trusted `[[idps]]`, JWKS discovery and cache, `[[agents]]` client auth, root grants; dev root mint off by default ([design](../design/server.md#hop-0-intake-from-an-identity-provider)).
 - [x] Policy hot reload with schema validation (`POST /admin/policies/reload`); invalid set rejected with 422, last good set kept.
