@@ -192,7 +192,7 @@ services:
       - ./policy.cedar:/etc/onbehalf/policy.cedar:ro
       - ./issuer.pem:/etc/onbehalf/issuer.pem:ro
       - onbehalf-data:/var/lib/onbehalf
-    stop_signal: SIGINT
+    stop_grace_period: 15s         # the server drains for up to 10s after SIGTERM
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]
@@ -207,7 +207,7 @@ Matching settings in `onbehalf.toml`: `policies_path = "/etc/onbehalf/policy.ced
 
 Notes:
 
-- **Signals.** The server shuts down gracefully on SIGINT (Ctrl-C) only. It installs no SIGTERM handler. As PID 1 in a container, SIGTERM is then ignored and `docker stop` waits for its timeout and kills the process. `stop_signal: SIGINT` avoids that. SQLite writes are transactional, so a kill does not corrupt the log, but a graceful stop is cleaner.
+- **Signals.** The server shuts down gracefully on SIGTERM (what `docker stop` and Kubernetes send) and on SIGINT. It stops accepting connections, gives in-flight requests up to 10 seconds to finish, then exits; it logs `shutdown signal received; draining` and `shutdown complete`. Set `stop_grace_period` (or `terminationGracePeriodSeconds`) above 10 seconds. No `stop_signal` override is needed. SQLite writes are transactional, so even a kill does not corrupt the log.
 - **Read-only root.** The server only writes under the data directory and, when the key file is missing, to the key path. Keep the key file in the read-only mount, so a missing key is an error you see, not a new key you did not plan.
 - **Upstreams** must be reachable from the container. `127.0.0.1` in `[[upstreams]]` means the container itself.
 
