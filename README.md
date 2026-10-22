@@ -50,8 +50,11 @@ Run the server with the example config. It generates an issuer key in `data/` on
 
 ```sh
 cargo build -p onbehalf-server
+export ONBEHALF_ADMIN_TOKEN=$(openssl rand -hex 32)   # the /admin bearer; overrides [admin] token
 cargo run -p onbehalf-server -- --config config/example.toml   # or ONBEHALF_CONFIG=config/example.toml
 ```
+
+The example ships no admin token. On a loopback `listen` address a missing, short or placeholder token only produces a warning (and without one the admin routes answer 403); on any other address the server refuses to start unless the token is at least 32 bytes and not a published placeholder. Revocations, policy reloads and dev root mints are written to the audit log as admin actions.
 
 The flows below use `curl` and `jq`.
 
@@ -78,7 +81,7 @@ The agent exchanges the user's ID token for a root delegation token (RFC 8693), 
 
 ```sh
 OB=http://127.0.0.1:8080
-ADMIN=dev-admin-token-change-me
+ADMIN=$ONBEHALF_ADMIN_TOKEN   # see below
 ID_TOKEN=...   # from your IdP's login flow
 
 # 1. Exchange the user's ID token for a root token held by "planner".
@@ -146,7 +149,7 @@ Other endpoints: `POST /token/renew` (extend your lease), `POST /access/v1/evalu
 
 ```sh
 cargo build -p onbehalf-cli
-export ONBEHALF_SERVER=http://127.0.0.1:8080 ONBEHALF_ADMIN_TOKEN=dev-admin-token-change-me
+export ONBEHALF_SERVER=http://127.0.0.1:8080   # and ONBEHALF_ADMIN_TOKEN, as the server got it
 alias onbehalf=target/debug/onbehalf
 
 onbehalf token root --subject alice --issuer https://idp.example --agent planner --cap 'github:*'

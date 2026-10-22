@@ -416,14 +416,20 @@ fn fmt_audit_entry(e: &Value) -> String {
         .flatten()
         .filter_map(Value::as_str)
         .collect();
+    // Admin actions have no delegation chain, so no agents.
+    let who = if agents.is_empty() {
+        "by".to_string()
+    } else {
+        format!("{} for", agents.join(" > "))
+    };
     format!(
-        "#{:<4} {}  {:<5} {}/{}  {} for {}  reason={}  id={}",
+        "#{:<4} {}  {:<5} {}/{}  {} {}  reason={}  id={}",
         e["seq"].as_u64().unwrap_or(0),
         r["at"].as_str().unwrap_or("-"),
         r["decision"].as_str().unwrap_or("-").to_uppercase(),
         r["server"].as_str().unwrap_or("-"),
         r["tool"].as_str().unwrap_or("-"),
-        agents.join(" > "),
+        who,
         r["originating_subject"].as_str().unwrap_or("-"),
         r["reason"].as_str().unwrap_or("-"),
         r["id"].as_str().unwrap_or("-"),

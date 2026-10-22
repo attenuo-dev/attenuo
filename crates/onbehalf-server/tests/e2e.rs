@@ -634,6 +634,64 @@ async fn uncatalogued_tools_are_denied_and_audited() {
     assert_eq!(denied[0]["record"]["decision"], "deny");
 }
 
+/// SR-15: revocations, policy reloads (good and bad) and dev root mints are audited as admin
+/// actions, and the audit chain still verifies.
+#[tokio::test]
+async fn admin_actions_are_audited() {
+    let h = Harness::start().await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let resp = h.admin_post("/admin/policies/reload", json!({})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    std::fs::write(
+        &h.policy_path,
+        "permit(principal, action == Action::\"nope\", resource);",
+    )
+    .unwrap();
+    let resp = h.admin_post("/admin/policies/reload", json!({})).await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let resp = h
+        .admin_post(
+            &format!("/admin/leases/{}/revoke", root.lease),
+            json!({"reason": "incident 42"}),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: Value = resp.json().await.unwrap();
+    assert!(v["audit_id"].is_string(), "{v}");
+
+    let entries = h.audit_entries().await;
+    let admin: Vec<(String, String, String)> = entries
+        .iter()
+        .filter(|e| e["record"]["originating_subject"] == "admin")
+        .map(|e| {
+            let r = &e["record"];
+            (
+                r["tool"].as_str().unwrap().to_string(),
+                r["decision"].as_str().unwrap().to_string(),
+                r["reason"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let s = |a: &str, b: &str, c: &str| (a.to_string(), b.to_string(), c.to_string());
+    assert_eq!(
+        admin,
+        vec![
+            s("admin.root_token", "allow", "admin_action"),
+            s("admin.policies.reload", "allow", "admin_action"),
+            s("admin.policies.reload", "deny", "policy_invalid"),
+            s("admin.lease.revoke", "allow", "admin_action"),
+        ]
+    );
+    let revoke = entries
+        .iter()
+        .find(|e| e["record"]["tool"] == "admin.lease.revoke")
+        .unwrap();
+    assert_eq!(revoke["record"]["leases"], json!([root.lease]));
+    assert_eq!(revoke["record"]["server"], "onbehalf");
+    let report = h.admin_get("/admin/audit/verify").await;
+    assert_eq!(report["ok"], true);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Scenario 3: revoking the root lease cuts off the child on its next call.
 // ---------------------------------------------------------------------------------------------
@@ -941,10 +999,11 @@ async fn audit_verify_detects_tampering() {
 
     let report = h.admin_get("/admin/audit/verify").await;
     assert_eq!(report["ok"], true);
-    assert_eq!(report["entries"], 3);
+    // token.root, admin.root_token, two calls
+    assert_eq!(report["entries"], 4);
     assert_eq!(report["first_bad_seq"], Value::Null);
     let cp = h.admin_get("/admin/audit/checkpoint").await;
-    assert_eq!(cp["seq"], 3);
+    assert_eq!(cp["seq"], 4);
     assert_eq!(cp["hash"].as_str().unwrap().len(), 64);
 
     // Turn the recorded denial into an allow behind the server's back.

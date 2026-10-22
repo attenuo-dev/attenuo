@@ -50,6 +50,7 @@ impl AppState {
     /// Load keys, policies and storage as the config says.
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
         config.check_server_names()?;
+        config.check_admin_token()?;
         let issuer = load_issuer(config)?;
         let verifier = issuer.verifier();
         let jwks = crate::jwks::jwks_from_keys(&issuer.trusted_public_keys())?;
@@ -287,10 +288,7 @@ mod tests {
         let state = AppState::from_config(&cfg).unwrap();
         let ids = state.pipeline.policy().read().unwrap().policy_ids();
         assert!(ids.contains(&"permit_readonly_tools".to_string()));
-        assert_eq!(
-            state.admin_token.as_deref(),
-            Some("dev-admin-token-change-me")
-        );
+        assert_eq!(state.admin_token, None);
     }
 
     #[test]

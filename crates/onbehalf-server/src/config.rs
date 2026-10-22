@@ -17,6 +17,26 @@ use serde_json::Value;
 /// Environment variable that names the config file when `--config` is not given.
 pub const CONFIG_ENV: &str = "ONBEHALF_CONFIG";
 
+/// Environment variable that, when set, replaces `[admin] token` (so the secret need not be in
+/// the file). The CLI reads the same variable.
+pub const ADMIN_TOKEN_ENV: &str = "ONBEHALF_ADMIN_TOKEN";
+
+/// Minimum length of `[admin] token` outside loopback.
+pub const MIN_ADMIN_TOKEN_LEN: usize = 32;
+
+/// Admin tokens that have appeared in examples and docs. Refused outside loopback whatever
+/// their length.
+pub const PLACEHOLDER_ADMIN_TOKENS: &[&str] = &[
+    "dev-admin-token-change-me",
+    "demo-admin-token",
+    "test-admin-token",
+    "change-me",
+    "changeme",
+    "admin",
+    "secret",
+    "password",
+];
+
 /// The whole configuration file.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -266,6 +286,10 @@ fn default_sqlite_path() -> String {
 pub struct AdminSection {
     /// Static bearer token for `/admin/*`. When unset, every admin endpoint answers 403.
     /// v0 only: replace with real operator authentication before exposing the server.
+    ///
+    /// Outside a loopback `listen` address the server refuses to start when this is missing,
+    /// shorter than [`MIN_ADMIN_TOKEN_LEN`] bytes or a known placeholder; on loopback it only
+    /// warns. Generate one with `openssl rand -hex 32`, or set [`ADMIN_TOKEN_ENV`].
     #[serde(default)]
     pub token: Option<String>,
 }
@@ -481,6 +505,58 @@ impl Config {
         Ok(())
     }
 
+    /// Problems with `[admin] token`, or `None` when it is acceptable.
+    pub fn admin_token_problem(&self) -> Option<String> {
+        let token = match self.admin.token.as_deref() {
+            None => return Some("[admin] token is not set".into()),
+            Some(t) => t,
+        };
+        if PLACEHOLDER_ADMIN_TOKENS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(token.trim()))
+        {
+            return Some("[admin] token is a published placeholder value".into());
+        }
+        if token.len() < MIN_ADMIN_TOKEN_LEN {
+            return Some(format!(
+                "[admin] token is shorter than {MIN_ADMIN_TOKEN_LEN} bytes"
+            ));
+        }
+        None
+    }
+
+    /// Refuse a weak or missing admin token unless the server listens on loopback only, where
+    /// it is a warning (SR-15).
+    pub fn check_admin_token(&self) -> anyhow::Result<()> {
+        let Some(problem) = self.admin_token_problem() else {
+            return Ok(());
+        };
+        if self.server.listen.ip().is_loopback() {
+            tracing::warn!(
+                listen = %self.server.listen,
+                "{problem}; accepted because the server only listens on loopback. Generate a \
+                 real one with `openssl rand -hex 32` before binding another address."
+            );
+            return Ok(());
+        }
+        anyhow::bail!(
+            "{problem}, and [server] listen = {} is not loopback. Set a random token of at \
+             least {MIN_ADMIN_TOKEN_LEN} bytes (`openssl rand -hex 32`) in [admin] token or \
+             {ADMIN_TOKEN_ENV}.",
+            self.server.listen
+        )
+    }
+
+    /// Apply environment overrides: [`ADMIN_TOKEN_ENV`] replaces `[admin] token`.
+    pub fn apply_env(&mut self) {
+        if let Some(t) = std::env::var(ADMIN_TOKEN_ENV)
+            .ok()
+            .filter(|t| !t.is_empty())
+        {
+            self.admin.token = Some(t);
+        }
+    }
+
     /// Parse TOML text.
     pub fn from_toml(text: &str) -> anyhow::Result<Self> {
         Ok(toml::from_str(text)?)
@@ -504,7 +580,10 @@ mod tests {
         let cfg = Config::from_toml(text).unwrap();
         assert_eq!(cfg.server.listen, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(cfg.upstreams.len(), 1);
-        assert!(cfg.admin.token.is_some());
+        assert!(
+            cfg.admin.token.is_none(),
+            "the example ships no admin token (SR-15)"
+        );
         let catalog = cfg.policy.load_catalog().unwrap();
         assert!(catalog.get("github", "read_file").readonly);
         assert!(!cfg.root_grants.is_empty());
@@ -614,6 +693,45 @@ mod tests {
                   [[root_grants]]\nissuer = \"i\"\nagent = \"a\"\ncapabilities = [\"*:*\"]\n";
         Config::from_toml(ok).unwrap().check_server_names().unwrap();
         assert!(check_server_name("").is_err());
+    }
+
+    /// SR-15: weak, placeholder or missing admin tokens are refused off loopback.
+    #[test]
+    fn admin_token_is_checked_outside_loopback() {
+        let strong = "0123456789abcdef0123456789abcdef";
+        let with = |listen: &str, token: Option<&str>| {
+            let mut cfg = Config::default();
+            cfg.server.listen = listen.parse().unwrap();
+            cfg.admin.token = token.map(Into::into);
+            cfg.check_admin_token()
+        };
+        for token in [
+            None,
+            Some("short"),
+            Some("dev-admin-token-change-me"),
+            Some("demo-admin-token"),
+        ] {
+            assert!(with("0.0.0.0:8080", token).is_err(), "{token:?}");
+            assert!(with("10.1.2.3:8080", token).is_err(), "{token:?}");
+            // Loopback only warns.
+            assert!(with("127.0.0.1:8080", token).is_ok(), "{token:?}");
+            assert!(with("[::1]:8080", token).is_ok(), "{token:?}");
+        }
+        assert!(with("0.0.0.0:8080", Some(strong)).is_ok());
+        let err = with("0.0.0.0:8080", Some("x")).unwrap_err().to_string();
+        assert!(err.contains("openssl rand -hex 32"), "{err}");
+        // The demo configs: loopback with a placeholder is fine, the docker variant (all
+        // interfaces) has no token in the file and needs ONBEHALF_ADMIN_TOKEN.
+        let demo = Config::from_toml(include_str!(
+            "../../../examples/github-leak-demo/config.toml"
+        ))
+        .unwrap();
+        demo.check_admin_token().unwrap();
+        let docker = Config::from_toml(include_str!(
+            "../../../examples/github-leak-demo/config.docker.toml"
+        ))
+        .unwrap();
+        assert!(docker.check_admin_token().is_err());
     }
 
     #[test]

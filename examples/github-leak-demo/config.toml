@@ -35,6 +35,7 @@ name = "github"
 url = "http://127.0.0.1:13001/mcp"
 
 [admin]
+# A placeholder is accepted only because listen is loopback (the server warns). Never reuse it.
 token = "demo-admin-token"
 
 # Alice's assistant holds a broad token, like the over-privileged PAT in the real incident.

@@ -34,8 +34,8 @@ sqlite_path = ":memory:"
 name = "github"
 url = "http://fake-mcp:3001/mcp"
 
-[admin]
-token = "demo-admin-token"
+# No [admin] token in this file: the server listens on all interfaces inside the container,
+# so it refuses to start with a placeholder. docker-compose.yml passes ONBEHALF_ADMIN_TOKEN.
 
 # Alice's assistant holds a broad token, like the over-privileged PAT in the real incident.
 [[root_grants]]

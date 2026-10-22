@@ -32,6 +32,7 @@ async fn main() -> anyhow::Result<()> {
             anyhow::anyhow!("no config file: pass --config <file> or set {CONFIG_ENV}")
         })?;
     tracing::info!(config = %path.display(), "loading config");
-    let config = Config::load(&path)?;
+    let mut config = Config::load(&path)?;
+    config.apply_env();
     onbehalf_server::serve(config).await
 }

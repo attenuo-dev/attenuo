@@ -35,7 +35,7 @@ See [writing-policies](../../docs/guides/writing-policies.md#testing-policies).
 | 6 | `create_issue` on the public repo (the exfiltration path) | denied, `capability_denied` | `coder` was never delegated it. |
 | 7 | `lease revoke` on the assistant's lease | 2 leases revoked | Alice pulls the plug; the revocation cascades to `coder`. |
 | 8 | the legitimate `read_file` again | denied, `lease_revoked` | The next call after revocation is refused. |
-| 9 | `audit tail`, `audit verify` | six entries, chain OK | Every issuance and decision is recorded, denials included. |
+| 9 | `audit tail`, `audit verify` | eight entries, chain OK | Every issuance and decision is recorded, denials included, and so are the two admin actions (the dev root mint and the revocation). |
 
 At the end the script prints what the fake GitHub server received: one `tools/call`, the legitimate one.
 

@@ -250,7 +250,7 @@ Non-MCP endpoints answer errors as `{"error": "<code>", "detail": "<text>"}` wit
 
 ## Known limits (v0)
 
-- Admin authentication is one static bearer.
+- Admin authentication is one static bearer (`[admin] token`, or `ONBEHALF_ADMIN_TOKEN`, which overrides it). Off a loopback `listen` address the server refuses to start when it is missing, shorter than 32 bytes or a published placeholder; on loopback it warns. Admin actions are audited with `originating_subject` = `admin`, no agents, server `onbehalf` and tool `admin.lease.revoke`, `admin.policies.reload` (a rejected policy file is recorded as `deny` / `policy_invalid`) or `admin.root_token` (next to the `token.root` issuance record).
 - Agents authenticate at hop 0 with a static client secret; no `private_key_jwt` or mTLS.
 - No `jti` replay cache: an ID token (or ID-JAG) can be exchanged again by the same agent until it expires, each time minting a new root.
 - The root token's lifetime is the server's TTL, not bounded by the ID token's `exp`.

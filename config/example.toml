@@ -68,8 +68,12 @@ name = "github"
 url = "http://127.0.0.1:3001/mcp"
 
 [admin]
-# Static bearer for /admin/*. v0 only: change it, and do not expose /admin publicly.
-token = "dev-admin-token-change-me"
+# Static bearer for /admin/*. v0 only; do not expose /admin publicly. No token ships here:
+# generate one with `openssl rand -hex 32` and put it here, or set ONBEHALF_ADMIN_TOKEN (which
+# overrides this value). Without a token the admin routes answer 403. Off a loopback `listen`
+# address the server refuses to start when the token is missing, shorter than 32 bytes or a
+# published placeholder.
+# token = "<output of openssl rand -hex 32>"
 
 # Trusted identity providers for hop 0. POST /token accepts an OIDC ID token
 # (subject_token_type = urn:ietf:params:oauth:token-type:id_token) or an ID-JAG

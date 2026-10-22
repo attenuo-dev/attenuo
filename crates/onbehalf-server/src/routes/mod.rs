@@ -89,6 +89,49 @@ pub(crate) fn register_issued(
     Ok(())
 }
 
+/// `originating_subject` of audit records for actions taken with the admin bearer.
+pub const ADMIN_SUBJECT: &str = "admin";
+/// Audit `reason` of a successful admin action.
+pub const REASON_ADMIN_ACTION: &str = "admin_action";
+
+/// Record an action taken with the admin bearer (lease revocation, policy reload, dev root
+/// mint) in the audit log (SR-15).
+///
+/// There is no delegation chain behind an admin request, so the record names
+/// `originating_subject` = `admin`, no agents, depth 0 and the chain digest of nothing
+/// (`sha256` of JSON `null`). `leases` holds the leases the action touched, `server` is
+/// `onbehalf` and `tool` is `admin.<action>`; the arguments are stored as a digest as usual.
+pub(crate) fn audit_admin(
+    state: &AppState,
+    tool: &str,
+    decision: Decision,
+    reason: &str,
+    leases: Vec<LeaseId>,
+    arguments: Value,
+    now: OffsetDateTime,
+) -> Result<uuid::Uuid, ApiError> {
+    let call = ToolCall::new(AUDIT_SERVER, tool, arguments);
+    let record = DecisionRecord {
+        id: uuid::Uuid::new_v4(),
+        at: now,
+        decision,
+        reason: reason.to_string(),
+        originating_subject: ADMIN_SUBJECT.to_string(),
+        agents: Vec::new(),
+        chain_depth: 0,
+        chain_digest: onbehalf_core::digest::sha256_json(&Value::Null),
+        leases,
+        server: AUDIT_SERVER.to_string(),
+        tool: call.tool.clone(),
+        arguments_digest: call.arguments_digest(),
+        session_id: None,
+        policy_ids: Vec::new(),
+    };
+    let id = record.id;
+    onbehalf_audit::AuditSink::append(state.audit.as_ref(), record)?;
+    Ok(id)
+}
+
 /// Record a token issuance in the audit log.
 ///
 /// The audit log stores decision records only, so an issuance is written as an `allow` with
