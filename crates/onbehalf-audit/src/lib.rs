@@ -1,1 +1,28 @@
-//! onbehalf-audit (stub; implemented on its own branch)
+//! Tamper-evident decision log and lease registry for `onbehalf`.
+//!
+//! Two concerns live here because they are the two halves of accountability:
+//!
+//! - **Audit log** ([`AuditSink`]): every [`DecisionRecord`](onbehalf_core::DecisionRecord) is
+//!   appended as an [`AuditEntry`] whose `entry_hash` covers its sequence number, the previous
+//!   entry's hash and the record itself. Editing, reordering or deleting any stored entry breaks
+//!   the chain, and [`AuditSink::verify_chain`] says where. [`MemoryAudit`] is for tests and
+//!   single-process use; [`SqliteAudit`] persists to a file (or `:memory:`).
+//! - **Leases** ([`LeaseStore`]): every delegation hop holds a lease. Revoking a lease revokes
+//!   every lease delegated from it, and an unknown lease is treated as inactive so a store that
+//!   lost data fails closed. [`MemoryLeaseStore`] and [`SqliteLeaseStore`] mirror the two sinks.
+//!
+//! Nothing here evaluates policy; the sibling crates call into this one after deciding.
+
+pub mod error;
+pub mod lease;
+pub mod log;
+pub mod memory;
+pub mod sqlite;
+
+pub use error::AuditError;
+pub use lease::{LeaseStatus, LeaseStore, MemoryLeaseStore};
+pub use log::{
+    compute_entry_hash, verify_entries, AuditEntry, AuditSink, VerifyReport, GENESIS_HASH,
+};
+pub use memory::MemoryAudit;
+pub use sqlite::{SqliteAudit, SqliteLeaseStore};

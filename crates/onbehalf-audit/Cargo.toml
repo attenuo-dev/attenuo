@@ -1,5 +1,6 @@
 [package]
 name = "onbehalf-audit"
+description = "Tamper-evident, hash-chained decision log and lease registry for onbehalf"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,3 +9,11 @@ rust-version.workspace = true
 
 [dependencies]
 onbehalf-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
