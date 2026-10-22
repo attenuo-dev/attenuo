@@ -43,6 +43,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 glob-match = "0.2"
 rand = "0.8"
+async-trait = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+bytes = "1"
 
 [profile.release]
 lto = "thin"
