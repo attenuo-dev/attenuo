@@ -44,4 +44,6 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 - [x] `onbehalf-server`: config, `/token` (RFC 8693), JWKS endpoint, dev root mint, proxy with real authorizer, admin leases/audit endpoints ([design](../design/server.md)).
 - [x] AuthZEN `POST /access/v1/evaluation` served by the same pipeline as the proxy; bearer or body chain.
 - [x] Lease revocation cascade: integration test that revoking the root lease denies the child's next call (`lease_revoked`).
+- [x] `onbehalf-cli`: the `onbehalf` binary for tokens, calls, leases, audit and policy, with unit-tested arguments and tree rendering.
+- [x] GitHub MCP leak demo: `examples/github-leak-demo/run.sh` with a transcript; the integration-test form of the scenario (first item under Now) is still open.
 - [x] Policy hot reload with schema validation (`POST /admin/policies/reload`); invalid set rejected with 422, last good set kept.

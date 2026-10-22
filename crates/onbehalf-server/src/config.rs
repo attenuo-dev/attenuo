@@ -263,6 +263,25 @@ mod tests {
     }
 
     #[test]
+    fn demo_configs_parse() {
+        for text in [
+            include_str!("../../../examples/github-leak-demo/config.toml"),
+            include_str!("../../../examples/github-leak-demo/config.docker.toml"),
+        ] {
+            let cfg = Config::from_toml(text).unwrap();
+            assert_eq!(cfg.upstreams[0].name, "github");
+            assert!(
+                cfg.policy
+                    .load_catalog()
+                    .unwrap()
+                    .get("github", "read_file")
+                    .readonly
+            );
+            capability_set(&cfg.root_grants[0].capabilities).unwrap();
+        }
+    }
+
+    #[test]
     fn empty_config_takes_defaults() {
         let cfg = Config::from_toml("").unwrap();
         assert_eq!(cfg.audit.sqlite_path, ":memory:");

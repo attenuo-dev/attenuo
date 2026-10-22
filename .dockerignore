@@ -1,0 +1,10 @@
+/target
+/data
+/.git
+/.claude
+/docs
+**/*.sqlite
+**/*.db
+**/*.pem
+.env
+.DS_Store

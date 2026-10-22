@@ -1,0 +1,40 @@
+# The GitHub leak demo as two containers: onbehalf-server in front of a fake GitHub MCP server.
+#
+#   docker compose up --build
+#
+# Then, from the host (the server is published on 127.0.0.1:8080 only):
+#
+#   export ONBEHALF_SERVER=http://127.0.0.1:8080 ONBEHALF_ADMIN_TOKEN=demo-admin-token
+#   cargo run -p onbehalf-cli -- token root --subject alice --agent assistant --cap 'github:*'
+#
+# or run the CLI in the same image: docker compose run --rm --entrypoint onbehalf onbehalf --help
+# The scripted walk-through is examples/github-leak-demo/run.sh, which does not need Docker.
+# The admin token below is the demo's; never publish /admin outside localhost.
+
+services:
+  onbehalf:
+    image: onbehalf:dev
+    build: .
+    command: ["--config", "/etc/onbehalf/config.toml"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./examples/github-leak-demo/config.docker.toml:/etc/onbehalf/config.toml:ro
+      - ./examples/github-leak-demo/policy.cedar:/etc/onbehalf/policy.cedar:ro
+    depends_on:
+      - fake-mcp
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+  fake-mcp:
+    image: onbehalf:dev
+    entrypoint: ["fake-mcp"]
+    command: ["--host", "0.0.0.0", "--port", "3001"]
+    expose:
+      - "3001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
