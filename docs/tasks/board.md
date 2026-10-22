@@ -32,6 +32,9 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 - [ ] Server: real admin authentication, `actor_token` verification on exchange, `kid` in token headers, audit failed exchanges.
 - [ ] CI: fmt, clippy `-D warnings`, tests, proptest with fixed seed in CI and random locally.
 - [ ] AgentDojo / InjecAgent harness: run a no-policy baseline and an onbehalf-enforced run; report attack success and utility.
+- [ ] Docs follow-ups from the guides: test the Keycloak, Auth0, Okta, Entra ID and Google recipes (and ID-JAG with Okta) against live tenants and drop the "untested" marks; add a CI check that runs the getting-started commands.
+- [ ] Operations gaps found while writing the deploy guide: handle SIGTERM for graceful shutdown; a readiness check that touches SQLite; a metrics endpoint (decision counts by reason, audit append latency); automatic signed audit checkpoints.
+- [ ] Policy: let operators declare extra `originating_user.attributes` (for example `groups`) in config. Today only `mfa`, `roles`, `tenant` and `email` are in the Cedar schema, and a policy that tests anything else is reported impossible.
 
 ## Later
 
@@ -46,6 +49,7 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 
 ## Done
 
+- [x] User guides (`docs/guides/`), FAQ and positioning table; wire examples verified against a local build. IdP recipes remain untested against live providers.
 - [x] Security review pass 1: SR-01 to SR-07 fixed with regression tests (proxy re-encodes screened messages, no upstream redirects, non-object arguments rejected; Cedar action hierarchy; integral floats as Long; TTL overflow; root-grant attributes).
 - [x] Lease renewal: `POST /token/renew`, `LeaseStore::renew`, lease expiry enforced for every hop, ADR-0006.
 - [x] Proxy coverage: `resources/read`, `resources/subscribe`, `prompts/get`, `completion/complete` authorized; unknown methods denied by default; `tools/list` and session requests lease-checked.

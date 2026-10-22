@@ -2,6 +2,8 @@
 
 This folder is an Obsidian vault (open it with "Open folder as vault") and the project's public-safe knowledge base.
 
+- [guides/](guides/): getting started, deploying, integrating MCP clients, identity providers
+- [faq.md](faq.md): the questions people ask first
 - [spec/](spec/) — the RFC, threat model, and protocol/API specifications
 - [design/](design/) — architecture notes and component designs
 - [decisions/](decisions/) — Architecture Decision Records (ADRs), numbered

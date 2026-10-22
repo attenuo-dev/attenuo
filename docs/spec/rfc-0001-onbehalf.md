@@ -216,7 +216,11 @@ Every hop in a token's `chain` carries a `lease` id, and each lease is short-liv
 }
 ```
 
-`hash = SHA-256(prev_hash || canonical_json(record \ {hash}))` using RFC 8785 canonicalization. The log stores argument digests, not arguments, by default. A signed checkpoint `(seq, hash)` is emitted every N records and can be anchored externally. Record kinds: `issue`, `decision`, `renew`, `revoke`, `checkpoint`. Every record names the agent and the originating user separately, the attribution OWASP MCP08 says is missing ([Equixly](https://equixly.com/blog/2026/06/04/mapping-nsa-s-mcp-guidance-to-the-owasp-mcp-top-10-how-to-test-for-the-risks/)). Field names here are illustrative (`chain_id` is proposed, section 3.1); the implemented record is in `onbehalf-audit`.
+The design target is `hash = SHA-256(prev_hash || canonical_json(record \ {hash}))` using RFC 8785 canonicalization, a signed checkpoint `(seq, hash)` every N records that can be anchored externally, and record kinds `issue`, `decision`, `renew`, `revoke` and `checkpoint`.
+
+**Implemented in v0** (`onbehalf-audit`): each entry is `{seq, prev_hash, record, entry_hash}` with `entry_hash = SHA-256(JSON of (seq, prev_hash, record))`. The JSON is compact `serde_json` output with sorted keys, not yet RFC 8785 canonical form (task board, SR-20). The first entry's `prev_hash` is a fixed genesis value. The `record` is a `DecisionRecord`: decision id, time, allow or deny, reason code, originating subject, agents, chain depth and digest, leases, server, tool, argument digest, session id and policy ids. Issuance and renewal are stored as decision records with `server = onbehalf` and tool `token.root`, `token.exchange` or `lease.renew` ([design/server.md](../design/server.md#audit-convention-for-issuance)), so there is no separate `kind` field yet. `GET /admin/audit/checkpoint` returns the head `{seq, hash}` and `GET /admin/audit/verify` walks the chain. Checkpoints are not emitted or signed automatically: an operator has to copy the head off the host to detect truncation ([Deploying](../guides/deploying.md#sqlite-file-placement-and-backup)). The log stores argument digests, not arguments.
+
+Every record names the agent and the originating user separately, the attribution OWASP MCP08 says is missing ([Equixly](https://equixly.com/blog/2026/06/04/mapping-nsa-s-mcp-guidance-to-the-owasp-mcp-top-10-how-to-test-for-the-risks/)). Field names here are illustrative (`chain_id` is proposed, section 3.1); the implemented record is in `onbehalf-audit`.
 
 ## 8. Non-goals
 

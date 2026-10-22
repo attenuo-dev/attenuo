@@ -11,6 +11,8 @@ Delegated authorization for software agents. onbehalf lets a principal hand an a
 
 ## Where to look
 
+- [Guides](docs/guides/README.md): [getting started](docs/guides/getting-started.md), [deploying](docs/guides/deploying.md), [integrating MCP clients](docs/guides/integrating-mcp-clients.md) and [identity providers](docs/guides/identity-providers.md).
+- [FAQ](docs/faq.md): why a proxy, how it differs from gateways and policy engines, what happens when it is down.
 - [RFC-0001: onbehalf](docs/spec/rfc-0001-onbehalf.md): what the system is, the token model, the policy and audit design.
 - [docs/](docs/README.md): specifications, architecture decisions, research notes, task board and engineering log.
 - [examples/github-leak-demo](examples/github-leak-demo/README.md): the May 2025 GitHub MCP prompt-injection leak, replayed and stopped (`run.sh`, about a minute).
@@ -132,7 +134,7 @@ ROOT=$(curl -s -X POST $OB/admin/root-token -H "Authorization: Bearer $ADMIN" \
 ROOT_TOKEN=$(echo "$ROOT" | jq -r .access_token); ROOT_LEASE=$(echo "$ROOT" | jq -r .lease)
 ```
 
-Other endpoints: `POST /access/v1/evaluation` (AuthZEN; send the delegation token as bearer), `GET /.well-known/jwks.json`, `GET /.well-known/authzen-configuration`, `POST /admin/policies/reload`, `GET /admin/leases/{id}`, `GET /admin/audit/checkpoint`, `GET /healthz`. The request pipeline is described in [docs/design/server.md](docs/design/server.md). Set `RUST_LOG=debug` for more logging.
+Other endpoints: `POST /token/renew` (extend your lease), `POST /access/v1/evaluation` (AuthZEN; send the delegation token as bearer), `GET /.well-known/jwks.json`, `GET /.well-known/authzen-configuration`, `POST /admin/policies/reload`, `GET /admin/leases/{id}`, `GET /admin/audit/checkpoint`, `GET /healthz`. The request pipeline is described in [docs/design/server.md](docs/design/server.md). Set `RUST_LOG=debug` for more logging.
 
 ## Command line
 
