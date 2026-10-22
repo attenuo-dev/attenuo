@@ -8,7 +8,7 @@ use onbehalf_core::{DelegationChain, ToolCall};
 use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
 
-use crate::catalog::ToolCatalog;
+use crate::catalog::ToolAttrs;
 use crate::schema::GENERIC_ACTION;
 
 /// Largest magnitude a Cedar `decimal` can hold.
@@ -133,7 +133,7 @@ pub(crate) struct CedarRequest {
 pub(crate) fn build(
     chain: &DelegationChain,
     call: &ToolCall,
-    catalog: &ToolCatalog,
+    attrs: &ToolAttrs,
     now: OffsetDateTime,
 ) -> Result<CedarRequest, TranslationError> {
     let agent = chain
@@ -203,7 +203,6 @@ pub(crate) fn build(
         "attrs": { "name": call.server },
         "parents": [],
     }));
-    let attrs = catalog.get(&call.server, &call.tool);
     entities.push(json!({
         "uid": uid_json("Tool", &tool_id(call)),
         "attrs": {

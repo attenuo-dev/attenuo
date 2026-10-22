@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use onbehalf_core::{Capability, CapabilitySet};
-use onbehalf_policy::{ToolAttrs, ToolCatalog};
+use onbehalf_policy::{ToolAttrs, ToolCatalog, UnknownTools};
 use onbehalf_proxy::UpstreamConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -207,6 +207,12 @@ pub struct PolicySection {
     /// policy that tests an attribute fails validation instead of silently never matching.
     #[serde(default)]
     pub user_attributes: BTreeMap<String, String>,
+    /// What a `tools/call` for a `(server, tool)` pair missing from the catalog gets:
+    /// `"deny"` (default; reason `tool_not_in_catalog`, audited like any decision),
+    /// `"sensitive"` (evaluated with `resource.sensitive = true`) or `"allow"` (evaluated with
+    /// default attributes, so `forbid ... when { resource.sensitive }` does not apply).
+    #[serde(default)]
+    pub unknown_tools: UnknownTools,
 }
 
 impl PolicySection {
@@ -439,7 +445,42 @@ pub fn capability_set(specs: &[CapSpec]) -> Result<CapabilitySet, String> {
     specs.iter().map(CapSpec::to_capability).collect()
 }
 
+/// A server name used in `[[upstreams]]`, the catalog or capabilities must not be empty or
+/// contain `/`: the Cedar resource id is `"<server>/<tool>"`, which would be ambiguous (SR-13).
+pub fn check_server_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("server name must not be empty".into());
+    }
+    if name.contains('/') {
+        return Err(format!("server name `{name}` must not contain `/`"));
+    }
+    Ok(())
+}
+
 impl Config {
+    /// Reject server names that contain `/` (or are empty) in `[[upstreams]]`, the tool
+    /// catalog (inline and `catalog_path`) and `[[root_grants]]` capabilities.
+    pub fn check_server_names(&self) -> anyhow::Result<()> {
+        for u in &self.upstreams {
+            check_server_name(&u.name).map_err(|e| anyhow::anyhow!("[[upstreams]]: {e}"))?;
+        }
+        for ((server, _), _) in self.policy.load_catalog()?.iter() {
+            check_server_name(server).map_err(|e| anyhow::anyhow!("[policy] catalog: {e}"))?;
+        }
+        for g in &self.root_grants {
+            for cap in capability_set(&g.capabilities)
+                .map_err(|e| anyhow::anyhow!(e))?
+                .iter()
+            {
+                if cap.server != "*" {
+                    check_server_name(&cap.server)
+                        .map_err(|e| anyhow::anyhow!("[[root_grants]]: {e}"))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Parse TOML text.
     pub fn from_toml(text: &str) -> anyhow::Result<Self> {
         Ok(toml::from_str(text)?)
@@ -530,6 +571,49 @@ mod tests {
         assert_eq!(pick("bob").unwrap().subject, None);
         assert!(RootGrant::find(&grants, "other", "planner", "alice").is_none());
         assert!(RootGrant::find(&grants, "idp", "coder", "alice").is_none());
+    }
+
+    #[test]
+    fn unknown_tools_defaults_to_deny_and_parses() {
+        assert_eq!(
+            Config::from_toml("").unwrap().policy.unknown_tools,
+            UnknownTools::Deny
+        );
+        for (text, want) in [
+            ("deny", UnknownTools::Deny),
+            ("sensitive", UnknownTools::Sensitive),
+            ("allow", UnknownTools::Allow),
+        ] {
+            let cfg =
+                Config::from_toml(&format!("[policy]\nunknown_tools = \"{text}\"\n")).unwrap();
+            assert_eq!(cfg.policy.unknown_tools, want);
+        }
+        assert!(Config::from_toml("[policy]\nunknown_tools = \"maybe\"\n").is_err());
+    }
+
+    /// SR-13: `/` in a server name makes `Tool::"<server>/<tool>"` ambiguous.
+    #[test]
+    fn slash_in_server_names_is_rejected() {
+        let upstream = "[[upstreams]]\nname = \"evil/x\"\nurl = \"http://127.0.0.1:1/mcp\"\n";
+        assert!(Config::from_toml(upstream)
+            .unwrap()
+            .check_server_names()
+            .is_err());
+        let catalog = "[policy.catalog.\"a/b\".read_file]\nreadonly = true\n";
+        assert!(Config::from_toml(catalog)
+            .unwrap()
+            .check_server_names()
+            .is_err());
+        let grant =
+            "[[root_grants]]\nissuer = \"i\"\nagent = \"a\"\ncapabilities = [\"a/b:read\"]\n";
+        assert!(Config::from_toml(grant)
+            .unwrap()
+            .check_server_names()
+            .is_err());
+        let ok = "[[upstreams]]\nname = \"github\"\nurl = \"http://127.0.0.1:1/mcp\"\n\
+                  [[root_grants]]\nissuer = \"i\"\nagent = \"a\"\ncapabilities = [\"*:*\"]\n";
+        Config::from_toml(ok).unwrap().check_server_names().unwrap();
+        assert!(check_server_name("").is_err());
     }
 
     #[test]

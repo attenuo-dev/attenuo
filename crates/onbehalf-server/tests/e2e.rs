@@ -601,6 +601,39 @@ async fn actor_auth_can_be_switched_off_explicitly() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// SR-12: a tool the upstream exposes but the catalog does not list is denied and audited,
+/// even with a capability and a policy that would allow it.
+#[tokio::test]
+async fn uncatalogued_tools_are_denied_and_audited() {
+    let h = Harness::start().await;
+    std::fs::write(&h.policy_path, "permit(principal, action, resource);").unwrap();
+    let resp = h.admin_post("/admin/policies/reload", json!({})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+
+    let no = h
+        .call(&root.token, "delete_org", json!({"org": "acme"}))
+        .await;
+    assert_eq!(denied_reason(&no), "tool_not_in_catalog");
+    let no = h
+        .call(&root.token, "Delete_Repo", json!({"repo": "acme/x"}))
+        .await;
+    assert_eq!(denied_reason(&no), "tool_not_in_catalog");
+    assert!(allowed(
+        &h.call(&root.token, "read_file", json!({"repo": "acme/x"}))
+            .await
+    ));
+    assert_eq!(h.upstream.recorded_calls().len(), 1);
+    let entries = h.audit_entries().await;
+    let denied: Vec<_> = tool_calls(&entries)
+        .into_iter()
+        .filter(|e| e["record"]["reason"] == "tool_not_in_catalog")
+        .collect();
+    assert_eq!(denied.len(), 2);
+    assert_eq!(denied[0]["record"]["tool"], "delete_org");
+    assert_eq!(denied[0]["record"]["decision"], "deny");
+}
+
 // ---------------------------------------------------------------------------------------------
 // Scenario 3: revoking the root lease cuts off the child on its next call.
 // ---------------------------------------------------------------------------------------------

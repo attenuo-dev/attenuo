@@ -34,6 +34,11 @@ policies_path = "config/policies/default.cedar"
 # Alternatively (or additionally) point catalog_path at a JSON file of the same shape:
 # { "github": { "read_file": { "readonly": true, "inputs": { "repo": "string" } } } }
 # catalog_path = "config/catalog.json"
+# Calls to a (server, tool) pair missing from the catalog: "deny" (default, reason
+# tool_not_in_catalog), "sensitive" (evaluated with resource.sensitive = true) or "allow"
+# (default attributes; forbids keyed on resource.sensitive do not apply). Server names must
+# not contain "/".
+unknown_tools = "deny"
 
 # Extra originating_user.attributes the Cedar schema should know, so policies that test them
 # validate. Types: string, long, bool, set<string> (any scalar inside set<>). The built-in four

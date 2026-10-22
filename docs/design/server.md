@@ -46,6 +46,8 @@ Forwarded after authentication and the lease check, with no decision: `initializ
 
 A capability grants these like a tool: `github:resources/read` with constraint `uri` prefix `file:///public/` allows reads under that prefix; `github:prompts/get` allows prompts. A broad `github:*` capability covers all of them, which is a reason to prefer narrow grants. The Cedar action is the method name, so catalog entries and policies for `resources/read` use that string. The `resources/list` and `prompts/list` results are not filtered (v0).
 
+Every decided call also has to name a `(server, tool)` pair that is in the tool catalog. `[policy] unknown_tools` sets what happens otherwise: `"deny"` (the default) denies after the capability stage with reason `tool_not_in_catalog`, recorded in the audit log like any decision; `"sensitive"` evaluates the call with `resource.sensitive = true`, so MFA-style `forbid` rules apply; `"allow"` evaluates it with default attributes, which is how v0 behaved and lets `forbid ... when { resource.sensitive }` fail open (SR-12). Methods decided as tools (`resources/read`, `prompts/get` and the rest) need catalog entries under their method name too. Server names must not contain `/` (`Tool::"<server>/<tool>"` would be ambiguous); the server refuses to start when an upstream, catalog entry or root grant uses one.
+
 ```mermaid
 sequenceDiagram
     autonumber

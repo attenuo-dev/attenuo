@@ -49,6 +49,7 @@ pub struct AppState {
 impl AppState {
     /// Load keys, policies and storage as the config says.
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
+        config.check_server_names()?;
         let issuer = load_issuer(config)?;
         let verifier = issuer.verifier();
         let jwks = crate::jwks::jwks_from_keys(&issuer.trusted_public_keys())?;
@@ -214,11 +215,25 @@ fn write_private_key(path: &Path, pem: &str) -> anyhow::Result<()> {
 
 fn build_engine(config: &Config) -> anyhow::Result<PolicyEngine> {
     let catalog = config.policy.load_catalog()?;
-    let mut builder = PolicyEngineBuilder::new().with_catalog(catalog);
+    let mut builder = PolicyEngineBuilder::new()
+        .with_catalog(catalog)
+        .with_unknown_tools(config.policy.unknown_tools);
     let user_attrs = onbehalf_policy::parse_user_attributes(&config.policy.user_attributes)
         .map_err(|e| anyhow::anyhow!("[policy] {e}"))?;
     for (name, ty) in user_attrs {
         builder = builder.with_user_attr(name, ty);
+    }
+    match config.policy.unknown_tools {
+        onbehalf_policy::UnknownTools::Deny => {}
+        onbehalf_policy::UnknownTools::Sensitive => tracing::info!(
+            "[policy] unknown_tools = \"sensitive\": tools missing from the catalog are \
+             evaluated as sensitive"
+        ),
+        onbehalf_policy::UnknownTools::Allow => tracing::warn!(
+            "[policy] unknown_tools = \"allow\": tools missing from the catalog are evaluated \
+             as neither readonly nor sensitive, so forbids keyed on resource.sensitive do not \
+             apply to them"
+        ),
     }
     let builder = match &config.policy.policies_path {
         Some(path) => builder.with_policies_file(path),

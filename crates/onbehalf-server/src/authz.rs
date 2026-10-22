@@ -272,6 +272,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let engine = PolicyEngineBuilder::new()
             .with_policies_str("permit(principal, action, resource);")
+            .with_unknown_tools(onbehalf_policy::UnknownTools::Allow)
             .build()
             .unwrap();
         let leases = Arc::new(MemoryLeaseStore::new());

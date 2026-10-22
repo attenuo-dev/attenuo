@@ -9,9 +9,9 @@ use onbehalf_core::{
     ToolCall,
 };
 use onbehalf_policy::{
-    ArgType, PolicyEngine, PolicyEngineBuilder, PolicyError, ToolAttrs, ToolCatalog,
+    ArgType, PolicyEngine, PolicyEngineBuilder, PolicyError, ToolAttrs, ToolCatalog, UnknownTools,
     DEFAULT_POLICIES, REASON_CAPABILITY_DENIED, REASON_POLICY_ALLOW, REASON_POLICY_DENY,
-    REASON_POLICY_ERROR,
+    REASON_POLICY_ERROR, REASON_TOOL_NOT_IN_CATALOG,
 };
 use serde_json::{json, Value};
 use time::macros::datetime;
@@ -206,11 +206,60 @@ fn readonly_tools_are_permitted_and_others_denied_by_default() {
     let out = engine.authorize(&chain(), &call("list_issues", json!({})), now());
     assert_eq!(out.decision, Decision::Allow);
 
-    // A tool the catalog does not know is neither readonly nor sensitive: default deny.
+    // A tool the catalog does not know is denied before Cedar runs (SR-12).
     let out = engine.authorize(&chain(), &call("run_workflow", json!({})), now());
     assert_eq!(out.decision, Decision::Deny);
-    assert_eq!(out.reason, REASON_POLICY_DENY);
+    assert_eq!(out.reason, REASON_TOOL_NOT_IN_CATALOG);
     assert!(out.policy_ids.is_empty());
+}
+
+/// SR-12: an uncatalogued tool used to be evaluated as neither readonly nor sensitive, so every
+/// `forbid ... when { resource.sensitive }` failed open for it.
+#[test]
+fn unknown_tools_are_denied_by_default_or_treated_as_sensitive() {
+    let policies = r#"@id("allow_all") permit(principal, action, resource);
+        @id("mfa_for_sensitive")
+        forbid(principal, action, resource)
+        when { resource.sensitive && !(context.originating_user.attributes has mfa &&
+                                       context.originating_user.attributes.mfa == true) };"#;
+    let build = |mode: Option<UnknownTools>| {
+        let b = PolicyEngineBuilder::new()
+            .with_catalog(catalog())
+            .with_policies_str(policies);
+        match mode {
+            Some(m) => b.with_unknown_tools(m),
+            None => b,
+        }
+        .build()
+        .unwrap()
+    };
+    let delete_org = call("delete_org", json!({}));
+    // Default: deny, with a reason of its own, even though a broad permit matches.
+    let engine = build(None);
+    assert_eq!(engine.unknown_tools(), UnknownTools::Deny);
+    let o = engine.authorize(&chain(), &delete_org, now());
+    assert_eq!(o.reason, REASON_TOOL_NOT_IN_CATALOG, "{o:?}");
+    assert!(o.diagnostics[0].contains("github:delete_org"));
+    // A case variant of a catalogued tool is a different, unknown tool.
+    let o = engine.authorize(&chain(), &call("Read_File", json!({})), now());
+    assert_eq!(o.reason, REASON_TOOL_NOT_IN_CATALOG);
+    // Catalogued tools are unaffected.
+    assert!(engine
+        .authorize(&chain(), &call("list_issues", json!({})), now())
+        .decision
+        .is_allow());
+    // Sensitive: the MFA forbid now applies to the unknown tool.
+    let no_mfa = chain_for(
+        user_with(&[("mfa", json!(false))]),
+        "coder",
+        caps(vec![Capability::new("github", "*")]),
+    );
+    let o = build(Some(UnknownTools::Sensitive)).authorize(&no_mfa, &delete_org, now());
+    assert_eq!(o.reason, REASON_POLICY_DENY, "{o:?}");
+    assert_eq!(o.policy_ids, vec!["mfa_for_sensitive"]);
+    // Allow: the old behaviour, default attributes.
+    let o = build(Some(UnknownTools::Allow)).authorize(&no_mfa, &delete_org, now());
+    assert!(o.decision.is_allow(), "{o:?}");
 }
 
 #[test]
@@ -673,6 +722,8 @@ fn github_mcp_over_privileged_token_is_narrowed_by_policy() {
 fn forbid_on_generic_invoke_action_applies_to_every_tool() {
     let engine = PolicyEngineBuilder::new()
         .with_catalog(catalog())
+        // Evaluate uncatalogued tools too, to show the forbid reaches them.
+        .with_unknown_tools(UnknownTools::Allow)
         .with_policies_str(
             r#"@id("allow_all") permit(principal, action, resource);
                @id("no_dangerous_flag")
