@@ -236,7 +236,7 @@ The same runner is available as a library, `onbehalf_policy::testing`, for tests
 onbehalf policy lint policy.cedar --config server.toml [--schema] [--json]
 ```
 
-Parses the file, flags bare (not server-scoped) actions, and validates it against the schema generated from the catalog in `--config`, printing each problem as `file:line:col: error[stage]: message`. Exit `0` clean, `2` errors. `--schema` also prints the schema it validated against, which is the quickest way to see which actions and argument names are declared. Without `--config` the catalog is empty, so any policy that names an action fails validation; the lint says so.
+Parses the file, flags bare (not server-scoped) actions, and validates it against the schema generated from the catalog in `--config`, printing each problem as `file:line:col: error[stage]: message`. Exit `0` clean, `2` errors. `--schema` also prints the schema it validated against, which is the quickest way to see which actions and argument names are declared. Without `--config` the tools are declared from the policy's own `<server>/<tool>` action names, so a correct policy passes; a `note:` says that `resource.readonly`, `resource.sensitive`, `context.input` types and user attributes were not checked, and bare or malformed action names are listed as not declared. Pass `--config` for the full check.
 
 ### In CI
 

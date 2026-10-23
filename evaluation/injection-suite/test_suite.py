@@ -11,6 +11,8 @@ build them into ``target/debug`` (see README.md).
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from typing import Any
 
 import pytest
@@ -84,3 +86,51 @@ def test_subset_audit(result: dict[str, Any]) -> None:
         assert not a["decisions_unmatched"], arm
         assert a["cli_verify_exit"] == 0, a["cli_verify_output"]
         assert a["offline_verify_exit"] == 0, a["offline_verify_output"]
+
+
+GARBAGE_ENV = {
+    "ONBEHALF_ADMIN_TOKEN": "garbage-from-another-server",
+    "ONBEHALF_SERVER": "http://127.0.0.1:9",
+    "ONBEHALF_TOKEN": "garbage",
+    "ONBEHALF_CONFIG": "/nonexistent/server.toml",
+}
+
+
+def test_inherited_onbehalf_env_is_dropped_with_one_warning(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for k, v in GARBAGE_ENV.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("ONBEHALF_BIN_DIR", "/keep/me")
+    dropped = harness.ignore_inherited_env()
+    assert dropped == sorted(GARBAGE_ENV)
+    assert not any(k in os.environ for k in GARBAGE_ENV)
+    assert os.environ["ONBEHALF_BIN_DIR"] == "/keep/me"
+    err = capsys.readouterr().err
+    assert err.count("warning:") == 1 and "ONBEHALF_ADMIN_TOKEN" in err
+    assert harness.ignore_inherited_env() == []
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.integration
+def test_subset_passes_with_garbage_onbehalf_env_exported() -> None:
+    """A child run with another server's variables exported still passes (was a 401)."""
+    if os.environ.get("ONBEHALF_INTEGRATION") != "1":
+        pytest.skip("set ONBEHALF_INTEGRATION=1 to run")
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            f"{__file__}::test_subset_matches_expectations",
+            f"{__file__}::test_subset_audit",
+        ],
+        env={**os.environ, **GARBAGE_ENV},
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert child.returncode == 0, child.stdout + child.stderr
