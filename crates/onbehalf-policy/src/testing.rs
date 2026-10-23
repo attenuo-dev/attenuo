@@ -7,6 +7,8 @@
 //! policies: ./policy.cedar          # optional, relative to this file
 //! catalog: ./config.toml            # optional: [policy.catalog] of a server config (or a JSON
 //!                                   # catalog file); or an inline map, see below
+//! unknown_tools: deny               # optional: deny | sensitive | allow; default is the
+//!                                   # config's [policy] unknown_tools, else deny
 //! now: 1760000000                   # optional, unix seconds the calls are evaluated at
 //! cases:
 //!   - name: coder may read public docs
@@ -26,6 +28,11 @@
 //!     read_file: { readonly: true, inputs: { repo: string } }
 //!     delete_repo: { sensitive: true }
 //! ```
+//!
+//! Calls to tools missing from the catalog are handled as the server handles them
+//! (`[policy] unknown_tools`, SR-12): by default they are denied with `tool_not_in_catalog`
+//! before Cedar runs. When `catalog` names a server config, its `unknown_tools` applies unless
+//! the file sets its own.
 //!
 //! # How the chain is built
 //!
@@ -76,6 +83,7 @@ use time::{Duration, OffsetDateTime};
 
 use crate::{
     ArgType, Outcome, PolicyEngine, PolicyEngineBuilder, PolicyError, ToolAttrs, ToolCatalog,
+    UnknownTools,
 };
 
 /// The evaluation time used when a test file does not set `now`: 2025-10-09T08:53:20Z.
@@ -179,6 +187,26 @@ pub fn load_user_attrs(path: &Path) -> Result<BTreeMap<String, ArgType>, Harness
         .try_into()
         .map_err(|e: toml::de::Error| HarnessError::invalid(&what, e))?;
     crate::parse_user_attributes(&decls).map_err(|e| HarnessError::invalid(&what, e))
+}
+
+/// Read `[policy] unknown_tools` from a server config; `None` when it is not set.
+pub fn load_unknown_tools_from_config(path: &Path) -> Result<Option<UnknownTools>, HarnessError> {
+    let what = format!("unknown_tools in {}", path.display());
+    let doc: toml::Table = read(path)?
+        .parse()
+        .map_err(|e: toml::de::Error| HarnessError::invalid(&what, e))?;
+    match doc
+        .get("policy")
+        .and_then(|p| p.as_table())
+        .and_then(|p| p.get("unknown_tools"))
+    {
+        None => Ok(None),
+        Some(v) => v
+            .clone()
+            .try_into()
+            .map(Some)
+            .map_err(|e: toml::de::Error| HarnessError::invalid(&what, e)),
+    }
 }
 
 /// Read a JSON catalog file: `{ "<server>": { "<tool>": { "readonly": true, ... } } }`.
@@ -364,6 +392,8 @@ pub struct TestFile {
     #[serde(default)]
     catalog: Option<CatalogSpec>,
     #[serde(default)]
+    unknown_tools: Option<UnknownTools>,
+    #[serde(default)]
     now: Option<i64>,
     pub cases: Vec<TestCase>,
     /// Directory relative paths resolve against. Set by [`TestFile::load`].
@@ -426,6 +456,20 @@ impl TestFile {
         }
     }
 
+    /// How calls to uncatalogued tools are handled: the file's `unknown_tools`, else the one of
+    /// the server config `catalog` names, else deny (the server's default).
+    pub fn load_unknown_tools(&self) -> Result<UnknownTools, HarnessError> {
+        if let Some(u) = self.unknown_tools {
+            return Ok(u);
+        }
+        match &self.catalog {
+            Some(CatalogSpec::Path(p)) if !p.ends_with(".json") => {
+                Ok(load_unknown_tools_from_config(&self.resolve(p))?.unwrap_or_default())
+            }
+            _ => Ok(UnknownTools::default()),
+        }
+    }
+
     /// The tool catalog the file selects (empty when it names none).
     pub fn load_catalog(&self) -> Result<ToolCatalog, HarnessError> {
         match &self.catalog {
@@ -438,7 +482,9 @@ impl TestFile {
     /// Build the engine the file describes. With no `policies`, the policy set is empty and
     /// Cedar denies everything.
     pub fn build_engine(&self) -> Result<PolicyEngine, HarnessError> {
-        let mut builder = PolicyEngineBuilder::new().with_catalog(self.load_catalog()?);
+        let mut builder = PolicyEngineBuilder::new()
+            .with_catalog(self.load_catalog()?)
+            .with_unknown_tools(self.load_unknown_tools()?);
         if let Some(CatalogSpec::Path(p)) = &self.catalog {
             for (name, ty) in load_user_attrs(&self.resolve(p))? {
                 builder = builder.with_user_attr(name, ty);
@@ -862,10 +908,45 @@ catalog:
     #[test]
     fn no_policies_means_deny_everything() {
         let f = TestFile::from_yaml_str(
-            "cases:\n  - name: x\n    call: { server: s, tool: t }\n    expect: deny\n    reason: policy_deny\n",
+            "unknown_tools: allow\ncases:\n  - name: x\n    call: { server: s, tool: t }\n    expect: deny\n    reason: policy_deny\n",
         )
         .unwrap();
         assert!(f.run().unwrap().all_passed());
+    }
+
+    #[test]
+    fn uncatalogued_tools_follow_the_server_default() {
+        let permit = "permit(principal, action, resource);";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("p.cedar"), permit).unwrap();
+        // No catalog and no setting: denied like the server does.
+        let case = "cases:\n  - name: x\n    call: { server: s, tool: t }\n    expect: deny\n    reason: tool_not_in_catalog\n";
+        std::fs::write(
+            dir.path().join("a.yaml"),
+            format!("policies: p.cedar\n{case}"),
+        )
+        .unwrap();
+        let r = TestFile::load(&dir.path().join("a.yaml"))
+            .unwrap()
+            .run()
+            .unwrap();
+        assert!(r.all_passed(), "{r:?}");
+        // A server config's setting is picked up with its catalog.
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[policy]\nunknown_tools = \"allow\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b.yaml"),
+            "policies: p.cedar\ncatalog: config.toml\ncases:\n  - name: x\n    call: { server: s, tool: t }\n    expect: allow\n",
+        )
+        .unwrap();
+        let r = TestFile::load(&dir.path().join("b.yaml"))
+            .unwrap()
+            .run()
+            .unwrap();
+        assert!(r.all_passed(), "{r:?}");
     }
 
     #[test]
