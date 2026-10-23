@@ -130,9 +130,10 @@ pub struct TokenSection {
     /// that are presented are still checked.
     #[serde(default = "default_true")]
     pub require_actor_auth: bool,
-    /// How the actor of an exchange may authenticate: `"secret"` (`[[agents]]` client
-    /// credentials only), `"actor_token"` (a JWT from an `[[actor_trust]]` issuer only) or
-    /// `"either"` (default). With `require_actor_auth = true` one accepted method is mandatory.
+    /// How the actor of an exchange, and the agent of a hop-0 intake, may authenticate:
+    /// `"secret"` (`[[agents]]` client credentials only), `"actor_token"` (a JWT from an
+    /// `[[actor_trust]]` issuer only) or `"either"` (default). With `require_actor_auth = true`
+    /// one accepted method is mandatory for an exchange; hop 0 always needs one.
     #[serde(default)]
     pub actor_auth: ActorAuth,
 }
@@ -146,7 +147,8 @@ impl Default for TokenSection {
     }
 }
 
-/// `[token] actor_auth`: which credentials authenticate the actor of an exchange.
+/// `[token] actor_auth`: which credentials authenticate the actor of an exchange and the agent
+/// of a hop-0 intake.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActorAuth {
@@ -161,7 +163,8 @@ pub enum ActorAuth {
 }
 
 /// One `[[actor_trust]]` entry: an issuer of workload identities (a SPIFFE trust domain, or any
-/// JWT issuer with a JWKS) whose tokens authenticate the actor of an exchange.
+/// JWT issuer with a JWKS) whose tokens authenticate the actor of an exchange, or the agent
+/// at hop 0.
 ///
 /// Exactly one key source: `jwks_url` (with `issuer`), or `spiffe_trust_domain` with
 /// `spiffe_bundle_url` (the SPIRE server's bundle endpoint, which serves a JWKS; never

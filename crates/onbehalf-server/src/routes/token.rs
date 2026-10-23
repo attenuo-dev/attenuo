@@ -5,7 +5,8 @@
 //! - **Hop 0 (IdP intake).** `subject_token_type` is `...:token-type:id_token` or
 //!   `...:token-type:id-jag` (or `grant_type` is `...:grant-type:jwt-bearer`): the subject token
 //!   is a user credential from a trusted IdP, and the agent authenticates with its client
-//!   credentials. Handled by [`crate::idp::intake`].
+//!   credentials or an `actor_token`, under the same `[token] actor_auth` modes as an
+//!   exchange. Handled by [`crate::idp::intake`].
 //! - **Hop n to n+1.** `subject_token_type` is `...:token-type:jwt` and the subject token is an
 //!   onbehalf token. Described below.
 //!
@@ -94,7 +95,10 @@ pub async fn exchange(
 
 /// Remove `actor_token` / `actor_token_type` from the body and check them: both or neither,
 /// the type is the JWT URN, and `[token] actor_auth` accepts actor tokens.
-fn take_actor_token(value: &mut Value, mode: ActorAuth) -> Result<Option<String>, ApiError> {
+pub(crate) fn take_actor_token(
+    value: &mut Value,
+    mode: ActorAuth,
+) -> Result<Option<String>, ApiError> {
     let Some(obj) = value.as_object_mut() else {
         return Ok(None);
     };
