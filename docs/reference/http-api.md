@@ -15,8 +15,24 @@ All routes the server mounts, from the route table in `crates/onbehalf-server/sr
 
 | Method and path | Auth | Purpose |
 | --- | --- | --- |
-| `POST /token` | agent client credentials at hop 0, parent token at later hops | RFC 8693 token exchange, as a form or JSON. Hop 0 takes an OIDC ID token or an ID-JAG. Later hops take a parent delegation token and `authorization_details`. |
+| `POST /token` | agent client credentials at hop 0; at later hops the parent token, plus the actor's client credentials or an `actor_token` | RFC 8693 token exchange, as a form or JSON. Hop 0 takes an OIDC ID token or an ID-JAG. Later hops take a parent delegation token and `authorization_details`. Optional `may_act` (agent ids) sets who may exchange the new token next. |
 | `POST /token/renew` | bearer delegation token | Extend the lease of the token's last hop. Returns `{lease, expires_at, expires_in}`. |
+
+A later-hop request authenticates its `actor` with `client_id` / `client_secret` (or HTTP Basic), or with `actor_token` and `actor_token_type` = `urn:ietf:params:oauth:token-type:jwt` (RFC 8693 §2.1): a workload-identity JWT, such as a SPIFFE JWT-SVID, from an `[[actor_trust]]` issuer. `[token] actor_auth` decides which are accepted. An actor token works for one exchange, and the child expires no later than it does. If the parent token carries `may_act`, the `actor` must be listed (`actor_not_permitted` otherwise).
+
+```http
+POST /token
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=urn:ietf:params:oauth:grant-type:token-exchange
+&subject_token=<parent onbehalf token>
+&subject_token_type=urn:ietf:params:oauth:token-type:jwt
+&actor=coder
+&scope=github:read_file
+&actor_token=<JWT-SVID for spiffe://example.org/ns/agents/sa/coder>
+&actor_token_type=urn:ietf:params:oauth:token-type:jwt
+&may_act=reviewer
+```
 
 ## Decision
 

@@ -54,6 +54,7 @@
   - [ADR-0004: Rust workspace layout](decisions/0004-rust-workspace-layout.md)
   - [ADR-0005: Policy decision point](decisions/0005-policy-decision-point.md)
   - [ADR-0006: Lease-based revocation](decisions/0006-lease-based-in-flight-revocation.md)
+  - [ADR-0007: Actor authentication](decisions/0007-actor-authentication.md)
 
 # Research
 

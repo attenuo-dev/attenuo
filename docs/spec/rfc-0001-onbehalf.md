@@ -82,8 +82,9 @@ These parts of the original design have no counterpart in the code. They are tra
 
 - **`evidence`** on the originating user (type, `jti` and digest of the ID token or ID-JAG it came from), so audit can show how the user was verified. Hop 0 is minted from an IdP credential (section 4), but the credential itself is not referenced from the token; `ou_sig` is onbehalf's own signature. TODO: [board](../tasks/board.md).
 - **`chain_id`**, a stable id for a whole run, for revoking by chain and correlating audit. TODO: [board](../tasks/board.md).
-- **`may_act`** and a verified `actor_token` (for example a SPIFFE JWT-SVID). In v0 the actor authenticates with client credentials from `[[agents]]` (`[token] require_actor_auth`, on by default): the caller of an exchange must prove it is the `actor` it names, and an agent id may appear only once in a chain. A workload credential (`actor_token`) would replace the shared secret.
 - **Numeric and time-range constraints.**
+
+Implemented since this section was first written: **`may_act`** and a verified **`actor_token`** (see section 4, "Actor authentication", and [ADR-0007](../decisions/0007-actor-authentication.md)).
 
 ## 4. Token exchange
 
@@ -100,13 +101,15 @@ A delegation token is a compact JWS, EdDSA (Ed25519), with header `typ` = `onbeh
   "exp": 1761168900,
   "typ": "onbehalf+jwt",
   "chain": { "originating_user": { "...": "as in section 3" }, "hops": [ "...planner...", "...coder..." ] },
-  "ou_sig": "<base64url Ed25519 signature over canonical JSON of chain.originating_user>"
+  "ou_sig": "<base64url Ed25519 signature over canonical JSON of chain.originating_user>",
+  "may_act": { "sub": ["agent:reviewer"] }
 }
 ```
 
 - `sub` is the originating user. `act` is the RFC 8693 §4.1 actor chain: outermost is the agent currently acting, innermost the root agent (no `act`). Both are derived from `chain` so generic consumers can read who acts for whom without parsing it; the verifier requires them to agree.
 - `exp` always equals the last hop's `expires_at`. Leases are not a top-level claim; each hop carries its own inside `chain`.
 - `ou_sig` is made once at root issuance and copied unchanged through every exchange, so the user block is verifiable independently of the outer signature.
+- `may_act` is optional (RFC 8693 §4.4): the agents allowed to exchange this token. See "`may_act`" below.
 
 **Root issuance** (`Issuer::issue_root`) builds the chain, signs the user block and mints. The server calls it only after verifying a user credential (hop 0):
 
@@ -129,7 +132,16 @@ A delegation token is a compact JWS, EdDSA (Ed25519), with header `typ` = `onbeh
 }
 ```
 
-Any other `grant_type` or `subject_token_type` is rejected. Capabilities from every `onbehalf_capabilities` entry are merged; `requested_ttl_seconds` is optional. `actor` is the agent identifier of the new hop.
+Any other `grant_type` or `subject_token_type` is rejected. Capabilities from every `onbehalf_capabilities` entry are merged; `requested_ttl_seconds` is optional. `actor` is the agent identifier of the new hop. An optional `may_act` (a list of agent ids, or `{"sub": [...]}`) becomes the child's `may_act` claim.
+
+**Actor authentication.** The caller must prove it is `actor` (`[token] require_actor_auth`, on by default). `[token] actor_auth` (`secret`, `actor_token` or `either`, the default) selects how:
+
+- client credentials from `[[agents]]` (HTTP Basic or `client_id` / `client_secret`), whose id must equal `actor`;
+- or an RFC 8693 §2.1 `actor_token` with `actor_token_type` = `urn:ietf:params:oauth:token-type:jwt`: a workload-identity JWT, such as a SPIFFE JWT-SVID, from an `[[actor_trust]]` entry. The entry is a SPIFFE trust domain (keys from the SPIRE bundle endpoint, configured explicitly) or any issuer with a JWKS. The server checks `typ` (not another token kind), `alg`, the key by `kid`, the signature, `iss` (when the entry names one), `aud`, `exp` (required), `nbf`, `iat` and `sub` (a SPIFFE ID in the trust domain, for SPIFFE entries), maps `sub` to an agent id (`subject_to_agent`: `sub`, the SPIFFE path, or a table) and requires it to equal `actor`. Each actor token is used once (replay cache keyed by entry and `jti`, or the hash of the signing input), and the child's expiry is capped at the actor token's `exp`.
+
+When both are sent, both are checked. An agent id may appear only once in a chain (`duplicate_actor`).
+
+**`may_act`** (RFC 8693 §4.4). A token may carry `"may_act": {"sub": ["agent:a", ...]}`: the agents allowed to exchange it. It is set at issuance from the request's `may_act` or, at hop 0, from `[[root_grants]] may_act` (a ceiling the request may narrow). When the parent carries it, an exchange for an actor it does not list fails with `invalid_request` / `actor_not_permitted`. It is not inherited: a child carries only the `may_act` its own exchange asked for. Without it, any authenticated actor may exchange the token.
 
 **Exchange response:**
 
@@ -143,7 +155,7 @@ Any other `grant_type` or `subject_token_type` is rejected. Capabilities from ev
 }
 ```
 
-**Exchange** (`Issuer::exchange`) verifies the parent at `now`, then calls `DelegationChain::extend`: the requested set must be non-empty and covered per section 3, the new depth must not exceed `max_depth`, and the child's expiry is `min(now + ttl, parent.expires_at)` (default TTL from issuer config). The child gets a fresh lease and `jti`, and the parent's `ou_sig`. The server lets a parent token delegate to a given actor once (replay cache keyed by parent `jti` and actor, until the parent's `exp`).
+**Exchange** (`Issuer::exchange` / `exchange_with`) verifies the parent at `now`, checks the parent's `may_act` against the actor, then calls `DelegationChain::extend`: the requested set must be non-empty and covered per section 3, the new depth must not exceed `max_depth`, and the child's expiry is `min(now + ttl, parent.expires_at)` (default TTL from issuer config), further capped by `IssueOptions::not_after` (the actor token's `exp` when one authenticated the exchange). The child gets a fresh lease and `jti`, and the parent's `ou_sig`. The server lets a parent token delegate to a given actor once (replay cache keyed by parent `jti` and actor, until the parent's `exp`).
 
 **Verification order** (`Verifier::verify`; `now` is supplied by the caller, never read from the system clock):
 1. EdDSA signature and algorithm;

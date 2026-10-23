@@ -784,6 +784,11 @@ mod tests {
         assert_eq!(cfg.idps[0].allowed_algs, DEFAULT_IDP_ALGS);
         assert_eq!(cfg.agents.len(), 2);
         assert!(cfg.token.require_actor_auth);
+        assert_eq!(cfg.token.actor_auth, ActorAuth::Either);
+        assert!(
+            cfg.actor_trust.is_empty(),
+            "the [[actor_trust]] examples are commented out"
+        );
         assert!(!cfg.dev.allow_root_mint);
     }
 

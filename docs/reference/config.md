@@ -60,6 +60,33 @@ Checkpoints are signed with the issuer key and verified against the JWKS; see [A
 | `allow_unsigned_chain` | `false` | Accept `subject.properties.chain` without a bearer token from an authenticated `[[peps]]` entry. Every hop must match what the server issued. |
 | `max_batch` | 64 | Most evaluations one `POST /access/v1/evaluations` may carry. More is refused with 400 `batch_too_large` before anything is decided or audited. Must be at least 1. |
 
+## `[token]`
+
+How the caller of an exchange (hop n to n+1) proves it is the `actor` it names.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `require_actor_auth` | `true` | The actor must authenticate with a method `actor_auth` accepts. When `false`, `actor` is asserted (the server warns at start-up), but credentials that are sent are still checked. |
+| `actor_auth` | `"either"` | `"secret"`: `[[agents]]` client credentials only; an `actor_token` is refused with `actor_token_not_accepted`. `"actor_token"`: an `actor_token` from an `[[actor_trust]]` issuer only; client credentials are refused with `client_auth_not_accepted`, and the server will not start without an `[[actor_trust]]` entry. `"either"`: both are accepted, and when both are sent both are checked. |
+
+## `[[actor_trust]]`
+
+Issuers of workload identities whose JWTs are accepted as the RFC 8693 `actor_token` of an exchange. Give each entry exactly one key source: `jwks_url` (with `issuer`), or `spiffe_trust_domain` with `spiffe_bundle_url`. Neither is discovered. Hop 0 (IdP intake) still authenticates the agent with `[[agents]]` client credentials.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `issuer` | | Exact `iss` the token must carry. Required with `jwks_url`. Optional with `spiffe_trust_domain`, because JWT-SVIDs often have no `iss`; when set, it is required and checked. |
+| `jwks_url` | | JWKS of a generic JWT issuer. |
+| `spiffe_trust_domain` | | SPIFFE trust domain, for example `example.org`. The token's `sub` must be a SPIFFE ID in it. |
+| `spiffe_bundle_url` | | The trust domain's bundle endpoint (SPIRE server `federation.bundle_endpoint`). It serves a JWKS; keys with `use` = `jwt-svid` verify JWT-SVIDs, `x509-svid` keys are ignored. |
+| `audience` | | The `aud` the token must carry, as a string or in an array. Use a value no other service accepts, such as the onbehalf server's URL. |
+| `subject_to_agent` | `"sub"` | How `sub` becomes an agent id. `"sub"`: `sub` itself (a whole SPIFFE ID). `"spiffe_path"`: the SPIFFE ID's path without the leading `/` (`spiffe://example.org/agents/coder` is `agents/coder`); needs `spiffe_trust_domain`. A table `{ "<sub>" = "<agent id>" }`: only listed subjects are accepted. The result must equal the exchange's `actor`. |
+| `allowed_algs` | `RS256`, `ES256`, `EdDSA` | Accepted signature algorithms. HMAC is refused. |
+| `jwks_ttl_seconds` | `300` | How long a fetched key set is used. An unknown `kid` triggers one refetch, at most every 30 seconds. |
+| `clock_skew_seconds` | `60` | Leeway for `exp`, `nbf` and `iat`. |
+
+An actor token authenticates one exchange: its `jti` (or, without one, its signed content) goes through the replay cache until `exp`. The child token never outlives the actor token's `exp`.
+
 ## `[[upstreams]]`
 
 One table per MCP server, using streamable HTTP.
@@ -109,6 +136,7 @@ The most a root token may carry.
 | `subject` | Optional. Pins the entry to one user. A pinned entry wins over an unpinned one. |
 | `capabilities` | List of `server:tool` strings. Requests are attenuated against this. |
 | `attributes` | Used only by the development root mint. IdP intake takes attributes from the verified token. |
+| `may_act` | Optional list of agent ids: the RFC 8693 `may_act` of root tokens minted under this grant, so only these agents may exchange them. A request may narrow it with its own `may_act`, never widen it (`may_act_exceeds_grant`). |
 
 With no matching entry, no root token is issued.
 

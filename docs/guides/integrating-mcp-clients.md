@@ -112,13 +112,32 @@ curl -s -X POST https://onbehalf.example.com/token \
   --data-urlencode scope='github:read_file github:create_issue'
 ```
 
+With a SPIFFE JWT-SVID instead of a client secret, the receiving agent sends its own identity:
+
+```sh
+SVID=$(spire-agent api fetch jwt -audience https://onbehalf.example.com \
+  -socketPath /run/spire/sockets/agent.sock | sed -n 2p | tr -d '[:space:]')   # untested
+curl -s -X POST https://onbehalf.example.com/token \
+  --data-urlencode grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+  --data-urlencode subject_token=$PLANNER_TOKEN \
+  --data-urlencode subject_token_type=urn:ietf:params:oauth:token-type:jwt \
+  --data-urlencode actor=coder \
+  --data-urlencode scope='github:read_file' \
+  --data-urlencode actor_token=$SVID \
+  --data-urlencode actor_token_type=urn:ietf:params:oauth:token-type:jwt
+```
+
+The SDKs take the same: Python `client.exchange(parent, "coder", caps, actor_token=svid)`, TypeScript `ob.exchange(parent, "coder", caps, { actorToken: svid })`, CLI `onbehalf token exchange ... --actor-token-file svid.jwt`.
+
 Rules to know:
 
 - Capabilities are `{server, tool, constraints}`. `server` and `tool` are an exact name, `*`, or a prefix glob such as `read_*`. A constraint is `equals`, `one_of` or `prefix` on one argument. A call that leaves out a constrained argument is denied.
 - A child must constrain every argument its parent constrains, at least as tightly. It may add constraints.
 - A child is covered only by a single parent capability, not by a combination of several. If you need to split authority, ask for each piece separately.
 - A parent whose lease is revoked, expired or unknown cannot delegate. The exchange fails with `invalid_grant`.
-- `actor` must be an `[[agents]]` entry, and the request must authenticate as that agent with its client secret (HTTP Basic, or `client_id` and `client_secret` in the body). The agent receiving the token proves who it is, so whoever orchestrates the exchange needs the receiving agent's secret, or the receiving agent makes the request itself with the parent token. A wrong or missing secret is 401 `invalid_client`; authenticating as someone else is 400 `actor_mismatch`. An operator can turn this off with `[token] require_actor_auth = false` (the server warns), and then `actor` is only asserted.
+- The request must authenticate as `actor`. Either with that agent's `[[agents]]` client secret (HTTP Basic, or `client_id` and `client_secret` in the body), or with an `actor_token`: a workload-identity JWT for the agent, such as a SPIFFE JWT-SVID, from an `[[actor_trust]]` issuer (see [Workload identity for sub-agents](identity-providers.md#workload-identity-for-sub-agents)). `[token] actor_auth` says which the server accepts. The agent receiving the token proves who it is, so whoever orchestrates the exchange needs the receiving agent's credential, or the receiving agent makes the request itself with the parent token. A wrong or missing secret is 401 `invalid_client`, a bad actor token is 400 `invalid_request` with an `actor_token_*` code, and authenticating as someone else is 400 `actor_mismatch`. An operator can turn this off with `[token] require_actor_auth = false` (the server warns), and then `actor` is only asserted.
+- An actor token works for one exchange (`replayed` the second time), and the child token expires no later than the actor token. Fetch a fresh one per exchange.
+- A parent can name who may exchange it next with `may_act` (RFC 8693 §4.4). Send `"may_act": ["coder"]` on the exchange that mints it (or let `[[root_grants]] may_act` set it at hop 0). Exchanging such a token for an agent that is not listed fails with `actor_not_permitted`. Without `may_act`, any authenticated agent may.
 - An agent cannot appear twice in a chain (`duplicate_actor`).
 - A parent token delegates to a given actor once. A second exchange of the same token for the same actor is `invalid_grant` / `replayed`; renew the child's lease (below) to keep it alive instead.
 - Failed exchanges answer `{"error": "...", "detail": "..."}`. `invalid_scope` means you asked for too much. `invalid_grant` means the parent token or one of its leases is no good.
@@ -267,4 +286,5 @@ The CLI does the same: `onbehalf authzen eval --token "$TOKEN" --server github -
 - Renew your lease at a third of the interval, and stop on `lease_revoked`.
 - Refresh the root token before it expires. Tokens last `default_ttl_seconds` (900 by default).
 - Hand sub-agents the narrowest token that does the job, with the shortest TTL that does the job.
+- Where a workload identity exists (SPIFFE, a cloud workload token), authenticate exchanges with an `actor_token` rather than a shared secret, one fresh token per exchange. Set `may_act` on tokens meant for one specific sub-agent.
 - Keep tokens out of prompts, tool arguments and logs. A token in a model's context can be leaked by the model.

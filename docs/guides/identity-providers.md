@@ -95,7 +95,7 @@ Notes:
 - The secret goes in the agent's runtime. Treat a leak as a leak of that agent's root-grant ceiling for every user whose ID token the attacker can also get.
 - Secrets are static. There is no `private_key_jwt` and no mTLS in v0. Rotating one means editing the config and restarting.
 - If an `actor` is sent on an intake request it must equal the client id.
-- The same `[[agents]]` entries authenticate sub-agents: a token exchange must authenticate as its `actor`. Give every agent that receives delegated tokens an entry.
+- The same `[[agents]]` entries authenticate sub-agents: a token exchange must authenticate as its `actor`. Give every agent that receives delegated tokens an entry, or a workload identity under [`[[actor_trust]]`](#workload-identity-for-sub-agents).
 - Each ID token or ID-JAG mints one root token. A second presentation, by any agent, is `invalid_grant` / `replayed` (keyed by `iss` and `jti`, or by the whole token when it has no `jti`). The root token expires no later than the credential, and a credential accepted only thanks to `clock_skew_seconds` is refused with `credential_expired`. The record of used credentials is in memory, so it is per server process.
 
 ## `[[root_grants]]`
@@ -272,6 +272,74 @@ curl -s -X POST https://onbehalf.example.com/token -u planner:$SECRET \
 ```
 
 Status: **untested against any real provider.** The server's tests use assertions it signs itself. Okta and Descope are the providers named in [the standards note](../research/standards.md) as shipping ID-JAG. onbehalf has not been run against either.
+
+## Workload identity for sub-agents
+
+Hop 0 is about the user. Every later hop is about an agent: the caller of an exchange must prove it is the `actor` it names. Besides an `[[agents]]` client secret, it can send an RFC 8693 `actor_token`: a JWT that a workload-identity system issued to that agent. onbehalf verifies it against an `[[actor_trust]]` entry and maps its `sub` to an agent id, which must equal `actor`.
+
+**Status: tested only with tokens the server's tests sign themselves.** The SPIRE settings below follow SPIRE's documentation and have not been run against a live SPIRE deployment.
+
+### SPIRE (untested)
+
+SPIRE issues JWT-SVIDs whose `sub` is the workload's SPIFFE ID, for example `spiffe://example.org/ns/agents/sa/coder`. Their signing keys are in the trust bundle, which the SPIRE server serves from its bundle endpoint (`federation { bundle_endpoint { ... } }` in `server.conf`). onbehalf fetches that URL as a JWKS and keeps the keys with `use` = `jwt-svid`. It never discovers the URL: you give it.
+
+```toml
+[token]
+actor_auth = "either"          # or "actor_token" once every agent has an identity
+
+[[actor_trust]]
+spiffe_trust_domain = "example.org"
+spiffe_bundle_url = "https://spire-server.example.org:8443"
+audience = "https://onbehalf.example.com"
+# Map SPIFFE IDs to the agent ids your policies and root grants use.
+subject_to_agent = { "spiffe://example.org/ns/agents/sa/coder" = "coder", "spiffe://example.org/ns/agents/sa/reviewer" = "reviewer" }
+# Or take the path as the agent id: spiffe://example.org/agents/coder -> "agents/coder".
+# subject_to_agent = "spiffe_path"
+allowed_algs = ["ES256", "RS256"]
+```
+
+The bundle endpoint's TLS certificate must be one onbehalf trusts through the web PKI (SPIRE's `https_web` profile, or a TLS proxy in front). If you run the SPIRE OIDC Discovery Provider instead, configure `jwt_issuer` in SPIRE so JWT-SVIDs carry an `iss`, and use a generic entry: `issuer = "<jwt_issuer>"`, `jwks_url = "https://<discovery provider>/keys"`, plus the same `audience` and `subject_to_agent`.
+
+The agent fetches a JWT-SVID with onbehalf's URL as the audience and sends it on the exchange:
+
+```sh
+spire-agent api fetch jwt -audience https://onbehalf.example.com \
+  -socketPath /run/spire/sockets/agent.sock
+onbehalf token exchange --subject-token "$PARENT" --actor coder \
+  --cap github:read_file --actor-token -   # reads the JWT-SVID from stdin
+```
+
+What onbehalf checks: the entry (by `iss` when the entry has `issuer`, by the trust domain of `sub`), `alg` in `allowed_algs`, the key by `kid`, the signature, `aud` contains `audience`, `exp` is present and not past, `nbf` and `iat` are not in the future, and `sub` is a well-formed SPIFFE ID in the trust domain. Then `subject_to_agent` must give the exchange's `actor`.
+
+Each actor token authenticates one exchange: a second use is `invalid_grant` / `replayed`. The SPIRE agent caches JWT-SVIDs and may hand out the same one until it is half expired, so fetch a new one per exchange; asking with an extra, unique audience next to onbehalf's URL gets a fresh token, and onbehalf accepts an `aud` array that contains its own value. The child token never outlives the actor token, so with SPIRE's default five-minute JWT-SVIDs a child lives at most five minutes. Use leases and renewals for longer work.
+
+### Any other workload JWT
+
+Anything that signs JWTs with RS256, ES256 or EdDSA and publishes a JWKS works the same way: Kubernetes projected service-account tokens, a cloud provider's workload identity tokens, your own issuer.
+
+```toml
+[[actor_trust]]
+issuer = "https://kubernetes.default.svc.cluster.local"
+jwks_url = "https://k8s-api.example.com/openid/v1/jwks"
+audience = "https://onbehalf.example.com"
+subject_to_agent = { "system:serviceaccount:agents:coder" = "coder" }
+```
+
+Pick an `audience` that only onbehalf accepts. A token minted for some other service must not double as an actor token.
+
+### `may_act`: who may exchange a token next
+
+A token can name the agents allowed to exchange it, as the RFC 8693 §4.4 `may_act` claim. Set it on the exchange that mints the token (`"may_act": ["reviewer"]`), on the intake request at hop 0, or as a ceiling in `[[root_grants]]`:
+
+```toml
+[[root_grants]]
+issuer = "https://idp.example.com"
+agent = "planner"
+capabilities = ["github:*"]
+may_act = ["coder", "reviewer"]   # only these may receive a delegation from planner's root token
+```
+
+An exchange whose `actor` is not listed fails with `invalid_request` / `actor_not_permitted`. A request may narrow a grant's list but not widen it (`may_act_exceeds_grant`). Tokens without `may_act` can be exchanged by any authenticated agent, as before.
 
 ## Checking your setup
 
