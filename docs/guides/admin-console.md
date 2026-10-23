@@ -1,0 +1,119 @@
+# Admin console
+
+The admin console is a set of pages built into `attenuo-server` for reading what the server decided and why: the audit log, one decision with its delegation chain and policies, a lease and everything delegated from it, the loaded policies, and the signatures over the log. With writes allowed, it can also revoke a lease and reload the policy file.
+
+It calls the same admin API as the `attenuo` CLI, with the same admin token. Everything it shows, you can also get with `curl`; the [HTTP reference](../reference/http-api.md#admin) has the routes.
+
+## Turn it on
+
+The console has a listener of its own, off by default. Add to the server config:
+
+```toml
+[admin_ui]
+enabled = true
+# listen = "127.0.0.1:9101"   # the default
+# allow_write = false         # the default: read-only
+```
+
+Restart the server. The log says `admin console listening at /admin/ui/`, and `http://127.0.0.1:9101/` redirects to the console.
+
+The server refuses to start when `listen` is not a loopback address, unless you also set `allow_public = true`, and then `[admin] token` must pass the strength check a public listener needs. Keep it on loopback. All keys are in [the configuration reference](../reference/config.md#adminui).
+
+The listener needs `[admin] token` set. Without one, every admin route answers 403 and the login screen says the admin API is disabled.
+
+## Reach it from your laptop
+
+On a server, keep the console on loopback and forward the port over SSH:
+
+```console
+$ ssh -N -L 9101:127.0.0.1:9101 you@attenuo-host
+```
+
+Then open `http://127.0.0.1:9101/` on your laptop. The page and the API it calls come from that one address.
+
+## Log in
+
+The login screen asks for the admin token (the value of `[admin] token`). The console checks it with a one-entry read of the audit log and keeps it only if the server accepts it.
+
+The token stays in the memory of that browser tab. It is not written to `localStorage`, `sessionStorage`, a cookie or the URL. It is forgotten when you:
+
+- press **Lock**,
+- leave the tab without any keyboard, mouse or touch input for 15 minutes,
+- reload the page or close the tab,
+- or when the server answers 401 (for example after the token was changed).
+
+Each of these brings back the login screen.
+
+## The screens
+
+### Audit
+
+The log, newest first, 100 entries a page: seq, local time (hover for UTC), kind, decision, server and tool, the agents of the chain root first, the user, the reason code, the chain and the leases.
+
+- **Filters**: kind (several), decision, reason, subject, agent, server, tool, chain id, lease, and a time window in local time. Every filter is an exact match. The filters go in the page address (`#/audit?decision=deny`), so Back works and you can bookmark a filtered view. The admin token never goes there.
+- **Older**, **Newer**, **Newest** page through the log. A filtered page can come back shorter than 100 entries; the server stops reading after 50,000 entries per request, and the console keeps asking until it has a page or reaches the end.
+- **Follow** checks every 2 seconds whether the log grew and adds new entries at the top. It reads the head only; it never signs a checkpoint.
+- A chain id narrows the view to that chain. A lease id opens its lease tree. A seq opens the decision.
+- **Export this range** downloads the entries between the oldest and newest seq on screen, unfiltered, with the checkpoints in that range, as `attenuo-audit-{from}-{to}.ndjson`. Check it offline with `attenuo audit verify --file`.
+
+### Decision
+
+Open from a seq (`#/entry/42`) or from the `decision_id` a denial returns (`#/record/<uuid>`). It shows:
+
+- the decision, the reason code and one line on what the code means;
+- the delegation chain, the user first, then each hop's agent and lease, with the lease's state **now** (active, expired, or revoked with its reason and time);
+- the ids of the policies that decided, with their current text. If the policies were reloaded after the decision, a warning says so: the text shown may not be the text that decided;
+- the hash fields (`seq`, `prev_hash`, `entry_hash`, `chain_digest`, `arguments_digest`) and the signed checkpoint that covers the entry, or "not yet covered by a signed checkpoint";
+- every other record of the same chain, oldest first.
+
+What it cannot show: the tool arguments and the capabilities each hop held. The log stores only their digests. If you have the token, **Decode a token locally** shows its header and claims, decoded in the browser tab. The token is not sent to the server or anywhere else, and its signature is not checked there.
+
+### Lease tree
+
+`#/lease/<id>` shows the leases the lease was delegated from (root first), and the lease with everything delegated from it as an indented tree: lease id, agent, expiry, state (with revocation reason and time), and the seq of the record that issued it. **renewals** lists the renewals of one lease. **Revoke…** opens a confirmation (below).
+
+### Policy
+
+- The loaded policies: file path, its SHA-256, when it was loaded, warnings, and the text of each policy.
+- **Check file on disk** lints the file as it is on disk now against the running schema: errors and warnings with line and column, and whether the file differs from what is loaded. It loads nothing.
+- **Reload** becomes available after a check with no errors (see writes below).
+- **Evaluate this call** is a dry run: give a delegation token (an expired one works) or a chain as JSON, a server, a tool and the arguments, and the console shows what the loaded policies decide, the reason, the policy ids and any diagnostics. It skips the lease check and writes no audit record. The token is sent to this server only.
+
+### Verify
+
+- The head of the log and the newest stored checkpoints.
+- **Verify now** walks the whole hash chain and checks every checkpoint signature against the server's keys: `ok`, the first bad seq, the last signed seq, how many newest entries no signature covers yet, and any checkpoint that failed. On a large log this takes a while.
+- **Sign head now** stores a signed checkpoint of the current head, after a confirmation. It is the only button on this page that writes, and it changes no audit entry.
+
+## Writes and `allow_write`
+
+By default the console listener is read-only: `POST /admin/leases/{id}/revoke` and `POST /admin/policies/reload` are not mounted there (404). The console still shows **Revoke…** and **Reload**; pressing them explains that writes are disabled on this listener. Use the CLI against the main listener instead, or set:
+
+```toml
+[admin_ui]
+allow_write = true
+```
+
+With writes on:
+
+- **Revoke** shows how many leases a revoke would change and which active agents hold them, asks for a reason (recorded in the audit log) and the last 6 characters of the lease id, then revokes. It reports the server's count next to the preview's. It cannot be undone.
+- **Reload** swaps in the policy file. If the file does not load, the old policies stay in force and the console shows the error.
+
+One action writes even when `allow_write` is off, because it changes no lease, policy or audit entry: **Sign head now** (`GET /admin/audit/checkpoint`, which stores a checkpoint). Evaluate, check and the other reads write nothing.
+
+## Security model
+
+- **Separate listener.** The main listener also serves `/mcp/{server}`, where an upstream MCP server chooses the response type. If the console shared that origin, a hostile upstream could answer with HTML and run script next to the admin token. The console's own listener serves only the console files and the admin API.
+- **Same token as the CLI.** The console has no accounts or sessions of its own. Anyone with the admin token can do with `curl` everything the console can.
+- **No dev mint.** `POST /admin/root-token` is never mounted on the console listener, whatever `[dev] allow_root_mint` says.
+- **Strict page policy.** Every response carries a Content-Security-Policy that allows only the console's own scripts, styles and requests, no inline script, no framing and no form posts, and turns on Trusted Types. The console builds every element as text; it never turns a string into HTML. A test in the server scans the embedded files for HTML-parsing calls, `eval`, `javascript:` URLs, inline handlers and inline scripts or styles, and fails the build if one appears. So a tool name such as `<img src=x onerror=alert(1)>` in the log shows up as those characters.
+- **No cross-site requests.** No CORS header is ever sent, so another site's page cannot read admin answers. Every `POST` must say `Content-Type: application/json`, which a cross-site form cannot send without a CORS preflight the listener never grants.
+- **Nothing cached.** API answers carry `Cache-Control: no-store`. The console files carry `no-cache` with an ETag, so a server upgrade never leaves an old script running.
+- **Nothing stored.** The token lives in the tab's memory only and is dropped on lock, idle, reload or a 401.
+
+## Limits
+
+- One shared admin token, no per-user accounts or roles, and no record of which person used the console. Admin actions are audited as `urn:attenuo:admin`.
+- The decision view shows lease states and policy text as they are now, not as they were when the decision was made.
+- Readiness (`/readyz`) is served on the main listener only; the Verify page says so instead of showing it.
+- The console is tested in current Chromium. Other browsers are untested.

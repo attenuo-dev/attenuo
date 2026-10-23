@@ -65,18 +65,158 @@ A denial is a JSON-RPC error with code `-32003`, carrying `reason` and `decision
 
 ## Admin
 
-All admin routes need `Authorization: Bearer <admin token>`. They answer 401 without it and 403 `admin_disabled` when no admin token is configured.
+All admin routes need `Authorization: Bearer <admin token>`. They answer 401 without it and 403 `admin_disabled` when no admin token is configured. Every admin answer, errors included, carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
 
 | Method and path | Purpose |
 | --- | --- |
 | `GET /admin/leases/{lease_id}` | Lease state. |
 | `POST /admin/leases/{lease_id}/revoke` | Revoke the lease and all descendants. |
-| `GET /admin/audit` | Audit entries in ascending `seq` order, paged with `from` and `limit`. Also returns `next` (when the page was full) and `head`, the newest `seq`. |
+| `GET /admin/leases/{lease_id}/tree?max_nodes` | The lease, its descendants and its ancestors, and how many leases a revoke would change now. Read-only; see [Lease tree](#lease-tree). 404 for an unknown lease. |
+| `GET /admin/audit` | Audit entries in ascending `seq` order, paged with `from` and `limit` (default 100, at most 1000). Also returns `next` (when the page was full) and `head`, the newest `seq`. Filters and newest-first paging are below. |
+| `GET /admin/audit/entries/{seq}` | One entry with its context, `{entry, lease_states, covered_by_checkpoint, policy_reloaded_after}` (below). 404 when there is no entry at `seq`. |
+| `GET /admin/audit/records/{id}` | The same for the entry whose record id is `id`: the UUID that proxy denials and AuthZEN answers return as `decision_id`. 400 if `id` is not a UUID, 404 if no record has it. |
+| `GET /admin/audit/checkpoints?before&limit` | Stored checkpoints, newest first, `{checkpoints, prev}`; each is `{seq, head_hash, at, kid, signature}`. `prev` is the `before` of the next (older) page, null after the oldest. Read-only: it never signs, unlike `/admin/audit/checkpoint`. |
 | `GET /admin/audit/verify` | Walk the whole hash chain, verify every checkpoint signature against the JWKS, and report `{entries, ok, first_bad_seq, checkpoints, last_signed_seq, unsigned_tail, bad_checkpoints}`. |
 | `GET /admin/audit/checkpoint` | The signed checkpoint of the head, `{seq, head_hash, at, kid, signature}` (signing it now if the head has none). For keeping outside the host. `hash` repeats `head_hash` for older clients. |
 | `GET /admin/audit/export?from&to` | Entries `from..=to` (default: the whole log) and the checkpoints in that range, streamed as `application/x-ndjson`: a `header` line, `entry` lines, then `checkpoint` lines. Verify offline with `attenuo audit verify --file`. 400 if `from` is 0 or `to < from`. |
 | `POST /admin/policies/reload` | Re-read the policy file. On failure the old policy stays. |
+| `GET /admin/policies` | The policy set in force: file path, its `sha256` and `loaded_at` (startup or last successful reload), `policy_ids`, validation `warnings`, and `policies: [{id, text}]`. |
+| `GET /admin/policies/check` | Lint the policy file as it is on disk now against the running schema, with line and column for each issue, and say whether it differs from the loaded one. Loads nothing, audits nothing. 409 `check_unavailable` without `policy.policies_path`. |
+| `POST /admin/policies/evaluate` | Dry run: what the loaded policies decide for one call, given a token or a chain. No lease check, no audit record, no decision metric. |
 | `POST /admin/root-token` | Development root mint. Mounted only when `[dev] allow_root_mint = true`. |
+
+### Lease tree
+
+`GET /admin/leases/{lease_id}/tree` is a dry run of `POST /admin/leases/{lease_id}/revoke`: it shows what the revocation would reach and changes nothing (no lease row, no audit record).
+
+- `nodes`: the lease first, then every lease delegated from it, breadth-first (each level in id order). At most `max_nodes` (default 1000, clamped to 1..10000); `truncated` is `true` when the cap cut the list short.
+- `ancestors`: the leases it was delegated from, nearest first, ending at `root`, the chain's first hop. `root` is also the `chain_id` of the chain's audit records. Empty for a root lease.
+- `would_revoke`: the leases in the whole subtree that are not revoked yet, counted with the same query the revocation runs, so it is the `revoked` count a revoke sent now would return. It ignores `max_nodes`.
+- Per lease: the registry row (`parent`, `expires_at`, `revoked_at`, `revoke_reason`), `active` now, and from the audit record that issued it (`root_token` or `exchange`) the `agent` it was issued to, `issued_at` and `issued_seq`. These three are `null` when no issuance record is found.
+
+```json
+{
+  "root": "0b7c...",
+  "ancestors": [
+    {"lease_id": "0b7c...", "parent": null, "agent": "planner", "active": true,
+     "expires_at": "2026-10-23T19:20:00Z", "revoked_at": null, "revoke_reason": null,
+     "issued_at": "2026-10-23T19:05:00Z", "issued_seq": 41}
+  ],
+  "nodes": [
+    {"lease_id": "5e21...", "parent": "0b7c...", "agent": "coder", "active": true,
+     "expires_at": "2026-10-23T19:20:02Z", "revoked_at": null, "revoke_reason": null,
+     "issued_at": "2026-10-23T19:05:02Z", "issued_seq": 42},
+    {"lease_id": "9a40...", "parent": "5e21...", "agent": "reviewer", "active": false,
+     "expires_at": "2026-10-23T19:20:03Z", "revoked_at": "2026-10-23T19:06:10Z",
+     "revoke_reason": "rotated", "issued_at": "2026-10-23T19:05:03Z", "issued_seq": 43}
+  ],
+  "would_revoke": 1,
+  "truncated": false
+}
+```
+
+### Querying the audit log
+
+`GET /admin/audit` takes these optional filters. Each is an exact match, never a pattern: `%` and `_` are ordinary characters, and `agent=l1` does not match an agent called `l10`. Filters combine with AND.
+
+| Parameter | Keeps entries whose record has |
+| --- | --- |
+| `kind` | one of these kinds, comma-separated: `decision`, `exchange`, `root_token`, `lease_renew`, `lease_revoke`, `admin` |
+| `decision` | `allow` or `deny` |
+| `reason` | this `reason` (`policy_deny`, `lease_revoked`, ...) |
+| `subject` | this `originating_subject` |
+| `agent` | this agent among its `agents` |
+| `lease` | this lease among its `leases` |
+| `server`, `tool` | this `server`, this `tool` |
+| `chain_id` | this `chain_id` (the lease id of the chain's first hop) |
+| `since`, `until` | `at` in `[since, until)`, both RFC 3339 times |
+
+Paging:
+
+- `order=asc` (the default) with `from`: oldest first from `from`. The answer is `{entries, next, head}`; `next` is the `from` of the following page, null at the end. Without any of the new parameters the answer is exactly what it was before filters existed.
+- `order=desc` with `before`: newest first, entries with `seq < before` (default: from the head). The answer adds `prev`, the `before` of the following (older) page, null once seq 1 has been read; `next` is then the `from` for reading forward with `order=asc` from just above the page, null when the page reached the head. `before` with `order=asc`, or `from` with `order=desc`, is a 400.
+- A filtered page reads at most 50,000 seqs (`agent`, `lease`, `since` and `until` cannot use an index). It can therefore come back short, even empty, with `next` or `prev` set: keep following the link until it is null. Unfiltered pages are never cut short.
+
+An unknown `kind` or `decision`, a time that is not RFC 3339, an empty value or an unknown `order` is a 400 `invalid_request`. The renewal history of a lease, for example, is `kind=lease_renew&lease=<id>`.
+
+The single-entry routes (`/admin/audit/entries/{seq}`, `/admin/audit/records/{id}`) answer:
+
+- `entry`: the entry, as in `GET /admin/audit`.
+- `lease_states`: one object per lease in the record, root first, as the lease registry sees it now: `{lease_id, known, active, parent, expires_at, revoked_at, revoke_reason}`. A lease the registry does not hold has `known: false`.
+- `covered_by_checkpoint`: the oldest stored checkpoint at or after the entry, whose signature covers it through the hash chain, or null when the entry is newer than every checkpoint. It is returned as stored; `GET /admin/audit/verify` checks signatures.
+- `policy_reloaded_after`: the seq of the first successful `POST /admin/policies/reload` recorded after the entry, or null. When set, the policy in force now may not be the one that decided.
+
+### Policies: read, check, dry run
+
+These three routes change nothing and write no audit record. They answer the questions an operator has before acting: which policy file is loaded, would the edited file load, and what would the policies say about this call.
+
+`GET /admin/policies`:
+
+```json
+{
+  "path": "/etc/attenuo/policies.cedar",
+  "sha256": "9f2c...e1",
+  "loaded_at": "2026-10-23T19:02:11.52Z",
+  "policy_ids": ["issues", "public_reads"],
+  "warnings": [],
+  "policies": [
+    {"id": "issues", "text": "@id(\"issues\")\npermit(principal, action == Action::\"github/create_issue\", resource);"},
+    {"id": "public_reads", "text": "@id(\"public_reads\")\npermit(principal, action == Action::\"github/read_file\", resource)\nwhen { ... };"}
+  ]
+}
+```
+
+`sha256` and `loaded_at` describe the text the engine loaded, so after a failed reload they still name the old file. `path` and `sha256` are `null` when no policy file is configured.
+
+`GET /admin/policies/check` reads the file and lints it as `attenuo policy lint` does, against the schema of the running engine:
+
+```json
+{
+  "path": "/etc/attenuo/policies.cedar",
+  "sha256": "41b0...7a",
+  "loaded_sha256": "9f2c...e1",
+  "differs_from_loaded": true,
+  "ok": false,
+  "error_count": 1,
+  "warning_count": 0,
+  "issues": [
+    {"severity": "error", "stage": "validate", "policy_id": "public_reads",
+     "message": "...attribute `no_such_attribute` ... not found", "line": 3, "column": 8}
+  ],
+  "policy_ids": ["issues", "public_reads"]
+}
+```
+
+`ok` is true when there are no errors, which is when `POST /admin/policies/reload` would succeed.
+
+`POST /admin/policies/evaluate` takes an AuthZEN evaluation request (the body of `POST /access/v1/evaluation`) plus an optional `token`:
+
+```json
+{
+  "token": "<delegation token>",
+  "subject": {"type": "agent", "id": ""},
+  "action": {"name": "read_file"},
+  "resource": {"type": "tool", "id": "github/read_file", "properties": {"server": "github"}},
+  "context": {"input": {"repo": "alice/public-site"}}
+}
+```
+
+- With `token`, the token is verified with the server's keys and its chain is used; `subject.id` may be empty and `subject.properties.chain` may be left out (if present it must equal the token's chain, else 400 `chain_mismatch`). A bad signature or any other verification failure is 400 `invalid_token`. An expired token is accepted, verified as of the last second it was valid, and the answer has `token_expired: true`. The call counts as DPoP-bound when the token is bound (`cnf`).
+- Without `token`, `subject.properties.chain` is required (400 `invalid_request` otherwise) and is only checked structurally, as of now (400 `invalid_chain` if that fails). Nothing checks that this server issued it.
+
+```json
+{
+  "decision": "allow",
+  "reason": "policy_allow",
+  "policy_ids": ["public_reads"],
+  "diagnostics": [],
+  "lease_check": "skipped",
+  "chain_source": "token",
+  "token_expired": false
+}
+```
+
+`chain_source` is `token` or `admin_supplied`. The decision comes from the capability stage and Cedar, the same code `POST /access/v1/evaluation` runs after its lease check, so for a token with live leases the two agree on decision, reason and policy ids. A revoked or expired lease does not change the dry run's answer (`lease_check` is always `skipped`).
 
 ## Metrics
 

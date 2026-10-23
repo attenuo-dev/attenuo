@@ -108,6 +108,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # and exits non-zero if any step of the scenario does not come out as expected.
       - run: bash examples/github-leak-demo/run.sh
+      # The admin console listener against the real binary: page and CSP, admin token, no dev mint.
+      - name: Admin console smoke test
+        run: bash scripts/admin-ui-smoke.sh
 
   policy-tests:
     name: policy tests

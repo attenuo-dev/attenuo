@@ -20,13 +20,26 @@
 //! | `POST/GET/DELETE /mcp/{server}` | delegation token | MCP proxy |
 //! | `POST /admin/root-token` | admin | dev-only hop-0 mint ([`routes::dev_root`]), mounted only with `[dev] allow_root_mint = true` |
 //! | `POST /admin/leases/{id}/revoke`, `GET /admin/leases/{id}` | admin | leases |
+//! | `GET /admin/leases/{id}/tree?max_nodes` | admin | lease subtree, ancestors and how many leases a revoke would change (read-only, [`routes::admin::lease_tree`]) |
 //! | `GET /admin/audit`, `/admin/audit/verify`, `/admin/audit/checkpoint` | admin | audit |
+//! | `GET /admin/audit/entries/{seq}`, `/admin/audit/records/{id}`, `/admin/audit/checkpoints` | admin | one entry with its context; stored checkpoints (read-only) |
 //! | `GET /admin/audit/export?from&to` | admin | stream a verifiable slice of the log as JSON Lines |
 //! | `POST /admin/policies/reload` | admin | hot-reload the Cedar policy file |
+//! | `GET /admin/policies` | admin | the policy set in force: ids, text, file digest, load time ([`routes::policies`]) |
+//! | `GET /admin/policies/check` | admin | lint the policy file on disk against the running schema; swaps nothing |
+//! | `POST /admin/policies/evaluate` | admin | dry run: what the loaded policies say about one call; no lease check, no audit |
+//!
+//! **Console listener.** With `[admin_ui] enabled = true` a second listener on
+//! `[admin_ui] listen` (default `127.0.0.1:9101`) serves the embedded console under
+//! `/admin/ui/` and the admin routes above that have no side effect, behind the same admin
+//! bearer; revoke and reload only with `[admin_ui] allow_write = true`, and never
+//! `/admin/root-token`. Every response there carries a strict CSP and the other headers in
+//! [`admin_ui::SECURITY_HEADERS`], and no CORS headers. See [`admin_ui`].
 
 #![deny(unsafe_code)]
 
 pub mod actor;
+pub mod admin_ui;
 pub mod authz;
 pub mod clientauth;
 pub mod config;
@@ -60,23 +73,36 @@ pub fn build(config: &Config) -> anyhow::Result<(Router, Arc<AppState>)> {
 
 /// The full router over an existing state.
 pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Config) -> Router {
-    use routes::{admin, authzen, dev_root, renew, token, wellknown};
+    use routes::{admin, authzen, dev_root, policies, renew, token, wellknown};
 
     let mut admin_routes = Router::new()
         .route("/admin/leases/{lease_id}", get(admin::lease_status))
         .route("/admin/leases/{lease_id}/revoke", post(admin::revoke_lease))
+        .route("/admin/leases/{lease_id}/tree", get(admin::lease_tree))
         .route("/admin/audit", get(admin::audit_range))
         .route("/admin/audit/verify", get(admin::audit_verify))
+        .route("/admin/audit/entries/{seq}", get(admin::audit_entry))
+        .route("/admin/audit/records/{id}", get(admin::audit_record))
+        .route("/admin/audit/checkpoints", get(admin::audit_checkpoints))
         .route("/admin/audit/checkpoint", get(admin::audit_checkpoint))
         .route("/admin/audit/export", get(admin::audit_export))
+        .route("/admin/policies", get(policies::get_policies))
+        .route("/admin/policies/check", get(policies::check_policies))
+        .route(
+            "/admin/policies/evaluate",
+            post(policies::evaluate_policies),
+        )
         .route("/admin/policies/reload", post(admin::reload_policies));
     if state.dev_allow_root_mint {
         admin_routes = admin_routes.route("/admin/root-token", post(dev_root::mint_root));
     }
-    let admin_routes = admin_routes.route_layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        admin::require_admin,
-    ));
+    let admin_routes = admin_routes
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            admin::require_admin,
+        ))
+        // Added last, so it wraps `require_admin` and its 401/403 answers get the headers too.
+        .route_layer(axum::middleware::from_fn(admin::admin_response_headers));
 
     let api = Router::new()
         .route("/healthz", get(wellknown::healthz))
@@ -164,7 +190,22 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     } else {
         None
     };
+    let console_task = if config.admin_ui.enabled {
+        let l = tokio::net::TcpListener::bind(config.admin_ui.listen).await?;
+        tracing::info!(
+            addr = %l.local_addr()?,
+            allow_write = config.admin_ui.allow_write,
+            "admin console listening at /admin/ui/"
+        );
+        let app = admin_ui::router(state.clone(), &config);
+        Some(tokio::spawn(async move { axum::serve(l, app).await }))
+    } else {
+        None
+    };
     let res = serve_until(listener, app, shutdown_signal(), DRAIN_TIMEOUT).await;
+    if let Some(t) = console_task {
+        t.abort();
+    }
     if let Some(t) = metrics_task {
         t.abort();
     }

@@ -641,6 +641,26 @@ impl PolicyEngine {
         ids
     }
 
+    /// Each loaded policy (static policies and templates) with its Cedar text, sorted by id.
+    ///
+    /// The admin console shows what is in force, which may differ from the file on disk after
+    /// an edit that was not reloaded. The text is Cedar's rendering of the parsed policy: the
+    /// source text where Cedar kept it, so comments between policies are not included.
+    pub fn policy_texts(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .policies
+            .policies()
+            .map(|p| (p.id().to_string(), p.to_string()))
+            .chain(
+                self.policies
+                    .templates()
+                    .map(|t| (t.id().to_string(), t.to_string())),
+            )
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Validation warnings from the last successful load (for example "policy is impossible").
     pub fn validation_warnings(&self) -> &[String] {
         &self.validation_warnings

@@ -111,6 +111,29 @@ impl Pipeline {
         out
     }
 
+    /// Stage 2 alone: `PolicyEngine::authorize` (the capability stage, the catalog, then
+    /// Cedar) on the shared engine. No lease check, no audit record, no metrics.
+    ///
+    /// [`decide`](Self::decide) runs this after the lease check, and the admin dry run
+    /// (`POST /admin/policies/evaluate`) runs it on its own, so the two cannot disagree about
+    /// what the policy says. A poisoned engine lock denies with `policy_error`.
+    pub fn evaluate_policy(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        now: OffsetDateTime,
+    ) -> attenuo_policy::Outcome {
+        match self.policy.read() {
+            Ok(engine) => engine.authorize(chain, call, now),
+            Err(_) => attenuo_policy::Outcome {
+                decision: Decision::Deny,
+                reason: attenuo_policy::REASON_POLICY_ERROR.to_string(),
+                policy_ids: Vec::new(),
+                diagnostics: vec!["policy engine lock poisoned".to_string()],
+            },
+        }
+    }
+
     fn decide_inner(
         &self,
         chain: &DelegationChain,
@@ -124,19 +147,11 @@ impl Pipeline {
         let mut policy_time = None;
         let (decision, reason, policy_ids, diagnostics) = match leases {
             Err((reason, detail)) => (Decision::Deny, reason.to_string(), Vec::new(), detail),
-            Ok(()) => match self.policy.read() {
-                Ok(engine) => {
-                    let o = engine.authorize(chain, call, now);
-                    policy_time = Some(t1.elapsed());
-                    (o.decision, o.reason, o.policy_ids, o.diagnostics)
-                }
-                Err(_) => (
-                    Decision::Deny,
-                    attenuo_policy::REASON_POLICY_ERROR.to_string(),
-                    Vec::new(),
-                    vec!["policy engine lock poisoned".to_string()],
-                ),
-            },
+            Ok(()) => {
+                let o = self.evaluate_policy(chain, call, now);
+                policy_time = Some(t1.elapsed());
+                (o.decision, o.reason, o.policy_ids, o.diagnostics)
+            }
         };
 
         let record = DecisionRecord::new(now, decision, reason, chain, call, policy_ids);
