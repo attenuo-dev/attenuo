@@ -91,17 +91,30 @@ This is the weakest part of v0. Real operator authentication is on the [task boa
 
 ## Key rotation
 
-The server signs every token with one Ed25519 key, named by `[issuer] private_key_pem_path`. Its public half is served at `/.well-known/jwks.json`. Tokens carry no `kid`, and the JWKS holds exactly one key. That means there is no overlap period: the moment the server loads a new key, every token signed with the old one fails verification.
+The server signs every token with the Ed25519 key named by `[issuer] private_key_pem_path`. Each token's JOSE header carries a `kid`: the first 16 bytes of the SHA-256 of the key's SubjectPublicKeyInfo DER, base64url-encoded (22 characters). `/.well-known/jwks.json` lists every key the server trusts, signing key first, each with its `kid`.
+
+Rotation has an overlap period. Retired keys listed in `[issuer] previous_key_paths` stay trusted for verification and in the JWKS, but never sign. Tokens signed before the switch keep working until they expire, and can still be exchanged for children.
+
+```toml
+[issuer]
+private_key_pem_path = "/etc/onbehalf/issuer-2.pem"          # signs from now on
+previous_key_paths   = ["/etc/onbehalf/issuer-1.pem"]        # verify only
+```
 
 To rotate:
 
-1. Generate the new key: `openssl genpkey -algorithm ed25519 -out /etc/onbehalf/issuer-2.pem`, then `chmod 600` it. The server also generates a key itself if the path does not exist, so you can just point the setting at a new path.
-2. Stop the server.
-3. Change `private_key_pem_path` to the new file.
-4. Start the server. It logs the new public key.
-5. Agents get 401 on their next call. They re-run their login and exchange steps to get new tokens.
+1. Generate the new key: `openssl genpkey -algorithm ed25519 -out /etc/onbehalf/issuer-2.pem`, then `chmod 600` it. (The server also generates a key if the path does not exist.)
+2. Edit the config: point `private_key_pem_path` at the new file and add the old file to `previous_key_paths`. A previous key file may be the old private key or just its public key (`openssl pkey -in issuer-1.pem -pubout -out issuer-1.pub`); only the public half is used, so prefer the public file and archive the private one.
+3. Restart the server. It logs the new `kid` and how many previous keys it trusts. Check `/.well-known/jwks.json` lists both.
+4. Wait at least the longest token lifetime (`default_ttl_seconds`, or the largest `ttl_seconds` you allow) plus `clock_skew`. By then every token signed by the old key has expired.
+5. Remove `previous_key_paths`, restart, and destroy the old private key.
 
-Expect every in-flight run to need a new root token. Rotate in a quiet period, or on a compromise, where that cost is the point. Anything that verified onbehalf tokens offline against the old public key has to re-fetch the JWKS.
+Notes:
+
+- The originating-user block of a token (`ou_sig`) is signed once, at the root, and copied to every child. A child minted after the switch is signed by the new key but still carries an old-key `ou_sig`, so the old key must stay trusted until the whole chain has expired. That is why step 4 waits for the longest chain, not for one token.
+- A token whose `kid` is not in the trusted set is rejected with `invalid_grant`, whatever its signature. Tokens issued by a version before `kid` existed carry no `kid` and are tried against every trusted key.
+- Third parties that verify onbehalf tokens offline should select the key by `kid` and refresh the JWKS when they see an unknown one. `onbehalf token inspect --verify` fetches the JWKS and trusts every key in it.
+- In an emergency (key compromise), skip the overlap: replace the key and leave `previous_key_paths` empty. Every outstanding token stops verifying; agents re-run login and exchange.
 
 The audit log does not depend on the issuer key. It is a plain SHA-256 hash chain, so rotation does not break `audit verify`. Old leases stay in the database but belong to tokens that no longer verify.
 
@@ -192,7 +205,7 @@ services:
       - ./policy.cedar:/etc/onbehalf/policy.cedar:ro
       - ./issuer.pem:/etc/onbehalf/issuer.pem:ro
       - onbehalf-data:/var/lib/onbehalf
-    stop_signal: SIGINT
+    stop_grace_period: 15s         # the server drains for up to 10s after SIGTERM
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]
@@ -207,7 +220,7 @@ Matching settings in `onbehalf.toml`: `policies_path = "/etc/onbehalf/policy.ced
 
 Notes:
 
-- **Signals.** The server shuts down gracefully on SIGINT (Ctrl-C) only. It installs no SIGTERM handler. As PID 1 in a container, SIGTERM is then ignored and `docker stop` waits for its timeout and kills the process. `stop_signal: SIGINT` avoids that. SQLite writes are transactional, so a kill does not corrupt the log, but a graceful stop is cleaner.
+- **Signals.** The server shuts down gracefully on SIGTERM (what `docker stop` and Kubernetes send) and on SIGINT. It stops accepting connections, gives in-flight requests up to 10 seconds to finish, then exits; it logs `shutdown signal received; draining` and `shutdown complete`. Set `stop_grace_period` (or `terminationGracePeriodSeconds`) above 10 seconds. No `stop_signal` override is needed. SQLite writes are transactional, so even a kill does not corrupt the log.
 - **Read-only root.** The server only writes under the data directory and, when the key file is missing, to the key path. Keep the key file in the read-only mount, so a missing key is an error you see, not a new key you did not plan.
 - **Upstreams** must be reachable from the container. `127.0.0.1` in `[[upstreams]]` means the container itself.
 
@@ -215,13 +228,7 @@ Notes:
 
 `GET /healthz` returns `{"status":"ok","version":"..."}` with HTTP 200. It is a liveness check only. It does not open the database, check disk space or contact an identity provider. A server whose SQLite file is read-only or full still answers `ok`, and then denies every call.
 
-There is no readiness endpoint. For a deeper check, call an admin route that reads the database:
-
-```sh
-curl -fsS http://127.0.0.1:8080/admin/audit/checkpoint -H "Authorization: Bearer $ONBEHALF_ADMIN_TOKEN"
-```
-
-That proves the process is up, the token works and SQLite is readable. Do not put the admin token in a load balancer's config. Run this one from a monitor on the host.
+`GET /readyz` is the readiness check. It reads the head of the audit log and one row of the lease store. It answers 200 `{"status":"ready","checks":{...}}` when both work, and 503 with `"status":"unavailable"` and the failing check's error when either does not. Point a load balancer or Kubernetes `readinessProbe` at it; keep `/healthz` for the liveness probe so a full disk takes the instance out of rotation instead of restarting it. It needs no credentials and discloses only the storage error text.
 
 Startup is quick: parse config, load the key, open SQLite, load policy. Config, policy or catalog errors stop the process with a message instead of starting a half-working server.
 
@@ -229,7 +236,28 @@ Reloading policy does not need a restart: `onbehalf policy reload`. A bad policy
 
 ## What to monitor
 
-There are no metrics yet. Here is what to watch with the tools that exist.
+Enable the Prometheus endpoint with a separate listener, so it is never exposed on the proxy port by accident:
+
+```toml
+[metrics]
+enabled = true
+listen = "127.0.0.1:9100"
+```
+
+`GET http://127.0.0.1:9100/metrics` has no authentication. Keep it on loopback or a private network and scrape it from there. The API port does not serve `/metrics`. Series (all prefixed `onbehalf_`):
+
+| Series | Type | Labels |
+|---|---|---|
+| `decisions_total` | counter | `decision` (`allow`/`deny`), `reason` |
+| `tokens_issued_total` | counter | `kind` (`root`/`exchange`) |
+| `leases_revoked_total` | counter | none (counts cascaded descendants too) |
+| `audit_append_errors_total` | counter | none |
+| `http_requests_total` | counter | `route` (template, e.g. `/mcp/{server}`), `status` |
+| `authorize_duration_seconds` | histogram | none (lease check, policy and audit append) |
+
+Alert on any increase of `audit_append_errors_total`, on a rising share of `reason="lease_expired"` and on `readyz` returning 503.
+
+Beyond the metrics, watch these:
 
 From the process and the host:
 

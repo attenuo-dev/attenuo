@@ -22,6 +22,9 @@ lease_interval_seconds = 300
 # Ed25519 PKCS#8 key. Generated (mode 0600) on first start if missing; the public key is
 # logged and served at /.well-known/jwks.json. Omit to use an ephemeral key.
 private_key_pem_path = "data/issuer.pem"
+# Key rotation: keep retired keys (PEM, private or public) trusted for verification and in the
+# JWKS until their tokens expire. They never sign. See docs/guides/deploying.md.
+# previous_key_paths = ["data/issuer-old.pem"]
 
 [policy]
 # Cedar policies. POST /admin/policies/reload re-reads this file.
@@ -31,6 +34,12 @@ policies_path = "config/policies/default.cedar"
 # Alternatively (or additionally) point catalog_path at a JSON file of the same shape:
 # { "github": { "read_file": { "readonly": true, "inputs": { "repo": "string" } } } }
 # catalog_path = "config/catalog.json"
+
+# Extra originating_user.attributes the Cedar schema should know, so policies that test them
+# validate. Types: string, long, bool, set<string> (any scalar inside set<>). The built-in four
+# (mfa: bool, roles: set<string>, tenant: string, email: string) are always declared.
+# The values come from the IdP token claims listed in [[idps]] attribute_claims.
+user_attributes = { groups = "set<string>", department = "string" }
 
 [policy.catalog.github.read_file]
 readonly = true
@@ -95,3 +104,9 @@ attributes = { mfa = false }
 # DEVELOPMENT ONLY. Mounts POST /admin/root-token, which mints root tokens for a user nobody
 # verified (admin bearer + [[root_grants]] only). The server logs a warning when this is on.
 allow_root_mint = false
+
+[metrics]
+# Prometheus text endpoint on its OWN listener (GET /metrics), never on the proxy port.
+# No authentication: keep it on loopback or a private network.
+enabled = false
+# listen = "127.0.0.1:9100"

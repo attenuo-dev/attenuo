@@ -157,9 +157,15 @@ pub fn lint(policy: &Path, config: Option<&Path>, show_schema: bool, json_out: b
         Err(e) => return Run::error(e.to_string()),
     };
     let catalog_empty = catalog.is_empty();
-    let schema = PolicyEngineBuilder::new()
-        .with_catalog(catalog)
-        .schema_text();
+    let user_attrs = match config.map(testing::load_user_attrs).transpose() {
+        Ok(a) => a.unwrap_or_default(),
+        Err(e) => return Run::error(e.to_string()),
+    };
+    let mut builder = PolicyEngineBuilder::new().with_catalog(catalog);
+    for (name, ty) in user_attrs {
+        builder = builder.with_user_attr(name, ty);
+    }
+    let schema = builder.schema_text();
     let report = onbehalf_policy::lint(&text, &schema);
 
     if json_out {

@@ -14,6 +14,8 @@
 //! | `GET /.well-known/authzen-configuration` | none | AuthZEN metadata |
 //! | `GET /.well-known/jwks.json` | none | issuer public key |
 //! | `GET /healthz` | none | liveness |
+//! | `GET /metrics` | none | Prometheus metrics, on `[metrics] listen` only (separate port) |
+//! | `GET /readyz` | none | readiness: audit store and lease store answer |
 //! | `POST/GET/DELETE /mcp/{server}` | delegation token | MCP proxy |
 //! | `POST /admin/root-token` | admin | dev-only hop-0 mint ([`routes::dev_root`]), mounted only with `[dev] allow_root_mint = true` |
 //! | `POST /admin/leases/{id}/revoke`, `GET /admin/leases/{id}` | admin | leases |
@@ -27,6 +29,7 @@ pub mod config;
 pub mod error;
 pub mod idp;
 pub mod jwks;
+pub mod metrics;
 pub mod routes;
 pub mod state;
 
@@ -69,6 +72,7 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
 
     let api = Router::new()
         .route("/healthz", get(wellknown::healthz))
+        .route("/readyz", get(routes::ops::readyz))
         .route("/.well-known/jwks.json", get(wellknown::jwks))
         .route(
             "/.well-known/authzen-configuration",
@@ -89,19 +93,154 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
         ProxyConfig::new(config.server.listen, upstreams),
         authorizer,
     );
-    api.merge(proxy)
+    api.merge(proxy).layer(axum::middleware::from_fn_with_state(
+        state.metrics.clone(),
+        metrics::track_http,
+    ))
 }
 
-/// Bind `[server] listen` and serve until Ctrl-C.
+/// How long in-flight requests get to finish after a shutdown signal.
+pub const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Bind `[server] listen` and serve until SIGINT or SIGTERM, then drain for [`DRAIN_TIMEOUT`].
 pub async fn serve(config: Config) -> anyhow::Result<()> {
-    let (app, _state) = build(&config)?;
+    let (app, state) = build(&config)?;
     let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
     tracing::info!(addr = %listener.local_addr()?, upstreams = config.upstreams.len(), "onbehalf server listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("shutting down");
-        })
-        .await?;
+    let metrics_task = if config.metrics.enabled {
+        let l = tokio::net::TcpListener::bind(config.metrics.listen).await?;
+        tracing::info!(addr = %l.local_addr()?, "metrics listening (unauthenticated)");
+        let app = metrics::router(state.metrics.clone());
+        Some(tokio::spawn(async move { axum::serve(l, app).await }))
+    } else {
+        None
+    };
+    let res = serve_until(listener, app, shutdown_signal(), DRAIN_TIMEOUT).await;
+    if let Some(t) = metrics_task {
+        t.abort();
+    }
+    res
+}
+
+/// Serve `app` on `listener` until `shutdown` resolves, then stop accepting connections and
+/// wait up to `drain` for in-flight requests before giving up on them.
+pub async fn serve_until(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    drain: std::time::Duration,
+) -> anyhow::Result<()> {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        let _ = rx.await;
+    });
+    let mut server = tokio::spawn(async move { server.await });
+    tokio::select! {
+        res = &mut server => return Ok(res??),
+        () = shutdown => {}
+    }
+    tracing::info!(
+        drain_seconds = drain.as_secs_f32(),
+        "shutdown signal received; draining"
+    );
+    let _ = tx.send(());
+    match tokio::time::timeout(drain, &mut server).await {
+        Ok(res) => {
+            res??;
+            tracing::info!("shutdown complete");
+        }
+        Err(_) => {
+            server.abort();
+            tracing::warn!("drain timeout elapsed; closing remaining connections");
+        }
+    }
     Ok(())
+}
+
+/// Resolves on SIGINT (Ctrl-C) or, on Unix, SIGTERM (what `docker stop` and Kubernetes send).
+pub async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => tracing::info!("received SIGINT"),
+                    _ = term.recv() => tracing::info!("received SIGTERM"),
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot install SIGTERM handler; SIGINT only");
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    async fn slow() -> &'static str {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        "done"
+    }
+
+    async fn forever() -> &'static str {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        "never"
+    }
+
+    async fn start(
+        drain: Duration,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let app = Router::new()
+            .route("/slow", get(slow))
+            .route("/forever", get(forever));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(serve_until(
+            listener,
+            app,
+            async move {
+                let _ = rx.await;
+            },
+            drain,
+        ));
+        (base, tx, task)
+    }
+
+    #[tokio::test]
+    async fn in_flight_request_finishes_during_drain() {
+        let (base, stop, task) = start(Duration::from_secs(5)).await;
+        let url = format!("{base}/slow");
+        let req = tokio::spawn(async move { reqwest::get(url).await.unwrap().text().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stop.send(()).unwrap();
+        assert_eq!(req.await.unwrap().unwrap(), "done");
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stuck_request_is_cut_off_after_drain_timeout() {
+        let (base, stop, task) = start(Duration::from_millis(300)).await;
+        let url = format!("{base}/forever");
+        let req = tokio::spawn(async move { reqwest::get(url).await.map(|_| ()) });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let t = Instant::now();
+        stop.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        assert!(t.elapsed() < Duration::from_secs(5));
+        req.abort();
+    }
 }

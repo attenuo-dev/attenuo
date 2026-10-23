@@ -13,6 +13,7 @@ use time::{Duration, OffsetDateTime};
 use crate::authz::Pipeline;
 use crate::config::{AgentConfig, Config, RootGrant};
 use crate::idp::IdpRegistry;
+use crate::metrics::Metrics;
 
 /// Everything the handlers share.
 pub struct AppState {
@@ -36,6 +37,7 @@ pub struct AppState {
     pub lease_interval: Duration,
     /// Precomputed `/.well-known/jwks.json` body.
     pub jwks: Value,
+    pub metrics: Arc<Metrics>,
 }
 
 impl AppState {
@@ -43,13 +45,16 @@ impl AppState {
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
         let issuer = load_issuer(config)?;
         let verifier = issuer.verifier();
-        let jwks = crate::jwks::jwks_from_public_pem(&issuer.public_key_pem())?;
+        let jwks = crate::jwks::jwks_from_keys(&issuer.trusted_public_keys())?;
 
         let engine = build_engine(config)?;
         let policy = Arc::new(RwLock::new(engine));
 
         let (audit, leases) = open_storage(&config.audit.sqlite_path)?;
-        let pipeline = Arc::new(Pipeline::new(policy, leases.clone(), audit.clone()));
+        let metrics = Metrics::new();
+        let pipeline = Arc::new(
+            Pipeline::new(policy, leases.clone(), audit.clone()).with_metrics(metrics.clone()),
+        );
         let idps = IdpRegistry::from_config(&config.idps, &config.issuer.issuer)?;
         let agents = crate::idp::intake::validate_agents(&config.agents)?;
         if config.dev.allow_root_mint {
@@ -79,6 +84,7 @@ impl AppState {
             public_url: config.server.public_url.clone(),
             lease_interval: lease_interval(config)?,
             jwks,
+            metrics,
         })
     }
 
@@ -118,7 +124,7 @@ fn issuer_config(config: &Config) -> anyhow::Result<IssuerConfig> {
 /// Read the issuer key, or generate it (and write it if a path is configured).
 fn load_issuer(config: &Config) -> anyhow::Result<Issuer> {
     let ic = issuer_config(config)?;
-    let issuer = match &config.issuer.private_key_pem_path {
+    let mut issuer = match &config.issuer.private_key_pem_path {
         Some(path) if path.exists() => {
             let pem = std::fs::read_to_string(path)
                 .with_context(|| format!("reading issuer key {}", path.display()))?;
@@ -139,7 +145,19 @@ fn load_issuer(config: &Config) -> anyhow::Result<Issuer> {
             Issuer::generate(ic)
         }
     };
-    tracing::info!(public_key = %issuer.public_key_pem().trim(), "issuer public key");
+    for path in &config.issuer.previous_key_paths {
+        let pem = std::fs::read_to_string(path)
+            .with_context(|| format!("reading previous issuer key {}", path.display()))?;
+        issuer
+            .trust_previous_key(&pem)
+            .with_context(|| format!("parsing previous issuer key {}", path.display()))?;
+    }
+    tracing::info!(
+        public_key = %issuer.public_key_pem().trim(),
+        kid = %issuer.key_id(),
+        previous_keys = issuer.trusted_public_keys().len() - 1,
+        "issuer public key"
+    );
     Ok(issuer)
 }
 
@@ -163,7 +181,12 @@ fn write_private_key(path: &Path, pem: &str) -> anyhow::Result<()> {
 
 fn build_engine(config: &Config) -> anyhow::Result<PolicyEngine> {
     let catalog = config.policy.load_catalog()?;
-    let builder = PolicyEngineBuilder::new().with_catalog(catalog);
+    let mut builder = PolicyEngineBuilder::new().with_catalog(catalog);
+    let user_attrs = onbehalf_policy::parse_user_attributes(&config.policy.user_attributes)
+        .map_err(|e| anyhow::anyhow!("[policy] {e}"))?;
+    for (name, ty) in user_attrs {
+        builder = builder.with_user_attr(name, ty);
+    }
     let builder = match &config.policy.policies_path {
         Some(path) => builder.with_policies_file(path),
         None => {
@@ -239,6 +262,51 @@ mod tests {
         );
         cfg.issuer.lease_interval_seconds = 0;
         assert!(AppState::from_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn declared_user_attributes_extend_the_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = dir.path().join("p.cedar");
+        std::fs::write(
+            &policy,
+            r#"@id("eng") permit(principal, action, resource)
+               when { context.originating_user.attributes has groups &&
+                      context.originating_user.attributes.groups.contains("eng") &&
+                      context.originating_user.attributes has department &&
+                      context.originating_user.attributes.department == "platform" };"#,
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cfg.policy.policies_path = Some(policy);
+
+        let warnings = |cfg: &Config| {
+            let state = AppState::from_config(cfg).unwrap();
+            let engine = state.pipeline.policy().read().unwrap();
+            engine.validation_warnings().to_vec()
+        };
+        assert!(!warnings(&cfg).is_empty(), "undeclared attributes warn");
+
+        cfg.policy.user_attributes = [
+            ("groups".to_string(), "set<string>".to_string()),
+            ("department".to_string(), "string".to_string()),
+        ]
+        .into();
+        assert!(warnings(&cfg).is_empty());
+        let state = AppState::from_config(&cfg).unwrap();
+        let schema = state
+            .pipeline
+            .policy()
+            .read()
+            .unwrap()
+            .schema_text()
+            .to_string();
+        assert!(schema.contains("\"groups\"?: Set<String>"), "{schema}");
+        assert!(schema.contains("\"department\"?: String"), "{schema}");
+
+        cfg.policy.user_attributes = [("groups".to_string(), "list".to_string())].into();
+        let err = AppState::from_config(&cfg).err().unwrap().to_string();
+        assert!(err.contains("user_attributes.groups"), "{err}");
     }
 
     #[test]

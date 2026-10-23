@@ -94,12 +94,21 @@ pub fn verify_with_jwks(
 ) -> Result<VerifiedToken> {
     let pem = pem_from_jwks(jwks, decoded.header["kid"].as_str())?;
     let max_depth = decoded.claims.chain.hops.len().max(1);
-    let verifier = Verifier::from_public_pem(
+    let mut verifier = Verifier::from_public_pem(
         issuer.unwrap_or(&decoded.claims.iss),
         audience.unwrap_or(&decoded.claims.aud),
         max_depth.max(onbehalf_core::chain::DEFAULT_MAX_DEPTH),
         &pem,
     )?;
+    // During a key rotation the originating-user signature may come from a retired key that
+    // the JWKS still lists, so trust every key it publishes.
+    for other in jwks["keys"].as_array().into_iter().flatten() {
+        if let Some(k) = other["kid"].as_str() {
+            if let Ok(extra) = pem_from_jwks(jwks, Some(k)) {
+                verifier = verifier.with_public_pem(&extra)?;
+            }
+        }
+    }
     Ok(verifier.verify(token, now)?)
 }
 
@@ -124,7 +133,7 @@ mod tests {
         let pem = issuer.public_key_pem();
         let b64: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
         let der = STANDARD.decode(b64).unwrap();
-        json!({"keys": [{"kty": "OKP", "crv": "Ed25519", "kid": "k1",
+        json!({"keys": [{"kty": "OKP", "crv": "Ed25519", "kid": issuer.key_id(),
                          "x": URL_SAFE_NO_PAD.encode(&der[12..])}]})
     }
 
@@ -201,8 +210,9 @@ mod tests {
 
     #[test]
     fn jwks_selection() {
-        let j = jwks_for(&issuer());
-        assert!(pem_from_jwks(&j, Some("k1")).is_ok());
+        let i = issuer();
+        let j = jwks_for(&i);
+        assert!(pem_from_jwks(&j, Some(&i.key_id())).is_ok());
         assert!(pem_from_jwks(&j, Some("zzz")).is_err());
         assert!(pem_from_jwks(&json!({"keys": []}), None).is_err());
         assert!(pem_from_jwks(&json!({}), None).is_err());
