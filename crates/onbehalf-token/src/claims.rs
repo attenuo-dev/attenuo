@@ -240,6 +240,11 @@ pub fn ou_sig_payload(iss: &str, user: &OriginatingUser, root: &Hop) -> Vec<u8> 
 
 /// The exact bytes an `ou_sig` v2 signature is made over: [`ou_sig_payload`] framed under
 /// [`OU_SIG_CONTEXT`].
+///
+/// # Panics
+///
+/// If `user` or `root` holds a time RFC 3339 cannot write (a year outside 0..=9999). A chain
+/// decoded from JSON never does; [`crate::Issuer::issue_root`] refuses such a chain first.
 pub fn ou_sig_message(iss: &str, user: &OriginatingUser, root: &Hop) -> Vec<u8> {
     crate::detached::frame(OU_SIG_CONTEXT, &ou_sig_payload(iss, user, root))
 }

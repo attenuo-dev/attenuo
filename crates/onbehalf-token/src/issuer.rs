@@ -239,6 +239,12 @@ impl Issuer {
             options.ttl(ttl, self.config.default_ttl, now)?,
             lease.clone(),
         )?;
+        // RFC 3339 has no form for a year outside 0..=9999, which `OffsetDateTime` can hold
+        // (an IdP's `auth_time` of -1e11 is year -1200). The `ou_sig` encoding would panic on
+        // such a chain (found by the `ou_sig` fuzz target), so refuse it here.
+        serde_json::to_vec(&chain).map_err(|e| {
+            TokenError::Malformed(format!("chain has no JSON form (time out of range?): {e}"))
+        })?;
         let ou = OuSig {
             sig: self.key.sign_detached(&ou_sig_message(
                 &self.config.issuer,
