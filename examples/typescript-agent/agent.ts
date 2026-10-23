@@ -86,7 +86,8 @@ async function run(server = SERVER, adminToken = ADMIN_TOKEN): Promise<number> {
     root,
     CODER_AGENT,
     [capability("github", "read_file", { repo: prefix("alice/public-") })],
-    { ttlSeconds: 600 },
+    // The coder's [[agents]] secret: every hop n+1 exchange authenticates as its actor.
+    { ttlSeconds: 600, clientSecret: process.env.ONBEHALF_CLIENT_SECRET ?? "demo-coder-secret" },
   );
   console.log(`  chain: ${coderToken.agents.join(" > ")}  lease: ${coderToken.lease}`);
 

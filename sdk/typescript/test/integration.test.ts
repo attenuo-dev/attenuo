@@ -36,6 +36,10 @@ import {
   VerificationError,
 } from "../src/index.js";
 
+// [[agents]] secrets in the demo config: an exchange authenticates as its actor.
+const CODER_SECRET = "demo-coder-secret";
+const TESTER_SECRET = "demo-tester-secret";
+
 const enabled = process.env.ONBEHALF_INTEGRATION === "1";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const DEMO = join(ROOT, "examples", "github-leak-demo");
@@ -156,6 +160,7 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
     // 2. The assistant hands its coder read_file and nothing else.
     const coder = await ob.exchange(root, "coder", [capability("github", "read_file")], {
       ttlSeconds: 600,
+      clientSecret: CODER_SECRET,
     });
     expect(coder.agents).toEqual(["assistant", "coder"]);
     expect(coder.capabilities).toEqual([{ server: "github", tool: "read_file" }]);
@@ -214,13 +219,18 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
 
     // 9. Attenuation is monotonic: the coder cannot widen, and a prefix constraint binds.
     const widen = await ob
-      .exchange(coder, "tester", [capability("github", "create_issue")])
+      .exchange(coder, "tester", [capability("github", "create_issue")], {
+        clientSecret: TESTER_SECRET,
+      })
       .catch((e: unknown) => e);
     expect(widen).toBeInstanceOf(ApiError);
     expect(widen).toMatchObject({ status: 400, error: "invalid_scope" });
-    const tester = await ob.exchange(coder, "tester", [
-      capability("github", "read_file", { repo: prefix("alice/public-d") }),
-    ]);
+    const tester = await ob.exchange(
+      coder,
+      "tester",
+      [capability("github", "read_file", { repo: prefix("alice/public-d") })],
+      { clientSecret: TESTER_SECRET },
+    );
     expect(tester.chain.hops).toHaveLength(3);
     expect(
       (await ob.callTool(tester, "github", "read_file", { repo: "alice/public-docs" })).decisionId,

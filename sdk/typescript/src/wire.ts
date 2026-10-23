@@ -114,10 +114,18 @@ export function asObject(v: unknown, what: string): Json {
 export interface ExchangeOptions {
   /** Requested lifetime of the new token. */
   ttlSeconds?: number;
-  /** Hop 0 only: the registered agent's credentials, with an IdP credential as the subject. */
+  /**
+   * The actor's `[[agents]]` secret. A hop n+1 exchange must authenticate as the actor it
+   * names, so `clientSecret` is required there and `clientId` defaults to `actor`. For hop 0
+   * (an IdP credential as the subject) pass both `clientId` and `clientSecret` of a
+   * registered agent.
+   */
   clientId?: string;
   clientSecret?: string;
-  /** Defaults to the JWT type, or an OIDC ID token when `clientId` is given. */
+  /**
+   * Defaults to the JWT type for a delegation token, or an OIDC ID token when the subject is
+   * not a delegation token and client credentials are given.
+   */
   subjectTokenType?: string;
 }
 
@@ -127,10 +135,14 @@ export function exchangeBody(
   capabilities: CapabilityLike | readonly CapabilityLike[],
   opts: ExchangeOptions,
 ): Json {
-  const intake = opts.clientId !== undefined || opts.clientSecret !== undefined;
-  if (intake && !(opts.clientId && opts.clientSecret)) {
+  if (opts.clientId !== undefined && !opts.clientSecret) {
     throw new TypeError("clientId and clientSecret go together");
   }
+  // A hop n+1 exchange authenticates as its actor.
+  const clientId = opts.clientSecret && opts.clientId === undefined ? actor : opts.clientId;
+  // Client credentials alone do not make this hop 0: the server also requires them, as the
+  // actor's, on a hop n+1 exchange. Hop 0 is an IdP credential, not a delegation token.
+  const intake = Boolean(opts.clientSecret) && !isDelegationToken(subjectToken);
   const body: Json = {
     grant_type: TOKEN_EXCHANGE_GRANT,
     subject_token: bearer(subjectToken),
@@ -141,11 +153,22 @@ export function exchangeBody(
     ],
   };
   if (opts.ttlSeconds !== undefined) body.requested_ttl_seconds = Math.trunc(opts.ttlSeconds);
-  if (intake) {
-    body.client_id = opts.clientId;
+  if (opts.clientSecret) {
+    body.client_id = clientId;
     body.client_secret = opts.clientSecret;
   }
   return body;
+}
+
+/** Does `token` decode as an onbehalf delegation token? Nothing is verified. */
+export function isDelegationToken(token: Token | string): boolean {
+  if (typeof token !== "string") return true;
+  try {
+    decodeToken(token);
+  } catch {
+    return false;
+  }
+  return true;
 }
 
 export function tokenFromResponse(body: unknown): Token {

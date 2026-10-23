@@ -100,6 +100,20 @@ describe("exchange", () => {
     );
   });
 
+  it("authenticates a hop n+1 exchange as its actor", async () => {
+    const { fetch, calls } = mockFetch(() => jsonResponse(tokenResponse(rootJwt)));
+    const ob = new OnbehalfClient(URL_, { fetch });
+    await ob.exchange(rootJwt, "coder", "github:read_file", { clientSecret: "coder-secret" });
+    const body = calls[0]!.body as Record<string, unknown>;
+    // A delegation token stays a JWT exchange; the credentials name the actor.
+    expect(body).toMatchObject({
+      subject_token_type: "urn:ietf:params:oauth:token-type:jwt",
+      actor: "coder",
+      client_id: "coder",
+      client_secret: "coder-secret",
+    });
+  });
+
   it("requires clientId and clientSecret together", async () => {
     const ob = new OnbehalfClient(URL_, { fetch: mockFetch(() => jsonResponse({})).fetch });
     await expect(ob.exchange("t", "a", "g:t", { clientId: "c" })).rejects.toThrow(TypeError);

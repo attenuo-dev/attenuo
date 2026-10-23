@@ -28,9 +28,13 @@ const ob = new OnbehalfClient(SERVER);
 const root = await admin.mintRootDev("alice", "https://idp.example", PLANNER_AGENT, {
   capabilities: "github:*",
 });
-const token = await ob.exchange(root, "coder", [
-  capability("github", "read_file", { repo: prefix("alice/public-") }),
-]);
+const token = await ob.exchange(
+  root,
+  "coder",
+  [capability("github", "read_file", { repo: prefix("alice/public-") })],
+  // The coder's [[agents]] secret: every hop n+1 exchange authenticates as its actor.
+  { clientSecret: process.env.ONBEHALF_CLIENT_SECRET ?? "demo-coder-secret" },
+);
 
 const transport = new StreamableHTTPClientTransport(new URL(mcpUrl(SERVER, "github")), {
   // Sent on every request the transport makes (initialize, tools/*, the session GET and DELETE).
