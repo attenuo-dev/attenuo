@@ -24,6 +24,8 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 
 ## Next
 
+- [ ] Flaky Rust test: `security_low::a_newline_in_a_tool_name_stays_on_one_log_line` failed once in a full workspace run on 2026-10-23 (~10:10 UTC, unrelated docs-only branch) and passed on 4 reruns. Capture output on the next failure (`--nocapture`), likely a log-line interleaving assumption under parallel tests.
+
 - [ ] Python SDK: one intermittent test failure seen once during full verification on 2026-10-23 ~09:58 UTC (name not captured). Not reproduced in 62 runs under load (parallel suites, `taskset -c 0`, CPU burners; refresh tests at 13 fractional-second clock offsets). Hardened the integration fixture (port reservation, monotonic deadlines) and `-rf` is now in the documented invocation. Keep `-rf` in the next verifications; close when a failure is named or after a clean week.
 
 - [ ] Token claims: proposed extensions from RFC-0001 section 3.1: `evidence` on the originating user (how the IdP credential was verified), a stable `chain_id`, numeric and time-range constraints. Reconcile or drop each. (`may_act` and a verified `actor_token` are done.)
