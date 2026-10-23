@@ -1621,7 +1621,9 @@ dependencies = [
 name = "onbehalf-audit"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "onbehalf-core",
+ "onbehalf-token",
  "rusqlite",
  "serde",
  "serde_json",

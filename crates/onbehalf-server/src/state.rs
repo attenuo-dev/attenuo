@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
-use onbehalf_audit::{SqliteAudit, SqliteLeaseStore};
+use onbehalf_audit::{CheckpointKeys, SqliteAudit, SqliteLeaseStore};
 use onbehalf_policy::{PolicyEngine, PolicyEngineBuilder};
 use onbehalf_token::{Issuer, IssuerConfig, Verifier};
 use serde_json::Value;
@@ -21,6 +21,10 @@ pub struct AppState {
     pub verifier: Verifier,
     pub pipeline: Arc<Pipeline>,
     pub audit: Arc<SqliteAudit>,
+    /// Public keys that may have signed audit checkpoints (the JWKS: current plus retired).
+    pub checkpoint_keys: CheckpointKeys,
+    /// `[audit] checkpoint_interval_seconds`; zero means no timer.
+    pub checkpoint_interval: std::time::Duration,
     pub leases: Arc<SqliteLeaseStore>,
     /// Policy file to re-read on reload; `None` when no policy file is configured.
     pub policies_path: Option<PathBuf>,
@@ -65,7 +69,8 @@ impl AppState {
         let engine = build_engine(config)?;
         let policy = Arc::new(RwLock::new(engine));
 
-        let (audit, leases) = open_storage(&config.audit.sqlite_path)?;
+        let checkpoint_keys = CheckpointKeys::from_jwks(&jwks)?;
+        let (audit, leases) = open_storage(&config.audit, issuer.detached_signer())?;
         let metrics = Metrics::new();
         let pipeline = Arc::new(
             Pipeline::new(policy, leases.clone(), audit.clone()).with_metrics(metrics.clone()),
@@ -113,6 +118,10 @@ impl AppState {
             verifier,
             pipeline,
             audit,
+            checkpoint_keys,
+            checkpoint_interval: std::time::Duration::from_secs(
+                config.audit.checkpoint_interval_seconds,
+            ),
             leases,
             policies_path: config.policy.policies_path.clone(),
             admin_token: config.admin.token.clone(),
@@ -279,11 +288,17 @@ fn build_engine(config: &Config) -> anyhow::Result<PolicyEngine> {
     Ok(engine)
 }
 
-fn open_storage(path: &str) -> anyhow::Result<(Arc<SqliteAudit>, Arc<SqliteLeaseStore>)> {
+fn open_storage(
+    cfg: &crate::config::AuditSection,
+    signer: onbehalf_token::DetachedSigner,
+) -> anyhow::Result<(Arc<SqliteAudit>, Arc<SqliteLeaseStore>)> {
+    let path = cfg.sqlite_path.as_str();
     if path == ":memory:" {
         tracing::warn!("audit.sqlite_path is :memory:; the audit log is lost on exit");
         return Ok((
-            Arc::new(SqliteAudit::open_in_memory()?),
+            Arc::new(
+                SqliteAudit::open_in_memory()?.with_checkpointing(signer, cfg.checkpoint_every),
+            ),
             Arc::new(SqliteLeaseStore::open_in_memory()?),
         ));
     }
@@ -291,7 +306,9 @@ fn open_storage(path: &str) -> anyhow::Result<(Arc<SqliteAudit>, Arc<SqliteLease
     if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let audit = SqliteAudit::open(p).with_context(|| format!("opening audit log {path}"))?;
+    let audit = SqliteAudit::open(p)
+        .with_context(|| format!("opening audit log {path}"))?
+        .with_checkpointing(signer, cfg.checkpoint_every);
     let leases =
         SqliteLeaseStore::open(p).with_context(|| format!("opening lease store {path}"))?;
     Ok((Arc::new(audit), Arc::new(leases)))

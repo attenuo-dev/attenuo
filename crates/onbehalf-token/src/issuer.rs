@@ -1,10 +1,13 @@
 //! Minting root tokens and performing RFC 8693 exchanges.
 
+use std::sync::Arc;
+
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use onbehalf_core::{AgentId, CapabilitySet, DelegationChain, LeaseId, OriginatingUser};
 use time::{Duration, OffsetDateTime};
 
 use crate::claims::{canonical_user_bytes, ActClaim, Claims, TOKEN_TYPE};
+use crate::detached::DetachedSigner;
 use crate::error::TokenError;
 use crate::keys::{PublicKey, SigningKey};
 use crate::verifier::Verifier;
@@ -42,7 +45,7 @@ pub struct IssuedToken {
 /// or `DelegationChain::extend` from `onbehalf-core`, so attenuation and expiry monotonicity are
 /// enforced by the same code that verifiers run.
 pub struct Issuer {
-    key: SigningKey,
+    key: Arc<SigningKey>,
     /// Retired public keys that still verify (rotation overlap); never used to sign.
     previous: Vec<PublicKey>,
     encoding_key: EncodingKey,
@@ -77,7 +80,7 @@ impl Issuer {
     fn with_key(config: IssuerConfig, key: SigningKey) -> Self {
         let encoding_key = EncodingKey::from_ed_der(key.pkcs8_der());
         Self {
-            key,
+            key: Arc::new(key),
             previous: Vec::new(),
             encoding_key,
             config,
@@ -112,6 +115,12 @@ impl Issuer {
             .chain(self.previous.iter().cloned())
             .map(|k| (k.kid(), k.to_pem()))
             .collect()
+    }
+
+    /// A cloneable handle that signs non-token payloads (audit checkpoints) with the current
+    /// key, domain-separated by a context string. See [`crate::detached`].
+    pub fn detached_signer(&self) -> DetachedSigner {
+        DetachedSigner::new(Arc::clone(&self.key))
     }
 
     /// The configuration this issuer was built with.

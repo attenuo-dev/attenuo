@@ -13,12 +13,17 @@
 //!
 //! Nothing here evaluates policy; the sibling crates call into this one after deciding.
 
+pub mod checkpoint;
 pub mod error;
 pub mod lease;
 pub mod log;
 pub mod memory;
 pub mod sqlite;
 
+pub use checkpoint::{
+    verify_with_checkpoints, BadCheckpoint, Checkpoint, CheckpointKeys, SignedVerifyReport, Start,
+    CHECKPOINT_CONTEXT,
+};
 pub use error::AuditError;
 pub use lease::{LeaseStatus, LeaseStore, MemoryLeaseStore};
 pub use log::{

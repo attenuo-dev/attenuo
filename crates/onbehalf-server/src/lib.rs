@@ -103,6 +103,33 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
     ))
 }
 
+/// Start the `[audit] checkpoint_interval_seconds` timer: every `period`, sign the head if
+/// entries were appended since the newest checkpoint. (The `checkpoint_every` count trigger
+/// runs inside the append itself.) Dropping the handle does not stop it; abort it to stop.
+pub fn spawn_checkpointer(
+    state: Arc<AppState>,
+    period: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await; // the first tick is immediate
+        loop {
+            tick.tick().await;
+            let result = state
+                .blocking(|s| s.audit.checkpoint_if_new(time::OffsetDateTime::now_utc()))
+                .await;
+            match result {
+                Ok(Some(cp)) => {
+                    tracing::info!(seq = cp.seq, kid = %cp.kid, "audit checkpoint signed")
+                }
+                Ok(None) => {}
+                Err(e) => tracing::error!(error = %e, "signing an audit checkpoint failed"),
+            }
+        }
+    })
+}
+
 /// How long in-flight requests get to finish after a shutdown signal.
 pub const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -111,6 +138,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let (app, state) = build(&config)?;
     let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
     tracing::info!(addr = %listener.local_addr()?, upstreams = config.upstreams.len(), "onbehalf server listening");
+    let checkpoint_task = (!state.checkpoint_interval.is_zero())
+        .then(|| spawn_checkpointer(state.clone(), state.checkpoint_interval));
     let metrics_task = if config.metrics.enabled {
         let l = tokio::net::TcpListener::bind(config.metrics.listen).await?;
         tracing::info!(addr = %l.local_addr()?, "metrics listening (unauthenticated)");
@@ -121,6 +150,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     };
     let res = serve_until(listener, app, shutdown_signal(), DRAIN_TIMEOUT).await;
     if let Some(t) = metrics_task {
+        t.abort();
+    }
+    if let Some(t) = checkpoint_task {
         t.abort();
     }
     res

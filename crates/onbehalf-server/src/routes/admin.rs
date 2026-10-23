@@ -9,7 +9,7 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use onbehalf_audit::{AuditEntry, AuditSink, LeaseStore, VerifyReport};
+use onbehalf_audit::{AuditEntry, AuditSink, LeaseStore, SignedVerifyReport};
 use onbehalf_core::LeaseId;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -169,17 +169,28 @@ pub async fn audit_range(
     Ok(Json(json!({ "entries": entries, "next": next })))
 }
 
-/// `GET /admin/audit/verify`: walk the whole chain.
+/// `GET /admin/audit/verify`: walk the whole chain and verify every stored checkpoint
+/// signature against the JWKS keys. Besides `entries`, `ok` and `first_bad_seq` the report has
+/// `checkpoints`, `last_signed_seq`, `unsigned_tail` and `bad_checkpoints`.
 pub async fn audit_verify(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<VerifyReport>, ApiError> {
-    Ok(Json(state.blocking(|s| s.audit.verify_chain()).await?))
+) -> Result<Json<SignedVerifyReport>, ApiError> {
+    Ok(Json(
+        state
+            .blocking(|s| s.audit.verify_chain_signed(&s.checkpoint_keys))
+            .await?,
+    ))
 }
 
-/// `GET /admin/audit/checkpoint`: `{seq, hash}` of the head, for external countersigning.
+/// `GET /admin/audit/checkpoint`: the signed checkpoint of the current head,
+/// `{seq, head_hash, at, kid, signature}`. Created now if the head has none yet, so the answer
+/// can be kept off-host and checked later with only the JWKS. `hash` repeats `head_hash` for
+/// clients written against the unsigned v0 response.
 pub async fn audit_checkpoint(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
-    let (seq, hash) = state.blocking(|s| s.audit.checkpoint()).await?;
-    Ok(Json(json!({ "seq": seq, "hash": hash })))
+    let cp = state.blocking(|s| s.audit.checkpoint_signed(now())).await?;
+    let mut v = serde_json::to_value(&cp).map_err(ApiError::internal)?;
+    v["hash"] = Value::String(cp.head_hash.clone());
+    Ok(Json(v))
 }
 
 /// `POST /admin/policies/reload`: re-read `policy.policies_path` and swap the policy set if it

@@ -179,13 +179,10 @@ async fn run(cli: Cli) -> Result<Outcome> {
             let ok = resp["ok"] == true;
             if json {
                 print_json(&resp);
-            } else if ok {
-                println!("audit chain OK: {} entries verified", resp["entries"]);
             } else {
-                println!(
-                    "audit chain BROKEN at seq {} ({} entries examined)",
-                    resp["first_bad_seq"], resp["entries"]
-                );
+                for line in verify_lines(&resp) {
+                    println!("{line}");
+                }
             }
             Ok(if ok { Outcome::Ok } else { Outcome::No })
         }
@@ -407,6 +404,41 @@ fn print_tools(resp: &Value, json: bool) -> Outcome {
     Outcome::Ok
 }
 
+/// Human-readable lines for a `/admin/audit/verify` report: the chain verdict, then the
+/// checkpoint status (how many, the last signed seq, how many entries are not yet covered, and
+/// any checkpoint that failed).
+fn verify_lines(resp: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if resp["first_bad_seq"].is_null() {
+        out.push(format!(
+            "audit chain OK: {} entries verified",
+            resp["entries"]
+        ));
+    } else {
+        out.push(format!(
+            "audit chain BROKEN at seq {} ({} entries examined)",
+            resp["first_bad_seq"], resp["entries"]
+        ));
+    }
+    let n = resp["checkpoints"].as_u64().unwrap_or(0);
+    match resp["last_signed_seq"].as_u64() {
+        Some(seq) => out.push(format!(
+            "checkpoints: {n} signed, last at seq {seq} ({} entries after it are not yet signed)",
+            resp["unsigned_tail"]
+        )),
+        None if n == 0 => out.push("checkpoints: none signed yet".to_string()),
+        None => out.push(format!("checkpoints: {n} found, none verified")),
+    }
+    for bad in resp["bad_checkpoints"].as_array().into_iter().flatten() {
+        out.push(format!(
+            "checkpoint at seq {} INVALID: {}",
+            bad["seq"],
+            bad["reason"].as_str().unwrap_or("unknown")
+        ));
+    }
+    out
+}
+
 /// One line per audit entry.
 fn fmt_audit_entry(e: &Value) -> String {
     let r = &e["record"];
@@ -479,6 +511,30 @@ async fn audit_tail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_output_reports_checkpoint_status() {
+        let ok = json!({"entries": 12, "ok": true, "first_bad_seq": null, "checkpoints": 2,
+                        "last_signed_seq": 10, "unsigned_tail": 2, "bad_checkpoints": []});
+        let lines = verify_lines(&ok);
+        assert_eq!(lines[0], "audit chain OK: 12 entries verified");
+        assert!(lines[1].contains("2 signed, last at seq 10"), "{lines:?}");
+        assert!(lines[1].contains("2 entries after it"), "{lines:?}");
+
+        let none = json!({"entries": 3, "ok": true, "first_bad_seq": null, "checkpoints": 0,
+                          "last_signed_seq": null, "unsigned_tail": 3, "bad_checkpoints": []});
+        assert_eq!(verify_lines(&none)[1], "checkpoints: none signed yet");
+
+        let bad = json!({"entries": 8, "ok": false, "first_bad_seq": null, "checkpoints": 1,
+                         "last_signed_seq": null, "unsigned_tail": 8,
+                         "bad_checkpoints": [{"seq": 5, "reason": "signature does not verify"}]});
+        let lines = verify_lines(&bad);
+        assert_eq!(lines[1], "checkpoints: 1 found, none verified");
+        assert_eq!(
+            lines[2],
+            "checkpoint at seq 5 INVALID: signature does not verify"
+        );
+    }
 
     #[test]
     fn audit_line_names_decision_tool_chain_and_id() {

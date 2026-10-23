@@ -1658,3 +1658,121 @@ async fn authzen_default_max_batch_is_64() {
         .unwrap()
         .ends_with("/access/v1/evaluations"));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Signed audit checkpoints.
+// ---------------------------------------------------------------------------------------------
+
+async fn jwks_keys(h: &Harness) -> onbehalf_audit::CheckpointKeys {
+    let jwks: Value = h
+        .client
+        .get(h.url("/.well-known/jwks.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    onbehalf_audit::CheckpointKeys::from_jwks(&jwks).unwrap()
+}
+
+#[tokio::test]
+async fn checkpoint_endpoint_returns_a_signed_checkpoint_verifiable_with_the_jwks() {
+    let h = Harness::start().await;
+    let alice = h.mint_root("alice", "planner", &["github:*"]).await;
+    h.call(&alice.token, "read_file", json!({"repo": "alice/public-a"}))
+        .await;
+
+    let v = h.admin_get("/admin/audit/checkpoint").await;
+    let cp: onbehalf_audit::Checkpoint = serde_json::from_value(v.clone()).unwrap();
+    assert_eq!(cp.seq, 3);
+    assert_eq!(v["hash"], v["head_hash"], "legacy alias");
+    jwks_keys(&h).await.verify(&cp).unwrap();
+    let head = h.audit_entries().await.pop().unwrap();
+    assert_eq!(cp.head_hash, head["entry_hash"].as_str().unwrap());
+    // Same head, same checkpoint.
+    assert_eq!(h.admin_get("/admin/audit/checkpoint").await, v);
+
+    let report = h.admin_get("/admin/audit/verify").await;
+    assert_eq!(report["ok"], true, "{report}");
+    assert_eq!(report["checkpoints"], 1);
+    assert_eq!(report["last_signed_seq"], 3);
+    assert_eq!(report["unsigned_tail"], 0);
+
+    // A forged checkpoint row (right hash, wrong signature) makes verify fail.
+    let mut forged = cp.clone();
+    forged.seq = 2;
+    forged.head_hash = h.audit_entries().await[1]["entry_hash"]
+        .as_str()
+        .unwrap()
+        .into();
+    assert!(jwks_keys(&h).await.verify(&forged).is_err());
+}
+
+#[tokio::test]
+async fn checkpoints_are_written_automatically_every_n_entries() {
+    let h = Harness::start_tweaked(true, |cfg| cfg.audit.checkpoint_every = 3).await;
+    let alice = h.mint_root("alice", "planner", &["github:*"]).await; // entries 1, 2
+    for i in 0..5 {
+        h.call(
+            &alice.token,
+            "read_file",
+            json!({"repo": format!("alice/public-{i}")}),
+        )
+        .await;
+    }
+    // 7 entries so far: checkpoints at 3 and 6, tail of 1.
+    let report = h.admin_get("/admin/audit/verify").await;
+    assert_eq!(report["ok"], true, "{report}");
+    assert_eq!(report["entries"], 7);
+    assert_eq!(report["checkpoints"], 2);
+    assert_eq!(report["last_signed_seq"], 6);
+    assert_eq!(report["unsigned_tail"], 1);
+}
+
+#[tokio::test]
+async fn checkpoint_timer_signs_the_tail_of_a_quiet_log() {
+    let h = Harness::start_tweaked(false, |cfg| cfg.audit.checkpoint_every = 1000).await;
+    let alice = h.mint_root("alice", "planner", &["github:*"]).await;
+    h.call(&alice.token, "read_file", json!({"repo": "alice/public-a"}))
+        .await;
+    assert_eq!(h.admin_get("/admin/audit/verify").await["checkpoints"], 0);
+
+    let timer =
+        onbehalf_server::spawn_checkpointer(h.state.clone(), std::time::Duration::from_millis(40));
+    let mut signed = Value::Null;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let report = h.admin_get("/admin/audit/verify").await;
+        if report["last_signed_seq"] == 3 {
+            signed = report;
+            break;
+        }
+    }
+    timer.abort();
+    assert_eq!(signed["ok"], true, "{signed}");
+    assert_eq!(signed["checkpoints"], 1);
+    assert_eq!(signed["unsigned_tail"], 0);
+}
+
+#[tokio::test]
+async fn tampering_after_a_signed_checkpoint_is_reported_with_the_last_signed_seq() {
+    let h = Harness::start_tweaked(true, |cfg| cfg.audit.checkpoint_every = 3).await;
+    let alice = h.mint_root("alice", "planner", &["github:*"]).await;
+    for i in 0..4 {
+        h.call(
+            &alice.token,
+            "read_file",
+            json!({"repo": format!("alice/public-{i}")}),
+        )
+        .await;
+    }
+    let conn = rusqlite::Connection::open(h.db_path.as_ref().unwrap()).unwrap();
+    conn.execute("UPDATE audit SET reason = 'edited' WHERE seq = 5", [])
+        .unwrap();
+    drop(conn);
+    let report = h.admin_get("/admin/audit/verify").await;
+    assert_eq!(report["ok"], false);
+    assert_eq!(report["first_bad_seq"], 5);
+    assert_eq!(report["last_signed_seq"], 3);
+}

@@ -7,7 +7,7 @@
 //! `entry_hash` and the primary key on `seq` make a fork fail rather than succeed.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use onbehalf_core::{DecisionRecord, LeaseId};
@@ -15,6 +15,9 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use crate::checkpoint::{
+    verify_with_checkpoints, Checkpoint, CheckpointKeys, SignedVerifyReport, Start,
+};
 use crate::error::AuditError;
 use crate::lease::{classify, LeaseRow, LeaseStatus, LeaseStore};
 use crate::log::{verify_entries, AuditEntry, AuditSink, VerifyReport, GENESIS_HASH};
@@ -42,6 +45,16 @@ CREATE TABLE IF NOT EXISTS audit (
 CREATE INDEX IF NOT EXISTS audit_subject_idx ON audit(originating_subject);
 CREATE INDEX IF NOT EXISTS audit_chain_idx   ON audit(chain_digest);
 CREATE INDEX IF NOT EXISTS audit_at_idx      ON audit(at);
+"#;
+
+const CHECKPOINT_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS checkpoints (
+    seq       INTEGER PRIMARY KEY,
+    head_hash TEXT NOT NULL,
+    at        TEXT NOT NULL,
+    kid       TEXT NOT NULL,
+    signature TEXT NOT NULL
+);
 "#;
 
 const LEASE_SCHEMA: &str = r#"
@@ -190,10 +203,57 @@ fn query_entries(
     rows.map(|r| r?).collect()
 }
 
+fn checkpoint_from_row(row: &Row<'_>) -> rusqlite::Result<Checkpoint> {
+    let seq: i64 = row.get(0)?;
+    Ok(Checkpoint {
+        seq: seq.max(0) as u64,
+        head_hash: row.get(1)?,
+        at: row.get(2)?,
+        kid: row.get(3)?,
+        signature: row.get(4)?,
+    })
+}
+
+fn insert_checkpoint(conn: &Connection, cp: &Checkpoint) -> Result<(), AuditError> {
+    conn.execute(
+        "INSERT INTO checkpoints (seq, head_hash, at, kid, signature) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![cp.seq as i64, cp.head_hash, cp.at, cp.kid, cp.signature],
+    )?;
+    Ok(())
+}
+
+fn checkpoint_at(conn: &Connection, seq: u64) -> Result<Option<Checkpoint>, AuditError> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT seq, head_hash, at, kid, signature FROM checkpoints WHERE seq = ?1",
+        )?
+        .query_row([seq as i64], checkpoint_from_row)
+        .optional()?)
+}
+
+type CheckpointHook = Arc<dyn Fn(&Checkpoint) + Send + Sync>;
+
+/// Automatic checkpointing: sign the head every `every` entries, inside the append's
+/// transaction, so a checkpoint can never refer to a head that was not committed.
+struct Checkpointing {
+    signer: onbehalf_token::DetachedSigner,
+    every: u64,
+    on_created: Option<CheckpointHook>,
+}
+
 /// Hash-chained audit log in SQLite.
-#[derive(Debug)]
 pub struct SqliteAudit {
     conn: Mutex<Connection>,
+    checkpointing: Option<Checkpointing>,
+}
+
+impl std::fmt::Debug for SqliteAudit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqliteAudit")
+            .field("checkpointing", &self.checkpointing.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SqliteAudit {
@@ -209,9 +269,139 @@ impl SqliteAudit {
     /// Wrap an existing connection, creating the schema if needed.
     pub fn from_connection(conn: Connection) -> Result<Self, AuditError> {
         conn.execute_batch(AUDIT_SCHEMA)?;
+        conn.execute_batch(CHECKPOINT_SCHEMA)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            checkpointing: None,
         })
+    }
+
+    /// Sign checkpoints with `signer`: one every `every` appended entries (0 turns the
+    /// automatic ones off), plus whatever [`checkpoint_signed`](Self::checkpoint_signed) and
+    /// [`checkpoint_if_new`](Self::checkpoint_if_new) are asked for.
+    pub fn with_checkpointing(
+        mut self,
+        signer: onbehalf_token::DetachedSigner,
+        every: u64,
+    ) -> Self {
+        self.checkpointing = Some(Checkpointing {
+            signer,
+            every,
+            on_created: None,
+        });
+        self
+    }
+
+    /// Call `hook` once for every checkpoint this log creates (not for repeat requests that
+    /// return an existing one). For metrics. No effect before
+    /// [`with_checkpointing`](Self::with_checkpointing).
+    pub fn with_checkpoint_hook(
+        mut self,
+        hook: impl Fn(&Checkpoint) + Send + Sync + 'static,
+    ) -> Self {
+        if let Some(c) = self.checkpointing.as_mut() {
+            c.on_created = Some(Arc::new(hook));
+        }
+        self
+    }
+
+    /// The signed checkpoint of the current head, creating it if the head has none yet. Asking
+    /// twice without an append in between returns the same checkpoint.
+    pub fn checkpoint_signed(&self, now: OffsetDateTime) -> Result<Checkpoint, AuditError> {
+        let c = self
+            .checkpointing
+            .as_ref()
+            .ok_or(AuditError::NoCheckpointSigner)?;
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (seq, hash) = match head_in(&tx)? {
+            Some(h) => (h.seq, h.entry_hash),
+            None => (0, GENESIS_HASH.to_string()),
+        };
+        if let Some(existing) = checkpoint_at(&tx, seq)? {
+            if existing.head_hash == hash {
+                return Ok(existing);
+            }
+            // Never sign over a conflict: the log and an earlier checkpoint disagree.
+            return Err(AuditError::Corrupt {
+                seq,
+                detail: "a stored checkpoint disagrees with the log at its seq".into(),
+            });
+        }
+        let cp = Checkpoint::sign(&c.signer, seq, &hash, now)?;
+        insert_checkpoint(&tx, &cp)?;
+        tx.commit()?;
+        if let Some(hook) = &c.on_created {
+            hook(&cp);
+        }
+        Ok(cp)
+    }
+
+    /// Checkpoint the head only if it has advanced past the newest checkpoint; `None` when
+    /// there is nothing new to sign (or the log is empty). The timer behind
+    /// `[audit] checkpoint_interval_seconds` calls this.
+    pub fn checkpoint_if_new(&self, now: OffsetDateTime) -> Result<Option<Checkpoint>, AuditError> {
+        let (head, last) = {
+            let conn = self.conn.lock()?;
+            let head: i64 =
+                conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM audit", [], |r| r.get(0))?;
+            let last: i64 =
+                conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM checkpoints", [], |r| {
+                    r.get(0)
+                })?;
+            (head, last)
+        };
+        if head == 0 || head <= last {
+            return Ok(None);
+        }
+        self.checkpoint_signed(now).map(Some)
+    }
+
+    /// The newest checkpoint, if any.
+    pub fn last_checkpoint(&self) -> Result<Option<Checkpoint>, AuditError> {
+        let conn = self.conn.lock()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT seq, head_hash, at, kid, signature FROM checkpoints \
+             ORDER BY seq DESC LIMIT 1",
+        )?;
+        let cp = stmt.query_row([], checkpoint_from_row).optional()?;
+        Ok(cp)
+    }
+
+    /// Checkpoints with `from <= seq <= to`, ascending.
+    pub fn checkpoints_between(&self, from: u64, to: u64) -> Result<Vec<Checkpoint>, AuditError> {
+        let conn = self.conn.lock()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT seq, head_hash, at, kid, signature FROM checkpoints \
+             WHERE seq >= ?1 AND seq <= ?2 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(
+            [
+                from.min(i64::MAX as u64) as i64,
+                to.min(i64::MAX as u64) as i64,
+            ],
+            checkpoint_from_row,
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Walk the chain and verify every stored checkpoint against `keys`.
+    pub fn verify_chain_signed(
+        &self,
+        keys: &CheckpointKeys,
+    ) -> Result<SignedVerifyReport, AuditError> {
+        let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit ORDER BY seq");
+        let conn = self.conn.lock()?;
+        let checkpoints: Vec<Checkpoint> = {
+            let mut stmt = conn.prepare(
+                "SELECT seq, head_hash, at, kid, signature FROM checkpoints ORDER BY seq",
+            )?;
+            let rows = stmt.query_map([], checkpoint_from_row)?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| Ok(entry_from_row(row)))?;
+        verify_with_checkpoints(rows.map(|r| r?), &checkpoints, keys, Start::Genesis)
     }
 
     /// Run `f` against the underlying connection while holding the write lock.
@@ -313,7 +503,23 @@ impl AuditSink for SqliteAudit {
                 serde_json::to_string(r)?,
             ],
         )?;
+        let mut created = None;
+        if let Some(c) = self.checkpointing.as_ref().filter(|c| c.every > 0) {
+            if entry.seq.is_multiple_of(c.every) {
+                let cp = Checkpoint::sign(&c.signer, entry.seq, &entry.entry_hash, r.at)?;
+                insert_checkpoint(&tx, &cp)?;
+                created = Some(cp);
+            }
+        }
         tx.commit()?;
+        if let (Some(cp), Some(hook)) = (
+            created,
+            self.checkpointing
+                .as_ref()
+                .and_then(|c| c.on_created.as_ref()),
+        ) {
+            hook(&cp);
+        }
         Ok(entry)
     }
 
