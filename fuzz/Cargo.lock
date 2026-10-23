@@ -132,7 +132,7 @@ version = "0.1.0"
 dependencies = [
  "attenuo-core",
  "attenuo-token",
- "base64 0.22.1",
+ "base64 0.23.1",
  "hex",
  "rusqlite",
  "serde",
@@ -169,7 +169,7 @@ dependencies = [
  "attenuo-server",
  "attenuo-token",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "jsonwebtoken",
  "libfuzzer-sys",
  "ring",
@@ -232,7 +232,7 @@ dependencies = [
  "attenuo-proxy",
  "attenuo-token",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "futures-util",
  "hex",
@@ -258,7 +258,7 @@ name = "attenuo-token"
 version = "0.1.0"
 dependencies = [
  "attenuo-core",
- "base64 0.22.1",
+ "base64 0.23.1",
  "jsonwebtoken",
  "ring",
  "serde",
