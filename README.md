@@ -35,6 +35,7 @@ Delegated authorization for software agents. onbehalf lets a principal hand an a
 | `onbehalf-proxy` | Enforcement in front of upstream services |
 | `onbehalf-server` | The standalone server binary |
 | `onbehalf-cli` | The `onbehalf` command line for a running server |
+| `onbehalf-bench` | End-to-end latency and throughput benchmark (`scripts/bench-e2e.sh`, results in `docs/design/bench/`) |
 
 ## Building
 
