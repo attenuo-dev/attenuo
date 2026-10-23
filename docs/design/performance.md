@@ -4,7 +4,7 @@
 - Crates: `attenuo-policy` (`benches/authorize.rs`, `benches/policy_stage.rs`), `attenuo-core` (`benches/attenuation.rs`), `attenuo-server` (`benches/decide.rs`, the decision path by stage), `attenuo-bench` (end to end)
 - Related: [server pipeline](server.md), [ADR-0006](../decisions/0006-lease-based-in-flight-revocation.md)
 
-The first part of this page is criterion 0.5 micro-benchmarks of the two pure functions on the hot path. They do not include token verification, the lease lookup, the audit append or the network hop to the upstream, so they are a lower bound on the latency attenuo adds to a call. The end-to-end figures, measured through the real proxy, are in [End to end: proxy versus direct](#end-to-end-proxy-versus-direct) at the end of the page, followed by [the audit write path and the per-call cost](#after-the-audit-write-path-work) and [the policy stage and WAL checkpoints](#after-the-policy-stage-and-wal-work), which say what changed and by how much.
+The first part of this page is criterion micro-benchmarks of the two pure functions on the hot path. They do not include token verification, the lease lookup, the audit append or the network hop to the upstream, so they are a lower bound on the latency attenuo adds to a call. The end-to-end figures, measured through the real proxy, are in [End to end: proxy versus direct](#end-to-end-proxy-versus-direct) at the end of the page, followed by [the audit write path and the per-call cost](#after-the-audit-write-path-work) and [the policy stage and WAL checkpoints](#after-the-policy-stage-and-wal-work), which say what changed and by how much.
 
 ## How to run
 
@@ -148,8 +148,8 @@ Readings:
 
 What this means:
 
-- **The file-backed log is no longer the ceiling.** At `normal` it runs within about 25 percent of the in-memory store (3,100 to 4,500 calls per second at one hop with 8 and 32 clients, from 460 to 490), and single-client latency fell from 2.2 ms to 0.9 ms. At `full` group commit lets one `fsync` cover a batch, so throughput still grows with concurrency instead of staying flat at a few hundred.
-- **Tail latency at `normal`** shows periodic stalls (p99 of 15 to 25 ms with 8 or more clients) that `full` does not: SQLite checkpoints the WAL into the database every 1,000 pages on the writer thread, and at `normal` that is where the deferred `fsync` and write-back land. Moving checkpoints off the writer (`wal_autocheckpoint=0` plus a background `PASSIVE` checkpoint) was the next experiment; it is done, see [After the policy-stage and WAL work](#after-the-policy-stage-and-wal-work).
+- **The file-backed log is no longer the ceiling.** At `normal` it runs within about 30 to 40 percent of the in-memory store at 8 and 32 clients (3,100 to 4,500 calls per second at one hop with 8 and 32 clients, from 460 to 490), and single-client latency fell from 2.2 ms to 0.9 ms. At `full` group commit lets one `fsync` cover a batch, so throughput still grows with concurrency instead of staying flat at a few hundred.
+- **Tail latency at `normal`** shows periodic stalls (p99 of 15.5 to 26.9 ms with 8 or more clients) that `full` does not: SQLite checkpoints the WAL into the database every 1,000 pages on the writer thread, and at `normal` that is where the deferred `fsync` and write-back land. Moving checkpoints off the writer (`wal_autocheckpoint=0` plus a background `PASSIVE` checkpoint) was the next experiment; it is done, see [After the policy-stage and WAL work](#after-the-policy-stage-and-wal-work).
 - **Most of the added latency is still outside the decision.** The server's own work is now about 300 us per call (policy about 120 to 150, append 90 to 150, the rest small), against 0.7 to 1.2 ms added end to end; the blocking-pool hop, the proxy's request handling and the second HTTP round trip make up the rest and are not in this branch.
 
 ### After the policy-stage and WAL work
@@ -204,7 +204,7 @@ Load on the host was 4 to 7 during this run and other agents were compiling; the
 What this means:
 
 - **Single-client added latency** fell by about 200 us at one hop and about 400 us at three, close to what the policy stage lost (about 105 us, and 140 to 190 us) plus the shorter append. The policy stage is no longer what grows with depth.
-- **The file store's tail no longer has the checkpoint stalls.** Its p99 at 8 and 32 clients is now close to the in-memory store's. The worst case remains a catch-up pause each time the WAL passes 64 MB; it shows in the max column (30 to 135 ms on this host) rather than the p99.
+- **The file store's tail no longer has the checkpoint stalls.** Its p99 at 8 and 32 clients is now close to the in-memory store's. The worst case remains a catch-up pause each time the WAL passes 64 MB; it shows in the max column (32 to 131 ms on this host) rather than the p99.
 - **What is left of the added latency** is mostly outside the server's decision (now about 80 to 140 us at one hop): the blocking-pool hop, the proxy's request handling and the second HTTP round trip. It was not broken down by stage then; see [Time by stage of a proxied call](#time-by-stage-of-a-proxied-call-2026-10-23).
 
 ### Time by stage of a proxied call (2026-10-23)
@@ -302,7 +302,7 @@ Every cell also reads the server's CPU from `/proc/<pid>/stat`. Same environment
 | file, 1 | 649 (1.27 / 5.7) | 1,121 (6.1 / 23.6) | 1.2 to 1.3 ms |
 | file, 3 | 430 (1.40 / 11.2) | 833 (7.8 / 44.8) | 1.4 ms |
 
-An exchange costs the server about 1 ms of CPU, two to three times a proxied allow call (420 to 600 us in the open-loop cells below). That is the Ed25519 signing, the verification of the parent and of the token just minted, the lease registration and an audit record. A three-hop parent costs 20 to 30 percent more than a root. At 8 clients the in-memory server used 2.5 cores of the 4 and the generator the rest, so these are rates for this VM, not for the server alone. The file store is about half the in-memory rate at 8 clients and has the longer tail, as for calls. Open loop, 1-hop token: memory held 500 and 1,500 arrivals per second (p99 7.9 and 33 ms); file held 500 (p99 35 ms) and, in this pass, 1,500 (p50 27 ms, p99 290 ms), which is where its closed-loop rate of 1,100 to 1,200 says the knee is; see the note on run-to-run spread in the bench file.
+An exchange costs the server about 1 ms of CPU, two to three times a proxied allow call (470 to 610 us in the open-loop cells below). That is the Ed25519 signing, the verification of the parent and of the token just minted, the lease registration and an audit record. A three-hop parent costs 8 to 25 percent more than a root. At 8 clients the in-memory server used 2.5 cores of the 4 and the generator the rest, so these are rates for this VM, not for the server alone. The file store is about half the in-memory rate at 8 clients and has the longer tail, as for calls. Open loop, 1-hop token: memory held 500 and 1,500 arrivals per second (p99 7.9 and 33 ms); file held 500 (p99 35 ms) and, in this pass, 1,500 (p50 27 ms, p99 290 ms), which is where its closed-loop rate of 1,100 to 1,200 says the knee is; see the note on run-to-run spread in the bench file.
 
 **Lease renewal**, T = 1 s unless stated, latency from the due time (service time from the send in brackets):
 
@@ -317,7 +317,7 @@ An exchange costs the server about 1 ms of CPU, two to three times a proxied all
 | file | 5,000 | 5,000 / 1,600 | 8,271 / 13,707 | saturated | n/a |
 | file | 5,000, T = 10 s | 500 / 500 | 1.9 / 76 (0.95 / 75) | 39% | 790 us |
 
-Idle CPU with the leases live and nothing renewing was below the 10 ms tick resolution in every cell: live leases cost nothing until they renew. Server memory (RSS) went from 22 to 25 MB at 100 leases to 68 to 206 MB at 5,000 in the in-memory store; most of the growth is that store keeping every renewal record, not the leases (the file store went 60 to 74 MB).
+Idle CPU with the leases live and nothing renewing was below the 10 ms tick resolution in every cell: live leases cost nothing until they renew. Server memory (RSS) went from 22 to 25 MB at 100 leases to 68 to 229 MB at 5,000 in the in-memory store; most of the growth is that store keeping every renewal record, not the leases (the file store went 60 to 74 MB).
 
 Revoke cascade, root of a depth-3 tree with 100 descendants, 5 runs per store (revoked 101 leases each time; a descendant's renewal was refused afterwards): memory 1.0 / 1.2 / 3.0 ms (min / median / max), file 14.6 / 19.4 / 26.6 ms, including the HTTP round trip and the admin audit record. About 190 us per lease on the file store, 12 us in memory.
 
@@ -330,7 +330,7 @@ Revoke cascade, root of a depth-3 tree with 100 descendants, 5 runs per store (r
 | file | 500 | 0.97 / 2.9 | 0.30 / 0.94 | 0.67 ms | 610 us |
 | file | 2,000 | 1.08 / 15.6 | 0.30 / 0.75 | 0.78 ms | 530 us |
 
-The achieved rate matched the offered rate in every call cell and nothing was shed. The added p50 (0.63 to 0.78 ms) is larger than the closed-loop single-client figure (0.43 to 0.63 ms in [Time by stage](#time-by-stage-of-a-proxied-call-2026-10-23)) because the open-loop generator opens concurrent requests, and the baseline here is 0.29 ms instead of 0.07 ms for the same reason. The p99 of the file store at 2,000 per second (15.6 ms) shows its tail starting before its throughput limit does.
+The achieved rate matched the offered rate in every call cell and nothing was shed. The added p50 (0.63 to 0.78 ms) is larger than the closed-loop single-client figure (0.59 to 0.73 ms in [Time by stage](#time-by-stage-of-a-proxied-call-2026-10-23)) because the open-loop generator opens concurrent requests, and the baseline here is 0.29 ms instead of 0.07 ms for the same reason. The p99 of the file store at 2,000 per second (15.6 ms) shows its tail starting before its throughput limit does.
 
 What this means:
 
