@@ -1683,6 +1683,11 @@ async fn checkpoint_endpoint_returns_a_signed_checkpoint_verifiable_with_the_jwk
     h.call(&alice.token, "read_file", json!({"repo": "alice/public-a"}))
         .await;
 
+    // Reading the head through the entries page signs nothing.
+    let page = h.admin_get("/admin/audit?from=1&limit=1").await;
+    assert_eq!(page["head"], 3);
+    assert_eq!(h.admin_get("/admin/audit/verify").await["checkpoints"], 0);
+
     let v = h.admin_get("/admin/audit/checkpoint").await;
     let cp: onbehalf_audit::Checkpoint = serde_json::from_value(v.clone()).unwrap();
     assert_eq!(cp.seq, 3);

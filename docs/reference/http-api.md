@@ -43,7 +43,7 @@ All admin routes need `Authorization: Bearer <admin token>`. They answer 401 wit
 | --- | --- |
 | `GET /admin/leases/{lease_id}` | Lease state. |
 | `POST /admin/leases/{lease_id}/revoke` | Revoke the lease and all descendants. |
-| `GET /admin/audit` | Audit entries in ascending `seq` order, paged with `from` and `limit`. |
+| `GET /admin/audit` | Audit entries in ascending `seq` order, paged with `from` and `limit`. Also returns `next` (when the page was full) and `head`, the newest `seq`. |
 | `GET /admin/audit/verify` | Walk the whole hash chain, verify every checkpoint signature against the JWKS, and report `{entries, ok, first_bad_seq, checkpoints, last_signed_seq, unsigned_tail, bad_checkpoints}`. |
 | `GET /admin/audit/checkpoint` | The signed checkpoint of the head, `{seq, head_hash, at, kid, signature}` (signing it now if the head has none). For keeping outside the host. `hash` repeats `head_hash` for older clients. |
 | `GET /admin/audit/export?from&to` | Entries `from..=to` (default: the whole log) and the checkpoints in that range, streamed as `application/x-ndjson`: a `header` line, `entry` lines, then `checkpoint` lines. Verify offline with `onbehalf audit verify --file`. 400 if `from` is 0 or `to < from`. |

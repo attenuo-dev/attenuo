@@ -590,11 +590,13 @@ async fn audit_tail(
             println!("{}", fmt_audit_entry(e));
         }
     };
+    // `head` comes with any page; unlike `/admin/audit/checkpoint` it signs nothing, so polling
+    // with `--follow` does not add a checkpoint per new entry.
     let head = client
-        .admin_get("/admin/audit/checkpoint")
+        .admin_get("/admin/audit?from=1&limit=1")
         .await
         .ok()
-        .and_then(|c| c["seq"].as_u64())
+        .and_then(|c| c["head"].as_u64())
         .unwrap_or(0);
     let mut from = (head + 1).saturating_sub(lines).max(1);
     loop {

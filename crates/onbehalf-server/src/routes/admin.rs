@@ -152,7 +152,8 @@ pub struct AuditQuery {
 }
 
 /// `GET /admin/audit?from=&limit=`: entries in ascending `seq` order, plus `next` (the `from`
-/// for the following page) when the page was full.
+/// for the following page) when the page was full, and `head` (the newest seq, 0 for an empty
+/// log; reading it signs nothing, unlike `/admin/audit/checkpoint`).
 pub async fn audit_range(
     State(state): State<Arc<AppState>>,
     Query(q): Query<AuditQuery>,
@@ -162,11 +163,19 @@ pub async fn audit_range(
         .limit
         .unwrap_or(DEFAULT_AUDIT_PAGE)
         .clamp(1, MAX_AUDIT_PAGE);
-    let entries: Vec<AuditEntry> = state.blocking(move |s| s.audit.range(from, limit)).await?;
+    let (entries, head): (Vec<AuditEntry>, u64) = state
+        .blocking(move |s| {
+            let entries = s.audit.range(from, limit)?;
+            let head = s.audit.head()?.map_or(0, |h| h.seq);
+            Ok::<_, onbehalf_audit::AuditError>((entries, head))
+        })
+        .await?;
     let next = (entries.len() == limit)
         .then(|| entries.last().map(|e| e.seq + 1))
         .flatten();
-    Ok(Json(json!({ "entries": entries, "next": next })))
+    Ok(Json(
+        json!({ "entries": entries, "next": next, "head": head }),
+    ))
 }
 
 /// `GET /admin/audit/verify`: walk the whole chain and verify every stored checkpoint
