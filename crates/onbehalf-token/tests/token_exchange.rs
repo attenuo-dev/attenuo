@@ -11,8 +11,8 @@ use onbehalf_core::{
     OriginatingUser,
 };
 use onbehalf_token::{
-    Claims, ExchangeRequest, ExchangeResponse, IssuedToken, Issuer, IssuerConfig, TokenError,
-    Verifier, JWT_TOKEN_TYPE_URN, TOKEN_TYPE,
+    Claims, ExchangeRequest, ExchangeResponse, IssueOptions, IssuedToken, Issuer, IssuerConfig,
+    MayAct, TokenError, Verifier, JWT_TOKEN_TYPE_URN, TOKEN_TYPE,
 };
 use serde_json::json;
 use time::macros::datetime;
@@ -685,6 +685,7 @@ fn exchange_request_response_shapes() {
         actor: AgentId::new("agent:coder"),
         requested: caps([Capability::new("*", "*")]),
         ttl_seconds: None,
+        may_act: None,
     };
     assert!(matches!(
         wide.execute(&issuer, now),
@@ -703,9 +704,121 @@ fn exchange_with_maximal_requested_ttl_is_clamped_not_a_panic() {
         actor: AgentId::new("agent:coder"),
         requested: caps([Capability::new("github", "read_file")]),
         ttl_seconds: Some(u64::MAX),
+        may_act: None,
     };
     let resp = req.execute(&issuer, t0()).unwrap();
     let child = issuer.verifier().verify(&resp.access_token, t0()).unwrap();
     assert_eq!(child.chain.hops[1].expires_at, parent.expires_at);
     assert_eq!(resp.expires_in, 3600);
+}
+
+/// RFC 8693 §4.4: `may_act` on the parent names who may exchange it.
+#[test]
+fn may_act_on_the_parent_limits_the_next_actor() {
+    let issuer = issuer();
+    let read = || caps([Capability::new("github", "read_file")]);
+    let r = issuer
+        .issue_root_with(
+            user(),
+            AgentId::new("agent:planner"),
+            caps([Capability::new("github", "read_*")]),
+            None,
+            t0(),
+            &IssueOptions {
+                may_act: Some(MayAct::new(["agent:coder"])),
+                not_after: None,
+            },
+        )
+        .unwrap();
+    let claims = issuer.verifier().verify(&r.token, t0()).unwrap().claims;
+    assert_eq!(claims.may_act, Some(MayAct::new(["agent:coder"])));
+
+    // A listed actor may exchange; the child carries no may_act unless asked for.
+    let child = issuer
+        .exchange(&r.token, AgentId::new("agent:coder"), read(), None, t0())
+        .unwrap();
+    let c = issuer.verifier().verify(&child.token, t0()).unwrap().claims;
+    assert_eq!(c.may_act, None);
+    // An unlisted one is refused.
+    let err = issuer
+        .exchange(&r.token, AgentId::new("agent:sneaky"), read(), None, t0())
+        .unwrap_err();
+    assert!(
+        matches!(&err, TokenError::ActorNotPermitted(a) if a == "agent:sneaky"),
+        "{err}"
+    );
+    // An empty list means nobody.
+    let closed = issuer
+        .exchange_with(
+            &child.token,
+            AgentId::new("agent:reviewer"),
+            read(),
+            None,
+            t0(),
+            &IssueOptions {
+                may_act: Some(MayAct::new(Vec::<String>::new())),
+                not_after: None,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        issuer.exchange(&closed.token, AgentId::new("agent:x"), read(), None, t0()),
+        Err(TokenError::ActorNotPermitted(_))
+    ));
+    // Without may_act (the default), any actor may exchange, as before.
+    let open = root(&issuer);
+    assert_eq!(
+        issuer
+            .verifier()
+            .verify(&open.token, t0())
+            .unwrap()
+            .claims
+            .may_act,
+        None
+    );
+    issuer
+        .exchange(
+            &open.token,
+            AgentId::new("agent:anyone"),
+            read(),
+            None,
+            t0(),
+        )
+        .unwrap();
+}
+
+/// `not_after` caps the child's expiry below the parent's and the requested TTL.
+#[test]
+fn not_after_caps_the_child_expiry() {
+    let issuer = issuer();
+    let r = root(&issuer);
+    let limit = t0() + Duration::minutes(2);
+    let child = issuer
+        .exchange_with(
+            &r.token,
+            AgentId::new("agent:coder"),
+            caps([Capability::new("github", "read_file")]),
+            Some(Duration::minutes(30)),
+            t0(),
+            &IssueOptions {
+                may_act: None,
+                not_after: Some(limit),
+            },
+        )
+        .unwrap();
+    assert_eq!(child.expires_at, limit);
+    let err = issuer
+        .exchange_with(
+            &r.token,
+            AgentId::new("agent:coder"),
+            caps([Capability::new("github", "read_file")]),
+            None,
+            t0(),
+            &IssueOptions {
+                may_act: None,
+                not_after: Some(t0()),
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, TokenError::NoLifetimeLeft(_)), "{err}");
 }

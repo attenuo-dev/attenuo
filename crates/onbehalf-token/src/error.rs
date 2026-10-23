@@ -36,6 +36,12 @@ pub enum TokenError {
     /// The embedded delegation chain violates an invariant (attenuation, depth, expiry order).
     #[error("delegation chain is invalid: {0}")]
     Chain(#[from] ChainError),
+    /// The parent token carries `may_act` and the requested actor is not listed in it.
+    #[error("agent `{0}` is not permitted to act on this token (may_act)")]
+    ActorNotPermitted(String),
+    /// A cap on the new token's lifetime (for example the actor token's `exp`) leaves none.
+    #[error("no lifetime left for the new token: {0}")]
+    NoLifetimeLeft(String),
     /// A key could not be generated, parsed, or used.
     #[error("key error: {0}")]
     Key(String),

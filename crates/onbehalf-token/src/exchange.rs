@@ -14,17 +14,22 @@
 //!   "authorization_details": [
 //!     { "type": "onbehalf_capabilities", "capabilities": [ { "server": "github", "tool": "read_*" } ] }
 //!   ],
-//!   "requested_ttl_seconds": 600
+//!   "requested_ttl_seconds": 600,
+//!   "may_act": { "sub": ["agent:reviewer"] }
 //! }
 //! ```
+//!
+//! `may_act` is optional: it becomes the child token's RFC 8693 §4.4 `may_act` claim, the
+//! agents allowed to exchange the child next. Actor authentication (`actor_token`, client
+//! credentials) is the server's business and not part of this type.
 
 use onbehalf_core::{AgentId, CapabilitySet, LeaseId};
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 
-use crate::claims::JWT_TOKEN_TYPE_URN;
+use crate::claims::{MayAct, JWT_TOKEN_TYPE_URN};
 use crate::error::TokenError;
-use crate::issuer::{IssuedToken, Issuer};
+use crate::issuer::{IssueOptions, IssuedToken, Issuer};
 
 /// RFC 8693 §2.1 grant type.
 pub const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
@@ -48,6 +53,8 @@ pub struct ExchangeRequest {
     pub requested: CapabilitySet,
     /// Requested lifetime; clamped to the parent's expiry and defaulting to the issuer's TTL.
     pub ttl_seconds: Option<u64>,
+    /// `may_act` for the child token: who may exchange it next.
+    pub may_act: Option<MayAct>,
 }
 
 impl ExchangeRequest {
@@ -57,15 +64,30 @@ impl ExchangeRequest {
         issuer: &Issuer,
         now: OffsetDateTime,
     ) -> Result<ExchangeResponse, TokenError> {
+        self.execute_until(issuer, now, None)
+    }
+
+    /// As [`ExchangeRequest::execute`], with the child's expiry also capped at `not_after`
+    /// (for example the `exp` of the actor token that authenticated the request).
+    pub fn execute_until(
+        &self,
+        issuer: &Issuer,
+        now: OffsetDateTime,
+        not_after: Option<OffsetDateTime>,
+    ) -> Result<ExchangeResponse, TokenError> {
         let ttl = self
             .ttl_seconds
             .map(|s| Duration::seconds(i64::try_from(s).unwrap_or(i64::MAX)));
-        let issued = issuer.exchange(
+        let issued = issuer.exchange_with(
             &self.subject_token,
             self.actor.clone(),
             self.requested.clone(),
             ttl,
             now,
+            &IssueOptions {
+                may_act: self.may_act.clone(),
+                not_after,
+            },
         )?;
         Ok(ExchangeResponse::from_issued(&issued, now))
     }
@@ -90,6 +112,8 @@ struct ExchangeRequestWire {
     authorization_details: Vec<AuthorizationDetail>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     requested_ttl_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    may_act: Option<MayAct>,
 }
 
 impl From<ExchangeRequest> for ExchangeRequestWire {
@@ -104,6 +128,7 @@ impl From<ExchangeRequest> for ExchangeRequestWire {
                 capabilities: req.requested,
             }],
             requested_ttl_seconds: req.ttl_seconds,
+            may_act: req.may_act,
         }
     }
 }
@@ -132,6 +157,7 @@ impl TryFrom<ExchangeRequestWire> for ExchangeRequest {
             actor: wire.actor,
             requested,
             ttl_seconds: wire.requested_ttl_seconds,
+            may_act: wire.may_act,
         })
     }
 }
@@ -178,8 +204,10 @@ mod tests {
             actor: AgentId::new("agent:coder"),
             requested: CapabilitySet::from_iter([Capability::new("github", "read_*")]),
             ttl_seconds: Some(600),
+            may_act: Some(MayAct::new(["agent:reviewer"])),
         };
         let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["may_act"], json!({"sub": ["agent:reviewer"]}));
         assert_eq!(v["grant_type"], json!(TOKEN_EXCHANGE_GRANT_TYPE));
         assert_eq!(v["subject_token_type"], json!(JWT_TOKEN_TYPE_URN));
         assert_eq!(
@@ -213,5 +241,6 @@ mod tests {
         let req: ExchangeRequest = serde_json::from_value(v).unwrap();
         assert!(req.requested.is_empty());
         assert_eq!(req.ttl_seconds, None);
+        assert_eq!(req.may_act, None);
     }
 }
