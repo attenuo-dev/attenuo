@@ -101,6 +101,12 @@ The most a root token may carry.
 
 With no matching entry, no root token is issued.
 
+## `[proxy]`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `stream_recheck_seconds` | `2` | How often a long-lived response stream (the `GET` listen stream, or a `POST` answered over SSE) is re-checked against lease state and token expiry. At the first failure the stream ends, after a final SSE event with JSON-RPC error `-32001` and `data.reason` (`lease_revoked`, `token_expired`, ...). At least 1. |
+
 ## `[dev]`
 
 | Key | Default | Meaning |

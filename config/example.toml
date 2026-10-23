@@ -137,6 +137,12 @@ allow_unsigned_chain = false
 # verified (admin bearer + [[root_grants]] only). The server logs a warning when this is on.
 allow_root_mint = false
 
+[proxy]
+# How often (seconds, at least 1) a long-lived response stream (the GET listen stream, or a
+# tools/call answered over SSE) is re-checked against lease state and token expiry. The stream
+# is ended at the first failed check, so a revoked or expired token loses it within this time.
+stream_recheck_seconds = 2
+
 [metrics]
 # Prometheus text endpoint on its OWN listener (GET /metrics), never on the proxy port.
 # No authentication: keep it on loopback or a private network.

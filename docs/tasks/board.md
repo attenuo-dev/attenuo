@@ -13,8 +13,8 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 - [ ] `onbehalf-proxy`: streamable-HTTP interception of `tools/call` for one upstream server; forward on permit, JSON-RPC error on deny.
 - [ ] `onbehalf-audit`: append-only SQLite log, `prev_hash`/`hash` chaining, `onbehalf-audit verify` command.
 - [ ] Scenario test: GitHub MCP over-privileged-PAT reproduction, blocked by a `repo` constraint; recorded as an integration test.
-- [ ] Security SR-27 (medium, [pass 3](../research/security-review-2026-10-23.md)): reject requests with more than one `Mcp-Session-Id` or a non-visible-ASCII one, and forward only the validated value; un-ignore `a_second_session_header_cannot_smuggle_another_principals_session`. Apply after `feat/proxy-list-filtering` merges.
-- [ ] Security SR-28 (medium, pass 3): re-check leases and token expiry on open SSE streams (GET listen stream, streamed POST responses) and end them; un-ignore `revocation_ends_an_open_sse_stream`.
+- [x] Security SR-27 (medium, [pass 3](../research/security-review-2026-10-23.md)): reject requests with more than one `Mcp-Session-Id` or a non-visible-ASCII one, and forward only the validated value; un-ignore `a_second_session_header_cannot_smuggle_another_principals_session`. Apply after `feat/proxy-list-filtering` merges.
+- [x] Security SR-28 (medium, pass 3): re-check leases and token expiry on open SSE streams (GET listen stream, streamed POST responses) and end them; un-ignore `revocation_ends_an_open_sse_stream`. Done on `fix/sr27-sr28-streams`.
 
 - [x] Policy test harness: `onbehalf policy test` (YAML cases through the real `PolicyEngine`) and `onbehalf policy lint`; guide in [guides/writing-policies.md](../guides/writing-policies.md).
 
