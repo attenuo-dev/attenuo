@@ -330,10 +330,15 @@ fn checkpoint_at(conn: &Connection, seq: u64) -> Result<Option<Checkpoint>, Audi
 /// Default for [`SqliteAudit::with_wal_checkpoints`] (`[audit] wal_checkpoint_seconds`).
 pub const DEFAULT_WAL_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Committed audit entries after which the background checkpointer runs without waiting for
-/// its interval, so a burst cannot grow the WAL without bound. About 4 to 8 MB of WAL at
-/// typical record sizes.
-pub const WAL_CHECKPOINT_ENTRIES: u64 = 4096;
+/// Commits (transactions) after which the background checkpointer runs without waiting for
+/// its interval. A one-record commit adds about 15 pages to the WAL (the row and three
+/// indexes), so this is about 4,000 pages, 16 MB at the default 4 KiB page.
+pub const WAL_CHECKPOINT_COMMITS: u64 = 256;
+
+/// WAL size (in frames, one page each) above which a checkpoint round ends with a short
+/// catch-up pass that holds the store's lock (see [`WalCheckpointer`]), so that the next
+/// commit starts the WAL over. 16 MB at the default 4 KiB page.
+const WAL_RESTART_FRAMES: i64 = 4096;
 
 /// What one `PRAGMA wal_checkpoint` reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,7 +371,7 @@ fn wal_checkpoint(conn: &Connection, mode: &str) -> Result<WalCheckpoint, AuditE
 }
 
 enum WalMsg {
-    /// Enough entries were committed since the last checkpoint: run one now.
+    /// Enough commits since the last checkpoint: run one now.
     Kick,
     /// The store is closing: run the final checkpoint and exit.
     Stop,
@@ -378,11 +383,21 @@ enum WalMsg {
 /// The writer connection runs with `wal_autocheckpoint=0`, so a commit never copies the WAL
 /// into the database file (and, at `durability = "normal"`, never pays the `fsync` that comes
 /// with it); before this, every thousandth page made one append wait for a whole checkpoint.
-/// Instead this thread runs `PRAGMA wal_checkpoint(PASSIVE)` every interval, or sooner after
-/// [`WAL_CHECKPOINT_ENTRIES`] commits. `PASSIVE` takes no lock the writer needs and never
-/// waits, so appends continue while it copies. When a passive run copied everything and no
-/// append is queued or in progress, it follows with `TRUNCATE`, which resets the WAL file to
-/// zero bytes (it needs the write lock, briefly, which is why it waits for an idle writer).
+/// Instead this thread runs a round every interval, or sooner after
+/// [`WAL_CHECKPOINT_COMMITS`] commits:
+///
+/// 1. `PRAGMA wal_checkpoint(PASSIVE)` without any lock of the store's. `PASSIVE` takes no
+///    SQLite lock the writer needs and never waits, so appends continue while it copies and
+///    syncs; this is where nearly all of the work happens.
+/// 2. If the WAL has grown past [`WAL_RESTART_FRAMES`], a second `PASSIVE` while holding the
+///    store's connection lock, which pauses appends in this process for as long as it takes
+///    to copy what was committed during step 1. SQLite only starts a WAL over from its
+///    beginning when a write finds every frame already copied, which under continuous load
+///    step 1 alone never achieves (it copies up to where the WAL ended when it started), so
+///    without this the WAL file would grow for as long as the load lasts.
+/// 3. If no append is queued or in progress and everything was copied, `TRUNCATE` (busy
+///    timeout zero, so it never makes an append wait), which shrinks the WAL file to zero.
+///
 /// Stopping runs a final `TRUNCATE`.
 struct WalCheckpointer {
     msgs: mpsc::SyncSender<WalMsg>,
@@ -390,19 +405,35 @@ struct WalCheckpointer {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// What the checkpointer thread works with.
+struct WalShared {
+    /// Its own connection.
+    conn: Arc<Mutex<Connection>>,
+    /// The store's connection: holding its lock pauses every append and read in this process.
+    store: Arc<Mutex<Connection>>,
+    activity: Arc<Activity>,
+    interval: Duration,
+}
+
 impl WalCheckpointer {
     fn start(
         conn: Connection,
+        store: Arc<Mutex<Connection>>,
         interval: Duration,
         activity: Arc<Activity>,
         msgs: mpsc::SyncSender<WalMsg>,
         rx: mpsc::Receiver<WalMsg>,
     ) -> Result<Self, AuditError> {
         let conn = Arc::new(Mutex::new(conn));
-        let shared = Arc::clone(&conn);
+        let shared = WalShared {
+            conn: Arc::clone(&conn),
+            store,
+            activity,
+            interval,
+        };
         let thread = std::thread::Builder::new()
             .name("onbehalf-audit-wal".into())
-            .spawn(move || wal_loop(&shared, &activity, interval, &rx))
+            .spawn(move || wal_loop(&shared, &rx))
             .map_err(|e| AuditError::Storage(format!("cannot start the WAL checkpointer: {e}")))?;
         Ok(Self {
             msgs,
@@ -430,19 +461,14 @@ impl Drop for WalCheckpointer {
     }
 }
 
-fn wal_loop(
-    conn: &Mutex<Connection>,
-    activity: &Activity,
-    interval: Duration,
-    msgs: &mpsc::Receiver<WalMsg>,
-) {
+fn wal_loop(shared: &WalShared, msgs: &mpsc::Receiver<WalMsg>) {
     loop {
-        match msgs.recv_timeout(interval) {
+        match msgs.recv_timeout(shared.interval) {
             Ok(WalMsg::Kick) | Err(mpsc::RecvTimeoutError::Timeout) => {}
             Ok(WalMsg::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // Final checkpoint. The writer thread has stopped (`SqliteAudit`'s drop joins
                 // it first), so waiting for the write lock is fine.
-                let Ok(conn) = conn.lock() else { return };
+                let Ok(conn) = shared.conn.lock() else { return };
                 let _ = conn.busy_timeout(BUSY_TIMEOUT);
                 if let Err(e) = wal_checkpoint(&conn, "TRUNCATE") {
                     eprintln!("onbehalf-audit: final WAL checkpoint failed: {e}");
@@ -450,22 +476,31 @@ fn wal_loop(
                 return;
             }
         }
-        let Ok(conn) = conn.lock() else { return };
-        let committed_before = activity.committed.load(Ordering::Acquire);
-        activity.since_wal_checkpoint.store(0, Ordering::Release);
-        match wal_checkpoint(&conn, "PASSIVE") {
-            Ok(done) => {
-                let idle = activity.pending.load(Ordering::Acquire) == 0
-                    && activity.committed.load(Ordering::Acquire) == committed_before;
-                if done.complete() && done.wal_frames > 0 && idle {
-                    // Busy timeout zero: if an append starts meanwhile, give up rather than
-                    // make it wait; the next round tries again.
-                    let _ = wal_checkpoint(&conn, "TRUNCATE");
-                }
-            }
-            Err(e) => eprintln!("onbehalf-audit: WAL checkpoint failed: {e}"),
+        if let Err(e) = wal_round(shared) {
+            eprintln!("onbehalf-audit: WAL checkpoint failed: {e}");
         }
     }
+}
+
+/// One round: see [`WalCheckpointer`].
+fn wal_round(shared: &WalShared) -> Result<(), AuditError> {
+    let conn = shared.conn.lock()?;
+    let activity = &shared.activity;
+    activity.since_wal_checkpoint.store(0, Ordering::Release);
+    let committed_before = activity.committed.load(Ordering::Acquire);
+    let mut done = wal_checkpoint(&conn, "PASSIVE")?;
+    if done.wal_frames >= WAL_RESTART_FRAMES {
+        let _store = shared.store.lock()?;
+        done = wal_checkpoint(&conn, "PASSIVE")?;
+    }
+    let idle = activity.pending.load(Ordering::Acquire) == 0
+        && activity.committed.load(Ordering::Acquire) == committed_before;
+    if done.complete() && done.wal_frames > 0 && idle {
+        // Busy timeout zero: if an append starts meanwhile, give up rather than make it
+        // wait; the next round tries again.
+        let _ = wal_checkpoint(&conn, "TRUNCATE");
+    }
+    Ok(())
 }
 
 type CheckpointHook = Arc<dyn Fn(&Checkpoint) + Send + Sync>;
@@ -514,7 +549,8 @@ pub struct SqliteAudit {
 
 /// What the writer thread and the readers share.
 struct Inner {
-    conn: Mutex<Connection>,
+    /// Shared with the WAL checkpointer, which holds it briefly to pause appends.
+    conn: Arc<Mutex<Connection>>,
     checkpointing: Option<Checkpointing>,
     activity: Arc<Activity>,
 }
@@ -526,9 +562,9 @@ struct Activity {
     pending: AtomicUsize,
     /// Entries committed since the store was opened.
     committed: AtomicU64,
-    /// Entries committed since the last background checkpoint started.
+    /// Commits since the last background checkpoint started.
     since_wal_checkpoint: AtomicU64,
-    /// Wakes the checkpointer early (see [`WAL_CHECKPOINT_ENTRIES`]).
+    /// Wakes the checkpointer early (see [`WAL_CHECKPOINT_COMMITS`]).
     wal_kick: OnceLock<mpsc::SyncSender<WalMsg>>,
 }
 
@@ -720,8 +756,8 @@ impl Inner {
         let activity = &self.activity;
         activity.committed.fetch_add(n, Ordering::AcqRel);
         if let Some(kick) = activity.wal_kick.get() {
-            if activity.since_wal_checkpoint.fetch_add(n, Ordering::AcqRel) + n
-                >= WAL_CHECKPOINT_ENTRIES
+            if activity.since_wal_checkpoint.fetch_add(1, Ordering::AcqRel) + 1
+                >= WAL_CHECKPOINT_COMMITS
             {
                 // Full means a kick is already waiting.
                 let _ = kick.try_send(WalMsg::Kick);
@@ -795,7 +831,7 @@ impl SqliteAudit {
         conn.execute_batch(CHECKPOINT_SCHEMA)?;
         Ok(Self {
             inner: Arc::new(Inner {
-                conn: Mutex::new(conn),
+                conn: Arc::new(Mutex::new(conn)),
                 checkpointing: None,
                 activity: Arc::new(Activity::default()),
             }),
@@ -807,8 +843,10 @@ impl SqliteAudit {
     /// Move WAL checkpoints off the writer: the writer connection stops checkpointing on
     /// commit (`wal_autocheckpoint=0`) and a background thread with its own connection runs
     /// `PRAGMA wal_checkpoint(PASSIVE)` every `interval`, or sooner after
-    /// [`WAL_CHECKPOINT_ENTRIES`] appends, plus `TRUNCATE` when the writer is idle and once
-    /// more when the store is dropped. See `[audit] wal_checkpoint_seconds`.
+    /// [`WAL_CHECKPOINT_COMMITS`] commits, plus `TRUNCATE` when the writer is idle and once
+    /// more when the store is dropped. Under continuous load a round that finds the WAL past
+    /// 4,096 pages pauses appends for a short catch-up pass so the WAL starts over instead of
+    /// growing. See `[audit] wal_checkpoint_seconds`.
     ///
     /// A zero `interval` changes nothing (SQLite checkpoints on the writer, every 1,000
     /// pages), and so does a store that is not a file in WAL mode, such as an in-memory one.
@@ -844,7 +882,12 @@ impl SqliteAudit {
             .lock()?
             .pragma_update(None, "wal_autocheckpoint", 0)?;
         self.wal = Some(WalCheckpointer::start(
-            conn, interval, activity, kick, msgs,
+            conn,
+            Arc::clone(&self.inner.conn),
+            interval,
+            activity,
+            kick,
+            msgs,
         )?);
         Ok(self)
     }

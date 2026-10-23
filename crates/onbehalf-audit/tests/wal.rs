@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use common::record;
 use onbehalf_audit::{
-    AuditSink, Durability, SqliteAudit, SqliteLeaseStore, WAL_CHECKPOINT_ENTRIES,
+    AuditSink, Durability, SqliteAudit, SqliteLeaseStore, WAL_CHECKPOINT_COMMITS,
 };
 use rusqlite::{Connection, OpenFlags};
 
@@ -124,19 +124,59 @@ fn concurrent_appends_with_verify_running_and_background_checkpoints() {
 fn a_burst_triggers_a_checkpoint_before_the_interval() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("audit.db");
+    let audit = SqliteAudit::open_with(&path, Durability::Normal)
+        .unwrap()
+        .with_wal_checkpoints(Duration::from_secs(3600))
+        .unwrap();
+    // One thread, so every append is its own commit.
+    let n = WAL_CHECKPOINT_COMMITS as usize + 64;
+    for i in 0..n {
+        audit.append(record(i)).unwrap();
+    }
+    // The interval is an hour; only the commit count can have started a checkpoint.
+    wait_for(
+        "the count-triggered checkpoint",
+        Duration::from_secs(10),
+        || rows_in_main_file(&path) >= WAL_CHECKPOINT_COMMITS as i64,
+    );
+    assert!(audit.verify_chain().unwrap().ok);
+}
+
+/// Under continuous load a passive checkpoint never finds every frame copied, and SQLite only
+/// starts the WAL over when it does; the checkpointer's short catch-up pass is what keeps the
+/// WAL from growing for as long as the load lasts (without it this run leaves a WAL of
+/// hundreds of megabytes).
+#[test]
+fn the_wal_stays_bounded_under_continuous_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.db");
     let audit = Arc::new(
         SqliteAudit::open_with(&path, Durability::Normal)
             .unwrap()
             .with_wal_checkpoints(Duration::from_secs(3600))
             .unwrap(),
     );
-    let n = WAL_CHECKPOINT_ENTRIES as usize + 64;
-    let writers: Vec<_> = (0..8)
+    const THREADS: usize = 8;
+    const PER_THREAD: usize = 1500;
+    let done = Arc::new(AtomicBool::new(false));
+    let sampler = {
+        let done = Arc::clone(&done);
+        let wal = wal_path(&path);
+        std::thread::spawn(move || {
+            let mut largest = 0;
+            while !done.load(Ordering::Acquire) {
+                largest = largest.max(std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            largest
+        })
+    };
+    let writers: Vec<_> = (0..THREADS)
         .map(|t| {
             let audit = Arc::clone(&audit);
             std::thread::spawn(move || {
-                for i in (t..n).step_by(8) {
-                    audit.append(record(i)).unwrap();
+                for i in 0..PER_THREAD {
+                    audit.append(record(t * PER_THREAD + i)).unwrap();
                 }
             })
         })
@@ -144,13 +184,13 @@ fn a_burst_triggers_a_checkpoint_before_the_interval() {
     for w in writers {
         w.join().unwrap();
     }
-    // The interval is an hour; only the entry count can have started a checkpoint.
-    wait_for(
-        "the size-triggered checkpoint",
-        Duration::from_secs(10),
-        || rows_in_main_file(&path) >= WAL_CHECKPOINT_ENTRIES as i64,
-    );
-    assert!(audit.verify_chain().unwrap().ok);
+    done.store(true, Ordering::Release);
+    let largest = sampler.join().unwrap();
+    eprintln!("largest WAL: {} KiB", largest >> 10);
+    assert!(largest < 64 << 20, "the WAL reached {} MB", largest >> 20);
+    let report = audit.verify_chain().unwrap();
+    assert!(report.ok);
+    assert_eq!(report.entries, (THREADS * PER_THREAD) as u64);
 }
 
 #[test]

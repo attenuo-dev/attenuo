@@ -518,9 +518,11 @@ pub struct AuditSection {
     #[serde(default)]
     pub durability: onbehalf_audit::Durability,
     /// How often (in seconds) a background thread checkpoints SQLite's write-ahead log into
-    /// the database file (`PRAGMA wal_checkpoint(PASSIVE)`), so appends never wait for a
-    /// checkpoint. It also runs after every 4,096 appends, truncates the WAL when the writer
-    /// is idle, and once more at shutdown. Default 5; 0 leaves checkpoints to SQLite on the
+    /// the database file (`PRAGMA wal_checkpoint(PASSIVE)`), so appends do not wait while a
+    /// checkpoint copies and syncs. It also runs after every 256 commits; under continuous
+    /// load, once the WAL passes 4,096 pages, appends pause for a short catch-up pass so the
+    /// WAL starts over instead of growing. It truncates the WAL when the writer is idle, and
+    /// once more at shutdown. Default 5; 0 leaves checkpoints to SQLite on the
     /// writer (every 1,000 pages, the behaviour before this setting). Unrelated to the signed
     /// audit checkpoints above. Ignored for `":memory:"`.
     #[serde(default = "default_wal_checkpoint_seconds")]
