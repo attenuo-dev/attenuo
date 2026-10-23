@@ -31,6 +31,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::process::{Child, Command};
 
+pub mod exchange;
+
 const ADMIN_TOKEN: &str = "bench-admin-token";
 /// `printf %s bench-secret | sha256sum`; every bench agent uses this secret.
 const AGENT_SECRET: &str = "bench-secret";
@@ -200,6 +202,14 @@ pub struct Opts {
     /// `http://127.0.0.1:19100`), to report per-stage times. Without it no stage table is made.
     #[arg(long, requires = "onbehalf_url")]
     pub metrics_url: Option<String>,
+    /// Open loop: drive the proxied call (and the direct baseline) with Poisson arrivals at
+    /// these rates in requests per second, instead of closed-loop clients. See
+    /// [`exchange::run_call_open`]. `--audit`, `--depths`, `--outcomes`, `--duration` and
+    /// `--warmup` apply; the cells use their own servers.
+    #[arg(long, value_delimiter = ',')]
+    pub open_loop: Vec<f64>,
+    #[command(subcommand)]
+    pub command: Option<exchange::Command>,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1158,6 +1168,12 @@ fn default_bin_dir() -> Result<PathBuf> {
 
 /// Run the whole benchmark as configured by `opts`.
 pub async fn run(opts: Opts) -> Result<()> {
+    if let Some(cmd) = &opts.command {
+        return exchange::run_command(cmd).await;
+    }
+    if !opts.open_loop.is_empty() {
+        return exchange::run_call_open(&opts).await;
+    }
     ensure!(opts.duration > 0.0, "--duration must be positive");
     ensure!(
         !opts.concurrency.contains(&0),
