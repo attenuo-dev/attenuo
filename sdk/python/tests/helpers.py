@@ -15,8 +15,10 @@ def b64(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
-def hop(agent: str, caps: list[dict[str, Any]], lease: str, ttl: int = 900) -> dict[str, Any]:
-    now = int(time.time())
+def hop(
+    agent: str, caps: list[dict[str, Any]], lease: str, ttl: int = 900, at: float | None = None
+) -> dict[str, Any]:
+    now = int(time.time() if at is None else at)
     fmt = "%Y-%m-%dT%H:%M:%S.123456789Z"
     return {
         "agent": agent,
@@ -42,10 +44,11 @@ class Signer:
         exp_delta: int = 900,
         claims: dict[str, Any] | None = None,
         header: dict[str, Any] | None = None,
+        at: float | None = None,
     ) -> str:
         caps = caps if caps is not None else [{"server": "github", "tool": "*"}]
-        hops = [hop(a, caps, f"lease-{i}") for i, a in enumerate(agents)]
-        now = int(time.time())
+        hops = [hop(a, caps, f"lease-{i}", exp_delta, at) for i, a in enumerate(agents)]
+        now = int(time.time() if at is None else at)
         act: dict[str, Any] | None = None
         for a in agents:
             act = {"sub": a, **({"act": act} if act else {})}

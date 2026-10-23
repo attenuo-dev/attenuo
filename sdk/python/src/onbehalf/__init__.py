@@ -32,10 +32,12 @@ from .errors import (
     ApiError,
     Denied,
     OnbehalfError,
+    RefreshError,
     RpcError,
     Unauthorized,
     VerificationError,
 )
+from .refresh import AsyncTokenRefresher, TokenRefresher
 from .token import Chain, Hop, Token, User, decode_token, verify_token
 
 try:
@@ -48,6 +50,7 @@ __all__ = [
     "ApiError",
     "AsyncAdminClient",
     "AsyncClient",
+    "AsyncTokenRefresher",
     "AuditEntry",
     "AuthzenDecision",
     "Capability",
@@ -63,9 +66,11 @@ __all__ = [
     "OneOf",
     "PolicyReload",
     "Prefix",
+    "RefreshError",
     "RevokeResult",
     "RpcError",
     "Token",
+    "TokenRefresher",
     "Tool",
     "ToolResult",
     "Unauthorized",

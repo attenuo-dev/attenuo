@@ -51,11 +51,14 @@ export {
   ApiError,
   DeniedError,
   OnbehalfError,
+  RefreshError,
   RpcError,
   UnauthorizedError,
   VerificationError,
 } from "./errors.js";
 export type { FetchLike, HttpOptions } from "./http.js";
+export { TokenRefresher } from "./refresh.js";
+export type { RefresherOptions } from "./refresh.js";
 export { mcpFetch, mcpHeaders, mcpUrl } from "./mcp.js";
 export { decodeToken, Token, TOKEN_TYPE, verifyToken } from "./token.js";
 export type { Chain, Hop, Jwks, User, VerifyOptions } from "./token.js";

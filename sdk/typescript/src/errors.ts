@@ -56,3 +56,22 @@ export class DeniedError extends OnbehalfError {
 
 /** A token failed local verification (bad signature, expired, wrong issuer, ...). */
 export class VerificationError extends OnbehalfError {}
+
+/**
+ * The token refresher gave up: the token cannot be kept alive. `reason` is a stable code:
+ * `lease_revoked` (revoked, or no longer known to the server), `lease_lost` (an ancestor lease
+ * lapsed), `token_expired` (`exp` came before a refresh succeeded), `refused` (the server
+ * permanently refused a renewal or exchange, for example `invalid_scope` or a replayed subject
+ * token) or `key_mismatch` (the new token is not bound to the DPoP key of the old one). The
+ * message never contains a token; `cause` is the underlying error, if any.
+ */
+export class RefreshError extends OnbehalfError {
+  constructor(
+    readonly reason: string,
+    message = "",
+    cause?: unknown,
+  ) {
+    super(`token refresh failed: ${reason}${message ? `: ${message}` : ""}`);
+    if (cause !== undefined) this.cause = cause;
+  }
+}

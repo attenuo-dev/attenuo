@@ -64,3 +64,19 @@ class Denied(OnbehalfError):
 
 class VerificationError(OnbehalfError):
     """A token failed local verification (bad signature, expired, wrong issuer, ...)."""
+
+
+class RefreshError(OnbehalfError):
+    """The token refresher gave up: the token cannot be kept alive.
+
+    ``reason`` is a stable code: ``lease_revoked`` (the lease was revoked, or the server no
+    longer knows it), ``lease_lost`` (an ancestor lease lapsed), ``token_expired`` (the token
+    reached ``exp`` before a refresh succeeded), ``refused`` (the server permanently refused a
+    renewal or exchange, for example ``invalid_scope`` or a replayed subject token), or
+    ``key_mismatch`` (the new token is not bound to the DPoP key of the old one). The message
+    never contains a token; ``__cause__`` is the underlying error, if any.
+    """
+
+    def __init__(self, reason: str, message: str = "") -> None:
+        self.reason = reason
+        super().__init__(f"token refresh failed: {reason}" + (f": {message}" if message else ""))
