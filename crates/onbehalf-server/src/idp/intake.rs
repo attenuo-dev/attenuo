@@ -31,6 +31,7 @@ use onbehalf_core::{AgentId, CapabilitySet};
 use onbehalf_token::{ExchangeResponse, AUTHORIZATION_DETAILS_TYPE, TOKEN_EXCHANGE_GRANT_TYPE};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
 
 use super::JWT_BEARER_GRANT_TYPE;
@@ -85,7 +86,7 @@ fn invalid_scope(description: &'static str, detail: impl Into<String>) -> ApiErr
 
 /// Handle an intake request whose body has already been parsed to JSON.
 pub async fn handle(
-    state: &AppState,
+    state: &Arc<AppState>,
     headers: &HeaderMap,
     body: Value,
     now: OffsetDateTime,
@@ -164,35 +165,45 @@ pub async fn handle(
     }
     let ttl = Some(requested_ttl.min(remaining));
 
-    let issued =
-        state
-            .issuer
-            .issue_root(user, AgentId::new(agent.clone()), capabilities, ttl, now)?;
-    // Used once, recorded only after issuance succeeded; a refused token is never registered.
-    let skew = i64::try_from(verified.clock_skew_seconds).unwrap_or(i64::MAX);
-    state.replay.use_once(
-        &verified.replay_key(credential),
-        verified.expires_at.saturating_add(skew),
-        now,
-    )?;
-    register_issued(
-        state,
-        &issued.token,
-        &issued.lease,
-        None,
-        issued.expires_at,
-        now,
-    )?;
-    let args = json!({
-        "agent": agent,
-        "requested": issued.chain.hops[0].capabilities,
-        "credential": kind.as_str(),
-        "idp": verified.issuer,
-    });
-    if let Err(e) = audit_issuance(state, "token.root", &issued.chain, args, now) {
-        let _ = state.leases.revoke(&issued.lease, "audit_error", now);
-        return Err(e);
-    }
+    let replay_key = verified.replay_key(credential);
+    let replay_until = verified
+        .expires_at
+        .saturating_add(i64::try_from(verified.clock_skew_seconds).unwrap_or(i64::MAX));
+    let (agent_id, idp, kind_str) = (agent.clone(), verified.issuer.clone(), kind.as_str());
+    // Everything from here on touches SQLite; run it on the blocking pool.
+    let issued = state
+        .blocking(move |state| {
+            let issued = state.issuer.issue_root(
+                user,
+                AgentId::new(agent_id.clone()),
+                capabilities,
+                ttl,
+                now,
+            )?;
+            // Used once, recorded only after issuance succeeded; a refused token is never
+            // registered.
+            state.replay.use_once(&replay_key, replay_until, now)?;
+            register_issued(
+                state,
+                &issued.token,
+                &issued.lease,
+                None,
+                issued.expires_at,
+                now,
+            )?;
+            let args = json!({
+                "agent": agent_id,
+                "requested": issued.chain.hops[0].capabilities,
+                "credential": kind_str,
+                "idp": idp,
+            });
+            if let Err(e) = audit_issuance(state, "token.root", &issued.chain, args, now) {
+                let _ = state.leases.revoke(&issued.lease, "audit_error", now);
+                return Err(e);
+            }
+            Ok::<_, ApiError>(issued)
+        })
+        .await?;
     tracing::info!(
         subject = %verified.subject,
         idp = %verified.issuer,

@@ -52,6 +52,10 @@ pub async fn mint_root(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let req: RootTokenRequest = parse_json(&body)?;
+    state.blocking(move |s| mint_root_sync(s, req)).await
+}
+
+fn mint_root_sync(state: &AppState, req: RootTokenRequest) -> Result<Response, ApiError> {
     let (capabilities, grant_attributes) = resolve_grant(&state.root_grants, &req)?;
     let attributes = merge_attributes(grant_attributes, &req.attributes)?;
 
@@ -73,7 +77,7 @@ pub async fn mint_root(
         now,
     )?;
     register_issued(
-        &state,
+        state,
         &issued.token,
         &issued.lease,
         None,
@@ -87,9 +91,9 @@ pub async fn mint_root(
         "agent": req.agent,
         "lease": issued.lease,
     });
-    let recorded = audit_issuance(&state, "token.root", &issued.chain, args, now).and_then(|_| {
+    let recorded = audit_issuance(state, "token.root", &issued.chain, args, now).and_then(|_| {
         audit_admin(
-            &state,
+            state,
             "admin.root_token",
             Decision::Allow,
             REASON_ADMIN_ACTION,

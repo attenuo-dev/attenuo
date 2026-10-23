@@ -1518,3 +1518,143 @@ async fn exchanging_the_same_parent_for_the_same_actor_twice_is_refused() {
         .exchange(&root.token, "reviewer", &["github:read_file"])
         .await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Audit I/O runs on the blocking pool; the chain must survive concurrent callers.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_decisions_keep_the_audit_chain_valid() {
+    let h = Harness::start_with(true).await;
+    let alice = h.mint_root("alice", "planner", &["github:*"]).await;
+    let before = h.audit_entries().await.len();
+
+    let mut tasks = Vec::new();
+    for i in 0..48 {
+        let client = h.client.clone();
+        let (authzen_url, mcp_url) = (h.url("/access/v1/evaluation"), h.url("/mcp/github"));
+        let token = alice.token.clone();
+        tasks.push(tokio::spawn(async move {
+            if i % 2 == 0 {
+                let resp = client
+                    .post(authzen_url)
+                    .bearer_auth(&token)
+                    .json(&authzen_body(
+                        "read_file",
+                        json!({"repo": "alice/public-x"}),
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+            } else {
+                let resp = client
+                    .post(mcp_url)
+                    .bearer_auth(&token)
+                    .header("accept", "application/json, text/event-stream")
+                    .json(&json!({"jsonrpc": "2.0", "id": i, "method": "tools/call",
+                                  "params": {"name": "read_file",
+                                             "arguments": {"repo": "alice/public-x"}}}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+
+    let entries = h.audit_entries().await;
+    assert_eq!(entries.len(), before + 48);
+    let seqs: Vec<u64> = entries.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+    assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>());
+    let verify = h.admin_get("/admin/audit/verify").await;
+    assert_eq!(verify["ok"], true, "{verify}");
+    assert_eq!(verify["entries"].as_u64().unwrap(), seqs.len() as u64);
+}
+
+// ---------------------------------------------------------------------------------------------
+// AuthZEN batch evaluation and its size bound.
+// ---------------------------------------------------------------------------------------------
+
+fn batch_body(n: usize) -> Value {
+    json!({
+        "subject": {"type": "agent", "id": ""},
+        "resource": {"type": "tool", "id": "github/read_file",
+                     "properties": {"server": "github"}},
+        "action": {"name": "read_file"},
+        "evaluations": (0..n)
+            .map(|i| json!({"context": {"input": {"repo": format!("alice/public-{i}")}}}))
+            .collect::<Vec<_>>(),
+    })
+}
+
+async fn post_batch(h: &Harness, token: &str, body: &Value) -> reqwest::Response {
+    h.client
+        .post(h.url("/access/v1/evaluations"))
+        .bearer_auth(token)
+        .json(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn authzen_batches_are_bounded_by_max_batch() {
+    let h = Harness::start_tweaked(false, |cfg| cfg.authzen.max_batch = 3).await;
+    let alice = h.mint_root("alice", "planner", &["github:*"]).await;
+    let before = h.audit_entries().await.len();
+
+    let ok = post_batch(&h, &alice.token, &batch_body(3)).await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    let v: Value = ok.json().await.unwrap();
+    let results = v["evaluations"].as_array().unwrap();
+    assert_eq!(results.len(), 3);
+    assert!(results.iter().all(|r| r["decision"] == true), "{v}");
+    assert_eq!(h.audit_entries().await.len(), before + 3);
+
+    let too_big = post_batch(&h, &alice.token, &batch_body(4)).await;
+    assert_eq!(too_big.status(), StatusCode::BAD_REQUEST);
+    let e: Value = too_big.json().await.unwrap();
+    assert_eq!(e["error"], "batch_too_large", "{e}");
+    // Refused before anything was decided: nothing new in the audit log.
+    assert_eq!(h.audit_entries().await.len(), before + 3);
+
+    let empty = post_batch(&h, &alice.token, &batch_body(0)).await;
+    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+    let anon = h
+        .client
+        .post(h.url("/access/v1/evaluations"))
+        .json(&batch_body(1))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn authzen_default_max_batch_is_64() {
+    let h = Harness::start().await;
+    let alice = h.mint_root("alice", "planner", &["github:*"]).await;
+    let ok = post_batch(&h, &alice.token, &batch_body(64)).await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    let v: Value = ok.json().await.unwrap();
+    assert_eq!(v["evaluations"].as_array().unwrap().len(), 64);
+    let no = post_batch(&h, &alice.token, &batch_body(65)).await;
+    assert_eq!(no.status(), StatusCode::BAD_REQUEST);
+    let cfg: Value = h
+        .client
+        .get(h.url("/.well-known/authzen-configuration"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(cfg["access_evaluations_endpoint"]
+        .as_str()
+        .unwrap()
+        .ends_with("/access/v1/evaluations"));
+}

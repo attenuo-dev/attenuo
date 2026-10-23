@@ -48,9 +48,115 @@ pub async fn evaluation(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<EvaluationResponse>, Response> {
-    evaluate(&state, &headers, &body)
+    // Token checks, lease lookups and the audit append all touch SQLite; keep them off the
+    // async workers.
+    state
+        .blocking(move |s| evaluate(s, &headers, &body))
+        .await
         .map(Json)
         .map_err(|e| with_challenge(e.into_response()))
+}
+
+/// `POST /access/v1/evaluations`: the AuthZEN "boxcar" form. Top-level `subject`, `action`,
+/// `resource` and `context` are defaults; each entry of `evaluations` may replace any of them.
+/// Every entry is decided and audited exactly like a single evaluation, in order.
+///
+/// At most `[authzen] max_batch` entries (400 `batch_too_large` beyond that, 400
+/// `invalid_request` for none). Only the default `execute_all` semantic is supported. An
+/// authentication failure refuses the whole request; any other per-entry failure answers
+/// `decision: false` with `context.error` for that entry.
+pub async fn evaluations(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, Response> {
+    state
+        .blocking(move |s| evaluate_batch(s, &headers, &body))
+        .await
+        .map(Json)
+        .map_err(|e| with_challenge(e.into_response()))
+}
+
+/// Error code when a batch carries more evaluations than `[authzen] max_batch`.
+pub const BATCH_TOO_LARGE: &str = "batch_too_large";
+
+fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result<Value, ApiError> {
+    let mut raw: Value = parse_json(body)?;
+    let Some(obj) = raw.as_object_mut() else {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "expected a JSON object",
+        ));
+    };
+    let items = match obj.remove("evaluations") {
+        Some(Value::Array(items)) => items,
+        _ => {
+            return Err(ApiError::bad_request(
+                "invalid_request",
+                "`evaluations` must be an array",
+            ))
+        }
+    };
+    if items.is_empty() {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "`evaluations` must not be empty",
+        ));
+    }
+    // Refuse before any evaluation runs, so an oversized batch writes nothing to the audit log.
+    if items.len() > state.authzen_max_batch {
+        return Err(ApiError::bad_request(
+            BATCH_TOO_LARGE,
+            format!(
+                "{} evaluations exceed [authzen] max_batch = {}",
+                items.len(),
+                state.authzen_max_batch
+            ),
+        ));
+    }
+    if let Some(sem) = obj
+        .get("options")
+        .and_then(|o| o.get("evaluations_semantic"))
+        .and_then(Value::as_str)
+    {
+        if sem != "execute_all" {
+            return Err(ApiError::bad_request(
+                "invalid_request",
+                format!("evaluations_semantic `{sem}` is not supported; use `execute_all`"),
+            ));
+        }
+    }
+    obj.remove("options");
+
+    let mut results = Vec::with_capacity(items.len());
+    for item in items {
+        let Value::Object(item) = item else {
+            results.push(item_error(&ApiError::bad_request(
+                "invalid_request",
+                "each evaluation must be an object",
+            )));
+            continue;
+        };
+        let mut merged = obj.clone();
+        for (k, v) in item {
+            merged.insert(k, v);
+        }
+        match evaluate_value(state, headers, Value::Object(merged)) {
+            Ok(r) => results.push(serde_json::to_value(r).map_err(ApiError::internal)?),
+            Err(e) if matches!(e.status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
+                return Err(e)
+            }
+            Err(e) => results.push(item_error(&e)),
+        }
+    }
+    Ok(json!({ "evaluations": results }))
+}
+
+fn item_error(e: &ApiError) -> Value {
+    json!({
+        "decision": false,
+        "context": { "error": { "status": e.status.as_u16(), "code": e.code, "message": e.detail } },
+    })
 }
 
 fn with_challenge(mut resp: Response) -> Response {
@@ -88,7 +194,14 @@ fn evaluate(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<EvaluationResponse, ApiError> {
-    let raw: Value = parse_json(body)?;
+    evaluate_value(state, headers, parse_json(body)?)
+}
+
+fn evaluate_value(
+    state: &AppState,
+    headers: &HeaderMap,
+    raw: Value,
+) -> Result<EvaluationResponse, ApiError> {
     let pep_field = |k: &str| raw.get(k).and_then(Value::as_str).map(str::to_owned);
     let (pep_id, pep_secret) = (pep_field("pep_id"), pep_field("pep_secret"));
     let mut req: EvaluationRequest = serde_json::from_value(raw)

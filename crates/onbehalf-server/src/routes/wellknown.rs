@@ -30,6 +30,7 @@ pub async fn authzen_configuration(
     Json(json!({
         "policy_decision_point": base,
         "access_evaluation_endpoint": format!("{base}/access/v1/evaluation"),
+        "access_evaluations_endpoint": format!("{base}/access/v1/evaluations"),
     }))
 }
 

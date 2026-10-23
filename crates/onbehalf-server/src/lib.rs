@@ -11,6 +11,7 @@
 //! | `POST /token` | subject token in body | RFC 8693 exchange, hop n to n+1 |
 //! | `POST /token/renew` | delegation token (bearer) | extend the last hop's lease |
 //! | `POST /access/v1/evaluation` | delegation token (bearer); or `[[peps]]` credentials with `[authzen] allow_unsigned_chain` | AuthZEN evaluation |
+//! | `POST /access/v1/evaluations` | same as above | AuthZEN batch evaluation, at most `[authzen] max_batch` entries |
 //! | `GET /.well-known/authzen-configuration` | none | AuthZEN metadata |
 //! | `GET /.well-known/jwks.json` | none | issuer public key |
 //! | `GET /healthz` | none | liveness |
@@ -83,6 +84,7 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
         .route("/token", post(token::exchange))
         .route("/token/renew", post(renew::renew))
         .route("/access/v1/evaluation", post(authzen::evaluation))
+        .route("/access/v1/evaluations", post(authzen::evaluations))
         .merge(admin_routes)
         .with_state(state.clone())
         .layer(TraceLayer::new_for_http());

@@ -33,7 +33,12 @@ pub async fn renew(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    let bearer = bearer_of(&headers)?
+    // Lease and audit I/O is SQLite: keep it off the async workers.
+    state.blocking(move |s| renew_sync(s, &headers)).await
+}
+
+fn renew_sync(state: &AppState, headers: &HeaderMap) -> Result<Response, ApiError> {
+    let bearer = bearer_of(headers)?
         .ok_or_else(|| ApiError::unauthorized("a delegation token bearer is required"))?;
     let now = now();
     let verified = state
@@ -94,7 +99,7 @@ pub async fn renew(
         "expires_at": new_expiry.format(&Rfc3339).unwrap_or_default(),
     });
     if let Err(e) = audit_event(
-        &state,
+        state,
         REASON_LEASE_RENEWED,
         "lease.renew",
         &chain,

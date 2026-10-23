@@ -36,6 +36,8 @@ pub struct AppState {
     pub require_actor_auth: bool,
     /// `[authzen] allow_unsigned_chain`.
     pub authzen_allow_unsigned_chain: bool,
+    /// `[authzen] max_batch`.
+    pub authzen_max_batch: usize,
     /// PEPs allowed to send unsigned chains (`[[peps]]`, validated).
     pub peps: Vec<AgentConfig>,
     pub public_url: Option<String>,
@@ -53,6 +55,9 @@ impl AppState {
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
         config.check_server_names()?;
         config.check_admin_token()?;
+        if config.authzen.max_batch == 0 {
+            anyhow::bail!("[authzen] max_batch must be at least 1");
+        }
         let issuer = load_issuer(config)?;
         let verifier = issuer.verifier();
         let jwks = crate::jwks::jwks_from_keys(&issuer.trusted_public_keys())?;
@@ -116,6 +121,7 @@ impl AppState {
             agents,
             dev_allow_root_mint: config.dev.allow_root_mint,
             authzen_allow_unsigned_chain: config.authzen.allow_unsigned_chain,
+            authzen_max_batch: config.authzen.max_batch,
             require_actor_auth: config.token.require_actor_auth,
             peps,
             public_url: config.server.public_url.clone(),
@@ -124,6 +130,23 @@ impl AppState {
             metrics,
             replay: crate::replay::ReplayCache::default(),
         })
+    }
+
+    /// Run `f` on tokio's blocking pool.
+    ///
+    /// SQLite audit and lease I/O is synchronous and takes a lock, so handlers run it here
+    /// instead of on an async worker. Appends still serialize on the audit store's lock, which
+    /// is what keeps the hash chain linear no matter how many blocking threads call in.
+    pub async fn blocking<R, F>(self: &Arc<Self>, f: F) -> R
+    where
+        F: FnOnce(&AppState) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let state = Arc::clone(self);
+        match tokio::task::spawn_blocking(move || f(&state)).await {
+            Ok(r) => r,
+            Err(e) => std::panic::resume_unwind(e.into_panic()),
+        }
     }
 
     /// Expiry to register for a freshly issued lease: `min(now + lease_interval, token_exp)`.
@@ -311,6 +334,16 @@ mod tests {
         );
         cfg.issuer.lease_interval_seconds = 0;
         assert!(AppState::from_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn authzen_max_batch_defaults_to_64_and_must_be_positive() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.authzen.max_batch, 64);
+        assert_eq!(AppState::from_config(&cfg).unwrap().authzen_max_batch, 64);
+        cfg.authzen.max_batch = 0;
+        let err = AppState::from_config(&cfg).err().unwrap();
+        assert!(err.to_string().contains("max_batch"), "{err}");
     }
 
     /// SR-08: unsigned AuthZEN chains cannot be switched on without a PEP to authenticate.

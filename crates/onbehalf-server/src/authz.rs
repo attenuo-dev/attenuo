@@ -227,6 +227,20 @@ impl Pipeline {
     }
 }
 
+/// Run a blocking pipeline step on tokio's blocking pool, so lease lookups and the audit append
+/// (SQLite) never occupy an async worker. Appends from concurrent callers serialize on the
+/// audit store's lock, so the hash chain stays linear.
+async fn on_blocking_pool<R: Send + 'static>(
+    pipeline: &Arc<Pipeline>,
+    f: impl FnOnce(&Pipeline) -> R + Send + 'static,
+) -> R {
+    let pipeline = Arc::clone(pipeline);
+    match tokio::task::spawn_blocking(move || f(&pipeline)).await {
+        Ok(r) => r,
+        Err(e) => std::panic::resume_unwind(e.into_panic()),
+    }
+}
+
 /// The proxy's authorizer: token verification plus [`Pipeline::decide`].
 pub struct ServerAuthorizer {
     verifier: Verifier,
@@ -257,8 +271,9 @@ impl Authorizer for ServerAuthorizer {
         chain: &DelegationChain,
         now: OffsetDateTime,
     ) -> Result<(), AuthError> {
-        self.pipeline
-            .check_leases(chain, now)
+        let chain = chain.clone();
+        on_blocking_pool(&self.pipeline, move |p| p.check_leases(&chain, now))
+            .await
             .map_err(|(reason, detail)| {
                 tracing::warn!(reason, detail = %detail.join("; "), "lease check failed");
                 AuthError::LeaseInactive(reason.to_string())
@@ -271,7 +286,8 @@ impl Authorizer for ServerAuthorizer {
         call: &ToolCall,
         now: OffsetDateTime,
     ) -> AuthDecision {
-        let d = self.pipeline.decide(chain, call, now);
+        let (chain, call) = (chain.clone(), call.clone());
+        let d = on_blocking_pool(&self.pipeline, move |p| p.decide(&chain, &call, now)).await;
         AuthDecision {
             decision: d.decision,
             reason: d.reason,
@@ -286,7 +302,11 @@ impl Authorizer for ServerAuthorizer {
         reason: &str,
         now: OffsetDateTime,
     ) -> Uuid {
-        self.pipeline.record_rejection(chain, call, reason, now)
+        let (chain, call, reason) = (chain.clone(), call.clone(), reason.to_string());
+        on_blocking_pool(&self.pipeline, move |p| {
+            p.record_rejection(&chain, &call, &reason, now)
+        })
+        .await
     }
 }
 
