@@ -113,6 +113,7 @@ A delegation token is a compact JWS, EdDSA (Ed25519), with header `typ` = `onbeh
 - `ou_sig` is made once at root issuance and copied unchanged through every exchange, together with `ou_sig_v` and `ou_kid`, so the user block is verifiable independently of the outer signature, under the key that made it (which may be a retired key after a rotation).
 - **`ou_sig` construction, version 2** (`ou_sig_v` = 2, the only version verifiers accept). The payload is three fields, each a `u32` big-endian length followed by the bytes: `iss`; the canonical JSON of `chain.originating_user`; the canonical JSON of `chain.hops[0]` restricted to `agent`, `capabilities`, `issued_at` and `lease` (in that key order). The signed message is `len("onbehalf-ou-v2") || "onbehalf-ou-v2" || payload`, signed with Ed25519 by the issuer key named in `ou_kid` (`onbehalf_token::claims::ou_sig_message`). The context string separates it from JWS signatures and from other detached signatures (audit checkpoints use `onbehalf-checkpoint-v1`), and binding `iss` and the root hop means a user's signature lifted from one chain does not verify in a chain with another issuer or another root hop, even when the outer token is re-signed by a trusted key (SR-14). Hop 0's `expires_at` is not covered: it is bounded by every hop's expiry and the outer `exp`. Version 1 (a bare signature over the user block, no `ou_sig_v` claim) is refused with `UnsupportedOuSig`; nothing was deployed with it.
 - `may_act` is optional (RFC 8693 §4.4): the agents allowed to exchange this token. See "`may_act`" below.
+- `cnf` is optional (RFC 7800, RFC 9449): `{"jkt": "<RFC 7638 SHA-256 thumbprint>"}` binds the token to a key. See section 4.1.
 
 **Root issuance** (`Issuer::issue_root`) builds the chain, signs the user block and mints. The server calls it only after verifying a user credential (hop 0):
 
@@ -168,6 +169,41 @@ When both are sent, both are checked. An agent id may appear only once in a chai
 7. `exp` equals the last hop's `expires_at`;
 8. `ou_sig_v` equals 2, then `ou_sig` (construction above) under the trusted key named by `ou_kid`; canonical JSON is compact `serde_json` in `BTreeMap` key order (RFC 8785 is SR-20);
 9. `chain.validate_at(now, max_depth)`: non-empty subject, at least one hop, depth, per-hop expiry, expiry monotonicity, attenuation.
+
+A `cnf` claim whose `jkt` is not a 43-character base64url SHA-256 thumbprint fails verification.
+
+### 4.1 Sender-constrained tokens (DPoP)
+
+A token may be bound to a key with DPoP (RFC 9449). A bound token is accepted only together with a proof signed by that key, so a copy of the token alone is useless (threat model A4, SR-24). Binding is optional per request and per deployment.
+
+**Keys and proofs.** Proof keys are Ed25519 (`alg` `EdDSA`) or P-256 (`ES256`). A proof is a compact JWS with header `typ` = `dpop+jwt`, `alg` and `jwk` (the public key, no private members) and claims `htm`, `htu`, `iat`, `jti` (at most 256 bytes) and, when a bound token goes with the request, `ath` = base64url(SHA-256(token)). A proof is at most 4096 bytes and is sent as exactly one `DPoP` header (`onbehalf_token::dpop::verify_proof`).
+
+A proof is valid for a request when:
+
+1. it parses, `typ` and `alg` are as above, `alg` matches the `jwk`, and the signature verifies under `jwk`;
+2. `htm` equals the request method;
+3. `htu`, normalized (lowercase scheme and host, default port removed, query and fragment dropped, empty path as `/`), equals the request URL normalized the same way. The server builds the request URL from `[server] public_url` plus the path, or `http://<Host>` plus the path when `public_url` is unset;
+4. `|now - iat| <= [token] dpop_max_age_seconds` (default 300);
+5. `ath`, when the request presents a bound token, equals the hash of that token;
+6. the RFC 7638 thumbprint of `jwk` equals the token's `cnf.jkt`, when the request presents a bound token;
+7. its `jti` has not been seen for this key within the `iat` window (an in-memory cache per process, bounded by `[token] dpop_replay_capacity`; a full cache refuses new proofs with 503 rather than forget old ones).
+
+**Binding at issuance.** `POST /token` (hop 0 and exchanges) and the dev `POST /admin/root-token` bind the new token to the key of a valid `DPoP` header proof: `cnf.jkt` is its thumbprint and the response's `token_type` is `DPoP` (otherwise `Bearer`). `[token] dpop` controls this: `off` never binds new tokens, `optional` (the default) binds when a proof is sent, `required` refuses a request without a proof with `dpop_required`.
+
+**Attenuation.** A child of a bound token is always bound (`TokenError::BindingRequired`): binding is part of what a token cannot widen. The exchange's `DPoP` header names the child's key.
+
+- Same key as the parent: the header proof must carry `ath` of the subject token. It proves possession of the parent's key and binds the child to it.
+- Another key (a sub-agent with its own key): the body field `subject_token_dpop` must hold a second proof, by the parent's key, for `POST` and the `/token` URL, with `ath` of the subject token. It is the parent holder's consent to delegate to that key.
+
+Without these, the exchange fails with `dpop_required` or `invalid_dpop_proof`, so a stolen bound token cannot be exchanged either.
+
+**Use.** A token with `cnf` needs a valid proof wherever it is presented: the proxy (`/mcp/{server}`, every method), `POST /token/renew`, the AuthZEN endpoints, and `POST /token` as `subject_token`. `Authorization` may use the `DPoP` or the `Bearer` scheme; the token, not the scheme, decides whether a proof is needed. A proof sent with an unbound token is ignored, except under `dpop = "required"`, where an unbound token is refused on these routes. `dpop = "off"` does not relax the check for tokens that are already bound.
+
+**Errors.** 401 with `error` (and `error_description`) `dpop_required` when a proof is missing, or `invalid_dpop_proof` when one fails a check above, and `WWW-Authenticate: DPoP error="invalid_token", error_description="dpop_required", algs="EdDSA ES256"` or `DPoP error="invalid_dpop_proof", algs="EdDSA ES256"`. The proxy answers HTTP 401 with JSON-RPC `-32001` and `data.reason` set to the same code.
+
+**Audit.** A decision made for a request whose bound token was proven, and an issuance that bound the new token, carry `"dpop_bound": true` in the record. The field is omitted when false, so the hashes of existing records do not change.
+
+**Not covered.** No server-provided nonce (RFC 9449 §8); freshness relies on `iat` and the `jti` cache, which is per process. Cedar's context does not include the binding. mTLS-bound tokens (RFC 8705) and SPIFFE X.509 binding are not implemented. An external PEP that verifies tokens locally must check proofs itself.
 
 
 ## 5. Per-call authorization
@@ -248,7 +284,7 @@ Every record names the agent and the originating user separately, the attributio
 
 ## 9. Open questions
 
-1. **Token binding.** Should hop tokens be sender-constrained (`cnf` with DPoP or mTLS/SPIFFE), and at what cost to clients that cannot do either?
+1. **Token binding.** DPoP binding is implemented and optional (section 4.1); clients that cannot sign proofs keep using bearer tokens unless the deployment sets `[token] dpop = "required"`. Still open: mTLS or SPIFFE X.509 binding for workloads that already hold certificates, and a server nonce for deployments with several replicas.
 2. **Cross-organization chains.** How does the originating-user block survive when hop n+1 is in another trust domain? ID-JAG and the "crossing-the-trustee problem" are unresolved ([Cerbos](https://www.cerbos.dev/blog/mcp-authorization-standards)).
 3. **Constraint algebra.** Sets and ranges cover most tool arguments; nested objects, globs and regexes make `⊑` undecidable or expensive. Where is the line?
 4. **ReBAC composition.** Relationship facts (who owns which repo) are consulted via an external graph (SpiceDB/OpenFGA-style) and projected into Cedar entities; cache consistency with revocation is unsettled ([ADR-0002](../decisions/0002-cedar-for-policy.md)).

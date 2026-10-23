@@ -26,6 +26,7 @@ curl -s -X POST https://onbehalf.example.com/mcp/github \
 
 Things that are different from a plain MCP server:
 
+- **Tokens can be bound to keys.** A token with `cnf.jkt` needs a DPoP proof on every request, and the 401 then says `WWW-Authenticate: DPoP`. See [Binding tokens to keys](binding-tokens-to-keys.md).
 - **The bearer is not forwarded.** The upstream never sees the onbehalf token. If the upstream needs its own credential, onbehalf has no setting for injecting one in v0. Today that means the upstream must trust the proxy by network placement, or hold its own static credential.
 - **No OAuth discovery.** onbehalf does not serve Protected Resource Metadata (RFC 9728) or an authorization server. A 401 carries `WWW-Authenticate: Bearer realm="onbehalf"` and nothing else. An MCP client that tries to discover an authorization server will not find one. Configure the bearer yourself, as a static header or through a token provider you write.
 - **Whether your MCP client lets you set a header** (and refresh it) depends on the client. Most Streamable HTTP clients take custom headers. Which ones support changing the header between requests is untested here. If yours cannot, run a small local forwarder that adds a fresh bearer.

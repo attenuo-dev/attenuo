@@ -8,6 +8,7 @@ Task-oriented guides for people who want to run onbehalf or build on it. They de
 | [Writing and testing policies](writing-policies.md) | Write Cedar policies for agents (server-scoped `Action::"<server>/<tool>"`), test them offline with `onbehalf policy test`, lint them, and run both in CI |
 | [Deploying](deploying.md) | Put it somewhere other than your laptop: bind address, TLS, admin token, key rotation, SQLite backup, lease tuning, logs, Docker, monitoring, and the v0 limits |
 | [Integrating MCP clients](integrating-mcp-clients.md) | Write the agent side: send the bearer, exchange tokens hop to hop, handle denials, renew leases, call the AuthZEN endpoint from a non-MCP enforcement point |
+| [Binding tokens to keys](binding-tokens-to-keys.md) | Make a leaked token useless: bind tokens to agent keys with DPoP, from the CLI, the SDKs or raw HTTP, and what the server refuses |
 | [Identity providers](identity-providers.md) | Connect Keycloak, Auth0, Okta, Entra ID or Google, set up agents and root grants, and use ID-JAG. Provider recipes are untested |
 
 Suggested order: Getting started, then Identity providers and Integrating MCP clients, then Deploying.

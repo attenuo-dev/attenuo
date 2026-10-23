@@ -76,6 +76,14 @@ How the caller of an exchange (hop n to n+1) proves it is the `actor` it names.
 | `require_actor_auth` | `true` | The actor must authenticate with a method `actor_auth` accepts. When `false`, `actor` is asserted (the server warns at start-up), but credentials that are sent are still checked. |
 | `actor_auth` | `"either"` | `"secret"`: `[[agents]]` client credentials only; an `actor_token` is refused with `actor_token_not_accepted`. `"actor_token"`: an `actor_token` from an `[[actor_trust]]` issuer only; client credentials are refused with `client_auth_not_accepted`, and the server will not start without an `[[actor_trust]]` entry. `"either"`: both are accepted, and when both are sent both are checked. |
 
+It also sets sender-constrained tokens (DPoP, RFC 9449; see [Binding tokens to keys](../guides/binding-tokens-to-keys.md)):
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `dpop` | `"optional"` | `"off"`: new tokens are never bound (a proof on `/token` is ignored). `"optional"`: a request to `/token` or `/admin/root-token` with a `DPoP` proof gets a token bound to its key. `"required"`: every issuance needs a proof, and unbound tokens are refused wherever a token is presented (`dpop_required`). In every mode, a token that is already bound needs a proof by its key. |
+| `dpop_max_age_seconds` | 300 | How far a proof's `iat` may be from the server's clock, either way. 1 to 3600. Proof `jti`s are remembered for this long. |
+| `dpop_replay_capacity` | 1000000 | Most proof `jti`s kept in memory. When full, new proofs are refused with 503 `dpop_replay_cache_full` until old ones age out. At least 1. |
+
 ## `[[actor_trust]]`
 
 Issuers of workload identities whose JWTs are accepted as the RFC 8693 `actor_token` of an exchange. Give each entry exactly one key source: `jwks_url` (with `issuer`), or `spiffe_trust_domain` with `spiffe_bundle_url`. Neither is discovered. Hop 0 (IdP intake) still authenticates the agent with `[[agents]]` client credentials.

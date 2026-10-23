@@ -7,6 +7,7 @@
 - [Guides](guides/README.md)
   - [Getting started](guides/getting-started.md)
   - [Integrating MCP clients](guides/integrating-mcp-clients.md)
+  - [Binding tokens to keys](guides/binding-tokens-to-keys.md)
 
 # Concepts
 

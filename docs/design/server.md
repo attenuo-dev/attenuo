@@ -242,7 +242,9 @@ One cache per IdP (and per `[[actor_trust]]` entry, which uses the same code wit
 | `invalid_request` | 400 | `actor_mismatch`, `duplicate_actor` (exchange), `multiple_client_auth`, `no_capabilities_requested`, `unsupported_token_type`, `malformed_request`, `may_act_exceeds_grant` |
 | `invalid_request` | 400 | Exchange actor authentication: `actor_not_permitted` (parent's `may_act`), `actor_token_required`, `actor_token_not_accepted`, `client_auth_not_accepted`, `actor_token_type_unsupported`, `actor_token_malformed`, `actor_token_typ_mismatch`, `actor_token_untrusted_issuer`, `actor_token_unsupported_alg`, `actor_token_missing_kid`, `actor_token_unknown_kid`, `actor_token_bad_signature`, `actor_token_audience_mismatch`, `actor_token_expired`, `actor_token_not_yet_valid`, `actor_token_missing_claim`, `actor_token_invalid_spiffe_id`, `actor_token_unmapped_subject` |
 | `invalid_scope` | 400 | `no_root_grant`, `scope_exceeds_grant` |
-| `temporarily_unavailable` | 503 | `jwks_unavailable` (IdP or `[[actor_trust]]` keys), `replay_cache_full` |
+| `dpop_required` | 401 | `dpop_required`: a bound subject token without a proof, an exchange that would not bind the child of a bound parent, a new key for the child without `subject_token_dpop`, or `[token] dpop = "required"` and no proof (SR-24) |
+| `invalid_dpop_proof` | 401 | `invalid_dpop_proof`: a `DPoP` header or `subject_token_dpop` that fails a check (signature, `typ`, `alg`, `htm`, `htu`, `iat`, `ath`, key, replayed `jti`, several headers) |
+| `temporarily_unavailable` | 503 | `jwks_unavailable` (IdP or `[[actor_trust]]` keys), `replay_cache_full`, `dpop_replay_cache_full` |
 
 These codes are stable; `detail` is prose and may change.
 
