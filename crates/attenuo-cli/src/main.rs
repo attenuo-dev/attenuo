@@ -170,18 +170,24 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 .as_deref()
                 .map(|p| secrets::from_file("subject_token_dpop", p))
                 .transpose()?;
-            let (header, sign_off) = dpop_key::exchange_proofs(
-                &client.token_url(),
-                &subject_token,
-                &a.actor,
-                a.dpop_key.as_deref(),
-                a.subject_dpop_key.as_deref(),
-                given.is_some(),
-            )?;
-            if let Some(proof) = sign_off.or(given) {
+            let url = client.token_url();
+            let proofs = |nonce: Option<&str>| {
+                dpop_key::exchange_proofs(
+                    &url,
+                    &subject_token,
+                    &a.actor,
+                    a.dpop_key.as_deref(),
+                    a.subject_dpop_key.as_deref(),
+                    given.is_some(),
+                    nonce,
+                )
+            };
+            let (_, sign_off) = proofs(None)?;
+            if let Some(proof) = sign_off.or(given.clone()) {
                 body["subject_token_dpop"] = proof.into();
             }
-            let resp = client.exchange(&body, header).await?;
+            // The header proof is made again, with the server's nonce, if it asks for one.
+            let resp = client.exchange(&body, |nonce| Ok(proofs(nonce)?.0)).await?;
             print_token(&resp, a.print, json);
             Ok(Outcome::Ok)
         }

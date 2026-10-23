@@ -223,6 +223,21 @@ if (!report.ok) console.log(report.firstBadSeq, report.badCheckpoints, report.tr
 
 `verifyExport(source, { checkpointPublicKeys, allowUnsignedTail })` takes the export as text (`string`), bytes, an iterable of lines or `{ path }` (Node), in JSON Lines or the `--format json` form. `checkpointPublicKeys` is the JWKS or a `{ kid: key }` map (raw 32 bytes or base64url). It re-checks the SHA-256 hash chain over RFC 8785 canonical JSON of `["attenuo-audit-entry-v2", seq, prev_hash, record]`, the range the header declares and the Ed25519 checkpoint signatures (WebCrypto), with the same strictness as `attenuo audit verify --file`: a short file, entries outside the range and entries after the last valid checkpoint (unless `allowUnsignedTail`) all fail. The `ExportReport` has `ok`, `firstBadSeq`, `badCheckpoints`, `lastSignedSeq`, `unsignedTail`, `truncated`, `outsideRange` and the rest of the Rust report. A file that is not a verifiable export (no header, wrong format, a filtered export, not JSON) throws `ExportError`. The canonicalizer is a small RFC 8785 implementation tested against the RFC's vectors; it, and the strict JSON parser the verifier uses, refuse integers beyond 2^53 (a `seq` that large cannot be checked here) and duplicate object members. A filtered export (`auditExport(from, to, { kind, chainId })`) cannot be verified: its chain has gaps, so verify the unfiltered one, then filter. `AuditEntry` has `kind` and `chainId`.
 
+### Cross-checking shipped checkpoints
+
+A checkpoint is signed with the server's own key, so someone who holds the host and the key can rewrite the log and sign it again. `[audit.sink]` ships each checkpoint off the host; `crossCheck` compares an export with those copies (SR-21), like `attenuo audit verify --file --checkpoints`:
+
+```ts
+import { crossCheck, verifyExport } from "@attenuo/sdk";
+
+const opts = { checkpointPublicKeys: jwks };
+const verdict = await verifyExport({ path: "audit.jsonl" }, opts);
+const cross = await crossCheck({ path: "audit.jsonl" }, { path: "shipped.jsonl" }, opts);
+for (const m of cross.mismatches) console.log(m.seq, m.line, m.reason); // shipped-file order
+```
+
+`crossCheck(export, shipped, { checkpointPublicKeys })` takes both as text, bytes, an iterable of lines or `{ path }`; the shipped file is the file sink's JSON Lines, webhook bodies one per line, or bare checkpoint lines. For every shipped checkpoint inside the export's range it requires that the checkpoint verifies, that the export holds an identical one at that `seq`, and that the export's entry there hashes to the shipped `head_hash`. The `CrossCheckReport` has `ok`, `shipped`, `inRange`, `matched`, `beyondRange`, `lastShippedSeq` and `mismatches` (`seq`, `line`, `reason`): a checkpoint signed again after it was shipped, one deleted from the export, two different shipped copies for one `seq`, and a shipped copy that does not verify or whose envelope disagrees with itself. The reasons are the Rust ones, word for word. Run it next to `verifyExport`, not instead. A shipped file that is not checkpoints throws `ExportError`; `parseShipped` parses one on its own.
+
 ## Development
 
 ```sh

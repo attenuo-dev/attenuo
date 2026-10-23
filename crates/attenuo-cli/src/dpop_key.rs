@@ -63,6 +63,8 @@ pub fn token_jkt(token: &str) -> Option<String> {
 /// differs; `sign_off_given` says that a sign-off made elsewhere (`attenuo token sign-off`)
 /// goes in the body instead.
 ///
+/// `nonce` is the server's latest `DPoP-Nonce` for the header proof (the sign-off needs none).
+///
 /// - The header proof covers the subject token (`ath`) when `key` is the one the subject token
 ///   is bound to.
 /// - A bound subject token with another `key` needs a sign-off by its key, naming `key` and
@@ -74,6 +76,7 @@ pub fn exchange_proofs(
     key: Option<&Path>,
     subject_key: Option<&Path>,
     sign_off_given: bool,
+    nonce: Option<&str>,
 ) -> Result<(Option<String>, Option<String>)> {
     let now = OffsetDateTime::now_utc();
     let key = load_opt(key)?;
@@ -82,7 +85,7 @@ pub fn exchange_proofs(
     let same = |k: &DpopKey| parent_jkt.as_deref() == Some(k.thumbprint());
     let header = key.as_ref().map(|k| {
         let ath = same(k).then_some(subject);
-        k.proof("POST", url, ath, now)
+        k.proof_with_nonce("POST", url, ath, nonce, now)
     });
     let sign_off = match (&parent_jkt, &key, &subject_key) {
         (_, None, Some(_)) => bail!(
@@ -184,7 +187,7 @@ mod tests {
             .unwrap()
         };
         let proofs = |token: &str, key, subject_key, given| {
-            exchange_proofs(url, token, "coder", key, subject_key, given)
+            exchange_proofs(url, token, "coder", key, subject_key, given, None)
         };
         // Same key: one proof, covering the parent.
         let (h, s) = proofs(&bound, Some(&a), None, false).unwrap();

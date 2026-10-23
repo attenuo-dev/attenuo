@@ -4,7 +4,11 @@ import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   ExportError,
+  SHIPPED_FORMAT,
+  crossCheck,
+  parseShipped,
   verifyExport,
+  type CrossCheckReport,
   type ExportReport,
   type VerifyExportOptions,
 } from "../src/index.js";
@@ -306,5 +310,205 @@ describe("verifyExport", () => {
       checkpointPublicKeys: jwks,
     });
     expect(r.ok).toBe(true);
+  });
+});
+
+// ---- cross-check against shipped checkpoints (SR-21) -----------------------------------------
+
+const checkpointsOf = (objs: Obj[]): Obj[] =>
+  objs.filter((o) => o.type === "checkpoint").map(({ type: _t, ...cp }) => cp);
+
+const sha256Hex = async (text: string): Promise<string> =>
+  Array.from(
+    new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text))),
+    (b) => b.toString(16).padStart(2, "0"),
+  ).join("");
+
+/** What the file sink writes for `cp`. */
+const envelope = async (cp: Obj): Promise<Obj> => ({
+  checkpoint: cp,
+  checkpoint_sha256: await sha256Hex(canonicalize(cp)),
+  format: SHIPPED_FORMAT,
+  kid: cp.kid,
+  public_url: null,
+  signature: cp.signature,
+});
+
+const shippedLines = async (cps: Obj[]): Promise<string[]> => {
+  const out: string[] = [];
+  for (const c of cps) out.push(canonicalize(await envelope(c)) + "\n");
+  return out;
+};
+
+async function cross(
+  objs: Obj[],
+  shipped?: string[],
+  make: { n?: number; start?: number; cps?: number[] } = {},
+): Promise<CrossCheckReport> {
+  const sent = shipped ?? (await shippedLines(checkpointsOf(await makeExport(make.n, make))));
+  return crossCheck(lines(objs), sent, { checkpointPublicKeys: jwks });
+}
+
+/** The attacker's export: records from `startAt` changed, hashes recomputed, changed
+ * checkpoints signed again with the (stolen) key. */
+async function rewritten(startAt: number): Promise<Obj[]> {
+  const objs = await makeExport();
+  let prev = GENESIS_HASH;
+  const bySeq = new Map<number, string>();
+  for (const e of objs.filter((o) => o.type === "entry")) {
+    if (e.seq >= startAt) e.record = { ...e.record, reason: "rewritten" };
+    e.prev_hash = prev;
+    e.entry_hash = prev = await entryHash(e.seq, prev, e.record);
+    bySeq.set(e.seq, e.entry_hash);
+  }
+  for (const o of objs.filter((x) => x.type === "checkpoint")) {
+    if (o.head_hash === bySeq.get(o.seq)) continue;
+    const fresh = await sign(o.seq, bySeq.get(o.seq)!);
+    Object.assign(o, fresh, { at: "2026-10-24T00:00:00Z" });
+    const ctx = new TextEncoder().encode("attenuo-checkpoint-v1");
+    const payload = new TextEncoder().encode(canonicalize([o.seq, o.head_hash, o.at, o.kid]));
+    const msg = new Uint8Array(4 + ctx.length + payload.length);
+    new DataView(msg.buffer).setUint32(0, ctx.length);
+    msg.set(ctx, 4);
+    msg.set(payload, 4 + ctx.length);
+    o.signature = b64(new Uint8Array(await crypto.subtle.sign("Ed25519", priv, msg)));
+  }
+  return objs;
+}
+
+describe("crossCheck", () => {
+  it("accepts a genuine export, a retried delivery, bare lines and a path", async () => {
+    const objs = await makeExport();
+    const r = await cross(objs);
+    expect(r).toMatchObject({
+      ok: true,
+      mismatches: [],
+      shipped: 2,
+      inRange: 2,
+      matched: 2,
+      beyondRange: 0,
+      lastShippedSeq: 6,
+    });
+    const shipped = await shippedLines(checkpointsOf(objs));
+    expect((await cross(objs, [...shipped, ...shipped])).ok).toBe(true);
+    const bare = [...lines(objs.filter((o) => o.type === "checkpoint")), "\n"];
+    expect((await cross(objs, bare)).ok).toBe(true);
+    const dir = mkdtempSync(join(tmpdir(), "ob-ship-"));
+    try {
+      const path = join(dir, "shipped.jsonl");
+      writeFileSync(path, shipped.join(""));
+      const o = { checkpointPublicKeys: jwks };
+      expect((await crossCheck(lines(objs), { path }, o)).ok).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("catches a rewritten and re-signed log", async () => {
+    const attacker = await rewritten(2);
+    expect((await verify(attacker)).ok).toBe(true); // alone it verifies: the attacker had the key
+    const r = await cross(attacker);
+    expect(r.ok).toBe(false);
+    expect(r.mismatches.map((m) => [m.seq, m.line])).toEqual([
+      [3, 1],
+      [6, 2],
+    ]);
+    for (const m of r.mismatches) {
+      expect(m.reason).toContain("RE-SIGNED after shipping");
+      expect(m.reason).toContain("head_hash");
+      expect(m.reason).toContain("history rewritten");
+    }
+    const late = await cross(await rewritten(5));
+    expect(late.mismatches.map((m) => m.seq)).toEqual([6]);
+    expect(late.matched).toBe(1);
+  });
+
+  it("reports deleted, duplicate and forged shipped checkpoints", async () => {
+    const objs = await makeExport(6, { cps: [2, 4, 6] });
+    const shipped = await shippedLines(checkpointsOf(objs));
+    const gone = objs.filter((o) => !(o.type === "checkpoint" && o.seq === 4));
+    let r = await cross(gone, shipped);
+    expect(r.mismatches.map((m) => [m.seq, m.line])).toEqual([[4, 2]]);
+    expect(r.mismatches[0]!.reason).toContain("deleted after shipping");
+
+    const other = await shippedLines([await sign(4, "ab".repeat(32))]);
+    r = await cross(objs, [...shipped, ...other]);
+    expect(r.mismatches.map((m) => [m.seq, m.line])).toEqual([[4, 4]]);
+    expect(r.mismatches[0]!.reason).toContain(
+      "two different checkpoints for this seq (lines 2 and 4)",
+    );
+
+    const stranger = (
+      (await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"])) as CryptoKeyPair
+    ).privateKey;
+    const head4 = objs.find((o) => o.type === "entry" && o.seq === 4)!.entry_hash;
+    const forged = await shippedLines([await sign(4, head4, KID, stranger)]);
+    r = await cross(objs, [shipped[0]!, ...forged, shipped[2]!]);
+    expect(r.mismatches.map((m) => m.seq)).toEqual([4]);
+    expect(r.mismatches[0]!.reason).toContain(
+      "shipped checkpoint does not verify: signature does not verify",
+    );
+    const unknown = await shippedLines([await sign(4, head4, "other")]);
+    r = await cross(objs, unknown);
+    expect(r.mismatches[0]!.reason).toContain("unknown signing key `other`");
+  });
+
+  it("reports an envelope that disagrees with its checkpoint", async () => {
+    const objs = await makeExport();
+    const cp = checkpointsOf(objs)[0]!;
+    const reason = async (env: Obj): Promise<string> =>
+      (await cross(objs, [JSON.stringify(env)])).mismatches[0]!.reason;
+    expect(await reason({ ...(await envelope(cp)), checkpoint_sha256: "00".repeat(32) })).toContain(
+      "checkpoint_sha256",
+    );
+    expect(await reason({ ...(await envelope(cp)), kid: "other" })).toContain(
+      "differs from the checkpoint's own",
+    );
+    expect(await reason({ ...(await envelope(cp)), format: "v0" })).toContain(
+      "unsupported format `v0`",
+    );
+  });
+
+  it("counts checkpoints past the export and skips those before a window", async () => {
+    const objs = await makeExport();
+    const log = await makeExport(9, { cps: [3, 6, 9] });
+    const r = await cross(objs, await shippedLines(checkpointsOf(log)));
+    expect(r).toMatchObject({
+      ok: true,
+      inRange: 2,
+      matched: 2,
+      beyondRange: 1,
+      lastShippedSeq: 9,
+    });
+    const window = await makeExport(3, { start: 4, cps: [6] });
+    const w = await cross(window, await shippedLines(checkpointsOf(await makeExport())));
+    expect([w.inRange, w.mismatches.map((m) => m.seq)]).toEqual([1, [6]]);
+  });
+
+  it("matches the genesis checkpoint and accepts an empty shipped file", async () => {
+    const objs = await makeExport(6, { cps: [0, 3, 6] });
+    objs.push({ type: "checkpoint", ...(await sign(0, GENESIS_HASH)) });
+    const g = await cross(objs, await shippedLines([await sign(0, GENESIS_HASH)]));
+    expect(g.matched).toBe(1);
+    const empty = await cross(objs, []);
+    expect(empty).toMatchObject({ ok: true, shipped: 0, lastShippedSeq: undefined });
+  });
+
+  it.each([
+    ["not json\n", "shipped checkpoints, line 1"],
+    ["[1]\n", "not a JSON object"],
+    ['{"type":"entry","seq":1}\n', "not a checkpoint line"],
+    ['{"seq":1}\n', "head_hash"],
+    ['{"checkpoint":1,"format":"x","kid":"k","signature":"s","checkpoint_sha256":"h"}\n', "object"],
+  ])("rejects a shipped file that is not checkpoints: %s", async (text, match) => {
+    await expect(parseShipped([text])).rejects.toThrow(match);
+    await expect(cross(await makeExport(), [text])).rejects.toThrow(ExportError);
+  });
+
+  it("refuses what verifyExport refuses", async () => {
+    const objs = await makeExport();
+    await expect(cross(objs.slice(1), [])).rejects.toThrow("no header");
+    const o = { checkpointPublicKeys: { [KID]: "AAAA" } };
+    await expect(crossCheck(lines(objs), [], o)).rejects.toThrow("32 bytes");
   });
 });

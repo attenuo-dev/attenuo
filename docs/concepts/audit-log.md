@@ -94,7 +94,7 @@ attenuo audit export --out export.jsonl
 attenuo audit verify --file export.jsonl --jwks jwks.json --checkpoints shipped.jsonl
 ```
 
-For every shipped checkpoint inside the export's range, the export must hold the same checkpoint at that `seq`, field for field, and its entry there must hash to the shipped `head_hash`. A different checkpoint is reported as signed again after shipping (with the fields that differ); a missing one as deleted. A shipped copy whose signature does not verify against the JWKS, or whose envelope disagrees with itself, is reported instead of trusted. Shipped checkpoints past the export's range are counted (`beyond_range`): if the export runs to the head of the log, the log is shorter than what was shipped. Exit status 2 on any mismatch. In code: `attenuo_audit::{parse_shipped, cross_check}`.
+For every shipped checkpoint inside the export's range, the export must hold the same checkpoint at that `seq`, field for field, and its entry there must hash to the shipped `head_hash`. A different checkpoint is reported as signed again after shipping (with the fields that differ); a missing one as deleted. A shipped copy whose signature does not verify against the JWKS, or whose envelope disagrees with itself, is reported instead of trusted. Shipped checkpoints past the export's range are counted (`beyond_range`): if the export runs to the head of the log, the log is shorter than what was shipped. Exit status 2 on any mismatch. In code: `attenuo_audit::{parse_shipped, cross_check}`, `attenuo.audit.cross_check` (Python) and `crossCheck` (TypeScript); see [Verifying in code](#verifying-in-code).
 
 ## Reading and verifying
 
@@ -126,7 +126,9 @@ import { verifyExport } from "@attenuo/sdk";
 const report = await verifyExport({ path: "audit.jsonl" }, { checkpointPublicKeys: jwks });
 ```
 
-Both follow the Rust check rule for rule: the same file gets the same verdict and the same `first_bad_seq`. A file that is not an export at all (no header, wrong format, filtered, not JSON) raises `ExportError`. The cross-language test in `sdk/python/tests/test_integration.py` exports from a real server, flips one byte and checks that the Rust CLI, Python and TypeScript all name the same `seq`. They are a little stricter than Rust in two ways: they hash the record as it appears in the file (Rust decodes it into its record type first and so ignores a member it does not know), and they refuse duplicate object members. TypeScript also refuses integers beyond 2^53 (Python and Rust keep a `u64` seq exact).
+`cross_check(export, shipped, checkpoint_public_keys=jwks)` in Python and `crossCheck(export, shipped, { checkpointPublicKeys })` in TypeScript run the shipped-checkpoint cross-check above with the same findings: signed again after shipping, deleted, two different shipped copies for one `seq`, and a shipped copy that does not verify, each with the Rust reason text and the line of the shipped file.
+
+Both follow the Rust check rule for rule: the same file gets the same verdict and the same `first_bad_seq`. A file that is not an export at all (no header, wrong format, filtered, not JSON) raises `ExportError`. The cross-language tests in `sdk/python/tests/test_integration.py` export from a real server, flip one byte and check that the Rust CLI, Python and TypeScript all name the same `seq`; a second one runs a server with a file sink and the issuer key in the test's hands, rewrites and re-signs the export, deletes a checkpoint, and tampers with the shipped file, and checks that all three report the same mismatches (`seq`, line and reason). They are a little stricter than Rust in two ways: they hash the record as it appears in the file (Rust decodes it into its record type first and so ignores a member it does not know), and they refuse duplicate object members. TypeScript also refuses integers beyond 2^53 (Python and Rust keep a `u64` seq exact).
 
 ## What the chain does not prove
 
@@ -135,7 +137,7 @@ Entries after the last checkpoint are protected by the hash chain only, and the 
 
 ## Not built yet, or uncertain
 
-The checkpoint sink ships what the server signs; entries after the newest checkpoint are not covered until the next one is signed (at most `checkpoint_every` entries or `checkpoint_interval_seconds`). The SDKs verify exports but do not yet cross-check shipped checkpoints; use the CLI or `attenuo_audit::cross_check`.
+The checkpoint sink ships what the server signs; entries after the newest checkpoint are not covered until the next one is signed (at most `checkpoint_every` entries or `checkpoint_interval_seconds`).
 
 Revocations, policy reloads and dev root mints are appended to the log as admin actions (reason `admin_action`, server `attenuo`, subject `urn:attenuo:admin`, which no user can have). To pick out server events, filter on `kind` (anything but `decision`), or on `server = "attenuo"` and the tool (`token.*`, `lease.renew`, `admin.*`); no upstream or agent can use the name `attenuo`. The revoke response carries the `audit_id` of that record, or says that the append failed.
 

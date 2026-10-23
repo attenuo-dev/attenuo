@@ -11,6 +11,17 @@ for rule, so the same file gives the same verdict, and the same ``first_bad_seq`
     report = verify_export("audit.jsonl", checkpoint_public_keys=jwks)  # GET /.well-known/jwks.json
     assert report.ok, report
 
+``cross_check`` adds the SR-21 comparison with checkpoints the server shipped off the host
+(``[audit.sink]``), the Rust ``cross_check`` (``attenuo audit verify --file --checkpoints``) rule
+for rule: a checkpoint signed again after it was shipped, one deleted from the export, two
+different shipped copies for one seq, and a shipped copy that does not verify are reported with
+the same ``seq`` and reason in both::
+
+    from attenuo.audit import cross_check
+
+    cross = cross_check("audit.jsonl", "shipped.jsonl", checkpoint_public_keys=jwks)
+    assert cross.ok, cross.mismatches
+
 A file that fails verification gives a report with ``ok == False``; a file that cannot be read
 as an export at all (no header, the wrong format, a filtered export, a line that is not JSON)
 raises :class:`ExportError`. The Ed25519 check needs the ``cryptography`` package
@@ -42,10 +53,16 @@ __all__ = [
     "ENTRY_HASH_VERSION",
     "EXPORT_FORMAT",
     "GENESIS_HASH",
+    "SHIPPED_FORMAT",
     "BadCheckpoint",
+    "CrossCheckReport",
     "ExportError",
     "ExportReport",
+    "ShippedLine",
+    "ShippedMismatch",
+    "cross_check",
     "entry_hash",
+    "parse_shipped",
     "verify_export",
 ]
 
@@ -55,7 +72,10 @@ ENTRY_HASH_VERSION = "attenuo-audit-entry-v2"
 GENESIS_HASH = "0" * 64
 #: Value of the header's ``format`` member.
 EXPORT_FORMAT = "attenuo-audit-export-v2"
+#: Value of a shipped checkpoint's ``format`` member.
+SHIPPED_FORMAT = "attenuo-shipped-checkpoint-v1"
 _CHECKPOINT_CONTEXT = "attenuo-checkpoint-v1"
+_CP_FIELDS = ("seq", "head_hash", "at", "kid", "signature")
 _U64_MAX = 2**64 - 1
 _B64URL = re.compile(r"[A-Za-z0-9_-]*")
 
@@ -98,6 +118,49 @@ class ExportReport:
     outside_range: int = 0
     #: Failed only because of an unsigned tail that ``allow_unsigned_tail`` did not accept.
     unsigned_tail_rejected: bool = False
+
+
+@dataclass(frozen=True)
+class ShippedLine:
+    """One parsed line of a shipped-checkpoint file."""
+
+    #: 1-based line number in the file.
+    line: int
+    #: The five checkpoint members: ``seq``, ``head_hash``, ``at``, ``kid``, ``signature``.
+    checkpoint: Mapping[str, Any]
+    #: Set when the line was an envelope that does not match its own checkpoint.
+    inconsistency: str | None = None
+
+
+@dataclass(frozen=True)
+class ShippedMismatch:
+    """A shipped checkpoint the export disagrees with, or one that is unusable."""
+
+    seq: int
+    #: Line of the shipped file.
+    line: int
+    reason: str
+
+
+@dataclass(frozen=True)
+class CrossCheckReport:
+    """The verdict of :func:`cross_check` (the fields of the Rust ``CrossCheckReport``)."""
+
+    #: Lines in the shipped file.
+    shipped: int
+    #: Shipped checkpoints whose seq lies in the export header's ``from..=to`` (checked).
+    in_range: int
+    #: Of those, the ones the export agrees with.
+    matched: int
+    #: Shipped checkpoints past the export's range: not checked. If the export was taken up to
+    #: the head of the log, these say the log is shorter than what was shipped.
+    beyond_range: int
+    #: Highest seq in the shipped file.
+    last_shipped_seq: int | None
+    #: In the order of the shipped file; the first is the first offending seq.
+    mismatches: tuple[ShippedMismatch, ...]
+    #: No mismatches.
+    ok: bool
 
 
 def entry_hash(seq: int, prev_hash: str, record: Mapping[str, Any]) -> str:
@@ -228,6 +291,173 @@ def verify_export(
         truncated=truncated,
         outside_range=outside,
         unsigned_tail_rejected=tail_rejected,
+    )
+
+
+def parse_shipped(
+    path_or_lines: str | os.PathLike[str] | Iterable[str | bytes],
+) -> list[ShippedLine]:
+    """Parse a JSONL file of shipped checkpoints (``[audit.sink]`` file output).
+
+    A line is the sink's envelope (``format``, ``checkpoint``, ``kid``, ``signature``,
+    ``checkpoint_sha256``) or a bare checkpoint (an export's ``checkpoint`` line, or
+    ``GET /admin/audit/checkpoint`` saved by an operator's own job). Blank lines are skipped;
+    anything else raises :class:`ExportError`. An envelope that disagrees with its own
+    checkpoint is not an error here: the line carries ``inconsistency`` and
+    :func:`cross_check` reports it.
+    """
+    out: list[ShippedLine] = []
+    for n, raw in enumerate(_read_text(path_or_lines).split("\n"), start=1):
+        line = raw.removesuffix("\r")
+        if not line.strip():
+            continue
+        where = f"shipped checkpoints, line {n}"
+        try:
+            obj = _loads(line)
+        except ValueError as e:
+            raise ExportError(f"{where}: {e}") from e
+        if not isinstance(obj, dict):
+            raise ExportError(f"{where}: not a JSON object")
+        if "checkpoint" in obj:
+            _need(obj, where, format="str", kid="str", signature="str", checkpoint_sha256="str")
+            if obj.get("public_url") is not None and not isinstance(obj["public_url"], str):
+                raise ExportError(f"{where}: `public_url` must be a string")
+            if not isinstance(obj["checkpoint"], dict):
+                raise ExportError(f"{where}: `checkpoint` must be an object")
+            cp = _cp5(_checkpoint(obj["checkpoint"], where))
+            out.append(ShippedLine(n, cp, _inconsistency(obj, cp)))
+        else:
+            kind = obj.pop("type", "checkpoint")
+            if kind != "checkpoint":
+                raise ExportError(f"{where}: not a checkpoint line (type {json.dumps(kind)})")
+            out.append(ShippedLine(n, _cp5(_checkpoint(obj, where))))
+    return out
+
+
+def _cp5(c: Mapping[str, Any]) -> dict[str, Any]:
+    return {k: c[k] for k in _CP_FIELDS}
+
+
+def _checkpoint_sha256(cp: Mapping[str, Any]) -> str:
+    """Hex SHA-256 of the RFC 8785 canonical JSON of the five checkpoint members."""
+    # Members in code-unit order; `seq` by hand since `rfc8785` refuses integers beyond 2**53.
+    data = b'{"at":%s,"head_hash":%s,"kid":%s,"seq":%d,"signature":%s}' % (
+        rfc8785.dumps(cp["at"]),
+        rfc8785.dumps(cp["head_hash"]),
+        rfc8785.dumps(cp["kid"]),
+        cp["seq"],
+        rfc8785.dumps(cp["signature"]),
+    )
+    return hashlib.sha256(data).hexdigest()
+
+
+def _inconsistency(env: Mapping[str, Any], cp: Mapping[str, Any]) -> str | None:
+    if env["format"] != SHIPPED_FORMAT:
+        return f"unsupported format `{env['format']}`"
+    if env["kid"] != cp["kid"] or env["signature"] != cp["signature"]:
+        return "`kid` or `signature` differs from the checkpoint's own"
+    if env["checkpoint_sha256"] != _checkpoint_sha256(cp):
+        return "`checkpoint_sha256` does not match the checkpoint"
+    return None
+
+
+def cross_check(
+    export: str | os.PathLike[str] | Iterable[str | bytes],
+    shipped: str | os.PathLike[str] | Iterable[str | bytes],
+    *,
+    checkpoint_public_keys: Mapping[str, Any],
+) -> CrossCheckReport:
+    """Compare an audit export with checkpoints shipped off the host (SR-21).
+
+    A signed checkpoint proves the log prefix ``1..=seq`` hashed to ``head_hash``, but it is
+    signed with the server's own key: someone who holds the host and that key can rewrite the
+    log and sign fresh checkpoints, and the export then verifies. A copy of the original
+    checkpoint that already left the host (the checkpoint sink) is what they cannot change.
+
+    ``export`` and ``shipped`` are file paths or iterables of lines, as for
+    :func:`verify_export`; ``checkpoint_public_keys`` is the same JWKS or ``kid`` map. For each
+    shipped checkpoint inside the export's declared range:
+
+    - it must verify against the keys (a forged shipped copy would otherwise be trusted);
+    - the export must hold a checkpoint at that seq, identical in every member: a different
+      one was **signed again after shipping**, none at all means it was **deleted**;
+    - the export's entry at that seq must hash to the shipped ``head_hash``.
+
+    Two different shipped checkpoints for one seq are reported too, and so is an envelope whose
+    ``kid``, ``signature`` or ``checkpoint_sha256`` disagrees with its checkpoint. This does not
+    replace :func:`verify_export`: run both.
+    """
+    keys = _load_keys(checkpoint_public_keys)
+    header, entries, cps = _parse(_read_text(export))
+    lines = parse_shipped(shipped)
+    lo, hi = header["from"], header["to"]
+    exported = {c["seq"]: _cp5(c) for c in cps}
+    entry_hashes = {e["seq"]: e["entry_hash"] for e in entries}
+    first_by_seq: dict[int, ShippedLine] = {}
+    mismatches: list[ShippedMismatch] = []
+    in_range = matched = beyond = 0
+    for s in lines:
+        cp = s.checkpoint
+        seq = cp["seq"]
+
+        def fail(reason: str, s: ShippedLine = s, seq: int = seq) -> None:
+            mismatches.append(ShippedMismatch(seq, s.line, reason))
+
+        if s.inconsistency is not None:
+            fail(f"shipped envelope is inconsistent: {s.inconsistency}")
+            continue
+        prev = first_by_seq.get(seq)
+        if prev is None:
+            first_by_seq[seq] = s
+        elif prev.checkpoint != cp:
+            fail(
+                "the sink holds two different checkpoints for this seq "
+                f"(lines {prev.line} and {s.line}): "
+                "the seq was signed again after the first was shipped"
+            )
+            continue
+        # else: a retried delivery, same content
+        if seq > hi:
+            beyond += 1
+            continue
+        if seq < lo and not (seq == 0 and lo <= 1):
+            continue
+        in_range += 1
+        why = _verify_checkpoint(cp, keys)
+        if why is not None:
+            fail(f"shipped checkpoint does not verify: {why}")
+            continue
+        problems: list[str] = []
+        e = exported.get(seq)
+        if e is None:
+            problems.append("the export has no checkpoint at this seq (deleted after shipping)")
+        elif e != cp:
+            diff = [k for k in ("head_hash", "signature", "at", "kid") if e[k] != cp[k]]
+            problems.append(
+                "RE-SIGNED after shipping: the export's checkpoint at this seq differs in "
+                + ", ".join(diff)
+            )
+        if seq > 0:
+            h = entry_hashes.get(seq)
+            if h is None:
+                problems.append("the export has no entry at this seq")
+            elif h != cp["head_hash"]:
+                problems.append(
+                    "the export's entry at this seq does not hash to the shipped head_hash "
+                    "(history rewritten after shipping)"
+                )
+        if problems:
+            fail("; ".join(problems))
+        else:
+            matched += 1
+    return CrossCheckReport(
+        shipped=len(lines),
+        in_range=in_range,
+        matched=matched,
+        beyond_range=beyond,
+        last_shipped_seq=max((s.checkpoint["seq"] for s in lines), default=None),
+        mismatches=tuple(mismatches),
+        ok=not mismatches,
     )
 
 
@@ -412,7 +642,7 @@ def _raw_key(kid: str, v: Any) -> bytes:
     return raw
 
 
-def _verify_checkpoint(cp: dict[str, Any], keys: dict[str, bytes]) -> str | None:
+def _verify_checkpoint(cp: Mapping[str, Any], keys: dict[str, bytes]) -> str | None:
     """``None`` when the signature verifies, else why not."""
     key = keys.get(cp["kid"])
     if key is None:
