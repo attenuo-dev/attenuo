@@ -28,7 +28,7 @@ use time::{Duration, OffsetDateTime};
 /// The policy `onbehalf-bench` runs (the leak demo's, server `fake`).
 const POLICY: &str = r#"
 @id("read_file_public_repos_only")
-permit(principal, action == Action::"read_file", resource)
+permit(principal, action == Action::"fake/read_file", resource)
 when { context.input has repo && context.input.repo like "alice/public-*" };
 
 @id("forbid_sensitive_without_mfa")
