@@ -4,11 +4,12 @@
 use std::sync::Arc;
 
 use attenuo_proxy::testing::{spawn_router, Spawned};
-use attenuo_server::admin_ui::{CSP, SECURITY_HEADERS};
+use attenuo_server::admin_ui::{ASSETS, CSP, SECURITY_HEADERS};
 use attenuo_server::{AppState, Config};
 use reqwest::header::HeaderMap;
 use reqwest::{redirect, StatusCode};
 use serde_json::{json, Value};
+use sha2::Digest;
 
 const ADMIN: &str = "admin";
 
@@ -68,7 +69,15 @@ impl Harness {
     }
 
     async fn mint_root(&self) -> String {
-        let r: Value = Self::client()
+        self.mint_root_full().await["lease"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// The whole answer of the dev mint: `access_token`, `lease`, ...
+    async fn mint_root_full(&self) -> Value {
+        Self::client()
             .post(self.main.url("/admin/root-token"))
             .bearer_auth(ADMIN)
             .json(&json!({"subject": "alice", "issuer": "https://idp.example",
@@ -78,8 +87,29 @@ impl Harness {
             .unwrap()
             .json()
             .await
+            .unwrap()
+    }
+
+    async fn admin_get(&self, path: &str) -> reqwest::Response {
+        Self::client()
+            .get(self.console.url(path))
+            .bearer_auth(ADMIN)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn head(&self) -> u64 {
+        let r: Value = Self::client()
+            .get(self.console.url("/admin/audit?order=desc&limit=1"))
+            .bearer_auth(ADMIN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
             .unwrap();
-        r["lease"].as_str().unwrap().to_string()
+        r["head"].as_u64().unwrap()
     }
 }
 
@@ -140,10 +170,14 @@ async fn index_is_html_with_the_exact_security_headers() {
 async fn assets_have_their_content_type_and_unknown_ones_404() {
     let h = Harness::start(false).await;
     for (path, ct) in [
-        ("/admin/ui/app.js", "text/javascript; charset=utf-8"),
-        ("/admin/ui/app.css", "text/css; charset=utf-8"),
-        ("/admin/ui/index.html", "text/html; charset=utf-8"),
-    ] {
+        ("app.js", "text/javascript; charset=utf-8"),
+        ("app.css", "text/css; charset=utf-8"),
+        ("index.html", "text/html; charset=utf-8"),
+    ]
+    .into_iter()
+    .chain(ASSETS.iter().map(|a| (a.path, a.content_type)))
+    {
+        let path = &format!("/admin/ui/{path}");
         let r = h.get(path).await;
         assert_eq!(r.status(), StatusCode::OK, "{path}");
         assert_eq!(r.headers()["content-type"], ct, "{path}");
@@ -170,10 +204,11 @@ async fn etag_and_if_none_match_give_304() {
     let h = Harness::start(false).await;
     let r = h.get("/admin/ui/app.js").await;
     let etag = r.headers()["etag"].to_str().unwrap().to_string();
-    // SHA-256 of the empty placeholder.
+    // The SHA-256 of the embedded file.
+    let app_js = ASSETS.iter().find(|a| a.path == "app.js").unwrap();
     assert_eq!(
         etag,
-        "\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\""
+        format!("\"{}\"", hex::encode(sha2::Sha256::digest(app_js.bytes)))
     );
     let r = Harness::client()
         .get(h.console.url("/admin/ui/app.js"))
@@ -219,7 +254,13 @@ async fn read_routes_need_the_admin_bearer_and_carry_no_store() {
         "/admin/audit/verify",
         "/admin/audit/checkpoint",
         "/admin/audit/export",
+        "/admin/audit/checkpoints",
+        "/admin/audit/entries/1",
+        "/admin/audit/records/00000000-0000-0000-0000-000000000000",
         "/admin/leases/nope",
+        "/admin/leases/nope/tree",
+        "/admin/policies",
+        "/admin/policies/check",
     ] {
         let r = h.get(path).await;
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{path}");
@@ -246,6 +287,114 @@ async fn read_routes_need_the_admin_bearer_and_carry_no_store() {
         .unwrap();
     assert_eq!(r.status(), StatusCode::NOT_FOUND);
     assert_no_store(r.headers());
+}
+
+/// The read routes the console pages use, mounted without `allow_write`, with the bearer.
+#[tokio::test]
+async fn console_page_routes_are_mounted_without_allow_write() {
+    let h = Harness::start(false).await;
+    let lease = h.mint_root().await;
+    for (path, want) in [
+        (
+            "/admin/audit/checkpoints?limit=20".to_string(),
+            StatusCode::OK,
+        ),
+        ("/admin/audit/entries/1".to_string(), StatusCode::OK),
+        (
+            "/admin/audit/entries/999".to_string(),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "/admin/audit/records/00000000-0000-0000-0000-000000000000".to_string(),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            "/admin/audit/records/nope".to_string(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (format!("/admin/leases/{lease}/tree"), StatusCode::OK),
+        ("/admin/policies".to_string(), StatusCode::OK),
+        // No policies_path in this config: the check says there is nothing to check.
+        ("/admin/policies/check".to_string(), StatusCode::CONFLICT),
+    ] {
+        let r = h.admin_get(&path).await;
+        assert_eq!(r.status(), want, "{path}");
+        assert_security_headers(r.headers());
+        assert_no_store(r.headers());
+    }
+    let tree: Value = h
+        .admin_get(&format!("/admin/leases/{lease}/tree"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(tree["root"], lease.as_str());
+    assert_eq!(tree["would_revoke"], 1);
+    let entry: Value = h
+        .admin_get("/admin/audit/entries/1")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(entry["entry"]["seq"], 1);
+    assert!(entry["lease_states"].is_array());
+}
+
+/// The dry run is mounted read-only, needs JSON, and writes nothing.
+#[tokio::test]
+async fn policy_evaluate_is_a_json_only_dry_run_on_the_console() {
+    let h = Harness::start(false).await;
+    let token = h.mint_root_full().await["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let url = h.console.url("/admin/policies/evaluate");
+    let body = json!({
+        "token": token,
+        "subject": {"type": "agent", "id": ""},
+        "action": {"name": "read_file"},
+        "resource": {"type": "tool", "id": "github/read_file", "properties": {"server": "github"}},
+        "context": {"input": {"repo": "alice/public-docs"}}
+    });
+    // No bearer: 401 before anything else.
+    let r = Harness::client()
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+    // Not JSON: 415, as for the write routes.
+    let r = Harness::client()
+        .post(&url)
+        .bearer_auth(ADMIN)
+        .header("content-type", "text/plain")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_security_headers(r.headers());
+    let before = h.head().await;
+    let r = Harness::client()
+        .post(&url)
+        .bearer_auth(ADMIN)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_security_headers(r.headers());
+    assert_no_store(r.headers());
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["lease_check"], "skipped");
+    assert_eq!(v["chain_source"], "token");
+    assert!(v["decision"] == "allow" || v["decision"] == "deny", "{v}");
+    assert_eq!(
+        h.head().await,
+        before,
+        "a dry run must not write an audit record"
+    );
 }
 
 #[tokio::test]
