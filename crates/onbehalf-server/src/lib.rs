@@ -31,6 +31,7 @@ pub mod error;
 pub mod idp;
 pub mod jwks;
 pub mod metrics;
+pub mod replay;
 pub mod routes;
 pub mod state;
 

@@ -31,7 +31,9 @@
 //! the parent chain is 400 `invalid_request` / `duplicate_actor`.
 //!
 //! Besides what `ExchangeRequest::execute` checks (signature, chain validity, attenuation,
-//! depth), the parent's leases must all be live: a revoked parent cannot delegate. The new lease
+//! depth), the parent's leases must all be live: a revoked parent cannot delegate. A parent
+//! token delegates to a given actor once; a second exchange of the same parent for the same
+//! actor is 400 `invalid_grant` / `replayed` until the parent expires ([`crate::replay`]). The new lease
 //! is registered as a child of the parent token's last lease, so revoking the parent cascades.
 
 use std::sync::Arc;
@@ -118,6 +120,12 @@ pub async fn exchange(
             ),
         ));
     }
+    // A parent token delegates to a given actor once (see `crate::replay`).
+    state.replay.use_once(
+        &format!("exchange\n{}\n{}", parent.claims.jti, req.actor.0),
+        parent.claims.exp,
+        now,
+    )?;
     let resp = req.execute(&state.issuer, now)?;
     // The response carries no chain; read it back from the token we just minted.
     let issued = state.verifier.verify(&resp.access_token, now)?;

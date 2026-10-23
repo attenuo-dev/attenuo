@@ -102,6 +102,8 @@ mod tests {
             subject: "alice".into(),
             claims: claims.as_object().unwrap().clone(),
             attribute_claims: vec!["email".into(), "groups".into(), "amr".into()],
+            expires_at: 0,
+            clock_skew_seconds: 0,
         }
     }
 

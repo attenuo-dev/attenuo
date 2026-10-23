@@ -1492,3 +1492,24 @@ async fn resources_and_unknown_methods_are_authorized_through_the_pipeline() {
         .collect();
     assert!(tools.contains(&"resources/read") && tools.contains(&"vendor/x"));
 }
+
+/// A parent token delegates to a given actor once; other actors are unaffected.
+#[tokio::test]
+async fn exchanging_the_same_parent_for_the_same_actor_twice_is_refused() {
+    let h = Harness::start().await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let _coder = h
+        .exchange(&root.token, "coder", &["github:read_file"])
+        .await;
+    let resp = h
+        .exchange_raw(&root.token, "coder", &["github:read_file"])
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "invalid_grant", "{body}");
+    assert_eq!(body["error_description"], "replayed", "{body}");
+    // A different actor from the same parent is fine.
+    let _reviewer = h
+        .exchange(&root.token, "reviewer", &["github:read_file"])
+        .await;
+}

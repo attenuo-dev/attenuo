@@ -44,6 +44,8 @@ pub struct AppState {
     /// Precomputed `/.well-known/jwks.json` body.
     pub jwks: Value,
     pub metrics: Arc<Metrics>,
+    /// One-time use of IdP credentials and of (parent token, actor) exchanges.
+    pub replay: crate::replay::ReplayCache,
 }
 
 impl AppState {
@@ -120,6 +122,7 @@ impl AppState {
             lease_interval: lease_interval(config)?,
             jwks,
             metrics,
+            replay: crate::replay::ReplayCache::default(),
         })
     }
 

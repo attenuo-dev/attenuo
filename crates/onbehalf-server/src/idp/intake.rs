@@ -18,8 +18,10 @@
 //! ([`IdpRegistry::verify`](super::IdpRegistry::verify), `invalid_grant`); for an ID-JAG,
 //! require its `client_id` to be the authenticated agent; build the originating user
 //! ([`claims::originating_user`]); find the `[[root_grants]]` entry for (issuer, agent,
-//! subject) and attenuate the request against it (`invalid_scope`); then `Issuer::issue_root`,
-//! register the lease, and audit as `token.root` / `token_issued`.
+//! subject) and attenuate the request against it (`invalid_scope`); cap the TTL at the
+//! credential's remaining lifetime (`credential_expired` if none is left); use the credential
+//! once ([`crate::replay`], `replayed`); then `Issuer::issue_root`, register the lease, and
+//! audit as `token.root` / `token_issued`.
 
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
@@ -147,9 +149,27 @@ pub async fn handle(
         .attenuate(&requested)
         .map_err(|e| invalid_scope("scope_exceeds_grant", e.to_string()))?;
 
-    let ttl = req
+    // The root token never outlives the credential it was minted from.
+    let requested_ttl = req
         .requested_ttl_seconds
-        .map(|s| Duration::seconds(i64::try_from(s).unwrap_or(i64::MAX)));
+        .map(|s| Duration::seconds(i64::try_from(s).unwrap_or(i64::MAX)))
+        .unwrap_or(state.issuer.config().default_ttl);
+    let remaining = Duration::seconds(verified.expires_at - now.unix_timestamp());
+    if remaining < Duration::seconds(1) {
+        return Err(ApiError::bad_request(
+            "invalid_grant",
+            "the credential expires now; present a fresh one",
+        )
+        .with_description("credential_expired"));
+    }
+    let ttl = Some(requested_ttl.min(remaining));
+
+    let skew = i64::try_from(verified.clock_skew_seconds).unwrap_or(i64::MAX);
+    state.replay.use_once(
+        &verified.replay_key(credential),
+        verified.expires_at.saturating_add(skew),
+        now,
+    )?;
     let issued =
         state
             .issuer

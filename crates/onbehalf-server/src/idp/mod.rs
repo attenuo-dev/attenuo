@@ -29,9 +29,11 @@
 //!    `clock_skew_seconds` of leeway, then `sub` (required, non-empty).
 //!
 //! `nonce` is ignored: it binds an ID token to the browser session that requested it, and the
-//! agent presenting the token here is not that session. Replay within the token's lifetime is
-//! bounded instead by requiring the agent's own client credentials and by the root grants.
-//! There is no `jti` replay cache in v0.
+//! agent presenting the token here is not that session. Replay is bounded instead by requiring
+//! the agent's own client credentials, by the root grants, and by using each credential once:
+//! a second presentation of the same (`iss`, `jti`), or of the same credential when it has no
+//! `jti`, is refused with `replayed` ([`crate::replay`]). The root token issued from a
+//! credential never outlives the credential's `exp`.
 //!
 //! # Errors
 //!
@@ -176,6 +178,26 @@ pub struct VerifiedAssertion {
     pub claims: Map<String, Value>,
     /// `[[idps]] attribute_claims` of the issuer.
     pub attribute_claims: Vec<String>,
+    /// `exp`, unix seconds.
+    pub expires_at: i64,
+    /// `[[idps]] clock_skew_seconds` of the issuer: the credential is accepted until
+    /// `expires_at` plus this.
+    pub clock_skew_seconds: u64,
+}
+
+impl VerifiedAssertion {
+    /// The key under which the credential is used once: (`iss`, `jti`), or the SHA-256 of the
+    /// credential when it has no `jti`.
+    pub fn replay_key(&self, credential: &str) -> String {
+        use sha2::{Digest, Sha256};
+        match self.claims.get("jti").and_then(Value::as_str) {
+            Some(jti) if !jti.is_empty() => format!("idp\n{}\n{jti}", self.issuer),
+            _ => format!(
+                "idp-sha256\n{}",
+                hex::encode(Sha256::digest(credential.as_bytes()))
+            ),
+        }
+    }
 }
 
 struct TrustedIdp {
@@ -310,12 +332,16 @@ impl IdpRegistry {
             now,
             idp.config.clock_skew_seconds,
         )?;
+        // `check_claims` required a numeric `exp`.
+        let expires_at = claims.get("exp").and_then(Value::as_i64).unwrap_or(0);
         Ok(VerifiedAssertion {
             kind,
             issuer: idp.config.issuer.clone(),
             subject,
             claims,
             attribute_claims: idp.config.attribute_claims.clone(),
+            expires_at,
+            clock_skew_seconds: idp.config.clock_skew_seconds,
         })
     }
 }

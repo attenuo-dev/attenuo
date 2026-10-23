@@ -115,6 +115,7 @@ sequenceDiagram
         T-->>C: 400 invalid_grant "subject token cannot delegate: lease_revoked"
     end
     T->>T: actor already in the parent chain? 400 invalid_request duplicate_actor
+    T->>T: replay cache: (parent jti, actor) used before? 400 invalid_grant replayed
     T->>I: ExchangeRequest::execute (attenuation, depth, expiry clamp)
     I-->>T: child token (or 400 invalid_scope / invalid_grant)
     T->>L: register(child lease, parent = parent's last lease, expires_at), bind(child lease, chain digest)
@@ -149,9 +150,12 @@ The root token of every chain is minted at `POST /token` from a user credential 
 4. **ID-JAG claims** (`idp::claims::map_id_jag`, the one place that depends on the draft's claim names): `client_id` is required and must be the authenticated agent.
 5. **Originating user** (`idp::claims::originating_user`): `subject` = `sub`, `issuer` = `iss`, `authenticated_at` = `auth_time`, else `iat`; `attributes` = the claims listed in `attribute_claims` (default `email`, `groups`, `amr`) plus `mfa: bool`, true when `amr` contains `mfa`, `otp`, `hwk` or `swk` (RFC 8176 values for a second factor or a key; `pwd`, `sms` and the rest do not count on their own).
 6. **Root grant.** The `[[root_grants]]` entry for (issuer, agent), preferring one whose `subject` equals `sub`, is the ceiling; `CapabilitySet::attenuate(requested)` must succeed. No entry: `invalid_scope` / `no_root_grant`. Wider than the entry: `invalid_scope` / `scope_exceeds_grant`.
-7. **Issue, register, audit**: `Issuer::issue_root`, a lease with no parent, and an audit record `token.root` / `token_issued`. If the audit append fails the lease is revoked and the request fails.
+7. **Lifetime and one-time use.** The root token's TTL (requested, else the issuer default) is capped at the credential's remaining lifetime, `exp - now`; a credential inside the clock skew after its `exp` has none left and gets `invalid_grant` / `credential_expired`. The credential is then recorded in the replay cache (module `replay`) under (`iss`, `jti`), or the SHA-256 of the credential when it has no `jti`, until `exp` plus the skew. A second presentation, by any agent, is `invalid_grant` / `replayed`.
+8. **Issue, register, audit**: `Issuer::issue_root`, a lease with no parent, and an audit record `token.root` / `token_issued`. If the audit append fails the lease is revoked and the request fails.
 
-`nonce` is ignored on purpose: it binds an ID token to the browser session that requested it, and the agent presenting it here is not that session. What stops someone who has only a leaked ID token is step 1; what limits an agent that has one is step 6.
+`nonce` is ignored on purpose: it binds an ID token to the browser session that requested it, and the agent presenting it here is not that session. What stops someone who has only a leaked ID token is step 1; what limits an agent that has one is steps 6 and 7.
+
+The replay cache also covers exchanges: a parent token delegates to a given actor once, keyed by (parent `jti`, actor) until the parent's `exp`. Delegating to another agent is unaffected; a holder that wants a child to live longer renews its lease instead of exchanging again. The cache is in memory and bounded (100 000 live entries): expired entries are dropped first, and when it is still full, issuance fails closed with `503 temporarily_unavailable` / `replay_cache_full`. It is per process, so a restart, or a second replica, forgets what was used.
 
 ```mermaid
 sequenceDiagram
@@ -195,9 +199,9 @@ One cache per IdP. The JWKS location is `jwks_url`, or `jwks_uri` from `<issuer>
 |---|---|---|
 | `invalid_client` | 401 | `client_auth_missing`, `client_authentication_failed`, `malformed_client_auth`, `no_agents_configured` |
 | `invalid_request` | 400 | `actor_mismatch`, `duplicate_actor` (exchange), `multiple_client_auth`, `no_capabilities_requested`, `unsupported_token_type`, `malformed_request` |
-| `invalid_grant` | 400 | `malformed_token`, `typ_mismatch`, `untrusted_issuer`, `unsupported_alg`, `missing_kid`, `unknown_kid`, `bad_signature`, `audience_mismatch`, `expired`, `not_yet_valid`, `missing_claim`, `client_id_mismatch` |
+| `invalid_grant` | 400 | `malformed_token`, `typ_mismatch`, `untrusted_issuer`, `unsupported_alg`, `missing_kid`, `unknown_kid`, `bad_signature`, `audience_mismatch`, `expired`, `not_yet_valid`, `missing_claim`, `client_id_mismatch`, `credential_expired`, `replayed` (also for a repeated exchange) |
 | `invalid_scope` | 400 | `no_root_grant`, `scope_exceeds_grant` |
-| `temporarily_unavailable` | 503 | `jwks_unavailable` |
+| `temporarily_unavailable` | 503 | `jwks_unavailable`, `replay_cache_full` |
 
 These codes are stable; `detail` is prose and may change.
 
@@ -254,11 +258,10 @@ Non-MCP endpoints answer errors as `{"error": "<code>", "detail": "<text>"}` wit
 
 - Admin authentication is one static bearer (`[admin] token`, or `ONBEHALF_ADMIN_TOKEN`, which overrides it). Off a loopback `listen` address the server refuses to start when it is missing, shorter than 32 bytes or a published placeholder; on loopback it warns. Admin actions are audited with `originating_subject` = `admin`, no agents, server `onbehalf` and tool `admin.lease.revoke`, `admin.policies.reload` (a rejected policy file is recorded as `deny` / `policy_invalid`) or `admin.root_token` (next to the `token.root` issuance record).
 - Agents authenticate at hop 0 with a static client secret; no `private_key_jwt` or mTLS.
-- No `jti` replay cache: an ID token (or ID-JAG) can be exchanged again by the same agent until it expires, each time minting a new root.
-- The root token's lifetime is the server's TTL, not bounded by the ID token's `exp`.
+- The replay cache is in memory: it does not survive a restart and is not shared between replicas.
 - The user block does not record which credential it came from (`evidence`, RFC-0001 §3.1); the audit record's argument digest covers the credential type and IdP.
 - ID-JAG follows draft -04; claim mapping is isolated in `idp::claims::map_id_jag` for when the draft changes. The draft's `resource` and `scope` claims are not used.
-- The `actor` in an exchange is asserted, not authenticated (`actor_token` is not checked).
+- The `actor` of an exchange authenticates with its `[[agents]]` client secret (`[token] require_actor_auth`, on by default); `actor_token` is not used.
 - Key rotation is manual (edit the config, restart) but has an overlap: see `previous_key_paths` below.
 - SQLite calls run on the async worker threads; fine at demo load, to be moved to `spawn_blocking` or a pool.
 - No lease cache and no push channel: every request reads the registry, and external PEPs using the AuthZEN endpoint learn of revocation only by asking.
