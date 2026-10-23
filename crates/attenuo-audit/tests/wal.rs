@@ -9,7 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use attenuo_audit::{AuditSink, Durability, SqliteAudit, SqliteLeaseStore, WAL_CHECKPOINT_COMMITS};
+use attenuo_audit::{
+    AuditSink, Durability, SqliteAudit, SqliteLeaseStore, WAL_CHECKPOINT_COMMITS,
+    WAL_WRITER_BACKSTOP_FRAMES,
+};
 use common::record;
 use rusqlite::{Connection, OpenFlags};
 
@@ -151,7 +154,10 @@ fn a_burst_triggers_a_checkpoint_before_the_interval() {
 /// Under continuous load a passive checkpoint never finds every frame copied, and SQLite only
 /// starts the WAL over when it does; the checkpointer's short catch-up pass is what keeps the
 /// WAL from growing for as long as the load lasts (without it this run leaves a WAL of
-/// hundreds of megabytes).
+/// hundreds of megabytes). On a slow box the background thread can still lose the race with
+/// eight writers; then the writer's own backstop caps the WAL at
+/// `WAL_WRITER_BACKSTOP_FRAMES` plus one batch, which is the bound asserted here (the page
+/// size is SQLite's default, 4 KiB; one batch of 256 records is under 16 MB).
 #[test]
 fn the_wal_stays_bounded_under_continuous_load() {
     let dir = tempfile::tempdir().unwrap();
@@ -193,7 +199,13 @@ fn the_wal_stays_bounded_under_continuous_load() {
     done.store(true, Ordering::Release);
     let largest = sampler.join().unwrap();
     eprintln!("largest WAL: {} KiB", largest >> 10);
-    assert!(largest < 160 << 20, "the WAL reached {} MB", largest >> 20);
+    let bound = WAL_WRITER_BACKSTOP_FRAMES as u64 * 4096 + (32 << 20);
+    assert!(
+        largest < bound,
+        "the WAL reached {} MB, bound {} MB",
+        largest >> 20,
+        bound >> 20
+    );
     let report = audit.verify_chain().unwrap();
     assert!(report.ok);
     assert_eq!(report.entries, (THREADS * PER_THREAD) as u64);
