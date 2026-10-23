@@ -26,14 +26,14 @@ The proxy covers `tools/call` and also maps `resources/read`, `prompts/get` and 
 
 ## The AuthZEN endpoint
 
-`POST /access/v1/evaluation` follows the AuthZEN evaluation shape. It lets some other component ask onbehalf for a decision and enforce it itself. That component might be an API gateway, a tool server or a sandbox. onbehalf then acts as a policy decision point (PDP) and the other component is the policy enforcement point (PEP).
+`POST /access/v1/evaluation` follows the AuthZEN evaluation shape, and `POST /access/v1/evaluations` takes a batch of them. It lets some other component ask onbehalf for a decision and enforce it itself. That component might be an API gateway, a tool server or a sandbox. onbehalf then acts as a policy decision point (PDP) and the other component is the policy enforcement point (PEP).
 
 There is a discovery document at `/.well-known/authzen-configuration`.
 
 The chain can arrive two ways:
 
 - **With a bearer token.** The chain comes from the verified token. This is the safe way.
-- **Without a bearer.** The chain in `subject.properties.chain` is taken as asserted by the caller. It carries no signatures. It still has to pass the lease check, so a chain this server never issued is denied with `lease_unknown`. Only trusted PEPs should be able to reach the endpoint in this mode.
+- **Without a bearer.** Off by default: a request with no bearer gets 401. With `[authzen] allow_unsigned_chain = true`, a PEP listed under `[[peps]]` that authenticates (HTTP Basic, or `pep_id` and `pep_secret` in the body) may send the chain in `subject.properties.chain`. The chain carries no signatures, so every hop must match what this server issued for its lease (leases are bound to a digest of the chain at issuance), or the request gets 403 `chain_not_issued`. It then has to pass the lease check like any other chain.
 
 The call arguments go in `context.input`. The response includes a decision id.
 
