@@ -13,15 +13,14 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let _ = onbehalf_audit::to_json_form(&export);
-    // Known gap (board, 2026-10-23 fuzzing): an entry with `seq` = u64::MAX and a correct hash
-    // overflows `seq + 1` in the chain walk (`onbehalf-audit` log.rs) and panics where overflow
-    // checks are on. Skipped here until that is fixed in `onbehalf-audit`.
-    if export.entries.iter().any(|e| e.seq == u64::MAX) {
-        return;
-    }
 
     if let Ok(report) = onbehalf_audit::verify_export(&export, &a.keys) {
         // Only an export that verifies counts: entries after a break are reported, not vouched for.
+        // Strict verification (F5): an export that verifies is countersigned throughout.
+        if report.report.ok {
+            assert_eq!(report.report.unsigned_tail, 0, "ok with an unsigned tail");
+            assert_eq!(report.outside_range, 0, "ok with entries outside the header range");
+        }
         if report.report.ok && report.report.last_signed_seq.is_some_and(|s| s > 0) {
             // A checkpoint verified, so its entries must be the fixture's (the only thing the
             // fuzzer could have taken a valid signature from).

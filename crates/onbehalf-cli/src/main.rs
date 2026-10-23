@@ -267,7 +267,13 @@ async fn run(cli: Cli) -> Result<Outcome> {
         Command::Audit(AuditCmd::Verify {
             file: Some(file),
             jwks,
-        }) => audit_verify_file(client, &file, jwks.as_deref(), json).await,
+            allow_unsigned_tail,
+        }) => {
+            let options = onbehalf_audit::VerifyOptions {
+                allow_unsigned_tail,
+            };
+            audit_verify_file(client, &file, jwks.as_deref(), options, json).await
+        }
         Command::Audit(AuditCmd::Export {
             from,
             to,
@@ -598,6 +604,7 @@ async fn audit_verify_file(
     client: Result<Client>,
     file: &std::path::Path,
     jwks: Option<&std::path::Path>,
+    options: onbehalf_audit::VerifyOptions,
     json: bool,
 ) -> Result<Outcome> {
     let text =
@@ -615,7 +622,7 @@ async fn audit_verify_file(
             .context("fetching the JWKS (or pass --jwks <file>)")?,
     };
     let keys = onbehalf_audit::CheckpointKeys::from_jwks(&jwks)?;
-    let report = onbehalf_audit::verify_export(&export, &keys)?;
+    let report = onbehalf_audit::verify_export_with(&export, &keys, options)?;
     let v = serde_json::to_value(&report)?;
     if json {
         print_json(&v);
@@ -642,6 +649,18 @@ fn export_lines(v: &Value) -> Vec<String> {
     out.extend(verify_lines(v));
     if v["truncated"] == true {
         out.push("export is TRUNCATED: entries named in its header are missing".to_string());
+    }
+    if let Some(n) = v["outside_range"].as_u64().filter(|n| *n > 0) {
+        out.push(format!(
+            "export holds {n} entries OUTSIDE the range its header declares"
+        ));
+    }
+    if v["unsigned_tail_rejected"] == true {
+        out.push(format!(
+            "export REJECTED: {} entries after the last checkpoint are not signed (pass \
+             --allow-unsigned-tail to accept an export newer than its last checkpoint)",
+            v["unsigned_tail"]
+        ));
     }
     if v["from_genesis"] == false && v["first_seq"].is_u64() {
         out.push(format!(
@@ -732,10 +751,27 @@ mod tests {
         let v = json!({"entries": 5, "ok": false, "first_bad_seq": null, "checkpoints": 1,
                        "last_signed_seq": 8, "unsigned_tail": 0, "bad_checkpoints": [],
                        "first_seq": 4, "last_seq": 8, "from_genesis": false,
-                       "truncated": true});
+                       "truncated": true, "outside_range": 0,
+                       "unsigned_tail_rejected": false});
         let lines = export_lines(&v);
         assert_eq!(lines[0], "export covers seq 4..8");
         assert!(lines.iter().any(|l| l.contains("TRUNCATED")), "{lines:?}");
+        assert!(!lines
+            .iter()
+            .any(|l| l.contains("OUTSIDE") || l.contains("REJECTED")));
+        // Fuzzing F5: more entries than declared, and an unsigned tail refused.
+        let v = json!({"entries": 6, "ok": false, "first_bad_seq": null, "checkpoints": 1,
+                       "last_signed_seq": 5, "unsigned_tail": 1, "bad_checkpoints": [],
+                       "first_seq": 1, "last_seq": 6, "from_genesis": true,
+                       "truncated": false, "outside_range": 1,
+                       "unsigned_tail_rejected": true});
+        let f5 = export_lines(&v);
+        assert!(f5.iter().any(|l| l.contains("1 entries OUTSIDE")), "{f5:?}");
+        assert!(
+            f5.iter()
+                .any(|l| l.contains("REJECTED") && l.contains("--allow-unsigned-tail")),
+            "{f5:?}"
+        );
         assert!(
             lines
                 .iter()

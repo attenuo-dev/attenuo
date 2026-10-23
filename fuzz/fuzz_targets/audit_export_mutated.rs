@@ -5,11 +5,12 @@
 //! attacker without the checkpoint key would), delete, swap or duplicate entries, renumber
 //! them, edit or drop checkpoints and the header, or flip bytes of the JSONL text.
 //!
-//! The invariant: an export that verifies `ok` never carries an entry, at or below the highest
-//! countersigned seq, that differs from the original; and with the header kept, it holds no
-//! entry outside the header's range. In other words, every mutation of signed content is
-//! rejected, and the only thing an attacker can do undetected is drop the evidence (header,
-//! checkpoints and the entries they cover), which verification then reports as unsigned.
+//! The invariant: an export that verifies `ok` (strictly, the default) never carries an entry,
+//! at or below the highest countersigned seq, that differs from the original; it has no
+//! unsigned tail, and with the header kept, it holds no entry outside the header's range. In
+//! other words, every mutation of signed content is rejected, and the only thing an attacker
+//! can do undetected is drop the evidence (checkpoints and the entries they cover, together
+//! with the header's range), which leaves a smaller export that is still all signed.
 #![no_main]
 
 use arbitrary::{Arbitrary, Result, Unstructured};
@@ -223,12 +224,6 @@ fuzz_target!(|ops: Vec<Op>| {
             Err(_) => return,
         }
     }
-    // Known gap (board, 2026-10-23 fuzzing): an entry with `seq` = u64::MAX and a correct hash
-    // overflows `seq + 1` in the chain walk (`onbehalf-audit` log.rs) and panics where overflow
-    // checks are on. Skipped here until that is fixed in `onbehalf-audit`.
-    if ex.entries.iter().any(|e| e.seq == u64::MAX) {
-        return;
-    }
     let Ok(report) = onbehalf_audit::verify_export(&ex, &a.keys) else {
         return;
     };
@@ -243,16 +238,16 @@ fuzz_target!(|ops: Vec<Op>| {
             );
         }
     }
-    // Known gap (board, 2026-10-23 fuzzing): `verify_export` accepts entries appended after
-    // the header's `to` as an unsigned tail; reproducer `[AppendEntry { rehash: true }]`. The
-    // upper bound is checked only with ONBEHALF_FUZZ_STRICT_EXPORT_RANGE set, until that is
-    // decided in `onbehalf-audit`.
-    let strict = std::env::var_os("ONBEHALF_FUZZ_STRICT_EXPORT_RANGE").is_some();
+    // F5 (fixed): entries after the last checkpoint, or outside the header's range, fail a
+    // strict verification; reproducer `[AppendEntry { rehash: true }]`.
+    if report.report.ok {
+        assert_eq!(report.report.unsigned_tail, 0, "verified with an unsigned tail");
+    }
     if report.report.ok && header_kept_from {
         if let Some(h) = &ex.header {
             for e in &ex.entries {
                 assert!(
-                    e.seq >= h.from && (e.seq <= h.to || !strict),
+                    e.seq >= h.from && e.seq <= h.to,
                     "export verified with entry {} outside its header range {}..={}",
                     e.seq,
                     h.from,
