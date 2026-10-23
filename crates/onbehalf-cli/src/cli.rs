@@ -64,6 +64,21 @@ pub enum Command {
     /// Query the AuthZEN decision endpoint.
     #[command(subcommand)]
     Authzen(AuthzenCmd),
+    /// Generate keys.
+    #[command(subcommand)]
+    Key(KeyCmd),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum KeyCmd {
+    /// Generate a key. `--dpop <PATH>` writes a new Ed25519 DPoP key (RFC 9449) as a private
+    /// JWK, readable only by you, and prints its thumbprint (the `cnf.jkt` of tokens bound to
+    /// it). Use it with `--dpop-key`; the Python and TypeScript SDKs take the same file.
+    Gen {
+        /// Where to write the DPoP key. An existing file is never overwritten.
+        #[arg(long, value_name = "PATH", required = true)]
+        dpop: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -112,6 +127,9 @@ pub struct RootArgs {
     /// authenticated agent may).
     #[arg(long = "may-act", value_name = "AGENT")]
     pub may_act: Vec<String>,
+    /// Bind the root token to this DPoP key (a private JWK from `onbehalf key gen --dpop`).
+    #[arg(long, value_name = "PATH")]
+    pub dpop_key: Option<std::path::PathBuf>,
     /// Print only this value, for scripts.
     #[arg(long, value_enum)]
     pub print: Option<Field>,
@@ -213,6 +231,16 @@ pub struct ExchangeArgs {
     /// Requested lifetime in seconds (clamped to the parent's expiry).
     #[arg(long)]
     pub ttl_seconds: Option<u64>,
+    /// Bind the new token to this DPoP key (a private JWK from `onbehalf key gen --dpop`): a
+    /// proof by it goes in the `DPoP` header. When the parent token is bound to the same key,
+    /// the proof also covers the parent. Required for a bound parent.
+    #[arg(long, value_name = "PATH")]
+    pub dpop_key: Option<std::path::PathBuf>,
+    /// The parent token's DPoP key, when it differs from `--dpop-key`: its proof goes in the
+    /// body as `subject_token_dpop`, the parent holder's consent to binding the new token to
+    /// another key.
+    #[arg(long, value_name = "PATH")]
+    pub subject_dpop_key: Option<std::path::PathBuf>,
     /// Print only this value, for scripts.
     #[arg(long, value_enum)]
     pub print: Option<Field>,
@@ -277,6 +305,10 @@ pub struct TokenSource {
     /// Read the delegation token from the first line of this file.
     #[arg(long, value_name = "PATH")]
     pub token_file: Option<std::path::PathBuf>,
+    /// The DPoP key the token is bound to (a private JWK): every request carries a proof by
+    /// it and `Authorization: DPoP <token>`. Needed for tokens bound with `--dpop-key`.
+    #[arg(long, value_name = "PATH", env = "ONBEHALF_DPOP_KEY")]
+    pub dpop_key: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Args)]

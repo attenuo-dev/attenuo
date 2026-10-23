@@ -1,8 +1,28 @@
 //! A thin HTTP client for the onbehalf server.
 
 use anyhow::{anyhow, bail, Context, Result};
+use onbehalf_token::DpopKey;
 use reqwest::{RequestBuilder, StatusCode};
 use serde_json::{json, Value};
+
+/// Present `token` with a DPoP proof by `key` for `method` and `url` (RFC 9449 §7.1:
+/// `Authorization: DPoP <token>` and a `DPoP` header whose `ath` covers the token), or as a
+/// plain bearer without a key.
+fn present(
+    req: RequestBuilder,
+    token: &str,
+    key: Option<&DpopKey>,
+    method: &str,
+    url: &str,
+) -> RequestBuilder {
+    match key {
+        Some(k) => req.header("authorization", format!("DPoP {token}")).header(
+            "dpop",
+            k.proof(method, url, Some(token), time::OffsetDateTime::now_utc()),
+        ),
+        None => req.bearer_auth(token),
+    }
+}
 
 pub struct Client {
     http: reqwest::Client,
@@ -84,21 +104,38 @@ impl Client {
             .await
     }
 
-    /// `POST /token` with an RFC 8693 JSON body.
-    pub async fn exchange(&self, body: &Value) -> Result<Value> {
-        self.send_json(self.http.post(self.url("/token")).json(body))
-            .await
+    /// `POST /admin/root-token`, bound to `key` when given (a DPoP proof in the header).
+    pub async fn root(&self, body: &Value, key: Option<&DpopKey>) -> Result<Value> {
+        let url = self.url("/admin/root-token");
+        let mut req = self.admin(self.http.post(&url).json(body))?;
+        if let Some(k) = key {
+            req = req.header(
+                "dpop",
+                k.proof("POST", &url, None, time::OffsetDateTime::now_utc()),
+            );
+        }
+        self.send_json(req).await
+    }
+
+    /// The URL of `POST /token`, which DPoP proofs for an exchange name.
+    pub fn token_url(&self) -> String {
+        self.url("/token")
+    }
+
+    /// `POST /token` with an RFC 8693 JSON body and, when given, a `DPoP` header.
+    pub async fn exchange(&self, body: &Value, dpop: Option<String>) -> Result<Value> {
+        let mut req = self.http.post(self.url("/token")).json(body);
+        if let Some(proof) = dpop {
+            req = req.header("dpop", proof);
+        }
+        self.send_json(req).await
     }
 
     /// `POST /access/v1/evaluation` with the delegation token as bearer.
-    pub async fn authzen(&self, token: &str, body: &Value) -> Result<Value> {
-        self.send_json(
-            self.http
-                .post(self.url("/access/v1/evaluation"))
-                .bearer_auth(token)
-                .json(body),
-        )
-        .await
+    pub async fn authzen(&self, token: &str, body: &Value, key: Option<&DpopKey>) -> Result<Value> {
+        let url = self.url("/access/v1/evaluation");
+        self.send_json(present(self.http.post(&url), token, key, "POST", &url).json(body))
+            .await
     }
 
     /// One JSON-RPC request to `/mcp/{server}`. Returns the JSON-RPC response whatever the
@@ -106,15 +143,14 @@ impl Client {
     pub async fn mcp(
         &self,
         token: &str,
+        key: Option<&DpopKey>,
         server: &str,
         method: &str,
         params: Value,
     ) -> Result<Value> {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
-        let resp = self
-            .http
-            .post(self.url(&format!("/mcp/{server}")))
-            .bearer_auth(token)
+        let url = self.url(&format!("/mcp/{server}"));
+        let resp = present(self.http.post(&url), token, key, "POST", &url)
             .header("accept", "application/json, text/event-stream")
             .json(&body)
             .send()
