@@ -1,6 +1,6 @@
 //! The hash chain: entry layout, hashing and verification shared by every sink.
 
-use onbehalf_core::digest::sha256_json;
+use onbehalf_core::digest::{sha256_bytes, sha256_json};
 use onbehalf_core::DecisionRecord;
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +47,22 @@ impl AuditEntry {
 /// the encoding is stable across processes.
 pub fn compute_entry_hash(seq: u64, prev_hash: &str, record: &DecisionRecord) -> String {
     sha256_json(&(seq, prev_hash, record))
+}
+
+/// [`compute_entry_hash`] for a record that is already serialized (`record_json` must be
+/// `serde_json::to_string(record)`). It hashes the same bytes, `[seq,"prev_hash",record_json]`
+/// (compact JSON, which is what `serde_json` writes for the tuple), without serializing the
+/// record a second time.
+pub fn entry_hash_from_json(seq: u64, prev_hash: &str, record_json: &str) -> String {
+    let mut buf = Vec::with_capacity(record_json.len() + prev_hash.len() + 28);
+    buf.push(b'[');
+    buf.extend_from_slice(seq.to_string().as_bytes());
+    buf.push(b',');
+    serde_json::to_writer(&mut buf, prev_hash).expect("a string always serializes");
+    buf.push(b',');
+    buf.extend_from_slice(record_json.as_bytes());
+    buf.push(b']');
+    sha256_bytes(&buf)
 }
 
 /// Result of walking the chain from the first entry to the head.

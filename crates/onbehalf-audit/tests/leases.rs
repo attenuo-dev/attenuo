@@ -195,6 +195,41 @@ fn check_all_reports_mixed_statuses() {
     }
 }
 
+/// The SQLite store reads every lease of a chain in one `IN (...)` query (in chunks for very
+/// long lists). Order, duplicates and unknown ids must come out as with one lookup per lease.
+#[test]
+fn check_all_batches_agree_with_per_lease_lookups() {
+    let exp = t0() + Duration::hours(1);
+    let leases: Vec<LeaseId> = (0..1100)
+        .map(|i| id(&format!("l{i}")))
+        .chain([id("l7"), id("unknown-1"), id("l3")])
+        .collect();
+    let refs: Vec<&LeaseId> = leases.iter().collect();
+    let mut results = Vec::new();
+    for (name, store) in stores() {
+        for (i, l) in leases.iter().take(1100).enumerate() {
+            let at = if i % 97 == 5 {
+                t0() - Duration::seconds(1)
+            } else {
+                exp
+            };
+            store.register(l, None, at).unwrap();
+        }
+        store.revoke(&id("l3"), "r", t0()).unwrap();
+        store.revoke(&id("l1050"), "r", t0()).unwrap();
+        let status = store.check_all(&refs, t0()).unwrap();
+        assert!(!status.active, "{name}");
+        assert_eq!(
+            status.revoked,
+            vec![id("l3"), id("l1050"), id("l3")],
+            "{name}"
+        );
+        assert_eq!(status.unknown, vec![id("unknown-1")], "{name}");
+        results.push(status);
+    }
+    assert_eq!(results[0], results[1], "memory and sqlite agree");
+}
+
 #[test]
 fn reregister_keeps_revocation() {
     for (name, store) in stores() {
@@ -265,4 +300,34 @@ fn renew_rejects_unknown_and_revoked() {
             assert!(!store.is_active(&id(l), t0()).unwrap(), "{name}: {l}");
         }
     }
+}
+
+#[test]
+fn file_store_revokes_with_full_sync_and_returns_to_its_setting() {
+    use onbehalf_audit::Durability;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("leases.db");
+    let store = SqliteLeaseStore::open_with(&path, Durability::Normal).unwrap();
+    let query = |s: &SqliteLeaseStore, sql: &str| -> String {
+        s.with_connection(|c| Ok(c.query_row(sql, [], |r| r.get::<_, rusqlite::types::Value>(0))?))
+            .map(|v| match v {
+                rusqlite::types::Value::Integer(i) => i.to_string(),
+                rusqlite::types::Value::Text(t) => t,
+                other => format!("{other:?}"),
+            })
+            .unwrap()
+    };
+    assert_eq!(query(&store, "PRAGMA journal_mode"), "wal");
+    assert_eq!(query(&store, "PRAGMA synchronous"), "1", "normal");
+    tree(&store);
+    assert_eq!(store.revoke(&id("a"), "test", t0()).unwrap(), 4);
+    assert_eq!(query(&store, "PRAGMA synchronous"), "1", "back to normal");
+    // A failed revocation restores the setting too.
+    assert!(store.revoke(&id("nope"), "test", t0()).is_err());
+    assert_eq!(query(&store, "PRAGMA synchronous"), "1");
+    drop(store);
+    let store = SqliteLeaseStore::open_with(&path, Durability::Full).unwrap();
+    assert_eq!(query(&store, "PRAGMA synchronous"), "2", "full");
+    let status = store.check_all(&[&id("root"), &id("a2x")], t0()).unwrap();
+    assert_eq!(status.revoked, vec![id("a2x")], "the revocation persisted");
 }

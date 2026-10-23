@@ -13,7 +13,8 @@
 //!
 //! The chain is assumed to be verified already (token signature, structure, expiry).
 
-use std::sync::{Arc, RwLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use onbehalf_audit::{AuditSink, LeaseStore};
@@ -128,11 +129,10 @@ impl Pipeline {
 
         let record = DecisionRecord::new(now, decision, reason, chain, call, policy_ids);
         let decision_id = record.id;
-        match self
-            .metrics
-            .time_audit_append(|| self.audit.append(record.clone()))
-        {
+        // The record moves into the log; the entry hands it back, so it is never cloned.
+        match self.metrics.time_audit_append(|| self.audit.append(record)) {
             Ok(entry) => {
+                let record = entry.record;
                 // Subject, agent, server and tool come from the caller: Debug-format them so
                 // a newline cannot forge a log line (SR-18).
                 tracing::info!(
@@ -254,11 +254,77 @@ async fn on_blocking_pool<R: Send + 'static>(
 pub struct ServerAuthorizer {
     verifier: Verifier,
     pipeline: Arc<Pipeline>,
+    verified: VerifiedTokens,
 }
 
 impl ServerAuthorizer {
     pub fn new(verifier: Verifier, pipeline: Arc<Pipeline>) -> Self {
-        Self { verifier, pipeline }
+        Self {
+            verifier,
+            pipeline,
+            verified: VerifiedTokens::new(VERIFIED_TOKENS_CAPACITY),
+        }
+    }
+}
+
+/// Tokens kept by [`VerifiedTokens`].
+pub const VERIFIED_TOKENS_CAPACITY: usize = 4096;
+
+/// Chains of tokens that already passed [`Verifier::verify`], keyed by the SHA-256 of the
+/// exact token text.
+///
+/// An agent sends the same bearer token on every call, and verifying it (two Ed25519
+/// signatures, JSON decoding, structural checks) costs about 100 us, the largest single stage
+/// after the policy. None of that can change while the server runs: the trusted keys are fixed
+/// when the verifier is built, and the token's bytes are what was signed. The only
+/// time-dependent checks are expiry, so a cache hit re-runs `validate_at(now)` (every hop's
+/// expiry, which includes the token's `exp`, the last hop's) and nothing is cached for a token
+/// that failed. Lease revocation is unaffected: leases are checked on every call.
+///
+/// Bounded: when full, expired chains are dropped, and if that frees nothing the map is
+/// cleared (the next calls simply verify again).
+struct VerifiedTokens {
+    chains: Mutex<HashMap<[u8; 32], DelegationChain>>,
+    capacity: usize,
+}
+
+impl VerifiedTokens {
+    fn new(capacity: usize) -> Self {
+        Self {
+            chains: Mutex::new(HashMap::new()),
+            capacity,
+        }
+    }
+
+    fn key(token: &str) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(token.as_bytes()).into()
+    }
+
+    /// The cached chain for `token`, if it is still valid at `now`.
+    fn get(
+        &self,
+        key: &[u8; 32],
+        now: OffsetDateTime,
+        max_depth: usize,
+    ) -> Option<DelegationChain> {
+        let chains = self.chains.lock().ok()?;
+        let chain = chains.get(key)?;
+        chain.validate_at(now, max_depth).ok()?;
+        Some(chain.clone())
+    }
+
+    fn insert(&self, key: [u8; 32], chain: &DelegationChain, now: OffsetDateTime) {
+        let Ok(mut chains) = self.chains.lock() else {
+            return;
+        };
+        if chains.len() >= self.capacity {
+            chains.retain(|_, c| c.hops.iter().all(|h| h.expires_at > now));
+            if chains.len() >= self.capacity {
+                chains.clear();
+            }
+        }
+        chains.insert(key, chain.clone());
     }
 }
 
@@ -269,7 +335,12 @@ impl Authorizer for ServerAuthorizer {
         bearer: &str,
         now: OffsetDateTime,
     ) -> Result<DelegationChain, AuthError> {
-        self.verifier
+        let key = VerifiedTokens::key(bearer);
+        if let Some(chain) = self.verified.get(&key, now, self.verifier.max_depth()) {
+            return Ok(chain);
+        }
+        let chain = self
+            .verifier
             .verify(bearer, now)
             .map(|v| v.chain)
             .map_err(|e| {
@@ -278,7 +349,9 @@ impl Authorizer for ServerAuthorizer {
                 } else {
                     AuthError::InvalidToken(e.to_string())
                 }
-            })
+            })?;
+        self.verified.insert(key, &chain, now);
+        Ok(chain)
     }
 
     async fn check_active(
@@ -471,5 +544,86 @@ mod tests {
             .unwrap();
         let call = ToolCall::new("github", "read_file", json!({}));
         assert_eq!(p.decide(&chain, &call, now).reason, REASON_LEASE_EXPIRED);
+    }
+
+    #[test]
+    fn decide_returns_the_record_it_appended() {
+        let (p, leases, audit, chain) = setup();
+        let now = OffsetDateTime::now_utc();
+        leases
+            .register(&LeaseId::new("l1"), None, now + Duration::hours(1))
+            .unwrap();
+        let d = p.decide(
+            &chain,
+            &ToolCall::new("github", "read_file", json!({})),
+            now,
+        );
+        let stored = &audit.snapshot().unwrap()[0];
+        assert_eq!(d.audit_seq, Some(stored.seq));
+        assert_eq!(d.decision_id, stored.record.id);
+        assert_eq!(d.reason, stored.record.reason);
+        assert_eq!(d.policy_ids, stored.record.policy_ids);
+    }
+
+    #[tokio::test]
+    async fn verified_tokens_are_cached_but_expiry_is_rechecked() {
+        let (p, _leases, _audit, _chain) = setup();
+        let issuer = onbehalf_token::Issuer::generate(onbehalf_token::IssuerConfig {
+            issuer: "https://onbehalf.test".into(),
+            audience: "onbehalf".into(),
+            max_depth: 4,
+            default_ttl: Duration::minutes(5),
+        });
+        let now = OffsetDateTime::now_utc();
+        let user = OriginatingUser {
+            subject: "alice".into(),
+            issuer: "idp".into(),
+            authenticated_at: now,
+            attributes: Default::default(),
+        };
+        let caps = CapabilitySet::from_iter([Capability::new("github", "read_*")]);
+        let issued = issuer
+            .issue_root(user, AgentId::new("planner"), caps, None, now)
+            .unwrap();
+        let auth = ServerAuthorizer::new(issuer.verifier(), Arc::new(p));
+
+        let first = auth.authenticate(&issued.token, now).await.unwrap();
+        assert_eq!(first, issued.chain);
+        assert_eq!(auth.verified.chains.lock().unwrap().len(), 1);
+        let again = auth.authenticate(&issued.token, now).await.unwrap();
+        assert_eq!(again, issued.chain, "served from the cache");
+
+        // Past the token's expiry the cached chain is refused, like a fresh verification.
+        let later = issued.expires_at + Duration::seconds(1);
+        assert!(auth.authenticate(&issued.token, later).await.is_err());
+
+        // A token that differs in one byte is verified on its own (and fails); failures are
+        // not cached.
+        let mut forged = issued.token.clone().into_bytes();
+        let last = forged.len() - 2;
+        forged[last] = if forged[last] == b'A' { b'B' } else { b'A' };
+        let forged = String::from_utf8(forged).unwrap();
+        assert!(auth.authenticate(&forged, now).await.is_err());
+        assert_eq!(auth.verified.chains.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn verified_token_cache_stays_bounded() {
+        let (_p, _leases, _audit, chain) = setup();
+        let now = OffsetDateTime::now_utc();
+        let cache = VerifiedTokens::new(3);
+        for i in 0..10 {
+            cache.insert(VerifiedTokens::key(&format!("t{i}")), &chain, now);
+            assert!(cache.chains.lock().unwrap().len() <= 3);
+        }
+        // Expired entries go first when the cache is full.
+        let expired_at = chain.hops[0].expires_at;
+        let cache = VerifiedTokens::new(2);
+        cache.insert(VerifiedTokens::key("a"), &chain, now);
+        cache.insert(VerifiedTokens::key("b"), &chain, now);
+        cache.insert(VerifiedTokens::key("c"), &chain, expired_at);
+        let chains = cache.chains.lock().unwrap();
+        assert_eq!(chains.len(), 1);
+        assert!(chains.contains_key(&VerifiedTokens::key("c")));
     }
 }

@@ -91,7 +91,11 @@ fn concurrent_appends_keep_a_contiguous_valid_chain() {
     let per_thread = 25;
     let sqlite = Arc::new(SqliteAudit::open_in_memory().unwrap());
     let memory = Arc::new(MemoryAudit::new());
-    let targets: Vec<Arc<dyn AuditSink>> = vec![sqlite.clone(), memory.clone()];
+    // A file-backed log too: appends go through the group-commit writer and real WAL commits.
+    // (Checkpoints under concurrency: tests/checkpoints.rs.)
+    let dir = tempfile::tempdir().unwrap();
+    let file = Arc::new(SqliteAudit::open(dir.path().join("audit.db")).unwrap());
+    let targets: Vec<Arc<dyn AuditSink>> = vec![sqlite.clone(), memory.clone(), file];
     for sink in targets {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
@@ -337,6 +341,23 @@ fn queries_by_subject_chain_and_lease() {
 
 // ---- persistence ----
 
+/// The SQLite sink hashes the record text it stores instead of serializing the record twice.
+/// That must be byte-for-byte the canonical hash, or `verify_chain` would reject the log.
+#[test]
+fn entry_hash_from_stored_json_equals_the_canonical_hash() {
+    use onbehalf_audit::entry_hash_from_json;
+    for i in 0..20 {
+        let r = record(i);
+        let json = serde_json::to_string(&r).unwrap();
+        for (seq, prev) in [(1, GENESIS_HASH), (u64::MAX, "ab\"c\\d"), (42, "")] {
+            assert_eq!(
+                entry_hash_from_json(seq, prev, &json),
+                compute_entry_hash(seq, prev, &r)
+            );
+        }
+    }
+}
+
 #[test]
 fn sqlite_persists_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
@@ -366,4 +387,58 @@ fn sqlite_persists_across_reopen() {
     .unwrap();
     drop(raw);
     assert_eq!(s.verify_chain().unwrap().first_bad_seq, Some(2));
+}
+
+// ---- durability settings ----
+
+fn pragma(s: &SqliteAudit, name: &str) -> String {
+    s.with_connection(|c| {
+        Ok(c.query_row(&format!("PRAGMA {name}"), [], |r| {
+            r.get::<_, rusqlite::types::Value>(0)
+        })?)
+    })
+    .map(|v| match v {
+        rusqlite::types::Value::Integer(i) => i.to_string(),
+        rusqlite::types::Value::Text(t) => t,
+        other => format!("{other:?}"),
+    })
+    .unwrap()
+}
+
+#[test]
+fn file_log_runs_in_wal_mode_at_the_requested_durability() {
+    use onbehalf_audit::Durability;
+    let dir = tempfile::tempdir().unwrap();
+    for (durability, synchronous) in [(Durability::Normal, "1"), (Durability::Full, "2")] {
+        let path = dir.path().join(format!("{durability}.db"));
+        let s = SqliteAudit::open_with(&path, durability).unwrap();
+        assert_eq!(pragma(&s, "journal_mode"), "wal", "{durability}");
+        assert_eq!(pragma(&s, "synchronous"), synchronous, "{durability}");
+        assert_eq!(pragma(&s, "busy_timeout"), "5000", "{durability}");
+        fill(&s, 5);
+        drop(s);
+        // WAL mode is persistent; the data survives a reopen at the other setting.
+        let s = SqliteAudit::open_with(&path, Durability::Normal).unwrap();
+        assert_eq!(pragma(&s, "journal_mode"), "wal");
+        let report = s.verify_chain().unwrap();
+        assert!(report.ok && report.entries == 5, "{report:?}");
+    }
+    // `open` is `normal`, and so is the default.
+    assert_eq!(Durability::default(), Durability::Normal);
+    let s = SqliteAudit::open(dir.path().join("default.db")).unwrap();
+    assert_eq!(pragma(&s, "synchronous"), "1");
+}
+
+#[test]
+fn durability_parses_from_config_strings() {
+    use onbehalf_audit::Durability;
+    #[derive(serde::Deserialize)]
+    struct T {
+        d: Durability,
+    }
+    let t: T = serde_json::from_str(r#"{"d":"full"}"#).unwrap();
+    assert_eq!(t.d, Durability::Full);
+    let t: T = serde_json::from_str(r#"{"d":"normal"}"#).unwrap();
+    assert_eq!(t.d, Durability::Normal);
+    assert!(serde_json::from_str::<T>(r#"{"d":"off"}"#).is_err());
 }

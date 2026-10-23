@@ -1,13 +1,14 @@
 //! SQLite-backed audit sink and lease store.
 //!
-//! Both wrap a single `rusqlite::Connection` behind a `Mutex`. Appends run inside a transaction
-//! that reads the current head and inserts the next row, so two writers can never produce two
-//! entries with the same `prev_hash`. The lock, not SQLite's locking, is what keeps the chain
-//! linear within a process; across processes SQLite's write lock plus the `UNIQUE` constraint on
-//! `entry_hash` and the primary key on `seq` make a fork fail rather than succeed.
+//! Both wrap a single `rusqlite::Connection` behind a `Mutex`. Audit appends go through one
+//! writer thread (group commit, see [`SqliteAudit`]): it takes the lock, reads the current head
+//! and inserts the next rows in one transaction, so two entries can never share a `prev_hash`.
+//! The lock and the single writer, not SQLite's locking, keep the chain linear within a
+//! process; across processes SQLite's write lock plus the `UNIQUE` constraint on `entry_hash`
+//! and the primary key on `seq` make a fork fail rather than succeed.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use onbehalf_core::{DecisionRecord, LeaseId};
@@ -20,7 +21,9 @@ use crate::checkpoint::{
 };
 use crate::error::AuditError;
 use crate::lease::{classify, LeaseRow, LeaseStatus, LeaseStore};
-use crate::log::{verify_entries, AuditEntry, AuditSink, VerifyReport, GENESIS_HASH};
+use crate::log::{
+    entry_hash_from_json, verify_entries, AuditEntry, AuditSink, VerifyReport, GENESIS_HASH,
+};
 
 const AUDIT_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS audit (
@@ -77,9 +80,77 @@ const ENTRY_COLUMNS: &str = "seq, prev_hash, entry_hash, decision, reason, origi
      agents, chain_depth, chain_digest, leases, server, tool, arguments_digest, session_id, \
      policy_ids, record_json";
 
-fn open_connection(path: &Path) -> Result<Connection, AuditError> {
+/// How long a connection waits for another connection's write lock before giving up with
+/// `SQLITE_BUSY`. Within one process the store's own lock serializes writers; this covers a
+/// second process (and the audit and lease connections of one server, which share a file).
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Prepared statements kept per connection (`prepare_cached`). The stores use about a dozen.
+const STATEMENT_CACHE: usize = 32;
+
+/// How hard a file-backed store pushes a commit to stable storage. In-memory stores ignore it.
+///
+/// Both settings run SQLite in write-ahead-log mode (`journal_mode=WAL`): a commit appends to
+/// the `-wal` file and readers do not block the writer. They differ in when SQLite calls
+/// `fsync`:
+///
+/// - [`Normal`](Self::Normal) (`synchronous=NORMAL`, the default): not on commit, only when
+///   the WAL is checkpointed into the database file. A committed transaction survives the
+///   process crashing or being killed (it is in the OS page cache), but the most recent
+///   commits can be lost if the machine loses power or the OS crashes before the next sync.
+///   What survives is always a prefix of the log: a transaction is never torn, the database is
+///   never corrupt, and the hash chain still verifies, ending at an earlier head. Lease
+///   revocations are the exception: they always commit with `synchronous=FULL` (see
+///   [`SqliteLeaseStore`]), so a revoked lease cannot come back after a power failure.
+/// - [`Full`](Self::Full) (`synchronous=FULL`): every commit is synced before it returns, so a
+///   decision that was answered is on disk. One `fsync` per commit bounds throughput by the
+///   storage's sync latency.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Durability {
+    #[default]
+    Normal,
+    Full,
+}
+
+impl Durability {
+    fn pragma(self) -> &'static str {
+        match self {
+            Durability::Normal => "NORMAL",
+            Durability::Full => "FULL",
+        }
+    }
+}
+
+impl std::fmt::Display for Durability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Durability::Normal => "normal",
+            Durability::Full => "full",
+        })
+    }
+}
+
+fn open_connection(path: &Path, durability: Durability) -> Result<Connection, AuditError> {
     let conn = Connection::open(path)?;
-    conn.busy_timeout(Duration::from_secs(5))?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
+    // `journal_mode` answers with the mode in force. A `:memory:` path keeps `memory`, which
+    // is fine: there is nothing to sync.
+    let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+    if !mode.eq_ignore_ascii_case("wal") && !mode.eq_ignore_ascii_case("memory") {
+        return Err(AuditError::Storage(format!(
+            "could not switch {} to WAL mode (journal_mode is `{mode}`)",
+            path.display()
+        )));
+    }
+    conn.pragma_update(None, "synchronous", durability.pragma())?;
+    Ok(conn)
+}
+
+fn open_memory_connection() -> Result<Connection, AuditError> {
+    let conn = Connection::open_in_memory()?;
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
     Ok(conn)
 }
 
@@ -193,6 +264,29 @@ fn head_in(tx: &Transaction<'_>) -> Result<Option<AuditEntry>, AuditError> {
         .transpose()
 }
 
+/// `(seq, entry_hash)` of the newest row, for chaining the next append. Unlike [`head_in`] it
+/// does not decode and cross-check the row: checking stored entries is `verify_chain`'s job
+/// (and the signed checkpoints'), and decoding the head on every append cost more than the
+/// insert itself.
+fn head_link(tx: &Transaction<'_>) -> Result<(u64, String), AuditError> {
+    let link = tx
+        .prepare_cached("SELECT seq, entry_hash FROM audit ORDER BY seq DESC LIMIT 1")?
+        .query_row([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .optional()?;
+    match link {
+        None => Ok((0, GENESIS_HASH.to_string())),
+        Some((seq, hash)) => match u64::try_from(seq) {
+            Ok(seq) => Ok((seq, hash)),
+            Err(_) => Err(AuditError::Corrupt {
+                seq: 0,
+                detail: format!("negative seq {seq}"),
+            }),
+        },
+    }
+}
+
 fn query_entries(
     conn: &Connection,
     sql: &str,
@@ -242,8 +336,31 @@ struct Checkpointing {
     on_created: Option<CheckpointHook>,
 }
 
+/// Most appends committed in one transaction by the writer thread.
+pub const MAX_BATCH: usize = 256;
+
 /// Hash-chained audit log in SQLite.
+///
+/// **Group commit.** [`append`](AuditSink::append) hands the record to a single writer thread
+/// over a channel and blocks until that thread answers with the entry (or the error). The
+/// writer takes the first waiting record, adds every other record already queued (up to
+/// [`MAX_BATCH`]) and commits them in one transaction, so under load one commit (and, at
+/// `durability = "full"`, one `fsync`) covers many appends, while a lone caller pays no extra
+/// wait: records that arrive while a batch is being committed form the next batch. Records get
+/// sequence numbers in the order they reached the channel. If a batch fails, its records are
+/// retried one transaction each, so one bad record fails only its own append; every append
+/// either gets its committed entry back or an error, never a guess.
+///
+/// Reads, checkpoints and [`with_connection`](Self::with_connection) take the same lock and
+/// see only committed batches.
 pub struct SqliteAudit {
+    inner: Arc<Inner>,
+    /// Started by the first append, after the builders have run.
+    writer: OnceLock<Writer>,
+}
+
+/// What the writer thread and the readers share.
+struct Inner {
     conn: Mutex<Connection>,
     checkpointing: Option<Checkpointing>,
 }
@@ -251,19 +368,227 @@ pub struct SqliteAudit {
 impl std::fmt::Debug for SqliteAudit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqliteAudit")
-            .field("checkpointing", &self.checkpointing.is_some())
+            .field("checkpointing", &self.inner.checkpointing.is_some())
+            .field("writer_started", &self.writer.get().is_some())
             .finish_non_exhaustive()
     }
 }
 
+/// One append waiting for the writer.
+struct Job {
+    record: DecisionRecord,
+    reply: mpsc::SyncSender<Result<AuditEntry, AuditError>>,
+}
+
+/// Handle on the writer thread. Dropping it closes the channel; the thread finishes the batch
+/// in hand and exits, and the drop waits for it.
+struct Writer {
+    jobs: Option<mpsc::Sender<Job>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Writer {
+    fn start(inner: Arc<Inner>) -> Self {
+        let (tx, rx) = mpsc::channel::<Job>();
+        match std::thread::Builder::new()
+            .name("onbehalf-audit-writer".into())
+            .spawn(move || writer_loop(&inner, &rx))
+        {
+            Ok(thread) => Self {
+                jobs: Some(tx),
+                thread: Some(thread),
+            },
+            // Without a writer every append fails, and so every decision is denied.
+            Err(e) => {
+                eprintln!("onbehalf-audit: cannot start the audit writer thread: {e}");
+                Self {
+                    jobs: None,
+                    thread: None,
+                }
+            }
+        }
+    }
+
+    fn append(&self, record: DecisionRecord) -> Result<AuditEntry, AuditError> {
+        let stopped = || AuditError::Storage("the audit writer is not running".into());
+        let jobs = self.jobs.as_ref().ok_or_else(stopped)?;
+        let (reply, answer) = mpsc::sync_channel(1);
+        jobs.send(Job { record, reply }).map_err(|_| stopped())?;
+        // A writer that panicked drops the reply sender: the append fails, it is not assumed.
+        answer.recv().map_err(|_| stopped())?
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        self.jobs.take();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn writer_loop(inner: &Inner, jobs: &mpsc::Receiver<Job>) {
+    while let Ok(first) = jobs.recv() {
+        let mut batch = vec![first];
+        while batch.len() < MAX_BATCH {
+            match jobs.try_recv() {
+                Ok(job) => batch.push(job),
+                Err(_) => break,
+            }
+        }
+        let (records, replies): (Vec<_>, Vec<_>) =
+            batch.into_iter().map(|j| (j.record, j.reply)).unzip();
+        for (reply, result) in replies.into_iter().zip(inner.append_batch(records)) {
+            // The caller always waits for its answer; a send can only fail if it panicked.
+            let _ = reply.send(result);
+        }
+    }
+}
+
+impl Inner {
+    /// Commit `records` in order, as one transaction when possible. One result per record.
+    fn append_batch(&self, records: Vec<DecisionRecord>) -> Vec<Result<AuditEntry, AuditError>> {
+        let n = records.len();
+        let mut conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(_) => return (0..n).map(|_| Err(AuditError::Poisoned)).collect(),
+        };
+        match self.commit(&mut conn, records) {
+            Ok(entries) => entries.into_iter().map(Ok).collect(),
+            Err((e, _)) if n == 1 => vec![Err(e)],
+            // Something in the batch failed and the transaction rolled back. Find out which
+            // record it was by committing them one at a time, in the same order.
+            Err((_, records)) => records
+                .into_iter()
+                .map(|r| match self.commit(&mut conn, vec![r]) {
+                    Ok(mut one) => Ok(one.pop().expect("one record, one entry")),
+                    Err((e, _)) => Err(e),
+                })
+                .collect(),
+        }
+    }
+
+    /// One transaction: read the head, chain and insert every record, sign the checkpoints
+    /// that fall in the batch, commit. On failure nothing is written and the records come back.
+    fn commit(
+        &self,
+        conn: &mut Connection,
+        records: Vec<DecisionRecord>,
+    ) -> Result<Vec<AuditEntry>, (AuditError, Vec<DecisionRecord>)> {
+        let tx = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+            Ok(tx) => tx,
+            Err(e) => return Err((e.into(), records)),
+        };
+        let (mut seq, mut prev_hash) = match head_link(&tx) {
+            Ok(h) => h,
+            Err(e) => return Err((e, records)),
+        };
+        // Serialize each record once: the same text is hashed and stored as `record_json`.
+        let jsons = match records
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(j) => j,
+            Err(e) => return Err((e.into(), records)),
+        };
+        let mut entries: Vec<AuditEntry> = Vec::with_capacity(records.len());
+        for (record, json) in records.into_iter().zip(&jsons) {
+            seq += 1;
+            let entry_hash = entry_hash_from_json(seq, &prev_hash, json);
+            let entry = AuditEntry {
+                seq,
+                prev_hash: std::mem::replace(&mut prev_hash, entry_hash.clone()),
+                record,
+                entry_hash,
+            };
+            entries.push(entry);
+        }
+        let mut created = Vec::new();
+        let written = entries
+            .iter()
+            .zip(&jsons)
+            .try_for_each(|(entry, json)| {
+                insert_entry(&tx, entry, json)?;
+                if let Some(c) = self.checkpointing.as_ref().filter(|c| c.every > 0) {
+                    if entry.seq.is_multiple_of(c.every) {
+                        let cp = Checkpoint::sign(
+                            &c.signer,
+                            entry.seq,
+                            &entry.entry_hash,
+                            entry.record.at,
+                        )?;
+                        insert_checkpoint(&tx, &cp)?;
+                        created.push(cp);
+                    }
+                }
+                Ok::<(), AuditError>(())
+            })
+            .and_then(|()| Ok(tx.commit()?));
+        if let Err(e) = written {
+            return Err((e, entries.into_iter().map(|e| e.record).collect()));
+        }
+        if let Some(hook) = self
+            .checkpointing
+            .as_ref()
+            .and_then(|c| c.on_created.as_ref())
+        {
+            created.iter().for_each(|cp| hook(cp));
+        }
+        Ok(entries)
+    }
+}
+
+/// Insert `entry`, whose record serializes to `record_json`.
+fn insert_entry(
+    tx: &Transaction<'_>,
+    entry: &AuditEntry,
+    record_json: &str,
+) -> Result<(), AuditError> {
+    let r = &entry.record;
+    tx.prepare_cached(
+        "INSERT INTO audit (seq, prev_hash, entry_hash, at, decision, reason, \
+         originating_subject, agents, chain_depth, chain_digest, leases, server, tool, \
+         arguments_digest, session_id, policy_ids, record_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+    )?
+    .execute(params![
+        entry.seq as i64,
+        entry.prev_hash,
+        entry.entry_hash,
+        fmt_time(r.at)?,
+        decision_str(&r.decision),
+        r.reason,
+        r.originating_subject,
+        serde_json::to_string(&r.agents)?,
+        r.chain_depth as i64,
+        r.chain_digest,
+        serde_json::to_string(&r.leases)?,
+        r.server,
+        r.tool,
+        r.arguments_digest,
+        r.session_id,
+        serde_json::to_string(&r.policy_ids)?,
+        record_json,
+    ])?;
+    Ok(())
+}
+
 impl SqliteAudit {
-    /// Open (or create) the log at `path`. Pass `":memory:"` for a private in-memory log.
+    /// Open (or create) the log at `path` with [`Durability::Normal`]. Pass `":memory:"` for a
+    /// private in-memory log.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AuditError> {
-        Self::from_connection(open_connection(path.as_ref())?)
+        Self::open_with(path, Durability::default())
+    }
+
+    /// Open (or create) the log at `path` in WAL mode with the given durability.
+    pub fn open_with(path: impl AsRef<Path>, durability: Durability) -> Result<Self, AuditError> {
+        Self::from_connection(open_connection(path.as_ref(), durability)?)
     }
 
     pub fn open_in_memory() -> Result<Self, AuditError> {
-        Self::from_connection(Connection::open_in_memory()?)
+        Self::from_connection(open_memory_connection()?)
     }
 
     /// Wrap an existing connection, creating the schema if needed.
@@ -271,9 +596,18 @@ impl SqliteAudit {
         conn.execute_batch(AUDIT_SCHEMA)?;
         conn.execute_batch(CHECKPOINT_SCHEMA)?;
         Ok(Self {
-            conn: Mutex::new(conn),
-            checkpointing: None,
+            inner: Arc::new(Inner {
+                conn: Mutex::new(conn),
+                checkpointing: None,
+            }),
+            writer: OnceLock::new(),
         })
+    }
+
+    /// The shared state, for the builders. They run before the first append starts the writer
+    /// thread (which holds the other reference), so the `Arc` is still unique.
+    fn inner_mut(&mut self) -> &mut Inner {
+        Arc::get_mut(&mut self.inner).expect("SqliteAudit builders must run before any append")
     }
 
     /// Sign checkpoints with `signer`: one every `every` appended entries (0 turns the
@@ -284,7 +618,7 @@ impl SqliteAudit {
         signer: onbehalf_token::DetachedSigner,
         every: u64,
     ) -> Self {
-        self.checkpointing = Some(Checkpointing {
+        self.inner_mut().checkpointing = Some(Checkpointing {
             signer,
             every,
             on_created: None,
@@ -299,7 +633,7 @@ impl SqliteAudit {
         mut self,
         hook: impl Fn(&Checkpoint) + Send + Sync + 'static,
     ) -> Self {
-        if let Some(c) = self.checkpointing.as_mut() {
+        if let Some(c) = self.inner_mut().checkpointing.as_mut() {
             c.on_created = Some(Arc::new(hook));
         }
         self
@@ -309,10 +643,11 @@ impl SqliteAudit {
     /// twice without an append in between returns the same checkpoint.
     pub fn checkpoint_signed(&self, now: OffsetDateTime) -> Result<Checkpoint, AuditError> {
         let c = self
+            .inner
             .checkpointing
             .as_ref()
             .ok_or(AuditError::NoCheckpointSigner)?;
-        let mut conn = self.conn.lock()?;
+        let mut conn = self.inner.conn.lock()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let (seq, hash) = match head_in(&tx)? {
             Some(h) => (h.seq, h.entry_hash),
@@ -342,7 +677,7 @@ impl SqliteAudit {
     /// `[audit] checkpoint_interval_seconds` calls this.
     pub fn checkpoint_if_new(&self, now: OffsetDateTime) -> Result<Option<Checkpoint>, AuditError> {
         let (head, last) = {
-            let conn = self.conn.lock()?;
+            let conn = self.inner.conn.lock()?;
             let head: i64 =
                 conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM audit", [], |r| r.get(0))?;
             let last: i64 =
@@ -359,7 +694,7 @@ impl SqliteAudit {
 
     /// The newest checkpoint, if any.
     pub fn last_checkpoint(&self) -> Result<Option<Checkpoint>, AuditError> {
-        let conn = self.conn.lock()?;
+        let conn = self.inner.conn.lock()?;
         let mut stmt = conn.prepare_cached(
             "SELECT seq, head_hash, at, kid, signature FROM checkpoints \
              ORDER BY seq DESC LIMIT 1",
@@ -370,7 +705,7 @@ impl SqliteAudit {
 
     /// Checkpoints with `from <= seq <= to`, ascending.
     pub fn checkpoints_between(&self, from: u64, to: u64) -> Result<Vec<Checkpoint>, AuditError> {
-        let conn = self.conn.lock()?;
+        let conn = self.inner.conn.lock()?;
         let mut stmt = conn.prepare_cached(
             "SELECT seq, head_hash, at, kid, signature FROM checkpoints \
              WHERE seq >= ?1 AND seq <= ?2 ORDER BY seq",
@@ -391,7 +726,7 @@ impl SqliteAudit {
         keys: &CheckpointKeys,
     ) -> Result<SignedVerifyReport, AuditError> {
         let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit ORDER BY seq");
-        let conn = self.conn.lock()?;
+        let conn = self.inner.conn.lock()?;
         let checkpoints: Vec<Checkpoint> = {
             let mut stmt = conn.prepare(
                 "SELECT seq, head_hash, at, kid, signature FROM checkpoints ORDER BY seq",
@@ -412,7 +747,7 @@ impl SqliteAudit {
         &self,
         f: impl FnOnce(&Connection) -> Result<R, AuditError>,
     ) -> Result<R, AuditError> {
-        let conn = self.conn.lock()?;
+        let conn = self.inner.conn.lock()?;
         f(&conn)
     }
 
@@ -422,14 +757,14 @@ impl SqliteAudit {
             "SELECT {ENTRY_COLUMNS} FROM audit WHERE originating_subject = ?1 \
              ORDER BY seq DESC LIMIT ?2"
         );
-        let conn = self.conn.lock()?;
+        let conn = self.inner.conn.lock()?;
         query_entries(&conn, &sql, &[&subject, &(limit as i64)])
     }
 
     /// Every entry bound to one delegation chain, in order.
     pub fn by_chain(&self, chain_digest: &str) -> Result<Vec<AuditEntry>, AuditError> {
         let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE chain_digest = ?1 ORDER BY seq");
-        let conn = self.conn.lock()?;
+        let conn = self.inner.conn.lock()?;
         query_entries(&conn, &sql, &[&chain_digest])
     }
 
@@ -450,7 +785,7 @@ impl SqliteAudit {
         let sql = format!(
             "SELECT {ENTRY_COLUMNS} FROM audit WHERE leases LIKE ?1 ESCAPE '\\' ORDER BY seq"
         );
-        let conn = self.conn.lock()?;
+        let conn = self.inner.conn.lock()?;
         let candidates = query_entries(&conn, &sql, &[&pattern])?;
         // Confirm against the decoded record; LIKE is only a prefilter.
         Ok(candidates
@@ -461,7 +796,7 @@ impl SqliteAudit {
 
     /// Number of entries.
     pub fn len(&self) -> Result<u64, AuditError> {
-        let conn = self.conn.lock()?;
+        let conn = self.inner.conn.lock()?;
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM audit", [], |r| r.get(0))?;
         Ok(n as u64)
     }
@@ -473,58 +808,13 @@ impl SqliteAudit {
 
 impl AuditSink for SqliteAudit {
     fn append(&self, record: DecisionRecord) -> Result<AuditEntry, AuditError> {
-        let mut conn = self.conn.lock()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let head = head_in(&tx)?;
-        let entry = AuditEntry::next(head.as_ref(), record);
-        let r = &entry.record;
-        tx.execute(
-            "INSERT INTO audit (seq, prev_hash, entry_hash, at, decision, reason, \
-             originating_subject, agents, chain_depth, chain_digest, leases, server, tool, \
-             arguments_digest, session_id, policy_ids, record_json) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-            params![
-                entry.seq as i64,
-                entry.prev_hash,
-                entry.entry_hash,
-                fmt_time(r.at)?,
-                decision_str(&r.decision),
-                r.reason,
-                r.originating_subject,
-                serde_json::to_string(&r.agents)?,
-                r.chain_depth as i64,
-                r.chain_digest,
-                serde_json::to_string(&r.leases)?,
-                r.server,
-                r.tool,
-                r.arguments_digest,
-                r.session_id,
-                serde_json::to_string(&r.policy_ids)?,
-                serde_json::to_string(r)?,
-            ],
-        )?;
-        let mut created = None;
-        if let Some(c) = self.checkpointing.as_ref().filter(|c| c.every > 0) {
-            if entry.seq.is_multiple_of(c.every) {
-                let cp = Checkpoint::sign(&c.signer, entry.seq, &entry.entry_hash, r.at)?;
-                insert_checkpoint(&tx, &cp)?;
-                created = Some(cp);
-            }
-        }
-        tx.commit()?;
-        if let (Some(cp), Some(hook)) = (
-            created,
-            self.checkpointing
-                .as_ref()
-                .and_then(|c| c.on_created.as_ref()),
-        ) {
-            hook(&cp);
-        }
-        Ok(entry)
+        self.writer
+            .get_or_init(|| Writer::start(Arc::clone(&self.inner)))
+            .append(record)
     }
 
     fn head(&self) -> Result<Option<AuditEntry>, AuditError> {
-        let mut conn = self.conn.lock()?;
+        let mut conn = self.inner.conn.lock()?;
         let tx = conn.transaction()?;
         head_in(&tx)
     }
@@ -532,13 +822,13 @@ impl AuditSink for SqliteAudit {
     fn range(&self, from_seq: u64, limit: usize) -> Result<Vec<AuditEntry>, AuditError> {
         let sql =
             format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE seq >= ?1 ORDER BY seq LIMIT ?2");
-        let conn = self.conn.lock()?;
+        let conn = self.inner.conn.lock()?;
         query_entries(&conn, &sql, &[&(from_seq as i64), &(limit as i64)])
     }
 
     fn verify_chain(&self) -> Result<VerifyReport, AuditError> {
         let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit ORDER BY seq");
-        let conn = self.conn.lock()?;
+        let conn = self.inner.conn.lock()?;
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], |row| Ok(entry_from_row(row)))?;
         // A row that cannot be decoded (corrupt JSON, column/JSON disagreement) surfaces as
@@ -555,26 +845,54 @@ impl AuditSink for SqliteAudit {
 }
 
 /// Lease registry in SQLite.
+///
+/// A file-backed store runs at the [`Durability`] it was opened with, except that
+/// [`revoke`](LeaseStore::revoke) always commits with `synchronous=FULL`: losing a revocation
+/// to a power failure would bring a revoked lease back, and revocations are rare enough that
+/// their `fsync` does not matter.
 #[derive(Debug)]
 pub struct SqliteLeaseStore {
     conn: Mutex<Connection>,
+    /// `None` for a connection this crate did not open (or an in-memory one): its pragmas are
+    /// left alone.
+    durability: Option<Durability>,
 }
 
 impl SqliteLeaseStore {
-    /// Open (or create) the registry at `path`. May be the same file as a [`SqliteAudit`].
+    /// Open (or create) the registry at `path` with [`Durability::Normal`]. May be the same file
+    /// as a [`SqliteAudit`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AuditError> {
-        Self::from_connection(open_connection(path.as_ref())?)
+        Self::open_with(path, Durability::default())
+    }
+
+    /// Open (or create) the registry at `path` in WAL mode with the given durability.
+    /// Revocations commit with `synchronous=FULL` whatever `durability` says.
+    pub fn open_with(path: impl AsRef<Path>, durability: Durability) -> Result<Self, AuditError> {
+        let mut store = Self::from_connection(open_connection(path.as_ref(), durability)?)?;
+        store.durability = Some(durability);
+        Ok(store)
     }
 
     pub fn open_in_memory() -> Result<Self, AuditError> {
-        Self::from_connection(Connection::open_in_memory()?)
+        Self::from_connection(open_memory_connection()?)
     }
 
     pub fn from_connection(conn: Connection) -> Result<Self, AuditError> {
         conn.execute_batch(LEASE_SCHEMA)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            durability: None,
         })
+    }
+
+    /// Run `f` against the underlying connection while holding the store's lock. For tests
+    /// and operational tooling.
+    pub fn with_connection<R>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<R, AuditError>,
+    ) -> Result<R, AuditError> {
+        let conn = self.conn.lock()?;
+        f(&conn)
     }
 
     /// One lease's row, if known.
@@ -584,11 +902,83 @@ impl SqliteLeaseStore {
     }
 }
 
+fn revoke_in(
+    conn: &mut Connection,
+    lease: &LeaseId,
+    reason: &str,
+    now: OffsetDateTime,
+) -> Result<u64, AuditError> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if get_in(&tx, lease)?.is_none() {
+        return Err(AuditError::UnknownLease(lease.0.clone()));
+    }
+    // UNION (not UNION ALL) so an accidental cycle terminates.
+    let changed = tx.execute(
+        "UPDATE leases SET revoked_at = ?2, revoke_reason = ?3 \
+         WHERE revoked_at IS NULL AND id IN ( \
+             WITH RECURSIVE sub(id) AS ( \
+                 SELECT id FROM leases WHERE id = ?1 \
+                 UNION \
+                 SELECT l.id FROM leases l JOIN sub ON l.parent = sub.id \
+             ) SELECT id FROM sub)",
+        params![lease.0, fmt_time(now)?, reason],
+    )?;
+    tx.commit()?;
+    Ok(changed as u64)
+}
+
 fn binding_in(conn: &Connection, lease: &LeaseId) -> Result<Option<String>, AuditError> {
     Ok(conn
         .prepare_cached("SELECT binding FROM lease_bindings WHERE id = ?1")?
         .query_row([&lease.0], |row| row.get::<_, String>(0))
         .optional()?)
+}
+
+/// Leases read per `IN (...)` query. SQLite allows 32766 parameters; chains are capped far
+/// below this, but a longer list still works, in chunks.
+const LEASES_PER_QUERY: usize = 64;
+
+/// `SELECT ... WHERE id IN (?,...,?)` with `n` placeholders, built once per `n`.
+fn leases_in_sql(n: usize) -> &'static str {
+    static SQL: OnceLock<Vec<String>> = OnceLock::new();
+    &SQL.get_or_init(|| {
+        (0..=LEASES_PER_QUERY)
+            .map(|n| {
+                format!(
+                    "SELECT id, parent, expires_at, revoked_at, revoke_reason FROM leases \
+                     WHERE id IN ({})",
+                    vec!["?"; n].join(",")
+                )
+            })
+            .collect()
+    })[n]
+}
+
+/// The rows of every lease in `leases`, with one query (`WHERE id IN (...)`) instead of one
+/// per hop. Unknown ids are absent from the result; order is unspecified.
+fn rows_in(conn: &Connection, leases: &[&LeaseId]) -> Result<Vec<(String, LeaseRow)>, AuditError> {
+    let mut out = Vec::with_capacity(leases.len());
+    for chunk in leases.chunks(LEASES_PER_QUERY) {
+        // One cached statement per chain length.
+        let mut stmt = conn.prepare_cached(leases_in_sql(chunk.len()))?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(
+            chunk.iter().map(|l| l.0.as_str()),
+        ))?;
+        while let Some(row) = rows.next()? {
+            let expires_at: String = row.get(2)?;
+            let revoked_at: Option<String> = row.get(3)?;
+            out.push((
+                row.get::<_, String>(0)?,
+                LeaseRow {
+                    parent: row.get::<_, Option<String>>(1)?.map(LeaseId),
+                    expires_at: parse_time(&expires_at)?,
+                    revoked_at: revoked_at.as_deref().map(parse_time).transpose()?,
+                    revoke_reason: row.get(4)?,
+                },
+            ));
+        }
+    }
+    Ok(out)
 }
 
 fn get_in(conn: &Connection, lease: &LeaseId) -> Result<Option<LeaseRow>, AuditError> {
@@ -624,12 +1014,16 @@ impl LeaseStore for SqliteLeaseStore {
         expires_at: OffsetDateTime,
     ) -> Result<(), AuditError> {
         let conn = self.conn.lock()?;
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO leases (id, parent, expires_at) VALUES (?1, ?2, ?3) \
              ON CONFLICT(id) DO UPDATE SET parent = excluded.parent, \
              expires_at = excluded.expires_at",
-            params![lease.0, parent.map(|p| p.0.as_str()), fmt_time(expires_at)?],
-        )?;
+        )?
+        .execute(params![
+            lease.0,
+            parent.map(|p| p.0.as_str()),
+            fmt_time(expires_at)?
+        ])?;
         Ok(())
     }
 
@@ -640,23 +1034,16 @@ impl LeaseStore for SqliteLeaseStore {
         now: OffsetDateTime,
     ) -> Result<u64, AuditError> {
         let mut conn = self.conn.lock()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if get_in(&tx, lease)?.is_none() {
-            return Err(AuditError::UnknownLease(lease.0.clone()));
+        // A revocation must survive a power failure even when the store runs at `normal`.
+        let relaxed = self.durability.filter(|d| *d != Durability::Full);
+        if relaxed.is_some() {
+            conn.pragma_update(None, "synchronous", Durability::Full.pragma())?;
         }
-        // UNION (not UNION ALL) so an accidental cycle terminates.
-        let changed = tx.execute(
-            "UPDATE leases SET revoked_at = ?2, revoke_reason = ?3 \
-             WHERE revoked_at IS NULL AND id IN ( \
-                 WITH RECURSIVE sub(id) AS ( \
-                     SELECT id FROM leases WHERE id = ?1 \
-                     UNION \
-                     SELECT l.id FROM leases l JOIN sub ON l.parent = sub.id \
-                 ) SELECT id FROM sub)",
-            params![lease.0, fmt_time(now)?, reason],
-        )?;
-        tx.commit()?;
-        Ok(changed as u64)
+        let out = revoke_in(&mut conn, lease, reason, now);
+        if let Some(d) = relaxed {
+            conn.pragma_update(None, "synchronous", d.pragma())?;
+        }
+        out
     }
 
     fn renew(
@@ -717,7 +1104,16 @@ impl LeaseStore for SqliteLeaseStore {
         leases: &[&LeaseId],
         now: OffsetDateTime,
     ) -> Result<LeaseStatus, AuditError> {
-        let conn = self.conn.lock()?;
-        classify(leases, now, |id| get_in(&conn, id))
+        let rows = {
+            let conn = self.conn.lock()?;
+            rows_in(&conn, leases)?
+        };
+        // A chain has a handful of leases: a linear scan beats hashing them.
+        classify(leases, now, |id| {
+            Ok(rows
+                .iter()
+                .find(|(r, _)| *r == id.0)
+                .map(|(_, row)| row.clone()))
+        })
     }
 }

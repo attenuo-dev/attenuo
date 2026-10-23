@@ -362,3 +362,132 @@ fn jwks_parsing_skips_foreign_keys_and_rejects_bad_ones() {
     let short = json!({"keys": [{"kty": "OKP", "crv": "Ed25519", "kid": "k", "x": "AAAA"}]});
     assert!(CheckpointKeys::from_jwks(&short).is_err());
 }
+
+// ---- group commit under concurrency ----
+
+/// Many threads append to a file-backed log through the group-commit writer while another
+/// thread verifies and asks for timer checkpoints. Afterwards the chain is contiguous, every
+/// checkpoint (automatic and timer) verifies, each thread saw its own appends in increasing
+/// order, and every returned entry is exactly what is stored at its seq.
+#[test]
+fn group_commit_keeps_the_chain_and_checkpoints_under_concurrency() {
+    use onbehalf_audit::Durability;
+    let threads = 8;
+    let per_thread = 40;
+    let total = (threads * per_thread) as u64;
+    for durability in [Durability::Normal, Durability::Full] {
+        let issuer = issuer();
+        let dir = tempfile::tempdir().unwrap();
+        let hooked = Arc::new(AtomicU64::new(0));
+        let counter = hooked.clone();
+        let log = Arc::new(
+            SqliteAudit::open_with(dir.path().join("audit.db"), durability)
+                .unwrap()
+                .with_checkpointing(issuer.detached_signer(), 7)
+                .with_checkpoint_hook(move |_| {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }),
+        );
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let checker = {
+            let (log, stop) = (log.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    assert!(log.verify_chain().unwrap().ok);
+                    log.checkpoint_if_new(t0()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        };
+        let writers: Vec<_> = (0..threads)
+            .map(|t| {
+                let log = log.clone();
+                std::thread::spawn(move || {
+                    (0..per_thread)
+                        .map(|i| log.append(record(t * per_thread + i)).unwrap())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut returned = Vec::new();
+        for w in writers {
+            let mine = w.join().unwrap();
+            assert!(
+                mine.windows(2).all(|p| p[0].seq < p[1].seq),
+                "{durability}: a thread's appends are ordered"
+            );
+            returned.extend(mine);
+        }
+        stop.store(true, Ordering::Relaxed);
+        checker.join().unwrap();
+
+        let report = log.verify_chain_signed(&keys(&issuer)).unwrap();
+        assert!(report.ok, "{durability}: {report:?}");
+        assert_eq!(report.entries, total, "{durability}");
+        assert!(report.checkpoints >= total / 7, "{durability}: {report:?}");
+        assert_eq!(report.checkpoints, hooked.load(Ordering::Relaxed));
+        let stored = log.range(1, usize::MAX).unwrap();
+        assert_eq!(
+            stored.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            (1..=total).collect::<Vec<_>>()
+        );
+        returned.sort_by_key(|e| e.seq);
+        assert_eq!(returned, stored, "{durability}: answers match the log");
+        for cp in log.checkpoints_between(1, total).unwrap() {
+            assert_eq!(cp.head_hash, stored[cp.seq as usize - 1].entry_hash);
+        }
+    }
+}
+
+/// A record the database refuses fails only its own append: the others in the same batch
+/// are committed, and the log holds no trace of the refused one.
+#[test]
+fn a_refused_record_fails_only_its_own_append() {
+    let log = Arc::new(SqliteAudit::open_in_memory().unwrap());
+    exec(
+        &log,
+        "CREATE TRIGGER refuse BEFORE INSERT ON audit WHEN NEW.reason = 'boom' \
+         BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        &[],
+    );
+    let writers: Vec<_> = (0..8)
+        .map(|t| {
+            let log = log.clone();
+            std::thread::spawn(move || {
+                (0..30)
+                    .map(|i| {
+                        let mut r = record(t * 30 + i);
+                        let boom = i % 5 == 0;
+                        if boom {
+                            r.reason = "boom".into();
+                        }
+                        (boom, log.append(r))
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    let mut ok = 0u64;
+    for w in writers {
+        for (boom, result) in w.join().unwrap() {
+            match result {
+                Ok(_) => {
+                    assert!(!boom, "a refused record was reported as written");
+                    ok += 1;
+                }
+                Err(e) => {
+                    assert!(boom, "a good record failed: {e}");
+                    assert!(e.to_string().contains("refused"), "{e}");
+                }
+            }
+        }
+    }
+    assert_eq!(ok, 8 * 24);
+    let report = log.verify_chain().unwrap();
+    assert!(report.ok && report.entries == ok, "{report:?}");
+    assert!(log
+        .range(1, usize::MAX)
+        .unwrap()
+        .iter()
+        .all(|e| e.record.reason != "boom"));
+}

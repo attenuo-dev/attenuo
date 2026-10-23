@@ -511,6 +511,12 @@ pub struct AuditSection {
     /// triggers are independent: whichever fires first writes the checkpoint.
     #[serde(default = "default_checkpoint_interval_seconds")]
     pub checkpoint_interval_seconds: u64,
+    /// `"normal"` (default) or `"full"`: SQLite `synchronous` for a file-backed store, which
+    /// always runs in WAL mode. `normal` does not sync on commit, so a power failure (not a
+    /// process crash) can lose the newest decisions, never tear one or break the chain; `full`
+    /// syncs every commit. Lease revocations always sync. Ignored for `":memory:"`.
+    #[serde(default)]
+    pub durability: onbehalf_audit::Durability,
 }
 
 impl Default for AuditSection {
@@ -519,6 +525,7 @@ impl Default for AuditSection {
             sqlite_path: default_sqlite_path(),
             checkpoint_every: default_checkpoint_every(),
             checkpoint_interval_seconds: default_checkpoint_interval_seconds(),
+            durability: onbehalf_audit::Durability::default(),
         }
     }
 }
@@ -1135,6 +1142,15 @@ mod tests {
         assert_eq!(cfg.audit.sqlite_path, ":memory:");
         assert_eq!(cfg.audit.checkpoint_every, 1000);
         assert_eq!(cfg.audit.checkpoint_interval_seconds, 300);
+        assert_eq!(cfg.audit.durability, onbehalf_audit::Durability::Normal);
+        assert_eq!(
+            Config::from_toml("[audit]\ndurability = \"full\"\n")
+                .unwrap()
+                .audit
+                .durability,
+            onbehalf_audit::Durability::Full
+        );
+        assert!(Config::from_toml("[audit]\ndurability = \"off\"\n").is_err());
         assert_eq!(cfg.issuer.default_ttl_seconds, 900);
         assert!(cfg.admin.token.is_none());
         assert!(

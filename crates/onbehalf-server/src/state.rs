@@ -361,12 +361,13 @@ fn open_storage(
     if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let audit = SqliteAudit::open(p)
+    let audit = SqliteAudit::open_with(p, cfg.durability)
         .with_context(|| format!("opening audit log {path}"))?
         .with_checkpointing(signer, cfg.checkpoint_every)
         .with_checkpoint_hook(count);
-    let leases =
-        SqliteLeaseStore::open(p).with_context(|| format!("opening lease store {path}"))?;
+    let leases = SqliteLeaseStore::open_with(p, cfg.durability)
+        .with_context(|| format!("opening lease store {path}"))?;
+    tracing::info!(path, durability = %cfg.durability, "audit store opened (WAL)");
     Ok((Arc::new(audit), Arc::new(leases)))
 }
 

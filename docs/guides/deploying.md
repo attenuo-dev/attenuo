@@ -7,7 +7,7 @@ This guide covers what to change between "it runs on my laptop" and "other peopl
 onbehalf is pre-alpha. Do not treat this guide as a statement that it is ready for production. It is a list of what you would have to do if you ran it anyway, for example in a staging environment or a closed pilot.
 
 - **One node.** There is no clustering, no replication and no leader election. One server process owns one SQLite file.
-- **SQLite only.** The audit log and the lease registry live in the same SQLite file. Access is serialised behind a mutex, and the calls run on the async worker threads. That is fine at demo load. It has not been load tested. The only numbers are micro-benchmarks, in [design/performance.md](../design/performance.md).
+- **SQLite only.** The audit log and the lease registry live in the same SQLite file, in WAL mode. Store calls run on the blocking pool, and audit appends go through one writer thread that commits whatever is queued in one transaction (group commit). On a shared 4-core development container a file-backed server handled about 3,000 to 4,500 calls per second at one hop (memory: about 5,000 to 6,600); see [design/performance.md](../design/performance.md) for the method and the caveats.
 - **No high availability.** If the process is down, every call through the proxy fails. That is by design: onbehalf fails closed. Do not start a second replica against the same file, or against a copy. Each process would keep its own idea of which leases are revoked.
 - **No TLS.** The server speaks plain HTTP. Terminate TLS in front of it.
 - **One static admin token.** There are no operator accounts or roles. Admin actions (lease revocations, policy reloads, development root mints) are recorded in the audit log as `by urn:onbehalf:admin`, a subject no identity provider can issue (the `urn:onbehalf:` prefix is reserved).
@@ -132,6 +132,13 @@ Placement:
 - Keep it away from anything agents can reach. Whoever can write the file can rewrite the log and un-revoke leases.
 - In a container, mount a volume. The image's working directory is `/var/lib/onbehalf`, owned by the `onbehalf` user (uid 10001).
 - Watch free disk space. An audit append that fails turns the decision into a deny with reason `audit_error`, so a full disk stops all calls and token issuance. That is the fail-closed rule working as designed.
+- The file runs in SQLite's WAL mode, so next to `onbehalf.sqlite` you will see `onbehalf.sqlite-wal` and `onbehalf.sqlite-shm`. They belong to the database: keep them on the same volume, and never copy or delete one of the three on its own.
+
+Durability (`[audit] durability`):
+
+- `"normal"` (the default) does not `fsync` on each commit. A process crash, `kill -9` or OOM kill loses nothing that was answered. A power failure or kernel crash can lose the most recent decisions, those written since SQLite's last sync. The log that remains is a clean prefix: no torn entry, no corruption, and `audit verify` passes with an earlier head. Lease revocations are always synced, so a revoked lease stays revoked.
+- `"full"` syncs every commit, so an answered decision is on disk. Use it when your record-keeping rules say the audit trail must survive power loss. It costs throughput, mostly for a single client (each commit waits for its `fsync`; under concurrency group commit lets one `fsync` cover a batch): on the development container one client went from about 1,000 calls per second at `normal` to between about 450 and 830 at `full`, and 32 clients from about 4,500 to between 2,200 and 5,700, depending on what else the host was doing (see [performance](../design/performance.md)). On storage with slow syncs (network block devices, some cloud disks) the gap is larger.
+- Either way, ship signed checkpoints off the host (below). After a power failure they are what tells you how much of the tail was lost.
 
 Backup:
 
