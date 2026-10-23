@@ -92,14 +92,14 @@ Capabilities serialize as the server expects: `{ server, tool, constraints: { re
 
 ### Errors
 
-| Error               | When                                                                                                                                          |
-| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DeniedError`       | The proxy denied a call (JSON-RPC `-32003`). Branch on `reason` (`capability_denied`, `policy_deny`, `lease_revoked`, ...), log `decisionId`. |
-| `UnauthorizedError` | HTTP 401 or JSON-RPC `-32001`: the bearer is missing, malformed, expired or not ours. A subclass of `ApiError`.                               |
-| `ApiError`          | A non-success HTTP status. `status`, `error` (for example `invalid_scope`), `detail`.                                                         |
-| `RpcError`          | Any other JSON-RPC error (`code`, `rpcMessage`, `data`).                                                                                      |
-| `VerificationError` | `inspect(..., { verify: true })` failed.                                                                                                      |
-| `OnbehalfError`     | Base class; also thrown for responses that are not what the server sends.                                                                     |
+| Error               | When                                                                                                                                                                                                                                                                             |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DeniedError`       | The proxy denied a call (JSON-RPC `-32003` with the `X-Onbehalf-Decision-Id` header naming `data.decision_id`; an upstream's own `-32003` without that proof is an `RpcError`). Branch on `reason` (`capability_denied`, `policy_deny`, `lease_revoked`, ...), log `decisionId`. |
+| `UnauthorizedError` | HTTP 401 or JSON-RPC `-32001`: the bearer is missing, malformed, expired or not ours. A subclass of `ApiError`.                                                                                                                                                                  |
+| `ApiError`          | A non-success HTTP status. `status`, `error` (for example `invalid_scope`), `detail`.                                                                                                                                                                                            |
+| `RpcError`          | Any other JSON-RPC error (`code`, `rpcMessage`, `data`).                                                                                                                                                                                                                         |
+| `VerificationError` | `inspect(..., { verify: true })` failed.                                                                                                                                                                                                                                         |
+| `OnbehalfError`     | Base class; also thrown for responses that are not what the server sends.                                                                                                                                                                                                        |
 
 An AuthZEN deny and a tool's own `isError` are results, not exceptions.
 

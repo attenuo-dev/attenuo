@@ -246,8 +246,21 @@ export function parseRpcBody(text: string, sse: boolean): Json | undefined {
 }
 
 /**
- * The `result` of a JSON-RPC response, or the right error. Denials (`-32003`) throw
- * `DeniedError`; `-32001` or HTTP 401 throws `UnauthorizedError`; any other JSON-RPC error throws
+ * The decision id of a denial the proxy produced, else `undefined` (SR-32). The proxy sets
+ * `X-Onbehalf-Decision-Id` (comma separated, request order) and forwards no such header from an
+ * upstream; an upstream is untrusted and can put any `-32003` error in its own body. A denial
+ * counts only when `data.decision_id` is one of the ids in that header.
+ */
+function proxyDecisionId(headerValue: string | undefined, data: Json): string | undefined {
+  const claimed = data.decision_id;
+  if (typeof claimed !== "string" || claimed === "" || !headerValue) return undefined;
+  return headerValue.split(",").some((p) => p.trim() === claimed) ? claimed : undefined;
+}
+
+/**
+ * The `result` of a JSON-RPC response, or the right error. Denials (`-32003` that the proxy
+ * vouches for with `X-Onbehalf-Decision-Id`) throw `DeniedError`; a `-32003` without that proof
+ * is an upstream's own error and throws `RpcError`; `-32001` or HTTP 401 throws `UnauthorizedError`; any other JSON-RPC error throws
  * `RpcError`.
  */
 export async function rpcResult(res: Response): Promise<{ result: Json; decisionId?: string }> {
@@ -265,9 +278,8 @@ export async function rpcResult(res: Response): Promise<{ result: Json; decision
     const data = (typeof e.data === "object" && e.data !== null ? e.data : {}) as Json;
     const message = String(e.message ?? "");
     if (e.code === CODE_DENIED) {
-      const id =
-        typeof data.decision_id === "string" && data.decision_id ? data.decision_id : headerId;
-      throw new DeniedError(String(data.reason ?? "unknown"), id, message);
+      const id = proxyDecisionId(headerId, data);
+      if (id !== undefined) throw new DeniedError(String(data.reason ?? "unknown"), id, message);
     }
     if (e.code === CODE_UNAUTHORIZED || res.status === 401) {
       throw new UnauthorizedError(401, "unauthorized", message);

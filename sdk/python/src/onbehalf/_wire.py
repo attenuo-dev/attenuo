@@ -270,10 +270,29 @@ def parse_rpc_body(text: str, sse: bool) -> dict[str, Any] | None:
     return None
 
 
+def _proxy_decision_id(resp: httpx.Response, data: dict[str, Any]) -> str | None:
+    """The decision id of a denial the proxy produced, else ``None`` (SR-32).
+
+    The proxy sets ``X-Onbehalf-Decision-Id`` (a comma separated list, request order) on every
+    response that carries its decisions and forwards no such header from an upstream. An upstream
+    is untrusted and can put any ``-32003`` error in its own body, so a denial counts only when
+    ``data.decision_id`` is one of the ids in that header.
+    """
+    claimed = data.get("decision_id")
+    header = resp.headers.get(DECISION_ID_HEADER)
+    if not isinstance(claimed, str) or not claimed or not header:
+        return None
+    ids = [part.strip() for part in header.split(",")]
+    return claimed if claimed in ids else None
+
+
 def rpc_result(resp: httpx.Response) -> tuple[dict[str, Any], str | None]:
     """The ``result`` of a JSON-RPC response, or the right exception.
 
-    Returns ``(result, decision_id)``. Denials (``-32003``) raise :class:`Denied`; ``-32001``
+    Returns ``(result, decision_id)``. Denials (``-32003`` that the proxy
+    vouches for with ``X-Onbehalf-Decision-Id``, see :func:`_proxy_decision_id`) raise
+    :class:`Denied`; a ``-32003`` without that proof is an upstream's own error and raises
+    :class:`RpcError`. ``-32001`
     or HTTP 401 raises :class:`Unauthorized`; any other JSON-RPC error raises :class:`RpcError`.
     """
     decision_id = resp.headers.get(DECISION_ID_HEADER)
@@ -290,11 +309,9 @@ def rpc_result(resp: httpx.Response) -> tuple[dict[str, Any], str | None]:
         data: dict[str, Any] = raw_data if isinstance(raw_data, dict) else {}
         message = str(err.get("message", ""))
         if code == CODE_DENIED:
-            raise Denied(
-                str(data.get("reason", "unknown")),
-                data.get("decision_id") or decision_id,
-                message,
-            )
+            proven = _proxy_decision_id(resp, data)
+            if proven is not None:
+                raise Denied(str(data.get("reason", "unknown")), proven, message)
         if code == CODE_UNAUTHORIZED or resp.status_code == 401:
             raise Unauthorized(401, "unauthorized", message)
         raise RpcError(int(code) if isinstance(code, int) else 0, message, raw_data)
