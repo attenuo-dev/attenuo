@@ -147,6 +147,10 @@ dpop = "optional"
 dpop_max_age_seconds = 300
 # Most proof jtis remembered for replay detection; when full, new proofs get 503.
 dpop_replay_capacity = 1000000
+# Server-provided DPoP nonces (RFC 9449 section 8). "required": every proof must carry the
+# nonce from the server's latest DPoP-Nonce response header, or the request gets 401
+# use_dpop_nonce with the nonce to retry with. "off" (default): no nonces.
+dpop_nonce = "off"
 
 # Workload identities accepted as `actor_token` on an exchange or at hop 0. Each actor token
 # works for one request, and the token it obtains never outlives it. A SPIFFE trust domain, keys from the SPIRE

@@ -6,7 +6,7 @@
  */
 
 import { capabilitiesToJson, type CapabilityLike } from "./capability.js";
-import { DpopKey, type DpopKeyLike } from "./dpop.js";
+import { DpopKey, NonceCache, type DpopKeyLike } from "./dpop.js";
 import { Http, type HttpOptions } from "./http.js";
 import { OnbehalfError } from "./errors.js";
 import type { Token } from "./token.js";
@@ -120,6 +120,7 @@ function entriesOf(page: Json): AuditEntry[] {
 export class AdminClient {
   readonly serverUrl: string;
   private readonly http: Http;
+  private readonly nonce = new NonceCache();
 
   constructor(serverUrl: string, adminToken: string, opts: HttpOptions = {}) {
     this.http = new Http(serverUrl, opts, { authorization: `Bearer ${adminToken}` });
@@ -274,10 +275,27 @@ export class AdminClient {
       body.attributes = opts.attributes;
     if (opts.mayAct !== undefined) body.may_act = w.mayActJson(opts.mayAct);
     const key = await DpopKey.of(opts.dpopKey);
-    const headers: Record<string, string> = key
-      ? { dpop: await key.proof("POST", `${this.serverUrl}/admin/root-token`) }
-      : {};
-    const res = await this.http.post("/admin/root-token", { json: body, headers });
+    const send = async () => {
+      const proofOpts = this.nonce.value === undefined ? {} : { nonce: this.nonce.value };
+      const headers: Record<string, string> = key
+        ? {
+            dpop: await key.proof(
+              "POST",
+              `${this.serverUrl}/admin/root-token`,
+              undefined,
+              proofOpts,
+            ),
+          }
+        : {};
+      return this.http.post("/admin/root-token", { json: body, headers });
+    };
+    let res = await send();
+    if (key !== undefined && (await this.nonce.update(res))) {
+      // `use_dpop_nonce`: retry once with the server's nonce.
+      await res.body?.cancel();
+      res = await send();
+      await this.nonce.update(res);
+    }
     return w.tokenFromResponse(await w.jsonBody(res));
   }
 }

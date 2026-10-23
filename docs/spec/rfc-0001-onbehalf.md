@@ -189,6 +189,8 @@ A proof is valid for a request when:
 6. the RFC 7638 thumbprint of `jwk` equals the token's `cnf.jkt`, when the request presents a bound token;
 7. its `jti` has not been seen for this key within the `iat` window (an in-memory cache per process, bounded by `[token] dpop_replay_capacity`; a full cache refuses new proofs with 503 rather than forget old ones). The `jti` is recorded only after every other check, including 6, has passed, so proofs by the wrong key cannot fill the cache (SR-41). The proofs of one request (an exchange's header and sign-off) are recorded together or not at all.
 
+With `[token] dpop_nonce = "required"`, a `DPoP` header proof must also carry a current server nonce (see "Server nonces" below). That check runs after 1 to 5 and before 6 and 7, so a nonce failure never uses up a `jti`.
+
 **Binding at issuance.** `POST /token` (hop 0 and exchanges) and the dev `POST /admin/root-token` bind the new token to the key of a valid `DPoP` header proof: `cnf.jkt` is its thumbprint and the response's `token_type` is `DPoP` (otherwise `Bearer`). `[token] dpop` controls this: `off` never binds new tokens, `optional` (the default) binds when a proof is sent, `required` refuses a request without a proof with `dpop_required`.
 
 **Attenuation.** A child of a bound token is always bound (`TokenError::BindingRequired`): binding is part of what a token cannot widen. The exchange's `DPoP` header names the child's key.
@@ -202,9 +204,19 @@ Without these, the exchange fails with `dpop_required` or `invalid_dpop_proof`, 
 
 **Errors.** 401 with `error` (and `error_description`) `dpop_required` when a proof is missing, or `invalid_dpop_proof` when one fails a check above, and `WWW-Authenticate: DPoP error="invalid_token", error_description="dpop_required", algs="EdDSA ES256"` or `DPoP error="invalid_dpop_proof", algs="EdDSA ES256"`. The proxy answers HTTP 401 with JSON-RPC `-32001` and `data.reason` set to the same code. A full replay cache is HTTP 503 at both: `temporarily_unavailable` with `error_description` `dpop_replay_cache_full` at the server, JSON-RPC `-32006` with `data.reason` `dpop_replay_cache_full` and `Retry-After` at the proxy (SR-47).
 
+**Server nonces.** `[token] dpop_nonce` is `off` (the default) or `required` (RFC 9449 §8). When required:
+
+- The server issues nonces without storing them: nonce = base64url(HMAC-SHA256(k, b)), with b = floor(unix time / `dpop_max_age_seconds`) as a big-endian 64-bit integer. The key is k = HMAC-SHA256(issuer private key PEM, `"onbehalf/dpop-nonce/v1"`), so an ephemeral issuer key gives ephemeral nonces, and replicas that share the signing key share nonces. A nonce is accepted while the current bucket is b or b + 1, so it lives between one and two windows. Rotating the signing key invalidates outstanding nonces; clients recover with one retry.
+- Every response to a request with a `DPoP` header, and every response with a `WWW-Authenticate: DPoP` challenge (including `dpop_required`), carries `DPoP-Nonce: <current nonce>`.
+- Every proof checked from a `DPoP` header (binding at issuance, a presented bound token, the header proof of an exchange) must carry a `nonce` claim the server accepts. A missing, stale or unknown nonce is 401 `use_dpop_nonce` with `WWW-Authenticate: DPoP error="use_dpop_nonce", error_description="Resource server requires nonce in DPoP proof", algs="EdDSA ES256"` and a `DPoP-Nonce` header. The proxy answers JSON-RPC `-32001` with `data.reason` `use_dpop_nonce`. Unlike RFC 9449 §8, which has an authorization server answer 400, `POST /token` uses 401 too, like its other DPoP errors. Clients should accept either.
+- The exchange sign-off (`subject_token_dpop`) is not a proof of the request and needs no nonce: the parent makes it ahead of time, and it is already limited to one key, one agent and the `iat` window.
+- A proof that fails another check is still `invalid_dpop_proof`. When `dpop_nonce` is `off`, a `nonce` claim is ignored.
+
+Clients keep the latest `DPoP-Nonce` they were sent, put it in each proof, and retry a request once when it is refused with `use_dpop_nonce`. The Python and TypeScript SDKs do this; the CLI does not yet.
+
 **Audit.** A decision made for a request whose bound token was proven, and an issuance that bound the new token, carry `"dpop_bound": true` in the record. The field is omitted when false, so the hashes of existing records do not change.
 
-**Not covered.** No server-provided nonce (RFC 9449 §8); freshness relies on `iat` and the `jti` cache, which is per process. Cedar's context does not include the binding. mTLS-bound tokens (RFC 8705) and SPIFFE X.509 binding are not implemented. An external PEP that verifies tokens locally must check proofs itself.
+**Not covered.** Server nonces are optional and off by default; without them, freshness relies on `iat` and the `jti` cache, which is per process. A nonce is shared by all clients for its lifetime, so it bounds how early a proof can be made but does not stop replay of a proof against another replica within that time. Cedar's context does not include the binding. mTLS-bound tokens (RFC 8705) and SPIFFE X.509 binding are not implemented. An external PEP that verifies tokens locally must check proofs itself.
 
 
 ## 5. Per-call authorization
@@ -285,7 +297,7 @@ Every record names the agent and the originating user separately, the attributio
 
 ## 9. Open questions
 
-1. **Token binding.** DPoP binding is implemented and optional (section 4.1); clients that cannot sign proofs keep using bearer tokens unless the deployment sets `[token] dpop = "required"`. Still open: mTLS or SPIFFE X.509 binding for workloads that already hold certificates, and a server nonce for deployments with several replicas.
+1. **Token binding.** DPoP binding is implemented and optional (section 4.1); clients that cannot sign proofs keep using bearer tokens unless the deployment sets `[token] dpop = "required"`. Server nonces (`[token] dpop_nonce`) are implemented. Still open: mTLS or SPIFFE X.509 binding for workloads that already hold certificates, and a replay cache shared by replicas.
 2. **Cross-organization chains.** How does the originating-user block survive when hop n+1 is in another trust domain? ID-JAG and the "crossing-the-trustee problem" are unresolved ([Cerbos](https://www.cerbos.dev/blog/mcp-authorization-standards)).
 3. **Constraint algebra.** Sets and ranges cover most tool arguments; nested objects, globs and regexes make `⊑` undecidable or expensive. Where is the line?
 4. **ReBAC composition.** Relationship facts (who owns which repo) are consulted via an external graph (SpiceDB/OpenFGA-style) and projected into Cedar entities; cache consistency with revocation is unsettled ([ADR-0002](../decisions/0002-cedar-for-policy.md)).

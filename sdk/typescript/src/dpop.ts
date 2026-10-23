@@ -9,6 +9,12 @@
  * Keys are private JWKs: Ed25519 (`{ kty: "OKP", crv: "Ed25519", x, d }`, what
  * `onbehalf key gen --dpop` writes) or P-256 (`{ kty: "EC", crv: "P-256", x, y, d }`). Signing
  * uses WebCrypto (`globalThis.crypto.subtle`); there are no extra dependencies.
+ *
+ * **Server nonces** (RFC 9449 §8). A server with `[token] dpop_nonce = "required"` wants a
+ * `nonce` it issued in every proof. It sends the current one in a `DPoP-Nonce` response header
+ * and refuses a proof without it with `use_dpop_nonce`. The clients keep the latest nonce they
+ * were sent (`NonceCache`), put it in every proof, and retry a request once when the server
+ * answers `use_dpop_nonce`.
  */
 
 import { OnbehalfError } from "./errors.js";
@@ -20,6 +26,10 @@ export const PROOF_TYPE = "dpop+jwt";
 export const SIGN_OFF_CHILD_JKT = "child_jkt";
 /** Sign-off claim naming the new token's agent. */
 export const SIGN_OFF_CHILD_ACTOR = "child_actor";
+/** Response header carrying the server's current DPoP nonce. */
+export const NONCE_HEADER = "DPoP-Nonce";
+/** `error` of a refusal asking for a proof with the server's nonce. */
+export const USE_DPOP_NONCE = "use_dpop_nonce";
 
 /** A private JWK as stored on disk, or any JWK-shaped object. */
 export type Jwk = Record<string, unknown>;
@@ -139,13 +149,14 @@ export class DpopKey {
 
   /**
    * A proof for one request: `htm` = `method`, `htu` = `url` without query or fragment, a fresh
-   * `jti`, and `ath` when `accessToken` (a bound token sent with the request) is given.
+   * `jti`, `ath` when `accessToken` (a bound token sent with the request) is given, and `nonce`
+   * (the server's latest `DPoP-Nonce`) when given.
    */
   async proof(
     method: string,
     url: string,
     accessToken?: string,
-    opts: { iat?: number } = {},
+    opts: { iat?: number; nonce?: string } = {},
   ): Promise<string> {
     const claims: Record<string, unknown> = {
       jti: crypto.randomUUID(),
@@ -154,6 +165,7 @@ export class DpopKey {
       iat: opts.iat ?? Math.floor(Date.now() / 1000),
     };
     if (accessToken !== undefined) claims.ath = await accessTokenHash(accessToken);
+    if (opts.nonce !== undefined) claims.nonce = opts.nonce;
     return this.sign(claims);
   }
 
@@ -211,9 +223,46 @@ export async function presented(
   key: DpopKey | undefined,
   method: string,
   url: string,
+  nonce?: string,
 ): Promise<Record<string, string>> {
   if (key === undefined) return { authorization: `Bearer ${token}` };
-  return { authorization: `DPoP ${token}`, dpop: await key.proof(method, url, token) };
+  const opts = nonce === undefined ? {} : { nonce };
+  return { authorization: `DPoP ${token}`, dpop: await key.proof(method, url, token, opts) };
+}
+
+/** The latest `DPoP-Nonce` a server sent (RFC 9449 §8), for the next proof. */
+export class NonceCache {
+  /** The nonce to put in the next proof, or undefined before the server sent one. */
+  value: string | undefined;
+
+  /**
+   * Remember `res`'s `DPoP-Nonce`. True when the response refused the proof with
+   * `use_dpop_nonce` and gave a nonce: the request should be retried, once, with a new proof
+   * carrying it.
+   */
+  async update(res: Response): Promise<boolean> {
+    const nonce = res.headers.get(NONCE_HEADER);
+    if (!nonce) return false;
+    this.value = nonce;
+    return isUseDpopNonce(res);
+  }
+}
+
+/**
+ * Did the server refuse the proof for want of its nonce? A 401 with
+ * `WWW-Authenticate: DPoP error="use_dpop_nonce"` (resource servers, and onbehalf's own routes),
+ * or a 400 or 401 whose JSON `error` is `use_dpop_nonce` (authorization servers). Reads a clone
+ * of the body, so `res` stays readable.
+ */
+export async function isUseDpopNonce(res: Response): Promise<boolean> {
+  if (res.status !== 400 && res.status !== 401) return false;
+  if ((res.headers.get("www-authenticate") ?? "").includes(USE_DPOP_NONCE)) return true;
+  try {
+    const body: unknown = await res.clone().json();
+    return (body as { error?: unknown } | null)?.error === USE_DPOP_NONCE;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -222,7 +271,8 @@ export async function presented(
  * `key` binds the new token; its proof covers the subject token when the subject token is bound
  * to the same key. `subjectKey` is the subject token's key when the new token is bound to another
  * one: its sign-off names `key` and `actor` (see `DpopKey.signOff`), so it consents to that
- * delegation only.
+ * delegation only. `nonce` goes in the header proof only: the server does not ask for one in the
+ * sign-off.
  */
 export async function exchangeProofs(
   url: string,
@@ -230,12 +280,18 @@ export async function exchangeProofs(
   key: DpopKey | undefined,
   subjectKey: DpopKey | undefined,
   actor: string,
+  nonce?: string,
 ): Promise<{ header?: string; signOff?: string }> {
   const parent = tokenJkt(subjectToken);
   const out: { header?: string; signOff?: string } = {};
   if (key !== undefined) {
     const same = parent !== undefined && parent === key.thumbprint;
-    out.header = await key.proof("POST", url, same ? subjectToken : undefined);
+    out.header = await key.proof(
+      "POST",
+      url,
+      same ? subjectToken : undefined,
+      nonce === undefined ? {} : { nonce },
+    );
   }
   if (subjectKey !== undefined) {
     if (key === undefined) {

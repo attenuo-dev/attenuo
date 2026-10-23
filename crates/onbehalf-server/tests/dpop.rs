@@ -11,7 +11,7 @@ use std::path::Path;
 use onbehalf_policy::{ArgType, ToolAttrs};
 use onbehalf_proxy::testing::{spawn_router, FakeMcpServer, Spawned};
 use onbehalf_proxy::UpstreamConfig;
-use onbehalf_server::config::{AgentConfig, DpopMode};
+use onbehalf_server::config::{AgentConfig, DpopMode, DpopNonceMode};
 use onbehalf_server::Config;
 use onbehalf_token::DpopKey;
 use reqwest::{RequestBuilder, StatusCode};
@@ -42,6 +42,11 @@ struct Server {
 /// A server with `[token] dpop = mode`. Servers started on the same `dir` share the issuer key
 /// and the SQLite file, so a token minted by one is accepted by the others.
 async fn start(dir: &Path, mode: DpopMode) -> Server {
+    start_with(dir, mode, DpopNonceMode::Off).await
+}
+
+/// [`start`] with `[token] dpop_nonce = nonce`.
+async fn start_with(dir: &Path, mode: DpopMode, nonce: DpopNonceMode) -> Server {
     let upstream = FakeMcpServer::new(&["read_file"]);
     let upstream_task = upstream.spawn().await.unwrap();
     let policy = dir.join("policies.cedar");
@@ -69,6 +74,7 @@ async fn start(dir: &Path, mode: DpopMode) -> Server {
     cfg.admin.token = Some(ADMIN.into());
     cfg.dev.allow_root_mint = true;
     cfg.token.dpop = mode;
+    cfg.token.dpop_nonce = nonce;
     cfg.agents = AGENTS
         .iter()
         .map(|id| AgentConfig {
@@ -564,4 +570,100 @@ async fn several_dpop_headers_are_refused_sr24() {
         .await
         .unwrap();
     assert_eq!(refusal(resp).await.1, "invalid_dpop_proof");
+}
+
+/// The `DPoP-Nonce` header of a response.
+fn nonce_of(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get("dpop-nonce")
+        .map(|v| v.to_str().unwrap().to_string())
+}
+
+/// RFC 9449 §8: with `[token] dpop_nonce = "required"`, a proof without the server's nonce is
+/// refused with `use_dpop_nonce` and the nonce to use; the retry carries it and goes through,
+/// at issuance and through the proxy.
+#[tokio::test]
+async fn server_nonce_required_through_the_proxy() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start_with(dir.path(), DpopMode::Optional, DpopNonceMode::Required).await;
+    let key = DpopKey::generate().unwrap();
+
+    // Issuance: the first proof has no nonce, so 401 `use_dpop_nonce` with a nonce.
+    let root_url = s.url("/admin/root-token");
+    let resp = s.root(Some(&key)).await;
+    let nonce = nonce_of(&resp).expect("DPoP-Nonce on the use_dpop_nonce response");
+    let (status, code, challenge) = refusal(resp).await;
+    assert_eq!(
+        (status, code.as_str()),
+        (StatusCode::UNAUTHORIZED, "use_dpop_nonce")
+    );
+    assert!(
+        challenge.starts_with("DPoP error=\"use_dpop_nonce\""),
+        "{challenge}"
+    );
+    let resp = s
+        .client
+        .post(&root_url)
+        .bearer_auth(ADMIN)
+        .header(
+            "DPoP",
+            key.proof_with_nonce("POST", &root_url, None, Some(&nonce), now()),
+        )
+        .json(&json!({"subject": "alice", "issuer": "https://idp.example",
+            "agent": "planner", "capabilities": ["github:read_file"]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        nonce_of(&resp).is_some(),
+        "every DPoP response carries a nonce"
+    );
+    let token = bound_token(resp).await;
+
+    // Through the proxy: no nonce, then a wrong one, are refused with a fresh nonce.
+    let mcp = s.url("/mcp/github");
+    for bad in [None, Some("bm90LWEtbm9uY2U")] {
+        let p = key.proof_with_nonce("POST", &mcp, Some(&token), bad, now());
+        let resp = s.call(&token, Some(p)).send().await.unwrap();
+        assert!(nonce_of(&resp).is_some());
+        let (status, code, challenge) = refusal(resp).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (StatusCode::UNAUTHORIZED, "use_dpop_nonce")
+        );
+        assert!(challenge.contains("use_dpop_nonce"), "{challenge}");
+    }
+    let p = key.proof_with_nonce("POST", &mcp, Some(&token), Some(&nonce), now());
+    let resp = s.call(&token, Some(p)).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(nonce_of(&resp).is_some());
+    assert!(allowed(&resp.json().await.unwrap()));
+    assert_eq!(s.upstream.recorded_calls().len(), 1);
+
+    // A bad proof is still `invalid_dpop_proof`, and a challenge without a proof
+    // (`dpop_required`) carries the nonce too, so the first proof can include it.
+    let other = DpopKey::generate().unwrap();
+    let p = other.proof_with_nonce("POST", &mcp, Some(&token), Some(&nonce), now());
+    let resp = s.call(&token, Some(p)).send().await.unwrap();
+    assert_eq!(refusal(resp).await.1, "invalid_dpop_proof");
+    let resp = s.call(&token, None).send().await.unwrap();
+    assert!(nonce_of(&resp).is_some());
+    assert_eq!(refusal(resp).await.1, "dpop_required");
+
+    // A server with the same issuer key accepts the nonce (no shared storage needed); one
+    // with nonces off neither sends nor checks them.
+    let twin = start_with(dir.path(), DpopMode::Optional, DpopNonceMode::Required).await;
+    let twin_mcp = twin.url("/mcp/github");
+    let p = key.proof_with_nonce("POST", &twin_mcp, Some(&token), Some(&nonce), now());
+    let resp = twin.call(&token, Some(p)).send().await.unwrap();
+    assert!(allowed(&resp.json().await.unwrap()));
+    let off = start(dir.path(), DpopMode::Optional).await;
+    let off_mcp = off.url("/mcp/github");
+    let resp = off
+        .call(&token, Some(proof(&key, &off_mcp, Some(&token))))
+        .send()
+        .await
+        .unwrap();
+    assert!(nonce_of(&resp).is_none());
+    assert!(allowed(&resp.json().await.unwrap()));
 }

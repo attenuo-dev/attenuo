@@ -45,7 +45,15 @@ export {
   prefix,
 } from "./capability.js";
 export type { Capability, CapabilityLike, Constraint } from "./capability.js";
-export { accessTokenHash, DpopKey, jwkThumbprint } from "./dpop.js";
+export {
+  accessTokenHash,
+  DpopKey,
+  isUseDpopNonce,
+  jwkThumbprint,
+  NONCE_HEADER,
+  NonceCache,
+  USE_DPOP_NONCE,
+} from "./dpop.js";
 export type { DpopKeyLike, Jwk } from "./dpop.js";
 export { OnbehalfClient } from "./client.js";
 export type { ClientOptions, InspectOptions, McpOptions } from "./client.js";

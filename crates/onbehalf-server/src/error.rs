@@ -125,6 +125,9 @@ impl IntoResponse for ApiError {
                 crate::dpop::INVALID_DPOP_PROOF => {
                     Some(onbehalf_proxy::AuthError::InvalidDpopProof(String::new()))
                 }
+                crate::dpop::USE_NONCE => {
+                    Some(onbehalf_proxy::AuthError::UseDpopNonce(String::new()))
+                }
                 _ => None,
             };
             if let Some(v) =

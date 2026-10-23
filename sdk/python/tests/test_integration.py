@@ -37,6 +37,7 @@ from onbehalf import (
     TokenRefresher,
     Unauthorized,
 )
+from onbehalf.mcp import TokenAuth
 
 pytestmark = [
     pytest.mark.integration,
@@ -113,7 +114,18 @@ class Stack:
 
 @pytest.fixture(scope="module")
 def stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
-    work = tmp_path_factory.mktemp("onbehalf-it")
+    yield from run_stack(tmp_path_factory.mktemp("onbehalf-it"))
+
+
+@pytest.fixture(scope="module")
+def nonce_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
+    """The same stack with ``[token] dpop_nonce = "required"`` (RFC 9449 §8)."""
+    yield from run_stack(
+        tmp_path_factory.mktemp("onbehalf-it-nonce"), '[token]\ndpop_nonce = "required"\n\n'
+    )
+
+
+def run_stack(work: Path, token_section: str = "") -> Iterator[Stack]:
     built_server, built_fake = binaries()
     # Copy them: a shared CARGO_TARGET_DIR can be rebuilt under us mid-test.
     server_bin = work / "onbehalf-server"
@@ -130,6 +142,7 @@ def stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
         .replace("18080", str(ob_port))
         .replace("13001", str(mcp_port))
         .replace("examples/github-leak-demo/policy.cedar", str(DEMO / "policy.cedar"))
+        .replace("[audit]\n", f"{token_section}[audit]\n", 1)
     )
     (work / "config.toml").write_text(config)
 
@@ -385,6 +398,58 @@ def test_dpop_bound_chain(stack: Stack) -> None:
     by_id = {e.id: e for e in entries}
     assert by_id[res.decision_id].dpop_bound
     assert not any(e.dpop_bound for e in entries if e.tool == "admin.root_token")
+    admin.revoke_lease(root.lease)
+    admin.close()
+
+
+def test_dpop_server_nonce(nonce_stack: Stack) -> None:
+    """RFC 9449 §8: against a server that requires its nonce, the clients pick it up from the
+    first ``use_dpop_nonce`` refusal, retry once, and use it from then on."""
+    url = nonce_stack.url
+    admin = AdminClient(url, ADMIN_TOKEN)
+    key = DpopKey.generate()
+    root = admin.mint_root_dev(
+        "alice", "https://idp.example", "assistant", ["github:*"], dpop_key=key
+    )
+    assert root.dpop_jkt == key.thumbprint
+
+    # Raw: a proof without the nonce is refused with the nonce to use.
+    resp = httpx.post(
+        f"{url}/token/renew",
+        headers={
+            "authorization": f"DPoP {root.jwt}",
+            "dpop": key.proof("POST", f"{url}/token/renew", root.jwt),
+        },
+    )
+    assert resp.status_code == 401
+    assert resp.json()["error"] == "use_dpop_nonce"
+    assert 'error="use_dpop_nonce"' in resp.headers["www-authenticate"]
+    assert resp.headers["dpop-nonce"]
+
+    with Client(url, dpop_key=key) as ob:
+        res = ob.call_tool(root, "github", "read_file", {"repo": "alice/public-docs"})
+        assert res.decision_id
+        assert ob.renew(root).expires_in > 0
+        assert ob.authzen_evaluate(root, "github", "read_file", {"repo": "alice/public-x"})
+        coder = ob.exchange(root, "coder", ["github:read_file"], client_secret=CODER_SECRET)
+        assert coder.dpop_jkt == key.thumbprint
+
+    # Through the `httpx` auth an MCP client library would use.
+    auth = TokenAuth(lambda: coder, dpop_key=key)
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "read_file", "arguments": {"repo": "alice/public-docs"}},
+    }
+    with httpx.Client(auth=auth) as http:
+        r = http.post(
+            f"{url}/mcp/github",
+            json=body,
+            headers={"accept": "application/json, text/event-stream"},
+        )
+        assert r.status_code == 200, r.text
+        assert "result" in r.json()
     admin.revoke_lease(root.lease)
     admin.close()
 

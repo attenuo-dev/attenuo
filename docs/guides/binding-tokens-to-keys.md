@@ -155,14 +155,23 @@ Each 401 carries `WWW-Authenticate: DPoP error="…", algs="EdDSA ES256"`. Audit
 dpop = "optional"            # "off": never bind new tokens; "required": every token must be bound
 dpop_max_age_seconds = 300   # how far a proof's iat may be from the server's clock
 dpop_replay_capacity = 1000000
+dpop_nonce = "off"           # "required": every proof must carry the server's current nonce
 ```
 
 A bound token stays bound whatever `dpop` says: `off` stops binding new tokens but does not let bound ones through without proofs. Set `[server] public_url` when the server sits behind a proxy or a TLS terminator, so `htu` matches what clients see.
 
+## Server nonces
+
+With `[token] dpop_nonce = "required"` the server supplies the freshness instead of trusting the client's clock (RFC 9449 §8). Every response to a request that sent a `DPoP` header, and every `WWW-Authenticate: DPoP` challenge, carries a `DPoP-Nonce` header. Each proof the server checks in a `DPoP` header must put the latest such value in its `nonce` claim. A proof without it, or with a stale or unknown one, is refused with 401 `use_dpop_nonce`. That response carries the nonce to use, and the client retries with a new proof.
+
+The Python and TypeScript clients (`Client`, `AsyncClient`, `OnbehalfClient`, `AdminClient` for the dev root mint, `TokenAuth` and `mcpFetch`) do this for you. They keep the latest nonce and retry a refused request once. The CLI does not handle nonces yet.
+
+The server keeps no nonce state. A nonce is an HMAC of the current time bucket (`dpop_max_age_seconds` wide) under a key derived from the issuer's signing key. The current and the previous bucket's nonces are accepted, so a nonce lives for one to two windows, and replicas that share the signing key accept each other's nonces. The exchange sign-off (`subject_token_dpop`) needs no nonce, because the parent makes it ahead of time.
+
 ## Limits
 
 - Replay protection is in memory, per process. With several server replicas, a proof could be replayed against another replica within the `iat` window.
-- No server nonce (RFC 9449 §8). Freshness rests on `iat` and the `jti` cache.
+- Server nonces are off by default; freshness then rests on `iat` and the `jti` cache. With nonces on, a nonce is shared by every client of the server for its lifetime, so it limits how far ahead a proof can be made. It does not stop the cross-replica replay above.
 - Binding is checked by the server and the built-in proxy. An external enforcement point that verifies tokens itself must check proofs too, or ask the AuthZEN endpoint with the token and a proof.
 - Cedar policies cannot see whether a call was bound yet; only the audit record says so.
 - mTLS (RFC 8705) and SPIFFE X.509 binding are not implemented.

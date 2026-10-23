@@ -8,7 +8,7 @@ and ``POST /access/v1/evaluation``.
 from __future__ import annotations
 
 import itertools
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from types import TracebackType
 from typing import Any
 
@@ -16,7 +16,7 @@ import httpx
 
 from . import _wire as w
 from .capability import CapabilityLike
-from .dpop import DpopKey, exchange_proofs, presented
+from .dpop import DpopKey, NonceCache, exchange_proofs, presented
 from .errors import OnbehalfError
 from .token import Token, decode_token, verify_token
 
@@ -35,7 +35,9 @@ class Client:
     ``dpop_key`` (a :class:`~onbehalf.dpop.DpopKey` or a private JWK dict) makes this client
     sender-constrained (DPoP, RFC 9449): every request carries a proof by the key, exchanges
     bind the new token to it, and tokens are sent as ``Authorization: DPoP <token>``. A token
-    bound to a key is refused without proofs, so a copied token is useless on its own.
+    bound to a key is refused without proofs, so a copied token is useless on its own. When the
+    server hands out DPoP nonces, the client keeps the latest one, puts it in every proof, and
+    retries a request once when the server answers ``use_dpop_nonce``.
     """
 
     def __init__(
@@ -51,6 +53,7 @@ class Client:
         self.server_url = w.normalize_base(server_url)
         self.token = token
         self.dpop_key = DpopKey.of(dpop_key)
+        self._nonce = NonceCache()
         self._http = httpx.Client(
             base_url=self.server_url, timeout=timeout, transport=transport, headers=headers
         )
@@ -124,20 +127,33 @@ class Client:
             actor_token=actor_token,
             may_act=may_act,
         )
-        headers = _exchange_dpop(
-            self.server_url, self.dpop_key, body, subject_dpop_key, subject_token_dpop
+        resp = self._post(
+            "/token",
+            lambda nonce: _exchange_dpop(
+                self.server_url, self.dpop_key, body, subject_dpop_key, subject_token_dpop, nonce
+            ),
+            json=body,
         )
-        resp = self._http.post("/token", json=body, headers=headers)
         return w.token_from_response(w.json_body(resp))
 
-    def _auth(self, token: str, path: str) -> dict[str, str]:
-        return presented(token, self.dpop_key, "POST", f"{self.server_url}{path}")
+    def _post(
+        self, path: str, headers: Callable[[str | None], dict[str, str]], **kwargs: Any
+    ) -> httpx.Response:
+        """``POST path`` with ``headers(nonce)``; once more with the server's new nonce when it
+        answers ``use_dpop_nonce``."""
+        resp = self._http.post(path, headers=headers(self._nonce.value), **kwargs)
+        if self.dpop_key is not None and self._nonce.update(resp):
+            resp = self._http.post(path, headers=headers(self._nonce.value), **kwargs)
+            self._nonce.update(resp)
+        return resp
+
+    def _auth(self, token: str, path: str) -> Callable[[str | None], dict[str, str]]:
+        url = f"{self.server_url}{path}"
+        return lambda nonce: presented(token, self.dpop_key, "POST", url, nonce)
 
     def renew(self, token: Token | str | None = None) -> w.Lease:
         """Extend the lease of the token's last hop (``POST /token/renew``)."""
-        resp = self._http.post(
-            "/token/renew", headers=self._auth(w.bearer(token, self.token), "/token/renew")
-        )
+        resp = self._post("/token/renew", self._auth(w.bearer(token, self.token), "/token/renew"))
         return w.lease_from_response(w.json_body(resp))
 
     # -- MCP through the proxy --
@@ -150,12 +166,11 @@ class Client:
         session_id: str | None = None,
     ) -> tuple[dict[str, Any], str | None, httpx.Response]:
         path = f"/mcp/{w.path_segment(server, 'server')}"
-        resp = self._http.post(
+        jwt = w.bearer(token, self.token)
+        auth = self._auth(jwt, path)
+        resp = self._post(
             path,
-            headers={
-                **w.mcp_headers(w.bearer(token, self.token), session_id),
-                **self._auth(w.bearer(token, self.token), path),
-            },
+            lambda nonce: {**w.mcp_headers(jwt, session_id), **auth(nonce)},
             json=w.rpc_request(method, params, next(self._ids)),
         )
         result, decision_id = w.rpc_result(resp)
@@ -208,9 +223,9 @@ class Client:
         arguments: dict[str, Any] | None = None,
     ) -> w.AuthzenDecision:
         """Ask for a decision without calling the tool. A deny is returned, not raised."""
-        resp = self._http.post(
+        resp = self._post(
             "/access/v1/evaluation",
-            headers=self._auth(w.bearer(token, self.token), "/access/v1/evaluation"),
+            self._auth(w.bearer(token, self.token), "/access/v1/evaluation"),
             json=w.authzen_body(server, tool, arguments),
         )
         return w.authzen_from_response(w.json_body(resp))
@@ -256,6 +271,7 @@ class AsyncClient:
         self.server_url = w.normalize_base(server_url)
         self.token = token
         self.dpop_key = DpopKey.of(dpop_key)
+        self._nonce = NonceCache()
         self._http = httpx.AsyncClient(
             base_url=self.server_url, timeout=timeout, transport=transport, headers=headers
         )
@@ -301,18 +317,31 @@ class AsyncClient:
             actor_token=actor_token,
             may_act=may_act,
         )
-        headers = _exchange_dpop(
-            self.server_url, self.dpop_key, body, subject_dpop_key, subject_token_dpop
+        resp = await self._post(
+            "/token",
+            lambda nonce: _exchange_dpop(
+                self.server_url, self.dpop_key, body, subject_dpop_key, subject_token_dpop, nonce
+            ),
+            json=body,
         )
-        resp = await self._http.post("/token", json=body, headers=headers)
         return w.token_from_response(w.json_body(resp))
 
-    def _auth(self, token: str, path: str) -> dict[str, str]:
-        return presented(token, self.dpop_key, "POST", f"{self.server_url}{path}")
+    async def _post(
+        self, path: str, headers: Callable[[str | None], dict[str, str]], **kwargs: Any
+    ) -> httpx.Response:
+        resp = await self._http.post(path, headers=headers(self._nonce.value), **kwargs)
+        if self.dpop_key is not None and self._nonce.update(resp):
+            resp = await self._http.post(path, headers=headers(self._nonce.value), **kwargs)
+            self._nonce.update(resp)
+        return resp
+
+    def _auth(self, token: str, path: str) -> Callable[[str | None], dict[str, str]]:
+        url = f"{self.server_url}{path}"
+        return lambda nonce: presented(token, self.dpop_key, "POST", url, nonce)
 
     async def renew(self, token: Token | str | None = None) -> w.Lease:
-        resp = await self._http.post(
-            "/token/renew", headers=self._auth(w.bearer(token, self.token), "/token/renew")
+        resp = await self._post(
+            "/token/renew", self._auth(w.bearer(token, self.token), "/token/renew")
         )
         return w.lease_from_response(w.json_body(resp))
 
@@ -325,12 +354,11 @@ class AsyncClient:
         session_id: str | None = None,
     ) -> tuple[dict[str, Any], str | None, httpx.Response]:
         path = f"/mcp/{w.path_segment(server, 'server')}"
-        resp = await self._http.post(
+        jwt = w.bearer(token, self.token)
+        auth = self._auth(jwt, path)
+        resp = await self._post(
             path,
-            headers={
-                **w.mcp_headers(w.bearer(token, self.token), session_id),
-                **self._auth(w.bearer(token, self.token), path),
-            },
+            lambda nonce: {**w.mcp_headers(jwt, session_id), **auth(nonce)},
             json=w.rpc_request(method, params, next(self._ids)),
         )
         result, decision_id = w.rpc_result(resp)
@@ -378,9 +406,9 @@ class AsyncClient:
         tool: str,
         arguments: dict[str, Any] | None = None,
     ) -> w.AuthzenDecision:
-        resp = await self._http.post(
+        resp = await self._post(
             "/access/v1/evaluation",
-            headers=self._auth(w.bearer(token, self.token), "/access/v1/evaluation"),
+            self._auth(w.bearer(token, self.token), "/access/v1/evaluation"),
             json=w.authzen_body(server, tool, arguments),
         )
         return w.authzen_from_response(w.json_body(resp))
@@ -409,10 +437,11 @@ def _exchange_dpop(
     body: dict[str, Any],
     subject_dpop_key: DpopKey | dict[str, Any] | None,
     subject_token_dpop: str | None = None,
+    nonce: str | None = None,
 ) -> dict[str, str]:
-    """Add DPoP to an exchange: the ``DPoP`` header binding the new token to ``key``, and the
-    parent's sign-off in ``body``, made here when ``subject_dpop_key`` is given or passed in
-    ready-made as ``subject_token_dpop``."""
+    """Add DPoP to an exchange: the ``DPoP`` header binding the new token to ``key`` (with the
+    server's ``nonce``, if any), and the parent's sign-off in ``body``, made here when
+    ``subject_dpop_key`` is given or passed in ready-made as ``subject_token_dpop``."""
     if subject_dpop_key is not None and subject_token_dpop is not None:
         raise OnbehalfError("pass subject_dpop_key or subject_token_dpop, not both")
     header, sign_off = exchange_proofs(
@@ -421,6 +450,7 @@ def _exchange_dpop(
         key,
         DpopKey.of(subject_dpop_key),
         body["actor"],
+        nonce,
     )
     sign_off = sign_off or subject_token_dpop
     if sign_off is not None:

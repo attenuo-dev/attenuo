@@ -4,7 +4,7 @@
  */
 
 import type { CapabilityLike } from "./capability.js";
-import { DpopKey, exchangeProofs, presented, type DpopKeyLike } from "./dpop.js";
+import { DpopKey, NonceCache, exchangeProofs, presented, type DpopKeyLike } from "./dpop.js";
 import { OnbehalfError } from "./errors.js";
 import { Http, type HttpOptions } from "./http.js";
 import { bearer, decodeToken, verifyToken, type Jwks, type Token } from "./token.js";
@@ -18,7 +18,8 @@ export interface ClientOptions extends HttpOptions {
    * Make this client sender-constrained (DPoP, RFC 9449): a `DpopKey` or a private JWK. Every
    * request then carries a proof by the key, exchanges bind the new token to it, and tokens are
    * sent as `Authorization: DPoP <token>`. A token bound to a key is refused without proofs, so a
-   * copied token is useless on its own.
+   * copied token is useless on its own. When the server hands out DPoP nonces, the client keeps
+   * the latest one, puts it in every proof, and retries a request once on `use_dpop_nonce`.
    */
   dpopKey?: DpopKeyLike;
 }
@@ -47,6 +48,7 @@ export class OnbehalfClient {
   private nextId = 1;
   private readonly dpopKeyLike: DpopKeyLike | undefined;
   private dpopKeyPromise: Promise<DpopKey | undefined> | undefined;
+  private readonly nonce = new NonceCache();
 
   constructor(serverUrl: string, opts: ClientOptions = {}) {
     this.http = new Http(serverUrl, opts);
@@ -61,9 +63,30 @@ export class OnbehalfClient {
     return this.dpopKeyPromise;
   }
 
-  /** `Authorization` (and a DPoP proof with this client's key) to present `jwt` at `path`. */
-  private async auth(jwt: string, path: string): Promise<Record<string, string>> {
-    return presented(jwt, await this.dpopKey(), "POST", `${this.serverUrl}${path}`);
+  /**
+   * `Authorization` (and a DPoP proof with this client's key and the server's `nonce`) to present
+   * `jwt` at `path`.
+   */
+  private auth(jwt: string, path: string): (nonce?: string) => Promise<Record<string, string>> {
+    return async (nonce) =>
+      presented(jwt, await this.dpopKey(), "POST", `${this.serverUrl}${path}`, nonce);
+  }
+
+  /** `POST path` with `headers(nonce)`; once more with the server's new nonce on `use_dpop_nonce`. */
+  private async post(
+    path: string,
+    headers: (nonce?: string) => Promise<Record<string, string>>,
+    json?: unknown,
+  ): Promise<Response> {
+    const send = async () =>
+      this.http.post(path, { headers: await headers(this.nonce.value), json });
+    let res = await send();
+    if ((await this.dpopKey()) !== undefined && (await this.nonce.update(res))) {
+      await res.body?.cancel();
+      res = await send();
+      await this.nonce.update(res);
+    }
+    return res;
   }
 
   /**
@@ -98,26 +121,29 @@ export class OnbehalfClient {
       throw new OnbehalfError("pass subjectDpopKey or subjectTokenDpop, not both");
     }
     const body = w.exchangeBody(subjectToken, actor, capabilities, opts);
-    const { header, signOff } = await exchangeProofs(
-      `${this.serverUrl}/token`,
-      String(body.subject_token),
-      await this.dpopKey(),
-      await DpopKey.of(opts.subjectDpopKey),
-      actor,
-    );
-    const given = signOff ?? opts.subjectTokenDpop;
-    if (given !== undefined) body.subject_token_dpop = given;
-    const headers: Record<string, string> = header === undefined ? {} : { dpop: header };
-    return w.tokenFromResponse(
-      await w.jsonBody(await this.http.post("/token", { json: body, headers })),
-    );
+    const subjectKey = await DpopKey.of(opts.subjectDpopKey);
+    const headers = async (nonce?: string): Promise<Record<string, string>> => {
+      const { header, signOff } = await exchangeProofs(
+        `${this.serverUrl}/token`,
+        String(body.subject_token),
+        await this.dpopKey(),
+        subjectKey,
+        actor,
+        nonce,
+      );
+      const given = signOff ?? opts.subjectTokenDpop;
+      if (given !== undefined) body.subject_token_dpop = given;
+      return header === undefined ? {} : { dpop: header };
+    };
+    return w.tokenFromResponse(await w.jsonBody(await this.post("/token", headers, body)));
   }
 
   /** Extend the lease of the token's last hop (`POST /token/renew`). */
   async renew(token?: Token | string): Promise<w.Lease> {
-    const res = await this.http.post("/token/renew", {
-      headers: await this.auth(bearer(token, this.token), "/token/renew"),
-    });
+    const res = await this.post(
+      "/token/renew",
+      this.auth(bearer(token, this.token), "/token/renew"),
+    );
     return w.leaseFromResponse(await w.jsonBody(res));
   }
 
@@ -132,10 +158,12 @@ export class OnbehalfClient {
     const jwt = bearer(token, this.token);
     const headers = mcpHeaders(jwt, sessionId, { contentHeaders: true });
     delete headers.Authorization; // replaced by `auth` (lowercase), with a proof when keyed
-    const res = await this.http.post(path, {
-      headers: { ...headers, ...(await this.auth(jwt, path)) },
-      json: w.rpcRequest(method, params, this.nextId++),
-    });
+    const auth = this.auth(jwt, path);
+    const res = await this.post(
+      path,
+      async (nonce) => ({ ...headers, ...(await auth(nonce)) }),
+      w.rpcRequest(method, params, this.nextId++),
+    );
     return { ...(await w.rpcResult(res)), response: res };
   }
 
@@ -188,10 +216,11 @@ export class OnbehalfClient {
     tool: string,
     args?: Record<string, unknown>,
   ): Promise<w.AuthzenDecision> {
-    const res = await this.http.post("/access/v1/evaluation", {
-      headers: await this.auth(bearer(token, this.token), "/access/v1/evaluation"),
-      json: w.authzenBody(server, tool, args),
-    });
+    const res = await this.post(
+      "/access/v1/evaluation",
+      this.auth(bearer(token, this.token), "/access/v1/evaluation"),
+      w.authzenBody(server, tool, args),
+    );
     return w.authzenFromResponse(await w.jsonBody(res));
   }
 

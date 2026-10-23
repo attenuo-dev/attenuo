@@ -132,6 +132,8 @@ await ob.callTool(coder, "github", "read_file", { repo: "alice/docs" }); // proo
 
 With a key, every `callTool`, `listTools`, `initialize`, `renew` and `authzenEvaluate` sends `Authorization: DPoP <token>` and a fresh proof, and every `exchange` binds the new token. When the parent is bound to another key, its holder's sign-off names the new key and agent and works for that one exchange; a process that holds both keys can pass `subjectDpopKey: plannerKey` instead. When the parent is bound to the client's own key, no sign-off is needed. `Token.dpopJkt` is the thumbprint a token is bound to (undefined for a bearer token), and `AuditEntry.dpopBound` says whether a decision was made with a proven bound token. A bound token without a proof is an `UnauthorizedError` with `error === "dpop_required"`. See [Binding tokens to keys](../../docs/guides/binding-tokens-to-keys.md).
 
+Server nonces (RFC 9449 §8, `[token] dpop_nonce = "required"`) need no code. `OnbehalfClient`, `AdminClient.mintRootDev` and `mcpFetch` keep the latest `DPoP-Nonce` header the server sent and put it in each proof. When the server refuses a proof with `use_dpop_nonce`, they retry the request once with a new proof carrying the nonce from that response (`mcpFetch` does not retry a request whose body is a stream). For your own HTTP code, `key.proof(method, url, token, { nonce })` adds the claim, and `NonceCache` does the bookkeeping: `await cache.update(response)` stores the nonce and resolves to true when the request should be retried.
+
 ### Keeping a token alive
 
 `TokenRefresher` renews the lease at a third of the lease interval, calls your `exchange` function before the token's `exp`, and keeps the current token in `refresher.token`. `start()` returns a disposer.

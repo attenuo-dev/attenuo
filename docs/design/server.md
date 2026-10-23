@@ -246,6 +246,7 @@ One cache per IdP (and per `[[actor_trust]]` entry, which uses the same code wit
 | `invalid_scope` | 400 | `no_root_grant`, `scope_exceeds_grant` |
 | `dpop_required` | 401 | `dpop_required`: a bound subject token without a proof, an exchange that would not bind the child of a bound parent, a new key for the child without `subject_token_dpop`, or `[token] dpop = "required"` and no proof (SR-24) |
 | `invalid_dpop_proof` | 401 | `invalid_dpop_proof`: a `DPoP` header or `subject_token_dpop` that fails a check (signature, `typ`, `alg`, `htm`, `htu`, `iat`, `ath`, key, replayed `jti`, several headers), or a `subject_token_dpop` whose `child_jkt` and `child_actor` do not name the new key and `actor` (SR-40) |
+| `use_dpop_nonce` | 401 | `use_dpop_nonce`: with `[token] dpop_nonce = "required"`, a `DPoP` header proof that is otherwise valid but has no current server nonce. The response carries `DPoP-Nonce` |
 | `temporarily_unavailable` | 503 | `jwks_unavailable` (IdP or `[[actor_trust]]` keys), `replay_cache_full`, `dpop_replay_cache_full` |
 | `server_error` | 500 | none. `detail` is always "internal error; the details are in the server log": a storage or I/O error, which can name a file, is logged and never returned (SR-43) |
 
@@ -302,7 +303,7 @@ Non-MCP endpoints answer errors as `{"error": "<code>", "detail": "<text>"}` wit
 
 | JSON-RPC code | HTTP status | `data.reason` |
 |---|---|---|
-| `-32001` unauthorized | 401 | `missing_token`, `invalid_token`, `token_expired`, `lease_revoked`, `lease_expired`, `lease_unknown`, `dpop_required`, `invalid_dpop_proof` |
+| `-32001` unauthorized | 401 | `missing_token`, `invalid_token`, `token_expired`, `lease_revoked`, `lease_expired`, `lease_unknown`, `dpop_required`, `invalid_dpop_proof`, `use_dpop_nonce` |
 | `-32003` denied | 200 (inside the JSON-RPC response), 403 for `session_mismatch` | the decision's reason, with `data.decision_id`; also `invalid_name`, `tool_not_listed`, `session_mismatch` |
 | `-32004` unknown server | 404 | none |
 | `-32005` upstream | 502 | `upstream_unreachable`, `upstream_body_too_large` |

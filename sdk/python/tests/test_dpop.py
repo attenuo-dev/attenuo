@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import time
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -14,7 +15,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
-from onbehalf import Client, DpopKey, OnbehalfError
+from onbehalf import AdminClient, AsyncAdminClient, Client, DpopKey, OnbehalfError, Unauthorized
 from onbehalf.dpop import access_token_hash, jwk_thumbprint
 from onbehalf.mcp import TokenAuth
 
@@ -173,3 +174,149 @@ def test_token_auth_adds_a_proof_per_request() -> None:
     assert [p["htm"] for p in proofs] == ["POST", "GET"]
     assert proofs[0]["jti"] != proofs[1]["jti"]
     assert rec.last.headers["authorization"] == "DPoP a.b.c"
+
+
+class NonceServer:
+    """A fake server that wants its current nonce in every proof (RFC 9449 §8).
+
+    Refusals are the resource-server kind (401, ``WWW-Authenticate: DPoP
+    error="use_dpop_nonce"``) except on ``/token``, which answers like an authorization server
+    (400, JSON ``error``), so both are covered.
+    """
+
+    def __init__(self, ok: Callable[[httpx.Request], httpx.Response]) -> None:
+        self.nonce = "n-1"
+        self.ok = ok
+        self.seen: list[str | None] = []  # the nonce of each request's proof
+
+    def __call__(self, r: httpx.Request) -> httpx.Response:
+        proof = r.headers.get("dpop")
+        nonce = verify(proof)[1].get("nonce") if proof else None
+        self.seen.append(nonce)
+        if proof is not None and nonce != self.nonce:
+            if r.url.path in ("/token", "/admin/root-token"):
+                return httpx.Response(
+                    400, json={"error": "use_dpop_nonce"}, headers={"DPoP-Nonce": self.nonce}
+                )
+            return httpx.Response(
+                401,
+                json={"jsonrpc": "2.0", "id": 1, "error": {"code": -32001, "message": "x"}},
+                headers={
+                    "WWW-Authenticate": 'DPoP error="use_dpop_nonce", algs="EdDSA ES256"',
+                    "DPoP-Nonce": self.nonce,
+                },
+            )
+        resp = self.ok(r)
+        resp.headers["DPoP-Nonce"] = self.nonce
+        return resp
+
+
+def ok_for_every_route(child: str) -> Callable[[httpx.Request], httpx.Response]:
+    def ok(r: httpx.Request) -> httpx.Response:
+        if r.url.path in ("/token", "/admin/root-token"):
+            return httpx.Response(200, json=token_response(child, "lease-1"))
+        if r.url.path == "/token/renew":
+            return httpx.Response(
+                200, json={"lease": "l", "expires_at": "2030-01-01T00:00:00Z", "expires_in": 5}
+            )
+        if r.url.path == "/access/v1/evaluation":
+            return httpx.Response(200, json={"decision": True})
+        return rpc_ok({"content": []})
+
+    return ok
+
+
+async def test_client_caches_the_nonce_and_retries_once_on_use_dpop_nonce(
+    make: Any,  # noqa: F811
+) -> None:
+    s, key = Signer(), DpopKey.generate()
+    child = bound(s, key.thumbprint, ("planner", "coder"))
+    server = NonceServer(ok_for_every_route(child))
+    client, rec = make(server, dpop_key=key)
+
+    # First request: no nonce yet, refused, retried once with the server's nonce.
+    await call(client, "call_tool", child, "github", "read_file", {})
+    assert server.seen == [None, "n-1"]
+    first, retry = rec.requests
+    assert verify(first.headers["dpop"])[1]["jti"] != verify(retry.headers["dpop"])[1]["jti"]
+    assert retry.content == first.content
+
+    # Later requests carry the cached nonce straight away, on every route.
+    await call(client, "renew", child)
+    await call(client, "authzen_evaluate", child, "github", "read_file", {})
+    await call(client, "exchange", child, "reviewer", ["github:read_file"])
+    assert server.seen[2:] == ["n-1", "n-1", "n-1"]
+
+    # The server rolls its nonce: one more refusal (here the 400 of `/token`), one retry.
+    server.nonce = "n-2"
+    await call(client, "exchange", child, "reviewer", ["github:read_file"])
+    assert server.seen[5:] == ["n-1", "n-2"]
+    await call(client, "call_tool", child, "github", "read_file", {})
+    assert server.seen[7:] == ["n-2"]
+
+
+async def test_client_retries_only_once(make: Any) -> None:  # noqa: F811
+    s, key = Signer(), DpopKey.generate()
+    child = bound(s, key.thumbprint)
+    server = NonceServer(ok_for_every_route(child))
+    client, rec = make(server, dpop_key=key)
+    counter = iter(range(100))
+
+    def rotate(r: httpx.Request) -> httpx.Response:
+        server.nonce = f"r-{next(counter)}"  # never the one the client just learned
+        return server(r)
+
+    rec.handler = rotate
+    with pytest.raises(Unauthorized):
+        await call(client, "renew", child)
+    assert len(rec.requests) == 2
+
+
+async def test_client_without_a_key_does_not_retry(make: Any) -> None:  # noqa: F811
+    def refuse(r: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            json={"error": "use_dpop_nonce"},
+            headers={"WWW-Authenticate": 'DPoP error="use_dpop_nonce"', "DPoP-Nonce": "n"},
+        )
+
+    client, rec = make(refuse)
+    with pytest.raises(Unauthorized):
+        await call(client, "renew", "a.b.c")
+    assert len(rec.requests) == 1
+
+
+def test_token_auth_retries_with_the_servers_nonce() -> None:
+    key = DpopKey.generate()
+    server = NonceServer(lambda r: httpx.Response(200))
+    rec = Recorder(server)
+    auth = TokenAuth(lambda: "a.b.c", dpop_key=key)
+    with httpx.Client(transport=httpx.MockTransport(rec), auth=auth) as http:
+        assert http.post(f"{BASE}/mcp/github", json={"id": 1}).status_code == 200
+        assert http.get(f"{BASE}/mcp/github").status_code == 200
+    assert server.seen == [None, "n-1", "n-1"]
+    assert rec.requests[1].content == rec.requests[0].content
+
+
+@pytest.mark.parametrize("kind", ["sync", "async"])
+async def test_admin_root_mint_retries_with_the_servers_nonce(kind: str) -> None:
+    s, key = Signer(), DpopKey.generate()
+    child = bound(s, key.thumbprint)
+    server = NonceServer(ok_for_every_route(child))
+    transport_rec = Recorder(server)
+    if kind == "sync":
+        with AdminClient(BASE, "t", transport=httpx.MockTransport(transport_rec)) as a:
+            tok = a.mint_root_dev("alice", "https://idp", "planner", dpop_key=key)
+            a.mint_root_dev("alice", "https://idp", "planner", dpop_key=key)
+    else:
+        async with AsyncAdminClient(BASE, "t", transport=httpx.MockTransport(transport_rec)) as a:
+            tok = await a.mint_root_dev("alice", "https://idp", "planner", dpop_key=key)
+            await a.mint_root_dev("alice", "https://idp", "planner", dpop_key=key)
+    assert tok.dpop_jkt == key.thumbprint
+    assert server.seen == [None, "n-1", "n-1"]
+
+
+def test_proof_carries_a_nonce_only_when_given() -> None:
+    key = DpopKey.generate()
+    assert "nonce" not in verify(key.proof("POST", f"{BASE}/token"))[1]
+    assert verify(key.proof("POST", f"{BASE}/token", nonce="abc"))[1]["nonce"] == "abc"

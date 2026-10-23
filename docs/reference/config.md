@@ -87,6 +87,7 @@ It also sets sender-constrained tokens (DPoP, RFC 9449; see [Binding tokens to k
 | `dpop` | `"optional"` | `"off"`: new tokens are never bound (a proof on `/token` is ignored). `"optional"`: a request to `/token` or `/admin/root-token` with a `DPoP` proof gets a token bound to its key. `"required"`: every issuance needs a proof, and unbound tokens are refused wherever a token is presented (`dpop_required`). In every mode, a token that is already bound needs a proof by its key. |
 | `dpop_max_age_seconds` | 300 | How far a proof's `iat` may be from the server's clock, either way. 1 to 3600. Proof `jti`s are remembered for this long. |
 | `dpop_replay_capacity` | 1000000 | Most proof `jti`s kept in memory. When full, new proofs are refused with 503 `dpop_replay_cache_full` until old ones age out. At least 1. |
+| `dpop_nonce` | `"off"` | Server-provided nonces (RFC 9449 §8). `"off"`: a proof's `nonce` claim is ignored. `"required"`: every response to a request with a `DPoP` header, and every `WWW-Authenticate: DPoP` challenge, carries a `DPoP-Nonce` header, and every `DPoP` header proof must carry a current nonce, or the request is refused with 401 `use_dpop_nonce`. Nonces are stateless (an HMAC of a `dpop_max_age_seconds`-wide time bucket, keyed from the issuer's signing key) and live one to two buckets. The exchange sign-off needs none. |
 
 ## `[[actor_trust]]`
 

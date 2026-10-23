@@ -72,6 +72,11 @@ pub enum AuthError {
     /// method, URL or token, outside the accepted time window, or replayed.
     #[error("invalid DPoP proof: {0}")]
     InvalidDpopProof(String),
+    /// The server wants a fresh server-provided nonce in the DPoP proof (RFC 9449 §9) and the
+    /// proof has none, or a stale or wrong one. The client retries with the nonce from the
+    /// response's `DPoP-Nonce` header, which the server adds to every DPoP response.
+    #[error("the DPoP proof needs the server's current nonce: {0}")]
+    UseDpopNonce(String),
     /// The request could not be checked because of a server-side limit, not because of
     /// anything wrong with it (a full DPoP replay cache). The string is a reason code. The
     /// proxy answers `503` with `Retry-After`, not `401`, so a client does not discard a
@@ -90,6 +95,8 @@ pub const REASON_TOKEN_EXPIRED: &str = "token_expired";
 pub const REASON_DPOP_REQUIRED: &str = "dpop_required";
 /// Reason code of [`AuthError::InvalidDpopProof`].
 pub const REASON_INVALID_DPOP_PROOF: &str = "invalid_dpop_proof";
+/// Reason code of [`AuthError::UseDpopNonce`] (RFC 9449 §9).
+pub const REASON_USE_DPOP_NONCE: &str = "use_dpop_nonce";
 /// DPoP signature algorithms accepted, for `WWW-Authenticate: DPoP algs="..."` (RFC 9449 §7.1).
 pub const DPOP_ALGS: &str = "EdDSA ES256";
 
@@ -103,6 +110,7 @@ impl AuthError {
             AuthError::LeaseInactive(reason) => reason,
             AuthError::DpopRequired => REASON_DPOP_REQUIRED,
             AuthError::InvalidDpopProof(_) => REASON_INVALID_DPOP_PROOF,
+            AuthError::UseDpopNonce(_) => REASON_USE_DPOP_NONCE,
             AuthError::Unavailable(reason) => reason,
         }
     }
@@ -116,6 +124,9 @@ impl AuthError {
             ),
             AuthError::InvalidDpopProof(_) => format!(
                 "DPoP error=\"{REASON_INVALID_DPOP_PROOF}\", algs=\"{DPOP_ALGS}\""
+            ),
+            AuthError::UseDpopNonce(_) => format!(
+                "DPoP error=\"{REASON_USE_DPOP_NONCE}\", error_description=\"Resource server requires nonce in DPoP proof\", algs=\"{DPOP_ALGS}\""
             ),
             _ => "Bearer realm=\"onbehalf\"".to_string(),
         }

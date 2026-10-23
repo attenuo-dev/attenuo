@@ -76,74 +76,91 @@ function binaries(): { server: string; fake: string } {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => {
+/**
+ * Start the fake upstream and the server with the demo config, plus `tokenSection` (a `[token]`
+ * table) when given; resolves once both answer.
+ */
+async function startStack(
+  tokenSection = "",
+): Promise<{ url: string; work: string; procs: ChildProcess[] }> {
+  const work = mkdtempSync(join(tmpdir(), "onbehalf-it-"));
   const procs: ChildProcess[] = [];
+  const built = binaries();
+  // Copy them: a shared CARGO_TARGET_DIR can be rebuilt under us mid-test.
+  const serverBin = join(work, "onbehalf-server");
+  const fakeBin = join(work, "fake_mcp");
+  copyFileSync(built.server, serverBin);
+  copyFileSync(built.fake, fakeBin);
+
+  const obPort = await freePort();
+  let mcpPort = await freePort();
+  while (mcpPort === obPort) mcpPort = await freePort();
+  const config = readFileSync(join(DEMO, "config.toml"), "utf8")
+    .replaceAll("18080", String(obPort))
+    .replaceAll("13001", String(mcpPort))
+    .replaceAll("examples/github-leak-demo/policy.cedar", join(DEMO, "policy.cedar"))
+    .replace("[audit]\n", `${tokenSection}[audit]\n`);
+  writeFileSync(join(work, "config.toml"), config);
+
+  const fakeOut = join(work, "fake-mcp.out");
+  const fakeLog = join(work, "fake-mcp.log");
+  const serverLog = join(work, "server.log");
+  const out = (path: string) => createWriteStream(path);
+  const fakeOutS = out(fakeOut);
+  const fakeLogS = out(fakeLog);
+  const serverLogS = out(serverLog);
+  await Promise.all(
+    [fakeOutS, fakeLogS, serverLogS].map((s) => new Promise((r) => s.once("open", r))),
+  );
+  procs.push(
+    spawn(fakeBin, ["--port", String(mcpPort)], { stdio: ["ignore", fakeOutS, fakeLogS] }),
+    spawn(serverBin, ["--config", join(work, "config.toml")], {
+      stdio: ["ignore", serverLogS, serverLogS],
+      env: { ...process.env, RUST_LOG: "warn" },
+    }),
+  );
+  const url = `http://127.0.0.1:${obPort}`;
+
+  const deadline = Date.now() + 20_000;
+  for (;;) {
+    let ready = false;
+    try {
+      ready = (await fetch(`${url}/healthz`, { signal: AbortSignal.timeout(1000) })).ok;
+    } catch {
+      /* not up yet */
+    }
+    if (ready && readFileSync(fakeOut, "utf8").includes("listening")) break;
+    for (const p of procs) {
+      if (p.exitCode !== null) {
+        throw new Error(`a server exited early:\n${readFileSync(serverLog, "utf8")}`);
+      }
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`server did not start:\n${readFileSync(serverLog, "utf8")}`);
+    }
+    await sleep(100);
+  }
+  return { url, work, procs };
+}
+
+async function stopStack(procs: ChildProcess[], work: string): Promise<void> {
+  for (const p of procs) p.kill("SIGTERM");
+  await sleep(200);
+  for (const p of procs) if (p.exitCode === null) p.kill("SIGKILL");
+  if (work) rmSync(work, { recursive: true, force: true });
+}
+
+describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => {
+  let procs: ChildProcess[] = [];
   let work = "";
   let url = "";
 
   beforeAll(async () => {
-    work = mkdtempSync(join(tmpdir(), "onbehalf-it-"));
-    const built = binaries();
-    // Copy them: a shared CARGO_TARGET_DIR can be rebuilt under us mid-test.
-    const serverBin = join(work, "onbehalf-server");
-    const fakeBin = join(work, "fake_mcp");
-    copyFileSync(built.server, serverBin);
-    copyFileSync(built.fake, fakeBin);
-
-    const obPort = await freePort();
-    let mcpPort = await freePort();
-    while (mcpPort === obPort) mcpPort = await freePort();
-    const config = readFileSync(join(DEMO, "config.toml"), "utf8")
-      .replaceAll("18080", String(obPort))
-      .replaceAll("13001", String(mcpPort))
-      .replaceAll("examples/github-leak-demo/policy.cedar", join(DEMO, "policy.cedar"));
-    writeFileSync(join(work, "config.toml"), config);
-
-    const fakeOut = join(work, "fake-mcp.out");
-    const fakeLog = join(work, "fake-mcp.log");
-    const serverLog = join(work, "server.log");
-    const out = (path: string) => createWriteStream(path);
-    const fakeOutS = out(fakeOut);
-    const fakeLogS = out(fakeLog);
-    const serverLogS = out(serverLog);
-    await Promise.all(
-      [fakeOutS, fakeLogS, serverLogS].map((s) => new Promise((r) => s.once("open", r))),
-    );
-    procs.push(
-      spawn(fakeBin, ["--port", String(mcpPort)], { stdio: ["ignore", fakeOutS, fakeLogS] }),
-      spawn(serverBin, ["--config", join(work, "config.toml")], {
-        stdio: ["ignore", serverLogS, serverLogS],
-        env: { ...process.env, RUST_LOG: "warn" },
-      }),
-    );
-    url = `http://127.0.0.1:${obPort}`;
-
-    const deadline = Date.now() + 20_000;
-    for (;;) {
-      let ready = false;
-      try {
-        ready = (await fetch(`${url}/healthz`, { signal: AbortSignal.timeout(1000) })).ok;
-      } catch {
-        /* not up yet */
-      }
-      if (ready && readFileSync(fakeOut, "utf8").includes("listening")) break;
-      for (const p of procs) {
-        if (p.exitCode !== null) {
-          throw new Error(`a server exited early:\n${readFileSync(serverLog, "utf8")}`);
-        }
-      }
-      if (Date.now() > deadline) {
-        throw new Error(`server did not start:\n${readFileSync(serverLog, "utf8")}`);
-      }
-      await sleep(100);
-    }
+    ({ url, work, procs } = await startStack());
   });
 
   afterAll(async () => {
-    for (const p of procs) p.kill("SIGTERM");
-    await sleep(200);
-    for (const p of procs) if (p.exitCode === null) p.kill("SIGKILL");
-    if (work) rmSync(work, { recursive: true, force: true });
+    await stopStack(procs, work);
   });
 
   const upstreamCalls = () =>
@@ -483,4 +500,69 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
       expect(proc.stdout).toContain("denied:");
     },
   );
+});
+
+describe.skipIf(!enabled)("DPoP server nonces against the real server", () => {
+  let procs: ChildProcess[] = [];
+  let work = "";
+  let url = "";
+
+  beforeAll(async () => {
+    ({ url, work, procs } = await startStack('[token]\ndpop_nonce = "required"\n\n'));
+  });
+
+  afterAll(async () => {
+    await stopStack(procs, work);
+  });
+
+  it("picks up the nonce from use_dpop_nonce, retries once and reuses it", async () => {
+    const admin = new AdminClient(url, ADMIN_TOKEN);
+    const key = await DpopKey.generate();
+    const root = await admin.mintRootDev("alice", "https://idp.example", "assistant", {
+      capabilities: ["github:*"],
+      dpopKey: key,
+    });
+    expect(root.dpopJkt).toBe(key.thumbprint);
+
+    // Raw: a proof without the nonce is refused with the nonce to use.
+    const raw = await fetch(`${url}/token/renew`, {
+      method: "POST",
+      headers: {
+        authorization: `DPoP ${root.jwt}`,
+        dpop: await key.proof("POST", `${url}/token/renew`, root.jwt),
+      },
+    });
+    expect(raw.status).toBe(401);
+    expect(((await raw.json()) as { error: string }).error).toBe("use_dpop_nonce");
+    expect(raw.headers.get("www-authenticate")).toContain('error="use_dpop_nonce"');
+    expect(raw.headers.get("dpop-nonce")).toBeTruthy();
+
+    const ob = new OnbehalfClient(url, { dpopKey: key });
+    const res = await ob.callTool(root, "github", "read_file", { repo: "alice/public-docs" });
+    expect(res.decisionId).toBeTruthy();
+    expect((await ob.renew(root)).expiresIn).toBeGreaterThan(0);
+    const coder = await ob.exchange(root, "coder", ["github:read_file"], {
+      clientSecret: CODER_SECRET,
+    });
+    expect(coder.dpopJkt).toBe(key.thumbprint);
+
+    // Through the fetch an MCP client library would use.
+    const f = mcpFetch(() => coder, { dpopKey: key });
+    const r = await f(mcpUrl(url, "github"), {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "read_file", arguments: { repo: "alice/public-docs" } },
+      }),
+    });
+    expect(r.status).toBe(200);
+    expect(((await r.json()) as { result?: unknown }).result).toBeTruthy();
+    await admin.revokeLease(root.lease);
+  });
 });

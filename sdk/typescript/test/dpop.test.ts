@@ -10,7 +10,7 @@ import {
   OnbehalfClient,
   OnbehalfError,
 } from "../src/index.js";
-import { jsonResponse, mockFetch, rpcOk, Signer, tokenResponse } from "./helpers.js";
+import { jsonResponse, mockFetch, rpcOk, Signer, tokenResponse, type Seen } from "./helpers.js";
 
 const BASE = "http://ob.test";
 type Json = Record<string, unknown>;
@@ -207,5 +207,133 @@ describe("clients with a DPoP key", () => {
     const plain = mockFetch(() => new Response(null, { status: 200 }));
     await mcpFetch(() => "a.b.c", { fetch: plain.fetch })(`${BASE}/mcp/github`);
     expect(plain.calls[0]!.headers.get("authorization")).toBe("Bearer a.b.c");
+  });
+});
+
+/**
+ * A fake server that wants its current nonce in every proof (RFC 9449 §8). Refusals are the
+ * resource-server kind (401 with `WWW-Authenticate: DPoP error="use_dpop_nonce"`) except on
+ * `/token` and `/admin/root-token`, which answer like an authorization server (400, JSON `error`).
+ */
+function nonceServer(ok: (seen: Seen) => Response) {
+  const state = { nonce: "n-1", seen: [] as (string | undefined)[] };
+  const handler = async (seen: Seen): Promise<Response> => {
+    const proof = seen.headers.get("dpop");
+    const nonce = proof ? ((await verify(proof)).claims.nonce as string | undefined) : undefined;
+    state.seen.push(nonce);
+    if (proof && nonce !== state.nonce) {
+      if (seen.url.pathname === "/token" || seen.url.pathname === "/admin/root-token") {
+        return jsonResponse({ error: "use_dpop_nonce" }, 400, { "DPoP-Nonce": state.nonce });
+      }
+      return jsonResponse({ jsonrpc: "2.0", id: 1, error: { code: -32001, message: "x" } }, 401, {
+        "WWW-Authenticate": 'DPoP error="use_dpop_nonce", algs="EdDSA ES256"',
+        "DPoP-Nonce": state.nonce,
+      });
+    }
+    const res = ok(seen);
+    res.headers.set("DPoP-Nonce", state.nonce);
+    return res;
+  };
+  return { state, handler };
+}
+
+function okForEveryRoute(child: string) {
+  return (seen: Seen): Response => {
+    switch (seen.url.pathname) {
+      case "/token":
+      case "/admin/root-token":
+        return jsonResponse(tokenResponse(child));
+      case "/token/renew":
+        return jsonResponse({ lease: "l", expires_at: "2030-01-01T00:00:00Z", expires_in: 5 });
+      case "/access/v1/evaluation":
+        return jsonResponse({ decision: true });
+      default:
+        return rpcOk({ content: [] });
+    }
+  };
+}
+
+describe("DPoP server nonces", () => {
+  it("caches the nonce and retries once on use_dpop_nonce", async () => {
+    const key = await DpopKey.generate();
+    const child = await bound(key.thumbprint, ["planner", "coder"]);
+    const server = nonceServer(okForEveryRoute(child));
+    const { fetch, calls } = mockFetch(server.handler);
+    const ob = new OnbehalfClient(BASE, { fetch, dpopKey: key });
+
+    // First request: no nonce yet, refused, retried once with the server's nonce.
+    await ob.callTool(child, "github", "read_file");
+    expect(server.state.seen).toEqual([undefined, "n-1"]);
+    const [first, retry] = calls as [Seen, Seen];
+    expect(retry.body).toEqual(first.body);
+    expect((await verify(first.headers.get("dpop"))).claims.jti).not.toBe(
+      (await verify(retry.headers.get("dpop"))).claims.jti,
+    );
+
+    // Later requests carry the cached nonce straight away, on every route.
+    await ob.renew(child);
+    await ob.authzenEvaluate(child, "github", "read_file");
+    await ob.exchange(child, "reviewer", ["github:read_file"]);
+    expect(server.state.seen.slice(2)).toEqual(["n-1", "n-1", "n-1"]);
+
+    // The server rolls its nonce: one more refusal (the 400 of `/token`), one retry.
+    server.state.nonce = "n-2";
+    await ob.exchange(child, "reviewer", ["github:read_file"]);
+    expect(server.state.seen.slice(5)).toEqual(["n-1", "n-2"]);
+    await ob.callTool(child, "github", "read_file");
+    expect(server.state.seen.slice(7)).toEqual(["n-2"]);
+  });
+
+  it("retries only once", async () => {
+    const key = await DpopKey.generate();
+    const child = await bound(key.thumbprint);
+    const server = nonceServer(okForEveryRoute(child));
+    let n = 0;
+    const { fetch, calls } = mockFetch((seen) => {
+      server.state.nonce = `r-${n++}`; // never the one the client just learned
+      return server.handler(seen);
+    });
+    const ob = new OnbehalfClient(BASE, { fetch, dpopKey: key });
+    await expect(ob.renew(child)).rejects.toThrow();
+    expect(calls).toHaveLength(2);
+  });
+
+  it("does not retry without a key", async () => {
+    const { fetch, calls } = mockFetch(() =>
+      jsonResponse({ error: "use_dpop_nonce" }, 401, {
+        "WWW-Authenticate": 'DPoP error="use_dpop_nonce"',
+        "DPoP-Nonce": "n",
+      }),
+    );
+    await expect(new OnbehalfClient(BASE, { fetch }).renew("a.b.c")).rejects.toThrow();
+    expect(calls).toHaveLength(1);
+  });
+
+  it("mcpFetch and the admin root mint retry with the server's nonce", async () => {
+    const key = await DpopKey.generate();
+    const child = await bound(key.thumbprint);
+    const server = nonceServer(okForEveryRoute(child));
+    const { fetch } = mockFetch(server.handler);
+    const f = mcpFetch(() => "a.b.c", { dpopKey: key, fetch });
+    const init = { method: "POST", body: JSON.stringify({ id: 1 }) };
+    expect((await f(`${BASE}/mcp/github`, init)).status).toBe(200);
+    expect((await f(`${BASE}/mcp/github`, init)).status).toBe(200);
+    expect(server.state.seen).toEqual([undefined, "n-1", "n-1"]);
+
+    const admin = new AdminClient(BASE, "adm", { fetch });
+    server.state.seen.length = 0;
+    const tok = await admin.mintRootDev("alice", "https://idp", "planner", { dpopKey: key });
+    await admin.mintRootDev("alice", "https://idp", "planner", { dpopKey: key });
+    expect(tok.dpopJkt).toBe(key.thumbprint);
+    expect(server.state.seen).toEqual([undefined, "n-1", "n-1"]);
+  });
+
+  it("puts a nonce in a proof only when given", async () => {
+    const key = await DpopKey.generate();
+    expect((await verify(await key.proof("POST", `${BASE}/token`))).claims.nonce).toBeUndefined();
+    const { claims } = await verify(
+      await key.proof("POST", `${BASE}/token`, undefined, { nonce: "abc" }),
+    );
+    expect(claims.nonce).toBe("abc");
   });
 });
