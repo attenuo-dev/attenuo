@@ -65,7 +65,8 @@ impl StreamGuard {
                 AuthError::MissingToken
                 | AuthError::InvalidToken(_)
                 | AuthError::DpopRequired
-                | AuthError::InvalidDpopProof(_),
+                | AuthError::InvalidDpopProof(_)
+                | AuthError::UseDpopNonce(_),
             ) => Err("unauthorized".to_owned()),
         }
     }

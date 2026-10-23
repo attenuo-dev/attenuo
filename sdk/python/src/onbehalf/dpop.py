@@ -8,6 +8,12 @@ token to the key, and bound tokens are sent as ``Authorization: DPoP <token>``.
 Keys are private JWKs: Ed25519 (``{"kty": "OKP", "crv": "Ed25519", "x": ..., "d": ...}``, what
 ``onbehalf key gen --dpop`` writes) or P-256 (``{"kty": "EC", "crv": "P-256", ...}``). Signing
 needs the ``cryptography`` package (``pip install 'onbehalf[dpop]'``).
+
+**Server nonces** (RFC 9449 §8). A server with ``[token] dpop_nonce = "required"`` wants a
+``nonce`` it issued in every proof. It sends the current one in a ``DPoP-Nonce`` response header
+and refuses a proof without it with ``use_dpop_nonce``. The clients keep the latest nonce they
+were sent (:class:`NonceCache`), put it in every proof, and retry a request once when the server
+answers ``use_dpop_nonce``.
 """
 
 from __future__ import annotations
@@ -20,6 +26,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from .errors import OnbehalfError
 
 #: ``typ`` of a DPoP proof.
@@ -28,6 +36,10 @@ PROOF_TYPE = "dpop+jwt"
 SIGN_OFF_CHILD_JKT = "child_jkt"
 #: Sign-off claim naming the new token's agent.
 SIGN_OFF_CHILD_ACTOR = "child_actor"
+#: Response header carrying the server's current DPoP nonce.
+NONCE_HEADER = "DPoP-Nonce"
+#: ``error`` of a refusal asking for a proof with the server's nonce.
+USE_DPOP_NONCE = "use_dpop_nonce"
 
 
 def _b64(data: bytes) -> str:
@@ -140,10 +152,11 @@ class DpopKey:
         access_token: str | None = None,
         *,
         iat: int | None = None,
+        nonce: str | None = None,
     ) -> str:
         """A proof for one request: ``htm`` = ``method``, ``htu`` = ``url`` without query or
-        fragment, a fresh ``jti``, and ``ath`` when ``access_token`` (a bound token sent with the
-        request) is given."""
+        fragment, a fresh ``jti``, ``ath`` when ``access_token`` (a bound token sent with the
+        request) is given, and ``nonce`` (the server's latest ``DPoP-Nonce``) when given."""
         claims: dict[str, Any] = {
             "jti": str(uuid.uuid4()),
             "htm": method.upper(),
@@ -152,6 +165,8 @@ class DpopKey:
         }
         if access_token is not None:
             claims["ath"] = access_token_hash(access_token)
+        if nonce is not None:
+            claims["nonce"] = nonce
         return self.sign(claims)
 
     def sign_off(
@@ -208,11 +223,46 @@ def token_jkt(token: str) -> str | None:
     return jkt if isinstance(jkt, str) else None
 
 
-def presented(token: str, key: DpopKey | None, method: str, url: str) -> dict[str, str]:
+def presented(
+    token: str, key: DpopKey | None, method: str, url: str, nonce: str | None = None
+) -> dict[str, str]:
     """``Authorization`` (and ``DPoP``) headers to present ``token`` for a request."""
     if key is None:
         return {"authorization": f"Bearer {token}"}
-    return {"authorization": f"DPoP {token}", "dpop": key.proof(method, url, token)}
+    return {"authorization": f"DPoP {token}", "dpop": key.proof(method, url, token, nonce=nonce)}
+
+
+class NonceCache:
+    """The latest ``DPoP-Nonce`` a server sent (RFC 9449 §8), for the next proof."""
+
+    def __init__(self) -> None:
+        #: The nonce to put in the next proof, or ``None`` before the server sent one.
+        self.value: str | None = None
+
+    def update(self, response: httpx.Response) -> bool:
+        """Remember ``response``'s ``DPoP-Nonce``. True when the response refused the proof
+        with ``use_dpop_nonce`` and gave a nonce: the request should be retried, once, with a
+        new proof carrying it."""
+        nonce = response.headers.get(NONCE_HEADER)
+        if nonce:
+            self.value = nonce
+        return bool(nonce) and is_use_dpop_nonce(response)
+
+
+def is_use_dpop_nonce(response: httpx.Response) -> bool:
+    """Did the server refuse the proof for want of its nonce? A 401 with
+    ``WWW-Authenticate: DPoP error="use_dpop_nonce"`` (resource servers, and onbehalf's own
+    routes), or a 400 or 401 whose JSON ``error`` is ``use_dpop_nonce`` (authorization
+    servers)."""
+    if response.status_code not in (400, 401):
+        return False
+    if USE_DPOP_NONCE in response.headers.get("www-authenticate", ""):
+        return True
+    try:
+        body = response.json()
+    except Exception:  # not JSON, or a streamed body that was not read
+        return False
+    return isinstance(body, dict) and body.get("error") == USE_DPOP_NONCE
 
 
 def exchange_proofs(
@@ -221,19 +271,21 @@ def exchange_proofs(
     key: DpopKey | None,
     subject_key: DpopKey | None,
     actor: str,
+    nonce: str | None = None,
 ) -> tuple[str | None, str | None]:
     """The ``DPoP`` header and the ``subject_token_dpop`` sign-off of an exchange.
 
     ``key`` binds the new token; its proof covers the subject token when the subject token is
     bound to the same key. ``subject_key`` is the subject token's key when the new token is
     bound to another one: its sign-off names ``key`` and ``actor`` (see
-    :meth:`DpopKey.sign_off`), so it consents to that delegation only.
+    :meth:`DpopKey.sign_off`), so it consents to that delegation only. ``nonce`` goes in the
+    header proof only: the server does not ask for one in the sign-off.
     """
     parent = token_jkt(subject_token)
     header = None
     if key is not None:
         same = parent is not None and parent == key.thumbprint
-        header = key.proof("POST", url, subject_token if same else None)
+        header = key.proof("POST", url, subject_token if same else None, nonce=nonce)
     sign_off = None
     if subject_key is not None:
         if key is None:

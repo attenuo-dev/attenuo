@@ -16,7 +16,7 @@ from typing import Any
 import httpx
 
 from ._wire import MCP_ACCEPT, bearer, normalize_base
-from .dpop import DpopKey
+from .dpop import DpopKey, NonceCache
 from .token import Token
 
 
@@ -58,7 +58,9 @@ class TokenAuth(httpx.Auth):
 
     With ``dpop_key``, each request also gets a DPoP proof for its method and URL, and the token
     is sent as ``Authorization: DPoP <token>``: what a token bound to that key needs. Static
-    headers (:func:`mcp_headers`) cannot carry proofs, which are single-use.
+    headers (:func:`mcp_headers`) cannot carry proofs, which are single-use. The latest
+    ``DPoP-Nonce`` the server sent goes in each proof, and a request the server refuses with
+    ``use_dpop_nonce`` is sent once more with a proof carrying the new nonce.
     """
 
     def __init__(
@@ -68,12 +70,20 @@ class TokenAuth(httpx.Auth):
     ) -> None:
         self._provider = provider
         self._dpop_key = DpopKey.of(dpop_key)
+        self._nonce = NonceCache()
 
     def auth_flow(self, request: httpx.Request) -> Any:
         token = bearer(self._provider())
-        if self._dpop_key is None:
+        key = self._dpop_key
+        if key is None:
             request.headers["Authorization"] = f"Bearer {token}"
-        else:
-            request.headers["Authorization"] = f"DPoP {token}"
-            request.headers["DPoP"] = self._dpop_key.proof(request.method, str(request.url), token)
-        yield request
+            yield request
+            return
+        request.headers["Authorization"] = f"DPoP {token}"
+        method, url = request.method, str(request.url)
+        request.headers["DPoP"] = key.proof(method, url, token, nonce=self._nonce.value)
+        response = yield request
+        if self._nonce.update(response):
+            request.headers["DPoP"] = key.proof(method, url, token, nonce=self._nonce.value)
+            response = yield request
+            self._nonce.update(response)

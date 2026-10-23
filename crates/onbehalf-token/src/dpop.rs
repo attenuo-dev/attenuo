@@ -19,6 +19,10 @@
 //! - [`DpopKey`]: a private key that makes proofs, for clients (the CLI) and tests. It
 //!   generates Ed25519 keys and loads Ed25519 or P-256 private JWKs.
 //!
+//! A proof may carry a server-provided `nonce` (RFC 9449 §8). [`verify_proof`] returns it in
+//! [`VerifiedProof::nonce`] without judging it: whether a nonce is needed, and which ones are
+//! good, is server state. [`DpopKey::proof_with_nonce`] makes a proof that carries one.
+//!
 //! Two signature algorithms are accepted: `EdDSA` (Ed25519, what the issuer itself signs
 //! with, and what `onbehalf key gen --dpop` makes) and `ES256` (P-256, what browsers'
 //! WebCrypto supports everywhere).
@@ -48,6 +52,13 @@ pub const MAX_PROOF_BYTES: usize = 4096;
 
 /// Longest `jti` accepted, in bytes.
 pub const MAX_JTI_BYTES: usize = 256;
+
+/// Response header carrying a server-provided nonce (RFC 9449 §8.1).
+pub const DPOP_NONCE_HEADER: &str = "dpop-nonce";
+
+/// `error` of a refusal that asks the client to retry with the nonce in [`DPOP_NONCE_HEADER`]
+/// (RFC 9449 §8, §9).
+pub const USE_DPOP_NONCE: &str = "use_dpop_nonce";
 
 /// Claim of an exchange sign-off (`subject_token_dpop`) naming the thumbprint of the key the
 /// new token is bound to (SR-40).
@@ -157,6 +168,8 @@ pub struct VerifiedProof {
     /// [`SIGN_OFF_CHILD_ACTOR`], if the proof has it as a string: in an exchange sign-off, the
     /// agent the parent's holder agrees to delegate to.
     pub child_actor: Option<String>,
+    /// The proof's `nonce`, if it has one as a string (RFC 9449 §8). Not checked here.
+    pub nonce: Option<String>,
 }
 
 impl VerifiedProof {
@@ -380,6 +393,7 @@ pub fn verify_proof(proof: &str, check: &ProofCheck<'_>) -> Result<VerifiedProof
         ath: opt_str("ath"),
         child_jkt: opt_str(SIGN_OFF_CHILD_JKT),
         child_actor: opt_str(SIGN_OFF_CHILD_ACTOR),
+        nonce: opt_str("nonce"),
     };
     if let Some(token) = check.access_token {
         if !proof.covers(token) {
@@ -526,6 +540,19 @@ impl DpopKey {
         access_token: Option<&str>,
         now: OffsetDateTime,
     ) -> String {
+        self.proof_with_nonce(method, url, access_token, None, now)
+    }
+
+    /// [`DpopKey::proof`] that also carries `nonce`, when given: the value of the server's
+    /// latest `DPoP-Nonce` response header (RFC 9449 §8).
+    pub fn proof_with_nonce(
+        &self,
+        method: &str,
+        url: &str,
+        access_token: Option<&str>,
+        nonce: Option<&str>,
+        now: OffsetDateTime,
+    ) -> String {
         let htu = url.split(['?', '#']).next().unwrap_or(url);
         let mut claims = json!({
             "jti": uuid::Uuid::new_v4().to_string(),
@@ -535,6 +562,9 @@ impl DpopKey {
         });
         if let Some(token) = access_token {
             claims["ath"] = access_token_hash(token).into();
+        }
+        if let Some(nonce) = nonce {
+            claims["nonce"] = nonce.into();
         }
         self.sign_claims(&claims)
     }
@@ -651,6 +681,17 @@ mod tests {
                 now().unix_timestamp() + 301
             );
         }
+    }
+
+    #[test]
+    fn nonce_is_carried_and_returned_unchecked() {
+        let k = DpopKey::generate().unwrap();
+        let with = k.proof_with_nonce("POST", URL, Some("tok"), Some("n-1"), now());
+        let v = verify_proof(&with, &check(Some("tok"), now())).unwrap();
+        assert_eq!(v.nonce.as_deref(), Some("n-1"));
+        let without = k.proof("POST", URL, Some("tok"), now());
+        let v = verify_proof(&without, &check(Some("tok"), now())).unwrap();
+        assert_eq!(v.nonce, None);
     }
 
     #[test]

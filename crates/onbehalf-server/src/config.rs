@@ -181,6 +181,12 @@ pub struct TokenSection {
     /// `dpop_max_age_seconds`). When full of live proofs, new ones get 503. Default 1000000.
     #[serde(default = "default_dpop_replay_capacity")]
     pub dpop_replay_capacity: usize,
+    /// Server-provided DPoP nonces (RFC 9449 §8): `"off"` (default) or `"required"`. When
+    /// required, every proof the server checks must carry a `nonce` the server issued in a
+    /// `DPoP-Nonce` response header within the last one to two `dpop_max_age_seconds`; see
+    /// [`crate::dpop`].
+    #[serde(default)]
+    pub dpop_nonce: DpopNonceMode,
 }
 
 /// Default for `[token] dpop_max_age_seconds`.
@@ -204,6 +210,7 @@ impl Default for TokenSection {
             dpop: DpopMode::default(),
             dpop_max_age_seconds: DEFAULT_DPOP_MAX_AGE_SECONDS,
             dpop_replay_capacity: DEFAULT_DPOP_REPLAY_CAPACITY,
+            dpop_nonce: DpopNonceMode::default(),
         }
     }
 }
@@ -233,6 +240,18 @@ pub enum DpopMode {
     Optional,
     /// Every issuance needs a proof, and unbound tokens are refused wherever a token is
     /// presented.
+    Required,
+}
+
+/// `[token] dpop_nonce`: whether DPoP proofs must carry a server-provided nonce (RFC 9449 §8).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DpopNonceMode {
+    /// No nonces: a proof's `nonce` claim, if any, is ignored.
+    #[default]
+    Off,
+    /// Every DPoP response carries a `DPoP-Nonce` header, and every proof the server checks
+    /// must carry a current one; otherwise 401 `use_dpop_nonce`.
     Required,
 }
 

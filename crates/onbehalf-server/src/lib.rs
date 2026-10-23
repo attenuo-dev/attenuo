@@ -104,10 +104,15 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
             .apply(ProxyConfig::new(config.server.listen, upstreams)),
         authorizer,
     );
-    api.merge(proxy).layer(axum::middleware::from_fn_with_state(
-        state.metrics.clone(),
-        metrics::track_http,
-    ))
+    api.merge(proxy)
+        .layer(axum::middleware::from_fn_with_state(
+            state.dpop.clone(),
+            dpop::nonce_header,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.metrics.clone(),
+            metrics::track_http,
+        ))
 }
 
 /// Start the `[audit] checkpoint_interval_seconds` timer: every `period`, sign the head if

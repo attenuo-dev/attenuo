@@ -40,6 +40,23 @@
 //! same value in `error_description`, and a `WWW-Authenticate: DPoP` challenge (RFC 9449
 //! §7.1). The proxy answers with JSON-RPC `-32001` and the same reason codes.
 //!
+//! **Server nonces** (RFC 9449 §8). With `[token] dpop_nonce = "required"`, every proof the
+//! server checks in a `DPoP` header must also carry a `nonce` the server issued. Nonces need no
+//! storage: a nonce is base64url(HMAC-SHA256(k, bucket)), where `bucket` is the Unix time
+//! divided by `[token] dpop_max_age_seconds` and `k` is derived from the issuer's signing key
+//! (an ephemeral issuer key gives an ephemeral nonce key; servers that share a signing key
+//! share nonces). The current and the previous bucket's nonces are accepted, so a nonce lives
+//! between one and two windows. Every response to a request with a `DPoP` header, and every
+//! `WWW-Authenticate: DPoP` challenge, carries the current nonce in `DPoP-Nonce`
+//! ([`nonce_header`]). A proof with no nonce, or a stale or foreign one, is refused with 401
+//! `use_dpop_nonce` (and `WWW-Authenticate: DPoP error="use_dpop_nonce"`) before its `jti` is
+//! recorded, so the client retries once with a new proof carrying the nonce from that
+//! response. The nonce is checked after the proof's signature and claims, so a bad proof is
+//! still `invalid_dpop_proof`. The exchange sign-off (`subject_token_dpop`) is not a request
+//! proof and needs no nonce: the parent makes it ahead of time, and it is already limited to
+//! one key, one agent and the `iat` window. With `dpop_nonce = "off"` (default) a proof's
+//! `nonce` is ignored.
+//!
 //! **Replay.** Proof `jti`s are kept in a bounded in-memory cache, per process, until the
 //! proof's `iat` plus the window has passed (after that the `iat` check refuses it anyway).
 //! Entries sit in time buckets, so expired ones are dropped a bucket at a time. When the cache
@@ -50,19 +67,31 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;
 
-use axum::http::{header, HeaderMap, StatusCode};
+use std::sync::Arc;
+
+use axum::extract::{Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::Next;
+use axum::response::Response;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use onbehalf_proxy::AuthError;
-use onbehalf_token::dpop::{verify_proof, ProofCheck, VerifiedProof};
+use onbehalf_token::dpop::{
+    verify_proof, ProofCheck, VerifiedProof, DPOP_NONCE_HEADER, USE_DPOP_NONCE,
+};
 use onbehalf_token::{Confirmation, DpopError};
+use ring::hmac;
 use time::{Duration, OffsetDateTime};
 
-use crate::config::DpopMode;
+use crate::config::{DpopMode, DpopNonceMode};
 use crate::error::ApiError;
 
 /// `error` / `error_description` when a proof is needed and absent.
 pub const DPOP_REQUIRED: &str = "dpop_required";
 /// `error` / `error_description` when a proof is present and fails.
 pub const INVALID_DPOP_PROOF: &str = "invalid_dpop_proof";
+/// `error` / `error_description` when a proof lacks a current server nonce (RFC 9449 §8, §9).
+pub const USE_NONCE: &str = USE_DPOP_NONCE;
 /// `error_description` (and the proxy's `data.reason`, with HTTP 503) when the replay cache is
 /// full of live proofs.
 pub const DPOP_REPLAY_CACHE_FULL: &str = "dpop_replay_cache_full";
@@ -74,6 +103,8 @@ pub enum DpopFailure {
     Required(String),
     /// The proof failed a check.
     Invalid(String),
+    /// The proof is fine but carries no current server nonce (`[token] dpop_nonce`).
+    UseNonce(String),
     /// The replay cache is full of live entries.
     Unavailable,
 }
@@ -95,6 +126,10 @@ impl From<DpopFailure> for ApiError {
                 ApiError::new(StatusCode::UNAUTHORIZED, INVALID_DPOP_PROOF, detail)
                     .with_description(INVALID_DPOP_PROOF)
             }
+            DpopFailure::UseNonce(detail) => {
+                ApiError::new(StatusCode::UNAUTHORIZED, USE_NONCE, detail)
+                    .with_description(USE_NONCE)
+            }
             DpopFailure::Unavailable => ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "temporarily_unavailable",
@@ -110,6 +145,7 @@ impl From<DpopFailure> for AuthError {
         match f {
             DpopFailure::Required(_) => AuthError::DpopRequired,
             DpopFailure::Invalid(detail) => AuthError::InvalidDpopProof(detail),
+            DpopFailure::UseNonce(detail) => AuthError::UseDpopNonce(detail),
             // 503, not 401: the proof may be fine (SR-47).
             DpopFailure::Unavailable => AuthError::Unavailable(DPOP_REPLAY_CACHE_FULL.into()),
         }
@@ -122,6 +158,7 @@ pub struct Dpop {
     max_age: Duration,
     public_url: Option<String>,
     replay: ProofReplayCache,
+    nonces: Option<Nonces>,
 }
 
 impl Dpop {
@@ -137,7 +174,23 @@ impl Dpop {
             max_age: Duration::seconds(secs),
             public_url: public_url.map(|u| u.trim_end_matches('/').to_owned()),
             replay: ProofReplayCache::new(replay_capacity, secs),
+            nonces: None,
         }
+    }
+
+    /// Require server nonces when `mode` says so, with a nonce key derived from `secret` (the
+    /// issuer's private key material). Nonce buckets are `dpop_max_age_seconds` wide.
+    pub fn with_nonce(mut self, mode: DpopNonceMode, secret: &[u8]) -> Self {
+        self.nonces = match mode {
+            DpopNonceMode::Off => None,
+            DpopNonceMode::Required => Some(Nonces::new(secret, self.max_age.whole_seconds())),
+        };
+        self
+    }
+
+    /// The nonce to hand out at `now`, when `[token] dpop_nonce = "required"`.
+    pub fn current_nonce(&self, now: OffsetDateTime) -> Option<String> {
+        self.nonces.as_ref().map(|n| n.issue(now.unix_timestamp()))
     }
 
     /// `[token] dpop`.
@@ -186,8 +239,42 @@ impl Dpop {
 
     /// [`Dpop::verify`] without using up the `jti`. A caller that has more to check about the
     /// proof (whose key it is, what a sign-off names) calls [`Dpop::use_once`] after those
-    /// checks, so a proof that is refused anyway never takes a replay-cache slot (SR-41).
+    /// checks, so a proof that is refused anyway never takes a replay-cache slot (SR-41). With
+    /// `[token] dpop_nonce = "required"` the proof must carry a current server nonce.
     fn check(
+        &self,
+        proof: &str,
+        method: &str,
+        url: &str,
+        access_token: Option<&str>,
+        now: OffsetDateTime,
+    ) -> Result<VerifiedProof, DpopFailure> {
+        let verified = self.check_without_nonce(proof, method, url, access_token, now)?;
+        if let Some(nonces) = &self.nonces {
+            match verified.nonce.as_deref() {
+                None => {
+                    return Err(DpopFailure::UseNonce(
+                        "this server requires a nonce in DPoP proofs: retry with the \
+                         `DPoP-Nonce` of this response"
+                            .into(),
+                    ))
+                }
+                Some(n) if !nonces.accepts(n, now.unix_timestamp()) => {
+                    return Err(DpopFailure::UseNonce(
+                        "the DPoP proof's nonce is not current: retry with the `DPoP-Nonce` of \
+                         this response"
+                            .into(),
+                    ))
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(verified)
+    }
+
+    /// [`Dpop::check`] without the server nonce: for the exchange sign-off, which is made by
+    /// the parent ahead of time and is not a proof of the request itself.
+    fn check_without_nonce(
         &self,
         proof: &str,
         method: &str,
@@ -317,7 +404,8 @@ impl Dpop {
                         .into(),
                 )
             })?;
-            let parent_proof = self.check(proof, "POST", url, Some(subject_token), now)?;
+            let parent_proof =
+                self.check_without_nonce(proof, "POST", url, Some(subject_token), now)?;
             if parent_proof.jkt != parent.jkt {
                 return Err(DpopError::KeyMismatch.into());
             }
@@ -330,6 +418,72 @@ impl Dpop {
         }
         Ok(Some(Confirmation::jkt(child.jkt)))
     }
+}
+
+/// Stateless server nonces (RFC 9449 §8): HMAC-SHA256 over a time bucket.
+struct Nonces {
+    key: hmac::Key,
+    width: i64,
+}
+
+impl Nonces {
+    /// Label of the nonce key derivation, so the key is used for nothing else.
+    const LABEL: &'static [u8] = b"onbehalf/dpop-nonce/v1";
+
+    fn new(secret: &[u8], width_seconds: i64) -> Self {
+        let derived = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, secret), Self::LABEL);
+        Self {
+            key: hmac::Key::new(hmac::HMAC_SHA256, derived.as_ref()),
+            width: width_seconds.max(1),
+        }
+    }
+
+    fn bucket(&self, now: i64) -> i64 {
+        now.div_euclid(self.width)
+    }
+
+    fn for_bucket(&self, bucket: i64) -> String {
+        URL_SAFE_NO_PAD.encode(hmac::sign(&self.key, &bucket.to_be_bytes()))
+    }
+
+    /// The nonce of the current bucket.
+    fn issue(&self, now: i64) -> String {
+        self.for_bucket(self.bucket(now))
+    }
+
+    /// Is `nonce` the current or the previous bucket's? Compared in constant time.
+    fn accepts(&self, nonce: &str, now: i64) -> bool {
+        let Ok(tag) = URL_SAFE_NO_PAD.decode(nonce) else {
+            return false;
+        };
+        let current = self.bucket(now);
+        [current, current.saturating_sub(1)]
+            .iter()
+            .any(|b| hmac::verify(&self.key, &b.to_be_bytes(), &tag).is_ok())
+    }
+}
+
+/// Middleware: with `[token] dpop_nonce = "required"`, put the current nonce in a `DPoP-Nonce`
+/// header on every response to a request that sent a `DPoP` proof, and on every
+/// `WWW-Authenticate: DPoP` challenge (RFC 9449 §8.1), so a client always has the nonce its
+/// next proof needs.
+pub async fn nonce_header(State(dpop): State<Arc<Dpop>>, req: Request, next: Next) -> Response {
+    let proof_sent = req.headers().contains_key("dpop");
+    let mut resp = next.run(req).await;
+    let Some(nonce) = dpop.current_nonce(OffsetDateTime::now_utc()) else {
+        return resp;
+    };
+    let challenged = resp
+        .headers()
+        .get(header::WWW_AUTHENTICATE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("DPoP"));
+    if proof_sent || challenged {
+        if let Ok(v) = HeaderValue::from_str(&nonce) {
+            resp.headers_mut().insert(DPOP_NONCE_HEADER, v);
+        }
+    }
+    resp
 }
 
 /// The request's single `DPoP` header (RFC 9449 §4.3): two or more, or a non-ASCII one, is an
@@ -600,6 +754,122 @@ mod tests {
             d.check_presented(Some(&cnf), "tok", Some(&p), "POST", &url, now),
             Ok(true)
         );
+    }
+
+    fn nonced(width: u64) -> Dpop {
+        Dpop::new(DpopMode::Optional, width, 100, None)
+            .with_nonce(DpopNonceMode::Required, b"issuer key material")
+    }
+
+    #[test]
+    fn nonce_buckets_roll_over_and_the_previous_one_is_accepted() {
+        let d = nonced(300);
+        let n = |secs| d.current_nonce(t(secs)).unwrap();
+        // One nonce per 300-second bucket.
+        assert_eq!(n(1_000_200), n(1_000_499));
+        assert_ne!(n(1_000_499), n(1_000_500));
+        let nonces = d.nonces.as_ref().unwrap();
+        let issued = n(1_000_200); // bucket [1_000_200, 1_000_500)
+        assert!(nonces.accepts(&issued, 1_000_499));
+        // The next bucket still takes it, the one after does not.
+        assert!(nonces.accepts(&issued, 1_000_500));
+        assert!(nonces.accepts(&issued, 1_000_799));
+        assert!(!nonces.accepts(&issued, 1_000_800));
+        // A nonce of a bucket that has not started yet is not accepted either.
+        assert!(!nonces.accepts(&n(1_000_500), 1_000_499));
+        // The key is the server's: another key's nonces are refused.
+        let other = Dpop::new(DpopMode::Optional, 300, 100, None)
+            .with_nonce(DpopNonceMode::Required, b"another key");
+        assert!(!nonces.accepts(&other.current_nonce(t(1_000_200)).unwrap(), 1_000_200));
+        assert!(!nonces.accepts("not base64url!", 1_000_200));
+        assert!(!nonces.accepts("", 1_000_200));
+    }
+
+    #[test]
+    fn proofs_need_a_current_nonce_when_required() {
+        let d = nonced(300);
+        let key = DpopKey::generate().unwrap();
+        let now = t(1_000_000);
+        let url = d.expected_url(None, "/token");
+        let current = d.current_nonce(now).unwrap();
+        let bind = |p: &str| d.bind_new(Some(p), "POST", &url, now);
+        // Missing.
+        assert!(matches!(
+            bind(&key.proof("POST", &url, None, now)),
+            Err(DpopFailure::UseNonce(_))
+        ));
+        // Wrong, and stale (two buckets old).
+        for wrong in ["bm9wZQ".to_string(), d.current_nonce(t(999_000)).unwrap()] {
+            let p = key.proof_with_nonce("POST", &url, None, Some(&wrong), now);
+            assert!(matches!(bind(&p), Err(DpopFailure::UseNonce(_))));
+        }
+        // A bad proof is still `invalid_dpop_proof`, nonce or not.
+        let wrong_url = key.proof_with_nonce("POST", "http://localhost/x", None, None, now);
+        assert!(matches!(bind(&wrong_url), Err(DpopFailure::Invalid(_))));
+        // Refused proofs did not use up a replay slot; the right nonce is accepted.
+        assert_eq!(d.replay.len(), 0);
+        let good = key.proof_with_nonce("POST", &url, None, Some(&current), now);
+        assert!(bind(&good).unwrap().is_some());
+        // The same holds for a presented bound token.
+        let cnf = Confirmation::jkt(key.thumbprint());
+        let mcp = d.expected_url(None, "/mcp/github");
+        let without = key.proof("POST", &mcp, Some("tok"), now);
+        assert!(matches!(
+            d.check_presented(Some(&cnf), "tok", Some(&without), "POST", &mcp, now),
+            Err(DpopFailure::UseNonce(_))
+        ));
+        let with = key.proof_with_nonce("POST", &mcp, Some("tok"), Some(&current), now);
+        assert_eq!(
+            d.check_presented(Some(&cnf), "tok", Some(&with), "POST", &mcp, now),
+            Ok(true)
+        );
+        // The failure maps to 401 `use_dpop_nonce` and the matching proxy reason.
+        let api: ApiError = DpopFailure::UseNonce("x".into()).into();
+        assert_eq!(api.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(api.code, USE_NONCE);
+        let auth: AuthError = DpopFailure::UseNonce("x".into()).into();
+        assert_eq!(auth.reason(), "use_dpop_nonce");
+        assert!(auth
+            .challenge()
+            .starts_with("DPoP error=\"use_dpop_nonce\""));
+    }
+
+    #[test]
+    fn exchange_sign_off_needs_no_nonce() {
+        let d = nonced(300);
+        let (parent, child) = (DpopKey::generate().unwrap(), DpopKey::generate().unwrap());
+        let now = t(1_000_000);
+        let url = d.expected_url(None, "/token");
+        let nonce = d.current_nonce(now).unwrap();
+        let cnf = Confirmation::jkt(parent.thumbprint());
+        let header = child.proof_with_nonce("POST", &url, None, Some(&nonce), now);
+        let sign_off = parent.sign_off(&url, "sub", child.thumbprint(), "coder", now);
+        assert_eq!(
+            d.bind_exchange(
+                Some(&cnf),
+                "sub",
+                "coder",
+                Some(&header),
+                Some(&sign_off),
+                &url,
+                now
+            ),
+            Ok(Some(Confirmation::jkt(child.thumbprint())))
+        );
+    }
+
+    #[test]
+    fn nonce_is_ignored_when_off() {
+        let d = Dpop::new(DpopMode::Optional, 300, 100, None)
+            .with_nonce(DpopNonceMode::Off, b"issuer key material");
+        assert_eq!(d.current_nonce(t(1_000_000)), None);
+        let key = DpopKey::generate().unwrap();
+        let now = t(1_000_000);
+        let url = d.expected_url(None, "/token");
+        for nonce in [None, Some("anything at all")] {
+            let p = key.proof_with_nonce("POST", &url, None, nonce, now);
+            assert!(d.bind_new(Some(&p), "POST", &url, now).unwrap().is_some());
+        }
     }
 
     /// SR-42: without `public_url`, only a loopback `Host` goes into the expected `htu`.

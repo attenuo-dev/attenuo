@@ -7,7 +7,7 @@
  * A token bound to a key (DPoP) also needs a fresh proof per request: use `mcpFetch`.
  */
 
-import { DpopKey, presented, type DpopKeyLike } from "./dpop.js";
+import { DpopKey, NonceCache, presented, type DpopKeyLike } from "./dpop.js";
 import type { FetchLike } from "./http.js";
 import { bearer, type Token } from "./token.js";
 import { MCP_ACCEPT, normalizeBase } from "./wire.js";
@@ -39,7 +39,9 @@ export function mcpHeaders(
  * `token` is called per request, so a re-exchanged token is picked up. With `dpopKey`, each
  * request also gets a DPoP proof for its method and URL and the token is sent as
  * `Authorization: DPoP <token>`: what a token bound to that key needs. Static headers
- * (`mcpHeaders`) cannot carry proofs, which are single-use.
+ * (`mcpHeaders`) cannot carry proofs, which are single-use. The latest `DPoP-Nonce` the server
+ * sent goes in each proof, and a request the server refuses with `use_dpop_nonce` is sent once
+ * more with a proof carrying the new nonce (unless its body is a stream, which cannot be resent).
  */
 export function mcpFetch(
   token: () => Token | string | Promise<Token | string>,
@@ -47,17 +49,25 @@ export function mcpFetch(
 ): FetchLike {
   const base = opts.fetch ?? ((input, init) => fetch(input, init));
   let key: Promise<DpopKey | undefined> | undefined;
+  const nonce = new NonceCache();
   return async (input, init = {}) => {
     key ??= DpopKey.of(opts.dpopKey);
-    const headers = new Headers(init.headers);
-    const auth = await presented(
-      bearer(await token()),
-      await key,
-      init.method ?? "GET",
-      String(input),
-    );
-    for (const [k, v] of Object.entries(auth)) headers.set(k, v);
-    return base(input, { ...init, headers });
+    const dpopKey = await key;
+    const jwt = bearer(await token());
+    const send = async () => {
+      const headers = new Headers(init.headers);
+      const auth = await presented(jwt, dpopKey, init.method ?? "GET", String(input), nonce.value);
+      for (const [k, v] of Object.entries(auth)) headers.set(k, v);
+      return base(input, { ...init, headers });
+    };
+    let res = await send();
+    const replayable = !(init.body instanceof ReadableStream);
+    if (dpopKey !== undefined && (await nonce.update(res)) && replayable) {
+      await res.body?.cancel();
+      res = await send();
+      await nonce.update(res);
+    }
+    return res;
   };
 }
 

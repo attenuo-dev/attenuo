@@ -16,7 +16,7 @@ import httpx
 
 from . import _wire as w
 from .capability import CapabilityLike, capabilities_to_json
-from .dpop import DpopKey
+from .dpop import DpopKey, NonceCache
 from .errors import OnbehalfError
 from .token import Token
 
@@ -134,12 +134,11 @@ def _export_line(line: str) -> dict[str, Any]:
     return obj
 
 
-def _root_dpop(server_url: str, dpop_key: DpopKey | dict[str, Any] | None) -> dict[str, str]:
-    """The ``DPoP`` header that binds a dev root token to ``dpop_key``."""
-    key = DpopKey.of(dpop_key)
+def _root_dpop(server_url: str, key: DpopKey | None, nonce: str | None) -> dict[str, str]:
+    """The ``DPoP`` header that binds a dev root token to ``key``, with the server's nonce."""
     if key is None:
         return {}
-    return {"dpop": key.proof("POST", f"{server_url}/admin/root-token")}
+    return {"dpop": key.proof("POST", f"{server_url}/admin/root-token", nonce=nonce)}
 
 
 def _root_body(
@@ -189,6 +188,7 @@ class AdminClient:
             transport=transport,
             headers={"authorization": f"Bearer {admin_token}"},
         )
+        self._nonce = NonceCache()
 
     def close(self) -> None:
         self._http.close()
@@ -310,8 +310,13 @@ class AdminClient:
         ``dpop_key`` binds the root token to that key (DPoP, RFC 9449).
         """
         body = _root_body(subject, issuer, agent, capabilities, ttl_seconds, attributes, may_act)
-        headers = _root_dpop(self.server_url, dpop_key)
+        key = DpopKey.of(dpop_key)
+        headers = _root_dpop(self.server_url, key, self._nonce.value)
         resp = self._http.post("/admin/root-token", json=body, headers=headers)
+        if key is not None and self._nonce.update(resp):  # use_dpop_nonce: retry once
+            headers = _root_dpop(self.server_url, key, self._nonce.value)
+            resp = self._http.post("/admin/root-token", json=body, headers=headers)
+            self._nonce.update(resp)
         return w.token_from_response(w.json_body(resp))
 
 
@@ -333,6 +338,7 @@ class AsyncAdminClient:
             transport=transport,
             headers={"authorization": f"Bearer {admin_token}"},
         )
+        self._nonce = NonceCache()
 
     async def aclose(self) -> None:
         await self._http.aclose()
@@ -435,6 +441,11 @@ class AsyncAdminClient:
         dpop_key: DpopKey | dict[str, Any] | None = None,
     ) -> Token:
         body = _root_body(subject, issuer, agent, capabilities, ttl_seconds, attributes, may_act)
-        headers = _root_dpop(self.server_url, dpop_key)
+        key = DpopKey.of(dpop_key)
+        headers = _root_dpop(self.server_url, key, self._nonce.value)
         resp = await self._http.post("/admin/root-token", json=body, headers=headers)
+        if key is not None and self._nonce.update(resp):  # use_dpop_nonce: retry once
+            headers = _root_dpop(self.server_url, key, self._nonce.value)
+            resp = await self._http.post("/admin/root-token", json=body, headers=headers)
+            self._nonce.update(resp)
         return w.token_from_response(w.json_body(resp))
