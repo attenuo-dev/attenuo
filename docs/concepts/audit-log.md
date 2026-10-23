@@ -66,6 +66,6 @@ Also, the hash covers compact JSON with sorted keys. It is not yet RFC 8785 cano
 
 The RFC describes a `kind` field (`issue`, `decision`, `renew`, `revoke`, `checkpoint`) and a `chain_id`. Neither exists in the code. Checkpoints live in their own table, not as chain entries.
 
-Revocations, policy reloads and dev root mints are appended to the log as admin actions (reason `admin_action`, server `onbehalf`). The revoke response carries the `audit_id` of that record, or says that the append failed.
+Revocations, policy reloads and dev root mints are appended to the log as admin actions (reason `admin_action`, server `onbehalf`, subject `urn:onbehalf:admin`, which no user can have). To pick out server events, filter on `server = "onbehalf"` and the tool (`token.*`, `lease.renew`, `admin.*`); no upstream or agent can use the name `onbehalf`. The revoke response carries the `audit_id` of that record, or says that the append failed.
 
 More detail: [RFC-0001 section 7](../spec/rfc-0001-onbehalf.md#7-audit-record-and-hash-chaining) and [design/server.md](../design/server.md#audit-convention-for-issuance).
