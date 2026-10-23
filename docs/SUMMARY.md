@@ -32,6 +32,7 @@
 - [Performance](design/performance.md)
   - [End-to-end benchmark, 2026-10-23](design/bench/2026-10-23-vm.md)
 - [Fuzzing](design/fuzzing.md)
+- [Admin console](design/admin-console.md)
 
 # Policy
 
@@ -60,6 +61,7 @@
   - [ADR-0005: Policy decision point](decisions/0005-policy-decision-point.md)
   - [ADR-0006: Lease-based revocation](decisions/0006-lease-based-in-flight-revocation.md)
   - [ADR-0007: Actor authentication](decisions/0007-actor-authentication.md)
+  - [ADR-0008: Admin console](decisions/0008-admin-console.md)
 
 # Research
 

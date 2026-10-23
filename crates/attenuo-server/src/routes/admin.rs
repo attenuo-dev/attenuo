@@ -154,13 +154,6 @@ pub async fn lease_status(
         .await
 }
 
-/// Most seqs one filtered `GET /admin/audit` page reads. `agent`, `lease`, `since` and
-/// `until` cannot use an index, so without a bound one request could read the whole log. A
-/// page that reaches the bound before it fills comes back short (possibly empty) with `next`
-/// or `prev` set, and the client keeps paging. Unfiltered pages need no bound: they read
-/// exactly the rows they return.
-pub const MAX_AUDIT_SCAN: u64 = 50_000;
-
 /// Leases `GET /admin/leases/{id}/tree` lists when the request names no `max_nodes`.
 pub const DEFAULT_TREE_NODES: usize = 1000;
 /// Most leases `GET /admin/leases/{id}/tree` lists, whatever `max_nodes` asks for. Bounds the
@@ -244,6 +237,13 @@ pub async fn lease_tree(
         })
         .await
 }
+
+/// Most seqs one filtered `GET /admin/audit` page reads. `agent`, `lease`, `since` and
+/// `until` cannot use an index, so without a bound one request could read the whole log. A
+/// page that reaches the bound before it fills comes back short (possibly empty) with `next`
+/// or `prev` set, and the client keeps paging. Unfiltered pages need no bound: they read
+/// exactly the rows they return.
+pub const MAX_AUDIT_SCAN: u64 = 50_000;
 
 /// Query string of `GET /admin/audit`. Every field is optional; with none of the filter
 /// fields, `order` or `before`, the answer is the same as before filters existed.
