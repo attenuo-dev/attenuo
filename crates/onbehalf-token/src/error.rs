@@ -19,11 +19,12 @@ pub enum TokenError {
     #[error("token signature is invalid")]
     InvalidSignature,
     /// The token's `ou_sig` uses a construction this verifier no longer accepts (the
-    /// `ou_sig_v` claim is missing, which means version 1, or names an unknown version).
+    /// `ou_sig_v` claim is missing, which means version 1, or names another version).
     /// Version 1 signed only the user block, with no issuer, root hop or domain separation
-    /// (SR-14); such tokens must be re-issued from the root.
+    /// (SR-14); version 2 encoded it with non-canonical JSON (SR-20). Such tokens must be
+    /// re-issued from the root.
     #[error(
-        "ou_sig version {0} is not supported (only version 2 is accepted); re-issue the root token"
+        "ou_sig version {0} is not supported (only version 3 is accepted); re-issue the root token"
     )]
     UnsupportedOuSig(u32),
     /// The header names a `kid` that is not among the trusted keys.

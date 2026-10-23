@@ -7,8 +7,9 @@
 //!
 //! 1. **The originating-user block is signed once.** At [`Issuer::issue_root`] the issuer signs
 //!    `iss`, the canonical JSON of the `OriginatingUser` and the root hop, domain-separated
-//!    (`ou_sig` v2, [`claims::ou_sig_payload`]), and stores the detached signature in the
-//!    `ou_sig` claim with `ou_sig_v` = 2 and the signing key's `ou_kid`. Exchanges copy them
+//!    (`ou_sig` v3, [`claims::ou_sig_payload`], RFC 8785 canonical JSON), and stores the
+//!    detached signature in the `ou_sig` claim with `ou_sig_v` = 3 and the signing key's
+//!    `ou_kid`. Exchanges copy them
 //!    unchanged, and every verification recomputes and checks the signature, so no hop can alter
 //!    who the chain is for or how it started, even if the outer JWT is re-signed by another
 //!    legitimate issuer key, and a user's signature cannot be lifted into another chain.
