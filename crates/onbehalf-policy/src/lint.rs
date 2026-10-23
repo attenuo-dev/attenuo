@@ -123,6 +123,20 @@ pub struct LintOptions {
     /// are warnings (deprecated) instead of errors. The schema text must match (generated with
     /// the same switch).
     pub legacy_bare_actions: bool,
+    /// The schema was built without a real catalog, so it declares no `context.input` or
+    /// `originating_user.attributes` attributes. Validator warnings that a policy is
+    /// impossible are then dropped for policies that read either, because the cause is the
+    /// missing declaration, not the policy. Other impossible policies still warn.
+    pub undeclared_catalog: bool,
+}
+
+/// Whether the policy reads `context.input` or `...attributes`, whose attributes come from the
+/// catalog and the server config.
+fn reads_catalog_attributes(policies: &PolicySet, id: &cedar_policy::PolicyId) -> bool {
+    policies.policy(id).is_some_and(|p| {
+        let t = p.to_string();
+        t.contains("context.input") || t.contains("attributes")
+    })
 }
 
 /// An `Action::"<id>"` entity reference in policy text, outside comments, with the policy it is
@@ -339,6 +353,9 @@ pub fn lint_with_options(policy_text: &str, schema_text: &str, options: LintOpti
         }
     }
     for w in result.validation_warnings() {
+        if options.undeclared_catalog && reads_catalog_attributes(&policies, w.policy_id()) {
+            continue;
+        }
         let mut found = Vec::new();
         leaves(w, policy_text, &mut found);
         for (message, loc) in found {
@@ -440,6 +457,7 @@ mod tests {
             &legacy_schema,
             LintOptions {
                 legacy_bare_actions: true,
+                ..Default::default()
             },
         );
         assert!(!r.has_errors(), "{:?}", r.issues);

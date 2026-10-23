@@ -15,6 +15,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 ### Fixed
 
 - `onbehalf policy lint` without `--config` no longer reports a correct server-scoped policy as an error. It declares the tools from the policy's own `<server>/<tool>` action names and prints a `note:` (and a `notes` array with `--json`) saying that tool attributes, input types and user attributes were not checked. New `onbehalf_policy::policy_action_names`.
+- `onbehalf policy lint` without `--config` no longer warns that a policy using `context.input has repo` is impossible: it drops "impossible policy" warnings for policies that read `context.input` or user attributes, which the schema cannot declare without a catalog (`LintOptions::undeclared_catalog`), and the note says so. A policy that is impossible for other reasons (`when { false }`) still warns.
 - The injection suite (`evaluation/injection-suite`) ignores `ONBEHALF_*` variables exported from another deployment (`ONBEHALF_ADMIN_TOKEN`, `ONBEHALF_SERVER`, ...), with one warning, instead of failing with 401. `ONBEHALF_BIN_DIR` and `ONBEHALF_INTEGRATION` still apply.
 
 ### Security

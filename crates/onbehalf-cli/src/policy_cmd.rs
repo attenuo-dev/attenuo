@@ -178,8 +178,9 @@ pub fn lint(policy: &Path, config: Option<&Path>, show_schema: bool, json_out: b
             let (catalog, skipped) = catalog_from_policy(&text);
             notes.push(
                 "no --config: tools were declared from the policy's own action names; \
-                 `resource.readonly`, `resource.sensitive`, `context.input` types and user \
-                 attributes were not checked against a real catalog (pass --config <server.toml> \
+                 `context.input` and user attributes are not declared, so \"impossible policy\" \
+                 warnings are dropped for policies that read them; `resource.readonly`, \
+                 `resource.sensitive` and input types were not checked against a real catalog (pass --config <server.toml> \
                  for the full check)"
                     .to_string(),
             );
@@ -217,6 +218,7 @@ pub fn lint(policy: &Path, config: Option<&Path>, show_schema: bool, json_out: b
         &schema,
         onbehalf_policy::LintOptions {
             legacy_bare_actions,
+            undeclared_catalog: config.is_none(),
         },
     );
 
@@ -364,6 +366,7 @@ mod tests {
         assert_eq!(bare.status, Status::Ok, "{}", bare.stdout);
         assert!(bare.stdout.contains("note: no --config"), "{}", bare.stdout);
         assert!(bare.stdout.contains("0 error(s)"), "{}", bare.stdout);
+        assert!(bare.stdout.contains("0 warning(s)"), "{}", bare.stdout);
     }
 
     #[test]
