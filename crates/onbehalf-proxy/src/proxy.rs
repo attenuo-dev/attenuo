@@ -535,23 +535,48 @@ async fn handle_post_inner(
         Err(e) => return upstream_error(e),
     };
 
-    let needs_buffer = !screened.list_requests.is_empty() || !screened.replies.is_empty();
-    let is_json = resp
+    let has_lists = !screened.list_requests.is_empty();
+    let needs_buffer = has_lists || !screened.replies.is_empty();
+    let content_type = resp
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.trim_start().starts_with("application/json"))
-        .unwrap_or(false);
+        .map(|ct| ct.trim_start().to_ascii_lowercase())
+        .unwrap_or_default();
+    let is_json = content_type.starts_with("application/json");
+    let is_sse = content_type.starts_with("text/event-stream");
 
     let mut response = if needs_buffer && is_json {
         buffer_and_rewrite(resp, chain, server, &screened, is_batch).await
+    } else if has_lists && is_sse {
+        // The list response is an event of the stream, alone or inside a batch: filter each
+        // event as it passes. Replies the proxy generated itself lead the stream.
+        let pending = screened.list_requests.clone();
+        let caps = chain.effective_capabilities().cloned().unwrap_or_default();
+        let server = server.to_owned();
+        let prelude = sse_prelude(&screened.replies);
+        stream_response_filtered(resp, prelude, move |msg| {
+            let removed = ListFilter::new(&pending, &caps, &server).apply(msg);
+            if removed > 0 {
+                tracing::debug!(removed, "filtered list result in SSE stream");
+            }
+        })
+    } else if has_lists && !matches!(resp.status().as_u16(), 202 | 204) {
+        // Neither JSON nor SSE: the proxy cannot tell what is in it, and a list result must
+        // not reach the client unfiltered. Fail closed.
+        tracing::error!(
+            content_type,
+            status = %resp.status(),
+            "upstream answered a list request with a body the proxy cannot filter"
+        );
+        let body = error_response(
+            Value::Null,
+            CODE_UPSTREAM,
+            "onbehalf: upstream answered a list request with an unsupported content type",
+            None,
+        );
+        json_response(StatusCode::BAD_GATEWAY, &body)
     } else {
-        if !screened.list_requests.is_empty() {
-            tracing::warn!(
-                "upstream answered a list request over a non-JSON response; passing through \
-                 unfiltered (v0 limitation)"
-            );
-        }
         let prelude = sse_prelude(&screened.replies);
         stream_response(resp, prelude, &[])
     };
@@ -736,6 +761,17 @@ async fn buffer_and_rewrite(
     let mut value: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {
+            if !screened.list_requests.is_empty() {
+                // A list result the proxy cannot parse is one it cannot filter.
+                tracing::error!(error = %e, "upstream answered a list request with invalid JSON");
+                let body = error_response(
+                    Value::Null,
+                    CODE_UPSTREAM,
+                    "onbehalf: upstream answered a list request with invalid JSON",
+                    None,
+                );
+                return json_response(StatusCode::BAD_GATEWAY, &body);
+            }
             tracing::warn!(error = %e, "upstream JSON response did not parse; passing through");
             return build_response(status, &headers, Body::from(bytes));
         }
@@ -795,6 +831,25 @@ fn stream_response(
         response.headers_mut().insert(k.clone(), v.clone());
     }
     response
+}
+
+/// Like [`stream_response`] for an SSE body, with `filter` run over every JSON-RPC message in
+/// its events (see [`crate::sse`]).
+fn stream_response_filtered(
+    resp: reqwest::Response,
+    prelude: Option<Bytes>,
+    filter: impl FnMut(&mut Value) + Send + 'static,
+) -> Response {
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let filtered = crate::sse::rewrite_stream(resp.bytes_stream(), filter);
+    let body = match prelude {
+        Some(p) => Body::from_stream(
+            futures_util::stream::once(async { Ok::<_, std::io::Error>(p) }).chain(filtered),
+        ),
+        None => Body::from_stream(filtered),
+    };
+    build_response(status, &headers, body)
 }
 
 fn build_response(status: StatusCode, upstream_headers: &HeaderMap, body: Body) -> Response {

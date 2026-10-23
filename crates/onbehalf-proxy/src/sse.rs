@@ -1,0 +1,303 @@
+//! Rewriting of `text/event-stream` bodies.
+//!
+//! A Streamable HTTP server may answer a `POST` with an SSE stream instead of a JSON body. The
+//! response to a `tools/list` (or any list request) is then the `data:` of one of the stream's
+//! events, possibly after notifications and server requests, possibly inside a JSON-RPC batch.
+//! [`rewrite_stream`] parses the stream incrementally, runs a callback over the JSON-RPC
+//! message(s) of each event, and emits the event again. Events with no `data`, and comments, are
+//! passed through; the stream is never buffered beyond one event.
+//!
+//! The framing rules are those of the WHATWG SSE specification: lines end in `\n`, `\r\n` or
+//! `\r`; an empty line ends an event; several `data:` lines of one event are joined with `\n`;
+//! one space after the colon is dropped; a final event that is not terminated by an empty line
+//! is discarded (a client would discard it too).
+
+use std::io;
+
+use axum::body::Bytes;
+use futures_util::{Stream, StreamExt};
+use serde_json::Value;
+
+/// The largest single event the proxy will buffer.
+pub const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Incremental SSE event splitter and rewriter.
+#[derive(Default)]
+pub struct SseRewriter {
+    buf: Vec<u8>,
+}
+
+impl SseRewriter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed a chunk of the stream; returns the bytes of every event completed by it, rewritten.
+    /// `f` is called with the parsed JSON of each event that carries valid JSON `data`, and may
+    /// modify it. Such an event is re-serialized (so duplicate object keys cannot survive);
+    /// any other event is emitted byte for byte.
+    pub fn push(
+        &mut self,
+        chunk: &[u8],
+        f: &mut impl FnMut(&mut Value),
+    ) -> Result<Vec<u8>, io::Error> {
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        while let Some(end) = find_event_end(&self.buf) {
+            let event: Vec<u8> = self.buf.drain(..end).collect();
+            rewrite_event(&event, f, &mut out)?;
+        }
+        if self.buf.len() > MAX_EVENT_BYTES {
+            return Err(io::Error::other("SSE event larger than the proxy's limit"));
+        }
+        Ok(out)
+    }
+}
+
+/// Byte offset just past the first complete event in `buf` (past its terminating empty line).
+fn find_event_end(buf: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    let mut line_start = 0;
+    while i < buf.len() {
+        let term = match buf[i] {
+            b'\n' => 1,
+            b'\r' => match buf.get(i + 1) {
+                Some(b'\n') => 2,
+                Some(_) => 1,
+                // `\r` last in the buffer: it may be the first half of `\r\n`.
+                None => return None,
+            },
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let empty_line = i == line_start;
+        i += term;
+        if empty_line {
+            return Some(i);
+        }
+        line_start = i;
+    }
+    None
+}
+
+fn split_lines(text: &str) -> Vec<&str> {
+    let mut lines = Vec::new();
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                lines.push(&text[start..i]);
+                i += 1;
+                start = i;
+            }
+            b'\r' => {
+                lines.push(&text[start..i]);
+                i += if bytes.get(i + 1) == Some(&b'\n') {
+                    2
+                } else {
+                    1
+                };
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    if start < bytes.len() {
+        lines.push(&text[start..]);
+    }
+    lines
+}
+
+fn rewrite_event(
+    event: &[u8],
+    f: &mut impl FnMut(&mut Value),
+    out: &mut Vec<u8>,
+) -> Result<(), io::Error> {
+    let text = std::str::from_utf8(event)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SSE event is not UTF-8"))?;
+    let lines = split_lines(text);
+    let data: Vec<&str> = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("data"))
+        .filter_map(|rest| {
+            // `data:value` or `data: value`; a bare `data` line is an empty data line.
+            if rest.is_empty() {
+                Some("")
+            } else {
+                rest.strip_prefix(':')
+                    .map(|v| v.strip_prefix(' ').unwrap_or(v))
+            }
+        })
+        .collect();
+    let parsed = (!data.is_empty())
+        .then(|| serde_json::from_str::<Value>(&data.join("\n")).ok())
+        .flatten();
+    let Some(mut message) = parsed else {
+        out.extend_from_slice(event);
+        return Ok(());
+    };
+    f(&mut message);
+    let encoded = serde_json::to_string(&message)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut wrote_data = false;
+    for line in lines.iter().filter(|l| !l.is_empty()) {
+        let is_data = line
+            .strip_prefix("data")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'));
+        if is_data {
+            if !wrote_data {
+                out.extend_from_slice(format!("data: {encoded}\n").as_bytes());
+                wrote_data = true;
+            }
+        } else {
+            out.extend_from_slice(line.as_bytes());
+            out.push(b'\n');
+        }
+    }
+    out.push(b'\n');
+    Ok(())
+}
+
+/// Wrap an upstream byte stream so that every JSON-RPC message in its events passes through
+/// `f`. A trailing event without its empty line is dropped; a transport error or an oversized
+/// or non-UTF-8 event ends the stream with an error.
+pub fn rewrite_stream<S, E>(
+    upstream: S,
+    f: impl FnMut(&mut Value) + Send + 'static,
+) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    futures_util::stream::unfold(
+        (upstream, SseRewriter::new(), f, false),
+        |(mut upstream, mut rewriter, mut f, failed)| async move {
+            if failed {
+                return None;
+            }
+            loop {
+                match upstream.next().await {
+                    None => return None,
+                    Some(Err(e)) => {
+                        return Some((Err(io::Error::other(e)), (upstream, rewriter, f, true)))
+                    }
+                    Some(Ok(chunk)) => match rewriter.push(&chunk, &mut f) {
+                        Err(e) => return Some((Err(e), (upstream, rewriter, f, true))),
+                        Ok(out) if out.is_empty() => continue,
+                        Ok(out) => {
+                            return Some((Ok(Bytes::from(out)), (upstream, rewriter, f, false)))
+                        }
+                    },
+                }
+            }
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn run(chunks: &[&[u8]]) -> String {
+        let mut r = SseRewriter::new();
+        let mut out = Vec::new();
+        let mut f = |v: &mut Value| {
+            if v.get("mark").is_some() {
+                v["marked"] = json!(true);
+            }
+        };
+        for c in chunks {
+            out.extend(r.push(c, &mut f).unwrap());
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn rewrites_data_and_keeps_other_fields() {
+        let out = run(&[b"id: 7\nevent: message\ndata: {\"mark\":1}\n\n"]);
+        assert_eq!(
+            out,
+            "id: 7\nevent: message\ndata: {\"mark\":1,\"marked\":true}\n\n"
+        );
+    }
+
+    #[test]
+    fn handles_chunks_split_anywhere() {
+        let whole = "event: message\r\ndata: {\"mark\":1}\r\n\r\n: ping\n\ndata: {\"x\":2}\n\n";
+        let expected = run(&[whole.as_bytes()]);
+        for cut in 0..whole.len() {
+            let (a, b) = whole.as_bytes().split_at(cut);
+            assert_eq!(run(&[a, b]), expected, "cut at {cut}");
+        }
+        assert!(expected.contains("\"marked\":true"));
+        assert!(expected.contains(": ping\n\n"));
+    }
+
+    #[test]
+    fn multi_line_data_is_joined_and_collapsed() {
+        let out = run(&[b"data: {\"mark\":\ndata: 1}\n\n"]);
+        assert_eq!(out, "data: {\"mark\":1,\"marked\":true}\n\n");
+    }
+
+    #[test]
+    fn data_without_space_and_cr_only_line_ends() {
+        // A final lone `\r` could be half of `\r\n`, so it is held back until more arrives.
+        let out = run(&[b"data:{\"mark\":1}\r\r", b"data: 2\n\n"]);
+        assert_eq!(out, "data: {\"mark\":1,\"marked\":true}\n\ndata: 2\n\n");
+    }
+
+    #[test]
+    fn non_json_and_data_less_events_pass_through_byte_for_byte() {
+        let input = "data: not json\n\n: comment\n\nretry: 5\n\n";
+        assert_eq!(run(&[input.as_bytes()]), input);
+    }
+
+    #[test]
+    fn unterminated_trailing_event_is_dropped() {
+        assert_eq!(
+            run(&[b"data: {\"a\":1}\n\ndata: {\"mark\":1}\n"]),
+            "data: {\"a\":1}\n\n"
+        );
+    }
+
+    #[test]
+    fn duplicate_keys_do_not_survive() {
+        let out = run(&[b"data: {\"id\":1,\"id\":2}\n\n"]);
+        assert_eq!(out, "data: {\"id\":2}\n\n");
+    }
+
+    #[test]
+    fn oversized_event_is_an_error() {
+        let mut r = SseRewriter::new();
+        let big = vec![b'a'; MAX_EVENT_BYTES + 1];
+        assert!(r.push(&big, &mut |_| {}).is_err());
+    }
+
+    #[test]
+    fn non_utf8_event_is_an_error() {
+        let mut r = SseRewriter::new();
+        assert!(r.push(b"data: \xff\xfe\n\n", &mut |_| {}).is_err());
+    }
+
+    #[tokio::test]
+    async fn stream_wrapper_rewrites_and_stops_on_error() {
+        let chunks: Vec<Result<Bytes, io::Error>> = vec![
+            Ok(Bytes::from_static(b"data: {\"mark\":1}\n")),
+            Ok(Bytes::from_static(b"\n")),
+            Err(io::Error::other("boom")),
+        ];
+        let mut s = Box::pin(rewrite_stream(
+            futures_util::stream::iter(chunks),
+            |v: &mut Value| v["marked"] = json!(true),
+        ));
+        let first = s.next().await.unwrap().unwrap();
+        assert_eq!(&first[..], b"data: {\"mark\":1,\"marked\":true}\n\n");
+        assert!(s.next().await.unwrap().is_err());
+        assert!(s.next().await.is_none());
+    }
+}

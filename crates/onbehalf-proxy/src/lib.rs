@@ -57,13 +57,15 @@
 //!
 //! # Limitations (v0)
 //!
-//! - `tools/list` is only filtered when the upstream answers with `application/json`. If the
-//!   upstream answers over SSE the response is passed through unfiltered and a warning is
-//!   logged. Denials inside a JSON-RPC batch whose remainder is answered over SSE are emitted as
-//!   leading SSE `message` events on the same stream.
+//! - List results are filtered in `application/json` bodies (single or batch) and in
+//!   `text/event-stream` bodies, event by event ([`sse`]). A list request answered with any
+//!   other content type, or with a body that does not parse, gets `502` instead of an
+//!   unfiltered result. Denials inside a JSON-RPC batch whose remainder is answered over SSE
+//!   are emitted as leading SSE `message` events on the same stream.
 //! - The proxy does not add credentials for the upstream; the bearer token it receives is
 //!   onbehalf's, not the upstream's, and is never forwarded.
-//! - A server-to-client stream (the `GET` SSE channel) is not inspected; the client's replies to
+//! - A server-to-client stream (the `GET` SSE channel, including a resumed one) is not
+//!   inspected; the client's replies to
 //!   server requests are forwarded after a lease check, not authorized.
 //! - Authentication is performed per HTTP request; there is no caching of resolved chains.
 //!
@@ -75,6 +77,7 @@ pub mod filter;
 pub mod jsonrpc;
 pub mod proxy;
 pub mod session;
+pub mod sse;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

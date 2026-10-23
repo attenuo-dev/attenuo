@@ -22,6 +22,20 @@ struct Harness {
 impl Harness {
     async fn start(upstream: FakeMcpServer, chain: DelegationChain) -> anyhow::Result<Self> {
         let upstream_task = upstream.spawn().await?;
+        Self::start_at(upstream, upstream_task, chain).await
+    }
+
+    /// Start against a hand-written upstream router (mounted at `/mcp`) instead of the fake.
+    async fn start_router(router: axum::Router, chain: DelegationChain) -> anyhow::Result<Self> {
+        let upstream_task = spawn_router(router).await?;
+        Self::start_at(FakeMcpServer::new(&[]), upstream_task, chain).await
+    }
+
+    async fn start_at(
+        upstream: FakeMcpServer,
+        upstream_task: Spawned,
+        chain: DelegationChain,
+    ) -> anyhow::Result<Self> {
         let authorizer = Arc::new(StaticAuthorizer::new().with_chain(TOKEN, chain));
         let config = ProxyConfig::new(
             "127.0.0.1:0".parse()?,
@@ -379,5 +393,249 @@ async fn list_requests_are_forwarded_with_their_cursor() -> anyhow::Result<()> {
             "prompts/list"
         ]
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// SSE streams and JSON-RPC batches
+// ---------------------------------------------------------------------------------------------
+
+/// Capabilities that leave one tool, one resource prefix and one prompt visible.
+fn narrow_chain() -> DelegationChain {
+    test_chain(
+        "user:a",
+        "agent:a",
+        [
+            Capability::new(SERVER, "read_file"),
+            Capability::new(SERVER, "resources/read")
+                .with_constraint("uri", ArgConstraint::Prefix("file:///public/".into())),
+            Capability::new(SERVER, "prompts/get")
+                .with_constraint("name", ArgConstraint::Equals(json!("summarize"))),
+        ],
+    )
+}
+
+fn assert_narrow(msgs: &[Value]) {
+    let by_id = |id: u64| {
+        msgs.iter()
+            .find(|m| m["id"] == id)
+            .unwrap_or_else(|| panic!("no response {id} in {msgs:?}"))
+    };
+    assert_eq!(
+        names(&by_id(1)["result"], "tools", "name"),
+        vec!["read_file"]
+    );
+    assert_eq!(
+        names(&by_id(2)["result"], "resources", "uri"),
+        vec!["file:///public/a.txt", "file:///public/b.txt"]
+    );
+    assert_eq!(
+        names(&by_id(3)["result"], "resourceTemplates", "uriTemplate").len(),
+        2
+    );
+    assert_eq!(
+        names(&by_id(4)["result"], "prompts", "name"),
+        vec!["summarize"]
+    );
+}
+
+fn four_lists() -> Value {
+    json!([
+        req(1, "tools/list", json!({})),
+        req(2, "resources/list", json!({})),
+        req(3, "resources/templates/list", json!({})),
+        req(4, "prompts/list", json!({})),
+    ])
+}
+
+#[tokio::test]
+async fn every_list_is_filtered_in_a_json_batch() -> anyhow::Result<()> {
+    let h = Harness::start(full_upstream(), narrow_chain()).await?;
+    let resp = h.post(&four_lists()).await?;
+    assert!(resp.headers()["content-type"]
+        .to_str()?
+        .starts_with("application/json"));
+    assert_narrow(&decode_messages(resp).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_list_is_filtered_over_sse_single_event() -> anyhow::Result<()> {
+    // One event holding the whole batch response.
+    let h = Harness::start(full_upstream().with_sse(true), narrow_chain()).await?;
+    let resp = h.post(&four_lists()).await?;
+    assert!(resp.headers()["content-type"]
+        .to_str()?
+        .starts_with("text/event-stream"));
+    assert_narrow(&decode_messages(resp).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_list_is_filtered_over_sse_event_per_response() -> anyhow::Result<()> {
+    // A notification event first, then one event per response, each with an `id:` field.
+    let upstream = full_upstream()
+        .with_sse(true)
+        .with_sse_event_per_response(true);
+    let h = Harness::start(upstream, narrow_chain()).await?;
+    let resp = h.post(&four_lists()).await?;
+    let msgs = decode_messages(resp).await?;
+    assert_eq!(msgs.len(), 5, "{msgs:?}");
+    // The notification passes untouched, first.
+    assert_eq!(msgs[0]["method"], "notifications/message");
+    assert_narrow(&msgs);
+    Ok(())
+}
+
+#[tokio::test]
+async fn single_list_request_over_sse_is_filtered() -> anyhow::Result<()> {
+    for per_response in [false, true] {
+        let upstream = full_upstream()
+            .with_sse(true)
+            .with_sse_event_per_response(per_response);
+        let h = Harness::start(upstream, narrow_chain()).await?;
+        let resp = h.post(&req(1, "tools/list", json!({}))).await?;
+        let msgs = decode_messages(resp).await?;
+        let list = msgs.iter().find(|m| m["id"] == 1).unwrap();
+        assert_eq!(names(&list["result"], "tools", "name"), vec!["read_file"]);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn paginated_sse_list_keeps_cursor() -> anyhow::Result<()> {
+    let upstream = full_upstream().with_sse(true).with_page_size(1);
+    let h = Harness::start(upstream, narrow_chain()).await?;
+    let resp = h.post(&req(1, "resources/list", json!({}))).await?;
+    let msg = decode_single(resp).await?;
+    assert_eq!(
+        names(&msg["result"], "resources", "uri"),
+        vec!["file:///public/a.txt"]
+    );
+    assert_eq!(msg["result"]["nextCursor"], "1");
+    let resp = h
+        .post(&req(2, "resources/list", json!({"cursor": "2"})))
+        .await?;
+    let msg = decode_single(resp).await?;
+    // page three holds only the secret key
+    assert_eq!(msg["result"]["resources"], json!([]));
+    assert!(msg["result"].get("nextCursor").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn denied_call_and_list_in_one_sse_batch() -> anyhow::Result<()> {
+    let upstream = full_upstream()
+        .with_sse(true)
+        .with_sse_event_per_response(true);
+    let h = Harness::start(upstream, narrow_chain()).await?;
+    let batch = json!([
+        req(1, "tools/list", json!({})),
+        json!({"jsonrpc":"2.0","id":9,"method":"tools/call",
+               "params":{"name":"delete_repo","arguments":{}}}),
+    ]);
+    let msgs = decode_messages(h.post(&batch).await?).await?;
+    let denial = msgs.iter().find(|m| m["id"] == 9).unwrap();
+    assert_eq!(denial["error"]["code"], -32003);
+    let list = msgs.iter().find(|m| m["id"] == 1).unwrap();
+    assert_eq!(names(&list["result"], "tools", "name"), vec!["read_file"]);
+    assert!(h.upstream.recorded_calls().is_empty());
+    Ok(())
+}
+
+/// An upstream that answers every POST with the given raw `Content-Type` and body chunks,
+/// sent as separate stream items so that events are split across reads.
+fn raw_upstream(content_type: &'static str, chunks: Vec<String>) -> axum::Router {
+    use axum::body::{Body, Bytes};
+    use axum::routing::post;
+    axum::Router::new().route(
+        "/mcp",
+        post(move || {
+            let chunks = chunks.clone();
+            async move {
+                let stream = futures_util::stream::iter(
+                    chunks
+                        .into_iter()
+                        .map(|c| Ok::<_, std::io::Error>(Bytes::from(c))),
+                );
+                axum::response::Response::builder()
+                    .header("content-type", content_type)
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }
+        }),
+    )
+}
+
+#[tokio::test]
+async fn sse_event_split_across_chunks_with_server_request_reusing_the_id() -> anyhow::Result<()> {
+    // A server-initiated request that reuses id 1 (and carries a `result` of its own) must
+    // not be mistaken for the response, and must not stop the real response being filtered.
+    let tools = json!({"jsonrpc":"2.0","id":1,"result":{"tools":[
+        {"name":"read_file"},{"name":"delete_repo"}], "nextCursor":"c1"}})
+    .to_string();
+    let server_request = json!({"jsonrpc":"2.0","id":1,"method":"sampling/createMessage",
+        "params":{}, "result":{"tools":[{"name":"delete_repo"}]}})
+    .to_string();
+    let chunks = vec![
+        format!("event: message\ndata: {server_request}\n\nevent: mess"),
+        "age\r\nid: 5\r\nda".to_owned(),
+        format!("ta: {tools}\r"),
+        "\n\r".to_owned(),
+        "\n".to_owned(),
+    ];
+    let h =
+        Harness::start_router(raw_upstream("text/event-stream", chunks), narrow_chain()).await?;
+    let resp = h.post(&req(1, "tools/list", json!({}))).await?;
+    let msgs = decode_messages(resp).await?;
+    assert_eq!(msgs.len(), 2, "{msgs:?}");
+    // the server's own request is untouched, its `result` member included
+    assert_eq!(msgs[0]["method"], "sampling/createMessage");
+    assert_eq!(msgs[0]["result"]["tools"][0]["name"], "delete_repo");
+    // the response is filtered, cursor intact
+    assert_eq!(
+        names(&msgs[1]["result"], "tools", "name"),
+        vec!["read_file"]
+    );
+    assert_eq!(msgs[1]["result"]["nextCursor"], "c1");
+    Ok(())
+}
+
+#[tokio::test]
+async fn upstream_body_that_cannot_be_filtered_fails_closed() -> anyhow::Result<()> {
+    let tools = json!({"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"delete_repo"}]}});
+    // wrong content type
+    let h = Harness::start_router(
+        raw_upstream("text/plain", vec![tools.to_string()]),
+        narrow_chain(),
+    )
+    .await?;
+    let resp = h.post(&req(1, "tools/list", json!({}))).await?;
+    assert_eq!(resp.status(), 502);
+    assert!(!resp.text().await?.contains("delete_repo"));
+
+    // JSON content type, broken body
+    let h = Harness::start_router(
+        raw_upstream("application/json", vec!["{\"tools\": [delete_repo".into()]),
+        narrow_chain(),
+    )
+    .await?;
+    let resp = h.post(&req(1, "resources/list", json!({}))).await?;
+    assert_eq!(resp.status(), 502);
+    assert!(!resp.text().await?.contains("delete_repo"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn sse_stream_with_unterminated_final_event_does_not_leak_it() -> anyhow::Result<()> {
+    let leak = json!({"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"delete_repo"}]}});
+    let h = Harness::start_router(
+        raw_upstream("text/event-stream", vec![format!("data: {leak}\n")]),
+        narrow_chain(),
+    )
+    .await?;
+    let resp = h.post(&req(1, "tools/list", json!({}))).await?;
+    let text = resp.text().await?;
+    assert!(!text.contains("delete_repo"), "{text}");
     Ok(())
 }
