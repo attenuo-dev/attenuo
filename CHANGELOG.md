@@ -8,6 +8,10 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ## [Unreleased]
 
+### Added
+
+- Token refresh in both SDKs. Python: `TokenRefresher` (a context manager running a thread) and `AsyncTokenRefresher` (an `asyncio` task), plus `RefreshError`. TypeScript: `TokenRefresher` with `start()` returning a disposer, `provider` and `fetch()` for the MCP transport (the per-request token hook, on top of `mcpFetch`), plus `RefreshError`. Each renews the lease at a third of the lease interval, calls a caller-supplied `exchange` function before `exp` (margin default 20% of the lifetime, at least 5 s), exposes the current token with a change callback, retries with jittered backoff, and stops with a terminal error callback on `lease_revoked`, a permanent refusal or expiry. A replacement token must carry the same DPoP `cnf.jkt` as the one it replaces. Tokens are never logged. The exchange function must bring a fresh subject token each time, because a parent delegates to a given actor once.
+
 ### Security
 
 - SR-40: a DPoP exchange sign-off (`subject_token_dpop`) is consent to one delegation only. BREAKING: the sign-off must carry `child_jkt` (the thumbprint of the key in the exchange's `DPoP` header) and `child_actor` (the request's `actor`), or the exchange is 401 `invalid_dpop_proof`; a plain proof by the parent's key is no longer accepted. The parent's holder can now make the sign-off in its own process and hand over only the result: `onbehalf token sign-off --dpop-key parent.jwk --child-jkt <jkt> --actor <agent>` and `token exchange --subject-token-dpop-file`, `DpopKey.sign_off` and `exchange(..., subject_token_dpop=...)` in Python, `DpopKey.signOff` and `subjectTokenDpop` in TypeScript. `subject_dpop_key` / `subjectDpopKey` / `--subject-dpop-key` still work for a process that holds both keys.
