@@ -708,6 +708,11 @@ pub struct ProxySection {
     /// `session_registry_full`; live bindings are never evicted (SR-36). Default 100000.
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
+    /// Most live session bindings one principal (root lease) holds. One more gets `429`
+    /// `too_many_sessions`, other principals are unaffected, and the upstream session is
+    /// deleted (SR-49). Default 64.
+    #[serde(default = "default_max_sessions_per_principal")]
+    pub max_sessions_per_principal: usize,
 }
 
 impl Default for ProxySection {
@@ -719,6 +724,7 @@ impl Default for ProxySection {
             max_request_body_bytes: default_max_request_body_bytes(),
             session_ttl_seconds: default_session_ttl_seconds(),
             max_sessions: default_max_sessions(),
+            max_sessions_per_principal: default_max_sessions_per_principal(),
         }
     }
 }
@@ -737,6 +743,10 @@ fn default_session_ttl_seconds() -> u64 {
 
 fn default_max_sessions() -> usize {
     onbehalf_proxy::session::DEFAULT_MAX_SESSIONS
+}
+
+fn default_max_sessions_per_principal() -> usize {
+    onbehalf_proxy::session::DEFAULT_MAX_SESSIONS_PER_PRINCIPAL
 }
 
 fn default_stream_recheck_seconds() -> u64 {
@@ -762,6 +772,10 @@ impl ProxySection {
             ("max_request_body_bytes", self.max_request_body_bytes as u64),
             ("session_ttl_seconds", self.session_ttl_seconds),
             ("max_sessions", self.max_sessions as u64),
+            (
+                "max_sessions_per_principal",
+                self.max_sessions_per_principal as u64,
+            ),
         ] {
             if value == 0 {
                 anyhow::bail!("[proxy] {name} must be at least 1");
@@ -784,6 +798,7 @@ impl ProxySection {
                 std::time::Duration::from_secs(self.session_ttl_seconds),
                 self.max_sessions,
             )
+            .with_max_sessions_per_principal(self.max_sessions_per_principal)
     }
 }
 
@@ -1101,17 +1116,20 @@ mod tests {
         assert_eq!(cfg.proxy.max_request_body_bytes, 4 * 1024 * 1024);
         assert_eq!(cfg.proxy.session_ttl_seconds, 3600);
         assert_eq!(cfg.proxy.max_sessions, 100_000);
+        assert_eq!(cfg.proxy.max_sessions_per_principal, 64);
         cfg.proxy.check_limits().unwrap();
         let applied = cfg.proxy.apply(onbehalf_proxy::ProxyConfig::new(
             "127.0.0.1:0".parse().unwrap(),
             vec![],
         ));
         assert_eq!(applied.max_sessions, 100_000);
+        assert_eq!(applied.max_sessions_per_principal, 64);
         for key in [
             "max_upstream_body_bytes",
             "max_request_body_bytes",
             "session_ttl_seconds",
             "max_sessions",
+            "max_sessions_per_principal",
         ] {
             let cfg = Config::from_toml(&format!("[proxy]\n{key} = 0\n")).unwrap();
             let err = cfg.proxy.check_limits().unwrap_err().to_string();

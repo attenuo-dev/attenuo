@@ -169,6 +169,7 @@ With no matching entry, no root token is issued.
 | `max_request_body_bytes` | `4194304` (4 MiB) | Largest client request body, read after authentication. Over it: `413`, reason `request_too_large`. At least 1. |
 | `session_ttl_seconds` | `3600` | Idle lifetime of an `Mcp-Session-Id` binding. At least 1. |
 | `max_sessions` | `100000` | Most live session bindings. Expired ones are reclaimed as new ones arrive; when every slot is live, the response that would bind a new session is replaced by `503`, JSON-RPC `-32006`, reason `session_registry_full`, `Retry-After: 30`. Live bindings are never evicted (SR-36). At least 1. |
+| `max_sessions_per_principal` | `64` | Most live session bindings one principal holds. The principal is the chain's root lease: one user's root grant, shared by every agent it delegates to. Only live bindings count (expired ones are reclaimed first; a `DELETE` frees one). One more gets `429`, JSON-RPC `-32007`, reason `too_many_sessions`, `Retry-After: 30`, while other principals keep opening sessions (SR-49). When the proxy refuses a session for this reason or for `max_sessions`, it sends the upstream an MCP `DELETE` for the session the upstream just created (best effort, logged on failure). At least 1. |
 
 ## `[dev]`
 

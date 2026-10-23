@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -68,7 +69,8 @@ pub struct RecordedCall {
 
 /// A minimal Streamable HTTP MCP server: `initialize`, `tools/list`, `tools/call`,
 /// `resources/list`, `resources/templates/list`, `prompts/list` (all optionally paginated),
-/// notifications, batches. Mounted at `POST /mcp`.
+/// notifications, batches. Mounted at `POST /mcp`; `DELETE /mcp` ends a session and is recorded
+/// ([`FakeMcpServer::deleted_sessions`]).
 #[derive(Clone)]
 pub struct FakeMcpServer {
     tools: Vec<Value>,
@@ -87,6 +89,12 @@ pub struct FakeMcpServer {
     session_id: String,
     /// Resolve `tools/call` names case-insensitively, like some real servers do (SR-25).
     case_insensitive_names: bool,
+    /// When set, every `initialize` opens a new session (`{session_id}-{n}`) and other responses
+    /// carry no session id, like a real server; otherwise every response carries `session_id`.
+    fresh_sessions: bool,
+    sessions_opened: Arc<AtomicU64>,
+    /// `Mcp-Session-Id` of every `DELETE` received, in order.
+    deleted: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeMcpServer {
@@ -113,7 +121,27 @@ impl FakeMcpServer {
             sse_event_per_response: false,
             session_id: "fake-session-1".into(),
             case_insensitive_names: false,
+            fresh_sessions: false,
+            sessions_opened: Arc::new(AtomicU64::new(0)),
+            deleted: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Open a new session on every `initialize` (`{session_id}-1`, `{session_id}-2`, ...), and
+    /// send no session id on other responses, as a real server does.
+    pub fn with_fresh_session_ids(mut self, on: bool) -> Self {
+        self.fresh_sessions = on;
+        self
+    }
+
+    /// Sessions opened so far with [`with_fresh_session_ids`](Self::with_fresh_session_ids).
+    pub fn sessions_opened(&self) -> u64 {
+        self.sessions_opened.load(Ordering::SeqCst)
+    }
+
+    /// The `Mcp-Session-Id` of every `DELETE` received so far, in order.
+    pub fn deleted_sessions(&self) -> Vec<String> {
+        self.deleted.lock().expect("deleted mutex").clone()
     }
 
     /// Resolve `tools/call` names case-insensitively against the tool list (`Delete_Repo` runs
@@ -193,7 +221,7 @@ impl FakeMcpServer {
 
     pub fn router(&self) -> Router {
         Router::new()
-            .route("/mcp", post(fake_handle))
+            .route("/mcp", post(fake_handle).delete(fake_delete))
             .with_state(self.clone())
     }
 
@@ -370,10 +398,33 @@ async fn fake_handle(
         )
             .into_response(),
     };
-    if let Ok(sid) = HeaderValue::from_str(&server.session_id) {
+    let assigned = if !server.fresh_sessions {
+        Some(server.session_id.clone())
+    } else if method_of(&parsed) == Some("initialize") {
+        let n = server.sessions_opened.fetch_add(1, Ordering::SeqCst) + 1;
+        Some(format!("{}-{n}", server.session_id))
+    } else {
+        None
+    };
+    if let Some(sid) = assigned.and_then(|s| HeaderValue::from_str(&s).ok()) {
         response.headers_mut().insert("mcp-session-id", sid);
     }
     response
+}
+
+async fn fake_delete(
+    axum::extract::State(server): axum::extract::State<FakeMcpServer>,
+    headers: HeaderMap,
+) -> StatusCode {
+    let Some(sid) = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    server
+        .deleted
+        .lock()
+        .expect("deleted mutex")
+        .push(sid.to_owned());
+    StatusCode::OK
 }
 
 // ---------------------------------------------------------------------------------------------

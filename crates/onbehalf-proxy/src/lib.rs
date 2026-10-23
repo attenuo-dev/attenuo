@@ -44,6 +44,10 @@
 //!    stream); and when every one of [`ProxyConfig::max_sessions`] session slots holds a live
 //!    binding, a response that would bind a new session is replaced by `503` with reason
 //!    `session_registry_full`. Expired bindings are reclaimed; live ones are never evicted.
+//!    One principal (root lease) holds at most [`ProxyConfig::max_sessions_per_principal`]
+//!    (default 64) live bindings; one more gets `429` with reason `too_many_sessions`, while
+//!    other principals keep working (SR-49). Either way the session the upstream just created
+//!    is deleted there with an MCP `DELETE`, best effort.
 //!
 //! 8. passes a `DPoP` proof (RFC 9449), with the method and path it must name, to
 //!    [`Authorizer::authenticate_request`] (SR-24). A token bound to a key (`cnf.jkt`) is
@@ -124,6 +128,6 @@ pub use config::{ProxyConfig, UpstreamConfig};
 pub use proxy::{
     router, serve, DECISION_ID_HEADER, REASON_INVALID_NAME, REASON_REQUEST_TOO_LARGE,
     REASON_SESSION_MISMATCH, REASON_SESSION_REGISTRY_FULL, REASON_TOOL_NOT_LISTED,
-    REASON_UPSTREAM_BODY_TOO_LARGE,
+    REASON_TOO_MANY_SESSIONS, REASON_UPSTREAM_BODY_TOO_LARGE,
 };
 pub use session::{SessionOwner, SessionRegistry};

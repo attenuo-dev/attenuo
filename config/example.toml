@@ -214,6 +214,10 @@ max_request_body_bytes = 4194304
 # session gets 503 session_registry_full; live sessions are never evicted to make room.
 session_ttl_seconds = 3600
 max_sessions = 100000
+# Live sessions one principal (one root grant and the agents it delegates to) may hold; one more
+# gets 429 too_many_sessions, and other users are unaffected. A session the proxy refuses is
+# deleted at the upstream.
+max_sessions_per_principal = 64
 
 [metrics]
 # Prometheus text endpoint on its OWN listener (GET /metrics), never on the proxy port.
