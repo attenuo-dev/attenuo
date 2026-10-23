@@ -195,6 +195,41 @@ fn check_all_reports_mixed_statuses() {
     }
 }
 
+/// The SQLite store reads every lease of a chain in one `IN (...)` query (in chunks for very
+/// long lists). Order, duplicates and unknown ids must come out as with one lookup per lease.
+#[test]
+fn check_all_batches_agree_with_per_lease_lookups() {
+    let exp = t0() + Duration::hours(1);
+    let leases: Vec<LeaseId> = (0..1100)
+        .map(|i| id(&format!("l{i}")))
+        .chain([id("l7"), id("unknown-1"), id("l3")])
+        .collect();
+    let refs: Vec<&LeaseId> = leases.iter().collect();
+    let mut results = Vec::new();
+    for (name, store) in stores() {
+        for (i, l) in leases.iter().take(1100).enumerate() {
+            let at = if i % 97 == 5 {
+                t0() - Duration::seconds(1)
+            } else {
+                exp
+            };
+            store.register(l, None, at).unwrap();
+        }
+        store.revoke(&id("l3"), "r", t0()).unwrap();
+        store.revoke(&id("l1050"), "r", t0()).unwrap();
+        let status = store.check_all(&refs, t0()).unwrap();
+        assert!(!status.active, "{name}");
+        assert_eq!(
+            status.revoked,
+            vec![id("l3"), id("l1050"), id("l3")],
+            "{name}"
+        );
+        assert_eq!(status.unknown, vec![id("unknown-1")], "{name}");
+        results.push(status);
+    }
+    assert_eq!(results[0], results[1], "memory and sqlite agree");
+}
+
 #[test]
 fn reregister_keeps_revocation() {
     for (name, store) in stores() {

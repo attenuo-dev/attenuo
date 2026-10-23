@@ -32,7 +32,8 @@ pub use export::{
 };
 pub use lease::{LeaseStatus, LeaseStore, MemoryLeaseStore};
 pub use log::{
-    compute_entry_hash, verify_entries, AuditEntry, AuditSink, VerifyReport, GENESIS_HASH,
+    compute_entry_hash, entry_hash_from_json, verify_entries, AuditEntry, AuditSink, VerifyReport,
+    GENESIS_HASH,
 };
 pub use memory::MemoryAudit;
 pub use sqlite::{Durability, SqliteAudit, SqliteLeaseStore};

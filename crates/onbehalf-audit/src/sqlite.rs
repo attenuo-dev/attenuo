@@ -21,7 +21,9 @@ use crate::checkpoint::{
 };
 use crate::error::AuditError;
 use crate::lease::{classify, LeaseRow, LeaseStatus, LeaseStore};
-use crate::log::{verify_entries, AuditEntry, AuditSink, VerifyReport, GENESIS_HASH};
+use crate::log::{
+    entry_hash_from_json, verify_entries, AuditEntry, AuditSink, VerifyReport, GENESIS_HASH,
+};
 
 const AUDIT_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS audit (
@@ -262,6 +264,29 @@ fn head_in(tx: &Transaction<'_>) -> Result<Option<AuditEntry>, AuditError> {
         .transpose()
 }
 
+/// `(seq, entry_hash)` of the newest row, for chaining the next append. Unlike [`head_in`] it
+/// does not decode and cross-check the row: checking stored entries is `verify_chain`'s job
+/// (and the signed checkpoints'), and decoding the head on every append cost more than the
+/// insert itself.
+fn head_link(tx: &Transaction<'_>) -> Result<(u64, String), AuditError> {
+    let link = tx
+        .prepare_cached("SELECT seq, entry_hash FROM audit ORDER BY seq DESC LIMIT 1")?
+        .query_row([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .optional()?;
+    match link {
+        None => Ok((0, GENESIS_HASH.to_string())),
+        Some((seq, hash)) => match u64::try_from(seq) {
+            Ok(seq) => Ok((seq, hash)),
+            Err(_) => Err(AuditError::Corrupt {
+                seq: 0,
+                detail: format!("negative seq {seq}"),
+            }),
+        },
+    }
+}
+
 fn query_entries(
     conn: &Connection,
     sql: &str,
@@ -455,20 +480,37 @@ impl Inner {
             Ok(tx) => tx,
             Err(e) => return Err((e.into(), records)),
         };
-        let head = match head_in(&tx) {
+        let (mut seq, mut prev_hash) = match head_link(&tx) {
             Ok(h) => h,
             Err(e) => return Err((e, records)),
         };
+        // Serialize each record once: the same text is hashed and stored as `record_json`.
+        let jsons = match records
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(j) => j,
+            Err(e) => return Err((e.into(), records)),
+        };
         let mut entries: Vec<AuditEntry> = Vec::with_capacity(records.len());
-        for record in records {
-            let entry = AuditEntry::next(entries.last().or(head.as_ref()), record);
+        for (record, json) in records.into_iter().zip(&jsons) {
+            seq += 1;
+            let entry_hash = entry_hash_from_json(seq, &prev_hash, json);
+            let entry = AuditEntry {
+                seq,
+                prev_hash: std::mem::replace(&mut prev_hash, entry_hash.clone()),
+                record,
+                entry_hash,
+            };
             entries.push(entry);
         }
         let mut created = Vec::new();
         let written = entries
             .iter()
-            .try_for_each(|entry| {
-                insert_entry(&tx, entry)?;
+            .zip(&jsons)
+            .try_for_each(|(entry, json)| {
+                insert_entry(&tx, entry, json)?;
                 if let Some(c) = self.checkpointing.as_ref().filter(|c| c.every > 0) {
                     if entry.seq.is_multiple_of(c.every) {
                         let cp = Checkpoint::sign(
@@ -498,7 +540,12 @@ impl Inner {
     }
 }
 
-fn insert_entry(tx: &Transaction<'_>, entry: &AuditEntry) -> Result<(), AuditError> {
+/// Insert `entry`, whose record serializes to `record_json`.
+fn insert_entry(
+    tx: &Transaction<'_>,
+    entry: &AuditEntry,
+    record_json: &str,
+) -> Result<(), AuditError> {
     let r = &entry.record;
     tx.prepare_cached(
         "INSERT INTO audit (seq, prev_hash, entry_hash, at, decision, reason, \
@@ -523,7 +570,7 @@ fn insert_entry(tx: &Transaction<'_>, entry: &AuditEntry) -> Result<(), AuditErr
         r.arguments_digest,
         r.session_id,
         serde_json::to_string(&r.policy_ids)?,
-        serde_json::to_string(r)?,
+        record_json,
     ])?;
     Ok(())
 }
@@ -887,6 +934,53 @@ fn binding_in(conn: &Connection, lease: &LeaseId) -> Result<Option<String>, Audi
         .optional()?)
 }
 
+/// Leases read per `IN (...)` query. SQLite allows 32766 parameters; chains are capped far
+/// below this, but a longer list still works, in chunks.
+const LEASES_PER_QUERY: usize = 64;
+
+/// `SELECT ... WHERE id IN (?,...,?)` with `n` placeholders, built once per `n`.
+fn leases_in_sql(n: usize) -> &'static str {
+    static SQL: OnceLock<Vec<String>> = OnceLock::new();
+    &SQL.get_or_init(|| {
+        (0..=LEASES_PER_QUERY)
+            .map(|n| {
+                format!(
+                    "SELECT id, parent, expires_at, revoked_at, revoke_reason FROM leases \
+                     WHERE id IN ({})",
+                    vec!["?"; n].join(",")
+                )
+            })
+            .collect()
+    })[n]
+}
+
+/// The rows of every lease in `leases`, with one query (`WHERE id IN (...)`) instead of one
+/// per hop. Unknown ids are absent from the result; order is unspecified.
+fn rows_in(conn: &Connection, leases: &[&LeaseId]) -> Result<Vec<(String, LeaseRow)>, AuditError> {
+    let mut out = Vec::with_capacity(leases.len());
+    for chunk in leases.chunks(LEASES_PER_QUERY) {
+        // One cached statement per chain length.
+        let mut stmt = conn.prepare_cached(leases_in_sql(chunk.len()))?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(
+            chunk.iter().map(|l| l.0.as_str()),
+        ))?;
+        while let Some(row) = rows.next()? {
+            let expires_at: String = row.get(2)?;
+            let revoked_at: Option<String> = row.get(3)?;
+            out.push((
+                row.get::<_, String>(0)?,
+                LeaseRow {
+                    parent: row.get::<_, Option<String>>(1)?.map(LeaseId),
+                    expires_at: parse_time(&expires_at)?,
+                    revoked_at: revoked_at.as_deref().map(parse_time).transpose()?,
+                    revoke_reason: row.get(4)?,
+                },
+            ));
+        }
+    }
+    Ok(out)
+}
+
 fn get_in(conn: &Connection, lease: &LeaseId) -> Result<Option<LeaseRow>, AuditError> {
     let mut stmt = conn.prepare_cached(
         "SELECT parent, expires_at, revoked_at, revoke_reason FROM leases WHERE id = ?1",
@@ -1010,7 +1104,16 @@ impl LeaseStore for SqliteLeaseStore {
         leases: &[&LeaseId],
         now: OffsetDateTime,
     ) -> Result<LeaseStatus, AuditError> {
-        let conn = self.conn.lock()?;
-        classify(leases, now, |id| get_in(&conn, id))
+        let rows = {
+            let conn = self.conn.lock()?;
+            rows_in(&conn, leases)?
+        };
+        // A chain has a handful of leases: a linear scan beats hashing them.
+        classify(leases, now, |id| {
+            Ok(rows
+                .iter()
+                .find(|(r, _)| *r == id.0)
+                .map(|(_, row)| row.clone()))
+        })
     }
 }

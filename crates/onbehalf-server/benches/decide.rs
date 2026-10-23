@@ -2,7 +2,7 @@
 //!
 //! The end-to-end harness (`onbehalf-bench`) measures the whole call through HTTP. This bench
 //! splits the server's share of it into the stages the proxy runs for every `tools/call`:
-//! token verification (`Verifier::verify`), the lease check (`Pipeline::check_leases`),
+//! token verification (`Verifier::verify`, and `ServerAuthorizer::authenticate` with its cache), the lease check (`Pipeline::check_leases`),
 //! policy (`PolicyEngine::authorize`), building the `DecisionRecord`, the audit append, and
 //! `Pipeline::decide` as a whole (leases, policy, record, append). Chains of 1 and 3 hops, the
 //! `onbehalf-bench` policy and catalog, SQLite stores in memory and in a temporary file
@@ -21,7 +21,8 @@ use onbehalf_core::{
     AgentId, Capability, CapabilitySet, Decision, DecisionRecord, OriginatingUser, ToolCall,
 };
 use onbehalf_policy::{ArgType, PolicyEngine, PolicyEngineBuilder, ToolAttrs, ToolCatalog};
-use onbehalf_server::Pipeline;
+use onbehalf_proxy::Authorizer;
+use onbehalf_server::{Pipeline, ServerAuthorizer};
 use onbehalf_token::{Issuer, IssuerConfig};
 use serde_json::json;
 use time::{Duration, OffsetDateTime};
@@ -166,7 +167,15 @@ fn bench_decide(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("decide");
     for store in stores() {
-        let pipeline = Pipeline::new(policy.clone(), store.leases.clone(), store.audit.clone());
+        let pipeline = Arc::new(Pipeline::new(
+            policy.clone(),
+            store.leases.clone(),
+            store.audit.clone(),
+        ));
+        let auth = ServerAuthorizer::new(verifier.clone(), pipeline.clone());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         for depth in [1usize, 3] {
             let tok = token(&issuer, store.leases.as_ref(), depth, now);
             let chain = verifier.verify(&tok, now).expect("verifies").chain;
@@ -176,6 +185,13 @@ fn bench_decide(c: &mut Criterion) {
             if s == "memory" {
                 group.bench_function(format!("verify/{depth}_hop"), |b| {
                     b.iter(|| verifier.verify(black_box(&tok), now).unwrap())
+                });
+                // What the proxy calls: verification behind the server's verified-token cache.
+                group.bench_function(format!("authenticate/{depth}_hop"), |b| {
+                    b.iter(|| {
+                        rt.block_on(auth.authenticate(black_box(&tok), now))
+                            .unwrap()
+                    })
                 });
                 group.bench_function(format!("policy/{depth}_hop"), |b| {
                     b.iter(|| {

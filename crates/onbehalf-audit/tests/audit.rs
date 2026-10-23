@@ -341,6 +341,23 @@ fn queries_by_subject_chain_and_lease() {
 
 // ---- persistence ----
 
+/// The SQLite sink hashes the record text it stores instead of serializing the record twice.
+/// That must be byte-for-byte the canonical hash, or `verify_chain` would reject the log.
+#[test]
+fn entry_hash_from_stored_json_equals_the_canonical_hash() {
+    use onbehalf_audit::entry_hash_from_json;
+    for i in 0..20 {
+        let r = record(i);
+        let json = serde_json::to_string(&r).unwrap();
+        for (seq, prev) in [(1, GENESIS_HASH), (u64::MAX, "ab\"c\\d"), (42, "")] {
+            assert_eq!(
+                entry_hash_from_json(seq, prev, &json),
+                compute_entry_hash(seq, prev, &r)
+            );
+        }
+    }
+}
+
 #[test]
 fn sqlite_persists_across_reopen() {
     let dir = tempfile::tempdir().unwrap();
