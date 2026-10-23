@@ -9,8 +9,11 @@
 //! 2. intercepts every request that can read data or cause an effect, asks the [`Authorizer`]
 //!    for a decision, forwards allowed ones upstream unchanged and answers denied ones with
 //!    JSON-RPC error `-32003` (`"onbehalf: denied: <reason>"`, `data: {reason, decision_id}`);
-//! 3. filters `tools/list` results down to the tools the caller's effective capabilities could
-//!    ever permit by name (see [`filter::could_permit_tool`]);
+//! 3. filters `tools/list`, `resources/list`, `resources/templates/list` and `prompts/list`
+//!    results down to the entries the caller's effective capabilities could ever permit, using
+//!    the same names the request mapping below uses (see [`filter::could_permit_tool`],
+//!    [`filter::could_permit_resource`], [`filter::could_permit_prompt`]); `nextCursor` is
+//!    passed through untouched;
 //! 4. forwards the remaining allowlisted methods transparently, preserving `Mcp-Session-Id`.
 //!    These, `tools/list` and `GET`/`DELETE` session requests are authenticated and
 //!    lease-checked ([`Authorizer::check_active`]) first, so a revoked token gets `401` there
@@ -60,8 +63,6 @@
 //!   leading SSE `message` events on the same stream.
 //! - The proxy does not add credentials for the upstream; the bearer token it receives is
 //!   onbehalf's, not the upstream's, and is never forwarded.
-//! - `resources/list`, `resources/templates/list` and `prompts/list` results are not filtered,
-//!   so they can reveal names and URIs the caller could not read.
 //! - A server-to-client stream (the `GET` SSE channel) is not inspected; the client's replies to
 //!   server requests are forwarded after a lease check, not authorized.
 //! - Authentication is performed per HTTP request; there is no caching of resolved chains.

@@ -1,5 +1,6 @@
-//! The axum router: authentication, `tools/call` interception, `tools/list` filtering, and
-//! transparent forwarding of everything else.
+//! The axum router: authentication, `tools/call` interception, list-result filtering
+//! (`tools/list`, `resources/list`, `resources/templates/list`, `prompts/list`), and transparent
+//! forwarding of everything else.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
 use futures_util::StreamExt;
-use onbehalf_core::{DelegationChain, ToolCall};
+use onbehalf_core::{CapabilitySet, DelegationChain, ToolCall};
 use serde_json::Value;
 use time::OffsetDateTime;
 use tower_http::trace::TraceLayer;
@@ -21,7 +22,7 @@ use uuid::Uuid;
 
 use crate::auth::{AuthError, Authorizer};
 use crate::config::ProxyConfig;
-use crate::filter::filter_tools_response;
+use crate::filter::{ListFilter, ListKind};
 use crate::jsonrpc::{
     self, denied_response, error_response, id_of, is_passthrough_method, is_request, method_of,
     CODE_INVALID_PARAMS, CODE_INVALID_REQUEST, CODE_PARSE_ERROR, CODE_UNAUTHORIZED,
@@ -359,8 +360,9 @@ struct Screened {
     replies: Vec<Value>,
     /// Decision ids of every `tools/call`, in request order.
     decision_ids: Vec<Uuid>,
-    /// Ids of `tools/list` requests, whose responses must be filtered.
-    tools_list_ids: Vec<Value>,
+    /// Ids and kinds of the list requests (`tools/list`, `resources/list`,
+    /// `resources/templates/list`, `prompts/list`), whose responses must be filtered.
+    list_requests: Vec<(Value, ListKind)>,
     /// Result of the lease check made for messages forwarded without a per-call decision;
     /// made at most once per HTTP request.
     lease_check: Option<Result<(), AuthError>>,
@@ -533,7 +535,7 @@ async fn handle_post_inner(
         Err(e) => return upstream_error(e),
     };
 
-    let needs_buffer = !screened.tools_list_ids.is_empty() || !screened.replies.is_empty();
+    let needs_buffer = !screened.list_requests.is_empty() || !screened.replies.is_empty();
     let is_json = resp
         .headers()
         .get(header::CONTENT_TYPE)
@@ -544,9 +546,9 @@ async fn handle_post_inner(
     let mut response = if needs_buffer && is_json {
         buffer_and_rewrite(resp, chain, server, &screened, is_batch).await
     } else {
-        if !screened.tools_list_ids.is_empty() {
+        if !screened.list_requests.is_empty() {
             tracing::warn!(
-                "upstream answered tools/list over a non-JSON response; passing through \
+                "upstream answered a list request over a non-JSON response; passing through \
                  unfiltered (v0 limitation)"
             );
         }
@@ -586,8 +588,10 @@ async fn screen_message(
         if !lease_live(state, chain, &msg, now, out).await {
             return;
         }
-        if method == jsonrpc::METHOD_TOOLS_LIST && is_request(&msg) {
-            out.tools_list_ids.push(id_of(&msg));
+        if let Some(kind) = ListKind::from_method(&method) {
+            if is_request(&msg) {
+                out.list_requests.push((id_of(&msg), kind));
+            }
         }
         out.forward.push(msg);
         return;
@@ -714,7 +718,7 @@ async fn lease_live(
     }
 }
 
-/// Read a JSON upstream response fully, filter `tools/list` results and merge in the replies
+/// Read a JSON upstream response fully, filter list results and merge in the replies
 /// the proxy generated for a batch, then re-encode.
 async fn buffer_and_rewrite(
     resp: reqwest::Response,
@@ -737,23 +741,12 @@ async fn buffer_and_rewrite(
         }
     };
 
-    let caps = chain.effective_capabilities();
-    let mut filter = |v: &mut Value| {
-        if screened.tools_list_ids.contains(&id_of(v)) {
-            if let Some(caps) = caps {
-                let removed = filter_tools_response(v, caps, server);
-                tracing::debug!(removed, "filtered tools/list");
-            } else {
-                // A chain with no hops has no capabilities: list nothing.
-                if let Some(r) = v.get_mut("result") {
-                    r["tools"] = Value::Array(vec![]);
-                }
-            }
-        }
-    };
-    match &mut value {
-        Value::Array(items) => items.iter_mut().for_each(&mut filter),
-        other => filter(other),
+    // A chain with no hops has no capabilities: list nothing.
+    let no_caps = CapabilitySet::new();
+    let caps = chain.effective_capabilities().unwrap_or(&no_caps);
+    let removed = ListFilter::new(&screened.list_requests, caps, server).apply(&mut value);
+    if removed > 0 {
+        tracing::debug!(removed, "filtered list result");
     }
 
     if !screened.replies.is_empty() || (is_batch && !value.is_array()) {
