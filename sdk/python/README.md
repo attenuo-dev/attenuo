@@ -16,6 +16,8 @@ Python 3.10 or newer.
 Start a server with the example config (`[dev] allow_root_mint = true` for the dev root token) and an MCP upstream, as in [getting started](../../docs/guides/getting-started.md). Then:
 
 ```python
+import os
+
 from onbehalf import AdminClient, Capability, Client, Denied, Prefix
 
 URL = "http://127.0.0.1:8080"
@@ -27,11 +29,13 @@ root = admin.mint_root_dev("alice", "https://idp.example", "planner", ["github:*
 
 with Client(URL) as ob:
     # The planner hands the coder read_file on alice's public repos only.
+    # The coder authenticates as itself with its [[agents]] secret.
     coder = ob.exchange(
         root,
         "coder",
         [Capability("github", "read_file", repo=Prefix("alice/public-"))],
         ttl_seconds=600,
+        client_secret=os.environ["CODER_SECRET"],
     )
     print(coder.chain.agents, coder.lease)  # ('planner', 'coder') <lease id>
 
@@ -58,7 +62,7 @@ print(admin.audit_verify())  # VerifyReport(ok=True, entries=..., ...)
 | Call | Does |
 | --- | --- |
 | `Client(server_url, token=None, timeout=30)` | HTTP client for the server. `token` is a default bearer. |
-| `exchange(subject_token, actor, capabilities, ttl_seconds=None, client_id=None, client_secret=None)` | RFC 8693 exchange. Returns a `Token`. With `client_id` and `client_secret` it is a hop-0 exchange of an IdP credential (`subject_token_type="...:id-jag"` for an ID-JAG). |
+| `exchange(subject_token, actor, capabilities, ttl_seconds=None, client_id=None, client_secret=None)` | RFC 8693 exchange. Returns a `Token`. From a delegation token, `client_secret` is the actor's `[[agents]]` secret (`client_id` defaults to `actor`), which the server requires by default. From any other subject token, `client_id` and `client_secret` make it a hop-0 exchange of an IdP credential (`subject_token_type="...:id-jag"` for an ID-JAG). A parent token can be exchanged for a given actor once. |
 | `renew(token)` | `POST /token/renew`. Returns `Lease(lease, expires_at, expires_in)`. |
 | `call_tool(token, server, tool, arguments, session_id=None)` | `tools/call` through `/mcp/{server}`. Returns `ToolResult` (`.text`, `.content`, `.is_error`, `.decision_id`). |
 | `list_tools(token, server)` | `tools/list`, filtered by the proxy to what the token may call. |

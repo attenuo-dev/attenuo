@@ -49,6 +49,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 - BREAKING: off a loopback `listen` address the server refuses to start without a strong admin token (at least 32 bytes, not a published placeholder); `ONBEHALF_ADMIN_TOKEN` overrides `[admin] token`, and `config/example.toml` ships no token (SR-15).
 - BREAKING: an `Mcp-Session-Id` the proxy did not see the upstream assign gets 404; one bound to another principal gets 403 (SR-11). `onbehalf_proxy::Authorizer` gained `record_rejection` (with a default), and `LeaseStore` gained `bind` and `binding`.
 - Policy test files take `unknown_tools`, and pick up `[policy] unknown_tools` from a server config named as `catalog`.
+- Python SDK: `exchange(..., client_secret=...)` from a delegation token authenticates the actor (`client_id` defaults to `actor`) and stays a hop n+1 exchange; client credentials only make it hop 0 when the subject token is not an onbehalf token. The examples and the integration test pass the demo agents' secrets; the demo config registers a `tester` agent.
 
 ### Deprecated
 
