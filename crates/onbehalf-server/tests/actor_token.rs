@@ -605,3 +605,48 @@ async fn refused_exchange_does_not_consume_the_actor_token() {
     let (status, v) = h.with_actor_token(&root, "coder", &svid).await;
     assert_eq!(status, StatusCode::OK, "{v}");
 }
+
+/// SR-44 (security review pass 4): an exchange refused because the parent already delegated
+/// to this actor does not use up the actor token either. The two are recorded together, as
+/// at hop 0.
+#[tokio::test]
+async fn exchange_refused_as_a_replay_does_not_consume_the_actor_token_sr44() {
+    let h = Harness::start(|_| {}).await;
+    let root = h.root_token().await;
+    let (status, v) = h
+        .with_actor_token(&root, "coder", &h.keys.svid(CODER_ID))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    // The same parent to the same actor again: refused as a replay of the parent...
+    let fresh = h.keys.svid(CODER_ID);
+    let (status, v) = h.with_actor_token(&root, "coder", &fresh).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(code(&v), ("invalid_grant", "replayed"), "{v}");
+    // ...and the fresh actor token is still good for an exchange of another parent.
+    let (status, v) = h
+        .with_actor_token(&h.root_token().await, "coder", &fresh)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+}
+
+/// SR-45 (security review pass 4): the agent id `onbehalf`, reserved for the server's own
+/// audit records (SR-34), cannot receive a delegation, even when an `[[actor_trust]]` mapping
+/// yields it.
+#[tokio::test]
+async fn an_actor_token_mapped_to_the_reserved_agent_id_is_refused_sr45() {
+    let h = Harness::start(|cfg| {
+        if let SubjectToAgent::Map(m) = &mut cfg.actor_trust[0].subject_to_agent {
+            m.insert(
+                "spiffe://example.org/ns/agents/sa/onbehalf".into(),
+                "onbehalf".into(),
+            );
+        }
+    })
+    .await;
+    let svid = h.keys.svid("spiffe://example.org/ns/agents/sa/onbehalf");
+    let (status, v) = h
+        .with_actor_token(&h.root_token().await, "onbehalf", &svid)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(code(&v), ("invalid_request", "reserved_agent"), "{v}");
+}

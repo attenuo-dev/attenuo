@@ -98,6 +98,28 @@ async fn run(cli: Cli) -> Result<Outcome> {
             print_token(&resp, a.print, json);
             Ok(Outcome::Ok)
         }
+        Command::Token(TokenCmd::SignOff(a)) => {
+            let client = client?;
+            let subject_token = secrets::resolve_token(
+                "--subject-token",
+                a.subject_token.clone(),
+                a.subject_token_file.as_deref(),
+                &mut stdin,
+            )?;
+            let proof = dpop_key::sign_off(
+                &client.token_url(),
+                &subject_token,
+                &a.dpop_key,
+                &a.child_jkt,
+                &a.actor,
+            )?;
+            if json {
+                print_json(&json!({"subject_token_dpop": proof}));
+            } else {
+                println!("{proof}");
+            }
+            Ok(Outcome::Ok)
+        }
         Command::Token(TokenCmd::Exchange(a)) => {
             let client = client?;
             let subject_token = secrets::resolve_token(
@@ -143,13 +165,20 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 body["client_id"] = a.client_id.unwrap_or_else(|| a.actor.clone()).into();
                 body["client_secret"] = secret.into();
             }
+            let given = a
+                .subject_token_dpop_file
+                .as_deref()
+                .map(|p| secrets::from_file("subject_token_dpop", p))
+                .transpose()?;
             let (header, sign_off) = dpop_key::exchange_proofs(
                 &client.token_url(),
                 &subject_token,
+                &a.actor,
                 a.dpop_key.as_deref(),
                 a.subject_dpop_key.as_deref(),
+                given.is_some(),
             )?;
-            if let Some(proof) = sign_off {
+            if let Some(proof) = sign_off.or(given) {
                 body["subject_token_dpop"] = proof.into();
             }
             let resp = client.exchange(&body, header).await?;

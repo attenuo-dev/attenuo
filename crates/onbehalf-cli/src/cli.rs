@@ -87,6 +87,11 @@ pub enum TokenCmd {
     Root(RootArgs),
     /// RFC 8693 exchange: delegate a subset of a token's capabilities to a sub-agent.
     Exchange(ExchangeArgs),
+    /// Consent, as the holder of a DPoP-bound token, to one exchange of it that binds the new
+    /// token to a sub-agent's own key. Prints the proof to pass as
+    /// `token exchange --subject-token-dpop-file`; it names the key and the agent, is good for
+    /// one exchange, and expires with the server's DPoP window (default 5 minutes).
+    SignOff(SignOffArgs),
     /// Decode a token and show its delegation chain as a tree.
     Inspect(InspectArgs),
 }
@@ -238,9 +243,15 @@ pub struct ExchangeArgs {
     pub dpop_key: Option<std::path::PathBuf>,
     /// The parent token's DPoP key, when it differs from `--dpop-key`: its proof goes in the
     /// body as `subject_token_dpop`, the parent holder's consent to binding the new token to
-    /// another key.
-    #[arg(long, value_name = "PATH")]
+    /// `--dpop-key` for `--actor`. Only when one party holds both keys; otherwise the parent
+    /// makes the consent with `onbehalf token sign-off` and you pass it with
+    /// `--subject-token-dpop-file`.
+    #[arg(long, value_name = "PATH", conflicts_with = "subject_token_dpop_file")]
     pub subject_dpop_key: Option<std::path::PathBuf>,
+    /// The parent holder's consent (`subject_token_dpop`) made with `onbehalf token sign-off`
+    /// for this exchange's `--dpop-key` and `--actor`, read from the first line of this file.
+    #[arg(long, value_name = "PATH")]
+    pub subject_token_dpop_file: Option<std::path::PathBuf>,
     /// Print only this value, for scripts.
     #[arg(long, value_enum)]
     pub print: Option<Field>,
@@ -276,6 +287,27 @@ impl ExchangeArgs {
     pub fn may_act(&self) -> Vec<String> {
         split_agents(&self.may_act)
     }
+}
+
+#[derive(Debug, Args)]
+pub struct SignOffArgs {
+    /// The bound token to be exchanged (the parent), or `-` to read it from the first line of
+    /// stdin. Without this flag or `--subject-token-file`, `ONBEHALF_TOKEN` is used.
+    #[arg(long, conflicts_with = "subject_token_file")]
+    pub subject_token: Option<String>,
+    /// Read the parent token from the first line of this file.
+    #[arg(long, value_name = "PATH")]
+    pub subject_token_file: Option<std::path::PathBuf>,
+    /// The parent token's DPoP key (a private JWK).
+    #[arg(long, value_name = "PATH")]
+    pub dpop_key: std::path::PathBuf,
+    /// Thumbprint (`jkt`) of the sub-agent's key, which the new token will be bound to
+    /// (`onbehalf key gen --dpop` prints it).
+    #[arg(long, value_name = "JKT")]
+    pub child_jkt: String,
+    /// The sub-agent that will exchange the token for itself.
+    #[arg(long)]
+    pub actor: String,
 }
 
 #[derive(Debug, Args)]

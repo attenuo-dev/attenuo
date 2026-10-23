@@ -123,8 +123,27 @@ async def test_client_attaches_proofs_and_binds_on_exchange(make: Any) -> None: 
     header, claims = verify(rec.body()["subject_token_dpop"])
     assert jwk_thumbprint(header["jwk"]) == parent_key.thumbprint
     assert claims["ath"] == access_token_hash(other)
+    # SR-40: the sign-off names the new token's key and agent.
+    assert claims["child_jkt"] == key.thumbprint and claims["child_actor"] == "coder"
     with pytest.raises(OnbehalfError):
         await call(client, "exchange", other, "coder", ["github:read_file"], subject_dpop_key=key)
+
+    # A sign-off made by the parent's holder elsewhere is passed through as it is.
+    detached = parent_key.sign_off(f"{BASE}/token", other, key.thumbprint, "coder")
+    await call(
+        client, "exchange", other, "coder", ["github:read_file"], subject_token_dpop=detached
+    )
+    assert rec.body()["subject_token_dpop"] == detached
+    with pytest.raises(OnbehalfError):
+        await call(
+            client,
+            "exchange",
+            other,
+            "coder",
+            ["github:read_file"],
+            subject_dpop_key=parent_key,
+            subject_token_dpop=detached,
+        )
 
     # Every use of a token carries a proof for that request.
     await call(client, "call_tool", child, "github", "read_file", {})

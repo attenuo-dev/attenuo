@@ -1,0 +1,99 @@
+# Security review, pass 4
+
+- Date: 2026-10-23
+- Branch: `review/security-pass-4` (base: `0ff8177` on main)
+- Related: [pass 1 and 2](security-review-2026-10-22.md), [pass 3](security-review-2026-10-23.md), [RFC-0001](../spec/rfc-0001-onbehalf.md), [threat model](../spec/threat-model.md), [task board](../tasks/board.md)
+
+## Scope and method
+
+Everything that merged after pass 3, and the pass 3 fixes themselves:
+
+- SR-24 DPoP (`crates/onbehalf-token/src/dpop.rs`, `crates/onbehalf-server/src/dpop.rs`, the exchange in `routes/token.rs`, the proxy's `auth.rs`/`guard.rs`, the CLI's `dpop_key.rs`, both SDKs);
+- the verified-token cache (`crates/onbehalf-server/src/authz.rs`);
+- SR-13 server-scoped actions, SR-25 names and `ListedTools` (`onbehalf_core::names`, `crates/onbehalf-proxy/src/proxy.rs`);
+- SR-14 `ou_sig` v2, hop-0 actor tokens and `ReplayCache::use_all_once`;
+- SR-17 reason-only errors, SR-18 log formatting, SR-19 `public_url`, SR-34 reserved names, SR-35 CLI secrets;
+- the audit group-commit writer and `[audit] durability` (`crates/onbehalf-audit/src/sqlite.rs`);
+- SR-36 session registry limits and its 503;
+- the injection suite (`docs/evaluation/injection-suite.md`) and the claims in the framework examples' READMEs.
+
+The attacker was taken as each of: (a) the holder of a valid child token, (b) a compromised sub-agent with its own credentials, (c) a thief holding a copied bound token but not its key, (d) a network position between client and server, (e) an upstream MCP server, (f) a power failure. Every finding fixed here has a regression test that fails on the base commit and passes on this branch (run against a copy of the base sources). Findings are numbered from SR-40.
+
+Not changed on this branch: `crates/onbehalf-policy/src/*` and `crates/onbehalf-audit/src/*`, which another branch was editing at the time (entity caching, the WAL checkpoint thread). Findings there are Open with the file and function to change, and are listed on the [task board](../tasks/board.md).
+
+## Summary
+
+| Severity | Found | Fixed here | Open | Accepted |
+|---|---|---|---|---|
+| Critical | 0 | 0 | 0 | 0 |
+| High | 0 | 0 | 0 | 0 |
+| Medium | 1 | 1 | 0 | 0 |
+| Low | 10 | 8 | 2 | 0 |
+| Info | 4 | 0 | 2 | 2 |
+| **Total** | **15** | **9** | **4** | **2** |
+
+The one Medium finding is in DPoP:
+
+- **SR-40.** An exchange's `subject_token_dpop` (the parent holder's consent to bind the child to another key) said nothing about which key or agent. The documented flows (CLI `--subject-dpop-key`, SDK `subject_dpop_key`) also needed the parent's private key in the sub-agent's process, which defeats binding the parent at all.
+- Fixed: the sign-off now names `child_jkt` and `child_actor`. The parent makes it in its own process (`onbehalf token sign-off`, `DpopKey.sign_off` / `signOff`) and hands over only the result.
+
+The Low findings fixed here:
+
+- DPoP replay-cache lockout by wrong-key proofs (SR-41)
+- `htu` built from an attacker-chosen `Host` (SR-42)
+- storage error text in 500 bodies (SR-43)
+- an actor token burnt by a refused exchange (SR-44)
+- the reserved agent id `onbehalf` accepted as an exchange actor (SR-45)
+- the verified-token cache bounded by count but not bytes (SR-46)
+- the proxy reporting a full replay cache as a bad proof (SR-47)
+- the cost of `durability = "normal"` missing from RFC P4 and the threat model (SR-48)
+
+Open:
+
+- a per-principal session cap (SR-49)
+- two audit-crate items, for the branch that owns that crate (SR-50, SR-51)
+- the framework examples reading any `-32003` as onbehalf's denial (SR-53)
+
+No finding in `onbehalf-policy`.
+
+## Findings
+
+| ID | Severity | Component | Description | Exploit scenario | Recommended fix | Status |
+|---|---|---|---|---|---|---|
+| SR-40 | Medium | server (`dpop.rs` `bind_exchange`), token (`dpop.rs`), CLI, SDKs | When an exchange binds the child to a key other than the parent's, `subject_token_dpop` had to be a proof by the parent's key with `ath` of the parent token, for `POST /token`. Nothing in it named the child's key or the `actor`, so it was consent to *any* new binding by *anyone* holding it, within `dpop_max_age` (300 s). Worse, the only ways the CLI and SDKs could produce it (`--subject-dpop-key`, `subject_dpop_key`, `subjectDpopKey`) signed it in the process doing the exchange, so the guide and READMEs had the sub-agent hold the parent's private key. | Planner P (bound to key Kp) delegates to coder C (key Kc). Following the guide, C's process loads Kp to sign off. A compromised C (attacker b) now has P's root token and P's key: it can act as P, and mint children under P's authority bound to any key. Or, if P signs off elsewhere and sends the proof to C over a channel the attacker reads, the attacker races C with the same sign-off, its own `DPoP` key and its own agent's credentials: the server accepts it (the `jti` is new to the server), and the attacker gets a child of P's token bound to its own key. | Make the sign-off name the child key's thumbprint and the agent, and check both; let the parent make it without the child. | Fixed on this branch: `DpopKey::sign_off` adds `child_jkt` and `child_actor`; `bind_exchange` requires both to match the `DPoP` header's key and `actor` (`invalid_dpop_proof` otherwise). New `onbehalf token sign-off`, `token exchange --subject-token-dpop-file`, `DpopKey.sign_off`/`signOff` and `subject_token_dpop`/`subjectTokenDpop` in the SDKs. Tests `a_sign_off_is_good_only_for_the_key_and_agent_it_names_sr40` (`security_pass4.rs`), `exchange_binding_rule`, `sign_off_names_the_child_key_and_actor`, `exchange_proofs_follow_the_binding_rule` (CLI), SDK unit and integration tests (`test_dpop.py`, `dpop.test.ts`, both `integration` suites) |
+| SR-41 | Low | server (`dpop.rs` `check_presented`) | A presented token's proof was verified and its `jti` written to the replay cache before the proof's key was compared with the token's `cnf.jkt`. | A thief with a copy of a bound token but not the key (attacker c) sends proofs signed by its own key with fresh `jti`s. Each is refused with 401, but each fills a slot. Once `[token] dpop_replay_capacity` slots are full, every DPoP request by every client is 503 until the window passes: one stolen token, a server-wide lockout. | Record the `jti` only after every check, including the key match. | Fixed: `check` (verify only), the `cnf` comparison, then `use_once`. Exchange proofs are recorded together (`use_all_once`). Tests `wrong_key_proofs_cannot_lock_out_the_key_holder_sr41`, `wrong_key_proofs_do_not_fill_the_replay_cache` |
+| SR-42 | Low | server (`dpop.rs` `expected_url`) | Without `[server] public_url` (allowed on loopback, SR-19), the URL a proof's `htu` must match was `http://<Host header>/<path>`, with the `Host` taken from the request. | A proof captured on its way to `https://mcp.other.example/token` (attacker d) is replayed here with `Host: mcp.other.example`: the `htu` check passes. The proof's own `ath` and the `jti` cache still apply, so the gain is narrow (only proofs this server has not seen), but `htu` is meant to stop exactly this. | Trust the `Host` header only when it names loopback; otherwise expect `localhost`. | Fixed: `Host` is used only when `config::is_loopback_host` accepts it. Tests `a_proof_for_another_host_is_refused_sr42`, `htu_takes_only_a_loopback_host` |
+| SR-43 | Low | server (`error.rs` `ApiError::internal`, `routes/token.rs`) | Every 500 put the internal error's text in `detail`: SQLite messages, file paths (for example a failed policy reload names `policies.cedar` under the config directory), and in an exchange the lease-store error (`lease_error`). SR-17 had removed this from 401s only. | An admin-token holder, or any caller who can trigger a storage error (disk full, a locked database), learns file system paths and the database state. Minor on its own; it helps target other attacks. | Log the detail; return a fixed message. | Fixed: `ApiError::internal` logs the detail (Debug-formatted) and returns `INTERNAL_DETAIL`; the exchange maps a lease-store error to `ApiError::internal`. Tests `internal_errors_do_not_reveal_paths_sr43`, `internal_errors_keep_their_detail_in_the_log` |
+| SR-44 | Low | server (`routes/token.rs` `exchange_sync`) | An exchange consumed the actor token (`use_once` on its replay key) and then, separately, checked the exchange's own replay key. When the second check refused (a replayed exchange), the actor token was already burnt. | An agent retries an exchange whose response it lost, with a fresh JWT-SVID. The retry is rightly refused as `replayed` (a parent is exchanged once per actor), but the fresh SVID is spent too, so the agent's next, legitimate exchange fails until it fetches yet another SVID. No privilege is gained; a refused request had a side effect it should not have. | Consume both keys in one `use_all_once`, all or nothing. | Fixed. Test `exchange_refused_as_a_replay_does_not_consume_the_actor_token_sr44` (`actor_token.rs`) |
+| SR-45 | Low | server (`routes/token.rs` `exchange_sync`) | SR-34 reserved the agent id `onbehalf` (it is the agent of the server's own audit records), and startup refuses it in `[[agents]]`. But an exchange with `[token] require_actor_auth = false`, or an `[[actor_trust]]` mapping whose `agent_id_template` produces `onbehalf`, issued a token whose current agent is `onbehalf`. | Audit records of that token's calls carry `agent = "onbehalf"`, the same as the server's own records, so a reviewer filtering out "server" activity misses them. | Refuse `actor == "onbehalf"` in the exchange. | Fixed: 400 `invalid_request`, `reserved_agent`. Tests `the_reserved_agent_id_cannot_receive_a_delegation_sr45`, `an_actor_token_mapped_to_the_reserved_agent_id_is_refused_sr45` |
+| SR-46 | Low | server (`authz.rs` `VerifiedTokens`) | The verified-token cache held up to 4096 entries, each with the whole verified token (claims and chain), and no limit on the size of one entry. Token size is bounded only by the request body limit and the capabilities a root grant allows. | A holder of a root grant with large argument constraints mints tokens of hundreds of KiB and presents many distinct ones (each exchange makes a new one), pinning up to 4096 times that in memory. Not a bypass; a memory amplifier. | Do not cache tokens above a size limit. | Fixed: `VERIFIED_TOKEN_MAX_BYTES` (16 KiB); larger tokens are verified on every request. Test `oversized_tokens_are_verified_but_not_cached` |
+| SR-47 | Low | proxy (`auth.rs`, `guard.rs`, `proxy.rs` `unauthorized`) | When the server's DPoP replay cache was full, the proxy answered 401 `invalid_dpop_proof`, which tells a client its key or proof is wrong. The server's own routes answer 503. | A client following RFC 9449 discards its key or token and re-authenticates, adding load during exactly the condition (SR-41-style flooding) that filled the cache. | Answer 503 with a reason and `Retry-After`. | Fixed: `AuthError::Unavailable`; the proxy answers HTTP 503, JSON-RPC `-32006`, `data.reason` `dpop_replay_cache_full`, `Retry-After: 5`. Test `a_full_dpop_replay_cache_is_503_at_the_proxy_sr47` |
+| SR-48 | Low | docs (RFC-0001 P4, threat model) | At `[audit] durability = "normal"` (the default) a decision is answered, and an allowed call forwarded, once its record is committed, but the commit is not synced. P4 said "every decision ... is appended", and the threat model did not mention the gap; only the deploy guide did. | After a power failure the log verifies cleanly but lacks the newest calls, which did run. A reader of the RFC would assume they were recorded. | State it in P4 and the threat model. | Fixed: RFC P4 and the threat model's residual risks say it, and point to `durability = "full"` |
+| SR-49 | Low | proxy (`session.rs` `SessionRegistry::bind`, `proxy.rs` `adopt_session`) | SR-36 made a full registry refuse instead of evict, but there is no per-principal cap: one user (one root lease) can open `max_sessions` sessions (default 100000) and leave every other user with 503 `session_registry_full` until the session TTL passes. And when `adopt_session` replaces an upstream's successful `initialize` with 503, the session the upstream created is left open there. | A holder of any valid token (attacker a) loops `initialize`. Each is a new upstream session bound to them; after 100000 the proxy refuses new sessions to everyone. Each refused attempt also leaks an upstream session. | Add `[proxy] max_sessions_per_principal` (count per `SessionOwner` in `SessionRegistry`, refuse in `bind` with a distinct reason). When `adopt_session` refuses, send the upstream a `DELETE` for the session it created. | Open (on the board) |
+| SR-50 | Low | audit (`sqlite.rs` `Inner::commit`) | A batch that creates a checkpoint commits at the store's `synchronous` setting and then hands the checkpoint to the `on_created` hook (the way checkpoints get shipped off the host). At `normal`, the hook can export a checkpoint whose rows are not yet synced. | Power failure after the hook ran: the log comes back shorter, new records reuse those `seq`s with different hashes, and the shipped checkpoint now disagrees with the log. `audit verify` against it reports tampering that did not happen, which trains operators to ignore that alarm. | Commit a batch that creates a checkpoint with `synchronous=FULL` (as revocations do), or call the hook only after the next synced commit. | Open (audit crate; on the board) |
+| SR-51 | Info | audit (`sqlite.rs` `SqliteLeaseStore::revoke`) | `revoke` raises `synchronous` to `FULL`, revokes, then restores the setting with `?`. If the restore fails, `revoke` returns an error although the revocation committed. | The admin sees a failed revocation that took effect; a retry is harmless. It errs in the safe direction. | Return the revocation's result; log a failed restore. | Open (audit crate; on the board) |
+| SR-52 | Info | server, proxy (`auth.rs`) | A bound token is accepted with `Authorization: Bearer` when a valid proof accompanies it. RFC 9449 §7.1 says a DPoP-bound token uses the `DPoP` scheme. | None: the token's `cnf`, not the scheme, decides that a proof is required, so `Bearer` does not skip the check (`check_presented` reads `cnf` whatever the scheme). | None; documented in RFC-0001 §4.1. | Accepted |
+| SR-53 | Info | examples (`examples/langchain-agent/agent.py` `denial_of`, `examples/claude-agent-sdk/agent.py` `_denial`) | The examples read any JSON-RPC `-32003` as onbehalf's denial and print its `reason` and `decision_id`. The SDKs stopped doing this in SR-32 (they require the `x-onbehalf-decision-id` header to match). | A malicious upstream answers with its own `-32003` and a reason of its choosing; the example shows it as an onbehalf decision. Demo code only, but people copy it. | Check that `data.decision_id` is in the response's `x-onbehalf-decision-id` header, as the SDKs do, or use the SDK's `Denied`. | Open |
+| SR-54 | Info | server (`dpop.rs`) | The 401 `detail` for `invalid_dpop_proof` carries the `DpopError` text, which includes the proof's own `alg` value. SR-17 reduced other 401s to a reason code. | None found: the text names which check failed, the only request data in it is the caller's own `alg`, and it is JSON-encoded. It helps client authors. | None. | Accepted |
+
+## Verified fixed from earlier passes
+
+- **SR-13, SR-25.** Actions are `Action::"<server>/<tool>"`. `ListedTools` is kept per upstream, filled only from `tools/list` responses that answer a pending request id, and names are ASCII `[A-Za-z0-9_.-]`, compared exactly. An upstream can only list its own tools, and an agent cannot add to the set.
+- **SR-14.** `ou_sig` v2 signs `"onbehalf-ou-v2"`, the issuer, the canonical originating user and the root hop, with length framing, under a `kid`. Root-hop substitution and cross-issuer reuse fail, and v1 signatures are refused.
+- **Hop-0 actor tokens.** Intake checks the actor token with the IdP credential and consumes both replay keys in one `use_all_once`: all or nothing, duplicates counted as a replay. Exchanges did not use it (SR-44, fixed).
+- **SR-17, SR-18, SR-19.** 401s are reason codes. Caller-controlled log fields are Debug-formatted. Off loopback, the server refuses to start without `public_url`. 500s and the DPoP `Host` fallback were the remaining gaps (SR-43, SR-42).
+- **SR-23.** `tools/list` and the other list results are filtered inside SSE streams too (`every_list_is_filtered_over_sse_single_event`). The pass 1 status said Open; it is fixed.
+- **SR-24.** Proofs are checked for `typ`, `alg`, signature, `htm`, `htu`, `iat` (in both directions), `ath` and key. A bound token needs a proof on every route, and a child of a bound token is always bound. The gaps were the sign-off (SR-40) and the order of the replay record (SR-41).
+- **SR-34.** `onbehalf` is refused at startup as an upstream, catalog entry and root-grant capability, and as an `[[agents]]`, `[[peps]]` or `[[root_grants]]` agent id. `urn:onbehalf:` subjects are refused at intake. The exchange actor was the gap (SR-45).
+- **SR-35.** Key files are written with mode 0600 and `create_new`, and token and secret flags take stdin or files. The demo and examples use `mktemp -d`.
+- **SR-36.** A full registry refuses with 503 and never evicts a live binding, and expired bindings are reclaimed oldest first. The remaining gap is per principal (SR-49).
+
+Still open from earlier passes, not re-examined here: SR-20 (canonical JSON) and SR-21 (checkpoints are signed but not shipped off the host).
+
+## Checked and found sound
+
+- **Verified-token cache.** Keyed by SHA-256 of the token. A hit re-checks expiry (`validate_at`) and the chain's leases, and returns the stored `cnf`, so a cached bound token still needs a proof. Verifier keys are fixed at startup (there is no runtime key reload), so a cached entry cannot outlive a key that stopped being trusted.
+- **DPoP replay cache.** Entries are 16-byte digests per key and `jti`, bucketed by time and dropped once outside the `iat` window. It fails closed when full. `use_all_once` either records every key or none.
+- **Audit group commit.** One writer thread serializes appends in order. A batch is one `IMMEDIATE` transaction, and if the batch fails each record is retried alone, so a bad record cannot take others down with it. Every caller gets its own result, and a decision is answered only after its record commits. Revocations commit with `synchronous=FULL`. The gaps are durability, not ordering (SR-48, SR-50).
+- **CLI.** `token sign-off` checks the key matches the token's `cnf.jkt` before signing. Export uses a fixed `to`. Secrets are never echoed.
+- **Injection suite and examples.** The suite's claims match what the tests assert: each scenario names the policy that stops it, and the "not stopped" cases (permitted reads that are exfiltrated, server-internal misbehaviour) are listed as such. The framework examples' READMEs claim only what their dry-run checks assert. The one weakness is how they read denials (SR-53).

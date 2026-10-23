@@ -23,7 +23,7 @@ Generate a key for each agent. The file is a private JWK, written with mode 0600
 $ onbehalf key gen --dpop assistant.jwk
 wrote DPoP key assistant.jwk (EdDSA)
 jkt  4MMDxQj9pafXPrWH6dxBeoSk2DpHFpEZvXvsmr6JibU
-$ onbehalf key gen --dpop coder.jwk
+$ CODER_JKT=$(onbehalf --json key gen --dpop coder.jwk | jq -r .jkt)
 ```
 
 Mint a root token bound to the assistant's key (the dev endpoint; with an IdP, pass `--dpop-key` to the hop-0 `token exchange` instead):
@@ -35,15 +35,22 @@ ROOT=$(onbehalf token root --subject alice --agent assistant --cap 'github:*' \
 
 `onbehalf token inspect` shows the binding: `bound to DPoP key jkt 4MMDxQj9…`.
 
-The assistant delegates to a coder that has its own key. A child of a bound token is always bound, so the exchange names the coder's key with `--dpop-key`, and the assistant agrees to the new binding with a proof by its own key (`--subject-dpop-key`):
+The assistant delegates to a coder that has its own key. A child of a bound token is always bound, so the exchange names the coder's key with `--dpop-key`. The assistant consents to the new binding with a **sign-off**: a proof by its own key that names the coder's key thumbprint and agent id. It makes the sign-off in its own process and hands only the result to the coder, so its key never leaves it:
 
 ```sh
+# The assistant, with assistant.jwk:
+onbehalf token sign-off --subject-token "$ROOT" --dpop-key assistant.jwk \
+  --child-jkt "$CODER_JKT" --actor coder > sign-off.txt
+
+# The coder, with coder.jwk and the sign-off:
 CODER=$(ONBEHALF_TOKEN="$ROOT" ONBEHALF_CLIENT_SECRET=demo-coder-secret \
   onbehalf token exchange --actor coder --cap github:read_file \
-  --dpop-key coder.jwk --subject-dpop-key assistant.jwk --print token)
+  --dpop-key coder.jwk --subject-token-dpop-file sign-off.txt --print token)
 ```
 
-When the child should stay on the parent's key (one agent, two tokens), pass the same file as `--dpop-key` and leave out `--subject-dpop-key`.
+The sign-off is good for one exchange (its `jti` is single-use), within `[token] dpop_max_age_seconds` of when it was made, and only for the key and agent it names: whoever intercepts it cannot use it to bind a token to their own key, or exchange as another agent. When one process holds both keys (tests, a single-binary agent), `--subject-dpop-key assistant.jwk` on the exchange makes the sign-off in place.
+
+When the child should stay on the parent's key (one agent, two tokens), pass the same file as `--dpop-key` and leave out the sign-off.
 
 The coder calls tools with its key. `--dpop-key` (or `ONBEHALF_DPOP_KEY`) works on `call`, `tools` and `authzen eval`:
 
@@ -75,11 +82,16 @@ coder_key = DpopKey.load("coder.jwk")
 
 root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"],
                            dpop_key=assistant_key)
+# The assistant signs off on delegating to the coder's key; only the sign-off travels.
+sign_off = assistant_key.sign_off(f"{url}/token", str(root), coder_key.thumbprint, "coder")
+
 with Client(url, dpop_key=coder_key) as ob:
     coder = ob.exchange(root, "coder", ["github:read_file"], client_secret=secret,
-                        subject_dpop_key=assistant_key)
+                        subject_token_dpop=sign_off)
     ob.call_tool(coder, "github", "read_file", {"repo": "alice/public-docs"})
 ```
+
+When one process holds both keys, `subject_dpop_key=assistant_key` makes the sign-off inside `exchange`.
 
 For an MCP client library on `httpx`, `TokenAuth(provider, dpop_key=key)` adds the proof per request.
 
@@ -95,10 +107,13 @@ const root = await admin.mintRootDev("alice", "https://idp.example", "assistant"
   capabilities: "github:*",
   dpopKey: assistantKey,
 });
+// The assistant signs off on delegating to the coder's key; only the sign-off travels.
+const signOff = await assistantKey.signOff(`${url}/token`, root.jwt, coderKey.thumbprint, "coder");
+
 const ob = new OnbehalfClient(url, { dpopKey: coderKey });
 const coder = await ob.exchange(root, "coder", "github:read_file", {
   clientSecret,
-  subjectDpopKey: assistantKey,
+  subjectTokenDpop: signOff,
 });
 await ob.callTool(coder, "github", "read_file", { repo: "alice/public-docs" });
 ```
@@ -112,12 +127,12 @@ A proof is a JWS with header `{"typ": "dpop+jwt", "alg": "EdDSA" or "ES256", "jw
 | Claim | Value |
 | --- | --- |
 | `htm` | The request method, `POST` or `GET` |
-| `htu` | The request URL without query or fragment, as the server sees it: `[server] public_url` plus the path, or `http://<Host>` plus the path when `public_url` is unset |
+| `htu` | The request URL without query or fragment, as the server sees it: `[server] public_url` plus the path. When `public_url` is unset, `http://<Host>` plus the path for a loopback `Host` (`localhost`, `127.0.0.1`, `[::1]`, with any port), and `http://localhost` plus the path for any other `Host`; set `public_url` on any server reached by another name |
 | `iat` | Now, in seconds. Accepted within `[token] dpop_max_age_seconds` (default 300) either side of the server's clock |
 | `jti` | Unique per proof. A repeated `jti` for the same key is refused |
 | `ath` | base64url(SHA-256(token)), whenever a bound token goes with the request |
 
-Send it as the `DPoP` header (exactly one). For an exchange whose child is bound to a different key than its parent, add `subject_token_dpop` to the request body: a proof by the parent's key for `POST` and the `/token` URL, with `ath` of the parent token.
+Send it as the `DPoP` header (exactly one). For an exchange whose child is bound to a different key than its parent, add `subject_token_dpop` to the request body: the sign-off, a proof by the parent's key for `POST` and the `/token` URL, with `ath` of the parent token and two more claims, `child_jkt` (the thumbprint of the key in the `DPoP` header) and `child_actor` (the request's `actor`). The server refuses a sign-off whose `child_jkt` or `child_actor` does not match the request.
 
 ## What the server refuses
 
@@ -127,8 +142,9 @@ Send it as the `DPoP` header (exactly one). For an exchange whose child is bound
 | A proof by another key, for another method or URL, too old, replayed, badly signed, or several `DPoP` headers | 401 `invalid_dpop_proof` |
 | Exchanging a bound parent without binding the child | 401 `dpop_required` |
 | Binding the child to a new key without `subject_token_dpop` | 401 `dpop_required` |
+| A `subject_token_dpop` that names another key or agent, or none | 401 `invalid_dpop_proof` |
 | `[token] dpop = "required"` and a request without a proof, or an unbound token | 401 `dpop_required` |
-| The replay cache is full (`[token] dpop_replay_capacity`) | 503 `temporarily_unavailable` (`dpop_replay_cache_full`) |
+| The replay cache is full (`[token] dpop_replay_capacity`) | 503 `temporarily_unavailable` (`dpop_replay_cache_full`); at the proxy, HTTP 503 with JSON-RPC `-32006` (`data.reason` `dpop_replay_cache_full`) and `Retry-After` |
 
 Each 401 carries `WWW-Authenticate: DPoP error="…", algs="EdDSA ES256"`. Audit records of requests made with a bound token, and of issuances that bound a token, carry `"dpop_bound": true`.
 

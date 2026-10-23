@@ -23,6 +23,8 @@ Status updated 2026-10-23 for `fix/sr13-sr25-sr36`: SR-36 fixed (registry refuse
 
 Status updated 2026-10-23 for `fix/sr17-sr18-sr19-sr34-sr35`: SR-34 and SR-35 fixed.
 
+Status updated 2026-10-23 by [pass 4](security-review-2026-10-23-pass4.md) (`review/security-pass-4`): SR-34, SR-35 and SR-36 verified fixed, with two gaps found next to them: the reserved agent id `onbehalf` was still accepted as an exchange actor (SR-45, fixed there), and SR-36 has no per-principal cap (SR-49, open). Nothing from this report is open.
+
 Not changed on this branch: `crates/onbehalf-proxy/src/*` and `crates/onbehalf-audit/src/*`, which other branches (`feat/proxy-list-filtering`, `feat/audit-hardening`) were editing at the time. Findings there have an ignored regression test and the fix is described below precisely enough to apply after those branches merge.
 
 ## Summary

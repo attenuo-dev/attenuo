@@ -68,6 +68,12 @@ pub enum AuthError {
     /// method, URL or token, outside the accepted time window, or replayed.
     #[error("invalid DPoP proof: {0}")]
     InvalidDpopProof(String),
+    /// The request could not be checked because of a server-side limit, not because of
+    /// anything wrong with it (a full DPoP replay cache). The string is a reason code. The
+    /// proxy answers `503` with `Retry-After`, not `401`, so a client does not discard a
+    /// good token or key (SR-47).
+    #[error("temporarily unavailable: {0}")]
+    Unavailable(String),
 }
 
 /// Reason code of [`AuthError::MissingToken`].
@@ -93,6 +99,7 @@ impl AuthError {
             AuthError::LeaseInactive(reason) => reason,
             AuthError::DpopRequired => REASON_DPOP_REQUIRED,
             AuthError::InvalidDpopProof(_) => REASON_INVALID_DPOP_PROOF,
+            AuthError::Unavailable(reason) => reason,
         }
     }
 

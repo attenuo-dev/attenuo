@@ -81,12 +81,29 @@ RFC 8693 exchange: delegate a subset of a token's capabilities to a sub-agent.
 | `--actor-token-file <PATH>` | Read the actor token from a file, for example the JWT-SVID a SPIFFE helper writes. Cannot be combined with `--actor-token`. |
 | `--may-act <AGENT>` | Only this agent may exchange the new token (RFC 8693 `may_act`). Repeatable, or comma-separated. |
 | `--dpop-key PATH` | Bind the new token to this DPoP key. Required when the parent is bound. When the parent is bound to the same key, the proof also covers the parent. |
-| `--subject-dpop-key PATH` | The parent's DPoP key, when it differs from `--dpop-key`: its proof (`subject_token_dpop`) is the parent holder's consent to the new binding. |
+| `--subject-token-dpop-file PATH` | The parent holder's sign-off (`subject_token_dpop`), made with `token sign-off` for this exchange's `--dpop-key` and `--actor`. Required when the parent is bound to a key other than `--dpop-key`. |
+| `--subject-dpop-key PATH` | Instead of `--subject-token-dpop-file`, when this process may hold the parent's key too: the sign-off is made here. Cannot be combined with `--subject-token-dpop-file`. |
 | `--print token\|lease` | Print only that value. |
 
 ```sh
 ONBEHALF_TOKEN="$PARENT" onbehalf token exchange --actor coder \
   --cap github:read_file --actor-token-file /run/spiffe/coder.jwt --may-act reviewer
+```
+
+### `token sign-off`
+
+Made by the holder of a bound parent token, to consent to one exchange that binds the child to another key. Prints a proof by `--dpop-key` (the parent's key) for `POST` to the server's `/token`, with `ath` of the parent token and the claims `child_jkt` and `child_actor`; with `--json`, `{"subject_token_dpop": ...}`. The server accepts it only for an exchange whose `DPoP` key and `actor` are the ones it names, within `[token] dpop_max_age_seconds`, once. Hand it to the sub-agent, which passes it with `--subject-token-dpop-file`; the parent's key stays with the parent.
+
+| Option | Meaning |
+| --- | --- |
+| `--subject-token <JWT\|->` / `--subject-token-file PATH` | The parent token. Defaults to `ONBEHALF_TOKEN`. |
+| `--dpop-key PATH` | The key the parent token is bound to. Required; refused if it is not that key. |
+| `--child-jkt JKT` | Thumbprint of the sub-agent's key (`key gen --dpop` prints it). Required. |
+| `--actor AGENT` | The sub-agent that will make the exchange. Required. |
+
+```sh
+onbehalf token sign-off --subject-token "$ROOT" --dpop-key assistant.jwk \
+  --child-jkt "$CODER_JKT" --actor coder > sign-off.txt
 ```
 
 ### `key gen --dpop <PATH>`

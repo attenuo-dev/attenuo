@@ -117,17 +117,20 @@ import { DpopKey, OnbehalfClient } from "@onbehalf/sdk";
 
 const coderKey = await DpopKey.fromJwk(JSON.parse(await readFile("coder.jwk", "utf8")));
 // or: await DpopKey.generate(), and keep key.privateJwk() to reuse it
+
+// In the planner's process: consent to delegating `root` to the coder's key and agent id.
+const signOff = await plannerKey.signOff(`${URL}/token`, root.jwt, coderKey.thumbprint, "coder");
+
+// In the coder's process: the new token is bound to coderKey.
 const ob = new OnbehalfClient(URL, { dpopKey: coderKey });
-// The new token is bound to coderKey. The parent is bound to the planner's key, which signs off.
 const coder = await ob.exchange(root, "coder", "github:read_file", {
   clientSecret,
-  subjectDpopKey: plannerKey,
+  subjectTokenDpop: signOff,
 });
 await ob.callTool(coder, "github", "read_file", { repo: "alice/docs" }); // proof attached
-await admin.mintRootDev("alice", "https://idp.example", "planner", { dpopKey: plannerKey });
 ```
 
-With a key, every `callTool`, `listTools`, `initialize`, `renew` and `authzenEvaluate` sends `Authorization: DPoP <token>` and a fresh proof, and every `exchange` binds the new token. When the parent is bound to the client's own key, `subjectDpopKey` is not needed. `Token.dpopJkt` is the thumbprint a token is bound to (undefined for a bearer token), and `AuditEntry.dpopBound` says whether a decision was made with a proven bound token. A bound token without a proof is an `UnauthorizedError` with `error === "dpop_required"`. See [Binding tokens to keys](../../docs/guides/binding-tokens-to-keys.md).
+With a key, every `callTool`, `listTools`, `initialize`, `renew` and `authzenEvaluate` sends `Authorization: DPoP <token>` and a fresh proof, and every `exchange` binds the new token. When the parent is bound to another key, its holder's sign-off names the new key and agent and works for that one exchange; a process that holds both keys can pass `subjectDpopKey: plannerKey` instead. When the parent is bound to the client's own key, no sign-off is needed. `Token.dpopJkt` is the thumbprint a token is bound to (undefined for a bearer token), and `AuditEntry.dpopBound` says whether a decision was made with a proven bound token. A bound token without a proof is an `UnauthorizedError` with `error === "dpop_required"`. See [Binding tokens to keys](../../docs/guides/binding-tokens-to-keys.md).
 
 ### Errors
 

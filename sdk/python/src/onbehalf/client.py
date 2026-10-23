@@ -17,6 +17,7 @@ import httpx
 from . import _wire as w
 from .capability import CapabilityLike
 from .dpop import DpopKey, exchange_proofs, presented
+from .errors import OnbehalfError
 from .token import Token, decode_token, verify_token
 
 DEFAULT_TIMEOUT = 30.0
@@ -84,6 +85,7 @@ class Client:
         actor_token: str | None = None,
         may_act: Iterable[str] | None = None,
         subject_dpop_key: DpopKey | dict[str, Any] | None = None,
+        subject_token_dpop: str | None = None,
     ) -> Token:
         """RFC 8693 token exchange: trade ``subject_token`` for a narrower token held by ``actor``.
 
@@ -102,8 +104,12 @@ class Client:
         ``may_act`` lists the agents allowed to exchange the new token next (RFC 8693 §4.4).
 
         With a ``dpop_key`` on the client, the new token is bound to it. When ``subject_token`` is
-        bound to another key, pass that key as ``subject_dpop_key``: its proof tells the server
-        the parent's holder agrees (a child of a bound token is always bound).
+        bound to another key, the parent's holder must sign off on this delegation (a child of a
+        bound token is always bound): it makes ``DpopKey.sign_off(token_url, subject_token,
+        child_jkt, actor)`` with its key and hands the result to the sub-agent, which passes it
+        as ``subject_token_dpop``. The sign-off names the new token's key and agent, so it is
+        good for this delegation only. When one process holds both keys, pass the parent's key
+        as ``subject_dpop_key`` instead and the sign-off is made here.
 
         Raises :class:`~onbehalf.ApiError` (``invalid_scope``, ``invalid_grant``, ...) on refusal.
         """
@@ -118,14 +124,11 @@ class Client:
             actor_token=actor_token,
             may_act=may_act,
         )
-        headers = self._exchange_dpop(body, subject_dpop_key)
+        headers = _exchange_dpop(
+            self.server_url, self.dpop_key, body, subject_dpop_key, subject_token_dpop
+        )
         resp = self._http.post("/token", json=body, headers=headers)
         return w.token_from_response(w.json_body(resp))
-
-    def _exchange_dpop(
-        self, body: dict[str, Any], subject_dpop_key: DpopKey | dict[str, Any] | None
-    ) -> dict[str, str]:
-        return _exchange_dpop(self.server_url, self.dpop_key, body, subject_dpop_key)
 
     def _auth(self, token: str, path: str) -> dict[str, str]:
         return presented(token, self.dpop_key, "POST", f"{self.server_url}{path}")
@@ -285,6 +288,7 @@ class AsyncClient:
         actor_token: str | None = None,
         may_act: Iterable[str] | None = None,
         subject_dpop_key: DpopKey | dict[str, Any] | None = None,
+        subject_token_dpop: str | None = None,
     ) -> Token:
         body = w.exchange_body(
             subject_token,
@@ -297,7 +301,9 @@ class AsyncClient:
             actor_token=actor_token,
             may_act=may_act,
         )
-        headers = _exchange_dpop(self.server_url, self.dpop_key, body, subject_dpop_key)
+        headers = _exchange_dpop(
+            self.server_url, self.dpop_key, body, subject_dpop_key, subject_token_dpop
+        )
         resp = await self._http.post("/token", json=body, headers=headers)
         return w.token_from_response(w.json_body(resp))
 
@@ -402,12 +408,21 @@ def _exchange_dpop(
     key: DpopKey | None,
     body: dict[str, Any],
     subject_dpop_key: DpopKey | dict[str, Any] | None,
+    subject_token_dpop: str | None = None,
 ) -> dict[str, str]:
     """Add DPoP to an exchange: the ``DPoP`` header binding the new token to ``key``, and the
-    parent's sign-off in ``body`` when ``subject_dpop_key`` is given."""
+    parent's sign-off in ``body``, made here when ``subject_dpop_key`` is given or passed in
+    ready-made as ``subject_token_dpop``."""
+    if subject_dpop_key is not None and subject_token_dpop is not None:
+        raise OnbehalfError("pass subject_dpop_key or subject_token_dpop, not both")
     header, sign_off = exchange_proofs(
-        f"{server_url}/token", body["subject_token"], key, DpopKey.of(subject_dpop_key)
+        f"{server_url}/token",
+        body["subject_token"],
+        key,
+        DpopKey.of(subject_dpop_key),
+        body["actor"],
     )
+    sign_off = sign_off or subject_token_dpop
     if sign_off is not None:
         body["subject_token_dpop"] = sign_off
     return {"dpop": header} if header is not None else {}

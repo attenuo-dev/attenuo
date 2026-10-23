@@ -24,6 +24,10 @@ from .errors import OnbehalfError
 
 #: ``typ`` of a DPoP proof.
 PROOF_TYPE = "dpop+jwt"
+#: Sign-off claim naming the new token's key thumbprint.
+SIGN_OFF_CHILD_JKT = "child_jkt"
+#: Sign-off claim naming the new token's agent.
+SIGN_OFF_CHILD_ACTOR = "child_actor"
 
 
 def _b64(data: bytes) -> str:
@@ -150,6 +154,30 @@ class DpopKey:
             claims["ath"] = access_token_hash(access_token)
         return self.sign(claims)
 
+    def sign_off(
+        self,
+        url: str,
+        subject_token: str,
+        child_jkt: str,
+        actor: str,
+        *,
+        iat: int | None = None,
+    ) -> str:
+        """The ``subject_token_dpop`` sign-off of an exchange: a proof by the subject token's key
+        that also names the new token's key (``child_jkt``) and agent (``child_actor``), so it
+        is consent to delegate to that key and agent only. The parent's holder makes it and hands
+        it to the sub-agent; the parent's key never leaves the parent's process."""
+        claims: dict[str, Any] = {
+            "jti": str(uuid.uuid4()),
+            "htm": "POST",
+            "htu": url.split("#", 1)[0].split("?", 1)[0],
+            "iat": int(time.time()) if iat is None else iat,
+            "ath": access_token_hash(subject_token),
+            SIGN_OFF_CHILD_JKT: child_jkt,
+            SIGN_OFF_CHILD_ACTOR: actor,
+        }
+        return self.sign(claims)
+
     def sign(self, claims: dict[str, Any]) -> str:
         """Sign arbitrary proof claims with a DPoP header (for tests and special cases)."""
         header = {"typ": PROOF_TYPE, "alg": self.alg, "jwk": self.public_jwk}
@@ -192,12 +220,14 @@ def exchange_proofs(
     subject_token: str,
     key: DpopKey | None,
     subject_key: DpopKey | None,
+    actor: str,
 ) -> tuple[str | None, str | None]:
     """The ``DPoP`` header and the ``subject_token_dpop`` sign-off of an exchange.
 
     ``key`` binds the new token; its proof covers the subject token when the subject token is
     bound to the same key. ``subject_key`` is the subject token's key when the new token is
-    bound to another one: its proof is the parent holder's consent.
+    bound to another one: its sign-off names ``key`` and ``actor`` (see
+    :meth:`DpopKey.sign_off`), so it consents to that delegation only.
     """
     parent = token_jkt(subject_token)
     header = None
@@ -206,7 +236,9 @@ def exchange_proofs(
         header = key.proof("POST", url, subject_token if same else None)
     sign_off = None
     if subject_key is not None:
+        if key is None:
+            raise OnbehalfError("subject_dpop_key needs a dpop_key to bind the new token to")
         if parent is not None and parent != subject_key.thumbprint:
             raise OnbehalfError("subject_dpop_key is not the key the subject token is bound to")
-        sign_off = subject_key.proof("POST", url, subject_token)
+        sign_off = subject_key.sign_off(url, subject_token, key.thumbprint, actor)
     return header, sign_off
