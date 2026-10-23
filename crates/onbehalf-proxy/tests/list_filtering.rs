@@ -639,3 +639,86 @@ async fn sse_stream_with_unterminated_final_event_does_not_leak_it() -> anyhow::
     assert!(!text.contains("delete_repo"), "{text}");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------------
+// Notifications carry no data: a `result` smuggled into one changes nothing
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn list_changed_notifications_pass_through_without_a_body() -> anyhow::Result<()> {
+    let h = Harness::start(full_upstream(), narrow_chain()).await?;
+    for method in [
+        "notifications/tools/list_changed",
+        "notifications/resources/list_changed",
+        "notifications/prompts/list_changed",
+        "notifications/resources/updated",
+    ] {
+        let resp = h.post(&json!({"jsonrpc": "2.0", "method": method})).await?;
+        assert_eq!(resp.status(), 202, "{method}");
+        assert!(resp.text().await?.is_empty(), "{method}");
+    }
+    assert_eq!(
+        h.upstream.recorded_methods(),
+        vec![
+            "notifications/tools/list_changed",
+            "notifications/resources/list_changed",
+            "notifications/prompts/list_changed",
+            "notifications/resources/updated",
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_result_smuggled_into_a_notification_is_not_a_list_response() -> anyhow::Result<()> {
+    let leak = json!({"tools": [{"name": "delete_repo"}, {"name": "read_file"}]});
+    for sse in [false, true] {
+        let h = Harness::start(full_upstream().with_sse(sse), narrow_chain()).await?;
+
+        // 1. A bare notification with a `result`: forwarded as the notification it is; nothing
+        //    comes back.
+        let resp = h
+            .post(
+                &json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed",
+                          "result": leak}),
+            )
+            .await?;
+        assert_eq!(resp.status(), 202);
+        assert!(resp.text().await?.is_empty());
+
+        // 2. In a batch with a real `tools/list`, a notification that borrows its id and
+        //    carries a `result` cannot replace or widen the filtered response, and neither
+        //    can a response-shaped message (no method) for the same id.
+        let batch = json!([
+            req(1, "tools/list", json!({})),
+            {"jsonrpc": "2.0", "id": 1, "method": "notifications/tools/list_changed",
+             "result": leak},
+            {"jsonrpc": "2.0", "id": 1, "result": leak},
+        ]);
+        let resp = h.post(&batch).await?;
+        let msgs = decode_messages(resp).await?;
+        let text = serde_json::to_string(&msgs)?;
+        assert!(!text.contains("delete_repo"), "sse={sse}: {text}");
+        let list = msgs
+            .iter()
+            .find(|m| m.get("result").is_some())
+            .expect("the filtered list response");
+        assert_eq!(names(&list["result"], "tools", "name"), vec!["read_file"]);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_extra_result_member_does_not_skip_the_deny_path() -> anyhow::Result<()> {
+    // A smuggled `result` on a request for a method that needs a decision is still decided.
+    let h = Harness::start(full_upstream(), narrow_chain()).await?;
+    let resp = h
+        .post(&json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                      "params": {"name": "delete_repo", "arguments": {}},
+                      "result": {"tools": []}}))
+        .await?;
+    let msg = decode_single(resp).await?;
+    assert_eq!(msg["error"]["code"], -32003);
+    assert!(h.upstream.recorded_calls().is_empty());
+    Ok(())
+}
