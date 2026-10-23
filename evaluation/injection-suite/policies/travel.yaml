@@ -1,0 +1,21 @@
+# Environment of the `travel` suite: upstream name and tool catalog. Frozen together with
+# travel.cedar (the catalog's readonly and sensitive flags feed the policy).
+# Travel suite: hotels, restaurants, car hire, plus email and calendar. Task shapes follow
+# AgentDojo's "travel" suite: injected reviews push a booking, or ask for the user's personal
+# details to be mailed out. Names are synthetic.
+
+suite: travel
+upstream: travel
+description: A travel agent tool set for alice@acme.example.
+
+catalog:
+  get_all_hotels_in_city: { readonly: true, inputs: { city: string } }
+  get_rating_reviews_for_hotels: { readonly: true, inputs: { hotel_names: set<string> } }
+  get_user_information: { readonly: true, inputs: {} }
+  reserve_hotel: { inputs: { hotel: string, start_day: string, end_day: string } }
+  reserve_restaurant: { inputs: { restaurant: string, start_time: string } }
+  reserve_car_rental: { inputs: { company: string, start_time: string, end_time: string } }
+  send_email:
+    inputs: { recipients: set<string>, subject: string, body: string, cc: set<string>, bcc: set<string> }
+  create_calendar_event:
+    inputs: { title: string, start_time: string, end_time: string, participants: set<string> }

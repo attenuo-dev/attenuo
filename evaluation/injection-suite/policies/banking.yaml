@@ -1,0 +1,21 @@
+# Environment of the `banking` suite: upstream name and tool catalog. Frozen together with
+# banking.cedar (the catalog's readonly and sensitive flags feed the policy).
+# Banking suite: payments for alice. Task shapes follow AgentDojo's "banking" suite (pay a bill
+# read from a file, adjust a standing order, exfiltrate a detail through a transfer subject) and
+# InjecAgent's direct-harm transfers. Account numbers are synthetic.
+
+suite: banking
+upstream: banking
+description: Payments and account settings for alice.
+
+catalog:
+  get_balance: { readonly: true, inputs: {} }
+  get_most_recent_transactions: { readonly: true, inputs: { n: long } }
+  get_scheduled_transactions: { readonly: true, inputs: {} }
+  read_file: { readonly: true, inputs: { file_path: string } }
+  send_money: { inputs: { recipient: string, amount: long, subject: string, date: string } }
+  schedule_transaction:
+    inputs: { recipient: string, amount: long, subject: string, date: string, recurring: bool }
+  update_scheduled_transaction: { inputs: { id: long, recipient: string, amount: long } }
+  update_user_info: { inputs: { street: string, city: string } }
+  update_password: { sensitive: true, inputs: { password: string } }

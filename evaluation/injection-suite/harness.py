@@ -38,6 +38,8 @@ import yaml
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 CASES_DIR = HERE / "cases"
+POLICIES_DIR = HERE / "policies"
+FROZEN_FILE = CASES_DIR / "test" / "POLICY_HASHES.json"
 
 sys.path.insert(0, str(ROOT / "sdk" / "python" / "src"))
 
@@ -62,6 +64,7 @@ ARMS = ("direct", "scope_only", "onbehalf")
 STAGES = ("capability", "policy", "lease")
 ROLES = ("benign", "attack")
 CLASSES = ("S", "C", "D", "N")
+SPLITS = ("dev", "test")
 
 PERMIT_ALL = '@id("permit_all")\npermit(principal, action, resource);\n'
 
@@ -138,17 +141,42 @@ def _parse_step(case_id: str, i: int, raw: dict[str, Any], catalog: dict[str, An
     return Call(str(tool), dict(raw.get("args") or {}), role, expect, stage, raw.get("note"))
 
 
-def load_suite(path: Path) -> Suite:
+def load_environment(policies_dir: Path | None = None) -> dict[str, Suite]:
+    """The frozen part of the corpus: each suite's upstream, tool catalog and Cedar policy,
+    from ``policies/<suite>.yaml`` and ``policies/<suite>.cedar``. No cases."""
+    d = policies_dir or POLICIES_DIR
+    env: dict[str, Suite] = {}
+    for p in sorted(d.glob("*.yaml")):
+        doc = yaml.safe_load(p.read_text())
+        name = doc["suite"]
+        policy = (d / f"{name}.cedar").read_text()
+        env[name] = Suite(name, doc["upstream"], doc["description"], doc["catalog"], policy)
+    # The generated Cedar schema merges every tool's inputs into the generic "invoke" action, so
+    # one argument name must have one type across the whole corpus.
+    types: dict[str, tuple[str, str]] = {}
+    for s in env.values():
+        for tool, spec in s.catalog.items():
+            for arg, ty in (spec.get("inputs") or {}).items():
+                prev = types.setdefault(arg, (ty, f"{s.name}/{tool}"))
+                if prev[0] != ty:
+                    raise CorpusError(
+                        f"argument {arg!r} is {ty} in {s.name}/{tool} but {prev[0]} in {prev[1]}"
+                    )
+    return env
+
+
+def load_cases(path: Path, suite: Suite) -> list[Case]:
     doc = yaml.safe_load(path.read_text())
-    catalog = doc["catalog"]
-    suite = Suite(doc["suite"], doc["upstream"], doc["description"], catalog, doc["policy"])
+    if doc.get("suite") != suite.name:
+        raise CorpusError(f"{path}: suite must be {suite.name!r}")
+    out: list[Case] = []
     seen: set[str] = set()
     for raw in doc["cases"]:
         cid = raw["id"]
         if cid in seen:
             raise CorpusError(f"duplicate case id {cid}")
         seen.add(cid)
-        steps = [_parse_step(cid, i, s, catalog) for i, s in enumerate(raw["calls"])]
+        steps = [_parse_step(cid, i, s, suite.catalog) for i, s in enumerate(raw["calls"])]
         case = Case(
             id=cid,
             suite=suite.name,
@@ -166,26 +194,67 @@ def load_suite(path: Path) -> Suite:
         if not any(c.role == "attack" for c in case.calls):
             raise CorpusError(f"{cid}: a case needs at least one attack call")
         for g in case.grant:
-            if g["tool"] != "*" and g["tool"] not in catalog:
+            if g["tool"] != "*" and g["tool"] not in suite.catalog:
                 raise CorpusError(f"{cid}: granted tool {g['tool']!r} is not in the catalog")
-        suite.cases.append(case)
-    return suite
+        out.append(case)
+    return out
 
 
-def load_corpus(cases_dir: Path = CASES_DIR) -> list[Suite]:
-    suites = [load_suite(p) for p in sorted(cases_dir.glob("*.yaml"))]
-    # The generated Cedar schema merges every tool's inputs into the generic "invoke" action, so
-    # one argument name must have one type across the whole corpus.
-    types: dict[str, tuple[str, str]] = {}
-    for s in suites:
-        for tool, spec in s.catalog.items():
-            for arg, ty in (spec.get("inputs") or {}).items():
-                prev = types.setdefault(arg, (ty, f"{s.name}/{tool}"))
-                if prev[0] != ty:
-                    raise CorpusError(
-                        f"argument {arg!r} is {ty} in {s.name}/{tool} but {prev[0]} in {prev[1]}"
-                    )
+def load_corpus(split: str = "dev", cases_dir: Path | None = None) -> list[Suite]:
+    """Every suite of the environment, with the cases of one split (``cases/<split>/``).
+    Suites without cases in the split are left out."""
+    if split not in SPLITS:
+        raise CorpusError(f"split must be one of {SPLITS}")
+    d = cases_dir or CASES_DIR / split
+    env = load_environment()
+    suites = []
+    for p in sorted(d.glob("*.yaml")):
+        name = yaml.safe_load(p.read_text())["suite"]
+        if name not in env:
+            raise CorpusError(f"{p}: no suite {name!r} in policies/")
+        s = env[name]
+        s.cases = load_cases(p, s)
+        suites.append(s)
+    ids = [c.id for s in suites for c in s.cases]
+    if len(ids) != len(set(ids)):
+        raise CorpusError("case ids must be unique across the split")
     return suites
+
+
+# --- freeze -----------------------------------------------------------------------------------
+
+
+def sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def policy_hashes() -> dict[str, str]:
+    """SHA-256 of every file under ``policies/`` (Cedar policies and catalogs), by file name."""
+    return {p.name: sha256_file(p) for p in sorted(POLICIES_DIR.iterdir()) if p.is_file()}
+
+
+def frozen_hashes() -> dict[str, Any]:
+    return dict(json.loads(FROZEN_FILE.read_text()))
+
+
+def freeze_violations() -> list[str]:
+    """Differences between ``policies/`` now and the hashes frozen before the test split was
+    written. Empty means test numbers may be reported."""
+    if not FROZEN_FILE.exists():
+        return [f"{FROZEN_FILE.name} is missing"]
+    frozen = frozen_hashes()["files"]
+    now = policy_hashes()
+    out = []
+    for name in sorted(set(frozen) | set(now)):
+        if name not in now:
+            out.append(f"policies/{name} was removed")
+        elif name not in frozen:
+            out.append(f"policies/{name} was added")
+        elif frozen[name] != now[name]:
+            out.append(
+                f"policies/{name} changed (sha256 {now[name][:12]}, frozen {frozen[name][:12]})"
+            )
+    return out
 
 
 # --- capabilities -----------------------------------------------------------------------------
