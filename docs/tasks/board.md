@@ -92,3 +92,4 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 - [x] `onbehalf-cli`: the `onbehalf` binary for tokens, calls, leases, audit and policy, with unit-tested arguments and tree rendering.
 - [x] GitHub MCP leak demo: `examples/github-leak-demo/run.sh` with a transcript; the integration-test form of the scenario (first item under Now) is still open.
 - [x] Policy hot reload with schema validation (`POST /admin/policies/reload`); invalid set rejected with 422, last good set kept.
+- [ ] CLI: `onbehalf policy lint` without `--config` reports an error on a correct policy (found while writing the walkthrough, 2026-10-23); make lint work without a config or say clearly what it needs. Also: `evaluation/injection-suite/run.py` returns 401 when `ONBEHALF_ADMIN_TOKEN`/`ONBEHALF_SERVER` are exported from another server; it should ignore or warn about them.
