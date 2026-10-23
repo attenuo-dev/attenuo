@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, OnceLock, TryLockError};
 use std::time::Duration;
 
 use onbehalf_core::{DecisionRecord, LeaseId};
@@ -493,6 +493,11 @@ pub const MAX_BATCH: usize = 256;
 /// retried one transaction each, so one bad record fails only its own append; every append
 /// either gets its committed entry back or an error, never a guess.
 ///
+/// **Inline commit.** When no append is waiting for the writer and the connection is free, an
+/// append commits on the caller's thread instead, the same one-record transaction the writer
+/// would run, without the hand-off between threads. The connection lock keeps the chain
+/// linear whichever thread commits.
+///
 /// **WAL checkpoints.** [`with_wal_checkpoints`](Self::with_wal_checkpoints) moves SQLite's
 /// checkpoints off the commit path to a background thread.
 ///
@@ -500,7 +505,7 @@ pub const MAX_BATCH: usize = 256;
 /// see only committed batches.
 pub struct SqliteAudit {
     inner: Arc<Inner>,
-    /// Started by the first append, after the builders have run.
+    /// Started by the first append that finds the store busy, after the builders have run.
     writer: OnceLock<Writer>,
     /// The background WAL checkpointer, if [`with_wal_checkpoints`](Self::with_wal_checkpoints)
     /// started one.
@@ -1065,6 +1070,19 @@ impl SqliteAudit {
 impl AuditSink for SqliteAudit {
     fn append(&self, record: DecisionRecord) -> Result<AuditEntry, AuditError> {
         let activity = &self.inner.activity;
+        // Nothing queued for the writer and the connection free: commit on this thread and
+        // skip the hand-off. Anything else (a batch in progress, appends waiting, a reader
+        // holding the lock) goes to the writer, so group commit works as before under load.
+        if activity.pending.load(Ordering::Acquire) == 0 {
+            match self.inner.conn.try_lock() {
+                Ok(mut conn) => {
+                    let mut out = self.inner.append_locked(&mut conn, vec![record]);
+                    return out.pop().expect("one record, one result");
+                }
+                Err(TryLockError::Poisoned(_)) => return Err(AuditError::Poisoned),
+                Err(TryLockError::WouldBlock) => {}
+            }
+        }
         activity.pending.fetch_add(1, Ordering::AcqRel);
         let result = self
             .writer
