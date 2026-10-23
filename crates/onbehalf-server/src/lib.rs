@@ -161,6 +161,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     if let Some(t) = checkpoint_task {
         t.abort();
     }
+    // Requests have drained: fold the WAL into the database file before exiting.
+    match state.blocking(|s| s.audit.checkpoint_wal()).await {
+        Ok(Some(done)) if !done.complete() => {
+            tracing::warn!(?done, "final WAL checkpoint was incomplete")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "final WAL checkpoint failed"),
+    }
     res
 }
 
