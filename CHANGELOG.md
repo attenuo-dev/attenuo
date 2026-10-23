@@ -24,9 +24,13 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 - Criterion benchmarks for `PolicyEngine::authorize` and `CapabilitySet::covers`; numbers in `docs/design/performance.md`.
 - ADR-0006: lease-based in-flight revocation.
 - Policy test harness: `onbehalf_policy::testing` loads YAML test files (user, agent chain, call, expected decision, reason and deciding policy ids), builds real delegation chains, runs them through `PolicyEngine::authorize` and returns a report. `onbehalf policy test <file>... [--json]` runs them offline (exit 0 pass, 1 error, 2 failures). `onbehalf policy lint <policy.cedar> [--config server.toml] [--schema]` parses and validates a policy file against the schema generated from the catalog, with line and column. `onbehalf_policy::lint` exposes the same check as a library. Example: `examples/github-leak-demo/policy_test.yaml`, run by `run.sh`. Guide: `docs/guides/writing-policies.md`.
+- Operations hardening: graceful shutdown on SIGTERM and SIGINT with a 10 s drain of in-flight requests; `GET /readyz` (audit store and lease store, 503 with a JSON body on failure; `/healthz` stays liveness-only); Prometheus `GET /metrics` on its own listener (`[metrics] enabled`, `listen`, default `127.0.0.1:9100`) with `decisions_total`, `tokens_issued_total`, `leases_revoked_total`, `audit_append_errors_total`, `http_requests_total` and `authorize_duration_seconds`.
+- Key rotation with overlap: tokens carry a `kid`; `Verifier` trusts a set of keys; `[issuer] previous_key_paths` keeps retired keys verify-only and publishes them in the JWKS. `Issuer::trust_previous_key`, `Verifier::with_public_pem`, `TokenError::UnknownKeyId`. Procedure in `docs/guides/deploying.md`.
+- `[policy] user_attributes = { groups = "set<string>", ... }` declares extra `originating_user.attributes` in the generated Cedar schema; `onbehalf policy lint --config` and `policy test` read it too.
 
 ### Changed
 
+- JWKS `kid` is now the first 16 bytes of SHA-256 over the SPKI DER, base64url (22 characters), replacing the 16 hex characters. A token whose `kid` is not trusted is rejected (`UnknownKeyId`); tokens without a `kid` are tried against every trusted key.
 - BREAKING: `POST /admin/root-token` is mounted only when `[dev] allow_root_mint = true` (default `false`); otherwise it answers 404.
 - `[[root_grants]]` entries no longer need a `subject`: without one an entry applies to every user of its `issuer`. The same list now caps IdP intake.
 - BREAKING: `LeaseStore` has a new required method `renew`; `onbehalf_proxy::Authorizer` has a new required method `check_active`, and `AuthError` a new variant `LeaseInactive`.

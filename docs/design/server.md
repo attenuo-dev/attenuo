@@ -10,7 +10,8 @@ The server is wiring. It holds no authorization logic of its own: tokens come fr
 
 | Piece | Type | Shared as |
 |---|---|---|
-| Issuer and verifier | `onbehalf_token::Issuer`, `Verifier` | one Ed25519 key, loaded from or generated at `issuer.private_key_pem_path` |
+| Issuer and verifier | `onbehalf_token::Issuer`, `Verifier` | one signing Ed25519 key, loaded from or generated at `issuer.private_key_pem_path`, plus verify-only `issuer.previous_key_paths`; tokens carry a `kid` |
+| Metrics | `metrics::Metrics` | `Arc`, incremented by the pipeline and token routes, served on `[metrics] listen` |
 | Policy engine | `onbehalf_policy::PolicyEngine` | `Arc<RwLock<_>>`, swapped in place by `POST /admin/policies/reload` |
 | Lease registry | `onbehalf_audit::SqliteLeaseStore` | `Arc`, same SQLite file as the log |
 | Audit log | `onbehalf_audit::SqliteAudit` | `Arc` |
@@ -228,6 +229,14 @@ sequenceDiagram
 
 Own-lease expiry is not an error: a lapsed but unrevoked lease is revived, provided the token has not expired and the ancestors are live. If the audit append fails the previous expiry is restored and the call fails. `[issuer] lease_interval_seconds` (default 300, must be positive) sets the interval used at issuance and renewal. Agents should renew at a fraction of it, for example every interval / 3.
 
+## Operations
+
+- **Shutdown.** `serve` waits for SIGINT or SIGTERM, stops accepting connections, and gives in-flight requests `DRAIN_TIMEOUT` (10 s) to finish before it returns and the process exits.
+- **Readiness.** `GET /readyz` reads `AuditSink::head` and one `SqliteLeaseStore::get`. Both ok: 200 `{"status":"ready"}`; otherwise 503 `{"status":"unavailable","checks":{"audit":{"ok":false,"error":"..."},...}}`. `GET /healthz` never touches storage.
+- **Metrics.** `metrics::Metrics` holds atomics and two small maps (decisions by `(decision, reason)`, HTTP by `(route template, status)`) and renders Prometheus text format 0.0.4. `Pipeline::decide` records the decision, its duration and audit append failures; `audit_issuance` records tokens issued (`kind` root for `token.root`, else exchange); the admin revoke handler adds the number of leases changed. A middleware on the whole router counts responses by `MatchedPath`. The endpoint is served only by a second listener (`[metrics] enabled`, `listen`), with no authentication.
+- **Key rotation.** `Issuer` signs with one key and sets the JWT header `kid` to base64url of the first 16 bytes of SHA-256 over the key's SPKI DER. `Verifier` holds a list of trusted keys: a `kid` selects one key (unknown: `UnknownKeyId`), no `kid` tries all. `ou_sig` must verify under any trusted key, because a child minted after rotation copies its parent's `ou_sig`. `[issuer] previous_key_paths` (private or public PEM) adds verify-only keys, also published in the JWKS.
+- **User attributes.** `[policy] user_attributes` is parsed with `ArgType::from_str` and passed to `PolicyEngineBuilder::with_user_attr`, extending the generated `UserAttributes` record.
+
 ## Errors
 
 Non-MCP endpoints answer errors as `{"error": "<code>", "detail": "<text>"}` with a matching status. `/token` uses OAuth codes (`invalid_request`, `unsupported_grant_type`, `invalid_client`, `invalid_grant`, `invalid_scope`, `temporarily_unavailable`); hop-0 intake errors add a stable `error_description` (table above). Admin endpoints answer 401 without the admin bearer and 403 `admin_disabled` when no admin token is configured. MCP routes keep the proxy's JSON-RPC errors (`-32001` unauthenticated, `-32003` denied).
@@ -241,7 +250,7 @@ Non-MCP endpoints answer errors as `{"error": "<code>", "detail": "<text>"}` wit
 - The user block does not record which credential it came from (`evidence`, RFC-0001 §3.1); the audit record's argument digest covers the credential type and IdP.
 - ID-JAG follows draft -04; claim mapping is isolated in `idp::claims::map_id_jag` for when the draft changes. The draft's `resource` and `scope` claims are not used.
 - The `actor` in an exchange is asserted, not authenticated (`actor_token` is not checked).
-- No `kid` in token headers; the JWKS has one key and rotation is manual.
+- Key rotation is manual (edit the config, restart) but has an overlap: see `previous_key_paths` below.
 - SQLite calls run on the async worker threads; fine at demo load, to be moved to `spawn_blocking` or a pool.
 - No lease cache and no push channel: every request reads the registry, and external PEPs using the AuthZEN endpoint learn of revocation only by asking.
 - Failed renewals are not audited (only successful ones).

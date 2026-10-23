@@ -74,7 +74,7 @@ You do not need to write much of it. Before Cedar runs, a capability check in pl
 
 ## How do I rotate keys?
 
-Replace the issuer key and restart. There is no overlap period in v0, so every token signed with the old key stops working and agents must get new ones. The steps are in [Deploying](guides/deploying.md#key-rotation).
+Point `private_key_pem_path` at a new key, list the old one in `previous_key_paths`, and restart. Tokens signed with the old key keep verifying (they carry a `kid`, and the JWKS lists both keys) until you remove it. The steps are in [Deploying](guides/deploying.md#key-rotation).
 
 Rotating the signing key does not touch the audit log, which is not signed with it. Rotating the admin token and agent secrets also means editing the config and restarting.
 
