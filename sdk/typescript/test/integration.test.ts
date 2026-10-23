@@ -35,6 +35,9 @@ import {
   mcpUrl,
   OnbehalfClient,
   prefix,
+  RefreshError,
+  type Token,
+  TokenRefresher,
   UnauthorizedError,
   VerificationError,
 } from "../src/index.js";
@@ -352,6 +355,99 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
     const entries = await admin.auditTail(50);
     expect(entries.find((e) => e.record.id === ok.decisionId)?.dpopBound).toBe(true);
     await admin.revokeLease(root.lease);
+  });
+
+  async function until(cond: () => boolean, what: string, ms = 10_000): Promise<void> {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (cond()) return;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    throw new Error(`timed out waiting for ${what}`);
+  }
+
+  it("keeps a short-lived token alive, then stops on revocation", async () => {
+    const admin = new AdminClient(url, ADMIN_TOKEN);
+    const ob = new OnbehalfClient(url);
+    // Each exchange needs a fresh parent: a parent delegates to an actor once.
+    const exchange = async () => {
+      const root = await admin.mintRootDev("alice", "https://idp.example", "assistant", {
+        capabilities: ["github:*"],
+      });
+      return ob.exchange(root, "coder", [capability("github", "read_file")], {
+        ttlSeconds: 6,
+        clientSecret: CODER_SECRET,
+      });
+    };
+    const first = await exchange();
+    const changes: Token[] = [];
+    const errors: RefreshError[] = [];
+    const refresher = new TokenRefresher({
+      client: ob,
+      token: first,
+      exchange,
+      onChange: (t) => changes.push(t),
+      onError: (e) => errors.push(e),
+    });
+    const dispose = refresher.start();
+    try {
+      await until(() => changes.length > 0, "a replacement token");
+      expect(refresher.token.jwt).not.toBe(first.jwt);
+      expect(refresher.token.lease).not.toBe(first.lease);
+      const ok = await ob.callTool(refresher.token, "github", "read_file", {
+        repo: "alice/public-docs",
+      });
+      expect(ok.decisionId).toBeTruthy();
+      expect((await admin.auditTail(100)).some((e) => e.record.tool === "lease.renew")).toBe(true);
+      await admin.revokeLease(refresher.token.lease, "test");
+      await until(() => errors.length > 0, "the terminal error");
+    } finally {
+      await dispose();
+    }
+    expect(errors[0]!.reason).toBe("lease_revoked");
+    expect(refresher.error).toBe(errors[0]);
+    await expect(
+      ob.callTool(refresher.token, "github", "read_file", { repo: "alice/public-docs" }),
+    ).rejects.toMatchObject({ reason: "lease_revoked" });
+  });
+
+  it("keeps the DPoP key across a refresh", async () => {
+    const admin = new AdminClient(url, ADMIN_TOKEN);
+    const [assistantKey, coderKey] = await Promise.all([DpopKey.generate(), DpopKey.generate()]);
+    const ob = new OnbehalfClient(url, { dpopKey: coderKey });
+    const exchange = async () => {
+      const root = await admin.mintRootDev("alice", "https://idp.example", "assistant", {
+        capabilities: ["github:*"],
+        dpopKey: assistantKey,
+      });
+      return ob.exchange(root, "coder", [capability("github", "read_file")], {
+        ttlSeconds: 6,
+        clientSecret: CODER_SECRET,
+        subjectDpopKey: assistantKey,
+      });
+    };
+    const first = await exchange();
+    expect(first.dpopJkt).toBe(coderKey.thumbprint);
+    const changes: Token[] = [];
+    const refresher = new TokenRefresher({
+      client: ob,
+      token: first,
+      exchange,
+      onChange: (t) => changes.push(t),
+    });
+    const dispose = refresher.start();
+    try {
+      await until(() => changes.length > 0, "a replacement token");
+      expect(refresher.error).toBeUndefined();
+      expect(refresher.token.dpopJkt).toBe(coderKey.thumbprint);
+      const ok = await ob.callTool(refresher.token, "github", "read_file", {
+        repo: "alice/public-docs",
+      });
+      expect(ok.decisionId).toBeTruthy();
+      expect((await ob.renew(refresher.token)).expiresIn).toBeGreaterThan(0);
+    } finally {
+      await dispose();
+    }
   });
 
   // The examples need `npm install` in examples/typescript-agent (and the SDK built); skipped

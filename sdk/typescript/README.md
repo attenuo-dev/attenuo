@@ -132,6 +132,40 @@ await ob.callTool(coder, "github", "read_file", { repo: "alice/docs" }); // proo
 
 With a key, every `callTool`, `listTools`, `initialize`, `renew` and `authzenEvaluate` sends `Authorization: DPoP <token>` and a fresh proof, and every `exchange` binds the new token. When the parent is bound to another key, its holder's sign-off names the new key and agent and works for that one exchange; a process that holds both keys can pass `subjectDpopKey: plannerKey` instead. When the parent is bound to the client's own key, no sign-off is needed. `Token.dpopJkt` is the thumbprint a token is bound to (undefined for a bearer token), and `AuditEntry.dpopBound` says whether a decision was made with a proven bound token. A bound token without a proof is an `UnauthorizedError` with `error === "dpop_required"`. See [Binding tokens to keys](../../docs/guides/binding-tokens-to-keys.md).
 
+### Keeping a token alive
+
+`TokenRefresher` renews the lease at a third of the lease interval, calls your `exchange` function before the token's `exp`, and keeps the current token in `refresher.token`. `start()` returns a disposer.
+
+```ts
+import { mcpFetch, RefreshError, TokenRefresher } from "@onbehalf/sdk";
+
+// Each exchange needs a fresh subject token: a parent delegates to a given actor once, so
+// re-exchanging the same parent is refused as `replayed`.
+const exchange = async () =>
+  ob.exchange(await planner.freshRoot(), "coder", "github:read_file", { clientSecret });
+
+const refresher = new TokenRefresher({
+  client: ob,
+  token: await exchange(),
+  exchange,
+  onError: (e: RefreshError) => console.error("stopping:", e.reason), // lease_revoked, ...
+});
+const dispose = refresher.start();
+
+// A per-request token hook for the MCP transport: it always sends the current token.
+const transport = new StreamableHTTPClientTransport(new URL(mcpUrl(URL, "github")), {
+  fetch: refresher.fetch({ dpopKey: coderKey }), // = mcpFetch(refresher.provider, { dpopKey })
+});
+
+await dispose(); // stop the loop
+```
+
+- **Schedule.** `leaseInterval` (seconds) is the server's `[issuer] lease_interval_seconds`; left out, it is learned from the first renewal, which then happens right away. The token is re-exchanged `margin` seconds before `exp` (default 20% of its lifetime, at least 5 s, at most half the lifetime). `onChange(token)` is called with each replacement.
+- **Failures.** Network errors, 5xx, 408 and 429 are retried with jittered exponential backoff (1 s doubling to 30 s). It stops, calls `onError` once and sets `refresher.error` when the lease is revoked (`RefreshError.reason === "lease_revoked"`, or `lease_lost` when an ancestor lapsed), the server refuses an exchange for good (`refused`: `invalid_scope`, `replayed`, a bad secret), or the token reaches `exp` (`token_expired`). It never loops on a revoked lease. `refresher.provider()` throws the `RefreshError` once it has given up.
+- **DPoP.** Renewals go through your client and are signed with its `dpopKey`. A replacement must be bound to the same key as the current token; otherwise it is not adopted and the refresher stops with `key_mismatch`.
+- **Logging.** Nothing is logged, and no error message contains a token.
+- **Testing.** `tick()` runs whatever is due and returns the milliseconds to wait; `start()` is a loop around it, and `now` and `random` options replace the clock and the jitter.
+
 ### Errors
 
 | Error               | When                                                                                                                                                                                                                                                                             |
@@ -140,6 +174,7 @@ With a key, every `callTool`, `listTools`, `initialize`, `renew` and `authzenEva
 | `UnauthorizedError` | HTTP 401 or JSON-RPC `-32001`: the bearer is missing, malformed, expired or not ours. A subclass of `ApiError`.                                                                                                                                                                  |
 | `ApiError`          | A non-success HTTP status. `status`, `error` (for example `invalid_scope`), `detail`.                                                                                                                                                                                            |
 | `RpcError`          | Any other JSON-RPC error (`code`, `rpcMessage`, `data`).                                                                                                                                                                                                                         |
+| `RefreshError`      | A `TokenRefresher` gave up. `reason`: `lease_revoked`, `lease_lost`, `token_expired`, `refused`, `key_mismatch`.                                                                                                                                                                 |
 | `VerificationError` | `inspect(..., { verify: true })` failed.                                                                                                                                                                                                                                         |
 | `OnbehalfError`     | Base class; also thrown for responses that are not what the server sends.                                                                                                                                                                                                        |
 
@@ -172,6 +207,8 @@ const transport = new StreamableHTTPClientTransport(new URL(mcpUrl(URL, "github"
 });
 ```
 
+To have the token replaced for you, use a [`TokenRefresher`](#keeping-a-token-alive) and `refresher.fetch({ dpopKey })`.
+
 ## Development
 
 ```sh
@@ -196,7 +233,7 @@ cd sdk/typescript && npm run build && ONBEHALF_INTEGRATION=1 npm test
 ## Not done
 
 - Not published to npm.
-- No token-refresh helper (renew on a timer, re-exchange before `exp`), and no streaming: `callTool` reads the whole response, so a long-lived SSE stream or server-initiated requests are not supported through the SDK's own methods (use the MCP client for those).
+- No streaming: `callTool` reads the whole response, so a long-lived SSE stream or server-initiated requests are not supported through the SDK's own methods (use the MCP client for those).
 - The detached `ou_sig` over the user block is not checked locally; the server checks it on every request.
 - Hop-0 exchange against a live IdP is untested.
 - Browsers: nothing here is Node-only, but only Node 20 and 22 are tested.

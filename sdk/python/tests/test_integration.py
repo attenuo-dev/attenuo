@@ -17,7 +17,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import httpx
@@ -32,6 +32,9 @@ from onbehalf import (
     Denied,
     DpopKey,
     Prefix,
+    RefreshError,
+    Token,
+    TokenRefresher,
     Unauthorized,
 )
 
@@ -383,6 +386,77 @@ def test_dpop_bound_chain(stack: Stack) -> None:
     assert by_id[res.decision_id].dpop_bound
     assert not any(e.dpop_bound for e in entries if e.tool == "admin.root_token")
     admin.revoke_lease(root.lease)
+    admin.close()
+
+
+def wait_for(cond: Callable[[], bool], seconds: float, what: str) -> None:
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if cond():
+            return
+        time.sleep(0.1)
+    pytest.fail(f"timed out waiting for {what}")
+
+
+def test_token_refresher(stack: Stack) -> None:
+    """A short-lived coder token is replaced before exp, stays usable, and revocation stops it."""
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    changes: list[Token] = []
+    errors: list[RefreshError] = []
+    with Client(stack.url) as ob:
+
+        def exchange() -> Token:
+            # Each exchange needs a fresh parent: a parent delegates to an actor once.
+            root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+            return ob.exchange(
+                root, "coder", ["github:read_file"], ttl_seconds=6, client_secret=CODER_SECRET
+            )
+
+        first = exchange()
+        with TokenRefresher(
+            ob, first, exchange, on_change=changes.append, on_error=errors.append
+        ) as r:
+            wait_for(lambda: bool(changes), 10, "a replacement token")
+            assert r.token.jwt != first.jwt and r.token.lease != first.lease
+            assert ob.call_tool(r.token, "github", "read_file", {"repo": "alice/public-docs"})
+            # The lease is being renewed: the audit log has lease.renew entries.
+            assert any(e.tool == "lease.renew" for e in admin.audit_tail(100))
+            admin.revoke_lease(r.token.lease, "test")
+            wait_for(lambda: bool(errors), 10, "the terminal error")
+        assert errors[0].reason == "lease_revoked" and r.error is errors[0]
+        with pytest.raises(Denied) as denied:
+            ob.call_tool(r.token, "github", "read_file", {"repo": "alice/public-docs"})
+        assert denied.value.reason == "lease_revoked"
+    admin.close()
+
+
+def test_token_refresher_keeps_the_dpop_key(stack: Stack) -> None:
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    assistant_key, coder_key = DpopKey.generate(), DpopKey.generate()
+    changes: list[Token] = []
+    with Client(stack.url, dpop_key=coder_key) as ob:
+
+        def exchange() -> Token:
+            root = admin.mint_root_dev(
+                "alice", "https://idp.example", "assistant", ["github:*"], dpop_key=assistant_key
+            )
+            return ob.exchange(
+                root,
+                "coder",
+                ["github:read_file"],
+                ttl_seconds=6,
+                client_secret=CODER_SECRET,
+                subject_dpop_key=assistant_key,
+            )
+
+        first = exchange()
+        assert first.dpop_jkt == coder_key.thumbprint
+        with TokenRefresher(ob, first, exchange, on_change=changes.append) as r:
+            wait_for(lambda: bool(changes), 10, "a replacement token")
+            assert r.error is None
+            assert r.token.dpop_jkt == coder_key.thumbprint
+            assert ob.call_tool(r.token, "github", "read_file", {"repo": "alice/public-docs"})
+            assert ob.renew(r.token).expires_in > 0
     admin.close()
 
 

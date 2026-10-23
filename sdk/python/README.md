@@ -127,6 +127,39 @@ with Client(url, dpop_key=coder_key) as ob:
 
 With a key, every `call_tool`, `list_tools`, `renew` and `authzen_evaluate` sends `Authorization: DPoP <token>` and a fresh proof, and every `exchange` binds the new token. When the parent is bound to another key, its holder's sign-off names the new key and agent and works for that one exchange; a process that holds both keys can pass `subject_dpop_key=planner_key` instead. When the parent is bound to the client's own key, no sign-off is needed. `Token.dpop_jkt` is the thumbprint a token is bound to (`None` for a bearer token), and `AuditEntry.dpop_bound` says whether a decision was made with a proven bound token. A bound token without a proof is `Unauthorized` with `error == "dpop_required"`. See [Binding tokens to keys](../../docs/guides/binding-tokens-to-keys.md).
 
+### Keeping a token alive
+
+`TokenRefresher` (threads) and `AsyncTokenRefresher` (`asyncio`) renew the lease at a third of the lease interval, call your `exchange` function before the token's `exp`, and keep the current token in `.token`:
+
+```python
+from onbehalf import Client, RefreshError, TokenRefresher
+from onbehalf.mcp import TokenAuth
+
+
+def new_coder_token():
+    # Each exchange needs a fresh subject token: a parent delegates to a given actor once,
+    # so re-exchanging the same parent is refused as `replayed`.
+    return ob.exchange(planner.fresh_root(), "coder", ["github:read_file"], client_secret=SECRET)
+
+
+def on_dead(err: RefreshError):
+    print("stopping:", err.reason)  # lease_revoked, token_expired, refused, ...
+
+
+with (
+    Client(URL, dpop_key=key) as ob,
+    TokenRefresher(ob, new_coder_token(), new_coder_token, on_error=on_dead) as refresher,
+):
+    auth = TokenAuth(refresher, dpop_key=key)  # reads refresher.token on every request
+    ob.call_tool(refresher.token, "github", "read_file", {"repo": "alice/docs"})
+```
+
+- **Schedule.** `lease_interval` is the server's `[issuer] lease_interval_seconds`; left out, it is learned from the first renewal, which then happens right away. The token is re-exchanged `margin` seconds before `exp` (default 20% of its lifetime, at least 5 s, at most half the lifetime). `on_change(token)` is called with each replacement.
+- **Failures.** Network errors, 5xx, 408 and 429 are retried with jittered exponential backoff (1 s doubling to 30 s). It stops, calls `on_error` once and sets `.error` when the lease is revoked (`RefreshError.reason == "lease_revoked"`, or `lease_lost` when an ancestor lapsed), the server refuses an exchange for good (`refused`: `invalid_scope`, `replayed`, a bad secret), or the token reaches `exp` (`token_expired`). It never loops on a revoked lease. `refresher()` raises the `RefreshError` once it has given up.
+- **DPoP.** Renewals go through your client and are signed with its `dpop_key`. A replacement must be bound to the same key as the current token; otherwise it is not adopted and the refresher stops with `key_mismatch`.
+- **Logging.** The `onbehalf.refresh` logger writes lease ids and reason codes only, never tokens.
+- **Testing.** `tick()` runs whatever is due and returns the seconds to wait; the thread is a loop around it, and `clock=` and `rng=` replace the time source and the jitter.
+
 ### Errors
 
 All SDK errors derive from `OnbehalfError`.
@@ -137,6 +170,7 @@ All SDK errors derive from `OnbehalfError`.
 | `Unauthorized`                              | HTTP 401: missing, bad or expired bearer.                                                                                                                                                                                                                                                                                                                                    |
 | `ApiError` (`.status`, `.error`, `.detail`) | Any other non-success from the server: `invalid_scope`, `invalid_grant`, 404, 422.                                                                                                                                                                                                                                                                                           |
 | `RpcError`                                  | A JSON-RPC error that is not a denial (unknown upstream, upstream down).                                                                                                                                                                                                                                                                                                     |
+| `RefreshError` (`.reason`)                  | A `TokenRefresher` gave up: `lease_revoked`, `lease_lost`, `token_expired`, `refused`, `key_mismatch`.
 | `VerificationError`                         | `inspect(verify=True)` failed.                                                                                                                                                                                                                                                                                                                                               |
 
 A denied `tools/call` is a decision, not a glitch: do not retry it blindly. A `lease_expired` denial is the one case where `renew()` then one retry makes sense; `lease_revoked` means stop.
@@ -152,7 +186,7 @@ url = mcp_url("http://127.0.0.1:8080", "github")  # http://127.0.0.1:8080/mcp/gi
 headers = mcp_headers(coder)  # {"Authorization": "Bearer ..."}
 ```
 
-`TokenAuth(provider)` is an `httpx.Auth` that reads the current token on each request, for tokens that get replaced. `TokenAuth(provider, dpop_key=key)` also adds a DPoP proof per request, which a bound token needs; static headers cannot carry one.
+`TokenAuth(provider)` is an `httpx.Auth` that reads the current token on each request, for tokens that get replaced (a [`TokenRefresher`](#keeping-a-token-alive) is a provider). `TokenAuth(provider, dpop_key=key)` also adds a DPoP proof per request, which a bound token needs; static headers cannot carry one.
 
 ## Verifying
 

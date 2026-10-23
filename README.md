@@ -249,7 +249,7 @@ A `Dockerfile` and `docker-compose.yml` run the same pair of servers in containe
 
 ## Python SDK
 
-[`sdk/python`](sdk/python/README.md) is a Python client (`pip install -e sdk/python`, Python 3.10 or newer, depends on `httpx`) for agents written in Python: token exchange with typed capabilities and constraints, calls through the proxy that raise `Denied(reason, decision_id)` on a denial, lease renewal, AuthZEN evaluation, token inspection, and an admin client for revocation and the audit log. There is an async variant of each client. [`examples/python-agent`](examples/python-agent/agent.py) shows a planner delegating to a coder, and a second script wires the official `mcp` client to the proxy.
+[`sdk/python`](sdk/python/README.md) is a Python client (`pip install -e sdk/python`, Python 3.10 or newer, depends on `httpx`) for agents written in Python: token exchange with typed capabilities and constraints, calls through the proxy that raise `Denied(reason, decision_id)` on a denial, lease renewal, a token refresher that renews leases and re-exchanges before `exp`, AuthZEN evaluation, token inspection, and an admin client for revocation and the audit log. There is an async variant of each client. [`examples/python-agent`](examples/python-agent/agent.py) shows a planner delegating to a coder, and a second script wires the official `mcp` client to the proxy.
 
 ```python
 from onbehalf import AdminClient, Capability, Client, Denied, Prefix
@@ -271,7 +271,7 @@ It is pre-alpha like the rest and is not published to PyPI.
 
 ## TypeScript SDK
 
-[`sdk/typescript`](sdk/typescript/README.md) is the same client for Node 20 or newer as the npm package `@onbehalf/sdk` (ESM and CJS, strict types, no runtime dependencies, global `fetch`, Ed25519 verification through WebCrypto): `OnbehalfClient` for exchange, renew, `callTool` (throws `DeniedError` with `reason` and `decisionId`), `listTools`, AuthZEN and `inspect`, and `AdminClient` for revocation, the audit log and policy reload. `mcpUrl` and `mcpHeaders` point the official `@modelcontextprotocol/sdk` client at the proxy. [`examples/typescript-agent`](examples/typescript-agent/agent.ts) shows a planner delegating to a coder.
+[`sdk/typescript`](sdk/typescript/README.md) is the same client for Node 20 or newer as the npm package `@onbehalf/sdk` (ESM and CJS, strict types, no runtime dependencies, global `fetch`, Ed25519 verification through WebCrypto): `OnbehalfClient` for exchange, renew, `callTool` (throws `DeniedError` with `reason` and `decisionId`), `listTools`, AuthZEN and `inspect`, and `AdminClient` for revocation, the audit log and policy reload. `TokenRefresher` keeps a token alive (lease renewal, re-exchange before `exp`). `mcpUrl` and `mcpHeaders` point the official `@modelcontextprotocol/sdk` client at the proxy. [`examples/typescript-agent`](examples/typescript-agent/agent.ts) shows a planner delegating to a coder.
 
 ```ts
 import { AdminClient, DeniedError, OnbehalfClient, capability, prefix } from "@onbehalf/sdk";

@@ -10,8 +10,8 @@ function iso(sec: number): string {
   return new Date(sec * 1000).toISOString().replace(/\.\d+Z$/, ".123456789Z");
 }
 
-export function hop(agent: string, caps: unknown[], lease: string, ttl = 900) {
-  const now = Math.floor(Date.now() / 1000);
+export function hop(agent: string, caps: unknown[], lease: string, ttl = 900, at?: number) {
+  const now = Math.floor(at ?? Date.now() / 1000);
   return {
     agent,
     capabilities: caps,
@@ -26,6 +26,8 @@ export interface MintOptions {
   subject?: string;
   caps?: unknown[];
   expDelta?: number;
+  /** Issue time in epoch seconds (default: now). */
+  at?: number;
   claims?: Record<string, unknown>;
   header?: Record<string, unknown>;
 }
@@ -51,7 +53,7 @@ export class Signer {
     const agents = o.agents ?? ["planner"];
     const subject = o.subject ?? "alice";
     const caps = o.caps ?? [{ server: "github", tool: "*" }];
-    const now = Math.floor(Date.now() / 1000);
+    const now = Math.floor(o.at ?? Date.now() / 1000);
     let act: Record<string, unknown> | undefined;
     for (const a of agents) act = act ? { sub: a, act } : { sub: a };
     const payload = {
@@ -70,7 +72,7 @@ export class Signer {
           issuer: "https://idp.example",
           authenticated_at: "2026-10-23T09:00:00.5Z",
         },
-        hops: agents.map((a, i) => hop(a, caps, `lease-${i}`)),
+        hops: agents.map((a, i) => hop(a, caps, `lease-${i}`, o.expDelta ?? 900, now)),
       },
       ...o.claims,
     };

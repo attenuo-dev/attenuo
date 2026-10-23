@@ -29,7 +29,7 @@ Things that are different from a plain MCP server:
 - **Tokens can be bound to keys.** A token with `cnf.jkt` needs a DPoP proof on every request, and the 401 then says `WWW-Authenticate: DPoP`. See [Binding tokens to keys](binding-tokens-to-keys.md).
 - **The bearer is not forwarded.** The upstream never sees the onbehalf token. If the upstream needs its own credential, onbehalf has no setting for injecting one in v0. Today that means the upstream must trust the proxy by network placement, or hold its own static credential.
 - **No OAuth discovery.** onbehalf does not serve Protected Resource Metadata (RFC 9728) or an authorization server. A 401 carries `WWW-Authenticate: Bearer realm="onbehalf"` and nothing else. An MCP client that tries to discover an authorization server will not find one. Configure the bearer yourself, as a static header or through a token provider you write.
-- **Whether your MCP client lets you set a header** (and refresh it) depends on the client. Most Streamable HTTP clients take custom headers. Which ones support changing the header between requests is untested here. If yours cannot, run a small local forwarder that adds a fresh bearer.
+- **Whether your MCP client lets you set a header** (and refresh it) depends on the client. Most Streamable HTTP clients take custom headers. Which ones support changing the header between requests is untested here. If yours cannot, run a small local forwarder that adds a fresh bearer. The SDKs have the per-request hook: `TokenAuth(provider)` in Python and `mcpFetch(provider)` in TypeScript, and a token refresher is such a provider.
 - **`tools/list` is filtered.** You see only the tools the token may call. A tool missing from the list is not necessarily missing upstream.
 - **Resources and prompts are authorized like tool calls.** `resources/read`, `resources/subscribe`, `prompts/get` and `completion/complete` need a capability with the method name as the tool, for example `github:resources/read`. Any other method outside a short allowlist is denied unless a capability and the policy permit it. `tools/list`, `resources/list`, `resources/templates/list` and `prompts/list` show only entries your capabilities could permit (the cursor is passed through, so a page can be empty while `nextCursor` is set). See [design/server.md](../design/server.md#mcp-method-coverage).
 
@@ -293,8 +293,8 @@ The CLI does the same: `ONBEHALF_TOKEN="$TOKEN" onbehalf authzen eval --server g
 - Keep the token and its lease id together, per agent.
 - Treat `-32003` as a decision. Branch on `data.reason`. Never retry blindly.
 - Log `decision_id`.
-- Renew your lease at a third of the interval, and stop on `lease_revoked`.
-- Refresh the root token before it expires. Tokens last `default_ttl_seconds` (900 by default).
+- Renew your lease at a third of the interval, and stop on `lease_revoked`. The Python (`TokenRefresher`) and TypeScript (`TokenRefresher`) SDKs do this, and re-exchange before `exp`, for you.
+- Refresh the root token before it expires. Tokens last `default_ttl_seconds` (900 by default). A parent token delegates to a given actor once, so a refresh needs a fresh subject token, not the same one again.
 - Hand sub-agents the narrowest token that does the job, with the shortest TTL that does the job.
 - Where a workload identity exists (SPIFFE, a cloud workload token), authenticate exchanges with an `actor_token` rather than a shared secret, one fresh token per exchange. Set `may_act` on tokens meant for one specific sub-agent.
 - Keep tokens out of prompts, tool arguments and logs. A token in a model's context can be leaked by the model.
