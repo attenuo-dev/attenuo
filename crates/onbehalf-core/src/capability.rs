@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::call::ToolCall;
 use crate::error::AttenuationError;
+use crate::jcs::value_eq;
 use crate::names::NameError;
 
 /// A constraint on a single tool argument.
@@ -19,10 +20,15 @@ use crate::names::NameError;
 /// Constraints are compared by *implication*: `a.implies(&b)` is true when every value that
 /// satisfies `a` also satisfies `b`. A child capability must carry constraints that imply the
 /// parent's, so it can only be stricter.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// JSON values are compared as their RFC 8785 canonical forms ([`crate::jcs::value_eq`]):
+/// numbers by value (`1` equals `1.0`, as in JavaScript and in the Cedar translation) and
+/// objects regardless of member order. Equality, ordering and the chain digest all use that
+/// one notion, so two constraints with the same digest also admit the same arguments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", content = "value", rename_all = "snake_case")]
 pub enum ArgConstraint {
-    /// Argument must equal this JSON value exactly.
+    /// Argument must equal this JSON value (canonically; see above).
     Equals(Value),
     /// Argument must equal one of these JSON values.
     OneOf(Vec<Value>),
@@ -31,16 +37,17 @@ pub enum ArgConstraint {
 }
 
 impl ArgConstraint {
-    /// Canonical JSON form; used for ordering so constraints can live in `BTreeSet`/`BTreeMap`.
-    fn canonical(&self) -> String {
-        serde_json::to_string(self).expect("constraint serializes")
+    /// Canonical (RFC 8785) JSON form; equality and ordering are defined on it, so
+    /// constraints can live in `BTreeSet`/`BTreeMap`.
+    fn canonical(&self) -> Vec<u8> {
+        crate::jcs::to_vec(self).expect("a constraint has a canonical JSON form")
     }
 
     /// Does a concrete argument value satisfy this constraint?
     pub fn satisfied_by(&self, value: &Value) -> bool {
         match self {
-            ArgConstraint::Equals(expected) => value == expected,
-            ArgConstraint::OneOf(options) => options.iter().any(|o| o == value),
+            ArgConstraint::Equals(expected) => value_eq(value, expected),
+            ArgConstraint::OneOf(options) => options.iter().any(|o| value_eq(o, value)),
             ArgConstraint::Prefix(prefix) => value
                 .as_str()
                 .map(|s| s.starts_with(prefix))
@@ -51,8 +58,10 @@ impl ArgConstraint {
     /// Does every value satisfying `self` also satisfy `other`?
     pub fn implies(&self, other: &ArgConstraint) -> bool {
         match (self, other) {
-            (ArgConstraint::Equals(a), ArgConstraint::Equals(b)) => a == b,
-            (ArgConstraint::Equals(a), ArgConstraint::OneOf(bs)) => bs.contains(a),
+            (ArgConstraint::Equals(a), ArgConstraint::Equals(b)) => value_eq(a, b),
+            (ArgConstraint::Equals(a), ArgConstraint::OneOf(bs)) => {
+                bs.iter().any(|b| value_eq(a, b))
+            }
             (ArgConstraint::Equals(a), ArgConstraint::Prefix(p)) => a
                 .as_str()
                 .map(|s| s.starts_with(p.as_str()))
@@ -60,9 +69,11 @@ impl ArgConstraint {
             // An empty `OneOf` is satisfied by no value, so it vacuously implies every
             // constraint (`all` over an empty set is true). That is sound: a capability
             // carrying it permits nothing, and it can still be re-delegated unchanged.
-            (ArgConstraint::OneOf(as_), ArgConstraint::Equals(b)) => as_.iter().all(|a| a == b),
+            (ArgConstraint::OneOf(as_), ArgConstraint::Equals(b)) => {
+                as_.iter().all(|a| value_eq(a, b))
+            }
             (ArgConstraint::OneOf(as_), ArgConstraint::OneOf(bs)) => {
-                as_.iter().all(|a| bs.contains(a))
+                as_.iter().all(|a| bs.iter().any(|b| value_eq(a, b)))
             }
             (ArgConstraint::OneOf(as_), ArgConstraint::Prefix(p)) => as_.iter().all(|a| {
                 a.as_str()
@@ -76,6 +87,14 @@ impl ArgConstraint {
         }
     }
 }
+
+impl PartialEq for ArgConstraint {
+    fn eq(&self, other: &Self) -> bool {
+        self.canonical() == other.canonical()
+    }
+}
+
+impl Eq for ArgConstraint {}
 
 impl PartialOrd for ArgConstraint {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -378,6 +397,27 @@ mod tests {
         let child = CapabilitySet::from_iter([Capability::new("github", "create_issue")
             .with_constraint("repo", ArgConstraint::OneOf(vec![json!("a"), json!("b")]))]);
         assert!(!parent.covers(&child));
+    }
+
+    /// SR-20: equality, ordering and satisfaction agree with the canonical (RFC 8785) form
+    /// that the chain digest hashes.
+    #[test]
+    fn constraints_compare_canonically_sr20() {
+        let a = ArgConstraint::Equals(serde_json::from_str(r#"{"x":1,"y":[2.0]}"#).unwrap());
+        let b = ArgConstraint::Equals(serde_json::from_str(r#"{"y":[2],"x":1.0}"#).unwrap());
+        assert_eq!(a, b);
+        assert_eq!(a.cmp(&b), std::cmp::Ordering::Equal);
+        assert!(a.implies(&b) && b.implies(&a));
+        let one = ArgConstraint::Equals(json!(1));
+        assert!(one.satisfied_by(&json!(1.0)));
+        assert!(!one.satisfied_by(&json!("1")));
+        assert!(ArgConstraint::OneOf(vec![json!(1.0)]).implies(&one));
+        let c = ArgConstraint::Equals(json!({"x": 2}));
+        assert_ne!(a, c);
+        assert_ne!(a.cmp(&c), std::cmp::Ordering::Equal);
+        // A set holds one of two canonically equal constraints.
+        let set: std::collections::BTreeSet<_> = [a.clone(), b, c].into_iter().collect();
+        assert_eq!(set.len(), 2);
     }
 
     #[test]

@@ -3,13 +3,19 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-/// SHA-256 over the canonical JSON encoding of `value`, hex-encoded.
+/// SHA-256 over the RFC 8785 canonical JSON encoding of `value` ([`crate::jcs`]),
+/// hex-encoded.
 ///
-/// Canonical here means: `serde_json` with map keys sorted (the default `Map` is a `BTreeMap`),
-/// no whitespace. Callers must use `BTreeMap`-backed structures for anything that must hash
-/// stably; the types in this crate do.
-pub fn sha256_json<T: Serialize>(value: &T) -> String {
-    let bytes = serde_json::to_vec(value).expect("serializable value");
+/// The bytes depend only on the JSON value: not on map types, member order or `serde_json`'s
+/// `preserve_order` feature, so a verifier in another language computes the same digest.
+///
+/// # Panics
+///
+/// If `value` has no canonical form ([`crate::jcs::JcsError`]: a NaN or infinite float, a
+/// non-string map key, a duplicate member, raw JSON). Nothing decoded from JSON holds one, and
+/// the types of this crate never do.
+pub fn sha256_json<T: Serialize + ?Sized>(value: &T) -> String {
+    let bytes = crate::jcs::to_vec(value).expect("value has a canonical JSON form");
     sha256_bytes(&bytes)
 }
 
@@ -34,6 +40,16 @@ mod tests {
         b.insert("a", 2);
         b.insert("b", 1);
         assert_eq!(sha256_json(&a), sha256_json(&b));
+    }
+
+    #[test]
+    fn digest_is_over_the_canonical_form() {
+        // Nested `serde_json` objects keep insertion order (`preserve_order` is on in this
+        // workspace); the digest does not depend on it, nor on `2.0` versus `2`.
+        let a: serde_json::Value = serde_json::from_str(r#"{"o":{"b":1,"a":2.0}}"#).unwrap();
+        let b: serde_json::Value = serde_json::from_str(r#"{"o":{"a":2,"b":1}}"#).unwrap();
+        assert_eq!(sha256_json(&a), sha256_json(&b));
+        assert_eq!(sha256_json(&a), sha256_bytes(br#"{"o":{"a":2,"b":1}}"#));
     }
 
     #[test]
