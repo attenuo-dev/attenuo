@@ -50,7 +50,8 @@
 //! }
 //! ```
 //!
-//! `session_id` is **absent** when the call carries none (Cedar has no `null`); test it with
+//! Through the MCP proxy, `session_id` is a 12-hex-digit SHA-256 prefix of the `Mcp-Session-Id`,
+//! never the id itself. It is **absent** when the call carries none (Cedar has no `null`); test it with
 //! `context has session_id`. The same goes for every `null` inside `input` and
 //! `originating_user.attributes`: null-valued members are dropped, so write
 //! `context.input has repo && context.input.repo like "acme/*"`. Integers (and floats with no

@@ -15,6 +15,12 @@
 //!    These, `tools/list` and `GET`/`DELETE` session requests are authenticated and
 //!    lease-checked ([`Authorizer::check_active`]) first, so a revoked token gets `401` there
 //!    too.
+//! 5. binds every `Mcp-Session-Id` the upstream assigns to the principal it was assigned to
+//!    (originating user and root lease) and refuses the id from anyone else: `403` with reason
+//!    `session_mismatch`, recorded through [`Authorizer::record_rejection`]. An id the proxy
+//!    does not know gets `404`, which tells an MCP client to start a new session. Decision
+//!    records and logs carry a hash prefix of the id ([`session::session_tag`]), never the id.
+//!    See [`session`].
 //!
 //! Every authorized request's response carries an `X-Onbehalf-Decision-Id` header with the
 //! id(s) of the decision record(s) the authorizer produced, so a client can correlate a reply
@@ -67,10 +73,12 @@ pub mod config;
 pub mod filter;
 pub mod jsonrpc;
 pub mod proxy;
+pub mod session;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
 pub use auth::{AuthDecision, AuthError, Authorizer};
 pub use config::{ProxyConfig, UpstreamConfig};
-pub use proxy::{router, serve, DECISION_ID_HEADER};
+pub use proxy::{router, serve, DECISION_ID_HEADER, REASON_SESSION_MISMATCH};
+pub use session::{SessionOwner, SessionRegistry};
