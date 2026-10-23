@@ -1,9 +1,12 @@
 //! `/admin/*`: leases, audit log and policy reload. Every route requires the static admin
 //! bearer from `[admin] token` (v0; see [`require_admin`]).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use attenuo_audit::{AuditEntry, AuditSink, EntryFilter, LeaseStore, Order, SignedVerifyReport};
+use attenuo_audit::{
+    AuditEntry, AuditSink, EntryFilter, LeaseNode, LeaseStore, Order, SignedVerifyReport,
+};
 use attenuo_core::{AgentId, LeaseId, RecordKind};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, Request, State};
@@ -144,6 +147,90 @@ pub async fn lease_status(
                 "expires_at": fmt(row.expires_at),
                 "revoked_at": row.revoked_at.map(fmt),
                 "revoke_reason": row.revoke_reason,
+            })))
+        })
+        .await
+}
+
+/// Leases `GET /admin/leases/{id}/tree` lists when the request names no `max_nodes`.
+pub const DEFAULT_TREE_NODES: usize = 1000;
+/// Most leases `GET /admin/leases/{id}/tree` lists, whatever `max_nodes` asks for. Bounds the
+/// response and the issuance lookup; `would_revoke` still counts the whole subtree.
+pub const MAX_TREE_NODES: usize = 10_000;
+
+/// Query of `GET /admin/leases/{lease_id}/tree`.
+#[derive(Debug, Deserialize)]
+pub struct TreeQuery {
+    /// Most nodes to list (default [`DEFAULT_TREE_NODES`], clamped to 1..=[`MAX_TREE_NODES`]).
+    pub max_nodes: Option<usize>,
+}
+
+/// `GET /admin/leases/{lease_id}/tree?max_nodes=`: a dry-run revocation. Answers
+/// `{root, ancestors, nodes, would_revoke, truncated}`:
+///
+/// - `nodes`: the lease, then everything delegated from it, breadth-first, at most
+///   `max_nodes`; `truncated` says the cap cut the list short.
+/// - `ancestors`: the leases it was delegated from, nearest first, ending at `root`, the
+///   chain's first hop (also the audit `chain_id`).
+/// - `would_revoke`: how many leases `POST /admin/leases/{lease_id}/revoke` would revoke if
+///   sent now, counted over the whole subtree with the same query the revocation runs.
+///
+/// Each node carries its registry row, whether it is active now, and `agent`, `issued_at`
+/// and `issued_seq` from the audit record that issued it (null when none is found). Nothing
+/// is written, not even an audit record: this is a read like `GET /admin/leases/{id}`.
+pub async fn lease_tree(
+    State(state): State<Arc<AppState>>,
+    Path(lease_id): Path<String>,
+    Query(q): Query<TreeQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let max_nodes = q
+        .max_nodes
+        .unwrap_or(DEFAULT_TREE_NODES)
+        .clamp(1, MAX_TREE_NODES);
+    let lease = LeaseId::new(lease_id);
+    state
+        .blocking(move |state| {
+            let tree = state
+                .leases
+                .subtree(&lease, max_nodes)?
+                .ok_or_else(|| ApiError::not_found(format!("unknown lease `{}`", lease.0)))?;
+            let root = tree.root().clone();
+            // Every lease here descends from `root`, so one indexed lookup by `chain_id`
+            // finds all their issuance records.
+            let wanted: Vec<&LeaseId> = tree
+                .ancestors
+                .iter()
+                .chain(&tree.nodes)
+                .map(|n| &n.id)
+                .collect();
+            let issued: BTreeMap<LeaseId, AuditEntry> = state
+                .audit
+                .issuance_records(&root.0, &wanted)?
+                .into_iter()
+                .filter_map(|e| Some((e.record.leases.last()?.clone(), e)))
+                .collect();
+            let now = now();
+            let fmt = |t: time::OffsetDateTime| t.format(&Rfc3339).unwrap_or_default();
+            let node = |n: &LeaseNode| {
+                let issuance = issued.get(&n.id);
+                json!({
+                    "lease_id": n.id,
+                    "parent": n.row.parent,
+                    "expires_at": fmt(n.row.expires_at),
+                    "revoked_at": n.row.revoked_at.map(fmt),
+                    "revoke_reason": n.row.revoke_reason,
+                    "active": n.row.is_active(now),
+                    "agent": issuance.and_then(|e| e.record.agents.last()),
+                    "issued_at": issuance.map(|e| fmt(e.record.at)),
+                    "issued_seq": issuance.map(|e| e.seq),
+                })
+            };
+            Ok(Json(json!({
+                "root": root,
+                "ancestors": tree.ancestors.iter().map(node).collect::<Vec<_>>(),
+                "nodes": tree.nodes.iter().map(node).collect::<Vec<_>>(),
+                "would_revoke": tree.would_revoke,
+                "truncated": tree.truncated,
             })))
         })
         .await

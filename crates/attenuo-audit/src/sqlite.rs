@@ -7,6 +7,7 @@
 //! process; across processes SQLite's write lock plus the `UNIQUE` constraint on `entry_hash`
 //! and the primary key on `seq` make a fork fail rather than succeed.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock, TryLockError};
@@ -22,7 +23,9 @@ use crate::checkpoint::{
 };
 use crate::error::AuditError;
 use crate::export::RecordFilter;
-use crate::lease::{classify, LeaseRow, LeaseStatus, LeaseStore};
+use crate::lease::{
+    ancestors_of, breadth_first, classify, LeaseRow, LeaseStatus, LeaseStore, LeaseSubtree,
+};
 use crate::log::{
     canonical_record_json, entry_hash_from_json, verify_entries, AuditEntry, AuditSink,
     VerifyReport, ENTRY_HASH_VERSION, GENESIS_HASH,
@@ -1657,6 +1660,40 @@ impl SqliteAudit {
         .pop())
     }
 
+    /// The issuance record (kind `root_token` or `exchange`) of each lease in `leases`, all of
+    /// which belong to the chain `chain_id`. The issuance of a hop is the record whose last
+    /// lease is that hop's, so its last agent is the agent the lease was issued to. Leases
+    /// with no such record are absent from the result; if a lease has several, the earliest
+    /// wins.
+    ///
+    /// Reads through the `chain_id` index and decodes only that chain's issuance records, so
+    /// the cost grows with the chain, not the log.
+    pub fn issuance_records(
+        &self,
+        chain_id: &str,
+        leases: &[&LeaseId],
+    ) -> Result<Vec<AuditEntry>, AuditError> {
+        let wanted: BTreeSet<&LeaseId> = leases.iter().copied().collect();
+        let mut found: BTreeMap<LeaseId, AuditEntry> = BTreeMap::new();
+        let sql = format!(
+            "SELECT {ENTRY_COLUMNS} FROM audit WHERE chain_id = ?1 \
+             AND kind IN ('root_token', 'exchange') ORDER BY seq"
+        );
+        let conn = self.inner.conn.lock()?;
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut rows = stmt.query([chain_id])?;
+        while let Some(row) = rows.next()? {
+            let entry = entry_from_row(row)?;
+            let Some(last) = entry.record.leases.last() else {
+                continue;
+            };
+            if wanted.contains(last) && !found.contains_key(last) {
+                found.insert(last.clone(), entry);
+            }
+        }
+        Ok(found.into_values().collect())
+    }
+
     /// Every entry bound to one delegation chain, in order.
     pub fn by_chain(&self, chain_digest: &str) -> Result<Vec<AuditEntry>, AuditError> {
         let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE chain_digest = ?1 ORDER BY seq");
@@ -1820,6 +1857,38 @@ impl SqliteLeaseStore {
         let conn = self.conn.lock()?;
         get_in(&conn, lease)
     }
+
+    /// What revoking `lease` would touch, without changing anything; `None` for an unknown
+    /// lease. A dry run of [`revoke`](LeaseStore::revoke): it reads the subtree through the
+    /// same recursive query over `leases_parent_idx`, so `would_revoke` is the count a
+    /// revocation run now would return. `nodes` holds at most `max_nodes` leases (at least 1),
+    /// found breadth-first; `would_revoke` counts the whole subtree regardless of the cap.
+    pub fn subtree(
+        &self,
+        lease: &LeaseId,
+        max_nodes: usize,
+    ) -> Result<Option<LeaseSubtree>, AuditError> {
+        let mut conn = self.conn.lock()?;
+        subtree_in(&mut conn, lease, max_nodes)
+    }
+}
+
+/// `SELECT id FROM sub`, where `sub` is lease `?1` and every lease descended from it, found
+/// through `leases_parent_idx`. UNION (not UNION ALL) so an accidental cycle terminates.
+/// `$limit` goes on the recursive select: `""` for the whole subtree, or a `LIMIT` that stops
+/// the recursion early. Revocation and its preview ([`SqliteLeaseStore::subtree`]) both use
+/// this, so the preview counts exactly the rows a revocation would change.
+macro_rules! subtree_ids {
+    ($limit:literal) => {
+        concat!(
+            "WITH RECURSIVE sub(id) AS ( \
+                 SELECT id FROM leases WHERE id = ?1 \
+                 UNION \
+                 SELECT l.id FROM leases l JOIN sub ON l.parent = sub.id ",
+            $limit,
+            ") SELECT id FROM sub"
+        )
+    };
 }
 
 fn revoke_in(
@@ -1832,19 +1901,65 @@ fn revoke_in(
     if get_in(&tx, lease)?.is_none() {
         return Err(AuditError::UnknownLease(lease.0.clone()));
     }
-    // UNION (not UNION ALL) so an accidental cycle terminates.
     let changed = tx.execute(
-        "UPDATE leases SET revoked_at = ?2, revoke_reason = ?3 \
-         WHERE revoked_at IS NULL AND id IN ( \
-             WITH RECURSIVE sub(id) AS ( \
-                 SELECT id FROM leases WHERE id = ?1 \
-                 UNION \
-                 SELECT l.id FROM leases l JOIN sub ON l.parent = sub.id \
-             ) SELECT id FROM sub)",
+        concat!(
+            "UPDATE leases SET revoked_at = ?2, revoke_reason = ?3 \
+             WHERE revoked_at IS NULL AND id IN (",
+            subtree_ids!(""),
+            ")"
+        ),
         params![lease.0, fmt_time(now)?, reason],
     )?;
     tx.commit()?;
     Ok(changed as u64)
+}
+
+/// [`SqliteLeaseStore::subtree`] inside one read transaction, so the nodes, the count and the
+/// ancestors describe the same moment.
+fn subtree_in(
+    conn: &mut Connection,
+    lease: &LeaseId,
+    max_nodes: usize,
+) -> Result<Option<LeaseSubtree>, AuditError> {
+    let tx = conn.transaction()?;
+    let Some(row) = get_in(&tx, lease)? else {
+        return Ok(None);
+    };
+    // The same predicate as the UPDATE in `revoke_in`, counted instead of written.
+    let would_revoke: i64 = tx
+        .prepare_cached(concat!(
+            "SELECT COUNT(*) FROM leases WHERE revoked_at IS NULL AND id IN (",
+            subtree_ids!(""),
+            ")"
+        ))?
+        .query_row([&lease.0], |r| r.get(0))?;
+    // One row past the cap tells a full answer from a truncated one.
+    let max_nodes = max_nodes.max(1);
+    let fetch = i64::try_from(max_nodes.saturating_add(1)).unwrap_or(i64::MAX);
+    let mut found = Vec::new();
+    {
+        let mut stmt = tx.prepare_cached(concat!(
+            "SELECT id, parent, expires_at, revoked_at, revoke_reason FROM leases WHERE id IN (",
+            subtree_ids!("LIMIT ?2"),
+            ")"
+        ))?;
+        let mut rows = stmt.query(params![lease.0, fetch])?;
+        while let Some(r) = rows.next()? {
+            let (id, row) = lease_row_from(r)?;
+            found.push((LeaseId(id), row));
+        }
+    }
+    let truncated = found.len() > max_nodes;
+    let mut nodes = breadth_first(lease, found);
+    nodes.truncate(max_nodes);
+    let ancestors = ancestors_of(lease, &row, |id| get_in(&tx, id))?;
+    tx.commit()?;
+    Ok(Some(LeaseSubtree {
+        nodes,
+        ancestors,
+        would_revoke: u64::try_from(would_revoke).unwrap_or(0),
+        truncated,
+    }))
 }
 
 fn binding_in(conn: &Connection, lease: &LeaseId) -> Result<Option<String>, AuditError> {
@@ -1885,20 +2000,25 @@ fn rows_in(conn: &Connection, leases: &[&LeaseId]) -> Result<Vec<(String, LeaseR
             chunk.iter().map(|l| l.0.as_str()),
         ))?;
         while let Some(row) = rows.next()? {
-            let expires_at: String = row.get(2)?;
-            let revoked_at: Option<String> = row.get(3)?;
-            out.push((
-                row.get::<_, String>(0)?,
-                LeaseRow {
-                    parent: row.get::<_, Option<String>>(1)?.map(LeaseId),
-                    expires_at: parse_time(&expires_at)?,
-                    revoked_at: revoked_at.as_deref().map(parse_time).transpose()?,
-                    revoke_reason: row.get(4)?,
-                },
-            ));
+            out.push(lease_row_from(row)?);
         }
     }
     Ok(out)
+}
+
+/// Decode `id, parent, expires_at, revoked_at, revoke_reason` (in that order).
+fn lease_row_from(row: &Row<'_>) -> Result<(String, LeaseRow), AuditError> {
+    let expires_at: String = row.get(2)?;
+    let revoked_at: Option<String> = row.get(3)?;
+    Ok((
+        row.get::<_, String>(0)?,
+        LeaseRow {
+            parent: row.get::<_, Option<String>>(1)?.map(LeaseId),
+            expires_at: parse_time(&expires_at)?,
+            revoked_at: revoked_at.as_deref().map(parse_time).transpose()?,
+            revoke_reason: row.get(4)?,
+        },
+    ))
 }
 
 fn get_in(conn: &Connection, lease: &LeaseId) -> Result<Option<LeaseRow>, AuditError> {
