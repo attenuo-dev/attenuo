@@ -351,10 +351,10 @@ impl ServerAuthorizer {
     }
 }
 
-/// Tokens kept by [`VerifiedTokens`].
+/// Tokens kept by the verified-token cache (`VerifiedTokens`).
 pub const VERIFIED_TOKENS_CAPACITY: usize = 4096;
 
-/// Largest token [`VerifiedTokens`] keeps, in bytes. A token of a few hops with ordinary
+/// Largest token the verified-token cache (`VerifiedTokens`) keeps, in bytes. A token of a few hops with ordinary
 /// capabilities is 1 to 4 KiB; a child can carry an arbitrarily long constraint list (a
 /// narrowing of its parent), which would make the cache's 4096 entries hundreds of MiB (SR-46).
 pub const VERIFIED_TOKEN_MAX_BYTES: usize = 16 * 1024;

@@ -313,6 +313,8 @@ fn request_span(server: &str, chain: &DelegationChain, session_id: Option<&str>)
 /// bound to someone else is refused with `403` (`session_mismatch`, recorded through
 /// [`Authorizer::record_rejection`]); one the proxy does not know gets `404`, the MCP signal
 /// to start a new session.
+// The `Err` is a full response, built once per refused request; boxing it buys nothing.
+#[allow(clippy::result_large_err)]
 async fn session_gate(
     state: &AppState,
     server: &str,
