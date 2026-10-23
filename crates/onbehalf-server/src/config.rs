@@ -584,6 +584,233 @@ pub struct AuditSection {
     /// audit checkpoints above. Ignored for `":memory:"`.
     #[serde(default = "default_wal_checkpoint_seconds")]
     pub wal_checkpoint_seconds: u64,
+    /// `[audit.sink]`: ship every signed checkpoint off the host as it is created (SR-21).
+    /// Unset by default.
+    #[serde(default)]
+    pub sink: Option<SinkSection>,
+}
+
+/// Where `[audit.sink]` ships checkpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SinkKind {
+    /// `POST` each checkpoint to `url`.
+    Webhook,
+    /// Append each checkpoint as one JSON line to `path`.
+    File,
+    /// `PUT` each checkpoint as one object to an S3-compatible bucket (SigV4).
+    S3,
+}
+
+impl std::fmt::Display for SinkKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Webhook => "webhook",
+            Self::File => "file",
+            Self::S3 => "s3",
+        })
+    }
+}
+
+/// Environment variable read for `[audit.sink] bearer_token` when the file leaves it unset.
+pub const SINK_TOKEN_ENV: &str = "ONBEHALF_AUDIT_SINK_TOKEN";
+
+/// `[audit.sink]`: the checkpoint sink (SR-21). A signed checkpoint is only as trustworthy as
+/// the host holding the signing key; a copy that has left the host cannot be re-signed. Every
+/// checkpoint the log creates is queued (bounded, never blocking an append) and delivered by a
+/// background thread with retries and jittered exponential backoff. See
+/// `docs/concepts/audit-log.md#shipping-checkpoints-off-the-host`.
+///
+/// Only the fields of the chosen `kind` may be set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SinkSection {
+    /// `"webhook"`, `"file"` or `"s3"`.
+    pub kind: SinkKind,
+    /// webhook: the URL to `POST` to. Any 2xx is success; redirects are not followed.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// webhook: sent as `Authorization: Bearer <token>`. Falls back to
+    /// [`SINK_TOKEN_ENV`].
+    #[serde(default)]
+    pub bearer_token: Option<String>,
+    /// file: the JSON Lines file to append to (created if missing, synced after each line).
+    /// Put it on another mount than the SQLite file, ideally append-only (`chattr +a`) and
+    /// shipped by the operator's own agent.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    /// s3: endpoint base URL, e.g. `https://s3.eu-west-1.amazonaws.com` or
+    /// `http://minio:9000`. Requests are path-style: `<endpoint>/<bucket>/<key>`.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// s3: bucket name.
+    #[serde(default)]
+    pub bucket: Option<String>,
+    /// s3: signing region. Default `us-east-1`.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// s3: key prefix; objects are `<prefix><seq, 20 digits>-<first 16 hex of
+    /// checkpoint_sha256>.json`. Default `onbehalf/checkpoints/`.
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// s3: access key id. Falls back to `AWS_ACCESS_KEY_ID`.
+    #[serde(default)]
+    pub access_key_id: Option<String>,
+    /// s3: secret access key. Falls back to `AWS_SECRET_ACCESS_KEY`.
+    #[serde(default)]
+    pub secret_access_key: Option<String>,
+    /// s3: session token for temporary credentials. Falls back to `AWS_SESSION_TOKEN`.
+    #[serde(default)]
+    pub session_token: Option<String>,
+    /// Checkpoints waiting to be delivered, at most. When full, the oldest queued one is
+    /// dropped (a later checkpoint covers every entry an earlier one does) and
+    /// `onbehalf_audit_sink_dropped_total` counts it. Default 1024.
+    #[serde(default = "default_sink_queue_capacity")]
+    pub queue_capacity: usize,
+    /// `/readyz` reports the sink degraded once the oldest undelivered checkpoint is older
+    /// than this, or the queue is full. Default 300.
+    #[serde(default = "default_sink_max_lag_seconds")]
+    pub max_lag_seconds: u64,
+    /// Turn a degraded sink into a failed readiness check (503). Default `false`: `/readyz`
+    /// stays 200 and reports `"degraded": true`.
+    #[serde(default)]
+    pub fail_readiness: bool,
+    /// Per-request timeout for webhook and s3, in seconds. Default 10.
+    #[serde(default = "default_sink_timeout_seconds")]
+    pub timeout_seconds: u64,
+    /// First retry delay in milliseconds; doubles per attempt, with jitter. Default 500.
+    #[serde(default = "default_sink_initial_backoff_ms")]
+    pub initial_backoff_ms: u64,
+    /// Longest retry delay in seconds. Default 60.
+    #[serde(default = "default_sink_max_backoff_seconds")]
+    pub max_backoff_seconds: u64,
+}
+
+fn default_sink_queue_capacity() -> usize {
+    1024
+}
+fn default_sink_max_lag_seconds() -> u64 {
+    300
+}
+fn default_sink_timeout_seconds() -> u64 {
+    10
+}
+fn default_sink_initial_backoff_ms() -> u64 {
+    500
+}
+fn default_sink_max_backoff_seconds() -> u64 {
+    60
+}
+
+impl SinkSection {
+    /// A section of `kind` with every other field at its default.
+    pub fn new(kind: SinkKind) -> Self {
+        Self {
+            kind,
+            url: None,
+            bearer_token: None,
+            path: None,
+            endpoint: None,
+            bucket: None,
+            region: None,
+            prefix: None,
+            access_key_id: None,
+            secret_access_key: None,
+            session_token: None,
+            queue_capacity: default_sink_queue_capacity(),
+            max_lag_seconds: default_sink_max_lag_seconds(),
+            fail_readiness: false,
+            timeout_seconds: default_sink_timeout_seconds(),
+            initial_backoff_ms: default_sink_initial_backoff_ms(),
+            max_backoff_seconds: default_sink_max_backoff_seconds(),
+        }
+    }
+
+    /// Startup check: the fields `kind` needs are set, no other kind's fields are, and the
+    /// limits are positive.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let set = |name: &'static str, present: bool| present.then_some(name);
+        let webhook = [
+            set("url", self.url.is_some()),
+            set("bearer_token", self.bearer_token.is_some()),
+        ];
+        let file = [set("path", self.path.is_some())];
+        let s3 = [
+            set("endpoint", self.endpoint.is_some()),
+            set("bucket", self.bucket.is_some()),
+            set("region", self.region.is_some()),
+            set("prefix", self.prefix.is_some()),
+            set("access_key_id", self.access_key_id.is_some()),
+            set("secret_access_key", self.secret_access_key.is_some()),
+            set("session_token", self.session_token.is_some()),
+        ];
+        let kind = self.kind;
+        let foreign: Vec<&str> = match kind {
+            SinkKind::Webhook => file.iter().chain(&s3).flatten().copied().collect(),
+            SinkKind::File => webhook.iter().chain(&s3).flatten().copied().collect(),
+            SinkKind::S3 => webhook.iter().chain(&file).flatten().copied().collect(),
+        };
+        if !foreign.is_empty() {
+            anyhow::bail!(
+                "[audit.sink] kind = \"{kind}\" does not use {}",
+                foreign.join(", ")
+            );
+        }
+        let need = |name: &str, present: bool| {
+            if present {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(
+                    "[audit.sink] kind = \"{kind}\" needs `{name}`"
+                ))
+            }
+        };
+        let http_url = |name: &str, v: &str| {
+            if v.starts_with("https://") || v.starts_with("http://") {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!(
+                    "[audit.sink] {name} = {v:?} must start with https:// or http://"
+                ))
+            }
+        };
+        match kind {
+            SinkKind::Webhook => {
+                need("url", self.url.is_some())?;
+                http_url("url", self.url.as_deref().unwrap_or_default())?;
+            }
+            SinkKind::File => need("path", self.path.is_some())?,
+            SinkKind::S3 => {
+                need("endpoint", self.endpoint.is_some())?;
+                need("bucket", self.bucket.is_some())?;
+                let ep = self.endpoint.as_deref().unwrap_or_default();
+                http_url("endpoint", ep)?;
+                let rest = ep.split_once("://").map_or("", |(_, r)| r);
+                if rest.trim_end_matches('/').contains('/') || rest.contains(['?', '#']) {
+                    anyhow::bail!(
+                        "[audit.sink] endpoint = {ep:?} must be a base URL without a path \
+                         (requests are path-style: <endpoint>/<bucket>/<key>)"
+                    );
+                }
+                let bucket = self.bucket.as_deref().unwrap_or_default();
+                if bucket.is_empty() || bucket.contains('/') {
+                    anyhow::bail!("[audit.sink] bucket = {bucket:?} is not a bucket name");
+                }
+            }
+        }
+        if self.queue_capacity == 0 {
+            anyhow::bail!("[audit.sink] queue_capacity must be at least 1");
+        }
+        if self.max_lag_seconds == 0 || self.timeout_seconds == 0 {
+            anyhow::bail!("[audit.sink] max_lag_seconds and timeout_seconds must be positive");
+        }
+        if self.initial_backoff_ms == 0 || self.max_backoff_seconds == 0 {
+            anyhow::bail!(
+                "[audit.sink] initial_backoff_ms and max_backoff_seconds must be positive"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for AuditSection {
@@ -594,6 +821,7 @@ impl Default for AuditSection {
             checkpoint_interval_seconds: default_checkpoint_interval_seconds(),
             durability: onbehalf_audit::Durability::default(),
             wal_checkpoint_seconds: default_wal_checkpoint_seconds(),
+            sink: None,
         }
     }
 }

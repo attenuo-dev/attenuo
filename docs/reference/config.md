@@ -63,6 +63,28 @@ Server and tool names follow one rule everywhere (catalog, `[[upstreams]]`, capa
 
 Checkpoints are signed with the issuer key and verified against the JWKS; see [Audit log](../concepts/audit-log.md#signed-checkpoints).
 
+### `[audit.sink]`
+
+Ships every signed checkpoint off the host as it is created (SR-21); see [Shipping checkpoints off the host](../concepts/audit-log.md#shipping-checkpoints-off-the-host). Unset by default. Only the keys of the chosen `kind` may be set; a missing required key fails startup.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `kind` | required | `"webhook"`, `"file"` or `"s3"`. |
+| `url` | required for webhook | URL to `POST` each checkpoint to (`http://` or `https://`). Any 2xx is success; redirects are not followed. |
+| `bearer_token` | `ONBEHALF_AUDIT_SINK_TOKEN` | webhook: sent as `Authorization: Bearer <token>`. |
+| `path` | required for file | JSON Lines file to append to; created if missing, synced after each line. Put it on another mount than `sqlite_path` (a warning at startup otherwise). |
+| `endpoint` | required for s3 | Base URL without a path, e.g. `https://s3.eu-west-1.amazonaws.com` or `http://minio:9000`. Requests are path-style. |
+| `bucket` | required for s3 | Bucket name. |
+| `region` | `us-east-1` | s3: SigV4 signing region. |
+| `prefix` | `onbehalf/checkpoints/` | s3: object key prefix; keys are `<prefix><seq, 20 digits>-<16 hex of checkpoint_sha256>.json`. |
+| `access_key_id`, `secret_access_key`, `session_token` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | s3 credentials. Give them `PutObject` only. |
+| `queue_capacity` | 1024 | Checkpoints waiting for delivery, at most. When full, the oldest queued one is dropped and `onbehalf_audit_sink_dropped_total` counts it. |
+| `max_lag_seconds` | 300 | `/readyz` reports the sink degraded once the oldest undelivered checkpoint is older than this, or the queue is full. |
+| `fail_readiness` | `false` | Make a degraded sink fail `/readyz` (503). Off by default: the server keeps serving and reports `"degraded": true`. |
+| `timeout_seconds` | 10 | Per-request timeout (webhook, s3). |
+| `initial_backoff_ms` | 500 | First retry delay; doubles per attempt up to `max_backoff_seconds`, each wait drawn between half and all of it. Failed deliveries are retried until they succeed. |
+| `max_backoff_seconds` | 60 | Longest retry delay. |
+
 ## `[authzen]`
 
 | Key | Default | Meaning |

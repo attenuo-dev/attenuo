@@ -90,7 +90,7 @@ No finding in `onbehalf-policy`.
 - **SR-35.** Key files are written with mode 0600 and `create_new`, and token and secret flags take stdin or files. The demo and examples use `mktemp -d`.
 - **SR-36.** A full registry refuses with 503 and never evicts a live binding, and expired bindings are reclaimed oldest first. The remaining gap was per principal (SR-49, now fixed).
 
-Still open from earlier passes, not re-examined here: SR-20 (canonical JSON; fixed since on `fix/audit-followups`) and SR-21 (checkpoints are signed but not shipped off the host).
+Still open from earlier passes, not re-examined here: SR-20 (canonical JSON; fixed since on `fix/audit-followups`) and SR-21 (checkpoints are signed but not shipped off the host; fixed since on `feat/checkpoint-sink`).
 
 ## Checked and found sound
 

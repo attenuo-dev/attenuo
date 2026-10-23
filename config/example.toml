@@ -84,6 +84,19 @@ durability = "normal"
 # also when the newest decisions reach the disk. 0 leaves it to SQLite on the writer.
 wal_checkpoint_seconds = 5
 
+# Ship every signed checkpoint off the host as it is created (SR-21). The signing key lives
+# here, so only a copy that already left the host shows a log rewritten and re-signed later
+# (`onbehalf audit verify --file <export> --checkpoints <shipped.jsonl>`). kind = "webhook"
+# (POST, any 2xx), "file" (append JSON Lines on another mount, shipped by your own agent) or
+# "s3" (SigV4 PUT to an S3-compatible bucket). Delivery is queued and retried with backoff;
+# /readyz reports "degraded" when the queue is full or lags more than max_lag_seconds.
+# [audit.sink]
+# kind = "webhook"
+# url = "https://anchor.example.com/onbehalf/checkpoints"
+# bearer_token = "..."          # or ONBEHALF_AUDIT_SINK_TOKEN
+# max_lag_seconds = 300
+# queue_capacity = 1024
+
 # MCP servers (Streamable HTTP), mounted at /mcp/<name>. `name` is the server part of
 # capabilities, e.g. "github:read_file".
 [[upstreams]]

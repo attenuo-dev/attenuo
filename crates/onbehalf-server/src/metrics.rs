@@ -44,6 +44,14 @@ pub struct Metrics {
     leases_revoked: AtomicU64,
     audit_append_errors: AtomicU64,
     audit_checkpoints: AtomicU64,
+    /// `[audit.sink]` (SR-21): checkpoints delivered, delivery attempts that failed,
+    /// checkpoints dropped from a full queue, the queue depth, and when the oldest undelivered
+    /// checkpoint was queued (unix seconds, 0 when none).
+    audit_sink_delivered: AtomicU64,
+    audit_sink_failures: AtomicU64,
+    audit_sink_dropped: AtomicU64,
+    audit_sink_queue_depth: AtomicU64,
+    audit_sink_oldest_unix: AtomicU64,
     /// Time to decide one tool call.
     authorize: Histogram,
     /// Time for one audit append, lock wait and commit included.
@@ -62,6 +70,11 @@ impl Default for Metrics {
             leases_revoked: AtomicU64::default(),
             audit_append_errors: AtomicU64::default(),
             audit_checkpoints: AtomicU64::default(),
+            audit_sink_delivered: AtomicU64::default(),
+            audit_sink_failures: AtomicU64::default(),
+            audit_sink_dropped: AtomicU64::default(),
+            audit_sink_queue_depth: AtomicU64::default(),
+            audit_sink_oldest_unix: AtomicU64::default(),
             authorize: Histogram::new(&BUCKETS),
             audit_append: Histogram::new(&BUCKETS),
             stages: std::array::from_fn(|_| Histogram::new(&STAGE_BUCKETS)),
@@ -213,6 +226,31 @@ impl Metrics {
         self.audit_checkpoints.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count one checkpoint delivered by `[audit.sink]`.
+    pub fn audit_sink_delivered(&self) {
+        self.audit_sink_delivered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one failed delivery attempt (it is retried).
+    pub fn audit_sink_failure(&self) {
+        self.audit_sink_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one checkpoint dropped from a full sink queue.
+    pub fn audit_sink_dropped(&self) {
+        self.audit_sink_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Set the sink queue gauges: queued checkpoints, and when the oldest undelivered one
+    /// (queued or in flight) was queued.
+    pub fn audit_sink_queue(&self, depth: u64, oldest: Option<std::time::SystemTime>) {
+        self.audit_sink_queue_depth.store(depth, Ordering::Relaxed);
+        let unix = oldest
+            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs().max(1));
+        self.audit_sink_oldest_unix.store(unix, Ordering::Relaxed);
+    }
+
     /// Prometheus text exposition format (version 0.0.4).
     pub fn render(&self) -> String {
         let mut out = String::new();
@@ -266,6 +304,36 @@ impl Metrics {
             "Signed audit checkpoints written.",
             &self.audit_checkpoints,
         );
+        simple_counter(
+            &mut out,
+            "audit_sink_delivered_total",
+            "Signed audit checkpoints delivered off the host by [audit.sink].",
+            &self.audit_sink_delivered,
+        );
+        simple_counter(
+            &mut out,
+            "audit_sink_failures_total",
+            "Checkpoint deliveries by [audit.sink] that failed and will be retried.",
+            &self.audit_sink_failures,
+        );
+        simple_counter(
+            &mut out,
+            "audit_sink_dropped_total",
+            "Checkpoints dropped from a full [audit.sink] queue before delivery.",
+            &self.audit_sink_dropped,
+        );
+        simple_gauge(
+            &mut out,
+            "audit_sink_queue_depth",
+            "Checkpoints waiting in the [audit.sink] queue.",
+            &self.audit_sink_queue_depth,
+        );
+        simple_gauge(
+            &mut out,
+            "audit_sink_oldest_undelivered_timestamp_seconds",
+            "Unix time the oldest undelivered checkpoint was queued; 0 when none.",
+            &self.audit_sink_oldest_unix,
+        );
         header_lines(
             &mut out,
             "http_requests_total",
@@ -317,6 +385,11 @@ fn header_lines(out: &mut String, name: &str, help: &str, kind: &str) {
 
 fn simple_counter(out: &mut String, name: &str, help: &str, c: &AtomicU64) {
     header_lines(out, name, help, "counter");
+    let _ = writeln!(out, "{PREFIX}_{name} {}", c.load(Ordering::Relaxed));
+}
+
+fn simple_gauge(out: &mut String, name: &str, help: &str, c: &AtomicU64) {
+    header_lines(out, name, help, "gauge");
     let _ = writeln!(out, "{PREFIX}_{name} {}", c.load(Ordering::Relaxed));
 }
 

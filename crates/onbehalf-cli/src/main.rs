@@ -268,11 +268,20 @@ async fn run(cli: Cli) -> Result<Outcome> {
             file: Some(file),
             jwks,
             allow_unsigned_tail,
+            checkpoints,
         }) => {
             let options = onbehalf_audit::VerifyOptions {
                 allow_unsigned_tail,
             };
-            audit_verify_file(client, &file, jwks.as_deref(), options, json).await
+            audit_verify_file(
+                client,
+                &file,
+                jwks.as_deref(),
+                checkpoints.as_deref(),
+                options,
+                json,
+            )
+            .await
         }
         Command::Audit(AuditCmd::Export {
             from,
@@ -635,6 +644,7 @@ async fn audit_verify_file(
     client: Result<Client>,
     file: &std::path::Path,
     jwks: Option<&std::path::Path>,
+    shipped: Option<&std::path::Path>,
     options: onbehalf_audit::VerifyOptions,
     json: bool,
 ) -> Result<Outcome> {
@@ -654,19 +664,63 @@ async fn audit_verify_file(
     };
     let keys = onbehalf_audit::CheckpointKeys::from_jwks(&jwks)?;
     let report = onbehalf_audit::verify_export_with(&export, &keys, options)?;
-    let v = serde_json::to_value(&report)?;
+    let mut v = serde_json::to_value(&report)?;
+    let mut ok = report.report.ok;
+    if let Some(p) = shipped {
+        let text =
+            std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
+        let lines = onbehalf_audit::parse_shipped(&text)
+            .with_context(|| format!("parsing {}", p.display()))?;
+        let cross = onbehalf_audit::cross_check(&export, &lines, &keys);
+        ok &= cross.ok;
+        v["shipped"] = serde_json::to_value(&cross)?;
+        v["ok"] = json!(ok);
+    }
     if json {
         print_json(&v);
     } else {
         for line in export_lines(&v) {
             println!("{line}");
         }
+        if v.get("shipped").is_some() {
+            for line in shipped_lines(&v["shipped"]) {
+                println!("{line}");
+            }
+        }
     }
-    Ok(if report.report.ok {
-        Outcome::Ok
+    Ok(if ok { Outcome::Ok } else { Outcome::No })
+}
+
+/// Text for the cross-check against shipped checkpoints (`--checkpoints`).
+fn shipped_lines(v: &Value) -> Vec<String> {
+    let mut out = vec![format!(
+        "shipped checkpoints: {} in the file, {} inside the export's range, {} match",
+        v["shipped"], v["in_range"], v["matched"]
+    )];
+    for m in v["mismatches"].as_array().into_iter().flatten() {
+        out.push(format!(
+            "shipped checkpoint seq {} (line {}) MISMATCH: {}",
+            m["seq"],
+            m["line"],
+            m["reason"].as_str().unwrap_or_default()
+        ));
+    }
+    if let Some(n) = v["beyond_range"].as_u64().filter(|n| *n > 0) {
+        out.push(format!(
+            "note: {n} shipped checkpoints lie past the export's range and were not checked; if \
+             the export runs to the head of the log, the log is shorter than what was shipped \
+             (last shipped seq {})",
+            v["last_shipped_seq"]
+        ));
+    }
+    if v["ok"] == true {
+        out.push("shipped checkpoints: OK".to_string());
     } else {
-        Outcome::No
-    })
+        out.push(
+            "shipped checkpoints: FAILED (signed again after shipping, or deleted)".to_string(),
+        );
+    }
+    out
 }
 
 /// Text for an offline export verification: what the file covers, then the same chain and

@@ -34,7 +34,7 @@ Go through this before pointing anything real at the server.
 - [ ] Every tool on the upstream that agents should call is in the catalog. With the default `[policy] unknown_tools = "deny"`, a tool missing from the catalog is denied with `tool_not_in_catalog`; with `"allow"` it is neither `readonly` nor `sensitive`, so rules that depend on those attributes do not see it.
 - [ ] The config file is mode 0600. It holds secret hashes and possibly the admin token. The admin token can come from `ONBEHALF_ADMIN_TOKEN` instead; there is no other environment-variable substitution, so inject the file at deploy time.
 - [ ] You have read the [threat model](../spec/threat-model.md) section "What onbehalf does not prevent" and have decided how the agents' other routes (direct API keys, local STDIO servers) are closed.
-- [ ] Something checks `onbehalf audit verify` on a schedule, and something copies `/admin/audit/checkpoint` off the host. The server signs checkpoints itself (`[audit] checkpoint_every`, `checkpoint_interval_seconds`); `audit verify` reports the last signed `seq`.
+- [ ] Something checks `onbehalf audit verify` on a schedule, and `[audit.sink]` ships checkpoints off the host ([audit log](../concepts/audit-log.md#shipping-checkpoints-off-the-host)). The server signs checkpoints itself (`[audit] checkpoint_every`, `checkpoint_interval_seconds`); `audit verify` reports the last signed `seq`.
 
 ## Network exposure
 
@@ -145,7 +145,7 @@ Backup:
 - Use SQLite's own backup, not a plain file copy, while the server runs: `sqlite3 /var/lib/onbehalf/onbehalf.sqlite ".backup '/backups/onbehalf-$(date +%F).sqlite'"`. This needs the `sqlite3` command-line tool. Untested here.
 - Keep the PEM and the config separately from the database backup.
 - Know what a restore does. Restoring an old backup rewinds the lease registry, so a lease revoked after the backup is live again, and it cuts the audit log back to that point. After a restore, revoke anything that was revoked since, and note the gap.
-- Copy `GET /admin/audit/checkpoint` (`{seq, head_hash, at, kid, signature}`) somewhere the server's host cannot write, such as a ticket system or a separate log store. A hash chain proves the log was not edited in the middle. It does not prove nobody truncated the end or rebuilt the chain. The server signs a checkpoint every `[audit] checkpoint_every` entries and every `checkpoint_interval_seconds`, and `audit verify` rejects a log that is shorter than a stored checkpoint or whose hash at that `seq` differs. The signing key is the server's own, so a checkpoint stored only on the host will not help if the server process is compromised. Shipping them off the host is still a cron job you write, for example `onbehalf audit export --from <last shipped seq> --out slice.jsonl`, which also verifies offline later with `onbehalf audit verify --file slice.jsonl --jwks jwks.json`.
+- Copy `GET /admin/audit/checkpoint` (`{seq, head_hash, at, kid, signature}`) somewhere the server's host cannot write, such as a ticket system or a separate log store. A hash chain proves the log was not edited in the middle. It does not prove nobody truncated the end or rebuilt the chain. The server signs a checkpoint every `[audit] checkpoint_every` entries and every `checkpoint_interval_seconds`, and `audit verify` rejects a log that is shorter than a stored checkpoint or whose hash at that `seq` differs. The signing key is the server's own, so a checkpoint stored only on the host will not help if the server process is compromised. Set `[audit.sink]` (webhook, a file on another mount, or S3) so each checkpoint leaves the host when it is signed, with credentials that can add but not overwrite; then `onbehalf audit verify --file export.jsonl --jwks jwks.json --checkpoints shipped.jsonl` shows any checkpoint signed again after it was shipped. Alert on `audit_sink_dropped_total` and on `readyz` reporting `"degraded": true`.
 - Keep retired signing keys in `[issuer] previous_key_paths` for as long as you want old checkpoints to verify. Without the old key in the JWKS, a checkpoint it signed is reported invalid.
 
 ## Leases: tuning the interval
@@ -263,6 +263,11 @@ listen = "127.0.0.1:9100"
 | `leases_revoked_total` | counter | none (counts cascaded descendants too) |
 | `audit_append_errors_total` | counter | none |
 | `audit_checkpoints_total` | counter | none (signed checkpoints written) |
+| `audit_sink_delivered_total` | counter | none (checkpoints delivered by `[audit.sink]`) |
+| `audit_sink_failures_total` | counter | none (failed delivery attempts; each is retried) |
+| `audit_sink_dropped_total` | counter | none (checkpoints dropped from a full sink queue) |
+| `audit_sink_queue_depth` | gauge | none |
+| `audit_sink_oldest_undelivered_timestamp_seconds` | gauge | none (unix time the oldest undelivered checkpoint was queued; 0 when none) |
 | `http_requests_total` | counter | `route` (template, e.g. `/mcp/{server}`), `status` |
 | `authorize_duration_seconds` | histogram | none (lease check, policy and audit append) |
 | `audit_append_duration_seconds` | histogram | none (one audit append, including waiting for the store's lock) |
