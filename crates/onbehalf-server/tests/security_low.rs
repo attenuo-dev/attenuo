@@ -6,8 +6,6 @@
 // Configs are built field by field from `Config::default()`, as in the other server tests.
 #![allow(clippy::field_reassign_with_default)]
 
-use std::sync::{Arc, Mutex};
-
 use onbehalf_audit::CheckpointKeys;
 use onbehalf_core::{Capability, ToolCall};
 use onbehalf_proxy::testing::{spawn_router, test_chain, Spawned};
@@ -249,13 +247,21 @@ async fn authzen_diagnostics_go_only_to_authenticated_peps() {
 // SR-18: log injection.
 // ---------------------------------------------------------------------------------------------
 
-/// A `MakeWriter` that appends every log line to a shared buffer.
-#[derive(Clone, Default)]
-struct LogBuf(Arc<Mutex<Vec<u8>>>);
+thread_local! {
+    /// The capture buffer of the test running on this thread, if any.
+    static CAPTURE: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
 
-impl std::io::Write for LogBuf {
+/// Writes to the calling thread's capture buffer, and discards output when none is active.
+struct ThreadCapture;
+
+impl std::io::Write for ThreadCapture {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
+        CAPTURE.with(|c| {
+            if let Some(v) = c.borrow_mut().as_mut() {
+                v.extend_from_slice(buf);
+            }
+        });
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -263,16 +269,30 @@ impl std::io::Write for LogBuf {
     }
 }
 
+/// Installs, once per process, a global subscriber that writes to [`CAPTURE`].
+///
+/// A scoped `with_default` subscriber is not enough here: `tracing` caches each callsite's
+/// "interest" process-wide, and a callsite first hit by another test thread (with no subscriber
+/// active) can be cached as disabled, so the capturing test then saw no output at all (observed
+/// as `0 != 1` lines under load). A global subscriber keeps every callsite enabled, and the
+/// per-thread buffer keeps tests from seeing each other's lines.
+fn install_capture() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(|| ThreadCapture)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("no other test in this binary may install a global subscriber");
+    });
+}
+
 /// SR-18: the decision log line formatted subject, agent, server and tool with `Display`, so a
 /// newline in any of them forged a second line. Each is Debug-formatted now.
 #[test]
 fn a_newline_in_a_tool_name_stays_on_one_log_line() {
-    let logs = LogBuf::default();
-    let writer = logs.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .finish();
+    install_capture();
     let (_router, state) = onbehalf_server::build(&base_config()).unwrap();
     let chain = test_chain(
         "alice\nFORGED subject",
@@ -280,14 +300,14 @@ fn a_newline_in_a_tool_name_stays_on_one_log_line() {
         [Capability::new("github", "*")],
     );
     let call = ToolCall::new("github", "read_file\nFORGED level=INFO decision", json!({}));
-    tracing::subscriber::with_default(subscriber, || {
-        // The lease is unknown, so this is a deny; it is logged either way.
-        let d = state
-            .pipeline
-            .decide(&chain, &call, time::OffsetDateTime::now_utc());
-        assert!(!d.is_allow());
-    });
-    let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    // The lease is unknown, so this is a deny; it is logged either way.
+    let d = state
+        .pipeline
+        .decide(&chain, &call, time::OffsetDateTime::now_utc());
+    let captured = CAPTURE.with(|c| c.borrow_mut().take()).unwrap();
+    assert!(!d.is_allow());
+    let text = String::from_utf8(captured).unwrap();
     assert_eq!(text.lines().count(), 1, "{text}");
     assert!(text.contains(r#"tool="read_file\nFORGED"#), "{text}");
     assert!(text.contains(r#"subject="alice\nFORGED"#), "{text}");
