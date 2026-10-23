@@ -254,7 +254,7 @@ Field notes:
 
 The CLI does the same: `onbehalf authzen eval --token "$TOKEN" --server github --tool create_issue --arg repo=acme/api --arg title=x`. It exits 2 on a negative decision.
 
-**Without a bearer.** By default a request without a bearer gets 401. An operator can allow PEPs that cannot carry the token to send the chain in `subject.properties.chain` instead, with `[authzen] allow_unsigned_chain = true` and a `[[peps]]` entry per PEP. The PEP then authenticates with its client secret (HTTP Basic, or `client_id` and `client_secret` in the body). The server checks that the chain is well-formed, and that every hop's lease is live and was issued for exactly that chain prefix; a chain it never issued, or one with any field changed, is 403 `chain_not_issued`. Prefer the bearer.
+**Without a bearer.** By default a request without a bearer gets 401. An operator can allow PEPs that cannot carry the token to send the chain in `subject.properties.chain` instead, with `[authzen] allow_unsigned_chain = true` and a `[[peps]]` entry per PEP. The PEP then authenticates with its client secret (HTTP Basic, or `pep_id` and `pep_secret` at the top level of the body). The server checks that the chain is well-formed, and that every hop's lease is live and was issued for exactly that chain prefix; a chain it never issued, or one with any field changed, is 403 `chain_not_issued`. Prefer the bearer.
 
 **Enforcing the answer.** onbehalf only answers. The PEP has to refuse the action on `false`, and refuse it when the call to onbehalf fails. A PEP that fails open turns onbehalf off. Revocation reaches a PEP only when it asks, since there is no push channel in v0. Do not cache an allow for longer than you are willing to leave a revoked agent running.
 
