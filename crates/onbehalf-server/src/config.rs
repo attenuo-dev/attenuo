@@ -356,6 +356,34 @@ pub struct MetricsSection {
     /// keep it on loopback or a private network.
     #[serde(default = "default_metrics_listen")]
     pub listen: SocketAddr,
+    /// Allow `listen` to be a non-loopback address. Default `false`: the server refuses to
+    /// start with metrics enabled on a public address, because decision counts by reason are
+    /// served without authentication. Set it only when the address is a private interface
+    /// that network policy protects. A warning is still logged at startup.
+    #[serde(default)]
+    pub allow_public: bool,
+}
+
+impl MetricsSection {
+    /// Startup check (SR-38): a metrics listener off loopback needs `allow_public = true`.
+    pub fn check_listen(&self) -> anyhow::Result<()> {
+        if !self.enabled || self.listen.ip().is_loopback() {
+            return Ok(());
+        }
+        if !self.allow_public {
+            anyhow::bail!(
+                "[metrics] listen = {} is not a loopback address and /metrics has no \
+                 authentication; bind 127.0.0.1 or set [metrics] allow_public = true",
+                self.listen
+            );
+        }
+        tracing::warn!(
+            listen = %self.listen,
+            "[metrics] listener is not on loopback: /metrics is unauthenticated, restrict it \
+             with network policy"
+        );
+        Ok(())
+    }
 }
 
 impl Default for MetricsSection {
@@ -363,6 +391,7 @@ impl Default for MetricsSection {
         Self {
             enabled: false,
             listen: default_metrics_listen(),
+            allow_public: false,
         }
     }
 }
