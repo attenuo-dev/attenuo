@@ -367,3 +367,57 @@ fn sqlite_persists_across_reopen() {
     drop(raw);
     assert_eq!(s.verify_chain().unwrap().first_bad_seq, Some(2));
 }
+
+// ---- durability settings ----
+
+fn pragma(s: &SqliteAudit, name: &str) -> String {
+    s.with_connection(|c| {
+        Ok(c.query_row(&format!("PRAGMA {name}"), [], |r| {
+            r.get::<_, rusqlite::types::Value>(0)
+        })?)
+    })
+    .map(|v| match v {
+        rusqlite::types::Value::Integer(i) => i.to_string(),
+        rusqlite::types::Value::Text(t) => t,
+        other => format!("{other:?}"),
+    })
+    .unwrap()
+}
+
+#[test]
+fn file_log_runs_in_wal_mode_at_the_requested_durability() {
+    use onbehalf_audit::Durability;
+    let dir = tempfile::tempdir().unwrap();
+    for (durability, synchronous) in [(Durability::Normal, "1"), (Durability::Full, "2")] {
+        let path = dir.path().join(format!("{durability}.db"));
+        let s = SqliteAudit::open_with(&path, durability).unwrap();
+        assert_eq!(pragma(&s, "journal_mode"), "wal", "{durability}");
+        assert_eq!(pragma(&s, "synchronous"), synchronous, "{durability}");
+        assert_eq!(pragma(&s, "busy_timeout"), "5000", "{durability}");
+        fill(&s, 5);
+        drop(s);
+        // WAL mode is persistent; the data survives a reopen at the other setting.
+        let s = SqliteAudit::open_with(&path, Durability::Normal).unwrap();
+        assert_eq!(pragma(&s, "journal_mode"), "wal");
+        let report = s.verify_chain().unwrap();
+        assert!(report.ok && report.entries == 5, "{report:?}");
+    }
+    // `open` is `normal`, and so is the default.
+    assert_eq!(Durability::default(), Durability::Normal);
+    let s = SqliteAudit::open(dir.path().join("default.db")).unwrap();
+    assert_eq!(pragma(&s, "synchronous"), "1");
+}
+
+#[test]
+fn durability_parses_from_config_strings() {
+    use onbehalf_audit::Durability;
+    #[derive(serde::Deserialize)]
+    struct T {
+        d: Durability,
+    }
+    let t: T = serde_json::from_str(r#"{"d":"full"}"#).unwrap();
+    assert_eq!(t.d, Durability::Full);
+    let t: T = serde_json::from_str(r#"{"d":"normal"}"#).unwrap();
+    assert_eq!(t.d, Durability::Normal);
+    assert!(serde_json::from_str::<T>(r#"{"d":"off"}"#).is_err());
+}

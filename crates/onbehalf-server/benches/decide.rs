@@ -5,7 +5,8 @@
 //! token verification (`Verifier::verify`), the lease check (`Pipeline::check_leases`),
 //! policy (`PolicyEngine::authorize`), building the `DecisionRecord`, the audit append, and
 //! `Pipeline::decide` as a whole (leases, policy, record, append). Chains of 1 and 3 hops, the
-//! `onbehalf-bench` policy and catalog, SQLite stores in memory and in a temporary file.
+//! `onbehalf-bench` policy and catalog, SQLite stores in memory and in a temporary file
+//! (`durability` normal and full).
 //!
 //! ```text
 //! cargo bench -p onbehalf-server --bench decide -- --warm-up-time 1 --measurement-time 3
@@ -15,7 +16,7 @@ use std::hint::black_box;
 use std::sync::{Arc, RwLock};
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use onbehalf_audit::{AuditSink, LeaseStore, SqliteAudit, SqliteLeaseStore};
+use onbehalf_audit::{AuditSink, Durability, LeaseStore, SqliteAudit, SqliteLeaseStore};
 use onbehalf_core::{
     AgentId, Capability, CapabilitySet, Decision, DecisionRecord, OriginatingUser, ToolCall,
 };
@@ -110,22 +111,26 @@ struct Store {
 }
 
 fn stores() -> Vec<Store> {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("audit.db");
-    vec![
-        Store {
-            name: "memory",
-            audit: Arc::new(SqliteAudit::open_in_memory().unwrap()),
-            leases: Arc::new(SqliteLeaseStore::open_in_memory().unwrap()),
-            _dir: None,
-        },
-        Store {
-            name: "file",
-            audit: Arc::new(SqliteAudit::open(&path).unwrap()),
-            leases: Arc::new(SqliteLeaseStore::open(&path).unwrap()),
+    let mut out = vec![Store {
+        name: "memory",
+        audit: Arc::new(SqliteAudit::open_in_memory().unwrap()),
+        leases: Arc::new(SqliteLeaseStore::open_in_memory().unwrap()),
+        _dir: None,
+    }];
+    for (name, durability) in [
+        ("file", Durability::Normal),
+        ("file_full", Durability::Full),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.db");
+        out.push(Store {
+            name,
+            audit: Arc::new(SqliteAudit::open_with(&path, durability).unwrap()),
+            leases: Arc::new(SqliteLeaseStore::open_with(&path, durability).unwrap()),
             _dir: Some(dir),
-        },
-    ]
+        });
+    }
+    out
 }
 
 fn record(

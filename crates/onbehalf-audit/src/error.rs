@@ -11,6 +11,9 @@ pub enum AuditError {
     TimeFormat(#[from] time::error::Format),
     #[error("timestamp parse error: {0}")]
     TimeParse(#[from] time::error::Parse),
+    /// The database could not be set up as required (for example, WAL mode refused).
+    #[error("audit storage error: {0}")]
+    Storage(String),
     /// A lock protecting the store was poisoned by a panicking writer.
     #[error("audit store lock poisoned")]
     Poisoned,

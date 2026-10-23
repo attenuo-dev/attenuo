@@ -35,4 +35,4 @@ pub use log::{
     compute_entry_hash, verify_entries, AuditEntry, AuditSink, VerifyReport, GENESIS_HASH,
 };
 pub use memory::MemoryAudit;
-pub use sqlite::{SqliteAudit, SqliteLeaseStore};
+pub use sqlite::{Durability, SqliteAudit, SqliteLeaseStore};

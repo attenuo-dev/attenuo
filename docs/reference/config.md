@@ -54,6 +54,9 @@ Server and tool names follow one rule everywhere (catalog, `[[upstreams]]`, capa
 | `sqlite_path` | none | Audit log and lease registry. `:memory:` keeps both in memory and loses them on exit. |
 | `checkpoint_every` | 1000 | Sign a checkpoint every this many entries. 0 turns the count trigger off. |
 | `checkpoint_interval_seconds` | 300 | Also sign one this often, if entries arrived since the last. 0 turns the timer off. Whichever trigger fires first writes the checkpoint. |
+| `durability` | `"normal"` | `"normal"` or `"full"`: SQLite `synchronous` for a file-backed store, which always runs in WAL mode. `normal` does not sync on commit; `full` syncs every commit. Lease revocations always sync. Ignored for `:memory:`. See below. |
+
+**Durability.** With `"normal"` a decision that was answered survives the server process crashing or being killed, because the commit is in the operating system's page cache. If the machine loses power or the kernel crashes before SQLite's next sync (at a WAL checkpoint), the newest decisions can be lost. What survives is always a prefix of the log: an entry is never half-written, the database is never corrupt, and `audit verify` still passes, with the head at an earlier `seq`. A signed checkpoint you shipped off the host for a lost entry will then show the truncation, as it should. Lease revocations are always committed with `synchronous=FULL`, so a revoked lease cannot come back after a power failure; lease registrations and renewals follow the setting. Choose `"full"` when losing the last moments of the record on power failure is not acceptable; it costs one `fsync` per audit commit (see [performance](../design/performance.md)).
 
 Checkpoints are signed with the issuer key and verified against the JWKS; see [Audit log](../concepts/audit-log.md#signed-checkpoints).
 

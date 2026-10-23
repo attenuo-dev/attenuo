@@ -51,8 +51,29 @@ when { context.chain.depth > 3 };
 pub enum AuditMode {
     /// `sqlite_path = ":memory:"`.
     Memory,
-    /// A SQLite file in the work directory.
+    /// A SQLite file in the work directory, `[audit] durability = "normal"` (the default).
     File,
+    /// A SQLite file in the work directory, `[audit] durability = "full"` (sync every commit).
+    FileFull,
+}
+
+impl AuditMode {
+    fn label(self) -> &'static str {
+        match self {
+            AuditMode::Memory => "memory",
+            AuditMode::File => "file",
+            AuditMode::FileFull => "file_full",
+        }
+    }
+
+    /// `[audit] sqlite_path` and `durability` for this mode, with files under `dir`.
+    fn settings(self, dir: &Path) -> (String, &'static str) {
+        match self {
+            AuditMode::Memory => (":memory:".to_string(), "normal"),
+            AuditMode::File => (dir.join("audit-normal.db").display().to_string(), "normal"),
+            AuditMode::FileFull => (dir.join("audit-full.db").display().to_string(), "full"),
+        }
+    }
 }
 
 /// What the benchmarked call should come out as.
@@ -116,8 +137,9 @@ pub struct Opts {
     /// Chain depth (number of hops in the token; 1 is the root token itself).
     #[arg(long, value_delimiter = ',', default_values_t = [1usize, 3])]
     pub depths: Vec<usize>,
-    /// Audit store: `memory` (`:memory:`) or `file` (SQLite on disk). One server per mode.
-    #[arg(long, value_delimiter = ',', value_enum, default_values_t = [AuditMode::Memory, AuditMode::File])]
+    /// Audit store: `memory` (`:memory:`), `file` (SQLite on disk, `durability = "normal"`) or
+    /// `file_full` (SQLite on disk, `durability = "full"`). One server per mode.
+    #[arg(long, value_delimiter = ',', value_enum, default_values_t = [AuditMode::Memory, AuditMode::File, AuditMode::FileFull])]
     pub audit: Vec<AuditMode>,
     /// Call outcomes to measure.
     #[arg(long, value_delimiter = ',', value_enum,
@@ -259,12 +281,14 @@ impl Drop for WorkDir {
     }
 }
 
-/// The server config the bench needs. `sqlite` is the `[audit] sqlite_path` value.
+/// The server config the bench needs. `sqlite` and `durability` are the `[audit]`
+/// `sqlite_path` and `durability` values.
 pub fn render_config(
     onbehalf_port: u16,
     upstream_port: u16,
     policy_path: &Path,
     sqlite: &str,
+    durability: &str,
 ) -> String {
     let mut s = format!(
         r#"# onbehalf-server config written by onbehalf-bench.
@@ -294,6 +318,7 @@ inputs = {{ repo = "string" }}
 
 [audit]
 sqlite_path = "{sqlite}"
+durability = "{durability}"
 
 [[upstreams]]
 name = "{UPSTREAM}"
@@ -785,11 +810,15 @@ pub async fn run(opts: Opts) -> Result<()> {
         std::fs::create_dir_all(dir)?;
         let policy = dir.join("policy.cedar");
         std::fs::write(&policy, POLICY)?;
-        let sqlite = match opts.audit.first().copied().unwrap_or(AuditMode::Memory) {
-            AuditMode::Memory => ":memory:".to_string(),
-            AuditMode::File => dir.join("audit.db").display().to_string(),
-        };
-        let cfg = render_config(opts.onbehalf_port, opts.upstream_port, &policy, &sqlite);
+        let mode = opts.audit.first().copied().unwrap_or(AuditMode::Memory);
+        let (sqlite, durability) = mode.settings(dir);
+        let cfg = render_config(
+            opts.onbehalf_port,
+            opts.upstream_port,
+            &policy,
+            &sqlite,
+            durability,
+        );
         std::fs::write(dir.join("config.toml"), cfg)?;
         eprintln!("wrote {}/config.toml and policy.cedar", dir.display());
         return Ok(());
@@ -811,10 +840,7 @@ pub async fn run(opts: Opts) -> Result<()> {
             upstream_mcp: format!("{}/mcp", up.trim_end_matches('/')),
         };
         wait_http(&http, &format!("{}/healthz", ep.onbehalf)).await?;
-        let label = opts.audit.first().map_or("external", |m| match m {
-            AuditMode::Memory => "memory",
-            AuditMode::File => "file",
-        });
+        let label = opts.audit.first().map_or("external", |m| m.label());
         run_group(&opts, label, &ep, &http, &mut report).await?;
     } else {
         let bin_dir = match &opts.bin_dir {
@@ -836,19 +862,14 @@ pub async fn run(opts: Opts) -> Result<()> {
                 continue;
             }
             seen.push(mode);
-            let (label, sqlite) = match mode {
-                AuditMode::Memory => ("memory", ":memory:".to_string()),
-                AuditMode::File => (
-                    "file",
-                    work.0
-                        .join(format!("audit-{}.db", seen.len()))
-                        .display()
-                        .to_string(),
-                ),
-            };
+            let label = mode.label();
+            let (sqlite, durability) = mode.settings(&work.0);
             let (ob_port, up_port) = (free_port()?, free_port()?);
             let cfg_path = work.0.join(format!("config-{label}.toml"));
-            std::fs::write(&cfg_path, render_config(ob_port, up_port, &policy, &sqlite))?;
+            std::fs::write(
+                &cfg_path,
+                render_config(ob_port, up_port, &policy, &sqlite, durability),
+            )?;
 
             let _fake = Proc {
                 child: Command::new(&fake_bin)

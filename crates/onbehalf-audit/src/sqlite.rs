@@ -77,9 +77,77 @@ const ENTRY_COLUMNS: &str = "seq, prev_hash, entry_hash, decision, reason, origi
      agents, chain_depth, chain_digest, leases, server, tool, arguments_digest, session_id, \
      policy_ids, record_json";
 
-fn open_connection(path: &Path) -> Result<Connection, AuditError> {
+/// How long a connection waits for another connection's write lock before giving up with
+/// `SQLITE_BUSY`. Within one process the store's own lock serializes writers; this covers a
+/// second process (and the audit and lease connections of one server, which share a file).
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Prepared statements kept per connection (`prepare_cached`). The stores use about a dozen.
+const STATEMENT_CACHE: usize = 32;
+
+/// How hard a file-backed store pushes a commit to stable storage. In-memory stores ignore it.
+///
+/// Both settings run SQLite in write-ahead-log mode (`journal_mode=WAL`): a commit appends to
+/// the `-wal` file and readers do not block the writer. They differ in when SQLite calls
+/// `fsync`:
+///
+/// - [`Normal`](Self::Normal) (`synchronous=NORMAL`, the default): not on commit, only when
+///   the WAL is checkpointed into the database file. A committed transaction survives the
+///   process crashing or being killed (it is in the OS page cache), but the most recent
+///   commits can be lost if the machine loses power or the OS crashes before the next sync.
+///   What survives is always a prefix of the log: a transaction is never torn, the database is
+///   never corrupt, and the hash chain still verifies, ending at an earlier head. Lease
+///   revocations are the exception: they always commit with `synchronous=FULL` (see
+///   [`SqliteLeaseStore`]), so a revoked lease cannot come back after a power failure.
+/// - [`Full`](Self::Full) (`synchronous=FULL`): every commit is synced before it returns, so a
+///   decision that was answered is on disk. One `fsync` per commit bounds throughput by the
+///   storage's sync latency.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Durability {
+    #[default]
+    Normal,
+    Full,
+}
+
+impl Durability {
+    fn pragma(self) -> &'static str {
+        match self {
+            Durability::Normal => "NORMAL",
+            Durability::Full => "FULL",
+        }
+    }
+}
+
+impl std::fmt::Display for Durability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Durability::Normal => "normal",
+            Durability::Full => "full",
+        })
+    }
+}
+
+fn open_connection(path: &Path, durability: Durability) -> Result<Connection, AuditError> {
     let conn = Connection::open(path)?;
-    conn.busy_timeout(Duration::from_secs(5))?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
+    // `journal_mode` answers with the mode in force. A `:memory:` path keeps `memory`, which
+    // is fine: there is nothing to sync.
+    let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+    if !mode.eq_ignore_ascii_case("wal") && !mode.eq_ignore_ascii_case("memory") {
+        return Err(AuditError::Storage(format!(
+            "could not switch {} to WAL mode (journal_mode is `{mode}`)",
+            path.display()
+        )));
+    }
+    conn.pragma_update(None, "synchronous", durability.pragma())?;
+    Ok(conn)
+}
+
+fn open_memory_connection() -> Result<Connection, AuditError> {
+    let conn = Connection::open_in_memory()?;
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
     Ok(conn)
 }
 
@@ -257,13 +325,19 @@ impl std::fmt::Debug for SqliteAudit {
 }
 
 impl SqliteAudit {
-    /// Open (or create) the log at `path`. Pass `":memory:"` for a private in-memory log.
+    /// Open (or create) the log at `path` with [`Durability::Normal`]. Pass `":memory:"` for a
+    /// private in-memory log.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AuditError> {
-        Self::from_connection(open_connection(path.as_ref())?)
+        Self::open_with(path, Durability::default())
+    }
+
+    /// Open (or create) the log at `path` in WAL mode with the given durability.
+    pub fn open_with(path: impl AsRef<Path>, durability: Durability) -> Result<Self, AuditError> {
+        Self::from_connection(open_connection(path.as_ref(), durability)?)
     }
 
     pub fn open_in_memory() -> Result<Self, AuditError> {
-        Self::from_connection(Connection::open_in_memory()?)
+        Self::from_connection(open_memory_connection()?)
     }
 
     /// Wrap an existing connection, creating the schema if needed.
@@ -478,31 +552,31 @@ impl AuditSink for SqliteAudit {
         let head = head_in(&tx)?;
         let entry = AuditEntry::next(head.as_ref(), record);
         let r = &entry.record;
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO audit (seq, prev_hash, entry_hash, at, decision, reason, \
              originating_subject, agents, chain_depth, chain_digest, leases, server, tool, \
              arguments_digest, session_id, policy_ids, record_json) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-            params![
-                entry.seq as i64,
-                entry.prev_hash,
-                entry.entry_hash,
-                fmt_time(r.at)?,
-                decision_str(&r.decision),
-                r.reason,
-                r.originating_subject,
-                serde_json::to_string(&r.agents)?,
-                r.chain_depth as i64,
-                r.chain_digest,
-                serde_json::to_string(&r.leases)?,
-                r.server,
-                r.tool,
-                r.arguments_digest,
-                r.session_id,
-                serde_json::to_string(&r.policy_ids)?,
-                serde_json::to_string(r)?,
-            ],
-        )?;
+        )?
+        .execute(params![
+            entry.seq as i64,
+            entry.prev_hash,
+            entry.entry_hash,
+            fmt_time(r.at)?,
+            decision_str(&r.decision),
+            r.reason,
+            r.originating_subject,
+            serde_json::to_string(&r.agents)?,
+            r.chain_depth as i64,
+            r.chain_digest,
+            serde_json::to_string(&r.leases)?,
+            r.server,
+            r.tool,
+            r.arguments_digest,
+            r.session_id,
+            serde_json::to_string(&r.policy_ids)?,
+            serde_json::to_string(r)?,
+        ])?;
         let mut created = None;
         if let Some(c) = self.checkpointing.as_ref().filter(|c| c.every > 0) {
             if entry.seq.is_multiple_of(c.every) {
@@ -555,26 +629,54 @@ impl AuditSink for SqliteAudit {
 }
 
 /// Lease registry in SQLite.
+///
+/// A file-backed store runs at the [`Durability`] it was opened with, except that
+/// [`revoke`](LeaseStore::revoke) always commits with `synchronous=FULL`: losing a revocation
+/// to a power failure would bring a revoked lease back, and revocations are rare enough that
+/// their `fsync` does not matter.
 #[derive(Debug)]
 pub struct SqliteLeaseStore {
     conn: Mutex<Connection>,
+    /// `None` for a connection this crate did not open (or an in-memory one): its pragmas are
+    /// left alone.
+    durability: Option<Durability>,
 }
 
 impl SqliteLeaseStore {
-    /// Open (or create) the registry at `path`. May be the same file as a [`SqliteAudit`].
+    /// Open (or create) the registry at `path` with [`Durability::Normal`]. May be the same file
+    /// as a [`SqliteAudit`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AuditError> {
-        Self::from_connection(open_connection(path.as_ref())?)
+        Self::open_with(path, Durability::default())
+    }
+
+    /// Open (or create) the registry at `path` in WAL mode with the given durability.
+    /// Revocations commit with `synchronous=FULL` whatever `durability` says.
+    pub fn open_with(path: impl AsRef<Path>, durability: Durability) -> Result<Self, AuditError> {
+        let mut store = Self::from_connection(open_connection(path.as_ref(), durability)?)?;
+        store.durability = Some(durability);
+        Ok(store)
     }
 
     pub fn open_in_memory() -> Result<Self, AuditError> {
-        Self::from_connection(Connection::open_in_memory()?)
+        Self::from_connection(open_memory_connection()?)
     }
 
     pub fn from_connection(conn: Connection) -> Result<Self, AuditError> {
         conn.execute_batch(LEASE_SCHEMA)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            durability: None,
         })
+    }
+
+    /// Run `f` against the underlying connection while holding the store's lock. For tests
+    /// and operational tooling.
+    pub fn with_connection<R>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<R, AuditError>,
+    ) -> Result<R, AuditError> {
+        let conn = self.conn.lock()?;
+        f(&conn)
     }
 
     /// One lease's row, if known.
@@ -582,6 +684,31 @@ impl SqliteLeaseStore {
         let conn = self.conn.lock()?;
         get_in(&conn, lease)
     }
+}
+
+fn revoke_in(
+    conn: &mut Connection,
+    lease: &LeaseId,
+    reason: &str,
+    now: OffsetDateTime,
+) -> Result<u64, AuditError> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if get_in(&tx, lease)?.is_none() {
+        return Err(AuditError::UnknownLease(lease.0.clone()));
+    }
+    // UNION (not UNION ALL) so an accidental cycle terminates.
+    let changed = tx.execute(
+        "UPDATE leases SET revoked_at = ?2, revoke_reason = ?3 \
+         WHERE revoked_at IS NULL AND id IN ( \
+             WITH RECURSIVE sub(id) AS ( \
+                 SELECT id FROM leases WHERE id = ?1 \
+                 UNION \
+                 SELECT l.id FROM leases l JOIN sub ON l.parent = sub.id \
+             ) SELECT id FROM sub)",
+        params![lease.0, fmt_time(now)?, reason],
+    )?;
+    tx.commit()?;
+    Ok(changed as u64)
 }
 
 fn binding_in(conn: &Connection, lease: &LeaseId) -> Result<Option<String>, AuditError> {
@@ -624,12 +751,16 @@ impl LeaseStore for SqliteLeaseStore {
         expires_at: OffsetDateTime,
     ) -> Result<(), AuditError> {
         let conn = self.conn.lock()?;
-        conn.execute(
+        conn.prepare_cached(
             "INSERT INTO leases (id, parent, expires_at) VALUES (?1, ?2, ?3) \
              ON CONFLICT(id) DO UPDATE SET parent = excluded.parent, \
              expires_at = excluded.expires_at",
-            params![lease.0, parent.map(|p| p.0.as_str()), fmt_time(expires_at)?],
-        )?;
+        )?
+        .execute(params![
+            lease.0,
+            parent.map(|p| p.0.as_str()),
+            fmt_time(expires_at)?
+        ])?;
         Ok(())
     }
 
@@ -640,23 +771,16 @@ impl LeaseStore for SqliteLeaseStore {
         now: OffsetDateTime,
     ) -> Result<u64, AuditError> {
         let mut conn = self.conn.lock()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if get_in(&tx, lease)?.is_none() {
-            return Err(AuditError::UnknownLease(lease.0.clone()));
+        // A revocation must survive a power failure even when the store runs at `normal`.
+        let relaxed = self.durability.filter(|d| *d != Durability::Full);
+        if relaxed.is_some() {
+            conn.pragma_update(None, "synchronous", Durability::Full.pragma())?;
         }
-        // UNION (not UNION ALL) so an accidental cycle terminates.
-        let changed = tx.execute(
-            "UPDATE leases SET revoked_at = ?2, revoke_reason = ?3 \
-             WHERE revoked_at IS NULL AND id IN ( \
-                 WITH RECURSIVE sub(id) AS ( \
-                     SELECT id FROM leases WHERE id = ?1 \
-                     UNION \
-                     SELECT l.id FROM leases l JOIN sub ON l.parent = sub.id \
-                 ) SELECT id FROM sub)",
-            params![lease.0, fmt_time(now)?, reason],
-        )?;
-        tx.commit()?;
-        Ok(changed as u64)
+        let out = revoke_in(&mut conn, lease, reason, now);
+        if let Some(d) = relaxed {
+            conn.pragma_update(None, "synchronous", d.pragma())?;
+        }
+        out
     }
 
     fn renew(

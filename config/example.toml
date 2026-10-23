@@ -72,6 +72,11 @@ sqlite_path = "data/onbehalf.sqlite"
 # entries arrive; 0 turns a trigger off.
 checkpoint_every = 1000
 checkpoint_interval_seconds = 300
+# A file-backed store runs SQLite in WAL mode. "normal" (default) does not fsync on commit:
+# a process crash loses nothing, a power failure or OS crash can lose the newest decisions
+# (never tear one; the chain still verifies, ending earlier). "full" fsyncs every commit and
+# costs throughput. Lease revocations always fsync. Ignored for ":memory:".
+durability = "normal"
 
 # MCP servers (Streamable HTTP), mounted at /mcp/<name>. `name` is the server part of
 # capabilities, e.g. "github:read_file".

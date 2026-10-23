@@ -266,3 +266,33 @@ fn renew_rejects_unknown_and_revoked() {
         }
     }
 }
+
+#[test]
+fn file_store_revokes_with_full_sync_and_returns_to_its_setting() {
+    use onbehalf_audit::Durability;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("leases.db");
+    let store = SqliteLeaseStore::open_with(&path, Durability::Normal).unwrap();
+    let query = |s: &SqliteLeaseStore, sql: &str| -> String {
+        s.with_connection(|c| Ok(c.query_row(sql, [], |r| r.get::<_, rusqlite::types::Value>(0))?))
+            .map(|v| match v {
+                rusqlite::types::Value::Integer(i) => i.to_string(),
+                rusqlite::types::Value::Text(t) => t,
+                other => format!("{other:?}"),
+            })
+            .unwrap()
+    };
+    assert_eq!(query(&store, "PRAGMA journal_mode"), "wal");
+    assert_eq!(query(&store, "PRAGMA synchronous"), "1", "normal");
+    tree(&store);
+    assert_eq!(store.revoke(&id("a"), "test", t0()).unwrap(), 4);
+    assert_eq!(query(&store, "PRAGMA synchronous"), "1", "back to normal");
+    // A failed revocation restores the setting too.
+    assert!(store.revoke(&id("nope"), "test", t0()).is_err());
+    assert_eq!(query(&store, "PRAGMA synchronous"), "1");
+    drop(store);
+    let store = SqliteLeaseStore::open_with(&path, Durability::Full).unwrap();
+    assert_eq!(query(&store, "PRAGMA synchronous"), "2", "full");
+    let status = store.check_all(&[&id("root"), &id("a2x")], t0()).unwrap();
+    assert_eq!(status.revoked, vec![id("a2x")], "the revocation persisted");
+}

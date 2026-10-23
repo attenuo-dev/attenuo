@@ -132,6 +132,13 @@ Placement:
 - Keep it away from anything agents can reach. Whoever can write the file can rewrite the log and un-revoke leases.
 - In a container, mount a volume. The image's working directory is `/var/lib/onbehalf`, owned by the `onbehalf` user (uid 10001).
 - Watch free disk space. An audit append that fails turns the decision into a deny with reason `audit_error`, so a full disk stops all calls and token issuance. That is the fail-closed rule working as designed.
+- The file runs in SQLite's WAL mode, so next to `onbehalf.sqlite` you will see `onbehalf.sqlite-wal` and `onbehalf.sqlite-shm`. They belong to the database: keep them on the same volume, and never copy or delete one of the three on its own.
+
+Durability (`[audit] durability`):
+
+- `"normal"` (the default) does not `fsync` on each commit. A process crash, `kill -9` or OOM kill loses nothing that was answered. A power failure or kernel crash can lose the most recent decisions, those written since SQLite's last sync. The log that remains is a clean prefix: no torn entry, no corruption, and `audit verify` passes with an earlier head. Lease revocations are always synced, so a revoked lease stays revoked.
+- `"full"` syncs every commit, so an answered decision is on disk. Use it when your record-keeping rules say the audit trail must survive power loss. It costs throughput: on the development container, one-hop calls with a file-backed log went from about 3,000 to 3,800 calls per second at `normal` to about 2,000 to 2,300 at `full` (see [performance](../design/performance.md)). On storage with slow syncs (network block devices, some cloud disks) the gap is larger.
+- Either way, ship signed checkpoints off the host (below). After a power failure they are what tells you how much of the tail was lost.
 
 Backup:
 
