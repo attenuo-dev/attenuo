@@ -7,6 +7,7 @@
 //! process; across processes SQLite's write lock plus the `UNIQUE` constraint on `entry_hash`
 //! and the primary key on `seq` make a fork fail rather than succeed.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock, TryLockError};
@@ -22,11 +23,14 @@ use crate::checkpoint::{
 };
 use crate::error::AuditError;
 use crate::export::RecordFilter;
-use crate::lease::{classify, LeaseRow, LeaseStatus, LeaseStore};
+use crate::lease::{
+    ancestors_of, breadth_first, classify, LeaseRow, LeaseStatus, LeaseStore, LeaseSubtree,
+};
 use crate::log::{
     canonical_record_json, entry_hash_from_json, verify_entries, AuditEntry, AuditSink,
     VerifyReport, ENTRY_HASH_VERSION, GENESIS_HASH,
 };
+use crate::query::{like_contains, EntryFilter, Order};
 
 const AUDIT_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS audit (
@@ -89,6 +93,27 @@ CREATE TABLE IF NOT EXISTS lease_bindings (
     binding TEXT NOT NULL
 );
 "#;
+
+/// The record id (`DecisionRecord::id`) of a row, as SQL. `record_json` is the hashed text
+/// and is only read here. `json_valid` keeps a row whose JSON was damaged from failing the
+/// index build (and so the open): such a row indexes as NULL and `verify` reports it.
+/// The index and [`SqliteAudit::entry_by_record_id`] both use this one expression, which is
+/// what lets SQLite answer the lookup from the index.
+const RECORD_ID_EXPR: &str =
+    "CASE WHEN json_valid(record_json) THEN json_extract(record_json, '$.id') END";
+
+/// Create the index for looking an entry up by its record id (`GET /admin/audit/records/{id}`).
+///
+/// Added after the table was first released, so it is created at open on databases that
+/// lack it. An expression index stores derived values in a separate b-tree; it never writes
+/// to the `audit` rows, so no hashed data changes. Once built it costs one b-tree insert per
+/// append; building it on a large existing log reads every row once.
+fn create_record_id_index(conn: &Connection) -> Result<(), AuditError> {
+    conn.execute_batch(&format!(
+        "CREATE INDEX IF NOT EXISTS audit_record_id_idx ON audit({RECORD_ID_EXPR})"
+    ))?;
+    Ok(())
+}
 
 /// Columns read back for an entry, in the order `entry_from_row` expects.
 const ENTRY_COLUMNS: &str = "seq, prev_hash, entry_hash, decision, reason, originating_subject, \
@@ -1163,6 +1188,8 @@ impl SqliteAudit {
         conn.execute_batch(CHECKPOINT_SCHEMA)?;
         conn.execute_batch(META_SCHEMA)?;
         check_hash_version(&conn)?;
+        // After the version check, so a log this version refuses is not changed by it.
+        create_record_id_index(&conn)?;
         let relaxed_sync = relaxed_sync_of(&conn)?;
         Ok(Self {
             inner: Arc::new(Inner {
@@ -1422,24 +1449,249 @@ impl SqliteAudit {
         filter: &RecordFilter,
         limit: usize,
     ) -> Result<Vec<AuditEntry>, AuditError> {
+        self.entries_matching(
+            from_seq,
+            to_seq,
+            &EntryFilter::from(filter),
+            Order::Ascending,
+            limit,
+        )
+    }
+
+    /// Up to `limit` entries with `lo <= seq <= hi` that match `filter`, in `order`.
+    ///
+    /// Fewer than `limit` entries means the whole window was read. A full page stops at its
+    /// last entry, so the next page in the same direction starts just past that entry's seq.
+    ///
+    /// The SQL narrows rows by the `seq` range (the primary key) and by the denormalized
+    /// columns, compared with `=`, never as patterns. `agent` and `lease` live in JSON array
+    /// columns and are found with a `LIKE` on the element as a quoted JSON string, with its
+    /// `%`, `_` and `\` escaped, so `l1` does not match `l10`. The time window is compared
+    /// with `julianday` and a one-second margin. Both are only a first cut: every row the SQL
+    /// returns is decoded (and cross-checked against `record_json`) and must also pass
+    /// [`EntryFilter::matches`].
+    ///
+    /// Rows are read in batches of `limit` and the store's lock is released between batches,
+    /// so a long scan does not hold up appends. The cost grows with the window, not the page:
+    /// callers bound the window.
+    pub fn entries_matching(
+        &self,
+        lo: u64,
+        hi: u64,
+        filter: &EntryFilter,
+        order: Order,
+        limit: usize,
+    ) -> Result<Vec<AuditEntry>, AuditError> {
+        let mut out = Vec::new();
+        if limit == 0 {
+            return Ok(out);
+        }
+        let direction = match order {
+            Order::Ascending => "ASC",
+            Order::Descending => "DESC",
+        };
         let sql = format!(
             "SELECT {ENTRY_COLUMNS} FROM audit WHERE seq >= ?1 AND seq <= ?2 \
-             AND (?3 IS NULL OR kind = ?3) AND (?4 IS NULL OR chain_id = ?4) \
-             ORDER BY seq LIMIT ?5"
+             AND (?3 IS NULL OR kind IN (SELECT value FROM json_each(?3))) \
+             AND (?4 IS NULL OR decision = ?4) \
+             AND (?5 IS NULL OR reason = ?5) \
+             AND (?6 IS NULL OR originating_subject = ?6) \
+             AND (?7 IS NULL OR agents LIKE ?7 ESCAPE '\\') \
+             AND (?8 IS NULL OR leases LIKE ?8 ESCAPE '\\') \
+             AND (?9 IS NULL OR server = ?9) \
+             AND (?10 IS NULL OR tool = ?10) \
+             AND (?11 IS NULL OR chain_id = ?11) \
+             AND (?12 IS NULL OR julianday(at) >= julianday(?12) - 1.0 / 86400) \
+             AND (?13 IS NULL OR julianday(at) <= julianday(?13) + 1.0 / 86400) \
+             ORDER BY seq {direction} LIMIT ?14"
         );
-        let kind = filter.kind.map(|k| k.as_str());
+        let kinds = if filter.kinds.is_empty() {
+            None
+        } else {
+            let names: Vec<&str> = filter.kinds.iter().map(|k| k.as_str()).collect();
+            Some(serde_json::to_string(&names)?)
+        };
+        let decision = filter.decision.as_ref().map(decision_str);
+        // The columns hold JSON arrays of strings: look for the element as a quoted string.
+        let agent = match &filter.agent {
+            Some(a) => Some(like_contains(&serde_json::to_string(&a.0)?)),
+            None => None,
+        };
+        let lease = match &filter.lease {
+            Some(l) => Some(like_contains(&serde_json::to_string(&l.0)?)),
+            None => None,
+        };
+        let since = filter.since.map(fmt_time).transpose()?;
+        let until = filter.until.map(fmt_time).transpose()?;
+        let batch = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut lo = i64::try_from(lo).unwrap_or(i64::MAX);
+        let mut hi = i64::try_from(hi).unwrap_or(i64::MAX);
+        while lo <= hi {
+            let rows = {
+                let conn = self.inner.conn.lock()?;
+                query_entries(
+                    &conn,
+                    &sql,
+                    &[
+                        &lo,
+                        &hi,
+                        &kinds,
+                        &decision,
+                        &filter.reason,
+                        &filter.subject,
+                        &agent,
+                        &lease,
+                        &filter.server,
+                        &filter.tool,
+                        &filter.chain_id,
+                        &since,
+                        &until,
+                        &batch,
+                    ],
+                )?
+            };
+            let read_all = rows.len() < limit;
+            for entry in rows {
+                // A seq read from an INTEGER column fits in i64.
+                let seq = entry.seq as i64;
+                match order {
+                    Order::Ascending => lo = seq + 1,
+                    Order::Descending => hi = seq - 1,
+                }
+                if filter.matches(&entry.record) {
+                    out.push(entry);
+                    if out.len() == limit {
+                        return Ok(out);
+                    }
+                }
+            }
+            if read_all {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// The entry at `seq`, if there is one.
+    pub fn entry_at(&self, seq: u64) -> Result<Option<AuditEntry>, AuditError> {
+        let Ok(seq) = i64::try_from(seq) else {
+            return Ok(None);
+        };
+        let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE seq = ?1");
         let conn = self.inner.conn.lock()?;
-        query_entries(
+        Ok(query_entries(&conn, &sql, &[&seq])?.pop())
+    }
+
+    /// The entry whose record has id `id` (the hyphenated lower-case UUID that proxy denials
+    /// and AuthZEN answers return as `decision_id`), if there is one. Uses the
+    /// `audit_record_id_idx` expression index.
+    pub fn entry_by_record_id(&self, id: &str) -> Result<Option<AuditEntry>, AuditError> {
+        let sql =
+            format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE {RECORD_ID_EXPR} = ?1 ORDER BY seq");
+        let conn = self.inner.conn.lock()?;
+        let found = query_entries(&conn, &sql, &[&id])?;
+        // Record ids are random UUIDs, so one row at most is expected; take the first whose
+        // decoded record really has that id.
+        Ok(found.into_iter().find(|e| e.record.id.to_string() == id))
+    }
+
+    /// Up to `limit` stored checkpoints with `seq < before`, newest first. It only reads:
+    /// unlike [`checkpoint_signed`](Self::checkpoint_signed) it never signs one.
+    pub fn checkpoints_before(
+        &self,
+        before: u64,
+        limit: usize,
+    ) -> Result<Vec<Checkpoint>, AuditError> {
+        let conn = self.inner.conn.lock()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT seq, head_hash, at, kid, signature FROM checkpoints \
+             WHERE seq < ?1 ORDER BY seq DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            [
+                i64::try_from(before).unwrap_or(i64::MAX),
+                i64::try_from(limit).unwrap_or(i64::MAX),
+            ],
+            checkpoint_from_row,
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The oldest stored checkpoint at or after `seq`: the first one whose signature covers
+    /// the entry at `seq` through the hash chain. It is read as stored, not verified;
+    /// [`verify_chain_signed`](Self::verify_chain_signed) checks signatures.
+    pub fn checkpoint_covering(&self, seq: u64) -> Result<Option<Checkpoint>, AuditError> {
+        let Ok(seq) = i64::try_from(seq) else {
+            return Ok(None);
+        };
+        let conn = self.inner.conn.lock()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT seq, head_hash, at, kid, signature FROM checkpoints \
+             WHERE seq >= ?1 ORDER BY seq LIMIT 1",
+        )?;
+        Ok(stmt.query_row([seq], checkpoint_from_row).optional()?)
+    }
+
+    /// The first entry after `after` (`seq > after`) of `kind` with this `tool` and
+    /// `decision`, if any. For questions such as "was the policy reloaded after this
+    /// decision?" (kind `admin`, tool `admin.policies.reload`, `allow`). It reads through the
+    /// `kind` index, so it stays cheap on a long log as long as that kind is rare.
+    pub fn first_entry_after(
+        &self,
+        after: u64,
+        kind: attenuo_core::RecordKind,
+        tool: &str,
+        decision: &attenuo_core::Decision,
+    ) -> Result<Option<AuditEntry>, AuditError> {
+        let Ok(after) = i64::try_from(after) else {
+            return Ok(None);
+        };
+        let sql = format!(
+            "SELECT {ENTRY_COLUMNS} FROM audit \
+             WHERE kind = ?1 AND tool = ?2 AND decision = ?3 AND seq > ?4 \
+             ORDER BY seq LIMIT 1"
+        );
+        let conn = self.inner.conn.lock()?;
+        Ok(query_entries(
             &conn,
             &sql,
-            &[
-                &i64::try_from(from_seq).unwrap_or(i64::MAX),
-                &i64::try_from(to_seq).unwrap_or(i64::MAX),
-                &kind,
-                &filter.chain_id,
-                &(limit as i64),
-            ],
-        )
+            &[&kind.as_str(), &tool, &decision_str(decision), &after],
+        )?
+        .pop())
+    }
+
+    /// The issuance record (kind `root_token` or `exchange`) of each lease in `leases`, all of
+    /// which belong to the chain `chain_id`. The issuance of a hop is the record whose last
+    /// lease is that hop's, so its last agent is the agent the lease was issued to. Leases
+    /// with no such record are absent from the result; if a lease has several, the earliest
+    /// wins.
+    ///
+    /// Reads through the `chain_id` index and decodes only that chain's issuance records, so
+    /// the cost grows with the chain, not the log.
+    pub fn issuance_records(
+        &self,
+        chain_id: &str,
+        leases: &[&LeaseId],
+    ) -> Result<Vec<AuditEntry>, AuditError> {
+        let wanted: BTreeSet<&LeaseId> = leases.iter().copied().collect();
+        let mut found: BTreeMap<LeaseId, AuditEntry> = BTreeMap::new();
+        let sql = format!(
+            "SELECT {ENTRY_COLUMNS} FROM audit WHERE chain_id = ?1 \
+             AND kind IN ('root_token', 'exchange') ORDER BY seq"
+        );
+        let conn = self.inner.conn.lock()?;
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut rows = stmt.query([chain_id])?;
+        while let Some(row) = rows.next()? {
+            let entry = entry_from_row(row)?;
+            let Some(last) = entry.record.leases.last() else {
+                continue;
+            };
+            if wanted.contains(last) && !found.contains_key(last) {
+                found.insert(last.clone(), entry);
+            }
+        }
+        Ok(found.into_values().collect())
     }
 
     /// Every entry bound to one delegation chain, in order.
@@ -1455,14 +1707,7 @@ impl SqliteAudit {
     /// (the id is matched as a quoted JSON string so `l1` does not match `l10`). It is a full scan;
     /// a join table is the upgrade path when volume demands an index.
     pub fn by_lease(&self, lease: &LeaseId) -> Result<Vec<AuditEntry>, AuditError> {
-        let needle = serde_json::to_string(&lease.0)?;
-        let pattern = format!(
-            "%{}%",
-            needle
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_")
-        );
+        let pattern = like_contains(&serde_json::to_string(&lease.0)?);
         let sql = format!(
             "SELECT {ENTRY_COLUMNS} FROM audit WHERE leases LIKE ?1 ESCAPE '\\' ORDER BY seq"
         );
@@ -1612,6 +1857,38 @@ impl SqliteLeaseStore {
         let conn = self.conn.lock()?;
         get_in(&conn, lease)
     }
+
+    /// What revoking `lease` would touch, without changing anything; `None` for an unknown
+    /// lease. A dry run of [`revoke`](LeaseStore::revoke): it reads the subtree through the
+    /// same recursive query over `leases_parent_idx`, so `would_revoke` is the count a
+    /// revocation run now would return. `nodes` holds at most `max_nodes` leases (at least 1),
+    /// found breadth-first; `would_revoke` counts the whole subtree regardless of the cap.
+    pub fn subtree(
+        &self,
+        lease: &LeaseId,
+        max_nodes: usize,
+    ) -> Result<Option<LeaseSubtree>, AuditError> {
+        let mut conn = self.conn.lock()?;
+        subtree_in(&mut conn, lease, max_nodes)
+    }
+}
+
+/// `SELECT id FROM sub`, where `sub` is lease `?1` and every lease descended from it, found
+/// through `leases_parent_idx`. UNION (not UNION ALL) so an accidental cycle terminates.
+/// `$limit` goes on the recursive select: `""` for the whole subtree, or a `LIMIT` that stops
+/// the recursion early. Revocation and its preview ([`SqliteLeaseStore::subtree`]) both use
+/// this, so the preview counts exactly the rows a revocation would change.
+macro_rules! subtree_ids {
+    ($limit:literal) => {
+        concat!(
+            "WITH RECURSIVE sub(id) AS ( \
+                 SELECT id FROM leases WHERE id = ?1 \
+                 UNION \
+                 SELECT l.id FROM leases l JOIN sub ON l.parent = sub.id ",
+            $limit,
+            ") SELECT id FROM sub"
+        )
+    };
 }
 
 fn revoke_in(
@@ -1624,19 +1901,65 @@ fn revoke_in(
     if get_in(&tx, lease)?.is_none() {
         return Err(AuditError::UnknownLease(lease.0.clone()));
     }
-    // UNION (not UNION ALL) so an accidental cycle terminates.
     let changed = tx.execute(
-        "UPDATE leases SET revoked_at = ?2, revoke_reason = ?3 \
-         WHERE revoked_at IS NULL AND id IN ( \
-             WITH RECURSIVE sub(id) AS ( \
-                 SELECT id FROM leases WHERE id = ?1 \
-                 UNION \
-                 SELECT l.id FROM leases l JOIN sub ON l.parent = sub.id \
-             ) SELECT id FROM sub)",
+        concat!(
+            "UPDATE leases SET revoked_at = ?2, revoke_reason = ?3 \
+             WHERE revoked_at IS NULL AND id IN (",
+            subtree_ids!(""),
+            ")"
+        ),
         params![lease.0, fmt_time(now)?, reason],
     )?;
     tx.commit()?;
     Ok(changed as u64)
+}
+
+/// [`SqliteLeaseStore::subtree`] inside one read transaction, so the nodes, the count and the
+/// ancestors describe the same moment.
+fn subtree_in(
+    conn: &mut Connection,
+    lease: &LeaseId,
+    max_nodes: usize,
+) -> Result<Option<LeaseSubtree>, AuditError> {
+    let tx = conn.transaction()?;
+    let Some(row) = get_in(&tx, lease)? else {
+        return Ok(None);
+    };
+    // The same predicate as the UPDATE in `revoke_in`, counted instead of written.
+    let would_revoke: i64 = tx
+        .prepare_cached(concat!(
+            "SELECT COUNT(*) FROM leases WHERE revoked_at IS NULL AND id IN (",
+            subtree_ids!(""),
+            ")"
+        ))?
+        .query_row([&lease.0], |r| r.get(0))?;
+    // One row past the cap tells a full answer from a truncated one.
+    let max_nodes = max_nodes.max(1);
+    let fetch = i64::try_from(max_nodes.saturating_add(1)).unwrap_or(i64::MAX);
+    let mut found = Vec::new();
+    {
+        let mut stmt = tx.prepare_cached(concat!(
+            "SELECT id, parent, expires_at, revoked_at, revoke_reason FROM leases WHERE id IN (",
+            subtree_ids!("LIMIT ?2"),
+            ")"
+        ))?;
+        let mut rows = stmt.query(params![lease.0, fetch])?;
+        while let Some(r) = rows.next()? {
+            let (id, row) = lease_row_from(r)?;
+            found.push((LeaseId(id), row));
+        }
+    }
+    let truncated = found.len() > max_nodes;
+    let mut nodes = breadth_first(lease, found);
+    nodes.truncate(max_nodes);
+    let ancestors = ancestors_of(lease, &row, |id| get_in(&tx, id))?;
+    tx.commit()?;
+    Ok(Some(LeaseSubtree {
+        nodes,
+        ancestors,
+        would_revoke: u64::try_from(would_revoke).unwrap_or(0),
+        truncated,
+    }))
 }
 
 fn binding_in(conn: &Connection, lease: &LeaseId) -> Result<Option<String>, AuditError> {
@@ -1677,20 +2000,25 @@ fn rows_in(conn: &Connection, leases: &[&LeaseId]) -> Result<Vec<(String, LeaseR
             chunk.iter().map(|l| l.0.as_str()),
         ))?;
         while let Some(row) = rows.next()? {
-            let expires_at: String = row.get(2)?;
-            let revoked_at: Option<String> = row.get(3)?;
-            out.push((
-                row.get::<_, String>(0)?,
-                LeaseRow {
-                    parent: row.get::<_, Option<String>>(1)?.map(LeaseId),
-                    expires_at: parse_time(&expires_at)?,
-                    revoked_at: revoked_at.as_deref().map(parse_time).transpose()?,
-                    revoke_reason: row.get(4)?,
-                },
-            ));
+            out.push(lease_row_from(row)?);
         }
     }
     Ok(out)
+}
+
+/// Decode `id, parent, expires_at, revoked_at, revoke_reason` (in that order).
+fn lease_row_from(row: &Row<'_>) -> Result<(String, LeaseRow), AuditError> {
+    let expires_at: String = row.get(2)?;
+    let revoked_at: Option<String> = row.get(3)?;
+    Ok((
+        row.get::<_, String>(0)?,
+        LeaseRow {
+            parent: row.get::<_, Option<String>>(1)?.map(LeaseId),
+            expires_at: parse_time(&expires_at)?,
+            revoked_at: revoked_at.as_deref().map(parse_time).transpose()?,
+            revoke_reason: row.get(4)?,
+        },
+    ))
 }
 
 fn get_in(conn: &Connection, lease: &LeaseId) -> Result<Option<LeaseRow>, AuditError> {
@@ -1844,7 +2172,8 @@ impl SqliteAudit {
 mod tests {
     use super::*;
     use attenuo_core::{
-        AgentId, Capability, CapabilitySet, Decision, DelegationChain, OriginatingUser, ToolCall,
+        AgentId, Capability, CapabilitySet, Decision, DelegationChain, OriginatingUser, RecordKind,
+        ToolCall,
     };
     use time::macros::datetime;
 
@@ -2144,5 +2473,383 @@ mod tests {
         let report = audit.verify_chain().unwrap();
         assert!(report.ok);
         assert_eq!(report.entries, i as u64);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Queries for the admin API: `entries_matching`, lookups, checkpoint listing, the
+    // record-id index.
+    // -----------------------------------------------------------------------------------------
+
+    /// A record with the given fields, at `2026-10-23 12:00 UTC + i seconds`.
+    fn shaped(
+        i: i64,
+        kind: RecordKind,
+        decision: Decision,
+        agent: &str,
+        lease: &str,
+        tool: &str,
+    ) -> DecisionRecord {
+        let mut r = record(i);
+        r.reason = match decision {
+            Decision::Allow => "policy_allow".into(),
+            Decision::Deny => "policy_deny".into(),
+        };
+        r.kind = kind;
+        r.decision = decision;
+        r.agents = vec![AgentId::new(agent)];
+        r.leases = vec![LeaseId::new(lease)];
+        r.chain_id = Some(lease.to_string());
+        r.tool = tool.into();
+        r
+    }
+
+    /// Twelve entries: seqs 1 to 12, at 12:00:01 to 12:00:12. Agents `l1` and `l10`, leases
+    /// `a_1` and `ab1` (an unescaped `_` would match both), tools `50%` and `50x`.
+    fn query_log() -> SqliteAudit {
+        use Decision as D;
+        use RecordKind as K;
+        let log = SqliteAudit::open_in_memory().unwrap();
+        let rows = [
+            (K::Decision, D::Allow, "l1", "a_1", "50%"),
+            (K::Decision, D::Deny, "l10", "ab1", "50x"),
+            (K::Exchange, D::Allow, "l1", "a_1", "read_file"),
+            (K::Decision, D::Deny, "l1", "a_1", "50%"),
+            (K::LeaseRenew, D::Allow, "l10", "ab1", "read_file"),
+            (K::Decision, D::Allow, "l10", "ab1", "50x"),
+            (K::Admin, D::Allow, "l1", "a_1", "read_file"),
+            (K::Decision, D::Deny, "l1", "ab1", "read_file"),
+            (K::Decision, D::Allow, "l10", "a_1", "50%"),
+            (K::Exchange, D::Allow, "l1", "ab1", "50x"),
+            (K::Decision, D::Deny, "l10", "a_1", "read_file"),
+            (K::Decision, D::Allow, "l1", "ab1", "50%"),
+        ];
+        for (i, (kind, decision, agent, lease, tool)) in rows.into_iter().enumerate() {
+            log.append(shaped(i as i64 + 1, kind, decision, agent, lease, tool))
+                .unwrap();
+        }
+        log
+    }
+
+    fn seqs(log: &SqliteAudit, filter: &EntryFilter) -> Vec<u64> {
+        log.entries_matching(1, u64::MAX, filter, Order::Ascending, 1000)
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect()
+    }
+
+    #[test]
+    fn each_filter_returns_exactly_the_matching_entries() {
+        let log = query_log();
+        let all = log.range(1, 1000).unwrap();
+        let filters = [
+            EntryFilter {
+                kinds: vec![RecordKind::Exchange, RecordKind::LeaseRenew],
+                ..Default::default()
+            },
+            EntryFilter {
+                decision: Some(Decision::Deny),
+                ..Default::default()
+            },
+            EntryFilter {
+                reason: Some("policy_allow".into()),
+                ..Default::default()
+            },
+            EntryFilter {
+                subject: Some("user:mudit".into()),
+                ..Default::default()
+            },
+            EntryFilter {
+                agent: Some(AgentId::new("l1")),
+                ..Default::default()
+            },
+            EntryFilter {
+                lease: Some(LeaseId::new("a_1")),
+                ..Default::default()
+            },
+            EntryFilter {
+                server: Some("github".into()),
+                ..Default::default()
+            },
+            EntryFilter {
+                tool: Some("50%".into()),
+                ..Default::default()
+            },
+            EntryFilter {
+                chain_id: Some("ab1".into()),
+                ..Default::default()
+            },
+            EntryFilter {
+                since: Some(datetime!(2026-10-23 12:00:04 UTC)),
+                until: Some(datetime!(2026-10-23 12:00:09 UTC)),
+                ..Default::default()
+            },
+            EntryFilter {
+                kinds: vec![RecordKind::Decision],
+                decision: Some(Decision::Allow),
+                agent: Some(AgentId::new("l10")),
+                ..Default::default()
+            },
+        ];
+        for f in filters {
+            let want: Vec<u64> = all
+                .iter()
+                .filter(|e| f.matches(&e.record))
+                .map(|e| e.seq)
+                .collect();
+            assert!(!want.is_empty(), "{f:?} matches nothing in the fixture");
+            assert_eq!(seqs(&log, &f), want, "{f:?}");
+        }
+        // Spot checks against the fixture table rather than against `matches`.
+        let agent = |a: &str| EntryFilter {
+            agent: Some(AgentId::new(a)),
+            ..Default::default()
+        };
+        assert_eq!(seqs(&log, &agent("l1")), [1, 3, 4, 7, 8, 10, 12]);
+        assert_eq!(seqs(&log, &agent("l10")), [2, 5, 6, 9, 11]);
+        assert_eq!(seqs(&log, &agent("l")), Vec::<u64>::new());
+        // `LIKE` ignores ASCII case; the exact check does not.
+        assert_eq!(seqs(&log, &agent("L1")), Vec::<u64>::new());
+        let window = EntryFilter {
+            since: Some(datetime!(2026-10-23 12:00:04 UTC)),
+            until: Some(datetime!(2026-10-23 12:00:09 UTC)),
+            ..Default::default()
+        };
+        assert_eq!(seqs(&log, &window), [4, 5, 6, 7, 8]);
+        let multi = EntryFilter {
+            kinds: vec![RecordKind::Exchange, RecordKind::Admin],
+            ..Default::default()
+        };
+        assert_eq!(seqs(&log, &multi), [3, 7, 10]);
+        assert_eq!(seqs(&log, &EntryFilter::default()).len(), 12);
+    }
+
+    #[test]
+    fn percent_and_underscore_match_literally() {
+        let log = query_log();
+        let lease = |l: &str| EntryFilter {
+            lease: Some(LeaseId::new(l)),
+            ..Default::default()
+        };
+        assert_eq!(seqs(&log, &lease("a_1")), [1, 3, 4, 7, 9, 11]);
+        assert_eq!(seqs(&log, &lease("ab1")), [2, 5, 6, 8, 10, 12]);
+        assert_eq!(seqs(&log, &lease("a%")), Vec::<u64>::new());
+        let tool = |t: &str| EntryFilter {
+            tool: Some(t.into()),
+            ..Default::default()
+        };
+        assert_eq!(seqs(&log, &tool("50%")), [1, 4, 9, 12]);
+        assert_eq!(seqs(&log, &tool("50_")), Vec::<u64>::new());
+        let agent = |a: &str| EntryFilter {
+            agent: Some(AgentId::new(a)),
+            ..Default::default()
+        };
+        assert_eq!(seqs(&log, &agent("l_")), Vec::<u64>::new());
+        assert_eq!(seqs(&log, &agent("%")), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn pages_cover_the_window_in_both_directions_without_gaps_or_repeats() {
+        let log = query_log();
+        let l1 = EntryFilter {
+            agent: Some(AgentId::new("l1")),
+            ..Default::default()
+        };
+        let want = seqs(&log, &l1);
+        for limit in 1..=4 {
+            // Ascending: each page starts after the last entry of the previous one.
+            let (mut got, mut from) = (Vec::new(), 1);
+            loop {
+                let page = log
+                    .entries_matching(from, u64::MAX, &l1, Order::Ascending, limit)
+                    .unwrap();
+                got.extend(page.iter().map(|e| e.seq));
+                if page.len() < limit {
+                    break;
+                }
+                from = page.last().unwrap().seq + 1;
+            }
+            assert_eq!(got, want, "ascending, limit {limit}");
+            // Descending: each page ends before the last (oldest) entry of the previous one.
+            let (mut got, mut hi) = (Vec::new(), 12);
+            loop {
+                let page = log
+                    .entries_matching(1, hi, &l1, Order::Descending, limit)
+                    .unwrap();
+                got.extend(page.iter().map(|e| e.seq));
+                if page.len() < limit {
+                    break;
+                }
+                hi = page.last().unwrap().seq - 1;
+            }
+            got.reverse();
+            assert_eq!(got, want, "descending, limit {limit}");
+        }
+        // The window bounds the scan.
+        let some = log
+            .entries_matching(5, 9, &EntryFilter::default(), Order::Descending, 100)
+            .unwrap();
+        assert_eq!(
+            some.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            [9, 8, 7, 6, 5]
+        );
+    }
+
+    #[test]
+    fn range_filtered_keeps_its_meaning() {
+        let log = query_log();
+        let f = RecordFilter {
+            kind: Some(RecordKind::Exchange),
+            chain_id: None,
+        };
+        let got: Vec<u64> = log
+            .range_filtered(1, 12, &f, 100)
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect();
+        assert_eq!(got, [3, 10]);
+        let unfiltered = log
+            .range_filtered(1, 5, &RecordFilter::default(), 100)
+            .unwrap();
+        assert_eq!(unfiltered.len(), 5);
+    }
+
+    #[test]
+    fn lookups_by_seq_and_record_id() {
+        let log = query_log();
+        let e = log.entry_at(7).unwrap().unwrap();
+        assert_eq!(e.seq, 7);
+        assert!(log.entry_at(13).unwrap().is_none());
+        assert!(log.entry_at(0).unwrap().is_none());
+        assert!(log.entry_at(u64::MAX).unwrap().is_none());
+        let id = e.record.id.to_string();
+        assert_eq!(log.entry_by_record_id(&id).unwrap().unwrap().seq, 7);
+        assert!(log
+            .entry_by_record_id("00000000-0000-0000-0000-000000000000")
+            .unwrap()
+            .is_none());
+        let plan: Vec<String> = log
+            .with_connection(|c| {
+                let sql =
+                    format!("EXPLAIN QUERY PLAN SELECT seq FROM audit WHERE {RECORD_ID_EXPR} = ?1");
+                let mut stmt = c.prepare(&sql)?;
+                let rows = stmt.query_map([&id], |r| r.get::<_, String>(3))?;
+                Ok(rows.collect::<Result<_, _>>()?)
+            })
+            .unwrap();
+        assert!(
+            plan.iter().any(|p| p.contains("audit_record_id_idx")),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn checkpoints_are_listed_newest_first_without_signing() {
+        let log = SqliteAudit::open_in_memory()
+            .unwrap()
+            .with_checkpointing(issuer().detached_signer(), 3);
+        for i in 0..10 {
+            log.append(record(i)).unwrap();
+        }
+        let count = || -> i64 {
+            log.with_connection(|c| {
+                Ok(c.query_row("SELECT COUNT(*) FROM checkpoints", [], |r| r.get(0))?)
+            })
+            .unwrap()
+        };
+        assert_eq!(count(), 3);
+        let seqs = |v: Vec<Checkpoint>| v.iter().map(|c| c.seq).collect::<Vec<_>>();
+        assert_eq!(
+            seqs(log.checkpoints_before(u64::MAX, 10).unwrap()),
+            [9, 6, 3]
+        );
+        assert_eq!(seqs(log.checkpoints_before(9, 1).unwrap()), [6]);
+        assert!(log.checkpoints_before(3, 10).unwrap().is_empty());
+        assert_eq!(log.checkpoint_covering(4).unwrap().unwrap().seq, 6);
+        assert_eq!(log.checkpoint_covering(6).unwrap().unwrap().seq, 6);
+        assert!(log.checkpoint_covering(10).unwrap().is_none());
+        assert_eq!(count(), 3, "listing must not sign");
+    }
+
+    #[test]
+    fn first_entry_after_finds_the_next_one_of_a_kind() {
+        let log = query_log();
+        let next = |after| {
+            log.first_entry_after(after, RecordKind::Exchange, "50x", &Decision::Allow)
+                .unwrap()
+                .map(|e| e.seq)
+        };
+        assert_eq!(next(0), Some(10));
+        assert_eq!(next(10), None);
+        let deny = log
+            .first_entry_after(0, RecordKind::Exchange, "50x", &Decision::Deny)
+            .unwrap();
+        assert!(deny.is_none());
+    }
+
+    /// The record-id index is created when a log written without it is opened. It changes no
+    /// row (so no hash) and the log still verifies. A row with damaged JSON does not stop the
+    /// open; `verify` reports it as before.
+    #[test]
+    fn the_record_id_index_is_added_to_an_existing_log_without_touching_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("before-index.db");
+        let dump = |log: &SqliteAudit| -> Vec<String> {
+            log.with_connection(|c| {
+                let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit ORDER BY seq");
+                let mut stmt = c.prepare(&sql)?;
+                let rows = stmt.query_map([], |r| {
+                    let mut cols = Vec::new();
+                    for i in 0..18 {
+                        cols.push(format!("{:?}", r.get_ref(i)?));
+                    }
+                    Ok(cols.join("|"))
+                })?;
+                Ok(rows.collect::<Result<_, _>>()?)
+            })
+            .unwrap()
+        };
+        let index_exists = |log: &SqliteAudit| -> bool {
+            log.with_connection(|c| {
+                Ok(c.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM sqlite_master \
+                     WHERE type = 'index' AND name = 'audit_record_id_idx')",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap()
+        };
+        let (before, id) = {
+            let log = SqliteAudit::open(&path).unwrap();
+            for i in 0..5 {
+                log.append(record(i)).unwrap();
+            }
+            // Make the file look like one written before the index existed.
+            log.with_connection(|c| Ok(c.execute_batch("DROP INDEX audit_record_id_idx")?))
+                .unwrap();
+            assert!(!index_exists(&log));
+            let id = log.entry_at(4).unwrap().unwrap().record.id.to_string();
+            (dump(&log), id)
+        };
+        let log = SqliteAudit::open(&path).unwrap();
+        assert!(index_exists(&log));
+        assert_eq!(dump(&log), before, "opening must not change any row");
+        assert!(log.verify_chain().unwrap().ok);
+        assert_eq!(log.entry_by_record_id(&id).unwrap().unwrap().seq, 4);
+        // A row whose JSON was damaged while the index did not exist.
+        log.with_connection(|c| {
+            c.execute_batch(
+                "DROP INDEX audit_record_id_idx; \
+                 UPDATE audit SET record_json = '{not json' WHERE seq = 2;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        drop(log);
+        let log = SqliteAudit::open(&path).expect("a damaged row must not stop the open");
+        assert!(index_exists(&log));
+        assert_eq!(log.verify_chain().unwrap().first_bad_seq, Some(2));
     }
 }

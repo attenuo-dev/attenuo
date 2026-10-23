@@ -19,6 +19,7 @@ pub mod export;
 pub mod lease;
 pub mod log;
 pub mod memory;
+pub mod query;
 pub mod shipped;
 pub mod sqlite;
 
@@ -32,12 +33,13 @@ pub use export::{
     verify_export_with, Export, ExportHeader, ExportReport, RecordFilter, VerifyOptions,
     EXPORT_FORMAT,
 };
-pub use lease::{LeaseStatus, LeaseStore, MemoryLeaseStore};
+pub use lease::{LeaseNode, LeaseStatus, LeaseStore, LeaseSubtree, MemoryLeaseStore};
 pub use log::{
     canonical_record_json, compute_entry_hash, entry_hash_from_json, verify_entries, AuditEntry,
     AuditSink, VerifyReport, ENTRY_HASH_VERSION, GENESIS_HASH,
 };
 pub use memory::MemoryAudit;
+pub use query::{EntryFilter, Order};
 pub use shipped::{
     checkpoint_sha256, cross_check, parse_shipped, CrossCheckReport, ShippedCheckpoint,
     ShippedLine, ShippedMismatch, SHIPPED_FORMAT,
