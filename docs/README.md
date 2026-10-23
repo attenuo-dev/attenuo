@@ -4,6 +4,8 @@ This folder is an Obsidian vault (open it with "Open folder as vault") and the p
 
 - [guides/](guides/): getting started, deploying, integrating MCP clients, identity providers
 - [faq.md](faq.md): the questions people ask first
+- [comparison.md](comparison.md): onbehalf next to OAuth scopes, gateways, policy engines, IdP agent features and SPIFFE
+- [launch-checklist.md](launch-checklist.md): what maintainers check before the first public release
 - [reference/](reference/): lookup tables for CLI commands, configuration keys and HTTP endpoints
 - [spec/](spec/) — the RFC, threat model, and protocol/API specifications
 - [guides/](guides/) — how-to guides for operators, starting with [writing and testing policies](guides/writing-policies.md)

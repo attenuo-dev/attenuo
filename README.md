@@ -6,19 +6,98 @@
 [![Status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-orange.svg)](docs/spec/rfc-0001-onbehalf.md)
 <!-- TODO once published: crates.io and docs.rs badges for onbehalf-core -->
 
-Delegated authorization for software agents. onbehalf lets a principal hand an agent a scoped, attenuable, revocable capability to act on their behalf, checks every call against policy, and writes a tamper-evident audit record of each decision. It is written in Rust and ships as a set of crates plus a standalone server.
+When you give an AI agent access to your GitHub, your mail or your bank, it usually gets one broad token, and every tool call it makes after that is allowed. If a poisoned issue or web page talks the agent into something, nothing stands between the instruction and your data. onbehalf is a self-hosted server and proxy for that gap. A user's login becomes a token for an agent, and the agent can hand a narrower token to each sub-agent it uses. Every tool call goes through onbehalf, which checks it against what was delegated and against a Cedar policy that sees the call's arguments. You can revoke a running session, and every decision is written to a hash-chained audit log. It works with any OIDC identity provider and is written in Rust, with Python and TypeScript SDKs.
 
-**Status: pre-alpha.** The design is in [RFC-0001](docs/spec/rfc-0001-onbehalf.md) and is still open for comment. Nothing here is ready for production use and formats will change before 1.0.
+**Status: pre-alpha.** The design is in [RFC-0001](docs/spec/rfc-0001-onbehalf.md) and is still open for comment. Nothing here is ready for production use and formats will change before 1.0. See [Status](#status) for what has and has not been tested.
+
+## See it block the GitHub MCP leak
+
+In May 2025 researchers showed that a malicious issue in a public repository could steer an AI assistant. Through the official GitHub MCP server it read the user's private repositories and published them ([write-up](https://invariantlabs.ai/blog/mcp-github-vulnerability)). The demo replays that against a fake GitHub MCP server, so it runs offline.
+
+You need a Rust toolchain, `curl` and `python3`.
+
+```sh
+git clone https://github.com/7Mudit/onbehalf.git
+cd onbehalf
+examples/github-leak-demo/run.sh
+```
+
+The first run compiles the workspace, which takes a few minutes. After that the script takes about a minute. It starts onbehalf and the fake server on free ports, plays nine steps with the `onbehalf` CLI, and exits non-zero if any step comes out differently. In short:
+
+- Alice's assistant gets a broad `github:*` token and hands its `coder` sub-agent `github:read_file` only.
+- `coder` reads `alice/public-docs`: allowed.
+- The injected call reads `alice/private-salaries`: `DENIED policy_deny`. The token allows `read_file`, but the policy only permits repos matching `alice/public-*`.
+- The injected `create_issue` that would copy the data out: `DENIED capability_denied`, because it was never delegated.
+- Alice revokes the assistant's lease. `coder`'s next call, even the legitimate one, is `DENIED lease_revoked`.
+- The audit chain verifies (8 entries), and the fake GitHub server received exactly one call.
+
+A recorded run is in [transcript.md](examples/github-leak-demo/transcript.md), and the step table is in the [demo README](examples/github-leak-demo/README.md). The demo mints Alice's root token through a development-only endpoint. A real deployment mints it from an OIDC ID token, as shown in [getting started](docs/guides/getting-started.md) and [identity providers](docs/guides/identity-providers.md).
+
+## How it works
+
+```text
+ user --login--> IdP --ID token--> orchestrator --exchange--> sub-agent
+                                        |                        |
+                       RFC 8693 token exchange at onbehalf:      |
+                       each hop gets a narrower token            |
+                                        v                        v
+                                  +---------------------------------+
+     tools/call + bearer token    |        onbehalf proxy           |
+     ---------------------------> |  1. token and chain verify      |
+                                  |  2. leases of every hop         |
+                                  |  3. capability (tool, args)     |
+                                  |  4. Cedar policy                |
+                                  |  5. audit record, then answer   |
+                                  +----------------+----------------+
+                                                   | allowed calls only
+                                                   v
+                                              MCP server
+```
+
+The user's ID token is exchanged once for a root token (RFC 8693) held by the orchestrator. The orchestrator exchanges that token again for each sub-agent. Each exchange can only shrink what the token allows: fewer tools, tighter argument constraints, a shorter lifetime, no more than the maximum depth. The whole chain, from the verified user to the current agent, is inside the token.
+
+On every `tools/call`, onbehalf verifies the token and its chain, then runs the checks below in order. The first failure denies the call, and the proxy answers with a JSON-RPC error carrying the reason and a decision id.
+
+1. **Lease.** Every hop's lease must be live. Revoking any ancestor lease denies all of its descendants on their next call.
+2. **Capability.** The tool and arguments must be covered by every hop's capability set.
+3. **Policy.** A Cedar policy sees the originating user, the chain and the arguments, and must explicitly permit the call. Deny is the default.
+4. **Audit.** The decision, allow or deny, is appended to a hash-chained log before the answer goes out.
+
+Only allowed calls reach the MCP server. More detail: [delegation chains](docs/concepts/delegation-chain.md), [capabilities and attenuation](docs/concepts/capabilities-and-attenuation.md), [leases](docs/concepts/leases-and-revocation.md), [the audit log](docs/concepts/audit-log.md), and [how it compares with the alternatives](docs/comparison.md).
+
+## What it is not
+
+- **Not a replacement for your API gateway.** It does not do routing, rate limiting or general traffic management. It can sit behind a gateway as the decision point through its AuthZEN endpoint. An adapter for any particular gateway has not been written or tested.
+- **Not a prompt-injection detector.** It never reads prompts or model output. It limits what an agent that has already been fooled can do with the authority it was given. In the [injection suite](docs/evaluation/injection-suite.md), 10 of 60 attack calls still went through, because they used a tool and arguments the task legitimately needed.
+- **Not a sandbox.** It only sees calls that go through it. If the agent also holds a direct API key or network path to the tool, onbehalf sees nothing. See [what onbehalf does not prevent](docs/spec/threat-model.md#what-onbehalf-does-not-prevent).
+
+## Numbers
+
+All of these come from a shared 4-core development container, not a reference machine. Read them as indicative.
+
+- **Injection suite.** Across 46 synthetic cases with 60 attack calls and 69 benign calls, an agent with no onbehalf got all 60 attack calls through. With scope-only tokens (tool names, no argument checks) 41 got through. With onbehalf, 10 did, and 3 benign calls were refused by static suite policies. Caveats: the call sequences are hand-written and no model is in the loop. The policies were written by the same person as the cases. So this checks the corpus against the code and does not measure effectiveness. See [injection-suite.md](docs/evaluation/injection-suite.md).
+- **Latency added.** Through the real proxy with one client, onbehalf added about 0.4 to 0.8 ms at the median (425 to 771 microseconds, one to three hops, in-memory or file-backed audit). Load was closed-loop and each cell is good to roughly plus or minus 20 percent. See [performance.md](docs/design/performance.md#after-the-policy-stage-and-wal-work).
+- **Policy stage.** A Cedar decision takes about 13 microseconds when the per-chain request cache hits and 125 to 175 microseconds when it does not. The cache keys on chain and tool, so the first call of a chain pays the uncached cost. See [performance.md](docs/design/performance.md#after-the-policy-stage-and-wal-work).
+- **Throughput.** With a file-backed audit log at `durability = "normal"` and one hop, the benchmark measured 1,252, 4,049 and 6,254 allowed calls per second at 1, 8 and 32 clients. That setting can lose the newest audit records on a power failure (up to five seconds or 256 commits). Open-loop load, a quiet machine and confidence intervals are listed in performance.md as not measured.
+
+## Status
+
+onbehalf is pre-alpha and has not been used in production.
+
+- **Security review.** Four review passes have been done in this repository, written up in [pass 1](docs/research/security-review-2026-10-22.md), [pass 3](docs/research/security-review-2026-10-23.md) and [pass 4](docs/research/security-review-2026-10-23-pass4.md). Pass 2 was the fix round for pass 1. Passes 1, 3 and 4 recorded 26, 13 and 15 findings. None was Critical, and only pass 1 found any High (5). Pass 4 found 1 Medium, fixed, so no Medium finding was open at its end. It ended with 4 findings open (2 Low, 2 Info) and 2 accepted, and a couple of pass 1 items were still open. The project did all four passes itself; there has been no outside audit.
+- **Tests and fuzzing.** The last full run on main had 573 Rust tests, 91 Python SDK tests, 80 TypeScript SDK tests and the demo passing. There are [12 fuzz targets](docs/design/fuzzing.md) (tokens, DPoP, chains, capability attenuation, the proxy, SSE, audit export). Fuzzing found three bugs, now fixed, and two audit-verification issues that are still open on the [task board](docs/tasks/board.md).
+- **Not tested.** Every identity-provider recipe (Keycloak, Auth0, Okta, Entra ID, Google, ID-JAG) is untested against a real provider; the server's tests use assertions it signs itself. The Docker setup is untested. There has been no production use and no load test on reference hardware.
 
 ## Where to look
 
 - [Guides](docs/guides/README.md): [getting started](docs/guides/getting-started.md), [deploying](docs/guides/deploying.md), [integrating MCP clients](docs/guides/integrating-mcp-clients.md) and [identity providers](docs/guides/identity-providers.md).
 - [FAQ](docs/faq.md): why a proxy, how it differs from gateways and policy engines, what happens when it is down.
+- [Comparison](docs/comparison.md): onbehalf next to OAuth scopes, gateways, policy engines, IdP agent features and SPIFFE.
 - [RFC-0001: onbehalf](docs/spec/rfc-0001-onbehalf.md): what the system is, the token model, the policy and audit design.
 - [docs/](docs/README.md): specifications, architecture decisions, research notes, task board and engineering log.
 - [Python SDK](sdk/python/README.md): `pip install -e sdk/python`, sync and async clients, an admin client, and an [agent example](examples/python-agent/agent.py).
 - [TypeScript SDK](sdk/typescript/README.md): `@onbehalf/sdk` (Node 20+, no runtime dependencies), the same API with promises, and an [agent example](examples/typescript-agent/agent.ts).
-- [examples/github-leak-demo](examples/github-leak-demo/README.md): the May 2025 GitHub MCP prompt-injection leak, replayed and stopped (`run.sh`, about a minute).
+- [examples/github-leak-demo](examples/github-leak-demo/README.md): the demo from the top of this page.
 - [examples/claude-agent-sdk](examples/claude-agent-sdk/README.md) and [examples/langchain-agent](examples/langchain-agent/README.md): an orchestrator delegating to a coder sub-agent in the Claude Agent SDK and in LangChain, each hop with its own token, through the proxy. A `run.sh` dry-run needs no API key. All examples are listed in [examples/README.md](examples/README.md).
 - [docs/guides/writing-policies.md](docs/guides/writing-policies.md): writing Cedar policies for agents and testing them offline with `onbehalf policy test` and `onbehalf policy lint`, including a CI recipe.
 - [CONTRIBUTING.md](CONTRIBUTING.md): how to build, test and submit changes.
@@ -47,7 +126,7 @@ cargo test --workspace
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full set of checks CI runs.
 
-## Quick start
+## Run the server yourself
 
 Run the server with the example config. It generates an issuer key in `data/` on first start, keeps the audit log and lease registry in `data/onbehalf.sqlite`, and proxies an MCP server expected at `http://127.0.0.1:3001/mcp` as `github` (edit `[[upstreams]]` to point at yours).
 
@@ -59,7 +138,7 @@ cargo run -p onbehalf-server -- --config config/example.toml   # or ONBEHALF_CON
 
 The example ships no admin token. On a loopback `listen` address a missing, short or placeholder token only produces a warning (and without one the admin routes answer 403); on any other address the server refuses to start unless the token is at least 32 bytes and not a published placeholder. Revocations, policy reloads and dev root mints are written to the audit log as admin actions.
 
-The flows below use `curl` and `jq`.
+The flows below use `curl` and `jq`. [Getting started](docs/guides/getting-started.md) covers the same ground step by step.
 
 ### Hop 0 from your identity provider
 
@@ -164,9 +243,9 @@ onbehalf audit tail -n 10 --follow
 onbehalf audit verify
 ```
 
-Other subcommands: `tools` (`tools/list`), `lease show`, `policy reload`, `authzen eval`. Output is for people by default and JSON with `--json`; `--print token|lease` on `token root` and `token exchange` prints one value for scripts. `--server` before the subcommand is the onbehalf URL; after `call` or `tools` it names the MCP upstream. Exit status is 0 on success, 1 on an error and 2 when the server said no (a denied call, a negative AuthZEN decision, a broken audit chain). Secrets stay out of the argument list: the admin token and the agent client secret come from `ONBEHALF_ADMIN_TOKEN` / `ONBEHALF_CLIENT_SECRET`, `--admin-token-stdin` / `--client-secret-stdin`, or `--admin-token-file` / `--client-secret-file`; delegation tokens come from `ONBEHALF_TOKEN`, `--token-file` / `--subject-token-file`, or stdin with `--token -` / `--subject-token -`. `--admin-token`, `--client-secret`, `--token` and `--subject-token` with a literal value still work but print a warning, since arguments show up in `ps` and shell history.
+Other subcommands: `tools` (`tools/list`), `lease show`, `policy reload`, `authzen eval`. Output is for people by default and JSON with `--json`. Exit status is 0 on success, 1 on an error and 2 when the server said no (a denied call, a negative AuthZEN decision, a broken audit chain). Secrets stay out of the argument list: use the environment variables, `-stdin` flags or `-file` flags described in the [CLI reference](docs/reference/cli.md).
 
-A scripted end-to-end run of the GitHub leak scenario, with a fake MCP server, is in [examples/github-leak-demo](examples/github-leak-demo/README.md). A `Dockerfile` and `docker-compose.yml` run the same pair of servers in containers (untested).
+A `Dockerfile` and `docker-compose.yml` run the same pair of servers in containers (untested).
 
 ## Python SDK
 

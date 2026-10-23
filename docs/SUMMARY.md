@@ -74,6 +74,8 @@
 # Project
 
 - [FAQ](faq.md)
+- [Comparison with alternatives](comparison.md)
+- [Launch checklist](launch-checklist.md)
 - [Changelog](project/changelog.md)
 - [Security policy](project/security.md)
 - [Task board](tasks/board.md)

@@ -127,7 +127,8 @@ Maintainers only. Versions follow [SemVer 2.0](https://semver.org/). Pre-1.0, a 
 1. Make sure `main` is green and `CHANGELOG.md`'s `Unreleased` section is complete. `git cliff --unreleased` gives a draft to compare against.
 2. Open a `chore(release): vX.Y.Z` PR that bumps `workspace.package.version` in `Cargo.toml`, moves `Unreleased` to a dated `[X.Y.Z]` heading with a compare link, and adds a fresh empty `Unreleased`.
 3. Merge, then tag the merge commit `vX.Y.Z` (annotated, signed if you have a key) and push the tag. `.github/workflows/release.yml` builds `onbehalf` and `onbehalf-server` for Linux (musl, x86_64 and aarch64) and macOS (arm64, x86_64), pushes a signed multi-arch image to GHCR (cosign keyless, SBOM attached), and opens a **draft** GitHub release with the archives, `SHA256SUMS` and the git-cliff changelog section. Review the draft and publish it by hand. It needs only the automatic `GITHUB_TOKEN`; set the GHCR package to public after the first push.
-4. Crate publishing to crates.io is manual until the public API settles; the plan is to adopt release-plz once it does.
+4. For the first public release, work through the [launch checklist](docs/launch-checklist.md).
+5. Crate publishing to crates.io is manual until the public API settles; the plan is to adopt release-plz once it does.
 
 ## Licence
 
