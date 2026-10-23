@@ -1110,6 +1110,25 @@ fn cached_translations_decide_like_fresh_ones() {
 }
 
 #[test]
+fn policy_texts_name_each_loaded_policy_with_its_source() {
+    let mut engine = engine_with(
+        r#"// a comment that is not part of any policy
+@id("b_forbid") forbid(principal, action == Action::"github/delete_repo", resource);
+@id("a_reads") permit(principal, action, resource) when { resource.readonly };"#,
+    );
+    let texts = engine.policy_texts();
+    let ids: Vec<&str> = texts.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, vec!["a_reads", "b_forbid"]);
+    assert!(texts[0].1.contains("resource.readonly"), "{}", texts[0].1);
+    assert!(texts[1].1.contains("forbid"), "{}", texts[1].1);
+    assert!(texts[1].1.contains("github/delete_repo"), "{}", texts[1].1);
+
+    // A failed reload leaves the texts of the policies still in force.
+    assert!(engine.reload_policies_str("permit(").is_err());
+    assert_eq!(engine.policy_texts(), texts);
+}
+
+#[test]
 fn reload_empties_the_request_cache() {
     let mut engine = engine_with(r#"@id("all") permit(principal, action, resource);"#);
     let c = call("read_file", json!({}));

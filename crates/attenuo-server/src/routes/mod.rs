@@ -4,6 +4,7 @@ pub mod admin;
 pub mod authzen;
 pub mod dev_root;
 pub mod ops;
+pub mod policies;
 pub mod renew;
 pub mod token;
 pub mod wellknown;
