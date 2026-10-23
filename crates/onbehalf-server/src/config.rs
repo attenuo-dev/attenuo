@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use onbehalf_core::{Capability, CapabilitySet};
 use onbehalf_policy::{ToolAttrs, ToolCatalog, UnknownTools};
 use onbehalf_proxy::UpstreamConfig;
+use onbehalf_token::MayAct;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -564,6 +565,11 @@ pub struct RootGrant {
     pub capabilities: Vec<CapSpec>,
     #[serde(default)]
     pub attributes: BTreeMap<String, Value>,
+    /// RFC 8693 §4.4 `may_act` of root tokens minted under this grant: the agents allowed to
+    /// exchange them. A request may narrow it (its own `may_act` must be a subset), never widen
+    /// it. When absent, the request's `may_act` (if any) is used as is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub may_act: Option<Vec<String>>,
 }
 
 impl RootGrant {
@@ -588,6 +594,29 @@ impl RootGrant {
             return Some(first);
         }
         matching.find(|g| g.subject.is_some()).or(Some(first))
+    }
+
+    /// The `may_act` of a root token minted under this grant, given the request's: the
+    /// request's when it is within the grant's, the grant's when the request has none.
+    pub fn may_act_for(&self, requested: Option<MayAct>) -> Result<Option<MayAct>, String> {
+        resolve_may_act(self.may_act.as_deref(), requested)
+    }
+}
+
+/// `may_act` for a root token: `requested` must be within `ceiling` when both are set.
+pub fn resolve_may_act(
+    ceiling: Option<&[String]>,
+    requested: Option<MayAct>,
+) -> Result<Option<MayAct>, String> {
+    let ceiling = ceiling.map(|c| MayAct::new(c.iter().cloned()));
+    match (ceiling, requested) {
+        (None, r) => Ok(r),
+        (Some(c), None) => Ok(Some(c)),
+        (Some(c), Some(r)) if r.is_within(&c) => Ok(Some(r)),
+        (Some(c), Some(r)) => Err(format!(
+            "may_act {:?} is not within the [[root_grants]] may_act {:?}",
+            r.sub, c.sub
+        )),
     }
 }
 
@@ -846,6 +875,7 @@ mod tests {
             agent: "planner".into(),
             capabilities: vec![CapSpec::Short(cap.into())],
             attributes: BTreeMap::new(),
+            may_act: None,
         };
         let grants = vec![
             grant(None, "github:read_*"),
@@ -856,6 +886,31 @@ mod tests {
         assert_eq!(pick("bob").unwrap().subject, None);
         assert!(RootGrant::find(&grants, "other", "planner", "alice").is_none());
         assert!(RootGrant::find(&grants, "idp", "coder", "alice").is_none());
+    }
+
+    #[test]
+    fn root_grant_may_act_is_a_ceiling() {
+        let m = |v: &[&str]| MayAct::new(v.iter().copied());
+        let ceiling = vec!["coder".to_string(), "reviewer".to_string()];
+        assert_eq!(resolve_may_act(None, None).unwrap(), None);
+        assert_eq!(
+            resolve_may_act(None, Some(m(&["x"]))).unwrap(),
+            Some(m(&["x"]))
+        );
+        assert_eq!(
+            resolve_may_act(Some(&ceiling), None).unwrap(),
+            Some(m(&["coder", "reviewer"]))
+        );
+        assert_eq!(
+            resolve_may_act(Some(&ceiling), Some(m(&["coder"]))).unwrap(),
+            Some(m(&["coder"]))
+        );
+        assert!(resolve_may_act(Some(&ceiling), Some(m(&["coder", "sneaky"]))).is_err());
+        let g: RootGrant = toml::from_str(
+            "issuer = \"i\"\nagent = \"a\"\ncapabilities = [\"*:*\"]\nmay_act = [\"coder\"]\n",
+        )
+        .unwrap();
+        assert_eq!(g.may_act_for(None).unwrap(), Some(m(&["coder"])));
     }
 
     #[test]

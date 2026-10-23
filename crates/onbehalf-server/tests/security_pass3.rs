@@ -145,6 +145,7 @@ async fn server_trusting(idp: &EcIdp) -> Spawned {
         agent: "planner".into(),
         capabilities: vec![CapSpec::Short("github:*".into())],
         attributes: BTreeMap::new(),
+        may_act: None,
     }];
     let (router, _state) = onbehalf_server::build(&cfg).unwrap();
     spawn_router(router).await.unwrap()

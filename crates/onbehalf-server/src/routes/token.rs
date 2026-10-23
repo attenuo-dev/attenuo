@@ -22,6 +22,7 @@
 //! | `authorization_details` | RFC 9396 list with one `{"type":"onbehalf_capabilities","capabilities":[...]}`; a JSON string in form encoding |
 //! | `scope` | form only, alternative to `authorization_details`: space-separated `server:tool` |
 //! | `requested_ttl_seconds` | optional |
+//! | `may_act` | optional RFC 8693 §4.4 `may_act` for the child token: agent ids (JSON list or `{"sub": [...]}`; space-separated in form encoding) |
 //!
 //! **Actor authentication (SR-10).** With `[token] require_actor_auth = true` (the default) the
 //! caller must authenticate as `actor`, with whichever methods `[token] actor_auth` accepts
@@ -349,6 +350,11 @@ fn form_to_json(body: &Bytes) -> Result<Value, ApiError> {
                 scope = Some(v);
                 continue;
             }
+            "may_act" if v.trim_start().starts_with(['[', '{']) => serde_json::from_str(&v)
+                .map_err(|e| {
+                    ApiError::bad_request("invalid_request", format!("may_act is not JSON: {e}"))
+                })?,
+            "may_act" => Value::from(v.split_whitespace().collect::<Vec<_>>()),
             _ => Value::String(v),
         };
         obj.insert(k, value);
@@ -389,6 +395,20 @@ mod tests {
         assert_eq!(req.requested.len(), 2);
         assert_eq!(req.ttl_seconds, Some(60));
         assert_eq!(req.actor.0, "coder");
+        assert_eq!(req.may_act, None);
+        for may_act in ["reviewer+tester", "%5B%22reviewer%22%2C%22tester%22%5D"] {
+            let v = form_to_json(&Bytes::from(format!(
+                "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange\
+                 &subject_token=a&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Ajwt\
+                 &actor=coder&scope=github%3Aread_file&may_act={may_act}"
+            )))
+            .unwrap();
+            let req: ExchangeRequest = serde_json::from_value(v).unwrap();
+            assert_eq!(
+                req.may_act,
+                Some(onbehalf_token::MayAct::new(["reviewer", "tester"]))
+            );
+        }
     }
 
     #[test]

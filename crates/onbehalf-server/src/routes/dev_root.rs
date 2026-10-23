@@ -7,8 +7,10 @@
 //! server logs a warning at startup when it is), sits behind the admin bearer and, when
 //! `[[root_grants]]` is configured, is limited to those grants.
 //!
-//! Body: `{ subject, issuer, agent, capabilities?, ttl_seconds?, attributes? }`, where
-//! `capabilities` is a list of `"server:tool"` strings or capability objects. The response has
+//! Body: `{ subject, issuer, agent, capabilities?, ttl_seconds?, attributes?, may_act? }`, where
+//! `capabilities` is a list of `"server:tool"` strings or capability objects and `may_act` is
+//! the RFC 8693 §4.4 claim for the root token (a list of agent ids, or `{"sub": [...]}`;
+//! within the grant's `may_act` when it has one). The response has
 //! the same shape as a `/token` response.
 
 use std::collections::BTreeMap;
@@ -20,7 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use onbehalf_audit::LeaseStore;
 use onbehalf_core::{AgentId, CapabilitySet, OriginatingUser};
-use onbehalf_token::ExchangeResponse;
+use onbehalf_token::{ExchangeResponse, IssueOptions, MayAct};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use time::Duration;
@@ -45,6 +47,8 @@ pub struct RootTokenRequest {
     pub ttl_seconds: Option<u64>,
     #[serde(default)]
     pub attributes: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub may_act: Option<MayAct>,
 }
 
 pub async fn mint_root(
@@ -56,7 +60,7 @@ pub async fn mint_root(
 }
 
 fn mint_root_sync(state: &AppState, req: RootTokenRequest) -> Result<Response, ApiError> {
-    let (capabilities, grant_attributes) = resolve_grant(&state.root_grants, &req)?;
+    let (capabilities, grant_attributes, may_act) = resolve_grant(&state.root_grants, &req)?;
     let attributes = merge_attributes(grant_attributes, &req.attributes)?;
 
     let now = now();
@@ -69,12 +73,16 @@ fn mint_root_sync(state: &AppState, req: RootTokenRequest) -> Result<Response, A
         authenticated_at: now,
         attributes,
     };
-    let issued = state.issuer.issue_root(
+    let issued = state.issuer.issue_root_with(
         user,
         AgentId::new(req.agent.clone()),
         capabilities,
         ttl,
         now,
+        &IssueOptions {
+            may_act,
+            not_after: None,
+        },
     )?;
     register_issued(
         state,
@@ -117,12 +125,12 @@ fn mint_root_sync(state: &AppState, req: RootTokenRequest) -> Result<Response, A
     Ok(out)
 }
 
-/// Apply the `[[root_grants]]` allowlist. Returns the capabilities to grant and the grant's
-/// attributes (request attributes are merged over them by the caller).
-fn resolve_grant(
-    grants: &[RootGrant],
-    req: &RootTokenRequest,
-) -> Result<(CapabilitySet, BTreeMap<String, Value>), ApiError> {
+/// What a grant allows: capabilities, attributes, `may_act`.
+type Granted = (CapabilitySet, BTreeMap<String, Value>, Option<MayAct>);
+
+/// Apply the `[[root_grants]]` allowlist. Returns the capabilities to grant, the grant's
+/// attributes (request attributes are merged over them by the caller) and the `may_act`.
+fn resolve_grant(grants: &[RootGrant], req: &RootTokenRequest) -> Result<Granted, ApiError> {
     let requested = req
         .capabilities
         .as_deref()
@@ -132,7 +140,7 @@ fn resolve_grant(
     if grants.is_empty() {
         let caps = requested
             .ok_or_else(|| ApiError::bad_request("invalid_request", "capabilities are required"))?;
-        return Ok((caps, BTreeMap::new()));
+        return Ok((caps, BTreeMap::new(), req.may_act.clone()));
     }
     let grant =
         RootGrant::find(grants, &req.issuer, &req.agent, &req.subject).ok_or_else(|| {
@@ -152,7 +160,10 @@ fn resolve_grant(
             .attenuate(&r)
             .map_err(|e| ApiError::bad_request("invalid_scope", e.to_string()))?,
     };
-    Ok((caps, grant.attributes.clone()))
+    let may_act = grant.may_act_for(req.may_act.clone()).map_err(|e| {
+        ApiError::bad_request("invalid_request", e).with_description("may_act_exceeds_grant")
+    })?;
+    Ok((caps, grant.attributes.clone(), may_act))
 }
 
 /// Request attributes may add to a grant's attributes but never replace one: a grant that says
@@ -191,6 +202,7 @@ mod tests {
             capabilities: caps.map(|v| v.into_iter().map(|s| CapSpec::Short(s.into())).collect()),
             ttl_seconds: None,
             attributes: BTreeMap::new(),
+            may_act: None,
         }
     }
 
@@ -202,6 +214,7 @@ mod tests {
             agent: "planner".into(),
             capabilities: vec![CapSpec::Short("github:read_*".into())],
             attributes: BTreeMap::new(),
+            may_act: None,
         }];
         assert_eq!(resolve_grant(&grants, &req(None)).unwrap().0.len(), 1);
         assert!(resolve_grant(&grants, &req(Some(vec!["github:read_file"]))).is_ok());

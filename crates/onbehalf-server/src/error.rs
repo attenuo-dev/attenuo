@@ -108,6 +108,14 @@ impl From<onbehalf_token::TokenError> for ApiError {
             }
             TokenError::Chain(ChainError::AttenuationViolated { .. })
             | TokenError::Chain(ChainError::TooDeep { .. }) => "invalid_scope",
+            TokenError::ActorNotPermitted(_) => {
+                return ApiError::bad_request("invalid_request", e.to_string())
+                    .with_description("actor_not_permitted")
+            }
+            TokenError::NoLifetimeLeft(_) => {
+                return ApiError::bad_request("invalid_request", e.to_string())
+                    .with_description("no_lifetime_left")
+            }
             TokenError::Key(_) => return ApiError::internal(e),
             _ => "invalid_grant",
         };
