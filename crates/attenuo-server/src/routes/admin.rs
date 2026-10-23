@@ -161,9 +161,6 @@ pub async fn lease_status(
 /// exactly the rows they return.
 pub const MAX_AUDIT_SCAN: u64 = 50_000;
 
-/// Query string of `GET /admin/audit`. Every field is optional; with none of the filter
-/// fields, `order` or `before`, the answer is the same as before filters existed.
-#[derive(Debug, Default, Deserialize)]
 /// Leases `GET /admin/leases/{id}/tree` lists when the request names no `max_nodes`.
 pub const DEFAULT_TREE_NODES: usize = 1000;
 /// Most leases `GET /admin/leases/{id}/tree` lists, whatever `max_nodes` asks for. Bounds the
@@ -248,7 +245,9 @@ pub async fn lease_tree(
         .await
 }
 
-#[derive(Debug, Deserialize)]
+/// Query string of `GET /admin/audit`. Every field is optional; with none of the filter
+/// fields, `order` or `before`, the answer is the same as before filters existed.
+#[derive(Debug, Default, Deserialize)]
 pub struct AuditQuery {
     /// First sequence number to return, for `order=asc` (default 1).
     pub from: Option<u64>,
