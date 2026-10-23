@@ -6,10 +6,12 @@
 //! strictly. The guarantees are:
 //!
 //! 1. **The originating-user block is signed once.** At [`Issuer::issue_root`] the issuer signs
-//!    the canonical JSON of the `OriginatingUser` and stores the detached signature in the
-//!    `ou_sig` claim. Exchanges copy it unchanged, and every verification recomputes and checks
-//!    it, so no hop can alter who the chain is for, even if the outer JWT is re-signed by another
-//!    legitimate issuer key.
+//!    `iss`, the canonical JSON of the `OriginatingUser` and the root hop, domain-separated
+//!    (`ou_sig` v2, [`claims::ou_sig_payload`]), and stores the detached signature in the
+//!    `ou_sig` claim with `ou_sig_v` = 2 and the signing key's `ou_kid`. Exchanges copy them
+//!    unchanged, and every verification recomputes and checks the signature, so no hop can alter
+//!    who the chain is for or how it started, even if the outer JWT is re-signed by another
+//!    legitimate issuer key, and a user's signature cannot be lifted into another chain.
 //! 2. **Exchanges only narrow.** [`Issuer::exchange`] builds the child chain with
 //!    `DelegationChain::extend` from `onbehalf-core`: the requested capabilities must be covered
 //!    by the parent's, and the child's expiry is clamped to the parent's.
@@ -70,7 +72,9 @@ pub mod issuer;
 mod keys;
 pub mod verifier;
 
-pub use claims::{ActClaim, Claims, MayAct, JWT_TOKEN_TYPE_URN, TOKEN_TYPE};
+pub use claims::{
+    ActClaim, Claims, MayAct, JWT_TOKEN_TYPE_URN, OU_SIG_CONTEXT, OU_SIG_VERSION, TOKEN_TYPE,
+};
 pub use detached::{verify_detached, DetachedSigner};
 pub use error::TokenError;
 pub use exchange::{
