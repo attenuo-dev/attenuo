@@ -1,7 +1,7 @@
 # Admin console: design
 
 Status: draft for discussion. Date: 2026-10-23. Base: `main` at 25649d6.
-Related: [ADR draft](adr-draft.md) (architecture only), RFC-0001 sections 6 and 7, `docs/design/server.md`, ADR-0006.
+Related: [ADR-0008](../decisions/0008-admin-console.md) (architecture only), RFC-0001 sections 6 and 7, `docs/design/server.md`, ADR-0006.
 
 Attenuo has a CLI and an `/admin/*` REST surface but no UI. This document proposes an admin console for one job: let an operator read the audit log, see and revoke leases, and test policy, without a terminal. The console is a view over the admin API. It adds no authority that the admin bearer does not already have, and it does not grant anything.
 
