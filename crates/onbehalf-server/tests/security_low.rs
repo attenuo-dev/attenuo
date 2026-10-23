@@ -499,7 +499,11 @@ async fn admin_records_use_a_subject_no_user_can_have() {
         .await
         .unwrap();
     let keys = CheckpointKeys::from_jwks(&jwks).unwrap();
-    let report = onbehalf_audit::export::verify_export(&parsed, &keys).unwrap();
+    // No checkpoint was asked for, so every entry is in the unsigned tail.
+    let allow = onbehalf_audit::VerifyOptions {
+        allow_unsigned_tail: true,
+    };
+    let report = onbehalf_audit::export::verify_export_with(&parsed, &keys, allow).unwrap();
     assert!(report.report.ok, "{report:?}");
     let online: Value = client
         .get(server.url("/admin/audit/verify"))

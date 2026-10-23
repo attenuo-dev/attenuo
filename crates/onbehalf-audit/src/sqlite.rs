@@ -23,7 +23,8 @@ use crate::checkpoint::{
 use crate::error::AuditError;
 use crate::lease::{classify, LeaseRow, LeaseStatus, LeaseStore};
 use crate::log::{
-    entry_hash_from_json, verify_entries, AuditEntry, AuditSink, VerifyReport, GENESIS_HASH,
+    canonical_record_json, entry_hash_from_json, verify_entries, AuditEntry, AuditSink,
+    VerifyReport, ENTRY_HASH_VERSION, GENESIS_HASH,
 };
 
 const AUDIT_SCHEMA: &str = r#"
@@ -58,6 +59,14 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     at        TEXT NOT NULL,
     kid       TEXT NOT NULL,
     signature TEXT NOT NULL
+);
+"#;
+
+/// Which entry hash construction the `audit` table was written with (key `entry_hash`).
+const META_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS audit_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 );
 "#;
 
@@ -100,9 +109,12 @@ const STATEMENT_CACHE: usize = 32;
 ///   process crashing or being killed (it is in the OS page cache), but the most recent
 ///   commits can be lost if the machine loses power or the OS crashes before the next sync.
 ///   What survives is always a prefix of the log: a transaction is never torn, the database is
-///   never corrupt, and the hash chain still verifies, ending at an earlier head. Lease
-///   revocations are the exception: they always commit with `synchronous=FULL` (see
-///   [`SqliteLeaseStore`]), so a revoked lease cannot come back after a power failure.
+///   never corrupt, and the hash chain still verifies, ending at an earlier head. Two kinds of
+///   commit are the exception and always run with `synchronous=FULL`: lease revocations (see
+///   [`SqliteLeaseStore`]), so a revoked lease cannot come back after a power failure, and
+///   every commit that writes a signed checkpoint (see [`SqliteAudit`]), so a checkpoint
+///   handed to the `on_created` hook, and shipped off the host from there, never names
+///   entries that a power failure could still take back (SR-50).
 /// - [`Full`](Self::Full) (`synchronous=FULL`): every commit is synced before it returns, so a
 ///   decision that was answered is on disk. One `fsync` per commit bounds throughput by the
 ///   storage's sync latency.
@@ -119,6 +131,104 @@ impl Durability {
         match self {
             Durability::Normal => "NORMAL",
             Durability::Full => "FULL",
+        }
+    }
+
+    /// The numeric `PRAGMA synchronous` level.
+    fn level(self) -> i64 {
+        match self {
+            Durability::Normal => SYNC_NORMAL,
+            Durability::Full => SYNC_FULL,
+        }
+    }
+}
+
+/// `PRAGMA synchronous` levels (`OFF` is 0, `EXTRA` 3).
+const SYNC_NORMAL: i64 = 1;
+const SYNC_FULL: i64 = 2;
+
+/// Put `conn` back to `synchronous` level `level` after a commit that ran at `FULL`. A failure
+/// is logged, not returned: the commit before it succeeded and its caller must learn that, and
+/// the connection merely stays at the safer setting (SR-51).
+fn restore_sync(conn: &Connection, level: i64) {
+    if let Err(e) = conn.pragma_update(None, "synchronous", level) {
+        eprintln!(
+            "onbehalf-audit: could not set synchronous back to {level} after a synced commit \
+             (the connection stays at FULL): {e}"
+        );
+    }
+}
+
+/// Run `f` with `synchronous=FULL`, then go back to `relaxed`, the connection's own level,
+/// when it is set (`None`: the connection already syncs every commit, or has nothing to sync).
+/// Raising the level must succeed before `f` runs; lowering it again cannot fail the call (see
+/// [`restore_sync`]), so `f`'s result always comes back.
+fn with_full_sync<T>(
+    conn: &mut Connection,
+    relaxed: Option<i64>,
+    f: impl FnOnce(&mut Connection) -> T,
+) -> Result<T, AuditError> {
+    let Some(level) = relaxed else {
+        return Ok(f(conn));
+    };
+    conn.pragma_update(None, "synchronous", SYNC_FULL)?;
+    let out = f(conn);
+    restore_sync(conn, level);
+    Ok(out)
+}
+
+/// The `synchronous` level of `conn` if it is below `FULL` and there is a file to sync.
+fn relaxed_sync_of(conn: &Connection) -> Result<Option<i64>, AuditError> {
+    let file_backed = conn.path().is_some_and(|p| !p.is_empty());
+    let level: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
+    Ok((file_backed && level < SYNC_FULL).then_some(level))
+}
+
+/// Refuse a log whose entries were hashed with another construction than
+/// [`ENTRY_HASH_VERSION`], and record the construction of a new one.
+fn check_hash_version(conn: &Connection) -> Result<(), AuditError> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM audit_meta WHERE key = 'entry_hash'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match stored {
+        Some(v) if v == ENTRY_HASH_VERSION => Ok(()),
+        Some(v) => Err(AuditError::Storage(format!(
+            "this audit log was written with entry hash `{v}`; this version reads only \
+             `{ENTRY_HASH_VERSION}`"
+        ))),
+        None => {
+            let has_entries: bool =
+                conn.query_row("SELECT EXISTS (SELECT 1 FROM audit)", [], |r| r.get(0))?;
+            if has_entries {
+                return Err(AuditError::Storage(format!(
+                    "this audit log was written by an earlier onbehalf (entry hash v1, before \
+                     RFC 8785 canonical JSON) and cannot be verified or extended by this \
+                     version, which hashes `{ENTRY_HASH_VERSION}`; move the file aside and \
+                     start a new log"
+                )));
+            }
+            conn.execute(
+                "INSERT OR IGNORE INTO audit_meta (key, value) VALUES ('entry_hash', ?1)",
+                [ENTRY_HASH_VERSION],
+            )?;
+            // Another process may have created the log meanwhile; whoever won must agree.
+            let v: String = conn.query_row(
+                "SELECT value FROM audit_meta WHERE key = 'entry_hash'",
+                [],
+                |r| r.get(0),
+            )?;
+            if v == ENTRY_HASH_VERSION {
+                Ok(())
+            } else {
+                Err(AuditError::Storage(format!(
+                    "this audit log uses entry hash `{v}`; this version reads only \
+                     `{ENTRY_HASH_VERSION}`"
+                )))
+            }
         }
     }
 }
@@ -195,8 +305,9 @@ fn entry_from_row(row: &Row<'_>) -> Result<AuditEntry, AuditError> {
         serde_json::from_str(&record_json).map_err(|e| corrupt(format!("record_json: {e}")))?;
     // The hash covers the *decoded* record, and some decoders are lenient (RFC 3339 accepts any
     // date/time separator, for instance), so a byte-level edit could decode to the same value.
-    // Rows are written in canonical form; anything that no longer round-trips was edited.
-    if serde_json::to_string(&record)? != record_json {
+    // Rows are written in canonical (RFC 8785) form; anything that no longer round-trips was
+    // edited.
+    if canonical_record_json(&record) != record_json {
         return Err(corrupt(
             "record_json is not the canonical encoding of its record".into(),
         ));
@@ -528,7 +639,9 @@ fn wal_round(shared: &WalShared) -> Result<(), AuditError> {
 type CheckpointHook = Arc<dyn Fn(&Checkpoint) + Send + Sync>;
 
 /// Automatic checkpointing: sign the head every `every` entries, inside the append's
-/// transaction, so a checkpoint can never refer to a head that was not committed.
+/// transaction, so a checkpoint can never refer to a head that was not committed. That
+/// transaction commits with `synchronous=FULL` whatever the store's durability, before the
+/// `on_created` hook sees the checkpoint (SR-50).
 struct Checkpointing {
     signer: onbehalf_token::DetachedSigner,
     every: u64,
@@ -558,6 +671,15 @@ pub const MAX_BATCH: usize = 256;
 /// **WAL checkpoints.** [`with_wal_checkpoints`](Self::with_wal_checkpoints) moves SQLite's
 /// checkpoints off the commit path to a background thread.
 ///
+/// **Signed checkpoints are synced.** A commit that writes a signed checkpoint (an automatic
+/// one in an append batch, or [`checkpoint_signed`](Self::checkpoint_signed)) runs with
+/// `synchronous=FULL` even at `durability = "normal"`, and only then is the checkpoint handed
+/// to the [`with_checkpoint_hook`](Self::with_checkpoint_hook) hook. The sync covers every
+/// earlier commit too, so whatever the hook ships off the host is on disk here. A batch finds
+/// out that it crosses a checkpoint after it has read the head inside its transaction, and
+/// SQLite cannot change `synchronous` inside a transaction, so such a batch rolls back
+/// (nothing was written yet) and runs again at `FULL`: one extra transaction per checkpoint.
+///
 /// Reads, checkpoints and [`with_connection`](Self::with_connection) take the same lock and
 /// see only committed batches.
 pub struct SqliteAudit {
@@ -575,6 +697,19 @@ struct Inner {
     conn: Arc<Mutex<Connection>>,
     checkpointing: Option<Checkpointing>,
     activity: Arc<Activity>,
+    /// The connection's `synchronous` level when it is below `FULL` on a file: commits that
+    /// write a signed checkpoint raise it to `FULL` for themselves (SR-50).
+    relaxed_sync: Option<i64>,
+    /// Tests: every commit and the `synchronous` level it ran at, in one log with the hook.
+    #[cfg(test)]
+    probe: Option<Arc<Mutex<Vec<String>>>>,
+}
+
+/// Why [`Inner::commit_tx`] wrote nothing. Either way the records come back.
+enum CommitFailure {
+    Error(AuditError, Vec<DecisionRecord>),
+    /// The batch writes a signed checkpoint and must run again with `synchronous=FULL`.
+    NeedsSync(Vec<DecisionRecord>),
 }
 
 /// Counters the WAL checkpointer reads to know whether the writer is busy.
@@ -716,28 +851,53 @@ impl Inner {
 
     /// One transaction: read the head, chain and insert every record, sign the checkpoints
     /// that fall in the batch, commit. On failure nothing is written and the records come back.
+    /// A batch that writes a signed checkpoint commits with `synchronous=FULL` (SR-50).
     fn commit(
         &self,
         conn: &mut Connection,
         records: Vec<DecisionRecord>,
     ) -> Result<Vec<AuditEntry>, (AuditError, Vec<DecisionRecord>)> {
+        let records = match self.commit_tx(conn, records, false) {
+            Ok(entries) => return Ok(entries),
+            Err(CommitFailure::Error(e, records)) => return Err((e, records)),
+            Err(CommitFailure::NeedsSync(records)) => records,
+        };
+        // `commit_tx` asks for a sync only when `relaxed_sync` is set.
+        let level = self.relaxed_sync.unwrap_or(SYNC_NORMAL);
+        if let Err(e) = conn.pragma_update(None, "synchronous", SYNC_FULL) {
+            return Err((e.into(), records));
+        }
+        let out = self.commit_tx(conn, records, true);
+        restore_sync(conn, level);
+        out.map_err(|f| match f {
+            CommitFailure::Error(e, records) => (e, records),
+            CommitFailure::NeedsSync(records) => (
+                AuditError::Storage("a synced commit asked for a sync".into()),
+                records,
+            ),
+        })
+    }
+
+    /// [`commit`](Self::commit)'s transaction. With `synced` false, a batch that would write a
+    /// signed checkpoint on a relaxed connection is rolled back before anything is inserted
+    /// and comes back as [`CommitFailure::NeedsSync`].
+    fn commit_tx(
+        &self,
+        conn: &mut Connection,
+        records: Vec<DecisionRecord>,
+        synced: bool,
+    ) -> Result<Vec<AuditEntry>, CommitFailure> {
         let tx = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
             Ok(tx) => tx,
-            Err(e) => return Err((e.into(), records)),
+            Err(e) => return Err(CommitFailure::Error(e.into(), records)),
         };
         let (mut seq, mut prev_hash) = match head_link(&tx) {
             Ok(h) => h,
-            Err(e) => return Err((e, records)),
+            Err(e) => return Err(CommitFailure::Error(e, records)),
         };
-        // Serialize each record once: the same text is hashed and stored as `record_json`.
-        let jsons = match records
-            .iter()
-            .map(serde_json::to_string)
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(j) => j,
-            Err(e) => return Err((e.into(), records)),
-        };
+        // Serialize each record once, canonically: the same text is hashed and stored as
+        // `record_json`.
+        let jsons: Vec<String> = records.iter().map(canonical_record_json).collect();
         let mut entries: Vec<AuditEntry> = Vec::with_capacity(records.len());
         for (record, json) in records.into_iter().zip(&jsons) {
             seq += 1;
@@ -749,6 +909,17 @@ impl Inner {
                 entry_hash,
             };
             entries.push(entry);
+        }
+        let every = self.checkpointing.as_ref().map_or(0, |c| c.every).max(1);
+        let signs = self.checkpointing.as_ref().is_some_and(|c| c.every > 0)
+            && entries.iter().any(|e| e.seq.is_multiple_of(every));
+        if signs && !synced && self.relaxed_sync.is_some() {
+            // `synchronous` cannot change inside a transaction: roll back (nothing is written
+            // yet) and let `commit` run the batch again at `FULL`.
+            drop(tx);
+            return Err(CommitFailure::NeedsSync(
+                entries.into_iter().map(|e| e.record).collect(),
+            ));
         }
         let mut created = Vec::new();
         let written = entries
@@ -770,9 +941,16 @@ impl Inner {
                 }
                 Ok::<(), AuditError>(())
             })
-            .and_then(|()| Ok(tx.commit()?));
+            .and_then(|()| {
+                #[cfg(test)]
+                self.probe_commit(&tx, format!("commit {}", seq));
+                Ok(tx.commit()?)
+            });
         if let Err(e) = written {
-            return Err((e, entries.into_iter().map(|e| e.record).collect()));
+            return Err(CommitFailure::Error(
+                e,
+                entries.into_iter().map(|e| e.record).collect(),
+            ));
         }
         let n = entries.len() as u64;
         let activity = &self.activity;
@@ -793,6 +971,19 @@ impl Inner {
             created.iter().for_each(|cp| hook(cp));
         }
         Ok(entries)
+    }
+
+    /// Tests: note `what` and the `synchronous` level `conn` runs at.
+    #[cfg(test)]
+    fn probe_commit(&self, conn: &Connection, what: String) {
+        if let Some(log) = &self.probe {
+            let level: i64 = conn
+                .query_row("PRAGMA synchronous", [], |r| r.get(0))
+                .unwrap_or(-1);
+            log.lock()
+                .unwrap()
+                .push(format!("{what} synchronous={level}"));
+        }
     }
 }
 
@@ -848,14 +1039,24 @@ impl SqliteAudit {
     }
 
     /// Wrap an existing connection, creating the schema if needed.
+    ///
+    /// Fails for a log written with another entry hash construction than
+    /// [`ENTRY_HASH_VERSION`](crate::ENTRY_HASH_VERSION), such as one written before RFC 8785
+    /// canonical JSON (SR-20): there is no migration, start a new file.
     pub fn from_connection(conn: Connection) -> Result<Self, AuditError> {
         conn.execute_batch(AUDIT_SCHEMA)?;
         conn.execute_batch(CHECKPOINT_SCHEMA)?;
+        conn.execute_batch(META_SCHEMA)?;
+        check_hash_version(&conn)?;
+        let relaxed_sync = relaxed_sync_of(&conn)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 conn: Arc::new(Mutex::new(conn)),
                 checkpointing: None,
                 activity: Arc::new(Activity::default()),
+                relaxed_sync,
+                #[cfg(test)]
+                probe: None,
             }),
             writer: OnceLock::new(),
             wal: None,
@@ -953,7 +1154,9 @@ impl SqliteAudit {
     }
 
     /// Call `hook` once for every checkpoint this log creates (not for repeat requests that
-    /// return an existing one). For metrics. No effect before
+    /// return an existing one), after the commit that wrote it, which ran with
+    /// `synchronous=FULL`: the checkpoint and every entry it covers are on disk (SR-50). For
+    /// metrics, or to ship checkpoints off the host. No effect before
     /// [`with_checkpointing`](Self::with_checkpointing).
     pub fn with_checkpoint_hook(
         mut self,
@@ -974,26 +1177,34 @@ impl SqliteAudit {
             .as_ref()
             .ok_or(AuditError::NoCheckpointSigner)?;
         let mut conn = self.inner.conn.lock()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let (seq, hash) = match head_in(&tx)? {
-            Some(h) => (h.seq, h.entry_hash),
-            None => (0, GENESIS_HASH.to_string()),
-        };
-        if let Some(existing) = checkpoint_at(&tx, seq)? {
-            if existing.head_hash == hash {
-                return Ok(existing);
+        // Synced like an append batch that writes a checkpoint (SR-50).
+        let (cp, created) = with_full_sync(&mut conn, self.inner.relaxed_sync, |conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let (seq, hash) = match head_in(&tx)? {
+                Some(h) => (h.seq, h.entry_hash),
+                None => (0, GENESIS_HASH.to_string()),
+            };
+            if let Some(existing) = checkpoint_at(&tx, seq)? {
+                if existing.head_hash == hash {
+                    return Ok((existing, false));
+                }
+                // Never sign over a conflict: the log and an earlier checkpoint disagree.
+                return Err(AuditError::Corrupt {
+                    seq,
+                    detail: "a stored checkpoint disagrees with the log at its seq".into(),
+                });
             }
-            // Never sign over a conflict: the log and an earlier checkpoint disagree.
-            return Err(AuditError::Corrupt {
-                seq,
-                detail: "a stored checkpoint disagrees with the log at its seq".into(),
-            });
-        }
-        let cp = Checkpoint::sign(&c.signer, seq, &hash, now)?;
-        insert_checkpoint(&tx, &cp)?;
-        tx.commit()?;
-        if let Some(hook) = &c.on_created {
-            hook(&cp);
+            let cp = Checkpoint::sign(&c.signer, seq, &hash, now)?;
+            insert_checkpoint(&tx, &cp)?;
+            #[cfg(test)]
+            self.inner.probe_commit(&tx, format!("checkpoint {seq}"));
+            tx.commit()?;
+            Ok::<_, AuditError>((cp, true))
+        })??;
+        if created {
+            if let Some(hook) = &c.on_created {
+                hook(&cp);
+            }
         }
         Ok(cp)
     }
@@ -1391,16 +1602,16 @@ impl LeaseStore for SqliteLeaseStore {
         now: OffsetDateTime,
     ) -> Result<u64, AuditError> {
         let mut conn = self.conn.lock()?;
-        // A revocation must survive a power failure even when the store runs at `normal`.
-        let relaxed = self.durability.filter(|d| *d != Durability::Full);
-        if relaxed.is_some() {
-            conn.pragma_update(None, "synchronous", Durability::Full.pragma())?;
-        }
-        let out = revoke_in(&mut conn, lease, reason, now);
-        if let Some(d) = relaxed {
-            conn.pragma_update(None, "synchronous", d.pragma())?;
-        }
-        out
+        // A revocation must survive a power failure even when the store runs at `normal`. The
+        // answer is the revocation's: a failure to lower `synchronous` again afterwards is
+        // logged, not returned, because the revocation has committed (SR-51).
+        let relaxed = self
+            .durability
+            .filter(|d| *d != Durability::Full)
+            .map(Durability::level);
+        with_full_sync(&mut conn, relaxed, |conn| {
+            revoke_in(conn, lease, reason, now)
+        })?
     }
 
     fn renew(
@@ -1472,5 +1683,248 @@ impl LeaseStore for SqliteLeaseStore {
                 .find(|(r, _)| *r == id.0)
                 .map(|(_, row)| row.clone()))
         })
+    }
+}
+
+#[cfg(test)]
+impl SqliteAudit {
+    /// Log every commit (with its `synchronous` level) into `log`, the log a test's
+    /// checkpoint hook writes to as well.
+    fn with_probe(mut self, log: Arc<Mutex<Vec<String>>>) -> Self {
+        self.inner_mut().probe = Some(log);
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use onbehalf_core::{
+        AgentId, Capability, CapabilitySet, Decision, DelegationChain, OriginatingUser, ToolCall,
+    };
+    use time::macros::datetime;
+
+    fn record(i: i64) -> DecisionRecord {
+        let at = datetime!(2026-10-23 12:00 UTC);
+        let chain = DelegationChain::root(
+            OriginatingUser {
+                subject: "user:mudit".into(),
+                issuer: "https://idp.example".into(),
+                authenticated_at: at,
+                attributes: Default::default(),
+            },
+            AgentId::new("agent:planner"),
+            CapabilitySet::from_iter([Capability::new("github", "*")]),
+            at,
+            time::Duration::hours(1),
+            LeaseId::new("l1"),
+        )
+        .unwrap();
+        let call = ToolCall::new("github", "read_file", serde_json::json!({ "i": i }));
+        DecisionRecord::new(
+            at + time::Duration::seconds(i),
+            Decision::Allow,
+            "policy_allow",
+            &chain,
+            &call,
+            vec![],
+        )
+    }
+
+    fn issuer() -> onbehalf_token::Issuer {
+        onbehalf_token::Issuer::generate(onbehalf_token::IssuerConfig {
+            issuer: "https://onbehalf.test".into(),
+            audience: "onbehalf".into(),
+            max_depth: 4,
+            default_ttl: time::Duration::minutes(5),
+        })
+    }
+
+    fn synchronous(log: &SqliteAudit) -> i64 {
+        log.with_connection(|c| Ok(c.query_row("PRAGMA synchronous", [], |r| r.get(0))?))
+            .unwrap()
+    }
+
+    /// SR-50: at `durability = "normal"`, the commit that writes a signed checkpoint runs at
+    /// `synchronous=FULL` (2), the hook sees the checkpoint only after that commit, and the
+    /// connection is back at `NORMAL` (1) afterwards. Appends here run one at a time on the
+    /// caller's thread, so the log's order is deterministic.
+    #[test]
+    fn checkpoint_commits_are_synced_before_the_hook_sr50() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&events);
+        let log = SqliteAudit::open_with(dir.path().join("audit.db"), Durability::Normal)
+            .unwrap()
+            .with_checkpointing(issuer().detached_signer(), 3)
+            .with_checkpoint_hook(move |cp| seen.lock().unwrap().push(format!("hook {}", cp.seq)))
+            .with_probe(Arc::clone(&events));
+        assert_eq!(synchronous(&log), SYNC_NORMAL);
+        for i in 0..4 {
+            log.append(record(i)).unwrap();
+        }
+        log.checkpoint_signed(datetime!(2026-10-23 13:00 UTC))
+            .unwrap();
+        // Asking again returns the stored checkpoint: no commit, no hook.
+        log.checkpoint_signed(datetime!(2026-10-23 13:00 UTC))
+            .unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "commit 1 synchronous=1",
+                "commit 2 synchronous=1",
+                "commit 3 synchronous=2",
+                "hook 3",
+                "commit 4 synchronous=1",
+                "checkpoint 4 synchronous=2",
+                "hook 4",
+            ]
+        );
+        assert_eq!(synchronous(&log), SYNC_NORMAL);
+        assert!(log.verify_chain().unwrap().ok);
+    }
+
+    /// SR-50, batched: a group commit that crosses a checkpoint is retried as a whole at
+    /// `FULL`, and every record of it still gets its entry.
+    #[test]
+    fn a_batch_crossing_a_checkpoint_is_committed_synced_sr50() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&events);
+        let log = SqliteAudit::open_with(dir.path().join("audit.db"), Durability::Normal)
+            .unwrap()
+            .with_checkpointing(issuer().detached_signer(), 4)
+            .with_checkpoint_hook(move |cp| seen.lock().unwrap().push(format!("hook {}", cp.seq)))
+            .with_probe(Arc::clone(&events));
+        let entries = {
+            let mut conn = log.inner.conn.lock().unwrap();
+            log.inner
+                .append_locked(&mut conn, (0..6).map(record).collect())
+                .into_iter()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6]
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["commit 6 synchronous=2", "hook 4"]
+        );
+        assert_eq!(synchronous(&log), SYNC_NORMAL);
+        assert_eq!(log.len().unwrap(), 6);
+    }
+
+    /// A store opened at `full` (or in memory) needs no extra step.
+    #[test]
+    fn full_and_in_memory_stores_commit_checkpoints_once_sr50() {
+        let dir = tempfile::tempdir().unwrap();
+        for log in [
+            SqliteAudit::open_with(dir.path().join("audit.db"), Durability::Full).unwrap(),
+            SqliteAudit::open_in_memory().unwrap(),
+        ] {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let log = log
+                .with_checkpointing(issuer().detached_signer(), 2)
+                .with_probe(Arc::clone(&events));
+            for i in 0..2 {
+                log.append(record(i)).unwrap();
+            }
+            assert_eq!(
+                events.lock().unwrap().len(),
+                2,
+                "{:?}",
+                events.lock().unwrap()
+            );
+        }
+    }
+
+    /// SR-51: the synced operation's result comes back even when lowering `synchronous`
+    /// afterwards fails (here because the operation left a transaction open, inside which
+    /// SQLite refuses to change it).
+    #[test]
+    fn a_failed_restore_does_not_replace_the_result_sr51() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open_connection(&dir.path().join("x.db"), Durability::Normal).unwrap();
+        let out = with_full_sync(&mut conn, Some(SYNC_NORMAL), |c| {
+            c.execute_batch("BEGIN")?;
+            Ok::<_, AuditError>(7)
+        });
+        assert_eq!(out.unwrap().unwrap(), 7);
+        // The restore did fail: the connection is still at FULL.
+        let level: i64 = conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(level, SYNC_FULL);
+        // And a failure of the operation itself is returned as such.
+        conn.execute_batch("ROLLBACK").unwrap();
+        let out = with_full_sync(&mut conn, Some(SYNC_NORMAL), |_| {
+            Err::<u64, _>(AuditError::UnknownLease("x".into()))
+        });
+        assert!(matches!(out, Ok(Err(AuditError::UnknownLease(_)))));
+    }
+
+    /// SR-51: `revoke` at `normal` answers with the revocation's result, commits at `FULL` and
+    /// goes back to `NORMAL`.
+    #[test]
+    fn revoke_returns_the_revocation_result_sr51() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            SqliteLeaseStore::open_with(dir.path().join("leases.db"), Durability::Normal).unwrap();
+        let now = datetime!(2026-10-23 12:00 UTC);
+        let (a, b) = (LeaseId::new("a"), LeaseId::new("b"));
+        store
+            .register(&a, None, now + time::Duration::hours(1))
+            .unwrap();
+        store
+            .register(&b, Some(&a), now + time::Duration::hours(1))
+            .unwrap();
+        assert_eq!(store.revoke(&a, "test", now).unwrap(), 2);
+        assert!(matches!(
+            store.revoke(&LeaseId::new("nope"), "test", now),
+            Err(AuditError::UnknownLease(_))
+        ));
+        let level: i64 = store
+            .with_connection(|c| Ok(c.query_row("PRAGMA synchronous", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(level, SYNC_NORMAL);
+    }
+
+    /// SR-20: a log written with the v1 entry hash (no `audit_meta` row, entries present) is
+    /// refused with a clear error; a new log records the construction.
+    #[test]
+    fn a_log_with_v1_hashes_is_refused_sr20() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let log = SqliteAudit::open(&path).unwrap();
+            log.append(record(0)).unwrap();
+            log.with_connection(|c| Ok(c.execute("DROP TABLE audit_meta", [])?))
+                .unwrap();
+        }
+        let err = SqliteAudit::open(&path).unwrap_err().to_string();
+        assert!(err.contains("earlier onbehalf"), "{err}");
+        assert!(err.contains(ENTRY_HASH_VERSION), "{err}");
+        let other = dir.path().join("other.db");
+        {
+            let log = SqliteAudit::open(&other).unwrap();
+            log.with_connection(|c| {
+                Ok(c.execute(
+                    "UPDATE audit_meta SET value = 'onbehalf-audit-entry-v9'",
+                    [],
+                )?)
+            })
+            .unwrap();
+        }
+        let err = SqliteAudit::open(&other).unwrap_err().to_string();
+        assert!(err.contains("onbehalf-audit-entry-v9"), "{err}");
+        // Reopening a current log works, empty or not.
+        let fresh = dir.path().join("fresh.db");
+        SqliteAudit::open(&fresh).unwrap();
+        let log = SqliteAudit::open(&fresh).unwrap();
+        log.append(record(1)).unwrap();
+        drop(log);
+        assert_eq!(SqliteAudit::open(&fresh).unwrap().len().unwrap(), 1);
     }
 }

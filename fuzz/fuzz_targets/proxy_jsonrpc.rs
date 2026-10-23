@@ -339,6 +339,7 @@ fn world() -> &'static World {
                     max_request_body_bytes: MAX_BODY,
                     session_ttl: std::time::Duration::from_secs(60),
                     max_sessions: 64,
+                    max_sessions_per_principal: 64,
                 };
                 onbehalf_proxy::router(config, auth.clone())
             })

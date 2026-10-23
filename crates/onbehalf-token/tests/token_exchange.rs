@@ -949,13 +949,16 @@ fn ou_sig_v1_and_unknown_versions_or_kids_are_refused() {
     assert!(matches!(err, TokenError::UnsupportedOuSig(1)), "{err:?}");
     assert!(err.to_string().contains("re-issue"), "{err}");
 
-    let mut payload = decode_payload(&r.token);
-    payload["ou_sig_v"] = json!(3);
-    let v3 = resign_with_issuer_key(&issuer, &payload);
-    assert!(matches!(
-        issuer.verifier().verify(&v3, t0()),
-        Err(TokenError::UnsupportedOuSig(3))
-    ));
+    // Version 2 (SR-20: non-canonical JSON) and unknown versions.
+    for v in [2u32, 4] {
+        let mut payload = decode_payload(&r.token);
+        payload["ou_sig_v"] = json!(v);
+        let other = resign_with_issuer_key(&issuer, &payload);
+        assert!(matches!(
+            issuer.verifier().verify(&other, t0()),
+            Err(TokenError::UnsupportedOuSig(n)) if n == v
+        ));
+    }
 
     // `ou_kid` must name a trusted key, and that key must have made the signature.
     let other = Issuer::generate(config());
@@ -1116,4 +1119,62 @@ fn root_with_an_unrepresentable_time_is_refused_not_a_panic() {
     // Year 0 is still fine.
     let token = mint(-62_167_219_200).unwrap();
     issuer.verifier().verify(&token.token, t0()).unwrap();
+}
+
+/// SR-20: `ou_sig` v3 signs RFC 8785 canonical JSON, so a token whose user block and root hop
+/// were re-encoded with nested members in another order and numbers spelled differently (what
+/// another JSON library, or a build without `preserve_order`, produces) still verifies. The
+/// v2 encoding (`serde_json` output in insertion order) did not survive this.
+#[test]
+fn ou_sig_survives_reencoding_of_nested_objects_sr20() {
+    let issuer = issuer();
+    let mut u = user();
+    u.attributes.insert(
+        "org".into(),
+        serde_json::from_str(r#"{"b": 1, "a": [2, {"y": true, "x": null}]}"#).unwrap(),
+    );
+    let r = issuer
+        .issue_root(
+            u,
+            AgentId::new("agent:planner"),
+            caps([Capability::new("github", "create_issue").with_constraint(
+                "repo",
+                ArgConstraint::Equals(
+                    serde_json::from_str(r#"{"owner": "acme", "id": 7}"#).unwrap(),
+                ),
+            )]),
+            Some(Duration::hours(1)),
+            t0(),
+        )
+        .unwrap();
+    let digest = issuer
+        .verifier()
+        .verify(&r.token, t0())
+        .unwrap()
+        .chain
+        .digest();
+
+    let mut payload = decode_payload(&r.token);
+    payload["chain"]["originating_user"]["attributes"]["org"] =
+        serde_json::from_str(r#"{"a": [2.0, {"x": null, "y": true}], "b": 1}"#).unwrap();
+    let cap = &mut payload["chain"]["hops"][0]["capabilities"][0]["constraints"]["repo"];
+    cap["value"] = serde_json::from_str(r#"{"id": 7.0, "owner": "acme"}"#).unwrap();
+    let reencoded = resign_with_issuer_key(&issuer, &payload);
+    let text = String::from_utf8(URL_SAFE_NO_PAD.decode(segments(&reencoded).1).unwrap()).unwrap();
+    assert!(
+        text.contains(r#""a":[2.0,{"x":null,"y":true}],"b":1"#),
+        "{text}"
+    );
+    let verified = issuer.verifier().verify(&reencoded, t0()).unwrap();
+    // The chain digest (what audit records and lease bindings name) is unchanged too.
+    assert_eq!(verified.chain.digest(), digest);
+
+    // A real change to a nested value is still caught.
+    let mut payload = decode_payload(&r.token);
+    payload["chain"]["originating_user"]["attributes"]["org"]["b"] = json!(2);
+    let tampered = resign_with_issuer_key(&issuer, &payload);
+    assert!(matches!(
+        issuer.verifier().verify(&tampered, t0()),
+        Err(TokenError::InvalidSignature)
+    ));
 }

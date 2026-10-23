@@ -345,17 +345,75 @@ fn queries_by_subject_chain_and_lease() {
 /// That must be byte-for-byte the canonical hash, or `verify_chain` would reject the log.
 #[test]
 fn entry_hash_from_stored_json_equals_the_canonical_hash() {
-    use onbehalf_audit::entry_hash_from_json;
+    use onbehalf_audit::{canonical_record_json, entry_hash_from_json, ENTRY_HASH_VERSION};
+    use onbehalf_core::digest::sha256_bytes;
+    use onbehalf_core::jcs;
     for i in 0..20 {
         let r = record(i);
-        let json = serde_json::to_string(&r).unwrap();
-        for (seq, prev) in [(1, GENESIS_HASH), (u64::MAX, "ab\"c\\d"), (42, "")] {
-            assert_eq!(
-                entry_hash_from_json(seq, prev, &json),
-                compute_entry_hash(seq, prev, &r)
-            );
+        let json = canonical_record_json(&r);
+        for (seq, prev) in [(1, GENESIS_HASH), (u64::MAX, "ab\"c\\d\n"), (42, "")] {
+            let expected = compute_entry_hash(seq, prev, &r);
+            assert_eq!(entry_hash_from_json(seq, prev, &json), expected);
+            // SR-20: the hash is SHA-256 over the RFC 8785 form of the tagged array.
+            let canonical = jcs::to_vec(&(ENTRY_HASH_VERSION, seq, prev, &r)).unwrap();
+            assert_eq!(sha256_bytes(&canonical), expected);
         }
     }
+}
+
+/// SR-20: the stored record text is RFC 8785 canonical (sorted members), so its hash does not
+/// depend on the declaration order of `DecisionRecord`'s fields or on `preserve_order`.
+#[test]
+fn stored_record_json_is_canonical_sr20() {
+    let s = SqliteAudit::open_in_memory().unwrap();
+    s.append(record(3)).unwrap();
+    let stored: String = s
+        .with_connection(|c| {
+            Ok(
+                c.query_row("SELECT record_json FROM audit WHERE seq = 1", [], |r| {
+                    r.get(0)
+                })?,
+            )
+        })
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&stored).unwrap();
+    let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(keys, sorted, "{stored}");
+    assert_eq!(onbehalf_core::jcs::to_string(&v).unwrap(), stored);
+}
+
+/// Fuzzing F4: an entry whose `seq` is `u64::MAX`, with a correct hash, used to overflow
+/// `seq + 1` in the chain walk (a panic with overflow checks on). It is now a bad entry.
+#[test]
+fn an_entry_at_u64_max_fails_verification_cleanly_f4() {
+    use onbehalf_audit::{verify_with_checkpoints, AuditEntry, CheckpointKeys, Start};
+    let first = AuditEntry::next(None, record(0));
+    let mut last = AuditEntry::next(Some(&first), record(1));
+    last.seq = u64::MAX;
+    last.entry_hash = compute_entry_hash(last.seq, &last.prev_hash, &last.record);
+    assert!(last.hash_matches());
+    // As the only entry of a window (the first entry sets the expected seq).
+    let r = verify_with_checkpoints(
+        [Ok(last.clone())],
+        &[],
+        &CheckpointKeys::default(),
+        Start::Window,
+    )
+    .unwrap();
+    assert!(!r.ok);
+    assert_eq!(r.first_bad_seq, Some(u64::MAX));
+    // After a good entry, anchored.
+    let r = onbehalf_audit::verify_entries([Ok(first), Ok(last)]).unwrap();
+    assert_eq!(
+        r,
+        VerifyReport {
+            entries: 2,
+            ok: false,
+            first_bad_seq: Some(u64::MAX)
+        }
+    );
 }
 
 #[test]

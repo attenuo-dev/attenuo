@@ -396,7 +396,9 @@ pub enum AuditCmd {
     },
     /// Walk the whole hash chain and verify the signed checkpoints. Exits 2 if the chain is
     /// broken or a checkpoint is invalid. With `--file`, verify an exported file offline
-    /// instead (it needs only the issuer's JWKS, no admin token).
+    /// instead (it needs only the issuer's JWKS, no admin token); that check is strict: it
+    /// also fails if the file holds entries outside the range its header declares, or entries
+    /// after its last valid checkpoint (unless `--allow-unsigned-tail`).
     Verify {
         /// An export made with `audit export` (JSON Lines, or the `--format json` object).
         #[arg(long)]
@@ -405,6 +407,11 @@ pub enum AuditCmd {
         /// fetched from `<server>/.well-known/jwks.json`.
         #[arg(long, requires = "file")]
         jwks: Option<std::path::PathBuf>,
+        /// With `--file`: accept entries after the export's last valid checkpoint, which only
+        /// the hash chain covers (an export taken while the log was ahead of its newest
+        /// checkpoint). They are still reported as `unsigned_tail`.
+        #[arg(long, requires = "file")]
+        allow_unsigned_tail: bool,
     },
     /// Export entries `--from` to `--to` (inclusive) and the checkpoints inside that range.
     /// Defaults to the whole log. Writes to stdout unless `--out` is given.

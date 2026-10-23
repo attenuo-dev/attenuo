@@ -27,13 +27,13 @@ pub use checkpoint::{
 };
 pub use error::AuditError;
 pub use export::{
-    checkpoint_line, entry_line, header_line, parse_export, to_json_form, verify_export, Export,
-    ExportHeader, ExportReport, EXPORT_FORMAT,
+    checkpoint_line, entry_line, header_line, parse_export, to_json_form, verify_export,
+    verify_export_with, Export, ExportHeader, ExportReport, VerifyOptions, EXPORT_FORMAT,
 };
 pub use lease::{LeaseStatus, LeaseStore, MemoryLeaseStore};
 pub use log::{
-    compute_entry_hash, entry_hash_from_json, verify_entries, AuditEntry, AuditSink, VerifyReport,
-    GENESIS_HASH,
+    canonical_record_json, compute_entry_hash, entry_hash_from_json, verify_entries, AuditEntry,
+    AuditSink, VerifyReport, ENTRY_HASH_VERSION, GENESIS_HASH,
 };
 pub use memory::MemoryAudit;
 pub use sqlite::{

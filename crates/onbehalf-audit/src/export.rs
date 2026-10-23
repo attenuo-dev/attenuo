@@ -1,19 +1,26 @@
 //! Audit export: a self-contained slice of the log that can be verified offline.
 //!
-//! The export is JSON Lines, one object per line, each tagged by `type`:
+//! The export is JSON Lines, one object per line, each tagged by `type` and written as RFC 8785
+//! canonical JSON (members sorted, so `type` is not first):
 //!
 //! ```text
-//! {"type":"header","format":"onbehalf-audit-export-v1","from":1,"to":120,"exported_at":"..."}
-//! {"type":"entry","seq":1,"prev_hash":"..","record":{..},"entry_hash":".."}
+//! {"exported_at":"...","format":"onbehalf-audit-export-v2","from":1,"to":120,"type":"header"}
+//! {"entry_hash":"..","prev_hash":"..","record":{..},"seq":1,"type":"entry"}
 //! ...
-//! {"type":"checkpoint","seq":100,"head_hash":"..","at":"..","kid":"..","signature":".."}
+//! {"at":"..","head_hash":"..","kid":"..","seq":100,"signature":"..","type":"checkpoint"}
 //! ```
 //!
-//! Entries come first, in order, then the checkpoints whose seq falls inside the range. The
-//! same content is also accepted as one JSON object, `{"header":..,"entries":[..],
+//! The header comes first and is required: it declares the range `from..=to` the file holds.
+//! Entries follow, in order, then the checkpoints whose seq falls inside the range. The same
+//! content is also accepted as one JSON object, `{"header":..,"entries":[..],
 //! "checkpoints":[..]}` (the CLI's `--format json`). [`verify_export`] needs nothing but the
 //! JWKS: it re-hashes every entry, checks the links, verifies each checkpoint signature and
-//! that its `head_hash` equals the entry hash at its seq.
+//! that its `head_hash` equals the entry hash at its seq, and checks that the entries are
+//! exactly the declared range and are all countersigned (see [`VerifyOptions`]).
+//!
+//! Format `onbehalf-audit-export-v2` goes with entry hash construction
+//! [`ENTRY_HASH_VERSION`](crate::ENTRY_HASH_VERSION) (RFC 8785, SR-20). A `v1` export, hashed
+//! the earlier way, is refused when parsed.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -25,7 +32,7 @@ use crate::error::AuditError;
 use crate::log::AuditEntry;
 
 /// Value of the header's `format` field.
-pub const EXPORT_FORMAT: &str = "onbehalf-audit-export-v1";
+pub const EXPORT_FORMAT: &str = "onbehalf-audit-export-v2";
 
 /// First line of an export.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +57,8 @@ impl ExportHeader {
 /// A parsed export.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Export {
+    /// Always present in a parsed export; [`verify_export`] refuses an `Export` built without
+    /// one, since nothing would say which range the file claims to hold.
     pub header: Option<ExportHeader>,
     pub entries: Vec<AuditEntry>,
     pub checkpoints: Vec<Checkpoint>,
@@ -73,7 +82,7 @@ pub fn checkpoint_line(c: &Checkpoint) -> String {
 fn tagged(kind: &str, v: serde_json::Result<Value>) -> String {
     let mut v = v.expect("export types serialize");
     v["type"] = Value::String(kind.to_string());
-    let mut s = v.to_string();
+    let mut s = onbehalf_core::jcs::to_string(&v).expect("export lines have a canonical form");
     s.push('\n');
     s
 }
@@ -151,12 +160,22 @@ fn parse_json_form(v: Value) -> Result<Export, AuditError> {
 
 fn check_header(export: &Export) -> Result<(), AuditError> {
     match &export.header {
+        Some(h) if h.format == "onbehalf-audit-export-v1" => Err(bad(format!(
+            "export format `onbehalf-audit-export-v1` was written by an earlier onbehalf whose \
+             entry hashes were not RFC 8785 canonical; this version verifies only \
+             `{EXPORT_FORMAT}` (export the log again with this version)"
+        ))),
         Some(h) if h.format != EXPORT_FORMAT => Err(bad(format!(
             "unsupported export format `{}` (expected `{EXPORT_FORMAT}`)",
             h.format
         ))),
-        _ => Ok(()),
+        Some(_) => Ok(()),
+        None => Err(missing_header()),
     }
+}
+
+fn missing_header() -> AuditError {
+    bad("the export has no header line; the header declares the range of entries the file holds")
 }
 
 /// The JSON form of an export (`--format json`).
@@ -181,14 +200,49 @@ pub struct ExportReport {
     pub from_genesis: bool,
     /// Entries of the header's range are missing from the start or end of the file.
     pub truncated: bool,
+    /// Entries whose seq lies outside the header's `from..=to`. Any makes the export fail:
+    /// the file holds more than it declares (fuzzing F5).
+    pub outside_range: u64,
+    /// The export failed because entries after its last valid checkpoint
+    /// ([`SignedVerifyReport::unsigned_tail`]) are not countersigned and
+    /// [`VerifyOptions::allow_unsigned_tail`] was not set.
+    pub unsigned_tail_rejected: bool,
+}
+
+/// How strict [`verify_export_with`] is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VerifyOptions {
+    /// Accept entries after the last valid checkpoint, which only the hash chain covers (an
+    /// export taken while the log was ahead of its newest checkpoint). Off by default: such
+    /// entries could have been appended by anyone who can write the file, and an export that
+    /// verifies should vouch for every entry in it. The CLI's `--allow-unsigned-tail`.
+    pub allow_unsigned_tail: bool,
+}
+
+/// Verify an export against the JWKS keys, offline, strictly: [`verify_export_with`] with the
+/// default [`VerifyOptions`], so every entry must be countersigned.
+pub fn verify_export(export: &Export, keys: &CheckpointKeys) -> Result<ExportReport, AuditError> {
+    verify_export_with(export, keys, VerifyOptions::default())
 }
 
 /// Verify an export against the JWKS keys, offline.
 ///
-/// Beyond [`verify_with_checkpoints`]: a file whose last entry stops short of the header's
-/// `to` is flagged `truncated` and not ok, and a checkpoint outside the file's entry range is
-/// ignored by the chain check but still has its signature verified.
-pub fn verify_export(export: &Export, keys: &CheckpointKeys) -> Result<ExportReport, AuditError> {
+/// Beyond [`verify_with_checkpoints`], the export is not ok when:
+///
+/// - it has no header (an error, not a report);
+/// - its entries do not start at the header's `from` or stop short of its `to` (`truncated`);
+/// - it holds an entry outside `from..=to` (`outside_range`);
+/// - entries follow its last valid checkpoint (`unsigned_tail`) and
+///   `options.allow_unsigned_tail` is not set (`unsigned_tail_rejected`).
+///
+/// A checkpoint outside the file's entry range is ignored by the chain check but still has
+/// its signature verified.
+pub fn verify_export_with(
+    export: &Export,
+    keys: &CheckpointKeys,
+    options: VerifyOptions,
+) -> Result<ExportReport, AuditError> {
+    let header = export.header.as_ref().ok_or_else(missing_header)?;
     let first_seq = export.entries.first().map(|e| e.seq);
     let last_seq = export.entries.last().map(|e| e.seq);
     let from_genesis = first_seq == Some(1) && export.entries[0].prev_hash == crate::GENESIS_HASH;
@@ -225,13 +279,18 @@ pub fn verify_export(export: &Export, keys: &CheckpointKeys) -> Result<ExportRep
     }
     report.checkpoints = export.checkpoints.len() as u64;
     // The header says which range was asked for; a file that starts later or ends earlier has
-    // had entries cut off.
-    let truncated = match (&export.header, first_seq, last_seq) {
-        (Some(h), Some(f), Some(l)) => f != h.from || l < h.to,
-        (Some(h), _, _) => h.to >= h.from && h.to > 0,
-        _ => false,
+    // had entries cut off, and one with entries outside it holds more than it declares.
+    let truncated = match (first_seq, last_seq) {
+        (Some(f), Some(l)) => f != header.from || l < header.to,
+        _ => header.to >= header.from && header.to > 0,
     };
-    if truncated {
+    let outside_range = export
+        .entries
+        .iter()
+        .filter(|e| e.seq < header.from || e.seq > header.to)
+        .count() as u64;
+    let unsigned_tail_rejected = report.unsigned_tail > 0 && !options.allow_unsigned_tail;
+    if truncated || outside_range > 0 || unsigned_tail_rejected {
         report.ok = false;
     }
     Ok(ExportReport {
@@ -240,5 +299,7 @@ pub fn verify_export(export: &Export, keys: &CheckpointKeys) -> Result<ExportRep
         last_seq,
         from_genesis,
         truncated,
+        outside_range,
+        unsigned_tail_rejected,
     })
 }

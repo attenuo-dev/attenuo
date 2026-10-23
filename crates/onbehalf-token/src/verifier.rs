@@ -131,7 +131,7 @@ impl Verifier {
     /// Verify `token` as of `now`.
     ///
     /// Checks, in order: EdDSA signature; header and claim `typ`; `iss`; `aud`; `exp` against
-    /// `now`; `sub`/`act` consistency with the chain; `ou_sig_v` (only 2 is accepted) and
+    /// `now`; `sub`/`act` consistency with the chain; `ou_sig_v` (only 3 is accepted) and
     /// `ou_sig` over `iss`, the originating-user block and the root hop, under the `ou_kid` key;
     /// and finally `chain.validate_at(now, max_depth)`. Time is taken from `now`, never from the
     /// system clock, so callers control leeway and tests are deterministic.

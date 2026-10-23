@@ -14,11 +14,14 @@ pub const TOKEN_TYPE: &str = "onbehalf+jwt";
 pub const JWT_TOKEN_TYPE_URN: &str = "urn:ietf:params:oauth:token-type:jwt";
 
 /// The only `ou_sig` construction verifiers accept (the `ou_sig_v` claim). Version 1, a bare
-/// signature over the user block, is refused (SR-14).
-pub const OU_SIG_VERSION: u32 = 2;
+/// signature over the user block, is refused (SR-14). Version 2 had the framing of version 3
+/// but encoded the user block and root hop with `serde_json`, whose nested objects keep their
+/// insertion order (`preserve_order`) and whose numbers keep their spelling, so a verifier
+/// built differently computed other bytes; it is refused too (SR-20).
+pub const OU_SIG_VERSION: u32 = 3;
 
-/// Domain-separation context of an `ou_sig` v2 signature (see [`ou_sig_payload`]).
-pub const OU_SIG_CONTEXT: &str = "onbehalf-ou-v2";
+/// Domain-separation context of an `ou_sig` v3 signature (see [`ou_sig_payload`]).
+pub const OU_SIG_CONTEXT: &str = "onbehalf-ou-v3";
 
 /// The `act` (actor) claim, nested as in RFC 8693 §4.1.
 ///
@@ -187,12 +190,11 @@ impl<'de> Deserialize<'de> for MayAct {
     }
 }
 
-/// Canonical byte encoding of the originating-user block that `ou_sig` signs.
-///
-/// Canonical means `serde_json` compact output with map keys in `BTreeMap` order; the core types
-/// are `BTreeMap`-backed, so re-serializing a decoded block yields the same bytes.
+/// Canonical byte encoding of the originating-user block that `ou_sig` signs: its RFC 8785
+/// canonical JSON ([`onbehalf_core::jcs`]), so the bytes depend only on the values (nested
+/// attribute objects in any member order, `2` or `2.0`), never on how they were decoded.
 pub fn canonical_user_bytes(user: &OriginatingUser) -> Vec<u8> {
-    serde_json::to_vec(user).expect("OriginatingUser serializes")
+    onbehalf_core::jcs::to_vec(user).expect("OriginatingUser has a canonical JSON form")
 }
 
 /// The hop-0 fields `ou_sig` covers. `expires_at` is left out on purpose: it is already
@@ -213,24 +215,26 @@ fn push_field(out: &mut Vec<u8>, field: &[u8]) {
     out.extend_from_slice(field);
 }
 
-/// The payload `ou_sig` v2 signs, before domain separation.
+/// The payload `ou_sig` v3 signs, before domain separation.
 ///
 /// It is three length-prefixed fields (`u32` big-endian length, then the bytes): `iss`, the
-/// canonical JSON of the originating user ([`canonical_user_bytes`]) and the canonical JSON of
-/// hop 0 restricted to `agent`, `capabilities`, `issued_at` and `lease`. The issuer signs
+/// RFC 8785 canonical JSON of the originating user ([`canonical_user_bytes`]) and the RFC 8785
+/// canonical JSON of hop 0 restricted to `agent`, `capabilities`, `issued_at` and `lease`.
+/// The length prefixes keep the three fields apart; canonical JSON makes each field's bytes a
+/// function of its value alone (SR-20). The issuer signs
 /// `len(OU_SIG_CONTEXT) || OU_SIG_CONTEXT || payload` (the framing of
 /// [`crate::detached`]) with Ed25519, so the signature is bound to the issuer and to this
 /// chain's root hop, and cannot be confused with a token signature or another detached
 /// signature.
 pub fn ou_sig_payload(iss: &str, user: &OriginatingUser, root: &Hop) -> Vec<u8> {
     let user = canonical_user_bytes(user);
-    let hop = serde_json::to_vec(&RootHopView {
+    let hop = onbehalf_core::jcs::to_vec(&RootHopView {
         agent: &root.agent,
         capabilities: &root.capabilities,
         issued_at: root.issued_at,
         lease: &root.lease,
     })
-    .expect("hop serializes");
+    .expect("hop has a canonical JSON form");
     let mut out = Vec::with_capacity(12 + iss.len() + user.len() + hop.len());
     push_field(&mut out, iss.as_bytes());
     push_field(&mut out, &user);
@@ -238,7 +242,7 @@ pub fn ou_sig_payload(iss: &str, user: &OriginatingUser, root: &Hop) -> Vec<u8> 
     out
 }
 
-/// The exact bytes an `ou_sig` v2 signature is made over: [`ou_sig_payload`] framed under
+/// The exact bytes an `ou_sig` v3 signature is made over: [`ou_sig_payload`] framed under
 /// [`OU_SIG_CONTEXT`].
 ///
 /// # Panics
@@ -296,7 +300,7 @@ mod tests {
         let base = ou_sig_payload("iss", &user, &hop);
         assert_eq!(&base[..7], b"\0\0\0\x03iss");
         let msg = ou_sig_message("iss", &user, &hop);
-        assert!(msg.starts_with(b"\0\0\0\x0eonbehalf-ou-v2"));
+        assert!(msg.starts_with(b"\0\0\0\x0eonbehalf-ou-v3"));
         assert!(msg.ends_with(&base));
         // Every covered field changes the payload; `expires_at` does not.
         let mut later = hop.clone();
