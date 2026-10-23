@@ -1,10 +1,10 @@
 # Performance: micro-benchmarks and end to end
 
-- Status: first measurement (v0)
-- Crates: `onbehalf-policy` (`benches/authorize.rs`), `onbehalf-core` (`benches/attenuation.rs`), `onbehalf-bench` (end to end)
+- Status: second measurement, after the audit write-path work (`perf/audit-write-path`)
+- Crates: `onbehalf-policy` (`benches/authorize.rs`), `onbehalf-core` (`benches/attenuation.rs`), `onbehalf-server` (`benches/decide.rs`, the decision path by stage), `onbehalf-bench` (end to end)
 - Related: [server pipeline](server.md), [ADR-0006](../decisions/0006-lease-based-in-flight-revocation.md)
 
-The first part of this page is criterion 0.5 micro-benchmarks of the two pure functions on the hot path. They do not include token verification, the lease lookup, the audit append or the network hop to the upstream, so they are a lower bound on the latency onbehalf adds to a call. The end-to-end figures, measured through the real proxy, are in [End to end: proxy versus direct](#end-to-end-proxy-versus-direct) at the end of the page.
+The first part of this page is criterion 0.5 micro-benchmarks of the two pure functions on the hot path. They do not include token verification, the lease lookup, the audit append or the network hop to the upstream, so they are a lower bound on the latency onbehalf adds to a call. The end-to-end figures, measured through the real proxy, are in [End to end: proxy versus direct](#end-to-end-proxy-versus-direct) at the end of the page, followed by [the audit write path and the per-call cost](#after-the-audit-write-path-work), which says what changed and by how much.
 
 ## How to run
 
@@ -77,14 +77,17 @@ Harness: `crates/onbehalf-bench` (binary `onbehalf-bench`), driven by `scripts/b
 - **Baseline.** The `allow` call posted straight to `fake_mcp`, at the same concurrency, in the same server group. "Added" is proxy minus direct for the same percentile (p50, p99) or the mean. For denied calls the upstream hop is skipped, so "added" there is the cost of getting the answer, not a hop on top of the upstream call.
 - **Load.** N closed-loop clients (1, 8, 32), one request in flight each. 2 s warm-up discarded, then 5 s measured per cell. Latency per request goes into an HdrHistogram (3 significant digits) and is reported as p50, p90, p99, max and mean; throughput is completed measured requests over the 5 s.
 - **Checks.** Every answer is classified (result versus JSON-RPC error) and a mismatch fails the run. At the end of each group the harness calls `GET /admin/audit/verify` and fails unless the chain verifies and holds at least one entry per proxied call.
-- **Audit modes.** `memory` is `sqlite_path = ":memory:"`; `file` is a SQLite file in the temp directory (a container filesystem here).
+- **Audit modes.** `memory` is `sqlite_path = ":memory:"`; `file` is a SQLite file in the temp directory (a container filesystem here), and `file_full` the same with `[audit] durability = "full"` (added with the write-path work; the first run predates WAL, so its `file` mode ran SQLite defaults).
 - **Limits.** Closed-loop load suffers coordinated omission: a slow response delays the next request, so tail percentiles under overload are understated compared with open-loop load at a fixed arrival rate, which the [evaluation plan](../research/evaluation-plan.md) calls for. One run per cell, no confidence intervals.
 
 ### Environment (shared dev container, not a reference machine)
 
 4 vCPU Intel Xeon @ 2.10 GHz, Linux 6.18, rustc 1.97.0, release profile (`lto = "thin"`). Other agents were compiling on the same host during the run (load average 3 to 4 before it started) and the load generator, proxy and upstream share the 4 cores, so the numbers carry a lot of noise and the high-concurrency rows are CPU-saturated: read them as "how it degrades", not as capacity. The full hardware block is in the committed `.md`. Run of 2026-10-23, commit 8ea3d07, file `bench/2026-10-23-vm.json`.
 
-### Headline numbers
+### Headline numbers (first run, before the write-path work)
+
+These are the figures of the first run, at commit 8ea3d07. The audit and decision-path changes that followed are measured in [After the audit write-path work](#after-the-audit-write-path-work).
+
 
 Allow call, audit in memory, p50 / p99 in microseconds and requests per second:
 
@@ -103,10 +106,56 @@ Allow call, audit in memory, p50 / p99 in microseconds and requests per second:
 
 The complete matrix (every hop count, outcome, concurrency and audit mode, with p90, max and mean) is in `bench/2026-10-23-vm.md`.
 
+### After the audit write-path work
+
+Three changes, each its own commit on `perf/audit-write-path`:
+
+1. **SQLite durability settings.** File-backed stores open in WAL mode with `synchronous=NORMAL` by default (`[audit] durability = "full"` syncs every commit), a busy timeout and a prepared-statement cache. At `normal` a power failure can lose the newest decisions but never tear one, and the chain still verifies with an earlier head; lease revocations always sync. See [config](../reference/config.md#audit).
+2. **Group commit.** Appends go to one writer thread over a channel. It commits the first waiting record plus everything already queued (up to 256) in one transaction and answers each caller with its entry; checkpoints falling in a batch are signed inside it. A failed batch is retried record by record, so only a record the database refuses fails (and its call is denied with `audit_error`).
+3. **Per-call waste.** Found with the stage bench below plus temporary timers inside the audit commit: the server verified the same bearer token on every call (now cached by token hash, with expiry rechecked on every hit), the append decoded and cross-checked the whole head row to learn its hash (now reads `seq, entry_hash`), each record was serialized twice (now once, hashed and stored), the pipeline cloned the record, and the lease check ran one query per hop (now one `IN (...)` query).
+
+**Decision path by stage** (`cargo bench -p onbehalf-server --bench decide`, in process, point estimates in microseconds, 1 hop / 3 hops; same container, about 5 to 10 percent run-to-run noise):
+
+| Stage | before | after |
+|---|---|---|
+| Token verification as the proxy calls it (`authenticate`) | 97 / 98 | 1.3 / 2.3 (cache hit; a miss is still about 100) |
+| Lease check, in-memory store | 0.8 / 2.4 | 1.0 / 4.0 |
+| Lease check, file store | 4.1 / 11.1 | 2.1 / 5.3 |
+| Policy (`PolicyEngine::authorize`, not changed) | 115 / 153 | 117 / 151 |
+| `DecisionRecord::new` | 1.8 / 3.1 | 1.9 / 3.0 |
+| Audit append, in memory | 77 / 111 | 91 / 149 |
+| Audit append, file, `normal` | 1,055 / 1,054 (SQLite defaults) | 150 / 157 |
+| Audit append, file, `full` | (no such setting) | 280 to 1,800 (one `fsync`; varies run to run) |
+
+Readings:
+
+- **Verification was the biggest per-call cost after Cedar**, about 100 us, paid again on every call with the same token. It is now about 1 to 2 us on a hit.
+- **The per-hop growth is Cedar's.** Policy grows about 18 us per hop, which matches the micro-benchmark. The audit append also grew with depth because it decoded the previous (larger) record; reading only the head's hash removed that, but the single-threaded append is not faster overall: it now pays a thread handoff to the writer (about 25 us round trip, measured on its own) and the SQLite insert and in-memory commit are about 16 and 13 us. Under concurrency the handoff is shared by a batch.
+- **The batched lease query** is faster for a file store and slower for the in-memory one (SQLite builds a small ephemeral table for an `IN` list), and both are a few microseconds against a decision of about 300.
+
+**End to end, before and after** (`onbehalf-bench`, allow call, req/s at 1 / 8 / 32 clients, closed loop; "before" is merged main before this work, 3 s cells; "after" is the full run in [`bench/2026-10-23-vm-audit-write-path.md`](bench/2026-10-23-vm-audit-write-path.md), 5 s cells, commit 38a438d):
+
+| Audit, hops | before | after | single client, added p50 before / after |
+|---|---|---|---|
+| memory, 1 | 1,131 / 4,266 / 5,275 | 1,209 / 4,958 / 6,601 | 775 / 697 us |
+| memory, 3 | 819 / 3,327 / 3,746 | 670 / 2,547 / 3,235 | 1,132 / 1,156 us |
+| file (`normal`), 1 | 435 / 488 / 461 | 962 / 3,110 / 4,526 | 2,145 / 851 us |
+| file (`normal`), 3 | 290 / 261 / 465 | 720 / 2,846 / 3,873 | 2,580 / 1,176 us |
+| file, `full`, 1 | (SQLite defaults are the "before" file row) | 434 / 1,248 / 2,176 (*) | 1,377 us (*) |
+| file, `full`, 3 | | 545 / 2,389 / 3,603 | 1,608 us |
+
+(*) Load on the host rose from 3 to 6 during the run, and these cells sit at the end of it; the same cells measured 765 / 3,476 / 5,710 req/s an hour earlier at commit 78e9b14 (before the last merge of main, same code otherwise). The memory, 3-hop row also moved within noise: intermediate runs on the branch measured 934 / 4,038 / 5,479. Read every cell as plus or minus 20 percent on this container.
+
+What this means:
+
+- **The file-backed log is no longer the ceiling.** At `normal` it runs within about 25 percent of the in-memory store (3,100 to 4,500 calls per second at one hop with 8 and 32 clients, from 460 to 490), and single-client latency fell from 2.2 ms to 0.9 ms. At `full` group commit lets one `fsync` cover a batch, so throughput still grows with concurrency instead of staying flat at a few hundred.
+- **Tail latency at `normal`** shows periodic stalls (p99 of 15 to 25 ms with 8 or more clients) that `full` does not: SQLite checkpoints the WAL into the database every 1,000 pages on the writer thread, and at `normal` that is where the deferred `fsync` and write-back land. Moving checkpoints off the writer (`wal_autocheckpoint=0` plus a background `PASSIVE` checkpoint) is the next experiment; it is on the board.
+- **Most of the added latency is still outside the decision.** The server's own work is now about 300 us per call (policy about 120 to 150, append 90 to 150, the rest small), against 0.7 to 1.2 ms added end to end; the blocking-pool hop, the proxy's request handling and the second HTTP round trip make up the rest and are not in this branch.
+
 ### How to run
 
 ```
-scripts/bench-e2e.sh                       # full matrix, about 6 minutes, writes docs/design/bench/
+scripts/bench-e2e.sh                       # full matrix, about 9 minutes, writes docs/design/bench/
 DURATION=10 scripts/bench-e2e.sh --concurrency 8 --depths 3 --audit memory
 cargo run --release -p onbehalf-bench -- --help
 ```
@@ -117,6 +166,6 @@ cargo run --release -p onbehalf-bench -- --help
 
 - `POST /token` exchange throughput and `POST /token/renew` load (the harness only uses exchanges for setup).
 - Policy size (the set here has three policies) and catalog size.
-- A time breakdown of the proxied call by stage.
+- A time breakdown of the proxy's own HTTP handling (the server's decision path is broken down by `benches/decide.rs`).
 - Open-loop load at fixed arrival rates, confidence intervals over repeated runs, and a quiet reference machine.
 - Streaming (SSE) responses and `tools/list` filtering.

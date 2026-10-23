@@ -2,7 +2,7 @@
 # End-to-end latency and throughput benchmark: builds release binaries, runs the matrix with
 # onbehalf-bench, and writes docs/design/bench/<date>-<host>.json plus a markdown summary.
 #
-#   scripts/bench-e2e.sh                 full matrix (about 6 minutes)
+#   scripts/bench-e2e.sh                 full matrix (about 9 minutes)
 #   DURATION=10 WARMUP=2 scripts/bench-e2e.sh
 #   scripts/bench-e2e.sh --concurrency 8 --depths 3     extra arguments go to onbehalf-bench
 #
