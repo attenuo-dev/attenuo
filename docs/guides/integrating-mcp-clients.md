@@ -150,6 +150,15 @@ To see what a token carries:
 onbehalf token inspect "$TOKEN" --verify
 ```
 
+## Worked examples with agent frameworks
+
+Two runnable examples put an orchestrator and a `coder` sub-agent behind the proxy, each with its own token, and replay the GitHub-leak scenario:
+
+- [Claude Agent SDK](https://github.com/7Mudit/onbehalf/blob/main/examples/claude-agent-sdk/README.md): the sub-agent's `AgentDefinition` carries an inline MCP server (`{"type": "http", "url": ".../mcp/github", "headers": {"Authorization": "Bearer ..."}}`), so only that agent holds the narrowed token.
+- [LangChain](https://github.com/7Mudit/onbehalf/blob/main/examples/langchain-agent/README.md): `langchain-mcp-adapters` with the same URL and header, and a tool interceptor that hands a `-32003` denial to the model as a tool error instead of letting it end the run. The adapter opens a new MCP session per call, so after a revocation it sees HTTP 401 rather than `-32003`.
+
+Both run without an API key in a dry-run mode (`run.sh`). The live mode with a model is untested.
+
 ## Handling `DENIED` responses
 
 A denied `tools/call` comes back as HTTP 200 with a JSON-RPC error. The MCP request was understood and answered. The answer is no.

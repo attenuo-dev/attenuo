@@ -1,0 +1,10 @@
+# Tested together on Python 3.13. The onbehalf SDK itself is installed from the checkout
+# (pip install -e sdk/python), which run.sh does.
+# langchain-mcp-adapters is archived upstream in favour of langchain[mcp]; 0.3.2 is its last
+# release at the time of writing and is what this example was run with.
+langchain==1.4.7
+langchain-core==1.7.0
+langchain-anthropic==1.7.6
+langchain-mcp-adapters==0.3.2
+langgraph==1.2.16
+mcp==1.30.0
