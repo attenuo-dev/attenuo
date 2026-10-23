@@ -2,8 +2,12 @@
 
 mod common;
 
-use attenuo_audit::{AuditError, LeaseStatus, LeaseStore, MemoryLeaseStore, SqliteLeaseStore};
+use attenuo_audit::{
+    AuditError, AuditSink, LeaseNode, LeaseStatus, LeaseStore, LeaseSubtree, MemoryLeaseStore,
+    SqliteAudit, SqliteLeaseStore,
+};
 use attenuo_core::LeaseId;
+use attenuo_core::{Decision, DelegationChain, RecordKind};
 use common::t0;
 use time::Duration;
 
@@ -330,4 +334,208 @@ fn file_store_revokes_with_full_sync_and_returns_to_its_setting() {
     assert_eq!(query(&store, "PRAGMA synchronous"), "2", "full");
     let status = store.check_all(&[&id("root"), &id("a2x")], t0()).unwrap();
     assert_eq!(status.revoked, vec![id("a2x")], "the revocation persisted");
+}
+
+/// `subtree` is inherent on each store (the server holds a concrete `SqliteLeaseStore`), so
+/// the parity tests below run it on both through this pair.
+struct Both {
+    memory: MemoryLeaseStore,
+    sqlite: SqliteLeaseStore,
+}
+
+impl Both {
+    fn new() -> Self {
+        Self {
+            memory: MemoryLeaseStore::new(),
+            sqlite: SqliteLeaseStore::open_in_memory().unwrap(),
+        }
+    }
+
+    fn each(&self) -> [(&'static str, &dyn LeaseStore); 2] {
+        [("memory", &self.memory), ("sqlite", &self.sqlite)]
+    }
+
+    /// Both stores' answer, after checking that they agree.
+    fn subtree(&self, lease: &str, max_nodes: usize) -> Option<LeaseSubtree> {
+        let m = self.memory.subtree(&id(lease), max_nodes).unwrap();
+        let s = self.sqlite.subtree(&id(lease), max_nodes).unwrap();
+        assert_eq!(m, s, "memory and sqlite disagree on the subtree of {lease}");
+        s
+    }
+}
+
+fn ids(nodes: &[LeaseNode]) -> Vec<&str> {
+    nodes.iter().map(|n| n.id.0.as_str()).collect()
+}
+
+#[test]
+fn subtree_lists_the_lease_its_descendants_and_its_ancestors() {
+    let both = Both::new();
+    for (_, s) in both.each() {
+        tree(s);
+    }
+    let t = both.subtree("a", 1000).unwrap();
+    assert_eq!(ids(&t.nodes), ["a", "a1", "a2", "a2x"]);
+    assert_eq!(ids(&t.ancestors), ["root"]);
+    assert_eq!(t.root(), &id("root"));
+    assert_eq!(t.would_revoke, 4);
+    assert!(!t.truncated);
+
+    let t = both.subtree("a2x", 1000).unwrap();
+    assert_eq!(ids(&t.nodes), ["a2x"]);
+    assert_eq!(ids(&t.ancestors), ["a2", "a", "root"], "nearest first");
+
+    let t = both.subtree("root", 1000).unwrap();
+    assert_eq!(ids(&t.nodes), ["root", "a", "b", "a1", "a2", "a2x"]);
+    assert!(t.ancestors.is_empty());
+    assert_eq!(t.root(), &id("root"));
+
+    assert_eq!(both.subtree("ghost", 1000), None);
+}
+
+/// The preview is a dry run: `would_revoke` is what `revoke` then reports, whether the
+/// subtree is fresh, partly revoked or fully revoked, and reading it changes nothing.
+#[test]
+fn would_revoke_matches_the_following_revocation() {
+    let both = Both::new();
+    for (_, s) in both.each() {
+        tree(s);
+    }
+    let now = t0() + Duration::minutes(1);
+    let before = both.subtree("root", 1000).unwrap();
+    assert_eq!(both.subtree("root", 1000).unwrap(), before, "read-only");
+    // Fresh: a2 and a2x.
+    let predicted = both.subtree("a2", 1000).unwrap().would_revoke;
+    assert_eq!(predicted, 2);
+    for (name, s) in both.each() {
+        assert_eq!(s.revoke(&id("a2"), "x", now).unwrap(), predicted, "{name}");
+    }
+    // Partly revoked: only a and a1 are still live.
+    let predicted = both.subtree("a", 1000).unwrap().would_revoke;
+    assert_eq!(predicted, 2);
+    for (name, s) in both.each() {
+        assert_eq!(s.revoke(&id("a"), "x", now).unwrap(), predicted, "{name}");
+    }
+    // Fully revoked.
+    assert_eq!(both.subtree("a", 1000).unwrap().would_revoke, 0);
+    for (name, s) in both.each() {
+        assert_eq!(s.revoke(&id("a"), "x", now).unwrap(), 0, "{name}");
+    }
+    // The rows show the revocation the preview did not make.
+    let t = both.subtree("a", 1000).unwrap();
+    assert!(t.nodes.iter().all(|n| n.row.revoked_at == Some(now)));
+}
+
+#[test]
+fn max_nodes_truncates_breadth_first_but_would_revoke_counts_everything() {
+    let both = Both::new();
+    for (_, s) in both.each() {
+        tree(s);
+    }
+    let t = both.subtree("root", 3).unwrap();
+    assert_eq!(ids(&t.nodes), ["root", "a", "b"]);
+    assert!(t.truncated);
+    assert_eq!(t.would_revoke, 6);
+    // Exactly the subtree's size is not truncated; zero is raised to one.
+    assert!(!both.subtree("root", 6).unwrap().truncated);
+    let t = both.subtree("root", 0).unwrap();
+    assert_eq!(ids(&t.nodes), ["root"]);
+    assert!(t.truncated);
+}
+
+/// A parent cycle cannot come from the issuer, but a store edited by hand could hold one.
+/// Neither the descendant query nor the ancestor walk may loop on it.
+#[test]
+fn a_parent_cycle_terminates() {
+    let both = Both::new();
+    let exp = t0() + Duration::hours(1);
+    for (_, s) in both.each() {
+        // x -> y -> z -> x, plus a child w of z outside the cycle.
+        s.register(&id("x"), Some(&id("z")), exp).unwrap();
+        s.register(&id("y"), Some(&id("x")), exp).unwrap();
+        s.register(&id("z"), Some(&id("y")), exp).unwrap();
+        s.register(&id("w"), Some(&id("z")), exp).unwrap();
+    }
+    let t = both.subtree("x", 1000).unwrap();
+    assert_eq!(ids(&t.nodes), ["x", "y", "z", "w"]);
+    assert_eq!(
+        ids(&t.ancestors),
+        ["z", "y"],
+        "stops before coming back to x"
+    );
+    assert_eq!(t.root(), &id("y"));
+    assert_eq!(t.would_revoke, 4);
+    for (name, s) in both.each() {
+        assert_eq!(s.revoke(&id("x"), "x", t0()).unwrap(), 4, "{name}");
+    }
+
+    // A lease that is its own parent.
+    let both = Both::new();
+    for (_, s) in both.each() {
+        s.register(&id("self"), Some(&id("self")), exp).unwrap();
+    }
+    let t = both.subtree("self", 1000).unwrap();
+    assert_eq!(ids(&t.nodes), ["self"]);
+    assert!(t.ancestors.is_empty());
+    assert_eq!(t.root(), &id("self"));
+}
+
+/// The SQLite subtree reads the parent column directly, so a cycle written with plain SQL
+/// (bypassing `register`) is covered too.
+#[test]
+fn sqlite_subtree_survives_a_cycle_written_with_sql() {
+    let store = SqliteLeaseStore::open_in_memory().unwrap();
+    store
+        .with_connection(|c| {
+            c.execute_batch(
+                "INSERT INTO leases (id, parent, expires_at) VALUES \
+                 ('p', 'q', '2026-10-23T00:00:00Z'), ('q', 'p', '2026-10-23T00:00:00Z');",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let t = store.subtree(&id("p"), 1000).unwrap().unwrap();
+    assert_eq!(ids(&t.nodes), ["p", "q"]);
+    assert_eq!(ids(&t.ancestors), ["q"]);
+    assert_eq!(t.would_revoke, 2);
+}
+
+/// `issuance_records` finds the record that issued each lease (the one whose last lease it
+/// is), only among the `root_token` and `exchange` records of the chain.
+#[test]
+fn issuance_records_pick_the_record_that_issued_each_lease() {
+    let audit = SqliteAudit::open_in_memory().unwrap();
+    let two = common::chain("user:mudit", ("l1", "l2"));
+    let one = DelegationChain {
+        hops: two.hops[..1].to_vec(),
+        ..two.clone()
+    };
+    // A decision on the two-hop chain is not an issuance.
+    audit
+        .append(common::record_for(&two, 0, Decision::Allow))
+        .unwrap();
+    audit
+        .append(common::record_for(&one, 1, Decision::Allow).with_kind(RecordKind::RootToken))
+        .unwrap();
+    audit
+        .append(common::record_for(&two, 2, Decision::Allow).with_kind(RecordKind::Exchange))
+        .unwrap();
+    let got = audit
+        .issuance_records("l1", &[&id("l1"), &id("l2"), &id("l3")])
+        .unwrap();
+    let by: Vec<_> = got
+        .iter()
+        .map(|e| {
+            (
+                e.record.leases.last().unwrap().0.as_str(),
+                e.record.agents.last().unwrap().0.as_str(),
+                e.seq,
+            )
+        })
+        .collect();
+    assert_eq!(by, [("l1", "agent:planner", 2), ("l2", "agent:coder", 3)]);
+    assert!(audit
+        .issuance_records("nope", &[&id("l1")])
+        .unwrap()
+        .is_empty());
 }
