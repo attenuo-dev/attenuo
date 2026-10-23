@@ -22,6 +22,9 @@ pub const CODE_UPSTREAM: i64 = -32005;
 /// onbehalf: the proxy is out of a bounded resource, such as session slots (sent with HTTP
 /// 503).
 pub const CODE_UNAVAILABLE: i64 = -32006;
+/// onbehalf: this principal holds too many of a bounded resource, such as session slots (sent
+/// with HTTP 429 and `Retry-After`; SR-49).
+pub const CODE_TOO_MANY: i64 = -32007;
 
 /// MCP method names the proxy understands.
 pub const METHOD_TOOLS_CALL: &str = "tools/call";

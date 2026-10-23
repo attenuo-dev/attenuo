@@ -26,7 +26,7 @@ use crate::filter::{ListFilter, ListKind};
 use crate::guard::{guard_stream, StreamGuard};
 use crate::jsonrpc::{
     self, denied_response, error_response, id_of, is_passthrough_method, is_request, method_of,
-    CODE_INVALID_PARAMS, CODE_INVALID_REQUEST, CODE_PARSE_ERROR, CODE_UNAUTHORIZED,
+    CODE_INVALID_PARAMS, CODE_INVALID_REQUEST, CODE_PARSE_ERROR, CODE_TOO_MANY, CODE_UNAUTHORIZED,
     CODE_UNAVAILABLE, CODE_UNKNOWN_SERVER, CODE_UPSTREAM,
 };
 use crate::listed::ListedTools;
@@ -47,6 +47,15 @@ pub const REASON_INVALID_NAME: &str = "invalid_name";
 /// Reason code (JSON-RPC `data.reason`, HTTP 503) when a response would bind a new session but
 /// every slot of the session registry holds a live binding (SR-36).
 pub const REASON_SESSION_REGISTRY_FULL: &str = "session_registry_full";
+
+/// Reason code (JSON-RPC `data.reason`, HTTP 429) when a response would bind a new session but
+/// the caller's principal (root lease) already holds `max_sessions_per_principal` live
+/// bindings (SR-49).
+pub const REASON_TOO_MANY_SESSIONS: &str = "too_many_sessions";
+
+/// How long the proxy waits for the upstream to acknowledge the `DELETE` of a session it
+/// refused to bind (SR-49).
+const UPSTREAM_DELETE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Reason code (HTTP 413) for a request body over `max_request_body_bytes` (SR-36).
 pub const REASON_REQUEST_TOO_LARGE: &str = "request_too_large";
@@ -109,7 +118,8 @@ pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
     let require_listed_tools = config.require_listed_tools;
     let max_upstream_body = config.max_upstream_body_bytes.max(1);
     let max_request_body = config.max_request_body_bytes.max(1);
-    let sessions = SessionRegistry::new(config.session_ttl, config.max_sessions);
+    let sessions = SessionRegistry::new(config.session_ttl, config.max_sessions)
+        .with_max_per_principal(config.max_sessions_per_principal);
     let upstreams = config
         .upstreams
         .into_iter()
@@ -355,10 +365,17 @@ async fn session_gate(
 
 /// Bind the session id a successful upstream response assigns to the caller. A session id
 /// already bound to another principal is removed from the response. When the registry has no
-/// free slot, the whole response is replaced by `503` `session_registry_full` (SR-36): the
+/// free slot, the whole response is replaced by `503` `session_registry_full` (SR-36); when the
+/// caller's principal already holds its share, by `429` `too_many_sessions` (SR-49). The
 /// client cannot use a session the proxy would not let it back into, and no other user's live
-/// binding is given up for it.
-fn adopt_session(state: &AppState, owner: Option<&SessionOwner>, response: &mut Response) {
+/// binding is given up for it. In both refusals the session the upstream just created is
+/// deleted there ([`delete_upstream_session`]), so refused attempts leave nothing open.
+async fn adopt_session(
+    state: &AppState,
+    upstream: &str,
+    owner: Option<&SessionOwner>,
+    response: &mut Response,
+) {
     if !response.status().is_success() {
         return;
     }
@@ -393,7 +410,51 @@ fn adopt_session(state: &AppState, owner: Option<&SessionOwner>, response: &mut 
             resp.headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
             *response = resp;
+            delete_upstream_session(state, upstream, &sid).await;
         }
+        BindOutcome::PrincipalFull => {
+            tracing::warn!(
+                session = %session_tag(&sid),
+                "principal holds too many sessions; refusing to bind a new one"
+            );
+            let body = error_response(
+                Value::Null,
+                CODE_TOO_MANY,
+                "onbehalf: too many open sessions for this principal; close one or try again later",
+                Some(serde_json::json!({ "reason": REASON_TOO_MANY_SESSIONS })),
+            );
+            let mut resp = json_response(StatusCode::TOO_MANY_REQUESTS, &body);
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
+            *response = resp;
+            delete_upstream_session(state, upstream, &sid).await;
+        }
+    }
+}
+
+/// End, at the upstream, a session the proxy refused to bind (SR-49): the MCP `DELETE` with
+/// its `Mcp-Session-Id`. Best effort: a failure or a timeout is logged, and the refusal stands.
+async fn delete_upstream_session(state: &AppState, upstream: &str, session_id: &str) {
+    let tag = session_tag(session_id);
+    let req = state
+        .client
+        .delete(upstream)
+        .headers(with_session_header(HeaderMap::new(), Some(session_id)))
+        .timeout(UPSTREAM_DELETE_TIMEOUT);
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::info!(session = %tag, "refused session deleted at the upstream");
+        }
+        Ok(resp) => tracing::warn!(
+            session = %tag,
+            status = resp.status().as_u16(),
+            "upstream did not accept the DELETE of a refused session"
+        ),
+        Err(e) => tracing::warn!(
+            session = %tag,
+            error = ?e.to_string(),
+            "DELETE of a refused session at the upstream failed"
+        ),
     }
 }
 
@@ -614,7 +675,7 @@ async fn handle_passthrough(
         match (is_delete, session_id.as_deref()) {
             (true, Some(sid)) if response.status().is_success() => state.sessions.remove(sid),
             (true, _) => {}
-            (false, _) => adopt_session(&state, owner.as_ref(), &mut response),
+            (false, _) => adopt_session(&state, &upstream, owner.as_ref(), &mut response).await,
         }
         response
     }
@@ -708,7 +769,7 @@ async fn handle_post(
             now,
         )
         .await;
-        adopt_session(&state, owner.as_ref(), &mut response);
+        adopt_session(&state, upstream, owner.as_ref(), &mut response).await;
         response
     }
     .instrument(span)

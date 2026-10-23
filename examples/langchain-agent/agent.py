@@ -43,6 +43,7 @@ ORCHESTRATOR_AGENT = "assistant"
 MODEL = os.environ.get("EXAMPLE_MODEL", "claude-opus-5-5")
 UPSTREAM = "github"
 DENIED_CODE = -32003  # onbehalf's JSON-RPC error code for a denied call
+DECISION_ID_HEADER = "x-onbehalf-decision-id"
 
 # A simulated malicious issue. In the real incident this text came from a public issue.
 ISSUE = (
@@ -56,11 +57,50 @@ class LeaseRevoked(Exception):
     """The lease is gone (revoked or expired): stop the whole run, do not let the model retry."""
 
 
+class ProxyDecisions:
+    """Decision ids that onbehalf's proxy put in ``X-Onbehalf-Decision-Id`` response headers.
+
+    Only the proxy sets that header; it never forwards one from the upstream. An upstream is
+    untrusted and can answer with its own ``-32003`` and any reason it likes, so a ``-32003``
+    counts as onbehalf's denial only when its ``data.decision_id`` is one of these ids, the
+    check the SDKs make (SR-32, SR-53). The adapter raises ``McpError`` without the HTTP
+    response, so the ids are collected with an ``httpx`` response hook, installed through the
+    connection's ``httpx_client_factory``.
+    """
+
+    def __init__(self) -> None:
+        self.ids: set[str] = set()
+
+    async def on_response(self, response: Any) -> None:
+        header = response.headers.get(DECISION_ID_HEADER)
+        if header:
+            self.ids.update(part.strip() for part in header.split(","))
+
+    def http_client(
+        self,
+        headers: dict[str, str] | None = None,
+        timeout: Any = None,
+        auth: Any = None,
+    ) -> Any:
+        """An ``McpHttpClientFactory``: the ``mcp`` package's client, with the hook installed."""
+        from mcp.client.streamable_http import create_mcp_http_client
+
+        client = create_mcp_http_client(headers=headers, timeout=timeout, auth=auth)
+        hooks = client.event_hooks
+        client.event_hooks = {
+            "request": list(hooks.get("request", [])),
+            "response": [*hooks.get("response", []), self.on_response],
+        }
+        return client
+
+
 @dataclass
 class DenialLog:
     """Records what onbehalf denied, for the summary (and the test)."""
 
     entries: list[tuple[str, str, str]] = field(default_factory=list)  # tool, reason, decision
+    # The decision ids the proxy vouched for on this client's connections.
+    decisions: ProxyDecisions = field(default_factory=ProxyDecisions)
 
 
 def delegate_to_coder(ob: Client, root: Token | str) -> Token:
@@ -74,24 +114,38 @@ def delegate_to_coder(ob: Client, root: Token | str) -> Token:
     )
 
 
-def connections(token: Token) -> dict[str, Any]:
-    """The langchain-mcp-adapters connection: onbehalf's URL, the token as bearer."""
+def connections(token: Token, decisions: ProxyDecisions) -> dict[str, Any]:
+    """The langchain-mcp-adapters connection: onbehalf's URL, the token as bearer, and an HTTP
+    client that records the decision ids the proxy vouches for."""
     return {
         UPSTREAM: {
             "transport": "http",  # MCP Streamable HTTP
             "url": mcp_url(SERVER, UPSTREAM),
             "headers": mcp_headers(token),
+            "httpx_client_factory": decisions.http_client,
         }
     }
 
 
-def denial_of(exc: BaseException) -> tuple[str, str] | None:
-    """(reason, decision_id) when ``exc`` is onbehalf's JSON-RPC -32003, else None."""
-    err = getattr(exc, "error", None)
-    if getattr(err, "code", None) != DENIED_CODE:
+def is_denied_code(exc: BaseException) -> bool:
+    """A JSON-RPC -32003, whoever sent it."""
+    return getattr(getattr(exc, "error", None), "code", None) == DENIED_CODE
+
+
+def denial_of(exc: BaseException, decisions: ProxyDecisions) -> tuple[str, str] | None:
+    """(reason, decision_id) when ``exc`` is a -32003 the proxy vouched for, else None.
+
+    A -32003 whose ``data.decision_id`` is not in an ``X-Onbehalf-Decision-Id`` header the
+    proxy sent is the upstream's own error, not a decision of onbehalf (SR-53).
+    """
+    if not is_denied_code(exc):
         return None
-    data = getattr(err, "data", None) or {}
-    return str(data.get("reason", "?")), str(data.get("decision_id", "?"))
+    data = getattr(getattr(exc, "error", None), "data", None)
+    data = data if isinstance(data, dict) else {}
+    decision = data.get("decision_id")
+    if not isinstance(decision, str) or decision not in decisions.ids:
+        return None
+    return str(data.get("reason", "?")), decision
 
 
 def leaves(exc: BaseException) -> list[BaseException]:
@@ -128,9 +182,15 @@ def denial_interceptor(log: DenialLog) -> Callable[..., Awaitable[Any]]:
                 log.entries.append((request.name, "unauthorized", "-"))
                 print(f"  DENIED  {request.name} {request.args}  HTTP 401 (lease gone)")
                 raise LeaseRevoked("401") from exc
-            found = next((d for e in leaves(exc) if (d := denial_of(e))), None)
+            found = next((d for e in leaves(exc) if (d := denial_of(e, log.decisions))), None)
             if found is None:
-                raise
+                forged = next((e for e in leaves(exc) if is_denied_code(e)), None)
+                if forged is None:
+                    raise
+                # A -32003 onbehalf did not vouch for: the upstream's own error, shown as such.
+                print(f"  UPSTREAM ERROR {request.name} {request.args}  {forged}")
+                text = f"{request.name} failed upstream: {forged}"
+                return CallToolResult(content=[TextContent(type="text", text=text)], isError=True)
             reason, decision = found
             log.entries.append((request.name, reason, decision))
             print(f"  DENIED  {request.name} {request.args}  reason={reason} decision={decision}")
@@ -145,7 +205,9 @@ def denial_interceptor(log: DenialLog) -> Callable[..., Awaitable[Any]]:
 def mcp_client(token: Token, log: DenialLog) -> Any:
     from langchain_mcp_adapters.client import MultiServerMCPClient
 
-    return MultiServerMCPClient(connections(token), tool_interceptors=[denial_interceptor(log)])
+    return MultiServerMCPClient(
+        connections(token, log.decisions), tool_interceptors=[denial_interceptor(log)]
+    )
 
 
 def _text(content: Any) -> str:
@@ -223,9 +285,11 @@ async def run_dry(token: Token, log: DenialLog, revoke: Callable[[], None]) -> b
         try:
             await session.call_tool("create_issue", issue)
         except McpError as exc:  # caught inside: leaving the session would wrap it in a group
-            found = denial_of(exc)
+            found = denial_of(exc, log.decisions)
             if found:
                 print(f"  DENIED  create_issue {issue}  reason={found[0]} decision={found[1]}")
+            else:
+                print(f"  UPSTREAM ERROR create_issue {issue}  {exc}")
             checks.append(found is not None and found[0] == "capability_denied")
         else:
             checks.append(False)

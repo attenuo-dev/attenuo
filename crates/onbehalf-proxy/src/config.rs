@@ -66,6 +66,12 @@ pub struct ProxyConfig {
     /// [`crate::session::DEFAULT_MAX_SESSIONS`].
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
+    /// Most live session bindings one principal (the chain's root lease) holds. One more gets
+    /// `429` with reason `too_many_sessions`, and the session the upstream just opened is
+    /// deleted there (SR-49). Default
+    /// [`crate::session::DEFAULT_MAX_SESSIONS_PER_PRINCIPAL`].
+    #[serde(default = "default_max_sessions_per_principal")]
+    pub max_sessions_per_principal: usize,
 }
 
 fn default_max_upstream_body_bytes() -> usize {
@@ -82,6 +88,10 @@ fn default_session_ttl() -> Duration {
 
 fn default_max_sessions() -> usize {
     crate::session::DEFAULT_MAX_SESSIONS
+}
+
+fn default_max_sessions_per_principal() -> usize {
+    crate::session::DEFAULT_MAX_SESSIONS_PER_PRINCIPAL
 }
 
 fn default_stream_recheck() -> Duration {
@@ -103,6 +113,7 @@ impl ProxyConfig {
             max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
             session_ttl: crate::session::DEFAULT_SESSION_TTL,
             max_sessions: crate::session::DEFAULT_MAX_SESSIONS,
+            max_sessions_per_principal: crate::session::DEFAULT_MAX_SESSIONS_PER_PRINCIPAL,
         }
     }
 
@@ -122,6 +133,12 @@ impl ProxyConfig {
     pub fn with_sessions(mut self, ttl: Duration, max: usize) -> Self {
         self.session_ttl = ttl;
         self.max_sessions = max;
+        self
+    }
+
+    /// Set [`ProxyConfig::max_sessions_per_principal`].
+    pub fn with_max_sessions_per_principal(mut self, max: usize) -> Self {
+        self.max_sessions_per_principal = max;
         self
     }
 

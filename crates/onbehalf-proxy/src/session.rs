@@ -17,7 +17,10 @@
 //! (SR-36): expired bindings (idle past the TTL) are dropped as new ones arrive, oldest first and
 //! without a scan, and when every slot holds a live binding a new one is refused, so the
 //! response that would have created it gets `503` with reason `session_registry_full`. A live
-//! binding of another user is never evicted to make room. Session
+//! binding of another user is never evicted to make room. Each principal (the chain's root lease:
+//! one user's root grant, shared by every agent it delegates to) may hold at most
+//! `max_per_principal` live bindings (SR-49); one more gets `429` with reason
+//! `too_many_sessions`, so one user cannot fill the registry and lock everyone else out. Session
 //! ids are secrets that grant access to a session, so logs only carry [`session_tag`], a short
 //! hash prefix.
 
@@ -32,6 +35,8 @@ use sha2::{Digest, Sha256};
 pub const DEFAULT_SESSION_TTL: Duration = Duration::from_secs(3600);
 /// Default maximum number of bindings held.
 pub const DEFAULT_MAX_SESSIONS: usize = 100_000;
+/// Default maximum number of live bindings one principal (root lease) holds (SR-49).
+pub const DEFAULT_MAX_SESSIONS_PER_PRINCIPAL: usize = 64;
 
 /// Who a session belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +86,9 @@ pub enum BindOutcome {
     /// The registry holds `max` live bindings; nothing changed. No live binding is ever
     /// evicted to make room (SR-36).
     Full,
+    /// This owner's root lease already holds `max_per_principal` live bindings; nothing
+    /// changed (SR-49).
+    PrincipalFull,
 }
 
 #[derive(Default)]
@@ -89,6 +97,8 @@ struct Inner {
     /// `(last_seen, seq)` to session id, oldest first, so expired entries are found without a
     /// scan.
     by_age: BTreeMap<(Instant, u64), String>,
+    /// Live bindings per root lease (SR-49). A lease with none has no key.
+    per_principal: HashMap<LeaseId, usize>,
     next_seq: u64,
 }
 
@@ -98,6 +108,10 @@ impl Inner {
         let seq = self.next_seq;
         self.next_seq += 1;
         self.by_age.insert((now, seq), session_id.to_owned());
+        *self
+            .per_principal
+            .entry(owner.root_lease.clone())
+            .or_default() += 1;
         self.entries.insert(
             session_id.to_owned(),
             Entry {
@@ -122,7 +136,24 @@ impl Inner {
     fn remove(&mut self, session_id: &str) {
         if let Some(e) = self.entries.remove(session_id) {
             self.by_age.remove(&(e.last_seen, e.seq));
+            self.uncount(&e.owner);
         }
+    }
+
+    fn uncount(&mut self, owner: &SessionOwner) {
+        if let Some(n) = self.per_principal.get_mut(&owner.root_lease) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.per_principal.remove(&owner.root_lease);
+            }
+        }
+    }
+
+    fn held_by(&self, owner: &SessionOwner) -> usize {
+        self.per_principal
+            .get(&owner.root_lease)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Drop every entry idle for `ttl` or longer, oldest first; stops at the first live one.
@@ -132,7 +163,9 @@ impl Inner {
                 break;
             }
             if let Some((_, id)) = self.by_age.pop_first() {
-                self.entries.remove(&id);
+                if let Some(e) = self.entries.remove(&id) {
+                    self.uncount(&e.owner);
+                }
             }
         }
     }
@@ -143,6 +176,7 @@ pub struct SessionRegistry {
     inner: Mutex<Inner>,
     ttl: Duration,
     max: usize,
+    max_per_principal: usize,
 }
 
 impl Default for SessionRegistry {
@@ -157,7 +191,14 @@ impl SessionRegistry {
             inner: Mutex::new(Inner::default()),
             ttl,
             max: max.max(1),
+            max_per_principal: DEFAULT_MAX_SESSIONS_PER_PRINCIPAL,
         }
+    }
+
+    /// Set the most live bindings one principal (root lease) may hold (SR-49); at least one.
+    pub fn with_max_per_principal(mut self, max: usize) -> Self {
+        self.max_per_principal = max.max(1);
+        self
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -188,9 +229,11 @@ impl SessionRegistry {
     }
 
     /// Bind `session_id` to `owner`, unless it is live and bound to someone else
-    /// ([`BindOutcome::Taken`]) or the registry is full of live bindings
-    /// ([`BindOutcome::Full`]). Expired bindings are dropped first, oldest first, in time
-    /// proportional to how many expired; a live binding is never evicted.
+    /// ([`BindOutcome::Taken`]), the owner's root lease already holds `max_per_principal` live
+    /// bindings ([`BindOutcome::PrincipalFull`], SR-49), or the registry is full of live
+    /// bindings ([`BindOutcome::Full`]). Expired bindings are dropped first, oldest first, in
+    /// time proportional to how many expired, so only live bindings count against either
+    /// limit; a live binding is never evicted.
     pub fn bind(&self, session_id: &str, owner: &SessionOwner, now: Instant) -> BindOutcome {
         let mut inner = self.lock();
         inner.purge_expired(now, self.ttl);
@@ -200,6 +243,9 @@ impl SessionRegistry {
             }
             inner.touch(session_id, now);
             return BindOutcome::Bound;
+        }
+        if inner.held_by(owner) >= self.max_per_principal {
+            return BindOutcome::PrincipalFull;
         }
         if inner.entries.len() >= self.max {
             return BindOutcome::Full;
@@ -301,6 +347,38 @@ mod tests {
         assert_eq!(reg.len(), 2, "s1 and s2 expired, s3 was refreshed");
         assert_eq!(reg.check("s3", &a, later), SessionCheck::Owned);
         assert_eq!(reg.check("s1", &a, later), SessionCheck::Unknown);
+    }
+
+    /// SR-49: one principal (root lease) holds at most `max_per_principal` live bindings, other
+    /// principals keep binding, and an expired or removed binding frees the principal's slot.
+    #[test]
+    fn a_principal_cannot_hold_more_than_its_share_sr49() {
+        let reg = SessionRegistry::new(Duration::from_secs(10), 100).with_max_per_principal(2);
+        let t = Instant::now();
+        let (a, a_other_run, b) = (owner("a", "l1"), owner("a", "l3"), owner("b", "l2"));
+        assert_eq!(reg.bind("s1", &a, t), BindOutcome::Bound);
+        assert_eq!(
+            reg.bind("s2", &a, t + Duration::from_secs(1)),
+            BindOutcome::Bound
+        );
+        assert_eq!(reg.bind("s3", &a, t), BindOutcome::PrincipalFull);
+        // Re-binding a held id is not a new slot.
+        assert_eq!(reg.bind("s1", &a, t), BindOutcome::Bound);
+        // Other principals, including another root grant of the same user, are unaffected.
+        assert_eq!(reg.bind("b1", &b, t), BindOutcome::Bound);
+        assert_eq!(reg.bind("x1", &a_other_run, t), BindOutcome::Bound);
+        // A removed binding frees a slot.
+        reg.remove("s2");
+        assert_eq!(reg.bind("s3", &a, t), BindOutcome::Bound);
+        assert_eq!(reg.bind("s4", &a, t), BindOutcome::PrincipalFull);
+        // Expired bindings stop counting: s1 and s3 were last seen at t.
+        let later = t + Duration::from_secs(10);
+        assert_eq!(reg.bind("s4", &a, later), BindOutcome::Bound);
+        assert_eq!(reg.bind("s5", &a, later), BindOutcome::Bound);
+        assert_eq!(reg.bind("s6", &a, later), BindOutcome::PrincipalFull);
+        let inner = reg.lock();
+        let counted: usize = inner.per_principal.values().sum();
+        assert_eq!(counted, inner.entries.len());
     }
 
     #[test]
