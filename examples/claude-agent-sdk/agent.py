@@ -42,6 +42,8 @@ CODER_SECRET = os.environ.get("ONBEHALF_CODER_SECRET", "demo-coder-secret")
 ORCHESTRATOR_AGENT = "assistant"
 MODEL = os.environ.get("EXAMPLE_MODEL", "claude-opus-5-5")
 UPSTREAM = "github"
+DENIED_CODE = -32003  # onbehalf's JSON-RPC error code for a denied call
+DECISION_ID_HEADER = "x-onbehalf-decision-id"
 
 # A simulated malicious issue. In the real incident this text came from a public issue.
 ISSUE = (
@@ -113,11 +115,48 @@ async def run_live(token: Token) -> None:
             print(f"[done]  {msg.subtype}, {msg.num_turns} turns")
 
 
-def _denial(exc: BaseException) -> tuple[str, str]:
-    """(reason, decision_id) from the McpError raised for onbehalf's -32003."""
+class ProxyDecisions:
+    """Decision ids that onbehalf's proxy put in ``X-Onbehalf-Decision-Id`` response headers.
+
+    Only the proxy sets that header; it never forwards one from the upstream. An upstream is
+    untrusted and can answer with its own ``-32003`` and any reason it likes, so a ``-32003``
+    counts as onbehalf's denial only when its ``data.decision_id`` is one of these ids, the
+    check the SDKs make (SR-32, SR-53). The ``mcp`` client raises ``McpError`` without the HTTP
+    response, so the ids are collected with an ``httpx`` response hook on the client it uses.
+    """
+
+    def __init__(self) -> None:
+        self.ids: set[str] = set()
+
+    async def on_response(self, response: Any) -> None:
+        header = response.headers.get(DECISION_ID_HEADER)
+        if header:
+            self.ids.update(part.strip() for part in header.split(","))
+
+    def http_client(self, headers: dict[str, str]) -> Any:
+        """The ``mcp`` package's HTTP client, with the hook installed."""
+        from mcp.client import streamable_http
+
+        client = streamable_http.create_mcp_http_client(headers=headers)
+        hooks = client.event_hooks
+        client.event_hooks = {
+            "request": list(hooks.get("request", [])),
+            "response": [*hooks.get("response", []), self.on_response],
+        }
+        return client
+
+
+def _denial(exc: BaseException, decisions: ProxyDecisions) -> tuple[str, str] | None:
+    """(reason, decision_id) when ``exc`` is a -32003 the proxy vouched for, else None."""
     err = getattr(exc, "error", None)
-    data = getattr(err, "data", None) or {}
-    return str(data.get("reason", "?")), str(data.get("decision_id", "?"))
+    if getattr(err, "code", None) != DENIED_CODE:
+        return None
+    data = getattr(err, "data", None)
+    data = data if isinstance(data, dict) else {}
+    decision = data.get("decision_id")
+    if not isinstance(decision, str) or decision not in decisions.ids:
+        return None  # an upstream's own -32003: not a decision of onbehalf
+    return str(data.get("reason", "?")), decision
 
 
 async def run_dry(token: Token, revoke: Callable[[], None]) -> bool:
@@ -126,15 +165,20 @@ async def run_dry(token: Token, revoke: Callable[[], None]) -> bool:
     from mcp.client import streamable_http
 
     cfg = coder_mcp_server(token)
-    http = streamable_http.create_mcp_http_client(headers=cfg["headers"])
+    decisions = ProxyDecisions()
+    http = decisions.http_client(cfg["headers"])
     checks: list[bool] = []
 
     async def call(session: ClientSession, tool: str, args: dict[str, Any]) -> str:
-        """Returns "allowed" or the denial reason."""
+        """Returns "allowed", the denial reason, or "upstream_error"."""
         try:
             await session.call_tool(tool, args)
         except Exception as exc:  # McpError; the module path moved between mcp releases
-            reason, decision = _denial(exc)
+            found = _denial(exc, decisions)
+            if found is None:
+                print(f"  UPSTREAM ERROR {tool} {args}  {exc}")
+                return "upstream_error"
+            reason, decision = found
             print(f"  DENIED  {tool} {args}  reason={reason} decision={decision}")
             return reason
         print(f"  ALLOWED {tool} {args}")

@@ -88,6 +88,10 @@ onbehalf audit verify
 
 `langchain-mcp-adapters` lets a JSON-RPC error escape the tool as an exception, which would end the whole agent run. A denial is a decision, so `denial_interceptor` (a `tool_interceptors` entry) catches onbehalf's `-32003` and returns it as a tool error: the model reads "read_file is not allowed for this agent (capability_denied). Do not retry it." and the decision id goes to the log. Keep that in any agent you build on this: the model should be told once, plainly, and not given the server's internals.
 
+### Telling onbehalf's denials from the upstream's errors
+
+The upstream is untrusted, and nothing stops it from answering with its own `-32003` and a `reason` of its choosing. A `-32003` is onbehalf's only when its `data.decision_id` is in the `X-Onbehalf-Decision-Id` header of the proxy's response: the proxy sets that header and never forwards one from the upstream. The onbehalf SDKs check this (SR-32); this example does the same (SR-53). The adapter raises `McpError` without the HTTP response, so `connections()` passes an `httpx_client_factory` that builds the `mcp` package's client with a response hook (`ProxyDecisions`), which collects every decision id the proxy sends. `denial_of` accepts a `-32003` only when its decision id is one of them; any other `-32003` is printed as `UPSTREAM ERROR` and given to the model as a plain tool failure, not as a decision. `test_example.py` checks both cases without servers. If you build on a client that gives you no way to see response headers, treat a `-32003` as an upstream error rather than as onbehalf's word.
+
 ## How the dry-run relates to the live run
 
 The dry-run builds the same `MultiServerMCPClient` (same connection, same interceptor), loads the tools with `get_tools()` and calls them with `ainvoke`, as the agent loop does. The token, the URL, the headers and the tool wrappers are exercised for real; the model's choice of tool calls is the only thing replaced.
