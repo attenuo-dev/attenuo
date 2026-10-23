@@ -2,17 +2,30 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>attenuo admin console</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>Attenuo console</title>
 <link rel="stylesheet" href="app.css">
-<script src="app.js" defer></script>
+<script type="module" src="app.js"></script>
 </head>
 <body>
-<main>
-<h1>attenuo admin console</h1>
-<p>The console is not built yet. This listener already serves the admin API under
-<code>/admin/*</code>; use the <code>attenuo</code> CLI or <code>curl</code> with the admin
-bearer token until the pages land.</p>
+<header class="topbar">
+  <div class="topbar-inner">
+    <span class="brand">Attenuo<small>admin console</small></span>
+    <nav class="nav" id="nav" aria-label="Pages" hidden>
+      <a href="#/audit" data-page="audit">Audit</a>
+      <a href="#/policy" data-page="policy">Policy</a>
+      <a href="#/verify" data-page="verify">Verify</a>
+    </nav>
+    <div class="topbar-actions">
+      <button type="button" id="theme-toggle">Light theme</button>
+      <button type="button" id="lock" hidden>Lock</button>
+    </div>
+  </div>
+</header>
+<div class="status" id="status" role="status" aria-live="polite"></div>
+<main class="page" id="main">
+  <noscript><p>The console needs JavaScript. The admin API under <code>/admin/*</code> also works with the <code>attenuo</code> CLI or <code>curl</code>.</p></noscript>
 </main>
 </body>
 </html>

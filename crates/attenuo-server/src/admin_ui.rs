@@ -12,9 +12,11 @@
 //!   compiled in with `include_bytes!` ([`ASSETS`]). `/` and `/admin/ui` redirect to
 //!   `/admin/ui/`. Assets carry `Cache-Control: no-cache` and a SHA-256 `ETag`, and answer
 //!   `If-None-Match` with 304, so a server upgrade never leaves a stale script running.
-//! - The read-only admin routes ([`read_routes`]) behind [`require_admin`]. One of them,
-//!   `GET /admin/audit/checkpoint`, signs a checkpoint of the head when it has none; it is
-//!   mounted as a read because it changes no recorded fact and the CLI treats it as one.
+//! - The read-only admin routes ([`read_routes`]) behind [`require_admin`]: audit queries,
+//!   entries and checkpoints, lease status and tree, the loaded policies, a lint of the policy
+//!   file, and the `POST /admin/policies/evaluate` dry run (JSON `Content-Type` required). One
+//!   of them, `GET /admin/audit/checkpoint`, signs a checkpoint of the head when it has none;
+//!   it is mounted as a read because it changes no recorded fact and the CLI treats it as one.
 //! - With `[admin_ui] allow_write = true` only, the routes that change state
 //!   ([`write_routes`]), which also require `Content-Type: application/json`.
 //! - Never `POST /admin/root-token`, whatever `[dev] allow_root_mint` says.
@@ -36,6 +38,7 @@ use tower_http::trace::TraceLayer;
 use crate::config::Config;
 use crate::error::ApiError;
 use crate::routes::admin::{self, require_admin};
+use crate::routes::policies;
 use crate::state::AppState;
 
 /// Where the console lives on its listener. Asset paths are relative to it.
@@ -74,7 +77,8 @@ const JS: &str = "text/javascript; charset=utf-8";
 const CSS: &str = "text/css; charset=utf-8";
 
 /// The console files. A fixed table rather than a directory walk, so what ships is exactly
-/// what is listed here and reviewed; a new file is one line.
+/// what is listed here and reviewed; a new file is one entry. Paths are flat (the asset route
+/// takes one path segment), so the views are `view-*.js` rather than a `views/` directory.
 pub const ASSETS: &[Asset] = &[
     Asset {
         path: "index.html",
@@ -82,14 +86,49 @@ pub const ASSETS: &[Asset] = &[
         bytes: include_bytes!("../ui/index.html"),
     },
     Asset {
+        path: "app.css",
+        content_type: CSS,
+        bytes: include_bytes!("../ui/app.css"),
+    },
+    Asset {
         path: "app.js",
         content_type: JS,
         bytes: include_bytes!("../ui/app.js"),
     },
     Asset {
-        path: "app.css",
-        content_type: CSS,
-        bytes: include_bytes!("../ui/app.css"),
+        path: "api.js",
+        content_type: JS,
+        bytes: include_bytes!("../ui/api.js"),
+    },
+    Asset {
+        path: "dom.js",
+        content_type: JS,
+        bytes: include_bytes!("../ui/dom.js"),
+    },
+    Asset {
+        path: "view-audit.js",
+        content_type: JS,
+        bytes: include_bytes!("../ui/view-audit.js"),
+    },
+    Asset {
+        path: "view-entry.js",
+        content_type: JS,
+        bytes: include_bytes!("../ui/view-entry.js"),
+    },
+    Asset {
+        path: "view-lease.js",
+        content_type: JS,
+        bytes: include_bytes!("../ui/view-lease.js"),
+    },
+    Asset {
+        path: "view-policy.js",
+        content_type: JS,
+        bytes: include_bytes!("../ui/view-policy.js"),
+    },
+    Asset {
+        path: "view-verify.js",
+        content_type: JS,
+        bytes: include_bytes!("../ui/view-verify.js"),
     },
 ];
 
@@ -122,16 +161,29 @@ fn asset_table() -> AssetTable {
 }
 
 /// The admin routes the console listener always mounts: those without side effects on leases
-/// or policy. Routes added to the admin API later (audit queries, lease tree, policy read)
-/// belong here, one line each.
+/// or policy. `POST /admin/policies/evaluate` is a dry run (no lease check, no audit record),
+/// so it is here too; being a `POST` it requires a JSON `Content-Type` like the write routes.
 pub fn read_routes() -> Router<Arc<AppState>> {
+    let evaluate = Router::new()
+        .route(
+            "/admin/policies/evaluate",
+            post(policies::evaluate_policies),
+        )
+        .route_layer(middleware::from_fn(require_json));
     Router::new()
         .route("/admin/audit", get(admin::audit_range))
         .route("/admin/audit/verify", get(admin::audit_verify))
         // Signs a checkpoint of the head when it has none yet; a read for the CLI and here.
         .route("/admin/audit/checkpoint", get(admin::audit_checkpoint))
+        .route("/admin/audit/checkpoints", get(admin::audit_checkpoints))
+        .route("/admin/audit/entries/{seq}", get(admin::audit_entry))
+        .route("/admin/audit/records/{id}", get(admin::audit_record))
         .route("/admin/audit/export", get(admin::audit_export))
         .route("/admin/leases/{lease_id}", get(admin::lease_status))
+        .route("/admin/leases/{lease_id}/tree", get(admin::lease_tree))
+        .route("/admin/policies", get(policies::get_policies))
+        .route("/admin/policies/check", get(policies::check_policies))
+        .merge(evaluate)
 }
 
 /// The admin routes that change state, mounted on the console listener only with
@@ -297,6 +349,122 @@ mod tests {
         assert!(!with("application/x-www-form-urlencoded"));
         assert!(!with("application/jsonp"));
         assert!(!is_json(&HeaderMap::new()));
+    }
+
+    /// What [`unsafe_markup`] refuses in every script and page: the HTML-parsing sinks,
+    /// string-to-code calls and `javascript:` URLs. The console builds every node with
+    /// `createElement`/`textContent`, and the CSP's Trusted Types would throw on these anyway;
+    /// this test keeps them out of the source so a regression fails CI rather than a browser.
+    const FORBIDDEN: &[&str] = &[
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.write",
+        "eval(",
+        "new Function",
+        "javascript:",
+    ];
+
+    /// Every reason `text` (the asset at `path`) breaks the console's markup rules.
+    fn unsafe_markup(path: &str, text: &str) -> Vec<String> {
+        let mut found: Vec<String> = FORBIDDEN
+            .iter()
+            .filter(|f| text.contains(**f))
+            .map(|f| format!("{path}: `{f}`"))
+            .collect();
+        if text.contains("style=") {
+            found.push(format!("{path}: `style=`"));
+        }
+        if !path.ends_with(".html") {
+            return found;
+        }
+        let lower = text.to_ascii_lowercase();
+        let b = lower.as_bytes();
+        for (i, _) in lower.match_indices("on") {
+            // An attribute starts after whitespace: ` onclick=`, `\nonload =`.
+            if i == 0 || !b[i - 1].is_ascii_whitespace() {
+                continue;
+            }
+            let name_end = i
+                + 2
+                + b[i + 2..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_lowercase())
+                    .count();
+            let rest = lower[name_end..].trim_start();
+            if name_end > i + 2 && rest.starts_with('=') {
+                found.push(format!("{path}: inline handler `{}`", &lower[i..name_end]));
+            }
+        }
+        for (i, _) in lower.match_indices("style") {
+            let attr = i > 0 && b[i - 1].is_ascii_whitespace();
+            if (attr && lower[i + 5..].trim_start().starts_with('=')) || (i > 0 && b[i - 1] == b'<')
+            {
+                found.push(format!("{path}: inline style at byte {i}"));
+            }
+        }
+        for (i, _) in lower.match_indices("<script") {
+            let Some(close) = lower[i..].find('>') else {
+                found.push(format!("{path}: unterminated <script"));
+                continue;
+            };
+            let tag = &lower[i..i + close];
+            let body_starts = i + close + 1;
+            if !tag.contains(" src=") || !lower[body_starts..].starts_with("</script>") {
+                found.push(format!("{path}: inline <script> at byte {i}"));
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn no_asset_contains_an_html_sink_or_inline_code() {
+        let mut found = Vec::new();
+        for a in ASSETS.iter().filter(|a| !a.path.ends_with(".css")) {
+            let text = std::str::from_utf8(a.bytes).expect("console assets are UTF-8");
+            found.extend(unsafe_markup(a.path, text));
+        }
+        assert!(found.is_empty(), "{found:#?}");
+    }
+
+    #[test]
+    fn the_markup_scan_catches_each_rule() {
+        let bad_js = [
+            "el.innerHTML = x",
+            "el.outerHTML = x",
+            "el.insertAdjacentHTML('beforeend', x)",
+            "document.write(x)",
+            "eval(x)",
+            "new Function('return 1')",
+            "a.href = 'javascript:alert(1)'",
+        ];
+        for js in bad_js {
+            assert!(!unsafe_markup("x.js", js).is_empty(), "{js}");
+        }
+        let bad_html = [
+            "<img src=x onerror=alert(1)>",
+            "<body\nonload = \"go()\">",
+            "<div style=\"color:red\">",
+            "<style>p{}</style>",
+            "<script>alert(1)</script>",
+            "<script src=\"a.js\">alert(1)</script>",
+            "<script type=\"module\"></script>",
+        ];
+        for html in bad_html {
+            assert!(!unsafe_markup("x.html", html).is_empty(), "{html}");
+        }
+        let fine = [
+            ("x.html", "<script type=\"module\" src=\"app.js\"></script><button id=\"lock\" hidden>Lock</button>"),
+            ("x.html", "<p>Questions on one line</p>"),
+            ("x.js", "el.textContent = reason; const done = () => onChain(id);"),
+        ];
+        for (path, text) in fine {
+            assert!(
+                unsafe_markup(path, text).is_empty(),
+                "{text}: {:?}",
+                unsafe_markup(path, text)
+            );
+        }
     }
 
     #[test]
