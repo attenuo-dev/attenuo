@@ -1,10 +1,10 @@
 # Evaluation plan
 
-- Status: draft plan, no results yet
+- Status: draft plan. First slice run: a synthetic, LLM-free replay of injected tool calls, [injection suite](../evaluation/injection-suite.md) (2026-10-23)
 - Date: 2026-10-22
 - Related: [RFC-0001](../spec/rfc-0001-onbehalf.md), [threat model](../spec/threat-model.md), [incidents](incidents-2025-2026.md), [related work](related-work.md), [performance notes](../design/performance.md)
 
-This document describes how to measure whether onbehalf does what the RFC claims, in a form that can be written up as a workshop paper or as the evaluation chapter of a Master's thesis. It is a plan, not a result. Nothing here has been run yet. Numbers quoted from other papers are as those papers report them.
+This document describes how to measure whether onbehalf does what the RFC claims, in a form that can be written up as a workshop paper or as the evaluation chapter of a Master's thesis. It is a plan, not a result. Numbers quoted from other papers are as those papers report them. The only part run so far is the [injection suite](../evaluation/injection-suite.md). It replays hand-written injected call sequences through arms A0, A1 and A2 with no model in the loop, and it does not follow the split discipline of section 4.4.
 
 The RFC states four properties (P1 to P4). The threat model says what onbehalf does not do: it does not detect prompt injection, it assumes the agent is compromised and bounds the damage. The evaluation therefore asks a bounded question. If an agent is successfully injected, how often does attenuated delegation plus per-call policy stop the harmful tool call, how much legitimate work does it break, and what does it cost?
 
