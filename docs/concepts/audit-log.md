@@ -53,6 +53,6 @@ Also, the hash covers compact JSON with sorted keys. It is not yet RFC 8785 cano
 
 The RFC describes a `kind` field (`issue`, `decision`, `renew`, `revoke`, `checkpoint`), signed checkpoints and a `chain_id`. None exist in the code.
 
-The RFC also says revocations are appended to the log. The admin revoke handler does not appear to write an audit entry in v0. Treat revocation as unaudited until you have checked the code for your version.
+Revocations, policy reloads and dev root mints are appended to the log as admin actions (reason `admin_action`, server `onbehalf`). The revoke response carries the `audit_id` of that record, or says that the append failed.
 
 More detail: [RFC-0001 section 7](../spec/rfc-0001-onbehalf.md#7-audit-record-and-hash-chaining) and [design/server.md](../design/server.md#audit-convention-for-issuance).
