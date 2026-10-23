@@ -81,5 +81,11 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 - SR-16 (low): `DelegationChain::validate_at` now rejects empty agent and lease ids, `issued_at` at or after `expires_at` or before the parent's, and repeated leases or agents.
 - SR-24 (info, partial): each OIDC ID token or ID-JAG mints at most one root token, a parent token delegates to a given actor at most once (in-memory replay cache, `invalid_grant` / `replayed`), and a root token never outlives the credential it came from.
 - Proxy: `tools/list` results delivered over SSE were passed through unfiltered (SR-23). List results are now filtered in JSON bodies, JSON-RPC batches and `text/event-stream` bodies. A list request answered with an unparseable body, or a content type that is neither JSON nor SSE, gets `502` instead of an unfiltered result.
+- SR-29 (medium): an ECDSA-signed ID token without `jti` could be redeemed for a second root token by re-encoding its signature (`s` to `n - s`), because the replay cache hashed the whole credential. It now hashes the JWS signing input.
+- SR-30 (medium): the release workflow, which can push and sign images and create releases, ran third-party actions from mutable tags and restored a shared cargo cache. Every action in `release.yml` is pinned to a commit SHA and the release build starts without a cache.
+- SR-31 (low): the Python SDK put server names and lease ids into URL paths unencoded, so `..`, `?` or `/` in them sent the request (with the admin or delegation bearer) to another endpoint. They are now percent-encoded, and `.` and `..` are refused.
+- SR-34 (low): an upstream named `onbehalf` could write tool-call audit records that look like the server's own issuance, renewal and admin records. The name is now reserved.
+- SR-39 (info): an IdP credential with a float `exp` was refused as expired.
+- Pass 3 of the security review (`docs/research/security-review-2026-10-23.md`) also reports two open proxy findings with ignored regression tests: a second `Mcp-Session-Id` header bypasses session binding (SR-27, medium), and open SSE streams survive revocation and token expiry (SR-28, medium).
 
 [Unreleased]: https://github.com/7Mudit/onbehalf/compare/main...HEAD

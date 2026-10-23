@@ -110,7 +110,7 @@ class Client:
         session_id: str | None = None,
     ) -> tuple[dict[str, Any], str | None, httpx.Response]:
         resp = self._http.post(
-            f"/mcp/{server}",
+            f"/mcp/{w.path_segment(server, 'server')}",
             headers=w.mcp_headers(w.bearer(token, self.token), session_id),
             json=w.rpc_request(method, params, next(self._ids)),
         )
@@ -263,7 +263,7 @@ class AsyncClient:
         session_id: str | None = None,
     ) -> tuple[dict[str, Any], str | None, httpx.Response]:
         resp = await self._http.post(
-            f"/mcp/{server}",
+            f"/mcp/{w.path_segment(server, 'server')}",
             headers=w.mcp_headers(w.bearer(token, self.token), session_id),
             json=w.rpc_request(method, params, next(self._ids)),
         )

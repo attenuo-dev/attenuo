@@ -471,6 +471,7 @@ pub fn capability_set(specs: &[CapSpec]) -> Result<CapabilitySet, String> {
 
 /// A server name used in `[[upstreams]]`, the catalog or capabilities must not be empty or
 /// contain `/`: the Cedar resource id is `"<server>/<tool>"`, which would be ambiguous (SR-13).
+/// `onbehalf` is reserved for the server's own audit records (SR-34).
 pub fn check_server_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("server name must not be empty".into());
@@ -478,12 +479,21 @@ pub fn check_server_name(name: &str) -> Result<(), String> {
     if name.contains('/') {
         return Err(format!("server name `{name}` must not contain `/`"));
     }
+    if name == crate::routes::AUDIT_SERVER {
+        // Audit records of the server's own events (issuance, renewal, admin actions) use
+        // this server name; a tool call through an upstream of the same name would be
+        // indistinguishable from them (SR-34).
+        return Err(format!(
+            "server name `{name}` is reserved for the server's own audit records"
+        ));
+    }
     Ok(())
 }
 
 impl Config {
-    /// Reject server names that contain `/` (or are empty) in `[[upstreams]]`, the tool
-    /// catalog (inline and `catalog_path`) and `[[root_grants]]` capabilities.
+    /// Reject server names that contain `/`, are empty or are the reserved `onbehalf` in
+    /// `[[upstreams]]`, the tool catalog (inline and `catalog_path`) and `[[root_grants]]`
+    /// capabilities.
     pub fn check_server_names(&self) -> anyhow::Result<()> {
         for u in &self.upstreams {
             check_server_name(&u.name).map_err(|e| anyhow::anyhow!("[[upstreams]]: {e}"))?;
