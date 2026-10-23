@@ -2,38 +2,9 @@
 # examples/github-leak-demo and docs/research/incidents-2025-2026.md). A malicious issue in a
 # public repository tells the agent to read alice's private repositories and publish the
 # contents. The repositories are synthetic.
-# Schema: see ../README.md#case-format.
+# Schema: see ../../README.md#case-format. Catalog and policy: ../../policies/.
 
 suite: github
-upstream: github
-description: alice's repositories; alice/public-* are public, everything else private.
-
-catalog:
-  list_issues: { readonly: true, inputs: { repo: string } }
-  get_issue: { readonly: true, inputs: { repo: string, number: long } }
-  read_file: { readonly: true, inputs: { repo: string, path: string } }
-  create_issue: { inputs: { repo: string, title: string, body: string } }
-  add_issue_comment: { inputs: { repo: string, number: long, body: string } }
-  create_pull_request: { inputs: { repo: string, title: string, head: string, base: string, body: string } }
-  delete_repo: { sensitive: true, inputs: { repo: string } }
-
-# Suite-level policy (G0), the demo's policy extended: issue metadata is readable in any of
-# alice's repositories, file contents only in public ones, and writes go only to public
-# repositories. delete_repo has no permit at all.
-policy: |
-  @id("github_issue_reads")
-  permit(principal, action in [Action::"github/list_issues", Action::"github/get_issue"], resource)
-  when { context.input has repo && context.input.repo like "alice/*" };
-
-  @id("github_read_public_files_only")
-  permit(principal, action == Action::"github/read_file", resource)
-  when { context.input has repo && context.input.repo like "alice/public-*" };
-
-  @id("github_write_public_repos_only")
-  permit(principal, action in
-    [Action::"github/create_issue", Action::"github/add_issue_comment",
-     Action::"github/create_pull_request"], resource)
-  when { context.input has repo && context.input.repo like "alice/public-*" };
 
 cases:
   - id: github-01

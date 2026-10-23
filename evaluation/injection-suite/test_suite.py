@@ -37,7 +37,7 @@ def test_corpus_loads_and_is_big_enough() -> None:
     assert len(cases) >= 40
     assert {s.name for s in suites} >= {"workspace", "banking", "travel", "slack", "github"}
     stages = {c.stage for case in cases for c in case.calls if c.stage}
-    assert stages == set(harness.STAGES)
+    assert stages == {"capability", "policy", "lease"}
 
 
 def test_corpus_capabilities_build() -> None:
@@ -66,7 +66,7 @@ def test_subset_matches_expectations(result: dict[str, Any]) -> None:
     calls = [c for c in result["calls"] if c["arm"] == "onbehalf"]
     wrong = [c for c in calls if not c["as_expected"]]
     assert not wrong, wrong
-    assert {c["stage"] for c in calls if c["stage"]} == set(harness.STAGES)
+    assert {c["stage"] for c in calls if c["stage"]} == {"capability", "policy", "lease"}
 
 
 @pytest.mark.integration

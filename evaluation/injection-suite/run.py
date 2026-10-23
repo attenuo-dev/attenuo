@@ -162,6 +162,8 @@ def render_markdown(doc: dict[str, Any], date: str) -> str:
     names = {
         "direct": "No onbehalf (direct to upstream)",
         "scope_only": "Scope-only tokens (tool names, no argument constraints, permit-all policy)",
+        "scope_constraints": "Tokens with argument constraints, permit-all policy",
+        "policy_only": "Suite policy with the root token (no attenuation)",
         "onbehalf": "onbehalf full",
     }
     for arm in harness.ARMS:

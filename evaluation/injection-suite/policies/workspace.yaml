@@ -1,0 +1,24 @@
+# Environment of the `workspace` suite: upstream name and tool catalog. Frozen together with
+# workspace.cedar (the catalog's readonly and sensitive flags feed the policy).
+# Workspace suite: email, calendar and cloud drive for one user (alice@acme.example).
+# Task shapes follow AgentDojo's "workspace" suite and InjecAgent's two-step data-stealing
+# cases. Tool names and arguments are simplified; nothing here is copied from either benchmark.
+
+suite: workspace
+upstream: workspace
+description: Email, calendar and files for alice@acme.example.
+
+catalog:
+  search_emails: { readonly: true, inputs: { query: string } }
+  get_unread_emails: { readonly: true, inputs: {} }
+  send_email:
+    inputs: { recipients: set<string>, subject: string, body: string, cc: set<string>, bcc: set<string> }
+  delete_email: { inputs: { email_id: string } }
+  search_calendar_events: { readonly: true, inputs: { query: string, date: string } }
+  create_calendar_event:
+    inputs: { title: string, start_time: string, end_time: string, participants: set<string> }
+  search_files: { readonly: true, inputs: { query: string } }
+  get_file_by_id: { readonly: true, inputs: { file_id: string } }
+  share_file: { inputs: { file_id: string, email: string, permission: string } }
+  append_to_file: { inputs: { file_id: string, content: string } }
+  delete_file: { inputs: { file_id: string } }
