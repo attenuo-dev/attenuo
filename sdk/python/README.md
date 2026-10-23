@@ -98,7 +98,9 @@ root = ob.exchange(id_token, "planner", ["github:*"], actor_token=svid)
 
 ```python
 coder = ob.exchange(root, "coder", ["github:read_file"], client_secret=..., may_act=["reviewer"])
-root = admin.mint_root_dev("alice", "https://idp.example", "planner", ["github:*"], may_act=["coder"])
+root = admin.mint_root_dev(
+    "alice", "https://idp.example", "planner", ["github:*"], may_act=["coder"]
+)
 ```
 
 `may_act` is a list of agent ids (a bare string is a `TypeError`); `[]` means nobody may exchange the token. For a root it must be within the `[[root_grants]]` entry's `may_act` when that has one.
@@ -114,11 +116,13 @@ coder_key = DpopKey.load("coder.jwk")  # or DpopKey.generate(); keep key.private
 with Client(url, dpop_key=coder_key) as ob:
     # The new token is bound to coder_key. The parent is bound to the planner's key, which
     # signs off on the exchange.
-    coder = ob.exchange(root, "coder", ["github:read_file"], client_secret=...,
-                        subject_dpop_key=planner_key)
+    coder = ob.exchange(
+        root, "coder", ["github:read_file"], client_secret=..., subject_dpop_key=planner_key
+    )
     ob.call_tool(coder, "github", "read_file", {"repo": "alice/docs"})  # proof attached
-root = admin.mint_root_dev("alice", "https://idp.example", "planner", ["github:*"],
-                           dpop_key=planner_key)
+root = admin.mint_root_dev(
+    "alice", "https://idp.example", "planner", ["github:*"], dpop_key=planner_key
+)
 ```
 
 With a key, every `call_tool`, `list_tools`, `renew` and `authzen_evaluate` sends `Authorization: DPoP <token>` and a fresh proof, and every `exchange` binds the new token. When the parent is bound to the client's own key, `subject_dpop_key` is not needed. `Token.dpop_jkt` is the thumbprint a token is bound to (`None` for a bearer token), and `AuditEntry.dpop_bound` says whether a decision was made with a proven bound token. A bound token without a proof is `Unauthorized` with `error == "dpop_required"`. See [Binding tokens to keys](../../docs/guides/binding-tokens-to-keys.md).
