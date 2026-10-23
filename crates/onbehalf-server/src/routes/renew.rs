@@ -38,13 +38,17 @@ pub async fn renew(
 }
 
 fn renew_sync(state: &AppState, headers: &HeaderMap) -> Result<Response, ApiError> {
-    let bearer = bearer_of(headers)?
-        .ok_or_else(|| ApiError::unauthorized("a delegation token bearer is required"))?;
+    let bearer = bearer_of(headers)?.ok_or_else(|| {
+        ApiError::unauthorized(
+            crate::error::REASON_MISSING_TOKEN,
+            "a delegation token bearer is required",
+        )
+    })?;
     let now = now();
     let verified = state
         .verifier
         .verify(bearer, now)
-        .map_err(|e| ApiError::unauthorized(e.to_string()))?;
+        .map_err(|e| ApiError::bad_token(&e))?;
     let chain = verified.chain;
     let hop = chain
         .hops

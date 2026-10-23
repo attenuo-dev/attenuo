@@ -154,6 +154,14 @@ pub async fn handle(
         }
     }
     let user = claims::originating_user(&verified)?;
+    if crate::routes::is_reserved_subject(&user.subject) {
+        // Audit records of admin actions use a subject under this prefix (SR-34).
+        return Err(ApiError::bad_request(
+            "invalid_grant",
+            "the credential's subject uses a prefix reserved for the server's own records",
+        )
+        .with_description("reserved_subject"));
+    }
 
     let grant = RootGrant::find(
         &state.root_grants,
@@ -266,10 +274,11 @@ pub async fn handle(
         })
         .await?;
     tracing::info!(
-        subject = %verified.subject,
-        idp = %verified.issuer,
+        // Caller-controlled strings are Debug-formatted (SR-18).
+        subject = ?verified.subject,
+        idp = ?verified.issuer,
         credential = kind.as_str(),
-        agent = %agent,
+        agent = ?agent,
         agent_auth,
         lease = %issued.lease.0,
         "root token issued from IdP credential"

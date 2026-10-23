@@ -16,7 +16,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use time::OffsetDateTime;
 
-use crate::error::ApiError;
+use crate::error::{ApiError, REASON_INVALID_TOKEN};
 use crate::metrics::TokenKind;
 use crate::state::AppState;
 
@@ -37,9 +37,9 @@ pub(crate) fn bearer_of(headers: &HeaderMap) -> Result<Option<&str>, ApiError> {
     let Some(raw) = headers.get(header::AUTHORIZATION) else {
         return Ok(None);
     };
-    let raw = raw
-        .to_str()
-        .map_err(|_| ApiError::unauthorized("authorization header is not ASCII"))?;
+    let raw = raw.to_str().map_err(|_| {
+        ApiError::unauthorized(REASON_INVALID_TOKEN, "authorization header is not ASCII")
+    })?;
     match raw.split_once(' ') {
         Some((scheme, token))
             if scheme.eq_ignore_ascii_case("bearer") && !token.trim().is_empty() =>
@@ -47,6 +47,7 @@ pub(crate) fn bearer_of(headers: &HeaderMap) -> Result<Option<&str>, ApiError> {
             Ok(Some(token.trim()))
         }
         _ => Err(ApiError::unauthorized(
+            REASON_INVALID_TOKEN,
             "expected `Authorization: Bearer <token>`",
         )),
     }
@@ -89,18 +90,31 @@ pub(crate) fn register_issued(
     Ok(())
 }
 
-/// `originating_subject` of audit records for actions taken with the admin bearer.
-pub const ADMIN_SUBJECT: &str = "admin";
+/// Prefix of subjects reserved for the server's own audit records. No user can have one:
+/// IdP intake and the dev root mint refuse a subject that starts with it (SR-34).
+pub const RESERVED_SUBJECT_PREFIX: &str = "urn:onbehalf:";
+/// `originating_subject` of audit records for actions taken with the admin bearer. It starts
+/// with [`RESERVED_SUBJECT_PREFIX`], so no IdP user can produce records that look like admin
+/// actions (SR-34).
+pub const ADMIN_SUBJECT: &str = "urn:onbehalf:admin";
 /// Audit `reason` of a successful admin action.
 pub const REASON_ADMIN_ACTION: &str = "admin_action";
+
+/// Is `subject` reserved for the server's own records ([`RESERVED_SUBJECT_PREFIX`])?
+pub fn is_reserved_subject(subject: &str) -> bool {
+    subject
+        .get(..RESERVED_SUBJECT_PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(RESERVED_SUBJECT_PREFIX))
+}
 
 /// Record an action taken with the admin bearer (lease revocation, policy reload, dev root
 /// mint) in the audit log (SR-15).
 ///
 /// There is no delegation chain behind an admin request, so the record names
-/// `originating_subject` = `admin`, no agents, depth 0 and the chain digest of nothing
-/// (`sha256` of JSON `null`). `leases` holds the leases the action touched, `server` is
-/// `onbehalf` and `tool` is `admin.<action>`; the arguments are stored as a digest as usual.
+/// `originating_subject` = [`ADMIN_SUBJECT`] (`urn:onbehalf:admin`), no agents, depth 0 and
+/// the chain digest of nothing (`sha256` of JSON `null`). `leases` holds the leases the action
+/// touched, `server` is `onbehalf` and `tool` is `admin.<action>`; the arguments are stored as
+/// a digest as usual.
 pub(crate) fn audit_admin(
     state: &AppState,
     tool: &str,

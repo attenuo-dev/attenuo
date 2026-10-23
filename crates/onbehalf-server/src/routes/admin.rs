@@ -46,8 +46,13 @@ pub async fn require_admin(
         Ok(Some(token)) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => {
             next.run(req).await
         }
-        _ => {
-            let mut resp = ApiError::unauthorized("admin bearer token required").into_response();
+        other => {
+            let reason = match other {
+                Ok(None) => crate::error::REASON_MISSING_TOKEN,
+                _ => crate::error::REASON_INVALID_TOKEN,
+            };
+            let mut resp =
+                ApiError::unauthorized(reason, "admin bearer token required").into_response();
             resp.headers_mut().insert(
                 header::WWW_AUTHENTICATE,
                 HeaderValue::from_static("Bearer realm=\"onbehalf-admin\""),
@@ -92,7 +97,7 @@ pub async fn revoke_lease(
         .blocking(move |state| {
             let revoked = state.leases.revoke(&lease, &reason, now)?;
             state.metrics.leases_revoked(revoked);
-            tracing::warn!(lease = %lease.0, reason = %reason, revoked, "lease revoked");
+            tracing::warn!(lease = ?lease.0, reason = ?reason, revoked, "lease revoked");
             // The revocation stands even if it cannot be recorded: undoing it would be the
             // unsafe direction. The response says whether it was audited.
             let audit_id = audit_admin(
@@ -104,7 +109,7 @@ pub async fn revoke_lease(
                 json!({ "lease": lease, "reason": reason, "revoked": revoked }),
                 now,
             )
-            .inspect_err(|e| tracing::error!(error = %e.detail, "admin revoke was not audited"))
+            .inspect_err(|e| tracing::error!(error = ?e.detail, "admin revoke was not audited"))
             .ok();
             Ok(Json(json!({
                 "lease_id": lease,
@@ -359,7 +364,7 @@ pub async fn reload_policies(State(state): State<Arc<AppState>>) -> Result<Json<
                 })
                 .await
                 .inspect_err(
-                    |e| tracing::error!(error = %e.detail, "failed reload was not audited"),
+                    |e| tracing::error!(error = ?e.detail, "failed reload was not audited"),
                 );
             return Err(ApiError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -383,7 +388,7 @@ pub async fn reload_policies(State(state): State<Arc<AppState>>) -> Result<Json<
             )
         })
         .await
-        .inspect_err(|e| tracing::error!(error = %e.detail, "policy reload was not audited"))
+        .inspect_err(|e| tracing::error!(error = ?e.detail, "policy reload was not audited"))
         .ok();
     Ok(Json(json!({
         "policy_ids": ids,
