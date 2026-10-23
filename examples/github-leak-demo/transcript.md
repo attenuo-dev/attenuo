@@ -30,7 +30,8 @@ token       eyJ0eXAiOiJvbmJlaGFsZitq...
 
 == 2. The assistant hands its 'coder' sub-agent read_file and nothing else
 # The coder authenticates as itself ([[agents]] in config.toml): only it can receive a token in its name.
-$ onbehalf token exchange --subject-token "$ROOT_TOKEN" --actor coder --client-secret demo-coder-secret --cap github:read_file
+# Its secret goes in on stdin (or ONBEHALF_CLIENT_SECRET, or --client-secret-file), never in argv.
+$ printf "%s\n" demo-coder-secret | onbehalf token exchange --subject-token "$ROOT_TOKEN" --actor coder --client-secret-stdin --cap github:read_file
 lease       67d6e0f2-c38b-4f87-a035-c472cfe453ac
 expires_in  899s
 token       eyJ0eXAiOiJvbmJlaGFsZitq...

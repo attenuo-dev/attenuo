@@ -19,8 +19,24 @@ pub struct Cli {
     pub server: String,
 
     /// Bearer token for `/admin/*` (token root, lease, audit, policy).
-    #[arg(long, env = "ONBEHALF_ADMIN_TOKEN", hide_env_values = true)]
+    ///
+    /// Prefer `ONBEHALF_ADMIN_TOKEN`, `--admin-token-stdin` or `--admin-token-file`: an argument
+    /// is visible to other local users in `ps` and ends up in shell history.
+    #[arg(
+        long,
+        env = "ONBEHALF_ADMIN_TOKEN",
+        hide_env_values = true,
+        conflicts_with_all = ["admin_token_stdin", "admin_token_file"]
+    )]
     pub admin_token: Option<String>,
+
+    /// Read the admin token from the first line of standard input.
+    #[arg(long, conflicts_with = "admin_token_file")]
+    pub admin_token_stdin: bool,
+
+    /// Read the admin token from the first line of this file.
+    #[arg(long, value_name = "PATH")]
+    pub admin_token_file: Option<std::path::PathBuf>,
 
     /// Print machine-readable JSON instead of text.
     #[arg(long, global = true)]
@@ -111,9 +127,21 @@ pub struct ExchangeArgs {
     #[arg(long)]
     pub client_id: Option<String>,
     /// The agent's client secret. Required by servers with `[token] require_actor_auth`
-    /// (the default).
-    #[arg(long, env = "ONBEHALF_CLIENT_SECRET", hide_env_values = true)]
+    /// (the default). Prefer `ONBEHALF_CLIENT_SECRET`, `--client-secret-stdin` or
+    /// `--client-secret-file`: an argument is visible to other local users in `ps`.
+    #[arg(
+        long,
+        env = "ONBEHALF_CLIENT_SECRET",
+        hide_env_values = true,
+        conflicts_with_all = ["client_secret_stdin", "client_secret_file"]
+    )]
     pub client_secret: Option<String>,
+    /// Read the client secret from the first line of standard input.
+    #[arg(long, conflicts_with = "client_secret_file")]
+    pub client_secret_stdin: bool,
+    /// Read the client secret from the first line of this file.
+    #[arg(long, value_name = "PATH")]
+    pub client_secret_file: Option<std::path::PathBuf>,
     /// Capability `server:tool`, or a full capability as a JSON object. Repeatable; plain
     /// `server:tool` values may also be comma-separated. Must be covered by the parent's capabilities.
     #[arg(long = "cap", required = true)]
@@ -428,6 +456,83 @@ mod tests {
         };
         assert_eq!(e.client_secret.as_deref(), Some("s3cret"));
         assert!(parse(&["token", "exchange", "--subject-token", "J", "--actor", "c"]).is_err());
+    }
+
+    #[test]
+    fn secrets_can_come_from_stdin_or_a_file() {
+        let cli = parse(&["--admin-token-stdin", "lease", "show", "L"]).unwrap();
+        assert!(cli.admin_token_stdin && cli.admin_token.is_none());
+        let cli = parse(&["--admin-token-file", "/run/s", "lease", "show", "L"]).unwrap();
+        assert_eq!(
+            cli.admin_token_file.as_deref(),
+            Some(std::path::Path::new("/run/s"))
+        );
+        let ex = |extra: &[&str]| {
+            let mut a = vec![
+                "token",
+                "exchange",
+                "--subject-token",
+                "J",
+                "--actor",
+                "c",
+                "--cap",
+                "g:t",
+            ];
+            a.extend_from_slice(extra);
+            parse(&a)
+        };
+        let Command::Token(TokenCmd::Exchange(e)) = ex(&["--client-secret-stdin"]).unwrap().command
+        else {
+            panic!("not exchange")
+        };
+        assert!(e.client_secret_stdin && e.client_secret.is_none());
+        let Command::Token(TokenCmd::Exchange(e)) =
+            ex(&["--client-secret-file", "/run/c"]).unwrap().command
+        else {
+            panic!("not exchange")
+        };
+        assert!(e.client_secret_file.is_some());
+    }
+
+    #[test]
+    fn secret_sources_are_mutually_exclusive() {
+        assert!(parse(&[
+            "--admin-token",
+            "t",
+            "--admin-token-stdin",
+            "lease",
+            "show",
+            "L"
+        ])
+        .is_err());
+        assert!(parse(&[
+            "--admin-token-stdin",
+            "--admin-token-file",
+            "/x",
+            "lease",
+            "show",
+            "L"
+        ])
+        .is_err());
+        let both = [
+            "token",
+            "exchange",
+            "--subject-token",
+            "J",
+            "--actor",
+            "c",
+            "--cap",
+            "g:t",
+        ];
+        for extra in [
+            ["--client-secret", "s", "--client-secret-stdin"].as_slice(),
+            ["--client-secret", "s", "--client-secret-file", "/x"].as_slice(),
+            ["--client-secret-stdin", "--client-secret-file", "/x"].as_slice(),
+        ] {
+            let mut a = both.to_vec();
+            a.extend_from_slice(extra);
+            assert!(parse(&a).is_err(), "{extra:?}");
+        }
     }
 
     #[test]
