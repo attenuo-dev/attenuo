@@ -1075,7 +1075,7 @@ impl SqliteAudit {
     /// Wrap an existing connection, creating the schema if needed.
     ///
     /// Fails for a log written with another entry hash construction than
-    /// [`ENTRY_HASH_VERSION`](crate::ENTRY_HASH_VERSION), such as one written before RFC 8785
+    /// [`ENTRY_HASH_VERSION`], such as one written before RFC 8785
     /// canonical JSON (SR-20): there is no migration, start a new file.
     pub fn from_connection(conn: Connection) -> Result<Self, AuditError> {
         check_record_fields(&conn)?;
