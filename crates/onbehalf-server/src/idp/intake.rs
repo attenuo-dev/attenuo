@@ -12,6 +12,7 @@
 //! | `actor` | optional; must equal `client_id` when given |
 //! | `authorization_details` / `scope` | requested capabilities, as for an exchange |
 //! | `requested_ttl_seconds` | optional |
+//! | `may_act` | optional RFC 8693 §4.4 `may_act` for the root token (agent ids); within the grant's |
 //!
 //! Steps, in order: authenticate the agent (`invalid_client`, 401); check `actor` and that
 //! capabilities were requested (`invalid_request`); verify the credential
@@ -78,6 +79,8 @@ struct IntakeRequest {
     authorization_details: Vec<Detail>,
     #[serde(default)]
     requested_ttl_seconds: Option<u64>,
+    #[serde(default)]
+    may_act: Option<onbehalf_token::MayAct>,
 }
 
 fn invalid_scope(description: &'static str, detail: impl Into<String>) -> ApiError {
@@ -149,6 +152,9 @@ pub async fn handle(
     let capabilities = ceiling
         .attenuate(&requested)
         .map_err(|e| invalid_scope("scope_exceeds_grant", e.to_string()))?;
+    let may_act = grant
+        .may_act_for(req.may_act.clone())
+        .map_err(|e| invalid_request("may_act_exceeds_grant", e))?;
 
     // The root token never outlives the credential it was minted from.
     let requested_ttl = req
@@ -173,12 +179,16 @@ pub async fn handle(
     // Everything from here on touches SQLite; run it on the blocking pool.
     let issued = state
         .blocking(move |state| {
-            let issued = state.issuer.issue_root(
+            let issued = state.issuer.issue_root_with(
                 user,
                 AgentId::new(agent_id.clone()),
                 capabilities,
                 ttl,
                 now,
+                &onbehalf_token::IssueOptions {
+                    may_act,
+                    not_after: None,
+                },
             )?;
             // Used once, recorded only after issuance succeeded; a refused token is never
             // registered.
@@ -296,6 +306,7 @@ mod tests {
             client_secret: secret.map(Into::into),
             authorization_details: vec![],
             requested_ttl_seconds: None,
+            may_act: None,
         }
     }
 

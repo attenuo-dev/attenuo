@@ -158,6 +158,34 @@ async def test_exchange_accepts_token_object_and_hop0(make: Any) -> None:
     assert rec.body()["subject_token_type"] == "urn:ietf:params:oauth:token-type:jwt"
 
 
+async def test_exchange_with_actor_token_and_may_act(make: Any) -> None:
+    s = Signer()
+    parent = s.mint(("planner",))
+    child = s.mint(("planner", "coder"))
+    client, rec = make(lambda r: httpx.Response(200, json=token_response(child)))
+    await call(
+        client, "exchange", parent, "coder", "github:read_file",
+        actor_token=" svid.jwt.sig\n", may_act=["reviewer", "tester"],
+    )  # fmt: skip
+    body = rec.body()
+    assert body["actor_token"] == "svid.jwt.sig"
+    assert body["actor_token_type"] == "urn:ietf:params:oauth:token-type:jwt"
+    assert body["subject_token_type"] == "urn:ietf:params:oauth:token-type:jwt"
+    assert body["may_act"] == {"sub": ["reviewer", "tester"]}
+    assert "client_id" not in body and "client_secret" not in body
+    # Both methods may be sent; the server checks both.
+    await call(
+        client, "exchange", parent, "coder", "github:read_file",
+        client_secret="cs", actor_token="a.b.c",
+    )  # fmt: skip
+    body = rec.body()
+    assert (body["client_id"], body["actor_token"]) == ("coder", "a.b.c")
+    with pytest.raises(ValueError):
+        await call(client, "exchange", parent, "coder", "github:read_file", actor_token=" ")
+    with pytest.raises(TypeError):
+        await call(client, "exchange", parent, "coder", "github:read_file", may_act="reviewer")
+
+
 async def test_exchange_errors(make: Any) -> None:
     body = {"error": "invalid_scope", "detail": "requested exceeds parent"}
     client, _ = make(lambda r: httpx.Response(400, json=body))

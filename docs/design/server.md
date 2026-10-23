@@ -124,10 +124,11 @@ sequenceDiagram
     participant I as Issuer
     participant G as AuditSink
 
-    C->>T: RFC 8693 exchange (form or JSON): subject_token, actor, authorization_details, client credentials
+    C->>T: RFC 8693 exchange (form or JSON): subject_token, actor, authorization_details, client credentials and/or actor_token
+    T->>T: verify actor_token against [[actor_trust]] (JWKS); mapped agent must equal actor
     T->>T: authenticate client against [[agents]]; client id must equal actor
-    alt no or wrong credentials / other actor
-        T-->>C: 401 invalid_client, or 400 invalid_request actor_mismatch
+    alt no or wrong credentials / bad actor_token / other actor
+        T-->>C: 401 invalid_client, or 400 invalid_request actor_mismatch / actor_token_*
     end
     T->>V: verify(subject_token)
     V-->>T: parent chain (or 400 invalid_grant)
@@ -136,13 +137,19 @@ sequenceDiagram
         T-->>C: 400 invalid_grant "subject token cannot delegate: lease_revoked"
     end
     T->>T: actor already in the parent chain? 400 invalid_request duplicate_actor
-    T->>I: ExchangeRequest::execute (attenuation, depth, expiry clamp)
-    I-->>T: child token (or 400 invalid_scope / invalid_grant)
-    T->>T: replay cache: (parent jti, actor) used before? 400 invalid_grant replayed, child dropped
+    T->>I: ExchangeRequest::execute_until (may_act, attenuation, depth, expiry clamp to parent and actor token)
+    I-->>T: child token (or 400 invalid_scope / invalid_grant / invalid_request actor_not_permitted)
+    T->>T: replay cache: actor token used before? (parent jti, actor) used before? 400 invalid_grant replayed, child dropped
     T->>L: register(child lease, parent = parent's last lease, expires_at), bind(child lease, chain digest)
     T->>G: append(allow, token_issued, onbehalf / token.exchange)
     T-->>C: {access_token, issued_token_type, token_type, expires_in, lease}
 ```
+
+### Actor authentication
+
+`[token] actor_auth` picks the accepted methods: `secret` (`[[agents]]` client credentials), `actor_token` (a JWT from an `[[actor_trust]]` issuer) or `either` (default; when both are sent, both are checked). With `require_actor_auth = true` one accepted method is mandatory.
+
+An actor token is checked in this order (module `actor`): the header `typ` must not name another kind of token (`onbehalf+jwt`, `oauth-id-jag+jwt`, `at+jwt`); the unverified `iss` and `sub` select the `[[actor_trust]]` entry (an entry with `issuer` needs that `iss`, an entry with `spiffe_trust_domain` needs `sub` in that trust domain), so unknown issuers are refused before any network call; `alg` must be allowed; the key is looked up by `kid` in the entry's JWKS (the same cache as for `[[idps]]`, reading `jwks_url` or the SPIRE bundle endpoint, never discovered); then the signature, `iss`, `aud`, `exp` (required), `nbf` and `iat`, all with the entry's clock skew; `sub` (a strictly parsed SPIFFE ID for a trust-domain entry); and `subject_to_agent` maps `sub` to the agent id that must equal `actor`. The token is used once (replay key: entry and `jti`, or the SHA-256 of the signing input) and the child's expiry is capped at its `exp`. A parent token that carries `may_act` can only be exchanged by an actor it lists.
 
 Because the child lease is registered under the parent's, revoking any lease revokes every lease delegated from it, and the child's next call fails the lease step. Even without the cascade, the child's chain lists every ancestor lease, so a revoked ancestor is caught directly.
 
@@ -220,7 +227,7 @@ sequenceDiagram
 
 ### JWKS cache
 
-One cache per IdP. The JWKS location is `jwks_url`, or `jwks_uri` from `<issuer>/.well-known/openid-configuration`, whose `issuer` must equal the configured one. A fetched set is used for `jwks_ttl_seconds` (300). A `kid` that is not in the set causes one refetch, then `unknown_kid`; a second unknown `kid` within 30 seconds does not refetch. Bodies over 256 KiB are refused, at most 32 keys are kept, and symmetric keys, encryption keys and unparseable keys are skipped. Fetches time out after 5 seconds. If a refresh fails, the old keys are dropped and the request fails with `503 temporarily_unavailable` / `jwks_unavailable`: no stale keys.
+One cache per IdP (and per `[[actor_trust]]` entry, which uses the same code with an explicit URL and no discovery; SPIFFE bundle keys with `use` = `jwt-svid` are kept). The JWKS location is `jwks_url`, or `jwks_uri` from `<issuer>/.well-known/openid-configuration`, whose `issuer` must equal the configured one. A fetched set is used for `jwks_ttl_seconds` (300). A `kid` that is not in the set causes one refetch, then `unknown_kid`; a second unknown `kid` within 30 seconds does not refetch. Bodies over 256 KiB are refused, at most 32 keys are kept, and symmetric keys, encryption keys and unparseable keys are skipped. Fetches time out after 5 seconds. If a refresh fails, the old keys are dropped and the request fails with `503 temporarily_unavailable` / `jwks_unavailable`: no stale keys.
 
 ### Error codes
 
@@ -229,8 +236,11 @@ One cache per IdP. The JWKS location is `jwks_url`, or `jwks_uri` from `<issuer>
 | `invalid_client` | 401 | `client_auth_missing`, `client_authentication_failed`, `malformed_client_auth`, `no_agents_configured` |
 | `invalid_request` | 400 | `actor_mismatch`, `duplicate_actor` (exchange), `multiple_client_auth`, `no_capabilities_requested`, `unsupported_token_type`, `malformed_request` |
 | `invalid_grant` | 400 | `malformed_token`, `typ_mismatch`, `untrusted_issuer`, `unsupported_alg`, `missing_kid`, `unknown_kid`, `bad_signature`, `audience_mismatch` (ID-JAG), `credential_audience_mismatch` (ID token not issued to the presenting agent), `expired`, `not_yet_valid`, `missing_claim`, `client_id_mismatch`, `credential_expired`, `replayed` (also for a repeated exchange) |
+| `invalid_request` | 400 | `actor_mismatch`, `duplicate_actor` (exchange), `multiple_client_auth`, `no_capabilities_requested`, `unsupported_token_type`, `malformed_request`, `may_act_exceeds_grant` |
+| `invalid_request` | 400 | Exchange actor authentication: `actor_not_permitted` (parent's `may_act`), `actor_token_required`, `actor_token_not_accepted`, `client_auth_not_accepted`, `actor_token_type_unsupported`, `actor_token_malformed`, `actor_token_typ_mismatch`, `actor_token_untrusted_issuer`, `actor_token_unsupported_alg`, `actor_token_missing_kid`, `actor_token_unknown_kid`, `actor_token_bad_signature`, `actor_token_audience_mismatch`, `actor_token_expired`, `actor_token_not_yet_valid`, `actor_token_missing_claim`, `actor_token_invalid_spiffe_id`, `actor_token_unmapped_subject` |
+| `invalid_grant` | 400 | `malformed_token`, `typ_mismatch`, `untrusted_issuer`, `unsupported_alg`, `missing_kid`, `unknown_kid`, `bad_signature`, `audience_mismatch`, `expired`, `not_yet_valid`, `missing_claim`, `client_id_mismatch`, `credential_expired`, `replayed` (also for a repeated exchange or a reused actor token) |
 | `invalid_scope` | 400 | `no_root_grant`, `scope_exceeds_grant` |
-| `temporarily_unavailable` | 503 | `jwks_unavailable`, `replay_cache_full` |
+| `temporarily_unavailable` | 503 | `jwks_unavailable` (IdP or `[[actor_trust]]` keys), `replay_cache_full` |
 
 These codes are stable; `detail` is prose and may change.
 
@@ -290,7 +300,7 @@ Non-MCP endpoints answer errors as `{"error": "<code>", "detail": "<text>"}` wit
 - The replay cache is in memory: it does not survive a restart and is not shared between replicas.
 - The user block does not record which credential it came from (`evidence`, RFC-0001 §3.1); the audit record's argument digest covers the credential type and IdP.
 - ID-JAG follows draft -04; claim mapping is isolated in `idp::claims::map_id_jag` for when the draft changes. The draft's `resource` and `scope` claims are not used.
-- The `actor` of an exchange authenticates with its `[[agents]]` client secret (`[token] require_actor_auth`, on by default); `actor_token` is not used.
+- The `actor` of an exchange authenticates with its `[[agents]]` client secret or an `actor_token` from `[[actor_trust]]` (`[token] actor_auth`). Hop 0 still uses the client secret. Hop tokens are bearer tokens: the actor token proves who asked for the child, but the child is not bound to that workload (`cnf`, RFC-0001 §9).
 - Key rotation is manual (edit the config, restart) but has an overlap: see `previous_key_paths` below.
 - SQLite calls run on tokio's blocking pool, serialised by one connection per store behind a mutex. That is correct and keeps the chain linear, but write throughput is that of a single SQLite writer; a dedicated writer thread with group commit would batch fsyncs and is not built.
 - Checkpoints are signed by the key the server holds. They detect truncation and rewrites by anyone who does not control the server process; copy them off the host for the rest.

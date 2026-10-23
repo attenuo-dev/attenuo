@@ -70,11 +70,11 @@ pub mod issuer;
 mod keys;
 pub mod verifier;
 
-pub use claims::{ActClaim, Claims, JWT_TOKEN_TYPE_URN, TOKEN_TYPE};
+pub use claims::{ActClaim, Claims, MayAct, JWT_TOKEN_TYPE_URN, TOKEN_TYPE};
 pub use detached::{verify_detached, DetachedSigner};
 pub use error::TokenError;
 pub use exchange::{
     ExchangeRequest, ExchangeResponse, AUTHORIZATION_DETAILS_TYPE, TOKEN_EXCHANGE_GRANT_TYPE,
 };
-pub use issuer::{IssuedToken, Issuer, IssuerConfig};
+pub use issuer::{IssueOptions, IssuedToken, Issuer, IssuerConfig};
 pub use verifier::{VerifiedToken, Verifier};

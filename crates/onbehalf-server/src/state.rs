@@ -10,8 +10,9 @@ use onbehalf_token::{Issuer, IssuerConfig, Verifier};
 use serde_json::Value;
 use time::{Duration, OffsetDateTime};
 
+use crate::actor::ActorTrustRegistry;
 use crate::authz::Pipeline;
-use crate::config::{AgentConfig, Config, RootGrant};
+use crate::config::{ActorAuth, AgentConfig, Config, RootGrant};
 use crate::idp::IdpRegistry;
 use crate::metrics::Metrics;
 
@@ -38,6 +39,10 @@ pub struct AppState {
     pub dev_allow_root_mint: bool,
     /// `[token] require_actor_auth`.
     pub require_actor_auth: bool,
+    /// `[token] actor_auth`.
+    pub actor_auth: ActorAuth,
+    /// Issuers of actor tokens (`[[actor_trust]]`).
+    pub actor_trust: ActorTrustRegistry,
     /// `[authzen] allow_unsigned_chain`.
     pub authzen_allow_unsigned_chain: bool,
     /// `[authzen] max_batch`.
@@ -96,16 +101,29 @@ impl AppState {
                 );
             }
         }
+        let actor_trust = ActorTrustRegistry::from_config(&config.actor_trust)?;
+        let actor_auth = config.token.actor_auth;
+        if actor_auth == ActorAuth::ActorToken && actor_trust.is_empty() {
+            anyhow::bail!(
+                "[token] actor_auth = \"actor_token\" needs at least one [[actor_trust]] entry"
+            );
+        }
+        if actor_auth == ActorAuth::Secret && !actor_trust.is_empty() {
+            tracing::warn!(
+                "[[actor_trust]] is configured but [token] actor_auth = \"secret\": actor \
+                 tokens are refused"
+            );
+        }
         if !config.token.require_actor_auth {
             tracing::warn!(
                 "[token] require_actor_auth = false: POST /token exchanges accept any `actor` \
                  without authenticating it, so agent identity in policies and audit records is \
                  only asserted"
             );
-        } else if agents.is_empty() {
+        } else if agents.is_empty() && actor_trust.is_empty() {
             tracing::warn!(
-                "[[agents]] is empty and [token] require_actor_auth = true: every token \
-                 exchange will be rejected"
+                "[[agents]] and [[actor_trust]] are empty and [token] require_actor_auth = \
+                 true: every token exchange will be rejected"
             );
         }
         if config.authzen.allow_unsigned_chain {
@@ -150,6 +168,8 @@ impl AppState {
             authzen_allow_unsigned_chain: config.authzen.allow_unsigned_chain,
             authzen_max_batch: config.authzen.max_batch,
             require_actor_auth: config.token.require_actor_auth,
+            actor_auth,
+            actor_trust,
             peps,
             public_url: config.server.public_url.clone(),
             lease_interval: lease_interval(config)?,
@@ -384,6 +404,14 @@ mod tests {
         cfg.authzen.max_batch = 0;
         let err = AppState::from_config(&cfg).err().unwrap();
         assert!(err.to_string().contains("max_batch"), "{err}");
+    }
+
+    #[test]
+    fn actor_token_only_needs_a_trusted_issuer() {
+        let mut cfg = Config::default();
+        cfg.token.actor_auth = ActorAuth::ActorToken;
+        let err = AppState::from_config(&cfg).err().unwrap();
+        assert!(err.to_string().contains("[[actor_trust]]"), "{err}");
     }
 
     /// SR-08: unsigned AuthZEN chains cannot be switched on without a PEP to authenticate.

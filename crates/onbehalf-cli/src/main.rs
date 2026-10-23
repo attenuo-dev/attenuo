@@ -116,6 +116,14 @@ async fn run(cli: Cli) -> Result<Outcome> {
             if let Some(ttl) = a.ttl_seconds {
                 body["requested_ttl_seconds"] = ttl.into();
             }
+            if let Some(token) = a.actor_token(std::io::stdin())? {
+                body["actor_token"] = token.into();
+                body["actor_token_type"] = "urn:ietf:params:oauth:token-type:jwt".into();
+            }
+            let may_act = a.may_act();
+            if !may_act.is_empty() {
+                body["may_act"] = json!({ "sub": may_act });
+            }
             let secret = secrets::resolve(
                 "client secret",
                 a.client_secret,

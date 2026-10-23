@@ -18,17 +18,32 @@
 //! | `subject_token_type` | `urn:ietf:params:oauth:token-type:jwt` |
 //! | `actor` | the sub-agent's id; the request must authenticate as this agent (below) |
 //! | `client_id`, `client_secret` | the actor's `[[agents]]` credentials; HTTP Basic also accepted |
+//! | `actor_token`, `actor_token_type` | RFC 8693 §2.1: a workload-identity JWT for the actor, type `urn:ietf:params:oauth:token-type:jwt` ([`crate::actor`]) |
 //! | `authorization_details` | RFC 9396 list with one `{"type":"onbehalf_capabilities","capabilities":[...]}`; a JSON string in form encoding |
 //! | `scope` | form only, alternative to `authorization_details`: space-separated `server:tool` |
 //! | `requested_ttl_seconds` | optional |
+//! | `may_act` | optional RFC 8693 §4.4 `may_act` for the child token: agent ids (JSON list or `{"sub": [...]}`; space-separated in form encoding) |
 //!
 //! **Actor authentication (SR-10).** With `[token] require_actor_auth = true` (the default) the
-//! caller must authenticate with client credentials from `[[agents]]` (HTTP Basic, or
-//! `client_id` / `client_secret`), and the authenticated id must equal `actor`: an agent can
-//! only receive a delegation in its own name, so `principal` in Cedar and the agent in the
-//! audit log are authenticated, not asserted. Failures are 401 `invalid_client` (sub-codes as
-//! for intake) or 400 `invalid_request` / `actor_mismatch`. An `actor` that already appears in
-//! the parent chain is 400 `invalid_request` / `duplicate_actor`.
+//! caller must authenticate as `actor`, with whichever methods `[token] actor_auth` accepts
+//! (`either` by default):
+//!
+//! - client credentials from `[[agents]]` (HTTP Basic, or `client_id` / `client_secret`); the
+//!   client id must equal `actor`. Failures are 401 `invalid_client` (sub-codes as for intake).
+//! - an `actor_token` from an `[[actor_trust]]` issuer (a SPIFFE JWT-SVID, or any JWT with a
+//!   JWKS), verified by [`crate::actor::ActorTrustRegistry::verify`]; the agent its `sub` maps
+//!   to must equal `actor`. Failures are 400 `invalid_request` with `actor_token_*` sub-codes.
+//!
+//! When both are sent, both are checked. A method `actor_auth` does not accept is refused
+//! (`actor_token_not_accepted`, `client_auth_not_accepted`); with `actor_auth = "actor_token"`
+//! and no token, `actor_token_required`. So an agent can only receive a delegation in its own
+//! name, and `principal` in Cedar and the agent in the audit log are authenticated, not
+//! asserted. A mismatch is 400 `invalid_request` / `actor_mismatch`. An `actor` that already
+//! appears in the parent chain is 400 `invalid_request` / `duplicate_actor`.
+//!
+//! An actor token is used once: a second exchange with the same token (same `jti`, or the same
+//! signed content when it has none) is 400 `invalid_grant` / `replayed`. The child token's
+//! expiry is also capped at the actor token's `exp`.
 //!
 //! Besides what `ExchangeRequest::execute` checks (signature, chain validity, attenuation,
 //! depth), the parent's leases must all be live: a revoked parent cannot delegate. A parent
@@ -49,8 +64,9 @@ use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
 
 use super::{audit_issuance, no_store, now, parse_json, register_issued};
+use crate::actor::{VerifiedActor, ACTOR_TOKEN_TYPE};
 use crate::clientauth::{self, ClientKind};
-use crate::config::{capability_set, CapSpec};
+use crate::config::{capability_set, ActorAuth, CapSpec};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -64,16 +80,72 @@ pub async fn exchange(
     if crate::idp::intake::is_intake(&value) {
         return crate::idp::intake::handle(&state, &headers, value, now).await;
     }
+    let mut value = value;
+    // The actor token is verified here, on the async side: it may need a JWKS fetch.
+    let actor = match take_actor_token(&mut value, state.actor_auth)? {
+        Some(token) => Some((state.actor_trust.verify(&token, now).await?, token)),
+        None => None,
+    };
     // Lease lookups, registration and the audit append are SQLite calls: off the async workers.
     state
-        .blocking(move |s| exchange_sync(s, &headers, value, now))
+        .blocking(move |s| exchange_sync(s, &headers, value, actor, now))
         .await
+}
+
+/// Remove `actor_token` / `actor_token_type` from the body and check them: both or neither,
+/// the type is the JWT URN, and `[token] actor_auth` accepts actor tokens.
+fn take_actor_token(value: &mut Value, mode: ActorAuth) -> Result<Option<String>, ApiError> {
+    let Some(obj) = value.as_object_mut() else {
+        return Ok(None);
+    };
+    let take = |obj: &mut Map<String, Value>, k: &str| -> Result<Option<String>, ApiError> {
+        match obj.remove(k) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s)),
+            Some(_) => Err(clientauth::invalid_request(
+                "malformed_request",
+                format!("{k} must be a string"),
+            )),
+        }
+    };
+    let token = take(obj, "actor_token")?;
+    let token_type = take(obj, "actor_token_type")?;
+    let token = match (token, token_type) {
+        (None, None) => return Ok(None),
+        (Some(_), None) => {
+            return Err(clientauth::invalid_request(
+                "malformed_request",
+                "actor_token_type is required with actor_token (RFC 8693 §2.1)",
+            ))
+        }
+        (None, Some(_)) => {
+            return Err(clientauth::invalid_request(
+                "malformed_request",
+                "actor_token_type without actor_token",
+            ))
+        }
+        (Some(t), Some(ty)) if ty == ACTOR_TOKEN_TYPE => t,
+        (Some(_), Some(ty)) => {
+            return Err(clientauth::invalid_request(
+                "actor_token_type_unsupported",
+                format!("unsupported actor_token_type `{ty}`; use `{ACTOR_TOKEN_TYPE}`"),
+            ))
+        }
+    };
+    if mode == ActorAuth::Secret {
+        return Err(clientauth::invalid_request(
+            "actor_token_not_accepted",
+            "this server authenticates actors with client credentials only ([token] actor_auth = \"secret\")",
+        ));
+    }
+    Ok(Some(token))
 }
 
 fn exchange_sync(
     state: &AppState,
     headers: &HeaderMap,
     value: Value,
+    actor: Option<(VerifiedActor, String)>,
     now: OffsetDateTime,
 ) -> Result<Response, ApiError> {
     let field = |k: &str| value.get(k).and_then(Value::as_str).map(str::to_owned);
@@ -85,7 +157,32 @@ fn exchange_sync(
     }
     let req = parse_request(value)?;
     let presented = client_secret.is_some() || clientauth::basic_credentials(headers)?.is_some();
-    if state.require_actor_auth || presented {
+    if presented && state.actor_auth == ActorAuth::ActorToken {
+        return Err(clientauth::invalid_request(
+            "client_auth_not_accepted",
+            "this server authenticates actors with an actor_token only ([token] actor_auth = \"actor_token\")",
+        ));
+    }
+    let mut actor_auth = "none";
+    if let Some((verified, _)) = &actor {
+        if verified.agent != req.actor.0 {
+            return Err(clientauth::invalid_request(
+                "actor_mismatch",
+                format!(
+                    "actor `{}` is not the agent `{}` the actor_token identifies",
+                    req.actor.0, verified.agent
+                ),
+            ));
+        }
+        actor_auth = "actor_token";
+    }
+    if presented || (state.require_actor_auth && actor.is_none()) {
+        if state.actor_auth == ActorAuth::ActorToken {
+            return Err(clientauth::invalid_request(
+                "actor_token_required",
+                format!("an actor_token (actor_token_type `{ACTOR_TOKEN_TYPE}`) is required"),
+            ));
+        }
         let agent = clientauth::authenticate(
             ClientKind::Agent,
             &state.agents,
@@ -102,6 +199,11 @@ fn exchange_sync(
                 ),
             ));
         }
+        actor_auth = if actor.is_some() {
+            "actor_token+client_secret"
+        } else {
+            "client_secret"
+        };
     }
     if req.requested.is_empty() {
         return Err(ApiError::bad_request(
@@ -133,7 +235,29 @@ fn exchange_sync(
             ),
         ));
     }
-    let resp = req.execute(&state.issuer, now)?;
+    // The child never outlives the actor token that authenticated the exchange.
+    let not_after = match &actor {
+        Some((verified, _)) => {
+            if verified.expires_at - now.unix_timestamp() < 1 {
+                return Err(clientauth::invalid_request(
+                    "actor_token_expired",
+                    "the actor_token expires now; present a fresh one",
+                ));
+            }
+            Some(
+                OffsetDateTime::from_unix_timestamp(verified.expires_at)
+                    .map_err(|e| ApiError::bad_request("invalid_request", e.to_string()))?,
+            )
+        }
+        None => None,
+    };
+    let resp = req.execute_until(&state.issuer, now, not_after)?;
+    // An actor token authenticates one exchange (see `crate::replay`), keyed by its `jti`.
+    if let Some((verified, token)) = &actor {
+        state
+            .replay
+            .use_once(&verified.replay_key(token), verified.replay_until(), now)?;
+    }
     // A parent token delegates to a given actor once (see `crate::replay`). Recorded only once
     // the exchange has succeeded, so a refused request (say `invalid_scope`) does not use up
     // the slot. If this refuses, the token just minted is dropped before its lease is
@@ -160,11 +284,16 @@ fn exchange_sync(
         now,
     )?;
 
-    let args = json!({
+    let mut args = json!({
         "actor": req.actor,
         "requested": req.requested,
         "parent_lease": parent_lease,
+        "actor_auth": actor_auth,
     });
+    if let Some((verified, _)) = &actor {
+        args["actor_subject"] = verified.subject.clone().into();
+        args["actor_trust"] = verified.trust.clone().into();
+    }
     if let Err(e) = audit_issuance(state, "token.exchange", &issued.chain, args, now) {
         // An issuance we cannot record must not be usable.
         let _ = state.leases.revoke(&resp.lease, "audit_error", now);
@@ -173,6 +302,8 @@ fn exchange_sync(
     tracing::info!(
         subject = %issued.chain.originating_user.subject,
         actor = %req.actor,
+        actor_auth,
+        actor_subject = actor.as_ref().map(|(v, _)| v.subject.as_str()),
         lease = %resp.lease.0,
         depth = issued.chain.depth(),
         "token exchanged"
@@ -245,6 +376,11 @@ fn form_to_json(body: &Bytes) -> Result<Value, ApiError> {
                 scope = Some(v);
                 continue;
             }
+            "may_act" if v.trim_start().starts_with(['[', '{']) => serde_json::from_str(&v)
+                .map_err(|e| {
+                    ApiError::bad_request("invalid_request", format!("may_act is not JSON: {e}"))
+                })?,
+            "may_act" => Value::from(v.split_whitespace().collect::<Vec<_>>()),
             _ => Value::String(v),
         };
         obj.insert(k, value);
@@ -285,6 +421,64 @@ mod tests {
         assert_eq!(req.requested.len(), 2);
         assert_eq!(req.ttl_seconds, Some(60));
         assert_eq!(req.actor.0, "coder");
+        assert_eq!(req.may_act, None);
+        for may_act in ["reviewer+tester", "%5B%22reviewer%22%2C%22tester%22%5D"] {
+            let v = form_to_json(&Bytes::from(format!(
+                "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange\
+                 &subject_token=a&subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Ajwt\
+                 &actor=coder&scope=github%3Aread_file&may_act={may_act}"
+            )))
+            .unwrap();
+            let req: ExchangeRequest = serde_json::from_value(v).unwrap();
+            assert_eq!(
+                req.may_act,
+                Some(onbehalf_token::MayAct::new(["reviewer", "tester"]))
+            );
+        }
+    }
+
+    #[test]
+    fn actor_token_fields_are_checked_and_removed() {
+        let mut v =
+            json!({"actor": "c", "actor_token": "a.b.c", "actor_token_type": ACTOR_TOKEN_TYPE});
+        assert_eq!(
+            take_actor_token(&mut v, ActorAuth::Either)
+                .unwrap()
+                .as_deref(),
+            Some("a.b.c")
+        );
+        assert_eq!(v, json!({"actor": "c"}));
+        let code = |mut v: Value, mode| take_actor_token(&mut v, mode).unwrap_err().description;
+        assert_eq!(
+            code(json!({"actor_token": "x"}), ActorAuth::Either),
+            Some("malformed_request")
+        );
+        assert_eq!(
+            code(
+                json!({"actor_token_type": ACTOR_TOKEN_TYPE}),
+                ActorAuth::Either
+            ),
+            Some("malformed_request")
+        );
+        assert_eq!(
+            code(
+                json!({"actor_token": "x", "actor_token_type": "urn:ietf:params:oauth:token-type:access_token"}),
+                ActorAuth::Either
+            ),
+            Some("actor_token_type_unsupported")
+        );
+        assert_eq!(
+            code(
+                json!({"actor_token": "x", "actor_token_type": ACTOR_TOKEN_TYPE}),
+                ActorAuth::Secret
+            ),
+            Some("actor_token_not_accepted")
+        );
+        let mut none = json!({"actor": "c"});
+        assert_eq!(
+            take_actor_token(&mut none, ActorAuth::Secret).unwrap(),
+            None
+        );
     }
 
     #[test]

@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use onbehalf_core::{Capability, CapabilitySet};
 use onbehalf_policy::{ToolAttrs, ToolCatalog, UnknownTools};
 use onbehalf_proxy::UpstreamConfig;
+use onbehalf_token::MayAct;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -79,6 +80,10 @@ pub struct Config {
     /// `[authzen] allow_unsigned_chain = true`. Same shape as `[[agents]]`.
     #[serde(default)]
     pub peps: Vec<PepConfig>,
+    /// Workload-identity issuers whose JWTs are accepted as RFC 8693 `actor_token` on an
+    /// exchange (hop n to n+1). See [`ActorTrustConfig`].
+    #[serde(default)]
+    pub actor_trust: Vec<ActorTrustConfig>,
 }
 
 /// `[authzen]`
@@ -125,12 +130,121 @@ pub struct TokenSection {
     /// that are presented are still checked.
     #[serde(default = "default_true")]
     pub require_actor_auth: bool,
+    /// How the actor of an exchange may authenticate: `"secret"` (`[[agents]]` client
+    /// credentials only), `"actor_token"` (a JWT from an `[[actor_trust]]` issuer only) or
+    /// `"either"` (default). With `require_actor_auth = true` one accepted method is mandatory.
+    #[serde(default)]
+    pub actor_auth: ActorAuth,
 }
 
 impl Default for TokenSection {
     fn default() -> Self {
         Self {
             require_actor_auth: true,
+            actor_auth: ActorAuth::default(),
+        }
+    }
+}
+
+/// `[token] actor_auth`: which credentials authenticate the actor of an exchange.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorAuth {
+    /// `[[agents]]` client credentials (HTTP Basic or `client_id` / `client_secret`) only. An
+    /// `actor_token` is refused.
+    Secret,
+    /// An `actor_token` verified against `[[actor_trust]]` only. Client credentials are refused.
+    ActorToken,
+    /// Either; when both are sent, both are checked.
+    #[default]
+    Either,
+}
+
+/// One `[[actor_trust]]` entry: an issuer of workload identities (a SPIFFE trust domain, or any
+/// JWT issuer with a JWKS) whose tokens authenticate the actor of an exchange.
+///
+/// Exactly one key source: `jwks_url` (with `issuer`), or `spiffe_trust_domain` with
+/// `spiffe_bundle_url` (the SPIRE server's bundle endpoint, which serves a JWKS; never
+/// discovered). A verified token's `sub` is turned into an onbehalf agent id by
+/// `subject_to_agent`, and that id must equal the exchange's `actor`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActorTrustConfig {
+    /// Exact `iss` the tokens must carry. Required with `jwks_url`. Optional for a SPIFFE trust
+    /// domain (JWT-SVIDs often have no `iss`); when set, it is required and checked.
+    #[serde(default)]
+    pub issuer: Option<String>,
+    /// JWKS location of a generic JWT issuer.
+    #[serde(default)]
+    pub jwks_url: Option<String>,
+    /// SPIFFE trust domain (`example.org`): `sub` must be a SPIFFE ID in it.
+    #[serde(default)]
+    pub spiffe_trust_domain: Option<String>,
+    /// The trust domain's bundle endpoint (SPIRE `federation.bundle_endpoint`), serving the
+    /// JWT-SVID signing keys as a JWKS. Required with `spiffe_trust_domain`.
+    #[serde(default)]
+    pub spiffe_bundle_url: Option<String>,
+    /// `aud` the token must carry (string, or an array containing it). Pick a value that no
+    /// other relying party uses, such as onbehalf's own URL.
+    pub audience: String,
+    /// How `sub` becomes an agent id. Default `"sub"`.
+    #[serde(default)]
+    pub subject_to_agent: SubjectToAgent,
+    /// JWS algorithms accepted. Only asymmetric algorithms are allowed.
+    #[serde(default = "default_idp_algs")]
+    pub allowed_algs: Vec<String>,
+    /// How long a fetched JWKS is used before it is fetched again. Default 300.
+    #[serde(default = "default_jwks_ttl")]
+    pub jwks_ttl_seconds: u64,
+    /// Allowed clock skew for `exp`, `nbf` and `iat`. Default 60.
+    #[serde(default = "default_clock_skew")]
+    pub clock_skew_seconds: u64,
+}
+
+/// `[[actor_trust]] subject_to_agent`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "SubjectToAgentWire", into = "SubjectToAgentWire")]
+pub enum SubjectToAgent {
+    /// The agent id is `sub` itself (for SPIFFE, the whole `spiffe://...` ID).
+    #[default]
+    Sub,
+    /// The agent id is the SPIFFE ID's path without the leading `/`
+    /// (`spiffe://example.org/agents/coder` is `agents/coder`). Needs `spiffe_trust_domain`.
+    SpiffePath,
+    /// An explicit table from `sub` to agent id. A `sub` missing from it is refused.
+    Map(BTreeMap<String, String>),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum SubjectToAgentWire {
+    Mode(String),
+    Map(BTreeMap<String, String>),
+}
+
+impl TryFrom<SubjectToAgentWire> for SubjectToAgent {
+    type Error = String;
+
+    fn try_from(w: SubjectToAgentWire) -> Result<Self, String> {
+        match w {
+            SubjectToAgentWire::Mode(m) => match m.as_str() {
+                "sub" => Ok(SubjectToAgent::Sub),
+                "spiffe_path" => Ok(SubjectToAgent::SpiffePath),
+                other => Err(format!(
+                    "subject_to_agent must be \"sub\", \"spiffe_path\" or a table, not `{other}`"
+                )),
+            },
+            SubjectToAgentWire::Map(m) => Ok(SubjectToAgent::Map(m)),
+        }
+    }
+}
+
+impl From<SubjectToAgent> for SubjectToAgentWire {
+    fn from(s: SubjectToAgent) -> Self {
+        match s {
+            SubjectToAgent::Sub => SubjectToAgentWire::Mode("sub".into()),
+            SubjectToAgent::SpiffePath => SubjectToAgentWire::Mode("spiffe_path".into()),
+            SubjectToAgent::Map(m) => SubjectToAgentWire::Map(m),
         }
     }
 }
@@ -523,6 +637,11 @@ pub struct RootGrant {
     pub capabilities: Vec<CapSpec>,
     #[serde(default)]
     pub attributes: BTreeMap<String, Value>,
+    /// RFC 8693 §4.4 `may_act` of root tokens minted under this grant: the agents allowed to
+    /// exchange them. A request may narrow it (its own `may_act` must be a subset), never widen
+    /// it. When absent, the request's `may_act` (if any) is used as is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub may_act: Option<Vec<String>>,
 }
 
 impl RootGrant {
@@ -547,6 +666,29 @@ impl RootGrant {
             return Some(first);
         }
         matching.find(|g| g.subject.is_some()).or(Some(first))
+    }
+
+    /// The `may_act` of a root token minted under this grant, given the request's: the
+    /// request's when it is within the grant's, the grant's when the request has none.
+    pub fn may_act_for(&self, requested: Option<MayAct>) -> Result<Option<MayAct>, String> {
+        resolve_may_act(self.may_act.as_deref(), requested)
+    }
+}
+
+/// `may_act` for a root token: `requested` must be within `ceiling` when both are set.
+pub fn resolve_may_act(
+    ceiling: Option<&[String]>,
+    requested: Option<MayAct>,
+) -> Result<Option<MayAct>, String> {
+    let ceiling = ceiling.map(|c| MayAct::new(c.iter().cloned()));
+    match (ceiling, requested) {
+        (None, r) => Ok(r),
+        (Some(c), None) => Ok(Some(c)),
+        (Some(c), Some(r)) if r.is_within(&c) => Ok(Some(r)),
+        (Some(c), Some(r)) => Err(format!(
+            "may_act {:?} is not within the [[root_grants]] may_act {:?}",
+            r.sub, c.sub
+        )),
     }
 }
 
@@ -730,6 +872,11 @@ mod tests {
         assert_eq!(cfg.idps[0].allowed_algs, DEFAULT_IDP_ALGS);
         assert_eq!(cfg.agents.len(), 2);
         assert!(cfg.token.require_actor_auth);
+        assert_eq!(cfg.token.actor_auth, ActorAuth::Either);
+        assert!(
+            cfg.actor_trust.is_empty(),
+            "the [[actor_trust]] examples are commented out"
+        );
         assert!(!cfg.dev.allow_root_mint);
     }
 
@@ -770,6 +917,47 @@ mod tests {
             "unsigned AuthZEN chains are off by default"
         );
         assert!(cfg.token.require_actor_auth, "actor auth is on by default");
+        assert_eq!(cfg.token.actor_auth, ActorAuth::Either);
+        assert!(cfg.actor_trust.is_empty());
+    }
+
+    #[test]
+    fn actor_trust_and_actor_auth_parse() {
+        let cfg = Config::from_toml(
+            r#"
+            [token]
+            actor_auth = "actor_token"
+
+            [[actor_trust]]
+            spiffe_trust_domain = "example.org"
+            spiffe_bundle_url = "https://spire.example.org:8443"
+            audience = "https://onbehalf.example.com"
+            subject_to_agent = "spiffe_path"
+
+            [[actor_trust]]
+            issuer = "https://wl.example.com"
+            jwks_url = "https://wl.example.com/jwks"
+            audience = "onbehalf"
+            subject_to_agent = { "wl:coder" = "coder" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.token.actor_auth, ActorAuth::ActorToken);
+        assert_eq!(cfg.actor_trust.len(), 2);
+        assert_eq!(
+            cfg.actor_trust[0].subject_to_agent,
+            SubjectToAgent::SpiffePath
+        );
+        assert_eq!(cfg.actor_trust[0].allowed_algs, DEFAULT_IDP_ALGS);
+        assert_eq!(
+            cfg.actor_trust[1].subject_to_agent,
+            SubjectToAgent::Map(BTreeMap::from([("wl:coder".into(), "coder".into())]))
+        );
+        assert!(Config::from_toml(
+            "[[actor_trust]]\naudience = \"a\"\nsubject_to_agent = \"path\"\n"
+        )
+        .is_err());
+        assert!(Config::from_toml("[token]\nactor_auth = \"mtls\"\n").is_err());
     }
 
     #[test]
@@ -780,6 +968,7 @@ mod tests {
             agent: "planner".into(),
             capabilities: vec![CapSpec::Short(cap.into())],
             attributes: BTreeMap::new(),
+            may_act: None,
         };
         let grants = vec![
             grant(None, "github:read_*"),
@@ -790,6 +979,31 @@ mod tests {
         assert_eq!(pick("bob").unwrap().subject, None);
         assert!(RootGrant::find(&grants, "other", "planner", "alice").is_none());
         assert!(RootGrant::find(&grants, "idp", "coder", "alice").is_none());
+    }
+
+    #[test]
+    fn root_grant_may_act_is_a_ceiling() {
+        let m = |v: &[&str]| MayAct::new(v.iter().copied());
+        let ceiling = vec!["coder".to_string(), "reviewer".to_string()];
+        assert_eq!(resolve_may_act(None, None).unwrap(), None);
+        assert_eq!(
+            resolve_may_act(None, Some(m(&["x"]))).unwrap(),
+            Some(m(&["x"]))
+        );
+        assert_eq!(
+            resolve_may_act(Some(&ceiling), None).unwrap(),
+            Some(m(&["coder", "reviewer"]))
+        );
+        assert_eq!(
+            resolve_may_act(Some(&ceiling), Some(m(&["coder"]))).unwrap(),
+            Some(m(&["coder"]))
+        );
+        assert!(resolve_may_act(Some(&ceiling), Some(m(&["coder", "sneaky"]))).is_err());
+        let g: RootGrant = toml::from_str(
+            "issuer = \"i\"\nagent = \"a\"\ncapabilities = [\"*:*\"]\nmay_act = [\"coder\"]\n",
+        )
+        .unwrap();
+        assert_eq!(g.may_act_for(None).unwrap(), Some(m(&["coder"])));
     }
 
     #[test]

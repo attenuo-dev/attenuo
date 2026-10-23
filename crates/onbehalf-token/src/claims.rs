@@ -77,6 +77,90 @@ pub struct Claims {
     /// same key; the separate field keeps the user block independently verifiable when that
     /// changes.
     pub ou_sig: String,
+    /// RFC 8693 §4.4 `may_act`: the agents allowed to act on this token in the next exchange.
+    ///
+    /// When present, [`crate::Issuer::exchange`] refuses an `actor` that is not listed
+    /// ([`crate::TokenError::ActorNotPermitted`]). Absent means any actor may exchange it, subject
+    /// to the server's actor authentication. It is not inherited: a child carries only the
+    /// `may_act` its own exchange asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub may_act: Option<MayAct>,
+}
+
+/// The RFC 8693 §4.4 `may_act` claim, restricted to agent ids.
+///
+/// Serialized as `{"sub": ["agent:a", "agent:b"]}`. A single `{"sub": "agent:a"}` (the RFC's
+/// own example shape), a bare list, or a bare string are accepted on input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MayAct {
+    /// Agent ids that may act. An empty list means nobody may exchange the token.
+    pub sub: Vec<String>,
+}
+
+impl MayAct {
+    /// Build from agent ids, dropping duplicates while keeping order.
+    pub fn new<I, S>(agents: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut sub: Vec<String> = Vec::new();
+        for a in agents {
+            let a = a.into();
+            if !sub.contains(&a) {
+                sub.push(a);
+            }
+        }
+        Self { sub }
+    }
+
+    /// Is `agent` allowed to act?
+    pub fn permits(&self, agent: &str) -> bool {
+        self.sub.iter().any(|s| s == agent)
+    }
+
+    /// Is every agent of `self` also in `ceiling`?
+    pub fn is_within(&self, ceiling: &MayAct) -> bool {
+        self.sub.iter().all(|s| ceiling.permits(s))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl From<OneOrMany> for Vec<String> {
+    fn from(v: OneOrMany) -> Self {
+        match v {
+            OneOrMany::One(s) => vec![s],
+            OneOrMany::Many(v) => v,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum MayActWire {
+    Object { sub: OneOrMany },
+    Bare(OneOrMany),
+}
+
+impl<'de> Deserialize<'de> for MayAct {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let agents: Vec<String> = match MayActWire::deserialize(d)? {
+            MayActWire::Object { sub } => sub.into(),
+            MayActWire::Bare(v) => v.into(),
+        };
+        if agents.iter().any(String::is_empty) {
+            return Err(serde::de::Error::custom(
+                "may_act: agent ids must not be empty",
+            ));
+        }
+        Ok(MayAct::new(agents))
+    }
 }
 
 /// Canonical byte encoding of the originating-user block that `ou_sig` signs.
@@ -85,4 +169,32 @@ pub struct Claims {
 /// are `BTreeMap`-backed, so re-serializing a decoded block yields the same bytes.
 pub fn canonical_user_bytes(user: &OriginatingUser) -> Vec<u8> {
     serde_json::to_vec(user).expect("OriginatingUser serializes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn may_act_accepts_the_rfc_shapes_and_serializes_as_a_list() {
+        for v in [
+            json!({"sub": "coder"}),
+            json!({"sub": ["coder"]}),
+            json!(["coder", "coder"]),
+            json!("coder"),
+        ] {
+            let m: MayAct = serde_json::from_value(v.clone()).unwrap();
+            assert_eq!(m, MayAct::new(["coder"]), "{v}");
+        }
+        let m = MayAct::new(["a", "b"]);
+        assert_eq!(
+            serde_json::to_value(&m).unwrap(),
+            json!({"sub": ["a", "b"]})
+        );
+        assert!(m.permits("a") && !m.permits("c"));
+        assert!(MayAct::new(["a"]).is_within(&m) && !m.is_within(&MayAct::new(["a"])));
+        assert!(serde_json::from_value::<MayAct>(json!({"sub": [""]})).is_err());
+        assert!(serde_json::from_value::<MayAct>(json!({"sub": 3})).is_err());
+    }
 }

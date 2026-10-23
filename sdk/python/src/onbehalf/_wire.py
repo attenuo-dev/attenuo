@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -149,7 +150,11 @@ def exchange_body(
     client_id: str | None,
     client_secret: str | None,
     subject_token_type: str | None,
+    actor_token: str | None = None,
+    may_act: Iterable[str] | None = None,
 ) -> dict[str, Any]:
+    if actor_token is not None and not actor_token.strip():
+        raise ValueError("actor_token is empty")
     if client_id is not None and not client_secret:
         raise ValueError("client_id and client_secret go together")
     if client_secret and client_id is None:
@@ -179,6 +184,14 @@ def exchange_body(
     if client_secret:
         body["client_id"] = client_id
         body["client_secret"] = client_secret
+    if actor_token is not None:
+        # RFC 8693 §2.1: a workload-identity JWT (e.g. a SPIFFE JWT-SVID) for the actor.
+        body["actor_token"] = actor_token.strip()
+        body["actor_token_type"] = TYPE_JWT
+    if may_act is not None:
+        if isinstance(may_act, str):
+            raise TypeError("may_act is a list of agent ids, not a string")
+        body["may_act"] = {"sub": list(may_act)}
     return body
 
 

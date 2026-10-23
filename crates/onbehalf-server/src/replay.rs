@@ -8,6 +8,9 @@
 //!   parent's `jti` and the actor, and the entry lives until the parent's `exp`. A parent can
 //!   still delegate to any number of different agents; re-delegating to the same agent needs a
 //!   new parent token. Renewal (`POST /token/renew`) is the way to keep a child alive.
+//! - **Actor token.** An `actor_token` authenticates one exchange. The key is the
+//!   `[[actor_trust]]` entry and the token's `jti`, or the SHA-256 of its signing input when it
+//!   has none; the entry lives until its `exp` plus the entry's clock skew.
 //!
 //! A replay is `400 invalid_grant` with `error_description` `replayed`. The cache is in
 //! memory, so it is per process and empty after a restart, and it is bounded: expired entries

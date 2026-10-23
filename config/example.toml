@@ -113,10 +113,29 @@ id = "coder"
 secret_sha256 = "c0a83cbb212848e0615711bb006be7edb88db29def8c4dae01c7465c6f64e99e"   # "coder-secret-change-me"
 
 [token]
-# Require the caller of an exchange to authenticate as its `actor` ([[agents]] credentials,
-# HTTP Basic or client_id/client_secret). Setting this to false makes `actor` an unverified
-# assertion again; the server warns at startup.
+# Require the caller of an exchange to authenticate as its `actor`. Setting this to false makes
+# `actor` an unverified assertion again; the server warns at startup.
 require_actor_auth = true
+# Which credentials authenticate the actor: "secret" ([[agents]] credentials, HTTP Basic or
+# client_id/client_secret), "actor_token" (an RFC 8693 actor_token from an [[actor_trust]]
+# issuer, e.g. a SPIFFE JWT-SVID) or "either". When both are sent, both are checked.
+actor_auth = "either"
+
+# Workload identities accepted as `actor_token` on an exchange. Each actor token works for one
+# exchange, and the child token never outlives it. A SPIFFE trust domain, keys from the SPIRE
+# server's bundle endpoint (given explicitly, never discovered):
+# [[actor_trust]]
+# spiffe_trust_domain = "example.org"
+# spiffe_bundle_url = "https://spire-server.example.org:8443"
+# audience = "http://127.0.0.1:8080"          # what the agent asks SPIRE to put in `aud`
+# subject_to_agent = { "spiffe://example.org/ns/agents/sa/coder" = "coder" }   # or "sub", "spiffe_path"
+#
+# Any other JWT issuer with a JWKS:
+# [[actor_trust]]
+# issuer = "https://workload-issuer.example"
+# jwks_url = "https://workload-issuer.example/jwks"
+# audience = "http://127.0.0.1:8080"
+# subject_to_agent = "sub"
 
 # The most a root token may carry: for users of `issuer`, held by `agent`. Add `subject = "..."`
 # to pin an entry to one user (a pinned entry wins over an unpinned one). The capabilities
@@ -127,6 +146,8 @@ agent = "planner"
 capabilities = ["github:*"]
 # Only the dev root mint copies `attributes`; IdP intake takes attributes from the verified token.
 attributes = { mfa = false }
+# Optional RFC 8693 may_act: only these agents may exchange root tokens minted under this grant.
+# may_act = ["coder"]
 
 [authzen]
 # POST /access/v1/evaluation requires `Authorization: Bearer <onbehalf token>` by default.

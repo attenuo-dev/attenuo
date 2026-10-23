@@ -66,7 +66,15 @@ RFC 8693 exchange: delegate a subset of a token's capabilities to a sub-agent.
 | `--client-id` | Client id to authenticate with. Defaults to `--actor`. |
 | `--cap` | Capability to hand over. Required, repeatable. Must be covered by the parent. |
 | `--ttl-seconds` | Requested lifetime, clamped to the parent's expiry. |
+| `--actor-token <JWT\|->` | Authenticate `--actor` with an RFC 8693 actor token, such as a SPIFFE JWT-SVID from an `[[actor_trust]]` issuer, instead of a client secret. `-` reads it from stdin. Each token works for one exchange. |
+| `--actor-token-file <PATH>` | Read the actor token from a file, for example the JWT-SVID a SPIFFE helper writes. Cannot be combined with `--actor-token`. |
+| `--may-act <AGENT>` | Only this agent may exchange the new token (RFC 8693 `may_act`). Repeatable, or comma-separated. |
 | `--print token\|lease` | Print only that value. |
+
+```sh
+onbehalf token exchange --subject-token "$PARENT" --actor coder \
+  --cap github:read_file --actor-token-file /run/spiffe/coder.jwt --may-act reviewer
+```
 
 ### `token inspect <JWT>`
 

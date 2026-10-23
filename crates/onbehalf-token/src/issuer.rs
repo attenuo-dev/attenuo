@@ -6,7 +6,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use onbehalf_core::{AgentId, CapabilitySet, DelegationChain, LeaseId, OriginatingUser};
 use time::{Duration, OffsetDateTime};
 
-use crate::claims::{canonical_user_bytes, ActClaim, Claims, TOKEN_TYPE};
+use crate::claims::{canonical_user_bytes, ActClaim, Claims, MayAct, TOKEN_TYPE};
 use crate::detached::DetachedSigner;
 use crate::error::TokenError;
 use crate::keys::{PublicKey, SigningKey};
@@ -23,6 +23,41 @@ pub struct IssuerConfig {
     pub max_depth: usize,
     /// Lifetime used when a caller does not request one.
     pub default_ttl: Duration,
+}
+
+/// Optional parts of a root issuance or an exchange.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IssueOptions {
+    /// `may_act` for the new token (RFC 8693 §4.4): who may exchange it next.
+    pub may_act: Option<MayAct>,
+    /// An upper bound on the new token's expiry besides the requested TTL and (for an
+    /// exchange) the parent's expiry; for example the `exp` of the actor token that
+    /// authenticated the exchange. At or before `now` fails with [`TokenError::NoLifetimeLeft`].
+    pub not_after: Option<OffsetDateTime>,
+}
+
+impl IssueOptions {
+    /// The TTL to use: `ttl` (or `default`), capped at `not_after - now`.
+    fn ttl(
+        &self,
+        ttl: Option<Duration>,
+        default: Duration,
+        now: OffsetDateTime,
+    ) -> Result<Duration, TokenError> {
+        let ttl = ttl.unwrap_or(default);
+        match self.not_after {
+            None => Ok(ttl),
+            Some(limit) => {
+                let left = limit - now;
+                if left < Duration::seconds(1) {
+                    return Err(TokenError::NoLifetimeLeft(format!(
+                        "capped at {limit}, which is not after now"
+                    )));
+                }
+                Ok(ttl.min(left))
+            }
+        }
+    }
 }
 
 /// A minted token together with the data it carries.
@@ -166,19 +201,39 @@ impl Issuer {
         ttl: Option<Duration>,
         now: OffsetDateTime,
     ) -> Result<IssuedToken, TokenError> {
+        self.issue_root_with(
+            user,
+            agent,
+            capabilities,
+            ttl,
+            now,
+            &IssueOptions::default(),
+        )
+    }
+
+    /// [`Issuer::issue_root`] with [`IssueOptions`] (`may_act`, an expiry cap).
+    pub fn issue_root_with(
+        &self,
+        user: OriginatingUser,
+        agent: AgentId,
+        capabilities: CapabilitySet,
+        ttl: Option<Duration>,
+        now: OffsetDateTime,
+        options: &IssueOptions,
+    ) -> Result<IssuedToken, TokenError> {
         let lease = new_lease();
         let chain = DelegationChain::root(
             user,
             agent,
             capabilities,
             now,
-            ttl.unwrap_or(self.config.default_ttl),
+            options.ttl(ttl, self.config.default_ttl, now)?,
             lease.clone(),
         )?;
         let ou_sig = self
             .key
             .sign_detached(&canonical_user_bytes(&chain.originating_user));
-        self.mint(chain, ou_sig, lease, now)
+        self.mint(chain, ou_sig, lease, options.may_act.clone(), now)
     }
 
     /// RFC 8693 token exchange: verify `parent_token`, then mint a child token for `actor` whose
@@ -186,8 +241,9 @@ impl Issuer {
     /// the earlier of `now + ttl` and the parent's expiry.
     ///
     /// Fails with [`TokenError::Chain`] when `requested` widens the parent's capabilities or the
-    /// chain would exceed `max_depth`, and with the verification error if the parent token is
-    /// not valid at `now`.
+    /// chain would exceed `max_depth`, with [`TokenError::ActorNotPermitted`] when the parent
+    /// carries `may_act` and `actor` is not listed, and with the verification error if the
+    /// parent token is not valid at `now`.
     pub fn exchange(
         &self,
         parent_token: &str,
@@ -196,17 +252,49 @@ impl Issuer {
         ttl: Option<Duration>,
         now: OffsetDateTime,
     ) -> Result<IssuedToken, TokenError> {
+        self.exchange_with(
+            parent_token,
+            actor,
+            requested,
+            ttl,
+            now,
+            &IssueOptions::default(),
+        )
+    }
+
+    /// [`Issuer::exchange`] with [`IssueOptions`]: `may_act` for the child, and an expiry cap
+    /// applied on top of the parent's expiry.
+    pub fn exchange_with(
+        &self,
+        parent_token: &str,
+        actor: AgentId,
+        requested: CapabilitySet,
+        ttl: Option<Duration>,
+        now: OffsetDateTime,
+        options: &IssueOptions,
+    ) -> Result<IssuedToken, TokenError> {
         let parent = self.verifier().verify(parent_token, now)?;
+        if let Some(may_act) = &parent.claims.may_act {
+            if !may_act.permits(&actor.0) {
+                return Err(TokenError::ActorNotPermitted(actor.0));
+            }
+        }
         let lease = new_lease();
         let chain = parent.chain.extend(
             actor,
             requested,
             now,
-            ttl.unwrap_or(self.config.default_ttl),
+            options.ttl(ttl, self.config.default_ttl, now)?,
             lease.clone(),
             self.config.max_depth,
         )?;
-        self.mint(chain, parent.claims.ou_sig, lease, now)
+        self.mint(
+            chain,
+            parent.claims.ou_sig,
+            lease,
+            options.may_act.clone(),
+            now,
+        )
     }
 
     fn mint(
@@ -214,6 +302,7 @@ impl Issuer {
         chain: DelegationChain,
         ou_sig: String,
         lease: LeaseId,
+        may_act: Option<MayAct>,
         now: OffsetDateTime,
     ) -> Result<IssuedToken, TokenError> {
         let expires_at = chain
@@ -234,6 +323,7 @@ impl Issuer {
             chain: chain.clone(),
             typ: TOKEN_TYPE.to_owned(),
             ou_sig,
+            may_act,
         };
         let mut header = Header::new(Algorithm::EdDSA);
         header.typ = Some(TOKEN_TYPE.to_owned());

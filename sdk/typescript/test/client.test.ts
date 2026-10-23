@@ -114,6 +114,28 @@ describe("exchange", () => {
     });
   });
 
+  it("sends an actor token and may_act", async () => {
+    const { fetch, calls } = mockFetch(() => jsonResponse(tokenResponse(coderJwt)));
+    const ob = new OnbehalfClient(URL_, { fetch });
+    await ob.exchange(rootJwt, "coder", "github:read_file", {
+      actorToken: " svid.jwt.sig\n",
+      mayAct: ["reviewer", "tester"],
+    });
+    const body = calls[0]!.body as Record<string, unknown>;
+    expect(body).toMatchObject({
+      subject_token_type: "urn:ietf:params:oauth:token-type:jwt",
+      actor: "coder",
+      actor_token: "svid.jwt.sig",
+      actor_token_type: "urn:ietf:params:oauth:token-type:jwt",
+      may_act: { sub: ["reviewer", "tester"] },
+    });
+    expect(body).not.toHaveProperty("client_id");
+    expect(body).not.toHaveProperty("client_secret");
+    await expect(
+      ob.exchange(rootJwt, "coder", "github:read_file", { actorToken: " " }),
+    ).rejects.toThrow(TypeError);
+  });
+
   it("requires clientId and clientSecret together", async () => {
     const ob = new OnbehalfClient(URL_, { fetch: mockFetch(() => jsonResponse({})).fetch });
     await expect(ob.exchange("t", "a", "g:t", { clientId: "c" })).rejects.toThrow(TypeError);

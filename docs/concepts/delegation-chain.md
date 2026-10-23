@@ -37,7 +37,7 @@ When a root token is issued, onbehalf signs the originating user block. The sign
 
 ## Limits today
 
-- The agent name in an exchange is asserted by the caller. There is no verified `actor_token` yet.
+- The agent name in an exchange is authenticated with the agent's client secret or an `actor_token` (a workload identity such as a SPIFFE JWT-SVID), unless an operator turns `[token] require_actor_auth` off. A parent can restrict who may exchange it with `may_act`. Hop tokens are still bearer tokens: nothing binds a child to the workload that received it.
 - The user block does not record which credential it came from. The RFC calls this `evidence` and lists it as proposed.
 - There is no stable `chain_id` yet. A run is identified by its leases.
 

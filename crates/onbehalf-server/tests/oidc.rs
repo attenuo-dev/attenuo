@@ -249,6 +249,7 @@ impl Harness {
             agent: "planner".into(),
             capabilities: vec![CapSpec::Short("github:*".into())],
             attributes: BTreeMap::new(),
+            may_act: None,
         }];
         tweak(&mut cfg);
 
@@ -590,6 +591,7 @@ async fn capabilities_are_capped_by_root_grants() {
                 CapSpec::Short("slack:post_message".into()),
             ],
             attributes: BTreeMap::new(),
+            may_act: None,
         });
     })
     .await;

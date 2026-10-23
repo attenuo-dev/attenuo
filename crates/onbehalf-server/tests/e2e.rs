@@ -1519,6 +1519,147 @@ async fn exchanging_the_same_parent_for_the_same_actor_twice_is_refused() {
         .await;
 }
 
+/// Exchange with an extra `may_act` for the child, authenticating as `actor`.
+async fn exchange_with_may_act(
+    h: &Harness,
+    parent: &str,
+    actor: &str,
+    may_act: Value,
+) -> reqwest::Response {
+    h.client
+        .post(h.url("/token"))
+        .json(&json!({
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "subject_token": parent,
+            "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+            "actor": actor,
+            "authorization_details": [{"type": "onbehalf_capabilities",
+                "capabilities": [{"server": "github", "tool": "read_file"}]}],
+            "client_id": actor,
+            "client_secret": agent_secret(actor),
+            "may_act": may_act,
+        }))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn error_description(resp: reqwest::Response) -> (StatusCode, String) {
+    let status = resp.status();
+    let v: Value = resp.json().await.unwrap();
+    (
+        status,
+        v["error_description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned(),
+    )
+}
+
+/// RFC 8693 §4.4: `may_act` on the parent lists who may exchange it.
+#[tokio::test]
+async fn may_act_on_the_parent_limits_who_may_exchange_it() {
+    let h = Harness::start().await;
+    let resp = h
+        .admin_post(
+            "/admin/root-token",
+            json!({"subject": "alice", "issuer": "https://idp.example", "agent": "planner",
+                   "capabilities": ["github:*"], "may_act": ["coder"]}),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let root: Value = resp.json().await.unwrap();
+    let root = root["access_token"].as_str().unwrap();
+    let claims = h
+        .state
+        .verifier
+        .verify(root, time::OffsetDateTime::now_utc())
+        .unwrap()
+        .claims;
+    assert_eq!(claims.may_act.unwrap().sub, ["coder"]);
+
+    // Unlisted (and properly authenticated) actor: refused.
+    let resp = h
+        .exchange_raw(root, "reviewer", &["github:read_file"])
+        .await;
+    assert_eq!(
+        error_description(resp).await,
+        (StatusCode::BAD_REQUEST, "actor_not_permitted".into())
+    );
+    // Listed actor: fine. It sets the child's own may_act.
+    let resp = exchange_with_may_act(&h, root, "coder", json!({"sub": ["x"]})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let child: Value = resp.json().await.unwrap();
+    let child = child["access_token"].as_str().unwrap();
+    let resp = h
+        .exchange_raw(child, "reviewer", &["github:read_file"])
+        .await;
+    assert_eq!(
+        error_description(resp).await,
+        (StatusCode::BAD_REQUEST, "actor_not_permitted".into())
+    );
+    h.exchange(child, "x", &["github:read_file"]).await;
+
+    // Without may_act, anyone authenticated may exchange (the behaviour before may_act).
+    let open = h.mint_root("bob", "planner", &["github:*"]).await;
+    h.exchange(&open.token, "reviewer", &["github:read_file"])
+        .await;
+}
+
+/// `[[root_grants]] may_act` is a ceiling for the root token's `may_act`.
+#[tokio::test]
+async fn root_grant_may_act_is_applied_and_cannot_be_widened() {
+    let h = Harness::start_tweaked(false, |cfg| {
+        cfg.root_grants = vec![onbehalf_server::config::RootGrant {
+            subject: None,
+            issuer: "https://idp.example".into(),
+            agent: "planner".into(),
+            capabilities: vec![onbehalf_server::config::CapSpec::Short("github:*".into())],
+            attributes: BTreeMap::new(),
+            may_act: Some(vec!["coder".into(), "reviewer".into()]),
+        }];
+    })
+    .await;
+    // The grant's may_act applies when the request names none.
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let resp = h
+        .exchange_raw(&root.token, "sneaky", &["github:read_file"])
+        .await;
+    assert_eq!(
+        error_description(resp).await,
+        (StatusCode::BAD_REQUEST, "actor_not_permitted".into())
+    );
+    h.exchange(&root.token, "reviewer", &["github:read_file"])
+        .await;
+    // A request may narrow it but not widen it.
+    let mint = |may_act: Value| {
+        h.admin_post(
+            "/admin/root-token",
+            json!({"subject": "alice", "issuer": "https://idp.example", "agent": "planner",
+                   "may_act": may_act}),
+        )
+    };
+    let resp = mint(json!(["coder", "sneaky"])).await;
+    assert_eq!(
+        error_description(resp).await,
+        (StatusCode::BAD_REQUEST, "may_act_exceeds_grant".into())
+    );
+    let resp = mint(json!(["coder"])).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let narrow: Value = resp.json().await.unwrap();
+    let resp = h
+        .exchange_raw(
+            narrow["access_token"].as_str().unwrap(),
+            "reviewer",
+            &["github:read_file"],
+        )
+        .await;
+    assert_eq!(
+        error_description(resp).await,
+        (StatusCode::BAD_REQUEST, "actor_not_permitted".into())
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Audit I/O runs on the blocking pool; the chain must survive concurrent callers.
 // ---------------------------------------------------------------------------------------------

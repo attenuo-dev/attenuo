@@ -51,6 +51,10 @@ export class OnbehalfClient {
    * then defaults to an OIDC ID token, or set `subjectTokenType` to
    * `urn:ietf:params:oauth:token-type:id-jag` for an ID-JAG.
    *
+   * A hop n+1 exchange authenticates the actor with `clientSecret`, or with `actorToken`: a
+   * workload-identity JWT (for example a SPIFFE JWT-SVID) from an `[[actor_trust]]` issuer.
+   * `mayAct` lists the agents allowed to exchange the new token next (RFC 8693 §4.4).
+   *
    * Throws `ApiError` (`invalid_scope`, `invalid_grant`, ...) on refusal.
    */
   async exchange(
