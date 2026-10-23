@@ -413,29 +413,37 @@ allow_root_mint = true
     s
 }
 
+/// How long a server or upstream gets to come up. Generous because the smoke tests start
+/// several debug-build servers at once, and a loaded CI runner (macOS most of all) can take
+/// well over ten seconds to get one listening.
+const START_BUDGET: Duration = Duration::from_secs(60);
+const START_POLL: Duration = Duration::from_millis(50);
+
 async fn wait_http(client: &reqwest::Client, url: &str) -> Result<()> {
-    for _ in 0..200 {
+    let deadline = tokio::time::Instant::now() + START_BUDGET;
+    while tokio::time::Instant::now() < deadline {
         if let Ok(r) = client.get(url).send().await {
             if r.status().is_success() {
                 return Ok(());
             }
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(START_POLL).await;
     }
-    bail!("{url} did not come up")
+    bail!("{url} did not come up within {START_BUDGET:?}")
 }
 
 async fn wait_tcp(port: u16) -> Result<()> {
-    for _ in 0..200 {
+    let deadline = tokio::time::Instant::now() + START_BUDGET;
+    while tokio::time::Instant::now() < deadline {
         if tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .is_ok()
         {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(START_POLL).await;
     }
-    bail!("port {port} did not open")
+    bail!("port {port} did not open within {START_BUDGET:?}")
 }
 
 // ---------------------------------------------------------------------------------------
