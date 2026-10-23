@@ -1,59 +1,67 @@
-# DRAFT release workflow. Not yet exercised: no tag has been pushed.
+# Release workflow. Not yet exercised: no tag has been pushed.
 #
-# Trigger: pushing a tag `vX.Y.Z` (see "Releases" in CONTRIBUTING.md).
-# What it does:
-#   1. creates a GitHub release from the matching CHANGELOG.md section
-#   2. builds `onbehalf-server` for Linux x86_64, Linux aarch64 and macOS arm64
-#   3. attaches a .tar.gz and a .sha256 per target to the release
+# Trigger: pushing a tag `vX.Y.Z[-suffix]` (see "Releases" in CONTRIBUTING.md).
 #
-# Before relying on it:
-#   - confirm the binary name matches `[[bin]]` in crates/onbehalf-server
-#   - run it once against a `v0.0.0-test` tag on a fork and delete the tag
-#   - decide whether to sign archives (cosign / sigstore) before 1.0
-#   - crates.io publishing is intentionally not here yet (see CONTRIBUTING.md)
+# What it does
+#   1. builds `onbehalf` and `onbehalf-server` for Linux x86_64/aarch64 (musl, static)
+#      and macOS arm64/x86_64 and packs one .tar.gz per target
+#   2. builds a multi-arch (amd64, arm64) image from the Dockerfile, pushes it to
+#      ghcr.io/<owner>/<repo> tagged with the version and `latest`, signs it with cosign
+#      (keyless, GitHub OIDC) and attaches an SPDX SBOM (anchore/sbom-action, also attested
+#      to the image with cosign)
+#   3. writes SHA256SUMS over all archives and the SBOM, renders this release's changelog
+#      section with git-cliff, and creates a DRAFT GitHub release. A maintainer reviews the
+#      draft and publishes it by hand.
+#
+# Secrets: none beyond the automatic GITHUB_TOKEN. Keyless cosign needs no key; it uses the
+# job's OIDC token (`id-token: write`). GHCR needs `packages: write`, granted below. After the
+# first push, set the package visibility to public in the repository's Packages settings.
+#
+# Verify a published image:
+#   cosign verify ghcr.io/7mudit/onbehalf:<version> \
+#     --certificate-identity-regexp '^https://github.com/7Mudit/onbehalf/\.github/workflows/release\.yml@' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+#
+# Before relying on it: run it once against a `v0.0.0-test` tag on a fork and delete the tag
+# and the draft. crates.io publishing is intentionally not here (see CONTRIBUTING.md).
 
 name: Release
-
-permissions:
-  contents: read
 
 on:
   push:
     tags:
-      - "v[0-9]+.[0-9]+.[0-9]+*"
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
-  create-release:
-    name: Create GitHub release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - uses: taiki-e/create-gh-release-action@v1
-        with:
-          changelog: CHANGELOG.md
-          # The action marks tags with a pre-release suffix (-rc.1, -beta) as
-          # pre-releases on its own. Releases are created as published, not
-          # draft, because the asset upload below looks the release up by tag.
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  upload-assets:
-    name: Build and upload (${{ matrix.target }})
-    needs: create-release
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            musl: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm # native arm64 runner, so no cross toolchain
+            musl: true
           - target: aarch64-apple-darwin
             os: macos-latest
-    runs-on: ${{ matrix.os }}
-    permissions:
-      contents: write
+          - target: x86_64-apple-darwin
+            os: macos-latest # cross-compiled with the Xcode SDK
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -62,19 +70,126 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-      - name: Install cross toolchain (Linux cross builds)
-        if: startsWith(matrix.os, 'ubuntu') && matrix.target != 'x86_64-unknown-linux-gnu'
-        uses: taiki-e/setup-cross-toolchain-action@v1
+      - name: Install musl tools
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p onbehalf-server -p onbehalf-cli
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="onbehalf-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/onbehalf" \
+             "target/${{ matrix.target }}/release/onbehalf-server" \
+             LICENSE README.md CHANGELOG.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          rm -rf "dist/$name"
+      - uses: actions/upload-artifact@v4
         with:
-          target: ${{ matrix.target }}
-          runner: none
-      - name: Build and upload
-        uses: taiki-e/upload-rust-binary-action@v1
+          name: archive-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  image:
+    name: Container image (GHCR, cosign, SBOM)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # keyless cosign signing
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
         with:
-          bin: onbehalf-server
-          target: ${{ matrix.target }}
-          # archive name: onbehalf-server-<target>.tar.gz
-          archive: $bin-$target
-          tar: unix
-          checksum: sha256
-          token: ${{ secrets.GITHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign the image (keyless)
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for tag in $TAGS; do
+            cosign sign --yes "${tag%%:*}@${DIGEST}"
+          done
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: onbehalf-image.spdx.json
+          artifact-name: sbom
+          upload-release-assets: false
+      - name: Attest the SBOM to the image
+        run: |
+          cosign attest --yes --type spdxjson --predicate onbehalf-image.spdx.json \
+            "${IMAGE}@${{ steps.build.outputs.digest }}"
+
+  release:
+    name: Draft GitHub release
+    needs: [build, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git-cliff needs the tag history
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: dist
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum *.tar.gz *.spdx.json > SHA256SUMS
+          cat SHA256SUMS
+      - name: Changelog section (git-cliff)
+        id: cliff
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: RELEASE_NOTES.md
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          name: ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.spdx.json
+            dist/SHA256SUMS
