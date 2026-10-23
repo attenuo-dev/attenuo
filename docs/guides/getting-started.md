@@ -268,11 +268,11 @@ reloaded 4 policies
   permit_readonly_tools
 ```
 
-If the new file does not parse or does not validate against the catalog, the old policy stays in force and the command reports why. The starter policy permits read-only tools, permits `create_issue` only in `acme/*`, caps chain depth at 3, and requires MFA for tools marked `sensitive`. The GitHub leak demo has a smaller policy you can read in a minute: [examples/github-leak-demo/policy.cedar](../../examples/github-leak-demo/policy.cedar).
+If the new file does not parse or does not validate against the catalog, the old policy stays in force and the command reports why. The starter policy permits read-only tools, permits `create_issue` only in `acme/*`, caps chain depth at 3, and requires MFA for tools marked `sensitive`. The GitHub leak demo has a smaller policy you can read in a minute: [examples/github-leak-demo/policy.cedar](https://github.com/7Mudit/onbehalf/blob/main/examples/github-leak-demo/policy.cedar).
 
 ## Where to go next
 
-- Replay a real incident end to end with [examples/github-leak-demo](../../examples/github-leak-demo/README.md). `run.sh` does the whole thing in about a minute.
+- Replay a real incident end to end with [examples/github-leak-demo](https://github.com/7Mudit/onbehalf/blob/main/examples/github-leak-demo/README.md). `run.sh` does the whole thing in about a minute.
 - Replace the development mint with a real login: [Identity providers](identity-providers.md).
 - Put this on something other than your laptop: [Deploying](deploying.md).
 - Write the agent side: [Integrating MCP clients](integrating-mcp-clients.md).

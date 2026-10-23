@@ -8,7 +8,7 @@ We use the [MADR 4](https://adr.github.io/madr/) template. Start from [`0000-adr
 
 Write an ADR when a choice is hard to reverse or affects more than one crate: a dependency that becomes part of the public surface (policy engine, token format, storage), a security invariant and how it is enforced, a change to the module boundaries, a convention everyone must follow. Small, local, easily reversible choices go in the PR description instead.
 
-Anything that changes the wire format or public API needs an RFC first (see [`../spec/README.md`](../spec/README.md)). An RFC often produces one or more ADRs for the decisions made along the way.
+Anything that changes the wire format or public API needs an RFC first (see [`../spec/README.md`](../spec/)). An RFC often produces one or more ADRs for the decisions made along the way.
 
 ## Process
 

@@ -12,3 +12,4 @@ docs/.obsidian/workspace-mobile.json
 __pycache__/
 *.egg-info/
 .venv/
+/book/

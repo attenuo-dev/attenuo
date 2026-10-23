@@ -15,8 +15,8 @@ Other places to look:
 
 - [FAQ](../faq.md): why a proxy, how it differs from gateways and policy engines, what happens when it is down.
 - [design/server.md](../design/server.md): how a request is decided, with sequence diagrams and error codes.
-- [config/example.toml](../../config/example.toml): every config key, annotated.
-- [examples/github-leak-demo](../../examples/github-leak-demo/README.md): a scripted replay of a real incident.
+- [config/example.toml](https://github.com/7Mudit/onbehalf/blob/main/config/example.toml): every config key, annotated.
+- [examples/github-leak-demo](https://github.com/7Mudit/onbehalf/blob/main/examples/github-leak-demo/README.md): a scripted replay of a real incident.
 - [RFC-0001](../spec/rfc-0001-onbehalf.md) and the [threat model](../spec/threat-model.md): what the system promises and what it does not.
 
 ## Conventions in these guides
