@@ -33,7 +33,7 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 - [ ] AuthZEN conformance fixtures (the endpoint itself is done).
 - [ ] Audit: signed checkpoints every N records; `kind` for `issue`, `decision`, `renew`, `revoke`, `checkpoint`.
 - [ ] Server: real admin authentication, `actor_token` verification on exchange, `kid` in token headers, audit failed exchanges.
-- [ ] CI: fmt, clippy `-D warnings`, tests, proptest with fixed seed in CI and random locally.
+- [ ] CI: proptest with a fixed seed in CI and random locally. Also: confirm the new workflows on GitHub (MSRV 1.89, musl and macOS release builds, GHCR push, cosign, SBOM) with a `v0.0.0-test` tag on a fork; enable private vulnerability reporting and the DCO app; set the GHCR package public.
 - [ ] AgentDojo / InjecAgent harness: run a no-policy baseline and an onbehalf-enforced run; report attack success and utility.
 - [ ] Docs follow-ups from the guides: test the Keycloak, Auth0, Okta, Entra ID and Google recipes (and ID-JAG with Okta) against live tenants and drop the "untested" marks; add a CI check that runs the getting-started commands.
 - [ ] Operations gaps found while writing the deploy guide: handle SIGTERM for graceful shutdown; a readiness check that touches SQLite; a metrics endpoint (decision counts by reason, audit append latency); automatic signed audit checkpoints.
@@ -52,6 +52,7 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 
 ## Done
 
+- [x] CI and release workflows (fmt, clippy, test matrix, MSRV, deny, audit, demo, policy tests, docs and link checks; musl/macOS archives, signed GHCR image, SBOM, draft release), dev scripts and justfile, repo hygiene files. Workflow YAML parses; none of it has run on GitHub.
 - [x] User guides (`docs/guides/`), FAQ and positioning table; wire examples verified against a local build. IdP recipes remain untested against live providers.
 - [x] Security review pass 1: SR-01 to SR-07 fixed with regression tests (proxy re-encodes screened messages, no upstream redirects, non-object arguments rejected; Cedar action hierarchy; integral floats as Long; TTL overflow; root-grant attributes).
 - [x] Lease renewal: `POST /token/renew`, `LeaseStore::renew`, lease expiry enforced for every hop, ADR-0006.
