@@ -1,0 +1,124 @@
+[package]
+name = "onbehalf-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "Apache-2.0"
+description = "cargo-fuzz targets for onbehalf's attacker-reachable parsers and checks"
+
+[package.metadata]
+cargo-fuzz = true
+
+# A workspace of its own: cargo-fuzz builds with nightly-only sanitizer flags, so this crate is
+# excluded from the main workspace (see the root Cargo.toml and docs/design/fuzzing.md).
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+onbehalf-core = { path = "../crates/onbehalf-core" }
+onbehalf-token = { path = "../crates/onbehalf-token" }
+onbehalf-policy = { path = "../crates/onbehalf-policy" }
+onbehalf-audit = { path = "../crates/onbehalf-audit" }
+onbehalf-proxy = { path = "../crates/onbehalf-proxy" }
+onbehalf-server = { path = "../crates/onbehalf-server" }
+serde = "1"
+serde_json = "1"
+time = { version = "0.3", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
+async-trait = "0.1"
+base64 = "0.22"
+ring = "0.17"
+jsonwebtoken = "9"
+uuid = "1"
+
+[profile.release]
+# No debug info: function names are enough for backtraces, and 13 targets add up on disk.
+debug = false
+
+[[bin]]
+name = "token_verify_bytes"
+path = "fuzz_targets/token_verify_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "token_verify_mutated"
+path = "fuzz_targets/token_verify_mutated.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chain_validate"
+path = "fuzz_targets/chain_validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ou_sig"
+path = "fuzz_targets/ou_sig.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dpop_proof"
+path = "fuzz_targets/dpop_proof.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "names"
+path = "fuzz_targets/names.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "capability_attenuation"
+path = "fuzz_targets/capability_attenuation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_jsonrpc"
+path = "fuzz_targets/proxy_jsonrpc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_sse"
+path = "fuzz_targets/proxy_sse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_context"
+path = "fuzz_targets/policy_context.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audit_export_bytes"
+path = "fuzz_targets/audit_export_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audit_export_mutated"
+path = "fuzz_targets/audit_export_mutated.rs"
+test = false
+doc = false
+bench = false

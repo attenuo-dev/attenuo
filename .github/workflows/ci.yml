@@ -116,6 +116,30 @@ jobs:
       - name: onbehalf policy test
         run: cargo run --locked -q -p onbehalf-cli -- policy test examples/github-leak-demo/policy_test.yaml
 
+  # Builds the cargo-fuzz targets (nightly, outside the workspace) and runs each over its seed
+  # corpus once, so a target that stops compiling or a seed that crashes fails CI. Long fuzzing
+  # runs are manual; see docs/design/fuzzing.md.
+  fuzz-build:
+    name: fuzz targets build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # dtolnay/rust-toolchain publishes no major tags; @master takes the toolchain as an input.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master 2026-10-23
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz
+      - run: cargo +nightly install cargo-fuzz --locked --version 0.13.2
+      - run: cargo +nightly fuzz build
+      - name: Seed corpus and one pass over it
+        run: |
+          cargo +nightly run -q --manifest-path fuzz/Cargo.toml --example seed_corpus
+          for t in $(cargo +nightly fuzz list); do
+            cargo +nightly fuzz run "$t" -- -runs=0
+          done
+
   docs:
     name: docs (rustdoc and links)
     runs-on: ubuntu-latest
