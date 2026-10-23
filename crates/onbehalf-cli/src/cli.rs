@@ -109,9 +109,62 @@ pub struct RootArgs {
     /// User attribute `key=value` (`key:=json` for non-strings). Repeatable.
     #[arg(long = "attr", value_parser = parse_kv)]
     pub attrs: Vec<(String, Value)>,
+    /// RFC 8693 `may_act` for the root token: an agent allowed to exchange it next. Repeatable;
+    /// values may also be comma-separated. Must be within the `[[root_grants]]` entry's
+    /// `may_act` when it has one. Without it the grant's `may_act` applies (or, if none, any
+    /// authenticated agent may).
+    #[arg(long = "may-act", value_name = "AGENT")]
+    pub may_act: Vec<String>,
     /// Print only this value, for scripts.
     #[arg(long, value_enum)]
     pub print: Option<Field>,
+}
+
+impl RootArgs {
+    /// `--may-act` values, split on commas, without empties.
+    pub fn may_act(&self) -> Vec<String> {
+        split_agents(&self.may_act)
+    }
+
+    /// The JSON body for `POST /admin/root-token`.
+    pub fn request_body(&self) -> anyhow::Result<Value> {
+        let mut body = serde_json::Map::new();
+        body.insert("subject".into(), self.subject.clone().into());
+        body.insert("issuer".into(), self.issuer.clone().into());
+        body.insert("agent".into(), self.agent.clone().into());
+        if !self.caps.is_empty() {
+            body.insert("capabilities".into(), parse_caps(&self.caps)?.into());
+        }
+        if let Some(ttl) = self.ttl_seconds {
+            body.insert("ttl_seconds".into(), ttl.into());
+        }
+        if !self.attrs.is_empty() {
+            body.insert(
+                "attributes".into(),
+                self.attrs
+                    .iter()
+                    .cloned()
+                    .collect::<serde_json::Map<_, _>>()
+                    .into(),
+            );
+        }
+        let may_act = self.may_act();
+        if !may_act.is_empty() {
+            body.insert("may_act".into(), serde_json::json!({ "sub": may_act }));
+        }
+        Ok(Value::Object(body))
+    }
+}
+
+/// Agent ids from repeatable, comma-separated flag values, trimmed, without empties.
+fn split_agents(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 #[derive(Debug, Args)]
@@ -195,13 +248,7 @@ impl ExchangeArgs {
 
     /// `--may-act` values, split on commas, without empties.
     pub fn may_act(&self) -> Vec<String> {
-        self.may_act
-            .iter()
-            .flat_map(|v| v.split(','))
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect()
+        split_agents(&self.may_act)
     }
 }
 
@@ -584,6 +631,45 @@ mod tests {
             a.extend_from_slice(extra);
             assert!(parse(&a).is_err(), "{extra:?}");
         }
+    }
+
+    #[test]
+    fn root_may_act_and_body() {
+        let root = |extra: &[&str]| {
+            let mut args = vec!["token", "root", "--subject", "alice", "--agent", "planner"];
+            args.extend_from_slice(extra);
+            match parse(&args).unwrap().command {
+                Command::Token(TokenCmd::Root(r)) => r,
+                _ => panic!("not root"),
+            }
+        };
+        let plain = root(&[]);
+        assert!(plain.may_act().is_empty());
+        assert_eq!(
+            plain.request_body().unwrap(),
+            serde_json::json!({"subject": "alice", "issuer": "https://idp.example", "agent": "planner"})
+        );
+        let full = root(&[
+            "--may-act",
+            "coder, reviewer",
+            "--may-act",
+            "tester",
+            "--cap",
+            "github:read_file",
+            "--ttl-seconds",
+            "60",
+            "--attr",
+            "mfa:=true",
+        ]);
+        assert_eq!(full.may_act(), ["coder", "reviewer", "tester"]);
+        let body = full.request_body().unwrap();
+        assert_eq!(
+            body["may_act"],
+            serde_json::json!({"sub": ["coder", "reviewer", "tester"]})
+        );
+        assert_eq!(body["ttl_seconds"], 60);
+        assert_eq!(body["attributes"], serde_json::json!({"mfa": true}));
+        assert_eq!(body["capabilities"].as_array().unwrap().len(), 1);
     }
 
     #[test]

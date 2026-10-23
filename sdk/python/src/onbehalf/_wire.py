@@ -162,10 +162,11 @@ def exchange_body(
         client_id = actor
     subject = bearer(subject_token)
     if subject_token_type is None:
-        # Client credentials alone do not make this hop 0: the server also requires them, as
-        # the actor's, on a hop n+1 exchange. Hop 0 is an IdP credential, which is not an
-        # onbehalf delegation token.
-        intake = client_secret is not None and not is_delegation_token(subject_token)
+        # Agent credentials (a client secret or an actor token) alone do not make this hop 0:
+        # the server also requires them, as the actor's, on a hop n+1 exchange. Hop 0 is an
+        # IdP credential, which is not an onbehalf delegation token.
+        authenticated = client_secret is not None or actor_token is not None
+        intake = authenticated and not is_delegation_token(subject_token)
         subject_token_type = TYPE_ID_TOKEN if intake else TYPE_JWT
     body: dict[str, Any] = {
         "grant_type": TOKEN_EXCHANGE_GRANT,
@@ -189,10 +190,18 @@ def exchange_body(
         body["actor_token"] = actor_token.strip()
         body["actor_token_type"] = TYPE_JWT
     if may_act is not None:
-        if isinstance(may_act, str):
-            raise TypeError("may_act is a list of agent ids, not a string")
-        body["may_act"] = {"sub": list(may_act)}
+        body["may_act"] = may_act_json(may_act)
     return body
+
+
+def may_act_json(may_act: Iterable[str]) -> dict[str, list[str]]:
+    """The RFC 8693 §4.4 ``may_act`` claim for a list of agent ids."""
+    if isinstance(may_act, str):
+        raise TypeError("may_act is a list of agent ids, not a string")
+    agents = list(may_act)
+    if not all(isinstance(a, str) and a for a in agents):
+        raise ValueError("may_act agent ids must be non-empty strings")
+    return {"sub": agents}
 
 
 def is_delegation_token(token: Token | str) -> bool:

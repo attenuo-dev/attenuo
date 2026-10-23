@@ -79,24 +79,8 @@ async fn run(cli: Cli) -> Result<Outcome> {
         Command::Token(TokenCmd::Inspect(args)) => inspect(client.ok(), args, json).await,
         Command::Token(TokenCmd::Root(a)) => {
             let client = client?;
-            let mut body = Map::new();
-            body.insert("subject".into(), a.subject.into());
-            body.insert("issuer".into(), a.issuer.into());
-            body.insert("agent".into(), a.agent.into());
-            if !a.caps.is_empty() {
-                body.insert("capabilities".into(), cli::parse_caps(&a.caps)?.into());
-            }
-            if let Some(ttl) = a.ttl_seconds {
-                body.insert("ttl_seconds".into(), ttl.into());
-            }
-            if !a.attrs.is_empty() {
-                body.insert(
-                    "attributes".into(),
-                    a.attrs.into_iter().collect::<Map<_, _>>().into(),
-                );
-            }
             let resp = client
-                .admin_post("/admin/root-token", &Value::Object(body))
+                .admin_post("/admin/root-token", &a.request_body()?)
                 .await?;
             print_token(&resp, a.print, json);
             Ok(Outcome::Ok)

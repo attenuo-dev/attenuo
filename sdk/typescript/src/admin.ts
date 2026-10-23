@@ -69,6 +69,11 @@ export interface MintRootOptions {
   capabilities?: CapabilityLike | readonly CapabilityLike[];
   ttlSeconds?: number;
   attributes?: Record<string, unknown>;
+  /**
+   * RFC 8693 §4.4 `may_act` for the root token: the agents allowed to exchange it next. Must be
+   * within the `[[root_grants]]` entry's `may_act` when that has one. `[]` means nobody may.
+   */
+  mayAct?: readonly string[];
 }
 
 function opt<T>(v: unknown): T | undefined {
@@ -234,6 +239,7 @@ export class AdminClient {
     if (opts.ttlSeconds !== undefined) body.ttl_seconds = Math.trunc(opts.ttlSeconds);
     if (opts.attributes && Object.keys(opts.attributes).length > 0)
       body.attributes = opts.attributes;
+    if (opts.mayAct !== undefined) body.may_act = w.mayActJson(opts.mayAct);
     const res = await this.http.post("/admin/root-token", { json: body });
     return w.tokenFromResponse(await w.jsonBody(res));
   }

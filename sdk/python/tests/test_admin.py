@@ -235,6 +235,20 @@ async def test_mint_root_dev(make: Any) -> None:
     await call(client, "mint_root_dev", "alice", "https://idp.example", "planner")
     assert set(json.loads(seen[-1].content)) == {"subject", "issuer", "agent"}
 
+    await call(
+        client, "mint_root_dev", "alice", "https://idp.example", "planner", may_act=["coder"]
+    )
+    assert json.loads(seen[-1].content)["may_act"] == {"sub": ["coder"]}
+    await call(client, "mint_root_dev", "a", "i", "p", may_act=iter(["x", "y"]))
+    assert json.loads(seen[-1].content)["may_act"] == {"sub": ["x", "y"]}
+    # An empty list is sent: nobody may exchange the token.
+    await call(client, "mint_root_dev", "a", "i", "p", may_act=[])
+    assert json.loads(seen[-1].content)["may_act"] == {"sub": []}
+    with pytest.raises(TypeError):
+        await call(client, "mint_root_dev", "a", "i", "p", may_act="coder")
+    with pytest.raises(ValueError):
+        await call(client, "mint_root_dev", "a", "i", "p", may_act=[""])
+
 
 async def test_admin_errors(make: Any) -> None:
     client, _ = make(

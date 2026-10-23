@@ -85,6 +85,24 @@ Capability("github", "read_*", repo=Prefix("alice/public-"), ref=Equals("main"))
 
 These serialize to the server's `authorization_details` shape, the same JSON `onbehalf token exchange --cap` produces. Plain strings (`"github:read_file"`, or comma separated) work anywhere a capability is accepted. A child must constrain every argument its parent constrains, at least as tightly; the server refuses an exchange that widens (`ApiError` with `error == "invalid_scope"`).
 
+### Workload identity and `may_act`
+
+An agent can authenticate with a workload-identity JWT instead of a client secret: an RFC 8693 `actor_token` from an `[[actor_trust]]` issuer, such as a SPIFFE JWT-SVID. It works at hop 0 (with the user's ID token or ID-JAG as the subject token) and on every exchange. Each actor token authenticates one request, and the token it obtains never outlives it.
+
+```python
+svid = open("/run/spire/svid.jwt").read()  # written by a SPIFFE helper, aud = the server
+root = ob.exchange(id_token, "planner", ["github:*"], actor_token=svid)
+```
+
+`may_act` limits who may exchange a token next (RFC 8693 §4.4). Pass it when exchanging, or when minting a dev root:
+
+```python
+coder = ob.exchange(root, "coder", ["github:read_file"], client_secret=..., may_act=["reviewer"])
+root = admin.mint_root_dev("alice", "https://idp.example", "planner", ["github:*"], may_act=["coder"])
+```
+
+`may_act` is a list of agent ids (a bare string is a `TypeError`); `[]` means nobody may exchange the token. For a root it must be within the `[[root_grants]]` entry's `may_act` when that has one.
+
 ### Errors
 
 All SDK errors derive from `OnbehalfError`.
