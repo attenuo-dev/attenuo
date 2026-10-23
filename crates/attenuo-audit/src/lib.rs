@@ -44,5 +44,5 @@ pub use shipped::{
 };
 pub use sqlite::{
     Durability, SqliteAudit, SqliteLeaseStore, WalCheckpoint, DEFAULT_WAL_CHECKPOINT_INTERVAL,
-    WAL_CHECKPOINT_COMMITS,
+    WAL_CHECKPOINT_COMMITS, WAL_WRITER_BACKSTOP_FRAMES,
 };
