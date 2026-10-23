@@ -63,6 +63,7 @@
 - [Incidents 2025-2026](research/incidents-2025-2026.md)
 - [Related work](research/related-work.md)
 - [Evaluation plan](research/evaluation-plan.md)
+  - [Injection suite, first results](evaluation/injection-suite.md)
 - [Security review, pass 1](research/security-review-2026-10-22.md)
   - [Security review, pass 3](research/security-review-2026-10-23.md)
 - [Open-source project practices](research/oss-project-practices.md)
