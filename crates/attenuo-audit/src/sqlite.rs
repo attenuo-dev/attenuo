@@ -493,7 +493,7 @@ const WAL_LOCKED_RESIDUE: i64 = 256;
 /// The writer's own backstop: `wal_autocheckpoint` on the writer connection while the
 /// background checkpointer is on. The background thread keeps the WAL far below this (it
 /// starts a round every [`WAL_CHECKPOINT_COMMITS`] commits and pauses appends once past
-/// [`WAL_RESTART_FRAMES`]), so a commit never checkpoints in normal operation. But that thread
+/// `WAL_RESTART_FRAMES`, 64 MB), so a commit never checkpoints in normal operation. But that thread
 /// can fall behind on a starved or slow host (two cores shared with many writers, a slow disk),
 /// and then the WAL grew by hundreds of megabytes before a round caught up. Past this many
 /// frames, 128 MB at the default page size, SQLite runs a `PASSIVE` checkpoint on the writer
