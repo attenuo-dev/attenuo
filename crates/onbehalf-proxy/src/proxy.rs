@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
@@ -23,6 +23,7 @@ use uuid::Uuid;
 use crate::auth::{AuthError, Authorizer};
 use crate::config::ProxyConfig;
 use crate::filter::{ListFilter, ListKind};
+use crate::guard::{guard_stream, StreamGuard};
 use crate::jsonrpc::{
     self, denied_response, error_response, id_of, is_passthrough_method, is_request, method_of,
     CODE_INVALID_PARAMS, CODE_INVALID_REQUEST, CODE_PARSE_ERROR, CODE_UNAUTHORIZED,
@@ -60,10 +61,20 @@ struct AppState {
     client: reqwest::Client,
     authorizer: Arc<dyn Authorizer>,
     sessions: SessionRegistry,
+    /// [`ProxyConfig::stream_recheck`].
+    stream_recheck: Duration,
+}
+
+impl AppState {
+    /// The re-check (SR-28) for a response streamed to `chain`'s holder.
+    fn stream_guard(&self, chain: &DelegationChain) -> StreamGuard {
+        StreamGuard::new(self.authorizer.clone(), chain.clone(), self.stream_recheck)
+    }
 }
 
 /// Build the proxy router. Upstreams are mounted at `/mcp/{name}`.
 pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
+    let stream_recheck = config.stream_recheck;
     let upstreams = config
         .upstreams
         .into_iter()
@@ -74,6 +85,7 @@ pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
         client: upstream_client(),
         authorizer,
         sessions: SessionRegistry::default(),
+        stream_recheck,
     });
     Router::new()
         .route(
@@ -375,6 +387,8 @@ async fn handle_passthrough(
         };
         tracing::debug!(%method, "forwarding transparently");
         let is_delete = method == Method::DELETE;
+        // The listen stream lives as long as the client keeps it open: re-check it (SR-28).
+        let guard = (!is_delete).then(|| state.stream_guard(&chain));
         let req = state
             .client
             .request(method, &upstream)
@@ -384,7 +398,7 @@ async fn handle_passthrough(
             ))
             .body(body);
         let mut response = match req.send().await {
-            Ok(resp) => stream_response(resp, None, &[]),
+            Ok(resp) => stream_response(resp, None, guard),
             Err(e) => return upstream_error(e),
         };
         match (is_delete, session_id.as_deref()) {
@@ -623,7 +637,8 @@ async fn handle_post_inner(
         let caps = chain.effective_capabilities().cloned().unwrap_or_default();
         let server = server.to_owned();
         let prelude = sse_prelude(&screened.replies);
-        stream_response_filtered(resp, prelude, move |msg| {
+        let guard = state.stream_guard(chain);
+        stream_response_filtered(resp, prelude, guard, move |msg| {
             let removed = ListFilter::new(&pending, &caps, &server).apply(msg);
             if removed > 0 {
                 tracing::debug!(removed, "filtered list result in SSE stream");
@@ -646,7 +661,7 @@ async fn handle_post_inner(
         json_response(StatusCode::BAD_GATEWAY, &body)
     } else {
         let prelude = sse_prelude(&screened.replies);
-        stream_response(resp, prelude, &[])
+        stream_response(resp, prelude, Some(state.stream_guard(chain)))
     };
     add_decision_header(&mut response, &screened.decision_ids);
     response
@@ -881,42 +896,64 @@ fn sse_prelude(replies: &[Value]) -> Option<Bytes> {
     Some(Bytes::from(out))
 }
 
-/// Stream an upstream response back without buffering (SSE passthrough).
+/// Is this an SSE body?
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| {
+            ct.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("text/event-stream")
+        })
+}
+
+/// Stream an upstream response back without buffering (SSE passthrough). With a `guard`, the
+/// stream is re-checked and ended when the check fails (SR-28); an SSE body is then relayed
+/// event by event ([`crate::sse::frame_stream`]), so the proxy's final event never lands
+/// inside a partial upstream event.
 fn stream_response(
     resp: reqwest::Response,
     prelude: Option<Bytes>,
-    extra: &[(HeaderName, HeaderValue)],
+    guard: Option<StreamGuard>,
 ) -> Response {
     let status = resp.status();
     let headers = resp.headers().clone();
-    let upstream = resp.bytes_stream();
-    let body = match prelude {
-        Some(p) => Body::from_stream(futures_util::stream::once(async { Ok(p) }).chain(upstream)),
-        None => Body::from_stream(upstream),
+    let prelude = futures_util::stream::iter(prelude.map(Ok::<_, std::io::Error>));
+    let body = match guard {
+        None => {
+            let raw = resp
+                .bytes_stream()
+                .map(|r| r.map_err(std::io::Error::other));
+            Body::from_stream(prelude.chain(raw))
+        }
+        Some(guard) if is_event_stream(&headers) => {
+            let framed = crate::sse::frame_stream(resp.bytes_stream());
+            Body::from_stream(guard_stream(prelude.chain(framed), guard, true))
+        }
+        Some(guard) => {
+            let raw = resp
+                .bytes_stream()
+                .map(|r| r.map_err(std::io::Error::other));
+            Body::from_stream(guard_stream(prelude.chain(raw), guard, false))
+        }
     };
-    let mut response = build_response(status, &headers, body);
-    for (k, v) in extra {
-        response.headers_mut().insert(k.clone(), v.clone());
-    }
-    response
+    build_response(status, &headers, body)
 }
 
 /// Like [`stream_response`] for an SSE body, with `filter` run over every JSON-RPC message in
-/// its events (see [`crate::sse`]).
+/// its events (see [`crate::sse`]), and always re-checked.
 fn stream_response_filtered(
     resp: reqwest::Response,
     prelude: Option<Bytes>,
+    guard: StreamGuard,
     filter: impl FnMut(&mut Value) + Send + 'static,
 ) -> Response {
     let status = resp.status();
     let headers = resp.headers().clone();
     let filtered = crate::sse::rewrite_stream(resp.bytes_stream(), filter);
-    let body = match prelude {
-        Some(p) => Body::from_stream(
-            futures_util::stream::once(async { Ok::<_, std::io::Error>(p) }).chain(filtered),
-        ),
-        None => Body::from_stream(filtered),
-    };
+    let prelude = futures_util::stream::iter(prelude.map(Ok::<_, std::io::Error>));
+    let body = Body::from_stream(guard_stream(prelude.chain(filtered), guard, true));
     build_response(status, &headers, body)
 }
 

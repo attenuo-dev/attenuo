@@ -14,12 +14,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
 use futures_util::StreamExt;
-use onbehalf_core::Capability;
-use onbehalf_proxy::testing::{spawn_router, test_chain, Spawned, StaticAuthorizer};
+use onbehalf_core::{AgentId, Capability, CapabilitySet, DelegationChain, LeaseId};
+use onbehalf_proxy::testing::{spawn_router, test_chain, test_user, Spawned, StaticAuthorizer};
 use onbehalf_proxy::{router, ProxyConfig, UpstreamConfig};
 use serde_json::json;
 
 const SERVER: &str = "github";
+
+/// The stream re-check interval used in these tests (SR-28); production defaults to 2 s.
+const RECHECK: Duration = Duration::from_millis(100);
 
 /// An upstream that hands out a fresh session id to every POST without one, records every
 /// `Mcp-Session-Id` value it receives (all of them, per request), and answers `GET` with an
@@ -112,7 +115,8 @@ async fn proxy_with(upstream: &Spawned, authorizer: Arc<StaticAuthorizer>) -> Sp
     let config = ProxyConfig::new(
         "127.0.0.1:0".parse().unwrap(),
         vec![UpstreamConfig::new(SERVER, upstream.url("/mcp"))],
-    );
+    )
+    .with_stream_recheck(RECHECK);
     spawn_router(router(config, authorizer)).await.unwrap()
 }
 
@@ -288,7 +292,6 @@ async fn an_upstream_sending_two_session_ids_binds_neither() {
 /// proxy keeps relaying server-to-client messages for as long as the connection lives, so
 /// in-flight revocation (P4) does not reach it.
 #[tokio::test]
-#[ignore = "SR-28: open, fix in crates/onbehalf-proxy/src/proxy.rs (see the 2026-10-23 report)"]
 async fn revocation_ends_an_open_sse_stream() {
     let upstream = SessionUpstream::default();
     let up = spawn_router(upstream.router()).await.unwrap();
@@ -334,5 +337,196 @@ async fn revocation_ends_an_open_sse_stream() {
     assert!(
         ended.is_ok(),
         "the SSE stream kept relaying events after the lease was revoked"
+    );
+}
+
+/// Open a `GET` listen stream as `bearer` on a fresh session, and wait for its first event.
+async fn open_listen_stream(
+    proxy: &Spawned,
+    bearer: &str,
+) -> impl futures_util::Stream<Item = reqwest::Result<axum::body::Bytes>> {
+    let sid = post_with_sessions(proxy, bearer, &[]).await.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let resp = reqwest::Client::new()
+        .get(proxy.url(&format!("/mcp/{SERVER}")))
+        .bearer_auth(bearer)
+        .header("accept", "text/event-stream")
+        .header("mcp-session-id", &sid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut stream = Box::pin(resp.bytes_stream());
+    let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("first event")
+        .expect("stream open")
+        .unwrap();
+    assert!(String::from_utf8_lossy(&first).contains("notifications/message"));
+    stream
+}
+
+/// Read `stream` to its end (or `limit`), returning everything received and how long it took.
+async fn drain(
+    mut stream: impl futures_util::Stream<Item = reqwest::Result<axum::body::Bytes>> + Unpin,
+    limit: Duration,
+) -> (String, Duration) {
+    let start = std::time::Instant::now();
+    let mut text = String::new();
+    let ended = tokio::time::timeout(limit, async {
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(b) => text.push_str(&String::from_utf8_lossy(&b)),
+                Err(_) => break,
+            }
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "the stream was still open after {limit:?}");
+    (text, start.elapsed())
+}
+
+/// The JSON-RPC payload of the last SSE event in `text`.
+fn last_event(text: &str) -> serde_json::Value {
+    let data = text
+        .split("\n\n")
+        .filter_map(|e| e.lines().find_map(|l| l.strip_prefix("data: ")))
+        .last()
+        .expect("an event");
+    serde_json::from_str(data).unwrap()
+}
+
+/// SR-28: the stream ends within a few re-check intervals of the revocation, and its last
+/// event says why.
+#[tokio::test]
+async fn a_revoked_listen_stream_ends_promptly_with_a_reason() {
+    let upstream = SessionUpstream::default();
+    let up = spawn_router(upstream.router()).await.unwrap();
+    let authorizer = Arc::new(StaticAuthorizer::new().with_chain(
+        "alice",
+        test_chain("user:alice", "agent:a", [Capability::new(SERVER, "read_*")]),
+    ));
+    let proxy = proxy_with(&up, authorizer.clone()).await;
+    let stream = open_listen_stream(&proxy, "alice").await;
+
+    authorizer.revoke("alice");
+    let (text, took) = drain(stream, Duration::from_secs(5)).await;
+    assert!(took < RECHECK * 10, "took {took:?}");
+    let last = last_event(&text);
+    assert_eq!(last["error"]["code"], -32001);
+    assert_eq!(last["error"]["data"]["reason"], "lease_revoked");
+}
+
+/// SR-28: a listen stream does not outlive the token that opened it.
+#[tokio::test]
+async fn an_expired_tokens_listen_stream_ends() {
+    let upstream = SessionUpstream::default();
+    let up = spawn_router(upstream.router()).await.unwrap();
+    let ttl = Duration::from_millis(800);
+    let chain = DelegationChain::root(
+        test_user("user:alice"),
+        AgentId::new("agent:a"),
+        CapabilitySet::from_iter([Capability::new(SERVER, "read_*")]),
+        time::OffsetDateTime::now_utc(),
+        time::Duration::try_from(ttl).unwrap(),
+        LeaseId::new("lease-short"),
+    )
+    .unwrap();
+    let authorizer = Arc::new(StaticAuthorizer::new().with_chain("alice", chain));
+    let proxy = proxy_with(&up, authorizer).await;
+    let stream = open_listen_stream(&proxy, "alice").await;
+
+    let (text, _) = drain(stream, ttl + Duration::from_secs(2)).await;
+    assert_eq!(
+        last_event(&text)["error"]["data"]["reason"],
+        "token_expired"
+    );
+}
+
+/// SR-28: re-checking does not disturb a stream whose lease stays live.
+#[tokio::test]
+async fn an_untouched_listen_stream_keeps_flowing() {
+    let upstream = SessionUpstream::default();
+    let up = spawn_router(upstream.router()).await.unwrap();
+    let authorizer = Arc::new(StaticAuthorizer::new().with_chain(
+        "alice",
+        test_chain("user:alice", "agent:a", [Capability::new(SERVER, "read_*")]),
+    ));
+    let proxy = proxy_with(&up, authorizer).await;
+    let mut stream = open_listen_stream(&proxy, "alice").await;
+
+    // Several re-check intervals' worth of events, all upstream notifications.
+    let mut events = 0;
+    let deadline = tokio::time::Instant::now() + RECHECK * 8;
+    while let Ok(next) = tokio::time::timeout_at(deadline, stream.next()).await {
+        let chunk = next
+            .expect("stream still open")
+            .expect("no transport error");
+        let text = String::from_utf8_lossy(&chunk).into_owned();
+        assert!(!text.contains("-32001"), "{text}");
+        events += text.matches("notifications/message").count();
+    }
+    assert!(events >= 8, "only {events} events in {:?}", RECHECK * 8);
+}
+
+/// SR-28: a `tools/call` answered over a long-lived SSE stream is re-checked too.
+#[tokio::test]
+async fn a_revoked_sse_tool_call_response_ends() {
+    let up = spawn_router(Router::new().route(
+        "/mcp",
+        post(|| async {
+            let events = futures_util::stream::unfold(0u64, |i| async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let event = format!(
+                    "event: message\ndata: {}\n\n",
+                    json!({"jsonrpc": "2.0", "method": "notifications/progress",
+                           "params": {"progressToken": "t", "progress": i}})
+                );
+                Some((Ok::<_, std::io::Error>(event), i + 1))
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(events))
+                .unwrap()
+        }),
+    ))
+    .await
+    .unwrap();
+    let authorizer = Arc::new(StaticAuthorizer::new().with_chain(
+        "alice",
+        test_chain("user:alice", "agent:a", [Capability::new(SERVER, "read_*")]),
+    ));
+    let proxy = proxy_with(&up, authorizer.clone()).await;
+    let resp = reqwest::Client::new()
+        .post(proxy.url(&format!("/mcp/{SERVER}")))
+        .bearer_auth("alice")
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .body(
+            json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                   "params": {"name": "read_slowly", "arguments": {}}})
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut stream = Box::pin(resp.bytes_stream());
+    let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("first event")
+        .expect("stream open")
+        .unwrap();
+    assert!(String::from_utf8_lossy(&first).contains("notifications/progress"));
+
+    authorizer.revoke("alice");
+    let (text, took) = drain(stream, Duration::from_secs(5)).await;
+    assert!(took < RECHECK * 10, "took {took:?}");
+    assert_eq!(
+        last_event(&text)["error"]["data"]["reason"],
+        "lease_revoked"
     );
 }

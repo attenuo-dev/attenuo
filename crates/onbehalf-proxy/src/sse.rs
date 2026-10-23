@@ -162,20 +162,46 @@ fn rewrite_event(
     Ok(())
 }
 
-/// Wrap an upstream byte stream so that every JSON-RPC message in its events passes through
-/// `f`. A trailing event without its empty line is dropped; a transport error or an oversized
-/// or non-UTF-8 event ends the stream with an error.
-pub fn rewrite_stream<S, E>(
+/// Incremental SSE event splitter that emits complete events byte for byte, holding back a
+/// partial one. Used where the proxy relays a stream unchanged but must be able to append an
+/// event of its own at any point (see [`crate::guard`]).
+#[derive(Default)]
+pub struct SseFramer {
+    buf: Vec<u8>,
+}
+
+impl SseFramer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed a chunk; returns the bytes of every event it completes, unchanged.
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<u8>, io::Error> {
+        self.buf.extend_from_slice(chunk);
+        let mut end = 0;
+        while let Some(n) = find_event_end(&self.buf[end..]) {
+            end += n;
+        }
+        if self.buf.len() - end > MAX_EVENT_BYTES {
+            return Err(io::Error::other("SSE event larger than the proxy's limit"));
+        }
+        Ok(self.buf.drain(..end).collect())
+    }
+}
+
+/// Run every chunk of `upstream` through `push` and emit what it returns, skipping empty
+/// output. A transport error or an error from `push` ends the stream with that error.
+fn process_stream<S, E>(
     upstream: S,
-    f: impl FnMut(&mut Value) + Send + 'static,
+    push: impl FnMut(&[u8]) -> Result<Vec<u8>, io::Error> + Send + 'static,
 ) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static
 where
     S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
     E: std::error::Error + Send + Sync + 'static,
 {
     futures_util::stream::unfold(
-        (upstream, SseRewriter::new(), f, false),
-        |(mut upstream, mut rewriter, mut f, failed)| async move {
+        (upstream, push, false),
+        |(mut upstream, mut push, failed)| async move {
             if failed {
                 return None;
             }
@@ -183,19 +209,46 @@ where
                 match upstream.next().await {
                     None => return None,
                     Some(Err(e)) => {
-                        return Some((Err(io::Error::other(e)), (upstream, rewriter, f, true)))
+                        return Some((Err(io::Error::other(e)), (upstream, push, true)))
                     }
-                    Some(Ok(chunk)) => match rewriter.push(&chunk, &mut f) {
-                        Err(e) => return Some((Err(e), (upstream, rewriter, f, true))),
+                    Some(Ok(chunk)) => match push(&chunk) {
+                        Err(e) => return Some((Err(e), (upstream, push, true))),
                         Ok(out) if out.is_empty() => continue,
-                        Ok(out) => {
-                            return Some((Ok(Bytes::from(out)), (upstream, rewriter, f, false)))
-                        }
+                        Ok(out) => return Some((Ok(Bytes::from(out)), (upstream, push, false))),
                     },
                 }
             }
         },
     )
+}
+
+/// Wrap an upstream byte stream so that every JSON-RPC message in its events passes through
+/// `f`. A trailing event without its empty line is dropped; a transport error or an oversized
+/// or non-UTF-8 event ends the stream with an error.
+pub fn rewrite_stream<S, E>(
+    upstream: S,
+    mut f: impl FnMut(&mut Value) + Send + 'static,
+) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let mut rewriter = SseRewriter::new();
+    process_stream(upstream, move |chunk| rewriter.push(chunk, &mut f))
+}
+
+/// Wrap an upstream byte stream so that it yields whole events only, unchanged. A trailing
+/// event without its empty line is dropped (a client would discard it too); a transport error
+/// or an oversized event ends the stream with an error.
+pub fn frame_stream<S, E>(
+    upstream: S,
+) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let mut framer = SseFramer::new();
+    process_stream(upstream, move |chunk| framer.push(chunk))
 }
 
 #[cfg(test)]
@@ -282,6 +335,25 @@ mod tests {
     fn non_utf8_event_is_an_error() {
         let mut r = SseRewriter::new();
         assert!(r.push(b"data: \xff\xfe\n\n", &mut |_| {}).is_err());
+    }
+
+    #[test]
+    fn framer_emits_whole_events_unchanged() {
+        let whole = "event: message\r\ndata: {\"a\":1}\r\n\r\n: ping\n\ndata: x\rdata: y\r\r\n";
+        for cut in 0..whole.len() {
+            let (a, b) = whole.as_bytes().split_at(cut);
+            let mut f = SseFramer::new();
+            let mut out = f.push(a).unwrap();
+            out.extend(f.push(b).unwrap());
+            out.extend(f.push(b"\n").unwrap());
+            assert_eq!(out, format!("{whole}\n").as_bytes(), "cut at {cut}");
+        }
+        let mut f = SseFramer::new();
+        assert_eq!(f.push(b"data: 1\n\ndata: 2\n").unwrap(), b"data: 1\n\n");
+        assert_eq!(f.push(b"\n").unwrap(), b"data: 2\n\n");
+        assert!(SseFramer::new()
+            .push(&vec![b'a'; MAX_EVENT_BYTES + 1])
+            .is_err());
     }
 
     #[tokio::test]

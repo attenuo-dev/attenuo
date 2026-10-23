@@ -27,6 +27,13 @@
 //!    only that checked value is forwarded. Upstream responses with more than one session id
 //!    (or an invalid one) have the header removed and bind nothing (SR-27). See [`session`].
 //!
+//! 6. re-checks every response it streams (the `GET` listen stream, and a `POST` answered with
+//!    a streamed body such as SSE) every [`ProxyConfig::stream_recheck`] (default 2 s) against
+//!    the token's expiry and [`Authorizer::check_active`], and ends the stream at the first
+//!    failure: an SSE stream after a final event carrying JSON-RPC error `-32001` with
+//!    `data.reason` (`token_expired`, `lease_revoked`, ...), any other body with a transport
+//!    error (SR-28). See [`guard`].
+//!
 //! Every authorized request's response carries an `X-Onbehalf-Decision-Id` header with the
 //! id(s) of the decision record(s) the authorizer produced, so a client can correlate a reply
 //! with the audit log.
@@ -67,7 +74,7 @@
 //! - The proxy does not add credentials for the upstream; the bearer token it receives is
 //!   onbehalf's, not the upstream's, and is never forwarded.
 //! - A server-to-client stream (the `GET` SSE channel, including a resumed one) is not
-//!   inspected; the client's replies to
+//!   inspected beyond being relayed event by event and re-checked; the client's replies to
 //!   server requests are forwarded after a lease check, not authorized.
 //! - Authentication is performed per HTTP request; there is no caching of resolved chains.
 //!
@@ -76,6 +83,7 @@
 pub mod auth;
 pub mod config;
 pub mod filter;
+pub mod guard;
 pub mod jsonrpc;
 pub mod proxy;
 pub mod session;

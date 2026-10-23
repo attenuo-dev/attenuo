@@ -1,6 +1,7 @@
 //! Proxy configuration.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -24,14 +25,37 @@ impl UpstreamConfig {
     }
 }
 
+/// Default for [`ProxyConfig::stream_recheck`].
+pub const DEFAULT_STREAM_RECHECK: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProxyConfig {
     pub upstreams: Vec<UpstreamConfig>,
     pub listen: SocketAddr,
+    /// How often a long-lived response stream (the `GET` listen stream, or a `POST` answered
+    /// with a streamed body such as SSE) is re-checked against lease state and token expiry.
+    /// The stream is ended at the first failed check (SR-28). Default
+    /// [`DEFAULT_STREAM_RECHECK`]; a zero value is treated as one millisecond.
+    #[serde(default = "default_stream_recheck")]
+    pub stream_recheck: Duration,
+}
+
+fn default_stream_recheck() -> Duration {
+    DEFAULT_STREAM_RECHECK
 }
 
 impl ProxyConfig {
     pub fn new(listen: SocketAddr, upstreams: Vec<UpstreamConfig>) -> Self {
-        Self { upstreams, listen }
+        Self {
+            upstreams,
+            listen,
+            stream_recheck: DEFAULT_STREAM_RECHECK,
+        }
+    }
+
+    /// Set [`ProxyConfig::stream_recheck`].
+    pub fn with_stream_recheck(mut self, interval: Duration) -> Self {
+        self.stream_recheck = interval;
+        self
     }
 }

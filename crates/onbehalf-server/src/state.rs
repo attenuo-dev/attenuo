@@ -53,6 +53,7 @@ impl AppState {
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
         config.check_server_names()?;
         config.check_admin_token()?;
+        config.proxy.stream_recheck()?;
         let issuer = load_issuer(config)?;
         let verifier = issuer.verifier();
         let jwks = crate::jwks::jwks_from_keys(&issuer.trusted_public_keys())?;
