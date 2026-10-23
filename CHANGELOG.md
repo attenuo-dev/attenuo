@@ -31,6 +31,12 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 ### Changed
 
 - JWKS `kid` is now the first 16 bytes of SHA-256 over the SPKI DER, base64url (22 characters), replacing the 16 hex characters. A token whose `kid` is not trusted is rejected (`UnknownKeyId`); tokens without a `kid` are tried against every trusted key.
+- CI split into fmt, clippy, test (ubuntu, macOS), MSRV, cargo-deny, cargo-audit, demo, policy-test and docs (rustdoc and Markdown links) jobs. `.github/workflows/release.yml` builds musl and macOS archives, a signed multi-arch GHCR image with an SBOM, `SHA256SUMS` and a changelog section from the cliff config, and creates a draft release (untested until a tag is pushed).
+- `scripts/dev.sh`, `scripts/gen-admin-token.sh`, `scripts/check-links.py` and a `justfile`; `.editorconfig`, `SUPPORT.md`, a commented-out `.github/FUNDING.yml` and an MSRV badge.
+
+### Changed
+
+- MSRV (`rust-version`, `clippy.toml`) raised from 1.85 to 1.89, which the locked dependencies already required. Not tested on 1.89 itself; the CI `msrv` job will.
 - BREAKING: `POST /admin/root-token` is mounted only when `[dev] allow_root_mint = true` (default `false`); otherwise it answers 404.
 - `[[root_grants]]` entries no longer need a `subject`: without one an entry applies to every user of its `issuer`. The same list now caps IdP intake.
 - BREAKING: `LeaseStore` has a new required method `renew`; `onbehalf_proxy::Authorizer` has a new required method `check_active`, and `AuthError` a new variant `LeaseInactive`.
@@ -43,8 +49,11 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ### Fixed
 
+- A rustdoc intra-doc link in `onbehalf-proxy` to the feature-gated `testing` module broke `cargo doc` with `-D warnings`.
+
 ### Documentation
 
+- `docs/research/standards.md`: `draft-klrc-aiagent-auth` expired and is replaced by `draft-ietf-wimse-aims` (checked on the IETF datatracker).
 - Guides in `docs/guides/`: getting started, deploying (with the v0 limits stated plainly), integrating MCP clients, and identity providers (Keycloak, Auth0, Okta, Entra ID, Google; provider recipes marked untested). Index in `docs/guides/README.md`.
 - `docs/faq.md`: fifteen launch-day questions.
 - Positioning table in `docs/research/related-work.md`.

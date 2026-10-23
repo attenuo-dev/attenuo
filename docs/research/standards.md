@@ -54,6 +54,13 @@ Workload identity: each workload gets a SPIFFE ID and an X.509 or JWT SVID from 
 - **Gives us:** a stable, verifiable `actor` identity for each agent and sub-agent (the `actor_token` in an exchange), and a possible `cnf` binding for hop tokens.
 - **Gap:** identifies the workload, not the human or the delegation. Many agent runtimes do not run a SPIRE agent, so onbehalf must also accept other actor credentials (OAuth client credentials, signed client assertions).
 
+## IETF agent identity drafts: `draft-ietf-wimse-aims` (replaces `draft-klrc-aiagent-auth`)
+
+`draft-klrc-aiagent-auth` ("AI Agent Authentication and Authorization", last revision -03 of 2026-07-06) has expired. The IETF datatracker lists it as "no longer active" with the IESG state "Replaced by draft-ietf-wimse-aims" (AI Identity Management System), a WIMSE working group document. Checked on 2026-10-23: [datatracker.ietf.org/doc/draft-klrc-aiagent-auth/](https://datatracker.ietf.org/doc/draft-klrc-aiagent-auth/), successor at [datatracker.ietf.org/doc/draft-ietf-wimse-aims/](https://datatracker.ietf.org/doc/draft-ietf-wimse-aims/). Cite the successor, not the expired draft, and re-check its status before quoting. The successor's text has not been read, so nothing here depends on its content.
+
+- **Gives us:** nothing used yet. The "AIMS" that the vendor survey above lists among the subsets vendors build on ([Forkast](https://forkast.news/six-vendors-are-shipping-agent-identity-products-the-ietf-has-not-finished-the-standard/)) is presumably this line of work; that mapping is not verified.
+- **Gap:** not yet assessed against onbehalf's per-hop attenuation and lease model.
+
 ## What remains unowned after composing all of the above
 
 Carrying a verified originating user across N hops, monotonic attenuation of structured capabilities per hop, per-call argument policy reachable by any PEP, revocation that reaches in-flight runs, and an audit record that names agent and user separately. Each standard above supplies one piece; none specifies their composition. That composition is [RFC-0001](../spec/rfc-0001-onbehalf.md).

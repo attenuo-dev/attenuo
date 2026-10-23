@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/7Mudit/onbehalf/actions/workflows/ci.yml/badge.svg)](https://github.com/7Mudit/onbehalf/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![MSRV: 1.89](https://img.shields.io/badge/MSRV-1.89-blue.svg)](Cargo.toml)
 [![Status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-orange.svg)](docs/spec/rfc-0001-onbehalf.md)
 <!-- TODO once published: crates.io and docs.rs badges for onbehalf-core -->
 

@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Local pre-push checks: fmt, clippy, tests, and the GitHub leak demo.
+#
+#   scripts/dev.sh            # everything
+#   scripts/dev.sh fmt|clippy|test|demo|policy|docs|deny|links   # one step
+#
+# Mirrors .github/workflows/ci.yml. Steps whose tool is not installed (cargo-deny) are skipped
+# with a note rather than failing.
+set -euo pipefail
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+fmt()    { cargo fmt --all -- --check; }
+clippy() { cargo clippy --workspace --all-targets -- -D warnings; }
+test_()  { cargo test --workspace; }
+demo()   { bash examples/github-leak-demo/run.sh; }
+policy() { cargo run -q -p onbehalf-cli -- policy test examples/github-leak-demo/policy_test.yaml; }
+docs()   { RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps; }
+links()  { python3 scripts/check-links.py; }
+deny() {
+  if cargo deny --version >/dev/null 2>&1; then cargo deny check
+  else echo "cargo-deny not installed, skipping (cargo install cargo-deny)"; fi
+}
+
+run() {
+  printf '\n==> %s\n' "$1"
+  case "$1" in test) test_ ;; *) "$1" ;; esac
+}
+
+if [ "$#" -eq 0 ]; then
+  for step in fmt clippy test demo; do run "$step"; done
+  printf '\nfmt, clippy, test and demo passed. CI also runs: policy docs links deny\n'
+else
+  for step in "$@"; do
+    case "$step" in
+      fmt|clippy|test|demo|policy|docs|links|deny) run "$step" ;;
+      *) echo "unknown step: $step" >&2; exit 2 ;;
+    esac
+  done
+fi
