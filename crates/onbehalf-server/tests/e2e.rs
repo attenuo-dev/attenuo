@@ -1498,6 +1498,11 @@ async fn resources_and_unknown_methods_are_authorized_through_the_pipeline() {
 async fn exchanging_the_same_parent_for_the_same_actor_twice_is_refused() {
     let h = Harness::start().await;
     let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    // A refused exchange (it asks for more than the parent holds) does not use up the slot.
+    let refused = h
+        .exchange_raw(&root.token, "coder", &["gitlab:read_file"])
+        .await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
     let _coder = h
         .exchange(&root.token, "coder", &["github:read_file"])
         .await;

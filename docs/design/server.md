@@ -115,9 +115,9 @@ sequenceDiagram
         T-->>C: 400 invalid_grant "subject token cannot delegate: lease_revoked"
     end
     T->>T: actor already in the parent chain? 400 invalid_request duplicate_actor
-    T->>T: replay cache: (parent jti, actor) used before? 400 invalid_grant replayed
     T->>I: ExchangeRequest::execute (attenuation, depth, expiry clamp)
     I-->>T: child token (or 400 invalid_scope / invalid_grant)
+    T->>T: replay cache: (parent jti, actor) used before? 400 invalid_grant replayed, child dropped
     T->>L: register(child lease, parent = parent's last lease, expires_at), bind(child lease, chain digest)
     T->>G: append(allow, token_issued, onbehalf / token.exchange)
     T-->>C: {access_token, issued_token_type, token_type, expires_in, lease}
@@ -150,7 +150,7 @@ The root token of every chain is minted at `POST /token` from a user credential 
 4. **ID-JAG claims** (`idp::claims::map_id_jag`, the one place that depends on the draft's claim names): `client_id` is required and must be the authenticated agent.
 5. **Originating user** (`idp::claims::originating_user`): `subject` = `sub`, `issuer` = `iss`, `authenticated_at` = `auth_time`, else `iat`; `attributes` = the claims listed in `attribute_claims` (default `email`, `groups`, `amr`) plus `mfa: bool`, true when `amr` contains `mfa`, `otp`, `hwk` or `swk` (RFC 8176 values for a second factor or a key; `pwd`, `sms` and the rest do not count on their own).
 6. **Root grant.** The `[[root_grants]]` entry for (issuer, agent), preferring one whose `subject` equals `sub`, is the ceiling; `CapabilitySet::attenuate(requested)` must succeed. No entry: `invalid_scope` / `no_root_grant`. Wider than the entry: `invalid_scope` / `scope_exceeds_grant`.
-7. **Lifetime and one-time use.** The root token's TTL (requested, else the issuer default) is capped at the credential's remaining lifetime, `exp - now`; a credential inside the clock skew after its `exp` has none left and gets `invalid_grant` / `credential_expired`. The credential is then recorded in the replay cache (module `replay`) under (`iss`, `jti`), or the SHA-256 of the credential when it has no `jti`, until `exp` plus the skew. A second presentation, by any agent, is `invalid_grant` / `replayed`.
+7. **Lifetime and one-time use.** The root token's TTL (requested, else the issuer default) is capped at the credential's remaining lifetime, `exp - now`; a credential inside the clock skew after its `exp` has none left and gets `invalid_grant` / `credential_expired`. Once the root token is minted, the credential is recorded in the replay cache (module `replay`) under (`iss`, `jti`), or the SHA-256 of the credential when it has no `jti`, until `exp` plus the skew; a request refused earlier does not use the credential up. A second presentation, by any agent, is `invalid_grant` / `replayed`, and the token minted for it is dropped before its lease is registered.
 8. **Issue, register, audit**: `Issuer::issue_root`, a lease with no parent, and an audit record `token.root` / `token_issued`. If the audit append fails the lease is revoked and the request fails.
 
 `nonce` is ignored on purpose: it binds an ID token to the browser session that requested it, and the agent presenting it here is not that session. What stops someone who has only a leaked ID token is step 1; what limits an agent that has one is steps 6 and 7.

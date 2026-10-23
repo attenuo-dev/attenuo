@@ -164,16 +164,17 @@ pub async fn handle(
     }
     let ttl = Some(requested_ttl.min(remaining));
 
+    let issued =
+        state
+            .issuer
+            .issue_root(user, AgentId::new(agent.clone()), capabilities, ttl, now)?;
+    // Used once, recorded only after issuance succeeded; a refused token is never registered.
     let skew = i64::try_from(verified.clock_skew_seconds).unwrap_or(i64::MAX);
     state.replay.use_once(
         &verified.replay_key(credential),
         verified.expires_at.saturating_add(skew),
         now,
     )?;
-    let issued =
-        state
-            .issuer
-            .issue_root(user, AgentId::new(agent.clone()), capabilities, ttl, now)?;
     register_issued(
         state,
         &issued.token,

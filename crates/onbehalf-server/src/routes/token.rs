@@ -120,13 +120,16 @@ pub async fn exchange(
             ),
         ));
     }
-    // A parent token delegates to a given actor once (see `crate::replay`).
+    let resp = req.execute(&state.issuer, now)?;
+    // A parent token delegates to a given actor once (see `crate::replay`). Recorded only once
+    // the exchange has succeeded, so a refused request (say `invalid_scope`) does not use up
+    // the slot. If this refuses, the token just minted is dropped before its lease is
+    // registered, so it could not be used anyway.
     state.replay.use_once(
         &format!("exchange\n{}\n{}", parent.claims.jti, req.actor.0),
         parent.claims.exp,
         now,
     )?;
-    let resp = req.execute(&state.issuer, now)?;
     // The response carries no chain; read it back from the token we just minted.
     let issued = state.verifier.verify(&resp.access_token, now)?;
     let hop = issued
