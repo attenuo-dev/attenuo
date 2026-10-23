@@ -7,6 +7,10 @@ use onbehalf_server::{AppState, Config};
 use reqwest::StatusCode;
 use serde_json::Value;
 
+use sha2::Digest;
+
+const CODER_SECRET: &str = "coder-secret";
+
 struct Harness {
     server: Spawned,
     state: Arc<AppState>,
@@ -24,6 +28,11 @@ impl Harness {
             .into_owned();
         cfg.admin.token = Some("admin".into());
         cfg.dev.allow_root_mint = true;
+        // Exchanges authenticate as their actor (SR-10).
+        cfg.agents.push(onbehalf_server::config::AgentConfig {
+            id: "coder".into(),
+            secret_sha256: hex::encode(sha2::Sha256::digest(CODER_SECRET.as_bytes())),
+        });
         let (router, state) = onbehalf_server::build(&cfg).unwrap();
         let server = spawn_router(router).await.unwrap();
         Self {
@@ -141,6 +150,7 @@ async fn metrics_endpoint_reports_pipeline_and_token_activity() {
     let token = root["access_token"].as_str().unwrap().to_string();
     let child = reqwest::Client::new()
         .post(h.server.url("/token"))
+        .basic_auth("coder", Some(CODER_SECRET))
         .json(&json!({
             "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
             "subject_token": token,
