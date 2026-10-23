@@ -200,7 +200,11 @@ fn parse_jwks(doc: &Value, issuer: &str) -> Vec<CachedKey> {
             tracing::warn!(%issuer, "skipping a symmetric key in the JWKS");
             continue;
         }
-        if matches!(jwk.common.public_key_use, Some(ref u) if *u != PublicKeyUse::Signature) {
+        // A SPIFFE bundle marks JWT-SVID signing keys `use` = `jwt-svid` (X.509 roots are
+        // `x509-svid` and skipped); `[[actor_trust]]` reads such bundles through this cache.
+        if matches!(jwk.common.public_key_use, Some(ref u)
+            if *u != PublicKeyUse::Signature && *u != PublicKeyUse::Other("jwt-svid".into()))
+        {
             continue;
         }
         let alg = match jwk.common.key_algorithm {
@@ -268,6 +272,18 @@ mod tests {
         let keys = parse_jwks(&doc, "i");
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].kid.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn parse_keeps_spiffe_jwt_svid_keys_only() {
+        let mut svid = ed_jwk("svid");
+        svid["use"] = json!("jwt-svid");
+        svid.as_object_mut().unwrap().remove("alg");
+        let mut x509 = ed_jwk("x509");
+        x509["use"] = json!("x509-svid");
+        let keys = parse_jwks(&json!({"spiffe_sequence": 1, "keys": [svid, x509]}), "i");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].kid.as_deref(), Some("svid"));
     }
 
     #[test]
