@@ -241,7 +241,7 @@ Because there is no `amr`, `mfa` is always `false` for Google users. Policies th
 
 ### Any other OIDC provider
 
-Anything that publishes `/.well-known/openid-configuration` and signs ID tokens with RS256, ES256 or EdDSA should work, for example Dex, Authentik or Zitadel. Set `issuer` to the value in the discovery document's `issuer` field and `audience` to your client id. Not tested with any of them.
+Anything that publishes `/.well-known/openid-configuration` and signs ID tokens with RS256, ES256 or EdDSA should work, for example Dex, Authentik or Zitadel. Set `issuer` to the value in the discovery document's `issuer` field and put your client id under the agent in `client_ids`. Not tested with any of them.
 
 ## ID-JAG
 

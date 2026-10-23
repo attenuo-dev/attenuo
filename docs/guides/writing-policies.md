@@ -27,7 +27,7 @@ The principal is an `Agent`, and an agent is `in` the originating `User` and in 
 
 `resource` carries `readonly` and `sensitive`, taken from the catalog (below). `principal.chain_depth` is the 1-based position of the agent in the chain.
 
-Three things trip people up:
+Four things trip people up:
 
 - **Null and missing values.** Cedar has no `null`. Null arguments are dropped, and optional attributes must be guarded: `context.input has repo && context.input.repo like "acme/*"`. A policy that reads a missing attribute raises an evaluation error, and onbehalf then denies the call with `policy_error` rather than trusting a half-evaluated set.
 - **Action names are exact.** `Action::"github/read_*"` is not valid. To say "every read-only tool", tag tools in the catalog and test `resource.readonly`.

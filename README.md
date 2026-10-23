@@ -67,7 +67,7 @@ The first token in a chain is minted from a credential the user's IdP issued: an
 ```toml
 [[idps]]
 issuer = "https://your-tenant.example.com"   # exact `iss`
-audience = "your-client-id"                  # `aud` of the ID tokens
+client_ids = { planner = "your-client-id" }   # agent id -> the `aud` its ID tokens carry
 
 [[agents]]
 id = "planner"
@@ -79,7 +79,7 @@ agent = "planner"
 capabilities = ["github:*"]
 ```
 
-The agent exchanges the user's ID token for a root delegation token (RFC 8693), authenticating with its own client credentials. The token's originating user comes from the verified ID token: `sub`, `iss`, `auth_time`, the configured `attribute_claims`, and an `mfa` flag derived from `amr`.
+An ID token is accepted only from the agent whose `client_ids` entry its `aud` names (an agent without an entry must have a client id equal to its agent id). The agent exchanges the user's ID token for a root delegation token (RFC 8693), authenticating with its own client credentials. The token's originating user comes from the verified ID token: `sub`, `iss`, `auth_time`, the configured `attribute_claims`, and an `mfa` flag derived from `amr`.
 
 ```sh
 OB=http://127.0.0.1:8080
@@ -143,7 +143,7 @@ ROOT=$(curl -s -X POST $OB/admin/root-token -H "Authorization: Bearer $ADMIN" \
 ROOT_TOKEN=$(echo "$ROOT" | jq -r .access_token); ROOT_LEASE=$(echo "$ROOT" | jq -r .lease)
 ```
 
-Other endpoints: `POST /token/renew` (extend your lease), `POST /access/v1/evaluation` (AuthZEN; the delegation token as bearer is required unless `[authzen] allow_unsigned_chain` is set for authenticated `[[peps]]`), `GET /.well-known/jwks.json`, `GET /.well-known/authzen-configuration`, `POST /admin/policies/reload`, `GET /admin/leases/{id}`, `GET /admin/audit/checkpoint` (signed), `GET /admin/audit/export`, `GET /healthz`. The request pipeline is described in [docs/design/server.md](docs/design/server.md). Set `RUST_LOG=debug` for more logging.
+Other endpoints: `POST /token/renew` (extend your lease), `POST /access/v1/evaluation` and `/evaluations` (AuthZEN, single and batch; the delegation token as bearer is required unless `[authzen] allow_unsigned_chain` is set for authenticated `[[peps]]`), `GET /.well-known/jwks.json`, `GET /.well-known/authzen-configuration`, `POST /admin/policies/reload`, `GET /admin/leases/{id}`, `GET /admin/audit/checkpoint` (signed), `GET /admin/audit/export`, `GET /healthz`, `GET /readyz`. The request pipeline is described in [docs/design/server.md](docs/design/server.md). Set `RUST_LOG=debug` for more logging.
 
 ## Command line
 
@@ -177,7 +177,10 @@ from onbehalf import AdminClient, Capability, Client, Denied, Prefix
 admin = AdminClient("http://127.0.0.1:8080", "dev-admin-token-change-me")
 root = admin.mint_root_dev("alice", "https://idp.example", "planner", ["github:*"])   # dev only
 with Client("http://127.0.0.1:8080") as ob:
-    coder = ob.exchange(root, "coder", [Capability("github", "read_file", repo=Prefix("alice/public-"))])
+    coder = ob.exchange(
+        root, "coder", [Capability("github", "read_file", repo=Prefix("alice/public-"))],
+        client_secret="coder-secret-change-me",   # the coder authenticates as itself
+    )
     try:
         ob.call_tool(coder, "github", "create_issue", {"repo": "alice/public-docs", "title": "x"})
     except Denied as d:
@@ -198,9 +201,12 @@ const root = await admin.mintRootDev("alice", "https://idp.example", "planner", 
   capabilities: ["github:*"], // dev only
 });
 const ob = new OnbehalfClient("http://127.0.0.1:8080");
-const coder = await ob.exchange(root, "coder", [
-  capability("github", "read_file", { repo: prefix("alice/public-") }),
-]);
+const coder = await ob.exchange(
+  root,
+  "coder",
+  [capability("github", "read_file", { repo: prefix("alice/public-") })],
+  { clientSecret: "coder-secret-change-me" }, // the coder authenticates as itself
+);
 try {
   await ob.callTool(coder, "github", "create_issue", { repo: "alice/public-docs", title: "x" });
 } catch (e) {
