@@ -1,6 +1,6 @@
 # Performance: micro-benchmarks and end to end
 
-- Status: third measurement, after the policy-stage and WAL work (`perf/policy-stage-and-wal-checkpoints`)
+- Status: third measurement, after the policy-stage and WAL work (`perf/policy-stage-and-wal-checkpoints`); exchange, lease renewal and open-loop cells added 2026-10-23 (`perf/exchange-lease-bench`)
 - Crates: `onbehalf-policy` (`benches/authorize.rs`, `benches/policy_stage.rs`), `onbehalf-core` (`benches/attenuation.rs`), `onbehalf-server` (`benches/decide.rs`, the decision path by stage), `onbehalf-bench` (end to end)
 - Related: [server pipeline](server.md), [ADR-0006](../decisions/0006-lease-based-in-flight-revocation.md)
 
@@ -251,12 +251,75 @@ Readings:
 - **Token verification is negligible on a cache hit** (5 to 9 us), and `response` handling is 10 to 21 us.
 - **Inside the handler, about 40 us is in no stage** (the allow-call stage means add up to 447 of a 485 us mean `total` in memory at one hop): reading and parsing the body, screening, building the decision record, the session gate and re-encoding. **Outside the handler**, the client's p50 is about 225 us above the handler's (661 against 437 us). That covers the client-to-proxy HTTP exchange, axum and hyper, and relaying the body. Subtracting medians gives only a rough split.
 
+### Exchange throughput, lease renewal and open-loop arrivals (2026-10-23)
+
+Branch `perf/exchange-lease-bench`, base def86a9, new code in `crates/onbehalf-bench/src/exchange.rs`. Full tables and the raw rows: [`bench/2026-10-23-vm-exchange-lease.md`](bench/2026-10-23-vm-exchange-lease.md) and `.json`. Three additions to the harness:
+
+- **`exchange`**: N closed-loop clients, each holding its own token (a root, or a chain of three hops), exchange it at `POST /token` for a child delegated to a fresh actor on every request. The server allows one delegation per parent and actor, so the actor ids are generated (`xa-<run>-<client>-<seq>`, never repeated). The server runs with `require_actor_auth = false` for this, which leaves out one SHA-256 comparison per request. Audit store memory or file (`normal`).
+- **`lease-renew`**: M live leases (groups of one root and 99 children), every lease renewing at interval T through `POST /token/renew`, first renewals spread evenly over one interval, with a 300 s lease so renewals really move the expiry. Latency is measured from the time a renewal was due. After the cells, the time to revoke the root of a tree of depth 3 with 100 descendants (a root, 10 children, 9 grandchildren under each).
+- **`--open-loop RATE[,RATE]`**: Poisson arrivals at a fixed rate instead of a fixed number of clients, on the existing proxied `tools/call` cell (top-level flag, with the call straight at the upstream at the same rate as the baseline) and on `exchange`. Latency runs from the scheduled arrival, so a slow server is not let off by the generator waiting for it. At most 1,024 requests are in flight; further arrivals are dropped and counted as `shed`. The lease cells are scheduled by the clock and need no flag.
+
+Every cell also reads the server's CPU from `/proc/<pid>/stat`. Same environment and caveats as the earlier sections: shared 4-core VM, load average 3 to 10, one run per cell, plus or minus 20 percent. 10 s cells after 2 s of warm-up.
+
+**Exchange**, 1 and 8 clients, req/s (p50 / p99 ms in brackets); "hops" is the length of the token being exchanged:
+
+| Audit, hops | 1 client | 8 clients | server CPU per exchange |
+|---|---|---|---|
+| memory, 1 | 844 (1.08 / 2.3) | 2,249 (3.2 / 9.3) | 1.0 to 1.2 ms |
+| memory, 3 | 676 (1.35 / 2.8) | 1,832 (4.0 / 11.2) | 1.3 to 1.4 ms |
+| file, 1 | 649 (1.27 / 5.7) | 1,121 (6.1 / 23.6) | 1.2 to 1.3 ms |
+| file, 3 | 430 (1.40 / 11.2) | 833 (7.8 / 44.8) | 1.4 ms |
+
+An exchange costs the server about 1 ms of CPU, two to three times a proxied allow call (420 to 600 us in the open-loop cells below). That is the Ed25519 signing, the verification of the parent and of the token just minted, the lease registration and an audit record. A three-hop parent costs 20 to 30 percent more than a root. At 8 clients the in-memory server used 2.5 cores of the 4 and the generator the rest, so these are rates for this VM, not for the server alone. The file store is about half the in-memory rate at 8 clients and has the longer tail, as for calls. Open loop, 1-hop token: memory held 500 and 1,500 arrivals per second (p99 7.9 and 33 ms); file held 500 (p99 35 ms) and, in this pass, 1,500 (p50 27 ms, p99 290 ms), which is where its closed-loop rate of 1,100 to 1,200 says the knee is; see the note on run-to-run spread in the bench file.
+
+**Lease renewal**, T = 1 s unless stated, latency from the due time (service time from the send in brackets):
+
+| Audit | Leases | Offered / achieved per s | p50 / p99 ms | Server CPU | CPU per renewal |
+|---|---|---|---|---|---|
+| memory | 100 | 100 / 100 | 1.5 / 5.0 (0.66 / 3.4) | 5% of a core | 530 us |
+| memory | 1,000 | 1,000 / 1,000 | 2.0 / 57 (0.62 / 51) | 49% | 490 us |
+| memory | 5,000 | 5,000 / 4,985 | 23 / 227 (16 / 157) | 225% | 450 us |
+| memory | 5,000, T = 10 s | 500 / 500 | 2.2 / 6.7 (0.74 / 4.3) | 38% | 770 us |
+| file | 100 | 100 / 100 | 2.1 / 6.4 (0.85 / 4.8) | 7% | 740 us |
+| file | 1,000 | 1,000 / 1,000 | 2.5 / 768 (1.1 / 736) | 67% | 670 us |
+| file | 5,000 | 5,000 / 1,600 | 8,271 / 13,707 | saturated | n/a |
+| file | 5,000, T = 10 s | 500 / 500 | 1.9 / 76 (0.95 / 75) | 39% | 790 us |
+
+Idle CPU with the leases live and nothing renewing was below the 10 ms tick resolution in every cell: live leases cost nothing until they renew. Server memory (RSS) went from 22 to 25 MB at 100 leases to 68 to 206 MB at 5,000 in the in-memory store; most of the growth is that store keeping every renewal record, not the leases (the file store went 60 to 74 MB).
+
+Revoke cascade, root of a depth-3 tree with 100 descendants, 5 runs per store (revoked 101 leases each time; a descendant's renewal was refused afterwards): memory 1.0 / 1.2 / 3.0 ms (min / median / max), file 14.6 / 19.4 / 26.6 ms, including the HTTP round trip and the admin audit record. About 190 us per lease on the file store, 12 us in memory.
+
+**Open-loop `tools/call`** (allow, 1 hop, direct baseline at the same rate). `svc` is send to answer, without the generator's own 1 ms scheduling lag:
+
+| Audit | Rate per s | svc p50 / p99 ms, proxy | svc p50 / p99 ms, direct | Added svc p50 | Server CPU per call |
+|---|---|---|---|---|---|
+| memory | 500 | 0.92 / 4.9 | 0.29 / 0.53 | 0.63 ms | 520 us |
+| memory | 2,000 | 1.03 / 4.4 | 0.28 / 0.82 | 0.75 ms | 470 us |
+| file | 500 | 0.97 / 2.9 | 0.30 / 0.94 | 0.67 ms | 610 us |
+| file | 2,000 | 1.08 / 15.6 | 0.30 / 0.75 | 0.78 ms | 530 us |
+
+The achieved rate matched the offered rate in every call cell and nothing was shed. The added p50 (0.63 to 0.78 ms) is larger than the closed-loop single-client figure (0.43 to 0.63 ms in [Time by stage](#time-by-stage-of-a-proxied-call-2026-10-23)) because the open-loop generator opens concurrent requests, and the baseline here is 0.29 ms instead of 0.07 ms for the same reason. The p99 of the file store at 2,000 per second (15.6 ms) shows its tail starting before its throughput limit does.
+
+What this means:
+
+- **Lease renewal is cheap per lease and expensive only at an unrealistic interval.** A renewal costs the server 450 to 790 us of CPU, about as much as a proxied call. With the default 300 s lease and a renewal at half of it, 5,000 live leases are about 33 renewals per second, 2 to 3 percent of one core if the per-renewal cost holds at that rate (extrapolated linearly from the 500 per second cells, not measured). Pushed to 5,000 renewals per second, the in-memory store kept up at 225 percent of a core with a p99 of 227 ms, and the file store did not (1,600 per second, a queue that never drained). So the number to take from this run for sizing is about 2,000 renewals per second per core for in-memory and well under 5,000 per second for the file store on this VM, not the 5,000-lease cells at T = 1 s read as a deployment.
+- **The file store's renewal tail is long, and the cause was not found.** At 1,000 per second its p99 was 0.77 s with a median of 2.5 ms. The renewal path makes two writes (the lease row and an audit record); stalls in the writer are the likely cause, but this run has no measurement that separates them from host load (the average was 9.7 at the end of the lease run).
+- **Every renewal writes an audit record.** At 500 per second that is 43 million records a day; at the 33 per second above, 2.9 million. This is a growth rate for the audit log to budget for, and a reason to look at whether renewals need a record each (a design question, not made here).
+- **Revocation is fast enough to be called immediate** at this size: 101 leases in about a millisecond in memory and 20 ms on file (HTTP round trip included). It scales with the number of descendants, and 100 is small. Larger trees were not tried.
+- **Exchange is a once-per-delegation cost**, about 1 ms of server CPU, so an agent that delegates once per task adds that to the task start, not to each call.
+
+What was not measured: renewal traffic and `tools/call` traffic at the same time (so the effect of a renewal load on call latency, which is what RQ2 asks, is inferred from the CPU figures, not observed); renewals with a DPoP-bound token; exchanges with client-secret checking; trees larger than 100 descendants; more than one run per cell. The generator's own cost is in every number: its 1 ms timer lag is shown, its CPU share is not.
+
 ### How to run
 
 ```
 scripts/bench-e2e.sh                       # full matrix, about 9 minutes, writes docs/design/bench/
 DURATION=10 scripts/bench-e2e.sh --concurrency 8 --depths 3 --audit memory
 cargo run --release -p onbehalf-bench -- --help
+onbehalf-bench exchange --audit memory,file --clients 1,8 --depths 1,3          # exchange throughput
+onbehalf-bench exchange --audit memory --depths 1 --open-loop 500,1500          # open loop
+onbehalf-bench lease-renew --cells 100:1,1000:1,5000:1 --cascade-runs 5         # lease renewal and revoke cascade
+onbehalf-bench --open-loop 500,2000 --depths 1 --outcomes allow --audit memory  # proxied call, open loop
 cargo bench -p onbehalf-policy --bench policy_stage -- --warm-up-time 1 --measurement-time 3
 cargo bench -p onbehalf-server --bench decide -- --warm-up-time 1 --measurement-time 3
 ```
@@ -265,8 +328,8 @@ cargo bench -p onbehalf-server --bench decide -- --warm-up-time 1 --measurement-
 
 ## Not measured
 
-- `POST /token` exchange throughput and `POST /token/renew` load (the harness only uses exchanges for setup).
+- Renewal load and `tools/call` load at the same time, `POST /token/renew` with DPoP-bound tokens, and exchanges with the actor's client secret checked (see [Exchange throughput, lease renewal and open-loop arrivals](#exchange-throughput-lease-renewal-and-open-loop-arrivals-2026-10-23)).
 - Policy size (the set here has three policies) and catalog size.
 - The time outside the proxy's handler (hyper and axum parsing the client's request, relaying a streamed body). The handler's stages are in `onbehalf_proxy_stage_seconds`; what lies between them and the client's latency is measured only as a difference.
-- Open-loop load at fixed arrival rates, confidence intervals over repeated runs, and a quiet reference machine.
+- Confidence intervals over repeated runs, open-loop load for the deny outcomes and for more than one hop, and a quiet reference machine. (Open-loop arrivals exist now, for the allow call at one hop and for exchange.)
 - Streaming (SSE) responses and `tools/list` filtering.
