@@ -127,6 +127,15 @@ export interface ExchangeOptions {
    * not a delegation token and client credentials are given.
    */
   subjectTokenType?: string;
+  /**
+   * RFC 8693 actor token: a workload-identity JWT (for example a SPIFFE JWT-SVID) from an
+   * `[[actor_trust]]` issuer that authenticates `actor` instead of (or as well as) a client
+   * secret. Sent with `actor_token_type` `urn:ietf:params:oauth:token-type:jwt`. Each actor
+   * token authenticates one exchange.
+   */
+  actorToken?: string;
+  /** RFC 8693 §4.4 `may_act` for the new token: the agents allowed to exchange it next. */
+  mayAct?: readonly string[];
 }
 
 export function exchangeBody(
@@ -137,6 +146,12 @@ export function exchangeBody(
 ): Json {
   if (opts.clientId !== undefined && !opts.clientSecret) {
     throw new TypeError("clientId and clientSecret go together");
+  }
+  if (opts.actorToken !== undefined && opts.actorToken.trim() === "") {
+    throw new TypeError("actorToken is empty");
+  }
+  if (opts.mayAct !== undefined && typeof opts.mayAct === "string") {
+    throw new TypeError("mayAct is a list of agent ids, not a string");
   }
   // A hop n+1 exchange authenticates as its actor.
   const clientId = opts.clientSecret && opts.clientId === undefined ? actor : opts.clientId;
@@ -157,6 +172,11 @@ export function exchangeBody(
     body.client_id = clientId;
     body.client_secret = opts.clientSecret;
   }
+  if (opts.actorToken !== undefined) {
+    body.actor_token = opts.actorToken.trim();
+    body.actor_token_type = TYPE_JWT;
+  }
+  if (opts.mayAct !== undefined) body.may_act = { sub: [...opts.mayAct] };
   return body;
 }
 

@@ -114,6 +114,19 @@ pub struct ExchangeArgs {
     /// (the default).
     #[arg(long, env = "ONBEHALF_CLIENT_SECRET", hide_env_values = true)]
     pub client_secret: Option<String>,
+    /// RFC 8693 actor token authenticating `--actor`: a workload-identity JWT (for example a
+    /// SPIFFE JWT-SVID) from an `[[actor_trust]]` issuer, or `-` to read it from stdin. Sent as
+    /// `actor_token` with `actor_token_type` `urn:ietf:params:oauth:token-type:jwt`. Each
+    /// token authenticates one exchange.
+    #[arg(long, conflicts_with = "actor_token_file")]
+    pub actor_token: Option<String>,
+    /// Read the actor token from this file (for example the JWT-SVID a SPIFFE helper writes).
+    #[arg(long, value_name = "PATH")]
+    pub actor_token_file: Option<std::path::PathBuf>,
+    /// RFC 8693 `may_act` for the new token: an agent allowed to exchange it next. Repeatable;
+    /// values may also be comma-separated. Without it, any authenticated agent may.
+    #[arg(long = "may-act", value_name = "AGENT")]
+    pub may_act: Vec<String>,
     /// Capability `server:tool`, or a full capability as a JSON object. Repeatable; plain
     /// `server:tool` values may also be comma-separated. Must be covered by the parent's capabilities.
     #[arg(long = "cap", required = true)]
@@ -124,6 +137,44 @@ pub struct ExchangeArgs {
     /// Print only this value, for scripts.
     #[arg(long, value_enum)]
     pub print: Option<Field>,
+}
+
+impl ExchangeArgs {
+    /// The actor token from `--actor-token` (`-` reads `stdin`) or `--actor-token-file`,
+    /// trimmed; `None` when neither is given.
+    pub fn actor_token(&self, stdin: impl std::io::Read) -> anyhow::Result<Option<String>> {
+        use anyhow::Context;
+        let raw = match (&self.actor_token, &self.actor_token_file) {
+            (None, None) => return Ok(None),
+            (Some(t), _) if t == "-" => {
+                let mut s = String::new();
+                let mut stdin = stdin;
+                stdin
+                    .read_to_string(&mut s)
+                    .context("reading the actor token from stdin")?;
+                s
+            }
+            (Some(t), _) => t.clone(),
+            (None, Some(path)) => std::fs::read_to_string(path)
+                .with_context(|| format!("reading actor token {}", path.display()))?,
+        };
+        let token = raw.trim().to_string();
+        if token.is_empty() {
+            anyhow::bail!("the actor token is empty");
+        }
+        Ok(Some(token))
+    }
+
+    /// `--may-act` values, split on commas, without empties.
+    pub fn may_act(&self) -> Vec<String> {
+        self.may_act
+            .iter()
+            .flat_map(|v| v.split(','))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
 }
 
 #[derive(Debug, Args)]
@@ -428,6 +479,65 @@ mod tests {
         };
         assert_eq!(e.client_secret.as_deref(), Some("s3cret"));
         assert!(parse(&["token", "exchange", "--subject-token", "J", "--actor", "c"]).is_err());
+    }
+
+    #[test]
+    fn exchange_actor_token_from_flag_stdin_or_file() {
+        let exchange = |extra: &[&str]| {
+            let mut args = vec![
+                "token",
+                "exchange",
+                "--subject-token",
+                "J",
+                "--actor",
+                "coder",
+                "--cap",
+                "github:read_file",
+            ];
+            args.extend_from_slice(extra);
+            match parse(&args).map(|c| c.command) {
+                Ok(Command::Token(TokenCmd::Exchange(e))) => Ok(e),
+                Ok(_) => panic!("not exchange"),
+                Err(e) => Err(e),
+            }
+        };
+        let none = exchange(&[]).unwrap();
+        assert_eq!(none.actor_token(std::io::empty()).unwrap(), None);
+        assert!(none.may_act().is_empty());
+
+        let flag = exchange(&[
+            "--actor-token",
+            " a.b.c\n",
+            "--may-act",
+            "x,y",
+            "--may-act",
+            "z",
+        ])
+        .unwrap();
+        assert_eq!(
+            flag.actor_token(std::io::empty()).unwrap().as_deref(),
+            Some("a.b.c")
+        );
+        assert_eq!(flag.may_act(), ["x", "y", "z"]);
+
+        let stdin = exchange(&["--actor-token", "-"]).unwrap();
+        assert_eq!(
+            stdin.actor_token(&b"s.v.id\n"[..]).unwrap().as_deref(),
+            Some("s.v.id")
+        );
+        assert!(stdin.actor_token(&b"  \n"[..]).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("svid.jwt");
+        std::fs::write(&path, "f.i.le\n").unwrap();
+        let file = exchange(&["--actor-token-file", path.to_str().unwrap()]).unwrap();
+        assert_eq!(
+            file.actor_token(std::io::empty()).unwrap().as_deref(),
+            Some("f.i.le")
+        );
+        let missing = exchange(&["--actor-token-file", "/nonexistent/svid"]).unwrap();
+        assert!(missing.actor_token(std::io::empty()).is_err());
+        assert!(exchange(&["--actor-token", "x", "--actor-token-file", "y"]).is_err());
     }
 
     #[test]

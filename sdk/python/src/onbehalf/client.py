@@ -72,6 +72,9 @@ class Client:
         client_id: str | None = None,
         client_secret: str | None = None,
         subject_token_type: str | None = None,
+        *,
+        actor_token: str | None = None,
+        may_act: Iterable[str] | None = None,
     ) -> Token:
         """RFC 8693 token exchange: trade ``subject_token`` for a narrower token held by ``actor``.
 
@@ -81,6 +84,12 @@ class Client:
         hop 0 (an IdP credential), pass ``client_id`` and ``client_secret`` of a registered
         agent; the subject token type then defaults to an OIDC ID token, or set
         ``subject_token_type`` to ``urn:ietf:params:oauth:token-type:id-jag`` for an ID-JAG.
+
+        Instead of a client secret, a hop n+1 exchange can authenticate the actor with
+        ``actor_token``: a workload-identity JWT (for example a SPIFFE JWT-SVID) from an
+        ``[[actor_trust]]`` issuer, sent with ``actor_token_type``
+        ``urn:ietf:params:oauth:token-type:jwt``. Each actor token authenticates one exchange.
+        ``may_act`` lists the agents allowed to exchange the new token next (RFC 8693 §4.4).
 
         Raises :class:`~onbehalf.ApiError` (``invalid_scope``, ``invalid_grant``, ...) on refusal.
         """
@@ -92,6 +101,8 @@ class Client:
             client_id,
             client_secret,
             subject_token_type,
+            actor_token=actor_token,
+            may_act=may_act,
         )
         return w.token_from_response(w.json_body(self._http.post("/token", json=body)))
 
@@ -238,6 +249,9 @@ class AsyncClient:
         client_id: str | None = None,
         client_secret: str | None = None,
         subject_token_type: str | None = None,
+        *,
+        actor_token: str | None = None,
+        may_act: Iterable[str] | None = None,
     ) -> Token:
         body = w.exchange_body(
             subject_token,
@@ -247,6 +261,8 @@ class AsyncClient:
             client_id,
             client_secret,
             subject_token_type,
+            actor_token=actor_token,
+            may_act=may_act,
         )
         return w.token_from_response(w.json_body(await self._http.post("/token", json=body)))
 
