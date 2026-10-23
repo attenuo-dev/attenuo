@@ -41,6 +41,10 @@
 //! asserted. A mismatch is 400 `invalid_request` / `actor_mismatch`. An `actor` that already
 //! appears in the parent chain is 400 `invalid_request` / `duplicate_actor`.
 //!
+//! An actor token is used once: a second exchange with the same token (same `jti`, or the same
+//! signed content when it has none) is 400 `invalid_grant` / `replayed`. The child token's
+//! expiry is also capped at the actor token's `exp`.
+//!
 //! Besides what `ExchangeRequest::execute` checks (signature, chain validity, attenuation,
 //! depth), the parent's leases must all be live: a revoked parent cannot delegate. A parent
 //! token delegates to a given actor once; a second exchange of the same parent for the same
@@ -231,7 +235,29 @@ fn exchange_sync(
             ),
         ));
     }
-    let resp = req.execute(&state.issuer, now)?;
+    // The child never outlives the actor token that authenticated the exchange.
+    let not_after = match &actor {
+        Some((verified, _)) => {
+            if verified.expires_at - now.unix_timestamp() < 1 {
+                return Err(clientauth::invalid_request(
+                    "actor_token_expired",
+                    "the actor_token expires now; present a fresh one",
+                ));
+            }
+            Some(
+                OffsetDateTime::from_unix_timestamp(verified.expires_at)
+                    .map_err(|e| ApiError::bad_request("invalid_request", e.to_string()))?,
+            )
+        }
+        None => None,
+    };
+    let resp = req.execute_until(&state.issuer, now, not_after)?;
+    // An actor token authenticates one exchange (see `crate::replay`), keyed by its `jti`.
+    if let Some((verified, token)) = &actor {
+        state
+            .replay
+            .use_once(&verified.replay_key(token), verified.replay_until(), now)?;
+    }
     // A parent token delegates to a given actor once (see `crate::replay`). Recorded only once
     // the exchange has succeeded, so a refused request (say `invalid_scope`) does not use up
     // the slot. If this refuses, the token just minted is dropped before its lease is

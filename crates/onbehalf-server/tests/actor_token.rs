@@ -536,3 +536,72 @@ async fn actor_token_in_form_encoding() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+/// An actor token authenticates one exchange, and the child never outlives it.
+#[tokio::test]
+async fn actor_tokens_are_single_use_and_cap_the_child_ttl() {
+    let h = Harness::start(|_| {}).await;
+    let svid = h.keys.svid(CODER_ID);
+    let (status, _) = h
+        .with_actor_token(&h.root_token().await, "coder", &svid)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    // Same token, another parent: refused.
+    let (status, v) = h
+        .with_actor_token(&h.root_token().await, "coder", &svid)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(code(&v), ("invalid_grant", "replayed"), "{v}");
+
+    // Without a jti the signed content is the key.
+    let mut claims = h.keys.svid_claims(CODER_ID);
+    claims.as_object_mut().unwrap().remove("jti");
+    let no_jti = h.keys.svid.sign(&claims);
+    let (status, _) = h
+        .with_actor_token(&h.root_token().await, "coder", &no_jti)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, v) = h
+        .with_actor_token(&h.root_token().await, "coder", &no_jti)
+        .await;
+    assert_eq!(code(&v).1, "replayed", "{v}");
+
+    // A short-lived actor token caps the child's expiry (the parent lives 900 s).
+    let exp = now() + 45;
+    let mut claims = h.keys.svid_claims(CODER_ID);
+    claims["exp"] = exp.into();
+    let (status, v) = h
+        .with_actor_token(&h.root_token().await, "coder", &h.keys.svid.sign(&claims))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let child = h
+        .state
+        .verifier
+        .verify(
+            v["access_token"].as_str().unwrap(),
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+    assert_eq!(child.claims.exp, exp);
+    assert!(v["expires_in"].as_u64().unwrap() <= 45, "{v}");
+}
+
+/// A refused exchange (say, too wide) does not use up the actor token.
+#[tokio::test]
+async fn refused_exchange_does_not_consume_the_actor_token() {
+    let h = Harness::start(|_| {}).await;
+    let root = h.root_token().await;
+    let svid = h.keys.svid(CODER_ID);
+    let (status, v) = h
+        .exchange(
+            &root,
+            "coder",
+            json!({"actor_token": svid, "actor_token_type": JWT,
+                   "authorization_details": [{"type": "onbehalf_capabilities",
+                       "capabilities": [{"server": "gitlab", "tool": "read_file"}]}]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    let (status, v) = h.with_actor_token(&root, "coder", &svid).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+}
