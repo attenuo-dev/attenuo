@@ -4,7 +4,7 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 
 ## Now
 
-- [ ] Rename: run `scripts/rename.py --to <name> --apply` once the name is decided (candidates Creance, Attenuo, Plenipo; plan and compatibility decisions in [rename-plan](../design/rename-plan.md)); then regenerate lockfiles, `cargo fmt --all`, full test run, update launch drafts, and work the post-rename checklist.
+- [x] Rename: run `scripts/rename.py --to <name> --apply` once the name is decided (candidates Creance, Attenuo, Plenipo; plan and compatibility decisions in [rename-plan](../design/rename-plan.md)); then regenerate lockfiles, `cargo fmt --all`, full test run, update launch drafts, and work the post-rename checklist. Done 2026-10-23: renamed to attenuo, repository attenuo-dev/attenuo.
 - [ ] Audit rejected `initialize` on a revoked lease: LangChain's MCP adapter opens a session per call, so a call after revocation fails with 401 at `initialize` and leaves no audit record (only the `admin.lease.revoke` entry). Decide whether rejected session opens for a known token should be audited.
 - [ ] `attenuo-core`: `Capability`, `CapabilitySet`, constraint types (set, numeric range, time range), `⊑` predicate.
 - [ ] `attenuo-core`: proptest suite for `⊑` (reflexive, transitive, empty-set minimal, adding a key narrows, removing a value narrows, widening fails).
