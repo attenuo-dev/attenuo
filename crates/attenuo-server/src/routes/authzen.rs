@@ -50,6 +50,8 @@ use crate::state::AppState;
 /// Error code when a body chain does not match what this server issued.
 pub const CHAIN_NOT_ISSUED: &str = "chain_not_issued";
 
+// The `Err` is a full response, built once per refused request; boxing it buys nothing.
+#[allow(clippy::result_large_err)]
 pub async fn evaluation(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -72,6 +74,8 @@ pub async fn evaluation(
 /// `invalid_request` for none). Only the default `execute_all` semantic is supported. An
 /// authentication failure refuses the whole request; any other per-entry failure answers
 /// `decision: false` with `context.error` for that entry.
+// The `Err` is a full response, built once per refused request; boxing it buys nothing.
+#[allow(clippy::result_large_err)]
 pub async fn evaluations(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
