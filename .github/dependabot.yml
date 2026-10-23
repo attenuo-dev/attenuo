@@ -11,6 +11,8 @@ updates:
     groups:
       cargo-minor-and-patch:
         update-types: ["minor", "patch"]
+      cargo-major:
+        update-types: ["major"]
     labels: ["dependencies", "rust"]
 
   - package-ecosystem: github-actions
