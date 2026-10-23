@@ -27,6 +27,7 @@
 
 - [Server request pipeline](design/server.md)
 - [Performance](design/performance.md)
+  - [End-to-end benchmark, 2026-10-23](design/bench/2026-10-23-vm.md)
 
 # Policy
 
@@ -63,6 +64,7 @@
 - [Related work](research/related-work.md)
 - [Evaluation plan](research/evaluation-plan.md)
 - [Security review, pass 1](research/security-review-2026-10-22.md)
+  - [Security review, pass 3](research/security-review-2026-10-23.md)
 - [Open-source project practices](research/oss-project-practices.md)
 
 # Project
