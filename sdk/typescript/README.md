@@ -9,7 +9,7 @@ cd sdk/typescript
 npm install && npm run build   # ESM + CJS + .d.ts in dist/
 ```
 
-Node 20 or newer, zero runtime dependencies. It uses the global `fetch` and WebCrypto (`crypto.subtle` with `Ed25519`) for local token verification. It is the same API as the [Python SDK](../python/README.md), with camelCase names and promises.
+Node 20 or newer (Ed25519 in WebCrypto needs no flag there: it is available since Node 18.4, still documented as experimental), zero runtime dependencies. It uses the global `fetch` and WebCrypto (`crypto.subtle` with `Ed25519`) for local token verification. It is the same API as the [Python SDK](../python/README.md), with camelCase names and promises.
 
 ## Quickstart
 
