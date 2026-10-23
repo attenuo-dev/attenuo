@@ -2,11 +2,17 @@
 //!
 //! The Cedar resource id of a call is `"<server>/<tool>"` and its action id is
 //! `Action::"<server>/<tool>"`, so a name must never be able to make two different
-//! `(server, tool)` pairs look alike (SR-13). The rules:
+//! `(server, tool)` pairs look alike (SR-13), and two spellings of one name must never reach
+//! different rules (SR-25). The rules:
 //!
-//! - A **server name** is one segment: no `/`.
+//! - A **segment** is 1 or more ASCII letters, digits, `_`, `.` or `-` (`[A-Za-z0-9_.-]+`).
+//!   No spaces, no `/`, no `:` (the capability separator), no `*` (the glob), no control
+//!   characters and nothing outside ASCII, so there are no look-alike or differently
+//!   normalized forms of one name.
+//! - A **server name** is one segment.
 //! - A **tool name**, as an MCP server lists it in `tools/list` and a client sends it in
-//!   `tools/call` `params.name`, is one segment: no `/`.
+//!   `tools/call` `params.name`, is one segment. This is the character set the MCP
+//!   specification recommends for tool names.
 //! - A **call name** is what [`ToolCall::tool`](crate::ToolCall::tool) and a capability's `tool`
 //!   hold: a tool name, or an MCP method name made of segments joined by single `/`
 //!   (`resources/read`, `prompts/get`, `vendor/x`), which the proxy uses for methods other than
@@ -16,7 +22,13 @@
 //! With no `/` in server names, `"<server>/<call name>"` splits at its first `/` into exactly
 //! one pair.
 //!
-//! Names are compared exactly (case-sensitively, byte for byte). Nothing is normalized.
+//! Every name is at most [`MAX_NAME_LEN`] bytes.
+//!
+//! Names are compared exactly (case-sensitively, byte for byte). Nothing is normalized:
+//! `Delete_Repo` and `delete_repo` are different names. An upstream that resolves names
+//! case-insensitively could still run `delete_repo` for a call to `Delete_Repo`; the proxy
+//! closes that by refusing a `tools/call` whose name the upstream did not list
+//! (`[proxy] require_listed_tools`).
 
 use serde::{Deserialize, Serialize};
 
@@ -57,9 +69,9 @@ pub enum NameError {
     },
 }
 
-/// Is `c` allowed inside one name segment?
+/// Is `c` allowed inside one name segment: `[A-Za-z0-9_.-]`?
 pub fn is_name_char(c: char) -> bool {
-    c != '/' && !c.is_control()
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')
 }
 
 fn invalid(kind: NameKind, name: &str, c: char) -> NameError {
@@ -193,6 +205,35 @@ mod tests {
         for bad in ["/read", "read/", "a//b", "/", ""] {
             assert!(check_call_name(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn only_ascii_letters_digits_underscore_dot_and_dash_sr25() {
+        for ok in ["read_file", "read-file", "v1.list", "A_Z-09"] {
+            assert!(check_tool_name(ok).is_ok(), "{ok}");
+            assert!(check_server_name(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "read file",
+            "read\nfile",
+            "read:file",
+            "read*file",
+            "re\u{0430}d_file",    // Cyrillic a
+            "\u{FF44}elete_repo",  // fullwidth d
+            "delete_repo\u{200B}", // zero-width space
+            "caf\u{E9}",
+            "a\u{0}b",
+        ] {
+            assert!(
+                matches!(check_tool_name(bad), Err(NameError::InvalidChar { .. })),
+                "{bad:?}"
+            );
+            assert!(check_server_name(bad).is_err(), "{bad:?}");
+            assert!(check_call_name(bad).is_err(), "{bad:?}");
+        }
+        // The error escapes the name, so it is safe to log.
+        let e = check_tool_name("a\nb").unwrap_err().to_string();
+        assert!(!e.contains('\n'), "{e}");
     }
 
     #[test]

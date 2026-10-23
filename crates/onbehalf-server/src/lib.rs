@@ -96,13 +96,15 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
         state.pipeline.clone(),
     ));
     let proxy = onbehalf_proxy::router(
-        ProxyConfig::new(config.server.listen, upstreams).with_stream_recheck(
-            // Validated in `AppState::from_config`.
-            config
-                .proxy
-                .stream_recheck()
-                .unwrap_or(onbehalf_proxy::config::DEFAULT_STREAM_RECHECK),
-        ),
+        ProxyConfig::new(config.server.listen, upstreams)
+            .with_stream_recheck(
+                // Validated in `AppState::from_config`.
+                config
+                    .proxy
+                    .stream_recheck()
+                    .unwrap_or(onbehalf_proxy::config::DEFAULT_STREAM_RECHECK),
+            )
+            .with_require_listed_tools(config.proxy.require_listed_tools),
         authorizer,
     );
     api.merge(proxy).layer(axum::middleware::from_fn_with_state(

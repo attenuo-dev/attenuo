@@ -416,12 +416,19 @@ pub struct ProxySection {
     /// ended at the first failed check (SR-28). Default 2, at least 1.
     #[serde(default = "default_stream_recheck_seconds")]
     pub stream_recheck_seconds: u64,
+    /// Deny a `tools/call` (reason `tool_not_listed`, audited) whose exact name is neither in
+    /// the upstream's `tools/list` results seen so far nor in `[policy.catalog]`, so an upstream
+    /// that resolves names case-insensitively cannot run `delete_repo` for `Delete_Repo`
+    /// (SR-25). Default `true`.
+    #[serde(default = "default_true")]
+    pub require_listed_tools: bool,
 }
 
 impl Default for ProxySection {
     fn default() -> Self {
         Self {
             stream_recheck_seconds: default_stream_recheck_seconds(),
+            require_listed_tools: true,
         }
     }
 }
@@ -701,6 +708,17 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn require_listed_tools_defaults_to_on_sr25() {
+        assert!(Config::from_toml("").unwrap().proxy.require_listed_tools);
+        assert!(
+            !Config::from_toml("[proxy]\nrequire_listed_tools = false\n")
+                .unwrap()
+                .proxy
+                .require_listed_tools
+        );
+    }
+
     #[test]
     fn proxy_stream_recheck_defaults_to_two_seconds_and_refuses_zero() {
         let cfg = super::Config::from_toml("").unwrap();

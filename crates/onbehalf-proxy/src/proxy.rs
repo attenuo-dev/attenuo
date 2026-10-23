@@ -29,6 +29,7 @@ use crate::jsonrpc::{
     CODE_INVALID_PARAMS, CODE_INVALID_REQUEST, CODE_PARSE_ERROR, CODE_UNAUTHORIZED,
     CODE_UNKNOWN_SERVER, CODE_UPSTREAM,
 };
+use crate::listed::ListedTools;
 use crate::session::{session_tag, SessionCheck, SessionOwner, SessionRegistry};
 
 /// Response header carrying the decision record id(s) of every `tools/call` in the request,
@@ -38,6 +39,14 @@ pub const DECISION_ID_HEADER: &str = "x-onbehalf-decision-id";
 /// Reason code (audit and JSON-RPC `data.reason`) for a request carrying an `Mcp-Session-Id`
 /// bound to another principal (SR-11).
 pub const REASON_SESSION_MISMATCH: &str = "session_mismatch";
+
+/// Reason code for a `tools/call` whose name is not a valid tool name
+/// ([`onbehalf_core::names`]; SR-25).
+pub const REASON_INVALID_NAME: &str = "invalid_name";
+
+/// Reason code for a `tools/call` whose name the upstream never listed and the catalog does not
+/// know, with [`ProxyConfig::require_listed_tools`] on (SR-25).
+pub const REASON_TOOL_NOT_LISTED: &str = "tool_not_listed";
 
 const HEADER_MCP_SESSION_ID: &str = "mcp-session-id";
 
@@ -63,6 +72,10 @@ struct AppState {
     sessions: SessionRegistry,
     /// [`ProxyConfig::stream_recheck`].
     stream_recheck: Duration,
+    /// [`ProxyConfig::require_listed_tools`].
+    require_listed_tools: bool,
+    /// Tool names each upstream has listed (SR-25).
+    listed: Arc<ListedTools>,
 }
 
 impl AppState {
@@ -75,6 +88,7 @@ impl AppState {
 /// Build the proxy router. Upstreams are mounted at `/mcp/{name}`.
 pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
     let stream_recheck = config.stream_recheck;
+    let require_listed_tools = config.require_listed_tools;
     let upstreams = config
         .upstreams
         .into_iter()
@@ -86,6 +100,8 @@ pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
         authorizer,
         sessions: SessionRegistry::default(),
         stream_recheck,
+        require_listed_tools,
+        listed: Arc::new(ListedTools::new()),
     });
     Router::new()
         .route(
@@ -629,7 +645,7 @@ async fn handle_post_inner(
     let is_sse = content_type.starts_with("text/event-stream");
 
     let mut response = if needs_buffer && is_json {
-        buffer_and_rewrite(resp, chain, server, &screened, is_batch).await
+        buffer_and_rewrite(state, resp, chain, server, &screened, is_batch).await
     } else if has_lists && is_sse {
         // The list response is an event of the stream, alone or inside a batch: filter each
         // event as it passes. Replies the proxy generated itself lead the stream.
@@ -638,8 +654,14 @@ async fn handle_post_inner(
         let server = server.to_owned();
         let prelude = sse_prelude(&screened.replies);
         let guard = state.stream_guard(chain);
+        let listed = state.listed.clone();
         stream_response_filtered(resp, prelude, guard, move |msg| {
-            let removed = ListFilter::new(&pending, &caps, &server).apply(msg);
+            let filter = ListFilter::new(&pending, &caps, &server);
+            let names = filter.listed_tool_names(msg);
+            if !names.is_empty() {
+                listed.record(&server, names.iter().map(String::as_str));
+            }
+            let removed = filter.apply(msg);
             if removed > 0 {
                 tracing::debug!(removed, "filtered list result in SSE stream");
             }
@@ -729,6 +751,13 @@ async fn screen_message(
                 out.replies.push(invalid("tools/call requires params.name"));
                 return;
             };
+            if let Some(reason) = tool_name_refusal(state, server, &name) {
+                refuse_call(
+                    state, chain, server, session_id, &name, id, reason, now, out,
+                )
+                .await;
+                return;
+            }
             let arguments = match params.and_then(|p| p.get("arguments")) {
                 None | Some(Value::Null) => Value::Object(Default::default()),
                 Some(v @ Value::Object(_)) => v.clone(),
@@ -797,6 +826,50 @@ async fn screen_message(
     }
 }
 
+/// Why a `tools/call` for `name` must be refused before a decision, if it must (SR-25): the
+/// name is not a valid tool name, or (with `require_listed_tools`) neither the upstream listed
+/// it nor the catalog knows it.
+fn tool_name_refusal(state: &AppState, server: &str, name: &str) -> Option<&'static str> {
+    if onbehalf_core::names::check_tool_name(name).is_err() {
+        return Some(REASON_INVALID_NAME);
+    }
+    if state.require_listed_tools
+        && !state.listed.contains(server, name)
+        && !state.authorizer.knows_tool(server, name)
+    {
+        return Some(REASON_TOOL_NOT_LISTED);
+    }
+    None
+}
+
+/// Deny a `tools/call` the proxy refuses on its own: record it through
+/// [`Authorizer::record_rejection`] and reply with a denial.
+#[allow(clippy::too_many_arguments)]
+async fn refuse_call(
+    state: &AppState,
+    chain: &DelegationChain,
+    server: &str,
+    session_id: Option<&str>,
+    name: &str,
+    id: Value,
+    reason: &'static str,
+    now: OffsetDateTime,
+    out: &mut Screened,
+) {
+    let mut call = ToolCall::new(server, name, serde_json::json!({}));
+    if let Some(sid) = session_id {
+        call = call.with_session(session_tag(sid));
+    }
+    let decision_id = state
+        .authorizer
+        .record_rejection(chain, &call, reason, now)
+        .await;
+    // `name` is caller-controlled: Debug-format it so it cannot forge log lines.
+    tracing::warn!(tool = ?name, reason, %decision_id, "tools/call refused");
+    out.decision_ids.push(decision_id);
+    out.replies.push(denied_response(id, reason, decision_id));
+}
+
 /// Lease check for a message forwarded without a decision. On failure, a request gets a
 /// `-32001` reply and a notification is dropped; returns whether to forward.
 async fn lease_live(
@@ -829,6 +902,7 @@ async fn lease_live(
 /// Read a JSON upstream response fully, filter list results and merge in the replies
 /// the proxy generated for a batch, then re-encode.
 async fn buffer_and_rewrite(
+    state: &AppState,
     resp: reqwest::Response,
     chain: &DelegationChain,
     server: &str,
@@ -863,7 +937,14 @@ async fn buffer_and_rewrite(
     // A chain with no hops has no capabilities: list nothing.
     let no_caps = CapabilitySet::new();
     let caps = chain.effective_capabilities().unwrap_or(&no_caps);
-    let removed = ListFilter::new(&screened.list_requests, caps, server).apply(&mut value);
+    let filter = ListFilter::new(&screened.list_requests, caps, server);
+    let names = filter.listed_tool_names(&value);
+    if !names.is_empty() {
+        state
+            .listed
+            .record(server, names.iter().map(String::as_str));
+    }
+    let removed = filter.apply(&mut value);
     if removed > 0 {
         tracing::debug!(removed, "filtered list result");
     }

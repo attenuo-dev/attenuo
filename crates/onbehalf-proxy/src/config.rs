@@ -38,10 +38,19 @@ pub struct ProxyConfig {
     /// [`DEFAULT_STREAM_RECHECK`]; a zero value is treated as one millisecond.
     #[serde(default = "default_stream_recheck")]
     pub stream_recheck: Duration,
+    /// Deny a `tools/call` (reason `tool_not_listed`) whose exact name the upstream never
+    /// returned from `tools/list` and the authorizer's catalog does not know
+    /// ([`crate::Authorizer::knows_tool`]). Default `true` (SR-25); see [`crate::listed`].
+    #[serde(default = "default_true")]
+    pub require_listed_tools: bool,
 }
 
 fn default_stream_recheck() -> Duration {
     DEFAULT_STREAM_RECHECK
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl ProxyConfig {
@@ -50,7 +59,14 @@ impl ProxyConfig {
             upstreams,
             listen,
             stream_recheck: DEFAULT_STREAM_RECHECK,
+            require_listed_tools: true,
         }
+    }
+
+    /// Set [`ProxyConfig::require_listed_tools`].
+    pub fn with_require_listed_tools(mut self, on: bool) -> Self {
+        self.require_listed_tools = on;
+        self
     }
 
     /// Set [`ProxyConfig::stream_recheck`].

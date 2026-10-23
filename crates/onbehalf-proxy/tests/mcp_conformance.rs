@@ -219,12 +219,6 @@ fn cases() -> Vec<Case> {
             "Tools/List",
             vec![cap("Tools/List")],
         ),
-        decided(
-            "tools/list ",
-            json!({}),
-            "tools/list ",
-            vec![cap("tools/list ")],
-        ),
         notification("notifications/initialized"),
         notification("notifications/cancelled"),
         notification("notifications/roots/list_changed"),
@@ -317,6 +311,26 @@ async fn unpermitted_requests_are_denied_and_never_forwarded() -> anyhow::Result
             assert_eq!(decisions[0].decision, Decision::Deny, "{label}");
             assert_eq!(decisions[0].tool, case.tool, "{label}");
         }
+    }
+    Ok(())
+}
+
+/// SR-25: a method name outside the name rules (`[A-Za-z0-9_.-]` segments joined by `/`) is
+/// never permitted, not even by `*`: no capability can name it.
+#[tokio::test]
+async fn near_miss_method_names_are_never_permitted() -> anyhow::Result<()> {
+    for method in ["tools/list ", "tools/call\u{200B}", "resources/re\u{0430}d"] {
+        let h = Harness::start(test_chain("user:a", "agent:a", [cap("*")])).await?;
+        let (status, body) = h
+            .post(&json!({"jsonrpc": "2.0", "id": 3, "method": method, "params": {}}))
+            .await?;
+        let label = format!("{method:?} -> {status} {body}");
+        assert_eq!(body["error"]["code"], CODE_DENIED, "{label}");
+        assert!(h.upstream.recorded_methods().is_empty(), "{label}");
+        assert!(
+            Capability::new(SERVER, method).validate().is_err(),
+            "{label}"
+        );
     }
     Ok(())
 }
