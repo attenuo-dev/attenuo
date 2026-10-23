@@ -429,7 +429,7 @@ async fn sse_responses_are_streamed_through() -> anyhow::Result<()> {
     assert_eq!(data["id"], 1);
     assert!(data.get("result").is_some());
 
-    // tools/list over SSE: passed through unfiltered (documented v0 limitation)
+    // tools/list over SSE is still an SSE stream (filtering is covered in list_filtering.rs)
     let resp = h
         .rpc(
             Some("tok"),

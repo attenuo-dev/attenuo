@@ -1,5 +1,6 @@
-//! The axum router: authentication, `tools/call` interception, `tools/list` filtering, and
-//! transparent forwarding of everything else.
+//! The axum router: authentication, `tools/call` interception, list-result filtering
+//! (`tools/list`, `resources/list`, `resources/templates/list`, `prompts/list`), and transparent
+//! forwarding of everything else.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
 use futures_util::StreamExt;
-use onbehalf_core::{DelegationChain, ToolCall};
+use onbehalf_core::{CapabilitySet, DelegationChain, ToolCall};
 use serde_json::Value;
 use time::OffsetDateTime;
 use tower_http::trace::TraceLayer;
@@ -21,7 +22,7 @@ use uuid::Uuid;
 
 use crate::auth::{AuthError, Authorizer};
 use crate::config::ProxyConfig;
-use crate::filter::filter_tools_response;
+use crate::filter::{ListFilter, ListKind};
 use crate::jsonrpc::{
     self, denied_response, error_response, id_of, is_passthrough_method, is_request, method_of,
     CODE_INVALID_PARAMS, CODE_INVALID_REQUEST, CODE_PARSE_ERROR, CODE_UNAUTHORIZED,
@@ -359,8 +360,9 @@ struct Screened {
     replies: Vec<Value>,
     /// Decision ids of every `tools/call`, in request order.
     decision_ids: Vec<Uuid>,
-    /// Ids of `tools/list` requests, whose responses must be filtered.
-    tools_list_ids: Vec<Value>,
+    /// Ids and kinds of the list requests (`tools/list`, `resources/list`,
+    /// `resources/templates/list`, `prompts/list`), whose responses must be filtered.
+    list_requests: Vec<(Value, ListKind)>,
     /// Result of the lease check made for messages forwarded without a per-call decision;
     /// made at most once per HTTP request.
     lease_check: Option<Result<(), AuthError>>,
@@ -533,23 +535,48 @@ async fn handle_post_inner(
         Err(e) => return upstream_error(e),
     };
 
-    let needs_buffer = !screened.tools_list_ids.is_empty() || !screened.replies.is_empty();
-    let is_json = resp
+    let has_lists = !screened.list_requests.is_empty();
+    let needs_buffer = has_lists || !screened.replies.is_empty();
+    let content_type = resp
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.trim_start().starts_with("application/json"))
-        .unwrap_or(false);
+        .map(|ct| ct.trim_start().to_ascii_lowercase())
+        .unwrap_or_default();
+    let is_json = content_type.starts_with("application/json");
+    let is_sse = content_type.starts_with("text/event-stream");
 
     let mut response = if needs_buffer && is_json {
         buffer_and_rewrite(resp, chain, server, &screened, is_batch).await
+    } else if has_lists && is_sse {
+        // The list response is an event of the stream, alone or inside a batch: filter each
+        // event as it passes. Replies the proxy generated itself lead the stream.
+        let pending = screened.list_requests.clone();
+        let caps = chain.effective_capabilities().cloned().unwrap_or_default();
+        let server = server.to_owned();
+        let prelude = sse_prelude(&screened.replies);
+        stream_response_filtered(resp, prelude, move |msg| {
+            let removed = ListFilter::new(&pending, &caps, &server).apply(msg);
+            if removed > 0 {
+                tracing::debug!(removed, "filtered list result in SSE stream");
+            }
+        })
+    } else if has_lists && !matches!(resp.status().as_u16(), 202 | 204) {
+        // Neither JSON nor SSE: the proxy cannot tell what is in it, and a list result must
+        // not reach the client unfiltered. Fail closed.
+        tracing::error!(
+            content_type,
+            status = %resp.status(),
+            "upstream answered a list request with a body the proxy cannot filter"
+        );
+        let body = error_response(
+            Value::Null,
+            CODE_UPSTREAM,
+            "onbehalf: upstream answered a list request with an unsupported content type",
+            None,
+        );
+        json_response(StatusCode::BAD_GATEWAY, &body)
     } else {
-        if !screened.tools_list_ids.is_empty() {
-            tracing::warn!(
-                "upstream answered tools/list over a non-JSON response; passing through \
-                 unfiltered (v0 limitation)"
-            );
-        }
         let prelude = sse_prelude(&screened.replies);
         stream_response(resp, prelude, &[])
     };
@@ -586,8 +613,10 @@ async fn screen_message(
         if !lease_live(state, chain, &msg, now, out).await {
             return;
         }
-        if method == jsonrpc::METHOD_TOOLS_LIST && is_request(&msg) {
-            out.tools_list_ids.push(id_of(&msg));
+        if let Some(kind) = ListKind::from_method(&method) {
+            if is_request(&msg) {
+                out.list_requests.push((id_of(&msg), kind));
+            }
         }
         out.forward.push(msg);
         return;
@@ -714,7 +743,7 @@ async fn lease_live(
     }
 }
 
-/// Read a JSON upstream response fully, filter `tools/list` results and merge in the replies
+/// Read a JSON upstream response fully, filter list results and merge in the replies
 /// the proxy generated for a batch, then re-encode.
 async fn buffer_and_rewrite(
     resp: reqwest::Response,
@@ -732,28 +761,28 @@ async fn buffer_and_rewrite(
     let mut value: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {
+            if !screened.list_requests.is_empty() {
+                // A list result the proxy cannot parse is one it cannot filter.
+                tracing::error!(error = %e, "upstream answered a list request with invalid JSON");
+                let body = error_response(
+                    Value::Null,
+                    CODE_UPSTREAM,
+                    "onbehalf: upstream answered a list request with invalid JSON",
+                    None,
+                );
+                return json_response(StatusCode::BAD_GATEWAY, &body);
+            }
             tracing::warn!(error = %e, "upstream JSON response did not parse; passing through");
             return build_response(status, &headers, Body::from(bytes));
         }
     };
 
-    let caps = chain.effective_capabilities();
-    let mut filter = |v: &mut Value| {
-        if screened.tools_list_ids.contains(&id_of(v)) {
-            if let Some(caps) = caps {
-                let removed = filter_tools_response(v, caps, server);
-                tracing::debug!(removed, "filtered tools/list");
-            } else {
-                // A chain with no hops has no capabilities: list nothing.
-                if let Some(r) = v.get_mut("result") {
-                    r["tools"] = Value::Array(vec![]);
-                }
-            }
-        }
-    };
-    match &mut value {
-        Value::Array(items) => items.iter_mut().for_each(&mut filter),
-        other => filter(other),
+    // A chain with no hops has no capabilities: list nothing.
+    let no_caps = CapabilitySet::new();
+    let caps = chain.effective_capabilities().unwrap_or(&no_caps);
+    let removed = ListFilter::new(&screened.list_requests, caps, server).apply(&mut value);
+    if removed > 0 {
+        tracing::debug!(removed, "filtered list result");
     }
 
     if !screened.replies.is_empty() || (is_batch && !value.is_array()) {
@@ -802,6 +831,25 @@ fn stream_response(
         response.headers_mut().insert(k.clone(), v.clone());
     }
     response
+}
+
+/// Like [`stream_response`] for an SSE body, with `filter` run over every JSON-RPC message in
+/// its events (see [`crate::sse`]).
+fn stream_response_filtered(
+    resp: reqwest::Response,
+    prelude: Option<Bytes>,
+    filter: impl FnMut(&mut Value) + Send + 'static,
+) -> Response {
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let filtered = crate::sse::rewrite_stream(resp.bytes_stream(), filter);
+    let body = match prelude {
+        Some(p) => Body::from_stream(
+            futures_util::stream::once(async { Ok::<_, std::io::Error>(p) }).chain(filtered),
+        ),
+        None => Body::from_stream(filtered),
+    };
+    build_response(status, &headers, body)
 }
 
 fn build_response(status: StatusCode, upstream_headers: &HeaderMap, body: Body) -> Response {

@@ -22,6 +22,9 @@ pub const CODE_UPSTREAM: i64 = -32005;
 /// MCP method names the proxy understands.
 pub const METHOD_TOOLS_CALL: &str = "tools/call";
 pub const METHOD_TOOLS_LIST: &str = "tools/list";
+pub const METHOD_RESOURCES_LIST: &str = "resources/list";
+pub const METHOD_RESOURCES_TEMPLATES_LIST: &str = "resources/templates/list";
+pub const METHOD_PROMPTS_LIST: &str = "prompts/list";
 pub const METHOD_RESOURCES_READ: &str = "resources/read";
 pub const METHOD_RESOURCES_SUBSCRIBE: &str = "resources/subscribe";
 pub const METHOD_PROMPTS_GET: &str = "prompts/get";
@@ -34,9 +37,9 @@ pub const PASSTHROUGH_METHODS: &[&str] = &[
     "initialize",
     "ping",
     METHOD_TOOLS_LIST,
-    "resources/list",
-    "resources/templates/list",
-    "prompts/list",
+    METHOD_RESOURCES_LIST,
+    METHOD_RESOURCES_TEMPLATES_LIST,
+    METHOD_PROMPTS_LIST,
     "logging/setLevel",
 ];
 

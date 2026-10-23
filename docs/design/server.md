@@ -44,9 +44,26 @@ The proxy turns every request that can read data or cause an effect into a `Tool
 | `completion/complete` | `completion/complete` | `params` as sent |
 | any other method outside the allowlist | the method name | `params` as sent (or `{}`) |
 
-Forwarded after authentication and the lease check, with no decision: `initialize`, `ping`, `tools/list` (response filtered), `resources/list`, `resources/templates/list`, `prompts/list`, `logging/setLevel`, `notifications/*`, and messages without a `method` (client replies to server requests). The default is deny: an unknown method such as `sampling/createMessage` or `resources/unsubscribe` passes only if a capability and the policy permit a tool named after it. A request missing `params.name` or `params.uri` where the mapping needs one is answered with `-32602` and is not forwarded.
+Forwarded after authentication and the lease check, with no decision: `initialize`, `ping`, `tools/list`, `resources/list`, `resources/templates/list` and `prompts/list` (the four list responses are filtered, below), `logging/setLevel`, `notifications/*`, and messages without a `method` (client replies to server requests). The default is deny: an unknown method such as `sampling/createMessage` or `resources/unsubscribe` passes only if a capability and the policy permit a tool named after it. A request missing `params.name` or `params.uri` where the mapping needs one is answered with `-32602` and is not forwarded.
 
-A capability grants these like a tool: `github:resources/read` with constraint `uri` prefix `file:///public/` allows reads under that prefix; `github:prompts/get` allows prompts. A broad `github:*` capability covers all of them, which is a reason to prefer narrow grants. The Cedar action is the method name, so catalog entries and policies for `resources/read` use that string. The `resources/list` and `prompts/list` results are not filtered (v0).
+A capability grants these like a tool: `github:resources/read` with constraint `uri` prefix `file:///public/` allows reads under that prefix; `github:prompts/get` allows prompts. A broad `github:*` capability covers all of them, which is a reason to prefer narrow grants. The Cedar action is the method name, so catalog entries and policies for `resources/read` use that string.
+
+### List filtering
+
+A list result only shows what the chain could ever be permitted to use. Each entry is mapped to the request that would use it, exactly as the table above maps requests, and kept when some capability in `chain.effective_capabilities()` could permit that request. A chain with no capabilities lists nothing.
+
+| List method | Result member | Entry key | Kept when a capability matches server and tool pattern... | and its constraint on... (if any) accepts the key |
+|---|---|---|---|---|
+| `tools/list` | `tools` | `name` | the tool name | none (arguments unknown) |
+| `resources/list` | `resources` | `uri` | `resources/read` | `uri` |
+| `resources/templates/list` | `resourceTemplates` | `uriTemplate` | `resources/read` | none (a template is not a URI) |
+| `prompts/list` | `prompts` | `name` | `prompts/get` | `name` |
+
+Constraints on any other argument are ignored, as they are for tools: the question is "could this ever be allowed", not "is this call allowed". An entry without its key is dropped. Cedar policy is not consulted (it needs a concrete call and writes an audit record); a listed entry can still be denied when used. `nextCursor` and every other member pass through unchanged, and the request's `cursor` is forwarded as sent. A page can therefore be empty and still carry a `nextCursor`, which clients must follow ([MCP pagination](https://modelcontextprotocol.io/specification/2025-06-18/server/utilities/pagination): a missing `nextCursor` marks the end, page size is the server's choice).
+
+The filter applies wherever the response arrives ([Streamable HTTP, 2025-06-18](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports)): in an `application/json` body, in a JSON-RPC batch response (the 2025-03-26 revision allows batches, 2025-06-18 removed them; the proxy accepts them), and in a `text/event-stream` body, where the proxy parses events incrementally (LF, CRLF and CR line ends, multi-line `data:`, events split across reads) and re-serializes every event that carries JSON, whether it holds one message or a batch. The server may put requests and notifications before the response on the stream; those are forwarded as they are. Only a message with no `method` and an `id` that matches a list request of this HTTP request is treated as a list response, so a notification or request carrying a `result` member never is. Fail closed: a list request answered with a body that is neither JSON nor SSE (other than `202`/`204`), with JSON that does not parse, or with an SSE event that is oversized (16 MiB) or not UTF-8 gets `502` or a broken stream, and a final SSE event with no terminating blank line is dropped, as a client would drop it.
+
+`notifications/tools/list_changed`, `notifications/resources/list_changed`, `notifications/prompts/list_changed` and `notifications/resources/updated` carry no list data and pass through (`202`, no body). Clients re-list after one and get a filtered list.
 
 Every decided call also has to name a `(server, tool)` pair that is in the tool catalog. `[policy] unknown_tools` sets what happens otherwise: `"deny"` (the default) denies after the capability stage with reason `tool_not_in_catalog`, recorded in the audit log like any decision; `"sensitive"` evaluates the call with `resource.sensitive = true`, so MFA-style `forbid` rules apply; `"allow"` evaluates it with default attributes, which is how v0 behaved and lets `forbid ... when { resource.sensitive }` fail open (SR-12). Methods decided as tools (`resources/read`, `prompts/get` and the rest) need catalog entries under their method name too. Server names must not contain `/` (`Tool::"<server>/<tool>"` would be ambiguous); the server refuses to start when an upstream, catalog entry or root grant uses one.
 
@@ -266,4 +283,5 @@ Non-MCP endpoints answer errors as `{"error": "<code>", "detail": "<text>"}` wit
 - SQLite calls run on the async worker threads; fine at demo load, to be moved to `spawn_blocking` or a pool.
 - No lease cache and no push channel: every request reads the registry, and external PEPs using the AuthZEN endpoint learn of revocation only by asking.
 - Failed renewals are not audited (only successful ones).
-- `resources/list`, `resources/templates/list` and `prompts/list` results are not filtered by capability.
+- List filtering does not cover the `GET` listen stream. The spec lets a server send a response on it when resuming a stream (`Last-Event-ID`), and such a replayed list response is passed through unfiltered. Not seen in practice; fixing it means tracking which request ids are in flight per session.
+- List filtering is by capability only, not by Cedar policy; and a resource template is listed whenever any `resources/read` capability for the server exists, even if every `uri` constraint would exclude what the template expands to.

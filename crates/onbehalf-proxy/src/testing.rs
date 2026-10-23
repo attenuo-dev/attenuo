@@ -67,14 +67,23 @@ pub struct RecordedCall {
 }
 
 /// A minimal Streamable HTTP MCP server: `initialize`, `tools/list`, `tools/call`,
+/// `resources/list`, `resources/templates/list`, `prompts/list` (all optionally paginated),
 /// notifications, batches. Mounted at `POST /mcp`.
 #[derive(Clone)]
 pub struct FakeMcpServer {
     tools: Vec<Value>,
+    resources: Vec<Value>,
+    resource_templates: Vec<Value>,
+    prompts: Vec<Value>,
+    /// Entries per page for the four list methods; `None` returns everything at once.
+    page_size: Option<usize>,
     calls: Arc<Mutex<Vec<RecordedCall>>>,
     methods: Arc<Mutex<Vec<String>>>,
     /// When set, every response is sent as a single `text/event-stream` event instead of JSON.
     sse: bool,
+    /// With `sse`: send each response of a batch as its own event, preceded by a server
+    /// notification event, like a streaming server does (instead of one event per HTTP reply).
+    sse_event_per_response: bool,
     session_id: String,
 }
 
@@ -92,11 +101,58 @@ impl FakeMcpServer {
                     })
                 })
                 .collect(),
+            resources: Vec::new(),
+            resource_templates: Vec::new(),
+            prompts: Vec::new(),
+            page_size: None,
             calls: Arc::new(Mutex::new(Vec::new())),
             methods: Arc::new(Mutex::new(Vec::new())),
             sse: false,
+            sse_event_per_response: false,
             session_id: "fake-session-1".into(),
         }
+    }
+
+    /// Resources returned by `resources/list`, one per URI.
+    pub fn with_resources(mut self, uris: &[&str]) -> Self {
+        self.resources = uris
+            .iter()
+            .map(|u| json!({"uri": u, "name": format!("fake resource {u}")}))
+            .collect();
+        self
+    }
+
+    /// Resource templates returned by `resources/templates/list`, one per URI template.
+    pub fn with_resource_templates(mut self, templates: &[&str]) -> Self {
+        self.resource_templates = templates
+            .iter()
+            .map(|t| json!({"uriTemplate": t, "name": format!("fake template {t}")}))
+            .collect();
+        self
+    }
+
+    /// Prompts returned by `prompts/list`, one per name.
+    pub fn with_prompts(mut self, names: &[&str]) -> Self {
+        self.prompts = names
+            .iter()
+            .map(|n| json!({"name": n, "description": format!("fake prompt {n}")}))
+            .collect();
+        self
+    }
+
+    /// Paginate `tools/list`, `resources/list`, `resources/templates/list` and `prompts/list`
+    /// with this many entries per page. The cursor is the index of the next entry as a string;
+    /// the last page has no `nextCursor`.
+    pub fn with_page_size(mut self, size: usize) -> Self {
+        self.page_size = Some(size.max(1));
+        self
+    }
+
+    /// With SSE on: answer a batch with one event per response, after a
+    /// `notifications/message` event, instead of one event holding the whole batch.
+    pub fn with_sse_event_per_response(mut self, on: bool) -> Self {
+        self.sse_event_per_response = on;
+        self
     }
 
     /// Answer every request over SSE (`text/event-stream`) instead of JSON.
@@ -135,6 +191,23 @@ impl FakeMcpServer {
         spawn_router(self.router()).await
     }
 
+    fn page(&self, key: &str, entries: &[Value], msg: &Value) -> Value {
+        let Some(size) = self.page_size else {
+            return json!({ key: entries });
+        };
+        let start = msg["params"]["cursor"]
+            .as_str()
+            .and_then(|c| c.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(entries.len());
+        let end = (start + size).min(entries.len());
+        let mut result = json!({ key: &entries[start..end] });
+        if end < entries.len() {
+            result["nextCursor"] = json!(end.to_string());
+        }
+        result
+    }
+
     fn respond_one(&self, msg: &Value, session_id: Option<&str>) -> Option<Value> {
         let id = id_of(msg);
         let method = method_of(msg)?;
@@ -152,7 +225,12 @@ impl FakeMcpServer {
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "fake-mcp", "version": "0.0.0"}
             }),
-            "tools/list" => json!({ "tools": self.tools }),
+            "tools/list" => self.page("tools", &self.tools, msg),
+            "resources/list" => self.page("resources", &self.resources, msg),
+            "resources/templates/list" => {
+                self.page("resourceTemplates", &self.resource_templates, msg)
+            }
+            "prompts/list" => self.page("prompts", &self.prompts, msg),
             "tools/call" => {
                 let name = msg["params"]["name"]
                     .as_str()
@@ -239,7 +317,25 @@ async fn fake_handle(
     let mut response = match reply {
         None => StatusCode::ACCEPTED.into_response(),
         Some(v) if server.sse => {
-            let body = format!("event: message\ndata: {v}\n\n");
+            let body = if server.sse_event_per_response {
+                // A streaming server: a progress-style notification first, then one event
+                // (with an `id:` field) per response.
+                let mut body = format!(
+                    "event: message\ndata: {}\n\n",
+                    json!({"jsonrpc": "2.0", "method": "notifications/message",
+                           "params": {"level": "info", "data": "working"}})
+                );
+                let items = match &v {
+                    Value::Array(items) => items.clone(),
+                    other => vec![other.clone()],
+                };
+                for (n, item) in items.iter().enumerate() {
+                    body.push_str(&format!("id: {n}\nevent: message\ndata: {item}\n\n"));
+                }
+                body
+            } else {
+                format!("event: message\ndata: {v}\n\n")
+            };
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "text/event-stream")],
