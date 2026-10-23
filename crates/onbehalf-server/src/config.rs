@@ -383,8 +383,10 @@ pub const DEFAULT_ATTRIBUTE_CLAIMS: &[&str] = &["email", "groups", "amr"];
 pub struct IdpConfig {
     /// Exact `iss` value of the IdP's tokens (and of its discovery document).
     pub issuer: String,
-    /// `aud` an OIDC ID token must carry: the client id onbehalf (or the agent platform) is
-    /// registered under at the IdP. Not used for ID-JAG, whose `aud` must be `[issuer] issuer`.
+    /// Deprecated and ignored (SR-37): an ID token's `aud` is checked against the presenting
+    /// agent's entry in `client_ids`, not against one IdP-wide value. ID-JAG's `aud` is always
+    /// `[issuer] issuer`. Still parsed so existing configs load; a warning is logged when set.
+    #[serde(default)]
     pub audience: String,
     /// JWKS location. When absent, `jwks_uri` from `<issuer>/.well-known/openid-configuration`.
     #[serde(default)]
@@ -401,6 +403,12 @@ pub struct IdpConfig {
     /// Allowed clock skew for `exp`, `iat` and `nbf`. Default 60.
     #[serde(default = "default_clock_skew")]
     pub clock_skew_seconds: u64,
+    /// Per-agent client id at this IdP: agent id to the `aud` its ID tokens carry. An ID
+    /// token is accepted only from the agent whose entry its `aud` names, and `azp` must name
+    /// it too when `aud` lists several values (SR-37). An agent without an entry must have a
+    /// client id equal to its agent id; the server warns at startup for each such agent.
+    #[serde(default)]
+    pub client_ids: BTreeMap<String, String>,
 }
 
 fn default_idp_algs() -> Vec<String> {

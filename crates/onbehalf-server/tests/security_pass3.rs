@@ -134,6 +134,7 @@ async fn server_trusting(idp: &EcIdp) -> Spawned {
         attribute_claims: vec![],
         jwks_ttl_seconds: 300,
         clock_skew_seconds: 60,
+        client_ids: BTreeMap::from([("planner".to_string(), CLIENT_AUD.to_string())]),
     }];
     cfg.agents = vec![AgentConfig {
         id: "planner".into(),
@@ -243,4 +244,141 @@ fn the_server_name_onbehalf_is_reserved() {
     assert!(err.contains("reserved"), "{err}");
     cfg.upstreams = vec![UpstreamConfig::new("github", "http://127.0.0.1:9/mcp")];
     cfg.check_server_names().unwrap();
+}
+
+impl EcIdp {
+    /// An ID token with explicit `aud` (and `azp` when given); `n` makes tokens distinct.
+    fn id_token_aud(&self, sub: &str, aud: Value, azp: Option<&str>, n: u32) -> String {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some("ec1".into());
+        let mut claims = json!({
+            "iss": self.issuer, "aud": aud, "sub": sub,
+            "iat": now, "exp": now + 300, "jti": format!("t{n}"),
+        });
+        if let Some(azp) = azp {
+            claims["azp"] = json!(azp);
+        }
+        jsonwebtoken::encode(&header, &claims, &self.encoding).unwrap()
+    }
+}
+
+/// `planner` is registered at the IdP as `planner-app`, `coder` as `coder-app`, and `reviewer`
+/// has no `client_ids` entry (so its client id must be `reviewer`).
+async fn server_with_two_clients(idp: &EcIdp) -> Spawned {
+    let mut cfg = Config::default();
+    cfg.idps = vec![IdpConfig {
+        issuer: idp.issuer.clone(),
+        audience: String::new(),
+        jwks_url: None,
+        allowed_algs: vec!["ES256".into()],
+        attribute_claims: vec![],
+        jwks_ttl_seconds: 300,
+        clock_skew_seconds: 60,
+        client_ids: BTreeMap::from([
+            ("planner".to_string(), "planner-app".to_string()),
+            ("coder".to_string(), "coder-app".to_string()),
+        ]),
+    }];
+    let secret = |id: &str| hex::encode(Sha256::digest(format!("{id}-secret").as_bytes()));
+    cfg.agents = ["planner", "coder", "reviewer"]
+        .iter()
+        .map(|id| AgentConfig {
+            id: (*id).into(),
+            secret_sha256: secret(id),
+        })
+        .collect();
+    cfg.root_grants = ["planner", "coder", "reviewer"]
+        .iter()
+        .map(|id| RootGrant {
+            subject: None,
+            issuer: idp.issuer.clone(),
+            agent: (*id).into(),
+            capabilities: vec![CapSpec::Short("github:*".into())],
+            attributes: BTreeMap::new(),
+        })
+        .collect();
+    let (router, _state) = onbehalf_server::build(&cfg).unwrap();
+    spawn_router(router).await.unwrap()
+}
+
+async fn intake_as(server: &Spawned, agent: &str, id_token: &str) -> (StatusCode, Value) {
+    let secret = format!("{agent}-secret");
+    let body = serde_urlencoded::to_string([
+        ("grant_type", EXCHANGE),
+        ("subject_token", id_token),
+        ("subject_token_type", ID_TOKEN),
+        ("client_id", agent),
+        ("client_secret", secret.as_str()),
+        ("scope", "github:read_file"),
+    ])
+    .unwrap();
+    let resp = reqwest::Client::new()
+        .post(server.url("/token"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+/// SR-37: an ID token was accepted from any agent with a root grant, because `aud` was the
+/// IdP-wide audience. It must now name the presenting agent's client id.
+#[tokio::test]
+async fn id_token_for_one_agent_is_refused_from_another() {
+    let idp = EcIdp::start().await;
+    let server = server_with_two_clients(&idp).await;
+
+    // Alice logged in through planner's front end. Coder gets hold of the token.
+    let for_planner = idp.id_token_aud("alice", json!(["planner-app"]), Some("planner-app"), 1);
+    let (status, body) = intake_as(&server, "coder", &for_planner).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error_description"], "credential_audience_mismatch",
+        "{body}"
+    );
+    // The refusal does not burn the token: planner can still redeem it.
+    let (status, body) = intake_as(&server, "planner", &for_planner).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The old shared audience no longer works for an agent with its own client id.
+    let shared = idp.id_token_aud("alice", json!(CLIENT_AUD), None, 2);
+    let (status, body) = intake_as(&server, "planner", &shared).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error_description"], "credential_audience_mismatch",
+        "{body}"
+    );
+
+    // Several audiences need an `azp` that names the presenter.
+    for (n, azp) in [(3, None), (4, Some("coder-app"))] {
+        let t = idp.id_token_aud("alice", json!(["planner-app", "coder-app"]), azp, n);
+        let (status, body) = intake_as(&server, "planner", &t).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            body["error_description"], "credential_audience_mismatch",
+            "{body}"
+        );
+    }
+}
+
+/// With no `client_ids` entry the agent id itself is the client id.
+#[tokio::test]
+async fn without_client_ids_the_agent_id_is_the_default_audience() {
+    let idp = EcIdp::start().await;
+    let server = server_with_two_clients(&idp).await;
+    let both = json!(["reviewer", "other"]);
+    let t = idp.id_token_aud("alice", both.clone(), Some("reviewer"), 1);
+    let (status, body) = intake_as(&server, "reviewer", &t).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The token whose aud only names the shared audience is refused.
+    let t = idp.id_token_aud("alice", json!(CLIENT_AUD), None, 2);
+    let (status, body) = intake_as(&server, "reviewer", &t).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error_description"], "credential_audience_mismatch",
+        "{body}"
+    );
 }

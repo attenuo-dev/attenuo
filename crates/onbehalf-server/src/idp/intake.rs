@@ -117,7 +117,7 @@ pub async fn handle(
         ));
     }
 
-    let verified = state.idps.verify(credential, kind, now).await?;
+    let verified = state.idps.verify(credential, kind, &agent, now).await?;
     if kind == CredentialKind::IdJag {
         let jag = claims::map_id_jag(&verified.claims)?;
         if jag.client_id != agent {

@@ -113,6 +113,8 @@ pub enum IntakeError {
     NotYetValid,
     #[error("required claim `{0}` is missing or has the wrong type")]
     MissingClaim(&'static str),
+    #[error("the credential was not issued to client `{0}`: aud/azp name another client")]
+    CredentialAudienceMismatch(String),
     #[error("ID-JAG client_id `{assertion}` does not match the authenticated client `{client}`")]
     ClientIdMismatch { assertion: String, client: String },
     #[error("cannot fetch the issuer's keys: {0}")]
@@ -134,6 +136,7 @@ impl IntakeError {
             IntakeError::Expired => "expired",
             IntakeError::NotYetValid => "not_yet_valid",
             IntakeError::MissingClaim(_) => "missing_claim",
+            IntakeError::CredentialAudienceMismatch(_) => "credential_audience_mismatch",
             IntakeError::ClientIdMismatch { .. } => "client_id_mismatch",
             IntakeError::JwksUnavailable(_) => "jwks_unavailable",
         }
@@ -233,8 +236,15 @@ impl IdpRegistry {
             .build()?;
         let mut out = Vec::with_capacity(idps.len());
         for cfg in idps {
-            if cfg.issuer.is_empty() || cfg.audience.is_empty() {
-                anyhow::bail!("[[idps]]: issuer and audience must not be empty");
+            if cfg.issuer.is_empty() {
+                anyhow::bail!("[[idps]]: issuer must not be empty");
+            }
+            if !cfg.audience.is_empty() {
+                tracing::warn!(
+                    issuer = %cfg.issuer,
+                    "[[idps]] audience is no longer used for ID tokens (SR-37); \
+                     use client_ids = {{ <agent> = \"<client id at the IdP>\" }}"
+                );
             }
             if out
                 .iter()
@@ -280,11 +290,20 @@ impl IdpRegistry {
         self.idps.is_empty()
     }
 
-    /// Verify `token` as a credential of `kind` at `now`. See the module docs for the order.
+    /// The `aud` an ID token must name when presented by `agent` at the IdP `issuer`: the
+    /// `client_ids` entry, else the agent id.
+    pub fn expected_client_id(&self, issuer: &str, agent: &str) -> Option<String> {
+        let idp = self.idps.iter().find(|i| i.config.issuer == issuer)?;
+        Some(client_id_for(&idp.config, agent))
+    }
+
+    /// Verify `token` as a credential of `kind` presented by `agent` at `now`. See the module
+    /// docs for the order.
     pub async fn verify(
         &self,
         token: &str,
         kind: CredentialKind,
+        agent: &str,
         now: OffsetDateTime,
     ) -> Result<VerifiedAssertion, IntakeError> {
         let (header, payload) = peek(token)?;
@@ -332,8 +351,14 @@ impl IdpRegistry {
             })?
             .claims;
 
+        // SR-37: an ID token is for one client, and the presenter must be that client. The
+        // check comes first so its sub-code is the one a replayed-by-another-agent token gets.
+        let client_id = client_id_for(&idp.config, agent);
         let expected_aud = match kind {
-            CredentialKind::IdToken => idp.config.audience.as_str(),
+            CredentialKind::IdToken => {
+                check_bound_to_agent(&claims, &client_id)?;
+                client_id.as_str()
+            }
             CredentialKind::IdJag => self.our_issuer.as_str(),
         };
         let subject = check_claims(
@@ -355,6 +380,34 @@ impl IdpRegistry {
             expires_at,
             clock_skew_seconds: idp.config.clock_skew_seconds,
         })
+    }
+}
+
+fn client_id_for(cfg: &IdpConfig, agent: &str) -> String {
+    cfg.client_ids
+        .get(agent)
+        .cloned()
+        .unwrap_or_else(|| agent.to_owned())
+}
+
+/// SR-37: the ID token must have been issued to the presenting agent's client. `aud` must
+/// contain `client_id`; when `aud` has several values, or `azp` is present at all, `azp` must
+/// equal it (OIDC Core 2.: `azp` names the party the token was issued to).
+fn check_bound_to_agent(claims: &Map<String, Value>, client_id: &str) -> Result<(), IntakeError> {
+    let mismatch = || IntakeError::CredentialAudienceMismatch(client_id.to_owned());
+    let (aud_has, multiple) = match claims.get("aud") {
+        Some(Value::String(a)) => (a == client_id, false),
+        Some(Value::Array(l)) => (l.iter().any(|a| a.as_str() == Some(client_id)), l.len() > 1),
+        _ => (false, false),
+    };
+    if !aud_has {
+        return Err(mismatch());
+    }
+    match claims.get("azp") {
+        Some(Value::String(azp)) if azp == client_id => Ok(()),
+        Some(_) => Err(mismatch()),
+        None if multiple => Err(mismatch()),
+        None => Ok(()),
     }
 }
 
@@ -485,6 +538,29 @@ mod tests {
     }
 
     #[test]
+    fn id_token_must_name_the_presenting_agent_sr37() {
+        let c = |v: Value| check_bound_to_agent(&claims(v), "planner");
+        assert!(c(json!({"aud": "planner"})).is_ok());
+        assert!(c(json!({"aud": ["planner"]})).is_ok());
+        assert!(c(json!({"aud": ["planner", "other"], "azp": "planner"})).is_ok());
+        for bad in [
+            json!({"aud": "coder"}),
+            json!({"aud": ["coder"]}),
+            json!({"aud": ["planner", "coder"]}),
+            json!({"aud": ["planner", "coder"], "azp": "coder"}),
+            json!({"aud": "planner", "azp": "coder"}),
+            json!({"aud": "planner", "azp": 7}),
+            json!({}),
+        ] {
+            assert_eq!(
+                c(bad.clone()).unwrap_err().description(),
+                "credential_audience_mismatch",
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
     fn symmetric_algs_are_refused_in_config() {
         assert!(parse_asymmetric_alg("HS256").is_err());
         assert!(parse_asymmetric_alg("none").is_err());
@@ -497,6 +573,7 @@ mod tests {
             attribute_claims: vec![],
             jwks_ttl_seconds: 300,
             clock_skew_seconds: 60,
+            client_ids: Default::default(),
         };
         assert!(IdpRegistry::from_config(std::slice::from_ref(&cfg), "me").is_err());
         let good = IdpConfig {

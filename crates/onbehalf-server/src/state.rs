@@ -79,6 +79,21 @@ impl AppState {
         let idps = IdpRegistry::from_config(&config.idps, &config.issuer.issuer)?;
         let agents = crate::idp::intake::validate_agents(&config.agents)?;
         let peps = crate::clientauth::validate_clients("[[peps]]", &config.peps)?;
+        for idp in &config.idps {
+            for agent in agents
+                .iter()
+                .filter(|a| !idp.client_ids.contains_key(&a.id))
+            {
+                tracing::warn!(
+                    idp = %idp.issuer,
+                    agent = %agent.id,
+                    "[[idps]] client_ids has no entry for this agent: its ID tokens must carry \
+                     aud = `{0}` (the agent id). Set client_ids.{0} = \"<client id at the IdP>\" \
+                     to bind ID tokens to the agent explicitly (SR-37)",
+                    agent.id
+                );
+            }
+        }
         if !config.token.require_actor_auth {
             tracing::warn!(
                 "[token] require_actor_auth = false: POST /token exchanges accept any `actor` \
