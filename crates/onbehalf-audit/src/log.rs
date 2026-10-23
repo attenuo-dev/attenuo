@@ -1,7 +1,7 @@
 //! The hash chain: entry layout, hashing and verification shared by every sink.
 
-use onbehalf_core::digest::{sha256_bytes, sha256_json};
-use onbehalf_core::DecisionRecord;
+use onbehalf_core::digest::sha256_bytes;
+use onbehalf_core::{jcs, DecisionRecord};
 use serde::{Deserialize, Serialize};
 
 use crate::error::AuditError;
@@ -9,13 +9,18 @@ use crate::error::AuditError;
 /// `prev_hash` of the first entry: 64 hex zeros.
 pub const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
+/// The entry hash construction, and the first element of the array it hashes (see
+/// [`compute_entry_hash`]). Version 1 hashed `serde_json`'s output of `[seq, prev_hash,
+/// record]` without a version tag; logs written that way are refused (SR-20).
+pub const ENTRY_HASH_VERSION: &str = "onbehalf-audit-entry-v2";
+
 /// One link in the audit chain. Sequence numbers start at 1 and are contiguous.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEntry {
     pub seq: u64,
     pub prev_hash: String,
     pub record: DecisionRecord,
-    /// `sha256_json(&(seq, &prev_hash, &record))`.
+    /// [`compute_entry_hash`] of the three fields above.
     pub entry_hash: String,
 }
 
@@ -41,24 +46,35 @@ impl AuditEntry {
     }
 }
 
-/// The canonical entry hash: SHA-256 over the JSON array `[seq, prev_hash, record]`.
+/// The entry hash (construction [`ENTRY_HASH_VERSION`]): SHA-256, hex, over the RFC 8785
+/// canonical JSON ([`onbehalf_core::jcs`]) of the array
+/// `["onbehalf-audit-entry-v2", seq, prev_hash, record]`.
 ///
-/// `DecisionRecord` serializes its fields in declaration order and its maps are `BTreeMap`s, so
-/// the encoding is stable across processes.
+/// The bytes depend only on the values, not on field order, map types or `serde_json`'s
+/// `preserve_order` feature, so any RFC 8785 implementation can recompute the hash. The leading
+/// tag keeps a hash of another construction from ever matching.
 pub fn compute_entry_hash(seq: u64, prev_hash: &str, record: &DecisionRecord) -> String {
-    sha256_json(&(seq, prev_hash, record))
+    entry_hash_from_json(seq, prev_hash, &canonical_record_json(record))
+}
+
+/// The canonical (RFC 8785) JSON text of a record: what [`compute_entry_hash`] hashes for it,
+/// and what the SQLite sink stores as `record_json`.
+pub fn canonical_record_json(record: &DecisionRecord) -> String {
+    jcs::to_string(record).expect("a decision record has a canonical JSON form")
 }
 
 /// [`compute_entry_hash`] for a record that is already serialized (`record_json` must be
-/// `serde_json::to_string(record)`). It hashes the same bytes, `[seq,"prev_hash",record_json]`
-/// (compact JSON, which is what `serde_json` writes for the tuple), without serializing the
-/// record a second time.
+/// [`canonical_record_json`] of it). It hashes the same bytes,
+/// `["onbehalf-audit-entry-v2",seq,"prev_hash",record_json]` (canonical JSON of an array is
+/// its canonical elements joined by commas), without serializing the record a second time.
 pub fn entry_hash_from_json(seq: u64, prev_hash: &str, record_json: &str) -> String {
-    let mut buf = Vec::with_capacity(record_json.len() + prev_hash.len() + 28);
+    let mut buf = Vec::with_capacity(record_json.len() + prev_hash.len() + 56);
     buf.push(b'[');
+    jcs::write_str(&mut buf, ENTRY_HASH_VERSION);
+    buf.push(b',');
     buf.extend_from_slice(seq.to_string().as_bytes());
     buf.push(b',');
-    serde_json::to_writer(&mut buf, prev_hash).expect("a string always serializes");
+    jcs::write_str(&mut buf, prev_hash);
     buf.push(b',');
     buf.extend_from_slice(record_json.as_bytes());
     buf.push(b']');
@@ -77,8 +93,8 @@ pub struct VerifyReport {
 }
 
 /// Verify an ordered stream of entries. An entry is bad when its seq is not the previous seq + 1
-/// (starting at 1), its `prev_hash` does not equal the previous `entry_hash`, or its own hash
-/// does not recompute. An item carrying [`AuditError::Corrupt`] (a row that could not be decoded)
+/// (starting at 1), its `prev_hash` does not equal the previous `entry_hash`, its own hash
+/// does not recompute, or its seq is `u64::MAX` (no entry could follow it). An item carrying [`AuditError::Corrupt`] (a row that could not be decoded)
 /// is reported as a break at that seq; any other error is propagated.
 pub fn verify_entries<I>(entries: I) -> Result<VerifyReport, AuditError>
 where
@@ -121,17 +137,22 @@ where
             expected_prev = entry.prev_hash.clone();
         }
         first = false;
-        let good =
-            entry.seq == expected_seq && entry.prev_hash == expected_prev && entry.hash_matches();
-        if !good {
+        // `u64::MAX` has no successor: an entry claiming it is bad (fuzzing F4), rather than
+        // an overflow (a panic with overflow checks on, a wrap to 0 without).
+        let next_seq = entry.seq.checked_add(1);
+        let good = next_seq.is_some()
+            && entry.seq == expected_seq
+            && entry.prev_hash == expected_prev
+            && entry.hash_matches();
+        let Some(next_seq) = next_seq.filter(|_| good) else {
             return Ok(VerifyReport {
                 entries: count,
                 ok: false,
                 first_bad_seq: Some(entry.seq),
             });
-        }
+        };
         on_ok(&entry);
-        expected_seq = entry.seq + 1;
+        expected_seq = next_seq;
         expected_prev = entry.entry_hash;
     }
     Ok(VerifyReport {

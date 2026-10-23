@@ -3,7 +3,8 @@
 //! the log.
 //!
 //! A checkpoint is `{seq, head_hash, at, kid, signature}`. The signature is Ed25519 by the
-//! issuer key `kid`, over the JSON array `[seq, head_hash, at, kid]` framed with the context
+//! issuer key `kid`, over the RFC 8785 canonical JSON array `[seq, head_hash, at, kid]`
+//! ([`Checkpoint::signing_payload`]) framed with the context
 //! string [`CHECKPOINT_CONTEXT`] (see `onbehalf_token::detached`), so it cannot be replayed as
 //! a token or any other signed object.
 //!
@@ -43,10 +44,17 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
-    /// The exact bytes the signature covers (before context framing).
+    /// The exact bytes the signature covers (before context framing): the RFC 8785 canonical
+    /// JSON of `[seq, head_hash, at, kid]`.
+    ///
+    /// For an integer and three strings that is the same text `serde_json` wrote before SR-20
+    /// (both escape exactly `"`, `\` and the control characters, the same way), so the
+    /// signature construction, and [`CHECKPOINT_CONTEXT`], did not change; what changed is the
+    /// entry hash a checkpoint's `head_hash` names
+    /// ([`ENTRY_HASH_VERSION`](crate::ENTRY_HASH_VERSION)).
     pub fn signing_payload(&self) -> Vec<u8> {
-        serde_json::to_vec(&(self.seq, &self.head_hash, &self.at, &self.kid))
-            .expect("checkpoint fields serialize")
+        onbehalf_core::jcs::to_vec(&(self.seq, &self.head_hash, &self.at, &self.kid))
+            .expect("checkpoint fields have a canonical JSON form")
     }
 
     /// Sign `(seq, head_hash)` at `now` with `signer`.

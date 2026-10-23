@@ -6,8 +6,9 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use common::{record, t0};
 use onbehalf_audit::{
-    checkpoint_line, entry_line, header_line, parse_export, to_json_form, verify_export, AuditSink,
-    CheckpointKeys, ExportHeader, SqliteAudit,
+    checkpoint_line, compute_entry_hash, entry_line, header_line, parse_export, to_json_form,
+    verify_export, verify_export_with, AuditSink, CheckpointKeys, ExportHeader, SqliteAudit,
+    VerifyOptions,
 };
 use onbehalf_token::{Issuer, IssuerConfig};
 use serde_json::{json, Value};
@@ -83,12 +84,26 @@ fn full_export_round_trips_and_verifies_with_only_the_jwks() {
     assert_eq!(export.entries, log.range(1, 100).unwrap());
 
     let keys = CheckpointKeys::from_jwks(&jwks(&issuer)).unwrap();
+    // Entries 9 and 10 come after the last checkpoint (8): strict verification refuses them.
     let r = verify_export(&export, &keys).unwrap();
-    assert!(r.report.ok, "{r:?}");
+    assert!(!r.report.ok && r.unsigned_tail_rejected, "{r:?}");
+    assert!(r.report.first_bad_seq.is_none() && r.report.bad_checkpoints.is_empty());
+    assert_eq!(r.report.unsigned_tail, 2);
+    // Accepting an export newer than its last checkpoint is an explicit choice.
+    let allow = VerifyOptions {
+        allow_unsigned_tail: true,
+    };
+    let r = verify_export_with(&export, &keys, allow).unwrap();
+    assert!(r.report.ok && !r.unsigned_tail_rejected, "{r:?}");
     assert!(r.from_genesis && !r.truncated);
+    assert_eq!(r.outside_range, 0);
     assert_eq!((r.first_seq, r.last_seq), (Some(1), Some(10)));
     assert_eq!(r.report.last_signed_seq, Some(8));
     assert_eq!(r.report.unsigned_tail, 2);
+    // Up to the last checkpoint, strict verification passes.
+    let signed = parse_export(&export_text(&log, 1, 8)).unwrap();
+    let r = verify_export(&signed, &keys).unwrap();
+    assert!(r.report.ok && r.report.unsigned_tail == 0, "{r:?}");
 
     // The single-object JSON form carries the same content.
     let json_form = to_json_form(&export).to_string();
@@ -175,6 +190,110 @@ fn forged_or_foreign_checkpoints_in_an_export_are_rejected() {
         .any(|b| b.reason.contains("unknown signing key")));
     // The genuine checkpoint at 4 and 8 still counted.
     assert_eq!(r.report.last_signed_seq, Some(8));
+}
+
+/// SR-20: every line of an export is RFC 8785 canonical JSON.
+#[test]
+fn export_lines_are_canonical_json_sr20() {
+    let issuer = issuer();
+    let log = log(&issuer, 2, 3);
+    let text = export_text(&log, 1, 3);
+    assert!(text.starts_with("{\"exported_at\":"), "{text}");
+    assert!(text.contains("\"format\":\"onbehalf-audit-export-v2\""));
+    for line in text.lines() {
+        let v: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(onbehalf_core::jcs::to_string(&v).unwrap(), line);
+    }
+}
+
+/// Fuzzing F5: a signed export of `1..=8` with a forged entry 9 appended (chained to 8 and
+/// hashed correctly) used to verify `ok` with `unsigned_tail = 1`. The file holds more than
+/// its header declares, so it fails, with or without `allow_unsigned_tail`.
+#[test]
+fn entries_after_the_declared_range_fail_the_export_f5() {
+    let issuer = issuer();
+    let log = log(&issuer, 4, 8);
+    let keys = CheckpointKeys::from_jwks(&jwks(&issuer)).unwrap();
+    let mut export = parse_export(&export_text(&log, 1, 8)).unwrap();
+    assert!(verify_export(&export, &keys).unwrap().report.ok);
+    let mut forged = export.entries[7].clone();
+    forged.seq = 9;
+    forged.prev_hash = export.entries[7].entry_hash.clone();
+    forged.record.reason = "forged".into();
+    forged.entry_hash = compute_entry_hash(forged.seq, &forged.prev_hash, &forged.record);
+    export.entries.push(forged);
+    for allow_unsigned_tail in [false, true] {
+        let r = verify_export_with(
+            &export,
+            &keys,
+            VerifyOptions {
+                allow_unsigned_tail,
+            },
+        )
+        .unwrap();
+        assert!(!r.report.ok, "{r:?}");
+        assert_eq!(r.outside_range, 1);
+        // The chain itself is intact: only the range (and the tail) give it away.
+        assert!(r.report.first_bad_seq.is_none());
+        assert_eq!(r.report.unsigned_tail, 1);
+        assert_eq!(r.unsigned_tail_rejected, !allow_unsigned_tail);
+    }
+    // An entry before `from` is outside the range too.
+    let mut window = parse_export(&export_text(&log, 5, 8)).unwrap();
+    window.header.as_mut().unwrap().from = 6;
+    let r = verify_export(&window, &keys).unwrap();
+    assert!(!r.report.ok && r.outside_range == 1 && r.truncated);
+}
+
+/// Fuzzing F4, the board's reproducer: a valid export whose first entry is renumbered to
+/// `u64::MAX` and re-hashed fails cleanly instead of overflowing in the chain walk.
+#[test]
+fn an_export_entry_at_u64_max_fails_cleanly_f4() {
+    let issuer = issuer();
+    let log = log(&issuer, 4, 5);
+    let keys = CheckpointKeys::from_jwks(&jwks(&issuer)).unwrap();
+    let mut export = parse_export(&export_text(&log, 1, 5)).unwrap();
+    let e = &mut export.entries[0];
+    e.seq = u64::MAX;
+    e.entry_hash = compute_entry_hash(e.seq, &e.prev_hash, &e.record);
+    for allow_unsigned_tail in [false, true] {
+        let r = verify_export_with(
+            &export,
+            &keys,
+            VerifyOptions {
+                allow_unsigned_tail,
+            },
+        )
+        .unwrap();
+        assert!(!r.report.ok, "{r:?}");
+        assert_eq!(r.report.first_bad_seq, Some(u64::MAX));
+    }
+}
+
+/// The header is required (it declares the range), and a `v1` export is refused with a
+/// message that says why.
+#[test]
+fn exports_need_a_v2_header_sr20() {
+    let issuer = issuer();
+    let log = log(&issuer, 4, 4);
+    let text = export_text(&log, 1, 4);
+    let headerless: String = text.lines().skip(1).map(|l| format!("{l}\n")).collect();
+    let err = parse_export(&headerless).unwrap_err().to_string();
+    assert!(err.contains("no header"), "{err}");
+    let mut export = parse_export(&text).unwrap();
+    let json_form = to_json_form(&export);
+    let mut no_header = json_form.clone();
+    no_header.as_object_mut().unwrap().remove("header");
+    assert!(parse_export(&no_header.to_string()).is_err());
+    export.header = None;
+    let keys = CheckpointKeys::from_jwks(&jwks(&issuer)).unwrap();
+    assert!(verify_export(&export, &keys).is_err());
+    let v1 = text.replace("onbehalf-audit-export-v2", "onbehalf-audit-export-v1");
+    let err = parse_export(&v1).unwrap_err().to_string();
+    assert!(
+        err.contains("earlier onbehalf") && err.contains("RFC 8785"),
+        "{err}"
+    );
 }
 
 #[test]

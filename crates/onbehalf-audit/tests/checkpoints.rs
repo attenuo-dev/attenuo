@@ -491,3 +491,23 @@ fn a_refused_record_fails_only_its_own_append() {
         .iter()
         .all(|e| e.record.reason != "boom"));
 }
+
+/// SR-20: the checkpoint signing input is the RFC 8785 form of `[seq, head_hash, at, kid]`,
+/// which for these field types is byte for byte what `serde_json` wrote before, so the
+/// signature construction (and `onbehalf-checkpoint-v1`) is unchanged.
+#[test]
+fn signing_payload_is_canonical_json_sr20() {
+    let cp = Checkpoint {
+        seq: 9_007_199_254_740_993,
+        head_hash: "ab\"\\\n\u{1}\u{7f}/é".into(),
+        at: "2026-10-23T12:00:00Z".into(),
+        kid: "kid-\u{2028}".into(),
+        signature: String::new(),
+    };
+    let fields = (cp.seq, &cp.head_hash, &cp.at, &cp.kid);
+    assert_eq!(
+        cp.signing_payload(),
+        onbehalf_core::jcs::to_vec(&fields).unwrap()
+    );
+    assert_eq!(cp.signing_payload(), serde_json::to_vec(&fields).unwrap());
+}

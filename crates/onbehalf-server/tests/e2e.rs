@@ -2033,18 +2033,33 @@ async fn export_streams_a_range_that_verifies_offline_with_only_the_jwks() {
         export.checkpoints.iter().map(|c| c.seq).collect::<Vec<_>>(),
         [400, 800]
     );
+    // Entries 801..=1103 are after the last checkpoint: a strict verification refuses them,
+    // and accepting them is an explicit choice (`--allow-unsigned-tail`).
     let report = onbehalf_audit::verify_export(&export, &keys).unwrap();
+    assert!(
+        !report.report.ok && report.unsigned_tail_rejected,
+        "{report:?}"
+    );
+    let allow = onbehalf_audit::VerifyOptions {
+        allow_unsigned_tail: true,
+    };
+    let report = onbehalf_audit::verify_export_with(&export, &keys, allow).unwrap();
     assert!(report.report.ok, "{report:?}");
     assert!(report.from_genesis);
     assert_eq!(report.report.last_signed_seq, Some(800));
     assert_eq!(report.report.unsigned_tail, 303);
+    // Up to a checkpoint, the strict check passes.
+    let text = export_text(&h, "?to=800").await;
+    let export = onbehalf_audit::parse_export(&text).unwrap();
+    let report = onbehalf_audit::verify_export(&export, &keys).unwrap();
+    assert!(report.report.ok, "{report:?}");
 
     // A sub-range is a verifiable window.
     let text = export_text(&h, "?from=390&to=810").await;
     let export = onbehalf_audit::parse_export(&text).unwrap();
     assert_eq!(export.entries.first().unwrap().seq, 390);
     assert_eq!(export.entries.last().unwrap().seq, 810);
-    let report = onbehalf_audit::verify_export(&export, &keys).unwrap();
+    let report = onbehalf_audit::verify_export_with(&export, &keys, allow).unwrap();
     assert!(report.report.ok, "{report:?}");
     assert!(!report.from_genesis);
     assert_eq!(report.report.last_signed_seq, Some(800));
