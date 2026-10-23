@@ -10,6 +10,9 @@ members = [
     "crates/onbehalf-cli",
     "crates/onbehalf-bench",
 ]
+# The cargo-fuzz targets build only on nightly (sanitizer flags) and keep their own lockfile;
+# see docs/design/fuzzing.md.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

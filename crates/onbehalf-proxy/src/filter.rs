@@ -184,6 +184,39 @@ pub fn filter_list_response(
     }
 }
 
+/// Does a response `id` answer the request `id`? Numbers compare by value, not by spelling:
+/// an upstream in JavaScript (or anything that parses ids into a double) answers a request
+/// with `"id": 1.0` as `"id": 1`, and `9007199254740993` as `9007199254740992`. Comparing
+/// the JSON values exactly let such an answer to a `tools/list` reach the client unfiltered
+/// (found by the `proxy_jsonrpc` fuzz target). A fractional or huge id can also come back
+/// spelled differently, and `serde_json` may parse the two spellings a unit in the last place
+/// apart, so doubles match within a few ULPs. Ids that collide this way are both filtered,
+/// which can only remove entries.
+fn same_id(request: &Value, response: &Value) -> bool {
+    match (request, response) {
+        (Value::Number(a), Value::Number(b)) => {
+            a == b
+                || match (a.as_f64(), b.as_f64()) {
+                    (Some(x), Some(y)) => {
+                        x == y || (x - y).abs() <= 4.0 * f64::EPSILON * x.abs().max(y.abs())
+                    }
+                    _ => false,
+                }
+        }
+        // JSON-RPC ids are strings, numbers or null, but nothing stops a client from sending
+        // an array or object; their numbers drift the same way.
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| same_id(x, y))
+        }
+        (Value::Object(a), Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(k, x)| b.get(k).is_some_and(|y| same_id(x, y)))
+        }
+        _ => request == response,
+    }
+}
+
 /// The list requests of one HTTP request whose responses must be filtered, and what to filter
 /// them with.
 ///
@@ -217,7 +250,7 @@ impl<'a> ListFilter<'a> {
         let kinds: Vec<ListKind> = self
             .pending
             .iter()
-            .filter(|(pid, _)| pid == id)
+            .filter(|(pid, _)| same_id(pid, id))
             .map(|(_, k)| *k)
             .collect();
         kinds
@@ -245,7 +278,7 @@ impl<'a> ListFilter<'a> {
             let is_tools = self
                 .pending
                 .iter()
-                .any(|(pid, k)| pid == id && *k == ListKind::Tools);
+                .any(|(pid, k)| same_id(pid, id) && *k == ListKind::Tools);
             if !is_tools {
                 continue;
             }
@@ -416,5 +449,38 @@ mod tests {
             {"jsonrpc":"2.0","id":1,"result":{"resources": entries}}
         ]);
         assert_eq!(f.apply(&mut b), 1);
+    }
+
+    /// Found by the `proxy_jsonrpc` fuzz target: a `tools/list` sent with `"id": 1.0` and
+    /// answered by a JavaScript upstream with `"id": 1` passed through unfiltered.
+    #[test]
+    fn list_filter_matches_numeric_ids_by_value() {
+        let c = caps();
+        let tools = json!([{"name": "read_file"}, {"name": "delete_repo"}]);
+        for (sent, answered) in [
+            (json!(1.0), json!(1)),
+            (json!(1), json!(1.0)),
+            (json!(-0.0), json!(0)),
+            (
+                json!(1.866_909_276_318_353e230),
+                json!(1.866_909_276_318_354e230),
+            ),
+            (
+                json!(9_007_199_254_740_993u64),
+                json!(9_007_199_254_740_992u64),
+            ),
+        ] {
+            let pending = vec![(sent.clone(), ListKind::Tools)];
+            let f = ListFilter::new(&pending, &c, "github");
+            let mut m = json!({"jsonrpc":"2.0","id":answered,"result":{"tools": tools}});
+            assert_eq!(f.listed_tool_names(&m).len(), 2, "{sent} / {answered}");
+            assert_eq!(f.apply_message(&mut m), 1, "{sent} / {answered}");
+            assert_eq!(m["result"]["tools"], json!([{"name": "read_file"}]));
+        }
+        // A string id is still not a number.
+        let pending = vec![(json!("1"), ListKind::Tools)];
+        let f = ListFilter::new(&pending, &c, "github");
+        let mut m = json!({"jsonrpc":"2.0","id":1,"result":{"tools": tools}});
+        assert_eq!(f.apply_message(&mut m), 0);
     }
 }

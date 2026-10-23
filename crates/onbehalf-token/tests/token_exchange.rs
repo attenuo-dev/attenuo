@@ -1088,3 +1088,32 @@ fn children_of_bound_tokens_must_be_bound_sr24() {
         Err(TokenError::Malformed(_))
     ));
 }
+
+/// Found by the `ou_sig` fuzz target: an `authenticated_at` outside RFC 3339's years 0..=9999
+/// (an IdP `auth_time` of -1e11 is year -1200) made the `ou_sig` encoding panic. It is a
+/// refusal now.
+#[test]
+fn root_with_an_unrepresentable_time_is_refused_not_a_panic() {
+    let issuer = issuer();
+    let mint = |secs: i64| {
+        let mut u = user();
+        u.authenticated_at = OffsetDateTime::from_unix_timestamp(secs).unwrap();
+        issuer.issue_root(
+            u,
+            AgentId::new("agent:planner"),
+            caps([Capability::new("github", "read_*")]),
+            None,
+            t0(),
+        )
+    };
+    for secs in [-100_000_000_000i64, -377_705_116_800, -62_167_219_201] {
+        let got = mint(secs);
+        assert!(
+            matches!(got, Err(TokenError::Malformed(_))),
+            "{secs}: {got:?}"
+        );
+    }
+    // Year 0 is still fine.
+    let token = mint(-62_167_219_200).unwrap();
+    issuer.verifier().verify(&token.token, t0()).unwrap();
+}

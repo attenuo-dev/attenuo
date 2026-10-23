@@ -29,6 +29,7 @@
 - [Server request pipeline](design/server.md)
 - [Performance](design/performance.md)
   - [End-to-end benchmark, 2026-10-23](design/bench/2026-10-23-vm.md)
+- [Fuzzing](design/fuzzing.md)
 
 # Policy
 

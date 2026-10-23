@@ -364,8 +364,12 @@ pub fn verify_proof(proof: &str, check: &ProofCheck<'_>) -> Result<VerifiedProof
         .get("iat")
         .and_then(Value::as_i64)
         .ok_or_else(|| DpopError::Malformed("`iat` is missing or not an integer".into()))?;
+    // `iat` is the caller's: `now - iat` can overflow (and `abs` of `i64::MIN` too), which
+    // panics in a debug build and, wrapped in a release build, made a proof with
+    // `iat = now - 2^63` look fresh. `abs_diff` is exact for every pair of `i64`s.
     let now = check.now.unix_timestamp();
-    if (now - iat).abs() > check.max_age.whole_seconds() {
+    let max_age = u64::try_from(check.max_age.whole_seconds()).unwrap_or(0);
+    if now.abs_diff(iat) > max_age {
         return Err(DpopError::Stale);
     }
     let opt_str = |k: &str| claims.get(k).and_then(Value::as_str).map(str::to_owned);
@@ -682,6 +686,25 @@ mod tests {
             ok(&k.proof("POST", URL, Some("tok"), t + Duration::seconds(301))),
             Err(DpopError::Stale)
         );
+        // `iat` at the i64 edges is stale, not an overflow (found by the `dpop_proof` fuzz
+        // target: `now - iat` overflowed, and in release builds `iat = now - 2^63` wrapped to a
+        // "fresh" proof).
+        for iat in [
+            i64::MIN,
+            i64::MAX,
+            t.unix_timestamp().wrapping_sub(i64::MIN),
+            t.unix_timestamp().wrapping_add(i64::MIN),
+        ] {
+            let claims = json!({
+                "jti": "j", "htm": "POST", "htu": URL, "iat": iat,
+                "ath": access_token_hash("tok"),
+            });
+            assert_eq!(
+                ok(&k.sign_claims(&claims)),
+                Err(DpopError::Stale),
+                "iat {iat}"
+            );
+        }
         // Without a bound token, `ath` is not required.
         verify_proof(&k.proof("POST", URL, None, t), &check(None, t)).unwrap();
         // Case and default ports are normalized; the query is ignored.
