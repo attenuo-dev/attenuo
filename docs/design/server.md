@@ -175,6 +175,8 @@ The audit crate stores decision records only. An issuance is recorded as a decis
 | `reason` | `token_issued` |
 | `server` | `onbehalf` |
 | `tool` | `token.exchange` for a hop n+1 exchange, `token.root` for hop 0 (IdP intake or the dev root mint) |
+| `kind` | `exchange` for `token.exchange`, `root_token` for `token.root` (renewals: `lease_renew`; admin revocation: `lease_revoke`; other admin actions: `admin`; every authorization decision: `decision`) |
+| `chain_id` | the lease of the new chain's first hop, the same for every record of the run |
 | chain fields | the **new** chain, so `agents` and `leases` include the new hop |
 | `arguments_digest` | digest of `{actor, requested, parent_lease}`; IdP intake: `{agent, requested, credential, idp}`; dev mint: `{agent, requested}` |
 

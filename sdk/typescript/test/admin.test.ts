@@ -106,6 +106,19 @@ describe("AdminClient", () => {
     expect(out.map((l) => l.type)).toEqual(["header", "entry", "checkpoint"]);
     expect(calls[0]!.url.pathname).toBe("/admin/audit/export");
     expect(calls[0]!.url.searchParams.get("to")).toBe("2");
+    expect(calls[0]!.url.searchParams.has("kind")).toBe(false);
+
+    const filtered = mockFetch(() => new Response('{"type":"header"}\n'));
+    const seen = [];
+    for await (const l of new AdminClient(URL_, "adm", { fetch: filtered.fetch }).auditExport(
+      3,
+      undefined,
+      { kind: "lease_renew", chainId: "l 1" },
+    ))
+      seen.push(l.type);
+    expect(seen).toEqual(["header"]);
+    const q = filtered.calls[0]!.url.searchParams;
+    expect([q.get("from"), q.get("kind"), q.get("chain_id")]).toEqual(["3", "lease_renew", "l 1"]);
 
     const enc = new TextEncoder();
     const chunked = new Response(

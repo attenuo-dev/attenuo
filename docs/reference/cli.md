@@ -171,7 +171,7 @@ With `--file` it verifies an export offline instead and needs no admin token. Th
 
 | Option | Meaning |
 | --- | --- |
-| `--file <PATH>` | An export from `audit export` (JSON Lines, or the `--format json` object, format `onbehalf-audit-export-v2`; older `v1` exports are refused). Re-hashes every entry, checks the links, verifies each checkpoint signature and its head hash. Fails a file that is shorter than the range in its header, one that holds entries outside it, and one with entries after its last valid checkpoint. |
+| `--file <PATH>` | An export from `audit export` (JSON Lines, or the `--format json` object, format `onbehalf-audit-export-v2`; older `v1` exports are refused). Re-hashes every entry, checks the links, verifies each checkpoint signature and its head hash. Fails a file that is shorter than the range in its header, one that holds entries outside it, and one with entries after its last valid checkpoint. A filtered export (`audit export --kind` or `--chain-id`) is refused with an error: its chain has gaps, so nothing shows it is complete. |
 | `--jwks <PATH>` | JWKS file with the issuer keys (what `/.well-known/jwks.json` returns). Without it, the JWKS is fetched from `--server`. Only with `--file`. |
 | `--allow-unsigned-tail` | Accept entries after the file's last valid checkpoint, which only the hash chain covers: an export taken while the log was ahead of its newest checkpoint. They are still reported (`unsigned_tail`). Entries outside the header's range fail either way. Only with `--file`. |
 
@@ -187,6 +187,10 @@ Write entries and the checkpoints inside the range. Needs the admin token.
 | `--to` | the head | Last sequence number, inclusive. |
 | `--format` | `jsonl` | `jsonl` streams one object per line (header, entries, checkpoints). `json` writes one object `{header, entries, checkpoints}`. |
 | `--out` | stdout | Write to this file. |
+| `--kind` | all | Keep only records of this kind: `decision`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin`. |
+| `--chain-id` | all | Keep only records of this delegation chain (the `chain_id` field: the lease id of the chain's first hop). |
+
+`--kind` and `--chain-id` combine, and apply inside `--from`/`--to`. A filtered export has a `filter` member in its header and cannot be verified with `audit verify --file` (its hash chain has gaps by construction): verify an unfiltered export, then filter. The same filters are `?kind=` and `?chain_id=` on `GET /admin/audit/export`; an unknown kind or an empty `chain_id` is a 400.
 
 ### `policy reload`
 

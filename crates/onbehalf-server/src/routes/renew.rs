@@ -23,10 +23,11 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use onbehalf_audit::{AuditError, LeaseStore};
+use onbehalf_core::RecordKind;
 use serde_json::json;
 use time::format_description::well_known::Rfc3339;
 
-use super::{audit_event, bearer_of, no_store, now, REASON_LEASE_RENEWED};
+use super::{audit_event, bearer_of, no_store, now};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -113,7 +114,7 @@ fn renew_sync(state: &AppState, headers: &HeaderMap) -> Result<Response, ApiErro
     });
     if let Err(e) = audit_event(
         state,
-        REASON_LEASE_RENEWED,
+        RecordKind::LeaseRenew,
         "lease.renew",
         &chain,
         args,

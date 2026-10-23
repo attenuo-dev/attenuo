@@ -18,6 +18,9 @@
 //! that its `head_hash` equals the entry hash at its seq, and checks that the entries are
 //! exactly the declared range and are all countersigned (see [`VerifyOptions`]).
 //!
+//! A header may carry `filter` (`{"kind":..,"chain_id":..}`) when the export holds only the
+//! matching entries; [`verify_export_with`] refuses such a file.
+//!
 //! Format `onbehalf-audit-export-v2` goes with entry hash construction
 //! [`ENTRY_HASH_VERSION`](crate::ENTRY_HASH_VERSION) (RFC 8785, SR-20). A `v1` export, hashed
 //! the earlier way, is refused when parsed.
@@ -30,9 +33,37 @@ use crate::checkpoint::{
 };
 use crate::error::AuditError;
 use crate::log::AuditEntry;
+use onbehalf_core::RecordKind;
 
 /// Value of the header's `format` field.
 pub const EXPORT_FORMAT: &str = "onbehalf-audit-export-v2";
+
+/// Which entries of the range an export holds, when it is not all of them. Set as the
+/// header's `filter` member. Absent from an unfiltered export.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordFilter {
+    /// Only records of this kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<RecordKind>,
+    /// Only records of this delegation chain (`chain_id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_id: Option<String>,
+}
+
+impl RecordFilter {
+    pub fn is_empty(&self) -> bool {
+        self.kind.is_none() && self.chain_id.is_none()
+    }
+
+    /// Does `record` pass?
+    pub fn matches(&self, record: &onbehalf_core::DecisionRecord) -> bool {
+        self.kind.is_none_or(|k| k == record.kind)
+            && self
+                .chain_id
+                .as_ref()
+                .is_none_or(|c| record.chain_id.as_ref() == Some(c))
+    }
+}
 
 /// First line of an export.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +72,11 @@ pub struct ExportHeader {
     pub from: u64,
     pub to: u64,
     pub exported_at: String,
+    /// Present when the export holds only the entries that match. Such a file has gaps in its
+    /// hash chain by construction, so [`verify_export_with`] refuses it: verify an unfiltered
+    /// export, then filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<RecordFilter>,
 }
 
 impl ExportHeader {
@@ -50,7 +86,14 @@ impl ExportHeader {
             from,
             to,
             exported_at,
+            filter: None,
         }
+    }
+
+    /// The same header for a filtered export (an empty filter is no filter).
+    pub fn with_filter(mut self, filter: RecordFilter) -> Self {
+        self.filter = (!filter.is_empty()).then_some(filter);
+        self
     }
 }
 
@@ -243,6 +286,13 @@ pub fn verify_export_with(
     options: VerifyOptions,
 ) -> Result<ExportReport, AuditError> {
     let header = export.header.as_ref().ok_or_else(missing_header)?;
+    if header.filter.is_some() {
+        return Err(bad(
+            "the export is filtered (its header has a `filter`), so its hash chain has gaps \
+             and nothing proves it is complete; verify an export taken without --kind and \
+             --chain-id, then filter that",
+        ));
+    }
     let first_seq = export.entries.first().map(|e| e.seq);
     let last_seq = export.entries.last().map(|e| e.seq);
     let from_genesis = first_seq == Some(1) && export.entries[0].prev_hash == crate::GENESIS_HASH;

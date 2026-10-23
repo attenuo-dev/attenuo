@@ -21,6 +21,7 @@ use crate::checkpoint::{
     verify_with_checkpoints, Checkpoint, CheckpointKeys, SignedVerifyReport, Start,
 };
 use crate::error::AuditError;
+use crate::export::RecordFilter;
 use crate::lease::{classify, LeaseRow, LeaseStatus, LeaseStore};
 use crate::log::{
     canonical_record_json, entry_hash_from_json, verify_entries, AuditEntry, AuditSink,
@@ -45,11 +46,15 @@ CREATE TABLE IF NOT EXISTS audit (
     arguments_digest    TEXT    NOT NULL,
     session_id          TEXT    NULL,
     policy_ids          TEXT    NOT NULL,
-    record_json         TEXT    NOT NULL
+    record_json         TEXT    NOT NULL,
+    kind                TEXT    NOT NULL,
+    chain_id            TEXT    NULL
 );
 CREATE INDEX IF NOT EXISTS audit_subject_idx ON audit(originating_subject);
 CREATE INDEX IF NOT EXISTS audit_chain_idx   ON audit(chain_digest);
 CREATE INDEX IF NOT EXISTS audit_at_idx      ON audit(at);
+CREATE INDEX IF NOT EXISTS audit_kind_idx    ON audit(kind);
+CREATE INDEX IF NOT EXISTS audit_chain_id_idx ON audit(chain_id);
 "#;
 
 const CHECKPOINT_SCHEMA: &str = r#"
@@ -88,7 +93,7 @@ CREATE TABLE IF NOT EXISTS lease_bindings (
 /// Columns read back for an entry, in the order `entry_from_row` expects.
 const ENTRY_COLUMNS: &str = "seq, prev_hash, entry_hash, decision, reason, originating_subject, \
      agents, chain_depth, chain_digest, leases, server, tool, arguments_digest, session_id, \
-     policy_ids, record_json";
+     policy_ids, record_json, kind, chain_id";
 
 /// How long a connection waits for another connection's write lock before giving up with
 /// `SQLITE_BUSY`. Within one process the store's own lock serializes writers; this covers a
@@ -182,6 +187,23 @@ fn relaxed_sync_of(conn: &Connection) -> Result<Option<i64>, AuditError> {
     let file_backed = conn.path().is_some_and(|p| !p.is_empty());
     let level: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
     Ok((file_backed && level < SYNC_FULL).then_some(level))
+}
+
+/// Refuse a log created before records had `kind` and `chain_id` (this morning's v2 shape,
+/// never released): its rows lack the columns and its hashes do not cover the fields.
+fn check_record_fields(conn: &Connection) -> Result<(), AuditError> {
+    let cols: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('audit')")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    if !cols.is_empty() && !cols.iter().any(|c| c == "kind") {
+        return Err(AuditError::Storage(
+            "this audit log was written before records had `kind` and `chain_id` (a pre-release \
+             build) and cannot be read by this version; move the file aside and start a new log"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Refuse a log whose entries were hashed with another construction than
@@ -299,6 +321,8 @@ fn entry_from_row(row: &Row<'_>) -> Result<AuditEntry, AuditError> {
     let session_id: Option<String> = row.get(13)?;
     let policy_ids: String = row.get(14)?;
     let record_json: String = row.get(15)?;
+    let kind: String = row.get(16)?;
+    let chain_id: Option<String> = row.get(17)?;
 
     let corrupt = |detail: String| AuditError::Corrupt { seq, detail };
     let record: DecisionRecord =
@@ -323,6 +347,13 @@ fn entry_from_row(row: &Row<'_>) -> Result<AuditEntry, AuditError> {
         }
     };
     expect("decision", &decision, decision_str(&record.decision))?;
+    expect("kind", &kind, record.kind.as_str())?;
+    if chain_id != record.chain_id {
+        return Err(corrupt(format!(
+            "column `chain_id` ({chain_id:?}) disagrees with record_json ({:?})",
+            record.chain_id
+        )));
+    }
     expect("reason", &reason, &record.reason)?;
     expect("originating_subject", &subject, &record.originating_subject)?;
     expect("agents", &agents, &serde_json::to_string(&record.agents)?)?;
@@ -997,8 +1028,9 @@ fn insert_entry(
     tx.prepare_cached(
         "INSERT INTO audit (seq, prev_hash, entry_hash, at, decision, reason, \
          originating_subject, agents, chain_depth, chain_digest, leases, server, tool, \
-         arguments_digest, session_id, policy_ids, record_json) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+         arguments_digest, session_id, policy_ids, record_json, kind, chain_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+         ?18, ?19)",
     )?
     .execute(params![
         entry.seq as i64,
@@ -1018,6 +1050,8 @@ fn insert_entry(
         r.session_id,
         serde_json::to_string(&r.policy_ids)?,
         record_json,
+        r.kind.as_str(),
+        r.chain_id,
     ])?;
     Ok(())
 }
@@ -1044,6 +1078,7 @@ impl SqliteAudit {
     /// [`ENTRY_HASH_VERSION`](crate::ENTRY_HASH_VERSION), such as one written before RFC 8785
     /// canonical JSON (SR-20): there is no migration, start a new file.
     pub fn from_connection(conn: Connection) -> Result<Self, AuditError> {
+        check_record_fields(&conn)?;
         conn.execute_batch(AUDIT_SCHEMA)?;
         conn.execute_batch(CHECKPOINT_SCHEMA)?;
         conn.execute_batch(META_SCHEMA)?;
@@ -1296,6 +1331,35 @@ impl SqliteAudit {
         );
         let conn = self.inner.conn.lock()?;
         query_entries(&conn, &sql, &[&subject, &(limit as i64)])
+    }
+
+    /// Up to `limit` entries with `from_seq <= seq <= to_seq` that match `filter`, in order.
+    /// An empty filter is the same as [`AuditSink::range`] bounded by `to_seq`.
+    pub fn range_filtered(
+        &self,
+        from_seq: u64,
+        to_seq: u64,
+        filter: &RecordFilter,
+        limit: usize,
+    ) -> Result<Vec<AuditEntry>, AuditError> {
+        let sql = format!(
+            "SELECT {ENTRY_COLUMNS} FROM audit WHERE seq >= ?1 AND seq <= ?2 \
+             AND (?3 IS NULL OR kind = ?3) AND (?4 IS NULL OR chain_id = ?4) \
+             ORDER BY seq LIMIT ?5"
+        );
+        let kind = filter.kind.map(|k| k.as_str());
+        let conn = self.inner.conn.lock()?;
+        query_entries(
+            &conn,
+            &sql,
+            &[
+                &i64::try_from(from_seq).unwrap_or(i64::MAX),
+                &i64::try_from(to_seq).unwrap_or(i64::MAX),
+                &kind,
+                &filter.chain_id,
+                &(limit as i64),
+            ],
+        )
     }
 
     /// Every entry bound to one delegation chain, in order.
@@ -1893,6 +1957,21 @@ mod tests {
 
     /// SR-20: a log written with the v1 entry hash (no `audit_meta` row, entries present) is
     /// refused with a clear error; a new log records the construction.
+    #[test]
+    fn a_log_from_before_kind_and_chain_id_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE audit (seq INTEGER PRIMARY KEY, record_json TEXT NOT NULL)",
+            )
+            .unwrap();
+        }
+        let err = SqliteAudit::open(&path).unwrap_err().to_string();
+        assert!(err.contains("`kind` and `chain_id`"), "{err}");
+    }
+
     #[test]
     fn a_log_with_v1_hashes_is_refused_sr20() {
         let dir = tempfile::tempdir().unwrap();

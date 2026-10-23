@@ -2073,6 +2073,8 @@ fn append_synthetic(h: &Harness, n: usize) {
         let record = onbehalf_core::DecisionRecord {
             id: uuid::Uuid::new_v4(),
             at: time::OffsetDateTime::now_utc(),
+            kind: onbehalf_core::RecordKind::Decision,
+            chain_id: None,
             decision: onbehalf_core::Decision::Allow,
             reason: "synthetic".into(),
             originating_subject: "load".into(),
@@ -2188,6 +2190,115 @@ async fn export_validates_its_query_and_needs_the_admin_token() {
     let text = export_text(&h, "?from=500").await;
     let export = onbehalf_audit::parse_export(&text).unwrap();
     assert!(export.entries.is_empty() && export.checkpoints.is_empty());
+}
+
+#[tokio::test]
+async fn every_record_has_a_kind_and_chains_share_a_chain_id_and_export_filters_on_both() {
+    let h = Harness::start().await;
+    let alice = h.mint_root("alice", "planner", &["github:*"]).await;
+    let bob = h.mint_root("bob", "planner", &["github:*"]).await;
+    let child = h
+        .exchange(&alice.token, "coder", &["github:read_file"])
+        .await;
+    h.call(&child.token, "read_file", json!({"repo": "alice/public-a"}))
+        .await;
+    h.set_lease_expiry(
+        &alice.lease,
+        OffsetDateTime::now_utc() + Duration::seconds(20),
+    );
+    assert_eq!(
+        h.renew_raw(Some(&alice.token)).await.status(),
+        StatusCode::OK
+    );
+    let resp = h
+        .admin_post(
+            &format!("/admin/leases/{}/revoke", bob.lease),
+            json!({"reason": "test"}),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let all = onbehalf_audit::parse_export(&export_text(&h, "").await).unwrap();
+    let kinds: Vec<_> = all
+        .entries
+        .iter()
+        .map(|e| (e.record.kind.as_str(), e.record.tool.as_str()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("root_token", "token.root"),
+            ("admin", "admin.root_token"),
+            ("root_token", "token.root"),
+            ("admin", "admin.root_token"),
+            ("exchange", "token.exchange"),
+            ("decision", "read_file"),
+            ("lease_renew", "lease.renew"),
+            ("lease_revoke", "admin.lease.revoke"),
+        ]
+    );
+    // The chain id is the root lease, the same for the root token, the exchange, the call and
+    // the renewal; admin records have none.
+    let chain_ids: Vec<_> = all
+        .entries
+        .iter()
+        .map(|e| e.record.chain_id.clone())
+        .collect();
+    let (a, b) = (Some(alice.lease.clone()), Some(bob.lease.clone()));
+    assert_eq!(
+        chain_ids,
+        [a.clone(), None, b, None, a.clone(), a.clone(), a, None]
+    );
+
+    // `?kind=` and `?chain_id=` filter, and combine; the header says the file is filtered.
+    let text = export_text(&h, "?kind=admin").await;
+    let export = onbehalf_audit::parse_export(&text).unwrap();
+    assert_eq!(export.entries.len(), 2);
+    assert!(export
+        .entries
+        .iter()
+        .all(|e| e.record.kind.as_str() == "admin"));
+    let header = export.header.unwrap();
+    assert_eq!(header.filter.unwrap().kind.unwrap().as_str(), "admin");
+    assert_eq!((header.from, header.to), (1, 8));
+
+    let q = format!("?chain_id={}", alice.lease);
+    let export = onbehalf_audit::parse_export(&export_text(&h, &q).await).unwrap();
+    assert_eq!(
+        export.entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        [1, 5, 6, 7]
+    );
+    let q = format!("?chain_id={}&kind=lease_renew", alice.lease);
+    let export = onbehalf_audit::parse_export(&export_text(&h, &q).await).unwrap();
+    assert_eq!(
+        export.entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        [7]
+    );
+    let export =
+        onbehalf_audit::parse_export(&export_text(&h, "?kind=exchange&from=6").await).unwrap();
+    assert!(export.entries.is_empty());
+    let export = onbehalf_audit::parse_export(&export_text(&h, "?chain_id=nope").await).unwrap();
+    assert!(export.entries.is_empty());
+
+    // Entries in a filtered export still hash correctly, but the file has gaps, so offline
+    // verification refuses it with an explanation.
+    let keys = jwks_keys(&h).await;
+    let export = onbehalf_audit::parse_export(&export_text(&h, "?kind=decision").await).unwrap();
+    assert!(export.entries.iter().all(|e| e.hash_matches()));
+    let err = onbehalf_audit::verify_export(&export, &keys).unwrap_err();
+    assert!(err.to_string().contains("filtered"), "{err}");
+
+    // Unknown kinds and empty chain ids are a 400.
+    for q in ["?kind=checkpoint", "?kind=", "?chain_id="] {
+        let resp = h
+            .client
+            .get(h.url(&format!("/admin/audit/export{q}")))
+            .bearer_auth(ADMIN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{q}");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

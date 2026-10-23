@@ -11,7 +11,7 @@ pub mod wellknown;
 use axum::body::Bytes;
 use axum::http::{header, HeaderMap, HeaderValue};
 use onbehalf_audit::LeaseStore;
-use onbehalf_core::{Decision, DecisionRecord, DelegationChain, LeaseId, ToolCall};
+use onbehalf_core::{Decision, DecisionRecord, DelegationChain, LeaseId, RecordKind, ToolCall};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -129,6 +129,12 @@ pub(crate) fn audit_admin(
     let record = DecisionRecord {
         id: uuid::Uuid::new_v4(),
         at: now,
+        kind: if tool == "admin.lease.revoke" {
+            RecordKind::LeaseRevoke
+        } else {
+            RecordKind::Admin
+        },
+        chain_id: None,
         decision,
         reason: reason.to_string(),
         originating_subject: ADMIN_SUBJECT.to_string(),
@@ -167,7 +173,11 @@ pub(crate) fn audit_issuance(
 ) -> Result<uuid::Uuid, ApiError> {
     let id = audit_event(
         state,
-        REASON_TOKEN_ISSUED,
+        if tool == "token.root" {
+            RecordKind::RootToken
+        } else {
+            RecordKind::Exchange
+        },
         tool,
         chain,
         arguments,
@@ -183,19 +193,24 @@ pub(crate) fn audit_issuance(
 }
 
 /// Record a server-performed event (issuance, lease renewal) as an `allow` decision record
-/// with the given `reason`, server `onbehalf` and `tool` naming the event, and the record's
+/// (reason `token_issued`, or `lease_renewed` for a renewal), server `onbehalf` and `tool` naming the event, and the record's
 /// `dpop_bound` flag.
 pub(crate) fn audit_event(
     state: &AppState,
-    reason: &str,
+    kind: RecordKind,
     tool: &str,
     chain: &DelegationChain,
     arguments: Value,
     dpop_bound: bool,
     now: OffsetDateTime,
 ) -> Result<uuid::Uuid, ApiError> {
+    let reason = match kind {
+        RecordKind::LeaseRenew => REASON_LEASE_RENEWED,
+        _ => REASON_TOKEN_ISSUED,
+    };
     let call = ToolCall::new(AUDIT_SERVER, tool, arguments).with_dpop_bound(dpop_bound);
-    let record = DecisionRecord::new(now, Decision::Allow, reason, chain, &call, Vec::new());
+    let record =
+        DecisionRecord::new(now, Decision::Allow, reason, chain, &call, Vec::new()).with_kind(kind);
     let id = record.id;
     if let Err(e) = state
         .metrics
