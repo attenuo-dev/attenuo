@@ -1,0 +1,53 @@
+$ cargo bench -p attenuo-policy --bench policy_stage -- --warm-up-time 1 --measurement-time 3 --noplot
+# commit 034fd5c, rustc 1.99.1 (58cf8f9c3 2026-10-13), release bench profile
+# shared 4 vCPU container (nproc 4, Intel Xeon @ 2.10GHz); other agents may be active
+# progress lines (Benchmarking ..., Finished, Running) removed; estimates are [low point high]
+# uptime before: 20:45:59 up  3:09,  0 user,  load average: 1.33, 2.58, 2.38
+policy_stage/authorize/1_hop
+                        time:   [11.811 µs 12.343 µs 12.933 µs]
+Found 17 outliers among 100 measurements (17.00%)
+  7 (7.00%) high mild
+  10 (10.00%) high severe
+policy_stage/authorize_uncached/1_hop
+                        time:   [116.53 µs 121.55 µs 127.26 µs]
+Found 11 outliers among 100 measurements (11.00%)
+  1 (1.00%) high mild
+  10 (10.00%) high severe
+policy_stage/prepare/1_hop
+                        time:   [5.3055 µs 5.5001 µs 5.7027 µs]
+Found 17 outliers among 100 measurements (17.00%)
+  5 (5.00%) high mild
+  12 (12.00%) high severe
+policy_stage/prepare_uncached/1_hop
+                        time:   [105.95 µs 108.22 µs 110.95 µs]
+Found 10 outliers among 100 measurements (10.00%)
+  5 (5.00%) high mild
+  5 (5.00%) high severe
+policy_stage/evaluate/1_hop
+                        time:   [5.1118 µs 5.1944 µs 5.2919 µs]
+Found 12 outliers among 100 measurements (12.00%)
+  8 (8.00%) high mild
+  4 (4.00%) high severe
+policy_stage/authorize/3_hop
+                        time:   [11.906 µs 12.142 µs 12.431 µs]
+Found 12 outliers among 100 measurements (12.00%)
+  4 (4.00%) high mild
+  8 (8.00%) high severe
+policy_stage/authorize_uncached/3_hop
+                        time:   [158.47 µs 163.20 µs 168.39 µs]
+Found 10 outliers among 100 measurements (10.00%)
+  5 (5.00%) high mild
+  5 (5.00%) high severe
+policy_stage/prepare/3_hop
+                        time:   [5.9641 µs 6.0890 µs 6.2285 µs]
+Found 11 outliers among 100 measurements (11.00%)
+  8 (8.00%) high mild
+  3 (3.00%) high severe
+policy_stage/prepare_uncached/3_hop
+                        time:   [149.90 µs 154.43 µs 159.72 µs]
+Found 13 outliers among 100 measurements (13.00%)
+  1 (1.00%) high mild
+  12 (12.00%) high severe
+policy_stage/evaluate/3_hop
+                        time:   [5.4412 µs 5.6576 µs 5.8797 µs]
+# uptime after: 20:46:49 up  3:10,  0 user,  load average: 1.15, 2.35, 2.31

@@ -3,6 +3,7 @@
 - Status: third measurement, after the policy-stage and WAL work (`perf/policy-stage-and-wal-checkpoints`); exchange, lease renewal and open-loop cells added 2026-10-23 (`perf/exchange-lease-bench`)
 - Crates: `attenuo-policy` (`benches/authorize.rs`, `benches/policy_stage.rs`), `attenuo-core` (`benches/attenuation.rs`), `attenuo-server` (`benches/decide.rs`, the decision path by stage), `attenuo-bench` (end to end)
 - Related: [server pipeline](server.md), [ADR-0006](../decisions/0006-lease-based-in-flight-revocation.md)
+- Sources: every figure links the committed file it comes from in [`bench/`](bench/). A figure with no file says "(unrecorded)". Where a rerun of 2026-10-23 gave a different number, the rerun is in the text and the earlier figure is kept in a "quoted earlier, unrecorded" note.
 
 The first part of this page is criterion micro-benchmarks of the two pure functions on the hot path. They do not include token verification, the lease lookup, the audit append or the network hop to the upstream, so they are a lower bound on the latency attenuo adds to a call. The end-to-end figures, measured through the real proxy, are in [End to end: proxy versus direct](#end-to-end-proxy-versus-direct) at the end of the page, followed by [the audit write path and the per-call cost](#after-the-audit-write-path-work) and [the policy stage and WAL checkpoints](#after-the-policy-stage-and-wal-work), which say what changed and by how much.
 
@@ -16,7 +17,7 @@ Name the bench targets: a bare `cargo bench -- --warm-up-time ...` also passes t
 
 ## Measurement environment (dev container, not a reference machine)
 
-Taken in a shared Linux development container while other builds were running on the same host, so treat the numbers as indicative: relative sizes mean more than absolute values, and run-to-run noise of 10 percent or more is expected. Rust release profile (`lto = "thin"`, `codegen-units = 1`), 2026-10-22.
+Taken in a shared Linux development container while other builds were running on the same host, so treat the numbers as indicative: relative sizes mean more than absolute values, and run-to-run noise of 10 percent or more is expected. Rust release profile (`lto = "thin"`, `codegen-units = 1`). First run 2026-10-22, with no output kept. Rerun 2026-10-23 at commit 034fd5c with rustc 1.99.1, load average 1 to 3, one bench at a time; the outputs are the `criterion-*.txt` files in [`bench/`](bench/).
 
 ```
 $ nproc
@@ -45,25 +46,39 @@ Warm-up 1 s, measurement 3 s, criterion's default 100 samples. Each cell is crit
 
 The shipped `policies/default.cedar` and a catalog with `read_file` (read-only), `create_issue` (argument rule) and `delete_repo` (sensitive). Chain capabilities are wide (`github:*`) so the capability stage passes; the time is chain-to-Cedar translation plus evaluation. Note that `forbid_deep_chains` denies depth greater than 3, so every 4-hop row is a deny; the rows compare the cost of a deeper principal hierarchy, not outcomes.
 
+Rerun 2026-10-23 ([`criterion-authorize`](bench/2026-10-23-vm-criterion-authorize.txt)):
+
 | Call | 1 hop | 4 hops |
 |---|---|---|
-| `read_file` (allow at 1 hop) | 123.8 us [118.6, 129.3] | 172.6 us [169.6, 176.0] |
-| `create_issue` in `acme/*` (allow at 1 hop) | 112.4 us [110.6, 114.4] | 182.1 us [175.0, 189.7] |
-| `delete_repo` (deny: no permit matches) | 114.9 us [110.7, 119.9] | 182.2 us [175.4, 190.1] |
+| `read_file` (allow at 1 hop) | 11.7 us [11.5, 11.8] | 14.1 us [13.6, 14.7] |
+| `create_issue` in `acme/*` (allow at 1 hop) | 12.7 us [12.4, 13.1] | 14.4 us [14.0, 14.8] |
+| `delete_repo` (deny: no permit matches) | 11.2 us [11.0, 11.5] | 14.3 us [13.8, 14.9] |
 
-Reading: roughly 110 to 125 us per decision for a single hop and 170 to 190 us for four hops, so about 20 us for each extra hop. Allow and deny cost the same, as expected, since Cedar evaluates the whole policy set either way. At these figures one core sustains on the order of 5,000 to 9,000 decisions per second before the audit append and lease lookup. These figures predate the request cache. Profiled since: evaluation is about 5 us and the rest was building the Cedar request (Cedar parsing the entity and context JSON). The engine now caches that per chain and tool, and a repeated call costs 11 to 14 us at any depth; see [After the policy-stage and WAL work](#after-the-policy-stage-and-wal-work). This bench repeats one chain and call, so it now measures cache hits.
+Quoted earlier, unrecorded (2026-10-22, before the request cache; no output was kept):
+
+| Call | 1 hop | 4 hops |
+|---|---|---|
+| `read_file` | 123.8 us [118.6, 129.3] | 172.6 us [169.6, 176.0] |
+| `create_issue` | 112.4 us [110.6, 114.4] | 182.1 us [175.0, 189.7] |
+| `delete_repo` | 114.9 us [110.7, 119.9] | 182.2 us [175.4, 190.1] |
+
+Reading: this bench repeats one chain and call, so since the request cache every iteration is a cache hit. The rerun is 11 to 13 us at one hop and about 14 us at four. Allow and deny cost the same, as expected, since Cedar evaluates the whole policy set either way. The earlier figures were uncached: 110 to 125 us for one hop and 170 to 190 us for four, about 20 us for each extra hop, or 5,000 to 9,000 decisions per second per core (unrecorded). The uncached cost today is in `policy_stage`: 122 us at one hop and 163 us at three ([`criterion-policy_stage`](bench/2026-10-23-vm-criterion-policy_stage.txt)). Profiled since: evaluation is about 5 us and the rest was building the Cedar request (Cedar parsing the entity and context JSON). The engine now caches that per chain and tool; see [After the policy-stage and WAL work](#after-the-policy-stage-and-wal-work).
 
 ## `CapabilitySet::covers`
 
 Parent: `n` capabilities `srv{i}:tool_*` with a `repo` prefix constraint. Child: `n` narrower ones (`srv{i}:tool_read`, longer prefix), each covered by exactly one parent capability. "covered" is the successful check made at every delegation hop; "rejected" swaps the sets, so the first child capability that the parent cannot cover ends the check.
 
+Rerun 2026-10-23 ([`criterion-attenuation`](bench/2026-10-23-vm-criterion-attenuation.txt)):
+
 | Capabilities (n) | covered | rejected (widening) |
 |---|---|---|
-| 1 | 34.3 ns [33.2, 35.7] | 15.2 ns [14.9, 15.5] |
-| 8 | 449 ns [444, 456] | 68.0 ns [67.1, 69.0] |
-| 32 | 4.91 us [4.85, 5.00] | 252.8 ns [248.7, 257.7] |
+| 1 | 36.4 ns [35.3, 37.6] | 15.9 ns [15.5, 16.3] |
+| 8 | 429 ns [427, 431] | 72.2 ns [70.7, 73.8] |
+| 32 | 5.06 us [4.86, 5.30] | 263.3 ns [258.4, 269.3] |
 
-Reading: a successful check is quadratic in the number of capabilities (each child capability scans the parent set), going from 34 ns to 4.9 us between 1 and 32. That is `O(n * m)` by design (see `CapabilitySet::covers`): the conservative single-parent coverage rule keeps it simple and explainable. It is negligible next to a policy decision (4.9 us against about 120 us) at realistic set sizes, and it runs once per exchange, not once per call.
+Quoted earlier, unrecorded (2026-10-22): covered 34.3 ns, 449 ns and 4.91 us; rejected 15.2, 68.0 and 252.8 ns. Every cell is within 6 percent of the rerun.
+
+Reading: a successful check is quadratic in the number of capabilities (each child capability scans the parent set), going from 36 ns to 5.1 us between 1 and 32. That is `O(n * m)` by design (see `CapabilitySet::covers`): the conservative single-parent coverage rule keeps it simple and explainable. It is small next to an uncached policy decision (5.1 us against about 120 us) at realistic set sizes, and it runs once per exchange, not once per call.
 
 ## End to end: proxy versus direct
 
@@ -99,8 +114,8 @@ Allow call, audit in memory, p50 / p99 in microseconds and requests per second:
 
 - **Added latency, single client, audit in memory:** about 0.7 ms at p50 and 1.2 ms at p99 for one hop; about 1.0 ms at p50 (4.3 ms at p99, noisy) for three hops. A denial by capability is cheaper (about 0.3 to 0.4 ms) because it stops before Cedar and the upstream.
 - **Throughput ceiling:** about 4,200 to 4,900 calls per second at one hop and 2,100 to 2,200 at three hops on these 4 shared cores, against roughly 48,000 for the direct baseline. Throughput stops growing between 8 and 32 clients, so extra clients only add queueing.
-- **Hops cost more than the micro-benchmark predicts.** Cedar adds about 20 us per hop (above), yet the end-to-end cost per call roughly doubles from 1 to 3 hops. Where it goes (verifying each hop, lease lookups per hop, request construction) is unprofiled.
-- **Most of the added latency is outside Cedar.** The decision is about 120 us; the proxied call costs about 700 us more than a direct one. Token verification, the lease check, the audit append behind a mutex, the blocking-pool hop and the second HTTP round trip account for the rest; there is no breakdown yet.
+- **Hops cost more than the micro-benchmark predicts.** Cedar added about 20 us per hop uncached (the earlier, unrecorded figure above), yet the end-to-end cost per call roughly doubles from 1 to 3 hops. Where it goes (verifying each hop, lease lookups per hop, request construction) is unprofiled.
+- **Most of the added latency is outside Cedar.** The decision was about 120 us uncached (unrecorded); the proxied call costs about 700 us more than a direct one. Token verification, the lease check, the audit append behind a mutex, the blocking-pool hop and the second HTTP round trip account for the rest; there is no breakdown yet.
 - **A file-backed audit log is the dominant cost.** With a SQLite file, throughput was about 270 to 590 calls per second regardless of concurrency or outcome (denials are audited too), single-client p50 was 1.6 to 2.5 ms, and p50 rose linearly with clients (about 16 ms at 8, 65 ms at 32): the signature of one serialised append per call. The audit store sets no `synchronous` or `journal_mode` pragma, so it runs SQLite's defaults, which sync to disk on each commit; the figure is specific to this container's filesystem and will differ on other storage. A few file-mode cells have large outliers (for example `deny_policy` at 1 hop with 1 and 8 clients, 70 and 61 req/s) that probably coincide with other builds on the host; rerun before quoting a single cell.
 - **Audit integrity under load:** the chain verified after both groups, with 351,679 entries (memory) and 50,495 (file), each at least the number of proxied calls sent.
 
@@ -114,7 +129,7 @@ Three changes, each its own commit on `perf/audit-write-path`:
 2. **Group commit.** Appends go to one writer thread over a channel. It commits the first waiting record plus everything already queued (up to 256) in one transaction and answers each caller with its entry; checkpoints falling in a batch are signed inside it. A failed batch is retried record by record, so only a record the database refuses fails (and its call is denied with `audit_error`).
 3. **Per-call waste.** Found with the stage bench below plus temporary timers inside the audit commit: the server verified the same bearer token on every call (now cached by token hash, with expiry rechecked on every hit), the append decoded and cross-checked the whole head row to learn its hash (now reads `seq, entry_hash`), each record was serialized twice (now once, hashed and stored), the pipeline cloned the record, and the lease check ran one query per hop (now one `IN (...)` query).
 
-**Decision path by stage** (`cargo bench -p attenuo-server --bench decide`, in process, point estimates in microseconds, 1 hop / 3 hops; same container, about 5 to 10 percent run-to-run noise):
+**Decision path by stage** (`cargo bench -p attenuo-server --bench decide`, in process, point estimates in microseconds, 1 hop / 3 hops; same container, about 5 to 10 percent run-to-run noise). Both columns are unrecorded: no criterion output was kept, and the code has changed since. Today's rerun is in the decide table of [the next section](#after-the-policy-stage-and-wal-work).
 
 | Stage | before | after |
 |---|---|---|
@@ -130,10 +145,10 @@ Three changes, each its own commit on `perf/audit-write-path`:
 Readings:
 
 - **Verification was the biggest per-call cost after Cedar**, about 100 us, paid again on every call with the same token. It is now about 1 to 2 us on a hit.
-- **The per-hop growth is Cedar's.** Policy grows about 18 us per hop, which matches the micro-benchmark. The audit append also grew with depth because it decoded the previous (larger) record; reading only the head's hash removed that, but the single-threaded append is not faster overall: it now pays a thread handoff to the writer (about 25 us round trip, measured on its own) and the SQLite insert and in-memory commit are about 16 and 13 us. Under concurrency the handoff is shared by a batch.
+- **The per-hop growth is Cedar's.** Policy grows about 18 us per hop, which matches the micro-benchmark. The audit append also grew with depth because it decoded the previous (larger) record; reading only the head's hash removed that, but the single-threaded append is not faster overall: it now pays a thread handoff to the writer (about 25 us round trip, measured on its own) and the SQLite insert and in-memory commit are about 16 and 13 us (temporary timers, unrecorded). Under concurrency the handoff is shared by a batch.
 - **The batched lease query** is faster for a file store and slower for the in-memory one (SQLite builds a small ephemeral table for an `IN` list), and both are a few microseconds against a decision of about 300.
 
-**End to end, before and after** (`attenuo-bench`, allow call, req/s at 1 / 8 / 32 clients, closed loop; "before" is merged main before this work, 3 s cells; "after" is the full run in [`bench/2026-10-23-vm-audit-write-path.md`](bench/2026-10-23-vm-audit-write-path.md), 5 s cells, commit 38a438d):
+**End to end, before and after** (`attenuo-bench`, allow call, req/s at 1 / 8 / 32 clients, closed loop; "before" is merged main before this work, 3 s cells, unrecorded: no results file was kept and that code is gone; "after" is the full run in [`bench/2026-10-23-vm-audit-write-path.md`](bench/2026-10-23-vm-audit-write-path.md), 5 s cells, commit 38a438d):
 
 | Audit, hops | before | after | single client, added p50 before / after |
 |---|---|---|---|
@@ -144,51 +159,53 @@ Readings:
 | file, `full`, 1 | (SQLite defaults are the "before" file row) | 434 / 1,248 / 2,176 (*) | 1,377 us (*) |
 | file, `full`, 3 | | 545 / 2,389 / 3,603 | 1,608 us |
 
-(*) Load on the host rose from 3 to 6 during the run, and these cells sit at the end of it; the same cells measured 765 / 3,476 / 5,710 req/s an hour earlier at commit 78e9b14 (before the last merge of main, same code otherwise). The memory, 3-hop row also moved within noise: intermediate runs on the branch measured 934 / 4,038 / 5,479. Read every cell as plus or minus 20 percent on this container.
+(*) Load on the host rose from 3 to 6 during the run, and these cells sit at the end of it; the same cells measured 765 / 3,476 / 5,710 req/s an hour earlier at commit 78e9b14 (before the last merge of main, same code otherwise). The memory, 3-hop row also moved within noise: intermediate runs on the branch measured 934 / 4,038 / 5,479 (unrecorded; that branch code has changed since). Read every cell as plus or minus 20 percent on this container.
 
 What this means:
 
-- **The file-backed log is no longer the ceiling.** At `normal` it runs within about 30 to 40 percent of the in-memory store at 8 and 32 clients (3,100 to 4,500 calls per second at one hop with 8 and 32 clients, from 460 to 490), and single-client latency fell from 2.2 ms to 0.9 ms. At `full` group commit lets one `fsync` cover a batch, so throughput still grows with concurrency instead of staying flat at a few hundred.
-- **Tail latency at `normal`** shows periodic stalls (p99 of 15.5 to 26.9 ms with 8 or more clients) that `full` does not: SQLite checkpoints the WAL into the database every 1,000 pages on the writer thread, and at `normal` that is where the deferred `fsync` and write-back land. Moving checkpoints off the writer (`wal_autocheckpoint=0` plus a background `PASSIVE` checkpoint) was the next experiment; it is done, see [After the policy-stage and WAL work](#after-the-policy-stage-and-wal-work).
+- **The file-backed log is no longer the ceiling.** At `normal` it runs within about 30 to 40 percent of the in-memory store at 8 and 32 clients (3,100 to 4,500 calls per second at one hop with 8 and 32 clients, from 460 to 490), and single-client latency fell from 2.2 ms to 0.9 ms. The "from" figures are the unrecorded "before" column. At `full` group commit lets one `fsync` cover a batch, so throughput still grows with concurrency instead of staying flat at a few hundred.
+- **Tail latency at `normal`** shows periodic stalls (p99 of 15.5 to 26.9 ms with 8 or more clients, [audit-write-path](bench/2026-10-23-vm-audit-write-path.md)) that `full` does not: SQLite checkpoints the WAL into the database every 1,000 pages on the writer thread, and at `normal` that is where the deferred `fsync` and write-back land. Moving checkpoints off the writer (`wal_autocheckpoint=0` plus a background `PASSIVE` checkpoint) was the next experiment; it is done, see [After the policy-stage and WAL work](#after-the-policy-stage-and-wal-work).
 - **Most of the added latency is still outside the decision.** The server's own work is now about 300 us per call (policy about 120 to 150, append 90 to 150, the rest small), against 0.7 to 1.2 ms added end to end; the blocking-pool hop, the proxy's request handling and the second HTTP round trip make up the rest and are not in this branch.
 
 ### After the policy-stage and WAL work
 
 Three changes on `perf/policy-stage-and-wal-checkpoints`, each its own commit (the WAL change took three: the first version had a bug the end-to-end run caught, below):
 
-1. **Request cache in the policy engine.** The new bench `cargo bench -p attenuo-policy --bench policy_stage` splits the Cedar stage into preparing the request and evaluating it. Evaluation was about 5 us; preparation was 115 to 160 us, and nearly all of it was Cedar parsing the JSON built for the entity store (about 50 us) and the context (about 40 us) on every call. The schema and policy set were already parsed once, at load. The engine now keeps what depends only on the chain and the tool (entity store, principal, action, resource, and the `originating_user` and `chain` context records) in a cache of 4,096 entries. An entry is used only when every input it was built from is equal (user, attributes, each hop's agent and lease, server, tool, the tool's catalog attributes), so a hash collision is a miss. A policy reload empties it, and a catalog change builds a new engine. A call then builds only `context.input`, `session_id` and `now_unix`, directly as Cedar values instead of JSON. A test compares the cached request with the old one-pass translation for every argument shape (nulls, decimals, integral floats, big integers, nested sets and records, sessions, legacy actions), and every existing policy test passes unchanged.
+1. **Request cache in the policy engine.** The new bench `cargo bench -p attenuo-policy --bench policy_stage` splits the Cedar stage into preparing the request and evaluating it. Evaluation was about 5 us; preparation was 115 to 160 us (rerun uncached: 108 and 154 us, [`criterion-policy_stage`](bench/2026-10-23-vm-criterion-policy_stage.txt)), and nearly all of it was Cedar parsing the JSON built for the entity store (about 50 us) and the context (about 40 us) on every call (profiled, unrecorded). The schema and policy set were already parsed once, at load. The engine now keeps what depends only on the chain and the tool (entity store, principal, action, resource, and the `originating_user` and `chain` context records) in a cache of 4,096 entries. An entry is used only when every input it was built from is equal (user, attributes, each hop's agent and lease, server, tool, the tool's catalog attributes), so a hash collision is a miss. A policy reload empties it, and a catalog change builds a new engine. A call then builds only `context.input`, `session_id` and `now_unix`, directly as Cedar values instead of JSON. A test compares the cached request with the old one-pass translation for every argument shape (nulls, decimals, integral floats, big integers, nested sets and records, sessions, legacy actions), and every existing policy test passes unchanged.
 2. **WAL checkpoints off the writer.** The writer connection runs with `wal_autocheckpoint=0`, and a background thread with its own connection runs `PRAGMA wal_checkpoint(PASSIVE)` every `[audit] wal_checkpoint_seconds` (default 5) or 256 commits. `PASSIVE` takes no lock the writer needs. It truncates the WAL when no append is in progress, and runs a final `TRUNCATE` at shutdown (and when the store is dropped). Reads go through the store's own connection, so verify and export see every committed row whether or not it has been copied yet. In-memory stores are unchanged.
 3. **Inline commit when the writer is idle.** An append that finds nothing queued for the writer and the connection free runs the same one-record transaction on its own thread, without the hand-off. Anything else goes to the writer as before, so group commit is unchanged under load.
 
-**The WAL bug the end-to-end run caught.** SQLite starts a WAL over from its beginning only when a write finds every frame already copied. A `PASSIVE` checkpoint next to a busy writer copies up to where the WAL ended when it started, never further, so under continuous load the first version never let the WAL restart. It grew by about 16 KB per append until the disk was full, and appends then failed with `SQLITE_FULL`. The bench's deny cells accept any JSON-RPC error, so those calls still counted as expected denials. The bench's final check caught it: the chain verified with 476,233 entries for 594,416 calls sent. Now, once the WAL passes 64 MB, a round makes up to four more unlocked passes, each copying what arrived during the one before. It then copies the small remainder while holding the store's connection lock, which pauses appends in this process for that copy and two syncs, and the next commit starts the WAL over. The WAL peaks around 100 MB under sustained load. A test keeps it bounded with eight writers and no idle moment; without the fix that test's WAL passes 400 MB. A first version of the fix paused at 4,096 pages, and those pauses set the p99 at 32 clients (28 to 30 ms, below).
+**The WAL bug the end-to-end run caught.** SQLite starts a WAL over from its beginning only when a write finds every frame already copied. A `PASSIVE` checkpoint next to a busy writer copies up to where the WAL ended when it started, never further, so under continuous load the first version never let the WAL restart. It grew by about 16 KB per append until the disk was full, and appends then failed with `SQLITE_FULL`. The bench's deny cells accept any JSON-RPC error, so those calls still counted as expected denials. The bench's final check caught it: the chain verified with 476,233 entries for 594,416 calls sent (unrecorded, as is the 16 KB per append: that run's file was not kept). Now, once the WAL passes 64 MB, a round makes up to four more unlocked passes, each copying what arrived during the one before. It then copies the small remainder while holding the store's connection lock, which pauses appends in this process for that copy and two syncs, and the next commit starts the WAL over. The WAL peaks around 100 MB under sustained load (unrecorded for the end-to-end run; the bounded-WAL test peaked at 78 to 104 MB over three runs, [log, 18:05 UTC](../log/2026-10-23.md#1805-utc-the-walkthrough-run-end-to-end)). A test keeps it bounded with eight writers and no idle moment; without the fix that test's WAL passes 400 MB (unrecorded). A first version of the fix paused at 4,096 pages, and those pauses set the p99 at 32 clients (28 to 30 ms, [policy-stage](bench/2026-10-23-vm-policy-stage.md)).
 
 One behaviour change follows from the design. At `durability = "normal"` the WAL is synced when it is checkpointed, so the decisions a power failure can lose are now those since the last background checkpoint: up to one interval (5 s) or 256 commits. Before, the window was about 1,000 pages. Lower `wal_checkpoint_seconds`, or use `"full"`, to narrow it. Decisions are unchanged.
 
-**Decision path by stage** (`cargo bench -p attenuo-server --bench decide`, point estimates in microseconds, 1 hop / 3 hops; "before" is the column "after" of the previous table, same container, load 2 to 5 during this run):
+**Decision path by stage** (`cargo bench -p attenuo-server --bench decide`, point estimates in microseconds, 1 hop / 3 hops). "before" is the column "after" of the previous table (unrecorded). "after" is the figure quoted at the time (load 2 to 5, unrecorded). "rerun" is today's run ([`criterion-decide`](bench/2026-10-23-vm-criterion-decide.txt), load average about 1); the file-store rows are the first of its two passes, and the second is in the file.
 
-| Stage | before | after |
-|---|---|---|
-| Policy (`PolicyEngine::authorize`) | 117 / 151 | 12.9 / 13.6 (cache hit; a miss is still 125 / 175) |
-| Audit append, in memory | 91 / 149 | 94 / 142 |
-| Audit append, file, `normal` | 150 / 157 | 60 / 68 |
-| Audit append, file, `full` | 280 to 1,800 | 256 / 267 |
-| Lease check, in memory / file | 1.0 / 4.0, 2.1 / 5.3 | 1.1 / 4.7, 2.5 / 6.2 |
-| Token verification (`authenticate`, cache hit) | 1.3 / 2.3 | 1.5 / 2.4 |
-| `Pipeline::decide` (leases, policy, record, append), memory / file | not recorded | 139 / 206, 81 / 106 |
+| Stage | before | after (quoted earlier, unrecorded) | rerun 2026-10-23 |
+|---|---|---|---|
+| Policy (`PolicyEngine::authorize`) | 117 / 151 | 12.9 / 13.6 (cache hit; a miss is still 125 / 175) | 11.8 / 13.0 (cache hit; a miss is 122 / 163, [`criterion-policy_stage`](bench/2026-10-23-vm-criterion-policy_stage.txt)) |
+| Audit append, in memory | 91 / 149 | 94 / 142 | 93 / 163 |
+| Audit append, file, `normal` | 150 / 157 | 60 / 68 | 114 / 128 (second pass 142 / 119; intervals up to plus or minus 45 percent) |
+| Audit append, file, `full` | 280 to 1,800 | 256 / 267 | 277 / 316 |
+| Lease check, in memory / file | 1.0 / 4.0, 2.1 / 5.3 | 1.1 / 4.7, 2.5 / 6.2 | 0.9 / 4.5, 2.4 / 5.9 |
+| Token verification (`authenticate`, cache hit) | 1.3 / 2.3 | 1.5 / 2.4 | 1.9 / 3.4 (a miss, `verify`, is 115 / 127) |
+| `Pipeline::decide` (leases, policy, record, append), memory / file | not recorded | 139 / 206, 81 / 106 | 156 / 236, 115 / 113 (second pass 130 / 131) |
 
-The Cedar stage itself (`cargo bench -p attenuo-policy --bench policy_stage`, same chain and call):
+The Cedar stage itself (`cargo bench -p attenuo-policy --bench policy_stage`, same chain and call). The "before" column is unrecorded. The "after" columns are today's rerun ([`criterion-policy_stage`](bench/2026-10-23-vm-criterion-policy_stage.txt)):
 
 | | before | after, cache hit | after, uncached |
 |---|---|---|---|
-| `authorize` | 122 / 200 | 11.8 / 12.1 | 129 / 174 |
-| prepare (entities, context, `Request::new`) | 121 / 158 | 5.8 / 6.3 | 115 / 168 |
-| evaluate | 5.5 / 5.5 | 5.4 / 5.5 | |
+| `authorize` | 122 / 200 | 12.3 / 12.1 | 122 / 163 |
+| prepare (entities, context, `Request::new`) | 121 / 158 | 5.5 / 6.1 | 108 / 154 |
+| evaluate | 5.5 / 5.5 | 5.2 / 5.7 | |
+
+Quoted earlier, unrecorded: cache hit 11.8 / 12.1, 5.8 / 6.3 and 5.4 / 5.5; uncached 129 / 174 and 115 / 168. Every cell is within 10 percent of the rerun.
 
 Readings:
 
 - **The policy stage is about ten times cheaper and no longer grows with depth.** The per-hop cost was translation, not evaluation: evaluation is 5.5 us at one hop and at three. What remains per call is building `context.input` and the `Request` (about 6 us) and evaluating (about 5.5 us).
-- **The file append is now cheaper than the in-memory one** (60 against 94 us at one hop). Part of that is the checkpoints that no longer run on the writer, part is the inline commit; the in-memory store, which journals in memory rather than appending to a WAL, gains only the inline commit. The A/B of the inline commit alone, same host load: in memory 114 / 169 to 92 / 120 us, file 72 / 91 to 70 / 63 us.
-- **At `full`** the append is one `fsync`, 250 to 270 us on this run against a range of 280 to 1,800 before; the difference is the host, not the change.
+- **The file append was cheaper than the in-memory one when measured** (60 against 94 us at one hop, unrecorded). Part of that was the checkpoints that no longer run on the writer, part the inline commit; the in-memory store, which journals in memory rather than appending to a WAL, gains only the inline commit. The A/B of the inline commit alone, same host load: in memory 114 / 169 to 92 / 120 us, file 72 / 91 to 70 / 63 us (unrecorded). The rerun does not show it: the file append is 114 to 142 us at one hop against 93 in memory, with wide intervals and 8 to 12 percent outliers. Later changes to the writer (the WAL backstop hook) may account for part of it; this was not investigated.
+- **At `full`** the append is one `fsync`, 250 to 270 us on that run (unrecorded) and 277 to 316 us in the rerun, against a range of 280 to 1,800 before; the difference is the host, not the change.
 
 **End to end, before and after** (`attenuo-bench`, allow call, req/s at 1 / 8 / 32 clients; "before" is the run in [`bench/2026-10-23-vm-audit-write-path.md`](bench/2026-10-23-vm-audit-write-path.md), "after" the run in [`bench/2026-10-23-vm-policy-stage.md`](bench/2026-10-23-vm-policy-stage.md), commit 238d914, memory and file only):
 
@@ -204,7 +221,7 @@ Load on the host was 4 to 7 during this run and other agents were compiling; the
 What this means:
 
 - **Single-client added latency** fell by about 200 us at one hop and about 400 us at three, close to what the policy stage lost (about 105 us, and 140 to 190 us) plus the shorter append. The policy stage is no longer what grows with depth.
-- **The file store's tail no longer has the checkpoint stalls.** Its p99 at 8 and 32 clients is now close to the in-memory store's. The worst case remains a catch-up pause each time the WAL passes 64 MB; it shows in the max column (32 to 131 ms on this host) rather than the p99.
+- **The file store's tail no longer has the checkpoint stalls.** Its p99 at 8 and 32 clients is now close to the in-memory store's. The worst case remains a catch-up pause each time the WAL passes 64 MB; it shows in the max column (32 to 131 ms on this host, [policy-stage](bench/2026-10-23-vm-policy-stage.md)) rather than the p99.
 - **What is left of the added latency** is mostly outside the server's decision (now about 80 to 140 us at one hop): the blocking-pool hop, the proxy's request handling and the second HTTP round trip. It was not broken down by stage then; see [Time by stage of a proxied call](#time-by-stage-of-a-proxied-call-2026-10-23).
 
 ### Time by stage of a proxied call (2026-10-23)
@@ -224,7 +241,7 @@ Branch `perf/proxy-stage-timing`, commit 51f0a89. The server now times each stag
 
 `lease_check`, `policy` and `audit_append` are recorded in the decision pipeline, so AuthZEN decisions count there too. `attenuo-bench` reads the histograms when each cell's warm-up ends and when it stops, and prints the difference as a table ([`bench/2026-10-23-vm-proxy-stages.md`](bench/2026-10-23-vm-proxy-stages.md)). The p50 and p90 columns are interpolated inside buckets the way Prometheus' `histogram_quantile` does, so they are estimates. The mean is exact.
 
-The run: one client, 10 s cells after 2 s of warm-up, allow and `deny_policy` at 1 and 3 hops, memory and file (`normal`) stores; 11,000 to 23,000 calls per cell. This is a shared 4-core VM, not a quiet machine. Load average was 4.4 to 6.4 during the run while other agents compiled, and the load generator, proxy and upstream share those cores. Read every figure as plus or minus 20 percent or worse. Absolute figures are 3 to 4 times the in-process `decide` bench (policy 43 to 57 us here, 13 us there), so compare stages within this run, not with the tables above.
+The run: one client, 10 s cells after 2 s of warm-up, allow and `deny_policy` at 1 and 3 hops, memory and file (`normal`) stores; 11,000 to 23,000 calls per cell. This is a shared 4-core VM, not a quiet machine. Load average was 4.4 to 6.4 during the run (unrecorded: the results file has no load line) while other agents compiled, and the load generator, proxy and upstream share those cores. Read every figure as plus or minus 20 percent or worse. Absolute figures are 3 to 4 times the in-process `decide` bench (policy 43 to 57 us here, 13 us there), so compare stages within this run, not with the tables above.
 
 Allow call, microseconds, p50 (mean in brackets):
 
@@ -257,19 +274,32 @@ Branch `perf/proxy-upstream-hop`. This follows the two questions the stage run a
 
 **The upstream client is already right.** `AppState` holds one `reqwest::Client`, built once in `router()`, and every request goes through it. During a run, `/proc/net/tcp` showed one established connection from the proxy to `fake_mcp` and no churn, so keep-alive pooling works. The request is HTTP/1.1 with no `Connection: close`, and an `strace` of the server showed it leave as one `writev` (headers and body) and the response come back in one read. The request body is read once. It is parsed and re-encoded on purpose (SR-01: forwarding the raw bytes would let duplicate JSON members past screening), and that happens before the `upstream` timer starts. A `tools/call` response is streamed back, not buffered. Nothing in the upstream path goes through the blocking pool.
 
-**The gap is the cost of waking idle CPUs on this VM.** In the direct baseline the load generator calls `fake_mcp` back to back, about 12,000 times a second, so its threads never sleep. Through the proxy, `fake_mcp` gets one call about every 650 us and sleeps in between, and so does the proxy thread waiting for the answer. A probe that calls `fake_mcp` directly over one keep-alive connection (Python `http.client`, so its absolute figures include Python's own overhead) shows the effect:
+**The gap is the cost of waking idle CPUs on this VM.** In the direct baseline the load generator calls `fake_mcp` back to back, about 12,000 times a second, so its threads never sleep. Through the proxy, `fake_mcp` gets one call about every 650 us and sleeps in between, and so does the proxy thread waiting for the answer. A probe that calls `fake_mcp` directly over one keep-alive connection (Python `http.client`, so its absolute figures include Python's own overhead) shows the effect. Rerun 2026-10-23, with the probe's source in the file ([`upstream-hop`](bench/2026-10-23-vm-upstream-hop.md)):
 
 | Pause between calls | p50, us (two runs) |
 |---|---|
-| none | 145, 130 |
-| 500 us `sleep` | 337, 377 |
-| 500 us busy loop in the client | 199, 349 |
+| none | 174, 162 |
+| 500 us `sleep` | 391, 351 |
+| 500 us busy loop in the client | 274, 280 |
 
-An idle gap adds about 200 us to the same call. That is the same size as the difference between the proxy's `upstream` stage and the direct baseline. The direct baseline in the bench is therefore a lower bound that the proxy cannot reach at one client, not a like-for-like figure.
+Quoted earlier, unrecorded (no probe source or output was kept): 145 and 130, 337 and 377, 199 and 349.
 
-**The blocking pool hop can be removed, but the time moves elsewhere.** The experiment (commit `5b9d17a`, reverted in the next commit) added `[proxy] inline_decisions`. With it, `ServerAuthorizer` ran the decision on the async worker handling the request when no other decision was in flight, and on the blocking pool otherwise. Decisions, audit records and their order were the same in both paths, and a 48-way concurrent test checked the chain. Results, 1 hop, 1 client, allow call, 8 s cells after 2 s of warm-up, three interleaved runs of each, load average 2.6 to 10.8. The figures are medians of the three runs, with the range in brackets; all in us except calls/s.
+An idle gap adds about 200 us to the same call (190 to 215 us in the rerun). That is the same size as the difference between the proxy's `upstream` stage and the direct baseline. The direct baseline in the bench is therefore a lower bound that the proxy cannot reach at one client, not a like-for-like figure.
 
-| | memory, pool (before) | memory, inline | file, pool (before) | file, pool (same code, rerun) | file, inline |
+**The blocking pool hop can be removed, but the time moves elsewhere.** The experiment (commit `5b9d17a`, reverted in the next commit) added `[proxy] inline_decisions`. With it, `ServerAuthorizer` ran the decision on the async worker handling the request when no other decision was in flight, and on the blocking pool otherwise. Decisions, audit records and their order were the same in both paths, and a 48-way concurrent test checked the chain. Rerun 2026-10-23 with binaries built from `5b9d17a` ([`upstream-hop`](bench/2026-10-23-vm-upstream-hop.md)): 1 hop, 1 client, allow call, 8 s cells after 2 s of warm-up, three interleaved runs of each, load average 0.5 to 1.6. "inline" is `inline_decisions = "when_idle"`. The figures are medians of the three runs, with the range in brackets; all in us except calls/s.
+
+| | memory, pool | memory, inline | file, pool | file, inline |
+|---|---|---|---|---|
+| client p50 | 691 [562-693] | 636 [604-637] | 708 [620-747] | 701 [681-704] |
+| client p99 | 1510 | 1348 | 1606 | 1476 |
+| calls/s | 1373 | 1510 | 1312 | 1356 |
+| `blocking_pool` p50 | 69 | 1.4 | 69 | 1.5 |
+| `upstream` p50 | 210 | 236 | 206 | 251 |
+| `total` (handler) p50 | 460 | 405 | 484 | 456 |
+
+Quoted earlier, unrecorded (first run, load average 2.6 to 10.8, no results file kept). Its columns were memory pool, memory inline, file pool, file pool again with the same code, and file inline:
+
+| | memory, pool | memory, inline | file, pool | file, pool (rerun) | file, inline |
 |---|---|---|---|---|---|
 | client p50 | 572 [532-588] | 650 [555-728] | 661 [536-713] | 629 [607-638] | 591 [532-609] |
 | client p99 | 1236 | 1392 | 1612 | 2761 | 1207 |
@@ -278,9 +308,9 @@ An idle gap adds about 200 us to the same call. That is the same size as the dif
 | `upstream` p50 | 170 | 245 | 186 | 171 | 202 |
 | `total` (handler) p50 | 396 | 417 | 460 | 438 | 413 |
 
-The hop disappears from `blocking_pool`, and `upstream` grows by about as much. With the pool, the worker that resumes the request and the pool thread are still awake when the upstream answer arrives. Inline, fewer threads are awake and the answer meets a sleeping CPU. The client sees no consistent gain. The two pool columns for the file store run the same code, and they differ by 32 us at p50 and by a factor of 1.7 at p99. That is the noise floor, and the inline gains on the file store sit inside it.
+The hop disappears from `blocking_pool`, and `upstream` grows. In the first run it grew by about as much as the hop. In the rerun it grew by 26 us on memory and 45 us on file, against a hop of 69 us. With the pool, the worker that resumes the request and the pool thread are still awake when the upstream answer arrives. Inline, fewer threads are awake and the answer meets a sleeping CPU. The client sees no consistent gain. In the first run inline was 78 us slower on memory and 38 to 70 us faster on file. In the rerun it was 55 us faster on memory and 7 us faster on file. The pool's own three memory runs spread from 562 to 693 us at p50. That is the noise floor, and every inline difference sits inside it.
 
-Under load, inline is worse. At 8 clients on the memory store, two runs each gave 4,929 and 4,606 calls/s with the pool against 3,569 and 2,481 inline. Running Cedar and the append on async workers takes them away from I/O, and a request that waits for the audit store's lock holds a worker while it waits. The `when_idle` rule (inline only when no other decision is in flight) gave 5,515 and 3,792 calls/s against the pool's 5,745 and 5,177 in the same session. `tokio::task::block_in_place` brought the hop down to about 17 us at one client, but at 8 clients it fell to 4,963 and 2,878 calls/s.
+Under load, inline did not help. At 8 clients on the memory store, the first run gave 4,929 and 4,606 calls/s with the pool against 3,569 and 2,481 inline (unrecorded; that always-inline variant is not in `5b9d17a`). Running Cedar and the append on async workers takes them away from I/O, and a request that waits for the audit store's lock holds a worker while it waits. The `when_idle` rule (inline only when no other decision is in flight) gave 5,669 and 5,732 calls/s against the pool's 5,814 and 5,824 in the rerun ([`upstream-hop`](bench/2026-10-23-vm-upstream-hop.md)). Quoted earlier, unrecorded: 5,515 and 3,792 against 5,745 and 5,177. `tokio::task::block_in_place` brought the hop down to about 17 us at one client, but at 8 clients it fell to 4,963 and 2,878 calls/s (unrecorded; that variant was never committed).
 
 So the blocking pool stays, for both stores, and SR-22 is unchanged. On this VM a call through the proxy pays a few wake-ups from idle, and moving work between threads changes which stage records them. A quieter machine with less idle-state latency (or more load) would show a smaller `upstream` stage and a smaller hop. The measurement that would settle it is a direct baseline paced at the proxied rate; see the board.
 ### Exchange throughput, lease renewal and open-loop arrivals (2026-10-23)
