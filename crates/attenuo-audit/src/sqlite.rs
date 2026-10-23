@@ -698,7 +698,15 @@ fn wal_round(shared: &WalShared) -> Result<(), AuditError> {
     }
     if done.wal_frames >= WAL_RESTART_FRAMES {
         let _store = shared.store.lock()?;
+        #[cfg(any(test, feature = "testing"))]
+        let started = std::time::Instant::now();
         done = gated_checkpoint(activity, &conn, "PASSIVE")?;
+        #[cfg(any(test, feature = "testing"))]
+        activity
+            .timings
+            .lock()?
+            .locked_passes
+            .push((started.elapsed(), done.wal_frames));
     }
     let idle = activity.pending.load(Ordering::Acquire) == 0
         && activity.committed.load(Ordering::Acquire) == committed_before;
@@ -808,6 +816,22 @@ struct Activity {
     /// Held for the duration of every `PRAGMA wal_checkpoint` in this process, by the
     /// background thread and by the writer's backstop (see [`WalCheckpointer`]).
     checkpoint_gate: Mutex<()>,
+    /// Tests and measurements: how long each pause the checkpointers impose lasted.
+    #[cfg(any(test, feature = "testing"))]
+    timings: Mutex<WalTimings>,
+}
+
+/// Tests and measurements: the pauses the WAL checkpointers imposed on appends, as returned
+/// by [`SqliteAudit::wal_timings`].
+#[cfg(any(test, feature = "testing"))]
+#[doc(hidden)]
+#[derive(Debug, Default, Clone)]
+pub struct WalTimings {
+    /// How long each writer backstop (`TRUNCATE` on the writer's connection) ran.
+    pub backstops: Vec<Duration>,
+    /// Each locked pass of the background checkpointer: how long it held the store lock and
+    /// the WAL frames its `PASSIVE` reported.
+    pub locked_passes: Vec<(Duration, i64)>,
 }
 
 impl Drop for SqliteAudit {
@@ -1068,7 +1092,14 @@ impl Inner {
     /// or failed checkpoint is reported and the next commit, finding the WAL still large,
     /// tries again.
     fn wal_backstop(&self, conn: &Connection) {
-        match gated_checkpoint(&self.activity, conn, "TRUNCATE") {
+        #[cfg(any(test, feature = "testing"))]
+        let started = std::time::Instant::now();
+        let result = gated_checkpoint(&self.activity, conn, "TRUNCATE");
+        #[cfg(any(test, feature = "testing"))]
+        if let (Ok(_), Ok(mut t)) = (&result, self.activity.timings.lock()) {
+            t.backstops.push(started.elapsed());
+        }
+        match result {
             Ok(done) if done.complete() => {
                 self.activity
                     .since_wal_checkpoint
@@ -1827,6 +1858,23 @@ impl LeaseStore for SqliteLeaseStore {
                 .find(|(r, _)| *r == id.0)
                 .map(|(_, row)| row.clone()))
         })
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl SqliteAudit {
+    /// Tests and measurements: park the background WAL checkpointer for as long as the guard
+    /// lives (it locks its own connection first thing in a round, so every round blocks).
+    /// `None` without [`with_wal_checkpoints`](Self::with_wal_checkpoints).
+    #[doc(hidden)]
+    pub fn park_wal_checkpointer(&self) -> Option<std::sync::MutexGuard<'_, Connection>> {
+        self.wal.as_ref().map(|w| w.conn.lock().unwrap())
+    }
+
+    /// Tests and measurements: the pauses the WAL checkpointers have imposed so far.
+    #[doc(hidden)]
+    pub fn wal_timings(&self) -> WalTimings {
+        self.inner.activity.timings.lock().unwrap().clone()
     }
 }
 
