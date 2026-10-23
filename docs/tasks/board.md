@@ -41,6 +41,7 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 - [ ] Operations gaps found while writing the deploy guide: handle SIGTERM for graceful shutdown; a readiness check that touches SQLite; a metrics endpoint (decision counts by reason, audit append latency); automatic signed audit checkpoints.
 - [ ] Policy: let operators declare extra `originating_user.attributes` (for example `groups`) in config. Today only `mfa`, `roles`, `tenant` and `email` are in the Cedar schema, and a policy that tests anything else is reported impossible.
 - [ ] Python SDK follow-ups: publish to PyPI (name, trusted publishing, release workflow); a token-refresh helper (renew at a third of the interval, re-exchange before `exp`); streaming responses in `call_tool`; test the hop-0 exchange against a live IdP; run the unit suite on Python 3.10 in CI and confirm the workflow; keep the `kid` check in `inspect(verify=True)` aligned with the server's header and JWKS `kid`.
+- [ ] TypeScript SDK follow-ups: publish to npm (scope `@onbehalf`, provenance); a token-refresh helper and a per-request token hook for the MCP transport; streaming in `callTool`; confirm the workflow on GitHub (Node 20 and 22); test hop-0 against a live IdP.
 
 ## Later
 
@@ -59,6 +60,8 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 - [x] Documentation site: mdBook build of `docs/` (`book.toml`, `docs/SUMMARY.md`), concept and reference pages, Pages workflow `docs.yml`. Not yet run on GitHub; Pages must be set to "GitHub Actions" as the source in the repo settings.
 - [x] CI and release workflows (fmt, clippy, test matrix, MSRV, deny, audit, demo, policy tests, docs and link checks; musl/macOS archives, signed GHCR image, SBOM, draft release), dev scripts and justfile, repo hygiene files. Workflow YAML parses; none of it has run on GitHub.
 - [x] Python SDK (`sdk/python`, package `onbehalf`): sync and async clients, admin client, capability helpers, `onbehalf.mcp`, unit and integration tests, `sdk-python` workflow, [agent example](https://github.com/7Mudit/onbehalf/blob/main/examples/python-agent/agent.py).
+- [x] Python SDK (`sdk/python`, package `onbehalf`): sync and async clients, admin client, capability helpers, `onbehalf.mcp`, unit and integration tests, `sdk-python` workflow, [agent example](../../examples/python-agent/agent.py).
+- [x] TypeScript SDK (`sdk/typescript`, package `@onbehalf/sdk`): `OnbehalfClient`, `AdminClient`, capability builders, `mcpHeaders`/`mcpUrl`, unit and integration tests, `sdk-typescript` workflow, [agent example](../../examples/typescript-agent/agent.ts) and the official MCP client example.
 - [x] User guides (`docs/guides/`), FAQ and positioning table; wire examples verified against a local build. IdP recipes remain untested against live providers.
 - [x] Security review pass 1: SR-01 to SR-07 fixed with regression tests (proxy re-encodes screened messages, no upstream redirects, non-object arguments rejected; Cedar action hierarchy; integral floats as Long; TTL overflow; root-grant attributes).
 - [x] Lease renewal: `POST /token/renew`, `LeaseStore::renew`, lease expiry enforced for every hop, ADR-0006.

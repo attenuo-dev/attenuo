@@ -9,6 +9,10 @@ docs/.obsidian/workspace-mobile.json
 /.claude/
 /data/
 
+node_modules/
+dist/
+.bin/
+*.tsbuildinfo
 __pycache__/
 *.egg-info/
 .venv/
