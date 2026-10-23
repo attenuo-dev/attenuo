@@ -4,7 +4,8 @@
  */
 
 import type { CapabilityLike } from "./capability.js";
-import { authHeader, Http, type HttpOptions } from "./http.js";
+import { DpopKey, exchangeProofs, presented, type DpopKeyLike } from "./dpop.js";
+import { Http, type HttpOptions } from "./http.js";
 import { bearer, decodeToken, verifyToken, type Jwks, type Token } from "./token.js";
 import { mcpHeaders } from "./mcp.js";
 import * as w from "./wire.js";
@@ -12,6 +13,13 @@ import * as w from "./wire.js";
 export interface ClientOptions extends HttpOptions {
   /** A default bearer used when a method is called without one. */
   token?: Token | string;
+  /**
+   * Make this client sender-constrained (DPoP, RFC 9449): a `DpopKey` or a private JWK. Every
+   * request then carries a proof by the key, exchanges bind the new token to it, and tokens are
+   * sent as `Authorization: DPoP <token>`. A token bound to a key is refused without proofs, so a
+   * copied token is useless on its own.
+   */
+  dpopKey?: DpopKeyLike;
 }
 
 export interface InspectOptions {
@@ -36,11 +44,25 @@ export class OnbehalfClient {
   token: Token | string | undefined;
   private readonly http: Http;
   private nextId = 1;
+  private readonly dpopKeyLike: DpopKeyLike | undefined;
+  private dpopKeyPromise: Promise<DpopKey | undefined> | undefined;
 
   constructor(serverUrl: string, opts: ClientOptions = {}) {
     this.http = new Http(serverUrl, opts);
     this.serverUrl = this.http.base;
     this.token = opts.token;
+    this.dpopKeyLike = opts.dpopKey;
+  }
+
+  /** The client's DPoP key (imported on first use), or undefined for a bearer-only client. */
+  dpopKey(): Promise<DpopKey | undefined> {
+    this.dpopKeyPromise ??= DpopKey.of(this.dpopKeyLike);
+    return this.dpopKeyPromise;
+  }
+
+  /** `Authorization` (and a DPoP proof with this client's key) to present `jwt` at `path`. */
+  private async auth(jwt: string, path: string): Promise<Record<string, string>> {
+    return presented(jwt, await this.dpopKey(), "POST", `${this.serverUrl}${path}`);
   }
 
   /**
@@ -56,6 +78,10 @@ export class OnbehalfClient {
    * actor token authenticates one request.
    * `mayAct` lists the agents allowed to exchange the new token next (RFC 8693 §4.4).
    *
+   * With a `dpopKey` on the client, the new token is bound to it. When `subjectToken` is bound to
+   * another key, pass that key as `subjectDpopKey`: its proof tells the server the parent's holder
+   * agrees (a child of a bound token is always bound).
+   *
    * Throws `ApiError` (`invalid_scope`, `invalid_grant`, ...) on refusal.
    */
   async exchange(
@@ -65,13 +91,23 @@ export class OnbehalfClient {
     opts: w.ExchangeOptions = {},
   ): Promise<Token> {
     const body = w.exchangeBody(subjectToken, actor, capabilities, opts);
-    return w.tokenFromResponse(await w.jsonBody(await this.http.post("/token", { json: body })));
+    const { header, signOff } = await exchangeProofs(
+      `${this.serverUrl}/token`,
+      String(body.subject_token),
+      await this.dpopKey(),
+      await DpopKey.of(opts.subjectDpopKey),
+    );
+    if (signOff !== undefined) body.subject_token_dpop = signOff;
+    const headers: Record<string, string> = header === undefined ? {} : { dpop: header };
+    return w.tokenFromResponse(
+      await w.jsonBody(await this.http.post("/token", { json: body, headers })),
+    );
   }
 
   /** Extend the lease of the token's last hop (`POST /token/renew`). */
   async renew(token?: Token | string): Promise<w.Lease> {
     const res = await this.http.post("/token/renew", {
-      headers: authHeader(bearer(token, this.token)),
+      headers: await this.auth(bearer(token, this.token), "/token/renew"),
     });
     return w.leaseFromResponse(await w.jsonBody(res));
   }
@@ -83,8 +119,12 @@ export class OnbehalfClient {
     params: Record<string, unknown>,
     sessionId?: string,
   ): Promise<{ result: Record<string, unknown>; decisionId?: string; response: Response }> {
-    const res = await this.http.post(`/mcp/${encodeURIComponent(server)}`, {
-      headers: mcpHeaders(bearer(token, this.token), sessionId, { contentHeaders: true }),
+    const path = `/mcp/${encodeURIComponent(server)}`;
+    const jwt = bearer(token, this.token);
+    const headers = mcpHeaders(jwt, sessionId, { contentHeaders: true });
+    delete headers.Authorization; // replaced by `auth` (lowercase), with a proof when keyed
+    const res = await this.http.post(path, {
+      headers: { ...headers, ...(await this.auth(jwt, path)) },
       json: w.rpcRequest(method, params, this.nextId++),
     });
     return { ...(await w.rpcResult(res)), response: res };
@@ -140,7 +180,7 @@ export class OnbehalfClient {
     args?: Record<string, unknown>,
   ): Promise<w.AuthzenDecision> {
     const res = await this.http.post("/access/v1/evaluation", {
-      headers: authHeader(bearer(token, this.token)),
+      headers: await this.auth(bearer(token, this.token), "/access/v1/evaluation"),
       json: w.authzenBody(server, tool, args),
     });
     return w.authzenFromResponse(await w.jsonBody(res));

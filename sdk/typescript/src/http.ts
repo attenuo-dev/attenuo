@@ -66,7 +66,3 @@ export class Http {
     return this.request("POST", path, opts);
   }
 }
-
-export function authHeader(jwt: string): Record<string, string> {
-  return { authorization: `Bearer ${jwt}` };
-}

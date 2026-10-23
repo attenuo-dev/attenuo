@@ -43,6 +43,8 @@ export {
   prefix,
 } from "./capability.js";
 export type { Capability, CapabilityLike, Constraint } from "./capability.js";
+export { accessTokenHash, DpopKey, jwkThumbprint } from "./dpop.js";
+export type { DpopKeyLike, Jwk } from "./dpop.js";
 export { OnbehalfClient } from "./client.js";
 export type { ClientOptions, InspectOptions, McpOptions } from "./client.js";
 export {
@@ -54,7 +56,7 @@ export {
   VerificationError,
 } from "./errors.js";
 export type { FetchLike, HttpOptions } from "./http.js";
-export { mcpHeaders, mcpUrl } from "./mcp.js";
+export { mcpFetch, mcpHeaders, mcpUrl } from "./mcp.js";
 export { decodeToken, Token, TOKEN_TYPE, verifyToken } from "./token.js";
 export type { Chain, Hop, Jwks, User, VerifyOptions } from "./token.js";
 export type { AuthzenDecision, ExchangeOptions, Lease, Tool, ToolResult } from "./wire.js";

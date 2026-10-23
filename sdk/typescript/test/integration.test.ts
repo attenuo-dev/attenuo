@@ -30,6 +30,9 @@ import {
   ApiError,
   capability,
   DeniedError,
+  DpopKey,
+  mcpFetch,
+  mcpUrl,
   OnbehalfClient,
   prefix,
   UnauthorizedError,
@@ -280,6 +283,63 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
 
     // 15. Policy reload works and keeps the policies.
     expect((await admin.policyReload()).policyIds).toContain("read_file_public_repos_only");
+  });
+
+  it("binds tokens to keys and refuses them without proofs (SR-24)", async () => {
+    const admin = new AdminClient(url, ADMIN_TOKEN);
+    const [assistantKey, coderKey] = await Promise.all([DpopKey.generate(), DpopKey.generate()]);
+    const root = await admin.mintRootDev("alice", "https://idp.example", "assistant", {
+      capabilities: ["github:*"],
+      dpopKey: assistantKey,
+    });
+    expect(root.dpopJkt).toBe(assistantKey.thumbprint);
+
+    // The coder binds its token to its own key; the assistant's key signs off on the exchange.
+    const ob = new OnbehalfClient(url, { dpopKey: coderKey.privateJwk() });
+    const coder = await ob.exchange(root, "coder", [capability("github", "read_file")], {
+      clientSecret: CODER_SECRET,
+      subjectDpopKey: assistantKey,
+    });
+    expect(coder.dpopJkt).toBe(coderKey.thumbprint);
+    const ok = await ob.callTool(coder, "github", "read_file", { repo: "alice/public-docs" });
+    expect(ok.decisionId).toBeTruthy();
+    expect((await ob.listTools(coder, "github")).map((t) => t.name)).toEqual(["read_file"]);
+    expect(
+      (await ob.authzenEvaluate(coder, "github", "read_file", { repo: "alice/public-x" })).decision,
+    ).toBe(true);
+    expect((await ob.renew(coder)).expiresIn).toBeGreaterThan(0);
+
+    // An MCP client library's fetch, with a proof per request.
+    const keyed = mcpFetch(() => coder, { dpopKey: coderKey });
+    const res = await keyed(mcpUrl(url, "github"), {
+      method: "POST",
+      headers: {
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("read_file");
+
+    // The same token without the key: refused everywhere.
+    const thief = new OnbehalfClient(url);
+    const noProof = await thief
+      .callTool(coder, "github", "read_file", { repo: "alice/public-docs" })
+      .catch((e: unknown) => e);
+    expect(noProof).toBeInstanceOf(UnauthorizedError);
+    await expect(thief.renew(coder)).rejects.toMatchObject({ status: 401, error: "dpop_required" });
+    await expect(
+      thief.exchange(coder, "tester", "github:read_file", { clientSecret: TESTER_SECRET }),
+    ).rejects.toMatchObject({ status: 401, error: "dpop_required" });
+    // Another key does not help either.
+    const other = new OnbehalfClient(url, { dpopKey: await DpopKey.generate() });
+    await expect(other.renew(coder)).rejects.toMatchObject({ error: "invalid_dpop_proof" });
+
+    // The audit log records the bound use.
+    const entries = await admin.auditTail(50);
+    expect(entries.find((e) => e.record.id === ok.decisionId)?.dpopBound).toBe(true);
+    await admin.revokeLease(root.lease);
   });
 
   // The examples need `npm install` in examples/typescript-agent (and the SDK built); skipped

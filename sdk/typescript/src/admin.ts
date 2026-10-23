@@ -6,6 +6,7 @@
  */
 
 import { capabilitiesToJson, type CapabilityLike } from "./capability.js";
+import { DpopKey, type DpopKeyLike } from "./dpop.js";
 import { Http, type HttpOptions } from "./http.js";
 import { OnbehalfError } from "./errors.js";
 import type { Token } from "./token.js";
@@ -35,6 +36,11 @@ export interface AuditEntry {
   seq: number;
   record: Json;
   raw: Json;
+  /**
+   * The request proved possession of the key its token is bound to (DPoP); for an issuance, the
+   * new token is bound.
+   */
+  dpopBound: boolean;
 }
 
 export interface AuditPage {
@@ -74,6 +80,8 @@ export interface MintRootOptions {
    * within the `[[root_grants]]` entry's `may_act` when that has one. `[]` means nobody may.
    */
   mayAct?: readonly string[];
+  /** Bind the root token to this key (DPoP, RFC 9449): a `DpopKey` or a private JWK. */
+  dpopKey?: DpopKeyLike;
 }
 
 function opt<T>(v: unknown): T | undefined {
@@ -91,6 +99,7 @@ function entriesOf(page: Json): AuditEntry[] {
     seq: Number(e.seq),
     record: { ...((e.record as Json | undefined) ?? {}) },
     raw: e,
+    dpopBound: (e.record as Json | undefined)?.dpop_bound === true,
   }));
 }
 
@@ -240,7 +249,11 @@ export class AdminClient {
     if (opts.attributes && Object.keys(opts.attributes).length > 0)
       body.attributes = opts.attributes;
     if (opts.mayAct !== undefined) body.may_act = w.mayActJson(opts.mayAct);
-    const res = await this.http.post("/admin/root-token", { json: body });
+    const key = await DpopKey.of(opts.dpopKey);
+    const headers: Record<string, string> = key
+      ? { dpop: await key.proof("POST", `${this.serverUrl}/admin/root-token`) }
+      : {};
+    const res = await this.http.post("/admin/root-token", { json: body, headers });
     return w.tokenFromResponse(await w.jsonBody(res));
   }
 }
