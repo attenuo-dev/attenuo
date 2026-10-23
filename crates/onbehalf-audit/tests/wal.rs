@@ -157,7 +157,7 @@ fn the_wal_stays_bounded_under_continuous_load() {
             .unwrap(),
     );
     const THREADS: usize = 8;
-    const PER_THREAD: usize = 1500;
+    const PER_THREAD: usize = 3000;
     let done = Arc::new(AtomicBool::new(false));
     let sampler = {
         let done = Arc::clone(&done);
@@ -187,7 +187,7 @@ fn the_wal_stays_bounded_under_continuous_load() {
     done.store(true, Ordering::Release);
     let largest = sampler.join().unwrap();
     eprintln!("largest WAL: {} KiB", largest >> 10);
-    assert!(largest < 64 << 20, "the WAL reached {} MB", largest >> 20);
+    assert!(largest < 160 << 20, "the WAL reached {} MB", largest >> 20);
     let report = audit.verify_chain().unwrap();
     assert!(report.ok);
     assert_eq!(report.entries, (THREADS * PER_THREAD) as u64);

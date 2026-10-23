@@ -337,8 +337,16 @@ pub const WAL_CHECKPOINT_COMMITS: u64 = 256;
 
 /// WAL size (in frames, one page each) above which a checkpoint round ends with a short
 /// catch-up pass that holds the store's lock (see [`WalCheckpointer`]), so that the next
-/// commit starts the WAL over. 16 MB at the default 4 KiB page.
-const WAL_RESTART_FRAMES: i64 = 4096;
+/// commit starts the WAL over. 64 MB at the default 4 KiB page: each such round pauses
+/// appends briefly (two syncs), so it is kept rare; with 4,096 pages the pauses set the p99
+/// at 32 clients in the end-to-end bench.
+const WAL_RESTART_FRAMES: i64 = 16384;
+
+/// Unlocked catch-up passes before the locked one, at most.
+const WAL_CATCH_UP_PASSES: usize = 4;
+
+/// Frames committed during a catch-up pass small enough to copy with appends paused.
+const WAL_LOCKED_RESIDUE: i64 = 256;
 
 /// What one `PRAGMA wal_checkpoint` reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -389,9 +397,11 @@ enum WalMsg {
 /// 1. `PRAGMA wal_checkpoint(PASSIVE)` without any lock of the store's. `PASSIVE` takes no
 ///    SQLite lock the writer needs and never waits, so appends continue while it copies and
 ///    syncs; this is where nearly all of the work happens.
-/// 2. If the WAL has grown past [`WAL_RESTART_FRAMES`], a second `PASSIVE` while holding the
-///    store's connection lock, which pauses appends in this process for as long as it takes
-///    to copy what was committed during step 1. SQLite only starts a WAL over from its
+/// 2. If the WAL has grown past [`WAL_RESTART_FRAMES`], more unlocked passes, each copying
+///    what was committed during the one before, until few frames arrive during a pass (at
+///    most [`WAL_CATCH_UP_PASSES`]), then one more `PASSIVE` while holding the store's
+///    connection lock, which pauses appends in this process for as long as it takes to copy
+///    that remainder and sync. SQLite only starts a WAL over from its
 ///    beginning when a write finds every frame already copied, which under continuous load
 ///    step 1 alone never achieves (it copies up to where the WAL ended when it started), so
 ///    without this the WAL file would grow for as long as the load lasts.
@@ -489,6 +499,18 @@ fn wal_round(shared: &WalShared) -> Result<(), AuditError> {
     activity.since_wal_checkpoint.store(0, Ordering::Release);
     let committed_before = activity.committed.load(Ordering::Acquire);
     let mut done = wal_checkpoint(&conn, "PASSIVE")?;
+    if done.wal_frames >= WAL_RESTART_FRAMES {
+        // Catch up without the lock first: each pass copies what was committed during the
+        // previous one, so the frames left for the locked pass (and the pause) stay small.
+        for _ in 0..WAL_CATCH_UP_PASSES {
+            let again = wal_checkpoint(&conn, "PASSIVE")?;
+            let arrived = again.wal_frames - done.wal_frames;
+            done = again;
+            if arrived <= WAL_LOCKED_RESIDUE {
+                break;
+            }
+        }
+    }
     if done.wal_frames >= WAL_RESTART_FRAMES {
         let _store = shared.store.lock()?;
         done = wal_checkpoint(&conn, "PASSIVE")?;
@@ -845,7 +867,7 @@ impl SqliteAudit {
     /// `PRAGMA wal_checkpoint(PASSIVE)` every `interval`, or sooner after
     /// [`WAL_CHECKPOINT_COMMITS`] commits, plus `TRUNCATE` when the writer is idle and once
     /// more when the store is dropped. Under continuous load a round that finds the WAL past
-    /// 4,096 pages pauses appends for a short catch-up pass so the WAL starts over instead of
+    /// 64 MB pauses appends for a short catch-up pass so the WAL starts over instead of
     /// growing. See `[audit] wal_checkpoint_seconds`.
     ///
     /// A zero `interval` changes nothing (SQLite checkpoints on the writer, every 1,000
