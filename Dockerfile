@@ -5,7 +5,7 @@
 #   docker build -t onbehalf:dev .
 #   docker compose up --build        # server + fake GitHub MCP, see docker-compose.yml
 #
-# The rust-version in Cargo.toml is 1.85; the toolchain is `stable`, so build with a current
+# The rust-version in Cargo.toml is 1.89; the toolchain is `stable`, so build with a current
 # image rather than pinning the minimum.
 
 FROM rust:1-bookworm AS build

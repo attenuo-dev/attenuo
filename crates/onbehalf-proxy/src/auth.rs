@@ -3,7 +3,7 @@
 //! The proxy never verifies tokens or evaluates policy itself. It hands the bearer token to an
 //! [`Authorizer`] to obtain a [`DelegationChain`], and hands each [`ToolCall`] back to it for a
 //! decision. The real implementation (token verification + policy engine + audit log) plugs in
-//! behind this trait; tests use [`crate::testing::StaticAuthorizer`].
+//! behind this trait; tests use `testing::StaticAuthorizer` (behind the `testing` feature).
 
 use async_trait::async_trait;
 use onbehalf_core::{Decision, DelegationChain, ToolCall};
