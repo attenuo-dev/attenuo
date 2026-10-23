@@ -56,28 +56,6 @@ forbid(principal, action, resource)
 when { context.chain.depth > 3 };
 "#;
 
-/// `[proxy] inline_decisions` for the server the bench starts (see the server's config
-/// reference). Left out, the server's default (`auto`) applies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
-#[serde(rename_all = "snake_case")]
-#[value(rename_all = "snake_case")]
-pub enum InlineDecisions {
-    Auto,
-    BlockingPool,
-    WhenIdle,
-}
-
-impl InlineDecisions {
-    /// The config value.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            InlineDecisions::Auto => "auto",
-            InlineDecisions::BlockingPool => "blocking_pool",
-            InlineDecisions::WhenIdle => "when_idle",
-        }
-    }
-}
-
 /// Where the audit log lives for a group of runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -190,10 +168,6 @@ pub struct Opts {
     /// `file_full` (SQLite on disk, `durability = "full"`). One server per mode.
     #[arg(long, value_delimiter = ',', value_enum, default_values_t = [AuditMode::Memory, AuditMode::File, AuditMode::FileFull])]
     pub audit: Vec<AuditMode>,
-    /// `[proxy] inline_decisions` for the server the bench starts (and for `--print-config`):
-    /// `auto`, `blocking_pool` or `when_idle`. Default: not set, so the server's default.
-    #[arg(long, value_enum)]
-    pub inline_decisions: Option<InlineDecisions>,
     /// Call outcomes to measure.
     #[arg(long, value_delimiter = ',', value_enum,
           default_values_t = [Outcome::Allow, Outcome::DenyPolicy, Outcome::DenyCapability])]
@@ -360,8 +334,7 @@ impl Drop for WorkDir {
 }
 
 /// The server config the bench needs. `sqlite` and `durability` are the `[audit]`
-/// `sqlite_path` and `durability` values; `inline` is `[proxy] inline_decisions`, left out when
-/// `None`.
+/// `sqlite_path` and `durability` values.
 pub fn render_config(
     onbehalf_port: u16,
     upstream_port: u16,
@@ -369,7 +342,6 @@ pub fn render_config(
     sqlite: &str,
     durability: &str,
     metrics_port: u16,
-    inline: Option<InlineDecisions>,
 ) -> String {
     let mut s = format!(
         r#"# onbehalf-server config written by onbehalf-bench.
@@ -426,12 +398,6 @@ allow_root_mint = true
     for i in 1..=MAX_EXCHANGES {
         s.push_str(&format!(
             "\n[[agents]]\nid = \"bench-a{i}\"\nsecret_sha256 = \"{AGENT_SECRET_SHA256}\"\n"
-        ));
-    }
-    if let Some(mode) = inline {
-        s.push_str(&format!(
-            "\n[proxy]\ninline_decisions = \"{}\"\n",
-            mode.as_str()
         ));
     }
     s
@@ -1211,7 +1177,6 @@ pub async fn run(opts: Opts) -> Result<()> {
             &sqlite,
             durability,
             opts.metrics_port,
-            opts.inline_decisions,
         );
         std::fs::write(dir.join("config.toml"), cfg)?;
         eprintln!("wrote {}/config.toml and policy.cedar", dir.display());
@@ -1267,15 +1232,7 @@ pub async fn run(opts: Opts) -> Result<()> {
             let cfg_path = work.0.join(format!("config-{label}.toml"));
             std::fs::write(
                 &cfg_path,
-                render_config(
-                    ob_port,
-                    up_port,
-                    &policy,
-                    &sqlite,
-                    durability,
-                    metrics_port,
-                    opts.inline_decisions,
-                ),
+                render_config(ob_port, up_port, &policy, &sqlite, durability, metrics_port),
             )?;
 
             let _fake = Proc {
@@ -1347,29 +1304,6 @@ mod tests {
             "message": format!("onbehalf: denied: {reason}"),
             "data": {"reason": reason, "decision_id": ID}}})
         .to_string()
-    }
-
-    #[test]
-    fn inline_decisions_is_written_only_when_set() {
-        let render =
-            |mode| render_config(1, 2, Path::new("p.cedar"), ":memory:", "normal", 3, mode);
-        assert!(!render(None).contains("[proxy]"));
-        for (mode, text) in [
-            (InlineDecisions::Auto, "auto"),
-            (InlineDecisions::BlockingPool, "blocking_pool"),
-            (InlineDecisions::WhenIdle, "when_idle"),
-        ] {
-            let cfg = render(Some(mode));
-            assert_eq!(cfg.matches("[proxy]").count(), 1, "{text}");
-            assert!(
-                cfg.ends_with(&format!("[proxy]\ninline_decisions = \"{text}\"\n")),
-                "{text}"
-            );
-        }
-        let opts = Opts::try_parse_from(["onbehalf-bench", "--inline-decisions", "blocking_pool"])
-            .unwrap();
-        assert_eq!(opts.inline_decisions, Some(InlineDecisions::BlockingPool));
-        assert!(Opts::try_parse_from(["onbehalf-bench", "--inline-decisions", "always"]).is_err());
     }
 
     #[test]

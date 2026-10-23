@@ -14,7 +14,6 @@
 //! The chain is assumed to be verified already (token signature, structure, expiry).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -286,29 +285,6 @@ pub struct ServerAuthorizer {
     pipeline: Arc<Pipeline>,
     verified: VerifiedTokens,
     dpop: Option<Arc<crate::dpop::Dpop>>,
-    /// Run a pipeline step inline when no other one is in flight
-    /// ([`crate::config::InlineDecisions`]).
-    inline_when_idle: bool,
-    /// Pipeline steps in flight through [`ServerAuthorizer::run`], inline or on the pool.
-    in_flight: AtomicUsize,
-}
-
-/// Counts one pipeline step in [`ServerAuthorizer::in_flight`] until dropped, so a panic or a
-/// cancelled request cannot leave the count raised.
-struct InFlight<'a>(&'a AtomicUsize);
-
-impl<'a> InFlight<'a> {
-    /// Enter, and whether no other step was in flight.
-    fn enter(count: &'a AtomicUsize) -> (Self, bool) {
-        let alone = count.fetch_add(1, Ordering::AcqRel) == 0;
-        (Self(count), alone)
-    }
-}
-
-impl Drop for InFlight<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
 }
 
 impl ServerAuthorizer {
@@ -318,31 +294,6 @@ impl ServerAuthorizer {
             pipeline,
             verified: VerifiedTokens::new(VERIFIED_TOKENS_CAPACITY),
             dpop: None,
-            inline_when_idle: false,
-            in_flight: AtomicUsize::new(0),
-        }
-    }
-
-    /// Run a decision (and the proxy's other pipeline steps) on the calling async worker when
-    /// no other one is in flight, and on the blocking pool otherwise. Off by default; see
-    /// [`crate::config::InlineDecisions`] for when it pays.
-    pub fn with_inline_when_idle(mut self, on: bool) -> Self {
-        self.inline_when_idle = on;
-        self
-    }
-
-    /// Run a pipeline step: inline when that is enabled and nothing else is in flight, else on
-    /// the blocking pool ([`on_blocking_pool`]). The step itself, and so the decision and its
-    /// audit record, is the same either way.
-    async fn run<R: Send + 'static>(&self, f: impl FnOnce(&Pipeline) -> R + Send + 'static) -> R {
-        if !self.inline_when_idle {
-            return on_blocking_pool(&self.pipeline, f).await;
-        }
-        let (_guard, alone) = InFlight::enter(&self.in_flight);
-        if alone {
-            f(&self.pipeline)
-        } else {
-            on_blocking_pool(&self.pipeline, f).await
         }
     }
 
@@ -514,7 +465,7 @@ impl Authorizer for ServerAuthorizer {
         now: OffsetDateTime,
     ) -> Result<(), AuthError> {
         let chain = chain.clone();
-        self.run(move |p| p.check_leases(&chain, now))
+        on_blocking_pool(&self.pipeline, move |p| p.check_leases(&chain, now))
             .await
             .map_err(|(reason, detail)| {
                 tracing::warn!(reason, detail = ?detail.join("; "), "lease check failed");
@@ -530,15 +481,13 @@ impl Authorizer for ServerAuthorizer {
     ) -> AuthDecision {
         let (chain, call) = (chain.clone(), call.clone());
         let started = Instant::now();
-        let (d, decide_time) = self
-            .run(move |p| {
-                let t = Instant::now();
-                let d = p.decide(&chain, &call, now);
-                (d, t.elapsed())
-            })
-            .await;
-        // What the hop to the blocking pool and back cost, beyond the decision itself (a few
-        // microseconds when the decision ran inline).
+        let (d, decide_time) = on_blocking_pool(&self.pipeline, move |p| {
+            let t = Instant::now();
+            let d = p.decide(&chain, &call, now);
+            (d, t.elapsed())
+        })
+        .await;
+        // What the hop to the blocking pool and back cost, beyond the decision itself.
         let hop = started.elapsed().saturating_sub(decide_time);
         self.pipeline
             .metrics()
@@ -571,8 +520,10 @@ impl Authorizer for ServerAuthorizer {
         now: OffsetDateTime,
     ) -> Uuid {
         let (chain, call, reason) = (chain.clone(), call.clone(), reason.to_string());
-        self.run(move |p| p.record_rejection(&chain, &call, &reason, now))
-            .await
+        on_blocking_pool(&self.pipeline, move |p| {
+            p.record_rejection(&chain, &call, &reason, now)
+        })
+        .await
     }
 
     fn observe_stage(&self, stage: Stage, elapsed: Duration) {
@@ -855,86 +806,5 @@ mod tests {
         let chains = cache.chains.lock().unwrap();
         assert_eq!(chains.len(), 1);
         assert!(chains.contains_key(&VerifiedTokens::key("c")));
-    }
-
-    fn authorizer(inline: bool) -> (ServerAuthorizer, Arc<MemoryAudit>, DelegationChain) {
-        let (p, leases, audit, chain) = setup();
-        leases
-            .register(
-                &LeaseId::new("l1"),
-                None,
-                OffsetDateTime::now_utc() + Duration::hours(1),
-            )
-            .unwrap();
-        let issuer = onbehalf_token::Issuer::generate(onbehalf_token::IssuerConfig {
-            issuer: "https://onbehalf.test".into(),
-            audience: "onbehalf".into(),
-            max_depth: 4,
-            default_ttl: Duration::minutes(5),
-        });
-        let auth =
-            ServerAuthorizer::new(issuer.verifier(), Arc::new(p)).with_inline_when_idle(inline);
-        (auth, audit, chain)
-    }
-
-    /// `[proxy] inline_decisions`: a step runs on the calling thread only when nothing else is
-    /// in flight, and the count goes back to zero.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn inline_when_idle_runs_on_the_caller_only_when_alone() {
-        let here = || std::thread::current().id();
-        let (auth, _audit, _chain) = authorizer(true);
-        let caller = here();
-        assert_eq!(auth.run(move |_| here()).await, caller, "alone: inline");
-        assert_eq!(auth.in_flight.load(Ordering::Acquire), 0);
-
-        // With another step in flight, the next one goes to the pool.
-        let (_busy, alone) = InFlight::enter(&auth.in_flight);
-        assert!(alone);
-        assert_ne!(auth.run(move |_| here()).await, caller, "busy: pool");
-        drop(_busy);
-        assert_eq!(auth.in_flight.load(Ordering::Acquire), 0);
-
-        // Off: always the pool.
-        let (off, _audit, _chain) = authorizer(false);
-        assert_ne!(off.run(move |_| here()).await, caller);
-    }
-
-    /// Inline or on the pool, concurrent decisions give the same answers and a linear,
-    /// complete audit chain.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn inline_when_idle_keeps_decisions_and_the_audit_chain() {
-        let mut answers = Vec::new();
-        for inline in [false, true] {
-            let (auth, audit, chain) = authorizer(inline);
-            let auth = Arc::new(auth);
-            let now = OffsetDateTime::now_utc();
-            let tasks: Vec<_> = (0..48)
-                .map(|i| {
-                    let (auth, chain) = (auth.clone(), chain.clone());
-                    tokio::spawn(async move {
-                        let tool = if i % 3 == 0 {
-                            "delete_repo"
-                        } else {
-                            "read_file"
-                        };
-                        let call = ToolCall::new("github", tool, json!({ "i": i }));
-                        let d = auth.authorize(&chain, &call, now).await;
-                        (i, d.decision, d.reason)
-                    })
-                })
-                .collect();
-            let mut got = Vec::new();
-            for t in tasks {
-                got.push(t.await.unwrap());
-            }
-            assert_eq!(auth.in_flight.load(Ordering::Acquire), 0);
-            let report = audit.verify_chain().unwrap();
-            assert!(report.ok, "{report:?}");
-            assert_eq!(report.entries, 48);
-            let seqs: Vec<u64> = audit.snapshot().unwrap().iter().map(|e| e.seq).collect();
-            assert_eq!(seqs, (seqs[0]..seqs[0] + 48).collect::<Vec<_>>());
-            answers.push(got);
-        }
-        assert_eq!(answers[0], answers[1]);
     }
 }

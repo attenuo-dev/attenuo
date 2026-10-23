@@ -728,46 +728,6 @@ pub struct ProxySection {
     /// deleted (SR-49). Default 64.
     #[serde(default = "default_max_sessions_per_principal")]
     pub max_sessions_per_principal: usize,
-    /// Where the proxy runs a call's decision (lease check, policy, audit append):
-    /// `"auto"` (default), `"blocking_pool"` or `"when_idle"`. See [`InlineDecisions`].
-    #[serde(default)]
-    pub inline_decisions: InlineDecisions,
-}
-
-/// `[proxy] inline_decisions`: whether the proxy may run a decision on the async worker that
-/// handles the request instead of handing it to tokio's blocking pool.
-///
-/// The hand-off and the wake-up back cost more than the decision on an idle server (about
-/// 70 us against 60 to 120 us of work, 2026-10-23 measurements in `docs/design/performance.md`).
-/// Under concurrent load the pool is better: it keeps the CPU work and the audit store's lock
-/// off the async workers. `when_idle` takes the inline path only when no other proxy decision
-/// is in flight, and the pool otherwise. Decisions, their audit records and their order are
-/// the same either way; only the thread differs.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InlineDecisions {
-    /// `when_idle` for an in-memory store (`[audit] sqlite_path = ":memory:"`, no file I/O),
-    /// `blocking_pool` for a file, so no SQLite file I/O or `fsync` runs on an async worker
-    /// (SR-22).
-    #[default]
-    Auto,
-    /// Always the blocking pool (the behaviour before this setting).
-    BlockingPool,
-    /// Inline when no other proxy decision is in flight. For a file-backed store this puts
-    /// SQLite writes, and the `fsync` of a commit that signs a checkpoint, on an async worker
-    /// while the proxy is otherwise idle.
-    WhenIdle,
-}
-
-impl InlineDecisions {
-    /// Whether decisions may run inline, for an audit store at `sqlite_path`.
-    pub fn when_idle(self, sqlite_path: &str) -> bool {
-        match self {
-            InlineDecisions::Auto => sqlite_path == ":memory:",
-            InlineDecisions::BlockingPool => false,
-            InlineDecisions::WhenIdle => true,
-        }
-    }
 }
 
 impl Default for ProxySection {
@@ -780,7 +740,6 @@ impl Default for ProxySection {
             session_ttl_seconds: default_session_ttl_seconds(),
             max_sessions: default_max_sessions(),
             max_sessions_per_principal: default_max_sessions_per_principal(),
-            inline_decisions: InlineDecisions::default(),
         }
     }
 }
@@ -1191,37 +1150,6 @@ mod tests {
             let err = cfg.proxy.check_limits().unwrap_err().to_string();
             assert!(err.contains(key), "{err}");
         }
-    }
-
-    #[test]
-    fn inline_decisions_default_to_auto_and_follow_the_store() {
-        let cfg = Config::from_toml("").unwrap();
-        assert_eq!(cfg.proxy.inline_decisions, InlineDecisions::Auto);
-        assert!(cfg.proxy.inline_decisions.when_idle(":memory:"));
-        assert!(!cfg
-            .proxy
-            .inline_decisions
-            .when_idle("/var/lib/onbehalf/audit.db"));
-        for (text, want, memory, file) in [
-            ("auto", InlineDecisions::Auto, true, false),
-            ("blocking_pool", InlineDecisions::BlockingPool, false, false),
-            ("when_idle", InlineDecisions::WhenIdle, true, true),
-        ] {
-            let cfg =
-                Config::from_toml(&format!("[proxy]\ninline_decisions = \"{text}\"\n")).unwrap();
-            assert_eq!(cfg.proxy.inline_decisions, want, "{text}");
-            assert_eq!(
-                cfg.proxy.inline_decisions.when_idle(":memory:"),
-                memory,
-                "{text}"
-            );
-            assert_eq!(
-                cfg.proxy.inline_decisions.when_idle("audit.db"),
-                file,
-                "{text}"
-            );
-        }
-        assert!(Config::from_toml("[proxy]\ninline_decisions = \"always\"\n").is_err());
     }
 
     #[test]

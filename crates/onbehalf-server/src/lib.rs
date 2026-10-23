@@ -95,13 +95,7 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
 
     let authorizer = Arc::new(
         ServerAuthorizer::new(state.verifier.clone(), state.pipeline.clone())
-            .with_dpop(state.dpop.clone())
-            .with_inline_when_idle(
-                config
-                    .proxy
-                    .inline_decisions
-                    .when_idle(&config.audit.sqlite_path),
-            ),
+            .with_dpop(state.dpop.clone()),
     );
     let proxy = onbehalf_proxy::router(
         // Validated in `AppState::from_config`.
