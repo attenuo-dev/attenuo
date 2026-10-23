@@ -5,6 +5,9 @@
 //! stage passes and the time goes to chain-to-Cedar translation and policy evaluation. The
 //! default policy `forbid_deep_chains` rejects depth > 3, so every 4-hop case is a deny; the
 //! cost of evaluating a deeper principal hierarchy is what is being compared, not the outcome.
+//!
+//! The same chain and call repeat, so after the first iteration every call is a hit in the
+//! engine's request cache (see `benches/policy_stage.rs` for the uncached cost).
 
 use std::collections::BTreeMap;
 use std::hint::black_box;

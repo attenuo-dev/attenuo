@@ -364,6 +364,7 @@ impl PolicyEngineBuilder {
             legacy_bare_actions: self.legacy_bare_actions,
             authorizer: Authorizer::new(),
             validation_warnings: warnings,
+            request_cache: request::RequestCache::new(request::REQUEST_CACHE_CAPACITY),
         })
     }
 }
@@ -414,8 +415,59 @@ fn apply_id_annotations(parsed: &PolicySet) -> Result<PolicySet, PolicyError> {
     Ok(out)
 }
 
-/// The policy decision point. Cheap to clone the parts that matter; build once per policy
-/// version and share behind an `Arc`/`RwLock` if you need hot reload across threads.
+/// A Cedar request ready to evaluate, with its entity store.
+struct Prepared {
+    request: Request,
+    parts: std::sync::Arc<request::RequestParts>,
+}
+
+/// Hooks for `benches/policy_stage.rs`: the two halves of the Cedar stage, timed apart.
+/// Not a stable API.
+#[doc(hidden)]
+pub mod bench_support {
+    use super::*;
+
+    /// A prepared Cedar request (opaque).
+    pub struct PreparedRequest(Prepared);
+
+    /// Translate `(chain, call)` into a Cedar request and entity store, as
+    /// [`PolicyEngine::authorize`] does after the capability and catalog stages.
+    pub fn prepare(
+        engine: &PolicyEngine,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        now: OffsetDateTime,
+    ) -> PreparedRequest {
+        let attrs = engine.catalog.get(&call.server, &call.tool);
+        PreparedRequest(
+            engine
+                .prepare(chain, call, &attrs, now)
+                .expect("request translates"),
+        )
+    }
+
+    /// Evaluate a prepared request.
+    pub fn evaluate(engine: &PolicyEngine, prepared: &PreparedRequest) -> Outcome {
+        engine.evaluate_prepared(&prepared.0)
+    }
+
+    /// Empty the engine's request cache, so the next call translates the chain again.
+    pub fn clear_request_cache(engine: &PolicyEngine) {
+        engine.request_cache.clear();
+    }
+}
+
+/// The policy decision point. Build once per policy version and share behind an
+/// `Arc`/`RwLock` if you need hot reload across threads.
+///
+/// The schema and policy set are parsed and validated once, at build or reload, never per
+/// call. Translating a chain into Cedar entities and context records (Cedar parsing their
+/// JSON) was about 90 percent of a decision, so the engine keeps the parts that depend only
+/// on the chain and the tool (entity store, principal, action, resource, and the
+/// `originating_user` and `chain` context records) in a bounded cache of 4,096 entries,
+/// matched on every input they were built from. A call then builds only `context.input`,
+/// `context.session_id` and `context.now_unix`. [`reload_policies_str`](Self::reload_policies_str)
+/// empties the cache; a catalog change means a new engine, so a new cache.
 #[derive(Debug)]
 pub struct PolicyEngine {
     schema: Schema,
@@ -427,6 +479,7 @@ pub struct PolicyEngine {
     legacy_bare_actions: bool,
     authorizer: Authorizer,
     validation_warnings: Vec<String>,
+    request_cache: request::RequestCache,
 }
 
 impl PolicyEngine {
@@ -494,18 +547,36 @@ impl PolicyEngine {
         }
 
         // Stage 2: Cedar.
-        let req = match request::build(chain, call, &attrs, now, self.legacy_bare_actions) {
-            Ok(r) => r,
-            Err(e) => return Outcome::deny(REASON_POLICY_ERROR, vec![e.to_string()]),
-        };
-        let request = match Request::new(req.principal, req.action, req.resource, req.context, None)
-        {
-            Ok(r) => r,
-            Err(e) => return Outcome::deny(REASON_POLICY_ERROR, vec![e.to_string()]),
-        };
-        let response = self
-            .authorizer
-            .is_authorized(&request, &self.policies, &req.entities);
+        match self.prepare(chain, call, &attrs, now) {
+            Ok(prepared) => self.evaluate_prepared(&prepared),
+            Err(e) => Outcome::deny(REASON_POLICY_ERROR, vec![e]),
+        }
+    }
+
+    /// Stage 2, first half: the Cedar request and entity store for `call`. The parts that
+    /// depend only on the chain and tool come from the request cache.
+    fn prepare(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        attrs: &ToolAttrs,
+        now: OffsetDateTime,
+    ) -> Result<Prepared, String> {
+        let parts = self
+            .request_cache
+            .get_or_build(chain, call, attrs, self.legacy_bare_actions)
+            .map_err(|e| e.to_string())?;
+        let request = parts.request(call, now).map_err(|e| e.to_string())?;
+        Ok(Prepared { request, parts })
+    }
+
+    /// Stage 2, second half: evaluate a prepared request against the policy set.
+    fn evaluate_prepared(&self, prepared: &Prepared) -> Outcome {
+        let response = self.authorizer.is_authorized(
+            &prepared.request,
+            &self.policies,
+            &prepared.parts.entities,
+        );
         let diagnostics = response.diagnostics();
         let errors: Vec<String> = diagnostics.errors().map(|e| e.to_string()).collect();
         let policy_ids: Vec<String> = diagnostics.reason().map(|id| id.to_string()).collect();
@@ -552,6 +623,9 @@ impl PolicyEngine {
         let (policies, warnings) = load_policies(policies, &self.schema)?;
         self.policies = policies;
         self.validation_warnings = warnings;
+        // The cached request parts do not depend on the policies, but a reload is the
+        // operator's "start from scratch", so it starts with an empty cache too.
+        self.request_cache.clear();
         Ok(())
     }
 
@@ -579,6 +653,11 @@ impl PolicyEngine {
 
     pub fn catalog(&self) -> &ToolCatalog {
         &self.catalog
+    }
+
+    /// How many `(chain, tool)` translations the request cache holds (at most 4,096).
+    pub fn cached_requests(&self) -> usize {
+        self.request_cache.len()
     }
 
     /// The policy for tools that are not in the catalog.

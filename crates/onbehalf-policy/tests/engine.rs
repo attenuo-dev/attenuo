@@ -1056,3 +1056,71 @@ fn catalog_and_call_names_are_checked_sr13() {
         assert_eq!(o.reason, onbehalf_policy::REASON_INVALID_NAME, "{call:?}");
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// The request cache (per chain and tool)
+// ---------------------------------------------------------------------------------------
+
+/// Every decision served from the request cache equals the one a fresh translation gives,
+/// across users, depths, tools, arguments, sessions and times, in any order.
+#[test]
+fn cached_translations_decide_like_fresh_ones() {
+    let policies = format!(
+        "{DEFAULT_POLICIES}\n@id(\"permit_delete\") permit(principal, action == Action::\"github/delete_repo\", resource);"
+    );
+    let cached = engine_with(&policies);
+    let fresh = engine_with(&policies);
+    let wide = || caps(vec![Capability::new("github", "*")]);
+    let chains = [
+        chain_for(user_with(&[("mfa", json!(true))]), "coder", wide()),
+        chain_for(user_with(&[("mfa", json!(false))]), "coder", wide()),
+        chain_for(user_with(&[]), "coder", wide()),
+        deepen(chain(), 2),
+        deepen(chain(), 3),
+    ];
+    let mut calls = vec![
+        call("read_file", json!({"repo": "alice/site"})),
+        call("create_issue", json!({"repo": "acme/site"})),
+        call("create_issue", json!({"repo": "evil/site"})),
+        call("create_issue", json!({})),
+        call("delete_repo", json!({"repo": "acme/old"})),
+    ];
+    let mut with_session = call("read_file", json!({"repo": "alice/site"}));
+    with_session.session_id = Some("0123456789ab".into());
+    calls.push(with_session);
+    let mut seen = 0;
+    for round in 0..3 {
+        for c in &chains {
+            for k in &calls {
+                let at = now() + Duration::seconds(round);
+                onbehalf_policy::bench_support::clear_request_cache(&fresh);
+                assert_eq!(
+                    cached.authorize(c, k, at),
+                    fresh.authorize(c, k, at),
+                    "round {round}, depth {}, {}",
+                    c.depth(),
+                    k.tool
+                );
+                seen += 1;
+            }
+        }
+    }
+    assert_eq!(seen, 3 * chains.len() * calls.len());
+    assert!(cached.cached_requests() > 0);
+}
+
+#[test]
+fn reload_empties_the_request_cache() {
+    let mut engine = engine_with(r#"@id("all") permit(principal, action, resource);"#);
+    let c = call("read_file", json!({}));
+    assert!(engine.authorize(&chain(), &c, now()).decision.is_allow());
+    assert_eq!(engine.cached_requests(), 1);
+    engine
+        .reload_policies_str(r#"@id("none") forbid(principal, action, resource);"#)
+        .unwrap();
+    assert_eq!(engine.cached_requests(), 0);
+    assert_eq!(
+        engine.authorize(&chain(), &c, now()).decision,
+        Decision::Deny
+    );
+}
