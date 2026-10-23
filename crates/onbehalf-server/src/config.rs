@@ -168,6 +168,32 @@ pub struct TokenSection {
     /// one accepted method is mandatory for an exchange; hop 0 always needs one.
     #[serde(default)]
     pub actor_auth: ActorAuth,
+    /// Sender-constrained tokens (DPoP, RFC 9449; SR-24): `"off"`, `"optional"` (default) or
+    /// `"required"`. See [`crate::dpop`]. Tokens already bound to a key need a proof whatever
+    /// this says.
+    #[serde(default)]
+    pub dpop: DpopMode,
+    /// How far a DPoP proof's `iat` may be from the server's clock, either way, in seconds.
+    /// Default 300.
+    #[serde(default = "default_dpop_max_age")]
+    pub dpop_max_age_seconds: u64,
+    /// Most DPoP proofs remembered for replay detection (each until its `iat` plus
+    /// `dpop_max_age_seconds`). When full of live proofs, new ones get 503. Default 1000000.
+    #[serde(default = "default_dpop_replay_capacity")]
+    pub dpop_replay_capacity: usize,
+}
+
+/// Default for `[token] dpop_max_age_seconds`.
+pub const DEFAULT_DPOP_MAX_AGE_SECONDS: u64 = 300;
+/// Default for `[token] dpop_replay_capacity`.
+pub const DEFAULT_DPOP_REPLAY_CAPACITY: usize = 1_000_000;
+
+fn default_dpop_max_age() -> u64 {
+    DEFAULT_DPOP_MAX_AGE_SECONDS
+}
+
+fn default_dpop_replay_capacity() -> usize {
+    DEFAULT_DPOP_REPLAY_CAPACITY
 }
 
 impl Default for TokenSection {
@@ -175,8 +201,39 @@ impl Default for TokenSection {
         Self {
             require_actor_auth: true,
             actor_auth: ActorAuth::default(),
+            dpop: DpopMode::default(),
+            dpop_max_age_seconds: DEFAULT_DPOP_MAX_AGE_SECONDS,
+            dpop_replay_capacity: DEFAULT_DPOP_REPLAY_CAPACITY,
         }
     }
+}
+
+impl TokenSection {
+    /// Startup check of the DPoP settings.
+    pub fn check_dpop(&self) -> anyhow::Result<()> {
+        if !(1..=3600).contains(&self.dpop_max_age_seconds) {
+            anyhow::bail!("[token] dpop_max_age_seconds must be between 1 and 3600");
+        }
+        if self.dpop_replay_capacity == 0 {
+            anyhow::bail!("[token] dpop_replay_capacity must be at least 1");
+        }
+        Ok(())
+    }
+}
+
+/// `[token] dpop`: when tokens are bound to a key with DPoP (RFC 9449).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DpopMode {
+    /// Never bind new tokens; `DPoP` headers on issuance are ignored. Bound tokens still need
+    /// proofs.
+    Off,
+    /// Bind a new token when the request carries a valid proof.
+    #[default]
+    Optional,
+    /// Every issuance needs a proof, and unbound tokens are refused wherever a token is
+    /// presented.
+    Required,
 }
 
 /// `[token] actor_auth`: which credentials authenticate the actor of an exchange and the agent

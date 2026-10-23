@@ -45,7 +45,15 @@
 //!    binding, a response that would bind a new session is replaced by `503` with reason
 //!    `session_registry_full`. Expired bindings are reclaimed; live ones are never evicted.
 //!
-//! 8. re-checks every response it streams (the `GET` listen stream, and a `POST` answered with
+//! 8. passes a `DPoP` proof (RFC 9449), with the method and path it must name, to
+//!    [`Authorizer::authenticate_request`] (SR-24). A token bound to a key (`cnf.jkt`) is
+//!    refused without a valid proof: `401` with reason `dpop_required` or
+//!    `invalid_dpop_proof` and a `WWW-Authenticate: DPoP` challenge. Either
+//!    `Authorization: Bearer <token>` or `Authorization: DPoP <token>` is accepted; the
+//!    binding comes from the token. Decisions record whether the request was bound
+//!    ([`onbehalf_core::ToolCall::dpop_bound`]).
+//!
+//! 9. re-checks every response it streams (the `GET` listen stream, and a `POST` answered with
 //!    a streamed body such as SSE) every [`ProxyConfig::stream_recheck`] (default 2 s) against
 //!    the token's expiry and [`Authorizer::check_active`], and ends the stream at the first
 //!    failure: an SSE stream after a final event carrying JSON-RPC error `-32001` with
@@ -111,7 +119,7 @@ pub mod sse;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
-pub use auth::{AuthDecision, AuthError, Authorizer};
+pub use auth::{AuthDecision, AuthError, Authenticated, Authorizer, RequestAuth};
 pub use config::{ProxyConfig, UpstreamConfig};
 pub use proxy::{
     router, serve, DECISION_ID_HEADER, REASON_INVALID_NAME, REASON_REQUEST_TOO_LARGE,

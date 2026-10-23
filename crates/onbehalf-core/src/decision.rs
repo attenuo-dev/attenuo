@@ -50,6 +50,11 @@ pub struct DecisionRecord {
     /// Identifiers of the policies that determined the decision, if the engine reports them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub policy_ids: Vec<String>,
+    /// The token was sender-constrained (`cnf.jkt`) and the request carried a valid DPoP proof
+    /// for it (SR-24). For an issuance record: the new token is bound. Absent (false) in
+    /// records written before this field existed, which keeps their hashes unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dpop_bound: bool,
 }
 
 impl DecisionRecord {
@@ -76,6 +81,7 @@ impl DecisionRecord {
             arguments_digest: call.arguments_digest(),
             session_id: call.session_id.clone(),
             policy_ids,
+            dpop_bound: call.dpop_bound,
         }
     }
 }

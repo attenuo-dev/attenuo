@@ -53,13 +53,20 @@ pub struct RootTokenRequest {
 
 pub async fn mint_root(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let req: RootTokenRequest = parse_json(&body)?;
-    state.blocking(move |s| mint_root_sync(s, req)).await
+    state
+        .blocking(move |s| mint_root_sync(s, &headers, req))
+        .await
 }
 
-fn mint_root_sync(state: &AppState, req: RootTokenRequest) -> Result<Response, ApiError> {
+fn mint_root_sync(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    req: RootTokenRequest,
+) -> Result<Response, ApiError> {
     // The server's own audit records use these names (SR-34).
     if super::is_reserved_subject(&req.subject) {
         return Err(ApiError::bad_request(
@@ -79,6 +86,14 @@ fn mint_root_sync(state: &AppState, req: RootTokenRequest) -> Result<Response, A
     let attributes = merge_attributes(grant_attributes, &req.attributes)?;
 
     let now = now();
+    // DPoP (SR-24): a `DPoP` header binds the root token to its key, per `[token] dpop`.
+    let cnf = state.dpop.bind_new(
+        crate::dpop::header_proof(headers)?,
+        "POST",
+        &state.dpop.expected_url_for(headers, "/admin/root-token"),
+        now,
+    )?;
+    let dpop_bound = cnf.is_some();
     let ttl = req
         .ttl_seconds
         .map(|s| Duration::seconds(i64::try_from(s).unwrap_or(i64::MAX)));
@@ -97,6 +112,7 @@ fn mint_root_sync(state: &AppState, req: RootTokenRequest) -> Result<Response, A
         &IssueOptions {
             may_act,
             not_after: None,
+            cnf,
         },
     )?;
     register_issued(
@@ -114,17 +130,18 @@ fn mint_root_sync(state: &AppState, req: RootTokenRequest) -> Result<Response, A
         "agent": req.agent,
         "lease": issued.lease,
     });
-    let recorded = audit_issuance(state, "token.root", &issued.chain, args, now).and_then(|_| {
-        audit_admin(
-            state,
-            "admin.root_token",
-            Decision::Allow,
-            REASON_ADMIN_ACTION,
-            vec![issued.lease.clone()],
-            admin_args,
-            now,
-        )
-    });
+    let recorded = audit_issuance(state, "token.root", &issued.chain, args, dpop_bound, now)
+        .and_then(|_| {
+            audit_admin(
+                state,
+                "admin.root_token",
+                Decision::Allow,
+                REASON_ADMIN_ACTION,
+                vec![issued.lease.clone()],
+                admin_args,
+                now,
+            )
+        });
     if let Err(e) = recorded {
         let _ = state.leases.revoke(&issued.lease, "audit_error", now);
         return Err(e);

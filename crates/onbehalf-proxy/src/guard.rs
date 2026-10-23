@@ -60,9 +60,12 @@ impl StreamGuard {
             Ok(()) => Ok(()),
             Err(AuthError::LeaseInactive(reason)) => Err(reason),
             Err(AuthError::TokenExpired) => Err(REASON_TOKEN_EXPIRED.to_owned()),
-            Err(AuthError::MissingToken | AuthError::InvalidToken(_)) => {
-                Err("unauthorized".to_owned())
-            }
+            Err(
+                AuthError::MissingToken
+                | AuthError::InvalidToken(_)
+                | AuthError::DpopRequired
+                | AuthError::InvalidDpopProof(_),
+            ) => Err("unauthorized".to_owned()),
         }
     }
 }

@@ -59,6 +59,8 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     /// One-time use of IdP credentials and of (parent token, actor) exchanges.
     pub replay: crate::replay::ReplayCache,
+    /// Sender-constrained tokens: `[token] dpop*` and the proof replay cache (SR-24).
+    pub dpop: Arc<crate::dpop::Dpop>,
 }
 
 impl AppState {
@@ -73,6 +75,7 @@ impl AppState {
         }
         config.proxy.stream_recheck()?;
         config.proxy.check_limits()?;
+        config.token.check_dpop()?;
         let issuer = load_issuer(config)?;
         let verifier = issuer.verifier();
         let jwks = crate::jwks::jwks_from_keys(&issuer.trusted_public_keys())?;
@@ -181,6 +184,12 @@ impl AppState {
             jwks,
             metrics,
             replay: crate::replay::ReplayCache::default(),
+            dpop: Arc::new(crate::dpop::Dpop::new(
+                config.token.dpop,
+                config.token.dpop_max_age_seconds,
+                config.token.dpop_replay_capacity,
+                config.server.public_url.clone(),
+            )),
         })
     }
 

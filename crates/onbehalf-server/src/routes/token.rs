@@ -51,6 +51,11 @@
 //! token delegates to a given actor once; a second exchange of the same parent for the same
 //! actor is 400 `invalid_grant` / `replayed` until the parent expires ([`crate::replay`]). The new lease
 //! is registered as a child of the parent token's last lease, so revoking the parent cascades.
+//!
+//! **Sender constraint (SR-24).** A `DPoP` header binds the child to the proof's key; a bound
+//! subject token needs a proof by its key (in the header, with `ath`, or in the body field
+//! `subject_token_dpop` when the child is bound to another key), and its child is always
+//! bound. See [`crate::dpop`] for the rule and `[token] dpop`.
 
 use std::sync::Arc;
 
@@ -154,10 +159,12 @@ fn exchange_sync(
 ) -> Result<Response, ApiError> {
     let field = |k: &str| value.get(k).and_then(Value::as_str).map(str::to_owned);
     let (client_id, client_secret) = (field("client_id"), field("client_secret"));
+    let subject_proof = field("subject_token_dpop");
     let mut value = value;
     if let Some(obj) = value.as_object_mut() {
         obj.remove("client_id");
         obj.remove("client_secret");
+        obj.remove("subject_token_dpop");
     }
     let req = parse_request(value)?;
     let presented = client_secret.is_some() || clientauth::basic_credentials(headers)?.is_some();
@@ -255,7 +262,18 @@ fn exchange_sync(
         }
         None => None,
     };
-    let resp = req.execute_until(&state.issuer, now, not_after)?;
+    // DPoP (SR-24): bind the child to the header proof's key; a bound parent needs proof of
+    // its key and a bound child.
+    let cnf = state.dpop.bind_exchange(
+        parent.claims.cnf.as_ref(),
+        &req.subject_token,
+        crate::dpop::header_proof(headers)?,
+        subject_proof.as_deref(),
+        &state.dpop.expected_url_for(headers, "/token"),
+        now,
+    )?;
+    let dpop_bound = cnf.is_some();
+    let resp = req.execute_with(&state.issuer, now, not_after, cnf)?;
     // An actor token authenticates one exchange (see `crate::replay`), keyed by its `jti`.
     if let Some((verified, token)) = &actor {
         state
@@ -293,12 +311,20 @@ fn exchange_sync(
         "requested": req.requested,
         "parent_lease": parent_lease,
         "actor_auth": actor_auth,
+        "dpop_bound": dpop_bound,
     });
     if let Some((verified, _)) = &actor {
         args["actor_subject"] = verified.subject.clone().into();
         args["actor_trust"] = verified.trust.clone().into();
     }
-    if let Err(e) = audit_issuance(state, "token.exchange", &issued.chain, args, now) {
+    if let Err(e) = audit_issuance(
+        state,
+        "token.exchange",
+        &issued.chain,
+        args,
+        dpop_bound,
+        now,
+    ) {
         // An issuance we cannot record must not be usable.
         let _ = state.leases.revoke(&resp.lease, "audit_error", now);
         return Err(e);
@@ -311,6 +337,7 @@ fn exchange_sync(
         actor_subject = ?actor.as_ref().map(|(v, _)| v.subject.as_str()),
         lease = %resp.lease.0,
         depth = issued.chain.depth(),
+        dpop_bound,
         "token exchanged"
     );
     let mut out = Json(resp).into_response();

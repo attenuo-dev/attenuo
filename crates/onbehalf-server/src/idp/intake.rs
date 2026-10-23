@@ -129,6 +129,14 @@ pub async fn handle(
         &req,
         actor.as_ref().map(|(v, _)| v),
     )?;
+    // DPoP (SR-24): bind the root token to the proof's key, per `[token] dpop`.
+    let cnf = state.dpop.bind_new(
+        crate::dpop::header_proof(headers)?,
+        "POST",
+        &state.dpop.expected_url_for(headers, "/token"),
+        now,
+    )?;
+    let dpop_bound = cnf.is_some();
     let requested: CapabilitySet = req
         .authorization_details
         .iter()
@@ -236,6 +244,7 @@ pub async fn handle(
                 &onbehalf_token::IssueOptions {
                     may_act,
                     not_after: None,
+                    cnf,
                 },
             )?;
             // Used once, recorded only after issuance succeeded; a refused token is never
@@ -261,12 +270,15 @@ pub async fn handle(
                 "credential": kind_str,
                 "idp": idp,
                 "agent_auth": agent_auth,
+                "dpop_bound": dpop_bound,
             });
             if let Some((subject, trust)) = actor_info {
                 args["actor_subject"] = subject.into();
                 args["actor_trust"] = trust.into();
             }
-            if let Err(e) = audit_issuance(state, "token.root", &issued.chain, args, now) {
+            if let Err(e) =
+                audit_issuance(state, "token.root", &issued.chain, args, dpop_bound, now)
+            {
                 let _ = state.leases.revoke(&issued.lease, "audit_error", now);
                 return Err(e);
             }

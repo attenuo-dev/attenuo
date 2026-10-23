@@ -10,8 +10,9 @@
 //! and never earlier than the current expiry. Renewal fails (400 `invalid_grant`) when the
 //! lease, or any ancestor lease, is revoked or unknown, or when an ancestor lease has expired:
 //! a child cannot outlive a parent that stopped renewing. An expired or invalid *token* is a
-//! 401. Every renewal is appended to the audit log (`onbehalf` / `lease.renew`,
-//! reason `lease_renewed`).
+//! 401. A token bound to a key (`cnf.jkt`) needs a DPoP proof for `POST /token/renew`
+//! ([`crate::dpop`]). Every renewal is appended to the audit log (`onbehalf` / `lease.renew`,
+//! reason `lease_renewed`, with `dpop_bound`).
 //!
 //! Response: `{ "lease": "<id>", "expires_at": "<RFC 3339>", "expires_in": <seconds> }`.
 
@@ -49,6 +50,14 @@ fn renew_sync(state: &AppState, headers: &HeaderMap) -> Result<Response, ApiErro
         .verifier
         .verify(bearer, now)
         .map_err(|e| ApiError::bad_token(&e))?;
+    let dpop_bound = state.dpop.check_presented(
+        verified.claims.cnf.as_ref(),
+        bearer,
+        crate::dpop::header_proof(headers)?,
+        "POST",
+        &state.dpop.expected_url_for(headers, "/token/renew"),
+        now,
+    )?;
     let chain = verified.chain;
     let hop = chain
         .hops
@@ -108,6 +117,7 @@ fn renew_sync(state: &AppState, headers: &HeaderMap) -> Result<Response, ApiErro
         "lease.renew",
         &chain,
         args,
+        dpop_bound,
         now,
     ) {
         // A renewal we cannot record does not happen.

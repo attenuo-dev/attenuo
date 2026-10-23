@@ -60,6 +60,14 @@ pub enum AuthError {
     /// is a reason code (`lease_revoked`, `lease_expired`, `lease_unknown`, `lease_error`).
     #[error("lease inactive: {0}")]
     LeaseInactive(String),
+    /// The token is sender-constrained (`cnf.jkt`, or the server requires DPoP for every
+    /// token) and the request carries no DPoP proof (SR-24).
+    #[error("a DPoP proof is required with this token")]
+    DpopRequired,
+    /// The request's DPoP proof is malformed, signed by the wrong key, made for another
+    /// method, URL or token, outside the accepted time window, or replayed.
+    #[error("invalid DPoP proof: {0}")]
+    InvalidDpopProof(String),
 }
 
 /// Reason code of [`AuthError::MissingToken`].
@@ -68,6 +76,12 @@ pub const REASON_MISSING_TOKEN: &str = "missing_token";
 pub const REASON_INVALID_TOKEN: &str = "invalid_token";
 /// Reason code of [`AuthError::TokenExpired`].
 pub const REASON_TOKEN_EXPIRED: &str = "token_expired";
+/// Reason code of [`AuthError::DpopRequired`].
+pub const REASON_DPOP_REQUIRED: &str = "dpop_required";
+/// Reason code of [`AuthError::InvalidDpopProof`].
+pub const REASON_INVALID_DPOP_PROOF: &str = "invalid_dpop_proof";
+/// DPoP signature algorithms accepted, for `WWW-Authenticate: DPoP algs="..."` (RFC 9449 §7.1).
+pub const DPOP_ALGS: &str = "EdDSA ES256";
 
 impl AuthError {
     /// The stable reason code sent to the client (JSON-RPC `error.data.reason`).
@@ -77,8 +91,49 @@ impl AuthError {
             AuthError::TokenExpired => REASON_TOKEN_EXPIRED,
             AuthError::InvalidToken(_) => REASON_INVALID_TOKEN,
             AuthError::LeaseInactive(reason) => reason,
+            AuthError::DpopRequired => REASON_DPOP_REQUIRED,
+            AuthError::InvalidDpopProof(_) => REASON_INVALID_DPOP_PROOF,
         }
     }
+
+    /// The `WWW-Authenticate` challenge for this error: `DPoP` (RFC 9449 §7.1) for a DPoP
+    /// failure, `Bearer` otherwise.
+    pub fn challenge(&self) -> String {
+        match self {
+            AuthError::DpopRequired => format!(
+                "DPoP error=\"invalid_token\", error_description=\"{REASON_DPOP_REQUIRED}\", algs=\"{DPOP_ALGS}\""
+            ),
+            AuthError::InvalidDpopProof(_) => format!(
+                "DPoP error=\"{REASON_INVALID_DPOP_PROOF}\", algs=\"{DPOP_ALGS}\""
+            ),
+            _ => "Bearer realm=\"onbehalf\"".to_string(),
+        }
+    }
+}
+
+/// What the proxy hands the [`Authorizer`] about a request (SR-24): the token, the DPoP proof
+/// if one was sent, and the method and target the proof must name.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestAuth<'a> {
+    /// The token from `Authorization: Bearer <token>` or `Authorization: DPoP <token>`.
+    pub token: &'a str,
+    /// The single `DPoP` header, if present.
+    pub dpop: Option<&'a str>,
+    /// HTTP method of the request.
+    pub method: &'a str,
+    /// Path of the request as received, without the query.
+    pub path: &'a str,
+    /// The `Host` header, used to rebuild the request URL when no public URL is configured.
+    pub host: Option<&'a str>,
+}
+
+/// An authenticated caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Authenticated {
+    /// The verified delegation chain.
+    pub chain: DelegationChain,
+    /// The token is sender-constrained and the request proved possession of its key.
+    pub dpop_bound: bool,
 }
 
 /// Authentication and authorization, as the proxy sees it.
@@ -91,6 +146,21 @@ pub trait Authorizer: Send + Sync {
         bearer: &str,
         now: OffsetDateTime,
     ) -> Result<DelegationChain, AuthError>;
+
+    /// Authenticate a request: the token, and the DPoP proof that must accompany a
+    /// sender-constrained token (SR-24). The default ignores DPoP and calls
+    /// [`Authorizer::authenticate`], so authorizers that know nothing of DPoP keep working;
+    /// the server's authorizer overrides it.
+    async fn authenticate_request(
+        &self,
+        req: &RequestAuth<'_>,
+        now: OffsetDateTime,
+    ) -> Result<Authenticated, AuthError> {
+        Ok(Authenticated {
+            chain: self.authenticate(req.token, now).await?,
+            dpop_bound: false,
+        })
+    }
 
     /// Is every lease of `chain` live at `now`? Called for requests that are forwarded
     /// without a per-call decision (`tools/list`, `initialize`, `ping`, `GET`/`DELETE` session

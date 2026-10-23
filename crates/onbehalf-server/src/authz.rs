@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use onbehalf_audit::{AuditSink, LeaseStore};
 use onbehalf_core::{Decision, DecisionRecord, DelegationChain, ToolCall};
 use onbehalf_policy::PolicyEngine;
-use onbehalf_proxy::{AuthDecision, AuthError, Authorizer};
+use onbehalf_proxy::{AuthDecision, AuthError, Authenticated, Authorizer, RequestAuth};
 use onbehalf_token::Verifier;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -250,35 +250,85 @@ async fn on_blocking_pool<R: Send + 'static>(
     }
 }
 
-/// The proxy's authorizer: token verification plus [`Pipeline::decide`].
+/// The proxy's authorizer: token verification, DPoP ([`crate::dpop`]) and
+/// [`Pipeline::decide`].
 pub struct ServerAuthorizer {
     verifier: Verifier,
     pipeline: Arc<Pipeline>,
+    dpop: Option<Arc<crate::dpop::Dpop>>,
 }
 
 impl ServerAuthorizer {
     pub fn new(verifier: Verifier, pipeline: Arc<Pipeline>) -> Self {
-        Self { verifier, pipeline }
+        Self {
+            verifier,
+            pipeline,
+            dpop: None,
+        }
+    }
+
+    /// Check DPoP proofs with these settings and replay cache (the server's own). Without
+    /// this, a bound token is always refused (`dpop_required`): the proof cannot be checked.
+    pub fn with_dpop(mut self, dpop: Arc<crate::dpop::Dpop>) -> Self {
+        self.dpop = Some(dpop);
+        self
+    }
+
+    fn verify(
+        &self,
+        token: &str,
+        now: OffsetDateTime,
+    ) -> Result<onbehalf_token::VerifiedToken, AuthError> {
+        self.verifier.verify(token, now).map_err(|e| {
+            if crate::error::is_expiry(&e) {
+                AuthError::TokenExpired
+            } else {
+                AuthError::InvalidToken(e.to_string())
+            }
+        })
     }
 }
 
 #[async_trait]
 impl Authorizer for ServerAuthorizer {
+    /// Without the request there is no DPoP proof to check: a bound token is refused.
     async fn authenticate(
         &self,
         bearer: &str,
         now: OffsetDateTime,
     ) -> Result<DelegationChain, AuthError> {
-        self.verifier
-            .verify(bearer, now)
-            .map(|v| v.chain)
-            .map_err(|e| {
-                if crate::error::is_expiry(&e) {
-                    AuthError::TokenExpired
-                } else {
-                    AuthError::InvalidToken(e.to_string())
-                }
-            })
+        let v = self.verify(bearer, now)?;
+        if v.claims.cnf.is_some() {
+            return Err(AuthError::DpopRequired);
+        }
+        Ok(v.chain)
+    }
+
+    async fn authenticate_request(
+        &self,
+        req: &RequestAuth<'_>,
+        now: OffsetDateTime,
+    ) -> Result<Authenticated, AuthError> {
+        let v = self.verify(req.token, now)?;
+        let dpop_bound = match &self.dpop {
+            Some(dpop) => {
+                let url = dpop.expected_url(req.host, req.path);
+                dpop.check_presented(
+                    v.claims.cnf.as_ref(),
+                    req.token,
+                    req.dpop,
+                    req.method,
+                    &url,
+                    now,
+                )?
+            }
+            None if v.claims.cnf.is_some() => return Err(AuthError::DpopRequired),
+            None => false,
+        };
+        Ok(Authenticated {
+            chain: v.chain,
+            dpop_bound,
+        })
     }
 
     async fn check_active(
