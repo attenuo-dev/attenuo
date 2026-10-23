@@ -664,6 +664,14 @@ fn wal_round(shared: &WalShared) -> Result<(), AuditError> {
         // wait; the next round tries again.
         let _ = wal_checkpoint(&conn, "TRUNCATE");
     }
+    if !done.complete() {
+        // Frames were left behind (a reader or the writer was in the way). Do not wait a
+        // whole interval, or another WAL_CHECKPOINT_COMMITS commits, to try again: the very
+        // next commit kicks a new round.
+        activity
+            .since_wal_checkpoint
+            .store(WAL_CHECKPOINT_COMMITS - 1, Ordering::Release);
+    }
     Ok(())
 }
 
