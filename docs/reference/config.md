@@ -30,6 +30,8 @@ The annotated source of truth is [config/example.toml](https://github.com/7Mudit
 | `policies_path` | none | Cedar policy file. `POST /admin/policies/reload` re-reads it. |
 | `catalog_path` | none | JSON tool catalog. Can be combined with `[policy.catalog]`. |
 | `user_attributes` | none | Extra `originating_user.attributes` for the Cedar schema, as `{ name = "type" }`. Types: `string`, `long`, `bool`, `set<string>`. A value of another type is denied with `attribute_type_mismatch`. |
+| `unknown_tools` | `"deny"` | A call to a `(server, tool)` pair missing from the catalog: `"deny"` (reason `tool_not_in_catalog`), `"sensitive"` (evaluated with `resource.sensitive = true`) or `"allow"` (default attributes). |
+| `legacy_bare_actions` | `false` | **Deprecated.** Evaluate with the pre-2026-10-23 action ids, `Action::"<tool>"`, instead of `Action::"<server>/<tool>"`. A bare action matches that tool on every server (SR-13). Logged as a warning at start; `onbehalf policy lint` lists bare actions. |
 
 The built-in user attributes `mfa` (bool), `roles` (set of string), `tenant` and `email` are always declared.
 
@@ -41,7 +43,9 @@ The built-in user attributes `mfa` (bool), `roles` (set of string), `tenant` and
 | `sensitive` | Boolean. Tests as `resource.sensitive` in policies. |
 | `inputs` | Table of argument name to type. Used to validate `context.input.*`. |
 
-Every action a policy names must be in the catalog.
+Every action a policy names must be in the catalog: the table `[policy.catalog.github.read_file]` declares `Action::"github/read_file"`.
+
+Server and tool names follow one rule everywhere (catalog, `[[upstreams]]`, capabilities, `tools/call`): 1 to 128 ASCII letters, digits, `_`, `.` or `-`, compared case-sensitively and never normalized. A tool key may also be an MCP method name made of such segments joined by `/` (`"resources/read"`), which is how the proxy authorizes methods other than `tools/call`. The server refuses to start with a catalog or grant that breaks the rule.
 
 ## `[audit]`
 
@@ -93,7 +97,7 @@ One table per MCP server, using streamable HTTP.
 
 | Key | Meaning |
 | --- | --- |
-| `name` | Mount name, served at `/mcp/<name>`. It is the `server` part of capabilities. |
+| `name` | Mount name, served at `/mcp/<name>`. It is the `server` part of capabilities and of action ids. ASCII letters, digits, `_`, `.`, `-`; `onbehalf` is reserved. |
 | `url` | Upstream MCP endpoint. |
 
 ## `[admin]`
@@ -146,6 +150,11 @@ With no matching entry, no root token is issued.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `stream_recheck_seconds` | `2` | How often a long-lived response stream (the `GET` listen stream, or a `POST` answered over SSE) is re-checked against lease state and token expiry. At the first failure the stream ends, after a final SSE event with JSON-RPC error `-32001` and `data.reason` (`lease_revoked`, `token_expired`, ...). At least 1. |
+| `require_listed_tools` | `true` | Deny (`-32003`, reason `tool_not_listed`, audited) a `tools/call` whose exact name the upstream never returned from `tools/list` and the catalog does not know. Stops an upstream that resolves names case-insensitively from running `delete_repo` for `Delete_Repo` (SR-25). A `tools/call` name outside the name rule is always denied with `invalid_name`. |
+| `max_upstream_body_bytes` | `16777216` (16 MiB) | Largest upstream body the proxy buffers: a JSON response it filters or merges replies into, or one SSE event. Over it: `502`, JSON-RPC `-32005`, reason `upstream_body_too_large` (an SSE stream ends instead). At least 1. |
+| `max_request_body_bytes` | `4194304` (4 MiB) | Largest client request body, read after authentication. Over it: `413`, reason `request_too_large`. At least 1. |
+| `session_ttl_seconds` | `3600` | Idle lifetime of an `Mcp-Session-Id` binding. At least 1. |
+| `max_sessions` | `100000` | Most live session bindings. Expired ones are reclaimed as new ones arrive; when every slot is live, the response that would bind a new session is replaced by `503`, JSON-RPC `-32006`, reason `session_registry_full`, `Retry-After: 30`. Live bindings are never evicted (SR-36). At least 1. |
 
 ## `[dev]`
 

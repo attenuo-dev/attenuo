@@ -298,6 +298,15 @@ impl Authorizer for ServerAuthorizer {
         }
     }
 
+    fn knows_tool(&self, server: &str, tool: &str) -> bool {
+        // A poisoned lock fails closed: the tool counts as unknown.
+        self.pipeline
+            .policy()
+            .read()
+            .map(|engine| engine.catalog().contains(server, tool))
+            .unwrap_or(false)
+    }
+
     async fn record_rejection(
         &self,
         chain: &DelegationChain,

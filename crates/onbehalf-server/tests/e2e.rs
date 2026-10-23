@@ -25,19 +25,19 @@ const TOOLS: &[&str] = &["read_file", "create_issue", "delete_repo"];
 
 const POLICY_PUBLIC_READS: &str = r#"
 @id("public_reads")
-permit(principal, action == Action::"read_file", resource)
+permit(principal, action == Action::"github/read_file", resource)
 when { context.input has repo && context.input.repo like "alice/public-*" };
 
 @id("issues")
-permit(principal, action == Action::"create_issue", resource);
+permit(principal, action == Action::"github/create_issue", resource);
 "#;
 
 const POLICY_ALL_READS: &str = r#"
 @id("all_reads")
-permit(principal, action == Action::"read_file", resource);
+permit(principal, action == Action::"github/read_file", resource);
 
 @id("issues")
-permit(principal, action == Action::"create_issue", resource);
+permit(principal, action == Action::"github/create_issue", resource);
 "#;
 
 struct Harness {
@@ -605,7 +605,9 @@ async fn actor_auth_can_be_switched_off_explicitly() {
 /// even with a capability and a policy that would allow it.
 #[tokio::test]
 async fn uncatalogued_tools_are_denied_and_audited() {
-    let h = Harness::start().await;
+    // The proxy's own SR-25 check would refuse these unlisted names first; switch it off to
+    // reach the engine's catalog check.
+    let h = Harness::start_tweaked(false, |c| c.proxy.require_listed_tools = false).await;
     std::fs::write(&h.policy_path, "permit(principal, action, resource);").unwrap();
     let resp = h.admin_post("/admin/policies/reload", json!({})).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -634,6 +636,50 @@ async fn uncatalogued_tools_are_denied_and_audited() {
     assert_eq!(denied[0]["record"]["decision"], "deny");
 }
 
+/// SR-25: with `unknown_tools = "allow"` an uncatalogued spelling such as `Delete_Repo` would
+/// be evaluated, and a `forbid` on `Action::"github/delete_repo"` would not see it. The proxy
+/// refuses names the upstream never listed and the catalog does not know, and audits it.
+#[tokio::test]
+async fn unlisted_tool_names_are_refused_by_the_proxy_and_audited() {
+    let h = Harness::start_tweaked(false, |c| {
+        c.policy.unknown_tools = onbehalf_policy::UnknownTools::Allow;
+    })
+    .await;
+    std::fs::write(
+        &h.policy_path,
+        "permit(principal, action, resource);\n\
+         forbid(principal, action == Action::\"github/delete_repo\", resource);",
+    )
+    .unwrap();
+    let resp = h.admin_post("/admin/policies/reload", json!({})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    assert_eq!(h.list_tools(&root.token).await.len(), 3);
+    for name in ["Delete_Repo", "delete_org"] {
+        let no = h.call(&root.token, name, json!({"repo": "acme/x"})).await;
+        assert_eq!(denied_reason(&no), "tool_not_listed", "{name}");
+    }
+    let no = h
+        .call(&root.token, "delete repo", json!({"repo": "acme/x"}))
+        .await;
+    assert_eq!(denied_reason(&no), "invalid_name");
+    assert_eq!(
+        denied_reason(
+            &h.call(&root.token, "delete_repo", json!({"repo": "acme/x"}))
+                .await
+        ),
+        "policy_deny"
+    );
+    assert!(h.upstream.recorded_calls().is_empty());
+    let entries = h.audit_entries().await;
+    let refused: Vec<&str> = entries
+        .iter()
+        .filter(|e| e["record"]["reason"] == "tool_not_listed")
+        .filter_map(|e| e["record"]["tool"].as_str())
+        .collect();
+    assert_eq!(refused, vec!["Delete_Repo", "delete_org"]);
+}
+
 /// SR-15: revocations, policy reloads (good and bad) and dev root mints are audited as admin
 /// actions, and the audit chain still verifies.
 #[tokio::test]
@@ -644,7 +690,7 @@ async fn admin_actions_are_audited() {
     assert_eq!(resp.status(), StatusCode::OK);
     std::fs::write(
         &h.policy_path,
-        "permit(principal, action == Action::\"nope\", resource);",
+        "permit(principal, action == Action::\"github/nope\", resource);",
     )
     .unwrap();
     let resp = h.admin_post("/admin/policies/reload", json!({})).await;
@@ -1072,7 +1118,7 @@ async fn policy_reload_changes_decision_without_restart() {
     // An invalid file is refused and the last good set stays in force.
     std::fs::write(
         &h.policy_path,
-        "permit(principal, action == Action::\"no_such_tool\", resource);",
+        "permit(principal, action == Action::\"github/no_such_tool\", resource);",
     )
     .unwrap();
     let resp = h.admin_post("/admin/policies/reload", json!({})).await;
@@ -2115,7 +2161,7 @@ async fn mistyped_user_attribute_is_denied_and_audited() {
     std::fs::write(
         &h.policy_path,
         r#"@id("not_suspended")
-permit(principal, action == Action::"read_file", resource)
+permit(principal, action == Action::"github/read_file", resource)
 when { context.originating_user.attributes has status
        && context.originating_user.attributes.status != "suspended" };"#,
     )

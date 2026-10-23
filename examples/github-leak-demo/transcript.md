@@ -96,6 +96,7 @@ $ onbehalf audit tail -n 10
 #8    2026-10-23T01:43:42.186751983Z  DENY  github/read_file  assistant > coder for alice  reason=lease_revoked  id=abe9f8f9-0724-4784-9172-6745c6e628f9
 $ onbehalf audit verify
 audit chain OK: 8 entries verified
+checkpoints: none signed yet
 
 == What reached the GitHub server
   fake-mcp: tools/call read_file {"path":"README.md","repo":"alice/public-docs"}

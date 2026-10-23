@@ -61,4 +61,12 @@ pub enum ChainError {
         first: usize,
         agent: String,
     },
+    /// A capability of the hop names a server or tool that no call can have (see
+    /// [`crate::names`]).
+    #[error("hop {index} has an invalid capability: {source}")]
+    InvalidName {
+        index: usize,
+        #[source]
+        source: crate::names::NameError,
+    },
 }

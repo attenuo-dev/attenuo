@@ -84,6 +84,15 @@ pub trait Authorizer: Send + Sync {
         now: OffsetDateTime,
     ) -> AuthDecision;
 
+    /// Is `(server, tool)` in the tool catalog behind this authorizer? Used by the proxy's
+    /// `require_listed_tools` check (SR-25): a `tools/call` whose name the upstream never listed
+    /// is still screened if the catalog knows it. Names are compared exactly. The default knows
+    /// nothing, which leaves only the upstream's own `tools/list` results.
+    fn knows_tool(&self, server: &str, tool: &str) -> bool {
+        let _ = (server, tool);
+        false
+    }
+
     /// Record a request the proxy refused on its own, before any per-call decision (for
     /// example `session_mismatch`, SR-11), and return the audit record's id. `call` describes
     /// the HTTP request (`tool` = `http.POST`, `http.GET` or `http.DELETE`). Implementations

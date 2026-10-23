@@ -139,7 +139,7 @@ fn engine_serves_authzen_requests() {
             ToolAttrs::new().with_input("repo", ArgType::String),
         ))
         .with_policies_str(
-            r#"@id("acme") permit(principal, action == Action::"create_issue", resource)
+            r#"@id("acme") permit(principal, action == Action::"github/create_issue", resource)
                when { context.input has repo && context.input.repo like "acme/*" };"#,
         )
         .build()

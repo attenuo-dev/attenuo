@@ -9,6 +9,8 @@
 //!                                   # catalog file); or an inline map, see below
 //! unknown_tools: deny               # optional: deny | sensitive | allow; default is the
 //!                                   # config's [policy] unknown_tools, else deny
+//! legacy_bare_actions: false        # optional, deprecated: bare `Action::"<tool>"` ids;
+//!                                   # default is the config's [policy] value, else false
 //! now: 1760000000                   # optional, unix seconds the calls are evaluated at
 //! cases:
 //!   - name: coder may read public docs
@@ -209,6 +211,29 @@ pub fn load_unknown_tools_from_config(path: &Path) -> Result<Option<UnknownTools
     }
 }
 
+/// Read `[policy] legacy_bare_actions` from a server config; `None` when it is not set.
+pub fn load_legacy_bare_actions_from_config(path: &Path) -> Result<Option<bool>, HarnessError> {
+    if path.extension().and_then(|e| e.to_str()) == Some("json") {
+        return Ok(None);
+    }
+    let what = format!("legacy_bare_actions in {}", path.display());
+    let doc: toml::Table = read(path)?
+        .parse()
+        .map_err(|e: toml::de::Error| HarnessError::invalid(&what, e))?;
+    match doc
+        .get("policy")
+        .and_then(|p| p.as_table())
+        .and_then(|p| p.get("legacy_bare_actions"))
+    {
+        None => Ok(None),
+        Some(toml::Value::Boolean(b)) => Ok(Some(*b)),
+        Some(other) => Err(HarnessError::invalid(
+            &what,
+            format!("expected a boolean, got {other}"),
+        )),
+    }
+}
+
 /// Read a JSON catalog file: `{ "<server>": { "<tool>": { "readonly": true, ... } } }`.
 pub fn load_catalog_json(path: &Path) -> Result<ToolCatalog, HarnessError> {
     let tables: CatalogTables = serde_json::from_str(&read(path)?)
@@ -394,6 +419,8 @@ pub struct TestFile {
     #[serde(default)]
     unknown_tools: Option<UnknownTools>,
     #[serde(default)]
+    legacy_bare_actions: Option<bool>,
+    #[serde(default)]
     now: Option<i64>,
     pub cases: Vec<TestCase>,
     /// Directory relative paths resolve against. Set by [`TestFile::load`].
@@ -470,6 +497,20 @@ impl TestFile {
         }
     }
 
+    /// Whether the engine uses the deprecated bare action ids: the file's
+    /// `legacy_bare_actions`, else the one of the server config `catalog` names, else `false`.
+    pub fn load_legacy_bare_actions(&self) -> Result<bool, HarnessError> {
+        if let Some(b) = self.legacy_bare_actions {
+            return Ok(b);
+        }
+        match &self.catalog {
+            Some(CatalogSpec::Path(p)) => {
+                Ok(load_legacy_bare_actions_from_config(&self.resolve(p))?.unwrap_or(false))
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// The tool catalog the file selects (empty when it names none).
     pub fn load_catalog(&self) -> Result<ToolCatalog, HarnessError> {
         match &self.catalog {
@@ -484,7 +525,8 @@ impl TestFile {
     pub fn build_engine(&self) -> Result<PolicyEngine, HarnessError> {
         let mut builder = PolicyEngineBuilder::new()
             .with_catalog(self.load_catalog()?)
-            .with_unknown_tools(self.load_unknown_tools()?);
+            .with_unknown_tools(self.load_unknown_tools()?)
+            .with_legacy_bare_actions(self.load_legacy_bare_actions()?);
         if let Some(CatalogSpec::Path(p)) = &self.catalog {
             for (name, ty) in load_user_attrs(&self.resolve(p))? {
                 builder = builder.with_user_attr(name, ty);
@@ -704,7 +746,7 @@ mod tests {
 
     const POLICY: &str = r#"
 @id("read_public")
-permit(principal, action == Action::"read_file", resource)
+permit(principal, action == Action::"github/read_file", resource)
 when { context.input has repo && context.input.repo like "alice/public-*" };
 
 @id("no_deep")
@@ -716,7 +758,7 @@ when { resource.sensitive &&
   !(context.originating_user.attributes has mfa && context.originating_user.attributes.mfa == true) };
 
 @id("allow_delete")
-permit(principal, action == Action::"delete_repo", resource);
+permit(principal, action == Action::"github/delete_repo", resource);
 "#;
 
     const CATALOG: &str = r#"
@@ -814,7 +856,7 @@ catalog:
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("p.cedar"),
-            r#"@id("not_suspended") permit(principal, action == Action::"read_file", resource)
+            r#"@id("not_suspended") permit(principal, action == Action::"github/read_file", resource)
                when { context.originating_user.attributes has status
                       && context.originating_user.attributes.status != "suspended" };"#,
         )
@@ -990,6 +1032,50 @@ catalog:
             .run()
             .unwrap();
         assert!(r.all_passed(), "{r:?}");
+    }
+
+    #[test]
+    fn legacy_bare_actions_come_from_the_file_or_the_config_sr13() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("p.cedar"),
+            r#"permit(principal, action == Action::"read_file", resource);"#,
+        )
+        .unwrap();
+        let catalog = "[policy.catalog.github.read_file]\n[policy.catalog.evil.read_file]\n";
+        std::fs::write(dir.path().join("new.toml"), catalog).unwrap();
+        std::fs::write(
+            dir.path().join("old.toml"),
+            format!("[policy]\nlegacy_bare_actions = true\n{catalog}"),
+        )
+        .unwrap();
+        let cases = "cases:\n  - name: gh\n    call: { server: github, tool: read_file }\n    expect: allow\n  - name: evil\n    call: { server: evil, tool: read_file }\n    expect: allow\n";
+        // Off by default: the bare action does not validate.
+        std::fs::write(
+            dir.path().join("a.yaml"),
+            format!("policies: p.cedar\ncatalog: new.toml\n{cases}"),
+        )
+        .unwrap();
+        assert!(TestFile::load(&dir.path().join("a.yaml"))
+            .unwrap()
+            .run()
+            .is_err());
+        // From the config, or set in the file: it loads, and matches every server.
+        for (name, head) in [
+            ("b.yaml", "catalog: old.toml\n"),
+            ("c.yaml", "catalog: new.toml\nlegacy_bare_actions: true\n"),
+        ] {
+            std::fs::write(
+                dir.path().join(name),
+                format!("policies: p.cedar\n{head}{cases}"),
+            )
+            .unwrap();
+            let r = TestFile::load(&dir.path().join(name))
+                .unwrap()
+                .run()
+                .unwrap();
+            assert!(r.all_passed(), "{name}: {r:?}");
+        }
     }
 
     #[test]

@@ -226,6 +226,45 @@ impl<'a> ListFilter<'a> {
             .sum()
     }
 
+    /// The tool names in every `tools/list` result in `body` (a message or a batch) that
+    /// answers a pending `tools/list` request, unfiltered. Matching is the same as for
+    /// [`apply`](Self::apply). Call it before filtering.
+    pub fn listed_tool_names(&self, body: &Value) -> Vec<String> {
+        let messages: Vec<&Value> = match body {
+            Value::Array(items) => items.iter().collect(),
+            other => vec![other],
+        };
+        let mut names = Vec::new();
+        for msg in messages {
+            if msg.get("method").is_some() {
+                continue;
+            }
+            let Some(id) = msg.get("id") else {
+                continue;
+            };
+            let is_tools = self
+                .pending
+                .iter()
+                .any(|(pid, k)| pid == id && *k == ListKind::Tools);
+            if !is_tools {
+                continue;
+            }
+            if let Some(tools) = msg
+                .get("result")
+                .and_then(|r| r.get("tools"))
+                .and_then(Value::as_array)
+            {
+                names.extend(
+                    tools
+                        .iter()
+                        .filter_map(|t| t.get("name").and_then(Value::as_str))
+                        .map(str::to_owned),
+                );
+            }
+        }
+        names
+    }
+
     /// Filter a JSON body: a single message or a batch.
     pub fn apply(&self, body: &mut Value) -> usize {
         match body {

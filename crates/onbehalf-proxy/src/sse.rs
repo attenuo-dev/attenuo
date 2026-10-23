@@ -18,18 +18,33 @@ use axum::body::Bytes;
 use futures_util::{Stream, StreamExt};
 use serde_json::Value;
 
-/// The largest single event the proxy will buffer.
+/// The largest single event the proxy buffers by default (the proxy passes
+/// `[proxy] max_upstream_body_bytes`).
 pub const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Incremental SSE event splitter and rewriter.
-#[derive(Default)]
 pub struct SseRewriter {
     buf: Vec<u8>,
+    limit: usize,
+}
+
+impl Default for SseRewriter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SseRewriter {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_limit(MAX_EVENT_BYTES)
+    }
+
+    /// Buffer at most `limit` bytes of an incomplete event.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            limit,
+        }
     }
 
     /// Feed a chunk of the stream; returns the bytes of every event completed by it, rewritten.
@@ -47,7 +62,7 @@ impl SseRewriter {
             let event: Vec<u8> = self.buf.drain(..end).collect();
             rewrite_event(&event, f, &mut out)?;
         }
-        if self.buf.len() > MAX_EVENT_BYTES {
+        if self.buf.len() > self.limit {
             return Err(io::Error::other("SSE event larger than the proxy's limit"));
         }
         Ok(out)
@@ -165,14 +180,28 @@ fn rewrite_event(
 /// Incremental SSE event splitter that emits complete events byte for byte, holding back a
 /// partial one. Used where the proxy relays a stream unchanged but must be able to append an
 /// event of its own at any point (see [`crate::guard`]).
-#[derive(Default)]
 pub struct SseFramer {
     buf: Vec<u8>,
+    limit: usize,
+}
+
+impl Default for SseFramer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SseFramer {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_limit(MAX_EVENT_BYTES)
+    }
+
+    /// Buffer at most `limit` bytes of an incomplete event.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            buf: Vec::new(),
+            limit,
+        }
     }
 
     /// Feed a chunk; returns the bytes of every event it completes, unchanged.
@@ -182,7 +211,7 @@ impl SseFramer {
         while let Some(n) = find_event_end(&self.buf[end..]) {
             end += n;
         }
-        if self.buf.len() - end > MAX_EVENT_BYTES {
+        if self.buf.len() - end > self.limit {
             return Err(io::Error::other("SSE event larger than the proxy's limit"));
         }
         Ok(self.buf.drain(..end).collect())
@@ -223,31 +252,33 @@ where
 }
 
 /// Wrap an upstream byte stream so that every JSON-RPC message in its events passes through
-/// `f`. A trailing event without its empty line is dropped; a transport error or an oversized
-/// or non-UTF-8 event ends the stream with an error.
+/// `f`. A trailing event without its empty line is dropped; a transport error, an event over
+/// `limit` bytes or a non-UTF-8 event ends the stream with an error.
 pub fn rewrite_stream<S, E>(
     upstream: S,
+    limit: usize,
     mut f: impl FnMut(&mut Value) + Send + 'static,
 ) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static
 where
     S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
     E: std::error::Error + Send + Sync + 'static,
 {
-    let mut rewriter = SseRewriter::new();
+    let mut rewriter = SseRewriter::with_limit(limit);
     process_stream(upstream, move |chunk| rewriter.push(chunk, &mut f))
 }
 
 /// Wrap an upstream byte stream so that it yields whole events only, unchanged. A trailing
 /// event without its empty line is dropped (a client would discard it too); a transport error
-/// or an oversized event ends the stream with an error.
+/// or an event over `limit` bytes ends the stream with an error.
 pub fn frame_stream<S, E>(
     upstream: S,
+    limit: usize,
 ) -> impl Stream<Item = Result<Bytes, io::Error>> + Send + 'static
 where
     S: Stream<Item = Result<Bytes, E>> + Send + Unpin + 'static,
     E: std::error::Error + Send + Sync + 'static,
 {
-    let mut framer = SseFramer::new();
+    let mut framer = SseFramer::with_limit(limit);
     process_stream(upstream, move |chunk| framer.push(chunk))
 }
 
@@ -332,6 +363,15 @@ mod tests {
     }
 
     #[test]
+    fn the_event_limit_is_configurable_sr36() {
+        let mut r = SseRewriter::with_limit(8);
+        assert!(r.push(b"data: 1\n\n", &mut |_| {}).is_ok());
+        assert!(r.push(b"data: 123456789", &mut |_| {}).is_err());
+        let mut f = SseFramer::with_limit(8);
+        assert!(f.push(b"data: 123456789").is_err());
+    }
+
+    #[test]
     fn non_utf8_event_is_an_error() {
         let mut r = SseRewriter::new();
         assert!(r.push(b"data: \xff\xfe\n\n", &mut |_| {}).is_err());
@@ -365,6 +405,7 @@ mod tests {
         ];
         let mut s = Box::pin(rewrite_stream(
             futures_util::stream::iter(chunks),
+            MAX_EVENT_BYTES,
             |v: &mut Value| v["marked"] = json!(true),
         ));
         let first = s.next().await.unwrap().unwrap();

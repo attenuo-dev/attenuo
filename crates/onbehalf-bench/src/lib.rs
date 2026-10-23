@@ -30,7 +30,7 @@ const MAX_EXCHANGES: usize = 7;
 
 const POLICY: &str = r#"// Policy used by onbehalf-bench: the leak-demo policy with the server name `fake`.
 @id("read_file_public_repos_only")
-permit(principal, action == Action::"read_file", resource)
+permit(principal, action == Action::"fake/read_file", resource)
 when { context.input has repo && context.input.repo like "alice/public-*" };
 
 @id("forbid_sensitive_without_mfa")
