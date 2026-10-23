@@ -1,0 +1,31 @@
+$ cargo bench -p attenuo-policy --bench authorize -- --warm-up-time 1 --measurement-time 3 --noplot
+# commit 034fd5c, rustc 1.99.1 (58cf8f9c3 2026-10-13), release bench profile
+# shared 4 vCPU container (nproc 4, Intel Xeon @ 2.10GHz); other agents may be active
+# progress lines (Benchmarking ..., Finished, Running) removed; estimates are [low point high]
+# uptime before: 20:44:43 up  3:08,  0 user,  load average: 3.08, 3.13, 2.53
+authorize/read_file/1_hop
+                        time:   [11.538 µs 11.662 µs 11.810 µs]
+Found 11 outliers among 100 measurements (11.00%)
+  6 (6.00%) high mild
+  5 (5.00%) high severe
+authorize/create_issue/1_hop
+                        time:   [12.407 µs 12.709 µs 13.064 µs]
+Found 8 outliers among 100 measurements (8.00%)
+  5 (5.00%) high mild
+  3 (3.00%) high severe
+authorize/delete_repo/1_hop
+                        time:   [11.045 µs 11.233 µs 11.475 µs]
+Found 10 outliers among 100 measurements (10.00%)
+  10 (10.00%) high severe
+authorize/read_file/4_hop
+                        time:   [13.589 µs 14.118 µs 14.687 µs]
+Found 11 outliers among 100 measurements (11.00%)
+  10 (10.00%) high mild
+  1 (1.00%) high severe
+authorize/create_issue/4_hop
+                        time:   [13.978 µs 14.373 µs 14.822 µs]
+authorize/delete_repo/4_hop
+                        time:   [13.811 µs 14.332 µs 14.948 µs]
+Found 13 outliers among 100 measurements (13.00%)
+  13 (13.00%) high mild
+# uptime after: 20:45:14 up  3:08,  0 user,  load average: 2.21, 2.91, 2.47

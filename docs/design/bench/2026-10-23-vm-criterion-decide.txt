@@ -1,0 +1,168 @@
+$ cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3 --noplot   (pass 2: the same with the filter _file/)
+# commit 034fd5c, rustc 1.99.1 (58cf8f9c3 2026-10-13), release bench profile
+# shared 4 vCPU container (nproc 4, Intel Xeon @ 2.10GHz); other agents may be active
+# progress lines (Benchmarking ..., Finished, Running) removed; estimates are [low point high]
+
+# pass 1
+# uptime before: 20:46:55 up  3:10,  0 user,  load average: 0.97, 2.28, 2.29
+decide/verify/1_hop     time:   [111.58 µs 115.44 µs 120.50 µs]
+Found 5 outliers among 100 measurements (5.00%)
+  2 (2.00%) high mild
+  3 (3.00%) high severe
+decide/authenticate/1_hop
+                        time:   [1.8879 µs 1.9337 µs 1.9894 µs]
+Found 8 outliers among 100 measurements (8.00%)
+  1 (1.00%) high mild
+  7 (7.00%) high severe
+decide/policy/1_hop     time:   [11.553 µs 11.798 µs 12.061 µs]
+Found 9 outliers among 100 measurements (9.00%)
+  8 (8.00%) high mild
+  1 (1.00%) high severe
+decide/record/1_hop     time:   [3.7682 µs 3.8755 µs 3.9967 µs]
+Found 10 outliers among 100 measurements (10.00%)
+  10 (10.00%) high mild
+decide/leases_memory/1_hop
+                        time:   [878.64 ns 893.83 ns 915.61 ns]
+Found 10 outliers among 100 measurements (10.00%)
+  4 (4.00%) high mild
+  6 (6.00%) high severe
+decide/append_memory/1_hop
+                        time:   [87.806 µs 92.901 µs 97.438 µs]
+decide/decide_memory/1_hop
+                        time:   [149.14 µs 155.56 µs 161.93 µs]
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) low mild
+  2 (2.00%) high mild
+decide/verify/3_hop     time:   [122.43 µs 126.83 µs 132.19 µs]
+Found 14 outliers among 100 measurements (14.00%)
+  4 (4.00%) high mild
+  10 (10.00%) high severe
+decide/authenticate/3_hop
+                        time:   [3.3642 µs 3.4212 µs 3.4925 µs]
+Found 15 outliers among 100 measurements (15.00%)
+  3 (3.00%) high mild
+  12 (12.00%) high severe
+decide/policy/3_hop     time:   [12.650 µs 13.027 µs 13.529 µs]
+Found 7 outliers among 100 measurements (7.00%)
+  3 (3.00%) high mild
+  4 (4.00%) high severe
+decide/record/3_hop     time:   [6.5856 µs 6.9237 µs 7.2776 µs]
+Found 17 outliers among 100 measurements (17.00%)
+  4 (4.00%) high mild
+  13 (13.00%) high severe
+decide/leases_memory/3_hop
+                        time:   [4.3062 µs 4.4638 µs 4.6433 µs]
+decide/append_memory/3_hop
+                        time:   [155.31 µs 162.71 µs 169.56 µs]
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) low mild
+  2 (2.00%) high mild
+decide/decide_memory/3_hop
+                        time:   [227.53 µs 236.14 µs 245.21 µs]
+Found 5 outliers among 100 measurements (5.00%)
+  3 (3.00%) low mild
+  2 (2.00%) high severe
+decide/leases_file/1_hop
+                        time:   [2.3601 µs 2.4330 µs 2.5188 µs]
+Found 15 outliers among 100 measurements (15.00%)
+  3 (3.00%) high mild
+  12 (12.00%) high severe
+decide/append_file/1_hop
+                        time:   [88.078 µs 114.05 µs 143.87 µs]
+Found 12 outliers among 100 measurements (12.00%)
+  3 (3.00%) high mild
+  9 (9.00%) high severe
+decide/decide_file/1_hop
+                        time:   [97.979 µs 114.92 µs 135.57 µs]
+Found 14 outliers among 100 measurements (14.00%)
+  4 (4.00%) high mild
+  10 (10.00%) high severe
+decide/leases_file/3_hop
+                        time:   [5.7498 µs 5.8881 µs 6.0573 µs]
+Found 18 outliers among 100 measurements (18.00%)
+  3 (3.00%) high mild
+  15 (15.00%) high severe
+decide/append_file/3_hop
+                        time:   [96.511 µs 127.74 µs 165.10 µs]
+Found 12 outliers among 100 measurements (12.00%)
+  4 (4.00%) high mild
+  8 (8.00%) high severe
+decide/decide_file/3_hop
+                        time:   [101.81 µs 113.46 µs 126.30 µs]
+Found 15 outliers among 100 measurements (15.00%)
+  1 (1.00%) low mild
+  3 (3.00%) high mild
+  11 (11.00%) high severe
+decide/leases_file_full/1_hop
+                        time:   [2.3841 µs 2.4503 µs 2.5268 µs]
+Found 15 outliers among 100 measurements (15.00%)
+  5 (5.00%) high mild
+  10 (10.00%) high severe
+decide/append_file_full/1_hop
+                        time:   [267.57 µs 277.06 µs 286.88 µs]
+Found 3 outliers among 100 measurements (3.00%)
+  2 (2.00%) high mild
+  1 (1.00%) high severe
+decide/decide_file_full/1_hop
+                        time:   [332.89 µs 346.14 µs 360.48 µs]
+decide/leases_file_full/3_hop
+                        time:   [5.7914 µs 5.9171 µs 6.0690 µs]
+Found 15 outliers among 100 measurements (15.00%)
+  5 (5.00%) high mild
+  10 (10.00%) high severe
+decide/append_file_full/3_hop
+                        time:   [305.26 µs 316.40 µs 328.11 µs]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+decide/decide_file_full/3_hop
+                        time:   [407.34 µs 424.65 µs 442.96 µs]
+Found 4 outliers among 100 measurements (4.00%)
+  3 (3.00%) high mild
+  1 (1.00%) high severe
+# uptime after: 20:49:16 up  3:12,  0 user,  load average: 1.12, 1.84, 2.12
+
+# pass 2
+# uptime before: 20:49:31 up  3:12,  0 user,  load average: 0.87, 1.75, 2.08
+decide/leases_file/1_hop
+                        time:   [2.3678 µs 2.4332 µs 2.5147 µs]
+                        change: [−7.9662% −3.5272% +1.0685%] (p = 0.14 > 0.05)
+                        No change in performance detected.
+Found 14 outliers among 100 measurements (14.00%)
+  7 (7.00%) high mild
+  7 (7.00%) high severe
+decide/append_file/1_hop
+                        time:   [98.800 µs 141.99 µs 194.77 µs]
+                        change: [−21.734% +19.902% +82.703%] (p = 0.42 > 0.05)
+                        No change in performance detected.
+Found 14 outliers among 100 measurements (14.00%)
+  3 (3.00%) high mild
+  11 (11.00%) high severe
+decide/decide_file/1_hop
+                        time:   [93.498 µs 130.18 µs 191.51 µs]
+                        change: [−19.768% +5.6329% +37.394%] (p = 0.72 > 0.05)
+                        No change in performance detected.
+Found 11 outliers among 100 measurements (11.00%)
+  2 (2.00%) high mild
+  9 (9.00%) high severe
+decide/leases_file/3_hop
+                        time:   [6.2251 µs 6.5464 µs 6.8975 µs]
+                        change: [+0.1092% +5.1784% +10.761%] (p = 0.04 < 0.05)
+                        Change within noise threshold.
+Found 13 outliers among 100 measurements (13.00%)
+  6 (6.00%) high mild
+  7 (7.00%) high severe
+decide/append_file/3_hop
+                        time:   [81.060 µs 119.20 µs 167.13 µs]
+                        change: [−43.779% −12.098% +40.792%] (p = 0.64 > 0.05)
+                        No change in performance detected.
+Found 10 outliers among 100 measurements (10.00%)
+  1 (1.00%) high mild
+  9 (9.00%) high severe
+decide/decide_file/3_hop
+                        time:   [116.59 µs 130.63 µs 146.62 µs]
+                        change: [−2.6016% +13.004% +30.823%] (p = 0.12 > 0.05)
+                        No change in performance detected.
+Found 9 outliers among 100 measurements (9.00%)
+  1 (1.00%) high mild
+  8 (8.00%) high severe
+# uptime after: 20:50:07 up  3:13,  0 user,  load average: 1.04, 1.69, 2.05
