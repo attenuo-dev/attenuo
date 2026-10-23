@@ -229,6 +229,9 @@ impl Harness {
             attribute_claims: vec!["email".into(), "groups".into(), "amr".into()],
             jwks_ttl_seconds: 300,
             clock_skew_seconds: 60,
+            client_ids: ["planner", "coder"]
+                .map(|a| (a.to_string(), CLIENT_AUD.to_string()))
+                .into(),
         }];
         cfg.agents = vec![
             AgentConfig {
@@ -417,8 +420,14 @@ async fn bad_id_tokens_are_rejected_with_stable_codes() {
         ..IdpKey::generate("x")
     };
     let cases = vec![
-        bad("audience_mismatch", with("aud", json!("someone-else"))),
-        bad("audience_mismatch", with("aud", json!(["a", "b"]))),
+        bad(
+            "credential_audience_mismatch",
+            with("aud", json!("someone-else")),
+        ),
+        bad(
+            "credential_audience_mismatch",
+            with("aud", json!(["a", "b"])),
+        ),
         bad(
             "untrusted_issuer",
             with("iss", json!("https://evil.example")),
@@ -445,8 +454,20 @@ async fn bad_id_tokens_are_rejected_with_stable_codes() {
         assert_error(&got, StatusCode::BAD_REQUEST, "invalid_grant", code);
     }
 
-    // An audience given as an array that contains ours is fine.
-    let ok = with("aud", json!(["other", CLIENT_AUD]));
+    // An audience given as an array that contains ours is fine when `azp` names us too; without
+    // it, or with another party, the token is refused (SR-37).
+    let no_azp = with("aud", json!(["other", CLIENT_AUD]));
+    let got = h.intake(&no_azp, "github:read_file").await;
+    assert_error(
+        &got,
+        StatusCode::BAD_REQUEST,
+        "invalid_grant",
+        "credential_audience_mismatch",
+    );
+    let mut claims = idp.id_token_claims("alice");
+    claims["aud"] = json!(["other", CLIENT_AUD]);
+    claims["azp"] = json!(CLIENT_AUD);
+    let ok = idp.sign(&idp.key, Some("JWT"), &claims);
     assert_eq!(h.intake(&ok, "github:read_file").await.0, StatusCode::OK);
 
     // A kid the IdP never published: one refetch, then rejected.

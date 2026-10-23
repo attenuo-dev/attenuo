@@ -870,3 +870,54 @@ fn arg_type_notation_parses() {
         assert!(bad.parse::<ArgType>().is_err(), "{bad}");
     }
 }
+
+#[test]
+fn mistyped_declared_attribute_denies_instead_of_matching_ne_permit() {
+    use onbehalf_policy::REASON_ATTRIBUTE_TYPE_MISMATCH;
+    let engine = PolicyEngineBuilder::new()
+        .with_catalog(ToolCatalog::new().with("srv", "read_file", ToolAttrs::new()))
+        .with_user_attr("status", ArgType::String)
+        .with_policies_str(
+            r#"permit(principal, action == Action::"read_file", resource)
+               when { context.originating_user.attributes has status
+                      && context.originating_user.attributes.status != "suspended" };"#,
+        )
+        .build()
+        .unwrap();
+    let now = OffsetDateTime::now_utc();
+    let call = ToolCall::new("srv", "read_file", json!({}));
+    for (attrs, allow) in [
+        (json!({"status": "active"}), true),
+        (json!({"status": ["suspended"]}), false),
+        (json!({"mfa": "yes"}), false),
+        (json!({"roles": "admin"}), false),
+        (json!({"tenant": 7}), false),
+        (json!({"email": ["a@x"]}), false),
+    ] {
+        let mut user = OriginatingUser {
+            subject: "alice".into(),
+            issuer: "https://idp".into(),
+            authenticated_at: now,
+            attributes: Default::default(),
+        };
+        for (k, v) in attrs.as_object().unwrap() {
+            user.attributes.insert(k.clone(), v.clone());
+        }
+        let chain = DelegationChain::root(
+            user,
+            AgentId::new("coder"),
+            CapabilitySet::from_iter([Capability::new("srv", "*")]),
+            now,
+            Duration::hours(1),
+            LeaseId::new("l1"),
+        )
+        .unwrap();
+        let out = engine.authorize(&chain, &call, now);
+        if allow {
+            assert!(out.decision.is_allow(), "{attrs}: {out:?}");
+        } else {
+            assert!(!out.decision.is_allow(), "{attrs}");
+            assert_eq!(out.reason, REASON_ATTRIBUTE_TYPE_MISMATCH, "{attrs}");
+        }
+    }
+}

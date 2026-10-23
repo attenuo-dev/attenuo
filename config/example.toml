@@ -87,9 +87,11 @@ url = "http://127.0.0.1:3001/mcp"
 # works (Okta, Entra ID, Google, Auth0, Keycloak, Dex, ...).
 [[idps]]
 issuer = "https://idp.example"
-# `aud` an ID token must carry: the client id registered at the IdP. (An ID-JAG's `aud` must be
-# [issuer] issuer instead.)
-audience = "onbehalf"
+# Per-agent client id at the IdP (SR-37). An ID token is accepted only from the agent whose
+# client id its `aud` names (and, when `aud` lists several values, its `azp`). An agent without
+# an entry here must have a client id equal to its agent id; the server warns for each one.
+# (An ID-JAG's `aud` must be [issuer] issuer instead.) The old `audience` key is ignored.
+client_ids = { planner = "planner-app", coder = "coder-app" }
 # Optional; when absent, jwks_uri from <issuer>/.well-known/openid-configuration.
 # jwks_url = "https://idp.example/oauth2/v1/keys"
 allowed_algs = ["RS256", "ES256", "EdDSA"]
@@ -157,3 +159,5 @@ stream_recheck_seconds = 2
 # No authentication: keep it on loopback or a private network.
 enabled = false
 # listen = "127.0.0.1:9100"
+# A non-loopback `listen` is refused at startup unless this is true (SR-38).
+# allow_public = false

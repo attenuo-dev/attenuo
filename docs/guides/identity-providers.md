@@ -31,7 +31,7 @@ All three must match for hop 0 to work. With no `[[agents]]`, every intake reque
 ```toml
 [[idps]]
 issuer = "https://idp.example.com/realms/acme"   # exact `iss` of the tokens
-audience = "agent-platform"                       # `aud` an ID token must carry
+client_ids = { planner = "agent-platform" }       # client id of each agent at the IdP
 # jwks_url = "https://idp.example.com/keys"       # optional
 allowed_algs = ["RS256", "ES256", "EdDSA"]        # default
 attribute_claims = ["email", "groups", "amr"]     # default
@@ -42,7 +42,8 @@ clock_skew_seconds = 60                           # default
 | Key | Meaning |
 | --- | --- |
 | `issuer` | Required. Compared byte for byte with the token's `iss` and with the `issuer` in the discovery document. A trailing slash counts. |
-| `audience` | Required. The `aud` an ID token must carry. This is the client id of the application that ran the login. Not used for an ID-JAG, whose `aud` must be onbehalf's own `[issuer] issuer`. |
+| `client_ids` | Table of agent id to the client id registered for that agent at the IdP, the application that ran the login. An ID token is accepted only when its `aud` contains the presenting agent's client id, and its `azp` equals it when `aud` has several values or `azp` is present. An agent with no entry must have a client id equal to its agent id; the server logs a warning at startup for each such agent. Not used for an ID-JAG, whose `aud` must be onbehalf's own `[issuer] issuer` and whose `client_id` must be the agent. |
+| `audience` | Deprecated. Ignored for ID tokens since SR-37, which needed the audience to be per agent. Existing configs still load; the server logs a warning when it is set. |
 | `jwks_url` | Where to fetch signing keys. When absent, onbehalf reads `jwks_uri` from `<issuer>/.well-known/openid-configuration`. |
 | `allowed_algs` | Accepted JWS algorithms. Asymmetric only: `RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `PS256` and so on. A symmetric algorithm such as `HS256` is refused when the config loads. |
 | `attribute_claims` | Claims copied verbatim into `originating_user.attributes`, when present and not null. |
@@ -67,7 +68,7 @@ Points to know:
 
 - `mfa` is always set, `false` when `amr` is missing. It overrides any claim called `mfa`. `pwd`, `sms` and the other `amr` values do not set it on their own. If your IdP does not send `amr`, every user looks like they did not use MFA, and policies that require `mfa` (the starter policy does, for `sensitive` tools) will deny them. Fix it at the IdP, not in onbehalf.
 - `attributes` set in `[[root_grants]]` are ignored for IdP intake. User attributes come only from the verified token.
-- **Cedar policies should only test attributes the policy schema declares.** By default those are `mfa` (bool), `roles` (set of strings), `tenant` (string) and `email` (string). Other attributes, `groups` among them, are copied into the token and the audit trail, but a policy that tests an undeclared one is reported as "impossible" at load time. Declare them with `[policy] user_attributes = { groups = "set<string>" }`; see [Writing policies](writing-policies.md#user-attributes). A claim whose value has a different type than declared makes the policy error at evaluation, and the call is denied with `policy_error`.
+- **Cedar policies should only test attributes the policy schema declares.** By default those are `mfa` (bool), `roles` (set of strings), `tenant` (string) and `email` (string). Other attributes, `groups` among them, are copied into the token and the audit trail, but a policy that tests an undeclared one is reported as "impossible" at load time. Declare them with `[policy] user_attributes = { groups = "set<string>" }`; see [Writing policies](writing-policies.md#user-attributes). A claim whose value has a different type than declared (a list where you declared `string`, which Keycloak's multivalued mappers and SCIM-sourced claims produce) is denied with `attribute_type_mismatch` and audited; onbehalf does not coerce it. This covers `mfa`, `roles`, `tenant` and `email` too.
 - The token also carries the whole `attributes` map, and it is readable by whoever holds the token. Do not list claims you would not want an agent to see.
 - `sub` is the user's identity inside onbehalf. Some providers issue a different `sub` per application (Entra does). Two applications then see the same person as two users.
 
@@ -127,17 +128,19 @@ capabilities = [
 
 `op` is `equals`, `one_of` or `prefix`. Start narrow. A root token is the widest anything in the chain can be.
 
+ID tokens are bearer credentials, bound to the agent that presents them only through `aud`/`azp` (SR-37): a token issued for agent A is refused from agent B with `credential_audience_mismatch`. `nonce` is not checked, because it binds a token to the browser session that requested it and the agent presenting the token here is not that session; the bearer risk remains until sender-constrained tokens exist.
+
 Root tokens last `[issuer] default_ttl_seconds` (900 by default), not as long as the ID token. v0 does not cap them by the ID token's `exp`, and does not remember used ID tokens: the same ID token can be exchanged again by the same agent until it expires. Prefer short-lived ID tokens.
 
 ## Provider recipes
 
-In every recipe, the **audience** is the client id of the application the user logs in to. The **issuer** must match the `iss` claim exactly. Replace the placeholders.
+In every recipe, the **client id** is the id of the application the user logs in to; it goes under the agent's name in `client_ids` (these examples use an agent called `planner`). The **issuer** must match the `iss` claim exactly. Replace the placeholders.
 
 ### Keycloak (untested)
 
 At Keycloak:
 
-- Realm `acme`, an OIDC client (for example `agent-platform`) with the standard flow. Its client id is the audience.
+- Realm `acme`, an OIDC client (for example `agent-platform`) with the standard flow. Its client id goes in `client_ids`.
 - Client scopes `openid`, `email` and `profile` give `sub`, `email` and the basics.
 - For roles, add a mapper of type "User Realm Role" (or "User Client Role") to the client's dedicated scope with token claim name `roles`, multivalued, "Add to ID token" on. Without this, roles sit in a nested `realm_access.roles` claim that onbehalf cannot use.
 - For groups, add a "Group Membership" mapper with claim name `groups` and "Add to ID token" on.
@@ -148,7 +151,7 @@ At onbehalf:
 ```toml
 [[idps]]
 issuer = "https://keycloak.example.com/realms/acme"   # older Keycloak: .../auth/realms/acme
-audience = "agent-platform"
+client_ids = { planner = "agent-platform" }
 attribute_claims = ["email", "roles", "amr"]
 ```
 
@@ -158,7 +161,7 @@ Discovery is at `https://keycloak.example.com/realms/acme/.well-known/openid-con
 
 At Auth0:
 
-- An application (Regular Web App or SPA) whose client id is the audience.
+- An application (Regular Web App or SPA) whose client id goes in `client_ids`.
 - Under the application's advanced settings, make sure the ID token signing algorithm is **RS256**. HS256 is symmetric and onbehalf refuses it.
 - Custom claims in Auth0 must be namespaced URLs, set in a post-login Action, for example `https://example.com/roles`. List the full namespaced name in `attribute_claims`. Because the name is not `roles`, a Cedar policy cannot test it in v0.
 - When a user completes MFA, Auth0 is expected to include `amr` with `mfa` in the ID token. This is not confirmed for any tenant.
@@ -168,7 +171,7 @@ At onbehalf:
 ```toml
 [[idps]]
 issuer = "https://acme.us.auth0.com/"      # trailing slash: Auth0 puts one in `iss`
-audience = "AUTH0_APP_CLIENT_ID"
+client_ids = { planner = "AUTH0_APP_CLIENT_ID" }
 allowed_algs = ["RS256"]
 attribute_claims = ["email", "amr"]
 ```
@@ -181,7 +184,7 @@ Whether Auth0 for AI Agents issues ID-JAG assertions is unknown to us ("?").
 
 At Okta:
 
-- An OIDC web app integration. Its client id is the audience.
+- An OIDC web app integration. Its client id goes in `client_ids`.
 - Pick the authorization server. The org server issuer is `https://acme.okta.com`. A custom server's issuer is `https://acme.okta.com/oauth2/<id>`, and the built-in one is `https://acme.okta.com/oauth2/default`. Use the issuer that your app's ID tokens actually carry in `iss`.
 - Add a groups claim to the ID token (a claim named `groups` with a filter), or name it `roles` if you want policy to see it.
 - Okta ID tokens are expected to carry `amr`. Check which values appear for your sign-on policy: only `mfa`, `otp`, `hwk` and `swk` count.
@@ -191,7 +194,7 @@ At onbehalf:
 ```toml
 [[idps]]
 issuer = "https://acme.okta.com/oauth2/default"
-audience = "0oa1b2c3d4EXAMPLE"
+client_ids = { planner = "0oa1b2c3d4EXAMPLE" }
 attribute_claims = ["email", "groups", "amr"]
 ```
 
@@ -201,7 +204,7 @@ Okta Cross App Access and Agent SSO issue ID-JAG assertions, per the sources in 
 
 At Entra:
 
-- An app registration. Its Application (client) ID is the audience. Use the v2.0 endpoints, so that ID tokens carry the v2.0 issuer.
+- An app registration. Its Application (client) ID goes in `client_ids`. Use the v2.0 endpoints, so that ID tokens carry the v2.0 issuer.
 - Single-tenant: `https://login.microsoftonline.com/<tenant-id>/v2.0`. Use the tenant id, not `common` or `organizations`: those serve a templated issuer that would not match.
 - Optional claims for the ID token: `email`. App roles arrive as a `roles` claim of strings, which matches the attribute Cedar knows about. The `groups` claim carries group object ids, and above a size limit the token carries a pointer (an "overage") instead. onbehalf does not follow it.
 - `sub` is unique per user per application.
@@ -212,7 +215,7 @@ At onbehalf:
 ```toml
 [[idps]]
 issuer = "https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/v2.0"
-audience = "66666666-7777-8888-9999-000000000000"
+client_ids = { planner = "66666666-7777-8888-9999-000000000000" }
 attribute_claims = ["email", "roles", "amr"]
 ```
 
@@ -222,7 +225,7 @@ Discovery is at `.../v2.0/.well-known/openid-configuration` under the same prefi
 
 At Google Cloud:
 
-- An OAuth 2.0 client (Web application) in the Google Cloud console. Its client id is the audience.
+- An OAuth 2.0 client (Web application) in the Google Cloud console. Its client id goes in `client_ids`.
 - Google ID tokens carry `sub`, `email`, `email_verified`, and `hd` for Workspace accounts. They carry no groups and no `amr`.
 
 At onbehalf:
@@ -230,7 +233,7 @@ At onbehalf:
 ```toml
 [[idps]]
 issuer = "https://accounts.google.com"
-audience = "1234567890-abcdefg.apps.googleusercontent.com"
+client_ids = { planner = "1234567890-abcdefg.apps.googleusercontent.com" }
 attribute_claims = ["email", "hd"]
 ```
 
@@ -289,7 +292,7 @@ Before you point an agent at it:
    echo "$ID_TOKEN" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq '{iss, aud, sub, exp, amr, email, roles, groups}'
    ```
 
-   `iss` must equal `issuer`. `aud` must equal `audience` (it may be an array that contains it). Check the header too: `cut -d. -f1` gives `alg` and `kid`. `alg` must be in `allowed_algs`.
+   `iss` must equal `issuer`. `aud` must contain the client id you set for the agent in `client_ids` (it may be an array, in which case `azp` must equal it too). Check the header too: `cut -d. -f1` gives `alg` and `kid`. `alg` must be in `allowed_algs`.
 3. Try the exchange:
 
    ```sh
@@ -315,7 +318,8 @@ Errors carry a stable `error_description`. The usual causes:
 | `401 invalid_client` / `client_authentication_failed` | Wrong agent id or secret, or the hash in `[[agents]]` was made from a different string. Check for a trailing newline: use `printf %s`, not `echo` |
 | `401 invalid_client` / `no_agents_configured` | `[[agents]]` is empty |
 | `400 invalid_grant` / `untrusted_issuer` | `iss` is not in `[[idps]]`. Look for a trailing slash, `http` against `https`, or a tenant id mismatch |
-| `400 invalid_grant` / `audience_mismatch` | `aud` is not your `audience`. For an ID-JAG, `aud` must be `[issuer] issuer` |
+| `400 invalid_grant` / `credential_audience_mismatch` | An ID token's `aud` (or `azp`) does not name the presenting agent's client id: the token was issued to another client, or `client_ids` has no entry for this agent and the id differs from the agent id |
+| `400 invalid_grant` / `audience_mismatch` | An ID-JAG's `aud` is not `[issuer] issuer` |
 | `400 invalid_grant` / `unsupported_alg` | The token's `alg` is not in `allowed_algs` |
 | `400 invalid_grant` / `unknown_kid` | The signing key is not in the IdP's JWKS, even after a refetch |
 | `400 invalid_grant` / `bad_signature`, `expired`, `not_yet_valid` | The token is bad, stale, or your clock is off by more than `clock_skew_seconds` |

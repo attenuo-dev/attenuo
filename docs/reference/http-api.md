@@ -7,7 +7,7 @@ All routes the server mounts, from the route table in `crates/onbehalf-server/sr
 | Method and path | Auth | Purpose |
 | --- | --- | --- |
 | `GET /healthz` | none | Liveness. Never touches storage. |
-| `GET /readyz` | none | Readiness. Checks the audit store and the lease store. 200 or 503. |
+| `GET /readyz` | none | Readiness. Checks the audit store and the lease store. 200 `{"ready":true,"checks":{"audit":"ok","leases":"ok"}}` or 503 with `"error"` for the failing check and no error text. |
 | `GET /.well-known/jwks.json` | none | Public keys for token verification, including retired keys. |
 | `GET /.well-known/authzen-configuration` | none | AuthZEN discovery: decision point, evaluation and evaluations endpoint URLs. |
 

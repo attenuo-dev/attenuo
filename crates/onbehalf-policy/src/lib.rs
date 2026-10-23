@@ -18,6 +18,12 @@
 //! for a `forbid` means a silent grant), the outcome is Deny with reason `policy_error` and the
 //! details in [`Outcome::diagnostics`].
 //!
+//! Declared `originating_user.attributes` types (the built-in `mfa`, `roles`, `tenant`,
+//! `email` and anything added with [`PolicyEngineBuilder::with_user_attr`]) are enforced at
+//! this boundary: a value of another type is denied with reason `attribute_type_mismatch`
+//! rather than passed on, because Cedar's `!=` across types is `true` and would let a
+//! `!= "suspended"` permit fire on `["suspended"]`. Nothing is coerced.
+//!
 //! # Request shape
 //!
 //! The Cedar request mirrors the shape used by AWS Bedrock AgentCore policies, so policies
@@ -174,6 +180,9 @@ pub const REASON_POLICY_ERROR: &str = "policy_error";
 /// Reason code when the tool is not in the catalog and [`UnknownTools::Deny`] is in force.
 pub const REASON_TOOL_NOT_IN_CATALOG: &str = "tool_not_in_catalog";
 
+/// Reason code when an originating-user attribute does not have its declared type (SR-33).
+pub const REASON_ATTRIBUTE_TYPE_MISMATCH: &str = "attribute_type_mismatch";
+
 /// Errors from loading policies or schema.
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
@@ -194,8 +203,8 @@ pub enum PolicyError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
     pub decision: Decision,
-    /// One of `capability_denied`, `tool_not_in_catalog`, `policy_allow`, `policy_deny`,
-    /// `policy_error`.
+    /// One of `capability_denied`, `tool_not_in_catalog`, `attribute_type_mismatch`,
+    /// `policy_allow`, `policy_deny`, `policy_error`.
     pub reason: String,
     /// Ids of the policies that determined the decision (permits that matched for an allow,
     /// forbids that matched for a deny). Empty for a capability denial or a default deny.
@@ -312,6 +321,7 @@ impl PolicyEngineBuilder {
             schema_text,
             policies,
             catalog: self.catalog,
+            user_attrs: self.user_attrs,
             unknown_tools: self.unknown_tools,
             authorizer: Authorizer::new(),
             validation_warnings: warnings,
@@ -373,6 +383,7 @@ pub struct PolicyEngine {
     schema_text: String,
     policies: PolicySet,
     catalog: ToolCatalog,
+    user_attrs: BTreeMap<String, ArgType>,
     unknown_tools: UnknownTools,
     authorizer: Authorizer,
     validation_warnings: Vec<String>,
@@ -428,6 +439,13 @@ impl PolicyEngine {
                 UnknownTools::Allow => ToolAttrs::default(),
             }
         };
+
+        // Stage 1c: declared attribute types. Evaluation is schema-free, and Cedar's `!=`
+        // across types is `true` without an error, so a value of the wrong type (a list where
+        // a string is declared) would make `attributes.status != "suspended"` permit.
+        if let Err(e) = request::check_user_attributes(&chain.originating_user, &self.user_attrs) {
+            return Outcome::deny(REASON_ATTRIBUTE_TYPE_MISMATCH, vec![e]);
+        }
 
         // Stage 2: Cedar.
         let req = match request::build(chain, call, &attrs, now) {

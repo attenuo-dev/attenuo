@@ -231,7 +231,7 @@ Notes:
 
 `GET /healthz` returns `{"status":"ok","version":"..."}` with HTTP 200. It is a liveness check only. It does not open the database, check disk space or contact an identity provider. A server whose SQLite file is read-only or full still answers `ok`, and then denies every call.
 
-`GET /readyz` is the readiness check. It reads the head of the audit log and one row of the lease store. It answers 200 `{"status":"ready","checks":{...}}` when both work, and 503 with `"status":"unavailable"` and the failing check's error when either does not. Point a load balancer or Kubernetes `readinessProbe` at it; keep `/healthz` for the liveness probe so a full disk takes the instance out of rotation instead of restarting it. It needs no credentials and discloses only the storage error text.
+`GET /readyz` is the readiness check. It reads the head of the audit log and one row of the lease store. It answers 200 `{"ready":true,"checks":{"audit":"ok","leases":"ok"}}` when both work, and 503 `{"ready":false,"checks":{"audit":"error","leases":"ok"}}` when one does not. Point a load balancer or Kubernetes `readinessProbe` at it; keep `/healthz` for the liveness probe so a full disk takes the instance out of rotation instead of restarting it. It needs no credentials, so the body names only the check and `ok` or `error`; the storage error (SQLite message, file path) is written to the server log at `warn` level.
 
 Startup is quick: parse config, load the key, open SQLite, load policy. Config, policy or catalog errors stop the process with a message instead of starting a half-working server.
 
@@ -247,7 +247,7 @@ enabled = true
 listen = "127.0.0.1:9100"
 ```
 
-`GET http://127.0.0.1:9100/metrics` has no authentication. Keep it on loopback or a private network and scrape it from there. The API port does not serve `/metrics`. Series (all prefixed `onbehalf_`):
+`GET http://127.0.0.1:9100/metrics` has no authentication. Keep it on loopback or a private network and scrape it from there. The server refuses to start when `listen` is not a loopback address, unless you also set `allow_public = true` (it then logs a warning); do that only for a private interface that network policy protects, since decision counts by reason are served to anyone who can connect. The API port does not serve `/metrics`. Series (all prefixed `onbehalf_`):
 
 | Series | Type | Labels |
 |---|---|---|

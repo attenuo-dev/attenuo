@@ -810,6 +810,49 @@ catalog:
     }
 
     #[test]
+    fn mistyped_user_attribute_is_denied_not_permitted_sr33() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("p.cedar"),
+            r#"@id("not_suspended") permit(principal, action == Action::"read_file", resource)
+               when { context.originating_user.attributes has status
+                      && context.originating_user.attributes.status != "suspended" };"#,
+        )
+        .unwrap();
+        let yaml = format!(
+            "policies: ./p.cedar\n{CATALOG}\ncases:\n{}",
+            r#"
+  - name: string status allowed
+    chain: [coder]
+    user: { attributes: { status: active } }
+    call: { server: github, tool: read_file, arguments: { repo: a/b } }
+    expect: allow
+  - name: list status is a type mismatch
+    chain: [coder]
+    user: { attributes: { status: [suspended] } }
+    call: { server: github, tool: read_file, arguments: { repo: a/b } }
+    expect: deny
+    reason: attribute_type_mismatch
+"#
+        );
+        let path = dir.path().join("t.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let f = TestFile::load(&path).unwrap();
+        let engine = PolicyEngineBuilder::new()
+            .with_catalog(f.load_catalog().unwrap())
+            .with_user_attr("status", ArgType::String)
+            .with_policies_file(dir.path().join("p.cedar"))
+            .build()
+            .unwrap();
+        let r = f.run_with(&engine);
+        for c in &r.cases {
+            assert!(c.passed, "{}: {:?} {:?}", c.name, c.failures, c.error);
+        }
+        let d = &r.cases[1].actual.as_ref().unwrap().diagnostics;
+        assert!(d[0].contains("attributes.status"), "{d:?}");
+    }
+
+    #[test]
     fn user_attributes_are_read_from_a_server_config() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("server.toml");

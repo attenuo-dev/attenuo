@@ -8,6 +8,12 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ## [Unreleased]
 
+### Security
+
+- SR-33: declared `originating_user.attributes` types (the built-in `mfa`, `roles`, `tenant`, `email` and `[policy] user_attributes`) are enforced before Cedar runs. A value of another type is denied with reason `attribute_type_mismatch` and audited, so `attributes.status != "suspended"` no longer permits `["suspended"]`. Nothing is coerced.
+- SR-37: an ID token is bound to the agent that presents it. BREAKING: `[[idps]] audience` is ignored for ID tokens; `aud` must contain the agent's client id from the new `[[idps]] client_ids` table (default: the agent id), and `azp` must name it when `aud` has several values or `azp` is present. A token for agent A presented by agent B is refused with `credential_audience_mismatch`. The server warns at startup for each agent without an entry.
+- SR-38: `GET /readyz` returns a fixed shape, `{"ready":false,"checks":{"audit":"error","leases":"ok"}}`, with the storage error in the server log only. BREAKING: the old `status` field and the per-check `{ok,error}` objects are gone. A `[metrics] listen` off loopback is refused at startup unless `[metrics] allow_public = true`, and logs a warning when it is set.
+
 ### Added
 
 - SDKs: `audit_head` / `auditHead` (the newest audit `seq`, read from `head` of `GET /admin/audit`, signs nothing) and `audit_export` / `auditExport` (iterator of the JSON Lines objects of `GET /admin/audit/export`). The Python and TypeScript `audit_tail` / `auditTail` use `head` instead of `GET /admin/audit/checkpoint`, which signs and stores a checkpoint per call; `audit_checkpoint` stays as the explicit call. `AuditPage.head` in TypeScript.

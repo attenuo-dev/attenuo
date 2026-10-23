@@ -29,7 +29,7 @@ The annotated source of truth is [config/example.toml](https://github.com/7Mudit
 | --- | --- | --- |
 | `policies_path` | none | Cedar policy file. `POST /admin/policies/reload` re-reads it. |
 | `catalog_path` | none | JSON tool catalog. Can be combined with `[policy.catalog]`. |
-| `user_attributes` | none | Extra `originating_user.attributes` for the Cedar schema, as `{ name = "type" }`. Types: `string`, `long`, `bool`, `set<string>`. |
+| `user_attributes` | none | Extra `originating_user.attributes` for the Cedar schema, as `{ name = "type" }`. Types: `string`, `long`, `bool`, `set<string>`. A value of another type is denied with `attribute_type_mismatch`. |
 
 The built-in user attributes `mfa` (bool), `roles` (set of string), `tenant` and `email` are always declared.
 
@@ -82,7 +82,8 @@ Trusted identity providers for hop 0. Only these issuers are accepted at `POST /
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `issuer` | | The IdP issuer URL. |
-| `audience` | | The `aud` an ID token must carry, normally the client id registered at the IdP. |
+| `client_ids` | `{}` | Table of agent id to the client id registered for it at the IdP. An ID token must have that value in `aud` (and in `azp` when `aud` has several values or `azp` is present), or it is refused with `credential_audience_mismatch`. An agent with no entry must have a client id equal to its agent id; the server logs a warning at startup for each such agent. |
+| `audience` | | Deprecated and ignored for ID tokens. Parsed so old configs load; a warning is logged when set. |
 | `jwks_url` | discovery | JWKS location. Otherwise `jwks_uri` from `<issuer>/.well-known/openid-configuration`. |
 | `allowed_algs` | `RS256`, `ES256`, `EdDSA` | Accepted signature algorithms. HMAC is refused. |
 | `attribute_claims` | `email`, `groups`, `amr` | Claims copied into `originating_user.attributes`. `mfa` is always derived from `amr`. |
@@ -130,3 +131,4 @@ With no matching entry, no root token is issued.
 | --- | --- | --- |
 | `enabled` | `false` | Serve Prometheus text on a separate listener. |
 | `listen` | `127.0.0.1:9100` | Address of the metrics listener. No authentication, so keep it on loopback or a private network. |
+| `allow_public` | `false` | Without it, the server refuses to start when `enabled` and `listen` is not a loopback address. With it, the server starts and logs a warning. |

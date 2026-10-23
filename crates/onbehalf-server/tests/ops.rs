@@ -53,9 +53,10 @@ async fn readyz_ok_when_stores_answer() {
     let r = h.get("/readyz").await;
     assert_eq!(r.status(), StatusCode::OK);
     let body: Value = r.json().await.unwrap();
-    assert_eq!(body["status"], "ready");
-    assert_eq!(body["checks"]["audit"]["ok"], true);
-    assert_eq!(body["checks"]["leases"]["ok"], true);
+    assert_eq!(
+        body,
+        json!({"ready": true, "checks": {"audit": "ok", "leases": "ok"}})
+    );
 }
 
 #[tokio::test]
@@ -71,10 +72,11 @@ async fn readyz_503_when_audit_store_fails_but_healthz_stays_ok() {
     let r = h.get("/readyz").await;
     assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body: Value = r.json().await.unwrap();
-    assert_eq!(body["status"], "unavailable");
-    assert_eq!(body["checks"]["audit"]["ok"], false);
-    assert!(body["checks"]["audit"]["error"].is_string());
-    assert_eq!(body["checks"]["leases"]["ok"], true);
+    // Stable shape, and none of the SQLite error text (SR-38).
+    assert_eq!(
+        body,
+        json!({"ready": false, "checks": {"audit": "error", "leases": "ok"}})
+    );
     assert_eq!(h.get("/healthz").await.status(), StatusCode::OK);
 }
 
@@ -91,8 +93,10 @@ async fn readyz_503_when_lease_store_fails() {
     let r = h.get("/readyz").await;
     assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body: Value = r.json().await.unwrap();
-    assert_eq!(body["checks"]["leases"]["ok"], false);
-    assert_eq!(body["checks"]["audit"]["ok"], true);
+    assert_eq!(
+        body,
+        json!({"ready": false, "checks": {"audit": "ok", "leases": "error"}})
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -353,4 +357,45 @@ async fn previous_key_path_errors_are_reported() {
     std::fs::write(dir.path().join("bad.pem"), "not a pem").unwrap();
     cfg.issuer.previous_key_paths = vec![dir.path().join("bad.pem")];
     assert!(onbehalf_server::build(&cfg).is_err());
+}
+
+// ---------------------------------------------------------------------------------------------
+// SR-38: the metrics listener must not be public by accident.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn metrics_listener_off_loopback_needs_allow_public() {
+    use onbehalf_server::config::MetricsSection;
+    let at = |addr: &str, enabled: bool, allow_public: bool| MetricsSection {
+        enabled,
+        listen: addr.parse().unwrap(),
+        allow_public,
+    };
+    for ok in [
+        at("127.0.0.1:9100", true, false),
+        at("[::1]:9100", true, false),
+        at("0.0.0.0:9100", false, false),
+        at("0.0.0.0:9100", true, true),
+        at("10.0.0.5:9100", true, true),
+    ] {
+        ok.check_listen().unwrap();
+    }
+    for bad in ["0.0.0.0:9100", "10.0.0.5:9100", "[::]:9100"] {
+        let err = at(bad, true, false).check_listen().unwrap_err().to_string();
+        assert!(err.contains("allow_public"), "{err}");
+    }
+}
+
+#[tokio::test]
+async fn server_refuses_to_start_with_a_public_metrics_listener() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::default();
+    cfg.audit.sqlite_path = dir.path().join("a.sqlite").to_string_lossy().into_owned();
+    cfg.admin.token = Some("admin".into());
+    cfg.metrics.enabled = true;
+    cfg.metrics.listen = "0.0.0.0:9100".parse().unwrap();
+    let err = onbehalf_server::build(&cfg).err().expect("must refuse");
+    assert!(err.to_string().contains("[metrics] listen"), "{err}");
+    cfg.metrics.allow_public = true;
+    let _ = onbehalf_server::build(&cfg).unwrap();
 }
