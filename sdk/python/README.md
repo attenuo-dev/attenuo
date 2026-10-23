@@ -62,7 +62,7 @@ print(admin.audit_verify())  # VerifyReport(ok=True, entries=..., ...)
 | Call                                                                                                 | Does                                                                                                                                                                                                                                                                                                                                                                                                              |
 | ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Client(server_url, token=None, timeout=30)`                                                         | HTTP client for the server. `token` is a default bearer.                                                                                                                                                                                                                                                                                                                                                          |
-| `exchange(subject_token, actor, capabilities, ttl_seconds=None, client_id=None, client_secret=None)` | RFC 8693 exchange. Returns a `Token`. From a delegation token, `client_secret` is the actor's `[[agents]]` secret (`client_id` defaults to `actor`), which the server requires by default. From any other subject token, `client_id` and `client_secret` make it a hop-0 exchange of an IdP credential (`subject_token_type="...:id-jag"` for an ID-JAG). A parent token can be exchanged for a given actor once. |
+| `exchange(subject_token, actor, capabilities, ttl_seconds=None, client_id=None, client_secret=None, subject_token_type=None, *, actor_token=None, may_act=None)` | RFC 8693 exchange. Returns a `Token`. From a delegation token, `client_secret` is the actor's `[[agents]]` secret (`client_id` defaults to `actor`), which the server requires by default. From any other subject token, `client_id` and `client_secret` make it a hop-0 exchange of an IdP credential (`subject_token_type="...:id-jag"` for an ID-JAG). A parent token can be exchanged for a given actor once. `actor_token` (a workload-identity JWT such as a SPIFFE JWT-SVID from an `[[actor_trust]]` issuer) authenticates the actor instead of a secret, depending on `[token] actor_auth`; each one works for one exchange. `may_act` lists the agents allowed to exchange the new token next. |
 | `renew(token)`                                                                                       | `POST /token/renew`. Returns `Lease(lease, expires_at, expires_in)`.                                                                                                                                                                                                                                                                                                                                              |
 | `call_tool(token, server, tool, arguments, session_id=None)`                                         | `tools/call` through `/mcp/{server}`. Returns `ToolResult` (`.text`, `.content`, `.is_error`, `.decision_id`).                                                                                                                                                                                                                                                                                                    |
 | `list_tools(token, server)`                                                                          | `tools/list`, filtered by the proxy to what the token may call.                                                                                                                                                                                                                                                                                                                                                   |
@@ -84,6 +84,24 @@ Capability("github", "read_*", repo=Prefix("alice/public-"), ref=Equals("main"))
 ```
 
 These serialize to the server's `authorization_details` shape, the same JSON `onbehalf token exchange --cap` produces. Plain strings (`"github:read_file"`, or comma separated) work anywhere a capability is accepted. A child must constrain every argument its parent constrains, at least as tightly; the server refuses an exchange that widens (`ApiError` with `error == "invalid_scope"`).
+
+### Workload identity and `may_act`
+
+An agent can authenticate with a workload-identity JWT instead of a client secret: an RFC 8693 `actor_token` from an `[[actor_trust]]` issuer, such as a SPIFFE JWT-SVID. It works at hop 0 (with the user's ID token or ID-JAG as the subject token) and on every exchange. Each actor token authenticates one request, and the token it obtains never outlives it.
+
+```python
+svid = open("/run/spire/svid.jwt").read()  # written by a SPIFFE helper, aud = the server
+root = ob.exchange(id_token, "planner", ["github:*"], actor_token=svid)
+```
+
+`may_act` limits who may exchange a token next (RFC 8693 §4.4). Pass it when exchanging, or when minting a dev root:
+
+```python
+coder = ob.exchange(root, "coder", ["github:read_file"], client_secret=..., may_act=["reviewer"])
+root = admin.mint_root_dev("alice", "https://idp.example", "planner", ["github:*"], may_act=["coder"])
+```
+
+`may_act` is a list of agent ids (a bare string is a `TypeError`); `[]` means nobody may exchange the token. For a root it must be within the `[[root_grants]]` entry's `may_act` when that has one.
 
 ### Errors
 

@@ -113,29 +113,30 @@ ROOT_TOKEN="$(field token)"; ROOT_LEASE="$(field lease)"
 
 say "2. The assistant hands its 'coder' sub-agent read_file and nothing else"
 note "The coder authenticates as itself ([[agents]] in config.toml): only it can receive a token in its name."
-note "Its secret goes in on stdin (or ONBEHALF_CLIENT_SECRET, or --client-secret-file), never in argv."
-step 0 'printf "%s\n" demo-coder-secret | onbehalf token exchange --subject-token "$ROOT_TOKEN" --actor coder --client-secret-stdin --cap github:read_file'
+note "Its secret goes in on stdin (or ONBEHALF_CLIENT_SECRET, or --client-secret-file), never in argv;"
+note "so do the tokens (ONBEHALF_TOKEN, --token-file or --token -)."
+step 0 'printf "%s\n" demo-coder-secret | ONBEHALF_TOKEN="$ROOT_TOKEN" onbehalf token exchange --actor coder --client-secret-stdin --cap github:read_file'
 CODER="$(field token)"; CODER_LEASE="$(field lease)"
 
 say "3. What the coder's token says"
 step 0 'onbehalf token inspect "$CODER" --verify'
 
 say "4. The coder reads a public repo as intended: allowed"
-step 0 'onbehalf call --token "$CODER" --server github --tool read_file --arg repo=alice/public-docs --arg path=README.md'
+step 0 'ONBEHALF_TOKEN="$CODER" onbehalf call --server github --tool read_file --arg repo=alice/public-docs --arg path=README.md'
 
 say "5. A malicious issue tells the coder to read alice/private-salaries: denied by policy"
 note "read_file is in the token, but the policy only lets it touch alice/public-*."
-step 2 'onbehalf call --token "$CODER" --server github --tool read_file --arg repo=alice/private-salaries --arg path=2025.csv'
+step 2 'ONBEHALF_TOKEN="$CODER" onbehalf call --server github --tool read_file --arg repo=alice/private-salaries --arg path=2025.csv'
 
 say "6. The injection tries to copy the data out through create_issue: denied, never delegated"
-step 2 'onbehalf call --token "$CODER" --server github --tool create_issue --arg repo=alice/public-docs --arg title=leak'
+step 2 'ONBEHALF_TOKEN="$CODER" onbehalf call --server github --tool create_issue --arg repo=alice/public-docs --arg title=leak'
 
 say "7. Alice sees the session going wrong and revokes the assistant's lease"
 step 0 'onbehalf lease revoke "$ROOT_LEASE" --reason "agent session compromised"'
 step 0 'onbehalf lease show "$CODER_LEASE"'
 
 say "8. The coder's next call, even the legitimate one, is denied: the revocation cascaded"
-step 2 'onbehalf call --token "$CODER" --server github --tool read_file --arg repo=alice/public-docs --arg path=README.md'
+step 2 'ONBEHALF_TOKEN="$CODER" onbehalf call --server github --tool read_file --arg repo=alice/public-docs --arg path=README.md'
 
 say "9. The audit log records every decision, and its hash chain checks out"
 step 0 'onbehalf audit tail -n 10'

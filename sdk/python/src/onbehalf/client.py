@@ -82,13 +82,14 @@ class Client:
         ``client_secret`` is the actor's ``[[agents]]`` secret (``client_id`` defaults to
         ``actor``); the server requires it unless ``[token] require_actor_auth = false``. For
         hop 0 (an IdP credential), pass ``client_id`` and ``client_secret`` of a registered
-        agent; the subject token type then defaults to an OIDC ID token, or set
-        ``subject_token_type`` to ``urn:ietf:params:oauth:token-type:id-jag`` for an ID-JAG.
+        agent, or its ``actor_token``; the subject token type then defaults to an OIDC ID token,
+        or set ``subject_token_type`` to ``urn:ietf:params:oauth:token-type:id-jag`` for an
+        ID-JAG.
 
-        Instead of a client secret, a hop n+1 exchange can authenticate the actor with
+        Instead of a client secret, either kind of request can authenticate the agent with
         ``actor_token``: a workload-identity JWT (for example a SPIFFE JWT-SVID) from an
         ``[[actor_trust]]`` issuer, sent with ``actor_token_type``
-        ``urn:ietf:params:oauth:token-type:jwt``. Each actor token authenticates one exchange.
+        ``urn:ietf:params:oauth:token-type:jwt``. Each actor token authenticates one request.
         ``may_act`` lists the agents allowed to exchange the new token next (RFC 8693 §4.4).
 
         Raises :class:`~onbehalf.ApiError` (``invalid_scope``, ``invalid_grant``, ...) on refusal.

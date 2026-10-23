@@ -6,7 +6,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use onbehalf_core::{AgentId, CapabilitySet, DelegationChain, LeaseId, OriginatingUser};
 use time::{Duration, OffsetDateTime};
 
-use crate::claims::{canonical_user_bytes, ActClaim, Claims, MayAct, TOKEN_TYPE};
+use crate::claims::{ou_sig_message, ActClaim, Claims, MayAct, OU_SIG_VERSION, TOKEN_TYPE};
 use crate::detached::DetachedSigner;
 use crate::error::TokenError;
 use crate::keys::{PublicKey, SigningKey};
@@ -191,8 +191,9 @@ impl Issuer {
     /// Mint the root token: `agent` acts for `user` with `capabilities` for `ttl`
     /// (default: `config.default_ttl`), starting at `now`.
     ///
-    /// This is the only place the originating-user block is signed (`ou_sig`); exchanges copy
-    /// that signature unchanged.
+    /// This is the only place the originating-user block is signed (`ou_sig`, bound to `iss`
+    /// and this root hop, see [`crate::claims::ou_sig_payload`]); exchanges copy that
+    /// signature, its version and its `kid` unchanged.
     pub fn issue_root(
         &self,
         user: OriginatingUser,
@@ -230,10 +231,15 @@ impl Issuer {
             options.ttl(ttl, self.config.default_ttl, now)?,
             lease.clone(),
         )?;
-        let ou_sig = self
-            .key
-            .sign_detached(&canonical_user_bytes(&chain.originating_user));
-        self.mint(chain, ou_sig, lease, options.may_act.clone(), now)
+        let ou = OuSig {
+            sig: self.key.sign_detached(&ou_sig_message(
+                &self.config.issuer,
+                &chain.originating_user,
+                &chain.hops[0],
+            )),
+            kid: self.key.public_key().kid(),
+        };
+        self.mint(chain, ou, lease, options.may_act.clone(), now)
     }
 
     /// RFC 8693 token exchange: verify `parent_token`, then mint a child token for `actor` whose
@@ -290,7 +296,10 @@ impl Issuer {
         )?;
         self.mint(
             chain,
-            parent.claims.ou_sig,
+            OuSig {
+                sig: parent.claims.ou_sig,
+                kid: parent.claims.ou_kid,
+            },
             lease,
             options.may_act.clone(),
             now,
@@ -300,7 +309,7 @@ impl Issuer {
     fn mint(
         &self,
         chain: DelegationChain,
-        ou_sig: String,
+        ou: OuSig,
         lease: LeaseId,
         may_act: Option<MayAct>,
         now: OffsetDateTime,
@@ -322,7 +331,9 @@ impl Issuer {
             exp: expires_at.unix_timestamp(),
             chain: chain.clone(),
             typ: TOKEN_TYPE.to_owned(),
-            ou_sig,
+            ou_sig: ou.sig,
+            ou_sig_v: OU_SIG_VERSION,
+            ou_kid: ou.kid,
             may_act,
         };
         let mut header = Header::new(Algorithm::EdDSA);
@@ -336,6 +347,12 @@ impl Issuer {
             lease,
         })
     }
+}
+
+/// The originating-user signature and the `kid` of the key that made it.
+struct OuSig {
+    sig: String,
+    kid: String,
 }
 
 fn new_lease() -> LeaseId {

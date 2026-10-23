@@ -47,6 +47,8 @@ pub struct AppState {
     pub authzen_allow_unsigned_chain: bool,
     /// `[authzen] max_batch`.
     pub authzen_max_batch: usize,
+    /// `[authzen] diagnostics`.
+    pub authzen_diagnostics: crate::config::AuthzenDiagnostics,
     /// PEPs allowed to send unsigned chains (`[[peps]]`, validated).
     pub peps: Vec<AgentConfig>,
     pub public_url: Option<String>,
@@ -63,6 +65,7 @@ impl AppState {
     /// Load keys, policies and storage as the config says.
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
         config.check_server_names()?;
+        config.server.check_public_url()?;
         config.check_admin_token()?;
         config.metrics.check_listen()?;
         if config.authzen.max_batch == 0 {
@@ -93,8 +96,8 @@ impl AppState {
                 .filter(|a| !idp.client_ids.contains_key(&a.id))
             {
                 tracing::warn!(
-                    idp = %idp.issuer,
-                    agent = %agent.id,
+                    idp = ?idp.issuer,
+                    agent = ?agent.id,
                     "[[idps]] client_ids has no entry for this agent: its ID tokens must carry \
                      aud = `{0}` (the agent id). Set client_ids.{0} = \"<client id at the IdP>\" \
                      to bind ID tokens to the agent explicitly (SR-37)",
@@ -168,6 +171,7 @@ impl AppState {
             dev_allow_root_mint: config.dev.allow_root_mint,
             authzen_allow_unsigned_chain: config.authzen.allow_unsigned_chain,
             authzen_max_batch: config.authzen.max_batch,
+            authzen_diagnostics: config.authzen.diagnostics,
             require_actor_auth: config.token.require_actor_auth,
             actor_auth,
             actor_trust,

@@ -98,6 +98,13 @@ describe("exchange", () => {
     expect((calls[1]!.body as Record<string, unknown>).subject_token_type).toBe(
       "urn:ietf:params:oauth:token-type:id-jag",
     );
+    // Hop 0 authenticated by an actor token (a JWT-SVID) instead of a client secret.
+    await ob.exchange("idtoken", "planner", "github:*", { actorToken: "s.v.id" });
+    expect(calls[2]!.body).toMatchObject({
+      subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
+      actor_token: "s.v.id",
+    });
+    expect(calls[2]!.body).not.toHaveProperty("client_secret");
   });
 
   it("authenticates a hop n+1 exchange as its actor", async () => {

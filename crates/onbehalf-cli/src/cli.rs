@@ -18,16 +18,13 @@ pub struct Cli {
     #[arg(long, visible_alias = "url", env = "ONBEHALF_SERVER", default_value = DEFAULT_SERVER)]
     pub server: String,
 
-    /// Bearer token for `/admin/*` (token root, lease, audit, policy).
+    /// Bearer token for `/admin/*` (token root, lease, audit, policy). Without this flag,
+    /// `--admin-token-stdin` or `--admin-token-file`, the `ONBEHALF_ADMIN_TOKEN` environment
+    /// variable is used.
     ///
     /// Prefer `ONBEHALF_ADMIN_TOKEN`, `--admin-token-stdin` or `--admin-token-file`: an argument
     /// is visible to other local users in `ps` and ends up in shell history.
-    #[arg(
-        long,
-        env = "ONBEHALF_ADMIN_TOKEN",
-        hide_env_values = true,
-        conflicts_with_all = ["admin_token_stdin", "admin_token_file"]
-    )]
+    #[arg(long, conflicts_with_all = ["admin_token_stdin", "admin_token_file"])]
     pub admin_token: Option<String>,
 
     /// Read the admin token from the first line of standard input.
@@ -109,16 +106,74 @@ pub struct RootArgs {
     /// User attribute `key=value` (`key:=json` for non-strings). Repeatable.
     #[arg(long = "attr", value_parser = parse_kv)]
     pub attrs: Vec<(String, Value)>,
+    /// RFC 8693 `may_act` for the root token: an agent allowed to exchange it next. Repeatable;
+    /// values may also be comma-separated. Must be within the `[[root_grants]]` entry's
+    /// `may_act` when it has one. Without it the grant's `may_act` applies (or, if none, any
+    /// authenticated agent may).
+    #[arg(long = "may-act", value_name = "AGENT")]
+    pub may_act: Vec<String>,
     /// Print only this value, for scripts.
     #[arg(long, value_enum)]
     pub print: Option<Field>,
 }
 
+impl RootArgs {
+    /// `--may-act` values, split on commas, without empties.
+    pub fn may_act(&self) -> Vec<String> {
+        split_agents(&self.may_act)
+    }
+
+    /// The JSON body for `POST /admin/root-token`.
+    pub fn request_body(&self) -> anyhow::Result<Value> {
+        let mut body = serde_json::Map::new();
+        body.insert("subject".into(), self.subject.clone().into());
+        body.insert("issuer".into(), self.issuer.clone().into());
+        body.insert("agent".into(), self.agent.clone().into());
+        if !self.caps.is_empty() {
+            body.insert("capabilities".into(), parse_caps(&self.caps)?.into());
+        }
+        if let Some(ttl) = self.ttl_seconds {
+            body.insert("ttl_seconds".into(), ttl.into());
+        }
+        if !self.attrs.is_empty() {
+            body.insert(
+                "attributes".into(),
+                self.attrs
+                    .iter()
+                    .cloned()
+                    .collect::<serde_json::Map<_, _>>()
+                    .into(),
+            );
+        }
+        let may_act = self.may_act();
+        if !may_act.is_empty() {
+            body.insert("may_act".into(), serde_json::json!({ "sub": may_act }));
+        }
+        Ok(Value::Object(body))
+    }
+}
+
+/// Agent ids from repeatable, comma-separated flag values, trimmed, without empties.
+fn split_agents(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 #[derive(Debug, Args)]
 pub struct ExchangeArgs {
-    /// The parent token.
-    #[arg(long, env = "ONBEHALF_TOKEN", hide_env_values = true)]
-    pub subject_token: String,
+    /// The parent token, or `-` to read it from the first line of stdin. Without this flag or
+    /// `--subject-token-file`, the `ONBEHALF_TOKEN` environment variable is used. Prefer those:
+    /// an argument is visible to other local users in `ps`.
+    #[arg(long, conflicts_with = "subject_token_file")]
+    pub subject_token: Option<String>,
+    /// Read the parent token from the first line of this file.
+    #[arg(long, value_name = "PATH")]
+    pub subject_token_file: Option<std::path::PathBuf>,
     /// The sub-agent that will hold the new token. The request authenticates as this agent.
     #[arg(long)]
     pub actor: String,
@@ -127,14 +182,10 @@ pub struct ExchangeArgs {
     #[arg(long)]
     pub client_id: Option<String>,
     /// The agent's client secret. Required by servers with `[token] require_actor_auth`
-    /// (the default). Prefer `ONBEHALF_CLIENT_SECRET`, `--client-secret-stdin` or
-    /// `--client-secret-file`: an argument is visible to other local users in `ps`.
-    #[arg(
-        long,
-        env = "ONBEHALF_CLIENT_SECRET",
-        hide_env_values = true,
-        conflicts_with_all = ["client_secret_stdin", "client_secret_file"]
-    )]
+    /// (the default). Without this flag, `--client-secret-stdin` or `--client-secret-file`,
+    /// the `ONBEHALF_CLIENT_SECRET` environment variable is used. Prefer those: an argument is
+    /// visible to other local users in `ps`.
+    #[arg(long, conflicts_with_all = ["client_secret_stdin", "client_secret_file"])]
     pub client_secret: Option<String>,
     /// Read the client secret from the first line of standard input.
     #[arg(long, conflicts_with = "client_secret_file")]
@@ -195,13 +246,7 @@ impl ExchangeArgs {
 
     /// `--may-act` values, split on commas, without empties.
     pub fn may_act(&self) -> Vec<String> {
-        self.may_act
-            .iter()
-            .flat_map(|v| v.split(','))
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect()
+        split_agents(&self.may_act)
     }
 }
 
@@ -220,11 +265,24 @@ pub struct InspectArgs {
     pub audience: Option<String>,
 }
 
+/// `--token` / `--token-file`: where the delegation token of `call`, `tools` and
+/// `authzen eval` comes from.
+#[derive(Debug, Args)]
+pub struct TokenSource {
+    /// Delegation token, or `-` to read it from the first line of stdin. Without this flag or
+    /// `--token-file`, the `ONBEHALF_TOKEN` environment variable is used. Prefer those: an
+    /// argument is visible to other local users in `ps`.
+    #[arg(long, conflicts_with = "token_file")]
+    pub token: Option<String>,
+    /// Read the delegation token from the first line of this file.
+    #[arg(long, value_name = "PATH")]
+    pub token_file: Option<std::path::PathBuf>,
+}
+
 #[derive(Debug, Args)]
 pub struct CallArgs {
-    /// Delegation token.
-    #[arg(long, env = "ONBEHALF_TOKEN", hide_env_values = true)]
-    pub token: String,
+    #[command(flatten)]
+    pub token: TokenSource,
     /// MCP upstream name, as mounted at `/mcp/<name>`.
     #[arg(long, alias = "upstream")]
     pub server: String,
@@ -238,9 +296,8 @@ pub struct CallArgs {
 
 #[derive(Debug, Args)]
 pub struct ToolsArgs {
-    /// Delegation token.
-    #[arg(long, env = "ONBEHALF_TOKEN", hide_env_values = true)]
-    pub token: String,
+    #[command(flatten)]
+    pub token: TokenSource,
     /// MCP upstream name.
     #[arg(long, alias = "upstream")]
     pub server: String,
@@ -340,9 +397,9 @@ pub enum PolicyCmd {
 pub enum AuthzenCmd {
     /// Ask the PDP whether the token's chain may make this call, without making it.
     Eval {
-        /// Delegation token, sent as the bearer.
-        #[arg(long, env = "ONBEHALF_TOKEN", hide_env_values = true)]
-        token: String,
+        /// The delegation token, sent as the bearer.
+        #[command(flatten)]
+        token: TokenSource,
         /// MCP server name.
         #[arg(long, default_value = "github")]
         server: String,
@@ -584,6 +641,88 @@ mod tests {
             a.extend_from_slice(extra);
             assert!(parse(&a).is_err(), "{extra:?}");
         }
+    }
+
+    /// SR-35: `--token` and `--subject-token` take `-` for stdin and have `--…-file` forms, which
+    /// are mutually exclusive with the flag; with neither, `ONBEHALF_TOKEN` is read at run time
+    /// (not by clap, so the environment never conflicts with a file flag).
+    #[test]
+    fn delegation_tokens_from_stdin_or_a_file() {
+        let call = |extra: &[&str]| {
+            let mut a = vec!["call", "--server", "github", "--tool", "t"];
+            a.extend_from_slice(extra);
+            parse(&a).map(|c| match c.command {
+                Command::Call(c) => c.token,
+                _ => panic!("not call"),
+            })
+        };
+        let t = call(&["--token", "-"]).unwrap();
+        assert_eq!(t.token.as_deref(), Some("-"));
+        let t = call(&["--token-file", "/run/t"]).unwrap();
+        assert!(t.token.is_none() && t.token_file.is_some());
+        let t = call(&[]).unwrap();
+        assert!(t.token.is_none() && t.token_file.is_none());
+        assert!(call(&["--token", "x", "--token-file", "/run/t"]).is_err());
+        for cmd in [
+            ["tools", "--server", "github", "--token-file", "/t"].as_slice(),
+            ["authzen", "eval", "--tool", "t", "--token-file", "/t"].as_slice(),
+        ] {
+            assert!(parse(cmd).is_ok(), "{cmd:?}");
+        }
+
+        let ex = |extra: &[&str]| {
+            let mut a = vec!["token", "exchange", "--actor", "c", "--cap", "g:t"];
+            a.extend_from_slice(extra);
+            parse(&a).map(|c| match c.command {
+                Command::Token(TokenCmd::Exchange(e)) => e,
+                _ => panic!("not exchange"),
+            })
+        };
+        assert!(ex(&[]).unwrap().subject_token.is_none());
+        assert!(ex(&["--subject-token-file", "/t"])
+            .unwrap()
+            .subject_token_file
+            .is_some());
+        assert!(ex(&["--subject-token", "J", "--subject-token-file", "/t"]).is_err());
+    }
+
+    #[test]
+    fn root_may_act_and_body() {
+        let root = |extra: &[&str]| {
+            let mut args = vec!["token", "root", "--subject", "alice", "--agent", "planner"];
+            args.extend_from_slice(extra);
+            match parse(&args).unwrap().command {
+                Command::Token(TokenCmd::Root(r)) => r,
+                _ => panic!("not root"),
+            }
+        };
+        let plain = root(&[]);
+        assert!(plain.may_act().is_empty());
+        assert_eq!(
+            plain.request_body().unwrap(),
+            serde_json::json!({"subject": "alice", "issuer": "https://idp.example", "agent": "planner"})
+        );
+        let full = root(&[
+            "--may-act",
+            "coder, reviewer",
+            "--may-act",
+            "tester",
+            "--cap",
+            "github:read_file",
+            "--ttl-seconds",
+            "60",
+            "--attr",
+            "mfa:=true",
+        ]);
+        assert_eq!(full.may_act(), ["coder", "reviewer", "tester"]);
+        let body = full.request_body().unwrap();
+        assert_eq!(
+            body["may_act"],
+            serde_json::json!({"sub": ["coder", "reviewer", "tester"]})
+        );
+        assert_eq!(body["ttl_seconds"], 60);
+        assert_eq!(body["attributes"], serde_json::json!({"mfa": true}));
+        assert_eq!(body["capabilities"].as_array().unwrap().len(), 1);
     }
 
     #[test]

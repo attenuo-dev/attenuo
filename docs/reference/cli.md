@@ -20,15 +20,23 @@ The `--server` flag of `call`, `tools` and `authzen eval` is different. It names
 
 ## Secrets
 
-The admin token and the agent client secret are never taken from the argument list by default. For each, the CLI accepts, in this order of preference: the environment variable, `--…-file PATH`, `--…-stdin`, and (with a warning on stderr) the flag itself. A value from a file or stdin is the first line, without the line ending. At most one value can come from stdin per invocation. The flags are mutually exclusive on the command line.
+Secrets are never taken from the argument list by default. That covers the admin token, the agent client secret and the delegation tokens (`--token`, `--subject-token`). For each, the CLI accepts, in this order of preference: the environment variable, `--…-file PATH`, stdin, and (with a one-line warning on stderr) the flag itself. Stdin is `--admin-token-stdin` / `--client-secret-stdin` for the first two, and the value `-` for the tokens (`--token -`, `--subject-token -`). A value from a file or stdin is the first line, without the line ending. At most one value can come from stdin per invocation. The flag, file and stdin forms are mutually exclusive on the command line; any of them overrides the environment variable.
+
+| Secret | Environment | File | Stdin |
+| --- | --- | --- | --- |
+| Admin token | `ONBEHALF_ADMIN_TOKEN` | `--admin-token-file` | `--admin-token-stdin` |
+| Client secret | `ONBEHALF_CLIENT_SECRET` | `--client-secret-file` | `--client-secret-stdin` |
+| Delegation token (`call`, `tools`, `authzen eval`) | `ONBEHALF_TOKEN` | `--token-file` | `--token -` |
+| Parent token (`token exchange`) | `ONBEHALF_TOKEN` | `--subject-token-file` | `--subject-token -` |
 
 ```sh
 export ONBEHALF_ADMIN_TOKEN=$(cat /run/secrets/onbehalf-admin)
-printf '%s\n' "$CODER_SECRET" | onbehalf token exchange --subject-token "$ROOT" --actor coder --client-secret-stdin --cap github:read_file
+printf '%s\n' "$CODER_SECRET" | ONBEHALF_TOKEN="$ROOT" onbehalf token exchange --actor coder --client-secret-stdin --cap github:read_file
 onbehalf --admin-token-file /run/secrets/onbehalf-admin lease show "$LEASE"
+printf '%s\n' "$CODER" | onbehalf call --token - --server github --tool read_file --arg repo=acme/api
 ```
 
-Delegation tokens (`--token`, `--subject-token`) expire; `ONBEHALF_TOKEN` stands in for both, and `token inspect -` reads one from stdin.
+`token inspect -` also reads a token from stdin.
 
 ## Argument forms
 
@@ -50,6 +58,7 @@ Mint a root (hop 0) token. This uses the development endpoint, so it needs the a
 | `--cap` | Capability to request. Omit to take the `[[root_grants]]` ceiling. |
 | `--ttl-seconds` | Requested lifetime. |
 | `--attr` | User attribute. Repeatable. |
+| `--may-act <AGENT>` | Only this agent may exchange the root token (RFC 8693 `may_act`). Repeatable, or comma-separated. Must be within the `[[root_grants]]` entry's `may_act` when it has one; without the flag the grant's `may_act` applies. |
 | `--print token\|lease` | Print only that value, for scripts. |
 
 ### `token exchange`
@@ -58,7 +67,8 @@ RFC 8693 exchange: delegate a subset of a token's capabilities to a sub-agent.
 
 | Option | Meaning |
 | --- | --- |
-| `--subject-token` (`ONBEHALF_TOKEN`) | The parent token. Required. |
+| `--subject-token-file PATH` | Read the parent token from the first line of a file. |
+| `--subject-token <JWT\|->` (`ONBEHALF_TOKEN`) | The parent token; `-` reads it from stdin. One of the flag, the file or `ONBEHALF_TOKEN` is required. The flag with a literal token prints a warning. |
 | `--actor` | The sub-agent that will hold the new token. Required. |
 | `--client-secret-stdin` | Read the agent's client secret from the first line of standard input. |
 | `--client-secret-file PATH` | Read it from the first line of a file. |
@@ -72,7 +82,7 @@ RFC 8693 exchange: delegate a subset of a token's capabilities to a sub-agent.
 | `--print token\|lease` | Print only that value. |
 
 ```sh
-onbehalf token exchange --subject-token "$PARENT" --actor coder \
+ONBEHALF_TOKEN="$PARENT" onbehalf token exchange --actor coder \
   --cap github:read_file --actor-token-file /run/spiffe/coder.jwt --may-act reviewer
 ```
 
@@ -92,14 +102,15 @@ Call a tool through the proxy (`tools/call`).
 
 | Option | Meaning |
 | --- | --- |
-| `--token` (`ONBEHALF_TOKEN`) | Delegation token. Required. |
+| `--token <JWT\|->` (`ONBEHALF_TOKEN`) | Delegation token; `-` reads it from stdin. One of the flag, `--token-file` or `ONBEHALF_TOKEN` is required. The flag with a literal token prints a warning. |
+| `--token-file PATH` | Read the delegation token from the first line of a file. |
 | `--server`, `--upstream` | MCP upstream name. Required. |
 | `--tool` | Tool name. Required. |
 | `--arg` | Tool argument. Repeatable. |
 
 ### `tools`
 
-List the tools the token may see (`tools/list`). Takes `--token` and `--server`.
+List the tools the token may see (`tools/list`). Takes `--token` (or `--token-file`, or `ONBEHALF_TOKEN`) and `--server`.
 
 ### `lease revoke <ID> [--reason TEXT]`
 
@@ -164,7 +175,7 @@ Ask the decision endpoint whether the token's chain may make a call, without mak
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--token` (`ONBEHALF_TOKEN`) | | Delegation token, sent as the bearer. Required. |
+| `--token <JWT\|->` (`ONBEHALF_TOKEN`) | | Delegation token, sent as the bearer; `-` reads it from stdin. Or `--token-file PATH`. |
 | `--server` | `github` | MCP server name. |
 | `--tool` | | Tool name. Required. |
 | `--arg` | | Tool argument. Repeatable. |

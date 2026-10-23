@@ -349,3 +349,83 @@ async fn session_ids_are_bound_to_the_principal() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// SR-17: a `502` used to carry the `reqwest` error, which names the internal upstream URL.
+/// Now the client gets the reason code `upstream_unreachable` and nothing else.
+#[tokio::test]
+async fn unreachable_upstream_is_a_reason_code_without_the_internal_url() -> anyhow::Result<()> {
+    // Port 9 (discard) is not listening; the path stands in for an internal address.
+    let proxy = proxy_for("http://127.0.0.1:9/internal-only-path".into()).await?;
+    let resp = post_raw(
+        &proxy,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
+    )
+    .await?;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let text = resp.text().await?;
+    let body: Value = serde_json::from_str(&text)?;
+    assert_eq!(
+        body["error"]["data"]["reason"], "upstream_unreachable",
+        "{text}"
+    );
+    assert_eq!(body["error"]["message"], "onbehalf: upstream unreachable");
+    assert!(
+        !text.contains("127.0.0.1") && !text.contains("internal-only-path"),
+        "{text}"
+    );
+    Ok(())
+}
+
+/// A `MakeWriter` that appends every log line to a shared buffer.
+#[derive(Clone, Default)]
+struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// SR-18: caller-controlled strings (tool name, method, subject, agent) were logged with
+/// `Display`, so a newline in a tool name started a forged log line. They are Debug-formatted
+/// now: each event is one line, and the newline shows up escaped.
+// One thread, so the proxy and the client run where the thread-local subscriber is set.
+#[tokio::test(flavor = "current_thread")]
+async fn newlines_in_caller_strings_do_not_forge_log_lines() -> anyhow::Result<()> {
+    let logs = LogBuf::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let upstream = RawUpstream::default();
+    let up = spawn_router(upstream.router(json_ok)).await?;
+    let proxy = proxy_for(up.url("/mcp")).await?;
+    // A tool name with a newline (refused as an invalid name, and logged) and an unknown method
+    // with one (decided like a call, and logged with its name).
+    for body in [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+               "params": {"name": "read_x\nFORGED level=INFO tool allowed", "arguments": {}}}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "x/y\nFORGED level=INFO method", "params": {}}),
+    ] {
+        let resp = post_raw(&proxy, &body.to_string()).await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    let text = String::from_utf8(logs.0.lock().unwrap().clone())?;
+    assert!(
+        text.contains(r"\nFORGED"),
+        "the newline is logged escaped:\n{text}"
+    );
+    for line in text.lines() {
+        assert!(!line.starts_with("FORGED"), "forged log line:\n{text}");
+    }
+    Ok(())
+}

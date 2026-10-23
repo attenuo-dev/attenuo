@@ -1,6 +1,7 @@
 //! Actor authentication with an RFC 8693 `actor_token`: a workload-identity JWT (a SPIFFE
 //! JWT-SVID, or any JWT from an issuer with a JWKS) that proves which agent is calling
-//! `POST /token` for an exchange (hop n to n+1).
+//! `POST /token`, for an exchange (hop n to n+1) or for hop 0 (IdP intake,
+//! [`crate::idp::intake`]).
 //!
 //! Trusted issuers are the `[[actor_trust]]` entries ([`ActorTrustConfig`]). Keys come from
 //! the entry's `jwks_url`, or for a SPIFFE trust domain from its bundle endpoint
@@ -24,8 +25,8 @@
 //!    domain entry).
 //! 5. `sub` is mapped to an agent id by `subject_to_agent`.
 //!
-//! The caller then checks that the agent equals the exchange's `actor`, uses the token once
-//! ([`VerifiedActor::replay_key`]) and caps the child token's expiry at the actor token's `exp`.
+//! The caller then checks that the agent equals the request's `actor`, uses the token once
+//! ([`VerifiedActor::replay_key`]) and caps the new token's expiry at the actor token's `exp`.
 //!
 //! Every rejection is `400 invalid_request` (RFC 8693 §2.2.2) with a stable `error_description`
 //! sub-code starting `actor_token_`, except `jwks_unavailable` (`503 temporarily_unavailable`).
@@ -113,11 +114,16 @@ impl From<ActorTokenError> for ApiError {
     fn from(e: ActorTokenError) -> Self {
         let d = e.description();
         match e {
-            ActorTokenError::JwksUnavailable(_) => ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "temporarily_unavailable",
-                e.to_string(),
-            ),
+            // The fetch error names the JWKS URL and the transport failure: log it, do not
+            // return it (SR-17).
+            ActorTokenError::JwksUnavailable(detail) => {
+                tracing::warn!(detail = ?detail, "actor token issuer JWKS unavailable");
+                ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "temporarily_unavailable",
+                    "the actor token issuer's keys cannot be fetched; try again later",
+                )
+            }
             _ => ApiError::bad_request("invalid_request", e.to_string()),
         }
         .with_description(d)

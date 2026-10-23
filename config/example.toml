@@ -7,8 +7,10 @@
 
 [server]
 listen = "127.0.0.1:8080"
-# Externally visible base URL, used in /.well-known/authzen-configuration.
-# Defaults to http://<Host header>.
+# Externally visible base URL: the only source of the URLs in
+# /.well-known/authzen-configuration. Required when `listen` is not a loopback address (the
+# server refuses to start without it). On loopback it may stay unset: discovery then uses
+# http://<Host>, and only a Host of localhost, 127.0.0.1 or [::1] is accepted (400 otherwise).
 # public_url = "https://onbehalf.example.com"
 
 [issuer]
@@ -127,13 +129,14 @@ secret_sha256 = "c0a83cbb212848e0615711bb006be7edb88db29def8c4dae01c7465c6f64e99
 # Require the caller of an exchange to authenticate as its `actor`. Setting this to false makes
 # `actor` an unverified assertion again; the server warns at startup.
 require_actor_auth = true
-# Which credentials authenticate the actor: "secret" ([[agents]] credentials, HTTP Basic or
-# client_id/client_secret), "actor_token" (an RFC 8693 actor_token from an [[actor_trust]]
-# issuer, e.g. a SPIFFE JWT-SVID) or "either". When both are sent, both are checked.
+# Which credentials authenticate the actor of an exchange and the agent at hop 0 (IdP intake):
+# "secret" ([[agents]] credentials, HTTP Basic or client_id/client_secret), "actor_token" (an
+# RFC 8693 actor_token from an [[actor_trust]] issuer, e.g. a SPIFFE JWT-SVID) or "either".
+# When both are sent, both are checked.
 actor_auth = "either"
 
-# Workload identities accepted as `actor_token` on an exchange. Each actor token works for one
-# exchange, and the child token never outlives it. A SPIFFE trust domain, keys from the SPIRE
+# Workload identities accepted as `actor_token` on an exchange or at hop 0. Each actor token
+# works for one request, and the token it obtains never outlives it. A SPIFFE trust domain, keys from the SPIRE
 # server's bundle endpoint (given explicitly, never discovered):
 # [[actor_trust]]
 # spiffe_trust_domain = "example.org"
@@ -169,6 +172,10 @@ allow_unsigned_chain = false
 # Most evaluations one POST /access/v1/evaluations may carry. Larger requests get 400
 # batch_too_large before anything is decided or audited.
 max_batch = 64
+# Who gets context.diagnostics (effective capabilities, lease ids, Cedar errors) in
+# evaluation responses: "peps" (callers authenticated as a [[peps]] entry; with a bearer
+# token, by pep_id/pep_secret in the body), "always" or "never". Others get an empty list.
+diagnostics = "peps"
 
 # Policy enforcement points for allow_unsigned_chain, same shape as [[agents]].
 # [[peps]]

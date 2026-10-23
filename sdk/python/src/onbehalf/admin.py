@@ -7,7 +7,7 @@ token out of agents: it can revoke anything and read every decision.
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterable, Iterator
 from dataclasses import dataclass, field
 from types import TracebackType
 from typing import Any
@@ -110,6 +110,7 @@ def _root_body(
     capabilities: Any,
     ttl_seconds: int | None,
     attributes: dict[str, Any] | None,
+    may_act: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {"subject": subject, "issuer": issuer, "agent": agent}
     if capabilities is not None:
@@ -118,6 +119,8 @@ def _root_body(
         body["ttl_seconds"] = int(ttl_seconds)
     if attributes:
         body["attributes"] = attributes
+    if may_act is not None:
+        body["may_act"] = w.may_act_json(may_act)
     return body
 
 
@@ -249,9 +252,15 @@ class AdminClient:
         capabilities: list[CapabilityLike] | CapabilityLike | None = None,
         ttl_seconds: int | None = None,
         attributes: dict[str, Any] | None = None,
+        *,
+        may_act: Iterable[str] | None = None,
     ) -> Token:
-        """**Development only.** Mint a root token for an asserted, unverified user."""
-        body = _root_body(subject, issuer, agent, capabilities, ttl_seconds, attributes)
+        """**Development only.** Mint a root token for an asserted, unverified user.
+
+        ``may_act`` lists the agents allowed to exchange the root token next (RFC 8693 §4.4); it
+        must be within the ``[[root_grants]]`` entry's ``may_act`` when that has one.
+        """
+        body = _root_body(subject, issuer, agent, capabilities, ttl_seconds, attributes, may_act)
         return w.token_from_response(w.json_body(self._http.post("/admin/root-token", json=body)))
 
 
@@ -367,7 +376,9 @@ class AsyncAdminClient:
         capabilities: list[CapabilityLike] | CapabilityLike | None = None,
         ttl_seconds: int | None = None,
         attributes: dict[str, Any] | None = None,
+        *,
+        may_act: Iterable[str] | None = None,
     ) -> Token:
-        body = _root_body(subject, issuer, agent, capabilities, ttl_seconds, attributes)
+        body = _root_body(subject, issuer, agent, capabilities, ttl_seconds, attributes, may_act)
         resp = await self._http.post("/admin/root-token", json=body)
         return w.token_from_response(w.json_body(resp))

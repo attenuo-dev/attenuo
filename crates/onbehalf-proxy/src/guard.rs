@@ -28,7 +28,7 @@ use crate::auth::{AuthError, Authorizer};
 use crate::jsonrpc::{error_response, CODE_UNAUTHORIZED};
 
 /// Reason given when a stream is ended because a hop of the token's chain expired.
-pub const REASON_TOKEN_EXPIRED: &str = "token_expired";
+pub use crate::auth::REASON_TOKEN_EXPIRED;
 
 /// What a stream is re-checked against, and how often.
 #[derive(Clone)]
@@ -59,6 +59,7 @@ impl StreamGuard {
         match self.authorizer.check_active(&self.chain, now).await {
             Ok(()) => Ok(()),
             Err(AuthError::LeaseInactive(reason)) => Err(reason),
+            Err(AuthError::TokenExpired) => Err(REASON_TOKEN_EXPIRED.to_owned()),
             Err(AuthError::MissingToken | AuthError::InvalidToken(_)) => {
                 Err("unauthorized".to_owned())
             }
@@ -121,8 +122,8 @@ where
                         continue;
                     };
                     tracing::warn!(
-                        reason = %reason,
-                        subject = %st.guard.chain.originating_user.subject,
+                        reason = ?reason,
+                        subject = ?st.guard.chain.originating_user.subject,
                         "ending response stream: re-check failed"
                     );
                     st.done = true;

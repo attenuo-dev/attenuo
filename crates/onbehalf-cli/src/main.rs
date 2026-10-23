@@ -72,6 +72,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
         cli.admin_token.clone(),
         cli.admin_token_stdin,
         cli.admin_token_file.as_deref(),
+        secrets::ADMIN_TOKEN_ENV,
         &mut stdin,
     )?;
     let client = Client::new(&cli.server, admin_token);
@@ -79,33 +80,23 @@ async fn run(cli: Cli) -> Result<Outcome> {
         Command::Token(TokenCmd::Inspect(args)) => inspect(client.ok(), args, json).await,
         Command::Token(TokenCmd::Root(a)) => {
             let client = client?;
-            let mut body = Map::new();
-            body.insert("subject".into(), a.subject.into());
-            body.insert("issuer".into(), a.issuer.into());
-            body.insert("agent".into(), a.agent.into());
-            if !a.caps.is_empty() {
-                body.insert("capabilities".into(), cli::parse_caps(&a.caps)?.into());
-            }
-            if let Some(ttl) = a.ttl_seconds {
-                body.insert("ttl_seconds".into(), ttl.into());
-            }
-            if !a.attrs.is_empty() {
-                body.insert(
-                    "attributes".into(),
-                    a.attrs.into_iter().collect::<Map<_, _>>().into(),
-                );
-            }
             let resp = client
-                .admin_post("/admin/root-token", &Value::Object(body))
+                .admin_post("/admin/root-token", &a.request_body()?)
                 .await?;
             print_token(&resp, a.print, json);
             Ok(Outcome::Ok)
         }
         Command::Token(TokenCmd::Exchange(a)) => {
             let client = client?;
+            let subject_token = secrets::resolve_token(
+                "--subject-token",
+                a.subject_token.clone(),
+                a.subject_token_file.as_deref(),
+                &mut stdin,
+            )?;
             let mut body = json!({
                 "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
-                "subject_token": a.subject_token,
+                "subject_token": subject_token,
                 "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
                 "actor": a.actor,
                 "authorization_details": [{
@@ -115,6 +106,10 @@ async fn run(cli: Cli) -> Result<Outcome> {
             });
             if let Some(ttl) = a.ttl_seconds {
                 body["requested_ttl_seconds"] = ttl.into();
+            }
+            if a.actor_token.as_deref() == Some("-") {
+                // Only one value can come from stdin.
+                stdin.claim("actor token")?;
             }
             if let Some(token) = a.actor_token(std::io::stdin())? {
                 body["actor_token"] = token.into();
@@ -129,6 +124,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 a.client_secret,
                 a.client_secret_stdin,
                 a.client_secret_file.as_deref(),
+                secrets::CLIENT_SECRET_ENV,
                 &mut stdin,
             )?;
             if let Some(secret) = secret {
@@ -140,10 +136,17 @@ async fn run(cli: Cli) -> Result<Outcome> {
             Ok(Outcome::Ok)
         }
         Command::Call(a) => {
+            let client = client?;
+            let token = secrets::resolve_token(
+                "--token",
+                a.token.token,
+                a.token.token_file.as_deref(),
+                &mut stdin,
+            )?;
             let args: Map<String, Value> = a.args.into_iter().collect();
-            let resp = client?
+            let resp = client
                 .mcp(
-                    &a.token,
+                    &token,
                     &a.server,
                     "tools/call",
                     json!({"name": a.tool, "arguments": args}),
@@ -152,8 +155,15 @@ async fn run(cli: Cli) -> Result<Outcome> {
             Ok(print_call(&resp, json))
         }
         Command::Tools(a) => {
-            let resp = client?
-                .mcp(&a.token, &a.server, "tools/list", json!({}))
+            let client = client?;
+            let token = secrets::resolve_token(
+                "--token",
+                a.token.token,
+                a.token.token_file.as_deref(),
+                &mut stdin,
+            )?;
+            let resp = client
+                .mcp(&token, &a.server, "tools/list", json!({}))
                 .await?;
             Ok(print_tools(&resp, json))
         }
@@ -266,7 +276,14 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 "resource": {"type": "tool", "id": format!("{server}/{tool}")},
                 "context": {"input": input},
             });
-            let resp = client?.authzen(&token, &req).await?;
+            let client = client?;
+            let token = secrets::resolve_token(
+                "--token",
+                token.token,
+                token.token_file.as_deref(),
+                &mut stdin,
+            )?;
+            let resp = client.authzen(&token, &req).await?;
             let allow = resp["decision"] == true;
             if json {
                 print_json(&resp);

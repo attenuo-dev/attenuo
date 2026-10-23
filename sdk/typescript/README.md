@@ -63,7 +63,7 @@ console.log(await admin.auditVerify()); // { ok: true, entries: ..., firstBadSeq
 | Call                                                                                                        | Does                                                                                                                                                                                                                                                                                                                                                                  |
 | ----------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `new OnbehalfClient(serverUrl, { token?, fetch?, headers?, timeoutMs? })`                                   | HTTP client for the server. `token` is a default bearer; `fetch` swaps the transport (tests, proxies, custom TLS). Timeout defaults to 30 s.                                                                                                                                                                                                                          |
-| `exchange(subjectToken, actor, capabilities, { ttlSeconds?, clientId?, clientSecret?, subjectTokenType? })` | RFC 8693 exchange. Returns a `Token`. Every hop n+1 exchange authenticates as its actor: pass the actor's `[[agents]]` secret as `clientSecret` (`clientId` defaults to `actor`). With an IdP credential as the subject and both `clientId` and `clientSecret`, it is a hop-0 exchange (`subjectTokenType: "urn:ietf:params:oauth:token-type:id-jag"` for an ID-JAG). |
+| `exchange(subjectToken, actor, capabilities, { ttlSeconds?, clientId?, clientSecret?, subjectTokenType?, actorToken?, mayAct? })` | RFC 8693 exchange. Returns a `Token`. Every hop n+1 exchange authenticates as its actor: pass the actor's `[[agents]]` secret as `clientSecret` (`clientId` defaults to `actor`). With an IdP credential as the subject and both `clientId` and `clientSecret`, it is a hop-0 exchange (`subjectTokenType: "urn:ietf:params:oauth:token-type:id-jag"` for an ID-JAG). `actorToken` (a workload-identity JWT such as a SPIFFE JWT-SVID from an `[[actor_trust]]` issuer) authenticates the actor instead of a secret, depending on `[token] actor_auth`; each one works for one exchange. `mayAct` lists the agents allowed to exchange the new token next. |
 | `renew(token?)`                                                                                             | `POST /token/renew`. Returns `{ lease, expiresAt, expiresIn }`.                                                                                                                                                                                                                                                                                                       |
 | `callTool(token, server, tool, args?, { sessionId? })`                                                      | `tools/call` through `/mcp/{server}`. Returns `{ text, content, isError, decisionId, structuredContent, raw }`. Throws `DeniedError` when refused.                                                                                                                                                                                                                    |
 | `listTools(token, server)`                                                                                  | `tools/list`, filtered by the proxy to what the token may call.                                                                                                                                                                                                                                                                                                       |
@@ -89,6 +89,24 @@ capability("github", "list_issues", { state: "open" }); // a bare value means eq
 ```
 
 Capabilities serialize as the server expects: `{ server, tool, constraints: { repo: { op: "prefix", value: "..." } } }`, with `constraints` omitted when empty. `exchange` and `mintRootDev` also take `"server:tool"` strings (comma-separated lists too, like the CLI's `--cap`) and raw objects.
+
+### Workload identity and `mayAct`
+
+An agent can authenticate with a workload-identity JWT instead of a client secret: an RFC 8693 `actor_token` from an `[[actor_trust]]` issuer, such as a SPIFFE JWT-SVID. It works at hop 0 (with the user's ID token or ID-JAG as the subject token) and on every exchange. Each actor token authenticates one request, and the token it obtains never outlives it.
+
+```ts
+const svid = await readFile("/run/spire/svid.jwt", "utf8"); // aud = the server
+const root = await ob.exchange(idToken, "planner", ["github:*"], { actorToken: svid });
+```
+
+`mayAct` limits who may exchange a token next (RFC 8693 §4.4). Pass it when exchanging, or when minting a dev root:
+
+```ts
+await ob.exchange(root, "coder", ["github:read_file"], { clientSecret, mayAct: ["reviewer"] });
+await admin.mintRootDev("alice", "https://idp.example", "planner", { mayAct: ["coder"] });
+```
+
+`mayAct` is a list of agent ids (a bare string is a `TypeError`); `[]` means nobody may exchange the token. For a root it must be within the `[[root_grants]]` entry's `may_act` when that has one.
 
 ### Errors
 

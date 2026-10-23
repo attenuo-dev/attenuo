@@ -8,7 +8,9 @@
 //!   parent's `jti` and the actor, and the entry lives until the parent's `exp`. A parent can
 //!   still delegate to any number of different agents; re-delegating to the same agent needs a
 //!   new parent token. Renewal (`POST /token/renew`) is the way to keep a child alive.
-//! - **Actor token.** An `actor_token` authenticates one exchange. The key is the
+//! - **Actor token.** An `actor_token` authenticates one request: an exchange, or a hop-0
+//!   intake (where it is recorded together with the IdP credential, so a request refused for
+//!   one does not use up the other). The key is the
 //!   `[[actor_trust]]` entry and the token's `jti`, or the SHA-256 of its signing input when it
 //!   has none; the entry lives until its `exp` plus the entry's clock skew.
 //!
@@ -60,10 +62,18 @@ impl ReplayCache {
         expires_at: i64,
         now: OffsetDateTime,
     ) -> Result<(), ApiError> {
+        self.use_all_once(&[(key, expires_at)], now)
+    }
+
+    /// [`ReplayCache::use_once`] for several keys at once: either every key is recorded, or
+    /// none is (so a request refused for one credential does not use up the others).
+    pub fn use_all_once(&self, keys: &[(&str, i64)], now: OffsetDateTime) -> Result<(), ApiError> {
         let now = now.unix_timestamp();
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&exp) = entries.get(key) {
-            if exp > now {
+        for (i, (key, _)) in keys.iter().enumerate() {
+            let live = entries.get(*key).is_some_and(|&exp| exp > now);
+            // The same key twice in one request is a replay as well.
+            if live || keys[..i].iter().any(|(k, _)| k == key) {
                 return Err(ApiError::bad_request(
                     "invalid_grant",
                     "this credential was already used; present a fresh one",
@@ -71,9 +81,14 @@ impl ReplayCache {
                 .with_description("replayed"));
             }
         }
-        if entries.len() >= self.capacity && !entries.contains_key(key) {
+        let new = |entries: &HashMap<String, i64>| {
+            keys.iter()
+                .filter(|(k, _)| !entries.contains_key(*k))
+                .count()
+        };
+        if entries.len() + new(&entries) > self.capacity {
             entries.retain(|_, exp| *exp > now);
-            if entries.len() >= self.capacity {
+            if entries.len() + new(&entries) > self.capacity {
                 tracing::error!(
                     capacity = self.capacity,
                     "replay cache full of live entries; refusing issuance"
@@ -86,7 +101,9 @@ impl ReplayCache {
                 .with_description("replay_cache_full"));
             }
         }
-        entries.insert(key.to_owned(), expires_at);
+        for (key, expires_at) in keys {
+            entries.insert((*key).to_owned(), *expires_at);
+        }
         Ok(())
     }
 
@@ -132,5 +149,32 @@ mod tests {
             c.use_once("b", 1_100, later).unwrap_err().description,
             Some("replayed")
         );
+    }
+
+    #[test]
+    fn several_keys_are_used_together_or_not_at_all() {
+        let c = ReplayCache::new(3);
+        let t = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+        c.use_once("used", 1_100, t).unwrap();
+        // One key replayed: the other is not recorded.
+        let e = c
+            .use_all_once(&[("fresh", 1_100), ("used", 1_100)], t)
+            .unwrap_err();
+        assert_eq!(e.description, Some("replayed"));
+        assert_eq!(c.len(), 1);
+        // The same key twice in one call is a replay.
+        let e = c
+            .use_all_once(&[("dup", 1_100), ("dup", 1_100)], t)
+            .unwrap_err();
+        assert_eq!(e.description, Some("replayed"));
+        // Two keys that do not both fit: neither is recorded.
+        c.use_once("b", 1_100, t).unwrap();
+        let e = c
+            .use_all_once(&[("x", 1_100), ("y", 1_100)], t)
+            .unwrap_err();
+        assert_eq!(e.description, Some("replay_cache_full"));
+        assert_eq!(c.len(), 2);
+        c.use_all_once(&[("x", 1_100)], t).unwrap();
+        assert_eq!(c.len(), 3);
     }
 }

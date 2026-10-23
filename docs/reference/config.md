@@ -9,7 +9,9 @@ The annotated source of truth is [config/example.toml](https://github.com/7Mudit
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `listen` | `127.0.0.1:8080` | Address to bind. |
-| `public_url` | from the `Host` header | Externally visible base URL, used in `/.well-known/authzen-configuration`. |
+| `public_url` | none | Externally visible base URL (`https://onbehalf.example.com`), the only source of the URLs in `/.well-known/authzen-configuration`. **Required** when `listen` is not a loopback address: the server refuses to start without it. On loopback it may be left out; discovery then uses `http://<Host>` and answers 400 `invalid_host` unless `Host` is `localhost`, `127.0.0.1` or `[::1]` (with an optional port). Must be `http(s)://host[:port][/path]`, without query or fragment. |
+
+The names reserved for the server's own audit records are refused at start: `onbehalf` as a server name (`[[upstreams]]`, the catalog, `[[root_grants]]` capabilities) and as an agent id (`[[agents]]`, `[[peps]]`, `[[root_grants]] agent`). User subjects starting with `urn:onbehalf:` are refused at IdP intake and by the dev root mint; admin actions are audited as `urn:onbehalf:admin`.
 
 ## `[issuer]`
 
@@ -66,6 +68,7 @@ Checkpoints are signed with the issuer key and verified against the JWKS; see [A
 | --- | --- | --- |
 | `allow_unsigned_chain` | `false` | Accept `subject.properties.chain` without a bearer token from an authenticated `[[peps]]` entry. Every hop must match what the server issued. |
 | `max_batch` | 64 | Most evaluations one `POST /access/v1/evaluations` may carry. More is refused with 400 `batch_too_large` before anything is decided or audited. Must be at least 1. |
+| `diagnostics` | `"peps"` | Who gets `context.diagnostics` (the effective capabilities a call fell outside, lease ids, Cedar errors): `"peps"` only callers that authenticated as a `[[peps]]` entry (with a bearer token, by `pep_id` and `pep_secret` in the body), `"always"` every caller, `"never"` nobody. Others get an empty list; `reason`, `policy_ids` and `decision_id` are always returned. |
 
 ## `[token]`
 

@@ -43,15 +43,42 @@ impl AuthDecision {
 }
 
 /// Why a request could not be authenticated.
+///
+/// Only [`AuthError::reason`], a stable code, is sent to the client; the `Display` text (which
+/// can name the verifier's exact complaint, such as a wrong audience or an unknown `kid`) is
+/// logged at debug level and never returned (SR-17).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AuthError {
     #[error("missing bearer token")]
     MissingToken,
+    /// The token verified but has expired.
+    #[error("token has expired")]
+    TokenExpired,
     #[error("invalid token: {0}")]
     InvalidToken(String),
-    /// The token is valid but a lease in its chain is revoked, expired or unknown.
+    /// The token is valid but a lease in its chain is revoked, expired or unknown. The string
+    /// is a reason code (`lease_revoked`, `lease_expired`, `lease_unknown`, `lease_error`).
     #[error("lease inactive: {0}")]
     LeaseInactive(String),
+}
+
+/// Reason code of [`AuthError::MissingToken`].
+pub const REASON_MISSING_TOKEN: &str = "missing_token";
+/// Reason code of [`AuthError::InvalidToken`].
+pub const REASON_INVALID_TOKEN: &str = "invalid_token";
+/// Reason code of [`AuthError::TokenExpired`].
+pub const REASON_TOKEN_EXPIRED: &str = "token_expired";
+
+impl AuthError {
+    /// The stable reason code sent to the client (JSON-RPC `error.data.reason`).
+    pub fn reason(&self) -> &str {
+        match self {
+            AuthError::MissingToken => REASON_MISSING_TOKEN,
+            AuthError::TokenExpired => REASON_TOKEN_EXPIRED,
+            AuthError::InvalidToken(_) => REASON_INVALID_TOKEN,
+            AuthError::LeaseInactive(reason) => reason,
+        }
+    }
 }
 
 /// Authentication and authorization, as the proxy sees it.

@@ -1,7 +1,8 @@
 //! JWT claim set of a delegation token.
 
-use onbehalf_core::{DelegationChain, OriginatingUser};
+use onbehalf_core::{AgentId, CapabilitySet, DelegationChain, Hop, LeaseId, OriginatingUser};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 /// Value of the JWT header `typ` and of the `typ` claim. Verifiers reject anything else, so a
 /// delegation token can never be confused with an ordinary access token for the same audience.
@@ -9,6 +10,13 @@ pub const TOKEN_TYPE: &str = "onbehalf+jwt";
 
 /// RFC 8693 §3 token type identifier for the tokens this crate issues and accepts.
 pub const JWT_TOKEN_TYPE_URN: &str = "urn:ietf:params:oauth:token-type:jwt";
+
+/// The only `ou_sig` construction verifiers accept (the `ou_sig_v` claim). Version 1, a bare
+/// signature over the user block, is refused (SR-14).
+pub const OU_SIG_VERSION: u32 = 2;
+
+/// Domain-separation context of an `ou_sig` v2 signature (see [`ou_sig_payload`]).
+pub const OU_SIG_CONTEXT: &str = "onbehalf-ou-v2";
 
 /// The `act` (actor) claim, nested as in RFC 8693 §4.1.
 ///
@@ -68,15 +76,24 @@ pub struct Claims {
     pub chain: DelegationChain,
     /// Always [`TOKEN_TYPE`].
     pub typ: String,
-    /// Detached issuer signature over the canonical JSON of `chain.originating_user`, base64url.
+    /// Detached issuer signature binding the originating user to this chain's issuer and root
+    /// hop, base64url (construction version `ou_sig_v`, see [`ou_sig_payload`]).
     ///
     /// It is produced once, at root issuance, and copied unchanged through every exchange. A
-    /// verifier recomputes the canonical encoding and checks the signature, so an exchanged token
-    /// whose user block was edited fails even if its outer JWT signature is valid under a
-    /// different legitimate issuer key (multi-issuer deployments). In v0 both signatures use the
-    /// same key; the separate field keeps the user block independently verifiable when that
-    /// changes.
+    /// verifier recomputes the signed bytes from `iss`, `chain.originating_user` and
+    /// `chain.hops[0]` and checks the signature under the key named by `ou_kid`, so an
+    /// exchanged token whose user block or root hop was edited fails even if its outer JWT
+    /// signature is valid under another trusted key (rotation, multi-issuer), and a signature
+    /// lifted from one chain does not verify in a chain with another root hop or issuer.
     pub ou_sig: String,
+    /// Version of the `ou_sig` construction. Verifiers accept only [`OU_SIG_VERSION`]; a token
+    /// without this claim (version 1) is refused with [`crate::TokenError::UnsupportedOuSig`].
+    #[serde(default)]
+    pub ou_sig_v: u32,
+    /// `kid` of the key that made `ou_sig`. It can differ from the JWT header `kid` when the
+    /// root was minted before a key rotation and the token after it.
+    #[serde(default)]
+    pub ou_kid: String,
     /// RFC 8693 §4.4 `may_act`: the agents allowed to act on this token in the next exchange.
     ///
     /// When present, [`crate::Issuer::exchange`] refuses an `actor` that is not listed
@@ -171,6 +188,55 @@ pub fn canonical_user_bytes(user: &OriginatingUser) -> Vec<u8> {
     serde_json::to_vec(user).expect("OriginatingUser serializes")
 }
 
+/// The hop-0 fields `ou_sig` covers. `expires_at` is left out on purpose: it is already
+/// bounded by the outer token's `exp` and every hop's expiry check, and the user signs for who
+/// acts first, with what, from when, under which lease.
+#[derive(Serialize)]
+struct RootHopView<'a> {
+    agent: &'a AgentId,
+    capabilities: &'a CapabilitySet,
+    #[serde(with = "time::serde::rfc3339")]
+    issued_at: OffsetDateTime,
+    lease: &'a LeaseId,
+}
+
+fn push_field(out: &mut Vec<u8>, field: &[u8]) {
+    let len = u32::try_from(field.len()).expect("ou_sig field shorter than 4 GiB");
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(field);
+}
+
+/// The payload `ou_sig` v2 signs, before domain separation.
+///
+/// It is three length-prefixed fields (`u32` big-endian length, then the bytes): `iss`, the
+/// canonical JSON of the originating user ([`canonical_user_bytes`]) and the canonical JSON of
+/// hop 0 restricted to `agent`, `capabilities`, `issued_at` and `lease`. The issuer signs
+/// `len(OU_SIG_CONTEXT) || OU_SIG_CONTEXT || payload` (the framing of
+/// [`crate::detached`]) with Ed25519, so the signature is bound to the issuer and to this
+/// chain's root hop, and cannot be confused with a token signature or another detached
+/// signature.
+pub fn ou_sig_payload(iss: &str, user: &OriginatingUser, root: &Hop) -> Vec<u8> {
+    let user = canonical_user_bytes(user);
+    let hop = serde_json::to_vec(&RootHopView {
+        agent: &root.agent,
+        capabilities: &root.capabilities,
+        issued_at: root.issued_at,
+        lease: &root.lease,
+    })
+    .expect("hop serializes");
+    let mut out = Vec::with_capacity(12 + iss.len() + user.len() + hop.len());
+    push_field(&mut out, iss.as_bytes());
+    push_field(&mut out, &user);
+    push_field(&mut out, &hop);
+    out
+}
+
+/// The exact bytes an `ou_sig` v2 signature is made over: [`ou_sig_payload`] framed under
+/// [`OU_SIG_CONTEXT`].
+pub fn ou_sig_message(iss: &str, user: &OriginatingUser, root: &Hop) -> Vec<u8> {
+    crate::detached::frame(OU_SIG_CONTEXT, &ou_sig_payload(iss, user, root))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +262,48 @@ mod tests {
         assert!(MayAct::new(["a"]).is_within(&m) && !m.is_within(&MayAct::new(["a"])));
         assert!(serde_json::from_value::<MayAct>(json!({"sub": [""]})).is_err());
         assert!(serde_json::from_value::<MayAct>(json!({"sub": 3})).is_err());
+    }
+
+    #[test]
+    fn ou_sig_payload_is_length_prefixed_and_covers_each_part() {
+        use onbehalf_core::Capability;
+        use time::macros::datetime;
+        let user = OriginatingUser {
+            subject: "u".into(),
+            issuer: "https://idp".into(),
+            authenticated_at: datetime!(2026-10-23 10:00 UTC),
+            attributes: Default::default(),
+        };
+        let hop = Hop {
+            agent: AgentId::new("a"),
+            capabilities: CapabilitySet::from_iter([Capability::new("s", "t")]),
+            issued_at: datetime!(2026-10-23 10:01 UTC),
+            expires_at: datetime!(2026-10-23 10:11 UTC),
+            lease: LeaseId::new("l"),
+        };
+        let base = ou_sig_payload("iss", &user, &hop);
+        assert_eq!(&base[..7], b"\0\0\0\x03iss");
+        let msg = ou_sig_message("iss", &user, &hop);
+        assert!(msg.starts_with(b"\0\0\0\x0eonbehalf-ou-v2"));
+        assert!(msg.ends_with(&base));
+        // Every covered field changes the payload; `expires_at` does not.
+        let mut later = hop.clone();
+        later.expires_at = datetime!(2026-10-23 10:12 UTC);
+        assert_eq!(ou_sig_payload("iss", &user, &later), base);
+        assert_ne!(ou_sig_payload("isS", &user, &hop), base);
+        let edits: [fn(&mut Hop); 4] = [
+            |h| h.agent = AgentId::new("b"),
+            |h| h.capabilities = CapabilitySet::from_iter([Capability::new("s", "*")]),
+            |h| h.issued_at = datetime!(2026-10-23 10:02 UTC),
+            |h| h.lease = LeaseId::new("m"),
+        ];
+        for edit in edits {
+            let mut h = hop.clone();
+            edit(&mut h);
+            assert_ne!(ou_sig_payload("iss", &user, &h), base);
+        }
+        let mut u = user.clone();
+        u.subject = "v".into();
+        assert_ne!(ou_sig_payload("iss", &u, &hop), base);
     }
 }

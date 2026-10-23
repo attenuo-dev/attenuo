@@ -10,7 +10,7 @@ onbehalf is pre-alpha. Do not treat this guide as a statement that it is ready f
 - **SQLite only.** The audit log and the lease registry live in the same SQLite file. Access is serialised behind a mutex, and the calls run on the async worker threads. That is fine at demo load. It has not been load tested. The only numbers are micro-benchmarks, in [design/performance.md](../design/performance.md).
 - **No high availability.** If the process is down, every call through the proxy fails. That is by design: onbehalf fails closed. Do not start a second replica against the same file, or against a copy. Each process would keep its own idea of which leases are revoked.
 - **No TLS.** The server speaks plain HTTP. Terminate TLS in front of it.
-- **One static admin token.** There are no operator accounts or roles. Admin actions (lease revocations, policy reloads, development root mints) are recorded in the audit log as `by admin`.
+- **One static admin token.** There are no operator accounts or roles. Admin actions (lease revocations, policy reloads, development root mints) are recorded in the audit log as `by urn:onbehalf:admin`, a subject no identity provider can issue (the `urn:onbehalf:` prefix is reserved).
 - **No metrics endpoint.** You monitor it through logs and the audit log. See [What to monitor](#what-to-monitor).
 - **Manual key rotation with no overlap.** See [Key rotation](#key-rotation).
 
@@ -29,7 +29,7 @@ Go through this before pointing anything real at the server.
 - [ ] TLS terminates in front of onbehalf, and agents reach it over HTTPS only.
 - [ ] `[issuer] private_key_pem_path` is set, the file is mode 0600, owned by the service user, and backed up somewhere safe. Without the setting the server makes a new key at every start and every token dies on restart.
 - [ ] `[audit] sqlite_path` is a real path on durable storage. The default is `:memory:`, which loses the audit log and every lease on exit. The server logs a warning when it is in memory.
-- [ ] `[issuer] issuer` is the URL clients will use, for example `https://onbehalf.example.com`. It becomes the `iss` of every token, and changing it later invalidates tokens. `[server] public_url` is set to the same base URL so the AuthZEN discovery document points at the right host.
+- [ ] `[issuer] issuer` is the URL clients will use, for example `https://onbehalf.example.com`. It becomes the `iss` of every token, and changing it later invalidates tokens. `[server] public_url` is set to the same base URL so the AuthZEN discovery document points at the right host. Off a loopback `listen` address the server refuses to start without it.
 - [ ] `[policy] policies_path` points at your policy, and the catalog lists every tool a policy names.
 - [ ] Every tool on the upstream that agents should call is in the catalog. With the default `[policy] unknown_tools = "deny"`, a tool missing from the catalog is denied with `tool_not_in_catalog`; with `"allow"` it is neither `readonly` nor `sensitive`, so rules that depend on those attributes do not see it.
 - [ ] The config file is mode 0600. It holds secret hashes and possibly the admin token. The admin token can come from `ONBEHALF_ADMIN_TOKEN` instead; there is no other environment-variable substitution, so inject the file at deploy time.
@@ -79,7 +79,7 @@ This hides `/admin` from the public name. Operators reach it on `127.0.0.1:8080`
 
 For nginx, the equivalent pieces are `proxy_pass http://127.0.0.1:8080;`, `proxy_buffering off;`, `proxy_http_version 1.1;` and a `location /admin/ { return 404; }` block. Untested.
 
-onbehalf reads the request's `Host` header only to build the AuthZEN discovery document, and only when `public_url` is unset. It does not use `X-Forwarded-*` headers.
+onbehalf builds the AuthZEN discovery document from `[server] public_url`, which is required whenever `listen` is not a loopback address, so a forged `Host` header cannot put another host's URLs into a document a shared cache might keep. Only on a loopback listener without `public_url` does it fall back to `Host`, and then it accepts only `localhost`, `127.0.0.1` or `[::1]` (with an optional port) and answers 400 `invalid_host` to anything else. It does not use `X-Forwarded-*` headers.
 
 ## Admin token handling
 
@@ -113,7 +113,7 @@ To rotate:
 
 Notes:
 
-- The originating-user block of a token (`ou_sig`) is signed once, at the root, and copied to every child. A child minted after the switch is signed by the new key but still carries an old-key `ou_sig`, so the old key must stay trusted until the whole chain has expired. That is why step 4 waits for the longest chain, not for one token.
+- The originating-user block of a token (`ou_sig`) is signed once, at the root, and copied to every child. A child minted after the switch is signed by the new key but still carries an old-key `ou_sig` (its `ou_kid` names the old key), so the old key must stay trusted until the whole chain has expired. That is why step 4 waits for the longest chain, not for one token.
 - A token whose `kid` is not in the trusted set is rejected with `invalid_grant`, whatever its signature. Tokens issued by a version before `kid` existed carry no `kid` and are tried against every trusted key.
 - Third parties that verify onbehalf tokens offline should select the key by `kid` and refresh the JWKS when they see an unknown one. `onbehalf token inspect --verify` fetches the JWKS and trusts every key in it.
 - In an emergency (key compromise), skip the overlap: replace the key and leave `previous_key_paths` empty. Every outstanding token stops verifying; agents re-run login and exchange.
@@ -226,7 +226,7 @@ volumes:
   onbehalf-data:
 ```
 
-Matching settings in `onbehalf.toml`: `policies_path = "/etc/onbehalf/policy.cedar"`, `private_key_pem_path = "/etc/onbehalf/issuer.pem"`, `sqlite_path = "/var/lib/onbehalf/onbehalf.sqlite"`, `listen = "0.0.0.0:8080"` (inside the container only; the published port stays on loopback). This layout is untested.
+Matching settings in `onbehalf.toml`: `policies_path = "/etc/onbehalf/policy.cedar"`, `private_key_pem_path = "/etc/onbehalf/issuer.pem"`, `sqlite_path = "/var/lib/onbehalf/onbehalf.sqlite"`, `listen = "0.0.0.0:8080"` (inside the container only; the published port stays on loopback) and `public_url` set to the URL clients use, which a non-loopback `listen` requires. This layout is untested.
 
 Notes:
 
