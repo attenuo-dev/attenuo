@@ -7,6 +7,12 @@
  * signatures. It follows the Rust `verify_export_with` (`attenuo audit verify --file`) rule
  * for rule, so a file gets the same verdict, and the same `firstBadSeq`, in both.
  *
+ * `crossCheck` adds the SR-21 comparison with checkpoints the server shipped off the host
+ * (`[audit.sink]`), the Rust `cross_check` (`attenuo audit verify --file --checkpoints`) rule for
+ * rule: a checkpoint signed again after it was shipped, one deleted from the export, two
+ * different shipped copies for one seq, and a shipped copy that does not verify are reported
+ * with the same `seq` and reason in both.
+ *
  * A file that fails verification gives a report with `ok: false`; a file that cannot be read as
  * an export at all (no header, the wrong format, a filtered export, a line that is not JSON)
  * throws `ExportError`.
@@ -26,6 +32,8 @@ export const ENTRY_HASH_VERSION = "attenuo-audit-entry-v2";
 export const GENESIS_HASH = "0".repeat(64);
 /** Value of the header's `format` member. */
 export const EXPORT_FORMAT = "attenuo-audit-export-v2";
+/** Value of a shipped checkpoint's `format` member. */
+export const SHIPPED_FORMAT = "attenuo-shipped-checkpoint-v1";
 const CHECKPOINT_CONTEXT = "attenuo-checkpoint-v1";
 
 /** The input is not an audit export this version can verify. */
@@ -62,6 +70,54 @@ export interface ExportReport {
   outsideRange: number;
   /** Failed only because of an unsigned tail that `allowUnsignedTail` did not accept. */
   unsignedTailRejected: boolean;
+}
+
+/** One parsed line of a shipped-checkpoint file. */
+export interface ShippedLine {
+  /** 1-based line number in the file. */
+  line: number;
+  /** The five checkpoint members. */
+  checkpoint: CheckpointFields;
+  /** Set when the line was an envelope that does not match its own checkpoint. */
+  inconsistency: string | undefined;
+}
+
+/** `seq`, `head_hash`, `at`, `kid` and `signature` of a checkpoint. */
+export interface CheckpointFields {
+  seq: number;
+  head_hash: string;
+  at: string;
+  kid: string;
+  signature: string;
+}
+
+/** A shipped checkpoint the export disagrees with, or one that is unusable. */
+export interface ShippedMismatch {
+  seq: number;
+  /** Line of the shipped file. */
+  line: number;
+  reason: string;
+}
+
+/** The verdict of `crossCheck` (the fields of the Rust `CrossCheckReport`). */
+export interface CrossCheckReport {
+  /** Lines in the shipped file. */
+  shipped: number;
+  /** Shipped checkpoints whose seq lies in the export header's `from..=to` (checked). */
+  inRange: number;
+  /** Of those, the ones the export agrees with. */
+  matched: number;
+  /**
+   * Shipped checkpoints past the export's range: not checked. If the export was taken up to the
+   * head of the log, these say the log is shorter than what was shipped.
+   */
+  beyondRange: number;
+  /** Highest seq in the shipped file. */
+  lastShippedSeq: number | undefined;
+  /** In the order of the shipped file; the first is the first offending seq. */
+  mismatches: ShippedMismatch[];
+  /** No mismatches. */
+  ok: boolean;
 }
 
 /** An export to verify. */
@@ -224,6 +280,175 @@ export async function verifyExport(
     truncated,
     outsideRange,
     unsignedTailRejected,
+  };
+}
+
+const CP_FIELDS = ["seq", "head_hash", "at", "kid", "signature"] as const;
+
+function cp5(c: Checkpoint): CheckpointFields {
+  return { seq: c.seq, head_hash: c.head_hash, at: c.at, kid: c.kid, signature: c.signature };
+}
+
+const sameCheckpoint = (a: CheckpointFields, b: CheckpointFields): boolean =>
+  CP_FIELDS.every((k) => a[k] === b[k]);
+
+/**
+ * Parse a JSONL file of shipped checkpoints (`[audit.sink]` file output).
+ *
+ * A line is the sink's envelope (`format`, `checkpoint`, `kid`, `signature`,
+ * `checkpoint_sha256`) or a bare checkpoint (an export's `checkpoint` line, or
+ * `GET /admin/audit/checkpoint` saved by an operator's own job). Blank lines are skipped;
+ * anything else throws `ExportError`. An envelope that disagrees with its own checkpoint is not
+ * an error here: the line carries `inconsistency` and `crossCheck` reports it.
+ */
+export async function parseShipped(source: ExportSource): Promise<ShippedLine[]> {
+  const out: ShippedLine[] = [];
+  for (const [n, raw] of (await readText(source)).split("\n").entries()) {
+    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+    if (line.trim() === "") continue;
+    const where = `shipped checkpoints, line ${n + 1}`;
+    const obj = parseLine(line, where);
+    if (!isObj(obj)) throw new ExportError(`${where}: not a JSON object`);
+    if ("checkpoint" in obj) {
+      need(obj, where, { format: "str", kid: "str", signature: "str", checkpoint_sha256: "str" });
+      if (
+        obj.public_url !== undefined &&
+        obj.public_url !== null &&
+        typeof obj.public_url !== "string"
+      ) {
+        throw new ExportError(`${where}: \`public_url\` must be a string`);
+      }
+      if (!isObj(obj.checkpoint))
+        throw new ExportError(`${where}: \`checkpoint\` must be an object`);
+      const cp = cp5(toCheckpoint(obj.checkpoint, where));
+      out.push({ line: n + 1, checkpoint: cp, inconsistency: await inconsistency(obj, cp) });
+    } else {
+      const { type, ...rest } = obj;
+      if (type !== undefined && type !== "checkpoint") {
+        throw new ExportError(`${where}: not a checkpoint line (type ${JSON.stringify(type)})`);
+      }
+      out.push({
+        line: n + 1,
+        checkpoint: cp5(toCheckpoint(rest, where)),
+        inconsistency: undefined,
+      });
+    }
+  }
+  return out;
+}
+
+async function inconsistency(env: Obj, cp: CheckpointFields): Promise<string | undefined> {
+  if (env.format !== SHIPPED_FORMAT) return `unsupported format \`${String(env.format)}\``;
+  if (env.kid !== cp.kid || env.signature !== cp.signature) {
+    return "`kid` or `signature` differs from the checkpoint's own";
+  }
+  if (env.checkpoint_sha256 !== (await sha256Hex(canonicalize(cp)))) {
+    return "`checkpoint_sha256` does not match the checkpoint";
+  }
+  return undefined;
+}
+
+/**
+ * Compare an audit export with checkpoints shipped off the host (SR-21).
+ *
+ * A signed checkpoint proves the log prefix `1..=seq` hashed to `head_hash`, but it is signed
+ * with the server's own key: someone who holds the host and that key can rewrite the log and
+ * sign fresh checkpoints, and the export then verifies. A copy of the original checkpoint that
+ * already left the host (the checkpoint sink) is what they cannot change.
+ *
+ * For each shipped checkpoint inside the export's declared range:
+ *
+ * - it must verify against the keys (a forged shipped copy would otherwise be trusted);
+ * - the export must hold a checkpoint at that seq, identical in every member: a different one
+ *   was **signed again after shipping**, none at all means it was **deleted**;
+ * - the export's entry at that seq must hash to the shipped `head_hash`.
+ *
+ * Two different shipped checkpoints for one seq are reported too, and so is an envelope whose
+ * `kid`, `signature` or `checkpoint_sha256` disagrees with its checkpoint. This does not
+ * replace `verifyExport`: run both.
+ */
+export async function crossCheck(
+  exportSource: ExportSource,
+  shippedSource: ExportSource,
+  opts: Pick<VerifyExportOptions, "checkpointPublicKeys">,
+): Promise<CrossCheckReport> {
+  const keys = loadKeys(opts.checkpointPublicKeys);
+  const { header, entries, checkpoints } = parse(await readText(exportSource));
+  const shipped = await parseShipped(shippedSource);
+  const from = header.from as number;
+  const to = header.to as number;
+  const exported = new Map(checkpoints.map((c) => [c.seq, cp5(c)]));
+  const entryHashes = new Map(entries.map((e) => [e.seq, e.entry_hash]));
+  const firstBySeq = new Map<number, ShippedLine>();
+  const mismatches: ShippedMismatch[] = [];
+  let inRange = 0;
+  let matched = 0;
+  let beyond = 0;
+  for (const s of shipped) {
+    const cp = s.checkpoint;
+    const fail = (reason: string): void => {
+      mismatches.push({ seq: cp.seq, line: s.line, reason });
+    };
+    if (s.inconsistency !== undefined) {
+      fail(`shipped envelope is inconsistent: ${s.inconsistency}`);
+      continue;
+    }
+    const prev = firstBySeq.get(cp.seq);
+    if (prev === undefined) {
+      firstBySeq.set(cp.seq, s);
+    } else if (!sameCheckpoint(prev.checkpoint, cp)) {
+      fail(
+        "the sink holds two different checkpoints for this seq " +
+          `(lines ${prev.line} and ${s.line}): ` +
+          "the seq was signed again after the first was shipped",
+      );
+      continue;
+    } // else: a retried delivery, same content
+    if (cp.seq > to) {
+      beyond++;
+      continue;
+    }
+    if (cp.seq < from && !(cp.seq === 0 && from <= 1)) continue;
+    inRange++;
+    const why = await verifyCheckpoint(cp, keys);
+    if (why !== undefined) {
+      fail(`shipped checkpoint does not verify: ${why}`);
+      continue;
+    }
+    const problems: string[] = [];
+    const e = exported.get(cp.seq);
+    if (e === undefined) {
+      problems.push("the export has no checkpoint at this seq (deleted after shipping)");
+    } else if (!sameCheckpoint(e, cp)) {
+      const diff = (["head_hash", "signature", "at", "kid"] as const).filter((k) => e[k] !== cp[k]);
+      problems.push(
+        "RE-SIGNED after shipping: the export's checkpoint at this seq differs in " +
+          diff.join(", "),
+      );
+    }
+    if (cp.seq > 0) {
+      const h = entryHashes.get(cp.seq);
+      if (h === undefined) {
+        problems.push("the export has no entry at this seq");
+      } else if (h !== cp.head_hash) {
+        problems.push(
+          "the export's entry at this seq does not hash to the shipped head_hash " +
+            "(history rewritten after shipping)",
+        );
+      }
+    }
+    if (problems.length === 0) matched++;
+    else fail(problems.join("; "));
+  }
+  return {
+    shipped: shipped.length,
+    inRange,
+    matched,
+    beyondRange: beyond,
+    lastShippedSeq:
+      shipped.length > 0 ? Math.max(...shipped.map((s) => s.checkpoint.seq)) : undefined,
+    mismatches,
+    ok: mismatches.length === 0,
   };
 }
 
@@ -411,7 +636,7 @@ function loadKeys(src: VerifyExportOptions["checkpointPublicKeys"]): Map<string,
 
 /** Undefined when the signature verifies, else why not. */
 async function verifyCheckpoint(
-  cp: Checkpoint,
+  cp: CheckpointFields,
   keys: Map<string, Uint8Array>,
 ): Promise<string | undefined> {
   const key = keys.get(cp.kid);

@@ -164,7 +164,7 @@ A bound token stays bound whatever `dpop` says: `off` stops binding new tokens b
 
 With `[token] dpop_nonce = "required"` the server supplies the freshness instead of trusting the client's clock (RFC 9449 §8). Every response to a request that sent a `DPoP` header, and every `WWW-Authenticate: DPoP` challenge, carries a `DPoP-Nonce` header. Each proof the server checks in a `DPoP` header must put the latest such value in its `nonce` claim. A proof without it, or with a stale or unknown one, is refused with 401 `use_dpop_nonce`. That response carries the nonce to use, and the client retries with a new proof.
 
-The Python and TypeScript clients (`Client`, `AsyncClient`, `AttenuoClient`, `AdminClient` for the dev root mint, `TokenAuth` and `mcpFetch`) do this for you. They keep the latest nonce and retry a refused request once. The CLI does not handle nonces yet.
+The Python and TypeScript clients (`Client`, `AsyncClient`, `AttenuoClient`, `AdminClient` for the dev root mint, `TokenAuth` and `mcpFetch`) do this for you. They keep the latest nonce and retry a refused request once. The CLI does too: it keeps the latest nonce for the server it talks to, within one command, and retries a refused request once.
 
 The server keeps no nonce state. A nonce is an HMAC of the current time bucket (`dpop_max_age_seconds` wide) under a key derived from the issuer's signing key. The current and the previous bucket's nonces are accepted, so a nonce lives for one to two windows, and replicas that share the signing key accept each other's nonces. The exchange sign-off (`subject_token_dpop`) needs no nonce, because the parent makes it ahead of time.
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import struct
 from pathlib import Path
@@ -15,8 +16,12 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from attenuo.audit import (
     EXPORT_FORMAT,
     GENESIS_HASH,
+    SHIPPED_FORMAT,
+    CrossCheckReport,
     ExportError,
+    cross_check,
     entry_hash,
+    parse_shipped,
     verify_export,
 )
 
@@ -284,3 +289,184 @@ def test_garbage_lines_duplicates_and_constants_raise() -> None:
 def test_blank_lines_and_crlf_are_tolerated() -> None:
     crlf = [ln.replace("\n", "\r\n") for ln in lines(make_export())]
     assert verify_export([*crlf[:2], "\r\n", *crlf[2:]], checkpoint_public_keys=JWKS).ok
+
+
+# ---- cross-check against shipped checkpoints (SR-21) -------------------------------------------
+
+
+def checkpoints_of(objs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{k: v for k, v in o.items() if k != "type"} for o in objs if o["type"] == "checkpoint"]
+
+
+def envelope(cp: dict[str, Any]) -> dict[str, Any]:
+    """What the file sink writes for ``cp``."""
+    return {
+        "checkpoint": cp,
+        "checkpoint_sha256": hashlib.sha256(rfc8785.dumps(cp)).hexdigest(),
+        "format": SHIPPED_FORMAT,
+        "kid": cp["kid"],
+        "public_url": None,
+        "signature": cp["signature"],
+    }
+
+
+def shipped_lines(cps: list[dict[str, Any]]) -> list[str]:
+    return [rfc8785.dumps(envelope(c)).decode() + "\n" for c in cps]
+
+
+def cross(
+    objs: list[dict[str, Any]], shipped: list[str] | None = None, **kw: Any
+) -> CrossCheckReport:
+    if shipped is None:
+        shipped = shipped_lines(checkpoints_of(make_export(**kw)))
+    return cross_check(lines(objs), shipped, checkpoint_public_keys=JWKS)
+
+
+def rewritten(start_at: int) -> list[dict[str, Any]]:
+    """The attacker's export: records from ``start_at`` changed, hashes recomputed, checkpoints
+    signed again with the (stolen) key."""
+    objs = make_export()
+    entries = [o for o in objs if o["type"] == "entry"]
+    prev = GENESIS_HASH
+    for e in entries:
+        if e["seq"] >= start_at:
+            e["record"] = {**e["record"], "reason": "rewritten"}
+        e["prev_hash"] = prev
+        e["entry_hash"] = prev = entry_hash(e["seq"], prev, e["record"])
+    by_seq = {e["seq"]: e["entry_hash"] for e in entries}
+    for o in objs:
+        if o["type"] == "checkpoint" and o["head_hash"] != by_seq[o["seq"]]:
+            o.update(head_hash=by_seq[o["seq"]], at="2026-10-24T00:00:00Z")
+            o["signature"] = sign_at(o)
+    return objs
+
+
+def sign_at(cp: dict[str, Any]) -> str:
+    payload = rfc8785.dumps([cp["seq"], cp["head_hash"], cp["at"], cp["kid"]])
+    ctx = b"attenuo-checkpoint-v1"
+    return b64(KEY.sign(struct.pack(">I", len(ctx)) + ctx + payload))
+
+
+def test_a_genuine_export_matches_its_shipped_checkpoints(tmp_path: Path) -> None:
+    objs = make_export()
+    r = cross(objs)
+    assert r.ok and r.mismatches == ()
+    assert (r.shipped, r.in_range, r.matched, r.beyond_range) == (2, 2, 2, 0)
+    assert r.last_shipped_seq == 6
+    # A retried delivery (the same line twice) is not a conflict.
+    twice = shipped_lines(checkpoints_of(objs)) * 2
+    assert cross(objs, twice).ok
+    # Paths and bare checkpoint lines (an export's own `checkpoint` lines) work too.
+    sink = tmp_path / "shipped.jsonl"
+    sink.write_text("".join(shipped_lines(checkpoints_of(objs))))
+    assert (
+        cross_check(lines(objs), sink, checkpoint_public_keys=JWKS).ok
+        and cross_check(lines(objs), str(sink), checkpoint_public_keys=JWKS).ok
+    )
+    bare = [json.dumps(o) + "\n" for o in objs if o["type"] == "checkpoint"] + ["\n"]
+    assert cross(objs, bare).ok
+
+
+def test_a_rewritten_and_re_signed_log_is_caught_by_the_shipped_copies() -> None:
+    attacker = rewritten(2)
+    assert verify(attacker).ok  # alone it verifies: the attacker had the key
+    r = cross(attacker)
+    assert not r.ok
+    assert [m.seq for m in r.mismatches] == [3, 6]
+    for m in r.mismatches:
+        assert "RE-SIGNED after shipping" in m.reason
+        assert "head_hash" in m.reason and "history rewritten" in m.reason
+    assert r.mismatches[0].line == 1 and r.mismatches[1].line == 2
+    # Only what changed after the first checkpoint: the early one still matches.
+    r = cross(rewritten(5))
+    assert [m.seq for m in r.mismatches] == [6]
+    assert r.matched == 1
+
+
+def test_deleted_duplicate_and_forged_shipped_checkpoints_are_reported() -> None:
+    objs = make_export(cps=(2, 4, 6))
+    shipped = shipped_lines(checkpoints_of(objs))
+    # A checkpoint deleted from the export.
+    gone = [o for o in objs if not (o["type"] == "checkpoint" and o["seq"] == 4)]
+    r = cross(gone, shipped)
+    assert [(m.seq, m.line) for m in r.mismatches] == [(4, 2)]
+    assert "deleted after shipping" in r.mismatches[0].reason
+    # Two different shipped copies for one seq: the second is reported at its line.
+    other = shipped_lines([sign(4, "ab" * 32)])
+    r = cross(objs, [*shipped, *other])
+    assert [(m.seq, m.line) for m in r.mismatches] == [(4, 4)]
+    assert "two different checkpoints for this seq (lines 2 and 4)" in r.mismatches[0].reason
+    # A shipped copy that does not verify (a forged one, signed by another key).
+    forged = sign(4, objs[4]["entry_hash"], key=Ed25519PrivateKey.generate())
+    r = cross(objs, [shipped[0], *shipped_lines([forged]), shipped[2]])
+    assert [m.seq for m in r.mismatches] == [4]
+    assert "shipped checkpoint does not verify: signature does not verify" in r.mismatches[0].reason
+    unknown = sign(4, objs[4]["entry_hash"], kid="other")
+    r = cross(objs, shipped_lines([unknown]))
+    assert "unknown signing key `other`" in r.mismatches[0].reason
+
+
+def test_an_envelope_that_disagrees_with_its_checkpoint_is_reported() -> None:
+    objs = make_export()
+    cps = checkpoints_of(objs)
+    env = envelope(cps[0])
+    env["checkpoint_sha256"] = "00" * 32
+    r = cross(objs, [json.dumps(env) + "\n"])
+    assert r.mismatches[0].seq == 3
+    assert "checkpoint_sha256" in r.mismatches[0].reason
+    env = envelope(cps[0])
+    env["kid"] = "other"
+    assert (
+        "differs from the checkpoint's own" in cross(objs, [json.dumps(env)]).mismatches[0].reason
+    )
+    env = {**envelope(cps[0]), "format": "v0"}
+    assert "unsupported format `v0`" in cross(objs, [json.dumps(env)]).mismatches[0].reason
+
+
+def test_shipped_checkpoints_past_the_export_are_counted_not_checked() -> None:
+    objs = make_export()
+    log = make_export(n=9, cps=(3, 6, 9))
+    r = cross(objs, shipped_lines(checkpoints_of(log)))
+    assert r.ok
+    assert (r.in_range, r.matched, r.beyond_range, r.last_shipped_seq) == (2, 2, 1, 9)
+    # Checkpoints before a windowed export's range are not checked either (seq 3 here; the
+    # window's own hashes differ from the full log's, so seq 6 is reported).
+    window = make_export(n=3, start=4, cps=(6,))
+    r = cross(window, shipped_lines(checkpoints_of(make_export())))
+    assert (r.in_range, [m.seq for m in r.mismatches]) == (1, [6])
+
+
+def test_the_genesis_checkpoint_matches_and_an_empty_shipped_file_is_ok() -> None:
+    objs = make_export(cps=(0, 3, 6))
+    objs.append({"type": "checkpoint", **sign(0, GENESIS_HASH)})
+    assert cross(objs, shipped_lines([sign(0, GENESIS_HASH)])).matched == 1
+    r = cross(objs, [])
+    assert r.ok and r.shipped == 0 and r.last_shipped_seq is None
+
+
+@pytest.mark.parametrize(
+    ("text", "match"),
+    [
+        ("not json\n", "shipped checkpoints, line 1"),
+        ("[1]\n", "not a JSON object"),
+        ('{"type":"entry","seq":1}\n', "not a checkpoint line"),
+        ('{"seq":1}\n', "head_hash"),
+        (
+            '{"checkpoint":1,"format":"x","kid":"k","signature":"s","checkpoint_sha256":"h"}\n',
+            "object",
+        ),
+    ],
+)
+def test_a_shipped_file_that_is_not_checkpoints_raises(text: str, match: str) -> None:
+    with pytest.raises(ExportError, match=match):
+        parse_shipped([text])
+    with pytest.raises(ExportError, match=match):
+        cross(make_export(), [text])
+
+
+def test_cross_check_refuses_what_verify_export_refuses() -> None:
+    objs = make_export()
+    with pytest.raises(ExportError, match="no header"):
+        cross(objs[1:], [])
+    with pytest.raises(ExportError, match="32 bytes"):
+        cross_check(lines(objs), [], checkpoint_public_keys={KID: "AAAA"})

@@ -212,6 +212,21 @@ if not report.ok:
 
 `verify_export(path_or_lines, *, checkpoint_public_keys, allow_unsigned_tail=False)` takes a path (`str` or `PathLike`; a `str` is always a path) or an iterable of lines, in JSON Lines or the `--format json` form. `checkpoint_public_keys` is the JWKS or a `{kid: public key}` map (raw 32 bytes or base64url). It re-checks the SHA-256 hash chain over RFC 8785 canonical JSON of `["attenuo-audit-entry-v2", seq, prev_hash, record]`, the range the header declares and the Ed25519 checkpoint signatures, with the same strictness as `attenuo audit verify --file`: a short file, entries outside the range and entries after the last valid checkpoint (unless `allow_unsigned_tail=True`) all fail. The `ExportReport` has `ok`, `first_bad_seq`, `bad_checkpoints`, `last_signed_seq`, `unsigned_tail`, `truncated`, `outside_range` and the rest of the Rust report. A file that is not a verifiable export (no header, wrong format, a filtered export, not JSON) raises `attenuo.audit.ExportError`. It needs the `verify` extra (`cryptography`) for the signatures and depends on the pinned `rfc8785`. It hashes each record as it appears in the file and refuses duplicate object members, so it is a little stricter than the Rust check. A filtered export (`audit_export(kind=..., chain_id=...)`) cannot be verified: its chain has gaps, so verify the unfiltered one, then filter. `AuditEntry` has `kind` and `chain_id`.
 
+### Cross-checking shipped checkpoints
+
+A checkpoint is signed with the server's own key, so someone who holds the host and the key can rewrite the log and sign it again. `[audit.sink]` ships each checkpoint off the host; `cross_check` compares an export with those copies (SR-21), like `attenuo audit verify --file --checkpoints`:
+
+```python
+from attenuo.audit import cross_check, verify_export
+
+assert verify_export("audit.jsonl", checkpoint_public_keys=jwks).ok
+cross = cross_check("audit.jsonl", "shipped.jsonl", checkpoint_public_keys=jwks)
+for m in cross.mismatches:  # in the order of the shipped file
+    print(m.seq, m.line, m.reason)
+```
+
+`cross_check(export, shipped, *, checkpoint_public_keys)` takes the export and the shipped file (the file sink's JSON Lines, webhook bodies one per line, or bare checkpoint lines) as paths or iterables of lines. For every shipped checkpoint inside the export's range it requires that the checkpoint verifies, that the export holds an identical one at that `seq`, and that the export's entry there hashes to the shipped `head_hash`. The `CrossCheckReport` has `ok`, `shipped`, `in_range`, `matched`, `beyond_range`, `last_shipped_seq` and `mismatches` (`seq`, `line`, `reason`): a checkpoint signed again after it was shipped, one deleted from the export, two different shipped copies for one `seq`, and a shipped copy that does not verify or whose envelope disagrees with itself. The reasons are the Rust ones, word for word. Run it next to `verify_export`, not instead. A shipped file that is not checkpoints raises `ExportError`; `parse_shipped` parses one on its own.
+
 ## Development
 
 ```sh

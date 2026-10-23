@@ -10,18 +10,29 @@ Set ``ATTENUO_BIN_DIR`` to a directory holding prebuilt ``attenuo-server`` and
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
+import rfc8785
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    NoEncryption,
+    PrivateFormat,
+)
 
 from attenuo import (
     AdminClient,
@@ -37,6 +48,7 @@ from attenuo import (
     TokenRefresher,
     Unauthorized,
 )
+from attenuo.audit import entry_hash
 from attenuo.mcp import TokenAuth
 
 pytestmark = [
@@ -113,6 +125,8 @@ class Stack:
     def __init__(self, url: str, work: Path) -> None:
         self.url = url
         self.work = work
+        #: The issuer's private key, when the test generated it (``sink_stack``).
+        self.issuer_key: Ed25519PrivateKey | None = None
 
     def upstream_calls(self) -> list[str]:
         log = (self.work / "fake-mcp.log").read_text()
@@ -132,7 +146,28 @@ def nonce_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
     )
 
 
-def run_stack(work: Path, token_section: str = "") -> Iterator[Stack]:
+@pytest.fixture(scope="module")
+def sink_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
+    """The same stack with an issuer key the test holds (the stolen key of SR-21) and the file
+    checkpoint sink on (``[audit.sink]``)."""
+    work = tmp_path_factory.mktemp("attenuo-it-sink")
+    key = Ed25519PrivateKey.generate()
+    pem = work / "issuer.pem"
+    pem.write_bytes(key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()))
+    pem.chmod(0o600)
+    stack = run_stack(
+        work,
+        '[audit.sink]\nkind = "file"\npath = "{work}/shipped.jsonl"\n\n',
+        issuer_key=pem,
+    )
+    for s in stack:
+        s.issuer_key = key
+        yield s
+
+
+def run_stack(
+    work: Path, token_section: str = "", issuer_key: Path | None = None
+) -> Iterator[Stack]:
     built_server, built_fake = binaries()
     # Copy them: a shared CARGO_TARGET_DIR can be rebuilt under us mid-test.
     server_bin = work / "attenuo-server"
@@ -147,8 +182,12 @@ def run_stack(work: Path, token_section: str = "") -> Iterator[Stack]:
         .replace("18080", str(ob_port))
         .replace("13001", str(mcp_port))
         .replace("examples/github-leak-demo/policy.cedar", str(DEMO / "policy.cedar"))
-        .replace("[audit]\n", f"{token_section}[audit]\n", 1)
+        .replace("[audit]\n", f"{token_section.replace('{work}', str(work))}[audit]\n", 1)
     )
+    if issuer_key is not None:
+        config = config.replace(
+            "[issuer]\n", f'[issuer]\nprivate_key_pem_path = "{issuer_key}"\n', 1
+        )
     (work / "config.toml").write_text(config)
 
     procs: list[subprocess.Popen[bytes]] = []
@@ -697,5 +736,194 @@ def test_one_mutated_byte_is_rejected_at_the_same_seq_by_rust_python_and_typescr
     mine = [json.loads(line) for line in filtered.read_text().splitlines()]
     assert {o["record"]["chain_id"] for o in mine if o["type"] == "entry"} == {root.lease}
     assert len([o for o in mine if o["type"] == "entry"]) == len(ours)
+    admin.close()
+    ob.close()
+
+
+# ---- cross-language check of shipped checkpoints (SR-21) -------------------------------------
+
+
+def cross_check_with_typescript(export: Path, shipped: Path, jwks: Path) -> dict[str, object]:
+    script = (
+        f"import {{ crossCheck }} from {json.dumps(TS_DIST.as_uri())};"
+        "import { readFileSync } from 'node:fs';"
+        "const [e, s, j] = process.argv.slice(1);"
+        "try { console.log(JSON.stringify(await crossCheck({ path: e }, { path: s },"
+        " { checkpointPublicKeys: JSON.parse(readFileSync(j, 'utf8')) }))); }"
+        " catch (err) { console.log(JSON.stringify({ error: String(err.message) })); }"
+    )
+    proc = subprocess.run(
+        ["node", "--input-type=module", "-e", script, str(export), str(shipped), str(jwks)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert isinstance(out, dict)
+    return out
+
+
+def sign_checkpoint(
+    key: Ed25519PrivateKey, kid: str, seq: int, head: str, at: str
+) -> dict[str, Any]:
+    ctx = b"attenuo-checkpoint-v1"
+    payload = rfc8785.dumps([seq, head, at, kid])
+    sig = key.sign(struct.pack(">I", len(ctx)) + ctx + payload)
+    return {
+        "seq": seq,
+        "head_hash": head,
+        "at": at,
+        "kid": kid,
+        "signature": base64.urlsafe_b64encode(sig).rstrip(b"=").decode(),
+    }
+
+
+def envelope(cp: Mapping[str, Any]) -> str:
+    env = {
+        "checkpoint": cp,
+        "checkpoint_sha256": hashlib.sha256(rfc8785.dumps(cp)).hexdigest(),
+        "format": "attenuo-shipped-checkpoint-v1",
+        "kid": cp["kid"],
+        "public_url": None,
+        "signature": cp["signature"],
+    }
+    return rfc8785.dumps(env).decode() + "\n"
+
+
+def test_shipped_checkpoint_tampering_is_reported_at_the_same_seq_by_rust_python_and_typescript(
+    sink_stack: Stack, tmp_path: Path
+) -> None:
+    from attenuo.audit import cross_check, verify_export
+
+    stack = sink_stack
+    key = stack.issuer_key
+    assert key is not None
+    cli = cli_binary()
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    ob = Client(stack.url)
+
+    # Three stretches of activity, each countersigned (and so shipped to the file sink).
+    shipped_cps: list[dict[str, Any]] = []
+    for _ in range(3):
+        root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+        coder = ob.exchange(
+            root, "coder", [Capability("github", "read_file")], client_secret=CODER_SECRET
+        )
+        ob.call_tool(coder, "github", "read_file", {"repo": "alice/public-docs", "path": "R.md"})
+        shipped_cps.append(admin.audit_checkpoint())
+    sink = stack.work / "shipped.jsonl"
+    wait_for(
+        lambda: sink.exists() and len(sink.read_text().splitlines()) >= 3,
+        10,
+        "the file sink to receive three checkpoints",
+    )
+
+    jwks = tmp_path / "jwks.json"
+    jwks.write_text(httpx.get(f"{stack.url}/.well-known/jwks.json").text)
+    kid = json.loads(jwks.read_text())["keys"][0]["kid"]
+    export = tmp_path / "export.jsonl"
+    proc = run_cli(stack, cli, "audit", "export", "--out", str(export))
+    assert proc.returncode == 0, proc.stderr
+    objs = [json.loads(line) for line in export.read_text().splitlines()]
+    cp_seqs = sorted(o["seq"] for o in objs if o["type"] == "checkpoint")
+    assert len(cp_seqs) >= 3, cp_seqs
+    shipped = tmp_path / "shipped.jsonl"
+    shutil.copy2(sink, shipped)
+    shipped_lines = shipped.read_text().splitlines(keepends=True)
+    shipped_seqs = [json.loads(ln)["checkpoint"]["seq"] for ln in shipped_lines]
+    assert set(cp_seqs[-3:]) <= set(shipped_seqs)
+    first, second, third = cp_seqs[-3:]
+
+    keys = json.loads(jwks.read_text())
+    have_ts = TS_DIST.exists() and shutil.which("node") is not None
+    if os.environ.get("ATTENUO_REQUIRE_TS") == "1":
+        assert have_ts, "build sdk/typescript (npm run build) first"
+
+    def findings(exp: Path, ship: Path) -> list[tuple[int, int, str]]:
+        """The mismatches all three implementations report: (seq, shipped line, reason)."""
+        proc = run_cli(
+            stack, cli, "--json", "audit", "verify", "--file", str(exp), "--jwks", str(jwks),
+            "--checkpoints", str(ship),
+        )  # fmt: skip
+        rust_report = json.loads(proc.stdout)["shipped"]
+        assert proc.returncode == (0 if rust_report["ok"] else 2), proc.stdout
+        rust = [(m["seq"], m["line"], m["reason"]) for m in rust_report["mismatches"]]
+        py_report = cross_check(exp, ship, checkpoint_public_keys=keys)
+        py = [(m.seq, m.line, m.reason) for m in py_report.mismatches]
+        assert py == rust
+        counts = ("shipped", "in_range", "matched", "beyond_range")
+        assert [getattr(py_report, c) for c in counts] == [rust_report[c] for c in counts]
+        assert py_report.ok is rust_report["ok"]
+        if have_ts:
+            ts_report = cross_check_with_typescript(exp, ship, jwks)
+            assert [(m["seq"], m["line"], m["reason"]) for m in ts_report["mismatches"]] == rust  # type: ignore[attr-defined]
+            assert ts_report["ok"] is rust_report["ok"]
+            assert ts_report["inRange"] == rust_report["in_range"]
+            assert ts_report["matched"] == rust_report["matched"]
+        return rust
+
+    # Clean: nothing to report.
+    assert findings(export, shipped) == []
+
+    # 1. Re-signed after shipping. The attacker holds the host and the issuer key: they change a
+    #    record after the first checkpoint, recompute the chain and sign fresh checkpoints.
+    entries = [o for o in objs if o["type"] == "entry"]
+    victim = next(e["seq"] for e in entries if e["seq"] > first)
+    prev = entries[0]["prev_hash"]
+    new_hash: dict[int, str] = {}
+    for e in entries:
+        if e["seq"] >= victim:
+            e["record"] = {**e["record"], "reason": "rewritten"}
+        e["prev_hash"] = prev
+        e["entry_hash"] = prev = entry_hash(e["seq"], prev, e["record"])
+        new_hash[e["seq"]] = e["entry_hash"]
+    forged = []
+    for o in objs:
+        if o["type"] == "checkpoint" and o["seq"] >= victim:
+            o.update(
+                sign_checkpoint(key, kid, o["seq"], new_hash[o["seq"]], "2026-10-24T00:00:00Z")
+            )
+        forged.append(o)
+    resigned = tmp_path / "resigned.jsonl"
+    resigned.write_text("".join(json.dumps(o) + "\n" for o in forged))
+    assert verify_export(resigned, checkpoint_public_keys=keys).ok  # alone it verifies
+    got = findings(resigned, shipped)
+    assert [g[0] for g in got] == [second, third]
+    assert "RE-SIGNED after shipping" in got[0][2]
+
+    # 2. A checkpoint deleted from the export.
+    deleted = tmp_path / "deleted.jsonl"
+    deleted.write_text(
+        "".join(
+            line
+            for line in export.read_text().splitlines(keepends=True)
+            if not (json.loads(line)["type"] == "checkpoint" and json.loads(line)["seq"] == second)
+        )
+    )
+    got = findings(deleted, shipped)
+    assert [g[0] for g in got] == [second]
+    assert "deleted after shipping" in got[0][2]
+
+    # 3. Two different shipped copies for one seq (the second is signed with the same key).
+    twin = sign_checkpoint(key, kid, second, "ab" * 32, "2026-10-24T00:00:00Z")
+    twice = tmp_path / "twice.jsonl"
+    twice.write_text("".join(shipped_lines) + envelope(twin))
+    got = findings(export, twice)
+    assert got[0][0] == second and "two different checkpoints for this seq" in got[0][2]
+
+    # 4. A shipped copy that does not verify: a signature that is not the issuer's.
+    third_line = next(ln for ln in shipped_lines if json.loads(ln)["checkpoint"]["seq"] == third)
+    bad_cp = json.loads(third_line)["checkpoint"]
+    other_key = Ed25519PrivateKey.generate()
+    bad_cp["signature"] = sign_checkpoint(other_key, kid, third, bad_cp["head_hash"], bad_cp["at"])[
+        "signature"
+    ]
+    lines_with_bad = [envelope(bad_cp) if ln == third_line else ln for ln in shipped_lines]
+    unverifiable = tmp_path / "unverifiable.jsonl"
+    unverifiable.write_text("".join(lines_with_bad))
+    got = findings(export, unverifiable)
+    assert [g[0] for g in got] == [third]
+    assert "shipped checkpoint does not verify" in got[0][2]
     admin.close()
     ob.close()
