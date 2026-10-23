@@ -147,6 +147,14 @@ async def test_exchange_accepts_token_object_and_hop0(make: Any) -> None:
         subject_token_type="urn:ietf:params:oauth:token-type:id-jag",
     )  # fmt: skip
     assert rec.body()["subject_token_type"].endswith("id-jag")
+    # Hop 0 authenticated by an actor token (a JWT-SVID) instead of a client secret.
+    await call(client, "exchange", "ID.TOKEN.JWT", "planner", "github:*", actor_token="s.v.id")
+    body = rec.body()
+    assert body["subject_token_type"] == "urn:ietf:params:oauth:token-type:id_token"
+    assert body["actor_token"] == "s.v.id" and "client_secret" not in body
+    # From a delegation token, an actor token keeps it hop n+1.
+    await call(client, "exchange", tok, "coder", "github:read_file", actor_token="s.v.id")
+    assert rec.body()["subject_token_type"] == "urn:ietf:params:oauth:token-type:jwt"
     with pytest.raises(ValueError):
         await call(client, "exchange", "J", "planner", "github:*", client_id="planner")
     # From a delegation token, client credentials authenticate the actor; it stays hop n+1.

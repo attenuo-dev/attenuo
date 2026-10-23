@@ -150,14 +150,14 @@ export function exchangeBody(
   if (opts.actorToken !== undefined && opts.actorToken.trim() === "") {
     throw new TypeError("actorToken is empty");
   }
-  if (opts.mayAct !== undefined && typeof opts.mayAct === "string") {
-    throw new TypeError("mayAct is a list of agent ids, not a string");
-  }
+  const mayAct = opts.mayAct === undefined ? undefined : mayActJson(opts.mayAct);
   // A hop n+1 exchange authenticates as its actor.
   const clientId = opts.clientSecret && opts.clientId === undefined ? actor : opts.clientId;
-  // Client credentials alone do not make this hop 0: the server also requires them, as the
-  // actor's, on a hop n+1 exchange. Hop 0 is an IdP credential, not a delegation token.
-  const intake = Boolean(opts.clientSecret) && !isDelegationToken(subjectToken);
+  // Agent credentials (a client secret or an actor token) alone do not make this hop 0: the
+  // server also requires them, as the actor's, on a hop n+1 exchange. Hop 0 is an IdP
+  // credential, not a delegation token.
+  const authenticated = Boolean(opts.clientSecret) || opts.actorToken !== undefined;
+  const intake = authenticated && !isDelegationToken(subjectToken);
   const body: Json = {
     grant_type: TOKEN_EXCHANGE_GRANT,
     subject_token: bearer(subjectToken),
@@ -176,8 +176,20 @@ export function exchangeBody(
     body.actor_token = opts.actorToken.trim();
     body.actor_token_type = TYPE_JWT;
   }
-  if (opts.mayAct !== undefined) body.may_act = { sub: [...opts.mayAct] };
+  if (mayAct !== undefined) body.may_act = mayAct;
   return body;
+}
+
+/** The RFC 8693 §4.4 `may_act` claim for a list of agent ids. */
+export function mayActJson(mayAct: readonly string[]): { sub: string[] } {
+  if (typeof mayAct === "string") {
+    throw new TypeError("mayAct is a list of agent ids, not a string");
+  }
+  const sub = [...mayAct];
+  if (!sub.every((a) => typeof a === "string" && a !== "")) {
+    throw new TypeError("mayAct agent ids must be non-empty strings");
+  }
+  return { sub };
 }
 
 /** Does `token` decode as an onbehalf delegation token? Nothing is verified. */

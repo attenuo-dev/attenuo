@@ -46,11 +46,11 @@ Chosen option: "RFC 8693 `actor_token` alongside client secrets, with `may_act`"
 - Bad, because single use clashes with SPIRE's JWT-SVID cache: an agent that exchanges twice within one SVID lifetime must fetch a fresh token (for example with an extra unique audience). Documented in the identity-providers guide.
 - Bad, because child tokens from a five-minute JWT-SVID live at most five minutes; longer work relies on lease renewal and re-exchange.
 - Neutral, because the child token is still a bearer token. Binding it to the actor's key (`cnf`, DPoP or mTLS) is RFC-0001 open question 1 and is not decided here.
-- Neutral, because hop 0 still authenticates the agent with its client secret; an actor token there is future work.
+- Good, because hop 0 accepts an actor token too (amended 2026-10-23, `fix/sr14-ou-sig-and-hop0-actor`): on IdP intake the agent may authenticate with an `actor_token` instead of its client secret, under the same `[token] actor_auth` modes, so a deployment can drop `[[agents]]` secrets entirely. The mapped agent must equal `actor` and `client_id` when the request names them and is the agent `[[root_grants]]` and `[[idps]] client_ids` are looked up for; the actor token is used once, recorded together with the IdP credential, and caps the root's expiry. `[token] actor_auth = "actor_token"` now also refuses client secrets at hop 0. `require_actor_auth` does not apply to hop 0, which always authenticates the agent.
 
 ### Confirmation
 
-Server integration tests in `crates/onbehalf-server/tests/actor_token.rs` (JWT-SVID with ES256 keys from a fake SPIRE bundle endpoint, a generic EdDSA issuer, every rejection code, `actor_auth` modes, single use, TTL cap) and `e2e.rs` (`may_act_on_the_parent_limits_who_may_exchange_it`, `root_grant_may_act_is_applied_and_cannot_be_widened`); token tests `may_act_on_the_parent_limits_the_next_actor`, `not_after_caps_the_child_expiry`; unit tests in `crates/onbehalf-server/src/actor.rs` for SPIFFE ID parsing, subject mapping, entry validation and claim checks.
+Server integration tests in `crates/onbehalf-server/tests/actor_token.rs` and, for hop 0, `actor_token_hop0.rs` (JWT-SVID with ES256 keys from a fake SPIRE bundle endpoint, a generic EdDSA issuer, every rejection code, `actor_auth` modes, single use, TTL cap) and `e2e.rs` (`may_act_on_the_parent_limits_who_may_exchange_it`, `root_grant_may_act_is_applied_and_cannot_be_widened`); token tests `may_act_on_the_parent_limits_the_next_actor`, `not_after_caps_the_child_expiry`; unit tests in `crates/onbehalf-server/src/actor.rs` for SPIFFE ID parsing, subject mapping, entry validation and claim checks.
 
 ## Pros and Cons of the Options
 
@@ -80,4 +80,4 @@ Server integration tests in `crates/onbehalf-server/tests/actor_token.rs` (JWT-S
 - RFC 8693 §2.1 (`actor_token`), §4.4 (`may_act`); SPIFFE JWT-SVID specification; [standards note](../research/standards.md) (SPIFFE, WIMSE).
 - [Security review 2026-10-22](../research/security-review-2026-10-22.md), SR-10.
 - [RFC-0001](../spec/rfc-0001-onbehalf.md) section 4, "Actor authentication" and "`may_act`".
-- Revisit when sender-constrained hop tokens (`cnf`) are designed, and when hop 0 should accept an actor token instead of a client secret.
+- Revisit when sender-constrained hop tokens (`cnf`) are designed.

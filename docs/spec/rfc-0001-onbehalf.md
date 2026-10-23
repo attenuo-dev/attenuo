@@ -101,19 +101,22 @@ A delegation token is a compact JWS, EdDSA (Ed25519), with header `typ` = `onbeh
   "exp": 1761168900,
   "typ": "onbehalf+jwt",
   "chain": { "originating_user": { "...": "as in section 3" }, "hops": [ "...planner...", "...coder..." ] },
-  "ou_sig": "<base64url Ed25519 signature over canonical JSON of chain.originating_user>",
+  "ou_sig": "<base64url Ed25519 signature, construction v2, see below>",
+  "ou_sig_v": 2,
+  "ou_kid": "<kid of the key that made ou_sig>",
   "may_act": { "sub": ["agent:reviewer"] }
 }
 ```
 
 - `sub` is the originating user. `act` is the RFC 8693 §4.1 actor chain: outermost is the agent currently acting, innermost the root agent (no `act`). Both are derived from `chain` so generic consumers can read who acts for whom without parsing it; the verifier requires them to agree.
 - `exp` always equals the last hop's `expires_at`. Leases are not a top-level claim; each hop carries its own inside `chain`.
-- `ou_sig` is made once at root issuance and copied unchanged through every exchange, so the user block is verifiable independently of the outer signature.
+- `ou_sig` is made once at root issuance and copied unchanged through every exchange, together with `ou_sig_v` and `ou_kid`, so the user block is verifiable independently of the outer signature, under the key that made it (which may be a retired key after a rotation).
+- **`ou_sig` construction, version 2** (`ou_sig_v` = 2, the only version verifiers accept). The payload is three fields, each a `u32` big-endian length followed by the bytes: `iss`; the canonical JSON of `chain.originating_user`; the canonical JSON of `chain.hops[0]` restricted to `agent`, `capabilities`, `issued_at` and `lease` (in that key order). The signed message is `len("onbehalf-ou-v2") || "onbehalf-ou-v2" || payload`, signed with Ed25519 by the issuer key named in `ou_kid` (`onbehalf_token::claims::ou_sig_message`). The context string separates it from JWS signatures and from other detached signatures (audit checkpoints use `onbehalf-checkpoint-v1`), and binding `iss` and the root hop means a user's signature lifted from one chain does not verify in a chain with another issuer or another root hop, even when the outer token is re-signed by a trusted key (SR-14). Hop 0's `expires_at` is not covered: it is bounded by every hop's expiry and the outer `exp`. Version 1 (a bare signature over the user block, no `ou_sig_v` claim) is refused with `UnsupportedOuSig`; nothing was deployed with it.
 - `may_act` is optional (RFC 8693 §4.4): the agents allowed to exchange this token. See "`may_act`" below.
 
 **Root issuance** (`Issuer::issue_root`) builds the chain, signs the user block and mints. The server calls it only after verifying a user credential (hop 0):
 
-**Hop 0** is a `POST /token` exchange whose subject token is a user credential from a configured IdP: an OIDC ID token (`subject_token_type` `urn:ietf:params:oauth:token-type:id_token`) or an ID-JAG (`urn:ietf:params:oauth:token-type:id-jag`, header `typ` `oauth-id-jag+jwt`, draft -04). The agent authenticates with its client credentials and becomes the root hop's agent. The credential is verified against the IdP's JWKS (`kid`, allowed asymmetric `alg`, `iss`, `aud`, `exp`, `iat`, `sub`; `nonce` ignored), the user block is built from `sub`, `iss`, `auth_time` and selected claims plus a derived `mfa`, and the requested capabilities are attenuated against the configured root grant. Each credential mints at most one root token (an in-memory replay cache keyed by `iss` and `jti`, or the credential's hash), and the root token never outlives the credential's `exp`. Details and error codes: [design/server.md](../design/server.md#hop-0-intake-from-an-identity-provider).
+**Hop 0** is a `POST /token` exchange whose subject token is a user credential from a configured IdP: an OIDC ID token (`subject_token_type` `urn:ietf:params:oauth:token-type:id_token`) or an ID-JAG (`urn:ietf:params:oauth:token-type:id-jag`, header `typ` `oauth-id-jag+jwt`, draft -04). The agent authenticates with its client credentials or an `actor_token` from an `[[actor_trust]]` issuer (same `[token] actor_auth` modes as an exchange, see "Actor authentication"; the actor token is single-use and caps the root's expiry) and becomes the root hop's agent. The credential is verified against the IdP's JWKS (`kid`, allowed asymmetric `alg`, `iss`, `aud`, `exp`, `iat`, `sub`; `nonce` ignored), the user block is built from `sub`, `iss`, `auth_time` and selected claims plus a derived `mfa`, and the requested capabilities are attenuated against the configured root grant. Each credential mints at most one root token (an in-memory replay cache keyed by `iss` and `jti`, or the credential's hash), and the root token never outlives the credential's `exp`. Details and error codes: [design/server.md](../design/server.md#hop-0-intake-from-an-identity-provider).
 
 **Exchange request** (JSON body; RFC 8693 with RFC 9396 `authorization_details`):
 
@@ -155,7 +158,7 @@ When both are sent, both are checked. An agent id may appear only once in a chai
 }
 ```
 
-**Exchange** (`Issuer::exchange` / `exchange_with`) verifies the parent at `now`, checks the parent's `may_act` against the actor, then calls `DelegationChain::extend`: the requested set must be non-empty and covered per section 3, the new depth must not exceed `max_depth`, and the child's expiry is `min(now + ttl, parent.expires_at)` (default TTL from issuer config), further capped by `IssueOptions::not_after` (the actor token's `exp` when one authenticated the exchange). The child gets a fresh lease and `jti`, and the parent's `ou_sig`. The server lets a parent token delegate to a given actor once (replay cache keyed by parent `jti` and actor, until the parent's `exp`).
+**Exchange** (`Issuer::exchange` / `exchange_with`) verifies the parent at `now`, checks the parent's `may_act` against the actor, then calls `DelegationChain::extend`: the requested set must be non-empty and covered per section 3, the new depth must not exceed `max_depth`, and the child's expiry is `min(now + ttl, parent.expires_at)` (default TTL from issuer config), further capped by `IssueOptions::not_after` (the actor token's `exp` when one authenticated the exchange). The child gets a fresh lease and `jti`, and the parent's `ou_sig`, `ou_sig_v` and `ou_kid`. The server lets a parent token delegate to a given actor once (replay cache keyed by parent `jti` and actor, until the parent's `exp`).
 
 **Verification order** (`Verifier::verify`; `now` is supplied by the caller, never read from the system clock):
 1. EdDSA signature and algorithm;
@@ -163,7 +166,7 @@ When both are sent, both are checked. An agent id may appear only once in a chai
 3. `iss`, then 4. `aud`, then 5. `exp > now`;
 6. `sub` equals `chain.originating_user.subject`, and `act` equals the actor chain rebuilt from `chain.hops`;
 7. `exp` equals the last hop's `expires_at`;
-8. `ou_sig` over the canonical user block (compact `serde_json`, `BTreeMap` key order);
+8. `ou_sig_v` equals 2, then `ou_sig` (construction above) under the trusted key named by `ou_kid`; canonical JSON is compact `serde_json` in `BTreeMap` key order (RFC 8785 is SR-20);
 9. `chain.validate_at(now, max_depth)`: non-empty subject, at least one hop, depth, per-hop expiry, expiry monotonicity, attenuation.
 
 
@@ -256,7 +259,7 @@ Every record names the agent and the originating user separately, the attributio
 
 | Property | Enforced by | Tests | Gap |
 |---|---|---|---|
-| P1 | `onbehalf-token` (`Verifier::verify`, `ou_sig`); `onbehalf-server` `idp` (hop-0 ID token / ID-JAG verification) | `token_exchange.rs`: `originating_user_tamper_is_caught_by_ou_sig`, `inconsistent_sub_or_act_is_rejected`; server `oidc.rs`: `valid_id_token_yields_root_token_for_the_verified_user`, `bad_id_tokens_are_rejected_with_stable_codes`, `id_jag_yields_root_token_and_typ_is_enforced` | No `evidence` linking the token to the credential; the credential replay cache is in memory, per process |
+| P1 | `onbehalf-token` (`Verifier::verify`, `ou_sig`); `onbehalf-server` `idp` (hop-0 ID token / ID-JAG verification) | `token_exchange.rs`: `originating_user_tamper_is_caught_by_ou_sig`, `ou_sig_cannot_be_lifted_into_a_chain_with_another_root_hop`, `ou_sig_is_bound_to_the_issuer`, `ou_sig_v1_and_unknown_versions_or_kids_are_refused`, `inconsistent_sub_or_act_is_rejected`; server `oidc.rs`: `valid_id_token_yields_root_token_for_the_verified_user`, `bad_id_tokens_are_rejected_with_stable_codes`, `id_jag_yields_root_token_and_typ_is_enforced` | No `evidence` linking the token to the credential; the credential replay cache is in memory, per process |
 | P2 | `onbehalf-core` (`Capability::covers`, `CapabilitySet::attenuate`, `DelegationChain::extend`/`validate_at`), `onbehalf-token` (`Issuer::exchange`) | core: `set_attenuation_only_narrows`, `union_coverage_is_rejected_conservatively`, `extend_cannot_widen`, `expiry_and_depth`; token: `exchange_cannot_widen_capabilities`, `exchange_ttl_is_clamped_to_parent_expiry`, `max_depth_exceeded_is_rejected` | No proptest suite for `covers` yet |
 | P3 | `onbehalf-policy` (capability stage, then Cedar), `onbehalf-proxy` | policy `engine.rs`: `capability_stage_denies_before_cedar`, `create_issue_argument_rule_allows_acme_and_denies_others`, `github_mcp_over_privileged_token_is_narrowed_by_policy`; proxy: `denied_tools_call_returns_32003_and_never_reaches_upstream`, `github_leak_scenario_repo_prefix_constraint` | Proxy tests use the stub authorizer, not the token verifier |
 | P4 | `onbehalf-audit` (hash chain, `LeaseStore`) | `audit.rs`: `tamper_every_byte_of_record_json_is_detected`, `delete_middle_row_is_detected`, `reordered_rows_are_detected`; `leases.rs`: `revoke_cascades_to_descendants_only`, `renew_rejects_unknown_and_revoked`; server `e2e.rs`: `unrenewed_lease_denies_even_though_the_jwt_is_valid`, `renew_never_goes_beyond_the_parent_lease` | Revocation takes effect on the next request (no lease cache); lease state is not yet pushed to external PEPs |

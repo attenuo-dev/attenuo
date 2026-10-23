@@ -3,9 +3,11 @@
 //!
 //! The signed message is `len(context) as u32 big-endian || context || payload`, so a signature
 //! made for one `context` string never verifies under another, and never verifies as a token
-//! signature or as the originating-user signature (which has no such prefix). The key is the
-//! issuer's own Ed25519 key, so a verifier needs nothing beyond the JWKS the server already
-//! publishes.
+//! signature (a JWS signing input starts with base64url text, never with a length prefix). The
+//! originating-user signature `ou_sig` uses the same framing under the reserved context
+//! [`crate::claims::OU_SIG_CONTEXT`], which [`DetachedSigner::sign`] refuses, so no other
+//! caller of the issuer key can produce one. The key is the issuer's own Ed25519 key, so a
+//! verifier needs nothing beyond the JWKS the server already publishes.
 
 use std::sync::Arc;
 
@@ -15,7 +17,10 @@ use ring::signature::{UnparsedPublicKey, ED25519};
 
 use crate::keys::SigningKey;
 
-fn frame(context: &str, payload: &[u8]) -> Vec<u8> {
+/// Context prefix reserved for `ou_sig` (see [`crate::claims::OU_SIG_CONTEXT`]).
+const RESERVED_PREFIX: &str = "onbehalf-ou-";
+
+pub(crate) fn frame(context: &str, payload: &[u8]) -> Vec<u8> {
     let mut msg = Vec::with_capacity(4 + context.len() + payload.len());
     msg.extend_from_slice(&(context.len() as u32).to_be_bytes());
     msg.extend_from_slice(context.as_bytes());
@@ -48,7 +53,15 @@ impl DetachedSigner {
     }
 
     /// Sign `payload` under `context`. Returns base64url (no padding).
+    ///
+    /// # Panics
+    /// Panics if `context` starts with `onbehalf-ou-`: those contexts are reserved for the
+    /// originating-user signature, which only [`crate::Issuer::issue_root`] makes.
     pub fn sign(&self, context: &str, payload: &[u8]) -> String {
+        assert!(
+            !context.starts_with(RESERVED_PREFIX),
+            "detached signature context `{context}` is reserved for ou_sig"
+        );
         self.key.sign_detached(&frame(context, payload))
     }
 }
@@ -89,6 +102,13 @@ mod tests {
         assert!(!verify_detached(&pk, "ctx-a", b"payloae", &sig));
         assert!(!verify_detached(&other, "ctx-a", b"payload", &sig));
         assert!(!verify_detached(&pk, "ctx-a", b"payload", "***"));
+    }
+
+    #[test]
+    #[should_panic(expected = "reserved for ou_sig")]
+    fn ou_sig_contexts_are_reserved() {
+        let (s, _) = signer();
+        let _ = s.sign(crate::claims::OU_SIG_CONTEXT, b"payload");
     }
 
     #[test]

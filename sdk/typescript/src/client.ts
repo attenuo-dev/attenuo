@@ -47,12 +47,13 @@ export class OnbehalfClient {
    * RFC 8693 token exchange: trade `subjectToken` for a narrower token held by `actor`.
    *
    * For a hop n to n+1 exchange, `subjectToken` is the parent delegation token. For hop 0 (an IdP
-   * credential), pass `clientId` and `clientSecret` of a registered agent; the subject token type
-   * then defaults to an OIDC ID token, or set `subjectTokenType` to
+   * credential), pass `clientId` and `clientSecret` of a registered agent, or its `actorToken`;
+   * the subject token type then defaults to an OIDC ID token, or set `subjectTokenType` to
    * `urn:ietf:params:oauth:token-type:id-jag` for an ID-JAG.
    *
-   * A hop n+1 exchange authenticates the actor with `clientSecret`, or with `actorToken`: a
-   * workload-identity JWT (for example a SPIFFE JWT-SVID) from an `[[actor_trust]]` issuer.
+   * Either kind of request authenticates the agent with `clientSecret`, or with `actorToken`: a
+   * workload-identity JWT (for example a SPIFFE JWT-SVID) from an `[[actor_trust]]` issuer. Each
+   * actor token authenticates one request.
    * `mayAct` lists the agents allowed to exchange the new token next (RFC 8693 §4.4).
    *
    * Throws `ApiError` (`invalid_scope`, `invalid_grant`, ...) on refusal.

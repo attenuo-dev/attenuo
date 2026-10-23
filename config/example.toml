@@ -122,13 +122,14 @@ secret_sha256 = "c0a83cbb212848e0615711bb006be7edb88db29def8c4dae01c7465c6f64e99
 # Require the caller of an exchange to authenticate as its `actor`. Setting this to false makes
 # `actor` an unverified assertion again; the server warns at startup.
 require_actor_auth = true
-# Which credentials authenticate the actor: "secret" ([[agents]] credentials, HTTP Basic or
-# client_id/client_secret), "actor_token" (an RFC 8693 actor_token from an [[actor_trust]]
-# issuer, e.g. a SPIFFE JWT-SVID) or "either". When both are sent, both are checked.
+# Which credentials authenticate the actor of an exchange and the agent at hop 0 (IdP intake):
+# "secret" ([[agents]] credentials, HTTP Basic or client_id/client_secret), "actor_token" (an
+# RFC 8693 actor_token from an [[actor_trust]] issuer, e.g. a SPIFFE JWT-SVID) or "either".
+# When both are sent, both are checked.
 actor_auth = "either"
 
-# Workload identities accepted as `actor_token` on an exchange. Each actor token works for one
-# exchange, and the child token never outlives it. A SPIFFE trust domain, keys from the SPIRE
+# Workload identities accepted as `actor_token` on an exchange or at hop 0. Each actor token
+# works for one request, and the token it obtains never outlives it. A SPIFFE trust domain, keys from the SPIRE
 # server's bundle endpoint (given explicitly, never discovered):
 # [[actor_trust]]
 # spiffe_trust_domain = "example.org"

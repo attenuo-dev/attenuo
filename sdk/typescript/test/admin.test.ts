@@ -204,6 +204,23 @@ describe("AdminClient", () => {
     });
     await admin.mintRootDev("alice", "i", "planner");
     expect(calls[1]!.body).toEqual({ subject: "alice", issuer: "i", agent: "planner" });
+    await admin.mintRootDev("alice", "i", "planner", { mayAct: ["coder", "reviewer"] });
+    expect(calls[2]!.body).toEqual({
+      subject: "alice",
+      issuer: "i",
+      agent: "planner",
+      may_act: { sub: ["coder", "reviewer"] },
+    });
+    // An empty list is sent: nobody may exchange the token.
+    await admin.mintRootDev("alice", "i", "planner", { mayAct: [] });
+    expect(calls[3]!.body).toMatchObject({ may_act: { sub: [] } });
+    await expect(
+      admin.mintRootDev("alice", "i", "planner", { mayAct: "coder" as unknown as string[] }),
+    ).rejects.toThrow(TypeError);
+    await expect(admin.mintRootDev("alice", "i", "planner", { mayAct: [""] })).rejects.toThrow(
+      TypeError,
+    );
+    expect(calls).toHaveLength(4);
   });
 
   it("maps a wrong admin token to ApiError 401", async () => {

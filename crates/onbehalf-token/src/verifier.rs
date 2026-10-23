@@ -4,7 +4,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use onbehalf_core::DelegationChain;
 use time::OffsetDateTime;
 
-use crate::claims::{canonical_user_bytes, ActClaim, Claims, TOKEN_TYPE};
+use crate::claims::{ou_sig_message, ActClaim, Claims, OU_SIG_VERSION, TOKEN_TYPE};
 use crate::error::TokenError;
 use crate::keys::PublicKey;
 
@@ -23,8 +23,9 @@ pub struct VerifiedToken {
 /// of issuer keys, each named by its `kid` (normally the current key plus, during a rotation,
 /// the retired one). A token whose header names a `kid` is checked against that key only; an
 /// unknown `kid` is rejected. A token without a `kid` is tried against each key. The
-/// originating-user signature `ou_sig` must verify under one of the trusted keys: it is made
-/// once at the root and copied into children, which may be signed by a newer key.
+/// originating-user signature `ou_sig` (version 2 only) must verify under the trusted key its
+/// `ou_kid` names: it is made once at the root and copied into children, which may be signed
+/// by a newer key.
 #[derive(Clone)]
 pub struct Verifier {
     keys: Vec<TrustedKey>,
@@ -130,7 +131,8 @@ impl Verifier {
     /// Verify `token` as of `now`.
     ///
     /// Checks, in order: EdDSA signature; header and claim `typ`; `iss`; `aud`; `exp` against
-    /// `now`; `sub`/`act` consistency with the chain; `ou_sig` over the originating-user block;
+    /// `now`; `sub`/`act` consistency with the chain; `ou_sig_v` (only 2 is accepted) and
+    /// `ou_sig` over `iss`, the originating-user block and the root hop, under the `ou_kid` key;
     /// and finally `chain.validate_at(now, max_depth)`. Time is taken from `now`, never from the
     /// system clock, so callers control leeway and tests are deterministic.
     pub fn verify(&self, token: &str, now: OffsetDateTime) -> Result<VerifiedToken, TokenError> {
@@ -196,12 +198,22 @@ impl Verifier {
                 "`exp` does not match the last hop's expiry".into(),
             ));
         }
-        let user_bytes = canonical_user_bytes(&claims.chain.originating_user);
-        if !self
+        if claims.ou_sig_v != OU_SIG_VERSION {
+            // A missing claim deserializes as 0: a version-1 token from before SR-14.
+            return Err(TokenError::UnsupportedOuSig(claims.ou_sig_v.max(1)));
+        }
+        let ou_key = self
             .keys
             .iter()
-            .any(|k| k.public_key.verify_detached(&user_bytes, &claims.ou_sig))
-        {
+            .find(|k| k.kid == claims.ou_kid)
+            .ok_or(TokenError::InvalidSignature)?;
+        let root = claims
+            .chain
+            .hops
+            .first()
+            .ok_or(TokenError::Chain(onbehalf_core::ChainError::NoHops))?;
+        let message = ou_sig_message(&claims.iss, &claims.chain.originating_user, root);
+        if !ou_key.public_key.verify_detached(&message, &claims.ou_sig) {
             return Err(TokenError::InvalidSignature);
         }
         claims.chain.validate_at(now, self.max_depth)?;

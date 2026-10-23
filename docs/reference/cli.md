@@ -50,6 +50,7 @@ Mint a root (hop 0) token. This uses the development endpoint, so it needs the a
 | `--cap` | Capability to request. Omit to take the `[[root_grants]]` ceiling. |
 | `--ttl-seconds` | Requested lifetime. |
 | `--attr` | User attribute. Repeatable. |
+| `--may-act <AGENT>` | Only this agent may exchange the root token (RFC 8693 `may_act`). Repeatable, or comma-separated. Must be within the `[[root_grants]]` entry's `may_act` when it has one; without the flag the grant's `may_act` applies. |
 | `--print token\|lease` | Print only that value, for scripts. |
 
 ### `token exchange`

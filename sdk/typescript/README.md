@@ -90,6 +90,24 @@ capability("github", "list_issues", { state: "open" }); // a bare value means eq
 
 Capabilities serialize as the server expects: `{ server, tool, constraints: { repo: { op: "prefix", value: "..." } } }`, with `constraints` omitted when empty. `exchange` and `mintRootDev` also take `"server:tool"` strings (comma-separated lists too, like the CLI's `--cap`) and raw objects.
 
+### Workload identity and `mayAct`
+
+An agent can authenticate with a workload-identity JWT instead of a client secret: an RFC 8693 `actor_token` from an `[[actor_trust]]` issuer, such as a SPIFFE JWT-SVID. It works at hop 0 (with the user's ID token or ID-JAG as the subject token) and on every exchange. Each actor token authenticates one request, and the token it obtains never outlives it.
+
+```ts
+const svid = await readFile("/run/spire/svid.jwt", "utf8"); // aud = the server
+const root = await ob.exchange(idToken, "planner", ["github:*"], { actorToken: svid });
+```
+
+`mayAct` limits who may exchange a token next (RFC 8693 §4.4). Pass it when exchanging, or when minting a dev root:
+
+```ts
+await ob.exchange(root, "coder", ["github:read_file"], { clientSecret, mayAct: ["reviewer"] });
+await admin.mintRootDev("alice", "https://idp.example", "planner", { mayAct: ["coder"] });
+```
+
+`mayAct` is a list of agent ids (a bare string is a `TypeError`); `[]` means nobody may exchange the token. For a root it must be within the `[[root_grants]]` entry's `may_act` when that has one.
+
 ### Errors
 
 | Error               | When                                                                                                                                                                                                                                                                             |

@@ -12,7 +12,7 @@ use onbehalf_core::{
 };
 use onbehalf_token::{
     Claims, ExchangeRequest, ExchangeResponse, IssueOptions, IssuedToken, Issuer, IssuerConfig,
-    MayAct, TokenError, Verifier, JWT_TOKEN_TYPE_URN, TOKEN_TYPE,
+    MayAct, TokenError, Verifier, JWT_TOKEN_TYPE_URN, OU_SIG_VERSION, TOKEN_TYPE,
 };
 use serde_json::json;
 use time::macros::datetime;
@@ -110,6 +110,8 @@ fn root_issue_verify_round_trip_and_claims_shape() {
     assert!(c.act.act.is_none());
     assert!(!c.jti.is_empty());
     assert!(!c.ou_sig.is_empty());
+    assert_eq!(c.ou_sig_v, OU_SIG_VERSION);
+    assert_eq!(c.ou_kid, issuer.key_id());
 
     // header has the expected alg and typ
     let header = jsonwebtoken::decode_header(&issued.token).unwrap();
@@ -119,7 +121,8 @@ fn root_issue_verify_round_trip_and_claims_shape() {
     // the raw payload has the claim names RFC 8693 consumers expect
     let payload = decode_payload(&issued.token);
     for key in [
-        "iss", "aud", "sub", "act", "jti", "iat", "exp", "chain", "typ", "ou_sig",
+        "iss", "aud", "sub", "act", "jti", "iat", "exp", "chain", "typ", "ou_sig", "ou_sig_v",
+        "ou_kid",
     ] {
         assert!(payload.get(key).is_some(), "missing claim {key}");
     }
@@ -400,7 +403,20 @@ fn exchange_of_an_old_key_parent_is_signed_by_the_new_key_and_verifies() {
         .unwrap();
     assert_eq!(header_of(&child.token)["kid"], new.key_id());
     // ou_sig was made by the old key; the verifier accepts it because that key is trusted.
-    assert!(new.verifier().verify(&child.token, t0()).is_ok());
+    let verified = new.verifier().verify(&child.token, t0()).unwrap();
+    assert_eq!(verified.claims.ou_kid, old.key_id());
+    assert_eq!(verified.claims.ou_sig_v, OU_SIG_VERSION);
+    // A grandchild minted by the new key still carries the old-key v2 signature.
+    let grandchild = new
+        .exchange(
+            &child.token,
+            AgentId::new("agent:reviewer"),
+            caps([Capability::new("github", "read_file")]),
+            None,
+            t0(),
+        )
+        .unwrap();
+    assert!(new.verifier().verify(&grandchild.token, t0()).is_ok());
     // A verifier that dropped the old key rejects the child's user block.
     let only_new = Verifier::from_public_pem(ISS, AUD, 4, &new.public_key_pem()).unwrap();
     assert!(matches!(
@@ -821,4 +837,165 @@ fn not_after_caps_the_child_expiry() {
         )
         .unwrap_err();
     assert!(matches!(err, TokenError::NoLifetimeLeft(_)), "{err}");
+}
+
+/// SR-14: `ou_sig` v2 binds the user to the issuer and to the root hop, so a signature lifted
+/// from one chain does not start another.
+#[test]
+fn ou_sig_cannot_be_lifted_into_a_chain_with_another_root_hop() {
+    let issuer = issuer();
+    // The same user, two chains: a narrow one the attacker saw, and one they want.
+    let narrow = issuer
+        .issue_root(
+            user(),
+            AgentId::new("agent:planner"),
+            caps([Capability::new("github", "read_file")]),
+            None,
+            t0(),
+        )
+        .unwrap();
+    let wide = issuer
+        .issue_root(
+            OriginatingUser {
+                subject: "user:someone-else".into(),
+                ..user()
+            },
+            AgentId::new("agent:evil"),
+            caps([Capability::new("github", "*")]),
+            None,
+            t0(),
+        )
+        .unwrap();
+    // Graft the user block and its ou_sig from `narrow` onto `wide`'s root hop, re-signed by a
+    // trusted key (the multi-issuer / rotation threat).
+    let narrow_p = decode_payload(&narrow.token);
+    let mut payload = decode_payload(&wide.token);
+    payload["chain"]["originating_user"] = narrow_p["chain"]["originating_user"].clone();
+    payload["sub"] = narrow_p["sub"].clone();
+    for k in ["ou_sig", "ou_sig_v", "ou_kid"] {
+        payload[k] = narrow_p[k].clone();
+    }
+    let lifted = resign_with_issuer_key(&issuer, &payload);
+    assert!(matches!(
+        issuer.verifier().verify(&lifted, t0()),
+        Err(TokenError::InvalidSignature)
+    ));
+
+    // Widening the root hop of a real chain in place fails too, although the chain itself
+    // stays valid (only hop 0 grows).
+    let mut payload = decode_payload(&narrow.token);
+    payload["chain"]["hops"][0]["capabilities"] = json!([{"server": "github", "tool": "*"}]);
+    let widened = resign_with_issuer_key(&issuer, &payload);
+    assert!(matches!(
+        issuer.verifier().verify(&widened, t0()),
+        Err(TokenError::InvalidSignature)
+    ));
+    // So does swapping the root agent or the root lease.
+    for (field, value) in [
+        ("agent", json!("agent:evil")),
+        ("lease", json!("other-lease")),
+    ] {
+        let mut payload = decode_payload(&narrow.token);
+        payload["chain"]["hops"][0][field] = value;
+        payload["act"] = json!({"sub": payload["chain"]["hops"][0]["agent"]});
+        let edited = resign_with_issuer_key(&issuer, &payload);
+        assert!(
+            matches!(
+                issuer.verifier().verify(&edited, t0()),
+                Err(TokenError::InvalidSignature)
+            ),
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn ou_sig_is_bound_to_the_issuer() {
+    // Two issuers sharing one key (a multi-issuer deployment that reuses keys, or an operator
+    // mistake): a chain started under one `iss` cannot be relabelled to the other.
+    let a = issuer();
+    let b = Issuer::from_pem(
+        IssuerConfig {
+            issuer: "https://other-onbehalf.example".into(),
+            ..config()
+        },
+        &a.private_key_pem(),
+    )
+    .unwrap();
+    let from_b = root(&b);
+    assert!(b.verifier().verify(&from_b.token, t0()).is_ok());
+    let mut payload = decode_payload(&from_b.token);
+    payload["iss"] = json!(ISS);
+    let relabelled = resign_with_issuer_key(&a, &payload);
+    assert!(matches!(
+        a.verifier().verify(&relabelled, t0()),
+        Err(TokenError::InvalidSignature)
+    ));
+}
+
+#[test]
+fn ou_sig_v1_and_unknown_versions_or_kids_are_refused() {
+    let issuer = issuer();
+    let r = root(&issuer);
+    // A v1 token has no `ou_sig_v` claim.
+    let mut payload = decode_payload(&r.token);
+    payload.as_object_mut().unwrap().remove("ou_sig_v");
+    let v1 = resign_with_issuer_key(&issuer, &payload);
+    let err = issuer.verifier().verify(&v1, t0()).unwrap_err();
+    assert!(matches!(err, TokenError::UnsupportedOuSig(1)), "{err:?}");
+    assert!(err.to_string().contains("re-issue"), "{err}");
+
+    let mut payload = decode_payload(&r.token);
+    payload["ou_sig_v"] = json!(3);
+    let v3 = resign_with_issuer_key(&issuer, &payload);
+    assert!(matches!(
+        issuer.verifier().verify(&v3, t0()),
+        Err(TokenError::UnsupportedOuSig(3))
+    ));
+
+    // `ou_kid` must name a trusted key, and that key must have made the signature.
+    let other = Issuer::generate(config());
+    let mut trusting_both = Issuer::generate(config());
+    trusting_both
+        .trust_previous_key(&other.public_key_pem())
+        .unwrap();
+    trusting_both
+        .trust_previous_key(&issuer.public_key_pem())
+        .unwrap();
+    assert!(trusting_both.verifier().verify(&r.token, t0()).is_ok());
+    for kid in [json!("nope"), json!(other.key_id()), json!("")] {
+        let mut payload = decode_payload(&r.token);
+        payload["ou_kid"] = kid.clone();
+        let tok = resign_with_issuer_key(&issuer, &payload);
+        assert!(
+            matches!(
+                trusting_both.verifier().verify(&tok, t0()),
+                Err(TokenError::InvalidSignature)
+            ),
+            "{kid}"
+        );
+    }
+}
+
+#[test]
+fn ou_sig_stops_verifying_once_its_key_is_dropped() {
+    let old = issuer();
+    let from_old = root(&old);
+    let new = rotated(&old);
+    let child = new
+        .exchange(
+            &from_old.token,
+            AgentId::new("agent:coder"),
+            caps([Capability::new("github", "read_file")]),
+            None,
+            t0(),
+        )
+        .unwrap();
+    // While listed: verifies. Once dropped: the user signature no longer does.
+    assert!(new.verifier().verify(&child.token, t0()).is_ok());
+    let dropped = Issuer::from_pem(config(), &new.private_key_pem()).unwrap();
+    assert!(matches!(
+        dropped.verifier().verify(&child.token, t0()),
+        Err(TokenError::InvalidSignature)
+    ));
 }
