@@ -131,11 +131,19 @@ fn a_burst_triggers_a_checkpoint_before_the_interval() {
     for i in 0..n {
         audit.append(record(i)).unwrap();
     }
-    // The interval is an hour; only the commit count can have started a checkpoint.
+    // The interval is an hour; only the commit count can have started a checkpoint. Keep a
+    // trickle of appends going while waiting, as a live server would: a passive checkpoint
+    // that found the writer in the way copies nothing, and the next commit must re-arm it
+    // (seen on a slow macOS runner, where the first round raced the tail of the burst).
+    let mut i = n;
     wait_for(
         "the count-triggered checkpoint",
-        Duration::from_secs(10),
-        || rows_in_main_file(&path) >= WAL_CHECKPOINT_COMMITS as i64,
+        Duration::from_secs(30),
+        || {
+            audit.append(record(i)).unwrap();
+            i += 1;
+            rows_in_main_file(&path) >= WAL_CHECKPOINT_COMMITS as i64
+        },
     );
     assert!(audit.verify_chain().unwrap().ok);
 }
