@@ -1,6 +1,7 @@
 //! Human-readable rendering of chains, capabilities and times.
 
 use attenuo_core::{ArgConstraint, Capability, CapabilitySet, DelegationChain};
+use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -105,6 +106,308 @@ pub fn render_chain_tree(chain: &DelegationChain, now: OffsetDateTime) -> String
     out
 }
 
+// -- admin API answers --
+//
+// These read the server's JSON as `Value` rather than typed structs: a field the server adds
+// later should not break an older CLI, and a missing one prints as `-`.
+
+/// `v[key]` as text, `-` when absent or not a string.
+fn s<'a>(v: &'a Value, key: &str) -> &'a str {
+    v[key].as_str().unwrap_or("-")
+}
+
+/// The strings of a JSON array.
+fn strs(v: &Value) -> Vec<&str> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect()
+}
+
+/// One line per audit entry.
+pub fn fmt_audit_entry(e: &Value) -> String {
+    let r = &e["record"];
+    let agents = strs(&r["agents"]);
+    // Admin actions have no delegation chain, so no agents.
+    let who = if agents.is_empty() {
+        "by".to_string()
+    } else {
+        format!("{} for", agents.join(" > "))
+    };
+    format!(
+        "#{:<4} {}  {:<5} {}/{}  {} {}  reason={}  id={}",
+        e["seq"].as_u64().unwrap_or(0),
+        s(r, "at"),
+        s(r, "decision").to_uppercase(),
+        s(r, "server"),
+        s(r, "tool"),
+        who,
+        s(r, "originating_subject"),
+        s(r, "reason"),
+        s(r, "id"),
+    )
+}
+
+/// A lease's state as the registry sees it now: `active, expires ...`, `REVOKED ...`,
+/// `expired ...`, or `unknown` for a lease the registry does not hold.
+fn fmt_lease_state(l: &Value) -> String {
+    if l["known"] == false {
+        return "unknown to the lease registry".to_string();
+    }
+    if !l["revoked_at"].is_null() {
+        return format!(
+            "REVOKED {} ({})",
+            s(l, "revoked_at"),
+            l["revoke_reason"].as_str().unwrap_or("no reason")
+        );
+    }
+    if l["active"] == true {
+        format!("active, expires {}", s(l, "expires_at"))
+    } else {
+        format!("expired {}", s(l, "expires_at"))
+    }
+}
+
+/// `audit show`: the entry line, then the record's details and its context
+/// (`{entry, lease_states, covered_by_checkpoint, policy_reloaded_after}`).
+pub fn render_entry_view(v: &Value) -> String {
+    let e = &v["entry"];
+    let r = &e["record"];
+    let mut out = format!("{}\n", fmt_audit_entry(e));
+    out.push_str(&format!("kind        {}\n", s(r, "kind")));
+    if let Some(chain) = r["chain_id"].as_str() {
+        out.push_str(&format!("chain       {chain}\n"));
+    }
+    let policies = strs(&r["policy_ids"]);
+    if !policies.is_empty() {
+        out.push_str(&format!("policies    {}\n", policies.join(", ")));
+    }
+    if r["dpop_bound"] == true {
+        out.push_str("dpop        bound\n");
+    }
+    out.push_str(&format!("hash        {}\n", s(e, "entry_hash")));
+    out.push_str(&format!("prev hash   {}\n", s(e, "prev_hash")));
+    let leases = v["lease_states"].as_array().cloned().unwrap_or_default();
+    if leases.is_empty() {
+        out.push_str("leases      (none)\n");
+    } else {
+        out.push_str("leases      (root first, as the registry sees them now)\n");
+        for l in &leases {
+            out.push_str(&format!("  {}  {}\n", s(l, "lease_id"), fmt_lease_state(l)));
+        }
+    }
+    let cp = &v["covered_by_checkpoint"];
+    if cp.is_null() {
+        out.push_str(
+            "checkpoint  none yet: the entry is newer than every checkpoint, only the hash chain covers it\n",
+        );
+    } else {
+        out.push_str(&format!(
+            "checkpoint  seq {} at {} (kid {}); `audit verify` checks its signature\n",
+            cp["seq"],
+            s(cp, "at"),
+            s(cp, "kid")
+        ));
+    }
+    match v["policy_reloaded_after"].as_u64() {
+        Some(seq) => out.push_str(&format!(
+            "policy      reloaded at seq {seq}, after this entry: the policy in force now may not be the one that decided\n"
+        )),
+        None => out.push_str("policy      not reloaded since this entry\n"),
+    }
+    out
+}
+
+/// `audit checkpoints`: one line per stored checkpoint, newest first, and how to page on.
+pub fn render_checkpoints(v: &Value) -> String {
+    let cps = v["checkpoints"].as_array().cloned().unwrap_or_default();
+    if cps.is_empty() {
+        return "no checkpoints stored\n".to_string();
+    }
+    let mut out = String::new();
+    for c in &cps {
+        out.push_str(&format!(
+            "seq {:<6} {}  kid {}  head {}\n",
+            c["seq"],
+            s(c, "at"),
+            s(c, "kid"),
+            s(c, "head_hash")
+        ));
+    }
+    if let Some(prev) = v["prev"].as_u64() {
+        out.push_str(&format!("older: audit checkpoints --before {prev}\n"));
+    }
+    out
+}
+
+/// One lease of a tree: id, agent, state and the audit seq that issued it.
+fn fmt_tree_node(n: &Value) -> String {
+    let issued = n["issued_seq"]
+        .as_u64()
+        .map(|seq| format!("  issued #{seq}"))
+        .unwrap_or_default();
+    format!(
+        "{}  {}  {}{issued}",
+        s(n, "lease_id"),
+        n["agent"].as_str().unwrap_or("(agent unknown)"),
+        fmt_lease_state(n)
+    )
+}
+
+/// `lease tree`: the ancestors nearest first, then the lease and its descendants drawn as a
+/// tree, then what a revoke would change.
+pub fn render_lease_tree(v: &Value) -> String {
+    let nodes = v["nodes"].as_array().cloned().unwrap_or_default();
+    let mut out = String::new();
+    let ancestors = v["ancestors"].as_array().cloned().unwrap_or_default();
+    if ancestors.is_empty() {
+        out.push_str("root lease (no ancestors)\n");
+    } else {
+        out.push_str(&format!(
+            "ancestors (nearest first, chain root {})\n",
+            s(v, "root")
+        ));
+        for a in &ancestors {
+            out.push_str(&format!("  {}\n", fmt_tree_node(a)));
+        }
+    }
+    // Breadth-first order puts every parent before its children, so a parent-to-children
+    // map drawn from the first node reaches every listed lease.
+    let mut children: std::collections::BTreeMap<&str, Vec<&Value>> = Default::default();
+    for n in nodes.iter().skip(1) {
+        children.entry(s(n, "parent")).or_default().push(n);
+    }
+    fn draw(
+        out: &mut String,
+        n: &Value,
+        prefix: &str,
+        children: &std::collections::BTreeMap<&str, Vec<&Value>>,
+    ) {
+        let kids = children.get(s(n, "lease_id")).cloned().unwrap_or_default();
+        for (i, k) in kids.iter().enumerate() {
+            let last = i + 1 == kids.len();
+            out.push_str(&format!(
+                "{prefix}{}{}\n",
+                if last { "└─ " } else { "├─ " },
+                fmt_tree_node(k)
+            ));
+            let deeper = format!("{prefix}{}", if last { "   " } else { "│  " });
+            draw(out, k, &deeper, children);
+        }
+    }
+    if let Some(first) = nodes.first() {
+        out.push_str(&format!("{}\n", fmt_tree_node(first)));
+        draw(&mut out, first, "", &children);
+    }
+    out.push_str(&format!(
+        "would revoke {} lease(s) if revoked now\n",
+        v["would_revoke"]
+    ));
+    if v["truncated"] == true {
+        out.push_str(&format!(
+            "truncated: only {} leases listed (raise --max-nodes); `would revoke` counts the whole subtree\n",
+            nodes.len()
+        ));
+    }
+    out
+}
+
+/// `policy show`: what the server has loaded, then each policy's text.
+pub fn render_policies(v: &Value) -> String {
+    let ids = strs(&v["policy_ids"]);
+    let mut out = format!(
+        "path       {}\nsha256     {}\nloaded at  {}\npolicies   {}: {}\n",
+        v["path"].as_str().unwrap_or("(no policy file configured)"),
+        s(v, "sha256"),
+        s(v, "loaded_at"),
+        ids.len(),
+        ids.join(", ")
+    );
+    for w in strs(&v["warnings"]) {
+        out.push_str(&format!("warning: {w}\n"));
+    }
+    for p in v["policies"].as_array().into_iter().flatten() {
+        out.push_str(&format!(
+            "\n// {}\n{}\n",
+            s(p, "id"),
+            s(p, "text").trim_end()
+        ));
+    }
+    out
+}
+
+/// `policy check`: the lint issues as `path:line:col: severity[stage] (id): message`, as
+/// `policy lint` prints them, then whether a reload would succeed.
+pub fn render_policy_check(v: &Value) -> String {
+    let path = s(v, "path");
+    let mut out = String::new();
+    for i in v["issues"].as_array().into_iter().flatten() {
+        let loc = match (i["line"].as_u64(), i["column"].as_u64()) {
+            (Some(l), Some(c)) => format!("{path}:{l}:{c}"),
+            _ => path.to_string(),
+        };
+        let id = i["policy_id"]
+            .as_str()
+            .map(|p| format!(" ({p})"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "{loc}: {}[{}]{id}: {}\n",
+            s(i, "severity"),
+            s(i, "stage"),
+            s(i, "message")
+        ));
+    }
+    let n = strs(&v["policy_ids"]).len();
+    out.push_str(&format!(
+        "{path}: {n} polic{}, {} error(s), {} warning(s)\n",
+        if n == 1 { "y" } else { "ies" },
+        v["error_count"],
+        v["warning_count"]
+    ));
+    let differs = if v["differs_from_loaded"] == true {
+        "differs from the loaded policy set"
+    } else {
+        "same as the loaded policy set"
+    };
+    out.push_str(&format!("on disk sha256 {} ({differs})\n", s(v, "sha256")));
+    out.push_str(if v["ok"] == true {
+        "a reload would succeed\n"
+    } else {
+        "a reload would FAIL: the server keeps the loaded set\n"
+    });
+    out
+}
+
+/// `policy evaluate`: the decision, its reason and policies, and what the dry run left out.
+pub fn render_evaluation(v: &Value) -> String {
+    let mut out = format!("{}  {}\n", s(v, "decision").to_uppercase(), s(v, "reason"));
+    let pols = strs(&v["policy_ids"]);
+    if !pols.is_empty() {
+        out.push_str(&format!("policies     {}\n", pols.join(", ")));
+    }
+    let source = match s(v, "chain_source") {
+        "token" if v["token_expired"] == true => {
+            "token (expired; verified as of its last valid second)"
+        }
+        "token" => "token",
+        "admin_supplied" => "admin supplied (shape checked only, not shown to be issued here)",
+        other => other,
+    };
+    out.push_str(&format!("chain from   {source}\n"));
+    out.push_str(&format!(
+        "lease check  {} (dry run: nothing audited)\n",
+        s(v, "lease_check")
+    ));
+    for d in v["diagnostics"].as_array().into_iter().flatten() {
+        match d.as_str() {
+            Some(text) => out.push_str(&format!("diagnostic: {text}\n")),
+            None => out.push_str(&format!("diagnostic: {d}\n")),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +493,80 @@ user alice  (issuer https://idp.example)
             .with_constraint("r", ArgConstraint::OneOf(vec![json!("a"), json!("b")]));
         assert_eq!(fmt_capability(&c), "github:x {n == 1, r in [\"a\", \"b\"]}");
         assert_eq!(fmt_capabilities(&CapabilitySet::new()), "(none)");
+    }
+
+    fn node(id: &str, parent: Option<&str>, agent: &str, revoked: bool) -> Value {
+        json!({"lease_id": id, "parent": parent, "agent": agent, "active": !revoked,
+               "expires_at": "2026-10-23T10:00:00Z",
+               "revoked_at": if revoked { json!("2026-10-23T09:30:00Z") } else { json!(null) },
+               "revoke_reason": if revoked { json!("rotated") } else { json!(null) },
+               "issued_seq": 3})
+    }
+
+    #[test]
+    fn lease_tree_draws_siblings_and_marks_state() {
+        let v = json!({
+            "root": "R",
+            "ancestors": [node("R", None, "planner", false)],
+            "nodes": [
+                node("A", Some("R"), "coder", false),
+                node("B", Some("A"), "reviewer", true),
+                node("C", Some("A"), "tester", false),
+                node("D", Some("B"), "linter", false),
+            ],
+            "would_revoke": 3,
+            "truncated": true,
+        });
+        let expected = "\
+ancestors (nearest first, chain root R)
+  R  planner  active, expires 2026-10-23T10:00:00Z  issued #3
+A  coder  active, expires 2026-10-23T10:00:00Z  issued #3
+├─ B  reviewer  REVOKED 2026-10-23T09:30:00Z (rotated)  issued #3
+│  └─ D  linter  active, expires 2026-10-23T10:00:00Z  issued #3
+└─ C  tester  active, expires 2026-10-23T10:00:00Z  issued #3
+would revoke 3 lease(s) if revoked now
+truncated: only 4 leases listed (raise --max-nodes); `would revoke` counts the whole subtree
+";
+        assert_eq!(render_lease_tree(&v), expected);
+    }
+
+    #[test]
+    fn entry_view_names_unknown_leases_and_missing_checkpoint() {
+        let v = json!({
+            "entry": {"seq": 4, "entry_hash": "h4", "prev_hash": "h3",
+                      "record": {"kind": "admin", "decision": "allow", "agents": []}},
+            "lease_states": [{"lease_id": "L", "known": false, "active": false}],
+            "covered_by_checkpoint": null,
+            "policy_reloaded_after": 9,
+        });
+        let text = render_entry_view(&v);
+        assert!(
+            text.contains("  L  unknown to the lease registry\n"),
+            "{text}"
+        );
+        assert!(text.contains("checkpoint  none yet"), "{text}");
+        assert!(
+            text.contains("reloaded at seq 9, after this entry"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("\nchain "),
+            "admin records have no chain: {text}"
+        );
+    }
+
+    #[test]
+    fn empty_checkpoints_and_expired_evaluation() {
+        assert_eq!(
+            render_checkpoints(&json!({"checkpoints": [], "prev": null})),
+            "no checkpoints stored\n"
+        );
+        let text = render_evaluation(&json!({
+            "decision": "deny", "reason": "policy_deny", "policy_ids": [],
+            "diagnostics": ["no policy matched"], "lease_check": "skipped",
+            "chain_source": "token", "token_expired": true}));
+        assert!(text.starts_with("DENY  policy_deny\n"), "{text}");
+        assert!(text.contains("token (expired"), "{text}");
+        assert!(text.contains("diagnostic: no policy matched"), "{text}");
     }
 }

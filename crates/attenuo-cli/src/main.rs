@@ -23,7 +23,8 @@ use time::OffsetDateTime;
 use cli::{
     AuditCmd, AuthzenCmd, Cli, Command, ExportFormat, Field, KeyCmd, LeaseCmd, PolicyCmd, TokenCmd,
 };
-use client::Client;
+use client::{query_escape, Client};
+use render::fmt_audit_entry;
 
 /// JSON-RPC error code the proxy uses for a denied call.
 const CODE_DENIED: i64 = -32003;
@@ -232,7 +233,10 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 None => json!({}),
             };
             let resp = client?
-                .admin_post(&format!("/admin/leases/{id}/revoke"), &body)
+                .admin_post(
+                    &format!("/admin/leases/{}/revoke", query_escape(&id)),
+                    &body,
+                )
                 .await?;
             if json {
                 print_json(&resp);
@@ -247,7 +251,9 @@ async fn run(cli: Cli) -> Result<Outcome> {
             Ok(Outcome::Ok)
         }
         Command::Lease(LeaseCmd::Show { id }) => {
-            let resp = client?.admin_get(&format!("/admin/leases/{id}")).await?;
+            let resp = client?
+                .admin_get(&format!("/admin/leases/{}", query_escape(&id)))
+                .await?;
             if json {
                 print_json(&resp);
             } else {
@@ -265,11 +271,61 @@ async fn run(cli: Cli) -> Result<Outcome> {
             }
             Ok(Outcome::Ok)
         }
+        Command::Lease(LeaseCmd::Tree { id, max_nodes }) => {
+            let mut path = format!("/admin/leases/{}/tree", query_escape(&id));
+            if let Some(n) = max_nodes {
+                path.push_str(&format!("?max_nodes={n}"));
+            }
+            let resp = client?.admin_get(&path).await?;
+            if json {
+                print_json(&resp);
+            } else {
+                print!("{}", render::render_lease_tree(&resp));
+            }
+            Ok(Outcome::Ok)
+        }
         Command::Audit(AuditCmd::Tail {
             lines,
+            before,
             follow,
             interval_ms,
-        }) => audit_tail(&client?, lines, follow, interval_ms, json).await,
+            filter,
+        }) => audit_tail(&client?, lines, before, &filter, follow, interval_ms, json).await,
+        Command::Audit(AuditCmd::Show { seq, id }) => {
+            let path = match (seq, id) {
+                (Some(seq), _) => format!("/admin/audit/entries/{seq}"),
+                (None, Some(id)) => format!("/admin/audit/records/{}", query_escape(&id)),
+                (None, None) => unreachable!("clap requires a seq or --id"),
+            };
+            let resp = client?.admin_get(&path).await?;
+            if json {
+                print_json(&resp);
+            } else {
+                print!("{}", render::render_entry_view(&resp));
+            }
+            Ok(Outcome::Ok)
+        }
+        Command::Audit(AuditCmd::Checkpoints { before, limit }) => {
+            // The list route only reads; `/admin/audit/checkpoint` (singular) would sign one.
+            let mut query = Vec::new();
+            if let Some(b) = before {
+                query.push(format!("before={b}"));
+            }
+            if let Some(l) = limit {
+                query.push(format!("limit={l}"));
+            }
+            let mut path = "/admin/audit/checkpoints".to_string();
+            if !query.is_empty() {
+                path = format!("{path}?{}", query.join("&"));
+            }
+            let resp = client?.admin_get(&path).await?;
+            if json {
+                print_json(&resp);
+            } else {
+                print!("{}", render::render_checkpoints(&resp));
+            }
+            Ok(Outcome::Ok)
+        }
         Command::Audit(AuditCmd::Verify {
             file: Some(file),
             jwks,
@@ -323,6 +379,43 @@ async fn run(cli: Cli) -> Result<Outcome> {
             policy_cmd::lint(&policy, config.as_deref(), schema, json),
             "policy lint failed to run",
         ),
+        Command::Policy(PolicyCmd::Show) => {
+            let resp = client?.admin_get("/admin/policies").await?;
+            if json {
+                print_json(&resp);
+            } else {
+                print!("{}", render::render_policies(&resp));
+            }
+            Ok(Outcome::Ok)
+        }
+        Command::Policy(PolicyCmd::Check) => {
+            let resp = client?.admin_get("/admin/policies/check").await?;
+            if json {
+                print_json(&resp);
+            } else {
+                print!("{}", render::render_policy_check(&resp));
+            }
+            Ok(if resp["ok"] == true {
+                Outcome::Ok
+            } else {
+                Outcome::No
+            })
+        }
+        Command::Policy(PolicyCmd::Evaluate(a)) => {
+            let client = client?;
+            let body = evaluate_body(&a, &mut stdin)?;
+            let resp = client.admin_post("/admin/policies/evaluate", &body).await?;
+            if json {
+                print_json(&resp);
+            } else {
+                print!("{}", render::render_evaluation(&resp));
+            }
+            Ok(if resp["decision"] == "allow" {
+                Outcome::Ok
+            } else {
+                Outcome::No
+            })
+        }
         Command::Policy(PolicyCmd::Reload) => {
             let resp = client?
                 .admin_post("/admin/policies/reload", &json!({}))
@@ -389,6 +482,42 @@ async fn run(cli: Cli) -> Result<Outcome> {
             Ok(if allow { Outcome::Ok } else { Outcome::No })
         }
     }
+}
+
+/// The body of `POST /admin/policies/evaluate`: the AuthZEN request `authzen eval` sends, plus
+/// either the `token` (the server takes the chain from it and fills the empty subject id) or
+/// the chain from `--chain-file` (then `subject.id` must name its current agent).
+fn evaluate_body(a: &cli::EvaluateArgs, stdin: &mut secrets::Stdin) -> Result<Value> {
+    let input: Map<String, Value> = a.args.iter().cloned().collect();
+    let mut req = json!({
+        "subject": {"type": "agent", "id": ""},
+        "action": {"name": a.tool, "properties": {"server": a.server}},
+        "resource": {"type": "tool", "id": format!("{}/{}", a.server, a.tool)},
+        "context": {"input": input},
+    });
+    match &a.chain_file {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let chain: attenuo_core::DelegationChain = serde_json::from_str(&text)
+                .with_context(|| format!("{} is not a delegation chain", path.display()))?;
+            let agent = chain
+                .current_agent()
+                .map(|a| a.0.clone())
+                .context("the chain has no hops")?;
+            req["subject"] = json!({
+                "type": "agent",
+                "id": agent,
+                "properties": {"chain": serde_json::to_value(&chain)?},
+            });
+        }
+        None => {
+            let token =
+                secrets::resolve_token("--token", a.token.clone(), a.token_file.as_deref(), stdin)?;
+            req["token"] = json!(token);
+        }
+    }
+    Ok(req)
 }
 
 fn print_token(resp: &Value, only: Option<Field>, json: bool) {
@@ -580,19 +709,6 @@ fn verify_lines(resp: &Value) -> Vec<String> {
     out
 }
 
-/// Percent-encode a query value (everything but unreserved characters).
-fn query_escape(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
 /// Request path of `audit export`.
 fn export_path(from: u64, to: Option<u64>, filter: &attenuo_audit::RecordFilter) -> String {
     let mut path = format!("/admin/audit/export?from={from}");
@@ -762,38 +878,20 @@ fn export_lines(v: &Value) -> Vec<String> {
     out
 }
 
-/// One line per audit entry.
-fn fmt_audit_entry(e: &Value) -> String {
-    let r = &e["record"];
-    let agents: Vec<&str> = r["agents"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
-    // Admin actions have no delegation chain, so no agents.
-    let who = if agents.is_empty() {
-        "by".to_string()
-    } else {
-        format!("{} for", agents.join(" > "))
-    };
-    format!(
-        "#{:<4} {}  {:<5} {}/{}  {} {}  reason={}  id={}",
-        e["seq"].as_u64().unwrap_or(0),
-        r["at"].as_str().unwrap_or("-"),
-        r["decision"].as_str().unwrap_or("-").to_uppercase(),
-        r["server"].as_str().unwrap_or("-"),
-        r["tool"].as_str().unwrap_or("-"),
-        who,
-        r["originating_subject"].as_str().unwrap_or("-"),
-        r["reason"].as_str().unwrap_or("-"),
-        r["id"].as_str().unwrap_or("-"),
-    )
-}
+/// Largest page `GET /admin/audit` serves.
+const MAX_AUDIT_PAGE: u64 = 1000;
 
+/// `audit tail`: the newest `lines` matching entries (below `before` when given), read newest
+/// first and printed oldest first, then with `follow` every new matching entry as it comes.
+///
+/// A filtered page may come back short, even empty, with `prev`/`next` set (the server bounds
+/// how far one page scans), so both loops keep following the link rather than stopping at
+/// the first short page.
 async fn audit_tail(
     client: &Client,
     lines: u64,
+    before: Option<u64>,
+    filter: &cli::AuditFilter,
     follow: bool,
     interval_ms: u64,
     json: bool,
@@ -805,18 +903,45 @@ async fn audit_tail(
             println!("{}", fmt_audit_entry(e));
         }
     };
+    let q = filter.query();
+    let want = usize::try_from(lines).unwrap_or(usize::MAX);
+    let mut newest_first: Vec<Value> = Vec::new();
+    let mut cursor = before;
     // `head` comes with any page; unlike `/admin/audit/checkpoint` it signs nothing, so polling
     // with `--follow` does not add a checkpoint per new entry.
-    let head = client
-        .admin_get("/admin/audit?from=1&limit=1")
-        .await
-        .ok()
-        .and_then(|c| c["head"].as_u64())
-        .unwrap_or(0);
-    let mut from = (head + 1).saturating_sub(lines).max(1);
+    let mut head = None;
+    loop {
+        let limit = (lines - newest_first.len() as u64).clamp(1, MAX_AUDIT_PAGE);
+        let mut path = format!("/admin/audit?order=desc&limit={limit}{q}");
+        if let Some(b) = cursor {
+            path.push_str(&format!("&before={b}"));
+        }
+        let page = client.admin_get(&path).await?;
+        head.get_or_insert(page["head"].as_u64().unwrap_or(0));
+        for e in page["entries"].as_array().into_iter().flatten() {
+            if newest_first.len() < want {
+                newest_first.push(e.clone());
+            }
+        }
+        match page["prev"].as_u64() {
+            Some(prev) if newest_first.len() < want => cursor = Some(prev),
+            _ => break,
+        }
+    }
+    for e in newest_first.iter().rev() {
+        show(e);
+    }
+    if !follow {
+        return Ok(Outcome::Ok);
+    }
+    // The first descending page read up to `head` (clap keeps `--before` away from
+    // `--follow`), so everything after it is new.
+    let mut from = head.unwrap_or(0) + 1;
     loop {
         let page = client
-            .admin_get(&format!("/admin/audit?from={from}&limit=1000"))
+            .admin_get(&format!(
+                "/admin/audit?from={from}&limit={MAX_AUDIT_PAGE}{q}"
+            ))
             .await?;
         for e in page["entries"].as_array().into_iter().flatten() {
             show(e);
@@ -824,11 +949,10 @@ async fn audit_tail(
                 from = seq + 1;
             }
         }
-        if page["next"].is_null() {
-            if !follow {
-                return Ok(Outcome::Ok);
-            }
-            tokio::time::sleep(Duration::from_millis(interval_ms.max(50))).await;
+        // `next` is past the entries shown, or past the seqs a short filtered page scanned.
+        match page["next"].as_u64() {
+            Some(next) => from = from.max(next),
+            None => tokio::time::sleep(Duration::from_millis(interval_ms.max(50))).await,
         }
     }
 }

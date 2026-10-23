@@ -322,6 +322,19 @@ pub fn parse_rpc_body(text: &str, sse: bool) -> Option<Value> {
         .find(|v| v.get("result").is_some() || v.get("error").is_some())
 }
 
+/// Percent-encode a query value or a path segment (everything but unreserved characters).
+pub fn query_escape(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
