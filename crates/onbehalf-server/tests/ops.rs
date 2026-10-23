@@ -397,5 +397,5 @@ async fn server_refuses_to_start_with_a_public_metrics_listener() {
     let err = onbehalf_server::build(&cfg).err().expect("must refuse");
     assert!(err.to_string().contains("[metrics] listen"), "{err}");
     cfg.metrics.allow_public = true;
-    onbehalf_server::build(&cfg).unwrap();
+    let _ = onbehalf_server::build(&cfg).unwrap();
 }

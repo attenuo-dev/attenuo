@@ -75,7 +75,7 @@ when {
 };
 ```
 
-Declaring an attribute does not make it appear. The value comes from the verified IdP token: add the claim to `attribute_claims` in the `[[idps]]` entry (`groups` is there by default). If a token carries a value of a different type than declared, for example a string where you declared `set<string>`, the policy errors at evaluation time and onbehalf denies the call with `policy_error`. `onbehalf policy lint --config server.toml` and `onbehalf policy test` (when the test file's `catalog:` points at the server config) read `user_attributes` too, so tests and lint see the same schema as the server.
+Declaring an attribute does not make it appear. The value comes from the verified IdP token: add the claim to `attribute_claims` in the `[[idps]]` entry (`groups` is there by default). If a token carries a value of a different type than declared, for example a string where you declared `set<string>`, onbehalf denies the call before any policy runs, with reason `attribute_type_mismatch` (audited, and shown by `onbehalf policy test`). Nothing is coerced. This matters because Cedar's `!=` across types is `true` without an error: `attributes.status != "suspended"` would otherwise permit `["suspended"]`. Still guard each use with `has` and prefer `.contains` and `like` over `!=` for exclusions. `onbehalf policy lint --config server.toml` and `onbehalf policy test` (when the test file's `catalog:` points at the server config) read `user_attributes` too, so tests and lint see the same schema as the server.
 
 ## Patterns
 

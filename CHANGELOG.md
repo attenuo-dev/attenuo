@@ -8,6 +8,12 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ## [Unreleased]
 
+### Security
+
+- SR-33: declared `originating_user.attributes` types (the built-in `mfa`, `roles`, `tenant`, `email` and `[policy] user_attributes`) are enforced before Cedar runs. A value of another type is denied with reason `attribute_type_mismatch` and audited, so `attributes.status != "suspended"` no longer permits `["suspended"]`. Nothing is coerced.
+- SR-37: an ID token is bound to the agent that presents it. BREAKING: `[[idps]] audience` is ignored for ID tokens; `aud` must contain the agent's client id from the new `[[idps]] client_ids` table (default: the agent id), and `azp` must name it when `aud` has several values or `azp` is present. A token for agent A presented by agent B is refused with `credential_audience_mismatch`. The server warns at startup for each agent without an entry.
+- SR-38: `GET /readyz` returns a fixed shape, `{"ready":false,"checks":{"audit":"error","leases":"ok"}}`, with the storage error in the server log only. BREAKING: the old `status` field and the per-check `{ok,error}` objects are gone. A `[metrics] listen` off loopback is refused at startup unless `[metrics] allow_public = true`, and logs a warning when it is set.
+
 ### Added
 
 - Signed audit checkpoints. `{seq, head_hash, at, kid, signature}`, Ed25519 by the issuer key under the context `onbehalf-checkpoint-v1` (new `onbehalf_token::DetachedSigner` and `verify_detached`), stored in a `checkpoints` table and written every `[audit] checkpoint_every` entries (default 1000) and every `checkpoint_interval_seconds` (default 300). `GET /admin/audit/checkpoint` now returns the signed checkpoint (`hash` stays as an alias of `head_hash`); `GET /admin/audit/verify` also verifies checkpoint signatures against the JWKS keys and reports `checkpoints`, `last_signed_seq`, `unsigned_tail` and `bad_checkpoints`. Keys retired in a rotation keep verifying old checkpoints while they are in the JWKS. `onbehalf audit verify` prints the checkpoint status.
