@@ -28,7 +28,8 @@ pub use checkpoint::{
 pub use error::AuditError;
 pub use export::{
     checkpoint_line, entry_line, header_line, parse_export, to_json_form, verify_export,
-    verify_export_with, Export, ExportHeader, ExportReport, VerifyOptions, EXPORT_FORMAT,
+    verify_export_with, Export, ExportHeader, ExportReport, RecordFilter, VerifyOptions,
+    EXPORT_FORMAT,
 };
 pub use lease::{LeaseStatus, LeaseStore, MemoryLeaseStore};
 pub use log::{

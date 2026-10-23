@@ -279,7 +279,12 @@ async fn run(cli: Cli) -> Result<Outcome> {
             to,
             format,
             out,
-        }) => audit_export(&client?, from, to, format, out.as_deref()).await,
+            kind,
+            chain_id,
+        }) => {
+            let filter = onbehalf_audit::RecordFilter { kind, chain_id };
+            audit_export(&client?, from, to, &filter, format, out.as_deref()).await
+        }
         Command::Audit(AuditCmd::Verify { .. }) => {
             let resp = client?.admin_get("/admin/audit/verify").await?;
             let ok = resp["ok"] == true;
@@ -560,21 +565,47 @@ fn verify_lines(resp: &Value) -> Vec<String> {
     out
 }
 
+/// Percent-encode a query value (everything but unreserved characters).
+fn query_escape(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Request path of `audit export`.
+fn export_path(from: u64, to: Option<u64>, filter: &onbehalf_audit::RecordFilter) -> String {
+    let mut path = format!("/admin/audit/export?from={from}");
+    if let Some(to) = to {
+        path.push_str(&format!("&to={to}"));
+    }
+    if let Some(kind) = filter.kind {
+        path.push_str(&format!("&kind={kind}"));
+    }
+    if let Some(chain_id) = &filter.chain_id {
+        path.push_str(&format!("&chain_id={}", query_escape(chain_id)));
+    }
+    path
+}
+
 /// `audit export`: stream the server's JSON Lines to `out` (or stdout), or collect them into
 /// one JSON object for `--format json`.
 async fn audit_export(
     client: &Client,
     from: u64,
     to: Option<u64>,
+    filter: &onbehalf_audit::RecordFilter,
     format: ExportFormat,
     out: Option<&std::path::Path>,
 ) -> Result<Outcome> {
     use std::io::Write;
 
-    let mut path = format!("/admin/audit/export?from={from}");
-    if let Some(to) = to {
-        path.push_str(&format!("&to={to}"));
-    }
+    let path = export_path(from, to, filter);
     let mut resp = client.admin_get_stream(&path).await?;
     let mut sink: Box<dyn Write> = match out {
         Some(p) => Box::new(std::io::BufWriter::new(
@@ -801,6 +832,23 @@ mod tests {
         assert_eq!(
             lines[2],
             "checkpoint at seq 5 INVALID: signature does not verify"
+        );
+    }
+
+    #[test]
+    fn export_path_carries_range_and_escaped_filters() {
+        use onbehalf_audit::RecordFilter;
+        assert_eq!(
+            export_path(1, None, &RecordFilter::default()),
+            "/admin/audit/export?from=1"
+        );
+        let f = RecordFilter {
+            kind: Some(onbehalf_core::RecordKind::LeaseRenew),
+            chain_id: Some("l 1&x=é".into()),
+        };
+        assert_eq!(
+            export_path(5, Some(9), &f),
+            "/admin/audit/export?from=5&to=9&kind=lease_renew&chain_id=l%201%26x%3D%C3%A9"
         );
     }
 

@@ -428,7 +428,20 @@ pub enum AuditCmd {
         /// Write here instead of stdout.
         #[arg(long)]
         out: Option<std::path::PathBuf>,
+        /// Keep only records of this kind: decision, exchange, root_token, lease_renew,
+        /// lease_revoke or admin. A filtered export has gaps in its hash chain, so
+        /// `audit verify --file` refuses it; verify an unfiltered export, then filter.
+        #[arg(long, value_parser = parse_record_kind)]
+        kind: Option<onbehalf_core::RecordKind>,
+        /// Keep only records of this delegation chain (the `chain_id` field: the lease id of
+        /// the chain's first hop). Same verification caveat as `--kind`.
+        #[arg(long)]
+        chain_id: Option<String>,
     },
+}
+
+fn parse_record_kind(s: &str) -> Result<onbehalf_core::RecordKind, String> {
+    s.parse()
 }
 
 /// Output format of `audit export`.
@@ -904,6 +917,16 @@ mod tests {
             parse(&["audit", "export", "--from", "5", "--to", "9", "--format", "json"]).is_ok()
         );
         assert!(parse(&["audit", "export", "--format", "xml"]).is_err());
+        assert!(parse(&[
+            "audit",
+            "export",
+            "--kind",
+            "lease_renew",
+            "--chain-id",
+            "l1"
+        ])
+        .is_ok());
+        assert!(parse(&["audit", "export", "--kind", "nope"]).is_err());
         assert!(parse(&["nope"]).is_err());
     }
 }

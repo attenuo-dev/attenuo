@@ -34,7 +34,7 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 - [ ] Policy harness follow-ups: report which policies no case exercised, run cases through the AuthZEN endpoint too, a `--schema-file` for custom base schemas, `onbehalf policy test --watch`.
 - [ ] AuthZEN conformance fixtures (the endpoint itself is done).
 - [x] Audit: signed checkpoints every N records and every T seconds, verified against the JWKS, with export and offline verify (`feat/audit-hardening`).
-- [ ] Audit: `kind` for `issue`, `decision`, `renew`, `revoke`, `checkpoint` and `chain_id` (RFC-0001 section 7); ship checkpoints off the host (no built-in sink yet).
+- [x] Audit: top-level `kind` and `chain_id` on every record, `?kind=` / `?chain_id=` on the export endpoint and `audit export --kind --chain-id` (`feat/audit-record-fields-sdk-verify`). Open: ship checkpoints off the host (no built-in sink yet); verifying a filtered export (it is refused today; it would need per-entry inclusion proofs or a signed filter statement); `chain_id` as a token claim and a revocation handle (revoke by chain).
 - [x] Audit: WAL with `[audit] durability`, a dedicated writer thread with group commit, and per-call waste removed on the decision path (`perf/audit-write-path`).
 - [ ] Server: real admin authentication, audit failed exchanges.
 - [ ] CI: proptest with a fixed seed in CI and random locally. Also: confirm the new workflows on GitHub (MSRV 1.89, musl and macOS release builds, GHCR push, cosign, SBOM) with a `v0.0.0-test` tag on a fork; enable private vulnerability reporting and the DCO app; set the GHCR package public.
@@ -42,7 +42,7 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 - [ ] Docs follow-ups from the guides: test the Keycloak, Auth0, Okta, Entra ID and Google recipes (and ID-JAG with Okta) against live tenants and drop the "untested" marks; add a CI check that runs the getting-started commands.
 - [x] Operations gaps from the deploy guide: SIGTERM graceful shutdown, `/readyz`, `/metrics`, key rotation with overlap (`kid`, `previous_key_paths`). Done in `feat/audit-hardening`: automatic signed audit checkpoints, `audit_append_duration_seconds`, SQLite I/O on the blocking pool.
 - [x] Policy: `[policy] user_attributes` declares extra `originating_user.attributes`.
-- [ ] SDK follow-ups: offline `audit verify` (export file plus JWKS) in the SDKs; the CLI has it.
+- [x] SDK offline `audit verify` (export file plus JWKS): `onbehalf.audit.verify_export` and `verifyExport`, cross-checked against the Rust CLI on a real server's export (`feat/audit-record-fields-sdk-verify`).
 - [ ] Python SDK follow-ups: publish to PyPI (name, trusted publishing, release workflow); streaming responses in `call_tool`; test the hop-0 exchange against a live IdP; confirm the Python 3.10 CI job on GitHub (syntax is checked locally by `test_python310_grammar.py`); keep the `kid` check in `inspect(verify=True)` aligned with the server's header and JWKS `kid`. Token-refresh helper (`TokenRefresher`, `AsyncTokenRefresher`) done on `feat/sdk-token-refresh`.
 - [ ] TypeScript SDK follow-ups: publish to npm (scope `@onbehalf`, provenance); streaming in `callTool`; confirm the workflow on GitHub (Node 20 and 22; Ed25519 WebCrypto needs no flag on 20); test hop-0 against a live IdP. Token-refresh helper (`TokenRefresher`, with `provider`/`fetch()` as the per-request token hook) done on `feat/sdk-token-refresh`.
 

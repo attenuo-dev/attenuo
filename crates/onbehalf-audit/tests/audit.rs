@@ -8,7 +8,8 @@ use common::{chain, record, record_for};
 use onbehalf_audit::{
     compute_entry_hash, AuditSink, MemoryAudit, SqliteAudit, VerifyReport, GENESIS_HASH,
 };
-use onbehalf_core::{Decision, LeaseId};
+use onbehalf_audit::{ExportHeader, RecordFilter};
+use onbehalf_core::{Decision, LeaseId, RecordKind};
 use rusqlite::params;
 
 fn sinks() -> Vec<(&'static str, Box<dyn AuditSink>)> {
@@ -382,6 +383,152 @@ fn stored_record_json_is_canonical_sr20() {
     sorted.sort();
     assert_eq!(keys, sorted, "{stored}");
     assert_eq!(onbehalf_core::jcs::to_string(&v).unwrap(), stored);
+}
+
+fn kinded(sink: &SqliteAudit) {
+    let c1 = chain("user:mudit", ("l1", "l2"));
+    let c2 = chain("user:other", ("m1", "m2"));
+    let kinds = [
+        (&c1, RecordKind::Exchange),
+        (&c1, RecordKind::Decision),
+        (&c2, RecordKind::Exchange),
+        (&c2, RecordKind::Decision),
+        (&c1, RecordKind::LeaseRenew),
+        (&c2, RecordKind::Decision),
+    ];
+    for (i, (c, k)) in kinds.into_iter().enumerate() {
+        sink.append(record_for(c, i, Decision::Allow).with_kind(k))
+            .unwrap();
+    }
+}
+
+#[test]
+fn records_carry_kind_and_chain_id_at_the_top_level_of_the_hashed_json() {
+    let s = SqliteAudit::open_in_memory().unwrap();
+    kinded(&s);
+    let e = s.range(1, 10).unwrap();
+    assert_eq!(e[0].record.kind, RecordKind::Exchange);
+    assert_eq!(e[0].record.chain_id.as_deref(), Some("l1"));
+    assert_eq!(e[2].record.chain_id.as_deref(), Some("m1"));
+    let json = onbehalf_audit::canonical_record_json(&e[4].record);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["kind"], "lease_renew");
+    assert_eq!(v["chain_id"], "l1");
+    // The fields are part of the hash: changing either changes it.
+    let mut r = e[4].record.clone();
+    let h = compute_entry_hash(5, &e[4].prev_hash, &r);
+    assert_eq!(h, e[4].entry_hash);
+    r.kind = RecordKind::Decision;
+    assert_ne!(compute_entry_hash(5, &e[4].prev_hash, &r), h);
+    r.kind = RecordKind::LeaseRenew;
+    r.chain_id = None;
+    assert_ne!(compute_entry_hash(5, &e[4].prev_hash, &r), h);
+    assert!(s.verify_chain().unwrap().ok);
+}
+
+#[test]
+fn range_filtered_matches_kind_and_chain_id_within_the_range() {
+    let s = SqliteAudit::open_in_memory().unwrap();
+    kinded(&s);
+    let seqs = |f: RecordFilter, from, to| -> Vec<u64> {
+        s.range_filtered(from, to, &f, 100)
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect()
+    };
+    let kind = |k| RecordFilter {
+        kind: Some(k),
+        chain_id: None,
+    };
+    let chain = |c: &str| RecordFilter {
+        kind: None,
+        chain_id: Some(c.into()),
+    };
+    assert_eq!(seqs(RecordFilter::default(), 1, 6), [1, 2, 3, 4, 5, 6]);
+    assert_eq!(seqs(kind(RecordKind::Decision), 1, 6), [2, 4, 6]);
+    assert_eq!(seqs(kind(RecordKind::Decision), 3, 5), [4]);
+    assert_eq!(seqs(kind(RecordKind::Admin), 1, 6), Vec::<u64>::new());
+    assert_eq!(seqs(chain("l1"), 1, 6), [1, 2, 5]);
+    assert_eq!(seqs(chain("m1"), 1, 6), [3, 4, 6]);
+    assert_eq!(seqs(chain("nope"), 1, 6), Vec::<u64>::new());
+    let both = RecordFilter {
+        kind: Some(RecordKind::Exchange),
+        chain_id: Some("m1".into()),
+    };
+    assert_eq!(seqs(both, 1, 6), [3]);
+    // The limit applies to matches.
+    let f = kind(RecordKind::Decision);
+    assert_eq!(s.range_filtered(1, 6, &f, 2).unwrap().len(), 2);
+}
+
+#[test]
+fn tamper_kind_or_chain_id_column_is_detected() {
+    for sql in [
+        "UPDATE audit SET kind = 'admin' WHERE seq = 2",
+        "UPDATE audit SET chain_id = 'x' WHERE seq = 2",
+        "UPDATE audit SET chain_id = NULL WHERE seq = 2",
+    ] {
+        let s = SqliteAudit::open_in_memory().unwrap();
+        kinded(&s);
+        exec(&s, sql, &[]);
+        let report = s.verify_chain().unwrap();
+        assert_eq!(report.first_bad_seq, Some(2), "{sql}");
+    }
+}
+
+#[test]
+fn a_filtered_export_is_marked_and_refused_by_verification() {
+    let h = ExportHeader::new(1, 6, "2026-10-23T00:00:00Z".into());
+    assert!(h.filter.is_none());
+    assert!(!onbehalf_audit::header_line(&h).contains("filter"));
+    let same = h.clone().with_filter(RecordFilter::default());
+    assert_eq!(same, h);
+    let f = RecordFilter {
+        kind: Some(RecordKind::LeaseRevoke),
+        chain_id: None,
+    };
+    let line = onbehalf_audit::header_line(&h.clone().with_filter(f.clone()));
+    assert!(
+        line.contains(r#""filter":{"kind":"lease_revoke"}"#),
+        "{line}"
+    );
+
+    let s = SqliteAudit::open_in_memory().unwrap();
+    kinded(&s);
+    let mut text = line;
+    for e in s
+        .range(1, 10)
+        .unwrap()
+        .iter()
+        .filter(|e| f.matches(&e.record))
+    {
+        text.push_str(&onbehalf_audit::entry_line(e));
+    }
+    let export = onbehalf_audit::parse_export(&text).unwrap();
+    assert_eq!(export.header.unwrap().filter, Some(f));
+    let keys = onbehalf_audit::CheckpointKeys::from_jwks(&serde_json::json!({"keys": []})).unwrap();
+    let export = onbehalf_audit::parse_export(&text).unwrap();
+    let err = onbehalf_audit::verify_export(&export, &keys).unwrap_err();
+    assert!(err.to_string().contains("filtered"), "{err}");
+}
+
+/// The SDKs (Python `tests/test_audit.py`, TypeScript `test/audit.test.ts`) assert the same
+/// record and hash: it pins the construction across implementations.
+#[test]
+fn entry_hash_golden_vector() {
+    let record: onbehalf_core::DecisionRecord = serde_json::from_value(serde_json::json!({
+        "agents": ["agent:planner"], "arguments_digest": "ab".repeat(32), "chain_depth": 1,
+        "chain_digest": "cd".repeat(32), "chain_id": "l1", "decision": "allow",
+        "id": "00000000-0000-4000-8000-000000000001", "kind": "decision", "leases": ["l1"],
+        "originating_subject": "user:mudit", "reason": "policy_allow", "server": "github",
+        "tool": "read_file", "at": "2026-10-23T12:00:00Z"
+    }))
+    .unwrap();
+    assert_eq!(
+        compute_entry_hash(7, &"11".repeat(32), &record),
+        "9026ac429517fb97a10afa12781cb97297a18ab36085315d82c41ba7b9ba861e"
+    );
 }
 
 /// Fuzzing F4: an entry whose `seq` is `u64::MAX`, with a correct hash, used to overflow

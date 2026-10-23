@@ -216,6 +216,11 @@ pub struct ExportQuery {
     pub from: Option<u64>,
     /// Last sequence number, inclusive (default: the head when the export starts).
     pub to: Option<u64>,
+    /// Only records of this kind (`decision`, `exchange`, `root_token`, `lease_renew`,
+    /// `lease_revoke`, `admin`).
+    pub kind: Option<String>,
+    /// Only records of this delegation chain (the `chain_id` field).
+    pub chain_id: Option<String>,
 }
 
 /// Where a streaming export is.
@@ -229,6 +234,9 @@ enum ExportPhase {
 /// range, as `application/x-ndjson` (one JSON object per line, see
 /// `onbehalf_audit::export`), streamed a page at a time so a large range never sits in memory.
 /// Verify the result offline with `onbehalf audit verify --file`.
+///
+/// `kind` and `chain_id` keep only the matching entries. The header then carries a `filter`
+/// member and the file cannot be verified (its chain has gaps); verify an unfiltered export.
 pub async fn audit_export(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ExportQuery>,
@@ -253,57 +261,79 @@ pub async fn audit_export(
             "`to` must not be smaller than `from`",
         ));
     }
+    let filter = onbehalf_audit::RecordFilter {
+        kind: q
+            .kind
+            .as_deref()
+            .map(str::parse)
+            .transpose()
+            .map_err(|e: String| ApiError::bad_request("invalid_request", e))?,
+        chain_id: q.chain_id.clone(),
+    };
+    if filter.chain_id.as_deref() == Some("") {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "`chain_id` must not be empty",
+        ));
+    }
     let exported_at = now().format(&Rfc3339).map_err(ApiError::internal)?;
-    let header =
-        onbehalf_audit::header_line(&onbehalf_audit::ExportHeader::new(from, to, exported_at));
+    let header = onbehalf_audit::header_line(
+        &onbehalf_audit::ExportHeader::new(from, to, exported_at).with_filter(filter.clone()),
+    );
 
     let first = stream::once(async move { Ok::<_, std::io::Error>(Bytes::from(header)) });
     let rest = stream::unfold(
         (state, ExportPhase::Entries { next: from }),
-        move |(state, phase)| async move {
-            match phase {
-                ExportPhase::Done => None,
-                ExportPhase::Entries { next } if next > to => {
-                    Some((Ok(Bytes::new()), (state, ExportPhase::Checkpoints)))
-                }
-                ExportPhase::Entries { next } => {
-                    let want = usize::try_from(to - next + 1)
-                        .unwrap_or(EXPORT_PAGE)
-                        .min(EXPORT_PAGE);
-                    let page = state.blocking(move |s| s.audit.range(next, want)).await;
-                    match page {
-                        Err(e) => Some((
-                            Err(std::io::Error::other(e.to_string())),
-                            (state, ExportPhase::Done),
-                        )),
-                        Ok(entries) if entries.is_empty() => {
-                            Some((Ok(Bytes::new()), (state, ExportPhase::Checkpoints)))
-                        }
-                        Ok(entries) => {
-                            let last = entries.last().map_or(next, |e| e.seq);
-                            let mut out = String::new();
-                            for e in entries.iter().filter(|e| e.seq <= to) {
-                                out.push_str(&onbehalf_audit::entry_line(e));
+        move |(state, phase)| {
+            let filter = filter.clone();
+            async move {
+                match phase {
+                    ExportPhase::Done => None,
+                    ExportPhase::Entries { next } if next > to => {
+                        Some((Ok(Bytes::new()), (state, ExportPhase::Checkpoints)))
+                    }
+                    ExportPhase::Entries { next } => {
+                        let want = usize::try_from(to - next + 1)
+                            .unwrap_or(EXPORT_PAGE)
+                            .min(EXPORT_PAGE);
+                        let f = filter.clone();
+                        let page = state
+                            .blocking(move |s| s.audit.range_filtered(next, to, &f, want))
+                            .await;
+                        match page {
+                            Err(e) => Some((
+                                Err(std::io::Error::other(e.to_string())),
+                                (state, ExportPhase::Done),
+                            )),
+                            Ok(entries) if entries.is_empty() => {
+                                Some((Ok(Bytes::new()), (state, ExportPhase::Checkpoints)))
                             }
-                            Some((
-                                Ok(Bytes::from(out)),
-                                (state, ExportPhase::Entries { next: last + 1 }),
-                            ))
+                            Ok(entries) => {
+                                let last = entries.last().map_or(next, |e| e.seq);
+                                let mut out = String::new();
+                                for e in entries.iter().filter(|e| e.seq <= to) {
+                                    out.push_str(&onbehalf_audit::entry_line(e));
+                                }
+                                Some((
+                                    Ok(Bytes::from(out)),
+                                    (state, ExportPhase::Entries { next: last + 1 }),
+                                ))
+                            }
                         }
                     }
-                }
-                ExportPhase::Checkpoints => {
-                    let cps = state
-                        .blocking(move |s| s.audit.checkpoints_between(from, to))
-                        .await;
-                    let item = cps
-                        .map(|cps| {
-                            let out: String =
-                                cps.iter().map(onbehalf_audit::checkpoint_line).collect();
-                            Bytes::from(out)
-                        })
-                        .map_err(|e| std::io::Error::other(e.to_string()));
-                    Some((item, (state, ExportPhase::Done)))
+                    ExportPhase::Checkpoints => {
+                        let cps = state
+                            .blocking(move |s| s.audit.checkpoints_between(from, to))
+                            .await;
+                        let item = cps
+                            .map(|cps| {
+                                let out: String =
+                                    cps.iter().map(onbehalf_audit::checkpoint_line).collect();
+                                Bytes::from(out)
+                            })
+                            .map_err(|e| std::io::Error::other(e.to_string()));
+                        Some((item, (state, ExportPhase::Done)))
+                    }
                 }
             }
         },
