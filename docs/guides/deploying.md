@@ -113,7 +113,7 @@ To rotate:
 
 Notes:
 
-- The originating-user block of a token (`ou_sig`) is signed once, at the root, and copied to every child. A child minted after the switch is signed by the new key but still carries an old-key `ou_sig`, so the old key must stay trusted until the whole chain has expired. That is why step 4 waits for the longest chain, not for one token.
+- The originating-user block of a token (`ou_sig`) is signed once, at the root, and copied to every child. A child minted after the switch is signed by the new key but still carries an old-key `ou_sig` (its `ou_kid` names the old key), so the old key must stay trusted until the whole chain has expired. That is why step 4 waits for the longest chain, not for one token.
 - A token whose `kid` is not in the trusted set is rejected with `invalid_grant`, whatever its signature. Tokens issued by a version before `kid` existed carry no `kid` and are tried against every trusted key.
 - Third parties that verify onbehalf tokens offline should select the key by `kid` and refresh the JWKS when they see an unknown one. `onbehalf token inspect --verify` fetches the JWKS and trusts every key in it.
 - In an emergency (key compromise), skip the overlap: replace the key and leave `previous_key_paths` empty. Every outstanding token stops verifying; agents re-run login and exchange.

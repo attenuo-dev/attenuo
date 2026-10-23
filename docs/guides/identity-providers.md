@@ -10,7 +10,7 @@ onbehalf does not log users in. It trusts your identity provider (IdP) for that,
 ## How hop 0 works
 
 1. A user logs in to some application you run, usually the agent platform, using standard OIDC. The application receives an **ID token**.
-2. The agent calls `POST /token` on onbehalf, authenticating as itself with a client id and secret, and passes the ID token as the `subject_token`.
+2. The agent calls `POST /token` on onbehalf, authenticating as itself with a client id and secret (or with a workload-identity token, see [Hop 0 with a JWT-SVID](#hop-0-with-a-jwt-svid)), and passes the ID token as the `subject_token`.
 3. onbehalf finds the `[[idps]]` entry for the token's `iss`, fetches that IdP's signing keys, and verifies the token: signature, algorithm, `iss`, `aud`, `exp`, `iat`, `nbf`, `sub`.
 4. It builds the **originating user** from the verified claims.
 5. It looks up the `[[root_grants]]` entry for this issuer and agent, and attenuates the request against it. If the agent asked for more than the grant allows, it fails.
@@ -24,7 +24,7 @@ Three config lists are involved and they do different jobs:
 | `[[agents]]` | Which agents may present a user credential, and how do they prove who they are? |
 | `[[root_grants]]` | How much may this agent get for the users of this IdP? |
 
-All three must match for hop 0 to work. With no `[[agents]]`, every intake request is rejected.
+All three must match for hop 0 to work. With no `[[agents]]` and no `[[actor_trust]]`, every intake request is rejected.
 
 ## `[[idps]]`
 
@@ -95,7 +95,7 @@ Notes:
 - Use a separate entry and a separate secret for each agent identity. Do not share one across agents.
 - The secret goes in the agent's runtime. Treat a leak as a leak of that agent's root-grant ceiling for every user whose ID token the attacker can also get.
 - Secrets are static. There is no `private_key_jwt` and no mTLS in v0. Rotating one means editing the config and restarting.
-- If an `actor` is sent on an intake request it must equal the client id.
+- If an `actor` is sent on an intake request it must equal the authenticated agent.
 - The same `[[agents]]` entries authenticate sub-agents: a token exchange must authenticate as its `actor`. Give every agent that receives delegated tokens an entry, or a workload identity under [`[[actor_trust]]`](#workload-identity-for-sub-agents).
 - Each ID token or ID-JAG mints one root token. A second presentation, by any agent, is `invalid_grant` / `replayed` (keyed by `iss` and `jti`, or by the whole token when it has no `jti`). The root token expires no later than the credential, and a credential accepted only thanks to `clock_skew_seconds` is refused with `credential_expired`. The record of used credentials is in memory, so it is per server process.
 
@@ -315,6 +315,27 @@ onbehalf token exchange --subject-token "$PARENT" --actor coder \
 What onbehalf checks: the entry (by `iss` when the entry has `issuer`, by the trust domain of `sub`), `alg` in `allowed_algs`, the key by `kid`, the signature, `aud` contains `audience`, `exp` is present and not past, `nbf` and `iat` are not in the future, and `sub` is a well-formed SPIFFE ID in the trust domain. Then `subject_to_agent` must give the exchange's `actor`.
 
 Each actor token authenticates one exchange: a second use is `invalid_grant` / `replayed`. The SPIRE agent caches JWT-SVIDs and may hand out the same one until it is half expired, so fetch a new one per exchange; asking with an extra, unique audience next to onbehalf's URL gets a fresh token, and onbehalf accepts an `aud` array that contains its own value. The child token never outlives the actor token, so with SPIRE's default five-minute JWT-SVIDs a child lives at most five minutes. Use leases and renewals for longer work.
+
+### Hop 0 with a JWT-SVID
+
+The agent that presents the user's ID token can authenticate the same way, so no agent needs an `[[agents]]` secret at all. Send the JWT-SVID as `actor_token` next to the ID token:
+
+```sh
+SVID=$(spire-agent api fetch jwt -audience https://onbehalf.example.com \
+  -socketPath /run/spire/sockets/agent.sock | sed -n 2p | tr -d '[:space:]')
+curl -s https://onbehalf.example.com/token \
+  -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+  -d subject_token="$ID_TOKEN" \
+  -d subject_token_type=urn:ietf:params:oauth:token-type:id_token \
+  -d actor=planner \
+  -d scope="github:read_file github:create_issue" \
+  -d actor_token="$SVID" \
+  -d actor_token_type=urn:ietf:params:oauth:token-type:jwt
+```
+
+From the SDKs: `ob.exchange(id_token, "planner", ["github:*"], actor_token=svid)` (Python) or `ob.exchange(idToken, "planner", ["github:*"], { actorToken: svid })` (TypeScript).
+
+The agent the SVID maps to (here `spiffe://example.org/ns/agents/sa/planner` to `planner`) is the root hop's agent. It must equal `actor` and `client_id` when the request sends them (`actor_mismatch`), the ID token's `aud` must be that agent's client id (`[[idps]] client_ids`), and a `[[root_grants]]` entry must exist for it. The rules are the exchange's: `[token] actor_auth` decides which methods are accepted (`"actor_token"` refuses client secrets here too; `"either"` checks both when both are sent), the SVID is used once, and the root token never outlives it. The ID token and the SVID are recorded as used together, so a request refused for one does not spend the other.
 
 ### Any other workload JWT
 
