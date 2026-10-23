@@ -1,0 +1,635 @@
+{
+ "description": "Same-binary A/B of [audit] wal_checkpoint_seconds, file store, one-hop allow call. variant bin16k = as merged (238d914), bin = intermediate checkpointer restarting the WAL at 4,096 pages; wal0 = SQLite checkpoints on the writer. out = first pair, earlier version of the checkpointer.",
+ "runs": [
+  {
+   "set": "out",
+   "file": "run-1-wal0.json",
+   "results": [
+    {
+     "audit": "memory",
+     "depth": 1,
+     "outcome": "allow",
+     "concurrency": 8,
+     "requests": 23642,
+     "unexpected": 0,
+     "seconds": 8.0,
+     "rps": 2955.3,
+     "mean_us": 2706.2,
+     "p50_us": 1677.3,
+     "p90_us": 3815.4,
+     "p99_us": 20512.8,
+     "max_us": 168296.4,
+     "added": {
+      "p50_us": 1316.9,
+      "p90_us": 3206.1,
+      "p99_us": 18753.6,
+      "mean_us": 2298.5
+     }
+    },
+    {
+     "audit": "memory",
+     "depth": 1,
+     "outcome": "allow",
+     "concurrency": 32,
+     "requests": 31947,
+     "unexpected": 0,
+     "seconds": 8.0,
+     "rps": 3993.4,
+     "mean_us": 8003.6,
+     "p50_us": 5304.3,
+     "p90_us": 19447.8,
+     "p99_us": 32768.0,
+     "max_us": 211157.0,
+     "added": {
+      "p50_us": 4074.5,
+      "p90_us": 17283.1,
+      "p99_us": 27619.3,
+      "mean_us": 6661.2
+     }
+    }
+   ],
+   "meta": {
+    "date_utc": "2026-10-23T07:58:09Z",
+    "host": "vm",
+    "kernel": "6.18.44-fc-v153",
+    "cpus": 4,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "git_rev": null,
+    "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+    "bench_version": "0.1.0",
+    "profile": "release",
+    "duration_s": 8.0,
+    "warmup_s": 2.0,
+    "load": "closed loop, one request in flight per client, loopback, HTTP/1.1 keep-alive",
+    "external_servers": true
+   }
+  },
+  {
+   "set": "out",
+   "file": "run-2-wal5.json",
+   "results": [
+    {
+     "audit": "memory",
+     "depth": 1,
+     "outcome": "allow",
+     "concurrency": 8,
+     "requests": 34873,
+     "unexpected": 0,
+     "seconds": 8.0,
+     "rps": 4359.1,
+     "mean_us": 1833.7,
+     "p50_us": 1517.6,
+     "p90_us": 2820.1,
+     "p99_us": 8175.6,
+     "max_us": 19431.4,
+     "added": {
+      "p50_us": 1139.7,
+      "p90_us": 2131.5,
+      "p99_us": 6402.0,
+      "mean_us": 1402.8
+     }
+    },
+    {
+     "audit": "memory",
+     "depth": 1,
+     "outcome": "allow",
+     "concurrency": 32,
+     "requests": 52586,
+     "unexpected": 0,
+     "seconds": 8.0,
+     "rps": 6573.3,
+     "mean_us": 4868.1,
+     "p50_us": 4247.6,
+     "p90_us": 7036.9,
+     "p99_us": 25198.6,
+     "max_us": 43778.0,
+     "added": {
+      "p50_us": 3331.1,
+      "p90_us": 5144.5,
+      "p99_us": 20852.7,
+      "mean_us": 3739.6
+     }
+    }
+   ],
+   "meta": {
+    "date_utc": "2026-10-23T07:58:50Z",
+    "host": "vm",
+    "kernel": "6.18.44-fc-v153",
+    "cpus": 4,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "git_rev": null,
+    "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+    "bench_version": "0.1.0",
+    "profile": "release",
+    "duration_s": 8.0,
+    "warmup_s": 2.0,
+    "load": "closed loop, one request in flight per client, loopback, HTTP/1.1 keep-alive",
+    "external_servers": true
+   }
+  },
+  {
+   "set": "out",
+   "file": "run-3-wal0.json",
+   "results": [
+    {
+     "audit": "memory",
+     "depth": 1,
+     "outcome": "allow",
+     "concurrency": 8,
+     "requests": 28848,
+     "unexpected": 0,
+     "seconds": 8.0,
+     "rps": 3606.0,
+     "mean_us": 2218.0,
+     "p50_us": 1543.2,
+     "p90_us": 2814.0,
+     "p99_us": 15835.1,
+     "max_us": 24657.9,
+     "added": {
+      "p50_us": 1289.9,
+      "p90_us": 2271.3,
+      "p99_us": 14493.7,
+      "mean_us": 1904.9
+     }
+    },
+    {
+     "audit": "memory",
+     "depth": 1,
+     "outcome": "allow",
+     "concurrency": 32,
+     "requests": 41212,
+     "unexpected": 0,
+     "seconds": 8.0,
+     "rps": 5151.5,
+     "mean_us": 6208.9,
+     "p50_us": 4362.2,
+     "p90_us": 17006.6,
+     "p99_us": 23396.4,
+     "max_us": 41058.3,
+     "added": {
+      "p50_us": 3592.2,
+      "p90_us": 15482.9,
+      "p99_us": 20381.7,
+      "mean_us": 5304.2
+     }
+    }
+   ],
+   "meta": {
+    "date_utc": "2026-10-23T07:59:31Z",
+    "host": "vm",
+    "kernel": "6.18.44-fc-v153",
+    "cpus": 4,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "git_rev": null,
+    "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+    "bench_version": "0.1.0",
+    "profile": "release",
+    "duration_s": 8.0,
+    "warmup_s": 2.0,
+    "load": "closed loop, one request in flight per client, loopback, HTTP/1.1 keep-alive",
+    "external_servers": true
+   }
+  },
+  {
+   "set": "out",
+   "file": "run-4-wal5.json",
+   "results": [
+    {
+     "audit": "memory",
+     "depth": 1,
+     "outcome": "allow",
+     "concurrency": 8,
+     "requests": 36081,
+     "unexpected": 0,
+     "seconds": 8.0,
+     "rps": 4510.1,
+     "mean_us": 1773.1,
+     "p50_us": 1529.9,
+     "p90_us": 2697.2,
+     "p99_us": 5783.6,
+     "max_us": 19234.8,
+     "added": {
+      "p50_us": 1256.0,
+      "p90_us": 2088.4,
+      "p99_us": 4232.2,
+      "mean_us": 1423.7
+     }
+    },
+    {
+     "audit": "memory",
+     "depth": 1,
+     "outcome": "allow",
+     "concurrency": 32,
+     "requests": 49041,
+     "unexpected": 0,
+     "seconds": 8.0,
+     "rps": 6130.1,
+     "mean_us": 5220.1,
+     "p50_us": 4325.4,
+     "p90_us": 7778.3,
+     "p99_us": 27525.1,
+     "max_us": 47939.6,
+     "added": {
+      "p50_us": 3539.0,
+      "p90_us": 6240.3,
+      "p99_us": 24557.5,
+      "mean_us": 4302.9
+     }
+    }
+   ],
+   "meta": {
+    "date_utc": "2026-10-23T08:00:12Z",
+    "host": "vm",
+    "kernel": "6.18.44-fc-v153",
+    "cpus": 4,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "git_rev": null,
+    "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+    "bench_version": "0.1.0",
+    "profile": "release",
+    "duration_s": 8.0,
+    "warmup_s": 2.0,
+    "load": "closed loop, one request in flight per client, loopback, HTTP/1.1 keep-alive",
+    "external_servers": true
+   }
+  },
+  {
+   "set": "out2",
+   "file": "run-1-bin16k-wal5.json",
+   "results": [
+    {
+     "audit": "memory",
+     "depth": 1,
+     "outcome": "allow",
+     "concurrency": 8,
+     "requests": 42362,
+     "unexpected": 0,
+     "seconds": 8.0,
+     "rps": 5295.3,
+     "mean_us": 1510.2,
+     "p50_us": 1346.6,
+     "p90_us": 2197.5,
+     "p99_us": 4005.9,
+     "max_us": 26951.7,
+     "added": {
+      "p50_us": 1013.8,
+      "p90_us": 1516.0,
+      "p99_us": 1804.3,
+      "mean_us": 1094.8
+     }
+    },
+    {
+     "audit": "memory",
+     "depth": 1,
+     "outcome": "allow",
+     "concurrency": 32,
+     "requests": 64436,
+     "unexpected": 0,
+     "seconds": 8.0,
+     "rps": 8054.5,
+     "mean_us": 3971.9,
+     "p50_us": 3477.5,
+     "p90_us": 5603.3,
+     "p99_us": 11411.5,
+     "max_us": 58294.3,
+     "added": {
+      "p50_us": 2731.0,
+      "p90_us": 4251.6,
+      "p99_us": 9082.9,
+      "mean_us": 3139.3
+     }
+    }
+   ],
+   "meta": {
+    "date_utc": "2026-10-23T08:06:18Z",
+    "host": "vm",
+    "kernel": "6.18.44-fc-v153",
+    "cpus": 4,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "git_rev": null,
+    "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+    "bench_version": "0.1.0",
+    "profile": "release",
+    "duration_s": 8.0,
+    "warmup_s": 2.0,
+    "load": "closed loop, one request in flight per client, loopback, HTTP/1.1 keep-alive",
+    "external_servers": true
+   }
+  },
+  {
+   "set": "out2",
+   "file": "run-2-bin-wal5.json",
+   "results": [
+    {
+     "audit": "memory",
+     "depth": 1,
+     "outcome": "allow",
+     "concurrency": 8,
+     "requests": 40376,
+     "unexpected": 0,
+     "seconds": 8.0,
+     "rps": 5047.0,
+     "mean_us": 1584.6,
+     "p50_us": 1375.2,
+     "p90_us": 2258.9,
+     "p99_us": 5324.8,
+     "max_us": 20463.6,
+     "added": {
+      "p50_us": 1114.1,
+      "p90_us": 1743.1,
+      "p99_us": 4247.6,
+      "mean_us": 1278.6
+     }
+    },
+    {
+     "audit": "memory",
+     "depth": 1,
+     "outcome": "allow",
+     "concurrency": 32,
+     "requests": 56484,
+     "unexpected": 0,
+     "seconds": 8.0,
+     "rps": 7060.5,
+     "mean_us": 4532.2,
+     "p50_us": 3868.7,
+     "p90_us": 6291.5,
+     "p99_us": 27869.2,
+     "max_us": 48726.0,
+     "added": {
+      "p50_us": 3097.1,
+      "p90_us": 4847.7,
+      "p99_us": 25098.3,
+      "mean_us": 3647.8
+     }
+    }
+   ],
+   "meta": {
+    "date_utc": "2026-10-23T08:06:59Z",
+    "host": "vm",
+    "kernel": "6.18.44-fc-v153",
+    "cpus": 4,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "git_rev": null,
+    "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+    "bench_version": "0.1.0",
+    "profile": "release",
+    "duration_s": 8.0,
+    "warmup_s": 2.0,
+    "load": "closed loop, one request in flight per client, loopback, HTTP/1.1 keep-alive",
+    "external_servers": true
+   }
+  },
+  {
+   "set": "out2",
+   "file": "run-3-bin-wal0.json",
+   "results": [
+    {
+     "audit": "memory",
+     "depth": 1,
+     "outcome": "allow",
+     "concurrency": 8,
+     "requests": 21756,
+     "unexpected": 0,
+     "seconds": 8.0,
+     "rps": 2719.5,
+     "mean_us": 2941.1,
+     "p50_us": 1866.8,
+     "p90_us": 4077.6,
+     "p99_us": 22855.7,
+     "max_us": 52592.6,
+     "added": {
+      "p50_us": 1583.9,
+      "p90_us": 3481.6,
+      "p99_us": 21554.2,
+      "mean_us": 2594.7
+     }
+    },
+    {
+     "audit": "memory",
+     "depth": 1,
+     "outcome": "allow",
+     "concurrency": 32,
+     "requests": 27171,
+     "unexpected": 0,
+     "seconds": 8.0,
+     "rps": 3396.4,
+     "mean_us": 9422.1,
+     "p50_us": 6172.7,
+     "p90_us": 22151.2,
+     "p99_us": 40828.9,
+     "max_us": 150732.8,
+     "added": {
+      "p50_us": 5255.7,
+      "p90_us": 20075.6,
+      "p99_us": 36630.5,
+      "mean_us": 8271.8
+     }
+    }
+   ],
+   "meta": {
+    "date_utc": "2026-10-23T08:07:40Z",
+    "host": "vm",
+    "kernel": "6.18.44-fc-v153",
+    "cpus": 4,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "git_rev": null,
+    "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+    "bench_version": "0.1.0",
+    "profile": "release",
+    "duration_s": 8.0,
+    "warmup_s": 2.0,
+    "load": "closed loop, one request in flight per client, loopback, HTTP/1.1 keep-alive",
+    "external_servers": true
+   }
+  },
+  {
+   "set": "out2",
+   "file": "run-4-bin16k-wal5.json",
+   "results": [
+    {
+     "audit": "memory",
+     "depth": 1,
+     "outcome": "allow",
+     "concurrency": 8,
+     "requests": 28936,
+     "unexpected": 0,
+     "seconds": 8.0,
+     "rps": 3617.0,
+     "mean_us": 2210.6,
+     "p50_us": 1841.2,
+     "p90_us": 3491.8,
+     "p99_us": 8200.2,
+     "max_us": 34275.3,
+     "added": {
+      "p50_us": 1413.4,
+      "p90_us": 2735.1,
+      "p99_us": 6659.1,
+      "mean_us": 1714.4
+     }
+    },
+    {
+     "audit": "memory",
+     "depth": 1,
+     "outcome": "allow",
+     "concurrency": 32,
+     "requests": 37034,
+     "unexpected": 0,
+     "seconds": 8.0,
+     "rps": 4629.3,
+     "mean_us": 6911.8,
+     "p50_us": 5976.1,
+     "p90_us": 10420.2,
+     "p99_us": 22986.8,
+     "max_us": 86835.2,
+     "added": {
+      "p50_us": 4974.6,
+      "p90_us": 8130.5,
+      "p99_us": 17494.1,
+      "mean_us": 5632.6
+     }
+    }
+   ],
+   "meta": {
+    "date_utc": "2026-10-23T08:08:21Z",
+    "host": "vm",
+    "kernel": "6.18.44-fc-v153",
+    "cpus": 4,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "git_rev": null,
+    "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+    "bench_version": "0.1.0",
+    "profile": "release",
+    "duration_s": 8.0,
+    "warmup_s": 2.0,
+    "load": "closed loop, one request in flight per client, loopback, HTTP/1.1 keep-alive",
+    "external_servers": true
+   }
+  },
+  {
+   "set": "out2",
+   "file": "run-5-bin-wal5.json",
+   "results": [
+    {
+     "audit": "memory",
+     "depth": 1,
+     "outcome": "allow",
+     "concurrency": 8,
+     "requests": 28114,
+     "unexpected": 0,
+     "seconds": 8.0,
+     "rps": 3514.3,
+     "mean_us": 2276.1,
+     "p50_us": 1836.0,
+     "p90_us": 3567.6,
+     "p99_us": 10010.6,
+     "max_us": 48562.2,
+     "added": {
+      "p50_us": 1397.0,
+      "p90_us": 2816.5,
+      "p99_us": 8238.1,
+      "mean_us": 1768.0
+     }
+    },
+    {
+     "audit": "memory",
+     "depth": 1,
+     "outcome": "allow",
+     "concurrency": 32,
+     "requests": 34814,
+     "unexpected": 0,
+     "seconds": 8.0,
+     "rps": 4351.8,
+     "mean_us": 7352.8,
+     "p50_us": 6217.7,
+     "p90_us": 11141.1,
+     "p99_us": 30031.9,
+     "max_us": 76218.4,
+     "added": {
+      "p50_us": 4898.8,
+      "p90_us": 8835.1,
+      "p99_us": 24387.6,
+      "mean_us": 5887.0
+     }
+    }
+   ],
+   "meta": {
+    "date_utc": "2026-10-23T08:09:02Z",
+    "host": "vm",
+    "kernel": "6.18.44-fc-v153",
+    "cpus": 4,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "git_rev": null,
+    "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+    "bench_version": "0.1.0",
+    "profile": "release",
+    "duration_s": 8.0,
+    "warmup_s": 2.0,
+    "load": "closed loop, one request in flight per client, loopback, HTTP/1.1 keep-alive",
+    "external_servers": true
+   }
+  },
+  {
+   "set": "out2",
+   "file": "run-6-bin-wal0.json",
+   "results": [
+    {
+     "audit": "memory",
+     "depth": 1,
+     "outcome": "allow",
+     "concurrency": 8,
+     "requests": 21552,
+     "unexpected": 0,
+     "seconds": 8.0,
+     "rps": 2694.0,
+     "mean_us": 2968.9,
+     "p50_us": 1983.5,
+     "p90_us": 4157.4,
+     "p99_us": 21299.2,
+     "max_us": 43352.1,
+     "added": {
+      "p50_us": 1541.6,
+      "p90_us": 3397.1,
+      "p99_us": 19707.9,
+      "mean_us": 2460.0
+     }
+    },
+    {
+     "audit": "memory",
+     "depth": 1,
+     "outcome": "allow",
+     "concurrency": 32,
+     "requests": 30030,
+     "unexpected": 0,
+     "seconds": 8.0,
+     "rps": 3753.8,
+     "mean_us": 8518.9,
+     "p50_us": 5972.0,
+     "p90_us": 20103.2,
+     "p99_us": 33751.0,
+     "max_us": 57311.2,
+     "added": {
+      "p50_us": 4695.1,
+      "p90_us": 17750.0,
+      "p99_us": 27627.5,
+      "mean_us": 7044.5
+     }
+    }
+   ],
+   "meta": {
+    "date_utc": "2026-10-23T08:09:43Z",
+    "host": "vm",
+    "kernel": "6.18.44-fc-v153",
+    "cpus": 4,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "git_rev": null,
+    "rustc": "rustc 1.97.0 (2d8144b78 2026-07-07)",
+    "bench_version": "0.1.0",
+    "profile": "release",
+    "duration_s": 8.0,
+    "warmup_s": 2.0,
+    "load": "closed loop, one request in flight per client, loopback, HTTP/1.1 keep-alive",
+    "external_servers": true
+   }
+  }
+ ]
+}

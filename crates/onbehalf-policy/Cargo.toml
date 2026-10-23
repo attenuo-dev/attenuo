@@ -26,3 +26,7 @@ criterion = { workspace = true }
 [[bench]]
 name = "authorize"
 harness = false
+
+[[bench]]
+name = "policy_stage"
+harness = false

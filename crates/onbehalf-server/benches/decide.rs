@@ -6,7 +6,8 @@
 //! policy (`PolicyEngine::authorize`), building the `DecisionRecord`, the audit append, and
 //! `Pipeline::decide` as a whole (leases, policy, record, append). Chains of 1 and 3 hops, the
 //! `onbehalf-bench` policy and catalog, SQLite stores in memory and in a temporary file
-//! (`durability` normal and full).
+//! (`durability` normal and full, opened as the server opens them: WAL checkpoints in the
+//! background).
 //!
 //! ```text
 //! cargo bench -p onbehalf-server --bench decide -- --warm-up-time 1 --measurement-time 3
@@ -16,7 +17,10 @@ use std::hint::black_box;
 use std::sync::{Arc, RwLock};
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use onbehalf_audit::{AuditSink, Durability, LeaseStore, SqliteAudit, SqliteLeaseStore};
+use onbehalf_audit::{
+    AuditSink, Durability, LeaseStore, SqliteAudit, SqliteLeaseStore,
+    DEFAULT_WAL_CHECKPOINT_INTERVAL,
+};
 use onbehalf_core::{
     AgentId, Capability, CapabilitySet, Decision, DecisionRecord, OriginatingUser, ToolCall,
 };
@@ -124,10 +128,19 @@ fn stores() -> Vec<Store> {
     ] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.db");
+        // As the server opens them: WAL checkpoints in the background, not on the writer.
+        let audit = SqliteAudit::open_with(&path, durability)
+            .unwrap()
+            .with_wal_checkpoints(DEFAULT_WAL_CHECKPOINT_INTERVAL)
+            .unwrap();
+        let leases = SqliteLeaseStore::open_with(&path, durability)
+            .unwrap()
+            .without_wal_autocheckpoint()
+            .unwrap();
         out.push(Store {
             name,
-            audit: Arc::new(SqliteAudit::open_with(&path, durability).unwrap()),
-            leases: Arc::new(SqliteLeaseStore::open_with(&path, durability).unwrap()),
+            audit: Arc::new(audit),
+            leases: Arc::new(leases),
             _dir: Some(dir),
         });
     }

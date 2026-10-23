@@ -442,3 +442,34 @@ fn durability_parses_from_config_strings() {
     assert_eq!(t.d, Durability::Normal);
     assert!(serde_json::from_str::<T>(r#"{"d":"off"}"#).is_err());
 }
+
+/// An append that finds the store idle commits on the caller's thread: sequential appends
+/// never start the writer thread, and the chain is the same as through the writer.
+#[test]
+fn idle_appends_commit_inline_without_the_writer_thread() {
+    let s = SqliteAudit::open_in_memory().unwrap();
+    for i in 0..20 {
+        assert_eq!(s.append(record(i)).unwrap().seq, i as u64 + 1);
+    }
+    assert!(format!("{s:?}").contains("writer_started: false"), "{s:?}");
+    assert!(s.verify_chain().unwrap().ok);
+
+    // Contended appends go through the writer; mixed with inline ones the chain stays linear.
+    let s = Arc::new(s);
+    let threads: Vec<_> = (0..8)
+        .map(|t| {
+            let s = Arc::clone(&s);
+            std::thread::spawn(move || {
+                for i in 0..100 {
+                    s.append(record(1000 + t * 100 + i)).unwrap();
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    let report = s.verify_chain().unwrap();
+    assert!(report.ok);
+    assert_eq!(report.entries, 820);
+}

@@ -36,4 +36,7 @@ pub use log::{
     GENESIS_HASH,
 };
 pub use memory::MemoryAudit;
-pub use sqlite::{Durability, SqliteAudit, SqliteLeaseStore};
+pub use sqlite::{
+    Durability, SqliteAudit, SqliteLeaseStore, WalCheckpoint, DEFAULT_WAL_CHECKPOINT_INTERVAL,
+    WAL_CHECKPOINT_COMMITS,
+};
