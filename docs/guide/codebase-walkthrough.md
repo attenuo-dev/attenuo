@@ -495,12 +495,12 @@ Read beside: [Injection suite: results](../evaluation/injection-suite.md). Optio
 
 | Order | File | What it does | Lines |
 | --- | --- | --- | --- |
-| 1 | `evaluation/injection-suite/README.md` | What a case is, the five arms (no enforcement, scope only, scope plus constraints, policy only, full attenuo), the dev and test splits. | 130 |
+| 1 | `evaluation/injection-suite/README.md` | What a case is, the five arms (no enforcement, scope only, scope plus constraints, policy only, full attenuo), the dev and test splits. | 138 |
 | 2 | `evaluation/injection-suite/cases/dev/`, `cases/test/`, `policies/` | The case files and the frozen suite policies (hashes in `cases/test/POLICY_HASHES.json`). | data |
 | 3 | `evaluation/injection-suite/label_rules.py` | The labelling oracle: derives each call's expected outcome from the case structure, independent of hand labels. | |
 | 4 | `evaluation/injection-suite/harness.py`, `run.py` | Starts real servers, replays every call through each arm, writes results with SHA-256 of every input. | |
-| 5 | `crates/attenuo-bench/src/lib.rs` | End-to-end load generator: proxy versus direct, by chain depth and concurrency. | 1410 |
-| 6 | `crates/attenuo-core/benches/attenuation.rs`, `crates/attenuo-policy/benches/*.rs`, `crates/attenuo-server/benches/decide.rs` | criterion micro-benchmarks of the hot path. | 580 |
+| 5 | `crates/attenuo-bench/src/lib.rs` | End-to-end load generator: proxy versus direct, by chain depth and concurrency. | 1432 |
+| 6 | `crates/attenuo-core/benches/attenuation.rs`, `crates/attenuo-policy/benches/*.rs`, `crates/attenuo-server/benches/decide.rs` | criterion micro-benchmarks of the hot path. | 575 |
 | 7 | `fuzz/fuzz_targets/` and `fuzz/README.md` | Twelve libFuzzer targets; they assert properties as well as absence of panics. | 12 files |
 
 Check you understood:
