@@ -1,0 +1,83 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "book.toml"
+      - "book-theme/**"
+      - "CHANGELOG.md"
+      - "SECURITY.md"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - "book.toml"
+      - "book-theme/**"
+      - "CHANGELOG.md"
+      - "SECURITY.md"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+# Least privilege by default; the deploy job asks for more.
+permissions:
+  contents: read
+
+# A newer PR push supersedes the running build; a deploy to main is never cancelled half way.
+concurrency:
+  group: docs-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Exact mdBook release, installed from the upstream binary and checked against this digest.
+  MDBOOK_VERSION: "0.4.52"
+  MDBOOK_SHA256: "c0b903f01dd8f4edc644372ad2b80b1fdddd12552d37b6a098657cbd8eddd768"
+
+jobs:
+  build:
+    name: build book
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check relative links
+        run: python3 scripts/check-links.py
+
+      - name: Install mdBook
+        run: |
+          set -euo pipefail
+          url="https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl --proto '=https' --tlsv1.2 -sSfL -o mdbook.tar.gz "$url"
+          echo "${MDBOOK_SHA256}  mdbook.tar.gz" | sha256sum -c -
+          tar -xzf mdbook.tar.gz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Build the book
+        run: |
+          mdbook --version
+          mdbook build
+          # The Obsidian settings in docs/ are not part of the site.
+          rm -rf book/.obsidian
+
+      - uses: actions/configure-pages@v5
+        if: github.event_name != 'pull_request'
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: book
+
+  deploy:
+    name: deploy to GitHub Pages
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
