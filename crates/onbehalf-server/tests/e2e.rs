@@ -25,19 +25,19 @@ const TOOLS: &[&str] = &["read_file", "create_issue", "delete_repo"];
 
 const POLICY_PUBLIC_READS: &str = r#"
 @id("public_reads")
-permit(principal, action == Action::"read_file", resource)
+permit(principal, action == Action::"github/read_file", resource)
 when { context.input has repo && context.input.repo like "alice/public-*" };
 
 @id("issues")
-permit(principal, action == Action::"create_issue", resource);
+permit(principal, action == Action::"github/create_issue", resource);
 "#;
 
 const POLICY_ALL_READS: &str = r#"
 @id("all_reads")
-permit(principal, action == Action::"read_file", resource);
+permit(principal, action == Action::"github/read_file", resource);
 
 @id("issues")
-permit(principal, action == Action::"create_issue", resource);
+permit(principal, action == Action::"github/create_issue", resource);
 "#;
 
 struct Harness {
@@ -644,7 +644,7 @@ async fn admin_actions_are_audited() {
     assert_eq!(resp.status(), StatusCode::OK);
     std::fs::write(
         &h.policy_path,
-        "permit(principal, action == Action::\"nope\", resource);",
+        "permit(principal, action == Action::\"github/nope\", resource);",
     )
     .unwrap();
     let resp = h.admin_post("/admin/policies/reload", json!({})).await;
@@ -1072,7 +1072,7 @@ async fn policy_reload_changes_decision_without_restart() {
     // An invalid file is refused and the last good set stays in force.
     std::fs::write(
         &h.policy_path,
-        "permit(principal, action == Action::\"no_such_tool\", resource);",
+        "permit(principal, action == Action::\"github/no_such_tool\", resource);",
     )
     .unwrap();
     let resp = h.admin_post("/admin/policies/reload", json!({})).await;
@@ -1974,7 +1974,7 @@ async fn mistyped_user_attribute_is_denied_and_audited() {
     std::fs::write(
         &h.policy_path,
         r#"@id("not_suspended")
-permit(principal, action == Action::"read_file", resource)
+permit(principal, action == Action::"github/read_file", resource)
 when { context.originating_user.attributes has status
        && context.originating_user.attributes.status != "suspended" };"#,
     )

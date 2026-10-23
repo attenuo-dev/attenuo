@@ -6,15 +6,17 @@
 //
 // Request shape (see the onbehalf-policy crate docs for the full table):
 //   principal  Agent::"<agent id>"        in User::"<subject>", in earlier Agents of the chain
-//   action     Action::"<tool name>"      in Action::"invoke"
+//   action     Action::"<server>/<tool>"  in Action::"invoke"
 //   resource   Tool::"<server>/<tool>"    in Server::"<server>", attrs readonly/sensitive
 //   context    { input, originating_user, chain, session_id?, now_unix }
 //
 // Tool attributes (`resource.readonly`, `resource.sensitive`) come from the ToolCatalog the
 // engine was built with. Tools that are not registered are neither readonly nor sensitive.
 //
-// This file names Action::"create_issue", so the catalog must register a `create_issue` tool
-// for the set to validate. Give every policy an @id: that id is what shows up in audit records.
+// Actions name their server: Action::"github/create_issue" is create_issue on the server
+// mounted as `github`, and on no other server (SR-13). This file names it, so the catalog
+// must register `create_issue` for server `github` for the set to validate. Give every policy
+// an @id: that id is what shows up in audit records.
 
 // Read-only tools are fine for any agent on behalf of any user.
 // Cedar cannot glob action names (`Action::"read_*"` is not a thing), so tag tools as
@@ -23,11 +25,12 @@
 permit(principal, action, resource)
 when { resource.readonly };
 
-// Issues may be created, but only in the acme organisation's repositories.
+// Issues may be created on the github server, but only in the acme organisation's
+// repositories.
 // `input.repo` is optional in the schema, so guard with `has`: a missing argument must
 // never satisfy an argument-level rule.
 @id("permit_create_issue_in_acme")
-permit(principal, action == Action::"create_issue", resource)
+permit(principal, action == Action::"github/create_issue", resource)
 when { context.input has repo && context.input.repo like "acme/*" };
 
 // Deep delegation chains are almost always a bug or an attack. Cap the depth regardless of

@@ -42,6 +42,13 @@ impl ToolCall {
         self
     }
 
+    /// Check `server` and `tool` against [`crate::names`]: a server name, and a call name (a
+    /// tool name or an MCP method name such as `resources/read`).
+    pub fn check_names(&self) -> Result<(), crate::names::NameError> {
+        crate::names::check_server_name(&self.server)?;
+        crate::names::check_call_name(&self.tool)
+    }
+
     /// Stable digest of the arguments, for audit records (arguments themselves may be sensitive).
     pub fn arguments_digest(&self) -> String {
         sha256_json(&self.arguments)

@@ -6,6 +6,7 @@
 //! - [`DelegationChain`]: the originating user plus every agent hop, with the invariant that
 //!   capabilities only narrow from one hop to the next (monotonic attenuation).
 //! - [`ToolCall`]: a normalized tool invocation to authorize.
+//! - [`names`]: what server and tool names may contain (one rule for every boundary).
 //! - [`Decision`] and [`DecisionRecord`]: the outcome of authorization and the record that the
 //!   audit log stores.
 //!
@@ -17,9 +18,11 @@ pub mod chain;
 pub mod decision;
 pub mod digest;
 pub mod error;
+pub mod names;
 
 pub use call::ToolCall;
 pub use capability::{ArgConstraint, Capability, CapabilitySet};
 pub use chain::{AgentId, DelegationChain, Hop, LeaseId, OriginatingUser};
 pub use decision::{Decision, DecisionRecord};
 pub use error::{AttenuationError, ChainError};
+pub use names::{NameError, NameKind};

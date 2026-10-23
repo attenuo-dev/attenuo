@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::call::ToolCall;
 use crate::error::AttenuationError;
+use crate::names::NameError;
 
 /// A constraint on a single tool argument.
 ///
@@ -139,6 +140,13 @@ impl Capability {
         self
     }
 
+    /// Check the server and tool patterns against [`crate::names`]: `*`, `<prefix>*` or a
+    /// name. A capability that fails this could only ever match names no call can have.
+    pub fn validate(&self) -> Result<(), NameError> {
+        crate::names::check_server_pattern(&self.server)?;
+        crate::names::check_call_pattern(&self.tool)
+    }
+
     /// Does this capability permit every call that `child` permits?
     pub fn covers(&self, child: &Capability) -> bool {
         if !pattern_covers(&self.server, &child.server) || !pattern_covers(&self.tool, &child.tool)
@@ -155,9 +163,11 @@ impl Capability {
         })
     }
 
-    /// Does this capability permit this concrete call?
+    /// Does this capability permit this concrete call? A call whose server or tool name is
+    /// not valid ([`ToolCall::check_names`]) is never permitted.
     pub fn permits(&self, call: &ToolCall) -> bool {
-        pattern_matches(&self.server, &call.server)
+        call.check_names().is_ok()
+            && pattern_matches(&self.server, &call.server)
             && pattern_matches(&self.tool, &call.tool)
             && self.constraints.iter().all(|(arg, c)| {
                 call.arguments
@@ -212,6 +222,11 @@ impl CapabilitySet {
 
     pub fn iter(&self) -> impl Iterator<Item = &Capability> {
         self.0.iter()
+    }
+
+    /// [`Capability::validate`] every member.
+    pub fn validate(&self) -> Result<(), NameError> {
+        self.0.iter().try_for_each(Capability::validate)
     }
 
     /// Does this set permit every call that `child` permits?
@@ -363,6 +378,27 @@ mod tests {
         let child = CapabilitySet::from_iter([Capability::new("github", "create_issue")
             .with_constraint("repo", ArgConstraint::OneOf(vec![json!("a"), json!("b")]))]);
         assert!(!parent.covers(&child));
+    }
+
+    #[test]
+    fn names_are_checked_sr13() {
+        assert!(Capability::new("github", "read_*").validate().is_ok());
+        assert!(Capability::new("*", "resources/read").validate().is_ok());
+        // `/` in a server name would make `Tool::"a/b/c"` ambiguous.
+        assert!(Capability::new("a/b", "c").validate().is_err());
+        assert!(Capability::new("github", "/x").validate().is_err());
+        assert!(Capability::new("github", "").validate().is_err());
+        let set = CapabilitySet::from_iter([
+            Capability::new("github", "*"),
+            Capability::new("evil/x", "*"),
+        ]);
+        assert!(set.validate().is_err());
+        // A call with an invalid name is never permitted, even by `*:*`.
+        let all = Capability::new("*", "*");
+        assert!(all.permits(&call("github", "read_file", json!({}))));
+        assert!(!all.permits(&call("evil/x", "read_file", json!({}))));
+        assert!(!all.permits(&call("github", "", json!({}))));
+        assert!(!all.permits(&call("github", "a//b", json!({}))));
     }
 
     #[test]

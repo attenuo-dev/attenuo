@@ -32,7 +32,7 @@
 //! | Part        | Value |
 //! |-------------|-------|
 //! | `principal` | `Agent::"<current agent id>"` (the last hop of the chain) |
-//! | `action`    | `Action::"<tool name>"`, a member of the generic `Action::"invoke"` |
+//! | `action`    | `Action::"<server>/<tool>"`, a member of the generic `Action::"invoke"` |
 //! | `resource`  | `Tool::"<server>/<tool>"`, `in` its `Server::"<server>"` |
 //! | `context`   | the record below |
 //!
@@ -76,15 +76,29 @@
 //! So policies can say `principal in User::"alice"`, `principal in Agent::"planner"`,
 //! `resource in Server::"github"`, `resource.readonly`, or `principal.chain_depth > 2`.
 //!
+//! ## Actions are server-scoped (SR-13)
+//!
+//! The action id names the server: `action == Action::"github/read_file"` matches `read_file`
+//! on `github` only, never `evil/read_file`. Server names cannot contain `/` and tool names
+//! cannot either (except the MCP method names the proxy maps other requests to, such as
+//! `resources/read`), see [`onbehalf_core::names`]; a call with a name outside those rules is
+//! denied with reason `invalid_name` before anything else runs, and so is a catalog entry at
+//! build time.
+//!
+//! Before SR-13 the action was the bare tool name, `Action::"read_file"`, which matched that
+//! tool on every server. That form is still available, deprecated, behind
+//! [`PolicyEngineBuilder::with_legacy_bare_actions`] (`[policy] legacy_bare_actions = true`);
+//! the two forms cannot be mixed in one policy set. [`lint`] flags bare actions.
+//!
 //! ## Schema and validation
 //!
 //! Every policy set is validated (Cedar strict mode) against a schema at load time, and
 //! validation errors are returned as [`PolicyError::Validation`]. The schema is the base
 //! entity schema ([`DEFAULT_SCHEMA`], or [`PolicyEngineBuilder::with_schema_str`]) plus a
-//! generated fragment: one action per tool name in the catalog, typed `context.input`
+//! generated fragment: one action per catalog entry, typed `context.input`
 //! attributes from [`ToolAttrs::inputs`], and `UserAttributes` from
 //! [`PolicyEngineBuilder::with_user_attr`]. Because Cedar requires actions to be declared, a
-//! policy that names `Action::"x"` validates only if some catalog entry has tool `x`.
+//! policy that names `Action::"s/x"` validates only if the catalog has tool `x` on server `s`.
 //! Evaluation itself is schema-free. A call to a tool that is not in the catalog is handled
 //! as [`UnknownTools`] says: denied with reason `tool_not_in_catalog` by default
 //! ([`PolicyEngineBuilder::with_unknown_tools`]), evaluated as sensitive, or evaluated with
@@ -125,7 +139,7 @@
 //!     ))
 //!     .with_policies_str(
 //!         r#"@id("public_only")
-//!            permit(principal, action == Action::"read_file", resource)
+//!            permit(principal, action == Action::"github/read_file", resource)
 //!            when { context.input has repo && context.input.repo like "alice/public-*" };"#,
 //!     )
 //!     .build()
@@ -161,12 +175,13 @@ use time::OffsetDateTime;
 
 pub use catalog::{parse_user_attributes, ArgType, ToolAttrs, ToolCatalog, UnknownTools};
 pub use lint::{lint, LintIssue, LintReport, LintSeverity};
-pub use schema::{default_user_attrs, DEFAULT_SCHEMA, GENERIC_ACTION};
+pub use lint::{lint_with_options, LintOptions};
+pub use schema::{action_id, default_user_attrs, DEFAULT_SCHEMA, GENERIC_ACTION};
 
 /// The starter policy set shipped with the crate (`policies/default.cedar`).
 ///
-/// It references `Action::"create_issue"`, so it validates only when the catalog registers a
-/// `create_issue` tool.
+/// It references `Action::"github/create_issue"`, so it validates only when the catalog
+/// registers a `create_issue` tool on server `github`.
 pub const DEFAULT_POLICIES: &str = include_str!("../policies/default.cedar");
 
 /// Reason code when the capability stage denies.
@@ -179,6 +194,9 @@ pub const REASON_POLICY_DENY: &str = "policy_deny";
 pub const REASON_POLICY_ERROR: &str = "policy_error";
 /// Reason code when the tool is not in the catalog and [`UnknownTools::Deny`] is in force.
 pub const REASON_TOOL_NOT_IN_CATALOG: &str = "tool_not_in_catalog";
+
+/// Reason code when the call's server or tool name breaks [`onbehalf_core::names`].
+pub const REASON_INVALID_NAME: &str = "invalid_name";
 
 /// Reason code when an originating-user attribute does not have its declared type (SR-33).
 pub const REASON_ATTRIBUTE_TYPE_MISMATCH: &str = "attribute_type_mismatch";
@@ -195,6 +213,9 @@ pub enum PolicyError {
     /// The schema text does not parse.
     #[error("schema error: {0}")]
     Schema(String),
+    /// A catalog entry names a server or tool that breaks [`onbehalf_core::names`].
+    #[error("tool catalog: {0}")]
+    Catalog(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -203,7 +224,7 @@ pub enum PolicyError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
     pub decision: Decision,
-    /// One of `capability_denied`, `tool_not_in_catalog`, `attribute_type_mismatch`,
+    /// One of `invalid_name`, `capability_denied`, `tool_not_in_catalog`, `attribute_type_mismatch`,
     /// `policy_allow`, `policy_deny`, `policy_error`.
     pub reason: String,
     /// Ids of the policies that determined the decision (permits that matched for an allow,
@@ -238,6 +259,7 @@ pub struct PolicyEngineBuilder {
     catalog: ToolCatalog,
     user_attrs: BTreeMap<String, ArgType>,
     unknown_tools: UnknownTools,
+    legacy_bare_actions: bool,
 }
 
 impl Default for PolicyEngineBuilder {
@@ -254,7 +276,17 @@ impl PolicyEngineBuilder {
             catalog: ToolCatalog::new(),
             user_attrs: default_user_attrs(),
             unknown_tools: UnknownTools::default(),
+            legacy_bare_actions: false,
         }
+    }
+
+    /// Use the pre-SR-13 action ids, the bare tool name (`Action::"read_file"`), instead of
+    /// `Action::"<server>/<tool>"`. **Deprecated**: a bare action matches that tool on every
+    /// server. Off by default; meant only to keep an old policy set loading while it is
+    /// rewritten. Callers should warn when it is on.
+    pub fn with_legacy_bare_actions(mut self, on: bool) -> Self {
+        self.legacy_bare_actions = on;
+        self
     }
 
     /// What to do with calls to tools that are not in the catalog. Default
@@ -300,10 +332,16 @@ impl PolicyEngineBuilder {
 
     /// The complete schema text this builder would validate against.
     pub fn schema_text(&self) -> String {
-        schema::generate(&self.base_schema, &self.catalog, &self.user_attrs)
+        schema::generate(
+            &self.base_schema,
+            &self.catalog,
+            &self.user_attrs,
+            self.legacy_bare_actions,
+        )
     }
 
     pub fn build(self) -> Result<PolicyEngine, PolicyError> {
+        self.catalog.validate().map_err(PolicyError::Catalog)?;
         let schema_text = self.schema_text();
         let (schema, _warnings) = Schema::from_cedarschema_str(&schema_text)
             .map_err(|e| PolicyError::Schema(e.to_string()))?;
@@ -323,6 +361,7 @@ impl PolicyEngineBuilder {
             catalog: self.catalog,
             user_attrs: self.user_attrs,
             unknown_tools: self.unknown_tools,
+            legacy_bare_actions: self.legacy_bare_actions,
             authorizer: Authorizer::new(),
             validation_warnings: warnings,
         })
@@ -385,6 +424,7 @@ pub struct PolicyEngine {
     catalog: ToolCatalog,
     user_attrs: BTreeMap<String, ArgType>,
     unknown_tools: UnknownTools,
+    legacy_bare_actions: bool,
     authorizer: Authorizer,
     validation_warnings: Vec<String>,
 }
@@ -400,6 +440,12 @@ impl PolicyEngine {
         call: &ToolCall,
         now: OffsetDateTime,
     ) -> Outcome {
+        // Stage 0: names. A name outside the rules could not have come from a well-behaved
+        // client, and `/` in a server name would make the action and resource ids ambiguous.
+        if let Err(e) = call.check_names() {
+            return Outcome::deny(REASON_INVALID_NAME, vec![e.to_string()]);
+        }
+
         // Stage 1: capabilities.
         let Some(caps) = chain.effective_capabilities() else {
             return Outcome::deny(
@@ -448,7 +494,7 @@ impl PolicyEngine {
         }
 
         // Stage 2: Cedar.
-        let req = match request::build(chain, call, &attrs, now) {
+        let req = match request::build(chain, call, &attrs, now, self.legacy_bare_actions) {
             Ok(r) => r,
             Err(e) => return Outcome::deny(REASON_POLICY_ERROR, vec![e.to_string()]),
         };
@@ -538,5 +584,11 @@ impl PolicyEngine {
     /// The policy for tools that are not in the catalog.
     pub fn unknown_tools(&self) -> UnknownTools {
         self.unknown_tools
+    }
+
+    /// Whether the deprecated bare action ids are in use
+    /// ([`PolicyEngineBuilder::with_legacy_bare_actions`]).
+    pub fn legacy_bare_actions(&self) -> bool {
+        self.legacy_bare_actions
     }
 }

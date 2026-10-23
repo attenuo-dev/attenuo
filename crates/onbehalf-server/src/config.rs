@@ -256,6 +256,11 @@ pub struct PolicySection {
     /// default attributes, so `forbid ... when { resource.sensitive }` does not apply).
     #[serde(default)]
     pub unknown_tools: UnknownTools,
+    /// **Deprecated.** Evaluate with the pre-SR-13 action ids, the bare tool name
+    /// (`Action::"read_file"`), instead of `Action::"<server>/<tool>"`. A bare action matches
+    /// that tool on every server. Default `false`; the server logs a warning when it is on.
+    #[serde(default)]
+    pub legacy_bare_actions: bool,
 }
 
 impl PolicySection {
@@ -581,16 +586,12 @@ pub fn capability_set(specs: &[CapSpec]) -> Result<CapabilitySet, String> {
     specs.iter().map(CapSpec::to_capability).collect()
 }
 
-/// A server name used in `[[upstreams]]`, the catalog or capabilities must not be empty or
-/// contain `/`: the Cedar resource id is `"<server>/<tool>"`, which would be ambiguous (SR-13).
-/// `onbehalf` is reserved for the server's own audit records (SR-34).
+/// A server name used in `[[upstreams]]`, the catalog or capabilities must follow
+/// [`onbehalf_core::names`] (no `/`: the Cedar resource and action ids are
+/// `"<server>/<tool>"`, which would be ambiguous, SR-13). `onbehalf` is reserved for the
+/// server's own audit records (SR-34).
 pub fn check_server_name(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("server name must not be empty".into());
-    }
-    if name.contains('/') {
-        return Err(format!("server name `{name}` must not contain `/`"));
-    }
+    onbehalf_core::names::check_server_name(name).map_err(|e| e.to_string())?;
     if name == crate::routes::AUDIT_SERVER {
         // Audit records of the server's own events (issuance, renewal, admin actions) use
         // this server name; a tool call through an upstream of the same name would be
@@ -610,14 +611,20 @@ impl Config {
         for u in &self.upstreams {
             check_server_name(&u.name).map_err(|e| anyhow::anyhow!("[[upstreams]]: {e}"))?;
         }
-        for ((server, _), _) in self.policy.load_catalog()?.iter() {
+        let catalog = self.policy.load_catalog()?;
+        for ((server, _), _) in catalog.iter() {
             check_server_name(server).map_err(|e| anyhow::anyhow!("[policy] catalog: {e}"))?;
         }
+        catalog
+            .validate()
+            .map_err(|e| anyhow::anyhow!("[policy] catalog: {e}"))?;
         for g in &self.root_grants {
             for cap in capability_set(&g.capabilities)
                 .map_err(|e| anyhow::anyhow!(e))?
                 .iter()
             {
+                cap.validate()
+                    .map_err(|e| anyhow::anyhow!("[[root_grants]]: {e}"))?;
                 if cap.server != "*" {
                     check_server_name(&cap.server)
                         .map_err(|e| anyhow::anyhow!("[[root_grants]]: {e}"))?;
@@ -833,6 +840,36 @@ mod tests {
                   [[root_grants]]\nissuer = \"i\"\nagent = \"a\"\ncapabilities = [\"*:*\"]\n";
         Config::from_toml(ok).unwrap().check_server_names().unwrap();
         assert!(check_server_name("").is_err());
+        // Tool names in the catalog and grants follow the same rules: `/` only between
+        // segments of an MCP method name.
+        let catalog = "[policy.catalog.github.\"/x\"]\nreadonly = true\n";
+        assert!(Config::from_toml(catalog)
+            .unwrap()
+            .check_server_names()
+            .is_err());
+        let catalog = "[policy.catalog.github.\"resources/read\"]\nreadonly = true\n";
+        Config::from_toml(catalog)
+            .unwrap()
+            .check_server_names()
+            .unwrap();
+        let grant =
+            "[[root_grants]]\nissuer = \"i\"\nagent = \"a\"\ncapabilities = [\"github:a//b\"]\n";
+        assert!(Config::from_toml(grant)
+            .unwrap()
+            .check_server_names()
+            .is_err());
+    }
+
+    /// SR-13: actions are server-scoped unless the deprecated switch is on.
+    #[test]
+    fn legacy_bare_actions_defaults_to_off() {
+        assert!(!Config::from_toml("").unwrap().policy.legacy_bare_actions);
+        assert!(
+            Config::from_toml("[policy]\nlegacy_bare_actions = true\n")
+                .unwrap()
+                .policy
+                .legacy_bare_actions
+        );
     }
 
     /// SR-15: weak, placeholder or missing admin tokens are refused off loopback.

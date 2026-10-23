@@ -36,10 +36,10 @@ const JWT: &str = "urn:ietf:params:oauth:token-type:jwt";
 
 const POLICY: &str = r#"
 @id("reads")
-permit(principal, action == Action::"read_file", resource);
+permit(principal, action == Action::"github/read_file", resource);
 
 @id("issues")
-permit(principal, action == Action::"create_issue", resource);
+permit(principal, action == Action::"github/create_issue", resource);
 "#;
 
 // ---------------------------------------------------------------------------------------------

@@ -5,7 +5,7 @@
 //! test the tag on the resource entity: `permit(...) when { resource.readonly }`.
 //!
 //! The catalog also drives the generated part of the Cedar schema: every tool becomes a
-//! declared action and every declared input argument becomes a typed, optional attribute of
+//! declared action (`Action::"<server>/<tool>"`) and every declared input argument becomes a typed, optional attribute of
 //! `context.input`, so the validator can catch typos and type errors in policies at load time.
 
 use std::collections::BTreeMap;
@@ -183,13 +183,29 @@ impl ToolCatalog {
         self.tools.iter()
     }
 
-    /// Distinct tool names across all servers, with the union of their declared inputs.
-    /// Where two servers declare the same argument with different types, the first (in
-    /// `(server, tool)` order) wins.
-    pub(crate) fn actions(&self) -> BTreeMap<String, BTreeMap<String, ArgType>> {
+    /// Check every server and tool name against [`onbehalf_core::names`]: a server name has
+    /// no `/`, and a tool is a tool name or an MCP method name (`resources/read`). Called by
+    /// [`PolicyEngineBuilder::build`](crate::PolicyEngineBuilder::build).
+    pub fn validate(&self) -> Result<(), String> {
+        for (server, tool) in self.tools.keys() {
+            onbehalf_core::names::check_server_name(server)
+                .and_then(|()| onbehalf_core::names::check_call_name(tool))
+                .map_err(|e| format!("catalog entry {server:?} / {tool:?}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Cedar action ids (see [`crate::action_id`]) with the union of their declared inputs.
+    /// In legacy mode several servers can share an action; where two declare the same argument
+    /// with different types, the first (in `(server, tool)` order) wins.
+    pub(crate) fn actions(
+        &self,
+        legacy_bare_actions: bool,
+    ) -> BTreeMap<String, BTreeMap<String, ArgType>> {
         let mut out: BTreeMap<String, BTreeMap<String, ArgType>> = BTreeMap::new();
-        for ((_, tool), attrs) in &self.tools {
-            let entry = out.entry(tool.clone()).or_default();
+        for ((server, tool), attrs) in &self.tools {
+            let id = crate::schema::action_id(server, tool, legacy_bare_actions);
+            let entry = out.entry(id).or_default();
             for (name, ty) in &attrs.inputs {
                 entry.entry(name.clone()).or_insert_with(|| ty.clone());
             }

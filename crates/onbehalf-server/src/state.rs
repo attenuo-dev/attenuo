@@ -271,7 +271,15 @@ fn build_engine(config: &Config) -> anyhow::Result<PolicyEngine> {
     let catalog = config.policy.load_catalog()?;
     let mut builder = PolicyEngineBuilder::new()
         .with_catalog(catalog)
-        .with_unknown_tools(config.policy.unknown_tools);
+        .with_unknown_tools(config.policy.unknown_tools)
+        .with_legacy_bare_actions(config.policy.legacy_bare_actions);
+    if config.policy.legacy_bare_actions {
+        tracing::warn!(
+            "[policy] legacy_bare_actions = true is deprecated: policies name actions as \
+             Action::\"<tool>\", which matches that tool on every server (SR-13). Rewrite them as \
+             Action::\"<server>/<tool>\" (`onbehalf policy lint` lists them) and remove the switch"
+        );
+    }
     let user_attrs = onbehalf_policy::parse_user_attributes(&config.policy.user_attributes)
         .map_err(|e| anyhow::anyhow!("[policy] {e}"))?;
     for (name, ty) in user_attrs {
