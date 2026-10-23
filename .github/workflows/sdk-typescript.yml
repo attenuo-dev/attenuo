@@ -39,8 +39,8 @@ jobs:
       - run: npm test
       - name: Smoke-test the CJS and ESM builds
         run: |
-          node -e "const s = require('./dist/index.cjs'); if (typeof s.OnbehalfClient !== 'function') process.exit(1)"
-          node --input-type=module -e "import('./dist/index.js').then((s) => { if (typeof s.OnbehalfClient !== 'function') process.exit(1) })"
+          node -e "const s = require('./dist/index.cjs'); if (typeof s.AttenuoClient !== 'function') process.exit(1)"
+          node --input-type=module -e "import('./dist/index.js').then((s) => { if (typeof s.AttenuoClient !== 'function') process.exit(1) })"
 
   integration:
     name: Integration (real server, fake MCP upstream, Node ${{ matrix.node }})
@@ -62,10 +62,10 @@ jobs:
             examples/typescript-agent/package-lock.json
       - name: Build the server and the fake MCP upstream
         run: |
-          cargo build -p onbehalf-server -p onbehalf-cli
-          cargo build -p onbehalf-proxy --example fake_mcp
+          cargo build -p attenuo-server -p attenuo-cli
+          cargo build -p attenuo-proxy --example fake_mcp
           mkdir -p .bin/examples
-          cp target/debug/onbehalf-server .bin/
+          cp target/debug/attenuo-server .bin/
           cp target/debug/examples/fake_mcp .bin/examples/
       - run: npm ci && npm run build
         working-directory: sdk/typescript
@@ -74,4 +74,4 @@ jobs:
       - run: npm test
         working-directory: sdk/typescript
         env:
-          ONBEHALF_INTEGRATION: "1"
+          ATTENUO_INTEGRATION: "1"

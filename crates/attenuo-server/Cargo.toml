@@ -1,0 +1,54 @@
+[package]
+name = "attenuo-server"
+description = "The attenuo server: token exchange, AuthZEN PDP, MCP proxy and audit log in one process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "attenuo-server"
+path = "src/main.rs"
+
+[dependencies]
+attenuo-core = { workspace = true }
+attenuo-token = { workspace = true }
+attenuo-policy = { workspace = true }
+attenuo-audit = { workspace = true }
+attenuo-proxy = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true }
+futures-util = { workspace = true }
+hex = { workspace = true }
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
+ring = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+attenuo-proxy = { workspace = true, features = ["testing"] }
+rusqlite = { workspace = true }
+tempfile = { workspace = true }
+
+[[bench]]
+name = "decide"
+harness = false

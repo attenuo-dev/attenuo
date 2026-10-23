@@ -1,6 +1,6 @@
 # Enforcement points
 
-A decision is only useful if something enforces it. onbehalf has one decision pipeline and two ways to reach it. You can use either, or both.
+A decision is only useful if something enforces it. attenuo has one decision pipeline and two ways to reach it. You can use either, or both.
 
 ## One pipeline
 
@@ -16,7 +16,7 @@ If any step fails, the answer is deny. Both enforcement points call the same cod
 
 The proxy is a reverse proxy for MCP over streamable HTTP. Each upstream is mounted at `/mcp/{server}`. An agent points its MCP client at that URL and sends its delegation token as the bearer.
 
-For each request the proxy verifies the token, then asks the pipeline. On allow, it forwards the request to the upstream. It does not pass the onbehalf token on. On deny, it answers with a JSON-RPC error (`-32003`) that carries the reason and the decision id. A bad or expired token gets HTTP 401 and `-32001`.
+For each request the proxy verifies the token, then asks the pipeline. On allow, it forwards the request to the upstream. It does not pass the attenuo token on. On deny, it answers with a JSON-RPC error (`-32003`) that carries the reason and the decision id. A bad or expired token gets HTTP 401 and `-32001`.
 
 The proxy is the enforcement point. The agent cannot skip it, because the upstream is only reachable through it. Run the upstream where the agent cannot reach it directly.
 
@@ -26,7 +26,7 @@ The proxy covers `tools/call` and also maps `resources/read`, `prompts/get` and 
 
 ## The AuthZEN endpoint
 
-`POST /access/v1/evaluation` follows the AuthZEN evaluation shape, and `POST /access/v1/evaluations` takes a batch of them. It lets some other component ask onbehalf for a decision and enforce it itself. That component might be an API gateway, a tool server or a sandbox. onbehalf then acts as a policy decision point (PDP) and the other component is the policy enforcement point (PEP).
+`POST /access/v1/evaluation` follows the AuthZEN evaluation shape, and `POST /access/v1/evaluations` takes a batch of them. It lets some other component ask attenuo for a decision and enforce it itself. That component might be an API gateway, a tool server or a sandbox. attenuo then acts as a policy decision point (PDP) and the other component is the policy enforcement point (PEP).
 
 There is a discovery document at `/.well-known/authzen-configuration`.
 
@@ -43,7 +43,7 @@ Use AuthZEN when the thing that makes the call is not an MCP client you control,
 
 | | Proxy | AuthZEN |
 | --- | --- | --- |
-| Who enforces | onbehalf | The caller of the endpoint |
+| Who enforces | attenuo | The caller of the endpoint |
 | Protocol | MCP over HTTP | AuthZEN evaluation |
 | Agent changes needed | Point at `/mcp/{server}` | None, but the PEP must call the endpoint |
 | If the PEP skips the call | Not possible when the upstream is private | Nothing stops the call |
@@ -57,4 +57,4 @@ Both paths write to the same audit log.
 - Admin routes use one static bearer and should not be public.
 - AuthZEN conformance fixtures are on the task board. Treat conformance with the spec as unverified.
 
-More detail: [design/server.md](../design/server.md#the-decision-pipeline), [ADR-0001](../decisions/0001-separate-enforcement-layer.md) and [RFC-0001 section 5](../spec/rfc-0001-onbehalf.md#5-per-call-authorization).
+More detail: [design/server.md](../design/server.md#the-decision-pipeline), [ADR-0001](../decisions/0001-separate-enforcement-layer.md) and [RFC-0001 section 5](../spec/rfc-0001-attenuo.md#5-per-call-authorization).

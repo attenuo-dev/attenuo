@@ -1,13 +1,13 @@
 """Run the injection suite and write ``results/<date>[-<tag>].json`` and ``.md``.
 
-    ONBEHALF_BIN_DIR=/path/to/bins python3 evaluation/injection-suite/run.py --split all
+    ATTENUO_BIN_DIR=/path/to/bins python3 evaluation/injection-suite/run.py --split all
 
 Options: ``--split dev|test|all`` (default dev), ``--seed N`` to shuffle the order of execution,
-``--cases id,id`` or ``--suite name`` to run a subset, ``--arms direct,onbehalf`` to skip arms,
+``--cases id,id`` or ``--suite name`` to run a subset, ``--arms direct,attenuo`` to skip arms,
 ``--date`` and ``--tag`` to name the output files, ``--out DIR``, ``--keep DIR`` to keep the
 generated configs, logs and audit export.
 
-Exit status 1 if any onbehalf-arm call does not match its expected outcome, if a denied call
+Exit status 1 if any attenuo-arm call does not match its expected outcome, if a denied call
 reached the upstream, or if the audit check fails. Exit status 2, before anything runs, if the
 test split is requested while ``policies/`` differs from its frozen hashes or while the labelling
 oracle (``label_rules.py``) disagrees with a hand label that has no ``label_note``.
@@ -74,14 +74,14 @@ def problems(doc: dict[str, Any]) -> list[str]:
     out = []
     for c in doc["calls"]:
         where = f"{c['arm']} {c['case']}#{c['index']} {c['tool']}"
-        if c["arm"] == "onbehalf" and not c["as_expected"]:
+        if c["arm"] == "attenuo" and not c["as_expected"]:
             out.append(
                 f"{where}: expected {c['expect']}/{c['expect_stage']}, "
                 f"got {c['outcome']}/{c['reason']}"
             )
         if c["outcome"] == "deny" and c["reached_upstream"]:
             out.append(f"{where}: denied but reached the upstream")
-        if c["arm"] != "onbehalf" and c["outcome"] == "error":
+        if c["arm"] != "attenuo" and c["outcome"] == "error":
             out.append(f"{where}: upstream returned an error")
     for arm, a in doc["audit"].items():
         if a["decisions_unmatched"]:
@@ -116,11 +116,11 @@ def _ci(k: int, n: int) -> str:
 
 
 ARM_NAMES = {
-    "direct": "No onbehalf (direct to upstream)",
+    "direct": "No attenuo (direct to upstream)",
     "scope_only": "Scope-only tokens (tool names, no argument constraints, permit-all policy)",
     "scope_constraints": "Tokens with argument constraints, permit-all policy",
     "policy_only": "Suite policy with the root token (no attenuation)",
-    "onbehalf": "onbehalf full",
+    "attenuo": "attenuo full",
 }
 
 
@@ -146,12 +146,12 @@ def arm_rates(doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def taxonomy_rows(doc: dict[str, Any]) -> list[dict[str, Any]]:
-    """Per taxonomy class (test split) or plan class (dev, which has no taxonomy), onbehalf arm:
+    """Per taxonomy class (test split) or plan class (dev, which has no taxonomy), attenuo arm:
     attack calls, how they were stopped, which got through."""
     cm = doc["case_meta"]
     rows: dict[str, dict[str, Any]] = {}
     for c in doc["calls"]:
-        if c["arm"] != "onbehalf":
+        if c["arm"] != "attenuo":
             continue
         key = cm[c["case"]]["taxonomy"] or f"class {cm[c['case']]['class']}"
         r = rows.setdefault(
@@ -194,7 +194,7 @@ def render_split(doc: dict[str, Any], split: str) -> list[str]:
                     t[k] = t.get(k, 0) + v
         return t
 
-    ob = by_arm.get("onbehalf", [])
+    ob = by_arm.get("attenuo", [])
     n_calls = sum(r["attack_calls"] + r["benign_calls"] for r in ob)
     lab = doc["labels"]
     L = [
@@ -224,13 +224,13 @@ def render_split(doc: dict[str, Any], split: str) -> list[str]:
         )
     L += [
         "",
-        "### onbehalf by suite and stage",
+        "### attenuo by suite and stage",
         "",
         "| Suite | Cases | Attack calls | Name | Capability | Policy | Exchange | Lease "
         "| Allowed | Benign calls | Benign denied |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
-    for r in [*ob, total("onbehalf")] if ob else []:
+    for r in [*ob, total("attenuo")] if ob else []:
         L.append(
             f"| {r['suite']} | {r['cases']} | {r['attack_calls']} | {r['blocked_name']} "
             f"| {r['blocked_capability']} | {r['blocked_policy']} | {r['blocked_exchange']} "
@@ -238,7 +238,7 @@ def render_split(doc: dict[str, Any], split: str) -> list[str]:
             f"| {r['benign_denied']} |"
         )
     if ob:
-        t = total("onbehalf")
+        t = total("attenuo")
         L += [
             "",
             f"Calls that did not match the corpus's expected outcome: {t['unexpected']}. "
@@ -249,7 +249,7 @@ def render_split(doc: dict[str, Any], split: str) -> list[str]:
     tax = doc["taxonomy"]
     L += [
         "",
-        "### onbehalf by attack class",
+        "### attenuo by attack class",
         "",
         "Rows are the `taxonomy:` classes of [TAXONOMY.md](../cases/test/TAXONOMY.md) where cases "
         "have one, else the plan's S/C/D/N class.",
@@ -266,13 +266,13 @@ def render_split(doc: dict[str, Any], split: str) -> list[str]:
             f"| {r['benign_denied']}/{r['benign_calls']} |"
         )
 
-    calls = [c for c in doc["calls"] if c["arm"] == "onbehalf"]
+    calls = [c for c in doc["calls"] if c["arm"] == "attenuo"]
     cm = doc["case_meta"]
     missed = [r for r in tax if r["attack_allowed"]]
-    L += ["", "### What onbehalf cannot block", ""]
+    L += ["", "### What attenuo cannot block", ""]
     if missed:
         L += [
-            "Classes with at least one attack call that onbehalf allowed. Each of these calls "
+            "Classes with at least one attack call that attenuo allowed. Each of these calls "
             "uses a tool and arguments the token and the frozen policy permit.",
             "",
             "| Class | Allowed of attack calls | Cases |",
@@ -287,7 +287,7 @@ def render_split(doc: dict[str, Any], split: str) -> list[str]:
         L.append("No attack call was allowed.")
     fn = [c for c in calls if c["role"] == "attack" and c["outcome"] != "deny"]
     fp = [c for c in calls if c["role"] == "benign" and c["outcome"] == "deny"]
-    L += ["", "### Attack calls onbehalf allowed", ""]
+    L += ["", "### Attack calls attenuo allowed", ""]
     if fn:
         L += ["| Case | Class | Call | Why it got through |", "|---|---|---|---|"]
         for c in fn:
@@ -295,7 +295,7 @@ def render_split(doc: dict[str, Any], split: str) -> list[str]:
             L.append(f"| {c['case']} | {cm[c['case']]['class']} | `{c['tool']}` | {why} |")
     else:
         L.append("None.")
-    L += ["", "### Benign calls onbehalf denied", ""]
+    L += ["", "### Benign calls attenuo denied", ""]
     if fp:
         L += ["| Case | Call | Reason | Why |", "|---|---|---|---|"]
         for c in fp:
@@ -332,7 +332,7 @@ def render_split(doc: dict[str, Any], split: str) -> list[str]:
         L.append(
             f"- {arm}: {a['entries']} audit entries; {a['decisions_matched']} of "
             f"{a['decisions_matched'] + len(a['decisions_unmatched'])} call decisions found by id "
-            f"with the same decision and reason; `onbehalf audit verify` exit "
+            f"with the same decision and reason; `attenuo audit verify` exit "
             f"{a['cli_verify_exit']}, offline `audit verify --file` on the export exit "
             f"{a['offline_verify_exit']}."
         )

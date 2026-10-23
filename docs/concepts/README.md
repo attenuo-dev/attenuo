@@ -1,6 +1,6 @@
 # Concepts
 
-Five short pages that explain the ideas behind onbehalf. Read them in order if you are new. Each one points to the spec section and the design note that hold the full detail.
+Five short pages that explain the ideas behind attenuo. Read them in order if you are new. Each one points to the spec section and the design note that hold the full detail.
 
 | Page | What it explains |
 | --- | --- |
@@ -10,4 +10,4 @@ Five short pages that explain the ideas behind onbehalf. Read them in order if y
 | [Audit log](audit-log.md) | What is recorded for every decision and how tampering is detected |
 | [Enforcement points](enforcement-points.md) | The two ways a call reaches the decision: the MCP proxy and the AuthZEN endpoint |
 
-onbehalf is pre-alpha. These pages describe what the code does today. Where the RFC describes something that is not built, the page says so.
+attenuo is pre-alpha. These pages describe what the code does today. Where the RFC describes something that is not built, the page says so.

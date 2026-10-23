@@ -1,4 +1,4 @@
-//! Shared helpers for the onbehalf fuzz targets: JSON and string generators biased towards
+//! Shared helpers for the attenuo fuzz targets: JSON and string generators biased towards
 //! edge cases, and a fixed token issuer whose key the targets can use to re-sign mutated
 //! tokens (so the checks after the signature are reached).
 
@@ -7,8 +7,8 @@ use std::sync::OnceLock;
 use arbitrary::{Result, Unstructured};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
-use onbehalf_core::{AgentId, Capability, CapabilitySet, OriginatingUser};
-use onbehalf_token::{Issuer, IssuerConfig, Verifier};
+use attenuo_core::{AgentId, Capability, CapabilitySet, OriginatingUser};
+use attenuo_token::{Issuer, IssuerConfig, Verifier};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{Map, Number, Value};
 use time::{Duration, OffsetDateTime};
@@ -44,7 +44,7 @@ const EDGE_STRINGS: &[&str] = &[
     "%00",
     "../",
     "dpop+jwt",
-    "onbehalf+jwt",
+    "attenuo+jwt",
     "EdDSA",
     "ES256",
     "none",
@@ -147,7 +147,7 @@ pub fn json_value(u: &mut Unstructured<'_>, depth: u32) -> Result<Value> {
 }
 
 /// The issuer string of the fixed issuer.
-pub const ISS: &str = "https://onbehalf.fuzz";
+pub const ISS: &str = "https://attenuo.fuzz";
 /// The audience of the fixed issuer.
 pub const AUD: &str = "mcp-proxy";
 /// Max chain depth of the fixed issuer.
@@ -248,9 +248,9 @@ pub fn fixture() -> &'static Fixture {
 
 impl Fixture {
     /// Sign `claims` as a JWT with the fixed key. `header` replaces the standard
-    /// `{"alg":"EdDSA","typ":"onbehalf+jwt","kid":..}` when given.
+    /// `{"alg":"EdDSA","typ":"attenuo+jwt","kid":..}` when given.
     pub fn sign_jwt(&self, header: Option<&Value>, claims: &Value) -> String {
-        let default = serde_json::json!({"alg": "EdDSA", "typ": "onbehalf+jwt", "kid": self.kid});
+        let default = serde_json::json!({"alg": "EdDSA", "typ": "attenuo+jwt", "kid": self.kid});
         let h = URL_SAFE_NO_PAD.encode(serde_json::to_vec(header.unwrap_or(&default)).unwrap());
         let p = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
         let input = format!("{h}.{p}");
@@ -269,9 +269,9 @@ impl Fixture {
         let root = claims
             .pointer("/chain/hops/0")
             .cloned()
-            .and_then(|v| serde_json::from_value::<onbehalf_core::Hop>(v).ok());
+            .and_then(|v| serde_json::from_value::<attenuo_core::Hop>(v).ok());
         if let (Some(iss), Some(user), Some(root)) = (iss, user, root) {
-            let msg = onbehalf_token::claims::ou_sig_message(&iss, &user, &root);
+            let msg = attenuo_token::claims::ou_sig_message(&iss, &user, &root);
             let sig = URL_SAFE_NO_PAD.encode(self.pair.sign(&msg).as_ref());
             if let Some(obj) = claims.as_object_mut() {
                 obj.insert("ou_sig".into(), Value::String(sig));
@@ -283,7 +283,7 @@ impl Fixture {
 /// Check, independently of `validate_at`, the properties an accepted chain must have:
 /// bounded depth, a non-empty subject, and every hop narrower and no longer-lived than its
 /// parent. Panics (a fuzz finding) if one does not hold.
-pub fn assert_chain_sound(chain: &onbehalf_core::DelegationChain, now: OffsetDateTime) {
+pub fn assert_chain_sound(chain: &attenuo_core::DelegationChain, now: OffsetDateTime) {
     assert!(!chain.originating_user.subject.is_empty());
     assert!(!chain.hops.is_empty() && chain.hops.len() <= MAX_DEPTH);
     for (i, hop) in chain.hops.iter().enumerate() {
@@ -305,20 +305,20 @@ pub fn assert_chain_sound(chain: &onbehalf_core::DelegationChain, now: OffsetDat
 
 /// A small, valid, signed audit export and the keys that verify it.
 pub struct AuditFixture {
-    pub export: onbehalf_audit::Export,
-    pub keys: onbehalf_audit::CheckpointKeys,
+    pub export: attenuo_audit::Export,
+    pub keys: attenuo_audit::CheckpointKeys,
     /// The JSONL text of `export`.
     pub text: String,
 }
 
 /// Five entries (`1..=5`), checkpoints at 3 and 5, a header for `1..=5`.
 pub fn audit_fixture() -> &'static AuditFixture {
-    use onbehalf_audit::{checkpoint_line, entry_line, header_line, AuditEntry, Checkpoint};
-    use onbehalf_core::{Decision, DecisionRecord, LeaseId, ToolCall};
+    use attenuo_audit::{checkpoint_line, entry_line, header_line, AuditEntry, Checkpoint};
+    use attenuo_core::{Decision, DecisionRecord, LeaseId, ToolCall};
     static A: OnceLock<AuditFixture> = OnceLock::new();
     A.get_or_init(|| {
         let f = fixture();
-        let chain = onbehalf_core::DelegationChain::root(
+        let chain = attenuo_core::DelegationChain::root(
             OriginatingUser {
                 subject: "user:mudit".into(),
                 issuer: "https://idp.example".into(),
@@ -356,7 +356,7 @@ pub fn audit_fixture() -> &'static AuditFixture {
             .map(|&s| Checkpoint::sign(&signer, s as u64, &entries[s - 1].entry_hash, f.now))
             .collect::<std::result::Result<_, _>>()
             .expect("sign");
-        let header = onbehalf_audit::ExportHeader::new(1, 5, "2026-10-23T12:00:00Z".into());
+        let header = attenuo_audit::ExportHeader::new(1, 5, "2026-10-23T12:00:00Z".into());
         let mut text = header_line(&header);
         for e in &entries {
             text.push_str(&entry_line(e));
@@ -365,12 +365,12 @@ pub fn audit_fixture() -> &'static AuditFixture {
             text.push_str(&checkpoint_line(c));
         }
         let x = URL_SAFE_NO_PAD.encode(f.pair.public_key().as_ref());
-        let keys = onbehalf_audit::CheckpointKeys::from_jwks(&serde_json::json!({
+        let keys = attenuo_audit::CheckpointKeys::from_jwks(&serde_json::json!({
             "keys": [{"kty": "OKP", "crv": "Ed25519", "kid": signer.kid(), "x": x}]
         }))
         .expect("jwks");
-        let export = onbehalf_audit::parse_export(&text).expect("fixture export parses");
-        let report = onbehalf_audit::verify_export(&export, &keys).expect("verifies");
+        let export = attenuo_audit::parse_export(&text).expect("fixture export parses");
+        let report = attenuo_audit::verify_export(&export, &keys).expect("verifies");
         assert!(report.report.ok, "fixture export must verify: {report:?}");
         AuditFixture { export, keys, text }
     })

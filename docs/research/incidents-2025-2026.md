@@ -1,5 +1,8 @@
 # MCP and agent security incidents, 2025-2026
 
+<!-- renamed-note -->
+> Note (2026-10-23): this project was renamed from `onbehalf` to `attenuo`. This historical document keeps the old name.
+
 - Date: 2026-10-22
 - Related: [threat model](../spec/threat-model.md) (maps each to onbehalf's properties)
 

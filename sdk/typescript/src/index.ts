@@ -1,15 +1,15 @@
 /**
- * TypeScript SDK for the onbehalf authorization server.
+ * TypeScript SDK for the attenuo authorization server.
  *
  * ```ts
- * import { AdminClient, OnbehalfClient, capability, prefix, DeniedError } from "@onbehalf/sdk";
+ * import { AdminClient, AttenuoClient, capability, prefix, DeniedError } from "@attenuo/sdk";
  *
  * const admin = new AdminClient("http://127.0.0.1:8080", "admin-token");
  * const root = await admin.mintRootDev("alice", "https://idp.example", "planner", {
  *   capabilities: "github:*",
  * }); // development only
  *
- * const ob = new OnbehalfClient("http://127.0.0.1:8080");
+ * const ob = new AttenuoClient("http://127.0.0.1:8080");
  * const coder = await ob.exchange(root, "coder", [
  *   capability("github", "read_file", { repo: prefix("alice/") }),
  * ]);
@@ -55,12 +55,12 @@ export {
   USE_DPOP_NONCE,
 } from "./dpop.js";
 export type { DpopKeyLike, Jwk } from "./dpop.js";
-export { OnbehalfClient } from "./client.js";
+export { AttenuoClient } from "./client.js";
 export type { ClientOptions, InspectOptions, McpOptions } from "./client.js";
 export {
   ApiError,
   DeniedError,
-  OnbehalfError,
+  AttenuoError,
   RefreshError,
   RpcError,
   UnauthorizedError,

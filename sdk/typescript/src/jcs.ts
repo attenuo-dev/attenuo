@@ -12,7 +12,7 @@
  * a double cannot, so `parseJson` refuses such an integer literal instead of rounding it.
  */
 
-import { OnbehalfError } from "./errors.js";
+import { AttenuoError } from "./errors.js";
 
 export type JsonValue =
   null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
@@ -26,7 +26,7 @@ export function canonicalize(value: unknown): string {
     case "string":
       return JSON.stringify(value);
     case "number":
-      if (!Number.isFinite(value)) throw new OnbehalfError("JCS: non-finite number");
+      if (!Number.isFinite(value)) throw new AttenuoError("JCS: non-finite number");
       return JSON.stringify(value);
     case "object": {
       if (Array.isArray(value)) return `[${value.map(canonicalize).join(",")}]`;
@@ -40,7 +40,7 @@ export function canonicalize(value: unknown): string {
       return `{${members.join(",")}}`;
     }
     default:
-      throw new OnbehalfError(`JCS: cannot encode a ${typeof value}`);
+      throw new AttenuoError(`JCS: cannot encode a ${typeof value}`);
   }
 }
 
@@ -50,12 +50,12 @@ const NUMBER = /-?(?:0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/y;
 /**
  * Parse JSON text strictly: RFC 8259 grammar only, duplicate object members are an error, and
  * an integer literal beyond 2^53 is an error rather than a silent rounding. Throws
- * `OnbehalfError` with the offset of the problem.
+ * `AttenuoError` with the offset of the problem.
  */
 export function parseJson(text: string): JsonValue {
   let i = 0;
   const fail = (msg: string): never => {
-    throw new OnbehalfError(`invalid JSON at offset ${i}: ${msg}`);
+    throw new AttenuoError(`invalid JSON at offset ${i}: ${msg}`);
   };
   const ws = (): void => {
     while (i < text.length && " \t\n\r".includes(text[i] as string)) i++;

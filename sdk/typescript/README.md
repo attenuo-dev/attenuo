@@ -1,6 +1,6 @@
-# @onbehalf/sdk (TypeScript SDK)
+# @attenuo/sdk (TypeScript SDK)
 
-TypeScript client for the [onbehalf](../../README.md) authorization server: exchange delegation tokens, attenuate capabilities, call MCP tools through the enforcing proxy, handle denials, renew leases, and read the audit log.
+TypeScript client for the [attenuo](../../README.md) authorization server: exchange delegation tokens, attenuate capabilities, call MCP tools through the enforcing proxy, handle denials, renew leases, and read the audit log.
 
 **Status: pre-alpha**, like the server. The API follows the server's wire format as of this repository and will change with it. Not on npm yet; build it from a checkout.
 
@@ -16,7 +16,7 @@ Node 20 or newer (Ed25519 in WebCrypto needs no flag there: it is available sinc
 Start a server with the example config (`[dev] allow_root_mint = true` for the dev root token) and an MCP upstream, as in [getting started](../../docs/guides/getting-started.md). Then:
 
 ```ts
-import { AdminClient, DeniedError, OnbehalfClient, capability, prefix } from "@onbehalf/sdk";
+import { AdminClient, DeniedError, AttenuoClient, capability, prefix } from "@attenuo/sdk";
 
 const URL = "http://127.0.0.1:8080";
 
@@ -27,7 +27,7 @@ const root = await admin.mintRootDev("alice", "https://idp.example", "planner", 
   capabilities: ["github:*"],
 });
 
-const ob = new OnbehalfClient(URL);
+const ob = new AttenuoClient(URL);
 
 // The planner hands the coder read_file on alice's public repos only.
 const coder = await ob.exchange(
@@ -35,7 +35,7 @@ const coder = await ob.exchange(
   "coder",
   [capability("github", "read_file", { repo: prefix("alice/public-") })],
   // The coder's [[agents]] secret: a hop n+1 exchange authenticates as its actor.
-  { ttlSeconds: 600, clientSecret: process.env.ONBEHALF_CLIENT_SECRET },
+  { ttlSeconds: 600, clientSecret: process.env.ATTENUO_CLIENT_SECRET },
 );
 console.log(coder.agents, coder.lease); // [ 'planner', 'coder' ] <lease id>
 
@@ -62,7 +62,7 @@ console.log(await admin.auditVerify()); // { ok: true, entries: ..., firstBadSeq
 
 | Call                                                                                                                              | Does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | --------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `new OnbehalfClient(serverUrl, { token?, fetch?, headers?, timeoutMs?, dpopKey? })`                                               | HTTP client for the server. `token` is a default bearer; `fetch` swaps the transport (tests, proxies, custom TLS). Timeout defaults to 30 s.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `new AttenuoClient(serverUrl, { token?, fetch?, headers?, timeoutMs?, dpopKey? })`                                                | HTTP client for the server. `token` is a default bearer; `fetch` swaps the transport (tests, proxies, custom TLS). Timeout defaults to 30 s.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `exchange(subjectToken, actor, capabilities, { ttlSeconds?, clientId?, clientSecret?, subjectTokenType?, actorToken?, mayAct? })` | RFC 8693 exchange. Returns a `Token`. Every hop n+1 exchange authenticates as its actor: pass the actor's `[[agents]]` secret as `clientSecret` (`clientId` defaults to `actor`). With an IdP credential as the subject and both `clientId` and `clientSecret`, it is a hop-0 exchange (`subjectTokenType: "urn:ietf:params:oauth:token-type:id-jag"` for an ID-JAG). `actorToken` (a workload-identity JWT such as a SPIFFE JWT-SVID from an `[[actor_trust]]` issuer) authenticates the actor instead of a secret, depending on `[token] actor_auth`; each one works for one exchange. `mayAct` lists the agents allowed to exchange the new token next. |
 | `renew(token?)`                                                                                                                   | `POST /token/renew`. Returns `{ lease, expiresAt, expiresIn }`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `callTool(token, server, tool, args?, { sessionId? })`                                                                            | `tools/call` through `/mcp/{server}`. Returns `{ text, content, isError, decisionId, structuredContent, raw }`. Throws `DeniedError` when refused.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
@@ -80,7 +80,7 @@ A `Token` carries `lease`, `expiresAt`, `chain` (user and hops with capabilities
 ### Capabilities
 
 ```ts
-import { capability, equals, oneOf, prefix } from "@onbehalf/sdk";
+import { capability, equals, oneOf, prefix } from "@attenuo/sdk";
 
 capability("github", "read_file"); // github:read_file
 capability("github", "create_issue", { repo: oneOf("acme/api", "acme/web") });
@@ -110,10 +110,10 @@ await admin.mintRootDev("alice", "https://idp.example", "planner", { mayAct: ["c
 
 ### Binding tokens to keys (DPoP)
 
-A token can be bound to a key the agent holds (RFC 9449), so a leaked copy is useless without the key. Give the client a `dpopKey`: a `DpopKey` or a private JWK object, such as the file `onbehalf key gen --dpop` writes. Proofs are signed with WebCrypto (Ed25519 or P-256); there is no extra dependency.
+A token can be bound to a key the agent holds (RFC 9449), so a leaked copy is useless without the key. Give the client a `dpopKey`: a `DpopKey` or a private JWK object, such as the file `attenuo key gen --dpop` writes. Proofs are signed with WebCrypto (Ed25519 or P-256); there is no extra dependency.
 
 ```ts
-import { DpopKey, OnbehalfClient } from "@onbehalf/sdk";
+import { DpopKey, AttenuoClient } from "@attenuo/sdk";
 
 const coderKey = await DpopKey.fromJwk(JSON.parse(await readFile("coder.jwk", "utf8")));
 // or: await DpopKey.generate(), and keep key.privateJwk() to reuse it
@@ -122,7 +122,7 @@ const coderKey = await DpopKey.fromJwk(JSON.parse(await readFile("coder.jwk", "u
 const signOff = await plannerKey.signOff(`${URL}/token`, root.jwt, coderKey.thumbprint, "coder");
 
 // In the coder's process: the new token is bound to coderKey.
-const ob = new OnbehalfClient(URL, { dpopKey: coderKey });
+const ob = new AttenuoClient(URL, { dpopKey: coderKey });
 const coder = await ob.exchange(root, "coder", "github:read_file", {
   clientSecret,
   subjectTokenDpop: signOff,
@@ -132,14 +132,14 @@ await ob.callTool(coder, "github", "read_file", { repo: "alice/docs" }); // proo
 
 With a key, every `callTool`, `listTools`, `initialize`, `renew` and `authzenEvaluate` sends `Authorization: DPoP <token>` and a fresh proof, and every `exchange` binds the new token. When the parent is bound to another key, its holder's sign-off names the new key and agent and works for that one exchange; a process that holds both keys can pass `subjectDpopKey: plannerKey` instead. When the parent is bound to the client's own key, no sign-off is needed. `Token.dpopJkt` is the thumbprint a token is bound to (undefined for a bearer token), and `AuditEntry.dpopBound` says whether a decision was made with a proven bound token. A bound token without a proof is an `UnauthorizedError` with `error === "dpop_required"`. See [Binding tokens to keys](../../docs/guides/binding-tokens-to-keys.md).
 
-Server nonces (RFC 9449 §8, `[token] dpop_nonce = "required"`) need no code. `OnbehalfClient`, `AdminClient.mintRootDev` and `mcpFetch` keep the latest `DPoP-Nonce` header the server sent and put it in each proof. When the server refuses a proof with `use_dpop_nonce`, they retry the request once with a new proof carrying the nonce from that response (`mcpFetch` does not retry a request whose body is a stream). For your own HTTP code, `key.proof(method, url, token, { nonce })` adds the claim, and `NonceCache` does the bookkeeping: `await cache.update(response)` stores the nonce and resolves to true when the request should be retried.
+Server nonces (RFC 9449 §8, `[token] dpop_nonce = "required"`) need no code. `AttenuoClient`, `AdminClient.mintRootDev` and `mcpFetch` keep the latest `DPoP-Nonce` header the server sent and put it in each proof. When the server refuses a proof with `use_dpop_nonce`, they retry the request once with a new proof carrying the nonce from that response (`mcpFetch` does not retry a request whose body is a stream). For your own HTTP code, `key.proof(method, url, token, { nonce })` adds the claim, and `NonceCache` does the bookkeeping: `await cache.update(response)` stores the nonce and resolves to true when the request should be retried.
 
 ### Keeping a token alive
 
 `TokenRefresher` renews the lease at a third of the lease interval, calls your `exchange` function before the token's `exp`, and keeps the current token in `refresher.token`. `start()` returns a disposer.
 
 ```ts
-import { mcpFetch, RefreshError, TokenRefresher } from "@onbehalf/sdk";
+import { mcpFetch, RefreshError, TokenRefresher } from "@attenuo/sdk";
 
 // Each exchange needs a fresh subject token: a parent delegates to a given actor once, so
 // re-exchanging the same parent is refused as `replayed`.
@@ -170,26 +170,26 @@ await dispose(); // stop the loop
 
 ### Errors
 
-| Error               | When                                                                                                                                                                                                                                                                             |
-| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DeniedError`       | The proxy denied a call (JSON-RPC `-32003` with the `X-Onbehalf-Decision-Id` header naming `data.decision_id`; an upstream's own `-32003` without that proof is an `RpcError`). Branch on `reason` (`capability_denied`, `policy_deny`, `lease_revoked`, ...), log `decisionId`. |
-| `UnauthorizedError` | HTTP 401 or JSON-RPC `-32001`: the bearer is missing, malformed, expired or not ours. A subclass of `ApiError`.                                                                                                                                                                  |
-| `ApiError`          | A non-success HTTP status. `status`, `error` (for example `invalid_scope`), `detail`.                                                                                                                                                                                            |
-| `RpcError`          | Any other JSON-RPC error (`code`, `rpcMessage`, `data`).                                                                                                                                                                                                                         |
-| `RefreshError`      | A `TokenRefresher` gave up. `reason`: `lease_revoked`, `lease_lost`, `token_expired`, `refused`, `key_mismatch`.                                                                                                                                                                 |
-| `VerificationError` | `inspect(..., { verify: true })` failed.                                                                                                                                                                                                                                         |
-| `OnbehalfError`     | Base class; also thrown for responses that are not what the server sends.                                                                                                                                                                                                        |
+| Error               | When                                                                                                                                                                                                                                                                            |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DeniedError`       | The proxy denied a call (JSON-RPC `-32003` with the `X-Attenuo-Decision-Id` header naming `data.decision_id`; an upstream's own `-32003` without that proof is an `RpcError`). Branch on `reason` (`capability_denied`, `policy_deny`, `lease_revoked`, ...), log `decisionId`. |
+| `UnauthorizedError` | HTTP 401 or JSON-RPC `-32001`: the bearer is missing, malformed, expired or not ours. A subclass of `ApiError`.                                                                                                                                                                 |
+| `ApiError`          | A non-success HTTP status. `status`, `error` (for example `invalid_scope`), `detail`.                                                                                                                                                                                           |
+| `RpcError`          | Any other JSON-RPC error (`code`, `rpcMessage`, `data`).                                                                                                                                                                                                                        |
+| `RefreshError`      | A `TokenRefresher` gave up. `reason`: `lease_revoked`, `lease_lost`, `token_expired`, `refused`, `key_mismatch`.                                                                                                                                                                |
+| `VerificationError` | `inspect(..., { verify: true })` failed.                                                                                                                                                                                                                                        |
+| `AttenuoError`      | Base class; also thrown for responses that are not what the server sends.                                                                                                                                                                                                       |
 
 An AuthZEN deny and a tool's own `isError` are results, not exceptions.
 
 ## Using the official MCP client
 
-onbehalf mounts each upstream at `<server>/mcp/<name>` and speaks MCP Streamable HTTP there. An MCP client needs that URL and `Authorization: Bearer <token>` on every request. `mcpUrl` and `mcpHeaders` produce both:
+attenuo mounts each upstream at `<server>/mcp/<name>` and speaks MCP Streamable HTTP there. An MCP client needs that URL and `Authorization: Bearer <token>` on every request. `mcpUrl` and `mcpHeaders` produce both:
 
 ```ts
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { mcpHeaders, mcpUrl } from "@onbehalf/sdk";
+import { mcpHeaders, mcpUrl } from "@attenuo/sdk";
 
 const transport = new StreamableHTTPClientTransport(new URL(mcpUrl(URL, "github")), {
   requestInit: { headers: mcpHeaders(coder) },
@@ -214,14 +214,14 @@ To have the token replaced for you, use a [`TokenRefresher`](#keeping-a-token-al
 ## Verifying an audit export offline
 
 ```ts
-import { verifyExport } from "@onbehalf/sdk";
+import { verifyExport } from "@attenuo/sdk";
 
 const jwks = await (await fetch("http://127.0.0.1:8080/.well-known/jwks.json")).json();
 const report = await verifyExport({ path: "audit.jsonl" }, { checkpointPublicKeys: jwks });
 if (!report.ok) console.log(report.firstBadSeq, report.badCheckpoints, report.truncated);
 ```
 
-`verifyExport(source, { checkpointPublicKeys, allowUnsignedTail })` takes the export as text (`string`), bytes, an iterable of lines or `{ path }` (Node), in JSON Lines or the `--format json` form. `checkpointPublicKeys` is the JWKS or a `{ kid: key }` map (raw 32 bytes or base64url). It re-checks the SHA-256 hash chain over RFC 8785 canonical JSON of `["onbehalf-audit-entry-v2", seq, prev_hash, record]`, the range the header declares and the Ed25519 checkpoint signatures (WebCrypto), with the same strictness as `onbehalf audit verify --file`: a short file, entries outside the range and entries after the last valid checkpoint (unless `allowUnsignedTail`) all fail. The `ExportReport` has `ok`, `firstBadSeq`, `badCheckpoints`, `lastSignedSeq`, `unsignedTail`, `truncated`, `outsideRange` and the rest of the Rust report. A file that is not a verifiable export (no header, wrong format, a filtered export, not JSON) throws `ExportError`. The canonicalizer is a small RFC 8785 implementation tested against the RFC's vectors; it, and the strict JSON parser the verifier uses, refuse integers beyond 2^53 (a `seq` that large cannot be checked here) and duplicate object members. A filtered export (`auditExport(from, to, { kind, chainId })`) cannot be verified: its chain has gaps, so verify the unfiltered one, then filter. `AuditEntry` has `kind` and `chainId`.
+`verifyExport(source, { checkpointPublicKeys, allowUnsignedTail })` takes the export as text (`string`), bytes, an iterable of lines or `{ path }` (Node), in JSON Lines or the `--format json` form. `checkpointPublicKeys` is the JWKS or a `{ kid: key }` map (raw 32 bytes or base64url). It re-checks the SHA-256 hash chain over RFC 8785 canonical JSON of `["attenuo-audit-entry-v2", seq, prev_hash, record]`, the range the header declares and the Ed25519 checkpoint signatures (WebCrypto), with the same strictness as `attenuo audit verify --file`: a short file, entries outside the range and entries after the last valid checkpoint (unless `allowUnsignedTail`) all fail. The `ExportReport` has `ok`, `firstBadSeq`, `badCheckpoints`, `lastSignedSeq`, `unsignedTail`, `truncated`, `outsideRange` and the rest of the Rust report. A file that is not a verifiable export (no header, wrong format, a filtered export, not JSON) throws `ExportError`. The canonicalizer is a small RFC 8785 implementation tested against the RFC's vectors; it, and the strict JSON parser the verifier uses, refuse integers beyond 2^53 (a `seq` that large cannot be checked here) and duplicate object members. A filtered export (`auditExport(from, to, { kind, chainId })`) cannot be verified: its chain has gaps, so verify the unfiltered one, then filter. `AuditEntry` has `kind` and `chainId`.
 
 ## Development
 
@@ -232,17 +232,17 @@ npm test             # vitest: unit tests on a mocked fetch
 npm run lint         # tsc --noEmit, eslint, prettier --check
 ```
 
-The integration test replays the GitHub leak scenario from [`examples/github-leak-demo`](../../examples/github-leak-demo) against a real `onbehalf-server` and the `fake_mcp` upstream, then runs both examples. It needs prebuilt binaries:
+The integration test replays the GitHub leak scenario from [`examples/github-leak-demo`](../../examples/github-leak-demo) against a real `attenuo-server` and the `fake_mcp` upstream, then runs both examples. It needs prebuilt binaries:
 
 ```sh
-cargo build -p onbehalf-server -p onbehalf-cli && cargo build -p onbehalf-proxy --example fake_mcp
+cargo build -p attenuo-server -p attenuo-cli && cargo build -p attenuo-proxy --example fake_mcp
 mkdir -p .bin/examples
-cp target/debug/onbehalf-server .bin/ && cp target/debug/examples/fake_mcp .bin/examples/
+cp target/debug/attenuo-server .bin/ && cp target/debug/examples/fake_mcp .bin/examples/
 (cd examples/typescript-agent && npm install)      # for the two example tests
-cd sdk/typescript && npm run build && ONBEHALF_INTEGRATION=1 npm test
+cd sdk/typescript && npm run build && ATTENUO_INTEGRATION=1 npm test
 ```
 
-`ONBEHALF_BIN_DIR` points at another directory holding `onbehalf-server` and `examples/fake_mcp` (default: `<repo>/.bin`, which is gitignored). The test copies the binaries into a temp directory before starting them, so a shared `CARGO_TARGET_DIR` rebuilt by another checkout cannot swap them mid-run. Without `ONBEHALF_INTEGRATION=1` it is skipped.
+`ATTENUO_BIN_DIR` points at another directory holding `attenuo-server` and `examples/fake_mcp` (default: `<repo>/.bin`, which is gitignored). The test copies the binaries into a temp directory before starting them, so a shared `CARGO_TARGET_DIR` rebuilt by another checkout cannot swap them mid-run. Without `ATTENUO_INTEGRATION=1` it is skipped.
 
 ## Not done
 

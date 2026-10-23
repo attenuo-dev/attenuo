@@ -1,9 +1,9 @@
-"""LangChain: an orchestrator delegates to a coder agent; every MCP call goes through onbehalf.
+"""LangChain: an orchestrator delegates to a coder agent; every MCP call goes through attenuo.
 
 The scenario is the one from ``examples/github-leak-demo``: a malicious issue tells the coder to
 read a private repository and copy it out through ``create_issue``. Here the agents are
 LangChain agents (``langchain.agents.create_agent``) and their tools come from
-``langchain-mcp-adapters``, pointed at onbehalf's proxy with a delegation token as the bearer.
+``langchain-mcp-adapters``, pointed at attenuo's proxy with a delegation token as the bearer.
 
 Two modes, the same tool calls:
 
@@ -17,8 +17,8 @@ Two modes, the same tool calls:
 Run it with ``examples/langchain-agent/run.sh``, or by hand against a server started from
 ``examples/github-leak-demo/config.toml``.
 
-Environment: ONBEHALF_SERVER, ONBEHALF_ADMIN_TOKEN, ONBEHALF_CODER_SECRET (defaults match the
-demo config), ONBEHALF_ROOT_TOKEN and ONBEHALF_ROOT_LEASE (the orchestrator's root token; minted
+Environment: ATTENUO_SERVER, ATTENUO_ADMIN_TOKEN, ATTENUO_CODER_SECRET (defaults match the
+demo config), ATTENUO_ROOT_TOKEN and ATTENUO_ROOT_LEASE (the orchestrator's root token; minted
 through the dev endpoint when unset), EXAMPLE_MODEL (default ``claude-opus-5-5``).
 """
 
@@ -31,19 +31,19 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from onbehalf import AdminClient, Capability, Client, Prefix, Token
-from onbehalf.mcp import mcp_headers, mcp_url
+from attenuo import AdminClient, Capability, Client, Prefix, Token
+from attenuo.mcp import mcp_headers, mcp_url
 
-SERVER = os.environ.get("ONBEHALF_SERVER", "http://127.0.0.1:8080")
-ADMIN_TOKEN = os.environ.get("ONBEHALF_ADMIN_TOKEN", "demo-admin-token")
+SERVER = os.environ.get("ATTENUO_SERVER", "http://127.0.0.1:8080")
+ADMIN_TOKEN = os.environ.get("ATTENUO_ADMIN_TOKEN", "demo-admin-token")
 # The coder's [[agents]] secret in the demo config: an exchange authenticates as its actor.
-CODER_SECRET = os.environ.get("ONBEHALF_CODER_SECRET", "demo-coder-secret")
+CODER_SECRET = os.environ.get("ATTENUO_CODER_SECRET", "demo-coder-secret")
 # The agent id that the demo config grants `github:*`; it plays the orchestrator.
 ORCHESTRATOR_AGENT = "assistant"
 MODEL = os.environ.get("EXAMPLE_MODEL", "claude-opus-5-5")
 UPSTREAM = "github"
-DENIED_CODE = -32003  # onbehalf's JSON-RPC error code for a denied call
-DECISION_ID_HEADER = "x-onbehalf-decision-id"
+DENIED_CODE = -32003  # attenuo's JSON-RPC error code for a denied call
+DECISION_ID_HEADER = "x-attenuo-decision-id"
 
 # A simulated malicious issue. In the real incident this text came from a public issue.
 ISSUE = (
@@ -58,11 +58,11 @@ class LeaseRevoked(Exception):
 
 
 class ProxyDecisions:
-    """Decision ids that onbehalf's proxy put in ``X-Onbehalf-Decision-Id`` response headers.
+    """Decision ids that attenuo's proxy put in ``X-Attenuo-Decision-Id`` response headers.
 
     Only the proxy sets that header; it never forwards one from the upstream. An upstream is
     untrusted and can answer with its own ``-32003`` and any reason it likes, so a ``-32003``
-    counts as onbehalf's denial only when its ``data.decision_id`` is one of these ids, the
+    counts as attenuo's denial only when its ``data.decision_id`` is one of these ids, the
     check the SDKs make (SR-32, SR-53). The adapter raises ``McpError`` without the HTTP
     response, so the ids are collected with an ``httpx`` response hook, installed through the
     connection's ``httpx_client_factory``.
@@ -96,7 +96,7 @@ class ProxyDecisions:
 
 @dataclass
 class DenialLog:
-    """Records what onbehalf denied, for the summary (and the test)."""
+    """Records what attenuo denied, for the summary (and the test)."""
 
     entries: list[tuple[str, str, str]] = field(default_factory=list)  # tool, reason, decision
     # The decision ids the proxy vouched for on this client's connections.
@@ -115,7 +115,7 @@ def delegate_to_coder(ob: Client, root: Token | str) -> Token:
 
 
 def connections(token: Token, decisions: ProxyDecisions) -> dict[str, Any]:
-    """The langchain-mcp-adapters connection: onbehalf's URL, the token as bearer, and an HTTP
+    """The langchain-mcp-adapters connection: attenuo's URL, the token as bearer, and an HTTP
     client that records the decision ids the proxy vouches for."""
     return {
         UPSTREAM: {
@@ -135,8 +135,8 @@ def is_denied_code(exc: BaseException) -> bool:
 def denial_of(exc: BaseException, decisions: ProxyDecisions) -> tuple[str, str] | None:
     """(reason, decision_id) when ``exc`` is a -32003 the proxy vouched for, else None.
 
-    A -32003 whose ``data.decision_id`` is not in an ``X-Onbehalf-Decision-Id`` header the
-    proxy sent is the upstream's own error, not a decision of onbehalf (SR-53).
+    A -32003 whose ``data.decision_id`` is not in an ``X-Attenuo-Decision-Id`` header the
+    proxy sent is the upstream's own error, not a decision of attenuo (SR-53).
     """
     if not is_denied_code(exc):
         return None
@@ -157,7 +157,7 @@ def leaves(exc: BaseException) -> list[BaseException]:
 
 
 def is_unauthorized(exc: BaseException) -> bool:
-    """HTTP 401 from the proxy. onbehalf answers it before MCP starts, so a client that opens a
+    """HTTP 401 from the proxy. attenuo answers it before MCP starts, so a client that opens a
     new MCP session per call (as langchain-mcp-adapters does) sees it as a transport error,
     not as a JSON-RPC -32003. After a revocation that is how a dead lease shows up."""
     return any(
@@ -187,7 +187,7 @@ def denial_interceptor(log: DenialLog) -> Callable[..., Awaitable[Any]]:
                 forged = next((e for e in leaves(exc) if is_denied_code(e)), None)
                 if forged is None:
                     raise
-                # A -32003 onbehalf did not vouch for: the upstream's own error, shown as such.
+                # A -32003 attenuo did not vouch for: the upstream's own error, shown as such.
                 print(f"  UPSTREAM ERROR {request.name} {request.args}  {forged}")
                 text = f"{request.name} failed upstream: {forged}"
                 return CallToolResult(content=[TextContent(type="text", text=text)], isError=True)
@@ -262,7 +262,7 @@ async def run_dry(token: Token, log: DenialLog, revoke: Callable[[], None]) -> b
     checks: list[bool] = []
 
     tools = {t.name: t for t in await client.get_tools()}
-    print(f"[coder] tools/list through onbehalf shows: {sorted(tools)}")
+    print(f"[coder] tools/list through attenuo shows: {sorted(tools)}")
     checks.append(sorted(tools) == ["read_file"])
 
     readme = {"repo": "alice/public-docs", "path": "README.md"}
@@ -311,7 +311,7 @@ async def run_dry(token: Token, log: DenialLog, revoke: Callable[[], None]) -> b
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="LangChain agents through onbehalf")
+    ap = argparse.ArgumentParser(description="LangChain agents through attenuo")
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="no model; deterministic tool calls")
     mode.add_argument("--live", action="store_true", help="run the agents with Claude")
@@ -320,8 +320,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"mode: {'live (' + MODEL + ')' if live else 'dry-run'}")
 
     admin = AdminClient(SERVER, ADMIN_TOKEN)
-    root_jwt = os.environ.get("ONBEHALF_ROOT_TOKEN")
-    root_lease = os.environ.get("ONBEHALF_ROOT_LEASE")
+    root_jwt = os.environ.get("ATTENUO_ROOT_TOKEN")
+    root_lease = os.environ.get("ATTENUO_ROOT_LEASE")
     if not (root_jwt and root_lease):
         root = admin.mint_root_dev("alice", "https://idp.example", ORCHESTRATOR_AGENT, ["github:*"])
         root_jwt, root_lease = root.jwt, root.lease

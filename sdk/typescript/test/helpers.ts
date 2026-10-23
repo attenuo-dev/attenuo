@@ -58,13 +58,13 @@ export class Signer {
     for (const a of agents) act = act ? { sub: a, act } : { sub: a };
     const payload = {
       iss: "http://ob.test",
-      aud: "onbehalf",
+      aud: "attenuo",
       sub: subject,
       act,
       jti: "jti-1",
       iat: now,
       exp: now + (o.expDelta ?? 900),
-      typ: "onbehalf+jwt",
+      typ: "attenuo+jwt",
       ou_sig: "sig",
       chain: {
         originating_user: {

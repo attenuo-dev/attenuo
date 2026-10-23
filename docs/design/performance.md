@@ -1,10 +1,10 @@
 # Performance: micro-benchmarks and end to end
 
 - Status: third measurement, after the policy-stage and WAL work (`perf/policy-stage-and-wal-checkpoints`); exchange, lease renewal and open-loop cells added 2026-10-23 (`perf/exchange-lease-bench`)
-- Crates: `onbehalf-policy` (`benches/authorize.rs`, `benches/policy_stage.rs`), `onbehalf-core` (`benches/attenuation.rs`), `onbehalf-server` (`benches/decide.rs`, the decision path by stage), `onbehalf-bench` (end to end)
+- Crates: `attenuo-policy` (`benches/authorize.rs`, `benches/policy_stage.rs`), `attenuo-core` (`benches/attenuation.rs`), `attenuo-server` (`benches/decide.rs`, the decision path by stage), `attenuo-bench` (end to end)
 - Related: [server pipeline](server.md), [ADR-0006](../decisions/0006-lease-based-in-flight-revocation.md)
 
-The first part of this page is criterion 0.5 micro-benchmarks of the two pure functions on the hot path. They do not include token verification, the lease lookup, the audit append or the network hop to the upstream, so they are a lower bound on the latency onbehalf adds to a call. The end-to-end figures, measured through the real proxy, are in [End to end: proxy versus direct](#end-to-end-proxy-versus-direct) at the end of the page, followed by [the audit write path and the per-call cost](#after-the-audit-write-path-work) and [the policy stage and WAL checkpoints](#after-the-policy-stage-and-wal-work), which say what changed and by how much.
+The first part of this page is criterion 0.5 micro-benchmarks of the two pure functions on the hot path. They do not include token verification, the lease lookup, the audit append or the network hop to the upstream, so they are a lower bound on the latency attenuo adds to a call. The end-to-end figures, measured through the real proxy, are in [End to end: proxy versus direct](#end-to-end-proxy-versus-direct) at the end of the page, followed by [the audit write path and the per-call cost](#after-the-audit-write-path-work) and [the policy stage and WAL checkpoints](#after-the-policy-stage-and-wal-work), which say what changed and by how much.
 
 ## How to run
 
@@ -67,11 +67,11 @@ Reading: a successful check is quadratic in the number of capabilities (each chi
 
 ## End to end: proxy versus direct
 
-Harness: `crates/onbehalf-bench` (binary `onbehalf-bench`), driven by `scripts/bench-e2e.sh`. Raw results are committed in [`bench/`](bench/) as `<date>-<host>.json` (every number below, plus the metadata) and `.md` (the tables with the hardware).
+Harness: `crates/attenuo-bench` (binary `attenuo-bench`), driven by `scripts/bench-e2e.sh`. Raw results are committed in [`bench/`](bench/) as `<date>-<host>.json` (every number below, plus the metadata) and `.md` (the tables with the hardware).
 
 ### Method
 
-- **What runs.** The release `onbehalf-server` and the `fake_mcp` example (an echo upstream; its stderr goes to `/dev/null`), both started by the harness on free loopback ports, from copies of the binaries. A server is started per audit mode. The load generator runs on the same machine.
+- **What runs.** The release `attenuo-server` and the `fake_mcp` example (an echo upstream; its stderr goes to `/dev/null`), both started by the harness on free loopback ports, from copies of the binaries. A server is started per audit mode. The load generator runs on the same machine.
 - **Tokens.** A root token from the development mint (`POST /admin/root-token`, capability `fake:read_file` only), then `POST /token` exchanges with agent client secrets down to the requested depth. "Hops" counts hops in the token's chain, so 1 is the root token itself and 3 is the root plus two exchanges. Lease lifetime is raised to 24 h so a long run does not outlive its leases.
 - **Calls.** `tools/call` over HTTP/1.1 keep-alive, bodies fixed. `allow`: `read_file` on `alice/public-docs`, permitted by the Cedar policy (the leak demo's, three policies). `deny_policy`: `read_file` on `alice/private-salaries`, which the capability stage passes and Cedar denies. `deny_capability`: `delete_repo`, which the token does not carry, denied at the capability stage. Denied calls never reach the upstream.
 - **Baseline.** The `allow` call posted straight to `fake_mcp`, at the same concurrency, in the same server group. "Added" is proxy minus direct for the same percentile (p50, p99) or the mean. For denied calls the upstream hop is skipped, so "added" there is the cost of getting the answer, not a hop on top of the upstream call.
@@ -114,7 +114,7 @@ Three changes, each its own commit on `perf/audit-write-path`:
 2. **Group commit.** Appends go to one writer thread over a channel. It commits the first waiting record plus everything already queued (up to 256) in one transaction and answers each caller with its entry; checkpoints falling in a batch are signed inside it. A failed batch is retried record by record, so only a record the database refuses fails (and its call is denied with `audit_error`).
 3. **Per-call waste.** Found with the stage bench below plus temporary timers inside the audit commit: the server verified the same bearer token on every call (now cached by token hash, with expiry rechecked on every hit), the append decoded and cross-checked the whole head row to learn its hash (now reads `seq, entry_hash`), each record was serialized twice (now once, hashed and stored), the pipeline cloned the record, and the lease check ran one query per hop (now one `IN (...)` query).
 
-**Decision path by stage** (`cargo bench -p onbehalf-server --bench decide`, in process, point estimates in microseconds, 1 hop / 3 hops; same container, about 5 to 10 percent run-to-run noise):
+**Decision path by stage** (`cargo bench -p attenuo-server --bench decide`, in process, point estimates in microseconds, 1 hop / 3 hops; same container, about 5 to 10 percent run-to-run noise):
 
 | Stage | before | after |
 |---|---|---|
@@ -133,7 +133,7 @@ Readings:
 - **The per-hop growth is Cedar's.** Policy grows about 18 us per hop, which matches the micro-benchmark. The audit append also grew with depth because it decoded the previous (larger) record; reading only the head's hash removed that, but the single-threaded append is not faster overall: it now pays a thread handoff to the writer (about 25 us round trip, measured on its own) and the SQLite insert and in-memory commit are about 16 and 13 us. Under concurrency the handoff is shared by a batch.
 - **The batched lease query** is faster for a file store and slower for the in-memory one (SQLite builds a small ephemeral table for an `IN` list), and both are a few microseconds against a decision of about 300.
 
-**End to end, before and after** (`onbehalf-bench`, allow call, req/s at 1 / 8 / 32 clients, closed loop; "before" is merged main before this work, 3 s cells; "after" is the full run in [`bench/2026-10-23-vm-audit-write-path.md`](bench/2026-10-23-vm-audit-write-path.md), 5 s cells, commit 38a438d):
+**End to end, before and after** (`attenuo-bench`, allow call, req/s at 1 / 8 / 32 clients, closed loop; "before" is merged main before this work, 3 s cells; "after" is the full run in [`bench/2026-10-23-vm-audit-write-path.md`](bench/2026-10-23-vm-audit-write-path.md), 5 s cells, commit 38a438d):
 
 | Audit, hops | before | after | single client, added p50 before / after |
 |---|---|---|---|
@@ -156,7 +156,7 @@ What this means:
 
 Three changes on `perf/policy-stage-and-wal-checkpoints`, each its own commit (the WAL change took three: the first version had a bug the end-to-end run caught, below):
 
-1. **Request cache in the policy engine.** The new bench `cargo bench -p onbehalf-policy --bench policy_stage` splits the Cedar stage into preparing the request and evaluating it. Evaluation was about 5 us; preparation was 115 to 160 us, and nearly all of it was Cedar parsing the JSON built for the entity store (about 50 us) and the context (about 40 us) on every call. The schema and policy set were already parsed once, at load. The engine now keeps what depends only on the chain and the tool (entity store, principal, action, resource, and the `originating_user` and `chain` context records) in a cache of 4,096 entries. An entry is used only when every input it was built from is equal (user, attributes, each hop's agent and lease, server, tool, the tool's catalog attributes), so a hash collision is a miss. A policy reload empties it, and a catalog change builds a new engine. A call then builds only `context.input`, `session_id` and `now_unix`, directly as Cedar values instead of JSON. A test compares the cached request with the old one-pass translation for every argument shape (nulls, decimals, integral floats, big integers, nested sets and records, sessions, legacy actions), and every existing policy test passes unchanged.
+1. **Request cache in the policy engine.** The new bench `cargo bench -p attenuo-policy --bench policy_stage` splits the Cedar stage into preparing the request and evaluating it. Evaluation was about 5 us; preparation was 115 to 160 us, and nearly all of it was Cedar parsing the JSON built for the entity store (about 50 us) and the context (about 40 us) on every call. The schema and policy set were already parsed once, at load. The engine now keeps what depends only on the chain and the tool (entity store, principal, action, resource, and the `originating_user` and `chain` context records) in a cache of 4,096 entries. An entry is used only when every input it was built from is equal (user, attributes, each hop's agent and lease, server, tool, the tool's catalog attributes), so a hash collision is a miss. A policy reload empties it, and a catalog change builds a new engine. A call then builds only `context.input`, `session_id` and `now_unix`, directly as Cedar values instead of JSON. A test compares the cached request with the old one-pass translation for every argument shape (nulls, decimals, integral floats, big integers, nested sets and records, sessions, legacy actions), and every existing policy test passes unchanged.
 2. **WAL checkpoints off the writer.** The writer connection runs with `wal_autocheckpoint=0`, and a background thread with its own connection runs `PRAGMA wal_checkpoint(PASSIVE)` every `[audit] wal_checkpoint_seconds` (default 5) or 256 commits. `PASSIVE` takes no lock the writer needs. It truncates the WAL when no append is in progress, and runs a final `TRUNCATE` at shutdown (and when the store is dropped). Reads go through the store's own connection, so verify and export see every committed row whether or not it has been copied yet. In-memory stores are unchanged.
 3. **Inline commit when the writer is idle.** An append that finds nothing queued for the writer and the connection free runs the same one-record transaction on its own thread, without the hand-off. Anything else goes to the writer as before, so group commit is unchanged under load.
 
@@ -164,7 +164,7 @@ Three changes on `perf/policy-stage-and-wal-checkpoints`, each its own commit (t
 
 One behaviour change follows from the design. At `durability = "normal"` the WAL is synced when it is checkpointed, so the decisions a power failure can lose are now those since the last background checkpoint: up to one interval (5 s) or 256 commits. Before, the window was about 1,000 pages. Lower `wal_checkpoint_seconds`, or use `"full"`, to narrow it. Decisions are unchanged.
 
-**Decision path by stage** (`cargo bench -p onbehalf-server --bench decide`, point estimates in microseconds, 1 hop / 3 hops; "before" is the column "after" of the previous table, same container, load 2 to 5 during this run):
+**Decision path by stage** (`cargo bench -p attenuo-server --bench decide`, point estimates in microseconds, 1 hop / 3 hops; "before" is the column "after" of the previous table, same container, load 2 to 5 during this run):
 
 | Stage | before | after |
 |---|---|---|
@@ -176,7 +176,7 @@ One behaviour change follows from the design. At `durability = "normal"` the WAL
 | Token verification (`authenticate`, cache hit) | 1.3 / 2.3 | 1.5 / 2.4 |
 | `Pipeline::decide` (leases, policy, record, append), memory / file | not recorded | 139 / 206, 81 / 106 |
 
-The Cedar stage itself (`cargo bench -p onbehalf-policy --bench policy_stage`, same chain and call):
+The Cedar stage itself (`cargo bench -p attenuo-policy --bench policy_stage`, same chain and call):
 
 | | before | after, cache hit | after, uncached |
 |---|---|---|---|
@@ -190,7 +190,7 @@ Readings:
 - **The file append is now cheaper than the in-memory one** (60 against 94 us at one hop). Part of that is the checkpoints that no longer run on the writer, part is the inline commit; the in-memory store, which journals in memory rather than appending to a WAL, gains only the inline commit. The A/B of the inline commit alone, same host load: in memory 114 / 169 to 92 / 120 us, file 72 / 91 to 70 / 63 us.
 - **At `full`** the append is one `fsync`, 250 to 270 us on this run against a range of 280 to 1,800 before; the difference is the host, not the change.
 
-**End to end, before and after** (`onbehalf-bench`, allow call, req/s at 1 / 8 / 32 clients; "before" is the run in [`bench/2026-10-23-vm-audit-write-path.md`](bench/2026-10-23-vm-audit-write-path.md), "after" the run in [`bench/2026-10-23-vm-policy-stage.md`](bench/2026-10-23-vm-policy-stage.md), commit 238d914, memory and file only):
+**End to end, before and after** (`attenuo-bench`, allow call, req/s at 1 / 8 / 32 clients; "before" is the run in [`bench/2026-10-23-vm-audit-write-path.md`](bench/2026-10-23-vm-audit-write-path.md), "after" the run in [`bench/2026-10-23-vm-policy-stage.md`](bench/2026-10-23-vm-policy-stage.md), commit 238d914, memory and file only):
 
 | Audit, hops | before | after | p99 at 8 / 32 clients, before / after | single client, added p50 before / after |
 |---|---|---|---|---|
@@ -209,7 +209,7 @@ What this means:
 
 ### Time by stage of a proxied call (2026-10-23)
 
-Branch `perf/proxy-stage-timing`, commit 51f0a89. The server now times each stage of a proxied call and serves the result as the histogram `onbehalf_proxy_stage_seconds{stage=...}` on `/metrics` (buckets from 1 us to 1 s, five per decade), with the same figures as `tracing` debug fields. Each stage costs one `Instant::now()` pair. The stages:
+Branch `perf/proxy-stage-timing`, commit 51f0a89. The server now times each stage of a proxied call and serves the result as the histogram `attenuo_proxy_stage_seconds{stage=...}` on `/metrics` (buckets from 1 us to 1 s, five per decade), with the same figures as `tracing` debug fields. Each stage costs one `Instant::now()` pair. The stages:
 
 | `stage` | What it covers |
 |---|---|
@@ -222,7 +222,7 @@ Branch `perf/proxy-stage-timing`, commit 51f0a89. The server now times each stag
 | `response` | From those headers to the response the handler returns (filtering, session binding, headers); a streamed body is relayed after this |
 | `total` | The proxy's `POST` handler, start to returned response, for requests with at least one decided call |
 
-`lease_check`, `policy` and `audit_append` are recorded in the decision pipeline, so AuthZEN decisions count there too. `onbehalf-bench` reads the histograms when each cell's warm-up ends and when it stops, and prints the difference as a table ([`bench/2026-10-23-vm-proxy-stages.md`](bench/2026-10-23-vm-proxy-stages.md)). The p50 and p90 columns are interpolated inside buckets the way Prometheus' `histogram_quantile` does, so they are estimates. The mean is exact.
+`lease_check`, `policy` and `audit_append` are recorded in the decision pipeline, so AuthZEN decisions count there too. `attenuo-bench` reads the histograms when each cell's warm-up ends and when it stops, and prints the difference as a table ([`bench/2026-10-23-vm-proxy-stages.md`](bench/2026-10-23-vm-proxy-stages.md)). The p50 and p90 columns are interpolated inside buckets the way Prometheus' `histogram_quantile` does, so they are estimates. The mean is exact.
 
 The run: one client, 10 s cells after 2 s of warm-up, allow and `deny_policy` at 1 and 3 hops, memory and file (`normal`) stores; 11,000 to 23,000 calls per cell. This is a shared 4-core VM, not a quiet machine. Load average was 4.4 to 6.4 during the run while other agents compiled, and the load generator, proxy and upstream share those cores. Read every figure as plus or minus 20 percent or worse. Absolute figures are 3 to 4 times the in-process `decide` bench (policy 43 to 57 us here, 13 us there), so compare stages within this run, not with the tables above.
 
@@ -285,7 +285,7 @@ Under load, inline is worse. At 8 clients on the memory store, two runs each gav
 So the blocking pool stays, for both stores, and SR-22 is unchanged. On this VM a call through the proxy pays a few wake-ups from idle, and moving work between threads changes which stage records them. A quieter machine with less idle-state latency (or more load) would show a smaller `upstream` stage and a smaller hop. The measurement that would settle it is a direct baseline paced at the proxied rate; see the board.
 ### Exchange throughput, lease renewal and open-loop arrivals (2026-10-23)
 
-Branch `perf/exchange-lease-bench`, base def86a9, new code in `crates/onbehalf-bench/src/exchange.rs`. Full tables and the raw rows: [`bench/2026-10-23-vm-exchange-lease.md`](bench/2026-10-23-vm-exchange-lease.md) and `.json`. Three additions to the harness:
+Branch `perf/exchange-lease-bench`, base def86a9, new code in `crates/attenuo-bench/src/exchange.rs`. Full tables and the raw rows: [`bench/2026-10-23-vm-exchange-lease.md`](bench/2026-10-23-vm-exchange-lease.md) and `.json`. Three additions to the harness:
 
 - **`exchange`**: N closed-loop clients, each holding its own token (a root, or a chain of three hops), exchange it at `POST /token` for a child delegated to a fresh actor on every request. The server allows one delegation per parent and actor, so the actor ids are generated (`xa-<run>-<client>-<seq>`, never repeated). The server runs with `require_actor_auth = false` for this, which leaves out one SHA-256 comparison per request. Audit store memory or file (`normal`).
 - **`lease-renew`**: M live leases (groups of one root and 99 children), every lease renewing at interval T through `POST /token/renew`, first renewals spread evenly over one interval, with a 300 s lease so renewals really move the expiry. Latency is measured from the time a renewal was due. After the cells, the time to revoke the root of a tree of depth 3 with 100 descendants (a root, 10 children, 9 grandchildren under each).
@@ -347,21 +347,21 @@ What was not measured: renewal traffic and `tools/call` traffic at the same time
 ```
 scripts/bench-e2e.sh                       # full matrix, about 9 minutes, writes docs/design/bench/
 DURATION=10 scripts/bench-e2e.sh --concurrency 8 --depths 3 --audit memory
-cargo run --release -p onbehalf-bench -- --help
-onbehalf-bench exchange --audit memory,file --clients 1,8 --depths 1,3          # exchange throughput
-onbehalf-bench exchange --audit memory --depths 1 --open-loop 500,1500          # open loop
-onbehalf-bench lease-renew --cells 100:1,1000:1,5000:1 --cascade-runs 5         # lease renewal and revoke cascade
-onbehalf-bench --open-loop 500,2000 --depths 1 --outcomes allow --audit memory  # proxied call, open loop
-cargo bench -p onbehalf-policy --bench policy_stage -- --warm-up-time 1 --measurement-time 3
-cargo bench -p onbehalf-server --bench decide -- --warm-up-time 1 --measurement-time 3
+cargo run --release -p attenuo-bench -- --help
+attenuo-bench exchange --audit memory,file --clients 1,8 --depths 1,3          # exchange throughput
+attenuo-bench exchange --audit memory --depths 1 --open-loop 500,1500          # open loop
+attenuo-bench lease-renew --cells 100:1,1000:1,5000:1 --cascade-runs 5         # lease renewal and revoke cascade
+attenuo-bench --open-loop 500,2000 --depths 1 --outcomes allow --audit memory  # proxied call, open loop
+cargo bench -p attenuo-policy --bench policy_stage -- --warm-up-time 1 --measurement-time 3
+cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3
 ```
 
-`onbehalf-bench --print-config DIR` writes the server config and policy it expects, for pointing the harness at an already running server (`--onbehalf-url`, `--upstream-url`, and `--metrics-url` for the stage table). Every answer is checked: a denial counts only as the proxy's `-32003` with the expected reason code and a decision id listed in `X-Onbehalf-Decision-Id`, so an `audit_error` denial, a `too_many_sessions` refusal or a `5xx` stops the run after that cell. A one-second smoke run is part of `cargo test --workspace` (`crates/onbehalf-bench/tests/smoke.rs`). There is no CI job for the full matrix: it needs a release build and minutes of load, and numbers from shared runners could not be compared.
+`attenuo-bench --print-config DIR` writes the server config and policy it expects, for pointing the harness at an already running server (`--attenuo-url`, `--upstream-url`, and `--metrics-url` for the stage table). Every answer is checked: a denial counts only as the proxy's `-32003` with the expected reason code and a decision id listed in `X-Attenuo-Decision-Id`, so an `audit_error` denial, a `too_many_sessions` refusal or a `5xx` stops the run after that cell. A one-second smoke run is part of `cargo test --workspace` (`crates/attenuo-bench/tests/smoke.rs`). There is no CI job for the full matrix: it needs a release build and minutes of load, and numbers from shared runners could not be compared.
 
 ## Not measured
 
 - Renewal load and `tools/call` load at the same time, `POST /token/renew` with DPoP-bound tokens, and exchanges with the actor's client secret checked (see [Exchange throughput, lease renewal and open-loop arrivals](#exchange-throughput-lease-renewal-and-open-loop-arrivals-2026-10-23)).
 - Policy size (the set here has three policies) and catalog size.
-- The time outside the proxy's handler (hyper and axum parsing the client's request, relaying a streamed body). The handler's stages are in `onbehalf_proxy_stage_seconds`; what lies between them and the client's latency is measured only as a difference.
+- The time outside the proxy's handler (hyper and axum parsing the client's request, relaying a streamed body). The handler's stages are in `attenuo_proxy_stage_seconds`; what lies between them and the client's latency is measured only as a difference.
 - Confidence intervals over repeated runs, open-loop load for the deny outcomes and for more than one hop, and a quiet reference machine. (Open-loop arrivals exist now, for the allow call at one hop and for exchange.)
 - Streaming (SSE) responses and `tools/list` filtering.

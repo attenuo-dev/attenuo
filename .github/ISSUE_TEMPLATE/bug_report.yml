@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for the report. If this is a security problem (an allow that should have been a deny, a token that should have been rejected, an audit record that can be altered), **do not file it here**. Follow [SECURITY.md](https://github.com/7Mudit/onbehalf/blob/main/SECURITY.md) instead.
+        Thanks for the report. If this is a security problem (an allow that should have been a deny, a token that should have been rejected, an audit record that can be altered), **do not file it here**. Follow [SECURITY.md](https://github.com/attenuo-dev/attenuo/blob/main/SECURITY.md) instead.
   - type: checkboxes
     id: not-security
     attributes:
@@ -20,12 +20,12 @@ body:
       label: Affected crate
       multiple: true
       options:
-        - onbehalf-core
-        - onbehalf-token
-        - onbehalf-policy
-        - onbehalf-audit
-        - onbehalf-proxy
-        - onbehalf-server
+        - attenuo-core
+        - attenuo-token
+        - attenuo-policy
+        - attenuo-audit
+        - attenuo-proxy
+        - attenuo-server
         - docs
         - other / not sure
     validations:
@@ -34,7 +34,7 @@ body:
     id: version
     attributes:
       label: Version or commit
-      description: Output of `onbehalf-server --version`, the crate version, or the git SHA.
+      description: Output of `attenuo-server --version`, the crate version, or the git SHA.
       placeholder: "0.1.0 / 252f73c"
     validations:
       required: true

@@ -1,8 +1,11 @@
 # Evaluation plan
 
+<!-- renamed-note -->
+> Note (2026-10-23): this project was renamed from `onbehalf` to `attenuo`. This historical document keeps the old name.
+
 - Status: draft plan. First slice run: a synthetic, LLM-free replay of injected tool calls, [injection suite](../evaluation/injection-suite.md) (2026-10-23)
 - Date: 2026-10-22
-- Related: [RFC-0001](../spec/rfc-0001-onbehalf.md), [threat model](../spec/threat-model.md), [incidents](incidents-2025-2026.md), [related work](related-work.md), [performance notes](../design/performance.md)
+- Related: [RFC-0001](../spec/rfc-0001-attenuo.md), [threat model](../spec/threat-model.md), [incidents](incidents-2025-2026.md), [related work](related-work.md), [performance notes](../design/performance.md)
 
 This document describes how to measure whether onbehalf does what the RFC claims, in a form that can be written up as a workshop paper or as the evaluation chapter of a Master's thesis. It is a plan, not a result. Numbers quoted from other papers are as those papers report them. The only part run so far is the [injection suite](../evaluation/injection-suite.md). It replays hand-written injected call sequences through arms A0, A1 and A2 with no model in the loop, and it does not follow the split discipline of section 4.4.
 
@@ -191,7 +194,7 @@ Run separately from the LLM experiments, because model latency would swamp the s
 Fixed attack sets are written against agents, not against a particular policy. A small additional step:
 
 - Take the A2 policy for a sample of tasks and give an attacker (an LLM with the policy text, the tool catalogue and the user task, but no model weights) a budget of attempts to craft an injection whose goal call is permitted by the policy yet still harmful, for example sending to an allowed recipient with attacker-influenced content.
-- Report how many attempts succeeded, and classify each as inside the threat model (a permitted harmful call) or a bypass of enforcement (which would be a bug, filed through [SECURITY.md](https://github.com/7Mudit/onbehalf/blob/main/SECURITY.md)).
+- Report how many attempts succeeded, and classify each as inside the threat model (a permitted harmful call) or a bypass of enforcement (which would be a bug, filed through [SECURITY.md](https://github.com/attenuo-dev/attenuo/blob/main/SECURITY.md)).
 - Expect successes of the first kind. Documenting them is part of the result: it measures how much the policy author's precision matters, and it ties to the "legitimate-but-harmful reads" limitation.
 
 ## 8. Threats to validity

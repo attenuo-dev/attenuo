@@ -1,7 +1,7 @@
-# onbehalf-server example configuration.
+# attenuo-server example configuration.
 #
-#   cargo run -p onbehalf-server -- --config config/example.toml
-#   # or: ONBEHALF_CONFIG=config/example.toml cargo run -p onbehalf-server
+#   cargo run -p attenuo-server -- --config config/example.toml
+#   # or: ATTENUO_CONFIG=config/example.toml cargo run -p attenuo-server
 #
 # Relative paths are resolved against the working directory. Unknown keys are rejected.
 
@@ -11,11 +11,11 @@ listen = "127.0.0.1:8080"
 # /.well-known/authzen-configuration. Required when `listen` is not a loopback address (the
 # server refuses to start without it). On loopback it may stay unset: discovery then uses
 # http://<Host>, and only a Host of localhost, 127.0.0.1 or [::1] is accepted (400 otherwise).
-# public_url = "https://onbehalf.example.com"
+# public_url = "https://attenuo.example.com"
 
 [issuer]
 issuer = "http://127.0.0.1:8080"
-audience = "onbehalf"
+audience = "attenuo"
 max_depth = 8
 default_ttl_seconds = 900
 # How long a hop's lease lives after issuance or POST /token/renew (capped by the token's
@@ -45,7 +45,7 @@ policies_path = "config/policies/default.cedar"
 unknown_tools = "deny"
 # DEPRECATED. Policies name actions per server, Action::"<server>/<tool>". `true` brings back
 # the old bare Action::"<tool>", which matches that tool on every server; only for a policy set
-# not yet rewritten (`onbehalf policy lint` lists the bare actions). Logged as a warning.
+# not yet rewritten (`attenuo policy lint` lists the bare actions). Logged as a warning.
 legacy_bare_actions = false
 
 # Extra originating_user.attributes the Cedar schema should know, so policies that test them
@@ -67,9 +67,9 @@ inputs = { repo = "string" }
 
 [audit]
 # Audit log and lease registry. ":memory:" keeps both in memory (lost on exit).
-sqlite_path = "data/onbehalf.sqlite"
+sqlite_path = "data/attenuo.sqlite"
 # Signed checkpoints: the issuer key signs the head of the hash chain, so truncation or a
-# rewritten history can be caught with only the JWKS (`onbehalf audit verify`). One is written
+# rewritten history can be caught with only the JWKS (`attenuo audit verify`). One is written
 # every `checkpoint_every` entries and at least every `checkpoint_interval_seconds` while
 # entries arrive; 0 turns a trigger off.
 checkpoint_every = 1000
@@ -86,14 +86,14 @@ wal_checkpoint_seconds = 5
 
 # Ship every signed checkpoint off the host as it is created (SR-21). The signing key lives
 # here, so only a copy that already left the host shows a log rewritten and re-signed later
-# (`onbehalf audit verify --file <export> --checkpoints <shipped.jsonl>`). kind = "webhook"
+# (`attenuo audit verify --file <export> --checkpoints <shipped.jsonl>`). kind = "webhook"
 # (POST, any 2xx), "file" (append JSON Lines on another mount, shipped by your own agent) or
 # "s3" (SigV4 PUT to an S3-compatible bucket). Delivery is queued and retried with backoff;
 # /readyz reports "degraded" when the queue is full or lags more than max_lag_seconds.
 # [audit.sink]
 # kind = "webhook"
-# url = "https://anchor.example.com/onbehalf/checkpoints"
-# bearer_token = "..."          # or ONBEHALF_AUDIT_SINK_TOKEN
+# url = "https://anchor.example.com/attenuo/checkpoints"
+# bearer_token = "..."          # or ATTENUO_AUDIT_SINK_TOKEN
 # max_lag_seconds = 300
 # queue_capacity = 1024
 
@@ -105,7 +105,7 @@ url = "http://127.0.0.1:3001/mcp"
 
 [admin]
 # Static bearer for /admin/*. v0 only; do not expose /admin publicly. No token ships here:
-# generate one with `openssl rand -hex 32` and put it here, or set ONBEHALF_ADMIN_TOKEN (which
+# generate one with `openssl rand -hex 32` and put it here, or set ATTENUO_ADMIN_TOKEN (which
 # overrides this value). Without a token the admin routes answer 403. Off a loopback `listen`
 # address the server refuses to start when the token is missing, shorter than 32 bytes or a
 # published placeholder.
@@ -194,7 +194,7 @@ attributes = { mfa = false }
 # may_act = ["coder"]
 
 [authzen]
-# POST /access/v1/evaluation requires `Authorization: Bearer <onbehalf token>` by default.
+# POST /access/v1/evaluation requires `Authorization: Bearer <attenuo token>` by default.
 # Set to true to also accept a chain in subject.properties.chain without the token, from a
 # PEP listed in [[peps]] (HTTP Basic, or pep_id/pep_secret in the body). Each hop of such a
 # chain must match what this server issued for its lease, or the request gets 403.

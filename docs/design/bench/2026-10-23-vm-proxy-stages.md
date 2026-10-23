@@ -58,7 +58,7 @@ Linux 6.18.44-fc-v153
 
 ### Time by stage through the proxy, audit = memory
 
-From the server's `onbehalf_proxy_stage_seconds` over each measured window. p50 and p90 are interpolated inside histogram buckets (estimates); the mean is exact.
+From the server's `attenuo_proxy_stage_seconds` over each measured window. p50 and p90 are interpolated inside histogram buckets (estimates); the mean is exact.
 
 | hops | outcome | clients | stage | count | mean us | p50 us | p90 us |
 |---|---|---|---|---|---|---|---|
@@ -93,7 +93,7 @@ From the server's `onbehalf_proxy_stage_seconds` over each measured window. p50 
 
 ### Time by stage through the proxy, audit = file
 
-From the server's `onbehalf_proxy_stage_seconds` over each measured window. p50 and p90 are interpolated inside histogram buckets (estimates); the mean is exact.
+From the server's `attenuo_proxy_stage_seconds` over each measured window. p50 and p90 are interpolated inside histogram buckets (estimates); the mean is exact.
 
 | hops | outcome | clients | stage | count | mean us | p50 us | p90 us |
 |---|---|---|---|---|---|---|---|

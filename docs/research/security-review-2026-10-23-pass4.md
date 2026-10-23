@@ -1,8 +1,11 @@
 # Security review, pass 4
 
+<!-- renamed-note -->
+> Note (2026-10-23): this project was renamed from `onbehalf` to `attenuo`. This historical document keeps the old name.
+
 - Date: 2026-10-23
 - Branch: `review/security-pass-4` (base: `0ff8177` on main)
-- Related: [pass 1 and 2](security-review-2026-10-22.md), [pass 3](security-review-2026-10-23.md), [RFC-0001](../spec/rfc-0001-onbehalf.md), [threat model](../spec/threat-model.md), [task board](../tasks/board.md)
+- Related: [pass 1 and 2](security-review-2026-10-22.md), [pass 3](security-review-2026-10-23.md), [RFC-0001](../spec/rfc-0001-attenuo.md), [threat model](../spec/threat-model.md), [task board](../tasks/board.md)
 
 ## Scope and method
 

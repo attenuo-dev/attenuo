@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from "vitest";
-import { decodeToken, OnbehalfError, Token, VerificationError, verifyToken } from "../src/index.js";
+import { decodeToken, AttenuoError, Token, VerificationError, verifyToken } from "../src/index.js";
 import { b64, Signer } from "./helpers.js";
 
 let signer: Signer;
@@ -30,10 +30,10 @@ describe("decodeToken", () => {
   });
 
   it("rejects garbage", () => {
-    expect(() => decodeToken("a.b")).toThrow(OnbehalfError);
-    expect(() => decodeToken("a.b.c")).toThrow(OnbehalfError);
+    expect(() => decodeToken("a.b")).toThrow(AttenuoError);
+    expect(() => decodeToken("a.b.c")).toThrow(AttenuoError);
     const notToken = `${b64("{}")}.${b64('{"exp":1}')}.${b64("x")}`;
-    expect(() => decodeToken(notToken)).toThrow(/not an onbehalf delegation token/);
+    expect(() => decodeToken(notToken)).toThrow(/not an attenuo delegation token/);
   });
 });
 
@@ -42,7 +42,7 @@ describe("verifyToken", () => {
     const jwt = await signer.mint({ agents: ["assistant", "coder"] });
     const tok = await verifyToken(jwt, signer.jwks, {
       issuer: "http://ob.test",
-      audience: "onbehalf",
+      audience: "attenuo",
     });
     expect(tok.verified).toBe(true);
     expect(tok.agents).toEqual(["assistant", "coder"]);

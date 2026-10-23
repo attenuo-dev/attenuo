@@ -15,18 +15,18 @@ fn write(target: &str, name: &str, bytes: &[u8]) {
 }
 
 fn main() {
-    let f = onbehalf_fuzz::fixture();
+    let f = attenuo_fuzz::fixture();
     write("token_verify_bytes", "valid_token", f.token.as_bytes());
     let chain = serde_json::to_vec_pretty(&f.claims["chain"]).unwrap();
     write("chain_validate", "valid_chain", &chain);
 
-    let a = onbehalf_fuzz::audit_fixture();
+    let a = attenuo_fuzz::audit_fixture();
     write(
         "audit_export_bytes",
         "valid_export.jsonl",
         a.text.as_bytes(),
     );
-    let json_form = serde_json::to_vec(&onbehalf_audit::to_json_form(&a.export)).unwrap();
+    let json_form = serde_json::to_vec(&attenuo_audit::to_json_form(&a.export)).unwrap();
     write("audit_export_bytes", "valid_export.json", &json_form);
 
     let proof = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"a"}}}"#;

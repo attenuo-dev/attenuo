@@ -1,4 +1,4 @@
-# Tests for policy.cedar, run offline by `onbehalf policy test` (and by run.sh).
+# Tests for policy.cedar, run offline by `attenuo policy test` (and by run.sh).
 # The catalog is read from the demo's server config, so the tests see the same tools as the
 # server does. Hops without `capabilities` get exactly the call's server:tool.
 policies: ./policy.cedar

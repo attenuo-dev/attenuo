@@ -1,6 +1,6 @@
 # Integrating MCP clients
 
-This guide is for the person writing the agent side: an agent framework, an MCP client library, or a script. It covers how to send the onbehalf token, how a token passes from one agent to the next, what to do with a denial, how to keep a lease alive, and how a client that does not speak MCP can ask onbehalf for a decision.
+This guide is for the person writing the agent side: an agent framework, an MCP client library, or a script. It covers how to send the attenuo token, how a token passes from one agent to the next, what to do with a denial, how to keep a lease alive, and how a client that does not speak MCP can ask attenuo for a decision.
 
 The examples use `curl` so you can see the wire format. Every request and response shape below was run against a local server.
 
@@ -10,14 +10,14 @@ An agent holds a **delegation token**: a signed JWT that names the user the agen
 
 ## Sending the bearer to the proxy
 
-onbehalf mounts each configured upstream at `/mcp/<name>` and speaks MCP Streamable HTTP on it. To use an upstream through onbehalf:
+attenuo mounts each configured upstream at `/mcp/<name>` and speaks MCP Streamable HTTP on it. To use an upstream through attenuo:
 
-1. Change the MCP server URL in your client from the upstream's URL to `https://<onbehalf host>/mcp/<name>`.
+1. Change the MCP server URL in your client from the upstream's URL to `https://<attenuo host>/mcp/<name>`.
 2. Send `Authorization: Bearer <delegation token>` on every request, including `initialize`, `tools/list` and the `GET` and `DELETE` session requests. Without it, or with a bad one, you get HTTP 401 and JSON-RPC error `-32001`.
 3. Keep sending `Accept: application/json, text/event-stream` and `Content-Type: application/json` as MCP requires. The proxy forwards `Accept`, `Content-Type`, `Mcp-Session-Id`, `Mcp-Protocol-Version` and `Last-Event-ID` to the upstream.
 
 ```sh
-curl -s -X POST https://onbehalf.example.com/mcp/github \
+curl -s -X POST https://attenuo.example.com/mcp/github \
   -H "Authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   -H 'accept: application/json, text/event-stream' \
@@ -27,25 +27,25 @@ curl -s -X POST https://onbehalf.example.com/mcp/github \
 Things that are different from a plain MCP server:
 
 - **Tokens can be bound to keys.** A token with `cnf.jkt` needs a DPoP proof on every request, and the 401 then says `WWW-Authenticate: DPoP`. See [Binding tokens to keys](binding-tokens-to-keys.md).
-- **The bearer is not forwarded.** The upstream never sees the onbehalf token. If the upstream needs its own credential, onbehalf has no setting for injecting one in v0. Today that means the upstream must trust the proxy by network placement, or hold its own static credential.
-- **No OAuth discovery.** onbehalf does not serve Protected Resource Metadata (RFC 9728) or an authorization server. A 401 carries `WWW-Authenticate: Bearer realm="onbehalf"` and nothing else. An MCP client that tries to discover an authorization server will not find one. Configure the bearer yourself, as a static header or through a token provider you write.
+- **The bearer is not forwarded.** The upstream never sees the attenuo token. If the upstream needs its own credential, attenuo has no setting for injecting one in v0. Today that means the upstream must trust the proxy by network placement, or hold its own static credential.
+- **No OAuth discovery.** attenuo does not serve Protected Resource Metadata (RFC 9728) or an authorization server. A 401 carries `WWW-Authenticate: Bearer realm="attenuo"` and nothing else. An MCP client that tries to discover an authorization server will not find one. Configure the bearer yourself, as a static header or through a token provider you write.
 - **Whether your MCP client lets you set a header** (and refresh it) depends on the client. Most Streamable HTTP clients take custom headers. Which ones support changing the header between requests is untested here. If yours cannot, run a small local forwarder that adds a fresh bearer. The SDKs have the per-request hook: `TokenAuth(provider)` in Python and `mcpFetch(provider)` in TypeScript, and a token refresher is such a provider.
 - **`tools/list` is filtered.** You see only the tools the token may call. A tool missing from the list is not necessarily missing upstream.
 - **Resources and prompts are authorized like tool calls.** `resources/read`, `resources/subscribe`, `prompts/get` and `completion/complete` need a capability with the method name as the tool, for example `github:resources/read`. Any other method outside a short allowlist is denied unless a capability and the policy permit it. `tools/list`, `resources/list`, `resources/templates/list` and `prompts/list` show only entries your capabilities could permit (the cursor is passed through, so a page can be empty while `nextCursor` is set). See [design/server.md](../design/server.md#mcp-method-coverage).
 
-Every response to a request that was decided carries the header `X-Onbehalf-Decision-Id`, a comma-separated list in request order when the body is a batch.
+Every response to a request that was decided carries the header `X-Attenuo-Decision-Id`, a comma-separated list in request order when the body is a batch.
 
 ## Getting the first token
 
 The first token in a chain is the **root token**. It binds one user to one agent. How you get it depends on the deployment:
 
-- **Production.** The agent authenticates itself to `POST /token` with its client id and secret and presents a credential the user's identity provider issued: an OIDC ID token or an ID-JAG. onbehalf checks the credential and builds the user block from it. Details are in [Identity providers](identity-providers.md).
-- **Development.** An operator mints it with `onbehalf token root`, which needs `[dev] allow_root_mint = true`. See [Getting started](getting-started.md).
+- **Production.** The agent authenticates itself to `POST /token` with its client id and secret and presents a credential the user's identity provider issued: an OIDC ID token or an ID-JAG. attenuo checks the credential and builds the user block from it. Details are in [Identity providers](identity-providers.md).
+- **Development.** An operator mints it with `attenuo token root`, which needs `[dev] allow_root_mint = true`. See [Getting started](getting-started.md).
 
 A root token request, from a registered agent:
 
 ```sh
-curl -s -X POST https://onbehalf.example.com/token \
+curl -s -X POST https://attenuo.example.com/token \
   -u planner:$PLANNER_SECRET \
   --data-urlencode grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
   --data-urlencode subject_token=$ID_TOKEN \
@@ -82,7 +82,7 @@ At every step the rule is the same: the requested capabilities must be covered b
 The exchange request, with a constraint, as JSON:
 
 ```sh
-curl -s -X POST https://onbehalf.example.com/token \
+curl -s -X POST https://attenuo.example.com/token \
   -u coder:$CODER_SECRET \
   -H 'content-type: application/json' \
   -d '{
@@ -92,7 +92,7 @@ curl -s -X POST https://onbehalf.example.com/token \
     "actor": "coder",
     "requested_ttl_seconds": 600,
     "authorization_details": [
-      { "type": "onbehalf_capabilities",
+      { "type": "attenuo_capabilities",
         "capabilities": [
           { "server": "github", "tool": "create_issue",
             "constraints": { "repo": { "op": "prefix", "value": "acme/" } } }
@@ -104,7 +104,7 @@ curl -s -X POST https://onbehalf.example.com/token \
 The form encoding takes `scope` instead, a space-separated list of `server:tool` with no constraints:
 
 ```sh
-curl -s -X POST https://onbehalf.example.com/token \
+curl -s -X POST https://attenuo.example.com/token \
   -u coder:$CODER_SECRET \
   --data-urlencode grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
   --data-urlencode subject_token=$PLANNER_TOKEN \
@@ -116,9 +116,9 @@ curl -s -X POST https://onbehalf.example.com/token \
 With a SPIFFE JWT-SVID instead of a client secret, the receiving agent sends its own identity:
 
 ```sh
-SVID=$(spire-agent api fetch jwt -audience https://onbehalf.example.com \
+SVID=$(spire-agent api fetch jwt -audience https://attenuo.example.com \
   -socketPath /run/spire/sockets/agent.sock | sed -n 2p | tr -d '[:space:]')   # untested
-curl -s -X POST https://onbehalf.example.com/token \
+curl -s -X POST https://attenuo.example.com/token \
   --data-urlencode grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
   --data-urlencode subject_token=$PLANNER_TOKEN \
   --data-urlencode subject_token_type=urn:ietf:params:oauth:token-type:jwt \
@@ -128,7 +128,7 @@ curl -s -X POST https://onbehalf.example.com/token \
   --data-urlencode actor_token_type=urn:ietf:params:oauth:token-type:jwt
 ```
 
-The SDKs take the same: Python `client.exchange(parent, "coder", caps, actor_token=svid)`, TypeScript `ob.exchange(parent, "coder", caps, { actorToken: svid })`, CLI `onbehalf token exchange ... --actor-token-file svid.jwt`.
+The SDKs take the same: Python `client.exchange(parent, "coder", caps, actor_token=svid)`, TypeScript `ob.exchange(parent, "coder", caps, { actorToken: svid })`, CLI `attenuo token exchange ... --actor-token-file svid.jwt`.
 
 Rules to know:
 
@@ -148,15 +148,15 @@ Each hop gets its own lease. Revoking a lease revokes its whole subtree. So if t
 To see what a token carries:
 
 ```sh
-onbehalf token inspect "$TOKEN" --verify
+attenuo token inspect "$TOKEN" --verify
 ```
 
 ## Worked examples with agent frameworks
 
 Two runnable examples put an orchestrator and a `coder` sub-agent behind the proxy, each with its own token, and replay the GitHub-leak scenario:
 
-- [Claude Agent SDK](https://github.com/7Mudit/onbehalf/blob/main/examples/claude-agent-sdk/README.md): the sub-agent's `AgentDefinition` carries an inline MCP server (`{"type": "http", "url": ".../mcp/github", "headers": {"Authorization": "Bearer ..."}}`), so only that agent holds the narrowed token.
-- [LangChain](https://github.com/7Mudit/onbehalf/blob/main/examples/langchain-agent/README.md): `langchain-mcp-adapters` with the same URL and header, and a tool interceptor that hands a `-32003` denial to the model as a tool error instead of letting it end the run. The adapter opens a new MCP session per call, so after a revocation it sees HTTP 401 rather than `-32003`.
+- [Claude Agent SDK](https://github.com/attenuo-dev/attenuo/blob/main/examples/claude-agent-sdk/README.md): the sub-agent's `AgentDefinition` carries an inline MCP server (`{"type": "http", "url": ".../mcp/github", "headers": {"Authorization": "Bearer ..."}}`), so only that agent holds the narrowed token.
+- [LangChain](https://github.com/attenuo-dev/attenuo/blob/main/examples/langchain-agent/README.md): `langchain-mcp-adapters` with the same URL and header, and a tool interceptor that hands a `-32003` denial to the model as a tool error instead of letting it end the run. The adapter opens a new MCP session per call, so after a revocation it sees HTTP 401 rather than `-32003`.
 
 Both run without an API key in a dry-run mode (`run.sh`). The live mode with a model is untested.
 
@@ -170,7 +170,7 @@ A denied `tools/call` comes back as HTTP 200 with a JSON-RPC error. The MCP requ
   "id": 2,
   "error": {
     "code": -32003,
-    "message": "onbehalf: denied: capability_denied",
+    "message": "attenuo: denied: capability_denied",
     "data": {
       "reason": "capability_denied",
       "decision_id": "98849dc3-f053-4649-9b1a-fae0c2f11426"
@@ -179,7 +179,7 @@ A denied `tools/call` comes back as HTTP 200 with a JSON-RPC error. The MCP requ
 }
 ```
 
-Code on `-32003`. Branch on `error.data.reason`, not on the message text. The `decision_id` is the id of the audit record for this decision. It is also in the `X-Onbehalf-Decision-Id` header.
+Code on `-32003`. Branch on `error.data.reason`, not on the message text. The `decision_id` is the id of the audit record for this decision. It is also in the `X-Attenuo-Decision-Id` header.
 
 What each reason means for the agent:
 
@@ -202,7 +202,7 @@ Other proxy errors: `-32004` (HTTP 404) for an unknown upstream name, `-32005` (
 Good client behaviour:
 
 - Return the denial to the model as a plain tool error that says what was denied and why, in your words. Do not paste raw server output into the model's context, and do not invite it to try other routes.
-- Log the `decision_id` next to your own request id. When a user asks "why did the agent not do X", an operator can look it up. Over HTTP: `GET /admin/audit?from=1&limit=1000`, then pick the entry where `record.id` matches. With the CLI and `jq`: `onbehalf --json audit tail -n 1000 | jq '.entries[] | select(.record.id == "<decision id>")'`. Untested against a large log.
+- Log the `decision_id` next to your own request id. When a user asks "why did the agent not do X", an operator can look it up. Over HTTP: `GET /admin/audit?from=1&limit=1000`, then pick the entry where `record.id` matches. With the CLI and `jq`: `attenuo --json audit tail -n 1000 | jq '.entries[] | select(.record.id == "<decision id>")'`. Untested against a large log.
 - Do not loop on a denial. A denial is a decision, not a glitch.
 
 ## Renewing leases
@@ -210,7 +210,7 @@ Good client behaviour:
 A lease is short-lived. When it expires, calls on that hop are denied with `lease_expired` even if the token itself is still valid. The agent that holds the token keeps its lease alive.
 
 ```sh
-curl -s -X POST https://onbehalf.example.com/token/renew \
+curl -s -X POST https://attenuo.example.com/token/renew \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -231,20 +231,20 @@ How to use it:
 - An expired token gets 401. Mint a new one.
 - Every renewal is one audit row. Do not renew faster than you need to.
 
-A client that has finished should simply stop renewing. The lease lapses on its own. There is no "release" call in v0. The operator can revoke at once if needed with `onbehalf lease revoke <id>`.
+A client that has finished should simply stop renewing. The lease lapses on its own. There is no "release" call in v0. The operator can revoke at once if needed with `attenuo lease revoke <id>`.
 
 A sub-agent that crashes and stops renewing is denied within one interval. A revoke is immediate.
 
 ## Using the AuthZEN endpoint from a non-MCP PEP
 
-You do not need MCP to use onbehalf. `POST /access/v1/evaluation` is an [OpenID AuthZEN](https://openid.net/wg/authzen/) Authorization API endpoint. Anything that enforces policy, such as an API gateway, a sidecar, a function wrapper or a service that guards its own routes, can send it a question and enforce the answer. The same pipeline decides, so you get the same lease check, the same capability check, the same Cedar policy and the same audit record as the proxy path.
+You do not need MCP to use attenuo. `POST /access/v1/evaluation` is an [OpenID AuthZEN](https://openid.net/wg/authzen/) Authorization API endpoint. Anything that enforces policy, such as an API gateway, a sidecar, a function wrapper or a service that guards its own routes, can send it a question and enforce the answer. The same pipeline decides, so you get the same lease check, the same capability check, the same Cedar policy and the same audit record as the proxy path.
 
 The discovery document is at `/.well-known/authzen-configuration`.
 
 The simplest form sends the delegation token as the bearer and describes the call in the body:
 
 ```sh
-curl -s -X POST https://onbehalf.example.com/access/v1/evaluation \
+curl -s -X POST https://attenuo.example.com/access/v1/evaluation \
   -H "Authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   -d '{
@@ -281,11 +281,11 @@ Field notes:
 - The call is audited as an ordinary decision, so the `decision_id` points at a real row.
 - Each question is a decision, and it is logged. Ask once per action you will enforce.
 
-The CLI does the same: `ONBEHALF_TOKEN="$TOKEN" onbehalf authzen eval --server github --tool create_issue --arg repo=acme/api --arg title=x`. It exits 2 on a negative decision.
+The CLI does the same: `ATTENUO_TOKEN="$TOKEN" attenuo authzen eval --server github --tool create_issue --arg repo=acme/api --arg title=x`. It exits 2 on a negative decision.
 
 **Without a bearer.** By default a request without a bearer gets 401. An operator can allow PEPs that cannot carry the token to send the chain in `subject.properties.chain` instead, with `[authzen] allow_unsigned_chain = true` and a `[[peps]]` entry per PEP. The PEP then authenticates with its client secret (HTTP Basic, or `pep_id` and `pep_secret` at the top level of the body). The server checks that the chain is well-formed, and that every hop's lease is live and was issued for exactly that chain prefix; a chain it never issued, or one with any field changed, is 403 `chain_not_issued`. Prefer the bearer.
 
-**Enforcing the answer.** onbehalf only answers. The PEP has to refuse the action on `false`, and refuse it when the call to onbehalf fails. A PEP that fails open turns onbehalf off. Revocation reaches a PEP only when it asks, since there is no push channel in v0. Do not cache an allow for longer than you are willing to leave a revoked agent running.
+**Enforcing the answer.** attenuo only answers. The PEP has to refuse the action on `false`, and refuse it when the call to attenuo fails. A PEP that fails open turns attenuo off. Revocation reaches a PEP only when it asks, since there is no push channel in v0. Do not cache an allow for longer than you are willing to leave a revoked agent running.
 
 ## A checklist for client authors
 

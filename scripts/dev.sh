@@ -13,7 +13,7 @@ fmt()    { cargo fmt --all -- --check; }
 clippy() { cargo clippy --workspace --all-targets -- -D warnings; }
 test_()  { cargo test --workspace; }
 demo()   { bash examples/github-leak-demo/run.sh; }
-policy() { cargo run -q -p onbehalf-cli -- policy test examples/github-leak-demo/policy_test.yaml; }
+policy() { cargo run -q -p attenuo-cli -- policy test examples/github-leak-demo/policy_test.yaml; }
 docs()   { RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps; }
 links()  { python3 scripts/check-links.py; }
 deny() {

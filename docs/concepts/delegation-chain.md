@@ -2,7 +2,7 @@
 
 An AI agent rarely works alone. A person asks a planner agent for something. The planner hands part of the job to a coder agent. The coder calls a tool. By then, the tool server sees only the last agent. It has no idea which person started the run.
 
-The delegation chain fixes that. It is the record of who is acting for whom, carried inside every token onbehalf issues.
+The delegation chain fixes that. It is the record of who is acting for whom, carried inside every token attenuo issues.
 
 ## What is in a chain
 
@@ -15,7 +15,7 @@ The chain is stored whole in the `chain` claim of the token. The standard `sub` 
 
 ## Where a chain starts
 
-Hop 0 starts at `POST /token`. An agent presents a credential for a user from an identity provider you trust: an OIDC ID token or an ID-JAG. onbehalf verifies the signature and claims, then builds the originating user block from them. The agent must authenticate with its own client secret. The requested capabilities must fit inside the root grant you configured for that issuer and agent.
+Hop 0 starts at `POST /token`. An agent presents a credential for a user from an identity provider you trust: an OIDC ID token or an ID-JAG. attenuo verifies the signature and claims, then builds the originating user block from them. The agent must authenticate with its own client secret. The requested capabilities must fit inside the root grant you configured for that issuer and agent.
 
 For local trials only, a development endpoint can mint a root token for a user nobody verified. It is off by default.
 
@@ -27,7 +27,7 @@ The exchange fails if the new capabilities are not covered by the parent hop, if
 
 ## Protecting the user block
 
-When a root token is issued, onbehalf signs the originating user block together with the token issuer (`iss`) and the root hop (its agent, capabilities, issue time and lease). The signature is the `ou_sig` claim, with `ou_sig_v` (the construction version, always 3: the signed JSON is RFC 8785 canonical form) and `ou_kid` (the key that signed it). Every exchange copies them unchanged. A verifier checks the signature on its own, apart from the outer token signature. A token whose user block or root hop fails the check is rejected. It is never filled in with a default. Because the root hop is covered, a signature taken from one of the user's chains cannot start another chain with different root capabilities.
+When a root token is issued, attenuo signs the originating user block together with the token issuer (`iss`) and the root hop (its agent, capabilities, issue time and lease). The signature is the `ou_sig` claim, with `ou_sig_v` (the construction version, always 3: the signed JSON is RFC 8785 canonical form) and `ou_kid` (the key that signed it). Every exchange copies them unchanged. A verifier checks the signature on its own, apart from the outer token signature. A token whose user block or root hop fails the check is rejected. It is never filled in with a default. Because the root hop is covered, a signature taken from one of the user's chains cannot start another chain with different root capabilities.
 
 ## What the chain gives you
 
@@ -41,4 +41,4 @@ When a root token is issued, onbehalf signs the originating user block together 
 - The user block does not record which credential it came from. The RFC calls this `evidence` and lists it as proposed.
 - There is no stable `chain_id` yet. A run is identified by its leases.
 
-More detail: [RFC-0001 section 3](../spec/rfc-0001-onbehalf.md#3-delegation-chain-data-model) and [section 4](../spec/rfc-0001-onbehalf.md#4-token-exchange), and [design/server.md](../design/server.md#hop-0-intake-from-an-identity-provider).
+More detail: [RFC-0001 section 3](../spec/rfc-0001-attenuo.md#3-delegation-chain-data-model) and [section 4](../spec/rfc-0001-attenuo.md#4-token-exchange), and [design/server.md](../design/server.md#hop-0-intake-from-an-identity-provider).

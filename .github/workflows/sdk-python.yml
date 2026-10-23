@@ -55,4 +55,4 @@ jobs:
       - run: pytest -m integration
         working-directory: sdk/python
         env:
-          ONBEHALF_INTEGRATION: "1"
+          ATTENUO_INTEGRATION: "1"

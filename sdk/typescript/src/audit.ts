@@ -1,10 +1,10 @@
 /**
  * Offline verification of an audit export.
  *
- * `verifyExport` re-checks a file written by `onbehalf audit export` (or
+ * `verifyExport` re-checks a file written by `attenuo audit export` (or
  * `AdminClient.auditExport`) with nothing but the issuer's public keys: the SHA-256 hash chain
  * over RFC 8785 canonical JSON, the range the header declares, and the Ed25519 checkpoint
- * signatures. It follows the Rust `verify_export_with` (`onbehalf audit verify --file`) rule
+ * signatures. It follows the Rust `verify_export_with` (`attenuo audit verify --file`) rule
  * for rule, so a file gets the same verdict, and the same `firstBadSeq`, in both.
  *
  * A file that fails verification gives a report with `ok: false`; a file that cannot be read as
@@ -16,20 +16,20 @@
  * `seq` that large is refused with `ExportError`).
  */
 
-import { OnbehalfError } from "./errors.js";
+import { AttenuoError } from "./errors.js";
 import { canonicalize, parseJson, type JsonValue } from "./jcs.js";
 import { b64urlDecode } from "./token.js";
 
 /** First element of the array the entry hash covers. */
-export const ENTRY_HASH_VERSION = "onbehalf-audit-entry-v2";
+export const ENTRY_HASH_VERSION = "attenuo-audit-entry-v2";
 /** `prev_hash` of the first entry of a log. */
 export const GENESIS_HASH = "0".repeat(64);
 /** Value of the header's `format` member. */
-export const EXPORT_FORMAT = "onbehalf-audit-export-v2";
-const CHECKPOINT_CONTEXT = "onbehalf-checkpoint-v1";
+export const EXPORT_FORMAT = "attenuo-audit-export-v2";
+const CHECKPOINT_CONTEXT = "attenuo-checkpoint-v1";
 
 /** The input is not an audit export this version can verify. */
-export class ExportError extends OnbehalfError {}
+export class ExportError extends AttenuoError {}
 
 export interface BadCheckpoint {
   seq: number;
@@ -111,14 +111,14 @@ async function sha256Hex(text: string): Promise<string> {
 
 /**
  * SHA-256 (hex) of the RFC 8785 canonical JSON of
- * `["onbehalf-audit-entry-v2", seq, prevHash, record]`.
+ * `["attenuo-audit-entry-v2", seq, prevHash, record]`.
  */
 export function entryHash(seq: number, prevHash: string, record: unknown): Promise<string> {
   return sha256Hex(canonicalize([ENTRY_HASH_VERSION, seq, prevHash, record]));
 }
 
 /**
- * Verify an audit export offline. Strict like `onbehalf audit verify --file`: the header is
+ * Verify an audit export offline. Strict like `attenuo audit verify --file`: the header is
  * required, entries outside its `from..=to` fail, a file short of that range fails, and so do
  * entries after the last valid checkpoint unless `allowUnsignedTail` is set.
  */
@@ -332,9 +332,9 @@ function parse(text: string): { header: Obj; entries: Entry[]; checkpoints: Chec
 function checkHeader(h: unknown): Obj {
   if (!isObj(h)) throw new ExportError("the header must be an object");
   need(h, "header", { format: "str", exported_at: "str", from: "uint", to: "uint" });
-  if (h.format === "onbehalf-audit-export-v1") {
+  if (h.format === "attenuo-audit-export-v1") {
     throw new ExportError(
-      "export format `onbehalf-audit-export-v1` was written by an earlier onbehalf whose entry " +
+      "export format `attenuo-audit-export-v1` was written by an earlier attenuo whose entry " +
         `hashes were not RFC 8785 canonical; this version verifies only \`${EXPORT_FORMAT}\` ` +
         "(export the log again with this version)",
     );

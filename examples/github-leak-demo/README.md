@@ -4,7 +4,7 @@
 
 In May 2025 researchers showed that an AI assistant wired to the official GitHub MCP server could be turned against its user. A malicious issue in a public repository carried instructions; the assistant read them while triaging issues, followed them, pulled files out of the user's private repositories with the user's broad access token, and published the contents in a public pull request ([Invariant Labs write-up](https://invariantlabs.ai/blog/mcp-github-vulnerability)). Nothing was exploited in GitHub or in the MCP server. The agent held more authority than the task needed, and nothing checked each call against what the user had actually delegated.
 
-This demo replays that shape against onbehalf, with a fake GitHub MCP server so it runs offline.
+This demo replays that shape against attenuo, with a fake GitHub MCP server so it runs offline.
 
 ## Run it
 
@@ -17,8 +17,8 @@ It needs a Rust toolchain, `curl` and `python3`. The first run compiles the work
 The policy has its own tests, which need no server (`run.sh` runs them first):
 
 ```sh
-cargo run -q -p onbehalf-cli -- policy test examples/github-leak-demo/policy_test.yaml
-cargo run -q -p onbehalf-cli -- policy lint examples/github-leak-demo/policy.cedar --config examples/github-leak-demo/config.toml
+cargo run -q -p attenuo-cli -- policy test examples/github-leak-demo/policy_test.yaml
+cargo run -q -p attenuo-cli -- policy lint examples/github-leak-demo/policy.cedar --config examples/github-leak-demo/config.toml
 ```
 
 See [writing-policies](../../docs/guides/writing-policies.md#testing-policies).
@@ -43,11 +43,11 @@ At the end the script prints what the fake GitHub server received: one `tools/ca
 
 - `config.toml`: server config with the catalog, the upstream, the admin token and alice's root grant. `run.sh` rewrites the ports and the policy path in a copy.
 - `policy.cedar`: the one permit rule, `read_file` only when `repo like "alice/public-*"`, plus two guard-rail forbids (sensitive tools without MFA, chains deeper than three).
-- `policy_test.yaml`: nine cases for that policy, run by `onbehalf policy test`.
+- `policy_test.yaml`: nine cases for that policy, run by `attenuo policy test`.
 - `config.docker.toml`: the same, for `docker-compose.yml` at the repository root (untested).
 - `run.sh`, `transcript.md`.
 
-The fake server is `crates/onbehalf-proxy/examples/fake_mcp.rs`: the proxy crate's `FakeMcpServer` test double with `read_file`, `create_issue` and `delete_repo`, which echoes calls instead of doing anything.
+The fake server is `crates/attenuo-proxy/examples/fake_mcp.rs`: the proxy crate's `FakeMcpServer` test double with `read_file`, `create_issue` and `delete_repo`, which echoes calls instead of doing anything.
 
 ## What this does not show
 

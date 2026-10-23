@@ -9,9 +9,9 @@
 
 use arbitrary::{Arbitrary, Result, Unstructured};
 use libfuzzer_sys::fuzz_target;
-use onbehalf_core::{Capability, CapabilitySet};
-use onbehalf_proxy::filter::{could_permit_tool, ListFilter, ListKind};
-use onbehalf_proxy::sse::{SseFramer, SseRewriter};
+use attenuo_core::{Capability, CapabilitySet};
+use attenuo_proxy::filter::{could_permit_tool, ListFilter, ListKind};
+use attenuo_proxy::sse::{SseFramer, SseRewriter};
 use serde_json::{json, Value};
 
 #[derive(Debug)]

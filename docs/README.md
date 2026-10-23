@@ -1,11 +1,11 @@
-# onbehalf docs
+# attenuo docs
 
 This folder is an Obsidian vault (open it with "Open folder as vault") and the project's public-safe knowledge base.
 
 - [guides/](guides/): getting started, deploying, integrating MCP clients, identity providers
 - [guide/codebase-walkthrough.md](guide/codebase-walkthrough.md): a reading-and-running plan for the whole codebase, in nine sessions, with a glossary and a list of surprises
 - [faq.md](faq.md): the questions people ask first
-- [comparison.md](comparison.md): onbehalf next to OAuth scopes, gateways, policy engines, IdP agent features and SPIFFE
+- [comparison.md](comparison.md): attenuo next to OAuth scopes, gateways, policy engines, IdP agent features and SPIFFE
 - [launch-checklist.md](launch-checklist.md): what maintainers check before the first public release
 - [reference/](reference/): lookup tables for CLI commands, configuration keys and HTTP endpoints
 - [spec/](spec/) — the RFC, threat model, and protocol/API specifications
@@ -16,7 +16,7 @@ This folder is an Obsidian vault (open it with "Open folder as vault") and the p
 - [tasks/](tasks/) — the task board and milestone plans
 - [log/](log/) — engineering log, one file per day
 
-Process documents live at the repository root: [CONTRIBUTING](https://github.com/7Mudit/onbehalf/blob/main/CONTRIBUTING.md), [SECURITY](https://github.com/7Mudit/onbehalf/blob/main/SECURITY.md), [GOVERNANCE](https://github.com/7Mudit/onbehalf/blob/main/GOVERNANCE.md), [CHANGELOG](https://github.com/7Mudit/onbehalf/blob/main/CHANGELOG.md). How ADRs and RFCs are written is in [decisions/README.md](decisions/) and [spec/README.md](spec/).
+Process documents live at the repository root: [CONTRIBUTING](https://github.com/attenuo-dev/attenuo/blob/main/CONTRIBUTING.md), [SECURITY](https://github.com/attenuo-dev/attenuo/blob/main/SECURITY.md), [GOVERNANCE](https://github.com/attenuo-dev/attenuo/blob/main/GOVERNANCE.md), [CHANGELOG](https://github.com/attenuo-dev/attenuo/blob/main/CHANGELOG.md). How ADRs and RFCs are written is in [decisions/README.md](decisions/) and [spec/README.md](spec/).
 
 ## Engineering log convention
 

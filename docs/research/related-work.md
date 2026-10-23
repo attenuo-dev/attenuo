@@ -1,7 +1,10 @@
 # Related work
 
+<!-- renamed-note -->
+> Note (2026-10-23): this project was renamed from `onbehalf` to `attenuo`. This historical document keeps the old name.
+
 - Date: 2026-10-22
-- Related: [RFC-0001](../spec/rfc-0001-onbehalf.md), [standards](standards.md), [ADR-0002](../decisions/0002-cedar-for-policy.md)
+- Related: [RFC-0001](../spec/rfc-0001-attenuo.md), [standards](standards.md), [ADR-0002](../decisions/0002-cedar-for-policy.md)
 
 ## Positioning table
 
@@ -34,7 +37,7 @@ Columns:
 
 Notes:
 
-- **onbehalf** is the only row that claims all of the first four columns, and it does so for MCP tool calls through its proxy or AuthZEN endpoint. "Yes" means implemented in this repository, with the gaps in [RFC-0001 section 10](../spec/rfc-0001-onbehalf.md#10-implementation-status) and [design/server.md](../design/server.md#known-limits-v0): the `actor` of an exchange is asserted not proven, revocation is checked per request but not pushed to external PEPs, and none of it has been load tested.
+- **onbehalf** is the only row that claims all of the first four columns, and it does so for MCP tool calls through its proxy or AuthZEN endpoint. "Yes" means implemented in this repository, with the gaps in [RFC-0001 section 10](../spec/rfc-0001-attenuo.md#10-implementation-status) and [design/server.md](../design/server.md#known-limits-v0): the `actor` of an exchange is asserted not proven, revocation is checked per request but not pushed to external PEPs, and none of it has been load tested.
 - **OAuth scopes alone** can carry a delegation chain with RFC 8693 `act` claims, but scopes themselves say nothing about hops or arguments.
 - **Gateways** can call an external authorizer on each request, so they can enforce what onbehalf decides. onbehalf speaks AuthZEN, not Envoy's `ext_authz` protocol, so an adapter would be needed. We have not built or tried one.
 - **OpenFGA and SpiceDB** are relationship-based (Zanzibar-style) engines. They are a good source of facts such as "who owns this repo" and onbehalf plans to consume them ([ADR-0002](../decisions/0002-cedar-for-policy.md), task board "Later"). They do not issue tokens or sit in the request path.

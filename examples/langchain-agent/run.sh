@@ -4,16 +4,16 @@
 #   examples/langchain-agent/run.sh            # dry-run, no API key needed
 #   LIVE=1 ANTHROPIC_API_KEY=sk-ant-... examples/langchain-agent/run.sh   # real agents
 #
-# Starts onbehalf-server and the fake GitHub MCP server on free local ports with the config and
+# Starts attenuo-server and the fake GitHub MCP server on free local ports with the config and
 # policy of examples/github-leak-demo, mints the orchestrator's root token through the dev
 # endpoint, and runs agent.py. Exits non-zero if any call does not come out as expected.
 #
 # Environment:
 #   LIVE=1                run the agents with Claude instead of the dry-run
-#   PYTHON=PATH           a Python with onbehalf, mcp and langchain-agent installed; by default a
+#   PYTHON=PATH           a Python with attenuo, mcp and langchain-agent installed; by default a
 #                         venv in the temp dir is created and requirements.txt installed
 #   KEEP=1                keep the temp dir (logs, rendered config) after the run
-#   ONBEHALF_BIN_DIR=DIR  use prebuilt onbehalf-server / fake_mcp from DIR instead of building
+#   ATTENUO_BIN_DIR=DIR  use prebuilt attenuo-server / fake_mcp from DIR instead of building
 
 set -euo pipefail
 
@@ -22,7 +22,7 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 DEMO="$ROOT/examples/github-leak-demo"
 cd "$ROOT"
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/onbehalf-example.XXXXXX")"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/attenuo-example.XXXXXX")"
 PIDS=()
 
 cleanup() {
@@ -47,15 +47,15 @@ free_port() {
 }
 
 # --- binaries -------------------------------------------------------------------------------
-if [ -n "${ONBEHALF_BIN_DIR:-}" ]; then
-  BIN="$ONBEHALF_BIN_DIR"
+if [ -n "${ATTENUO_BIN_DIR:-}" ]; then
+  BIN="$ATTENUO_BIN_DIR"
 else
   echo "building (first run takes a while)..." >&2
-  cargo build -q -p onbehalf-server
-  cargo build -q -p onbehalf-proxy --features testing --example fake_mcp
+  cargo build -q -p attenuo-server
+  cargo build -q -p attenuo-proxy --features testing --example fake_mcp
   BIN="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/debug"
 fi
-SERVER_BIN="$BIN/onbehalf-server"; FAKE_BIN="$BIN/examples/fake_mcp"
+SERVER_BIN="$BIN/attenuo-server"; FAKE_BIN="$BIN/examples/fake_mcp"
 [ -x "$FAKE_BIN" ] || FAKE_BIN="$BIN/fake_mcp"
 
 # --- python ---------------------------------------------------------------------------------
@@ -86,16 +86,16 @@ for _ in $(seq 1 100); do
 done
 curl -sf "http://127.0.0.1:$OB_PORT/healthz" >/dev/null || { echo "server did not start" >&2; exit 1; }
 
-export ONBEHALF_SERVER="http://127.0.0.1:$OB_PORT"
-export ONBEHALF_ADMIN_TOKEN="demo-admin-token"
+export ATTENUO_SERVER="http://127.0.0.1:$OB_PORT"
+export ATTENUO_ADMIN_TOKEN="demo-admin-token"
 
 # --- the orchestrator's root token (dev endpoint; real deployments use an IdP) ---------------
-ROOT_JSON="$(curl -sf -X POST "$ONBEHALF_SERVER/admin/root-token" \
-  -H "Authorization: Bearer $ONBEHALF_ADMIN_TOKEN" -H 'content-type: application/json' \
+ROOT_JSON="$(curl -sf -X POST "$ATTENUO_SERVER/admin/root-token" \
+  -H "Authorization: Bearer $ATTENUO_ADMIN_TOKEN" -H 'content-type: application/json' \
   -d '{"subject":"alice","issuer":"https://idp.example","agent":"assistant","capabilities":["github:*"]}')"
-ONBEHALF_ROOT_TOKEN="$(printf '%s' "$ROOT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')"
-ONBEHALF_ROOT_LEASE="$(printf '%s' "$ROOT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["lease"])')"
-export ONBEHALF_ROOT_TOKEN ONBEHALF_ROOT_LEASE
+ATTENUO_ROOT_TOKEN="$(printf '%s' "$ROOT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')"
+ATTENUO_ROOT_LEASE="$(printf '%s' "$ROOT_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["lease"])')"
+export ATTENUO_ROOT_TOKEN ATTENUO_ROOT_LEASE
 
 if [ "${LIVE:-0}" = 1 ]; then MODE=--live; else MODE=--dry-run; fi
 "$PYTHON" "$HERE/agent.py" "$MODE"
@@ -107,5 +107,5 @@ if [ "$MODE" = --dry-run ]; then
   grep 'tools/call' "$WORK/fake-mcp.log" | sed 's/^/  /'
   CALLS="$(grep -c 'tools/call' "$WORK/fake-mcp.log" || true)"
   [ "$CALLS" = 1 ] || { echo "!! expected exactly 1 upstream tools/call, saw $CALLS" >&2; exit 1; }
-  echo "  -> 1 tools/call reached upstream; nothing denied ever left onbehalf."
+  echo "  -> 1 tools/call reached upstream; nothing denied ever left attenuo."
 fi

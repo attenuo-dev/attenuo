@@ -1,6 +1,6 @@
-# onbehalf (Python SDK)
+# attenuo (Python SDK)
 
-Python client for the [onbehalf](../../README.md) authorization server: exchange delegation tokens, attenuate capabilities, call MCP tools through the enforcing proxy, handle denials, renew leases, and read the audit log.
+Python client for the [attenuo](../../README.md) authorization server: exchange delegation tokens, attenuate capabilities, call MCP tools through the enforcing proxy, handle denials, renew leases, and read the audit log.
 
 **Status: pre-alpha**, like the server. The API follows the server's wire format as of this repository and will change with it. Not on PyPI yet; install from a checkout.
 
@@ -18,7 +18,7 @@ Start a server with the example config (`[dev] allow_root_mint = true` for the d
 ```python
 import os
 
-from onbehalf import AdminClient, Capability, Client, Denied, Prefix
+from attenuo import AdminClient, Capability, Client, Denied, Prefix
 
 URL = "http://127.0.0.1:8080"
 
@@ -76,14 +76,14 @@ print(admin.audit_verify())  # VerifyReport(ok=True, entries=..., ...)
 ### Capabilities
 
 ```python
-from onbehalf import Capability, Equals, OneOf, Prefix
+from attenuo import Capability, Equals, OneOf, Prefix
 
 Capability("github", "read_file")  # github:read_file
 Capability("github", "create_issue", repo=OneOf("acme/api", "acme/web"))
 Capability("github", "read_*", repo=Prefix("alice/public-"), ref=Equals("main"))
 ```
 
-These serialize to the server's `authorization_details` shape, the same JSON `onbehalf token exchange --cap` produces. Plain strings (`"github:read_file"`, or comma separated) work anywhere a capability is accepted. A child must constrain every argument its parent constrains, at least as tightly; the server refuses an exchange that widens (`ApiError` with `error == "invalid_scope"`).
+These serialize to the server's `authorization_details` shape, the same JSON `attenuo token exchange --cap` produces. Plain strings (`"github:read_file"`, or comma separated) work anywhere a capability is accepted. A child must constrain every argument its parent constrains, at least as tightly; the server refuses an exchange that widens (`ApiError` with `error == "invalid_scope"`).
 
 ### Workload identity and `may_act`
 
@@ -107,10 +107,10 @@ root = admin.mint_root_dev(
 
 ### Binding tokens to keys (DPoP)
 
-A token can be bound to a key the agent holds (RFC 9449), so a leaked copy is useless without the key. Give the client a `dpop_key`: a `DpopKey` or a private JWK dict, such as the file `onbehalf key gen --dpop` writes. Signing needs `cryptography` (`pip install 'onbehalf[dpop]'`).
+A token can be bound to a key the agent holds (RFC 9449), so a leaked copy is useless without the key. Give the client a `dpop_key`: a `DpopKey` or a private JWK dict, such as the file `attenuo key gen --dpop` writes. Signing needs `cryptography` (`pip install 'attenuo[dpop]'`).
 
 ```python
-from onbehalf import Client, DpopKey
+from attenuo import Client, DpopKey
 
 coder_key = DpopKey.load("coder.jwk")  # or DpopKey.generate(); keep key.private_jwk() to reuse it
 
@@ -127,15 +127,15 @@ with Client(url, dpop_key=coder_key) as ob:
 
 With a key, every `call_tool`, `list_tools`, `renew` and `authzen_evaluate` sends `Authorization: DPoP <token>` and a fresh proof, and every `exchange` binds the new token. When the parent is bound to another key, its holder's sign-off names the new key and agent and works for that one exchange; a process that holds both keys can pass `subject_dpop_key=planner_key` instead. When the parent is bound to the client's own key, no sign-off is needed. `Token.dpop_jkt` is the thumbprint a token is bound to (`None` for a bearer token), and `AuditEntry.dpop_bound` says whether a decision was made with a proven bound token. A bound token without a proof is `Unauthorized` with `error == "dpop_required"`. See [Binding tokens to keys](../../docs/guides/binding-tokens-to-keys.md).
 
-Server nonces (RFC 9449 §8, `[token] dpop_nonce = "required"`) need no code. `Client`, `AsyncClient`, `AdminClient.mint_root_dev` and `TokenAuth` keep the latest `DPoP-Nonce` header the server sent and put it in each proof. When the server refuses a proof with `use_dpop_nonce`, they retry the request once with a new proof carrying the nonce from that response. For your own HTTP code, `DpopKey.proof(method, url, token, nonce=...)` adds the claim, and `onbehalf.dpop.NonceCache` does the bookkeeping: `update(response)` stores the nonce and returns true when the request should be retried.
+Server nonces (RFC 9449 §8, `[token] dpop_nonce = "required"`) need no code. `Client`, `AsyncClient`, `AdminClient.mint_root_dev` and `TokenAuth` keep the latest `DPoP-Nonce` header the server sent and put it in each proof. When the server refuses a proof with `use_dpop_nonce`, they retry the request once with a new proof carrying the nonce from that response. For your own HTTP code, `DpopKey.proof(method, url, token, nonce=...)` adds the claim, and `attenuo.dpop.NonceCache` does the bookkeeping: `update(response)` stores the nonce and returns true when the request should be retried.
 
 ### Keeping a token alive
 
 `TokenRefresher` (threads) and `AsyncTokenRefresher` (`asyncio`) renew the lease at a third of the lease interval, call your `exchange` function before the token's `exp`, and keep the current token in `.token`:
 
 ```python
-from onbehalf import Client, RefreshError, TokenRefresher
-from onbehalf.mcp import TokenAuth
+from attenuo import Client, RefreshError, TokenRefresher
+from attenuo.mcp import TokenAuth
 
 
 def new_coder_token():
@@ -159,16 +159,16 @@ with (
 - **Schedule.** `lease_interval` is the server's `[issuer] lease_interval_seconds`; left out, it is learned from the first renewal, which then happens right away. The token is re-exchanged `margin` seconds before `exp` (default 20% of its lifetime, at least 5 s, at most half the lifetime). `on_change(token)` is called with each replacement.
 - **Failures.** Network errors, 5xx, 408 and 429 are retried with jittered exponential backoff (1 s doubling to 30 s). It stops, calls `on_error` once and sets `.error` when the lease is revoked (`RefreshError.reason == "lease_revoked"`, or `lease_lost` when an ancestor lapsed), the server refuses an exchange for good (`refused`: `invalid_scope`, `replayed`, a bad secret), or the token reaches `exp` (`token_expired`). It never loops on a revoked lease. `refresher()` raises the `RefreshError` once it has given up.
 - **DPoP.** Renewals go through your client and are signed with its `dpop_key`. A replacement must be bound to the same key as the current token; otherwise it is not adopted and the refresher stops with `key_mismatch`.
-- **Logging.** The `onbehalf.refresh` logger writes lease ids and reason codes only, never tokens.
+- **Logging.** The `attenuo.refresh` logger writes lease ids and reason codes only, never tokens.
 - **Testing.** `tick()` runs whatever is due and returns the seconds to wait; the thread is a loop around it, and `clock=` and `rng=` replace the time source and the jitter.
 
 ### Errors
 
-All SDK errors derive from `OnbehalfError`.
+All SDK errors derive from `AttenuoError`.
 
 | Exception                                   | When                                                                                                                                                                                                                                                                                                                                                                         |
 | ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Denied` (`.reason`, `.decision_id`)        | The proxy said no (JSON-RPC `-32003` with the `X-Onbehalf-Decision-Id` header naming `data.decision_id`; an upstream's own `-32003` without that proof is an `RpcError`). Branch on `reason`: `capability_denied`, `policy_deny`, `lease_revoked`, `lease_expired`, ... See the [integration guide](../../docs/guides/integrating-mcp-clients.md#handling-denied-responses). |
+| `Denied` (`.reason`, `.decision_id`)        | The proxy said no (JSON-RPC `-32003` with the `X-Attenuo-Decision-Id` header naming `data.decision_id`; an upstream's own `-32003` without that proof is an `RpcError`). Branch on `reason`: `capability_denied`, `policy_deny`, `lease_revoked`, `lease_expired`, ... See the [integration guide](../../docs/guides/integrating-mcp-clients.md#handling-denied-responses). |
 | `Unauthorized`                              | HTTP 401: missing, bad or expired bearer.                                                                                                                                                                                                                                                                                                                                    |
 | `ApiError` (`.status`, `.error`, `.detail`) | Any other non-success from the server: `invalid_scope`, `invalid_grant`, 404, 422.                                                                                                                                                                                                                                                                                           |
 | `RpcError`                                  | A JSON-RPC error that is not a denial (unknown upstream, upstream down).                                                                                                                                                                                                                                                                                                     |
@@ -179,10 +179,10 @@ A denied `tools/call` is a decision, not a glitch: do not retry it blindly. A `l
 
 ## MCP clients
 
-`onbehalf.mcp` produces the URL and headers an MCP client needs; see [`examples/python-agent/mcp_client_example.py`](../../examples/python-agent/mcp_client_example.py) for the official `mcp` package.
+`attenuo.mcp` produces the URL and headers an MCP client needs; see [`examples/python-agent/mcp_client_example.py`](../../examples/python-agent/mcp_client_example.py) for the official `mcp` package.
 
 ```python
-from onbehalf.mcp import mcp_headers, mcp_url
+from attenuo.mcp import mcp_headers, mcp_url
 
 url = mcp_url("http://127.0.0.1:8080", "github")  # http://127.0.0.1:8080/mcp/github
 headers = mcp_headers(coder)  # {"Authorization": "Bearer ..."}
@@ -193,7 +193,7 @@ headers = mcp_headers(coder)  # {"Authorization": "Bearer ..."}
 ## Verifying
 
 ```python
-tok = ob.inspect(jwt, verify=True, issuer="http://127.0.0.1:8080", audience="onbehalf")
+tok = ob.inspect(jwt, verify=True, issuer="http://127.0.0.1:8080", audience="attenuo")
 ```
 
 Local verification checks the signature against the server's JWKS and the claims listed above. It does not check the detached `ou_sig` over the user block; the server does that on every request. Without `issuer`/`audience` pins it proves "signed by this server's key and unexpired", as the CLI's `token inspect --verify` does.
@@ -202,15 +202,15 @@ Local verification checks the signature against the server's JWKS and the claims
 
 ```python
 import httpx
-from onbehalf.audit import verify_export
+from attenuo.audit import verify_export
 
 jwks = httpx.get("http://127.0.0.1:8080/.well-known/jwks.json").json()
-report = verify_export("audit.jsonl", checkpoint_public_keys=jwks)  # from `onbehalf audit export`
+report = verify_export("audit.jsonl", checkpoint_public_keys=jwks)  # from `attenuo audit export`
 if not report.ok:
     print(report.first_bad_seq, report.bad_checkpoints, report.truncated, report.unsigned_tail)
 ```
 
-`verify_export(path_or_lines, *, checkpoint_public_keys, allow_unsigned_tail=False)` takes a path (`str` or `PathLike`; a `str` is always a path) or an iterable of lines, in JSON Lines or the `--format json` form. `checkpoint_public_keys` is the JWKS or a `{kid: public key}` map (raw 32 bytes or base64url). It re-checks the SHA-256 hash chain over RFC 8785 canonical JSON of `["onbehalf-audit-entry-v2", seq, prev_hash, record]`, the range the header declares and the Ed25519 checkpoint signatures, with the same strictness as `onbehalf audit verify --file`: a short file, entries outside the range and entries after the last valid checkpoint (unless `allow_unsigned_tail=True`) all fail. The `ExportReport` has `ok`, `first_bad_seq`, `bad_checkpoints`, `last_signed_seq`, `unsigned_tail`, `truncated`, `outside_range` and the rest of the Rust report. A file that is not a verifiable export (no header, wrong format, a filtered export, not JSON) raises `onbehalf.audit.ExportError`. It needs the `verify` extra (`cryptography`) for the signatures and depends on the pinned `rfc8785`. It hashes each record as it appears in the file and refuses duplicate object members, so it is a little stricter than the Rust check. A filtered export (`audit_export(kind=..., chain_id=...)`) cannot be verified: its chain has gaps, so verify the unfiltered one, then filter. `AuditEntry` has `kind` and `chain_id`.
+`verify_export(path_or_lines, *, checkpoint_public_keys, allow_unsigned_tail=False)` takes a path (`str` or `PathLike`; a `str` is always a path) or an iterable of lines, in JSON Lines or the `--format json` form. `checkpoint_public_keys` is the JWKS or a `{kid: public key}` map (raw 32 bytes or base64url). It re-checks the SHA-256 hash chain over RFC 8785 canonical JSON of `["attenuo-audit-entry-v2", seq, prev_hash, record]`, the range the header declares and the Ed25519 checkpoint signatures, with the same strictness as `attenuo audit verify --file`: a short file, entries outside the range and entries after the last valid checkpoint (unless `allow_unsigned_tail=True`) all fail. The `ExportReport` has `ok`, `first_bad_seq`, `bad_checkpoints`, `last_signed_seq`, `unsigned_tail`, `truncated`, `outside_range` and the rest of the Rust report. A file that is not a verifiable export (no header, wrong format, a filtered export, not JSON) raises `attenuo.audit.ExportError`. It needs the `verify` extra (`cryptography`) for the signatures and depends on the pinned `rfc8785`. It hashes each record as it appears in the file and refuses duplicate object members, so it is a little stricter than the Rust check. A filtered export (`audit_export(kind=..., chain_id=...)`) cannot be verified: its chain has gaps, so verify the unfiltered one, then filter. `AuditEntry` has `kind` and `chain_id`.
 
 ## Development
 
@@ -221,15 +221,15 @@ ruff check --config pyproject.toml . ../../examples/python-agent
 ruff format --check --config pyproject.toml . ../../examples/python-agent
 mypy --strict src tests ../../examples/python-agent
 pytest -rf                   # unit tests, no server needed
-ONBEHALF_INTEGRATION=1 pytest -rf -m integration   # builds and starts the real server (needs cargo)
+ATTENUO_INTEGRATION=1 pytest -rf -m integration   # builds and starts the real server (needs cargo)
 ```
 
 Keep `-rf`: it prints the name of every failed test in the summary, which a long run otherwise scrolls away.
 
-The integration test builds `onbehalf-server` and the `fake_mcp` example, starts both on free ports, and replays the [GitHub leak scenario](../../examples/github-leak-demo/README.md) through the SDK: dev root mint, exchange, an allowed call, a policy denial, a capability denial, revocation, `lease_revoked`, and an audit chain check.
+The integration test builds `attenuo-server` and the `fake_mcp` example, starts both on free ports, and replays the [GitHub leak scenario](../../examples/github-leak-demo/README.md) through the SDK: dev root mint, exchange, an allowed call, a policy denial, a capability denial, revocation, `lease_revoked`, and an audit chain check.
 
 ## Limits
 
 - The server's JSON-RPC and header behaviour is what is implemented in this repository today. Nothing here is tested against a server of another version.
-- Streaming responses (long-lived SSE, server-initiated requests) are not supported by `call_tool`: it reads one response and returns the first JSON-RPC result or error in it. Use a full MCP client with `onbehalf.mcp` for that.
+- Streaming responses (long-lived SSE, server-initiated requests) are not supported by `call_tool`: it reads one response and returns the first JSON-RPC result or error in it. Use a full MCP client with `attenuo.mcp` for that.
 - Hop-0 exchange (`client_id`/`client_secret`) is covered by unit tests against a mock transport only, not against a live IdP.

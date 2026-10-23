@@ -1,4 +1,4 @@
-//! DPoP proof parsing and verification (`onbehalf_token::dpop::verify_proof`, and the server's
+//! DPoP proof parsing and verification (`attenuo_token::dpop::verify_proof`, and the server's
 //! `Dpop::verify` with its replay cache) with arbitrary `htu`, `htm`, `iat`, `ath`, `jti`,
 //! headers and `jwk`, either as raw text or as a correctly signed proof whose fields are
 //! fuzzed. A proof that verifies must match the request it was checked against, and a second
@@ -9,8 +9,8 @@ use arbitrary::{Arbitrary, Result, Unstructured};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use libfuzzer_sys::fuzz_target;
-use onbehalf_fuzz::{edge_number, edge_string, json_value};
-use onbehalf_token::dpop::{
+use attenuo_fuzz::{edge_number, edge_string, json_value};
+use attenuo_token::dpop::{
     access_token_hash, jwk_thumbprint, normalize_htu, verify_proof, ProofCheck,
 };
 use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -20,9 +20,9 @@ use time::Duration;
 const URLS: &[&str] = &[
     "http://localhost/mcp/github",
     "HTTP://LOCALHOST:80/mcp/github?x=1#f",
-    "https://onbehalf.example/token",
-    "https://onbehalf.example:443/token",
-    "https://user@onbehalf.example/token",
+    "https://attenuo.example/token",
+    "https://attenuo.example:443/token",
+    "https://user@attenuo.example/token",
     "http:///x",
     "ftp://x/y",
     "http://[::1]:8080/a",
@@ -71,7 +71,7 @@ struct Input {
 
 impl<'a> Arbitrary<'a> for Input {
     fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
-        let f = onbehalf_fuzz::fixture();
+        let f = attenuo_fuzz::fixture();
         let now = f.now.unix_timestamp();
         let method = pick_str(u, METHODS)?;
         let url = pick_str(u, URLS)?;
@@ -156,7 +156,7 @@ fn claims_of(proof: &str) -> (Value, Value) {
 }
 
 fuzz_target!(|input: Input| {
-    let f = onbehalf_fuzz::fixture();
+    let f = attenuo_fuzz::fixture();
     let _ = normalize_htu(&input.url);
     let max_age_secs = i64::try_from(input.max_age).unwrap_or(i64::MAX).max(1);
     let check = ProofCheck {
@@ -191,8 +191,8 @@ fuzz_target!(|input: Input| {
     }
 
     // The server's wrapper adds the one-time-use check.
-    let dpop = onbehalf_server::dpop::Dpop::new(
-        onbehalf_server::config::DpopMode::Optional,
+    let dpop = attenuo_server::dpop::Dpop::new(
+        attenuo_server::config::DpopMode::Optional,
         input.max_age,
         16,
         None,

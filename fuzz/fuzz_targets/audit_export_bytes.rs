@@ -5,16 +5,16 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    let a = onbehalf_fuzz::audit_fixture();
+    let a = attenuo_fuzz::audit_fixture();
     let Ok(text) = std::str::from_utf8(data) else {
         return;
     };
-    let Ok(export) = onbehalf_audit::parse_export(text) else {
+    let Ok(export) = attenuo_audit::parse_export(text) else {
         return;
     };
-    let _ = onbehalf_audit::to_json_form(&export);
+    let _ = attenuo_audit::to_json_form(&export);
 
-    if let Ok(report) = onbehalf_audit::verify_export(&export, &a.keys) {
+    if let Ok(report) = attenuo_audit::verify_export(&export, &a.keys) {
         // Only an export that verifies counts: entries after a break are reported, not vouched for.
         // Strict verification (F5): an export that verifies is countersigned throughout.
         if report.report.ok {

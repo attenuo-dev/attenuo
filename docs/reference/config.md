@@ -1,24 +1,24 @@
 # Configuration keys
 
-The server reads one TOML file: `onbehalf-server --config <file>` or `ONBEHALF_CONFIG=<file>`. Unknown keys are rejected at start-up. Relative paths resolve against the working directory.
+The server reads one TOML file: `attenuo-server --config <file>` or `ATTENUO_CONFIG=<file>`. Unknown keys are rejected at start-up. Relative paths resolve against the working directory.
 
-The annotated source of truth is [config/example.toml](https://github.com/7Mudit/onbehalf/blob/main/config/example.toml). Never use its example admin token or agent secret for anything real. [Deploying](../guides/deploying.md) covers what to change before you expose a server.
+The annotated source of truth is [config/example.toml](https://github.com/attenuo-dev/attenuo/blob/main/config/example.toml). Never use its example admin token or agent secret for anything real. [Deploying](../guides/deploying.md) covers what to change before you expose a server.
 
 ## `[server]`
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `listen` | `127.0.0.1:8080` | Address to bind. |
-| `public_url` | none | Externally visible base URL (`https://onbehalf.example.com`), the only source of the URLs in `/.well-known/authzen-configuration`. **Required** when `listen` is not a loopback address: the server refuses to start without it. On loopback it may be left out; discovery then uses `http://<Host>` and answers 400 `invalid_host` unless `Host` is `localhost`, `127.0.0.1` or `[::1]` (with an optional port). Must be `http(s)://host[:port][/path]`, without query or fragment. |
+| `public_url` | none | Externally visible base URL (`https://attenuo.example.com`), the only source of the URLs in `/.well-known/authzen-configuration`. **Required** when `listen` is not a loopback address: the server refuses to start without it. On loopback it may be left out; discovery then uses `http://<Host>` and answers 400 `invalid_host` unless `Host` is `localhost`, `127.0.0.1` or `[::1]` (with an optional port). Must be `http(s)://host[:port][/path]`, without query or fragment. |
 
-The names reserved for the server's own audit records are refused at start: `onbehalf` as a server name (`[[upstreams]]`, the catalog, `[[root_grants]]` capabilities) and as an agent id (`[[agents]]`, `[[peps]]`, `[[root_grants]] agent`). User subjects starting with `urn:onbehalf:` are refused at IdP intake and by the dev root mint; admin actions are audited as `urn:onbehalf:admin`.
+The names reserved for the server's own audit records are refused at start: `attenuo` as a server name (`[[upstreams]]`, the catalog, `[[root_grants]]` capabilities) and as an agent id (`[[agents]]`, `[[peps]]`, `[[root_grants]] agent`). User subjects starting with `urn:attenuo:` are refused at IdP intake and by the dev root mint; admin actions are audited as `urn:attenuo:admin`.
 
 ## `[issuer]`
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `issuer` | `http://127.0.0.1:8080` | The `iss` of tokens. Also the `aud` an ID-JAG must carry. |
-| `audience` | `onbehalf` | The `aud` of issued tokens. |
+| `audience` | `attenuo` | The `aud` of issued tokens. |
 | `max_depth` | library default | Longest allowed delegation chain. The example sets 8. |
 | `default_ttl_seconds` | `900` | Token lifetime when the exchange does not ask for one. |
 | `lease_interval_seconds` | `300` | How long a lease lives after issuance or renewal. Must be positive. |
@@ -33,7 +33,7 @@ The names reserved for the server's own audit records are refused at start: `onb
 | `catalog_path` | none | JSON tool catalog. Can be combined with `[policy.catalog]`. |
 | `user_attributes` | none | Extra `originating_user.attributes` for the Cedar schema, as `{ name = "type" }`. Types: `string`, `long`, `bool`, `set<string>`. A value of another type is denied with `attribute_type_mismatch`. |
 | `unknown_tools` | `"deny"` | A call to a `(server, tool)` pair missing from the catalog: `"deny"` (reason `tool_not_in_catalog`), `"sensitive"` (evaluated with `resource.sensitive = true`) or `"allow"` (default attributes). |
-| `legacy_bare_actions` | `false` | **Deprecated.** Evaluate with the pre-2026-10-23 action ids, `Action::"<tool>"`, instead of `Action::"<server>/<tool>"`. A bare action matches that tool on every server (SR-13). Logged as a warning at start; `onbehalf policy lint` lists bare actions. |
+| `legacy_bare_actions` | `false` | **Deprecated.** Evaluate with the pre-2026-10-23 action ids, `Action::"<tool>"`, instead of `Action::"<server>/<tool>"`. A bare action matches that tool on every server (SR-13). Logged as a warning at start; `attenuo policy lint` lists bare actions. |
 
 The built-in user attributes `mfa` (bool), `roles` (set of string), `tenant` and `email` are always declared.
 
@@ -71,14 +71,14 @@ Ships every signed checkpoint off the host as it is created (SR-21); see [Shippi
 | --- | --- | --- |
 | `kind` | required | `"webhook"`, `"file"` or `"s3"`. |
 | `url` | required for webhook | URL to `POST` each checkpoint to (`http://` or `https://`). Any 2xx is success; redirects are not followed. |
-| `bearer_token` | `ONBEHALF_AUDIT_SINK_TOKEN` | webhook: sent as `Authorization: Bearer <token>`. |
+| `bearer_token` | `ATTENUO_AUDIT_SINK_TOKEN` | webhook: sent as `Authorization: Bearer <token>`. |
 | `path` | required for file | JSON Lines file to append to; created if missing, synced after each line. Put it on another mount than `sqlite_path` (a warning at startup otherwise). |
 | `endpoint` | required for s3 | Base URL without a path, e.g. `https://s3.eu-west-1.amazonaws.com` or `http://minio:9000`. Requests are path-style. |
 | `bucket` | required for s3 | Bucket name. |
 | `region` | `us-east-1` | s3: SigV4 signing region. |
-| `prefix` | `onbehalf/checkpoints/` | s3: object key prefix; keys are `<prefix><seq, 20 digits>-<16 hex of checkpoint_sha256>.json`. |
+| `prefix` | `attenuo/checkpoints/` | s3: object key prefix; keys are `<prefix><seq, 20 digits>-<16 hex of checkpoint_sha256>.json`. |
 | `access_key_id`, `secret_access_key`, `session_token` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | s3 credentials. Give them `PutObject` only. |
-| `queue_capacity` | 1024 | Checkpoints waiting for delivery, at most. When full, the oldest queued one is dropped and `onbehalf_audit_sink_dropped_total` counts it. |
+| `queue_capacity` | 1024 | Checkpoints waiting for delivery, at most. When full, the oldest queued one is dropped and `attenuo_audit_sink_dropped_total` counts it. |
 | `max_lag_seconds` | 300 | `/readyz` reports the sink degraded once the oldest undelivered checkpoint is older than this, or the queue is full. |
 | `fail_readiness` | `false` | Make a degraded sink fail `/readyz` (503). Off by default: the server keeps serving and reports `"degraded": true`. |
 | `timeout_seconds` | 10 | Per-request timeout (webhook, s3). |
@@ -121,7 +121,7 @@ Issuers of workload identities whose JWTs are accepted as the RFC 8693 `actor_to
 | `jwks_url` | | JWKS of a generic JWT issuer. |
 | `spiffe_trust_domain` | | SPIFFE trust domain, for example `example.org`. The token's `sub` must be a SPIFFE ID in it. |
 | `spiffe_bundle_url` | | The trust domain's bundle endpoint (SPIRE server `federation.bundle_endpoint`). It serves a JWKS; keys with `use` = `jwt-svid` verify JWT-SVIDs, `x509-svid` keys are ignored. |
-| `audience` | | The `aud` the token must carry, as a string or in an array. Use a value no other service accepts, such as the onbehalf server's URL. |
+| `audience` | | The `aud` the token must carry, as a string or in an array. Use a value no other service accepts, such as the attenuo server's URL. |
 | `subject_to_agent` | `"sub"` | How `sub` becomes an agent id. `"sub"`: `sub` itself (a whole SPIFFE ID). `"spiffe_path"`: the SPIFFE ID's path without the leading `/` (`spiffe://example.org/agents/coder` is `agents/coder`); needs `spiffe_trust_domain`. A table `{ "<sub>" = "<agent id>" }`: only listed subjects are accepted. The result must equal the exchange's `actor`. |
 | `allowed_algs` | `RS256`, `ES256`, `EdDSA` | Accepted signature algorithms. HMAC is refused. |
 | `jwks_ttl_seconds` | `300` | How long a fetched key set is used. An unknown `kid` triggers one refetch, at most every 30 seconds. |
@@ -135,7 +135,7 @@ One table per MCP server, using streamable HTTP.
 
 | Key | Meaning |
 | --- | --- |
-| `name` | Mount name, served at `/mcp/<name>`. It is the `server` part of capabilities and of action ids. ASCII letters, digits, `_`, `.`, `-`; `onbehalf` is reserved. |
+| `name` | Mount name, served at `/mcp/<name>`. It is the `server` part of capabilities and of action ids. ASCII letters, digits, `_`, `.`, `-`; `attenuo` is reserved. |
 | `url` | Upstream MCP endpoint. |
 
 ## `[admin]`

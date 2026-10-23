@@ -1,10 +1,10 @@
-// onbehalf starter policy set.
+// attenuo starter policy set.
 //
 // Cedar denies by default: a call is allowed only if at least one `permit` matches and no
 // `forbid` matches. Everything below is evaluated after the capability stage, so a policy
 // can only narrow what the delegation chain already granted; it can never widen it.
 //
-// Request shape (see the onbehalf-policy crate docs for the full table):
+// Request shape (see the attenuo-policy crate docs for the full table):
 //   principal  Agent::"<agent id>"        in User::"<subject>", in earlier Agents of the chain
 //   action     Action::"<server>/<tool>"  in Action::"invoke"
 //   resource   Tool::"<server>/<tool>"    in Server::"<server>", attrs readonly/sensitive

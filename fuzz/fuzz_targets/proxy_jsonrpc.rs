@@ -1,4 +1,4 @@
-//! The MCP proxy's request path, end to end through `onbehalf_proxy::router`: JSON-RPC body
+//! The MCP proxy's request path, end to end through `attenuo_proxy::router`: JSON-RPC body
 //! parsing (single messages and batches, non-object `params.arguments` (SR-07), ids of every
 //! JSON type), the `Mcp-Session-Id` checks (SR-27), the request body limit (SR-36), and the
 //! rewriting of the upstream's answer (JSON or SSE, list filtering).
@@ -24,13 +24,13 @@ use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use libfuzzer_sys::fuzz_target;
-use onbehalf_core::{
+use attenuo_core::{
     AgentId, ArgConstraint, Capability, CapabilitySet, Decision, DelegationChain, LeaseId,
     OriginatingUser, ToolCall,
 };
-use onbehalf_fuzz::{edge_number, edge_string, json_value};
-use onbehalf_proxy::jsonrpc::is_passthrough_method;
-use onbehalf_proxy::{AuthDecision, AuthError, Authorizer, ProxyConfig, UpstreamConfig};
+use attenuo_fuzz::{edge_number, edge_string, json_value};
+use attenuo_proxy::jsonrpc::is_passthrough_method;
+use attenuo_proxy::{AuthDecision, AuthError, Authorizer, ProxyConfig, UpstreamConfig};
 use serde_json::{json, Value};
 use time::OffsetDateTime;
 use tower::ServiceExt;
@@ -341,7 +341,7 @@ fn world() -> &'static World {
                     max_sessions: 64,
                     max_sessions_per_principal: 64,
                 };
-                onbehalf_proxy::router(config, auth.clone())
+                attenuo_proxy::router(config, auth.clone())
             })
             .collect();
         World { rt, routers }

@@ -3,7 +3,7 @@
 # Trigger: pushing a tag `vX.Y.Z[-suffix]` (see "Releases" in CONTRIBUTING.md).
 #
 # What it does
-#   1. builds `onbehalf` and `onbehalf-server` for Linux x86_64/aarch64 (musl, static)
+#   1. builds `attenuo` and `attenuo-server` for Linux x86_64/aarch64 (musl, static)
 #      and macOS arm64/x86_64 and packs one .tar.gz per target
 #   2. builds a multi-arch (amd64, arm64) image from the Dockerfile, pushes it to
 #      ghcr.io/<owner>/<repo> tagged with the version and `latest`, signs it with cosign
@@ -22,8 +22,8 @@
 # first push, set the package visibility to public in the repository's Packages settings.
 #
 # Verify a published image:
-#   cosign verify ghcr.io/7mudit/onbehalf:<version> \
-#     --certificate-identity-regexp '^https://github.com/7Mudit/onbehalf/\.github/workflows/release\.yml@' \
+#   cosign verify ghcr.io/7mudit/attenuo:<version> \
+#     --certificate-identity-regexp '^https://github.com/attenuo-dev/attenuo/\.github/workflows/release\.yml@' \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
 #
 # Before relying on it: run it once against a `v0.0.0-test` tag on a fork and delete the tag
@@ -79,15 +79,15 @@ jobs:
         if: matrix.musl
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }} -p onbehalf-server -p onbehalf-cli
+        run: cargo build --release --locked --target ${{ matrix.target }} -p attenuo-server -p attenuo-cli
       - name: Package
         shell: bash
         run: |
           set -euo pipefail
-          name="onbehalf-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="attenuo-${GITHUB_REF_NAME}-${{ matrix.target }}"
           mkdir -p "dist/$name"
-          cp "target/${{ matrix.target }}/release/onbehalf" \
-             "target/${{ matrix.target }}/release/onbehalf-server" \
+          cp "target/${{ matrix.target }}/release/attenuo" \
+             "target/${{ matrix.target }}/release/attenuo-server" \
              LICENSE README.md CHANGELOG.md "dist/$name/"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           rm -rf "dist/$name"
@@ -145,12 +145,12 @@ jobs:
         with:
           image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
           format: spdx-json
-          output-file: onbehalf-image.spdx.json
+          output-file: attenuo-image.spdx.json
           artifact-name: sbom
           upload-release-assets: false
       - name: Attest the SBOM to the image
         run: |
-          cosign attest --yes --type spdxjson --predicate onbehalf-image.spdx.json \
+          cosign attest --yes --type spdxjson --predicate attenuo-image.spdx.json \
             "${IMAGE}@${{ steps.build.outputs.digest }}"
 
   release:

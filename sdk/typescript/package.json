@@ -1,7 +1,7 @@
 {
-  "name": "@onbehalf/sdk",
+  "name": "@attenuo/sdk",
   "version": "0.0.0",
-  "description": "TypeScript client for the onbehalf authorization server: token exchange, attenuated capabilities, MCP calls through the enforcing proxy, lease renewal and the audit log.",
+  "description": "TypeScript client for the attenuo authorization server: token exchange, attenuated capabilities, MCP calls through the enforcing proxy, lease renewal and the audit log.",
   "license": "Apache-2.0",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -32,12 +32,12 @@
     "build": "tsup",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:integration": "ONBEHALF_INTEGRATION=1 vitest run test/integration.test.ts",
+    "test:integration": "ATTENUO_INTEGRATION=1 vitest run test/integration.test.ts",
     "lint": "tsc --noEmit && eslint . && prettier --check .",
     "format": "prettier --write ."
   },
   "keywords": [
-    "onbehalf",
+    "attenuo",
     "mcp",
     "agents",
     "authorization",

@@ -7,8 +7,8 @@ import {
   DpopKey,
   jwkThumbprint,
   mcpFetch,
-  OnbehalfClient,
-  OnbehalfError,
+  AttenuoClient,
+  AttenuoError,
 } from "../src/index.js";
 import { jsonResponse, mockFetch, rpcOk, Signer, tokenResponse, type Seen } from "./helpers.js";
 
@@ -91,10 +91,10 @@ describe("DPoP keys", () => {
   it("refuses public, mismatched and unsupported keys", async () => {
     const ed = await DpopKey.generate();
     const other = await DpopKey.generate();
-    await expect(DpopKey.fromJwk(ed.publicJwk)).rejects.toBeInstanceOf(OnbehalfError);
+    await expect(DpopKey.fromJwk(ed.publicJwk)).rejects.toBeInstanceOf(AttenuoError);
     await expect(
       DpopKey.fromJwk({ ...ed.privateJwk(), x: other.publicJwk.x }),
-    ).rejects.toBeInstanceOf(OnbehalfError);
+    ).rejects.toBeInstanceOf(AttenuoError);
     await expect(DpopKey.fromJwk({ kty: "RSA", n: "x", e: "AQAB", d: "x" })).rejects.toThrow(
       /unsupported/,
     );
@@ -113,7 +113,7 @@ describe("clients with a DPoP key", () => {
       if (seen.url.pathname === "/access/v1/evaluation") return jsonResponse({ decision: true });
       return rpcOk({ content: [] });
     });
-    const ob = new OnbehalfClient(BASE, { fetch, dpopKey: key.privateJwk() });
+    const ob = new AttenuoClient(BASE, { fetch, dpopKey: key.privateJwk() });
     const last = () => calls[calls.length - 1]!;
 
     // Unbound parent: the header proof binds the child and covers nothing.
@@ -142,7 +142,7 @@ describe("clients with a DPoP key", () => {
     expect(claims.child_actor).toBe("coder");
     await expect(
       ob.exchange(other, "coder", "github:read_file", { subjectDpopKey: key }),
-    ).rejects.toBeInstanceOf(OnbehalfError);
+    ).rejects.toBeInstanceOf(AttenuoError);
 
     // A sign-off made by the parent's holder elsewhere is passed through as it is.
     const detached = await parentKey.signOff(`${BASE}/token`, other, key.thumbprint, "coder");
@@ -153,7 +153,7 @@ describe("clients with a DPoP key", () => {
         subjectDpopKey: parentKey,
         subjectTokenDpop: detached,
       }),
-    ).rejects.toBeInstanceOf(OnbehalfError);
+    ).rejects.toBeInstanceOf(AttenuoError);
 
     // Every use of a token carries a proof for that request.
     const before = calls.length;
@@ -171,7 +171,7 @@ describe("clients with a DPoP key", () => {
 
   it("sends a plain bearer without a key", async () => {
     const { fetch, calls } = mockFetch(() => rpcOk({ content: [] }));
-    await new OnbehalfClient(BASE, { fetch }).callTool("a.b.c", "github", "read_file");
+    await new AttenuoClient(BASE, { fetch }).callTool("a.b.c", "github", "read_file");
     expect(calls[0]!.headers.get("authorization")).toBe("Bearer a.b.c");
     expect(calls[0]!.headers.get("dpop")).toBeNull();
   });
@@ -259,7 +259,7 @@ describe("DPoP server nonces", () => {
     const child = await bound(key.thumbprint, ["planner", "coder"]);
     const server = nonceServer(okForEveryRoute(child));
     const { fetch, calls } = mockFetch(server.handler);
-    const ob = new OnbehalfClient(BASE, { fetch, dpopKey: key });
+    const ob = new AttenuoClient(BASE, { fetch, dpopKey: key });
 
     // First request: no nonce yet, refused, retried once with the server's nonce.
     await ob.callTool(child, "github", "read_file");
@@ -293,7 +293,7 @@ describe("DPoP server nonces", () => {
       server.state.nonce = `r-${n++}`; // never the one the client just learned
       return server.handler(seen);
     });
-    const ob = new OnbehalfClient(BASE, { fetch, dpopKey: key });
+    const ob = new AttenuoClient(BASE, { fetch, dpopKey: key });
     await expect(ob.renew(child)).rejects.toThrow();
     expect(calls).toHaveLength(2);
   });
@@ -305,7 +305,7 @@ describe("DPoP server nonces", () => {
         "DPoP-Nonce": "n",
       }),
     );
-    await expect(new OnbehalfClient(BASE, { fetch }).renew("a.b.c")).rejects.toThrow();
+    await expect(new AttenuoClient(BASE, { fetch }).renew("a.b.c")).rejects.toThrow();
     expect(calls).toHaveLength(1);
   });
 

@@ -33,7 +33,7 @@ cargo audit               # cargo install cargo-audit (optional locally; CI runs
 
 Fuzz targets for the parsers and checks an attacker can reach live in `fuzz/` (cargo-fuzz, nightly, outside the workspace). CI only builds them and runs their seeds; run one for a few minutes when you change a parser, a token or proof check, capability coverage, the proxy's JSON-RPC or SSE handling, or audit verification: `cargo +nightly fuzz run <target> -- -max_total_time=120`. See [fuzz/README.md](fuzz/README.md) and [docs/design/fuzzing.md](docs/design/fuzzing.md).
 
-The Python SDK tests (`cd sdk/python && pytest -rf`, and `ONBEHALF_INTEGRATION=1 pytest -rf -m integration` for the real-server tests) are run with `-rf` so that the name of a failing test is in the summary; see [sdk/python/README.md](sdk/python/README.md).
+The Python SDK tests (`cd sdk/python && pytest -rf`, and `ATTENUO_INTEGRATION=1 pytest -rf -m integration` for the real-server tests) are run with `-rf` so that the name of a failing test is in the summary; see [sdk/python/README.md](sdk/python/README.md).
 
 `rustfmt.toml` and `clippy.toml` in the repo root carry the project settings, so `cargo fmt` and `cargo clippy` pick them up without flags. The toolchain is pinned by `rust-toolchain.toml`.
 
@@ -78,7 +78,7 @@ Commit messages follow [Conventional Commits 1.0](https://www.conventionalcommit
 <footer: BREAKING CHANGE:, Refs:, Fixes:, Signed-off-by:>
 ```
 
-Types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `perf`, `build`, `ci`, `revert`. Scope is the crate without the `onbehalf-` prefix (`core`, `token`, `policy`, `audit`, `proxy`, `server`) or an area (`ci`, `docs`, `deps`). A breaking change carries `!` after the type/scope and a `BREAKING CHANGE:` footer explaining the migration.
+Types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `perf`, `build`, `ci`, `revert`. Scope is the crate without the `attenuo-` prefix (`core`, `token`, `policy`, `audit`, `proxy`, `server`) or an area (`ci`, `docs`, `deps`). A breaking change carries `!` after the type/scope and a `BREAKING CHANGE:` footer explaining the migration.
 
 ```
 feat(token)!: require audience claim on every token
@@ -128,7 +128,7 @@ Maintainers only. Versions follow [SemVer 2.0](https://semver.org/). Pre-1.0, a 
 
 1. Make sure `main` is green and `CHANGELOG.md`'s `Unreleased` section is complete. `git cliff --unreleased` gives a draft to compare against.
 2. Open a `chore(release): vX.Y.Z` PR that bumps `workspace.package.version` in `Cargo.toml`, moves `Unreleased` to a dated `[X.Y.Z]` heading with a compare link, and adds a fresh empty `Unreleased`.
-3. Merge, then tag the merge commit `vX.Y.Z` (annotated, signed if you have a key) and push the tag. `.github/workflows/release.yml` builds `onbehalf` and `onbehalf-server` for Linux (musl, x86_64 and aarch64) and macOS (arm64, x86_64), pushes a signed multi-arch image to GHCR (cosign keyless, SBOM attached), and opens a **draft** GitHub release with the archives, `SHA256SUMS` and the git-cliff changelog section. Review the draft and publish it by hand. It needs only the automatic `GITHUB_TOKEN`; set the GHCR package to public after the first push.
+3. Merge, then tag the merge commit `vX.Y.Z` (annotated, signed if you have a key) and push the tag. `.github/workflows/release.yml` builds `attenuo` and `attenuo-server` for Linux (musl, x86_64 and aarch64) and macOS (arm64, x86_64), pushes a signed multi-arch image to GHCR (cosign keyless, SBOM attached), and opens a **draft** GitHub release with the archives, `SHA256SUMS` and the git-cliff changelog section. Review the draft and publish it by hand. It needs only the automatic `GITHUB_TOKEN`; set the GHCR package to public after the first push.
 4. For the first public release, work through the [launch checklist](docs/launch-checklist.md).
 5. Crate publishing to crates.io is manual until the public API settles; the plan is to adopt release-plz once it does.
 

@@ -1,10 +1,10 @@
 """The GitHub-leak scenario through the SDK, against the real server and a fake MCP upstream.
 
-Skipped unless ``ONBEHALF_INTEGRATION=1``. Needs ``cargo``. Builds ``onbehalf-server`` and the
+Skipped unless ``ATTENUO_INTEGRATION=1``. Needs ``cargo``. Builds ``attenuo-server`` and the
 ``fake_mcp`` example (honours ``CARGO_TARGET_DIR``), starts both on free ports with the demo
 config from ``examples/github-leak-demo``, and plays the scenario from ``run.sh``.
 
-Set ``ONBEHALF_BIN_DIR`` to a directory holding prebuilt ``onbehalf-server`` and
+Set ``ATTENUO_BIN_DIR`` to a directory holding prebuilt ``attenuo-server`` and
 ``examples/fake_mcp`` (or ``fake_mcp``) to skip the build.
 """
 
@@ -23,7 +23,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from onbehalf import (
+from attenuo import (
     AdminClient,
     ApiError,
     AsyncClient,
@@ -37,12 +37,12 @@ from onbehalf import (
     TokenRefresher,
     Unauthorized,
 )
-from onbehalf.mcp import TokenAuth
+from attenuo.mcp import TokenAuth
 
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(
-        os.environ.get("ONBEHALF_INTEGRATION") != "1", reason="set ONBEHALF_INTEGRATION=1 to run"
+        os.environ.get("ATTENUO_INTEGRATION") != "1", reason="set ATTENUO_INTEGRATION=1 to run"
     ),
 ]
 
@@ -72,7 +72,7 @@ def cargo_executable(args: list[str], name: str) -> Path:
 
     Caveat: when several checkouts share one ``CARGO_TARGET_DIR``, another checkout's build can
     replace ``debug/<name>`` after ours. If the scenario fails oddly there (for example a token
-    header the repo does not produce), pin the binaries with ``ONBEHALF_BIN_DIR``.
+    header the repo does not produce), pin the binaries with ``ATTENUO_BIN_DIR``.
     """
     proc = subprocess.run(
         ["cargo", "build", "-q", "--message-format=json-render-diagnostics", *args],
@@ -96,15 +96,15 @@ def cargo_executable(args: list[str], name: str) -> Path:
 
 
 def binaries() -> tuple[Path, Path]:
-    given = os.environ.get("ONBEHALF_BIN_DIR")
+    given = os.environ.get("ATTENUO_BIN_DIR")
     if given:
         d = Path(given)
         fake = d / "examples" / "fake_mcp"
-        return d / "onbehalf-server", fake if fake.exists() else d / "fake_mcp"
+        return d / "attenuo-server", fake if fake.exists() else d / "fake_mcp"
     return (
-        cargo_executable(["-p", "onbehalf-server"], "onbehalf-server"),
+        cargo_executable(["-p", "attenuo-server"], "attenuo-server"),
         cargo_executable(
-            ["-p", "onbehalf-proxy", "--features", "testing", "--example", "fake_mcp"], "fake_mcp"
+            ["-p", "attenuo-proxy", "--features", "testing", "--example", "fake_mcp"], "fake_mcp"
         ),
     )
 
@@ -121,21 +121,21 @@ class Stack:
 
 @pytest.fixture(scope="module")
 def stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
-    yield from run_stack(tmp_path_factory.mktemp("onbehalf-it"))
+    yield from run_stack(tmp_path_factory.mktemp("attenuo-it"))
 
 
 @pytest.fixture(scope="module")
 def nonce_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
     """The same stack with ``[token] dpop_nonce = "required"`` (RFC 9449 §8)."""
     yield from run_stack(
-        tmp_path_factory.mktemp("onbehalf-it-nonce"), '[token]\ndpop_nonce = "required"\n\n'
+        tmp_path_factory.mktemp("attenuo-it-nonce"), '[token]\ndpop_nonce = "required"\n\n'
     )
 
 
 def run_stack(work: Path, token_section: str = "") -> Iterator[Stack]:
     built_server, built_fake = binaries()
     # Copy them: a shared CARGO_TARGET_DIR can be rebuilt under us mid-test.
-    server_bin = work / "onbehalf-server"
+    server_bin = work / "attenuo-server"
     fake_bin = work / "fake_mcp"
     shutil.copy2(built_server, server_bin)
     shutil.copy2(built_fake, fake_bin)
@@ -221,11 +221,11 @@ def test_github_leak_scenario(stack: Stack) -> None:
     assert coder.lease != root.lease
 
     # 3. The token verifies against the server's JWKS; a tampered copy does not.
-    verified = ob.inspect(coder, verify=True, issuer=stack.url, audience="onbehalf")
+    verified = ob.inspect(coder, verify=True, issuer=stack.url, audience="attenuo")
     assert verified.verified and verified.chain == coder.chain
     head, payload, sig = coder.jwt.split(".")
     flipped = ("A" if sig[0] != "A" else "B") + sig[1:]
-    from onbehalf import VerificationError
+    from attenuo import VerificationError
 
     with pytest.raises(VerificationError):
         ob.inspect(f"{head}.{payload}.{flipped}", verify=True)
@@ -531,7 +531,7 @@ def test_token_refresher_keeps_the_dpop_key(stack: Stack) -> None:
 
 
 def run_example(stack: Stack, script: str) -> subprocess.CompletedProcess[str]:
-    env = {**os.environ, "ONBEHALF_SERVER": stack.url, "ONBEHALF_ADMIN_TOKEN": ADMIN_TOKEN}
+    env = {**os.environ, "ATTENUO_SERVER": stack.url, "ATTENUO_ADMIN_TOKEN": ADMIN_TOKEN}
     return subprocess.run(
         [sys.executable, str(ROOT / "examples" / "python-agent" / script)],
         env=env,
@@ -565,14 +565,14 @@ TS_DIST = ROOT / "sdk" / "typescript" / "dist" / "index.js"
 
 
 def cli_binary() -> Path:
-    given = os.environ.get("ONBEHALF_BIN_DIR")
+    given = os.environ.get("ATTENUO_BIN_DIR")
     if given:
-        return Path(given) / "onbehalf"
-    return cargo_executable(["-p", "onbehalf-cli"], "onbehalf")
+        return Path(given) / "attenuo"
+    return cargo_executable(["-p", "attenuo-cli"], "attenuo")
 
 
 def run_cli(stack: Stack, cli: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    env = {**os.environ, "ONBEHALF_SERVER": stack.url, "ONBEHALF_ADMIN_TOKEN": ADMIN_TOKEN}
+    env = {**os.environ, "ATTENUO_SERVER": stack.url, "ATTENUO_ADMIN_TOKEN": ADMIN_TOKEN}
     return subprocess.run([str(cli), *args], env=env, capture_output=True, text=True, timeout=60)
 
 
@@ -600,7 +600,7 @@ def verify_with_typescript(export: Path, jwks: Path) -> dict[str, object]:
 def test_one_mutated_byte_is_rejected_at_the_same_seq_by_rust_python_and_typescript(
     stack: Stack, tmp_path: Path
 ) -> None:
-    from onbehalf.audit import ExportError, verify_export
+    from attenuo.audit import ExportError, verify_export
 
     cli = cli_binary()
     admin = AdminClient(stack.url, ADMIN_TOKEN)
@@ -647,7 +647,7 @@ def test_one_mutated_byte_is_rejected_at_the_same_seq_by_rust_python_and_typescr
         return verify_export(path, checkpoint_public_keys=json.loads(jwks.read_text()))
 
     have_ts = TS_DIST.exists() and shutil.which("node") is not None
-    if os.environ.get("ONBEHALF_REQUIRE_TS") == "1":
+    if os.environ.get("ATTENUO_REQUIRE_TS") == "1":
         assert have_ts, "build sdk/typescript (npm run build) first"
 
     # Clean: all three accept.

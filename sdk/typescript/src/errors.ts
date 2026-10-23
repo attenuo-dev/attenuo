@@ -6,7 +6,7 @@
  */
 
 /** Base class for every error the SDK throws on purpose. */
-export class OnbehalfError extends Error {
+export class AttenuoError extends Error {
   constructor(message: string) {
     super(message);
     this.name = new.target.name;
@@ -14,7 +14,7 @@ export class OnbehalfError extends Error {
 }
 
 /** The server answered a non-success status, usually `{"error": ..., "detail": ...}`. */
-export class ApiError extends OnbehalfError {
+export class ApiError extends AttenuoError {
   constructor(
     readonly status: number,
     readonly error: string,
@@ -29,7 +29,7 @@ export class ApiError extends OnbehalfError {
 export class UnauthorizedError extends ApiError {}
 
 /** A JSON-RPC error that is not a denial (unknown upstream, upstream down, ...). */
-export class RpcError extends OnbehalfError {
+export class RpcError extends AttenuoError {
   constructor(
     readonly code: number,
     readonly rpcMessage: string,
@@ -40,13 +40,13 @@ export class RpcError extends OnbehalfError {
 }
 
 /** The proxy denied a call (JSON-RPC `-32003`). `decisionId` is the id of the audit record. */
-export class DeniedError extends OnbehalfError {
+export class DeniedError extends AttenuoError {
   readonly reason: string;
   readonly decisionId: string | undefined;
   readonly detail: string;
 
   constructor(reason: string, decisionId?: string, detail = "") {
-    const message = detail || `onbehalf: denied: ${reason}`;
+    const message = detail || `attenuo: denied: ${reason}`;
     super(decisionId ? `${message} (decision ${decisionId})` : message);
     this.reason = reason;
     this.decisionId = decisionId;
@@ -55,7 +55,7 @@ export class DeniedError extends OnbehalfError {
 }
 
 /** A token failed local verification (bad signature, expired, wrong issuer, ...). */
-export class VerificationError extends OnbehalfError {}
+export class VerificationError extends AttenuoError {}
 
 /**
  * The token refresher gave up: the token cannot be kept alive. `reason` is a stable code:
@@ -65,7 +65,7 @@ export class VerificationError extends OnbehalfError {}
  * token) or `key_mismatch` (the new token is not bound to the DPoP key of the old one). The
  * message never contains a token; `cause` is the underlying error, if any.
  */
-export class RefreshError extends OnbehalfError {
+export class RefreshError extends AttenuoError {
   constructor(
     readonly reason: string,
     message = "",

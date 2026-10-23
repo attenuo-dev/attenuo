@@ -3,8 +3,8 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from onbehalf import Client
-from onbehalf.mcp import TokenAuth, mcp_headers, mcp_url
+from attenuo import Client
+from attenuo.mcp import TokenAuth, mcp_headers, mcp_url
 
 from .helpers import Signer
 

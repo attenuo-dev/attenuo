@@ -8,13 +8,13 @@ from typing import Any
 import httpx
 import pytest
 
-from onbehalf import (
+from attenuo import (
     AdminClient,
     ApiError,
     AsyncAdminClient,
+    AttenuoError,
     AuditEntry,
     Capability,
-    OnbehalfError,
     Prefix,
     Unauthorized,
 )
@@ -152,7 +152,7 @@ async def _collect(client: Any, *args: Any, **kwargs: Any) -> list[dict[str, Any
 
 async def test_audit_export_streams_jsonl(make: Any) -> None:
     body = (
-        '{"type":"header","format":"onbehalf-audit-export/1","from":1,"to":2}\n'
+        '{"type":"header","format":"attenuo-audit-export/1","from":1,"to":2}\n'
         '{"type":"entry","seq":1}\n\n'
         '{"type":"checkpoint","seq":2}\n'
     )
@@ -182,7 +182,7 @@ async def test_audit_export_errors(make: Any) -> None:
     with pytest.raises(ApiError):
         await _collect(client)
     client, _ = make(lambda r: httpx.Response(200, text="not json\n"))
-    with pytest.raises(OnbehalfError):
+    with pytest.raises(AttenuoError):
         await _collect(client)
 
 

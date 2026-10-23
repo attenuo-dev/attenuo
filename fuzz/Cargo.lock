@@ -139,6 +139,148 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "attenuo-audit"
+version = "0.1.0"
+dependencies = [
+ "attenuo-core",
+ "attenuo-token",
+ "base64 0.22.1",
+ "hex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "time",
+]
+
+[[package]]
+name = "attenuo-core"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "ryu",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "time",
+ "uuid",
+]
+
+[[package]]
+name = "attenuo-fuzz"
+version = "0.0.0"
+dependencies = [
+ "arbitrary",
+ "async-trait",
+ "attenuo-audit",
+ "attenuo-core",
+ "attenuo-policy",
+ "attenuo-proxy",
+ "attenuo-server",
+ "attenuo-token",
+ "axum",
+ "base64 0.22.1",
+ "jsonwebtoken",
+ "libfuzzer-sys",
+ "ring",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "tower",
+ "uuid",
+]
+
+[[package]]
+name = "attenuo-policy"
+version = "0.1.0"
+dependencies = [
+ "attenuo-core",
+ "cedar-policy",
+ "miette",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror",
+ "time",
+ "toml",
+ "uuid",
+]
+
+[[package]]
+name = "attenuo-proxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "attenuo-core",
+ "axum",
+ "bytes",
+ "futures-util",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "time",
+ "tokio",
+ "tower-http 0.7.1",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "attenuo-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "attenuo-audit",
+ "attenuo-core",
+ "attenuo-policy",
+ "attenuo-proxy",
+ "attenuo-token",
+ "axum",
+ "base64 0.22.1",
+ "clap",
+ "futures-util",
+ "hex",
+ "jsonwebtoken",
+ "reqwest",
+ "ring",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sha2",
+ "thiserror",
+ "time",
+ "tokio",
+ "toml",
+ "tower-http 0.7.1",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "attenuo-token"
+version = "0.1.0"
+dependencies = [
+ "attenuo-core",
+ "base64 0.22.1",
+ "jsonwebtoken",
+ "ring",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "uuid",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1490,145 +1632,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "onbehalf-audit"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "onbehalf-core",
- "onbehalf-token",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror",
- "time",
-]
-
-[[package]]
-name = "onbehalf-core"
-version = "0.1.0"
-dependencies = [
- "hex",
- "ryu",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "time",
- "uuid",
-]
-
-[[package]]
-name = "onbehalf-fuzz"
-version = "0.0.0"
-dependencies = [
- "arbitrary",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "jsonwebtoken",
- "libfuzzer-sys",
- "onbehalf-audit",
- "onbehalf-core",
- "onbehalf-policy",
- "onbehalf-proxy",
- "onbehalf-server",
- "onbehalf-token",
- "ring",
- "serde",
- "serde_json",
- "time",
- "tokio",
- "tower",
- "uuid",
-]
-
-[[package]]
-name = "onbehalf-policy"
-version = "0.1.0"
-dependencies = [
- "cedar-policy",
- "miette",
- "onbehalf-core",
- "serde",
- "serde_json",
- "serde_yaml",
- "thiserror",
- "time",
- "toml",
- "uuid",
-]
-
-[[package]]
-name = "onbehalf-proxy"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "bytes",
- "futures-util",
- "hex",
- "onbehalf-core",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "time",
- "tokio",
- "tower-http 0.7.1",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "onbehalf-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "clap",
- "futures-util",
- "hex",
- "jsonwebtoken",
- "onbehalf-audit",
- "onbehalf-core",
- "onbehalf-policy",
- "onbehalf-proxy",
- "onbehalf-token",
- "reqwest",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "sha2",
- "thiserror",
- "time",
- "tokio",
- "toml",
- "tower-http 0.7.1",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "onbehalf-token"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "jsonwebtoken",
- "onbehalf-core",
- "ring",
- "serde",
- "serde_json",
- "thiserror",
- "time",
- "uuid",
 ]
 
 [[package]]

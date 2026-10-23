@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from "vitest";
-import { AdminClient, ApiError, capability, OnbehalfError, prefix } from "../src/index.js";
+import { AdminClient, ApiError, capability, AttenuoError, prefix } from "../src/index.js";
 import { jsonResponse, mockFetch, Signer, tokenResponse } from "./helpers.js";
 
 const URL_ = "http://ob.test";
@@ -152,7 +152,7 @@ describe("AdminClient", () => {
         for await (const _ of new AdminClient(URL_, "x", { fetch: junk.fetch }).auditExport())
           void _;
       })(),
-    ).rejects.toBeInstanceOf(OnbehalfError);
+    ).rejects.toBeInstanceOf(AttenuoError);
   });
 
   it("tails an empty log", async () => {

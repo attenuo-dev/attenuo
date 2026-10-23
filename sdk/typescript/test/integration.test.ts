@@ -1,12 +1,12 @@
 /**
  * The GitHub-leak scenario through the SDK, against the real server and a fake MCP upstream.
  *
- * Skipped unless `ONBEHALF_INTEGRATION=1`. Needs prebuilt binaries: `onbehalf-server` and
- * `examples/fake_mcp` in `ONBEHALF_BIN_DIR` (default `<repo>/.bin`). Build them with
+ * Skipped unless `ATTENUO_INTEGRATION=1`. Needs prebuilt binaries: `attenuo-server` and
+ * `examples/fake_mcp` in `ATTENUO_BIN_DIR` (default `<repo>/.bin`). Build them with
  *
- *   cargo build -p onbehalf-server && cargo build -p onbehalf-proxy --example fake_mcp
+ *   cargo build -p attenuo-server && cargo build -p attenuo-proxy --example fake_mcp
  *
- * and copy `target/debug/onbehalf-server` and `target/debug/examples/fake_mcp` there. Starts both
+ * and copy `target/debug/attenuo-server` and `target/debug/examples/fake_mcp` there. Starts both
  * on free ports with the demo config from `examples/github-leak-demo` and plays `run.sh`.
  */
 
@@ -33,7 +33,7 @@ import {
   DpopKey,
   mcpFetch,
   mcpUrl,
-  OnbehalfClient,
+  AttenuoClient,
   prefix,
   RefreshError,
   type Token,
@@ -46,7 +46,7 @@ import {
 const CODER_SECRET = "demo-coder-secret";
 const TESTER_SECRET = "demo-tester-secret";
 
-const enabled = process.env.ONBEHALF_INTEGRATION === "1";
+const enabled = process.env.ATTENUO_INTEGRATION === "1";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const DEMO = join(ROOT, "examples", "github-leak-demo");
 const ADMIN_TOKEN = "demo-admin-token";
@@ -63,12 +63,12 @@ function freePort(): Promise<number> {
 }
 
 function binaries(): { server: string; fake: string } {
-  const dir = process.env.ONBEHALF_BIN_DIR ?? join(ROOT, ".bin");
-  const server = join(dir, "onbehalf-server");
+  const dir = process.env.ATTENUO_BIN_DIR ?? join(ROOT, ".bin");
+  const server = join(dir, "attenuo-server");
   const fake = [join(dir, "examples", "fake_mcp"), join(dir, "fake_mcp")].find(existsSync);
   if (!existsSync(server) || !fake) {
     throw new Error(
-      `onbehalf-server / fake_mcp not found in ${dir}; build them and set ONBEHALF_BIN_DIR (see this file's header)`,
+      `attenuo-server / fake_mcp not found in ${dir}; build them and set ATTENUO_BIN_DIR (see this file's header)`,
     );
   }
   return { server, fake };
@@ -83,11 +83,11 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function startStack(
   tokenSection = "",
 ): Promise<{ url: string; work: string; procs: ChildProcess[] }> {
-  const work = mkdtempSync(join(tmpdir(), "onbehalf-it-"));
+  const work = mkdtempSync(join(tmpdir(), "attenuo-it-"));
   const procs: ChildProcess[] = [];
   const built = binaries();
   // Copy them: a shared CARGO_TARGET_DIR can be rebuilt under us mid-test.
-  const serverBin = join(work, "onbehalf-server");
+  const serverBin = join(work, "attenuo-server");
   const fakeBin = join(work, "fake_mcp");
   copyFileSync(built.server, serverBin);
   copyFileSync(built.fake, fakeBin);
@@ -170,7 +170,7 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
 
   it("replays the scenario", async () => {
     const admin = new AdminClient(url, ADMIN_TOKEN);
-    const ob = new OnbehalfClient(url);
+    const ob = new AttenuoClient(url);
 
     // 1. A broad root token for Alice's assistant (dev mint: no IdP in this setup).
     const root = await admin.mintRootDev("alice", "https://idp.example", "assistant", {
@@ -190,7 +190,7 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
     expect(coder.lease).not.toBe(root.lease);
 
     // 3. The token verifies against the server's JWKS; a tampered copy does not.
-    const verified = await ob.inspect(coder, { verify: true, issuer: url, audience: "onbehalf" });
+    const verified = await ob.inspect(coder, { verify: true, issuer: url, audience: "attenuo" });
     expect(verified.verified).toBe(true);
     expect(verified.chain).toEqual(coder.chain);
     const [head, payload, sig] = coder.jwt.split(".") as [string, string, string];
@@ -316,7 +316,7 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
 
     // The coder binds its token to its own key. The assistant signs off on this delegation (to
     // the coder's key and agent id) without handing over its own key (SR-40).
-    const ob = new OnbehalfClient(url, { dpopKey: coderKey.privateJwk() });
+    const ob = new AttenuoClient(url, { dpopKey: coderKey.privateJwk() });
     const signOff = (agent: string) =>
       assistantKey.signOff(`${url}/token`, root.jwt, coderKey.thumbprint, agent);
     // A sign-off for another agent is no good.
@@ -355,7 +355,7 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
     expect(await res.text()).toContain("read_file");
 
     // The same token without the key: refused everywhere.
-    const thief = new OnbehalfClient(url);
+    const thief = new AttenuoClient(url);
     const noProof = await thief
       .callTool(coder, "github", "read_file", { repo: "alice/public-docs" })
       .catch((e: unknown) => e);
@@ -365,7 +365,7 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
       thief.exchange(coder, "tester", "github:read_file", { clientSecret: TESTER_SECRET }),
     ).rejects.toMatchObject({ status: 401, error: "dpop_required" });
     // Another key does not help either.
-    const other = new OnbehalfClient(url, { dpopKey: await DpopKey.generate() });
+    const other = new AttenuoClient(url, { dpopKey: await DpopKey.generate() });
     await expect(other.renew(coder)).rejects.toMatchObject({ error: "invalid_dpop_proof" });
 
     // The audit log records the bound use.
@@ -385,7 +385,7 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
 
   it("keeps a short-lived token alive, then stops on revocation", async () => {
     const admin = new AdminClient(url, ADMIN_TOKEN);
-    const ob = new OnbehalfClient(url);
+    const ob = new AttenuoClient(url);
     // Each exchange needs a fresh parent: a parent delegates to an actor once.
     const exchange = async () => {
       const root = await admin.mintRootDev("alice", "https://idp.example", "assistant", {
@@ -431,7 +431,7 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
   it("keeps the DPoP key across a refresh", async () => {
     const admin = new AdminClient(url, ADMIN_TOKEN);
     const [assistantKey, coderKey] = await Promise.all([DpopKey.generate(), DpopKey.generate()]);
-    const ob = new OnbehalfClient(url, { dpopKey: coderKey });
+    const ob = new AttenuoClient(url, { dpopKey: coderKey });
     const exchange = async () => {
       const root = await admin.mintRootDev("alice", "https://idp.example", "assistant", {
         capabilities: ["github:*"],
@@ -470,7 +470,7 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
   // The examples need `npm install` in examples/typescript-agent (and the SDK built); skipped
   // when that has not been done.
   const EXAMPLES = join(ROOT, "examples", "typescript-agent");
-  const exampleReady = existsSync(join(EXAMPLES, "node_modules", "@onbehalf", "sdk", "dist"));
+  const exampleReady = existsSync(join(EXAMPLES, "node_modules", "@attenuo", "sdk", "dist"));
   const mcpReady = existsSync(join(EXAMPLES, "node_modules", "@modelcontextprotocol", "sdk"));
 
   const runExample = (script: string) =>
@@ -478,7 +478,7 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
       cwd: EXAMPLES,
       encoding: "utf8",
       timeout: 60_000,
-      env: { ...process.env, ONBEHALF_SERVER: url, ONBEHALF_ADMIN_TOKEN: ADMIN_TOKEN },
+      env: { ...process.env, ATTENUO_SERVER: url, ATTENUO_ADMIN_TOKEN: ADMIN_TOKEN },
     });
 
   it.skipIf(!exampleReady)("runs examples/typescript-agent/agent.ts", () => {
@@ -537,7 +537,7 @@ describe.skipIf(!enabled)("DPoP server nonces against the real server", () => {
     expect(raw.headers.get("www-authenticate")).toContain('error="use_dpop_nonce"');
     expect(raw.headers.get("dpop-nonce")).toBeTruthy();
 
-    const ob = new OnbehalfClient(url, { dpopKey: key });
+    const ob = new AttenuoClient(url, { dpopKey: key });
     const res = await ob.callTool(root, "github", "read_file", { repo: "alice/public-docs" });
     expect(res.decisionId).toBeTruthy();
     expect((await ob.renew(root)).expiresIn).toBeGreaterThan(0);

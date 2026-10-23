@@ -25,7 +25,7 @@
  * Tokens are never logged or put in error messages.
  */
 
-import type { OnbehalfClient } from "./client.js";
+import type { AttenuoClient } from "./client.js";
 import { ApiError, RefreshError, UnauthorizedError } from "./errors.js";
 import type { FetchLike } from "./http.js";
 import type { DpopKeyLike } from "./dpop.js";
@@ -41,7 +41,7 @@ const BACKOFF_CAP_MS = 30_000;
 
 export interface RefresherOptions {
   /** The client used for renewals (so it signs DPoP proofs with its own key). */
-  client: OnbehalfClient;
+  client: AttenuoClient;
   /** The token to keep alive. */
   token: Token;
   /** Returns a replacement token. Needs a fresh subject token each call (see the module docs). */

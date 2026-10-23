@@ -1,7 +1,10 @@
 # Standards onbehalf builds on
 
+<!-- renamed-note -->
+> Note (2026-10-23): this project was renamed from `onbehalf` to `attenuo`. This historical document keeps the old name.
+
 - Date: 2026-10-22
-- Related: [RFC-0001](../spec/rfc-0001-onbehalf.md), [related work](related-work.md)
+- Related: [RFC-0001](../spec/rfc-0001-attenuo.md), [related work](related-work.md)
 
 Each entry: what it is, what it gives onbehalf, what gap remains. Status as reported in the cited sources on the date above; drafts move, so re-check before quoting.
 
@@ -16,7 +19,7 @@ Release candidate 21 May 2026, final 28 Jul 2026; maintainers called it "the lar
 
 Defines the `urn:ietf:params:oauth:grant-type:token-exchange` grant, `subject_token`/`actor_token`, and the `act` (nested actor chain) and `may_act` (who may later act for this subject) JWT claims. Cerbos calls it "the right primitive" for delegation that "does not fully close the gap" ([Cerbos](https://www.cerbos.dev/blog/mcp-authorization-standards)). AWS's multi-agent sample issues a scoped on-behalf-of token per hop with it ([AWS Security Blog](https://aws.amazon.com/blogs/security/enforce-least-privilege-authorization-in-multi-agent-ai-chains-using-cedar/)). Spec text: [RFC 8693](https://www.rfc-editor.org/rfc/rfc8693).
 
-- **Gives us:** the exchange endpoint shape and the `act` chain, used as-is in [RFC-0001 §4](../spec/rfc-0001-onbehalf.md#4-token-exchange).
+- **Gives us:** the exchange endpoint shape and the `act` chain, used as-is in [RFC-0001 §4](../spec/rfc-0001-attenuo.md#4-token-exchange).
 - **Gap:** says nothing about what claims the exchanged token may carry relative to its parent. Attenuation (`cap` narrowing), the originating-user block (`obo`) and leases are onbehalf additions layered on it.
 
 ## ID-JAG (Identity Assertion JWT Authorization Grant) and Cross-App Access
@@ -63,4 +66,4 @@ Workload identity: each workload gets a SPIFFE ID and an X.509 or JWT SVID from 
 
 ## What remains unowned after composing all of the above
 
-Carrying a verified originating user across N hops, monotonic attenuation of structured capabilities per hop, per-call argument policy reachable by any PEP, revocation that reaches in-flight runs, and an audit record that names agent and user separately. Each standard above supplies one piece; none specifies their composition. That composition is [RFC-0001](../spec/rfc-0001-onbehalf.md).
+Carrying a verified originating user across N hops, monotonic attenuation of structured capabilities per hop, per-call argument policy reachable by any PEP, revocation that reaches in-flight runs, and an audit record that names agent and user separately. Each standard above supplies one piece; none specifies their composition. That composition is [RFC-0001](../spec/rfc-0001-attenuo.md).

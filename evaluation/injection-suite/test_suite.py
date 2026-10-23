@@ -2,10 +2,10 @@
 
 ``test_corpus_*`` check the case files and always run. ``test_subset`` replays ten cases (one or
 two per suite, covering all three deny stages and some known gaps) against the real server and
-is skipped unless ``ONBEHALF_INTEGRATION=1``. It needs the binaries: set ``ONBEHALF_BIN_DIR`` or
+is skipped unless ``ATTENUO_INTEGRATION=1``. It needs the binaries: set ``ATTENUO_BIN_DIR`` or
 build them into ``target/debug`` (see README.md).
 
-    ONBEHALF_INTEGRATION=1 ONBEHALF_BIN_DIR=... pytest evaluation/injection-suite/test_suite.py -q
+    ATTENUO_INTEGRATION=1 ATTENUO_BIN_DIR=... pytest evaluation/injection-suite/test_suite.py -q
 """
 
 from __future__ import annotations
@@ -52,8 +52,8 @@ def test_corpus_capabilities_build() -> None:
 
 @pytest.fixture(scope="module")
 def result() -> dict[str, Any]:
-    if os.environ.get("ONBEHALF_INTEGRATION") != "1":
-        pytest.skip("set ONBEHALF_INTEGRATION=1 to run")
+    if os.environ.get("ATTENUO_INTEGRATION") != "1":
+        pytest.skip("set ATTENUO_INTEGRATION=1 to run")
     suites = []
     for s in harness.load_corpus():
         s.cases = [c for c in s.cases if c.id in SUBSET]
@@ -65,7 +65,7 @@ def result() -> dict[str, Any]:
 
 @pytest.mark.integration
 def test_subset_matches_expectations(result: dict[str, Any]) -> None:
-    calls = [c for c in result["calls"] if c["arm"] == "onbehalf"]
+    calls = [c for c in result["calls"] if c["arm"] == "attenuo"]
     wrong = [c for c in calls if not c["as_expected"]]
     assert not wrong, wrong
     assert {c["stage"] for c in calls if c["stage"]} == {"capability", "policy", "lease"}
@@ -89,34 +89,34 @@ def test_subset_audit(result: dict[str, Any]) -> None:
 
 
 GARBAGE_ENV = {
-    "ONBEHALF_ADMIN_TOKEN": "garbage-from-another-server",
-    "ONBEHALF_SERVER": "http://127.0.0.1:9",
-    "ONBEHALF_TOKEN": "garbage",
-    "ONBEHALF_CONFIG": "/nonexistent/server.toml",
+    "ATTENUO_ADMIN_TOKEN": "garbage-from-another-server",
+    "ATTENUO_SERVER": "http://127.0.0.1:9",
+    "ATTENUO_TOKEN": "garbage",
+    "ATTENUO_CONFIG": "/nonexistent/server.toml",
 }
 
 
-def test_inherited_onbehalf_env_is_dropped_with_one_warning(
+def test_inherited_attenuo_env_is_dropped_with_one_warning(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     for k, v in GARBAGE_ENV.items():
         monkeypatch.setenv(k, v)
-    monkeypatch.setenv("ONBEHALF_BIN_DIR", "/keep/me")
+    monkeypatch.setenv("ATTENUO_BIN_DIR", "/keep/me")
     dropped = harness.ignore_inherited_env()
     assert dropped == sorted(GARBAGE_ENV)
     assert not any(k in os.environ for k in GARBAGE_ENV)
-    assert os.environ["ONBEHALF_BIN_DIR"] == "/keep/me"
+    assert os.environ["ATTENUO_BIN_DIR"] == "/keep/me"
     err = capsys.readouterr().err
-    assert err.count("warning:") == 1 and "ONBEHALF_ADMIN_TOKEN" in err
+    assert err.count("warning:") == 1 and "ATTENUO_ADMIN_TOKEN" in err
     assert harness.ignore_inherited_env() == []
     assert capsys.readouterr().err == ""
 
 
 @pytest.mark.integration
-def test_subset_passes_with_garbage_onbehalf_env_exported() -> None:
+def test_subset_passes_with_garbage_attenuo_env_exported() -> None:
     """A child run with another server's variables exported still passes (was a 401)."""
-    if os.environ.get("ONBEHALF_INTEGRATION") != "1":
-        pytest.skip("set ONBEHALF_INTEGRATION=1 to run")
+    if os.environ.get("ATTENUO_INTEGRATION") != "1":
+        pytest.skip("set ATTENUO_INTEGRATION=1 to run")
     child = subprocess.run(
         [
             sys.executable,

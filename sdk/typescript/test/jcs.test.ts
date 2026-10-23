@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { canonicalize, parseJson } from "../src/jcs.js";
 
 // The known answers are the RFC 8785 examples (sections 3.2.2, 3.2.3 and Appendix B), the same
-// ones crates/onbehalf-core/src/jcs.rs checks against the Rust implementation.
+// ones crates/attenuo-core/src/jcs.rs checks against the Rust implementation.
 const canon = (text: string): string => canonicalize(parseJson(text));
 
 const hex = (s: string): string => Buffer.from(s, "utf8").toString("hex");

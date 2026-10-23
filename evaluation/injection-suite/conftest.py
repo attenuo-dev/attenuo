@@ -5,5 +5,5 @@ import pytest
 
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
-        "markers", "integration: runs the real onbehalf-server (set ONBEHALF_INTEGRATION=1)"
+        "markers", "integration: runs the real attenuo-server (set ATTENUO_INTEGRATION=1)"
     )

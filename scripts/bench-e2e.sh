@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # End-to-end latency and throughput benchmark: builds release binaries, runs the matrix with
-# onbehalf-bench, and writes docs/design/bench/<date>-<host>.json plus a markdown summary.
+# attenuo-bench, and writes docs/design/bench/<date>-<host>.json plus a markdown summary.
 #
 #   scripts/bench-e2e.sh                 full matrix (about 9 minutes)
 #   DURATION=10 WARMUP=2 scripts/bench-e2e.sh
-#   scripts/bench-e2e.sh --concurrency 8 --depths 3     extra arguments go to onbehalf-bench
+#   scripts/bench-e2e.sh --concurrency 8 --depths 3     extra arguments go to attenuo-bench
 #
 # Environment:
 #   DURATION, WARMUP   seconds per cell (default 5 and 2)
@@ -28,18 +28,18 @@ BASE="$OUT_DIR/$DATE-$HOST"
 mkdir -p "$OUT_DIR"
 
 echo "building release binaries..." >&2
-cargo build --release -q -p onbehalf-bench -p onbehalf-server
-cargo build --release -q -p onbehalf-proxy --features testing --example fake_mcp
+cargo build --release -q -p attenuo-bench -p attenuo-server
+cargo build --release -q -p attenuo-proxy --features testing --example fake_mcp
 TARGET="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 BIN="$TARGET/release"
 
 # The target dir may be shared with other checkouts; run copies of what was just built.
-STAGE="$(mktemp -d "${TMPDIR:-/tmp}/onbehalf-bench-bin.XXXXXX")"
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/attenuo-bench-bin.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
-cp "$BIN/onbehalf-bench" "$BIN/onbehalf-server" "$STAGE/"
+cp "$BIN/attenuo-bench" "$BIN/attenuo-server" "$STAGE/"
 cp "$BIN/examples/fake_mcp" "$STAGE/"
 
-"$STAGE/onbehalf-bench" --bin-dir "$STAGE" --duration "$DURATION" --warmup "$WARMUP" \
+"$STAGE/attenuo-bench" --bin-dir "$STAGE" --duration "$DURATION" --warmup "$WARMUP" \
   --json "$BASE.json" --markdown "$BASE.tables.md" "$@" >/dev/null
 
 {

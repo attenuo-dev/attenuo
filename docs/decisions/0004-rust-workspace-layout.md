@@ -5,7 +5,7 @@
 
 ## Context
 
-The guarantees in [RFC-0001](../spec/rfc-0001-onbehalf.md) have different trust and change profiles. The attenuation rule and audit chain are the trusted base and should be small, dependency-light and property-tested. The MCP proxy and HTTP server change with transports and framework versions. Gateways should be able to use the PDP without pulling in the proxy. One crate would blur those lines; too many would slow a small team.
+The guarantees in [RFC-0001](../spec/rfc-0001-attenuo.md) have different trust and change profiles. The attenuation rule and audit chain are the trusted base and should be small, dependency-light and property-tested. The MCP proxy and HTTP server change with transports and framework versions. Gateways should be able to use the PDP without pulling in the proxy. One crate would blur those lines; too many would slow a small team.
 
 Rust is the implementation language because the pieces being composed are Rust (Cedar's evaluator, AgentGateway, Firecracker-class VMMs for a later sandbox layer) and because a reference monitor benefits from memory safety without a GC pause in the call path ([arXiv 2403.04651](https://arxiv.org/abs/2403.04651v2), [agentgateway](https://github.com/agentgateway/agentgateway)).
 
@@ -15,18 +15,18 @@ A Cargo workspace with seven crates, dependencies pointing only downward in this
 
 | Crate | Responsibility | Key dependencies | Notes |
 |---|---|---|---|
-| `onbehalf-core` | Domain types: `OriginatingUser`, `Capability`, `CapabilitySet`, `DelegationChain`, `Hop`, `Lease`, `Decision`, `AuditRecord`. The attenuation predicate `⊑` and canonical JSON. | `serde`, `serde_json`, `thiserror`, `time` | No I/O, no async, no crypto beyond hashing. The attenuation rule lives here and nowhere else. Property tests with `proptest` for `⊑` (reflexive, transitive, empty set minimal, adding a constraint narrows). |
-| `onbehalf-token` | RFC 8693 token exchange, JWT mint/verify, `act`, `chain` and `ou_sig` claims (`may_act` proposed), ID-JAG and OIDC ID-token intake, JWKS fetching and caching, key management. | `core`, `jsonwebtoken` or `josekit`, `reqwest` | Verifies `requested ⊑ parent` by calling `core`; never reimplements it. |
-| `onbehalf-policy` | Cedar engine wrapper, AuthZEN request/response types, request builder (token + MCP call to Cedar request), `RelationResolver` trait, policy store with hot reload and schema validation. | `core`, `cedar-policy` 4.x | Capability match and lease liveness run here before Cedar; a `forbid`-by-default result when any input is missing. |
-| `onbehalf-audit` | Hash-chained append-only log, checkpoints, verifier, SQLite backend behind a `LogSink` trait. | `core`, `rusqlite` (bundled), `sha2` | Verifier is a separate binary entry point so an auditor can run it without the server. |
-| `onbehalf-proxy` | MCP streamable-HTTP interception: parse JSON-RPC, extract `tools/call`, enforce decision, forward or reject, propagate session ids; lease renewal client. | `core`, `token`, `policy`, `audit`, `axum`/`hyper`, `tower` | Only crate that understands MCP framing. Must not interpret tool results. |
-| `onbehalf-server` | The binary: config, wiring, `/token`, `/access/v1/evaluation`, `/lease/*`, `/revoke`, health, metrics, the proxy routes. | all of the above, `axum`, `tokio`, `clap`, `tracing` | No logic beyond wiring and config. |
-| `onbehalf-cli` | The `onbehalf` binary: a thin HTTP client for a running server (token root/exchange/inspect, call, lease, audit, policy, AuthZEN eval). | `core`, `token`, `reqwest`, `clap` | Holds no keys and decides nothing; `token inspect` decodes locally and `--verify` uses the server's JWKS. |
+| `attenuo-core` | Domain types: `OriginatingUser`, `Capability`, `CapabilitySet`, `DelegationChain`, `Hop`, `Lease`, `Decision`, `AuditRecord`. The attenuation predicate `⊑` and canonical JSON. | `serde`, `serde_json`, `thiserror`, `time` | No I/O, no async, no crypto beyond hashing. The attenuation rule lives here and nowhere else. Property tests with `proptest` for `⊑` (reflexive, transitive, empty set minimal, adding a constraint narrows). |
+| `attenuo-token` | RFC 8693 token exchange, JWT mint/verify, `act`, `chain` and `ou_sig` claims (`may_act` proposed), ID-JAG and OIDC ID-token intake, JWKS fetching and caching, key management. | `core`, `jsonwebtoken` or `josekit`, `reqwest` | Verifies `requested ⊑ parent` by calling `core`; never reimplements it. |
+| `attenuo-policy` | Cedar engine wrapper, AuthZEN request/response types, request builder (token + MCP call to Cedar request), `RelationResolver` trait, policy store with hot reload and schema validation. | `core`, `cedar-policy` 4.x | Capability match and lease liveness run here before Cedar; a `forbid`-by-default result when any input is missing. |
+| `attenuo-audit` | Hash-chained append-only log, checkpoints, verifier, SQLite backend behind a `LogSink` trait. | `core`, `rusqlite` (bundled), `sha2` | Verifier is a separate binary entry point so an auditor can run it without the server. |
+| `attenuo-proxy` | MCP streamable-HTTP interception: parse JSON-RPC, extract `tools/call`, enforce decision, forward or reject, propagate session ids; lease renewal client. | `core`, `token`, `policy`, `audit`, `axum`/`hyper`, `tower` | Only crate that understands MCP framing. Must not interpret tool results. |
+| `attenuo-server` | The binary: config, wiring, `/token`, `/access/v1/evaluation`, `/lease/*`, `/revoke`, health, metrics, the proxy routes. | all of the above, `axum`, `tokio`, `clap`, `tracing` | No logic beyond wiring and config. |
+| `attenuo-cli` | The `attenuo` binary: a thin HTTP client for a running server (token root/exchange/inspect, call, lease, audit, policy, AuthZEN eval). | `core`, `token`, `reqwest`, `clap` | Holds no keys and decides nothing; `token inspect` decodes locally and `--verify` uses the server's JWKS. |
 
 Conventions:
 
-- `onbehalf-core` has `#![forbid(unsafe_code)]` and no async; the others `#![deny(unsafe_code)]`.
-- Security invariants (attenuation, lease revocation reaching the next call, audit chain verification) get property or integration tests in the crate that owns them, per [CONTRIBUTING](https://github.com/7Mudit/onbehalf/blob/main/CONTRIBUTING.md).
+- `attenuo-core` has `#![forbid(unsafe_code)]` and no async; the others `#![deny(unsafe_code)]`.
+- Security invariants (attenuation, lease revocation reaching the next call, audit chain verification) get property or integration tests in the crate that owns them, per [CONTRIBUTING](https://github.com/attenuo-dev/attenuo/blob/main/CONTRIBUTING.md).
 - Shared `rustfmt.toml`, `clippy.toml` with `-D warnings` in CI, pinned toolchain in `rust-toolchain.toml`.
 - Public APIs in `core`, `token` and `policy` are the integration surface for gateways; `proxy` and `server` are not promised stable.
 

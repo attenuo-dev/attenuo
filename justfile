@@ -27,7 +27,7 @@ demo:
 
 # the demo's Cedar policy tests, offline
 policy:
-    cargo run -q -p onbehalf-cli -- policy test examples/github-leak-demo/policy_test.yaml
+    cargo run -q -p attenuo-cli -- policy test examples/github-leak-demo/policy_test.yaml
 
 # rustdoc with warnings as errors
 docs:
