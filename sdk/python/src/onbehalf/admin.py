@@ -16,6 +16,7 @@ import httpx
 
 from . import _wire as w
 from .capability import CapabilityLike, capabilities_to_json
+from .dpop import DpopKey
 from .errors import OnbehalfError
 from .token import Token
 
@@ -67,6 +68,12 @@ class AuditEntry:
     def server(self) -> str | None:
         return self.record.get("server")
 
+    @property
+    def dpop_bound(self) -> bool:
+        """The request proved possession of the key its token is bound to (DPoP); for an
+        issuance, the new token is bound."""
+        return bool(self.record.get("dpop_bound", False))
+
 
 @dataclass(frozen=True)
 class VerifyReport:
@@ -101,6 +108,14 @@ def _export_line(line: str) -> dict[str, Any]:
     if not isinstance(obj, dict):
         raise OnbehalfError(f"audit export: line is not an object: {line[:200]}")
     return obj
+
+
+def _root_dpop(server_url: str, dpop_key: DpopKey | dict[str, Any] | None) -> dict[str, str]:
+    """The ``DPoP`` header that binds a dev root token to ``dpop_key``."""
+    key = DpopKey.of(dpop_key)
+    if key is None:
+        return {}
+    return {"dpop": key.proof("POST", f"{server_url}/admin/root-token")}
 
 
 def _root_body(
@@ -254,14 +269,18 @@ class AdminClient:
         attributes: dict[str, Any] | None = None,
         *,
         may_act: Iterable[str] | None = None,
+        dpop_key: DpopKey | dict[str, Any] | None = None,
     ) -> Token:
         """**Development only.** Mint a root token for an asserted, unverified user.
 
         ``may_act`` lists the agents allowed to exchange the root token next (RFC 8693 §4.4); it
         must be within the ``[[root_grants]]`` entry's ``may_act`` when that has one.
+        ``dpop_key`` binds the root token to that key (DPoP, RFC 9449).
         """
         body = _root_body(subject, issuer, agent, capabilities, ttl_seconds, attributes, may_act)
-        return w.token_from_response(w.json_body(self._http.post("/admin/root-token", json=body)))
+        headers = _root_dpop(self.server_url, dpop_key)
+        resp = self._http.post("/admin/root-token", json=body, headers=headers)
+        return w.token_from_response(w.json_body(resp))
 
 
 class AsyncAdminClient:
@@ -378,7 +397,9 @@ class AsyncAdminClient:
         attributes: dict[str, Any] | None = None,
         *,
         may_act: Iterable[str] | None = None,
+        dpop_key: DpopKey | dict[str, Any] | None = None,
     ) -> Token:
         body = _root_body(subject, issuer, agent, capabilities, ttl_seconds, attributes, may_act)
-        resp = await self._http.post("/admin/root-token", json=body)
+        headers = _root_dpop(self.server_url, dpop_key)
+        resp = await self._http.post("/admin/root-token", json=body, headers=headers)
         return w.token_from_response(w.json_body(resp))

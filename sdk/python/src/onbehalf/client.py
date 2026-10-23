@@ -16,6 +16,7 @@ import httpx
 
 from . import _wire as w
 from .capability import CapabilityLike
+from .dpop import DpopKey, exchange_proofs, presented
 from .token import Token, decode_token, verify_token
 
 DEFAULT_TIMEOUT = 30.0
@@ -29,6 +30,11 @@ class Client:
     ``token`` is an optional default bearer used by ``call_tool``, ``list_tools``, ``renew`` and
     ``authzen_evaluate`` when they are called without one. ``transport`` is for tests
     (``httpx.MockTransport``) or custom TLS/proxy setups.
+
+    ``dpop_key`` (a :class:`~onbehalf.dpop.DpopKey` or a private JWK dict) makes this client
+    sender-constrained (DPoP, RFC 9449): every request carries a proof by the key, exchanges
+    bind the new token to it, and tokens are sent as ``Authorization: DPoP <token>``. A token
+    bound to a key is refused without proofs, so a copied token is useless on its own.
     """
 
     def __init__(
@@ -39,9 +45,11 @@ class Client:
         *,
         transport: httpx.BaseTransport | None = None,
         headers: dict[str, str] | None = None,
+        dpop_key: DpopKey | dict[str, Any] | None = None,
     ) -> None:
         self.server_url = w.normalize_base(server_url)
         self.token = token
+        self.dpop_key = DpopKey.of(dpop_key)
         self._http = httpx.Client(
             base_url=self.server_url, timeout=timeout, transport=transport, headers=headers
         )
@@ -75,6 +83,7 @@ class Client:
         *,
         actor_token: str | None = None,
         may_act: Iterable[str] | None = None,
+        subject_dpop_key: DpopKey | dict[str, Any] | None = None,
     ) -> Token:
         """RFC 8693 token exchange: trade ``subject_token`` for a narrower token held by ``actor``.
 
@@ -92,6 +101,10 @@ class Client:
         ``urn:ietf:params:oauth:token-type:jwt``. Each actor token authenticates one request.
         ``may_act`` lists the agents allowed to exchange the new token next (RFC 8693 §4.4).
 
+        With a ``dpop_key`` on the client, the new token is bound to it. When ``subject_token`` is
+        bound to another key, pass that key as ``subject_dpop_key``: its proof tells the server
+        the parent's holder agrees (a child of a bound token is always bound).
+
         Raises :class:`~onbehalf.ApiError` (``invalid_scope``, ``invalid_grant``, ...) on refusal.
         """
         body = w.exchange_body(
@@ -105,11 +118,23 @@ class Client:
             actor_token=actor_token,
             may_act=may_act,
         )
-        return w.token_from_response(w.json_body(self._http.post("/token", json=body)))
+        headers = self._exchange_dpop(body, subject_dpop_key)
+        resp = self._http.post("/token", json=body, headers=headers)
+        return w.token_from_response(w.json_body(resp))
+
+    def _exchange_dpop(
+        self, body: dict[str, Any], subject_dpop_key: DpopKey | dict[str, Any] | None
+    ) -> dict[str, str]:
+        return _exchange_dpop(self.server_url, self.dpop_key, body, subject_dpop_key)
+
+    def _auth(self, token: str, path: str) -> dict[str, str]:
+        return presented(token, self.dpop_key, "POST", f"{self.server_url}{path}")
 
     def renew(self, token: Token | str | None = None) -> w.Lease:
         """Extend the lease of the token's last hop (``POST /token/renew``)."""
-        resp = self._http.post("/token/renew", headers=_auth(w.bearer(token, self.token)))
+        resp = self._http.post(
+            "/token/renew", headers=self._auth(w.bearer(token, self.token), "/token/renew")
+        )
         return w.lease_from_response(w.json_body(resp))
 
     # -- MCP through the proxy --
@@ -121,9 +146,13 @@ class Client:
         params: dict[str, Any],
         session_id: str | None = None,
     ) -> tuple[dict[str, Any], str | None, httpx.Response]:
+        path = f"/mcp/{w.path_segment(server, 'server')}"
         resp = self._http.post(
-            f"/mcp/{w.path_segment(server, 'server')}",
-            headers=w.mcp_headers(w.bearer(token, self.token), session_id),
+            path,
+            headers={
+                **w.mcp_headers(w.bearer(token, self.token), session_id),
+                **self._auth(w.bearer(token, self.token), path),
+            },
             json=w.rpc_request(method, params, next(self._ids)),
         )
         result, decision_id = w.rpc_result(resp)
@@ -178,7 +207,7 @@ class Client:
         """Ask for a decision without calling the tool. A deny is returned, not raised."""
         resp = self._http.post(
             "/access/v1/evaluation",
-            headers=_auth(w.bearer(token, self.token)),
+            headers=self._auth(w.bearer(token, self.token), "/access/v1/evaluation"),
             json=w.authzen_body(server, tool, arguments),
         )
         return w.authzen_from_response(w.json_body(resp))
@@ -219,9 +248,11 @@ class AsyncClient:
         *,
         transport: httpx.AsyncBaseTransport | None = None,
         headers: dict[str, str] | None = None,
+        dpop_key: DpopKey | dict[str, Any] | None = None,
     ) -> None:
         self.server_url = w.normalize_base(server_url)
         self.token = token
+        self.dpop_key = DpopKey.of(dpop_key)
         self._http = httpx.AsyncClient(
             base_url=self.server_url, timeout=timeout, transport=transport, headers=headers
         )
@@ -253,6 +284,7 @@ class AsyncClient:
         *,
         actor_token: str | None = None,
         may_act: Iterable[str] | None = None,
+        subject_dpop_key: DpopKey | dict[str, Any] | None = None,
     ) -> Token:
         body = w.exchange_body(
             subject_token,
@@ -265,10 +297,17 @@ class AsyncClient:
             actor_token=actor_token,
             may_act=may_act,
         )
-        return w.token_from_response(w.json_body(await self._http.post("/token", json=body)))
+        headers = _exchange_dpop(self.server_url, self.dpop_key, body, subject_dpop_key)
+        resp = await self._http.post("/token", json=body, headers=headers)
+        return w.token_from_response(w.json_body(resp))
+
+    def _auth(self, token: str, path: str) -> dict[str, str]:
+        return presented(token, self.dpop_key, "POST", f"{self.server_url}{path}")
 
     async def renew(self, token: Token | str | None = None) -> w.Lease:
-        resp = await self._http.post("/token/renew", headers=_auth(w.bearer(token, self.token)))
+        resp = await self._http.post(
+            "/token/renew", headers=self._auth(w.bearer(token, self.token), "/token/renew")
+        )
         return w.lease_from_response(w.json_body(resp))
 
     async def _rpc(
@@ -279,9 +318,13 @@ class AsyncClient:
         params: dict[str, Any],
         session_id: str | None = None,
     ) -> tuple[dict[str, Any], str | None, httpx.Response]:
+        path = f"/mcp/{w.path_segment(server, 'server')}"
         resp = await self._http.post(
-            f"/mcp/{w.path_segment(server, 'server')}",
-            headers=w.mcp_headers(w.bearer(token, self.token), session_id),
+            path,
+            headers={
+                **w.mcp_headers(w.bearer(token, self.token), session_id),
+                **self._auth(w.bearer(token, self.token), path),
+            },
             json=w.rpc_request(method, params, next(self._ids)),
         )
         result, decision_id = w.rpc_result(resp)
@@ -331,7 +374,7 @@ class AsyncClient:
     ) -> w.AuthzenDecision:
         resp = await self._http.post(
             "/access/v1/evaluation",
-            headers=_auth(w.bearer(token, self.token)),
+            headers=self._auth(w.bearer(token, self.token), "/access/v1/evaluation"),
             json=w.authzen_body(server, tool, arguments),
         )
         return w.authzen_from_response(w.json_body(resp))
@@ -354,5 +397,17 @@ class AsyncClient:
         return verify_token(raw, await self.jwks(), issuer=issuer, audience=audience)
 
 
-def _auth(token: str) -> dict[str, str]:
-    return {"authorization": f"Bearer {token}"}
+def _exchange_dpop(
+    server_url: str,
+    key: DpopKey | None,
+    body: dict[str, Any],
+    subject_dpop_key: DpopKey | dict[str, Any] | None,
+) -> dict[str, str]:
+    """Add DPoP to an exchange: the ``DPoP`` header binding the new token to ``key``, and the
+    parent's sign-off in ``body`` when ``subject_dpop_key`` is given."""
+    header, sign_off = exchange_proofs(
+        f"{server_url}/token", body["subject_token"], key, DpopKey.of(subject_dpop_key)
+    )
+    if sign_off is not None:
+        body["subject_token_dpop"] = sign_off
+    return {"dpop": header} if header is not None else {}

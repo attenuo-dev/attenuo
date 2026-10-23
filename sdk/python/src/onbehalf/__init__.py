@@ -27,6 +27,7 @@ from .admin import (
 )
 from .capability import Capability, Equals, OneOf, Prefix
 from .client import AsyncClient, Client
+from .dpop import DpopKey
 from .errors import (
     ApiError,
     Denied,
@@ -53,6 +54,7 @@ __all__ = [
     "Chain",
     "Client",
     "Denied",
+    "DpopKey",
     "Equals",
     "Hop",
     "Lease",
