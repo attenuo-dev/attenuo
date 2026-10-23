@@ -44,6 +44,9 @@ pytestmark = [
 ROOT = Path(__file__).resolve().parents[3]
 DEMO = ROOT / "examples" / "github-leak-demo"
 ADMIN_TOKEN = "demo-admin-token"
+# [[agents]] secrets in the demo config: an exchange authenticates as its actor.
+CODER_SECRET = "demo-coder-secret"
+TESTER_SECRET = "demo-tester-secret"
 
 
 def free_port() -> int:
@@ -184,7 +187,13 @@ def test_github_leak_scenario(stack: Stack) -> None:
     assert root.chain.depth == 1
 
     # 2. The assistant hands its coder read_file and nothing else.
-    coder = ob.exchange(root, "coder", [Capability("github", "read_file")], ttl_seconds=600)
+    coder = ob.exchange(
+        root,
+        "coder",
+        [Capability("github", "read_file")],
+        ttl_seconds=600,
+        client_secret=CODER_SECRET,
+    )
     assert coder.chain.agents == ("assistant", "coder")
     assert [str(c) for c in coder.capabilities] == ["github:read_file"]
     assert coder.lease != root.lease
@@ -233,10 +242,15 @@ def test_github_leak_scenario(stack: Stack) -> None:
 
     # 9. Attenuation is monotonic: the coder cannot widen, and a Prefix constraint binds.
     with pytest.raises(ApiError) as widen:
-        ob.exchange(coder, "tester", [Capability("github", "create_issue")])
+        ob.exchange(
+            coder, "tester", [Capability("github", "create_issue")], client_secret=TESTER_SECRET
+        )
     assert widen.value.status == 400 and widen.value.error == "invalid_scope"
     tester = ob.exchange(
-        coder, "tester", [Capability("github", "read_file", repo=Prefix("alice/public-d"))]
+        coder,
+        "tester",
+        [Capability("github", "read_file", repo=Prefix("alice/public-d"))],
+        client_secret=TESTER_SECRET,
     )
     assert tester.chain.depth == 3
     assert ob.call_tool(tester, "github", "read_file", {"repo": "alice/public-docs"}).decision_id
@@ -247,6 +261,11 @@ def test_github_leak_scenario(stack: Stack) -> None:
     # 10. Renewal extends the coder's lease.
     lease = ob.renew(coder)
     assert lease.lease == coder.lease and lease.expires_in > 0
+
+    # 10b. The actor must authenticate as itself.
+    with pytest.raises(ApiError) as unauthenticated:
+        ob.exchange(root, "reviewer", ["github:read_file"])
+    assert unauthenticated.value.status == 401
 
     # 11. A bad bearer is a 401, not a denial.
     with pytest.raises(Unauthorized):
@@ -290,7 +309,7 @@ async def test_async_client_end_to_end(stack: Stack) -> None:
     admin = AdminClient(stack.url, ADMIN_TOKEN)
     root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
     async with AsyncClient(stack.url) as ob:
-        coder = await ob.exchange(root, "coder", ["github:read_file"])
+        coder = await ob.exchange(root, "coder", ["github:read_file"], client_secret=CODER_SECRET)
         res = await ob.call_tool(coder, "github", "read_file", {"repo": "alice/public-docs"})
         assert res.decision_id
         with pytest.raises(Denied) as d:

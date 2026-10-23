@@ -166,6 +166,32 @@ impl Pipeline {
         }
     }
 
+    /// Append a `deny` record for a request refused before any decision (for example the
+    /// proxy's `session_mismatch`). Returns the record id, which is not in the log if the
+    /// append failed.
+    pub fn record_rejection(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        reason: &str,
+        now: OffsetDateTime,
+    ) -> Uuid {
+        let record = DecisionRecord::new(now, Decision::Deny, reason, chain, call, Vec::new());
+        let id = record.id;
+        match self.audit.append(record) {
+            Ok(entry) => tracing::info!(
+                reason,
+                subject = %chain.originating_user.subject,
+                server = %call.server,
+                tool = %call.tool,
+                seq = entry.seq,
+                "request rejected"
+            ),
+            Err(e) => tracing::error!(error = %e, reason, "audit append failed for a rejection"),
+        }
+        id
+    }
+
     /// `Ok` when every lease in the chain is live; otherwise the reason code and details.
     pub fn check_leases(
         &self,
@@ -252,6 +278,16 @@ impl Authorizer for ServerAuthorizer {
             decision_id: d.decision_id,
         }
     }
+
+    async fn record_rejection(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        reason: &str,
+        now: OffsetDateTime,
+    ) -> Uuid {
+        self.pipeline.record_rejection(chain, call, reason, now)
+    }
 }
 
 #[cfg(test)]
@@ -272,6 +308,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let engine = PolicyEngineBuilder::new()
             .with_policies_str("permit(principal, action, resource);")
+            .with_unknown_tools(onbehalf_policy::UnknownTools::Allow)
             .build()
             .unwrap();
         let leases = Arc::new(MemoryLeaseStore::new());
@@ -302,6 +339,26 @@ mod tests {
         assert_eq!(d.reason, REASON_LEASE_UNKNOWN);
         assert_eq!(audit.len().unwrap(), 1);
         assert_eq!(audit.snapshot().unwrap()[0].record.id, d.decision_id);
+    }
+
+    #[test]
+    fn proxy_rejections_are_audited_as_denials() {
+        let (p, _leases, audit, chain) = setup();
+        let call = ToolCall::new("github", "http.GET", json!({})).with_session("abc123");
+        let id = p.record_rejection(
+            &chain,
+            &call,
+            onbehalf_proxy::REASON_SESSION_MISMATCH,
+            OffsetDateTime::now_utc(),
+        );
+        let entries = audit.snapshot().unwrap();
+        assert_eq!(entries.len(), 1);
+        let r = &entries[0].record;
+        assert_eq!(r.id, id);
+        assert_eq!(r.decision, Decision::Deny);
+        assert_eq!(r.reason, "session_mismatch");
+        assert_eq!(r.tool, "http.GET");
+        assert_eq!(r.session_id.as_deref(), Some("abc123"));
     }
 
     #[test]

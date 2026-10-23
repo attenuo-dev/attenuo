@@ -75,10 +75,12 @@ class Client:
     ) -> Token:
         """RFC 8693 token exchange: trade ``subject_token`` for a narrower token held by ``actor``.
 
-        For a hop n to n+1 exchange, ``subject_token`` is the parent delegation token. For hop 0
-        (an IdP credential), pass ``client_id`` and ``client_secret`` of a registered agent; the
-        subject token type then defaults to an OIDC ID token, or set ``subject_token_type`` to
-        ``urn:ietf:params:oauth:token-type:id-jag`` for an ID-JAG.
+        For a hop n to n+1 exchange, ``subject_token`` is the parent delegation token and
+        ``client_secret`` is the actor's ``[[agents]]`` secret (``client_id`` defaults to
+        ``actor``); the server requires it unless ``[token] require_actor_auth = false``. For
+        hop 0 (an IdP credential), pass ``client_id`` and ``client_secret`` of a registered
+        agent; the subject token type then defaults to an OIDC ID token, or set
+        ``subject_token_type`` to ``urn:ietf:params:oauth:token-type:id-jag`` for an ID-JAG.
 
         Raises :class:`~onbehalf.ApiError` (``invalid_scope``, ``invalid_grant``, ...) on refusal.
         """

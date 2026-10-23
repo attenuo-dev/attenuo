@@ -10,7 +10,7 @@
 //! | `POST /token` | client credentials + IdP credential | hop 0 from an OIDC ID token or ID-JAG ([`idp`]) |
 //! | `POST /token` | subject token in body | RFC 8693 exchange, hop n to n+1 |
 //! | `POST /token/renew` | delegation token (bearer) | extend the last hop's lease |
-//! | `POST /access/v1/evaluation` | optional bearer | AuthZEN evaluation |
+//! | `POST /access/v1/evaluation` | delegation token (bearer); or `[[peps]]` credentials with `[authzen] allow_unsigned_chain` | AuthZEN evaluation |
 //! | `GET /.well-known/authzen-configuration` | none | AuthZEN metadata |
 //! | `GET /.well-known/jwks.json` | none | issuer public key |
 //! | `GET /healthz` | none | liveness |
@@ -25,11 +25,13 @@
 #![deny(unsafe_code)]
 
 pub mod authz;
+pub mod clientauth;
 pub mod config;
 pub mod error;
 pub mod idp;
 pub mod jwks;
 pub mod metrics;
+pub mod replay;
 pub mod routes;
 pub mod state;
 

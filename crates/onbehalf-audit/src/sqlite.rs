@@ -53,6 +53,10 @@ CREATE TABLE IF NOT EXISTS leases (
     revoke_reason TEXT NULL
 );
 CREATE INDEX IF NOT EXISTS leases_parent_idx ON leases(parent);
+CREATE TABLE IF NOT EXISTS lease_bindings (
+    id      TEXT PRIMARY KEY,
+    binding TEXT NOT NULL
+);
 "#;
 
 /// Columns read back for an entry, in the order `entry_from_row` expects.
@@ -374,6 +378,13 @@ impl SqliteLeaseStore {
     }
 }
 
+fn binding_in(conn: &Connection, lease: &LeaseId) -> Result<Option<String>, AuditError> {
+    Ok(conn
+        .prepare_cached("SELECT binding FROM lease_bindings WHERE id = ?1")?
+        .query_row([&lease.0], |row| row.get::<_, String>(0))
+        .optional()?)
+}
+
 fn get_in(conn: &Connection, lease: &LeaseId) -> Result<Option<LeaseRow>, AuditError> {
     let mut stmt = conn.prepare_cached(
         "SELECT parent, expires_at, revoked_at, revoke_reason FROM leases WHERE id = ?1",
@@ -468,6 +479,31 @@ impl LeaseStore for SqliteLeaseStore {
     fn is_active(&self, lease: &LeaseId, now: OffsetDateTime) -> Result<bool, AuditError> {
         let conn = self.conn.lock()?;
         Ok(get_in(&conn, lease)?.is_some_and(|r| r.is_active(now)))
+    }
+
+    fn bind(&self, lease: &LeaseId, binding: &str) -> Result<(), AuditError> {
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if get_in(&tx, lease)?.is_none() {
+            return Err(AuditError::UnknownLease(lease.0.clone()));
+        }
+        match binding_in(&tx, lease)? {
+            Some(b) if b == binding => {}
+            Some(_) => return Err(AuditError::BindingConflict(lease.0.clone())),
+            None => {
+                tx.execute(
+                    "INSERT INTO lease_bindings (id, binding) VALUES (?1, ?2)",
+                    params![lease.0, binding],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn binding(&self, lease: &LeaseId) -> Result<Option<String>, AuditError> {
+        let conn = self.conn.lock()?;
+        binding_in(&conn, lease)
     }
 
     fn check_all(

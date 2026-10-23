@@ -35,11 +35,17 @@ openssl genpkey -algorithm ed25519 -out data/issuer.pem
 chmod 600 data/issuer.pem
 
 export ONBEHALF_ADMIN_TOKEN=$(openssl rand -hex 32)
+
+# The sub-agent's client secret, and the hash the server stores.
+export CODER_SECRET=$(openssl rand -hex 16)
+export CODER_SECRET_SHA256=$(printf %s "$CODER_SECRET" | openssl dgst -sha256 | sed 's/.* //')
 ```
 
 The issuer key is an Ed25519 key in PKCS#8 PEM form, which is what `openssl genpkey` writes. You can skip generating it. If the file named by `private_key_pem_path` does not exist, the server creates it with mode 0600 on first start. Generating it yourself just shows where it comes from.
 
-The admin token is a static bearer for everything under `/admin`. The server reads it from the config file and from nowhere else, so the next step writes it into the file.
+The admin token is a static bearer for everything under `/admin`. The server reads it from `[admin] token` in the config file, or from `ONBEHALF_ADMIN_TOKEN`, which wins when both are set. The next step writes it into the file. Off a loopback address the server refuses to start with a token shorter than 32 bytes or one copied from an example; on `127.0.0.1` it only warns.
+
+Every agent that receives a delegated token proves who it is with a client secret. The server keeps only the SHA-256 of the secret, so the config gets `CODER_SECRET_SHA256` and the agent keeps `CODER_SECRET`.
 
 ## 3. Write a minimal config
 
@@ -75,6 +81,11 @@ url = "http://127.0.0.1:3001/mcp"
 [admin]
 token = "$ONBEHALF_ADMIN_TOKEN"
 
+# Agents that authenticate to POST /token. An exchange must authenticate as its actor.
+[[agents]]
+id = "coder"
+secret_sha256 = "$CODER_SECRET_SHA256"
+
 # The most a root token may carry for this user and agent.
 [[root_grants]]
 issuer = "https://idp.example"
@@ -88,7 +99,7 @@ EOF
 chmod 600 onbehalf.toml
 ```
 
-The config has more keys than this. `config/example.toml` in the repository is the annotated reference. Unknown keys are rejected, so a typo stops the server at startup instead of being ignored. Relative paths in the file resolve against the directory you start the server from.
+The config has more keys than this. `config/example.toml` in the repository is the annotated reference. Tools missing from `[policy.catalog]` are denied (`tool_not_in_catalog`) unless `[policy] unknown_tools` says otherwise, so list every tool your agents should be able to call. Unknown keys are rejected, so a typo stops the server at startup instead of being ignored. Relative paths in the file resolve against the directory you start the server from.
 
 ## 4. Run the fake MCP server and onbehalf
 
@@ -147,7 +158,7 @@ This uses the development endpoint `POST /admin/root-token`, which trusts you to
 Now delegate less to a sub-agent. The `coder` agent gets one tool:
 
 ```sh
-CODER=$(onbehalf token exchange --subject-token "$ROOT" --actor coder --cap github:read_file --print token)
+CODER=$(onbehalf token exchange --subject-token "$ROOT" --actor coder --client-secret "$CODER_SECRET" --cap github:read_file --print token)
 onbehalf token inspect "$CODER" --verify
 ```
 
@@ -166,7 +177,7 @@ user alice  (issuer https://idp.example)
 verified: signature, type, issuer, audience, expiry, chain
 ```
 
-An exchange can only narrow. If `coder` tried to pass `github:create_issue` on to another agent, the exchange would fail, because the `coder` token only holds `read_file`.
+The exchange authenticates as `coder` with its client secret (`ONBEHALF_CLIENT_SECRET` works too), so only `coder` can receive a token in its own name. An exchange can only narrow. If `coder` tried to pass `github:create_issue` on to another agent, the exchange would fail, because the `coder` token only holds `read_file`.
 
 ## 7. Make a call
 
@@ -234,15 +245,17 @@ onbehalf audit verify
 ```
 
 ```text
-#1  2026-10-22T22:14:20Z  ALLOW onbehalf/token.root      planner for alice          reason=token_issued
-#2  2026-10-22T22:14:20Z  ALLOW onbehalf/token.exchange  planner > coder for alice  reason=token_issued
-#3  2026-10-22T22:14:20Z  ALLOW github/read_file         planner > coder for alice  reason=policy_allow
-#4  2026-10-22T22:14:20Z  DENY  github/create_issue      planner > coder for alice  reason=capability_denied
-#5  2026-10-22T22:14:21Z  DENY  github/read_file         planner > coder for alice  reason=lease_revoked
-audit chain OK: 5 entries verified
+#1  2026-10-22T22:14:20Z  ALLOW onbehalf/token.root          planner for alice          reason=token_issued
+#2  2026-10-22T22:14:20Z  ALLOW onbehalf/admin.root_token    by admin                   reason=admin_action
+#3  2026-10-22T22:14:20Z  ALLOW onbehalf/token.exchange      planner > coder for alice  reason=token_issued
+#4  2026-10-22T22:14:20Z  ALLOW github/read_file             planner > coder for alice  reason=policy_allow
+#5  2026-10-22T22:14:20Z  DENY  github/create_issue          planner > coder for alice  reason=capability_denied
+#6  2026-10-22T22:14:21Z  ALLOW onbehalf/admin.lease.revoke  by admin                   reason=admin_action
+#7  2026-10-22T22:14:21Z  DENY  github/read_file             planner > coder for alice  reason=lease_revoked
+audit chain OK: 7 entries verified
 ```
 
-Timestamps and ids are shortened here. Every row names the agents and the user separately. Each row also carries the hash of the row before it. `audit verify` walks the whole chain from the start and exits 1 if any row was changed, removed or reordered. The log stores a digest of the call arguments, not the arguments themselves. Use `audit tail --follow` to watch decisions as they happen.
+Timestamps and ids are shortened here. Every row names the agents and the user separately, and admin actions (the development root mint, the revocation) are recorded too. Each row also carries the hash of the row before it. `audit verify` walks the whole chain from the start and exits 1 if any row was changed, removed or reordered. The log stores a digest of the call arguments, not the arguments themselves. Use `audit tail --follow` to watch decisions as they happen.
 
 The same data is available over HTTP:
 

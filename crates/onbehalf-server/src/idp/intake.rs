@@ -18,28 +18,27 @@
 //! ([`IdpRegistry::verify`](super::IdpRegistry::verify), `invalid_grant`); for an ID-JAG,
 //! require its `client_id` to be the authenticated agent; build the originating user
 //! ([`claims::originating_user`]); find the `[[root_grants]]` entry for (issuer, agent,
-//! subject) and attenuate the request against it (`invalid_scope`); then `Issuer::issue_root`,
-//! register the lease, and audit as `token.root` / `token_issued`.
+//! subject) and attenuate the request against it (`invalid_scope`); cap the TTL at the
+//! credential's remaining lifetime (`credential_expired` if none is left); use the credential
+//! once ([`crate::replay`], `replayed`); then `Issuer::issue_root`, register the lease, and
+//! audit as `token.root` / `token_issued`.
 
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
 use onbehalf_audit::LeaseStore;
 use onbehalf_core::{AgentId, CapabilitySet};
 use onbehalf_token::{ExchangeResponse, AUTHORIZATION_DETAILS_TYPE, TOKEN_EXCHANGE_GRANT_TYPE};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
 
 use super::JWT_BEARER_GRANT_TYPE;
 use super::{claims, CredentialKind, IntakeError, ID_JAG_TOKEN_TYPE, ID_TOKEN_TYPE};
+use crate::clientauth::{self, invalid_request, ClientKind};
 use crate::config::{capability_set, AgentConfig, RootGrant};
 use crate::error::ApiError;
-use crate::routes::admin::constant_time_eq;
-use crate::routes::{audit_issuance, no_store};
+use crate::routes::{audit_issuance, no_store, register_issued};
 use crate::state::AppState;
 
 /// Does this `/token` request carry an IdP credential (rather than an onbehalf token)?
@@ -78,14 +77,6 @@ struct IntakeRequest {
     authorization_details: Vec<Detail>,
     #[serde(default)]
     requested_ttl_seconds: Option<u64>,
-}
-
-fn invalid_request(description: &'static str, detail: impl Into<String>) -> ApiError {
-    ApiError::bad_request("invalid_request", detail).with_description(description)
-}
-
-fn invalid_client(description: &'static str, detail: impl Into<String>) -> ApiError {
-    ApiError::new(StatusCode::UNAUTHORIZED, "invalid_client", detail).with_description(description)
 }
 
 fn invalid_scope(description: &'static str, detail: impl Into<String>) -> ApiError {
@@ -158,16 +149,40 @@ pub async fn handle(
         .attenuate(&requested)
         .map_err(|e| invalid_scope("scope_exceeds_grant", e.to_string()))?;
 
-    let ttl = req
+    // The root token never outlives the credential it was minted from.
+    let requested_ttl = req
         .requested_ttl_seconds
-        .map(|s| Duration::seconds(i64::try_from(s).unwrap_or(i64::MAX)));
+        .map(|s| Duration::seconds(i64::try_from(s).unwrap_or(i64::MAX)))
+        .unwrap_or(state.issuer.config().default_ttl);
+    let remaining = Duration::seconds(verified.expires_at - now.unix_timestamp());
+    if remaining < Duration::seconds(1) {
+        return Err(ApiError::bad_request(
+            "invalid_grant",
+            "the credential expires now; present a fresh one",
+        )
+        .with_description("credential_expired"));
+    }
+    let ttl = Some(requested_ttl.min(remaining));
+
     let issued =
         state
             .issuer
             .issue_root(user, AgentId::new(agent.clone()), capabilities, ttl, now)?;
-    state
-        .leases
-        .register(&issued.lease, None, issued.expires_at)?;
+    // Used once, recorded only after issuance succeeded; a refused token is never registered.
+    let skew = i64::try_from(verified.clock_skew_seconds).unwrap_or(i64::MAX);
+    state.replay.use_once(
+        &verified.replay_key(credential),
+        verified.expires_at.saturating_add(skew),
+        now,
+    )?;
+    register_issued(
+        state,
+        &issued.token,
+        &issued.lease,
+        None,
+        issued.expires_at,
+        now,
+    )?;
     let args = json!({
         "agent": agent,
         "requested": issued.chain.hops[0].capabilities,
@@ -223,119 +238,33 @@ fn credential_of(req: &IntakeRequest) -> Result<(CredentialKind, &str), ApiError
     }
 }
 
-/// Client credentials from HTTP Basic (RFC 6749 §2.3.1, form-encoded id and secret).
-fn basic_credentials(headers: &HeaderMap) -> Result<Option<(String, String)>, ApiError> {
-    let Some(raw) = headers.get(header::AUTHORIZATION) else {
-        return Ok(None);
-    };
-    let raw = raw.to_str().unwrap_or_default();
-    let Some((scheme, b64)) = raw.split_once(' ') else {
-        return Ok(None);
-    };
-    if !scheme.eq_ignore_ascii_case("basic") {
-        return Ok(None);
-    }
-    let bad = || invalid_client("malformed_client_auth", "malformed Basic credentials");
-    let decoded = STANDARD.decode(b64.trim()).map_err(|_| bad())?;
-    let decoded = String::from_utf8(decoded).map_err(|_| bad())?;
-    let (id, secret) = decoded.split_once(':').ok_or_else(bad)?;
-    let unescape = |s: &str| -> Result<String, ApiError> {
-        let pairs: Vec<(String, String)> =
-            serde_urlencoded::from_str(&format!("v={s}")).map_err(|_| bad())?;
-        Ok(pairs.into_iter().next().map(|(_, v)| v).unwrap_or_default())
-    };
-    Ok(Some((unescape(id)?, unescape(secret)?)))
-}
-
 /// Authenticate the agent against `[[agents]]`; returns its id.
 fn authenticate_client(
     agents: &[AgentConfig],
     headers: &HeaderMap,
     req: &IntakeRequest,
 ) -> Result<String, ApiError> {
-    let (id, secret) = match (basic_credentials(headers)?, &req.client_secret) {
-        (Some(_), Some(_)) => {
-            return Err(invalid_request(
-                "multiple_client_auth",
-                "use either HTTP Basic or client_secret in the body, not both",
-            ))
-        }
-        (Some((id, secret)), None) => {
-            if req.client_id.as_deref().is_some_and(|c| c != id) {
-                return Err(invalid_client(
-                    "client_authentication_failed",
-                    "client_id differs from the Basic credentials",
-                ));
-            }
-            (id, secret)
-        }
-        (None, Some(secret)) => match &req.client_id {
-            Some(id) => (id.clone(), secret.clone()),
-            None => {
-                return Err(invalid_client(
-                    "client_auth_missing",
-                    "client_id is required",
-                ))
-            }
-        },
-        (None, None) => {
-            return Err(invalid_client(
-                "client_auth_missing",
-                "client authentication is required (client_id and client_secret)",
-            ))
-        }
-    };
-    if agents.is_empty() {
-        return Err(invalid_client(
-            "no_agents_configured",
-            "no [[agents]] are configured; IdP intake is disabled",
-        ));
-    }
-    let presented = hex::encode(Sha256::digest(secret.as_bytes()));
-    let known = agents.iter().find(|a| a.id == id);
-    // Compare against something even for unknown ids, so timing does not reveal which exist.
-    let expected = known
-        .map(|a| a.secret_sha256.as_str())
-        .unwrap_or("0000000000000000000000000000000000000000000000000000000000000000");
-    let ok = constant_time_eq(presented.as_bytes(), expected.as_bytes());
-    match known {
-        Some(a) if ok => Ok(a.id.clone()),
-        _ => Err(invalid_client(
-            "client_authentication_failed",
-            "unknown client or wrong secret",
-        )),
-    }
+    clientauth::authenticate(
+        ClientKind::Agent,
+        agents,
+        headers,
+        req.client_id.as_deref(),
+        req.client_secret.as_deref(),
+    )
 }
 
 /// Validate `[[agents]]` at startup; returns them with the hash lowercased.
 pub fn validate_agents(agents: &[AgentConfig]) -> anyhow::Result<Vec<AgentConfig>> {
-    let mut out: Vec<AgentConfig> = Vec::with_capacity(agents.len());
-    for a in agents {
-        if a.id.is_empty() {
-            anyhow::bail!("[[agents]]: id must not be empty");
-        }
-        if out.iter().any(|b| b.id == a.id) {
-            anyhow::bail!("[[agents]]: id `{}` is listed twice", a.id);
-        }
-        let h = a.secret_sha256.to_ascii_lowercase();
-        if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
-            anyhow::bail!(
-                "[[agents]] `{}`: secret_sha256 must be 64 hex characters",
-                a.id
-            );
-        }
-        out.push(AgentConfig {
-            id: a.id.clone(),
-            secret_sha256: h,
-        });
-    }
-    Ok(out)
+    clientauth::validate_clients("[[agents]]", agents)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
+    use axum::http::{header, HeaderValue};
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
 
     fn agents() -> Vec<AgentConfig> {
         validate_agents(&[AgentConfig {

@@ -104,6 +104,10 @@ async fn run(cli: Cli) -> Result<Outcome> {
             if let Some(ttl) = a.ttl_seconds {
                 body["requested_ttl_seconds"] = ttl.into();
             }
+            if let Some(secret) = a.client_secret {
+                body["client_id"] = a.client_id.unwrap_or_else(|| a.actor.clone()).into();
+                body["client_secret"] = secret.into();
+            }
             let resp = client.exchange(&body).await?;
             print_token(&resp, a.print, json);
             Ok(Outcome::Ok)
@@ -412,14 +416,20 @@ fn fmt_audit_entry(e: &Value) -> String {
         .flatten()
         .filter_map(Value::as_str)
         .collect();
+    // Admin actions have no delegation chain, so no agents.
+    let who = if agents.is_empty() {
+        "by".to_string()
+    } else {
+        format!("{} for", agents.join(" > "))
+    };
     format!(
-        "#{:<4} {}  {:<5} {}/{}  {} for {}  reason={}  id={}",
+        "#{:<4} {}  {:<5} {}/{}  {} {}  reason={}  id={}",
         e["seq"].as_u64().unwrap_or(0),
         r["at"].as_str().unwrap_or("-"),
         r["decision"].as_str().unwrap_or("-").to_uppercase(),
         r["server"].as_str().unwrap_or("-"),
         r["tool"].as_str().unwrap_or("-"),
-        agents.join(" > "),
+        who,
         r["originating_subject"].as_str().unwrap_or("-"),
         r["reason"].as_str().unwrap_or("-"),
         r["id"].as_str().unwrap_or("-"),

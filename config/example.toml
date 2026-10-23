@@ -34,6 +34,11 @@ policies_path = "config/policies/default.cedar"
 # Alternatively (or additionally) point catalog_path at a JSON file of the same shape:
 # { "github": { "read_file": { "readonly": true, "inputs": { "repo": "string" } } } }
 # catalog_path = "config/catalog.json"
+# Calls to a (server, tool) pair missing from the catalog: "deny" (default, reason
+# tool_not_in_catalog), "sensitive" (evaluated with resource.sensitive = true) or "allow"
+# (default attributes; forbids keyed on resource.sensitive do not apply). Server names must
+# not contain "/".
+unknown_tools = "deny"
 
 # Extra originating_user.attributes the Cedar schema should know, so policies that test them
 # validate. Types: string, long, bool, set<string> (any scalar inside set<>). The built-in four
@@ -63,8 +68,12 @@ name = "github"
 url = "http://127.0.0.1:3001/mcp"
 
 [admin]
-# Static bearer for /admin/*. v0 only: change it, and do not expose /admin publicly.
-token = "dev-admin-token-change-me"
+# Static bearer for /admin/*. v0 only; do not expose /admin publicly. No token ships here:
+# generate one with `openssl rand -hex 32` and put it here, or set ONBEHALF_ADMIN_TOKEN (which
+# overrides this value). Without a token the admin routes answer 403. Off a loopback `listen`
+# address the server refuses to start when the token is missing, shorter than 32 bytes or a
+# published placeholder.
+# token = "<output of openssl rand -hex 32>"
 
 # Trusted identity providers for hop 0. POST /token accepts an OIDC ID token
 # (subject_token_type = urn:ietf:params:oauth:token-type:id_token) or an ID-JAG
@@ -90,6 +99,17 @@ attribute_claims = ["email", "groups", "amr"]
 id = "planner"
 secret_sha256 = "a93d472e76b73bffcef69973eb463fb679b1365377e183a459d7f33c2ee97b7a"   # "planner-secret-change-me"
 
+# Agents also authenticate on every token exchange (hop n to n+1) as the `actor` they name.
+[[agents]]
+id = "coder"
+secret_sha256 = "c0a83cbb212848e0615711bb006be7edb88db29def8c4dae01c7465c6f64e99e"   # "coder-secret-change-me"
+
+[token]
+# Require the caller of an exchange to authenticate as its `actor` ([[agents]] credentials,
+# HTTP Basic or client_id/client_secret). Setting this to false makes `actor` an unverified
+# assertion again; the server warns at startup.
+require_actor_auth = true
+
 # The most a root token may carry: for users of `issuer`, held by `agent`. Add `subject = "..."`
 # to pin an entry to one user (a pinned entry wins over an unpinned one). The capabilities
 # requested at /token are attenuated against the matching entry; no entry, no root token.
@@ -99,6 +119,18 @@ agent = "planner"
 capabilities = ["github:*"]
 # Only the dev root mint copies `attributes`; IdP intake takes attributes from the verified token.
 attributes = { mfa = false }
+
+[authzen]
+# POST /access/v1/evaluation requires `Authorization: Bearer <onbehalf token>` by default.
+# Set to true to also accept a chain in subject.properties.chain without the token, from a
+# PEP listed in [[peps]] (HTTP Basic, or pep_id/pep_secret in the body). Each hop of such a
+# chain must match what this server issued for its lease, or the request gets 403.
+allow_unsigned_chain = false
+
+# Policy enforcement points for allow_unsigned_chain, same shape as [[agents]].
+# [[peps]]
+# id = "gateway"
+# secret_sha256 = "<printf %s \"$SECRET\" | sha256sum>"
 
 [dev]
 # DEVELOPMENT ONLY. Mounts POST /admin/root-token, which mints root tokens for a user nobody

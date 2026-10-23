@@ -35,6 +35,7 @@ name = "github"
 url = "http://127.0.0.1:13001/mcp"
 
 [admin]
+# A placeholder is accepted only because listen is loopback (the server warns). Never reuse it.
 token = "demo-admin-token"
 
 # Alice's assistant holds a broad token, like the over-privileged PAT in the real incident.
@@ -43,6 +44,19 @@ subject = "alice"
 issuer = "https://idp.example"
 agent = "assistant"
 capabilities = ["github:*"]
+
+# The sub-agent that receives the delegation in step 2. Token exchanges authenticate the
+# actor ([token] require_actor_auth, on by default); run.sh passes the secret with
+# --client-secret. secret_sha256 = printf %s demo-coder-secret | sha256sum
+[[agents]]
+id = "coder"
+secret_sha256 = "f0f962bada9d92c8a30f5c55a388ce47d1074ddff4bfdb099ef67ad43003baeb"
+
+# A third agent, used by the Python SDK's integration test (examples/python-agent too).
+# secret_sha256 = printf %s demo-tester-secret | sha256sum
+[[agents]]
+id = "tester"
+secret_sha256 = "4d4d01d5f4743384d7e17f557918cd0e2f81d9a46a4fcb3c8d2c851e8d08bbdf"
 
 # Demo only: mounts POST /admin/root-token so step 1 works without an identity provider.
 # Real deployments leave this off and mint root tokens from an OIDC ID token or ID-JAG.

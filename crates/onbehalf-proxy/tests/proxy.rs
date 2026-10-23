@@ -1,6 +1,7 @@
 //! End-to-end tests: a real proxy in front of a real (fake) MCP server, over TCP.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use onbehalf_core::{ArgConstraint, Capability, DelegationChain};
 use onbehalf_proxy::jsonrpc::{CODE_DENIED, CODE_UNAUTHORIZED, CODE_UNKNOWN_SERVER};
@@ -16,6 +17,9 @@ struct Harness {
     proxy: Spawned,
     authorizer: Arc<StaticAuthorizer>,
     client: reqwest::Client,
+    /// The `Mcp-Session-Id` each bearer was given, sent back on its later requests like an MCP
+    /// client would.
+    sessions: Mutex<HashMap<String, String>>,
 }
 
 impl Harness {
@@ -46,6 +50,7 @@ impl Harness {
             proxy,
             authorizer,
             client: reqwest::Client::new(),
+            sessions: Mutex::default(),
         })
     }
 
@@ -60,12 +65,23 @@ impl Harness {
             .post(self.proxy.url(&format!("/mcp/{server}")))
             .header("accept", "application/json, text/event-stream")
             .header("content-type", "application/json")
-            .header("mcp-session-id", "client-session-42")
             .body(body.to_string());
         if let Some(b) = bearer {
             req = req.bearer_auth(b);
+            if let Some(sid) = self.sessions.lock().unwrap().get(b) {
+                req = req.header("mcp-session-id", sid);
+            }
         }
-        Ok(req.send().await?)
+        let resp = req.send().await?;
+        if let (Some(b), Some(sid)) = (bearer, resp.headers().get("mcp-session-id")) {
+            if resp.status().is_success() {
+                self.sessions
+                    .lock()
+                    .unwrap()
+                    .insert(b.to_owned(), sid.to_str()?.to_owned());
+            }
+        }
+        Ok(resp)
     }
 
     async fn rpc(&self, bearer: Option<&str>, body: &Value) -> anyhow::Result<reqwest::Response> {
@@ -114,8 +130,18 @@ async fn allowed_tools_call_is_forwarded_upstream() -> anyhow::Result<()> {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].name, "read_file");
     assert_eq!(calls[0].arguments, json!({"path": "README.md"}));
-    // the client's session id reached the upstream
-    assert_eq!(calls[0].session_id.as_deref(), Some("client-session-42"));
+    assert_eq!(calls[0].session_id, None);
+
+    // The client sends the session id back; it reaches the upstream unchanged.
+    let resp = h
+        .rpc(Some("tok"), &tools_call(2, "read_file", json!({})))
+        .await?;
+    assert_eq!(resp.status(), 200);
+    let calls = h.upstream.recorded_calls();
+    assert_eq!(
+        calls[1].session_id.as_deref(),
+        Some(h.upstream.session_id())
+    );
     Ok(())
 }
 
@@ -339,7 +365,13 @@ async fn decision_ids_are_returned_in_header_and_recorded() -> anyhow::Result<()
     assert_eq!(records[0].tool, "read_file");
     assert_eq!(records[0].originating_subject, "user:alice");
     assert_eq!(records[0].agents[0].0, "agent:reader");
-    assert_eq!(records[0].session_id.as_deref(), Some("client-session-42"));
+    // The first call had no session; the second carried the one the upstream assigned, and
+    // the record holds its hash prefix, never the id itself (SR-11).
+    assert_eq!(records[0].session_id, None);
+    assert_eq!(
+        records[1].session_id.as_deref(),
+        Some(onbehalf_proxy::session::session_tag(h.upstream.session_id()).as_str())
+    );
     assert_eq!(records[1].id.to_string(), denied_id);
     assert!(!records[1].decision.is_allow());
     assert_eq!(records[1].reason, StaticAuthorizer::REASON_DENY);

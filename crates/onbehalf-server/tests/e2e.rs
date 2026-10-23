@@ -15,6 +15,12 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 
 const ADMIN: &str = "test-admin-token";
+/// Agents registered in `[[agents]]`; each one's secret is [`agent_secret`].
+const AGENTS: &[&str] = &["coder", "sneaky", "x", "reviewer"];
+
+fn agent_secret(id: &str) -> String {
+    format!("{id}-secret")
+}
 const TOOLS: &[&str] = &["read_file", "create_issue", "delete_repo"];
 
 const POLICY_PUBLIC_READS: &str = r#"
@@ -57,6 +63,11 @@ impl Harness {
 
     /// `file_db`: back the audit log with a file in a temp dir instead of `:memory:`.
     async fn start_with(file_db: bool) -> Self {
+        Self::start_tweaked(file_db, |_| {}).await
+    }
+
+    /// As [`start_with`](Self::start_with), with a last chance to change the config.
+    async fn start_tweaked(file_db: bool, tweak: impl FnOnce(&mut Config)) -> Self {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_test_writer()
@@ -90,6 +101,14 @@ impl Harness {
         cfg.upstreams = vec![UpstreamConfig::new("github", upstream_task.url("/mcp"))];
         cfg.admin.token = Some(ADMIN.into());
         cfg.dev.allow_root_mint = true;
+        cfg.agents = AGENTS
+            .iter()
+            .map(|id| onbehalf_server::config::AgentConfig {
+                id: (*id).into(),
+                secret_sha256: sha256_hex(&agent_secret(id)),
+            })
+            .collect();
+        tweak(&mut cfg);
 
         let (router, state) = onbehalf_server::build(&cfg).unwrap();
         assert!(dir.path().join("keys/issuer.pem").exists());
@@ -152,7 +171,20 @@ impl Harness {
         }
     }
 
+    /// Exchange, authenticating as `actor` with its client secret.
     async fn exchange_raw(&self, parent: &str, actor: &str, caps: &[&str]) -> reqwest::Response {
+        self.exchange_as(parent, actor, caps, Some((actor, &agent_secret(actor))))
+            .await
+    }
+
+    /// Exchange with explicit client credentials (sent as `client_id` / `client_secret`).
+    async fn exchange_as(
+        &self,
+        parent: &str,
+        actor: &str,
+        caps: &[&str],
+        client: Option<(&str, &str)>,
+    ) -> reqwest::Response {
         let caps: Vec<Value> = caps
             .iter()
             .map(|c| {
@@ -168,6 +200,8 @@ impl Harness {
                 "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
                 "actor": actor,
                 "authorization_details": [{"type": "onbehalf_capabilities", "capabilities": caps}],
+                "client_id": client.map(|c| c.0),
+                "client_secret": client.map(|c| c.1),
             }))
             .send()
             .await
@@ -401,6 +435,8 @@ async fn exchange_accepts_rfc8693_form_encoding() {
         ("subject_token", root.token.as_str()),
         ("subject_token_type", "urn:ietf:params:oauth:token-type:jwt"),
         ("actor", "coder"),
+        ("client_id", "coder"),
+        ("client_secret", "coder-secret"),
         ("authorization_details", details.as_str()),
         ("requested_ttl_seconds", "120"),
     ];
@@ -465,6 +501,195 @@ fn enc(s: &str) -> String {
             _ => format!("%{b:02X}"),
         })
         .collect()
+}
+
+/// SR-10: the actor of an exchange is authenticated, and an agent cannot appear twice.
+#[tokio::test]
+async fn exchange_actor_must_authenticate_as_itself() {
+    let h = Harness::start().await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let caps = &["github:read_file"];
+    let error = |v: &Value| {
+        (
+            v["error"].as_str().unwrap_or_default().to_string(),
+            v["error_description"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        )
+    };
+
+    // No credentials: 401 invalid_client.
+    let resp = h.exchange_as(&root.token, "coder", caps, None).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        error(&resp.json().await.unwrap()),
+        ("invalid_client".into(), "client_auth_missing".into())
+    );
+    // Wrong secret, unknown client.
+    for client in [("coder", "nope"), ("ghost", "ghost-secret")] {
+        let resp = h
+            .exchange_as(&root.token, "coder", caps, Some(client))
+            .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{client:?}");
+    }
+    // A compromised sub-agent with its own valid credentials cannot name another agent.
+    let resp = h
+        .exchange_as(
+            &root.token,
+            "release-bot",
+            caps,
+            Some(("coder", "coder-secret")),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error(&resp.json().await.unwrap()),
+        ("invalid_request".into(), "actor_mismatch".into())
+    );
+    // HTTP Basic works too.
+    let resp = h
+        .client
+        .post(h.url("/token"))
+        .basic_auth("coder", Some("coder-secret"))
+        .json(&json!({
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "subject_token": root.token,
+            "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+            "actor": "coder",
+            "authorization_details": [{"type": "onbehalf_capabilities",
+                "capabilities": [{"server": "github", "tool": "read_file"}]}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let child: Value = resp.json().await.unwrap();
+
+    // coder -> reviewer -> coder again is refused with a clear error.
+    let reviewer = h
+        .exchange(child["access_token"].as_str().unwrap(), "reviewer", caps)
+        .await;
+    let resp = h.exchange_raw(&reviewer.token, "coder", caps).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let err: Value = resp.json().await.unwrap();
+    assert_eq!(
+        error(&err),
+        ("invalid_request".into(), "duplicate_actor".into())
+    );
+    assert!(err["detail"].as_str().unwrap().contains("coder"), "{err}");
+}
+
+/// SR-10: `[token] require_actor_auth = false` restores asserted actors (with a startup
+/// warning), but credentials that are sent are still checked.
+#[tokio::test]
+async fn actor_auth_can_be_switched_off_explicitly() {
+    let h = Harness::start_tweaked(false, |cfg| cfg.token.require_actor_auth = false).await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let resp = h
+        .exchange_as(&root.token, "anyone", &["github:read_file"], None)
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = h
+        .exchange_as(
+            &root.token,
+            "coder",
+            &["github:read_file"],
+            Some(("coder", "wrong")),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// SR-12: a tool the upstream exposes but the catalog does not list is denied and audited,
+/// even with a capability and a policy that would allow it.
+#[tokio::test]
+async fn uncatalogued_tools_are_denied_and_audited() {
+    let h = Harness::start().await;
+    std::fs::write(&h.policy_path, "permit(principal, action, resource);").unwrap();
+    let resp = h.admin_post("/admin/policies/reload", json!({})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+
+    let no = h
+        .call(&root.token, "delete_org", json!({"org": "acme"}))
+        .await;
+    assert_eq!(denied_reason(&no), "tool_not_in_catalog");
+    let no = h
+        .call(&root.token, "Delete_Repo", json!({"repo": "acme/x"}))
+        .await;
+    assert_eq!(denied_reason(&no), "tool_not_in_catalog");
+    assert!(allowed(
+        &h.call(&root.token, "read_file", json!({"repo": "acme/x"}))
+            .await
+    ));
+    assert_eq!(h.upstream.recorded_calls().len(), 1);
+    let entries = h.audit_entries().await;
+    let denied: Vec<_> = tool_calls(&entries)
+        .into_iter()
+        .filter(|e| e["record"]["reason"] == "tool_not_in_catalog")
+        .collect();
+    assert_eq!(denied.len(), 2);
+    assert_eq!(denied[0]["record"]["tool"], "delete_org");
+    assert_eq!(denied[0]["record"]["decision"], "deny");
+}
+
+/// SR-15: revocations, policy reloads (good and bad) and dev root mints are audited as admin
+/// actions, and the audit chain still verifies.
+#[tokio::test]
+async fn admin_actions_are_audited() {
+    let h = Harness::start().await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let resp = h.admin_post("/admin/policies/reload", json!({})).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    std::fs::write(
+        &h.policy_path,
+        "permit(principal, action == Action::\"nope\", resource);",
+    )
+    .unwrap();
+    let resp = h.admin_post("/admin/policies/reload", json!({})).await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let resp = h
+        .admin_post(
+            &format!("/admin/leases/{}/revoke", root.lease),
+            json!({"reason": "incident 42"}),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: Value = resp.json().await.unwrap();
+    assert!(v["audit_id"].is_string(), "{v}");
+
+    let entries = h.audit_entries().await;
+    let admin: Vec<(String, String, String)> = entries
+        .iter()
+        .filter(|e| e["record"]["originating_subject"] == "admin")
+        .map(|e| {
+            let r = &e["record"];
+            (
+                r["tool"].as_str().unwrap().to_string(),
+                r["decision"].as_str().unwrap().to_string(),
+                r["reason"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let s = |a: &str, b: &str, c: &str| (a.to_string(), b.to_string(), c.to_string());
+    assert_eq!(
+        admin,
+        vec![
+            s("admin.root_token", "allow", "admin_action"),
+            s("admin.policies.reload", "allow", "admin_action"),
+            s("admin.policies.reload", "deny", "policy_invalid"),
+            s("admin.lease.revoke", "allow", "admin_action"),
+        ]
+    );
+    let revoke = entries
+        .iter()
+        .find(|e| e["record"]["tool"] == "admin.lease.revoke")
+        .unwrap();
+    assert_eq!(revoke["record"]["leases"], json!([root.lease]));
+    assert_eq!(revoke["record"]["server"], "onbehalf");
+    let report = h.admin_get("/admin/audit/verify").await;
+    assert_eq!(report["ok"], true);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -553,7 +778,7 @@ async fn authzen_matches_proxy_decisions() {
         assert!(az["context"]["decision_id"].is_string());
     }
 
-    // Without a bearer, a PEP can send the chain itself; it is still lease-checked.
+    // Without a bearer the endpoint refuses by default, even for a genuine chain (SR-08).
     let chain = h
         .state
         .verifier
@@ -563,20 +788,15 @@ async fn authzen_matches_proxy_decisions() {
     let call =
         onbehalf_core::ToolCall::new("github", "read_file", json!({"repo": "alice/public-site"}));
     let body = serde_json::to_value(authzen::to_request(&chain, &call)).unwrap();
-    let az: Value = h.authzen(None, body).await.json().await.unwrap();
-    assert_eq!(az["decision"], true);
-
-    // A chain this server never issued has unknown leases.
-    let mut forged = chain.clone();
-    for hop in &mut forged.hops {
-        hop.lease = onbehalf_core::LeaseId::new("forged");
-    }
-    let body = serde_json::to_value(authzen::to_request(&forged, &call)).unwrap();
-    let az: Value = h.authzen(None, body).await.json().await.unwrap();
-    assert_eq!(az["decision"], false);
-    assert_eq!(az["context"]["reason"], "lease_unknown");
+    let resp = h.authzen(None, body).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(resp.headers().contains_key("www-authenticate"));
 
     // A body chain that disagrees with the bearer is rejected.
+    let mut forged = chain.clone();
+    for (i, hop) in forged.hops.iter_mut().enumerate() {
+        hop.lease = onbehalf_core::LeaseId::new(format!("forged-{i}"));
+    }
     let body = serde_json::to_value(authzen::to_request(&forged, &call)).unwrap();
     let resp = h.authzen(Some(&child.token), body).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -587,7 +807,7 @@ async fn authzen_matches_proxy_decisions() {
 
     // No bearer and no chain.
     let resp = h.authzen(None, authzen_body("read_file", json!({}))).await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     // A bad bearer.
     let resp = h
         .authzen(Some("garbage"), authzen_body("read_file", json!({})))
@@ -608,6 +828,152 @@ async fn authzen_matches_proxy_decisions() {
         cfg["access_evaluation_endpoint"],
         h.url("/access/v1/evaluation")
     );
+}
+
+const PEP_SECRET: &str = "pep-secret-for-tests";
+
+fn sha256_hex(s: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(s.as_bytes()))
+}
+
+/// SR-08: with `allow_unsigned_chain`, a body chain needs PEP credentials and must match, hop by
+/// hop, a chain this server issued. Lease ids alone (they are printed in every token) are not
+/// enough to forge a user, attributes or capabilities, and a refused chain leaves no audit
+/// record in the victim's name.
+#[tokio::test]
+async fn unsigned_authzen_chains_need_a_pep_and_an_issued_chain() {
+    let h = Harness::start_tweaked(false, |cfg| {
+        cfg.authzen.allow_unsigned_chain = true;
+        cfg.peps = vec![onbehalf_server::config::PepConfig {
+            id: "gateway".into(),
+            secret_sha256: sha256_hex(PEP_SECRET),
+        }];
+    })
+    .await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let child = h
+        .exchange(&root.token, "coder", &["github:read_file"])
+        .await;
+    let chain = h
+        .state
+        .verifier
+        .verify(&child.token, time::OffsetDateTime::now_utc())
+        .unwrap()
+        .chain;
+    let read =
+        onbehalf_core::ToolCall::new("github", "read_file", json!({"repo": "alice/public-site"}));
+    let with_pep = |chain: &onbehalf_core::DelegationChain,
+                    call: &onbehalf_core::ToolCall,
+                    secret: Option<&str>| {
+        let mut body = serde_json::to_value(authzen::to_request(chain, call)).unwrap();
+        if let Some(s) = secret {
+            body["pep_id"] = json!("gateway");
+            body["pep_secret"] = json!(s);
+        }
+        body
+    };
+    let audit_len = |entries: Vec<Value>| entries.len();
+
+    // The genuine chain from an authenticated PEP: decided and audited.
+    let before = audit_len(h.audit_entries().await);
+    let az: Value = h
+        .authzen(None, with_pep(&chain, &read, Some(PEP_SECRET)))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(az["decision"], true, "{az}");
+    assert_eq!(audit_len(h.audit_entries().await), before + 1);
+    // The root chain alone is a genuine chain too.
+    let root_chain = onbehalf_core::DelegationChain {
+        originating_user: chain.originating_user.clone(),
+        hops: chain.hops[..1].to_vec(),
+    };
+    let az: Value = h
+        .authzen(None, with_pep(&root_chain, &read, Some(PEP_SECRET)))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(az["decision"], true, "{az}");
+
+    // PEP credentials are required: none, wrong, and HTTP Basic.
+    let resp = h.authzen(None, with_pep(&chain, &read, None)).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        resp.json::<Value>().await.unwrap()["error"],
+        "invalid_client"
+    );
+    let resp = h
+        .authzen(None, with_pep(&chain, &read, Some("wrong")))
+        .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = h
+        .client
+        .post(h.url("/access/v1/evaluation"))
+        .basic_auth("gateway", Some(PEP_SECRET))
+        .json(&with_pep(&chain, &read, None))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Forgeries built from real, live lease ids. None of them is decided or audited.
+    let before = audit_len(h.audit_entries().await);
+    let mut other_user = chain.clone();
+    other_user.originating_user.subject = "bob".into();
+    let mut mfa = chain.clone();
+    mfa.originating_user
+        .attributes
+        .insert("mfa".into(), json!(true));
+    let mut wider = chain.clone();
+    wider.hops[1].capabilities = root_chain.hops[0].capabilities.clone();
+    let mut other_agent = chain.clone();
+    other_agent.hops[1].agent = onbehalf_core::AgentId::new("release-bot");
+    let mut root_lease_twice = chain.clone();
+    root_lease_twice.hops[1].lease = chain.hops[0].lease.clone();
+    let mut swapped = root_chain.clone();
+    swapped.hops[0].lease = chain.hops[1].lease.clone();
+    for (name, forged, status) in [
+        ("other user", &other_user, StatusCode::FORBIDDEN),
+        ("mfa attribute", &mfa, StatusCode::FORBIDDEN),
+        ("wider child", &wider, StatusCode::FORBIDDEN),
+        ("other agent", &other_agent, StatusCode::FORBIDDEN),
+        (
+            "child lease on the root hop",
+            &swapped,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "root lease twice",
+            &root_lease_twice,
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let resp = h
+            .authzen(None, with_pep(forged, &read, Some(PEP_SECRET)))
+            .await;
+        assert_eq!(resp.status(), status, "{name}");
+        let err: Value = resp.json().await.unwrap();
+        if status == StatusCode::FORBIDDEN {
+            assert_eq!(err["error"], "chain_not_issued", "{name}: {err}");
+        }
+    }
+    assert_eq!(
+        audit_len(h.audit_entries().await),
+        before,
+        "refused chains write no audit records"
+    );
+
+    // The bearer path still works alongside.
+    let resp = h
+        .authzen(
+            Some(&child.token),
+            authzen_body("read_file", json!({"repo": "alice/public-site"})),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -633,10 +999,11 @@ async fn audit_verify_detects_tampering() {
 
     let report = h.admin_get("/admin/audit/verify").await;
     assert_eq!(report["ok"], true);
-    assert_eq!(report["entries"], 3);
+    // token.root, admin.root_token, two calls
+    assert_eq!(report["entries"], 4);
     assert_eq!(report["first_bad_seq"], Value::Null);
     let cp = h.admin_get("/admin/audit/checkpoint").await;
-    assert_eq!(cp["seq"], 3);
+    assert_eq!(cp["seq"], 4);
     assert_eq!(cp["hash"].as_str().unwrap().len(), 64);
 
     // Turn the recorded denial into an allow behind the server's back.
@@ -1124,4 +1491,30 @@ async fn resources_and_unknown_methods_are_authorized_through_the_pipeline() {
         .filter_map(|e| e["record"]["tool"].as_str())
         .collect();
     assert!(tools.contains(&"resources/read") && tools.contains(&"vendor/x"));
+}
+
+/// A parent token delegates to a given actor once; other actors are unaffected.
+#[tokio::test]
+async fn exchanging_the_same_parent_for_the_same_actor_twice_is_refused() {
+    let h = Harness::start().await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    // A refused exchange (it asks for more than the parent holds) does not use up the slot.
+    let refused = h
+        .exchange_raw(&root.token, "coder", &["gitlab:read_file"])
+        .await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let _coder = h
+        .exchange(&root.token, "coder", &["github:read_file"])
+        .await;
+    let resp = h
+        .exchange_raw(&root.token, "coder", &["github:read_file"])
+        .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "invalid_grant", "{body}");
+    assert_eq!(body["error_description"], "replayed", "{body}");
+    // A different actor from the same parent is fine.
+    let _reviewer = h
+        .exchange(&root.token, "reviewer", &["github:read_file"])
+        .await;
 }

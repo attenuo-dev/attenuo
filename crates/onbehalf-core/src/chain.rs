@@ -100,6 +100,12 @@ impl DelegationChain {
                 source: crate::error::AttenuationError::Empty,
             });
         }
+        if agent.0.is_empty() {
+            return Err(ChainError::EmptyAgentId { index: 0 });
+        }
+        if lease.0.is_empty() {
+            return Err(ChainError::EmptyLeaseId { index: 0 });
+        }
         Ok(Self {
             originating_user,
             hops: vec![Hop {
@@ -115,8 +121,10 @@ impl DelegationChain {
     /// Delegate from the last hop to `agent`, requesting `requested` capabilities.
     ///
     /// Fails if `requested` is not covered by the last hop's capabilities (attenuation), if the
-    /// chain is already at `max_depth`, or if the chain is currently invalid. The new hop's
-    /// expiry is clamped to its parent's so a child can never outlive its parent.
+    /// chain is already at `max_depth`, if `agent` already acts somewhere in the chain
+    /// ([`ChainError::DuplicateAgent`]), if `agent` or `lease` is empty or `lease` is already
+    /// used, or if the chain is currently invalid. The new hop's expiry is clamped to its
+    /// parent's so a child can never outlive its parent.
     pub fn extend(
         &self,
         agent: AgentId,
@@ -133,6 +141,27 @@ impl DelegationChain {
             return Err(ChainError::TooDeep {
                 depth: self.hops.len() + 1,
                 max: max_depth,
+            });
+        }
+        let index = self.hops.len();
+        if agent.0.is_empty() {
+            return Err(ChainError::EmptyAgentId { index });
+        }
+        if lease.0.is_empty() {
+            return Err(ChainError::EmptyLeaseId { index });
+        }
+        if let Some(first) = self.hops.iter().position(|h| h.agent == agent) {
+            return Err(ChainError::DuplicateAgent {
+                index,
+                first,
+                agent: agent.0,
+            });
+        }
+        if let Some(first) = self.hops.iter().position(|h| h.lease == lease) {
+            return Err(ChainError::DuplicateLease {
+                index,
+                first,
+                lease: lease.0,
             });
         }
         let capabilities = parent
@@ -164,6 +193,15 @@ impl DelegationChain {
     /// Check every structural invariant at time `now`.
     ///
     /// Call this on every chain received from the outside, after signature verification.
+    ///
+    /// Checked, in order: a non-empty subject; at least one hop and at most `max_depth`; then
+    /// per hop: non-empty agent and lease ids, `issued_at < expires_at`, not expired at `now`,
+    /// a lease and an agent id that no earlier hop uses, and, against the parent hop,
+    /// `issued_at` not before the parent's, an expiry not after the parent's, and capabilities
+    /// the parent covers.
+    ///
+    /// `issued_at` is not compared with `now`: chains are validated at arbitrary times (tests,
+    /// replays of the audit log), and a chain from a token was stamped by the issuer's clock.
     pub fn validate_at(&self, now: OffsetDateTime, max_depth: usize) -> Result<(), ChainError> {
         if self.originating_user.subject.is_empty() {
             return Err(ChainError::EmptySubject);
@@ -178,6 +216,15 @@ impl DelegationChain {
             });
         }
         for (i, hop) in self.hops.iter().enumerate() {
+            if hop.agent.0.is_empty() {
+                return Err(ChainError::EmptyAgentId { index: i });
+            }
+            if hop.lease.0.is_empty() {
+                return Err(ChainError::EmptyLeaseId { index: i });
+            }
+            if hop.issued_at >= hop.expires_at {
+                return Err(ChainError::IssuedAfterExpiry { index: i });
+            }
             if hop.expires_at <= now {
                 return Err(ChainError::HopExpired {
                     index: i,
@@ -187,8 +234,29 @@ impl DelegationChain {
                         .unwrap_or_default(),
                 });
             }
+            let earlier = &self.hops[..i];
+            if let Some(first) = earlier.iter().position(|h| h.lease == hop.lease) {
+                return Err(ChainError::DuplicateLease {
+                    index: i,
+                    first,
+                    lease: hop.lease.0.clone(),
+                });
+            }
+            if let Some(first) = earlier.iter().position(|h| h.agent == hop.agent) {
+                return Err(ChainError::DuplicateAgent {
+                    index: i,
+                    first,
+                    agent: hop.agent.0.clone(),
+                });
+            }
             if i > 0 {
                 let parent = &self.hops[i - 1];
+                if hop.issued_at < parent.issued_at {
+                    return Err(ChainError::IssuedBeforeParent {
+                        index: i,
+                        parent: i - 1,
+                    });
+                }
                 if hop.expires_at > parent.expires_at {
                     return Err(ChainError::ExpiryNotMonotonic {
                         index: i,
@@ -234,6 +302,26 @@ impl DelegationChain {
     /// Stable digest of the whole chain, used to bind audit records to it.
     pub fn digest(&self) -> String {
         sha256_json(self)
+    }
+
+    /// Digest of the chain cut after hop `index` (the chain as it was when that hop was
+    /// issued). `prefix_digest(depth - 1)` equals [`digest`](Self::digest). `None` when `index`
+    /// is out of range.
+    ///
+    /// The issuer records this per lease (`LeaseStore::bind`), so a chain received without its
+    /// signature can be matched hop by hop against what was actually issued.
+    pub fn prefix_digest(&self, index: usize) -> Option<String> {
+        if index >= self.hops.len() {
+            return None;
+        }
+        if index + 1 == self.hops.len() {
+            return Some(self.digest());
+        }
+        let prefix = DelegationChain {
+            originating_user: self.originating_user.clone(),
+            hops: self.hops[..=index].to_vec(),
+        };
+        Some(prefix.digest())
     }
 }
 
@@ -398,7 +486,7 @@ mod tests {
                     caps(vec![Capability::new("*", "*")]),
                     t0(),
                     Duration::minutes(1),
-                    LeaseId::new(format!("l{i}")),
+                    LeaseId::new(format!("l-hop{i}")),
                     DEFAULT_MAX_DEPTH,
                 )
                 .unwrap();
@@ -456,6 +544,144 @@ mod tests {
         }
     }
 
+    fn two_hops() -> DelegationChain {
+        DelegationChain::root(
+            user(),
+            AgentId::new("a"),
+            caps(vec![Capability::new("github", "read_*")]),
+            t0(),
+            Duration::hours(1),
+            LeaseId::new("l1"),
+        )
+        .unwrap()
+        .extend(
+            AgentId::new("b"),
+            caps(vec![Capability::new("github", "read_file")]),
+            t0() + Duration::minutes(1),
+            Duration::minutes(30),
+            LeaseId::new("l2"),
+            DEFAULT_MAX_DEPTH,
+        )
+        .unwrap()
+    }
+
+    /// SR-16: one live lease repeated on every hop of a hand-written chain.
+    #[test]
+    fn duplicate_lease_is_rejected() {
+        let mut c = two_hops();
+        c.hops[1].lease = LeaseId::new("l1");
+        assert_eq!(
+            c.validate_at(t0() + Duration::minutes(2), DEFAULT_MAX_DEPTH),
+            Err(ChainError::DuplicateLease {
+                index: 1,
+                first: 0,
+                lease: "l1".into()
+            })
+        );
+    }
+
+    /// SR-16 / SR-10: an agent cannot appear twice, whether validated or extended.
+    #[test]
+    fn duplicate_agent_is_rejected_on_validate_and_extend() {
+        let mut c = two_hops();
+        c.hops[1].agent = AgentId::new("a");
+        assert!(matches!(
+            c.validate_at(t0() + Duration::minutes(2), DEFAULT_MAX_DEPTH),
+            Err(ChainError::DuplicateAgent {
+                index: 1,
+                first: 0,
+                ..
+            })
+        ));
+        let err = two_hops()
+            .extend(
+                AgentId::new("a"),
+                caps(vec![Capability::new("github", "read_file")]),
+                t0() + Duration::minutes(2),
+                Duration::minutes(5),
+                LeaseId::new("l3"),
+                DEFAULT_MAX_DEPTH,
+            )
+            .unwrap_err();
+        assert_eq!(
+            err,
+            ChainError::DuplicateAgent {
+                index: 2,
+                first: 0,
+                agent: "a".into()
+            }
+        );
+        assert!(err.to_string().contains("already acts at hop 0"));
+        // reusing a lease id on extend is refused too
+        assert!(matches!(
+            two_hops().extend(
+                AgentId::new("c"),
+                caps(vec![Capability::new("github", "read_file")]),
+                t0() + Duration::minutes(2),
+                Duration::minutes(5),
+                LeaseId::new("l2"),
+                DEFAULT_MAX_DEPTH,
+            ),
+            Err(ChainError::DuplicateLease {
+                index: 2,
+                first: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn empty_ids_are_rejected() {
+        let at = t0() + Duration::minutes(2);
+        let mut c = two_hops();
+        c.hops[1].agent = AgentId::new("");
+        assert_eq!(
+            c.validate_at(at, DEFAULT_MAX_DEPTH),
+            Err(ChainError::EmptyAgentId { index: 1 })
+        );
+        let mut c = two_hops();
+        c.hops[0].lease = LeaseId::new("");
+        assert_eq!(
+            c.validate_at(at, DEFAULT_MAX_DEPTH),
+            Err(ChainError::EmptyLeaseId { index: 0 })
+        );
+        let root = |agent: &str, lease: &str| {
+            DelegationChain::root(
+                user(),
+                AgentId::new(agent),
+                caps(vec![Capability::new("github", "read_*")]),
+                t0(),
+                Duration::hours(1),
+                LeaseId::new(lease),
+            )
+        };
+        assert_eq!(root("", "l1"), Err(ChainError::EmptyAgentId { index: 0 }));
+        assert_eq!(root("a", ""), Err(ChainError::EmptyLeaseId { index: 0 }));
+    }
+
+    #[test]
+    fn issued_at_ordering_is_checked() {
+        let at = t0() + Duration::minutes(2);
+        // issued at (or after) its own expiry
+        let mut c = two_hops();
+        c.hops[1].issued_at = c.hops[1].expires_at;
+        assert_eq!(
+            c.validate_at(at, DEFAULT_MAX_DEPTH),
+            Err(ChainError::IssuedAfterExpiry { index: 1 })
+        );
+        // issued before the parent that delegated to it
+        let mut c = two_hops();
+        c.hops[1].issued_at = t0() - Duration::minutes(1);
+        assert_eq!(
+            c.validate_at(at, DEFAULT_MAX_DEPTH),
+            Err(ChainError::IssuedBeforeParent {
+                index: 1,
+                parent: 0
+            })
+        );
+        two_hops().validate_at(at, DEFAULT_MAX_DEPTH).unwrap();
+    }
+
     #[test]
     fn digest_changes_when_chain_changes() {
         let root = DelegationChain::root(
@@ -477,5 +703,18 @@ mod tests {
         let s = serde_json::to_string(&root).unwrap();
         let back: DelegationChain = serde_json::from_str(&s).unwrap();
         assert_eq!(back.digest(), d1);
+    }
+
+    #[test]
+    fn prefix_digest_is_the_digest_at_issuance() {
+        let child = two_hops();
+        let root = DelegationChain {
+            originating_user: child.originating_user.clone(),
+            hops: child.hops[..1].to_vec(),
+        };
+        assert_eq!(child.prefix_digest(0), Some(root.digest()));
+        assert_eq!(child.prefix_digest(1), Some(child.digest()));
+        assert_eq!(child.prefix_digest(2), None);
+        assert_ne!(child.prefix_digest(0), child.prefix_digest(1));
     }
 }

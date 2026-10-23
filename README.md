@@ -50,8 +50,11 @@ Run the server with the example config. It generates an issuer key in `data/` on
 
 ```sh
 cargo build -p onbehalf-server
+export ONBEHALF_ADMIN_TOKEN=$(openssl rand -hex 32)   # the /admin bearer; overrides [admin] token
 cargo run -p onbehalf-server -- --config config/example.toml   # or ONBEHALF_CONFIG=config/example.toml
 ```
+
+The example ships no admin token. On a loopback `listen` address a missing, short or placeholder token only produces a warning (and without one the admin routes answer 403); on any other address the server refuses to start unless the token is at least 32 bytes and not a published placeholder. Revocations, policy reloads and dev root mints are written to the audit log as admin actions.
 
 The flows below use `curl` and `jq`.
 
@@ -78,7 +81,7 @@ The agent exchanges the user's ID token for a root delegation token (RFC 8693), 
 
 ```sh
 OB=http://127.0.0.1:8080
-ADMIN=dev-admin-token-change-me
+ADMIN=$ONBEHALF_ADMIN_TOKEN   # see below
 ID_TOKEN=...   # from your IdP's login flow
 
 # 1. Exchange the user's ID token for a root token held by "planner".
@@ -95,8 +98,9 @@ For an ID-JAG, send `subject_token_type=urn:ietf:params:oauth:token-type:id-jag`
 ### Delegate, call, revoke
 
 ```sh
-# 2. RFC 8693 exchange: planner delegates read_file only to a "coder" sub-agent.
-CHILD_TOKEN=$(curl -s -X POST $OB/token \
+# 2. RFC 8693 exchange: planner delegates read_file only to a "coder" sub-agent. The coder
+#    authenticates as itself ([[agents]]); only it can receive a token in its name.
+CHILD_TOKEN=$(curl -s -X POST $OB/token -u coder:coder-secret-change-me \
   --data-urlencode grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
   --data-urlencode subject_token=$ROOT_TOKEN \
   --data-urlencode subject_token_type=urn:ietf:params:oauth:token-type:jwt \
@@ -137,7 +141,7 @@ ROOT=$(curl -s -X POST $OB/admin/root-token -H "Authorization: Bearer $ADMIN" \
 ROOT_TOKEN=$(echo "$ROOT" | jq -r .access_token); ROOT_LEASE=$(echo "$ROOT" | jq -r .lease)
 ```
 
-Other endpoints: `POST /token/renew` (extend your lease), `POST /access/v1/evaluation` (AuthZEN; send the delegation token as bearer), `GET /.well-known/jwks.json`, `GET /.well-known/authzen-configuration`, `POST /admin/policies/reload`, `GET /admin/leases/{id}`, `GET /admin/audit/checkpoint`, `GET /healthz`. The request pipeline is described in [docs/design/server.md](docs/design/server.md). Set `RUST_LOG=debug` for more logging.
+Other endpoints: `POST /token/renew` (extend your lease), `POST /access/v1/evaluation` (AuthZEN; the delegation token as bearer is required unless `[authzen] allow_unsigned_chain` is set for authenticated `[[peps]]`), `GET /.well-known/jwks.json`, `GET /.well-known/authzen-configuration`, `POST /admin/policies/reload`, `GET /admin/leases/{id}`, `GET /admin/audit/checkpoint`, `GET /healthz`. The request pipeline is described in [docs/design/server.md](docs/design/server.md). Set `RUST_LOG=debug` for more logging.
 
 ## Command line
 
@@ -145,11 +149,11 @@ Other endpoints: `POST /token/renew` (extend your lease), `POST /access/v1/evalu
 
 ```sh
 cargo build -p onbehalf-cli
-export ONBEHALF_SERVER=http://127.0.0.1:8080 ONBEHALF_ADMIN_TOKEN=dev-admin-token-change-me
+export ONBEHALF_SERVER=http://127.0.0.1:8080   # and ONBEHALF_ADMIN_TOKEN, as the server got it
 alias onbehalf=target/debug/onbehalf
 
 onbehalf token root --subject alice --issuer https://idp.example --agent planner --cap 'github:*'
-onbehalf token exchange --subject-token "$ROOT_TOKEN" --actor coder --cap github:read_file
+onbehalf token exchange --subject-token "$ROOT_TOKEN" --actor coder --client-secret coder-secret-change-me --cap github:read_file
 onbehalf token inspect "$CHILD_TOKEN" --verify      # the chain as a tree; --verify checks it against the server's JWKS
 onbehalf call --token "$CHILD_TOKEN" --server github --tool read_file --arg repo=acme/api
 onbehalf lease revoke "$ROOT_LEASE" --reason demo
@@ -157,7 +161,7 @@ onbehalf audit tail -n 10 --follow
 onbehalf audit verify
 ```
 
-Other subcommands: `tools` (`tools/list`), `lease show`, `policy reload`, `authzen eval`. Output is for people by default and JSON with `--json`; `--print token|lease` on `token root` and `token exchange` prints one value for scripts. `--server` before the subcommand is the onbehalf URL; after `call` or `tools` it names the MCP upstream. Exit status is 0 on success, 1 on an error and 2 when the server said no (a denied call, a negative AuthZEN decision, a broken audit chain). `ONBEHALF_TOKEN` can stand in for `--token` and `--subject-token`.
+Other subcommands: `tools` (`tools/list`), `lease show`, `policy reload`, `authzen eval`. Output is for people by default and JSON with `--json`; `--print token|lease` on `token root` and `token exchange` prints one value for scripts. `--server` before the subcommand is the onbehalf URL; after `call` or `tools` it names the MCP upstream. Exit status is 0 on success, 1 on an error and 2 when the server said no (a denied call, a negative AuthZEN decision, a broken audit chain). `ONBEHALF_TOKEN` can stand in for `--token` and `--subject-token`, and `ONBEHALF_CLIENT_SECRET` for `--client-secret`.
 
 A scripted end-to-end run of the GitHub leak scenario, with a fake MCP server, is in [examples/github-leak-demo](examples/github-leak-demo/README.md). A `Dockerfile` and `docker-compose.yml` run the same pair of servers in containers (untested).
 

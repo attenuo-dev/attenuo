@@ -369,6 +369,26 @@ impl Authorizer for StaticAuthorizer {
             decision_id: id,
         }
     }
+
+    async fn record_rejection(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        reason: &str,
+        now: OffsetDateTime,
+    ) -> uuid::Uuid {
+        let record = DecisionRecord::new(
+            now,
+            onbehalf_core::Decision::Deny,
+            reason,
+            chain,
+            call,
+            vec![],
+        );
+        let id = record.id;
+        self.decisions.lock().expect("decisions mutex").push(record);
+        id
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -4,18 +4,23 @@
 #
 # Then, from the host (the server is published on 127.0.0.1:8080 only):
 #
-#   export ONBEHALF_SERVER=http://127.0.0.1:8080 ONBEHALF_ADMIN_TOKEN=demo-admin-token
+#   export ONBEHALF_ADMIN_TOKEN=$(openssl rand -hex 32)   # before `docker compose up`
+#   export ONBEHALF_SERVER=http://127.0.0.1:8080
 #   cargo run -p onbehalf-cli -- token root --subject alice --agent assistant --cap 'github:*'
 #
 # or run the CLI in the same image: docker compose run --rm --entrypoint onbehalf onbehalf --help
 # The scripted walk-through is examples/github-leak-demo/run.sh, which does not need Docker.
-# The admin token below is the demo's; never publish /admin outside localhost.
+# The server listens on all interfaces inside the container, so it refuses to start without a
+# strong admin token: compose passes ONBEHALF_ADMIN_TOKEN from your shell. Never publish /admin
+# outside localhost.
 
 services:
   onbehalf:
     image: onbehalf:dev
     build: .
     command: ["--config", "/etc/onbehalf/config.toml"]
+    environment:
+      ONBEHALF_ADMIN_TOKEN: ${ONBEHALF_ADMIN_TOKEN:?set ONBEHALF_ADMIN_TOKEN, e.g. $(openssl rand -hex 32)}
     ports:
       - "127.0.0.1:8080:8080"
     volumes:

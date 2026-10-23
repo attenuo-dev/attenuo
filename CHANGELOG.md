@@ -43,6 +43,13 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 - BREAKING: `LeaseStore` has a new required method `renew`; `onbehalf_proxy::Authorizer` has a new required method `check_active`, and `AuthError` a new variant `LeaseInactive`.
 - Leases are registered with `expires_at = min(now + lease_interval, token exp)` instead of the token's expiry, so a holder that stops renewing is denied (`lease_expired`) within one interval while its JWT is still valid.
 - `tools/list`, `initialize`, `ping`, the other allowlisted methods and `GET`/`DELETE` session requests are now lease-checked; a revoked token gets 401 instead of being served.
+- BREAKING: `POST /access/v1/evaluation` requires the delegation token as bearer. Body-only chains need `[authzen] allow_unsigned_chain = true` and an authenticated `[[peps]]` client (SR-08).
+- BREAKING: a hop n+1 token exchange must authenticate as its `actor` with `[[agents]]` client credentials (`[token] require_actor_auth`, default `true`). The CLI takes `--client-id` / `--client-secret` (env `ONBEHALF_CLIENT_SECRET`) on `token exchange` (SR-10).
+- BREAKING: tool calls for tools missing from `[policy.catalog]` are denied by default (`[policy] unknown_tools = "deny" | "sensitive" | "allow"`); server names containing `/` are rejected at startup (SR-12, SR-13).
+- BREAKING: off a loopback `listen` address the server refuses to start without a strong admin token (at least 32 bytes, not a published placeholder); `ONBEHALF_ADMIN_TOKEN` overrides `[admin] token`, and `config/example.toml` ships no token (SR-15).
+- BREAKING: an `Mcp-Session-Id` the proxy did not see the upstream assign gets 404; one bound to another principal gets 403 (SR-11). `onbehalf_proxy::Authorizer` gained `record_rejection` (with a default), and `LeaseStore` gained `bind` and `binding`.
+- Policy test files take `unknown_tools`, and pick up `[policy] unknown_tools` from a server config named as `catalog`.
+- Python SDK: `exchange(..., client_secret=...)` from a delegation token authenticates the actor (`client_id` defaults to `actor`) and stays a hop n+1 exchange; client credentials only make it hop 0 when the subject token is not an onbehalf token. The examples and the integration test pass the demo agents' secrets; the demo config registers a `tester` agent.
 
 ### Deprecated
 
@@ -61,5 +68,13 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 - RFC-0001 section 7 now says what the audit log implements today (hash over `(seq, prev_hash, record)`, no automatic checkpoints, no `kind` field) next to the design target.
 
 ### Security
+
+- SR-08 (high): AuthZEN evaluated unsigned chains from unauthenticated callers, so anyone who had seen a lease id could get decisions and write audit records for a forged user. The bearer is now required by default; body chains need a PEP credential, and every hop's lease must be bound (at issuance, write-once) to the digest of the chain prefix that created it.
+- SR-10 (high): the `actor` of a token exchange was asserted, not authenticated, so any token holder could mint a child naming any agent. The actor now authenticates with its `[[agents]]` secret and must match `actor`; an agent already in the chain is refused (`duplicate_actor`).
+- SR-11 (medium): `Mcp-Session-Id` was not bound to the caller, so another user's token could use, listen on or end a session. Session ids are bound to the originating user and root lease; mismatches get 403 `session_mismatch` and an audit record. Logs, policy context and audit records carry a hash prefix of the id, never the id.
+- SR-12 (medium): tools missing from the catalog were evaluated as not `sensitive`, so `forbid ... when { resource.sensitive }` failed open for them. They are now denied with `tool_not_in_catalog` unless `[policy] unknown_tools` says otherwise.
+- SR-15 (medium): the example config's fixed admin token was accepted on any bind address. Weak or placeholder admin tokens now stop the server off loopback, and admin actions (lease revocation, policy reload, dev root mint) are written to the audit log.
+- SR-16 (low): `DelegationChain::validate_at` now rejects empty agent and lease ids, `issued_at` at or after `expires_at` or before the parent's, and repeated leases or agents.
+- SR-24 (info, partial): each OIDC ID token or ID-JAG mints at most one root token, a parent token delegates to a given actor at most once (in-memory replay cache, `invalid_grant` / `replayed`), and a root token never outlives the credential it came from.
 
 [Unreleased]: https://github.com/7Mudit/onbehalf/compare/main...HEAD

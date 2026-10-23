@@ -50,7 +50,7 @@ inputs = { repo = "string" }
 
 It does two jobs:
 
-1. **Tool attributes** (`readonly`, `sensitive`) become `resource.readonly` and `resource.sensitive`. A tool that is not in the catalog is neither, so a `forbid` keyed on `sensitive` silently skips it. Register every tool the server exposes (MCP `tools/list` is the natural source).
+1. **Tool attributes** (`readonly`, `sensitive`) become `resource.readonly` and `resource.sensitive`. A tool that is not in the catalog is denied before Cedar runs, with reason `tool_not_in_catalog`, unless `[policy] unknown_tools` is `sensitive` (evaluated as `sensitive = true`) or `allow` (evaluated as neither, so a `forbid` keyed on `sensitive` silently skips it). Register every tool the server exposes (MCP `tools/list` is the natural source).
 2. **Schema generation.** Each tool becomes a declared action and each `inputs` entry a typed, optional attribute of `context.input`. Policies are validated against this schema at load time, so a typo in an argument name or a comparison of a string to a number fails the load instead of misbehaving on a call. A policy that names `Action::"x"` validates only if some catalog entry has a tool `x`. Argument types are `string`, `long`, `bool`, or `{ set = "string" }`.
 
 ### User attributes
@@ -144,7 +144,7 @@ forbid(principal in Agent::"untrusted-summarizer", action, resource)
 when { !resource.readonly };
 ```
 
-**Warning: agent identity is only as strong as actor authentication.** The agent ids in a chain are whatever the token exchange recorded. Today the `actor` of an exchange is asserted by the caller, not proven (task board SR-10), so a token holder can exchange under any name it likes. A `permit` that trusts an agent id grants to anyone who can claim it, and a `forbid` on an id can be dodged by exchanging under a different one. Until actor authentication is verified, treat agent-keyed rules as defence in depth. Put the real boundary in things the holder cannot change: the capabilities in the token (attenuation only narrows), attributes of the originating user, and chain depth.
+**Warning: agent identity is only as strong as actor authentication.** The agent ids in a chain are whatever the token exchange recorded. With `[token] require_actor_auth = true` (the default) an exchange must authenticate as its `actor` with that agent's `[[agents]]` client secret, so an id in the chain means "someone holding that agent's secret". That is a shared secret, not a workload identity (`actor_token` is not verified yet), and an operator who turns the setting off makes the `actor` an assertion again. Treat agent-keyed rules as defence in depth. Put the real boundary in things the holder cannot change: the capabilities in the token (attenuation only narrows), attributes of the originating user, and chain depth.
 
 ## Testing policies
 
@@ -158,6 +158,7 @@ A test file is YAML. Each case says who asks, through which chain, for what, and
 policies: ./policy.cedar            # relative to this file; optional (no policies means deny all)
 catalog: ./config.toml              # a server config's [policy.catalog] (and catalog_path), a .json
                                     # catalog, or an inline map as in the server config
+unknown_tools: deny                 # optional; default: the config's [policy] unknown_tools, else deny
 now: 1760000000                     # optional; evaluation time, unix seconds
 cases:
   - name: coder may read public docs

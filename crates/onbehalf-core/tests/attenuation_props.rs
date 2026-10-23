@@ -394,6 +394,31 @@ proptest! {
         prop_assert!(tampered.validate_at(t0(), MAX_DEPTH).is_err());
     }
 
+    /// 5d (SR-16). Copying one hop's lease or agent id onto another hop is rejected, and so is
+    /// moving a hop's `issued_at` before its parent's.
+    #[test]
+    fn repeated_ids_and_reordered_issuance_are_rejected(
+        chain in chain(),
+        a in any::<prop::sample::Index>(),
+        b in any::<prop::sample::Index>(),
+        back_secs in 1i64..100_000,
+    ) {
+        prop_assume!(chain.hops.len() > 1);
+        let n = chain.hops.len();
+        let (i, j) = (a.index(n), b.index(n));
+        prop_assume!(i != j);
+        let mut lease = chain.clone();
+        lease.hops[j].lease = chain.hops[i].lease.clone();
+        prop_assert!(lease.validate_at(t0(), MAX_DEPTH).is_err());
+        let mut agent = chain.clone();
+        agent.hops[j].agent = chain.hops[i].agent.clone();
+        prop_assert!(agent.validate_at(t0(), MAX_DEPTH).is_err());
+        let k = 1 + a.index(n - 1);
+        let mut early = chain.clone();
+        early.hops[k].issued_at = chain.hops[k - 1].issued_at - Duration::seconds(back_secs);
+        prop_assert!(early.validate_at(t0(), MAX_DEPTH).is_err());
+    }
+
     /// 6. attenuate succeeds iff the request is covered and non-empty.
     #[test]
     fn attenuate_iff_covered_and_nonempty(

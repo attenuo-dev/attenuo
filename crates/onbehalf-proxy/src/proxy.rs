@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
@@ -26,10 +27,15 @@ use crate::jsonrpc::{
     CODE_INVALID_PARAMS, CODE_INVALID_REQUEST, CODE_PARSE_ERROR, CODE_UNAUTHORIZED,
     CODE_UNKNOWN_SERVER, CODE_UPSTREAM,
 };
+use crate::session::{session_tag, SessionCheck, SessionOwner, SessionRegistry};
 
 /// Response header carrying the decision record id(s) of every `tools/call` in the request,
 /// comma separated in request order.
 pub const DECISION_ID_HEADER: &str = "x-onbehalf-decision-id";
+
+/// Reason code (audit and JSON-RPC `data.reason`) for a request carrying an `Mcp-Session-Id`
+/// bound to another principal (SR-11).
+pub const REASON_SESSION_MISMATCH: &str = "session_mismatch";
 
 const HEADER_MCP_SESSION_ID: &str = "mcp-session-id";
 
@@ -56,6 +62,7 @@ struct AppState {
     upstreams: HashMap<String, String>,
     client: reqwest::Client,
     authorizer: Arc<dyn Authorizer>,
+    sessions: SessionRegistry,
 }
 
 /// Build the proxy router. Upstreams are mounted at `/mcp/{name}`.
@@ -69,6 +76,7 @@ pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
         upstreams,
         client: upstream_client(),
         authorizer,
+        sessions: SessionRegistry::default(),
     });
     Router::new()
         .route(
@@ -181,8 +189,82 @@ fn request_span(server: &str, chain: &DelegationChain, session_id: Option<&str>)
         agent = %agent,
         subject = %chain.originating_user.subject,
         chain_depth = chain.depth(),
-        session_id = session_id.unwrap_or(""),
+        // Session ids grant access to a session: log a hash prefix only (SR-11).
+        session = %session_id.map(session_tag).unwrap_or_default(),
     )
+}
+
+/// The SR-11 session check, made after authentication. `Ok` carries the caller's
+/// [`SessionOwner`], to bind a session id the upstream assigns in its response. A session id
+/// bound to someone else is refused with `403` (`session_mismatch`, recorded through
+/// [`Authorizer::record_rejection`]); one the proxy does not know gets `404`, the MCP signal
+/// to start a new session.
+async fn session_gate(
+    state: &AppState,
+    server: &str,
+    method: &Method,
+    chain: &DelegationChain,
+    session_id: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<Option<SessionOwner>, Response> {
+    let owner = SessionOwner::of(chain);
+    let Some(sid) = session_id else {
+        return Ok(owner);
+    };
+    let check = match &owner {
+        Some(o) => state.sessions.check(sid, o, Instant::now()),
+        None => SessionCheck::Mismatch,
+    };
+    match check {
+        SessionCheck::Owned => Ok(owner),
+        SessionCheck::Unknown => {
+            tracing::warn!(session = %session_tag(sid), "request rejected: unknown session");
+            let body = error_response(
+                Value::Null,
+                CODE_INVALID_REQUEST,
+                "onbehalf: session not found; start a new session",
+                None,
+            );
+            Err(json_response(StatusCode::NOT_FOUND, &body))
+        }
+        SessionCheck::Mismatch => {
+            let tag = session_tag(sid);
+            let call = ToolCall::new(server, format!("http.{method}"), serde_json::json!({}))
+                .with_session(tag.clone());
+            let id = state
+                .authorizer
+                .record_rejection(chain, &call, REASON_SESSION_MISMATCH, now)
+                .await;
+            tracing::warn!(
+                session = %tag,
+                decision_id = %id,
+                "request rejected: session belongs to another principal"
+            );
+            let body = denied_response(Value::Null, REASON_SESSION_MISMATCH, id);
+            let mut resp = json_response(StatusCode::FORBIDDEN, &body);
+            add_decision_header(&mut resp, &[id]);
+            Err(resp)
+        }
+    }
+}
+
+/// Bind the session id a successful upstream response assigns to the caller. A session id
+/// already bound to another principal is removed from the response.
+fn adopt_session(state: &AppState, owner: Option<&SessionOwner>, response: &mut Response) {
+    if !response.status().is_success() {
+        return;
+    }
+    let Some(sid) = header_str(response.headers(), HEADER_MCP_SESSION_ID).map(str::to_owned) else {
+        return;
+    };
+    let bound = owner.is_some_and(|o| state.sessions.bind(&sid, o, Instant::now()));
+    if !bound {
+        tracing::warn!(
+            session = %session_tag(&sid),
+            "upstream assigned a session id bound to another principal; header removed"
+        );
+        response.headers_mut().remove(HEADER_MCP_SESSION_ID);
+    }
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -225,16 +307,29 @@ async fn handle_passthrough(
     let session_id = header_str(&headers, HEADER_MCP_SESSION_ID).map(str::to_owned);
     let span = request_span(&server, &chain, session_id.as_deref());
     async move {
+        let owner = match session_gate(&state, &server, &method, &chain, session_id.as_deref(), now)
+            .await
+        {
+            Ok(o) => o,
+            Err(resp) => return resp,
+        };
         tracing::debug!(%method, "forwarding transparently");
+        let is_delete = method == Method::DELETE;
         let req = state
             .client
             .request(method, &upstream)
             .headers(forward_headers(&headers, FORWARD_REQUEST_HEADERS))
             .body(body);
-        match req.send().await {
+        let mut response = match req.send().await {
             Ok(resp) => stream_response(resp, None, &[]),
-            Err(e) => upstream_error(e),
+            Err(e) => return upstream_error(e),
+        };
+        match (is_delete, session_id.as_deref()) {
+            (true, Some(sid)) if response.status().is_success() => state.sessions.remove(sid),
+            (true, _) => {}
+            (false, _) => adopt_session(&state, owner.as_ref(), &mut response),
         }
+        response
     }
     .instrument(span)
     .await
@@ -287,16 +382,34 @@ async fn handle_post(
     };
     let session_id = header_str(&headers, HEADER_MCP_SESSION_ID).map(str::to_owned);
     let span = request_span(&server, &chain, session_id.as_deref());
-    handle_post_inner(
-        &state,
-        upstream,
-        &server,
-        &chain,
-        session_id.as_deref(),
-        &headers,
-        body,
-        now,
-    )
+    async {
+        let owner = match session_gate(
+            &state,
+            &server,
+            &Method::POST,
+            &chain,
+            session_id.as_deref(),
+            now,
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(resp) => return resp,
+        };
+        let mut response = handle_post_inner(
+            &state,
+            upstream,
+            &server,
+            &chain,
+            session_id.as_deref(),
+            &headers,
+            body,
+            now,
+        )
+        .await;
+        adopt_session(&state, owner.as_ref(), &mut response);
+        response
+    }
     .instrument(span)
     .await
 }
@@ -551,7 +664,8 @@ async fn screen_message(
 
     let mut call = ToolCall::new(server, tool.clone(), arguments);
     if let Some(sid) = session_id {
-        call = call.with_session(sid);
+        // Policy and the audit log see a stable hash prefix, not the session id (SR-11).
+        call = call.with_session(session_tag(sid));
     }
     let verdict = state.authorizer.authorize(chain, &call, now).await;
     tracing::info!(

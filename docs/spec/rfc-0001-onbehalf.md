@@ -82,7 +82,7 @@ These parts of the original design have no counterpart in the code. They are tra
 
 - **`evidence`** on the originating user (type, `jti` and digest of the ID token or ID-JAG it came from), so audit can show how the user was verified. Hop 0 is minted from an IdP credential (section 4), but the credential itself is not referenced from the token; `ou_sig` is onbehalf's own signature. TODO: [board](../tasks/board.md).
 - **`chain_id`**, a stable id for a whole run, for revoking by chain and correlating audit. TODO: [board](../tasks/board.md).
-- **`may_act`** and a verified `actor_token` (for example a SPIFFE JWT-SVID). In v0 the actor is a name the caller asserts.
+- **`may_act`** and a verified `actor_token` (for example a SPIFFE JWT-SVID). In v0 the actor authenticates with client credentials from `[[agents]]` (`[token] require_actor_auth`, on by default): the caller of an exchange must prove it is the `actor` it names, and an agent id may appear only once in a chain. A workload credential (`actor_token`) would replace the shared secret.
 - **Numeric and time-range constraints.**
 
 ## 4. Token exchange
@@ -110,7 +110,7 @@ A delegation token is a compact JWS, EdDSA (Ed25519), with header `typ` = `onbeh
 
 **Root issuance** (`Issuer::issue_root`) builds the chain, signs the user block and mints. The server calls it only after verifying a user credential (hop 0):
 
-**Hop 0** is a `POST /token` exchange whose subject token is a user credential from a configured IdP: an OIDC ID token (`subject_token_type` `urn:ietf:params:oauth:token-type:id_token`) or an ID-JAG (`urn:ietf:params:oauth:token-type:id-jag`, header `typ` `oauth-id-jag+jwt`, draft -04). The agent authenticates with its client credentials and becomes the root hop's agent. The credential is verified against the IdP's JWKS (`kid`, allowed asymmetric `alg`, `iss`, `aud`, `exp`, `iat`, `sub`; `nonce` ignored), the user block is built from `sub`, `iss`, `auth_time` and selected claims plus a derived `mfa`, and the requested capabilities are attenuated against the configured root grant. Details and error codes: [design/server.md](../design/server.md#hop-0-intake-from-an-identity-provider).
+**Hop 0** is a `POST /token` exchange whose subject token is a user credential from a configured IdP: an OIDC ID token (`subject_token_type` `urn:ietf:params:oauth:token-type:id_token`) or an ID-JAG (`urn:ietf:params:oauth:token-type:id-jag`, header `typ` `oauth-id-jag+jwt`, draft -04). The agent authenticates with its client credentials and becomes the root hop's agent. The credential is verified against the IdP's JWKS (`kid`, allowed asymmetric `alg`, `iss`, `aud`, `exp`, `iat`, `sub`; `nonce` ignored), the user block is built from `sub`, `iss`, `auth_time` and selected claims plus a derived `mfa`, and the requested capabilities are attenuated against the configured root grant. Each credential mints at most one root token (an in-memory replay cache keyed by `iss` and `jti`, or the credential's hash), and the root token never outlives the credential's `exp`. Details and error codes: [design/server.md](../design/server.md#hop-0-intake-from-an-identity-provider).
 
 **Exchange request** (JSON body; RFC 8693 with RFC 9396 `authorization_details`):
 
@@ -143,7 +143,7 @@ Any other `grant_type` or `subject_token_type` is rejected. Capabilities from ev
 }
 ```
 
-**Exchange** (`Issuer::exchange`) verifies the parent at `now`, then calls `DelegationChain::extend`: the requested set must be non-empty and covered per section 3, the new depth must not exceed `max_depth`, and the child's expiry is `min(now + ttl, parent.expires_at)` (default TTL from issuer config). The child gets a fresh lease and `jti`, and the parent's `ou_sig`.
+**Exchange** (`Issuer::exchange`) verifies the parent at `now`, then calls `DelegationChain::extend`: the requested set must be non-empty and covered per section 3, the new depth must not exceed `max_depth`, and the child's expiry is `min(now + ttl, parent.expires_at)` (default TTL from issuer config). The child gets a fresh lease and `jti`, and the parent's `ou_sig`. The server lets a parent token delegate to a given actor once (replay cache keyed by parent `jti` and actor, until the parent's `exp`).
 
 **Verification order** (`Verifier::verify`; `now` is supplied by the caller, never read from the system clock):
 1. EdDSA signature and algorithm;
@@ -157,7 +157,7 @@ Any other `grant_type` or `subject_token_type` is rejected. Capabilities from ev
 
 ## 5. Per-call authorization
 
-The shape below is the design target. The implemented wire shape is in `onbehalf-policy::authzen`: `subject.properties.chain` carries the whole `DelegationChain`, `context.input` the call arguments, and `context.session_id` the session. The Cedar context exposes `input`, `originating_user`, `chain{depth, agents, root_agent, leases}`, `session_id` and `now_unix`. `chain_id` and `lease_state` below are proposed (section 3.1, section 6).
+The shape below is the design target. The implemented wire shape is in `onbehalf-policy::authzen`: `subject.properties.chain` carries the whole `DelegationChain`, `context.input` the call arguments, and `context.session_id` the session. The Cedar context exposes `input`, `originating_user`, `chain{depth, agents, root_agent, leases}`, `session_id` and `now_unix`. `chain_id` and `lease_state` below are proposed (section 3.1, section 6). A call for a `(server, tool)` pair missing from the tool catalog is denied with `tool_not_in_catalog` unless the deployment sets `[policy] unknown_tools` to `"sensitive"` or `"allow"`. The endpoint requires the delegation token as bearer, and the chain is taken from it. A deployment may set `[authzen] allow_unsigned_chain = true` to let authenticated PEPs (`[[peps]]`) send the chain in the body instead; every hop of such a chain must then equal what the server issued for its lease (each lease is bound to the digest of the chain prefix ending at its hop), otherwise the request is refused with `chain_not_issued`.
 
 The proxy intercepts MCP `tools/call` over streamable HTTP, validates the bearer token, and builds an AuthZEN-shaped request ([Cerbos](https://www.cerbos.dev/blog/mcp-authorization-standards)):
 
@@ -242,7 +242,7 @@ Every record names the agent and the originating user separately, the attributio
 
 | Property | Enforced by | Tests | Gap |
 |---|---|---|---|
-| P1 | `onbehalf-token` (`Verifier::verify`, `ou_sig`); `onbehalf-server` `idp` (hop-0 ID token / ID-JAG verification) | `token_exchange.rs`: `originating_user_tamper_is_caught_by_ou_sig`, `inconsistent_sub_or_act_is_rejected`; server `oidc.rs`: `valid_id_token_yields_root_token_for_the_verified_user`, `bad_id_tokens_are_rejected_with_stable_codes`, `id_jag_yields_root_token_and_typ_is_enforced` | No `evidence` linking the token to the credential; no `jti` replay cache for ID tokens |
+| P1 | `onbehalf-token` (`Verifier::verify`, `ou_sig`); `onbehalf-server` `idp` (hop-0 ID token / ID-JAG verification) | `token_exchange.rs`: `originating_user_tamper_is_caught_by_ou_sig`, `inconsistent_sub_or_act_is_rejected`; server `oidc.rs`: `valid_id_token_yields_root_token_for_the_verified_user`, `bad_id_tokens_are_rejected_with_stable_codes`, `id_jag_yields_root_token_and_typ_is_enforced` | No `evidence` linking the token to the credential; the credential replay cache is in memory, per process |
 | P2 | `onbehalf-core` (`Capability::covers`, `CapabilitySet::attenuate`, `DelegationChain::extend`/`validate_at`), `onbehalf-token` (`Issuer::exchange`) | core: `set_attenuation_only_narrows`, `union_coverage_is_rejected_conservatively`, `extend_cannot_widen`, `expiry_and_depth`; token: `exchange_cannot_widen_capabilities`, `exchange_ttl_is_clamped_to_parent_expiry`, `max_depth_exceeded_is_rejected` | No proptest suite for `covers` yet |
 | P3 | `onbehalf-policy` (capability stage, then Cedar), `onbehalf-proxy` | policy `engine.rs`: `capability_stage_denies_before_cedar`, `create_issue_argument_rule_allows_acme_and_denies_others`, `github_mcp_over_privileged_token_is_narrowed_by_policy`; proxy: `denied_tools_call_returns_32003_and_never_reaches_upstream`, `github_leak_scenario_repo_prefix_constraint` | Proxy tests use the stub authorizer, not the token verifier |
 | P4 | `onbehalf-audit` (hash chain, `LeaseStore`) | `audit.rs`: `tamper_every_byte_of_record_json_is_detected`, `delete_middle_row_is_detected`, `reordered_rows_are_detected`; `leases.rs`: `revoke_cascades_to_descendants_only`, `renew_rejects_unknown_and_revoked`; server `e2e.rs`: `unrenewed_lease_denies_even_though_the_jwt_is_valid`, `renew_never_goes_beyond_the_parent_lease` | Revocation takes effect on the next request (no lease cache); lease state is not yet pushed to external PEPs |

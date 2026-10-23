@@ -29,6 +29,8 @@ The server is wiring. It holds no authorization logic of its own: tokens come fr
 
 Lease and audit failures fail closed. Revocation reaches the next request: there is no lease cache in v0, so the TTL-bounded cache in RFC-0001 §6 is a later optimisation. Requests that carry no per-call decision (`tools/list`, `initialize`, `ping`, the other allowlisted methods, `GET`/`DELETE` session requests) run the same lease check through `Authorizer::check_active` and get HTTP 401 (JSON-RPC `-32001`, message ending in the reason, for example `lease inactive: lease_revoked`) instead of a decision. Those checks are not audited, since no call was decided.
 
+`Mcp-Session-Id` is bound to the principal it was assigned to (SR-11). When an upstream response carries a session id, the proxy records it against the caller's originating user (subject and issuer) and root lease, in an in-memory, bounded registry with a one-hour idle TTL. Every agent of one delegation run shares the root lease and so the session; another user, or another run of the same user, does not. A `POST`, `GET` (listen stream) or `DELETE` carrying a session id bound to someone else gets HTTP 403, JSON-RPC `-32003` with reason `session_mismatch`, and a `deny` record (tool `http.POST`, `http.GET` or `http.DELETE`) through `Authorizer::record_rejection`. An unknown or expired id gets 404, which MCP clients answer by starting a new session; a proxy restart therefore ends every session. A successful `DELETE` ends the binding, and a response that names a session id bound to another principal has the header removed. Logs, policy context and decision records carry a 12-hex-digit SHA-256 prefix of the id instead of the id.
+
 ## MCP method coverage
 
 The proxy turns every request that can read data or cause an effect into a `ToolCall` and sends it through `Pipeline::decide`, so capabilities, Cedar policy and the audit log treat a resource read like a tool call. `server` is always the `/mcp/{server}` name.
@@ -45,6 +47,8 @@ The proxy turns every request that can read data or cause an effect into a `Tool
 Forwarded after authentication and the lease check, with no decision: `initialize`, `ping`, `tools/list` (response filtered), `resources/list`, `resources/templates/list`, `prompts/list`, `logging/setLevel`, `notifications/*`, and messages without a `method` (client replies to server requests). The default is deny: an unknown method such as `sampling/createMessage` or `resources/unsubscribe` passes only if a capability and the policy permit a tool named after it. A request missing `params.name` or `params.uri` where the mapping needs one is answered with `-32602` and is not forwarded.
 
 A capability grants these like a tool: `github:resources/read` with constraint `uri` prefix `file:///public/` allows reads under that prefix; `github:prompts/get` allows prompts. A broad `github:*` capability covers all of them, which is a reason to prefer narrow grants. The Cedar action is the method name, so catalog entries and policies for `resources/read` use that string. The `resources/list` and `prompts/list` results are not filtered (v0).
+
+Every decided call also has to name a `(server, tool)` pair that is in the tool catalog. `[policy] unknown_tools` sets what happens otherwise: `"deny"` (the default) denies after the capability stage with reason `tool_not_in_catalog`, recorded in the audit log like any decision; `"sensitive"` evaluates the call with `resource.sensitive = true`, so MFA-style `forbid` rules apply; `"allow"` evaluates it with default attributes, which is how v0 behaved and lets `forbid ... when { resource.sensitive }` fail open (SR-12). Methods decided as tools (`resources/read`, `prompts/get` and the rest) need catalog entries under their method name too. Server names must not contain `/` (`Tool::"<server>/<tool>"` would be ambiguous); the server refuses to start when an upstream, catalog entry or root grant uses one.
 
 ```mermaid
 sequenceDiagram
@@ -85,7 +89,7 @@ sequenceDiagram
     end
 ```
 
-`POST /access/v1/evaluation` takes the same path from step 3 onward. With a bearer token, the chain comes from the verified token (a chain also present in the body must match it). Without one, the chain in `subject.properties.chain` is taken as asserted by the calling PEP, checked structurally, and still has to pass the lease check, so a chain this server never issued is denied with `lease_unknown`. The body chain carries no signatures, so the endpoint should only be reachable by trusted PEPs unless they send the bearer.
+`POST /access/v1/evaluation` takes the same path from step 3 onward. By default it requires a bearer token, and the chain comes from the verified token (a chain also present in the body must match it); without a bearer the answer is 401. With `[authzen] allow_unsigned_chain = true`, a request without a bearer may carry the chain in `subject.properties.chain` if it authenticates as a `[[peps]]` entry (HTTP Basic, or `pep_id`/`pep_secret`). Such a chain is checked structurally (`validate_at`) and then hop by hop against what was issued: at issuance every lease is bound to the digest of the chain up to its hop (`LeaseStore::bind`), and each hop of the body chain must reproduce that digest. A mismatch is a 403 `chain_not_issued` and writes no audit record, so lease ids, which every token prints, are not enough to forge a user, attributes, capabilities or an agent (SR-08).
 
 ## Token issuance
 
@@ -99,16 +103,22 @@ sequenceDiagram
     participant I as Issuer
     participant G as AuditSink
 
-    C->>T: RFC 8693 exchange (form or JSON): subject_token, actor, authorization_details
+    C->>T: RFC 8693 exchange (form or JSON): subject_token, actor, authorization_details, client credentials
+    T->>T: authenticate client against [[agents]]; client id must equal actor
+    alt no or wrong credentials / other actor
+        T-->>C: 401 invalid_client, or 400 invalid_request actor_mismatch
+    end
     T->>V: verify(subject_token)
     V-->>T: parent chain (or 400 invalid_grant)
     T->>L: check_all(parent leases)
     alt parent lease inactive
         T-->>C: 400 invalid_grant "subject token cannot delegate: lease_revoked"
     end
+    T->>T: actor already in the parent chain? 400 invalid_request duplicate_actor
     T->>I: ExchangeRequest::execute (attenuation, depth, expiry clamp)
     I-->>T: child token (or 400 invalid_scope / invalid_grant)
-    T->>L: register(child lease, parent = parent's last lease, expires_at)
+    T->>T: replay cache: (parent jti, actor) used before? 400 invalid_grant replayed, child dropped
+    T->>L: register(child lease, parent = parent's last lease, expires_at), bind(child lease, chain digest)
     T->>G: append(allow, token_issued, onbehalf / token.exchange)
     T-->>C: {access_token, issued_token_type, token_type, expires_in, lease}
 ```
@@ -140,9 +150,12 @@ The root token of every chain is minted at `POST /token` from a user credential 
 4. **ID-JAG claims** (`idp::claims::map_id_jag`, the one place that depends on the draft's claim names): `client_id` is required and must be the authenticated agent.
 5. **Originating user** (`idp::claims::originating_user`): `subject` = `sub`, `issuer` = `iss`, `authenticated_at` = `auth_time`, else `iat`; `attributes` = the claims listed in `attribute_claims` (default `email`, `groups`, `amr`) plus `mfa: bool`, true when `amr` contains `mfa`, `otp`, `hwk` or `swk` (RFC 8176 values for a second factor or a key; `pwd`, `sms` and the rest do not count on their own).
 6. **Root grant.** The `[[root_grants]]` entry for (issuer, agent), preferring one whose `subject` equals `sub`, is the ceiling; `CapabilitySet::attenuate(requested)` must succeed. No entry: `invalid_scope` / `no_root_grant`. Wider than the entry: `invalid_scope` / `scope_exceeds_grant`.
-7. **Issue, register, audit**: `Issuer::issue_root`, a lease with no parent, and an audit record `token.root` / `token_issued`. If the audit append fails the lease is revoked and the request fails.
+7. **Lifetime and one-time use.** The root token's TTL (requested, else the issuer default) is capped at the credential's remaining lifetime, `exp - now`; a credential inside the clock skew after its `exp` has none left and gets `invalid_grant` / `credential_expired`. Once the root token is minted, the credential is recorded in the replay cache (module `replay`) under (`iss`, `jti`), or the SHA-256 of the credential when it has no `jti`, until `exp` plus the skew; a request refused earlier does not use the credential up. A second presentation, by any agent, is `invalid_grant` / `replayed`, and the token minted for it is dropped before its lease is registered.
+8. **Issue, register, audit**: `Issuer::issue_root`, a lease with no parent, and an audit record `token.root` / `token_issued`. If the audit append fails the lease is revoked and the request fails.
 
-`nonce` is ignored on purpose: it binds an ID token to the browser session that requested it, and the agent presenting it here is not that session. What stops someone who has only a leaked ID token is step 1; what limits an agent that has one is step 6.
+`nonce` is ignored on purpose: it binds an ID token to the browser session that requested it, and the agent presenting it here is not that session. What stops someone who has only a leaked ID token is step 1; what limits an agent that has one is steps 6 and 7.
+
+The replay cache also covers exchanges: a parent token delegates to a given actor once, keyed by (parent `jti`, actor) until the parent's `exp`. Delegating to another agent is unaffected; a holder that wants a child to live longer renews its lease instead of exchanging again. The cache is in memory and bounded (100 000 live entries): expired entries are dropped first, and when it is still full, issuance fails closed with `503 temporarily_unavailable` / `replay_cache_full`. It is per process, so a restart, or a second replica, forgets what was used.
 
 ```mermaid
 sequenceDiagram
@@ -185,10 +198,10 @@ One cache per IdP. The JWKS location is `jwks_url`, or `jwks_uri` from `<issuer>
 | `error` | Status | `error_description` |
 |---|---|---|
 | `invalid_client` | 401 | `client_auth_missing`, `client_authentication_failed`, `malformed_client_auth`, `no_agents_configured` |
-| `invalid_request` | 400 | `actor_mismatch`, `multiple_client_auth`, `no_capabilities_requested`, `unsupported_token_type`, `malformed_request` |
-| `invalid_grant` | 400 | `malformed_token`, `typ_mismatch`, `untrusted_issuer`, `unsupported_alg`, `missing_kid`, `unknown_kid`, `bad_signature`, `audience_mismatch`, `expired`, `not_yet_valid`, `missing_claim`, `client_id_mismatch` |
+| `invalid_request` | 400 | `actor_mismatch`, `duplicate_actor` (exchange), `multiple_client_auth`, `no_capabilities_requested`, `unsupported_token_type`, `malformed_request` |
+| `invalid_grant` | 400 | `malformed_token`, `typ_mismatch`, `untrusted_issuer`, `unsupported_alg`, `missing_kid`, `unknown_kid`, `bad_signature`, `audience_mismatch`, `expired`, `not_yet_valid`, `missing_claim`, `client_id_mismatch`, `credential_expired`, `replayed` (also for a repeated exchange) |
 | `invalid_scope` | 400 | `no_root_grant`, `scope_exceeds_grant` |
-| `temporarily_unavailable` | 503 | `jwks_unavailable` |
+| `temporarily_unavailable` | 503 | `jwks_unavailable`, `replay_cache_full` |
 
 These codes are stable; `detail` is prose and may change.
 
@@ -243,13 +256,12 @@ Non-MCP endpoints answer errors as `{"error": "<code>", "detail": "<text>"}` wit
 
 ## Known limits (v0)
 
-- Admin authentication is one static bearer.
+- Admin authentication is one static bearer (`[admin] token`, or `ONBEHALF_ADMIN_TOKEN`, which overrides it). Off a loopback `listen` address the server refuses to start when it is missing, shorter than 32 bytes or a published placeholder; on loopback it warns. Admin actions are audited with `originating_subject` = `admin`, no agents, server `onbehalf` and tool `admin.lease.revoke`, `admin.policies.reload` (a rejected policy file is recorded as `deny` / `policy_invalid`) or `admin.root_token` (next to the `token.root` issuance record).
 - Agents authenticate at hop 0 with a static client secret; no `private_key_jwt` or mTLS.
-- No `jti` replay cache: an ID token (or ID-JAG) can be exchanged again by the same agent until it expires, each time minting a new root.
-- The root token's lifetime is the server's TTL, not bounded by the ID token's `exp`.
+- The replay cache is in memory: it does not survive a restart and is not shared between replicas.
 - The user block does not record which credential it came from (`evidence`, RFC-0001 §3.1); the audit record's argument digest covers the credential type and IdP.
 - ID-JAG follows draft -04; claim mapping is isolated in `idp::claims::map_id_jag` for when the draft changes. The draft's `resource` and `scope` claims are not used.
-- The `actor` in an exchange is asserted, not authenticated (`actor_token` is not checked).
+- The `actor` of an exchange authenticates with its `[[agents]]` client secret (`[token] require_actor_auth`, on by default); `actor_token` is not used.
 - Key rotation is manual (edit the config, restart) but has an overlap: see `previous_key_paths` below.
 - SQLite calls run on the async worker threads; fine at demo load, to be moved to `spawn_blocking` or a pool.
 - No lease cache and no push channel: every request reads the registry, and external PEPs using the AuthZEN endpoint learn of revocation only by asking.

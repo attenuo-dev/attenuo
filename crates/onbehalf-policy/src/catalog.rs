@@ -108,10 +108,27 @@ impl ToolAttrs {
     }
 }
 
-/// Attributes for every known `(server, tool)` pair. Unknown tools get [`ToolAttrs::default`]
-/// (not read-only, not sensitive), which is the conservative choice for `permit` rules keyed
-/// on `readonly` and the permissive one for `forbid` rules keyed on `sensitive`. Register
-/// every tool a server exposes (MCP `tools/list` is the natural source).
+/// What the engine does with a `tools/call` for a `(server, tool)` pair that is not in the
+/// catalog. See [`PolicyEngineBuilder::with_unknown_tools`](crate::PolicyEngineBuilder::with_unknown_tools).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownTools {
+    /// Deny with reason `tool_not_in_catalog` (after the capability stage). The default: a
+    /// tool nobody classified cannot be reached by `forbid ... when { resource.sensitive }`
+    /// failing open (SR-12), and a renamed tool (`Delete_Repo`) is not a different, unlisted
+    /// tool that slips past rules keyed on the real name (SR-25).
+    #[default]
+    Deny,
+    /// Evaluate with `sensitive = true` (and `readonly = false`).
+    Sensitive,
+    /// Evaluate with [`ToolAttrs::default`] (not read-only, not sensitive). The behaviour
+    /// before SR-12: `forbid` rules keyed on `sensitive` do not apply.
+    Allow,
+}
+
+/// Attributes for every known `(server, tool)` pair. What happens to a call for a tool that is
+/// not here is set by [`UnknownTools`] (deny by default). Register every tool a server exposes
+/// (MCP `tools/list` is the natural source).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ToolCatalog {

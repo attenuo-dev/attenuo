@@ -38,6 +38,8 @@ from onbehalf import (
 
 SERVER = os.environ.get("ONBEHALF_SERVER", "http://127.0.0.1:8080")
 ADMIN_TOKEN = os.environ.get("ONBEHALF_ADMIN_TOKEN", "demo-admin-token")
+# The coder's [[agents]] secret in the demo config: an exchange authenticates as its actor.
+CODER_SECRET = os.environ.get("ONBEHALF_CODER_SECRET", "demo-coder-secret")
 # The agent id that the demo config (examples/github-leak-demo/config.toml) grants `github:*`.
 PLANNER_AGENT = "assistant"
 
@@ -85,6 +87,7 @@ def run(server: str = SERVER, admin_token: str = ADMIN_TOKEN) -> int:
             "coder",
             [Capability("github", "read_file", repo=Prefix("alice/public-"))],
             ttl_seconds=600,
+            client_secret=CODER_SECRET,
         )
         print(f"  chain: {' > '.join(coder_token.chain.agents)}  lease: {coder_token.lease}")
 

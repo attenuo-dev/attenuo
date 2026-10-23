@@ -15,9 +15,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 
-use super::{bearer_of, now};
+use super::{audit_admin, bearer_of, now, REASON_ADMIN_ACTION};
 use crate::error::ApiError;
 use crate::state::AppState;
+use onbehalf_core::Decision;
+use sha2::Digest;
 
 /// Largest page `GET /admin/audit` returns.
 pub const MAX_AUDIT_PAGE: usize = 1000;
@@ -85,12 +87,29 @@ pub async fn revoke_lease(
         .reason
         .unwrap_or_else(|| "revoked by admin".to_string());
     let lease = LeaseId::new(lease_id);
-    let revoked = state.leases.revoke(&lease, &reason, now())?;
+    let now = now();
+    let revoked = state.leases.revoke(&lease, &reason, now)?;
     state.metrics.leases_revoked(revoked);
     tracing::warn!(lease = %lease.0, reason = %reason, revoked, "lease revoked");
-    Ok(Json(
-        json!({ "lease_id": lease, "revoked": revoked, "reason": reason }),
-    ))
+    // The revocation stands even if it cannot be recorded: undoing it would be the unsafe
+    // direction. The response says whether it was audited.
+    let audit_id = audit_admin(
+        &state,
+        "admin.lease.revoke",
+        Decision::Allow,
+        REASON_ADMIN_ACTION,
+        vec![lease.clone()],
+        json!({ "lease": lease, "reason": reason, "revoked": revoked }),
+        now,
+    )
+    .inspect_err(|e| tracing::error!(error = %e.detail, "admin revoke was not audited"))
+    .ok();
+    Ok(Json(json!({
+        "lease_id": lease,
+        "revoked": revoked,
+        "reason": reason,
+        "audit_id": audit_id,
+    })))
 }
 
 /// `GET /admin/leases/{lease_id}`: the lease's registry row and whether it is active now.
@@ -173,18 +192,47 @@ pub async fn reload_policies(State(state): State<Arc<AppState>>) -> Result<Json<
         .policy()
         .write()
         .map_err(|_| ApiError::internal("policy engine lock poisoned"))?;
-    engine.reload_policies_str(&text).map_err(|e| {
-        ApiError::new(
+    let digest = hex::encode(sha2::Sha256::digest(text.as_bytes()));
+    let now = now();
+    if let Err(e) = engine.reload_policies_str(&text) {
+        drop(engine);
+        let _ = audit_admin(
+            &state,
+            "admin.policies.reload",
+            Decision::Deny,
+            "policy_invalid",
+            Vec::new(),
+            json!({ "path": path, "sha256": digest }),
+            now,
+        )
+        .inspect_err(|e| tracing::error!(error = %e.detail, "failed reload was not audited"));
+        return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "policy_invalid",
             e.to_string(),
-        )
-    })?;
+        ));
+    }
     let ids = engine.policy_ids();
     let warnings = engine.validation_warnings().to_vec();
     drop(engine);
     tracing::info!(policies = ?ids, "policies reloaded");
-    Ok(Json(json!({ "policy_ids": ids, "warnings": warnings })))
+    let audit_id = audit_admin(
+        &state,
+        "admin.policies.reload",
+        Decision::Allow,
+        REASON_ADMIN_ACTION,
+        Vec::new(),
+        json!({ "path": path, "sha256": digest, "policy_ids": ids }),
+        now,
+    )
+    .inspect_err(|e| tracing::error!(error = %e.detail, "policy reload was not audited"))
+    .ok();
+    Ok(Json(json!({
+        "policy_ids": ids,
+        "warnings": warnings,
+        "sha256": digest,
+        "audit_id": audit_id,
+    })))
 }
 
 #[cfg(test)]

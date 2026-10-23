@@ -83,4 +83,20 @@ pub trait Authorizer: Send + Sync {
         call: &ToolCall,
         now: OffsetDateTime,
     ) -> AuthDecision;
+
+    /// Record a request the proxy refused on its own, before any per-call decision (for
+    /// example `session_mismatch`, SR-11), and return the audit record's id. `call` describes
+    /// the HTTP request (`tool` = `http.POST`, `http.GET` or `http.DELETE`). Implementations
+    /// that keep an audit log must append a `deny` record; the default records nothing and
+    /// returns a fresh id.
+    async fn record_rejection(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        reason: &str,
+        now: OffsetDateTime,
+    ) -> Uuid {
+        let _ = (chain, call, reason, now);
+        Uuid::new_v4()
+    }
 }

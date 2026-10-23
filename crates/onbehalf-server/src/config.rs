@@ -9,13 +9,33 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use onbehalf_core::{Capability, CapabilitySet};
-use onbehalf_policy::{ToolAttrs, ToolCatalog};
+use onbehalf_policy::{ToolAttrs, ToolCatalog, UnknownTools};
 use onbehalf_proxy::UpstreamConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Environment variable that names the config file when `--config` is not given.
 pub const CONFIG_ENV: &str = "ONBEHALF_CONFIG";
+
+/// Environment variable that, when set, replaces `[admin] token` (so the secret need not be in
+/// the file). The CLI reads the same variable.
+pub const ADMIN_TOKEN_ENV: &str = "ONBEHALF_ADMIN_TOKEN";
+
+/// Minimum length of `[admin] token` outside loopback.
+pub const MIN_ADMIN_TOKEN_LEN: usize = 32;
+
+/// Admin tokens that have appeared in examples and docs. Refused outside loopback whatever
+/// their length.
+pub const PLACEHOLDER_ADMIN_TOKENS: &[&str] = &[
+    "dev-admin-token-change-me",
+    "demo-admin-token",
+    "test-admin-token",
+    "change-me",
+    "changeme",
+    "admin",
+    "secret",
+    "password",
+];
 
 /// The whole configuration file.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -49,7 +69,55 @@ pub struct Config {
     pub dev: DevSection,
     #[serde(default)]
     pub metrics: MetricsSection,
+    #[serde(default)]
+    pub authzen: AuthzenSection,
+    #[serde(default)]
+    pub token: TokenSection,
+    /// Policy enforcement points allowed to send unsigned chains to the AuthZEN endpoint when
+    /// `[authzen] allow_unsigned_chain = true`. Same shape as `[[agents]]`.
+    #[serde(default)]
+    pub peps: Vec<PepConfig>,
 }
+
+/// `[authzen]`
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthzenSection {
+    /// Accept `subject.properties.chain` from the request body when there is no bearer token.
+    /// Default `false`: `POST /access/v1/evaluation` requires `Authorization: Bearer <onbehalf
+    /// token>`. When `true`, a body-only request must also authenticate as a `[[peps]]` entry
+    /// (HTTP Basic, or `pep_id` / `pep_secret` in the body), and every hop of the body chain
+    /// must match what this server issued for its lease.
+    #[serde(default)]
+    pub allow_unsigned_chain: bool,
+}
+
+/// `[token]`: the `POST /token` exchange endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenSection {
+    /// Require the caller of an exchange (hop n to n+1) to authenticate as the `actor` it
+    /// names, with `[[agents]]` client credentials. Default `true`. When `false` the actor is
+    /// asserted, not authenticated (the server logs a warning at startup), though credentials
+    /// that are presented are still checked.
+    #[serde(default = "default_true")]
+    pub require_actor_auth: bool,
+}
+
+impl Default for TokenSection {
+    fn default() -> Self {
+        Self {
+            require_actor_auth: true,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// One `[[peps]]` entry: `{ id, secret_sha256 }`, as for [`AgentConfig`].
+pub type PepConfig = AgentConfig;
 
 /// `[server]`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +227,12 @@ pub struct PolicySection {
     /// policy that tests an attribute fails validation instead of silently never matching.
     #[serde(default)]
     pub user_attributes: BTreeMap<String, String>,
+    /// What a `tools/call` for a `(server, tool)` pair missing from the catalog gets:
+    /// `"deny"` (default; reason `tool_not_in_catalog`, audited like any decision),
+    /// `"sensitive"` (evaluated with `resource.sensitive = true`) or `"allow"` (evaluated with
+    /// default attributes, so `forbid ... when { resource.sensitive }` does not apply).
+    #[serde(default)]
+    pub unknown_tools: UnknownTools,
 }
 
 impl PolicySection {
@@ -212,6 +286,10 @@ fn default_sqlite_path() -> String {
 pub struct AdminSection {
     /// Static bearer token for `/admin/*`. When unset, every admin endpoint answers 403.
     /// v0 only: replace with real operator authentication before exposing the server.
+    ///
+    /// Outside a loopback `listen` address the server refuses to start when this is missing,
+    /// shorter than [`MIN_ADMIN_TOKEN_LEN`] bytes or a known placeholder; on loopback it only
+    /// warns. Generate one with `openssl rand -hex 32`, or set [`ADMIN_TOKEN_ENV`].
     #[serde(default)]
     pub token: Option<String>,
 }
@@ -391,7 +469,94 @@ pub fn capability_set(specs: &[CapSpec]) -> Result<CapabilitySet, String> {
     specs.iter().map(CapSpec::to_capability).collect()
 }
 
+/// A server name used in `[[upstreams]]`, the catalog or capabilities must not be empty or
+/// contain `/`: the Cedar resource id is `"<server>/<tool>"`, which would be ambiguous (SR-13).
+pub fn check_server_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("server name must not be empty".into());
+    }
+    if name.contains('/') {
+        return Err(format!("server name `{name}` must not contain `/`"));
+    }
+    Ok(())
+}
+
 impl Config {
+    /// Reject server names that contain `/` (or are empty) in `[[upstreams]]`, the tool
+    /// catalog (inline and `catalog_path`) and `[[root_grants]]` capabilities.
+    pub fn check_server_names(&self) -> anyhow::Result<()> {
+        for u in &self.upstreams {
+            check_server_name(&u.name).map_err(|e| anyhow::anyhow!("[[upstreams]]: {e}"))?;
+        }
+        for ((server, _), _) in self.policy.load_catalog()?.iter() {
+            check_server_name(server).map_err(|e| anyhow::anyhow!("[policy] catalog: {e}"))?;
+        }
+        for g in &self.root_grants {
+            for cap in capability_set(&g.capabilities)
+                .map_err(|e| anyhow::anyhow!(e))?
+                .iter()
+            {
+                if cap.server != "*" {
+                    check_server_name(&cap.server)
+                        .map_err(|e| anyhow::anyhow!("[[root_grants]]: {e}"))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Problems with `[admin] token`, or `None` when it is acceptable.
+    pub fn admin_token_problem(&self) -> Option<String> {
+        let token = match self.admin.token.as_deref() {
+            None => return Some("[admin] token is not set".into()),
+            Some(t) => t,
+        };
+        if PLACEHOLDER_ADMIN_TOKENS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(token.trim()))
+        {
+            return Some("[admin] token is a published placeholder value".into());
+        }
+        if token.len() < MIN_ADMIN_TOKEN_LEN {
+            return Some(format!(
+                "[admin] token is shorter than {MIN_ADMIN_TOKEN_LEN} bytes"
+            ));
+        }
+        None
+    }
+
+    /// Refuse a weak or missing admin token unless the server listens on loopback only, where
+    /// it is a warning (SR-15).
+    pub fn check_admin_token(&self) -> anyhow::Result<()> {
+        let Some(problem) = self.admin_token_problem() else {
+            return Ok(());
+        };
+        if self.server.listen.ip().is_loopback() {
+            tracing::warn!(
+                listen = %self.server.listen,
+                "{problem}; accepted because the server only listens on loopback. Generate a \
+                 real one with `openssl rand -hex 32` before binding another address."
+            );
+            return Ok(());
+        }
+        anyhow::bail!(
+            "{problem}, and [server] listen = {} is not loopback. Set a random token of at \
+             least {MIN_ADMIN_TOKEN_LEN} bytes (`openssl rand -hex 32`) in [admin] token or \
+             {ADMIN_TOKEN_ENV}.",
+            self.server.listen
+        )
+    }
+
+    /// Apply environment overrides: [`ADMIN_TOKEN_ENV`] replaces `[admin] token`.
+    pub fn apply_env(&mut self) {
+        if let Some(t) = std::env::var(ADMIN_TOKEN_ENV)
+            .ok()
+            .filter(|t| !t.is_empty())
+        {
+            self.admin.token = Some(t);
+        }
+    }
+
     /// Parse TOML text.
     pub fn from_toml(text: &str) -> anyhow::Result<Self> {
         Ok(toml::from_str(text)?)
@@ -415,14 +580,18 @@ mod tests {
         let cfg = Config::from_toml(text).unwrap();
         assert_eq!(cfg.server.listen, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(cfg.upstreams.len(), 1);
-        assert!(cfg.admin.token.is_some());
+        assert!(
+            cfg.admin.token.is_none(),
+            "the example ships no admin token (SR-15)"
+        );
         let catalog = cfg.policy.load_catalog().unwrap();
         assert!(catalog.get("github", "read_file").readonly);
         assert!(!cfg.root_grants.is_empty());
         capability_set(&cfg.root_grants[0].capabilities).unwrap();
         assert_eq!(cfg.idps.len(), 1);
         assert_eq!(cfg.idps[0].allowed_algs, DEFAULT_IDP_ALGS);
-        assert_eq!(cfg.agents.len(), 1);
+        assert_eq!(cfg.agents.len(), 2);
+        assert!(cfg.token.require_actor_auth);
         assert!(!cfg.dev.allow_root_mint);
     }
 
@@ -456,6 +625,11 @@ mod tests {
             "the dev root mint is off by default"
         );
         assert!(cfg.idps.is_empty() && cfg.agents.is_empty());
+        assert!(
+            !cfg.authzen.allow_unsigned_chain && cfg.peps.is_empty(),
+            "unsigned AuthZEN chains are off by default"
+        );
+        assert!(cfg.token.require_actor_auth, "actor auth is on by default");
     }
 
     #[test]
@@ -476,6 +650,88 @@ mod tests {
         assert_eq!(pick("bob").unwrap().subject, None);
         assert!(RootGrant::find(&grants, "other", "planner", "alice").is_none());
         assert!(RootGrant::find(&grants, "idp", "coder", "alice").is_none());
+    }
+
+    #[test]
+    fn unknown_tools_defaults_to_deny_and_parses() {
+        assert_eq!(
+            Config::from_toml("").unwrap().policy.unknown_tools,
+            UnknownTools::Deny
+        );
+        for (text, want) in [
+            ("deny", UnknownTools::Deny),
+            ("sensitive", UnknownTools::Sensitive),
+            ("allow", UnknownTools::Allow),
+        ] {
+            let cfg =
+                Config::from_toml(&format!("[policy]\nunknown_tools = \"{text}\"\n")).unwrap();
+            assert_eq!(cfg.policy.unknown_tools, want);
+        }
+        assert!(Config::from_toml("[policy]\nunknown_tools = \"maybe\"\n").is_err());
+    }
+
+    /// SR-13: `/` in a server name makes `Tool::"<server>/<tool>"` ambiguous.
+    #[test]
+    fn slash_in_server_names_is_rejected() {
+        let upstream = "[[upstreams]]\nname = \"evil/x\"\nurl = \"http://127.0.0.1:1/mcp\"\n";
+        assert!(Config::from_toml(upstream)
+            .unwrap()
+            .check_server_names()
+            .is_err());
+        let catalog = "[policy.catalog.\"a/b\".read_file]\nreadonly = true\n";
+        assert!(Config::from_toml(catalog)
+            .unwrap()
+            .check_server_names()
+            .is_err());
+        let grant =
+            "[[root_grants]]\nissuer = \"i\"\nagent = \"a\"\ncapabilities = [\"a/b:read\"]\n";
+        assert!(Config::from_toml(grant)
+            .unwrap()
+            .check_server_names()
+            .is_err());
+        let ok = "[[upstreams]]\nname = \"github\"\nurl = \"http://127.0.0.1:1/mcp\"\n\
+                  [[root_grants]]\nissuer = \"i\"\nagent = \"a\"\ncapabilities = [\"*:*\"]\n";
+        Config::from_toml(ok).unwrap().check_server_names().unwrap();
+        assert!(check_server_name("").is_err());
+    }
+
+    /// SR-15: weak, placeholder or missing admin tokens are refused off loopback.
+    #[test]
+    fn admin_token_is_checked_outside_loopback() {
+        let strong = "0123456789abcdef0123456789abcdef";
+        let with = |listen: &str, token: Option<&str>| {
+            let mut cfg = Config::default();
+            cfg.server.listen = listen.parse().unwrap();
+            cfg.admin.token = token.map(Into::into);
+            cfg.check_admin_token()
+        };
+        for token in [
+            None,
+            Some("short"),
+            Some("dev-admin-token-change-me"),
+            Some("demo-admin-token"),
+        ] {
+            assert!(with("0.0.0.0:8080", token).is_err(), "{token:?}");
+            assert!(with("10.1.2.3:8080", token).is_err(), "{token:?}");
+            // Loopback only warns.
+            assert!(with("127.0.0.1:8080", token).is_ok(), "{token:?}");
+            assert!(with("[::1]:8080", token).is_ok(), "{token:?}");
+        }
+        assert!(with("0.0.0.0:8080", Some(strong)).is_ok());
+        let err = with("0.0.0.0:8080", Some("x")).unwrap_err().to_string();
+        assert!(err.contains("openssl rand -hex 32"), "{err}");
+        // The demo configs: loopback with a placeholder is fine, the docker variant (all
+        // interfaces) has no token in the file and needs ONBEHALF_ADMIN_TOKEN.
+        let demo = Config::from_toml(include_str!(
+            "../../../examples/github-leak-demo/config.toml"
+        ))
+        .unwrap();
+        demo.check_admin_token().unwrap();
+        let docker = Config::from_toml(include_str!(
+            "../../../examples/github-leak-demo/config.docker.toml"
+        ))
+        .unwrap();
+        assert!(docker.check_admin_token().is_err());
     }
 
     #[test]

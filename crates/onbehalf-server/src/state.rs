@@ -32,17 +32,27 @@ pub struct AppState {
     pub agents: Vec<AgentConfig>,
     /// `[dev] allow_root_mint`.
     pub dev_allow_root_mint: bool,
+    /// `[token] require_actor_auth`.
+    pub require_actor_auth: bool,
+    /// `[authzen] allow_unsigned_chain`.
+    pub authzen_allow_unsigned_chain: bool,
+    /// PEPs allowed to send unsigned chains (`[[peps]]`, validated).
+    pub peps: Vec<AgentConfig>,
     pub public_url: Option<String>,
     /// `[issuer] lease_interval_seconds`: lifetime of a lease after issuance or renewal.
     pub lease_interval: Duration,
     /// Precomputed `/.well-known/jwks.json` body.
     pub jwks: Value,
     pub metrics: Arc<Metrics>,
+    /// One-time use of IdP credentials and of (parent token, actor) exchanges.
+    pub replay: crate::replay::ReplayCache,
 }
 
 impl AppState {
     /// Load keys, policies and storage as the config says.
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
+        config.check_server_names()?;
+        config.check_admin_token()?;
         let issuer = load_issuer(config)?;
         let verifier = issuer.verifier();
         let jwks = crate::jwks::jwks_from_keys(&issuer.trusted_public_keys())?;
@@ -57,6 +67,30 @@ impl AppState {
         );
         let idps = IdpRegistry::from_config(&config.idps, &config.issuer.issuer)?;
         let agents = crate::idp::intake::validate_agents(&config.agents)?;
+        let peps = crate::clientauth::validate_clients("[[peps]]", &config.peps)?;
+        if !config.token.require_actor_auth {
+            tracing::warn!(
+                "[token] require_actor_auth = false: POST /token exchanges accept any `actor` \
+                 without authenticating it, so agent identity in policies and audit records is \
+                 only asserted"
+            );
+        } else if agents.is_empty() {
+            tracing::warn!(
+                "[[agents]] is empty and [token] require_actor_auth = true: every token \
+                 exchange will be rejected"
+            );
+        }
+        if config.authzen.allow_unsigned_chain {
+            if peps.is_empty() {
+                anyhow::bail!(
+                    "[authzen] allow_unsigned_chain = true needs at least one [[peps]] entry"
+                );
+            }
+            tracing::warn!(
+                "[authzen] allow_unsigned_chain = true: authenticated [[peps]] may send \
+                 delegation chains without the signed token"
+            );
+        }
         if config.dev.allow_root_mint {
             tracing::warn!(
                 "!!! [dev] allow_root_mint = true: POST /admin/root-token mints root tokens for \
@@ -81,10 +115,14 @@ impl AppState {
             idps,
             agents,
             dev_allow_root_mint: config.dev.allow_root_mint,
+            authzen_allow_unsigned_chain: config.authzen.allow_unsigned_chain,
+            require_actor_auth: config.token.require_actor_auth,
+            peps,
             public_url: config.server.public_url.clone(),
             lease_interval: lease_interval(config)?,
             jwks,
             metrics,
+            replay: crate::replay::ReplayCache::default(),
         })
     }
 
@@ -181,11 +219,25 @@ fn write_private_key(path: &Path, pem: &str) -> anyhow::Result<()> {
 
 fn build_engine(config: &Config) -> anyhow::Result<PolicyEngine> {
     let catalog = config.policy.load_catalog()?;
-    let mut builder = PolicyEngineBuilder::new().with_catalog(catalog);
+    let mut builder = PolicyEngineBuilder::new()
+        .with_catalog(catalog)
+        .with_unknown_tools(config.policy.unknown_tools);
     let user_attrs = onbehalf_policy::parse_user_attributes(&config.policy.user_attributes)
         .map_err(|e| anyhow::anyhow!("[policy] {e}"))?;
     for (name, ty) in user_attrs {
         builder = builder.with_user_attr(name, ty);
+    }
+    match config.policy.unknown_tools {
+        onbehalf_policy::UnknownTools::Deny => {}
+        onbehalf_policy::UnknownTools::Sensitive => tracing::info!(
+            "[policy] unknown_tools = \"sensitive\": tools missing from the catalog are \
+             evaluated as sensitive"
+        ),
+        onbehalf_policy::UnknownTools::Allow => tracing::warn!(
+            "[policy] unknown_tools = \"allow\": tools missing from the catalog are evaluated \
+             as neither readonly nor sensitive, so forbids keyed on resource.sensitive do not \
+             apply to them"
+        ),
     }
     let builder = match &config.policy.policies_path {
         Some(path) => builder.with_policies_file(path),
@@ -239,10 +291,7 @@ mod tests {
         let state = AppState::from_config(&cfg).unwrap();
         let ids = state.pipeline.policy().read().unwrap().policy_ids();
         assert!(ids.contains(&"permit_readonly_tools".to_string()));
-        assert_eq!(
-            state.admin_token.as_deref(),
-            Some("dev-admin-token-change-me")
-        );
+        assert_eq!(state.admin_token, None);
     }
 
     #[test]
@@ -262,6 +311,15 @@ mod tests {
         );
         cfg.issuer.lease_interval_seconds = 0;
         assert!(AppState::from_config(&cfg).is_err());
+    }
+
+    /// SR-08: unsigned AuthZEN chains cannot be switched on without a PEP to authenticate.
+    #[test]
+    fn unsigned_authzen_chains_need_peps() {
+        let mut cfg = Config::default();
+        cfg.authzen.allow_unsigned_chain = true;
+        let err = AppState::from_config(&cfg).err().unwrap();
+        assert!(err.to_string().contains("[[peps]]"), "{err}");
     }
 
     #[test]

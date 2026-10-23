@@ -136,13 +136,22 @@ def exchange_body(
     client_secret: str | None,
     subject_token_type: str | None,
 ) -> dict[str, Any]:
-    intake = client_id is not None or client_secret is not None
-    if intake and not (client_id and client_secret):
+    if client_id is not None and not client_secret:
         raise ValueError("client_id and client_secret go together")
+    if client_secret and client_id is None:
+        # A hop n+1 exchange authenticates as its actor.
+        client_id = actor
+    subject = bearer(subject_token)
+    if subject_token_type is None:
+        # Client credentials alone do not make this hop 0: the server also requires them, as
+        # the actor's, on a hop n+1 exchange. Hop 0 is an IdP credential, which is not an
+        # onbehalf delegation token.
+        intake = client_secret is not None and not is_delegation_token(subject_token)
+        subject_token_type = TYPE_ID_TOKEN if intake else TYPE_JWT
     body: dict[str, Any] = {
         "grant_type": TOKEN_EXCHANGE_GRANT,
-        "subject_token": bearer(subject_token),
-        "subject_token_type": subject_token_type or (TYPE_ID_TOKEN if intake else TYPE_JWT),
+        "subject_token": subject,
+        "subject_token_type": subject_token_type,
         "actor": actor,
         "authorization_details": [
             {
@@ -153,10 +162,21 @@ def exchange_body(
     }
     if ttl_seconds is not None:
         body["requested_ttl_seconds"] = int(ttl_seconds)
-    if intake:
+    if client_secret:
         body["client_id"] = client_id
         body["client_secret"] = client_secret
     return body
+
+
+def is_delegation_token(token: Token | str) -> bool:
+    """Does ``token`` decode as an onbehalf delegation token? Nothing is verified."""
+    if isinstance(token, Token):
+        return True
+    try:
+        decode_token(str(token))
+    except OnbehalfError:
+        return False
+    return True
 
 
 def token_from_response(body: Any) -> Token:

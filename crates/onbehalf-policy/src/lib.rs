@@ -50,7 +50,8 @@
 //! }
 //! ```
 //!
-//! `session_id` is **absent** when the call carries none (Cedar has no `null`); test it with
+//! Through the MCP proxy, `session_id` is a 12-hex-digit SHA-256 prefix of the `Mcp-Session-Id`,
+//! never the id itself. It is **absent** when the call carries none (Cedar has no `null`); test it with
 //! `context has session_id`. The same goes for every `null` inside `input` and
 //! `originating_user.attributes`: null-valued members are dropped, so write
 //! `context.input has repo && context.input.repo like "acme/*"`. Integers (and floats with no
@@ -78,8 +79,10 @@
 //! attributes from [`ToolAttrs::inputs`], and `UserAttributes` from
 //! [`PolicyEngineBuilder::with_user_attr`]. Because Cedar requires actions to be declared, a
 //! policy that names `Action::"x"` validates only if some catalog entry has tool `x`.
-//! Evaluation itself is schema-free, so tools that are not in the catalog are still
-//! authorized correctly; they just get default tool attributes.
+//! Evaluation itself is schema-free. A call to a tool that is not in the catalog is handled
+//! as [`UnknownTools`] says: denied with reason `tool_not_in_catalog` by default
+//! ([`PolicyEngineBuilder::with_unknown_tools`]), evaluated as sensitive, or evaluated with
+//! default attributes.
 //!
 //! A starter policy set lives in `policies/default.cedar` ([`DEFAULT_POLICIES`]).
 //!
@@ -150,7 +153,7 @@ use cedar_policy::{
 use onbehalf_core::{Decision, DelegationChain, ToolCall};
 use time::OffsetDateTime;
 
-pub use catalog::{parse_user_attributes, ArgType, ToolAttrs, ToolCatalog};
+pub use catalog::{parse_user_attributes, ArgType, ToolAttrs, ToolCatalog, UnknownTools};
 pub use lint::{lint, LintIssue, LintReport, LintSeverity};
 pub use schema::{default_user_attrs, DEFAULT_SCHEMA, GENERIC_ACTION};
 
@@ -168,6 +171,8 @@ pub const REASON_POLICY_ALLOW: &str = "policy_allow";
 pub const REASON_POLICY_DENY: &str = "policy_deny";
 /// Reason code when the request could not be evaluated safely; always a deny.
 pub const REASON_POLICY_ERROR: &str = "policy_error";
+/// Reason code when the tool is not in the catalog and [`UnknownTools::Deny`] is in force.
+pub const REASON_TOOL_NOT_IN_CATALOG: &str = "tool_not_in_catalog";
 
 /// Errors from loading policies or schema.
 #[derive(Debug, thiserror::Error)]
@@ -189,7 +194,8 @@ pub enum PolicyError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
     pub decision: Decision,
-    /// One of `capability_denied`, `policy_allow`, `policy_deny`, `policy_error`.
+    /// One of `capability_denied`, `tool_not_in_catalog`, `policy_allow`, `policy_deny`,
+    /// `policy_error`.
     pub reason: String,
     /// Ids of the policies that determined the decision (permits that matched for an allow,
     /// forbids that matched for a deny). Empty for a capability denial or a default deny.
@@ -222,6 +228,7 @@ pub struct PolicyEngineBuilder {
     base_schema: String,
     catalog: ToolCatalog,
     user_attrs: BTreeMap<String, ArgType>,
+    unknown_tools: UnknownTools,
 }
 
 impl Default for PolicyEngineBuilder {
@@ -237,7 +244,15 @@ impl PolicyEngineBuilder {
             base_schema: DEFAULT_SCHEMA.to_string(),
             catalog: ToolCatalog::new(),
             user_attrs: default_user_attrs(),
+            unknown_tools: UnknownTools::default(),
         }
+    }
+
+    /// What to do with calls to tools that are not in the catalog. Default
+    /// [`UnknownTools::Deny`].
+    pub fn with_unknown_tools(mut self, unknown_tools: UnknownTools) -> Self {
+        self.unknown_tools = unknown_tools;
+        self
     }
 
     /// Add Cedar policy text. May be called more than once; the sources are concatenated.
@@ -297,6 +312,7 @@ impl PolicyEngineBuilder {
             schema_text,
             policies,
             catalog: self.catalog,
+            unknown_tools: self.unknown_tools,
             authorizer: Authorizer::new(),
             validation_warnings: warnings,
         })
@@ -357,6 +373,7 @@ pub struct PolicyEngine {
     schema_text: String,
     policies: PolicySet,
     catalog: ToolCatalog,
+    unknown_tools: UnknownTools,
     authorizer: Authorizer,
     validation_warnings: Vec<String>,
 }
@@ -392,8 +409,28 @@ impl PolicyEngine {
             );
         }
 
+        // Stage 1b: the catalog. An unclassified tool would otherwise get default attributes,
+        // so every `forbid ... when { resource.sensitive }` would fail open for it.
+        let attrs = if self.catalog.contains(&call.server, &call.tool) {
+            self.catalog.get(&call.server, &call.tool)
+        } else {
+            match self.unknown_tools {
+                UnknownTools::Deny => {
+                    return Outcome::deny(
+                        REASON_TOOL_NOT_IN_CATALOG,
+                        vec![format!(
+                            "tool {}:{} is not in the tool catalog",
+                            call.server, call.tool
+                        )],
+                    )
+                }
+                UnknownTools::Sensitive => ToolAttrs::new().sensitive(true),
+                UnknownTools::Allow => ToolAttrs::default(),
+            }
+        };
+
         // Stage 2: Cedar.
-        let req = match request::build(chain, call, &self.catalog, now) {
+        let req = match request::build(chain, call, &attrs, now) {
             Ok(r) => r,
             Err(e) => return Outcome::deny(REASON_POLICY_ERROR, vec![e.to_string()]),
         };
@@ -478,5 +515,10 @@ impl PolicyEngine {
 
     pub fn catalog(&self) -> &ToolCatalog {
         &self.catalog
+    }
+
+    /// The policy for tools that are not in the catalog.
+    pub fn unknown_tools(&self) -> UnknownTools {
+        self.unknown_tools
     }
 }

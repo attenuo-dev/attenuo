@@ -143,6 +143,13 @@ async def test_exchange_accepts_token_object_and_hop0(make: Any) -> None:
     assert rec.body()["subject_token_type"].endswith("id-jag")
     with pytest.raises(ValueError):
         await call(client, "exchange", "J", "planner", "github:*", client_id="planner")
+    # From a delegation token, client credentials authenticate the actor; it stays hop n+1.
+    await call(client, "exchange", tok, "coder", "github:read_file", client_secret="cs")
+    body = rec.body()
+    assert body["subject_token_type"] == "urn:ietf:params:oauth:token-type:jwt"
+    assert (body["client_id"], body["client_secret"]) == ("coder", "cs")
+    await call(client, "exchange", root, "coder", "github:read_file", client_secret="cs")
+    assert rec.body()["subject_token_type"] == "urn:ietf:params:oauth:token-type:jwt"
 
 
 async def test_exchange_errors(make: Any) -> None:

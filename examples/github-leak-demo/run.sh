@@ -112,7 +112,8 @@ step 0 'onbehalf token root --subject alice --agent assistant --cap "github:*"'
 ROOT_TOKEN="$(field token)"; ROOT_LEASE="$(field lease)"
 
 say "2. The assistant hands its 'coder' sub-agent read_file and nothing else"
-step 0 'onbehalf token exchange --subject-token "$ROOT_TOKEN" --actor coder --cap github:read_file'
+note "The coder authenticates as itself ([[agents]] in config.toml): only it can receive a token in its name."
+step 0 'onbehalf token exchange --subject-token "$ROOT_TOKEN" --actor coder --client-secret demo-coder-secret --cap github:read_file'
 CODER="$(field token)"; CODER_LEASE="$(field lease)"
 
 say "3. What the coder's token says"

@@ -25,10 +25,13 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use time::Duration;
 
-use super::{audit_issuance, no_store, now, parse_json};
+use super::{
+    audit_admin, audit_issuance, no_store, now, parse_json, register_issued, REASON_ADMIN_ACTION,
+};
 use crate::config::{capability_set, CapSpec, RootGrant};
 use crate::error::ApiError;
 use crate::state::AppState;
+use onbehalf_core::Decision;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,13 +72,33 @@ pub async fn mint_root(
         ttl,
         now,
     )?;
-    state.leases.register(
+    register_issued(
+        &state,
+        &issued.token,
         &issued.lease,
         None,
-        state.initial_lease_expiry(now, issued.expires_at),
+        issued.expires_at,
+        now,
     )?;
     let args = json!({ "agent": req.agent, "requested": issued.chain.hops[0].capabilities });
-    if let Err(e) = audit_issuance(&state, "token.root", &issued.chain, args, now) {
+    let admin_args = json!({
+        "subject": req.subject,
+        "issuer": req.issuer,
+        "agent": req.agent,
+        "lease": issued.lease,
+    });
+    let recorded = audit_issuance(&state, "token.root", &issued.chain, args, now).and_then(|_| {
+        audit_admin(
+            &state,
+            "admin.root_token",
+            Decision::Allow,
+            REASON_ADMIN_ACTION,
+            vec![issued.lease.clone()],
+            admin_args,
+            now,
+        )
+    });
+    if let Err(e) = recorded {
         let _ = state.leases.revoke(&issued.lease, "audit_error", now);
         return Err(e);
     }

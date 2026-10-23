@@ -715,7 +715,27 @@ async fn id_jag_yields_root_token_and_typ_is_enforced() {
     assert_eq!(chain.originating_user.attributes["mfa"], json!(true));
     assert_eq!(chain.hops[0].agent.0, "planner");
 
+    // Each ID-JAG is used once.
+    let (status, body) = h
+        .post_form(
+            &[
+                ("grant_type", EXCHANGE),
+                ("subject_token", &jag),
+                ("subject_token_type", ID_JAG),
+                ("scope", "github:read_file"),
+            ],
+            Some(("planner", PLANNER_SECRET)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error_description"], "replayed");
+
     // As the draft presents it: jwt-bearer with `assertion`.
+    let jag = idp.sign(
+        &idp.key,
+        Some("oauth-id-jag+jwt"),
+        &idp.id_jag_claims("alice", "planner"),
+    );
     let (status, body) = h
         .post_form(
             &[
@@ -849,7 +869,7 @@ async fn id_token_to_root_to_exchange_to_proxy() {
                 ("actor", "coder"),
                 ("scope", "github:read_file"),
             ],
-            None,
+            Some(("coder", CODER_SECRET)),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{child}");
@@ -868,4 +888,67 @@ async fn id_token_to_root_to_exchange_to_proxy() {
     // The root holder itself may create issues.
     let ok = h.mcp_call(root_token, "create_issue").await;
     assert!(ok.get("result").is_some(), "{ok}");
+}
+
+/// An ID token mints one root token, and that token does not outlive it.
+#[tokio::test]
+async fn id_tokens_are_used_once_and_cap_the_root_ttl() {
+    let h = Harness::start().await;
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let mut claims = h.idp.id_token_claims("alice");
+    claims["exp"] = json!(now + 120);
+    let token = h.idp.sign(&h.idp.key, Some("JWT"), &claims);
+
+    // A long TTL is asked for; the root token ends when the ID token does.
+    let (status, body) = h
+        .post_form(
+            &[
+                ("grant_type", EXCHANGE),
+                ("subject_token", &token),
+                ("subject_token_type", ID_TOKEN),
+                ("client_id", "planner"),
+                ("client_secret", PLANNER_SECRET),
+                ("scope", "github:read_file"),
+                ("requested_ttl_seconds", "86400"),
+            ],
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["expires_in"].as_i64().unwrap() <= 120, "{body}");
+    let chain = h.verify(body["access_token"].as_str().unwrap());
+    assert!(chain.hops[0].expires_at.unix_timestamp() <= now + 120);
+
+    // The same ID token again (no `jti`, so keyed by its hash): refused.
+    let again = h.intake(&token, "github:read_file").await;
+    assert_error(&again, StatusCode::BAD_REQUEST, "invalid_grant", "replayed");
+    // A token with a `jti` is keyed by (iss, jti).
+    let mut claims = h.idp.id_token_claims("alice");
+    claims["jti"] = json!("id-token-1");
+    let with_jti = h.idp.sign(&h.idp.key, Some("JWT"), &claims);
+    assert_eq!(
+        h.intake(&with_jti, "github:read_file").await.0,
+        StatusCode::OK
+    );
+    // A token re-signed with the same (iss, jti) is the same credential.
+    claims["exp"] = json!(now + 200);
+    let same_jti = h.idp.sign(&h.idp.key, Some("JWT"), &claims);
+    assert_error(
+        &h.intake(&same_jti, "github:read_file").await,
+        StatusCode::BAD_REQUEST,
+        "invalid_grant",
+        "replayed",
+    );
+
+    // Inside the clock skew after `exp` the token still verifies, but there is no lifetime
+    // left to give a root token.
+    let mut claims = h.idp.id_token_claims("alice");
+    claims["exp"] = json!(now - 5);
+    let expiring = h.idp.sign(&h.idp.key, Some("JWT"), &claims);
+    assert_error(
+        &h.intake(&expiring, "github:read_file").await,
+        StatusCode::BAD_REQUEST,
+        "invalid_grant",
+        "credential_expired",
+    );
 }
