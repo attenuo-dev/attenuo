@@ -64,6 +64,7 @@ impl AppState {
             anyhow::bail!("[authzen] max_batch must be at least 1");
         }
         config.proxy.stream_recheck()?;
+        config.proxy.check_limits()?;
         let issuer = load_issuer(config)?;
         let verifier = issuer.verifier();
         let jwks = crate::jwks::jwks_from_keys(&issuer.trusted_public_keys())?;

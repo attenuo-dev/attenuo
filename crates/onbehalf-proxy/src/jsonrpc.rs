@@ -16,8 +16,12 @@ pub const CODE_UNAUTHORIZED: i64 = -32001;
 pub const CODE_DENIED: i64 = -32003;
 /// onbehalf: no upstream is configured under this name (sent with HTTP 404).
 pub const CODE_UNKNOWN_SERVER: i64 = -32004;
-/// onbehalf: the upstream could not be reached (sent with HTTP 502).
+/// onbehalf: the upstream could not be reached, or answered with something the proxy will not
+/// relay (sent with HTTP 502).
 pub const CODE_UPSTREAM: i64 = -32005;
+/// onbehalf: the proxy is out of a bounded resource, such as session slots (sent with HTTP
+/// 503).
+pub const CODE_UNAVAILABLE: i64 = -32006;
 
 /// MCP method names the proxy understands.
 pub const METHOD_TOOLS_CALL: &str = "tools/call";

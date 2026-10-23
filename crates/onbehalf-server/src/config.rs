@@ -422,6 +422,20 @@ pub struct ProxySection {
     /// (SR-25). Default `true`.
     #[serde(default = "default_true")]
     pub require_listed_tools: bool,
+    /// Largest upstream body the proxy buffers (a JSON response it filters, one SSE event);
+    /// larger gets `502` or ends the stream (SR-36). Default 16 MiB.
+    #[serde(default = "default_max_upstream_body_bytes")]
+    pub max_upstream_body_bytes: usize,
+    /// Largest client request body; larger gets `413` (SR-36). Default 4 MiB.
+    #[serde(default = "default_max_request_body_bytes")]
+    pub max_request_body_bytes: usize,
+    /// Idle lifetime of an `Mcp-Session-Id` binding, in seconds. Default 3600.
+    #[serde(default = "default_session_ttl_seconds")]
+    pub session_ttl_seconds: u64,
+    /// Most live session bindings. When all are live, a new session gets `503`
+    /// `session_registry_full`; live bindings are never evicted (SR-36). Default 100000.
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions: usize,
 }
 
 impl Default for ProxySection {
@@ -429,8 +443,28 @@ impl Default for ProxySection {
         Self {
             stream_recheck_seconds: default_stream_recheck_seconds(),
             require_listed_tools: true,
+            max_upstream_body_bytes: default_max_upstream_body_bytes(),
+            max_request_body_bytes: default_max_request_body_bytes(),
+            session_ttl_seconds: default_session_ttl_seconds(),
+            max_sessions: default_max_sessions(),
         }
     }
+}
+
+fn default_max_upstream_body_bytes() -> usize {
+    onbehalf_proxy::config::DEFAULT_MAX_UPSTREAM_BODY_BYTES
+}
+
+fn default_max_request_body_bytes() -> usize {
+    onbehalf_proxy::config::DEFAULT_MAX_REQUEST_BODY_BYTES
+}
+
+fn default_session_ttl_seconds() -> u64 {
+    onbehalf_proxy::session::DEFAULT_SESSION_TTL.as_secs()
+}
+
+fn default_max_sessions() -> usize {
+    onbehalf_proxy::session::DEFAULT_MAX_SESSIONS
 }
 
 fn default_stream_recheck_seconds() -> u64 {
@@ -444,6 +478,40 @@ impl ProxySection {
             anyhow::bail!("[proxy] stream_recheck_seconds must be at least 1");
         }
         Ok(std::time::Duration::from_secs(self.stream_recheck_seconds))
+    }
+
+    /// Reject limits of zero, which would refuse every request, body or session.
+    pub fn check_limits(&self) -> anyhow::Result<()> {
+        for (name, value) in [
+            (
+                "max_upstream_body_bytes",
+                self.max_upstream_body_bytes as u64,
+            ),
+            ("max_request_body_bytes", self.max_request_body_bytes as u64),
+            ("session_ttl_seconds", self.session_ttl_seconds),
+            ("max_sessions", self.max_sessions as u64),
+        ] {
+            if value == 0 {
+                anyhow::bail!("[proxy] {name} must be at least 1");
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply this section to a proxy configuration.
+    pub fn apply(&self, config: onbehalf_proxy::ProxyConfig) -> onbehalf_proxy::ProxyConfig {
+        config
+            .with_stream_recheck(
+                self.stream_recheck()
+                    .unwrap_or(onbehalf_proxy::config::DEFAULT_STREAM_RECHECK),
+            )
+            .with_require_listed_tools(self.require_listed_tools)
+            .with_max_upstream_body_bytes(self.max_upstream_body_bytes)
+            .with_max_request_body_bytes(self.max_request_body_bytes)
+            .with_sessions(
+                std::time::Duration::from_secs(self.session_ttl_seconds),
+                self.max_sessions,
+            )
     }
 }
 
@@ -708,6 +776,31 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn proxy_limits_have_defaults_and_refuse_zero_sr36() {
+        let cfg = Config::from_toml("").unwrap();
+        assert_eq!(cfg.proxy.max_upstream_body_bytes, 16 * 1024 * 1024);
+        assert_eq!(cfg.proxy.max_request_body_bytes, 4 * 1024 * 1024);
+        assert_eq!(cfg.proxy.session_ttl_seconds, 3600);
+        assert_eq!(cfg.proxy.max_sessions, 100_000);
+        cfg.proxy.check_limits().unwrap();
+        let applied = cfg.proxy.apply(onbehalf_proxy::ProxyConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![],
+        ));
+        assert_eq!(applied.max_sessions, 100_000);
+        for key in [
+            "max_upstream_body_bytes",
+            "max_request_body_bytes",
+            "session_ttl_seconds",
+            "max_sessions",
+        ] {
+            let cfg = Config::from_toml(&format!("[proxy]\n{key} = 0\n")).unwrap();
+            let err = cfg.proxy.check_limits().unwrap_err().to_string();
+            assert!(err.contains(key), "{err}");
+        }
+    }
+
     #[test]
     fn require_listed_tools_defaults_to_on_sr25() {
         assert!(Config::from_toml("").unwrap().proxy.require_listed_tools);

@@ -27,10 +27,10 @@ use crate::guard::{guard_stream, StreamGuard};
 use crate::jsonrpc::{
     self, denied_response, error_response, id_of, is_passthrough_method, is_request, method_of,
     CODE_INVALID_PARAMS, CODE_INVALID_REQUEST, CODE_PARSE_ERROR, CODE_UNAUTHORIZED,
-    CODE_UNKNOWN_SERVER, CODE_UPSTREAM,
+    CODE_UNAVAILABLE, CODE_UNKNOWN_SERVER, CODE_UPSTREAM,
 };
 use crate::listed::ListedTools;
-use crate::session::{session_tag, SessionCheck, SessionOwner, SessionRegistry};
+use crate::session::{session_tag, BindOutcome, SessionCheck, SessionOwner, SessionRegistry};
 
 /// Response header carrying the decision record id(s) of every `tools/call` in the request,
 /// comma separated in request order.
@@ -43,6 +43,16 @@ pub const REASON_SESSION_MISMATCH: &str = "session_mismatch";
 /// Reason code for a `tools/call` whose name is not a valid tool name
 /// ([`onbehalf_core::names`]; SR-25).
 pub const REASON_INVALID_NAME: &str = "invalid_name";
+
+/// Reason code (JSON-RPC `data.reason`, HTTP 503) when a response would bind a new session but
+/// every slot of the session registry holds a live binding (SR-36).
+pub const REASON_SESSION_REGISTRY_FULL: &str = "session_registry_full";
+
+/// Reason code (HTTP 413) for a request body over `max_request_body_bytes` (SR-36).
+pub const REASON_REQUEST_TOO_LARGE: &str = "request_too_large";
+
+/// Reason code (HTTP 502) for an upstream body over `max_upstream_body_bytes` (SR-36).
+pub const REASON_UPSTREAM_BODY_TOO_LARGE: &str = "upstream_body_too_large";
 
 /// Reason code for a `tools/call` whose name the upstream never listed and the catalog does not
 /// know, with [`ProxyConfig::require_listed_tools`] on (SR-25).
@@ -76,6 +86,10 @@ struct AppState {
     require_listed_tools: bool,
     /// Tool names each upstream has listed (SR-25).
     listed: Arc<ListedTools>,
+    /// [`ProxyConfig::max_upstream_body_bytes`].
+    max_upstream_body: usize,
+    /// [`ProxyConfig::max_request_body_bytes`].
+    max_request_body: usize,
 }
 
 impl AppState {
@@ -89,6 +103,9 @@ impl AppState {
 pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
     let stream_recheck = config.stream_recheck;
     let require_listed_tools = config.require_listed_tools;
+    let max_upstream_body = config.max_upstream_body_bytes.max(1);
+    let max_request_body = config.max_request_body_bytes.max(1);
+    let sessions = SessionRegistry::new(config.session_ttl, config.max_sessions);
     let upstreams = config
         .upstreams
         .into_iter()
@@ -98,10 +115,12 @@ pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
         upstreams,
         client: upstream_client(),
         authorizer,
-        sessions: SessionRegistry::default(),
+        sessions,
         stream_recheck,
         require_listed_tools,
         listed: Arc::new(ListedTools::new()),
+        max_upstream_body,
+        max_request_body,
     });
     Router::new()
         .route(
@@ -274,7 +293,10 @@ async fn session_gate(
 }
 
 /// Bind the session id a successful upstream response assigns to the caller. A session id
-/// already bound to another principal is removed from the response.
+/// already bound to another principal is removed from the response. When the registry has no
+/// free slot, the whole response is replaced by `503` `session_registry_full` (SR-36): the
+/// client cannot use a session the proxy would not let it back into, and no other user's live
+/// binding is given up for it.
 fn adopt_session(state: &AppState, owner: Option<&SessionOwner>, response: &mut Response) {
     if !response.status().is_success() {
         return;
@@ -282,14 +304,119 @@ fn adopt_session(state: &AppState, owner: Option<&SessionOwner>, response: &mut 
     let Some(sid) = header_str(response.headers(), HEADER_MCP_SESSION_ID).map(str::to_owned) else {
         return;
     };
-    let bound = owner.is_some_and(|o| state.sessions.bind(&sid, o, Instant::now()));
-    if !bound {
-        tracing::warn!(
-            session = %session_tag(&sid),
-            "upstream assigned a session id bound to another principal; header removed"
-        );
-        response.headers_mut().remove(HEADER_MCP_SESSION_ID);
+    let outcome = match owner {
+        Some(o) => state.sessions.bind(&sid, o, Instant::now()),
+        None => BindOutcome::Taken,
+    };
+    match outcome {
+        BindOutcome::Bound => {}
+        BindOutcome::Taken => {
+            tracing::warn!(
+                session = %session_tag(&sid),
+                "upstream assigned a session id bound to another principal; header removed"
+            );
+            response.headers_mut().remove(HEADER_MCP_SESSION_ID);
+        }
+        BindOutcome::Full => {
+            tracing::warn!(
+                session = %session_tag(&sid),
+                "session registry full; refusing to bind a new session"
+            );
+            let body = error_response(
+                Value::Null,
+                CODE_UNAVAILABLE,
+                "onbehalf: too many open sessions; try again later",
+                Some(serde_json::json!({ "reason": REASON_SESSION_REGISTRY_FULL })),
+            );
+            let mut resp = json_response(StatusCode::SERVICE_UNAVAILABLE, &body);
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("30"));
+            *response = resp;
+        }
     }
+}
+
+/// Read a client request body, at most `limit` bytes. Over the limit is `413` (checked against
+/// `Content-Length` first, then while reading); a broken body is `400`.
+// The `Err` is a full response, built once per refused request; boxing it buys nothing.
+#[allow(clippy::result_large_err)]
+async fn read_request_body(
+    headers: &HeaderMap,
+    body: Body,
+    limit: usize,
+) -> Result<Bytes, Response> {
+    let too_large = || {
+        tracing::warn!(limit, "request rejected: body too large");
+        let body = error_response(
+            Value::Null,
+            CODE_INVALID_REQUEST,
+            format!("onbehalf: request body larger than {limit} bytes"),
+            Some(serde_json::json!({ "reason": REASON_REQUEST_TOO_LARGE })),
+        );
+        json_response(StatusCode::PAYLOAD_TOO_LARGE, &body)
+    };
+    let declared = header_str(headers, header::CONTENT_LENGTH.as_str())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    if declared.is_some_and(|n| n > limit as u64) {
+        return Err(too_large());
+    }
+    let mut out = Vec::new();
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            tracing::warn!(error = %e, "request body could not be read");
+            let body = error_response(
+                Value::Null,
+                CODE_INVALID_REQUEST,
+                "onbehalf: request body could not be read",
+                None,
+            );
+            json_response(StatusCode::BAD_REQUEST, &body)
+        })?;
+        if out.len() + chunk.len() > limit {
+            return Err(too_large());
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(out))
+}
+
+/// Why reading an upstream body failed.
+enum UpstreamBodyError {
+    TooLarge,
+    Transport(reqwest::Error),
+}
+
+/// Read an upstream body, at most `limit` bytes (checked against `Content-Length` first, then
+/// while reading).
+async fn read_upstream_body(
+    resp: reqwest::Response,
+    limit: usize,
+) -> Result<Bytes, UpstreamBodyError> {
+    if resp.content_length().is_some_and(|n| n > limit as u64) {
+        return Err(UpstreamBodyError::TooLarge);
+    }
+    let mut out = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(UpstreamBodyError::Transport)?;
+        if out.len() + chunk.len() > limit {
+            return Err(UpstreamBodyError::TooLarge);
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(out))
+}
+
+fn upstream_body_too_large(limit: usize) -> Response {
+    tracing::error!(limit, "upstream body larger than the proxy buffers");
+    let body = error_response(
+        Value::Null,
+        CODE_UPSTREAM,
+        format!("onbehalf: upstream response larger than {limit} bytes"),
+        Some(serde_json::json!({ "reason": REASON_UPSTREAM_BODY_TOO_LARGE })),
+    );
+    json_response(StatusCode::BAD_GATEWAY, &body)
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -376,7 +503,7 @@ async fn handle_passthrough(
     Path(server): Path<String>,
     method: Method,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let Some(upstream) = state.upstreams.get(&server).cloned() else {
         return unknown_server(&server);
@@ -393,6 +520,10 @@ async fn handle_passthrough(
         Ok(s) => s,
         Err(resp) => return resp,
     };
+    let body = match read_request_body(&headers, body, state.max_request_body).await {
+        Ok(b) => b,
+        Err(resp) => return resp,
+    };
     let span = request_span(&server, &chain, session_id.as_deref());
     async move {
         let owner = match session_gate(&state, &server, &method, &chain, session_id.as_deref(), now)
@@ -405,6 +536,7 @@ async fn handle_passthrough(
         let is_delete = method == Method::DELETE;
         // The listen stream lives as long as the client keeps it open: re-check it (SR-28).
         let guard = (!is_delete).then(|| state.stream_guard(&chain));
+        let limit = state.max_upstream_body;
         let req = state
             .client
             .request(method, &upstream)
@@ -414,7 +546,7 @@ async fn handle_passthrough(
             ))
             .body(body);
         let mut response = match req.send().await {
-            Ok(resp) => stream_response(resp, None, guard),
+            Ok(resp) => stream_response(resp, None, guard, limit),
             Err(e) => return upstream_error(e),
         };
         match (is_delete, session_id.as_deref()) {
@@ -464,7 +596,7 @@ async fn handle_post(
     State(state): State<Arc<AppState>>,
     Path(server): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let Some(upstream) = state.upstreams.get(&server) else {
         return unknown_server(&server);
@@ -476,6 +608,11 @@ async fn handle_post(
     };
     let session_id = match session_id_of(&headers) {
         Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    // Read only after authentication, so an anonymous caller cannot make the proxy buffer.
+    let body = match read_request_body(&headers, body, state.max_request_body).await {
+        Ok(b) => b,
         Err(resp) => return resp,
     };
     let span = request_span(&server, &chain, session_id.as_deref());
@@ -655,7 +792,7 @@ async fn handle_post_inner(
         let prelude = sse_prelude(&screened.replies);
         let guard = state.stream_guard(chain);
         let listed = state.listed.clone();
-        stream_response_filtered(resp, prelude, guard, move |msg| {
+        stream_response_filtered(resp, prelude, guard, state.max_upstream_body, move |msg| {
             let filter = ListFilter::new(&pending, &caps, &server);
             let names = filter.listed_tool_names(msg);
             if !names.is_empty() {
@@ -683,7 +820,12 @@ async fn handle_post_inner(
         json_response(StatusCode::BAD_GATEWAY, &body)
     } else {
         let prelude = sse_prelude(&screened.replies);
-        stream_response(resp, prelude, Some(state.stream_guard(chain)))
+        stream_response(
+            resp,
+            prelude,
+            Some(state.stream_guard(chain)),
+            state.max_upstream_body,
+        )
     };
     add_decision_header(&mut response, &screened.decision_ids);
     response
@@ -911,9 +1053,12 @@ async fn buffer_and_rewrite(
 ) -> Response {
     let status = resp.status();
     let headers = resp.headers().clone();
-    let bytes = match resp.bytes().await {
+    let bytes = match read_upstream_body(resp, state.max_upstream_body).await {
         Ok(b) => b,
-        Err(e) => return upstream_error(e),
+        Err(UpstreamBodyError::TooLarge) => {
+            return upstream_body_too_large(state.max_upstream_body)
+        }
+        Err(UpstreamBodyError::Transport(e)) => return upstream_error(e),
     };
     let mut value: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
@@ -993,10 +1138,12 @@ fn is_event_stream(headers: &HeaderMap) -> bool {
 /// stream is re-checked and ended when the check fails (SR-28); an SSE body is then relayed
 /// event by event ([`crate::sse::frame_stream`]), so the proxy's final event never lands
 /// inside a partial upstream event.
+/// `limit` bounds one buffered SSE event (`max_upstream_body_bytes`).
 fn stream_response(
     resp: reqwest::Response,
     prelude: Option<Bytes>,
     guard: Option<StreamGuard>,
+    limit: usize,
 ) -> Response {
     let status = resp.status();
     let headers = resp.headers().clone();
@@ -1009,7 +1156,7 @@ fn stream_response(
             Body::from_stream(prelude.chain(raw))
         }
         Some(guard) if is_event_stream(&headers) => {
-            let framed = crate::sse::frame_stream(resp.bytes_stream());
+            let framed = crate::sse::frame_stream(resp.bytes_stream(), limit);
             Body::from_stream(guard_stream(prelude.chain(framed), guard, true))
         }
         Some(guard) => {
@@ -1028,11 +1175,12 @@ fn stream_response_filtered(
     resp: reqwest::Response,
     prelude: Option<Bytes>,
     guard: StreamGuard,
+    limit: usize,
     filter: impl FnMut(&mut Value) + Send + 'static,
 ) -> Response {
     let status = resp.status();
     let headers = resp.headers().clone();
-    let filtered = crate::sse::rewrite_stream(resp.bytes_stream(), filter);
+    let filtered = crate::sse::rewrite_stream(resp.bytes_stream(), limit, filter);
     let prelude = futures_util::stream::iter(prelude.map(Ok::<_, std::io::Error>));
     let body = Body::from_stream(guard_stream(prelude.chain(filtered), guard, true));
     build_response(status, &headers, body)

@@ -37,7 +37,15 @@
 //!    keyed on `delete_repo`. Both denials are recorded through
 //!    [`Authorizer::record_rejection`]. See [`listed`].
 //!
-//! 7. re-checks every response it streams (the `GET` listen stream, and a `POST` answered with
+//! 7. bounds what it holds in memory (SR-36): request bodies over
+//!    [`ProxyConfig::max_request_body_bytes`] (default 4 MiB) get `413`; an upstream body it
+//!    must buffer (a JSON response to filter, one SSE event) over
+//!    [`ProxyConfig::max_upstream_body_bytes`] (default 16 MiB) gets `502` (or ends the
+//!    stream); and when every one of [`ProxyConfig::max_sessions`] session slots holds a live
+//!    binding, a response that would bind a new session is replaced by `503` with reason
+//!    `session_registry_full`. Expired bindings are reclaimed; live ones are never evicted.
+//!
+//! 8. re-checks every response it streams (the `GET` listen stream, and a `POST` answered with
 //!    a streamed body such as SSE) every [`ProxyConfig::stream_recheck`] (default 2 s) against
 //!    the token's expiry and [`Authorizer::check_active`], and ends the stream at the first
 //!    failure: an SSE stream after a final event carrying JSON-RPC error `-32001` with
@@ -106,7 +114,8 @@ pub mod testing;
 pub use auth::{AuthDecision, AuthError, Authorizer};
 pub use config::{ProxyConfig, UpstreamConfig};
 pub use proxy::{
-    router, serve, DECISION_ID_HEADER, REASON_INVALID_NAME, REASON_SESSION_MISMATCH,
-    REASON_TOOL_NOT_LISTED,
+    router, serve, DECISION_ID_HEADER, REASON_INVALID_NAME, REASON_REQUEST_TOO_LARGE,
+    REASON_SESSION_MISMATCH, REASON_SESSION_REGISTRY_FULL, REASON_TOOL_NOT_LISTED,
+    REASON_UPSTREAM_BODY_TOO_LARGE,
 };
 pub use session::{SessionOwner, SessionRegistry};
