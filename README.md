@@ -201,14 +201,14 @@ mcp '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_issu
 # 5. Revoke the ROOT lease; the revocation cascades to the coder's lease.
 curl -s -X POST $OB/admin/leases/$ROOT_LEASE/revoke -H "Authorization: Bearer $ADMIN" \
   -H 'content-type: application/json' -d '{"reason":"demo"}'
-# {"lease_id":"...","revoked":2,"reason":"demo"}
+# {"lease_id":"...","revoked":2,"reason":"demo","audit_id":"..."}
 
 # 6. The coder's next call is denied.
 mcp '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"repo":"acme/api"}}}'
 # ... "message":"attenuo: denied: lease_revoked" ...
 
 # Every decision and issuance is in the hash-chained audit log.
-curl -s $OB/admin/audit/verify -H "Authorization: Bearer $ADMIN"   # {"entries":5,"ok":true,"first_bad_seq":null}
+curl -s $OB/admin/audit/verify -H "Authorization: Bearer $ADMIN"   # {"entries":5,"ok":true,"first_bad_seq":null,"checkpoints":...,...}
 curl -s "$OB/admin/audit?from=1&limit=20" -H "Authorization: Bearer $ADMIN" | jq '.entries[].record | {decision,reason,tool,agents}'
 ```
 
@@ -232,7 +232,7 @@ Other endpoints: `POST /token/renew` (extend your lease), `POST /access/v1/evalu
 ```sh
 cargo build -p attenuo-cli
 export ATTENUO_SERVER=http://127.0.0.1:8080   # and ATTENUO_ADMIN_TOKEN, as the server got it
-alias attenuo=target/debug/attenuo
+export PATH=$PWD/target/debug:$PATH   # or $CARGO_TARGET_DIR/debug
 
 attenuo token root --subject alice --issuer https://idp.example --agent planner --cap 'github:*'
 printf '%s\n' coder-secret-change-me | ATTENUO_TOKEN="$ROOT_TOKEN" attenuo token exchange --actor coder --client-secret-stdin --cap github:read_file

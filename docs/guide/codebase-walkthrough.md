@@ -10,7 +10,7 @@ A reading-and-running plan for someone who wants to understand every piece of at
 
 Paths are relative to the repository root. Functions are cited by name, not line number, because lines move: find one with `grep -rn "fn name" crates/`. Line counts are rounded and were taken at the commit this page was written against; use them to size a session, not as a contract.
 
-Every non-cargo command below (the CLI, `curl`, the Python SDK, the demo, the evaluation oracle and runner) was run on 2026-10-23 against prebuilt binaries of this repository's `main`. The `cargo test` and `cargo bench` lines were not run for this page, which was written without building; their filters were checked against the test names in the source with `grep`, so a filter that matches nothing means a test was renamed since. TypeScript and fuzzing commands are marked where they appear.
+Every command below except `cargo bench` and `cargo +nightly fuzz` was run, in this order, on 2026-10-23 against `main` (about 110 commands; the Rust test filters, the Python and TypeScript test suites and the demo included). Where the text quotes output, that is what was printed. Line counts were refreshed the same day; they are rounded, so use them to size a session, not as a contract.
 
 ## 0. Setup you need once
 
@@ -31,6 +31,8 @@ RUST_LOG=warn attenuo-server --config examples/github-leak-demo/config.toml > /t
 export ATTENUO_SERVER=http://127.0.0.1:18080 ATTENUO_ADMIN_TOKEN=demo-admin-token
 sleep 2 && curl -s $ATTENUO_SERVER/healthz       # {"status":"ok","version":"0.1.0"}
 ```
+
+Those two variables are read by anything in this shell, the test binaries included: the `attenuo-cli` unit tests expect the default server address and the `attenuo-bench` smoke test mints its own admin token, so with them exported one test in each fails. The `cargo test` lines of sessions 7 and 9 are written with `env -u` for that reason; the other crates' tests do not read them.
 
 The config uses fixed ports (18080 for attenuo, 13001 for the upstream), an in-memory audit log (`sqlite_path = ":memory:"`, so a restart starts a new log) and an ephemeral signing key (so a restart invalidates every token). Stop everything with `pkill -x attenuo-server; pkill -x fake_mcp`.
 
@@ -110,7 +112,7 @@ Read beside: [Capabilities and attenuation](../concepts/capabilities-and-attenua
 | 3 | `crates/attenuo-core/src/capability.rs` | `ArgConstraint` (`Eq`, `OneOf`, `Prefix`), `Capability::covers` (is a child no wider than a parent), `permits` (does this call fit), `CapabilitySet::attenuate`. The heart of the project. | 450 |
 | 4 | `crates/attenuo-core/src/chain.rs` | `DelegationChain`, `Hop`, `OriginatingUser`; `root`, `extend` (the only way to add a hop), `validate_at` (re-checks everything), `digest`, `prefix_digest`. | 780 |
 | 5 | `crates/attenuo-core/src/names.rs` | The one rule for server, tool and method names (ASCII, no `/` or `:` or `*`, at most 128 bytes, never normalized). | 250 |
-| 6 | `crates/attenuo-core/src/decision.rs`, `digest.rs` | `Decision`, `DecisionRecord` (what the audit log stores), the SHA-256 helper. | 150 |
+| 6 | `crates/attenuo-core/src/decision.rs`, `digest.rs` | `Decision`, `DecisionRecord` (what the audit log stores), the SHA-256 helper. | 235 |
 | 7 | `crates/attenuo-core/src/jcs.rs` | Skim only; session 4 returns to it. RFC 8785 canonical JSON. | 790 |
 
 Check you understood:
@@ -176,14 +178,14 @@ mkdir -p /tmp/ob-dpop && cd /tmp/ob-dpop
 attenuo key gen --dpop assistant.jwk
 CODER_JKT=$(attenuo --json key gen --dpop coder.jwk | python3 -c 'import json,sys; print(json.load(sys.stdin)["jkt"])')
 BROOT=$(attenuo token root --subject alice --agent assistant --cap 'github:*' --dpop-key assistant.jwk --print token)
-attenuo token sign-off --subject-token "$BROOT" --dpop-key assistant.jwk \
+ATTENUO_TOKEN="$BROOT" attenuo token sign-off --dpop-key assistant.jwk \
   --child-jkt "$CODER_JKT" --actor coder > sign-off.txt
 BCODER=$(ATTENUO_TOKEN="$BROOT" ATTENUO_CLIENT_SECRET=demo-coder-secret attenuo token exchange \
   --actor coder --cap github:read_file --dpop-key coder.jwk --subject-token-dpop-file sign-off.txt --print token)
 ATTENUO_TOKEN="$BCODER" attenuo call --dpop-key coder.jwk --server github --tool read_file \
   --arg repo=alice/public-docs --arg path=README.md      # ALLOWED
 ATTENUO_TOKEN="$BCODER" attenuo call --server github --tool read_file \
-  --arg repo=alice/public-docs --arg path=README.md      # error -32001 ... dpop_required: a stolen token without the key
+  --arg repo=alice/public-docs --arg path=README.md      # error -32001 ... dpop_required: a stolen token without the key (exit status 2)
 cd - > /dev/null
 ```
 
@@ -222,8 +224,9 @@ attenuo policy lint examples/github-leak-demo/policy.cedar --config examples/git
 # 3 policies, 0 error(s), 0 warning(s). Without --config lint declares the tools from the policy's own action names and prints a note about what it could not check.
 
 # Ask for a decision without calling the tool (needs the running server):
-attenuo authzen eval --server github --tool read_file --arg repo=alice/public-x --arg path=a --token "$CODER"
-# ALLOW policy_allow ... then try repo=bob/x: DENIED
+ATTENUO_TOKEN="$CODER" attenuo authzen eval --server github --tool read_file --arg repo=alice/public-x --arg path=a
+# ALLOW  policy_allow, then the decision id and the policy that matched; try repo=bob/x: DENY  policy_deny, exit status 2
+# (a token passed as --token works too, with a warning that the command line is visible to other local users)
 ```
 
 ### Session 4: audit log, WAL, checkpoints and canonical JSON (`attenuo-audit`, and `jcs.rs` in core)
@@ -238,9 +241,9 @@ Read beside: [Audit log](../concepts/audit-log.md), then [RFC-0001](../spec/rfc-
 | 2 | `crates/attenuo-audit/src/log.rs` | `AuditEntry`, `compute_entry_hash` (SHA-256 over canonical `["attenuo-audit-entry-v2", seq, prev_hash, record]`), `verify_entries`, the `AuditSink` trait. | 185 |
 | 3 | `crates/attenuo-audit/src/memory.rs` | An in-memory sink: the smallest implementation to read first. | 60 |
 | 4 | `crates/attenuo-audit/src/checkpoint.rs` | `Checkpoint` (seq, head hash, time, `kid`, signature), `CheckpointKeys` from a JWKS, `verify_with_checkpoints`. | 265 |
-| 5 | `crates/attenuo-audit/src/export.rs` | The `attenuo-audit-export-v2` JSON Lines format, `parse_export`, strict `verify_export`. | 305 |
+| 5 | `crates/attenuo-audit/src/export.rs` | The `attenuo-audit-export-v2` JSON Lines format, `parse_export`, strict `verify_export`. | 355 |
 | 6 | `crates/attenuo-audit/src/lease.rs` | The `LeaseStore` trait and `MemoryLeaseStore`: register, renew, revoke with cascade, `check_all`. | 240 |
-| 7 | `crates/attenuo-audit/src/sqlite.rs` | `SqliteAudit` and `SqliteLeaseStore`. Read the module comment, `Durability`, `append_locked` and the group-commit writer; skim the rest. WAL mode, background WAL checkpoints, `checkpoint_signed`. | 1930 |
+| 7 | `crates/attenuo-audit/src/sqlite.rs` | `SqliteAudit` and `SqliteLeaseStore`. Read the module comment, `Durability`, `append_locked` and the group-commit writer; skim the rest. WAL mode, background WAL checkpoints (and the writer's own backstop), `checkpoint_signed`. | 2150 |
 
 Check you understood:
 
@@ -307,7 +310,10 @@ curl -s -D - -X POST $ATTENUO_SERVER/mcp/github \
   -H "Authorization: Bearer $CODER" -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"repo":"alice/public-docs","path":"README.md"}}}'
-# HTTP/1.1 200 OK ... x-attenuo-decision-id: <uuid> ... mcp-session-id: fake-session-1
+# HTTP/1.1 200 OK ... x-attenuo-decision-id: <uuid>
+# No mcp-session-id here, although fake_mcp sends one: it gives every response the same id, fake-session-1, and the
+# proxy binds a session id to the first principal that received it (the Session 2 DPoP call, in this order), so for
+# CODER the header is removed and the server log says why. Restart the server and repeat the call to see it.
 
 # A denied call (policy: private repo). The upstream never sees it.
 curl -s -X POST $ATTENUO_SERVER/mcp/github \
@@ -341,9 +347,9 @@ Read beside: [ADR-0006: Lease-based in-flight revocation](../decisions/0006-leas
 | 5 | `crates/attenuo-server/src/routes/renew.rs`, `dev_root.rs` | Lease renewal; the development root mint. | 420 |
 | 6 | `crates/attenuo-server/src/routes/admin.rs` | `require_admin`, revoke, lease status, audit range/verify/checkpoint/export, policy reload. | 410 |
 | 7 | `crates/attenuo-server/src/routes/authzen.rs` | AuthZEN single and batch evaluation; `check_issued` rejects a chain the server never issued. | 395 |
-| 8 | `crates/attenuo-server/src/dpop.rs`, `replay.rs`, `clientauth.rs`, `actor.rs` | DPoP policy (`bind_new`, `bind_exchange`), single-use caches, client-secret check, actor tokens (SPIFFE). | 1770 |
+| 8 | `crates/attenuo-server/src/dpop.rs`, `replay.rs`, `clientauth.rs`, `actor.rs` | DPoP policy (`bind_new`, `bind_exchange`), single-use caches, client-secret check, actor tokens (SPIFFE). | 2040 |
 | 9 | `crates/attenuo-server/src/idp/` (`mod.rs`, `intake.rs`, `jwks.rs`, `claims.rs`) | Hop 0 from a real identity provider: ID tokens and ID-JAG, JWKS cache. Read last, or skip until you wire an IdP. | 1700 |
-| 10 | `crates/attenuo-server/src/config.rs`, `metrics.rs`, `routes/ops.rs`, `routes/wellknown.rs` | Config schema with validation (read with `config/example.toml`), Prometheus metrics, `/readyz`, JWKS. | 2100 |
+| 10 | `crates/attenuo-server/src/config.rs`, `metrics.rs`, `routes/ops.rs`, `routes/wellknown.rs` | Config schema with validation (read with `config/example.toml`), Prometheus metrics, `/readyz`, JWKS. | 2430 |
 
 Check you understood:
 
@@ -361,12 +367,16 @@ cargo test -p attenuo-server --test e2e authzen_matches_proxy_decisions
 cargo test -p attenuo-server --test dpop
 cargo test -p attenuo-server --lib authz::                 # Pipeline and the token cache
 
-# Leases over HTTP. A fresh root, its lease, a child, then revoke the root:
-R=$(attenuo token root --subject alice --agent assistant --cap 'github:*' --print token)
-L=$(attenuo token root --subject alice --agent assistant --cap 'github:*' --print lease)
+# Leases over HTTP. A fresh root and its lease (one --json call, so both come from the same mint), a child
+# under it, then revoke the root and watch the cascade:
+ROOTJ=$(attenuo --json token root --subject alice --agent assistant --cap 'github:*')
+R=$(printf '%s' "$ROOTJ" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+L=$(printf '%s' "$ROOTJ" | python3 -c 'import json,sys; print(json.load(sys.stdin)["lease"])')
+printf '%s\n' demo-coder-secret | ATTENUO_TOKEN="$R" \
+  attenuo token exchange --actor coder --client-secret-stdin --cap github:read_file --print lease   # the child's lease
 curl -s -H "Authorization: Bearer $ATTENUO_ADMIN_TOKEN" $ATTENUO_SERVER/admin/leases/$L
 # {"lease_id":"...","active":true,"parent":null,"expires_at":"...","revoked_at":null,"revoke_reason":null}
-attenuo lease revoke $L --reason "trying it"
+attenuo lease revoke $L --reason "trying it"      # revoked 2 lease(s): the root and its child
 curl -s -H "Authorization: Bearer $ATTENUO_ADMIN_TOKEN" $ATTENUO_SERVER/admin/leases/$L     # active false
 
 # The same-parent-same-actor rule:
@@ -388,11 +398,11 @@ Read beside: [CLI commands](../reference/cli.md), and the demo's own README, `ex
 
 | Order | File | What it does | Lines |
 | --- | --- | --- | --- |
-| 1 | `examples/github-leak-demo/run.sh` | The scenario in nine steps, with checks on every exit status. | 200 |
+| 1 | `examples/github-leak-demo/run.sh` | The scenario in nine steps, with checks on every exit status. | 150 |
 | 2 | `examples/github-leak-demo/config.toml`, `policy.cedar`, `policy_test.yaml` | The server config, policy and policy tests it uses. | 190 |
 | 3 | `crates/attenuo-cli/src/cli.rs` | The whole command surface in clap definitions. | 910 |
 | 4 | `crates/attenuo-cli/src/main.rs` | What each command does with the HTTP API. | 845 |
-| 5 | `crates/attenuo-cli/src/client.rs`, `secrets.rs` | The HTTP client; how secrets are read (env, file, stdin, flag with a warning). | 550 |
+| 5 | `crates/attenuo-cli/src/client.rs`, `secrets.rs` | The HTTP client; how secrets are read (env, file, stdin, flag with a warning). | 700 |
 | 6 | `crates/attenuo-cli/src/jwt.rs`, `render.rs`, `dpop_key.rs`, `policy_cmd.rs` | Local token decoding and display, DPoP key files, `policy test` and `policy lint`. | 1040 |
 
 Check you understood:
@@ -407,7 +417,7 @@ Run it:
 bash examples/github-leak-demo/run.sh            # needs no running server; starts its own on free ports
 ATTENUO_BIN_DIR=$BIN bash examples/github-leak-demo/run.sh     # reuse your build
 
-cargo test -p attenuo-cli
+env -u ATTENUO_SERVER -u ATTENUO_ADMIN_TOKEN cargo test -p attenuo-cli   # see section 0 for the env -u
 attenuo --help; attenuo token --help
 attenuo token inspect "$CODER"                  # offline decode
 attenuo tools --server github --token "$CODER" # tools/list through the proxy (--server here is the upstream)
@@ -428,11 +438,11 @@ Read beside: [Integrating MCP clients](../guides/integrating-mcp-clients.md), th
 | 2 | `sdk/python/src/attenuo/_wire.py` | Request building and response parsing with no I/O, shared by the sync and async clients. | 365 |
 | 3 | `sdk/python/src/attenuo/client.py` | `Client` / `AsyncClient`: `exchange`, `renew`, `call_tool`, `list_tools`, `authzen_evaluate`, `inspect`. | 430 |
 | 4 | `sdk/python/src/attenuo/errors.py`, `token.py` | `Denied` (trusted only if the decision id is in the response header), `Token` and local decoding. | 360 |
-| 5 | `sdk/python/src/attenuo/dpop.py`, `mcp.py` | `DpopKey` (including `sign_off`), `TokenAuth` for `httpx`. | 320 |
+| 5 | `sdk/python/src/attenuo/dpop.py`, `mcp.py` | `DpopKey` (including `sign_off`), `TokenAuth` for `httpx`. | 385 |
 | 6 | `sdk/python/src/attenuo/refresh.py` | `TokenRefresher` and `AsyncTokenRefresher`: renew at a third of the lease interval, re-exchange before `exp`, back off, stop on a revoked lease. | 410 |
 | 7 | `sdk/python/src/attenuo/admin.py` | `AdminClient`: revoke, lease status, audit, verify, dev root mint. | 405 |
 | 8 | `sdk/typescript/src/` (`client.ts`, `refresh.ts`, `dpop.ts`, `wire.ts`) | The same, with WebCrypto and `fetch`. | 1100 |
-| 9 | `examples/python-agent/agent.py` | A planner delegates to a coder, the coder meets an injected instruction, the planner revokes. | 200 |
+| 9 | `examples/python-agent/agent.py` | A planner delegates to a coder, the coder meets an injected instruction, the planner revokes (`mcp_client_example.py` beside it shows the raw client). | 130 |
 
 Check you understood:
 
@@ -443,8 +453,9 @@ Check you understood:
 Run it:
 
 ```sh
-PYTHONPATH=sdk/python/src python3 -m pytest sdk/python/tests -q       # 100+ tests, no server needed (integration ones skip)
-pip install -e sdk/python                                              # or keep using PYTHONPATH=sdk/python/src
+python3 -m venv .venv && . .venv/bin/activate && pip install -e 'sdk/python[dev]'   # httpx, rfc8785; [dev] adds pytest, pytest-asyncio, cryptography
+PYTHONPATH=sdk/python/src python3 -m pytest sdk/python/tests -q       # 150+ tests, no server needed (integration ones skip)
+# PYTHONPATH alone is enough only once those dependencies are installed; the system Python lacks rfc8785.
 
 PYTHONPATH=sdk/python/src CODER_SECRET=demo-coder-secret python3 - <<'PY'
 import os
@@ -470,10 +481,11 @@ print(admin.audit_verify())                                    # VerifyReport(ok
 PY
 
 PYTHONPATH=sdk/python/src python3 -m pytest sdk/python/tests/test_refresh.py -q    # the refresher's schedule, with a fake clock
-ATTENUO_INTEGRATION=1 ATTENUO_BIN_DIR=$BIN PYTHONPATH=sdk/python/src python3 -m pytest sdk/python/tests/test_integration.py -q   # builds nothing; starts its own server
+(cd sdk/typescript && npm ci && npm run build)   # the cross-language tests below run sdk/typescript/dist with node; a stale dist fails two of them
+ATTENUO_INTEGRATION=1 ATTENUO_BIN_DIR=$BIN PYTHONPATH=sdk/python/src python3 -m pytest sdk/python/tests/test_integration.py -q   # builds no Rust; starts its own server
 ```
 
-The TypeScript SDK needs `cd sdk/typescript && npm install && npm test`. That was not run for this page (no `node_modules` in the environment it was written in), so treat the TypeScript commands as unverified.
+The TypeScript SDK: `cd sdk/typescript && npm ci && npm test` (150 passed, 7 skipped without `ATTENUO_INTEGRATION`; Node 22, 2026-10-23).
 
 ### Session 9: evaluation suite, benchmarks and fuzzing
 
@@ -509,7 +521,7 @@ ATTENUO_BIN_DIR=$BIN \
   python3 evaluation/injection-suite/run.py --split all --out /tmp/ob-inj --tag mine
 ls /tmp/ob-inj          # <date>-mine.json and <date>-mine.md; compare with results/2026-10-23-v2.md
 
-cargo test -p attenuo-bench                                   # a short smoke run of the load generator
+env -u ATTENUO_SERVER -u ATTENUO_ADMIN_TOKEN cargo test -p attenuo-bench   # a short smoke run of the load generator (env -u: section 0)
 cargo bench -p attenuo-server --bench decide                  # the decision path by stage (optional, slow)
 OUT_DIR=/tmp/ob-bench DURATION=10 WARMUP=2 scripts/bench-e2e.sh   # release build plus the end-to-end matrix; the full run is about 9 minutes, and OUT_DIR keeps it out of docs/design/bench
 
