@@ -266,6 +266,7 @@ listen = "127.0.0.1:9100"
 | `http_requests_total` | counter | `route` (template, e.g. `/mcp/{server}`), `status` |
 | `authorize_duration_seconds` | histogram | none (lease check, policy and audit append) |
 | `audit_append_duration_seconds` | histogram | none (one audit append, including waiting for the store's lock) |
+| `proxy_stage_seconds` | histogram | `stage`: `token_verify_hit`, `token_verify_miss`, `lease_check`, `policy`, `audit_append`, `blocking_pool`, `upstream`, `response`, `total` (time per stage of a proxied call; see [performance](../design/performance.md#time-by-stage-of-a-proxied-call-2026-10-23)) |
 
 Alert on any increase of `audit_append_errors_total`, on a rising share of `reason="lease_expired"` and on `readyz` returning 503.
 

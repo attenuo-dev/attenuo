@@ -31,6 +31,7 @@ use crate::jsonrpc::{
 };
 use crate::listed::ListedTools;
 use crate::session::{session_tag, BindOutcome, SessionCheck, SessionOwner, SessionRegistry};
+use crate::stage::Stage;
 
 /// Response header carrying the decision record id(s) of every `tools/call` in the request,
 /// comma separated in request order.
@@ -718,6 +719,18 @@ struct Screened {
     lease_check: Option<Result<(), AuthError>>,
 }
 
+/// Stage timings of one `POST`, filled in by [`handle_post_inner`] and reported by
+/// [`handle_post`] once the response is ready.
+#[derive(Default)]
+struct PostTiming {
+    /// At least one message got a per-call decision.
+    decided: bool,
+    /// The upstream round trip, up to its response headers.
+    upstream: Option<Duration>,
+    /// When the upstream's response headers arrived.
+    upstream_done: Option<Instant>,
+}
+
 async fn handle_post(
     State(state): State<Arc<AppState>>,
     Path(server): Path<String>,
@@ -725,6 +738,7 @@ async fn handle_post(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    let started = Instant::now();
     let Some(upstream) = state.upstreams.get(&server) else {
         return unknown_server(&server);
     };
@@ -758,6 +772,7 @@ async fn handle_post(
             Ok(o) => o,
             Err(resp) => return resp,
         };
+        let mut timing = PostTiming::default();
         let mut response = handle_post_inner(
             &state,
             upstream,
@@ -767,9 +782,13 @@ async fn handle_post(
             &headers,
             body,
             now,
+            &mut timing,
         )
         .await;
         adopt_session(&state, upstream, owner.as_ref(), &mut response).await;
+        if timing.decided {
+            report_post_timing(&state, &timing, started);
+        }
         response
     }
     .instrument(span)
@@ -786,6 +805,7 @@ async fn handle_post_inner(
     headers: &HeaderMap,
     body: Bytes,
     now: OffsetDateTime,
+    timing: &mut PostTiming,
 ) -> Response {
     let chain = &who.chain;
     let parsed: Value = match serde_json::from_slice(&body) {
@@ -829,6 +849,7 @@ async fn handle_post_inner(
     for msg in messages {
         screen_message(state, who, server, session_id, msg, now, &mut screened).await;
     }
+    timing.decided = !screened.decision_ids.is_empty();
 
     // A single message that was refused only because the token's lease is inactive is an
     // authentication failure for the whole request.
@@ -887,6 +908,7 @@ async fn handle_post_inner(
             HeaderValue::from_static("application/json"),
         );
     }
+    let sent = Instant::now();
     let resp = match state
         .client
         .post(upstream)
@@ -898,6 +920,9 @@ async fn handle_post_inner(
         Ok(r) => r,
         Err(e) => return upstream_error(e),
     };
+    let headers_in = Instant::now();
+    timing.upstream = Some(headers_in - sent);
+    timing.upstream_done = Some(headers_in);
 
     let has_lists = !screened.list_requests.is_empty();
     let needs_buffer = has_lists || !screened.replies.is_empty();
@@ -958,6 +983,28 @@ async fn handle_post_inner(
     };
     add_decision_header(&mut response, &screened.decision_ids);
     response
+}
+
+/// Report the proxy's own stages of a `POST` that carried a decided call: to the authorizer
+/// ([`Authorizer::observe_stage`]) and as one debug event.
+fn report_post_timing(state: &AppState, timing: &PostTiming, started: Instant) {
+    let done = Instant::now();
+    let total = done - started;
+    let response = timing.upstream_done.map(|t| done - t);
+    let a = &state.authorizer;
+    if let Some(d) = timing.upstream {
+        a.observe_stage(Stage::Upstream, d);
+    }
+    if let Some(d) = response {
+        a.observe_stage(Stage::Response, d);
+    }
+    a.observe_stage(Stage::Total, total);
+    tracing::debug!(
+        upstream_us = timing.upstream.map(|d| d.as_micros() as u64),
+        response_us = response.map(|d| d.as_micros() as u64),
+        total_us = total.as_micros() as u64,
+        "proxy stages"
+    );
 }
 
 /// Classify one JSON-RPC message and route it. See the method table in the crate docs.

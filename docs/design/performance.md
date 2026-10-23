@@ -205,7 +205,51 @@ What this means:
 
 - **Single-client added latency** fell by about 200 us at one hop and about 400 us at three, close to what the policy stage lost (about 105 us, and 140 to 190 us) plus the shorter append. The policy stage is no longer what grows with depth.
 - **The file store's tail no longer has the checkpoint stalls.** Its p99 at 8 and 32 clients is now close to the in-memory store's. The worst case remains a catch-up pause each time the WAL passes 64 MB; it shows in the max column (30 to 135 ms on this host) rather than the p99.
-- **What is left of the added latency** is mostly outside the server's decision (now about 80 to 140 us at one hop): the blocking-pool hop, the proxy's request handling and the second HTTP round trip. It is still not broken down by stage.
+- **What is left of the added latency** is mostly outside the server's decision (now about 80 to 140 us at one hop): the blocking-pool hop, the proxy's request handling and the second HTTP round trip. It was not broken down by stage then; see [Time by stage of a proxied call](#time-by-stage-of-a-proxied-call-2026-10-23).
+
+### Time by stage of a proxied call (2026-10-23)
+
+Branch `perf/proxy-stage-timing`, commit 51f0a89. The server now times each stage of a proxied call and serves the result as the histogram `onbehalf_proxy_stage_seconds{stage=...}` on `/metrics` (buckets from 1 us to 1 s, five per decade), with the same figures as `tracing` debug fields. Each stage costs one `Instant::now()` pair. The stages:
+
+| `stage` | What it covers |
+|---|---|
+| `token_verify_hit`, `token_verify_miss` | Bearer token verification, answered from the verified-token cache or by the verifier |
+| `lease_check` | Every hop's lease, inside the decision |
+| `policy` | Capability stage and Cedar |
+| `audit_append` | Appending the decision record |
+| `blocking_pool` | Getting the decision onto a blocking thread and the answer back: the authorizer's wait minus the decision itself |
+| `upstream` | The forwarded request, until the upstream's response headers arrive |
+| `response` | From those headers to the response the handler returns (filtering, session binding, headers); a streamed body is relayed after this |
+| `total` | The proxy's `POST` handler, start to returned response, for requests with at least one decided call |
+
+`lease_check`, `policy` and `audit_append` are recorded in the decision pipeline, so AuthZEN decisions count there too. `onbehalf-bench` reads the histograms when each cell's warm-up ends and when it stops, and prints the difference as a table ([`bench/2026-10-23-vm-proxy-stages.md`](bench/2026-10-23-vm-proxy-stages.md)). The p50 and p90 columns are interpolated inside buckets the way Prometheus' `histogram_quantile` does, so they are estimates. The mean is exact.
+
+The run: one client, 10 s cells after 2 s of warm-up, allow and `deny_policy` at 1 and 3 hops, memory and file (`normal`) stores; 11,000 to 23,000 calls per cell. This is a shared 4-core VM, not a quiet machine. Load average was 4.4 to 6.4 during the run while other agents compiled, and the load generator, proxy and upstream share those cores. Read every figure as plus or minus 20 percent or worse. Absolute figures are 3 to 4 times the in-process `decide` bench (policy 43 to 57 us here, 13 us there), so compare stages within this run, not with the tables above.
+
+Allow call, microseconds, p50 (mean in brackets):
+
+| Stage | memory, 1 hop | memory, 3 hops | file, 1 hop | file, 3 hops |
+|---|---|---|---|---|
+| `token_verify_hit` | 4.5 (5.2) | 8.6 (9.3) | 4.7 (5.3) | 8.3 (9.5) |
+| `lease_check` | 15 (16) | 42 (44) | 37 (36) | 50 (54) |
+| `policy` | 48 (53) | 57 (57) | 46 (50) | 48 (55) |
+| `audit_append` | 51 (61) | 59 (111) | 69 (81) | 81 (95) |
+| `blocking_pool` | 70 (86) | 85 (122) | 74 (97) | 82 (115) |
+| `upstream` | 205 (216) | 235 (241) | 215 (218) | 231 (233) |
+| `response` | 9.5 (10.5) | 21 (23) | 10 (11) | 21 (22) |
+| `total` (handler) | 437 (485) | 577 (652) | 486 (536) | 586 (627) |
+| client p50, through the proxy | 661 | 800 | 713 | 806 |
+| client p50, direct to the upstream | 67 | 67 | 67 | 67 |
+
+A denied call (`deny_policy`) has no `upstream` or `response`; its handler `total` was 231 to 276 us p50 and its other stages match the allow column within noise.
+
+Readings:
+
+- **The proxy's own upstream round trip is the biggest stage**, 205 to 235 us p50, against 67 us p50 for the same call sent straight to the upstream by the load generator. Most of what the proxy adds to an allowed call is therefore a second HTTP exchange that costs about three times what the client pays for its own. Why it is that much slower from inside the server was not investigated. Candidates are the `reqwest` client on a busy runtime, scheduling across three processes on four cores, and the forwarded request being built and re-encoded.
+- **The hop to the blocking pool costs more than the policy stage**: 70 to 85 us p50, which is more than lease check plus policy at one hop. For the in-memory stores, a decision that runs inline (or on a dedicated thread with a cheaper hand-off) is the obvious experiment. The file store still needs to stay off async workers.
+- **The decision itself** (lease check, policy, append) is about 115 to 180 us p50 here. Lease check grows with depth (one row per hop) and is two to three times slower on the file store at one hop. The append's mean sits well above its p50 at three hops in memory (111 against 59 us), which shows occasional slow appends.
+- **Token verification is negligible on a cache hit** (5 to 9 us), and `response` handling is 10 to 21 us.
+- **Inside the handler, about 40 us is in no stage** (the allow-call stage means add up to 447 of a 485 us mean `total` in memory at one hop): reading and parsing the body, screening, building the decision record, the session gate and re-encoding. **Outside the handler**, the client's p50 is about 225 us above the handler's (661 against 437 us). That covers the client-to-proxy HTTP exchange, axum and hyper, and relaying the body. Subtracting medians gives only a rough split.
 
 ### How to run
 
@@ -217,12 +261,12 @@ cargo bench -p onbehalf-policy --bench policy_stage -- --warm-up-time 1 --measur
 cargo bench -p onbehalf-server --bench decide -- --warm-up-time 1 --measurement-time 3
 ```
 
-`onbehalf-bench --print-config DIR` writes the server config and policy it expects, for pointing the harness at an already running server (`--onbehalf-url`, `--upstream-url`). A one-second smoke run is part of `cargo test --workspace` (`crates/onbehalf-bench/tests/smoke.rs`). There is no CI job for the full matrix: it needs a release build and minutes of load, and numbers from shared runners could not be compared.
+`onbehalf-bench --print-config DIR` writes the server config and policy it expects, for pointing the harness at an already running server (`--onbehalf-url`, `--upstream-url`, and `--metrics-url` for the stage table). Every answer is checked: a denial counts only as the proxy's `-32003` with the expected reason code and a decision id listed in `X-Onbehalf-Decision-Id`, so an `audit_error` denial, a `too_many_sessions` refusal or a `5xx` stops the run after that cell. A one-second smoke run is part of `cargo test --workspace` (`crates/onbehalf-bench/tests/smoke.rs`). There is no CI job for the full matrix: it needs a release build and minutes of load, and numbers from shared runners could not be compared.
 
 ## Not measured
 
 - `POST /token` exchange throughput and `POST /token/renew` load (the harness only uses exchanges for setup).
 - Policy size (the set here has three policies) and catalog size.
-- A time breakdown of the proxy's own HTTP handling (the server's decision path is broken down by `benches/decide.rs`).
+- The time outside the proxy's handler (hyper and axum parsing the client's request, relaying a streamed body). The handler's stages are in `onbehalf_proxy_stage_seconds`; what lies between them and the client's latency is measured only as a difference.
 - Open-loop load at fixed arrival rates, confidence intervals over repeated runs, and a quiet reference machine.
 - Streaming (SSE) responses and `tools/list` filtering.

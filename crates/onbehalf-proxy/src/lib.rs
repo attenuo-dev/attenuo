@@ -68,6 +68,10 @@
 //! id(s) of the decision record(s) the authorizer produced, so a client can correlate a reply
 //! with the audit log.
 //!
+//! The proxy times its own stages of a `POST` that carried a decided call (upstream round trip,
+//! response handling, total; see [`Stage`]) and reports them through
+//! [`Authorizer::observe_stage`] and a `tracing` debug event.
+//!
 //! # Method to `ToolCall` mapping
 //!
 //! The authorizer sees a [`ToolCall`](onbehalf_core::ToolCall) with `server` = the `/mcp/{server}`
@@ -119,6 +123,7 @@ pub mod listed;
 pub mod proxy;
 pub mod session;
 pub mod sse;
+pub mod stage;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -131,3 +136,4 @@ pub use proxy::{
     REASON_TOO_MANY_SESSIONS, REASON_UPSTREAM_BODY_TOO_LARGE,
 };
 pub use session::{SessionOwner, SessionRegistry};
+pub use stage::Stage;

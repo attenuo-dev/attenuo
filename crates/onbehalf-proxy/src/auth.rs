@@ -5,10 +5,14 @@
 //! decision. The real implementation (token verification + policy engine + audit log) plugs in
 //! behind this trait; tests use `testing::StaticAuthorizer` (behind the `testing` feature).
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use onbehalf_core::{Decision, DelegationChain, ToolCall};
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+use crate::stage::Stage;
 
 /// The outcome of authorizing one call, plus the id of the audit record that was written.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,5 +215,12 @@ pub trait Authorizer: Send + Sync {
     ) -> Uuid {
         let _ = (chain, call, reason, now);
         Uuid::new_v4()
+    }
+
+    /// Record how long one stage of a proxied request took ([`Stage::Upstream`],
+    /// [`Stage::Response`], [`Stage::Total`] come from the proxy). Called on the request path,
+    /// so it must be cheap. The default discards it.
+    fn observe_stage(&self, stage: Stage, elapsed: Duration) {
+        let _ = (stage, elapsed);
     }
 }
