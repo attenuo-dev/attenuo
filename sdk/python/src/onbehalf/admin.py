@@ -148,13 +148,14 @@ class AdminClient:
         """Revoke a lease and, by cascade, every lease delegated from it."""
         body = w.json_body(
             self._http.post(
-                f"/admin/leases/{lease_id}/revoke", json={"reason": reason} if reason else {}
+                f"/admin/leases/{w.path_segment(lease_id, 'lease_id')}/revoke",
+                json={"reason": reason} if reason else {},
             )
         )
         return RevokeResult(body["lease_id"], int(body["revoked"]), str(body["reason"]))
 
     def lease_status(self, lease_id: str) -> LeaseStatus:
-        b = w.json_body(self._http.get(f"/admin/leases/{lease_id}"))
+        b = w.json_body(self._http.get(f"/admin/leases/{w.path_segment(lease_id, 'lease_id')}"))
         return LeaseStatus(
             b["lease_id"],
             b["active"] is True,
@@ -248,13 +249,16 @@ class AsyncAdminClient:
     async def revoke_lease(self, lease_id: str, reason: str | None = None) -> RevokeResult:
         body = w.json_body(
             await self._http.post(
-                f"/admin/leases/{lease_id}/revoke", json={"reason": reason} if reason else {}
+                f"/admin/leases/{w.path_segment(lease_id, 'lease_id')}/revoke",
+                json={"reason": reason} if reason else {},
             )
         )
         return RevokeResult(body["lease_id"], int(body["revoked"]), str(body["reason"]))
 
     async def lease_status(self, lease_id: str) -> LeaseStatus:
-        b = w.json_body(await self._http.get(f"/admin/leases/{lease_id}"))
+        b = w.json_body(
+            await self._http.get(f"/admin/leases/{w.path_segment(lease_id, 'lease_id')}")
+        )
         return LeaseStatus(
             b["lease_id"],
             b["active"] is True,

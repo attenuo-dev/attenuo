@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -33,6 +34,19 @@ def normalize_base(url: str) -> str:
             "To name an MCP upstream, pass it as the `server` argument of call_tool/list_tools."
         )
     return base
+
+
+def path_segment(value: str, what: str) -> str:
+    """``value`` as one percent-encoded URL path segment.
+
+    Server names and lease ids can come from untrusted input (a lease id is read from a token
+    an agent handed over). Left as they are, ``../`` or ``?`` in them would send the request,
+    with this client's bearer, to another endpoint (SR-31). ``.`` and ``..`` are refused
+    because URL normalization removes them even inside an encoded path.
+    """
+    if value in ("", ".", ".."):
+        raise ValueError(f"{what} must be a non-empty name other than '.' and '..', got {value!r}")
+    return quote(value, safe="")
 
 
 def bearer(token: Token | str | None, default: Token | str | None = None) -> str:
