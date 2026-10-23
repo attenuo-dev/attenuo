@@ -1,16 +1,21 @@
 """Replay prompt-injection tool-call sequences against onbehalf and against a bare upstream.
 
-The corpus (``cases/*.yaml``) describes, per case, the capability grant a user task needs and
-the tool calls a compromised agent would emit, each with the expected outcome. This module
-loads the corpus, writes a server config, catalog and Cedar policy from it, starts
+The environment (``policies/``) holds each suite's upstream, tool catalog and Cedar policy. The
+corpus (``cases/dev/*.yaml`` and ``cases/test/*.yaml``) describes, per case, the capability grant
+a user task needs and the tool calls a compromised agent would emit, each with the expected
+outcome. This module loads both, writes a server config, catalog and Cedar policy, starts
 ``onbehalf-server`` and one echoing ``fake_mcp`` upstream per suite, and replays the calls in
-three arms:
+five arms:
 
-``direct``      no onbehalf: JSON-RPC straight to the upstream (the baseline).
-``scope_only``  onbehalf with tool-level capabilities only (argument constraints dropped) and a
-                permit-all Cedar policy. The OAuth-scope equivalent (arm A1 in the plan).
-``onbehalf``    onbehalf as configured: attenuated tokens with argument constraints, the suite
-                Cedar policies, leases and audit (arm A2).
+``direct``             no onbehalf: JSON-RPC straight to the upstream (the baseline).
+``scope_only``         tool-level capabilities only (argument constraints dropped) and a
+                       permit-all Cedar policy. The OAuth-scope equivalent (arm A1 in the plan).
+``scope_constraints``  the case's capabilities with their argument constraints, permit-all
+                       policy: what attenuated tokens give without any policy.
+``policy_only``        the suite Cedar policies, but every call carries the user's root token
+                       (all servers, no attenuation): what policy gives without delegation.
+``onbehalf``           onbehalf as configured: attenuated tokens with argument constraints, the
+                       suite Cedar policies, leases and audit (arm A2).
 
 No LLM is involved. See README.md for the method and its limits.
 """
@@ -20,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
 import shutil
 import socket
 import subprocess
@@ -31,6 +37,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import yaml
@@ -45,9 +52,9 @@ sys.path.insert(0, str(ROOT / "sdk" / "python" / "src"))
 
 from onbehalf import (  # noqa: E402
     AdminClient,
+    ApiError,
     Capability,
     Client,
-    Denied,
     Equals,
     OneOf,
     Prefix,
@@ -58,15 +65,25 @@ USER = "alice"
 USER_ISSUER = "https://idp.example"
 ROOT_AGENT = "assistant"
 WORKER = "worker"
-WORKER_SECRET = "eval-worker-secret"
+AGENT_SECRET = "eval-worker-secret"
+DECISION_HEADER = "x-onbehalf-decision-id"
+CODE_DENIED = -32003
+CODE_UNKNOWN_SERVER = -32004
 
-ARMS = ("direct", "scope_only", "onbehalf")
-STAGES = ("capability", "policy", "lease")
+ARMS = ("direct", "scope_only", "scope_constraints", "policy_only", "onbehalf")
+PROXIED = ARMS[1:]
+CONSTRAINED_ARMS = ("scope_constraints", "onbehalf")
+PERMIT_ALL_ARMS = ("scope_only", "scope_constraints")
+STAGES = ("name", "lease", "capability", "policy", "exchange")
 ROLES = ("benign", "attack")
 CLASSES = ("S", "C", "D", "N")
 SPLITS = ("dev", "test")
 
 PERMIT_ALL = '@id("permit_all")\npermit(principal, action, resource);\n'
+
+# Reasons the proxy gives before the policy engine runs: the request names a server or tool
+# that does not exist, or a name outside the naming rule.
+NAME_REASONS = ("invalid_name", "tool_not_listed", "tool_not_in_catalog", "unknown_server")
 
 
 # --- corpus -----------------------------------------------------------------------------------
@@ -80,14 +97,44 @@ class Call:
     expect: str
     stage: str | None
     note: str | None = None
+    server: str | None = None  # None: the case's own upstream
+    resolves_to: str | None = None  # where a spoofed server name lands in the direct arm
+    spoof_of: str | None = None  # the real tool a spoofed tool name imitates
+    holder: str = WORKER  # which agent's token makes the call (``as:`` in YAML)
+    decoy: str | None = None  # sent as a duplicate, earlier ``params.name`` member
+    original_label: str | None = None  # hand label before an oracle disagreement was resolved
+
+    def target(self, default: str) -> str:
+        return self.server or default
+
+    @property
+    def label(self) -> str:
+        return self.expect if self.stage is None else f"{self.expect}/{self.stage}"
 
 
 @dataclass(frozen=True)
 class Revoke:
     reason: str
+    holder: str = WORKER  # whose lease (``lease_of:`` in YAML)
 
 
-Step = Call | Revoke
+@dataclass(frozen=True)
+class Delegate:
+    """The holder of ``parent``'s token exchanges it for a token for ``agent`` with ``grant``."""
+
+    parent: str
+    agent: str
+    grant: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class Batch:
+    """Several calls in one JSON-RPC batch (one HTTP request, one server)."""
+
+    calls: tuple[Call, ...]
+
+
+Step = Call | Revoke | Delegate | Batch
 
 
 @dataclass(frozen=True)
@@ -102,10 +149,22 @@ class Case:
     grant: list[dict[str, Any]]
     steps: list[Step]
     note: str | None = None
+    taxonomy: str | None = None
+    original_class: str | None = None
 
     @property
     def calls(self) -> list[Call]:
-        return [s for s in self.steps if isinstance(s, Call)]
+        out: list[Call] = []
+        for s in self.steps:
+            if isinstance(s, Call):
+                out.append(s)
+            elif isinstance(s, Batch):
+                out.extend(s.calls)
+        return out
+
+    @property
+    def agents(self) -> set[str]:
+        return {s.agent for s in self.steps if isinstance(s, Delegate)}
 
 
 @dataclass
@@ -122,13 +181,25 @@ class CorpusError(ValueError):
     pass
 
 
-def _parse_step(case_id: str, i: int, raw: dict[str, Any], catalog: dict[str, Any]) -> Step:
-    where = f"{case_id} step {i}"
-    if "revoke" in raw:
-        return Revoke(str(raw["revoke"]))
+def _parse_call(where: str, raw: dict[str, Any], env: dict[str, Suite], home: Suite) -> Call:
     tool = raw.get("tool")
-    if tool not in catalog:
-        raise CorpusError(f"{where}: tool {tool!r} is not in the suite catalog")
+    server = raw.get("server")
+    if not isinstance(tool, str) or not tool:
+        raise CorpusError(f"{where}: a call needs a tool")
+    resolves_to = raw.get("resolves_to")
+    known_server = server is None or server in {s.upstream for s in env.values()}
+    if not known_server and resolves_to is None:
+        raise CorpusError(f"{where}: unknown server {server!r} needs resolves_to")
+    target = next(
+        (s for s in env.values() if s.upstream == (resolves_to or server or home.upstream)), None
+    )
+    if target is None:
+        raise CorpusError(f"{where}: resolves_to {resolves_to!r} is not a suite upstream")
+    spoof_of = raw.get("spoof_of")
+    if tool not in target.catalog and spoof_of is None:
+        raise CorpusError(f"{where}: tool {tool!r} is not in the {target.name} catalog")
+    if spoof_of is not None and spoof_of not in target.catalog:
+        raise CorpusError(f"{where}: spoof_of {spoof_of!r} is not in the {target.name} catalog")
     role, expect, stage = raw.get("role"), raw.get("expect"), raw.get("stage")
     if role not in ROLES:
         raise CorpusError(f"{where}: role must be one of {ROLES}")
@@ -138,7 +209,45 @@ def _parse_step(case_id: str, i: int, raw: dict[str, Any], catalog: dict[str, An
         raise CorpusError(f"{where}: a deny needs a stage and an allow must not have one")
     if stage is not None and stage not in STAGES:
         raise CorpusError(f"{where}: stage must be one of {STAGES}")
-    return Call(str(tool), dict(raw.get("args") or {}), role, expect, stage, raw.get("note"))
+    known = {
+        "tool", "args", "role", "expect", "stage", "note", "server", "resolves_to", "spoof_of",
+        "as", "decoy", "original_label",
+    }  # fmt: skip
+    if set(raw) - known:
+        raise CorpusError(f"{where}: unknown keys {sorted(set(raw) - known)}")
+    return Call(
+        tool=tool,
+        args=dict(raw.get("args") or {}),
+        role=role,
+        expect=expect,
+        stage=stage,
+        note=raw.get("note"),
+        server=server,
+        resolves_to=resolves_to,
+        spoof_of=spoof_of,
+        holder=str(raw.get("as", WORKER)),
+        decoy=raw.get("decoy"),
+        original_label=raw.get("original_label"),
+    )
+
+
+def _parse_step(
+    case_id: str, i: int, raw: dict[str, Any], env: dict[str, Suite], home: Suite
+) -> Step:
+    where = f"{case_id} step {i}"
+    if "revoke" in raw:
+        return Revoke(str(raw["revoke"]), str(raw.get("lease_of", WORKER)))
+    if "delegate" in raw:
+        d = raw["delegate"]
+        return Delegate(str(d.get("from", WORKER)), str(d["to"]), list(d["grant"]))
+    if "batch" in raw:
+        calls = tuple(_parse_call(f"{where}.{j}", c, env, home) for j, c in enumerate(raw["batch"]))
+        if len({c.target(home.upstream) for c in calls}) != 1 or any(c.decoy for c in calls):
+            raise CorpusError(f"{where}: a batch goes to one server and has no decoys")
+        if len({c.holder for c in calls}) != 1:
+            raise CorpusError(f"{where}: a batch is sent with one token")
+        return Batch(calls)
+    return _parse_call(where, raw, env, home)
 
 
 def load_environment(policies_dir: Path | None = None) -> dict[str, Suite]:
@@ -165,7 +274,19 @@ def load_environment(policies_dir: Path | None = None) -> dict[str, Suite]:
     return env
 
 
-def load_cases(path: Path, suite: Suite) -> list[Case]:
+def _grant_ok(where: str, grant: list[dict[str, Any]], env: dict[str, Suite], home: Suite) -> None:
+    for g in grant:
+        server = g.get("server", home.upstream)
+        target = next((s for s in env.values() if s.upstream == server), None)
+        if target is None:
+            raise CorpusError(f"{where}: granted server {server!r} is not a suite upstream")
+        tool = g["tool"]
+        if tool != "*" and not tool.endswith("*") and tool not in target.catalog:
+            raise CorpusError(f"{where}: granted tool {tool!r} is not in the catalog")
+
+
+def load_cases(path: Path, suite: Suite, env: dict[str, Suite] | None = None) -> list[Case]:
+    env = env if env is not None else {suite.name: suite}
     doc = yaml.safe_load(path.read_text())
     if doc.get("suite") != suite.name:
         raise CorpusError(f"{path}: suite must be {suite.name!r}")
@@ -176,7 +297,7 @@ def load_cases(path: Path, suite: Suite) -> list[Case]:
         if cid in seen:
             raise CorpusError(f"duplicate case id {cid}")
         seen.add(cid)
-        steps = [_parse_step(cid, i, s, suite.catalog) for i, s in enumerate(raw["calls"])]
+        steps = [_parse_step(cid, i, s, env, suite) for i, s in enumerate(raw["calls"])]
         case = Case(
             id=cid,
             suite=suite.name,
@@ -188,21 +309,28 @@ def load_cases(path: Path, suite: Suite) -> list[Case]:
             grant=list(raw["grant"]),
             steps=steps,
             note=raw.get("note"),
+            taxonomy=raw.get("taxonomy"),
+            original_class=raw.get("original_class"),
         )
         if case.cls not in CLASSES:
             raise CorpusError(f"{cid}: class must be one of {CLASSES}")
         if not any(c.role == "attack" for c in case.calls):
             raise CorpusError(f"{cid}: a case needs at least one attack call")
-        for g in case.grant:
-            if g["tool"] != "*" and g["tool"] not in suite.catalog:
-                raise CorpusError(f"{cid}: granted tool {g['tool']!r} is not in the catalog")
+        _grant_ok(cid, case.grant, env, suite)
+        holders = {WORKER}
+        for s in case.steps:
+            if isinstance(s, Delegate):
+                _grant_ok(cid, s.grant, env, suite)
+                holders.add(s.agent)
+        for c in case.calls:
+            if c.holder not in holders:
+                raise CorpusError(f"{cid}: call by {c.holder!r}, who never gets a token")
         out.append(case)
     return out
 
 
 def load_corpus(split: str = "dev", cases_dir: Path | None = None) -> list[Suite]:
-    """Every suite of the environment, with the cases of one split (``cases/<split>/``).
-    Suites without cases in the split are left out."""
+    """Every suite of the environment that has cases in one split (``cases/<split>/``)."""
     if split not in SPLITS:
         raise CorpusError(f"split must be one of {SPLITS}")
     d = cases_dir or CASES_DIR / split
@@ -213,12 +341,16 @@ def load_corpus(split: str = "dev", cases_dir: Path | None = None) -> list[Suite
         if name not in env:
             raise CorpusError(f"{p}: no suite {name!r} in policies/")
         s = env[name]
-        s.cases = load_cases(p, s)
+        s.cases = load_cases(p, s, env)
         suites.append(s)
     ids = [c.id for s in suites for c in s.cases]
     if len(ids) != len(set(ids)):
         raise CorpusError("case ids must be unique across the split")
     return suites
+
+
+def case_files(split: str) -> dict[str, str]:
+    return {p.name: sha256_file(p) for p in sorted((CASES_DIR / split).glob("*.yaml"))}
 
 
 # --- freeze -----------------------------------------------------------------------------------
@@ -273,16 +405,22 @@ def _constraint(spec: dict[str, Any]) -> Equals | OneOf | Prefix:
     raise CorpusError(f"unknown constraint operator {op!r}")
 
 
-def capabilities(suite: Suite, case: Case, *, constraints: bool) -> list[Capability]:
+def grant_capabilities(
+    upstream: str, grant: list[dict[str, Any]], *, constraints: bool
+) -> list[Capability]:
     caps = []
-    for g in case.grant:
+    for g in grant:
         cons = (
             {k: _constraint(v) for k, v in (g.get("constraints") or {}).items()}
             if constraints
             else {}
         )
-        caps.append(Capability(suite.upstream, g["tool"], **cons))
+        caps.append(Capability(g.get("server", upstream), g["tool"], **cons))
     return caps
+
+
+def capabilities(suite: Suite, case: Case, *, constraints: bool) -> list[Capability]:
+    return grant_capabilities(suite.upstream, case.grant, constraints=constraints)
 
 
 # --- config generation ------------------------------------------------------------------------
@@ -301,16 +439,31 @@ def _toml_type(ty: str) -> str:
     return _toml_str(t)
 
 
+def agent_ids(suites: list[Suite]) -> list[str]:
+    """Every agent that receives a token by exchange: the worker, any delegate target, and the
+    root agent (so that a delegation back to it fails on the chain rule, not on a secret)."""
+    names = {WORKER, ROOT_AGENT}
+    for s in suites:
+        for c in s.cases:
+            names |= c.agents
+    return sorted(names)
+
+
 def write_config(
-    work: Path, suites: list[Suite], port: int, upstream_urls: dict[str, str], arm: str
+    work: Path,
+    env: list[Suite],
+    port: int,
+    upstream_urls: dict[str, str],
+    arm: str,
+    agents: list[str],
 ) -> Path:
     """Write ``config.toml`` and ``policy.cedar`` for one arm into ``work``."""
     policy = work / "policy.cedar"
-    if arm == "scope_only":
+    if arm in PERMIT_ALL_ARMS:
         policy.write_text(PERMIT_ALL)
     else:
-        policy.write_text("\n".join(f"// ---- suite {s.name} ----\n{s.policy}" for s in suites))
-    secret_sha = hashlib.sha256(WORKER_SECRET.encode()).hexdigest()
+        policy.write_text("\n".join(f"// ---- suite {s.name} ----\n{s.policy}" for s in env))
+    secret_sha = hashlib.sha256(AGENT_SECRET.encode()).hexdigest()
     lines = [
         "# Generated by evaluation/injection-suite/harness.py. Do not edit.",
         "[server]",
@@ -322,7 +475,7 @@ def write_config(
         "[policy]",
         f"policies_path = {_toml_str(str(policy))}",
     ]
-    for s in suites:
+    for s in env:
         for tool, spec in s.catalog.items():
             lines.append(f"[policy.catalog.{s.upstream}.{tool}]")
             if spec.get("readonly"):
@@ -339,21 +492,19 @@ def write_config(
         "[admin]",
         f'token = "{ADMIN_TOKEN}"',
     ]
-    for s in suites:
+    for s in env:
         lines += ["[[upstreams]]", f'name = "{s.upstream}"', f'url = "{upstream_urls[s.upstream]}"']
-    caps = ", ".join(f'"{s.upstream}:*"' for s in suites)
+    caps = ", ".join(f'"{s.upstream}:*"' for s in env)
     lines += [
         "[[root_grants]]",
         f'subject = "{USER}"',
         f'issuer = "{USER_ISSUER}"',
         f'agent = "{ROOT_AGENT}"',
         f"capabilities = [{caps}]",
-        "[[agents]]",
-        f'id = "{WORKER}"',
-        f'secret_sha256 = "{secret_sha}"',
-        "[dev]",
-        "allow_root_mint = true",
     ]
+    for a in agents:
+        lines += ["[[agents]]", f'id = "{a}"', f'secret_sha256 = "{secret_sha}"']
+    lines += ["[dev]", "allow_root_mint = true"]
     cfg = work / "config.toml"
     cfg.write_text("\n".join(lines) + "\n")
     return cfg
@@ -376,13 +527,13 @@ class Binaries:
 
 
 def find_binaries() -> Binaries:
-    """Prebuilt binaries from ``ONBEHALF_BIN_DIR``, else ``target/debug`` (run ``cargo build``)."""
+    """Prebuilt binaries from ``ONBEHALF_BIN_DIR``, else ``target/debug`` (run ``cargo build``).
+    ``fake_mcp`` is taken from the directory itself or from ``examples/``, whichever is newer."""
     given = os.environ.get("ONBEHALF_BIN_DIR")
     d = Path(given) if given else ROOT / "target" / "debug"
-    fake = d / "examples" / "fake_mcp"
-    bins = Binaries(
-        d / "onbehalf-server", d / "onbehalf", fake if fake.exists() else d / "fake_mcp"
-    )
+    fakes = [p for p in (d / "fake_mcp", d / "examples" / "fake_mcp") if p.exists()]
+    fake = max(fakes, key=lambda p: p.stat().st_mtime) if fakes else d / "fake_mcp"
+    bins = Binaries(d / "onbehalf-server", d / "onbehalf", fake)
     missing = [str(p) for p in (bins.server, bins.cli, bins.fake_mcp) if not p.exists()]
     if missing:
         raise FileNotFoundError(
@@ -399,8 +550,22 @@ class Upstream:
     url: str
     log: Path
 
+    def received(self) -> list[tuple[str, Any]]:
+        """Every ``tools/call`` this upstream logged, as (tool name, arguments)."""
+        out: list[tuple[str, Any]] = []
+        marker = "fake-mcp: tools/call "
+        for line in self.log.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.startswith(marker):
+                continue
+            name, _, args = line[len(marker) :].partition(" ")
+            try:
+                out.append((name, json.loads(args)))
+            except ValueError:
+                out.append((name, None))
+        return out
+
     def calls(self) -> int:
-        return sum(1 for line in self.log.read_text().splitlines() if "tools/call" in line)
+        return len(self.received())
 
 
 @dataclass
@@ -455,12 +620,17 @@ def upstreams(suites: list[Suite], bins: Binaries, work: Path) -> Iterator[dict[
 
 @contextmanager
 def server(
-    suites: list[Suite], bins: Binaries, work: Path, ups: dict[str, Upstream], arm: str
+    env: list[Suite],
+    bins: Binaries,
+    work: Path,
+    ups: dict[str, Upstream],
+    arm: str,
+    agents: list[str],
 ) -> Iterator[Stack]:
     arm_dir = work / arm
     arm_dir.mkdir()
     port = free_port()
-    cfg = write_config(arm_dir, suites, port, {k: u.url for k, u in ups.items()}, arm)
+    cfg = write_config(arm_dir, env, port, {k: u.url for k, u in ups.items()}, arm, agents)
     lint = subprocess.run(
         [str(bins.cli), "policy", "lint", str(arm_dir / "policy.cedar"), "--config", str(cfg)],
         capture_output=True,
@@ -501,9 +671,13 @@ def server(
 def stage_of(reason: str | None) -> str | None:
     if reason is None:
         return None
+    if reason in NAME_REASONS:
+        return "name"
+    if reason.startswith("exchange_refused"):
+        return "exchange"
     if reason.startswith("capability_"):
         return "capability"
-    if reason.startswith("policy_"):
+    if reason.startswith("policy_") or reason == "attribute_type_mismatch":
         return "policy"
     if reason.startswith("lease_"):
         return "lease"
@@ -517,6 +691,8 @@ class CallResult:
     arm: str
     index: int
     tool: str
+    server: str
+    holder: str
     role: str
     expect: str
     expect_stage: str | None
@@ -525,11 +701,20 @@ class CallResult:
     stage: str | None
     decision_id: str | None
     reached_upstream: bool
+    args_intact: bool | None  # the upstream got exactly the call's arguments (None: not reached)
     note: str | None = None
+    detail: str | None = None
+    spoof: bool = False
 
     @property
     def as_expected(self) -> bool:
         return self.outcome == self.expect and self.stage == self.expect_stage
+
+    @property
+    def audited(self) -> bool:
+        """Whether an audit record exists: refusals before authentication (unknown server) and
+        calls never sent (the delegation was refused) have none."""
+        return self.arm != "direct" and self.stage != "exchange" and self.reason != "unknown_server"
 
     def to_json(self) -> dict[str, Any]:
         d = dict(self.__dict__)
@@ -537,71 +722,299 @@ class CallResult:
         return d
 
 
-def replay_direct(suites: list[Suite], ups: dict[str, Upstream]) -> list[CallResult]:
-    """Baseline: every call straight to the upstream. Revocation means nothing here."""
+def _canon(v: Any) -> str:
+    return json.dumps(v, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+class _Observer:
+    """What every upstream logged between two points, matched to the calls of one request."""
+
+    def __init__(self, ups: dict[str, Upstream]) -> None:
+        self.ups = ups
+        self.before = {k: u.calls() for k, u in ups.items()}
+
+    def take(self) -> dict[str, list[tuple[str, Any]]]:
+        return {k: u.received()[self.before[k] :] for k, u in self.ups.items()}
+
+
+def _delivered(
+    new: dict[str, list[tuple[str, Any]]], upstream: str | None, call: Call
+) -> tuple[bool, bool | None]:
+    """Pop the line for ``call`` from ``new``: (reached the upstream, arguments intact)."""
+    lines = new.get(upstream or "", [])
+    for i, (name, args) in enumerate(lines):
+        if name == call.tool:
+            lines.pop(i)
+            return True, _canon(args) == _canon(call.args)
+    return False, None
+
+
+def _echoed(msg: dict[str, Any] | None, call: Call) -> tuple[bool, bool | None]:
+    """(reached, arguments intact) from fake_mcp's echo ``{"name", "arguments"}`` in a reply."""
+    try:
+        echo = json.loads((msg or {})["result"]["content"][0]["text"])
+    except (KeyError, IndexError, TypeError, ValueError):
+        return False, None
+    if echo.get("name") != call.tool:
+        return False, None
+    return True, _canon(echo.get("arguments")) == _canon(call.args)
+
+
+def _rpc_body(call: Call, rid: int) -> Any:
+    return {
+        "jsonrpc": "2.0",
+        "id": rid,
+        "method": "tools/call",
+        "params": {"name": call.tool, "arguments": call.args},
+    }
+
+
+def _decoy_bytes(call: Call, rid: int) -> bytes:
+    """A request whose ``params`` names the decoy first and the real tool second. Parsers that
+    keep the last duplicate member (serde_json, Python) see the real tool."""
+    params = (
+        f'{{"name":{json.dumps(call.decoy)},"arguments":{json.dumps(call.args)},'
+        f'"name":{json.dumps(call.tool)}}}'
+    )
+    return f'{{"jsonrpc":"2.0","id":{rid},"method":"tools/call","params":{params}}}'.encode()
+
+
+def _parse_messages(resp: httpx.Response) -> list[dict[str, Any]]:
+    text = resp.text
+    if "event-stream" in resp.headers.get("content-type", ""):
+        out = []
+        for block in text.replace("\r\n", "\n").split("\n\n"):
+            data = "\n".join(
+                ln[5:].removeprefix(" ") for ln in block.split("\n") if ln.startswith("data:")
+            )
+            if data.strip():
+                try:
+                    v = json.loads(data)
+                except ValueError:
+                    continue
+                out.extend(v if isinstance(v, list) else [v])
+        return out
+    try:
+        v = json.loads(text)
+    except ValueError:
+        return []
+    return v if isinstance(v, list) else [v]
+
+
+def _judge(msg: dict[str, Any] | None, header_ids: list[str]) -> tuple[str, str | None, str | None]:
+    """(outcome, reason, decision id) of one JSON-RPC reply."""
+    if msg is None:
+        return "error", "no_reply", None
+    err = msg.get("error")
+    if isinstance(err, dict):
+        data = err.get("data") if isinstance(err.get("data"), dict) else {}
+        if err.get("code") == CODE_DENIED and data.get("decision_id") in header_ids:
+            return "deny", str(data.get("reason")), str(data.get("decision_id"))
+        if err.get("code") == CODE_UNKNOWN_SERVER:
+            return "deny", "unknown_server", None
+        return "error", f"rpc_{err.get('code')}", None
+    res = msg.get("result") or {}
+    return ("error" if res.get("isError") else "allow"), None, None
+
+
+class _Replayer:
+    """Replays one case's steps in one arm and records a CallResult per call."""
+
+    def __init__(
+        self,
+        arm: str,
+        suite: Suite,
+        case: Case,
+        ups: dict[str, Upstream],
+        http: httpx.Client,
+        stack: Stack | None = None,
+        ob: Client | None = None,
+        admin: AdminClient | None = None,
+    ) -> None:
+        self.arm, self.suite, self.case, self.ups, self.http = arm, suite, case, ups, http
+        self.stack, self.ob, self.admin = stack, ob, admin
+        self.tokens: dict[str, Any] = {}
+        self.refused: dict[str, str] = {}
+        self.out: list[CallResult] = []
+        self.index = 0
+        self.rid = 0
+
+    # tokens
+    def start(self, all_upstreams: list[str]) -> None:
+        if self.arm == "direct":
+            return
+        assert self.ob is not None and self.admin is not None
+        root = self.admin.mint_root_dev(
+            USER, USER_ISSUER, ROOT_AGENT, [f"{u}:*" for u in all_upstreams]
+        )
+        if self.arm == "policy_only":
+            self.tokens[WORKER] = root
+            return
+        caps = capabilities(self.suite, self.case, constraints=self.arm in CONSTRAINED_ARMS)
+        self.tokens[WORKER] = self.ob.exchange(root, WORKER, caps, client_secret=AGENT_SECRET)
+
+    def delegate(self, d: Delegate) -> None:
+        if self.arm == "direct":
+            return
+        if d.parent in self.refused or d.parent not in self.tokens:
+            self.refused[d.agent] = self.refused.get(d.parent, "no_parent_token")
+            return
+        if self.arm == "policy_only":
+            self.tokens[d.agent] = self.tokens[d.parent]
+            return
+        assert self.ob is not None
+        caps = grant_capabilities(
+            self.suite.upstream, d.grant, constraints=self.arm in CONSTRAINED_ARMS
+        )
+        try:
+            self.tokens[d.agent] = self.ob.exchange(
+                self.tokens[d.parent], d.agent, caps, client_secret=AGENT_SECRET
+            )
+        except ApiError as e:
+            self.refused[d.agent] = f"{e.error}:{e.detail or e.description or ''}"
+
+    def revoke(self, r: Revoke) -> None:
+        if self.arm == "direct" or r.holder not in self.tokens:
+            return
+        assert self.admin is not None
+        tok = self.tokens[r.holder]
+        assert tok.lease is not None
+        self.admin.revoke_lease(tok.lease, r.reason)
+
+    # calls
+    def _record(self, call: Call, outcome: str, reason: str | None, decision: str | None,
+                reached: bool, intact: bool | None, detail: str | None = None) -> None:  # fmt: skip
+        self.out.append(
+            CallResult(
+                case=self.case.id,
+                suite=self.suite.name,
+                arm=self.arm,
+                index=self.index,
+                tool=call.tool,
+                server=call.target(self.suite.upstream),
+                holder=call.holder,
+                role=call.role,
+                expect=call.expect,
+                expect_stage=call.stage,
+                outcome=outcome,
+                reason=reason,
+                stage=stage_of(reason),
+                decision_id=decision,
+                reached_upstream=reached,
+                args_intact=intact,
+                note=call.note,
+                detail=detail,
+                spoof=call.spoof_of is not None or call.resolves_to is not None,
+            )
+        )
+        self.index += 1
+
+    def _post(self, server: str, token: Any, body: Any, raw: bytes | None) -> httpx.Response:
+        headers = {
+            "accept": "application/json, text/event-stream",
+            "content-type": "application/json",
+        }
+        if self.arm == "direct":
+            url = self.ups[server].url
+        else:
+            assert self.stack is not None
+            url = f"{self.stack.url}/mcp/{quote(server, safe='')}"
+            headers["authorization"] = f"Bearer {token}"
+        if raw is not None:
+            return self.http.post(url, content=raw, headers=headers)
+        return self.http.post(url, json=body, headers=headers)
+
+    def send(self, calls: tuple[Call, ...], batch: bool) -> None:
+        first = calls[0]
+        dest = first.target(self.suite.upstream)
+        if self.arm == "direct":
+            dest = first.resolves_to or dest
+        token = None
+        if self.arm != "direct":
+            if first.holder in self.refused or first.holder not in self.tokens:
+                why = self.refused.get(first.holder, "no_token")
+                for c in calls:
+                    self._record(c, "deny", "exchange_refused", None, False, None, why)
+                return
+            token = self.tokens[first.holder]
+        ids = []
+        for _ in calls:
+            self.rid += 1
+            ids.append(self.rid)
+        if batch:
+            body: Any = [_rpc_body(c, i) for c, i in zip(calls, ids, strict=True)]
+            raw = None
+        else:
+            body = _rpc_body(first, ids[0])
+            raw = _decoy_bytes(first, ids[0]) if first.decoy else None
+        obs = _Observer(self.ups)
+        resp = self._post(dest, token, body, raw)
+        new = obs.take()
+        header = [p.strip() for p in resp.headers.get(DECISION_HEADER, "").split(",") if p.strip()]
+        msgs = {m.get("id"): m for m in _parse_messages(resp) if isinstance(m, dict)}
+        landed = first.resolves_to or first.target(self.suite.upstream)
+        if self.arm != "direct":
+            landed = first.target(self.suite.upstream)
+        for n, (c, rid) in enumerate(zip(calls, ids, strict=True)):
+            msg = msgs.get(rid)
+            if msg is None and not batch and len(msgs) == 1:
+                msg = next(iter(msgs.values()))  # an error with id null (unknown server)
+            outcome, reason, decision = _judge(msg, header)
+            if outcome == "allow" and self.arm != "direct" and len(header) > n:
+                decision = header[n] if batch else header[0]
+            if batch:
+                # fake_mcp logs single requests only; a batch member is checked against the
+                # upstream's echo of what it executed, which comes back in the reply.
+                reached, intact = _echoed(msg, c)
+            else:
+                reached, intact = _delivered(new, landed if landed in self.ups else None, c)
+            self._record(c, outcome, reason, decision, reached, intact)
+
+    def run(self) -> list[CallResult]:
+        for step in self.case.steps:
+            if isinstance(step, Revoke):
+                self.revoke(step)
+            elif isinstance(step, Delegate):
+                self.delegate(step)
+            elif isinstance(step, Batch):
+                self.send(step.calls, batch=True)
+            else:
+                self.send((step,), batch=False)
+        return self.out
+
+
+def ordered_cases(suites: list[Suite], seed: int) -> list[tuple[Suite, Case]]:
+    """Cases in file order (seed 0) or in an order shuffled by ``seed``. Results are sorted by
+    case id afterwards, so the seed changes only the order of execution."""
+    pairs = [(s, c) for s in suites for c in s.cases]
+    if seed:
+        random.Random(seed).shuffle(pairs)
+    return pairs
+
+
+def replay(
+    arm: str,
+    pairs: list[tuple[Suite, Case]],
+    ups: dict[str, Upstream],
+    all_upstreams: list[str],
+    stack: Stack | None = None,
+) -> list[CallResult]:
     out: list[CallResult] = []
     with httpx.Client(timeout=10) as http:
-        for s in suites:
-            up = ups[s.upstream]
-            for case in s.cases:
-                for i, call in enumerate(case.calls):
-                    before = up.calls()
-                    r = http.post(
-                        up.url,
-                        json={
-                            "jsonrpc": "2.0",
-                            "id": i,
-                            "method": "tools/call",
-                            "params": {"name": call.tool, "arguments": call.args},
-                        },
-                        headers={"accept": "application/json, text/event-stream"},
-                    )
-                    body = r.json()
-                    ok = "result" in body and not body["result"].get("isError", False)
-                    out.append(
-                        CallResult(
-                            case.id, s.name, "direct", i, call.tool, call.role, call.expect,
-                            call.stage, "allow" if ok else "error", None, None, None,
-                            up.calls() > before, call.note,
-                        )
-                    )  # fmt: skip
-    return out
-
-
-def replay_proxy(suites: list[Suite], stack: Stack, arm: str) -> list[CallResult]:
-    out: list[CallResult] = []
-    admin = AdminClient(stack.url, ADMIN_TOKEN)
-    with Client(stack.url) as ob:
-        for s in suites:
-            up = stack.upstreams[s.upstream]
-            for case in s.cases:
+        if arm == "direct":
+            for s, case in pairs:
+                out += _Replayer(arm, s, case, ups, http).run()
+            return out
+        assert stack is not None
+        admin = AdminClient(stack.url, ADMIN_TOKEN)
+        with Client(stack.url) as ob:
+            for s, case in pairs:
                 # A parent token can be exchanged for a given actor once, so every case gets a
-                # fresh root: alice's assistant with the whole suite, as a broad PAT would be.
-                root = admin.mint_root_dev(USER, USER_ISSUER, ROOT_AGENT, [f"{s.upstream}:*"])
-                caps = capabilities(s, case, constraints=(arm == "onbehalf"))
-                tok = ob.exchange(root, WORKER, caps, client_secret=WORKER_SECRET)
-                i = 0
-                for step in case.steps:
-                    if isinstance(step, Revoke):
-                        assert tok.lease is not None
-                        admin.revoke_lease(tok.lease, step.reason)
-                        continue
-                    before = up.calls()
-                    try:
-                        res = ob.call_tool(tok, s.upstream, step.tool, step.args)
-                        outcome = "error" if res.is_error else "allow"
-                        reason, decision = None, res.decision_id
-                    except Denied as d:
-                        outcome, reason, decision = "deny", d.reason, d.decision_id
-                    out.append(
-                        CallResult(
-                            case.id, s.name, arm, i, step.tool, step.role, step.expect,
-                            step.stage, outcome, reason, stage_of(reason), decision,
-                            up.calls() > before, step.note,
-                        )
-                    )  # fmt: skip
-                    i += 1
-    admin.close()
+                # fresh root: alice's assistant with every server, as a broad PAT would be.
+                r = _Replayer(arm, s, case, ups, http, stack, ob, admin)
+                r.start(all_upstreams)
+                out += r.run()
+        admin.close()
     return out
 
 
@@ -619,7 +1032,8 @@ def audit_check(stack: Stack, results: list[CallResult]) -> dict[str, Any]:
             break
         seq = nxt
     mismatched = []
-    for r in results:
+    checked = [r for r in results if r.audited]
+    for r in checked:
         e = entries.get(r.decision_id or "")
         want = "deny" if r.outcome == "deny" else "allow"
         if e is None or e.decision != want or (r.reason and e.reason != r.reason):
@@ -634,8 +1048,10 @@ def audit_check(stack: Stack, results: list[CallResult]) -> dict[str, Any]:
     offline = stack.cli("audit", "verify", "--file", str(export), "--jwks", str(jwks))
     return {
         "entries": len(entries),
-        "decisions_matched": len(results) - len(mismatched),
+        "decisions_checked": len(checked),
+        "decisions_matched": len(checked) - len(mismatched),
         "decisions_unmatched": mismatched,
+        "not_audited": len(results) - len(checked),
         "cli_verify_exit": verify.returncode,
         "cli_verify_output": verify.stdout.strip(),
         "export_exit": exp.returncode,
@@ -644,42 +1060,58 @@ def audit_check(stack: Stack, results: list[CallResult]) -> dict[str, Any]:
     }
 
 
+def case_meta(suites: list[Suite]) -> dict[str, Any]:
+    return {
+        c.id: {
+            "suite": c.suite,
+            "shape": c.shape,
+            "attack_class": c.attack_class,
+            "class": c.cls,
+            "taxonomy": c.taxonomy,
+            "user_task": c.user_task,
+            "injection": c.injection,
+            "note": c.note,
+        }
+        for s in sorted(suites, key=lambda s: s.name)
+        for c in s.cases
+    }
+
+
 def run(
-    suites: list[Suite], arms: tuple[str, ...] = ARMS, keep: Path | None = None
+    suites: list[Suite],
+    arms: tuple[str, ...] = ARMS,
+    keep: Path | None = None,
+    seed: int = 0,
 ) -> dict[str, Any]:
     """Run the arms and return a JSON-able result document."""
     bins = find_binaries()
+    env = list(load_environment().values())
+    all_upstreams = [s.upstream for s in env]
+    agents = agent_ids(suites)
+    pairs = ordered_cases(suites, seed)
     work = Path(tempfile.mkdtemp(prefix="onbehalf-injection-"))
     try:
         results: list[CallResult] = []
         audits: dict[str, Any] = {}
-        with upstreams(suites, bins, work) as ups:
-            if "direct" in arms:
-                results += replay_direct(suites, ups)
-            for arm in arms:
-                if arm == "direct":
+        with upstreams(env, bins, work) as ups:
+            for arm in ARMS:
+                if arm not in arms:
                     continue
-                with server(suites, bins, work, ups, arm) as stack:
-                    arm_results = replay_proxy(suites, stack, arm)
+                if arm == "direct":
+                    results += replay(arm, pairs, ups, all_upstreams)
+                    continue
+                with server(env, bins, work, ups, arm, agents) as stack:
+                    arm_results = replay(arm, pairs, ups, all_upstreams, stack)
                     audits[arm] = audit_check(stack, arm_results)
                     results += arm_results
+        order = {a: i for i, a in enumerate(ARMS)}
+        results.sort(key=lambda r: (order[r.arm], r.case, r.index))
         return {
             "cases": sum(len(s.cases) for s in suites),
-            "arms": list(arms),
+            "arms": [a for a in ARMS if a in arms],
+            "seed": seed,
             "audit": audits,
-            "case_meta": {
-                c.id: {
-                    "suite": c.suite,
-                    "shape": c.shape,
-                    "attack_class": c.attack_class,
-                    "class": c.cls,
-                    "user_task": c.user_task,
-                    "injection": c.injection,
-                    "note": c.note,
-                }
-                for s in suites
-                for c in s.cases
-            },
+            "case_meta": case_meta(suites),
             "calls": [r.to_json() for r in results],
         }
     finally:
@@ -703,14 +1135,13 @@ def summarise(doc: dict[str, Any]) -> dict[str, Any]:
                 "arm": c["arm"],
                 "cases": set(),
                 "attack_calls": 0,
-                "blocked_capability": 0,
-                "blocked_policy": 0,
-                "blocked_lease": 0,
+                **{f"blocked_{s}": 0 for s in STAGES},
                 "blocked_other": 0,
                 "attack_allowed": 0,
                 "attack_reached_upstream": 0,
                 "benign_calls": 0,
                 "benign_denied": 0,
+                "benign_delivered_intact": 0,
                 "unexpected": 0,
             },
         )
@@ -725,6 +1156,7 @@ def summarise(doc: dict[str, Any]) -> dict[str, Any]:
         else:
             r["benign_calls"] += 1
             r["benign_denied"] += int(c["outcome"] == "deny")
+            r["benign_delivered_intact"] += int(bool(c["reached_upstream"] and c["args_intact"]))
         if c["arm"] == "onbehalf" and not c["as_expected"]:
             r["unexpected"] += 1
     out = []
