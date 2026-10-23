@@ -23,6 +23,9 @@
 //! | `GET /admin/audit`, `/admin/audit/verify`, `/admin/audit/checkpoint` | admin | audit |
 //! | `GET /admin/audit/export?from&to` | admin | stream a verifiable slice of the log as JSON Lines |
 //! | `POST /admin/policies/reload` | admin | hot-reload the Cedar policy file |
+//! | `GET /admin/policies` | admin | the policy set in force: ids, text, file digest, load time ([`routes::policies`]) |
+//! | `GET /admin/policies/check` | admin | lint the policy file on disk against the running schema; swaps nothing |
+//! | `POST /admin/policies/evaluate` | admin | dry run: what the loaded policies say about one call; no lease check, no audit |
 
 #![deny(unsafe_code)]
 
@@ -60,7 +63,7 @@ pub fn build(config: &Config) -> anyhow::Result<(Router, Arc<AppState>)> {
 
 /// The full router over an existing state.
 pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Config) -> Router {
-    use routes::{admin, authzen, dev_root, renew, token, wellknown};
+    use routes::{admin, authzen, dev_root, policies, renew, token, wellknown};
 
     let mut admin_routes = Router::new()
         .route("/admin/leases/{lease_id}", get(admin::lease_status))
@@ -69,6 +72,12 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
         .route("/admin/audit/verify", get(admin::audit_verify))
         .route("/admin/audit/checkpoint", get(admin::audit_checkpoint))
         .route("/admin/audit/export", get(admin::audit_export))
+        .route("/admin/policies", get(policies::get_policies))
+        .route("/admin/policies/check", get(policies::check_policies))
+        .route(
+            "/admin/policies/evaluate",
+            post(policies::evaluate_policies),
+        )
         .route("/admin/policies/reload", post(admin::reload_policies));
     if state.dev_allow_root_mint {
         admin_routes = admin_routes.route("/admin/root-token", post(dev_root::mint_root));

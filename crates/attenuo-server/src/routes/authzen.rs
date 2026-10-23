@@ -360,7 +360,10 @@ fn check_issued(state: &AppState, chain: &DelegationChain) -> Result<(), String>
 }
 
 /// Put the verified chain into `subject.properties.chain`, or check the one already there.
-fn attach_chain(req: &mut EvaluationRequest, chain: &DelegationChain) -> Result<(), ApiError> {
+pub(crate) fn attach_chain(
+    req: &mut EvaluationRequest,
+    chain: &DelegationChain,
+) -> Result<(), ApiError> {
     if req.subject.id.is_empty() {
         req.subject.id = chain
             .current_agent()
