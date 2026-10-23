@@ -70,6 +70,9 @@ pub struct Config {
     pub dev: DevSection,
     #[serde(default)]
     pub metrics: MetricsSection,
+    /// The opt-in admin console listener. See [`AdminUiSection`].
+    #[serde(default)]
+    pub admin_ui: AdminUiSection,
     #[serde(default)]
     pub proxy: ProxySection,
     #[serde(default)]
@@ -941,6 +944,75 @@ fn default_metrics_listen() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 9100))
 }
 
+/// `[admin_ui]`: the admin console, on its own opt-in listener.
+///
+/// The console is served on a separate port rather than on the main listener so that it never
+/// shares an origin with `/mcp/{server}`, where an upstream chooses the response content type
+/// (see `docs/design/admin-console.md`). The listener serves the embedded console assets under
+/// `/admin/ui/` and the admin API under `/admin/*` behind the same `[admin] token`; see
+/// [`crate::admin_ui`]. An absent section means no console.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminUiSection {
+    /// Bind the console listener. Default `false`: no console, nothing extra is listening.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Address of the console listener. Default `127.0.0.1:9101`, so the console is reached
+    /// from the host itself or through an SSH tunnel.
+    #[serde(default = "default_admin_ui_listen")]
+    pub listen: SocketAddr,
+    /// Allow `listen` to be a non-loopback address. Default `false`: the server refuses to start
+    /// with the console enabled on a public address, because the console exposes the admin API
+    /// to a browser. When set, a warning is logged at startup and `[admin] token` must pass the
+    /// same strength check as for a public `[server] listen`.
+    #[serde(default)]
+    pub allow_public: bool,
+    /// Mount the routes that change state (`POST /admin/leases/{id}/revoke` and
+    /// `POST /admin/policies/reload`) on the console listener. Default `false`, so read-only is
+    /// enforced by the server and not only by the page: those paths answer 404 there. The main
+    /// listener keeps every admin route whatever this says.
+    #[serde(default)]
+    pub allow_write: bool,
+}
+
+impl AdminUiSection {
+    /// Startup check, as for `[metrics]` (SR-38): a console listener off loopback needs
+    /// `allow_public = true`, and gets a warning when it has it.
+    pub fn check_listen(&self) -> anyhow::Result<()> {
+        if !self.enabled || self.listen.ip().is_loopback() {
+            return Ok(());
+        }
+        if !self.allow_public {
+            anyhow::bail!(
+                "[admin_ui] listen = {} is not a loopback address and the console exposes the \
+                 admin API to browsers; bind 127.0.0.1 (and use an SSH tunnel) or set \
+                 [admin_ui] allow_public = true",
+                self.listen
+            );
+        }
+        tracing::warn!(
+            listen = %self.listen,
+            "[admin_ui] console listener is not on loopback: restrict it with network policy"
+        );
+        Ok(())
+    }
+}
+
+impl Default for AdminUiSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: default_admin_ui_listen(),
+            allow_public: false,
+            allow_write: false,
+        }
+    }
+}
+
+fn default_admin_ui_listen() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 9101))
+}
+
 /// `[proxy]`: the MCP proxy mounted at `/mcp/{server}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1325,24 +1397,32 @@ impl Config {
     }
 
     /// Refuse a weak or missing admin token unless the server listens on loopback only, where
-    /// it is a warning (SR-15).
+    /// it is a warning (SR-15). An enabled `[admin_ui]` listener counts as a listener here,
+    /// since it serves the admin API too.
     pub fn check_admin_token(&self) -> anyhow::Result<()> {
         let Some(problem) = self.admin_token_problem() else {
             return Ok(());
         };
-        if self.server.listen.ip().is_loopback() {
+        // The console listener serves the admin API too, so it counts as exposure.
+        let console = self
+            .admin_ui
+            .enabled
+            .then_some(("[admin_ui] listen", self.admin_ui.listen));
+        let exposed = std::iter::once(("[server] listen", self.server.listen))
+            .chain(console)
+            .find(|(_, addr)| !addr.ip().is_loopback());
+        let Some((key, addr)) = exposed else {
             tracing::warn!(
                 listen = %self.server.listen,
                 "{problem}; accepted because the server only listens on loopback. Generate a \
                  real one with `openssl rand -hex 32` before binding another address."
             );
             return Ok(());
-        }
+        };
         anyhow::bail!(
-            "{problem}, and [server] listen = {} is not loopback. Set a random token of at \
+            "{problem}, and {key} = {addr} is not loopback. Set a random token of at \
              least {MIN_ADMIN_TOKEN_LEN} bytes (`openssl rand -hex 32`) in [admin] token or \
-             {ADMIN_TOKEN_ENV}.",
-            self.server.listen
+             {ADMIN_TOKEN_ENV}."
         )
     }
 
@@ -1707,6 +1787,68 @@ mod tests {
         ))
         .unwrap();
         assert!(docker.check_admin_token().is_err());
+    }
+
+    #[test]
+    fn admin_ui_is_disabled_by_default() {
+        let cfg = Config::from_toml("").unwrap();
+        assert_eq!(cfg.admin_ui, AdminUiSection::default());
+        assert!(!cfg.admin_ui.enabled);
+        assert!(!cfg.admin_ui.allow_public);
+        assert!(!cfg.admin_ui.allow_write);
+        assert_eq!(cfg.admin_ui.listen, "127.0.0.1:9101".parse().unwrap());
+        cfg.admin_ui.check_listen().unwrap();
+        // An empty section is the same as no section.
+        assert_eq!(
+            Config::from_toml("[admin_ui]\n").unwrap().admin_ui,
+            AdminUiSection::default()
+        );
+        let cfg = Config::from_toml(
+            "[admin_ui]\nenabled = true\nlisten = \"127.0.0.1:9200\"\nallow_write = true\n",
+        )
+        .unwrap();
+        assert!(cfg.admin_ui.enabled && cfg.admin_ui.allow_write);
+        assert_eq!(cfg.admin_ui.listen.port(), 9200);
+        assert!(Config::from_toml("[admin_ui]\ncors = true\n").is_err());
+    }
+
+    #[test]
+    fn admin_ui_listener_off_loopback_needs_allow_public() {
+        let at = |addr: &str, enabled: bool, allow_public: bool| AdminUiSection {
+            enabled,
+            listen: addr.parse().unwrap(),
+            allow_public,
+            allow_write: false,
+        };
+        for ok in [
+            at("127.0.0.1:9101", true, false),
+            at("[::1]:9101", true, false),
+            at("0.0.0.0:9101", false, false),
+            at("0.0.0.0:9101", true, true),
+            at("10.0.0.5:9101", true, true),
+        ] {
+            ok.check_listen().unwrap();
+        }
+        for bad in ["0.0.0.0:9101", "10.0.0.5:9101", "[::]:9101"] {
+            let err = at(bad, true, false).check_listen().unwrap_err().to_string();
+            assert!(err.contains("[admin_ui] listen"), "{err}");
+            assert!(err.contains("allow_public"), "{err}");
+        }
+    }
+
+    #[test]
+    fn public_admin_ui_needs_a_strong_admin_token() {
+        let mut cfg = Config::default();
+        cfg.admin.token = Some("short".into());
+        cfg.admin_ui.listen = "0.0.0.0:9101".parse().unwrap();
+        cfg.admin_ui.allow_public = true;
+        // Disabled: the console address does not matter.
+        cfg.check_admin_token().unwrap();
+        cfg.admin_ui.enabled = true;
+        let err = cfg.check_admin_token().unwrap_err().to_string();
+        assert!(err.contains("[admin_ui] listen"), "{err}");
+        cfg.admin.token = Some("0123456789abcdef0123456789abcdef".into());
+        cfg.check_admin_token().unwrap();
     }
 
     /// SR-19: the loopback `Host` names discovery accepts without `public_url`.
