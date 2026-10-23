@@ -106,6 +106,9 @@ impl DelegationChain {
         if lease.0.is_empty() {
             return Err(ChainError::EmptyLeaseId { index: 0 });
         }
+        capabilities
+            .validate()
+            .map_err(|source| ChainError::InvalidName { index: 0, source })?;
         Ok(Self {
             originating_user,
             hops: vec![Hop {
@@ -164,6 +167,9 @@ impl DelegationChain {
                 lease: lease.0,
             });
         }
+        requested
+            .validate()
+            .map_err(|source| ChainError::InvalidName { index, source })?;
         let capabilities = parent
             .capabilities
             .attenuate(&requested)
@@ -195,7 +201,8 @@ impl DelegationChain {
     /// Call this on every chain received from the outside, after signature verification.
     ///
     /// Checked, in order: a non-empty subject; at least one hop and at most `max_depth`; then
-    /// per hop: non-empty agent and lease ids, `issued_at < expires_at`, not expired at `now`,
+    /// per hop: non-empty agent and lease ids, capability patterns that are valid names
+    /// ([`crate::names`]), `issued_at < expires_at`, not expired at `now`,
     /// a lease and an agent id that no earlier hop uses, and, against the parent hop,
     /// `issued_at` not before the parent's, an expiry not after the parent's, and capabilities
     /// the parent covers.
@@ -222,6 +229,9 @@ impl DelegationChain {
             if hop.lease.0.is_empty() {
                 return Err(ChainError::EmptyLeaseId { index: i });
             }
+            hop.capabilities
+                .validate()
+                .map_err(|source| ChainError::InvalidName { index: i, source })?;
             if hop.issued_at >= hop.expires_at {
                 return Err(ChainError::IssuedAfterExpiry { index: i });
             }
@@ -716,5 +726,56 @@ mod tests {
         assert_eq!(child.prefix_digest(1), Some(child.digest()));
         assert_eq!(child.prefix_digest(2), None);
         assert_ne!(child.prefix_digest(0), child.prefix_digest(1));
+    }
+
+    #[test]
+    fn invalid_capability_names_are_rejected_sr13() {
+        let now = OffsetDateTime::now_utc();
+        let user = OriginatingUser {
+            subject: "alice".into(),
+            issuer: "https://idp".into(),
+            authenticated_at: now,
+            attributes: Default::default(),
+        };
+        let bad = CapabilitySet::from_iter([Capability::new("evil/github", "*")]);
+        assert!(matches!(
+            DelegationChain::root(
+                user.clone(),
+                AgentId::new("a"),
+                bad.clone(),
+                now,
+                Duration::hours(1),
+                LeaseId::new("l1"),
+            ),
+            Err(ChainError::InvalidName { index: 0, .. })
+        ));
+        let root = DelegationChain::root(
+            user,
+            AgentId::new("a"),
+            CapabilitySet::from_iter([Capability::new("*", "*")]),
+            now,
+            Duration::hours(1),
+            LeaseId::new("l1"),
+        )
+        .unwrap();
+        // `*` covers it, but it is still not a name a call can have.
+        assert!(matches!(
+            root.extend(
+                AgentId::new("b"),
+                bad.clone(),
+                now,
+                Duration::hours(1),
+                LeaseId::new("l2"),
+                8
+            ),
+            Err(ChainError::InvalidName { index: 1, .. })
+        ));
+        // A received chain is checked too.
+        let mut forged = root.clone();
+        forged.hops[0].capabilities = bad;
+        assert!(matches!(
+            forged.validate_at(now, 8),
+            Err(ChainError::InvalidName { index: 0, .. })
+        ));
     }
 }

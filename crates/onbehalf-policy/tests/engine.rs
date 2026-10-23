@@ -343,7 +343,7 @@ fn deep_chains_are_forbidden() {
 fn sensitive_tools_require_mfa() {
     // Add a permit for delete_repo so the only thing standing in the way is the MFA forbid.
     let policies = format!(
-        "{DEFAULT_POLICIES}\n@id(\"permit_delete\") permit(principal, action == Action::\"delete_repo\", resource);"
+        "{DEFAULT_POLICIES}\n@id(\"permit_delete\") permit(principal, action == Action::\"github/delete_repo\", resource);"
     );
     let engine = engine_with(&policies);
     let call = call("delete_repo", json!({"repo": "acme/old"}));
@@ -390,7 +390,7 @@ fn forbid_wins_over_permit_and_both_ids_are_reported_appropriately() {
     let engine = engine_with(
         r#"
         @id("p") permit(principal, action, resource);
-        @id("f") forbid(principal, action == Action::"delete_repo", resource);
+        @id("f") forbid(principal, action == Action::"github/delete_repo", resource);
         "#,
     );
     let out = engine.authorize(&chain(), &call("delete_repo", json!({})), now());
@@ -410,7 +410,7 @@ fn principal_hierarchy_user_and_agents() {
     let engine = engine_with(
         r#"
         @id("alice_only") permit(principal in User::"alice", action, resource);
-        @id("under_planner") forbid(principal in Agent::"planner", action == Action::"delete_repo", resource);
+        @id("under_planner") forbid(principal in Agent::"planner", action == Action::"github/delete_repo", resource);
         "#,
     );
     let planner = chain_for(
@@ -470,7 +470,7 @@ fn context_exposes_chain_session_time_and_resource_hierarchy() {
 fn nested_and_numeric_arguments_are_available_to_policies() {
     let engine = engine_with(
         r#"
-        @id("limit") permit(principal, action == Action::"set_limit", resource)
+        @id("limit") permit(principal, action == Action::"github/set_limit", resource)
         when { context.input has count && context.input.count <= 10 };
         "#,
     );
@@ -498,7 +498,7 @@ fn evaluation_errors_deny_even_when_a_permit_matches() {
     let engine = engine_with(
         r#"
         @id("all") permit(principal, action, resource);
-        @id("cap") forbid(principal, action == Action::"set_limit", resource)
+        @id("cap") forbid(principal, action == Action::"github/set_limit", resource)
         when { context.input has count && context.input.count > 10 };
         "#,
     );
@@ -559,7 +559,9 @@ fn validation_error_surfaces_for_unknown_attribute_and_unknown_action() {
     // An action that no catalog entry declares is a typo until proven otherwise.
     let err = PolicyEngineBuilder::new()
         .with_catalog(catalog())
-        .with_policies_str(r#"permit(principal, action == Action::"craete_issue", resource);"#)
+        .with_policies_str(
+            r#"permit(principal, action == Action::"github/craete_issue", resource);"#,
+        )
         .build()
         .unwrap_err();
     assert!(matches!(err, PolicyError::Validation(_)), "{err}");
@@ -782,7 +784,7 @@ fn integral_floats_are_longs_so_equality_forbids_hold() {
 
 const GROUP_POLICY: &str = r#"
 @id("eng_reads")
-permit(principal, action == Action::"read_file", resource)
+permit(principal, action == Action::"github/read_file", resource)
 when {
     context.originating_user.attributes has groups &&
     context.originating_user.attributes.groups.contains("eng") &&
@@ -878,7 +880,7 @@ fn mistyped_declared_attribute_denies_instead_of_matching_ne_permit() {
         .with_catalog(ToolCatalog::new().with("srv", "read_file", ToolAttrs::new()))
         .with_user_attr("status", ArgType::String)
         .with_policies_str(
-            r#"permit(principal, action == Action::"read_file", resource)
+            r#"permit(principal, action == Action::"srv/read_file", resource)
                when { context.originating_user.attributes has status
                       && context.originating_user.attributes.status != "suspended" };"#,
         )
@@ -919,5 +921,138 @@ fn mistyped_declared_attribute_denies_instead_of_matching_ne_permit() {
             assert!(!out.decision.is_allow(), "{attrs}");
             assert_eq!(out.reason, REASON_ATTRIBUTE_TYPE_MISMATCH, "{attrs}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// SR-13: actions are server-scoped
+// ---------------------------------------------------------------------------------------------
+
+fn two_server_catalog() -> ToolCatalog {
+    ToolCatalog::new()
+        .with("github", "read_file", ToolAttrs::new())
+        .with("evil", "read_file", ToolAttrs::new())
+}
+
+fn any_server_chain() -> DelegationChain {
+    chain_for(
+        user(),
+        "coder",
+        caps(vec![Capability::new("*", "read_file")]),
+    )
+}
+
+#[test]
+fn a_permit_for_one_servers_tool_does_not_match_another_server_sr13() {
+    let engine = PolicyEngineBuilder::new()
+        .with_catalog(two_server_catalog())
+        .with_policies_str(
+            r#"@id("gh_read") permit(principal, action == Action::"github/read_file", resource);"#,
+        )
+        .build()
+        .unwrap();
+    let ok = engine.authorize(
+        &any_server_chain(),
+        &ToolCall::new("github", "read_file", json!({})),
+        now(),
+    );
+    assert_eq!(ok.reason, REASON_POLICY_ALLOW);
+    assert_eq!(ok.policy_ids, vec!["gh_read"]);
+    let evil = engine.authorize(
+        &any_server_chain(),
+        &ToolCall::new("evil", "read_file", json!({})),
+        now(),
+    );
+    assert_eq!(evil.reason, REASON_POLICY_DENY, "{evil:?}");
+
+    // `resource in Server::"..."` scopes as well, and `action in Action::"invoke"` still
+    // covers every server's actions.
+    let engine = PolicyEngineBuilder::new()
+        .with_catalog(two_server_catalog())
+        .with_policies_str(
+            r#"permit(principal, action in Action::"invoke", resource in Server::"github");"#,
+        )
+        .build()
+        .unwrap();
+    for (server, allow) in [("github", true), ("evil", false)] {
+        let o = engine.authorize(
+            &any_server_chain(),
+            &ToolCall::new(server, "read_file", json!({})),
+            now(),
+        );
+        assert_eq!(o.decision.is_allow(), allow, "{server}: {o:?}");
+    }
+}
+
+#[test]
+fn bare_actions_need_the_legacy_switch_sr13() {
+    let bare = r#"@id("bare") permit(principal, action == Action::"read_file", resource);"#;
+    let err = PolicyEngineBuilder::new()
+        .with_catalog(two_server_catalog())
+        .with_policies_str(bare)
+        .build()
+        .unwrap_err();
+    assert!(matches!(err, PolicyError::Validation(_)), "{err}");
+
+    // With the deprecated switch the old form loads, with the old (unscoped) meaning.
+    let engine = PolicyEngineBuilder::new()
+        .with_catalog(two_server_catalog())
+        .with_legacy_bare_actions(true)
+        .with_policies_str(bare)
+        .build()
+        .unwrap();
+    assert!(engine.legacy_bare_actions());
+    for server in ["github", "evil"] {
+        let o = engine.authorize(
+            &any_server_chain(),
+            &ToolCall::new(server, "read_file", json!({})),
+            now(),
+        );
+        assert!(o.decision.is_allow(), "{server}: {o:?}");
+    }
+    // ... and the namespaced form does not load in that mode.
+    assert!(PolicyEngineBuilder::new()
+        .with_catalog(two_server_catalog())
+        .with_legacy_bare_actions(true)
+        .with_policies_str(r#"permit(principal, action == Action::"github/read_file", resource);"#)
+        .build()
+        .is_err());
+}
+
+#[test]
+fn catalog_and_call_names_are_checked_sr13() {
+    for (server, tool) in [
+        ("a/b", "read_file"),
+        ("", "x"),
+        ("github", "/x"),
+        ("github", ""),
+    ] {
+        let err = PolicyEngineBuilder::new()
+            .with_catalog(ToolCatalog::new().with(server, tool, ToolAttrs::new()))
+            .build()
+            .unwrap_err();
+        assert!(
+            matches!(err, PolicyError::Catalog(_)),
+            "{server:?}/{tool:?}: {err}"
+        );
+    }
+    // Method-style names (the proxy's `resources/read`) are fine in the catalog.
+    PolicyEngineBuilder::new()
+        .with_catalog(ToolCatalog::new().with("github", "resources/read", ToolAttrs::new()))
+        .with_policies_str(
+            r#"permit(principal, action == Action::"github/resources/read", resource);"#,
+        )
+        .build()
+        .unwrap();
+
+    let engine = engine_with("permit(principal, action, resource);");
+    let wide = chain_for(user(), "coder", caps(vec![Capability::new("*", "*")]));
+    for call in [
+        ToolCall::new("a/b", "read_file", json!({})),
+        ToolCall::new("github", "a//b", json!({})),
+        ToolCall::new("github", "", json!({})),
+    ] {
+        let o = engine.authorize(&wide, &call, now());
+        assert_eq!(o.reason, onbehalf_policy::REASON_INVALID_NAME, "{call:?}");
     }
 }

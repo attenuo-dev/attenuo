@@ -85,6 +85,8 @@ pub struct FakeMcpServer {
     /// notification event, like a streaming server does (instead of one event per HTTP reply).
     sse_event_per_response: bool,
     session_id: String,
+    /// Resolve `tools/call` names case-insensitively, like some real servers do (SR-25).
+    case_insensitive_names: bool,
 }
 
 impl FakeMcpServer {
@@ -110,7 +112,15 @@ impl FakeMcpServer {
             sse: false,
             sse_event_per_response: false,
             session_id: "fake-session-1".into(),
+            case_insensitive_names: false,
         }
+    }
+
+    /// Resolve `tools/call` names case-insensitively against the tool list (`Delete_Repo` runs
+    /// `delete_repo`), the way some servers do. The recorded call carries the resolved name.
+    pub fn with_case_insensitive_names(mut self, on: bool) -> Self {
+        self.case_insensitive_names = on;
+        self
     }
 
     /// Resources returned by `resources/list`, one per URI.
@@ -232,10 +242,20 @@ impl FakeMcpServer {
             }
             "prompts/list" => self.page("prompts", &self.prompts, msg),
             "tools/call" => {
-                let name = msg["params"]["name"]
+                let mut name = msg["params"]["name"]
                     .as_str()
                     .unwrap_or_default()
                     .to_owned();
+                if self.case_insensitive_names {
+                    if let Some(listed) = self
+                        .tools
+                        .iter()
+                        .filter_map(|t| t["name"].as_str())
+                        .find(|t| t.eq_ignore_ascii_case(&name))
+                    {
+                        name = listed.to_owned();
+                    }
+                }
                 let arguments = msg["params"]
                     .get("arguments")
                     .cloned()
@@ -362,11 +382,16 @@ async fn fake_handle(
 
 /// Maps bearer strings to pre-built chains and decides purely from
 /// `chain.effective_capabilities().permits(call)`. Every decision is recorded.
+///
+/// Without [`with_catalog`](Self::with_catalog) every tool counts as catalogued
+/// ([`Authorizer::knows_tool`] is always true), so the proxy's `require_listed_tools` check
+/// never refuses anything; with a catalog, only the listed `(server, tool)` pairs are known.
 #[derive(Default)]
 pub struct StaticAuthorizer {
     chains: HashMap<String, DelegationChain>,
     revoked: Arc<Mutex<std::collections::HashSet<String>>>,
     decisions: Arc<Mutex<Vec<DecisionRecord>>>,
+    catalog: Option<std::collections::HashSet<(String, String)>>,
 }
 
 impl StaticAuthorizer {
@@ -379,6 +404,17 @@ impl StaticAuthorizer {
 
     pub fn with_chain(mut self, bearer: impl Into<String>, chain: DelegationChain) -> Self {
         self.chains.insert(bearer.into(), chain);
+        self
+    }
+
+    /// Know only these `(server, tool)` pairs ([`Authorizer::knows_tool`]).
+    pub fn with_catalog<'a>(mut self, tools: impl IntoIterator<Item = (&'a str, &'a str)>) -> Self {
+        self.catalog = Some(
+            tools
+                .into_iter()
+                .map(|(s, t)| (s.to_owned(), t.to_owned()))
+                .collect(),
+        );
         self
     }
 
@@ -464,6 +500,12 @@ impl Authorizer for StaticAuthorizer {
             reason: reason.into(),
             decision_id: id,
         }
+    }
+
+    fn knows_tool(&self, server: &str, tool: &str) -> bool {
+        self.catalog
+            .as_ref()
+            .is_none_or(|c| c.contains(&(server.to_owned(), tool.to_owned())))
     }
 
     async fn record_rejection(

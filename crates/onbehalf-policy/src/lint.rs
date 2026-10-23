@@ -4,6 +4,10 @@
 //! [`PolicyEngineBuilder::build`](crate::PolicyEngineBuilder::build) stops at the first failing
 //! stage and flattens errors to a string. This module keeps going where it can and keeps the
 //! source locations, which is what an editor or a CI log wants.
+//!
+//! It also flags bare actions (`Action::"read_file"`, stage `actions`): since SR-13 an action
+//! names its server (`Action::"github/read_file"`). A bare action is an error by default and a
+//! deprecation warning under [`LintOptions::legacy_bare_actions`].
 
 use std::str::FromStr;
 
@@ -23,7 +27,7 @@ pub enum LintSeverity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LintIssue {
     pub severity: LintSeverity,
-    /// `schema`, `parse`, or `validate`.
+    /// `schema`, `parse`, `actions` or `validate`.
     pub stage: &'static str,
     /// The policy the issue is about, when Cedar names one.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -112,10 +116,154 @@ fn issue(
     }
 }
 
+/// Options for [`lint_with_options`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LintOptions {
+    /// The policies are for an engine with `[policy] legacy_bare_actions = true`: bare actions
+    /// are warnings (deprecated) instead of errors. The schema text must match (generated with
+    /// the same switch).
+    pub legacy_bare_actions: bool,
+}
+
+/// An `Action::"<id>"` entity reference in policy text, outside comments, with the policy it is
+/// in (its `@id`, else Cedar's default `policy<N>`) and its location.
+struct ActionRef {
+    id: String,
+    policy_id: String,
+    loc: (usize, usize),
+}
+
+/// Read a string literal whose opening quote is at `start`; returns its raw contents and the
+/// index just past the closing quote.
+fn read_string(text: &str, start: usize) -> (String, usize) {
+    let bytes = text.as_bytes();
+    let mut j = start + 1;
+    while j < bytes.len() && bytes[j] != b'"' {
+        j += if bytes[j] == b'\\' { 2 } else { 1 };
+    }
+    let end = j.min(bytes.len());
+    (text[start + 1..end].to_string(), (j + 1).min(bytes.len()))
+}
+
+fn skip_ws(bytes: &[u8], mut j: usize) -> usize {
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    j
+}
+
+fn is_ident(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Find every `Action::"..."` in `text`. A small scanner, not a Cedar parser: it skips `//`
+/// comments and string literals, tracks `@id("...")` annotations and counts `;` to know which
+/// policy it is in. Only run on text that already parsed.
+fn action_refs(text: &str) -> Vec<ActionRef> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut index = 0usize;
+    let mut current_id: Option<String> = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'"' => i = read_string(text, i).1,
+            b';' => {
+                index += 1;
+                current_id = None;
+                i += 1;
+            }
+            b'@' if text[i + 1..].starts_with("id")
+                && bytes.get(i + 3).is_some_and(|b| !is_ident(*b)) =>
+            {
+                let j = skip_ws(bytes, i + 3);
+                if bytes.get(j) == Some(&b'(') {
+                    let k = skip_ws(bytes, j + 1);
+                    if bytes.get(k) == Some(&b'"') {
+                        let (id, next) = read_string(text, k);
+                        current_id = Some(id);
+                        i = next;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            b'A' if text[i..].starts_with("Action")
+                && (i == 0 || !is_ident(bytes[i - 1]))
+                && bytes.get(i + 6).is_none_or(|b| !is_ident(*b)) =>
+            {
+                let start = i;
+                let j = skip_ws(bytes, i + 6);
+                if text[j..].starts_with("::") {
+                    let k = skip_ws(bytes, j + 2);
+                    if bytes.get(k) == Some(&b'"') {
+                        let (id, next) = read_string(text, k);
+                        out.push(ActionRef {
+                            id,
+                            policy_id: current_id
+                                .clone()
+                                .unwrap_or_else(|| format!("policy{index}")),
+                            loc: line_col(text, start),
+                        });
+                        i = next;
+                        continue;
+                    }
+                }
+                i += 6;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// Issues for bare (not server-scoped) actions, SR-13.
+fn bare_action_issues(text: &str, options: LintOptions) -> Vec<LintIssue> {
+    action_refs(text)
+        .into_iter()
+        .filter(|r| r.id != crate::GENERIC_ACTION && !r.id.contains('/'))
+        .map(|r| {
+            let (severity, message) = if options.legacy_bare_actions {
+                (
+                    LintSeverity::Warning,
+                    format!(
+                        "bare action `Action::\"{id}\"` matches `{id}` on every server; \
+                         [policy] legacy_bare_actions is deprecated: write \
+                         `Action::\"<server>/{id}\"` and turn it off",
+                        id = r.id
+                    ),
+                )
+            } else {
+                (
+                    LintSeverity::Error,
+                    format!(
+                        "bare action `Action::\"{id}\"`: actions are server-scoped, write \
+                         `Action::\"<server>/{id}\"` (SR-13); bare actions load only with the \
+                         deprecated [policy] legacy_bare_actions = true",
+                        id = r.id
+                    ),
+                )
+            };
+            issue(severity, "actions", Some(r.policy_id), message, Some(r.loc))
+        })
+        .collect()
+}
+
 /// Lint `policy_text` against `schema_text` (see
 /// [`PolicyEngineBuilder::schema_text`](crate::PolicyEngineBuilder::schema_text)), in Cedar
-/// strict validation mode, the mode the engine itself uses.
+/// strict validation mode, the mode the engine itself uses, with default [`LintOptions`] (bare
+/// actions are errors).
 pub fn lint(policy_text: &str, schema_text: &str) -> LintReport {
+    lint_with_options(policy_text, schema_text, LintOptions::default())
+}
+
+/// [`lint`] with options.
+pub fn lint_with_options(policy_text: &str, schema_text: &str, options: LintOptions) -> LintReport {
     let mut report = LintReport::default();
 
     let schema = match Schema::from_cedarschema_str(schema_text) {
@@ -163,6 +311,9 @@ pub fn lint(policy_text: &str, schema_text: &str) -> LintReport {
     };
     report.policy_ids = policies.policies().map(|p| p.id().to_string()).collect();
     report.policy_ids.sort();
+    report
+        .issues
+        .extend(bare_action_issues(policy_text, options));
 
     let result = Validator::new(schema).validate(&policies, ValidationMode::Strict);
     for e in result.validation_errors() {
@@ -212,7 +363,7 @@ mod tests {
     #[test]
     fn clean_policy_has_no_issues() {
         let r = lint(
-            "@id(\"p\")\npermit(principal, action == Action::\"read_file\", resource);\n",
+            "@id(\"p\")\npermit(principal, action == Action::\"github/read_file\", resource);\n",
             &schema(),
         );
         assert!(r.issues.is_empty(), "{:?}", r.issues);
@@ -251,6 +402,47 @@ mod tests {
         let r = lint(text, &schema());
         assert!(r.has_errors());
         assert!(r.issues[0].message.contains("duplicate"), "{:?}", r.issues);
+    }
+
+    #[test]
+    fn bare_actions_are_flagged_sr13() {
+        let text = concat!(
+            "// Action::\"in_comment\" is ignored\n",
+            "@id(\"bare\")\n",
+            "permit(principal, action in [Action::\"invoke\", Action :: \"read_file\"], resource);\n",
+            "permit(principal, action == Action::\"github/read_file\", resource)\n",
+            "when { \"Action::\\\"x\\\"\" == \"y\" };\n",
+        );
+        let r = lint(text, &schema());
+        let bare: Vec<&LintIssue> = r.issues.iter().filter(|i| i.stage == "actions").collect();
+        assert_eq!(bare.len(), 1, "{:?}", r.issues);
+        assert_eq!(bare[0].severity, LintSeverity::Error);
+        assert_eq!(bare[0].policy_id.as_deref(), Some("bare"));
+        assert_eq!((bare[0].line, bare[0].column), (Some(3), Some(48)));
+        assert!(bare[0].message.contains("<server>/read_file"));
+
+        // Under the legacy switch the same reference is a warning, and it validates.
+        let legacy_schema = PolicyEngineBuilder::new()
+            .with_legacy_bare_actions(true)
+            .with_catalog(ToolCatalog::new().with("github", "read_file", ToolAttrs::new()))
+            .schema_text();
+        let r = lint_with_options(
+            "@id(\"bare\")\npermit(principal, action == Action::\"read_file\", resource);\n",
+            &legacy_schema,
+            LintOptions {
+                legacy_bare_actions: true,
+            },
+        );
+        assert!(!r.has_errors(), "{:?}", r.issues);
+        assert_eq!(r.warning_count(), 1, "{:?}", r.issues);
+    }
+
+    #[test]
+    fn unannotated_policies_get_cedar_default_ids() {
+        let text = "permit(principal, action, resource);\nforbid(principal, action == Action::\"read_file\", resource);\n";
+        let refs = action_refs(text);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].policy_id, "policy1");
     }
 
     #[test]

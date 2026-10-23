@@ -161,12 +161,27 @@ pub fn lint(policy: &Path, config: Option<&Path>, show_schema: bool, json_out: b
         Ok(a) => a.unwrap_or_default(),
         Err(e) => return Run::error(e.to_string()),
     };
-    let mut builder = PolicyEngineBuilder::new().with_catalog(catalog);
+    let legacy_bare_actions = match config
+        .map(testing::load_legacy_bare_actions_from_config)
+        .transpose()
+    {
+        Ok(v) => v.flatten().unwrap_or(false),
+        Err(e) => return Run::error(e.to_string()),
+    };
+    let mut builder = PolicyEngineBuilder::new()
+        .with_catalog(catalog)
+        .with_legacy_bare_actions(legacy_bare_actions);
     for (name, ty) in user_attrs {
         builder = builder.with_user_attr(name, ty);
     }
     let schema = builder.schema_text();
-    let report = onbehalf_policy::lint(&text, &schema);
+    let report = onbehalf_policy::lint_with_options(
+        &text,
+        &schema,
+        onbehalf_policy::LintOptions {
+            legacy_bare_actions,
+        },
+    );
 
     if json_out {
         let mut v = serde_json::to_value(&report).unwrap_or_default();
@@ -230,7 +245,7 @@ mod tests {
     use super::*;
 
     const POLICY: &str =
-        "@id(\"read\")\npermit(principal, action == Action::\"read_file\", resource);\n";
+        "@id(\"read\")\npermit(principal, action == Action::\"github/read_file\", resource);\n";
     const CONFIG: &str = "[policy.catalog.github.read_file]\nreadonly = true\n";
 
     fn write(dir: &Path, name: &str, body: &str) -> PathBuf {
@@ -354,6 +369,33 @@ mod tests {
         assert!(schema);
 
         assert!(Cli::try_parse_from(["onbehalf", "policy", "test"]).is_err());
+    }
+
+    #[test]
+    fn lint_flags_bare_actions_unless_the_config_opts_into_them_sr13() {
+        let d = tempfile::tempdir().unwrap();
+        let p = write(
+            d.path(),
+            "p.cedar",
+            "@id(\"read\")\npermit(principal, action == Action::\"read_file\", resource);\n",
+        );
+        let c = write(d.path(), "c.toml", CONFIG);
+        let r = lint(&p, Some(&c), false, false);
+        assert_eq!(r.status, Status::Failed);
+        assert!(
+            r.stdout
+                .contains("p.cedar:2:29: error[actions] (read): bare action"),
+            "{}",
+            r.stdout
+        );
+        let legacy = write(
+            d.path(),
+            "legacy.toml",
+            &format!("[policy]\nlegacy_bare_actions = true\n{CONFIG}"),
+        );
+        let r = lint(&p, Some(&legacy), false, false);
+        assert_eq!(r.status, Status::Ok, "{}", r.stdout);
+        assert!(r.stdout.contains("warning[actions]"), "{}", r.stdout);
     }
 
     #[test]
