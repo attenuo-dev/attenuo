@@ -8,7 +8,9 @@
 # The rust-version in Cargo.toml is 1.89; the toolchain is `stable`, so build with a current
 # image rather than pinning the minimum.
 
-FROM rust:1-bookworm AS build
+# Pinned by digest (multi-arch index, SR-30). Refresh: Dependabot (docker ecosystem), or
+# `docker buildx imagetools inspect rust:1-bookworm` and paste the top-level Digest.
+FROM rust:1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 AS build
 WORKDIR /src
 COPY . .
 # Cache mounts keep the registry and target dir between builds; the binaries are copied out
@@ -21,7 +23,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && cp target/release/onbehalf-server target/release/onbehalf /out/ \
  && cp target/release/examples/fake_mcp /out/fake-mcp
 
-FROM debian:bookworm-slim AS runtime
+# Pinned by digest (multi-arch index, SR-30). Refresh: Dependabot (docker ecosystem), or
+# `docker buildx imagetools inspect debian:bookworm-slim` and paste the top-level Digest.
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS runtime
 # curl is only for the HEALTHCHECK.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \
