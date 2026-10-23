@@ -26,7 +26,7 @@ A Cargo workspace with seven crates, dependencies pointing only downward in this
 Conventions:
 
 - `attenuo-core` has `#![forbid(unsafe_code)]` and no async; the others `#![deny(unsafe_code)]`.
-- Security invariants (attenuation, lease revocation reaching the next call, audit chain verification) get property or integration tests in the crate that owns them, per [CONTRIBUTING](https://github.com/7Mudit/attenuo/blob/main/CONTRIBUTING.md).
+- Security invariants (attenuation, lease revocation reaching the next call, audit chain verification) get property or integration tests in the crate that owns them, per [CONTRIBUTING](https://github.com/attenuo-dev/attenuo/blob/main/CONTRIBUTING.md).
 - Shared `rustfmt.toml`, `clippy.toml` with `-D warnings` in CI, pinned toolchain in `rust-toolchain.toml`.
 - Public APIs in `core`, `token` and `policy` are the integration surface for gateways; `proxy` and `server` are not promised stable.
 

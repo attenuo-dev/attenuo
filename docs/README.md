@@ -16,7 +16,7 @@ This folder is an Obsidian vault (open it with "Open folder as vault") and the p
 - [tasks/](tasks/) — the task board and milestone plans
 - [log/](log/) — engineering log, one file per day
 
-Process documents live at the repository root: [CONTRIBUTING](https://github.com/7Mudit/attenuo/blob/main/CONTRIBUTING.md), [SECURITY](https://github.com/7Mudit/attenuo/blob/main/SECURITY.md), [GOVERNANCE](https://github.com/7Mudit/attenuo/blob/main/GOVERNANCE.md), [CHANGELOG](https://github.com/7Mudit/attenuo/blob/main/CHANGELOG.md). How ADRs and RFCs are written is in [decisions/README.md](decisions/) and [spec/README.md](spec/).
+Process documents live at the repository root: [CONTRIBUTING](https://github.com/attenuo-dev/attenuo/blob/main/CONTRIBUTING.md), [SECURITY](https://github.com/attenuo-dev/attenuo/blob/main/SECURITY.md), [GOVERNANCE](https://github.com/attenuo-dev/attenuo/blob/main/GOVERNANCE.md), [CHANGELOG](https://github.com/attenuo-dev/attenuo/blob/main/CHANGELOG.md). How ADRs and RFCs are written is in [decisions/README.md](decisions/) and [spec/README.md](spec/).
 
 ## Engineering log convention
 

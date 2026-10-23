@@ -6,7 +6,7 @@
 
 attenuo parses a lot of input it does not trust: delegation tokens and DPoP proofs from agents, JSON-RPC bodies and headers from MCP clients, SSE streams and list results from upstreams, tool arguments that become Cedar context, and audit exports handed to an offline verifier. Unit tests and proptest cover the cases someone thought of. The fuzz targets cover the rest: each one feeds generated or mutated input to a public API and checks that it never panics and that a security property still holds.
 
-How to run them, and a table of targets, is in [`fuzz/README.md`](https://github.com/7Mudit/attenuo/blob/main/fuzz/README.md).
+How to run them, and a table of targets, is in [`fuzz/README.md`](https://github.com/attenuo-dev/attenuo/blob/main/fuzz/README.md).
 
 ## Design
 

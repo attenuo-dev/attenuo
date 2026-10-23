@@ -20,7 +20,7 @@ Three consequences of the reference-monitor framing are design rules:
 
 1. **Complete mediation** for the transport it covers: every `tools/call` over streamable HTTP passes the same check; there is no bypass flag.
 2. **Tamper-evidence**: the monitor's own state (keys, leases, log) is the trusted base, kept small and tested.
-3. **Verifiability**: the attenuation and lease invariants are stated as predicates and covered by property tests ([CONTRIBUTING](https://github.com/7Mudit/attenuo/blob/main/CONTRIBUTING.md)).
+3. **Verifiability**: the attenuation and lease invariants are stated as predicates and covered by property tests ([CONTRIBUTING](https://github.com/attenuo-dev/attenuo/blob/main/CONTRIBUTING.md)).
 
 ## Consequences
 

@@ -25,7 +25,7 @@ dpop = ["cryptography>=41"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "cryptography>=41", "ruff", "mypy"]
 
 [project.urls]
-Repository = "https://github.com/7Mudit/attenuo"
+Repository = "https://github.com/attenuo-dev/attenuo"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/attenuo"]

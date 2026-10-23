@@ -18,9 +18,9 @@ Other places to look:
 
 - [FAQ](../faq.md): why a proxy, how it differs from gateways and policy engines, what happens when it is down.
 - [design/server.md](../design/server.md): how a request is decided, with sequence diagrams and error codes.
-- [config/example.toml](https://github.com/7Mudit/attenuo/blob/main/config/example.toml): every config key, annotated.
-- [examples/github-leak-demo](https://github.com/7Mudit/attenuo/blob/main/examples/github-leak-demo/README.md): a scripted replay of a real incident.
-- [examples/claude-agent-sdk](https://github.com/7Mudit/attenuo/blob/main/examples/claude-agent-sdk/README.md) and [examples/langchain-agent](https://github.com/7Mudit/attenuo/blob/main/examples/langchain-agent/README.md): agent frameworks talking to MCP servers through attenuo, a token per hop.
+- [config/example.toml](https://github.com/attenuo-dev/attenuo/blob/main/config/example.toml): every config key, annotated.
+- [examples/github-leak-demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/github-leak-demo/README.md): a scripted replay of a real incident.
+- [examples/claude-agent-sdk](https://github.com/attenuo-dev/attenuo/blob/main/examples/claude-agent-sdk/README.md) and [examples/langchain-agent](https://github.com/attenuo-dev/attenuo/blob/main/examples/langchain-agent/README.md): agent frameworks talking to MCP servers through attenuo, a token per hop.
 - [RFC-0001](../spec/rfc-0001-attenuo.md) and the [threat model](../spec/threat-model.md): what the system promises and what it does not.
 
 ## Conventions in these guides

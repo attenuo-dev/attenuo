@@ -109,7 +109,7 @@ attenuo accepts an ID-JAG, or a plain OIDC ID token, as the credential at hop 0 
 
 ## Does it stop prompt injection?
 
-No. It does not detect injected instructions, and does not try to. It assumes the agent can be talked into anything and limits what the agent can do when that happens: the sub-agent that reads untrusted text holds only the tools it needs, a policy checks the arguments, and a lease lets you pull the plug. The [GitHub leak demo](https://github.com/7Mudit/attenuo/blob/main/examples/github-leak-demo/README.md) shows this on a replay of a real incident.
+No. It does not detect injected instructions, and does not try to. It assumes the agent can be talked into anything and limits what the agent can do when that happens: the sub-agent that reads untrusted text holds only the tools it needs, a policy checks the arguments, and a lease lets you pull the plug. The [GitHub leak demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/github-leak-demo/README.md) shows this on a replay of a real incident.
 
 It cannot stop an agent from misusing something it is legitimately allowed to do. See the [threat model](spec/threat-model.md).
 

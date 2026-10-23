@@ -196,4 +196,4 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 - SR-27 (medium): the proxy's session check read only the first `Mcp-Session-Id` header (none if it was not visible ASCII) but forwarded every one, so a caller could slip another principal's session id past the SR-11 binding. `POST`, `GET` and `DELETE` now answer 400 to more than one `Mcp-Session-Id` or a value outside visible ASCII, forward only the checked value, and drop session headers from an upstream response that carries more than one.
 - SR-28 (medium): a `GET` listen stream or a `tools/call` answered over SSE was lease-checked only when it opened, so revocation and token expiry did not end it. Streamed responses are now re-checked every `[proxy] stream_recheck_seconds` (new, default 2) and ended at the first failure, after a final SSE event with JSON-RPC error `-32001` and `data.reason` (`lease_revoked`, `token_expired`, ...). SSE bodies are relayed event by event; a final event without its terminating blank line is dropped.
 
-[Unreleased]: https://github.com/7Mudit/attenuo/compare/main...HEAD
+[Unreleased]: https://github.com/attenuo-dev/attenuo/compare/main...HEAD

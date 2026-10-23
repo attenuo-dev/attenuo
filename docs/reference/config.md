@@ -2,7 +2,7 @@
 
 The server reads one TOML file: `attenuo-server --config <file>` or `ATTENUO_CONFIG=<file>`. Unknown keys are rejected at start-up. Relative paths resolve against the working directory.
 
-The annotated source of truth is [config/example.toml](https://github.com/7Mudit/attenuo/blob/main/config/example.toml). Never use its example admin token or agent secret for anything real. [Deploying](../guides/deploying.md) covers what to change before you expose a server.
+The annotated source of truth is [config/example.toml](https://github.com/attenuo-dev/attenuo/blob/main/config/example.toml). Never use its example admin token or agent secret for anything real. [Deploying](../guides/deploying.md) covers what to change before you expose a server.
 
 ## `[server]`
 

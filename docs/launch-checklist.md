@@ -4,9 +4,9 @@ Engineering checklist for the first public release. It lists what to check and s
 
 ## Repository settings
 
-- [ ] Branch protection on `main`: pull request required, CI checks required, no direct pushes, as [CONTRIBUTING](https://github.com/7Mudit/attenuo/blob/main/CONTRIBUTING.md) and [GOVERNANCE](https://github.com/7Mudit/attenuo/blob/main/GOVERNANCE.md) already promise. The required checks are the jobs in `.github/workflows/ci.yml`: `fmt`, `clippy`, `test`, `msrv`, `deny`, `audit`, `demo`, `policy-tests`, `fuzz-build`, `docs`. `.github/CODEOWNERS` says code-owner approval satisfies the rule.
+- [ ] Branch protection on `main`: pull request required, CI checks required, no direct pushes, as [CONTRIBUTING](https://github.com/attenuo-dev/attenuo/blob/main/CONTRIBUTING.md) and [GOVERNANCE](https://github.com/attenuo-dev/attenuo/blob/main/GOVERNANCE.md) already promise. The required checks are the jobs in `.github/workflows/ci.yml`: `fmt`, `clippy`, `test`, `msrv`, `deny`, `audit`, `demo`, `policy-tests`, `fuzz-build`, `docs`. `.github/CODEOWNERS` says code-owner approval satisfies the rule.
 - [ ] Discussions switched on. `.github/ISSUE_TEMPLATE/config.yml` already links to `/discussions` for questions and early design ideas, so the link is dead until this is enabled.
-- [ ] Private vulnerability reporting switched on. [SECURITY.md](https://github.com/7Mudit/attenuo/blob/main/SECURITY.md) points reporters at `github.com/7Mudit/attenuo/security/advisories/new`.
+- [ ] Private vulnerability reporting switched on. [SECURITY.md](https://github.com/attenuo-dev/attenuo/blob/main/SECURITY.md) points reporters at `github.com/attenuo-dev/attenuo/security/advisories/new`.
 - [ ] Issue templates render: open the "New issue" page and confirm the bug report, feature request and security links appear, and that blank issues are off (`.github/ISSUE_TEMPLATE/`).
 - [ ] Pull request template appears on a test PR (`.github/pull_request_template.md`).
 - [ ] Dependabot enabled (`.github/dependabot.yml`) and the repository has a description, topics and the Apache-2.0 licence detected.
@@ -34,11 +34,11 @@ Engineering checklist for the first public release. It lists what to check and s
 
 ## Signing and SBOM
 
-- [ ] Verify the signature of the test image with the command from the workflow header, using the real identity `https://github.com/7Mudit/attenuo/.github/workflows/release.yml@` and the issuer `https://token.actions.githubusercontent.com`:
+- [ ] Verify the signature of the test image with the command from the workflow header, using the real identity `https://github.com/attenuo-dev/attenuo/.github/workflows/release.yml@` and the issuer `https://token.actions.githubusercontent.com`:
 
   ```sh
   cosign verify ghcr.io/7mudit/attenuo:<version> \
-    --certificate-identity-regexp '^https://github.com/7Mudit/attenuo/\.github/workflows/release\.yml@' \
+    --certificate-identity-regexp '^https://github.com/attenuo-dev/attenuo/\.github/workflows/release\.yml@' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
   ```
 
@@ -70,7 +70,7 @@ Crate publishing is manual for now (see "Releases" in CONTRIBUTING). The crates 
 
 - [ ] `CHANGELOG.md` `Unreleased` is complete. Compare it with `git cliff --unreleased`, using `cliff.toml`.
 - [ ] Open the `chore(release): vX.Y.Z` PR described in CONTRIBUTING: bump `workspace.package.version`, move `Unreleased` to a dated heading, add a fresh empty `Unreleased`.
-- [ ] Tag, wait for the draft release, and read the git-cliff section the workflow rendered. Edit the first public release's notes by hand: say it is pre-alpha, link the [README status section](https://github.com/7Mudit/attenuo#status), and list the untested areas (identity provider recipes, Docker, production use).
+- [ ] Tag, wait for the draft release, and read the git-cliff section the workflow rendered. Edit the first public release's notes by hand: say it is pre-alpha, link the [README status section](https://github.com/attenuo-dev/attenuo#status), and list the untested areas (identity provider recipes, Docker, production use).
 - [ ] Publish the draft by hand.
 
 ## Before the announcement

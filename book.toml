@@ -10,8 +10,8 @@ build-dir = "book"
 create-missing = false
 
 [output.html]
-git-repository-url = "https://github.com/7Mudit/attenuo"
-edit-url-template = "https://github.com/7Mudit/attenuo/edit/main/{path}"
+git-repository-url = "https://github.com/attenuo-dev/attenuo"
+edit-url-template = "https://github.com/attenuo-dev/attenuo/edit/main/{path}"
 site-url = "/attenuo/"
 default-theme = "light"
 preferred-dark-theme = "navy"

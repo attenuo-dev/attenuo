@@ -4,7 +4,7 @@ attenuo decides every tool call in two stages. First the **capability stage**: t
 
 Policies can only narrow what the chain already grants. A `permit` never adds a capability the token lacks. That is the point: the token says what the user delegated, the policy says what the operator will tolerate on top of that.
 
-This guide covers the request shape, the tool catalog, common patterns, and how to test policies offline and in CI. The reference for the request is the [`attenuo-policy` crate docs](https://github.com/7Mudit/attenuo/blob/main/crates/attenuo-policy/src/lib.rs); the design is in [RFC-0001](../spec/rfc-0001-attenuo.md).
+This guide covers the request shape, the tool catalog, common patterns, and how to test policies offline and in CI. The reference for the request is the [`attenuo-policy` crate docs](https://github.com/attenuo-dev/attenuo/blob/main/crates/attenuo-policy/src/lib.rs); the design is in [RFC-0001](../spec/rfc-0001-attenuo.md).
 
 ## The request
 
@@ -108,7 +108,7 @@ permit(principal, action == Action::"github/read_file", resource)
 when { context.input has repo && context.input.repo like "alice/public-*" };
 ```
 
-This is the rule that stops the prompt-injected "read my private repo" in the [GitHub leak demo](https://github.com/7Mudit/attenuo/blob/main/examples/github-leak-demo/README.md), even though the token allows `read_file`. Prefer an allow-list (`permit ... when repo like ...`) to a deny-list (`forbid ... when repo like "*private*"`): the deny-list fails open for names you did not think of. For constraints that must travel with the token and survive delegation, put them in the capability itself (`ArgConstraint`) rather than in policy.
+This is the rule that stops the prompt-injected "read my private repo" in the [GitHub leak demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/github-leak-demo/README.md), even though the token allows `read_file`. Prefer an allow-list (`permit ... when repo like ...`) to a deny-list (`forbid ... when repo like "*private*"`): the deny-list fails open for names you did not think of. For constraints that must travel with the token and survive delegation, put them in the capability itself (`ArgConstraint`) rather than in policy.
 
 ### MFA for sensitive tools
 
@@ -255,7 +255,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Install the attenuo CLI
-        run: cargo install --locked --git https://github.com/7Mudit/attenuo attenuo-cli
+        run: cargo install --locked --git https://github.com/attenuo-dev/attenuo attenuo-cli
       - name: Lint
         run: attenuo policy lint policy/policy.cedar --config config/server.toml
       - name: Test

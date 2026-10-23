@@ -1,6 +1,6 @@
 # attenuo
 
-[![CI](https://github.com/7Mudit/attenuo/actions/workflows/ci.yml/badge.svg)](https://github.com/7Mudit/attenuo/actions/workflows/ci.yml)
+[![CI](https://github.com/attenuo-dev/attenuo/actions/workflows/ci.yml/badge.svg)](https://github.com/attenuo-dev/attenuo/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![MSRV: 1.89](https://img.shields.io/badge/MSRV-1.89-blue.svg)](Cargo.toml)
 [![Status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-orange.svg)](docs/spec/rfc-0001-attenuo.md)
@@ -17,7 +17,7 @@ In May 2025 researchers showed that a malicious issue in a public repository cou
 You need a Rust toolchain, `curl` and `python3`.
 
 ```sh
-git clone https://github.com/7Mudit/attenuo.git
+git clone https://github.com/attenuo-dev/attenuo.git
 cd attenuo
 examples/github-leak-demo/run.sh
 ```

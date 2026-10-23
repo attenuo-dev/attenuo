@@ -23,7 +23,7 @@
 #
 # Verify a published image:
 #   cosign verify ghcr.io/7mudit/attenuo:<version> \
-#     --certificate-identity-regexp '^https://github.com/7Mudit/attenuo/\.github/workflows/release\.yml@' \
+#     --certificate-identity-regexp '^https://github.com/attenuo-dev/attenuo/\.github/workflows/release\.yml@' \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
 #
 # Before relying on it: run it once against a `v0.0.0-test` tag on a fork and delete the tag

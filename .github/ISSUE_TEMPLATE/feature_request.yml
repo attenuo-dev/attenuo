@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Changes to the token format, policy request shape, audit schema or public API go through an RFC (see [docs/spec/README.md](https://github.com/7Mudit/attenuo/blob/main/docs/spec/README.md)). This issue is the right place to get agreement that an RFC is worth writing.
+        Changes to the token format, policy request shape, audit schema or public API go through an RFC (see [docs/spec/README.md](https://github.com/attenuo-dev/attenuo/blob/main/docs/spec/README.md)). This issue is the right place to get agreement that an RFC is worth writing.
   - type: textarea
     id: problem
     attributes:

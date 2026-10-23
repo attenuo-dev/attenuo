@@ -55,7 +55,7 @@ draft ──► accepted ──► implemented ──► superseded
 5. Merge with `Status: accepted` (or `rejected`). Create a tracking issue that lists the implementation PRs.
 6. When the feature ships in a release, a small PR flips the status to `implemented` and records the version.
 
-Security-sensitive RFCs (anything under the token format or audit schema headings) additionally require the Security considerations section to name the property or integration tests that will guard the invariant, as [`CONTRIBUTING.md`](https://github.com/7Mudit/attenuo/blob/main/CONTRIBUTING.md) requires for code.
+Security-sensitive RFCs (anything under the token format or audit schema headings) additionally require the Security considerations section to name the property or integration tests that will guard the invariant, as [`CONTRIBUTING.md`](https://github.com/attenuo-dev/attenuo/blob/main/CONTRIBUTING.md) requires for code.
 
 ## Index
 

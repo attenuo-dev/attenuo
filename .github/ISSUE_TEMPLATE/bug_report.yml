@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for the report. If this is a security problem (an allow that should have been a deny, a token that should have been rejected, an audit record that can be altered), **do not file it here**. Follow [SECURITY.md](https://github.com/7Mudit/attenuo/blob/main/SECURITY.md) instead.
+        Thanks for the report. If this is a security problem (an allow that should have been a deny, a token that should have been rejected, an audit record that can be altered), **do not file it here**. Follow [SECURITY.md](https://github.com/attenuo-dev/attenuo/blob/main/SECURITY.md) instead.
   - type: checkboxes
     id: not-security
     attributes:

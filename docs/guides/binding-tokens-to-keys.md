@@ -4,7 +4,7 @@ A delegation token is a bearer token by default: whoever holds it can use it unt
 
 A **bound** token is useless without a private key the agent keeps. attenuo implements this with DPoP (RFC 9449): the token carries the thumbprint of a key, and every request that presents it must carry a fresh proof signed by that key. This guide shows how to bind tokens with the CLI and the SDKs, how binding passes from one agent to the next, and what the server refuses.
 
-Everything below was run against a local server with the [GitHub leak demo](https://github.com/7Mudit/attenuo/blob/main/examples/github-leak-demo/README.md) config. Binding is optional: nothing changes for clients that do not use it, unless the operator sets `[token] dpop = "required"`.
+Everything below was run against a local server with the [GitHub leak demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/github-leak-demo/README.md) config. Binding is optional: nothing changes for clients that do not use it, unless the operator sets `[token] dpop = "required"`.
 
 ## How it works
 

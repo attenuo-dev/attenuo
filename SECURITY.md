@@ -9,7 +9,7 @@ attenuo is authorization infrastructure. A bug here is not a crash; it is an age
 Report privately through either channel:
 
 - Email `security@<domain>` (placeholder until the project domain is set; until then use GitHub private reporting).
-- GitHub private vulnerability reporting: [github.com/7Mudit/attenuo/security/advisories/new](https://github.com/7Mudit/attenuo/security/advisories/new).
+- GitHub private vulnerability reporting: [github.com/attenuo-dev/attenuo/security/advisories/new](https://github.com/attenuo-dev/attenuo/security/advisories/new).
 
 Please include as much of the following as you can:
 
