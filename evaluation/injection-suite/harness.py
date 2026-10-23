@@ -103,6 +103,7 @@ class Call:
     holder: str = WORKER  # which agent's token makes the call (``as:`` in YAML)
     decoy: str | None = None  # sent as a duplicate, earlier ``params.name`` member
     original_label: str | None = None  # hand label before an oracle disagreement was resolved
+    label_note: str | None = None  # why the label differs from, or was changed to, the oracle's
 
     def target(self, default: str) -> str:
         return self.server or default
@@ -151,6 +152,7 @@ class Case:
     note: str | None = None
     taxonomy: str | None = None
     original_class: str | None = None
+    label_note: str | None = None
 
     @property
     def calls(self) -> list[Call]:
@@ -211,7 +213,7 @@ def _parse_call(where: str, raw: dict[str, Any], env: dict[str, Suite], home: Su
         raise CorpusError(f"{where}: stage must be one of {STAGES}")
     known = {
         "tool", "args", "role", "expect", "stage", "note", "server", "resolves_to", "spoof_of",
-        "as", "decoy", "original_label",
+        "as", "decoy", "original_label", "label_note",
     }  # fmt: skip
     if set(raw) - known:
         raise CorpusError(f"{where}: unknown keys {sorted(set(raw) - known)}")
@@ -228,6 +230,7 @@ def _parse_call(where: str, raw: dict[str, Any], env: dict[str, Suite], home: Su
         holder=str(raw.get("as", WORKER)),
         decoy=raw.get("decoy"),
         original_label=raw.get("original_label"),
+        label_note=raw.get("label_note"),
     )
 
 
@@ -311,6 +314,7 @@ def load_cases(path: Path, suite: Suite, env: dict[str, Suite] | None = None) ->
             note=raw.get("note"),
             taxonomy=raw.get("taxonomy"),
             original_class=raw.get("original_class"),
+            label_note=raw.get("label_note"),
         )
         if case.cls not in CLASSES:
             raise CorpusError(f"{cid}: class must be one of {CLASSES}")
