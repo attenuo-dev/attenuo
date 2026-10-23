@@ -33,6 +33,8 @@ cargo audit               # cargo install cargo-audit (optional locally; CI runs
 
 Fuzz targets for the parsers and checks an attacker can reach live in `fuzz/` (cargo-fuzz, nightly, outside the workspace). CI only builds them and runs their seeds; run one for a few minutes when you change a parser, a token or proof check, capability coverage, the proxy's JSON-RPC or SSE handling, or audit verification: `cargo +nightly fuzz run <target> -- -max_total_time=120`. See [fuzz/README.md](fuzz/README.md) and [docs/design/fuzzing.md](docs/design/fuzzing.md).
 
+The Python SDK tests (`cd sdk/python && pytest -rf`, and `ONBEHALF_INTEGRATION=1 pytest -rf -m integration` for the real-server tests) are run with `-rf` so that the name of a failing test is in the summary; see [sdk/python/README.md](sdk/python/README.md).
+
 `rustfmt.toml` and `clippy.toml` in the repo root carry the project settings, so `cargo fmt` and `cargo clippy` pick them up without flags. The toolchain is pinned by `rust-toolchain.toml`.
 
 ## Previewing the documentation site
