@@ -13,6 +13,13 @@ updates:
         update-types: ["minor", "patch"]
       cargo-major:
         update-types: ["major"]
+    ignore:
+      # jsonwebtoken 10+ needs its own crypto backend (aws-lc-rs, or rust_crypto which
+      # brings the unfixed RUSTSEC-2023-0071 `rsa`); 9 verifies with `ring`, which the
+      # workspace already links for DPoP and the audit checkpoints. Stay on 9 until the
+      # token crate's JWT handling is reviewed as a whole.
+      - dependency-name: jsonwebtoken
+        update-types: ["version-update:semver-major"]
     labels: ["dependencies", "rust"]
 
   - package-ecosystem: github-actions
