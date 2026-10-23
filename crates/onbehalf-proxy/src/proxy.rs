@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
@@ -23,6 +23,7 @@ use uuid::Uuid;
 use crate::auth::{AuthError, Authorizer};
 use crate::config::ProxyConfig;
 use crate::filter::{ListFilter, ListKind};
+use crate::guard::{guard_stream, StreamGuard};
 use crate::jsonrpc::{
     self, denied_response, error_response, id_of, is_passthrough_method, is_request, method_of,
     CODE_INVALID_PARAMS, CODE_INVALID_REQUEST, CODE_PARSE_ERROR, CODE_UNAUTHORIZED,
@@ -41,14 +42,10 @@ pub const REASON_SESSION_MISMATCH: &str = "session_mismatch";
 const HEADER_MCP_SESSION_ID: &str = "mcp-session-id";
 
 /// Request headers forwarded to the upstream. `Authorization` is deliberately absent: the
-/// bearer the proxy receives is onbehalf's token, not an upstream credential.
-const FORWARD_REQUEST_HEADERS: &[&str] = &[
-    "accept",
-    "content-type",
-    HEADER_MCP_SESSION_ID,
-    "mcp-protocol-version",
-    "last-event-id",
-];
+/// bearer the proxy receives is onbehalf's token, not an upstream credential. So is
+/// `Mcp-Session-Id`: the proxy inserts the one value it checked ([`session_id_of`],
+/// [`with_session_header`]), never the client's headers as sent (SR-27).
+const FORWARD_REQUEST_HEADERS: &[&str] = &["accept", "content-type", "last-event-id"];
 
 /// Upstream response headers forwarded back to the client. `Content-Length` and hop-by-hop
 /// headers are recomputed by the server.
@@ -64,10 +61,20 @@ struct AppState {
     client: reqwest::Client,
     authorizer: Arc<dyn Authorizer>,
     sessions: SessionRegistry,
+    /// [`ProxyConfig::stream_recheck`].
+    stream_recheck: Duration,
+}
+
+impl AppState {
+    /// The re-check (SR-28) for a response streamed to `chain`'s holder.
+    fn stream_guard(&self, chain: &DelegationChain) -> StreamGuard {
+        StreamGuard::new(self.authorizer.clone(), chain.clone(), self.stream_recheck)
+    }
 }
 
 /// Build the proxy router. Upstreams are mounted at `/mcp/{name}`.
 pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
+    let stream_recheck = config.stream_recheck;
     let upstreams = config
         .upstreams
         .into_iter()
@@ -78,6 +85,7 @@ pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
         client: upstream_client(),
         authorizer,
         sessions: SessionRegistry::default(),
+        stream_recheck,
     });
     Router::new()
         .route(
@@ -272,6 +280,66 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
+/// Is `value` a session id the MCP specification allows: non-empty, visible ASCII only
+/// (`0x21..=0x7E`)?
+fn is_valid_session_id(value: &[u8]) -> bool {
+    !value.is_empty() && value.iter().all(|b| (0x21..=0x7E).contains(b))
+}
+
+/// The request's `Mcp-Session-Id`, checked (SR-27). More than one such header, or a value
+/// that is not visible ASCII, is refused with `400`: the session gate and the upstream must
+/// act on the same, single value, and the proxy forwards only the value returned here.
+// The `Err` is a full response, built once per refused request; boxing it buys nothing.
+#[allow(clippy::result_large_err)]
+fn session_id_of(headers: &HeaderMap) -> Result<Option<String>, Response> {
+    let mut values = headers.get_all(HEADER_MCP_SESSION_ID).iter();
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    let several = values.next().is_some();
+    if several || !is_valid_session_id(first.as_bytes()) {
+        tracing::warn!(
+            several,
+            "request rejected: Mcp-Session-Id header repeated or not visible ASCII"
+        );
+        let body = error_response(
+            Value::Null,
+            CODE_INVALID_REQUEST,
+            "onbehalf: invalid request: exactly one Mcp-Session-Id header, visible ASCII",
+            None,
+        );
+        return Err(json_response(StatusCode::BAD_REQUEST, &body));
+    }
+    // Visible ASCII is valid UTF-8.
+    Ok(Some(String::from_utf8_lossy(first.as_bytes()).into_owned()))
+}
+
+/// Add the checked session id to headers bound for the upstream.
+fn with_session_header(mut headers: HeaderMap, session_id: Option<&str>) -> HeaderMap {
+    if let Some(v) = session_id.and_then(|s| HeaderValue::from_str(s).ok()) {
+        headers.insert(HeaderName::from_static(HEADER_MCP_SESSION_ID), v);
+    }
+    headers
+}
+
+/// Drop every `Mcp-Session-Id` of an upstream response unless there is exactly one and it is
+/// visible ASCII, so a client never sees two session ids, or one the proxy could not bind
+/// (SR-27).
+fn sanitize_session_header(headers: &mut HeaderMap) {
+    let mut values = headers.get_all(HEADER_MCP_SESSION_ID).iter();
+    let Some(first) = values.next() else {
+        return;
+    };
+    let several = values.next().is_some();
+    if several || !is_valid_session_id(first.as_bytes()) {
+        tracing::warn!(
+            several,
+            "upstream sent Mcp-Session-Id headers the proxy cannot bind; removed"
+        );
+        headers.remove(HEADER_MCP_SESSION_ID);
+    }
+}
+
 fn forward_headers(headers: &HeaderMap, names: &[&'static str]) -> HeaderMap {
     let mut out = HeaderMap::new();
     for name in names {
@@ -305,7 +373,10 @@ async fn handle_passthrough(
     if let Err(e) = state.authorizer.check_active(&chain, now).await {
         return unauthorized(e);
     }
-    let session_id = header_str(&headers, HEADER_MCP_SESSION_ID).map(str::to_owned);
+    let session_id = match session_id_of(&headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
     let span = request_span(&server, &chain, session_id.as_deref());
     async move {
         let owner = match session_gate(&state, &server, &method, &chain, session_id.as_deref(), now)
@@ -316,13 +387,18 @@ async fn handle_passthrough(
         };
         tracing::debug!(%method, "forwarding transparently");
         let is_delete = method == Method::DELETE;
+        // The listen stream lives as long as the client keeps it open: re-check it (SR-28).
+        let guard = (!is_delete).then(|| state.stream_guard(&chain));
         let req = state
             .client
             .request(method, &upstream)
-            .headers(forward_headers(&headers, FORWARD_REQUEST_HEADERS))
+            .headers(with_session_header(
+                forward_headers(&headers, FORWARD_REQUEST_HEADERS),
+                session_id.as_deref(),
+            ))
             .body(body);
         let mut response = match req.send().await {
-            Ok(resp) => stream_response(resp, None, &[]),
+            Ok(resp) => stream_response(resp, None, guard),
             Err(e) => return upstream_error(e),
         };
         match (is_delete, session_id.as_deref()) {
@@ -382,7 +458,10 @@ async fn handle_post(
         Ok(c) => c,
         Err(e) => return unauthorized(e),
     };
-    let session_id = header_str(&headers, HEADER_MCP_SESSION_ID).map(str::to_owned);
+    let session_id = match session_id_of(&headers) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
     let span = request_span(&server, &chain, session_id.as_deref());
     async {
         let owner = match session_gate(
@@ -516,7 +595,10 @@ async fn handle_post_inner(
             return json_response(StatusCode::BAD_REQUEST, &body);
         }
     };
-    let mut req_headers = forward_headers(headers, FORWARD_REQUEST_HEADERS);
+    let mut req_headers = with_session_header(
+        forward_headers(headers, FORWARD_REQUEST_HEADERS),
+        session_id,
+    );
     if !req_headers.contains_key(header::CONTENT_TYPE) {
         req_headers.insert(
             header::CONTENT_TYPE,
@@ -555,7 +637,8 @@ async fn handle_post_inner(
         let caps = chain.effective_capabilities().cloned().unwrap_or_default();
         let server = server.to_owned();
         let prelude = sse_prelude(&screened.replies);
-        stream_response_filtered(resp, prelude, move |msg| {
+        let guard = state.stream_guard(chain);
+        stream_response_filtered(resp, prelude, guard, move |msg| {
             let removed = ListFilter::new(&pending, &caps, &server).apply(msg);
             if removed > 0 {
                 tracing::debug!(removed, "filtered list result in SSE stream");
@@ -578,7 +661,7 @@ async fn handle_post_inner(
         json_response(StatusCode::BAD_GATEWAY, &body)
     } else {
         let prelude = sse_prelude(&screened.replies);
-        stream_response(resp, prelude, &[])
+        stream_response(resp, prelude, Some(state.stream_guard(chain)))
     };
     add_decision_header(&mut response, &screened.decision_ids);
     response
@@ -813,42 +896,64 @@ fn sse_prelude(replies: &[Value]) -> Option<Bytes> {
     Some(Bytes::from(out))
 }
 
-/// Stream an upstream response back without buffering (SSE passthrough).
+/// Is this an SSE body?
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| {
+            ct.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("text/event-stream")
+        })
+}
+
+/// Stream an upstream response back without buffering (SSE passthrough). With a `guard`, the
+/// stream is re-checked and ended when the check fails (SR-28); an SSE body is then relayed
+/// event by event ([`crate::sse::frame_stream`]), so the proxy's final event never lands
+/// inside a partial upstream event.
 fn stream_response(
     resp: reqwest::Response,
     prelude: Option<Bytes>,
-    extra: &[(HeaderName, HeaderValue)],
+    guard: Option<StreamGuard>,
 ) -> Response {
     let status = resp.status();
     let headers = resp.headers().clone();
-    let upstream = resp.bytes_stream();
-    let body = match prelude {
-        Some(p) => Body::from_stream(futures_util::stream::once(async { Ok(p) }).chain(upstream)),
-        None => Body::from_stream(upstream),
+    let prelude = futures_util::stream::iter(prelude.map(Ok::<_, std::io::Error>));
+    let body = match guard {
+        None => {
+            let raw = resp
+                .bytes_stream()
+                .map(|r| r.map_err(std::io::Error::other));
+            Body::from_stream(prelude.chain(raw))
+        }
+        Some(guard) if is_event_stream(&headers) => {
+            let framed = crate::sse::frame_stream(resp.bytes_stream());
+            Body::from_stream(guard_stream(prelude.chain(framed), guard, true))
+        }
+        Some(guard) => {
+            let raw = resp
+                .bytes_stream()
+                .map(|r| r.map_err(std::io::Error::other));
+            Body::from_stream(guard_stream(prelude.chain(raw), guard, false))
+        }
     };
-    let mut response = build_response(status, &headers, body);
-    for (k, v) in extra {
-        response.headers_mut().insert(k.clone(), v.clone());
-    }
-    response
+    build_response(status, &headers, body)
 }
 
 /// Like [`stream_response`] for an SSE body, with `filter` run over every JSON-RPC message in
-/// its events (see [`crate::sse`]).
+/// its events (see [`crate::sse`]), and always re-checked.
 fn stream_response_filtered(
     resp: reqwest::Response,
     prelude: Option<Bytes>,
+    guard: StreamGuard,
     filter: impl FnMut(&mut Value) + Send + 'static,
 ) -> Response {
     let status = resp.status();
     let headers = resp.headers().clone();
     let filtered = crate::sse::rewrite_stream(resp.bytes_stream(), filter);
-    let body = match prelude {
-        Some(p) => Body::from_stream(
-            futures_util::stream::once(async { Ok::<_, std::io::Error>(p) }).chain(filtered),
-        ),
-        None => Body::from_stream(filtered),
-    };
+    let prelude = futures_util::stream::iter(prelude.map(Ok::<_, std::io::Error>));
+    let body = Body::from_stream(guard_stream(prelude.chain(filtered), guard, true));
     build_response(status, &headers, body)
 }
 
@@ -856,6 +961,7 @@ fn build_response(status: StatusCode, upstream_headers: &HeaderMap, body: Body) 
     let mut response = Response::new(body);
     *response.status_mut() = status;
     *response.headers_mut() = forward_headers(upstream_headers, FORWARD_RESPONSE_HEADERS);
+    sanitize_session_header(response.headers_mut());
     response
 }
 
@@ -902,6 +1008,50 @@ mod tests {
             bearer_of(&headers_with_auth("abc")),
             Err(AuthError::InvalidToken(_))
         ));
+    }
+
+    #[test]
+    fn session_header_must_be_single_and_visible_ascii() {
+        let with = |values: &[&[u8]]| {
+            let mut h = HeaderMap::new();
+            for v in values {
+                h.append(HEADER_MCP_SESSION_ID, HeaderValue::from_bytes(v).unwrap());
+            }
+            h
+        };
+        assert_eq!(session_id_of(&HeaderMap::new()).ok(), Some(None));
+        assert_eq!(
+            session_id_of(&with(&[b"sess-1"])).ok(),
+            Some(Some("sess-1".to_owned()))
+        );
+        for bad in [
+            &[&b"a"[..], &b"b"[..]][..],
+            &[&b"a"[..], &b"a"[..]][..],
+            &[&b"\x80"[..]][..],
+            &[&b"a b"[..]][..],
+            &[&b"a\tb"[..]][..],
+            &[&b""[..]][..],
+        ] {
+            let resp = session_id_of(&with(bad)).unwrap_err();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn upstream_session_headers_are_dropped_unless_single_and_valid() {
+        let mut h = HeaderMap::new();
+        h.append(HEADER_MCP_SESSION_ID, HeaderValue::from_static("one"));
+        sanitize_session_header(&mut h);
+        assert_eq!(h.get(HEADER_MCP_SESSION_ID).unwrap(), "one");
+        h.append(HEADER_MCP_SESSION_ID, HeaderValue::from_static("two"));
+        sanitize_session_header(&mut h);
+        assert!(h.get(HEADER_MCP_SESSION_ID).is_none());
+        h.append(
+            HEADER_MCP_SESSION_ID,
+            HeaderValue::from_bytes(b"\x80").unwrap(),
+        );
+        sanitize_session_header(&mut h);
+        assert!(h.get(HEADER_MCP_SESSION_ID).is_none());
     }
 
     #[test]
