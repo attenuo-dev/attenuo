@@ -1,0 +1,34 @@
+$ cargo bench -p attenuo-core --bench attenuation -- --warm-up-time 1 --measurement-time 3 --noplot
+# commit 034fd5c, rustc 1.99.1 (58cf8f9c3 2026-10-13), release bench profile
+# shared 4 vCPU container (nproc 4, Intel Xeon @ 2.10GHz); other agents may be active
+# progress lines (Benchmarking ..., Finished, Running) removed; estimates are [low point high]
+# uptime before: 20:45:26 up  3:08,  0 user,  load average: 1.87, 2.81, 2.45
+covers/covered/1        time:   [35.346 ns 36.408 ns 37.582 ns]
+Found 11 outliers among 100 measurements (11.00%)
+  6 (6.00%) high mild
+  5 (5.00%) high severe
+covers/rejected_widening/1
+                        time:   [15.522 ns 15.890 ns 16.294 ns]
+Found 18 outliers among 100 measurements (18.00%)
+  1 (1.00%) low mild
+  3 (3.00%) high mild
+  14 (14.00%) high severe
+covers/covered/8        time:   [427.29 ns 429.00 ns 431.28 ns]
+Found 15 outliers among 100 measurements (15.00%)
+  8 (8.00%) high mild
+  7 (7.00%) high severe
+covers/rejected_widening/8
+                        time:   [70.722 ns 72.225 ns 73.804 ns]
+Found 4 outliers among 100 measurements (4.00%)
+  3 (3.00%) high mild
+  1 (1.00%) high severe
+covers/covered/32       time:   [4.8551 µs 5.0609 µs 5.3007 µs]
+Found 12 outliers among 100 measurements (12.00%)
+  8 (8.00%) high mild
+  4 (4.00%) high severe
+covers/rejected_widening/32
+                        time:   [258.41 ns 263.30 ns 269.33 ns]
+Found 10 outliers among 100 measurements (10.00%)
+  3 (3.00%) high mild
+  7 (7.00%) high severe
+# uptime after: 20:45:54 up  3:09,  0 user,  load average: 1.57, 2.66, 2.41

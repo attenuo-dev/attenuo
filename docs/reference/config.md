@@ -208,3 +208,14 @@ With no matching entry, no root token is issued.
 | `enabled` | `false` | Serve Prometheus text on a separate listener. |
 | `listen` | `127.0.0.1:9100` | Address of the metrics listener. No authentication, so keep it on loopback or a private network. |
 | `allow_public` | `false` | Without it, the server refuses to start when `enabled` and `listen` is not a loopback address. With it, the server starts and logs a warning. |
+
+## `[admin_ui]`
+
+The admin console, on its own opt-in listener so it never shares an origin with `/mcp/{server}`. It serves the embedded console under `/admin/ui/` (`/` redirects there) and the admin API under `/admin/*`, behind the same `[admin] token`. Every response carries a strict `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` and same-origin `Cross-Origin-Opener-Policy` / `Cross-Origin-Resource-Policy`; API answers also carry `Cache-Control: no-store`. No CORS headers are ever sent. `POST /admin/root-token` is never mounted here, whatever `[dev]` says.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Start the console listener. Without the section there is no console. |
+| `listen` | `127.0.0.1:9101` | Address of the console listener. Keep it on loopback and reach it over an SSH tunnel. |
+| `allow_public` | `false` | Without it, the server refuses to start when `enabled` and `listen` is not a loopback address. With it, the server starts and logs a warning, and `[admin] token` must then pass the strength check that a public `[server] listen` needs. |
+| `allow_write` | `false` | Also mount `POST /admin/leases/{id}/revoke` and `POST /admin/policies/reload` on the console listener; they require `Content-Type: application/json` there (415 otherwise). Without it those paths are 404 on this listener, so the console is read-only by the server's rule. The read routes, always mounted, are `GET /admin/audit`, `/admin/audit/entries/{seq}`, `/admin/audit/records/{id}`, `/admin/audit/checkpoints`, `/admin/audit/verify`, `/admin/audit/checkpoint` (which signs a checkpoint of the head when it has none) and `/admin/audit/export`; `GET /admin/leases/{id}` and `/admin/leases/{id}/tree`; `GET /admin/policies` and `/admin/policies/check`; and the `POST /admin/policies/evaluate` dry run (JSON `Content-Type` required). The main listener keeps every admin route either way. See [the admin console guide](../guides/admin-console.md). |

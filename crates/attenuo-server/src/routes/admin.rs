@@ -1,10 +1,15 @@
 //! `/admin/*`: leases, audit log and policy reload. Every route requires the static admin
-//! bearer from `[admin] token` (v0; see [`require_admin`]).
+//! bearer from `[admin] token` (v0; see [`require_admin`]). The read-only policy routes
+//! (`GET /admin/policies`, `/check`, `POST /admin/policies/evaluate`) are in
+//! [`super::policies`].
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use attenuo_audit::{AuditEntry, AuditSink, LeaseStore, SignedVerifyReport};
-use attenuo_core::LeaseId;
+use attenuo_audit::{
+    AuditEntry, AuditSink, EntryFilter, LeaseNode, LeaseStore, Order, SignedVerifyReport,
+};
+use attenuo_core::{AgentId, LeaseId, RecordKind};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -14,6 +19,7 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 use super::{audit_admin, bearer_of, now, REASON_ADMIN_ACTION};
 use crate::error::ApiError;
@@ -148,39 +154,301 @@ pub async fn lease_status(
         .await
 }
 
+/// Leases `GET /admin/leases/{id}/tree` lists when the request names no `max_nodes`.
+pub const DEFAULT_TREE_NODES: usize = 1000;
+/// Most leases `GET /admin/leases/{id}/tree` lists, whatever `max_nodes` asks for. Bounds the
+/// response and the issuance lookup; `would_revoke` still counts the whole subtree.
+pub const MAX_TREE_NODES: usize = 10_000;
+
+/// Query of `GET /admin/leases/{lease_id}/tree`.
 #[derive(Debug, Deserialize)]
-pub struct AuditQuery {
-    /// First sequence number to return (default 1).
-    pub from: Option<u64>,
-    /// Page size (default 100, at most [`MAX_AUDIT_PAGE`]).
-    pub limit: Option<usize>,
+pub struct TreeQuery {
+    /// Most nodes to list (default [`DEFAULT_TREE_NODES`], clamped to 1..=[`MAX_TREE_NODES`]).
+    pub max_nodes: Option<usize>,
 }
 
-/// `GET /admin/audit?from=&limit=`: entries in ascending `seq` order, plus `next` (the `from`
-/// for the following page) when the page was full, and `head` (the newest seq, 0 for an empty
-/// log; reading it signs nothing, unlike `/admin/audit/checkpoint`).
+/// `GET /admin/leases/{lease_id}/tree?max_nodes=`: a dry-run revocation. Answers
+/// `{root, ancestors, nodes, would_revoke, truncated}`:
+///
+/// - `nodes`: the lease, then everything delegated from it, breadth-first, at most
+///   `max_nodes`; `truncated` says the cap cut the list short.
+/// - `ancestors`: the leases it was delegated from, nearest first, ending at `root`, the
+///   chain's first hop (also the audit `chain_id`).
+/// - `would_revoke`: how many leases `POST /admin/leases/{lease_id}/revoke` would revoke if
+///   sent now, counted over the whole subtree with the same query the revocation runs.
+///
+/// Each node carries its registry row, whether it is active now, and `agent`, `issued_at`
+/// and `issued_seq` from the audit record that issued it (null when none is found). Nothing
+/// is written, not even an audit record: this is a read like `GET /admin/leases/{id}`.
+pub async fn lease_tree(
+    State(state): State<Arc<AppState>>,
+    Path(lease_id): Path<String>,
+    Query(q): Query<TreeQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let max_nodes = q
+        .max_nodes
+        .unwrap_or(DEFAULT_TREE_NODES)
+        .clamp(1, MAX_TREE_NODES);
+    let lease = LeaseId::new(lease_id);
+    state
+        .blocking(move |state| {
+            let tree = state
+                .leases
+                .subtree(&lease, max_nodes)?
+                .ok_or_else(|| ApiError::not_found(format!("unknown lease `{}`", lease.0)))?;
+            let root = tree.root().clone();
+            // Every lease here descends from `root`, so one indexed lookup by `chain_id`
+            // finds all their issuance records.
+            let wanted: Vec<&LeaseId> = tree
+                .ancestors
+                .iter()
+                .chain(&tree.nodes)
+                .map(|n| &n.id)
+                .collect();
+            let issued: BTreeMap<LeaseId, AuditEntry> = state
+                .audit
+                .issuance_records(&root.0, &wanted)?
+                .into_iter()
+                .filter_map(|e| Some((e.record.leases.last()?.clone(), e)))
+                .collect();
+            let now = now();
+            let fmt = |t: time::OffsetDateTime| t.format(&Rfc3339).unwrap_or_default();
+            let node = |n: &LeaseNode| {
+                let issuance = issued.get(&n.id);
+                json!({
+                    "lease_id": n.id,
+                    "parent": n.row.parent,
+                    "expires_at": fmt(n.row.expires_at),
+                    "revoked_at": n.row.revoked_at.map(fmt),
+                    "revoke_reason": n.row.revoke_reason,
+                    "active": n.row.is_active(now),
+                    "agent": issuance.and_then(|e| e.record.agents.last()),
+                    "issued_at": issuance.map(|e| fmt(e.record.at)),
+                    "issued_seq": issuance.map(|e| e.seq),
+                })
+            };
+            Ok(Json(json!({
+                "root": root,
+                "ancestors": tree.ancestors.iter().map(node).collect::<Vec<_>>(),
+                "nodes": tree.nodes.iter().map(node).collect::<Vec<_>>(),
+                "would_revoke": tree.would_revoke,
+                "truncated": tree.truncated,
+            })))
+        })
+        .await
+}
+
+/// Most seqs one filtered `GET /admin/audit` page reads. `agent`, `lease`, `since` and
+/// `until` cannot use an index, so without a bound one request could read the whole log. A
+/// page that reaches the bound before it fills comes back short (possibly empty) with `next`
+/// or `prev` set, and the client keeps paging. Unfiltered pages need no bound: they read
+/// exactly the rows they return.
+pub const MAX_AUDIT_SCAN: u64 = 50_000;
+
+/// Query string of `GET /admin/audit`. Every field is optional; with none of the filter
+/// fields, `order` or `before`, the answer is the same as before filters existed.
+#[derive(Debug, Default, Deserialize)]
+pub struct AuditQuery {
+    /// First sequence number to return, for `order=asc` (default 1).
+    pub from: Option<u64>,
+    /// Return entries with `seq < before`, for `order=desc` (default: up to the head).
+    pub before: Option<u64>,
+    /// Page size (default 100, at most [`MAX_AUDIT_PAGE`]).
+    pub limit: Option<usize>,
+    /// `asc` (oldest first, the default) or `desc` (newest first).
+    pub order: Option<String>,
+    /// Record kinds, comma-separated (`decision,exchange`).
+    pub kind: Option<String>,
+    /// `allow` or `deny`.
+    pub decision: Option<String>,
+    /// The record's `reason`.
+    pub reason: Option<String>,
+    /// The record's `originating_subject`.
+    pub subject: Option<String>,
+    /// An agent in the record's `agents`.
+    pub agent: Option<String>,
+    /// A lease in the record's `leases`.
+    pub lease: Option<String>,
+    /// The record's `server`.
+    pub server: Option<String>,
+    /// The record's `tool`.
+    pub tool: Option<String>,
+    /// The record's `chain_id`.
+    pub chain_id: Option<String>,
+    /// Records at or after this RFC 3339 time.
+    pub since: Option<String>,
+    /// Records strictly before this RFC 3339 time.
+    pub until: Option<String>,
+}
+
+/// The filter part of an [`AuditQuery`]. 400 `invalid_request` for an unknown kind or
+/// decision, a time that is not RFC 3339, or an empty value.
+fn entry_filter(q: &AuditQuery) -> Result<EntryFilter, ApiError> {
+    let text = |name: &str, v: &Option<String>| -> Result<Option<String>, ApiError> {
+        match v.as_deref() {
+            Some("") => Err(ApiError::bad_request(
+                "invalid_request",
+                format!("`{name}` must not be empty"),
+            )),
+            other => Ok(other.map(str::to_string)),
+        }
+    };
+    let time = |name: &str, v: &Option<String>| -> Result<Option<OffsetDateTime>, ApiError> {
+        text(name, v)?
+            .map(|s| {
+                OffsetDateTime::parse(&s, &Rfc3339).map_err(|_| {
+                    ApiError::bad_request(
+                        "invalid_request",
+                        format!("`{name}` must be an RFC 3339 time"),
+                    )
+                })
+            })
+            .transpose()
+    };
+    let kinds = match text("kind", &q.kind)? {
+        None => Vec::new(),
+        Some(list) => list
+            .split(',')
+            .map(|k| k.trim().parse::<RecordKind>())
+            .collect::<Result<_, String>>()
+            .map_err(|e| ApiError::bad_request("invalid_request", e))?,
+    };
+    let decision = match text("decision", &q.decision)?.as_deref() {
+        None => None,
+        Some("allow") => Some(Decision::Allow),
+        Some("deny") => Some(Decision::Deny),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "invalid_request",
+                "`decision` must be `allow` or `deny`",
+            ))
+        }
+    };
+    Ok(EntryFilter {
+        kinds,
+        decision,
+        reason: text("reason", &q.reason)?,
+        subject: text("subject", &q.subject)?,
+        agent: text("agent", &q.agent)?.map(AgentId::new),
+        lease: text("lease", &q.lease)?.map(LeaseId::new),
+        server: text("server", &q.server)?,
+        tool: text("tool", &q.tool)?,
+        chain_id: text("chain_id", &q.chain_id)?,
+        since: time("since", &q.since)?,
+        until: time("until", &q.until)?,
+    })
+}
+
+/// `GET /admin/audit`: a page of audit entries, oldest first by default.
+///
+/// - `order=asc` (default) with `from`: entries with `seq >= from` ascending. `next` is the
+///   `from` of the following page, or null at the end.
+/// - `order=desc` with `before`: entries with `seq < before` (default: up to the head)
+///   newest first. `prev` is the `before` of the following (older) page, or null at seq 1;
+///   `next` is the `from` for reading forward (`order=asc`) from just above this page, or
+///   null when the page reached the head.
+/// - Filters (`kind`, `decision`, `reason`, `subject`, `agent`, `lease`, `server`, `tool`,
+///   `chain_id`, `since`, `until`) keep only matching entries; all are exact matches. A
+///   filtered page reads at most [`MAX_AUDIT_SCAN`] seqs, so it can come back short with
+///   `next`/`prev` set: keep paging until it is null.
+///
+/// `head` is the newest seq (0 for an empty log); reading it signs nothing, unlike
+/// `/admin/audit/checkpoint`. An ascending answer is `{entries, next, head}`, exactly as
+/// before filters existed; a descending one adds `prev`.
 pub async fn audit_range(
     State(state): State<Arc<AppState>>,
     Query(q): Query<AuditQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let from = q.from.unwrap_or(1).max(1);
+    let order = match q.order.as_deref() {
+        None | Some("asc") => Order::Ascending,
+        Some("desc") => Order::Descending,
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "invalid_request",
+                "`order` must be `asc` or `desc`",
+            ))
+        }
+    };
+    let filter = entry_filter(&q)?;
     let limit = q
         .limit
         .unwrap_or(DEFAULT_AUDIT_PAGE)
         .clamp(1, MAX_AUDIT_PAGE);
-    let (entries, head): (Vec<AuditEntry>, u64) = state
-        .blocking(move |s| {
-            let entries = s.audit.range(from, limit)?;
-            let head = s.audit.head()?.map_or(0, |h| h.seq);
-            Ok::<_, attenuo_audit::AuditError>((entries, head))
-        })
-        .await?;
-    let next = (entries.len() == limit)
-        .then(|| entries.last().map(|e| e.seq + 1))
-        .flatten();
-    Ok(Json(
-        json!({ "entries": entries, "next": next, "head": head }),
-    ))
+    // How many seqs a page may read below or above where it starts (see MAX_AUDIT_SCAN).
+    let span = if filter.is_empty() {
+        u64::MAX
+    } else {
+        MAX_AUDIT_SCAN - 1
+    };
+    match order {
+        Order::Ascending => {
+            if q.before.is_some() {
+                return Err(ApiError::bad_request(
+                    "invalid_request",
+                    "`before` needs `order=desc`; use `from` to page forward",
+                ));
+            }
+            let from = q.from.unwrap_or(1).max(1);
+            let to = from.saturating_add(span);
+            let (entries, head) = state
+                .blocking(move |s| {
+                    let entries = s.audit.entries_matching(from, to, &filter, order, limit)?;
+                    let head = s.audit.head()?.map_or(0, |h| h.seq);
+                    Ok::<_, attenuo_audit::AuditError>((entries, head))
+                })
+                .await?;
+            let next = match entries.last() {
+                Some(last) if entries.len() == limit => Some(last.seq + 1),
+                _ if to < head => Some(to + 1),
+                _ => None,
+            };
+            Ok(Json(
+                json!({ "entries": entries, "next": next, "head": head }),
+            ))
+        }
+        Order::Descending => {
+            if q.from.is_some() {
+                return Err(ApiError::bad_request(
+                    "invalid_request",
+                    "`from` needs `order=asc`; use `before` to page backward",
+                ));
+            }
+            if q.before == Some(0) {
+                return Err(ApiError::bad_request(
+                    "invalid_request",
+                    "`before` must be at least 1",
+                ));
+            }
+            let (entries, head, top, bottom) = state
+                .blocking(move |s| {
+                    let head = s.audit.head()?.map_or(0, |h| h.seq);
+                    // The newest seq this page may return, and the oldest it may read.
+                    let top = q.before.map_or(head, |b| (b - 1).min(head));
+                    let bottom = top.saturating_sub(span).max(1);
+                    let entries = if top == 0 {
+                        Vec::new()
+                    } else {
+                        s.audit
+                            .entries_matching(bottom, top, &filter, order, limit)?
+                    };
+                    Ok::<_, attenuo_audit::AuditError>((entries, head, top, bottom))
+                })
+                .await?;
+            let prev = match entries.last() {
+                Some(last) if entries.len() == limit => Some(last.seq),
+                _ if bottom > 1 => Some(bottom),
+                _ => None,
+            }
+            .filter(|&b| b > 1);
+            let next = (top < head).then_some(top + 1);
+            Ok(Json(json!({
+                "entries": entries,
+                "next": next,
+                "prev": prev,
+                "head": head,
+            })))
+        }
+    }
 }
 
 /// `GET /admin/audit/verify`: walk the whole chain and verify every stored checkpoint
@@ -205,6 +473,159 @@ pub async fn audit_checkpoint(State(state): State<Arc<AppState>>) -> Result<Json
     let mut v = serde_json::to_value(&cp).map_err(ApiError::internal)?;
     v["hash"] = Value::String(cp.head_hash.clone());
     Ok(Json(v))
+}
+
+/// The tool name `POST /admin/policies/reload` records ([`audit_admin`]).
+const POLICY_RELOAD_TOOL: &str = "admin.policies.reload";
+
+/// The body of the single-entry routes; the shape is described on [`audit_entry`].
+fn entry_view(state: &AppState, entry: AuditEntry) -> Result<Value, ApiError> {
+    let fmt = |t: time::OffsetDateTime| t.format(&Rfc3339).unwrap_or_default();
+    let now = now();
+    let mut lease_states = Vec::with_capacity(entry.record.leases.len());
+    for lease in &entry.record.leases {
+        let state_of = match state.leases.get(lease)? {
+            None => json!({
+                "lease_id": lease,
+                "known": false,
+                "active": false,
+                "parent": null,
+                "expires_at": null,
+                "revoked_at": null,
+                "revoke_reason": null,
+            }),
+            Some(row) => json!({
+                "lease_id": lease,
+                "known": true,
+                "active": state.leases.is_active(lease, now)?,
+                "parent": row.parent,
+                "expires_at": fmt(row.expires_at),
+                "revoked_at": row.revoked_at.map(fmt),
+                "revoke_reason": row.revoke_reason,
+            }),
+        };
+        lease_states.push(state_of);
+    }
+    let covered = state.audit.checkpoint_covering(entry.seq)?;
+    let reloaded = state
+        .audit
+        .first_entry_after(
+            entry.seq,
+            RecordKind::Admin,
+            POLICY_RELOAD_TOOL,
+            &Decision::Allow,
+        )?
+        .map(|e| e.seq);
+    Ok(json!({
+        "entry": entry,
+        "lease_states": lease_states,
+        "covered_by_checkpoint": covered,
+        "policy_reloaded_after": reloaded,
+    }))
+}
+
+/// `GET /admin/audit/entries/{seq}`: one entry and its context, as
+/// `{entry, lease_states, covered_by_checkpoint, policy_reloaded_after}`. 404 when there is
+/// no entry at `seq`.
+///
+/// - `lease_states`: one object per lease in the record's chain, root first, as the lease
+///   registry sees it now: `{lease_id, known, active, parent, expires_at, revoked_at,
+///   revoke_reason}`. A lease the registry does not hold is `known: false, active: false`.
+/// - `covered_by_checkpoint`: the oldest stored checkpoint at or after the entry's seq
+///   (`{seq, head_hash, at, kid, signature}`), whose signature covers the entry through the
+///   hash chain; null when the entry is newer than every checkpoint. It is read as stored:
+///   `GET /admin/audit/verify` checks the signatures.
+/// - `policy_reloaded_after`: the seq of the first successful policy reload recorded after
+///   the entry, or null. When set, the policy in force now may not be the one that made the
+///   decision.
+pub async fn audit_entry(
+    State(state): State<Arc<AppState>>,
+    Path(seq): Path<u64>,
+) -> Result<Json<Value>, ApiError> {
+    state
+        .blocking(move |s| {
+            let entry = s
+                .audit
+                .entry_at(seq)?
+                .ok_or_else(|| ApiError::not_found(format!("no audit entry at seq {seq}")))?;
+            entry_view(s, entry).map(Json)
+        })
+        .await
+}
+
+/// `GET /admin/audit/records/{id}`: the entry whose record id is `id`, the UUID that proxy
+/// denials and AuthZEN answers return as `decision_id` (shape as for
+/// `/admin/audit/entries/{seq}`). 400 when `id` is not a UUID, 404 when no record has it.
+pub async fn audit_record(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| ApiError::bad_request("invalid_request", "the record id must be a UUID"))?;
+    state
+        .blocking(move |s| {
+            // Records store the hyphenated lower-case form.
+            let entry = s
+                .audit
+                .entry_by_record_id(&id.to_string())?
+                .ok_or_else(|| ApiError::not_found(format!("no audit record with id {id}")))?;
+            entry_view(s, entry).map(Json)
+        })
+        .await
+}
+
+/// Query string of `GET /admin/audit/checkpoints`.
+#[derive(Debug, Default, Deserialize)]
+pub struct CheckpointsQuery {
+    /// Only checkpoints with `seq < before` (default: all).
+    pub before: Option<u64>,
+    /// Page size (default 100, at most [`MAX_AUDIT_PAGE`]).
+    pub limit: Option<usize>,
+}
+
+/// `GET /admin/audit/checkpoints?before=&limit=`: stored checkpoints, newest first, as
+/// `{checkpoints, prev}`; `prev` is the `before` of the next (older) page, or null after the
+/// oldest. Read-only: unlike `GET /admin/audit/checkpoint` it never signs a new checkpoint.
+pub async fn audit_checkpoints(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<CheckpointsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if q.before == Some(0) {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "`before` must be at least 1",
+        ));
+    }
+    let before = q.before.unwrap_or(u64::MAX);
+    let limit = q
+        .limit
+        .unwrap_or(DEFAULT_AUDIT_PAGE)
+        .clamp(1, MAX_AUDIT_PAGE);
+    let checkpoints = state
+        .blocking(move |s| s.audit.checkpoints_before(before, limit))
+        .await?;
+    let prev = match checkpoints.last() {
+        Some(last) if checkpoints.len() == limit && last.seq > 1 => Some(last.seq),
+        _ => None,
+    };
+    Ok(Json(json!({ "checkpoints": checkpoints, "prev": prev })))
+}
+
+/// Middleware on every `/admin/*` route: `Cache-Control: no-store` (unless the handler chose
+/// a cache policy itself) and `X-Content-Type-Options: nosniff`, so an admin answer is never
+/// kept by a browser or proxy cache and a browser never renders one as anything but its
+/// declared type. It wraps [`require_admin`], so the 401 and 403 answers carry them too.
+pub async fn admin_response_headers(req: Request, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    if !headers.contains_key(header::CACHE_CONTROL) {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    resp
 }
 
 /// Entries read per blocking-pool hop while streaming an export.
@@ -373,7 +794,19 @@ pub async fn reload_policies(State(state): State<Arc<AppState>>) -> Result<Json<
             .map_err(|_| ApiError::internal("policy engine lock poisoned"))?;
         match engine.reload_policies_str(&text) {
             Err(e) => Err(e.to_string()),
-            Ok(()) => Ok((engine.policy_ids(), engine.validation_warnings().to_vec())),
+            Ok(()) => {
+                // Under the engine's write lock, so `GET /admin/policies` never pairs the new
+                // policies with the old digest. A failed reload leaves both as they were.
+                let mut loaded = state
+                    .loaded_policies
+                    .write()
+                    .map_err(|_| ApiError::internal("loaded policy info lock poisoned"))?;
+                *loaded = crate::state::LoadedPolicies {
+                    sha256: Some(digest.clone()),
+                    loaded_at: now,
+                };
+                Ok((engine.policy_ids(), engine.validation_warnings().to_vec()))
+            }
         }
     };
     let (ids, warnings) = match reloaded {
