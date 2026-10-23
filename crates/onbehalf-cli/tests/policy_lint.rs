@@ -24,7 +24,7 @@ fn lint(args: &[&str]) -> (i32, String) {
 fn demo_policy_lints_clean_without_a_config() {
     let (code, out) = lint(&[DEMO]);
     assert_eq!(code, 0, "{out}");
-    assert!(out.contains("0 error(s)"), "{out}");
+    assert!(out.contains("0 error(s), 0 warning(s)"), "{out}");
     assert!(out.contains("note: no --config"), "{out}");
 }
 
@@ -41,4 +41,18 @@ fn no_config_still_catches_real_errors() {
     assert_eq!(code, 2, "{out}");
     assert!(out.contains("bare action"), "{out}");
     assert!(out.contains("not declared"), "{out}");
+}
+
+#[test]
+fn no_config_still_warns_on_an_impossible_policy() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("p.cedar");
+    std::fs::write(
+        &p,
+        "permit(principal, action == Action::\"github/read_file\", resource) when { false };\n",
+    )
+    .unwrap();
+    let (code, out) = lint(&[p.to_str().unwrap()]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("warning[validate]"), "{out}");
 }
