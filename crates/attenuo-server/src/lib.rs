@@ -21,6 +21,7 @@
 //! | `POST /admin/root-token` | admin | dev-only hop-0 mint ([`routes::dev_root`]), mounted only with `[dev] allow_root_mint = true` |
 //! | `POST /admin/leases/{id}/revoke`, `GET /admin/leases/{id}` | admin | leases |
 //! | `GET /admin/audit`, `/admin/audit/verify`, `/admin/audit/checkpoint` | admin | audit |
+//! | `GET /admin/audit/entries/{seq}`, `/admin/audit/records/{id}`, `/admin/audit/checkpoints` | admin | one entry with its context; stored checkpoints (read-only) |
 //! | `GET /admin/audit/export?from&to` | admin | stream a verifiable slice of the log as JSON Lines |
 //! | `POST /admin/policies/reload` | admin | hot-reload the Cedar policy file |
 
@@ -67,16 +68,22 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
         .route("/admin/leases/{lease_id}/revoke", post(admin::revoke_lease))
         .route("/admin/audit", get(admin::audit_range))
         .route("/admin/audit/verify", get(admin::audit_verify))
+        .route("/admin/audit/entries/{seq}", get(admin::audit_entry))
+        .route("/admin/audit/records/{id}", get(admin::audit_record))
+        .route("/admin/audit/checkpoints", get(admin::audit_checkpoints))
         .route("/admin/audit/checkpoint", get(admin::audit_checkpoint))
         .route("/admin/audit/export", get(admin::audit_export))
         .route("/admin/policies/reload", post(admin::reload_policies));
     if state.dev_allow_root_mint {
         admin_routes = admin_routes.route("/admin/root-token", post(dev_root::mint_root));
     }
-    let admin_routes = admin_routes.route_layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        admin::require_admin,
-    ));
+    let admin_routes = admin_routes
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            admin::require_admin,
+        ))
+        // Added last, so it wraps `require_admin` and its 401/403 answers get the headers too.
+        .route_layer(axum::middleware::from_fn(admin::admin_response_headers));
 
     let api = Router::new()
         .route("/healthz", get(wellknown::healthz))

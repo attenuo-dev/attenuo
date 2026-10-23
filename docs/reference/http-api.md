@@ -65,18 +65,52 @@ A denial is a JSON-RPC error with code `-32003`, carrying `reason` and `decision
 
 ## Admin
 
-All admin routes need `Authorization: Bearer <admin token>`. They answer 401 without it and 403 `admin_disabled` when no admin token is configured.
+All admin routes need `Authorization: Bearer <admin token>`. They answer 401 without it and 403 `admin_disabled` when no admin token is configured. Every admin answer, errors included, carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
 
 | Method and path | Purpose |
 | --- | --- |
 | `GET /admin/leases/{lease_id}` | Lease state. |
 | `POST /admin/leases/{lease_id}/revoke` | Revoke the lease and all descendants. |
-| `GET /admin/audit` | Audit entries in ascending `seq` order, paged with `from` and `limit`. Also returns `next` (when the page was full) and `head`, the newest `seq`. |
+| `GET /admin/audit` | Audit entries in ascending `seq` order, paged with `from` and `limit` (default 100, at most 1000). Also returns `next` (when the page was full) and `head`, the newest `seq`. Filters and newest-first paging are below. |
+| `GET /admin/audit/entries/{seq}` | One entry with its context, `{entry, lease_states, covered_by_checkpoint, policy_reloaded_after}` (below). 404 when there is no entry at `seq`. |
+| `GET /admin/audit/records/{id}` | The same for the entry whose record id is `id`: the UUID that proxy denials and AuthZEN answers return as `decision_id`. 400 if `id` is not a UUID, 404 if no record has it. |
+| `GET /admin/audit/checkpoints?before&limit` | Stored checkpoints, newest first, `{checkpoints, prev}`; each is `{seq, head_hash, at, kid, signature}`. `prev` is the `before` of the next (older) page, null after the oldest. Read-only: it never signs, unlike `/admin/audit/checkpoint`. |
 | `GET /admin/audit/verify` | Walk the whole hash chain, verify every checkpoint signature against the JWKS, and report `{entries, ok, first_bad_seq, checkpoints, last_signed_seq, unsigned_tail, bad_checkpoints}`. |
 | `GET /admin/audit/checkpoint` | The signed checkpoint of the head, `{seq, head_hash, at, kid, signature}` (signing it now if the head has none). For keeping outside the host. `hash` repeats `head_hash` for older clients. |
 | `GET /admin/audit/export?from&to` | Entries `from..=to` (default: the whole log) and the checkpoints in that range, streamed as `application/x-ndjson`: a `header` line, `entry` lines, then `checkpoint` lines. Verify offline with `attenuo audit verify --file`. 400 if `from` is 0 or `to < from`. |
 | `POST /admin/policies/reload` | Re-read the policy file. On failure the old policy stays. |
 | `POST /admin/root-token` | Development root mint. Mounted only when `[dev] allow_root_mint = true`. |
+
+### Querying the audit log
+
+`GET /admin/audit` takes these optional filters. Each is an exact match, never a pattern: `%` and `_` are ordinary characters, and `agent=l1` does not match an agent called `l10`. Filters combine with AND.
+
+| Parameter | Keeps entries whose record has |
+| --- | --- |
+| `kind` | one of these kinds, comma-separated: `decision`, `exchange`, `root_token`, `lease_renew`, `lease_revoke`, `admin` |
+| `decision` | `allow` or `deny` |
+| `reason` | this `reason` (`policy_deny`, `lease_revoked`, ...) |
+| `subject` | this `originating_subject` |
+| `agent` | this agent among its `agents` |
+| `lease` | this lease among its `leases` |
+| `server`, `tool` | this `server`, this `tool` |
+| `chain_id` | this `chain_id` (the lease id of the chain's first hop) |
+| `since`, `until` | `at` in `[since, until)`, both RFC 3339 times |
+
+Paging:
+
+- `order=asc` (the default) with `from`: oldest first from `from`. The answer is `{entries, next, head}`; `next` is the `from` of the following page, null at the end. Without any of the new parameters the answer is exactly what it was before filters existed.
+- `order=desc` with `before`: newest first, entries with `seq < before` (default: from the head). The answer adds `prev`, the `before` of the following (older) page, null once seq 1 has been read; `next` is then the `from` for reading forward with `order=asc` from just above the page, null when the page reached the head. `before` with `order=asc`, or `from` with `order=desc`, is a 400.
+- A filtered page reads at most 50,000 seqs (`agent`, `lease`, `since` and `until` cannot use an index). It can therefore come back short, even empty, with `next` or `prev` set: keep following the link until it is null. Unfiltered pages are never cut short.
+
+An unknown `kind` or `decision`, a time that is not RFC 3339, an empty value or an unknown `order` is a 400 `invalid_request`. The renewal history of a lease, for example, is `kind=lease_renew&lease=<id>`.
+
+The single-entry routes (`/admin/audit/entries/{seq}`, `/admin/audit/records/{id}`) answer:
+
+- `entry`: the entry, as in `GET /admin/audit`.
+- `lease_states`: one object per lease in the record, root first, as the lease registry sees it now: `{lease_id, known, active, parent, expires_at, revoked_at, revoke_reason}`. A lease the registry does not hold has `known: false`.
+- `covered_by_checkpoint`: the oldest stored checkpoint at or after the entry, whose signature covers it through the hash chain, or null when the entry is newer than every checkpoint. It is returned as stored; `GET /admin/audit/verify` checks signatures.
+- `policy_reloaded_after`: the seq of the first successful `POST /admin/policies/reload` recorded after the entry, or null. When set, the policy in force now may not be the one that decided.
 
 ## Metrics
 
