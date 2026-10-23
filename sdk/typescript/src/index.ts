@@ -23,6 +23,8 @@
  */
 
 export { AdminClient } from "./admin.js";
+export { ExportError, verifyExport } from "./audit.js";
+export type { BadCheckpoint, ExportReport, ExportSource, VerifyExportOptions } from "./audit.js";
 export type {
   AuditCheckpoint,
   AuditEntry,

@@ -41,6 +41,13 @@ export interface AuditEntry {
    * new token is bound.
    */
   dpopBound: boolean;
+  /**
+   * What sort of event the record is: `decision`, `exchange`, `root_token`, `lease_renew`,
+   * `lease_revoke` or `admin`.
+   */
+  kind: string | undefined;
+  /** The lease id of the delegation chain's first hop (undefined for admin records). */
+  chainId: string | undefined;
 }
 
 export interface AuditPage {
@@ -93,6 +100,10 @@ function headOf(page: Json): number {
   return typeof h === "number" && Number.isInteger(h) && h >= 0 ? h : 0;
 }
 
+function strOrUndef(v: unknown): string | undefined {
+  return typeof v === "string" ? v : undefined;
+}
+
 function entriesOf(page: Json): AuditEntry[] {
   const list = Array.isArray(page.entries) ? (page.entries as Json[]) : [];
   return list.map((e) => ({
@@ -100,6 +111,8 @@ function entriesOf(page: Json): AuditEntry[] {
     record: { ...((e.record as Json | undefined) ?? {}) },
     raw: e,
     dpopBound: (e.record as Json | undefined)?.dpop_bound === true,
+    kind: strOrUndef((e.record as Json | undefined)?.kind),
+    chainId: strOrUndef((e.record as Json | undefined)?.chain_id),
   }));
 }
 
@@ -153,11 +166,22 @@ export class AdminClient {
   /**
    * Stream `GET /admin/audit/export` as parsed JSON Lines objects: a `header`, then `entry` and
    * `checkpoint` objects, each tagged with `type`. Write the raw lines to a file and check it
-   * offline with `onbehalf audit verify --file`.
+   * offline with `verifyExport`.
+   *
+   * `filter.kind` (`decision`, `exchange`, `root_token`, `lease_renew`, `lease_revoke`,
+   * `admin`) and `filter.chainId` keep only matching entries. The header then carries a
+   * `filter` and the file cannot be verified (its chain has gaps): verify an unfiltered
+   * export, then filter.
    */
-  async *auditExport(fromSeq = 1, toSeq?: number): AsyncGenerator<AuditExportLine> {
-    const query: Record<string, number> = { from: fromSeq };
+  async *auditExport(
+    fromSeq = 1,
+    toSeq?: number,
+    filter: { kind?: string; chainId?: string } = {},
+  ): AsyncGenerator<AuditExportLine> {
+    const query: Record<string, string | number> = { from: fromSeq };
     if (toSeq !== undefined) query.to = toSeq;
+    if (filter.kind !== undefined) query.kind = filter.kind;
+    if (filter.chainId !== undefined) query.chain_id = filter.chainId;
     const res = await this.http.get("/admin/audit/export", { query });
     if (!res.ok) throw w.errorFromResponse(res.status, await res.text());
     const decoder = new TextDecoder();
