@@ -398,6 +398,12 @@ async fn inspect(client: Option<Client>, args: cli::InspectArgs, json: bool) -> 
                 render::fmt_relative(exp, now)
             );
         }
+        if let Some(cnf) = &c.cnf {
+            println!(
+                "bound to DPoP key jkt {} (needs a proof by that key)",
+                cnf.jkt
+            );
+        }
         match &verdict {
             None => println!("signature NOT verified (decoded only; pass --verify to check it)"),
             Some(Ok(())) => println!("verified: signature, type, issuer, audience, expiry, chain"),
