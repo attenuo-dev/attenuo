@@ -7,6 +7,7 @@
 
 import { capabilitiesToJson, type CapabilityLike } from "./capability.js";
 import { Http, type HttpOptions } from "./http.js";
+import { OnbehalfError } from "./errors.js";
 import type { Token } from "./token.js";
 import * as w from "./wire.js";
 
@@ -40,7 +41,12 @@ export interface AuditPage {
   entries: AuditEntry[];
   /** The `from` for the next page, or undefined at the end. */
   next: number | undefined;
+  /** The newest `seq` in the log (0 for an empty log). */
+  head: number;
 }
+
+/** One parsed JSON Lines object of an audit export, tagged with `type`. */
+export type AuditExportLine = { type: string; [key: string]: unknown };
 
 export interface VerifyReport {
   ok: boolean;
@@ -67,6 +73,11 @@ export interface MintRootOptions {
 
 function opt<T>(v: unknown): T | undefined {
   return v === null || v === undefined ? undefined : (v as T);
+}
+
+function headOf(page: Json): number {
+  const h = page.head;
+  return typeof h === "number" && Number.isInteger(h) && h >= 0 ? h : 0;
 }
 
 function entriesOf(page: Json): AuditEntry[] {
@@ -114,12 +125,60 @@ export class AdminClient {
   async audit(fromSeq = 1, limit = 100): Promise<AuditPage> {
     const res = await this.http.get("/admin/audit", { query: { from: fromSeq, limit } });
     const page = w.asObject(await w.jsonBody(res), "audit");
-    return { entries: entriesOf(page), next: opt<number>(page.next) };
+    return { entries: entriesOf(page), next: opt<number>(page.next), head: headOf(page) };
+  }
+
+  /**
+   * The newest audit `seq` (0 for an empty log), read from `head` of `GET /admin/audit`. Unlike
+   * `auditCheckpoint` it signs nothing.
+   */
+  async auditHead(): Promise<number> {
+    return (await this.audit(1, 1)).head;
+  }
+
+  /**
+   * Stream `GET /admin/audit/export` as parsed JSON Lines objects: a `header`, then `entry` and
+   * `checkpoint` objects, each tagged with `type`. Write the raw lines to a file and check it
+   * offline with `onbehalf audit verify --file`.
+   */
+  async *auditExport(fromSeq = 1, toSeq?: number): AsyncGenerator<AuditExportLine> {
+    const query: Record<string, number> = { from: fromSeq };
+    if (toSeq !== undefined) query.to = toSeq;
+    const res = await this.http.get("/admin/audit/export", { query });
+    if (!res.ok) throw w.errorFromResponse(res.status, await res.text());
+    const decoder = new TextDecoder();
+    let buf = "";
+    const emit = function* (line: string): Generator<AuditExportLine> {
+      if (line.trim() === "") return;
+      let v: unknown;
+      try {
+        v = JSON.parse(line);
+      } catch {
+        throw new OnbehalfError(`audit export: line is not JSON: ${line.slice(0, 200)}`);
+      }
+      if (typeof v !== "object" || v === null || Array.isArray(v)) {
+        throw new OnbehalfError(`audit export: line is not an object: ${line.slice(0, 200)}`);
+      }
+      yield v as AuditExportLine;
+    };
+    if (res.body) {
+      for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+        buf += decoder.decode(chunk, { stream: true });
+        let nl: number;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          yield* emit(line);
+        }
+      }
+    }
+    buf += decoder.decode();
+    yield* emit(buf);
   }
 
   /** The last `n` audit entries, oldest first. */
   async auditTail(n = 20): Promise<AuditEntry[]> {
-    const head = (await this.auditCheckpoint()).seq || 0;
+    const head = await this.auditHead();
     let start = Math.max(1, head + 1 - n);
     const out: AuditEntry[] = [];
     for (;;) {
@@ -130,7 +189,10 @@ export class AdminClient {
     }
   }
 
-  /** `{ seq, hash }` of the log head. */
+  /**
+   * The signed checkpoint of the log head (`seq`, `head_hash`, `hash`, `at`, `kid`, `signature`).
+   * Each call may create and store a signed checkpoint; use `auditHead` to just read the head.
+   */
   async auditCheckpoint(): Promise<AuditCheckpoint> {
     const res = await this.http.get("/admin/audit/checkpoint");
     return w.asObject(await w.jsonBody(res), "checkpoint") as AuditCheckpoint;

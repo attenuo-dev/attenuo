@@ -69,7 +69,7 @@ print(admin.audit_verify())  # VerifyReport(ok=True, entries=..., ...)
 | `initialize(token, server)` | MCP `initialize`; returns the `Mcp-Session-Id`, if any. |
 | `authzen_evaluate(token, server, tool, arguments)` | AuthZEN decision without calling the tool. A deny is a falsy `AuthzenDecision`, not an exception. |
 | `inspect(jwt, verify=False)` | Decode a token. With `verify=True` fetch the JWKS and check the Ed25519 signature, `typ`, `exp` and that `sub`/`act` match the chain. |
-| `AdminClient(server_url, admin_token)` | `revoke_lease`, `lease_status`, `audit`, `audit_tail`, `audit_checkpoint`, `audit_verify`, `policy_reload`, `mint_root_dev`. |
+| `AdminClient(server_url, admin_token)` | `revoke_lease`, `lease_status`, `audit`, `audit_head` (reads `head` from `GET /admin/audit`, signs nothing), `audit_tail`, `audit_export` (iterator of JSON Lines objects), `audit_checkpoint` (explicit; signs and stores a checkpoint), `audit_verify`, `policy_reload`, `mint_root_dev`. |
 
 `Token` carries `jwt` (also `str(token)`), `lease`, `expires_at`, `chain` (user, hops, capabilities per hop), and `verified`. `repr` does not print the JWT. Everything decoded from a token is untrusted unless `verified` is true.
 

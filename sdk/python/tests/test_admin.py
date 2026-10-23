@@ -8,7 +8,15 @@ from typing import Any
 import httpx
 import pytest
 
-from onbehalf import AdminClient, ApiError, AsyncAdminClient, Capability, Prefix, Unauthorized
+from onbehalf import (
+    AdminClient,
+    ApiError,
+    AsyncAdminClient,
+    Capability,
+    OnbehalfError,
+    Prefix,
+    Unauthorized,
+)
 
 from .helpers import Signer, token_response
 
@@ -90,33 +98,79 @@ async def test_audit_page_and_tail(make: Any) -> None:
             return httpx.Response(200, json={"seq": 7, "hash": "abc"})
         q = dict(r.url.params)
         start = int(q["from"])
-        return httpx.Response(
-            200, json={"entries": [_entry(s) for s in range(start, 8)], "next": None}
-        )
+        entries = [_entry(s) for s in range(start, 8)][: int(q["limit"])]
+        return httpx.Response(200, json={"entries": entries, "next": None, "head": 7})
 
     client, seen = make(handler)
     entries = await call(client, "audit_tail", 3)
+    # the head comes from GET /admin/audit; the checkpoint endpoint (which signs) is not used
+    assert all(r.url.path == "/admin/audit" for r in seen)
     assert [e.seq for e in entries] == [5, 6, 7]
     assert entries[0].id == "id5" and entries[0].decision == "allow" and entries[0].tool == "t"
     assert dict(seen[-1].url.params) == {"from": "5", "limit": "1000"}
+    assert await call(client, "audit_head") == 7
     entries = await call(client, "audit_tail", 100)
     assert entries[0].seq == 1 and len(entries) == 7
     page, nxt = await call(client, "audit", 2, 2)
     assert nxt is None and page[0].seq == 2
     assert (await call(client, "audit_checkpoint")) == {"seq": 7, "hash": "abc"}
+    assert seen[-1].url.path == "/admin/audit/checkpoint"
 
 
 async def test_audit_tail_follows_next(make: Any) -> None:
     def handler(r: httpx.Request) -> httpx.Response:
-        if r.url.path.endswith("checkpoint"):
-            return httpx.Response(200, json={"seq": 3, "hash": "h"})
-        start = int(r.url.params["from"])
+        assert not r.url.path.endswith("checkpoint")
+        q = r.url.params
+        start = int(q["from"])
+        if q["limit"] == "1":
+            return httpx.Response(200, json={"entries": [_entry(1)], "next": 2, "head": 3})
         if start == 1:
-            return httpx.Response(200, json={"entries": [_entry(1), _entry(2)], "next": 3})
-        return httpx.Response(200, json={"entries": [_entry(3)], "next": None})
+            return httpx.Response(
+                200, json={"entries": [_entry(1), _entry(2)], "next": 3, "head": 3}
+            )
+        return httpx.Response(200, json={"entries": [_entry(3)], "next": None, "head": 3})
 
     client, _ = make(handler)
     assert [e.seq for e in await call(client, "audit_tail", 10)] == [1, 2, 3]
+
+
+async def test_audit_head_empty_log_and_missing_field(make: Any) -> None:
+    client, _ = make(lambda r: httpx.Response(200, json={"entries": [], "next": None, "head": 0}))
+    assert await call(client, "audit_head") == 0
+    assert await call(client, "audit_tail", 5) == []
+    client, _ = make(lambda r: httpx.Response(200, json={"entries": [], "next": None}))
+    assert await call(client, "audit_head") == 0
+
+
+async def _collect(client: Any, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+    it = client.audit_export(*args, **kwargs)
+    if hasattr(it, "__aiter__"):
+        return [x async for x in it]
+    return list(it)
+
+
+async def test_audit_export_streams_jsonl(make: Any) -> None:
+    body = (
+        '{"type":"header","format":"onbehalf-audit-export/1","from":1,"to":2}\n'
+        '{"type":"entry","seq":1}\n\n'
+        '{"type":"checkpoint","seq":2}\n'
+    )
+    client, seen = make(lambda r: httpx.Response(200, text=body))
+    lines = await _collect(client, 1, 2)
+    assert [x["type"] for x in lines] == ["header", "entry", "checkpoint"]
+    assert seen[-1].url.path == "/admin/audit/export"
+    assert dict(seen[-1].url.params) == {"from": "1", "to": "2"}
+    await _collect(client)
+    assert dict(seen[-1].url.params) == {"from": "1"}
+
+
+async def test_audit_export_errors(make: Any) -> None:
+    client, _ = make(lambda r: httpx.Response(401, json={"error": "unauthorized"}))
+    with pytest.raises(ApiError):
+        await _collect(client)
+    client, _ = make(lambda r: httpx.Response(200, text="not json\n"))
+    with pytest.raises(OnbehalfError):
+        await _collect(client)
 
 
 async def test_audit_verify(make: Any) -> None:
