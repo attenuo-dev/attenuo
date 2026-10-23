@@ -13,13 +13,15 @@ Every call becomes one Cedar request.
 | Part | Value |
 | --- | --- |
 | `principal` | `Agent::"<id>"`, the last hop of the chain |
-| `action` | `Action::"<tool name>"`, a member of `Action::"invoke"` |
+| `action` | `Action::"<server>/<tool>"`, a member of `Action::"invoke"` |
 | `resource` | `Tool::"<server>/<tool>"`, which is `in Server::"<server>"` |
 | `context.input` | the call's arguments, verbatim |
 | `context.originating_user` | `subject`, `issuer`, `authenticated_at_unix`, `attributes` (`mfa`, `roles`, `tenant`, `email`, plus whatever `[policy] user_attributes` declares) |
 | `context.chain` | `depth`, `agents` (root first), `root_agent`, `leases` |
 | `context.session_id` | present only if the call carries one |
 | `context.now_unix` | evaluation time, unix seconds |
+
+The action names the server as well as the tool. `action == Action::"github/read_file"` matches `read_file` on the upstream mounted as `github` and nothing else: a second upstream that also has a `read_file` tool (a malicious one, say) is not covered by that permit. To write a rule for every tool of one server, use the resource: `resource in Server::"github"`. To write one for every tool everywhere, leave `action` unconstrained or use `action in Action::"invoke"`.
 
 The principal is an `Agent`, and an agent is `in` the originating `User` and in every earlier agent of the chain. So `principal in User::"alice"` and `principal in Agent::"planner"` both work, the latter matching `planner` and anything it delegated to.
 
@@ -28,7 +30,8 @@ The principal is an `Agent`, and an agent is `in` the originating `User` and in 
 Three things trip people up:
 
 - **Null and missing values.** Cedar has no `null`. Null arguments are dropped, and optional attributes must be guarded: `context.input has repo && context.input.repo like "acme/*"`. A policy that reads a missing attribute raises an evaluation error, and onbehalf then denies the call with `policy_error` rather than trusting a half-evaluated set.
-- **Action names are exact.** `Action::"read_*"` is not valid. To say "every read-only tool", tag tools in the catalog and test `resource.readonly`.
+- **Action names are exact.** `Action::"github/read_*"` is not valid. To say "every read-only tool", tag tools in the catalog and test `resource.readonly`.
+- **Actions name their server.** `Action::"read_file"` on its own (a *bare* action, the form before 2026-10-23) is rejected: it fails validation, and `onbehalf policy lint` reports it as `error[actions]` with the line to fix. See [Migrating from bare actions](#migrating-from-bare-actions).
 - **Give every policy an `@id`.** That id is what appears in audit records and in test reports. Without it Cedar names policies `policy0`, `policy1`, ... by position, which changes when you reorder the file.
 
 ## The catalog
@@ -51,7 +54,9 @@ inputs = { repo = "string" }
 It does two jobs:
 
 1. **Tool attributes** (`readonly`, `sensitive`) become `resource.readonly` and `resource.sensitive`. A tool that is not in the catalog is denied before Cedar runs, with reason `tool_not_in_catalog`, unless `[policy] unknown_tools` is `sensitive` (evaluated as `sensitive = true`) or `allow` (evaluated as neither, so a `forbid` keyed on `sensitive` silently skips it). Register every tool the server exposes (MCP `tools/list` is the natural source).
-2. **Schema generation.** Each tool becomes a declared action and each `inputs` entry a typed, optional attribute of `context.input`. Policies are validated against this schema at load time, so a typo in an argument name or a comparison of a string to a number fails the load instead of misbehaving on a call. A policy that names `Action::"x"` validates only if some catalog entry has a tool `x`. Argument types are `string`, `long`, `bool`, or `{ set = "string" }`.
+2. **Schema generation.** Each catalog entry becomes a declared action, `Action::"<server>/<tool>"`, and each `inputs` entry a typed, optional attribute of `context.input`. Policies are validated against this schema at load time, so a typo in an argument name or a comparison of a string to a number fails the load instead of misbehaving on a call. A policy that names `Action::"github/x"` validates only if the catalog has a tool `x` under `github`. Argument types are `string`, `long`, `bool`, or `{ set = "string" }`.
+
+Server names (the `[[upstreams]]` names and the catalog's server keys) and tool names may not contain `/`, so `"<server>/<tool>"` always splits one way. The one exception is on the tool side: the proxy authorizes MCP methods other than `tools/call` under their method name (`resources/read`, `prompts/get`), so those catalog entries are `[policy.catalog.github."resources/read"]` and their action is `Action::"github/resources/read"`. A `tools/call` can never carry a `/` in its tool name, so a tool cannot pose as one of these methods. The server refuses to start with a catalog entry that breaks these rules.
 
 ### User attributes
 
@@ -66,7 +71,7 @@ Types are `string`, `long`, `bool` and `set<T>` (for example `set<string>`). The
 
 ```cedar
 @id("platform_engineers_may_deploy")
-permit(principal, action == Action::"create_deployment", resource)
+permit(principal, action == Action::"github/create_deployment", resource)
 when {
     context.originating_user.attributes has groups &&
     context.originating_user.attributes.groups.contains("platform") &&
@@ -99,7 +104,7 @@ Constrain what a permitted tool may touch. Always guard with `has`:
 
 ```cedar
 @id("read_file_public_repos_only")
-permit(principal, action == Action::"read_file", resource)
+permit(principal, action == Action::"github/read_file", resource)
 when { context.input has repo && context.input.repo like "alice/public-*" };
 ```
 
@@ -136,7 +141,7 @@ You can key rules on who is acting:
 ```cedar
 // Only the "release-bot" agent may merge.
 @id("merge_only_release_bot")
-permit(principal == Agent::"release-bot", action == Action::"merge_pull_request", resource);
+permit(principal == Agent::"release-bot", action == Action::"github/merge_pull_request", resource);
 
 // Nothing delegated from the "untrusted-summarizer" agent may write.
 @id("summarizer_subtree_is_readonly")
@@ -145,6 +150,16 @@ when { !resource.readonly };
 ```
 
 **Warning: agent identity is only as strong as actor authentication.** The agent ids in a chain are whatever the token exchange recorded. With `[token] require_actor_auth = true` (the default) an exchange must authenticate as its `actor`, with that agent's `[[agents]]` client secret or with an `actor_token` from an `[[actor_trust]]` issuer (`[token] actor_auth`). With a secret, an id in the chain means "someone holding that agent's secret"; with an actor token, "a workload the identity system vouched for", which is only as strong as that system and its `subject_to_agent` mapping. An operator who turns the setting off makes the `actor` an assertion again. Treat agent-keyed rules as defence in depth. Put the real boundary in things the holder cannot change: the capabilities in the token (attenuation only narrows), attributes of the originating user, and chain depth.
+
+### Migrating from bare actions
+
+Until 2026-10-23 the action was the bare tool name, `Action::"read_file"`, and it matched that tool on every upstream (SR-13 in the [security review](../research/security-review-2026-10-22.md)). To migrate:
+
+1. Run `onbehalf policy lint policy.cedar --config server.toml`. Every bare action is reported as `error[actions]` with its line and column.
+2. Rewrite each one as `Action::"<server>/<tool>"`. If one bare permit was meant for the same tool on several servers, write one action per server: `action in [Action::"github/read_file", Action::"gitlab/read_file"]`.
+3. Run your `onbehalf policy test` files; the cases themselves do not change, since they name the server and the tool separately.
+
+If you cannot rewrite the policies before upgrading, `[policy] legacy_bare_actions = true` keeps the old ids (and their old, unscoped meaning) for the whole policy set. It is deprecated: the server logs a warning at start, lint reports each bare action as a warning instead of an error, and the two forms cannot be mixed. `onbehalf policy test` follows the same switch from the config its `catalog:` names, or from `legacy_bare_actions: true` in the test file.
 
 ## Testing policies
 
@@ -221,7 +236,7 @@ The same runner is available as a library, `onbehalf_policy::testing`, for tests
 onbehalf policy lint policy.cedar --config server.toml [--schema] [--json]
 ```
 
-Parses the file and validates it against the schema generated from the catalog in `--config`, printing each problem as `file:line:col: error[stage]: message`. Exit `0` clean, `2` errors. `--schema` also prints the schema it validated against, which is the quickest way to see which actions and argument names are declared. Without `--config` the catalog is empty, so any policy that names an action fails validation; the lint says so.
+Parses the file, flags bare (not server-scoped) actions, and validates it against the schema generated from the catalog in `--config`, printing each problem as `file:line:col: error[stage]: message`. Exit `0` clean, `2` errors. `--schema` also prints the schema it validated against, which is the quickest way to see which actions and argument names are declared. Without `--config` the catalog is empty, so any policy that names an action fails validation; the lint says so.
 
 ### In CI
 

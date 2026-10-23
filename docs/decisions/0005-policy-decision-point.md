@@ -25,7 +25,8 @@ Cedar has three properties that shape the design:
 - **Two stages, capabilities first.** `chain.effective_capabilities().permits(call)` runs
   before Cedar and cannot be bypassed by any policy. Reason code `capability_denied`.
 - **Request shape** (documented in the crate root): `principal = Agent::"<id>"`,
-  `action = Action::"<tool>"` (member of `Action::"invoke"`), `resource =
+  `action = Action::"<server>/<tool>"` (member of `Action::"invoke"`; amended 2026-10-23, see
+  below), `resource =
   Tool::"<server>/<tool>"` in `Server::"<server>"`, context `{ input, originating_user,
   chain, session_id?, now_unix }`. Agents are `in` the `User` and `in` earlier agents.
 - **Schema = fixed entity model + generated action model.** The base schema declares
@@ -45,7 +46,7 @@ Cedar has three properties that shape the design:
 
 ## Consequences
 
-- A policy that names `Action::"x"` validates only when some catalog entry has tool `x`.
+- A policy that names `Action::"s/x"` validates only when the catalog has tool `x` on server `s`.
   This catches typos, which for `forbid` rules would otherwise be silent holes. Operators
   must feed the catalog (MCP `tools/list` is the natural source).
 - The shipped `policies/default.cedar` requires a `create_issue` tool in the catalog.
@@ -59,7 +60,12 @@ Cedar has three properties that shape the design:
   would silently disable rules.
 - **Hand-maintained full schema from the operator.** Rejected as the default: it duplicates
   the catalog and drifts. Still possible through `with_schema_str` for the entity part.
-- **Namespacing actions per server (`Github::Action::"read_file"`).** Deferred: plain action
-  names keep policies portable to AgentCore; the server is on the resource and its parent.
+- **Namespacing actions per server (`Github::Action::"read_file"`).** Deferred at first: plain
+  action names kept policies portable to AgentCore, and the server is on the resource and its
+  parent. **Amended 2026-10-23 (SR-13):** a bare `Action::"read_file"` matched that tool on
+  every upstream, so a permit written for one server covered a malicious second one. Action ids
+  are now `Action::"<server>/<tool>"` (a plain string id, not a Cedar namespace, so the policy
+  syntax is unchanged). The bare form remains behind the deprecated
+  `[policy] legacy_bare_actions` switch, and `onbehalf policy lint` flags it.
 - **Trusting Cedar's decision when a policy errored.** Rejected: a skipped `forbid` is a
   grant.

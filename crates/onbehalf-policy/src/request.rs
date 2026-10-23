@@ -179,7 +179,9 @@ pub(crate) fn build(
     call: &ToolCall,
     attrs: &ToolAttrs,
     now: OffsetDateTime,
+    legacy_bare_actions: bool,
 ) -> Result<CedarRequest, TranslationError> {
+    let action = crate::schema::action_id(&call.server, &call.tool, legacy_bare_actions);
     let agent = chain
         .current_agent()
         .ok_or_else(|| TranslationError("delegation chain has no hops".into()))?;
@@ -258,16 +260,17 @@ pub(crate) fn build(
         "parents": [uid_json("Server", &call.server)],
     }));
     // The action hierarchy. Evaluation is schema-free, so Cedar only knows that
-    // `Action::"<tool>"` is `in Action::"invoke"` if the entity store says so; without these
-    // entries `action in Action::"invoke"` is false and a `forbid` written that way never fires.
+    // `Action::"<server>/<tool>"` is `in Action::"invoke"` if the entity store says so; without
+    // these entries `action in Action::"invoke"` is false and a `forbid` written that way never
+    // fires.
     entities.push(json!({
         "uid": uid_json("Action", GENERIC_ACTION),
         "attrs": {},
         "parents": [],
     }));
-    if call.tool != GENERIC_ACTION {
+    if action != GENERIC_ACTION {
         entities.push(json!({
-            "uid": uid_json("Action", &call.tool),
+            "uid": uid_json("Action", &action),
             "attrs": {},
             "parents": [uid_json("Action", GENERIC_ACTION)],
         }));
@@ -277,7 +280,7 @@ pub(crate) fn build(
 
     Ok(CedarRequest {
         principal: uid("Agent", &agent.0),
-        action: uid("Action", &call.tool),
+        action: uid("Action", &action),
         resource: uid("Tool", &tool_id(call)),
         context,
         entities,

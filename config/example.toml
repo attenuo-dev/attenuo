@@ -30,15 +30,21 @@ private_key_pem_path = "data/issuer.pem"
 # Cedar policies. POST /admin/policies/reload re-reads this file.
 policies_path = "config/policies/default.cedar"
 # Tool catalog: attributes policies can test (resource.readonly, resource.sensitive) and the
-# argument types used to validate `context.input.*`. Every action a policy names must be here.
+# argument types used to validate `context.input.*`. Every action a policy names must be here:
+# the entry [policy.catalog.github.read_file] declares Action::"github/read_file".
+# Server and tool names are ASCII letters, digits, "_", "." and "-" only (a tool may also be an
+# MCP method name such as "resources/read"); anything else is refused at start.
 # Alternatively (or additionally) point catalog_path at a JSON file of the same shape:
 # { "github": { "read_file": { "readonly": true, "inputs": { "repo": "string" } } } }
 # catalog_path = "config/catalog.json"
 # Calls to a (server, tool) pair missing from the catalog: "deny" (default, reason
 # tool_not_in_catalog), "sensitive" (evaluated with resource.sensitive = true) or "allow"
-# (default attributes; forbids keyed on resource.sensitive do not apply). Server names must
-# not contain "/".
+# (default attributes; forbids keyed on resource.sensitive do not apply).
 unknown_tools = "deny"
+# DEPRECATED. Policies name actions per server, Action::"<server>/<tool>". `true` brings back
+# the old bare Action::"<tool>", which matches that tool on every server; only for a policy set
+# not yet rewritten (`onbehalf policy lint` lists the bare actions). Logged as a warning.
+legacy_bare_actions = false
 
 # Extra originating_user.attributes the Cedar schema should know, so policies that test them
 # validate. Types: string, long, bool, set<string> (any scalar inside set<>). The built-in four
@@ -174,6 +180,19 @@ allow_root_mint = false
 # tools/call answered over SSE) is re-checked against lease state and token expiry. The stream
 # is ended at the first failed check, so a revoked or expired token loses it within this time.
 stream_recheck_seconds = 2
+# Refuse a tools/call whose exact name the upstream never returned from tools/list and the
+# catalog does not know (reason tool_not_listed), so an upstream that resolves names
+# case-insensitively cannot run delete_repo for "Delete_Repo".
+require_listed_tools = true
+# Memory bounds. An upstream body the proxy must buffer (a JSON list result it filters, one SSE
+# event) over max_upstream_body_bytes gets 502; a request body over max_request_body_bytes
+# gets 413.
+max_upstream_body_bytes = 16777216
+max_request_body_bytes = 4194304
+# Mcp-Session-Id bindings: idle lifetime, and how many are held. When every slot is live a new
+# session gets 503 session_registry_full; live sessions are never evicted to make room.
+session_ttl_seconds = 3600
+max_sessions = 100000
 
 [metrics]
 # Prometheus text endpoint on its OWN listener (GET /metrics), never on the proxy port.
