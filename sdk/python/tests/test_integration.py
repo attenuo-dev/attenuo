@@ -487,3 +487,145 @@ def test_example_mcp_client(stack: Stack) -> None:
     assert "tools the token may call: ['read_file']" in proc.stdout
     assert "allowed:" in proc.stdout
     assert "denied:" in proc.stdout
+
+
+# ---- cross-language export verification ------------------------------------------------------
+
+TS_DIST = ROOT / "sdk" / "typescript" / "dist" / "index.js"
+
+
+def cli_binary() -> Path:
+    given = os.environ.get("ONBEHALF_BIN_DIR")
+    if given:
+        return Path(given) / "onbehalf"
+    return cargo_executable(["-p", "onbehalf-cli"], "onbehalf")
+
+
+def run_cli(stack: Stack, cli: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ, "ONBEHALF_SERVER": stack.url, "ONBEHALF_ADMIN_TOKEN": ADMIN_TOKEN}
+    return subprocess.run([str(cli), *args], env=env, capture_output=True, text=True, timeout=60)
+
+
+def verify_with_typescript(export: Path, jwks: Path) -> dict[str, object]:
+    script = (
+        f"import {{ verifyExport }} from {json.dumps(TS_DIST.as_uri())};"
+        "import { readFileSync } from 'node:fs';"
+        "const [e, j] = process.argv.slice(1);"
+        "try { console.log(JSON.stringify(await verifyExport({ path: e },"
+        " { checkpointPublicKeys: JSON.parse(readFileSync(j, 'utf8')) }))); }"
+        " catch (err) { console.log(JSON.stringify({ error: String(err.message) })); }"
+    )
+    proc = subprocess.run(
+        ["node", "--input-type=module", "-e", script, str(export), str(jwks)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    assert isinstance(out, dict)
+    return out
+
+
+def test_one_mutated_byte_is_rejected_at_the_same_seq_by_rust_python_and_typescript(
+    stack: Stack, tmp_path: Path
+) -> None:
+    from onbehalf.audit import ExportError, verify_export
+
+    cli = cli_binary()
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    ob = Client(stack.url)
+
+    # Every kind of record: root token (and its admin record), exchange, decision, renewal,
+    # revocation.
+    root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+    coder = ob.exchange(
+        root, "coder", [Capability("github", "read_file")], client_secret=CODER_SECRET
+    )
+    ob.call_tool(coder, "github", "read_file", {"repo": "alice/public-docs", "path": "README.md"})
+    ob.renew(coder)
+    admin.revoke_lease(coder.lease, "cross-language test")
+    admin.audit_checkpoint()  # countersign the head: the strict check needs no unsigned tail
+
+    jwks = tmp_path / "jwks.json"
+    jwks.write_text(httpx.get(f"{stack.url}/.well-known/jwks.json").text)
+    export = tmp_path / "export.jsonl"
+    proc = run_cli(stack, cli, "audit", "export", "--out", str(export))
+    assert proc.returncode == 0, proc.stderr
+    objs = [json.loads(line) for line in export.read_text().splitlines()]
+    entries = [o for o in objs if o["type"] == "entry"]
+    kinds = {e["record"]["kind"] for e in entries}
+    assert {"root_token", "admin", "exchange", "decision", "lease_renew", "lease_revoke"} <= kinds
+    ours = [e for e in entries if e["record"].get("chain_id") == root.lease]
+    assert {e["record"]["kind"] for e in ours} >= {"root_token", "exchange", "decision"}
+
+    def rust(path: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+        return run_cli(
+            stack,
+            cli,
+            "--json",
+            "audit",
+            "verify",
+            "--file",
+            str(path),
+            "--jwks",
+            str(jwks),
+            *extra,
+        )
+
+    def python(path: Path) -> object:
+        return verify_export(path, checkpoint_public_keys=json.loads(jwks.read_text()))
+
+    have_ts = TS_DIST.exists() and shutil.which("node") is not None
+    if os.environ.get("ONBEHALF_REQUIRE_TS") == "1":
+        assert have_ts, "build sdk/typescript (npm run build) first"
+
+    # Clean: all three accept.
+    p0 = rust(export)
+    assert p0.returncode == 0, p0.stdout
+    clean = python(export)
+    assert clean.ok  # type: ignore[attr-defined]
+    if have_ts:
+        assert verify_with_typescript(export, jwks)["ok"] is True
+
+    # One byte of one entry's record changes: all three name the same seq.
+    target = entries[len(entries) // 2]
+    out_lines = export.read_text().splitlines(keepends=True)
+    (idx,) = [i for i, ln in enumerate(out_lines) if f'"seq":{target["seq"]},"type":"entry"' in ln]
+    needle = '"chain_digest":"'
+    pos = out_lines[idx].index(needle) + len(needle)
+    old = out_lines[idx][pos]
+    out_lines[idx] = out_lines[idx][:pos] + ("0" if old != "0" else "1") + out_lines[idx][pos + 1 :]
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text("".join(out_lines))
+
+    proc = rust(bad)
+    assert proc.returncode != 0, proc.stdout
+    assert json.loads(proc.stdout)["first_bad_seq"] == target["seq"]
+    report = python(bad)
+    assert not report.ok and report.first_bad_seq == target["seq"]  # type: ignore[attr-defined]
+    if have_ts:
+        ts = verify_with_typescript(bad, jwks)
+        assert ts["ok"] is False and ts["firstBadSeq"] == target["seq"]
+
+    # A filtered export is refused by all three (its chain has gaps by construction).
+    filtered = tmp_path / "filtered.jsonl"
+    proc = run_cli(stack, cli, "audit", "export", "--kind", "decision", "--out", str(filtered))
+    assert proc.returncode == 0, proc.stderr
+    only = [json.loads(line) for line in filtered.read_text().splitlines()]
+    assert only[0]["filter"] == {"kind": "decision"}
+    assert {o["record"]["kind"] for o in only if o["type"] == "entry"} == {"decision"}
+    assert rust(filtered).returncode != 0
+    with pytest.raises(ExportError, match="filtered"):
+        python(filtered)
+    if have_ts:
+        assert "filtered" in str(verify_with_typescript(filtered, jwks)["error"])
+
+    # --chain-id keeps one run, whatever its kinds.
+    proc = run_cli(stack, cli, "audit", "export", "--chain-id", root.lease, "--out", str(filtered))
+    assert proc.returncode == 0, proc.stderr
+    mine = [json.loads(line) for line in filtered.read_text().splitlines()]
+    assert {o["record"]["chain_id"] for o in mine if o["type"] == "entry"} == {root.lease}
+    assert len([o for o in mine if o["type"] == "entry"]) == len(ours)
+    admin.close()
+    ob.close()

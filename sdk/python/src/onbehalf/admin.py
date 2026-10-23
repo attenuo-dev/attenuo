@@ -69,6 +69,17 @@ class AuditEntry:
         return self.record.get("server")
 
     @property
+    def kind(self) -> str | None:
+        """``decision``, ``exchange``, ``root_token``, ``lease_renew``, ``lease_revoke`` or
+        ``admin``."""
+        return self.record.get("kind")
+
+    @property
+    def chain_id(self) -> str | None:
+        """The lease id of the delegation chain's first hop (``None`` for admin records)."""
+        return self.record.get("chain_id")
+
+    @property
     def dpop_bound(self) -> bool:
         """The request proved possession of the key its token is bound to (DPoP); for an
         issuance, the new token is bound."""
@@ -98,6 +109,19 @@ def _entries(page: Any) -> list[AuditEntry]:
 def _head(page: Any) -> int:
     head = page.get("head") if isinstance(page, dict) else None
     return head if isinstance(head, int) and not isinstance(head, bool) and head >= 0 else 0
+
+
+def _export_params(
+    from_seq: int, to_seq: int | None, kind: str | None, chain_id: str | None
+) -> dict[str, Any]:
+    params: dict[str, Any] = {"from": from_seq}
+    if to_seq is not None:
+        params["to"] = to_seq
+    if kind is not None:
+        params["kind"] = kind
+    if chain_id is not None:
+        params["chain_id"] = chain_id
+    return params
 
 
 def _export_line(line: str) -> dict[str, Any]:
@@ -233,14 +257,22 @@ class AdminClient:
         return body if isinstance(body, dict) else {}
 
     def audit_export(
-        self, from_seq: int = 1, to_seq: int | None = None
+        self,
+        from_seq: int = 1,
+        to_seq: int | None = None,
+        *,
+        kind: str | None = None,
+        chain_id: str | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Stream ``GET /admin/audit/export`` as parsed JSON Lines objects: a ``header``, then
         ``entry`` and ``checkpoint`` objects, each tagged with ``type``. Write the raw lines to
-        a file and check it offline with ``onbehalf audit verify --file``."""
-        params: dict[str, Any] = {"from": from_seq}
-        if to_seq is not None:
-            params["to"] = to_seq
+        a file and check it offline with :func:`onbehalf.audit.verify_export`.
+
+        ``kind`` (``decision``, ``exchange``, ``root_token``, ``lease_renew``, ``lease_revoke``,
+        ``admin``) and ``chain_id`` keep only matching entries. The header then carries a
+        ``filter`` and the file cannot be verified (its chain has gaps): verify an unfiltered
+        export, then filter."""
+        params = _export_params(from_seq, to_seq, kind, chain_id)
         with self._http.stream("GET", "/admin/audit/export", params=params) as resp:
             if not resp.is_success:
                 resp.read()
@@ -367,11 +399,14 @@ class AsyncAdminClient:
         return body if isinstance(body, dict) else {}
 
     async def audit_export(
-        self, from_seq: int = 1, to_seq: int | None = None
+        self,
+        from_seq: int = 1,
+        to_seq: int | None = None,
+        *,
+        kind: str | None = None,
+        chain_id: str | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        params: dict[str, Any] = {"from": from_seq}
-        if to_seq is not None:
-            params["to"] = to_seq
+        params = _export_params(from_seq, to_seq, kind, chain_id)
         async with self._http.stream("GET", "/admin/audit/export", params=params) as resp:
             if not resp.is_success:
                 await resp.aread()

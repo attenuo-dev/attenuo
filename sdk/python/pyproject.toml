@@ -9,7 +9,7 @@ description = "Python SDK for the onbehalf agent authorization server: token exc
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
-dependencies = ["httpx>=0.25"]
+dependencies = ["httpx>=0.25", "rfc8785==0.1.4"]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
   "License :: OSI Approved :: Apache Software License",

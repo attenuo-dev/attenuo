@@ -12,6 +12,7 @@ from onbehalf import (
     AdminClient,
     ApiError,
     AsyncAdminClient,
+    AuditEntry,
     Capability,
     OnbehalfError,
     Prefix,
@@ -162,6 +163,18 @@ async def test_audit_export_streams_jsonl(make: Any) -> None:
     assert dict(seen[-1].url.params) == {"from": "1", "to": "2"}
     await _collect(client)
     assert dict(seen[-1].url.params) == {"from": "1"}
+    await _collect(client, 3, kind="lease_renew", chain_id="l 1")
+    assert dict(seen[-1].url.params) == {
+        "from": "3",
+        "kind": "lease_renew",
+        "chain_id": "l 1",
+    }
+
+
+def test_audit_entry_exposes_kind_and_chain_id() -> None:
+    e = AuditEntry(seq=1, record={"kind": "exchange", "chain_id": "l1"}, raw={})
+    assert (e.kind, e.chain_id) == ("exchange", "l1")
+    assert AuditEntry(seq=2, record={}, raw={}).chain_id is None
 
 
 async def test_audit_export_errors(make: Any) -> None:
