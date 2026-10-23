@@ -73,7 +73,7 @@ pub fn record(i: usize) -> DecisionRecord {
     record_for(
         &c,
         i,
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             Decision::Allow
         } else {
             Decision::Deny
