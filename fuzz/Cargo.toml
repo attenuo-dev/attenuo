@@ -32,7 +32,7 @@ tower = { version = "0.5", features = ["util"] }
 async-trait = "0.1"
 base64 = "0.23"
 ring = "0.17"
-jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
+jsonwebtoken = "9"
 uuid = "1"
 
 [profile.release]
