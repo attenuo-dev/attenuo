@@ -664,6 +664,14 @@ fn wal_round(shared: &WalShared) -> Result<(), AuditError> {
         // wait; the next round tries again.
         let _ = wal_checkpoint(&conn, "TRUNCATE");
     }
+    if !done.complete() {
+        // Frames were left behind (a reader or the writer was in the way). Do not wait a
+        // whole interval, or another WAL_CHECKPOINT_COMMITS commits, to try again: the very
+        // next commit kicks a new round.
+        activity
+            .since_wal_checkpoint
+            .store(WAL_CHECKPOINT_COMMITS - 1, Ordering::Release);
+    }
     Ok(())
 }
 
@@ -1075,7 +1083,7 @@ impl SqliteAudit {
     /// Wrap an existing connection, creating the schema if needed.
     ///
     /// Fails for a log written with another entry hash construction than
-    /// [`ENTRY_HASH_VERSION`](crate::ENTRY_HASH_VERSION), such as one written before RFC 8785
+    /// [`ENTRY_HASH_VERSION`], such as one written before RFC 8785
     /// canonical JSON (SR-20): there is no migration, start a new file.
     pub fn from_connection(conn: Connection) -> Result<Self, AuditError> {
         check_record_fields(&conn)?;

@@ -104,10 +104,13 @@ async fn exchange_closed_loop_with_fresh_actors() {
         assert!(r["requests"].as_u64().unwrap() > 0, "{r}");
         assert_eq!(r["unexpected"], 0, "{r}");
         assert_eq!(r["load"], "closed");
-        assert!(
-            r["cpu"]["seconds"].as_f64().is_some(),
-            "server CPU is read: {r}"
-        );
+        // Server CPU comes from `/proc/<pid>/stat`, so it is only read on Linux.
+        if cfg!(target_os = "linux") {
+            assert!(
+                r["cpu"]["seconds"].as_f64().is_some(),
+                "server CPU is read: {r}"
+            );
+        }
     }
     for c in v["runs"]["exchange"]["audit_checks"].as_array().unwrap() {
         assert_eq!(c["ok"], true, "{c}");
