@@ -53,6 +53,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ### Added
 
+- Per-stage timing of proxied calls: histogram `onbehalf_proxy_stage_seconds{stage=...}` on `/metrics` (`token_verify_hit`, `token_verify_miss`, `lease_check`, `policy`, `audit_append`, `blocking_pool`, `upstream`, `response`, `total`; buckets from 1 us to 1 s) and the same figures as `tracing` debug fields. `onbehalf_proxy::Stage` and `Authorizer::observe_stage` (default no-op) let the proxy report its own stages. `onbehalf-bench` enables `/metrics` on the server it starts, reads the histograms around each measured window and prints a per-stage table (`--metrics-url` for an external server, `--metrics-port` for `--print-config`). First run in `docs/design/bench/2026-10-23-vm-proxy-stages.md`.
 - Fuzz targets (`fuzz/`, cargo-fuzz on nightly, outside the workspace) for token and DPoP verification, `ou_sig`, delegation chains, names, capability attenuation (differential: an attenuated set never permits a call its parent does not), the proxy's JSON-RPC, session-header, body-limit and SSE handling, policy context building and AuthZEN, and audit export verification. CI job `fuzz-build` builds them and runs their seeds. Guide: `fuzz/README.md`; design and findings: `docs/design/fuzzing.md`.
 - Framework integration examples: `examples/claude-agent-sdk` (Claude Agent SDK orchestrator and `coder` sub-agent, narrowed token as the sub-agent's MCP bearer) and `examples/langchain-agent` (LangChain with `langchain-mcp-adapters`, plus a tool interceptor for denials). Each has a `run.sh` that starts the server and the fake upstream and runs a deterministic dry-run without an API key, a README with the hop diagram, and a `test_example.py` gated on `ONBEHALF_INTEGRATION=1`. Versions are pinned in each `requirements.txt`. The live mode with a model is untested. New `examples/README.md` indexes all examples.
 
@@ -133,6 +134,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ### Fixed
 
+- `onbehalf-bench` no longer counts any JSON-RPC error in a deny cell as the expected denial: a denial must be `-32003` with the expected reason (`policy_deny`, `capability_denied`) and a `data.decision_id` listed in `X-Onbehalf-Decision-Id`, and an allow must carry that header. Anything else (`audit_error`, `-32007` `too_many_sessions`, a `5xx`) stops the run after the cell with the first bad answer.
 - A rustdoc intra-doc link in `onbehalf-proxy` to the feature-gated `testing` module broke `cargo doc` with `-D warnings`.
 
 ### Documentation
