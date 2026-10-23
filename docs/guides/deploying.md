@@ -284,4 +284,4 @@ If you run a second system that needs to react to revocations, such as an AuthZE
 
 ## Upgrades
 
-Until 1.0, minor versions can change the config, the token format and the database layout. Read the [CHANGELOG](../../CHANGELOG.md) before every upgrade, and back up the database and the key first. Tokens issued by one version may not verify on the next. Plan to re-mint.
+Until 1.0, minor versions can change the config, the token format and the database layout. Read the [CHANGELOG](https://github.com/7Mudit/onbehalf/blob/main/CHANGELOG.md) before every upgrade, and back up the database and the key first. Tokens issued by one version may not verify on the next. Plan to re-mint.

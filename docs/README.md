@@ -12,7 +12,7 @@ This folder is an Obsidian vault (open it with "Open folder as vault") and the p
 - [tasks/](tasks/) — the task board and milestone plans
 - [log/](log/) — engineering log, one file per day
 
-Process documents live at the repository root: [CONTRIBUTING](../CONTRIBUTING.md), [SECURITY](../SECURITY.md), [GOVERNANCE](../GOVERNANCE.md), [CHANGELOG](../CHANGELOG.md). How ADRs and RFCs are written is in [decisions/README.md](decisions/README.md) and [spec/README.md](spec/README.md).
+Process documents live at the repository root: [CONTRIBUTING](https://github.com/7Mudit/onbehalf/blob/main/CONTRIBUTING.md), [SECURITY](https://github.com/7Mudit/onbehalf/blob/main/SECURITY.md), [GOVERNANCE](https://github.com/7Mudit/onbehalf/blob/main/GOVERNANCE.md), [CHANGELOG](https://github.com/7Mudit/onbehalf/blob/main/CHANGELOG.md). How ADRs and RFCs are written is in [decisions/README.md](decisions/) and [spec/README.md](spec/).
 
 ## Engineering log convention
 

@@ -33,6 +33,19 @@ cargo audit               # cargo install cargo-audit (optional locally; CI runs
 
 `rustfmt.toml` and `clippy.toml` in the repo root carry the project settings, so `cargo fmt` and `cargo clippy` pick them up without flags. The toolchain is pinned by `rust-toolchain.toml`.
 
+## Previewing the documentation site
+
+The pages in `docs/` are published as an [mdBook](https://rust-lang.github.io/mdBook/) site by `.github/workflows/docs.yml`. The book is configured in `book.toml` and its table of contents is `docs/SUMMARY.md`. A new page appears on the site only once it is listed there.
+
+```sh
+cargo install mdbook --locked --version 0.4.52   # the version CI uses
+mdbook serve --open                              # http://localhost:3000, rebuilds on save
+mdbook build                                     # one-off build into book/ (ignored by git)
+python3 scripts/check-links.py                   # relative links and anchors
+```
+
+Keep the pages readable on GitHub and in Obsidian as well. Link to other pages with relative `.md` paths. Link to files outside `docs/` (for example `config/example.toml`) with a full GitHub URL, because the book only contains `docs/`. To link to a folder's `README.md`, link the folder (`../spec/`), since the book renders it as `index.html`. Mermaid diagrams render on the site through a script that loads mermaid from a CDN, so they need network access when you preview.
+
 ## Branches
 
 Branch from `main`. Name the branch with a type prefix and a short slug:

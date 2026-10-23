@@ -21,7 +21,7 @@ Let a *run* be a tree of hops rooted at an originating user `u`. Hop `h_n` is an
 - **P3. Argument-aware per-call authorization.** Every `tools/call` is evaluated as an AuthZEN-shaped request whose context contains the call arguments, the originating user, chain depth, and session/time. A call is forwarded only on an explicit `permit`. Deny is the default.
 - **P4. Tamper-evident audit and in-flight revocation.** Every decision, token issuance, lease renewal and revocation is appended to a hash-chained log. Every token is bound to a lease; a revoked lease (or any ancestor lease) causes the next call to be denied within one lease interval.
 
-P2 and P4 are the invariants that must carry property tests, not only unit tests ([CONTRIBUTING](../../CONTRIBUTING.md)).
+P2 and P4 are the invariants that must carry property tests, not only unit tests ([CONTRIBUTING](https://github.com/7Mudit/onbehalf/blob/main/CONTRIBUTING.md)).
 
 ## 3. Delegation-chain data model
 
