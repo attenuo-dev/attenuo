@@ -23,7 +23,9 @@
 //!    `session_mismatch`, recorded through [`Authorizer::record_rejection`]. An id the proxy
 //!    does not know gets `404`, which tells an MCP client to start a new session. Decision
 //!    records and logs carry a hash prefix of the id ([`session::session_tag`]), never the id.
-//!    See [`session`].
+//!    A request must carry at most one `Mcp-Session-Id`, visible ASCII only, or it gets `400`;
+//!    only that checked value is forwarded. Upstream responses with more than one session id
+//!    (or an invalid one) have the header removed and bind nothing (SR-27). See [`session`].
 //!
 //! Every authorized request's response carries an `X-Onbehalf-Decision-Id` header with the
 //! id(s) of the decision record(s) the authorizer produced, so a client can correlate a reply

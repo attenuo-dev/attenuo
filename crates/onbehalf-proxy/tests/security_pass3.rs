@@ -1,9 +1,8 @@
 //! Regression tests for findings of the 2026-10-23 security review, pass 3
 //! (`docs/research/security-review-2026-10-23.md`).
 //!
-//! Both findings here are in `crates/onbehalf-proxy/src/proxy.rs`, which was being changed on
-//! other branches during the review, so they are not fixed yet and the tests are `#[ignore]`d.
-//! The report describes the fix for each; remove the `#[ignore]` when it lands.
+//! Both findings here are in `crates/onbehalf-proxy/src/proxy.rs`: SR-27 (ambiguous
+//! `Mcp-Session-Id` headers) and SR-28 (long-lived streams outliving revocation).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -75,6 +74,16 @@ impl SessionUpstream {
                     resp
                 }
             })
+            .delete({
+                let me = self.clone();
+                move |headers: HeaderMap| {
+                    let me = me.clone();
+                    async move {
+                        me.record(&headers);
+                        StatusCode::OK
+                    }
+                }
+            })
             .get(move |headers: HeaderMap| {
                 let me = b.clone();
                 async move {
@@ -137,7 +146,6 @@ async fn post_with_sessions(proxy: &Spawned, bearer: &str, sids: &[&[u8]]) -> re
 /// session (or a junk byte) first and alice's session second; an upstream that reads the last
 /// header (or the first one it can decode) then serves bob inside alice's session.
 #[tokio::test]
-#[ignore = "SR-27: open, fix in crates/onbehalf-proxy/src/proxy.rs (see the 2026-10-23 report)"]
 async fn a_second_session_header_cannot_smuggle_another_principals_session() {
     let upstream = SessionUpstream::default();
     let up = spawn_router(upstream.router()).await.unwrap();
@@ -174,6 +182,105 @@ async fn a_second_session_header_cannot_smuggle_another_principals_session() {
     // The proxy should refuse an ambiguous or undecodable session header outright.
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(status2, StatusCode::BAD_REQUEST);
+}
+
+/// SR-27, `GET` and `DELETE`: the listen stream and session termination take the same single,
+/// visible-ASCII session header as `POST`; anything else is refused before the upstream sees it.
+#[tokio::test]
+async fn get_and_delete_refuse_ambiguous_session_headers() {
+    let upstream = SessionUpstream::default();
+    let up = spawn_router(upstream.router()).await.unwrap();
+    let caps = || [Capability::new(SERVER, "read_*")];
+    let authorizer = Arc::new(
+        StaticAuthorizer::new()
+            .with_chain("alice", test_chain("user:alice", "agent:a", caps()))
+            .with_chain("bob", test_chain("user:bob", "agent:b", caps())),
+    );
+    let proxy = proxy_with(&up, authorizer).await;
+    let sid = |resp: reqwest::Response| {
+        resp.headers()["mcp-session-id"]
+            .to_str()
+            .unwrap()
+            .to_owned()
+    };
+    let alice_sid = sid(post_with_sessions(&proxy, "alice", &[]).await);
+    let bob_sid = sid(post_with_sessions(&proxy, "bob", &[]).await);
+
+    let client = reqwest::Client::new();
+    for method in [reqwest::Method::GET, reqwest::Method::DELETE] {
+        for sids in [
+            &[bob_sid.as_bytes(), alice_sid.as_bytes()][..],
+            &[b"\x80", alice_sid.as_bytes()][..],
+            &[&b"\x80"[..]][..],
+        ] {
+            let mut headers = reqwest::header::HeaderMap::new();
+            for s in sids {
+                headers.append(
+                    "mcp-session-id",
+                    reqwest::header::HeaderValue::from_bytes(s).unwrap(),
+                );
+            }
+            let resp = client
+                .request(method.clone(), proxy.url(&format!("/mcp/{SERVER}")))
+                .bearer_auth("bob")
+                .header("accept", "text/event-stream")
+                .headers(headers)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{method} {sids:?}");
+        }
+    }
+    assert!(!upstream.received(&alice_sid));
+
+    // A single, valid header still works, and is forwarded once.
+    let resp = client
+        .delete(proxy.url(&format!("/mcp/{SERVER}")))
+        .bearer_auth("bob")
+        .header("mcp-session-id", &bob_sid)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let seen = upstream.seen.lock().unwrap().clone();
+    assert_eq!(seen.last().unwrap(), &vec![bob_sid.as_bytes().to_vec()]);
+}
+
+/// SR-27, response side: an upstream that sends two `Mcp-Session-Id` headers gets neither
+/// bound, and the client sees none.
+#[tokio::test]
+async fn an_upstream_sending_two_session_ids_binds_neither() {
+    let up = spawn_router(Router::new().route(
+        "/mcp",
+        post(|| async {
+            let mut resp = (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string(),
+            )
+                .into_response();
+            for sid in ["sess-a", "sess-b"] {
+                resp.headers_mut()
+                    .append("mcp-session-id", HeaderValue::from_static(sid));
+            }
+            resp
+        }),
+    ))
+    .await
+    .unwrap();
+    let authorizer = Arc::new(StaticAuthorizer::new().with_chain(
+        "alice",
+        test_chain("user:alice", "agent:a", [Capability::new(SERVER, "read_*")]),
+    ));
+    let proxy = proxy_with(&up, authorizer).await;
+    let resp = post_with_sessions(&proxy, "alice", &[]).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers().get_all("mcp-session-id").iter().count(), 0);
+    // Neither id was bound: using one is "unknown session".
+    for sid in ["sess-a", "sess-b"] {
+        let resp = post_with_sessions(&proxy, "alice", &[sid.as_bytes()]).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{sid}");
+    }
 }
 
 /// SR-28: the lease check for a `GET` listen stream (and for a `tools/call` answered over SSE)
