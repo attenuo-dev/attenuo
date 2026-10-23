@@ -245,11 +245,44 @@ A denied call (`deny_policy`) has no `upstream` or `response`; its handler `tota
 
 Readings:
 
-- **The proxy's own upstream round trip is the biggest stage**, 205 to 235 us p50, against 67 us p50 for the same call sent straight to the upstream by the load generator. Most of what the proxy adds to an allowed call is therefore a second HTTP exchange that costs about three times what the client pays for its own. Why it is that much slower from inside the server was not investigated. Candidates are the `reqwest` client on a busy runtime, scheduling across three processes on four cores, and the forwarded request being built and re-encoded.
-- **The hop to the blocking pool costs more than the policy stage**: 70 to 85 us p50, which is more than lease check plus policy at one hop. For the in-memory stores, a decision that runs inline (or on a dedicated thread with a cheaper hand-off) is the obvious experiment. The file store still needs to stay off async workers.
+- **The proxy's own upstream round trip is the biggest stage**, 205 to 235 us p50, against 67 us p50 for the same call sent straight to the upstream by the load generator. Most of what the proxy adds to an allowed call is therefore a second HTTP exchange that costs about three times what the client pays for its own. The follow-up below traced it to wake-ups from idle on this VM, not to the client code: see [Upstream hop and blocking pool](#upstream-hop-and-blocking-pool-2026-10-23-follow-up).
+- **The hop to the blocking pool costs more than the policy stage**: 70 to 85 us p50, which is more than lease check plus policy at one hop. Running the decision inline was tried in the follow-up below; the hop goes, the `upstream` stage grows by about as much, and throughput under load drops, so the pool stays.
 - **The decision itself** (lease check, policy, append) is about 115 to 180 us p50 here. Lease check grows with depth (one row per hop) and is two to three times slower on the file store at one hop. The append's mean sits well above its p50 at three hops in memory (111 against 59 us), which shows occasional slow appends.
 - **Token verification is negligible on a cache hit** (5 to 9 us), and `response` handling is 10 to 21 us.
 - **Inside the handler, about 40 us is in no stage** (the allow-call stage means add up to 447 of a 485 us mean `total` in memory at one hop): reading and parsing the body, screening, building the decision record, the session gate and re-encoding. **Outside the handler**, the client's p50 is about 225 us above the handler's (661 against 437 us). That covers the client-to-proxy HTTP exchange, axum and hyper, and relaying the body. Subtracting medians gives only a rough split.
+
+### Upstream hop and blocking pool (2026-10-23, follow-up)
+
+Branch `perf/proxy-upstream-hop`. This follows the two questions the stage run above left open: why the proxy's upstream round trip (about 205 us p50) costs three times what the load generator pays for the same call (67 us), and whether the `blocking_pool` hop (70 to 85 us) should go. Short answer: neither is a defect in the proxy code, and no change was kept.
+
+**The upstream client is already right.** `AppState` holds one `reqwest::Client`, built once in `router()`, and every request goes through it. During a run, `/proc/net/tcp` showed one established connection from the proxy to `fake_mcp` and no churn, so keep-alive pooling works. The request is HTTP/1.1 with no `Connection: close`, and an `strace` of the server showed it leave as one `writev` (headers and body) and the response come back in one read. The request body is read once. It is parsed and re-encoded on purpose (SR-01: forwarding the raw bytes would let duplicate JSON members past screening), and that happens before the `upstream` timer starts. A `tools/call` response is streamed back, not buffered. Nothing in the upstream path goes through the blocking pool.
+
+**The gap is the cost of waking idle CPUs on this VM.** In the direct baseline the load generator calls `fake_mcp` back to back, about 12,000 times a second, so its threads never sleep. Through the proxy, `fake_mcp` gets one call about every 650 us and sleeps in between, and so does the proxy thread waiting for the answer. A probe that calls `fake_mcp` directly over one keep-alive connection (Python `http.client`, so its absolute figures include Python's own overhead) shows the effect:
+
+| Pause between calls | p50, us (two runs) |
+|---|---|
+| none | 145, 130 |
+| 500 us `sleep` | 337, 377 |
+| 500 us busy loop in the client | 199, 349 |
+
+An idle gap adds about 200 us to the same call. That is the same size as the difference between the proxy's `upstream` stage and the direct baseline. The direct baseline in the bench is therefore a lower bound that the proxy cannot reach at one client, not a like-for-like figure.
+
+**The blocking pool hop can be removed, but the time moves elsewhere.** The experiment (commit `5b9d17a`, reverted in the next commit) added `[proxy] inline_decisions`. With it, `ServerAuthorizer` ran the decision on the async worker handling the request when no other decision was in flight, and on the blocking pool otherwise. Decisions, audit records and their order were the same in both paths, and a 48-way concurrent test checked the chain. Results, 1 hop, 1 client, allow call, 8 s cells after 2 s of warm-up, three interleaved runs of each, load average 2.6 to 10.8. The figures are medians of the three runs, with the range in brackets; all in us except calls/s.
+
+| | memory, pool (before) | memory, inline | file, pool (before) | file, pool (same code, rerun) | file, inline |
+|---|---|---|---|---|---|
+| client p50 | 572 [532-588] | 650 [555-728] | 661 [536-713] | 629 [607-638] | 591 [532-609] |
+| client p99 | 1236 | 1392 | 1612 | 2761 | 1207 |
+| calls/s | 1637 | 1468 | 1398 | 1386 | 1571 |
+| `blocking_pool` p50 | 58 | 1 | 63 | 60 | 2 |
+| `upstream` p50 | 170 | 245 | 186 | 171 | 202 |
+| `total` (handler) p50 | 396 | 417 | 460 | 438 | 413 |
+
+The hop disappears from `blocking_pool`, and `upstream` grows by about as much. With the pool, the worker that resumes the request and the pool thread are still awake when the upstream answer arrives. Inline, fewer threads are awake and the answer meets a sleeping CPU. The client sees no consistent gain. The two pool columns for the file store run the same code, and they differ by 32 us at p50 and by a factor of 1.7 at p99. That is the noise floor, and the inline gains on the file store sit inside it.
+
+Under load, inline is worse. At 8 clients on the memory store, two runs each gave 4,929 and 4,606 calls/s with the pool against 3,569 and 2,481 inline. Running Cedar and the append on async workers takes them away from I/O, and a request that waits for the audit store's lock holds a worker while it waits. The `when_idle` rule (inline only when no other decision is in flight) gave 5,515 and 3,792 calls/s against the pool's 5,745 and 5,177 in the same session. `tokio::task::block_in_place` brought the hop down to about 17 us at one client, but at 8 clients it fell to 4,963 and 2,878 calls/s.
+
+So the blocking pool stays, for both stores, and SR-22 is unchanged. On this VM a call through the proxy pays a few wake-ups from idle, and moving work between threads changes which stage records them. A quieter machine with less idle-state latency (or more load) would show a smaller `upstream` stage and a smaller hop. The measurement that would settle it is a direct baseline paced at the proxied rate; see the board.
 
 ### How to run
 

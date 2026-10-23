@@ -8,6 +8,10 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ## [Unreleased]
 
+### Performance
+
+- Investigated the proxy's upstream round trip and the `blocking_pool` stage (`perf/proxy-upstream-hop`); no code change. The upstream client already shares one keep-alive pooled `reqwest::Client` and sends each request in one write; the gap to a direct call is CPU wake-up latency between calls on the test VM. Running decisions inline removed the blocking-pool hop but moved the time into the `upstream` stage and cut 8-client throughput, so decisions stay on the blocking pool. Details in `docs/design/performance.md`.
+
 ### Added
 
 - Audit records have a top-level `kind` (`decision`, `exchange`, `root_token`, `lease_renew`, `lease_revoke`, `admin`) and, where there is a delegation chain, a `chain_id` (the lease id of the chain's first hop, stable as hops are added). Both are part of the hashed record and are indexed, cross-checked columns in SQLite. They went into entry hash v2, which was introduced this release cycle and never shipped, so v2 did not change; an audit database created with the earlier v2 shape (no `kind`/`chain_id` columns) is refused at open like the v1 ones, with a message to start a new log. `GET /admin/audit/export` takes `?kind=` and `?chain_id=` (400 for an unknown kind or an empty id), and so does `onbehalf audit export --kind --chain-id`; a filtered export's header carries `filter`, and offline verification refuses it because its chain has gaps. New `onbehalf_core::{RecordKind, chain_id_of}`, `onbehalf_audit::{RecordFilter, SqliteAudit::range_filtered}`, `AuditEntry.kind`/`.chain_id` (Python) and `kind`/`chainId` (TypeScript), and `kind`/`chain_id` (`chainId`) arguments on `audit_export` / `auditExport`.
