@@ -63,6 +63,7 @@
 //! ```
 
 pub mod claims;
+pub mod detached;
 pub mod error;
 pub mod exchange;
 pub mod issuer;
@@ -70,6 +71,7 @@ mod keys;
 pub mod verifier;
 
 pub use claims::{ActClaim, Claims, JWT_TOKEN_TYPE_URN, TOKEN_TYPE};
+pub use detached::{verify_detached, DetachedSigner};
 pub use error::TokenError;
 pub use exchange::{
     ExchangeRequest, ExchangeResponse, AUTHORIZATION_DETAILS_TYPE, TOKEN_EXCHANGE_GRANT_TYPE,

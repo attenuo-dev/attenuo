@@ -14,7 +14,7 @@ The server is wiring. It holds no authorization logic of its own: tokens come fr
 | Metrics | `metrics::Metrics` | `Arc`, incremented by the pipeline and token routes, served on `[metrics] listen` |
 | Policy engine | `onbehalf_policy::PolicyEngine` | `Arc<RwLock<_>>`, swapped in place by `POST /admin/policies/reload` |
 | Lease registry | `onbehalf_audit::SqliteLeaseStore` | `Arc`, same SQLite file as the log |
-| Audit log | `onbehalf_audit::SqliteAudit` | `Arc` |
+| Audit log | `onbehalf_audit::SqliteAudit` | `Arc`; signs checkpoints with the issuer key (`Issuer::detached_signer`) |
 | Pipeline | `authz::Pipeline` | `Arc`, used by the proxy's `ServerAuthorizer` and by the AuthZEN handler |
 | Proxy | `onbehalf_proxy::router` | mounted at `/mcp/{server}` |
 | IdP registry | `idp::IdpRegistry` | one `JwksCache` per `[[idps]]` entry, behind a `tokio::sync::Mutex` |
@@ -26,6 +26,8 @@ The server is wiring. It holds no authorization logic of its own: tokens come fr
 1. **Leases.** `LeaseStore::check_all(chain.leases(), now)`. Every hop's lease must be known, unrevoked and `expires_at > now`, so a lease that its holder stopped renewing denies the call while the JWT is still valid. If not, the decision is deny, with reason `lease_revoked`, `lease_expired` or `lease_unknown` (checked in that order), or `lease_error` if the store cannot be read.
 2. **Policy.** `PolicyEngine::authorize`: the capability stage (`capability_denied`), then Cedar (`policy_allow`, `policy_deny`, `policy_error`).
 3. **Audit.** `DecisionRecord::new(now, decision, reason, chain, call, policy_ids)` is appended to the hash-chained log, and its id becomes the decision id the client sees (`X-Onbehalf-Decision-Id`, the JSON-RPC error's `data.decision_id`, or AuthZEN `context.decision_id`). If the append fails, the decision becomes deny with reason `audit_error`: an action that cannot be recorded does not happen.
+
+**Blocking I/O.** SQLite calls are synchronous and take a lock, so they never run on an async worker. Handlers run their store-touching work through `AppState::blocking` (`tokio::task::spawn_blocking`), and `ServerAuthorizer` runs `Pipeline::decide`, `check_leases` and `record_rejection` the same way. Concurrent callers queue on the audit store's mutex inside an `IMMEDIATE` transaction that reads the head and inserts the next row, so appends stay strictly sequential and the chain cannot fork; the pool only decides which waiting caller goes next. This closes SR-22.
 
 Lease and audit failures fail closed. Revocation reaches the next request: there is no lease cache in v0, so the TTL-bounded cache in RFC-0001 §6 is a later optimisation. Requests that carry no per-call decision (`tools/list`, `initialize`, `ping`, the other allowlisted methods, `GET`/`DELETE` session requests) run the same lease check through `Authorizer::check_active` and get HTTP 401 (JSON-RPC `-32001`, message ending in the reason, for example `lease inactive: lease_revoked`) instead of a decision. Those checks are not audited, since no call was decided.
 
@@ -106,7 +108,7 @@ sequenceDiagram
     end
 ```
 
-`POST /access/v1/evaluation` takes the same path from step 3 onward. By default it requires a bearer token, and the chain comes from the verified token (a chain also present in the body must match it); without a bearer the answer is 401. With `[authzen] allow_unsigned_chain = true`, a request without a bearer may carry the chain in `subject.properties.chain` if it authenticates as a `[[peps]]` entry (HTTP Basic, or `pep_id`/`pep_secret`). Such a chain is checked structurally (`validate_at`) and then hop by hop against what was issued: at issuance every lease is bound to the digest of the chain up to its hop (`LeaseStore::bind`), and each hop of the body chain must reproduce that digest. A mismatch is a 403 `chain_not_issued` and writes no audit record, so lease ids, which every token prints, are not enough to forge a user, attributes, capabilities or an agent (SR-08).
+`POST /access/v1/evaluations` takes a list: top-level `subject`, `action`, `resource` and `context` are defaults, each entry of `evaluations` overrides what it names, and each entry is decided and audited like a single evaluation. More than `[authzen] max_batch` entries (default 64) is refused with 400 `batch_too_large` before anything is decided, so an oversized batch cannot flood the audit log (SR-22); only the `execute_all` semantic is supported. `POST /access/v1/evaluation` takes the same path from step 3 onward. By default it requires a bearer token, and the chain comes from the verified token (a chain also present in the body must match it); without a bearer the answer is 401. With `[authzen] allow_unsigned_chain = true`, a request without a bearer may carry the chain in `subject.properties.chain` if it authenticates as a `[[peps]]` entry (HTTP Basic, or `pep_id`/`pep_secret`). Such a chain is checked structurally (`validate_at`) and then hop by hop against what was issued: at issuance every lease is bound to the digest of the chain up to its hop (`LeaseStore::bind`), and each hop of the body chain must reproduce that digest. A mismatch is a 403 `chain_not_issued` and writes no audit record, so lease ids, which every token prints, are not enough to forge a user, attributes, capabilities or an agent (SR-08).
 
 ## Token issuance
 
@@ -141,6 +143,14 @@ sequenceDiagram
 ```
 
 Because the child lease is registered under the parent's, revoking any lease revokes every lease delegated from it, and the child's next call fails the lease step. Even without the cascade, the child's chain lists every ancestor lease, so a revoked ancestor is caught directly.
+
+### Checkpoints, export and verification
+
+`SqliteAudit::with_checkpointing(signer, every)` makes `append` sign `(seq, head_hash)` and insert a row into `checkpoints` inside the append's transaction whenever `seq` is a multiple of `every`, so a checkpoint never refers to a head that was not committed. `lib::spawn_checkpointer` (started by `serve` when `[audit] checkpoint_interval_seconds` is positive) calls `checkpoint_if_new` on a timer, which signs the head only if it moved past the newest checkpoint. `checkpoint_signed` backs `GET /admin/audit/checkpoint`: it returns the existing checkpoint for an unchanged head and refuses to sign when a stored checkpoint at that `seq` disagrees with the log.
+
+The signed bytes are `len(context) as u32 big-endian || "onbehalf-checkpoint-v1" || JSON [seq, head_hash, at, kid]`, signed by `onbehalf_token::DetachedSigner` and checked by `onbehalf_token::verify_detached`. `onbehalf_audit::CheckpointKeys::from_jwks` turns the published JWKS into the verifier. `verify_chain_signed` (the body of `GET /admin/audit/verify`) walks the chain once, remembers the entry hash at each checkpointed `seq`, then checks every checkpoint's signature and head hash. The report keeps `entries`, `ok` and `first_bad_seq` and adds `checkpoints`, `last_signed_seq`, `unsigned_tail` and `bad_checkpoints`.
+
+`GET /admin/audit/export?from&to` streams `application/x-ndjson`: a header line, the entries in pages of 500 (each page on the blocking pool), then the checkpoints in range. `onbehalf_audit::export` parses that format (or the single-object JSON form) and `verify_export` checks it offline: the same walk with the first entry as the anchor for a window, plus a check that the file covers the range its header names.
 
 ### Audit convention for issuance
 
@@ -263,7 +273,7 @@ Own-lease expiry is not an error: a lapsed but unrevoked lease is revived, provi
 
 - **Shutdown.** `serve` waits for SIGINT or SIGTERM, stops accepting connections, and gives in-flight requests `DRAIN_TIMEOUT` (10 s) to finish before it returns and the process exits.
 - **Readiness.** `GET /readyz` reads `AuditSink::head` and one `SqliteLeaseStore::get`. Both ok: 200 `{"status":"ready"}`; otherwise 503 `{"status":"unavailable","checks":{"audit":{"ok":false,"error":"..."},...}}`. `GET /healthz` never touches storage.
-- **Metrics.** `metrics::Metrics` holds atomics and two small maps (decisions by `(decision, reason)`, HTTP by `(route template, status)`) and renders Prometheus text format 0.0.4. `Pipeline::decide` records the decision, its duration and audit append failures; `audit_issuance` records tokens issued (`kind` root for `token.root`, else exchange); the admin revoke handler adds the number of leases changed. A middleware on the whole router counts responses by `MatchedPath`. The endpoint is served only by a second listener (`[metrics] enabled`, `listen`), with no authentication.
+- **Metrics.** `metrics::Metrics` holds atomics and two small maps (decisions by `(decision, reason)`, HTTP by `(route template, status)`) and two fixed-bucket histograms and renders Prometheus text format 0.0.4. `Pipeline::decide` records the decision, its duration and audit append failures; every audit append (`Metrics::time_audit_append`) feeds `audit_append_duration_seconds`; each checkpoint the log signs feeds `audit_checkpoints_total` through `SqliteAudit::with_checkpoint_hook`; `audit_issuance` records tokens issued (`kind` root for `token.root`, else exchange); the admin revoke handler adds the number of leases changed. A middleware on the whole router counts responses by `MatchedPath`. The endpoint is served only by a second listener (`[metrics] enabled`, `listen`), with no authentication.
 - **Key rotation.** `Issuer` signs with one key and sets the JWT header `kid` to base64url of the first 16 bytes of SHA-256 over the key's SPKI DER. `Verifier` holds a list of trusted keys: a `kid` selects one key (unknown: `UnknownKeyId`), no `kid` tries all. `ou_sig` must verify under any trusted key, because a child minted after rotation copies its parent's `ou_sig`. `[issuer] previous_key_paths` (private or public PEM) adds verify-only keys, also published in the JWKS.
 - **User attributes.** `[policy] user_attributes` is parsed with `ArgType::from_str` and passed to `PolicyEngineBuilder::with_user_attr`, extending the generated `UserAttributes` record.
 
@@ -280,7 +290,8 @@ Non-MCP endpoints answer errors as `{"error": "<code>", "detail": "<text>"}` wit
 - ID-JAG follows draft -04; claim mapping is isolated in `idp::claims::map_id_jag` for when the draft changes. The draft's `resource` and `scope` claims are not used.
 - The `actor` of an exchange authenticates with its `[[agents]]` client secret (`[token] require_actor_auth`, on by default); `actor_token` is not used.
 - Key rotation is manual (edit the config, restart) but has an overlap: see `previous_key_paths` below.
-- SQLite calls run on the async worker threads; fine at demo load, to be moved to `spawn_blocking` or a pool.
+- SQLite calls run on tokio's blocking pool, serialised by one connection per store behind a mutex. That is correct and keeps the chain linear, but write throughput is that of a single SQLite writer; a dedicated writer thread with group commit would batch fsyncs and is not built.
+- Checkpoints are signed by the key the server holds. They detect truncation and rewrites by anyone who does not control the server process; copy them off the host for the rest.
 - No lease cache and no push channel: every request reads the registry, and external PEPs using the AuthZEN endpoint learn of revocation only by asking.
 - Failed renewals are not audited (only successful ones).
 - List filtering does not cover the `GET` listen stream. The spec lets a server send a response on it when resuming a stream (`Last-Event-ID`), and such a replayed list response is passed through unfiltered. Not seen in practice; fixing it means tracking which request ids are in flight per session.

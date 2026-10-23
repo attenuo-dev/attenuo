@@ -194,8 +194,41 @@ pub enum AuditCmd {
         #[arg(long, default_value_t = 1000)]
         interval_ms: u64,
     },
-    /// Walk the whole hash chain. Exits 1 if it is broken.
-    Verify,
+    /// Walk the whole hash chain and verify the signed checkpoints. Exits 2 if the chain is
+    /// broken or a checkpoint is invalid. With `--file`, verify an exported file offline
+    /// instead (it needs only the issuer's JWKS, no admin token).
+    Verify {
+        /// An export made with `audit export` (JSON Lines, or the `--format json` object).
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
+        /// JWKS file holding the issuer keys; with `--file` and without this, the JWKS is
+        /// fetched from `<server>/.well-known/jwks.json`.
+        #[arg(long, requires = "file")]
+        jwks: Option<std::path::PathBuf>,
+    },
+    /// Export entries `--from` to `--to` (inclusive) and the checkpoints inside that range.
+    /// Defaults to the whole log. Writes to stdout unless `--out` is given.
+    Export {
+        /// First sequence number.
+        #[arg(long, default_value_t = 1)]
+        from: u64,
+        /// Last sequence number. Default: the head of the log.
+        #[arg(long)]
+        to: Option<u64>,
+        /// `jsonl` streams one object per line; `json` writes a single object.
+        #[arg(long, value_enum, default_value_t = ExportFormat::Jsonl)]
+        format: ExportFormat,
+        /// Write here instead of stdout.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+}
+
+/// Output format of `audit export`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ExportFormat {
+    Jsonl,
+    Json,
 }
 
 #[derive(Debug, Subcommand)]
@@ -437,6 +470,15 @@ mod tests {
         assert_eq!((id.as_str(), reason.as_deref()), ("L1", Some("demo")));
         assert!(parse(&["policy", "reload"]).is_ok());
         assert!(parse(&["audit", "verify"]).is_ok());
+        assert!(parse(&["audit", "verify", "--file", "a.jsonl", "--jwks", "j.json"]).is_ok());
+        assert!(
+            parse(&["audit", "verify", "--jwks", "j.json"]).is_err(),
+            "--jwks only makes sense with --file"
+        );
+        assert!(
+            parse(&["audit", "export", "--from", "5", "--to", "9", "--format", "json"]).is_ok()
+        );
+        assert!(parse(&["audit", "export", "--format", "xml"]).is_err());
         assert!(parse(&["nope"]).is_err());
     }
 }

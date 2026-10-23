@@ -128,7 +128,9 @@ pub(crate) fn audit_admin(
         policy_ids: Vec::new(),
     };
     let id = record.id;
-    onbehalf_audit::AuditSink::append(state.audit.as_ref(), record)?;
+    state
+        .metrics
+        .time_audit_append(|| onbehalf_audit::AuditSink::append(state.audit.as_ref(), record))?;
     Ok(id)
 }
 
@@ -167,7 +169,10 @@ pub(crate) fn audit_event(
     let call = ToolCall::new(AUDIT_SERVER, tool, arguments);
     let record = DecisionRecord::new(now, Decision::Allow, reason, chain, &call, Vec::new());
     let id = record.id;
-    if let Err(e) = onbehalf_audit::AuditSink::append(state.audit.as_ref(), record) {
+    if let Err(e) = state
+        .metrics
+        .time_audit_append(|| onbehalf_audit::AuditSink::append(state.audit.as_ref(), record))
+    {
         state.metrics.audit_append_error();
         return Err(e.into());
     }

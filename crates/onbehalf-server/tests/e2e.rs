@@ -1518,3 +1518,443 @@ async fn exchanging_the_same_parent_for_the_same_actor_twice_is_refused() {
         .exchange(&root.token, "reviewer", &["github:read_file"])
         .await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Audit I/O runs on the blocking pool; the chain must survive concurrent callers.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_decisions_keep_the_audit_chain_valid() {
+    let h = Harness::start_with(true).await;
+    let alice = h.mint_root("alice", "planner", &["github:*"]).await;
+    let before = h.audit_entries().await.len();
+
+    let mut tasks = Vec::new();
+    for i in 0..48 {
+        let client = h.client.clone();
+        let (authzen_url, mcp_url) = (h.url("/access/v1/evaluation"), h.url("/mcp/github"));
+        let token = alice.token.clone();
+        tasks.push(tokio::spawn(async move {
+            if i % 2 == 0 {
+                let resp = client
+                    .post(authzen_url)
+                    .bearer_auth(&token)
+                    .json(&authzen_body(
+                        "read_file",
+                        json!({"repo": "alice/public-x"}),
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+            } else {
+                let resp = client
+                    .post(mcp_url)
+                    .bearer_auth(&token)
+                    .header("accept", "application/json, text/event-stream")
+                    .json(&json!({"jsonrpc": "2.0", "id": i, "method": "tools/call",
+                                  "params": {"name": "read_file",
+                                             "arguments": {"repo": "alice/public-x"}}}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+
+    let entries = h.audit_entries().await;
+    assert_eq!(entries.len(), before + 48);
+    let seqs: Vec<u64> = entries.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+    assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>());
+    let verify = h.admin_get("/admin/audit/verify").await;
+    assert_eq!(verify["ok"], true, "{verify}");
+    assert_eq!(verify["entries"].as_u64().unwrap(), seqs.len() as u64);
+}
+
+// ---------------------------------------------------------------------------------------------
+// AuthZEN batch evaluation and its size bound.
+// ---------------------------------------------------------------------------------------------
+
+fn batch_body(n: usize) -> Value {
+    json!({
+        "subject": {"type": "agent", "id": ""},
+        "resource": {"type": "tool", "id": "github/read_file",
+                     "properties": {"server": "github"}},
+        "action": {"name": "read_file"},
+        "evaluations": (0..n)
+            .map(|i| json!({"context": {"input": {"repo": format!("alice/public-{i}")}}}))
+            .collect::<Vec<_>>(),
+    })
+}
+
+async fn post_batch(h: &Harness, token: &str, body: &Value) -> reqwest::Response {
+    h.client
+        .post(h.url("/access/v1/evaluations"))
+        .bearer_auth(token)
+        .json(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn authzen_batches_are_bounded_by_max_batch() {
+    let h = Harness::start_tweaked(false, |cfg| cfg.authzen.max_batch = 3).await;
+    let alice = h.mint_root("alice", "planner", &["github:*"]).await;
+    let before = h.audit_entries().await.len();
+
+    let ok = post_batch(&h, &alice.token, &batch_body(3)).await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    let v: Value = ok.json().await.unwrap();
+    let results = v["evaluations"].as_array().unwrap();
+    assert_eq!(results.len(), 3);
+    assert!(results.iter().all(|r| r["decision"] == true), "{v}");
+    assert_eq!(h.audit_entries().await.len(), before + 3);
+
+    let too_big = post_batch(&h, &alice.token, &batch_body(4)).await;
+    assert_eq!(too_big.status(), StatusCode::BAD_REQUEST);
+    let e: Value = too_big.json().await.unwrap();
+    assert_eq!(e["error"], "batch_too_large", "{e}");
+    // Refused before anything was decided: nothing new in the audit log.
+    assert_eq!(h.audit_entries().await.len(), before + 3);
+
+    let empty = post_batch(&h, &alice.token, &batch_body(0)).await;
+    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+    let anon = h
+        .client
+        .post(h.url("/access/v1/evaluations"))
+        .json(&batch_body(1))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn authzen_default_max_batch_is_64() {
+    let h = Harness::start().await;
+    let alice = h.mint_root("alice", "planner", &["github:*"]).await;
+    let ok = post_batch(&h, &alice.token, &batch_body(64)).await;
+    assert_eq!(ok.status(), StatusCode::OK);
+    let v: Value = ok.json().await.unwrap();
+    assert_eq!(v["evaluations"].as_array().unwrap().len(), 64);
+    let no = post_batch(&h, &alice.token, &batch_body(65)).await;
+    assert_eq!(no.status(), StatusCode::BAD_REQUEST);
+    let cfg: Value = h
+        .client
+        .get(h.url("/.well-known/authzen-configuration"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(cfg["access_evaluations_endpoint"]
+        .as_str()
+        .unwrap()
+        .ends_with("/access/v1/evaluations"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Signed audit checkpoints.
+// ---------------------------------------------------------------------------------------------
+
+async fn jwks_keys(h: &Harness) -> onbehalf_audit::CheckpointKeys {
+    let jwks: Value = h
+        .client
+        .get(h.url("/.well-known/jwks.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    onbehalf_audit::CheckpointKeys::from_jwks(&jwks).unwrap()
+}
+
+#[tokio::test]
+async fn checkpoint_endpoint_returns_a_signed_checkpoint_verifiable_with_the_jwks() {
+    let h = Harness::start().await;
+    let alice = h.mint_root("alice", "planner", &["github:*"]).await;
+    h.call(&alice.token, "read_file", json!({"repo": "alice/public-a"}))
+        .await;
+
+    // Reading the head through the entries page signs nothing.
+    let page = h.admin_get("/admin/audit?from=1&limit=1").await;
+    assert_eq!(page["head"], 3);
+    assert_eq!(h.admin_get("/admin/audit/verify").await["checkpoints"], 0);
+
+    let v = h.admin_get("/admin/audit/checkpoint").await;
+    let cp: onbehalf_audit::Checkpoint = serde_json::from_value(v.clone()).unwrap();
+    assert_eq!(cp.seq, 3);
+    assert_eq!(v["hash"], v["head_hash"], "legacy alias");
+    jwks_keys(&h).await.verify(&cp).unwrap();
+    let head = h.audit_entries().await.pop().unwrap();
+    assert_eq!(cp.head_hash, head["entry_hash"].as_str().unwrap());
+    // Same head, same checkpoint.
+    assert_eq!(h.admin_get("/admin/audit/checkpoint").await, v);
+
+    let report = h.admin_get("/admin/audit/verify").await;
+    assert_eq!(report["ok"], true, "{report}");
+    assert_eq!(report["checkpoints"], 1);
+    assert_eq!(report["last_signed_seq"], 3);
+    assert_eq!(report["unsigned_tail"], 0);
+
+    // A forged checkpoint row (right hash, wrong signature) makes verify fail.
+    let mut forged = cp.clone();
+    forged.seq = 2;
+    forged.head_hash = h.audit_entries().await[1]["entry_hash"]
+        .as_str()
+        .unwrap()
+        .into();
+    assert!(jwks_keys(&h).await.verify(&forged).is_err());
+}
+
+#[tokio::test]
+async fn checkpoints_are_written_automatically_every_n_entries() {
+    let h = Harness::start_tweaked(true, |cfg| cfg.audit.checkpoint_every = 3).await;
+    let alice = h.mint_root("alice", "planner", &["github:*"]).await; // entries 1, 2
+    for i in 0..5 {
+        h.call(
+            &alice.token,
+            "read_file",
+            json!({"repo": format!("alice/public-{i}")}),
+        )
+        .await;
+    }
+    // 7 entries so far: checkpoints at 3 and 6, tail of 1.
+    let report = h.admin_get("/admin/audit/verify").await;
+    assert_eq!(report["ok"], true, "{report}");
+    assert_eq!(report["entries"], 7);
+    assert_eq!(report["checkpoints"], 2);
+    assert_eq!(report["last_signed_seq"], 6);
+    assert_eq!(report["unsigned_tail"], 1);
+}
+
+#[tokio::test]
+async fn checkpoint_timer_signs_the_tail_of_a_quiet_log() {
+    let h = Harness::start_tweaked(false, |cfg| cfg.audit.checkpoint_every = 1000).await;
+    let alice = h.mint_root("alice", "planner", &["github:*"]).await;
+    h.call(&alice.token, "read_file", json!({"repo": "alice/public-a"}))
+        .await;
+    assert_eq!(h.admin_get("/admin/audit/verify").await["checkpoints"], 0);
+
+    let timer =
+        onbehalf_server::spawn_checkpointer(h.state.clone(), std::time::Duration::from_millis(40));
+    let mut signed = Value::Null;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let report = h.admin_get("/admin/audit/verify").await;
+        if report["last_signed_seq"] == 3 {
+            signed = report;
+            break;
+        }
+    }
+    timer.abort();
+    assert_eq!(signed["ok"], true, "{signed}");
+    assert_eq!(signed["checkpoints"], 1);
+    assert_eq!(signed["unsigned_tail"], 0);
+}
+
+#[tokio::test]
+async fn tampering_after_a_signed_checkpoint_is_reported_with_the_last_signed_seq() {
+    let h = Harness::start_tweaked(true, |cfg| cfg.audit.checkpoint_every = 3).await;
+    let alice = h.mint_root("alice", "planner", &["github:*"]).await;
+    for i in 0..4 {
+        h.call(
+            &alice.token,
+            "read_file",
+            json!({"repo": format!("alice/public-{i}")}),
+        )
+        .await;
+    }
+    let conn = rusqlite::Connection::open(h.db_path.as_ref().unwrap()).unwrap();
+    conn.execute("UPDATE audit SET reason = 'edited' WHERE seq = 5", [])
+        .unwrap();
+    drop(conn);
+    let report = h.admin_get("/admin/audit/verify").await;
+    assert_eq!(report["ok"], false);
+    assert_eq!(report["first_bad_seq"], 5);
+    assert_eq!(report["last_signed_seq"], 3);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Audit export and offline verification.
+// ---------------------------------------------------------------------------------------------
+
+async fn export_text(h: &Harness, query: &str) -> String {
+    let resp = h
+        .client
+        .get(h.url(&format!("/admin/audit/export{query}")))
+        .bearer_auth(ADMIN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()["content-type"].to_str().unwrap(),
+        "application/x-ndjson"
+    );
+    resp.text().await.unwrap()
+}
+
+/// Append `n` synthetic records straight to the log (cheaper than `n` HTTP calls).
+fn append_synthetic(h: &Harness, n: usize) {
+    use onbehalf_audit::AuditSink;
+    for i in 0..n {
+        let record = onbehalf_core::DecisionRecord {
+            id: uuid::Uuid::new_v4(),
+            at: time::OffsetDateTime::now_utc(),
+            decision: onbehalf_core::Decision::Allow,
+            reason: "synthetic".into(),
+            originating_subject: "load".into(),
+            agents: Vec::new(),
+            chain_depth: 0,
+            chain_digest: format!("{i:064}"),
+            leases: Vec::new(),
+            server: "onbehalf".into(),
+            tool: "synthetic".into(),
+            arguments_digest: format!("{i:064}"),
+            session_id: None,
+            policy_ids: Vec::new(),
+        };
+        h.state.audit.append(record).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn export_streams_a_range_that_verifies_offline_with_only_the_jwks() {
+    let h = Harness::start_tweaked(false, |cfg| cfg.audit.checkpoint_every = 400).await;
+    let alice = h.mint_root("alice", "planner", &["github:*"]).await; // entries 1, 2
+    h.call(&alice.token, "read_file", json!({"repo": "alice/public-a"}))
+        .await;
+    // Past one export page (500) and two automatic checkpoints (400, 800).
+    append_synthetic(&h, 1100);
+    let keys = jwks_keys(&h).await;
+
+    // The whole log: entries 1..=1103, checkpoints at 400, 800 and 1100.
+    let text = export_text(&h, "").await;
+    let export = onbehalf_audit::parse_export(&text).unwrap();
+    assert_eq!(export.header.as_ref().unwrap().to, 1103);
+    assert_eq!(export.entries.len(), 1103);
+    assert_eq!(
+        export.checkpoints.iter().map(|c| c.seq).collect::<Vec<_>>(),
+        [400, 800]
+    );
+    let report = onbehalf_audit::verify_export(&export, &keys).unwrap();
+    assert!(report.report.ok, "{report:?}");
+    assert!(report.from_genesis);
+    assert_eq!(report.report.last_signed_seq, Some(800));
+    assert_eq!(report.report.unsigned_tail, 303);
+
+    // A sub-range is a verifiable window.
+    let text = export_text(&h, "?from=390&to=810").await;
+    let export = onbehalf_audit::parse_export(&text).unwrap();
+    assert_eq!(export.entries.first().unwrap().seq, 390);
+    assert_eq!(export.entries.last().unwrap().seq, 810);
+    let report = onbehalf_audit::verify_export(&export, &keys).unwrap();
+    assert!(report.report.ok, "{report:?}");
+    assert!(!report.from_genesis);
+    assert_eq!(report.report.last_signed_seq, Some(800));
+
+    // `to` beyond the head is clamped; the exported entries equal the paged API's.
+    let text = export_text(&h, "?from=1100&to=999999").await;
+    let export = onbehalf_audit::parse_export(&text).unwrap();
+    assert_eq!(export.entries.len(), 4);
+    assert_eq!(export.header.unwrap().to, 1103);
+
+    // A file edited after export fails offline verification.
+    let text = export_text(&h, "?from=1&to=20").await;
+    let edited = text.replacen(
+        "\"reason\":\"token_issued\"",
+        "\"reason\":\"nothing_to_see\"",
+        1,
+    );
+    assert_ne!(edited, text);
+    let report =
+        onbehalf_audit::verify_export(&onbehalf_audit::parse_export(&edited).unwrap(), &keys)
+            .unwrap();
+    assert!(!report.report.ok);
+    assert_eq!(report.report.first_bad_seq, Some(1));
+}
+
+#[tokio::test]
+async fn export_validates_its_query_and_needs_the_admin_token() {
+    let h = Harness::start().await;
+    h.mint_root("alice", "planner", &["github:*"]).await;
+    for q in ["?from=0", "?from=5&to=2"] {
+        let resp = h
+            .client
+            .get(h.url(&format!("/admin/audit/export{q}")))
+            .bearer_auth(ADMIN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{q}");
+    }
+    let anon = h
+        .client
+        .get(h.url("/admin/audit/export"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
+
+    // An empty range (nothing past the head) is just a header.
+    let text = export_text(&h, "?from=500").await;
+    let export = onbehalf_audit::parse_export(&text).unwrap();
+    assert!(export.entries.is_empty() && export.checkpoints.is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Audit metrics.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn audit_append_latency_and_checkpoint_metrics_are_exported() {
+    let h = Harness::start_tweaked(false, |cfg| cfg.audit.checkpoint_every = 2).await;
+    let alice = h.mint_root("alice", "planner", &["github:*"]).await; // 2 appends
+    for i in 0..3 {
+        h.call(
+            &alice.token,
+            "read_file",
+            json!({"repo": format!("alice/public-{i}")}),
+        )
+        .await;
+    }
+    let entries = h.audit_entries().await.len() as u64;
+    assert_eq!(entries, 5);
+    let text = h.state.metrics.render();
+    let value = |prefix: &str| -> u64 {
+        text.lines()
+            .find_map(|l| l.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("no `{prefix}` in\n{text}"))
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    assert!(text.contains("# TYPE onbehalf_audit_append_duration_seconds histogram"));
+    // Every successful append was timed: root-token issuance (2), plus one per call.
+    assert_eq!(
+        value("onbehalf_audit_append_duration_seconds_count "),
+        entries
+    );
+    assert_eq!(
+        value("onbehalf_audit_append_duration_seconds_bucket{le=\"+Inf\"} "),
+        entries
+    );
+    // Checkpoints at seq 2 and 4.
+    assert_eq!(value("onbehalf_audit_checkpoints_total "), 2);
+    // A manual checkpoint of a new head counts; asking again for the same head does not.
+    h.admin_get("/admin/audit/checkpoint").await;
+    h.admin_get("/admin/audit/checkpoint").await;
+    let text = h.state.metrics.render();
+    assert!(
+        text.contains("onbehalf_audit_checkpoints_total 3\n"),
+        "{text}"
+    );
+}

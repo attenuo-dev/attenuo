@@ -11,6 +11,7 @@
 //! | `POST /token` | subject token in body | RFC 8693 exchange, hop n to n+1 |
 //! | `POST /token/renew` | delegation token (bearer) | extend the last hop's lease |
 //! | `POST /access/v1/evaluation` | delegation token (bearer); or `[[peps]]` credentials with `[authzen] allow_unsigned_chain` | AuthZEN evaluation |
+//! | `POST /access/v1/evaluations` | same as above | AuthZEN batch evaluation, at most `[authzen] max_batch` entries |
 //! | `GET /.well-known/authzen-configuration` | none | AuthZEN metadata |
 //! | `GET /.well-known/jwks.json` | none | issuer public key |
 //! | `GET /healthz` | none | liveness |
@@ -20,6 +21,7 @@
 //! | `POST /admin/root-token` | admin | dev-only hop-0 mint ([`routes::dev_root`]), mounted only with `[dev] allow_root_mint = true` |
 //! | `POST /admin/leases/{id}/revoke`, `GET /admin/leases/{id}` | admin | leases |
 //! | `GET /admin/audit`, `/admin/audit/verify`, `/admin/audit/checkpoint` | admin | audit |
+//! | `GET /admin/audit/export?from&to` | admin | stream a verifiable slice of the log as JSON Lines |
 //! | `POST /admin/policies/reload` | admin | hot-reload the Cedar policy file |
 
 #![deny(unsafe_code)]
@@ -63,6 +65,7 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
         .route("/admin/audit", get(admin::audit_range))
         .route("/admin/audit/verify", get(admin::audit_verify))
         .route("/admin/audit/checkpoint", get(admin::audit_checkpoint))
+        .route("/admin/audit/export", get(admin::audit_export))
         .route("/admin/policies/reload", post(admin::reload_policies));
     if state.dev_allow_root_mint {
         admin_routes = admin_routes.route("/admin/root-token", post(dev_root::mint_root));
@@ -83,6 +86,7 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
         .route("/token", post(token::exchange))
         .route("/token/renew", post(renew::renew))
         .route("/access/v1/evaluation", post(authzen::evaluation))
+        .route("/access/v1/evaluations", post(authzen::evaluations))
         .merge(admin_routes)
         .with_state(state.clone())
         .layer(TraceLayer::new_for_http());
@@ -101,6 +105,33 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
     ))
 }
 
+/// Start the `[audit] checkpoint_interval_seconds` timer: every `period`, sign the head if
+/// entries were appended since the newest checkpoint. (The `checkpoint_every` count trigger
+/// runs inside the append itself.) Dropping the handle does not stop it; abort it to stop.
+pub fn spawn_checkpointer(
+    state: Arc<AppState>,
+    period: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await; // the first tick is immediate
+        loop {
+            tick.tick().await;
+            let result = state
+                .blocking(|s| s.audit.checkpoint_if_new(time::OffsetDateTime::now_utc()))
+                .await;
+            match result {
+                Ok(Some(cp)) => {
+                    tracing::info!(seq = cp.seq, kid = %cp.kid, "audit checkpoint signed")
+                }
+                Ok(None) => {}
+                Err(e) => tracing::error!(error = %e, "signing an audit checkpoint failed"),
+            }
+        }
+    })
+}
+
 /// How long in-flight requests get to finish after a shutdown signal.
 pub const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -109,6 +140,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     let (app, state) = build(&config)?;
     let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
     tracing::info!(addr = %listener.local_addr()?, upstreams = config.upstreams.len(), "onbehalf server listening");
+    let checkpoint_task = (!state.checkpoint_interval.is_zero())
+        .then(|| spawn_checkpointer(state.clone(), state.checkpoint_interval));
     let metrics_task = if config.metrics.enabled {
         let l = tokio::net::TcpListener::bind(config.metrics.listen).await?;
         tracing::info!(addr = %l.local_addr()?, "metrics listening (unauthenticated)");
@@ -119,6 +152,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     };
     let res = serve_until(listener, app, shutdown_signal(), DRAIN_TIMEOUT).await;
     if let Some(t) = metrics_task {
+        t.abort();
+    }
+    if let Some(t) = checkpoint_task {
         t.abort();
     }
     res

@@ -68,9 +68,25 @@ pub fn verify_entries<I>(entries: I) -> Result<VerifyReport, AuditError>
 where
     I: IntoIterator<Item = Result<AuditEntry, AuditError>>,
 {
+    walk_entries(entries, true, |_| {})
+}
+
+/// The chain walk behind [`verify_entries`]. With `anchored` the run must start at seq 1 with
+/// the genesis `prev_hash`; without it (an export of a window of the log) the first entry sets
+/// the expected seq and `prev_hash`, and only its own hash and everything after it is checked.
+/// `on_ok` sees each entry that passes, in order.
+pub(crate) fn walk_entries<I>(
+    entries: I,
+    anchored: bool,
+    mut on_ok: impl FnMut(&AuditEntry),
+) -> Result<VerifyReport, AuditError>
+where
+    I: IntoIterator<Item = Result<AuditEntry, AuditError>>,
+{
     let mut count = 0u64;
     let mut expected_seq = 1u64;
     let mut expected_prev = GENESIS_HASH.to_string();
+    let mut first = true;
     for item in entries {
         count += 1;
         let entry = match item {
@@ -84,6 +100,11 @@ where
             }
             Err(e) => return Err(e),
         };
+        if first && !anchored {
+            expected_seq = entry.seq;
+            expected_prev = entry.prev_hash.clone();
+        }
+        first = false;
         let good =
             entry.seq == expected_seq && entry.prev_hash == expected_prev && entry.hash_matches();
         if !good {
@@ -93,6 +114,7 @@ where
                 first_bad_seq: Some(entry.seq),
             });
         }
+        on_ok(&entry);
         expected_seq = entry.seq + 1;
         expected_prev = entry.entry_hash;
     }

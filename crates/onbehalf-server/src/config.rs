@@ -80,7 +80,7 @@ pub struct Config {
 }
 
 /// `[authzen]`
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuthzenSection {
     /// Accept `subject.properties.chain` from the request body when there is no bearer token.
@@ -90,6 +90,27 @@ pub struct AuthzenSection {
     /// must match what this server issued for its lease.
     #[serde(default)]
     pub allow_unsigned_chain: bool,
+    /// Most evaluations one `POST /access/v1/evaluations` request may carry. Default 64.
+    /// Larger requests are refused with 400 `batch_too_large` before anything is decided or
+    /// audited. Must be at least 1.
+    #[serde(default = "default_max_batch")]
+    pub max_batch: usize,
+}
+
+impl Default for AuthzenSection {
+    fn default() -> Self {
+        Self {
+            allow_unsigned_chain: false,
+            max_batch: default_max_batch(),
+        }
+    }
+}
+
+/// Default for `[authzen] max_batch`.
+pub const DEFAULT_MAX_BATCH: usize = 64;
+
+fn default_max_batch() -> usize {
+    DEFAULT_MAX_BATCH
 }
 
 /// `[token]`: the `POST /token` exchange endpoint.
@@ -266,14 +287,33 @@ pub struct AuditSection {
     /// memory (lost on exit).
     #[serde(default = "default_sqlite_path")]
     pub sqlite_path: String,
+    /// Sign a checkpoint (`{seq, head_hash, at, kid, signature}`, Ed25519 by the issuer key)
+    /// every this many appended entries. Default 1000; 0 turns the count trigger off.
+    #[serde(default = "default_checkpoint_every")]
+    pub checkpoint_every: u64,
+    /// Also sign one at least this often (in seconds) while entries are being appended, so a
+    /// quiet log still gets its tail covered. Default 300; 0 turns the timer off. The two
+    /// triggers are independent: whichever fires first writes the checkpoint.
+    #[serde(default = "default_checkpoint_interval_seconds")]
+    pub checkpoint_interval_seconds: u64,
 }
 
 impl Default for AuditSection {
     fn default() -> Self {
         Self {
             sqlite_path: default_sqlite_path(),
+            checkpoint_every: default_checkpoint_every(),
+            checkpoint_interval_seconds: default_checkpoint_interval_seconds(),
         }
     }
+}
+
+fn default_checkpoint_every() -> u64 {
+    1000
+}
+
+fn default_checkpoint_interval_seconds() -> u64 {
+    300
 }
 
 fn default_sqlite_path() -> String {
@@ -628,6 +668,8 @@ mod tests {
     fn empty_config_takes_defaults() {
         let cfg = Config::from_toml("").unwrap();
         assert_eq!(cfg.audit.sqlite_path, ":memory:");
+        assert_eq!(cfg.audit.checkpoint_every, 1000);
+        assert_eq!(cfg.audit.checkpoint_interval_seconds, 300);
         assert_eq!(cfg.issuer.default_ttl_seconds, 900);
         assert!(cfg.admin.token.is_none());
         assert!(

@@ -48,6 +48,17 @@ Every action a policy names must be in the catalog.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `sqlite_path` | none | Audit log and lease registry. `:memory:` keeps both in memory and loses them on exit. |
+| `checkpoint_every` | 1000 | Sign a checkpoint every this many entries. 0 turns the count trigger off. |
+| `checkpoint_interval_seconds` | 300 | Also sign one this often, if entries arrived since the last. 0 turns the timer off. Whichever trigger fires first writes the checkpoint. |
+
+Checkpoints are signed with the issuer key and verified against the JWKS; see [Audit log](../concepts/audit-log.md#signed-checkpoints).
+
+## `[authzen]`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `allow_unsigned_chain` | `false` | Accept `subject.properties.chain` without a bearer token from an authenticated `[[peps]]` entry. Every hop must match what the server issued. |
+| `max_batch` | 64 | Most evaluations one `POST /access/v1/evaluations` may carry. More is refused with 400 `batch_too_large` before anything is decided or audited. Must be at least 1. |
 
 ## `[[upstreams]]`
 

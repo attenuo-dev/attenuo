@@ -46,6 +46,7 @@ use axum::Json;
 use onbehalf_audit::LeaseStore;
 use onbehalf_token::{ExchangeRequest, AUTHORIZATION_DETAILS_TYPE};
 use serde_json::{json, Map, Value};
+use time::OffsetDateTime;
 
 use super::{audit_issuance, no_store, now, parse_json, register_issued};
 use crate::clientauth::{self, ClientKind};
@@ -63,6 +64,18 @@ pub async fn exchange(
     if crate::idp::intake::is_intake(&value) {
         return crate::idp::intake::handle(&state, &headers, value, now).await;
     }
+    // Lease lookups, registration and the audit append are SQLite calls: off the async workers.
+    state
+        .blocking(move |s| exchange_sync(s, &headers, value, now))
+        .await
+}
+
+fn exchange_sync(
+    state: &AppState,
+    headers: &HeaderMap,
+    value: Value,
+    now: OffsetDateTime,
+) -> Result<Response, ApiError> {
     let field = |k: &str| value.get(k).and_then(Value::as_str).map(str::to_owned);
     let (client_id, client_secret) = (field("client_id"), field("client_secret"));
     let mut value = value;
@@ -71,12 +84,12 @@ pub async fn exchange(
         obj.remove("client_secret");
     }
     let req = parse_request(value)?;
-    let presented = client_secret.is_some() || clientauth::basic_credentials(&headers)?.is_some();
+    let presented = client_secret.is_some() || clientauth::basic_credentials(headers)?.is_some();
     if state.require_actor_auth || presented {
         let agent = clientauth::authenticate(
             ClientKind::Agent,
             &state.agents,
-            &headers,
+            headers,
             client_id.as_deref(),
             client_secret.as_deref(),
         )?;
@@ -139,7 +152,7 @@ pub async fn exchange(
         .ok_or_else(|| ApiError::internal("issued token has no hops"))?;
     let parent_lease = parent.chain.hops.last().map(|h| &h.lease);
     register_issued(
-        &state,
+        state,
         &resp.access_token,
         &resp.lease,
         parent_lease,
@@ -152,7 +165,7 @@ pub async fn exchange(
         "requested": req.requested,
         "parent_lease": parent_lease,
     });
-    if let Err(e) = audit_issuance(&state, "token.exchange", &issued.chain, args, now) {
+    if let Err(e) = audit_issuance(state, "token.exchange", &issued.chain, args, now) {
         // An issuance we cannot record must not be usable.
         let _ = state.leases.revoke(&resp.lease, "audit_error", now);
         return Err(e);

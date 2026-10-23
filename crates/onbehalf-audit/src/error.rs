@@ -17,6 +17,15 @@ pub enum AuditError {
     /// A stored row could not be read back as an entry (e.g. corrupted JSON).
     #[error("corrupt audit entry at seq {seq}: {detail}")]
     Corrupt { seq: u64, detail: String },
+    /// An audit export could not be parsed.
+    #[error("invalid audit export: {0}")]
+    Export(String),
+    /// A checkpoint was requested but no signing key was configured.
+    #[error("no checkpoint signer is configured")]
+    NoCheckpointSigner,
+    /// The JWKS handed to checkpoint verification is malformed.
+    #[error("invalid JWKS: {0}")]
+    Jwks(String),
     /// A lease operation referred to an id the store has never seen.
     #[error("unknown lease `{0}`")]
     UnknownLease(String),

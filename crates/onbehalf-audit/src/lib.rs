@@ -13,13 +13,23 @@
 //!
 //! Nothing here evaluates policy; the sibling crates call into this one after deciding.
 
+pub mod checkpoint;
 pub mod error;
+pub mod export;
 pub mod lease;
 pub mod log;
 pub mod memory;
 pub mod sqlite;
 
+pub use checkpoint::{
+    verify_with_checkpoints, BadCheckpoint, Checkpoint, CheckpointKeys, SignedVerifyReport, Start,
+    CHECKPOINT_CONTEXT,
+};
 pub use error::AuditError;
+pub use export::{
+    checkpoint_line, entry_line, header_line, parse_export, to_json_form, verify_export, Export,
+    ExportHeader, ExportReport, EXPORT_FORMAT,
+};
 pub use lease::{LeaseStatus, LeaseStore, MemoryLeaseStore};
 pub use log::{
     compute_entry_hash, verify_entries, AuditEntry, AuditSink, VerifyReport, GENESIS_HASH,

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
-use onbehalf_audit::{SqliteAudit, SqliteLeaseStore};
+use onbehalf_audit::{CheckpointKeys, SqliteAudit, SqliteLeaseStore};
 use onbehalf_policy::{PolicyEngine, PolicyEngineBuilder};
 use onbehalf_token::{Issuer, IssuerConfig, Verifier};
 use serde_json::Value;
@@ -21,6 +21,10 @@ pub struct AppState {
     pub verifier: Verifier,
     pub pipeline: Arc<Pipeline>,
     pub audit: Arc<SqliteAudit>,
+    /// Public keys that may have signed audit checkpoints (the JWKS: current plus retired).
+    pub checkpoint_keys: CheckpointKeys,
+    /// `[audit] checkpoint_interval_seconds`; zero means no timer.
+    pub checkpoint_interval: std::time::Duration,
     pub leases: Arc<SqliteLeaseStore>,
     /// Policy file to re-read on reload; `None` when no policy file is configured.
     pub policies_path: Option<PathBuf>,
@@ -36,6 +40,8 @@ pub struct AppState {
     pub require_actor_auth: bool,
     /// `[authzen] allow_unsigned_chain`.
     pub authzen_allow_unsigned_chain: bool,
+    /// `[authzen] max_batch`.
+    pub authzen_max_batch: usize,
     /// PEPs allowed to send unsigned chains (`[[peps]]`, validated).
     pub peps: Vec<AgentConfig>,
     pub public_url: Option<String>,
@@ -53,6 +59,9 @@ impl AppState {
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
         config.check_server_names()?;
         config.check_admin_token()?;
+        if config.authzen.max_batch == 0 {
+            anyhow::bail!("[authzen] max_batch must be at least 1");
+        }
         let issuer = load_issuer(config)?;
         let verifier = issuer.verifier();
         let jwks = crate::jwks::jwks_from_keys(&issuer.trusted_public_keys())?;
@@ -60,8 +69,10 @@ impl AppState {
         let engine = build_engine(config)?;
         let policy = Arc::new(RwLock::new(engine));
 
-        let (audit, leases) = open_storage(&config.audit.sqlite_path)?;
+        let checkpoint_keys = CheckpointKeys::from_jwks(&jwks)?;
         let metrics = Metrics::new();
+        let (audit, leases) =
+            open_storage(&config.audit, issuer.detached_signer(), metrics.clone())?;
         let pipeline = Arc::new(
             Pipeline::new(policy, leases.clone(), audit.clone()).with_metrics(metrics.clone()),
         );
@@ -108,6 +119,10 @@ impl AppState {
             verifier,
             pipeline,
             audit,
+            checkpoint_keys,
+            checkpoint_interval: std::time::Duration::from_secs(
+                config.audit.checkpoint_interval_seconds,
+            ),
             leases,
             policies_path: config.policy.policies_path.clone(),
             admin_token: config.admin.token.clone(),
@@ -116,6 +131,7 @@ impl AppState {
             agents,
             dev_allow_root_mint: config.dev.allow_root_mint,
             authzen_allow_unsigned_chain: config.authzen.allow_unsigned_chain,
+            authzen_max_batch: config.authzen.max_batch,
             require_actor_auth: config.token.require_actor_auth,
             peps,
             public_url: config.server.public_url.clone(),
@@ -124,6 +140,23 @@ impl AppState {
             metrics,
             replay: crate::replay::ReplayCache::default(),
         })
+    }
+
+    /// Run `f` on tokio's blocking pool.
+    ///
+    /// SQLite audit and lease I/O is synchronous and takes a lock, so handlers run it here
+    /// instead of on an async worker. Appends still serialize on the audit store's lock, which
+    /// is what keeps the hash chain linear no matter how many blocking threads call in.
+    pub async fn blocking<R, F>(self: &Arc<Self>, f: F) -> R
+    where
+        F: FnOnce(&AppState) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let state = Arc::clone(self);
+        match tokio::task::spawn_blocking(move || f(&state)).await {
+            Ok(r) => r,
+            Err(e) => std::panic::resume_unwind(e.into_panic()),
+        }
     }
 
     /// Expiry to register for a freshly issued lease: `min(now + lease_interval, token_exp)`.
@@ -256,11 +289,21 @@ fn build_engine(config: &Config) -> anyhow::Result<PolicyEngine> {
     Ok(engine)
 }
 
-fn open_storage(path: &str) -> anyhow::Result<(Arc<SqliteAudit>, Arc<SqliteLeaseStore>)> {
+fn open_storage(
+    cfg: &crate::config::AuditSection,
+    signer: onbehalf_token::DetachedSigner,
+    metrics: Arc<Metrics>,
+) -> anyhow::Result<(Arc<SqliteAudit>, Arc<SqliteLeaseStore>)> {
+    let count = move |_: &onbehalf_audit::Checkpoint| metrics.audit_checkpoint();
+    let path = cfg.sqlite_path.as_str();
     if path == ":memory:" {
         tracing::warn!("audit.sqlite_path is :memory:; the audit log is lost on exit");
         return Ok((
-            Arc::new(SqliteAudit::open_in_memory()?),
+            Arc::new(
+                SqliteAudit::open_in_memory()?
+                    .with_checkpointing(signer, cfg.checkpoint_every)
+                    .with_checkpoint_hook(count),
+            ),
             Arc::new(SqliteLeaseStore::open_in_memory()?),
         ));
     }
@@ -268,7 +311,10 @@ fn open_storage(path: &str) -> anyhow::Result<(Arc<SqliteAudit>, Arc<SqliteLease
     if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let audit = SqliteAudit::open(p).with_context(|| format!("opening audit log {path}"))?;
+    let audit = SqliteAudit::open(p)
+        .with_context(|| format!("opening audit log {path}"))?
+        .with_checkpointing(signer, cfg.checkpoint_every)
+        .with_checkpoint_hook(count);
     let leases =
         SqliteLeaseStore::open(p).with_context(|| format!("opening lease store {path}"))?;
     Ok((Arc::new(audit), Arc::new(leases)))
@@ -311,6 +357,16 @@ mod tests {
         );
         cfg.issuer.lease_interval_seconds = 0;
         assert!(AppState::from_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn authzen_max_batch_defaults_to_64_and_must_be_positive() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.authzen.max_batch, 64);
+        assert_eq!(AppState::from_config(&cfg).unwrap().authzen_max_batch, 64);
+        cfg.authzen.max_batch = 0;
+        let err = AppState::from_config(&cfg).err().unwrap();
+        assert!(err.to_string().contains("max_batch"), "{err}");
     }
 
     /// SR-08: unsigned AuthZEN chains cannot be switched on without a PEP to authenticate.

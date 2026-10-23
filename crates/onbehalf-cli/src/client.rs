@@ -62,6 +62,23 @@ impl Client {
             .await
     }
 
+    /// `GET` an admin path and hand back the response for the caller to read incrementally
+    /// (the audit export). Non-success statuses become errors; the long timeout is for a big
+    /// export, not for a hung server.
+    pub async fn admin_get_stream(&self, path: &str) -> Result<reqwest::Response> {
+        let resp = self
+            .admin(self.http.get(self.url(path)))?
+            .timeout(std::time::Duration::from_secs(3600))
+            .send()
+            .await
+            .with_context(|| format!("could not reach the server at {}", self.base))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp);
+        }
+        Err(api_error(status, &resp.text().await?))
+    }
+
     pub async fn admin_post(&self, path: &str, body: &Value) -> Result<Value> {
         self.send_json(self.admin(self.http.post(self.url(path)).json(body))?)
             .await
