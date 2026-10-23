@@ -490,6 +490,18 @@ const WAL_CATCH_UP_PASSES: usize = 4;
 /// Frames committed during a catch-up pass small enough to copy with appends paused.
 const WAL_LOCKED_RESIDUE: i64 = 256;
 
+/// The writer's own backstop: `wal_autocheckpoint` on the writer connection while the
+/// background checkpointer is on. The background thread keeps the WAL far below this (it
+/// starts a round every [`WAL_CHECKPOINT_COMMITS`] commits and pauses appends once past
+/// [`WAL_RESTART_FRAMES`]), so a commit never checkpoints in normal operation. But that thread
+/// can fall behind on a starved or slow host (two cores shared with many writers, a slow disk),
+/// and then the WAL grew by hundreds of megabytes before a round caught up. Past this many
+/// frames, 128 MB at the default page size, SQLite runs a `PASSIVE` checkpoint on the writer
+/// after the commit, which with no other writer copies everything, so the next commit starts
+/// the WAL over. The WAL is then bounded whatever the background thread's scheduling, at the
+/// price of one slow append when the backstop fires.
+pub const WAL_WRITER_BACKSTOP_FRAMES: i64 = 2 * WAL_RESTART_FRAMES;
+
 /// What one `PRAGMA wal_checkpoint` reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalCheckpoint {
@@ -530,10 +542,11 @@ enum WalMsg {
 /// The background WAL checkpointer of a file-backed [`SqliteAudit`]: a thread with its own
 /// connection to the same file.
 ///
-/// The writer connection runs with `wal_autocheckpoint=0`, so a commit never copies the WAL
-/// into the database file (and, at `durability = "normal"`, never pays the `fsync` that comes
-/// with it); before this, every thousandth page made one append wait for a whole checkpoint.
-/// Instead this thread runs a round every interval, or sooner after
+/// The writer connection runs with `wal_autocheckpoint` raised to
+/// [`WAL_WRITER_BACKSTOP_FRAMES`], so a commit never copies the WAL into the database file
+/// (and, at `durability = "normal"`, never pays the `fsync` that comes with it) unless this
+/// thread has fallen far behind; before this, every thousandth page made one append wait for a
+/// whole checkpoint. Instead this thread runs a round every interval, or sooner after
 /// [`WAL_CHECKPOINT_COMMITS`] commits:
 ///
 /// 1. `PRAGMA wal_checkpoint(PASSIVE)` without any lock of the store's. `PASSIVE` takes no
@@ -551,6 +564,9 @@ enum WalMsg {
 ///    timeout zero, so it never makes an append wait), which shrinks the WAL file to zero.
 ///
 /// Stopping runs a final `TRUNCATE`.
+///
+/// If this thread cannot keep up (starved of CPU, or a disk slower than the writers), the
+/// writer's backstop at [`WAL_WRITER_BACKSTOP_FRAMES`] bounds the WAL anyway.
 struct WalCheckpointer {
     msgs: mpsc::SyncSender<WalMsg>,
     conn: Arc<Mutex<Connection>>,
@@ -1107,8 +1123,9 @@ impl SqliteAudit {
     }
 
     /// Move WAL checkpoints off the writer: the writer connection stops checkpointing on
-    /// commit (`wal_autocheckpoint=0`) and a background thread with its own connection runs
-    /// `PRAGMA wal_checkpoint(PASSIVE)` every `interval`, or sooner after
+    /// commit (`wal_autocheckpoint` raised from 1,000 pages to 128 MB, a backstop that only
+    /// fires if the background thread falls far behind) and a background thread with its own
+    /// connection runs `PRAGMA wal_checkpoint(PASSIVE)` every `interval`, or sooner after
     /// [`WAL_CHECKPOINT_COMMITS`] commits, plus `TRUNCATE` when the writer is idle and once
     /// more when the store is dropped. Under continuous load a round that finds the WAL past
     /// 64 MB pauses appends for a short catch-up pass so the WAL starts over instead of
@@ -1143,10 +1160,11 @@ impl SqliteAudit {
         let (kick, msgs) = mpsc::sync_channel(1);
         let activity = Arc::clone(&self.inner.activity);
         let _ = activity.wal_kick.set(kick.clone());
-        self.inner
-            .conn
-            .lock()?
-            .pragma_update(None, "wal_autocheckpoint", 0)?;
+        self.inner.conn.lock()?.pragma_update(
+            None,
+            "wal_autocheckpoint",
+            WAL_WRITER_BACKSTOP_FRAMES,
+        )?;
         self.wal = Some(WalCheckpointer::start(
             conn,
             Arc::clone(&self.inner.conn),
@@ -1518,16 +1536,16 @@ impl SqliteLeaseStore {
         f(&conn)
     }
 
-    /// Stop this connection from checkpointing the WAL when it commits
-    /// (`wal_autocheckpoint=0`). Only for a store that shares its file with a
-    /// [`SqliteAudit`] whose [`with_wal_checkpoints`](SqliteAudit::with_wal_checkpoints) is on:
-    /// that checkpointer covers the whole file, and without this a token exchange that
-    /// registers a lease would still run a checkpoint inline now and then. Nothing to do for
-    /// an in-memory store.
+    /// Stop this connection from checkpointing the WAL when it commits (`wal_autocheckpoint`
+    /// raised to the same 128 MB backstop as the audit writer's). Only for a store that shares
+    /// its file with a [`SqliteAudit`] whose
+    /// [`with_wal_checkpoints`](SqliteAudit::with_wal_checkpoints) is on: that checkpointer
+    /// covers the whole file, and without this a token exchange that registers a lease would
+    /// still run a checkpoint inline now and then. Nothing to do for an in-memory store.
     pub fn without_wal_autocheckpoint(self) -> Result<Self, AuditError> {
         self.conn
             .lock()?
-            .pragma_update(None, "wal_autocheckpoint", 0)?;
+            .pragma_update(None, "wal_autocheckpoint", WAL_WRITER_BACKSTOP_FRAMES)?;
         Ok(self)
     }
 

@@ -9,7 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use attenuo_audit::{AuditSink, Durability, SqliteAudit, SqliteLeaseStore, WAL_CHECKPOINT_COMMITS};
+use attenuo_audit::{
+    AuditSink, Durability, SqliteAudit, SqliteLeaseStore, WAL_CHECKPOINT_COMMITS,
+    WAL_WRITER_BACKSTOP_FRAMES,
+};
 use common::record;
 use rusqlite::{Connection, OpenFlags};
 
@@ -56,8 +59,8 @@ fn concurrent_appends_with_verify_running_and_background_checkpoints() {
     );
     assert_eq!(
         autocheckpoint(&audit),
-        0,
-        "the writer no longer checkpoints"
+        WAL_WRITER_BACKSTOP_FRAMES,
+        "the writer checkpoints only as a backstop, far above what the background thread allows"
     );
 
     const THREADS: usize = 8;
@@ -151,7 +154,9 @@ fn a_burst_triggers_a_checkpoint_before_the_interval() {
 /// Under continuous load a passive checkpoint never finds every frame copied, and SQLite only
 /// starts the WAL over when it does; the checkpointer's short catch-up pass is what keeps the
 /// WAL from growing for as long as the load lasts (without it this run leaves a WAL of
-/// hundreds of megabytes).
+/// hundreds of megabytes). On a host where that thread cannot keep up (CI runners with two
+/// cores and a slow disk reached 184 and 301 MB), the writer's own 128 MB backstop holds the
+/// bound instead.
 #[test]
 fn the_wal_stays_bounded_under_continuous_load() {
     let dir = tempfile::tempdir().unwrap();
@@ -193,7 +198,9 @@ fn the_wal_stays_bounded_under_continuous_load() {
     done.store(true, Ordering::Release);
     let largest = sampler.join().unwrap();
     eprintln!("largest WAL: {} KiB", largest >> 10);
-    assert!(largest < 160 << 20, "the WAL reached {} MB", largest >> 20);
+    // The backstop (128 MB at the 4 KiB page) plus what one locked pass has in flight.
+    let bound = WAL_WRITER_BACKSTOP_FRAMES as u64 * 4096 + (32 << 20);
+    assert!(largest < bound, "the WAL reached {} MB", largest >> 20);
     let report = audit.verify_chain().unwrap();
     assert!(report.ok);
     assert_eq!(report.entries, (THREADS * PER_THREAD) as u64);
