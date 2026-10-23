@@ -87,7 +87,7 @@ That has limits, and they matter:
 - Whoever can write the database file can rewrite the whole chain from the point they edit, recomputing every hash after it. The chain alone does not stop that.
 - Truncating the end of the log is not detectable by the chain alone.
 
-The way to close both is to copy the head of the chain, `GET /admin/audit/checkpoint` (`{seq, hash}`), to a place the server's host cannot write. A later `verify` that disagrees with a saved checkpoint shows tampering. v0 gives you the endpoint, but does not sign or ship checkpoints for you. See [Deploying](guides/deploying.md#sqlite-file-placement-and-backup).
+The server closes both with signed checkpoints: every 1000 entries and every 300 seconds it signs `(seq, head_hash)` with the issuer key, and `onbehalf audit verify` rejects a log that is shorter than a checkpoint or has a different hash at its `seq`. The key is the server's own, so also copy checkpoints (`GET /admin/audit/checkpoint`) or exports to a place the host cannot write. The server does not ship them for you. See [Deploying](guides/deploying.md#sqlite-file-placement-and-backup).
 
 The log stores a digest of each call's arguments, not the arguments.
 

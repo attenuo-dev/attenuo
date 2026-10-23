@@ -60,6 +60,12 @@ inputs = { repo = "string" }
 [audit]
 # Audit log and lease registry. ":memory:" keeps both in memory (lost on exit).
 sqlite_path = "data/onbehalf.sqlite"
+# Signed checkpoints: the issuer key signs the head of the hash chain, so truncation or a
+# rewritten history can be caught with only the JWKS (`onbehalf audit verify`). One is written
+# every `checkpoint_every` entries and at least every `checkpoint_interval_seconds` while
+# entries arrive; 0 turns a trigger off.
+checkpoint_every = 1000
+checkpoint_interval_seconds = 300
 
 # MCP servers (Streamable HTTP), mounted at /mcp/<name>. `name` is the server part of
 # capabilities, e.g. "github:read_file".
@@ -126,6 +132,9 @@ attributes = { mfa = false }
 # PEP listed in [[peps]] (HTTP Basic, or pep_id/pep_secret in the body). Each hop of such a
 # chain must match what this server issued for its lease, or the request gets 403.
 allow_unsigned_chain = false
+# Most evaluations one POST /access/v1/evaluations may carry. Larger requests get 400
+# batch_too_large before anything is decided or audited.
+max_batch = 64
 
 # Policy enforcement points for allow_unsigned_chain, same shape as [[agents]].
 # [[peps]]

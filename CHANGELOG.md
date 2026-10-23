@@ -10,6 +10,11 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ### Added
 
+- Signed audit checkpoints. `{seq, head_hash, at, kid, signature}`, Ed25519 by the issuer key under the context `onbehalf-checkpoint-v1` (new `onbehalf_token::DetachedSigner` and `verify_detached`), stored in a `checkpoints` table and written every `[audit] checkpoint_every` entries (default 1000) and every `checkpoint_interval_seconds` (default 300). `GET /admin/audit/checkpoint` now returns the signed checkpoint (`hash` stays as an alias of `head_hash`); `GET /admin/audit/verify` also verifies checkpoint signatures against the JWKS keys and reports `checkpoints`, `last_signed_seq`, `unsigned_tail` and `bad_checkpoints`. Keys retired in a rotation keep verifying old checkpoints while they are in the JWKS. `onbehalf audit verify` prints the checkpoint status.
+- `GET /admin/audit/export?from&to` streams entries and checkpoints as JSON Lines; `onbehalf audit export --from --to --format jsonl|json` writes them, and `onbehalf audit verify --file <export> [--jwks <file>]` verifies an export offline with only the JWKS.
+- `POST /access/v1/evaluations` (AuthZEN batch), advertised as `access_evaluations_endpoint`, bounded by `[authzen] max_batch` (default 64; 400 `batch_too_large` beyond it).
+- Metrics `audit_append_duration_seconds` (histogram) and `audit_checkpoints_total` (counter).
+
 - Workspace skeleton: `onbehalf-core`, `onbehalf-token`, `onbehalf-policy`, `onbehalf-audit`, `onbehalf-proxy`, `onbehalf-server` crates.
 - Core model: delegation chains, capability sets, attenuation, decision records.
 - Project process files: ADR and RFC process, security policy, code of conduct, governance, contribution guide, release and supply-chain workflows.
@@ -40,6 +45,9 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ### Changed
 
+- SQLite audit and lease I/O runs on tokio's blocking pool instead of the async workers (handlers through `AppState::blocking`, the proxy authorizer through `spawn_blocking`). Appends still serialize on the store lock, so the hash chain stays linear.
+- `GET /admin/audit/checkpoint` answers `{seq, head_hash, at, kid, signature}` (plus `hash`, an alias of `head_hash`) and signs the head if it has no checkpoint yet. `GET /admin/audit/verify` has extra fields (the old ones are unchanged). `onbehalf audit verify` always exited 2 on a broken chain; the docs said 1 and are corrected.
+- `onbehalf-audit` now depends on `onbehalf-token` (checkpoint signing and verification), and `onbehalf-cli` on `onbehalf-audit` (offline export verification).
 - MSRV (`rust-version`, `clippy.toml`) raised from 1.85 to 1.89, which the locked dependencies already required. Not tested on 1.89 itself; the CI `msrv` job will.
 - BREAKING: `POST /admin/root-token` is mounted only when `[dev] allow_root_mint = true` (default `false`); otherwise it answers 404.
 - `[[root_grants]]` entries no longer need a `subject`: without one an entry applies to every user of its `issuer`. The same list now caps IdP intake.
@@ -73,6 +81,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ### Security
 
+- SR-22 (info): store I/O no longer blocks tokio workers, and AuthZEN batches are bounded by `[authzen] max_batch`. SR-21 (info, partial): audit checkpoints are signed by the issuer key and verified against the JWKS; shipping them off the host is still up to the operator.
 - SR-08 (high): AuthZEN evaluated unsigned chains from unauthenticated callers, so anyone who had seen a lease id could get decisions and write audit records for a forged user. The bearer is now required by default; body chains need a PEP credential, and every hop's lease must be bound (at issuance, write-once) to the digest of the chain prefix that created it.
 - SR-10 (high): the `actor` of a token exchange was asserted, not authenticated, so any token holder could mint a child naming any agent. The actor now authenticates with its `[[agents]]` secret and must match `actor`; an agent already in the chain is refused (`duplicate_actor`).
 - SR-11 (medium): `Mcp-Session-Id` was not bound to the caller, so another user's token could use, listen on or end a session. Session ids are bound to the originating user and root lease; mismatches get 403 `session_mismatch` and an audit record. Logs, policy context and audit records carry a hash prefix of the id, never the id.

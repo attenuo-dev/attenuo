@@ -32,14 +32,16 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 - [ ] Multi-hop demo: planner agent → coder sub-agent → GitHub tool, three exchanges, attenuated at each.
 - [ ] Policy harness follow-ups: report which policies no case exercised, run cases through the AuthZEN endpoint too, a `--schema-file` for custom base schemas, `onbehalf policy test --watch`.
 - [ ] AuthZEN conformance fixtures (the endpoint itself is done).
-- [ ] Audit: signed checkpoints every N records; `kind` for `issue`, `decision`, `renew`, `revoke`, `checkpoint`.
+- [x] Audit: signed checkpoints every N records and every T seconds, verified against the JWKS, with export and offline verify (`feat/audit-hardening`).
+- [ ] Audit: `kind` for `issue`, `decision`, `renew`, `revoke`, `checkpoint` and `chain_id` (RFC-0001 section 7); ship checkpoints off the host (no built-in sink yet); RFC 8785 canonical JSON (SR-20).
+- [ ] Audit: a dedicated writer thread with group commit if single-writer SQLite throughput becomes the limit (appends now run on the blocking pool behind one lock).
 - [ ] Server: real admin authentication, `actor_token` verification on exchange, audit failed exchanges.
 - [ ] CI: fmt, clippy `-D warnings`, tests, proptest with fixed seed in CI and random locally.
 - [ ] Server: real admin authentication, `actor_token` verification on exchange, `kid` in token headers, audit failed exchanges.
 - [ ] CI: proptest with a fixed seed in CI and random locally. Also: confirm the new workflows on GitHub (MSRV 1.89, musl and macOS release builds, GHCR push, cosign, SBOM) with a `v0.0.0-test` tag on a fork; enable private vulnerability reporting and the DCO app; set the GHCR package public.
 - [ ] AgentDojo / InjecAgent harness: run a no-policy baseline and an onbehalf-enforced run; report attack success and utility.
 - [ ] Docs follow-ups from the guides: test the Keycloak, Auth0, Okta, Entra ID and Google recipes (and ID-JAG with Okta) against live tenants and drop the "untested" marks; add a CI check that runs the getting-started commands.
-- [x] Operations gaps from the deploy guide: SIGTERM graceful shutdown, `/readyz`, `/metrics`, key rotation with overlap (`kid`, `previous_key_paths`). Still open: automatic signed audit checkpoints; audit append latency histogram (only authorize duration exists); `spawn_blocking` for SQLite.
+- [x] Operations gaps from the deploy guide: SIGTERM graceful shutdown, `/readyz`, `/metrics`, key rotation with overlap (`kid`, `previous_key_paths`). Done in `feat/audit-hardening`: automatic signed audit checkpoints, `audit_append_duration_seconds`, SQLite I/O on the blocking pool.
 - [x] Policy: `[policy] user_attributes` declares extra `originating_user.attributes`.
 - [ ] Operations gaps found while writing the deploy guide: handle SIGTERM for graceful shutdown; a readiness check that touches SQLite; a metrics endpoint (decision counts by reason, audit append latency); automatic signed audit checkpoints.
 - [ ] Policy: let operators declare extra `originating_user.attributes` (for example `groups`) in config. Today only `mfa`, `roles`, `tenant` and `email` are in the Cedar schema, and a policy that tests anything else is reported impossible.

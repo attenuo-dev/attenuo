@@ -95,7 +95,25 @@ Show the most recent audit entries. Needs the admin token.
 
 ### `audit verify`
 
-Walk the whole hash chain. Exits 1 if it is broken. Needs the admin token.
+Walk the whole hash chain and verify the signed checkpoints against the server's JWKS. Prints whether the chain is intact, then the checkpoint status: how many checkpoints exist, the last signed `seq`, how many entries come after it, and any invalid checkpoint with its reason. Exits 2 if the chain is broken or a checkpoint is invalid. Needs the admin token.
+
+With `--file` it verifies an export offline instead and needs no admin token:
+
+| Option | Meaning |
+| --- | --- |
+| `--file <PATH>` | An export from `audit export` (JSON Lines, or the `--format json` object). Re-hashes every entry, checks the links, verifies each checkpoint signature and its head hash, and reports a file that is shorter than the range in its header. |
+| `--jwks <PATH>` | JWKS file with the issuer keys (what `/.well-known/jwks.json` returns). Without it, the JWKS is fetched from `--server`. Only with `--file`. |
+
+### `audit export`
+
+Write entries and the checkpoints inside the range. Needs the admin token.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--from` | 1 | First sequence number. |
+| `--to` | the head | Last sequence number, inclusive. |
+| `--format` | `jsonl` | `jsonl` streams one object per line (header, entries, checkpoints). `json` writes one object `{header, entries, checkpoints}`. |
+| `--out` | stdout | Write to this file. |
 
 ### `policy reload`
 
