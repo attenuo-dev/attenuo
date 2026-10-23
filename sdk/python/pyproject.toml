@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "onbehalf"
+version = "0.0.1"
+description = "Python SDK for the onbehalf agent authorization server: token exchange, attenuated capabilities, proxied MCP calls, audit."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = ["httpx>=0.25"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+# Local Ed25519 verification of delegation tokens (`Client.inspect(..., verify=True)`).
+verify = ["cryptography>=41"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "cryptography>=41", "ruff", "mypy"]
+
+[project.urls]
+Repository = "https://github.com/7Mudit/onbehalf"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/onbehalf"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+  "integration: runs the real onbehalf-server and a fake MCP server (set ONBEHALF_INTEGRATION=1)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.mypy]
+strict = true
+python_version = "3.10"
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["mcp", "mcp.*"]
+ignore_missing_imports = true

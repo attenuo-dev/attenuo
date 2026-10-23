@@ -16,6 +16,7 @@ Delegated authorization for software agents. onbehalf lets a principal hand an a
 - [FAQ](docs/faq.md): why a proxy, how it differs from gateways and policy engines, what happens when it is down.
 - [RFC-0001: onbehalf](docs/spec/rfc-0001-onbehalf.md): what the system is, the token model, the policy and audit design.
 - [docs/](docs/README.md): specifications, architecture decisions, research notes, task board and engineering log.
+- [Python SDK](sdk/python/README.md): `pip install -e sdk/python`, sync and async clients, an admin client, and an [agent example](examples/python-agent/agent.py).
 - [examples/github-leak-demo](examples/github-leak-demo/README.md): the May 2025 GitHub MCP prompt-injection leak, replayed and stopped (`run.sh`, about a minute).
 - [docs/guides/writing-policies.md](docs/guides/writing-policies.md): writing Cedar policies for agents and testing them offline with `onbehalf policy test` and `onbehalf policy lint`, including a CI recipe.
 - [CONTRIBUTING.md](CONTRIBUTING.md): how to build, test and submit changes.
@@ -159,6 +160,25 @@ onbehalf audit verify
 Other subcommands: `tools` (`tools/list`), `lease show`, `policy reload`, `authzen eval`. Output is for people by default and JSON with `--json`; `--print token|lease` on `token root` and `token exchange` prints one value for scripts. `--server` before the subcommand is the onbehalf URL; after `call` or `tools` it names the MCP upstream. Exit status is 0 on success, 1 on an error and 2 when the server said no (a denied call, a negative AuthZEN decision, a broken audit chain). `ONBEHALF_TOKEN` can stand in for `--token` and `--subject-token`.
 
 A scripted end-to-end run of the GitHub leak scenario, with a fake MCP server, is in [examples/github-leak-demo](examples/github-leak-demo/README.md). A `Dockerfile` and `docker-compose.yml` run the same pair of servers in containers (untested).
+
+## Python SDK
+
+[`sdk/python`](sdk/python/README.md) is a Python client (`pip install -e sdk/python`, Python 3.10 or newer, depends on `httpx`) for agents written in Python: token exchange with typed capabilities and constraints, calls through the proxy that raise `Denied(reason, decision_id)` on a denial, lease renewal, AuthZEN evaluation, token inspection, and an admin client for revocation and the audit log. There is an async variant of each client. [`examples/python-agent`](examples/python-agent/agent.py) shows a planner delegating to a coder, and a second script wires the official `mcp` client to the proxy.
+
+```python
+from onbehalf import AdminClient, Capability, Client, Denied, Prefix
+
+admin = AdminClient("http://127.0.0.1:8080", "dev-admin-token-change-me")
+root = admin.mint_root_dev("alice", "https://idp.example", "planner", ["github:*"])   # dev only
+with Client("http://127.0.0.1:8080") as ob:
+    coder = ob.exchange(root, "coder", [Capability("github", "read_file", repo=Prefix("alice/public-"))])
+    try:
+        ob.call_tool(coder, "github", "create_issue", {"repo": "alice/public-docs", "title": "x"})
+    except Denied as d:
+        print(d.reason, d.decision_id)   # capability_denied <audit record id>
+```
+
+It is pre-alpha like the rest and is not published to PyPI.
 
 ## License
 

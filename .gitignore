@@ -8,3 +8,7 @@ docs/.obsidian/workspace.json
 docs/.obsidian/workspace-mobile.json
 /.claude/
 /data/
+
+__pycache__/
+*.egg-info/
+.venv/

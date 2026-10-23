@@ -40,6 +40,9 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 - [ ] Docs follow-ups from the guides: test the Keycloak, Auth0, Okta, Entra ID and Google recipes (and ID-JAG with Okta) against live tenants and drop the "untested" marks; add a CI check that runs the getting-started commands.
 - [x] Operations gaps from the deploy guide: SIGTERM graceful shutdown, `/readyz`, `/metrics`, key rotation with overlap (`kid`, `previous_key_paths`). Still open: automatic signed audit checkpoints; audit append latency histogram (only authorize duration exists); `spawn_blocking` for SQLite.
 - [x] Policy: `[policy] user_attributes` declares extra `originating_user.attributes`.
+- [ ] Operations gaps found while writing the deploy guide: handle SIGTERM for graceful shutdown; a readiness check that touches SQLite; a metrics endpoint (decision counts by reason, audit append latency); automatic signed audit checkpoints.
+- [ ] Policy: let operators declare extra `originating_user.attributes` (for example `groups`) in config. Today only `mfa`, `roles`, `tenant` and `email` are in the Cedar schema, and a policy that tests anything else is reported impossible.
+- [ ] Python SDK follow-ups: publish to PyPI (name, trusted publishing, release workflow); a token-refresh helper (renew at a third of the interval, re-exchange before `exp`); streaming responses in `call_tool`; test the hop-0 exchange against a live IdP; run the unit suite on Python 3.10 in CI and confirm the workflow; keep the `kid` check in `inspect(verify=True)` aligned with the server's header and JWKS `kid`.
 
 ## Later
 
@@ -55,6 +58,7 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 ## Done
 
 - [x] CI and release workflows (fmt, clippy, test matrix, MSRV, deny, audit, demo, policy tests, docs and link checks; musl/macOS archives, signed GHCR image, SBOM, draft release), dev scripts and justfile, repo hygiene files. Workflow YAML parses; none of it has run on GitHub.
+- [x] Python SDK (`sdk/python`, package `onbehalf`): sync and async clients, admin client, capability helpers, `onbehalf.mcp`, unit and integration tests, `sdk-python` workflow, [agent example](../../examples/python-agent/agent.py).
 - [x] User guides (`docs/guides/`), FAQ and positioning table; wire examples verified against a local build. IdP recipes remain untested against live providers.
 - [x] Security review pass 1: SR-01 to SR-07 fixed with regression tests (proxy re-encodes screened messages, no upstream redirects, non-object arguments rejected; Cedar action hierarchy; integral floats as Long; TTL overflow; root-grant attributes).
 - [x] Lease renewal: `POST /token/renew`, `LeaseStore::renew`, lease expiry enforced for every hop, ADR-0006.
