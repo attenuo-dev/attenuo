@@ -113,19 +113,19 @@ A token can be bound to a key the agent holds (RFC 9449), so a leaked copy is us
 from onbehalf import Client, DpopKey
 
 coder_key = DpopKey.load("coder.jwk")  # or DpopKey.generate(); keep key.private_jwk() to reuse it
+
+# In the planner's process: consent to delegating `root` to the coder's key and agent id.
+sign_off = planner_key.sign_off(f"{url}/token", str(root), coder_key.thumbprint, "coder")
+
+# In the coder's process: the new token is bound to coder_key.
 with Client(url, dpop_key=coder_key) as ob:
-    # The new token is bound to coder_key. The parent is bound to the planner's key, which
-    # signs off on the exchange.
     coder = ob.exchange(
-        root, "coder", ["github:read_file"], client_secret=..., subject_dpop_key=planner_key
+        root, "coder", ["github:read_file"], client_secret=..., subject_token_dpop=sign_off
     )
     ob.call_tool(coder, "github", "read_file", {"repo": "alice/docs"})  # proof attached
-root = admin.mint_root_dev(
-    "alice", "https://idp.example", "planner", ["github:*"], dpop_key=planner_key
-)
 ```
 
-With a key, every `call_tool`, `list_tools`, `renew` and `authzen_evaluate` sends `Authorization: DPoP <token>` and a fresh proof, and every `exchange` binds the new token. When the parent is bound to the client's own key, `subject_dpop_key` is not needed. `Token.dpop_jkt` is the thumbprint a token is bound to (`None` for a bearer token), and `AuditEntry.dpop_bound` says whether a decision was made with a proven bound token. A bound token without a proof is `Unauthorized` with `error == "dpop_required"`. See [Binding tokens to keys](../../docs/guides/binding-tokens-to-keys.md).
+With a key, every `call_tool`, `list_tools`, `renew` and `authzen_evaluate` sends `Authorization: DPoP <token>` and a fresh proof, and every `exchange` binds the new token. When the parent is bound to another key, its holder's sign-off names the new key and agent and works for that one exchange; a process that holds both keys can pass `subject_dpop_key=planner_key` instead. When the parent is bound to the client's own key, no sign-off is needed. `Token.dpop_jkt` is the thumbprint a token is bound to (`None` for a bearer token), and `AuditEntry.dpop_bound` says whether a decision was made with a proven bound token. A bound token without a proof is `Unauthorized` with `error == "dpop_required"`. See [Binding tokens to keys](../../docs/guides/binding-tokens-to-keys.md).
 
 ### Errors
 

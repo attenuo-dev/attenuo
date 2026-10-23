@@ -67,6 +67,7 @@
   - [Injection suite, first results](evaluation/injection-suite.md)
 - [Security review, pass 1](research/security-review-2026-10-22.md)
   - [Security review, pass 3](research/security-review-2026-10-23.md)
+  - [Security review, pass 4](research/security-review-2026-10-23-pass4.md)
 - [Open-source project practices](research/oss-project-practices.md)
 
 # Project

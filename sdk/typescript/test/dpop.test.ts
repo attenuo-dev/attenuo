@@ -137,8 +137,22 @@ describe("clients with a DPoP key", () => {
     ({ header, claims } = await verify((last().body as Json).subject_token_dpop as string));
     expect(await jwkThumbprint(header.jwk as Json)).toBe(parentKey.thumbprint);
     expect(claims.ath).toBe(await accessTokenHash(other));
+    // SR-40: the sign-off names the new token's key and agent.
+    expect(claims.child_jkt).toBe(key.thumbprint);
+    expect(claims.child_actor).toBe("coder");
     await expect(
       ob.exchange(other, "coder", "github:read_file", { subjectDpopKey: key }),
+    ).rejects.toBeInstanceOf(OnbehalfError);
+
+    // A sign-off made by the parent's holder elsewhere is passed through as it is.
+    const detached = await parentKey.signOff(`${BASE}/token`, other, key.thumbprint, "coder");
+    await ob.exchange(other, "coder", "github:read_file", { subjectTokenDpop: detached });
+    expect((last().body as Json).subject_token_dpop).toBe(detached);
+    await expect(
+      ob.exchange(other, "coder", "github:read_file", {
+        subjectDpopKey: parentKey,
+        subjectTokenDpop: detached,
+      }),
     ).rejects.toBeInstanceOf(OnbehalfError);
 
     // Every use of a token carries a proof for that request.

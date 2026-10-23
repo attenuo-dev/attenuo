@@ -16,6 +16,10 @@ import { b64urlDecode } from "./token.js";
 
 /** `typ` of a DPoP proof. */
 export const PROOF_TYPE = "dpop+jwt";
+/** Sign-off claim naming the new token's key thumbprint. */
+export const SIGN_OFF_CHILD_JKT = "child_jkt";
+/** Sign-off claim naming the new token's agent. */
+export const SIGN_OFF_CHILD_ACTOR = "child_actor";
 
 /** A private JWK as stored on disk, or any JWK-shaped object. */
 export type Jwk = Record<string, unknown>;
@@ -153,6 +157,30 @@ export class DpopKey {
     return this.sign(claims);
   }
 
+  /**
+   * The `subject_token_dpop` sign-off of an exchange: a proof by the subject token's key that
+   * also names the new token's key (`child_jkt`) and agent (`child_actor`), so it is consent to
+   * delegate to that key and agent only. The parent's holder makes it and hands it to the
+   * sub-agent; the parent's key never leaves the parent's process.
+   */
+  async signOff(
+    url: string,
+    subjectToken: string,
+    childJkt: string,
+    actor: string,
+    opts: { iat?: number } = {},
+  ): Promise<string> {
+    return this.sign({
+      jti: crypto.randomUUID(),
+      htm: "POST",
+      htu: url.split("#", 1)[0]!.split("?", 1)[0]!,
+      iat: opts.iat ?? Math.floor(Date.now() / 1000),
+      ath: await accessTokenHash(subjectToken),
+      [SIGN_OFF_CHILD_JKT]: childJkt,
+      [SIGN_OFF_CHILD_ACTOR]: actor,
+    });
+  }
+
   /** Sign arbitrary proof claims under a DPoP header (for tests and special cases). */
   async sign(claims: Record<string, unknown>): Promise<string> {
     const header = { typ: PROOF_TYPE, alg: this.alg, jwk: this.publicJwk };
@@ -193,13 +221,15 @@ export async function presented(
  *
  * `key` binds the new token; its proof covers the subject token when the subject token is bound
  * to the same key. `subjectKey` is the subject token's key when the new token is bound to another
- * one: its proof is the parent holder's consent.
+ * one: its sign-off names `key` and `actor` (see `DpopKey.signOff`), so it consents to that
+ * delegation only.
  */
 export async function exchangeProofs(
   url: string,
   subjectToken: string,
   key: DpopKey | undefined,
   subjectKey: DpopKey | undefined,
+  actor: string,
 ): Promise<{ header?: string; signOff?: string }> {
   const parent = tokenJkt(subjectToken);
   const out: { header?: string; signOff?: string } = {};
@@ -208,10 +238,13 @@ export async function exchangeProofs(
     out.header = await key.proof("POST", url, same ? subjectToken : undefined);
   }
   if (subjectKey !== undefined) {
+    if (key === undefined) {
+      throw new OnbehalfError("subjectDpopKey needs a dpopKey to bind the new token to");
+    }
     if (parent !== undefined && parent !== subjectKey.thumbprint) {
       throw new OnbehalfError("subjectDpopKey is not the key the subject token is bound to");
     }
-    out.signOff = await subjectKey.proof("POST", url, subjectToken);
+    out.signOff = await subjectKey.signOff(url, subjectToken, key.thumbprint, actor);
   }
   return out;
 }

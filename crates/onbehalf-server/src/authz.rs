@@ -292,13 +292,22 @@ impl ServerAuthorizer {
                 AuthError::InvalidToken(e.to_string())
             }
         })?;
-        self.verified.insert(key, &v, now);
+        // The cache is bounded by count; a size bound per entry makes it bounded in bytes
+        // (SR-46). Larger tokens are verified on every call.
+        if token.len() <= VERIFIED_TOKEN_MAX_BYTES {
+            self.verified.insert(key, &v, now);
+        }
         Ok(v)
     }
 }
 
 /// Tokens kept by [`VerifiedTokens`].
 pub const VERIFIED_TOKENS_CAPACITY: usize = 4096;
+
+/// Largest token [`VerifiedTokens`] keeps, in bytes. A token of a few hops with ordinary
+/// capabilities is 1 to 4 KiB; a child can carry an arbitrarily long constraint list (a
+/// narrowing of its parent), which would make the cache's 4096 entries hundreds of MiB (SR-46).
+pub const VERIFIED_TOKEN_MAX_BYTES: usize = 16 * 1024;
 
 /// Chains of tokens that already passed [`Verifier::verify`], keyed by the SHA-256 of the
 /// exact token text.
@@ -651,6 +660,47 @@ mod tests {
         let forged = String::from_utf8(forged).unwrap();
         assert!(auth.authenticate(&forged, now).await.is_err());
         assert_eq!(auth.verified.chains.lock().unwrap().len(), 1);
+    }
+
+    /// SR-46: a token over `VERIFIED_TOKEN_MAX_BYTES` is verified, but not kept.
+    #[tokio::test]
+    async fn oversized_tokens_are_verified_but_not_cached() {
+        let (p, _leases, _audit, _chain) = setup();
+        let issuer = onbehalf_token::Issuer::generate(onbehalf_token::IssuerConfig {
+            issuer: "https://onbehalf.test".into(),
+            audience: "onbehalf".into(),
+            max_depth: 4,
+            default_ttl: Duration::minutes(5),
+        });
+        let now = OffsetDateTime::now_utc();
+        let user = OriginatingUser {
+            subject: "alice".into(),
+            issuer: "idp".into(),
+            authenticated_at: now,
+            attributes: Default::default(),
+        };
+        // A long constraint list, as a child narrowing `github:read_*` could carry.
+        let values: Vec<serde_json::Value> = (0..2000)
+            .map(|i| json!(format!("acme/repo-{i:05}")))
+            .collect();
+        let cap = Capability::new("github", "read_*")
+            .with_constraint("repo", onbehalf_core::ArgConstraint::OneOf(values));
+        let issued = issuer
+            .issue_root(
+                user,
+                AgentId::new("planner"),
+                CapabilitySet::from_iter([cap]),
+                None,
+                now,
+            )
+            .unwrap();
+        assert!(issued.token.len() > VERIFIED_TOKEN_MAX_BYTES);
+        let auth = ServerAuthorizer::new(issuer.verifier(), Arc::new(p));
+        assert_eq!(
+            auth.authenticate(&issued.token, now).await.unwrap(),
+            issued.chain
+        );
+        assert_eq!(auth.verified.chains.lock().unwrap().len(), 0);
     }
 
     #[test]

@@ -49,6 +49,14 @@ pub const MAX_PROOF_BYTES: usize = 4096;
 /// Longest `jti` accepted, in bytes.
 pub const MAX_JTI_BYTES: usize = 256;
 
+/// Claim of an exchange sign-off (`subject_token_dpop`) naming the thumbprint of the key the
+/// new token is bound to (SR-40).
+pub const SIGN_OFF_CHILD_JKT: &str = "child_jkt";
+
+/// Claim of an exchange sign-off (`subject_token_dpop`) naming the agent the new token is for
+/// (SR-40).
+pub const SIGN_OFF_CHILD_ACTOR: &str = "child_actor";
+
 /// The `cnf` (confirmation) claim of a sender-constrained token (RFC 7800, RFC 9449 §6.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Confirmation {
@@ -107,6 +115,12 @@ pub enum DpopError {
     /// This proof was already used.
     #[error("DPoP proof jti was already used")]
     Replayed,
+    /// An exchange sign-off (`subject_token_dpop`) does not name the new token's key and agent
+    /// (SR-40).
+    #[error(
+        "subject_token_dpop must name the new token's key (`child_jkt`) and agent (`child_actor`)"
+    )]
+    SignOffMismatch,
 }
 
 /// What a request must look like for a proof to be accepted ([`verify_proof`]).
@@ -137,6 +151,12 @@ pub struct VerifiedProof {
     pub iat: i64,
     /// The proof's `ath`, if it has one.
     pub ath: Option<String>,
+    /// [`SIGN_OFF_CHILD_JKT`], if the proof has it as a string: in an exchange sign-off, the
+    /// key the parent's holder agrees to bind the new token to.
+    pub child_jkt: Option<String>,
+    /// [`SIGN_OFF_CHILD_ACTOR`], if the proof has it as a string: in an exchange sign-off, the
+    /// agent the parent's holder agrees to delegate to.
+    pub child_actor: Option<String>,
 }
 
 impl VerifiedProof {
@@ -348,12 +368,14 @@ pub fn verify_proof(proof: &str, check: &ProofCheck<'_>) -> Result<VerifiedProof
     if (now - iat).abs() > check.max_age.whole_seconds() {
         return Err(DpopError::Stale);
     }
-    let ath = claims.get("ath").and_then(Value::as_str).map(str::to_owned);
+    let opt_str = |k: &str| claims.get(k).and_then(Value::as_str).map(str::to_owned);
     let proof = VerifiedProof {
         jkt,
         jti: jti.to_owned(),
         iat,
-        ath,
+        ath: opt_str("ath"),
+        child_jkt: opt_str(SIGN_OFF_CHILD_JKT),
+        child_actor: opt_str(SIGN_OFF_CHILD_ACTOR),
     };
     if let Some(token) = check.access_token {
         if !proof.covers(token) {
@@ -511,6 +533,32 @@ impl DpopKey {
             claims["ath"] = access_token_hash(token).into();
         }
         self.sign_claims(&claims)
+    }
+
+    /// The parent holder's consent to an exchange that binds the new token to another key
+    /// (`subject_token_dpop`, SR-40): a proof by this key (the subject token's) for `POST` and
+    /// the `/token` URL `url`, with `ath` of `subject_token`, that also names the new token's
+    /// key ([`SIGN_OFF_CHILD_JKT`] = `child_jkt`) and agent ([`SIGN_OFF_CHILD_ACTOR`] =
+    /// `actor`). The server accepts it only for that key and that actor, so the parent can make
+    /// it and hand it to the sub-agent without handing over its private key.
+    pub fn sign_off(
+        &self,
+        url: &str,
+        subject_token: &str,
+        child_jkt: &str,
+        actor: &str,
+        now: OffsetDateTime,
+    ) -> String {
+        let htu = url.split(['?', '#']).next().unwrap_or(url);
+        self.sign_claims(&json!({
+            "jti": uuid::Uuid::new_v4().to_string(),
+            "htm": "POST",
+            "htu": htu,
+            "iat": now.unix_timestamp(),
+            "ath": access_token_hash(subject_token),
+            SIGN_OFF_CHILD_JKT: child_jkt,
+            SIGN_OFF_CHILD_ACTOR: actor,
+        }))
     }
 
     /// Sign arbitrary proof claims with a correct DPoP header. Mostly for tests that need a
@@ -700,6 +748,21 @@ mod tests {
             verify_proof(&long, &check(None, t)),
             Err(DpopError::Malformed(_))
         ));
+    }
+
+    /// SR-40: a sign-off carries the new token's key and actor, and they come back verified.
+    #[test]
+    fn sign_off_names_the_child_key_and_actor() {
+        let (parent, child) = (DpopKey::generate().unwrap(), DpopKey::generate().unwrap());
+        let t = now();
+        let p = parent.sign_off(URL, "tok", child.thumbprint(), "coder", t);
+        let v = verify_proof(&p, &check(Some("tok"), t)).unwrap();
+        assert_eq!(v.jkt, parent.thumbprint());
+        assert_eq!(v.child_jkt.as_deref(), Some(child.thumbprint()));
+        assert_eq!(v.child_actor.as_deref(), Some("coder"));
+        // An ordinary proof names neither.
+        let v = verify_proof(&parent.proof("POST", URL, None, t), &check(None, t)).unwrap();
+        assert_eq!((v.child_jkt, v.child_actor), (None, None));
     }
 
     #[test]

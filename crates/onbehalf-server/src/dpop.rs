@@ -26,8 +26,14 @@
 //! header proof must also carry the subject token's `ath`. When it is another key (a sub-agent
 //! with its own key), the parent's holder must authorize the exchange with a second proof in
 //! the body field `subject_token_dpop`: made by the parent's key for `POST` and the `/token`
-//! URL, with `ath` of the subject token. A stolen bound token is then useless for exchange,
-//! too.
+//! URL, with `ath` of the subject token, and naming the child's key in `child_jkt` and the
+//! actor in `child_actor` (SR-40), so the parent can make it and hand it to the sub-agent
+//! without handing over its own key, and it is good for that key and that agent only. A stolen
+//! bound token is then useless for exchange, too.
+//!
+//! A proof's `jti` is recorded only once every check of the request's proofs has passed
+//! (including the key match and the sign-off's names), so proofs that are refused anyway never
+//! take a replay-cache slot (SR-41).
 //!
 //! **Errors.** 401 with `error` `dpop_required` (no proof where one is needed) or
 //! `invalid_dpop_proof` (the proof fails a check, is made by another key, or is replayed), the
@@ -57,6 +63,9 @@ use crate::error::ApiError;
 pub const DPOP_REQUIRED: &str = "dpop_required";
 /// `error` / `error_description` when a proof is present and fails.
 pub const INVALID_DPOP_PROOF: &str = "invalid_dpop_proof";
+/// `error_description` (and the proxy's `data.reason`, with HTTP 503) when the replay cache is
+/// full of live proofs.
+pub const DPOP_REPLAY_CACHE_FULL: &str = "dpop_replay_cache_full";
 
 /// Why DPoP refused a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,7 +100,7 @@ impl From<DpopFailure> for ApiError {
                 "temporarily_unavailable",
                 "too many DPoP proofs in flight; retry later",
             )
-            .with_description("dpop_replay_cache_full"),
+            .with_description(DPOP_REPLAY_CACHE_FULL),
         }
     }
 }
@@ -101,9 +110,8 @@ impl From<DpopFailure> for AuthError {
         match f {
             DpopFailure::Required(_) => AuthError::DpopRequired,
             DpopFailure::Invalid(detail) => AuthError::InvalidDpopProof(detail),
-            DpopFailure::Unavailable => {
-                AuthError::InvalidDpopProof("DPoP replay cache full; retry later".into())
-            }
+            // 503, not 401: the proof may be fine (SR-47).
+            DpopFailure::Unavailable => AuthError::Unavailable(DPOP_REPLAY_CACHE_FULL.into()),
         }
     }
 }
@@ -138,11 +146,20 @@ impl Dpop {
     }
 
     /// The URL a proof for a request to `path` must name in `htu`: `[server] public_url` plus
-    /// the path, or `http://<Host>` plus the path when no public URL is configured.
+    /// the path, or `http://<Host>` plus the path when no public URL is configured. Without a
+    /// public URL the server listens on loopback only (SR-19), and only a loopback `Host`
+    /// (`localhost`, `127.0.0.1`, `[::1]`, optional port) is taken from the request; any other
+    /// `Host` counts as `localhost`, so a proof made for another server cannot be replayed here
+    /// by sending that server's name as `Host` (SR-42).
     pub fn expected_url(&self, host: Option<&str>, path: &str) -> String {
         match &self.public_url {
             Some(base) => format!("{base}{path}"),
-            None => format!("http://{}{path}", host.unwrap_or("localhost")),
+            None => {
+                let host = host
+                    .filter(|h| crate::config::is_loopback_host(h))
+                    .unwrap_or("localhost");
+                format!("http://{host}{path}")
+            }
         }
     }
 
@@ -162,7 +179,23 @@ impl Dpop {
         access_token: Option<&str>,
         now: OffsetDateTime,
     ) -> Result<VerifiedProof, DpopFailure> {
-        let verified = verify_proof(
+        let verified = self.check(proof, method, url, access_token, now)?;
+        self.use_once(&[&verified], now)?;
+        Ok(verified)
+    }
+
+    /// [`Dpop::verify`] without using up the `jti`. A caller that has more to check about the
+    /// proof (whose key it is, what a sign-off names) calls [`Dpop::use_once`] after those
+    /// checks, so a proof that is refused anyway never takes a replay-cache slot (SR-41).
+    fn check(
+        &self,
+        proof: &str,
+        method: &str,
+        url: &str,
+        access_token: Option<&str>,
+        now: OffsetDateTime,
+    ) -> Result<VerifiedProof, DpopFailure> {
+        Ok(verify_proof(
             proof,
             &ProofCheck {
                 method,
@@ -171,13 +204,17 @@ impl Dpop {
                 now,
                 max_age: self.max_age,
             },
-        )?;
-        self.replay.use_once(
-            &verified.replay_key(),
-            verified.replay_until(self.max_age),
-            now.unix_timestamp(),
-        )?;
-        Ok(verified)
+        )?)
+    }
+
+    /// Record the `jti`s of `proofs` as used: all of them, or none when one was already used or
+    /// the cache is full.
+    fn use_once(&self, proofs: &[&VerifiedProof], now: OffsetDateTime) -> Result<(), DpopFailure> {
+        let keys: Vec<(String, i64)> = proofs
+            .iter()
+            .map(|p| (p.replay_key(), p.replay_until(self.max_age)))
+            .collect();
+        self.replay.use_all_once(&keys, now.unix_timestamp())
     }
 
     /// A presented token (proxy bearer, renewal, AuthZEN bearer): when it is bound
@@ -205,10 +242,13 @@ impl Dpop {
         let proof = proof.ok_or_else(|| {
             DpopFailure::Required("the token is bound to a key: send a DPoP proof".into())
         })?;
-        let verified = self.verify(proof, method, url, Some(token), now)?;
+        let verified = self.check(proof, method, url, Some(token), now)?;
         if verified.jkt != cnf.jkt {
+            // Checked before the `jti` is recorded: the holder of a stolen token, who can make
+            // proofs only with keys of its own, must not be able to fill the cache (SR-41).
             return Err(DpopError::KeyMismatch.into());
         }
+        self.use_once(&[&verified], now)?;
         Ok(true)
     }
 
@@ -235,13 +275,15 @@ impl Dpop {
         }
     }
 
-    /// The binding of a child token in an exchange, and whether the requester proved
-    /// possession of a bound parent's key. `header` is the request's `DPoP` header and
+    /// The binding of a child token in an exchange for `actor`, and whether the requester
+    /// proved possession of a bound parent's key. `header` is the request's `DPoP` header and
     /// `subject_proof` the body's `subject_token_dpop`; see the module docs for the rule.
+    #[allow(clippy::too_many_arguments)]
     pub fn bind_exchange(
         &self,
         parent_cnf: Option<&Confirmation>,
         subject_token: &str,
+        actor: &str,
         header: Option<&str>,
         subject_proof: Option<&str>,
         url: &str,
@@ -257,14 +299,17 @@ impl Dpop {
                     .into(),
             ));
         };
-        let child = self.verify(header, "POST", url, None, now)?;
+        let child = self.check(header, "POST", url, None, now)?;
         if child.jkt == parent.jkt {
             // One proof by the parent's key: it must cover the subject token.
             if !child.covers(subject_token) {
                 return Err(DpopError::AthMismatch.into());
             }
+            self.use_once(&[&child], now)?;
         } else {
-            // A new key for the child: the parent's holder signs off with its own proof.
+            // A new key for the child: the parent's holder signs off with its own proof, which
+            // names the child's key and agent (SR-40), so it cannot be used for another key or
+            // another agent than the one the parent agreed to.
             let proof = subject_proof.ok_or_else(|| {
                 DpopFailure::Required(
                     "binding the new token to another key than the subject token's needs \
@@ -272,10 +317,16 @@ impl Dpop {
                         .into(),
                 )
             })?;
-            let parent_proof = self.verify(proof, "POST", url, Some(subject_token), now)?;
+            let parent_proof = self.check(proof, "POST", url, Some(subject_token), now)?;
             if parent_proof.jkt != parent.jkt {
                 return Err(DpopError::KeyMismatch.into());
             }
+            if parent_proof.child_jkt.as_deref() != Some(child.jkt.as_str())
+                || parent_proof.child_actor.as_deref() != Some(actor)
+            {
+                return Err(DpopError::SignOffMismatch.into());
+            }
+            self.use_once(&[&child, &parent_proof], now)?;
         }
         Ok(Some(Confirmation::jkt(child.jkt)))
     }
@@ -324,8 +375,16 @@ impl ProofReplayCache {
         }
     }
 
+    #[cfg(test)]
     fn use_once(&self, key: &str, until: i64, now: i64) -> Result<(), DpopFailure> {
-        let digest = key_digest(key);
+        self.use_all_once(&[(key.to_owned(), until)], now)
+    }
+
+    /// Record every `(key, until)` as used, or none: a key already used (or given twice) is
+    /// [`DpopError::Replayed`], and a cache without room for all of them is
+    /// [`DpopFailure::Unavailable`].
+    fn use_all_once(&self, keys: &[(String, i64)], now: i64) -> Result<(), DpopFailure> {
+        let digests: Vec<[u8; 16]> = keys.iter().map(|(k, _)| key_digest(k)).collect();
         let mut b = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         // Drop every bucket whose entries have all expired.
         while let Some((&end, _)) = b.by_end.first_key_value() {
@@ -336,20 +395,24 @@ impl ProofReplayCache {
                 b.len -= set.len();
             }
         }
-        if b.by_end.values().any(|set| set.contains(&digest)) {
-            return Err(DpopError::Replayed.into());
+        for (i, digest) in digests.iter().enumerate() {
+            if digests[..i].contains(digest) || b.by_end.values().any(|set| set.contains(digest)) {
+                return Err(DpopError::Replayed.into());
+            }
         }
-        if b.len >= self.capacity {
+        if b.len.saturating_add(digests.len()) > self.capacity {
             tracing::error!(
                 capacity = self.capacity,
                 "DPoP replay cache full of live proofs; refusing"
             );
             return Err(DpopFailure::Unavailable);
         }
-        // The bucket ends at the first multiple of `width` after `until`.
-        let end = (until.div_euclid(self.width) + 1).saturating_mul(self.width);
-        b.by_end.entry(end).or_default().insert(digest);
-        b.len += 1;
+        for ((_, until), digest) in keys.iter().zip(digests) {
+            // The bucket ends at the first multiple of `width` after `until`.
+            let end = (until.div_euclid(self.width) + 1).saturating_mul(self.width);
+            b.by_end.entry(end).or_default().insert(digest);
+            b.len += 1;
+        }
         Ok(())
     }
 
@@ -450,8 +513,9 @@ mod tests {
         let now = t(1_000_000);
         let url = d.expected_url(None, "/token");
         let cnf = Confirmation::jkt(parent.thumbprint());
-        let bind =
-            |h: Option<&str>, s: Option<&str>| d.bind_exchange(Some(&cnf), "sub", h, s, &url, now);
+        let bind = |h: Option<&str>, s: Option<&str>| {
+            d.bind_exchange(Some(&cnf), "sub", "coder", h, s, &url, now)
+        };
         // No proof at all: the child cannot be unbound.
         assert!(matches!(bind(None, None), Err(DpopFailure::Required(_))));
         // Parent key, but without `ath` of the subject token.
@@ -469,29 +533,90 @@ mod tests {
             bind(Some(&new_key), None),
             Err(DpopFailure::Required(_))
         ));
-        let forged = child.proof("POST", &url, Some("sub"), now);
+        let forged = child.sign_off(&url, "sub", child.thumbprint(), "coder", now);
         let new_key = child.proof("POST", &url, None, now);
         assert_eq!(
             bind(Some(&new_key), Some(&forged)),
             Err(DpopError::KeyMismatch.into())
         );
-        let sign_off = parent.proof("POST", &url, Some("sub"), now);
-        let new_key = child.proof("POST", &url, None, now);
+        // SR-40: the sign-off must name this child's key and this actor. A plain proof by the
+        // parent's key, or a sign-off for another key or another agent, is refused; none of
+        // the refused attempts uses up the child's header proof (SR-41).
+        let other = DpopKey::generate().unwrap();
+        for wrong in [
+            parent.proof("POST", &url, Some("sub"), now),
+            parent.sign_off(&url, "sub", other.thumbprint(), "coder", now),
+            parent.sign_off(&url, "sub", child.thumbprint(), "reviewer", now),
+        ] {
+            assert_eq!(
+                bind(Some(&new_key), Some(&wrong)),
+                Err(DpopError::SignOffMismatch.into())
+            );
+        }
+        let sign_off = parent.sign_off(&url, "sub", child.thumbprint(), "coder", now);
         assert_eq!(
             bind(Some(&new_key), Some(&sign_off)),
             Ok(Some(Confirmation::jkt(child.thumbprint())))
+        );
+        // Both proofs are now used.
+        let fresh = child.proof("POST", &url, None, now);
+        assert_eq!(
+            bind(Some(&fresh), Some(&sign_off)),
+            Err(DpopError::Replayed.into())
         );
         // `off` and an unbound parent: no binding; `required`: a proof is needed.
         let off = Dpop::new(DpopMode::Off, 300, 100, None);
         let p = child.proof("POST", &url, None, now);
         assert_eq!(
-            off.bind_exchange(None, "sub", Some(&p), None, &url, now),
+            off.bind_exchange(None, "sub", "coder", Some(&p), None, &url, now),
             Ok(None)
         );
         let strict = Dpop::new(DpopMode::Required, 300, 100, None);
         assert!(matches!(
-            strict.bind_exchange(None, "sub", None, None, &url, now),
+            strict.bind_exchange(None, "sub", "coder", None, None, &url, now),
             Err(DpopFailure::Required(_))
         ));
+    }
+
+    /// SR-41: proofs by the wrong key never reach the replay cache, so a stolen bound token
+    /// cannot be used to fill it and lock out the key's holder.
+    #[test]
+    fn wrong_key_proofs_do_not_fill_the_replay_cache() {
+        let d = Dpop::new(DpopMode::Optional, 300, 1, None);
+        let (key, thief) = (DpopKey::generate().unwrap(), DpopKey::generate().unwrap());
+        let now = t(1_000_000);
+        let url = d.expected_url(None, "/mcp/github");
+        let cnf = Confirmation::jkt(key.thumbprint());
+        for _ in 0..5 {
+            let p = thief.proof("POST", &url, Some("tok"), now);
+            assert_eq!(
+                d.check_presented(Some(&cnf), "tok", Some(&p), "POST", &url, now),
+                Err(DpopError::KeyMismatch.into())
+            );
+        }
+        assert_eq!(d.replay.len(), 0);
+        let p = key.proof("POST", &url, Some("tok"), now);
+        assert_eq!(
+            d.check_presented(Some(&cnf), "tok", Some(&p), "POST", &url, now),
+            Ok(true)
+        );
+    }
+
+    /// SR-42: without `public_url`, only a loopback `Host` goes into the expected `htu`.
+    #[test]
+    fn htu_takes_only_a_loopback_host() {
+        let d = Dpop::new(DpopMode::Optional, 300, 10, None);
+        for host in ["127.0.0.1:8080", "localhost", "[::1]:9"] {
+            assert_eq!(
+                d.expected_url(Some(host), "/token"),
+                format!("http://{host}/token")
+            );
+        }
+        for host in ["evil.example", "onbehalf.example.com:443", "127.0.0.1.evil"] {
+            assert_eq!(
+                d.expected_url(Some(host), "/token"),
+                "http://localhost/token"
+            );
+        }
     }
 }

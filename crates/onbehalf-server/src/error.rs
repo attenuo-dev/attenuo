@@ -23,6 +23,9 @@ pub fn is_expiry(e: &onbehalf_token::TokenError) -> bool {
     )
 }
 
+/// `detail` of every 500: the cause is in the server log only (SR-43).
+pub const INTERNAL_DETAIL: &str = "internal error; the details are in the server log";
+
 /// An error a handler returns. `code` is short and machine-readable; `detail` is for humans.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiError {
@@ -77,11 +80,16 @@ impl ApiError {
         Self::unauthorized(reason, e)
     }
 
-    pub fn internal(detail: impl std::fmt::Display) -> Self {
+    /// A 500. `internal` (a storage error, which can name a database file and its state; a
+    /// path that could not be read) is logged and never returned: the body says
+    /// [`INTERNAL_DETAIL`] (SR-43, completing SR-17).
+    pub fn internal(internal: impl std::fmt::Display) -> Self {
+        // Debug-formatted: the text can quote the request (SR-18).
+        tracing::error!(detail = ?internal.to_string(), "internal error");
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "server_error",
-            detail.to_string(),
+            INTERNAL_DETAIL,
         )
     }
 }
@@ -172,5 +180,29 @@ impl From<onbehalf_token::TokenError> for ApiError {
             _ => "invalid_grant",
         };
         ApiError::bad_request(code, e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SR-43: a storage error (here as `AuditError` would carry it) never reaches the body.
+    #[tokio::test]
+    async fn internal_errors_keep_their_detail_in_the_log() {
+        let e: ApiError = onbehalf_audit::AuditError::Storage(
+            "unable to open /var/lib/onbehalf/audit.sqlite: disk I/O error".into(),
+        )
+        .into();
+        assert_eq!(e.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(e.detail, INTERNAL_DETAIL);
+        let body = axum::body::to_bytes(e.into_response().into_body(), 4096)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            !text.contains("/var/lib") && !text.contains("disk I/O"),
+            "{text}"
+        );
     }
 }

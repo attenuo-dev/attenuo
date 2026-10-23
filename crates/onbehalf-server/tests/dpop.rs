@@ -256,7 +256,7 @@ async fn bound_chain_end_to_end_through_the_proxy_sr24() {
             &root,
             "coder",
             Some(proof(&coder_key, &token_url, None)),
-            Some(proof(&planner_key, &token_url, Some(&root))),
+            Some(planner_key.sign_off(&token_url, &root, coder_key.thumbprint(), "coder", now())),
         )
         .await,
     )
@@ -452,13 +452,24 @@ async fn child_of_bound_parent_must_be_bound_sr24() {
         )
         .await;
     assert_eq!(refusal(resp).await.1, "invalid_dpop_proof");
+    // A plain proof by the parent's key is not a sign-off: it names no key and no agent
+    // (SR-40).
+    let resp = s
+        .exchange(
+            &root,
+            "coder",
+            Some(proof(&child_key, &url, None)),
+            Some(proof(&parent_key, &url, Some(&root))),
+        )
+        .await;
+    assert_eq!(refusal(resp).await.1, "invalid_dpop_proof");
     // Done right, the child is bound to the child's key, and only that key can use it.
     let child = bound_token(
         s.exchange(
             &root,
             "coder",
             Some(proof(&child_key, &url, None)),
-            Some(proof(&parent_key, &url, Some(&root))),
+            Some(parent_key.sign_off(&url, &root, child_key.thumbprint(), "coder", now())),
         )
         .await,
     )

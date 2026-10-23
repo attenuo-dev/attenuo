@@ -218,6 +218,21 @@ async fn authenticate(
 /// (wrong audience, unknown `kid`, ...) goes to the debug log, never to the client (SR-17).
 fn unauthorized(err: AuthError) -> Response {
     let reason = err.reason();
+    if let AuthError::Unavailable(_) = &err {
+        // A server-side limit, not a bad credential: 503, so the client keeps its token and
+        // key and retries (SR-47).
+        tracing::warn!(reason = ?reason, "request refused: temporarily unavailable");
+        let body = error_response(
+            Value::Null,
+            CODE_UNAVAILABLE,
+            format!("onbehalf: temporarily unavailable: {reason}"),
+            Some(serde_json::json!({ "reason": reason })),
+        );
+        let mut resp = json_response(StatusCode::SERVICE_UNAVAILABLE, &body);
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+        return resp;
+    }
     tracing::warn!(reason = ?reason, "request rejected: unauthenticated");
     // The detail can carry attacker-chosen text (an unknown `kid`): Debug-format it (SR-18).
     tracing::debug!(error = ?err.to_string(), "authentication failure detail");

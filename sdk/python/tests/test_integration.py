@@ -330,14 +330,28 @@ def test_dpop_bound_chain(stack: Stack) -> None:
     )
     assert root.dpop_jkt == assistant_key.thumbprint
 
-    # The coder binds its token to its own key; the assistant's key signs off on the exchange.
+    # The coder binds its token to its own key. The assistant signs off on this delegation
+    # (to the coder's key and agent id) without handing over its own key (SR-40).
+    sign_off = assistant_key.sign_off(f"{stack.url}/token", root.jwt, coder_key.thumbprint, "coder")
     with Client(stack.url, dpop_key=coder_key.private_jwk()) as coder_ob:
+        # A sign-off for another agent is no good.
+        with pytest.raises(ApiError) as other_agent:
+            coder_ob.exchange(
+                root,
+                "coder",
+                ["github:read_file"],
+                client_secret=CODER_SECRET,
+                subject_token_dpop=assistant_key.sign_off(
+                    f"{stack.url}/token", root.jwt, coder_key.thumbprint, "tester"
+                ),
+            )
+        assert other_agent.value.status == 401
         coder = coder_ob.exchange(
             root,
             "coder",
             ["github:read_file"],
             client_secret=CODER_SECRET,
-            subject_dpop_key=assistant_key,
+            subject_token_dpop=sign_off,
         )
         assert coder.dpop_jkt == coder_key.thumbprint
         res = coder_ob.call_tool(coder, "github", "read_file", {"repo": "alice/public-docs"})

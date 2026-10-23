@@ -227,6 +227,11 @@ fn exchange_sync(
         .pipeline
         .check_leases(&parent.chain, now)
         .map_err(|(reason, detail)| {
+            if reason == crate::authz::REASON_LEASE_ERROR {
+                // The detail is the lease store's error text: logged by `internal`, not returned
+                // (SR-43). A storage failure is the server's, not the grant's.
+                return ApiError::internal(format!("lease check failed: {}", detail.join("; ")));
+            }
             ApiError::bad_request(
                 "invalid_grant",
                 format!(
@@ -236,6 +241,15 @@ fn exchange_sync(
             )
         })?;
 
+    if req.actor.0 == super::AUDIT_SERVER {
+        // The agent id `onbehalf` is reserved for the server's own audit records (SR-34). The
+        // config check covers `[[agents]]`, but an exchange without actor authentication, or
+        // an `[[actor_trust]]` mapping, can still name it (SR-45).
+        return Err(clientauth::invalid_request(
+            "reserved_agent",
+            "agent id `onbehalf` is reserved for the server's own records",
+        ));
+    }
     if parent.chain.hops.iter().any(|h| h.agent == req.actor) {
         return Err(clientauth::invalid_request(
             "duplicate_actor",
@@ -267,6 +281,7 @@ fn exchange_sync(
     let cnf = state.dpop.bind_exchange(
         parent.claims.cnf.as_ref(),
         &req.subject_token,
+        &req.actor.0,
         crate::dpop::header_proof(headers)?,
         subject_proof.as_deref(),
         &state.dpop.expected_url_for(headers, "/token"),
@@ -274,21 +289,21 @@ fn exchange_sync(
     )?;
     let dpop_bound = cnf.is_some();
     let resp = req.execute_with(&state.issuer, now, not_after, cnf)?;
-    // An actor token authenticates one exchange (see `crate::replay`), keyed by its `jti`.
-    if let Some((verified, token)) = &actor {
-        state
-            .replay
-            .use_once(&verified.replay_key(token), verified.replay_until(), now)?;
-    }
-    // A parent token delegates to a given actor once (see `crate::replay`). Recorded only once
-    // the exchange has succeeded, so a refused request (say `invalid_scope`) does not use up
-    // the slot. If this refuses, the token just minted is dropped before its lease is
+    // A parent token delegates to a given actor once, and an actor token authenticates one
+    // exchange, keyed by its `jti` (see `crate::replay`). Recorded only once the exchange has
+    // succeeded, so a refused request (say `invalid_scope`) does not use up the slot, and
+    // together, so a request refused as a replay of one does not use up the other (SR-44), as
+    // at hop 0. If this refuses, the token just minted is dropped before its lease is
     // registered, so it could not be used anyway.
-    state.replay.use_once(
-        &format!("exchange\n{}\n{}", parent.claims.jti, req.actor.0),
-        parent.claims.exp,
-        now,
-    )?;
+    let exchange_key = format!("exchange\n{}\n{}", parent.claims.jti, req.actor.0);
+    let actor_key = actor
+        .as_ref()
+        .map(|(verified, token)| (verified.replay_key(token), verified.replay_until()));
+    let mut keys = vec![(exchange_key.as_str(), parent.claims.exp)];
+    if let Some((key, until)) = &actor_key {
+        keys.push((key.as_str(), *until));
+    }
+    state.replay.use_all_once(&keys, now)?;
     // The response carries no chain; read it back from the token we just minted.
     let issued = state.verifier.verify(&resp.access_token, now)?;
     let hop = issued

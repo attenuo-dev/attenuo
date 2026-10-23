@@ -138,10 +138,16 @@ export interface ExchangeOptions {
   /** RFC 8693 §4.4 `may_act` for the new token: the agents allowed to exchange it next. */
   mayAct?: readonly string[];
   /**
-   * The key `subjectToken` is bound to (DPoP), when the new token is bound to another key: its
-   * proof, sent as `subject_token_dpop`, is the parent holder's consent.
+   * The key `subjectToken` is bound to (DPoP), when the new token is bound to another key and
+   * this process holds both keys: the sign-off (see `DpopKey.signOff`) is made here.
    */
   subjectDpopKey?: DpopKeyLike;
+  /**
+   * A ready-made `subject_token_dpop` sign-off from the parent's holder (`DpopKey.signOff`),
+   * naming this client's key and `actor`. Use it instead of `subjectDpopKey` so the parent's key
+   * never leaves the parent's process.
+   */
+  subjectTokenDpop?: string;
 }
 
 export function exchangeBody(

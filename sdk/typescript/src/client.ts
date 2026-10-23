@@ -5,6 +5,7 @@
 
 import type { CapabilityLike } from "./capability.js";
 import { DpopKey, exchangeProofs, presented, type DpopKeyLike } from "./dpop.js";
+import { OnbehalfError } from "./errors.js";
 import { Http, type HttpOptions } from "./http.js";
 import { bearer, decodeToken, verifyToken, type Jwks, type Token } from "./token.js";
 import { mcpHeaders } from "./mcp.js";
@@ -79,8 +80,11 @@ export class OnbehalfClient {
    * `mayAct` lists the agents allowed to exchange the new token next (RFC 8693 §4.4).
    *
    * With a `dpopKey` on the client, the new token is bound to it. When `subjectToken` is bound to
-   * another key, pass that key as `subjectDpopKey`: its proof tells the server the parent's holder
-   * agrees (a child of a bound token is always bound).
+   * another key, the parent's holder must sign off on this delegation (a child of a bound token is
+   * always bound): it makes `DpopKey.signOff(tokenUrl, subjectToken, childJkt, actor)` with its
+   * key and hands the result to the sub-agent, which passes it as `subjectTokenDpop`. The sign-off
+   * names the new token's key and agent, so it is good for this delegation only. When one process
+   * holds both keys, pass the parent's key as `subjectDpopKey` instead.
    *
    * Throws `ApiError` (`invalid_scope`, `invalid_grant`, ...) on refusal.
    */
@@ -90,14 +94,19 @@ export class OnbehalfClient {
     capabilities: CapabilityLike | readonly CapabilityLike[],
     opts: w.ExchangeOptions = {},
   ): Promise<Token> {
+    if (opts.subjectDpopKey !== undefined && opts.subjectTokenDpop !== undefined) {
+      throw new OnbehalfError("pass subjectDpopKey or subjectTokenDpop, not both");
+    }
     const body = w.exchangeBody(subjectToken, actor, capabilities, opts);
     const { header, signOff } = await exchangeProofs(
       `${this.serverUrl}/token`,
       String(body.subject_token),
       await this.dpopKey(),
       await DpopKey.of(opts.subjectDpopKey),
+      actor,
     );
-    if (signOff !== undefined) body.subject_token_dpop = signOff;
+    const given = signOff ?? opts.subjectTokenDpop;
+    if (given !== undefined) body.subject_token_dpop = given;
     const headers: Record<string, string> = header === undefined ? {} : { dpop: header };
     return w.tokenFromResponse(
       await w.jsonBody(await this.http.post("/token", { json: body, headers })),

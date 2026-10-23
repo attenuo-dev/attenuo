@@ -294,11 +294,23 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
     });
     expect(root.dpopJkt).toBe(assistantKey.thumbprint);
 
-    // The coder binds its token to its own key; the assistant's key signs off on the exchange.
+    // The coder binds its token to its own key. The assistant signs off on this delegation (to
+    // the coder's key and agent id) without handing over its own key (SR-40).
     const ob = new OnbehalfClient(url, { dpopKey: coderKey.privateJwk() });
+    const signOff = (agent: string) =>
+      assistantKey.signOff(`${url}/token`, root.jwt, coderKey.thumbprint, agent);
+    // A sign-off for another agent is no good.
+    const refused = await ob
+      .exchange(root, "coder", [capability("github", "read_file")], {
+        clientSecret: CODER_SECRET,
+        subjectTokenDpop: await signOff("tester"),
+      })
+      .catch((e: unknown) => e);
+    expect(refused).toBeInstanceOf(ApiError);
+    expect((refused as ApiError).status).toBe(401);
     const coder = await ob.exchange(root, "coder", [capability("github", "read_file")], {
       clientSecret: CODER_SECRET,
-      subjectDpopKey: assistantKey,
+      subjectTokenDpop: await signOff("coder"),
     });
     expect(coder.dpopJkt).toBe(coderKey.thumbprint);
     const ok = await ob.callTool(coder, "github", "read_file", { repo: "alice/public-docs" });

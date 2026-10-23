@@ -60,6 +60,7 @@ impl StreamGuard {
             Ok(()) => Ok(()),
             Err(AuthError::LeaseInactive(reason)) => Err(reason),
             Err(AuthError::TokenExpired) => Err(REASON_TOKEN_EXPIRED.to_owned()),
+            Err(AuthError::Unavailable(reason)) => Err(reason),
             Err(
                 AuthError::MissingToken
                 | AuthError::InvalidToken(_)

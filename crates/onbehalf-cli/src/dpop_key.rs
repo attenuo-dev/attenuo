@@ -59,16 +59,21 @@ pub fn token_jkt(token: &str) -> Option<String> {
 }
 
 /// The `DPoP` header and the `subject_token_dpop` sign-off of an exchange of `subject` at
-/// `url`. `key` binds the new token; `subject_key` is the parent's key when it differs.
+/// `url` for `actor`. `key` binds the new token; `subject_key` is the parent's key when it
+/// differs; `sign_off_given` says that a sign-off made elsewhere (`onbehalf token sign-off`)
+/// goes in the body instead.
 ///
 /// - The header proof covers the subject token (`ath`) when `key` is the one the subject token
 ///   is bound to.
-/// - A bound subject token with another `key` needs `subject_key`, which must be its key.
+/// - A bound subject token with another `key` needs a sign-off by its key, naming `key` and
+///   `actor` (SR-40): made here from `subject_key`, or given.
 pub fn exchange_proofs(
     url: &str,
     subject: &str,
+    actor: &str,
     key: Option<&Path>,
     subject_key: Option<&Path>,
+    sign_off_given: bool,
 ) -> Result<(Option<String>, Option<String>)> {
     let now = OffsetDateTime::now_utc();
     let key = load_opt(key)?;
@@ -80,23 +85,49 @@ pub fn exchange_proofs(
         k.proof("POST", url, ath, now)
     });
     let sign_off = match (&parent_jkt, &key, &subject_key) {
-        (_, _, Some(sk)) => {
+        (_, None, Some(_)) => bail!(
+            "--subject-dpop-key signs off on binding the new token to another key: pass that \
+             key as --dpop-key"
+        ),
+        (_, Some(k), Some(sk)) => {
             if parent_jkt.is_some() && !same(sk) {
                 bail!("--subject-dpop-key is not the key the subject token is bound to");
             }
-            Some(sk.proof("POST", url, Some(subject), now))
+            Some(sk.sign_off(url, subject, k.thumbprint(), actor, now))
         }
         (Some(_), None, None) => bail!(
             "the subject token is bound to a DPoP key: pass --dpop-key (and \
-             --subject-dpop-key when the new token gets another key)"
+             --subject-dpop-key or --subject-token-dpop-file when the new token gets another \
+             key)"
         ),
-        (Some(_), Some(k), None) if !same(k) => bail!(
-            "--dpop-key is not the key the subject token is bound to: pass the parent's key as \
-             --subject-dpop-key"
+        (Some(_), Some(k), None) if !same(k) && !sign_off_given => bail!(
+            "--dpop-key is not the key the subject token is bound to: pass the parent's \
+             sign-off with --subject-token-dpop-file (made by `onbehalf token sign-off`), or the \
+             parent's key as --subject-dpop-key"
         ),
         _ => None,
     };
     Ok((header, sign_off))
+}
+
+/// `onbehalf token sign-off`: the parent holder's consent (`subject_token_dpop`) to an
+/// exchange of `subject` at `url` that binds the new token to the key `child_jkt` and gives it
+/// to `actor`, made with the parent's key at `key` (SR-40).
+pub fn sign_off(
+    url: &str,
+    subject: &str,
+    key: &Path,
+    child_jkt: &str,
+    actor: &str,
+) -> Result<String> {
+    let key = load(key)?;
+    if token_jkt(subject).is_some_and(|jkt| jkt != key.thumbprint()) {
+        bail!("--dpop-key is not the key the subject token is bound to");
+    }
+    if !onbehalf_token::Confirmation::jkt(child_jkt).is_well_formed() {
+        bail!("--child-jkt must be a key thumbprint (43 base64url characters, as `onbehalf key gen --dpop` prints)");
+    }
+    Ok(key.sign_off(url, subject, child_jkt, actor, OffsetDateTime::now_utc()))
 }
 
 #[cfg(test)]
@@ -135,7 +166,7 @@ mod tests {
     fn exchange_proofs_follow_the_binding_rule() {
         let dir = tempfile::tempdir().unwrap();
         let (a, b) = (dir.path().join("a"), dir.path().join("b"));
-        let (ka, _kb) = (generate(&a).unwrap(), generate(&b).unwrap());
+        let (ka, kb) = (generate(&a).unwrap(), generate(&b).unwrap());
         let url = "http://127.0.0.1:8080/token";
         let bound = fake_token(Some(ka.thumbprint()));
         let unbound = fake_token(None);
@@ -152,24 +183,37 @@ mod tests {
             )
             .unwrap()
         };
+        let proofs = |token: &str, key, subject_key, given| {
+            exchange_proofs(url, token, "coder", key, subject_key, given)
+        };
         // Same key: one proof, covering the parent.
-        let (h, s) = exchange_proofs(url, &bound, Some(&a), None).unwrap();
+        let (h, s) = proofs(&bound, Some(&a), None, false).unwrap();
         check(&h.unwrap(), Some(&bound));
         assert!(s.is_none());
-        // New key: the parent's key signs off.
-        let (h, s) = exchange_proofs(url, &bound, Some(&b), Some(&a)).unwrap();
+        // New key: the parent's key signs off, naming the new key and the actor (SR-40).
+        let (h, s) = proofs(&bound, Some(&b), Some(&a), false).unwrap();
         check(&h.unwrap(), None);
-        check(&s.unwrap(), Some(&bound));
-        // Missing or wrong keys fail before any request.
-        assert!(exchange_proofs(url, &bound, None, None).is_err());
-        assert!(exchange_proofs(url, &bound, Some(&b), None).is_err());
-        assert!(exchange_proofs(url, &bound, Some(&b), Some(&b)).is_err());
-        // An unbound parent: the key only binds the child.
-        let (h, s) = exchange_proofs(url, &unbound, Some(&b), None).unwrap();
+        let s = check(&s.unwrap(), Some(&bound));
+        assert_eq!(s.child_jkt.as_deref(), Some(kb.thumbprint()));
+        assert_eq!(s.child_actor.as_deref(), Some("coder"));
+        // ... or the sign-off was made elsewhere.
+        let (h, s) = proofs(&bound, Some(&b), None, true).unwrap();
         assert!(h.is_some() && s.is_none());
+        let made = sign_off(url, &bound, &a, kb.thumbprint(), "coder").unwrap();
         assert_eq!(
-            exchange_proofs(url, &unbound, None, None).unwrap(),
-            (None, None)
+            check(&made, Some(&bound)).child_jkt.as_deref(),
+            Some(kb.thumbprint())
         );
+        assert!(sign_off(url, &bound, &b, kb.thumbprint(), "coder").is_err());
+        assert!(sign_off(url, &bound, &a, "short", "coder").is_err());
+        // Missing or wrong keys fail before any request.
+        assert!(proofs(&bound, None, None, false).is_err());
+        assert!(proofs(&bound, Some(&b), None, false).is_err());
+        assert!(proofs(&bound, Some(&b), Some(&b), false).is_err());
+        assert!(proofs(&bound, None, Some(&a), false).is_err());
+        // An unbound parent: the key only binds the child.
+        let (h, s) = proofs(&unbound, Some(&b), None, false).unwrap();
+        assert!(h.is_some() && s.is_none());
+        assert_eq!(proofs(&unbound, None, None, false).unwrap(), (None, None));
     }
 }
