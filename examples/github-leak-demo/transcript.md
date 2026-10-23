@@ -30,8 +30,9 @@ token       eyJ0eXAiOiJvbmJlaGFsZitq...
 
 == 2. The assistant hands its 'coder' sub-agent read_file and nothing else
 # The coder authenticates as itself ([[agents]] in config.toml): only it can receive a token in its name.
-# Its secret goes in on stdin (or ONBEHALF_CLIENT_SECRET, or --client-secret-file), never in argv.
-$ printf "%s\n" demo-coder-secret | onbehalf token exchange --subject-token "$ROOT_TOKEN" --actor coder --client-secret-stdin --cap github:read_file
+# Its secret goes in on stdin (or ONBEHALF_CLIENT_SECRET, or --client-secret-file), never in argv;
+# so do the tokens (ONBEHALF_TOKEN, --token-file or --token -).
+$ printf "%s\n" demo-coder-secret | ONBEHALF_TOKEN="$ROOT_TOKEN" onbehalf token exchange --actor coder --client-secret-stdin --cap github:read_file
 lease       67d6e0f2-c38b-4f87-a035-c472cfe453ac
 expires_in  899s
 token       eyJ0eXAiOiJvbmJlaGFsZitq...
@@ -54,18 +55,18 @@ exp 2026-10-23T01:58:42Z (in 14m 59s)
 verified: signature, type, issuer, audience, expiry, chain
 
 == 4. The coder reads a public repo as intended: allowed
-$ onbehalf call --token "$CODER" --server github --tool read_file --arg repo=alice/public-docs --arg path=README.md
+$ ONBEHALF_TOKEN="$CODER" onbehalf call --server github --tool read_file --arg repo=alice/public-docs --arg path=README.md
 ALLOWED
 {"arguments":{"path":"README.md","repo":"alice/public-docs"},"name":"read_file"}
 
 == 5. A malicious issue tells the coder to read alice/private-salaries: denied by policy
 # read_file is in the token, but the policy only lets it touch alice/public-*.
-$ onbehalf call --token "$CODER" --server github --tool read_file --arg repo=alice/private-salaries --arg path=2025.csv
+$ ONBEHALF_TOKEN="$CODER" onbehalf call --server github --tool read_file --arg repo=alice/private-salaries --arg path=2025.csv
 DENIED  policy_deny
 decision 369bac7f-b84b-4420-89d5-8056e22939a5
 
 == 6. The injection tries to copy the data out through create_issue: denied, never delegated
-$ onbehalf call --token "$CODER" --server github --tool create_issue --arg repo=alice/public-docs --arg title=leak
+$ ONBEHALF_TOKEN="$CODER" onbehalf call --server github --tool create_issue --arg repo=alice/public-docs --arg title=leak
 DENIED  capability_denied
 decision d0e9fc25-8a84-48bf-93e2-bb0e654b7ccb
 
@@ -80,19 +81,19 @@ expires  2026-10-23T01:48:42.103377339Z
 revoked  2026-10-23T01:43:42.169715443Z (agent session compromised)
 
 == 8. The coder's next call, even the legitimate one, is denied: the revocation cascaded
-$ onbehalf call --token "$CODER" --server github --tool read_file --arg repo=alice/public-docs --arg path=README.md
+$ ONBEHALF_TOKEN="$CODER" onbehalf call --server github --tool read_file --arg repo=alice/public-docs --arg path=README.md
 DENIED  lease_revoked
 decision abe9f8f9-0724-4784-9172-6745c6e628f9
 
 == 9. The audit log records every decision, and its hash chain checks out
 $ onbehalf audit tail -n 10
 #1    2026-10-23T01:43:42.086457142Z  ALLOW onbehalf/token.root  assistant for alice  reason=token_issued  id=328cd90a-3c21-429c-a3f9-2839bef596a6
-#2    2026-10-23T01:43:42.086457142Z  ALLOW onbehalf/admin.root_token  by admin  reason=admin_action  id=6b39d9c2-f720-4e07-9d63-2f228c7092a8
+#2    2026-10-23T01:43:42.086457142Z  ALLOW onbehalf/admin.root_token  by urn:onbehalf:admin  reason=admin_action  id=6b39d9c2-f720-4e07-9d63-2f228c7092a8
 #3    2026-10-23T01:43:42.103377339Z  ALLOW onbehalf/token.exchange  assistant > coder for alice  reason=token_issued  id=5f052355-f77f-4a16-b0e6-0cd476e2a94f
 #4    2026-10-23T01:43:42.133457841Z  ALLOW github/read_file  assistant > coder for alice  reason=policy_allow  id=31dbb4f9-d31e-486d-a703-44836e9e858e
 #5    2026-10-23T01:43:42.148994973Z  DENY  github/read_file  assistant > coder for alice  reason=policy_deny  id=369bac7f-b84b-4420-89d5-8056e22939a5
 #6    2026-10-23T01:43:42.160063945Z  DENY  github/create_issue  assistant > coder for alice  reason=capability_denied  id=d0e9fc25-8a84-48bf-93e2-bb0e654b7ccb
-#7    2026-10-23T01:43:42.169715443Z  ALLOW onbehalf/admin.lease.revoke  by admin  reason=admin_action  id=26a60386-a01e-436c-901f-156b9a336a30
+#7    2026-10-23T01:43:42.169715443Z  ALLOW onbehalf/admin.lease.revoke  by urn:onbehalf:admin  reason=admin_action  id=26a60386-a01e-436c-901f-156b9a336a30
 #8    2026-10-23T01:43:42.186751983Z  DENY  github/read_file  assistant > coder for alice  reason=lease_revoked  id=abe9f8f9-0724-4784-9172-6745c6e628f9
 $ onbehalf audit verify
 audit chain OK: 8 entries verified

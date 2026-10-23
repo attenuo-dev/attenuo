@@ -18,16 +18,13 @@ pub struct Cli {
     #[arg(long, visible_alias = "url", env = "ONBEHALF_SERVER", default_value = DEFAULT_SERVER)]
     pub server: String,
 
-    /// Bearer token for `/admin/*` (token root, lease, audit, policy).
+    /// Bearer token for `/admin/*` (token root, lease, audit, policy). Without this flag,
+    /// `--admin-token-stdin` or `--admin-token-file`, the `ONBEHALF_ADMIN_TOKEN` environment
+    /// variable is used.
     ///
     /// Prefer `ONBEHALF_ADMIN_TOKEN`, `--admin-token-stdin` or `--admin-token-file`: an argument
     /// is visible to other local users in `ps` and ends up in shell history.
-    #[arg(
-        long,
-        env = "ONBEHALF_ADMIN_TOKEN",
-        hide_env_values = true,
-        conflicts_with_all = ["admin_token_stdin", "admin_token_file"]
-    )]
+    #[arg(long, conflicts_with_all = ["admin_token_stdin", "admin_token_file"])]
     pub admin_token: Option<String>,
 
     /// Read the admin token from the first line of standard input.
@@ -169,9 +166,14 @@ fn split_agents(values: &[String]) -> Vec<String> {
 
 #[derive(Debug, Args)]
 pub struct ExchangeArgs {
-    /// The parent token.
-    #[arg(long, env = "ONBEHALF_TOKEN", hide_env_values = true)]
-    pub subject_token: String,
+    /// The parent token, or `-` to read it from the first line of stdin. Without this flag or
+    /// `--subject-token-file`, the `ONBEHALF_TOKEN` environment variable is used. Prefer those:
+    /// an argument is visible to other local users in `ps`.
+    #[arg(long, conflicts_with = "subject_token_file")]
+    pub subject_token: Option<String>,
+    /// Read the parent token from the first line of this file.
+    #[arg(long, value_name = "PATH")]
+    pub subject_token_file: Option<std::path::PathBuf>,
     /// The sub-agent that will hold the new token. The request authenticates as this agent.
     #[arg(long)]
     pub actor: String,
@@ -180,14 +182,10 @@ pub struct ExchangeArgs {
     #[arg(long)]
     pub client_id: Option<String>,
     /// The agent's client secret. Required by servers with `[token] require_actor_auth`
-    /// (the default). Prefer `ONBEHALF_CLIENT_SECRET`, `--client-secret-stdin` or
-    /// `--client-secret-file`: an argument is visible to other local users in `ps`.
-    #[arg(
-        long,
-        env = "ONBEHALF_CLIENT_SECRET",
-        hide_env_values = true,
-        conflicts_with_all = ["client_secret_stdin", "client_secret_file"]
-    )]
+    /// (the default). Without this flag, `--client-secret-stdin` or `--client-secret-file`,
+    /// the `ONBEHALF_CLIENT_SECRET` environment variable is used. Prefer those: an argument is
+    /// visible to other local users in `ps`.
+    #[arg(long, conflicts_with_all = ["client_secret_stdin", "client_secret_file"])]
     pub client_secret: Option<String>,
     /// Read the client secret from the first line of standard input.
     #[arg(long, conflicts_with = "client_secret_file")]
@@ -267,11 +265,24 @@ pub struct InspectArgs {
     pub audience: Option<String>,
 }
 
+/// `--token` / `--token-file`: where the delegation token of `call`, `tools` and
+/// `authzen eval` comes from.
+#[derive(Debug, Args)]
+pub struct TokenSource {
+    /// Delegation token, or `-` to read it from the first line of stdin. Without this flag or
+    /// `--token-file`, the `ONBEHALF_TOKEN` environment variable is used. Prefer those: an
+    /// argument is visible to other local users in `ps`.
+    #[arg(long, conflicts_with = "token_file")]
+    pub token: Option<String>,
+    /// Read the delegation token from the first line of this file.
+    #[arg(long, value_name = "PATH")]
+    pub token_file: Option<std::path::PathBuf>,
+}
+
 #[derive(Debug, Args)]
 pub struct CallArgs {
-    /// Delegation token.
-    #[arg(long, env = "ONBEHALF_TOKEN", hide_env_values = true)]
-    pub token: String,
+    #[command(flatten)]
+    pub token: TokenSource,
     /// MCP upstream name, as mounted at `/mcp/<name>`.
     #[arg(long, alias = "upstream")]
     pub server: String,
@@ -285,9 +296,8 @@ pub struct CallArgs {
 
 #[derive(Debug, Args)]
 pub struct ToolsArgs {
-    /// Delegation token.
-    #[arg(long, env = "ONBEHALF_TOKEN", hide_env_values = true)]
-    pub token: String,
+    #[command(flatten)]
+    pub token: TokenSource,
     /// MCP upstream name.
     #[arg(long, alias = "upstream")]
     pub server: String,
@@ -387,9 +397,9 @@ pub enum PolicyCmd {
 pub enum AuthzenCmd {
     /// Ask the PDP whether the token's chain may make this call, without making it.
     Eval {
-        /// Delegation token, sent as the bearer.
-        #[arg(long, env = "ONBEHALF_TOKEN", hide_env_values = true)]
-        token: String,
+        /// The delegation token, sent as the bearer.
+        #[command(flatten)]
+        token: TokenSource,
         /// MCP server name.
         #[arg(long, default_value = "github")]
         server: String,
@@ -631,6 +641,49 @@ mod tests {
             a.extend_from_slice(extra);
             assert!(parse(&a).is_err(), "{extra:?}");
         }
+    }
+
+    /// SR-35: `--token` and `--subject-token` take `-` for stdin and have `--…-file` forms, which
+    /// are mutually exclusive with the flag; with neither, `ONBEHALF_TOKEN` is read at run time
+    /// (not by clap, so the environment never conflicts with a file flag).
+    #[test]
+    fn delegation_tokens_from_stdin_or_a_file() {
+        let call = |extra: &[&str]| {
+            let mut a = vec!["call", "--server", "github", "--tool", "t"];
+            a.extend_from_slice(extra);
+            parse(&a).map(|c| match c.command {
+                Command::Call(c) => c.token,
+                _ => panic!("not call"),
+            })
+        };
+        let t = call(&["--token", "-"]).unwrap();
+        assert_eq!(t.token.as_deref(), Some("-"));
+        let t = call(&["--token-file", "/run/t"]).unwrap();
+        assert!(t.token.is_none() && t.token_file.is_some());
+        let t = call(&[]).unwrap();
+        assert!(t.token.is_none() && t.token_file.is_none());
+        assert!(call(&["--token", "x", "--token-file", "/run/t"]).is_err());
+        for cmd in [
+            ["tools", "--server", "github", "--token-file", "/t"].as_slice(),
+            ["authzen", "eval", "--tool", "t", "--token-file", "/t"].as_slice(),
+        ] {
+            assert!(parse(cmd).is_ok(), "{cmd:?}");
+        }
+
+        let ex = |extra: &[&str]| {
+            let mut a = vec!["token", "exchange", "--actor", "c", "--cap", "g:t"];
+            a.extend_from_slice(extra);
+            parse(&a).map(|c| match c.command {
+                Command::Token(TokenCmd::Exchange(e)) => e,
+                _ => panic!("not exchange"),
+            })
+        };
+        assert!(ex(&[]).unwrap().subject_token.is_none());
+        assert!(ex(&["--subject-token-file", "/t"])
+            .unwrap()
+            .subject_token_file
+            .is_some());
+        assert!(ex(&["--subject-token", "J", "--subject-token-file", "/t"]).is_err());
     }
 
     #[test]
