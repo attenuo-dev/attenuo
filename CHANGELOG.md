@@ -149,6 +149,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ### Documentation
 
+- `docs/guide/codebase-walkthrough.md`: a reading-and-running plan for the codebase. The request path of one proxied call and one token exchange by file and function, nine reading sessions (files in order, a document to read beside them, questions, and commands that were run), an index of every ADR and design document with the rejected alternative, a glossary, and the things that surprise new readers. Linked from the docs index, the summary and the guides index.
 - `docs/research/standards.md`: `draft-klrc-aiagent-auth` expired and is replaced by `draft-ietf-wimse-aims` (checked on the IETF datatracker).
 - Guides in `docs/guides/`: getting started, deploying (with the v0 limits stated plainly), integrating MCP clients, and identity providers (Keycloak, Auth0, Okta, Entra ID, Google; provider recipes marked untested). Index in `docs/guides/README.md`.
 - `docs/faq.md`: fifteen launch-day questions.
