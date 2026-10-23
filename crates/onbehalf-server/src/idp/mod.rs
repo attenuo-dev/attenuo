@@ -186,16 +186,27 @@ pub struct VerifiedAssertion {
 }
 
 impl VerifiedAssertion {
-    /// The key under which the credential is used once: (`iss`, `jti`), or the SHA-256 of the
-    /// credential when it has no `jti`.
+    /// The key under which the credential is used once: (`iss`, `jti`), or, when it has no
+    /// `jti`, the SHA-256 of its JWS signing input (`header.payload`).
+    ///
+    /// Not of the whole credential: ECDSA signatures are malleable (`(r, s)` and `(r, n - s)`
+    /// both verify), so a hash over the signature would let one ES256/ES384 ID token be
+    /// re-encoded into a "new" credential and redeemed twice (SR-29). The signing input is
+    /// exactly what the signature covers, so it cannot change without failing verification.
     pub fn replay_key(&self, credential: &str) -> String {
         use sha2::{Digest, Sha256};
         match self.claims.get("jti").and_then(Value::as_str) {
             Some(jti) if !jti.is_empty() => format!("idp\n{}\n{jti}", self.issuer),
-            _ => format!(
-                "idp-sha256\n{}",
-                hex::encode(Sha256::digest(credential.as_bytes()))
-            ),
+            _ => {
+                let signing_input = credential
+                    .trim()
+                    .rsplit_once('.')
+                    .map_or(credential, |(input, _signature)| input);
+                format!(
+                    "idp-sha256\n{}",
+                    hex::encode(Sha256::digest(signing_input.as_bytes()))
+                )
+            }
         }
     }
 }
@@ -332,8 +343,9 @@ impl IdpRegistry {
             now,
             idp.config.clock_skew_seconds,
         )?;
-        // `check_claims` required a numeric `exp`.
-        let expires_at = claims.get("exp").and_then(Value::as_i64).unwrap_or(0);
+        // `check_claims` required a numeric `exp`; read it the same way (a JSON float is a
+        // valid NumericDate, and `as_i64` alone would turn it into 0).
+        let expires_at = numeric_date(&claims, "exp").unwrap_or(0);
         Ok(VerifiedAssertion {
             kind,
             issuer: idp.config.issuer.clone(),
@@ -498,5 +510,27 @@ mod tests {
     fn peek_rejects_garbage() {
         assert_eq!(peek("a.b").unwrap_err().description(), "malformed_token");
         assert_eq!(peek("!.!.!").unwrap_err().description(), "malformed_token");
+    }
+
+    /// SR-29: without `jti`, the replay key covers what the signature covers and nothing else.
+    #[test]
+    fn replay_key_ignores_the_signature_encoding() {
+        let v = |claims: Value| VerifiedAssertion {
+            kind: CredentialKind::IdToken,
+            issuer: "https://idp".into(),
+            subject: "alice".into(),
+            claims: claims.as_object().unwrap().clone(),
+            attribute_claims: vec![],
+            expires_at: 0,
+            clock_skew_seconds: 0,
+        };
+        let no_jti = v(json!({}));
+        assert_eq!(
+            no_jti.replay_key("h.p.sig-one"),
+            no_jti.replay_key("h.p.sig-two")
+        );
+        assert_ne!(no_jti.replay_key("h.p.s"), no_jti.replay_key("h.q.s"));
+        let with_jti = v(json!({"jti": "j1"}));
+        assert_eq!(with_jti.replay_key("a.b.c"), "idp\nhttps://idp\nj1");
     }
 }
