@@ -16,7 +16,7 @@
 //! | `GET /.well-known/jwks.json` | none | issuer public key |
 //! | `GET /healthz` | none | liveness |
 //! | `GET /metrics` | none | Prometheus metrics, on `[metrics] listen` only (separate port) |
-//! | `GET /readyz` | none | readiness: audit store and lease store answer |
+//! | `GET /readyz` | none | readiness: audit store and lease store answer; `[audit.sink]` health ([`sink`]) |
 //! | `POST/GET/DELETE /mcp/{server}` | delegation token | MCP proxy |
 //! | `POST /admin/root-token` | admin | dev-only hop-0 mint ([`routes::dev_root`]), mounted only with `[dev] allow_root_mint = true` |
 //! | `POST /admin/leases/{id}/revoke`, `GET /admin/leases/{id}` | admin | leases |
@@ -37,6 +37,7 @@ pub mod jwks;
 pub mod metrics;
 pub mod replay;
 pub mod routes;
+pub mod sink;
 pub mod state;
 
 use std::sync::Arc;
@@ -142,6 +143,9 @@ pub fn spawn_checkpointer(
     })
 }
 
+/// How long `[audit.sink]` keeps delivering queued checkpoints after a shutdown signal.
+pub const SINK_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How long in-flight requests get to finish after a shutdown signal.
 pub const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -166,6 +170,16 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     }
     if let Some(t) = checkpoint_task {
         t.abort();
+    }
+    // Give checkpoints still queued for `[audit.sink]` a moment to leave the host.
+    if state.checkpoint_sink.is_some() {
+        let s = state.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(sink) = &s.checkpoint_sink {
+                sink.shutdown(SINK_SHUTDOWN_GRACE);
+            }
+        })
+        .await;
     }
     // Requests have drained: fold the WAL into the database file before exiting.
     match state.blocking(|s| s.audit.checkpoint_wal()).await {

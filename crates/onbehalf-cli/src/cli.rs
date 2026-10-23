@@ -398,7 +398,8 @@ pub enum AuditCmd {
     /// broken or a checkpoint is invalid. With `--file`, verify an exported file offline
     /// instead (it needs only the issuer's JWKS, no admin token); that check is strict: it
     /// also fails if the file holds entries outside the range its header declares, or entries
-    /// after its last valid checkpoint (unless `--allow-unsigned-tail`).
+    /// after its last valid checkpoint (unless `--allow-unsigned-tail`). Add `--checkpoints`
+    /// to cross-check the export against checkpoints shipped off the host.
     Verify {
         /// An export made with `audit export` (JSON Lines, or the `--format json` object).
         #[arg(long)]
@@ -412,6 +413,13 @@ pub enum AuditCmd {
         /// checkpoint). They are still reported as `unsigned_tail`.
         #[arg(long, requires = "file")]
         allow_unsigned_tail: bool,
+        /// With `--file`: checkpoints shipped off the host by `[audit.sink]` (the file sink's
+        /// JSON Lines, webhook bodies one per line, or bare checkpoint lines). Every shipped
+        /// checkpoint inside the export's range must match the export's checkpoint at that
+        /// seq exactly, and the export's entry there must hash to its `head_hash`; one that
+        /// differs was signed again after it was shipped (SR-21). Exits 2 on any mismatch.
+        #[arg(long, requires = "file")]
+        checkpoints: Option<std::path::PathBuf>,
     },
     /// Export entries `--from` to `--to` (inclusive) and the checkpoints inside that range.
     /// Defaults to the whole log. Writes to stdout unless `--out` is given.
@@ -910,6 +918,19 @@ mod tests {
         assert!(parse(&["policy", "reload"]).is_ok());
         assert!(parse(&["audit", "verify"]).is_ok());
         assert!(parse(&["audit", "verify", "--file", "a.jsonl", "--jwks", "j.json"]).is_ok());
+        assert!(parse(&[
+            "audit",
+            "verify",
+            "--file",
+            "a.jsonl",
+            "--checkpoints",
+            "s.jsonl"
+        ])
+        .is_ok());
+        assert!(
+            parse(&["audit", "verify", "--checkpoints", "s.jsonl"]).is_err(),
+            "--checkpoints needs --file"
+        );
         assert!(
             parse(&["audit", "verify", "--jwks", "j.json"]).is_err(),
             "--jwks only makes sense with --file"

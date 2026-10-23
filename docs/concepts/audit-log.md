@@ -71,7 +71,30 @@ A hash chain alone cannot show that the newest entries were deleted, or that som
 
 Verification needs only the public keys the server already publishes at `/.well-known/jwks.json`. A checkpoint fails if its signature is bad, if its `kid` is not in the JWKS, if the entry hash at its `seq` differs from `head_hash` (history was rewritten, even with every later hash recomputed), or if the log is now shorter than its `seq` (truncation). After a key rotation, old checkpoints keep verifying as long as the retired key stays in `[issuer] previous_key_paths`.
 
-What it does not give you: the signing key lives on the same server. Someone who controls the server process can sign a rewritten history. Checkpoints you copied off the host before the compromise still catch it.
+What it does not give you: the signing key lives on the same server. Someone who controls the server process can sign a rewritten history. Checkpoints that left the host before the compromise still catch it, which is what the checkpoint sink is for.
+
+## Shipping checkpoints off the host
+
+`[audit.sink]` sends every checkpoint the log creates somewhere the host cannot rewrite, as soon as the commit that wrote it is on disk ([reference](../reference/config.md#auditsink)). Three kinds:
+
+- `webhook`: `POST` to `url`, `Content-Type: application/json`, optional `Authorization: Bearer`, headers `X-Onbehalf-Checkpoint-Seq` and `X-Onbehalf-Checkpoint-Sha256`. Any 2xx is delivered; redirects are not followed.
+- `file`: append one line to `path` and `fsync` it. For operators who already ship files with their own agent. Put the file on another mount (the server warns at startup when it shares a filesystem with the SQLite file), ideally append-only (`chattr +a`).
+- `s3`: `PUT <endpoint>/<bucket>/<prefix><seq, 20 digits>-<first 16 hex of checkpoint_sha256>.json`, signed with AWS Signature Version 4 (implemented in the server on `ring` and `sha2`; no AWS SDK). Works with AWS S3 and S3-compatible stores (path-style). Credentials come from the config or `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`.
+
+Each delivery is one canonical JSON object (format `onbehalf-shipped-checkpoint-v1`): the checkpoint record, its `kid` and `signature` repeated at the top level, the server's `public_url`, and `checkpoint_sha256`, the hex SHA-256 of the checkpoint's RFC 8785 canonical JSON. The same object is the webhook body, one line of the file, and one S3 object, so the shipped copies of any kind can be collected into one JSON Lines file.
+
+The log's hook only queues; it never waits on the network or the disk. The queue holds `queue_capacity` checkpoints (default 1024). When it is full the oldest queued checkpoint is dropped and `onbehalf_audit_sink_dropped_total` counts it: every later checkpoint covers the entries an earlier one does, so the newest are the ones to keep. One background thread delivers in order. A failed delivery is retried, never skipped, with exponential backoff from `initial_backoff_ms` (500) doubling to `max_backoff_seconds` (60), each wait drawn between half and all of that. `/readyz` adds `"degraded": true` and `checks.checkpoint_sink = "degraded"` when the queue is full or the oldest undelivered checkpoint is older than `max_lag_seconds` (300); it stays 200 unless `fail_readiness = true`. Metrics: `audit_sink_delivered_total`, `audit_sink_failures_total`, `audit_sink_dropped_total`, `audit_sink_queue_depth`, `audit_sink_oldest_undelivered_timestamp_seconds`. At shutdown the queue gets five seconds to drain.
+
+The sink's credentials are on the host too, so an attacker who holds the host can also send to the sink. Give the server credentials that can only add: a webhook receiver that never overwrites, an S3 policy with `s3:PutObject` only plus versioning or Object Lock, a file another user owns with the append-only attribute. They can then add a forged checkpoint but not remove the original, and two different checkpoints for one `seq` are themselves reported.
+
+To check a log against what was shipped:
+
+```sh
+onbehalf audit export --out export.jsonl
+onbehalf audit verify --file export.jsonl --jwks jwks.json --checkpoints shipped.jsonl
+```
+
+For every shipped checkpoint inside the export's range, the export must hold the same checkpoint at that `seq`, field for field, and its entry there must hash to the shipped `head_hash`. A different checkpoint is reported as signed again after shipping (with the fields that differ); a missing one as deleted. A shipped copy whose signature does not verify against the JWKS, or whose envelope disagrees with itself, is reported instead of trusted. Shipped checkpoints past the export's range are counted (`beyond_range`): if the export runs to the head of the log, the log is shorter than what was shipped. Exit status 2 on any mismatch. In code: `onbehalf_audit::{parse_shipped, cross_check}`.
 
 ## Reading and verifying
 
@@ -79,6 +102,7 @@ What it does not give you: the signing key lives on the same server. Someone who
 - `onbehalf audit verify` walks the whole chain, checks the checkpoint signatures, and prints the last signed `seq` and how many entries come after it. It exits 2 if the chain is broken or a checkpoint is invalid.
 - `onbehalf audit export --from 100 --to 200 --format jsonl` writes a slice of the log with the checkpoints inside it, one canonical JSON object per line, after a header that declares the range (format `onbehalf-audit-export-v2`). `onbehalf audit verify --file export.jsonl --jwks jwks.json` checks that file on any machine, with no admin token and no access to the server: it re-hashes every entry, checks the links, verifies each checkpoint signature and compares its head hash to the entry at that `seq`.
 - That check is strict. It fails a file that starts or ends short of the range in its header (truncated), a file that holds entries outside that range, and a file with entries after its last valid checkpoint. Such entries are covered by the hash chain only, and anyone who can write the file can append them. To check an export taken while the log was ahead of its newest checkpoint, pass `--allow-unsigned-tail`; the report still says how many entries are unsigned. Or sign the head first (`GET /admin/audit/checkpoint`) and export up to it.
+- `--checkpoints shipped.jsonl` adds a cross-check against checkpoints shipped off the host; see [Shipping checkpoints off the host](#shipping-checkpoints-off-the-host).
 - `GET /admin/audit`, `/admin/audit/verify`, `/admin/audit/checkpoint` and `/admin/audit/export` are the matching admin endpoints.
 - The Python SDK (`onbehalf.audit.verify_export`) and the TypeScript SDK (`verifyExport`) run the same strict check in your own code, with the issuer's JWKS as the only input; see [Verifying in code](#verifying-in-code).
 
@@ -111,7 +135,7 @@ Entries after the last checkpoint are protected by the hash chain only, and the 
 
 ## Not built yet, or uncertain
 
-No built-in sink ships checkpoints off the host yet; the key that signs them is the server's own.
+The checkpoint sink ships what the server signs; entries after the newest checkpoint are not covered until the next one is signed (at most `checkpoint_every` entries or `checkpoint_interval_seconds`). The SDKs verify exports but do not yet cross-check shipped checkpoints; use the CLI or `onbehalf_audit::cross_check`.
 
 Revocations, policy reloads and dev root mints are appended to the log as admin actions (reason `admin_action`, server `onbehalf`, subject `urn:onbehalf:admin`, which no user can have). To pick out server events, filter on `kind` (anything but `decision`), or on `server = "onbehalf"` and the tool (`token.*`, `lease.renew`, `admin.*`); no upstream or agent can use the name `onbehalf`. The revoke response carries the `audit_id` of that record, or says that the append failed.
 

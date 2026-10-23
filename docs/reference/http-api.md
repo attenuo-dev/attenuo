@@ -19,7 +19,7 @@ Optional, RFC 9449. See [Binding tokens to keys](../guides/binding-tokens-to-key
 | Method and path | Auth | Purpose |
 | --- | --- | --- |
 | `GET /healthz` | none | Liveness. Never touches storage. |
-| `GET /readyz` | none | Readiness. Checks the audit store and the lease store. 200 `{"ready":true,"checks":{"audit":"ok","leases":"ok"}}` or 503 with `"error"` for the failing check and no error text. |
+| `GET /readyz` | none | Readiness. Checks the audit store and the lease store. 200 `{"ready":true,"checks":{"audit":"ok","leases":"ok"}}` or 503 with `"error"` for the failing check and no error text. With `[audit.sink]` the body also has `"degraded"` and `checks.checkpoint_sink` (`"ok"` or `"degraded"`); a degraded sink is a 503 only with `fail_readiness = true`. |
 | `GET /.well-known/jwks.json` | none | Public keys for token verification, including retired keys. |
 | `GET /.well-known/authzen-configuration` | none | AuthZEN discovery: decision point, evaluation and evaluations endpoint URLs, built from `[server] public_url`. Without it (loopback only) from `Host`, which must be `localhost`, `127.0.0.1` or `[::1]`; anything else is 400 `invalid_host`. |
 

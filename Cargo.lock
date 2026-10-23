@@ -1638,11 +1638,13 @@ name = "onbehalf-audit"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "hex",
  "onbehalf-core",
  "onbehalf-token",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "time",

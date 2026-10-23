@@ -18,6 +18,11 @@ use crate::state::AppState;
 /// and 503 when any check fails. The storage error text (SQLite messages, file paths) goes to
 /// the server log only: the endpoint needs no credentials (SR-38). `/healthz` stays
 /// liveness-only.
+///
+/// With `[audit.sink]` configured, the body also has `"degraded"` and
+/// `checks.checkpoint_sink` (`"ok"` or `"degraded"`): degraded when the sink queue is full or
+/// the oldest undelivered checkpoint is older than `max_lag_seconds` (SR-21). A degraded sink
+/// fails readiness only with `fail_readiness = true`.
 pub async fn readyz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
     let (audit, leases) = state
         .blocking(|s| {
@@ -38,11 +43,29 @@ pub async fn readyz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Val
         }
     };
     let (audit_status, leases_status) = (check("audit", &audit), check("leases", &leases));
-    let ready = audit.is_ok() && leases.is_ok();
-    let body = json!({
+    let mut ready = audit.is_ok() && leases.is_ok();
+    let mut body = json!({
         "ready": ready,
         "checks": { "audit": audit_status, "leases": leases_status },
     });
+    if let Some(sink) = &state.checkpoint_sink {
+        let status = sink.status();
+        if status.degraded {
+            tracing::warn!(
+                queued = status.queued,
+                capacity = status.capacity,
+                lag_seconds = status.lag.as_secs(),
+                last_error = status.last_error.as_deref().unwrap_or(""),
+                "readiness: [audit.sink] is degraded"
+            );
+            if state.sink_fails_readiness {
+                ready = false;
+            }
+        }
+        body["ready"] = json!(ready);
+        body["degraded"] = json!(status.degraded);
+        body["checks"]["checkpoint_sink"] = json!(if status.degraded { "degraded" } else { "ok" });
+    }
     let code = if ready {
         StatusCode::OK
     } else {

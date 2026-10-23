@@ -61,6 +61,10 @@ pub struct AppState {
     pub replay: crate::replay::ReplayCache,
     /// Sender-constrained tokens: `[token] dpop*` and the proof replay cache (SR-24).
     pub dpop: Arc<crate::dpop::Dpop>,
+    /// `[audit.sink]`: ships every checkpoint off the host (SR-21); `None` when unset.
+    pub checkpoint_sink: Option<crate::sink::CheckpointSink>,
+    /// `[audit.sink] fail_readiness`.
+    pub sink_fails_readiness: bool,
 }
 
 impl AppState {
@@ -95,8 +99,26 @@ impl AppState {
 
         let checkpoint_keys = CheckpointKeys::from_jwks(&jwks)?;
         let metrics = Metrics::new();
-        let (audit, leases) =
-            open_storage(&config.audit, issuer.detached_signer(), metrics.clone())?;
+        let checkpoint_sink = match &config.audit.sink {
+            Some(cfg) => {
+                let sink = crate::sink::CheckpointSink::start(
+                    cfg,
+                    config.server.public_url.clone(),
+                    metrics.clone(),
+                )?;
+                if let Some(path) = &cfg.path {
+                    warn_if_same_mount(path, &config.audit.sqlite_path);
+                }
+                Some(sink)
+            }
+            None => None,
+        };
+        let (audit, leases) = open_storage(
+            &config.audit,
+            issuer.detached_signer(),
+            metrics.clone(),
+            checkpoint_sink.as_ref().map(|s| s.handle()),
+        )?;
         let pipeline = Arc::new(
             Pipeline::new(policy, leases.clone(), audit.clone()).with_metrics(metrics.clone()),
         );
@@ -195,6 +217,8 @@ impl AppState {
             metrics,
             replay: crate::replay::ReplayCache::default(),
             dpop,
+            checkpoint_sink,
+            sink_fails_readiness: config.audit.sink.as_ref().is_some_and(|s| s.fail_readiness),
         })
     }
 
@@ -353,12 +377,51 @@ fn build_engine(config: &Config) -> anyhow::Result<PolicyEngine> {
     Ok(engine)
 }
 
+/// A file sink on the same filesystem as the SQLite log does not get the checkpoints off the
+/// host's disk; say so (SR-21).
+fn warn_if_same_mount(sink_path: &Path, sqlite_path: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if sqlite_path == ":memory:" {
+            return;
+        }
+        let dir = |p: &Path| {
+            p.parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+                .to_path_buf()
+        };
+        let dev = |p: &Path| std::fs::metadata(p).ok().map(|m| m.dev());
+        if let (Some(a), Some(b)) = (dev(&dir(sink_path)), dev(&dir(Path::new(sqlite_path)))) {
+            if a == b {
+                tracing::warn!(
+                    sink = %sink_path.display(),
+                    sqlite = sqlite_path,
+                    "[audit.sink] path is on the same filesystem as the audit log: an attacker \
+                     who can rewrite the log can rewrite this file too. Put it on another mount \
+                     and ship it off the host"
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (sink_path, sqlite_path);
+}
+
 fn open_storage(
     cfg: &crate::config::AuditSection,
     signer: onbehalf_token::DetachedSigner,
     metrics: Arc<Metrics>,
+    sink: Option<crate::sink::SinkHandle>,
 ) -> anyhow::Result<(Arc<SqliteAudit>, Arc<SqliteLeaseStore>)> {
-    let count = move |_: &onbehalf_audit::Checkpoint| metrics.audit_checkpoint();
+    // Runs after the commit that wrote the checkpoint was synced (SR-50); the sink only queues.
+    let count = move |cp: &onbehalf_audit::Checkpoint| {
+        metrics.audit_checkpoint();
+        if let Some(sink) = &sink {
+            sink.push(cp);
+        }
+    };
     let path = cfg.sqlite_path.as_str();
     if path == ":memory:" {
         tracing::warn!("audit.sqlite_path is :memory:; the audit log is lost on exit");
