@@ -53,10 +53,17 @@ CODER_SECRET = "demo-coder-secret"
 TESTER_SECRET = "demo-tester-secret"
 
 
-def free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
+def reserve_ports(n: int) -> list[int]:
+    """Distinct free ports. All the probe sockets stay open until every port is chosen, so the
+    kernel cannot hand the same port out twice; the caller starts the servers right after."""
+    socks = [socket.socket() for _ in range(n)]
+    try:
+        for s in socks:
+            s.bind(("127.0.0.1", 0))
+        return [int(s.getsockname()[1]) for s in socks]
+    finally:
+        for s in socks:
+            s.close()
 
 
 def cargo_executable(args: list[str], name: str) -> Path:
@@ -120,9 +127,7 @@ def stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
     fake_bin = work / "fake_mcp"
     shutil.copy2(built_server, server_bin)
     shutil.copy2(built_fake, fake_bin)
-    ob_port, mcp_port = free_port(), free_port()
-    while mcp_port == ob_port:
-        mcp_port = free_port()
+    ob_port, mcp_port = reserve_ports(2)
 
     config = (
         (DEMO / "config.toml")
@@ -152,8 +157,8 @@ def stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
             )
         )
         url = f"http://127.0.0.1:{ob_port}"
-        deadline = time.time() + 20
-        while time.time() < deadline:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
             try:
                 ready = httpx.get(f"{url}/healthz", timeout=1).is_success
             except httpx.HTTPError:
@@ -390,8 +395,8 @@ def test_dpop_bound_chain(stack: Stack) -> None:
 
 
 def wait_for(cond: Callable[[], bool], seconds: float, what: str) -> None:
-    deadline = time.time() + seconds
-    while time.time() < deadline:
+    deadline = time.monotonic() + seconds  # not time.time(): a clock step must not cut the wait
+    while time.monotonic() < deadline:
         if cond():
             return
         time.sleep(0.1)

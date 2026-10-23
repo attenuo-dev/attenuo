@@ -218,9 +218,11 @@ pip install -e '.[dev]'
 ruff check --config pyproject.toml . ../../examples/python-agent
 ruff format --check --config pyproject.toml . ../../examples/python-agent
 mypy --strict src tests ../../examples/python-agent
-pytest                       # unit tests, no server needed
-ONBEHALF_INTEGRATION=1 pytest -m integration   # builds and starts the real server (needs cargo)
+pytest -rf                   # unit tests, no server needed
+ONBEHALF_INTEGRATION=1 pytest -rf -m integration   # builds and starts the real server (needs cargo)
 ```
+
+Keep `-rf`: it prints the name of every failed test in the summary, which a long run otherwise scrolls away.
 
 The integration test builds `onbehalf-server` and the `fake_mcp` example, starts both on free ports, and replays the [GitHub leak scenario](../../examples/github-leak-demo/README.md) through the SDK: dev root mint, exchange, an allowed call, a policy denial, a capability denial, revocation, `lease_revoked`, and an audit chain check.
 

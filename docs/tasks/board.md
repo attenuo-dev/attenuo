@@ -24,7 +24,7 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 
 ## Next
 
-- [ ] Python SDK: one intermittent test failure seen once during full verification on 2026-10-23 ~09:58 UTC (142 passed on three reruns); name not captured. Run `pytest -rf` in the next verification and fix or mark the flaky test.
+- [ ] Python SDK: one intermittent test failure seen once during full verification on 2026-10-23 ~09:58 UTC (name not captured). Not reproduced in 62 runs under load (parallel suites, `taskset -c 0`, CPU burners; refresh tests at 13 fractional-second clock offsets). Hardened the integration fixture (port reservation, monotonic deadlines) and `-rf` is now in the documented invocation. Keep `-rf` in the next verifications; close when a failure is named or after a clean week.
 
 - [ ] Token claims: proposed extensions from RFC-0001 section 3.1: `evidence` on the originating user (how the IdP credential was verified), a stable `chain_id`, numeric and time-range constraints. Reconcile or drop each. (`may_act` and a verified `actor_token` are done.)
 - [ ] Actor token follow-ups: test `[[actor_trust]]` against a live SPIRE (bundle endpoint and OIDC discovery provider) and drop the "untested" marks; consider a per-entry opt-out of single use for SPIRE's JWT-SVID cache; record the actor-auth method in the audit record itself (today only in the argument digest and the log line).
