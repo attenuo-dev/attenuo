@@ -8,7 +8,7 @@ use onbehalf_core::{DelegationChain, ToolCall};
 use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
 
-use crate::catalog::ToolAttrs;
+use crate::catalog::{ArgType, ToolAttrs};
 use crate::schema::GENERIC_ACTION;
 
 /// Largest magnitude a Cedar `decimal` can hold.
@@ -105,6 +105,50 @@ fn object_from<'a>(
         }
     }
     Ok(Value::Object(out))
+}
+
+fn matches_type(value: &Value, ty: &ArgType) -> bool {
+    match (ty, value) {
+        (ArgType::String, Value::String(_)) | (ArgType::Bool, Value::Bool(_)) => true,
+        (ArgType::Long, Value::Number(n)) => n.is_i64(),
+        (ArgType::Set(inner), Value::Array(items)) => items.iter().all(|i| matches_type(i, inner)),
+        _ => false,
+    }
+}
+
+fn type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(n) if n.is_i64() => "long",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// Check every declared attribute that is present against its declared type. Absent and
+/// `null` attributes are fine (policies test presence with `has`); a present value of another
+/// type is an error. No coercion: a single-element list is not a string.
+pub(crate) fn check_user_attributes(
+    user: &onbehalf_core::OriginatingUser,
+    declared: &BTreeMap<String, ArgType>,
+) -> Result<(), String> {
+    for (name, ty) in declared {
+        let Some(value) = user.attributes.get(name) else {
+            continue;
+        };
+        if value.is_null() || matches_type(value, ty) {
+            continue;
+        }
+        return Err(format!(
+            "originating_user.attributes.{name}: expected {}, got {}",
+            ty.cedar(),
+            type_name(value)
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn uid(ty: &str, id: &str) -> EntityUid {
@@ -260,6 +304,45 @@ mod tests {
                 "d": "18446744073709551615"
             })
         );
+    }
+
+    fn user_with(attrs: Value) -> onbehalf_core::OriginatingUser {
+        onbehalf_core::OriginatingUser {
+            subject: "alice".into(),
+            issuer: "https://idp".into(),
+            authenticated_at: OffsetDateTime::now_utc(),
+            attributes: attrs
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn declared_types_are_checked() {
+        let decl = crate::schema::default_user_attrs();
+        let ok = user_with(json!({"mfa": true, "roles": ["a"], "tenant": "t", "email": null}));
+        assert!(check_user_attributes(&ok, &decl).is_ok());
+        for bad in [
+            json!({"mfa": "true"}),
+            json!({"roles": "dev"}),
+            json!({"roles": ["a", 1]}),
+            json!({"tenant": ["t"]}),
+            json!({"email": 5}),
+            json!({"tenant": {"a": 1}}),
+        ] {
+            assert!(
+                check_user_attributes(&user_with(bad.clone()), &decl).is_err(),
+                "{bad}"
+            );
+        }
+        let mut long = BTreeMap::new();
+        long.insert("n".to_string(), ArgType::Long);
+        assert!(check_user_attributes(&user_with(json!({"n": 3})), &long).is_ok());
+        assert!(check_user_attributes(&user_with(json!({"n": 3.5})), &long).is_err());
+        assert!(check_user_attributes(&user_with(json!({"n": "3"})), &long).is_err());
     }
 
     #[test]

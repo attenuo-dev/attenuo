@@ -1958,3 +1958,63 @@ async fn audit_append_latency_and_checkpoint_metrics_are_exported() {
         "{text}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// SR-33: a declared user attribute of the wrong type is denied, not skipped.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn mistyped_user_attribute_is_denied_and_audited() {
+    let h = Harness::start_tweaked(false, |cfg| {
+        cfg.policy
+            .user_attributes
+            .insert("status".into(), "string".into());
+    })
+    .await;
+    std::fs::write(
+        &h.policy_path,
+        r#"@id("not_suspended")
+permit(principal, action == Action::"read_file", resource)
+when { context.originating_user.attributes has status
+       && context.originating_user.attributes.status != "suspended" };"#,
+    )
+    .unwrap();
+    assert_eq!(
+        h.admin_post("/admin/policies/reload", json!({}))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let mint = |subject: &'static str, status: Value| {
+        let h = &h;
+        async move {
+            let resp = h
+                .admin_post(
+                    "/admin/root-token",
+                    json!({"subject": subject, "issuer": "https://idp.example",
+                           "agent": "planner", "capabilities": ["github:*"],
+                           "attributes": {"status": status}}),
+                )
+                .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            resp.json::<Value>().await.unwrap()["access_token"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+    let args = json!({"repo": "alice/x"});
+    let good = mint("alice", json!("active")).await;
+    assert!(allowed(&h.call(&good, "read_file", args.clone()).await));
+    // `["suspended"] != "suspended"` is true in Cedar; the declared type stops it.
+    let bad = mint("bob", json!(["suspended"])).await;
+    let denied = h.call(&bad, "read_file", args).await;
+    assert_eq!(denied_reason(&denied), "attribute_type_mismatch");
+    let entries = h.audit_entries().await;
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["record"]["reason"] == "attribute_type_mismatch"),
+        "{entries:?}"
+    );
+}
