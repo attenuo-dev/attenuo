@@ -19,6 +19,7 @@ pub mod export;
 pub mod lease;
 pub mod log;
 pub mod memory;
+pub mod query;
 pub mod shipped;
 pub mod sqlite;
 
@@ -38,6 +39,7 @@ pub use log::{
     AuditSink, VerifyReport, ENTRY_HASH_VERSION, GENESIS_HASH,
 };
 pub use memory::MemoryAudit;
+pub use query::{EntryFilter, Order};
 pub use shipped::{
     checkpoint_sha256, cross_check, parse_shipped, CrossCheckReport, ShippedCheckpoint,
     ShippedLine, ShippedMismatch, SHIPPED_FORMAT,
