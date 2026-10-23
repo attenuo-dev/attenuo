@@ -6,6 +6,8 @@ token out of agents: it can revoke anything and read every decision.
 
 from __future__ import annotations
 
+import json
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from types import TracebackType
 from typing import Any
@@ -14,6 +16,7 @@ import httpx
 
 from . import _wire as w
 from .capability import CapabilityLike, capabilities_to_json
+from .errors import OnbehalfError
 from .token import Token
 
 _MAX_PAGE = 1000
@@ -83,6 +86,21 @@ def _entries(page: Any) -> list[AuditEntry]:
         AuditEntry(seq=int(e["seq"]), record=dict(e.get("record") or {}), raw=e)
         for e in page.get("entries", [])
     ]
+
+
+def _head(page: Any) -> int:
+    head = page.get("head") if isinstance(page, dict) else None
+    return head if isinstance(head, int) and not isinstance(head, bool) and head >= 0 else 0
+
+
+def _export_line(line: str) -> dict[str, Any]:
+    try:
+        obj = json.loads(line)
+    except ValueError as e:
+        raise OnbehalfError(f"audit export: line is not JSON: {line[:200]}") from e
+    if not isinstance(obj, dict):
+        raise OnbehalfError(f"audit export: line is not an object: {line[:200]}")
+    return obj
 
 
 def _root_body(
@@ -172,9 +190,14 @@ class AdminClient:
         )
         return _entries(page), page.get("next")
 
+    def audit_head(self) -> int:
+        """The newest audit ``seq`` (0 for an empty log). Reads ``head`` from
+        ``GET /admin/audit``; unlike :meth:`audit_checkpoint` it signs nothing."""
+        return _head(w.json_body(self._http.get("/admin/audit", params={"from": 1, "limit": 1})))
+
     def audit_tail(self, n: int = 20) -> list[AuditEntry]:
         """The last ``n`` audit entries, oldest first."""
-        head = w.json_body(self._http.get("/admin/audit/checkpoint")).get("seq") or 0
+        head = self.audit_head()
         start = max(1, head + 1 - n)
         out: list[AuditEntry] = []
         while True:
@@ -185,9 +208,28 @@ class AdminClient:
             start = nxt
 
     def audit_checkpoint(self) -> dict[str, Any]:
-        """``{seq, hash}`` of the log head."""
+        """The signed checkpoint of the log head (``seq``, ``head_hash``, ``hash``, ``at``,
+        ``kid``, ``signature``). Every call may create and store a signed checkpoint; use
+        :meth:`audit_head` to just read the head."""
         body = w.json_body(self._http.get("/admin/audit/checkpoint"))
         return body if isinstance(body, dict) else {}
+
+    def audit_export(
+        self, from_seq: int = 1, to_seq: int | None = None
+    ) -> Iterator[dict[str, Any]]:
+        """Stream ``GET /admin/audit/export`` as parsed JSON Lines objects: a ``header``, then
+        ``entry`` and ``checkpoint`` objects, each tagged with ``type``. Write the raw lines to
+        a file and check it offline with ``onbehalf audit verify --file``."""
+        params: dict[str, Any] = {"from": from_seq}
+        if to_seq is not None:
+            params["to"] = to_seq
+        with self._http.stream("GET", "/admin/audit/export", params=params) as resp:
+            if not resp.is_success:
+                resp.read()
+                raise w.error_from_response(resp)
+            for line in resp.iter_lines():
+                if line.strip():
+                    yield _export_line(line)
 
     def audit_verify(self) -> VerifyReport:
         """Walk the whole hash chain. ``ok`` is false (not an exception) if it is broken."""
@@ -276,8 +318,13 @@ class AsyncAdminClient:
         )
         return _entries(page), page.get("next")
 
+    async def audit_head(self) -> int:
+        return _head(
+            w.json_body(await self._http.get("/admin/audit", params={"from": 1, "limit": 1}))
+        )
+
     async def audit_tail(self, n: int = 20) -> list[AuditEntry]:
-        head = w.json_body(await self._http.get("/admin/audit/checkpoint")).get("seq") or 0
+        head = await self.audit_head()
         start = max(1, head + 1 - n)
         out: list[AuditEntry] = []
         while True:
@@ -290,6 +337,20 @@ class AsyncAdminClient:
     async def audit_checkpoint(self) -> dict[str, Any]:
         body = w.json_body(await self._http.get("/admin/audit/checkpoint"))
         return body if isinstance(body, dict) else {}
+
+    async def audit_export(
+        self, from_seq: int = 1, to_seq: int | None = None
+    ) -> AsyncIterator[dict[str, Any]]:
+        params: dict[str, Any] = {"from": from_seq}
+        if to_seq is not None:
+            params["to"] = to_seq
+        async with self._http.stream("GET", "/admin/audit/export", params=params) as resp:
+            if not resp.is_success:
+                await resp.aread()
+                raise w.error_from_response(resp)
+            async for line in resp.aiter_lines():
+                if line.strip():
+                    yield _export_line(line)
 
     async def audit_verify(self) -> VerifyReport:
         return _verify_report(w.json_body(await self._http.get("/admin/audit/verify")))

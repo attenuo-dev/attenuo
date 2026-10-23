@@ -10,6 +10,8 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ### Added
 
+- SDKs: `audit_head` / `auditHead` (the newest audit `seq`, read from `head` of `GET /admin/audit`, signs nothing) and `audit_export` / `auditExport` (iterator of the JSON Lines objects of `GET /admin/audit/export`). The Python and TypeScript `audit_tail` / `auditTail` use `head` instead of `GET /admin/audit/checkpoint`, which signs and stores a checkpoint per call; `audit_checkpoint` stays as the explicit call. `AuditPage.head` in TypeScript.
+- CLI: `--admin-token-stdin`, `--admin-token-file`, `--client-secret-stdin` and `--client-secret-file` (first line of stdin or of a file).
 - Signed audit checkpoints. `{seq, head_hash, at, kid, signature}`, Ed25519 by the issuer key under the context `onbehalf-checkpoint-v1` (new `onbehalf_token::DetachedSigner` and `verify_detached`), stored in a `checkpoints` table and written every `[audit] checkpoint_every` entries (default 1000) and every `checkpoint_interval_seconds` (default 300). `GET /admin/audit/checkpoint` now returns the signed checkpoint (`hash` stays as an alias of `head_hash`); `GET /admin/audit/verify` also verifies checkpoint signatures against the JWKS keys and reports `checkpoints`, `last_signed_seq`, `unsigned_tail` and `bad_checkpoints`. Keys retired in a rotation keep verifying old checkpoints while they are in the JWKS. `onbehalf audit verify` prints the checkpoint status.
 - `GET /admin/audit/export?from&to` streams entries and checkpoints as JSON Lines; `onbehalf audit export --from --to --format jsonl|json` writes them, and `onbehalf audit verify --file <export> [--jwks <file>]` verifies an export offline with only the JWKS.
 - `POST /access/v1/evaluations` (AuthZEN batch), advertised as `access_evaluations_endpoint`, bounded by `[authzen] max_batch` (default 64; 400 `batch_too_large` beyond it).
@@ -81,6 +83,8 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ### Security
 
+- SR-32: the Python and TypeScript SDKs raise `Denied` / `DeniedError` for a JSON-RPC `-32003` only when the response carries `X-Onbehalf-Decision-Id` and `data.decision_id` is one of the ids in it; an upstream's own `-32003` is an `RpcError`.
+- SR-35: `onbehalf --admin-token` and `--client-secret` print a warning to stderr (arguments show up in `ps` and shell history); docs, README and the leak demo use the environment or stdin. `--token` and `--subject-token` are unchanged (`ONBEHALF_TOKEN`).
 - SR-22 (info): store I/O no longer blocks tokio workers, and AuthZEN batches are bounded by `[authzen] max_batch`. SR-21 (info, partial): audit checkpoints are signed by the issuer key and verified against the JWKS; shipping them off the host is still up to the operator.
 - SR-08 (high): AuthZEN evaluated unsigned chains from unauthenticated callers, so anyone who had seen a lease id could get decisions and write audit records for a forged user. The bearer is now required by default; body chains need a PEP credential, and every hop's lease must be bound (at issuance, write-once) to the digest of the chain prefix that created it.
 - SR-10 (high): the `actor` of a token exchange was asserted, not authenticated, so any token holder could mint a child naming any agent. The actor now authenticates with its `[[agents]]` secret and must match `actor`; an agent already in the chain is refused (`duplicate_actor`).

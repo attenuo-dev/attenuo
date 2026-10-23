@@ -8,6 +8,7 @@ mod client;
 mod jwt;
 mod policy_cmd;
 mod render;
+mod secrets;
 
 use std::io::Read;
 use std::process::ExitCode;
@@ -34,6 +35,9 @@ enum Outcome {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    for line in secrets::argv_warnings(std::env::args_os()) {
+        eprintln!("{line}");
+    }
     match run(cli).await {
         Ok(Outcome::Ok) => ExitCode::SUCCESS,
         Ok(Outcome::No) => ExitCode::from(2),
@@ -62,7 +66,15 @@ fn print_json(v: &Value) {
 async fn run(cli: Cli) -> Result<Outcome> {
     let json = cli.json;
     // `token inspect` without --verify is purely local; do not insist on a sane --server.
-    let client = Client::new(&cli.server, cli.admin_token.clone());
+    let mut stdin = secrets::Stdin::default();
+    let admin_token = secrets::resolve(
+        "admin token",
+        cli.admin_token.clone(),
+        cli.admin_token_stdin,
+        cli.admin_token_file.as_deref(),
+        &mut stdin,
+    )?;
+    let client = Client::new(&cli.server, admin_token);
     match cli.command {
         Command::Token(TokenCmd::Inspect(args)) => inspect(client.ok(), args, json).await,
         Command::Token(TokenCmd::Root(a)) => {
@@ -104,7 +116,14 @@ async fn run(cli: Cli) -> Result<Outcome> {
             if let Some(ttl) = a.ttl_seconds {
                 body["requested_ttl_seconds"] = ttl.into();
             }
-            if let Some(secret) = a.client_secret {
+            let secret = secrets::resolve(
+                "client secret",
+                a.client_secret,
+                a.client_secret_stdin,
+                a.client_secret_file.as_deref(),
+                &mut stdin,
+            )?;
+            if let Some(secret) = secret {
                 body["client_id"] = a.client_id.unwrap_or_else(|| a.actor.clone()).into();
                 body["client_secret"] = secret.into();
             }

@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from "vitest";
-import { AdminClient, ApiError, capability, prefix } from "../src/index.js";
+import { AdminClient, ApiError, capability, OnbehalfError, prefix } from "../src/index.js";
 import { jsonResponse, mockFetch, Signer, tokenResponse } from "./helpers.js";
 
 const URL_ = "http://ob.test";
@@ -68,28 +68,85 @@ describe("AdminClient", () => {
     expect(calls[0]!.url.searchParams.get("limit")).toBe("2");
   });
 
-  it("tails the log from the checkpoint, following next", async () => {
+  it("tails the log from the head of GET /admin/audit, following next", async () => {
     const { fetch, calls } = mockFetch((s) => {
-      if (s.url.pathname === "/admin/audit/checkpoint") return jsonResponse({ seq: 10, hash: "h" });
+      expect(s.url.pathname).not.toBe("/admin/audit/checkpoint");
       const from = Number(s.url.searchParams.get("from"));
+      if (s.url.searchParams.get("limit") === "1")
+        return jsonResponse({ entries: [entry(1)], next: 2, head: 10 });
       return from === 8
-        ? jsonResponse({ entries: [entry(8), entry(9)], next: 10 })
-        : jsonResponse({ entries: [entry(10)], next: null });
+        ? jsonResponse({ entries: [entry(8), entry(9)], next: 10, head: 10 })
+        : jsonResponse({ entries: [entry(10)], next: null, head: 10 });
     });
     const tail = await new AdminClient(URL_, "adm", { fetch }).auditTail(3);
     expect(tail.map((e) => e.seq)).toEqual([8, 9, 10]);
     expect(calls.map((c) => c.url.pathname)).toEqual([
-      "/admin/audit/checkpoint",
+      "/admin/audit",
       "/admin/audit",
       "/admin/audit",
     ]);
+  });
+
+  it("reads the head, 0 when absent", async () => {
+    const a = mockFetch(() => jsonResponse({ entries: [], next: null, head: 12 }));
+    expect(await new AdminClient(URL_, "adm", { fetch: a.fetch }).auditHead()).toBe(12);
+    const b = mockFetch(() => jsonResponse({ entries: [], next: null }));
+    expect(await new AdminClient(URL_, "adm", { fetch: b.fetch }).auditHead()).toBe(0);
+  });
+
+  it("streams an export as parsed JSON Lines, across chunk boundaries", async () => {
+    const lines = [
+      '{"type":"header","from":1,"to":2}',
+      '{"type":"entry","seq":1}',
+      '{"type":"checkpoint","seq":2}',
+    ].join("\n");
+    const { fetch, calls } = mockFetch(() => new Response(`${lines}\n`));
+    const out = [];
+    for await (const l of new AdminClient(URL_, "adm", { fetch }).auditExport(1, 2)) out.push(l);
+    expect(out.map((l) => l.type)).toEqual(["header", "entry", "checkpoint"]);
+    expect(calls[0]!.url.pathname).toBe("/admin/audit/export");
+    expect(calls[0]!.url.searchParams.get("to")).toBe("2");
+
+    const enc = new TextEncoder();
+    const chunked = new Response(
+      new ReadableStream({
+        start(c) {
+          c.enqueue(enc.encode('{"type":"ent'));
+          c.enqueue(enc.encode('ry","seq":1}\n{"type":"entry","seq":2}'));
+          c.close();
+        },
+      }),
+    );
+    const got = [];
+    for await (const l of new AdminClient(URL_, "adm", {
+      fetch: async () => chunked,
+    }).auditExport())
+      got.push(l.seq);
+    expect(got).toEqual([1, 2]);
+  });
+
+  it("auditExport surfaces HTTP and parse errors", async () => {
+    const bad = mockFetch(() => jsonResponse({ error: "unauthorized" }, 401));
+    await expect(
+      (async () => {
+        for await (const _ of new AdminClient(URL_, "x", { fetch: bad.fetch }).auditExport())
+          void _;
+      })(),
+    ).rejects.toBeInstanceOf(ApiError);
+    const junk = mockFetch(() => new Response("nope\n"));
+    await expect(
+      (async () => {
+        for await (const _ of new AdminClient(URL_, "x", { fetch: junk.fetch }).auditExport())
+          void _;
+      })(),
+    ).rejects.toBeInstanceOf(OnbehalfError);
   });
 
   it("tails an empty log", async () => {
     const { fetch } = mockFetch((s) =>
       s.url.pathname.endsWith("checkpoint")
         ? jsonResponse({ seq: null, hash: null })
-        : jsonResponse({ entries: [], next: null }),
+        : jsonResponse({ entries: [], next: null, head: 0 }),
     );
     expect(await new AdminClient(URL_, "adm", { fetch }).auditTail(5)).toEqual([]);
   });

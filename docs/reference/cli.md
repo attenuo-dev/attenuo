@@ -3,7 +3,7 @@
 The `onbehalf` binary comes from the `onbehalf-cli` crate. It talks to a running onbehalf server over HTTP, except for `policy test` and `policy lint`, which run offline.
 
 ```
-onbehalf [--server URL] [--admin-token TOKEN] [--json] <command>
+onbehalf [--server URL] [--json] <command>
 ```
 
 ## Global options
@@ -11,10 +11,24 @@ onbehalf [--server URL] [--admin-token TOKEN] [--json] <command>
 | Option | Environment | Default | Meaning |
 | --- | --- | --- | --- |
 | `--server`, `--url` | `ONBEHALF_SERVER` | `http://127.0.0.1:8080` | Base URL of the onbehalf server. Goes before the subcommand. |
-| `--admin-token` | `ONBEHALF_ADMIN_TOKEN` | none | Bearer for `/admin/*`. |
+| `--admin-token-stdin` | | off | Read the admin token from the first line of standard input. |
+| `--admin-token-file PATH` | | none | Read the admin token from the first line of a file. |
+| `--admin-token TOKEN` | `ONBEHALF_ADMIN_TOKEN` | none | Bearer for `/admin/*`. Prefer the environment variable, stdin or a file: an argument is readable by other local users (`ps`, `/proc/<pid>/cmdline`) and lands in shell history, so the CLI prints a warning to stderr when it is used. |
 | `--json` | | off | Print machine-readable JSON instead of text. Works after any subcommand. |
 
 The `--server` flag of `call`, `tools` and `authzen eval` is different. It names the MCP upstream, for example `github`.
+
+## Secrets
+
+The admin token and the agent client secret are never taken from the argument list by default. For each, the CLI accepts, in this order of preference: the environment variable, `--…-file PATH`, `--…-stdin`, and (with a warning on stderr) the flag itself. A value from a file or stdin is the first line, without the line ending. At most one value can come from stdin per invocation. The flags are mutually exclusive on the command line.
+
+```sh
+export ONBEHALF_ADMIN_TOKEN=$(cat /run/secrets/onbehalf-admin)
+printf '%s\n' "$CODER_SECRET" | onbehalf token exchange --subject-token "$ROOT" --actor coder --client-secret-stdin --cap github:read_file
+onbehalf --admin-token-file /run/secrets/onbehalf-admin lease show "$LEASE"
+```
+
+Delegation tokens (`--token`, `--subject-token`) expire; `ONBEHALF_TOKEN` stands in for both, and `token inspect -` reads one from stdin.
 
 ## Argument forms
 
@@ -46,6 +60,10 @@ RFC 8693 exchange: delegate a subset of a token's capabilities to a sub-agent.
 | --- | --- |
 | `--subject-token` (`ONBEHALF_TOKEN`) | The parent token. Required. |
 | `--actor` | The sub-agent that will hold the new token. Required. |
+| `--client-secret-stdin` | Read the agent's client secret from the first line of standard input. |
+| `--client-secret-file PATH` | Read it from the first line of a file. |
+| `--client-secret` (`ONBEHALF_CLIENT_SECRET`) | The agent's client secret, required when the server has `require_actor_auth` (the default). Prefer the environment variable, stdin or a file; the flag prints a warning. |
+| `--client-id` | Client id to authenticate with. Defaults to `--actor`. |
 | `--cap` | Capability to hand over. Required, repeatable. Must be covered by the parent. |
 | `--ttl-seconds` | Requested lifetime, clamped to the parent's expiry. |
 | `--print token\|lease` | Print only that value. |

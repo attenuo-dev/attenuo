@@ -129,6 +129,12 @@ export function rpcOk(result: unknown, headers: Record<string, string> = {}) {
   return jsonResponse({ jsonrpc: "2.0", id: 1, result }, 200, headers);
 }
 
-export function rpcErr(code: number, message: string, data?: unknown, status = 200) {
-  return jsonResponse({ jsonrpc: "2.0", id: 1, error: { code, message, data } }, status);
+export function rpcErr(
+  code: number,
+  message: string,
+  data?: unknown,
+  status = 200,
+  headers: Record<string, string> = {},
+) {
+  return jsonResponse({ jsonrpc: "2.0", id: 1, error: { code, message, data } }, status, headers);
 }

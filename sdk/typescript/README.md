@@ -9,7 +9,7 @@ cd sdk/typescript
 npm install && npm run build   # ESM + CJS + .d.ts in dist/
 ```
 
-Node 20 or newer, zero runtime dependencies. It uses the global `fetch` and WebCrypto (`crypto.subtle` with `Ed25519`) for local token verification. It is the same API as the [Python SDK](../python/README.md), with camelCase names and promises.
+Node 20 or newer (Ed25519 in WebCrypto needs no flag there: it is available since Node 18.4, still documented as experimental), zero runtime dependencies. It uses the global `fetch` and WebCrypto (`crypto.subtle` with `Ed25519`) for local token verification. It is the same API as the [Python SDK](../python/README.md), with camelCase names and promises.
 
 ## Quickstart
 
@@ -71,7 +71,7 @@ console.log(await admin.auditVerify()); // { ok: true, entries: ..., firstBadSeq
 | `authzenEvaluate(token, server, tool, args?)`                                                               | AuthZEN decision without calling the tool. A deny is `{ decision: false, reason, decisionId, ... }`, not an exception.                                                                                                                                                                                                                                                |
 | `jwks()`                                                                                                    | `GET /.well-known/jwks.json`.                                                                                                                                                                                                                                                                                                                                         |
 | `inspect(jwt, { verify?, jwksUrl?, issuer?, audience? })`                                                   | Decode a token. With `verify: true` fetch the JWKS and check the Ed25519 signature, `typ`, `exp` and that `sub`/`act` match the chain.                                                                                                                                                                                                                                |
-| `new AdminClient(serverUrl, adminToken, opts?)`                                                             | `revokeLease`, `leaseStatus`, `audit`, `auditTail`, `auditCheckpoint`, `auditVerify`, `policyReload`, `mintRootDev`.                                                                                                                                                                                                                                                  |
+| `new AdminClient(serverUrl, adminToken, opts?)`                                                             | `revokeLease`, `leaseStatus`, `audit`, `auditHead` (reads `head` from `GET /admin/audit`, signs nothing), `auditTail`, `auditExport` (async iterator of JSON Lines objects), `auditCheckpoint` (explicit; signs and stores a checkpoint), `auditVerify`, `policyReload`, `mintRootDev`.                                                                               |
 
 Wherever a token is expected you can pass a `Token` or its JWT string; leave it out to use the client's default `token`.
 
@@ -92,14 +92,14 @@ Capabilities serialize as the server expects: `{ server, tool, constraints: { re
 
 ### Errors
 
-| Error               | When                                                                                                                                          |
-| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DeniedError`       | The proxy denied a call (JSON-RPC `-32003`). Branch on `reason` (`capability_denied`, `policy_deny`, `lease_revoked`, ...), log `decisionId`. |
-| `UnauthorizedError` | HTTP 401 or JSON-RPC `-32001`: the bearer is missing, malformed, expired or not ours. A subclass of `ApiError`.                               |
-| `ApiError`          | A non-success HTTP status. `status`, `error` (for example `invalid_scope`), `detail`.                                                         |
-| `RpcError`          | Any other JSON-RPC error (`code`, `rpcMessage`, `data`).                                                                                      |
-| `VerificationError` | `inspect(..., { verify: true })` failed.                                                                                                      |
-| `OnbehalfError`     | Base class; also thrown for responses that are not what the server sends.                                                                     |
+| Error               | When                                                                                                                                                                                                                                                                             |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DeniedError`       | The proxy denied a call (JSON-RPC `-32003` with the `X-Onbehalf-Decision-Id` header naming `data.decision_id`; an upstream's own `-32003` without that proof is an `RpcError`). Branch on `reason` (`capability_denied`, `policy_deny`, `lease_revoked`, ...), log `decisionId`. |
+| `UnauthorizedError` | HTTP 401 or JSON-RPC `-32001`: the bearer is missing, malformed, expired or not ours. A subclass of `ApiError`.                                                                                                                                                                  |
+| `ApiError`          | A non-success HTTP status. `status`, `error` (for example `invalid_scope`), `detail`.                                                                                                                                                                                            |
+| `RpcError`          | Any other JSON-RPC error (`code`, `rpcMessage`, `data`).                                                                                                                                                                                                                         |
+| `VerificationError` | `inspect(..., { verify: true })` failed.                                                                                                                                                                                                                                         |
+| `OnbehalfError`     | Base class; also thrown for responses that are not what the server sends.                                                                                                                                                                                                        |
 
 An AuthZEN deny and a tool's own `isError` are results, not exceptions.
 

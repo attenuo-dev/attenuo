@@ -154,7 +154,7 @@ export ONBEHALF_SERVER=http://127.0.0.1:8080   # and ONBEHALF_ADMIN_TOKEN, as th
 alias onbehalf=target/debug/onbehalf
 
 onbehalf token root --subject alice --issuer https://idp.example --agent planner --cap 'github:*'
-onbehalf token exchange --subject-token "$ROOT_TOKEN" --actor coder --client-secret coder-secret-change-me --cap github:read_file
+printf '%s\n' coder-secret-change-me | onbehalf token exchange --subject-token "$ROOT_TOKEN" --actor coder --client-secret-stdin --cap github:read_file
 onbehalf token inspect "$CHILD_TOKEN" --verify      # the chain as a tree; --verify checks it against the server's JWKS
 onbehalf call --token "$CHILD_TOKEN" --server github --tool read_file --arg repo=acme/api
 onbehalf lease revoke "$ROOT_LEASE" --reason demo
@@ -162,7 +162,7 @@ onbehalf audit tail -n 10 --follow
 onbehalf audit verify
 ```
 
-Other subcommands: `tools` (`tools/list`), `lease show`, `policy reload`, `authzen eval`. Output is for people by default and JSON with `--json`; `--print token|lease` on `token root` and `token exchange` prints one value for scripts. `--server` before the subcommand is the onbehalf URL; after `call` or `tools` it names the MCP upstream. Exit status is 0 on success, 1 on an error and 2 when the server said no (a denied call, a negative AuthZEN decision, a broken audit chain). `ONBEHALF_TOKEN` can stand in for `--token` and `--subject-token`, and `ONBEHALF_CLIENT_SECRET` for `--client-secret`.
+Other subcommands: `tools` (`tools/list`), `lease show`, `policy reload`, `authzen eval`. Output is for people by default and JSON with `--json`; `--print token|lease` on `token root` and `token exchange` prints one value for scripts. `--server` before the subcommand is the onbehalf URL; after `call` or `tools` it names the MCP upstream. Exit status is 0 on success, 1 on an error and 2 when the server said no (a denied call, a negative AuthZEN decision, a broken audit chain). `ONBEHALF_TOKEN` can stand in for `--token` and `--subject-token`. Secrets stay out of the argument list: the admin token and the agent client secret come from `ONBEHALF_ADMIN_TOKEN` / `ONBEHALF_CLIENT_SECRET`, `--admin-token-stdin` / `--client-secret-stdin`, or `--admin-token-file` / `--client-secret-file`. `--admin-token` and `--client-secret` still work but print a warning, since arguments show up in `ps` and shell history.
 
 A scripted end-to-end run of the GitHub leak scenario, with a fake MCP server, is in [examples/github-leak-demo](examples/github-leak-demo/README.md). A `Dockerfile` and `docker-compose.yml` run the same pair of servers in containers (untested).
 

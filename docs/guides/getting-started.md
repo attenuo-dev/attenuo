@@ -158,7 +158,7 @@ This uses the development endpoint `POST /admin/root-token`, which trusts you to
 Now delegate less to a sub-agent. The `coder` agent gets one tool:
 
 ```sh
-CODER=$(onbehalf token exchange --subject-token "$ROOT" --actor coder --client-secret "$CODER_SECRET" --cap github:read_file --print token)
+CODER=$(ONBEHALF_CLIENT_SECRET="$CODER_SECRET" onbehalf token exchange --subject-token "$ROOT" --actor coder --cap github:read_file --print token)
 onbehalf token inspect "$CODER" --verify
 ```
 
@@ -177,7 +177,7 @@ user alice  (issuer https://idp.example)
 verified: signature, type, issuer, audience, expiry, chain
 ```
 
-The exchange authenticates as `coder` with its client secret (`ONBEHALF_CLIENT_SECRET` works too), so only `coder` can receive a token in its own name. An exchange can only narrow. If `coder` tried to pass `github:create_issue` on to another agent, the exchange would fail, because the `coder` token only holds `read_file`.
+The exchange authenticates as `coder` with its client secret (from `ONBEHALF_CLIENT_SECRET`, as above, or `--client-secret-stdin` / `--client-secret-file`; avoid `--client-secret`, which shows up in `ps` and shell history), so only `coder` can receive a token in its own name. An exchange can only narrow. If `coder` tried to pass `github:create_issue` on to another agent, the exchange would fail, because the `coder` token only holds `read_file`.
 
 ## 7. Make a call
 

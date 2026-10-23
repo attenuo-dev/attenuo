@@ -85,7 +85,7 @@ onbehalf reads the request's `Host` header only to build the AuthZEN discovery d
 
 - The token is compared in constant time, and a missing token disables `/admin` (403) rather than opening it.
 - It sits in the config file in clear text. Treat the file as a secret: mode 0600, not in the image, not in the repository, not in a CI log. In Docker or Kubernetes, mount the whole file from a secret.
-- Operators pass it to the CLI with `ONBEHALF_ADMIN_TOKEN` or `--admin-token`. Prefer the environment variable, since command-line arguments show up in process listings.
+- Operators pass it to the CLI with `ONBEHALF_ADMIN_TOKEN`, `--admin-token-stdin` or `--admin-token-file`. `--admin-token` still works but prints a warning, since command-line arguments show up in process listings (`ps`, `/proc/<pid>/cmdline`) and shell history. The same goes for an agent's client secret (`ONBEHALF_CLIENT_SECRET`, `--client-secret-stdin`, `--client-secret-file`).
 - Rotating it means editing the file and restarting. There is no overlap window and no way to have two tokens.
 - Do not hand the admin token to agents. It can revoke any lease and read all audit entries. Agents use delegation tokens only.
 
