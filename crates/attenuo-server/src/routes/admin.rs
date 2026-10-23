@@ -1,5 +1,7 @@
 //! `/admin/*`: leases, audit log and policy reload. Every route requires the static admin
-//! bearer from `[admin] token` (v0; see [`require_admin`]).
+//! bearer from `[admin] token` (v0; see [`require_admin`]). The read-only policy routes
+//! (`GET /admin/policies`, `/check`, `POST /admin/policies/evaluate`) are in
+//! [`super::policies`].
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -792,7 +794,19 @@ pub async fn reload_policies(State(state): State<Arc<AppState>>) -> Result<Json<
             .map_err(|_| ApiError::internal("policy engine lock poisoned"))?;
         match engine.reload_policies_str(&text) {
             Err(e) => Err(e.to_string()),
-            Ok(()) => Ok((engine.policy_ids(), engine.validation_warnings().to_vec())),
+            Ok(()) => {
+                // Under the engine's write lock, so `GET /admin/policies` never pairs the new
+                // policies with the old digest. A failed reload leaves both as they were.
+                let mut loaded = state
+                    .loaded_policies
+                    .write()
+                    .map_err(|_| ApiError::internal("loaded policy info lock poisoned"))?;
+                *loaded = crate::state::LoadedPolicies {
+                    sha256: Some(digest.clone()),
+                    loaded_at: now,
+                };
+                Ok((engine.policy_ids(), engine.validation_warnings().to_vec()))
+            }
         }
     };
     let (ids, warnings) = match reloaded {

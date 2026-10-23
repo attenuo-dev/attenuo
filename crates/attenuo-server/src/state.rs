@@ -8,6 +8,7 @@ use attenuo_audit::{CheckpointKeys, SqliteAudit, SqliteLeaseStore};
 use attenuo_policy::{PolicyEngine, PolicyEngineBuilder};
 use attenuo_token::{Issuer, IssuerConfig, Verifier};
 use serde_json::Value;
+use sha2::Digest;
 use time::{Duration, OffsetDateTime};
 
 use crate::actor::ActorTrustRegistry;
@@ -29,6 +30,11 @@ pub struct AppState {
     pub leases: Arc<SqliteLeaseStore>,
     /// Policy file to re-read on reload; `None` when no policy file is configured.
     pub policies_path: Option<PathBuf>,
+    /// Digest and load time of the policy set in force, for `GET /admin/policies`. The engine
+    /// does not keep them, so they live here: set at startup and on every successful reload
+    /// (while the engine's write lock is held, so the two never disagree), and left alone by
+    /// a failed one.
+    pub loaded_policies: RwLock<LoadedPolicies>,
     pub admin_token: Option<String>,
     pub root_grants: Vec<RootGrant>,
     /// Trusted IdPs for hop-0 intake.
@@ -94,7 +100,11 @@ impl AppState {
         let verifier = issuer.verifier();
         let jwks = crate::jwks::jwks_from_keys(&issuer.trusted_public_keys())?;
 
-        let engine = build_engine(config)?;
+        let (engine, policies_sha256) = build_engine(config)?;
+        let loaded_policies = RwLock::new(LoadedPolicies {
+            sha256: policies_sha256,
+            loaded_at: OffsetDateTime::now_utc(),
+        });
         let policy = Arc::new(RwLock::new(engine));
 
         let checkpoint_keys = CheckpointKeys::from_jwks(&jwks)?;
@@ -199,6 +209,7 @@ impl AppState {
             ),
             leases,
             policies_path: config.policy.policies_path.clone(),
+            loaded_policies,
             admin_token: config.admin.token.clone(),
             root_grants: config.root_grants.clone(),
             idps,
@@ -247,6 +258,19 @@ impl AppState {
     ) -> OffsetDateTime {
         (now + self.lease_interval).min(token_exp)
     }
+}
+
+/// What is known about the policy set in force beyond what the engine holds.
+///
+/// `GET /admin/policies` reports it so an operator can tell which version of the file is
+/// loaded (and `GET /admin/policies/check` whether the file has changed since).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedPolicies {
+    /// Hex SHA-256 of the policy file text that was loaded; `None` when no
+    /// `policy.policies_path` is configured (no policies, every call denied).
+    pub sha256: Option<String>,
+    /// When that text was loaded: server start, or the last successful reload.
+    pub loaded_at: OffsetDateTime,
 }
 
 fn lease_interval(config: &Config) -> anyhow::Result<Duration> {
@@ -330,7 +354,11 @@ fn write_private_key(path: &Path, pem: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_engine(config: &Config) -> anyhow::Result<PolicyEngine> {
+/// Build the policy engine, and return the hex SHA-256 of the policy file text it loaded.
+///
+/// The file is read here (not by the builder) so the digest is of exactly the text the engine
+/// holds.
+fn build_engine(config: &Config) -> anyhow::Result<(PolicyEngine, Option<String>)> {
     let catalog = config.policy.load_catalog()?;
     let mut builder = PolicyEngineBuilder::new()
         .with_catalog(catalog)
@@ -360,21 +388,26 @@ fn build_engine(config: &Config) -> anyhow::Result<PolicyEngine> {
              apply to them"
         ),
     }
-    let builder = match &config.policy.policies_path {
-        Some(path) => builder.with_policies_file(path),
+    let (builder, digest) = match &config.policy.policies_path {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("loading policies: reading {}", path.display()))?;
+            let digest = hex::encode(sha2::Sha256::digest(text.as_bytes()));
+            (builder.with_policies_str(&text), Some(digest))
+        }
         None => {
             tracing::warn!(
                 "policy.policies_path is not set; no policies are loaded and every call is denied"
             );
-            builder
+            (builder, None)
         }
     };
     let engine = builder.build().context("loading policies")?;
     for w in engine.validation_warnings() {
         tracing::warn!(warning = %w, "policy validation warning");
     }
-    tracing::info!(policies = ?engine.policy_ids(), "policies loaded");
-    Ok(engine)
+    tracing::info!(policies = ?engine.policy_ids(), sha256 = ?digest, "policies loaded");
+    Ok((engine, digest))
 }
 
 /// A file sink on the same filesystem as the SQLite log does not get the checkpoints off the

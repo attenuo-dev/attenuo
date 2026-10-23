@@ -80,6 +80,9 @@ All admin routes need `Authorization: Bearer <admin token>`. They answer 401 wit
 | `GET /admin/audit/checkpoint` | The signed checkpoint of the head, `{seq, head_hash, at, kid, signature}` (signing it now if the head has none). For keeping outside the host. `hash` repeats `head_hash` for older clients. |
 | `GET /admin/audit/export?from&to` | Entries `from..=to` (default: the whole log) and the checkpoints in that range, streamed as `application/x-ndjson`: a `header` line, `entry` lines, then `checkpoint` lines. Verify offline with `attenuo audit verify --file`. 400 if `from` is 0 or `to < from`. |
 | `POST /admin/policies/reload` | Re-read the policy file. On failure the old policy stays. |
+| `GET /admin/policies` | The policy set in force: file path, its `sha256` and `loaded_at` (startup or last successful reload), `policy_ids`, validation `warnings`, and `policies: [{id, text}]`. |
+| `GET /admin/policies/check` | Lint the policy file as it is on disk now against the running schema, with line and column for each issue, and say whether it differs from the loaded one. Loads nothing, audits nothing. 409 `check_unavailable` without `policy.policies_path`. |
+| `POST /admin/policies/evaluate` | Dry run: what the loaded policies decide for one call, given a token or a chain. No lease check, no audit record, no decision metric. |
 | `POST /admin/root-token` | Development root mint. Mounted only when `[dev] allow_root_mint = true`. |
 
 ### Lease tree
@@ -142,6 +145,78 @@ The single-entry routes (`/admin/audit/entries/{seq}`, `/admin/audit/records/{id
 - `lease_states`: one object per lease in the record, root first, as the lease registry sees it now: `{lease_id, known, active, parent, expires_at, revoked_at, revoke_reason}`. A lease the registry does not hold has `known: false`.
 - `covered_by_checkpoint`: the oldest stored checkpoint at or after the entry, whose signature covers it through the hash chain, or null when the entry is newer than every checkpoint. It is returned as stored; `GET /admin/audit/verify` checks signatures.
 - `policy_reloaded_after`: the seq of the first successful `POST /admin/policies/reload` recorded after the entry, or null. When set, the policy in force now may not be the one that decided.
+
+### Policies: read, check, dry run
+
+These three routes change nothing and write no audit record. They answer the questions an operator has before acting: which policy file is loaded, would the edited file load, and what would the policies say about this call.
+
+`GET /admin/policies`:
+
+```json
+{
+  "path": "/etc/attenuo/policies.cedar",
+  "sha256": "9f2c...e1",
+  "loaded_at": "2026-10-23T19:02:11.52Z",
+  "policy_ids": ["issues", "public_reads"],
+  "warnings": [],
+  "policies": [
+    {"id": "issues", "text": "@id(\"issues\")\npermit(principal, action == Action::\"github/create_issue\", resource);"},
+    {"id": "public_reads", "text": "@id(\"public_reads\")\npermit(principal, action == Action::\"github/read_file\", resource)\nwhen { ... };"}
+  ]
+}
+```
+
+`sha256` and `loaded_at` describe the text the engine loaded, so after a failed reload they still name the old file. `path` and `sha256` are `null` when no policy file is configured.
+
+`GET /admin/policies/check` reads the file and lints it as `attenuo policy lint` does, against the schema of the running engine:
+
+```json
+{
+  "path": "/etc/attenuo/policies.cedar",
+  "sha256": "41b0...7a",
+  "loaded_sha256": "9f2c...e1",
+  "differs_from_loaded": true,
+  "ok": false,
+  "error_count": 1,
+  "warning_count": 0,
+  "issues": [
+    {"severity": "error", "stage": "validate", "policy_id": "public_reads",
+     "message": "...attribute `no_such_attribute` ... not found", "line": 3, "column": 8}
+  ],
+  "policy_ids": ["issues", "public_reads"]
+}
+```
+
+`ok` is true when there are no errors, which is when `POST /admin/policies/reload` would succeed.
+
+`POST /admin/policies/evaluate` takes an AuthZEN evaluation request (the body of `POST /access/v1/evaluation`) plus an optional `token`:
+
+```json
+{
+  "token": "<delegation token>",
+  "subject": {"type": "agent", "id": ""},
+  "action": {"name": "read_file"},
+  "resource": {"type": "tool", "id": "github/read_file", "properties": {"server": "github"}},
+  "context": {"input": {"repo": "alice/public-site"}}
+}
+```
+
+- With `token`, the token is verified with the server's keys and its chain is used; `subject.id` may be empty and `subject.properties.chain` may be left out (if present it must equal the token's chain, else 400 `chain_mismatch`). A bad signature or any other verification failure is 400 `invalid_token`. An expired token is accepted, verified as of the last second it was valid, and the answer has `token_expired: true`. The call counts as DPoP-bound when the token is bound (`cnf`).
+- Without `token`, `subject.properties.chain` is required (400 `invalid_request` otherwise) and is only checked structurally, as of now (400 `invalid_chain` if that fails). Nothing checks that this server issued it.
+
+```json
+{
+  "decision": "allow",
+  "reason": "policy_allow",
+  "policy_ids": ["public_reads"],
+  "diagnostics": [],
+  "lease_check": "skipped",
+  "chain_source": "token",
+  "token_expired": false
+}
+```
+
+`chain_source` is `token` or `admin_supplied`. The decision comes from the capability stage and Cedar, the same code `POST /access/v1/evaluation` runs after its lease check, so for a token with live leases the two agree on decision, reason and policy ids. A revoked or expired lease does not change the dry run's answer (`lease_check` is always `skipped`).
 
 ## Metrics
 
