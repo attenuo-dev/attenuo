@@ -50,7 +50,7 @@ inputs = { repo = "string" }
 
 It does two jobs:
 
-1. **Tool attributes** (`readonly`, `sensitive`) become `resource.readonly` and `resource.sensitive`. A tool that is not in the catalog is neither, so a `forbid` keyed on `sensitive` silently skips it. Register every tool the server exposes (MCP `tools/list` is the natural source).
+1. **Tool attributes** (`readonly`, `sensitive`) become `resource.readonly` and `resource.sensitive`. A tool that is not in the catalog is denied before Cedar runs, with reason `tool_not_in_catalog`, unless `[policy] unknown_tools` is `sensitive` (evaluated as `sensitive = true`) or `allow` (evaluated as neither, so a `forbid` keyed on `sensitive` silently skips it). Register every tool the server exposes (MCP `tools/list` is the natural source).
 2. **Schema generation.** Each tool becomes a declared action and each `inputs` entry a typed, optional attribute of `context.input`. Policies are validated against this schema at load time, so a typo in an argument name or a comparison of a string to a number fails the load instead of misbehaving on a call. A policy that names `Action::"x"` validates only if some catalog entry has a tool `x`. Argument types are `string`, `long`, `bool`, or `{ set = "string" }`.
 
 ### User attributes
@@ -158,6 +158,7 @@ A test file is YAML. Each case says who asks, through which chain, for what, and
 policies: ./policy.cedar            # relative to this file; optional (no policies means deny all)
 catalog: ./config.toml              # a server config's [policy.catalog] (and catalog_path), a .json
                                     # catalog, or an inline map as in the server config
+unknown_tools: deny                 # optional; default: the config's [policy] unknown_tools, else deny
 now: 1760000000                     # optional; evaluation time, unix seconds
 cases:
   - name: coder may read public docs

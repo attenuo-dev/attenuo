@@ -66,12 +66,14 @@ The response:
 
 Keep `access_token` and `lease`. You need the token for every call and the lease id if your orchestration wants to show or revoke it.
 
+Each ID token or ID-JAG can be used once. Presenting the same one again, from any agent, fails with `invalid_grant` / `replayed`, so fetch a fresh credential for every root token. The root token never outlives the credential: its `expires_in` is at most the time left until the credential's `exp`.
+
 ## How exchange works, hop to hop
 
 Take a run with a planner, a coder and a tester. Alice asks the planner to fix a bug.
 
 1. **Hop 0.** The planner trades Alice's login for a root token. The token says: Alice, acting through `planner`, may call `github:*`.
-2. **Hop 1.** The planner decides the coder should read files and open issues in one repository. It sends its own token to `POST /token` as the `subject_token`, names `coder` as the `actor`, and asks for `github:read_file` and `github:create_issue` limited to `acme/api`. The server checks that the request fits inside what the planner holds. It returns a new token for the coder. The planner passes it to the coder.
+2. **Hop 1.** The planner decides the coder should read files and open issues in one repository. It sends its own token to `POST /token` as the `subject_token`, names `coder` as the `actor`, authenticates with the coder's client credentials, and asks for `github:read_file` and `github:create_issue` limited to `acme/api`. The server checks that the request fits inside what the planner holds. It returns a new token for the coder. The planner passes it to the coder.
 3. **Hop 2.** The coder wants the tester to read files only. It repeats step 2 with its token and asks for `github:read_file`. The result is a token for the tester.
 
 At every step the rule is the same: the requested capabilities must be covered by the token you present, the new token cannot outlive its parent, and the chain cannot be deeper than `max_depth` (default 8). A request that breaks any of these fails with 400 and nothing is issued.
@@ -80,6 +82,7 @@ The exchange request, with a constraint, as JSON:
 
 ```sh
 curl -s -X POST https://onbehalf.example.com/token \
+  -u coder:$CODER_SECRET \
   -H 'content-type: application/json' \
   -d '{
     "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
@@ -101,6 +104,7 @@ The form encoding takes `scope` instead, a space-separated list of `server:tool`
 
 ```sh
 curl -s -X POST https://onbehalf.example.com/token \
+  -u coder:$CODER_SECRET \
   --data-urlencode grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
   --data-urlencode subject_token=$PLANNER_TOKEN \
   --data-urlencode subject_token_type=urn:ietf:params:oauth:token-type:jwt \
@@ -114,7 +118,9 @@ Rules to know:
 - A child must constrain every argument its parent constrains, at least as tightly. It may add constraints.
 - A child is covered only by a single parent capability, not by a combination of several. If you need to split authority, ask for each piece separately.
 - A parent whose lease is revoked, expired or unknown cannot delegate. The exchange fails with `invalid_grant`.
-- `actor` is a name you choose and the server records. In v0 it is asserted by the caller and not proven, so do not use agent ids as a security boundary between agents that share a runtime. The `[[agents]]` secrets protect hop 0 only.
+- `actor` must be an `[[agents]]` entry, and the request must authenticate as that agent with its client secret (HTTP Basic, or `client_id` and `client_secret` in the body). The agent receiving the token proves who it is, so whoever orchestrates the exchange needs the receiving agent's secret, or the receiving agent makes the request itself with the parent token. A wrong or missing secret is 401 `invalid_client`; authenticating as someone else is 400 `actor_mismatch`. An operator can turn this off with `[token] require_actor_auth = false` (the server warns), and then `actor` is only asserted.
+- An agent cannot appear twice in a chain (`duplicate_actor`).
+- A parent token delegates to a given actor once. A second exchange of the same token for the same actor is `invalid_grant` / `replayed`; renew the child's lease (below) to keep it alive instead.
 - Failed exchanges answer `{"error": "...", "detail": "..."}`. `invalid_scope` means you asked for too much. `invalid_grant` means the parent token or one of its leases is no good.
 
 Each hop gets its own lease. Revoking a lease revokes its whole subtree. So if the tester misbehaves, revoke the tester's lease and only the tester stops. If the planner's lease is revoked, all three stop.
@@ -155,11 +161,14 @@ What each reason means for the agent:
 | `lease_revoked` | The hop, or an ancestor, was revoked | Stop the run. This is the user or an operator pulling the plug. Do not renew or re-exchange. Surface it |
 | `lease_expired` | The lease ran out before it was renewed | Call `POST /token/renew`, then retry once. If renewal fails, stop |
 | `lease_unknown` | The server does not know a lease in the chain | Treat as fatal. The token was not issued by this server, or the database was reset |
+| `tool_not_in_catalog` | The tool is not in the server's catalog, and the operator denies unknown tools (the default) | Do not retry. The operator has to add the tool to `[policy.catalog]` |
 | `audit_error`, `lease_error`, `policy_error` | Internal failure. The server fails closed | Retry with backoff a few times, then give up and alert an operator |
 
 A request with no valid token is different: HTTP 401, JSON-RPC `-32001`, and `"id": null` when the proxy could not read the request id. The message ends in the cause, for example `lease inactive: lease_revoked` on a request that carries no per-call decision, such as `tools/list`. An expired or malformed token is a 401 as well. On a 401, a client that holds a fresh credential can re-run its exchange. One that does not should stop.
 
 Other proxy errors: `-32004` (HTTP 404) for an unknown upstream name, `-32005` (HTTP 502) when the upstream cannot be reached, `-32602` for a request missing a field the proxy needs.
+
+**Sessions.** The proxy binds each `Mcp-Session-Id` the upstream assigns to the user and the root lease of the token that opened it. Every agent of the same run (same root token lineage) can use the session; any other token gets HTTP 403 with JSON-RPC `-32003` and reason `session_mismatch`, on `POST`, `GET` and `DELETE` alike. A session id the proxy does not know, for example after a proxy restart or an hour without use, gets HTTP 404: start a new session with `initialize`, as MCP clients already do on 404.
 
 Good client behaviour:
 
@@ -238,14 +247,14 @@ Field notes:
 
 - `subject.type` must be `agent`. An empty `subject.id` is filled from the token's current agent.
 - `action.name` is the tool name. The server name comes from `action.properties.server` or `resource.properties.server`. `resource.type` is `tool`.
-- Tool arguments go in `context.input`. An optional `context.session_id` is passed to policy.
+- Tool arguments go in `context.input`. An optional `context.session_id` is passed to policy. (Through the MCP proxy, policy sees a 12-hex-digit hash prefix of the `Mcp-Session-Id`, not the id.)
 - The chain comes from the verified token. If you also send `subject.properties.chain`, it must equal the token's chain, or you get 400 `chain_mismatch`.
 - The call is audited as an ordinary decision, so the `decision_id` points at a real row.
 - Each question is a decision, and it is logged. Ask once per action you will enforce.
 
 The CLI does the same: `onbehalf authzen eval --token "$TOKEN" --server github --tool create_issue --arg repo=acme/api --arg title=x`. It exits 2 on a negative decision.
 
-**Without a bearer.** A PEP that cannot carry the token can send the chain in `subject.properties.chain`. The server then trusts the chain as asserted by the PEP. It still checks that the chain is well-formed and that every lease in it is live in its registry, so a chain it never issued is denied with `lease_unknown`. The signatures are not in the body, so this is only as trustworthy as the network path. Allow it only from PEPs you control. Prefer the bearer.
+**Without a bearer.** By default a request without a bearer gets 401. An operator can allow PEPs that cannot carry the token to send the chain in `subject.properties.chain` instead, with `[authzen] allow_unsigned_chain = true` and a `[[peps]]` entry per PEP. The PEP then authenticates with its client secret (HTTP Basic, or `client_id` and `client_secret` in the body). The server checks that the chain is well-formed, and that every hop's lease is live and was issued for exactly that chain prefix; a chain it never issued, or one with any field changed, is 403 `chain_not_issued`. Prefer the bearer.
 
 **Enforcing the answer.** onbehalf only answers. The PEP has to refuse the action on `false`, and refuse it when the call to onbehalf fails. A PEP that fails open turns onbehalf off. Revocation reaches a PEP only when it asks, since there is no push channel in v0. Do not cache an allow for longer than you are willing to leave a revoked agent running.
 

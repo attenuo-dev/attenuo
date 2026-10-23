@@ -10,7 +10,7 @@ onbehalf is pre-alpha. Do not treat this guide as a statement that it is ready f
 - **SQLite only.** The audit log and the lease registry live in the same SQLite file. Access is serialised behind a mutex, and the calls run on the async worker threads. That is fine at demo load. It has not been load tested. The only numbers are micro-benchmarks, in [design/performance.md](../design/performance.md).
 - **No high availability.** If the process is down, every call through the proxy fails. That is by design: onbehalf fails closed. Do not start a second replica against the same file, or against a copy. Each process would keep its own idea of which leases are revoked.
 - **No TLS.** The server speaks plain HTTP. Terminate TLS in front of it.
-- **One static admin token.** There are no operator accounts, roles or admin audit trail beyond the log lines the server writes.
+- **One static admin token.** There are no operator accounts or roles. Admin actions (lease revocations, policy reloads, development root mints) are recorded in the audit log as `by admin`.
 - **No metrics endpoint.** You monitor it through logs and the audit log. See [What to monitor](#what-to-monitor).
 - **Manual key rotation with no overlap.** See [Key rotation](#key-rotation).
 
@@ -22,15 +22,17 @@ Go through this before pointing anything real at the server.
 
 - [ ] `[dev] allow_root_mint` is `false` or absent. With it on, anyone holding the admin token can mint a root token for any user.
 - [ ] Root tokens come from a real identity provider: `[[idps]]`, `[[agents]]`, `[[root_grants]]`. See [Identity providers](identity-providers.md).
-- [ ] `[admin] token` is a long random value that is not in any example, not in version control and not shared with agents. Generate it with `openssl rand -hex 32`. The server does not refuse the example token from `config/example.toml`, even on a public bind, so this check is yours to make.
+- [ ] The admin token (`[admin] token`, or `ONBEHALF_ADMIN_TOKEN`, which overrides it) is a long random value that is not in any example, not in version control and not shared with agents. Generate it with `openssl rand -hex 32`. Off a loopback `listen` address the server refuses to start without one, with one shorter than 32 bytes, or with a known placeholder; it cannot tell whether your token was leaked.
+- [ ] Every agent that receives a token is an `[[agents]]` entry with its own secret: token exchanges authenticate as their `actor` (`[token] require_actor_auth`, on by default).
+- [ ] `[policy] unknown_tools` is `deny` (the default) or `sensitive`, not `allow`.
 - [ ] `/admin/*` is not reachable from the networks agents live on. See [Network exposure](#network-exposure).
 - [ ] TLS terminates in front of onbehalf, and agents reach it over HTTPS only.
 - [ ] `[issuer] private_key_pem_path` is set, the file is mode 0600, owned by the service user, and backed up somewhere safe. Without the setting the server makes a new key at every start and every token dies on restart.
 - [ ] `[audit] sqlite_path` is a real path on durable storage. The default is `:memory:`, which loses the audit log and every lease on exit. The server logs a warning when it is in memory.
 - [ ] `[issuer] issuer` is the URL clients will use, for example `https://onbehalf.example.com`. It becomes the `iss` of every token, and changing it later invalidates tokens. `[server] public_url` is set to the same base URL so the AuthZEN discovery document points at the right host.
 - [ ] `[policy] policies_path` points at your policy, and the catalog lists every tool a policy names.
-- [ ] Every tool on the upstream that matters is in the catalog. A tool missing from the catalog is neither `readonly` nor `sensitive`, so rules that depend on those attributes do not see it.
-- [ ] The config file is mode 0600. It holds the admin token. There is no environment-variable substitution, so inject the file at deploy time.
+- [ ] Every tool on the upstream that agents should call is in the catalog. With the default `[policy] unknown_tools = "deny"`, a tool missing from the catalog is denied with `tool_not_in_catalog`; with `"allow"` it is neither `readonly` nor `sensitive`, so rules that depend on those attributes do not see it.
+- [ ] The config file is mode 0600. It holds secret hashes and possibly the admin token. The admin token can come from `ONBEHALF_ADMIN_TOKEN` instead; there is no other environment-variable substitution, so inject the file at deploy time.
 - [ ] You have read the [threat model](../spec/threat-model.md) section "What onbehalf does not prevent" and have decided how the agents' other routes (direct API keys, local STDIO servers) are closed.
 - [ ] Something checks `onbehalf audit verify` on a schedule, and something copies `/admin/audit/checkpoint` off the host.
 
@@ -51,7 +53,7 @@ Binding to `0.0.0.0` puts `/admin` on the same listener as everything else. The 
 
 Two other exposure points to think about:
 
-- **`POST /access/v1/evaluation` without a bearer** accepts a delegation chain from the request body. The signatures are not in the body, so the server cannot check them, but every lease in the chain must still be live in this server's registry. Reach it only from PEPs you trust, or have PEPs send the delegation token as a bearer. See [Integrating MCP clients](integrating-mcp-clients.md#using-the-authzen-endpoint-from-a-non-mcp-pep).
+- **`POST /access/v1/evaluation` without a bearer** is refused with 401 unless `[authzen] allow_unsigned_chain = true`. With it on, only `[[peps]]` clients that authenticate can send a chain in the body, and the chain must be one this server issued (each lease is bound to its chain). See [Integrating MCP clients](integrating-mcp-clients.md#using-the-authzen-endpoint-from-a-non-mcp-pep).
 - **`POST /token` for hop 0** does an outbound fetch to your identity provider's discovery and JWKS URLs, but only after the agent has authenticated. Unknown issuers are rejected without a network call.
 
 ## TLS and a reverse proxy
