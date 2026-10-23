@@ -79,6 +79,10 @@ checkpoint_interval_seconds = 300
 # (never tear one; the chain still verifies, ending earlier). "full" fsyncs every commit and
 # costs throughput. Lease revocations always fsync. Ignored for ":memory:".
 durability = "normal"
+# A background thread checkpoints SQLite's write-ahead log into the database file this often
+# (and after every 256 commits), so appends do not wait while it copies; at "normal" that is
+# also when the newest decisions reach the disk. 0 leaves it to SQLite on the writer.
+wal_checkpoint_seconds = 5
 
 # MCP servers (Streamable HTTP), mounted at /mcp/<name>. `name` is the server part of
 # capabilities, e.g. "github:read_file".
