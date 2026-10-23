@@ -48,6 +48,28 @@ CASES_DIR = HERE / "cases"
 POLICIES_DIR = HERE / "policies"
 FROZEN_FILE = CASES_DIR / "test" / "POLICY_HASHES.json"
 
+# The suite starts its own server and CLI and sets what they need. These are the only ONBEHALF_*
+# variables it reads; any other (ONBEHALF_ADMIN_TOKEN, ONBEHALF_SERVER, ONBEHALF_TOKEN,
+# ONBEHALF_CONFIG, ...) comes from some other deployment and would redirect or break it.
+OWN_ENV = frozenset({"ONBEHALF_BIN_DIR", "ONBEHALF_INTEGRATION"})
+
+
+def ignore_inherited_env() -> list[str]:
+    """Remove inherited ``ONBEHALF_*`` variables from ``os.environ``; warn once if any were set."""
+    dropped = sorted(k for k in os.environ if k.startswith("ONBEHALF_") and k not in OWN_ENV)
+    for k in dropped:
+        del os.environ[k]
+    if dropped:
+        print(
+            f"warning: ignoring {', '.join(dropped)} from the environment: the suite starts "
+            "its own server",
+            file=sys.stderr,
+        )
+    return dropped
+
+
+ignore_inherited_env()
+
 sys.path.insert(0, str(ROOT / "sdk" / "python" / "src"))
 
 from onbehalf import (  # noqa: E402
@@ -1088,6 +1110,7 @@ def run(
     seed: int = 0,
 ) -> dict[str, Any]:
     """Run the arms and return a JSON-able result document."""
+    ignore_inherited_env()  # also covers variables exported after import
     bins = find_binaries()
     env = list(load_environment().values())
     all_upstreams = [s.upstream for s in env]

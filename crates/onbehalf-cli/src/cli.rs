@@ -455,7 +455,8 @@ pub enum PolicyCmd {
         /// The Cedar policy file.
         policy: std::path::PathBuf,
         /// Server config whose `[policy.catalog]` declares the tools (or a JSON catalog).
-        /// Without it the catalog is empty and any policy naming an action fails validation.
+        /// Without it, tools are declared from the policy's own `<server>/<tool>` action names
+        /// and a note says what could not be checked (tool attributes, input types).
         #[arg(long)]
         config: Option<std::path::PathBuf>,
         /// Also print the generated schema the policy was validated against.

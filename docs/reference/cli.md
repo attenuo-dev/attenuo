@@ -202,7 +202,7 @@ Parse a Cedar policy file and validate it against the generated schema. Prints e
 
 | Option | Meaning |
 | --- | --- |
-| `--config` | Server config whose `[policy.catalog]` declares the tools, or a JSON catalog. Without it the catalog is empty and any policy naming an action fails. |
+| `--config` | Server config whose `[policy.catalog]` declares the tools, or a JSON catalog. Without it, the tools are declared from the policy's own `<server>/<tool>` action names and a `note:` lists what could not be checked (tool attributes, input types, user attributes). |
 | `--schema` | Also print the generated schema. |
 
 ### `authzen eval`

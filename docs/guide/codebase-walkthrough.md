@@ -219,7 +219,7 @@ cargo bench -p onbehalf-policy --bench policy_stage               # translation 
 
 onbehalf policy test examples/github-leak-demo/policy_test.yaml    # 9 passed, 0 failed
 onbehalf policy lint examples/github-leak-demo/policy.cedar --config examples/github-leak-demo/config.toml
-# 3 policies, 0 error(s), 0 warning(s). Without --config the catalog is empty and lint reports a false error.
+# 3 policies, 0 error(s), 0 warning(s). Without --config lint declares the tools from the policy's own action names and prints a note about what it could not check.
 
 # Ask for a decision without calling the tool (needs the running server):
 onbehalf authzen eval --server github --tool read_file --arg repo=alice/public-x --arg path=a --token "$CODER"
@@ -501,11 +501,11 @@ Run it:
 
 ```sh
 python3 evaluation/injection-suite/label_rules.py dev test     # oracle agreement; kappa 1.0, no disagreements
-python3 -m pytest evaluation/injection-suite -q                # 14 passed, 3 skipped without ONBEHALF_INTEGRATION=1
+python3 -m pytest evaluation/injection-suite -q                # 15 passed, 4 skipped without ONBEHALF_INTEGRATION=1
 
 # The full run starts servers from prebuilt binaries and takes about half a minute.
 # --out keeps the results out of the committed results/ directory:
-env -u ONBEHALF_ADMIN_TOKEN -u ONBEHALF_SERVER ONBEHALF_BIN_DIR=$BIN \
+ONBEHALF_BIN_DIR=$BIN \
   python3 evaluation/injection-suite/run.py --split all --out /tmp/ob-inj --tag mine
 ls /tmp/ob-inj          # <date>-mine.json and <date>-mine.md; compare with results/2026-10-23-v2.md
 
@@ -518,7 +518,7 @@ cargo +nightly fuzz list
 cargo +nightly fuzz run dpop_proof -- -max_total_time=60
 ```
 
-The `env -u` is there because the runner starts its own servers and would otherwise pick up the `ONBEHALF_*` variables from section 0. The `cargo +nightly fuzz` commands, the `bench-e2e.sh` run and the Rust benches were not run for this page; the Python oracle, the pytest run and `run.py --out` were.
+The runner starts its own servers, so it ignores any `ONBEHALF_*` variables from section 0 (other than `ONBEHALF_BIN_DIR`) and prints one warning. The `cargo +nightly fuzz` commands, the `bench-e2e.sh` run and the Rust benches were not run for this page; the Python oracle, the pytest run and `run.py --out` were.
 
 ## 3. Why it is this way
 
@@ -596,7 +596,7 @@ Each of these is deliberate, and most were found by a review or the fuzzers. Whe
 - **A valid JWT is not enough.** Every call also needs every lease alive, so a token whose holder stopped renewing is denied while its signature and `exp` are fine. There is no lease cache in v0; revocation reaches the next request.
 - **`tools/list` shows less than the upstream has, and is not audited.** The filter uses capabilities only (no Cedar, no audit record), and it applies in JSON, batches and SSE. A listed tool can still be denied when called.
 - **Unknown tools are denied.** A tool absent from `[policy.catalog]` gets `tool_not_in_catalog`, and a `tools/call` name the upstream never listed gets `tool_not_listed`. Names are never normalized, so `Delete_Repo` is not `delete_repo`.
-- **`policy lint` without `--config` lies.** With no catalog the generated schema has no actions, so a correct server-scoped policy is reported as an error. Pass `--config`.
+- **`policy lint` without `--config` checks less.** It declares the tools from the policy's own `<server>/<tool>` action names, so a correct policy passes, but it cannot know `resource.readonly`, `resource.sensitive`, input types or user attributes. It prints a `note:` saying so. Pass `--config` for the full check.
 - **`--server` means two things.** Before the subcommand it is the onbehalf server's URL; after `call`, `tools` or `authzen eval` it is the MCP upstream name.
 - **The agent id `onbehalf` is reserved.** The server uses it for its own audit records, so no exchange may name it as the actor (SR-34, SR-45).
 - **`-32003` is only onbehalf's denial if the decision id is in the response header.** An upstream can send its own `-32003`; the SDKs and the examples raise `Denied` only when `data.decision_id` matches `X-Onbehalf-Decision-Id` (SR-32, SR-53).

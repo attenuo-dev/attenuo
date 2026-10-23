@@ -145,6 +145,22 @@ fn render_case(out: &mut String, case: &CaseReport) {
     }
 }
 
+/// A catalog declaring every `<server>/<tool>` action the policy names, with default
+/// attributes, plus the action ids that are not server-scoped (and so were left out).
+fn catalog_from_policy(text: &str) -> (onbehalf_policy::ToolCatalog, Vec<String>) {
+    let mut catalog = onbehalf_policy::ToolCatalog::new();
+    let mut skipped = Vec::new();
+    for id in onbehalf_policy::policy_action_names(text) {
+        match id.split_once('/') {
+            Some((server, tool)) if !server.is_empty() && !tool.is_empty() => {
+                catalog.insert(server, tool, onbehalf_policy::ToolAttrs::new());
+            }
+            _ => skipped.push(id),
+        }
+    }
+    (catalog, skipped)
+}
+
 /// `onbehalf policy lint <policy.cedar> [--config server.toml] [--schema]`
 pub fn lint(policy: &Path, config: Option<&Path>, show_schema: bool, json_out: bool) -> Run {
     let mut run = Run::new();
@@ -152,11 +168,32 @@ pub fn lint(policy: &Path, config: Option<&Path>, show_schema: bool, json_out: b
         Ok(t) => t,
         Err(e) => return Run::error(format!("reading {}: {e}", policy.display())),
     };
+    let mut notes: Vec<String> = Vec::new();
     let catalog = match config.map(testing::load_catalog).transpose() {
-        Ok(c) => c.unwrap_or_default(),
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            // No config: declare the tools the policy itself names so server-scoped actions
+            // validate. Tool attributes and argument types are unknown, so anything that
+            // depends on them cannot be checked.
+            let (catalog, skipped) = catalog_from_policy(&text);
+            notes.push(
+                "no --config: tools were declared from the policy's own action names; \
+                 `resource.readonly`, `resource.sensitive`, `context.input` types and user \
+                 attributes were not checked against a real catalog (pass --config <server.toml> \
+                 for the full check)"
+                    .to_string(),
+            );
+            if !skipped.is_empty() {
+                notes.push(format!(
+                    "no --config: not declared (not `<server>/<tool>`): {}",
+                    skipped.join(", ")
+                ));
+            }
+            catalog
+        }
         Err(e) => return Run::error(e.to_string()),
     };
-    let catalog_empty = catalog.is_empty();
+    let catalog_empty = catalog.is_empty() && config.is_some();
     let user_attrs = match config.map(testing::load_user_attrs).transpose() {
         Ok(a) => a.unwrap_or_default(),
         Err(e) => return Run::error(e.to_string()),
@@ -186,6 +223,7 @@ pub fn lint(policy: &Path, config: Option<&Path>, show_schema: bool, json_out: b
     if json_out {
         let mut v = serde_json::to_value(&report).unwrap_or_default();
         v["file"] = json!(policy);
+        v["notes"] = json!(notes);
         if show_schema {
             v["schema"] = json!(schema);
         }
@@ -197,6 +235,9 @@ pub fn lint(policy: &Path, config: Option<&Path>, show_schema: bool, json_out: b
                 run.stdout.push('\n');
             }
             run.stdout.push('\n');
+        }
+        for n in &notes {
+            let _ = writeln!(run.stdout, "note: {n}");
         }
         for i in &report.issues {
             let sev = match i.severity {
@@ -217,7 +258,7 @@ pub fn lint(policy: &Path, config: Option<&Path>, show_schema: bool, json_out: b
         if report.has_errors() && catalog_empty {
             let _ = writeln!(
                 run.stdout,
-                "hint: pass --config <server.toml> so tools named in the policy are declared from its [policy.catalog]"
+                "hint: the config declares no tools; add them under [policy.catalog] (or [policy] catalog_path)"
             );
         }
         let _ = writeln!(
@@ -310,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn lint_clean_with_config_and_noisy_without() {
+    fn lint_clean_with_and_without_config() {
         let d = tempfile::tempdir().unwrap();
         let p = write(d.path(), "p.cedar", POLICY);
         let c = write(d.path(), "c.toml", CONFIG);
@@ -318,9 +359,11 @@ mod tests {
         assert_eq!(ok.status, Status::Ok, "{}", ok.stdout);
         assert!(ok.stdout.contains("1 policy, 0 error(s)"));
 
-        let bad = lint(&p, None, false, false);
-        assert_eq!(bad.status, Status::Failed);
-        assert!(bad.stdout.contains("hint: pass --config"), "{}", bad.stdout);
+        // Without a config the policy's own action names declare the tools: no false error.
+        let bare = lint(&p, None, false, false);
+        assert_eq!(bare.status, Status::Ok, "{}", bare.stdout);
+        assert!(bare.stdout.contains("note: no --config"), "{}", bare.stdout);
+        assert!(bare.stdout.contains("0 error(s)"), "{}", bare.stdout);
     }
 
     #[test]

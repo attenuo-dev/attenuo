@@ -222,6 +222,15 @@ fn action_refs(text: &str) -> Vec<ActionRef> {
     out
 }
 
+/// Distinct action ids named as `Action::"<id>"` in `policy_text`, sorted. Used by the CLI to
+/// declare the policy's own server-scoped tools when no catalog is available.
+pub fn policy_action_names(policy_text: &str) -> Vec<String> {
+    let mut ids: Vec<String> = action_refs(policy_text).into_iter().map(|r| r.id).collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
 /// Issues for bare (not server-scoped) actions, SR-13.
 fn bare_action_issues(text: &str, options: LintOptions) -> Vec<LintIssue> {
     action_refs(text)

@@ -175,7 +175,7 @@ use time::OffsetDateTime;
 
 pub use catalog::{parse_user_attributes, ArgType, ToolAttrs, ToolCatalog, UnknownTools};
 pub use lint::{lint, LintIssue, LintReport, LintSeverity};
-pub use lint::{lint_with_options, LintOptions};
+pub use lint::{lint_with_options, policy_action_names, LintOptions};
 pub use schema::{action_id, default_user_attrs, DEFAULT_SCHEMA, GENERIC_ACTION};
 
 /// The starter policy set shipped with the crate (`policies/default.cedar`).
