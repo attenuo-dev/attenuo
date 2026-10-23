@@ -1,0 +1,223 @@
+// Policy page (#/policy): the policy set in force, a lint of the file on disk, reload after a
+// clean check, and a dry-run "evaluate this call" form.
+'use strict';
+
+import {
+  h, append, replace, mono, time, pill, decisionPill, table, empty, loading, kv, explainReason, jsonTree,
+} from './dom.js';
+import { api, showNotice } from './api.js';
+
+// GET /admin/policies, fetched once per login. Lock forgets it with the token.
+let cached = null;
+
+export function loadPolicies() {
+  if (!cached) {
+    cached = api('/admin/policies').catch((e) => {
+      cached = null;
+      throw e;
+    });
+  }
+  return cached;
+}
+
+export function forgetPolicyCache() {
+  cached = null;
+}
+
+export async function policyView(root) {
+  const loaded = h('section', { class: 'panel' }, loading());
+  append(root, [
+    h('div', { class: 'page-head' }, h('h1', null, 'Policy'),
+      h('span', { class: 'sub' }, 'What is loaded, whether the file on disk would load, and what the policies say about a call.')),
+    loaded,
+    checkPanel(() => {
+      forgetPolicyCache();
+      showLoaded(loaded);
+    }),
+    evaluatePanel(),
+  ]);
+  await showLoaded(loaded);
+}
+
+async function showLoaded(box) {
+  replace(box, loading());
+  const p = await loadPolicies();
+  replace(box,
+    h('header', null, h('h2', null, 'Loaded policies'),
+      h('span', { class: 'small muted' }, `${p.policies.length} polic${p.policies.length === 1 ? 'y' : 'ies'}`)),
+    kv([
+      ['File', p.path ? mono(p.path) : h('span', { class: 'muted' }, 'none configured (the built-in set is in force)')],
+      ['sha256', p.sha256 ? mono(p.sha256) : null],
+      ['Loaded at', time(p.loaded_at)],
+    ]),
+    p.warnings.length
+      ? h('div', { class: 'callout warn' }, h('p', null, 'Validation warnings:'), h('ul', null, p.warnings.map((w) => h('li', null, String(w)))))
+      : null,
+    p.policies.length
+      ? p.policies.map((x) => h('div', { class: 'policy-item' }, h('h3', null, mono(x.id)), h('pre', null, x.text)))
+      : empty('No policies are loaded, so every call that reaches the policy stage is denied.'));
+}
+
+function checkPanel(afterReload) {
+  const out = h('div', { class: 'stack' });
+  const reloadNote = h('span', { class: 'small muted' }, 'Reload is enabled after a check with no errors.');
+  const reloadBtn = h('button', { type: 'button', class: 'primary', disabled: true, on: { click: reload } }, 'Reload');
+  const checkBtn = h('button', { type: 'button', on: { click: check } }, 'Check file on disk');
+
+  async function check() {
+    checkBtn.disabled = true;
+    reloadBtn.disabled = true;
+    replace(out, loading());
+    try {
+      const c = await api('/admin/policies/check', { quiet: [409] });
+      const issues = c.issues.map((i) => h('tr', null,
+        h('td', null, pill(i.severity, i.severity === 'error' ? 'error' : 'warning')),
+        h('td', { class: 'num' }, mono(i.line ?? '—')),
+        h('td', { class: 'num' }, mono(i.column ?? '—')),
+        h('td', null, i.policy_id ? mono(i.policy_id) : '—'),
+        h('td', null, i.stage ?? ''),
+        h('td', { class: 'wrap' }, i.message)));
+      replace(out,
+        h('div', { class: 'row' },
+          pill(c.ok ? 'ok' : 'errors', c.ok ? 'ok' : 'error', true),
+          h('span', null, `${c.error_count} error${c.error_count === 1 ? '' : 's'}, ${c.warning_count} warning${c.warning_count === 1 ? '' : 's'}`),
+          c.differs_from_loaded
+            ? pill('differs from loaded', 'warn')
+            : pill('same as loaded', '')),
+        kv([['File', mono(c.path)], ['sha256 on disk', mono(c.sha256)], ['sha256 loaded', c.loaded_sha256 ? mono(c.loaded_sha256) : null]]),
+        issues.length ? table(['Severity', 'Line', 'Col', 'Policy', 'Stage', 'Message'], issues, { short: true }) : null);
+      reloadBtn.disabled = !c.ok;
+    } catch (e) {
+      if (e.status === 401) return;
+      replace(out, h('p', { class: 'callout' }, e.status === 409
+        ? 'No policy file is configured (policy.policies_path), so there is nothing to check or reload.'
+        : `The check failed: ${e.message}`));
+    } finally {
+      checkBtn.disabled = false;
+    }
+  }
+
+  async function reload() {
+    reloadBtn.disabled = true;
+    try {
+      const r = await api('/admin/policies/reload', { method: 'POST', body: {}, quiet: [404, 422] });
+      showNotice(`Reloaded: ${r.policy_ids.length} polic${r.policy_ids.length === 1 ? 'y' : 'ies'}, sha256 ${r.sha256.slice(0, 12)}…`);
+      afterReload();
+    } catch (e) {
+      if (e.status === 401) return;
+      if (e.status === 404) {
+        reloadNote.textContent = 'Writes are disabled on this listener ([admin_ui] allow_write). Reload with the CLI against the main listener.';
+      } else {
+        reloadNote.textContent = `The reload was refused and the old policies stay in force: ${e.message}`;
+      }
+    }
+  }
+
+  return h('section', { class: 'panel' },
+    h('header', null, h('h2', null, 'Check and reload'), checkBtn, reloadBtn),
+    reloadNote,
+    out);
+}
+
+// ---- dry-run evaluation -----------------------------------------------------------------
+
+function evaluatePanel() {
+  const field = (id, label, input, wide) => h('div', { class: `field${wide ? ' wide' : ''}` }, h('label', { for: id }, label), input);
+  const tokenIn = h('textarea', { id: 'ev-token', rows: 3, spellcheck: 'false', autocomplete: 'off', placeholder: 'eyJhbGciOi… (optional; expired tokens are accepted)' });
+  const chainIn = h('textarea', { id: 'ev-chain', rows: 4, spellcheck: 'false', placeholder: '{"originating_user": {...}, "hops": [...]}  (used only without a token)' });
+  const serverIn = h('input', { id: 'ev-server', required: true, placeholder: 'github', autocomplete: 'off' });
+  const toolIn = h('input', { id: 'ev-tool', required: true, placeholder: 'read_file', autocomplete: 'off' });
+  const argsIn = h('textarea', { id: 'ev-args', rows: 3, spellcheck: 'false', placeholder: '{"repo": "alice/public-docs"}' });
+  const out = h('div', { class: 'stack' });
+
+  const form = h('form', {
+    class: 'eval-form',
+    on: {
+      submit: async (ev) => {
+        ev.preventDefault();
+        let body;
+        try {
+          body = buildRequest(tokenIn.value.trim(), chainIn.value.trim(), serverIn.value.trim(), toolIn.value.trim(), argsIn.value.trim());
+        } catch (e) {
+          replace(out, h('p', { class: 'callout bad' }, e.message));
+          return;
+        }
+        replace(out, loading());
+        try {
+          const r = await api('/admin/policies/evaluate', { method: 'POST', body, quiet: [400] });
+          replace(out, evalResult(r));
+        } catch (e) {
+          if (e.status === 401) return;
+          replace(out, h('p', { class: 'callout bad' }, `${e.code}: ${e.message}`));
+        }
+      },
+    },
+  },
+  field('ev-token', 'Delegation token', tokenIn, true),
+  field('ev-chain', 'Or a chain (JSON)', chainIn, true),
+  field('ev-server', 'Server', serverIn),
+  field('ev-tool', 'Tool', toolIn),
+  field('ev-args', 'Arguments (JSON object)', argsIn, true),
+  h('div', { class: 'wide row' },
+    h('button', { type: 'submit', class: 'primary' }, 'Evaluate'),
+    h('span', { class: 'small muted' }, 'A dry run: no lease check, no audit record, no metrics. The token is sent to this server only.')));
+
+  return h('section', { class: 'panel' },
+    h('header', null, h('h2', null, 'Evaluate this call')),
+    form,
+    out);
+}
+
+/** The AuthZEN evaluation request of POST /admin/policies/evaluate. */
+function buildRequest(token, chainText, server, tool, argsText) {
+  if (!server || !tool) throw new Error('Server and tool are required.');
+  let input = {};
+  if (argsText) {
+    try {
+      input = JSON.parse(argsText);
+    } catch (e) {
+      throw new Error(`The arguments are not valid JSON: ${e.message}`);
+    }
+    if (input === null || typeof input !== 'object' || Array.isArray(input)) throw new Error('The arguments must be a JSON object.');
+  }
+  const req = {
+    subject: { type: 'agent', id: '' },
+    action: { name: tool },
+    resource: { type: 'tool', id: `${server}/${tool}`, properties: { server } },
+    context: { input },
+  };
+  if (token) {
+    req.token = token;
+  } else {
+    if (!chainText) throw new Error('Give either a token or a chain.');
+    let chain;
+    try {
+      chain = JSON.parse(chainText);
+    } catch (e) {
+      throw new Error(`The chain is not valid JSON: ${e.message}`);
+    }
+    const hops = chain && Array.isArray(chain.hops) ? chain.hops : [];
+    // subject.id must name the chain's current (last) agent.
+    req.subject.id = hops.length ? String(hops[hops.length - 1].agent ?? '') : '';
+    req.subject.properties = { chain };
+  }
+  return req;
+}
+
+function evalResult(r) {
+  return h('div', { class: 'stack' },
+    h('div', { class: 'verdict' },
+      decisionPill(r.decision, true),
+      h('span', { class: 'reason' }, r.reason),
+      h('span', { class: 'explain' }, explainReason(r.reason) || 'No description for this reason code.')),
+    r.token_expired ? h('p', { class: 'callout warn' }, 'The token has expired. This is what the policy says; the real call would be refused.') : null,
+    kv([
+      ['Policy ids', r.policy_ids.length ? r.policy_ids.map((p, i) => [i ? ', ' : null, mono(p)]) : h('span', { class: 'muted' }, 'none')],
+      ['Lease check', mono(r.lease_check)],
+      ['Chain source', h('span', null, mono(r.chain_source), r.chain_source === 'admin_supplied' ? ' (not checked to be issued by this server)' : '')],
+      ['Token expired', r.token_expired ? 'yes' : 'no'],
+    ]),
+    r.diagnostics && r.diagnostics.length
+      ? h('div', null, h('h3', null, 'Diagnostics'), jsonTree(r.diagnostics, true))
+      : h('p', { class: 'small muted' }, 'No diagnostics.'));
+}
