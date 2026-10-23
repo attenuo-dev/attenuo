@@ -71,11 +71,50 @@ console.log(await admin.auditVerify()); // { ok: true, entries: ..., firstBadSeq
 | `authzenEvaluate(token, server, tool, args?)`                                                                                     | AuthZEN decision without calling the tool. A deny is `{ decision: false, reason, decisionId, ... }`, not an exception.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `jwks()`                                                                                                                          | `GET /.well-known/jwks.json`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `inspect(jwt, { verify?, jwksUrl?, issuer?, audience? })`                                                                         | Decode a token. With `verify: true` fetch the JWKS and check the Ed25519 signature, `typ`, `exp` and that `sub`/`act` match the chain.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `new AdminClient(serverUrl, adminToken, opts?)`                                                                                   | `revokeLease`, `leaseStatus`, `audit`, `auditHead` (reads `head` from `GET /admin/audit`, signs nothing), `auditTail`, `auditExport` (async iterator of JSON Lines objects; optional `{ kind, chainId }` filter), `auditCheckpoint` (explicit; signs and stores a checkpoint), `auditVerify`, `policyReload`, `mintRootDev`.                                                                                                                                                                                                                                                                                                                               |
+| `new AdminClient(serverUrl, adminToken, opts?)`                                                                                   | `revokeLease`, `leaseStatus`, `audit`, `auditHead` (reads `head` from `GET /admin/audit`, signs nothing), `auditTail`, `auditExport` (async iterator of JSON Lines objects; optional `{ kind, chainId }` filter), `auditCheckpoint` (explicit; signs and stores a checkpoint), `auditVerify`, `policyReload`, `mintRootDev`; and the read-only console helpers below (`auditQuery`, `auditIter`, `auditEntry`, `auditRecord`, `auditCheckpoints`, `leaseTree`, `policies`, `policyCheck`, `policyEvaluate`).                                                                                                                                               |
 
 Wherever a token is expected you can pass a `Token` or its JWT string; leave it out to use the client's default `token`.
 
 A `Token` carries `lease`, `expiresAt`, `chain` (user and hops with capabilities), `agents`, `agent`, `subject`, and `verified`. The JWT is available as `token.jwt` and `String(token)`, but it is not an enumerable property, so `console.log(token)` and `JSON.stringify(token)` do not print it. Everything decoded from a token is untrusted unless `verified` is true.
+
+### Admin: querying the audit log, lease trees, policies
+
+These wrap the read-only operator routes the admin console uses. None of them signs, changes or audits anything.
+
+```ts
+const admin = new AdminClient(URL, "dev-admin-token-change-me");
+
+// Newest denials first. A filtered page can come back short (even empty) with a link still
+// set, so iterate rather than reading one page: auditIter follows prev/next until null.
+for await (const e of admin.auditIter({ order: "desc", decision: "deny", agent: "coder" })) {
+  console.log(e.seq, e.record.reason, e.record.tool);
+}
+const page = await admin.auditQuery({ kind: ["lease_renew"], lease: leaseId, limit: 50 });
+
+const detail = await admin.auditRecord(denied.decisionId); // or admin.auditEntry(seq)
+console.log(detail.leaseStates, detail.coveredByCheckpoint, detail.policyReloadedAfter);
+
+await admin.auditCheckpoints({ limit: 20 }); // stored checkpoints, newest first; never signs
+const tree = await admin.leaseTree(leaseId); // what a revoke would reach
+
+await admin.policies(); // the loaded set: path, sha256, loadedAt, { id: text }
+await admin.policyCheck(); // lint the file on disk now; ok means a reload would succeed
+const ev = await admin.policyEvaluate("github", "read_file", { repo: "alice/x" }, { token: coder });
+console.log(ev.decision, ev.reason, ev.policyIds); // no lease check, no audit record
+```
+
+| Call                                                      | Route                                                         | Returns                                                                            |
+| --------------------------------------------------------- | ------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `auditQuery(query?)`                                      | `GET /admin/audit`                                            | `{ entries, next, prev, head }`                                                    |
+| `auditIter(query?)` (`limit` defaults to 1000)            | `GET /admin/audit`, repeated                                  | async iterator of `AuditEntry`, following `next` (asc) or `prev` (desc) until null |
+| `auditEntry(seq)`, `auditRecord(id)`                      | `GET /admin/audit/entries/{seq}`, `/admin/audit/records/{id}` | `{ entry, leaseStates, coveredByCheckpoint, policyReloadedAfter }`                 |
+| `auditCheckpoints({ before?, limit? })`                   | `GET /admin/audit/checkpoints`                                | `{ checkpoints, prev }`                                                            |
+| `leaseTree(leaseId, maxNodes?)`                           | `GET /admin/leases/{id}/tree`                                 | `{ root, ancestors, nodes, wouldRevoke, truncated }`                               |
+| `policies()`                                              | `GET /admin/policies`                                         | `{ path, sha256, loadedAt, policyIds, warnings, policies }`                        |
+| `policyCheck()`                                           | `GET /admin/policies/check`                                   | `{ ok, issues, differsFromLoaded, ... }`                                           |
+| `policyEvaluate(server, tool, args?, { token?, chain? })` | `POST /admin/policies/evaluate`                               | `{ decision, allowed, reason, policyIds, ..., tokenExpired }`                      |
+
+`AuditQuery` takes `order` (`"asc"` with `from`, or `"desc"` with `before`), `limit`, and exact-match filters combined with AND: `kind` (one or an array), `decision`, `reason`, `subject`, `agent`, `lease`, `server`, `tool`, `chainId`, and `since` / `until` (RFC 3339 strings or `Date`s). Errors map as everywhere else: a 404 for an unknown seq, record or lease is an `ApiError` with `status: 404`, a bad filter is a 400 `invalid_request`.
 
 ### Capabilities
 
