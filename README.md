@@ -17,6 +17,7 @@ Delegated authorization for software agents. onbehalf lets a principal hand an a
 - [RFC-0001: onbehalf](docs/spec/rfc-0001-onbehalf.md): what the system is, the token model, the policy and audit design.
 - [docs/](docs/README.md): specifications, architecture decisions, research notes, task board and engineering log.
 - [Python SDK](sdk/python/README.md): `pip install -e sdk/python`, sync and async clients, an admin client, and an [agent example](examples/python-agent/agent.py).
+- [TypeScript SDK](sdk/typescript/README.md): `@onbehalf/sdk` (Node 20+, no runtime dependencies), the same API with promises, and an [agent example](examples/typescript-agent/agent.ts).
 - [examples/github-leak-demo](examples/github-leak-demo/README.md): the May 2025 GitHub MCP prompt-injection leak, replayed and stopped (`run.sh`, about a minute).
 - [docs/guides/writing-policies.md](docs/guides/writing-policies.md): writing Cedar policies for agents and testing them offline with `onbehalf policy test` and `onbehalf policy lint`, including a CI recipe.
 - [CONTRIBUTING.md](CONTRIBUTING.md): how to build, test and submit changes.
@@ -179,6 +180,30 @@ with Client("http://127.0.0.1:8080") as ob:
 ```
 
 It is pre-alpha like the rest and is not published to PyPI.
+
+## TypeScript SDK
+
+[`sdk/typescript`](sdk/typescript/README.md) is the same client for Node 20 or newer as the npm package `@onbehalf/sdk` (ESM and CJS, strict types, no runtime dependencies, global `fetch`, Ed25519 verification through WebCrypto): `OnbehalfClient` for exchange, renew, `callTool` (throws `DeniedError` with `reason` and `decisionId`), `listTools`, AuthZEN and `inspect`, and `AdminClient` for revocation, the audit log and policy reload. `mcpUrl` and `mcpHeaders` point the official `@modelcontextprotocol/sdk` client at the proxy. [`examples/typescript-agent`](examples/typescript-agent/agent.ts) shows a planner delegating to a coder.
+
+```ts
+import { AdminClient, DeniedError, OnbehalfClient, capability, prefix } from "@onbehalf/sdk";
+
+const admin = new AdminClient("http://127.0.0.1:8080", "dev-admin-token-change-me");
+const root = await admin.mintRootDev("alice", "https://idp.example", "planner", {
+  capabilities: ["github:*"], // dev only
+});
+const ob = new OnbehalfClient("http://127.0.0.1:8080");
+const coder = await ob.exchange(root, "coder", [
+  capability("github", "read_file", { repo: prefix("alice/public-") }),
+]);
+try {
+  await ob.callTool(coder, "github", "create_issue", { repo: "alice/public-docs", title: "x" });
+} catch (e) {
+  if (e instanceof DeniedError) console.log(e.reason, e.decisionId); // capability_denied <audit record id>
+}
+```
+
+It is pre-alpha like the rest and is not published to npm.
 
 ## License
 
