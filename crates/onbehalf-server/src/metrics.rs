@@ -1,4 +1,4 @@
-//! Prometheus metrics: hand-rolled counters and one histogram, plus the text exposition writer.
+//! Prometheus metrics: hand-rolled counters and histograms, plus the text exposition writer.
 //!
 //! No dependency: a few atomics and two small maps behind mutexes. Label values come from
 //! fixed sets (reason codes, route templates, status codes), so cardinality stays bounded.
@@ -16,16 +16,24 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use onbehalf_proxy::Stage;
 
 /// Upper bounds (seconds) of the `authorize_duration_seconds` buckets.
 pub const BUCKETS: [f64; 11] = [
     0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
 ];
 
+/// Upper bounds (seconds) of the `proxy_stage_seconds` buckets: 1 us to 1 s, five per decade,
+/// fine enough to read a median off stages that take a few microseconds.
+pub const STAGE_BUCKETS: [f64; 31] = [
+    1e-6, 2e-6, 3e-6, 5e-6, 7e-6, 1e-5, 2e-5, 3e-5, 5e-5, 7e-5, 1e-4, 2e-4, 3e-4, 5e-4, 7e-4, 1e-3,
+    2e-3, 3e-3, 5e-3, 7e-3, 1e-2, 2e-2, 3e-2, 5e-2, 7e-2, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0,
+];
+
 const PREFIX: &str = "onbehalf";
 
 /// All server metrics. Cheap to share: clone the `Arc`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Metrics {
     /// (decision, reason) -> count
     decisions: Mutex<BTreeMap<(String, String), u64>>,
@@ -40,24 +48,55 @@ pub struct Metrics {
     authorize: Histogram,
     /// Time for one audit append, lock wait and commit included.
     audit_append: Histogram,
+    /// Per-stage time of proxied calls, indexed by [`Stage::index`].
+    stages: [Histogram; Stage::ALL.len()],
 }
 
-/// A fixed-bucket histogram over [`BUCKETS`].
-#[derive(Debug, Default)]
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            decisions: Mutex::default(),
+            http: Mutex::default(),
+            tokens_root: AtomicU64::default(),
+            tokens_exchange: AtomicU64::default(),
+            leases_revoked: AtomicU64::default(),
+            audit_append_errors: AtomicU64::default(),
+            audit_checkpoints: AtomicU64::default(),
+            authorize: Histogram::new(&BUCKETS),
+            audit_append: Histogram::new(&BUCKETS),
+            stages: std::array::from_fn(|_| Histogram::new(&STAGE_BUCKETS)),
+        }
+    }
+}
+
+/// A fixed-bucket histogram.
+#[derive(Debug)]
 struct Histogram {
+    /// Upper bounds, ascending.
+    bounds: &'static [f64],
     /// Non-cumulative per-bucket counts; the last slot is `+Inf`.
-    buckets: [AtomicU64; BUCKETS.len() + 1],
+    buckets: Box<[AtomicU64]>,
     nanos: AtomicU64,
     count: AtomicU64,
 }
 
 impl Histogram {
+    fn new(bounds: &'static [f64]) -> Self {
+        Self {
+            bounds,
+            buckets: (0..=bounds.len()).map(|_| AtomicU64::new(0)).collect(),
+            nanos: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
     fn observe(&self, d: Duration) {
         let secs = d.as_secs_f64();
-        let i = BUCKETS
+        let i = self
+            .bounds
             .iter()
             .position(|b| secs <= *b)
-            .unwrap_or(BUCKETS.len());
+            .unwrap_or(self.bounds.len());
         self.buckets[i].fetch_add(1, Ordering::Relaxed);
         let nanos = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
         self.nanos.fetch_add(nanos, Ordering::Relaxed);
@@ -66,21 +105,37 @@ impl Histogram {
 
     fn render(&self, out: &mut String, name: &str, help: &str) {
         header_lines(out, name, help, "histogram");
+        self.render_samples(out, name, "");
+    }
+
+    /// The `_bucket`, `_sum` and `_count` lines. `labels` is empty or `key="value",` pairs,
+    /// each followed by a comma, placed before `le`.
+    fn render_samples(&self, out: &mut String, name: &str, labels: &str) {
         let mut cumulative = 0;
-        for (i, bound) in BUCKETS.iter().enumerate() {
+        for (i, bound) in self.bounds.iter().enumerate() {
             cumulative += self.buckets[i].load(Ordering::Relaxed);
-            let _ = writeln!(out, "{PREFIX}_{name}_bucket{{le=\"{bound}\"}} {cumulative}");
+            let _ = writeln!(
+                out,
+                "{PREFIX}_{name}_bucket{{{labels}le=\"{bound}\"}} {cumulative}"
+            );
         }
-        cumulative += self.buckets[BUCKETS.len()].load(Ordering::Relaxed);
-        let _ = writeln!(out, "{PREFIX}_{name}_bucket{{le=\"+Inf\"}} {cumulative}");
+        cumulative += self.buckets[self.bounds.len()].load(Ordering::Relaxed);
         let _ = writeln!(
             out,
-            "{PREFIX}_{name}_sum {}",
+            "{PREFIX}_{name}_bucket{{{labels}le=\"+Inf\"}} {cumulative}"
+        );
+        let braced = labels
+            .strip_suffix(',')
+            .map(|l| format!("{{{l}}}"))
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "{PREFIX}_{name}_sum{braced} {}",
             self.nanos.load(Ordering::Relaxed) as f64 / 1e9
         );
         let _ = writeln!(
             out,
-            "{PREFIX}_{name}_count {}",
+            "{PREFIX}_{name}_count{braced} {}",
             self.count.load(Ordering::Relaxed)
         );
     }
@@ -146,6 +201,11 @@ impl Metrics {
         let out = append();
         self.observe_audit_append(started.elapsed());
         out
+    }
+
+    /// Record how long one stage of a proxied call took (see [`Stage`]).
+    pub fn observe_stage(&self, stage: Stage, d: Duration) {
+        self.stages[stage.index()].observe(d);
     }
 
     /// Count one signed audit checkpoint.
@@ -231,6 +291,21 @@ impl Metrics {
             "audit_append_duration_seconds",
             "Time for one audit log append, including waiting for the store's lock.",
         );
+        header_lines(
+            &mut out,
+            "proxy_stage_seconds",
+            "Time spent in each stage of a proxied call (token verification, lease check, \
+             policy, audit append, blocking-pool hop, upstream round trip, response handling, \
+             total).",
+            "histogram",
+        );
+        for stage in Stage::ALL {
+            self.stages[stage.index()].render_samples(
+                &mut out,
+                "proxy_stage_seconds",
+                &format!("stage=\"{}\",", stage.as_str()),
+            );
+        }
         out
     }
 }
@@ -338,5 +413,38 @@ mod tests {
         assert!(text.contains("onbehalf_audit_checkpoints_total 2\n"));
         // The two histograms are independent.
         assert!(text.contains("onbehalf_authorize_duration_seconds_count 0\n"));
+    }
+
+    #[test]
+    fn renders_stage_histograms_with_labels() {
+        let m = Metrics::new();
+        m.observe_stage(Stage::Policy, Duration::from_micros(12));
+        m.observe_stage(Stage::Policy, Duration::from_micros(40));
+        m.observe_stage(Stage::Upstream, Duration::from_millis(2));
+        let text = m.render();
+        assert!(text.contains("# TYPE onbehalf_proxy_stage_seconds histogram\n"));
+        assert!(text
+            .contains("onbehalf_proxy_stage_seconds_bucket{stage=\"policy\",le=\"0.00002\"} 1\n"));
+        assert!(
+            text.contains("onbehalf_proxy_stage_seconds_bucket{stage=\"policy\",le=\"+Inf\"} 2\n")
+        );
+        assert!(text.contains("onbehalf_proxy_stage_seconds_count{stage=\"policy\"} 2\n"));
+        assert!(text.contains("onbehalf_proxy_stage_seconds_sum{stage=\"policy\"} 0.000052\n"));
+        assert!(text.contains("onbehalf_proxy_stage_seconds_count{stage=\"upstream\"} 1\n"));
+        // Every stage is rendered, observed or not, and only one TYPE line is written.
+        for s in Stage::ALL {
+            let line = format!(
+                "onbehalf_proxy_stage_seconds_count{{stage=\"{}\"}} ",
+                s.as_str()
+            );
+            assert!(text.contains(&line), "{line}");
+        }
+        assert_eq!(
+            text.matches("# TYPE onbehalf_proxy_stage_seconds").count(),
+            1
+        );
+        // The older histograms keep their label-free form.
+        assert!(text.contains("onbehalf_authorize_duration_seconds_bucket{le=\"+Inf\"} 0\n"));
+        assert!(text.contains("onbehalf_authorize_duration_seconds_sum 0\n"));
     }
 }

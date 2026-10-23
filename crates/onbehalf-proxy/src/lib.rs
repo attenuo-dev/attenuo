@@ -119,6 +119,7 @@ pub mod listed;
 pub mod proxy;
 pub mod session;
 pub mod sse;
+pub mod stage;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -131,3 +132,4 @@ pub use proxy::{
     REASON_TOO_MANY_SESSIONS, REASON_UPSTREAM_BODY_TOO_LARGE,
 };
 pub use session::{SessionOwner, SessionRegistry};
+pub use stage::Stage;

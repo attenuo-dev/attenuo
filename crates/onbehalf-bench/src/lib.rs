@@ -7,6 +7,17 @@
 //! is the proxy figure minus the direct one at the same concurrency. At the end it asks the
 //! server to verify the audit chain and fails if the chain is broken or short of entries.
 //!
+//! Every answer is checked against the scenario: an allow must be a JSON-RPC `result` that
+//! carries an `X-Onbehalf-Decision-Id`, and a denial must be the proxy's own `-32003` with the
+//! expected reason code (`policy_deny`, `capability_denied`) and a `data.decision_id` listed in
+//! that header, the rule the SDKs use. Anything else (an `audit_error` denial, `-32007`
+//! `too_many_sessions`, a `5xx`) stops the run after that cell.
+//!
+//! The server it starts serves `/metrics` on its own port; the harness reads the
+//! `onbehalf_proxy_stage_seconds` histograms before and after each measured window and reports
+//! the time per stage (token verification, lease check, policy, audit append, blocking-pool
+//! hop, upstream round trip, response handling, total).
+//!
 //! See `docs/design/performance.md` for the method and its limits.
 
 use std::path::{Path, PathBuf};
@@ -88,7 +99,23 @@ pub enum Outcome {
     DenyCapability,
 }
 
+/// Reason code of a Cedar denial (`onbehalf_policy::REASON_POLICY_DENY`).
+pub const REASON_POLICY_DENY: &str = "policy_deny";
+/// Reason code of a capability-stage denial (`onbehalf_policy::REASON_CAPABILITY_DENIED`).
+pub const REASON_CAPABILITY_DENIED: &str = "capability_denied";
+
 impl Outcome {
+    /// The answer a call of this outcome must get through the proxy.
+    pub fn expect(self) -> Expect {
+        match self {
+            Outcome::Allow => Expect::Result {
+                decision_header: true,
+            },
+            Outcome::DenyPolicy => Expect::Denied(REASON_POLICY_DENY),
+            Outcome::DenyCapability => Expect::Denied(REASON_CAPABILITY_DENIED),
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Outcome::Allow => "allow",
@@ -166,6 +193,13 @@ pub struct Opts {
     pub onbehalf_port: u16,
     #[arg(long, default_value_t = 13001)]
     pub upstream_port: u16,
+    /// Port of the `/metrics` listener in the config `--print-config` writes.
+    #[arg(long, default_value_t = 19100)]
+    pub metrics_port: u16,
+    /// With `--onbehalf-url`: the running server's metrics base URL (for example
+    /// `http://127.0.0.1:19100`), to report per-stage times. Without it no stage table is made.
+    #[arg(long, requires = "onbehalf_url")]
+    pub metrics_url: Option<String>,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -213,6 +247,23 @@ pub struct ProxyRow {
     pub added: Added,
 }
 
+/// Time in one stage over one measured window, from the server's
+/// `onbehalf_proxy_stage_seconds` histogram (difference of two scrapes). The quantiles are
+/// interpolated inside the histogram's buckets, the way Prometheus' `histogram_quantile` does,
+/// so they are estimates; the mean is exact.
+#[derive(Debug, Clone, Serialize)]
+pub struct StageRow {
+    pub audit: String,
+    pub depth: usize,
+    pub outcome: &'static str,
+    pub concurrency: usize,
+    pub stage: String,
+    pub count: u64,
+    pub mean_us: f64,
+    pub p50_us: f64,
+    pub p90_us: f64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditCheck {
     pub audit: String,
@@ -228,6 +279,7 @@ pub struct Report {
     pub meta: Value,
     pub direct: Vec<DirectRow>,
     pub results: Vec<ProxyRow>,
+    pub stages: Vec<StageRow>,
     pub audit_checks: Vec<AuditCheck>,
 }
 
@@ -289,6 +341,7 @@ pub fn render_config(
     policy_path: &Path,
     sqlite: &str,
     durability: &str,
+    metrics_port: u16,
 ) -> String {
     let mut s = format!(
         r#"# onbehalf-server config written by onbehalf-bench.
@@ -319,6 +372,10 @@ inputs = {{ repo = "string" }}
 [audit]
 sqlite_path = "{sqlite}"
 durability = "{durability}"
+
+[metrics]
+enabled = true
+listen = "127.0.0.1:{metrics_port}"
 
 [[upstreams]]
 name = "{UPSTREAM}"
@@ -442,24 +499,98 @@ async fn mint_chain(client: &reqwest::Client, base: &str, depth: usize) -> Resul
 // ---------------------------------------------------------------------------------------
 // Load generation
 
+/// The proxy's JSON-RPC error code for a denied call (`onbehalf_proxy::jsonrpc::CODE_DENIED`).
+pub const CODE_DENIED: i64 = -32003;
+/// Response header listing the proxy's decision ids (`onbehalf_proxy::DECISION_ID_HEADER`).
+pub const DECISION_ID_HEADER: &str = "x-onbehalf-decision-id";
+
+/// What a correct answer looks like.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Expect {
-    Result,
-    RpcError,
+pub enum Expect {
+    /// A JSON-RPC `result`; through the proxy it must also carry a decision id header.
+    Result { decision_header: bool },
+    /// The proxy's own denial (`-32003`) with this reason code.
+    Denied(&'static str),
 }
 
-fn classify(text: &str) -> Option<Expect> {
-    let v: Value = serde_json::from_str(text).ok().or_else(|| {
+/// The JSON-RPC response in a JSON or `text/event-stream` body.
+fn rpc_message(text: &str) -> Option<Value> {
+    serde_json::from_str(text).ok().or_else(|| {
         text.lines()
             .filter_map(|l| l.strip_prefix("data:"))
             .find_map(|d| serde_json::from_str(d.trim()).ok())
-    })?;
-    if v.get("error").is_some() {
-        Some(Expect::RpcError)
-    } else if v.get("result").is_some() {
-        Some(Expect::Result)
-    } else {
-        None
+    })
+}
+
+/// Check one answer against `expect`. `Err` says what was wrong, for the run's failure message.
+///
+/// A denial counts only when it is the expected reason and the proxy vouches for it: the
+/// `-32003` error's `data.decision_id` is one of the ids in `X-Onbehalf-Decision-Id`, as the
+/// SDKs require (an upstream can put any `-32003` in its own body). So an `audit_error` denial,
+/// a `-32007` `too_many_sessions`, a `-32001` or any non-200 status is a failure, not a denial.
+pub fn check_answer(
+    expect: Expect,
+    status: u16,
+    decision_header: Option<&str>,
+    text: &str,
+) -> std::result::Result<(), String> {
+    let short = |t: &str| t.chars().take(300).collect::<String>();
+    if status != 200 {
+        return Err(format!("HTTP {status}: {}", short(text)));
+    }
+    let Some(msg) = rpc_message(text) else {
+        return Err(format!("no JSON-RPC response in body: {}", short(text)));
+    };
+    let header_ids: Vec<&str> = decision_header
+        .map(|h| {
+            h.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let err = msg.get("error");
+    match expect {
+        Expect::Result { decision_header } => {
+            if err.is_some() || msg.get("result").is_none() {
+                return Err(format!(
+                    "expected a result, got {}",
+                    short(&msg.to_string())
+                ));
+            }
+            if decision_header && header_ids.is_empty() {
+                return Err(format!("result without {DECISION_ID_HEADER}"));
+            }
+            Ok(())
+        }
+        Expect::Denied(want) => {
+            let Some(err) = err else {
+                return Err(format!(
+                    "expected denial `{want}`, got {}",
+                    short(&msg.to_string())
+                ));
+            };
+            let code = err.get("code").and_then(Value::as_i64);
+            let reason = err
+                .pointer("/data/reason")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if code != Some(CODE_DENIED) || reason != want {
+                return Err(format!(
+                    "expected denial `{want}` (code {CODE_DENIED}), got code {} reason `{reason}`: {}",
+                    code.map_or_else(|| "none".to_string(), |c| c.to_string()),
+                    short(&err.to_string())
+                ));
+            }
+            let id = err.pointer("/data/decision_id").and_then(Value::as_str);
+            match id {
+                Some(id) if header_ids.contains(&id) => Ok(()),
+                _ => Err(format!(
+                    "denial `{want}` whose decision id {id:?} is not in {DECISION_ID_HEADER} \
+                     ({decision_header:?})"
+                )),
+            }
+        }
     }
 }
 
@@ -505,15 +636,14 @@ async fn client_loop(
         }
         let verdict = match req.send().await {
             Ok(resp) => {
-                let status = resp.status();
+                let status = resp.status().as_u16();
+                let header = resp
+                    .headers()
+                    .get(DECISION_ID_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
                 match resp.text().await {
-                    Ok(text) => {
-                        if classify(&text) == Some(t.expect) {
-                            None
-                        } else {
-                            Some(format!("HTTP {status}: {text}"))
-                        }
-                    }
+                    Ok(text) => check_answer(t.expect, status, header.as_deref(), &text).err(),
                     Err(e) => Some(format!("body error: {e}")),
                 }
             }
@@ -537,14 +667,26 @@ async fn client_loop(
     out
 }
 
-/// Run `conc` closed-loop clients; returns the stats and the number of requests sent in total
-/// (warm-up included).
+/// What one cell produced.
+struct DriveOut {
+    stats: Stats,
+    /// Requests sent in total, warm-up included.
+    sent: u64,
+    /// The first answer that was not what the scenario expects.
+    first_bad: Option<String>,
+    /// Stage histograms over the measured window, when a metrics URL was given.
+    stages: Option<Vec<(String, StageHist)>>,
+}
+
+/// Run `conc` closed-loop clients. With `metrics` (the server's `/metrics` URL), scrape the
+/// stage histograms when the warm-up ends and when the clients stop.
 async fn drive(
     target: &Target,
     conc: usize,
     warmup: Duration,
     duration: Duration,
-) -> Result<(Stats, u64)> {
+    metrics: Option<(&reqwest::Client, &str)>,
+) -> Result<DriveOut> {
     let http = reqwest::Client::builder()
         .pool_max_idle_per_host(conc)
         .timeout(Duration::from_secs(30))
@@ -555,6 +697,13 @@ async fn drive(
     let tasks: Vec<_> = (0..conc)
         .map(|_| tokio::spawn(client_loop(http.clone(), target.clone(), warm_end, end)))
         .collect();
+    let before = match metrics {
+        Some((client, url)) => {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(warm_end)).await;
+            Some(scrape_stages(client, url).await?)
+        }
+        None => None,
+    };
     let mut hist = Histogram::<u64>::new_with_bounds(1, 120_000_000_000, 3)?;
     let (mut sent, mut unexpected, mut first_bad) = (0, 0, None);
     for t in tasks {
@@ -566,14 +715,21 @@ async fn drive(
             first_bad = o.first_bad;
         }
     }
-    if let Some(bad) = first_bad {
+    if let Some(bad) = &first_bad {
         eprintln!("  unexpected answer ({unexpected} total), first: {bad}");
     }
+    let stages = match (metrics, before) {
+        (Some((client, url)), Some(before)) => {
+            let after = scrape_stages(client, url).await?;
+            Some(stage_delta(&before, &after))
+        }
+        _ => None,
+    };
     let us = |ns: f64| (ns / 1000.0 * 10.0).round() / 10.0;
     let secs = duration.as_secs_f64();
     let n = hist.len();
-    Ok((
-        Stats {
+    Ok(DriveOut {
+        stats: Stats {
             requests: n,
             unexpected,
             seconds: secs,
@@ -585,7 +741,159 @@ async fn drive(
             max_us: us(hist.max() as f64),
         },
         sent,
-    ))
+        first_bad,
+        stages,
+    })
+}
+
+/// Stop the run when a cell had answers that were not what it expects: the figures would mix
+/// in failures (an `audit_error` denial is cheap and fast) and mean nothing.
+fn ensure_expected(cell: &str, out: &DriveOut) -> Result<()> {
+    ensure!(
+        out.stats.unexpected == 0,
+        "{cell}: {} answers were not what the scenario expects; first: {}",
+        out.stats.unexpected,
+        out.first_bad.as_deref().unwrap_or("?")
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------
+// Stage metrics
+
+const STAGE_METRIC: &str = "onbehalf_proxy_stage_seconds";
+
+/// One stage's histogram as scraped: cumulative bucket counts by upper bound (the last is
+/// `+Inf`), sum in seconds, and count.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StageHist {
+    pub buckets: Vec<(f64, u64)>,
+    pub sum: f64,
+    pub count: u64,
+}
+
+impl StageHist {
+    /// Quantile `q` in seconds, interpolated linearly inside the bucket it falls in (lower
+    /// bound of the first bucket 0), as Prometheus' `histogram_quantile`. `None` when empty.
+    pub fn quantile(&self, q: f64) -> Option<f64> {
+        if self.count == 0 {
+            return None;
+        }
+        let rank = q * self.count as f64;
+        let mut prev = (0.0, 0u64);
+        for &(bound, cum) in &self.buckets {
+            if cum as f64 >= rank {
+                if bound.is_infinite() {
+                    return Some(prev.0);
+                }
+                let in_bucket = (cum - prev.1) as f64;
+                let frac = if in_bucket > 0.0 {
+                    (rank - prev.1 as f64) / in_bucket
+                } else {
+                    0.0
+                };
+                return Some(prev.0 + (bound - prev.0) * frac);
+            }
+            prev = (bound, cum);
+        }
+        Some(prev.0)
+    }
+}
+
+/// Parse the `onbehalf_proxy_stage_seconds` samples of a Prometheus text exposition, stages in
+/// the order they appear.
+pub fn parse_stages(text: &str) -> Vec<(String, StageHist)> {
+    let mut out: Vec<(String, StageHist)> = Vec::new();
+    let label = |s: &str, key: &str| -> Option<String> {
+        let start = s.find(&format!("{key}=\""))? + key.len() + 2;
+        let end = s[start..].find('"')?;
+        Some(s[start..start + end].to_string())
+    };
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix(STAGE_METRIC) else {
+            continue;
+        };
+        let Some((name_labels, value)) = rest.rsplit_once(' ') else {
+            continue;
+        };
+        let Some(stage) = label(name_labels, "stage") else {
+            continue;
+        };
+        let idx = match out.iter().position(|(s, _)| *s == stage) {
+            Some(i) => i,
+            None => {
+                out.push((stage, StageHist::default()));
+                out.len() - 1
+            }
+        };
+        let h = &mut out[idx].1;
+        if name_labels.starts_with("_bucket{") {
+            let Some(le) = label(name_labels, "le") else {
+                continue;
+            };
+            let bound = if le == "+Inf" {
+                f64::INFINITY
+            } else {
+                le.parse().unwrap_or(f64::NAN)
+            };
+            h.buckets.push((bound, value.parse().unwrap_or(0)));
+        } else if name_labels.starts_with("_sum{") {
+            h.sum = value.parse().unwrap_or(0.0);
+        } else if name_labels.starts_with("_count{") {
+            h.count = value.parse().unwrap_or(0);
+        }
+    }
+    out
+}
+
+/// `after - before`, stage by stage.
+pub fn stage_delta(
+    before: &[(String, StageHist)],
+    after: &[(String, StageHist)],
+) -> Vec<(String, StageHist)> {
+    after
+        .iter()
+        .map(|(stage, a)| {
+            let b = before.iter().find(|(s, _)| s == stage).map(|(_, h)| h);
+            let d = match b {
+                None => a.clone(),
+                Some(b) => StageHist {
+                    buckets: a
+                        .buckets
+                        .iter()
+                        .map(|&(bound, n)| {
+                            let prev = b
+                                .buckets
+                                .iter()
+                                .find(|(bb, _)| *bb == bound)
+                                .map_or(0, |(_, m)| *m);
+                            (bound, n.saturating_sub(prev))
+                        })
+                        .collect(),
+                    sum: (a.sum - b.sum).max(0.0),
+                    count: a.count.saturating_sub(b.count),
+                },
+            };
+            (stage.clone(), d)
+        })
+        .collect()
+}
+
+async fn scrape_stages(client: &reqwest::Client, url: &str) -> Result<Vec<(String, StageHist)>> {
+    let text = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()?
+        .text()
+        .await?;
+    let stages = parse_stages(&text);
+    ensure!(
+        !stages.is_empty(),
+        "{url} has no {STAGE_METRIC} samples (server too old?)"
+    );
+    Ok(stages)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -594,6 +902,8 @@ async fn drive(
 struct Endpoints {
     onbehalf: String,
     upstream_mcp: String,
+    /// The server's `/metrics` URL, if it serves one.
+    metrics: Option<String>,
 }
 
 async fn run_group(
@@ -612,12 +922,16 @@ async fn run_group(
         url: ep.upstream_mcp.clone(),
         token: None,
         body: Outcome::Allow.body(),
-        expect: Expect::Result,
+        expect: Expect::Result {
+            decision_header: false,
+        },
     };
     let mut direct: Vec<(usize, Stats)> = Vec::new();
     for &c in &opts.concurrency {
         eprintln!("[{mode_label}] direct, {c} clients");
-        let (stats, _) = drive(&direct_target, c, warmup, duration).await?;
+        let out = drive(&direct_target, c, warmup, duration, None).await?;
+        ensure_expected(&format!("[{mode_label}] direct, {c} clients"), &out)?;
+        let stats = out.stats;
         report.direct.push(DirectRow {
             audit_group: mode_label.into(),
             concurrency: c,
@@ -638,14 +952,36 @@ async fn run_group(
                     url: format!("{}/mcp/{UPSTREAM}", ep.onbehalf),
                     token: Some(token.clone()),
                     body: outcome.body(),
-                    expect: if outcome == Outcome::Allow {
-                        Expect::Result
-                    } else {
-                        Expect::RpcError
-                    },
+                    expect: outcome.expect(),
                 };
-                let (stats, sent) = drive(&target, c, warmup, duration).await?;
-                proxied_sent += sent;
+                let probe = ep.metrics.as_deref().map(|u| (http, u));
+                let out = drive(&target, c, warmup, duration, probe).await?;
+                proxied_sent += out.sent;
+                ensure_expected(
+                    &format!(
+                        "[{mode_label}] depth {depth} {}, {c} clients",
+                        outcome.label()
+                    ),
+                    &out,
+                )?;
+                for (stage, h) in out.stages.unwrap_or_default() {
+                    if h.count == 0 {
+                        continue;
+                    }
+                    let us = |s: Option<f64>| round1(s.unwrap_or(0.0) * 1e6);
+                    report.stages.push(StageRow {
+                        audit: mode_label.into(),
+                        depth,
+                        outcome: outcome.label(),
+                        concurrency: c,
+                        mean_us: us(Some(h.sum / h.count as f64)),
+                        p50_us: us(h.quantile(0.5)),
+                        p90_us: us(h.quantile(0.9)),
+                        count: h.count,
+                        stage,
+                    });
+                }
+                let stats = out.stats;
                 let d = &direct.iter().find(|(dc, _)| *dc == c).unwrap().1;
                 let added = Added {
                     p50_us: round1(stats.p50_us - d.p50_us),
@@ -776,6 +1112,28 @@ pub fn render_markdown(r: &Report) -> String {
             ));
         }
     }
+    let mut stage_modes: Vec<&str> = Vec::new();
+    for row in &r.stages {
+        if !stage_modes.contains(&row.audit.as_str()) {
+            stage_modes.push(&row.audit);
+        }
+    }
+    for m in stage_modes {
+        s.push_str(&format!(
+            "\n### Time by stage through the proxy, audit = {m}\n\n\
+             From the server's `onbehalf_proxy_stage_seconds` over each measured window. \
+             p50 and p90 are interpolated inside histogram buckets (estimates); the mean is \
+             exact.\n\n\
+             | hops | outcome | clients | stage | count | mean us | p50 us | p90 us |\n\
+             |---|---|---|---|---|---|---|---|\n"
+        ));
+        for x in r.stages.iter().filter(|x| x.audit == m) {
+            s.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                x.depth, x.outcome, x.concurrency, x.stage, x.count, x.mean_us, x.p50_us, x.p90_us
+            ));
+        }
+    }
     s.push_str("\n### Audit chain after each run\n\n| audit | verified | entries | proxied calls sent | checkpoints |\n|---|---|---|---|---|\n");
     for a in &r.audit_checks {
         s.push_str(&format!(
@@ -818,6 +1176,7 @@ pub async fn run(opts: Opts) -> Result<()> {
             &policy,
             &sqlite,
             durability,
+            opts.metrics_port,
         );
         std::fs::write(dir.join("config.toml"), cfg)?;
         eprintln!("wrote {}/config.toml and policy.cedar", dir.display());
@@ -831,6 +1190,7 @@ pub async fn run(opts: Opts) -> Result<()> {
         meta: meta(&opts),
         direct: Vec::new(),
         results: Vec::new(),
+        stages: Vec::new(),
         audit_checks: Vec::new(),
     };
 
@@ -838,6 +1198,10 @@ pub async fn run(opts: Opts) -> Result<()> {
         let ep = Endpoints {
             onbehalf: ob.trim_end_matches('/').to_string(),
             upstream_mcp: format!("{}/mcp", up.trim_end_matches('/')),
+            metrics: opts
+                .metrics_url
+                .as_ref()
+                .map(|m| format!("{}/metrics", m.trim_end_matches('/'))),
         };
         wait_http(&http, &format!("{}/healthz", ep.onbehalf)).await?;
         let label = opts.audit.first().map_or("external", |m| m.label());
@@ -864,11 +1228,11 @@ pub async fn run(opts: Opts) -> Result<()> {
             seen.push(mode);
             let label = mode.label();
             let (sqlite, durability) = mode.settings(&work.0);
-            let (ob_port, up_port) = (free_port()?, free_port()?);
+            let (ob_port, up_port, metrics_port) = (free_port()?, free_port()?, free_port()?);
             let cfg_path = work.0.join(format!("config-{label}.toml"));
             std::fs::write(
                 &cfg_path,
-                render_config(ob_port, up_port, &policy, &sqlite, durability),
+                render_config(ob_port, up_port, &policy, &sqlite, durability, metrics_port),
             )?;
 
             let _fake = Proc {
@@ -896,6 +1260,7 @@ pub async fn run(opts: Opts) -> Result<()> {
             let ep = Endpoints {
                 onbehalf: format!("http://127.0.0.1:{ob_port}"),
                 upstream_mcp: format!("http://127.0.0.1:{up_port}/mcp"),
+                metrics: Some(format!("http://127.0.0.1:{metrics_port}/metrics")),
             };
             if let Err(e) = wait_http(&http, &format!("{}/healthz", ep.onbehalf)).await {
                 let log = std::fs::read_to_string(work.0.join(format!("server-{label}.log")))
@@ -926,4 +1291,118 @@ pub async fn run(opts: Opts) -> Result<()> {
          error, or a deny answered with a result); the figures are not trustworthy"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ID: &str = "0b8f3d1e-3c55-4b47-9a43-0d6c3f0f7a10";
+
+    fn denial(code: i64, reason: &str) -> String {
+        json!({"jsonrpc": "2.0", "id": 1, "error": {"code": code,
+            "message": format!("onbehalf: denied: {reason}"),
+            "data": {"reason": reason, "decision_id": ID}}})
+        .to_string()
+    }
+
+    #[test]
+    fn only_the_expected_vouched_denial_counts() {
+        let policy = Outcome::DenyPolicy.expect();
+        let cap = Outcome::DenyCapability.expect();
+        // The expected denial, with its id in the header (alone or among others).
+        assert_eq!(
+            check_answer(policy, 200, Some(ID), &denial(-32003, "policy_deny")),
+            Ok(())
+        );
+        let several = format!("11111111-1111-1111-1111-111111111111, {ID}");
+        assert_eq!(
+            check_answer(
+                cap,
+                200,
+                Some(&several),
+                &denial(-32003, "capability_denied")
+            ),
+            Ok(())
+        );
+        // A denial for another reason is a failure, `audit_error` above all.
+        let e = check_answer(policy, 200, Some(ID), &denial(-32003, "audit_error")).unwrap_err();
+        assert!(e.contains("audit_error"), "{e}");
+        assert!(check_answer(cap, 200, Some(ID), &denial(-32003, "policy_deny")).is_err());
+        // Other error codes: too_many_sessions (-32007), unauthorized (-32001).
+        let e =
+            check_answer(policy, 200, Some(ID), &denial(-32007, "too_many_sessions")).unwrap_err();
+        assert!(
+            e.contains("-32007") && e.contains("too_many_sessions"),
+            "{e}"
+        );
+        assert!(check_answer(policy, 200, Some(ID), &denial(-32001, "lease_revoked")).is_err());
+        // A 5xx is never a denial, even with a denial-shaped body.
+        let e = check_answer(policy, 503, Some(ID), &denial(-32003, "policy_deny")).unwrap_err();
+        assert!(e.starts_with("HTTP 503"), "{e}");
+        assert!(check_answer(policy, 502, None, "bad gateway").is_err());
+        // A -32003 the proxy does not vouch for (an upstream's own) is not a denial.
+        assert!(check_answer(policy, 200, None, &denial(-32003, "policy_deny")).is_err());
+        let other = "22222222-2222-2222-2222-222222222222";
+        assert!(check_answer(policy, 200, Some(other), &denial(-32003, "policy_deny")).is_err());
+        // A result where a denial was expected.
+        let ok = json!({"jsonrpc": "2.0", "id": 1, "result": {"content": []}}).to_string();
+        assert!(check_answer(policy, 200, Some(ID), &ok).is_err());
+    }
+
+    #[test]
+    fn allow_needs_a_result_and_through_the_proxy_a_decision_id() {
+        let ok = json!({"jsonrpc": "2.0", "id": 1, "result": {"content": []}}).to_string();
+        let allow = Outcome::Allow.expect();
+        assert_eq!(check_answer(allow, 200, Some(ID), &ok), Ok(()));
+        assert!(check_answer(allow, 200, None, &ok).is_err());
+        let direct = Expect::Result {
+            decision_header: false,
+        };
+        assert_eq!(check_answer(direct, 200, None, &ok), Ok(()));
+        // As an SSE event.
+        let sse = format!("event: message\ndata: {ok}\n\n");
+        assert_eq!(check_answer(allow, 200, Some(ID), &sse), Ok(()));
+        assert!(check_answer(allow, 200, Some(ID), &denial(-32003, "audit_error")).is_err());
+        assert!(check_answer(allow, 500, Some(ID), &ok).is_err());
+    }
+
+    #[test]
+    fn stage_histograms_parse_diff_and_interpolate() {
+        let render = |policy: [u64; 3], sum: f64| {
+            format!(
+                "# TYPE onbehalf_proxy_stage_seconds histogram\n\
+                 onbehalf_proxy_stage_seconds_bucket{{stage=\"policy\",le=\"0.00001\"}} {}\n\
+                 onbehalf_proxy_stage_seconds_bucket{{stage=\"policy\",le=\"0.00002\"}} {}\n\
+                 onbehalf_proxy_stage_seconds_bucket{{stage=\"policy\",le=\"+Inf\"}} {}\n\
+                 onbehalf_proxy_stage_seconds_sum{{stage=\"policy\"}} {sum}\n\
+                 onbehalf_proxy_stage_seconds_count{{stage=\"policy\"}} {}\n\
+                 onbehalf_proxy_stage_seconds_bucket{{stage=\"upstream\",le=\"0.00001\"}} 0\n\
+                 onbehalf_proxy_stage_seconds_bucket{{stage=\"upstream\",le=\"+Inf\"}} 0\n\
+                 onbehalf_proxy_stage_seconds_sum{{stage=\"upstream\"}} 0\n\
+                 onbehalf_proxy_stage_seconds_count{{stage=\"upstream\"}} 0\n\
+                 onbehalf_authorize_duration_seconds_count 9\n",
+                policy[0], policy[1], policy[2], policy[2]
+            )
+        };
+        let before = parse_stages(&render([5, 5, 5], 0.00004));
+        assert_eq!(before.len(), 2);
+        assert_eq!(before[0].0, "policy");
+        assert_eq!(before[0].1.count, 5);
+        assert_eq!(before[0].1.buckets.len(), 3);
+        // 10 more calls: none under 10 us, 10 between 10 and 20 us.
+        let after = parse_stages(&render([5, 15, 15], 0.00019));
+        let d = stage_delta(&before, &after);
+        let policy = &d[0].1;
+        assert_eq!(policy.count, 10);
+        assert_eq!(
+            policy.buckets,
+            vec![(1e-5, 0), (2e-5, 10), (f64::INFINITY, 10)]
+        );
+        assert!((policy.sum - 0.00015).abs() < 1e-12);
+        // The median is half-way through the 10 to 20 us bucket.
+        let p50 = policy.quantile(0.5).unwrap();
+        assert!((p50 - 1.5e-5).abs() < 1e-12, "{p50}");
+        assert_eq!(d[1].1.quantile(0.5), None, "empty stage");
+    }
 }

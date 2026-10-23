@@ -354,6 +354,83 @@ async fn policy_restricts_arguments_and_audit_attributes() {
     assert_eq!(calls[1]["record"]["reason"], "policy_deny");
 }
 
+/// `onbehalf_proxy_stage_seconds_count{stage="..."}` from a metrics rendering.
+fn stage_count(text: &str, stage: &str) -> u64 {
+    let prefix = format!("onbehalf_proxy_stage_seconds_count{{stage=\"{stage}\"}} ");
+    text.lines()
+        .find_map(|l| l.strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| panic!("no {prefix} in:\n{text}"))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn one_proxied_call_fills_every_stage_histogram() {
+    let h = Harness::start().await;
+    let alice = h.mint_root("alice", "planner", &["github:*"]).await;
+    let before = h.state.metrics.render();
+    for stage in onbehalf_proxy::Stage::ALL {
+        assert_eq!(
+            stage_count(&before, stage.as_str()),
+            0,
+            "{}",
+            stage.as_str()
+        );
+    }
+
+    let ok = h
+        .call(
+            &alice.token,
+            "read_file",
+            json!({"repo": "alice/public-site"}),
+        )
+        .await;
+    assert!(allowed(&ok), "{ok}");
+
+    let text = h.state.metrics.render();
+    assert!(text.contains("# TYPE onbehalf_proxy_stage_seconds histogram\n"));
+    // One call, first use of the token: a cache miss, then every stage once.
+    for stage in [
+        "token_verify_miss",
+        "lease_check",
+        "policy",
+        "audit_append",
+        "blocking_pool",
+        "upstream",
+        "response",
+        "total",
+    ] {
+        assert_eq!(stage_count(&text, stage), 1, "{stage}");
+        assert!(
+            text.contains(&format!(
+                "onbehalf_proxy_stage_seconds_bucket{{stage=\"{stage}\",le=\"+Inf\"}} 1\n"
+            )),
+            "{stage}"
+        );
+    }
+    assert_eq!(stage_count(&text, "token_verify_hit"), 0);
+
+    // The same token again is answered from the verified-token cache; a denied call reaches
+    // no upstream, so only the decision stages and the total move.
+    let no = h
+        .call(
+            &alice.token,
+            "read_file",
+            json!({"repo": "alice/private-salaries"}),
+        )
+        .await;
+    assert_eq!(denied_reason(&no), "policy_deny");
+    let text = h.state.metrics.render();
+    assert_eq!(stage_count(&text, "token_verify_hit"), 1);
+    assert_eq!(stage_count(&text, "token_verify_miss"), 1);
+    assert_eq!(stage_count(&text, "policy"), 2);
+    assert_eq!(stage_count(&text, "audit_append"), 2);
+    assert_eq!(stage_count(&text, "total"), 2);
+    assert_eq!(stage_count(&text, "upstream"), 1);
+    assert_eq!(stage_count(&text, "response"), 1);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Scenario 2: attenuation across an exchange.
 // ---------------------------------------------------------------------------------------------

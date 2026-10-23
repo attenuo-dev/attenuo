@@ -74,6 +74,22 @@ async fn one_second_scenario_runs_and_audit_verifies() {
         assert_eq!(r["unexpected"], 0, "{r}");
         assert!(r["p99_us"].as_f64().unwrap() >= r["p50_us"].as_f64().unwrap());
     }
+    // The server's stage histograms were read for every cell.
+    let stages = v["stages"].as_array().unwrap();
+    for outcome in ["allow", "deny_policy", "deny_capability"] {
+        let names: Vec<&str> = stages
+            .iter()
+            .filter(|s| s["outcome"] == outcome)
+            .map(|s| s["stage"].as_str().unwrap())
+            .collect();
+        for stage in ["lease_check", "audit_append", "blocking_pool", "total"] {
+            assert!(
+                names.contains(&stage),
+                "{outcome}: {stage} missing in {names:?}"
+            );
+        }
+        assert_eq!(names.contains(&"upstream"), outcome == "allow", "{outcome}");
+    }
     assert_eq!(v["audit_checks"][0]["ok"], true);
     let _ = std::fs::remove_dir_all(out);
 }

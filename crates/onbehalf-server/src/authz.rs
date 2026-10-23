@@ -15,12 +15,13 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use onbehalf_audit::{AuditSink, LeaseStore};
 use onbehalf_core::{Decision, DecisionRecord, DelegationChain, ToolCall};
 use onbehalf_policy::PolicyEngine;
-use onbehalf_proxy::{AuthDecision, AuthError, Authenticated, Authorizer, RequestAuth};
+use onbehalf_proxy::{AuthDecision, AuthError, Authenticated, Authorizer, RequestAuth, Stage};
 use onbehalf_token::Verifier;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -85,6 +86,11 @@ impl Pipeline {
         self
     }
 
+    /// The metrics this pipeline reports to.
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
+    }
+
     /// The shared policy engine (for hot reload).
     pub fn policy(&self) -> &Arc<RwLock<PolicyEngine>> {
         &self.policy
@@ -97,7 +103,7 @@ impl Pipeline {
         call: &ToolCall,
         now: OffsetDateTime,
     ) -> PipelineDecision {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let out = self.decide_inner(chain, call, now);
         self.metrics.observe_authorize(started.elapsed());
         self.metrics
@@ -111,11 +117,17 @@ impl Pipeline {
         call: &ToolCall,
         now: OffsetDateTime,
     ) -> PipelineDecision {
-        let (decision, reason, policy_ids, diagnostics) = match self.check_leases(chain, now) {
+        // Stage timings: one `Instant::now()` per boundary (see `Stage`).
+        let t0 = Instant::now();
+        let leases = self.check_leases(chain, now);
+        let t1 = Instant::now();
+        let mut policy_time = None;
+        let (decision, reason, policy_ids, diagnostics) = match leases {
             Err((reason, detail)) => (Decision::Deny, reason.to_string(), Vec::new(), detail),
             Ok(()) => match self.policy.read() {
                 Ok(engine) => {
                     let o = engine.authorize(chain, call, now);
+                    policy_time = Some(t1.elapsed());
                     (o.decision, o.reason, o.policy_ids, o.diagnostics)
                 }
                 Err(_) => (
@@ -130,7 +142,23 @@ impl Pipeline {
         let record = DecisionRecord::new(now, decision, reason, chain, call, policy_ids);
         let decision_id = record.id;
         // The record moves into the log; the entry hands it back, so it is never cloned.
-        match self.metrics.time_audit_append(|| self.audit.append(record)) {
+        let t2 = Instant::now();
+        let appended = self.audit.append(record);
+        let append_time = t2.elapsed();
+        self.metrics.observe_audit_append(append_time);
+        let lease_time = t1 - t0;
+        self.metrics.observe_stage(Stage::LeaseCheck, lease_time);
+        if let Some(d) = policy_time {
+            self.metrics.observe_stage(Stage::Policy, d);
+        }
+        self.metrics.observe_stage(Stage::AuditAppend, append_time);
+        tracing::debug!(
+            lease_check_us = lease_time.as_micros() as u64,
+            policy_us = policy_time.map(|d| d.as_micros() as u64),
+            audit_append_us = append_time.as_micros() as u64,
+            "decision stages"
+        );
+        match appended {
             Ok(entry) => {
                 let record = entry.record;
                 // Subject, agent, server and tool come from the caller: Debug-format them so
@@ -281,9 +309,31 @@ impl ServerAuthorizer {
         token: &str,
         now: OffsetDateTime,
     ) -> Result<onbehalf_token::VerifiedToken, AuthError> {
+        let started = Instant::now();
+        let out = self.verify_inner(token, now);
+        let elapsed = started.elapsed();
+        let (stage, hit) = match &out {
+            Ok((_, true)) => (Stage::TokenVerifyHit, true),
+            _ => (Stage::TokenVerifyMiss, false),
+        };
+        self.pipeline.metrics().observe_stage(stage, elapsed);
+        tracing::debug!(
+            cache_hit = hit,
+            token_verify_us = elapsed.as_micros() as u64,
+            "token verified"
+        );
+        out.map(|(v, _)| v)
+    }
+
+    /// [`ServerAuthorizer::verify`], and whether the cache answered.
+    fn verify_inner(
+        &self,
+        token: &str,
+        now: OffsetDateTime,
+    ) -> Result<(onbehalf_token::VerifiedToken, bool), AuthError> {
         let key = VerifiedTokens::key(token);
         if let Some(v) = self.verified.get(&key, now, self.verifier.max_depth()) {
-            return Ok(v);
+            return Ok((v, true));
         }
         let v = self.verifier.verify(token, now).map_err(|e| {
             if crate::error::is_expiry(&e) {
@@ -297,7 +347,7 @@ impl ServerAuthorizer {
         if token.len() <= VERIFIED_TOKEN_MAX_BYTES {
             self.verified.insert(key, &v, now);
         }
-        Ok(v)
+        Ok((v, false))
     }
 }
 
@@ -430,7 +480,22 @@ impl Authorizer for ServerAuthorizer {
         now: OffsetDateTime,
     ) -> AuthDecision {
         let (chain, call) = (chain.clone(), call.clone());
-        let d = on_blocking_pool(&self.pipeline, move |p| p.decide(&chain, &call, now)).await;
+        let started = Instant::now();
+        let (d, decide_time) = on_blocking_pool(&self.pipeline, move |p| {
+            let t = Instant::now();
+            let d = p.decide(&chain, &call, now);
+            (d, t.elapsed())
+        })
+        .await;
+        // What the hop to the blocking pool and back cost, beyond the decision itself.
+        let hop = started.elapsed().saturating_sub(decide_time);
+        self.pipeline
+            .metrics()
+            .observe_stage(Stage::BlockingPool, hop);
+        tracing::debug!(
+            blocking_pool_us = hop.as_micros() as u64,
+            "decision returned"
+        );
         AuthDecision {
             decision: d.decision,
             reason: d.reason,
@@ -459,6 +524,10 @@ impl Authorizer for ServerAuthorizer {
             p.record_rejection(&chain, &call, &reason, now)
         })
         .await
+    }
+
+    fn observe_stage(&self, stage: Stage, elapsed: Duration) {
+        self.pipeline.metrics().observe_stage(stage, elapsed);
     }
 }
 
