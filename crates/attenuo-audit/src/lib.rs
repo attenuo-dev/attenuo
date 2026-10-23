@@ -32,7 +32,7 @@ pub use export::{
     verify_export_with, Export, ExportHeader, ExportReport, RecordFilter, VerifyOptions,
     EXPORT_FORMAT,
 };
-pub use lease::{LeaseStatus, LeaseStore, MemoryLeaseStore};
+pub use lease::{LeaseNode, LeaseStatus, LeaseStore, LeaseSubtree, MemoryLeaseStore};
 pub use log::{
     canonical_record_json, compute_entry_hash, entry_hash_from_json, verify_entries, AuditEntry,
     AuditSink, VerifyReport, ENTRY_HASH_VERSION, GENESIS_HASH,

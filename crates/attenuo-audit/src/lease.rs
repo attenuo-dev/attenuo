@@ -4,7 +4,7 @@
 //! revoking one revokes everything delegated from it. A lease the store does not know is
 //! reported as `unknown` and counts as inactive: a store that lost rows fails closed.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Mutex;
 
 use attenuo_core::LeaseId;
@@ -91,6 +91,101 @@ impl LeaseRow {
     }
 }
 
+/// One lease in a [`LeaseSubtree`]: its id and its registry row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseNode {
+    /// The lease.
+    pub id: LeaseId,
+    /// Its row as the store holds it (parent, expiry, revocation).
+    pub row: LeaseRow,
+}
+
+/// Read-only picture of what revoking a lease would touch: the lease, everything delegated
+/// from it, and the leases it was delegated from. Built by `subtree` on the lease stores; the
+/// admin console shows it before an operator confirms a revocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseSubtree {
+    /// The lease asked about first, then its descendants breadth-first (each level ordered
+    /// by id). Breadth-first so that a truncated answer keeps the leases closest to it.
+    pub nodes: Vec<LeaseNode>,
+    /// The lease's ancestors, nearest first: its parent, then the parent's parent, up to the
+    /// root of the chain. The walk stops at a lease with no parent, at a parent the store
+    /// does not know, or at a lease it has already seen (a cycle no real tree has).
+    pub ancestors: Vec<LeaseNode>,
+    /// Unrevoked leases in the whole subtree, counted without the `max_nodes` cap: exactly
+    /// the number a revocation of this lease would report if run now.
+    pub would_revoke: u64,
+    /// `nodes` stops short of the whole subtree because it reached `max_nodes`.
+    pub truncated: bool,
+}
+
+impl LeaseSubtree {
+    /// The topmost lease reached by walking `parent`. For a well-formed tree this is the
+    /// chain's first hop, which is also the audit records' `chain_id`.
+    pub fn root(&self) -> &LeaseId {
+        match self.ancestors.last() {
+            Some(top) => &top.id,
+            None => &self.nodes[0].id,
+        }
+    }
+}
+
+/// Order `rows` breadth-first from `start` along their parent links, children of one lease by
+/// id. `rows` is a subtree found by a recursive query, whose own order is not something to
+/// rely on; this gives both stores the same, stable order. Rows not reachable from `start`
+/// are dropped and a lease is visited once, so a cycle cannot loop.
+pub(crate) fn breadth_first(start: &LeaseId, rows: Vec<(LeaseId, LeaseRow)>) -> Vec<LeaseNode> {
+    let mut children: BTreeMap<LeaseId, Vec<LeaseId>> = BTreeMap::new();
+    for (id, row) in &rows {
+        if let Some(parent) = &row.parent {
+            children.entry(parent.clone()).or_default().push(id.clone());
+        }
+    }
+    for kids in children.values_mut() {
+        kids.sort();
+    }
+    let mut by_id: BTreeMap<LeaseId, LeaseRow> = rows.into_iter().collect();
+    let mut out = Vec::with_capacity(by_id.len());
+    let mut visited = BTreeSet::new();
+    let mut queue = VecDeque::from([start.clone()]);
+    while let Some(id) = queue.pop_front() {
+        if !visited.insert(id.clone()) {
+            continue;
+        }
+        let Some(row) = by_id.remove(&id) else {
+            continue;
+        };
+        if let Some(kids) = children.get(&id) {
+            queue.extend(kids.iter().cloned());
+        }
+        out.push(LeaseNode { id, row });
+    }
+    out
+}
+
+/// Walk `parent` links up from `row` (the row of `start`), nearest first. Stops at a lease
+/// with no parent, an unknown parent, or a lease already seen, so a cycle terminates.
+pub(crate) fn ancestors_of(
+    start: &LeaseId,
+    row: &LeaseRow,
+    mut lookup: impl FnMut(&LeaseId) -> Result<Option<LeaseRow>, AuditError>,
+) -> Result<Vec<LeaseNode>, AuditError> {
+    let mut seen = BTreeSet::from([start.clone()]);
+    let mut out = Vec::new();
+    let mut next = row.parent.clone();
+    while let Some(id) = next {
+        if !seen.insert(id.clone()) {
+            break;
+        }
+        let Some(row) = lookup(&id)? else {
+            break;
+        };
+        next = row.parent.clone();
+        out.push(LeaseNode { id, row });
+    }
+    Ok(out)
+}
+
 /// Fold per-lease lookups into a [`LeaseStatus`].
 pub(crate) fn classify(
     leases: &[&LeaseId],
@@ -126,6 +221,49 @@ impl MemoryLeaseStore {
     /// Copy of one lease's row, if known.
     pub fn get(&self, lease: &LeaseId) -> Result<Option<LeaseRow>, AuditError> {
         Ok(self.rows.lock()?.get(lease).cloned())
+    }
+
+    /// What revoking `lease` would touch, without changing anything; `None` for an unknown
+    /// lease. `nodes` holds at most `max_nodes` leases (at least 1); `would_revoke` counts
+    /// the whole subtree. See [`LeaseSubtree`]; the SQLite store answers the same way.
+    pub fn subtree(
+        &self,
+        lease: &LeaseId,
+        max_nodes: usize,
+    ) -> Result<Option<LeaseSubtree>, AuditError> {
+        let rows = self.rows.lock()?;
+        let Some(row) = rows.get(lease) else {
+            return Ok(None);
+        };
+        // Same walk as `revoke`, without the writes.
+        let mut found = Vec::new();
+        let mut visited = BTreeSet::new();
+        let mut queue = VecDeque::from([lease.clone()]);
+        while let Some(id) = queue.pop_front() {
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            if let Some(r) = rows.get(&id) {
+                found.push((id.clone(), r.clone()));
+            }
+            queue.extend(
+                rows.iter()
+                    .filter(|(_, r)| r.parent.as_ref() == Some(&id))
+                    .map(|(child, _)| child.clone()),
+            );
+        }
+        let would_revoke = found.iter().filter(|(_, r)| r.revoked_at.is_none()).count() as u64;
+        let mut nodes = breadth_first(lease, found);
+        let max_nodes = max_nodes.max(1);
+        let truncated = nodes.len() > max_nodes;
+        nodes.truncate(max_nodes);
+        let ancestors = ancestors_of(lease, row, |id| Ok(rows.get(id).cloned()))?;
+        Ok(Some(LeaseSubtree {
+            nodes,
+            ancestors,
+            would_revoke,
+            truncated,
+        }))
     }
 }
 

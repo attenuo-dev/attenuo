@@ -157,6 +157,8 @@ An actor token is checked in this order (module `actor`): the header `typ` must 
 
 Because the child lease is registered under the parent's, revoking any lease revokes every lease delegated from it, and the child's next call fails the lease step. Even without the cascade, the child's chain lists every ancestor lease, so a revoked ancestor is caught directly.
 
+`GET /admin/leases/{id}/tree` previews that cascade without writing (`SqliteLeaseStore::subtree`): it reads the subtree with the recursive query the revocation's `UPDATE` uses, counts its unrevoked rows as `would_revoke`, and lists at most `max_nodes` of them breadth-first plus the ancestors up to the root. Agents and issuance times come from the chain's `root_token` and `exchange` records, found through the `chain_id` index (the root lease); the hop a record issued is its last lease.
+
 ### Checkpoints, export and verification
 
 `SqliteAudit::with_checkpointing(signer, every)` makes `append` sign `(seq, head_hash)` and insert a row into `checkpoints` inside the append's transaction whenever `seq` is a multiple of `every`, so a checkpoint never refers to a head that was not committed. `lib::spawn_checkpointer` (started by `serve` when `[audit] checkpoint_interval_seconds` is positive) calls `checkpoint_if_new` on a timer, which signs the head only if it moved past the newest checkpoint. `checkpoint_signed` backs `GET /admin/audit/checkpoint`: it returns the existing checkpoint for an unchanged head and refuses to sign when a stored checkpoint at that `seq` disagrees with the log.

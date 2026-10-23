@@ -71,12 +71,43 @@ All admin routes need `Authorization: Bearer <admin token>`. They answer 401 wit
 | --- | --- |
 | `GET /admin/leases/{lease_id}` | Lease state. |
 | `POST /admin/leases/{lease_id}/revoke` | Revoke the lease and all descendants. |
+| `GET /admin/leases/{lease_id}/tree?max_nodes` | The lease, its descendants and its ancestors, and how many leases a revoke would change now. Read-only; see [Lease tree](#lease-tree). 404 for an unknown lease. |
 | `GET /admin/audit` | Audit entries in ascending `seq` order, paged with `from` and `limit`. Also returns `next` (when the page was full) and `head`, the newest `seq`. |
 | `GET /admin/audit/verify` | Walk the whole hash chain, verify every checkpoint signature against the JWKS, and report `{entries, ok, first_bad_seq, checkpoints, last_signed_seq, unsigned_tail, bad_checkpoints}`. |
 | `GET /admin/audit/checkpoint` | The signed checkpoint of the head, `{seq, head_hash, at, kid, signature}` (signing it now if the head has none). For keeping outside the host. `hash` repeats `head_hash` for older clients. |
 | `GET /admin/audit/export?from&to` | Entries `from..=to` (default: the whole log) and the checkpoints in that range, streamed as `application/x-ndjson`: a `header` line, `entry` lines, then `checkpoint` lines. Verify offline with `attenuo audit verify --file`. 400 if `from` is 0 or `to < from`. |
 | `POST /admin/policies/reload` | Re-read the policy file. On failure the old policy stays. |
 | `POST /admin/root-token` | Development root mint. Mounted only when `[dev] allow_root_mint = true`. |
+
+### Lease tree
+
+`GET /admin/leases/{lease_id}/tree` is a dry run of `POST /admin/leases/{lease_id}/revoke`: it shows what the revocation would reach and changes nothing (no lease row, no audit record).
+
+- `nodes`: the lease first, then every lease delegated from it, breadth-first (each level in id order). At most `max_nodes` (default 1000, clamped to 1..10000); `truncated` is `true` when the cap cut the list short.
+- `ancestors`: the leases it was delegated from, nearest first, ending at `root`, the chain's first hop. `root` is also the `chain_id` of the chain's audit records. Empty for a root lease.
+- `would_revoke`: the leases in the whole subtree that are not revoked yet, counted with the same query the revocation runs, so it is the `revoked` count a revoke sent now would return. It ignores `max_nodes`.
+- Per lease: the registry row (`parent`, `expires_at`, `revoked_at`, `revoke_reason`), `active` now, and from the audit record that issued it (`root_token` or `exchange`) the `agent` it was issued to, `issued_at` and `issued_seq`. These three are `null` when no issuance record is found.
+
+```json
+{
+  "root": "0b7c...",
+  "ancestors": [
+    {"lease_id": "0b7c...", "parent": null, "agent": "planner", "active": true,
+     "expires_at": "2026-10-23T19:20:00Z", "revoked_at": null, "revoke_reason": null,
+     "issued_at": "2026-10-23T19:05:00Z", "issued_seq": 41}
+  ],
+  "nodes": [
+    {"lease_id": "5e21...", "parent": "0b7c...", "agent": "coder", "active": true,
+     "expires_at": "2026-10-23T19:20:02Z", "revoked_at": null, "revoke_reason": null,
+     "issued_at": "2026-10-23T19:05:02Z", "issued_seq": 42},
+    {"lease_id": "9a40...", "parent": "5e21...", "agent": "reviewer", "active": false,
+     "expires_at": "2026-10-23T19:20:03Z", "revoked_at": "2026-10-23T19:06:10Z",
+     "revoke_reason": "rotated", "issued_at": "2026-10-23T19:05:03Z", "issued_seq": 43}
+  ],
+  "would_revoke": 1,
+  "truncated": false
+}
+```
 
 ## Metrics
 
