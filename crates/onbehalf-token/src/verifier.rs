@@ -198,6 +198,11 @@ impl Verifier {
                 "`exp` does not match the last hop's expiry".into(),
             ));
         }
+        if claims.cnf.as_ref().is_some_and(|c| !c.is_well_formed()) {
+            return Err(TokenError::Malformed(
+                "`cnf.jkt` is not a SHA-256 thumbprint".into(),
+            ));
+        }
         if claims.ou_sig_v != OU_SIG_VERSION {
             // A missing claim deserializes as 0: a version-1 token from before SR-14.
             return Err(TokenError::UnsupportedOuSig(claims.ou_sig_v.max(1)));

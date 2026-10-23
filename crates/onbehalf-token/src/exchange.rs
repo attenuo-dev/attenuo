@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 
 use crate::claims::{MayAct, JWT_TOKEN_TYPE_URN};
+use crate::dpop::Confirmation;
 use crate::error::TokenError;
 use crate::issuer::{IssueOptions, IssuedToken, Issuer};
 
@@ -75,6 +76,19 @@ impl ExchangeRequest {
         now: OffsetDateTime,
         not_after: Option<OffsetDateTime>,
     ) -> Result<ExchangeResponse, TokenError> {
+        self.execute_with(issuer, now, not_after, None)
+    }
+
+    /// As [`ExchangeRequest::execute_until`], with the child bound to a key (`cnf`) when given.
+    /// The caller has verified a DPoP proof for that key and, when the subject token is bound,
+    /// possession of the subject token's key; see [`IssueOptions::cnf`].
+    pub fn execute_with(
+        &self,
+        issuer: &Issuer,
+        now: OffsetDateTime,
+        not_after: Option<OffsetDateTime>,
+        cnf: Option<Confirmation>,
+    ) -> Result<ExchangeResponse, TokenError> {
         let ttl = self
             .ttl_seconds
             .map(|s| Duration::seconds(i64::try_from(s).unwrap_or(i64::MAX)));
@@ -87,6 +101,7 @@ impl ExchangeRequest {
             &IssueOptions {
                 may_act: self.may_act.clone(),
                 not_after,
+                cnf,
             },
         )?;
         Ok(ExchangeResponse::from_issued(&issued, now))
@@ -169,7 +184,7 @@ pub struct ExchangeResponse {
     pub access_token: String,
     /// Always `urn:ietf:params:oauth:token-type:jwt`.
     pub issued_token_type: String,
-    /// Always `Bearer`.
+    /// `DPoP` for a sender-constrained token (RFC 9449 §5), `Bearer` otherwise.
     pub token_type: String,
     /// Seconds until `access_token` expires, measured from the exchange time.
     pub expires_in: u64,
@@ -184,7 +199,12 @@ impl ExchangeResponse {
         Self {
             access_token: issued.token.clone(),
             issued_token_type: JWT_TOKEN_TYPE_URN.to_owned(),
-            token_type: "Bearer".to_owned(),
+            token_type: if issued.cnf.is_some() {
+                "DPoP"
+            } else {
+                "Bearer"
+            }
+            .to_owned(),
             expires_in,
             lease: issued.lease.clone(),
         }

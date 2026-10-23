@@ -743,6 +743,7 @@ fn may_act_on_the_parent_limits_the_next_actor() {
             &IssueOptions {
                 may_act: Some(MayAct::new(["agent:coder"])),
                 not_after: None,
+                cnf: None,
             },
         )
         .unwrap();
@@ -774,6 +775,7 @@ fn may_act_on_the_parent_limits_the_next_actor() {
             &IssueOptions {
                 may_act: Some(MayAct::new(Vec::<String>::new())),
                 not_after: None,
+                cnf: None,
             },
         )
         .unwrap();
@@ -819,6 +821,7 @@ fn not_after_caps_the_child_expiry() {
             &IssueOptions {
                 may_act: None,
                 not_after: Some(limit),
+                cnf: None,
             },
         )
         .unwrap();
@@ -833,6 +836,7 @@ fn not_after_caps_the_child_expiry() {
             &IssueOptions {
                 may_act: None,
                 not_after: Some(t0()),
+                cnf: None,
             },
         )
         .unwrap_err();
@@ -997,5 +1001,90 @@ fn ou_sig_stops_verifying_once_its_key_is_dropped() {
     assert!(matches!(
         dropped.verifier().verify(&child.token, t0()),
         Err(TokenError::InvalidSignature)
+    ));
+}
+
+/// SR-24: a bound token (`cnf.jkt`) can only have bound children; the binding is in the
+/// signed claims and in the exchange response's `token_type`.
+#[test]
+fn children_of_bound_tokens_must_be_bound_sr24() {
+    use onbehalf_token::{Confirmation, DpopKey};
+    let issuer = issuer();
+    let (parent_key, child_key) = (DpopKey::generate().unwrap(), DpopKey::generate().unwrap());
+    let bind = |k: &DpopKey| IssueOptions {
+        cnf: Some(Confirmation::jkt(k.thumbprint())),
+        ..IssueOptions::default()
+    };
+    let read = || caps([Capability::new("github", "read_file")]);
+    let r = issuer
+        .issue_root_with(
+            user(),
+            AgentId::new("agent:planner"),
+            caps([Capability::new("github", "read_*")]),
+            None,
+            t0(),
+            &bind(&parent_key),
+        )
+        .unwrap();
+    assert_eq!(r.cnf, Some(Confirmation::jkt(parent_key.thumbprint())));
+    let claims = issuer.verifier().verify(&r.token, t0()).unwrap().claims;
+    assert_eq!(
+        decode_payload(&r.token)["cnf"]["jkt"],
+        json!(parent_key.thumbprint())
+    );
+    assert_eq!(claims.cnf, r.cnf);
+    assert_eq!(ExchangeResponse::from_issued(&r, t0()).token_type, "DPoP");
+
+    // An unbound child of a bound parent is refused.
+    assert!(matches!(
+        issuer.exchange(&r.token, AgentId::new("agent:coder"), read(), None, t0()),
+        Err(TokenError::BindingRequired)
+    ));
+    // Bound to the same key, or to the child's own key: allowed.
+    for key in [&parent_key, &child_key] {
+        let c = issuer
+            .exchange_with(
+                &r.token,
+                AgentId::new("agent:coder"),
+                read(),
+                None,
+                t0(),
+                &bind(key),
+            )
+            .unwrap();
+        let cc = issuer.verifier().verify(&c.token, t0()).unwrap().claims;
+        assert_eq!(cc.cnf.unwrap().jkt, key.thumbprint());
+    }
+    // An unbound parent may have a bound or an unbound child, as before.
+    let open = root(&issuer);
+    assert_eq!(
+        ExchangeResponse::from_issued(&open, t0()).token_type,
+        "Bearer"
+    );
+    issuer
+        .exchange_with(
+            &open.token,
+            AgentId::new("agent:coder"),
+            read(),
+            None,
+            t0(),
+            &bind(&child_key),
+        )
+        .unwrap();
+    // A malformed thumbprint is not minted.
+    let bad = IssueOptions {
+        cnf: Some(Confirmation::jkt("nope")),
+        ..IssueOptions::default()
+    };
+    assert!(matches!(
+        issuer.exchange_with(
+            &open.token,
+            AgentId::new("agent:x"),
+            read(),
+            None,
+            t0(),
+            &bad
+        ),
+        Err(TokenError::Malformed(_))
     ));
 }

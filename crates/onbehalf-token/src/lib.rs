@@ -66,6 +66,7 @@
 
 pub mod claims;
 pub mod detached;
+pub mod dpop;
 pub mod error;
 pub mod exchange;
 pub mod issuer;
@@ -76,6 +77,7 @@ pub use claims::{
     ActClaim, Claims, MayAct, JWT_TOKEN_TYPE_URN, OU_SIG_CONTEXT, OU_SIG_VERSION, TOKEN_TYPE,
 };
 pub use detached::{verify_detached, DetachedSigner};
+pub use dpop::{Confirmation, DpopError, DpopKey};
 pub use error::TokenError;
 pub use exchange::{
     ExchangeRequest, ExchangeResponse, AUTHORIZATION_DETAILS_TYPE, TOKEN_EXCHANGE_GRANT_TYPE,
