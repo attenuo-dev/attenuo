@@ -1,13 +1,14 @@
 //! SQLite-backed audit sink and lease store.
 //!
-//! Both wrap a single `rusqlite::Connection` behind a `Mutex`. Appends run inside a transaction
-//! that reads the current head and inserts the next row, so two writers can never produce two
-//! entries with the same `prev_hash`. The lock, not SQLite's locking, is what keeps the chain
-//! linear within a process; across processes SQLite's write lock plus the `UNIQUE` constraint on
-//! `entry_hash` and the primary key on `seq` make a fork fail rather than succeed.
+//! Both wrap a single `rusqlite::Connection` behind a `Mutex`. Audit appends go through one
+//! writer thread (group commit, see [`SqliteAudit`]): it takes the lock, reads the current head
+//! and inserts the next rows in one transaction, so two entries can never share a `prev_hash`.
+//! The lock and the single writer, not SQLite's locking, keep the chain linear within a
+//! process; across processes SQLite's write lock plus the `UNIQUE` constraint on `entry_hash`
+//! and the primary key on `seq` make a fork fail rather than succeed.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use onbehalf_core::{DecisionRecord, LeaseId};
@@ -310,8 +311,31 @@ struct Checkpointing {
     on_created: Option<CheckpointHook>,
 }
 
+/// Most appends committed in one transaction by the writer thread.
+pub const MAX_BATCH: usize = 256;
+
 /// Hash-chained audit log in SQLite.
+///
+/// **Group commit.** [`append`](AuditSink::append) hands the record to a single writer thread
+/// over a channel and blocks until that thread answers with the entry (or the error). The
+/// writer takes the first waiting record, adds every other record already queued (up to
+/// [`MAX_BATCH`]) and commits them in one transaction, so under load one commit (and, at
+/// `durability = "full"`, one `fsync`) covers many appends, while a lone caller pays no extra
+/// wait: records that arrive while a batch is being committed form the next batch. Records get
+/// sequence numbers in the order they reached the channel. If a batch fails, its records are
+/// retried one transaction each, so one bad record fails only its own append; every append
+/// either gets its committed entry back or an error, never a guess.
+///
+/// Reads, checkpoints and [`with_connection`](Self::with_connection) take the same lock and
+/// see only committed batches.
 pub struct SqliteAudit {
+    inner: Arc<Inner>,
+    /// Started by the first append, after the builders have run.
+    writer: OnceLock<Writer>,
+}
+
+/// What the writer thread and the readers share.
+struct Inner {
     conn: Mutex<Connection>,
     checkpointing: Option<Checkpointing>,
 }
@@ -319,9 +343,189 @@ pub struct SqliteAudit {
 impl std::fmt::Debug for SqliteAudit {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqliteAudit")
-            .field("checkpointing", &self.checkpointing.is_some())
+            .field("checkpointing", &self.inner.checkpointing.is_some())
+            .field("writer_started", &self.writer.get().is_some())
             .finish_non_exhaustive()
     }
+}
+
+/// One append waiting for the writer.
+struct Job {
+    record: DecisionRecord,
+    reply: mpsc::SyncSender<Result<AuditEntry, AuditError>>,
+}
+
+/// Handle on the writer thread. Dropping it closes the channel; the thread finishes the batch
+/// in hand and exits, and the drop waits for it.
+struct Writer {
+    jobs: Option<mpsc::Sender<Job>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Writer {
+    fn start(inner: Arc<Inner>) -> Self {
+        let (tx, rx) = mpsc::channel::<Job>();
+        match std::thread::Builder::new()
+            .name("onbehalf-audit-writer".into())
+            .spawn(move || writer_loop(&inner, &rx))
+        {
+            Ok(thread) => Self {
+                jobs: Some(tx),
+                thread: Some(thread),
+            },
+            // Without a writer every append fails, and so every decision is denied.
+            Err(e) => {
+                eprintln!("onbehalf-audit: cannot start the audit writer thread: {e}");
+                Self {
+                    jobs: None,
+                    thread: None,
+                }
+            }
+        }
+    }
+
+    fn append(&self, record: DecisionRecord) -> Result<AuditEntry, AuditError> {
+        let stopped = || AuditError::Storage("the audit writer is not running".into());
+        let jobs = self.jobs.as_ref().ok_or_else(stopped)?;
+        let (reply, answer) = mpsc::sync_channel(1);
+        jobs.send(Job { record, reply }).map_err(|_| stopped())?;
+        // A writer that panicked drops the reply sender: the append fails, it is not assumed.
+        answer.recv().map_err(|_| stopped())?
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        self.jobs.take();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn writer_loop(inner: &Inner, jobs: &mpsc::Receiver<Job>) {
+    while let Ok(first) = jobs.recv() {
+        let mut batch = vec![first];
+        while batch.len() < MAX_BATCH {
+            match jobs.try_recv() {
+                Ok(job) => batch.push(job),
+                Err(_) => break,
+            }
+        }
+        let (records, replies): (Vec<_>, Vec<_>) =
+            batch.into_iter().map(|j| (j.record, j.reply)).unzip();
+        for (reply, result) in replies.into_iter().zip(inner.append_batch(records)) {
+            // The caller always waits for its answer; a send can only fail if it panicked.
+            let _ = reply.send(result);
+        }
+    }
+}
+
+impl Inner {
+    /// Commit `records` in order, as one transaction when possible. One result per record.
+    fn append_batch(&self, records: Vec<DecisionRecord>) -> Vec<Result<AuditEntry, AuditError>> {
+        let n = records.len();
+        let mut conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(_) => return (0..n).map(|_| Err(AuditError::Poisoned)).collect(),
+        };
+        match self.commit(&mut conn, records) {
+            Ok(entries) => entries.into_iter().map(Ok).collect(),
+            Err((e, _)) if n == 1 => vec![Err(e)],
+            // Something in the batch failed and the transaction rolled back. Find out which
+            // record it was by committing them one at a time, in the same order.
+            Err((_, records)) => records
+                .into_iter()
+                .map(|r| match self.commit(&mut conn, vec![r]) {
+                    Ok(mut one) => Ok(one.pop().expect("one record, one entry")),
+                    Err((e, _)) => Err(e),
+                })
+                .collect(),
+        }
+    }
+
+    /// One transaction: read the head, chain and insert every record, sign the checkpoints
+    /// that fall in the batch, commit. On failure nothing is written and the records come back.
+    fn commit(
+        &self,
+        conn: &mut Connection,
+        records: Vec<DecisionRecord>,
+    ) -> Result<Vec<AuditEntry>, (AuditError, Vec<DecisionRecord>)> {
+        let tx = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+            Ok(tx) => tx,
+            Err(e) => return Err((e.into(), records)),
+        };
+        let head = match head_in(&tx) {
+            Ok(h) => h,
+            Err(e) => return Err((e, records)),
+        };
+        let mut entries: Vec<AuditEntry> = Vec::with_capacity(records.len());
+        for record in records {
+            let entry = AuditEntry::next(entries.last().or(head.as_ref()), record);
+            entries.push(entry);
+        }
+        let mut created = Vec::new();
+        let written = entries
+            .iter()
+            .try_for_each(|entry| {
+                insert_entry(&tx, entry)?;
+                if let Some(c) = self.checkpointing.as_ref().filter(|c| c.every > 0) {
+                    if entry.seq.is_multiple_of(c.every) {
+                        let cp = Checkpoint::sign(
+                            &c.signer,
+                            entry.seq,
+                            &entry.entry_hash,
+                            entry.record.at,
+                        )?;
+                        insert_checkpoint(&tx, &cp)?;
+                        created.push(cp);
+                    }
+                }
+                Ok::<(), AuditError>(())
+            })
+            .and_then(|()| Ok(tx.commit()?));
+        if let Err(e) = written {
+            return Err((e, entries.into_iter().map(|e| e.record).collect()));
+        }
+        if let Some(hook) = self
+            .checkpointing
+            .as_ref()
+            .and_then(|c| c.on_created.as_ref())
+        {
+            created.iter().for_each(|cp| hook(cp));
+        }
+        Ok(entries)
+    }
+}
+
+fn insert_entry(tx: &Transaction<'_>, entry: &AuditEntry) -> Result<(), AuditError> {
+    let r = &entry.record;
+    tx.prepare_cached(
+        "INSERT INTO audit (seq, prev_hash, entry_hash, at, decision, reason, \
+         originating_subject, agents, chain_depth, chain_digest, leases, server, tool, \
+         arguments_digest, session_id, policy_ids, record_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+    )?
+    .execute(params![
+        entry.seq as i64,
+        entry.prev_hash,
+        entry.entry_hash,
+        fmt_time(r.at)?,
+        decision_str(&r.decision),
+        r.reason,
+        r.originating_subject,
+        serde_json::to_string(&r.agents)?,
+        r.chain_depth as i64,
+        r.chain_digest,
+        serde_json::to_string(&r.leases)?,
+        r.server,
+        r.tool,
+        r.arguments_digest,
+        r.session_id,
+        serde_json::to_string(&r.policy_ids)?,
+        serde_json::to_string(r)?,
+    ])?;
+    Ok(())
 }
 
 impl SqliteAudit {
@@ -345,9 +549,18 @@ impl SqliteAudit {
         conn.execute_batch(AUDIT_SCHEMA)?;
         conn.execute_batch(CHECKPOINT_SCHEMA)?;
         Ok(Self {
-            conn: Mutex::new(conn),
-            checkpointing: None,
+            inner: Arc::new(Inner {
+                conn: Mutex::new(conn),
+                checkpointing: None,
+            }),
+            writer: OnceLock::new(),
         })
+    }
+
+    /// The shared state, for the builders. They run before the first append starts the writer
+    /// thread (which holds the other reference), so the `Arc` is still unique.
+    fn inner_mut(&mut self) -> &mut Inner {
+        Arc::get_mut(&mut self.inner).expect("SqliteAudit builders must run before any append")
     }
 
     /// Sign checkpoints with `signer`: one every `every` appended entries (0 turns the
@@ -358,7 +571,7 @@ impl SqliteAudit {
         signer: onbehalf_token::DetachedSigner,
         every: u64,
     ) -> Self {
-        self.checkpointing = Some(Checkpointing {
+        self.inner_mut().checkpointing = Some(Checkpointing {
             signer,
             every,
             on_created: None,
@@ -373,7 +586,7 @@ impl SqliteAudit {
         mut self,
         hook: impl Fn(&Checkpoint) + Send + Sync + 'static,
     ) -> Self {
-        if let Some(c) = self.checkpointing.as_mut() {
+        if let Some(c) = self.inner_mut().checkpointing.as_mut() {
             c.on_created = Some(Arc::new(hook));
         }
         self
@@ -383,10 +596,11 @@ impl SqliteAudit {
     /// twice without an append in between returns the same checkpoint.
     pub fn checkpoint_signed(&self, now: OffsetDateTime) -> Result<Checkpoint, AuditError> {
         let c = self
+            .inner
             .checkpointing
             .as_ref()
             .ok_or(AuditError::NoCheckpointSigner)?;
-        let mut conn = self.conn.lock()?;
+        let mut conn = self.inner.conn.lock()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let (seq, hash) = match head_in(&tx)? {
             Some(h) => (h.seq, h.entry_hash),
@@ -416,7 +630,7 @@ impl SqliteAudit {
     /// `[audit] checkpoint_interval_seconds` calls this.
     pub fn checkpoint_if_new(&self, now: OffsetDateTime) -> Result<Option<Checkpoint>, AuditError> {
         let (head, last) = {
-            let conn = self.conn.lock()?;
+            let conn = self.inner.conn.lock()?;
             let head: i64 =
                 conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM audit", [], |r| r.get(0))?;
             let last: i64 =
@@ -433,7 +647,7 @@ impl SqliteAudit {
 
     /// The newest checkpoint, if any.
     pub fn last_checkpoint(&self) -> Result<Option<Checkpoint>, AuditError> {
-        let conn = self.conn.lock()?;
+        let conn = self.inner.conn.lock()?;
         let mut stmt = conn.prepare_cached(
             "SELECT seq, head_hash, at, kid, signature FROM checkpoints \
              ORDER BY seq DESC LIMIT 1",
@@ -444,7 +658,7 @@ impl SqliteAudit {
 
     /// Checkpoints with `from <= seq <= to`, ascending.
     pub fn checkpoints_between(&self, from: u64, to: u64) -> Result<Vec<Checkpoint>, AuditError> {
-        let conn = self.conn.lock()?;
+        let conn = self.inner.conn.lock()?;
         let mut stmt = conn.prepare_cached(
             "SELECT seq, head_hash, at, kid, signature FROM checkpoints \
              WHERE seq >= ?1 AND seq <= ?2 ORDER BY seq",
@@ -465,7 +679,7 @@ impl SqliteAudit {
         keys: &CheckpointKeys,
     ) -> Result<SignedVerifyReport, AuditError> {
         let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit ORDER BY seq");
-        let conn = self.conn.lock()?;
+        let conn = self.inner.conn.lock()?;
         let checkpoints: Vec<Checkpoint> = {
             let mut stmt = conn.prepare(
                 "SELECT seq, head_hash, at, kid, signature FROM checkpoints ORDER BY seq",
@@ -486,7 +700,7 @@ impl SqliteAudit {
         &self,
         f: impl FnOnce(&Connection) -> Result<R, AuditError>,
     ) -> Result<R, AuditError> {
-        let conn = self.conn.lock()?;
+        let conn = self.inner.conn.lock()?;
         f(&conn)
     }
 
@@ -496,14 +710,14 @@ impl SqliteAudit {
             "SELECT {ENTRY_COLUMNS} FROM audit WHERE originating_subject = ?1 \
              ORDER BY seq DESC LIMIT ?2"
         );
-        let conn = self.conn.lock()?;
+        let conn = self.inner.conn.lock()?;
         query_entries(&conn, &sql, &[&subject, &(limit as i64)])
     }
 
     /// Every entry bound to one delegation chain, in order.
     pub fn by_chain(&self, chain_digest: &str) -> Result<Vec<AuditEntry>, AuditError> {
         let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE chain_digest = ?1 ORDER BY seq");
-        let conn = self.conn.lock()?;
+        let conn = self.inner.conn.lock()?;
         query_entries(&conn, &sql, &[&chain_digest])
     }
 
@@ -524,7 +738,7 @@ impl SqliteAudit {
         let sql = format!(
             "SELECT {ENTRY_COLUMNS} FROM audit WHERE leases LIKE ?1 ESCAPE '\\' ORDER BY seq"
         );
-        let conn = self.conn.lock()?;
+        let conn = self.inner.conn.lock()?;
         let candidates = query_entries(&conn, &sql, &[&pattern])?;
         // Confirm against the decoded record; LIKE is only a prefilter.
         Ok(candidates
@@ -535,7 +749,7 @@ impl SqliteAudit {
 
     /// Number of entries.
     pub fn len(&self) -> Result<u64, AuditError> {
-        let conn = self.conn.lock()?;
+        let conn = self.inner.conn.lock()?;
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM audit", [], |r| r.get(0))?;
         Ok(n as u64)
     }
@@ -547,58 +761,13 @@ impl SqliteAudit {
 
 impl AuditSink for SqliteAudit {
     fn append(&self, record: DecisionRecord) -> Result<AuditEntry, AuditError> {
-        let mut conn = self.conn.lock()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let head = head_in(&tx)?;
-        let entry = AuditEntry::next(head.as_ref(), record);
-        let r = &entry.record;
-        tx.prepare_cached(
-            "INSERT INTO audit (seq, prev_hash, entry_hash, at, decision, reason, \
-             originating_subject, agents, chain_depth, chain_digest, leases, server, tool, \
-             arguments_digest, session_id, policy_ids, record_json) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-        )?
-        .execute(params![
-            entry.seq as i64,
-            entry.prev_hash,
-            entry.entry_hash,
-            fmt_time(r.at)?,
-            decision_str(&r.decision),
-            r.reason,
-            r.originating_subject,
-            serde_json::to_string(&r.agents)?,
-            r.chain_depth as i64,
-            r.chain_digest,
-            serde_json::to_string(&r.leases)?,
-            r.server,
-            r.tool,
-            r.arguments_digest,
-            r.session_id,
-            serde_json::to_string(&r.policy_ids)?,
-            serde_json::to_string(r)?,
-        ])?;
-        let mut created = None;
-        if let Some(c) = self.checkpointing.as_ref().filter(|c| c.every > 0) {
-            if entry.seq.is_multiple_of(c.every) {
-                let cp = Checkpoint::sign(&c.signer, entry.seq, &entry.entry_hash, r.at)?;
-                insert_checkpoint(&tx, &cp)?;
-                created = Some(cp);
-            }
-        }
-        tx.commit()?;
-        if let (Some(cp), Some(hook)) = (
-            created,
-            self.checkpointing
-                .as_ref()
-                .and_then(|c| c.on_created.as_ref()),
-        ) {
-            hook(&cp);
-        }
-        Ok(entry)
+        self.writer
+            .get_or_init(|| Writer::start(Arc::clone(&self.inner)))
+            .append(record)
     }
 
     fn head(&self) -> Result<Option<AuditEntry>, AuditError> {
-        let mut conn = self.conn.lock()?;
+        let mut conn = self.inner.conn.lock()?;
         let tx = conn.transaction()?;
         head_in(&tx)
     }
@@ -606,13 +775,13 @@ impl AuditSink for SqliteAudit {
     fn range(&self, from_seq: u64, limit: usize) -> Result<Vec<AuditEntry>, AuditError> {
         let sql =
             format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE seq >= ?1 ORDER BY seq LIMIT ?2");
-        let conn = self.conn.lock()?;
+        let conn = self.inner.conn.lock()?;
         query_entries(&conn, &sql, &[&(from_seq as i64), &(limit as i64)])
     }
 
     fn verify_chain(&self) -> Result<VerifyReport, AuditError> {
         let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit ORDER BY seq");
-        let conn = self.conn.lock()?;
+        let conn = self.inner.conn.lock()?;
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map([], |row| Ok(entry_from_row(row)))?;
         // A row that cannot be decoded (corrupt JSON, column/JSON disagreement) surfaces as

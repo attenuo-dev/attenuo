@@ -91,7 +91,11 @@ fn concurrent_appends_keep_a_contiguous_valid_chain() {
     let per_thread = 25;
     let sqlite = Arc::new(SqliteAudit::open_in_memory().unwrap());
     let memory = Arc::new(MemoryAudit::new());
-    let targets: Vec<Arc<dyn AuditSink>> = vec![sqlite.clone(), memory.clone()];
+    // A file-backed log too: appends go through the group-commit writer and real WAL commits.
+    // (Checkpoints under concurrency: tests/checkpoints.rs.)
+    let dir = tempfile::tempdir().unwrap();
+    let file = Arc::new(SqliteAudit::open(dir.path().join("audit.db")).unwrap());
+    let targets: Vec<Arc<dyn AuditSink>> = vec![sqlite.clone(), memory.clone(), file];
     for sink in targets {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
