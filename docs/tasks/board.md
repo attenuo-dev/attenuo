@@ -57,6 +57,7 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 
 ## Done
 
+- [x] Documentation site: mdBook build of `docs/` (`book.toml`, `docs/SUMMARY.md`), concept and reference pages, Pages workflow `docs.yml`. Not yet run on GitHub; Pages must be set to "GitHub Actions" as the source in the repo settings.
 - [x] CI and release workflows (fmt, clippy, test matrix, MSRV, deny, audit, demo, policy tests, docs and link checks; musl/macOS archives, signed GHCR image, SBOM, draft release), dev scripts and justfile, repo hygiene files. Workflow YAML parses; none of it has run on GitHub.
 - [x] Python SDK (`sdk/python`, package `onbehalf`): sync and async clients, admin client, capability helpers, `onbehalf.mcp`, unit and integration tests, `sdk-python` workflow, [agent example](https://github.com/7Mudit/onbehalf/blob/main/examples/python-agent/agent.py).
 - [x] User guides (`docs/guides/`), FAQ and positioning table; wire examples verified against a local build. IdP recipes remain untested against live providers.

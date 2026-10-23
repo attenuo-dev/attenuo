@@ -59,6 +59,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 - `docs/faq.md`: fifteen launch-day questions.
 - Positioning table in `docs/research/related-work.md`.
 - RFC-0001 section 7 now says what the audit log implements today (hash over `(seq, prev_hash, record)`, no automatic checkpoints, no `kind` field) next to the design target.
+- Documentation site: the `docs/` tree is built with mdBook (`book.toml`, `docs/SUMMARY.md`) and deployed to GitHub Pages by `.github/workflows/docs.yml` (mdBook 0.4.52, pinned). New concept pages in `docs/concepts/` (delegation chain, capabilities and attenuation, leases and revocation, audit log, enforcement points) and reference pages in `docs/reference/` (CLI commands, config keys, HTTP endpoints). Links from `docs/` to files outside it are now absolute GitHub URLs. Preview steps are in CONTRIBUTING.md.
 
 ### Security
 
