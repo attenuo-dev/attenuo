@@ -4,6 +4,7 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 
 ## Now
 
+- [ ] Audit rejected `initialize` on a revoked lease: LangChain's MCP adapter opens a session per call, so a call after revocation fails with 401 at `initialize` and leaves no audit record (only the `admin.lease.revoke` entry). Decide whether rejected session opens for a known token should be audited.
 - [ ] `onbehalf-core`: `Capability`, `CapabilitySet`, constraint types (set, numeric range, time range), `⊑` predicate.
 - [ ] `onbehalf-core`: proptest suite for `⊑` (reflexive, transitive, empty-set minimal, adding a key narrows, removing a value narrows, widening fails).
 - [ ] `onbehalf-core`: `DelegationChain`, `Hop`, `OriginatingUser`, canonical JSON (RFC 8785) for hashing.
