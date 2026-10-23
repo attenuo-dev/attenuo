@@ -54,13 +54,13 @@ class Signer:
             act = {"sub": a, **({"act": act} if act else {})}
         payload: dict[str, Any] = {
             "iss": "http://ob.test",
-            "aud": "onbehalf",
+            "aud": "attenuo",
             "sub": subject,
             "act": act,
             "jti": "jti-1",
             "iat": now,
             "exp": now + exp_delta,
-            "typ": "onbehalf+jwt",
+            "typ": "attenuo+jwt",
             "ou_sig": "sig",
             "chain": {
                 "originating_user": {

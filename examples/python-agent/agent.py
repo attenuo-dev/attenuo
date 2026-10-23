@@ -1,10 +1,10 @@
-"""A planner delegates to a coder, and the coder works through onbehalf's proxy.
+"""A planner delegates to a coder, and the coder works through attenuo's proxy.
 
-Run it against the GitHub-leak demo setup (an onbehalf server with `[dev] allow_root_mint = true`
+Run it against the GitHub-leak demo setup (an attenuo server with `[dev] allow_root_mint = true`
 and the fake GitHub MCP upstream; `examples/github-leak-demo/run.sh` shows how to start both):
 
     pip install -e sdk/python
-    ONBEHALF_SERVER=http://127.0.0.1:8080 ONBEHALF_ADMIN_TOKEN=demo-admin-token \\
+    ATTENUO_SERVER=http://127.0.0.1:8080 ATTENUO_ADMIN_TOKEN=demo-admin-token \\
         python examples/python-agent/agent.py
 
 What happens:
@@ -27,7 +27,7 @@ from __future__ import annotations
 import os
 import sys
 
-from onbehalf import (
+from attenuo import (
     AdminClient,
     Capability,
     Client,
@@ -36,23 +36,23 @@ from onbehalf import (
     Token,
 )
 
-SERVER = os.environ.get("ONBEHALF_SERVER", "http://127.0.0.1:8080")
-ADMIN_TOKEN = os.environ.get("ONBEHALF_ADMIN_TOKEN", "demo-admin-token")
+SERVER = os.environ.get("ATTENUO_SERVER", "http://127.0.0.1:8080")
+ADMIN_TOKEN = os.environ.get("ATTENUO_ADMIN_TOKEN", "demo-admin-token")
 # The coder's [[agents]] secret in the demo config: an exchange authenticates as its actor.
-CODER_SECRET = os.environ.get("ONBEHALF_CODER_SECRET", "demo-coder-secret")
+CODER_SECRET = os.environ.get("ATTENUO_CODER_SECRET", "demo-coder-secret")
 # The agent id that the demo config (examples/github-leak-demo/config.toml) grants `github:*`.
 PLANNER_AGENT = "assistant"
 
 
 class Coder:
-    """A sub-agent. It only knows its token and how to call tools through onbehalf."""
+    """A sub-agent. It only knows its token and how to call tools through attenuo."""
 
     def __init__(self, ob: Client, token: Token) -> None:
         self.ob = ob
         self.token = token
 
     def read_file(self, repo: str, path: str) -> str | None:
-        """Read a file. Returns None when onbehalf says the agent may not."""
+        """Read a file. Returns None when attenuo says the agent may not."""
         try:
             result = self.ob.call_tool(
                 self.token, "github", "read_file", {"repo": repo, "path": path}

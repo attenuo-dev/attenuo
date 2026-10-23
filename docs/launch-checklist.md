@@ -4,9 +4,9 @@ Engineering checklist for the first public release. It lists what to check and s
 
 ## Repository settings
 
-- [ ] Branch protection on `main`: pull request required, CI checks required, no direct pushes, as [CONTRIBUTING](https://github.com/7Mudit/onbehalf/blob/main/CONTRIBUTING.md) and [GOVERNANCE](https://github.com/7Mudit/onbehalf/blob/main/GOVERNANCE.md) already promise. The required checks are the jobs in `.github/workflows/ci.yml`: `fmt`, `clippy`, `test`, `msrv`, `deny`, `audit`, `demo`, `policy-tests`, `fuzz-build`, `docs`. `.github/CODEOWNERS` says code-owner approval satisfies the rule.
+- [ ] Branch protection on `main`: pull request required, CI checks required, no direct pushes, as [CONTRIBUTING](https://github.com/7Mudit/attenuo/blob/main/CONTRIBUTING.md) and [GOVERNANCE](https://github.com/7Mudit/attenuo/blob/main/GOVERNANCE.md) already promise. The required checks are the jobs in `.github/workflows/ci.yml`: `fmt`, `clippy`, `test`, `msrv`, `deny`, `audit`, `demo`, `policy-tests`, `fuzz-build`, `docs`. `.github/CODEOWNERS` says code-owner approval satisfies the rule.
 - [ ] Discussions switched on. `.github/ISSUE_TEMPLATE/config.yml` already links to `/discussions` for questions and early design ideas, so the link is dead until this is enabled.
-- [ ] Private vulnerability reporting switched on. [SECURITY.md](https://github.com/7Mudit/onbehalf/blob/main/SECURITY.md) points reporters at `github.com/7Mudit/onbehalf/security/advisories/new`.
+- [ ] Private vulnerability reporting switched on. [SECURITY.md](https://github.com/7Mudit/attenuo/blob/main/SECURITY.md) points reporters at `github.com/7Mudit/attenuo/security/advisories/new`.
 - [ ] Issue templates render: open the "New issue" page and confirm the bug report, feature request and security links appear, and that blank issues are off (`.github/ISSUE_TEMPLATE/`).
 - [ ] Pull request template appears on a test PR (`.github/pull_request_template.md`).
 - [ ] Dependabot enabled (`.github/dependabot.yml`) and the repository has a description, topics and the Apache-2.0 licence detected.
@@ -28,17 +28,17 @@ Engineering checklist for the first public release. It lists what to check and s
 `.github/workflows/release.yml` says in its header that it has not been exercised: no tag has been pushed.
 
 - [ ] On a fork, push a `v0.0.0-test` tag and watch the run. Expect four archives (Linux musl x86_64 and aarch64, macOS arm64 and x86_64), the multi-arch image to GHCR, the cosign signature, the SPDX SBOM, `SHA256SUMS`, and a draft release.
-- [ ] Download an archive, run `onbehalf --help` and `onbehalf-server --help`, and check the checksum against `SHA256SUMS`.
+- [ ] Download an archive, run `attenuo --help` and `attenuo-server --help`, and check the checksum against `SHA256SUMS`.
 - [ ] Delete the test tag, the draft release and the test image.
 - [ ] After the first real push, set the GHCR package to public.
 
 ## Signing and SBOM
 
-- [ ] Verify the signature of the test image with the command from the workflow header, using the real identity `https://github.com/7Mudit/onbehalf/.github/workflows/release.yml@` and the issuer `https://token.actions.githubusercontent.com`:
+- [ ] Verify the signature of the test image with the command from the workflow header, using the real identity `https://github.com/7Mudit/attenuo/.github/workflows/release.yml@` and the issuer `https://token.actions.githubusercontent.com`:
 
   ```sh
-  cosign verify ghcr.io/7mudit/onbehalf:<version> \
-    --certificate-identity-regexp '^https://github.com/7Mudit/onbehalf/\.github/workflows/release\.yml@' \
+  cosign verify ghcr.io/7mudit/attenuo:<version> \
+    --certificate-identity-regexp '^https://github.com/7Mudit/attenuo/\.github/workflows/release\.yml@' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
   ```
 
@@ -47,30 +47,30 @@ Engineering checklist for the first public release. It lists what to check and s
 
 ## Crates
 
-Crate publishing is manual for now (see "Releases" in CONTRIBUTING). The crates are `onbehalf-core`, `onbehalf-token`, `onbehalf-audit`, `onbehalf-policy`, `onbehalf-proxy`, `onbehalf-server` and `onbehalf-cli`. `onbehalf-bench` has `publish = false`.
+Crate publishing is manual for now (see "Releases" in CONTRIBUTING). The crates are `attenuo-core`, `attenuo-token`, `attenuo-audit`, `attenuo-policy`, `attenuo-proxy`, `attenuo-server` and `attenuo-cli`. `attenuo-bench` has `publish = false`.
 
 - [ ] Check that each crate name is free on crates.io before announcing anything.
 - [ ] Dry-run in dependency order, from the leaves up, and read each warning:
 
   ```sh
-  cargo publish --dry-run -p onbehalf-core
-  cargo publish --dry-run -p onbehalf-token
-  cargo publish --dry-run -p onbehalf-audit
-  cargo publish --dry-run -p onbehalf-policy
-  cargo publish --dry-run -p onbehalf-proxy
-  cargo publish --dry-run -p onbehalf-server
-  cargo publish --dry-run -p onbehalf-cli
+  cargo publish --dry-run -p attenuo-core
+  cargo publish --dry-run -p attenuo-token
+  cargo publish --dry-run -p attenuo-audit
+  cargo publish --dry-run -p attenuo-policy
+  cargo publish --dry-run -p attenuo-proxy
+  cargo publish --dry-run -p attenuo-server
+  cargo publish --dry-run -p attenuo-cli
   ```
 
-  A dry run for a crate whose dependencies are not yet on crates.io fails at the resolve step. Expect that for everything above `onbehalf-core` until the earlier crates are published, and decide whether to publish in order or to publish only the libraries.
+  A dry run for a crate whose dependencies are not yet on crates.io fails at the resolve step. Expect that for everything above `attenuo-core` until the earlier crates are published, and decide whether to publish in order or to publish only the libraries.
 - [ ] Each crate has a description, licence, repository and `rust-version` (they inherit from the workspace). Add `readme`, `keywords` and `categories` if you want them on the crate page.
-- [ ] The SDKs (`sdk/python`, `sdk/typescript`) are not published to PyPI or npm today and say so in their READMEs. Decide whether the first release publishes them. If it does, check the package names and the `@onbehalf` npm scope are yours first.
+- [ ] The SDKs (`sdk/python`, `sdk/typescript`) are not published to PyPI or npm today and say so in their READMEs. Decide whether the first release publishes them. If it does, check the package names and the `@attenuo` npm scope are yours first.
 
 ## Release notes and changelog
 
 - [ ] `CHANGELOG.md` `Unreleased` is complete. Compare it with `git cliff --unreleased`, using `cliff.toml`.
 - [ ] Open the `chore(release): vX.Y.Z` PR described in CONTRIBUTING: bump `workspace.package.version`, move `Unreleased` to a dated heading, add a fresh empty `Unreleased`.
-- [ ] Tag, wait for the draft release, and read the git-cliff section the workflow rendered. Edit the first public release's notes by hand: say it is pre-alpha, link the [README status section](https://github.com/7Mudit/onbehalf#status), and list the untested areas (identity provider recipes, Docker, production use).
+- [ ] Tag, wait for the draft release, and read the git-cliff section the workflow rendered. Edit the first public release's notes by hand: say it is pre-alpha, link the [README status section](https://github.com/7Mudit/attenuo#status), and list the untested areas (identity provider recipes, Docker, production use).
 - [ ] Publish the draft by hand.
 
 ## Before the announcement

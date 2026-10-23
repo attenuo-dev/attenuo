@@ -3,7 +3,7 @@ import {
   ApiError,
   decodeToken,
   DpopKey,
-  OnbehalfClient,
+  AttenuoClient,
   RefreshError,
   TokenRefresher,
   type Token,
@@ -47,7 +47,7 @@ async function rig(
     margin?: number;
     exchange?: (clock: { t: number }) => Promise<Token>;
     token?: Token;
-    clientOpts?: ConstructorParameters<typeof OnbehalfClient>[1];
+    clientOpts?: ConstructorParameters<typeof AttenuoClient>[1];
     onChange?: (t: Token) => void;
   } = {},
 ): Promise<Rig> {
@@ -72,7 +72,7 @@ async function rig(
   const changes: Token[] = [];
   const errors: RefreshError[] = [];
   const r = new TokenRefresher({
-    client: new OnbehalfClient("http://ob.test", { fetch, ...o.clientOpts }),
+    client: new AttenuoClient("http://ob.test", { fetch, ...o.clientOpts }),
     token: o.token ?? (await mint(o.ttl ?? 100)),
     exchange: o.exchange ? () => o.exchange!(clock) : () => mint(o.ttl ?? 100, { at: clock.t }),
     ...(o.interval !== undefined ? { leaseInterval: o.interval } : {}),

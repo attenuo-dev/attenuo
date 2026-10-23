@@ -60,4 +60,4 @@ This is why narrow grants matter. A capability of `github:*` also covers `resour
 - Only `equals`, `one_of` and `prefix` exist. Numeric and time-range constraints are proposed, not built.
 - There is no property test suite for the covering check yet. Unit tests cover the main cases.
 
-More detail: [RFC-0001 section 3](../spec/rfc-0001-onbehalf.md#3-delegation-chain-data-model) and [ADR-0005](../decisions/0005-policy-decision-point.md).
+More detail: [RFC-0001 section 3](../spec/rfc-0001-attenuo.md#3-delegation-chain-data-model) and [ADR-0005](../decisions/0005-policy-decision-point.md).

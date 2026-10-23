@@ -1,7 +1,7 @@
 /**
- * Helpers for pointing an MCP client at onbehalf's proxy.
+ * Helpers for pointing an MCP client at attenuo's proxy.
  *
- * onbehalf mounts each upstream at `<serverUrl>/mcp/<name>` and speaks MCP Streamable HTTP there.
+ * attenuo mounts each upstream at `<serverUrl>/mcp/<name>` and speaks MCP Streamable HTTP there.
  * A client needs two things: that URL, and `Authorization: Bearer <delegation token>` on every
  * request (`initialize`, `tools/list`, `tools/call` and the `GET`/`DELETE` session requests).
  * A token bound to a key (DPoP) also needs a fresh proof per request: use `mcpFetch`.
@@ -13,7 +13,7 @@ import { bearer, type Token } from "./token.js";
 import { MCP_ACCEPT, normalizeBase } from "./wire.js";
 
 /**
- * Headers an MCP client must send to onbehalf.
+ * Headers an MCP client must send to attenuo.
  *
  * By default only `Authorization` (and `Mcp-Session-Id` when given): MCP client libraries add
  * `Accept` and `Content-Type` themselves. Pass `contentHeaders: true` for a raw HTTP client.

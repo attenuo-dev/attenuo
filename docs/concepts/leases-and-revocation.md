@@ -30,7 +30,7 @@ An agent should renew well inside the interval. A third of it is a good rule. A 
 
 ## Revoking
 
-An operator revokes a lease with `POST /admin/leases/{id}/revoke`, or `onbehalf lease revoke <id>`. The server marks that lease and every descendant revoked in one transaction. The next request on any affected hop is denied.
+An operator revokes a lease with `POST /admin/leases/{id}/revoke`, or `attenuo lease revoke <id>`. The server marks that lease and every descendant revoked in one transaction. The next request on any affected hop is denied.
 
 Revoking the root lease of a run stops every sub-agent of every agent in it. You do not need to know which tokens exist. The server never stores tokens.
 
@@ -48,4 +48,4 @@ So "within one lease interval" is the worst case for a silent holder. For a deli
 - An external enforcement point that uses the AuthZEN endpoint learns about revocation only by asking. There is no push channel. See [Enforcement points](enforcement-points.md).
 - Failed renewals are not written to the audit log. Successful ones are.
 
-More detail: [ADR-0006](../decisions/0006-lease-based-in-flight-revocation.md), [RFC-0001 section 6](../spec/rfc-0001-onbehalf.md#6-revocation-via-leases) and [design/server.md](../design/server.md#lease-renewal).
+More detail: [ADR-0006](../decisions/0006-lease-based-in-flight-revocation.md), [RFC-0001 section 6](../spec/rfc-0001-attenuo.md#6-revocation-via-leases) and [design/server.md](../design/server.md#lease-renewal).

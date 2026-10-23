@@ -1,20 +1,20 @@
-"""Replay prompt-injection tool-call sequences against onbehalf and against a bare upstream.
+"""Replay prompt-injection tool-call sequences against attenuo and against a bare upstream.
 
 The environment (``policies/``) holds each suite's upstream, tool catalog and Cedar policy. The
 corpus (``cases/dev/*.yaml`` and ``cases/test/*.yaml``) describes, per case, the capability grant
 a user task needs and the tool calls a compromised agent would emit, each with the expected
 outcome. This module loads both, writes a server config, catalog and Cedar policy, starts
-``onbehalf-server`` and one echoing ``fake_mcp`` upstream per suite, and replays the calls in
+``attenuo-server`` and one echoing ``fake_mcp`` upstream per suite, and replays the calls in
 five arms:
 
-``direct``             no onbehalf: JSON-RPC straight to the upstream (the baseline).
+``direct``             no attenuo: JSON-RPC straight to the upstream (the baseline).
 ``scope_only``         tool-level capabilities only (argument constraints dropped) and a
                        permit-all Cedar policy. The OAuth-scope equivalent (arm A1 in the plan).
 ``scope_constraints``  the case's capabilities with their argument constraints, permit-all
                        policy: what attenuated tokens give without any policy.
 ``policy_only``        the suite Cedar policies, but every call carries the user's root token
                        (all servers, no attenuation): what policy gives without delegation.
-``onbehalf``           onbehalf as configured: attenuated tokens with argument constraints, the
+``attenuo``           attenuo as configured: attenuated tokens with argument constraints, the
                        suite Cedar policies, leases and audit (arm A2).
 
 No LLM is involved. See README.md for the method and its limits.
@@ -48,15 +48,15 @@ CASES_DIR = HERE / "cases"
 POLICIES_DIR = HERE / "policies"
 FROZEN_FILE = CASES_DIR / "test" / "POLICY_HASHES.json"
 
-# The suite starts its own server and CLI and sets what they need. These are the only ONBEHALF_*
-# variables it reads; any other (ONBEHALF_ADMIN_TOKEN, ONBEHALF_SERVER, ONBEHALF_TOKEN,
-# ONBEHALF_CONFIG, ...) comes from some other deployment and would redirect or break it.
-OWN_ENV = frozenset({"ONBEHALF_BIN_DIR", "ONBEHALF_INTEGRATION"})
+# The suite starts its own server and CLI and sets what they need. These are the only ATTENUO_*
+# variables it reads; any other (ATTENUO_ADMIN_TOKEN, ATTENUO_SERVER, ATTENUO_TOKEN,
+# ATTENUO_CONFIG, ...) comes from some other deployment and would redirect or break it.
+OWN_ENV = frozenset({"ATTENUO_BIN_DIR", "ATTENUO_INTEGRATION"})
 
 
 def ignore_inherited_env() -> list[str]:
-    """Remove inherited ``ONBEHALF_*`` variables from ``os.environ``; warn once if any were set."""
-    dropped = sorted(k for k in os.environ if k.startswith("ONBEHALF_") and k not in OWN_ENV)
+    """Remove inherited ``ATTENUO_*`` variables from ``os.environ``; warn once if any were set."""
+    dropped = sorted(k for k in os.environ if k.startswith("ATTENUO_") and k not in OWN_ENV)
     for k in dropped:
         del os.environ[k]
     if dropped:
@@ -72,7 +72,7 @@ ignore_inherited_env()
 
 sys.path.insert(0, str(ROOT / "sdk" / "python" / "src"))
 
-from onbehalf import (  # noqa: E402
+from attenuo import (  # noqa: E402
     AdminClient,
     ApiError,
     Capability,
@@ -88,13 +88,13 @@ USER_ISSUER = "https://idp.example"
 ROOT_AGENT = "assistant"
 WORKER = "worker"
 AGENT_SECRET = "eval-worker-secret"
-DECISION_HEADER = "x-onbehalf-decision-id"
+DECISION_HEADER = "x-attenuo-decision-id"
 CODE_DENIED = -32003
 CODE_UNKNOWN_SERVER = -32004
 
-ARMS = ("direct", "scope_only", "scope_constraints", "policy_only", "onbehalf")
+ARMS = ("direct", "scope_only", "scope_constraints", "policy_only", "attenuo")
 PROXIED = ARMS[1:]
-CONSTRAINED_ARMS = ("scope_constraints", "onbehalf")
+CONSTRAINED_ARMS = ("scope_constraints", "attenuo")
 PERMIT_ALL_ARMS = ("scope_only", "scope_constraints")
 STAGES = ("name", "lease", "capability", "policy", "exchange")
 ROLES = ("benign", "attack")
@@ -496,7 +496,7 @@ def write_config(
         f'listen = "127.0.0.1:{port}"',
         "[issuer]",
         f'issuer = "http://127.0.0.1:{port}"',
-        'audience = "onbehalf"',
+        'audience = "attenuo"',
         "default_ttl_seconds = 900",
         "[policy]",
         f"policies_path = {_toml_str(str(policy))}",
@@ -553,19 +553,19 @@ class Binaries:
 
 
 def find_binaries() -> Binaries:
-    """Prebuilt binaries from ``ONBEHALF_BIN_DIR``, else ``target/debug`` (run ``cargo build``).
+    """Prebuilt binaries from ``ATTENUO_BIN_DIR``, else ``target/debug`` (run ``cargo build``).
     ``fake_mcp`` is taken from the directory itself or from ``examples/``, whichever is newer."""
-    given = os.environ.get("ONBEHALF_BIN_DIR")
+    given = os.environ.get("ATTENUO_BIN_DIR")
     d = Path(given) if given else ROOT / "target" / "debug"
     fakes = [p for p in (d / "fake_mcp", d / "examples" / "fake_mcp") if p.exists()]
     fake = max(fakes, key=lambda p: p.stat().st_mtime) if fakes else d / "fake_mcp"
-    bins = Binaries(d / "onbehalf-server", d / "onbehalf", fake)
+    bins = Binaries(d / "attenuo-server", d / "attenuo", fake)
     missing = [str(p) for p in (bins.server, bins.cli, bins.fake_mcp) if not p.exists()]
     if missing:
         raise FileNotFoundError(
-            "missing binaries: " + ", ".join(missing) + ". Set ONBEHALF_BIN_DIR or build with "
-            "`cargo build -p onbehalf-server -p onbehalf-cli` and "
-            "`cargo build -p onbehalf-proxy --features testing --example fake_mcp`."
+            "missing binaries: " + ", ".join(missing) + ". Set ATTENUO_BIN_DIR or build with "
+            "`cargo build -p attenuo-server -p attenuo-cli` and "
+            "`cargo build -p attenuo-proxy --features testing --example fake_mcp`."
         )
     return bins
 
@@ -603,7 +603,7 @@ class Stack:
     bins: Binaries
 
     def cli(self, *args: str) -> subprocess.CompletedProcess[str]:
-        env = {**os.environ, "ONBEHALF_SERVER": self.url, "ONBEHALF_ADMIN_TOKEN": ADMIN_TOKEN}
+        env = {**os.environ, "ATTENUO_SERVER": self.url, "ATTENUO_ADMIN_TOKEN": ADMIN_TOKEN}
         return subprocess.run(
             [str(self.bins.cli), *args], env=env, capture_output=True, text=True, timeout=60
         )
@@ -677,14 +677,14 @@ def server(
         def healthy() -> bool:
             if proc.poll() is not None:
                 raise RuntimeError(
-                    f"onbehalf-server exited:\n{(arm_dir / 'server.log').read_text()[-2000:]}"
+                    f"attenuo-server exited:\n{(arm_dir / 'server.log').read_text()[-2000:]}"
                 )
             try:
                 return httpx.get(f"{url}/healthz", timeout=1).status_code == 200
             except httpx.HTTPError:
                 return False
 
-        _wait(healthy, "onbehalf-server")
+        _wait(healthy, "attenuo-server")
         yield Stack(url, arm_dir, cfg, ups, bins)
     finally:
         proc.terminate()
@@ -744,7 +744,7 @@ class CallResult:
 
     def to_json(self) -> dict[str, Any]:
         d = dict(self.__dict__)
-        d["as_expected"] = self.as_expected if self.arm == "onbehalf" else None
+        d["as_expected"] = self.as_expected if self.arm == "attenuo" else None
         return d
 
 
@@ -1116,7 +1116,7 @@ def run(
     all_upstreams = [s.upstream for s in env]
     agents = agent_ids(suites)
     pairs = ordered_cases(suites, seed)
-    work = Path(tempfile.mkdtemp(prefix="onbehalf-injection-"))
+    work = Path(tempfile.mkdtemp(prefix="attenuo-injection-"))
     try:
         results: list[CallResult] = []
         audits: dict[str, Any] = {}
@@ -1184,7 +1184,7 @@ def summarise(doc: dict[str, Any]) -> dict[str, Any]:
             r["benign_calls"] += 1
             r["benign_denied"] += int(c["outcome"] == "deny")
             r["benign_delivered_intact"] += int(bool(c["reached_upstream"] and c["args_intact"]))
-        if c["arm"] == "onbehalf" and not c["as_expected"]:
+        if c["arm"] == "attenuo" and not c["as_expected"]:
             r["unexpected"] += 1
     out = []
     for r in rows.values():

@@ -10,7 +10,7 @@ informed: []
 
 ## Context and Problem Statement
 
-A delegation token is a signed JWT valid for minutes (default 900 s) and cannot be recalled once issued. Principle P4 of [RFC-0001](../spec/rfc-0001-onbehalf.md) requires that when a user logs out, an operator kills a session, or an agent is found compromised, the agents acting for that user stop working "within one lease interval", including every sub-agent several hops down. How do we withdraw authority that was already delegated, without making every call depend on a round trip to the IdP and without a token blacklist that grows forever?
+A delegation token is a signed JWT valid for minutes (default 900 s) and cannot be recalled once issued. Principle P4 of [RFC-0001](../spec/rfc-0001-attenuo.md) requires that when a user logs out, an operator kills a session, or an agent is found compromised, the agents acting for that user stop working "within one lease interval", including every sub-agent several hops down. How do we withdraw authority that was already delegated, without making every call depend on a round trip to the IdP and without a token blacklist that grows forever?
 
 ## Decision Drivers
 
@@ -52,10 +52,10 @@ The mechanism:
 
 ### Confirmation
 
-- `crates/onbehalf-audit/tests/leases.rs`: `revoke_cascades_to_descendants_only`, `renew_extends_and_revives_an_expired_lease`, `renew_rejects_unknown_and_revoked` (memory and SQLite stores).
-- `crates/onbehalf-server/src/authz.rs`: `any_hop_with_an_unrenewed_lease_denies`.
-- `crates/onbehalf-server/tests/e2e.rs`: `revoking_root_lease_cascades_to_child`, `leases_are_issued_with_the_lease_interval_not_the_token_ttl`, `renew_never_goes_beyond_token_expiry`, `renew_never_goes_beyond_the_parent_lease`, `unrenewed_lease_denies_even_though_the_jwt_is_valid`, `expired_parent_blocks_child_renewal_and_calls`, `revoked_lease_cannot_be_renewed_and_token_problems_are_401`, `revoked_token_cannot_list_tools_over_the_proxy`.
-- `crates/onbehalf-proxy/tests/proxy.rs`: `revoked_token_cannot_list_tools_or_use_session_requests`.
+- `crates/attenuo-audit/tests/leases.rs`: `revoke_cascades_to_descendants_only`, `renew_extends_and_revives_an_expired_lease`, `renew_rejects_unknown_and_revoked` (memory and SQLite stores).
+- `crates/attenuo-server/src/authz.rs`: `any_hop_with_an_unrenewed_lease_denies`.
+- `crates/attenuo-server/tests/e2e.rs`: `revoking_root_lease_cascades_to_child`, `leases_are_issued_with_the_lease_interval_not_the_token_ttl`, `renew_never_goes_beyond_token_expiry`, `renew_never_goes_beyond_the_parent_lease`, `unrenewed_lease_denies_even_though_the_jwt_is_valid`, `expired_parent_blocks_child_renewal_and_calls`, `revoked_lease_cannot_be_renewed_and_token_problems_are_401`, `revoked_token_cannot_list_tools_over_the_proxy`.
+- `crates/attenuo-proxy/tests/proxy.rs`: `revoked_token_cannot_list_tools_or_use_session_requests`.
 
 ## Pros and Cons of the Options
 
@@ -81,11 +81,11 @@ The mechanism:
 ### Introspection of every token at the IdP
 
 - Good, because the IdP stays the single source of truth.
-- Bad, because delegated hops are minted by onbehalf, not by the IdP, so the IdP cannot answer for them.
+- Bad, because delegated hops are minted by attenuo, not by the IdP, so the IdP cannot answer for them.
 - Bad, because it puts a network round trip on every call.
 
 ## More Information
 
-- [RFC-0001](../spec/rfc-0001-onbehalf.md) principle P4 and section 6.
+- [RFC-0001](../spec/rfc-0001-attenuo.md) principle P4 and section 6.
 - [design/server.md](../design/server.md) for the pipeline and the renewal flow.
 - Revisit when a push-based revocation channel or a lease cache is proposed, or when renewal load shows up in [design/performance.md](../design/performance.md).

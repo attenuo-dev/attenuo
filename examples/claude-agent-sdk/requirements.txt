@@ -1,4 +1,4 @@
-# Tested together on Python 3.13. The onbehalf SDK itself is installed from the checkout
+# Tested together on Python 3.13. The attenuo SDK itself is installed from the checkout
 # (pip install -e sdk/python), which run.sh does.
 claude-agent-sdk==0.2.173
 mcp==1.30.0

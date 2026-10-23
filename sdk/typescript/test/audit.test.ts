@@ -47,7 +47,7 @@ const GOLDEN_RECORD = {
   tool: "read_file",
   at: "2026-10-23T12:00:00Z",
 };
-const GOLDEN_HASH = "9026ac429517fb97a10afa12781cb97297a18ab36085315d82c41ba7b9ba861e";
+const GOLDEN_HASH = "e8ababad86538918f6eee2d5edb7e6aa4bfa8f8f6ea032f2b5fde00dfe52d693";
 
 const record = (i: number, kind = "decision"): Obj => ({
   ...GOLDEN_RECORD,
@@ -58,7 +58,7 @@ const record = (i: number, kind = "decision"): Obj => ({
 
 async function sign(seq: number, head: string, kid = KID, key?: CryptoKey): Promise<Obj> {
   const at = "2026-10-23T12:00:00Z";
-  const ctx = new TextEncoder().encode("onbehalf-checkpoint-v1");
+  const ctx = new TextEncoder().encode("attenuo-checkpoint-v1");
   const payload = new TextEncoder().encode(canonicalize([seq, head, at, kid]));
   const msg = new Uint8Array(4 + ctx.length + payload.length);
   new DataView(msg.buffer).setUint32(0, ctx.length);
@@ -273,7 +273,7 @@ describe("verifyExport", () => {
 
   it.each([
     ["no header", (o: Obj[]) => o.shift(), /no header/],
-    ["v1", (o: Obj[]) => (o[0]!.format = "onbehalf-audit-export-v1"), /v1/],
+    ["v1", (o: Obj[]) => (o[0]!.format = "attenuo-audit-export-v1"), /v1/],
     ["format", (o: Obj[]) => (o[0]!.format = "nope"), /unsupported/],
     ["filtered", (o: Obj[]) => (o[0]!.filter = { kind: "admin" }), /filtered/],
     ["second header", (o: Obj[]) => o.splice(1, 0, { ...o[0]! }), /second header/],

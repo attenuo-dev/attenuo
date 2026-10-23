@@ -1,7 +1,7 @@
-# onbehalf-server config for the GitHub MCP leak demo (see README.md).
+# attenuo-server config for the GitHub MCP leak demo (see README.md).
 #
 # Variant of config.toml for docker-compose.yml: listens on all interfaces inside the container,
-# reaches the fake MCP server by service name, and reads the policy mounted at /etc/onbehalf.
+# reaches the fake MCP server by service name, and reads the policy mounted at /etc/attenuo.
 
 [server]
 listen = "0.0.0.0:8080"
@@ -11,12 +11,12 @@ public_url = "http://127.0.0.1:8080"
 
 [issuer]
 issuer = "http://127.0.0.1:8080"
-audience = "onbehalf"
+audience = "attenuo"
 default_ttl_seconds = 900
 # No key path: an ephemeral key per start, which is what a throwaway demo wants.
 
 [policy]
-policies_path = "/etc/onbehalf/policy.cedar"
+policies_path = "/etc/attenuo/policy.cedar"
 
 # Every action a policy names must be in the catalog, with the argument types it tests.
 [policy.catalog.github.read_file]
@@ -38,7 +38,7 @@ name = "github"
 url = "http://fake-mcp:3001/mcp"
 
 # No [admin] token in this file: the server listens on all interfaces inside the container,
-# so it refuses to start with a placeholder. docker-compose.yml passes ONBEHALF_ADMIN_TOKEN.
+# so it refuses to start with a placeholder. docker-compose.yml passes ATTENUO_ADMIN_TOKEN.
 
 # Alice's assistant holds a broad token, like the over-privileged PAT in the real incident.
 [[root_grants]]

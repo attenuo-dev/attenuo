@@ -8,7 +8,7 @@
 import { capabilitiesToJson, type CapabilityLike } from "./capability.js";
 import { DpopKey, NonceCache, type DpopKeyLike } from "./dpop.js";
 import { Http, type HttpOptions } from "./http.js";
-import { OnbehalfError } from "./errors.js";
+import { AttenuoError } from "./errors.js";
 import type { Token } from "./token.js";
 import * as w from "./wire.js";
 
@@ -193,10 +193,10 @@ export class AdminClient {
       try {
         v = JSON.parse(line);
       } catch {
-        throw new OnbehalfError(`audit export: line is not JSON: ${line.slice(0, 200)}`);
+        throw new AttenuoError(`audit export: line is not JSON: ${line.slice(0, 200)}`);
       }
       if (typeof v !== "object" || v === null || Array.isArray(v)) {
-        throw new OnbehalfError(`audit export: line is not an object: ${line.slice(0, 200)}`);
+        throw new AttenuoError(`audit export: line is not an object: ${line.slice(0, 200)}`);
       }
       yield v as AuditExportLine;
     };

@@ -47,9 +47,9 @@ artifact itself is not kept.
 | `chain_validate` | `DelegationChain` from JSON, `validate_at`, digests | an accepted chain narrows at every hop (checked independently) and round-trips |
 | `ou_sig` | `claims::ou_sig_message`, `Issuer::issue_root`, `verify_detached` | the encoding is injective; a signature never verifies for another triple; arbitrary times never panic the issuer |
 | `dpop_proof` | `dpop::verify_proof` and the server's `Dpop::verify` (replay cache) with fuzzed `htm`, `htu`, `iat`, `ath`, `jti`, header and `jwk`, raw or correctly signed | an accepted proof matches the request, is within `max_age`, and is refused the second time |
-| `names` | `onbehalf_core::names` checks | the name sets nest as documented; `<server>/<call>` splits back into one pair |
+| `names` | `attenuo_core::names` checks | the name sets nest as documented; `<server>/<call>` splits back into one pair |
 | `capability_attenuation` | `Capability::covers`, `CapabilitySet::{covers, attenuate, permits}` over small alphabets | if `parent ⊇ child` then every call `child` permits, `parent` permits; `attenuate` agrees with `covers`; coverage is reflexive and transitive |
-| `proxy_jsonrpc` | `onbehalf_proxy::router` end to end, with a fuzz-driven upstream | nothing unpermitted reaches the upstream (SR-07 included); 413 over the body limit; 400 for a bad `Mcp-Session-Id`; no unfiltered `tools/list` entry reaches the client |
+| `proxy_jsonrpc` | `attenuo_proxy::router` end to end, with a fuzz-driven upstream | nothing unpermitted reaches the upstream (SR-07 included); 413 over the body limit; 400 for a bad `Mcp-Session-Id`; no unfiltered `tools/list` entry reaches the client |
 | `proxy_sse` | `SseFramer`, `SseRewriter`, `ListFilter` on chunked bytes | framing is the input cut at event ends; rewriting does not depend on chunking; filtered answers hold only permitted tools |
 | `policy_context` | `PolicyEngine::authorize` with arbitrary arguments and user attributes; `PolicyEngine::evaluate` (AuthZEN) on arbitrary JSON | a documented reason every time; an allow passed the capability stage; deterministic |
 | `audit_export_bytes` | `parse_export` + `verify_export` on arbitrary text | countersigned entries are the original ones |

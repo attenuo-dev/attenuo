@@ -11,8 +11,8 @@ use arbitrary::{Arbitrary, Result, Unstructured};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use libfuzzer_sys::fuzz_target;
-use onbehalf_core::{AgentId, Capability, CapabilitySet, Hop, LeaseId, OriginatingUser};
-use onbehalf_fuzz::{edge_string, json_value};
+use attenuo_core::{AgentId, Capability, CapabilitySet, Hop, LeaseId, OriginatingUser};
+use attenuo_fuzz::{edge_string, json_value};
 use ring::signature::{UnparsedPublicKey, ED25519};
 use time::{OffsetDateTime, UtcOffset};
 
@@ -127,7 +127,7 @@ fn encodable(user: &OriginatingUser, root: &Hop) -> bool {
 }
 
 fuzz_target!(|input: Input| {
-    let f = onbehalf_fuzz::fixture();
+    let f = attenuo_fuzz::fixture();
     // The issuer must refuse, not panic, whatever the user block holds.
     let _ = f.issuer.issue_root(
         input.user.clone(),
@@ -139,9 +139,9 @@ fuzz_target!(|input: Input| {
     if !encodable(&input.user, &input.root) || !encodable(&input.other.1, &input.other.2) {
         return;
     }
-    let m1 = onbehalf_token::claims::ou_sig_message(&input.iss, &input.user, &input.root);
+    let m1 = attenuo_token::claims::ou_sig_message(&input.iss, &input.user, &input.root);
     let (iss2, user2, root2) = &input.other;
-    let m2 = onbehalf_token::claims::ou_sig_message(iss2, user2, root2);
+    let m2 = attenuo_token::claims::ou_sig_message(iss2, user2, root2);
     let same_triple = input.iss == *iss2
         && input.user == *user2
         && input.user.authenticated_at.offset() == user2.authenticated_at.offset()
@@ -163,8 +163,8 @@ fuzz_target!(|input: Input| {
     let pk_raw = ring::signature::KeyPair::public_key(&f.pair)
         .as_ref()
         .to_vec();
-    let _ = onbehalf_token::verify_detached(&input.key, &input.context, &input.payload, &input.sig);
-    let ok = onbehalf_token::verify_detached(&pk_raw, &input.context, &input.payload, &input.sig);
+    let _ = attenuo_token::verify_detached(&input.key, &input.context, &input.payload, &input.sig);
+    let ok = attenuo_token::verify_detached(&pk_raw, &input.context, &input.payload, &input.sig);
     if ok {
         // Only possible if the fuzzer reproduced a real signature, which it cannot.
         let raw = URL_SAFE_NO_PAD.decode(&input.sig).unwrap_or_default();

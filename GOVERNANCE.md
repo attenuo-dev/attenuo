@@ -1,10 +1,10 @@
 # Governance
 
-This document describes how decisions are made in the onbehalf project and how that is expected to change as the project grows. The current roster is in [MAINTAINERS.md](MAINTAINERS.md).
+This document describes how decisions are made in the attenuo project and how that is expected to change as the project grows. The current roster is in [MAINTAINERS.md](MAINTAINERS.md).
 
 ## Current model: single maintainer
 
-onbehalf is at an early stage and has one maintainer, who acts as a benevolent dictator for now: they have final say on design, scope, releases and this document. This is stated plainly so that nobody mistakes the project for something it is not yet. The intent is to move to the shared model below as soon as there are people to share it with.
+attenuo is at an early stage and has one maintainer, who acts as a benevolent dictator for now: they have final say on design, scope, releases and this document. This is stated plainly so that nobody mistakes the project for something it is not yet. The intent is to move to the shared model below as soon as there are people to share it with.
 
 Even with one maintainer the project binds itself to its own process:
 

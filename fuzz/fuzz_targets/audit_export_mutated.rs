@@ -15,8 +15,8 @@
 
 use arbitrary::{Arbitrary, Result, Unstructured};
 use libfuzzer_sys::fuzz_target;
-use onbehalf_audit::{compute_entry_hash, AuditEntry, Export};
-use onbehalf_fuzz::{edge_number, edge_string, json_value};
+use attenuo_audit::{compute_entry_hash, AuditEntry, Export};
+use attenuo_fuzz::{edge_number, edge_string, json_value};
 use serde_json::Value;
 
 const ENTRY_PATHS: &[&str] = &[
@@ -197,7 +197,7 @@ fn apply(ex: &mut Export, text: &mut Option<String>, op: Op) {
         }
         Op::DropHeader => ex.header = None,
         Op::FlipText(flips) => {
-            let mut bytes = onbehalf_fuzz::audit_fixture().text.clone().into_bytes();
+            let mut bytes = attenuo_fuzz::audit_fixture().text.clone().into_bytes();
             for (pos, b) in flips {
                 let i = pos as usize % bytes.len();
                 bytes[i] ^= b.max(1);
@@ -209,7 +209,7 @@ fn apply(ex: &mut Export, text: &mut Option<String>, op: Op) {
 }
 
 fuzz_target!(|ops: Vec<Op>| {
-    let a = onbehalf_fuzz::audit_fixture();
+    let a = attenuo_fuzz::audit_fixture();
     let mut ex = a.export.clone();
     let mut text = None;
     let header_kept_from = ops
@@ -219,12 +219,12 @@ fuzz_target!(|ops: Vec<Op>| {
         apply(&mut ex, &mut text, op);
     }
     if let Some(t) = text {
-        match onbehalf_audit::parse_export(&t) {
+        match attenuo_audit::parse_export(&t) {
             Ok(parsed) => ex = parsed,
             Err(_) => return,
         }
     }
-    let Ok(report) = onbehalf_audit::verify_export(&ex, &a.keys) else {
+    let Ok(report) = attenuo_audit::verify_export(&ex, &a.keys) else {
         return;
     };
     // Only an export that verifies counts: entries after a break are reported, not vouched for.

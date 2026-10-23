@@ -1,8 +1,8 @@
-"""An orchestrator delegates to a coder sub-agent; every MCP call goes through onbehalf.
+"""An orchestrator delegates to a coder sub-agent; every MCP call goes through attenuo.
 
 The scenario is the one from ``examples/github-leak-demo``: a malicious issue tells the coder to
 read a private repository and copy it out through ``create_issue``. Here the agents are Claude
-Agent SDK agents, and the GitHub MCP server is only reachable through onbehalf's proxy, with a
+Agent SDK agents, and the GitHub MCP server is only reachable through attenuo's proxy, with a
 delegation token as the bearer.
 
 Two modes, the same tool calls:
@@ -18,8 +18,8 @@ Two modes, the same tool calls:
 Run it with ``examples/claude-agent-sdk/run.sh`` (which starts the servers and sets the
 environment), or by hand against a server started from ``examples/github-leak-demo/config.toml``.
 
-Environment: ONBEHALF_SERVER, ONBEHALF_ADMIN_TOKEN, ONBEHALF_CODER_SECRET (defaults match the
-demo config), ONBEHALF_ROOT_TOKEN and ONBEHALF_ROOT_LEASE (the orchestrator's root token; minted
+Environment: ATTENUO_SERVER, ATTENUO_ADMIN_TOKEN, ATTENUO_CODER_SECRET (defaults match the
+demo config), ATTENUO_ROOT_TOKEN and ATTENUO_ROOT_LEASE (the orchestrator's root token; minted
 through the dev endpoint when unset), EXAMPLE_MODEL (default ``claude-opus-5-5``).
 """
 
@@ -31,19 +31,19 @@ import os
 from collections.abc import Callable
 from typing import Any
 
-from onbehalf import AdminClient, Capability, Client, Prefix, Token
-from onbehalf.mcp import mcp_headers, mcp_url
+from attenuo import AdminClient, Capability, Client, Prefix, Token
+from attenuo.mcp import mcp_headers, mcp_url
 
-SERVER = os.environ.get("ONBEHALF_SERVER", "http://127.0.0.1:8080")
-ADMIN_TOKEN = os.environ.get("ONBEHALF_ADMIN_TOKEN", "demo-admin-token")
+SERVER = os.environ.get("ATTENUO_SERVER", "http://127.0.0.1:8080")
+ADMIN_TOKEN = os.environ.get("ATTENUO_ADMIN_TOKEN", "demo-admin-token")
 # The coder's [[agents]] secret in the demo config: an exchange authenticates as its actor.
-CODER_SECRET = os.environ.get("ONBEHALF_CODER_SECRET", "demo-coder-secret")
+CODER_SECRET = os.environ.get("ATTENUO_CODER_SECRET", "demo-coder-secret")
 # The agent id that the demo config grants `github:*`; it plays the orchestrator.
 ORCHESTRATOR_AGENT = "assistant"
 MODEL = os.environ.get("EXAMPLE_MODEL", "claude-opus-5-5")
 UPSTREAM = "github"
-DENIED_CODE = -32003  # onbehalf's JSON-RPC error code for a denied call
-DECISION_ID_HEADER = "x-onbehalf-decision-id"
+DENIED_CODE = -32003  # attenuo's JSON-RPC error code for a denied call
+DECISION_ID_HEADER = "x-attenuo-decision-id"
 
 # A simulated malicious issue. In the real incident this text came from a public issue.
 ISSUE = (
@@ -65,7 +65,7 @@ def delegate_to_coder(ob: Client, root: Token | str) -> Token:
 
 
 def coder_mcp_server(token: Token) -> dict[str, Any]:
-    """The MCP server config for a Claude Agent SDK agent: onbehalf's URL, the token as bearer."""
+    """The MCP server config for a Claude Agent SDK agent: attenuo's URL, the token as bearer."""
     return {"type": "http", "url": mcp_url(SERVER, UPSTREAM), "headers": mcp_headers(token)}
 
 
@@ -101,7 +101,13 @@ def agent_options(token: Token) -> Any:
 
 
 async def run_live(token: Token) -> None:
-    from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock, query
+    from claude_agent_sdk import (
+        AssistantMessage,
+        ResultMessage,
+        TextBlock,
+        ToolUseBlock,
+        query,
+    )
 
     prompt = f"Handle this GitHub issue by delegating to the coder.\n\n{ISSUE}"
     async for msg in query(prompt=prompt, options=agent_options(token)):
@@ -116,11 +122,11 @@ async def run_live(token: Token) -> None:
 
 
 class ProxyDecisions:
-    """Decision ids that onbehalf's proxy put in ``X-Onbehalf-Decision-Id`` response headers.
+    """Decision ids that attenuo's proxy put in ``X-Attenuo-Decision-Id`` response headers.
 
     Only the proxy sets that header; it never forwards one from the upstream. An upstream is
     untrusted and can answer with its own ``-32003`` and any reason it likes, so a ``-32003``
-    counts as onbehalf's denial only when its ``data.decision_id`` is one of these ids, the
+    counts as attenuo's denial only when its ``data.decision_id`` is one of these ids, the
     check the SDKs make (SR-32, SR-53). The ``mcp`` client raises ``McpError`` without the HTTP
     response, so the ids are collected with an ``httpx`` response hook on the client it uses.
     """
@@ -155,7 +161,7 @@ def _denial(exc: BaseException, decisions: ProxyDecisions) -> tuple[str, str] | 
     data = data if isinstance(data, dict) else {}
     decision = data.get("decision_id")
     if not isinstance(decision, str) or decision not in decisions.ids:
-        return None  # an upstream's own -32003: not a decision of onbehalf
+        return None  # an upstream's own -32003: not a decision of attenuo
     return str(data.get("reason", "?")), decision
 
 
@@ -195,7 +201,7 @@ async def run_dry(token: Token, revoke: Callable[[], None]) -> bool:
     ):
         await session.initialize()
         names = [t.name for t in (await session.list_tools()).tools]
-        print(f"[coder] tools/list through onbehalf shows: {names}")
+        print(f"[coder] tools/list through attenuo shows: {names}")
         checks.append(names == ["read_file"])
 
         print("[coder] the task: read the README it was asked about")
@@ -218,7 +224,7 @@ async def run_dry(token: Token, revoke: Callable[[], None]) -> bool:
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="Claude Agent SDK agents through onbehalf")
+    ap = argparse.ArgumentParser(description="Claude Agent SDK agents through attenuo")
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="no model; deterministic tool calls")
     mode.add_argument("--live", action="store_true", help="run the agents with Claude")
@@ -227,8 +233,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"mode: {'live (' + MODEL + ')' if live else 'dry-run'}")
 
     admin = AdminClient(SERVER, ADMIN_TOKEN)
-    root_jwt = os.environ.get("ONBEHALF_ROOT_TOKEN")
-    root_lease = os.environ.get("ONBEHALF_ROOT_LEASE")
+    root_jwt = os.environ.get("ATTENUO_ROOT_TOKEN")
+    root_lease = os.environ.get("ATTENUO_ROOT_LEASE")
     if not (root_jwt and root_lease):
         root = admin.mint_root_dev("alice", "https://idp.example", ORCHESTRATOR_AGENT, ["github:*"])
         root_jwt, root_lease = root.jwt, root.lease

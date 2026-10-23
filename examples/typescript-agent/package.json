@@ -1,5 +1,5 @@
 {
-  "name": "onbehalf-typescript-agent-example",
+  "name": "attenuo-typescript-agent-example",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.1",
-    "@onbehalf/sdk": "file:../../sdk/typescript"
+    "@attenuo/sdk": "file:../../sdk/typescript"
   },
   "devDependencies": {
     "@types/node": "^20.19.43",

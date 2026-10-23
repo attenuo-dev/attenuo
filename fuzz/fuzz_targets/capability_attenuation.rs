@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use arbitrary::{Arbitrary, Result, Unstructured};
 use libfuzzer_sys::fuzz_target;
-use onbehalf_core::{ArgConstraint, Capability, CapabilitySet, ToolCall};
+use attenuo_core::{ArgConstraint, Capability, CapabilitySet, ToolCall};
 use serde_json::Value;
 
 const NAMES: &[&str] = &[
@@ -30,7 +30,7 @@ fn value(u: &mut Unstructured<'_>) -> Result<Value> {
         2 => serde_json::json!(1.0),
         3 => Value::Null,
         4 => Value::Bool(u.arbitrary()?),
-        _ => onbehalf_fuzz::json_value(u, 2)?,
+        _ => attenuo_fuzz::json_value(u, 2)?,
     })
 }
 

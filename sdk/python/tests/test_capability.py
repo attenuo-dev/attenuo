@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from onbehalf import Capability, Equals, OneOf, Prefix
-from onbehalf.capability import capabilities_to_json
+from attenuo import Capability, Equals, OneOf, Prefix
+from attenuo.capability import capabilities_to_json
 
 
 def test_plain_capability_omits_constraints() -> None:

@@ -1,10 +1,10 @@
 """Runs the LangChain example's dry-run end to end: servers, token exchange, MCP calls.
 
-The end-to-end test is skipped unless ``ONBEHALF_INTEGRATION=1``; the SR-53 check of how a
-denial is recognised runs without servers. Needs ``cargo`` or ``ONBEHALF_BIN_DIR`` (prebuilt
-``onbehalf-server`` and ``fake_mcp``), plus ``pip install -e sdk/python -r requirements.txt``.
+The end-to-end test is skipped unless ``ATTENUO_INTEGRATION=1``; the SR-53 check of how a
+denial is recognised runs without servers. Needs ``cargo`` or ``ATTENUO_BIN_DIR`` (prebuilt
+``attenuo-server`` and ``fake_mcp``), plus ``pip install -e sdk/python -r requirements.txt``.
 
-    ONBEHALF_INTEGRATION=1 ONBEHALF_BIN_DIR=target/debug pytest examples/langchain-agent
+    ATTENUO_INTEGRATION=1 ATTENUO_BIN_DIR=target/debug pytest examples/langchain-agent
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 
 integration = pytest.mark.skipif(
-    os.environ.get("ONBEHALF_INTEGRATION") != "1", reason="set ONBEHALF_INTEGRATION=1 to run"
+    os.environ.get("ATTENUO_INTEGRATION") != "1", reason="set ATTENUO_INTEGRATION=1 to run"
 )
 
 HERE = Path(__file__).resolve().parent
@@ -29,7 +29,7 @@ HERE = Path(__file__).resolve().parent
 
 def _load_agent(name: str) -> Any:
     """Import this example's ``agent.py`` under a name of its own (both examples have one)."""
-    pytest.importorskip("onbehalf")
+    pytest.importorskip("attenuo")
     spec = importlib.util.spec_from_file_location(name, HERE / "agent.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -54,7 +54,7 @@ class _McpError(Exception):
 @integration
 def test_dry_run_end_to_end() -> None:
     pytest.importorskip("langchain_mcp_adapters")
-    pytest.importorskip("onbehalf")
+    pytest.importorskip("attenuo")
     env = {k: v for k, v in os.environ.items() if k not in {"LIVE", "ANTHROPIC_API_KEY"}}
     env["PYTHON"] = sys.executable
     proc = subprocess.run(
@@ -69,7 +69,7 @@ def test_dry_run_end_to_end() -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "mode: dry-run" in out
     assert "chain: assistant > coder" in out
-    assert "tools/list through onbehalf shows: ['read_file']" in out
+    assert "tools/list through attenuo shows: ['read_file']" in out
     assert out.count("ALLOWED") == 1
     assert out.count("DENIED") == 3
     assert "HTTP 401 (lease gone)" in out
@@ -80,13 +80,13 @@ def test_dry_run_end_to_end() -> None:
 
 
 def test_only_a_minus_32003_the_proxy_vouched_for_is_a_denial_sr53() -> None:
-    """SR-53: an upstream can send its own -32003 with any reason. It is onbehalf's denial only
-    when ``data.decision_id`` came in an ``X-Onbehalf-Decision-Id`` header from the proxy."""
+    """SR-53: an upstream can send its own -32003 with any reason. It is attenuo's denial only
+    when ``data.decision_id`` came in an ``X-Attenuo-Decision-Id`` header from the proxy."""
     agent = _load_agent("langchain_example_agent")
     decisions = agent.ProxyDecisions()
     denial = _McpError(-32003, {"reason": "capability_denied", "decision_id": "d-1"})
     assert agent.denial_of(denial, decisions) is None, "no header has vouched for d-1 yet"
-    asyncio.run(decisions.on_response(_Response({"x-onbehalf-decision-id": "d-0, d-1"})))
+    asyncio.run(decisions.on_response(_Response({"x-attenuo-decision-id": "d-0, d-1"})))
     assert agent.denial_of(denial, decisions) == ("capability_denied", "d-1")
     forged = _McpError(-32003, {"reason": "lease_revoked", "decision_id": "d-forged"})
     assert agent.denial_of(forged, decisions) is None
@@ -107,4 +107,4 @@ def test_interceptor_shows_an_unvouched_minus_32003_as_an_upstream_error_sr53() 
     result = asyncio.run(intercept(request, forged))
     assert result.isError
     assert "failed upstream" in result.content[0].text
-    assert log.entries == [], "not recorded as a decision of onbehalf"
+    assert log.entries == [], "not recorded as a decision of attenuo"

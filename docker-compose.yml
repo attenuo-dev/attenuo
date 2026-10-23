@@ -1,31 +1,31 @@
-# The GitHub leak demo as two containers: onbehalf-server in front of a fake GitHub MCP server.
+# The GitHub leak demo as two containers: attenuo-server in front of a fake GitHub MCP server.
 #
 #   docker compose up --build
 #
 # Then, from the host (the server is published on 127.0.0.1:8080 only):
 #
-#   export ONBEHALF_ADMIN_TOKEN=$(openssl rand -hex 32)   # before `docker compose up`
-#   export ONBEHALF_SERVER=http://127.0.0.1:8080
-#   cargo run -p onbehalf-cli -- token root --subject alice --agent assistant --cap 'github:*'
+#   export ATTENUO_ADMIN_TOKEN=$(openssl rand -hex 32)   # before `docker compose up`
+#   export ATTENUO_SERVER=http://127.0.0.1:8080
+#   cargo run -p attenuo-cli -- token root --subject alice --agent assistant --cap 'github:*'
 #
-# or run the CLI in the same image: docker compose run --rm --entrypoint onbehalf onbehalf --help
+# or run the CLI in the same image: docker compose run --rm --entrypoint attenuo attenuo --help
 # The scripted walk-through is examples/github-leak-demo/run.sh, which does not need Docker.
 # The server listens on all interfaces inside the container, so it refuses to start without a
-# strong admin token: compose passes ONBEHALF_ADMIN_TOKEN from your shell. Never publish /admin
+# strong admin token: compose passes ATTENUO_ADMIN_TOKEN from your shell. Never publish /admin
 # outside localhost.
 
 services:
-  onbehalf:
-    image: onbehalf:dev
+  attenuo:
+    image: attenuo:dev
     build: .
-    command: ["--config", "/etc/onbehalf/config.toml"]
+    command: ["--config", "/etc/attenuo/config.toml"]
     environment:
-      ONBEHALF_ADMIN_TOKEN: ${ONBEHALF_ADMIN_TOKEN:?set ONBEHALF_ADMIN_TOKEN, e.g. $(openssl rand -hex 32)}
+      ATTENUO_ADMIN_TOKEN: ${ATTENUO_ADMIN_TOKEN:?set ATTENUO_ADMIN_TOKEN, e.g. $(openssl rand -hex 32)}
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
-      - ./examples/github-leak-demo/config.docker.toml:/etc/onbehalf/config.toml:ro
-      - ./examples/github-leak-demo/policy.cedar:/etc/onbehalf/policy.cedar:ro
+      - ./examples/github-leak-demo/config.docker.toml:/etc/attenuo/config.toml:ro
+      - ./examples/github-leak-demo/policy.cedar:/etc/attenuo/policy.cedar:ro
     depends_on:
       - fake-mcp
     read_only: true
@@ -34,7 +34,7 @@ services:
       - no-new-privileges:true
 
   fake-mcp:
-    image: onbehalf:dev
+    image: attenuo:dev
     entrypoint: ["fake-mcp"]
     command: ["--host", "0.0.0.0", "--port", "3001"]
     expose:

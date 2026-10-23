@@ -36,10 +36,10 @@ footer = """
 {% for release in releases -%}
   {% if release.version -%}
     {% if release.previous.version -%}
-[{{ release.version | trim_start_matches(pat="v") }}]: https://github.com/7Mudit/onbehalf/compare/{{ release.previous.version }}...{{ release.version }}
+[{{ release.version | trim_start_matches(pat="v") }}]: https://github.com/7Mudit/attenuo/compare/{{ release.previous.version }}...{{ release.version }}
     {% endif -%}
   {% else -%}
-[Unreleased]: https://github.com/7Mudit/onbehalf/compare/{{ release.previous.version }}...HEAD
+[Unreleased]: https://github.com/7Mudit/attenuo/compare/{{ release.previous.version }}...HEAD
   {% endif -%}
 {% endfor %}
 """
@@ -58,14 +58,14 @@ ignore_tags = "rc|beta|alpha"
 topo_order = false
 sort_commits = "oldest"
 link_parsers = [
-  { pattern = "#(\\d+)", href = "https://github.com/7Mudit/onbehalf/issues/$1" },
+  { pattern = "#(\\d+)", href = "https://github.com/7Mudit/attenuo/issues/$1" },
   { pattern = "RUSTSEC-(\\d{4})-(\\d+)", href = "https://rustsec.org/advisories/RUSTSEC-$1-$2" },
-  { pattern = "ADR-(\\d{4})", href = "https://github.com/7Mudit/onbehalf/blob/main/docs/decisions/$1" },
+  { pattern = "ADR-(\\d{4})", href = "https://github.com/7Mudit/attenuo/blob/main/docs/decisions/$1" },
 ]
 commit_preprocessors = [
   # Turn the "(#123)" that GitHub squash merges append into a PR link. Works
   # offline; no GitHub token needed.
-  { pattern = '\(#([0-9]+)\)', replace = "([#${1}](https://github.com/7Mudit/onbehalf/pull/${1}))" },
+  { pattern = '\(#([0-9]+)\)', replace = "([#${1}](https://github.com/7Mudit/attenuo/pull/${1}))" },
 ]
 # Order matters: the first matching parser wins. Groups are prefixed with an
 # HTML comment carrying a sort key so they come out in Keep a Changelog order;

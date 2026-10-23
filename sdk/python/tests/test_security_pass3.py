@@ -7,7 +7,7 @@ import json
 import httpx
 import pytest
 
-from onbehalf import AdminClient, AsyncAdminClient, AsyncClient, Client
+from attenuo import AdminClient, AsyncAdminClient, AsyncClient, Client
 
 BASE = "http://ob.test"
 

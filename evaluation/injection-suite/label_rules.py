@@ -2,7 +2,7 @@
 
 It derives, from the structure of a case alone (the grant, the delegation and revocation steps,
 each call's server, tool and arguments, and a Python model of the frozen suite policies), the
-outcome every call should get in the ``onbehalf`` arm and the case's S/C/D/N class. It never
+outcome every call should get in the ``attenuo`` arm and the case's S/C/D/N class. It never
 reads the hand labels (``expect``, ``stage``, ``class``), so comparing the two is a check on the
 labels, not a restatement of them. It runs without the server or any binary.
 
@@ -17,7 +17,7 @@ What it models:
   Calls by an agent whose delegation was refused are labelled ``exchange``.
 - **capability**: no capability in the holder's grant matches the server, the tool and every
   argument constraint (``equals``, ``one_of``, ``prefix``; a constrained argument that is
-  missing fails). Same rules as ``onbehalf-core``'s ``Capability::permits``.
+  missing fails). Same rules as ``attenuo-core``'s ``Capability::permits``.
 - **policy**: the call's arguments do not fit the catalog types, or no rule of the model of the
   suite's frozen Cedar policy permits it. Arguments the catalog does not declare are ignored,
   as the server ignores them.
@@ -40,7 +40,7 @@ from typing import Any
 
 import harness
 
-MAX_DEPTH = 8  # onbehalf_core::chain::DEFAULT_MAX_DEPTH; the harness config does not change it
+MAX_DEPTH = 8  # attenuo_core::chain::DEFAULT_MAX_DEPTH; the harness config does not change it
 CLASS_ORDER = ("N", "D", "C", "S")  # weakest first
 
 PAYEES = ("GB00LAND00000000000001", "DE00UTIL00000000000002", "FR00EMMA00000000000003")

@@ -16,7 +16,7 @@
 
 use arbitrary::{Arbitrary, Result, Unstructured};
 use libfuzzer_sys::fuzz_target;
-use onbehalf_fuzz::{edge_number, edge_string, json_value};
+use attenuo_fuzz::{edge_number, edge_string, json_value};
 use serde_json::{json, Value};
 
 const PATHS: &[&str] = &[
@@ -182,7 +182,7 @@ impl<'a> Arbitrary<'a> for Input {
                 let header = if u.ratio(1u8, 4u8)? {
                     Some(json!({
                         "alg": *u.choose(&["EdDSA", "none", "HS256", "ES256", "RS256"])?,
-                        "typ": *u.choose(&["onbehalf+jwt", "JWT", "dpop+jwt", ""])?,
+                        "typ": *u.choose(&["attenuo+jwt", "JWT", "dpop+jwt", ""])?,
                         "kid": json_value(u, 1)?,
                     }))
                 } else {
@@ -198,14 +198,14 @@ impl<'a> Arbitrary<'a> for Input {
     }
 }
 
-fn verified_claims(token: &str) -> Option<onbehalf_token::VerifiedToken> {
-    let f = onbehalf_fuzz::fixture();
+fn verified_claims(token: &str) -> Option<attenuo_token::VerifiedToken> {
+    let f = attenuo_fuzz::fixture();
     f.verifier.verify(token, f.now).ok()
 }
 
 fuzz_target!(|input: Input| {
-    let f = onbehalf_fuzz::fixture();
-    let original: onbehalf_token::Claims =
+    let f = attenuo_fuzz::fixture();
+    let original: attenuo_token::Claims =
         serde_json::from_value(f.claims.clone()).expect("fixture claims");
     match input {
         Input::Bytes(ops) => {
@@ -240,7 +240,7 @@ fuzz_target!(|input: Input| {
             }
             let token = f.sign_jwt(header.as_ref(), &claims);
             if let Some(v) = verified_claims(&token) {
-                onbehalf_fuzz::assert_chain_sound(&v.chain, f.now);
+                attenuo_fuzz::assert_chain_sound(&v.chain, f.now);
                 assert_eq!(v.claims.iss, original.iss);
                 assert_eq!(v.chain.originating_user, original.chain.originating_user);
                 let (a, b) = (&v.chain.hops[0], &original.chain.hops[0]);
@@ -261,17 +261,17 @@ fuzz_target!(|input: Input| {
             f.resign_ou(&mut claims);
             let token = f.sign_jwt(None, &claims);
             if let Some(v) = verified_claims(&token) {
-                onbehalf_fuzz::assert_chain_sound(&v.chain, f.now);
+                attenuo_fuzz::assert_chain_sound(&v.chain, f.now);
                 assert_eq!(v.claims.sub, v.chain.originating_user.subject);
                 assert_eq!(
                     Some(v.claims.exp),
                     v.chain.hops.last().map(|h| h.expires_at.unix_timestamp())
                 );
                 assert_eq!(
-                    onbehalf_token::ActClaim::from_chain(&v.chain).as_ref(),
+                    attenuo_token::ActClaim::from_chain(&v.chain).as_ref(),
                     Some(&v.claims.act)
                 );
-                assert_eq!(v.claims.ou_sig_v, onbehalf_token::OU_SIG_VERSION);
+                assert_eq!(v.claims.ou_sig_v, attenuo_token::OU_SIG_VERSION);
                 if let Some(cnf) = &v.claims.cnf {
                     assert!(cnf.is_well_formed());
                 }

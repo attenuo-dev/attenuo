@@ -1,4 +1,4 @@
-"""Offline export verification (`onbehalf.audit.verify_export`)."""
+"""Offline export verification (`attenuo.audit.verify_export`)."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import rfc8785
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
-from onbehalf.audit import (
+from attenuo.audit import (
     EXPORT_FORMAT,
     GENESIS_HASH,
     ExportError,
@@ -52,7 +52,7 @@ GOLDEN_RECORD = {
     "tool": "read_file",
     "at": "2026-10-23T12:00:00Z",
 }
-GOLDEN_HASH = "9026ac429517fb97a10afa12781cb97297a18ab36085315d82c41ba7b9ba861e"
+GOLDEN_HASH = "e8ababad86538918f6eee2d5edb7e6aa4bfa8f8f6ea032f2b5fde00dfe52d693"
 
 
 def record(i: int, kind: str = "decision") -> dict[str, Any]:
@@ -62,7 +62,7 @@ def record(i: int, kind: str = "decision") -> dict[str, Any]:
 def sign(seq: int, head_hash: str, kid: str = KID, key: Ed25519PrivateKey = KEY) -> dict[str, Any]:
     at = "2026-10-23T12:00:00Z"
     payload = rfc8785.dumps([seq, head_hash, at, kid])
-    ctx = b"onbehalf-checkpoint-v1"
+    ctx = b"attenuo-checkpoint-v1"
     sig = key.sign(struct.pack(">I", len(ctx)) + ctx + payload)
     return {"seq": seq, "head_hash": head_hash, "at": at, "kid": kid, "signature": b64(sig)}
 
@@ -255,7 +255,7 @@ def test_seq_u64_max_is_a_bad_entry_not_an_overflow() -> None:
     ("mutate", "match"),
     [
         (lambda o: o.pop(0), "no header"),
-        (lambda o: o[0].update(format="onbehalf-audit-export-v1"), "v1"),
+        (lambda o: o[0].update(format="attenuo-audit-export-v1"), "v1"),
         (lambda o: o[0].update(format="nope"), "unsupported"),
         (lambda o: o[0].update(filter={"kind": "admin"}), "filtered"),
         (lambda o: o.insert(1, dict(o[0])), "second header"),

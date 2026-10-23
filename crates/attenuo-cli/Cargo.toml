@@ -1,0 +1,29 @@
+[package]
+name = "attenuo-cli"
+description = "The `attenuo` command line: mint, exchange and inspect delegation tokens, call tools through the proxy, and administer a running attenuo server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "attenuo"
+path = "src/main.rs"
+
+[dependencies]
+attenuo-core = { workspace = true }
+attenuo-token = { workspace = true }
+attenuo-audit = { workspace = true }
+attenuo-policy = { workspace = true }
+anyhow = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+attenuo-core = { workspace = true }

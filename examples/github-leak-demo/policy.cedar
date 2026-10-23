@@ -24,4 +24,4 @@ when {
 forbid(principal, action, resource)
 when { context.chain.depth > 3 };
 
-// Tests for this file: policy_test.yaml, run with `onbehalf policy test`.
+// Tests for this file: policy_test.yaml, run with `attenuo policy test`.

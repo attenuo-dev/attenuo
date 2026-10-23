@@ -1,12 +1,12 @@
 /**
- * Use the official `@modelcontextprotocol/sdk` client through onbehalf's proxy.
+ * Use the official `@modelcontextprotocol/sdk` client through attenuo's proxy.
  *
- * onbehalf speaks MCP Streamable HTTP at `<server>/mcp/<upstream>` and wants
+ * attenuo speaks MCP Streamable HTTP at `<server>/mcp/<upstream>` and wants
  * `Authorization: Bearer <delegation token>` on every request. `mcpUrl` and `mcpHeaders` produce
  * the URL and the header; the rest is the MCP client's normal setup.
  *
  *     cd examples/typescript-agent && npm install
- *     ONBEHALF_SERVER=http://127.0.0.1:8080 ONBEHALF_ADMIN_TOKEN=demo-admin-token npm run mcp
+ *     ATTENUO_SERVER=http://127.0.0.1:8080 ATTENUO_ADMIN_TOKEN=demo-admin-token npm run mcp
  *
  * Tested with @modelcontextprotocol/sdk 1.32.1 against the fake GitHub MCP server of the demo
  * (`npm run mcp` here; the integration test runs it too).
@@ -17,14 +17,14 @@
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { AdminClient, capability, mcpHeaders, mcpUrl, OnbehalfClient, prefix } from "@onbehalf/sdk";
+import { AdminClient, capability, mcpHeaders, mcpUrl, AttenuoClient, prefix } from "@attenuo/sdk";
 
-const SERVER = process.env.ONBEHALF_SERVER ?? "http://127.0.0.1:8080";
-const ADMIN_TOKEN = process.env.ONBEHALF_ADMIN_TOKEN ?? "demo-admin-token";
+const SERVER = process.env.ATTENUO_SERVER ?? "http://127.0.0.1:8080";
+const ADMIN_TOKEN = process.env.ATTENUO_ADMIN_TOKEN ?? "demo-admin-token";
 const PLANNER_AGENT = "assistant";
 
 const admin = new AdminClient(SERVER, ADMIN_TOKEN);
-const ob = new OnbehalfClient(SERVER);
+const ob = new AttenuoClient(SERVER);
 const root = await admin.mintRootDev("alice", "https://idp.example", PLANNER_AGENT, {
   capabilities: "github:*",
 });
@@ -33,14 +33,14 @@ const token = await ob.exchange(
   "coder",
   [capability("github", "read_file", { repo: prefix("alice/public-") })],
   // The coder's [[agents]] secret: every hop n+1 exchange authenticates as its actor.
-  { clientSecret: process.env.ONBEHALF_CLIENT_SECRET ?? "demo-coder-secret" },
+  { clientSecret: process.env.ATTENUO_CLIENT_SECRET ?? "demo-coder-secret" },
 );
 
 const transport = new StreamableHTTPClientTransport(new URL(mcpUrl(SERVER, "github")), {
   // Sent on every request the transport makes (initialize, tools/*, the session GET and DELETE).
   requestInit: { headers: mcpHeaders(token) },
 });
-const client = new Client({ name: "onbehalf-example", version: "0" });
+const client = new Client({ name: "attenuo-example", version: "0" });
 await client.connect(transport);
 
 const tools = await client.listTools();

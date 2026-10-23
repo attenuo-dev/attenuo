@@ -1,12 +1,12 @@
 /**
- * A planner delegates to a coder, and the coder works through onbehalf's proxy.
+ * A planner delegates to a coder, and the coder works through attenuo's proxy.
  *
- * Run it against the GitHub-leak demo setup (an onbehalf server with `[dev] allow_root_mint = true`
+ * Run it against the GitHub-leak demo setup (an attenuo server with `[dev] allow_root_mint = true`
  * and the fake GitHub MCP upstream; `examples/github-leak-demo/run.sh` shows how to start both):
  *
  *     (cd sdk/typescript && npm install && npm run build)
  *     cd examples/typescript-agent && npm install
- *     ONBEHALF_SERVER=http://127.0.0.1:8080 ONBEHALF_ADMIN_TOKEN=demo-admin-token npm run agent
+ *     ATTENUO_SERVER=http://127.0.0.1:8080 ATTENUO_ADMIN_TOKEN=demo-admin-token npm run agent
  *
  * What happens:
  *
@@ -27,25 +27,25 @@ import {
   AdminClient,
   capability,
   DeniedError,
-  OnbehalfClient,
+  AttenuoClient,
   prefix,
   type Token,
-} from "@onbehalf/sdk";
+} from "@attenuo/sdk";
 
-const SERVER = process.env.ONBEHALF_SERVER ?? "http://127.0.0.1:8080";
-const ADMIN_TOKEN = process.env.ONBEHALF_ADMIN_TOKEN ?? "demo-admin-token";
+const SERVER = process.env.ATTENUO_SERVER ?? "http://127.0.0.1:8080";
+const ADMIN_TOKEN = process.env.ATTENUO_ADMIN_TOKEN ?? "demo-admin-token";
 // The agent id that the demo config (examples/github-leak-demo/config.toml) grants `github:*`.
 const PLANNER_AGENT = "assistant";
 const CODER_AGENT = "coder";
 
-/** A sub-agent. It only knows its token and how to call tools through onbehalf. */
+/** A sub-agent. It only knows its token and how to call tools through attenuo. */
 class Coder {
   constructor(
-    private readonly ob: OnbehalfClient,
+    private readonly ob: AttenuoClient,
     private readonly token: Token,
   ) {}
 
-  /** Read a file. Returns undefined when onbehalf says the agent may not. */
+  /** Read a file. Returns undefined when attenuo says the agent may not. */
   async readFile(repo: string, path: string): Promise<string | undefined> {
     try {
       const result = await this.ob.callTool(this.token, "github", "read_file", { repo, path });
@@ -74,7 +74,7 @@ class Coder {
 
 async function run(server = SERVER, adminToken = ADMIN_TOKEN): Promise<number> {
   const admin = new AdminClient(server, adminToken);
-  const ob = new OnbehalfClient(server);
+  const ob = new AttenuoClient(server);
 
   console.log("[planner] gets a root token for alice (dev mint)");
   const root = await admin.mintRootDev("alice", "https://idp.example", PLANNER_AGENT, {
@@ -87,7 +87,7 @@ async function run(server = SERVER, adminToken = ADMIN_TOKEN): Promise<number> {
     CODER_AGENT,
     [capability("github", "read_file", { repo: prefix("alice/public-") })],
     // The coder's [[agents]] secret: every hop n+1 exchange authenticates as its actor.
-    { ttlSeconds: 600, clientSecret: process.env.ONBEHALF_CLIENT_SECRET ?? "demo-coder-secret" },
+    { ttlSeconds: 600, clientSecret: process.env.ATTENUO_CLIENT_SECRET ?? "demo-coder-secret" },
   );
   console.log(`  chain: ${coderToken.agents.join(" > ")}  lease: ${coderToken.lease}`);
 

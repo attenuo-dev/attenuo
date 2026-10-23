@@ -22,7 +22,7 @@
 # Specification
 
 - [Specs and the RFC process](spec/README.md)
-  - [RFC-0001: onbehalf](spec/rfc-0001-onbehalf.md)
+  - [RFC-0001: attenuo](spec/rfc-0001-attenuo.md)
   - [Threat model](spec/threat-model.md)
 
 # Design

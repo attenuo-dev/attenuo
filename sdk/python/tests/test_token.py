@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from onbehalf import OnbehalfError, VerificationError, decode_token, verify_token
-from onbehalf.capability import Prefix
-from onbehalf.token import parse_time
+from attenuo import AttenuoError, VerificationError, decode_token, verify_token
+from attenuo.capability import Prefix
+from attenuo.token import parse_time
 
 from .helpers import Signer, b64
 
@@ -38,7 +38,7 @@ def test_decode_chain() -> None:
 
 def test_decode_rejects_garbage() -> None:
     for bad in ("nope", "a.b", "a.b.c.d", "a.b.c", f"{b64(b'{}')}.{b64(b'{}')}.sig"):
-        with pytest.raises(OnbehalfError):
+        with pytest.raises(AttenuoError):
             decode_token(bad)
 
 
@@ -50,7 +50,7 @@ def test_parse_time_nanoseconds() -> None:
 
 def test_verify_ok() -> None:
     s = Signer()
-    t = verify_token(s.mint(("a", "b")), s.jwks, issuer="http://ob.test", audience="onbehalf")
+    t = verify_token(s.mint(("a", "b")), s.jwks, issuer="http://ob.test", audience="attenuo")
     assert t.verified
     assert t.agent == "b"
 

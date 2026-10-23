@@ -1,22 +1,22 @@
-# onbehalf-server: request pipeline
+# attenuo-server: request pipeline
 
 - Status: implemented (v0)
-- Crate: `crates/onbehalf-server`
-- Related: [RFC-0001](../spec/rfc-0001-onbehalf.md) §4–§7, [ADR-0004](../decisions/0004-rust-workspace-layout.md)
+- Crate: `crates/attenuo-server`
+- Related: [RFC-0001](../spec/rfc-0001-attenuo.md) §4–§7, [ADR-0004](../decisions/0004-rust-workspace-layout.md)
 
-The server is wiring. It holds no authorization logic of its own: tokens come from `onbehalf-token`, decisions from `onbehalf-policy`, leases and the audit log from `onbehalf-audit`, MCP framing from `onbehalf-proxy`. The one piece of composition that matters for security is `authz::Pipeline`, and both enforcement paths go through it.
+The server is wiring. It holds no authorization logic of its own: tokens come from `attenuo-token`, decisions from `attenuo-policy`, leases and the audit log from `attenuo-audit`, MCP framing from `attenuo-proxy`. The one piece of composition that matters for security is `authz::Pipeline`, and both enforcement paths go through it.
 
 ## Components in the process
 
 | Piece | Type | Shared as |
 |---|---|---|
-| Issuer and verifier | `onbehalf_token::Issuer`, `Verifier` | one signing Ed25519 key, loaded from or generated at `issuer.private_key_pem_path`, plus verify-only `issuer.previous_key_paths`; tokens carry a `kid` |
+| Issuer and verifier | `attenuo_token::Issuer`, `Verifier` | one signing Ed25519 key, loaded from or generated at `issuer.private_key_pem_path`, plus verify-only `issuer.previous_key_paths`; tokens carry a `kid` |
 | Metrics | `metrics::Metrics` | `Arc`, incremented by the pipeline and token routes, served on `[metrics] listen` |
-| Policy engine | `onbehalf_policy::PolicyEngine` | `Arc<RwLock<_>>`, swapped in place by `POST /admin/policies/reload` |
-| Lease registry | `onbehalf_audit::SqliteLeaseStore` | `Arc`, same SQLite file as the log |
-| Audit log | `onbehalf_audit::SqliteAudit` | `Arc`; signs checkpoints with the issuer key (`Issuer::detached_signer`) |
+| Policy engine | `attenuo_policy::PolicyEngine` | `Arc<RwLock<_>>`, swapped in place by `POST /admin/policies/reload` |
+| Lease registry | `attenuo_audit::SqliteLeaseStore` | `Arc`, same SQLite file as the log |
+| Audit log | `attenuo_audit::SqliteAudit` | `Arc`; signs checkpoints with the issuer key (`Issuer::detached_signer`) |
 | Pipeline | `authz::Pipeline` | `Arc`, used by the proxy's `ServerAuthorizer` and by the AuthZEN handler |
-| Proxy | `onbehalf_proxy::router` | mounted at `/mcp/{server}` |
+| Proxy | `attenuo_proxy::router` | mounted at `/mcp/{server}` |
 | IdP registry | `idp::IdpRegistry` | one `JwksCache` per `[[idps]]` entry, behind a `tokio::sync::Mutex` |
 
 ## The decision pipeline
@@ -25,7 +25,7 @@ The server is wiring. It holds no authorization logic of its own: tokens come fr
 
 1. **Leases.** `LeaseStore::check_all(chain.leases(), now)`. Every hop's lease must be known, unrevoked and `expires_at > now`, so a lease that its holder stopped renewing denies the call while the JWT is still valid. If not, the decision is deny, with reason `lease_revoked`, `lease_expired` or `lease_unknown` (checked in that order), or `lease_error` if the store cannot be read.
 2. **Policy.** `PolicyEngine::authorize`: the capability stage (`capability_denied`), then Cedar (`policy_allow`, `policy_deny`, `policy_error`).
-3. **Audit.** `DecisionRecord::new(now, decision, reason, chain, call, policy_ids)` is appended to the hash-chained log, and its id becomes the decision id the client sees (`X-Onbehalf-Decision-Id`, the JSON-RPC error's `data.decision_id`, or AuthZEN `context.decision_id`). If the append fails, the decision becomes deny with reason `audit_error`: an action that cannot be recorded does not happen.
+3. **Audit.** `DecisionRecord::new(now, decision, reason, chain, call, policy_ids)` is appended to the hash-chained log, and its id becomes the decision id the client sees (`X-Attenuo-Decision-Id`, the JSON-RPC error's `data.decision_id`, or AuthZEN `context.decision_id`). If the append fails, the decision becomes deny with reason `audit_error`: an action that cannot be recorded does not happen.
 
 **Blocking I/O.** SQLite calls are synchronous and take a lock, so they never run on an async worker. Handlers run their store-touching work through `AppState::blocking` (`tokio::task::spawn_blocking`), and `ServerAuthorizer` runs `Pipeline::decide`, `check_leases` and `record_rejection` the same way. Concurrent callers queue on the audit store's mutex inside an `IMMEDIATE` transaction that reads the head and inserts the next row, so appends stay strictly sequential and the chain cannot fork; the pool only decides which waiting caller goes next. This closes SR-22.
 
@@ -69,7 +69,7 @@ The filter applies wherever the response arrives ([Streamable HTTP, 2025-06-18](
 
 `notifications/tools/list_changed`, `notifications/resources/list_changed`, `notifications/prompts/list_changed` and `notifications/resources/updated` carry no list data and pass through (`202`, no body). Clients re-list after one and get a filtered list.
 
-Every decided call also has to name a `(server, tool)` pair that is in the tool catalog. `[policy] unknown_tools` sets what happens otherwise: `"deny"` (the default) denies after the capability stage with reason `tool_not_in_catalog`, recorded in the audit log like any decision; `"sensitive"` evaluates the call with `resource.sensitive = true`, so MFA-style `forbid` rules apply; `"allow"` evaluates it with default attributes, which is how v0 behaved and lets `forbid ... when { resource.sensitive }` fail open (SR-12). Methods decided as tools (`resources/read`, `prompts/get` and the rest) need catalog entries under their method name too. Names follow one rule (`onbehalf_core::names`): a server name, or a tool name as `tools/call` carries it, is 1 to 128 ASCII letters, digits, `_`, `.` or `-`; a decided method name is such segments joined by `/`. With no `/` in a server name, the Cedar ids `Action::"<server>/<tool>"` and `Tool::"<server>/<tool>"` split one way (SR-13), and a permit for `github`'s `read_file` does not match another upstream's. The server refuses to start when an upstream, catalog entry or root grant breaks the rule; the engine denies a call that does with reason `invalid_name`.
+Every decided call also has to name a `(server, tool)` pair that is in the tool catalog. `[policy] unknown_tools` sets what happens otherwise: `"deny"` (the default) denies after the capability stage with reason `tool_not_in_catalog`, recorded in the audit log like any decision; `"sensitive"` evaluates the call with `resource.sensitive = true`, so MFA-style `forbid` rules apply; `"allow"` evaluates it with default attributes, which is how v0 behaved and lets `forbid ... when { resource.sensitive }` fail open (SR-12). Methods decided as tools (`resources/read`, `prompts/get` and the rest) need catalog entries under their method name too. Names follow one rule (`attenuo_core::names`): a server name, or a tool name as `tools/call` carries it, is 1 to 128 ASCII letters, digits, `_`, `.` or `-`; a decided method name is such segments joined by `/`. With no `/` in a server name, the Cedar ids `Action::"<server>/<tool>"` and `Tool::"<server>/<tool>"` split one way (SR-13), and a permit for `github`'s `read_file` does not match another upstream's. The server refuses to start when an upstream, catalog entry or root grant breaks the rule; the engine denies a call that does with reason `invalid_name`.
 
 Before the decision the proxy checks the `tools/call` name itself (SR-25). A name outside the rule is denied with reason `invalid_name`; this also keeps a tool named `resources/read` from posing as that method. With `[proxy] require_listed_tools` (default on), a name that the upstream never returned from `tools/list` and the catalog does not hold (`Authorizer::knows_tool`) is denied with reason `tool_not_listed`. The proxy learns names from every `tools/list` result that passes through it, JSON or SSE, before filtering, across sessions (up to 10,000 per upstream). Names are compared exactly and never normalized, so against an upstream that resolves `Delete_Repo` to `delete_repo`, the variant is refused instead of reaching a decision that looks at a different name. Both refusals are `deny` records through `Authorizer::record_rejection`.
 
@@ -105,9 +105,9 @@ sequenceDiagram
         P->>G: append(DecisionRecord)
         G-->>P: entry (seq, hash)
         alt allow
-            P->>U: forward tools/call (no onbehalf token)
+            P->>U: forward tools/call (no attenuo token)
             U-->>P: result
-            P-->>A: result + X-Onbehalf-Decision-Id
+            P-->>A: result + X-Attenuo-Decision-Id
         else deny
             P-->>A: JSON-RPC -32003 {reason, decision_id}
         end
@@ -145,7 +145,7 @@ sequenceDiagram
     I-->>T: child token (or 400 invalid_scope / invalid_grant / invalid_request actor_not_permitted)
     T->>T: replay cache: actor token used before? (parent jti, actor) used before? 400 invalid_grant replayed, child dropped
     T->>L: register(child lease, parent = parent's last lease, expires_at), bind(child lease, chain digest)
-    T->>G: append(allow, token_issued, onbehalf / token.exchange)
+    T->>G: append(allow, token_issued, attenuo / token.exchange)
     T-->>C: {access_token, issued_token_type, token_type, expires_in, lease}
 ```
 
@@ -153,7 +153,7 @@ sequenceDiagram
 
 `[token] actor_auth` picks the accepted methods: `secret` (`[[agents]]` client credentials), `actor_token` (a JWT from an `[[actor_trust]]` issuer) or `either` (default; when both are sent, both are checked). With `require_actor_auth = true` one accepted method is mandatory.
 
-An actor token is checked in this order (module `actor`): the header `typ` must not name another kind of token (`onbehalf+jwt`, `oauth-id-jag+jwt`, `at+jwt`); the unverified `iss` and `sub` select the `[[actor_trust]]` entry (an entry with `issuer` needs that `iss`, an entry with `spiffe_trust_domain` needs `sub` in that trust domain), so unknown issuers are refused before any network call; `alg` must be allowed; the key is looked up by `kid` in the entry's JWKS (the same cache as for `[[idps]]`, reading `jwks_url` or the SPIRE bundle endpoint, never discovered); then the signature, `iss`, `aud`, `exp` (required), `nbf` and `iat`, all with the entry's clock skew; `sub` (a strictly parsed SPIFFE ID for a trust-domain entry); and `subject_to_agent` maps `sub` to the agent id that must equal `actor`. The token is used once (replay key: entry and `jti`, or the SHA-256 of the signing input) and the child's expiry is capped at its `exp`. A parent token that carries `may_act` can only be exchanged by an actor it lists.
+An actor token is checked in this order (module `actor`): the header `typ` must not name another kind of token (`attenuo+jwt`, `oauth-id-jag+jwt`, `at+jwt`); the unverified `iss` and `sub` select the `[[actor_trust]]` entry (an entry with `issuer` needs that `iss`, an entry with `spiffe_trust_domain` needs `sub` in that trust domain), so unknown issuers are refused before any network call; `alg` must be allowed; the key is looked up by `kid` in the entry's JWKS (the same cache as for `[[idps]]`, reading `jwks_url` or the SPIRE bundle endpoint, never discovered); then the signature, `iss`, `aud`, `exp` (required), `nbf` and `iat`, all with the entry's clock skew; `sub` (a strictly parsed SPIFFE ID for a trust-domain entry); and `subject_to_agent` maps `sub` to the agent id that must equal `actor`. The token is used once (replay key: entry and `jti`, or the SHA-256 of the signing input) and the child's expiry is capped at its `exp`. A parent token that carries `may_act` can only be exchanged by an actor it lists.
 
 Because the child lease is registered under the parent's, revoking any lease revokes every lease delegated from it, and the child's next call fails the lease step. Even without the cascade, the child's chain lists every ancestor lease, so a revoked ancestor is caught directly.
 
@@ -161,9 +161,9 @@ Because the child lease is registered under the parent's, revoking any lease rev
 
 `SqliteAudit::with_checkpointing(signer, every)` makes `append` sign `(seq, head_hash)` and insert a row into `checkpoints` inside the append's transaction whenever `seq` is a multiple of `every`, so a checkpoint never refers to a head that was not committed. `lib::spawn_checkpointer` (started by `serve` when `[audit] checkpoint_interval_seconds` is positive) calls `checkpoint_if_new` on a timer, which signs the head only if it moved past the newest checkpoint. `checkpoint_signed` backs `GET /admin/audit/checkpoint`: it returns the existing checkpoint for an unchanged head and refuses to sign when a stored checkpoint at that `seq` disagrees with the log.
 
-The signed bytes are `len(context) as u32 big-endian || "onbehalf-checkpoint-v1" || JCS [seq, head_hash, at, kid]` (RFC 8785 canonical JSON, `onbehalf_core::jcs`), signed by `onbehalf_token::DetachedSigner` and checked by `onbehalf_token::verify_detached`. `onbehalf_audit::CheckpointKeys::from_jwks` turns the published JWKS into the verifier. `verify_chain_signed` (the body of `GET /admin/audit/verify`) walks the chain once, remembers the entry hash at each checkpointed `seq`, then checks every checkpoint's signature and head hash. The report keeps `entries`, `ok` and `first_bad_seq` and adds `checkpoints`, `last_signed_seq`, `unsigned_tail` and `bad_checkpoints`.
+The signed bytes are `len(context) as u32 big-endian || "attenuo-checkpoint-v1" || JCS [seq, head_hash, at, kid]` (RFC 8785 canonical JSON, `attenuo_core::jcs`), signed by `attenuo_token::DetachedSigner` and checked by `attenuo_token::verify_detached`. `attenuo_audit::CheckpointKeys::from_jwks` turns the published JWKS into the verifier. `verify_chain_signed` (the body of `GET /admin/audit/verify`) walks the chain once, remembers the entry hash at each checkpointed `seq`, then checks every checkpoint's signature and head hash. The report keeps `entries`, `ok` and `first_bad_seq` and adds `checkpoints`, `last_signed_seq`, `unsigned_tail` and `bad_checkpoints`.
 
-`GET /admin/audit/export?from&to` streams `application/x-ndjson`: a header line, the entries in pages of 500 (each page on the blocking pool), then the checkpoints in range. `onbehalf_audit::export` parses that format (or the single-object JSON form) and `verify_export` checks it offline: the same walk with the first entry as the anchor for a window, plus checks that the file covers the range its header names, holds nothing outside it, and has no entries after its last valid checkpoint (`verify_export_with` and `VerifyOptions { allow_unsigned_tail }` relax the last one). The format id is `onbehalf-audit-export-v2`; lines are RFC 8785 canonical JSON, and a header is required.
+`GET /admin/audit/export?from&to` streams `application/x-ndjson`: a header line, the entries in pages of 500 (each page on the blocking pool), then the checkpoints in range. `attenuo_audit::export` parses that format (or the single-object JSON form) and `verify_export` checks it offline: the same walk with the first entry as the anchor for a window, plus checks that the file covers the range its header names, holds nothing outside it, and has no entries after its last valid checkpoint (`verify_export_with` and `VerifyOptions { allow_unsigned_tail }` relax the last one). The format id is `attenuo-audit-export-v2`; lines are RFC 8785 canonical JSON, and a header is required.
 
 ### Audit convention for issuance
 
@@ -173,7 +173,7 @@ The audit crate stores decision records only. An issuance is recorded as a decis
 |---|---|
 | `decision` | `allow` |
 | `reason` | `token_issued` |
-| `server` | `onbehalf` |
+| `server` | `attenuo` |
 | `tool` | `token.exchange` for a hop n+1 exchange, `token.root` for hop 0 (IdP intake or the dev root mint) |
 | `kind` | `exchange` for `token.exchange`, `root_token` for `token.root` (renewals: `lease_renew`; admin revocation: `lease_revoke`; other admin actions: `admin`; every authorization decision: `decision`) |
 | `chain_id` | the lease of the new chain's first hop, the same for every record of the run |
@@ -240,8 +240,8 @@ One cache per IdP (and per `[[actor_trust]]` entry, which uses the same code wit
 | `error` | Status | `error_description` |
 |---|---|---|
 | `invalid_client` | 401 | `client_auth_missing`, `client_authentication_failed`, `malformed_client_auth`, `no_agents_configured` |
-| `invalid_grant` | 400 | `malformed_token`, `typ_mismatch`, `untrusted_issuer`, `unsupported_alg`, `missing_kid`, `unknown_kid`, `bad_signature`, `audience_mismatch` (ID-JAG), `credential_audience_mismatch` (ID token not issued to the presenting agent), `expired`, `not_yet_valid`, `missing_claim`, `client_id_mismatch`, `credential_expired`, `replayed` (also for a repeated exchange or a reused actor token), `reserved_subject` (the user's `sub` starts with `urn:onbehalf:`, kept for the server's own audit records) |
-| `invalid_request` | 400 | `actor_mismatch`, `duplicate_actor` (exchange), `reserved_agent` (an exchange `actor` of `onbehalf`, SR-45), `multiple_client_auth`, `no_capabilities_requested`, `unsupported_token_type`, `malformed_request`, `may_act_exceeds_grant` |
+| `invalid_grant` | 400 | `malformed_token`, `typ_mismatch`, `untrusted_issuer`, `unsupported_alg`, `missing_kid`, `unknown_kid`, `bad_signature`, `audience_mismatch` (ID-JAG), `credential_audience_mismatch` (ID token not issued to the presenting agent), `expired`, `not_yet_valid`, `missing_claim`, `client_id_mismatch`, `credential_expired`, `replayed` (also for a repeated exchange or a reused actor token), `reserved_subject` (the user's `sub` starts with `urn:attenuo:`, kept for the server's own audit records) |
+| `invalid_request` | 400 | `actor_mismatch`, `duplicate_actor` (exchange), `reserved_agent` (an exchange `actor` of `attenuo`, SR-45), `multiple_client_auth`, `no_capabilities_requested`, `unsupported_token_type`, `malformed_request`, `may_act_exceeds_grant` |
 | `invalid_request` | 400 | Exchange actor authentication: `actor_not_permitted` (parent's `may_act`), `actor_token_required`, `actor_token_not_accepted`, `client_auth_not_accepted`, `actor_token_type_unsupported`, `actor_token_malformed`, `actor_token_typ_mismatch`, `actor_token_untrusted_issuer`, `actor_token_unsupported_alg`, `actor_token_missing_kid`, `actor_token_unknown_kid`, `actor_token_bad_signature`, `actor_token_audience_mismatch`, `actor_token_expired`, `actor_token_not_yet_valid`, `actor_token_missing_claim`, `actor_token_invalid_spiffe_id`, `actor_token_unmapped_subject` |
 | `invalid_scope` | 400 | `no_root_grant`, `scope_exceeds_grant` |
 | `dpop_required` | 401 | `dpop_required`: a bound subject token without a proof, an exchange that would not bind the child of a bound parent, a new key for the child without `subject_token_dpop`, or `[token] dpop = "required"` and no proof (SR-24) |
@@ -283,7 +283,7 @@ sequenceDiagram
     alt own lease revoked or unknown
         R-->>C: 400 invalid_grant
     end
-    R->>G: append(allow, lease_renewed, onbehalf / lease.renew)
+    R->>G: append(allow, lease_renewed, attenuo / lease.renew)
     R-->>C: {lease, expires_at, expires_in}
 ```
 
@@ -313,7 +313,7 @@ Non-MCP endpoints answer errors as `{"error": "<code>", "detail": "<text>"}` wit
 
 ## Known limits (v0)
 
-- Admin authentication is one static bearer (`[admin] token`, or `ONBEHALF_ADMIN_TOKEN`, which overrides it). Off a loopback `listen` address the server refuses to start when it is missing, shorter than 32 bytes or a published placeholder; on loopback it warns. Admin actions are audited with `originating_subject` = `urn:onbehalf:admin` (a subject no user can have: IdP intake and the dev root mint refuse subjects under `urn:onbehalf:`, SR-34), no agents, server `onbehalf` and tool `admin.lease.revoke`, `admin.policies.reload` (a rejected policy file is recorded as `deny` / `policy_invalid`) or `admin.root_token` (next to the `token.root` issuance record).
+- Admin authentication is one static bearer (`[admin] token`, or `ATTENUO_ADMIN_TOKEN`, which overrides it). Off a loopback `listen` address the server refuses to start when it is missing, shorter than 32 bytes or a published placeholder; on loopback it warns. Admin actions are audited with `originating_subject` = `urn:attenuo:admin` (a subject no user can have: IdP intake and the dev root mint refuse subjects under `urn:attenuo:`, SR-34), no agents, server `attenuo` and tool `admin.lease.revoke`, `admin.policies.reload` (a rejected policy file is recorded as `deny` / `policy_invalid`) or `admin.root_token` (next to the `token.root` issuance record).
 - Agents authenticate at hop 0 with a static client secret; no `private_key_jwt` or mTLS.
 - The replay cache is in memory: it does not survive a restart and is not shared between replicas.
 - The user block does not record which credential it came from (`evidence`, RFC-0001 §3.1); the audit record's argument digest covers the credential type and IdP.

@@ -1,10 +1,10 @@
 # Writing and testing policies
 
-onbehalf decides every tool call in two stages. First the **capability stage**: the call must be covered by the capabilities of the agent making it (the last hop of the delegation chain). Then the **Cedar stage**: your policies get a vote. Cedar denies by default, so a call is allowed only if at least one `permit` matches and no `forbid` does.
+attenuo decides every tool call in two stages. First the **capability stage**: the call must be covered by the capabilities of the agent making it (the last hop of the delegation chain). Then the **Cedar stage**: your policies get a vote. Cedar denies by default, so a call is allowed only if at least one `permit` matches and no `forbid` does.
 
 Policies can only narrow what the chain already grants. A `permit` never adds a capability the token lacks. That is the point: the token says what the user delegated, the policy says what the operator will tolerate on top of that.
 
-This guide covers the request shape, the tool catalog, common patterns, and how to test policies offline and in CI. The reference for the request is the [`onbehalf-policy` crate docs](https://github.com/7Mudit/onbehalf/blob/main/crates/onbehalf-policy/src/lib.rs); the design is in [RFC-0001](../spec/rfc-0001-onbehalf.md).
+This guide covers the request shape, the tool catalog, common patterns, and how to test policies offline and in CI. The reference for the request is the [`attenuo-policy` crate docs](https://github.com/7Mudit/attenuo/blob/main/crates/attenuo-policy/src/lib.rs); the design is in [RFC-0001](../spec/rfc-0001-attenuo.md).
 
 ## The request
 
@@ -29,9 +29,9 @@ The principal is an `Agent`, and an agent is `in` the originating `User` and in 
 
 Four things trip people up:
 
-- **Null and missing values.** Cedar has no `null`. Null arguments are dropped, and optional attributes must be guarded: `context.input has repo && context.input.repo like "acme/*"`. A policy that reads a missing attribute raises an evaluation error, and onbehalf then denies the call with `policy_error` rather than trusting a half-evaluated set.
+- **Null and missing values.** Cedar has no `null`. Null arguments are dropped, and optional attributes must be guarded: `context.input has repo && context.input.repo like "acme/*"`. A policy that reads a missing attribute raises an evaluation error, and attenuo then denies the call with `policy_error` rather than trusting a half-evaluated set.
 - **Action names are exact.** `Action::"github/read_*"` is not valid. To say "every read-only tool", tag tools in the catalog and test `resource.readonly`.
-- **Actions name their server.** `Action::"read_file"` on its own (a *bare* action, the form before 2026-10-23) is rejected: it fails validation, and `onbehalf policy lint` reports it as `error[actions]` with the line to fix. See [Migrating from bare actions](#migrating-from-bare-actions).
+- **Actions name their server.** `Action::"read_file"` on its own (a *bare* action, the form before 2026-10-23) is rejected: it fails validation, and `attenuo policy lint` reports it as `error[actions]` with the line to fix. See [Migrating from bare actions](#migrating-from-bare-actions).
 - **Give every policy an `@id`.** That id is what appears in audit records and in test reports. Without it Cedar names policies `policy0`, `policy1`, ... by position, which changes when you reorder the file.
 
 ## The catalog
@@ -60,7 +60,7 @@ Server names (the `[[upstreams]]` names and the catalog's server keys) and tool 
 
 ### User attributes
 
-The schema declares four optional attributes of `context.originating_user.attributes`: `mfa` (bool), `roles` (set of strings), `tenant` (string) and `email` (string). A policy that tests any other attribute, `groups` for example, is reported as impossible when it loads (a validation warning in the server log and in `onbehalf policy lint`), because the validator has no such attribute to type-check. Declare the extra attributes in the config:
+The schema declares four optional attributes of `context.originating_user.attributes`: `mfa` (bool), `roles` (set of strings), `tenant` (string) and `email` (string). A policy that tests any other attribute, `groups` for example, is reported as impossible when it loads (a validation warning in the server log and in `attenuo policy lint`), because the validator has no such attribute to type-check. Declare the extra attributes in the config:
 
 ```toml
 [policy]
@@ -80,7 +80,7 @@ when {
 };
 ```
 
-Declaring an attribute does not make it appear. The value comes from the verified IdP token: add the claim to `attribute_claims` in the `[[idps]]` entry (`groups` is there by default). If a token carries a value of a different type than declared, for example a string where you declared `set<string>`, onbehalf denies the call before any policy runs, with reason `attribute_type_mismatch` (audited, and shown by `onbehalf policy test`). Nothing is coerced. This matters because Cedar's `!=` across types is `true` without an error: `attributes.status != "suspended"` would otherwise permit `["suspended"]`. Still guard each use with `has` and prefer `.contains` and `like` over `!=` for exclusions. `onbehalf policy lint --config server.toml` and `onbehalf policy test` (when the test file's `catalog:` points at the server config) read `user_attributes` too, so tests and lint see the same schema as the server.
+Declaring an attribute does not make it appear. The value comes from the verified IdP token: add the claim to `attribute_claims` in the `[[idps]]` entry (`groups` is there by default). If a token carries a value of a different type than declared, for example a string where you declared `set<string>`, attenuo denies the call before any policy runs, with reason `attribute_type_mismatch` (audited, and shown by `attenuo policy test`). Nothing is coerced. This matters because Cedar's `!=` across types is `true` without an error: `attributes.status != "suspended"` would otherwise permit `["suspended"]`. Still guard each use with `has` and prefer `.contains` and `like` over `!=` for exclusions. `attenuo policy lint --config server.toml` and `attenuo policy test` (when the test file's `catalog:` points at the server config) read `user_attributes` too, so tests and lint see the same schema as the server.
 
 ## Patterns
 
@@ -108,7 +108,7 @@ permit(principal, action == Action::"github/read_file", resource)
 when { context.input has repo && context.input.repo like "alice/public-*" };
 ```
 
-This is the rule that stops the prompt-injected "read my private repo" in the [GitHub leak demo](https://github.com/7Mudit/onbehalf/blob/main/examples/github-leak-demo/README.md), even though the token allows `read_file`. Prefer an allow-list (`permit ... when repo like ...`) to a deny-list (`forbid ... when repo like "*private*"`): the deny-list fails open for names you did not think of. For constraints that must travel with the token and survive delegation, put them in the capability itself (`ArgConstraint`) rather than in policy.
+This is the rule that stops the prompt-injected "read my private repo" in the [GitHub leak demo](https://github.com/7Mudit/attenuo/blob/main/examples/github-leak-demo/README.md), even though the token allows `read_file`. Prefer an allow-list (`permit ... when repo like ...`) to a deny-list (`forbid ... when repo like "*private*"`): the deny-list fails open for names you did not think of. For constraints that must travel with the token and survive delegation, put them in the capability itself (`ArgConstraint`) rather than in policy.
 
 ### MFA for sensitive tools
 
@@ -155,15 +155,15 @@ when { !resource.readonly };
 
 Until 2026-10-23 the action was the bare tool name, `Action::"read_file"`, and it matched that tool on every upstream (SR-13 in the [security review](../research/security-review-2026-10-22.md)). To migrate:
 
-1. Run `onbehalf policy lint policy.cedar --config server.toml`. Every bare action is reported as `error[actions]` with its line and column.
+1. Run `attenuo policy lint policy.cedar --config server.toml`. Every bare action is reported as `error[actions]` with its line and column.
 2. Rewrite each one as `Action::"<server>/<tool>"`. If one bare permit was meant for the same tool on several servers, write one action per server: `action in [Action::"github/read_file", Action::"gitlab/read_file"]`.
-3. Run your `onbehalf policy test` files; the cases themselves do not change, since they name the server and the tool separately.
+3. Run your `attenuo policy test` files; the cases themselves do not change, since they name the server and the tool separately.
 
-If you cannot rewrite the policies before upgrading, `[policy] legacy_bare_actions = true` keeps the old ids (and their old, unscoped meaning) for the whole policy set. It is deprecated: the server logs a warning at start, lint reports each bare action as a warning instead of an error, and the two forms cannot be mixed. `onbehalf policy test` follows the same switch from the config its `catalog:` names, or from `legacy_bare_actions: true` in the test file.
+If you cannot rewrite the policies before upgrading, `[policy] legacy_bare_actions = true` keeps the old ids (and their old, unscoped meaning) for the whole policy set. It is deprecated: the server logs a warning at start, lint reports each bare action as a warning instead of an error, and the two forms cannot be mixed. `attenuo policy test` follows the same switch from the config its `catalog:` names, or from `legacy_bare_actions: true` in the test file.
 
 ## Testing policies
 
-Policies are code. Test them offline, with no server, using `onbehalf policy test`.
+Policies are code. Test them offline, with no server, using `attenuo policy test`.
 
 ### Test files
 
@@ -214,7 +214,7 @@ The harness builds a real `DelegationChain` and calls the same `PolicyEngine::au
 ### Running
 
 ```sh
-onbehalf policy test policy_test.yaml [more.yaml ...] [--json]
+attenuo policy test policy_test.yaml [more.yaml ...] [--json]
 ```
 
 ```
@@ -228,12 +228,12 @@ examples/github-leak-demo/policy_test.yaml
 
 Exit status: `0` all cases pass, `2` some case fails, `1` a file could not be run (unreadable, malformed, policy that does not parse or validate). `--json` prints one object with every case, the actual decision, the policy ids that decided it and any diagnostics, for tooling.
 
-The same runner is available as a library, `onbehalf_policy::testing`, for tests written in Rust.
+The same runner is available as a library, `attenuo_policy::testing`, for tests written in Rust.
 
 ### Linting
 
 ```sh
-onbehalf policy lint policy.cedar --config server.toml [--schema] [--json]
+attenuo policy lint policy.cedar --config server.toml [--schema] [--json]
 ```
 
 Parses the file, flags bare (not server-scoped) actions, and validates it against the schema generated from the catalog in `--config`, printing each problem as `file:line:col: error[stage]: message`. Exit `0` clean, `2` errors. `--schema` also prints the schema it validated against, which is the quickest way to see which actions and argument names are declared. Without `--config` the tools are declared from the policy's own `<server>/<tool>` action names, so a correct policy passes; `context.input` and the user attributes are not declared, so "impossible policy" warnings are dropped for policies that read them, and a `note:` says that `resource.readonly`, `resource.sensitive` and input types were not checked, and bare or malformed action names are listed as not declared. Pass `--config` for the full check.
@@ -254,12 +254,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install the onbehalf CLI
-        run: cargo install --locked --git https://github.com/7Mudit/onbehalf onbehalf-cli
+      - name: Install the attenuo CLI
+        run: cargo install --locked --git https://github.com/7Mudit/attenuo attenuo-cli
       - name: Lint
-        run: onbehalf policy lint policy/policy.cedar --config config/server.toml
+        run: attenuo policy lint policy/policy.cedar --config config/server.toml
       - name: Test
-        run: onbehalf policy test policy/policy_test.yaml
+        run: attenuo policy test policy/policy_test.yaml
 ```
 
 Pin the install to a tag or `--rev` once releases exist, so a CLI change cannot break your pipeline. Because the exit status distinguishes failing cases (`2`) from a broken setup (`1`), you can treat them differently if you want.

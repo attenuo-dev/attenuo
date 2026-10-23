@@ -1,18 +1,18 @@
 /** Request building and response parsing shared by the clients. */
 
 import { capabilitiesToJson, type CapabilityLike } from "./capability.js";
-import { ApiError, DeniedError, OnbehalfError, RpcError, UnauthorizedError } from "./errors.js";
+import { ApiError, DeniedError, AttenuoError, RpcError, UnauthorizedError } from "./errors.js";
 import type { DpopKeyLike } from "./dpop.js";
 import { bearer, decodeToken, parseTime, type Token } from "./token.js";
 
 export const TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange";
 export const TYPE_JWT = "urn:ietf:params:oauth:token-type:jwt";
 export const TYPE_ID_TOKEN = "urn:ietf:params:oauth:token-type:id_token";
-export const AUTHORIZATION_DETAILS_TYPE = "onbehalf_capabilities";
+export const AUTHORIZATION_DETAILS_TYPE = "attenuo_capabilities";
 
 export const CODE_UNAUTHORIZED = -32001;
 export const CODE_DENIED = -32003;
-export const DECISION_ID_HEADER = "x-onbehalf-decision-id";
+export const DECISION_ID_HEADER = "x-attenuo-decision-id";
 export const SESSION_HEADER = "mcp-session-id";
 export const MCP_ACCEPT = "application/json, text/event-stream";
 
@@ -22,7 +22,7 @@ export function normalizeBase(url: string): string {
   const base = url.replace(/\/+$/, "");
   if (!/^https?:\/\//.test(base)) {
     throw new TypeError(
-      `serverUrl must be the onbehalf server's base URL (http://host:port), got ${JSON.stringify(url)}. ` +
+      `serverUrl must be the attenuo server's base URL (http://host:port), got ${JSON.stringify(url)}. ` +
         "To name an MCP upstream, pass it as the `server` argument of callTool/listTools.",
     );
   }
@@ -101,13 +101,13 @@ export async function jsonBody(res: Response): Promise<unknown> {
   try {
     return JSON.parse(text);
   } catch {
-    throw new OnbehalfError(`server sent non-JSON (${res.status}): ${text.slice(0, 200)}`);
+    throw new AttenuoError(`server sent non-JSON (${res.status}): ${text.slice(0, 200)}`);
   }
 }
 
 export function asObject(v: unknown, what: string): Json {
   if (typeof v !== "object" || v === null || Array.isArray(v)) {
-    throw new OnbehalfError(`unexpected ${what} response: ${JSON.stringify(v)?.slice(0, 200)}`);
+    throw new AttenuoError(`unexpected ${what} response: ${JSON.stringify(v)?.slice(0, 200)}`);
   }
   return v as Json;
 }
@@ -204,7 +204,7 @@ export function mayActJson(mayAct: readonly string[]): { sub: string[] } {
   return { sub };
 }
 
-/** Does `token` decode as an onbehalf delegation token? Nothing is verified. */
+/** Does `token` decode as an attenuo delegation token? Nothing is verified. */
 export function isDelegationToken(token: Token | string): boolean {
   if (typeof token !== "string") return true;
   try {
@@ -221,7 +221,7 @@ export function tokenFromResponse(body: unknown): Token {
     body === null ||
     typeof (body as Json).access_token !== "string"
   ) {
-    throw new OnbehalfError(`unexpected token response: ${JSON.stringify(body)?.slice(0, 200)}`);
+    throw new AttenuoError(`unexpected token response: ${JSON.stringify(body)?.slice(0, 200)}`);
   }
   const b = body as Json;
   return decodeToken(b.access_token as string, typeof b.lease === "string" ? b.lease : undefined);
@@ -291,7 +291,7 @@ export function parseRpcBody(text: string, sse: boolean): Json | undefined {
 
 /**
  * The decision id of a denial the proxy produced, else `undefined` (SR-32). The proxy sets
- * `X-Onbehalf-Decision-Id` (comma separated, request order) and forwards no such header from an
+ * `X-Attenuo-Decision-Id` (comma separated, request order) and forwards no such header from an
  * upstream; an upstream is untrusted and can put any `-32003` error in its own body. A denial
  * counts only when `data.decision_id` is one of the ids in that header.
  */
@@ -303,7 +303,7 @@ function proxyDecisionId(headerValue: string | undefined, data: Json): string | 
 
 /**
  * The `result` of a JSON-RPC response, or the right error. Denials (`-32003` that the proxy
- * vouches for with `X-Onbehalf-Decision-Id`) throw `DeniedError`; a `-32003` without that proof
+ * vouches for with `X-Attenuo-Decision-Id`) throw `DeniedError`; a `-32003` without that proof
  * is an upstream's own error and throws `RpcError`; `-32001` or HTTP 401 throws `UnauthorizedError`; any other JSON-RPC error throws
  * `RpcError`.
  */
@@ -313,7 +313,7 @@ export async function rpcResult(res: Response): Promise<{ result: Json; decision
   const text = await res.text();
   const msg = parseRpcBody(text, sse);
   if (!msg) {
-    if (res.ok) throw new OnbehalfError(`no JSON-RPC response in body: ${text.slice(0, 200)}`);
+    if (res.ok) throw new AttenuoError(`no JSON-RPC response in body: ${text.slice(0, 200)}`);
     throw errorFromResponse(res.status, text);
   }
   const err = msg.error;

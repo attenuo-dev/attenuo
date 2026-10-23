@@ -50,7 +50,7 @@ Chosen option: "RFC 8693 `actor_token` alongside client secrets, with `may_act`"
 
 ### Confirmation
 
-Server integration tests in `crates/onbehalf-server/tests/actor_token.rs` and, for hop 0, `actor_token_hop0.rs` (JWT-SVID with ES256 keys from a fake SPIRE bundle endpoint, a generic EdDSA issuer, every rejection code, `actor_auth` modes, single use, TTL cap) and `e2e.rs` (`may_act_on_the_parent_limits_who_may_exchange_it`, `root_grant_may_act_is_applied_and_cannot_be_widened`); token tests `may_act_on_the_parent_limits_the_next_actor`, `not_after_caps_the_child_expiry`; unit tests in `crates/onbehalf-server/src/actor.rs` for SPIFFE ID parsing, subject mapping, entry validation and claim checks.
+Server integration tests in `crates/attenuo-server/tests/actor_token.rs` and, for hop 0, `actor_token_hop0.rs` (JWT-SVID with ES256 keys from a fake SPIRE bundle endpoint, a generic EdDSA issuer, every rejection code, `actor_auth` modes, single use, TTL cap) and `e2e.rs` (`may_act_on_the_parent_limits_who_may_exchange_it`, `root_grant_may_act_is_applied_and_cannot_be_widened`); token tests `may_act_on_the_parent_limits_the_next_actor`, `not_after_caps_the_child_expiry`; unit tests in `crates/attenuo-server/src/actor.rs` for SPIFFE ID parsing, subject mapping, entry validation and claim checks.
 
 ## Pros and Cons of the Options
 
@@ -68,16 +68,16 @@ Server integration tests in `crates/onbehalf-server/tests/actor_token.rs` and, f
 ### mTLS with X.509-SVIDs
 
 - Good, because the credential never travels and is bound to the TLS session.
-- Bad, because it needs TLS termination at onbehalf (or trusted forwarding of client certificates), which most deployments put in a proxy; it does not fit RFC 8693 `actor_token`.
+- Bad, because it needs TLS termination at attenuo (or trusted forwarding of client certificates), which most deployments put in a proxy; it does not fit RFC 8693 `actor_token`.
 
 ### `private_key_jwt` per agent
 
 - Good, because no shared secret is stored on the server.
-- Bad, because it still needs a key per agent provisioned and registered with onbehalf, which is the work a workload-identity system already does.
+- Bad, because it still needs a key per agent provisioned and registered with attenuo, which is the work a workload-identity system already does.
 
 ## More Information
 
 - RFC 8693 §2.1 (`actor_token`), §4.4 (`may_act`); SPIFFE JWT-SVID specification; [standards note](../research/standards.md) (SPIFFE, WIMSE).
 - [Security review 2026-10-22](../research/security-review-2026-10-22.md), SR-10.
-- [RFC-0001](../spec/rfc-0001-onbehalf.md) section 4, "Actor authentication" and "`may_act`".
+- [RFC-0001](../spec/rfc-0001-attenuo.md) section 4, "Actor authentication" and "`may_act`".
 - Revisit when sender-constrained hop tokens (`cnf`) are designed.

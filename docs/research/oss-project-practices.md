@@ -1,5 +1,8 @@
 # Open-source project practices: what we adopt and why
 
+<!-- renamed-note -->
+> Note (2026-10-23): this project was renamed from `onbehalf` to `attenuo`. This historical document keeps the old name.
+
 - Date: 2026-10-22
 - Scope: repository hygiene and process conventions for an infrastructure project in Rust. This is not about the protocol design; see `docs/spec/`.
 

@@ -1,7 +1,7 @@
 /**
  * Delegation tokens: decoding without verification, and local Ed25519 verification.
  *
- * A delegation token is a compact JWS (`typ` `onbehalf+jwt`, `alg` `EdDSA`) whose claims carry
+ * A delegation token is a compact JWS (`typ` `attenuo+jwt`, `alg` `EdDSA`) whose claims carry
  * the delegation `chain`: the originating user and one hop per agent, each with its
  * capabilities, expiry and lease id. `decodeToken` reads those claims and checks nothing. Use
  * `verifyToken` (or `client.inspect(jwt, { verify: true })`) to check the signature against the
@@ -9,9 +9,9 @@
  */
 
 import { type Capability } from "./capability.js";
-import { OnbehalfError, VerificationError } from "./errors.js";
+import { AttenuoError, VerificationError } from "./errors.js";
 
-export const TOKEN_TYPE = "onbehalf+jwt";
+export const TOKEN_TYPE = "attenuo+jwt";
 
 export interface User {
   subject: string;
@@ -42,12 +42,12 @@ export interface Jwks {
 export function parseTime(text: string): Date {
   const t = text.trim().replace(/\.(\d+)/, (_m, d: string) => `.${d.slice(0, 3).padEnd(3, "0")}`);
   const ms = Date.parse(t);
-  if (Number.isNaN(ms)) throw new OnbehalfError(`not a timestamp: ${text}`);
+  if (Number.isNaN(ms)) throw new AttenuoError(`not a timestamp: ${text}`);
   return new Date(ms);
 }
 
 export function b64urlDecode(part: string): Uint8Array<ArrayBuffer> {
-  if (!/^[A-Za-z0-9_-]*$/.test(part)) throw new OnbehalfError("not base64url");
+  if (!/^[A-Za-z0-9_-]*$/.test(part)) throw new AttenuoError("not base64url");
   const b64 = part.replace(/-/g, "+").replace(/_/g, "/");
   const bin = atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4));
   const out = new Uint8Array(bin.length);
@@ -60,11 +60,11 @@ function decodeJsonPart(part: string): Record<string, unknown> {
   try {
     v = JSON.parse(new TextDecoder().decode(b64urlDecode(part)));
   } catch (e) {
-    if (e instanceof OnbehalfError) throw e;
-    throw new OnbehalfError(`JWT is not JSON: ${(e as Error).message}`);
+    if (e instanceof AttenuoError) throw e;
+    throw new AttenuoError(`JWT is not JSON: ${(e as Error).message}`);
   }
   if (typeof v !== "object" || v === null || Array.isArray(v)) {
-    throw new OnbehalfError("JWT header and payload must be JSON objects");
+    throw new AttenuoError("JWT header and payload must be JSON objects");
   }
   return v as Record<string, unknown>;
 }
@@ -161,7 +161,7 @@ export function bearer(token: Token | string | undefined, fallback?: Token | str
 export function decodeToken(jwt: string, lease?: string): Token {
   const raw = jwt.trim();
   const parts = raw.split(".");
-  if (parts.length !== 3) throw new OnbehalfError("not a JWT: expected three dot-separated parts");
+  if (parts.length !== 3) throw new AttenuoError("not a JWT: expected three dot-separated parts");
   const header = decodeJsonPart(parts[0]!);
   const claims = decodeJsonPart(parts[1]!);
   let chain: Chain;
@@ -172,10 +172,10 @@ export function decodeToken(jwt: string, lease?: string): Token {
     if (!Number.isFinite(e)) throw new TypeError("exp");
     exp = new Date(e * 1000);
   } catch (e) {
-    const what = e instanceof OnbehalfError ? e.message : (e as Error).message;
-    throw new OnbehalfError(`payload is not an onbehalf delegation token (bad or missing ${what})`);
+    const what = e instanceof AttenuoError ? e.message : (e as Error).message;
+    throw new AttenuoError(`payload is not an attenuo delegation token (bad or missing ${what})`);
   }
-  if (chain.hops.length === 0) throw new OnbehalfError("token chain has no hops");
+  if (chain.hops.length === 0) throw new AttenuoError("token chain has no hops");
   return new Token(
     raw,
     lease ?? chain.hops[chain.hops.length - 1]!.lease,

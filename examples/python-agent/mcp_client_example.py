@@ -1,11 +1,11 @@
-"""Use the official `mcp` Python client through onbehalf's proxy.
+"""Use the official `mcp` Python client through attenuo's proxy.
 
-onbehalf speaks MCP Streamable HTTP at `<server>/mcp/<upstream>` and wants
-`Authorization: Bearer <delegation token>` on every request. `onbehalf.mcp` produces the URL and
+attenuo speaks MCP Streamable HTTP at `<server>/mcp/<upstream>` and wants
+`Authorization: Bearer <delegation token>` on every request. `attenuo.mcp` produces the URL and
 the header; the rest is the MCP client's normal setup.
 
     pip install -e sdk/python mcp
-    ONBEHALF_SERVER=http://127.0.0.1:8080 ONBEHALF_ADMIN_TOKEN=demo-admin-token \\
+    ATTENUO_SERVER=http://127.0.0.1:8080 ATTENUO_ADMIN_TOKEN=demo-admin-token \\
         python examples/python-agent/mcp_client_example.py
 
 Tested with `mcp` 2.3.0 (which builds on `httpx2`) against the fake GitHub MCP server of the demo.
@@ -23,13 +23,13 @@ import asyncio
 import os
 from typing import Any
 
-from onbehalf import AdminClient, Capability, Client, Prefix
-from onbehalf.mcp import mcp_headers, mcp_url
+from attenuo import AdminClient, Capability, Client, Prefix
+from attenuo.mcp import mcp_headers, mcp_url
 
-SERVER = os.environ.get("ONBEHALF_SERVER", "http://127.0.0.1:8080")
-ADMIN_TOKEN = os.environ.get("ONBEHALF_ADMIN_TOKEN", "demo-admin-token")
+SERVER = os.environ.get("ATTENUO_SERVER", "http://127.0.0.1:8080")
+ADMIN_TOKEN = os.environ.get("ATTENUO_ADMIN_TOKEN", "demo-admin-token")
 # The coder's [[agents]] secret in the demo config: an exchange authenticates as its actor.
-CODER_SECRET = os.environ.get("ONBEHALF_CODER_SECRET", "demo-coder-secret")
+CODER_SECRET = os.environ.get("ATTENUO_CODER_SECRET", "demo-coder-secret")
 # The agent id that the demo config (examples/github-leak-demo/config.toml) grants `github:*`.
 PLANNER_AGENT = "assistant"
 

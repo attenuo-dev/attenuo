@@ -1,5 +1,8 @@
 # Security review, pass 1
 
+<!-- renamed-note -->
+> Note (2026-10-23): this project was renamed from `onbehalf` to `attenuo`. This historical document keeps the old name.
+
 Status updated 2026-10-23 for `fix/security-pass-2` (SR-08, SR-10, SR-11, SR-12, SR-15, SR-16 fixed; SR-13, SR-24, SR-25 partly).
 
 Status updated 2026-10-23 for `fix/sr13-sr25-sr36`: SR-13 and SR-25 fixed (server-scoped actions; one name rule and a listed-tools check in the proxy). The partly-fixed count in the summary drops to 1 (SR-24).
@@ -14,7 +17,7 @@ Status updated 2026-10-23 by [pass 4](security-review-2026-10-23-pass4.md) (`rev
 
 - Date: 2026-10-22
 - Branch: `review/security-pass-1` (base: `7411c9b`, all crates merged)
-- Related: [RFC-0001](../spec/rfc-0001-onbehalf.md), [threat model](../spec/threat-model.md), [task board](../tasks/board.md)
+- Related: [RFC-0001](../spec/rfc-0001-attenuo.md), [threat model](../spec/threat-model.md), [task board](../tasks/board.md)
 
 ## Scope and method
 

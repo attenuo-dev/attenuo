@@ -4,13 +4,13 @@ This guide covers what to change between "it runs on my laptop" and "other peopl
 
 ## What v0 is and is not
 
-onbehalf is pre-alpha. Do not treat this guide as a statement that it is ready for production. It is a list of what you would have to do if you ran it anyway, for example in a staging environment or a closed pilot.
+attenuo is pre-alpha. Do not treat this guide as a statement that it is ready for production. It is a list of what you would have to do if you ran it anyway, for example in a staging environment or a closed pilot.
 
 - **One node.** There is no clustering, no replication and no leader election. One server process owns one SQLite file.
 - **SQLite only.** The audit log and the lease registry live in the same SQLite file, in WAL mode. Store calls run on the blocking pool, and audit appends go through one writer thread that commits whatever is queued in one transaction (group commit). On a shared 4-core development container a file-backed server handled about 3,000 to 4,500 calls per second at one hop (memory: about 5,000 to 6,600); see [design/performance.md](../design/performance.md) for the method and the caveats.
-- **No high availability.** If the process is down, every call through the proxy fails. That is by design: onbehalf fails closed. Do not start a second replica against the same file, or against a copy. Each process would keep its own idea of which leases are revoked.
+- **No high availability.** If the process is down, every call through the proxy fails. That is by design: attenuo fails closed. Do not start a second replica against the same file, or against a copy. Each process would keep its own idea of which leases are revoked.
 - **No TLS.** The server speaks plain HTTP. Terminate TLS in front of it.
-- **One static admin token.** There are no operator accounts or roles. Admin actions (lease revocations, policy reloads, development root mints) are recorded in the audit log as `by urn:onbehalf:admin`, a subject no identity provider can issue (the `urn:onbehalf:` prefix is reserved).
+- **One static admin token.** There are no operator accounts or roles. Admin actions (lease revocations, policy reloads, development root mints) are recorded in the audit log as `by urn:attenuo:admin`, a subject no identity provider can issue (the `urn:attenuo:` prefix is reserved).
 - **No metrics endpoint.** You monitor it through logs and the audit log. See [What to monitor](#what-to-monitor).
 - **Manual key rotation with no overlap.** See [Key rotation](#key-rotation).
 
@@ -22,19 +22,19 @@ Go through this before pointing anything real at the server.
 
 - [ ] `[dev] allow_root_mint` is `false` or absent. With it on, anyone holding the admin token can mint a root token for any user.
 - [ ] Root tokens come from a real identity provider: `[[idps]]`, `[[agents]]`, `[[root_grants]]`. See [Identity providers](identity-providers.md).
-- [ ] The admin token (`[admin] token`, or `ONBEHALF_ADMIN_TOKEN`, which overrides it) is a long random value that is not in any example, not in version control and not shared with agents. Generate it with `openssl rand -hex 32`. Off a loopback `listen` address the server refuses to start without one, with one shorter than 32 bytes, or with a known placeholder; it cannot tell whether your token was leaked.
+- [ ] The admin token (`[admin] token`, or `ATTENUO_ADMIN_TOKEN`, which overrides it) is a long random value that is not in any example, not in version control and not shared with agents. Generate it with `openssl rand -hex 32`. Off a loopback `listen` address the server refuses to start without one, with one shorter than 32 bytes, or with a known placeholder; it cannot tell whether your token was leaked.
 - [ ] Every agent that receives a token is an `[[agents]]` entry with its own secret: token exchanges authenticate as their `actor` (`[token] require_actor_auth`, on by default).
 - [ ] `[policy] unknown_tools` is `deny` (the default) or `sensitive`, not `allow`.
 - [ ] `/admin/*` is not reachable from the networks agents live on. See [Network exposure](#network-exposure).
-- [ ] TLS terminates in front of onbehalf, and agents reach it over HTTPS only.
+- [ ] TLS terminates in front of attenuo, and agents reach it over HTTPS only.
 - [ ] `[issuer] private_key_pem_path` is set, the file is mode 0600, owned by the service user, and backed up somewhere safe. Without the setting the server makes a new key at every start and every token dies on restart.
 - [ ] `[audit] sqlite_path` is a real path on durable storage. The default is `:memory:`, which loses the audit log and every lease on exit. The server logs a warning when it is in memory.
-- [ ] `[issuer] issuer` is the URL clients will use, for example `https://onbehalf.example.com`. It becomes the `iss` of every token, and changing it later invalidates tokens. `[server] public_url` is set to the same base URL so the AuthZEN discovery document points at the right host. Off a loopback `listen` address the server refuses to start without it.
+- [ ] `[issuer] issuer` is the URL clients will use, for example `https://attenuo.example.com`. It becomes the `iss` of every token, and changing it later invalidates tokens. `[server] public_url` is set to the same base URL so the AuthZEN discovery document points at the right host. Off a loopback `listen` address the server refuses to start without it.
 - [ ] `[policy] policies_path` points at your policy, and the catalog lists every tool a policy names.
 - [ ] Every tool on the upstream that agents should call is in the catalog. With the default `[policy] unknown_tools = "deny"`, a tool missing from the catalog is denied with `tool_not_in_catalog`; with `"allow"` it is neither `readonly` nor `sensitive`, so rules that depend on those attributes do not see it.
-- [ ] The config file is mode 0600. It holds secret hashes and possibly the admin token. The admin token can come from `ONBEHALF_ADMIN_TOKEN` instead; there is no other environment-variable substitution, so inject the file at deploy time.
-- [ ] You have read the [threat model](../spec/threat-model.md) section "What onbehalf does not prevent" and have decided how the agents' other routes (direct API keys, local STDIO servers) are closed.
-- [ ] Something checks `onbehalf audit verify` on a schedule, and `[audit.sink]` ships checkpoints off the host ([audit log](../concepts/audit-log.md#shipping-checkpoints-off-the-host)). The server signs checkpoints itself (`[audit] checkpoint_every`, `checkpoint_interval_seconds`); `audit verify` reports the last signed `seq`.
+- [ ] The config file is mode 0600. It holds secret hashes and possibly the admin token. The admin token can come from `ATTENUO_ADMIN_TOKEN` instead; there is no other environment-variable substitution, so inject the file at deploy time.
+- [ ] You have read the [threat model](../spec/threat-model.md) section "What attenuo does not prevent" and have decided how the agents' other routes (direct API keys, local STDIO servers) are closed.
+- [ ] Something checks `attenuo audit verify` on a schedule, and `[audit.sink]` ships checkpoints off the host ([audit log](../concepts/audit-log.md#shipping-checkpoints-off-the-host)). The server signs checkpoints itself (`[audit] checkpoint_every`, `checkpoint_interval_seconds`); `audit verify` reports the last signed `seq`.
 
 ## Network exposure
 
@@ -66,7 +66,7 @@ Put anything that terminates TLS in front: Caddy, nginx, Envoy, a cloud load bal
 A minimal Caddy file. Untested, but small enough to check by eye:
 
 ```text
-onbehalf.example.com {
+attenuo.example.com {
     @admin path /admin/*
     respond @admin 404
     reverse_proxy 127.0.0.1:8080 {
@@ -79,13 +79,13 @@ This hides `/admin` from the public name. Operators reach it on `127.0.0.1:8080`
 
 For nginx, the equivalent pieces are `proxy_pass http://127.0.0.1:8080;`, `proxy_buffering off;`, `proxy_http_version 1.1;` and a `location /admin/ { return 404; }` block. Untested.
 
-onbehalf builds the AuthZEN discovery document from `[server] public_url`, which is required whenever `listen` is not a loopback address, so a forged `Host` header cannot put another host's URLs into a document a shared cache might keep. Only on a loopback listener without `public_url` does it fall back to `Host`, and then it accepts only `localhost`, `127.0.0.1` or `[::1]` (with an optional port) and answers 400 `invalid_host` to anything else. It does not use `X-Forwarded-*` headers.
+attenuo builds the AuthZEN discovery document from `[server] public_url`, which is required whenever `listen` is not a loopback address, so a forged `Host` header cannot put another host's URLs into a document a shared cache might keep. Only on a loopback listener without `public_url` does it fall back to `Host`, and then it accepts only `localhost`, `127.0.0.1` or `[::1]` (with an optional port) and answers 400 `invalid_host` to anything else. It does not use `X-Forwarded-*` headers.
 
 ## Admin token handling
 
 - The token is compared in constant time, and a missing token disables `/admin` (403) rather than opening it.
 - It sits in the config file in clear text. Treat the file as a secret: mode 0600, not in the image, not in the repository, not in a CI log. In Docker or Kubernetes, mount the whole file from a secret.
-- Operators pass it to the CLI with `ONBEHALF_ADMIN_TOKEN`, `--admin-token-stdin` or `--admin-token-file`. `--admin-token` still works but prints a warning, since command-line arguments show up in process listings (`ps`, `/proc/<pid>/cmdline`) and shell history. The same goes for an agent's client secret (`ONBEHALF_CLIENT_SECRET`, `--client-secret-stdin`, `--client-secret-file`).
+- Operators pass it to the CLI with `ATTENUO_ADMIN_TOKEN`, `--admin-token-stdin` or `--admin-token-file`. `--admin-token` still works but prints a warning, since command-line arguments show up in process listings (`ps`, `/proc/<pid>/cmdline`) and shell history. The same goes for an agent's client secret (`ATTENUO_CLIENT_SECRET`, `--client-secret-stdin`, `--client-secret-file`).
 - Rotating it means editing the file and restarting. There is no overlap window and no way to have two tokens.
 - Do not hand the admin token to agents. It can revoke any lease and read all audit entries. Agents use delegation tokens only.
 
@@ -99,13 +99,13 @@ Rotation has an overlap period. Retired keys listed in `[issuer] previous_key_pa
 
 ```toml
 [issuer]
-private_key_pem_path = "/etc/onbehalf/issuer-2.pem"          # signs from now on
-previous_key_paths   = ["/etc/onbehalf/issuer-1.pem"]        # verify only
+private_key_pem_path = "/etc/attenuo/issuer-2.pem"          # signs from now on
+previous_key_paths   = ["/etc/attenuo/issuer-1.pem"]        # verify only
 ```
 
 To rotate:
 
-1. Generate the new key: `openssl genpkey -algorithm ed25519 -out /etc/onbehalf/issuer-2.pem`, then `chmod 600` it. (The server also generates a key if the path does not exist.)
+1. Generate the new key: `openssl genpkey -algorithm ed25519 -out /etc/attenuo/issuer-2.pem`, then `chmod 600` it. (The server also generates a key if the path does not exist.)
 2. Edit the config: point `private_key_pem_path` at the new file and add the old file to `previous_key_paths`. A previous key file may be the old private key or just its public key (`openssl pkey -in issuer-1.pem -pubout -out issuer-1.pub`); only the public half is used, so prefer the public file and archive the private one.
 3. Restart the server. It logs the new `kid` and how many previous keys it trusts. Check `/.well-known/jwks.json` lists both.
 4. Wait at least the longest token lifetime (`default_ttl_seconds`, or the largest `ttl_seconds` you allow) plus `clock_skew`. By then every token signed by the old key has expired.
@@ -115,12 +115,12 @@ Notes:
 
 - The originating-user block of a token (`ou_sig`) is signed once, at the root, and copied to every child. A child minted after the switch is signed by the new key but still carries an old-key `ou_sig` (its `ou_kid` names the old key), so the old key must stay trusted until the whole chain has expired. That is why step 4 waits for the longest chain, not for one token.
 - A token whose `kid` is not in the trusted set is rejected with `invalid_grant`, whatever its signature. Tokens issued by a version before `kid` existed carry no `kid` and are tried against every trusted key.
-- Third parties that verify onbehalf tokens offline should select the key by `kid` and refresh the JWKS when they see an unknown one. `onbehalf token inspect --verify` fetches the JWKS and trusts every key in it.
+- Third parties that verify attenuo tokens offline should select the key by `kid` and refresh the JWKS when they see an unknown one. `attenuo token inspect --verify` fetches the JWKS and trusts every key in it.
 - In an emergency (key compromise), skip the overlap: replace the key and leave `previous_key_paths` empty. Every outstanding token stops verifying; agents re-run login and exchange.
 
 The audit log does not depend on the issuer key. It is a plain SHA-256 hash chain, so rotation does not break `audit verify`. Old leases stay in the database but belong to tokens that no longer verify.
 
-The PEM is the most sensitive file onbehalf owns. Whoever has it can mint any token for any user. Back it up apart from the database, with the same care as any signing key.
+The PEM is the most sensitive file attenuo owns. Whoever has it can mint any token for any user. Back it up apart from the database, with the same care as any signing key.
 
 ## SQLite file: placement and backup
 
@@ -130,9 +130,9 @@ Placement:
 
 - Put it on local, durable storage that the service user owns. SQLite over NFS or other network file systems is a known source of locking trouble.
 - Keep it away from anything agents can reach. Whoever can write the file can rewrite the log and un-revoke leases.
-- In a container, mount a volume. The image's working directory is `/var/lib/onbehalf`, owned by the `onbehalf` user (uid 10001).
+- In a container, mount a volume. The image's working directory is `/var/lib/attenuo`, owned by the `attenuo` user (uid 10001).
 - Watch free disk space. An audit append that fails turns the decision into a deny with reason `audit_error`, so a full disk stops all calls and token issuance. That is the fail-closed rule working as designed.
-- The file runs in SQLite's WAL mode, so next to `onbehalf.sqlite` you will see `onbehalf.sqlite-wal` and `onbehalf.sqlite-shm`. They belong to the database: keep them on the same volume, and never copy or delete one of the three on its own. A background thread folds the WAL into the main file every `[audit] wal_checkpoint_seconds` (default 5) and empties it when the server is idle and at a clean shutdown, so after `SIGTERM` the `-wal` file is empty. Under sustained load the `-wal` file grows to roughly 64 to 100 MB before it starts over; leave room for it.
+- The file runs in SQLite's WAL mode, so next to `attenuo.sqlite` you will see `attenuo.sqlite-wal` and `attenuo.sqlite-shm`. They belong to the database: keep them on the same volume, and never copy or delete one of the three on its own. A background thread folds the WAL into the main file every `[audit] wal_checkpoint_seconds` (default 5) and empties it when the server is idle and at a clean shutdown, so after `SIGTERM` the `-wal` file is empty. Under sustained load the `-wal` file grows to roughly 64 to 100 MB before it starts over; leave room for it.
 
 Durability (`[audit] durability`):
 
@@ -142,10 +142,10 @@ Durability (`[audit] durability`):
 
 Backup:
 
-- Use SQLite's own backup, not a plain file copy, while the server runs: `sqlite3 /var/lib/onbehalf/onbehalf.sqlite ".backup '/backups/onbehalf-$(date +%F).sqlite'"`. This needs the `sqlite3` command-line tool. Untested here.
+- Use SQLite's own backup, not a plain file copy, while the server runs: `sqlite3 /var/lib/attenuo/attenuo.sqlite ".backup '/backups/attenuo-$(date +%F).sqlite'"`. This needs the `sqlite3` command-line tool. Untested here.
 - Keep the PEM and the config separately from the database backup.
 - Know what a restore does. Restoring an old backup rewinds the lease registry, so a lease revoked after the backup is live again, and it cuts the audit log back to that point. After a restore, revoke anything that was revoked since, and note the gap.
-- Copy `GET /admin/audit/checkpoint` (`{seq, head_hash, at, kid, signature}`) somewhere the server's host cannot write, such as a ticket system or a separate log store. A hash chain proves the log was not edited in the middle. It does not prove nobody truncated the end or rebuilt the chain. The server signs a checkpoint every `[audit] checkpoint_every` entries and every `checkpoint_interval_seconds`, and `audit verify` rejects a log that is shorter than a stored checkpoint or whose hash at that `seq` differs. The signing key is the server's own, so a checkpoint stored only on the host will not help if the server process is compromised. Set `[audit.sink]` (webhook, a file on another mount, or S3) so each checkpoint leaves the host when it is signed, with credentials that can add but not overwrite; then `onbehalf audit verify --file export.jsonl --jwks jwks.json --checkpoints shipped.jsonl` shows any checkpoint signed again after it was shipped. Alert on `audit_sink_dropped_total` and on `readyz` reporting `"degraded": true`.
+- Copy `GET /admin/audit/checkpoint` (`{seq, head_hash, at, kid, signature}`) somewhere the server's host cannot write, such as a ticket system or a separate log store. A hash chain proves the log was not edited in the middle. It does not prove nobody truncated the end or rebuilt the chain. The server signs a checkpoint every `[audit] checkpoint_every` entries and every `checkpoint_interval_seconds`, and `audit verify` rejects a log that is shorter than a stored checkpoint or whose hash at that `seq` differs. The signing key is the server's own, so a checkpoint stored only on the host will not help if the server process is compromised. Set `[audit.sink]` (webhook, a file on another mount, or S3) so each checkpoint leaves the host when it is signed, with credentials that can add but not overwrite; then `attenuo audit verify --file export.jsonl --jwks jwks.json --checkpoints shipped.jsonl` shows any checkpoint signed again after it was shipped. Alert on `audit_sink_dropped_total` and on `readyz` reporting `"degraded": true`.
 - Keep retired signing keys in `[issuer] previous_key_paths` for as long as you want old checkpoints to verify. Without the old key in the JWKS, a checkpoint it signed is reported invalid.
 
 ## Leases: tuning the interval
@@ -179,7 +179,7 @@ The server logs through `tracing` to standard output. Control it with `RUST_LOG`
 | `warn` | Also shown at `info`: the dev root mint is on, the audit log is in memory, the key is ephemeral, rejected requests |
 | `debug` | Per-request detail, for diagnosing a client. Noisy. Do not leave it on |
 
-Examples: `RUST_LOG=info`, `RUST_LOG=onbehalf_server=debug,info`.
+Examples: `RUST_LOG=info`, `RUST_LOG=attenuo_server=debug,info`.
 
 Output has ANSI colour codes by default. Set `NO_COLOR=1` to switch them off for log shippers.
 
@@ -191,30 +191,30 @@ The repository has a `Dockerfile` and a `docker-compose.yml`. Both are marked un
 
 The image:
 
-- builds `onbehalf-server`, the `onbehalf` CLI and the fake MCP server from source;
-- runs as uid 10001 (`onbehalf`), working directory `/var/lib/onbehalf`;
-- expects a config at `/etc/onbehalf/config.toml` (the default `CMD` is `--config /etc/onbehalf/config.toml`);
+- builds `attenuo-server`, the `attenuo` CLI and the fake MCP server from source;
+- runs as uid 10001 (`attenuo`), working directory `/var/lib/attenuo`;
+- expects a config at `/etc/attenuo/config.toml` (the default `CMD` is `--config /etc/attenuo/config.toml`);
 - exposes 8080 and has a `HEALTHCHECK` that calls `/healthz`;
 - includes `curl` for that check.
 
 ```sh
-docker build -t onbehalf:dev .
+docker build -t attenuo:dev .
 ```
 
 For anything beyond the demo, start from the demo's compose file and change these things:
 
 ```yaml
 services:
-  onbehalf:
-    image: onbehalf:dev
-    command: ["--config", "/etc/onbehalf/config.toml"]
+  attenuo:
+    image: attenuo:dev
+    command: ["--config", "/etc/attenuo/config.toml"]
     ports:
       - "127.0.0.1:8080:8080"        # reverse proxy on the host or in another container
     volumes:
-      - ./onbehalf.toml:/etc/onbehalf/config.toml:ro
-      - ./policy.cedar:/etc/onbehalf/policy.cedar:ro
-      - ./issuer.pem:/etc/onbehalf/issuer.pem:ro
-      - onbehalf-data:/var/lib/onbehalf
+      - ./attenuo.toml:/etc/attenuo/config.toml:ro
+      - ./policy.cedar:/etc/attenuo/policy.cedar:ro
+      - ./issuer.pem:/etc/attenuo/issuer.pem:ro
+      - attenuo-data:/var/lib/attenuo
     stop_grace_period: 15s         # the server drains for up to 10s after SIGTERM
     restart: unless-stopped
     read_only: true
@@ -223,10 +223,10 @@ services:
       - no-new-privileges:true
 
 volumes:
-  onbehalf-data:
+  attenuo-data:
 ```
 
-Matching settings in `onbehalf.toml`: `policies_path = "/etc/onbehalf/policy.cedar"`, `private_key_pem_path = "/etc/onbehalf/issuer.pem"`, `sqlite_path = "/var/lib/onbehalf/onbehalf.sqlite"`, `listen = "0.0.0.0:8080"` (inside the container only; the published port stays on loopback) and `public_url` set to the URL clients use, which a non-loopback `listen` requires. This layout is untested.
+Matching settings in `attenuo.toml`: `policies_path = "/etc/attenuo/policy.cedar"`, `private_key_pem_path = "/etc/attenuo/issuer.pem"`, `sqlite_path = "/var/lib/attenuo/attenuo.sqlite"`, `listen = "0.0.0.0:8080"` (inside the container only; the published port stays on loopback) and `public_url` set to the URL clients use, which a non-loopback `listen` requires. This layout is untested.
 
 Notes:
 
@@ -242,7 +242,7 @@ Notes:
 
 Startup is quick: parse config, load the key, open SQLite, load policy. Config, policy or catalog errors stop the process with a message instead of starting a half-working server.
 
-Reloading policy does not need a restart: `onbehalf policy reload`. A bad policy file leaves the old policy in force. Changing the config file, the catalog or the key does need a restart.
+Reloading policy does not need a restart: `attenuo policy reload`. A bad policy file leaves the old policy in force. Changing the config file, the catalog or the key does need a restart.
 
 ## What to monitor
 
@@ -254,7 +254,7 @@ enabled = true
 listen = "127.0.0.1:9100"
 ```
 
-`GET http://127.0.0.1:9100/metrics` has no authentication. Keep it on loopback or a private network and scrape it from there. The server refuses to start when `listen` is not a loopback address, unless you also set `allow_public = true` (it then logs a warning); do that only for a private interface that network policy protects, since decision counts by reason are served to anyone who can connect. The API port does not serve `/metrics`. Series (all prefixed `onbehalf_`):
+`GET http://127.0.0.1:9100/metrics` has no authentication. Keep it on loopback or a private network and scrape it from there. The server refuses to start when `listen` is not a loopback address, unless you also set `allow_public = true` (it then logs a warning); do that only for a private interface that network policy protects, since decision counts by reason are served to anyone who can connect. The API port does not serve `/metrics`. Series (all prefixed `attenuo_`):
 
 | Series | Type | Labels |
 |---|---|---|
@@ -288,7 +288,7 @@ From the logs:
 - `warn` lines. A rise in rejections can mean a misconfigured client or an attack.
 - `503` answers from `POST /token` with `jwks_unavailable`. That is your identity provider or the network path to it.
 
-From the audit log (`GET /admin/audit`, `onbehalf audit tail`):
+From the audit log (`GET /admin/audit`, `attenuo audit tail`):
 
 - The count of denies by reason. A jump in `capability_denied` or `policy_deny` for one agent often means a prompt-injected agent. A jump in `lease_expired` means agents that stopped renewing.
 - Any `audit_error`, `lease_error` or `policy_error`. These are internal failures and every one denied a call.
@@ -300,4 +300,4 @@ If you run a second system that needs to react to revocations, such as an AuthZE
 
 ## Upgrades
 
-Until 1.0, minor versions can change the config, the token format and the database layout. Read the [CHANGELOG](https://github.com/7Mudit/onbehalf/blob/main/CHANGELOG.md) before every upgrade, and back up the database and the key first. Tokens issued by one version may not verify on the next. Plan to re-mint.
+Until 1.0, minor versions can change the config, the token format and the database layout. Read the [CHANGELOG](https://github.com/7Mudit/attenuo/blob/main/CHANGELOG.md) before every upgrade, and back up the database and the key first. Tokens issued by one version may not verify on the next. Plan to re-mint.

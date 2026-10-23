@@ -5,7 +5,7 @@
 
 ## Context
 
-`onbehalf-policy` has to answer "may this agent, acting for this user, make this tool call?"
+`attenuo-policy` has to answer "may this agent, acting for this user, make this tool call?"
 The delegation chain already carries capabilities that only narrow hop by hop. Operators also
 want to express rules the chain cannot: argument-level conditions (`repo like "acme/*"`),
 user attributes (MFA), chain depth limits, and read-only/sensitive tool classes. Cedar is the
@@ -66,6 +66,6 @@ Cedar has three properties that shape the design:
   every upstream, so a permit written for one server covered a malicious second one. Action ids
   are now `Action::"<server>/<tool>"` (a plain string id, not a Cedar namespace, so the policy
   syntax is unchanged). The bare form remains behind the deprecated
-  `[policy] legacy_bare_actions` switch, and `onbehalf policy lint` flags it.
+  `[policy] legacy_bare_actions` switch, and `attenuo policy lint` flags it.
 - **Trusting Cedar's decision when a policy errored.** Rejected: a skipped `forbid` is a
   grant.

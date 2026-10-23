@@ -1,4 +1,4 @@
-# onbehalf-server config for the GitHub MCP leak demo (see README.md).
+# attenuo-server config for the GitHub MCP leak demo (see README.md).
 #
 # run.sh copies this file, rewrites the two ports and the relative paths, and starts the
 # server from the copy. config.docker.toml is the docker-compose variant.
@@ -8,7 +8,7 @@ listen = "127.0.0.1:18080"
 
 [issuer]
 issuer = "http://127.0.0.1:18080"
-audience = "onbehalf"
+audience = "attenuo"
 default_ttl_seconds = 900
 # No key path: an ephemeral key per start, which is what a throwaway demo wants.
 

@@ -3,13 +3,13 @@
 #
 #   examples/github-leak-demo/run.sh
 #
-# Starts onbehalf-server and a fake GitHub MCP server on free local ports, then plays the
-# scenario with the `onbehalf` CLI. Exits non-zero if any step does not come out as expected.
+# Starts attenuo-server and a fake GitHub MCP server on free local ports, then plays the
+# scenario with the `attenuo` CLI. Exits non-zero if any step does not come out as expected.
 # Re-runnable: nothing is written outside a temp dir, which the exit trap removes.
 #
 # Environment:
 #   KEEP=1                keep the temp dir (logs, rendered config) after the run
-#   ONBEHALF_BIN_DIR=DIR  use prebuilt onbehalf-server / onbehalf / examples/fake_mcp from DIR
+#   ATTENUO_BIN_DIR=DIR  use prebuilt attenuo-server / attenuo / examples/fake_mcp from DIR
 #                         instead of building (default: cargo build into the target dir)
 
 set -euo pipefail
@@ -18,7 +18,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 cd "$ROOT"
 
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/onbehalf-demo.XXXXXX")"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/attenuo-demo.XXXXXX")"
 PIDS=()
 
 cleanup() {
@@ -65,17 +65,17 @@ free_port() {
 }
 
 # --- build ----------------------------------------------------------------------------------
-if [ -n "${ONBEHALF_BIN_DIR:-}" ]; then
-  BIN="$ONBEHALF_BIN_DIR"
+if [ -n "${ATTENUO_BIN_DIR:-}" ]; then
+  BIN="$ATTENUO_BIN_DIR"
 else
   echo "building (first run takes a while)..." >&2
-  cargo build -q -p onbehalf-server -p onbehalf-cli
-  cargo build -q -p onbehalf-proxy --features testing --example fake_mcp
+  cargo build -q -p attenuo-server -p attenuo-cli
+  cargo build -q -p attenuo-proxy --features testing --example fake_mcp
   BIN="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/debug"
 fi
-SERVER_BIN="$BIN/onbehalf-server"; FAKE_BIN="$BIN/examples/fake_mcp"; CLI="$BIN/onbehalf"
+SERVER_BIN="$BIN/attenuo-server"; FAKE_BIN="$BIN/examples/fake_mcp"; CLI="$BIN/attenuo"
 [ -x "$FAKE_BIN" ] || FAKE_BIN="$BIN/fake_mcp"
-onbehalf() { "$CLI" "$@"; }
+attenuo() { "$CLI" "$@"; }
 
 # --- start the two servers on free ports ---------------------------------------------------
 OB_PORT="$(free_port)"; MCP_PORT="$(free_port)"
@@ -97,53 +97,53 @@ for _ in $(seq 1 100); do
 done
 curl -sf "http://127.0.0.1:$OB_PORT/healthz" >/dev/null || { echo "server did not start" >&2; exit 1; }
 
-export ONBEHALF_SERVER="http://127.0.0.1:$OB_PORT"
-export ONBEHALF_ADMIN_TOKEN="demo-admin-token"
+export ATTENUO_SERVER="http://127.0.0.1:$OB_PORT"
+export ATTENUO_ADMIN_TOKEN="demo-admin-token"
 
 # --- the scenario --------------------------------------------------------------------------
 say "Setup"
-note "onbehalf at $ONBEHALF_SERVER proxies a fake GitHub MCP server at port $MCP_PORT as 'github'."
+note "attenuo at $ATTENUO_SERVER proxies a fake GitHub MCP server at port $MCP_PORT as 'github'."
 note "Policy: read_file only when repo like \"alice/public-*\". See policy.cedar."
 note "The policy has its own tests (policy_test.yaml). They run offline, before any server traffic."
-step 0 'onbehalf policy test examples/github-leak-demo/policy_test.yaml'
+step 0 'attenuo policy test examples/github-leak-demo/policy_test.yaml'
 
 say "1. Alice's assistant gets a broad token (any github tool), like the over-privileged PAT"
-step 0 'onbehalf token root --subject alice --agent assistant --cap "github:*"'
+step 0 'attenuo token root --subject alice --agent assistant --cap "github:*"'
 ROOT_TOKEN="$(field token)"; ROOT_LEASE="$(field lease)"
 
 say "2. The assistant hands its 'coder' sub-agent read_file and nothing else"
 note "The coder authenticates as itself ([[agents]] in config.toml): only it can receive a token in its name."
-note "Its secret goes in on stdin (or ONBEHALF_CLIENT_SECRET, or --client-secret-file), never in argv;"
-note "so do the tokens (ONBEHALF_TOKEN, --token-file or --token -)."
-step 0 'printf "%s\n" demo-coder-secret | ONBEHALF_TOKEN="$ROOT_TOKEN" onbehalf token exchange --actor coder --client-secret-stdin --cap github:read_file'
+note "Its secret goes in on stdin (or ATTENUO_CLIENT_SECRET, or --client-secret-file), never in argv;"
+note "so do the tokens (ATTENUO_TOKEN, --token-file or --token -)."
+step 0 'printf "%s\n" demo-coder-secret | ATTENUO_TOKEN="$ROOT_TOKEN" attenuo token exchange --actor coder --client-secret-stdin --cap github:read_file'
 CODER="$(field token)"; CODER_LEASE="$(field lease)"
 
 say "3. What the coder's token says"
-step 0 'onbehalf token inspect "$CODER" --verify'
+step 0 'attenuo token inspect "$CODER" --verify'
 
 say "4. The coder reads a public repo as intended: allowed"
-step 0 'ONBEHALF_TOKEN="$CODER" onbehalf call --server github --tool read_file --arg repo=alice/public-docs --arg path=README.md'
+step 0 'ATTENUO_TOKEN="$CODER" attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=README.md'
 
 say "5. A malicious issue tells the coder to read alice/private-salaries: denied by policy"
 note "read_file is in the token, but the policy only lets it touch alice/public-*."
-step 2 'ONBEHALF_TOKEN="$CODER" onbehalf call --server github --tool read_file --arg repo=alice/private-salaries --arg path=2025.csv'
+step 2 'ATTENUO_TOKEN="$CODER" attenuo call --server github --tool read_file --arg repo=alice/private-salaries --arg path=2025.csv'
 
 say "6. The injection tries to copy the data out through create_issue: denied, never delegated"
-step 2 'ONBEHALF_TOKEN="$CODER" onbehalf call --server github --tool create_issue --arg repo=alice/public-docs --arg title=leak'
+step 2 'ATTENUO_TOKEN="$CODER" attenuo call --server github --tool create_issue --arg repo=alice/public-docs --arg title=leak'
 
 say "7. Alice sees the session going wrong and revokes the assistant's lease"
-step 0 'onbehalf lease revoke "$ROOT_LEASE" --reason "agent session compromised"'
-step 0 'onbehalf lease show "$CODER_LEASE"'
+step 0 'attenuo lease revoke "$ROOT_LEASE" --reason "agent session compromised"'
+step 0 'attenuo lease show "$CODER_LEASE"'
 
 say "8. The coder's next call, even the legitimate one, is denied: the revocation cascaded"
-step 2 'ONBEHALF_TOKEN="$CODER" onbehalf call --server github --tool read_file --arg repo=alice/public-docs --arg path=README.md'
+step 2 'ATTENUO_TOKEN="$CODER" attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=README.md'
 
 say "9. The audit log records every decision, and its hash chain checks out"
-step 0 'onbehalf audit tail -n 10'
-step 0 'onbehalf audit verify'
+step 0 'attenuo audit tail -n 10'
+step 0 'attenuo audit verify'
 
 say "What reached the GitHub server"
 UPSTREAM_CALLS="$(grep -c 'tools/call' "$WORK/fake-mcp.log" || true)"
 grep 'tools/call' "$WORK/fake-mcp.log" | sed 's/^/  /'
-echo "  -> $UPSTREAM_CALLS tools/call reached upstream. The three denied calls never left onbehalf."
+echo "  -> $UPSTREAM_CALLS tools/call reached upstream. The three denied calls never left attenuo."
 [ "$UPSTREAM_CALLS" = 1 ] || { echo "!! expected exactly 1 upstream call" >&2; exit 1; }

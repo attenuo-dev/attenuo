@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 import pytest
 
-from onbehalf import (
+from attenuo import (
     ApiError,
     AsyncClient,
     AsyncTokenRefresher,
@@ -22,7 +22,7 @@ from onbehalf import (
     TokenRefresher,
     decode_token,
 )
-from onbehalf.mcp import TokenAuth
+from attenuo.mcp import TokenAuth
 
 from .helpers import Signer
 
@@ -302,7 +302,7 @@ def test_renewals_carry_the_dpop_proof_of_the_clients_key() -> None:
 
 
 def test_nothing_is_logged_with_a_token(caplog: pytest.LogCaptureFixture) -> None:
-    caplog.set_level(logging.DEBUG, logger="onbehalf.refresh")
+    caplog.set_level(logging.DEBUG, logger="attenuo.refresh")
     new = mint(100, at=T0 + 80)
     r, clock, server, _, _ = make(100, lease_interval=30, exchange=lambda: new)
     old_jwt = r.token.jwt

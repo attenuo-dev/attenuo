@@ -7,7 +7,7 @@
  * key, and bound tokens are sent as `Authorization: DPoP <token>`.
  *
  * Keys are private JWKs: Ed25519 (`{ kty: "OKP", crv: "Ed25519", x, d }`, what
- * `onbehalf key gen --dpop` writes) or P-256 (`{ kty: "EC", crv: "P-256", x, y, d }`). Signing
+ * `attenuo key gen --dpop` writes) or P-256 (`{ kty: "EC", crv: "P-256", x, y, d }`). Signing
  * uses WebCrypto (`globalThis.crypto.subtle`); there are no extra dependencies.
  *
  * **Server nonces** (RFC 9449 §8). A server with `[token] dpop_nonce = "required"` wants a
@@ -17,7 +17,7 @@
  * answers `use_dpop_nonce`.
  */
 
-import { OnbehalfError } from "./errors.js";
+import { AttenuoError } from "./errors.js";
 import { b64urlDecode } from "./token.js";
 
 /** `typ` of a DPoP proof. */
@@ -65,7 +65,7 @@ export function accessTokenHash(token: string): Promise<string> {
 function str(jwk: Jwk, member: string): string {
   const v = jwk[member];
   if (typeof v !== "string" || v === "") {
-    throw new OnbehalfError(`DPoP key: JWK member \`${member}\` is missing`);
+    throw new AttenuoError(`DPoP key: JWK member \`${member}\` is missing`);
   }
   return v;
 }
@@ -76,7 +76,7 @@ function publicMembers(jwk: Jwk): Record<string, string> {
   const crv = jwk.crv;
   if (kty === "OKP" && crv === ED25519) return { crv, kty, x: str(jwk, "x") };
   if (kty === "EC" && crv === "P-256") return { crv, kty, x: str(jwk, "x"), y: str(jwk, "y") };
-  throw new OnbehalfError(
+  throw new AttenuoError(
     `unsupported DPoP key type ${JSON.stringify(kty)} / curve ${JSON.stringify(crv)}`,
   );
 }
@@ -98,12 +98,12 @@ export class DpopKey {
     readonly thumbprint: string,
   ) {}
 
-  /** Import a private JWK. Throws `OnbehalfError` for a public key or a key that does not match. */
+  /** Import a private JWK. Throws `AttenuoError` for a public key or a key that does not match. */
   static async fromJwk(jwk: Jwk): Promise<DpopKey> {
-    if (typeof jwk !== "object" || jwk === null) throw new OnbehalfError("DPoP key: not a JWK");
+    if (typeof jwk !== "object" || jwk === null) throw new AttenuoError("DPoP key: not a JWK");
     const pub = publicMembers(jwk);
     const d = typeof jwk.d === "string" ? jwk.d : "";
-    if (!d) throw new OnbehalfError("a DPoP key must be a private JWK (with `d`)");
+    if (!d) throw new AttenuoError("a DPoP key must be a private JWK (with `d`)");
     const ed = pub.kty === "OKP";
     let key: CryptoKey;
     try {
@@ -116,7 +116,7 @@ export class DpopKey {
         ["sign"],
       );
     } catch (e) {
-      throw new OnbehalfError(`DPoP key: invalid ${pub.crv} key: ${(e as Error).message}`);
+      throw new AttenuoError(`DPoP key: invalid ${pub.crv} key: ${(e as Error).message}`);
     }
     return new DpopKey(key, d, ed ? "EdDSA" : "ES256", pub, await jwkThumbprint(pub));
   }
@@ -250,7 +250,7 @@ export class NonceCache {
 
 /**
  * Did the server refuse the proof for want of its nonce? A 401 with
- * `WWW-Authenticate: DPoP error="use_dpop_nonce"` (resource servers, and onbehalf's own routes),
+ * `WWW-Authenticate: DPoP error="use_dpop_nonce"` (resource servers, and attenuo's own routes),
  * or a 400 or 401 whose JSON `error` is `use_dpop_nonce` (authorization servers). Reads a clone
  * of the body, so `res` stays readable.
  */
@@ -295,10 +295,10 @@ export async function exchangeProofs(
   }
   if (subjectKey !== undefined) {
     if (key === undefined) {
-      throw new OnbehalfError("subjectDpopKey needs a dpopKey to bind the new token to");
+      throw new AttenuoError("subjectDpopKey needs a dpopKey to bind the new token to");
     }
     if (parent !== undefined && parent !== subjectKey.thumbprint) {
-      throw new OnbehalfError("subjectDpopKey is not the key the subject token is bound to");
+      throw new AttenuoError("subjectDpopKey is not the key the subject token is bound to");
     }
     out.signOff = await subjectKey.signOff(url, subjectToken, key.thumbprint, actor);
   }

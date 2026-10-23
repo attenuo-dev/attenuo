@@ -97,7 +97,7 @@ Linux 6.18.44-fc-v153
 
 The matrix above cannot separate the WAL change from host load, so the file store was also run
 with one binary and only `[audit] wal_checkpoint_seconds` changed, the variants interleaved
-(one-hop allow call, 2 s warm-up, 8 s measured, `onbehalf-bench --onbehalf-url`, a fresh
+(one-hop allow call, 2 s warm-up, 8 s measured, `attenuo-bench --attenuo-url`, a fresh
 database per run). `0` is SQLite checkpointing on the writer every 1,000 pages, the behaviour
 before this branch. "restart at 4,096 pages" is an intermediate version of the checkpointer that
 paused appends more often (see the commit history). Load average 8 to 12 during these runs. Raw

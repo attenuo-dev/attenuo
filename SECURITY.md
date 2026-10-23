@@ -1,6 +1,6 @@
 # Security Policy
 
-onbehalf is authorization infrastructure. A bug here is not a crash; it is an agent doing something its principal never allowed. We treat security reports as the most important input the project receives.
+attenuo is authorization infrastructure. A bug here is not a crash; it is an agent doing something its principal never allowed. We treat security reports as the most important input the project receives.
 
 ## Reporting a vulnerability
 
@@ -9,7 +9,7 @@ onbehalf is authorization infrastructure. A bug here is not a crash; it is an ag
 Report privately through either channel:
 
 - Email `security@<domain>` (placeholder until the project domain is set; until then use GitHub private reporting).
-- GitHub private vulnerability reporting: [github.com/7Mudit/onbehalf/security/advisories/new](https://github.com/7Mudit/onbehalf/security/advisories/new).
+- GitHub private vulnerability reporting: [github.com/7Mudit/attenuo/security/advisories/new](https://github.com/7Mudit/attenuo/security/advisories/new).
 
 Please include as much of the following as you can:
 
@@ -58,7 +58,7 @@ Once 1.0 is released this table will list the maintained minor series. Pre-1.0, 
 
 ## Scope and assumptions
 
-The threat model in `docs/spec/` describes what onbehalf defends against and what it assumes of its deployment (for example, that signing keys are held by a trusted issuer and that the server is reached over TLS). Findings that only apply outside those assumptions are still welcome, and we may fix them, but they are triaged as hardening rather than vulnerabilities.
+The threat model in `docs/spec/` describes what attenuo defends against and what it assumes of its deployment (for example, that signing keys are held by a trusted issuer and that the server is reached over TLS). Findings that only apply outside those assumptions are still welcome, and we may fix them, but they are triaged as hardening rather than vulnerabilities.
 
 ## Safe harbour
 

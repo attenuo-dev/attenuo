@@ -2,9 +2,9 @@
 
 A delegation token is a bearer token by default: whoever holds it can use it until it expires or its lease is revoked. If an agent leaks its token (in a log line, a prompt, a crash dump, a tool result it echoes back), the leak is as good as the agent.
 
-A **bound** token is useless without a private key the agent keeps. onbehalf implements this with DPoP (RFC 9449): the token carries the thumbprint of a key, and every request that presents it must carry a fresh proof signed by that key. This guide shows how to bind tokens with the CLI and the SDKs, how binding passes from one agent to the next, and what the server refuses.
+A **bound** token is useless without a private key the agent keeps. attenuo implements this with DPoP (RFC 9449): the token carries the thumbprint of a key, and every request that presents it must carry a fresh proof signed by that key. This guide shows how to bind tokens with the CLI and the SDKs, how binding passes from one agent to the next, and what the server refuses.
 
-Everything below was run against a local server with the [GitHub leak demo](https://github.com/7Mudit/onbehalf/blob/main/examples/github-leak-demo/README.md) config. Binding is optional: nothing changes for clients that do not use it, unless the operator sets `[token] dpop = "required"`.
+Everything below was run against a local server with the [GitHub leak demo](https://github.com/7Mudit/attenuo/blob/main/examples/github-leak-demo/README.md) config. Binding is optional: nothing changes for clients that do not use it, unless the operator sets `[token] dpop = "required"`.
 
 ## How it works
 
@@ -20,31 +20,31 @@ Supported keys are Ed25519 (`EdDSA`) and P-256 (`ES256`). The CLI and SDKs gener
 Generate a key for each agent. The file is a private JWK, written with mode 0600, and an existing file is never overwritten:
 
 ```console
-$ onbehalf key gen --dpop assistant.jwk
+$ attenuo key gen --dpop assistant.jwk
 wrote DPoP key assistant.jwk (EdDSA)
 jkt  4MMDxQj9pafXPrWH6dxBeoSk2DpHFpEZvXvsmr6JibU
-$ CODER_JKT=$(onbehalf --json key gen --dpop coder.jwk | jq -r .jkt)
+$ CODER_JKT=$(attenuo --json key gen --dpop coder.jwk | jq -r .jkt)
 ```
 
 Mint a root token bound to the assistant's key (the dev endpoint; with an IdP, pass `--dpop-key` to the hop-0 `token exchange` instead):
 
 ```sh
-ROOT=$(onbehalf token root --subject alice --agent assistant --cap 'github:*' \
+ROOT=$(attenuo token root --subject alice --agent assistant --cap 'github:*' \
   --dpop-key assistant.jwk --print token)
 ```
 
-`onbehalf token inspect` shows the binding: `bound to DPoP key jkt 4MMDxQj9…`.
+`attenuo token inspect` shows the binding: `bound to DPoP key jkt 4MMDxQj9…`.
 
 The assistant delegates to a coder that has its own key. A child of a bound token is always bound, so the exchange names the coder's key with `--dpop-key`. The assistant consents to the new binding with a **sign-off**: a proof by its own key that names the coder's key thumbprint and agent id. It makes the sign-off in its own process and hands only the result to the coder, so its key never leaves it:
 
 ```sh
 # The assistant, with assistant.jwk:
-onbehalf token sign-off --subject-token "$ROOT" --dpop-key assistant.jwk \
+attenuo token sign-off --subject-token "$ROOT" --dpop-key assistant.jwk \
   --child-jkt "$CODER_JKT" --actor coder > sign-off.txt
 
 # The coder, with coder.jwk and the sign-off:
-CODER=$(ONBEHALF_TOKEN="$ROOT" ONBEHALF_CLIENT_SECRET=demo-coder-secret \
-  onbehalf token exchange --actor coder --cap github:read_file \
+CODER=$(ATTENUO_TOKEN="$ROOT" ATTENUO_CLIENT_SECRET=demo-coder-secret \
+  attenuo token exchange --actor coder --cap github:read_file \
   --dpop-key coder.jwk --subject-token-dpop-file sign-off.txt --print token)
 ```
 
@@ -52,10 +52,10 @@ The sign-off is good for one exchange (its `jti` is single-use), within `[token]
 
 When the child should stay on the parent's key (one agent, two tokens), pass the same file as `--dpop-key` and leave out the sign-off.
 
-The coder calls tools with its key. `--dpop-key` (or `ONBEHALF_DPOP_KEY`) works on `call`, `tools` and `authzen eval`:
+The coder calls tools with its key. `--dpop-key` (or `ATTENUO_DPOP_KEY`) works on `call`, `tools` and `authzen eval`:
 
 ```console
-$ ONBEHALF_TOKEN="$CODER" onbehalf call --dpop-key coder.jwk --server github --tool read_file \
+$ ATTENUO_TOKEN="$CODER" attenuo call --dpop-key coder.jwk --server github --tool read_file \
     --arg repo=alice/public-docs --arg path=README.md
 ALLOWED
 ```
@@ -63,19 +63,19 @@ ALLOWED
 The same token without the key:
 
 ```console
-$ ONBEHALF_TOKEN="$CODER" onbehalf call --server github --tool read_file \
+$ ATTENUO_TOKEN="$CODER" attenuo call --server github --tool read_file \
     --arg repo=alice/public-docs --arg path=README.md
-error -32001: onbehalf: unauthorized: dpop_required
+error -32001: attenuo: unauthorized: dpop_required
 ```
 
 ## With the SDKs
 
 Give the client a key. It then attaches a proof to every request, binds every token it obtains by exchange, and sends tokens as `Authorization: DPoP`.
 
-Python (`pip install 'onbehalf[dpop]'` for the `cryptography` package):
+Python (`pip install 'attenuo[dpop]'` for the `cryptography` package):
 
 ```python
-from onbehalf import AdminClient, Client, DpopKey
+from attenuo import AdminClient, Client, DpopKey
 
 assistant_key = DpopKey.load("assistant.jwk")   # or DpopKey.generate()
 coder_key = DpopKey.load("coder.jwk")
@@ -98,7 +98,7 @@ For an MCP client library on `httpx`, `TokenAuth(provider, dpop_key=key)` adds t
 TypeScript (no extra dependencies; WebCrypto signs):
 
 ```ts
-import { AdminClient, DpopKey, mcpFetch, OnbehalfClient } from "@onbehalf/sdk";
+import { AdminClient, DpopKey, mcpFetch, AttenuoClient } from "@attenuo/sdk";
 
 const assistantKey = await DpopKey.fromJwk(JSON.parse(readFileSync("assistant.jwk", "utf8")));
 const coderKey = await DpopKey.generate(); // keep coderKey.privateJwk() to reuse it
@@ -110,7 +110,7 @@ const root = await admin.mintRootDev("alice", "https://idp.example", "assistant"
 // The assistant signs off on delegating to the coder's key; only the sign-off travels.
 const signOff = await assistantKey.signOff(`${url}/token`, root.jwt, coderKey.thumbprint, "coder");
 
-const ob = new OnbehalfClient(url, { dpopKey: coderKey });
+const ob = new AttenuoClient(url, { dpopKey: coderKey });
 const coder = await ob.exchange(root, "coder", "github:read_file", {
   clientSecret,
   subjectTokenDpop: signOff,
@@ -164,7 +164,7 @@ A bound token stays bound whatever `dpop` says: `off` stops binding new tokens b
 
 With `[token] dpop_nonce = "required"` the server supplies the freshness instead of trusting the client's clock (RFC 9449 §8). Every response to a request that sent a `DPoP` header, and every `WWW-Authenticate: DPoP` challenge, carries a `DPoP-Nonce` header. Each proof the server checks in a `DPoP` header must put the latest such value in its `nonce` claim. A proof without it, or with a stale or unknown one, is refused with 401 `use_dpop_nonce`. That response carries the nonce to use, and the client retries with a new proof.
 
-The Python and TypeScript clients (`Client`, `AsyncClient`, `OnbehalfClient`, `AdminClient` for the dev root mint, `TokenAuth` and `mcpFetch`) do this for you. They keep the latest nonce and retry a refused request once. The CLI does not handle nonces yet.
+The Python and TypeScript clients (`Client`, `AsyncClient`, `AttenuoClient`, `AdminClient` for the dev root mint, `TokenAuth` and `mcpFetch`) do this for you. They keep the latest nonce and retry a refused request once. The CLI does not handle nonces yet.
 
 The server keeps no nonce state. A nonce is an HMAC of the current time bucket (`dpop_max_age_seconds` wide) under a key derived from the issuer's signing key. The current and the previous bucket's nonces are accepted, so a nonce lives for one to two windows, and replicas that share the signing key accept each other's nonces. The exchange sign-off (`subject_token_dpop`) needs no nonce, because the parent makes it ahead of time.
 
@@ -176,4 +176,4 @@ The server keeps no nonce state. A nonce is an HMAC of the current time bucket (
 - Cedar policies cannot see whether a call was bound yet; only the audit record says so.
 - mTLS (RFC 8705) and SPIFFE X.509 binding are not implemented.
 
-See [RFC-0001 section 4.1](../spec/rfc-0001-onbehalf.md#41-sender-constrained-tokens-dpop) for the specification.
+See [RFC-0001 section 4.1](../spec/rfc-0001-attenuo.md#41-sender-constrained-tokens-dpop) for the specification.

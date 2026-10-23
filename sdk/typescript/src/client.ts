@@ -1,11 +1,11 @@
 /**
- * Client for the onbehalf server. It mirrors what the `onbehalf` CLI does over HTTP:
+ * Client for the attenuo server. It mirrors what the `attenuo` CLI does over HTTP:
  * `POST /token`, `POST /token/renew`, `POST /mcp/{server}` and `POST /access/v1/evaluation`.
  */
 
 import type { CapabilityLike } from "./capability.js";
 import { DpopKey, NonceCache, exchangeProofs, presented, type DpopKeyLike } from "./dpop.js";
-import { OnbehalfError } from "./errors.js";
+import { AttenuoError } from "./errors.js";
 import { Http, type HttpOptions } from "./http.js";
 import { bearer, decodeToken, verifyToken, type Jwks, type Token } from "./token.js";
 import { mcpHeaders } from "./mcp.js";
@@ -40,7 +40,7 @@ export interface McpOptions {
   sessionId?: string;
 }
 
-export class OnbehalfClient {
+export class AttenuoClient {
   readonly serverUrl: string;
   /** Default bearer; assign a new one after a re-exchange. */
   token: Token | string | undefined;
@@ -118,7 +118,7 @@ export class OnbehalfClient {
     opts: w.ExchangeOptions = {},
   ): Promise<Token> {
     if (opts.subjectDpopKey !== undefined && opts.subjectTokenDpop !== undefined) {
-      throw new OnbehalfError("pass subjectDpopKey or subjectTokenDpop, not both");
+      throw new AttenuoError("pass subjectDpopKey or subjectTokenDpop, not both");
     }
     const body = w.exchangeBody(subjectToken, actor, capabilities, opts);
     const subjectKey = await DpopKey.of(opts.subjectDpopKey);
@@ -176,7 +176,7 @@ export class OnbehalfClient {
     const { response } = await this.rpc(token, server, "initialize", {
       protocolVersion: opts.protocolVersion ?? "2025-06-18",
       capabilities: {},
-      clientInfo: { name: opts.clientName ?? "onbehalf-typescript", version: "0" },
+      clientInfo: { name: opts.clientName ?? "attenuo-typescript", version: "0" },
     });
     return response.headers.get(w.SESSION_HEADER) ?? undefined;
   }

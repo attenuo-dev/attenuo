@@ -5,7 +5,7 @@
 - Code and corpus: [`evaluation/injection-suite/`](../../evaluation/injection-suite/README.md)
 - Full results, v2 (dev and test splits, five arms): [results/2026-10-23-v2.md](../../evaluation/injection-suite/results/2026-10-23-v2.md), with every call and the SHA-256 of every case file, policy and binary in [2026-10-23-v2.json](../../evaluation/injection-suite/results/2026-10-23-v2.json). First run (dev corpus, three arms): [results/2026-10-23.md](../../evaluation/injection-suite/results/2026-10-23.md)
 
-The question: when an agent has already been injected and sends the harmful tool call, does onbehalf refuse it, and how many of the task's own calls does it refuse along the way? There are two splits. The development split has 46 cases across five suites. Four follow the structure of AgentDojo's suites (workspace, banking, travel, slack), some follow InjecAgent's data-stealing shape, and one replays the GitHub MCP leak. The suite policies were frozen after the dev split, and the test split was written against them: 26 cases so far, in the banking and workspace suites only. The taxonomy plans 33 more test cases for travel, slack and github, which are not written yet, so the target of 40 or more is still open. Each case is a user task, the grant that task needs, and a fixed list of benign and injected `tools/call` requests. The runner replays every list in five arms, from no onbehalf to onbehalf as configured, through the real server and proxy. [The README](../../evaluation/injection-suite/README.md) describes the method.
+The question: when an agent has already been injected and sends the harmful tool call, does attenuo refuse it, and how many of the task's own calls does it refuse along the way? There are two splits. The development split has 46 cases across five suites. Four follow the structure of AgentDojo's suites (workspace, banking, travel, slack), some follow InjecAgent's data-stealing shape, and one replays the GitHub MCP leak. The suite policies were frozen after the dev split, and the test split was written against them: 26 cases so far, in the banking and workspace suites only. The taxonomy plans 33 more test cases for travel, slack and github, which are not written yet, so the target of 40 or more is still open. Each case is a user task, the grant that task needs, and a fixed list of benign and injected `tools/call` requests. The runner replays every list in five arms, from no attenuo to attenuo as configured, through the real server and proxy. [The README](../../evaluation/injection-suite/README.md) describes the method.
 
 ## Numbers
 
@@ -13,15 +13,15 @@ Attack calls allowed and benign calls denied, with Wilson 95% intervals. The int
 
 | Arm | Dev: attack allowed | Dev: benign denied | Test: attack allowed | Test: benign denied |
 |---|---:|---:|---:|---:|
-| No onbehalf (direct to the upstream) | 60/60 (94-100%) | 0/69 (0-5%) | 38/38 (91-100%) | 0/29 (0-12%) |
+| No attenuo (direct to the upstream) | 60/60 (94-100%) | 0/69 (0-5%) | 38/38 (91-100%) | 0/29 (0-12%) |
 | Scope-only tokens (tool names only, permit-all policy) | 41/60 (56-79%) | 0/69 (0-5%) | 23/38 (45-74%) | 0/29 (0-12%) |
 | Constrained tokens, permit-all policy | 25/60 (30-54%) | 0/69 (0-5%) | 16/38 (28-58%) | 0/29 (0-12%) |
 | Suite policy, root token (no attenuation) | 20/60 (23-46%) | 3/69 (1-12%) | 11/38 (17-45%) | 3/29 (4-26%) |
-| onbehalf (constrained tokens, suite Cedar policy, leases) | 10/60 (9-28%) | 3/69 (1-12%) | 7/38 (9-33%) | 3/29 (4-26%) |
+| attenuo (constrained tokens, suite Cedar policy, leases) | 10/60 (9-28%) | 3/69 (1-12%) | 7/38 (9-33%) | 3/29 (4-26%) |
 
-On the test split, onbehalf refused 31 of 38 attack calls: 4 at the name check, 12 by the token's capabilities, 9 by the suite policy, 2 by refused delegations and 4 by leases. All 4 lease denials, and 1 of the 2 refused delegations, happened only because the case scripted a user revocation. Every test call matched the outcome written down before the first run.
+On the test split, attenuo refused 31 of 38 attack calls: 4 at the name check, 12 by the token's capabilities, 9 by the suite policy, 2 by refused delegations and 4 by leases. All 4 lease denials, and 1 of the 2 refused delegations, happened only because the case scripted a user revocation. Every test call matched the outcome written down before the first run.
 
-The dev numbers are unchanged from the first run. With onbehalf on the dev split, by stage:
+The dev numbers are unchanged from the first run. With attenuo on the dev split, by stage:
 
 | Suite | Cases | Attack calls | Capability | Policy | Lease | Allowed | Benign denied |
 |---|---:|---:|---:|---:|---:|---:|---:|
@@ -32,11 +32,11 @@ The dev numbers are unchanged from the first run. With onbehalf on the dev split
 | workspace | 12 | 13 | 7 | 3 | 1 | 2 | 2 of 16 |
 | **all** | 46 | 60 | 32 | 15 | 3 | 10 | 3 of 69 |
 
-The 3 lease denials happened only because the case scripted a user revocation. Without them, 47 of 60 attack calls were refused automatically. No denied call reached an upstream: the upstream logs were checked after every call. Every decision was found in the audit log under its id, with the same decision and reason. `onbehalf audit verify` passed, and so did an offline verify of the exported log.
+The 3 lease denials happened only because the case scripted a user revocation. Without them, 47 of 60 attack calls were refused automatically. No denied call reached an upstream: the upstream logs were checked after every call. Every decision was found in the audit log under its id, with the same decision and reason. `attenuo audit verify` passed, and so did an offline verify of the exported log.
 
 Scope-only tokens stop 19 attack calls: 16 that use a tool the task's grant does not include (14 in the class S cases, plus one each in `github-01` and `travel-06`), and the 3 scripted revocations. The other 31 refusals, the gap between 41 and 10 allowed, need more than tool names. Argument constraints in the token account for 16, and the suite policy for 15. The policy also accounts for all 3 lost benign calls.
 
-## What onbehalf did not stop
+## What attenuo did not stop
 
 ### Dev split
 
@@ -59,7 +59,7 @@ Seven attack calls went through, in three taxonomy classes:
 
 The first class is partly fixable in the policy language and the catalog: exact-match lists instead of suffix globs, and refusing undeclared arguments. Path resolution belongs to the upstream. The other two need information-flow tracking or rate and count limits.
 
-These are the cases the [threat model](../spec/threat-model.md) already says onbehalf does not prevent: permitted-but-harmful calls and information flow. Closing them needs information-flow labels, rate or count limits, or a human confirmation step for selected calls. None of these exists today.
+These are the cases the [threat model](../spec/threat-model.md) already says attenuo does not prevent: permitted-but-harmful calls and information flow. Closing them needs information-flow labels, rate or count limits, or a human confirmation step for selected calls. None of these exists today.
 
 ## What it cost
 

@@ -15,9 +15,9 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
-from onbehalf import AdminClient, AsyncAdminClient, Client, DpopKey, OnbehalfError, Unauthorized
-from onbehalf.dpop import access_token_hash, jwk_thumbprint
-from onbehalf.mcp import TokenAuth
+from attenuo import AdminClient, AsyncAdminClient, AttenuoError, Client, DpopKey, Unauthorized
+from attenuo.dpop import access_token_hash, jwk_thumbprint
+from attenuo.mcp import TokenAuth
 
 from .helpers import Signer, token_response
 from .test_client import Recorder, call, make, rpc_ok  # noqa: F401  (pytest fixture)
@@ -77,9 +77,9 @@ def test_keys_round_trip_and_sign_both_algorithms(tmp_path: Any) -> None:
         assert claims["htu"] == f"{BASE}/mcp/github"
         assert claims["ath"] == access_token_hash("tok")
         assert abs(claims["iat"] - time.time()) < 5 and claims["jti"]
-    with pytest.raises(OnbehalfError):
+    with pytest.raises(AttenuoError):
         DpopKey(ed.public_jwk)
-    with pytest.raises(OnbehalfError):
+    with pytest.raises(AttenuoError):
         DpopKey({**ed.private_jwk(), "x": DpopKey.generate().public_jwk["x"]})
 
 
@@ -126,7 +126,7 @@ async def test_client_attaches_proofs_and_binds_on_exchange(make: Any) -> None: 
     assert claims["ath"] == access_token_hash(other)
     # SR-40: the sign-off names the new token's key and agent.
     assert claims["child_jkt"] == key.thumbprint and claims["child_actor"] == "coder"
-    with pytest.raises(OnbehalfError):
+    with pytest.raises(AttenuoError):
         await call(client, "exchange", other, "coder", ["github:read_file"], subject_dpop_key=key)
 
     # A sign-off made by the parent's holder elsewhere is passed through as it is.
@@ -135,7 +135,7 @@ async def test_client_attaches_proofs_and_binds_on_exchange(make: Any) -> None: 
         client, "exchange", other, "coder", ["github:read_file"], subject_token_dpop=detached
     )
     assert rec.body()["subject_token_dpop"] == detached
-    with pytest.raises(OnbehalfError):
+    with pytest.raises(AttenuoError):
         await call(
             client,
             "exchange",

@@ -1,7 +1,7 @@
 [book]
-title = "onbehalf"
+title = "attenuo"
 description = "Authorization and enforcement plane for AI agents: delegation chains, per-call policy, leases and a tamper-evident audit log."
-authors = ["The onbehalf contributors"]
+authors = ["The attenuo contributors"]
 language = "en"
 src = "docs"
 
@@ -10,9 +10,9 @@ build-dir = "book"
 create-missing = false
 
 [output.html]
-git-repository-url = "https://github.com/7Mudit/onbehalf"
-edit-url-template = "https://github.com/7Mudit/onbehalf/edit/main/{path}"
-site-url = "/onbehalf/"
+git-repository-url = "https://github.com/7Mudit/attenuo"
+edit-url-template = "https://github.com/7Mudit/attenuo/edit/main/{path}"
+site-url = "/attenuo/"
 default-theme = "light"
 preferred-dark-theme = "navy"
 additional-js = ["book-theme/mermaid-init.js"]

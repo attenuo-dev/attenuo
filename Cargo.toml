@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/onbehalf-core",
-    "crates/onbehalf-token",
-    "crates/onbehalf-policy",
-    "crates/onbehalf-audit",
-    "crates/onbehalf-proxy",
-    "crates/onbehalf-server",
-    "crates/onbehalf-cli",
-    "crates/onbehalf-bench",
+    "crates/attenuo-core",
+    "crates/attenuo-token",
+    "crates/attenuo-policy",
+    "crates/attenuo-audit",
+    "crates/attenuo-proxy",
+    "crates/attenuo-server",
+    "crates/attenuo-cli",
+    "crates/attenuo-bench",
 ]
 # The cargo-fuzz targets build only on nightly (sanitizer flags) and keep their own lockfile;
 # see docs/design/fuzzing.md.
@@ -18,15 +18,15 @@ exclude = ["fuzz"]
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/7Mudit/onbehalf"
+repository = "https://github.com/7Mudit/attenuo"
 rust-version = "1.89"
 
 [workspace.dependencies]
-onbehalf-core = { path = "crates/onbehalf-core" }
-onbehalf-token = { path = "crates/onbehalf-token" }
-onbehalf-policy = { path = "crates/onbehalf-policy" }
-onbehalf-audit = { path = "crates/onbehalf-audit" }
-onbehalf-proxy = { path = "crates/onbehalf-proxy" }
+attenuo-core = { path = "crates/attenuo-core" }
+attenuo-token = { path = "crates/attenuo-token" }
+attenuo-policy = { path = "crates/attenuo-policy" }
+attenuo-audit = { path = "crates/attenuo-audit" }
+attenuo-proxy = { path = "crates/attenuo-proxy" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }

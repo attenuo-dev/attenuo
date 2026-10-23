@@ -1,6 +1,6 @@
 # Specifications and the RFC process
 
-This folder holds the documents that define what onbehalf is on the wire and at its boundaries: the RFCs, the threat model, and the protocol and API specifications. Markdown in this folder is the source of truth; anything rendered elsewhere is derived from it.
+This folder holds the documents that define what attenuo is on the wire and at its boundaries: the RFCs, the threat model, and the protocol and API specifications. Markdown in this folder is the source of truth; anything rendered elsewhere is derived from it.
 
 ## What needs an RFC
 
@@ -9,13 +9,13 @@ An RFC is a design document. One is required before implementing any change that
 - the **token format**: claims, encoding, signature scheme, attenuation rules, expiry and revocation semantics;
 - the **policy request shape**: what the policy engine is asked, the entity and context schema, how decisions are returned;
 - the **audit schema**: the record layout, the hash chain, what is and is not recorded;
-- the **public API**: HTTP routes and payloads of `onbehalf-server`, the public items of the published crates, CLI flags and configuration keys.
+- the **public API**: HTTP routes and payloads of `attenuo-server`, the public items of the published crates, CLI flags and configuration keys.
 
 Everything else (bug fixes, refactors, performance work, internal module changes, new tests, docs) does not need an RFC. If a change needs a decision but does not touch the list above, write an ADR instead (see [`../decisions/README.md`](../decisions/)). When in doubt, open an issue and ask; a maintainer will say which it is.
 
 ## Numbering and naming
 
-RFCs are numbered sequentially with four digits: `rfc-NNNN-short-title.md`. `rfc-0001-onbehalf.md` is the founding RFC and describes the system as a whole. Take the next free number when you open the PR; if two RFCs collide, the second to merge renumbers.
+RFCs are numbered sequentially with four digits: `rfc-NNNN-short-title.md`. `rfc-0001-attenuo.md` is the founding RFC and describes the system as a whole. Take the next free number when you open the PR; if two RFCs collide, the second to merge renumbers.
 
 ## Statuses
 
@@ -55,12 +55,12 @@ draft ──► accepted ──► implemented ──► superseded
 5. Merge with `Status: accepted` (or `rejected`). Create a tracking issue that lists the implementation PRs.
 6. When the feature ships in a release, a small PR flips the status to `implemented` and records the version.
 
-Security-sensitive RFCs (anything under the token format or audit schema headings) additionally require the Security considerations section to name the property or integration tests that will guard the invariant, as [`CONTRIBUTING.md`](https://github.com/7Mudit/onbehalf/blob/main/CONTRIBUTING.md) requires for code.
+Security-sensitive RFCs (anything under the token format or audit schema headings) additionally require the Security considerations section to name the property or integration tests that will guard the invariant, as [`CONTRIBUTING.md`](https://github.com/7Mudit/attenuo/blob/main/CONTRIBUTING.md) requires for code.
 
 ## Index
 
 | RFC | Title | Status |
 | --- | --- | --- |
-| [0001](rfc-0001-onbehalf.md) | onbehalf: delegated authorization for agents | draft |
+| [0001](rfc-0001-attenuo.md) | attenuo: delegated authorization for agents | draft |
 
 Add a row for each new RFC.

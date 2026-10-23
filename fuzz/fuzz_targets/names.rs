@@ -1,10 +1,10 @@
-//! The name rules of `onbehalf_core::names`: never panic, and the accepted sets nest the way
+//! The name rules of `attenuo_core::names`: never panic, and the accepted sets nest the way
 //! the module documents (a server name is a tool name is a call name; every accepted name is
 //! short, ASCII and free of the separators).
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use onbehalf_core::names::{
+use attenuo_core::names::{
     check_call_name, check_call_pattern, check_server_name, check_server_pattern, check_tool_name,
     is_name_char, MAX_NAME_LEN,
 };

@@ -10,12 +10,12 @@ use std::sync::OnceLock;
 
 use arbitrary::{Arbitrary, Result, Unstructured};
 use libfuzzer_sys::fuzz_target;
-use onbehalf_core::{
+use attenuo_core::{
     AgentId, Capability, CapabilitySet, Decision, DelegationChain, LeaseId, OriginatingUser,
     ToolCall,
 };
-use onbehalf_fuzz::{edge_string, json_value};
-use onbehalf_policy::{
+use attenuo_fuzz::{edge_string, json_value};
+use attenuo_policy::{
     ArgType, PolicyEngine, PolicyEngineBuilder, ToolAttrs, ToolCatalog, UnknownTools,
     DEFAULT_POLICIES,
 };
@@ -132,17 +132,17 @@ impl<'a> Arbitrary<'a> for Input {
 }
 
 const REASONS: &[&str] = &[
-    onbehalf_policy::REASON_INVALID_NAME,
-    onbehalf_policy::REASON_CAPABILITY_DENIED,
-    onbehalf_policy::REASON_TOOL_NOT_IN_CATALOG,
-    onbehalf_policy::REASON_ATTRIBUTE_TYPE_MISMATCH,
-    onbehalf_policy::REASON_POLICY_ALLOW,
-    onbehalf_policy::REASON_POLICY_DENY,
-    onbehalf_policy::REASON_POLICY_ERROR,
+    attenuo_policy::REASON_INVALID_NAME,
+    attenuo_policy::REASON_CAPABILITY_DENIED,
+    attenuo_policy::REASON_TOOL_NOT_IN_CATALOG,
+    attenuo_policy::REASON_ATTRIBUTE_TYPE_MISMATCH,
+    attenuo_policy::REASON_POLICY_ALLOW,
+    attenuo_policy::REASON_POLICY_DENY,
+    attenuo_policy::REASON_POLICY_ERROR,
 ];
 
 fuzz_target!(|input: Input| {
-    let f = onbehalf_fuzz::fixture();
+    let f = attenuo_fuzz::fixture();
     let engine = &engines()[input.engine];
     let user = OriginatingUser {
         subject: "user:mudit".into(),
@@ -173,7 +173,7 @@ fuzz_target!(|input: Input| {
         out.reason
     );
     if out.decision == Decision::Allow {
-        assert_eq!(out.reason, onbehalf_policy::REASON_POLICY_ALLOW);
+        assert_eq!(out.reason, attenuo_policy::REASON_POLICY_ALLOW);
         assert!(call.check_names().is_ok());
         assert!(chain.effective_capabilities().unwrap().permits(&call));
     }
@@ -182,7 +182,7 @@ fuzz_target!(|input: Input| {
 
     if let Some(bytes) = input.authzen {
         if let Ok(req) =
-            serde_json::from_slice::<onbehalf_policy::authzen::EvaluationRequest>(&bytes)
+            serde_json::from_slice::<attenuo_policy::authzen::EvaluationRequest>(&bytes)
         {
             let _ = engine.evaluate(&req, f.now);
         }
