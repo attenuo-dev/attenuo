@@ -8,6 +8,10 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ## [Unreleased]
 
+### Performance
+
+- Investigated the proxy's upstream round trip and the `blocking_pool` stage (`perf/proxy-upstream-hop`); no code change. The upstream client already shares one keep-alive pooled `reqwest::Client` and sends each request in one write; the gap to a direct call is CPU wake-up latency between calls on the test VM. Running decisions inline removed the blocking-pool hop but moved the time into the `upstream` stage and cut 8-client throughput, so decisions stay on the blocking pool. Details in `docs/design/performance.md`.
+
 ### Added
 
 - Token refresh in both SDKs. Python: `TokenRefresher` (a context manager running a thread) and `AsyncTokenRefresher` (an `asyncio` task), plus `RefreshError`. TypeScript: `TokenRefresher` with `start()` returning a disposer, `provider` and `fetch()` for the MCP transport (the per-request token hook, on top of `mcpFetch`), plus `RefreshError`. Each renews the lease at a third of the lease interval, calls a caller-supplied `exchange` function before `exp` (margin default 20% of the lifetime, at least 5 s), exposes the current token with a change callback, retries with jittered backoff, and stops with a terminal error callback on `lease_revoked`, a permanent refusal or expiry. A replacement token must carry the same DPoP `cnf.jkt` as the one it replaces. Tokens are never logged. The exchange function must bring a fresh subject token each time, because a parent delegates to a given actor once.
