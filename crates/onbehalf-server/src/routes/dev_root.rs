@@ -60,6 +60,21 @@ pub async fn mint_root(
 }
 
 fn mint_root_sync(state: &AppState, req: RootTokenRequest) -> Result<Response, ApiError> {
+    // The server's own audit records use these names (SR-34).
+    if super::is_reserved_subject(&req.subject) {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "subject uses a prefix reserved for the server's own records",
+        )
+        .with_description("reserved_subject"));
+    }
+    if req.agent == super::AUDIT_SERVER {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "agent id `onbehalf` is reserved for the server's own records",
+        )
+        .with_description("reserved_agent"));
+    }
     let (capabilities, grant_attributes, may_act) = resolve_grant(&state.root_grants, &req)?;
     let attributes = merge_attributes(grant_attributes, &req.attributes)?;
 
@@ -115,8 +130,8 @@ fn mint_root_sync(state: &AppState, req: RootTokenRequest) -> Result<Response, A
         return Err(e);
     }
     tracing::warn!(
-        subject = %req.subject,
-        agent = %req.agent,
+        subject = ?req.subject,
+        agent = ?req.agent,
         lease = %issued.lease.0,
         "dev root token minted (no user credential verified)"
     );

@@ -133,13 +133,15 @@ impl Pipeline {
             .time_audit_append(|| self.audit.append(record.clone()))
         {
             Ok(entry) => {
+                // Subject, agent, server and tool come from the caller: Debug-format them so
+                // a newline cannot forge a log line (SR-18).
                 tracing::info!(
                     decision = ?record.decision,
-                    reason = %record.reason,
-                    subject = %record.originating_subject,
-                    agent = %chain.current_agent().map(|a| a.0.as_str()).unwrap_or(""),
-                    server = %call.server,
-                    tool = %call.tool,
+                    reason = ?record.reason,
+                    subject = ?record.originating_subject,
+                    agent = ?chain.current_agent().map(|a| a.0.as_str()).unwrap_or(""),
+                    server = ?call.server,
+                    tool = ?call.tool,
                     seq = entry.seq,
                     "decision"
                 );
@@ -182,15 +184,19 @@ impl Pipeline {
         let record = DecisionRecord::new(now, Decision::Deny, reason, chain, call, Vec::new());
         let id = record.id;
         match self.metrics.time_audit_append(|| self.audit.append(record)) {
+            // Caller-controlled strings are Debug-formatted so they cannot forge log lines
+            // (SR-18).
             Ok(entry) => tracing::info!(
-                reason,
-                subject = %chain.originating_user.subject,
-                server = %call.server,
-                tool = %call.tool,
+                reason = ?reason,
+                subject = ?chain.originating_user.subject,
+                server = ?call.server,
+                tool = ?call.tool,
                 seq = entry.seq,
                 "request rejected"
             ),
-            Err(e) => tracing::error!(error = %e, reason, "audit append failed for a rejection"),
+            Err(e) => {
+                tracing::error!(error = %e, reason = ?reason, "audit append failed for a rejection")
+            }
         }
         id
     }
@@ -266,7 +272,13 @@ impl Authorizer for ServerAuthorizer {
         self.verifier
             .verify(bearer, now)
             .map(|v| v.chain)
-            .map_err(|e| AuthError::InvalidToken(e.to_string()))
+            .map_err(|e| {
+                if crate::error::is_expiry(&e) {
+                    AuthError::TokenExpired
+                } else {
+                    AuthError::InvalidToken(e.to_string())
+                }
+            })
     }
 
     async fn check_active(
@@ -278,7 +290,7 @@ impl Authorizer for ServerAuthorizer {
         on_blocking_pool(&self.pipeline, move |p| p.check_leases(&chain, now))
             .await
             .map_err(|(reason, detail)| {
-                tracing::warn!(reason, detail = %detail.join("; "), "lease check failed");
+                tracing::warn!(reason, detail = ?detail.join("; "), "lease check failed");
                 AuthError::LeaseInactive(reason.to_string())
             })
     }

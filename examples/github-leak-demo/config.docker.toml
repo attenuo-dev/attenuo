@@ -5,6 +5,9 @@
 
 [server]
 listen = "0.0.0.0:8080"
+# Required off loopback: discovery URLs are built from this, never from the Host header.
+# The URL clients on the host use (compose publishes the port on 127.0.0.1 only).
+public_url = "http://127.0.0.1:8080"
 
 [issuer]
 issuer = "http://127.0.0.1:8080"

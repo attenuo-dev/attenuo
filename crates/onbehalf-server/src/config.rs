@@ -102,6 +102,12 @@ pub struct AuthzenSection {
     /// audited. Must be at least 1.
     #[serde(default = "default_max_batch")]
     pub max_batch: usize,
+    /// Who gets `context.diagnostics` (the effective capabilities a call fell outside, lease
+    /// ids, Cedar evaluation errors) in evaluation responses: `"peps"` (default; only callers
+    /// that authenticated as a `[[peps]]` entry), `"always"` or `"never"`. Everyone else gets
+    /// an empty list; the reason code, policy ids and decision id are always returned (SR-17).
+    #[serde(default)]
+    pub diagnostics: AuthzenDiagnostics,
 }
 
 impl Default for AuthzenSection {
@@ -109,6 +115,32 @@ impl Default for AuthzenSection {
         Self {
             allow_unsigned_chain: false,
             max_batch: default_max_batch(),
+            diagnostics: AuthzenDiagnostics::default(),
+        }
+    }
+}
+
+/// `[authzen] diagnostics`: who sees `context.diagnostics`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthzenDiagnostics {
+    /// Every caller, including one that only holds a delegation token.
+    Always,
+    /// Only a caller that authenticated as a `[[peps]]` entry (HTTP Basic, or `pep_id` and
+    /// `pep_secret` in the body, which may accompany a bearer token).
+    #[default]
+    Peps,
+    /// Nobody.
+    Never,
+}
+
+impl AuthzenDiagnostics {
+    /// Should a caller get diagnostics, given whether it authenticated as a PEP?
+    pub fn allows(self, authenticated_pep: bool) -> bool {
+        match self {
+            AuthzenDiagnostics::Always => true,
+            AuthzenDiagnostics::Peps => authenticated_pep,
+            AuthzenDiagnostics::Never => false,
         }
     }
 }
@@ -266,10 +298,69 @@ pub struct ServerSection {
     /// Address to bind. Default `127.0.0.1:8080`.
     #[serde(default = "default_listen")]
     pub listen: SocketAddr,
-    /// Externally visible base URL (e.g. `https://onbehalf.example.com`), used in discovery
-    /// documents. When absent, the request's `Host` header is used with `http://`.
+    /// Externally visible base URL (e.g. `https://onbehalf.example.com`), the only source of
+    /// the URLs in discovery documents. Required when `listen` is not a loopback address (the
+    /// server refuses to start without it, SR-19). On loopback it may be left out: discovery
+    /// then uses `http://<Host>`, and only a `Host` of `localhost`, `127.0.0.1` or `[::1]`
+    /// (with an optional port) is accepted.
     #[serde(default)]
     pub public_url: Option<String>,
+}
+
+impl ServerSection {
+    /// Startup check (SR-19): `public_url`, when set, is an absolute `http(s)://` URL with a
+    /// host; when unset, `listen` must be a loopback address, because discovery would
+    /// otherwise build its URLs from a `Host` header any client can choose.
+    pub fn check_public_url(&self) -> anyhow::Result<()> {
+        match self.public_url.as_deref() {
+            Some(url) => {
+                let rest = url
+                    .strip_prefix("https://")
+                    .or_else(|| url.strip_prefix("http://"))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "[server] public_url = {url:?} must start with https:// or http://"
+                        )
+                    })?;
+                let host = rest.split('/').next().unwrap_or_default();
+                let bad_char =
+                    |c: char| c.is_whitespace() || c.is_control() || c == '?' || c == '#';
+                if host.is_empty() || url.chars().any(bad_char) {
+                    anyhow::bail!(
+                        "[server] public_url = {url:?} must be a base URL such as \
+                         https://onbehalf.example.com (a host, no query or fragment)"
+                    );
+                }
+                Ok(())
+            }
+            None if self.listen.ip().is_loopback() => Ok(()),
+            None => anyhow::bail!(
+                "[server] listen = {} is not a loopback address and [server] public_url is not \
+                 set. Set public_url to the URL clients use (for example \
+                 https://onbehalf.example.com): without it the AuthZEN discovery document would \
+                 be built from the request's Host header, which any client can choose.",
+                self.listen
+            ),
+        }
+    }
+}
+
+/// Is `host` (a `Host` header value) a loopback name, `localhost`, `127.0.0.1` or `[::1]`,
+/// with an optional numeric port? Discovery accepts only these when `[server] public_url` is
+/// unset (SR-19).
+pub fn is_loopback_host(host: &str) -> bool {
+    let (name, port) = match host.strip_prefix("[::1]") {
+        Some(rest) => ("[::1]", rest),
+        None => match host.find(':') {
+            Some(i) => host.split_at(i),
+            None => (host, ""),
+        },
+    };
+    let port_ok = match port.strip_prefix(':') {
+        None => port.is_empty(),
+        Some(p) => !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()),
+    };
+    port_ok && (name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1" || name == "[::1]")
 }
 
 impl Default for ServerSection {
@@ -826,7 +917,8 @@ pub fn check_server_name(name: &str) -> Result<(), String> {
 impl Config {
     /// Reject server names that contain `/`, are empty or are the reserved `onbehalf` in
     /// `[[upstreams]]`, the tool catalog (inline and `catalog_path`) and `[[root_grants]]`
-    /// capabilities.
+    /// capabilities, and the agent id `onbehalf` in `[[agents]]`, `[[peps]]` and
+    /// `[[root_grants]]` (SR-34).
     pub fn check_server_names(&self) -> anyhow::Result<()> {
         for u in &self.upstreams {
             check_server_name(&u.name).map_err(|e| anyhow::anyhow!("[[upstreams]]: {e}"))?;
@@ -838,7 +930,24 @@ impl Config {
         catalog
             .validate()
             .map_err(|e| anyhow::anyhow!("[policy] catalog: {e}"))?;
+        // An agent called `onbehalf` would put its own name next to the server's in audit
+        // records (`agents` beside `server = "onbehalf"`); refuse it with the server names.
+        let reserved_agent = |section: &str, id: &str| {
+            if id == crate::routes::AUDIT_SERVER {
+                anyhow::bail!(
+                    "{section}: agent id `{id}` is reserved for the server's own records"
+                );
+            }
+            Ok(())
+        };
+        for a in &self.agents {
+            reserved_agent("[[agents]]", &a.id)?;
+        }
+        for p in &self.peps {
+            reserved_agent("[[peps]]", &p.id)?;
+        }
         for g in &self.root_grants {
+            reserved_agent("[[root_grants]]", &g.agent)?;
             for cap in capability_set(&g.capabilities)
                 .map_err(|e| anyhow::anyhow!(e))?
                 .iter()
@@ -1237,6 +1346,44 @@ mod tests {
         ))
         .unwrap();
         assert!(docker.check_admin_token().is_err());
+    }
+
+    /// SR-19: the loopback `Host` names discovery accepts without `public_url`.
+    #[test]
+    fn loopback_hosts_sr19() {
+        for ok in [
+            "localhost",
+            "LOCALHOST:8080",
+            "127.0.0.1",
+            "127.0.0.1:65535",
+            "[::1]",
+            "[::1]:8080",
+        ] {
+            assert!(is_loopback_host(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "evil.example",
+            "localhost.evil.example",
+            "127.0.0.1.evil",
+            "127.0.0.2",
+            "localhost:",
+            "localhost:123456",
+            "localhost:8080:1",
+            "[::1]:",
+            "[::1]x",
+            "::1",
+            "user@localhost",
+        ] {
+            assert!(!is_loopback_host(bad), "{bad}");
+        }
+        // The docker demo listens on all interfaces, so it names its public URL.
+        let docker = Config::from_toml(include_str!(
+            "../../../examples/github-leak-demo/config.docker.toml"
+        ))
+        .unwrap();
+        docker.server.check_public_url().unwrap();
+        assert!(Config::default().server.check_public_url().is_ok());
     }
 
     #[test]

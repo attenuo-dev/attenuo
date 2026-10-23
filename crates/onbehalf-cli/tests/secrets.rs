@@ -173,12 +173,10 @@ fn admin_token_flag_still_works_and_warns_once_on_stderr() {
 fn client_secret_from_stdin_and_file_goes_in_the_exchange_body() {
     let exchange = |extra: &[&str]| {
         let mut c = onbehalf();
-        c.args(["--server"]);
+        c.env("ONBEHALF_TOKEN", "PARENT").args(["--server"]);
         let mut v: Vec<String> = vec![
             "token".into(),
             "exchange".into(),
-            "--subject-token".into(),
-            "PARENT".into(),
             "--actor".into(),
             "coder".into(),
             "--cap".into(),
@@ -351,4 +349,209 @@ fn bad_secret_sources_fail_before_any_request() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
+}
+
+const RPC_OK: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[]}}"#;
+
+fn warnings(out: &Output) -> Vec<String> {
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .filter(|l| l.starts_with("warning:"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// SR-35 (remaining part): the delegation token of `call` (and `tools`, `authzen eval`) comes
+/// from `--token -` (stdin), `--token-file` or `ONBEHALF_TOKEN` without a warning; the plain
+/// flag still works and warns once.
+#[test]
+fn delegation_token_from_stdin_a_file_or_the_environment() {
+    let call = |url: &str| {
+        let mut c = onbehalf();
+        c.args([
+            "--server",
+            url,
+            "call",
+            "--server",
+            "github",
+            "--tool",
+            "read_file",
+        ]);
+        c
+    };
+
+    let (url, server) = fake_server(RPC_OK);
+    let mut cmd = call(&url);
+    cmd.args(["--token", "-"]);
+    let out = run_with_stdin(cmd, "stdin.jwt.token\nignored\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(server
+        .join()
+        .unwrap()
+        .contains("Bearer stdin.jwt.token\r\n"));
+    assert!(warnings(&out).is_empty(), "{:?}", warnings(&out));
+
+    // The file wins over the environment, and the two do not conflict.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("token");
+    std::fs::write(&path, "file.jwt.token\n").unwrap();
+    let (url, server) = fake_server(RPC_OK);
+    let out = call(&url)
+        .env("ONBEHALF_TOKEN", "env.jwt.token")
+        .arg("--token-file")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(server.join().unwrap().contains("Bearer file.jwt.token\r\n"));
+    assert!(warnings(&out).is_empty());
+
+    let (url, server) = fake_server(RPC_OK);
+    let out = call(&url)
+        .env("ONBEHALF_TOKEN", "env.jwt.token")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(server.join().unwrap().contains("Bearer env.jwt.token\r\n"));
+    assert!(warnings(&out).is_empty());
+
+    let (url, server) = fake_server(RPC_OK);
+    let out = call(&url)
+        .args(["--token", "flag.jwt.token"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(server.join().unwrap().contains("Bearer flag.jwt.token\r\n"));
+    let w = warnings(&out);
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("--token") && w[0].contains("ONBEHALF_TOKEN"));
+    assert!(!w[0].contains("flag.jwt.token"));
+
+    // None of them: an error that names the alternatives, before any request.
+    let out = call("http://127.0.0.1:1").output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ONBEHALF_TOKEN"));
+}
+
+/// SR-35: `--subject-token -` reads the parent token from stdin; the client secret then comes
+/// from a file, since stdin can only be read once.
+#[test]
+fn subject_token_from_stdin_goes_in_the_exchange_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret = dir.path().join("secret");
+    std::fs::write(&secret, "file-client-secret\n").unwrap();
+    let (url, server) = fake_server(TOKEN);
+    let mut cmd = onbehalf();
+    cmd.args([
+        "--server",
+        &url,
+        "token",
+        "exchange",
+        "--subject-token",
+        "-",
+        "--actor",
+        "coder",
+        "--cap",
+        "github:read_file",
+        "--client-secret-file",
+    ])
+    .arg(&secret);
+    let out = run_with_stdin(cmd, "PARENT.FROM.STDIN\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let req = server.join().unwrap();
+    assert!(
+        req.contains(r#""subject_token":"PARENT.FROM.STDIN""#),
+        "{req}"
+    );
+    assert!(warnings(&out).is_empty());
+
+    let path = dir.path().join("parent");
+    std::fs::write(&path, "PARENT.FROM.FILE\n").unwrap();
+    let (url, server) = fake_server(TOKEN);
+    let out = onbehalf()
+        .env("ONBEHALF_CLIENT_SECRET", "env-secret")
+        .args([
+            "--server",
+            &url,
+            "token",
+            "exchange",
+            "--subject-token-file",
+        ])
+        .arg(&path)
+        .args(["--actor", "coder", "--cap", "github:read_file"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let req = server.join().unwrap();
+    assert!(
+        req.contains(r#""subject_token":"PARENT.FROM.FILE""#),
+        "{req}"
+    );
+    assert!(req.contains(r#""client_secret":"env-secret""#), "{req}");
+
+    // Parent token and client secret cannot both come from stdin.
+    let mut cmd = onbehalf();
+    cmd.args([
+        "--server",
+        "http://127.0.0.1:1",
+        "token",
+        "exchange",
+        "--subject-token",
+        "-",
+        "--actor",
+        "c",
+        "--cap",
+        "g:t",
+        "--client-secret-stdin",
+    ]);
+    let out = run_with_stdin(cmd, "one\n");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("already read"));
+}
+
+/// The environment variable and a `--…-file` flag used to be a clap conflict (clap counts an
+/// environment value as given); now the file simply wins.
+#[test]
+fn a_file_flag_overrides_the_environment_instead_of_conflicting() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("admin");
+    std::fs::write(&path, "file-admin-secret\n").unwrap();
+    let (url, server) = fake_server(LEASE);
+    let out = onbehalf()
+        .env("ONBEHALF_ADMIN_TOKEN", "env-admin-secret")
+        .args(["--server", &url, "--admin-token-file"])
+        .arg(&path)
+        .args(["lease", "show", "L"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(server.join().unwrap().contains("Bearer file-admin-secret"));
 }

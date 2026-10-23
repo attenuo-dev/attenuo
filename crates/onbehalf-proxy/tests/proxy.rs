@@ -185,15 +185,22 @@ async fn missing_or_invalid_token_is_401() -> anyhow::Result<()> {
     assert!(resp.headers().contains_key("www-authenticate"));
     let body: Value = resp.json().await?;
     assert_eq!(body["error"]["code"], CODE_UNAUTHORIZED);
+    assert_eq!(body["error"]["data"]["reason"], "missing_token");
     assert!(body["error"]["message"]
         .as_str()
         .unwrap()
-        .contains("missing bearer token"));
+        .contains("missing_token"));
 
     let resp = h.rpc(Some("not-a-token"), &call).await?;
     assert_eq!(resp.status(), 401);
     let body: Value = resp.json().await?;
     assert_eq!(body["error"]["code"], CODE_UNAUTHORIZED);
+    // Only the reason code: the verifier's own words stay in the log (SR-17).
+    assert_eq!(body["error"]["data"]["reason"], "invalid_token");
+    assert_eq!(
+        body["error"]["message"],
+        "onbehalf: unauthorized: invalid_token"
+    );
 
     // Even initialize is not forwarded without a token.
     let resp = h
@@ -525,6 +532,7 @@ async fn expired_chain_is_rejected_at_authentication() -> anyhow::Result<()> {
         .await?;
     assert_eq!(resp.status(), 401);
     let body: Value = resp.json().await?;
+    assert_eq!(body["error"]["data"]["reason"], "token_expired");
     assert!(body["error"]["message"]
         .as_str()
         .unwrap()

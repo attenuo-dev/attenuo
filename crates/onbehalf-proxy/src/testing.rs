@@ -457,7 +457,10 @@ impl Authorizer for StaticAuthorizer {
             .ok_or_else(|| AuthError::InvalidToken("unknown token".into()))?;
         chain
             .validate_at(now, onbehalf_core::chain::DEFAULT_MAX_DEPTH)
-            .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
+            .map_err(|e| match e {
+                onbehalf_core::ChainError::HopExpired { .. } => AuthError::TokenExpired,
+                other => AuthError::InvalidToken(other.to_string()),
+            })?;
         Ok(chain.clone())
     }
 

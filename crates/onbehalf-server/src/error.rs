@@ -7,6 +7,22 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 
+/// 401 reason: no credential was sent.
+pub const REASON_MISSING_TOKEN: &str = onbehalf_proxy::auth::REASON_MISSING_TOKEN;
+/// 401 reason: the credential is malformed, not ours, or fails verification.
+pub const REASON_INVALID_TOKEN: &str = onbehalf_proxy::auth::REASON_INVALID_TOKEN;
+/// 401 reason: the delegation token verified but has expired.
+pub const REASON_TOKEN_EXPIRED: &str = onbehalf_proxy::auth::REASON_TOKEN_EXPIRED;
+
+/// Did verification fail only because the token (or a hop of its chain) has expired?
+pub fn is_expiry(e: &onbehalf_token::TokenError) -> bool {
+    matches!(
+        e,
+        onbehalf_token::TokenError::Expired
+            | onbehalf_token::TokenError::Chain(onbehalf_core::ChainError::HopExpired { .. })
+    )
+}
+
 /// An error a handler returns. `code` is short and machine-readable; `detail` is for humans.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiError {
@@ -41,8 +57,24 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, "not_found", detail)
     }
 
-    pub fn unauthorized(detail: impl Into<String>) -> Self {
-        Self::new(StatusCode::UNAUTHORIZED, "unauthorized", detail)
+    /// A 401 whose body carries only the stable `reason` code, as both `detail` and
+    /// `error_description` (`missing_token`, `invalid_token`, `token_expired`). `internal` (the
+    /// verifier's complaint: wrong audience, unknown `kid` and so on) is logged at debug level
+    /// and never returned (SR-17).
+    pub fn unauthorized(reason: &'static str, internal: impl std::fmt::Display) -> Self {
+        tracing::debug!(reason, detail = ?internal.to_string(), "authentication failed");
+        Self::new(StatusCode::UNAUTHORIZED, "unauthorized", reason).with_description(reason)
+    }
+
+    /// A 401 for a delegation token that did not verify: `token_expired` when it verified but
+    /// has expired, `invalid_token` otherwise.
+    pub fn bad_token(e: &onbehalf_token::TokenError) -> Self {
+        let reason = if is_expiry(e) {
+            REASON_TOKEN_EXPIRED
+        } else {
+            REASON_INVALID_TOKEN
+        };
+        Self::unauthorized(reason, e)
     }
 
     pub fn internal(detail: impl std::fmt::Display) -> Self {
@@ -57,9 +89,10 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         if self.status.is_server_error() {
-            tracing::error!(code = %self.code, detail = %self.detail, "request failed");
+            // `detail` can quote the request (SR-18): Debug-format it.
+            tracing::error!(code = ?self.code, detail = ?self.detail, "request failed");
         } else {
-            tracing::debug!(status = %self.status, code = %self.code, detail = %self.detail, "request rejected");
+            tracing::debug!(status = %self.status, code = ?self.code, detail = ?self.detail, "request rejected");
         }
         let mut body = json!({ "error": self.code, "detail": self.detail });
         if let Some(d) = self.description {

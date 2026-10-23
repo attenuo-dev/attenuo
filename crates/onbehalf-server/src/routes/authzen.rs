@@ -20,6 +20,10 @@
 //!
 //! The response is the AuthZEN `{decision, context}` with `context.reason`,
 //! `context.policy_ids`, `context.diagnostics` and `context.decision_id` (the audit record).
+//! `context.diagnostics` (effective capabilities, lease ids, Cedar errors) is empty unless
+//! `[authzen] diagnostics` allows the caller: by default only a caller that authenticated as a
+//! `[[peps]]` entry gets it. With a bearer token, a PEP authenticates with `pep_id` and
+//! `pep_secret` in the body (SR-17).
 //!
 //! [`Pipeline`]: crate::authz::Pipeline
 
@@ -37,7 +41,7 @@ use serde_json::{json, Value};
 
 use super::{now, parse_json};
 use crate::clientauth::{self, ClientKind};
-use crate::error::ApiError;
+use crate::error::{ApiError, REASON_INVALID_TOKEN, REASON_MISSING_TOKEN};
 use crate::state::AppState;
 
 /// Error code when a body chain does not match what this server issued.
@@ -176,14 +180,15 @@ fn authorization(headers: &HeaderMap) -> Result<Option<(String, &str)>, ApiError
     let Some(raw) = headers.get(header::AUTHORIZATION) else {
         return Ok(None);
     };
-    let raw = raw
-        .to_str()
-        .map_err(|_| ApiError::unauthorized("authorization header is not ASCII"))?;
+    let raw = raw.to_str().map_err(|_| {
+        ApiError::unauthorized(REASON_INVALID_TOKEN, "authorization header is not ASCII")
+    })?;
     match raw.split_once(' ') {
         Some((scheme, value)) if !value.trim().is_empty() => {
             Ok(Some((scheme.to_ascii_lowercase(), value.trim())))
         }
         _ => Err(ApiError::unauthorized(
+            REASON_INVALID_TOKEN,
             "expected `Authorization: Bearer <token>`",
         )),
     }
@@ -214,30 +219,40 @@ fn evaluate_value(
         Some((scheme, _)) if scheme == "basic" => None,
         Some(_) => {
             return Err(ApiError::unauthorized(
+                REASON_INVALID_TOKEN,
                 "expected `Authorization: Bearer <token>`",
             ))
         }
         None => None,
     };
 
-    let pep = match bearer {
+    // `body_chain_pep`: the PEP whose unsigned body chain is used. `pep_authenticated`: the
+    // caller proved it is a `[[peps]]` entry, which decides whether it sees diagnostics.
+    let (body_chain_pep, pep_authenticated) = match bearer {
         Some(token) => {
-            if pep_secret.is_some() {
-                return Err(ApiError::bad_request(
-                    "invalid_request",
-                    "send either a bearer token or PEP credentials, not both",
-                ));
-            }
             let v = state
                 .verifier
                 .verify(token, now)
-                .map_err(|e| ApiError::unauthorized(e.to_string()))?;
+                .map_err(|e| ApiError::bad_token(&e))?;
             attach_chain(&mut req, &v.chain)?;
-            None
+            // A PEP forwarding an agent's token may authenticate itself in the body (the
+            // `Authorization` header holds the bearer) to receive diagnostics.
+            let pep = match pep_secret.as_deref() {
+                Some(secret) => Some(clientauth::authenticate(
+                    ClientKind::Pep,
+                    &state.peps,
+                    headers,
+                    pep_id.as_deref(),
+                    Some(secret),
+                )?),
+                None => None,
+            };
+            (None, pep.is_some())
         }
         None => {
             if !state.authzen_allow_unsigned_chain {
                 return Err(ApiError::unauthorized(
+                    REASON_MISSING_TOKEN,
                     "a delegation token is required: send `Authorization: Bearer <token>` \
                      ([authzen] allow_unsigned_chain is off)",
                 ));
@@ -249,29 +264,37 @@ fn evaluate_value(
                 pep_id.as_deref(),
                 pep_secret.as_deref(),
             )?;
-            Some(id)
+            (Some(id), true)
         }
     };
 
     let (chain_value, call) = authzen::to_chain_and_call(&req)
         .map_err(|e| ApiError::bad_request("invalid_request", e.to_string()))?;
-    if let Some(pep) = pep {
+    if let Some(pep) = body_chain_pep {
         chain_value
             .validate_at(now, state.verifier.max_depth())
             .map_err(|e| ApiError::bad_request("invalid_request", e.to_string()))?;
         check_issued(state, &chain_value).map_err(|detail| {
-            tracing::warn!(pep = %pep, detail = %detail, "AuthZEN body chain was not issued here");
+            tracing::warn!(pep = ?pep, detail = ?detail, "AuthZEN body chain was not issued here");
             ApiError::new(StatusCode::FORBIDDEN, CHAIN_NOT_ISSUED, detail)
         })?;
-        tracing::debug!(pep = %pep, "AuthZEN body chain accepted from an authenticated PEP");
+        tracing::debug!(pep = ?pep, "AuthZEN body chain accepted from an authenticated PEP");
     }
-    let d = state.pipeline.decide(&chain_value, &call, now);
+    let mut d = state.pipeline.decide(&chain_value, &call, now);
+    let allow = d.is_allow();
+    // Diagnostics name effective capabilities, lease ids and Cedar errors: reconnaissance for
+    // anyone holding a token. Only PEPs get them unless configured otherwise (SR-17).
+    let diagnostics = if state.authzen_diagnostics.allows(pep_authenticated) {
+        std::mem::take(&mut d.diagnostics)
+    } else {
+        Vec::new()
+    };
     Ok(EvaluationResponse {
-        decision: d.is_allow(),
+        decision: allow,
         context: Some(json!({
             "reason": d.reason,
             "policy_ids": d.policy_ids,
-            "diagnostics": d.diagnostics,
+            "diagnostics": diagnostics,
             "decision_id": d.decision_id,
         })),
     })

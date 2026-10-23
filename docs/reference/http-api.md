@@ -2,6 +2,8 @@
 
 All routes the server mounts, from the route table in `crates/onbehalf-server/src/lib.rs` and the proxy router. Errors on non-MCP routes look like `{"error": "<code>", "detail": "<text>"}`. The codes for `/token` are listed in [design/server.md](../design/server.md#error-codes).
 
+A 401 for a bearer token (`/token/renew`, AuthZEN, `/admin/*`) is `{"error": "unauthorized", "detail": "<reason>", "error_description": "<reason>"}`, where the reason is one of `missing_token`, `invalid_token` or `token_expired`. Why a token did not verify (wrong key, audience, issuer, malformed) is logged at debug level and never returned. The same goes for a JWKS the server cannot fetch (503 `temporarily_unavailable`, sub-code `jwks_unavailable`): the URL and the transport error are logged, not returned.
+
 ## Public
 
 | Method and path | Auth | Purpose |
@@ -9,7 +11,7 @@ All routes the server mounts, from the route table in `crates/onbehalf-server/sr
 | `GET /healthz` | none | Liveness. Never touches storage. |
 | `GET /readyz` | none | Readiness. Checks the audit store and the lease store. 200 `{"ready":true,"checks":{"audit":"ok","leases":"ok"}}` or 503 with `"error"` for the failing check and no error text. |
 | `GET /.well-known/jwks.json` | none | Public keys for token verification, including retired keys. |
-| `GET /.well-known/authzen-configuration` | none | AuthZEN discovery: decision point, evaluation and evaluations endpoint URLs. |
+| `GET /.well-known/authzen-configuration` | none | AuthZEN discovery: decision point, evaluation and evaluations endpoint URLs, built from `[server] public_url`. Without it (loopback only) from `Host`, which must be `localhost`, `127.0.0.1` or `[::1]`; anything else is 400 `invalid_host`. |
 
 ## Token
 
@@ -38,7 +40,7 @@ grant_type=urn:ietf:params:oauth:grant-type:token-exchange
 
 | Method and path | Auth | Purpose |
 | --- | --- | --- |
-| `POST /access/v1/evaluation` | bearer token, or a trusted PEP | AuthZEN evaluation. Same pipeline as the proxy. |
+| `POST /access/v1/evaluation` | bearer token, or a trusted PEP | AuthZEN evaluation. Same pipeline as the proxy. `context.diagnostics` is filled only for callers `[authzen] diagnostics` allows: by default a `[[peps]]` entry, which can authenticate next to a bearer token with `pep_id` and `pep_secret` in the body. |
 | `POST /access/v1/evaluations` | same | AuthZEN batch: top-level `subject`, `action`, `resource`, `context` are defaults and each entry of `evaluations` overrides them. Answers `{"evaluations": [{decision, context}, ...]}`, one per entry, each decided and audited like a single evaluation. At most `[authzen] max_batch` entries (default 64): more is 400 `batch_too_large`, none is 400 `invalid_request`. Only the default `execute_all` semantic is supported. |
 
 ## MCP proxy
@@ -49,7 +51,7 @@ grant_type=urn:ietf:params:oauth:grant-type:token-exchange
 | `GET /mcp/{server}` | bearer delegation token | Passthrough for the streamable HTTP event stream, after the lease check. |
 | `DELETE /mcp/{server}` | bearer delegation token | Passthrough session close, after the lease check. |
 
-A denial is a JSON-RPC error with code `-32003`, carrying `reason` and `decision_id`. A missing or bad token is HTTP 401 with `-32001`. Allowed responses carry `X-Onbehalf-Decision-Id`.
+A denial is a JSON-RPC error with code `-32003`, carrying `reason` and `decision_id`. A missing or bad token is HTTP 401 with `-32001` and `data.reason` set to `missing_token`, `invalid_token`, `token_expired` or, for a lease that is no longer live, `lease_revoked`, `lease_expired` or `lease_unknown`. An upstream the proxy cannot reach is HTTP 502 with `-32005` and `data.reason` `upstream_unreachable`; the upstream URL and transport error are only logged. Allowed responses carry `X-Onbehalf-Decision-Id`.
 
 ## Admin
 

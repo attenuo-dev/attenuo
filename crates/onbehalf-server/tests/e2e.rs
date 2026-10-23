@@ -708,7 +708,7 @@ async fn admin_actions_are_audited() {
     let entries = h.audit_entries().await;
     let admin: Vec<(String, String, String)> = entries
         .iter()
-        .filter(|e| e["record"]["originating_subject"] == "admin")
+        .filter(|e| e["record"]["originating_subject"] == "urn:onbehalf:admin")
         .map(|e| {
             let r = &e["record"];
             (

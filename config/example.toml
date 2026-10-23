@@ -7,8 +7,10 @@
 
 [server]
 listen = "127.0.0.1:8080"
-# Externally visible base URL, used in /.well-known/authzen-configuration.
-# Defaults to http://<Host header>.
+# Externally visible base URL: the only source of the URLs in
+# /.well-known/authzen-configuration. Required when `listen` is not a loopback address (the
+# server refuses to start without it). On loopback it may stay unset: discovery then uses
+# http://<Host>, and only a Host of localhost, 127.0.0.1 or [::1] is accepted (400 otherwise).
 # public_url = "https://onbehalf.example.com"
 
 [issuer]
@@ -165,6 +167,10 @@ allow_unsigned_chain = false
 # Most evaluations one POST /access/v1/evaluations may carry. Larger requests get 400
 # batch_too_large before anything is decided or audited.
 max_batch = 64
+# Who gets context.diagnostics (effective capabilities, lease ids, Cedar errors) in
+# evaluation responses: "peps" (callers authenticated as a [[peps]] entry; with a bearer
+# token, by pep_id/pep_secret in the body), "always" or "never". Others get an empty list.
+diagnostics = "peps"
 
 # Policy enforcement points for allow_unsigned_chain, same shape as [[agents]].
 # [[peps]]

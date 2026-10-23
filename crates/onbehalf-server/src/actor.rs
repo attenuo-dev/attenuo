@@ -114,11 +114,16 @@ impl From<ActorTokenError> for ApiError {
     fn from(e: ActorTokenError) -> Self {
         let d = e.description();
         match e {
-            ActorTokenError::JwksUnavailable(_) => ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "temporarily_unavailable",
-                e.to_string(),
-            ),
+            // The fetch error names the JWKS URL and the transport failure: log it, do not
+            // return it (SR-17).
+            ActorTokenError::JwksUnavailable(detail) => {
+                tracing::warn!(detail = ?detail, "actor token issuer JWKS unavailable");
+                ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "temporarily_unavailable",
+                    "the actor token issuer's keys cannot be fetched; try again later",
+                )
+            }
             _ => ApiError::bad_request("invalid_request", e.to_string()),
         }
         .with_description(d)

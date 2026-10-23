@@ -304,10 +304,11 @@ fn exchange_sync(
         return Err(e);
     }
     tracing::info!(
-        subject = %issued.chain.originating_user.subject,
-        actor = %req.actor,
+        // Caller-controlled strings are Debug-formatted (SR-18).
+        subject = ?issued.chain.originating_user.subject,
+        actor = ?req.actor,
         actor_auth,
-        actor_subject = actor.as_ref().map(|(v, _)| v.subject.as_str()),
+        actor_subject = ?actor.as_ref().map(|(v, _)| v.subject.as_str()),
         lease = %resp.lease.0,
         depth = issued.chain.depth(),
         "token exchanged"

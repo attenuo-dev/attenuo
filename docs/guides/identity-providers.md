@@ -308,7 +308,7 @@ The agent fetches a JWT-SVID with onbehalf's URL as the audience and sends it on
 ```sh
 spire-agent api fetch jwt -audience https://onbehalf.example.com \
   -socketPath /run/spire/sockets/agent.sock
-onbehalf token exchange --subject-token "$PARENT" --actor coder \
+ONBEHALF_TOKEN="$PARENT" onbehalf token exchange --actor coder \
   --cap github:read_file --actor-token -   # reads the JWT-SVID from stdin
 ```
 

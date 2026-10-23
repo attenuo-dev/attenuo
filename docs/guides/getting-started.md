@@ -158,7 +158,7 @@ This uses the development endpoint `POST /admin/root-token`, which trusts you to
 Now delegate less to a sub-agent. The `coder` agent gets one tool:
 
 ```sh
-CODER=$(ONBEHALF_CLIENT_SECRET="$CODER_SECRET" onbehalf token exchange --subject-token "$ROOT" --actor coder --cap github:read_file --print token)
+CODER=$(ONBEHALF_TOKEN="$ROOT" ONBEHALF_CLIENT_SECRET="$CODER_SECRET" onbehalf token exchange --actor coder --cap github:read_file --print token)
 onbehalf token inspect "$CODER" --verify
 ```
 
@@ -182,8 +182,9 @@ The exchange authenticates as `coder` with its client secret (from `ONBEHALF_CLI
 ## 7. Make a call
 
 ```sh
-onbehalf tools --token "$CODER" --server github
-onbehalf call --token "$CODER" --server github --tool read_file --arg repo=acme/api --arg path=README.md
+export ONBEHALF_TOKEN="$CODER"   # or --token-file PATH, or --token - to read it from stdin
+onbehalf tools --server github
+onbehalf call --server github --tool read_file --arg repo=acme/api --arg path=README.md
 ```
 
 ```text
@@ -196,7 +197,7 @@ ALLOWED
 Now one that should fail. `coder` was never given `create_issue`:
 
 ```sh
-onbehalf call --token "$CODER" --server github --tool create_issue --arg repo=acme/api --arg title=x
+onbehalf call --server github --tool create_issue --arg repo=acme/api --arg title=x
 echo $?
 ```
 
@@ -226,7 +227,7 @@ Revoking a lease cuts off that hop and everything delegated from it. Revoke the 
 
 ```sh
 onbehalf lease revoke "$ROOT_LEASE" --reason "trying it out"
-onbehalf call --token "$CODER" --server github --tool read_file --arg repo=acme/api --arg path=README.md
+onbehalf call --server github --tool read_file --arg repo=acme/api --arg path=README.md
 ```
 
 ```text
@@ -246,11 +247,11 @@ onbehalf audit verify
 
 ```text
 #1  2026-10-22T22:14:20Z  ALLOW onbehalf/token.root          planner for alice          reason=token_issued
-#2  2026-10-22T22:14:20Z  ALLOW onbehalf/admin.root_token    by admin                   reason=admin_action
+#2  2026-10-22T22:14:20Z  ALLOW onbehalf/admin.root_token    by urn:onbehalf:admin      reason=admin_action
 #3  2026-10-22T22:14:20Z  ALLOW onbehalf/token.exchange      planner > coder for alice  reason=token_issued
 #4  2026-10-22T22:14:20Z  ALLOW github/read_file             planner > coder for alice  reason=policy_allow
 #5  2026-10-22T22:14:20Z  DENY  github/create_issue          planner > coder for alice  reason=capability_denied
-#6  2026-10-22T22:14:21Z  ALLOW onbehalf/admin.lease.revoke  by admin                   reason=admin_action
+#6  2026-10-22T22:14:21Z  ALLOW onbehalf/admin.lease.revoke  by urn:onbehalf:admin      reason=admin_action
 #7  2026-10-22T22:14:21Z  DENY  github/read_file             planner > coder for alice  reason=lease_revoked
 audit chain OK: 7 entries verified
 ```

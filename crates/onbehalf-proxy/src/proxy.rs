@@ -54,6 +54,10 @@ pub const REASON_REQUEST_TOO_LARGE: &str = "request_too_large";
 /// Reason code (HTTP 502) for an upstream body over `max_upstream_body_bytes` (SR-36).
 pub const REASON_UPSTREAM_BODY_TOO_LARGE: &str = "upstream_body_too_large";
 
+/// Reason code (HTTP 502, JSON-RPC `data.reason`) when the upstream cannot be reached; the
+/// transport error itself is only logged (SR-17).
+pub const REASON_UPSTREAM_UNREACHABLE: &str = "upstream_unreachable";
+
 /// Reason code for a `tools/call` whose name the upstream never listed and the catalog does not
 /// know, with [`ProxyConfig::require_listed_tools`] on (SR-25).
 pub const REASON_TOOL_NOT_LISTED: &str = "tool_not_listed";
@@ -182,14 +186,14 @@ async fn authenticate(
     state.authorizer.authenticate(bearer, now).await
 }
 
+/// A 401 that names only the stable reason code ([`AuthError::reason`]); the verifier's detail
+/// (wrong audience, unknown `kid`, ...) goes to the debug log, never to the client (SR-17).
 fn unauthorized(err: AuthError) -> Response {
-    tracing::warn!(error = %err, "request rejected: unauthenticated");
-    let body = error_response(
-        Value::Null,
-        CODE_UNAUTHORIZED,
-        format!("onbehalf: unauthorized: {err}"),
-        None,
-    );
+    let reason = err.reason();
+    tracing::warn!(reason = ?reason, "request rejected: unauthenticated");
+    // The detail can carry attacker-chosen text (an unknown `kid`): Debug-format it (SR-18).
+    tracing::debug!(error = ?err.to_string(), "authentication failure detail");
+    let body = unauthorized_body(Value::Null, &err);
     let mut resp = json_response(StatusCode::UNAUTHORIZED, &body);
     resp.headers_mut().insert(
         header::WWW_AUTHENTICATE,
@@ -198,8 +202,19 @@ fn unauthorized(err: AuthError) -> Response {
     resp
 }
 
+/// The JSON-RPC `-32001` error for `err`: `message` and `data.reason` carry the reason code.
+fn unauthorized_body(id: Value, err: &AuthError) -> Value {
+    let reason = err.reason();
+    error_response(
+        id,
+        CODE_UNAUTHORIZED,
+        format!("onbehalf: unauthorized: {reason}"),
+        Some(serde_json::json!({ "reason": reason })),
+    )
+}
+
 fn unknown_server(server: &str) -> Response {
-    tracing::warn!(server, "request rejected: unknown upstream");
+    tracing::warn!(server = ?server, "request rejected: unknown upstream");
     let body = error_response(
         Value::Null,
         CODE_UNKNOWN_SERVER,
@@ -227,11 +242,12 @@ fn request_span(server: &str, chain: &DelegationChain, session_id: Option<&str>)
         .current_agent()
         .map(ToString::to_string)
         .unwrap_or_default();
+    // Server, agent and subject are caller-controlled: Debug-format them (SR-18).
     tracing::info_span!(
         "mcp_request",
-        server,
-        agent = %agent,
-        subject = %chain.originating_user.subject,
+        server = ?server,
+        agent = ?agent,
+        subject = ?chain.originating_user.subject,
         chain_depth = chain.depth(),
         // Session ids grant access to a session: log a hash prefix only (SR-11).
         session = %session_id.map(session_tag).unwrap_or_default(),
@@ -560,13 +576,16 @@ async fn handle_passthrough(
     .await
 }
 
+/// `502` for a failed upstream request. The `reqwest` error names the internal upstream URL
+/// and the transport failure: it is logged, and the client gets only the reason code
+/// [`REASON_UPSTREAM_UNREACHABLE`] (SR-17).
 fn upstream_error(err: reqwest::Error) -> Response {
-    tracing::error!(error = %err, "upstream request failed");
+    tracing::error!(error = ?err.to_string(), "upstream request failed");
     let body = error_response(
         Value::Null,
         CODE_UPSTREAM,
-        format!("onbehalf: upstream unreachable: {err}"),
-        None,
+        "onbehalf: upstream unreachable",
+        Some(serde_json::json!({ "reason": REASON_UPSTREAM_UNREACHABLE })),
     );
     json_response(StatusCode::BAD_GATEWAY, &body)
 }
@@ -662,7 +681,7 @@ async fn handle_post_inner(
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(error = %e, "request body is not JSON");
+            tracing::warn!(error = ?e.to_string(), "request body is not JSON");
             let body = error_response(
                 Value::Null,
                 CODE_PARSE_ERROR,
@@ -807,7 +826,7 @@ async fn handle_post_inner(
         // Neither JSON nor SSE: the proxy cannot tell what is in it, and a list result must
         // not reach the client unfiltered. Fail closed.
         tracing::error!(
-            content_type,
+            content_type = ?content_type,
             status = %resp.status(),
             "upstream answered a list request with a body the proxy cannot filter"
         );
@@ -879,7 +898,7 @@ async fn screen_message(
             .map(str::to_owned)
     };
     let invalid = |detail: &str| {
-        tracing::warn!(%method, "{detail}");
+        tracing::warn!(method = ?method, detail = ?detail, "invalid params");
         error_response(
             id.clone(),
             CODE_INVALID_PARAMS,
@@ -951,11 +970,13 @@ async fn screen_message(
         call = call.with_session(session_tag(sid));
     }
     let verdict = state.authorizer.authorize(chain, &call, now).await;
+    // Method and tool name are the caller's: Debug-format them so a newline cannot forge a
+    // log line (SR-18).
     tracing::info!(
-        %method,
-        tool = %tool,
+        method = ?method,
+        tool = ?tool,
         decision = ?verdict.decision,
-        reason = %verdict.reason,
+        reason = ?verdict.reason,
         decision_id = %verdict.decision_id,
         "request authorized"
     );
@@ -1026,14 +1047,9 @@ async fn lease_live(
     }
     match out.lease_check.as_ref() {
         Some(Err(e)) => {
-            tracing::warn!(error = %e, "request refused: lease inactive");
+            tracing::warn!(reason = ?e.reason(), "request refused: lease inactive");
             if is_request(msg) {
-                out.replies.push(error_response(
-                    id_of(msg),
-                    CODE_UNAUTHORIZED,
-                    format!("onbehalf: unauthorized: {e}"),
-                    None,
-                ));
+                out.replies.push(unauthorized_body(id_of(msg), e));
             }
             false
         }
@@ -1065,7 +1081,10 @@ async fn buffer_and_rewrite(
         Err(e) => {
             if !screened.list_requests.is_empty() {
                 // A list result the proxy cannot parse is one it cannot filter.
-                tracing::error!(error = %e, "upstream answered a list request with invalid JSON");
+                tracing::error!(
+                    error = ?e.to_string(),
+                    "upstream answered a list request with invalid JSON"
+                );
                 let body = error_response(
                     Value::Null,
                     CODE_UPSTREAM,
@@ -1074,7 +1093,10 @@ async fn buffer_and_rewrite(
                 );
                 return json_response(StatusCode::BAD_GATEWAY, &body);
             }
-            tracing::warn!(error = %e, "upstream JSON response did not parse; passing through");
+            tracing::warn!(
+                error = ?e.to_string(),
+                "upstream JSON response did not parse; passing through"
+            );
             return build_response(status, &headers, Body::from(bytes));
         }
     };

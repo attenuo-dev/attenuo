@@ -147,11 +147,16 @@ impl From<IntakeError> for ApiError {
     fn from(e: IntakeError) -> Self {
         let d = e.description();
         match e {
-            IntakeError::JwksUnavailable(_) => ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "temporarily_unavailable",
-                e.to_string(),
-            ),
+            // The fetch error names the JWKS URL and the transport failure: log it, do not
+            // return it (SR-17).
+            IntakeError::JwksUnavailable(detail) => {
+                tracing::warn!(detail = ?detail, "IdP JWKS unavailable");
+                ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "temporarily_unavailable",
+                    "the identity provider's keys cannot be fetched; try again later",
+                )
+            }
             _ => ApiError::bad_request("invalid_grant", e.to_string()),
         }
         .with_description(d)
