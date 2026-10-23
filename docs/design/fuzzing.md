@@ -1,6 +1,6 @@
 # Fuzzing
 
-- Status: first campaign, 2026-10-23 (`test/fuzz-targets`)
+- Status: first campaign 2026-10-23 (`test/fuzz-targets`); second campaign, 10 minutes per target, 2026-10-23 evening (below)
 - Crate: `fuzz/` (cargo-fuzz, libFuzzer), outside the workspace
 - Related: [threat model](../spec/threat-model.md), [security review pass 3](../research/security-review-2026-10-23.md)
 
@@ -49,9 +49,30 @@ Harness bugs found on the way (fixed in the targets, not product bugs): a random
 
 No panic and no property violation was found in `chain_validate`, `names`, `capability_attenuation`, `token_verify_bytes`, `token_verify_mutated`, `proxy_sse` or `policy_context` in these runs.
 
+## Second campaign: 10 minutes per target (2026-10-23 evening)
+
+Same container (4 vCPU, shared with other builds), `-s none`, `-timeout=20`, each target started from `seed_corpus` and run for 600 s on main @ 034fd5c. No crash, no timeout and no property violation in any target. Coverage is libFuzzer's final `cov:` edge count.
+
+| Target | Runs | Edges |
+| --- | --- | --- |
+| `names` | 117,120,469 | 151 |
+| `token_verify_bytes` | 75,053,697 | 2,349 |
+| `chain_validate` | 42,208,686 | 3,441 |
+| `audit_export_bytes` | 28,972,532 | 2,900 |
+| `proxy_sse` | 7,071,736 | 1,862 |
+| `dpop_proof` | 4,146,179 | 1,810 |
+| `capability_attenuation` | 3,236,332 | 1,431 |
+| `ou_sig` | 1,564,866 | 2,366 |
+| `proxy_jsonrpc` | 1,369,494 | 8,331 |
+| `audit_export_mutated` | 1,253,294 | 3,029 |
+| `policy_context` | 462,584 | 6,161 |
+| `token_verify_mutated` | 78,851 | 4,233 |
+
+The spread in run counts is the targets' setup cost, as in the first campaign: `token_verify_mutated` signs and parses a whole token per input and `proxy_jsonrpc` makes an HTTP round trip. Ten minutes is still short for the slow targets; a campaign on a dedicated machine should give those an hour or more. Corpora were not kept.
+
 ## Limits
 
-- Two minutes per target on a busy machine is a smoke test, not a campaign. The corpora are not kept in the repository; a long run should start from `seed_corpus` and keep its corpus.
+- Two minutes per target on a busy machine is a smoke test, not a campaign, and ten minutes (second campaign) is a short one. The corpora are not kept in the repository; a long run should start from `seed_corpus` and keep its corpus.
 - `-s none` skips AddressSanitizer, which matters only for the C and assembly in `ring`.
 - The proxy target models one JavaScript behaviour of upstreams (number ids). Other upstream quirks (case-insensitive tool names, SR-25) are covered by the integration tests, not here.
 - The server's HTTP routes beyond DPoP (token exchange, AuthZEN over HTTP, admin) are not fuzzed; `policy_context` covers the AuthZEN request shape through `PolicyEngine::evaluate`.
