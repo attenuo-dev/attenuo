@@ -61,7 +61,7 @@ print(admin.audit_verify())  # VerifyReport(ok=True, entries=..., ...)
 
 | Call                                                                                                 | Does                                                                                                                                                                                                                                                                                                                                                                                                              |
 | ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Client(server_url, token=None, timeout=30)`                                                         | HTTP client for the server. `token` is a default bearer.                                                                                                                                                                                                                                                                                                                                                          |
+| `Client(server_url, token=None, timeout=30, dpop_key=None)`                                                        | HTTP client for the server. `token` is a default bearer.                                                                                                                                                                                                                                                                                                                                                          |
 | `exchange(subject_token, actor, capabilities, ttl_seconds=None, client_id=None, client_secret=None, subject_token_type=None, *, actor_token=None, may_act=None)` | RFC 8693 exchange. Returns a `Token`. From a delegation token, `client_secret` is the actor's `[[agents]]` secret (`client_id` defaults to `actor`), which the server requires by default. From any other subject token, `client_id` and `client_secret` make it a hop-0 exchange of an IdP credential (`subject_token_type="...:id-jag"` for an ID-JAG). A parent token can be exchanged for a given actor once. `actor_token` (a workload-identity JWT such as a SPIFFE JWT-SVID from an `[[actor_trust]]` issuer) authenticates the actor instead of a secret, depending on `[token] actor_auth`; each one works for one exchange. `may_act` lists the agents allowed to exchange the new token next. |
 | `renew(token)`                                                                                       | `POST /token/renew`. Returns `Lease(lease, expires_at, expires_in)`.                                                                                                                                                                                                                                                                                                                                              |
 | `call_tool(token, server, tool, arguments, session_id=None)`                                         | `tools/call` through `/mcp/{server}`. Returns `ToolResult` (`.text`, `.content`, `.is_error`, `.decision_id`).                                                                                                                                                                                                                                                                                                    |
@@ -98,10 +98,34 @@ root = ob.exchange(id_token, "planner", ["github:*"], actor_token=svid)
 
 ```python
 coder = ob.exchange(root, "coder", ["github:read_file"], client_secret=..., may_act=["reviewer"])
-root = admin.mint_root_dev("alice", "https://idp.example", "planner", ["github:*"], may_act=["coder"])
+root = admin.mint_root_dev(
+    "alice", "https://idp.example", "planner", ["github:*"], may_act=["coder"]
+)
 ```
 
 `may_act` is a list of agent ids (a bare string is a `TypeError`); `[]` means nobody may exchange the token. For a root it must be within the `[[root_grants]]` entry's `may_act` when that has one.
+
+### Binding tokens to keys (DPoP)
+
+A token can be bound to a key the agent holds (RFC 9449), so a leaked copy is useless without the key. Give the client a `dpop_key`: a `DpopKey` or a private JWK dict, such as the file `onbehalf key gen --dpop` writes. Signing needs `cryptography` (`pip install 'onbehalf[dpop]'`).
+
+```python
+from onbehalf import Client, DpopKey
+
+coder_key = DpopKey.load("coder.jwk")  # or DpopKey.generate(); keep key.private_jwk() to reuse it
+with Client(url, dpop_key=coder_key) as ob:
+    # The new token is bound to coder_key. The parent is bound to the planner's key, which
+    # signs off on the exchange.
+    coder = ob.exchange(
+        root, "coder", ["github:read_file"], client_secret=..., subject_dpop_key=planner_key
+    )
+    ob.call_tool(coder, "github", "read_file", {"repo": "alice/docs"})  # proof attached
+root = admin.mint_root_dev(
+    "alice", "https://idp.example", "planner", ["github:*"], dpop_key=planner_key
+)
+```
+
+With a key, every `call_tool`, `list_tools`, `renew` and `authzen_evaluate` sends `Authorization: DPoP <token>` and a fresh proof, and every `exchange` binds the new token. When the parent is bound to the client's own key, `subject_dpop_key` is not needed. `Token.dpop_jkt` is the thumbprint a token is bound to (`None` for a bearer token), and `AuditEntry.dpop_bound` says whether a decision was made with a proven bound token. A bound token without a proof is `Unauthorized` with `error == "dpop_required"`. See [Binding tokens to keys](../../docs/guides/binding-tokens-to-keys.md).
 
 ### Errors
 
@@ -128,7 +152,7 @@ url = mcp_url("http://127.0.0.1:8080", "github")  # http://127.0.0.1:8080/mcp/gi
 headers = mcp_headers(coder)  # {"Authorization": "Bearer ..."}
 ```
 
-`TokenAuth(provider)` is an `httpx.Auth` that reads the current token on each request, for tokens that get replaced.
+`TokenAuth(provider)` is an `httpx.Auth` that reads the current token on each request, for tokens that get replaced. `TokenAuth(provider, dpop_key=key)` also adds a DPoP proof per request, which a bound token needs; static headers cannot carry one.
 
 ## Verifying
 

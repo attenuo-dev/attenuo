@@ -50,6 +50,10 @@ pub enum TokenError {
     /// A cap on the new token's lifetime (for example the actor token's `exp`) leaves none.
     #[error("no lifetime left for the new token: {0}")]
     NoLifetimeLeft(String),
+    /// The parent token is sender-constrained (`cnf.jkt`) and the exchange did not bind the
+    /// child to a key: a bound delegation can only produce bound children.
+    #[error("the subject token is bound to a key (cnf.jkt); the new token must be bound too")]
+    BindingRequired,
     /// A key could not be generated, parsed, or used.
     #[error("key error: {0}")]
     Key(String),

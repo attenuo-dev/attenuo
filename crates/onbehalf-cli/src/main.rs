@@ -5,6 +5,7 @@
 
 mod cli;
 mod client;
+mod dpop_key;
 mod jwt;
 mod policy_cmd;
 mod render;
@@ -19,7 +20,9 @@ use clap::Parser;
 use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
 
-use cli::{AuditCmd, AuthzenCmd, Cli, Command, ExportFormat, Field, LeaseCmd, PolicyCmd, TokenCmd};
+use cli::{
+    AuditCmd, AuthzenCmd, Cli, Command, ExportFormat, Field, KeyCmd, LeaseCmd, PolicyCmd, TokenCmd,
+};
 use client::Client;
 
 /// JSON-RPC error code the proxy uses for a denied call.
@@ -78,11 +81,20 @@ async fn run(cli: Cli) -> Result<Outcome> {
     let client = Client::new(&cli.server, admin_token);
     match cli.command {
         Command::Token(TokenCmd::Inspect(args)) => inspect(client.ok(), args, json).await,
+        Command::Key(KeyCmd::Gen { dpop }) => {
+            let key = dpop_key::generate(&dpop)?;
+            if json {
+                print_json(&json!({"path": dpop, "jkt": key.thumbprint(), "alg": key.alg()}));
+            } else {
+                println!("wrote DPoP key {} ({})", dpop.display(), key.alg());
+                println!("jkt  {}", key.thumbprint());
+            }
+            Ok(Outcome::Ok)
+        }
         Command::Token(TokenCmd::Root(a)) => {
             let client = client?;
-            let resp = client
-                .admin_post("/admin/root-token", &a.request_body()?)
-                .await?;
+            let key = dpop_key::load_opt(a.dpop_key.as_deref())?;
+            let resp = client.root(&a.request_body()?, key.as_ref()).await?;
             print_token(&resp, a.print, json);
             Ok(Outcome::Ok)
         }
@@ -131,7 +143,16 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 body["client_id"] = a.client_id.unwrap_or_else(|| a.actor.clone()).into();
                 body["client_secret"] = secret.into();
             }
-            let resp = client.exchange(&body).await?;
+            let (header, sign_off) = dpop_key::exchange_proofs(
+                &client.token_url(),
+                &subject_token,
+                a.dpop_key.as_deref(),
+                a.subject_dpop_key.as_deref(),
+            )?;
+            if let Some(proof) = sign_off {
+                body["subject_token_dpop"] = proof.into();
+            }
+            let resp = client.exchange(&body, header).await?;
             print_token(&resp, a.print, json);
             Ok(Outcome::Ok)
         }
@@ -144,9 +165,11 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 &mut stdin,
             )?;
             let args: Map<String, Value> = a.args.into_iter().collect();
+            let key = dpop_key::load_opt(a.token.dpop_key.as_deref())?;
             let resp = client
                 .mcp(
                     &token,
+                    key.as_ref(),
                     &a.server,
                     "tools/call",
                     json!({"name": a.tool, "arguments": args}),
@@ -162,8 +185,9 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 a.token.token_file.as_deref(),
                 &mut stdin,
             )?;
+            let key = dpop_key::load_opt(a.token.dpop_key.as_deref())?;
             let resp = client
-                .mcp(&token, &a.server, "tools/list", json!({}))
+                .mcp(&token, key.as_ref(), &a.server, "tools/list", json!({}))
                 .await?;
             Ok(print_tools(&resp, json))
         }
@@ -277,13 +301,15 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 "context": {"input": input},
             });
             let client = client?;
+            let token_src_key = token.dpop_key.clone();
             let token = secrets::resolve_token(
                 "--token",
                 token.token,
                 token.token_file.as_deref(),
                 &mut stdin,
             )?;
-            let resp = client.authzen(&token, &req).await?;
+            let key = dpop_key::load_opt(token_src_key.as_deref())?;
+            let resp = client.authzen(&token, &req, key.as_ref()).await?;
             let allow = resp["decision"] == true;
             if json {
                 print_json(&resp);
@@ -370,6 +396,12 @@ async fn inspect(client: Option<Client>, args: cli::InspectArgs, json: bool) -> 
                 "exp {} ({})",
                 render::fmt_time(exp),
                 render::fmt_relative(exp, now)
+            );
+        }
+        if let Some(cnf) = &c.cnf {
+            println!(
+                "bound to DPoP key jkt {} (needs a proof by that key)",
+                cnf.jkt
             );
         }
         match &verdict {

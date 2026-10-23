@@ -59,6 +59,7 @@ Mint a root (hop 0) token. This uses the development endpoint, so it needs the a
 | `--ttl-seconds` | Requested lifetime. |
 | `--attr` | User attribute. Repeatable. |
 | `--may-act <AGENT>` | Only this agent may exchange the root token (RFC 8693 `may_act`). Repeatable, or comma-separated. Must be within the `[[root_grants]]` entry's `may_act` when it has one; without the flag the grant's `may_act` applies. |
+| `--dpop-key PATH` | Bind the root token to this DPoP key (a private JWK from `key gen --dpop`). |
 | `--print token\|lease` | Print only that value, for scripts. |
 
 ### `token exchange`
@@ -79,11 +80,23 @@ RFC 8693 exchange: delegate a subset of a token's capabilities to a sub-agent.
 | `--actor-token <JWT\|->` | Authenticate `--actor` with an RFC 8693 actor token, such as a SPIFFE JWT-SVID from an `[[actor_trust]]` issuer, instead of a client secret. `-` reads it from stdin. Each token works for one exchange. |
 | `--actor-token-file <PATH>` | Read the actor token from a file, for example the JWT-SVID a SPIFFE helper writes. Cannot be combined with `--actor-token`. |
 | `--may-act <AGENT>` | Only this agent may exchange the new token (RFC 8693 `may_act`). Repeatable, or comma-separated. |
+| `--dpop-key PATH` | Bind the new token to this DPoP key. Required when the parent is bound. When the parent is bound to the same key, the proof also covers the parent. |
+| `--subject-dpop-key PATH` | The parent's DPoP key, when it differs from `--dpop-key`: its proof (`subject_token_dpop`) is the parent holder's consent to the new binding. |
 | `--print token\|lease` | Print only that value. |
 
 ```sh
 ONBEHALF_TOKEN="$PARENT" onbehalf token exchange --actor coder \
   --cap github:read_file --actor-token-file /run/spiffe/coder.jwt --may-act reviewer
+```
+
+### `key gen --dpop <PATH>`
+
+Write a new Ed25519 DPoP key (RFC 9449) to `PATH` as a private JWK, mode 0600, and print its thumbprint (`jkt`, what a bound token's `cnf.jkt` will be). An existing file is never overwritten (exit code 1). Pass the file to `--dpop-key`; the Python and TypeScript SDKs read the same format. See [Binding tokens to keys](../guides/binding-tokens-to-keys.md).
+
+```console
+$ onbehalf key gen --dpop coder.jwk
+wrote DPoP key coder.jwk (EdDSA)
+jkt  4MMDxQj9pafXPrWH6dxBeoSk2DpHFpEZvXvsmr6JibU
 ```
 
 ### `token inspect <JWT>`
@@ -96,6 +109,8 @@ Decode a token and show its delegation chain as a tree. Use `-` to read the toke
 | `--issuer` | With `--verify`: expected issuer. Default: the token's own. |
 | `--audience` | With `--verify`: expected audience. Default: the token's own. |
 
+For a bound token the text output adds `bound to DPoP key jkt <thumbprint>`.
+
 ### `call`
 
 Call a tool through the proxy (`tools/call`).
@@ -104,6 +119,7 @@ Call a tool through the proxy (`tools/call`).
 | --- | --- |
 | `--token <JWT\|->` (`ONBEHALF_TOKEN`) | Delegation token; `-` reads it from stdin. One of the flag, `--token-file` or `ONBEHALF_TOKEN` is required. The flag with a literal token prints a warning. |
 | `--token-file PATH` | Read the delegation token from the first line of a file. |
+| `--dpop-key PATH` (`ONBEHALF_DPOP_KEY`) | The DPoP key the token is bound to. Every request then carries a proof and `Authorization: DPoP`. Also on `tools` and `authzen eval`. |
 | `--server`, `--upstream` | MCP upstream name. Required. |
 | `--tool` | Tool name. Required. |
 | `--arg` | Tool argument. Repeatable. |
@@ -176,6 +192,7 @@ Ask the decision endpoint whether the token's chain may make a call, without mak
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--token <JWT\|->` (`ONBEHALF_TOKEN`) | | Delegation token, sent as the bearer; `-` reads it from stdin. Or `--token-file PATH`. |
+| `--dpop-key PATH` (`ONBEHALF_DPOP_KEY`) | | The DPoP key a bound token needs. |
 | `--server` | `github` | MCP server name. |
 | `--tool` | | Tool name. Required. |
 | `--arg` | | Tool argument. Repeatable. |

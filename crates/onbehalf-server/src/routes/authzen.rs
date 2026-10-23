@@ -6,7 +6,10 @@
 //! - **Default: the bearer.** The request must carry `Authorization: Bearer <delegation
 //!   token>`. The token is verified and its chain is used. If the body also carries
 //!   `subject.properties.chain`, it must equal the token's chain. An empty `subject.id` is
-//!   filled with the chain's current agent. Without a bearer the answer is 401.
+//!   filled with the chain's current agent. Without a bearer the answer is 401. A token
+//!   bound to a key (`cnf.jkt`) needs a DPoP proof for this request ([`crate::dpop`]), made
+//!   once per HTTP request (a batch's entries share it); `Authorization: DPoP <token>` is
+//!   accepted as well.
 //! - **Opt-in: an unsigned body chain from an authenticated PEP.** Only with
 //!   `[authzen] allow_unsigned_chain = true`. The caller must authenticate as a `[[peps]]` entry
 //!   (HTTP Basic, or `pep_id` and `pep_secret` in the body; 401 `invalid_client` otherwise), and
@@ -131,6 +134,7 @@ fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
         }
     }
     obj.remove("options");
+    let bearer = bearer_auth(state, headers, "/access/v1/evaluations")?;
 
     let mut results = Vec::with_capacity(items.len());
     for item in items {
@@ -145,7 +149,7 @@ fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
         for (k, v) in item {
             merged.insert(k, v);
         }
-        match evaluate_value(state, headers, Value::Object(merged)) {
+        match evaluate_value(state, headers, bearer.as_ref(), Value::Object(merged)) {
             Ok(r) => results.push(serde_json::to_value(r).map_err(ApiError::internal)?),
             Err(e) if matches!(e.status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
                 return Err(e)
@@ -199,12 +203,60 @@ fn evaluate(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<EvaluationResponse, ApiError> {
-    evaluate_value(state, headers, parse_json(body)?)
+    let value = parse_json(body)?;
+    let bearer = bearer_auth(state, headers, "/access/v1/evaluation")?;
+    evaluate_value(state, headers, bearer.as_ref(), value)
+}
+
+/// The bearer's chain and DPoP binding, checked once per HTTP request: a batch's entries share
+/// it, and a DPoP proof can be used only once.
+struct Bearer {
+    chain: DelegationChain,
+    dpop_bound: bool,
+}
+
+/// Verify the `Authorization: Bearer` (or `DPoP`) token and its DPoP proof, if the request has
+/// one. `Ok(None)` without a bearer (no header, or HTTP Basic for a PEP).
+fn bearer_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: &str,
+) -> Result<Option<Bearer>, ApiError> {
+    let auth = authorization(headers)?;
+    let token = match &auth {
+        Some((scheme, token)) if scheme == "bearer" || scheme == "dpop" => *token,
+        Some((scheme, _)) if scheme == "basic" => return Ok(None),
+        Some(_) => {
+            return Err(ApiError::unauthorized(
+                REASON_INVALID_TOKEN,
+                "expected `Authorization: Bearer <token>`",
+            ))
+        }
+        None => return Ok(None),
+    };
+    let now = now();
+    let v = state
+        .verifier
+        .verify(token, now)
+        .map_err(|e| ApiError::bad_token(&e))?;
+    let dpop_bound = state.dpop.check_presented(
+        v.claims.cnf.as_ref(),
+        token,
+        crate::dpop::header_proof(headers)?,
+        "POST",
+        &state.dpop.expected_url_for(headers, path),
+        now,
+    )?;
+    Ok(Some(Bearer {
+        chain: v.chain,
+        dpop_bound,
+    }))
 }
 
 fn evaluate_value(
     state: &AppState,
     headers: &HeaderMap,
+    bearer: Option<&Bearer>,
     raw: Value,
 ) -> Result<EvaluationResponse, ApiError> {
     let pep_field = |k: &str| raw.get(k).and_then(Value::as_str).map(str::to_owned);
@@ -213,28 +265,11 @@ fn evaluate_value(
         .map_err(|e| ApiError::bad_request("invalid_request", e.to_string()))?;
     let now = now();
 
-    let auth = authorization(headers)?;
-    let bearer = match &auth {
-        Some((scheme, token)) if scheme == "bearer" => Some(*token),
-        Some((scheme, _)) if scheme == "basic" => None,
-        Some(_) => {
-            return Err(ApiError::unauthorized(
-                REASON_INVALID_TOKEN,
-                "expected `Authorization: Bearer <token>`",
-            ))
-        }
-        None => None,
-    };
-
     // `body_chain_pep`: the PEP whose unsigned body chain is used. `pep_authenticated`: the
     // caller proved it is a `[[peps]]` entry, which decides whether it sees diagnostics.
     let (body_chain_pep, pep_authenticated) = match bearer {
-        Some(token) => {
-            let v = state
-                .verifier
-                .verify(token, now)
-                .map_err(|e| ApiError::bad_token(&e))?;
-            attach_chain(&mut req, &v.chain)?;
+        Some(b) => {
+            attach_chain(&mut req, &b.chain)?;
             // A PEP forwarding an agent's token may authenticate itself in the body (the
             // `Authorization` header holds the bearer) to receive diagnostics.
             let pep = match pep_secret.as_deref() {
@@ -280,6 +315,7 @@ fn evaluate_value(
         })?;
         tracing::debug!(pep = ?pep, "AuthZEN body chain accepted from an authenticated PEP");
     }
+    let call = call.with_dpop_bound(bearer.is_some_and(|b| b.dpop_bound));
     let mut d = state.pipeline.decide(&chain_value, &call, now);
     let allow = d.is_allow();
     // Diagnostics name effective capabilities, lease ids and Cedar errors: reconnaissance for

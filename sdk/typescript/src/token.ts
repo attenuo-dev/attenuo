@@ -135,6 +135,17 @@ export class Token {
   get expiresIn(): number {
     return (this.expiresAt.getTime() - Date.now()) / 1000;
   }
+
+  /**
+   * `cnf.jkt`: thumbprint of the key the token is bound to (DPoP), or undefined for a bearer
+   * token. A bound token is accepted only with proofs by that key.
+   */
+  get dpopJkt(): string | undefined {
+    const cnf = this.claims.cnf as { jkt?: unknown } | undefined;
+    return typeof cnf === "object" && cnf !== null && typeof cnf.jkt === "string"
+      ? cnf.jkt
+      : undefined;
+  }
 }
 
 /** The JWT of a `Token` or a string, trimmed. */

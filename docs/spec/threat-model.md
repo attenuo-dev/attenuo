@@ -68,6 +68,6 @@ Stated plainly so nobody relies on it for these.
 
 ## Residual risks to track
 
-- Token theft within a lease TTL window (mitigation: sender-constrained tokens, open question 1 in the RFC).
+- Token theft within a lease TTL window, for tokens that are not bound to a key. Bound tokens (DPoP, [RFC-0001 section 4.1](rfc-0001-onbehalf.md#41-sender-constrained-tokens-dpop)) are useless without the holder's private key; an attacker who also takes the key is still in scope only up to the token's capabilities and lease.
 - Policy-cache or lease-cache staleness longer than one TTL under partition (fail closed when the lease store is unreachable).
 - Constraint-algebra gaps that let an argument slip past `⊑` (property tests over the attenuation rule; fuzz the matcher).

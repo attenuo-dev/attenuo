@@ -30,6 +30,7 @@ from onbehalf import (
     Capability,
     Client,
     Denied,
+    DpopKey,
     Prefix,
     Unauthorized,
 )
@@ -316,6 +317,57 @@ async def test_async_client_end_to_end(stack: Stack) -> None:
             await ob.call_tool(coder, "github", "read_file", {"repo": "alice/private-x"})
         assert d.value.reason == "policy_deny"
         assert (await ob.renew(coder)).expires_in > 0
+    admin.revoke_lease(root.lease)
+    admin.close()
+
+
+def test_dpop_bound_chain(stack: Stack) -> None:
+    """SR-24: tokens bound to keys work end to end, and are useless without the key."""
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    assistant_key, coder_key = DpopKey.generate(), DpopKey.generate()
+    root = admin.mint_root_dev(
+        "alice", "https://idp.example", "assistant", ["github:*"], dpop_key=assistant_key
+    )
+    assert root.dpop_jkt == assistant_key.thumbprint
+
+    # The coder binds its token to its own key; the assistant's key signs off on the exchange.
+    with Client(stack.url, dpop_key=coder_key.private_jwk()) as coder_ob:
+        coder = coder_ob.exchange(
+            root,
+            "coder",
+            ["github:read_file"],
+            client_secret=CODER_SECRET,
+            subject_dpop_key=assistant_key,
+        )
+        assert coder.dpop_jkt == coder_key.thumbprint
+        res = coder_ob.call_tool(coder, "github", "read_file", {"repo": "alice/public-docs"})
+        assert res.decision_id
+        assert [t.name for t in coder_ob.list_tools(coder, "github")] == ["read_file"]
+        assert coder_ob.authzen_evaluate(coder, "github", "read_file", {"repo": "alice/public-x"})
+        assert coder_ob.renew(coder).expires_in > 0
+
+    # The same token without the key: refused everywhere.
+    with Client(stack.url) as thief:
+        with pytest.raises(Unauthorized) as no_proof:
+            thief.call_tool(coder, "github", "read_file", {"repo": "alice/public-docs"})
+        assert no_proof.value.status == 401
+        with pytest.raises(Unauthorized) as renew:
+            thief.renew(coder)
+        assert renew.value.error == "dpop_required"
+        with pytest.raises(Unauthorized) as exchange:
+            thief.exchange(coder, "tester", ["github:read_file"], client_secret=TESTER_SECRET)
+        assert exchange.value.error == "dpop_required"
+    # Another key does not help either.
+    with Client(stack.url, dpop_key=DpopKey.generate()) as other:
+        with pytest.raises(Unauthorized) as wrong_key:
+            other.renew(coder)
+        assert wrong_key.value.error == "invalid_dpop_proof"
+
+    # The audit log records the bound use.
+    entries = admin.audit_tail(50)
+    by_id = {e.id: e for e in entries}
+    assert by_id[res.decision_id].dpop_bound
+    assert not any(e.dpop_bound for e in entries if e.tool == "admin.root_token")
     admin.revoke_lease(root.lease)
     admin.close()
 

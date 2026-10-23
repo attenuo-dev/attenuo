@@ -31,8 +31,8 @@ pub(crate) fn now() -> OffsetDateTime {
     OffsetDateTime::now_utc()
 }
 
-/// The bearer token from `Authorization`, `Ok(None)` when the header is absent, or an error
-/// when it is present but not `Bearer <token>`.
+/// The token from `Authorization: Bearer <token>` (or `DPoP <token>`, RFC 9449 §7.1),
+/// `Ok(None)` when the header is absent, or an error when it is present but neither.
 pub(crate) fn bearer_of(headers: &HeaderMap) -> Result<Option<&str>, ApiError> {
     let Some(raw) = headers.get(header::AUTHORIZATION) else {
         return Ok(None);
@@ -42,7 +42,8 @@ pub(crate) fn bearer_of(headers: &HeaderMap) -> Result<Option<&str>, ApiError> {
     })?;
     match raw.split_once(' ') {
         Some((scheme, token))
-            if scheme.eq_ignore_ascii_case("bearer") && !token.trim().is_empty() =>
+            if (scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("dpop"))
+                && !token.trim().is_empty() =>
         {
             Ok(Some(token.trim()))
         }
@@ -140,6 +141,7 @@ pub(crate) fn audit_admin(
         arguments_digest: call.arguments_digest(),
         session_id: None,
         policy_ids: Vec::new(),
+        dpop_bound: false,
     };
     let id = record.id;
     state
@@ -154,14 +156,24 @@ pub(crate) fn audit_admin(
 /// reason `token_issued`, server `onbehalf` and tool `token.exchange` (or `token.root` for a
 /// dev root mint). The chain is the *new* chain, so the record names the new hop's agent and
 /// lease; the arguments (actor, requested capabilities) are stored as a digest like any call.
+/// `dpop_bound` records whether the new token is bound to a key (SR-24).
 pub(crate) fn audit_issuance(
     state: &AppState,
     tool: &str,
     chain: &DelegationChain,
     arguments: Value,
+    dpop_bound: bool,
     now: OffsetDateTime,
 ) -> Result<uuid::Uuid, ApiError> {
-    let id = audit_event(state, REASON_TOKEN_ISSUED, tool, chain, arguments, now)?;
+    let id = audit_event(
+        state,
+        REASON_TOKEN_ISSUED,
+        tool,
+        chain,
+        arguments,
+        dpop_bound,
+        now,
+    )?;
     state.metrics.token_issued(if tool == "token.root" {
         TokenKind::Root
     } else {
@@ -171,16 +183,18 @@ pub(crate) fn audit_issuance(
 }
 
 /// Record a server-performed event (issuance, lease renewal) as an `allow` decision record
-/// with the given `reason`, server `onbehalf` and `tool` naming the event.
+/// with the given `reason`, server `onbehalf` and `tool` naming the event, and the record's
+/// `dpop_bound` flag.
 pub(crate) fn audit_event(
     state: &AppState,
     reason: &str,
     tool: &str,
     chain: &DelegationChain,
     arguments: Value,
+    dpop_bound: bool,
     now: OffsetDateTime,
 ) -> Result<uuid::Uuid, ApiError> {
-    let call = ToolCall::new(AUDIT_SERVER, tool, arguments);
+    let call = ToolCall::new(AUDIT_SERVER, tool, arguments).with_dpop_bound(dpop_bound);
     let record = DecisionRecord::new(now, Decision::Allow, reason, chain, &call, Vec::new());
     let id = record.id;
     if let Err(e) = state

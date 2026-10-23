@@ -20,6 +20,8 @@ classifiers = [
 [project.optional-dependencies]
 # Local Ed25519 verification of delegation tokens (`Client.inspect(..., verify=True)`).
 verify = ["cryptography>=41"]
+# DPoP proofs for sender-constrained tokens (`Client(..., dpop_key=...)`).
+dpop = ["cryptography>=41"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "cryptography>=41", "ruff", "mypy"]
 
 [project.urls]

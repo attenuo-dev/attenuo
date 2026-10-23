@@ -8,6 +8,7 @@ use time::{Duration, OffsetDateTime};
 
 use crate::claims::{ou_sig_message, ActClaim, Claims, MayAct, OU_SIG_VERSION, TOKEN_TYPE};
 use crate::detached::DetachedSigner;
+use crate::dpop::Confirmation;
 use crate::error::TokenError;
 use crate::keys::{PublicKey, SigningKey};
 use crate::verifier::Verifier;
@@ -34,6 +35,11 @@ pub struct IssueOptions {
     /// exchange) the parent's expiry; for example the `exp` of the actor token that
     /// authenticated the exchange. At or before `now` fails with [`TokenError::NoLifetimeLeft`].
     pub not_after: Option<OffsetDateTime>,
+    /// Bind the new token to a key (`cnf`, RFC 9449). The caller has verified a DPoP proof
+    /// for it. For an exchange of a bound parent this is mandatory
+    /// ([`TokenError::BindingRequired`]); whoever calls [`Issuer::exchange_with`] must also
+    /// have checked possession of the parent's key, since the issuer cannot see the request.
+    pub cnf: Option<Confirmation>,
 }
 
 impl IssueOptions {
@@ -72,6 +78,8 @@ pub struct IssuedToken {
     /// Lease of the hop this token was minted for. Revoke it to deny this hop and everything
     /// delegated from it.
     pub lease: LeaseId,
+    /// The key binding, when the token is sender-constrained.
+    pub cnf: Option<Confirmation>,
 }
 
 /// Holder of the signing key. Mints root tokens and exchanges them for narrower child tokens.
@@ -239,7 +247,7 @@ impl Issuer {
             )),
             kid: self.key.public_key().kid(),
         };
-        self.mint(chain, ou, lease, options.may_act.clone(), now)
+        self.mint(chain, ou, lease, options, now)
     }
 
     /// RFC 8693 token exchange: verify `parent_token`, then mint a child token for `actor` whose
@@ -268,8 +276,11 @@ impl Issuer {
         )
     }
 
-    /// [`Issuer::exchange`] with [`IssueOptions`]: `may_act` for the child, and an expiry cap
-    /// applied on top of the parent's expiry.
+    /// [`Issuer::exchange`] with [`IssueOptions`]: `may_act` for the child, an expiry cap
+    /// applied on top of the parent's expiry, and a key binding (`cnf`). A bound parent
+    /// (`cnf.jkt`) needs a bound child: without `options.cnf` this fails with
+    /// [`TokenError::BindingRequired`]. The child may be bound to another key than the
+    /// parent's; checking that the requester holds the parent's key is the caller's job.
     pub fn exchange_with(
         &self,
         parent_token: &str,
@@ -284,6 +295,9 @@ impl Issuer {
             if !may_act.permits(&actor.0) {
                 return Err(TokenError::ActorNotPermitted(actor.0));
             }
+        }
+        if parent.claims.cnf.is_some() && options.cnf.is_none() {
+            return Err(TokenError::BindingRequired);
         }
         let lease = new_lease();
         let chain = parent.chain.extend(
@@ -301,7 +315,7 @@ impl Issuer {
                 kid: parent.claims.ou_kid,
             },
             lease,
-            options.may_act.clone(),
+            options,
             now,
         )
     }
@@ -311,9 +325,16 @@ impl Issuer {
         chain: DelegationChain,
         ou: OuSig,
         lease: LeaseId,
-        may_act: Option<MayAct>,
+        options: &IssueOptions,
         now: OffsetDateTime,
     ) -> Result<IssuedToken, TokenError> {
+        if let Some(cnf) = &options.cnf {
+            if !cnf.is_well_formed() {
+                return Err(TokenError::Malformed(
+                    "cnf.jkt must be a base64url SHA-256 thumbprint".into(),
+                ));
+            }
+        }
         let expires_at = chain
             .hops
             .last()
@@ -334,7 +355,8 @@ impl Issuer {
             ou_sig: ou.sig,
             ou_sig_v: OU_SIG_VERSION,
             ou_kid: ou.kid,
-            may_act,
+            may_act: options.may_act.clone(),
+            cnf: options.cnf.clone(),
         };
         let mut header = Header::new(Algorithm::EdDSA);
         header.typ = Some(TOKEN_TYPE.to_owned());
@@ -345,6 +367,7 @@ impl Issuer {
             chain,
             expires_at,
             lease,
+            cnf: options.cnf.clone(),
         })
     }
 }

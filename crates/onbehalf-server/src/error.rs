@@ -110,6 +110,22 @@ impl IntoResponse for ApiError {
                 axum::http::HeaderValue::from_static("Basic realm=\"onbehalf\""),
             );
         }
+        if self.status == StatusCode::UNAUTHORIZED {
+            // RFC 9449 §7.1: a DPoP failure names the DPoP scheme and the accepted algorithms.
+            let err = match self.code.as_str() {
+                crate::dpop::DPOP_REQUIRED => Some(onbehalf_proxy::AuthError::DpopRequired),
+                crate::dpop::INVALID_DPOP_PROOF => {
+                    Some(onbehalf_proxy::AuthError::InvalidDpopProof(String::new()))
+                }
+                _ => None,
+            };
+            if let Some(v) =
+                err.and_then(|e| axum::http::HeaderValue::from_str(&e.challenge()).ok())
+            {
+                resp.headers_mut()
+                    .insert(axum::http::header::WWW_AUTHENTICATE, v);
+            }
+        }
         resp
     }
 }
@@ -150,6 +166,9 @@ impl From<onbehalf_token::TokenError> for ApiError {
                     .with_description("no_lifetime_left")
             }
             TokenError::Key(_) => return ApiError::internal(e),
+            TokenError::BindingRequired => {
+                return crate::dpop::DpopFailure::Required(e.to_string()).into()
+            }
             _ => "invalid_grant",
         };
         ApiError::bad_request(code, e.to_string())

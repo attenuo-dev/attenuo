@@ -1,0 +1,217 @@
+/**
+ * Sender-constrained tokens: DPoP proofs (RFC 9449).
+ *
+ * A token bound to a key carries `cnf.jkt`, the RFC 7638 thumbprint of that key, and the server
+ * accepts it only with a DPoP proof made by the key for each request. Give a client a `dpopKey`
+ * and it does this for you: every request carries a proof, exchanges bind the new token to the
+ * key, and bound tokens are sent as `Authorization: DPoP <token>`.
+ *
+ * Keys are private JWKs: Ed25519 (`{ kty: "OKP", crv: "Ed25519", x, d }`, what
+ * `onbehalf key gen --dpop` writes) or P-256 (`{ kty: "EC", crv: "P-256", x, y, d }`). Signing
+ * uses WebCrypto (`globalThis.crypto.subtle`); there are no extra dependencies.
+ */
+
+import { OnbehalfError } from "./errors.js";
+import { b64urlDecode } from "./token.js";
+
+/** `typ` of a DPoP proof. */
+export const PROOF_TYPE = "dpop+jwt";
+
+/** A private JWK as stored on disk, or any JWK-shaped object. */
+export type Jwk = Record<string, unknown>;
+
+/** A key, or a private JWK to make one from. */
+export type DpopKeyLike = DpopKey | Jwk;
+
+const ED25519 = "Ed25519";
+const P256: EcKeyImportParams = { name: "ECDSA", namedCurve: "P-256" };
+const ES256: EcdsaParams = { name: "ECDSA", hash: "SHA-256" };
+
+export function b64urlEncode(data: Uint8Array | ArrayBuffer | string): string {
+  const bytes =
+    typeof data === "string"
+      ? new TextEncoder().encode(data)
+      : data instanceof Uint8Array
+        ? data
+        : new Uint8Array(data);
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+async function sha256(text: string): Promise<string> {
+  return b64urlEncode(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)));
+}
+
+/** `ath`: base64url of the SHA-256 of the token. */
+export function accessTokenHash(token: string): Promise<string> {
+  return sha256(token);
+}
+
+function str(jwk: Jwk, member: string): string {
+  const v = jwk[member];
+  if (typeof v !== "string" || v === "") {
+    throw new OnbehalfError(`DPoP key: JWK member \`${member}\` is missing`);
+  }
+  return v;
+}
+
+/** The public members of an Ed25519 or P-256 JWK, in RFC 7638 (lexicographic) order. */
+function publicMembers(jwk: Jwk): Record<string, string> {
+  const kty = jwk.kty;
+  const crv = jwk.crv;
+  if (kty === "OKP" && crv === ED25519) return { crv, kty, x: str(jwk, "x") };
+  if (kty === "EC" && crv === "P-256") return { crv, kty, x: str(jwk, "x"), y: str(jwk, "y") };
+  throw new OnbehalfError(
+    `unsupported DPoP key type ${JSON.stringify(kty)} / curve ${JSON.stringify(crv)}`,
+  );
+}
+
+/** RFC 7638 SHA-256 thumbprint of an Ed25519 or P-256 JWK (private members are ignored). */
+export function jwkThumbprint(jwk: Jwk): Promise<string> {
+  return sha256(JSON.stringify(publicMembers(jwk)));
+}
+
+/** A DPoP private key that signs proofs (`EdDSA` or `ES256`). Make one with `fromJwk`/`generate`. */
+export class DpopKey {
+  private constructor(
+    private readonly key: CryptoKey,
+    private readonly d: string,
+    readonly alg: "EdDSA" | "ES256",
+    /** The public JWK carried in each proof header. */
+    readonly publicJwk: Readonly<Record<string, string>>,
+    /** RFC 7638 thumbprint: the `cnf.jkt` of tokens bound to this key. */
+    readonly thumbprint: string,
+  ) {}
+
+  /** Import a private JWK. Throws `OnbehalfError` for a public key or a key that does not match. */
+  static async fromJwk(jwk: Jwk): Promise<DpopKey> {
+    if (typeof jwk !== "object" || jwk === null) throw new OnbehalfError("DPoP key: not a JWK");
+    const pub = publicMembers(jwk);
+    const d = typeof jwk.d === "string" ? jwk.d : "";
+    if (!d) throw new OnbehalfError("a DPoP key must be a private JWK (with `d`)");
+    const ed = pub.kty === "OKP";
+    let key: CryptoKey;
+    try {
+      // WebCrypto checks that `d` and the public members belong together.
+      key = await crypto.subtle.importKey(
+        "jwk",
+        { ...pub, d } as JsonWebKey,
+        ed ? ED25519 : P256,
+        false,
+        ["sign"],
+      );
+    } catch (e) {
+      throw new OnbehalfError(`DPoP key: invalid ${pub.crv} key: ${(e as Error).message}`);
+    }
+    return new DpopKey(key, d, ed ? "EdDSA" : "ES256", pub, await jwkThumbprint(pub));
+  }
+
+  /** A fresh Ed25519 key. Keep `privateJwk()` somewhere safe to reuse it. */
+  static async generate(): Promise<DpopKey> {
+    const pair = (await crypto.subtle.generateKey(ED25519, true, [
+      "sign",
+      "verify",
+    ])) as CryptoKeyPair;
+    const jwk = await crypto.subtle.exportKey("jwk", pair.privateKey);
+    return DpopKey.fromJwk({ kty: "OKP", crv: ED25519, x: jwk.x, d: jwk.d });
+  }
+
+  /** Accept a key, a private JWK, or `undefined`. */
+  static async of(key: DpopKeyLike | undefined): Promise<DpopKey | undefined> {
+    if (key === undefined || key instanceof DpopKey) return key;
+    return DpopKey.fromJwk(key);
+  }
+
+  /** The private JWK, for storage. Secret. */
+  privateJwk(): Record<string, string> {
+    return { ...this.publicJwk, d: this.d };
+  }
+
+  /** Never print the private key. */
+  toJSON(): Record<string, string> {
+    return { alg: this.alg, jkt: this.thumbprint };
+  }
+
+  /**
+   * A proof for one request: `htm` = `method`, `htu` = `url` without query or fragment, a fresh
+   * `jti`, and `ath` when `accessToken` (a bound token sent with the request) is given.
+   */
+  async proof(
+    method: string,
+    url: string,
+    accessToken?: string,
+    opts: { iat?: number } = {},
+  ): Promise<string> {
+    const claims: Record<string, unknown> = {
+      jti: crypto.randomUUID(),
+      htm: method.toUpperCase(),
+      htu: url.split("#", 1)[0]!.split("?", 1)[0]!,
+      iat: opts.iat ?? Math.floor(Date.now() / 1000),
+    };
+    if (accessToken !== undefined) claims.ath = await accessTokenHash(accessToken);
+    return this.sign(claims);
+  }
+
+  /** Sign arbitrary proof claims under a DPoP header (for tests and special cases). */
+  async sign(claims: Record<string, unknown>): Promise<string> {
+    const header = { typ: PROOF_TYPE, alg: this.alg, jwk: this.publicJwk };
+    const signing = `${b64urlEncode(JSON.stringify(header))}.${b64urlEncode(JSON.stringify(claims))}`;
+    const data = new TextEncoder().encode(signing);
+    // ES256 in WebCrypto already produces the JWS form (r || s, 64 bytes).
+    const sig = await crypto.subtle.sign(this.alg === "EdDSA" ? ED25519 : ES256, this.key, data);
+    return `${signing}.${b64urlEncode(sig)}`;
+  }
+}
+
+/** `cnf.jkt` of a token, read without verification; `undefined` for a bearer token. */
+export function tokenJkt(token: string): string | undefined {
+  try {
+    const claims: unknown = JSON.parse(
+      new TextDecoder().decode(b64urlDecode(token.split(".")[1]!)),
+    );
+    const cnf = (claims as { cnf?: { jkt?: unknown } } | null)?.cnf;
+    return typeof cnf?.jkt === "string" ? cnf.jkt : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** `Authorization` (and `DPoP`) headers to present `token` for a request. */
+export async function presented(
+  token: string,
+  key: DpopKey | undefined,
+  method: string,
+  url: string,
+): Promise<Record<string, string>> {
+  if (key === undefined) return { authorization: `Bearer ${token}` };
+  return { authorization: `DPoP ${token}`, dpop: await key.proof(method, url, token) };
+}
+
+/**
+ * The `DPoP` header and the `subject_token_dpop` sign-off of an exchange.
+ *
+ * `key` binds the new token; its proof covers the subject token when the subject token is bound
+ * to the same key. `subjectKey` is the subject token's key when the new token is bound to another
+ * one: its proof is the parent holder's consent.
+ */
+export async function exchangeProofs(
+  url: string,
+  subjectToken: string,
+  key: DpopKey | undefined,
+  subjectKey: DpopKey | undefined,
+): Promise<{ header?: string; signOff?: string }> {
+  const parent = tokenJkt(subjectToken);
+  const out: { header?: string; signOff?: string } = {};
+  if (key !== undefined) {
+    const same = parent !== undefined && parent === key.thumbprint;
+    out.header = await key.proof("POST", url, same ? subjectToken : undefined);
+  }
+  if (subjectKey !== undefined) {
+    if (parent !== undefined && parent !== subjectKey.thumbprint) {
+      throw new OnbehalfError("subjectDpopKey is not the key the subject token is bound to");
+    }
+    out.signOff = await subjectKey.proof("POST", url, subjectToken);
+  }
+  return out;
+}

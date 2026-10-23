@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use onbehalf_audit::{AuditSink, LeaseStore};
 use onbehalf_core::{Decision, DecisionRecord, DelegationChain, ToolCall};
 use onbehalf_policy::PolicyEngine;
-use onbehalf_proxy::{AuthDecision, AuthError, Authorizer};
+use onbehalf_proxy::{AuthDecision, AuthError, Authenticated, Authorizer, RequestAuth};
 use onbehalf_token::Verifier;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -250,11 +250,13 @@ async fn on_blocking_pool<R: Send + 'static>(
     }
 }
 
-/// The proxy's authorizer: token verification plus [`Pipeline::decide`].
+/// The proxy's authorizer: token verification, DPoP ([`crate::dpop`]) and
+/// [`Pipeline::decide`].
 pub struct ServerAuthorizer {
     verifier: Verifier,
     pipeline: Arc<Pipeline>,
     verified: VerifiedTokens,
+    dpop: Option<Arc<crate::dpop::Dpop>>,
 }
 
 impl ServerAuthorizer {
@@ -263,7 +265,35 @@ impl ServerAuthorizer {
             verifier,
             pipeline,
             verified: VerifiedTokens::new(VERIFIED_TOKENS_CAPACITY),
+            dpop: None,
         }
+    }
+
+    /// Check DPoP proofs with these settings and replay cache (the server's own). Without
+    /// this, a bound token is always refused (`dpop_required`): the proof cannot be checked.
+    pub fn with_dpop(mut self, dpop: Arc<crate::dpop::Dpop>) -> Self {
+        self.dpop = Some(dpop);
+        self
+    }
+
+    fn verify(
+        &self,
+        token: &str,
+        now: OffsetDateTime,
+    ) -> Result<onbehalf_token::VerifiedToken, AuthError> {
+        let key = VerifiedTokens::key(token);
+        if let Some(v) = self.verified.get(&key, now, self.verifier.max_depth()) {
+            return Ok(v);
+        }
+        let v = self.verifier.verify(token, now).map_err(|e| {
+            if crate::error::is_expiry(&e) {
+                AuthError::TokenExpired
+            } else {
+                AuthError::InvalidToken(e.to_string())
+            }
+        })?;
+        self.verified.insert(key, &v, now);
+        Ok(v)
     }
 }
 
@@ -284,7 +314,7 @@ pub const VERIFIED_TOKENS_CAPACITY: usize = 4096;
 /// Bounded: when full, expired chains are dropped, and if that frees nothing the map is
 /// cleared (the next calls simply verify again).
 struct VerifiedTokens {
-    chains: Mutex<HashMap<[u8; 32], DelegationChain>>,
+    chains: Mutex<HashMap<[u8; 32], onbehalf_token::VerifiedToken>>,
     capacity: usize,
 }
 
@@ -301,57 +331,73 @@ impl VerifiedTokens {
         Sha256::digest(token.as_bytes()).into()
     }
 
-    /// The cached chain for `token`, if it is still valid at `now`.
+    /// The cached verified token, if its chain is still valid at `now`.
     fn get(
         &self,
         key: &[u8; 32],
         now: OffsetDateTime,
         max_depth: usize,
-    ) -> Option<DelegationChain> {
+    ) -> Option<onbehalf_token::VerifiedToken> {
         let chains = self.chains.lock().ok()?;
-        let chain = chains.get(key)?;
-        chain.validate_at(now, max_depth).ok()?;
-        Some(chain.clone())
+        let v = chains.get(key)?;
+        v.chain.validate_at(now, max_depth).ok()?;
+        Some(v.clone())
     }
 
-    fn insert(&self, key: [u8; 32], chain: &DelegationChain, now: OffsetDateTime) {
+    fn insert(&self, key: [u8; 32], v: &onbehalf_token::VerifiedToken, now: OffsetDateTime) {
         let Ok(mut chains) = self.chains.lock() else {
             return;
         };
         if chains.len() >= self.capacity {
-            chains.retain(|_, c| c.hops.iter().all(|h| h.expires_at > now));
+            chains.retain(|_, c| c.chain.hops.iter().all(|h| h.expires_at > now));
             if chains.len() >= self.capacity {
                 chains.clear();
             }
         }
-        chains.insert(key, chain.clone());
+        chains.insert(key, v.clone());
     }
 }
 
 #[async_trait]
 impl Authorizer for ServerAuthorizer {
+    /// Without the request there is no DPoP proof to check: a bound token is refused.
     async fn authenticate(
         &self,
         bearer: &str,
         now: OffsetDateTime,
     ) -> Result<DelegationChain, AuthError> {
-        let key = VerifiedTokens::key(bearer);
-        if let Some(chain) = self.verified.get(&key, now, self.verifier.max_depth()) {
-            return Ok(chain);
+        let v = self.verify(bearer, now)?;
+        if v.claims.cnf.is_some() {
+            return Err(AuthError::DpopRequired);
         }
-        let chain = self
-            .verifier
-            .verify(bearer, now)
-            .map(|v| v.chain)
-            .map_err(|e| {
-                if crate::error::is_expiry(&e) {
-                    AuthError::TokenExpired
-                } else {
-                    AuthError::InvalidToken(e.to_string())
-                }
-            })?;
-        self.verified.insert(key, &chain, now);
-        Ok(chain)
+        Ok(v.chain)
+    }
+
+    async fn authenticate_request(
+        &self,
+        req: &RequestAuth<'_>,
+        now: OffsetDateTime,
+    ) -> Result<Authenticated, AuthError> {
+        let v = self.verify(req.token, now)?;
+        let dpop_bound = match &self.dpop {
+            Some(dpop) => {
+                let url = dpop.expected_url(req.host, req.path);
+                dpop.check_presented(
+                    v.claims.cnf.as_ref(),
+                    req.token,
+                    req.dpop,
+                    req.method,
+                    &url,
+                    now,
+                )?
+            }
+            None if v.claims.cnf.is_some() => return Err(AuthError::DpopRequired),
+            None => false,
+        };
+        Ok(Authenticated {
+            chain: v.chain,
+            dpop_bound,
+        })
     }
 
     async fn check_active(
@@ -609,19 +655,35 @@ mod tests {
 
     #[test]
     fn verified_token_cache_stays_bounded() {
-        let (_p, _leases, _audit, chain) = setup();
+        let issuer = onbehalf_token::Issuer::generate(onbehalf_token::IssuerConfig {
+            issuer: "https://onbehalf.test".into(),
+            audience: "onbehalf".into(),
+            max_depth: 4,
+            default_ttl: Duration::minutes(5),
+        });
         let now = OffsetDateTime::now_utc();
+        let user = OriginatingUser {
+            subject: "alice".into(),
+            issuer: "idp".into(),
+            authenticated_at: now,
+            attributes: Default::default(),
+        };
+        let caps = CapabilitySet::from_iter([Capability::new("github", "read_*")]);
+        let issued = issuer
+            .issue_root(user, AgentId::new("planner"), caps, None, now)
+            .unwrap();
+        let v = issuer.verifier().verify(&issued.token, now).unwrap();
         let cache = VerifiedTokens::new(3);
         for i in 0..10 {
-            cache.insert(VerifiedTokens::key(&format!("t{i}")), &chain, now);
+            cache.insert(VerifiedTokens::key(&format!("t{i}")), &v, now);
             assert!(cache.chains.lock().unwrap().len() <= 3);
         }
         // Expired entries go first when the cache is full.
-        let expired_at = chain.hops[0].expires_at;
+        let expired_at = v.chain.hops[0].expires_at;
         let cache = VerifiedTokens::new(2);
-        cache.insert(VerifiedTokens::key("a"), &chain, now);
-        cache.insert(VerifiedTokens::key("b"), &chain, now);
-        cache.insert(VerifiedTokens::key("c"), &chain, expired_at);
+        cache.insert(VerifiedTokens::key("a"), &v, now);
+        cache.insert(VerifiedTokens::key("b"), &v, now);
+        cache.insert(VerifiedTokens::key("c"), &v, expired_at);
         let chains = cache.chains.lock().unwrap();
         assert_eq!(chains.len(), 1);
         assert!(chains.contains_key(&VerifiedTokens::key("c")));

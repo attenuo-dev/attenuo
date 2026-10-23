@@ -4,6 +4,8 @@ use onbehalf_core::{AgentId, CapabilitySet, DelegationChain, Hop, LeaseId, Origi
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use crate::dpop::Confirmation;
+
 /// Value of the JWT header `typ` and of the `typ` claim. Verifiers reject anything else, so a
 /// delegation token can never be confused with an ordinary access token for the same audience.
 pub const TOKEN_TYPE: &str = "onbehalf+jwt";
@@ -102,6 +104,11 @@ pub struct Claims {
     /// `may_act` its own exchange asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub may_act: Option<MayAct>,
+    /// RFC 9449 §6.1 / RFC 7800 confirmation: the thumbprint of the key the holder must prove
+    /// possession of with a DPoP proof on every use ([`crate::dpop`]). Absent for a bearer
+    /// token. A child of a bound token is always bound ([`crate::TokenError::BindingRequired`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cnf: Option<Confirmation>,
 }
 
 /// The RFC 8693 §4.4 `may_act` claim, restricted to agent ids.

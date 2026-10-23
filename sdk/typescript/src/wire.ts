@@ -2,6 +2,7 @@
 
 import { capabilitiesToJson, type CapabilityLike } from "./capability.js";
 import { ApiError, DeniedError, OnbehalfError, RpcError, UnauthorizedError } from "./errors.js";
+import type { DpopKeyLike } from "./dpop.js";
 import { bearer, decodeToken, parseTime, type Token } from "./token.js";
 
 export const TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange";
@@ -136,6 +137,11 @@ export interface ExchangeOptions {
   actorToken?: string;
   /** RFC 8693 §4.4 `may_act` for the new token: the agents allowed to exchange it next. */
   mayAct?: readonly string[];
+  /**
+   * The key `subjectToken` is bound to (DPoP), when the new token is bound to another key: its
+   * proof, sent as `subject_token_dpop`, is the parent holder's consent.
+   */
+  subjectDpopKey?: DpopKeyLike;
 }
 
 export function exchangeBody(

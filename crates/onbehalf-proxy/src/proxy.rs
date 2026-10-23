@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, State};
+use axum::extract::{OriginalUri, Path, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -20,7 +20,7 @@ use tower_http::trace::TraceLayer;
 use tracing::Instrument;
 use uuid::Uuid;
 
-use crate::auth::{AuthError, Authorizer};
+use crate::auth::{AuthError, Authenticated, Authorizer, RequestAuth};
 use crate::config::ProxyConfig;
 use crate::filter::{ListFilter, ListKind};
 use crate::guard::{guard_stream, StreamGuard};
@@ -162,6 +162,8 @@ pub async fn serve(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> anyh
 // Authentication
 // ---------------------------------------------------------------------------------------------
 
+/// The token of `Authorization: Bearer <token>` or `Authorization: DPoP <token>` (RFC 9449
+/// §7.1). Whether a proof is needed depends on the token, not on the scheme.
 fn bearer_of(headers: &HeaderMap) -> Result<&str, AuthError> {
     let raw = headers
         .get(header::AUTHORIZATION)
@@ -171,19 +173,45 @@ fn bearer_of(headers: &HeaderMap) -> Result<&str, AuthError> {
     let (scheme, token) = raw
         .split_once(' ')
         .ok_or_else(|| AuthError::InvalidToken("expected `Bearer <token>`".into()))?;
-    if !scheme.eq_ignore_ascii_case("bearer") || token.trim().is_empty() {
+    let known = scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("dpop");
+    if !known || token.trim().is_empty() {
         return Err(AuthError::InvalidToken("expected `Bearer <token>`".into()));
     }
     Ok(token.trim())
 }
 
+/// The request's `DPoP` header: none, or exactly one ASCII value (RFC 9449 §4.3).
+fn dpop_of(headers: &HeaderMap) -> Result<Option<&str>, AuthError> {
+    let mut values = headers.get_all("dpop").iter();
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(AuthError::InvalidDpopProof(
+            "more than one DPoP header".into(),
+        ));
+    }
+    first
+        .to_str()
+        .map(Some)
+        .map_err(|_| AuthError::InvalidDpopProof("DPoP header is not ASCII".into()))
+}
+
 async fn authenticate(
     state: &AppState,
+    method: &Method,
+    uri: &axum::http::Uri,
     headers: &HeaderMap,
     now: OffsetDateTime,
-) -> Result<DelegationChain, AuthError> {
-    let bearer = bearer_of(headers)?;
-    state.authorizer.authenticate(bearer, now).await
+) -> Result<Authenticated, AuthError> {
+    let req = RequestAuth {
+        token: bearer_of(headers)?,
+        dpop: dpop_of(headers)?,
+        method: method.as_str(),
+        path: uri.path(),
+        host: header_str(headers, header::HOST.as_str()),
+    };
+    state.authorizer.authenticate_request(&req, now).await
 }
 
 /// A 401 that names only the stable reason code ([`AuthError::reason`]); the verifier's detail
@@ -195,10 +223,10 @@ fn unauthorized(err: AuthError) -> Response {
     tracing::debug!(error = ?err.to_string(), "authentication failure detail");
     let body = unauthorized_body(Value::Null, &err);
     let mut resp = json_response(StatusCode::UNAUTHORIZED, &body);
-    resp.headers_mut().insert(
-        header::WWW_AUTHENTICATE,
-        HeaderValue::from_static("Bearer realm=\"onbehalf\""),
-    );
+    if let Ok(challenge) = HeaderValue::from_str(&err.challenge()) {
+        resp.headers_mut()
+            .insert(header::WWW_AUTHENTICATE, challenge);
+    }
     resp
 }
 
@@ -263,10 +291,11 @@ async fn session_gate(
     state: &AppState,
     server: &str,
     method: &Method,
-    chain: &DelegationChain,
+    who: &Authenticated,
     session_id: Option<&str>,
     now: OffsetDateTime,
 ) -> Result<Option<SessionOwner>, Response> {
+    let chain = &who.chain;
     let owner = SessionOwner::of(chain);
     let Some(sid) = session_id else {
         return Ok(owner);
@@ -290,7 +319,8 @@ async fn session_gate(
         SessionCheck::Mismatch => {
             let tag = session_tag(sid);
             let call = ToolCall::new(server, format!("http.{method}"), serde_json::json!({}))
-                .with_session(tag.clone());
+                .with_session(tag.clone())
+                .with_dpop_bound(who.dpop_bound);
             let id = state
                 .authorizer
                 .record_rejection(chain, &call, REASON_SESSION_MISMATCH, now)
@@ -517,6 +547,7 @@ fn forward_headers(headers: &HeaderMap, names: &[&'static str]) -> HeaderMap {
 async fn handle_passthrough(
     State(state): State<Arc<AppState>>,
     Path(server): Path<String>,
+    OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
     body: Body,
@@ -525,10 +556,11 @@ async fn handle_passthrough(
         return unknown_server(&server);
     };
     let now = OffsetDateTime::now_utc();
-    let chain = match authenticate(&state, &headers, now).await {
-        Ok(c) => c,
+    let who = match authenticate(&state, &method, &uri, &headers, now).await {
+        Ok(a) => a,
         Err(e) => return unauthorized(e),
     };
+    let chain = who.chain.clone();
     if let Err(e) = state.authorizer.check_active(&chain, now).await {
         return unauthorized(e);
     }
@@ -542,12 +574,11 @@ async fn handle_passthrough(
     };
     let span = request_span(&server, &chain, session_id.as_deref());
     async move {
-        let owner = match session_gate(&state, &server, &method, &chain, session_id.as_deref(), now)
-            .await
-        {
-            Ok(o) => o,
-            Err(resp) => return resp,
-        };
+        let owner =
+            match session_gate(&state, &server, &method, &who, session_id.as_deref(), now).await {
+                Ok(o) => o,
+                Err(resp) => return resp,
+            };
         tracing::debug!(%method, "forwarding transparently");
         let is_delete = method == Method::DELETE;
         // The listen stream lives as long as the client keeps it open: re-check it (SR-28).
@@ -614,6 +645,7 @@ struct Screened {
 async fn handle_post(
     State(state): State<Arc<AppState>>,
     Path(server): Path<String>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
@@ -621,10 +653,11 @@ async fn handle_post(
         return unknown_server(&server);
     };
     let now = OffsetDateTime::now_utc();
-    let chain = match authenticate(&state, &headers, now).await {
-        Ok(c) => c,
+    let who = match authenticate(&state, &Method::POST, &uri, &headers, now).await {
+        Ok(a) => a,
         Err(e) => return unauthorized(e),
     };
+    let chain = &who.chain;
     let session_id = match session_id_of(&headers) {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -634,13 +667,13 @@ async fn handle_post(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let span = request_span(&server, &chain, session_id.as_deref());
+    let span = request_span(&server, chain, session_id.as_deref());
     async {
         let owner = match session_gate(
             &state,
             &server,
             &Method::POST,
-            &chain,
+            &who,
             session_id.as_deref(),
             now,
         )
@@ -653,7 +686,7 @@ async fn handle_post(
             &state,
             upstream,
             &server,
-            &chain,
+            &who,
             session_id.as_deref(),
             &headers,
             body,
@@ -672,12 +705,13 @@ async fn handle_post_inner(
     state: &AppState,
     upstream: &str,
     server: &str,
-    chain: &DelegationChain,
+    who: &Authenticated,
     session_id: Option<&str>,
     headers: &HeaderMap,
     body: Bytes,
     now: OffsetDateTime,
 ) -> Response {
+    let chain = &who.chain;
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -717,7 +751,7 @@ async fn handle_post_inner(
 
     let mut screened = Screened::default();
     for msg in messages {
-        screen_message(state, chain, server, session_id, msg, now, &mut screened).await;
+        screen_message(state, who, server, session_id, msg, now, &mut screened).await;
     }
 
     // A single message that was refused only because the token's lease is inactive is an
@@ -858,13 +892,14 @@ async fn handle_post_inner(
 /// - Allowlisted methods and `notifications/*` are forwarded, after a lease check.
 async fn screen_message(
     state: &AppState,
-    chain: &DelegationChain,
+    who: &Authenticated,
     server: &str,
     session_id: Option<&str>,
     msg: Value,
     now: OffsetDateTime,
     out: &mut Screened,
 ) {
+    let chain = &who.chain;
     let method = method_of(&msg).map(str::to_owned);
     let Some(method) = method else {
         // A response to a server-initiated request, or something malformed: the upstream
@@ -913,10 +948,7 @@ async fn screen_message(
                 return;
             };
             if let Some(reason) = tool_name_refusal(state, server, &name) {
-                refuse_call(
-                    state, chain, server, session_id, &name, id, reason, now, out,
-                )
-                .await;
+                refuse_call(state, who, server, session_id, &name, id, reason, now, out).await;
                 return;
             }
             let arguments = match params.and_then(|p| p.get("arguments")) {
@@ -964,7 +996,7 @@ async fn screen_message(
         ),
     };
 
-    let mut call = ToolCall::new(server, tool.clone(), arguments);
+    let mut call = ToolCall::new(server, tool.clone(), arguments).with_dpop_bound(who.dpop_bound);
     if let Some(sid) = session_id {
         // Policy and the audit log see a stable hash prefix, not the session id (SR-11).
         call = call.with_session(session_tag(sid));
@@ -1010,7 +1042,7 @@ fn tool_name_refusal(state: &AppState, server: &str, name: &str) -> Option<&'sta
 #[allow(clippy::too_many_arguments)]
 async fn refuse_call(
     state: &AppState,
-    chain: &DelegationChain,
+    who: &Authenticated,
     server: &str,
     session_id: Option<&str>,
     name: &str,
@@ -1019,13 +1051,14 @@ async fn refuse_call(
     now: OffsetDateTime,
     out: &mut Screened,
 ) {
-    let mut call = ToolCall::new(server, name, serde_json::json!({}));
+    let mut call =
+        ToolCall::new(server, name, serde_json::json!({})).with_dpop_bound(who.dpop_bound);
     if let Some(sid) = session_id {
         call = call.with_session(session_tag(sid));
     }
     let decision_id = state
         .authorizer
-        .record_rejection(chain, &call, reason, now)
+        .record_rejection(&who.chain, &call, reason, now)
         .await;
     // `name` is caller-controlled: Debug-format it so it cannot forge log lines.
     tracing::warn!(tool = ?name, reason, %decision_id, "tools/call refused");

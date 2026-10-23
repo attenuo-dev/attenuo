@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 
 from ._wire import MCP_ACCEPT, bearer, normalize_base
+from .dpop import DpopKey
 from .token import Token
 
 
@@ -54,11 +55,25 @@ class TokenAuth(httpx.Auth):
 
     This subclasses ``httpx.Auth``. If your MCP client uses a different HTTP library, build the
     same thing for that library; the logic is one line: set ``Authorization`` per request.
+
+    With ``dpop_key``, each request also gets a DPoP proof for its method and URL, and the token
+    is sent as ``Authorization: DPoP <token>``: what a token bound to that key needs. Static
+    headers (:func:`mcp_headers`) cannot carry proofs, which are single-use.
     """
 
-    def __init__(self, provider: Callable[[], Token | str]) -> None:
+    def __init__(
+        self,
+        provider: Callable[[], Token | str],
+        dpop_key: DpopKey | dict[str, Any] | None = None,
+    ) -> None:
         self._provider = provider
+        self._dpop_key = DpopKey.of(dpop_key)
 
     def auth_flow(self, request: httpx.Request) -> Any:
-        request.headers["Authorization"] = f"Bearer {bearer(self._provider())}"
+        token = bearer(self._provider())
+        if self._dpop_key is None:
+            request.headers["Authorization"] = f"Bearer {token}"
+        else:
+            request.headers["Authorization"] = f"DPoP {token}"
+            request.headers["DPoP"] = self._dpop_key.proof(request.method, str(request.url), token)
         yield request

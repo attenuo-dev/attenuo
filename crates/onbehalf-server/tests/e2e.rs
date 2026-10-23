@@ -2008,6 +2008,7 @@ fn append_synthetic(h: &Harness, n: usize) {
             arguments_digest: format!("{i:064}"),
             session_id: None,
             policy_ids: Vec::new(),
+            dpop_bound: false,
         };
         h.state.audit.append(record).unwrap();
     }

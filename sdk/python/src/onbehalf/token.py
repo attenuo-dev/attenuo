@@ -150,6 +150,14 @@ class Token:
         """Seconds until the token expires (negative once it has)."""
         return (self.expires_at - datetime.now(timezone.utc)).total_seconds()
 
+    @property
+    def dpop_jkt(self) -> str | None:
+        """``cnf.jkt``: thumbprint of the key the token is bound to (DPoP), or ``None`` for a
+        bearer token. A bound token is accepted only with proofs by that key."""
+        cnf = self.claims.get("cnf")
+        jkt = cnf.get("jkt") if isinstance(cnf, dict) else None
+        return jkt if isinstance(jkt, str) else None
+
 
 def decode_token(jwt: str, lease: str | None = None) -> Token:
     """Decode a delegation token. **Nothing is verified**: this is whatever the sender wrote."""

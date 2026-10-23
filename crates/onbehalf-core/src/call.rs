@@ -20,6 +20,10 @@ pub struct ToolCall {
     /// Caller-supplied session identifier, if any (used for session-scoped policy and leases).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// The request proved possession of the key its token is bound to (a DPoP proof for a
+    /// token with `cnf.jkt`, SR-24). Recorded in the audit log; not part of the policy input.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dpop_bound: bool,
 }
 
 impl ToolCall {
@@ -34,7 +38,14 @@ impl ToolCall {
             tool: tool.into(),
             arguments,
             session_id: None,
+            dpop_bound: false,
         }
+    }
+
+    /// Mark whether the request carried a verified DPoP proof for a bound token.
+    pub fn with_dpop_bound(mut self, bound: bool) -> Self {
+        self.dpop_bound = bound;
+        self
     }
 
     pub fn with_session(mut self, session_id: impl Into<String>) -> Self {

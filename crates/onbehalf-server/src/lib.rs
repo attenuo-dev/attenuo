@@ -9,7 +9,7 @@
 //! |---|---|---|
 //! | `POST /token` | client credentials + IdP credential | hop 0 from an OIDC ID token or ID-JAG ([`idp`]) |
 //! | `POST /token` | subject token in body; actor by client credentials or `actor_token` ([`actor`]) | RFC 8693 exchange, hop n to n+1 |
-//! | `POST /token/renew` | delegation token (bearer) | extend the last hop's lease |
+//! | `POST /token/renew` | delegation token (bearer; with a `DPoP` proof when bound, [`dpop`]) | extend the last hop's lease |
 //! | `POST /access/v1/evaluation` | delegation token (bearer); or `[[peps]]` credentials with `[authzen] allow_unsigned_chain` | AuthZEN evaluation |
 //! | `POST /access/v1/evaluations` | same as above | AuthZEN batch evaluation, at most `[authzen] max_batch` entries |
 //! | `GET /.well-known/authzen-configuration` | none | AuthZEN metadata |
@@ -30,6 +30,7 @@ pub mod actor;
 pub mod authz;
 pub mod clientauth;
 pub mod config;
+pub mod dpop;
 pub mod error;
 pub mod idp;
 pub mod jwks;
@@ -92,10 +93,10 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
         .with_state(state.clone())
         .layer(TraceLayer::new_for_http());
 
-    let authorizer = Arc::new(ServerAuthorizer::new(
-        state.verifier.clone(),
-        state.pipeline.clone(),
-    ));
+    let authorizer = Arc::new(
+        ServerAuthorizer::new(state.verifier.clone(), state.pipeline.clone())
+            .with_dpop(state.dpop.clone()),
+    );
     let proxy = onbehalf_proxy::router(
         // Validated in `AppState::from_config`.
         config
