@@ -35,10 +35,55 @@ pub struct Metrics {
     tokens_exchange: AtomicU64,
     leases_revoked: AtomicU64,
     audit_append_errors: AtomicU64,
+    audit_checkpoints: AtomicU64,
+    /// Time to decide one tool call.
+    authorize: Histogram,
+    /// Time for one audit append, lock wait and commit included.
+    audit_append: Histogram,
+}
+
+/// A fixed-bucket histogram over [`BUCKETS`].
+#[derive(Debug, Default)]
+struct Histogram {
     /// Non-cumulative per-bucket counts; the last slot is `+Inf`.
     buckets: [AtomicU64; BUCKETS.len() + 1],
-    duration_nanos: AtomicU64,
-    duration_count: AtomicU64,
+    nanos: AtomicU64,
+    count: AtomicU64,
+}
+
+impl Histogram {
+    fn observe(&self, d: Duration) {
+        let secs = d.as_secs_f64();
+        let i = BUCKETS
+            .iter()
+            .position(|b| secs <= *b)
+            .unwrap_or(BUCKETS.len());
+        self.buckets[i].fetch_add(1, Ordering::Relaxed);
+        let nanos = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        self.nanos.fetch_add(nanos, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn render(&self, out: &mut String, name: &str, help: &str) {
+        header_lines(out, name, help, "histogram");
+        let mut cumulative = 0;
+        for (i, bound) in BUCKETS.iter().enumerate() {
+            cumulative += self.buckets[i].load(Ordering::Relaxed);
+            let _ = writeln!(out, "{PREFIX}_{name}_bucket{{le=\"{bound}\"}} {cumulative}");
+        }
+        cumulative += self.buckets[BUCKETS.len()].load(Ordering::Relaxed);
+        let _ = writeln!(out, "{PREFIX}_{name}_bucket{{le=\"+Inf\"}} {cumulative}");
+        let _ = writeln!(
+            out,
+            "{PREFIX}_{name}_sum {}",
+            self.nanos.load(Ordering::Relaxed) as f64 / 1e9
+        );
+        let _ = writeln!(
+            out,
+            "{PREFIX}_{name}_count {}",
+            self.count.load(Ordering::Relaxed)
+        );
+    }
 }
 
 /// Which kind of token was issued.
@@ -86,15 +131,26 @@ impl Metrics {
 
     /// Record how long one authorization decision took.
     pub fn observe_authorize(&self, d: Duration) {
-        let secs = d.as_secs_f64();
-        let i = BUCKETS
-            .iter()
-            .position(|b| secs <= *b)
-            .unwrap_or(BUCKETS.len());
-        self.buckets[i].fetch_add(1, Ordering::Relaxed);
-        let nanos = u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
-        self.duration_nanos.fetch_add(nanos, Ordering::Relaxed);
-        self.duration_count.fetch_add(1, Ordering::Relaxed);
+        self.authorize.observe(d);
+    }
+
+    /// Record how long one audit append took, from asking for the store's lock to the commit
+    /// (failed appends included).
+    pub fn observe_audit_append(&self, d: Duration) {
+        self.audit_append.observe(d);
+    }
+
+    /// Run an audit append and record its duration.
+    pub fn time_audit_append<R>(&self, append: impl FnOnce() -> R) -> R {
+        let started = std::time::Instant::now();
+        let out = append();
+        self.observe_audit_append(started.elapsed());
+        out
+    }
+
+    /// Count one signed audit checkpoint.
+    pub fn audit_checkpoint(&self) {
+        self.audit_checkpoints.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Prometheus text exposition format (version 0.0.4).
@@ -144,6 +200,12 @@ impl Metrics {
             "Audit log appends that failed.",
             &self.audit_append_errors,
         );
+        simple_counter(
+            &mut out,
+            "audit_checkpoints_total",
+            "Signed audit checkpoints written.",
+            &self.audit_checkpoints,
+        );
         header_lines(
             &mut out,
             "http_requests_total",
@@ -159,34 +221,15 @@ impl Metrics {
                 );
             }
         }
-        header_lines(
+        self.authorize.render(
             &mut out,
             "authorize_duration_seconds",
             "Time to decide one tool call (leases, policy, audit append).",
-            "histogram",
         );
-        let mut cumulative = 0;
-        for (i, bound) in BUCKETS.iter().enumerate() {
-            cumulative += self.buckets[i].load(Ordering::Relaxed);
-            let _ = writeln!(
-                out,
-                "{PREFIX}_authorize_duration_seconds_bucket{{le=\"{bound}\"}} {cumulative}"
-            );
-        }
-        cumulative += self.buckets[BUCKETS.len()].load(Ordering::Relaxed);
-        let _ = writeln!(
-            out,
-            "{PREFIX}_authorize_duration_seconds_bucket{{le=\"+Inf\"}} {cumulative}"
-        );
-        let _ = writeln!(
-            out,
-            "{PREFIX}_authorize_duration_seconds_sum {}",
-            self.duration_nanos.load(Ordering::Relaxed) as f64 / 1e9
-        );
-        let _ = writeln!(
-            out,
-            "{PREFIX}_authorize_duration_seconds_count {}",
-            self.duration_count.load(Ordering::Relaxed)
+        self.audit_append.render(
+            &mut out,
+            "audit_append_duration_seconds",
+            "Time for one audit log append, including waiting for the store's lock.",
         );
         out
     }
@@ -267,5 +310,33 @@ mod tests {
         assert!(text.contains("authorize_duration_seconds_bucket{le=\"+Inf\"} 3\n"));
         assert!(text.contains("authorize_duration_seconds_count 3\n"));
         assert!(text.contains("# TYPE onbehalf_authorize_duration_seconds histogram\n"));
+    }
+
+    #[test]
+    fn renders_audit_append_histogram_and_checkpoint_counter() {
+        let m = Metrics::new();
+        let text = m.render();
+        assert!(text.contains("# TYPE onbehalf_audit_append_duration_seconds histogram\n"));
+        assert!(text.contains("onbehalf_audit_append_duration_seconds_count 0\n"));
+        assert!(text.contains("# TYPE onbehalf_audit_checkpoints_total counter\n"));
+        assert!(text.contains("onbehalf_audit_checkpoints_total 0\n"));
+
+        m.observe_audit_append(Duration::from_micros(300));
+        m.observe_audit_append(Duration::from_millis(7));
+        let slow = m.time_audit_append(|| {
+            std::thread::sleep(Duration::from_millis(30));
+            "done"
+        });
+        assert_eq!(slow, "done");
+        m.audit_checkpoint();
+        m.audit_checkpoint();
+        let text = m.render();
+        assert!(text.contains("audit_append_duration_seconds_bucket{le=\"0.0005\"} 1\n"));
+        assert!(text.contains("audit_append_duration_seconds_bucket{le=\"0.01\"} 2\n"));
+        assert!(text.contains("audit_append_duration_seconds_bucket{le=\"+Inf\"} 3\n"));
+        assert!(text.contains("audit_append_duration_seconds_count 3\n"));
+        assert!(text.contains("onbehalf_audit_checkpoints_total 2\n"));
+        // The two histograms are independent.
+        assert!(text.contains("onbehalf_authorize_duration_seconds_count 0\n"));
     }
 }

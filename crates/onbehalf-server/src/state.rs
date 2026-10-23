@@ -70,8 +70,9 @@ impl AppState {
         let policy = Arc::new(RwLock::new(engine));
 
         let checkpoint_keys = CheckpointKeys::from_jwks(&jwks)?;
-        let (audit, leases) = open_storage(&config.audit, issuer.detached_signer())?;
         let metrics = Metrics::new();
+        let (audit, leases) =
+            open_storage(&config.audit, issuer.detached_signer(), metrics.clone())?;
         let pipeline = Arc::new(
             Pipeline::new(policy, leases.clone(), audit.clone()).with_metrics(metrics.clone()),
         );
@@ -291,13 +292,17 @@ fn build_engine(config: &Config) -> anyhow::Result<PolicyEngine> {
 fn open_storage(
     cfg: &crate::config::AuditSection,
     signer: onbehalf_token::DetachedSigner,
+    metrics: Arc<Metrics>,
 ) -> anyhow::Result<(Arc<SqliteAudit>, Arc<SqliteLeaseStore>)> {
+    let count = move |_: &onbehalf_audit::Checkpoint| metrics.audit_checkpoint();
     let path = cfg.sqlite_path.as_str();
     if path == ":memory:" {
         tracing::warn!("audit.sqlite_path is :memory:; the audit log is lost on exit");
         return Ok((
             Arc::new(
-                SqliteAudit::open_in_memory()?.with_checkpointing(signer, cfg.checkpoint_every),
+                SqliteAudit::open_in_memory()?
+                    .with_checkpointing(signer, cfg.checkpoint_every)
+                    .with_checkpoint_hook(count),
             ),
             Arc::new(SqliteLeaseStore::open_in_memory()?),
         ));
@@ -308,7 +313,8 @@ fn open_storage(
     }
     let audit = SqliteAudit::open(p)
         .with_context(|| format!("opening audit log {path}"))?
-        .with_checkpointing(signer, cfg.checkpoint_every);
+        .with_checkpointing(signer, cfg.checkpoint_every)
+        .with_checkpoint_hook(count);
     let leases =
         SqliteLeaseStore::open(p).with_context(|| format!("opening lease store {path}"))?;
     Ok((Arc::new(audit), Arc::new(leases)))

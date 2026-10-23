@@ -128,7 +128,10 @@ impl Pipeline {
 
         let record = DecisionRecord::new(now, decision, reason, chain, call, policy_ids);
         let decision_id = record.id;
-        match self.audit.append(record.clone()) {
+        match self
+            .metrics
+            .time_audit_append(|| self.audit.append(record.clone()))
+        {
             Ok(entry) => {
                 tracing::info!(
                     decision = ?record.decision,
@@ -178,7 +181,7 @@ impl Pipeline {
     ) -> Uuid {
         let record = DecisionRecord::new(now, Decision::Deny, reason, chain, call, Vec::new());
         let id = record.id;
-        match self.audit.append(record) {
+        match self.metrics.time_audit_append(|| self.audit.append(record)) {
             Ok(entry) => tracing::info!(
                 reason,
                 subject = %chain.originating_user.subject,

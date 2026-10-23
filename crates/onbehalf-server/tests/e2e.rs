@@ -1904,3 +1904,52 @@ async fn export_validates_its_query_and_needs_the_admin_token() {
     let export = onbehalf_audit::parse_export(&text).unwrap();
     assert!(export.entries.is_empty() && export.checkpoints.is_empty());
 }
+
+// ---------------------------------------------------------------------------------------------
+// Audit metrics.
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn audit_append_latency_and_checkpoint_metrics_are_exported() {
+    let h = Harness::start_tweaked(false, |cfg| cfg.audit.checkpoint_every = 2).await;
+    let alice = h.mint_root("alice", "planner", &["github:*"]).await; // 2 appends
+    for i in 0..3 {
+        h.call(
+            &alice.token,
+            "read_file",
+            json!({"repo": format!("alice/public-{i}")}),
+        )
+        .await;
+    }
+    let entries = h.audit_entries().await.len() as u64;
+    assert_eq!(entries, 5);
+    let text = h.state.metrics.render();
+    let value = |prefix: &str| -> u64 {
+        text.lines()
+            .find_map(|l| l.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("no `{prefix}` in\n{text}"))
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    assert!(text.contains("# TYPE onbehalf_audit_append_duration_seconds histogram"));
+    // Every successful append was timed: root-token issuance (2), plus one per call.
+    assert_eq!(
+        value("onbehalf_audit_append_duration_seconds_count "),
+        entries
+    );
+    assert_eq!(
+        value("onbehalf_audit_append_duration_seconds_bucket{le=\"+Inf\"} "),
+        entries
+    );
+    // Checkpoints at seq 2 and 4.
+    assert_eq!(value("onbehalf_audit_checkpoints_total "), 2);
+    // A manual checkpoint of a new head counts; asking again for the same head does not.
+    h.admin_get("/admin/audit/checkpoint").await;
+    h.admin_get("/admin/audit/checkpoint").await;
+    let text = h.state.metrics.render();
+    assert!(
+        text.contains("onbehalf_audit_checkpoints_total 3\n"),
+        "{text}"
+    );
+}
