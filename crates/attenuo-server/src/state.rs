@@ -74,6 +74,7 @@ impl AppState {
         config.server.check_public_url()?;
         config.check_admin_token()?;
         config.metrics.check_listen()?;
+        config.admin_ui.check_listen()?;
         if config.authzen.max_batch == 0 {
             anyhow::bail!("[authzen] max_batch must be at least 1");
         }

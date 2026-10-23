@@ -23,10 +23,18 @@
 //! | `GET /admin/audit`, `/admin/audit/verify`, `/admin/audit/checkpoint` | admin | audit |
 //! | `GET /admin/audit/export?from&to` | admin | stream a verifiable slice of the log as JSON Lines |
 //! | `POST /admin/policies/reload` | admin | hot-reload the Cedar policy file |
+//!
+//! **Console listener.** With `[admin_ui] enabled = true` a second listener on
+//! `[admin_ui] listen` (default `127.0.0.1:9101`) serves the embedded console under
+//! `/admin/ui/` and the admin routes above that have no side effect, behind the same admin
+//! bearer; revoke and reload only with `[admin_ui] allow_write = true`, and never
+//! `/admin/root-token`. Every response there carries a strict CSP and the other headers in
+//! [`admin_ui::SECURITY_HEADERS`], and no CORS headers. See [`admin_ui`].
 
 #![deny(unsafe_code)]
 
 pub mod actor;
+pub mod admin_ui;
 pub mod authz;
 pub mod clientauth;
 pub mod config;
@@ -164,7 +172,22 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     } else {
         None
     };
+    let console_task = if config.admin_ui.enabled {
+        let l = tokio::net::TcpListener::bind(config.admin_ui.listen).await?;
+        tracing::info!(
+            addr = %l.local_addr()?,
+            allow_write = config.admin_ui.allow_write,
+            "admin console listening at /admin/ui/"
+        );
+        let app = admin_ui::router(state.clone(), &config);
+        Some(tokio::spawn(async move { axum::serve(l, app).await }))
+    } else {
+        None
+    };
     let res = serve_until(listener, app, shutdown_signal(), DRAIN_TIMEOUT).await;
+    if let Some(t) = console_task {
+        t.abort();
+    }
     if let Some(t) = metrics_task {
         t.abort();
     }

@@ -247,3 +247,13 @@ enabled = false
 # listen = "127.0.0.1:9100"
 # A non-loopback `listen` is refused at startup unless this is true (SR-38).
 # allow_public = false
+
+[admin_ui]
+# The admin console on its OWN listener (/admin/ui/ plus the admin API, same admin token).
+# Read-only unless allow_write; never serves /admin/root-token; no CORS.
+enabled = false
+# listen = "127.0.0.1:9101"
+# A non-loopback `listen` is refused at startup unless this is true.
+# allow_public = false
+# Mount POST /admin/leases/{id}/revoke and POST /admin/policies/reload on this listener.
+# allow_write = false
