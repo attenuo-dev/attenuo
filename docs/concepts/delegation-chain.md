@@ -27,7 +27,7 @@ The exchange fails if the new capabilities are not covered by the parent hop, if
 
 ## Protecting the user block
 
-When a root token is issued, onbehalf signs the originating user block together with the token issuer (`iss`) and the root hop (its agent, capabilities, issue time and lease). The signature is the `ou_sig` claim, with `ou_sig_v` (the construction version, always 2) and `ou_kid` (the key that signed it). Every exchange copies them unchanged. A verifier checks the signature on its own, apart from the outer token signature. A token whose user block or root hop fails the check is rejected. It is never filled in with a default. Because the root hop is covered, a signature taken from one of the user's chains cannot start another chain with different root capabilities.
+When a root token is issued, onbehalf signs the originating user block together with the token issuer (`iss`) and the root hop (its agent, capabilities, issue time and lease). The signature is the `ou_sig` claim, with `ou_sig_v` (the construction version, always 3: the signed JSON is RFC 8785 canonical form) and `ou_kid` (the key that signed it). Every exchange copies them unchanged. A verifier checks the signature on its own, apart from the outer token signature. A token whose user block or root hop fails the check is rejected. It is never filled in with a default. Because the root hop is covered, a signature taken from one of the user's chains cannot start another chain with different root capabilities.
 
 ## What the chain gives you
 

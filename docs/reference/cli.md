@@ -167,12 +167,15 @@ Show the most recent audit entries. Needs the admin token.
 
 Walk the whole hash chain and verify the signed checkpoints against the server's JWKS. Prints whether the chain is intact, then the checkpoint status: how many checkpoints exist, the last signed `seq`, how many entries come after it, and any invalid checkpoint with its reason. Exits 2 if the chain is broken or a checkpoint is invalid. Needs the admin token.
 
-With `--file` it verifies an export offline instead and needs no admin token:
+With `--file` it verifies an export offline instead and needs no admin token. The check is strict: it exits 2 unless every entry in the file is inside the range its header declares, the file covers that whole range, and every entry is covered by a valid checkpoint in the file.
 
 | Option | Meaning |
 | --- | --- |
-| `--file <PATH>` | An export from `audit export` (JSON Lines, or the `--format json` object). Re-hashes every entry, checks the links, verifies each checkpoint signature and its head hash, and reports a file that is shorter than the range in its header. |
+| `--file <PATH>` | An export from `audit export` (JSON Lines, or the `--format json` object, format `onbehalf-audit-export-v2`; older `v1` exports are refused). Re-hashes every entry, checks the links, verifies each checkpoint signature and its head hash. Fails a file that is shorter than the range in its header, one that holds entries outside it, and one with entries after its last valid checkpoint. |
 | `--jwks <PATH>` | JWKS file with the issuer keys (what `/.well-known/jwks.json` returns). Without it, the JWKS is fetched from `--server`. Only with `--file`. |
+| `--allow-unsigned-tail` | Accept entries after the file's last valid checkpoint, which only the hash chain covers: an export taken while the log was ahead of its newest checkpoint. They are still reported (`unsigned_tail`). Entries outside the header's range fail either way. Only with `--file`. |
+
+To get an export that passes without the flag, sign the head first (`GET /admin/audit/checkpoint`) and export up to it, or export up to an existing checkpoint with `--to`.
 
 ### `audit export`
 
