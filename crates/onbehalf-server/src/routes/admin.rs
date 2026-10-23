@@ -193,6 +193,118 @@ pub async fn audit_checkpoint(State(state): State<Arc<AppState>>) -> Result<Json
     Ok(Json(v))
 }
 
+/// Entries read per blocking-pool hop while streaming an export.
+const EXPORT_PAGE: usize = 500;
+
+#[derive(Debug, Deserialize)]
+pub struct ExportQuery {
+    /// First sequence number (default 1).
+    pub from: Option<u64>,
+    /// Last sequence number, inclusive (default: the head when the export starts).
+    pub to: Option<u64>,
+}
+
+/// Where a streaming export is.
+enum ExportPhase {
+    Entries { next: u64 },
+    Checkpoints,
+    Done,
+}
+
+/// `GET /admin/audit/export?from=&to=`: entries `from..=to` and the checkpoints inside that
+/// range, as `application/x-ndjson` (one JSON object per line, see
+/// `onbehalf_audit::export`), streamed a page at a time so a large range never sits in memory.
+/// Verify the result offline with `onbehalf audit verify --file`.
+pub async fn audit_export(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ExportQuery>,
+) -> Result<Response, ApiError> {
+    use futures_util::stream;
+
+    let from = q.from.unwrap_or(1);
+    if from == 0 {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "`from` must be at least 1",
+        ));
+    }
+    let head = state
+        .blocking(|s| s.audit.head())
+        .await?
+        .map_or(0, |h| h.seq);
+    let to = q.to.map_or(head, |t| t.min(head));
+    if q.to.is_some_and(|t| t < from) {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "`to` must not be smaller than `from`",
+        ));
+    }
+    let exported_at = now().format(&Rfc3339).map_err(ApiError::internal)?;
+    let header =
+        onbehalf_audit::header_line(&onbehalf_audit::ExportHeader::new(from, to, exported_at));
+
+    let first = stream::once(async move { Ok::<_, std::io::Error>(Bytes::from(header)) });
+    let rest = stream::unfold(
+        (state, ExportPhase::Entries { next: from }),
+        move |(state, phase)| async move {
+            match phase {
+                ExportPhase::Done => None,
+                ExportPhase::Entries { next } if next > to => {
+                    Some((Ok(Bytes::new()), (state, ExportPhase::Checkpoints)))
+                }
+                ExportPhase::Entries { next } => {
+                    let want = usize::try_from(to - next + 1)
+                        .unwrap_or(EXPORT_PAGE)
+                        .min(EXPORT_PAGE);
+                    let page = state.blocking(move |s| s.audit.range(next, want)).await;
+                    match page {
+                        Err(e) => Some((
+                            Err(std::io::Error::other(e.to_string())),
+                            (state, ExportPhase::Done),
+                        )),
+                        Ok(entries) if entries.is_empty() => {
+                            Some((Ok(Bytes::new()), (state, ExportPhase::Checkpoints)))
+                        }
+                        Ok(entries) => {
+                            let last = entries.last().map_or(next, |e| e.seq);
+                            let mut out = String::new();
+                            for e in entries.iter().filter(|e| e.seq <= to) {
+                                out.push_str(&onbehalf_audit::entry_line(e));
+                            }
+                            Some((
+                                Ok(Bytes::from(out)),
+                                (state, ExportPhase::Entries { next: last + 1 }),
+                            ))
+                        }
+                    }
+                }
+                ExportPhase::Checkpoints => {
+                    let cps = state
+                        .blocking(move |s| s.audit.checkpoints_between(from, to))
+                        .await;
+                    let item = cps
+                        .map(|cps| {
+                            let out: String =
+                                cps.iter().map(onbehalf_audit::checkpoint_line).collect();
+                            Bytes::from(out)
+                        })
+                        .map_err(|e| std::io::Error::other(e.to_string()));
+                    Some((item, (state, ExportPhase::Done)))
+                }
+            }
+        },
+    );
+    let body = axum::body::Body::from_stream(futures_util::StreamExt::chain(first, rest));
+    let mut resp = Response::new(body);
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-ndjson"),
+    );
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(resp)
+}
+
 /// `POST /admin/policies/reload`: re-read `policy.policies_path` and swap the policy set if it
 /// parses and validates. On failure the previous set stays in force and the answer is 422.
 pub async fn reload_policies(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {

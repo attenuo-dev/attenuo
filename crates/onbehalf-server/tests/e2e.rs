@@ -1776,3 +1776,131 @@ async fn tampering_after_a_signed_checkpoint_is_reported_with_the_last_signed_se
     assert_eq!(report["first_bad_seq"], 5);
     assert_eq!(report["last_signed_seq"], 3);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Audit export and offline verification.
+// ---------------------------------------------------------------------------------------------
+
+async fn export_text(h: &Harness, query: &str) -> String {
+    let resp = h
+        .client
+        .get(h.url(&format!("/admin/audit/export{query}")))
+        .bearer_auth(ADMIN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()["content-type"].to_str().unwrap(),
+        "application/x-ndjson"
+    );
+    resp.text().await.unwrap()
+}
+
+/// Append `n` synthetic records straight to the log (cheaper than `n` HTTP calls).
+fn append_synthetic(h: &Harness, n: usize) {
+    use onbehalf_audit::AuditSink;
+    for i in 0..n {
+        let record = onbehalf_core::DecisionRecord {
+            id: uuid::Uuid::new_v4(),
+            at: time::OffsetDateTime::now_utc(),
+            decision: onbehalf_core::Decision::Allow,
+            reason: "synthetic".into(),
+            originating_subject: "load".into(),
+            agents: Vec::new(),
+            chain_depth: 0,
+            chain_digest: format!("{i:064}"),
+            leases: Vec::new(),
+            server: "onbehalf".into(),
+            tool: "synthetic".into(),
+            arguments_digest: format!("{i:064}"),
+            session_id: None,
+            policy_ids: Vec::new(),
+        };
+        h.state.audit.append(record).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn export_streams_a_range_that_verifies_offline_with_only_the_jwks() {
+    let h = Harness::start_tweaked(false, |cfg| cfg.audit.checkpoint_every = 400).await;
+    let alice = h.mint_root("alice", "planner", &["github:*"]).await; // entries 1, 2
+    h.call(&alice.token, "read_file", json!({"repo": "alice/public-a"}))
+        .await;
+    // Past one export page (500) and two automatic checkpoints (400, 800).
+    append_synthetic(&h, 1100);
+    let keys = jwks_keys(&h).await;
+
+    // The whole log: entries 1..=1103, checkpoints at 400, 800 and 1100.
+    let text = export_text(&h, "").await;
+    let export = onbehalf_audit::parse_export(&text).unwrap();
+    assert_eq!(export.header.as_ref().unwrap().to, 1103);
+    assert_eq!(export.entries.len(), 1103);
+    assert_eq!(
+        export.checkpoints.iter().map(|c| c.seq).collect::<Vec<_>>(),
+        [400, 800]
+    );
+    let report = onbehalf_audit::verify_export(&export, &keys).unwrap();
+    assert!(report.report.ok, "{report:?}");
+    assert!(report.from_genesis);
+    assert_eq!(report.report.last_signed_seq, Some(800));
+    assert_eq!(report.report.unsigned_tail, 303);
+
+    // A sub-range is a verifiable window.
+    let text = export_text(&h, "?from=390&to=810").await;
+    let export = onbehalf_audit::parse_export(&text).unwrap();
+    assert_eq!(export.entries.first().unwrap().seq, 390);
+    assert_eq!(export.entries.last().unwrap().seq, 810);
+    let report = onbehalf_audit::verify_export(&export, &keys).unwrap();
+    assert!(report.report.ok, "{report:?}");
+    assert!(!report.from_genesis);
+    assert_eq!(report.report.last_signed_seq, Some(800));
+
+    // `to` beyond the head is clamped; the exported entries equal the paged API's.
+    let text = export_text(&h, "?from=1100&to=999999").await;
+    let export = onbehalf_audit::parse_export(&text).unwrap();
+    assert_eq!(export.entries.len(), 4);
+    assert_eq!(export.header.unwrap().to, 1103);
+
+    // A file edited after export fails offline verification.
+    let text = export_text(&h, "?from=1&to=20").await;
+    let edited = text.replacen(
+        "\"reason\":\"token_issued\"",
+        "\"reason\":\"nothing_to_see\"",
+        1,
+    );
+    assert_ne!(edited, text);
+    let report =
+        onbehalf_audit::verify_export(&onbehalf_audit::parse_export(&edited).unwrap(), &keys)
+            .unwrap();
+    assert!(!report.report.ok);
+    assert_eq!(report.report.first_bad_seq, Some(1));
+}
+
+#[tokio::test]
+async fn export_validates_its_query_and_needs_the_admin_token() {
+    let h = Harness::start().await;
+    h.mint_root("alice", "planner", &["github:*"]).await;
+    for q in ["?from=0", "?from=5&to=2"] {
+        let resp = h
+            .client
+            .get(h.url(&format!("/admin/audit/export{q}")))
+            .bearer_auth(ADMIN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{q}");
+    }
+    let anon = h
+        .client
+        .get(h.url("/admin/audit/export"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
+
+    // An empty range (nothing past the head) is just a header.
+    let text = export_text(&h, "?from=500").await;
+    let export = onbehalf_audit::parse_export(&text).unwrap();
+    assert!(export.entries.is_empty() && export.checkpoints.is_empty());
+}

@@ -18,7 +18,7 @@ use clap::Parser;
 use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
 
-use cli::{AuditCmd, AuthzenCmd, Cli, Command, Field, LeaseCmd, PolicyCmd, TokenCmd};
+use cli::{AuditCmd, AuthzenCmd, Cli, Command, ExportFormat, Field, LeaseCmd, PolicyCmd, TokenCmd};
 use client::Client;
 
 /// JSON-RPC error code the proxy uses for a denied call.
@@ -174,7 +174,17 @@ async fn run(cli: Cli) -> Result<Outcome> {
             follow,
             interval_ms,
         }) => audit_tail(&client?, lines, follow, interval_ms, json).await,
-        Command::Audit(AuditCmd::Verify) => {
+        Command::Audit(AuditCmd::Verify {
+            file: Some(file),
+            jwks,
+        }) => audit_verify_file(client, &file, jwks.as_deref(), json).await,
+        Command::Audit(AuditCmd::Export {
+            from,
+            to,
+            format,
+            out,
+        }) => audit_export(&client?, from, to, format, out.as_deref()).await,
+        Command::Audit(AuditCmd::Verify { .. }) => {
             let resp = client?.admin_get("/admin/audit/verify").await?;
             let ok = resp["ok"] == true;
             if json {
@@ -439,6 +449,104 @@ fn verify_lines(resp: &Value) -> Vec<String> {
     out
 }
 
+/// `audit export`: stream the server's JSON Lines to `out` (or stdout), or collect them into
+/// one JSON object for `--format json`.
+async fn audit_export(
+    client: &Client,
+    from: u64,
+    to: Option<u64>,
+    format: ExportFormat,
+    out: Option<&std::path::Path>,
+) -> Result<Outcome> {
+    use std::io::Write;
+
+    let mut path = format!("/admin/audit/export?from={from}");
+    if let Some(to) = to {
+        path.push_str(&format!("&to={to}"));
+    }
+    let mut resp = client.admin_get_stream(&path).await?;
+    let mut sink: Box<dyn Write> = match out {
+        Some(p) => Box::new(std::io::BufWriter::new(
+            std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
+        )),
+        None => Box::new(std::io::stdout().lock()),
+    };
+    match format {
+        ExportFormat::Jsonl => {
+            while let Some(chunk) = resp.chunk().await? {
+                sink.write_all(&chunk)?;
+            }
+        }
+        ExportFormat::Json => {
+            let text = resp.text().await?;
+            let export = onbehalf_audit::parse_export(&text)?;
+            serde_json::to_writer_pretty(&mut sink, &onbehalf_audit::to_json_form(&export))?;
+            writeln!(sink)?;
+        }
+    }
+    sink.flush()?;
+    Ok(Outcome::Ok)
+}
+
+/// `audit verify --file`: check an export with nothing but the issuer's JWKS.
+async fn audit_verify_file(
+    client: Result<Client>,
+    file: &std::path::Path,
+    jwks: Option<&std::path::Path>,
+    json: bool,
+) -> Result<Outcome> {
+    let text =
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    let export = onbehalf_audit::parse_export(&text)
+        .with_context(|| format!("parsing {}", file.display()))?;
+    let jwks: Value = match jwks {
+        Some(p) => serde_json::from_str(
+            &std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?,
+        )
+        .with_context(|| format!("{} is not JSON", p.display()))?,
+        None => client?
+            .get("/.well-known/jwks.json")
+            .await
+            .context("fetching the JWKS (or pass --jwks <file>)")?,
+    };
+    let keys = onbehalf_audit::CheckpointKeys::from_jwks(&jwks)?;
+    let report = onbehalf_audit::verify_export(&export, &keys)?;
+    let v = serde_json::to_value(&report)?;
+    if json {
+        print_json(&v);
+    } else {
+        for line in export_lines(&v) {
+            println!("{line}");
+        }
+    }
+    Ok(if report.report.ok {
+        Outcome::Ok
+    } else {
+        Outcome::No
+    })
+}
+
+/// Text for an offline export verification: what the file covers, then the same chain and
+/// checkpoint lines as the live `audit verify`.
+fn export_lines(v: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    match (v["first_seq"].as_u64(), v["last_seq"].as_u64()) {
+        (Some(f), Some(l)) => out.push(format!("export covers seq {f}..{l}")),
+        _ => out.push("export holds no entries".to_string()),
+    }
+    out.extend(verify_lines(v));
+    if v["truncated"] == true {
+        out.push("export is TRUNCATED: entries named in its header are missing".to_string());
+    }
+    if v["from_genesis"] == false && v["first_seq"].is_u64() {
+        out.push(format!(
+            "note: the file does not start at the first entry of the log; entries before seq {} are not covered",
+            v["first_seq"]
+        ));
+    }
+    out
+}
+
 /// One line per audit entry.
 fn fmt_audit_entry(e: &Value) -> String {
     let r = &e["record"];
@@ -511,6 +619,23 @@ async fn audit_tail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_lines_describe_coverage_and_problems() {
+        let v = json!({"entries": 5, "ok": false, "first_bad_seq": null, "checkpoints": 1,
+                       "last_signed_seq": 8, "unsigned_tail": 0, "bad_checkpoints": [],
+                       "first_seq": 4, "last_seq": 8, "from_genesis": false,
+                       "truncated": true});
+        let lines = export_lines(&v);
+        assert_eq!(lines[0], "export covers seq 4..8");
+        assert!(lines.iter().any(|l| l.contains("TRUNCATED")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("entries before seq 4 are not covered")),
+            "{lines:?}"
+        );
+    }
 
     #[test]
     fn verify_output_reports_checkpoint_status() {
