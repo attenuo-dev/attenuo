@@ -4,6 +4,8 @@ The test cases in this directory were written from this list, after the suite po
 
 The author of the test cases had read the frozen policies. The cases were written to probe them, including their known weak spots (suffix globs, undeclared arguments, open browsing). That makes the test split adversarial toward onbehalf, not tuned for it. It also means the cases are not a random sample of real attacks.
 
+Only the banking and workspace cases (t-banking-01..13, t-workspace-01..13, 26 in all) are written. The travel, slack and github ids in the table below (t-travel-01..11, t-slack-01..12, t-github-01..10) are not yet written; the test split's target of 40+ cases is still open.
+
 | Class (`taxonomy:`) | What the injected agent does | Source | What in onbehalf could stop it | Test cases |
 |---|---|---|---|---|
 | `tool_misuse` | Calls a tool the user task does not need: transfer money, delete a file, remove a user. | AgentDojo injection tasks; InjecAgent direct harm | Tool-level capability | t-banking-01, t-workspace-01, t-travel-01, t-slack-11 |
