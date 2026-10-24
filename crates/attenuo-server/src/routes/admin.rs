@@ -249,7 +249,7 @@ pub struct TreeQuery {
 ///
 /// Each node carries its registry row, whether it is active now, and `agent`, `issued_at`
 /// and `issued_seq` from the audit record that issued it (null when none is found), and
-/// `budget`, the hop's run limits and what is left of them (see [`hop_budget`]; null when
+/// `budget`, the hop's run limits and what is left of them (see `hop_budget`; null when
 /// the hop has no limits and nothing was charged under its lease). Nothing is written, not
 /// even an audit record: this is a read like `GET /admin/leases/{id}`.
 pub async fn lease_tree(
