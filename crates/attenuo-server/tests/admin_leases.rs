@@ -356,3 +356,91 @@ async fn a_lease_without_an_issuance_record_has_null_issuance_fields() {
     assert_eq!(orphan["issued_seq"], Value::Null);
     assert_eq!(orphan["active"], true);
 }
+
+/// Every node and ancestor carries `chain_id` (the chain's first-hop lease, the selector
+/// `POST /admin/leases/revoke` takes) and `subject`, the originating user recorded at issue,
+/// so the console can offer "revoke this chain" and "revoke every lease of this user".
+#[tokio::test]
+async fn nodes_carry_their_chain_id_and_originating_user() {
+    let h = Harness::start().await;
+    let root = h.mint_root("planner").await;
+    let child = h.exchange(&root, "coder").await;
+    let grandchild = h.exchange(&child, "reviewer").await;
+
+    for of in [&root, &child, &grandchild] {
+        let t = h.tree(&of.lease, "").await;
+        let all: Vec<&Value> = t["ancestors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(t["nodes"].as_array().unwrap())
+            .collect();
+        assert_eq!(all.len(), 3, "the tree of {} spans the chain", of.lease);
+        for n in all {
+            assert_eq!(n["chain_id"], json!(root.lease), "{n}");
+            assert_eq!(n["chain_id"], t["root"]);
+            assert_eq!(n["subject"], "alice", "{n}");
+        }
+    }
+
+    // The chain id is what the selector revocation takes: its preview names the tree.
+    let preview: Value = h
+        .client
+        .post(h.server.url("/admin/leases/revoke?preview=true"))
+        .bearer_auth(ADMIN)
+        .json(&json!({"chain_id": root.lease}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(preview["revoked_count"], 3);
+    let preview: Value = h
+        .client
+        .post(h.server.url("/admin/leases/revoke?preview=true"))
+        .bearer_auth(ADMIN)
+        .json(&json!({"user": "alice"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(preview["matched_count"], 3);
+}
+
+/// A lease registered without a subject (as every lease registered before subjects were
+/// recorded) shows `subject: null` next to leases that have one; the store is asked once for
+/// all of them, so this also checks the batch keeps leases apart.
+#[tokio::test]
+async fn a_lease_registered_before_subjects_has_a_null_subject() {
+    let h = Harness::start().await;
+    let root = h.mint_root("planner").await;
+    let exp = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+    h.state
+        .leases
+        .register(
+            &LeaseId::new("legacy-child"),
+            Some(&LeaseId::new(&root.lease)),
+            exp,
+        )
+        .unwrap();
+    h.state
+        .leases
+        .register(&LeaseId::new("legacy-root"), None, exp)
+        .unwrap();
+
+    let t = h.tree(&root.lease, "").await;
+    assert_eq!(
+        lease_ids(&t["nodes"]),
+        [root.lease.as_str(), "legacy-child"]
+    );
+    assert_eq!(t["nodes"][0]["subject"], "alice");
+    assert_eq!(t["nodes"][1]["subject"], Value::Null);
+    assert_eq!(t["nodes"][1]["chain_id"], json!(root.lease));
+
+    let t = h.tree("legacy-root", "").await;
+    assert_eq!(t["nodes"][0]["subject"], Value::Null);
+    assert_eq!(t["nodes"][0]["chain_id"], "legacy-root");
+}
