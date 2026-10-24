@@ -56,6 +56,9 @@ pub enum Command {
     /// Inspect and revoke leases.
     #[command(subcommand)]
     Lease(LeaseCmd),
+    /// List, show, grant and decline approvals of gated calls (as an operator).
+    #[command(subcommand)]
+    Approval(ApprovalCmd),
     /// Read and verify the audit log.
     #[command(subcommand)]
     Audit(AuditCmd),
@@ -388,6 +391,31 @@ pub enum LeaseCmd {
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         max_nodes: Option<u64>,
     },
+}
+
+/// Approvals of calls a policy gated with `@obligation("approval")` (JSON-RPC `-32008`). These
+/// use the admin API, so a grant here is recorded with `by = "operator"`; the originating user
+/// grants with an ID token at `POST /approvals/{id}` instead.
+#[derive(Debug, Subcommand)]
+pub enum ApprovalCmd {
+    /// The newest approvals, newest first.
+    List {
+        /// Only the approvals of this delegation run (its first hop's lease).
+        #[arg(long)]
+        chain_id: Option<String>,
+        /// Only approvals in this state.
+        #[arg(long, value_parser = ["pending", "granted", "declined", "consumed"])]
+        state: Option<String>,
+        /// At most this many (server maximum 500).
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=500))]
+        limit: Option<u64>,
+    },
+    /// Show one approval: the exact call, the run's labels, state and expiry.
+    Show { id: String },
+    /// Grant a pending approval as the operator. The agent's identical retry then runs once.
+    Grant { id: String },
+    /// Decline a pending approval.
+    Decline { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1071,6 +1099,25 @@ mod tests {
     fn inspect_verify_flags_need_verify() {
         assert!(parse(&["token", "inspect", "a.b.c", "--issuer", "x"]).is_err());
         assert!(parse(&["token", "inspect", "a.b.c", "--verify", "--issuer", "x"]).is_ok());
+    }
+
+    #[test]
+    fn approval_subcommands() {
+        let cli = parse(&["approval", "list", "--chain-id", "L1", "--state", "pending"]).unwrap();
+        let Command::Approval(ApprovalCmd::List {
+            chain_id, state, ..
+        }) = cli.command
+        else {
+            panic!("not list")
+        };
+        assert_eq!(chain_id.as_deref(), Some("L1"));
+        assert_eq!(state.as_deref(), Some("pending"));
+        assert!(parse(&["approval", "list", "--state", "maybe"]).is_err());
+        assert!(parse(&["approval", "list", "--limit", "0"]).is_err());
+        assert!(parse(&["approval", "show", "A"]).is_ok());
+        assert!(parse(&["approval", "grant", "A"]).is_ok());
+        assert!(parse(&["approval", "decline", "A"]).is_ok());
+        assert!(parse(&["approval", "grant"]).is_err());
     }
 
     #[test]

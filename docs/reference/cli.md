@@ -141,6 +141,8 @@ Call a tool through the proxy (`tools/call`).
 | `--tool` | Tool name. Required. |
 | `--arg` | Tool argument. Repeatable. |
 
+A call that needs an approval prints `APPROVAL REQUIRED` followed by the approval id, its expiry, the call hash and the decision id, and exits 2, like a denial. Once the approval is granted, run the identical command again: it is allowed once.
+
 ### `tools`
 
 List the tools the token may see (`tools/list`). Takes `--token` (or `--token-file`, or `ATTENUO_TOKEN`) and `--server`.
@@ -267,6 +269,19 @@ Parse a Cedar policy file and validate it against the generated schema. Prints e
 | --- | --- |
 | `--config` | Server config whose `[policy.catalog]` declares the tools, or a JSON catalog. Without it, the tools are declared from the policy's own `<server>/<tool>` action names and a `note:` lists what could not be checked (tool attributes, input types, user attributes). |
 | `--schema` | Also print the generated schema. |
+
+### `approval list` / `show` / `grant` / `decline`
+
+Approvals of gated calls, as the operator (admin token, `ATTENUO_ADMIN_TOKEN`).
+
+| Command | Does |
+| --- | --- |
+| `approval list [--chain-id ID] [--state pending\|granted\|declined\|consumed] [--limit N]` | `GET /admin/approvals`: one line per approval, newest first (id, state, call, run, expiry). `--limit` 1 to 500. |
+| `approval show <ID>` | `GET /admin/approvals/{id}`: the exact call with its arguments, the call hash, user, agents, run and lease, the labels the run carried with their audit seqs, the times, and who decided. |
+| `approval grant <ID>` | `POST /admin/approvals/{id}` with `grant`. The agent's identical retry then runs once. Recorded as `by = "operator"`. |
+| `approval decline <ID>` | The same with `decline`. |
+
+A grant or decline of an approval that is no longer pending fails with `approval_not_pending`, `approval_expired` or `lease_revoked`. `--json` prints the server's answer. A user approves with their own ID token at `POST /approvals/{id}`; the CLI does not do that for them.
 
 ### `authzen eval`
 

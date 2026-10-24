@@ -123,6 +123,7 @@ impl Row {
             decision_id: None,
             result: None,
             labels: None,
+            approval: None,
         }
     }
 }

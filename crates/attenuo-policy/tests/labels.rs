@@ -69,6 +69,7 @@ fn engine(policies: &str, import: AnnotationImport) -> PolicyEngine {
 fn tainted() -> CallLabels {
     CallLabels {
         session: SessionLabels::from_sources(["web/fetch"]),
+        ..Default::default()
     }
 }
 
@@ -179,6 +180,7 @@ fn an_unreadable_taint_state_is_tainted() {
     );
     let unknown = CallLabels {
         session: SessionLabels::unknown(),
+        ..Default::default()
     };
     let o = e.authorize_labelled(
         &all_caps(),
@@ -338,4 +340,32 @@ fn shipped_example_policies_pass_their_tests() {
         );
     }
     assert!(report.cases.len() >= 8);
+}
+
+/// `context.approval` reaches Cedar: a granted approval lifts the approval forbid, and
+/// `approval.by` is visible to policy. A plain forbid is not lifted by an approval.
+#[test]
+fn a_granted_approval_lifts_only_the_approval_forbid() {
+    let policies = format!(
+        "{ASK_AFTER_TAINT}
+@id(\"operators_may_not_approve_deletes\")
+forbid (principal, action == Action::\"fs/delete\", resource)
+when {{ context.approval.present && context.approval.by == \"operator\" }};
+@id(\"all\")
+permit (principal, action, resource);"
+    );
+    let e = engine(&policies, AnnotationImport::Never);
+    let c = all_caps();
+    let delete = ToolCall::new("fs", "delete", json!({ "path": "a.txt" }));
+    let with = |by: &str| CallLabels {
+        approval: attenuo_policy::ApprovalContext::by(by),
+        ..tainted()
+    };
+    let o = e.authorize_labelled(&c, &delete, &tainted(), now());
+    assert_eq!(o.reason, REASON_APPROVAL_REQUIRED);
+    let o = e.authorize_labelled(&c, &delete, &with("user"), now());
+    assert_eq!(o.reason, REASON_POLICY_ALLOW);
+    let o = e.authorize_labelled(&c, &delete, &with("operator"), now());
+    assert_eq!(o.reason, REASON_POLICY_DENY);
+    assert_eq!(o.policy_ids, vec!["operators_may_not_approve_deletes"]);
 }

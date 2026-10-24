@@ -1,11 +1,12 @@
 /**
  * Client for the attenuo server. It mirrors what the `attenuo` CLI does over HTTP:
- * `POST /token`, `POST /token/renew`, `POST /mcp/{server}` and `POST /access/v1/evaluation`.
+ * `POST /token`, `POST /token/renew`, `POST /mcp/{server}`, `POST /access/v1/evaluation` and
+ * `GET /approvals/{id}`.
  */
 
 import type { CapabilityLike } from "./capability.js";
 import { DpopKey, NonceCache, exchangeProofs, presented, type DpopKeyLike } from "./dpop.js";
-import { AttenuoError } from "./errors.js";
+import { ApprovalNotGrantedError, ApprovalRequiredError, AttenuoError } from "./errors.js";
 import { Http, type HttpOptions } from "./http.js";
 import { bearer, decodeToken, verifyToken, type Jwks, type Token } from "./token.js";
 import { mcpHeaders } from "./mcp.js";
@@ -40,6 +41,20 @@ export interface McpOptions {
   sessionId?: string;
 }
 
+export interface ApprovalWaitOptions {
+  /** Give up after this many milliseconds (default: wait until the approval expires). */
+  timeoutMs?: number;
+  /** Milliseconds between polls (default 2000). */
+  intervalMs?: number;
+}
+
+export interface CallWithApprovalOptions extends McpOptions, ApprovalWaitOptions {
+  /** Called once with the `-32008` error, to show the user the approval id. */
+  onApproval?: (e: ApprovalRequiredError) => void | Promise<void>;
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 export class AttenuoClient {
   readonly serverUrl: string;
   /** Default bearer; assign a new one after a re-exchange. */
@@ -67,9 +82,13 @@ export class AttenuoClient {
    * `Authorization` (and a DPoP proof with this client's key and the server's `nonce`) to present
    * `jwt` at `path`.
    */
-  private auth(jwt: string, path: string): (nonce?: string) => Promise<Record<string, string>> {
+  private auth(
+    jwt: string,
+    path: string,
+    method = "POST",
+  ): (nonce?: string) => Promise<Record<string, string>> {
     return async (nonce) =>
-      presented(jwt, await this.dpopKey(), "POST", `${this.serverUrl}${path}`, nonce);
+      presented(jwt, await this.dpopKey(), method, `${this.serverUrl}${path}`, nonce);
   }
 
   /** `POST path` with `headers(nonce)`; once more with the server's new nonce on `use_dpop_nonce`. */
@@ -77,9 +96,10 @@ export class AttenuoClient {
     path: string,
     headers: (nonce?: string) => Promise<Record<string, string>>,
     json?: unknown,
+    method = "POST",
   ): Promise<Response> {
     const send = async () =>
-      this.http.post(path, { headers: await headers(this.nonce.value), json });
+      this.http.request(method, path, { headers: await headers(this.nonce.value), json });
     let res = await send();
     if ((await this.dpopKey()) !== undefined && (await this.nonce.update(res))) {
       await res.body?.cancel();
@@ -207,6 +227,71 @@ export class AttenuoClient {
   ): Promise<w.Tool[]> {
     const { result } = await this.rpc(token, server, "tools/list", {}, opts.sessionId);
     return w.toolsFromResult(result);
+  }
+
+  /**
+   * `GET /approvals/{id}` with a delegation token of the same run (DPoP signed when the client
+   * has a key). Anyone else gets a 404 `ApiError`.
+   */
+  async getApproval(approvalId: string, token?: Token | string): Promise<w.Approval> {
+    if (approvalId === "" || approvalId === "." || approvalId === "..") {
+      throw new TypeError(`approvalId must be a non-empty name, got ${JSON.stringify(approvalId)}`);
+    }
+    const path = `/approvals/${encodeURIComponent(approvalId)}`;
+    const res = await this.post(
+      path,
+      this.auth(bearer(token, this.token), path, "GET"),
+      undefined,
+      "GET",
+    );
+    return w.approvalFromJson(await w.jsonBody(res));
+  }
+
+  /**
+   * Poll `getApproval` until the approval is granted and return it. Throws
+   * `ApprovalNotGrantedError` when it is declined, expires, was already used, or `timeoutMs`
+   * passes first.
+   */
+  async waitForApproval(
+    approvalId: string,
+    token?: Token | string,
+    opts: ApprovalWaitOptions = {},
+  ): Promise<w.Approval> {
+    const interval = opts.intervalMs ?? 2000;
+    const deadline = opts.timeoutMs === undefined ? undefined : Date.now() + opts.timeoutMs;
+    for (;;) {
+      const approval = await this.getApproval(approvalId, token);
+      if (w.approvalReady(approval)) return approval;
+      let pause = interval;
+      if (deadline !== undefined) {
+        const left = deadline - Date.now();
+        if (left <= 0) throw new ApprovalNotGrantedError(approvalId, "timeout");
+        pause = Math.min(interval, left);
+      }
+      await sleep(pause);
+    }
+  }
+
+  /**
+   * `callTool`; when the call needs an approval (`-32008`), call `onApproval`, wait for the
+   * grant, and retry the identical call once. A second `-32008`, a decline or an expiry is thrown.
+   */
+  async callToolWithApproval(
+    token: Token | string | undefined,
+    server: string,
+    tool: string,
+    args: Record<string, unknown> = {},
+    opts: CallWithApprovalOptions = {},
+  ): Promise<w.ToolResult> {
+    const mcp: McpOptions = opts.sessionId === undefined ? {} : { sessionId: opts.sessionId };
+    try {
+      return await this.callTool(token, server, tool, args, mcp);
+    } catch (e) {
+      if (!(e instanceof ApprovalRequiredError) || e.approvalId === undefined) throw e;
+      await opts.onApproval?.(e);
+      await this.waitForApproval(e.approvalId, token, opts);
+    }
+    return this.callTool(token, server, tool, args, mcp);
   }
 
   /** Ask for a decision without calling the tool. A deny is returned, not thrown. */

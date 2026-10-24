@@ -79,6 +79,10 @@ pub struct Config {
     pub authzen: AuthzenSection,
     #[serde(default)]
     pub token: TokenSection,
+    /// Approvals of calls gated by `@obligation("approval")` (ADR-0009). See
+    /// [`ApprovalsSection`].
+    #[serde(default)]
+    pub approvals: ApprovalsSection,
     /// Policy enforcement points allowed to send unsigned chains to the AuthZEN endpoint when
     /// `[authzen] allow_unsigned_chain = true`. Same shape as `[[agents]]`.
     #[serde(default)]
@@ -868,6 +872,62 @@ fn default_checkpoint_interval_seconds() -> u64 {
 
 fn default_sqlite_path() -> String {
     ":memory:".into()
+}
+
+/// `[approvals]`: pending approvals for calls the policy gates with `@obligation("approval")`
+/// (ADR-0009).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalsSection {
+    /// How long a pending or granted approval stays usable, in seconds. Default 120 (the
+    /// output-labelling design, section 3.7). The approval also ends with the calling hop's
+    /// lease or token, whichever comes first. 1 to 86400.
+    #[serde(default = "default_approval_ttl_seconds")]
+    pub ttl_seconds: u64,
+    /// The `aud` an ID token presented at `POST /approvals/{id}` must carry. Default: the same
+    /// client id hop-0 intake expects for the run's root agent (`[[idps]] client_ids`, else
+    /// the agent id). Set it to a client the agent does not control, such as the approval
+    /// page's own OAuth client, so that an ID token the agent can obtain for itself cannot
+    /// approve its calls.
+    #[serde(default)]
+    pub client_id: Option<String>,
+}
+
+/// Default of `[approvals] ttl_seconds`.
+pub const DEFAULT_APPROVAL_TTL_SECONDS: u64 = 120;
+
+fn default_approval_ttl_seconds() -> u64 {
+    DEFAULT_APPROVAL_TTL_SECONDS
+}
+
+impl Default for ApprovalsSection {
+    fn default() -> Self {
+        Self {
+            ttl_seconds: DEFAULT_APPROVAL_TTL_SECONDS,
+            client_id: None,
+        }
+    }
+}
+
+impl ApprovalsSection {
+    /// Startup check: `ttl_seconds` in 1..=86400, `client_id` not empty when set.
+    pub fn check(&self) -> anyhow::Result<()> {
+        if !(1..=86_400).contains(&self.ttl_seconds) {
+            anyhow::bail!(
+                "[approvals] ttl_seconds must be between 1 and 86400, got {}",
+                self.ttl_seconds
+            );
+        }
+        if self.client_id.as_deref().is_some_and(str::is_empty) {
+            anyhow::bail!("[approvals] client_id must not be empty when set");
+        }
+        Ok(())
+    }
+
+    /// `ttl_seconds` as a duration.
+    pub fn ttl(&self) -> time::Duration {
+        time::Duration::seconds(i64::try_from(self.ttl_seconds).unwrap_or(i64::MAX))
+    }
 }
 
 /// `[admin]`

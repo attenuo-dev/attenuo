@@ -38,7 +38,7 @@ use tower_http::trace::TraceLayer;
 use crate::config::Config;
 use crate::error::ApiError;
 use crate::routes::admin::{self, require_admin};
-use crate::routes::policies;
+use crate::routes::{approvals, policies};
 use crate::state::AppState;
 
 /// Where the console lives on its listener. Asset paths are relative to it.
@@ -104,6 +104,11 @@ pub const ASSETS: &[Asset] = &[
         path: "dom.js",
         content_type: JS,
         bytes: include_bytes!("../ui/dom.js"),
+    },
+    Asset {
+        path: "view-approvals.js",
+        content_type: JS,
+        bytes: include_bytes!("../ui/view-approvals.js"),
     },
     Asset {
         path: "view-audit.js",
@@ -183,6 +188,8 @@ pub fn read_routes() -> Router<Arc<AppState>> {
         .route("/admin/leases/{lease_id}/tree", get(admin::lease_tree))
         .route("/admin/policies", get(policies::get_policies))
         .route("/admin/policies/check", get(policies::check_policies))
+        .route("/admin/approvals", get(approvals::admin_list))
+        .route("/admin/approvals/{id}", get(approvals::admin_get))
         .merge(evaluate)
 }
 
@@ -193,6 +200,7 @@ pub fn write_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/admin/leases/{lease_id}/revoke", post(admin::revoke_lease))
         .route("/admin/policies/reload", post(admin::reload_policies))
+        .route("/admin/approvals/{id}", post(approvals::admin_decide))
         .route_layer(middleware::from_fn(require_json))
 }
 

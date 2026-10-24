@@ -61,7 +61,53 @@ grant_type=urn:ietf:params:oauth:grant-type:token-exchange
 | `GET /mcp/{server}` | bearer delegation token | Passthrough for the streamable HTTP event stream, after the lease check. |
 | `DELETE /mcp/{server}` | bearer delegation token | Passthrough session close, after the lease check. |
 
-A denial is a JSON-RPC error with code `-32003`, carrying `reason` and `decision_id`. A call that a policy sends for approval (reason `approval_required`) gets `-32008` instead, with `reason`, `decision_id` and `call_hash` (SHA-256 of the RFC 8785 JSON of `{server, tool, arguments}`), and is not forwarded. If the answer to an allowed call cannot be recorded in the audit log, the agent gets `-32003` with reason `label_error` and the call's `decision_id` instead of the answer. A missing or bad token is HTTP 401 with `-32001` and `data.reason` set to `missing_token`, `invalid_token`, `token_expired`, `dpop_required`, `invalid_dpop_proof`, `use_dpop_nonce` or, for a lease that is no longer live, `lease_revoked`, `lease_expired` or `lease_unknown`. An upstream the proxy cannot reach is HTTP 502 with `-32005` and `data.reason` `upstream_unreachable`; the upstream URL and transport error are only logged. Allowed responses carry `X-Attenuo-Decision-Id`.
+A denial is a JSON-RPC error with code `-32003`, carrying `reason` and `decision_id`. A call that a policy sends for approval (reason `approval_required`) gets `-32008` instead, with `reason`, `decision_id`, `call_hash` (SHA-256 of the RFC 8785 JSON of `{server, tool, arguments}`), `approval_id` and `expires_at`, and is not forwarded. Once the approval is granted, the identical call from the same hop is allowed once (see [Approvals](#approvals)). `approval_id` is absent if the server could not open an approval. If the answer to an allowed call cannot be recorded in the audit log, the agent gets `-32003` with reason `label_error` and the call's `decision_id` instead of the answer. A missing or bad token is HTTP 401 with `-32001` and `data.reason` set to `missing_token`, `invalid_token`, `token_expired`, `dpop_required`, `invalid_dpop_proof`, `use_dpop_nonce` or, for a lease that is no longer live, `lease_revoked`, `lease_expired` or `lease_unknown`. An upstream the proxy cannot reach is HTTP 502 with `-32005` and `data.reason` `upstream_unreachable`; the upstream URL and transport error are only logged. Allowed responses carry `X-Attenuo-Decision-Id`.
+
+## Approvals
+
+A call gated with `@obligation("approval")` gets an `approval_id` in its `-32008` error. A person decides it through one of these routes; the agent's own delegation token can read it but never decide it.
+
+| Method and path | Auth | Purpose |
+| --- | --- | --- |
+| `POST /approvals/{id}` | an OIDC ID token of the run's originating user (`Authorization: Bearer`) | Body `{"decision": "grant" \| "decline"}`. Answers the approval as below. |
+| `GET /approvals/{id}` | that user's ID token, or a delegation token of the same run (with a DPoP proof when bound) | The approval. Anyone else gets 404. |
+| `GET /admin/approvals?chain_id&state&limit` | admin | Approvals newest first, optionally of one run (`chain_id`, the first hop's lease) or in one state; `limit` default and maximum 500. `{"approvals": [...]}`. |
+| `GET /admin/approvals/{id}` | admin | One approval. |
+| `POST /admin/approvals/{id}` | admin | Body as above; decides as the operator (`by = "operator"`). Also on the console listener with `[admin_ui] allow_write = true`. |
+
+The ID token is verified as at hop 0: signature from a `[[idps]]` issuer, expiry, and `aud`/`azp` equal to `[approvals] client_id` or, when that is unset, to the client id intake expects for the run's root agent. Its `sub` and `iss` must match the run's originating user. A token can decide once; reads do not use it up.
+
+An approval:
+
+```json
+{
+  "approval_id": "0f8e6c1a-4b7d-4f61-9a39-2f4f5b0e8d11",
+  "state": "pending",
+  "expired": false,
+  "chain_id": "<first hop's lease>",
+  "lease": "<calling hop's lease>",
+  "call_hash": "<64 hex>",
+  "call": { "server": "github", "tool": "delete_repo", "arguments": { "repo": "alice/site" } },
+  "labels": [{ "source": "web/fetch", "seq": 41 }],
+  "decision_id": "<the gated decision>",
+  "subject": "alice",
+  "issuer": "https://idp.example",
+  "agents": ["planner", "coder"],
+  "created_at": "2026-10-24T10:00:00Z",
+  "expires_at": "2026-10-24T10:02:00Z"
+}
+```
+
+`state` is `pending`, `granted`, `declined` or `consumed`; `expired` says whether `expires_at` has passed. A decided approval adds `approver: {subject, method, by}` (`id_token`/`user` or `admin_token`/`operator`) and `decided_at`; a used one adds `consumed_by`, the id of the allowed decision.
+
+| Status | `error` | When |
+| --- | --- | --- |
+| 400 | `invalid_request` | `decision` is not `grant` or `decline` |
+| 401 | `missing_token`, `invalid_token` | no bearer, or the ID token failed verification or was already used |
+| 403 | `agent_token_refused` | a delegation token on `POST /approvals/{id}` |
+| 403 | `wrong_user` | the ID token belongs to someone other than the run's originating user |
+| 404 | `not_found` | unknown approval, or a delegation token of another run |
+| 409 | `approval_not_pending`, `approval_expired`, `lease_revoked` | already decided or used, past `expires_at`, or the lease it is bound to is no longer live |
 
 ## Admin
 
@@ -204,6 +250,7 @@ These three routes change nothing and write no audit record. They answer the que
 - With `token`, the token is verified with the server's keys and its chain is used; `subject.id` may be empty and `subject.properties.chain` may be left out (if present it must equal the token's chain, else 400 `chain_mismatch`). A bad signature or any other verification failure is 400 `invalid_token`. An expired token is accepted, verified as of the last second it was valid, and the answer has `token_expired: true`. The call counts as DPoP-bound when the token is bound (`cnf`).
 - Without `token`, `subject.properties.chain` is required (400 `invalid_request` otherwise) and is only checked structurally, as of now (400 `invalid_chain` if that fails). Nothing checks that this server issued it.
 - An optional `session`, `{"tainted_by": ["<server>/<tool>", ...], "tainted": true}`, sets the run's output labels for the dry run (`tainted` defaults to whether `tainted_by` is non-empty). Without it, the labels are read from the store for the chain's run. Anything else in `session` is a 400 `invalid_request`.
+- An optional `approval`, `{"by": "user" | "operator" | "policy"}`, evaluates the call as a retry that carries a granted approval (`context.approval.present` true, `by` as given). The dry run never looks up or uses a stored approval.
 
 ```json
 {
@@ -214,7 +261,8 @@ These three routes change nothing and write no audit record. They answer the que
   "lease_check": "skipped",
   "chain_source": "token",
   "token_expired": false,
-  "session": {"tainted": false, "tainted_by": [], "source": "store"}
+  "session": {"tainted": false, "tainted_by": [], "source": "store"},
+  "approval": {"present": false, "by": ""}
 }
 ```
 

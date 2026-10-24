@@ -336,8 +336,18 @@ fn evaluate_value(
         "decision_id": d.decision_id,
     });
     if d.reason == attenuo_policy::REASON_APPROVAL_REQUIRED {
-        // What an approval would be bound to (ADR-0009), as the proxy's `-32008` carries it.
+        // What an approval is bound to (ADR-0009), as the proxy's `-32008` carries it.
         context["call_hash"] = json!(call.call_hash());
+        if let Some(a) = &d.approval {
+            context["approval_id"] = json!(a.approval_id);
+            context["expires_at"] = json!(a
+                .expires_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default());
+        }
+    }
+    if let Some((id, by)) = &d.consumed_approval {
+        context["approval"] = json!({ "id": id, "by": by });
     }
     Ok(EvaluationResponse {
         decision: allow,

@@ -72,6 +72,10 @@ What it cannot show: the tool arguments and the capabilities each hop held. The 
 
 `#/lease/<id>` shows the leases the lease was delegated from (root first), and the lease with everything delegated from it as an indented tree: lease id, agent, expiry, state (with revocation reason and time), and the seq of the record that issued it. **renewals** lists the renewals of one lease. **Revoke…** opens a confirmation (below).
 
+### Approvals
+
+`#/approvals` lists approvals of gated calls, newest first: id, state (with `expired` when past `expires_at`), call, user, run and expiry. Filter by run (chain id) or state. `#/approval/<id>` shows one: the call with its arguments exactly as the agent sent them, the call hash, the user and agents, the run and the calling hop's lease, the labels the run carried (each links to its `tool_result` entry), the gated decision, the times, and who decided and which decision used it. A pending approval has **Grant** and **Decline**; they need `allow_write` (below) and record the operator as approver (`by = "operator"`). The user can also decide with their own ID token at `POST /approvals/{id}`, which the console does not do.
+
 ### Policy
 
 - The loaded policies: file path, its SHA-256, when it was loaded, warnings, and the text of each policy.
@@ -87,7 +91,7 @@ What it cannot show: the tool arguments and the capabilities each hop held. The 
 
 ## Writes and `allow_write`
 
-By default the console listener is read-only: `POST /admin/leases/{id}/revoke` and `POST /admin/policies/reload` are not mounted there (404). The console still shows **Revoke…** and **Reload**; pressing them explains that writes are disabled on this listener. Use the CLI against the main listener instead, or set:
+By default the console listener is read-only: `POST /admin/leases/{id}/revoke`, `POST /admin/policies/reload` and `POST /admin/approvals/{id}` are not mounted there (404). The console still shows **Revoke…**, **Reload**, **Grant** and **Decline**; pressing them explains that writes are disabled on this listener. Use the CLI against the main listener instead, or set:
 
 ```toml
 [admin_ui]
@@ -98,6 +102,7 @@ With writes on:
 
 - **Revoke** shows how many leases a revoke would change and which active agents hold them, asks for a reason (recorded in the audit log) and the last 6 characters of the lease id, then revokes. It reports the server's count next to the preview's. It cannot be undone.
 - **Reload** swaps in the policy file. If the file does not load, the old policies stay in force and the console shows the error.
+- **Grant** lets the agent's identical retry run once; **Decline** ends the approval. Both are recorded in the audit log as `approval_grant` records.
 
 One action writes even when `allow_write` is off, because it changes no lease, policy or audit entry: **Sign head now** (`GET /admin/audit/checkpoint`, which stores a checkpoint). Evaluate, check and the other reads write nothing.
 

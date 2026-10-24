@@ -110,6 +110,7 @@ impl Authorizer for FuzzAuth {
                 decision: Decision::Deny,
                 reason: "capability_denied".into(),
                 decision_id: id,
+                approval: None,
             }
         }
     }

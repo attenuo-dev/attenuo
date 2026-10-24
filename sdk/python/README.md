@@ -65,6 +65,8 @@ print(admin.audit_verify())  # VerifyReport(ok=True, entries=..., ...)
 | `exchange(subject_token, actor, capabilities, ttl_seconds=None, client_id=None, client_secret=None, subject_token_type=None, *, actor_token=None, may_act=None)` | RFC 8693 exchange. Returns a `Token`. From a delegation token, `client_secret` is the actor's `[[agents]]` secret (`client_id` defaults to `actor`), which the server requires by default. From any other subject token, `client_id` and `client_secret` make it a hop-0 exchange of an IdP credential (`subject_token_type="...:id-jag"` for an ID-JAG). A parent token can be exchanged for a given actor once. `actor_token` (a workload-identity JWT such as a SPIFFE JWT-SVID from an `[[actor_trust]]` issuer) authenticates the actor instead of a secret, depending on `[token] actor_auth`; each one works for one exchange. `may_act` lists the agents allowed to exchange the new token next. |
 | `renew(token)`                                                                                       | `POST /token/renew`. Returns `Lease(lease, expires_at, expires_in)`.                                                                                                                                                                                                                                                                                                                                              |
 | `call_tool(token, server, tool, arguments, session_id=None)`                                         | `tools/call` through `/mcp/{server}`. Returns `ToolResult` (`.text`, `.content`, `.is_error`, `.decision_id`).                                                                                                                                                                                                                                                                                                    |
+| `call_tool_with_approval(token, server, tool, arguments, *, on_approval=None, timeout=None, interval=2.0)` | `call_tool`; when the call needs an approval (`-32008`), calls `on_approval(err)`, waits for the grant, and retries the identical call once. See [Approvals](#approvals). |
+| `get_approval(approval_id, token)`, `wait_for_approval(approval_id, token, *, timeout=None, interval=2.0)` | `GET /approvals/{id}` as the agent (same run, DPoP signed when the client has a key); `wait_for_approval` polls until granted and raises `ApprovalNotGranted` otherwise. |
 | `list_tools(token, server)`                                                                          | `tools/list`, filtered by the proxy to what the token may call.                                                                                                                                                                                                                                                                                                                                                   |
 | `initialize(token, server)`                                                                          | MCP `initialize`; returns the `Mcp-Session-Id`, if any.                                                                                                                                                                                                                                                                                                                                                           |
 | `authzen_evaluate(token, server, tool, arguments)`                                                   | AuthZEN decision without calling the tool. A deny is a falsy `AuthzenDecision`, not an exception.                                                                                                                                                                                                                                                                                                                 |
@@ -202,6 +204,28 @@ with (
 - **Logging.** The `attenuo.refresh` logger writes lease ids and reason codes only, never tokens.
 - **Testing.** `tick()` runs whatever is due and returns the seconds to wait; the thread is a loop around it, and `clock=` and `rng=` replace the time source and the jitter.
 
+### Approvals
+
+A policy can hold a call until a person approves it (`@obligation("approval")`, see [Writing policies](../../docs/guides/writing-policies.md)). The proxy then answers JSON-RPC `-32008`, which the SDK raises as `ApprovalRequired`, a `Denied` with `reason == "approval_required"` plus `.approval_id`, `.expires_at` and `.call_hash`. The user grants it with their own sign-in (`POST /approvals/{id}`), or an operator does with `attenuo approval grant`. The agent's own token can read the approval but never decide it. The grant is good for one retry of the identical call (same server, tool and arguments) by the same hop, until `expires_at`.
+
+```python
+from attenuo import ApprovalNotGranted, ApprovalRequired
+
+
+def tell_user(err: ApprovalRequired) -> None:
+    print(f"Approval needed: {err.approval_id} (expires {err.expires_at})")
+
+
+try:
+    result = ob.call_tool_with_approval(
+        token, "github", "delete_repo", {"repo": "alice/site"}, on_approval=tell_user
+    )
+except ApprovalNotGranted as e:
+    print("not approved:", e.state)  # declined, expired, consumed or timeout
+```
+
+`approval_id` is `None` when the server could not open an approval; treat that as a plain denial. Like `-32003`, a `-32008` counts only when the `X-Attenuo-Decision-Id` header names its `data.decision_id`; otherwise it is an upstream's own `RpcError`.
+
 ### Errors
 
 All SDK errors derive from `AttenuoError`.
@@ -209,6 +233,8 @@ All SDK errors derive from `AttenuoError`.
 | Exception                                   | When                                                                                                                                                                                                                                                                                                                                                                         |
 | ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Denied` (`.reason`, `.decision_id`)        | The proxy said no (JSON-RPC `-32003` with the `X-Attenuo-Decision-Id` header naming `data.decision_id`; an upstream's own `-32003` without that proof is an `RpcError`). Branch on `reason`: `capability_denied`, `policy_deny`, `lease_revoked`, `lease_expired`, ... See the [integration guide](../../docs/guides/integrating-mcp-clients.md#handling-denied-responses). |
+| `ApprovalRequired` (`.approval_id`, `.expires_at`, `.call_hash`) | A `Denied` for JSON-RPC `-32008`: a policy holds the call until it is approved. See [Approvals](#approvals). |
+| `ApprovalNotGranted` (`.approval_id`, `.state`) | Waiting for an approval ended without a grant: `declined`, `expired`, `consumed` or `timeout`. |
 | `Unauthorized`                              | HTTP 401: missing, bad or expired bearer.                                                                                                                                                                                                                                                                                                                                    |
 | `ApiError` (`.status`, `.error`, `.detail`) | Any other non-success from the server: `invalid_scope`, `invalid_grant`, 404, 422.                                                                                                                                                                                                                                                                                           |
 | `RpcError`                                  | A JSON-RPC error that is not a denial (unknown upstream, upstream down).                                                                                                                                                                                                                                                                                                     |

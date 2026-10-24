@@ -10,6 +10,7 @@ import { h, replace } from './dom.js';
 import {
   api, setToken, forgetToken, hasToken, setUnauthorizedHandler, clearStatus, showError,
 } from './api.js';
+import { approvalsView, approvalView } from './view-approvals.js';
 import { auditView } from './view-audit.js';
 import { entryView } from './view-entry.js';
 import { leaseView } from './view-lease.js';
@@ -182,9 +183,11 @@ const ROUTES = {
   lease: (m, s) => leaseView(m, s[1]),
   policy: (m) => policyView(m),
   verify: (m) => verifyView(m),
+  approvals: (m, s, p) => approvalsView(m, p),
+  approval: (m, s) => approvalView(m, s[1]),
 };
 
-const NAV_FOR = { audit: 'audit', entry: 'audit', record: 'audit', lease: 'audit', policy: 'policy', verify: 'verify' };
+const NAV_FOR = { audit: 'audit', entry: 'audit', record: 'audit', lease: 'audit', policy: 'policy', verify: 'verify', approvals: 'approvals', approval: 'approvals' };
 
 async function route() {
   if (!hasToken()) return;
@@ -199,7 +202,7 @@ async function route() {
     if (a.dataset.page === NAV_FOR[name]) a.setAttribute('aria-current', 'page');
     else a.removeAttribute('aria-current');
   }
-  if (!view || (name !== 'audit' && name !== 'policy' && name !== 'verify' && !segments[1])) {
+  if (!view || (name !== 'audit' && name !== 'policy' && name !== 'verify' && name !== 'approvals' && !segments[1])) {
     replace(main, h('section', { class: 'panel' }, h('h1', null, 'Not found'),
       h('p', null, 'There is no such page. '), h('a', { href: '#/audit' }, 'Go to the audit log')));
     return;

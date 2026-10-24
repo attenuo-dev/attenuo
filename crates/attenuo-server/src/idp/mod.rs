@@ -311,6 +311,35 @@ impl IdpRegistry {
         agent: &str,
         now: OffsetDateTime,
     ) -> Result<VerifiedAssertion, IntakeError> {
+        self.verify_for(token, kind, ClientId::Agent(agent), now)
+            .await
+    }
+
+    /// Verify an OIDC ID token for an approval (ADR-0009): the same checks as hop-0 intake,
+    /// with `aud` (and `azp`) bound to `client_id` when given, else to the client id intake
+    /// expects for `agent` (the run's root agent).
+    pub async fn verify_approval(
+        &self,
+        token: &str,
+        client_id: Option<&str>,
+        agent: &str,
+        now: OffsetDateTime,
+    ) -> Result<VerifiedAssertion, IntakeError> {
+        let client = match client_id {
+            Some(c) => ClientId::Fixed(c),
+            None => ClientId::Agent(agent),
+        };
+        self.verify_for(token, CredentialKind::IdToken, client, now)
+            .await
+    }
+
+    async fn verify_for(
+        &self,
+        token: &str,
+        kind: CredentialKind,
+        client: ClientId<'_>,
+        now: OffsetDateTime,
+    ) -> Result<VerifiedAssertion, IntakeError> {
         let (header, payload) = peek(token)?;
 
         let typ = header.get("typ").and_then(Value::as_str);
@@ -358,7 +387,10 @@ impl IdpRegistry {
 
         // SR-37: an ID token is for one client, and the presenter must be that client. The
         // check comes first so its sub-code is the one a replayed-by-another-agent token gets.
-        let client_id = client_id_for(&idp.config, agent);
+        let client_id = match client {
+            ClientId::Agent(agent) => client_id_for(&idp.config, agent),
+            ClientId::Fixed(c) => c.to_owned(),
+        };
         let expected_aud = match kind {
             CredentialKind::IdToken => {
                 check_bound_to_agent(&claims, &client_id)?;
@@ -386,6 +418,15 @@ impl IdpRegistry {
             clock_skew_seconds: idp.config.clock_skew_seconds,
         })
     }
+}
+
+/// Which client an ID token must have been issued to.
+#[derive(Clone, Copy)]
+enum ClientId<'a> {
+    /// The client id configured for this agent (`client_ids`, else the agent id).
+    Agent(&'a str),
+    /// Exactly this client id (`[approvals] client_id`).
+    Fixed(&'a str),
 }
 
 fn client_id_for(cfg: &IdpConfig, agent: &str) -> String {
@@ -431,6 +472,13 @@ fn parse_asymmetric_alg(name: &str) -> Result<Algorithm, String> {
 type JsonObject = Map<String, Value>;
 
 /// Decode header and payload without verifying anything.
+/// The `iss` claim of a JWT, read without verifying anything. Used only to choose how to
+/// verify a bearer that may be either a delegation token or an IdP ID token.
+pub(crate) fn unverified_issuer(token: &str) -> Option<String> {
+    let (_, payload) = peek(token).ok()?;
+    payload.get("iss")?.as_str().map(str::to_owned)
+}
+
 fn peek(token: &str) -> Result<(JsonObject, JsonObject), IntakeError> {
     let mut parts = token.split('.');
     let (Some(h), Some(p), Some(_sig), None) =

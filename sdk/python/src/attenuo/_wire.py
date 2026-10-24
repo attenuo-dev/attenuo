@@ -12,7 +12,15 @@ from urllib.parse import quote
 import httpx
 
 from .capability import capabilities_to_json
-from .errors import ApiError, AttenuoError, Denied, RpcError, Unauthorized
+from .errors import (
+    ApiError,
+    ApprovalNotGranted,
+    ApprovalRequired,
+    AttenuoError,
+    Denied,
+    RpcError,
+    Unauthorized,
+)
 from .token import Token, decode_token, parse_time
 
 TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
@@ -22,6 +30,7 @@ AUTHORIZATION_DETAILS_TYPE = "attenuo_capabilities"
 
 CODE_UNAUTHORIZED = -32001
 CODE_DENIED = -32003
+CODE_APPROVAL_REQUIRED = -32008
 DECISION_ID_HEADER = "x-attenuo-decision-id"
 SESSION_HEADER = "mcp-session-id"
 MCP_ACCEPT = "application/json, text/event-stream"
@@ -108,6 +117,33 @@ class AuthzenDecision:
 
     def __bool__(self) -> bool:
         return self.decision
+
+
+@dataclass(frozen=True)
+class Approval:
+    """An approval as ``GET /approvals/{id}`` shows it.
+
+    ``state`` is ``pending``, ``granted``, ``declined`` or ``consumed``; ``expired`` is the
+    server's view of whether ``expires_at`` has passed. ``usable`` is true for a grant that a
+    retry of the identical call can still use.
+    """
+
+    approval_id: str
+    state: str
+    expired: bool
+    chain_id: str
+    call_hash: str
+    server: str
+    tool: str
+    arguments: dict[str, Any]
+    expires_at: datetime | None
+    approver: dict[str, Any] | None
+    consumed_by: str | None
+    raw: dict[str, Any] = field(repr=False)
+
+    @property
+    def usable(self) -> bool:
+        return self.state == "granted" and not self.expired
 
 
 # --- plain HTTP ------------------------------------------------------------------------------
@@ -308,14 +344,60 @@ def _proxy_decision_id(resp: httpx.Response, data: dict[str, Any]) -> str | None
     return claimed if claimed in ids else None
 
 
+def _opt_time(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return parse_time(value)
+    except ValueError:
+        return None
+
+
+def approval_from_json(body: Any) -> Approval:
+    if not isinstance(body, dict) or not isinstance(body.get("approval_id"), str):
+        raise AttenuoError("not an approval: missing approval_id")
+    raw_call = body.get("call")
+    call: dict[str, Any] = raw_call if isinstance(raw_call, dict) else {}
+    args = call.get("arguments")
+    approver = body.get("approver")
+    consumed = body.get("consumed_by")
+    return Approval(
+        approval_id=body["approval_id"],
+        state=str(body.get("state", "")),
+        expired=body.get("expired") is True,
+        chain_id=str(body.get("chain_id", "")),
+        call_hash=str(body.get("call_hash", "")),
+        server=str(call.get("server", "")),
+        tool=str(call.get("tool", "")),
+        arguments=args if isinstance(args, dict) else {},
+        expires_at=_opt_time(body.get("expires_at")),
+        approver=approver if isinstance(approver, dict) else None,
+        consumed_by=consumed if isinstance(consumed, str) else None,
+        raw=body,
+    )
+
+
+def approval_ready(approval: Approval) -> bool:
+    """True when the grant is usable, False while it is still pending; raises
+    :class:`~attenuo.ApprovalNotGranted` when waiting longer cannot help."""
+    if approval.usable:
+        return True
+    if approval.expired:
+        raise ApprovalNotGranted(approval.approval_id, "expired")
+    if approval.state == "pending":
+        return False
+    raise ApprovalNotGranted(approval.approval_id, approval.state or "unknown")
+
+
 def rpc_result(resp: httpx.Response) -> tuple[dict[str, Any], str | None]:
     """The ``result`` of a JSON-RPC response, or the right exception.
 
     Returns ``(result, decision_id)``. Denials (``-32003`` that the proxy
     vouches for with ``X-Attenuo-Decision-Id``, see :func:`_proxy_decision_id`) raise
     :class:`Denied`; a ``-32003`` without that proof is an upstream's own error and raises
-    :class:`RpcError`. ``-32001`
-    or HTTP 401 raises :class:`Unauthorized`; any other JSON-RPC error raises :class:`RpcError`.
+    :class:`RpcError`. A ``-32008`` with the same proof raises :class:`ApprovalRequired`.
+    ``-32001`` or HTTP 401 raises :class:`Unauthorized`; any other JSON-RPC error raises
+    :class:`RpcError`.
     """
     decision_id = resp.headers.get(DECISION_ID_HEADER)
     sse = "event-stream" in resp.headers.get("content-type", "")
@@ -334,6 +416,18 @@ def rpc_result(resp: httpx.Response) -> tuple[dict[str, Any], str | None]:
             proven = _proxy_decision_id(resp, data)
             if proven is not None:
                 raise Denied(str(data.get("reason", "unknown")), proven, message)
+        if code == CODE_APPROVAL_REQUIRED:
+            proven = _proxy_decision_id(resp, data)
+            if proven is not None:
+                approval_id = data.get("approval_id")
+                call_hash = data.get("call_hash")
+                raise ApprovalRequired(
+                    proven,
+                    approval_id if isinstance(approval_id, str) and approval_id else None,
+                    _opt_time(data.get("expires_at")),
+                    call_hash if isinstance(call_hash, str) else None,
+                    message,
+                )
         if code == CODE_UNAUTHORIZED or resp.status_code == 401:
             raise Unauthorized(401, "unauthorized", message)
         raise RpcError(int(code) if isinstance(code, int) else 0, message, raw_data)

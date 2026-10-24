@@ -174,6 +174,20 @@ pub async fn evaluate_policies(
         None | Some(Value::Null) => None,
         Some(v) => Some(session_from_json(&v)?),
     };
+    // `approval: {"by": "user" | "operator"}`: evaluate as if the call carried a granted
+    // approval. The dry run never looks one up or consumes one.
+    let approval = match obj.remove("approval") {
+        None | Some(Value::Null) => attenuo_policy::ApprovalContext::default(),
+        Some(v) => match v.get("by").and_then(Value::as_str) {
+            Some(by @ ("user" | "operator" | "policy")) => attenuo_policy::ApprovalContext::by(by),
+            _ => {
+                return Err(ApiError::bad_request(
+                    "invalid_request",
+                    "`approval` must be {\"by\": \"user\" | \"operator\" | \"policy\"}",
+                ))
+            }
+        },
+    };
     let mut req: EvaluationRequest = serde_json::from_value(raw)
         .map_err(|e| ApiError::bad_request("invalid_request", e.to_string()))?;
 
@@ -202,6 +216,7 @@ pub async fn evaluate_policies(
     };
     let labels = CallLabels {
         session: session.clone(),
+        approval: approval.clone(),
     };
     let o = state.pipeline.evaluate_policy(&chain, &call, &labels, now);
     Ok(Json(json!({
@@ -217,6 +232,7 @@ pub async fn evaluate_policies(
             "tainted_by": session.tainted_by,
             "source": session_source,
         },
+        "approval": { "present": approval.present, "by": approval.by },
     })))
 }
 

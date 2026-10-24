@@ -38,6 +38,15 @@ pub enum AuditError {
     /// A lease already carries a different chain binding (bindings are write-once).
     #[error("lease `{0}` is already bound to a different chain")]
     BindingConflict(String),
+    /// No approval with this id is stored.
+    #[error("unknown approval `{0}`")]
+    UnknownApproval(String),
+    /// The approval was already granted, declined or consumed.
+    #[error("approval `{id}` is {state}, not pending")]
+    ApprovalNotPending { id: String, state: &'static str },
+    /// The approval (or the lease it is bound to) has expired.
+    #[error("approval or lease `{0}` has expired")]
+    ApprovalExpired(String),
 }
 
 impl<T> From<std::sync::PoisonError<T>> for AuditError {

@@ -46,10 +46,18 @@ pub enum RecordKind {
     /// (output labelling, ADR-0009). Carries [`DecisionRecord::decision_id`] and
     /// [`DecisionRecord::result`]; the content itself is never stored.
     ToolResult,
+    /// A call was gated by `@obligation("approval")` and a pending approval was stored for it
+    /// (ADR-0009). Carries [`DecisionRecord::decision_id`] (the gated decision) and
+    /// [`DecisionRecord::approval`] (id, call hash, expiry).
+    ApprovalRequest,
+    /// A pending approval was granted or declined by the originating user or an operator.
+    /// Carries [`DecisionRecord::approval`] (id, call hash, approver, outcome, expiry). Using a
+    /// granted approval is recorded on the decision that consumed it.
+    ApprovalGrant,
 }
 
 impl RecordKind {
-    pub const ALL: [RecordKind; 7] = [
+    pub const ALL: [RecordKind; 9] = [
         RecordKind::Decision,
         RecordKind::Exchange,
         RecordKind::RootToken,
@@ -57,10 +65,12 @@ impl RecordKind {
         RecordKind::LeaseRevoke,
         RecordKind::Admin,
         RecordKind::ToolResult,
+        RecordKind::ApprovalRequest,
+        RecordKind::ApprovalGrant,
     ];
 
     /// The wire string (`decision`, `exchange`, `root_token`, `lease_renew`, `lease_revoke`,
-    /// `admin`, `tool_result`).
+    /// `admin`, `tool_result`, `approval_request`, `approval_grant`).
     pub fn as_str(&self) -> &'static str {
         match self {
             RecordKind::Decision => "decision",
@@ -70,6 +80,8 @@ impl RecordKind {
             RecordKind::LeaseRevoke => "lease_revoke",
             RecordKind::Admin => "admin",
             RecordKind::ToolResult => "tool_result",
+            RecordKind::ApprovalRequest => "approval_request",
+            RecordKind::ApprovalGrant => "approval_grant",
         }
     }
 }
@@ -146,6 +158,59 @@ pub struct DecisionRecord {
     /// Absent when the run had none, which keeps the hashes of older records unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labels: Option<RecordLabels>,
+    /// The approval this record is about (ADR-0009). On a decision: the approval the call
+    /// consumed (`id`, `by`). On an `approval_request` or `approval_grant` record: the
+    /// approval's id, call hash, expiry and, for a grant, approver and outcome. Absent on every
+    /// other record, which keeps the hashes of older records unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ApprovalInfo>,
+}
+
+/// What a record says about an approval (see [`DecisionRecord::approval`]). Every member but
+/// `id` is optional and omitted when absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalInfo {
+    /// The approval id (`approval_id` in the `-32008` error data).
+    pub id: Uuid,
+    /// Who stood behind the approval: `user` or `operator`. On a consuming decision and on a
+    /// grant record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    /// SHA-256 of the canonical `{server, tool, arguments}` the approval is bound to
+    /// ([`ToolCall::call_hash`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_hash: Option<String>,
+    /// When the approval stops being usable.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub expires_at: Option<OffsetDateTime>,
+    /// Subject of the approver: the user's `sub`, or `urn:attenuo:admin` for an operator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver: Option<String>,
+    /// How the approver authenticated: `id_token` or `admin_token`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// On a grant record: `grant` or `decline`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+}
+
+impl ApprovalInfo {
+    /// Only the id; set the other members as needed.
+    pub fn new(id: Uuid) -> Self {
+        Self {
+            id,
+            by: None,
+            call_hash: None,
+            expires_at: None,
+            approver: None,
+            method: None,
+            outcome: None,
+        }
+    }
 }
 
 /// Label of an upstream result (output labelling, ADR-0009).
@@ -243,6 +308,7 @@ impl DecisionRecord {
             decision_id: None,
             result: None,
             labels: None,
+            approval: None,
         }
     }
 
@@ -275,6 +341,13 @@ impl DecisionRecord {
         r
     }
 }
+
+/// `reason` of every [`RecordKind::ApprovalRequest`] record.
+pub const REASON_APPROVAL_REQUESTED: &str = "approval_requested";
+/// `reason` of an [`RecordKind::ApprovalGrant`] record that granted the approval.
+pub const REASON_APPROVAL_GRANTED: &str = "approval_granted";
+/// `reason` of an [`RecordKind::ApprovalGrant`] record that declined the approval.
+pub const REASON_APPROVAL_DECLINED: &str = "approval_declined";
 
 /// `reason` of every [`RecordKind::ToolResult`] record.
 pub const REASON_TOOL_RESULT: &str = "tool_result";

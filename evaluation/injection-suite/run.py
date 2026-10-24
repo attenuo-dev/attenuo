@@ -396,8 +396,8 @@ def render_labels(doc: dict[str, Any]) -> list[str]:
             "",
             'A gated call got JSON-RPC `-32008` with `data.reason = "approval_required"`. '
             "The scripted approver approves a call labelled benign and declines one labelled "
-            "attack. Retrying an approved call needs the approvals API, so gated calls are "
-            "counted, not retried. The approve-all bound treats every request as granted.",
+            "attack. The runner does not grant or retry, so gated calls are counted, not "
+            "retried. The approve-all bound treats every request as granted.",
             "",
             "| Attack allowed without approval | Attack gated | Attack allowed, approve-all "
             "| Benign gated | Benign denied | Approval requests |",

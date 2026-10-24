@@ -9,6 +9,7 @@ attenuo writes one record for every decision it makes. The records are chained b
 - Every AuthZEN evaluation.
 - Every token issued, at hop 0 and at each exchange.
 - Every successful lease renewal.
+- Every approval opened for a gated call, and every grant or decline of one.
 
 Requests that carry no decision, such as `tools/list` and `ping`, are not recorded. Failed exchanges and failed renewals are not recorded either in v0.
 
@@ -16,7 +17,7 @@ Requests that carry no decision, such as `tools/list` and `ping`, are not record
 
 A record names the agent chain and the originating user separately. That is the point: most logs cannot tell an agent action from a user action. A record also has:
 
-- a `kind`, one of `decision`, `tool_result`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin` (see [Kind and chain id](#kind-and-chain-id)),
+- a `kind`, one of `decision`, `tool_result`, `approval_request`, `approval_grant`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin` (see [Kind and chain id](#kind-and-chain-id)),
 - a `chain_id`, the id of the delegation chain it belongs to (absent for admin actions),
 - a decision id, which the client sees in the `X-Attenuo-Decision-Id` header or in the error data of a denial,
 - the time, and allow or deny,
@@ -38,6 +39,8 @@ Two top-level fields let you filter and join an export without reading anything 
 | --- | --- | --- |
 | `decision` | a tool call or AuthZEN evaluation was decided (allow or deny, including refusals before the policy ran) | the tool called |
 | `tool_result` | the proxy relayed the upstream's answer to an allowed call | the tool called |
+| `approval_request` | a gated call opened an approval | the tool called |
+| `approval_grant` | the user or the operator granted or declined an approval | the tool called |
 | `exchange` | a token exchange issued a new hop | `token.exchange` |
 | `root_token` | a root token was issued (IdP login, or the dev mint) | `token.root` |
 | `lease_renew` | a lease was renewed | `lease.renew` |
@@ -64,7 +67,19 @@ A `tool_result` record is written after every allowed mediated call that gets an
 
 The content is not stored. If the record cannot be written, the agent gets a `label_error` denial instead of the answer.
 
-An untrusted result taints the run (see [Writing policies](../guides/writing-policies.md#asking-for-approval-after-untrusted-output)). A decision record of a call on a tainted run has `labels: {tainted_by: [seq, ...]}`, the `seq` of the first `tool_result` record of each source, so an auditor can see what the run had read before a call. `decision_id`, `result` and `labels` are omitted when absent, so records without them hash exactly as before.
+An untrusted result taints the run (see [Writing policies](../guides/writing-policies.md#asking-for-approval-after-untrusted-output)). A decision record of a call on a tainted run has `labels: {tainted_by: [seq, ...]}`, the `seq` of the first `tool_result` record of each source, so an auditor can see what the run had read before a call. `decision_id`, `result`, `labels` and `approval` are omitted when absent, so records without them hash exactly as before.
+
+## Approvals
+
+A call that a policy gates with `@obligation("approval")` gets a `decision` record with reason `approval_required`. Three more records follow its approval:
+
+| Record | `kind` | Decision and reason | `approval` member |
+| --- | --- | --- | --- |
+| approval opened | `approval_request` | `deny`, `approval_requested`; `decision_id` is the gated decision, `labels` as on it | `id`, `call_hash`, `expires_at` |
+| granted or declined | `approval_grant` | `allow`, `approval_granted`, or `deny`, `approval_declined`; `decision_id` is the gated decision | `id`, `by` (`user` or `operator`), `approver` (the user's subject or `urn:attenuo:admin`), `method` (`id_token` or `admin_token`), `outcome` (`grant` or `decline`), `call_hash`, `expires_at` |
+| the retry that used it | `decision` | `allow`, the policy's reason | `id`, `by` |
+
+A repeated gated call while its approval is still pending gets a new `decision` record but no new `approval_request`. The record of the retry and the consumption of the grant go together: the grant is given back if the retry is not allowed or its record cannot be written, so every used grant has exactly one allowed decision naming it. A test in `attenuo-audit` pins the hashes of these records and checks that records without them hash as before.
 
 ## The hash chain
 

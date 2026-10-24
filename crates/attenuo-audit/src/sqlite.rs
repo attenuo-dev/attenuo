@@ -18,6 +18,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use crate::approval::{rules, Approval, ApprovalMethod, ApprovalState, Approver};
 use crate::checkpoint::{
     verify_with_checkpoints, Checkpoint, CheckpointKeys, SignedVerifyReport, Start,
 };
@@ -101,6 +102,26 @@ CREATE TABLE IF NOT EXISTS run_labels (
     at          TEXT    NOT NULL,
     PRIMARY KEY (chain_id, source)
 );
+CREATE TABLE IF NOT EXISTS approvals (
+    id               TEXT PRIMARY KEY,
+    chain_id         TEXT NOT NULL,
+    lease            TEXT NOT NULL,
+    call_hash        TEXT NOT NULL,
+    server           TEXT NOT NULL,
+    tool             TEXT NOT NULL,
+    arguments        TEXT NOT NULL,
+    labels           TEXT NOT NULL,
+    decision_id      TEXT NOT NULL,
+    chain            TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    expires_at       TEXT NOT NULL,
+    state            TEXT NOT NULL,
+    approver_subject TEXT NULL,
+    approver_method  TEXT NULL,
+    decided_at       TEXT NULL,
+    consumed_by      TEXT NULL
+);
+CREATE INDEX IF NOT EXISTS approvals_call_idx ON approvals(chain_id, call_hash, state);
 "#;
 
 /// The record id (`DecisionRecord::id`) of a row, as SQL. `record_json` is the hashed text
@@ -2086,6 +2107,73 @@ fn get_in(conn: &Connection, lease: &LeaseId) -> Result<Option<LeaseRow>, AuditE
     }
 }
 
+/// Columns of an approval row, in the order [`approval_from_row`] reads them.
+const APPROVAL_COLUMNS: &str = "id, chain_id, lease, call_hash, server, tool, arguments, labels, \
+     decision_id, chain, created_at, expires_at, state, approver_subject, approver_method, \
+     decided_at, consumed_by";
+
+fn approval_from_row(r: &Row<'_>) -> Result<Approval, AuditError> {
+    let text = |i: usize| -> Result<String, AuditError> { Ok(r.get::<_, String>(i)?) };
+    let opt =
+        |i: usize| -> Result<Option<String>, AuditError> { Ok(r.get::<_, Option<String>>(i)?) };
+    let approver = match (opt(13)?, opt(14)?) {
+        (Some(subject), Some(method)) => Some(Approver {
+            subject,
+            method: ApprovalMethod::parse(&method)?,
+        }),
+        _ => None,
+    };
+    Ok(Approval {
+        id: text(0)?,
+        chain_id: LeaseId(text(1)?),
+        lease: LeaseId(text(2)?),
+        call_hash: text(3)?,
+        server: text(4)?,
+        tool: text(5)?,
+        arguments: serde_json::from_str(&text(6)?)?,
+        labels: serde_json::from_str(&text(7)?)?,
+        decision_id: text(8)?,
+        chain: serde_json::from_str(&text(9)?)?,
+        created_at: parse_time(&text(10)?)?,
+        expires_at: parse_time(&text(11)?)?,
+        state: ApprovalState::parse(&text(12)?)?,
+        approver,
+        decided_at: opt(15)?.as_deref().map(parse_time).transpose()?,
+        consumed_by: opt(16)?,
+    })
+}
+
+fn approval_in(conn: &Connection, id: &str) -> Result<Option<Approval>, AuditError> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {APPROVAL_COLUMNS} FROM approvals WHERE id = ?1"
+    ))?;
+    let mut rows = stmt.query([id])?;
+    match rows.next()? {
+        Some(r) => Ok(Some(approval_from_row(r)?)),
+        None => Ok(None),
+    }
+}
+
+/// Approvals of one run for one call hash in one state. Expiry is compared in Rust: the
+/// stored times are RFC 3339 text, which does not sort as time across offsets.
+fn approvals_for_call(
+    conn: &Connection,
+    chain_id: &LeaseId,
+    call_hash: &str,
+    state: ApprovalState,
+) -> Result<Vec<Approval>, AuditError> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {APPROVAL_COLUMNS} FROM approvals \
+         WHERE chain_id = ?1 AND call_hash = ?2 AND state = ?3"
+    ))?;
+    let mut rows = stmt.query(params![chain_id.0, call_hash, state.as_str()])?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        out.push(approval_from_row(r)?);
+    }
+    Ok(out)
+}
+
 impl LeaseStore for SqliteLeaseStore {
     fn register(
         &self,
@@ -2252,6 +2340,163 @@ impl LeaseStore for SqliteLeaseStore {
             });
         }
         Ok(out)
+    }
+
+    fn create_approval(&self, approval: &Approval) -> Result<(Approval, bool), AuditError> {
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = approval.created_at;
+        let lease_expiry =
+            rules::live_lease(&approval.lease, get_in(&tx, &approval.lease)?.as_ref(), now)?;
+        if let Some(existing) = approvals_for_call(
+            &tx,
+            &approval.chain_id,
+            &approval.call_hash,
+            ApprovalState::Pending,
+        )?
+        .into_iter()
+        .find(|a| rules::reusable(a, approval, now))
+        {
+            return Ok((existing, false));
+        }
+        let mut stored = approval.clone();
+        stored.state = ApprovalState::Pending;
+        stored.approver = None;
+        stored.decided_at = None;
+        stored.consumed_by = None;
+        stored.expires_at = stored.expires_at.min(lease_expiry);
+        tx.prepare_cached(
+            "INSERT INTO approvals (id, chain_id, lease, call_hash, server, tool, arguments, \
+             labels, decision_id, chain, created_at, expires_at, state) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        )?
+        .execute(params![
+            stored.id,
+            stored.chain_id.0,
+            stored.lease.0,
+            stored.call_hash,
+            stored.server,
+            stored.tool,
+            serde_json::to_string(&stored.arguments)?,
+            serde_json::to_string(&stored.labels)?,
+            stored.decision_id,
+            serde_json::to_string(&stored.chain)?,
+            fmt_time(stored.created_at)?,
+            fmt_time(stored.expires_at)?,
+            stored.state.as_str(),
+        ])?;
+        tx.commit()?;
+        Ok((stored, true))
+    }
+
+    fn approval(&self, id: &str) -> Result<Option<Approval>, AuditError> {
+        let conn = self.conn.lock()?;
+        approval_in(&conn, id)
+    }
+
+    fn approvals(
+        &self,
+        chain_id: Option<&LeaseId>,
+        limit: usize,
+    ) -> Result<Vec<Approval>, AuditError> {
+        let conn = self.conn.lock()?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        // `rowid` follows insertion order, which is creation order.
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {APPROVAL_COLUMNS} FROM approvals \
+             WHERE ?1 IS NULL OR chain_id = ?1 ORDER BY rowid DESC LIMIT ?2"
+        ))?;
+        let mut rows = stmt.query(params![chain_id.map(|c| c.0.as_str()), limit])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            out.push(approval_from_row(r)?);
+        }
+        Ok(out)
+    }
+
+    fn decide_approval(
+        &self,
+        id: &str,
+        grant: bool,
+        approver: &Approver,
+        now: OffsetDateTime,
+    ) -> Result<Approval, AuditError> {
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut a =
+            approval_in(&tx, id)?.ok_or_else(|| AuditError::UnknownApproval(id.to_owned()))?;
+        rules::decidable(&a, now)?;
+        rules::live_lease(&a.lease, get_in(&tx, &a.lease)?.as_ref(), now)?;
+        a.state = if grant {
+            ApprovalState::Granted
+        } else {
+            ApprovalState::Declined
+        };
+        a.approver = Some(approver.clone());
+        a.decided_at = Some(now);
+        tx.execute(
+            "UPDATE approvals SET state = ?2, approver_subject = ?3, approver_method = ?4, \
+             decided_at = ?5 WHERE id = ?1 AND state = 'pending'",
+            params![
+                id,
+                a.state.as_str(),
+                approver.subject,
+                approver.method.as_str(),
+                fmt_time(now)?
+            ],
+        )?;
+        tx.commit()?;
+        Ok(a)
+    }
+
+    fn take_approval(
+        &self,
+        chain_id: &LeaseId,
+        lease: &LeaseId,
+        call_hash: &str,
+        decision_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<Approval>, AuditError> {
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if rules::live_lease(lease, get_in(&tx, lease)?.as_ref(), now).is_err() {
+            return Ok(None);
+        }
+        let Some(mut a) = approvals_for_call(&tx, chain_id, call_hash, ApprovalState::Granted)?
+            .into_iter()
+            .filter(|a| rules::usable(a, chain_id, lease, call_hash, now))
+            .min_by(|a, b| a.created_at.cmp(&b.created_at))
+        else {
+            return Ok(None);
+        };
+        let changed = tx.execute(
+            "UPDATE approvals SET state = 'consumed', consumed_by = ?2 \
+             WHERE id = ?1 AND state = 'granted'",
+            params![a.id, decision_id],
+        )?;
+        if changed != 1 {
+            return Ok(None);
+        }
+        tx.commit()?;
+        a.state = ApprovalState::Consumed;
+        a.consumed_by = Some(decision_id.to_owned());
+        Ok(Some(a))
+    }
+
+    fn restore_approval(&self, id: &str, decision_id: &str) -> Result<(), AuditError> {
+        let conn = self.conn.lock()?;
+        conn.execute(
+            "UPDATE approvals SET state = 'granted', consumed_by = NULL \
+             WHERE id = ?1 AND state = 'consumed' AND consumed_by = ?2",
+            params![id, decision_id],
+        )?;
+        Ok(())
+    }
+
+    fn remove_approval(&self, id: &str) -> Result<(), AuditError> {
+        let conn = self.conn.lock()?;
+        conn.execute("DELETE FROM approvals WHERE id = ?1", params![id])?;
+        Ok(())
     }
 }
 

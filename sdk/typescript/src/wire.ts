@@ -1,7 +1,15 @@
 /** Request building and response parsing shared by the clients. */
 
 import { capabilitiesToJson, type CapabilityLike } from "./capability.js";
-import { ApiError, DeniedError, AttenuoError, RpcError, UnauthorizedError } from "./errors.js";
+import {
+  ApiError,
+  ApprovalNotGrantedError,
+  ApprovalRequiredError,
+  AttenuoError,
+  DeniedError,
+  RpcError,
+  UnauthorizedError,
+} from "./errors.js";
 import type { DpopKeyLike } from "./dpop.js";
 import { bearer, decodeToken, parseTime, type Token } from "./token.js";
 
@@ -12,6 +20,7 @@ export const AUTHORIZATION_DETAILS_TYPE = "attenuo_capabilities";
 
 export const CODE_UNAUTHORIZED = -32001;
 export const CODE_DENIED = -32003;
+export const CODE_APPROVAL_REQUIRED = -32008;
 export const DECISION_ID_HEADER = "x-attenuo-decision-id";
 export const SESSION_HEADER = "mcp-session-id";
 export const MCP_ACCEPT = "application/json, text/event-stream";
@@ -54,6 +63,75 @@ export interface Tool {
   description: string;
   inputSchema: Json;
   raw: Json;
+}
+
+/**
+ * An approval as `GET /approvals/{id}` shows it. `state` is `pending`, `granted`, `declined` or
+ * `consumed`; `expired` is the server's view of whether `expiresAt` has passed. `usable` is true
+ * for a grant that a retry of the identical call can still use.
+ */
+export interface Approval {
+  approvalId: string;
+  state: string;
+  expired: boolean;
+  usable: boolean;
+  chainId: string;
+  callHash: string;
+  server: string;
+  tool: string;
+  arguments: Json;
+  expiresAt: Date | undefined;
+  approver: Json | undefined;
+  consumedBy: string | undefined;
+  raw: Json;
+}
+
+function optTime(v: unknown): Date | undefined {
+  if (typeof v !== "string" || v === "") return undefined;
+  try {
+    return parseTime(v);
+  } catch {
+    return undefined;
+  }
+}
+
+function isObject(v: unknown): v is Json {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+export function approvalFromJson(body: unknown): Approval {
+  if (!isObject(body) || typeof body.approval_id !== "string") {
+    throw new AttenuoError("not an approval: missing approval_id");
+  }
+  const call = isObject(body.call) ? body.call : {};
+  const state = String(body.state ?? "");
+  const expired = body.expired === true;
+  return {
+    approvalId: body.approval_id,
+    state,
+    expired,
+    usable: state === "granted" && !expired,
+    chainId: String(body.chain_id ?? ""),
+    callHash: String(body.call_hash ?? ""),
+    server: String(call.server ?? ""),
+    tool: String(call.tool ?? ""),
+    arguments: isObject(call.arguments) ? call.arguments : {},
+    expiresAt: optTime(body.expires_at),
+    approver: isObject(body.approver) ? body.approver : undefined,
+    consumedBy: typeof body.consumed_by === "string" ? body.consumed_by : undefined,
+    raw: body,
+  };
+}
+
+/**
+ * True when the grant is usable, false while it is still pending; throws
+ * `ApprovalNotGrantedError` when waiting longer cannot help.
+ */
+export function approvalReady(a: Approval): boolean {
+  if (a.usable) return true;
+  if (a.expired) throw new ApprovalNotGrantedError(a.approvalId, "expired");
+  if (a.state === "pending") return false;
+  throw new ApprovalNotGrantedError(a.approvalId, a.state || "unknown");
 }
 
 /** Answer to an AuthZEN evaluation. A `false` decision is returned, never thrown. */
@@ -304,8 +382,9 @@ function proxyDecisionId(headerValue: string | undefined, data: Json): string | 
 /**
  * The `result` of a JSON-RPC response, or the right error. Denials (`-32003` that the proxy
  * vouches for with `X-Attenuo-Decision-Id`) throw `DeniedError`; a `-32003` without that proof
- * is an upstream's own error and throws `RpcError`; `-32001` or HTTP 401 throws `UnauthorizedError`; any other JSON-RPC error throws
- * `RpcError`.
+ * is an upstream's own error and throws `RpcError`. A `-32008` with the same proof throws
+ * `ApprovalRequiredError`. `-32001` or HTTP 401 throws `UnauthorizedError`; any other JSON-RPC
+ * error throws `RpcError`.
  */
 export async function rpcResult(res: Response): Promise<{ result: Json; decisionId?: string }> {
   const headerId = res.headers.get(DECISION_ID_HEADER) ?? undefined;
@@ -324,6 +403,23 @@ export async function rpcResult(res: Response): Promise<{ result: Json; decision
     if (e.code === CODE_DENIED) {
       const id = proxyDecisionId(headerId, data);
       if (id !== undefined) throw new DeniedError(String(data.reason ?? "unknown"), id, message);
+    }
+    if (e.code === CODE_APPROVAL_REQUIRED) {
+      const id = proxyDecisionId(headerId, data);
+      if (id !== undefined) {
+        const approvalId =
+          typeof data.approval_id === "string" && data.approval_id !== ""
+            ? data.approval_id
+            : undefined;
+        const callHash = typeof data.call_hash === "string" ? data.call_hash : undefined;
+        throw new ApprovalRequiredError(
+          id,
+          approvalId,
+          optTime(data.expires_at),
+          callHash,
+          message,
+        );
+      }
     }
     if (e.code === CODE_UNAUTHORIZED || res.status === 401) {
       throw new UnauthorizedError(401, "unauthorized", message);

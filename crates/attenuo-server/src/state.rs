@@ -71,6 +71,8 @@ pub struct AppState {
     pub checkpoint_sink: Option<crate::sink::CheckpointSink>,
     /// `[audit.sink] fail_readiness`.
     pub sink_fails_readiness: bool,
+    /// `[approvals] client_id`: the `aud` of approval ID tokens, when set.
+    pub approvals_client_id: Option<String>,
 }
 
 impl AppState {
@@ -87,6 +89,7 @@ impl AppState {
         config.proxy.stream_recheck()?;
         config.proxy.check_limits()?;
         config.token.check_dpop()?;
+        config.approvals.check()?;
         let issuer = load_issuer(config)?;
         // Server DPoP nonces are keyed by the issuer's private key (see `crate::dpop`).
         let dpop = Arc::new(
@@ -131,7 +134,9 @@ impl AppState {
             checkpoint_sink.as_ref().map(|s| s.handle()),
         )?;
         let pipeline = Arc::new(
-            Pipeline::new(policy, leases.clone(), audit.clone()).with_metrics(metrics.clone()),
+            Pipeline::new(policy, leases.clone(), audit.clone())
+                .with_metrics(metrics.clone())
+                .with_approval_ttl(config.approvals.ttl()),
         );
         let idps = IdpRegistry::from_config(&config.idps, &config.issuer.issuer)?;
         let agents = crate::idp::intake::validate_agents(&config.agents)?;
@@ -231,6 +236,7 @@ impl AppState {
             dpop,
             checkpoint_sink,
             sink_fails_readiness: config.audit.sink.as_ref().is_some_and(|s| s.fail_readiness),
+            approvals_client_id: config.approvals.client_id.clone(),
         })
     }
 

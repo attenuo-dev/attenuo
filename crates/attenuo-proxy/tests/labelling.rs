@@ -191,6 +191,14 @@ async fn approval_required_is_answered_with_32008_and_the_call_hash() {
     let decision = &h.authorizer.decisions()[0];
     assert_eq!(err["data"]["decision_id"], decision.id.to_string());
     assert_eq!(decision.reason, "approval_required");
+    // The pending approval the authorizer stored is named in the error data.
+    assert_eq!(err["data"]["approval_id"], decision.id.to_string());
+    let expires = time::OffsetDateTime::parse(
+        err["data"]["expires_at"].as_str().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    assert_eq!(expires, decision.at + time::Duration::seconds(120));
     assert!(h.upstream.recorded_calls().is_empty(), "never forwarded");
 }
 

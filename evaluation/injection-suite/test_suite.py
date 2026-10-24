@@ -215,6 +215,12 @@ def test_approval_required_is_its_own_outcome() -> None:
     assert "probe got no error" in (harness.approval_probe_verdict({"result": {}}) or "")
     other = {"error": {"code": -32008, "data": {"reason": "something_else"}}}
     assert harness._judge(other, [])[0] == "error"
+    # The approvals API adds data.approval_id; the runner records it and does not retry.
+    assert harness._approval_id(GATED) is None
+    with_id = json.loads(json.dumps(GATED))
+    with_id["error"]["data"]["approval_id"] = "a-1"
+    assert harness._judge(with_id, []) == ("gated", "approval_required", "d-1")
+    assert harness._approval_id(with_id) == "a-1"
 
 
 def _call(role: str, outcome: str, expect: str = "allow", stage: str | None = None,

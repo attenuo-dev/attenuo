@@ -23,6 +23,19 @@ pub struct AuthDecision {
     pub reason: String,
     /// Id of the [`attenuo_core::DecisionRecord`] the authorizer stored for this decision.
     pub decision_id: Uuid,
+    /// For an `approval_required` decision: the pending approval the authorizer stored, which
+    /// the `-32008` error data names (ADR-0009). `None` otherwise, or when it could not be
+    /// stored.
+    pub approval: Option<ApprovalTicket>,
+}
+
+/// The pending approval behind an `approval_required` decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalTicket {
+    /// The id to grant or decline at `POST /approvals/{id}`.
+    pub approval_id: Uuid,
+    /// When the approval can no longer be granted or used.
+    pub expires_at: OffsetDateTime,
 }
 
 impl AuthDecision {
@@ -31,6 +44,7 @@ impl AuthDecision {
             decision: Decision::Allow,
             reason: reason.into(),
             decision_id,
+            approval: None,
         }
     }
 
@@ -39,7 +53,14 @@ impl AuthDecision {
             decision: Decision::Deny,
             reason: reason.into(),
             decision_id,
+            approval: None,
         }
+    }
+
+    /// Attach the pending approval of an `approval_required` decision.
+    pub fn with_approval(mut self, approval: Option<ApprovalTicket>) -> Self {
+        self.approval = approval;
+        self
     }
 
     pub fn is_allow(&self) -> bool {

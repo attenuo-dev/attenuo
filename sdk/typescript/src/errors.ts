@@ -54,6 +54,41 @@ export class DeniedError extends AttenuoError {
   }
 }
 
+/**
+ * A policy held the call for an approval (JSON-RPC `-32008`). It is a `DeniedError` with
+ * `reason === "approval_required"`, so code that already catches denials keeps working.
+ * `approvalId` names the pending approval: show it to the user, who grants it with their own
+ * sign-in (`POST /approvals/{id}`), or an operator grants it. Then retry the identical call once
+ * (`waitForApproval` and `callToolWithApproval` do this). `approvalId` is undefined when the
+ * server could not open an approval; the call is then simply denied. `callHash` is the RFC 8785
+ * hash of the call the approval is bound to.
+ */
+export class ApprovalRequiredError extends DeniedError {
+  constructor(
+    decisionId: string | undefined,
+    readonly approvalId: string | undefined,
+    readonly expiresAt: Date | undefined,
+    readonly callHash: string | undefined,
+    detail = "",
+  ) {
+    super("approval_required", decisionId, detail || "attenuo: approval required");
+  }
+}
+
+/**
+ * Waiting for an approval ended without a grant. `state` is `declined`, `expired` (nobody decided
+ * in time), `consumed` (a retry already used the grant) or `timeout` (the wait's own `timeoutMs`
+ * ran out while the approval was still pending).
+ */
+export class ApprovalNotGrantedError extends AttenuoError {
+  constructor(
+    readonly approvalId: string,
+    readonly state: string,
+  ) {
+    super(`approval ${approvalId} was not granted: ${state}`);
+  }
+}
+
 /** A token failed local verification (bad signature, expired, wrong issuer, ...). */
 export class VerificationError extends AttenuoError {}
 

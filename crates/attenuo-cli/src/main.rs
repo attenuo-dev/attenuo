@@ -21,13 +21,16 @@ use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
 
 use cli::{
-    AuditCmd, AuthzenCmd, Cli, Command, ExportFormat, Field, KeyCmd, LeaseCmd, PolicyCmd, TokenCmd,
+    ApprovalCmd, AuditCmd, AuthzenCmd, Cli, Command, ExportFormat, Field, KeyCmd, LeaseCmd,
+    PolicyCmd, TokenCmd,
 };
 use client::{query_escape, Client};
 use render::fmt_audit_entry;
 
 /// JSON-RPC error code the proxy uses for a denied call.
 const CODE_DENIED: i64 = -32003;
+/// JSON-RPC error code the proxy uses for a call that needs an approval (ADR-0009).
+const CODE_APPROVAL_REQUIRED: i64 = -32008;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
@@ -249,6 +252,51 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 );
             }
             Ok(Outcome::Ok)
+        }
+        Command::Approval(ApprovalCmd::List {
+            chain_id,
+            state,
+            limit,
+        }) => {
+            let mut q = Vec::new();
+            if let Some(c) = chain_id {
+                q.push(format!("chain_id={}", query_escape(&c)));
+            }
+            if let Some(s) = state {
+                q.push(format!("state={}", query_escape(&s)));
+            }
+            if let Some(n) = limit {
+                q.push(format!("limit={n}"));
+            }
+            let mut path = "/admin/approvals".to_string();
+            if !q.is_empty() {
+                path.push('?');
+                path.push_str(&q.join("&"));
+            }
+            let resp = client?.admin_get(&path).await?;
+            if json {
+                print_json(&resp);
+            } else {
+                print!("{}", render::render_approvals(&resp));
+            }
+            Ok(Outcome::Ok)
+        }
+        Command::Approval(ApprovalCmd::Show { id }) => {
+            let resp = client?
+                .admin_get(&format!("/admin/approvals/{}", query_escape(&id)))
+                .await?;
+            if json {
+                print_json(&resp);
+            } else {
+                print!("{}", render::render_approval(&resp));
+            }
+            Ok(Outcome::Ok)
+        }
+        Command::Approval(ApprovalCmd::Grant { id }) => {
+            approval_decide(&client?, &id, "grant", json).await
+        }
+        Command::Approval(ApprovalCmd::Decline { id }) => {
+            approval_decide(&client?, &id, "decline", json).await
         }
         Command::Lease(LeaseCmd::Show { id }) => {
             let resp = client?
@@ -601,6 +649,22 @@ async fn inspect(client: Option<Client>, args: cli::InspectArgs, json: bool) -> 
 }
 
 /// Print a `tools/call` response. A policy denial is reported with its reason and decision id.
+/// `approval grant` / `approval decline`: decide as the operator and print the approval.
+async fn approval_decide(client: &Client, id: &str, decision: &str, json: bool) -> Result<Outcome> {
+    let resp = client
+        .admin_post(
+            &format!("/admin/approvals/{}", query_escape(id)),
+            &json!({ "decision": decision }),
+        )
+        .await?;
+    if json {
+        print_json(&resp);
+    } else {
+        print!("{}", render::render_approval(&resp));
+    }
+    Ok(Outcome::Ok)
+}
+
 fn print_call(resp: &Value, json: bool) -> Outcome {
     if json {
         print_json(resp);
@@ -608,7 +672,15 @@ fn print_call(resp: &Value, json: bool) -> Outcome {
     if let Some(err) = resp.get("error") {
         let denied = err["code"].as_i64() == Some(CODE_DENIED);
         if !json {
-            if denied {
+            if err["code"].as_i64() == Some(CODE_APPROVAL_REQUIRED) {
+                let d = &err["data"];
+                let s = |k: &str| d[k].as_str().unwrap_or("-").to_string();
+                println!("APPROVAL REQUIRED");
+                println!("approval  {}", s("approval_id"));
+                println!("expires   {}", s("expires_at"));
+                println!("call hash {}", s("call_hash"));
+                println!("decision  {}", s("decision_id"));
+            } else if denied {
                 println!("DENIED  {}", err["data"]["reason"].as_str().unwrap_or("-"));
                 println!(
                     "decision {}",

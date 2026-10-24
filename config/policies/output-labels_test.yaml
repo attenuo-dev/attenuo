@@ -28,6 +28,14 @@ cases:
     reason: approval_required
     policy_ids: [confirm_destructive_after_untrusted_read]
 
+  - name: with a granted approval the same call is allowed
+    chain: [assistant]
+    session: { tainted_by: [web/fetch] }
+    approval: { by: user }
+    call: { server: workspace, tool: delete_file, arguments: { path: notes.txt } }
+    expect: allow
+    reason: policy_allow
+
   - name: sending mail is destructive by default, so it asks too
     chain: [assistant]
     session: { tainted_by: [workspace/read_email] }

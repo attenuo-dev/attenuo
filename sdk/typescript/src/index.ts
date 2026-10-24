@@ -76,9 +76,17 @@ export {
 } from "./dpop.js";
 export type { DpopKeyLike, Jwk } from "./dpop.js";
 export { AttenuoClient } from "./client.js";
-export type { ClientOptions, InspectOptions, McpOptions } from "./client.js";
+export type {
+  ApprovalWaitOptions,
+  CallWithApprovalOptions,
+  ClientOptions,
+  InspectOptions,
+  McpOptions,
+} from "./client.js";
 export {
   ApiError,
+  ApprovalNotGrantedError,
+  ApprovalRequiredError,
   DeniedError,
   AttenuoError,
   RefreshError,
@@ -92,4 +100,11 @@ export type { RefresherOptions } from "./refresh.js";
 export { mcpFetch, mcpHeaders, mcpUrl } from "./mcp.js";
 export { decodeToken, Token, TOKEN_TYPE, verifyToken } from "./token.js";
 export type { Chain, Hop, Jwks, User, VerifyOptions } from "./token.js";
-export type { AuthzenDecision, ExchangeOptions, Lease, Tool, ToolResult } from "./wire.js";
+export type {
+  Approval,
+  AuthzenDecision,
+  ExchangeOptions,
+  Lease,
+  Tool,
+  ToolResult,
+} from "./wire.js";

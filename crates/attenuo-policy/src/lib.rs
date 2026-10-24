@@ -66,9 +66,10 @@
 //! (or when its taint state could not be read), and `session.tainted_by` names the sources as
 //! `"<server>/<tool>"`. They come from [`CallLabels`], which
 //! [`PolicyEngine::authorize_labelled`] takes; [`PolicyEngine::authorize`] evaluates an
-//! untainted run. `args_contain_untrusted` is always `false`, `untrusted_args` always empty
-//! and `approval.present` always `false` (`approval.by` empty) until argument matching and
-//! approvals are built.
+//! untainted run. `args_contain_untrusted` is always `false` and `untrusted_args` always
+//! empty until argument matching is built. `approval.present` is `true` only when the call
+//! carries a granted approval for its exact call hash ([`ApprovalContext`]), with
+//! `approval.by` set to `user` or `operator`; otherwise it is `false` and `by` is empty.
 //!
 //! # Obligations
 //!
@@ -280,6 +281,28 @@ impl SessionLabels {
 pub struct CallLabels {
     /// `context.session`.
     pub session: SessionLabels,
+    /// `context.approval`.
+    pub approval: ApprovalContext,
+}
+
+/// `context.approval` (ADR-0009): whether the call carries a granted approval for its exact
+/// call hash, and who granted it. The default is no approval.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApprovalContext {
+    /// `context.approval.present`.
+    pub present: bool,
+    /// `context.approval.by`: `user`, `operator` or `policy`; empty when absent.
+    pub by: String,
+}
+
+impl ApprovalContext {
+    /// An approval granted by `by` (`user` or `operator`).
+    pub fn by(by: impl Into<String>) -> Self {
+        Self {
+            present: true,
+            by: by.into(),
+        }
+    }
 }
 
 /// Errors from loading policies or schema.
