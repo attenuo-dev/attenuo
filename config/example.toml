@@ -32,7 +32,9 @@ private_key_pem_path = "data/issuer.pem"
 # Cedar policies. POST /admin/policies/reload re-reads this file.
 policies_path = "config/policies/default.cedar"
 # Tool catalog: attributes policies can test (resource.readonly, resource.sensitive) and the
-# argument types used to validate `context.input.*`. Every action a policy names must be here:
+# argument types used to validate `context.input.*`. The types are also checked on every call,
+# before Cedar: an argument of another type is denied (input_type_mismatch); undeclared
+# arguments are not checked. Every action a policy names must be here:
 # the entry [policy.catalog.github.read_file] declares Action::"github/read_file".
 # Server and tool names are ASCII letters, digits, "_", "." and "-" only (a tool may also be an
 # MCP method name such as "resources/read"); anything else is refused at start.
