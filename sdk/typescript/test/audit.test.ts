@@ -280,6 +280,13 @@ describe("verifyExport", () => {
     ["v1", (o: Obj[]) => (o[0]!.format = "attenuo-audit-export-v1"), /v1/],
     ["format", (o: Obj[]) => (o[0]!.format = "nope"), /unsupported/],
     ["filtered", (o: Obj[]) => (o[0]!.filter = { kind: "admin" }), /filtered/],
+    ["filtered on tool", (o: Obj[]) => (o[0]!.filter = { tool: "token.exchange" }), /filtered/],
+    ["filtered on decision", (o: Obj[]) => (o[0]!.filter = { decision: "deny" }), /filtered/],
+    [
+      "filtered on tool and decision",
+      (o: Obj[]) => (o[0]!.filter = { tool: "token.exchange", decision: "deny" }),
+      /filtered/,
+    ],
     ["second header", (o: Obj[]) => o.splice(1, 0, { ...o[0]! }), /second header/],
     ["unknown type", (o: Obj[]) => o.push({ type: "mystery" }), /unknown line type/],
     ["negative from", (o: Obj[]) => (o[0]!.from = -1), /non-negative/],

@@ -23,6 +23,56 @@ export interface RevokeResult {
   reason: string;
 }
 
+/**
+ * Exactly one selector for `revokeBySelector`: an originating user's `sub` (any issuer), a
+ * delegation chain (the first hop's lease id) or a raw MCP session id (`Mcp-Session-Id`).
+ */
+export type LeaseSelector =
+  | { user: string; chainId?: never; session?: never }
+  | { chainId: string; user?: never; session?: never }
+  | { session: string; user?: never; chainId?: never };
+
+export interface RevokeBySelectorOptions {
+  /** Recorded with the revocation (server default `revoked by admin`). */
+  reason?: string;
+  /** Dry run: change nothing, write no audit record, answer what would be revoked. */
+  preview?: boolean;
+}
+
+/**
+ * The answer of `revokeBySelector` (`POST /admin/leases/revoke`).
+ *
+ * `selector` is how the server shows the selector: `{user}`, `{chain_id}` or, for a session,
+ * `{session_tag, chain_ids}`, never the raw session id. `matched` holds the unrevoked leases the
+ * selector named and `revoked` every lease that changed (the matches, then the cascade), each in
+ * id order and cut at 10,000 ids (`truncated`); the counts are always complete. On a preview
+ * `revoked` is what a revocation sent now would change, and `reason` and `auditId` are
+ * `undefined`. `auditId` is also `undefined` when the server could not write the record (the
+ * revocation stands).
+ */
+export interface SelectorRevocation {
+  selector: Record<string, unknown>;
+  preview: boolean;
+  matched: string[];
+  revoked: string[];
+  matchedCount: number;
+  revokedCount: number;
+  truncated: boolean;
+  reason: string | undefined;
+  auditId: string | undefined;
+}
+
+/** Filters for `auditExport`; the ones you set combine with AND. */
+export interface AuditExportFilter {
+  /** `decision`, `tool_result`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin`. */
+  kind?: string;
+  /** The delegation chain: the lease id of its first hop. */
+  chainId?: string;
+  /** The record's `tool`, for example `token.exchange`. */
+  tool?: string;
+  decision?: "allow" | "deny";
+}
+
 export interface LeaseStatus {
   leaseId: string;
   active: boolean;
@@ -324,6 +374,20 @@ const AUDIT_FILTERS = [
   ["chainId", "chain_id"],
 ] as const;
 
+function exportParams(
+  fromSeq: number,
+  toSeq: number | undefined,
+  filter: AuditExportFilter,
+): Record<string, string | number> {
+  const query: Record<string, string | number> = { from: fromSeq };
+  if (toSeq !== undefined) query.to = toSeq;
+  if (filter.kind !== undefined) query.kind = filter.kind;
+  if (filter.chainId !== undefined) query.chain_id = filter.chainId;
+  if (filter.tool !== undefined) query.tool = filter.tool;
+  if (filter.decision !== undefined) query.decision = filter.decision;
+  return query;
+}
+
 function rfc3339(v: string | Date): string {
   return typeof v === "string" ? v : v.toISOString();
 }
@@ -411,6 +475,51 @@ function leaseNodes(v: unknown): LeaseNode[] {
   return Array.isArray(v) ? (v as Json[]).map(leaseNodeOf) : [];
 }
 
+const SELECTORS = [
+  ["user", "user"],
+  ["chainId", "chain_id"],
+  ["session", "session"],
+] as const;
+
+/**
+ * The body and query of `POST /admin/leases/revoke`. Throws unless exactly one selector is given
+ * and it is not empty. No message names a value: `session` is a secret that grants use of the
+ * MCP session.
+ */
+function selectorRequest(
+  selector: LeaseSelector,
+  opts: RevokeBySelectorOptions,
+): { json: Json; query: Record<string, string> } {
+  const sel = selector as Partial<Record<"user" | "chainId" | "session", unknown>>;
+  const given = SELECTORS.filter(([key]) => sel[key] !== undefined);
+  if (given.length !== 1) {
+    throw new TypeError("give exactly one of `user`, `chainId`, `session`");
+  }
+  const [key, field] = given[0]!;
+  const value = sel[key];
+  if (typeof value !== "string" || value === "") {
+    throw new TypeError(`\`${key}\` must be a non-empty string`);
+  }
+  const json: Json = { [field]: value };
+  if (opts.reason !== undefined) json.reason = opts.reason;
+  return { json, query: opts.preview ? { preview: "true" } : {} };
+}
+
+function selectorRevocationOf(b: Json): SelectorRevocation {
+  const ids = (v: unknown) => (Array.isArray(v) ? v.map(String) : []);
+  return {
+    selector: { ...((b.selector as Json | undefined) ?? {}) },
+    preview: b.preview === true,
+    matched: ids(b.matched),
+    revoked: ids(b.revoked),
+    matchedCount: Number(b.matched_count ?? 0),
+    revokedCount: Number(b.revoked_count ?? 0),
+    truncated: b.truncated === true,
+    reason: b.reason == null ? undefined : String(b.reason),
+    auditId: b.audit_id == null ? undefined : String(b.audit_id),
+  };
+}
+
 /** Operator client. `mintRootDev` needs `[dev] allow_root_mint = true` on the server. */
 export class AdminClient {
   readonly serverUrl: string;
@@ -429,6 +538,26 @@ export class AdminClient {
     });
     const b = w.asObject(await w.jsonBody(res), "revoke");
     return { leaseId: String(b.lease_id), revoked: Number(b.revoked), reason: String(b.reason) };
+  }
+
+  /**
+   * `POST /admin/leases/revoke`: revoke every unrevoked lease of one originating `user` (the
+   * `sub`, any issuer), one delegation chain (`chainId`, the first hop's lease id) or the chain
+   * that opened one MCP `session` (the raw `Mcp-Session-Id`), each with its descendants, in one
+   * transaction. Give exactly one (a `TypeError` otherwise). Matching nothing is not an error:
+   * the lists come back empty.
+   *
+   * `preview: true` changes nothing and writes no audit record: the answer says what a
+   * revocation sent now would revoke. The SDK never logs or echoes `session`; the answer shows
+   * only its tag and the chains it resolved to.
+   */
+  async revokeBySelector(
+    selector: LeaseSelector,
+    opts: RevokeBySelectorOptions = {},
+  ): Promise<SelectorRevocation> {
+    const { json, query } = selectorRequest(selector, opts);
+    const res = await this.http.post("/admin/leases/revoke", { json, query });
+    return selectorRevocationOf(w.asObject(await w.jsonBody(res), "revoke"));
   }
 
   async leaseStatus(leaseId: string): Promise<LeaseStatus> {
@@ -464,20 +593,19 @@ export class AdminClient {
    * `checkpoint` objects, each tagged with `type`. Write the raw lines to a file and check it
    * offline with `verifyExport`.
    *
-   * `filter.kind` (`decision`, `exchange`, `root_token`, `lease_renew`, `lease_revoke`,
-   * `admin`) and `filter.chainId` keep only matching entries. The header then carries a
-   * `filter` and the file cannot be verified (its chain has gaps): verify an unfiltered
-   * export, then filter.
+   * `filter.kind` (`decision`, `tool_result`, `exchange`, `root_token`, `lease_renew`,
+   * `lease_revoke`, `admin`), `filter.chainId`, `filter.tool` (for example `token.exchange`)
+   * and `filter.decision` (`allow` or `deny`) keep only matching entries, combined with AND.
+   * The header then carries a `filter` naming them and the file cannot be verified (its chain
+   * has gaps): verify an unfiltered export, then filter. An unknown kind or decision, or an
+   * empty value, is an `ApiError` (400).
    */
   async *auditExport(
     fromSeq = 1,
     toSeq?: number,
-    filter: { kind?: string; chainId?: string } = {},
+    filter: AuditExportFilter = {},
   ): AsyncGenerator<AuditExportLine> {
-    const query: Record<string, string | number> = { from: fromSeq };
-    if (toSeq !== undefined) query.to = toSeq;
-    if (filter.kind !== undefined) query.kind = filter.kind;
-    if (filter.chainId !== undefined) query.chain_id = filter.chainId;
+    const query = exportParams(fromSeq, toSeq, filter);
     const res = await this.http.get("/admin/audit/export", { query });
     if (!res.ok) throw w.errorFromResponse(res.status, await res.text());
     const decoder = new TextDecoder();

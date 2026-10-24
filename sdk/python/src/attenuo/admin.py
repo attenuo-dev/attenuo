@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import TracebackType
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 
@@ -30,6 +30,30 @@ class RevokeResult:
     lease_id: str
     revoked: int
     reason: str
+
+
+@dataclass(frozen=True)
+class SelectorRevocation:
+    """The answer of :meth:`AdminClient.revoke_by_selector` (``POST /admin/leases/revoke``).
+
+    ``selector`` is how the server shows the selector: ``{"user": ...}``, ``{"chain_id": ...}``
+    or, for a session, ``{"session_tag": "<12 hex>", "chain_ids": [...]}``, never the raw
+    session id. ``matched`` holds the unrevoked leases the selector named and ``revoked`` every
+    lease that changed (the matches, then the cascade), each in id order and cut at 10,000 ids
+    (``truncated``); the counts are always complete. On a preview ``revoked`` is what a
+    revocation sent now would change, and ``reason`` and ``audit_id`` are ``None``.
+    ``audit_id`` is also ``None`` when the server could not write the record (the revocation
+    stands)."""
+
+    selector: dict[str, Any]
+    preview: bool
+    matched: list[str]
+    revoked: list[str]
+    matched_count: int
+    revoked_count: int
+    truncated: bool
+    reason: str | None
+    audit_id: str | None
 
 
 @dataclass(frozen=True)
@@ -272,16 +296,60 @@ def _head(page: Any) -> int:
 
 
 def _export_params(
-    from_seq: int, to_seq: int | None, kind: str | None, chain_id: str | None
+    from_seq: int,
+    to_seq: int | None,
+    kind: str | None,
+    chain_id: str | None,
+    tool: str | None = None,
+    decision: str | None = None,
 ) -> dict[str, Any]:
     params: dict[str, Any] = {"from": from_seq}
     if to_seq is not None:
         params["to"] = to_seq
-    if kind is not None:
-        params["kind"] = kind
-    if chain_id is not None:
-        params["chain_id"] = chain_id
+    for name, value in (("kind", kind), ("chain_id", chain_id), ("tool", tool)):
+        if value is not None:
+            params[name] = value
+    if decision is not None:
+        params["decision"] = decision
     return params
+
+
+def _selector_request(
+    user: str | None,
+    chain_id: str | None,
+    session: str | None,
+    reason: str | None,
+    preview: bool,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """The body and query of ``POST /admin/leases/revoke``. ``ValueError`` unless exactly one
+    selector is given and it is not empty. No message names a value: ``session`` is a secret
+    that grants use of the MCP session."""
+    given = {"user": user, "chain_id": chain_id, "session": session}
+    named = [k for k, v in given.items() if v is not None]
+    if len(named) != 1:
+        raise ValueError("give exactly one of `user`, `chain_id`, `session`")
+    if not given[named[0]]:
+        raise ValueError(f"`{named[0]}` must not be empty")
+    body: dict[str, Any] = {named[0]: given[named[0]]}
+    if reason is not None:
+        body["reason"] = reason
+    return body, ({"preview": "true"} if preview else {})
+
+
+def _selector_revocation(b: Any) -> SelectorRevocation:
+    audit_id = b.get("audit_id")
+    reason = b.get("reason")
+    return SelectorRevocation(
+        selector=dict(b.get("selector") or {}),
+        preview=b.get("preview") is True,
+        matched=[str(x) for x in b.get("matched") or []],
+        revoked=[str(x) for x in b.get("revoked") or []],
+        matched_count=int(b.get("matched_count", 0)),
+        revoked_count=int(b.get("revoked_count", 0)),
+        truncated=b.get("truncated") is True,
+        reason=None if reason is None else str(reason),
+        audit_id=None if audit_id is None else str(audit_id),
+    )
 
 
 def _export_line(line: str) -> dict[str, Any]:
@@ -554,6 +622,28 @@ class AdminClient:
         )
         return RevokeResult(body["lease_id"], int(body["revoked"]), str(body["reason"]))
 
+    def revoke_by_selector(
+        self,
+        *,
+        user: str | None = None,
+        chain_id: str | None = None,
+        session: str | None = None,
+        reason: str | None = None,
+        preview: bool = False,
+    ) -> SelectorRevocation:
+        """``POST /admin/leases/revoke``: revoke every unrevoked lease of one originating
+        ``user`` (the ``sub``, any issuer), one delegation chain (``chain_id``, the first hop's
+        lease id) or the chain that opened one MCP ``session`` (the raw ``Mcp-Session-Id``),
+        each with its descendants, in one transaction. Give exactly one (``ValueError``
+        otherwise). Matching nothing is not an error: the lists come back empty.
+
+        ``preview=True`` changes nothing and writes no audit record: the answer says what a
+        revocation sent now would revoke. The SDK never logs or echoes ``session``; the answer
+        shows only its tag and the chains it resolved to."""
+        body, params = _selector_request(user, chain_id, session, reason, preview)
+        resp = self._http.post("/admin/leases/revoke", json=body, params=params)
+        return _selector_revocation(w.json_body(resp))
+
     def lease_status(self, lease_id: str) -> LeaseStatus:
         b = w.json_body(self._http.get(f"/admin/leases/{w.path_segment(lease_id, 'lease_id')}"))
         return LeaseStatus(
@@ -603,16 +693,20 @@ class AdminClient:
         *,
         kind: str | None = None,
         chain_id: str | None = None,
+        tool: str | None = None,
+        decision: Literal["allow", "deny"] | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Stream ``GET /admin/audit/export`` as parsed JSON Lines objects: a ``header``, then
         ``entry`` and ``checkpoint`` objects, each tagged with ``type``. Write the raw lines to
         a file and check it offline with :func:`attenuo.audit.verify_export`.
 
-        ``kind`` (``decision``, ``exchange``, ``root_token``, ``lease_renew``, ``lease_revoke``,
-        ``admin``) and ``chain_id`` keep only matching entries. The header then carries a
-        ``filter`` and the file cannot be verified (its chain has gaps): verify an unfiltered
-        export, then filter."""
-        params = _export_params(from_seq, to_seq, kind, chain_id)
+        ``kind`` (``decision``, ``tool_result``, ``exchange``, ``root_token``, ``lease_renew``,
+        ``lease_revoke``, ``admin``), ``chain_id``, ``tool`` (for example ``token.exchange``)
+        and ``decision`` (``allow`` or ``deny``) keep only matching entries, combined with AND.
+        The header then carries a ``filter`` naming them and the file cannot be verified (its
+        chain has gaps): verify an unfiltered export, then filter. An unknown kind or decision,
+        or an empty value, is an ``ApiError`` (400)."""
+        params = _export_params(from_seq, to_seq, kind, chain_id, tool, decision)
         with self._http.stream("GET", "/admin/audit/export", params=params) as resp:
             if not resp.is_success:
                 resp.read()
@@ -832,6 +926,19 @@ class AsyncAdminClient:
         )
         return RevokeResult(body["lease_id"], int(body["revoked"]), str(body["reason"]))
 
+    async def revoke_by_selector(
+        self,
+        *,
+        user: str | None = None,
+        chain_id: str | None = None,
+        session: str | None = None,
+        reason: str | None = None,
+        preview: bool = False,
+    ) -> SelectorRevocation:
+        body, params = _selector_request(user, chain_id, session, reason, preview)
+        resp = await self._http.post("/admin/leases/revoke", json=body, params=params)
+        return _selector_revocation(w.json_body(resp))
+
     async def lease_status(self, lease_id: str) -> LeaseStatus:
         b = w.json_body(
             await self._http.get(f"/admin/leases/{w.path_segment(lease_id, 'lease_id')}")
@@ -880,8 +987,10 @@ class AsyncAdminClient:
         *,
         kind: str | None = None,
         chain_id: str | None = None,
+        tool: str | None = None,
+        decision: Literal["allow", "deny"] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
-        params = _export_params(from_seq, to_seq, kind, chain_id)
+        params = _export_params(from_seq, to_seq, kind, chain_id, tool, decision)
         async with self._http.stream("GET", "/admin/audit/export", params=params) as resp:
             if not resp.is_success:
                 await resp.aread()

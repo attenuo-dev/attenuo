@@ -906,7 +906,7 @@ What is still open (from the [task board](../tasks/board.md) and the day's log):
 - Proxy: Cedar-aware list filtering; the per-event re-serialization cost on the listen stream is not measured; a `GET` answered with something other than SSE is relayed unfiltered; listen streams the client dropped are log lines only; every listen stream still open at token expiry adds one `token_expired` record.
 - Policy harness: the admin dry run cannot be given a `budget`, so those cases are skipped.
 - Injection suite: `stage_of` in `evaluation/injection-suite/harness.py` does not know `input_type_mismatch`, so `t-banking-02` and `t-workspace-03` will score their mistyped attack calls as stage `other` (still denied) on the next run.
-- SDKs: `audit_export` and `auditExport` take only `kind` and `chain_id`, not the new `tool` and `decision` (the #91 log entry; not on the board).
+- SDKs: done after this session on `feat/sdk-export-revoke-selectors`: `audit_export` / `auditExport` take `tool` and `decision`, and `revoke_by_selector` / `revokeBySelector` wrap `POST /admin/leases/revoke`.
 - Metrics: soft-limit asks are not told apart from other `approval_required` decisions (that would need policy ids as labels).
 
 ## 3. Why it is this way

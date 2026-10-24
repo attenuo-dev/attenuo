@@ -173,6 +173,100 @@ async def test_audit_export_streams_jsonl(make: Any) -> None:
     }
 
 
+async def test_audit_export_tool_and_decision_filters(make: Any) -> None:
+    client, seen = make(lambda r: httpx.Response(200, text='{"type":"header"}\n'))
+    await _collect(client, tool="token.exchange", decision="deny")
+    assert dict(seen[-1].url.params) == {"from": "1", "tool": "token.exchange", "decision": "deny"}
+    assert seen[-1].url.query == b"from=1&tool=token.exchange&decision=deny"
+    await _collect(client, 2, 9, kind="decision", chain_id="c1", tool="read_file", decision="allow")
+    assert dict(seen[-1].url.params) == {
+        "from": "2",
+        "to": "9",
+        "kind": "decision",
+        "chain_id": "c1",
+        "tool": "read_file",
+        "decision": "allow",
+    }
+    # The server rejects a bad decision with a 400; the SDK passes it on as ApiError.
+    client, _ = make(lambda r: httpx.Response(400, json={"error": "invalid_request"}))
+    with pytest.raises(ApiError) as e:
+        await _collect(client, decision="maybe")
+    assert e.value.status == 400
+
+
+_SELECTED = {
+    "selector": {"chain_id": "c1"}, "preview": False, "matched": ["c1"],
+    "revoked": ["c1", "c2"], "matched_count": 1, "revoked_count": 2, "truncated": False,
+    "reason": "run went wrong", "audit_id": "3f2a",
+}  # fmt: skip
+
+
+async def test_revoke_by_selector_request(make: Any) -> None:
+    client, seen = make(lambda r: httpx.Response(200, json=_SELECTED))
+    res = await call(client, "revoke_by_selector", chain_id="c1", reason="run went wrong")
+    assert (seen[-1].method, seen[-1].url.path) == ("POST", "/admin/leases/revoke")
+    assert seen[-1].url.query == b""
+    assert json.loads(seen[-1].content) == {"chain_id": "c1", "reason": "run went wrong"}
+    assert res.selector == {"chain_id": "c1"} and not res.preview
+    assert (res.matched, res.revoked) == (["c1"], ["c1", "c2"])
+    assert (res.matched_count, res.revoked_count, res.truncated) == (1, 2, False)
+    assert (res.reason, res.audit_id) == ("run went wrong", "3f2a")
+
+    await call(client, "revoke_by_selector", user="alice@example.com", preview=True)
+    assert dict(seen[-1].url.params) == {"preview": "true"}
+    assert json.loads(seen[-1].content) == {"user": "alice@example.com"}
+
+
+async def test_revoke_by_selector_preview_answer(make: Any) -> None:
+    body = {
+        "selector": {"session_tag": "a1b2c3d4e5f6", "chain_ids": []}, "preview": True,
+        "matched": [], "revoked": [], "matched_count": 0, "revoked_count": 0,
+        "truncated": False, "reason": None, "audit_id": None,
+    }  # fmt: skip
+    client, seen = make(lambda r: httpx.Response(200, json=body))
+    res = await call(client, "revoke_by_selector", session="sid-secret", preview=True)
+    assert json.loads(seen[-1].content) == {"session": "sid-secret"}
+    assert res.preview and res.matched == [] and res.revoked == []
+    assert res.reason is None and res.audit_id is None
+    assert res.selector == {"session_tag": "a1b2c3d4e5f6", "chain_ids": []}
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"user": "a", "chain_id": "c"},
+        {"chain_id": "c", "session": "s"},
+        {"user": "a", "chain_id": "c", "session": "s"},
+        {"user": ""},
+        {"session": ""},
+        {"reason": "no selector"},
+    ],
+)
+async def test_revoke_by_selector_needs_exactly_one(make: Any, kwargs: dict[str, Any]) -> None:
+    client, seen = make(lambda r: httpx.Response(200, json=_SELECTED))
+    with pytest.raises(ValueError, match=r"exactly one|must not be empty"):
+        await call(client, "revoke_by_selector", **kwargs)
+    assert seen == []
+
+
+async def test_revoke_by_selector_never_logs_the_session(
+    make: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    secret = "mcp-session-9f8e7d6c5b4a"
+    client, _ = make(lambda r: httpx.Response(400, json={"error": "invalid_request"}))
+    with caplog.at_level("DEBUG"), pytest.raises(ApiError) as e:
+        await call(client, "revoke_by_selector", session=secret, preview=True)
+    assert secret not in caplog.text and secret not in str(e.value)
+    client, _ = make(lambda r: httpx.Response(200, json=_SELECTED))
+    with caplog.at_level("DEBUG"):
+        res = await call(client, "revoke_by_selector", session=secret)
+    assert secret not in caplog.text and secret not in repr(res)
+    with pytest.raises(ValueError) as bad:
+        await call(client, "revoke_by_selector", session=secret, user="alice")
+    assert secret not in str(bad.value)
+
+
 def test_audit_entry_exposes_kind_and_chain_id() -> None:
     e = AuditEntry(seq=1, record={"kind": "exchange", "chain_id": "l1"}, raw={})
     assert (e.kind, e.chain_id) == ("exchange", "l1")
