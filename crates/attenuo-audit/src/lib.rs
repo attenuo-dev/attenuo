@@ -44,6 +44,9 @@ pub use shipped::{
     checkpoint_sha256, cross_check, parse_shipped, CrossCheckReport, ShippedCheckpoint,
     ShippedLine, ShippedMismatch, SHIPPED_FORMAT,
 };
+#[cfg(feature = "testing")]
+#[doc(hidden)]
+pub use sqlite::WalTimings;
 pub use sqlite::{
     Durability, SqliteAudit, SqliteLeaseStore, WalCheckpoint, DEFAULT_WAL_CHECKPOINT_INTERVAL,
     WAL_CHECKPOINT_COMMITS, WAL_WRITER_BACKSTOP_FRAMES,

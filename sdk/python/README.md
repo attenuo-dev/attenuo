@@ -69,9 +69,49 @@ print(admin.audit_verify())  # VerifyReport(ok=True, entries=..., ...)
 | `initialize(token, server)`                                                                          | MCP `initialize`; returns the `Mcp-Session-Id`, if any.                                                                                                                                                                                                                                                                                                                                                           |
 | `authzen_evaluate(token, server, tool, arguments)`                                                   | AuthZEN decision without calling the tool. A deny is a falsy `AuthzenDecision`, not an exception.                                                                                                                                                                                                                                                                                                                 |
 | `inspect(jwt, verify=False)`                                                                         | Decode a token. With `verify=True` fetch the JWKS and check the Ed25519 signature, `typ`, `exp` and that `sub`/`act` match the chain.                                                                                                                                                                                                                                                                             |
-| `AdminClient(server_url, admin_token)`                                                               | `revoke_lease`, `lease_status`, `audit`, `audit_head` (reads `head` from `GET /admin/audit`, signs nothing), `audit_tail`, `audit_export` (iterator of JSON Lines objects; `kind=` and `chain_id=` filter), `audit_checkpoint` (explicit; signs and stores a checkpoint), `audit_verify`, `policy_reload`, `mint_root_dev`.                                                                                                                       |
+| `AdminClient(server_url, admin_token)`                                                               | `revoke_lease`, `lease_status`, `audit`, `audit_head` (reads `head` from `GET /admin/audit`, signs nothing), `audit_tail`, `audit_export` (iterator of JSON Lines objects; `kind=` and `chain_id=` filter), `audit_checkpoint` (explicit; signs and stores a checkpoint), `audit_verify`, `policy_reload`, `mint_root_dev`; and the read-only console helpers below (`audit_query`, `audit_iter`, `audit_entry`, `audit_record`, `audit_checkpoints`, `lease_tree`, `policies`, `policy_check`, `policy_evaluate`).                                                                                                                       |
 
 `Token` carries `jwt` (also `str(token)`), `lease`, `expires_at`, `chain` (user, hops, capabilities per hop), and `verified`. `repr` does not print the JWT. Everything decoded from a token is untrusted unless `verified` is true.
+
+### Admin: querying the audit log, lease trees, policies
+
+These wrap the read-only operator routes the admin console uses. None of them signs, changes or audits anything.
+
+```python
+from attenuo import AdminClient, AuditFilter
+
+admin = AdminClient(URL, "dev-admin-token-change-me")
+
+# Newest denials first. A filtered page can come back short (even empty) with a link still
+# set, so iterate rather than reading one page: audit_iter follows prev/next until null.
+for e in admin.audit_iter(AuditFilter(decision="deny", agent="coder"), order="desc"):
+    print(e.seq, e.reason, e.tool)
+page = admin.audit_query(AuditFilter(kind=["lease_renew"], lease=lease_id), limit=50)
+
+detail = admin.audit_record(denied.decision_id)  # or admin.audit_entry(seq)
+print(detail.lease_states, detail.covered_by_checkpoint, detail.policy_reloaded_after)
+
+admin.audit_checkpoints(before=None, limit=20)  # stored checkpoints, newest first; never signs
+tree = admin.lease_tree(lease_id)  # what a revoke would reach: nodes, ancestors, would_revoke
+
+admin.policies()  # the loaded set: path, sha256, loaded_at, {id: text}
+admin.policy_check()  # lint the file on disk now; .ok means a reload would succeed
+ev = admin.policy_evaluate("github", "read_file", {"repo": "alice/x"}, token=coder)
+print(ev.decision, ev.reason, ev.policy_ids)  # no lease check, no audit record
+```
+
+| Call | Route | Returns |
+| --- | --- | --- |
+| `audit_query(filter=None, *, order="asc", from_seq=None, before=None, limit=100)` | `GET /admin/audit` | `AuditPage(entries, next, prev, head)` |
+| `audit_iter(...)` (same arguments, `limit` defaults to 1000) | `GET /admin/audit`, repeated | iterator of `AuditEntry`, following `next` (asc) or `prev` (desc) until null |
+| `audit_entry(seq)`, `audit_record(record_id)` | `GET /admin/audit/entries/{seq}`, `/admin/audit/records/{id}` | `AuditEntryDetail(entry, lease_states, covered_by_checkpoint, policy_reloaded_after)` |
+| `audit_checkpoints(before=None, limit=None)` | `GET /admin/audit/checkpoints` | `CheckpointPage(checkpoints, prev)` |
+| `lease_tree(lease_id, max_nodes=None)` | `GET /admin/leases/{id}/tree` | `LeaseTree(root, ancestors, nodes, would_revoke, truncated)` |
+| `policies()` | `GET /admin/policies` | `PolicySet(path, sha256, loaded_at, policy_ids, warnings, policies)` |
+| `policy_check()` | `GET /admin/policies/check` | `PolicyCheck(ok, issues, differs_from_loaded, ...)` |
+| `policy_evaluate(server, tool, arguments=None, *, token=None, chain=None)` | `POST /admin/policies/evaluate` | `PolicyEvaluation(decision, reason, policy_ids, ..., token_expired)`; `.allowed` |
+
+`AuditFilter` fields are exact matches combined with AND: `kind` (one or a list), `decision`, `reason`, `subject`, `agent`, `lease`, `server`, `tool`, `chain_id`, and `since` / `until` (RFC 3339 strings or timezone-aware datetimes). Errors map as everywhere else: a 404 for an unknown seq, record or lease is an `ApiError` with `status == 404`, a bad filter is a 400 `invalid_request`. `AsyncAdminClient` has the same methods; `audit_iter` is an async iterator there.
 
 ### Capabilities
 

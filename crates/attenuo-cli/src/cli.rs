@@ -1,5 +1,6 @@
 //! Command line definition.
 
+use clap::builder::NonEmptyStringValueParser;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
@@ -378,21 +379,58 @@ pub enum LeaseCmd {
     },
     /// Show a lease's state.
     Show { id: String },
+    /// Show the lease, everything delegated from it and its ancestors, and how many leases a
+    /// revoke sent now would change. A dry run of `lease revoke`: nothing is written.
+    Tree {
+        id: String,
+        /// Most leases to list (server default 1000, at most 10000). `would_revoke` still
+        /// counts the whole subtree.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        max_nodes: Option<u64>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum AuditCmd {
-    /// Show the most recent audit entries.
+    /// Show the most recent audit entries, oldest of them first. Filters keep only matching
+    /// entries, so `-n 5 --decision deny` is the last five denials.
     Tail {
         /// How many entries to show.
         #[arg(short = 'n', long, default_value_t = 20)]
         lines: u64,
+        /// Show the entries just below this seq instead of the newest ones, to page back
+        /// through history (the next page is `--before <oldest seq shown>`).
+        #[arg(long, conflicts_with = "follow", value_parser = clap::value_parser!(u64).range(1..))]
+        before: Option<u64>,
         /// Keep polling for new entries.
         #[arg(short, long)]
         follow: bool,
         /// Polling interval with `--follow`, in milliseconds.
         #[arg(long, default_value_t = 1000)]
         interval_ms: u64,
+        // Boxed: the filter is most of the variant's size.
+        #[command(flatten)]
+        filter: Box<AuditFilter>,
+    },
+    /// Show one audit entry with its context: the state of each lease in its chain now, the
+    /// checkpoint that covers it and whether the policy was reloaded after it.
+    Show {
+        /// The entry's sequence number.
+        #[arg(required_unless_present = "id", conflicts_with = "id")]
+        seq: Option<u64>,
+        /// The record id instead: the UUID that denials and AuthZEN answers return as
+        /// `decision_id`.
+        #[arg(long)]
+        id: Option<String>,
+    },
+    /// List stored checkpoints, newest first. Read-only: never signs a new one.
+    Checkpoints {
+        /// Only checkpoints with a seq below this (the next page of an earlier listing).
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        before: Option<u64>,
+        /// Page size (server default 100, at most 1000).
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        limit: Option<u64>,
     },
     /// Walk the whole hash chain and verify the signed checkpoints. Exits 2 if the chain is
     /// broken or a checkpoint is invalid. With `--file`, verify an exported file offline
@@ -452,6 +490,98 @@ fn parse_record_kind(s: &str) -> Result<attenuo_core::RecordKind, String> {
     s.parse()
 }
 
+/// The server's `decision` filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DecisionArg {
+    Allow,
+    Deny,
+}
+
+/// Filters of `GET /admin/audit`, all exact matches combined with AND. Checked here as far as
+/// the server would check them, so a typo fails before any request.
+#[derive(Debug, Default, Args)]
+pub struct AuditFilter {
+    /// Record kind: decision, exchange, root_token, lease_renew, lease_revoke or admin.
+    /// Repeatable, or comma-separated; any of them matches.
+    #[arg(long, value_parser = parse_record_kind, value_delimiter = ',')]
+    pub kind: Vec<attenuo_core::RecordKind>,
+    /// `allow` or `deny`.
+    #[arg(long, value_enum)]
+    pub decision: Option<DecisionArg>,
+    /// The record's reason (`policy_deny`, `lease_revoked`, ...).
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub reason: Option<String>,
+    /// The originating user (`originating_subject`).
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub subject: Option<String>,
+    /// An agent anywhere in the record's chain.
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub agent: Option<String>,
+    /// A lease anywhere in the record's chain.
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub lease: Option<String>,
+    /// The MCP upstream the call went to (not the attenuo server URL, which is the global
+    /// `--server` before the subcommand).
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub server: Option<String>,
+    /// The tool.
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub tool: Option<String>,
+    /// The delegation chain (`chain_id`: the lease id of its first hop).
+    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+    pub chain_id: Option<String>,
+    /// Records at or after this RFC 3339 time.
+    #[arg(long, value_parser = parse_rfc3339)]
+    pub since: Option<String>,
+    /// Records strictly before this RFC 3339 time.
+    #[arg(long, value_parser = parse_rfc3339)]
+    pub until: Option<String>,
+}
+
+impl AuditFilter {
+    /// The filter as query parameters, each with a leading `&` (empty when there is none).
+    pub fn query(&self) -> String {
+        use crate::client::query_escape;
+        let mut q = String::new();
+        if !self.kind.is_empty() {
+            let kinds: Vec<String> = self.kind.iter().map(|k| k.to_string()).collect();
+            q.push_str(&format!("&kind={}", query_escape(&kinds.join(","))));
+        }
+        if let Some(d) = self.decision {
+            let d = match d {
+                DecisionArg::Allow => "allow",
+                DecisionArg::Deny => "deny",
+            };
+            q.push_str(&format!("&decision={d}"));
+        }
+        let text = [
+            ("reason", &self.reason),
+            ("subject", &self.subject),
+            ("agent", &self.agent),
+            ("lease", &self.lease),
+            ("server", &self.server),
+            ("tool", &self.tool),
+            ("chain_id", &self.chain_id),
+            ("since", &self.since),
+            ("until", &self.until),
+        ];
+        for (name, value) in text {
+            if let Some(v) = value {
+                q.push_str(&format!("&{name}={}", query_escape(v)));
+            }
+        }
+        q
+    }
+}
+
+/// Accept an RFC 3339 time and keep it as written, for the server to parse again.
+fn parse_rfc3339(s: &str) -> Result<String, String> {
+    use time::format_description::well_known::Rfc3339;
+    time::OffsetDateTime::parse(s, &Rfc3339)
+        .map(|_| s.to_string())
+        .map_err(|_| format!("`{s}` is not an RFC 3339 time (like 2026-10-23T09:00:00Z)"))
+}
+
 /// Output format of `audit export`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum ExportFormat {
@@ -463,6 +593,15 @@ pub enum ExportFormat {
 pub enum PolicyCmd {
     /// Re-read the policy file on the server.
     Reload,
+    /// Show the policy set the server has in force: file, digest, load time and each policy's
+    /// text. After an edit that was not reloaded, this is still the old text.
+    Show,
+    /// Lint the policy file as it is on the server's disk now, against the running schema,
+    /// without loading it. Exit 0 when a reload would succeed, 2 when the file has errors.
+    Check,
+    /// Dry run: what the loaded policies decide for one call. No lease check and no audit
+    /// record. Exit 0 for allow, 2 for deny.
+    Evaluate(EvaluateArgs),
     /// Run YAML policy test files offline. Exit 0 if every case passes, 2 if any fails,
     /// 1 if a file cannot be run.
     Test {
@@ -484,6 +623,32 @@ pub enum PolicyCmd {
         #[arg(long)]
         schema: bool,
     },
+}
+
+/// `policy evaluate`: the call, and the chain it is made for (from a token or a file).
+#[derive(Debug, Args)]
+pub struct EvaluateArgs {
+    /// Delegation token whose chain makes the call, or `-` to read it from stdin. An expired
+    /// token is accepted (the answer says so). Without this flag, `--token-file` or
+    /// `--chain-file`, `ATTENUO_TOKEN` is used.
+    #[arg(long, conflicts_with_all = ["token_file", "chain_file"])]
+    pub token: Option<String>,
+    /// Read the delegation token from the first line of this file.
+    #[arg(long, value_name = "PATH", conflicts_with = "chain_file")]
+    pub token_file: Option<std::path::PathBuf>,
+    /// A delegation chain as JSON instead of a token. Only checked for shape: nothing shows
+    /// this server issued it.
+    #[arg(long, value_name = "PATH")]
+    pub chain_file: Option<std::path::PathBuf>,
+    /// MCP upstream name.
+    #[arg(long, alias = "upstream")]
+    pub server: String,
+    /// Tool name.
+    #[arg(long)]
+    pub tool: String,
+    /// Tool argument `key=value` (`key:=json`). Repeatable.
+    #[arg(long = "arg", value_parser = parse_kv)]
+    pub args: Vec<(String, Value)>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -950,5 +1115,180 @@ mod tests {
         .is_ok());
         assert!(parse(&["audit", "export", "--kind", "nope"]).is_err());
         assert!(parse(&["nope"]).is_err());
+    }
+
+    fn tail(extra: &[&str]) -> Result<(Option<u64>, AuditFilter), clap::Error> {
+        let mut a = vec!["audit", "tail"];
+        a.extend_from_slice(extra);
+        parse(&a).map(|c| match c.command {
+            Command::Audit(AuditCmd::Tail { before, filter, .. }) => (before, *filter),
+            _ => panic!("not tail"),
+        })
+    }
+
+    #[test]
+    fn tail_without_filters_sends_no_filter() {
+        let (before, f) = tail(&[]).unwrap();
+        assert_eq!(before, None);
+        assert_eq!(f.query(), "");
+    }
+
+    #[test]
+    fn tail_filters_become_escaped_query_parameters() {
+        let (_, f) = tail(&[
+            "--kind",
+            "decision,exchange",
+            "--kind",
+            "admin",
+            "--decision",
+            "deny",
+            "--reason",
+            "policy_deny",
+            "--subject",
+            "alice@example.com",
+            "--agent",
+            "coder",
+            "--lease",
+            "L 1",
+            "--server",
+            "github",
+            "--tool",
+            "read_file",
+            "--chain-id",
+            "c&x",
+            "--since",
+            "2026-10-23T09:00:00Z",
+            "--until",
+            "2026-10-23T10:00:00+02:00",
+        ])
+        .unwrap();
+        assert_eq!(f.kind.len(), 3);
+        assert_eq!(
+            f.query(),
+            "&kind=decision%2Cexchange%2Cadmin&decision=deny&reason=policy_deny\
+             &subject=alice%40example.com&agent=coder&lease=L%201&server=github\
+             &tool=read_file&chain_id=c%26x&since=2026-10-23T09%3A00%3A00Z\
+             &until=2026-10-23T10%3A00%3A00%2B02%3A00"
+        );
+    }
+
+    #[test]
+    fn tail_rejects_bad_filter_values_before_any_request() {
+        assert!(tail(&["--kind", "nope"]).is_err());
+        assert!(tail(&["--decision", "maybe"]).is_err());
+        assert!(tail(&["--since", "yesterday"]).is_err());
+        assert!(tail(&["--until", "2026-10-23"]).is_err());
+        assert!(tail(&["--agent", ""]).is_err());
+        assert!(tail(&["--chain-id", ""]).is_err());
+    }
+
+    #[test]
+    fn tail_before_pages_back_and_excludes_follow() {
+        let (before, _) = tail(&["-n", "5", "--before", "40"]).unwrap();
+        assert_eq!(before, Some(40));
+        assert!(tail(&["--before", "0"]).is_err());
+        assert!(tail(&["--before", "40", "--follow"]).is_err());
+        // The upstream `--server` filter lives after the subcommand; the global one before it.
+        let cli = parse(&[
+            "--server",
+            "http://ob:9",
+            "audit",
+            "tail",
+            "--server",
+            "github",
+        ])
+        .unwrap();
+        assert_eq!(cli.server, "http://ob:9");
+    }
+
+    #[test]
+    fn audit_show_takes_a_seq_or_an_id() {
+        let show = |extra: &[&str]| {
+            let mut a = vec!["audit", "show"];
+            a.extend_from_slice(extra);
+            parse(&a).map(|c| match c.command {
+                Command::Audit(AuditCmd::Show { seq, id }) => (seq, id),
+                _ => panic!("not show"),
+            })
+        };
+        assert_eq!(show(&["7"]).unwrap(), (Some(7), None));
+        let id = "0b7c4f1e-0000-4000-8000-000000000001";
+        assert_eq!(show(&["--id", id]).unwrap(), (None, Some(id.to_string())));
+        assert!(show(&[]).is_err(), "one of them is required");
+        assert!(show(&["7", "--id", id]).is_err(), "not both");
+        assert!(show(&["seven"]).is_err());
+    }
+
+    #[test]
+    fn audit_checkpoints_paging_flags() {
+        let cps = |extra: &[&str]| {
+            let mut a = vec!["audit", "checkpoints"];
+            a.extend_from_slice(extra);
+            parse(&a).map(|c| match c.command {
+                Command::Audit(AuditCmd::Checkpoints { before, limit }) => (before, limit),
+                _ => panic!("not checkpoints"),
+            })
+        };
+        assert_eq!(cps(&[]).unwrap(), (None, None));
+        assert_eq!(
+            cps(&["--before", "9", "--limit", "3"]).unwrap(),
+            (Some(9), Some(3))
+        );
+        assert!(cps(&["--before", "0"]).is_err());
+        assert!(cps(&["--limit", "0"]).is_err());
+    }
+
+    #[test]
+    fn lease_tree_takes_max_nodes() {
+        let Command::Lease(LeaseCmd::Tree { id, max_nodes }) =
+            parse(&["lease", "tree", "L1", "--max-nodes", "50"])
+                .unwrap()
+                .command
+        else {
+            panic!("not tree")
+        };
+        assert_eq!((id.as_str(), max_nodes), ("L1", Some(50)));
+        assert!(parse(&["lease", "tree"]).is_err());
+        assert!(parse(&["lease", "tree", "L1", "--max-nodes", "0"]).is_err());
+    }
+
+    #[test]
+    fn policy_show_check_and_evaluate() {
+        assert!(matches!(
+            parse(&["policy", "show"]).unwrap().command,
+            Command::Policy(PolicyCmd::Show)
+        ));
+        assert!(matches!(
+            parse(&["policy", "check"]).unwrap().command,
+            Command::Policy(PolicyCmd::Check)
+        ));
+        let eval = |extra: &[&str]| {
+            let mut a = vec![
+                "policy",
+                "evaluate",
+                "--server",
+                "github",
+                "--tool",
+                "read_file",
+            ];
+            a.extend_from_slice(extra);
+            parse(&a).map(|c| match c.command {
+                Command::Policy(PolicyCmd::Evaluate(e)) => e,
+                _ => panic!("not evaluate"),
+            })
+        };
+        let e = eval(&["--token", "-", "--arg", "repo=a/b", "--arg", "n:=1"]).unwrap();
+        assert_eq!(e.token.as_deref(), Some("-"));
+        assert_eq!((e.server.as_str(), e.args.len()), ("github", 2));
+        let e = eval(&["--chain-file", "c.json"]).unwrap();
+        assert!(e.chain_file.is_some() && e.token.is_none());
+        assert!(eval(&["--token-file", "/t"]).unwrap().token_file.is_some());
+        assert!(eval(&["--token", "x", "--chain-file", "c.json"]).is_err());
+        assert!(eval(&["--token-file", "/t", "--chain-file", "c.json"]).is_err());
+        assert!(eval(&["--token", "x", "--token-file", "/t"]).is_err());
+        assert!(
+            parse(&["policy", "evaluate", "--tool", "t"]).is_err(),
+            "--server required"
+        );
     }
 }

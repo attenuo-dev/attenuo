@@ -77,6 +77,43 @@ Crate publishing is manual for now (see "Releases" in CONTRIBUTING). The crates 
 
 - [ ] Clone the repository fresh into an empty directory and run `examples/github-leak-demo/run.sh`. It should finish and print one upstream call.
 - [ ] Follow [getting started](guides/getting-started.md) on a second machine or a clean container.
-- [ ] Re-read the README numbers against [performance](design/performance.md) and the [injection suite](evaluation/injection-suite.md), and re-run the suite and the benchmark if the code has changed since they were taken.
+- [ ] Re-read the README numbers against [performance](design/performance.md) and the [injection suite](evaluation/injection-suite.md), and re-run the suite and the benchmark if the code has changed since they were taken. Done for main @ de3cf75 on 2026-10-24 (see [Numbers audit 2026-10-24](#numbers-audit-2026-10-24)); repeat if main moves before launch.
 - [ ] Re-check [comparison](comparison.md) against the other products' current documentation. It is dated, and these products change.
 - [ ] Look at the task board for findings still open, and decide which to list in the release notes (see [security review, pass 4](research/security-review-2026-10-23-pass4.md)).
+- [ ] Scrub `docs/log/` of process notes that are not about the code before the repo goes public: lines about usage-limit pauses, agent or worker scheduling, laptop sync and session restarts (grep for `usage limit`, `laptop`, `session restart`, `agents`). Keep the per-merge technical history. Owner: Claude.
+
+### Numbers audit 2026-10-24
+
+Every quantitative claim in the README, `docs/` (outside `docs/log/`, `docs/design/bench/` and the research notes, which quote outside sources), SECURITY.md, CONTRIBUTING.md, the SDK and example READMEs, checked against main @ de3cf75. No crate has its own README. "Fixed" means the text now carries the sourced figure and a link.
+
+| File:line | Claim | Source of truth | Verdict |
+| --- | --- | --- | --- |
+| README.md:71 | 10 of 60 dev attack calls still went through | [results v2](../evaluation/injection-suite/results/2026-10-23-v2.md), re-run on de3cf75 with the same tables | ok |
+| README.md:78 | dev 46 cases, 60 attack / 69 benign; 60, 41, 10 allowed; 3 benign refused; test 26 cases (72 in all), 7/38, 3/29 | results v2 | ok |
+| README.md:79 | added p50 0.4 to 0.8 ms (425 to 771 us) | [performance](design/performance.md#after-the-policy-stage-and-wal-work), [policy-stage run](design/bench/2026-10-23-vm-policy-stage.md) | ok |
+| README.md:80 | Cedar 13 us on a cache hit, 125 to 175 us on a miss | [criterion policy_stage](design/bench/2026-10-23-vm-criterion-policy_stage.txt): 11.8 to 13.0 and 122 to 163; 125/175 is marked unrecorded | stale, fixed |
+| README.md:81 | 1,252 / 4,049 / 6,254 req/s; loss window 5 s or 256 commits | policy-stage run; performance | ok, link added |
+| README.md:81 | open-loop load listed as not measured | performance: open-loop measured for the allow call at one hop and for exchange | stale, fixed |
+| README.md:87 | 4 passes; 26, 13, 15 findings; 5 High in pass 1; 1 Medium in pass 4; 2 Info accepted (SR-52, SR-54) | the three review reports | ok, "54 in all" added |
+| README.md:88 | 669 Rust, 157 Python (10 skipped), 150 TS (7 skipped) on 1a00055; suite 19 checks; demo | de3cf75: 748; 175 (10 skipped); 158 (7 skipped); suite 15 passed, 4 skipped | stale, fixed; demo claim dropped (not re-run on de3cf75) |
+| README.md:88 | 12 fuzz targets; 5 bugs, all fixed | [fuzzing](design/fuzzing.md) | ok; second campaign added (10 min each, about 282M inputs, 0 crashes) |
+| docs/faq.md:47 | 0.4 to 0.8 ms added at the median | performance | ok |
+| docs/faq.md:49 | policy 13 us hit, 125 to 175 us miss | criterion policy_stage | stale, fixed |
+| docs/faq.md:49 | attenuation check tens of ns to a few us | [criterion attenuation](design/bench/2026-10-23-vm-criterion-attenuation.txt): 15.9 ns to 5.06 us | ok |
+| docs/faq.md:51 | 425 to 771 us; open loop 0.6 to 0.8 ms at 500 to 2,000/s; 860 to 1,770 and 4,000 to 6,650 req/s; file 6 to 30 percent below memory; p99 at 8 clients 4 to 10 ms | performance tables | ok, open-loop link added |
+| docs/faq.md:53 | "closed-loop load" | open-loop cells exist | stale, now "mostly closed-loop" |
+| docs/faq.md:53 | a few hundred calls/s before WAL mode | performance (the "before" column, 460 to 490, unrecorded) | ok, qualitative |
+| docs/evaluation/injection-suite.md:8-58 | all tables and counts | results v2 | ok |
+| docs/guide/codebase-walkthrough.md:6 | sessions of 45 to 60 minutes | an estimate, not a measurement | ok |
+| docs/guide/codebase-walkthrough.md:245-443 | Lines column for `lease.rs`, `sqlite.rs`, server `main.rs`/`lib.rs`, `state.rs`, `routes/admin.rs`, CLI `cli.rs`, `main.rs`, `jwt.rs` and three others, Python `admin.py` | `wc -l` on de3cf75: 19 to 131 percent off | stale, fixed; every other row within 10 percent |
+| docs/guide/codebase-walkthrough.md:206, 222; docs/guides/writing-policies.md:226; examples/github-leak-demo/README.md:46 | nine policy tests | `policy_test.yaml` has 9 cases | ok |
+| docs/guide/codebase-walkthrough.md:488 | TS 150 passed, 7 skipped | 158 passed, 7 skipped | stale, fixed |
+| docs/guide/codebase-walkthrough.md:516 | suite 15 passed, 4 skipped | `pytest evaluation/injection-suite` on de3cf75 | ok |
+| docs/guide/codebase-walkthrough.md:526 | full bench run about 9 minutes | performance, "How to run" | ok |
+| CHANGELOG.md:86-101 | performance and eval figures | performance, bench files, results v2 | ok (dated entries, not edited) |
+| docs/tasks/board.md:76-83 | pass 3 and 4 counts, policy-stage figures | review reports, performance | ok |
+| docs/decisions/0004-rust-workspace-layout.md:14, 37 | seven crates | eight today (`attenuo-bench` added later) | ok as the ADR's original text, not edited |
+| docs/design/rename-plan.md:69 | all eight crates | `crates/` | ok |
+| SECURITY.md:28-33 | 72 hours, 7 days, 90 days | commitments, not measurements | ok |
+| docs/faq.md:92; docs/guides/deploying.md:166, 233; docs/guides/admin-console.md:41 | 1,000 entries / 300 s checkpoints, 300 s leases, 10 s drain, 15 min idle lock | config defaults (`config/example.toml`), spot-checked | ok |
+| CONTRIBUTING.md, comparison.md, SDK and example READMEs | no quantitative claims beyond the above | | n/a |
