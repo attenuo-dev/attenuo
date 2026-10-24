@@ -89,6 +89,7 @@ When implemented: new injection-suite arms `attenuo_limits` and `attenuo_labels_
 ## More Information
 
 - Design, corpus table and open questions: [design/run-limits.md](../design/run-limits.md).
+- Implementation: phase 1 on `feat/run-limits-phase1` (2026-10-24), not yet measured on the injection suite; deviations in [design section 6](../design/run-limits.md#implemented-phase-1-2026-10-24). The decision stays proposed until the phase 1 numbers are in.
 - Related: [ADR-0005](0005-policy-decision-point.md) (capabilities before Cedar), [ADR-0006](0006-lease-based-in-flight-revocation.md) (leases, where counters live), [ADR-0009](0009-output-labelling.md) (approvals, `@obligation("approval")`, run state keyed by `chain_id`), RFC-0001 sections 2, 3, 3.1, 8 and 9.
 - Prior work: AgentGate's budget-limited capability tokens and AWS AgentCore Policy's Dogwood ([related work](../research/related-work.md)), [AP2 Intent Mandates](https://cloud.google.com/blog/products/ai-machine-learning/announcing-agents-to-payments-ap2-protocol), [Macaroons](https://research.google/pubs/macaroons-cookies-with-contextual-caveats-for-decentralized-authorization-in-the-cloud/), [RFC 9396](https://www.rfc-editor.org/rfc/rfc9396.html).
 - Revisit after phase 1 is measured: if the new multi-call cases show benign losses under the frozen rule, phase 2's per-destination and soft limits move ahead of any default; if order dependence dominates on a model-in-the-loop run, combine counts with taint (count only after an untrusted read).

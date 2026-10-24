@@ -30,6 +30,8 @@ Optional, RFC 9449. See [Binding tokens to keys](../guides/binding-tokens-to-key
 | `POST /token` | agent client credentials at hop 0; at later hops the parent token, plus the actor's client credentials or an `actor_token` | RFC 8693 token exchange, as a form or JSON. Hop 0 takes an OIDC ID token or an ID-JAG. Later hops take a parent delegation token and `authorization_details`. Optional `may_act` (agent ids) sets who may exchange the new token next. A `DPoP` header binds the new token to a key (`token_type` `DPoP`); `subject_token_dpop` is the parent key's sign-off, naming the new key and `actor`, when the parent is bound to another key. |
 | `POST /token/renew` | bearer delegation token (and a DPoP proof if it is bound) | Extend the lease of the token's last hop. Returns `{lease, expires_at, expires_in}`. |
 
+A capability may carry run `limits` (`calls`, `sum: {arg, max}`, `calls_per: {arg, max}`; [run limits](../design/server.md#run-limits)). A child must keep every limit of the parent capability that covers it, at most as large; one it leaves out or asks larger is filled in or lowered (a `sum` or `calls_per` over another argument is refused as not covered), and its `calls` and `sum` are lowered further to what the parent hop has left. An unknown limit kind, such as `distinct`, is 400 `invalid_request`.
+
 A later-hop request authenticates its `actor` with `client_id` / `client_secret` (or HTTP Basic), or with `actor_token` and `actor_token_type` = `urn:ietf:params:oauth:token-type:jwt` (RFC 8693 §2.1): a workload-identity JWT, such as a SPIFFE JWT-SVID, from an `[[actor_trust]]` issuer. `[token] actor_auth` decides which are accepted. An actor token works for one exchange, and the child expires no later than it does. If the parent token carries `may_act`, the `actor` must be listed (`actor_not_permitted` otherwise).
 
 ```http
@@ -50,7 +52,7 @@ grant_type=urn:ietf:params:oauth:grant-type:token-exchange
 
 | Method and path | Auth | Purpose |
 | --- | --- | --- |
-| `POST /access/v1/evaluation` | bearer token, or a trusted PEP | AuthZEN evaluation. Same pipeline as the proxy. `context.diagnostics` is filled only for callers `[authzen] diagnostics` allows: by default a `[[peps]]` entry, which can authenticate next to a bearer token with `pep_id` and `pep_secret` in the body. |
+| `POST /access/v1/evaluation` | bearer token, or a trusted PEP | AuthZEN evaluation. Same pipeline as the proxy, run limits included: an allowed evaluation is charged as a proxied call is, and its answer carries `context.budget` (`limited`, `calls_remaining`, `amount_remaining`, `destination_new`) when a limit matched, `context.charged` when it was charged, and `context.limit` on `budget_exhausted`. `context.diagnostics` is filled only for callers `[authzen] diagnostics` allows: by default a `[[peps]]` entry, which can authenticate next to a bearer token with `pep_id` and `pep_secret` in the body. |
 | `POST /access/v1/evaluations` | same | AuthZEN batch: top-level `subject`, `action`, `resource`, `context` are defaults and each entry of `evaluations` overrides them. Answers `{"evaluations": [{decision, context}, ...]}`, one per entry, each decided and audited like a single evaluation. At most `[authzen] max_batch` entries (default 64): more is 400 `batch_too_large`, none is 400 `invalid_request`. Only the default `execute_all` semantic is supported. |
 
 ## MCP proxy
@@ -61,7 +63,7 @@ grant_type=urn:ietf:params:oauth:grant-type:token-exchange
 | `GET /mcp/{server}` | bearer delegation token | Passthrough for the streamable HTTP event stream, after the lease check. |
 | `DELETE /mcp/{server}` | bearer delegation token | Passthrough session close, after the lease check. |
 
-A denial is a JSON-RPC error with code `-32003`, carrying `reason` and `decision_id`. A call that a policy sends for approval (reason `approval_required`) gets `-32008` instead, with `reason`, `decision_id`, `call_hash` (SHA-256 of the RFC 8785 JSON of `{server, tool, arguments}`), `approval_id` and `expires_at`, and is not forwarded. Once the approval is granted, the identical call from the same hop is allowed once (see [Approvals](#approvals)). `approval_id` is absent if the server could not open an approval. If the answer to an allowed call cannot be recorded in the audit log, the agent gets `-32003` with reason `label_error` and the call's `decision_id` instead of the answer. A missing or bad token is HTTP 401 with `-32001` and `data.reason` set to `missing_token`, `invalid_token`, `token_expired`, `dpop_required`, `invalid_dpop_proof`, `use_dpop_nonce` or, for a lease that is no longer live, `lease_revoked`, `lease_expired` or `lease_unknown`. An upstream the proxy cannot reach is HTTP 502 with `-32005` and `data.reason` `upstream_unreachable`; the upstream URL and transport error are only logged. Allowed responses carry `X-Attenuo-Decision-Id`.
+A denial is a JSON-RPC error with code `-32003`, carrying `reason` and `decision_id`. A call that a policy sends for approval (reason `approval_required`) gets `-32008` instead, with `reason`, `decision_id`, `call_hash` (SHA-256 of the RFC 8785 JSON of `{server, tool, arguments}`), `approval_id` and `expires_at`, and is not forwarded. Once the approval is granted, the identical call from the same hop is allowed once (see [Approvals](#approvals)). `approval_id` is absent if the server could not open an approval. A call over a run limit gets `-32003` with reason `budget_exhausted` and `data.limit: {hop, kind, arg, max, used}` (`arg` absent for `calls`); `budget_error` means the counters could not be read or written, and `limit_arg_invalid` that the call lacks an argument a limit counts, or has a value it cannot count (a `sum` needs a non-negative integer). No policy or approval passes these. If the answer to an allowed call cannot be recorded in the audit log, the agent gets `-32003` with reason `label_error` and the call's `decision_id` instead of the answer. A missing or bad token is HTTP 401 with `-32001` and `data.reason` set to `missing_token`, `invalid_token`, `token_expired`, `dpop_required`, `invalid_dpop_proof`, `use_dpop_nonce` or, for a lease that is no longer live, `lease_revoked`, `lease_expired` or `lease_unknown`. An upstream the proxy cannot reach is HTTP 502 with `-32005` and `data.reason` `upstream_unreachable`; the upstream URL and transport error are only logged. Allowed responses carry `X-Attenuo-Decision-Id`.
 
 ## Approvals
 
@@ -129,6 +131,7 @@ All admin routes need `Authorization: Bearer <admin token>`. They answer 401 wit
 | `GET /admin/policies` | The policy set in force: file path, its `sha256` and `loaded_at` (startup or last successful reload), `policy_ids`, validation `warnings`, and `policies: [{id, text}]`. |
 | `GET /admin/policies/check` | Lint the policy file as it is on disk now against the running schema, with line and column for each issue, and say whether it differs from the loaded one. Loads nothing, audits nothing. 409 `check_unavailable` without `policy.policies_path`. |
 | `POST /admin/policies/evaluate` | Dry run: what the loaded policies decide for one call, given a token or a chain. No lease check, no audit record, no decision metric. |
+| `POST /admin/budgets/refund` | Body `{"decision_id": "<uuid>", "reason": "..."}`: give back to every run-limit counter what that decision charged, once, for an allowed call whose effect did not happen. Answers `{decision_id, refunded, reason, audit_id}` (`refunded` counts the counters credited) and appends an `admin.budget.refund` record. 404 when the decision charged nothing, 409 `already_refunded`. Also on the console listener with `[admin_ui] allow_write = true`. |
 | `POST /admin/root-token` | Development root mint. Mounted only when `[dev] allow_root_mint = true`. |
 
 ### Lease tree
@@ -262,9 +265,13 @@ These three routes change nothing and write no audit record. They answer the que
   "chain_source": "token",
   "token_expired": false,
   "session": {"tainted": false, "tainted_by": [], "source": "store"},
-  "approval": {"present": false, "by": ""}
+  "approval": {"present": false, "by": ""},
+  "budget": {"limited": false, "calls_remaining": 9223372036854775807,
+             "amount_remaining": 9223372036854775807, "destination_new": true}
 }
 ```
+
+`budget` is `context.budget` as the run's counters stand now: the dry run reads them and never charges. When the call would exceed a limit, the answer is `budget_exhausted` and adds `limit: {hop, kind, arg, max, used}`.
 
 `chain_source` is `token` or `admin_supplied`. `session.source` is `request` or `store`. The decision comes from the capability stage and Cedar, the same code `POST /access/v1/evaluation` runs after its lease check, so for a token with live leases the two agree on decision, reason and policy ids. A revoked or expired lease does not change the dry run's answer (`lease_check` is always `skipped`).
 

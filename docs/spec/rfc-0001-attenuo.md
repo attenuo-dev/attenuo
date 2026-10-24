@@ -60,11 +60,12 @@ The authoritative object is the `DelegationChain` (`attenuo-core`): the originat
 
 `attributes` is an optional map of verified facts for policy (roles, MFA level, tenant). A hop's `lease` is the id revoked to deny that hop and everything delegated from it.
 
-**Capability.** `{server, tool, constraints}`. `server` and `tool` are an exact name, `*`, or a `prefix*` glob. `constraints` maps an argument name to `{op, value}` with `op` one of `equals` (a JSON value), `one_of` (a list of JSON values) or `prefix` (a string). Arguments not mentioned are unconstrained; a call that omits a constrained argument is denied.
+**Capability.** `{server, tool, constraints, limits}`. `server` and `tool` are an exact name, `*`, or a `prefix*` glob. `constraints` maps an argument name to `{op, value}` with `op` one of `equals` (a JSON value), `one_of` (a list of JSON values) or `prefix` (a string). Arguments not mentioned are unconstrained; a call that omits a constrained argument is denied. `limits` (optional, [ADR-0010](../decisions/0010-run-limits.md)) bounds how often and how much: `calls` (a count), `sum: {arg, max}` (a total over one non-negative integer argument) and `calls_per: {arg, max}` (a count per value of one argument). The server keeps the counters, charged against every hop of the chain ([design/server.md](../design/server.md#run-limits)).
 
 **Attenuation rule.** `parent.covers(child)` holds when:
 1. server and tool patterns are covered: `*` covers anything; `p*` covers `q*` iff `q` starts with `p`, and covers an exact name starting with `p`; an exact parent covers only the identical exact name, never a glob;
-2. every argument the parent constrains is also constrained by the child, and the child's constraint *implies* the parent's. The child may add constraints.
+2. every argument the parent constrains is also constrained by the child, and the child's constraint *implies* the parent's. The child may add constraints;
+3. every limit of the parent is also a limit of the child, over the same argument, with a `max` no larger, except that a parent `calls_per` is also met by a child `calls` no larger than its `max`. The child may add limits.
 
 Constraint implication (child implies parent):
 
