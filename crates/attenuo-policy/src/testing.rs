@@ -689,10 +689,30 @@ impl TestFile {
         Ok(report)
     }
 
+    /// The evaluation time of the cases: the file's `now`, else [`DEFAULT_NOW_UNIX`].
+    pub fn now_unix(&self) -> i64 {
+        self.now.unwrap_or(DEFAULT_NOW_UNIX)
+    }
+
+    /// Whether the file sets `now` itself.
+    pub fn sets_now(&self) -> bool {
+        self.now.is_some()
+    }
+
+    /// A report for case results produced some other way (for instance by a remote server),
+    /// with the file's source and its policies (see [`TestFile::policy_refs`]).
+    pub fn report_for(&self, cases: Vec<CaseReport>) -> Result<TestReport, HarnessError> {
+        Ok(TestReport {
+            source: self.source.clone(),
+            cases,
+            policies: self.policy_refs()?,
+        })
+    }
+
     /// Run every case against an engine you built yourself. [`TestReport::policies`] lists
     /// the engine's policies without a file or line.
     pub fn run_with(&self, engine: &PolicyEngine) -> TestReport {
-        let now_unix = self.now.unwrap_or(DEFAULT_NOW_UNIX);
+        let now_unix = self.now_unix();
         TestReport {
             source: self.source.clone(),
             cases: self
@@ -888,6 +908,10 @@ pub struct CaseReport {
     /// Set when the case itself is malformed, for instance a chain that violates attenuation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Set when the case was deliberately not run, with the reason; `passed` is then `false`
+    /// but the case does not count as failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
 }
 
 /// The result of one test file.
@@ -924,8 +948,14 @@ impl TestReport {
         self.cases.iter().filter(|c| c.passed).count()
     }
 
+    /// Cases that ran (or could not be built) and did not pass. Skipped cases are not failed.
     pub fn failed(&self) -> usize {
-        self.cases.len() - self.passed()
+        self.cases.len() - self.passed() - self.skipped()
+    }
+
+    /// Cases deliberately not run, for instance ones the AuthZEN endpoint cannot express.
+    pub fn skipped(&self) -> usize {
+        self.cases.iter().filter(|c| c.skipped.is_some()).count()
     }
 
     pub fn all_passed(&self) -> bool {
@@ -934,68 +964,189 @@ impl TestReport {
 }
 
 fn run_case(engine: &PolicyEngine, case: &TestCase, now_unix: i64) -> CaseReport {
-    let mut report = CaseReport {
-        name: case.name.clone(),
-        passed: false,
-        expected: case.expect,
-        actual: None,
-        failures: Vec::new(),
-        error: None,
-    };
-    let (chain, call, now) = match build_case(case, now_unix) {
-        Ok(v) => v,
-        Err(e) => {
-            report.error = Some(e);
-            return report;
-        }
-    };
-    let mut labels = case
-        .session
-        .as_ref()
-        .map(SessionSpec::labels)
-        .unwrap_or_default();
-    if let Some(a) = &case.approval {
-        labels.approval = crate::ApprovalContext::by(a.by.clone());
+    match case.input(now_unix) {
+        Ok(i) => case.check(Actual::from(
+            engine.authorize_labelled(&i.chain, &i.call, &i.labels, i.now),
+        )),
+        Err(e) => case.errored(e),
     }
-    if let Some(b) = &case.budget {
-        labels.budget = b.context();
-    }
-    if let Some(u) = &case.usage {
-        labels.usage = u.context();
-    }
-    let actual = Actual::from(engine.authorize_labelled(&chain, &call, &labels, now));
+}
 
-    if !case.expect.matches(&actual.decision) {
-        report.failures.push(format!(
-            "expected {}, got {} ({})",
-            case.expect,
-            decision_str(&actual.decision),
-            actual.reason
-        ));
+/// What a case evaluates: the chain and call it describes, the run's labels and the time.
+#[derive(Debug, Clone)]
+pub struct CaseInput {
+    pub chain: DelegationChain,
+    pub call: ToolCall,
+    pub labels: CallLabels,
+    pub now: OffsetDateTime,
+}
+
+impl TestCase {
+    /// Build what the case evaluates at `now_unix` (the file's [`TestFile::now_unix`]), exactly
+    /// as the in-process run does. `Err` describes a malformed case, for instance a chain that
+    /// violates attenuation.
+    pub fn input(&self, now_unix: i64) -> Result<CaseInput, String> {
+        let (chain, call, now) = build_case(self, now_unix)?;
+        let mut labels = self
+            .session
+            .as_ref()
+            .map(SessionSpec::labels)
+            .unwrap_or_default();
+        if let Some(a) = &self.approval {
+            labels.approval = crate::ApprovalContext::by(a.by.clone());
+        }
+        if let Some(b) = &self.budget {
+            labels.budget = b.context();
+        }
+        if let Some(u) = &self.usage {
+            labels.usage = u.context();
+        }
+        Ok(CaseInput {
+            chain,
+            call,
+            labels,
+            now,
+        })
     }
-    if let Some(want) = &case.reason {
-        if *want != actual.reason {
-            report
-                .failures
-                .push(format!("expected reason {want}, got {}", actual.reason));
+
+    fn report(&self) -> CaseReport {
+        CaseReport {
+            name: self.name.clone(),
+            passed: false,
+            expected: self.expect,
+            actual: None,
+            failures: Vec::new(),
+            error: None,
+            skipped: None,
         }
     }
-    if let Some(want) = &case.policy_ids {
-        let mut w = want.clone();
-        let mut g = actual.policy_ids.clone();
-        w.sort();
-        g.sort();
-        if w != g {
-            report.failures.push(format!(
-                "expected policy_ids [{}], got [{}]",
-                want.join(", "),
-                actual.policy_ids.join(", ")
+
+    /// The report of a case that could not be evaluated.
+    pub fn errored(&self, error: impl Into<String>) -> CaseReport {
+        CaseReport {
+            error: Some(error.into()),
+            ..self.report()
+        }
+    }
+
+    /// The report of a case that was deliberately not run (neither passed nor failed).
+    pub fn skip(&self, why: impl Into<String>) -> CaseReport {
+        CaseReport {
+            skipped: Some(why.into()),
+            ..self.report()
+        }
+    }
+
+    /// Why this case cannot be sent to a server's AuthZEN endpoint with a token whose chain is
+    /// `token_chain`, or `None` when it can. The server takes the chain from the token and the
+    /// run's labels, approvals, budget and usage from its own state, so a case that sets any of
+    /// those must match the token or be skipped:
+    ///
+    /// - `session`, `approval`, `budget`, `usage` and `user.authenticated_at_unix` cannot be sent;
+    /// - a `user` other than the default must equal the token's user (subject, issuer and the
+    ///   exact attributes);
+    /// - a non-empty `chain` must name the token's agents in order, and a hop with explicit
+    ///   `capabilities` must carry exactly the token hop's capabilities.
+    pub fn authzen_skip_reason(&self, token_chain: &DelegationChain) -> Option<String> {
+        for (set, field) in [
+            (self.session.is_some(), "session"),
+            (self.approval.is_some(), "approval"),
+            (self.budget.is_some(), "budget"),
+            (self.usage.is_some(), "usage"),
+            (
+                self.user.authenticated_at_unix.is_some(),
+                "user.authenticated_at_unix",
+            ),
+        ] {
+            if set {
+                return Some(format!(
+                    "`{field}` cannot be sent through AuthZEN (the server uses its own state)"
+                ));
+            }
+        }
+        let ou = &token_chain.originating_user;
+        if self.user != UserSpec::default()
+            && (self.user.subject != ou.subject
+                || self.user.issuer != ou.issuer
+                || self.user.attributes != ou.attributes)
+        {
+            return Some(format!(
+                "`user` differs from the token's user ({} at {})",
+                ou.subject, ou.issuer
             ));
         }
+        if self.chain.is_empty() {
+            return None;
+        }
+        let agents = |names: Vec<&str>| names.join(" > ");
+        let case_agents: Vec<&str> = self.chain.iter().map(HopSpec::agent).collect();
+        let token_agents: Vec<&str> = token_chain
+            .hops
+            .iter()
+            .map(|h| h.agent.0.as_str())
+            .collect();
+        if case_agents != token_agents {
+            return Some(format!(
+                "`chain` {} differs from the token's chain {}",
+                agents(case_agents),
+                agents(token_agents)
+            ));
+        }
+        for (spec, hop) in self.chain.iter().zip(&token_chain.hops) {
+            let Some(caps) = spec.capabilities() else {
+                continue;
+            };
+            let same = caps
+                .iter()
+                .map(CapSpec::to_capability)
+                .collect::<Result<CapabilitySet, _>>()
+                .is_ok_and(|c| c == hop.capabilities);
+            if !same {
+                return Some(format!(
+                    "the capabilities of hop `{}` differ from the token's",
+                    spec.agent()
+                ));
+            }
+        }
+        None
     }
-    report.passed = report.failures.is_empty();
-    report.actual = Some(actual);
-    report
+
+    /// Compare what was decided with what the case expects.
+    pub fn check(&self, actual: Actual) -> CaseReport {
+        let case = self;
+        let mut report = self.report();
+        if !case.expect.matches(&actual.decision) {
+            report.failures.push(format!(
+                "expected {}, got {} ({})",
+                case.expect,
+                decision_str(&actual.decision),
+                actual.reason
+            ));
+        }
+        if let Some(want) = &case.reason {
+            if *want != actual.reason {
+                report
+                    .failures
+                    .push(format!("expected reason {want}, got {}", actual.reason));
+            }
+        }
+        if let Some(want) = &case.policy_ids {
+            let mut w = want.clone();
+            let mut g = actual.policy_ids.clone();
+            w.sort();
+            g.sort();
+            if w != g {
+                report.failures.push(format!(
+                    "expected policy_ids [{}], got [{}]",
+                    want.join(", "),
+                    actual.policy_ids.join(", ")
+                ));
+            }
+        }
+        report.passed = report.failures.is_empty();
+        report.actual = Some(actual);
+        report
+    }
 }
 
 fn decision_str(d: &Decision) -> &'static str {
@@ -1554,6 +1705,63 @@ mod coverage_tests {
         // `shadowed` can never decide: the forbid wins whenever it matches.
         let un: Vec<&str> = cov.unexercised.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(un, vec!["shadowed"]);
+    }
+
+    #[test]
+    fn authzen_skip_reason_matches_cases_against_the_token_chain() {
+        let f = TestFile::from_yaml_str(
+            r#"
+cases:
+  - name: same
+    user: { subject: carol, attributes: { mfa: true } }
+    chain:
+      - { agent: a, capabilities: ["github:*"] }
+      - b
+    call: { server: github, tool: read_file }
+    expect: allow
+  - name: any chain
+    call: { server: github, tool: read_file }
+    expect: allow
+  - name: narrower hop
+    chain:
+      - { agent: a, capabilities: ["github:*"] }
+      - { agent: b, capabilities: ["github:read_file"] }
+    call: { server: github, tool: read_file }
+    expect: allow
+  - name: other attrs
+    user: { subject: carol }
+    call: { server: github, tool: read_file }
+    expect: allow
+  - name: with usage
+    usage: { calls: 1 }
+    call: { server: github, tool: read_file }
+    expect: allow
+"#,
+        )
+        .unwrap();
+        // The token's chain is the one the first case describes.
+        let token = f.cases[0].input(f.now_unix()).unwrap().chain;
+        let why = |i: usize| f.cases[i].authzen_skip_reason(&token);
+        assert_eq!(why(0), None);
+        assert_eq!(why(1), None);
+        assert!(why(2).unwrap().contains("hop `b`"), "{:?}", why(2));
+        assert!(why(3).unwrap().contains("`user` differs"), "{:?}", why(3));
+        assert!(
+            why(4).unwrap().starts_with("`usage` cannot"),
+            "{:?}",
+            why(4)
+        );
+        let skipped = f.cases[4].skip("x");
+        assert!(!skipped.passed && skipped.skipped.is_some());
+        let report = TestReport {
+            source: None,
+            cases: vec![skipped, f.cases[0].errored("broken")],
+            policies: Vec::new(),
+        };
+        assert_eq!(
+            (report.passed(), report.failed(), report.skipped()),
+            (0, 1, 1)
+        );
     }
 
     #[test]

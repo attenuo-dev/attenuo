@@ -1,5 +1,6 @@
 //! `attenuo policy test` and `attenuo policy lint`: offline checks of a policy set. They
-//! never talk to a server.
+//! never talk to a server, except `policy test --via authzen`, which sends the cases to a
+//! running server's AuthZEN endpoint.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -74,7 +75,106 @@ pub fn test(files: &[PathBuf], opts: &TestOptions, json_out: bool) -> Run {
             Err(e) => errors.push((path, e.to_string())),
         }
     }
-    report(&reports, &errors, opts, json_out)
+    report(&reports, &errors, &[], opts, json_out)
+}
+
+/// The server and credentials of `policy test --via authzen`.
+pub struct Remote<'a> {
+    pub client: &'a crate::client::Client,
+    pub token: &'a str,
+    pub dpop_key: Option<&'a attenuo_token::DpopKey>,
+}
+
+/// `attenuo policy test --via authzen <file>...`: every case is decided by the server's
+/// `POST /access/v1/evaluation`, with the token's chain. Cases the endpoint cannot express
+/// (see [`testing::TestCase::authzen_skip_reason`]) are skipped and listed as such. Every
+/// evaluation is a real decision on the server, so each one writes an audit record there.
+pub async fn test_authzen(
+    files: &[PathBuf],
+    remote: &Remote<'_>,
+    opts: &TestOptions,
+    json_out: bool,
+) -> Run {
+    let token_chain = match crate::jwt::decode_unverified(remote.token) {
+        Ok(d) => d.claims.chain,
+        Err(e) => return Run::error(format!("--token: {e:#}")),
+    };
+    let mut reports: Vec<(&Path, TestReport)> = Vec::new();
+    let mut errors: Vec<(&Path, String)> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    for path in files {
+        let file = match TestFile::load(path) {
+            Ok(f) => f,
+            Err(e) => {
+                errors.push((path, e.to_string()));
+                continue;
+            }
+        };
+        if file.sets_now() {
+            notes.push(format!(
+                "{}: `now` is not sent; the server evaluates at its own clock",
+                path.display()
+            ));
+        }
+        let mut cases = Vec::with_capacity(file.cases.len());
+        let mut failure = None;
+        for case in &file.cases {
+            if let Some(why) = case.authzen_skip_reason(&token_chain) {
+                cases.push(case.skip(why));
+                continue;
+            }
+            let input = match case.input(file.now_unix()) {
+                Ok(i) => i,
+                Err(e) => {
+                    cases.push(case.errored(e));
+                    continue;
+                }
+            };
+            let body = authzen_body(&input.call);
+            match remote
+                .client
+                .authzen(remote.token, &body, remote.dpop_key)
+                .await
+                .and_then(|v| {
+                    serde_json::from_value::<attenuo_policy::authzen::EvaluationResponse>(v)
+                        .map_err(|e| anyhow::anyhow!("the server's answer is not AuthZEN: {e}"))
+                }) {
+                Ok(resp) => cases.push(case.check(testing::Actual::from(
+                    attenuo_policy::authzen::to_outcome(&resp),
+                ))),
+                Err(e) => {
+                    // A refused token or an unreachable server fails every case the same way.
+                    failure = Some(format!("case `{}`: {e:#}", case.name));
+                    break;
+                }
+            }
+        }
+        match failure {
+            Some(e) => errors.push((path, e)),
+            None => match file.report_for(cases) {
+                Ok(r) => reports.push((path, r)),
+                Err(e) => errors.push((path, e.to_string())),
+            },
+        }
+    }
+    report(&reports, &errors, &notes, opts, json_out)
+}
+
+/// The AuthZEN request for a case's call. The subject id is left empty: the server fills it
+/// from the bearer's chain, which is the chain that makes the call.
+fn authzen_body(call: &attenuo_core::ToolCall) -> Value {
+    let mut context =
+        json!({ "input": Value::Object(call.arguments.clone().into_iter().collect()) });
+    if let Some(sid) = &call.session_id {
+        context["session_id"] = json!(sid);
+    }
+    json!({
+        "subject": {"type": "agent", "id": ""},
+        "action": {"name": call.tool, "properties": {"server": call.server}},
+        "resource": {"type": "tool", "id": format!("{}/{}", call.server, call.tool),
+                     "properties": {"server": call.server, "tool": call.tool}},
+        "context": context,
+    })
 }
 
 /// Print the reports of a `policy test` run (however the cases were evaluated) and decide its
@@ -82,24 +182,29 @@ pub fn test(files: &[PathBuf], opts: &TestOptions, json_out: bool) -> Run {
 fn report(
     reports: &[(&Path, TestReport)],
     errors: &[(&Path, String)],
+    notes: &[String],
     opts: &TestOptions,
     json_out: bool,
 ) -> Run {
     let mut run = Run::new();
     let passed: usize = reports.iter().map(|(_, r)| r.passed()).sum();
     let failed: usize = reports.iter().map(|(_, r)| r.failed()).sum();
+    let skipped: usize = reports.iter().map(|(_, r)| r.skipped()).sum();
     let coverage = testing::coverage(reports.iter().map(|(_, r)| r));
 
     if json_out {
         let mut entries: Vec<Value> = reports
             .iter()
             .map(|(p, r)| {
-                json!({"file": p, "cases": r.cases, "passed": r.passed(), "failed": r.failed()})
+                json!({"file": p, "cases": r.cases, "passed": r.passed(), "failed": r.failed(),
+                       "skipped": r.skipped()})
             })
             .collect();
         entries.extend(errors.iter().map(|(p, e)| json!({"file": p, "error": e})));
         run.stdout = pretty(&json!({
-            "files": entries, "passed": passed, "failed": failed, "errors": errors.len(),
+            "files": entries, "passed": passed, "failed": failed, "skipped": skipped,
+            "errors": errors.len(),
+            "notes": notes,
             "coverage": {
                 "policies": coverage.policies,
                 "exercised": coverage.exercised(),
@@ -107,6 +212,9 @@ fn report(
             },
         }));
     } else {
+        for n in notes {
+            let _ = writeln!(run.stdout, "note: {n}");
+        }
         for (path, report) in reports {
             let _ = writeln!(run.stdout, "{}", path.display());
             for case in &report.cases {
@@ -118,10 +226,14 @@ fn report(
             let _ = writeln!(run.stderr, "error: {}: {e}", path.display());
         }
         if !reports.is_empty() {
+            let _ = write!(run.stdout, "{passed} passed, {failed} failed");
+            if skipped > 0 {
+                let _ = write!(run.stdout, ", {skipped} skipped");
+            }
             let _ = write!(
                 run.stdout,
-                "{passed} passed, {failed} failed ({} cases in {} file{})",
-                passed + failed,
+                " ({} cases in {} file{})",
+                passed + failed + skipped,
                 reports.len(),
                 if reports.len() == 1 { "" } else { "s" }
             );
@@ -175,6 +287,10 @@ fn render_coverage(out: &mut String, coverage: &testing::Coverage) {
 }
 
 fn render_case(out: &mut String, case: &CaseReport) {
+    if let Some(why) = &case.skipped {
+        let _ = writeln!(out, "  - {}  (skipped: {why})", case.name);
+        return;
+    }
     let mark = if case.passed { "\u{2713}" } else { "\u{2717}" };
     let detail = match &case.actual {
         Some(a) => {

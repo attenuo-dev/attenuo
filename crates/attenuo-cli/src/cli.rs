@@ -727,6 +727,23 @@ pub struct TestArgs {
     /// it), even if every case passed.
     #[arg(long)]
     pub fail_on_unexercised: bool,
+    /// Where the cases are decided: `local` (default, the in-process engine, offline) or
+    /// `authzen` (each case is sent to `POST /access/v1/evaluation` of the server named by the
+    /// global `--server`, with `--token` as the bearer).
+    #[arg(long, value_enum, default_value_t = Via::Local)]
+    pub via: Via,
+    /// With `--via authzen`: the delegation token whose chain makes every call.
+    #[command(flatten)]
+    pub token: TokenSource,
+}
+
+/// Where `policy test` decides the cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Via {
+    /// The in-process engine built from the test file (offline).
+    Local,
+    /// A running server's AuthZEN endpoint.
+    Authzen,
 }
 
 /// `policy evaluate`: the call, and the chain it is made for (from a token or a file).

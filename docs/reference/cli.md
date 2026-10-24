@@ -1,6 +1,6 @@
 # CLI commands
 
-The `attenuo` binary comes from the `attenuo-cli` crate. It talks to a running attenuo server over HTTP, except for `policy test` and `policy lint`, which run offline.
+The `attenuo` binary comes from the `attenuo-cli` crate. It talks to a running attenuo server over HTTP, except for `policy test` (unless `--via authzen`) and `policy lint`, which run offline.
 
 ```
 attenuo [--server URL] [--json] <command>
@@ -320,6 +320,14 @@ After the cases, the run lists the policies no case exercised: `N of M policies 
 | Option | Meaning |
 | --- | --- |
 | `--fail-on-unexercised` | Exit 2 when some policy was not exercised, even if every case passed. Off by default. |
+| `--via local\|authzen` | Where the cases are decided. `local` (default) builds the engine from the test file and runs offline. `authzen` sends each case to `POST /access/v1/evaluation` of the server named by the global `--server`, with the token below as the bearer. |
+| `--token <JWT\|->` (`ATTENUO_TOKEN`) / `--token-file PATH` / `--dpop-key PATH` | With `--via authzen`: the delegation token whose chain makes every call, and its DPoP key if it is bound to one. Refused without `--via authzen`. |
+
+With `--via authzen` the server decides with its own policies, catalog and clock, and takes the chain from the token, so the test file's `catalog`, `unknown_tools` and `now` do not apply (a `note:` says so for `now`), and the unexercised list is computed against the test file's local `policies` file. A case that sets something the endpoint cannot carry is skipped, not failed, and the run prints why: `session`, `approval`, `budget`, `usage` or `user.authenticated_at_unix`; a `user` other than the default that differs from the token's user (subject, issuer, attributes); a `chain` whose agents differ from the token's, or whose explicit `capabilities` differ from the token hop's. The summary then reads `N passed, M failed, K skipped`, and `--json` has `skipped` per file and in total. A refused token or an unreachable server stops that file with an error (exit 1). Each evaluation is a real decision, so the server writes an audit record for every case it decides.
+
+```sh
+attenuo --server https://attenuo.internal policy test --via authzen --token-file coder.jwt policy_test.yaml
+```
 
 ### `policy lint <POLICY>`
 

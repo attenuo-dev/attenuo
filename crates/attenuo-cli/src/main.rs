@@ -427,10 +427,39 @@ async fn run(cli: Cli) -> Result<Outcome> {
             }
             Ok(if ok { Outcome::Ok } else { Outcome::No })
         }
-        Command::Policy(PolicyCmd::Test(args)) => finish(
-            policy_cmd::test(&args.files, &policy_cmd::TestOptions::from(&args), json),
-            "policy test failed to run",
-        ),
+        Command::Policy(PolicyCmd::Test(args)) => {
+            let opts = policy_cmd::TestOptions::from(&args);
+            match args.via {
+                cli::Via::Local => {
+                    if args.token.token.is_some() || args.token.token_file.is_some() {
+                        anyhow::bail!("--token and --token-file need --via authzen");
+                    }
+                    finish(
+                        policy_cmd::test(&args.files, &opts, json),
+                        "policy test failed to run",
+                    )
+                }
+                cli::Via::Authzen => {
+                    let client = client?;
+                    let token = secrets::resolve_token(
+                        "--token",
+                        args.token.token,
+                        args.token.token_file.as_deref(),
+                        &mut stdin,
+                    )?;
+                    let key = dpop_key::load_opt(args.token.dpop_key.as_deref())?;
+                    let remote = policy_cmd::Remote {
+                        client: &client,
+                        token: &token,
+                        dpop_key: key.as_ref(),
+                    };
+                    finish(
+                        policy_cmd::test_authzen(&args.files, &remote, &opts, json).await,
+                        "policy test failed to run",
+                    )
+                }
+            }
+        }
         Command::Policy(PolicyCmd::Lint {
             policy,
             config,

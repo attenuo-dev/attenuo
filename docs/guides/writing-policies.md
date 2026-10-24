@@ -342,6 +342,22 @@ The last lines of a run list the policies that no case exercised, with the file 
 
 `--fail-on-unexercised` turns the list into a failure (exit `2`) for CI. With `--json` the same information is in `coverage`: `{"policies": 5, "exercised": 4, "unexercised": [{"id": "forbid_deep_chains", "file": "...", "line": 37}]}`.
 
+#### Against a running server
+
+The offline run proves the policy file. To check what a deployed server actually decides (its loaded policies, its catalog, its configuration), send the same cases to its AuthZEN endpoint:
+
+```sh
+attenuo --server https://attenuo.internal policy test --via authzen --token-file coder.jwt policy_test.yaml
+```
+
+Each case's call goes to `POST /access/v1/evaluation` with the token as the bearer, and the answer is compared with the case's `expect`, `reason` and `policy_ids` exactly as offline; the output and exit status are the same. The server takes the chain from the token, not from the case, and keeps the run's labels, approvals, budgets and usage itself. So a case runs only when what it describes is what the token is:
+
+- no `session`, `approval`, `budget`, `usage` or `user.authenticated_at_unix`;
+- a `user`, if the case sets one, equal to the token's user (subject, issuer and exactly the same attributes);
+- a `chain`, if the case sets one, naming the token's agents in order, with any explicit `capabilities` equal to that hop's capabilities in the token.
+
+Other cases are listed as skipped, with the reason, and do not fail the run. The file's `catalog`, `unknown_tools` and `now` are ignored, since the server uses its own. Every evaluation is a real decision, so each case leaves an audit record on that server; use a test token and a test run, not a production agent's token. The unexercised list still comes from the test file's local `policies` file, which may differ from what the server has loaded.
+
 The same runner is available as a library, `attenuo_policy::testing`, for tests written in Rust.
 
 ### Linting
