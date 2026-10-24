@@ -157,6 +157,7 @@ export const REASONS = {
   tool_not_in_catalog: 'The tool is not in the policy catalog and unknown tools are denied.',
   invalid_name: 'The server or tool name is not a valid name.',
   attribute_type_mismatch: 'A user attribute did not have the type the catalog declares.',
+  input_type_mismatch: 'A call argument did not have the type the catalog declares.',
   // Token checks at the proxy (attenuo-proxy auth).
   missing_token: 'The request carried no delegation token.',
   invalid_token: 'The token failed verification (signature, issuer, audience or chain).',

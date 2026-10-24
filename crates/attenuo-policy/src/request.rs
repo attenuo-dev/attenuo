@@ -155,6 +155,51 @@ pub(crate) fn check_user_attributes(
     Ok(())
 }
 
+/// Does a call argument have its declared type, read as Cedar will see it after
+/// [`to_cedar_json`]? Integers, and floats with no fractional part within range, are `Long`;
+/// `null` elements of a list are dropped. Anything else, an integer where a string is declared,
+/// a fraction or an out-of-range number where a long is, a single value where a set is, is a
+/// mismatch. Nothing is coerced.
+fn input_matches(value: &Value, ty: &ArgType) -> bool {
+    match (ty, value) {
+        (ArgType::String, Value::String(_)) | (ArgType::Bool, Value::Bool(_)) => true,
+        (ArgType::Long, Value::Number(n)) => {
+            n.is_i64()
+                || n.as_f64()
+                    .is_some_and(|f| f.is_finite() && f.fract() == 0.0 && f.abs() <= DECIMAL_MAX)
+        }
+        (ArgType::Set(inner), Value::Array(items)) => {
+            items.iter().all(|i| i.is_null() || input_matches(i, inner))
+        }
+        _ => false,
+    }
+}
+
+/// Check every argument the catalog declares a type for and the call carries, before Cedar.
+/// Absent and `null` arguments are fine (policies test presence with `has`); undeclared
+/// arguments are not checked and reach Cedar as they are. Without the check a wrongly typed
+/// argument reaches Cedar, where a policy that reads it raises a type error (`policy_error`)
+/// and one that does not lets it through to the upstream unread.
+pub(crate) fn check_tool_inputs(
+    arguments: &BTreeMap<String, Value>,
+    declared: &BTreeMap<String, ArgType>,
+) -> Result<(), String> {
+    for (name, ty) in declared {
+        let Some(value) = arguments.get(name) else {
+            continue;
+        };
+        if value.is_null() || input_matches(value, ty) {
+            continue;
+        }
+        return Err(format!(
+            "input.{name}: expected {}, got {}",
+            ty.cedar(),
+            type_name(value)
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn uid(ty: &str, id: &str) -> EntityUid {
     let ty: EntityTypeName = ty.parse().expect("entity type names used here are valid");
     EntityUid::from_type_name_and_id(ty, EntityId::new(id))
@@ -856,6 +901,75 @@ mod tests {
         assert!(check_user_attributes(&user_with(json!({"n": 3})), &long).is_ok());
         assert!(check_user_attributes(&user_with(json!({"n": 3.5})), &long).is_err());
         assert!(check_user_attributes(&user_with(json!({"n": "3"})), &long).is_err());
+    }
+
+    #[test]
+    fn declared_input_types_are_checked_as_cedar_sees_them() {
+        let decl: BTreeMap<String, ArgType> = [
+            ("repo".to_string(), ArgType::String),
+            ("n".to_string(), ArgType::Long),
+            ("flag".to_string(), ArgType::Bool),
+            ("tags".to_string(), ArgType::Set(Box::new(ArgType::String))),
+        ]
+        .into_iter()
+        .collect();
+        let args = |v: Value| -> BTreeMap<String, Value> {
+            v.as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
+        for ok in [
+            json!({}),
+            json!({"repo": "acme/api", "n": 3, "flag": false, "tags": ["a", "b"]}),
+            // Absent, null and undeclared arguments are not checked.
+            json!({"repo": null, "n": null, "other": 42}),
+            // Cedar sees these as Long, like `to_cedar_json` makes them.
+            json!({"n": -7}),
+            json!({"n": 5.0}),
+            // Null list elements are dropped before Cedar.
+            json!({"tags": ["a", null], "n": 0}),
+            json!({"tags": []}),
+        ] {
+            assert!(check_tool_inputs(&args(ok.clone()), &decl).is_ok(), "{ok}");
+        }
+        for (bad, why) in [
+            (json!({"repo": 42}), "input.repo: expected String, got long"),
+            (
+                json!({"repo": ["acme/api"]}),
+                "input.repo: expected String, got array",
+            ),
+            (
+                json!({"repo": {"a": 1}}),
+                "input.repo: expected String, got object",
+            ),
+            (json!({"n": "3"}), "input.n: expected Long, got string"),
+            (json!({"n": 3.5}), "input.n: expected Long, got number"),
+            (json!({"n": u64::MAX}), "input.n: expected Long, got number"),
+            (json!({"n": 1e300}), "input.n: expected Long, got number"),
+            (
+                json!({"flag": "true"}),
+                "input.flag: expected Bool, got string",
+            ),
+            (
+                json!({"tags": "a"}),
+                "input.tags: expected Set<String>, got string",
+            ),
+            (
+                json!({"tags": ["a", 1]}),
+                "input.tags: expected Set<String>, got array",
+            ),
+        ] {
+            assert_eq!(
+                check_tool_inputs(&args(bad.clone()), &decl).unwrap_err(),
+                why,
+                "{bad}"
+            );
+        }
+        // Nothing declared, nothing checked.
+        let none = BTreeMap::new();
+        assert!(check_tool_inputs(&args(json!({"repo": 42, "n": "x"})), &none).is_ok());
     }
 
     #[test]

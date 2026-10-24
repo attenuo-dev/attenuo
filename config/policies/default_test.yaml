@@ -139,13 +139,13 @@ cases:
     reason: policy_deny
     policy_ids: []
 
-  # The catalog declares repo as a string. A number reaches Cedar, the `like` raises a type
-  # error, and the engine fails closed instead of skipping the policy.
-  - name: a repo argument of the wrong type fails closed
+  # The catalog declares repo as a string. A number is refused at the boundary, before
+  # Cedar, so it never reaches the `like` (which would raise a type error).
+  - name: a repo argument of the wrong type is refused before Cedar
     chain: [assistant]
     call: { server: github, tool: create_issue, arguments: { repo: 42, title: hi } }
     expect: deny
-    reason: policy_error
+    reason: input_type_mismatch
     policy_ids: []
 
   - name: the acme rule names the github server only

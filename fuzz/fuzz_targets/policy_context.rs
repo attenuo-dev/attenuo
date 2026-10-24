@@ -136,6 +136,7 @@ const REASONS: &[&str] = &[
     attenuo_policy::REASON_CAPABILITY_DENIED,
     attenuo_policy::REASON_TOOL_NOT_IN_CATALOG,
     attenuo_policy::REASON_ATTRIBUTE_TYPE_MISMATCH,
+    attenuo_policy::REASON_INPUT_TYPE_MISMATCH,
     attenuo_policy::REASON_POLICY_ALLOW,
     attenuo_policy::REASON_POLICY_DENY,
     attenuo_policy::REASON_POLICY_ERROR,

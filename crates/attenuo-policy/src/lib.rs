@@ -22,7 +22,12 @@
 //! `email` and anything added with [`PolicyEngineBuilder::with_user_attr`]) are enforced at
 //! this boundary: a value of another type is denied with reason `attribute_type_mismatch`
 //! rather than passed on, because Cedar's `!=` across types is `true` and would let a
-//! `!= "suspended"` permit fire on `["suspended"]`. Nothing is coerced.
+//! `!= "suspended"` permit fire on `["suspended"]`. Nothing is coerced. Call arguments get the
+//! same treatment against the types the catalog declares in [`ToolAttrs::inputs`]: a present,
+//! non-null argument of another type is denied with reason `input_type_mismatch` before Cedar
+//! (an integral number, `5.0` included, is a `long`). Arguments the catalog declares no type
+//! for, and every argument of a tool evaluated under [`UnknownTools::Sensitive`] or
+//! [`UnknownTools::Allow`], are passed to Cedar unchecked.
 //!
 //! # Request shape
 //!
@@ -267,6 +272,10 @@ pub const REASON_INVALID_NAME: &str = "invalid_name";
 /// Reason code when an originating-user attribute does not have its declared type (SR-33).
 pub const REASON_ATTRIBUTE_TYPE_MISMATCH: &str = "attribute_type_mismatch";
 
+/// Reason code when a call argument does not have the type the catalog declares for it
+/// ([`ToolAttrs::inputs`]). Decided before Cedar, so never `policy_error`.
+pub const REASON_INPUT_TYPE_MISMATCH: &str = "input_type_mismatch";
+
 /// Reason code when Cedar denies only through forbids annotated `@obligation("approval")`
 /// and would allow without them (ADR-0009). Always a deny.
 pub const REASON_APPROVAL_REQUIRED: &str = "approval_required";
@@ -457,7 +466,7 @@ pub enum PolicyError {
 pub struct Outcome {
     pub decision: Decision,
     /// One of `invalid_name`, `capability_denied`, `tool_not_in_catalog`, `attribute_type_mismatch`,
-    /// `policy_allow`, `policy_deny`, `approval_required`, `policy_error`.
+    /// `input_type_mismatch`, `policy_allow`, `policy_deny`, `approval_required`, `policy_error`.
     pub reason: String,
     /// Ids of the policies that determined the decision (permits that matched for an allow,
     /// forbids that matched for a deny, the approval forbids for `approval_required`). Empty
@@ -970,6 +979,14 @@ impl PolicyEngine {
         // a string is declared) would make `attributes.status != "suspended"` permit.
         if let Err(e) = request::check_user_attributes(&chain.originating_user, &self.user_attrs) {
             return Outcome::deny(REASON_ATTRIBUTE_TYPE_MISMATCH, vec![e]);
+        }
+
+        // Stage 1d: declared argument types, for the same reason. A number where the catalog
+        // declares a string would otherwise make `like` raise a type error (`policy_error`),
+        // or pass unread to the upstream when no policy tests it. A tool the catalog does not
+        // know, or an argument it declares no type for, is not checked.
+        if let Err(e) = request::check_tool_inputs(&call.arguments, &attrs.inputs) {
+            return Outcome::deny(REASON_INPUT_TYPE_MISMATCH, vec![e]);
         }
 
         // Stage 2: Cedar.
