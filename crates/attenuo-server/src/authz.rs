@@ -1415,6 +1415,38 @@ impl Pipeline {
         id
     }
 
+    /// Record that upstream `server` opened the MCP session whose digest is `session` for a
+    /// caller of `chain` (`LeaseStore::record_session` with the chain id), so
+    /// `POST /admin/leases/revoke` can find the chain by session. Best effort: a failure is
+    /// logged and the session stays usable; revoking by chain id still works.
+    pub fn record_session(
+        &self,
+        chain: &DelegationChain,
+        server: &str,
+        session: &str,
+        now: OffsetDateTime,
+    ) {
+        let Some(root) = chain.hops.first().map(|h| &h.lease) else {
+            return;
+        };
+        let tag = session.get(..12).unwrap_or(session);
+        match self.leases.record_session(session, server, root, now) {
+            // Server is caller-controlled (the URL path): Debug-format it (SR-18).
+            Ok(true) => {
+                tracing::debug!(session = %tag, server = ?server, chain_id = ?root.0, "session bound to its chain")
+            }
+            Ok(false) => {
+                tracing::debug!(session = %tag, server = ?server, "session binding already recorded")
+            }
+            Err(e) => tracing::error!(
+                error = %e,
+                session = %tag,
+                server = ?server,
+                "session binding not recorded; this session cannot be revoked by id"
+            ),
+        }
+    }
+
     /// `Ok` when every lease in the chain is live; otherwise the reason code and details.
     pub fn check_leases(
         &self,
@@ -1778,6 +1810,24 @@ impl Authorizer for ServerAuthorizer {
         let (chain, call, reason) = (chain.clone(), call.clone(), reason.to_string());
         on_blocking_pool(&self.pipeline, move |p| {
             p.record_rejection(&chain, &call, &reason, now)
+        })
+        .await
+    }
+
+    async fn record_session(
+        &self,
+        chain: &DelegationChain,
+        server: &str,
+        session_digest: &str,
+        now: OffsetDateTime,
+    ) {
+        let (chain, server, session) = (
+            chain.clone(),
+            server.to_string(),
+            session_digest.to_string(),
+        );
+        on_blocking_pool(&self.pipeline, move |p| {
+            p.record_session(&chain, &server, &session, now)
         })
         .await
     }
