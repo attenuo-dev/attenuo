@@ -825,6 +825,15 @@ struct WalShared {
     interval: Duration,
     /// The database file.
     path: PathBuf,
+    /// A descriptor of the database file, opened once and kept for as long as the thread
+    /// runs, to sync the file before a locked pass ([`wal_round`]). Never open and close one
+    /// per sync: closing any descriptor of a file releases every POSIX lock the process holds
+    /// on it, including the SHARED lock SQLite keeps on the database file in WAL mode, and
+    /// SQLite does not take it again. Another process could then take the WAL for unused,
+    /// checkpoint it and delete it under the live store (SR-58). Dropped last, when the thread
+    /// ends after its final checkpoint. `None` when the file could not be opened (the sync is
+    /// skipped). The WAL file carries no such lock, so it is opened per sync.
+    db_file: Option<std::fs::File>,
 }
 
 impl WalCheckpointer {
@@ -838,12 +847,24 @@ impl WalCheckpointer {
     ) -> Result<Self, AuditError> {
         let (msgs, rx) = channel;
         let conn = Arc::new(Mutex::new(conn));
+        let db_file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!("attenuo-audit: cannot open the database file to sync it: {e}");
+                None
+            }
+        };
         let shared = WalShared {
             conn: Arc::clone(&conn),
             store,
             activity: Arc::clone(&activity),
             interval,
             path,
+            db_file,
         };
         let thread = std::thread::Builder::new()
             .name("attenuo-audit-wal".into())
@@ -910,10 +931,10 @@ fn wal_loop(shared: &WalShared, msgs: &mpsc::Receiver<WalMsg>) {
     }
 }
 
-/// `fsync` the file at `path` (the database file or its WAL) from a descriptor of our own:
-/// it writes out every dirty page of that file, whichever connection wrote it. Used before
-/// the locked pass of a checkpoint round (see [`wal_round`]) and before a signed audit
-/// checkpoint (see [`CHECKPOINT_PRESYNC_LEAD`]).
+/// `fsync` the file at `path` (the WAL) from a descriptor of our own: it writes out every
+/// dirty page of that file, whichever connection wrote it. Used before a signed audit
+/// checkpoint (see [`CHECKPOINT_PRESYNC_LEAD`]). Never for the database file itself, whose
+/// descriptor must not be closed while the store is open (see `WalShared::db_file`, SR-58).
 fn sync_file_data(path: &Path) -> std::io::Result<()> {
     std::fs::OpenOptions::new()
         .read(true)
@@ -997,7 +1018,11 @@ fn wal_round(shared: &WalShared) -> Result<(), AuditError> {
         // median on the dev VM for one client). Sync them here first, so the locked pass syncs only what it
         // copies itself. An extra sync: no commit becomes less durable.
         if presync_enabled(activity) {
-            let synced = sync_file_data(&shared.path);
+            // The kept descriptor, never a new one (SR-58).
+            let synced = match &shared.db_file {
+                Some(f) => f.sync_data(),
+                None => Err(std::io::Error::other("the database file is not open")),
+            };
             if let Err(e) = &synced {
                 eprintln!("attenuo-audit: syncing the database file failed: {e}");
             }
