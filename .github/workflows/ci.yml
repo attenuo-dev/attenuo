@@ -108,6 +108,10 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # and exits non-zero if any step of the scenario does not come out as expected.
       - run: bash examples/github-leak-demo/run.sh
+      # The multi-hop delegation demo (planner -> coder -> GitHub tool), the same way: it reuses
+      # the binaries built above and fails on any step, audit count or upstream count that differs.
+      - name: Multi-hop delegation demo
+        run: bash examples/multi-hop-demo/run.sh
       # The admin console listener against the real binary: page and CSP, admin token, no dev mint.
       - name: Admin console smoke test
         run: bash scripts/admin-ui-smoke.sh
@@ -152,7 +156,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: attenuo policy test
-        run: cargo run --locked -q -p attenuo-cli -- policy test examples/github-leak-demo/policy_test.yaml
+        run: cargo run --locked -q -p attenuo-cli -- policy test examples/github-leak-demo/policy_test.yaml examples/multi-hop-demo/policy_test.yaml
       - name: attenuo policy test (config/policies)
         run: cargo run --locked -q -p attenuo-cli -- policy test --fail-on-unexercised config/policies/*_test.yaml
 

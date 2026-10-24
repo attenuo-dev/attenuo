@@ -1,0 +1,81 @@
+# attenuo-server config for the multi-hop delegation demo (see README.md).
+#
+# run.sh copies this file, rewrites the two ports and the policy path, and starts the server
+# from the copy. Nothing here is secret: the admin token and agent secrets are demo values that
+# are accepted only because the server listens on loopback.
+
+[server]
+listen = "127.0.0.1:18090"
+
+[issuer]
+issuer = "http://127.0.0.1:18090"
+audience = "attenuo"
+default_ttl_seconds = 900
+# No key path: an ephemeral key per start, which is what a throwaway demo wants.
+
+[policy]
+policies_path = "examples/multi-hop-demo/policy.cedar"
+
+# The tools of the fake GitHub MCP server. run.sh starts it with these names, which are the
+# real GitHub MCP server's (the real one takes `owner` and `repo` separately; here `repo` is
+# `owner/name`). Every action a policy names must be in the catalog, with the argument types it
+# tests.
+[policy.catalog.github.get_file_contents]
+readonly = true
+inputs = { repo = "string", path = "string" }
+
+[policy.catalog.github.list_issues]
+readonly = true
+inputs = { repo = "string" }
+
+[policy.catalog.github.create_issue]
+inputs = { repo = "string", title = "string" }
+
+[policy.catalog.github.create_or_update_file]
+inputs = { repo = "string", path = "string", branch = "string", content = "string" }
+
+[audit]
+sqlite_path = ":memory:"
+
+[[upstreams]]
+name = "github"
+url = "http://127.0.0.1:13002/mcp"
+
+[admin]
+# A placeholder is accepted only because listen is loopback (the server warns). Never reuse it.
+token = "demo-admin-token"
+
+# Hop 1, the planner, acting for alice: the ceiling of what its root token can carry. It may
+# read repositories and issues, open issues and write files, all only under acme/. may_act is
+# the ceiling for who may exchange the root token next: only the coder.
+[[root_grants]]
+subject = "alice"
+issuer = "https://idp.example"
+agent = "planner"
+may_act = ["coder"]
+capabilities = [
+  { server = "github", tool = "get_file_contents", constraints = { repo = { op = "prefix", value = "acme/" } } },
+  { server = "github", tool = "list_issues", constraints = { repo = { op = "prefix", value = "acme/" } } },
+  { server = "github", tool = "create_issue", constraints = { repo = { op = "prefix", value = "acme/" } } },
+  { server = "github", tool = "create_or_update_file", constraints = { repo = { op = "prefix", value = "acme/" } } },
+]
+
+# Hop 2, the coder. Token exchanges authenticate the actor ([token] require_actor_auth, on by
+# default), so only the coder can receive a token in its name.
+# secret_sha256 = printf %s demo-coder-secret | sha256sum
+[[agents]]
+id = "coder"
+secret_sha256 = "f0f962bada9d92c8a30f5c55a388ce47d1074ddff4bfdb099ef67ad43003baeb"
+
+# The agent the coder tries to hand its token to. It authenticates fine; the coder's token
+# says that nobody may exchange it.
+# secret_sha256 = printf %s demo-reviewer-secret | sha256sum
+[[agents]]
+id = "reviewer"
+secret_sha256 = "4f96032df862eac5af33b4b1861e670b667b7b20ba48fffef2431b554433b245"
+
+# Demo only: mounts POST /admin/root-token so step 1 works without an identity provider.
+# Real deployments leave this off and mint root tokens at POST /token from an OIDC ID token or
+# an ID-JAG (hop-0 intake, an RFC 8693 exchange too).
+[dev]
+allow_root_mint = true

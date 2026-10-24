@@ -69,7 +69,7 @@ book() {
   rm -rf "$out"
 }
 policy() {
-  cargo run -q --locked -p attenuo-cli -- policy test examples/github-leak-demo/policy_test.yaml
+  cargo run -q --locked -p attenuo-cli -- policy test examples/github-leak-demo/policy_test.yaml examples/multi-hop-demo/policy_test.yaml
   cargo run -q --locked -p attenuo-cli -- policy test --fail-on-unexercised config/policies/*_test.yaml
 }
 suite()   { "$PYTHON" -m pytest evaluation/injection-suite -q -rf; }
