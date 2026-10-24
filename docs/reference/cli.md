@@ -160,9 +160,9 @@ List the tools the token may see (`tools/list`). Takes `--token` (or `--token-fi
 
 Revoke a lease and every lease delegated from it. Needs the admin token.
 
-### `lease revoke --user SUB | --chain-id ID [--preview] [--reason TEXT]`
+### `lease revoke --user SUB | --chain-id ID | --session ID [--preview] [--reason TEXT]`
 
-Revoke every unrevoked lease of one originating user (`--user`, the `sub` of the chain's originating user) or of one delegation chain (`--chain-id`, the `chain_id` of its audit records, which is its first hop's lease), each with everything delegated from it ([`POST /admin/leases/revoke`](http-api.md#revoke-by-user-or-chain)). Give exactly one of a lease id, `--user` and `--chain-id`. `--preview` lists what would be revoked and changes nothing. Leases registered before the server recorded subjects have none, so `--user` does not find them; `--chain-id` does. Needs the admin token.
+Revoke every unrevoked lease of one originating user (`--user`, the `sub` of the chain's originating user), of one delegation chain (`--chain-id`, the `chain_id` of its audit records, which is its first hop's lease) or of the chain that opened one MCP session through the proxy (`--session`, the raw `Mcp-Session-Id`), each with everything delegated from it ([`POST /admin/leases/revoke`](http-api.md#revoke-by-user-or-chain)). Give exactly one of a lease id, `--user`, `--chain-id` and `--session`. `--preview` lists what would be revoked and changes nothing. Leases registered before the server recorded subjects have none, so `--user` does not find them; `--chain-id` does. Needs the admin token.
 
 ```text
 $ attenuo lease revoke --user alice@example.com --reason "laptop stolen"
@@ -177,6 +177,21 @@ audit     3f2a...
 ```
 
 The matches come first, then the descendants the cascade reached. With `--preview` the output starts with `preview: nothing was changed`, says `would revoke`, and has no reason or audit line. `--json` prints the server's answer.
+
+With `--session` the server hashes the id and resolves it to the chain that opened the session ([Revoke by session](http-api.md#revoke-by-session)). The output names the session by its audit tag, never the id, and adds a `chains` line:
+
+```text
+$ attenuo lease revoke --session 3b9f0c1e-... --preview
+preview: nothing was changed
+selector  session 9c2e41d07a5b
+chains    6f1c...
+matched   2 lease(s)
+would revoke 2 lease(s)
+  6f1c...
+  a93d...
+```
+
+A session the server has no record of prints `chains    none recorded for this session` and matches nothing. The id is a command-line argument, so it lands in shell history; it is useless without the session owner's token (SR-11), and after the revocation that token's chain is dead.
 
 ### `lease show <ID>`
 

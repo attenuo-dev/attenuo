@@ -240,13 +240,17 @@ async fn run(cli: Cli) -> Result<Outcome> {
             id: None,
             user,
             chain_id,
+            session,
             preview,
             reason,
         }) => {
-            let mut body = match (user, chain_id) {
-                (Some(u), None) => json!({ "user": u }),
-                (None, Some(c)) => json!({ "chain_id": c }),
-                _ => anyhow::bail!("give exactly one of a lease id, --user or --chain-id"),
+            let mut body = match (user, chain_id, session) {
+                (Some(u), None, None) => json!({ "user": u }),
+                (None, Some(c), None) => json!({ "chain_id": c }),
+                (None, None, Some(s)) => json!({ "session": s }),
+                _ => {
+                    anyhow::bail!("give exactly one of a lease id, --user, --chain-id or --session")
+                }
             };
             if let Some(r) = reason {
                 body["reason"] = json!(r);

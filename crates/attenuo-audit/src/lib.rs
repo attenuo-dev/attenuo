@@ -40,7 +40,7 @@ pub use export::{
 };
 pub use lease::{
     LeaseNode, LeaseSelector, LeaseStatus, LeaseStore, LeaseSubtree, MemoryLeaseStore, RunLabel,
-    SelectorRevocation,
+    SelectorRevocation, SessionBinding,
 };
 pub use log::{
     canonical_record_json, compute_entry_hash, entry_hash_from_json, verify_entries, AuditEntry,
