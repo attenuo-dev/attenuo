@@ -1262,6 +1262,7 @@ async fn screen_message(
             verdict.decision_id,
             &call.call_hash(),
             verdict.approval.as_ref(),
+            verdict.untrusted_args.as_ref(),
         ));
     } else {
         out.replies.push(denied_response_with(
@@ -1269,6 +1270,7 @@ async fn screen_message(
             &verdict.reason,
             verdict.decision_id,
             verdict.limit.as_ref(),
+            verdict.untrusted_args.as_ref(),
         ));
     }
 }

@@ -54,8 +54,8 @@
 //!   "session_id": "s-123",
 //!   "now_unix": 1760000100,
 //!   "session": { "tainted": true, "tainted_by": ["web/fetch"] },
-//!   "args_contain_untrusted": false,
-//!   "untrusted_args": [],
+//!   "args_contain_untrusted": true,
+//!   "untrusted_args": ["body"],
 //!   "approval": { "present": false, "by": "" },
 //!   "budget": {
 //!     "limited": false,
@@ -72,8 +72,11 @@
 //! (or when its taint state could not be read), and `session.tainted_by` names the sources as
 //! `"<server>/<tool>"`. They come from [`CallLabels`], which
 //! [`PolicyEngine::authorize_labelled`] takes; [`PolicyEngine::authorize`] evaluates an
-//! untainted run. `args_contain_untrusted` is always `false` and `untrusted_args` always
-//! empty until argument matching is built. `approval.present` is `true` only when the call
+//! untainted run. `untrusted_args` names the arguments of the call that carry a verbatim span
+//! of an untrusted result of the run (phase 2: the server's span index, matched only for a
+//! destructive tool on a tainted run, with arguments pinned by `equals` or `one_of` exempt),
+//! and `args_contain_untrusted` is `true` when there is at least one ([`ArgLabels`]); both
+//! come from [`CallLabels::args`]. `approval.present` is `true` only when the call
 //! carries a granted approval for its exact call hash ([`ApprovalContext`]), with
 //! `approval.by` set to `user` or `operator`; otherwise it is `false` and `by` is empty.
 //!
@@ -291,6 +294,29 @@ impl SessionLabels {
     }
 }
 
+/// `context.args_contain_untrusted` and `context.untrusted_args` (output labelling phase 2,
+/// ADR-0009): which arguments of the call matched an untrusted result of the run. The default
+/// is no match.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArgLabels {
+    /// `context.args_contain_untrusted`. True when `untrusted` is non-empty; a policy test may
+    /// also set it alone.
+    pub contain_untrusted: bool,
+    /// `context.untrusted_args`: the top-level names of the arguments that matched.
+    pub untrusted: BTreeSet<String>,
+}
+
+impl ArgLabels {
+    /// These arguments matched; `contain_untrusted` when there is at least one.
+    pub fn from_args<S: Into<String>>(args: impl IntoIterator<Item = S>) -> Self {
+        let untrusted: BTreeSet<String> = args.into_iter().map(Into::into).collect();
+        Self {
+            contain_untrusted: !untrusted.is_empty(),
+            untrusted,
+        }
+    }
+}
+
 /// The per-call inputs to the Cedar context that the server computes from run state: output
 /// labelling (ADR-0009) and run limits (ADR-0010). The default is an untainted run with no
 /// limit.
@@ -298,6 +324,8 @@ impl SessionLabels {
 pub struct CallLabels {
     /// `context.session`.
     pub session: SessionLabels,
+    /// `context.args_contain_untrusted` and `context.untrusted_args`.
+    pub args: ArgLabels,
     /// `context.approval`.
     pub approval: ApprovalContext,
     /// `context.budget`, and a refusal from the run-limit check.

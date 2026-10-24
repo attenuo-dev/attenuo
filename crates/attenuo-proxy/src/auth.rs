@@ -30,6 +30,10 @@ pub struct AuthDecision {
     /// For a `budget_exhausted` decision: the run limit that was hit, `{hop, kind, arg, max,
     /// used}` (ADR-0010), which the `-32003` error data carries as `limit`. `None` otherwise.
     pub limit: Option<serde_json::Value>,
+    /// The arguments that matched an untrusted result of the run, `[{arg, seq, kind}]`
+    /// (ADR-0009 phase 2), which the `-32008` and `-32003` error data carry as
+    /// `untrusted_args`. `None` when none matched.
+    pub untrusted_args: Option<serde_json::Value>,
 }
 
 /// The `params._meta` key that carries a signed approval token (output labelling, ADR-0009).
@@ -65,6 +69,7 @@ impl AuthDecision {
             decision_id,
             approval: None,
             limit: None,
+            untrusted_args: None,
         }
     }
 
@@ -75,6 +80,7 @@ impl AuthDecision {
             decision_id,
             approval: None,
             limit: None,
+            untrusted_args: None,
         }
     }
 
@@ -87,6 +93,12 @@ impl AuthDecision {
     /// Attach the run limit a `budget_exhausted` decision hit.
     pub fn with_limit(mut self, limit: Option<serde_json::Value>) -> Self {
         self.limit = limit;
+        self
+    }
+
+    /// Attach the arguments that matched an untrusted result (`[{arg, seq, kind}]`).
+    pub fn with_untrusted_args(mut self, untrusted_args: Option<serde_json::Value>) -> Self {
+        self.untrusted_args = untrusted_args;
         self
     }
 

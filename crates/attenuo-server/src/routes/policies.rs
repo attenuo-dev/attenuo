@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use attenuo_core::{DelegationChain, ToolCall};
 use attenuo_policy::authzen::{self, EvaluationRequest};
-use attenuo_policy::{CallLabels, SessionLabels};
+use attenuo_policy::{ArgLabels, CallLabels, SessionLabels};
 use attenuo_token::{TokenError, VerifiedToken, Verifier};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -212,15 +212,21 @@ pub async fn evaluate_policies(
         }
     };
 
-    // Output labels (ADR-0009): as given, or else the run's current taint state.
-    let (session, session_source) = match session {
-        Some(s) => (s, "request"),
-        None => (state.pipeline.run_labels(&chain).session, "store"),
+    // Output labels (ADR-0009): as given, or else the run's current taint state and, for a
+    // destructive call on a tainted run, the arguments that match its span index now.
+    let (session, args, session_source) = match session {
+        Some((s, args)) => (s, args, "request"),
+        None => {
+            let s = state.pipeline.run_labels(&chain).session;
+            let args = state.pipeline.arg_taint(&chain, &call, &s).context;
+            (s, args, "store")
+        }
     };
     // Run limits (ADR-0010): the counters as they are now. Read, never charged.
     let budget = state.pipeline.budget_view(&chain, &call);
     let labels = CallLabels {
         session: session.clone(),
+        args: args.clone(),
         approval: approval.clone(),
         budget: budget.context.clone(),
     };
@@ -236,6 +242,8 @@ pub async fn evaluate_policies(
         "session": {
             "tainted": session.tainted,
             "tainted_by": session.tainted_by,
+            "args_contain_untrusted": args.contain_untrusted,
+            "untrusted_args": args.untrusted,
             "source": session_source,
         },
         "approval": { "present": approval.present, "by": approval.by },
@@ -248,34 +256,48 @@ pub async fn evaluate_policies(
 }
 
 /// The optional `session` member of a dry run: `{"tainted_by": ["<server>/<tool>", ...],
-/// "tainted": bool}`. `tainted` defaults to whether `tainted_by` is non-empty.
-fn session_from_json(v: &Value) -> Result<SessionLabels, ApiError> {
+/// "tainted": bool, "untrusted_args": ["<argument>", ...], "args_contain_untrusted": bool}`.
+/// `tainted` defaults to whether `tainted_by` is non-empty, `args_contain_untrusted` to
+/// whether `untrusted_args` is (ADR-0009 phase 2); either may be set `true` alone.
+fn session_from_json(v: &Value) -> Result<(SessionLabels, ArgLabels), ApiError> {
     let bad = |m: &str| ApiError::bad_request("invalid_request", format!("`session`: {m}"));
     let obj = v.as_object().ok_or_else(|| bad("expected an object"))?;
-    let mut sources = Vec::new();
-    match obj.get("tainted_by") {
-        None | Some(Value::Null) => {}
-        Some(Value::Array(items)) => {
-            for item in items {
-                sources.push(
-                    item.as_str()
-                        .ok_or_else(|| bad("`tainted_by` must be a list of strings"))?
-                        .to_owned(),
-                );
-            }
+    let strings = |key: &str| -> Result<Vec<String>, ApiError> {
+        let msg = format!("`{key}` must be a list of strings");
+        match obj.get(key) {
+            None | Some(Value::Null) => Ok(Vec::new()),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|i| i.as_str().map(str::to_owned).ok_or_else(|| bad(&msg)))
+                .collect(),
+            Some(_) => Err(bad(&msg)),
         }
-        Some(_) => return Err(bad("`tainted_by` must be a list of strings")),
+    };
+    let flag = |key: &str| -> Result<Option<bool>, ApiError> {
+        match obj.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Bool(b)) => Ok(Some(*b)),
+            Some(_) => Err(bad(&format!("`{key}` must be a boolean"))),
+        }
+    };
+    let mut session = SessionLabels::from_sources(strings("tainted_by")?);
+    if let Some(t) = flag("tainted")? {
+        session.tainted = t || !session.tainted_by.is_empty();
     }
-    let mut session = SessionLabels::from_sources(sources);
-    match obj.get("tainted") {
-        None | Some(Value::Null) => {}
-        Some(Value::Bool(t)) => session.tainted = *t || !session.tainted_by.is_empty(),
-        Some(_) => return Err(bad("`tainted` must be a boolean")),
+    let mut args = ArgLabels::from_args(strings("untrusted_args")?);
+    if let Some(c) = flag("args_contain_untrusted")? {
+        args.contain_untrusted = c || !args.untrusted.is_empty();
     }
-    if let Some(k) = obj.keys().find(|k| *k != "tainted" && *k != "tainted_by") {
+    const KNOWN: [&str; 4] = [
+        "tainted",
+        "tainted_by",
+        "untrusted_args",
+        "args_contain_untrusted",
+    ];
+    if let Some(k) = obj.keys().find(|k| !KNOWN.contains(&k.as_str())) {
         return Err(bad(&format!("unknown member `{k}`")));
     }
-    Ok(session)
+    Ok((session, args))
 }
 
 fn chain_and_call(req: &EvaluationRequest) -> Result<(DelegationChain, ToolCall), ApiError> {

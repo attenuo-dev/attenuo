@@ -28,6 +28,12 @@ these arms:
 ``attenuo_labels_limits``  ``attenuo_labels`` plus the same rule. Approvals are settled as in
                        the labels arm, so a granted retry is charged, and a retry over a limit
                        is ``denied`` with ``retry_reason`` ``budget_exhausted``.
+``attenuo_labels_args``  as ``attenuo``, plus ``policies/labels-args.cedar`` instead of
+                       ``labels.cedar``: ask only when an argument of a destructive call copies
+                       an unpinned value or span of an untrusted result (option (b), output
+                       labelling phase 2). Approvals are settled as in the labels arm. Runs only
+                       when the probe's ``-32008`` names the copied argument in
+                       ``untrusted_args``; skipped otherwise.
 
 No LLM is involved. See README.md for the method and its limits.
 """
@@ -114,6 +120,7 @@ ARMS = (
     "attenuo_labels",
     "attenuo_limits",
     "attenuo_labels_limits",
+    "attenuo_labels_args",
 )
 PROXIED = ARMS[1:]
 CONSTRAINED_ARMS = (
@@ -122,9 +129,14 @@ CONSTRAINED_ARMS = (
     "attenuo_labels",
     "attenuo_limits",
     "attenuo_labels_limits",
+    "attenuo_labels_args",
 )
-LABEL_ARMS = ("attenuo_labels", "attenuo_labels_limits")
+# Arms that load an @obligation("approval") policy and settle -32008 with the scripted approver.
+LABEL_ARMS = ("attenuo_labels", "attenuo_labels_limits", "attenuo_labels_args")
 LABELS_POLICY = POLICIES_DIR / "labels.cedar"
+# Option (b), argument-level taint (docs/design/output-labelling.md section 3.4).
+ARG_LABEL_ARMS = ("attenuo_labels_args",)
+LABELS_ARGS_POLICY = POLICIES_DIR / "labels-args.cedar"
 # Run limits (docs/design/run-limits.md section 6): these arms add the frozen rule's limits to
 # every capability that is not a read.
 LIMIT_ARMS = ("attenuo_limits", "attenuo_labels_limits")
@@ -555,6 +567,11 @@ def agent_ids(suites: list[Suite]) -> list[str]:
     return sorted(names)
 
 
+def labels_policy(arm: str) -> Path:
+    """The output-labelling policy file a labels arm loads."""
+    return LABELS_ARGS_POLICY if arm in ARG_LABEL_ARMS else LABELS_POLICY
+
+
 def write_config(
     work: Path,
     env: list[Suite],
@@ -570,7 +587,8 @@ def write_config(
     else:
         text = "\n".join(f"// ---- suite {s.name} ----\n{s.policy}" for s in env)
         if arm in LABEL_ARMS:
-            text += f"\n// ---- output labelling ----\n{LABELS_POLICY.read_text()}"
+            labels = labels_policy(arm)
+            text += f"\n// ---- output labelling ({labels.name}) ----\n{labels.read_text()}"
         policy.write_text(text)
     secret_sha = hashlib.sha256(AGENT_SECRET.encode()).hexdigest()
     lines = [
@@ -764,8 +782,8 @@ def server(
         first = next((ln for ln in lines if "error" in ln), lines[0] if lines else "no output")
         first = first[first.find("error") :] if "error" in first else first  # drop the tmp path
         raise ArmUnsupported(
-            "`attenuo policy lint` rejects policies/labels.cedar, so this server has no "
-            f"output-labelling attributes ({first})"
+            f"`attenuo policy lint` rejects policies/{labels_policy(arm).name}, so this server "
+            f"has no output-labelling attributes ({first})"
         )
     if lint.returncode != 0:
         raise RuntimeError(f"policy lint failed for arm {arm}:\n{lint.stdout}{lint.stderr}")
@@ -1357,6 +1375,50 @@ def probe_limits(stack: Stack, all_upstreams: list[str]) -> str | None:
     return limits_probe_verdict(msgs[1])
 
 
+def probe_arg_taint(stack: Stack, all_upstreams: list[str]) -> str | None:
+    """None if the server matches a destructive call's argument against an earlier untrusted
+    result (output labelling phase 2), else why the argument-taint arm cannot run. The read
+    carries an extra argument that the catalog ignores and the fake upstream echoes, so its
+    result holds the value the write then copies. Uses its own root token."""
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    try:
+        root = admin.mint_root_dev(USER, USER_ISSUER, ROOT_AGENT, [f"{u}:*" for u in all_upstreams])
+    finally:
+        admin.close()
+    headers = {
+        "accept": "application/json, text/event-stream",
+        "content-type": "application/json",
+        "authorization": f"Bearer {root}",
+    }
+    read = Call("get_most_recent_transactions", {"n": 1, "probe": "1 Probe Road"}, "benign",
+                "allow", None)  # fmt: skip
+    write = Call("update_user_info", {"street": "1 Probe Road", "city": "Leeds"}, "benign",
+                 "allow", None)  # fmt: skip
+    msgs: list[dict[str, Any] | None] = []
+    with httpx.Client(timeout=10) as http:
+        for i, c in enumerate((read, write), start=1):
+            resp = http.post(f"{stack.url}/mcp/banking", json=_rpc_body(c, i), headers=headers)
+            msgs.append(next(iter(_parse_messages(resp)), None))
+    return arg_taint_probe_verdict(msgs[1])
+
+
+def arg_taint_probe_verdict(reply: dict[str, Any] | None) -> str | None:
+    """None if ``reply`` is ``-32008`` whose data names ``street`` in ``untrusted_args``."""
+    why = approval_probe_verdict(reply)
+    if why:
+        return why.replace("after an untrusted read", "copying an untrusted result")
+    data: dict[str, Any] = (reply or {})["error"]["data"]
+    args = data.get("untrusted_args")
+    if isinstance(args, list) and any(
+        isinstance(a, dict) and a.get("arg") == "street" for a in args
+    ):
+        return None
+    return (
+        "the server's -32008 for an argument copied from an untrusted result does not name it "
+        "in data.untrusted_args (no argument-level taint)"
+    )
+
+
 def limits_probe_verdict(reply: dict[str, Any] | None) -> str | None:
     """None if ``reply`` (to the probe's second call on a one-call budget) is ``-32003
     budget_exhausted``."""
@@ -1514,7 +1576,11 @@ def run(
                             why = probe_limits(stack, all_upstreams)
                             if why:
                                 raise ArmUnsupported(why)
-                        if arm in LABEL_ARMS:
+                        if arm in ARG_LABEL_ARMS:
+                            why = probe_arg_taint(stack, all_upstreams)
+                            if why:
+                                raise ArmUnsupported(why)
+                        elif arm in LABEL_ARMS:
                             why = probe_approval(stack, all_upstreams)
                             if why:
                                 raise ArmUnsupported(why)

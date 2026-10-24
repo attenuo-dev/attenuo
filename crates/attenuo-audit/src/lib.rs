@@ -23,6 +23,7 @@ pub mod log;
 pub mod memory;
 pub mod query;
 pub mod shipped;
+pub mod spans;
 pub mod sqlite;
 
 pub use approval::{Approval, ApprovalLabel, ApprovalMethod, ApprovalState, Approver};
@@ -48,6 +49,7 @@ pub use shipped::{
     checkpoint_sha256, cross_check, parse_shipped, CrossCheckReport, ShippedCheckpoint,
     ShippedLine, ShippedMismatch, SHIPPED_FORMAT,
 };
+pub use spans::{SpanHit, MAX_SPANS_PER_RUN};
 #[cfg(feature = "testing")]
 #[doc(hidden)]
 pub use sqlite::WalTimings;

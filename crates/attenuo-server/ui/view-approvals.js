@@ -8,6 +8,7 @@ import {
   h, append, replace, link, mono, time, pill, empty, loading, kv, table, jsonTree,
 } from './dom.js';
 import { api, qs, showNotice } from './api.js';
+import { untrustedArgs } from './view-entry.js';
 
 const STATE_KIND = { pending: 'expired', granted: 'allow', declined: 'deny', consumed: 'active' };
 
@@ -117,6 +118,7 @@ function render(root, a) {
         ['Run', link(['lease', a.chain_id], mono(a.chain_id))],
         ['Calling hop lease', link(['lease', a.lease], mono(a.lease))],
         ['Labels the run carried', labels],
+        ['Arguments that matched an untrusted result', untrustedArgs(a.untrusted_args)],
         ['Gated decision', link(['record', a.decision_id], mono(a.decision_id))],
         ['Created', time(a.created_at)],
         ['Expires', time(a.expires_at)],

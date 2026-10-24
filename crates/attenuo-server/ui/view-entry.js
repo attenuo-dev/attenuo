@@ -57,7 +57,27 @@ function verdict(entry) {
       ['Record id', mono(r.id)],
       ['Session', r.session_id ? mono(r.session_id) : undefined],
       ['DPoP-bound', r.dpop_bound ? 'yes' : 'no'],
+      ['Run tainted by', taintedBy(r.labels)],
+      ['Untrusted arguments', untrustedArgs(r.labels && r.labels.untrusted_args)],
     ]));
+}
+
+// labels.tainted_by: seqs of the tool_result records that tainted the run.
+function taintedBy(labels) {
+  const seqs = (labels && labels.tainted_by) || [];
+  if (!seqs.length) return undefined;
+  return h('span', null, seqs.flatMap((s, i) => [i ? ', ' : '', link(['entry', s], `#${s}`)]));
+}
+
+// labels.untrusted_args (ADR-0009 phase 2): which argument matched which result, and how.
+// Argument names come from the agent's call; h() renders them as text.
+export function untrustedArgs(args) {
+  if (!args || !args.length) return undefined;
+  return h('ul', null, args.map((a) => h('li', null,
+    mono(a.arg), ' ', h('span', { class: 'tag' }, a.kind), ' ',
+    a.seq !== undefined && a.seq !== null
+      ? link(['entry', a.seq], `tool_result at seq ${a.seq}`)
+      : h('span', { class: 'muted' }, 'span index unreadable'))));
 }
 
 function chainPanel(r, leaseStates) {

@@ -239,7 +239,8 @@ async fn untrusted_read_then_destructive_call_requires_approval() {
     assert_eq!(result["decision_id"], read["id"]);
     assert_eq!(result["chain_id"], read["chain_id"]);
     assert_eq!(result["result"]["label"], "untrusted");
-    assert_eq!(result["result"]["fingerprints"], 0);
+    // The echo of the read's arguments is fingerprinted (phase 2): "alice/site" and "read_web".
+    assert!(result["result"]["fingerprints"].as_u64().unwrap() > 0);
     assert_eq!(result["result"]["digest"].as_str().unwrap().len(), 64);
     assert!(result["result"]["size"].as_u64().unwrap() > 0);
     let asked = records
@@ -402,5 +403,111 @@ async fn policy_check_and_dry_run_know_the_labelling_attributes() {
     assert_eq!(v["session"]["tainted"], true);
     assert_eq!(v["session"]["tainted_by"], json!(["web/fetch"]));
     let (status, _) = h.evaluate(body(Some(json!({"tainted": "yes"})))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Option (b) alone (ADR-0009 phase 2): ask only when an argument of a destructive call
+/// carries a span of an untrusted result of the run.
+const ARGS_POLICY: &str = r#"
+@id("allow")
+permit(principal, action, resource);
+
+@id("confirm_destructive_with_untrusted_args")
+@obligation("approval")
+forbid(principal, action, resource)
+when { resource.destructive && context.args_contain_untrusted && !context.approval.present };
+"#;
+
+fn call_with(tool: &str, arguments: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+           "params": {"name": tool, "arguments": arguments}})
+}
+
+#[tokio::test]
+async fn an_argument_copied_from_a_result_asks_and_names_the_result() {
+    let h = Harness::default(ARGS_POLICY).await;
+    let token = h.root().await;
+    // The fake upstream echoes the call as JSON text, so the read's result holds the string.
+    let read = h
+        .rpc(
+            &token,
+            call_with("read_web", json!({"repo": "attacker/payload-repo"})),
+        )
+        .await;
+    assert!(allowed(&read), "{read}");
+    // Tainted, but the agent's own value matches nothing: allowed under option (b).
+    let own = h
+        .rpc(
+            &token,
+            call_with("delete_repo", json!({"repo": "alice/site"})),
+        )
+        .await;
+    assert!(allowed(&own), "{own}");
+    // Copied from the result: asked, with the argument, the result's seq and the kind.
+    let v = h
+        .rpc(
+            &token,
+            call_with("delete_repo", json!({"repo": "attacker/payload-repo"})),
+        )
+        .await;
+    assert_eq!(v["error"]["code"], -32008, "{v}");
+    let records = h.records().await;
+    let result = records
+        .iter()
+        .find(|r| r["kind"] == "tool_result" && r["tool"] == "read_web")
+        .unwrap();
+    assert!(result["result"]["fingerprints"].as_u64().unwrap() > 0);
+    let seq = &result["seq"];
+    let expected = json!([
+        {"arg": "repo", "seq": seq, "kind": "leaf"},
+        {"arg": "repo", "seq": seq, "kind": "entity"},
+    ]);
+    assert_eq!(v["error"]["data"]["untrusted_args"], expected, "{v}");
+    let gated = records
+        .iter()
+        .find(|r| r["id"] == v["error"]["data"]["decision_id"])
+        .unwrap();
+    assert_eq!(gated["labels"]["untrusted_args"], expected);
+    // The allowed call's record has the taint but no `untrusted_args` member.
+    let own_record = records
+        .iter()
+        .find(|r| r["kind"] == "decision" && r["tool"] == "delete_repo")
+        .unwrap();
+    assert!(own_record["labels"].get("untrusted_args").is_none());
+    // The approval shows the matched arguments next to the labels.
+    let id = v["error"]["data"]["approval_id"].as_str().unwrap();
+    let a = h.admin_get(&format!("/admin/approvals/{id}")).await;
+    assert_eq!(a["untrusted_args"], expected, "{a}");
+
+    // The dry run reads the same from the store, and takes them as input.
+    let body = |session: Option<Value>| {
+        let mut b = json!({
+            "token": token,
+            "subject": {"type": "agent", "id": ""},
+            "action": {"name": "delete_repo"},
+            "resource": {"type": "tool", "id": "github/delete_repo",
+                         "properties": {"server": "github"}},
+            "context": {"input": {"repo": "attacker/payload-repo"}},
+        });
+        if let Some(s) = session {
+            b["session"] = s;
+        }
+        b
+    };
+    let (status, d) = h.evaluate(body(None)).await;
+    assert_eq!(status, StatusCode::OK, "{d}");
+    assert_eq!(d["reason"], "approval_required", "{d}");
+    assert_eq!(d["session"]["untrusted_args"], json!(["repo"]));
+    assert_eq!(d["session"]["args_contain_untrusted"], true);
+    let (_, d) = h.evaluate(body(Some(json!({"tainted": true})))).await;
+    assert_eq!(d["decision"], "allow", "{d}");
+    assert_eq!(d["session"]["untrusted_args"], json!([]));
+    let (_, d) = h
+        .evaluate(body(Some(json!({"untrusted_args": ["repo"]}))))
+        .await;
+    assert_eq!(d["reason"], "approval_required", "{d}");
+    let (status, _) = h
+        .evaluate(body(Some(json!({"untrusted_args": "repo"}))))
+        .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }

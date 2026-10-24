@@ -3,13 +3,15 @@
   "rule": "Hashes of every file in policies/ (suite Cedar policies and tool catalogs), recorded before any test case in this directory was written. run.py --split test refuses to report numbers while any file differs. The commit that froze them is named in ../../README.md#dev-and-test-splits.",
   "added_later": {
     "labels.cedar": "2026-10-24. The two @obligation(\"approval\") policies of docs/design/output-labelling.md section 3.6, loaded only by the attenuo_labels arm. Added after the test cases in this directory were written; no suite policy or catalog changed, and the other arms never load it. Test cases aimed at this arm are to be written after this date.",
-    "limits-rule.json": "2026-10-24. The frozen run-limit rule of docs/design/run-limits.md section 6 (calls: 1 on every capability that is not a read), applied by the runner to exchanged tokens in the attenuo_limits and attenuo_labels_limits arms only. Recorded before either arm was first run, and after the test cases in this directory were written and read; no suite policy, catalog or case changed, and the other arms never load it."
+    "limits-rule.json": "2026-10-24. The frozen run-limit rule of docs/design/run-limits.md section 6 (calls: 1 on every capability that is not a read), applied by the runner to exchanged tokens in the attenuo_limits and attenuo_labels_limits arms only. Recorded before either arm was first run, and after the test cases in this directory were written and read; no suite policy, catalog or case changed, and the other arms never load it.",
+    "labels-args.cedar": "2026-10-24. The option (b) @obligation(\"approval\") policy of docs/design/output-labelling.md sections 3.4 and 3.6 (ask when an argument of a destructive call copies an unpinned value or span of an untrusted result), loaded only by the attenuo_labels_args arm instead of labels.cedar. Recorded before the arm was first run, and after the test cases in this directory were written and read; no suite policy, catalog, case or labels.cedar changed, and the other arms never load it."
   },
   "files": {
     "banking.cedar": "1a4fb0c01c47a6571944c93115eba81f31996f496c70da7b33f1bad58a180c5c",
     "banking.yaml": "84f5e3a468e21e6e3efb30a31742e8ea75125556fb0c2b04a8ee3dd80b3cea4c",
     "github.cedar": "069f12299f97a22e60b904e31ccfd465fd86ce283845507182080a3ec64141bb",
     "github.yaml": "2536ad61bad87a613527cdac6ab3fedca4fdc13e44160e0f10de162a36935600",
+    "labels-args.cedar": "abe0e8e9b6d99db3aaf9962b4dac20bab1f8f2d6555da3678431a25a26c9295d",
     "labels.cedar": "68b309f24422605bd56075190b372f4c832d5552eb041d573d987e29e0950dd4",
     "limits-rule.json": "76fe7dc7b3fe58ee7303efcfd2dc9380069819f67abd8990d0e38015105bcc37",
     "slack.cedar": "ab9e4d3f21973cd9a2bbe277d4098b353ff408d9684f76e776abece89a2c183b",
