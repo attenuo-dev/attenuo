@@ -149,5 +149,54 @@ async fn no_delegation_makes_a_token_nobody_may_exchange() {
     ))
     .await;
     assert_eq!(out.status.code(), Some(2), "clap usage error");
+
+    // `token inspect` says who may exchange each token, and `--verify` covers it: the same
+    // token with its `may_act` rewritten decodes to the new list but fails verification.
+    let inspect = |token: &str, verify: bool| {
+        let mut c = attenuo();
+        c.args(["--server", &url, "token", "inspect", token]);
+        if verify {
+            c.arg("--verify");
+        }
+        c
+    };
+    let text = ok(&run(inspect(&child, true)).await);
+    assert!(
+        text.contains("\nmay_act []: no agent may exchange this token\n"),
+        "{text}"
+    );
+    assert!(text.contains("\nverified: "), "{text}");
+    let text = ok(&run(inspect(&open, true)).await);
+    assert!(
+        text.contains("\nmay_act (absent): any authenticated agent may exchange this token\n"),
+        "{text}"
+    );
+    let text = ok(&run(inspect(&root2, false)).await);
+    assert!(
+        text.contains("\nmay_act coder: only this agent may exchange this token\n"),
+        "{text}"
+    );
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let parts: Vec<&str> = child.split('.').collect();
+    let mut claims: Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+    claims["may_act"] = serde_json::json!({"sub": ["reviewer"]});
+    let forged = format!(
+        "{}.{}.{}",
+        parts[0],
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap()),
+        parts[2]
+    );
+    let text = ok(&run(inspect(&forged, false)).await);
+    assert!(text.contains("\nmay_act reviewer: "), "{text}");
+    assert!(text.contains("signature NOT verified"), "{text}");
+    let out = run(inspect(&forged, true)).await;
+    assert_eq!(out.status.code(), Some(2), "a failed verification exits 2");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("verification FAILED"),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     drop(server);
 }

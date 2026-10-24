@@ -712,21 +712,18 @@ async fn inspect(client: Option<Client>, args: cli::InspectArgs, json: bool) -> 
     };
     let decoded = jwt::decode_unverified(&token)?;
     let now = OffsetDateTime::now_utc();
-    let mut verdict: Option<Result<()>> = None;
+    let mut verdict: Option<Result<attenuo_token::VerifiedToken>> = None;
     if args.verify {
         let client = client.context("--verify needs a valid --server URL to fetch the JWKS")?;
         let jwks = client.get("/.well-known/jwks.json").await?;
-        verdict = Some(
-            jwt::verify_with_jwks(
-                &token,
-                &decoded,
-                &jwks,
-                args.issuer.as_deref(),
-                args.audience.as_deref(),
-                now,
-            )
-            .map(|_| ()),
-        );
+        verdict = Some(jwt::verify_with_jwks(
+            &token,
+            &decoded,
+            &jwks,
+            args.issuer.as_deref(),
+            args.audience.as_deref(),
+            now,
+        ));
     }
     let verified = verdict.as_ref().map(|v| v.is_ok());
     if json {
@@ -748,6 +745,12 @@ async fn inspect(client: Option<Client>, args: cli::InspectArgs, json: bool) -> 
                 render::fmt_relative(exp, now)
             );
         }
+        // With --verify, `may_act` is read from the verified claims: the signature covers it.
+        let may_act = match &verdict {
+            Some(Ok(v)) => v.claims.may_act.as_ref(),
+            _ => c.may_act.as_ref(),
+        };
+        println!("{}", render::fmt_may_act(may_act));
         if let Some(cnf) = &c.cnf {
             println!(
                 "bound to DPoP key jkt {} (needs a proof by that key)",
@@ -756,7 +759,7 @@ async fn inspect(client: Option<Client>, args: cli::InspectArgs, json: bool) -> 
         }
         match &verdict {
             None => println!("signature NOT verified (decoded only; pass --verify to check it)"),
-            Some(Ok(())) => println!("verified: signature, type, issuer, audience, expiry, chain"),
+            Some(Ok(_)) => println!("verified: signature, type, issuer, audience, expiry, chain"),
             Some(Err(e)) => println!("verification FAILED: {e}"),
         }
     }
