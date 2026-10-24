@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use attenuo_audit::{
-    AuditSink, Durability, SqliteAudit, SqliteLeaseStore, WAL_CHECKPOINT_COMMITS,
-    WAL_WRITER_BACKSTOP_FRAMES,
+    AuditSink, Durability, SqliteAudit, SqliteLeaseStore, DEFAULT_WAL_CHECKPOINT_INTERVAL,
+    WAL_CHECKPOINT_COMMITS, WAL_WRITER_BACKSTOP_FRAMES,
 };
 use common::record;
 use rusqlite::{Connection, OpenFlags};
@@ -198,7 +198,13 @@ fn the_wal_stays_bounded_under_continuous_load() {
     }
     done.store(true, Ordering::Release);
     let largest = sampler.join().unwrap();
-    eprintln!("largest WAL: {} KiB", largest >> 10);
+    let timings = audit.wal_timings();
+    eprintln!(
+        "largest WAL: {} KiB; locked passes: {}; writer backstops: {}",
+        largest >> 10,
+        timings.locked_passes.len(),
+        timings.backstops.len()
+    );
     let bound = WAL_WRITER_BACKSTOP_FRAMES as u64 * 4096 + (32 << 20);
     assert!(
         largest < bound,
@@ -286,4 +292,162 @@ fn in_memory_stores_and_a_zero_interval_are_left_alone() {
     );
     off.append(record(0)).unwrap();
     assert!(off.checkpoint_wal().unwrap().unwrap().complete());
+}
+
+/// Latency summary of a set of appends: (p50, p99, max).
+fn summary(latencies: &mut [Duration]) -> (Duration, Duration, Duration) {
+    latencies.sort_unstable();
+    let at = |q: f64| latencies[((latencies.len() - 1) as f64 * q).round() as usize];
+    (at(0.50), at(0.99), *latencies.last().unwrap())
+}
+
+fn ms(d: Duration) -> String {
+    format!("{:.2}", d.as_secs_f64() * 1e3)
+}
+
+/// Measurement, not a check (board item 4 under "Performance follow-ups"): the pause an
+/// append pays when the writer's backstop fires, against the background checkpointer's
+/// locked pass. Run it on a quiet box:
+///
+/// `cargo test -p attenuo-audit --release --test wal -- --ignored wal_backstop_pause --nocapture`
+///
+/// Phase 1 parks the background checkpointer (as the unit test
+/// `the_writer_checkpoints_itself_when_the_background_thread_cannot` does) and appends one
+/// record at a time until the backstop has fired three times, seen as the WAL file shrinking
+/// right after an append. Phase 2 lets the checkpointer run under eight writers until it has
+/// made three locked passes (the 64 MB restart), each of which holds the store lock and so
+/// stalls every append for its duration.
+#[test]
+#[ignore = "measurement; run in release mode on a quiet box"]
+fn wal_backstop_pause() {
+    const FIRES: usize = 3;
+    const THREADS: usize = 8;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.db");
+    let wal = wal_path(&path);
+    let wal_size = || std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    let audit = SqliteAudit::open_with(&path, Durability::Normal)
+        .unwrap()
+        .with_wal_checkpoints(DEFAULT_WAL_CHECKPOINT_INTERVAL)
+        .unwrap();
+    let mut i = 0;
+
+    // Phase 1: the backstop, with the background thread parked.
+    let parked = audit.park_wal_checkpointer().expect("a file store");
+    let mut triggers = Vec::new();
+    let mut others = Vec::new();
+    let mut before = wal_size();
+    let started = Instant::now();
+    while triggers.len() < FIRES {
+        let t = Instant::now();
+        audit.append(record(i)).unwrap();
+        let took = t.elapsed();
+        i += 1;
+        let size = wal_size();
+        if size < before / 2 {
+            triggers.push((took, before));
+        } else {
+            others.push(took);
+        }
+        before = size;
+        assert!(
+            started.elapsed() < Duration::from_secs(600),
+            "the backstop fired {} times in 10 minutes",
+            triggers.len()
+        );
+    }
+    drop(parked);
+    let phase1_appends = i;
+    let phase1_secs = started.elapsed().as_secs_f64();
+    let backstops = audit.wal_timings().backstops;
+    assert!(audit.verify_chain().unwrap().ok);
+    drop(audit);
+
+    // Phase 2: the background checkpointer's locked pass, on a fresh store so nothing is left
+    // over from phase 1. Eight writers, as in `the_wal_stays_bounded_under_continuous_load`,
+    // since that is the load that makes it run.
+    let audit = Arc::new(
+        SqliteAudit::open_with(dir.path().join("audit2.db"), Durability::Normal)
+            .unwrap()
+            .with_wal_checkpoints(DEFAULT_WAL_CHECKPOINT_INTERVAL)
+            .unwrap(),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let writers: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let audit = Arc::clone(&audit);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut latencies = Vec::new();
+                let mut n = 0;
+                while !stop.load(Ordering::Acquire) {
+                    let s = Instant::now();
+                    audit.append(record(t * 10_000_000 + n)).unwrap();
+                    latencies.push(s.elapsed());
+                    n += 1;
+                }
+                latencies
+            })
+        })
+        .collect();
+    let phase2 = Instant::now();
+    while audit.wal_timings().locked_passes.len() < FIRES
+        && phase2.elapsed() < Duration::from_secs(600)
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    stop.store(true, Ordering::Release);
+    let phase2_secs = phase2.elapsed().as_secs_f64();
+    let mut loaded: Vec<Duration> = writers
+        .into_iter()
+        .flat_map(|w| w.join().unwrap())
+        .collect();
+    let timings = audit.wal_timings();
+
+    let (p50, p99, max) = summary(&mut others);
+    println!();
+    println!(
+        "phase 1, checkpointer parked, 1 writer: {phase1_appends} appends in {phase1_secs:.1} s"
+    );
+    println!("| fire | WAL before | trigger append ms | TRUNCATE ms |");
+    println!("|---|---|---|---|");
+    for (n, ((took, size), ckpt)) in triggers.iter().zip(&backstops).enumerate() {
+        println!(
+            "| {} | {} MB | {} | {} |",
+            n + 1,
+            size >> 20,
+            ms(*took),
+            ms(*ckpt)
+        );
+    }
+    println!(
+        "the other {} appends: p50 {} ms, p99 {} ms, max {} ms",
+        others.len(),
+        ms(p50),
+        ms(p99),
+        ms(max)
+    );
+    let (p50, p99, max) = summary(&mut loaded);
+    println!();
+    println!(
+        "phase 2, checkpointer running, {THREADS} writers: {} appends in {phase2_secs:.1} s, \
+         {} writer backstops",
+        loaded.len(),
+        timings.backstops.len()
+    );
+    println!("| locked pass | WAL frames | store lock held ms |");
+    println!("|---|---|---|");
+    for (n, (held, frames)) in timings.locked_passes.iter().enumerate() {
+        println!("| {} | {frames} | {} |", n + 1, ms(*held));
+    }
+    for took in &timings.backstops {
+        println!("writer backstop: TRUNCATE {} ms", ms(*took));
+    }
+    println!(
+        "appends: p50 {} ms, p99 {} ms, max {} ms",
+        ms(p50),
+        ms(p99),
+        ms(max)
+    );
+    assert!(audit.verify_chain().unwrap().ok);
 }

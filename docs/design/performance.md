@@ -224,6 +224,20 @@ What this means:
 - **The file store's tail no longer has the checkpoint stalls.** Its p99 at 8 and 32 clients is now close to the in-memory store's. The worst case remains a catch-up pause each time the WAL passes 64 MB; it shows in the max column (32 to 131 ms on this host, [policy-stage](bench/2026-10-23-vm-policy-stage.md)) rather than the p99.
 - **What is left of the added latency** is mostly outside the server's decision (now about 80 to 140 us at one hop): the blocking-pool hop, the proxy's request handling and the second HTTP round trip. It was not broken down by stage then; see [Time by stage of a proxied call](#time-by-stage-of-a-proxied-call-2026-10-23).
 
+#### Backstop pause, measured (2026-10-23)
+
+Since #21 the writer runs `TRUNCATE` itself when a commit leaves 128 MB in the WAL (`WAL_WRITER_BACKSTOP_FRAMES`). The ignored test `wal_backstop_pause` in `crates/attenuo-audit/tests/wal.rs` times it directly, against the background checkpointer's locked pass, through two test-only hooks behind the crate's `testing` feature (park the checkpointer; read the time each checkpoint held appends up). Three runs, release build, on the 4-vCPU dev container described above (ext4 temp directory, `durability = "normal"`, nothing else running; raw output and the rerun command in [the results file](bench/2026-10-23-vm-wal-backstop.md)):
+
+| Pause | Measured | Notes |
+|---|---|---|
+| Backstop, checkpointer parked (copies the whole 128 MB) | 323 to 416 ms, median 335 ms (9 fires) | the latency of the append that triggered it; the `TRUNCATE` is all of it |
+| Every other append in the same run, one writer | p50 0.06 to 0.07 ms, p99 0.16 to 0.18 ms, max 1.8 to 5.3 ms | about 11,200 appends per run |
+| Backstop under load, checkpointer running (8 writers) | 123 and 132 ms | fired in 2 of 3 runs; the background thread had already copied most of the WAL |
+| Locked pass at 64 MB, checkpointer running (8 writers) | 23 to 28 ms (4 passes); 1.4 to 2.8 ms when little was left | store lock held for the final `PASSIVE` |
+| Appends under that load | p99 1.1 to 2.7 ms, max 27 to 177 ms | the max is the backstop when it fired |
+
+The backstop is not rare on this box once the build is optimised. In release mode the bounded-WAL test (`the_wal_stays_bounded_under_continuous_load`, 8 writers) fired it in 3 of 3 runs on all 4 cores (peak WAL 129 MB) and in 1 of 5 runs pinned to 2 cores with two `yes` burners (peak 100 to 129 MB); in a debug build it fired in 1 of 3 runs on 4 cores and 0 of 5 on 2 cores (peak 85 to 100 MB where it did not fire), which matches the earlier observation of 78 to 104 MB and no fire (its build was not recorded; `cargo test` builds debug). So under sustained full-speed load the backstop, not the locked pass, sets the worst append on the file store: about 130 ms when it fires with the checkpointer working, about 0.35 s if the checkpointer is stuck.
+
 ### Time by stage of a proxied call (2026-10-23)
 
 Branch `perf/proxy-stage-timing`, commit 51f0a89. The server now times each stage of a proxied call and serves the result as the histogram `attenuo_proxy_stage_seconds{stage=...}` on `/metrics` (buckets from 1 us to 1 s, five per decade), with the same figures as `tracing` debug fields. Each stage costs one `Instant::now()` pair. The stages:
