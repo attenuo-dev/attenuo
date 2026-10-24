@@ -424,23 +424,30 @@ pub struct ToolsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum LeaseCmd {
-    /// Revoke a lease and every lease delegated from it. With `--user` or `--chain-id`
-    /// instead of an id, revoke every unrevoked lease of that originating user or delegation
-    /// chain, each with its descendants (`POST /admin/leases/revoke`), and list them.
-    #[command(group(clap::ArgGroup::new("selector").args(["user", "chain_id"]).multiple(false)))]
+    /// Revoke a lease and every lease delegated from it. With `--user`, `--chain-id` or
+    /// `--session` instead of an id, revoke every unrevoked lease of that originating user,
+    /// delegation chain or MCP session's chain, each with its descendants
+    /// (`POST /admin/leases/revoke`), and list them.
+    #[command(group(clap::ArgGroup::new("selector").args(["user", "chain_id", "session"]).multiple(false)))]
     Revoke {
         /// The lease to revoke.
-        #[arg(required_unless_present_any = ["user", "chain_id"], conflicts_with_all = ["user", "chain_id"])]
+        #[arg(required_unless_present_any = ["user", "chain_id", "session"], conflicts_with_all = ["user", "chain_id", "session"])]
         id: Option<String>,
         /// Revoke every lease issued for this originating user (the `sub` of the chain's
         /// originating user, under any issuer).
-        #[arg(long, conflicts_with = "chain_id", value_parser = NonEmptyStringValueParser::new())]
+        #[arg(long, conflicts_with_all = ["chain_id", "session"], value_parser = NonEmptyStringValueParser::new())]
         user: Option<String>,
         /// Revoke one whole delegation chain: the `chain_id` of its audit records, which is the
         /// lease of its first hop.
-        #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+        #[arg(long, conflicts_with = "session", value_parser = NonEmptyStringValueParser::new())]
         chain_id: Option<String>,
-        /// With `--user` or `--chain-id`: list what would be revoked and change nothing.
+        /// Revoke the delegation chain that opened this MCP session through the proxy: the raw
+        /// `Mcp-Session-Id` (the server hashes it; audit records carry only its 12-character
+        /// tag). A session the server has no record of matches nothing.
+        #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+        session: Option<String>,
+        /// With `--user`, `--chain-id` or `--session`: list what would be revoked and change
+        /// nothing.
         #[arg(long, requires = "selector")]
         preview: bool,
         /// Recorded with the revocation.
@@ -1398,6 +1405,7 @@ mod tests {
             reason,
             user,
             chain_id,
+            session,
             preview,
         }) = cli.command
         else {
@@ -1407,7 +1415,10 @@ mod tests {
             (id.as_deref(), reason.as_deref()),
             (Some("L1"), Some("demo"))
         );
-        assert_eq!((user, chain_id, preview), (None, None, false));
+        assert_eq!(
+            (user, chain_id, session, preview),
+            (None, None, None, false)
+        );
         assert!(parse(&["policy", "reload"]).is_ok());
         assert!(parse(&["audit", "verify"]).is_ok());
         assert!(parse(&["audit", "verify", "--file", "a.jsonl", "--jwks", "j.json"]).is_ok());
@@ -1585,6 +1596,15 @@ mod tests {
             panic!("not revoke")
         };
         assert_eq!(chain_id.as_deref(), Some("L0"));
+        let Command::Lease(LeaseCmd::Revoke {
+            session, preview, ..
+        }) = parse(&["lease", "revoke", "--session", "s1", "--preview"])
+            .unwrap()
+            .command
+        else {
+            panic!("not revoke")
+        };
+        assert_eq!((session.as_deref(), preview), (Some("s1"), true));
         for bad in [
             &["lease", "revoke"][..],
             &["lease", "revoke", "--preview"],
@@ -1593,7 +1613,10 @@ mod tests {
             &["lease", "revoke", "L1", "--chain-id", "L0"],
             &["lease", "revoke", "--user", "alice", "--chain-id", "L0"],
             &["lease", "revoke", "--user", ""],
-            &["lease", "revoke", "--session", "s1"],
+            &["lease", "revoke", "--session", ""],
+            &["lease", "revoke", "L1", "--session", "s1"],
+            &["lease", "revoke", "--session", "s1", "--chain-id", "L0"],
+            &["lease", "revoke", "--session", "s1", "--user", "alice"],
         ] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }

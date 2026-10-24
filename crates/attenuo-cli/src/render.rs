@@ -506,19 +506,36 @@ pub fn render_refund(v: &Value) -> String {
     )
 }
 
-/// `lease revoke --user/--chain-id [--preview]`: the selector, the counts, then one line per
-/// revoked lease (the matches first, then the cascade), and the audit record.
+/// `lease revoke --user/--chain-id/--session [--preview]`: the selector (for a session, its
+/// audit tag and the chains it resolved to), the counts, then one line per revoked lease (the
+/// matches first, then the cascade), and the audit record.
 pub fn render_selector_revocation(v: &Value) -> String {
     let preview = v["preview"].as_bool().unwrap_or(false);
-    let selector = match v["selector"].as_object().and_then(|o| o.iter().next()) {
-        Some((k, val)) => format!("{k} {}", val.as_str().unwrap_or("-")),
-        None => "-".to_string(),
+    let sel = &v["selector"];
+    let session = sel["session_tag"].as_str();
+    let selector = match (session, sel.as_object().and_then(|o| o.iter().next())) {
+        (Some(tag), _) => format!("session {tag}"),
+        (None, Some((k, val))) => format!("{k} {}", val.as_str().unwrap_or("-")),
+        (None, None) => "-".to_string(),
     };
     let mut out = String::new();
     if preview {
         out.push_str("preview: nothing was changed\n");
     }
     out.push_str(&format!("selector  {selector}\n"));
+    if session.is_some() {
+        let chains: Vec<&str> = sel["chain_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        if chains.is_empty() {
+            out.push_str("chains    none recorded for this session\n");
+        } else {
+            out.push_str(&format!("chains    {}\n", chains.join(", ")));
+        }
+    }
     out.push_str(&format!(
         "matched   {} lease(s)\n",
         num(&v["matched_count"])
@@ -1110,6 +1127,24 @@ would revoke 4 lease(s) if revoked now
         assert!(text.contains("would revoke 0 lease(s)\n"), "{text}");
         assert!(text.contains("list cut short"), "{text}");
         assert!(!text.contains("audit"), "{text}");
+
+        let v = json!({"selector": {"session_tag": "0a1b2c3d4e5f", "chain_ids": ["L0"]},
+                       "preview": true, "matched": ["L0", "L1"], "revoked": ["L0", "L1"],
+                       "matched_count": 2, "revoked_count": 2, "truncated": false,
+                       "reason": null, "audit_id": null});
+        assert_eq!(
+            render_selector_revocation(&v),
+            "preview: nothing was changed\nselector  session 0a1b2c3d4e5f\nchains    L0\n\
+             matched   2 lease(s)\nwould revoke 2 lease(s)\n  L0\n  L1\n"
+        );
+        let v = json!({"selector": {"session_tag": "0a1b2c3d4e5f", "chain_ids": []},
+                       "preview": true, "matched": [], "revoked": [], "matched_count": 0,
+                       "revoked_count": 0, "truncated": false});
+        let text = render_selector_revocation(&v);
+        assert!(
+            text.contains("chains    none recorded for this session\n"),
+            "{text}"
+        );
     }
 
     #[test]
