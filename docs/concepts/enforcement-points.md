@@ -4,19 +4,22 @@ A decision is only useful if something enforces it. attenuo has one decision pip
 
 ## One pipeline
 
-For every call, `Pipeline::decide` does three things in order:
+For every call, `Pipeline::decide` does these things in order:
 
 1. Check the lease of every hop in the chain.
-2. Ask the policy engine: the capability stage first, then Cedar.
-3. Append a record to the audit log.
+2. Read the run's state: whether it has read untrusted tool output, and what its run limits have left.
+3. Take a granted approval for exactly this call, if there is one.
+4. Ask the policy engine: the capability stage first (including the run limits, which deny with `budget_exhausted`), then Cedar.
+5. For an allowed call, charge its run limits.
+6. Append a record to the audit log.
 
-If any step fails, the answer is deny. Both enforcement points call the same code. They cannot disagree.
+If any step fails, the answer is deny. A Cedar deny that comes only from forbids marked `@obligation("approval")` opens an approval instead, and the proxy answers `-32008` with its id. Both enforcement points call the same code. They cannot disagree.
 
 ## The MCP proxy
 
 The proxy is a reverse proxy for MCP over streamable HTTP. Each upstream is mounted at `/mcp/{server}`. An agent points its MCP client at that URL and sends its delegation token as the bearer.
 
-For each request the proxy verifies the token, then asks the pipeline. On allow, it forwards the request to the upstream. It does not pass the attenuo token on. On deny, it answers with a JSON-RPC error (`-32003`) that carries the reason and the decision id. A bad or expired token gets HTTP 401 and `-32001`.
+For each request the proxy verifies the token, then asks the pipeline. On allow, it forwards the request to the upstream. It does not pass the attenuo token on. On deny, it answers with a JSON-RPC error (`-32003`) that carries the reason and the decision id. When the policy asks for an approval, the error is `-32008` and also carries the approval id. After an allowed call, the proxy records the upstream's answer in the audit log before relaying it. A bad or expired token gets HTTP 401 and `-32001`.
 
 The proxy is the enforcement point. The agent cannot skip it, because the upstream is only reachable through it. Run the upstream where the agent cannot reach it directly.
 

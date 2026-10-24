@@ -37,8 +37,8 @@ When a root token is issued, attenuo signs the originating user block together w
 
 ## Limits today
 
-- The agent name in an exchange is authenticated with the agent's client secret or an `actor_token` (a workload identity such as a SPIFFE JWT-SVID), unless an operator turns `[token] require_actor_auth` off. A parent can restrict who may exchange it with `may_act`. Hop tokens are still bearer tokens: nothing binds a child to the workload that received it.
+- The agent name in an exchange is authenticated with the agent's client secret or an `actor_token` (a workload identity such as a SPIFFE JWT-SVID), unless an operator turns `[token] require_actor_auth` off. A parent can restrict who may exchange it with `may_act`. Hop tokens are bearer tokens unless they are bound to a key with DPoP (`cnf.jkt`; see [Binding tokens to keys](../guides/binding-tokens-to-keys.md)). An unbound child token works for whoever holds it.
 - The user block does not record which credential it came from. The RFC calls this `evidence` and lists it as proposed.
-- There is no stable `chain_id` yet. A run is identified by its leases.
+- A run is identified by its `chain_id`, the lease id of its first hop. It is not a separate token claim, and it keys audit records, approvals, run taint and run usage (see [Audit log](audit-log.md#kind-and-chain-id)).
 
 More detail: [RFC-0001 section 3](../spec/rfc-0001-attenuo.md#3-delegation-chain-data-model) and [section 4](../spec/rfc-0001-attenuo.md#4-token-exchange), and [design/server.md](../design/server.md#hop-0-intake-from-an-identity-provider).

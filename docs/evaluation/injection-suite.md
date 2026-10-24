@@ -5,9 +5,11 @@
 - Code and corpus: [`evaluation/injection-suite/`](../../evaluation/injection-suite/README.md)
 - Full results, v2 (dev and test splits, five arms): [results/2026-10-23-v2.md](../../evaluation/injection-suite/results/2026-10-23-v2.md), with every call and the SHA-256 of every case file, policy and binary in [2026-10-23-v2.json](../../evaluation/injection-suite/results/2026-10-23-v2.json). First run (dev corpus, three arms): [results/2026-10-23.md](../../evaluation/injection-suite/results/2026-10-23.md)
 
-The question: when an agent has already been injected and sends the harmful tool call, does attenuo refuse it, and how many of the task's own calls does it refuse along the way? There are two splits. The development split has 46 cases across five suites. Four follow the structure of AgentDojo's suites (workspace, banking, travel, slack), some follow InjecAgent's data-stealing shape, and one replays the GitHub MCP leak. The suite policies were frozen after the dev split, and the test split was written against them: 26 cases so far, in the banking and workspace suites only. The taxonomy plans 33 more test cases for travel, slack and github, which are not written yet, so the target of 40 or more is still open. Each case is a user task, the grant that task needs, and a fixed list of benign and injected `tools/call` requests. The runner replays every list in five arms, from no attenuo to attenuo as configured, through the real server and proxy. [The README](../../evaluation/injection-suite/README.md) describes the method.
+The question: when an agent has already been injected and sends the harmful tool call, does attenuo refuse it, and how many of the task's own calls does it refuse along the way? There are two splits. The development split had 46 cases across five suites when the policies were frozen; eleven multi-call and six browsing cases added on 2026-10-24 bring it to 63 cases, with 77 attack and 130 benign calls. Four follow the structure of AgentDojo's suites (workspace, banking, travel, slack), some follow InjecAgent's data-stealing shape, and one replays the GitHub MCP leak. The suite policies were frozen after the dev split, and the test split was written against them: 26 cases so far, in the banking and workspace suites only. The taxonomy plans 33 more test cases for travel, slack and github, which are not written yet, so the target of 40 or more is still open. Each case is a user task, the grant that task needs, and a fixed list of benign and injected `tools/call` requests. The runner replays every list in five arms, from no attenuo to attenuo as configured, through the real server and proxy. [The README](../../evaluation/injection-suite/README.md) describes the method.
 
 ## Numbers
+
+This table is the v2 run on the original 46 dev cases. The later sections add arms and cases; [section 7 of the run-limits note](../design/run-limits.md#7-measured) has every arm on the current 63 dev cases in one table.
 
 Attack calls allowed and benign calls denied, with Wilson 95% intervals. The intervals treat every call as an independent trial. Calls within one case are not independent, so the true uncertainty is wider.
 
@@ -61,7 +63,7 @@ Seven attack calls went through, in three taxonomy classes:
 
 The first class is partly fixable in the policy language and the catalog: exact-match lists instead of suffix globs, and refusing undeclared arguments. Path resolution belongs to the upstream. The other two need information-flow tracking or rate and count limits.
 
-These are the cases the [threat model](../spec/threat-model.md) already says attenuo does not prevent: permitted-but-harmful calls and information flow. Closing them needs information-flow labels, rate or count limits, or a human confirmation step for selected calls. None of these exists today.
+These are the cases the [threat model](../spec/threat-model.md) already says attenuo does not prevent: permitted-but-harmful calls and information flow. Closing them needs information-flow labels, rate or count limits, or a human confirmation step for selected calls. None of these existed at the time of this run. Output labelling with approvals (ADR-0009) and run limits (ADR-0010) were built afterwards, and the sections below measure them on the same cases.
 
 ## What it cost
 
