@@ -7,6 +7,12 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Test-only hooks (parking the WAL checkpointer, WAL checkpoint timings) for this crate's own
+# integration tests and measurements.
+testing = []
+
 [dependencies]
 attenuo-core = { workspace = true }
 attenuo-token = { workspace = true }
@@ -20,4 +26,6 @@ time = { workspace = true }
 rusqlite = { workspace = true }
 
 [dev-dependencies]
+# Enables the `testing` hooks for this crate's own integration tests.
+attenuo-audit = { path = ".", features = ["testing"] }
 tempfile = { workspace = true }
