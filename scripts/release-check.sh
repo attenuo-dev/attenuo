@@ -12,7 +12,7 @@
 # Environment:
 #   PYTHON       interpreter with the Python SDK's dev extras, the suite's needs, build and
 #                twine installed (default: python3). For example a venv made with
-#                `pip install -e 'sdk/python[dev]' build twine`.
+#                `pip install -e 'sdk/python[dev]' -r evaluation/injection-suite/requirements.txt mcp build twine`.
 #   ALLOW_DIRTY  set to 1 to pass --allow-dirty to the crates dry run. Leave it unset for the
 #                real pre-tag run, so the crates are packaged from committed files only.
 #
