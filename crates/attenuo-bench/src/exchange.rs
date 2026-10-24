@@ -395,6 +395,9 @@ fn stats_of(h: &Histogram<u64>, unexpected: u64, rate_count: u64, secs: f64) -> 
         p95_us: us(h.value_at_quantile(0.95) as f64),
         p99_us: us(h.value_at_quantile(0.99) as f64),
         max_us: us(h.max() as f64),
+        over_3ms: crate::over_ns(h, 3_000_000),
+        over_5ms: crate::over_ns(h, 5_000_000),
+        over_10ms: crate::over_ns(h, 10_000_000),
     }
 }
 

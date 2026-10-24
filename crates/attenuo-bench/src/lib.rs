@@ -228,6 +228,10 @@ pub struct Stats {
     pub p95_us: f64,
     pub p99_us: f64,
     pub max_us: f64,
+    /// Requests that took longer than 3, 5 and 10 ms (the single-client outliers).
+    pub over_3ms: u64,
+    pub over_5ms: u64,
+    pub over_10ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -764,6 +768,9 @@ async fn drive(
             p95_us: us(hist.value_at_quantile(0.95) as f64),
             p99_us: us(hist.value_at_quantile(0.99) as f64),
             max_us: us(hist.max() as f64),
+            over_3ms: over_ns(&hist, 3_000_000),
+            over_5ms: over_ns(&hist, 5_000_000),
+            over_10ms: over_ns(&hist, 10_000_000),
         },
         sent,
         first_bad,
@@ -789,6 +796,14 @@ fn ensure_expected(cell: &str, out: &DriveOut) -> Result<()> {
 
 const STAGE_METRIC: &str = "attenuo_proxy_stage_seconds";
 
+/// Samples in `h` (nanoseconds) above `ns`.
+pub fn over_ns(h: &Histogram<u64>, ns: u64) -> u64 {
+    if h.max() <= ns {
+        return 0;
+    }
+    h.count_between(ns + 1, h.max())
+}
+
 /// One stage's histogram as scraped: cumulative bucket counts by upper bound (the last is
 /// `+Inf`), sum in seconds, and count.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -799,6 +814,16 @@ pub struct StageHist {
 }
 
 impl StageHist {
+    /// Samples above `bound` seconds, when `bound` is one of the bucket bounds (`None`
+    /// otherwise: the histogram cannot tell).
+    pub fn over(&self, bound: f64) -> Option<u64> {
+        let (_, cum) = self
+            .buckets
+            .iter()
+            .find(|(b, _)| (b - bound).abs() <= bound * 1e-9)?;
+        Some(self.count.saturating_sub(*cum))
+    }
+
     /// Quantile `q` in seconds, interpolated linearly inside the bucket it falls in (lower
     /// bound of the first bucket 0), as Prometheus' `histogram_quantile`. `None` when empty.
     pub fn quantile(&self, q: f64) -> Option<f64> {

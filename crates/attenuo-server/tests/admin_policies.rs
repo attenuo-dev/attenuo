@@ -567,6 +567,33 @@ async fn policy_routes_need_the_admin_token() {
     }
 }
 
+/// No policy here reads `context.usage` and the catalog names no `amount` or `destination`,
+/// so the engine keeps no run usage: the dry run says `untracked` rather than presenting the
+/// zeros as the run's usage from the store. Usage given in the request is still `request`.
+#[tokio::test]
+async fn dry_run_says_untracked_when_the_engine_keeps_no_usage() {
+    let h = Harness::start().await;
+    assert!(!h.state.pipeline.policy().read().unwrap().tracks_usage());
+    let root = h.mint_root(&["github:*"]).await;
+    let body = with_token(
+        call_body("create_issue", json!({"repo": "alice/public-site"})),
+        &root.token,
+    );
+    let (status, v) = h.evaluate(body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["decision"], "allow", "{v}");
+    assert_eq!(
+        v["usage"],
+        json!({"calls": 0, "amount": 0, "destination_seen": false, "source": "untracked"})
+    );
+    let mut given = body;
+    given["usage"] = json!({"calls": 2});
+    let (status, v) = h.evaluate(given).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["usage"]["calls"], 2);
+    assert_eq!(v["usage"]["source"], "request");
+}
+
 /// Without a policy file there is nothing to check; reading reports an empty set.
 #[tokio::test]
 async fn no_policy_file_reads_empty_and_check_is_409() {
