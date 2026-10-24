@@ -2,7 +2,7 @@
 
 A replay benchmark for one question from the [evaluation plan](../../docs/research/evaluation-plan.md): when an agent has already been prompt-injected and emits a harmful tool call, does attenuo stop it, and how many legitimate calls does it stop along the way?
 
-There is no model in the loop. Each case is a fixed sequence of `tools/call` requests that a compromised agent would plausibly send for one user task: the calls the task needs, plus the injected ones. The runner replays every sequence in five arms, from no attenuo at all to attenuo as configured, and records what each call got. A sixth arm, `attenuo_labels`, is prepared for output labelling and does not run yet (see [The labels arm](#the-labels-arm)).
+There is no model in the loop. Each case is a fixed sequence of `tools/call` requests that a compromised agent would plausibly send for one user task: the calls the task needs, plus the injected ones. The runner replays every sequence in five arms, from no attenuo at all to attenuo as configured, and records what each call got. A sixth arm, `attenuo_labels`, measures output labelling and runs on servers from main `ed3a769` on (see [The labels arm](#the-labels-arm)).
 
 Current results, both splits: [results/2026-10-23-v2.md](results/2026-10-23-v2.md); re-run unchanged on main `de3cf75` after the admin console, CLI and SDK merges: [results/2026-10-24-recheck.md](results/2026-10-24-recheck.md). First results (dev corpus, three arms): [results/2026-10-23.md](results/2026-10-23.md). Summary and discussion: [docs/evaluation/injection-suite.md](../../docs/evaluation/injection-suite.md).
 
@@ -29,7 +29,7 @@ Current results, both splits: [results/2026-10-23-v2.md](results/2026-10-23-v2.m
 | `scope_constraints` | Through attenuo. The case's tokens with their argument constraints, permit-all policy: what attenuated tokens give without any policy. | ablation |
 | `policy_only` | Through attenuo. The suite policies, but every call carries the user's root token (all servers, no attenuation): what policy gives without delegation. | ablation |
 | `attenuo` | Through attenuo with the case's constrained tokens, the suite policies, leases and audit. | A2 |
-| `attenuo_labels` | As `attenuo`, plus `policies/labels.cedar` (approval after an untrusted read). Not yet run: needs output labelling phase 1 in the server. | `attenuo+labels` in the [design](https://github.com/attenuo-dev/attenuo/blob/docs/output-labelling-design/docs/design/output-labelling.md#6-phased-plan) |
+| `attenuo_labels` | As `attenuo`, plus `policies/labels.cedar` (approval after an untrusted read). First run 2026-10-24 on `ed3a769`: [`results/2026-10-24-labels-v1.md`](results/2026-10-24-labels-v1.md). | `attenuo+labels` in the [design](../../docs/design/output-labelling.md#6-phased-plan) |
 
 **Per case**, in the proxied arms: mint a root token for `alice` with the whole suite (`<suite>:*`, the over-privileged starting point) through the dev endpoint, then exchange it with the Python SDK for the case's grant, issued to an agent called `worker`. Then replay the calls. A `revoke` step revokes the worker's lease through the admin API. Each call records allow or deny, the reason code and its stage, the decision id (the audit record id), and whether a `tools/call` line showed up in the upstream's log. That last check is how "denied calls never reach the upstream" is measured, not assumed.
 
@@ -129,7 +129,7 @@ To add a dev case, append it to a file in `cases/dev/` and run `run.py --cases <
 
 ## The labels arm
 
-The [output-labelling design](https://github.com/attenuo-dev/attenuo/blob/docs/output-labelling-design/docs/design/output-labelling.md) (phase 1) makes a run tainted once it has read an upstream result, and makes a destructive call in a tainted run ask for an approval. The proxy answers such a call with JSON-RPC error `-32008` and `data: {reason: "approval_required", decision_id, call_hash, ...}`. The arm `attenuo_labels` measures this. It is inactive until the server supports `-32008`:
+The [output-labelling design](../../docs/design/output-labelling.md) (phase 1, on main since `ed3a769`) makes a run tainted once it has read an upstream result, and makes a destructive call in a tainted run ask for an approval. The proxy answers such a call with JSON-RPC error `-32008` and `data: {reason: "approval_required", decision_id, call_hash, ...}`. The arm `attenuo_labels` measures this. On a server without phase 1 it is skipped:
 
 - Before starting the arm's server, the runner lints the suite policies plus `policies/labels.cedar`. A server without the design's attributes (`resource.destructive`, `context.session.tainted`, `context.approval.present`, `context.args_contain_untrusted`) rejects the file, and the runner skips the arm with the lint error.
 - If the lint passes, the runner sends a probe with its own root token: a `banking` read (`get_most_recent_transactions`) and then `update_user_info`, which the banking policy permits. Unless the second call gets `-32008` with reason `approval_required`, the arm is skipped. The reason is printed and written into the results under `skipped_arms`.
