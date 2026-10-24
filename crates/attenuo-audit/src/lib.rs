@@ -27,7 +27,7 @@ pub mod spans;
 pub mod sqlite;
 
 pub use approval::{Approval, ApprovalLabel, ApprovalMethod, ApprovalState, Approver};
-pub use budget::ChargeOutcome;
+pub use budget::{ChargeOutcome, CounterSummary, HopLimit};
 pub use checkpoint::{
     verify_with_checkpoints, BadCheckpoint, Checkpoint, CheckpointKeys, SignedVerifyReport, Start,
     CHECKPOINT_CONTEXT,

@@ -40,7 +40,7 @@ printf '%s\n' "$CODER" | attenuo call --token - --server github --tool read_file
 
 ## Argument forms
 
-- `--cap server:tool` is a capability. Globs are allowed. Repeat the flag, or comma-separate plain values. A value that starts with `{` is a full capability as JSON, which can carry constraints and run `limits` (`{"server":"banking","tool":"send_money","limits":{"calls":1,"sum":{"arg":"amount","max":100}}}`). Commands that print capabilities show limits after the constraints: `banking:send_money [calls <= 1, sum(amount) <= 100]`.
+- `--cap server:tool` is a capability. Globs are allowed. Repeat the flag, or comma-separate plain values. A value that starts with `{` is a full capability as JSON, which can carry constraints and run `limits` (`{"server":"banking","tool":"send_money","limits":{"calls":1,"sum":{"arg":"amount","max":100}}}`). Commands that print capabilities show limits after the constraints: `banking:send_money [calls <= 1, sum(amount) <= 100]`. `distinct` and a derived value work the same way: `--cap '{"server":"web","tool":"get_webpage","limits":{"distinct":{"arg":"url","derive":"host","max":2}}}'` prints as `web:get_webpage [distinct url#host <= 2]`. A limit kind or derivation the CLI does not know is refused before anything is sent.
 - `--arg key=value` sets a string argument. `--arg key:=json` sets any JSON value, such as a number or an object.
 - `--attr key=value` follows the same rule for user attributes.
 
@@ -167,6 +167,45 @@ root lease (no ancestors)
    └─ 6dd4e10a-...  reviewer  REVOKED 2026-10-23T22:08:23Z (rotated)  issued #4
 would revoke 2 lease(s) if revoked now
 ```
+
+A lease whose hop has run limits ([ADR-0010](../decisions/0010-run-limits.md)), or that something was charged under, gets its budget on the lines under it, from the node's `budget` member ([Lease tree](http-api.md#lease-tree)). There is one `limit` line per limit: `<server>/<tool> <kind> [<arg>] <used>/<max> (<remaining> left)`. `used` is calls for `calls`, the sum for `sum`, the number of values seen for `distinct`, and for `calls_per` the most calls any one value has had, with the number of values seen after what is left. A host-derived argument shows as `url#host`. On a run's root lease, one `usage` line per destructive tool gives the run's calls, amount and number of destinations. A lease issued by a server that did not keep its hop's limits prints `limits not recorded` and then its counters as `cap <n> <kind> [<arg>] <used> used`. A lease with no limits and no charges adds nothing, so a tree without run limits looks as above. Every call is charged to every hop it passes through, so the smallest figure left along a branch is what its lowest lease can still spend. There is no flag to hide the budget lines: they are indented inside their lease's branch, and their number is bounded by the limits in each token. `--json` prints the server's answer unchanged.
+
+```console
+$ attenuo lease tree 7a1c90e2-...
+root lease (no ancestors)
+7a1c90e2-...  planner  active, expires 2026-10-24T14:20:00Z  issued #1
+│    limit bank/send_money calls 1/3 (2 left)
+│    limit bank/send_money sum amount 40/100 (60 left)
+│    limit web/get_webpage distinct url#host 2/3 (1 left)
+│    usage bank/send_money: 1 calls, amount 40, 1 destinations
+└─ 5e21d4b0-...  coder  active, expires 2026-10-24T14:20:00Z  issued #2
+        limit bank/send_money calls 1/2 (1 left)
+        limit bank/send_money calls_per to 1/1 (0 left, 1 values)
+        limit web/get_webpage distinct url#host 2/2 (0 left)
+would revoke 1 lease(s) if revoked now
+```
+
+### `budget refund <ID> --reason TEXT`
+
+Give back to every run-limit counter what one allowed decision charged, once, for a call whose effect did not happen (`POST /admin/budgets/refund`). `ID` is the decision record's id: the `id=` that `audit tail` prints for the allowed call, or the AuthZEN `context.decision_id`. `--reason` is required and must not be blank; it is recorded in the `admin.budget.refund` audit record the server appends. The run usage the decision charged is given back too, but `refunded` counts only the token-limit counters, so a call that charged usage alone answers 0. `--json` prints the server's `{decision_id, refunded, reason, audit_id}`. Needs the admin token.
+
+```console
+$ attenuo budget refund 9f35c2a1-... --reason "upstream timed out"
+decision  9f35c2a1-...
+refunded  2 limit counter(s)
+reason    upstream timed out
+audit     e1b04d7c-...
+```
+
+When the server refuses, one line goes to stderr and nothing to stdout, with `--json` too:
+
+| Server answer | Message | Exit status |
+| --- | --- | --- |
+| 404 `not_found` | `error: decision <id> charged no run limit or run usage; nothing to refund` | 2 |
+| 409 `already_refunded` | `error: the charge of decision <id> was already refunded` | 3 |
+| anything else | `error: server answered ...` | 1 |
+
+Exit 3 lets a script that retries a refund tell "already done" from "nothing to do". If the refund stood but its audit record could not be written, `audit` reads `- (the refund stands, but its audit record was not written; see the server log)` and the exit status is 0.
 
 ### `audit tail`
 

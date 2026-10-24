@@ -8,7 +8,10 @@ import {
   parseCapability,
   prefix,
   withLimits,
+  argLimit,
+  countedArg,
 } from "../src/index.js";
+import type { Capability } from "../src/index.js";
 
 describe("capability", () => {
   it("serializes constraints like the Rust Capability", () => {
@@ -98,14 +101,42 @@ describe("capability", () => {
     );
     expect(withLimits(cap, {})).toEqual({ server: "banking", tool: "send_money" });
     for (const bad of [
-      { distinct: { arg: "to", max: 1 } },
+      { window: { arg: "to", max: 1 } },
       { calls: -1 },
       { calls: 1.5 },
       { sum: { arg: "amount" } },
+      { sum: { arg: "url", max: 1, derive: "host" } },
+      { distinct: { arg: "url", max: 1, derive: "path" } },
+      { distinct: { arg: "", max: 1 } },
+      { calls_per: { arg: "to", max: 1, extra: 1 } },
     ]) {
       expect(() => capabilitiesToJson([{ server: "b", tool: "t", limits: bad as never }])).toThrow(
         TypeError,
       );
     }
+  });
+
+  it("types distinct and derived limits for a child token", () => {
+    const cap = withLimits(capability("web", "get_webpage"), {
+      calls: 5,
+      distinct: argLimit("url", 2, { derive: "host" }),
+    });
+    const wire = {
+      server: "web",
+      tool: "get_webpage",
+      limits: { calls: 5, distinct: { arg: "url", max: 2, derive: "host" } },
+    };
+    expect(cap).toEqual(wire);
+    expect(capabilitiesToJson([wire as Capability])).toEqual([wire]);
+    expect(formatCapability(cap)).toBe("web:get_webpage[calls<=5,distinct(url#host)<=2]");
+    expect(countedArg(argLimit("to", 1))).toBe("to");
+    const mail = withLimits(capability("mail", "send"), {
+      calls_per: argLimit("to", 1),
+      distinct: argLimit("to", 3),
+    });
+    expect(mail.limits).toEqual({
+      calls_per: { arg: "to", max: 1 },
+      distinct: { arg: "to", max: 3 },
+    });
   });
 });

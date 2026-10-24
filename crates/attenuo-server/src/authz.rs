@@ -193,7 +193,8 @@ impl LimitHit {
         }
     }
 
-    /// `{hop, kind, arg, max, used}`, `arg` only for `sum` and `calls_per`.
+    /// `{hop, kind, arg, max, used}`, `arg` only for `sum`, `calls_per` and `distinct` (`url#host`
+    /// for a derived value). For `distinct`, `used` is how many values the limit has seen.
     pub fn to_json(&self) -> Value {
         let mut v = serde_json::json!({
             "hop": self.hop,
@@ -231,6 +232,59 @@ pub fn budget_json(b: &BudgetContext) -> Value {
         "amount_remaining": b.amount_remaining,
         "destination_new": b.destination_new,
     })
+}
+
+/// Read what the counters of `charges` hold, in one read: per charge, its counter, and for a
+/// `distinct` charge also how many values its limit has seen (0 for any other charge). A
+/// `distinct` charge's own counter says whether its value was seen (1) or not (0).
+fn read_counters(
+    leases: &dyn LeaseStore,
+    charges: &[Charge],
+) -> Result<(Vec<u64>, Vec<u64>), attenuo_audit::AuditError> {
+    let distinct: Vec<usize> = (0..charges.len())
+        .filter(|&i| charges[i].kind == LimitKind::Distinct && !charges[i].usage)
+        .collect();
+    if distinct.is_empty() {
+        let used = leases.budget_used(charges)?;
+        let counts = vec![0; used.len()];
+        return Ok((used, counts));
+    }
+    let mut probes = charges.to_vec();
+    probes.extend(distinct.iter().map(|&i| {
+        let c = &charges[i];
+        Charge::probe(c.lease.clone(), c.cap, c.kind, c.arg.clone(), c.max)
+    }));
+    let mut used = leases.budget_used(&probes)?;
+    let tail = used.split_off(charges.len());
+    let mut counts = vec![0; charges.len()];
+    for (&i, count) in distinct.iter().zip(tail) {
+        counts[i] = count;
+    }
+    Ok((used, counts))
+}
+
+/// One `distinct` charge in [`Pipeline::budget_view`]: the limit's count of values before it
+/// (with the values new earlier in the same call) and what it adds, 1 for a new value and 0
+/// for one the limit has seen (`seen > 0`).
+fn distinct_step(
+    new_values: &mut Vec<((usize, usize), u64)>,
+    c: &Charge,
+    seen: u64,
+    count: u64,
+) -> (u64, u64) {
+    let key = (c.hop, c.cap);
+    let earlier = new_values
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map_or(0, |(_, n)| *n);
+    if seen > 0 {
+        return (count.saturating_add(earlier), 0);
+    }
+    match new_values.iter_mut().find(|(k, _)| *k == key) {
+        Some((_, n)) => *n += 1,
+        None => new_values.push((key, 1)),
+    }
+    (count.saturating_add(earlier), 1)
 }
 
 /// What Cedar sees as `context.usage` when the run's usage cannot be read: the worst case, as an
@@ -832,7 +886,7 @@ impl Pipeline {
         if charges.is_empty() {
             return BudgetView::default();
         }
-        let used = match self.leases.budget_used(&charges) {
+        let (used, counts) = match read_counters(self.leases.as_ref(), &charges) {
             Ok(u) => u,
             Err(e) if !limited => {
                 // Only run usage: no limit to enforce, so the policy decides on the worst case.
@@ -867,16 +921,24 @@ impl Pipeline {
         };
         let mut usage = keeps_usage.then(UsageContext::default);
         let mut hit = None;
-        for (c, &u) in charges.iter().zip(&used) {
+        // `distinct`: values new to a limit earlier in this call, per (hop, capability).
+        let mut new_values: Vec<((usize, usize), u64)> = Vec::new();
+        for ((c, &u), &count) in charges.iter().zip(&used).zip(&counts) {
             if c.usage {
                 let usage = usage.get_or_insert_with(UsageContext::default);
                 match c.kind {
                     LimitKind::Calls => usage.calls = figure(u),
                     LimitKind::Sum => usage.amount = figure(u),
-                    LimitKind::CallsPer => usage.destination_seen |= u > 0,
+                    LimitKind::CallsPer | LimitKind::Distinct => usage.destination_seen |= u > 0,
                 }
                 continue;
             }
+            // What the limit's counter holds and what this charge adds to it. For `distinct`,
+            // `u` says whether the value was seen; the counter is the limit's count of values.
+            let (held, adds) = match c.kind {
+                LimitKind::Distinct => distinct_step(&mut new_values, c, u, count),
+                _ => (u, c.amount),
+            };
             match c.kind {
                 LimitKind::Calls => {
                     context.calls_remaining = context.calls_remaining.min(left(c, u))
@@ -884,10 +946,10 @@ impl Pipeline {
                 LimitKind::Sum => {
                     context.amount_remaining = context.amount_remaining.min(left(c, u))
                 }
-                LimitKind::CallsPer => context.destination_new &= u == 0,
+                LimitKind::CallsPer | LimitKind::Distinct => context.destination_new &= u == 0,
             }
-            if hit.is_none() && u.checked_add(c.amount).is_none_or(|n| n > c.max) {
-                hit = Some(LimitHit::of(c, u));
+            if hit.is_none() && held.checked_add(adds).is_none_or(|n| n > c.max) {
+                hit = Some(LimitHit::of(c, held));
             }
         }
         if let Some(h) = &hit {

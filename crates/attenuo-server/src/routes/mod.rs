@@ -10,7 +10,7 @@ pub mod renew;
 pub mod token;
 pub mod wellknown;
 
-use attenuo_audit::LeaseStore;
+use attenuo_audit::{HopLimit, LeaseStore};
 use attenuo_core::{Decision, DecisionRecord, DelegationChain, LeaseId, RecordKind, ToolCall};
 use axum::body::Bytes;
 use axum::http::{header, HeaderMap, HeaderValue};
@@ -90,6 +90,27 @@ pub(crate) fn register_issued(
         .leases
         .register(lease, parent, state.initial_lease_expiry(now, token_exp))?;
     state.leases.bind(lease, &chain.digest())?;
+    // Run limits (ADR-0010): keep the hop's limits as issued (after clamping), for the admin
+    // console. Display only, so a failure is logged and the issuance stands.
+    if let Some(hop) = chain.hops.last() {
+        let limited: Vec<HopLimit> = hop
+            .capabilities
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.limits.is_empty())
+            .map(|(cap, c)| HopLimit {
+                cap,
+                server: c.server.clone(),
+                tool: c.tool.clone(),
+                limits: c.limits.clone(),
+            })
+            .collect();
+        if !limited.is_empty() {
+            if let Err(e) = state.leases.record_hop_limits(lease, &limited) {
+                tracing::warn!(error = %e, lease = %lease.0, "could not keep the hop's limits for the console");
+            }
+        }
+    }
     Ok(())
 }
 

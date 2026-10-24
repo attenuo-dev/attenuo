@@ -3,7 +3,7 @@
 'use strict';
 
 import {
-  h, append, replace, link, mono, time, leaseState, leaseStatePill, empty, loading, kv,
+  h, append, replace, link, mono, time, leaseState, leaseStatePill, empty, loading, kv, table,
 } from './dom.js';
 import { api, qs, showNotice } from './api.js';
 
@@ -47,11 +47,78 @@ function render(root, leaseId, tree) {
         ['A revoke now would change', h('strong', null, `${tree.would_revoke} lease${tree.would_revoke === 1 ? '' : 's'}`)],
         ['History', h('a', { href: `#/audit${qs({ lease: leaseId })}` }, 'Every record naming this lease')],
       ])),
+    limitsPanel(tree),
     h('section', { class: 'panel' },
       h('header', null, h('h2', null, 'Subtree'),
         h('span', { class: 'small muted' }, `${tree.nodes.length} lease${tree.nodes.length === 1 ? '' : 's'} listed`)),
       tree.truncated ? h('p', { class: 'callout warn' }, 'The list is cut short at the server’s node cap. The revoke count above covers the whole subtree.') : null,
       subtree(tree)));
+}
+
+// ---- run limits (ADR-0010) ----------------------------------------------------------------
+
+/**
+ * Each hop of this lease's chain (root first, ending at this lease) with its run limits and
+ * what is left, from the `budget` member of the tree's nodes. Charges go to every hop, so the
+ * smallest `left` along the chain is what this lease can still spend. `null` when no hop has
+ * limits or usage.
+ */
+function limitsPanel(tree) {
+  const hops = tree.ancestors.slice().reverse().concat([tree.nodes[0]]);
+  if (!hops.some((n) => n.budget)) return null;
+  const rows = [];
+  hops.forEach((n, i) => {
+    const b = n.budget;
+    if (!b || !b.limits.length) return;
+    for (const l of b.limits) {
+      rows.push(h('tr', null,
+        h('td', null, `hop ${i} `, i === hops.length - 1 ? mono(n.lease_id.slice(0, 10) + '…') : link(['lease', n.lease_id], mono(n.lease_id.slice(0, 10) + '…'), { title: n.lease_id })),
+        h('td', { class: 'wrap' }, l.server !== null ? mono(`${l.server} / ${l.tool}`) : h('span', { class: 'muted' }, `capability ${l.cap}`)),
+        h('td', null, h('span', { class: 'tag' }, l.kind)),
+        h('td', null, l.arg !== null ? mono(l.arg) : h('span', { class: 'muted' }, '—')),
+        h('td', { class: 'num' }, usedText(l)),
+        h('td', { class: 'num' }, l.max !== null ? mono(l.max) : h('span', { class: 'muted' }, 'not recorded')),
+        h('td', { class: 'num' }, l.remaining !== null ? mono(l.remaining) : h('span', { class: 'muted' }, '—'))));
+    }
+  });
+  const usage = (tree.ancestors.length ? tree.ancestors[tree.ancestors.length - 1] : tree.nodes[0]).budget;
+  const usageRows = usage ? usage.usage.map((u) => h('tr', null,
+    h('td', { class: 'wrap' }, mono(u.tool)),
+    h('td', { class: 'num' }, mono(u.calls)),
+    h('td', { class: 'num' }, mono(u.amount)),
+    h('td', { class: 'num' }, mono(u.destinations)))) : [];
+  return h('section', { class: 'panel' },
+    h('header', null, h('h2', null, 'Run limits')),
+    rows.length
+      ? h('div', null,
+        h('p', { class: 'small muted' }, 'The limits each hop of this chain was issued with, root first, and what their counters hold now. A call is charged to every hop it passes through, so the smallest figure left along the chain is what this lease can still spend.'),
+        table(['Hop', 'Capability', 'Kind', 'Argument', 'Used', 'Max', 'Left'], rows, { short: true }))
+      : h('p', { class: 'muted small' }, 'No hop of this chain carries run limits.'),
+    usageRows.length
+      ? h('div', null,
+        h('h3', null, 'Run usage'),
+        h('p', { class: 'small muted' }, 'Allowed calls of each destructive tool across the whole run, as policies see them in ', mono('context.usage'), '.'),
+        table(['Tool', 'Calls', 'Amount', 'Destinations'], usageRows, { short: true }))
+      : null,
+    hops.some((n) => n.budget && !n.budget.recorded)
+      ? h('p', { class: 'small muted' }, 'Some hops were issued before the server kept their limits: their counters are shown without a maximum.')
+      : null);
+}
+
+/** `used`, with how many values a `calls_per` limit has seen. */
+function usedText(l) {
+  if (l.kind === 'calls_per') {
+    return h('span', null, mono(l.used), h('span', { class: 'muted small' }, ` most per value, ${l.values} value${l.values === 1 ? '' : 's'}`));
+  }
+  return mono(l.used);
+}
+
+/** One line for a tree node: each limit as `kind used/max`. */
+function limitsSummary(n) {
+  const b = n.budget;
+  if (!b || !b.limits.length) return null;
+  const parts = b.limits.map((l) => `${l.kind}${l.arg !== null ? ` ${l.arg}` : ''} ${l.used}/${l.max !== null ? l.max : '?'}`);
+  return h('span', { class: 'small muted', title: 'Run limits of this hop: used/max' }, parts.join(' · '));
 }
 
 async function reload(root, leaseId) {
@@ -117,6 +184,7 @@ function nodeRow(n, root, focus) {
         ? h('span', { class: 'muted' }, time(n.revoked_at), n.revoke_reason ? ` · ${n.revoke_reason}` : '')
         : h('span', { class: 'muted' }, 'expires ', time(n.expires_at)),
       n.issued_seq !== null ? link(['entry', n.issued_seq], `issued at seq ${n.issued_seq}`) : h('span', { class: 'muted' }, 'issuance not found'),
+      limitsSummary(n),
       toggle),
     renewals);
 }

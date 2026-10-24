@@ -248,8 +248,10 @@ pub struct TreeQuery {
 ///   sent now, counted over the whole subtree with the same query the revocation runs.
 ///
 /// Each node carries its registry row, whether it is active now, and `agent`, `issued_at`
-/// and `issued_seq` from the audit record that issued it (null when none is found). Nothing
-/// is written, not even an audit record: this is a read like `GET /admin/leases/{id}`.
+/// and `issued_seq` from the audit record that issued it (null when none is found), and
+/// `budget`, the hop's run limits and what is left of them (see `hop_budget`; null when
+/// the hop has no limits and nothing was charged under its lease). Nothing is written, not
+/// even an audit record: this is a read like `GET /admin/leases/{id}`.
 pub async fn lease_tree(
     State(state): State<Arc<AppState>>,
     Path(lease_id): Path<String>,
@@ -283,9 +285,16 @@ pub async fn lease_tree(
                 .collect();
             let now = now();
             let fmt = |t: time::OffsetDateTime| t.format(&Rfc3339).unwrap_or_default();
+            let budgets: BTreeMap<&LeaseId, Value> = tree
+                .ancestors
+                .iter()
+                .chain(&tree.nodes)
+                .map(|n| Ok((&n.id, hop_budget(state.leases.as_ref(), &n.id)?)))
+                .collect::<Result<_, ApiError>>()?;
             let node = |n: &LeaseNode| {
                 let issuance = issued.get(&n.id);
                 json!({
+                    "budget": budgets.get(&n.id).cloned().unwrap_or(Value::Null),
                     "lease_id": n.id,
                     "parent": n.row.parent,
                     "expires_at": fmt(n.row.expires_at),
@@ -306,6 +315,99 @@ pub async fn lease_tree(
             })))
         })
         .await
+}
+
+/// The `budget` member of a lease tree node (run limits, ADR-0010): `null` when the hop has no
+/// recorded limits and nothing was charged under its lease, else
+/// `{recorded, limits: [..], usage: [..]}`:
+///
+/// - `recorded`: the server kept the hop's limits when it issued the token (leases issued by
+///   an older version have counters but no recorded limits, so their `max` is null).
+/// - `limits`: one entry per limit, `{cap, server, tool, kind, arg, max, used, remaining,
+///   values}`. `arg` is null for `calls` and `arg#host` for a derived value. `used` is what
+///   the counter holds: calls, the sum, for `distinct` how many values were seen, and for
+///   `calls_per` the most calls any one value has had (`values` says how many values were
+///   seen). `remaining` is `max - used` (for `calls_per`, what the most used value has left).
+/// - `usage`: on a run's root lease, the run's usage per destructive tool, `{tool, calls,
+///   amount, destinations}`.
+///
+/// Read only; value hashes are never shown.
+fn hop_budget(leases: &dyn attenuo_audit::LeaseStore, lease: &LeaseId) -> Result<Value, ApiError> {
+    let recorded = leases.hop_limits(lease)?;
+    let counters = leases.budget_summary(lease)?;
+    if recorded.is_none() && counters.is_empty() {
+        return Ok(Value::Null);
+    }
+    let find = |cap: usize, kind: &str, arg: &str| {
+        counters
+            .iter()
+            .find(|c| c.cap == cap && c.kind == kind && c.arg == arg)
+    };
+    let entry = |cap: usize,
+                 server: Option<&str>,
+                 tool: Option<&str>,
+                 kind: &str,
+                 arg: Option<String>,
+                 max: Option<u64>| {
+        let row = find(cap, kind, arg.as_deref().unwrap_or(""));
+        let used = row.map_or(0, |r| r.used);
+        let mut v = json!({
+            "cap": cap,
+            "server": server,
+            "tool": tool,
+            "kind": kind,
+            "arg": arg,
+            "max": max,
+            "used": used,
+            "remaining": max.map(|m| m.saturating_sub(used)),
+        });
+        if kind == "calls_per" {
+            v["values"] = row.map_or(0, |r| r.values).into();
+        }
+        v
+    };
+    let mut limits = Vec::new();
+    match &recorded {
+        Some(hop) => {
+            for h in hop {
+                let (s, t, l) = (Some(h.server.as_str()), Some(h.tool.as_str()), &h.limits);
+                if let Some(max) = l.calls {
+                    limits.push(entry(h.cap, s, t, "calls", None, Some(max)));
+                }
+                for (kind, a) in [
+                    ("sum", &l.sum),
+                    ("calls_per", &l.calls_per),
+                    ("distinct", &l.distinct),
+                ] {
+                    if let Some(a) = a {
+                        limits.push(entry(h.cap, s, t, kind, Some(a.counted()), Some(a.max)));
+                    }
+                }
+            }
+        }
+        None => {
+            for c in counters.iter().filter(|c| !c.kind.starts_with("usage_")) {
+                let arg = (!c.arg.is_empty()).then(|| c.arg.clone());
+                limits.push(entry(c.cap, None, None, &c.kind, arg, None));
+            }
+        }
+    }
+    let mut usage: BTreeMap<&str, Value> = BTreeMap::new();
+    for c in counters.iter().filter(|c| c.kind.starts_with("usage_")) {
+        let u = usage
+            .entry(c.arg.as_str())
+            .or_insert_with(|| json!({"tool": c.arg, "calls": 0, "amount": 0, "destinations": 0}));
+        match c.kind.as_str() {
+            "usage_calls" => u["calls"] = c.used.into(),
+            "usage_amount" => u["amount"] = c.used.into(),
+            _ => u["destinations"] = c.values.into(),
+        }
+    }
+    Ok(json!({
+        "recorded": recorded.is_some(),
+        "limits": limits,
+        "usage": usage.into_values().collect::<Vec<_>>(),
+    }))
 }
 
 /// Most seqs one filtered `GET /admin/audit` page reads. `agent`, `lease`, `since` and

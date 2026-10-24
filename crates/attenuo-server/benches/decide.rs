@@ -121,6 +121,7 @@ fn limited_read_file(sum: bool) -> CapabilitySet {
         calls: Some(1 << 40),
         sum: sum.then(|| ArgLimit::new("n", 1 << 50)),
         calls_per: None,
+        distinct: None,
     };
     CapabilitySet::from_iter([Capability::new("fake", "read_file").with_limits(limits)])
 }

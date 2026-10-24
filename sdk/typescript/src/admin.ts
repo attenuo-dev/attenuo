@@ -166,6 +166,42 @@ export interface LeaseNode {
   revokeReason: string | undefined;
   issuedAt: string | undefined;
   issuedSeq: number | undefined;
+  /** The hop's run limits and what is left; undefined when it has none and nothing was charged. */
+  budget: LeaseBudget | undefined;
+}
+
+/**
+ * One run limit of a hop and what its counter holds. `arg` is `arg#host` for a derived value.
+ * `used` is calls, the sum, for `distinct` the values seen, and for `calls_per` the most calls
+ * any one value has had (`values` counts the values). `max` and `remaining` are undefined for a
+ * hop issued before the server kept its limits.
+ */
+export interface LeaseLimit {
+  cap: number;
+  server: string | undefined;
+  tool: string | undefined;
+  kind: string;
+  arg: string | undefined;
+  max: number | undefined;
+  used: number;
+  remaining: number | undefined;
+  values: number | undefined;
+}
+
+/** A run's usage of one destructive tool (on the run's root lease). */
+export interface LeaseUsage {
+  tool: string;
+  calls: number;
+  amount: number;
+  destinations: number;
+}
+
+/** The `budget` of a lease tree node. */
+export interface LeaseBudget {
+  /** The server kept the hop's limits when it issued the token. */
+  recorded: boolean;
+  limits: LeaseLimit[];
+  usage: LeaseUsage[];
 }
 
 /** What a revoke of the lease would reach, changing nothing. */
@@ -341,6 +377,33 @@ function leaseNodeOf(n: Json): LeaseNode {
     revokeReason: opt<string>(n.revoke_reason),
     issuedAt: opt<string>(n.issued_at),
     issuedSeq: opt<number>(n.issued_seq),
+    budget: budgetOf(n.budget),
+  };
+}
+
+function budgetOf(v: unknown): LeaseBudget | undefined {
+  if (typeof v !== "object" || v === null) return undefined;
+  const b = v as Json;
+  const list = (x: unknown): Json[] => (Array.isArray(x) ? (x as Json[]) : []);
+  return {
+    recorded: b.recorded === true,
+    limits: list(b.limits).map((l) => ({
+      cap: Number(l.cap),
+      server: opt<string>(l.server),
+      tool: opt<string>(l.tool),
+      kind: String(l.kind),
+      arg: opt<string>(l.arg),
+      max: opt<number>(l.max),
+      used: Number(l.used),
+      remaining: opt<number>(l.remaining),
+      values: opt<number>(l.values),
+    })),
+    usage: list(b.usage).map((u) => ({
+      tool: String(u.tool),
+      calls: Number(u.calls),
+      amount: Number(u.amount),
+      destinations: Number(u.destinations),
+    })),
   };
 }
 

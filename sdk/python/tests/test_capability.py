@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from attenuo import Capability, Equals, OneOf, Prefix
+from attenuo import ArgLimit, Capability, Equals, Limits, OneOf, Prefix
 from attenuo.capability import capabilities_to_json
 
 
@@ -96,10 +96,50 @@ def test_limits_round_trip_and_unknown_kinds_are_refused() -> None:
     assert capabilities_to_json([wire]) == [wire]
     assert "limits" not in Capability("banking", "send_money").to_json()
     for bad in (
-        {"distinct": {"arg": "to", "max": 1}},
+        {"window": {"arg": "to", "max": 1}},
         {"calls": -1},
         {"calls": 1.5},
         {"sum": {"arg": "amount"}},
+        {"sum": {"arg": "url", "max": 1, "derive": "host"}},
+        {"distinct": {"arg": "url", "max": 1, "derive": "path"}},
+        {"distinct": {"arg": "", "max": 1}},
+        {"calls_per": {"arg": "to", "max": 1, "extra": 1}},
+        {"distinct": {"arg": "to", "max": 2**63}},
     ):
         with pytest.raises(ValueError):
             Capability.from_json({"server": "b", "tool": "t", "limits": bad})
+
+
+def test_distinct_and_derived_limits_are_typed() -> None:
+    cap = Capability("web", "get_webpage").with_limits(
+        calls=5, distinct=ArgLimit("url", 2, derive="host")
+    )
+    wire = {
+        "server": "web",
+        "tool": "get_webpage",
+        "limits": {"calls": 5, "distinct": {"arg": "url", "max": 2, "derive": "host"}},
+    }
+    assert cap.to_json() == wire
+    assert Capability.from_json(wire) == cap
+    assert capabilities_to_json([wire]) == [wire]
+    typed = cap.typed_limits
+    assert typed == Limits(calls=5, distinct=ArgLimit("url", 2, "host"))
+    assert typed.distinct is not None and typed.distinct.counted == "url#host"
+    # Tuples work too, with or without a derivation, and a whole Limits can be passed.
+    same = Capability("web", "get_webpage").with_limits(calls=5, distinct=("url", 2, "host"))
+    assert same == cap
+    assert Capability("web", "get_webpage").with_limits(typed) == cap
+    per = Capability("mail", "send").with_limits(calls_per=("to", 1), distinct=("to", 3))
+    assert per.to_json()["limits"] == {
+        "calls_per": {"arg": "to", "max": 1},
+        "distinct": {"arg": "to", "max": 3},
+    }
+    assert Capability("a", "b").typed_limits.is_empty()
+    with pytest.raises(ValueError):
+        Capability("a", "b").with_limits(sum=("url", 1, "host"))
+    with pytest.raises(ValueError):
+        Capability("a", "b").with_limits(typed, calls_per=("to", 1))
+    with pytest.raises(ValueError):
+        ArgLimit("url", 1, "path")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        ArgLimit("url", -1)

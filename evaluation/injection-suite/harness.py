@@ -39,6 +39,21 @@ these arms:
                        (``context.usage.calls >= 1``, run-limits phase 2). Approvals are settled
                        as in the labels arm. Runs only when the probe's second destructive call
                        gets ``-32008`` with ``usage`` in its data; skipped otherwise.
+``attenuo_usage_host``  as ``attenuo_usage_soft``, with the web fetch counted per site: the
+                       catalog entries that ``policies/url-hosts.json`` lists get ``destination =
+                       "url#host"``, and ``policies/usage-host.cedar`` asks on a fetch from a
+                       host the run has not fetched from (after its first fetch) instead of on
+                       every second fetch. Probed like the usage arm.
+``attenuo_distinct_host``  as ``attenuo``, with the ``distinct`` limit of
+                       ``policies/url-hosts.json`` (at most 1 URL host) added to every exchanged
+                       capability that names a listed web-fetching tool. Runs only when the
+                       server enforces a host ``distinct`` limit; skipped otherwise.
+``attenuo_distinct_host2``  the same with ``policies/url-hosts-max2.json`` (at most 2 URL hosts),
+                       added after the browsing dev cases. Probed the same way.
+``attenuo_distinct_recipient``  as ``attenuo``, with the ``distinct`` limits of
+                       ``policies/distinct-recipients.json`` (at most 1 recipient) added to every
+                       exchanged capability that names a listed messaging, mail or sharing tool.
+                       Probed with the file's ``probe`` call; skipped when it is not refused.
 
 No LLM is involved. See README.md for the method and its limits.
 """
@@ -127,6 +142,10 @@ ARMS = (
     "attenuo_labels_limits",
     "attenuo_labels_args",
     "attenuo_usage_soft",
+    "attenuo_usage_host",
+    "attenuo_distinct_host",
+    "attenuo_distinct_host2",
+    "attenuo_distinct_recipient",
 )
 PROXIED = ARMS[1:]
 CONSTRAINED_ARMS = (
@@ -137,6 +156,10 @@ CONSTRAINED_ARMS = (
     "attenuo_labels_limits",
     "attenuo_labels_args",
     "attenuo_usage_soft",
+    "attenuo_usage_host",
+    "attenuo_distinct_host",
+    "attenuo_distinct_host2",
+    "attenuo_distinct_recipient",
 )
 # Arms that load an @obligation("approval") policy and settle -32008 with the scripted approver.
 LABEL_ARMS = (
@@ -144,6 +167,7 @@ LABEL_ARMS = (
     "attenuo_labels_limits",
     "attenuo_labels_args",
     "attenuo_usage_soft",
+    "attenuo_usage_host",
 )
 LABELS_POLICY = POLICIES_DIR / "labels.cedar"
 # Option (b), argument-level taint (docs/design/output-labelling.md section 3.4).
@@ -151,8 +175,32 @@ ARG_LABEL_ARMS = ("attenuo_labels_args",)
 LABELS_ARGS_POLICY = POLICIES_DIR / "labels-args.cedar"
 # Soft run-usage limits (docs/design/run-limits.md section 3.5, phase 2): ask on the second and
 # later call of one destructive tool in a run, instead of any labels policy.
-USAGE_ARMS = ("attenuo_usage_soft",)
+USAGE_ARMS = ("attenuo_usage_soft", "attenuo_usage_host")
 USAGE_SOFT_POLICY = POLICIES_DIR / "usage-soft.cedar"
+# Derived destinations (docs/design/run-limits.md, phase 2, second slice): the web-fetching tools
+# of the frozen catalogs, the catalog `destination` and the hard `distinct` limit the host arms
+# give them. `attenuo_usage_host` counts fetches per site in a soft rule; `attenuo_distinct_host`
+# refuses a fetch from more than `max` hosts per capability.
+URL_HOSTS = POLICIES_DIR / "url-hosts.json"
+USAGE_HOST_POLICY = POLICIES_DIR / "usage-host.cedar"
+HOST_DESTINATION_ARMS = ("attenuo_usage_host",)
+HOST_LIMIT_ARMS = ("attenuo_distinct_host", "attenuo_distinct_host2")
+# The second host limit (`max: 2`), frozen after the browsing dev cases were written, and the
+# recipient limit on messaging, mail and sharing tools, frozen after the test split was read.
+URL_HOSTS_MAX2 = POLICIES_DIR / "url-hosts-max2.json"
+DISTINCT_RECIPIENTS = POLICIES_DIR / "distinct-recipients.json"
+RECIPIENT_LIMIT_ARMS = ("attenuo_distinct_recipient",)
+# Every arm that adds a frozen `distinct` rule to exchanged capabilities, and its file.
+DISTINCT_ARMS = HOST_LIMIT_ARMS + RECIPIENT_LIMIT_ARMS
+DISTINCT_RULE_FILES = {
+    "attenuo_distinct_host": URL_HOSTS,
+    "attenuo_distinct_host2": URL_HOSTS_MAX2,
+    "attenuo_distinct_recipient": DISTINCT_RECIPIENTS,
+}
+# The dev cases added on 2026-10-24 after the host arms' first run, whose benign task fetches
+# several pages of one site or pages of two sites (docs/design/run-limits.md, "Measured:
+# browsing cases"). slack-16 and slack-17 are attack variants. Reports split them out.
+BROWSING_CASES = ("slack-12", "slack-13", "slack-14", "slack-15", "slack-16", "slack-17")
 # The dev cases added on 2026-10-24 whose benign task needs a repeated destructive call
 # (docs/design/run-limits.md, "Measured: multi-call benign cases"). Reports split them out.
 MULTI_CALL_CASES = (
@@ -172,6 +220,8 @@ MULTI_CALL_CASES = (
 # every capability that is not a read.
 LIMIT_ARMS = ("attenuo_limits", "attenuo_labels_limits")
 LIMITS_RULE = POLICIES_DIR / "limits-rule.json"
+# Every arm whose tokens carry a run limit; their calls may be refused at stage ``budget``.
+BUDGET_ARMS = LIMIT_ARMS + DISTINCT_ARMS
 # Refusals by a run limit, in the capability stage after the capability check (ADR-0010).
 BUDGET_REASONS = ("budget_exhausted", "budget_error", "limit_arg_invalid")
 PERMIT_ALL_ARMS = ("scope_only", "scope_constraints")
@@ -553,6 +603,59 @@ def limits_rule(path: Path | None = None) -> dict[str, Any]:
     return limits
 
 
+def url_hosts(path: Path | None = None) -> dict[str, Any]:
+    """The frozen ``policies/url-hosts.json``: ``tools`` (web-fetching tools by upstream),
+    ``destination`` (their catalog destination) and ``limits`` (the host arm's limit), with the
+    limits checked the way the SDK checks a capability's."""
+    doc = dict(json.loads((path or URL_HOSTS).read_text()))
+    Capability.from_json({"server": "x", "tool": "y", "limits": doc["limits"]})
+    return doc
+
+
+def apply_host_limit(
+    caps: list[Capability], tools: dict[str, list[str]], limits: dict[str, Any]
+) -> list[Capability]:
+    """Add ``limits`` to every capability in ``caps`` that names exactly one tool of ``tools``
+    (by upstream), in place. A glob is not such a tool, whatever it matches."""
+    for cap in caps:
+        if cap.tool in tools.get(cap.server, ()):
+            cap.limits = Capability.from_json(
+                {"server": cap.server, "tool": cap.tool, "limits": limits}
+            ).limits
+    return caps
+
+
+def distinct_rule(arm: str) -> dict[str, dict[str, dict[str, Any]]]:
+    """The frozen ``distinct`` rule of an arm in ``DISTINCT_ARMS``, as ``{upstream: {tool:
+    limits}}``. A host file (``url-hosts*.json``) gives every listed tool its one ``limits``; the
+    recipient file lists ``limits`` per tool. Each is checked the way the SDK checks one."""
+    path = DISTINCT_RULE_FILES[arm]
+    doc = dict(json.loads(path.read_text()))
+    if arm in HOST_LIMIT_ARMS:
+        hosts = url_hosts(path)
+        rule = {u: {t: dict(hosts["limits"]) for t in ts} for u, ts in hosts["tools"].items()}
+    else:
+        rule = {u: {t: dict(lim) for t, lim in ts.items()} for u, ts in doc["tools"].items()}
+    for u, ts in rule.items():
+        for t, lim in ts.items():
+            Capability.from_json({"server": u, "tool": t, "limits": lim})
+    return rule
+
+
+def apply_distinct_rule(
+    caps: list[Capability], rule: dict[str, dict[str, dict[str, Any]]]
+) -> list[Capability]:
+    """Add each tool's limits from ``rule`` to every capability in ``caps`` that names exactly
+    that tool (by upstream), in place. A glob is not such a tool, whatever it matches."""
+    for cap in caps:
+        lim = rule.get(cap.server, {}).get(cap.tool)
+        if lim is not None:
+            cap.limits = Capability.from_json(
+                {"server": cap.server, "tool": cap.tool, "limits": lim}
+            ).limits
+    return caps
+
+
 def is_read_capability(cap: Capability, env: dict[str, Suite]) -> bool:
     """A capability that names exactly one read (``env`` is keyed by upstream). A glob is not
     a read, whatever it matches."""
@@ -600,6 +703,8 @@ def agent_ids(suites: list[Suite]) -> list[str]:
 
 def labels_policy(arm: str) -> Path:
     """The approval policy file an arm in ``LABEL_ARMS`` loads."""
+    if arm in HOST_DESTINATION_ARMS:
+        return USAGE_HOST_POLICY
     if arm in USAGE_ARMS:
         return USAGE_SOFT_POLICY
     return LABELS_ARGS_POLICY if arm in ARG_LABEL_ARMS else LABELS_POLICY
@@ -624,6 +729,10 @@ def write_config(
             text += f"\n// ---- approval policy ({labels.name}) ----\n{labels.read_text()}"
         policy.write_text(text)
     secret_sha = hashlib.sha256(AGENT_SECRET.encode()).hexdigest()
+    destinations: dict[str, list[str]] = {}
+    if arm in HOST_DESTINATION_ARMS:
+        hosts = url_hosts()
+        destinations = {u: list(ts) for u, ts in hosts["tools"].items()}
     lines = [
         "# Generated by evaluation/injection-suite/harness.py. Do not edit.",
         "[server]",
@@ -642,6 +751,8 @@ def write_config(
                 lines.append("readonly = true")
             if spec.get("sensitive"):
                 lines.append("sensitive = true")
+            if tool in destinations.get(s.upstream, ()):
+                lines.append(f"destination = {_toml_str(hosts['destination'])}")
             inputs = ", ".join(
                 f"{k} = {_toml_type(v)}" for k, v in (spec.get("inputs") or {}).items()
             )
@@ -815,9 +926,13 @@ def server(
         first = next((ln for ln in lines if "error" in ln), lines[0] if lines else "no output")
         first = first[first.find("error") :] if "error" in first else first  # drop the tmp path
         what = "run-usage" if arm in USAGE_ARMS else "output-labelling"
+        if arm in HOST_DESTINATION_ARMS:
+            what = "run-usage attributes or derived catalog destinations (`url#host`)"
+        else:
+            what += " attributes"
         raise ArmUnsupported(
-            f"`attenuo policy lint` rejects policies/{labels_policy(arm).name}, so this server "
-            f"has no {what} attributes ({first})"
+            f"`attenuo policy lint` rejects policies/{labels_policy(arm).name} with its catalog, "
+            f"so this server has no {what} ({first})"
         )
     if lint.returncode != 0:
         raise RuntimeError(f"policy lint failed for arm {arm}:\n{lint.stdout}{lint.stderr}")
@@ -1077,9 +1192,12 @@ class _Replayer:
         self.stack, self.ob, self.admin = stack, ob, admin
         self.env: dict[str, Suite] = {}
         self.limits: dict[str, Any] | None = None
+        self.distinct: dict[str, dict[str, dict[str, Any]]] | None = None
         if arm in LIMIT_ARMS:
             self.env = {s.upstream: s for s in load_environment().values()}
             self.limits = limits_rule()
+        if arm in DISTINCT_ARMS:
+            self.distinct = distinct_rule(arm)
         self.tokens: dict[str, Any] = {}
         self.refused: dict[str, str] = {}
         self.out: list[CallResult] = []
@@ -1103,6 +1221,8 @@ class _Replayer:
         self.tokens[WORKER] = self.ob.exchange(root, WORKER, caps, client_secret=AGENT_SECRET)
 
     def _limited(self, caps: list[Capability]) -> list[Capability]:
+        if self.distinct is not None:
+            apply_distinct_rule(caps, self.distinct)
         if self.limits is None:
             return caps
         return apply_limits_rule(caps, self.env, self.limits)
@@ -1509,6 +1629,64 @@ def limits_probe_verdict(reply: dict[str, Any] | None) -> str | None:
     )
 
 
+def probe_host_limit(
+    stack: Stack, all_upstreams: list[str], arm: str = "attenuo_distinct_host"
+) -> str | None:
+    """None if the server enforces the frozen ``distinct`` rule of ``arm`` (an arm in
+    ``DISTINCT_ARMS``), else why the arm cannot run. With its own tokens: one capability with
+    the rule's limit, then calls with ``max + 1`` different values; the last must get ``-32003
+    budget_exhausted``. A host rule fetches from that many hosts; the recipient rule sends its
+    file's ``probe`` call with each of its values. A server without ``distinct`` or derived
+    destinations refuses the token at exchange."""
+    rule = distinct_rule(arm)
+    if arm in HOST_LIMIT_ARMS:
+        upstream, tools = next(iter(rule.items()))
+        tool, limits = next(iter(tools.items()))
+        arg = limits["distinct"]["arg"]
+        n = int(limits["distinct"]["max"]) + 1
+        values: list[Any] = [f"https://probe-{i}.example/a" for i in range(1, n + 1)]
+        what = "a URL-host `distinct` limit"
+    else:
+        probe = json.loads(DISTINCT_RULE_FILES[arm].read_text())["probe"]
+        upstream, tool, arg = probe["server"], probe["tool"], probe["arg"]
+        n = int(rule[upstream][tool]["distinct"]["max"]) + 1
+        values = list(probe["values"])[:n]
+        if len(values) != n:
+            raise ValueError(f"{DISTINCT_RULE_FILES[arm].name}: probe needs {n} values")
+        what = "a `distinct` limit"
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    try:
+        root = admin.mint_root_dev(USER, USER_ISSUER, ROOT_AGENT, [f"{u}:*" for u in all_upstreams])
+    finally:
+        admin.close()
+    caps = apply_distinct_rule([Capability(upstream, tool)], rule)
+    with Client(stack.url) as ob:
+        try:
+            token = ob.exchange(root, WORKER, caps, client_secret=AGENT_SECRET)
+        except ApiError as e:
+            return (
+                f"the server refuses a token with {what} "
+                f"({e.error}: {e.detail or e.description or ''})"
+            )
+    headers = {
+        "accept": "application/json, text/event-stream",
+        "content-type": "application/json",
+        "authorization": f"Bearer {token}",
+    }
+    msgs: list[dict[str, Any] | None] = []
+    with httpx.Client(timeout=10) as http:
+        for i, value in enumerate(values, start=1):
+            call = Call(tool, {arg: value}, "benign", "allow", None)
+            resp = http.post(
+                f"{stack.url}/mcp/{upstream}", json=_rpc_body(call, i), headers=headers
+            )
+            msgs.append(next(iter(_parse_messages(resp)), None))
+    why = limits_probe_verdict(msgs[-1])
+    if why:
+        return why.replace("a `calls: 1` capability", f"a capability with {n - 1} value(s) seen")
+    return None
+
+
 def ordered_cases(suites: list[Suite], seed: int) -> list[tuple[Suite, Case]]:
     """Cases in file order (seed 0) or in an order shuffled by ``seed``. Results are sorted by
     case id afterwards, so the seed changes only the order of execution."""
@@ -1650,6 +1828,10 @@ def run(
                     with server(env, bins, work, ups, arm, agents) as stack:
                         if arm in LIMIT_ARMS:
                             why = probe_limits(stack, all_upstreams)
+                            if why:
+                                raise ArmUnsupported(why)
+                        if arm in DISTINCT_ARMS:
+                            why = probe_host_limit(stack, all_upstreams, arm)
                             if why:
                                 raise ArmUnsupported(why)
                         if arm in USAGE_ARMS:

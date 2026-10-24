@@ -259,4 +259,8 @@ fn catalog_usage_fields_are_checked() {
     )
     .is_err());
     assert!(build(ToolAttrs::new().with_destination("")).is_err());
+    // A derived destination (run-limits phase 2): `#host` only, after an input name.
+    assert!(build(ToolAttrs::new().with_destination("url#host")).is_ok());
+    assert!(build(ToolAttrs::new().with_destination("url#path")).is_err());
+    assert!(build(ToolAttrs::new().with_destination("#host")).is_err());
 }

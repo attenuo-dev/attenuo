@@ -59,6 +59,9 @@ pub enum Command {
     /// List, show, grant and decline approvals of gated calls (as an operator).
     #[command(subcommand)]
     Approval(ApprovalCmd),
+    /// Administer run-limit budgets (ADR-0010).
+    #[command(subcommand)]
+    Budget(BudgetCmd),
     /// Read and verify the audit log.
     #[command(subcommand)]
     Audit(AuditCmd),
@@ -386,7 +389,9 @@ pub enum LeaseCmd {
     /// Show a lease's state.
     Show { id: String },
     /// Show the lease, everything delegated from it and its ancestors, and how many leases a
-    /// revoke sent now would change. A dry run of `lease revoke`: nothing is written.
+    /// revoke sent now would change. A dry run of `lease revoke`: nothing is written. Under
+    /// each lease with run limits, one line per limit (used, maximum and what is left) and, on
+    /// the run's root lease, the run's usage per destructive tool.
     Tree {
         id: String,
         /// Most leases to list (server default 1000, at most 10000). `would_revoke` still
@@ -394,6 +399,33 @@ pub enum LeaseCmd {
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         max_nodes: Option<u64>,
     },
+}
+
+/// Run-limit budgets: what a token's `limits` let a run spend (ADR-0010). The figures
+/// themselves are shown by `lease tree`.
+#[derive(Debug, Subcommand)]
+pub enum BudgetCmd {
+    /// Give back to every run-limit counter what one allowed decision charged, once, for a
+    /// call whose effect did not happen (`POST /admin/budgets/refund`). The refund is audited
+    /// as an `admin.budget.refund` record. Exits 2 when the decision charged nothing and 3 when
+    /// it was already refunded.
+    Refund {
+        /// The allowed call's decision id (the record id `audit tail` prints as `id=`, or the
+        /// AuthZEN `context.decision_id`).
+        #[arg(value_parser = NonEmptyStringValueParser::new())]
+        decision_id: String,
+        /// Why the charge is given back. Recorded in the audit log; required and not blank.
+        #[arg(long, value_parser = parse_reason)]
+        reason: String,
+    },
+}
+
+/// A refund reason: any text that is not blank.
+fn parse_reason(s: &str) -> Result<String, String> {
+    if s.trim().is_empty() {
+        return Err("the reason must not be empty".to_string());
+    }
+    Ok(s.to_string())
 }
 
 /// Approvals of calls a policy gated with `@obligation("approval")` (JSON-RPC `-32008`). These
@@ -1128,11 +1160,21 @@ mod tests {
             limited[0]["limits"],
             json!({"calls": 1, "sum": {"arg": "amount", "max": 10}})
         );
-        assert!(parse_caps(&[
-            r#"{"server":"bank","tool":"send_money","limits":{"distinct":{"arg":"to","max":1}}}"#
-                .into()
+        // `distinct` and derived values (phase 2) pass through too.
+        let distinct = parse_caps(&[
+            r#"{"server":"web","tool":"get_webpage","limits":{"distinct":{"arg":"url","derive":"host","max":1}}}"#.into(),
         ])
-        .is_err());
+        .unwrap();
+        assert_eq!(
+            distinct[0]["limits"],
+            json!({"distinct": {"arg": "url", "derive": "host", "max": 1}})
+        );
+        for bad in [
+            r#"{"server":"bank","tool":"send_money","limits":{"window":{"arg":"to","max":1}}}"#,
+            r#"{"server":"web","tool":"get","limits":{"distinct":{"arg":"url","derive":"path","max":1}}}"#,
+        ] {
+            assert!(parse_caps(&[bad.into()]).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -1368,6 +1410,35 @@ mod tests {
         assert_eq!((id.as_str(), max_nodes), ("L1", Some(50)));
         assert!(parse(&["lease", "tree"]).is_err());
         assert!(parse(&["lease", "tree", "L1", "--max-nodes", "0"]).is_err());
+    }
+
+    #[test]
+    fn budget_refund_needs_a_decision_and_a_reason() {
+        let Command::Budget(BudgetCmd::Refund {
+            decision_id,
+            reason,
+        }) = parse(&["budget", "refund", "D1", "--reason", "upstream timed out"])
+            .unwrap()
+            .command
+        else {
+            panic!("not refund")
+        };
+        assert_eq!(
+            (decision_id.as_str(), reason.as_str()),
+            ("D1", "upstream timed out")
+        );
+        // `--json` is global, so it goes on either side of the subcommand.
+        let cli = parse(&["budget", "refund", "D1", "--reason", "x", "--json"]).unwrap();
+        assert!(cli.json);
+        assert!(
+            parse(&["budget", "refund", "D1"]).is_err(),
+            "--reason required"
+        );
+        assert!(parse(&["budget", "refund", "--reason", "x"]).is_err());
+        assert!(parse(&["budget", "refund", "", "--reason", "x"]).is_err());
+        assert!(parse(&["budget", "refund", "D1", "--reason", ""]).is_err());
+        assert!(parse(&["budget", "refund", "D1", "--reason", "  \t"]).is_err());
+        assert!(parse(&["budget"]).is_err());
     }
 
     #[test]

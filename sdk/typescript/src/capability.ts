@@ -15,6 +15,18 @@
  * ```ts
  * withLimits(capability("banking", "send_money"), { calls: 1, sum: { arg: "amount", max: 10 } })
  * ```
+ *
+ * `distinct` bounds how many different values an argument may take, and `calls_per` and
+ * `distinct` can count the host of a URL argument instead of the whole value:
+ *
+ * ```ts
+ * withLimits(capability("web", "get_webpage"), { distinct: argLimit("url", 2, { derive: "host" }) })
+ * // limits: { distinct: { arg: "url", max: 2, derive: "host" } }
+ * ```
+ *
+ * A child token is attenuated by passing such capabilities to `exchange`. The server keeps a
+ * child's figures no larger than its parent's (it lowers larger ones and fills in a limit the
+ * child leaves out), and charges every call to every hop.
  */
 
 export type Constraint =
@@ -22,20 +34,42 @@ export type Constraint =
   | { op: "one_of"; value: unknown[] }
   | { op: "prefix"; value: string };
 
-/** A run limit over one argument: a total (`sum`) or a count per distinct value (`calls_per`). */
+/**
+ * What a `calls_per` or `distinct` limit may count instead of the argument itself. `"host"`: the
+ * host of a URL argument (lowercased, without port or user info), so two pages of one site are one
+ * value; a value with no host cannot be counted and the call is refused (`limit_arg_invalid`).
+ */
+export type Derive = "host";
+
+/**
+ * A run limit over one argument: a total (`sum`), a count per value (`calls_per`) or a count of
+ * values (`distinct`). `derive` (`calls_per` and `distinct` only) counts a value derived from the
+ * argument; the server then names it `arg#host` in records and errors.
+ */
 export interface ArgLimit {
   arg: string;
   max: number;
+  derive?: Derive;
 }
 
 /**
  * Run limits (ADR-0010): at most `calls` matched calls, a total of at most `sum.max` over
- * argument `sum.arg`, at most `calls_per.max` calls per value of argument `calls_per.arg`.
+ * argument `sum.arg`, at most `calls_per.max` calls per value of argument `calls_per.arg`, and at
+ * most `distinct.max` different values of argument `distinct.arg`. List-valued arguments count
+ * each element.
  */
 export interface Limits {
   calls?: number;
   sum?: ArgLimit;
   calls_per?: ArgLimit;
+  distinct?: ArgLimit;
+}
+
+/** `argLimit("url", 2, { derive: "host" })` is `{ arg: "url", max: 2, derive: "host" }`. */
+export function argLimit(arg: string, max: number, opts: { derive?: Derive } = {}): ArgLimit {
+  const out: ArgLimit = { arg, max };
+  if (opts.derive !== undefined) out.derive = opts.derive;
+  return out;
 }
 
 export interface Capability {
@@ -99,9 +133,11 @@ function isCount(v: unknown): v is number {
   return typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
 }
 
+const DERIVATIONS: readonly string[] = ["host"];
+
 /**
- * Check a `limits` object and return a normalized copy. A kind this SDK does not know is refused,
- * as the server refuses it, rather than dropped.
+ * Check a `limits` object and return a normalized copy. A kind or derivation this SDK does not
+ * know is refused, as the server refuses it, rather than dropped.
  */
 function checkLimits(raw: unknown): Limits {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
@@ -112,24 +148,39 @@ function checkLimits(raw: unknown): Limits {
     if (kind === "calls") {
       if (!isCount(v)) throw new TypeError("limits.calls must be an integer >= 0");
       out.calls = v;
-    } else if (kind === "sum" || kind === "calls_per") {
+    } else if (kind === "sum" || kind === "calls_per" || kind === "distinct") {
       const o = v as Record<string, unknown> | null;
+      const allowed = kind === "sum" ? ["arg", "max"] : ["arg", "max", "derive"];
       const ok =
         typeof o === "object" &&
         o !== null &&
-        Object.keys(o).length === 2 &&
+        Object.keys(o).every((k) => allowed.includes(k)) &&
         typeof o.arg === "string" &&
         o.arg !== "" &&
-        isCount(o.max);
-      if (!ok) throw new TypeError(`limits.${kind} must be {arg: string, max: integer >= 0}`);
-      out[kind] = { arg: o.arg as string, max: o.max as number };
+        isCount(o.max) &&
+        (o.derive === undefined || DERIVATIONS.includes(o.derive as string));
+      if (!ok) {
+        const shape =
+          kind === "sum"
+            ? "{arg: string, max: integer >= 0}"
+            : '{arg: string, max: integer >= 0, derive?: "host"}';
+        throw new TypeError(`limits.${kind} must be ${shape}`);
+      }
+      const lim: ArgLimit = { arg: o.arg as string, max: o.max as number };
+      if (o.derive !== undefined) lim.derive = o.derive as Derive;
+      out[kind] = lim;
     } else {
       throw new TypeError(
-        `unknown limit kind ${JSON.stringify(kind)} (one of calls, sum, calls_per)`,
+        `unknown limit kind ${JSON.stringify(kind)} (one of calls, sum, calls_per, distinct)`,
       );
     }
   }
   return out;
+}
+
+/** What a limit counts as the server names it: `arg`, or `arg#host` for a derived value. */
+export function countedArg(l: ArgLimit): string {
+  return l.derive === undefined ? l.arg : `${l.arg}#${l.derive}`;
 }
 
 /** A copy of `cap` carrying run `limits` (ADR-0010); an empty object removes them. */
@@ -184,7 +235,8 @@ export function capabilitiesToJson(caps: CapabilityLike | readonly CapabilityLik
 
 /**
  * Human-readable form: `github:read_file{repo={"op":"prefix","value":"alice/"}}`, with run
- * limits after it: `banking:send_money[calls<=1,sum(amount)<=10]`.
+ * limits after it: `banking:send_money[calls<=1,sum(amount)<=10]`, or
+ * `web:get_webpage[distinct(url#host)<=2]`.
  */
 export function formatCapability(cap: Capability): string {
   let out = `${cap.server}:${cap.tool}`;
@@ -194,7 +246,8 @@ export function formatCapability(cap: Capability): string {
   const ls: string[] = [];
   if (l.calls !== undefined) ls.push(`calls<=${l.calls}`);
   if (l.sum) ls.push(`sum(${l.sum.arg})<=${l.sum.max}`);
-  if (l.calls_per) ls.push(`calls_per(${l.calls_per.arg})<=${l.calls_per.max}`);
+  if (l.calls_per) ls.push(`calls_per(${countedArg(l.calls_per)})<=${l.calls_per.max}`);
+  if (l.distinct) ls.push(`distinct(${countedArg(l.distinct)})<=${l.distinct.max}`);
   if (ls.length > 0) out += `[${ls.join(",")}]`;
   return out;
 }

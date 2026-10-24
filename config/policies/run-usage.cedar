@@ -15,6 +15,9 @@
 //   amount = "amount"
 //   destination = "recipient"
 //
+//   [policy.catalog.web.get_webpage]
+//   destination = "url#host"      # the host of the URL, not the whole URL (phase 2)
+//
 // Usage refuses nothing by itself. These policies turn it into limits that need no number in
 // any token: a hard one (`forbid`) and soft ones (`@obligation("approval")`) that ask once a
 // count is reached. An approval passes one call: that call is counted like any other, so the
@@ -42,6 +45,20 @@ when {
 @obligation("approval")
 forbid (principal, action == Action::"workspace/send_email", resource)
 when { context.usage.destination_seen && !context.approval.present };
+
+// Soft, per site: once a run has fetched a page, fetching from a site it has not fetched
+// from before asks. More pages of the same site do not. The catalog's `destination =
+// "url#host"` makes `destination_seen` compare hosts, so a query string carrying data to a
+// new host (the injection suite's `slack-08`) is asked whatever the path, while a second
+// article on the same site is not. Values with no host count as one destination.
+@id("ask_on_a_new_site")
+@obligation("approval")
+forbid (principal, action == Action::"web/get_webpage", resource)
+when {
+  context.usage.calls >= 1 &&
+  !context.usage.destination_seen &&
+  !context.approval.present
+};
 
 // The permit side of this example: everything the token's capabilities allow. The
 // capability stage runs before Cedar, so this cannot widen a token. Replace it with your own
