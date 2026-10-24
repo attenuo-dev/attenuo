@@ -149,7 +149,7 @@ An approval is bound to one call, one run and a short time.
 
 With these, an auditor can answer for any destructive call: which results the run had read before it, whether any argument was copied from one, and who approved it. Adding kinds extends `RecordKind`, which is part of the hashed record; old logs stay valid because nothing about existing kinds changes.
 
-The extra append per result is a cost on the hot path: one more audit write for every allowed call that returns. The [performance notes](performance.md) put a file-backed append at about 60 to 140 us; that needs measuring before phase 1 ships.
+The extra append per result is a cost on the hot path: one more audit write for every allowed call that returns. The [performance notes](performance.md) put a file-backed append at about 60 to 140 us; that needs measuring before phase 1 ships. Measured since: the `tool_result` append is about 135 to 140 us mean per allowed call on the file store end to end, and the run label of an untrusted result adds about 15 us more, with no difference at the client within noise ([performance](performance.md#output-labelling-and-run-limits-on-the-hot-path-2026-10-24)).
 
 ## 4. Trade-offs and false positives
 

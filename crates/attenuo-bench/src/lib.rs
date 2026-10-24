@@ -32,6 +32,7 @@ use serde_json::{json, Value};
 use tokio::process::{Child, Command};
 
 pub mod exchange;
+pub mod hotpath;
 
 const ADMIN_TOKEN: &str = "bench-admin-token";
 /// `printf %s bench-secret | sha256sum`; every bench agent uses this secret.
@@ -224,6 +225,7 @@ pub struct Stats {
     pub mean_us: f64,
     pub p50_us: f64,
     pub p90_us: f64,
+    pub p95_us: f64,
     pub p99_us: f64,
     pub max_us: f64,
 }
@@ -694,6 +696,9 @@ struct DriveOut {
     first_bad: Option<String>,
     /// Stage histograms over the measured window, when a metrics URL was given.
     stages: Option<Vec<(String, StageHist)>>,
+    /// The two `/metrics` scrapes the stage histograms came from (warm-up end, clients done),
+    /// for figures other than the stage histogram.
+    metrics_raw: Option<(String, String)>,
 }
 
 /// Run `conc` closed-loop clients. With `metrics` (the server's `/metrics` URL), scrape the
@@ -718,7 +723,7 @@ async fn drive(
     let before = match metrics {
         Some((client, url)) => {
             tokio::time::sleep_until(tokio::time::Instant::from_std(warm_end)).await;
-            Some(scrape_stages(client, url).await?)
+            Some(scrape_metrics(client, url).await?)
         }
         None => None,
     };
@@ -736,12 +741,13 @@ async fn drive(
     if let Some(bad) = &first_bad {
         eprintln!("  unexpected answer ({unexpected} total), first: {bad}");
     }
-    let stages = match (metrics, before) {
+    let (stages, metrics_raw) = match (metrics, before) {
         (Some((client, url)), Some(before)) => {
-            let after = scrape_stages(client, url).await?;
-            Some(stage_delta(&before, &after))
+            let after = scrape_metrics(client, url).await?;
+            let d = stage_delta(&parse_stages(&before), &parse_stages(&after));
+            (Some(d), Some((before, after)))
         }
-        _ => None,
+        _ => (None, None),
     };
     let us = |ns: f64| (ns / 1000.0 * 10.0).round() / 10.0;
     let secs = duration.as_secs_f64();
@@ -755,12 +761,14 @@ async fn drive(
             mean_us: us(hist.mean()),
             p50_us: us(hist.value_at_quantile(0.50) as f64),
             p90_us: us(hist.value_at_quantile(0.90) as f64),
+            p95_us: us(hist.value_at_quantile(0.95) as f64),
             p99_us: us(hist.value_at_quantile(0.99) as f64),
             max_us: us(hist.max() as f64),
         },
         sent,
         first_bad,
         stages,
+        metrics_raw,
     })
 }
 
@@ -897,7 +905,8 @@ pub fn stage_delta(
         .collect()
 }
 
-async fn scrape_stages(client: &reqwest::Client, url: &str) -> Result<Vec<(String, StageHist)>> {
+/// The server's `/metrics` text, checked to hold the stage histograms.
+async fn scrape_metrics(client: &reqwest::Client, url: &str) -> Result<String> {
     let text = client
         .get(url)
         .send()
@@ -906,12 +915,11 @@ async fn scrape_stages(client: &reqwest::Client, url: &str) -> Result<Vec<(Strin
         .error_for_status()?
         .text()
         .await?;
-    let stages = parse_stages(&text);
     ensure!(
-        !stages.is_empty(),
+        !parse_stages(&text).is_empty(),
         "{url} has no {STAGE_METRIC} samples (server too old?)"
     );
-    Ok(stages)
+    Ok(text)
 }
 
 // ---------------------------------------------------------------------------------------

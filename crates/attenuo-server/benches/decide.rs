@@ -8,7 +8,10 @@
 //! cost of an allowed call's answer (`result_digest` of a small result, and
 //! `Pipeline::record_result`: the `tool_result` append plus the run label). Chains of 1 and 3
 //! hops, the
-//! `attenuo-bench` policy and catalog, SQLite stores in memory and in a temporary file
+//! `attenuo-bench` policy and catalog, and the run-limit counters of a 2-hop chain with
+//! `calls` and `sum` limits (`LeaseStore::budget_used`, the read in the policy stage, and
+//! `LeaseStore::charge`, the transaction between policy and append; a `sum` charge commits
+//! with `synchronous=FULL`), SQLite stores in memory and in a temporary file
 //! (`durability` normal and full, opened as the server opens them: WAL checkpoints in the
 //! background).
 //!
@@ -23,6 +26,7 @@ use attenuo_audit::{
     AuditSink, Durability, LeaseStore, SqliteAudit, SqliteLeaseStore,
     DEFAULT_WAL_CHECKPOINT_INTERVAL,
 };
+use attenuo_core::limits::{charges_for, ArgLimit, Limits};
 use attenuo_core::{
     AgentId, Capability, CapabilitySet, Decision, DecisionRecord, OriginatingUser, ToolCall,
 };
@@ -81,8 +85,29 @@ fn read_file() -> CapabilitySet {
     CapabilitySet::from_iter([Capability::new("fake", "read_file")])
 }
 
+/// `read_file` with run limits: `calls`, and `sum` on argument `n` when `sum` is set.
+fn limited_read_file(sum: bool) -> CapabilitySet {
+    let limits = Limits {
+        calls: Some(1 << 40),
+        sum: sum.then(|| ArgLimit::new("n", 1 << 50)),
+        calls_per: None,
+    };
+    CapabilitySet::from_iter([Capability::new("fake", "read_file").with_limits(limits)])
+}
+
 /// A token with `depth` hops, its leases registered in `leases`.
 fn token(issuer: &Issuer, leases: &dyn LeaseStore, depth: usize, now: OffsetDateTime) -> String {
+    token_with(issuer, leases, depth, now, read_file)
+}
+
+/// [`token`] with the capabilities `caps` gives, in every hop.
+fn token_with(
+    issuer: &Issuer,
+    leases: &dyn LeaseStore,
+    depth: usize,
+    now: OffsetDateTime,
+    caps: impl Fn() -> CapabilitySet,
+) -> String {
     let user = OriginatingUser {
         subject: "bench-user".into(),
         issuer: "https://idp.example".into(),
@@ -90,7 +115,7 @@ fn token(issuer: &Issuer, leases: &dyn LeaseStore, depth: usize, now: OffsetDate
         attributes: Default::default(),
     };
     let mut issued = issuer
-        .issue_root(user, AgentId::new("bench-root"), read_file(), None, now)
+        .issue_root(user, AgentId::new("bench-root"), caps(), None, now)
         .expect("root");
     let far = now + Duration::days(1);
     leases.register(&issued.lease, None, far).expect("lease");
@@ -100,7 +125,7 @@ fn token(issuer: &Issuer, leases: &dyn LeaseStore, depth: usize, now: OffsetDate
             .exchange(
                 &issued.token,
                 AgentId::new(format!("bench-a{i}")),
-                read_file(),
+                caps(),
                 None,
                 now,
             )
@@ -255,6 +280,32 @@ fn bench_decide(c: &mut Criterion) {
             });
             group.bench_function(format!("decide_{s}/{depth}_hop"), |b| {
                 b.iter(|| pipeline.decide(black_box(&chain), &call, now))
+            });
+        }
+        // Run limits on a 2-hop chain: `calls` and `sum` in both hops is 4 counters per call;
+        // `calls` alone is 2 and commits at the store's durability.
+        let limited_call = ToolCall::new(
+            "fake",
+            "read_file",
+            json!({"repo": "alice/public-docs", "path": "README.md", "n": 1}),
+        );
+        for (kinds, sum) in [("calls_sum", true), ("calls", false)] {
+            let tok = token_with(&issuer, store.leases.as_ref(), 2, now, || {
+                limited_read_file(sum)
+            });
+            let chain = verifier.verify(&tok, now).expect("verifies").chain;
+            let charges = charges_for(&chain, &limited_call).expect("charges");
+            assert_eq!(charges.len(), if sum { 4 } else { 2 });
+            let s = store.name;
+            group.bench_function(format!("budget_read_{s}/{kinds}"), |b| {
+                b.iter(|| store.leases.budget_used(black_box(&charges)).unwrap())
+            });
+            group.bench_function(format!("charge_{s}/{kinds}"), |b| {
+                b.iter_batched(
+                    || uuid::Uuid::new_v4().to_string(),
+                    |id| store.leases.charge(&id, &charges, now).unwrap(),
+                    BatchSize::SmallInput,
+                )
             });
         }
         assert!(store.audit.verify_chain().unwrap().ok);
