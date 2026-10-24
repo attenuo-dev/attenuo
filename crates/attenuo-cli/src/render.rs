@@ -361,7 +361,9 @@ pub fn fmt_budget(b: &Value) -> Vec<String> {
         };
         let mut line = format!("limit {target} {}", s(l, "kind"));
         if let Some(arg) = l["arg"].as_str() {
-            line.push_str(&format!(" {arg}"));
+            // A child chooses the names of the limits it adds: escape control characters so
+            // a name cannot drive the terminal (SR-59; tokens with one are refused since).
+            line.push_str(&format!(" {}", arg.escape_debug()));
         }
         let values = (l["kind"] == "calls_per").then(|| format!("{} values", num(&l["values"])));
         if l["max"].is_null() {
@@ -935,6 +937,17 @@ truncated: only 4 leases listed (raise --max-nodes); `would revoke` counts the w
             fmt_budget(&usage_only),
             ["usage github/create_issue: 1 calls, amount 0, 0 destinations"]
         );
+    }
+
+    /// SR-59: a limit name with a terminal escape in it is printed escaped.
+    #[test]
+    fn budget_lines_escape_control_characters_sr59() {
+        let b = json!({"recorded": true, "limits": [
+            limit("mail", "send", "calls_per", Some("to\u{1b}[2J\u{1b}]0;x\u{7}"), 3, 0),
+        ], "usage": []});
+        let lines = fmt_budget(&b);
+        assert!(!lines[0].chars().any(char::is_control), "{lines:?}");
+        assert!(lines[0].contains(r"to\u{1b}[2J"), "{lines:?}");
     }
 
     #[test]

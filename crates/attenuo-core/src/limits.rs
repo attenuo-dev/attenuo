@@ -59,6 +59,13 @@ use crate::chain::{DelegationChain, LeaseId};
 /// derives from a limit (`context.budget.*`) is representable in policy.
 pub const MAX_LIMIT: u64 = i64::MAX as u64;
 
+/// The most values (list elements) a `calls_per` or `distinct` limit counts in one call. A
+/// call whose argument lists more is refused with [`REASON_LIMIT_ARG_INVALID`]; in run usage
+/// such a list counts as one destination. Every value counted is a counter row and a
+/// charge-log row written in the charge's transaction, which holds the store's write lock,
+/// so an unbounded list would let one call stall every decision and grow the store (SR-57).
+pub const MAX_COUNTED_VALUES: usize = 256;
+
 /// Reason code: a limit in the chain would be exceeded by this call.
 pub const REASON_BUDGET_EXHAUSTED: &str = "budget_exhausted";
 /// Reason code: the counters a limit needs could not be read or written (fail closed).
@@ -74,7 +81,10 @@ pub const REASON_LIMIT_ARG_INVALID: &str = "limit_arg_invalid";
 pub enum Derive {
     /// The host of a URL argument: parsed as a WHATWG URL, lowercased, without port, user
     /// info or one trailing dot. A value that is not a string, or not an absolute URL with a
-    /// host (`example.com/x`, `mailto:a@b`), has none.
+    /// host (`example.com/x`, `mailto:a@b`), has none. Nor does a string with a backslash,
+    /// whitespace or a control character in it: WHATWG reads `https://a.example\@b.example/`
+    /// as host `a.example`, while common HTTP clients (Python's `urllib` and `httpx`, among
+    /// others) fetch `b.example`, so the host counted would not be the host reached (SR-56).
     Host,
 }
 
@@ -98,7 +108,15 @@ impl Derive {
     pub fn apply(&self, v: &Value) -> Option<String> {
         match self {
             Derive::Host => {
-                let url = url::Url::parse(v.as_str()?).ok()?;
+                let raw = v.as_str()?;
+                // Characters on which URL parsers disagree about where the host ends (SR-56).
+                if raw
+                    .chars()
+                    .any(|c| c == '\\' || c.is_whitespace() || c.is_control())
+                {
+                    return None;
+                }
+                let url = url::Url::parse(raw).ok()?;
                 let host = url.host_str()?.to_ascii_lowercase();
                 let host = host.strip_suffix('.').unwrap_or(&host);
                 (!host.is_empty()).then(|| host.to_string())
@@ -348,7 +366,8 @@ impl Limits {
     }
 
     /// Check the limits of `cap` (which carries them): every `max` at most [`MAX_LIMIT`], every
-    /// `arg` a non-empty name, no `derive` on a `sum`, and a `sum` argument that its
+    /// `arg` a non-empty name with no control character or `#` in it, no `derive` on a
+    /// `sum`, and a `sum` argument that its
     /// constraint, if any, lets be a
     /// non-negative integer (otherwise no call could ever be charged and the limit is a
     /// mistake). Negative or fractional maxima cannot be written: they do not deserialize.
@@ -372,6 +391,18 @@ impl Limits {
             }
             if l.arg.is_empty() {
                 return Err(err(kind, "`arg` is empty".into()));
+            }
+            // A child may add limits on any argument name, and the name reaches the console,
+            // the CLI and the log: no control characters (terminal escapes), and no `#`, which
+            // records and catalogs use for a derived value (`url#host`) (SR-59).
+            if l.arg.chars().any(|c| c.is_control() || c == '#') {
+                return Err(err(
+                    kind,
+                    format!(
+                        "`arg` {:?} has a control character or `#`",
+                        l.arg.escape_debug().to_string()
+                    ),
+                ));
             }
             if kind == LimitKind::Sum && l.derive.is_some() {
                 return Err(err(
@@ -489,7 +520,8 @@ pub struct LimitArgError {
 
 /// Every counter `call` would be charged against: for each hop, each capability that carries
 /// limits and permits the call ([`Capability::permits`]), one charge per limit (and, for
-/// `calls_per` and `distinct` on a list-valued argument, one per distinct element). Ordered
+/// `calls_per` and `distinct` on a list-valued argument, one per distinct element; a list of
+/// more than [`MAX_COUNTED_VALUES`] elements is refused). Ordered
 /// by hop, then capability index, then kind. Empty when no limit in the chain matches.
 pub fn charges_for(chain: &DelegationChain, call: &ToolCall) -> Result<Vec<Charge>, LimitArgError> {
     let mut out = Vec::new();
@@ -552,6 +584,11 @@ pub fn charges_for(chain: &DelegationChain, call: &ToolCall) -> Result<Vec<Charg
                     .get(&l.arg)
                     .filter(|v| !v.is_null())
                     .ok_or_else(|| bad("is missing".into()))?;
+                // Each value is a counter row and a charge-log row, written in the charge's
+                // transaction: bound them per call (SR-57).
+                if v.as_array().is_some_and(|a| a.len() > MAX_COUNTED_VALUES) {
+                    return Err(bad(format!("lists more than {MAX_COUNTED_VALUES} values")));
+                }
                 let values = match l.derive {
                     None => destinations(v),
                     Some(d) => derived_destinations(v, d).ok_or_else(|| {
@@ -580,7 +617,8 @@ pub fn charges_for(chain: &DelegationChain, call: &ToolCall) -> Result<Vec<Charg
 ///   `calls_per` counter per distinct value (each element of a list), whose canonical JSON the
 ///   store keeps only as a keyed hash. A destination written `input#host` counts the host of
 ///   each value ([`Derive::Host`]); values with no host all count as one destination, the
-///   JSON `null` (a host is never `null`, so it collides with none). A `destination` that
+///   JSON `null` (a host is never `null`, so it collides with none). A list of more than
+///   [`MAX_COUNTED_VALUES`] elements is one destination, the whole list. A `destination` that
 ///   [`parse_arg_ref`] refuses counts nothing; the catalog refuses it at load.
 ///
 /// Each has `max` [`MAX_LIMIT`] and [`Charge::usage`] set. Ordered calls, amount, destinations.
@@ -614,6 +652,11 @@ pub fn usage_charges(
         .filter(|(v, _)| !v.is_null())
     {
         let values = match derive {
+            // More values than a call may count (SR-57): the list as a whole is one
+            // destination, new unless the very same list was seen.
+            _ if v.as_array().is_some_and(|a| a.len() > MAX_COUNTED_VALUES) => {
+                vec![canonical(v)]
+            }
             None => destinations(v),
             Some(d) => hosts_or_null(v, d),
         };
@@ -1083,6 +1126,108 @@ mod tests {
             ..Limits::default()
         });
         assert!(cap.validate_limits().is_err());
+    }
+
+    /// SR-56: WHATWG and common HTTP clients disagree on where the host of
+    /// `https://a.example\@b.example/` ends (`a.example` here, `b.example` for Python's
+    /// `urllib` and `httpx`), so such a value has no host to count; a limit refuses it and run
+    /// usage counts it as a value with no host.
+    #[test]
+    fn a_url_parsers_disagree_on_has_no_host_sr56() {
+        let h = |s: &str| Derive::Host.apply(&json!(s));
+        for url in [
+            "https://a.example\\@b.example/",
+            "https://a.example\\.b.example/",
+            "https://a.example/\\@b.example",
+            "https://a.exa\tmple/",
+            "https://a.example /",
+            " https://a.example/",
+            "https://a.example/\n",
+            "https://a.exa\u{7f}mple/",
+            "https://a.example\u{a0}/",
+        ] {
+            assert_eq!(h(url), None, "{url:?}");
+        }
+        // Userinfo is still dropped, and an encoded backslash is part of it on every parser.
+        assert_eq!(
+            h("https://a.example%5C@b.example/").as_deref(),
+            Some("b.example")
+        );
+        let chain = root(vec![Capability::new("web", "get_webpage").with_limits(
+            Limits {
+                distinct: Some(ArgLimit::new("url", 1).derived(Derive::Host)),
+                ..Limits::default()
+            },
+        )]);
+        let call = ToolCall::new(
+            "web",
+            "get_webpage",
+            json!({"url": "https://a.example\\@b.example/?q=secret"}),
+        );
+        assert_eq!(charges_for(&chain, &call).unwrap_err().arg, "url#host");
+        let usage = usage_charges(&LeaseId::new("run"), &call, None, Some("url#host"));
+        assert_eq!(usage[1].value.as_deref(), Some(&b"null"[..]));
+    }
+
+    /// SR-57: a list argument counts at most `MAX_COUNTED_VALUES` values per limit and call.
+    #[test]
+    fn a_call_counts_a_bounded_number_of_values_sr57() {
+        let chain = root(vec![Capability::new("mail", "send").with_limits(
+            Limits::default()
+                .with_calls_per("to", 1)
+                .with_distinct("cc", 1000),
+        )]);
+        let many: Vec<String> = (0..=MAX_COUNTED_VALUES)
+            .map(|i| format!("u{i}@x"))
+            .collect();
+        let at_most: Vec<String> = many[..MAX_COUNTED_VALUES].to_vec();
+        let call = |to: &[String], cc: &[String]| {
+            ToolCall::new("mail", "send", json!({ "to": to, "cc": cc }))
+        };
+        let charges = charges_for(&chain, &call(&at_most, &at_most)).unwrap();
+        assert_eq!(charges.len(), 2 * MAX_COUNTED_VALUES);
+        for (to, cc, kind, arg) in [
+            (&many, &at_most, LimitKind::CallsPer, "to"),
+            (&at_most, &many, LimitKind::Distinct, "cc"),
+        ] {
+            let err = charges_for(&chain, &call(to, cc)).unwrap_err();
+            assert_eq!((err.kind, err.arg.as_str()), (kind, arg));
+            assert!(err.problem.contains("more than 256"), "{}", err.problem);
+        }
+        // Run usage never refuses: the oversized list is one destination.
+        let usage = usage_charges(&LeaseId::new("run"), &call(&many, &[]), None, Some("to"));
+        assert_eq!(usage.len(), 2);
+        assert_eq!(
+            usage[1].value.as_deref(),
+            Some(canonical(&json!(many)).as_slice())
+        );
+        let hosts: Vec<String> = (0..=MAX_COUNTED_VALUES)
+            .map(|i| format!("https://h{i}.example/"))
+            .collect();
+        let fetch = ToolCall::new("web", "get_webpage", json!({ "url": hosts }));
+        assert_eq!(
+            usage_charges(&LeaseId::new("run"), &fetch, None, Some("url#host")).len(),
+            2
+        );
+    }
+
+    /// SR-59: a limit's `arg` is shown by the console and the CLI and written to the log, and
+    /// a child may add a limit on any name: control characters and `#` are refused.
+    #[test]
+    fn limit_arg_names_have_no_control_characters_or_hash_sr59() {
+        for arg in ["to\u{1b}[2J", "to\n", "a\u{7}", "url#host", "#"] {
+            for limits in [
+                Limits::default().with_sum(arg, 1),
+                Limits::default().with_calls_per(arg, 1),
+                Limits::default().with_distinct(arg, 1),
+            ] {
+                let cap = Capability::new("mail", "send").with_limits(limits);
+                assert!(cap.validate_limits().is_err(), "{arg:?}");
+            }
+        }
+        let ok = Capability::new("mail", "send")
+            .with_limits(Limits::default().with_calls_per("recipient_émail", 1));
+        assert!(ok.validate_limits().is_ok());
     }
 
     #[test]
