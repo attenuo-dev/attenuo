@@ -17,8 +17,11 @@ A constraint is `{op, value}`, and `op` is one of:
 - `equals`: the argument must equal a JSON value.
 - `one_of`: the argument must equal one of a list of values.
 - `prefix`: the argument must be a string that starts with the value.
+- `range`: the argument must be an integer between `min` and `max`, both inclusive. The value is `{"min": 0, "max": 2000}`; either bound can be left out, but not both, and `min` cannot be greater than `max`.
 
-Arguments with no constraint are free. A call that leaves out a constrained argument is denied.
+An argument has at most one constraint, so kinds do not combine: "between 1 and 100 but not 13" is a Cedar rule. Arguments with no constraint are free. A call that leaves out a constrained argument is denied.
+
+A `range` reads the argument the way Cedar does: a JSON integer, or a float with no fractional part (`5.0` is `5`). A fraction, a numeric string such as `"5"`, or a number too large for a Cedar `long` is outside every range, so the call is denied.
 
 Example: `github:create_issue` with `repo` prefix `acme/` lets the holder open issues only in repositories under `acme/`.
 
@@ -42,6 +45,8 @@ When a hop delegates to a child, the child's capabilities must be covered by the
 3. Every limit the parent has must also be on the child, with a maximum no larger. A child may add limits. At exchange the server fills in limits the child left out and lowers the child's figures to what the parent has left.
 
 So `repo prefix acme/` can become `repo equals acme/api`, or `repo prefix acme/api`. It cannot become a prefix that is shorter, and it cannot drop the constraint.
+
+For `range`, the child's interval must sit inside the parent's: `0..2000` can become `10..500`, `equals 300` or `one_of [100, 200]`, but not `0..5000`, `-10..2000` or a range with the upper bound left out. A range can become an `equals` or a `one_of` only when it holds one integer (`7..7` covers `equals 7`). `prefix` and `range` never cover each other.
 
 Each child capability must be covered by a single parent capability. A child that would be covered only by the union of two parent capabilities is rejected. This is deliberately conservative. It keeps the check simple and the reason for a refusal easy to explain.
 
@@ -69,7 +74,7 @@ This is why narrow grants matter. A capability of `github:*` also covers `resour
 
 ## Limits today
 
-- Only `equals`, `one_of` and `prefix` exist. Numeric and time-range constraints are proposed, not built. A `sum` limit bounds a total over the run, not the value of one call.
+- The constraint kinds are `equals`, `one_of`, `prefix` and `range`. A `range` bounds the value of each call; a `sum` limit bounds the total over the run. Use both to say "at most 2000 per payment and 5000 in all". Time-range constraints are not built ([RFC-0001 section 3.1](../spec/rfc-0001-attenuo.md#31-not-yet-implemented--proposed) says why).
 - Run limits count per delegation run. Limits per time window are not built.
 - Property tests (`crates/attenuo-core/tests/attenuation_props.rs`) check that coverage never lets a child permit something its parent does not, limits included. They check soundness, not that every narrower request is accepted.
 

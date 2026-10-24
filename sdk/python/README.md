@@ -148,12 +148,16 @@ It returns a `SelectorRevocation`: `selector` (as the server shows it), `preview
 ### Capabilities
 
 ```python
-from attenuo import Capability, Equals, OneOf, Prefix
+from attenuo import Capability, Equals, OneOf, Prefix, Range
 
 Capability("github", "read_file")  # github:read_file
 Capability("github", "create_issue", repo=OneOf("acme/api", "acme/web"))
 Capability("github", "read_*", repo=Prefix("alice/public-"), ref=Equals("main"))
+Capability("banking", "send_money", amount=Range(0, 2000))  # 0 <= amount <= 2000
+Capability("banking", "refund", amount=Range(max=50))  # no lower bound
 ```
+
+`Range(min, max)` bounds an integer argument, both ends inclusive; leave one out for no bound on that side, but not both. It raises `ValueError` for no bound, `min > max` or a bound that is not an integer. The server reads the argument as Cedar does (`5.0` is `5`), and a fraction or a numeric string is outside every range. A child may narrow a range (`Range(10, 500)` under `Range(0, 2000)`, or `OneOf(100, 200)`), never widen it. A range bounds each call; to bound the total over a run as well, add a `sum` limit (below).
 
 These serialize to the server's `authorization_details` shape, the same JSON `attenuo token exchange --cap` produces. Plain strings (`"github:read_file"`, or comma separated) work anywhere a capability is accepted. A child must constrain every argument its parent constrains, at least as tightly; the server refuses an exchange that widens (`ApiError` with `error == "invalid_scope"`).
 
