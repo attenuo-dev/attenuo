@@ -3,7 +3,7 @@
 This folder is an Obsidian vault (open it with "Open folder as vault") and the project's public-safe knowledge base.
 
 - [guides/](guides/): getting started, deploying, integrating MCP clients, identity providers
-- [guide/codebase-walkthrough.md](guide/codebase-walkthrough.md): a reading-and-running plan for the whole codebase, in nine sessions, with a glossary and a list of surprises
+- [guide/codebase-walkthrough.md](guide/codebase-walkthrough.md): a reading-and-running plan for the whole codebase, in eleven sessions, with a glossary and a list of surprises
 - [faq.md](faq.md): the questions people ask first
 - [comparison.md](comparison.md): attenuo next to OAuth scopes, gateways, policy engines, IdP agent features and SPIFFE
 - [launch-checklist.md](launch-checklist.md): what maintainers check before the first public release
