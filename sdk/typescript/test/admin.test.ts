@@ -245,3 +245,244 @@ describe("AdminClient", () => {
     });
   });
 });
+
+describe("AdminClient console endpoints", () => {
+  const deny = (seq: number) => ({ seq, record: { ...entry(seq).record, decision: "deny" } });
+
+  it("filters newest first and follows prev across a short page", async () => {
+    const { fetch, calls } = mockFetch((s) =>
+      s.url.searchParams.has("before")
+        ? jsonResponse({ entries: [deny(4), deny(2)], next: 10, prev: null, head: 12 })
+        : jsonResponse({ entries: [deny(9)], next: null, prev: 9, head: 12 }),
+    );
+    const admin = new AdminClient(URL_, "adm", { fetch });
+    const query = {
+      order: "desc",
+      limit: 3,
+      decision: "deny",
+      kind: ["decision", "exchange"],
+      lease: "l 1",
+      since: new Date("2026-10-23T09:00:00Z"),
+    } as const;
+    const page = await admin.auditQuery(query);
+    expect([page.next, page.prev, page.head]).toEqual([undefined, 9, 12]);
+    expect(Object.fromEntries(calls[0]!.url.searchParams)).toEqual({
+      order: "desc",
+      limit: "3",
+      decision: "deny",
+      kind: "decision,exchange",
+      lease: "l 1",
+      since: "2026-10-23T09:00:00.000Z",
+    });
+    const seqs = [];
+    for await (const e of admin.auditIter(query)) seqs.push(e.seq);
+    expect(seqs).toEqual([9, 4, 2]);
+    expect(calls[2]!.url.searchParams.get("before")).toBe("9");
+  });
+
+  it("iterates oldest first by next, and refuses a cursor that does not move", async () => {
+    const asc = mockFetch((s) => {
+      const from = Number(s.url.searchParams.get("from") ?? "1");
+      return jsonResponse({ entries: [entry(from)], next: from >= 5 ? null : from + 4, head: 5 });
+    });
+    const seqs = [];
+    for await (const e of new AdminClient(URL_, "adm", { fetch: asc.fetch }).auditIter({
+      chainId: "c1",
+    }))
+      seqs.push(e.seq);
+    expect(seqs).toEqual([1, 5]);
+    expect(Object.fromEntries(asc.calls[0]!.url.searchParams)).toEqual({
+      order: "asc",
+      limit: "1000",
+      chain_id: "c1",
+    });
+    const stuck = mockFetch(() => jsonResponse({ entries: [], prev: 5, head: 9 }));
+    await expect(
+      (async () => {
+        for await (const _ of new AdminClient(URL_, "adm", { fetch: stuck.fetch }).auditIter({
+          order: "desc",
+          before: 5,
+        }))
+          void _;
+      })(),
+    ).rejects.toBeInstanceOf(AttenuoError);
+  });
+
+  const detail = {
+    entry: { seq: 7, record: { id: "0b7c", kind: "decision", chain_id: "root" } },
+    lease_states: [
+      {
+        lease_id: "root",
+        known: true,
+        active: true,
+        parent: null,
+        expires_at: "2026-10-23T10:00:00Z",
+        revoked_at: null,
+        revoke_reason: null,
+      },
+      { lease_id: "gone", known: false },
+    ],
+    covered_by_checkpoint: { seq: 10, head_hash: "hh" },
+    policy_reloaded_after: null,
+  };
+
+  it("shows one entry by seq and by record id", async () => {
+    const { fetch, calls } = mockFetch(() => jsonResponse(detail));
+    const admin = new AdminClient(URL_, "adm", { fetch });
+    const d = await admin.auditEntry(7);
+    expect(calls[0]!.url.pathname).toBe("/admin/audit/entries/7");
+    expect(d.entry.seq).toBe(7);
+    expect(d.entry.chainId).toBe("root");
+    expect(d.leaseStates.map((s) => [s.leaseId, s.known, s.active])).toEqual([
+      ["root", true, true],
+      ["gone", false, false],
+    ]);
+    expect(d.coveredByCheckpoint).toEqual({ seq: 10, head_hash: "hh" });
+    expect(d.policyReloadedAfter).toBeUndefined();
+    const r = await admin.auditRecord("0b7c/../x");
+    expect(calls[1]!.url.pathname).toBe("/admin/audit/records/0b7c%2F..%2Fx");
+    expect(r.entry.record.id).toBe("0b7c");
+  });
+
+  it("maps a missing entry to ApiError 404", async () => {
+    const { fetch } = mockFetch(() =>
+      jsonResponse({ error: "not_found", detail: "no entry at seq 99" }, 404),
+    );
+    await expect(new AdminClient(URL_, "adm", { fetch }).auditEntry(99)).rejects.toMatchObject({
+      status: 404,
+      error: "not_found",
+    });
+  });
+
+  it("lists stored checkpoints without signing", async () => {
+    const cps = [
+      { seq: 20, head_hash: "a" },
+      { seq: 10, head_hash: "b" },
+    ];
+    const { fetch, calls } = mockFetch(() => jsonResponse({ checkpoints: cps, prev: 10 }));
+    const admin = new AdminClient(URL_, "adm", { fetch });
+    expect(await admin.auditCheckpoints({ before: 30, limit: 2 })).toEqual({
+      checkpoints: cps,
+      prev: 10,
+    });
+    expect(calls[0]!.url.pathname).toBe("/admin/audit/checkpoints");
+    expect(Object.fromEntries(calls[0]!.url.searchParams)).toEqual({ before: "30", limit: "2" });
+    await admin.auditCheckpoints();
+    expect(calls[1]!.url.search).toBe("");
+  });
+
+  it("reads a lease tree", async () => {
+    const node = (id: string, parent: string | null, active = true) => ({
+      lease_id: id,
+      parent,
+      agent: "coder",
+      active,
+      expires_at: "2026-10-23T19:20:00Z",
+      revoked_at: null,
+      revoke_reason: null,
+      issued_at: parent ? "2026-10-23T19:05:00Z" : null,
+      issued_seq: parent ? 42 : null,
+    });
+    const { fetch, calls } = mockFetch(() =>
+      jsonResponse({
+        root: "r",
+        ancestors: [node("r", null)],
+        nodes: [node("l1", "r"), node("l2", "l1", false)],
+        would_revoke: 1,
+        truncated: false,
+      }),
+    );
+    const tree = await new AdminClient(URL_, "adm", { fetch }).leaseTree("l1", 50);
+    expect(calls[0]!.url.pathname).toBe("/admin/leases/l1/tree");
+    expect(calls[0]!.url.searchParams.get("max_nodes")).toBe("50");
+    expect(tree.root).toBe("r");
+    expect(tree.wouldRevoke).toBe(1);
+    expect(tree.truncated).toBe(false);
+    expect(tree.nodes.map((n) => [n.leaseId, n.active, n.issuedSeq])).toEqual([
+      ["l1", true, 42],
+      ["l2", false, 42],
+    ]);
+    expect(tree.ancestors[0]!.issuedAt).toBeUndefined();
+  });
+
+  it("reads the policy set and the on-disk check", async () => {
+    const { fetch, calls } = mockFetch((s) =>
+      s.url.pathname.endsWith("/check")
+        ? jsonResponse({
+            path: "/etc/p.cedar",
+            sha256: "41",
+            loaded_sha256: "9f",
+            differs_from_loaded: true,
+            ok: false,
+            error_count: 1,
+            warning_count: 0,
+            issues: [{ severity: "error", stage: "validate", message: "m", line: 3 }],
+            policy_ids: ["a"],
+          })
+        : jsonResponse({
+            path: "/etc/p.cedar",
+            sha256: "9f",
+            loaded_at: "2026-10-23T19:02:11Z",
+            policy_ids: ["a"],
+            warnings: [],
+            policies: [{ id: "a", text: "permit(...);" }],
+          }),
+    );
+    const admin = new AdminClient(URL_, "adm", { fetch });
+    const ps = await admin.policies();
+    expect(calls[0]!.url.pathname).toBe("/admin/policies");
+    expect(ps.policies).toEqual({ a: "permit(...);" });
+    expect(ps.sha256).toBe("9f");
+    const pc = await admin.policyCheck();
+    expect(calls[1]!.url.pathname).toBe("/admin/policies/check");
+    expect([pc.ok, pc.differsFromLoaded, pc.errorCount, pc.issues[0]!.line]).toEqual([
+      false,
+      true,
+      1,
+      3,
+    ]);
+  });
+
+  it("dry-runs a policy evaluation with a token or a chain", async () => {
+    const { fetch, calls } = mockFetch(() =>
+      jsonResponse({
+        decision: "allow",
+        reason: "policy_allow",
+        policy_ids: ["a"],
+        diagnostics: [],
+        lease_check: "skipped",
+        chain_source: "token",
+        token_expired: true,
+      }),
+    );
+    const admin = new AdminClient(URL_, "adm", { fetch });
+    const ev = await admin.policyEvaluate(
+      "github",
+      "read_file",
+      { repo: "alice/x" },
+      { token: " tok " },
+    );
+    expect(calls[0]!.method).toBe("POST");
+    expect(calls[0]!.url.pathname).toBe("/admin/policies/evaluate");
+    expect(calls[0]!.body).toMatchObject({
+      token: "tok",
+      resource: { type: "tool", id: "github/read_file" },
+      context: { input: { repo: "alice/x" } },
+    });
+    expect(ev).toEqual({
+      decision: "allow",
+      allowed: true,
+      reason: "policy_allow",
+      policyIds: ["a"],
+      diagnostics: [],
+      leaseCheck: "skipped",
+      chainSource: "token",
+      tokenExpired: true,
+    });
+    await admin.policyEvaluate("github", "read_file", undefined, { chain: { hops: [] } });
+    const sent = calls[1]!.body as Record<string, Record<string, unknown>>;
+    expect(sent.token).toBeUndefined();
+    expect(sent.subject!.properties).toEqual({ chain: { hops: [] } });
+    await expect(admin.policyEvaluate("github", "read_file")).rejects.toThrow(TypeError);
+  });
+});

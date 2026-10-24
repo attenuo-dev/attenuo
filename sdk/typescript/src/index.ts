@@ -37,11 +37,22 @@ export type {
 export type {
   AuditCheckpoint,
   AuditEntry,
+  AuditEntryDetail,
   AuditPage,
+  AuditQuery,
+  CheckpointPage,
+  LeaseNode,
+  LeaseState,
   LeaseStatus,
+  LeaseTree,
   MintRootOptions,
+  PolicyCheck,
+  PolicyEvaluateOptions,
+  PolicyEvaluation,
   PolicyReload,
+  PolicySet,
   RevokeResult,
+  StoredCheckpoint,
   VerifyReport,
 } from "./admin.js";
 export {
