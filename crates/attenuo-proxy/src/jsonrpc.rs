@@ -40,12 +40,15 @@ pub const METHOD_RESOURCES_TEMPLATES_LIST: &str = "resources/templates/list";
 pub const METHOD_PROMPTS_LIST: &str = "prompts/list";
 pub const METHOD_RESOURCES_READ: &str = "resources/read";
 pub const METHOD_RESOURCES_SUBSCRIBE: &str = "resources/subscribe";
+pub const METHOD_RESOURCES_UNSUBSCRIBE: &str = "resources/unsubscribe";
 pub const METHOD_PROMPTS_GET: &str = "prompts/get";
 pub const METHOD_COMPLETION_COMPLETE: &str = "completion/complete";
 
 /// Methods forwarded without a per-call authorization decision. They are still authenticated
-/// and lease-checked (`Authorizer::check_active`). Everything else that is not a notification
-/// is authorized with `tool = method name`.
+/// and lease-checked (`Authorizer::check_active`), and a failed check is recorded under the
+/// method's name. Everything else that is not a notification is authorized with
+/// `tool = method name`. `resources/unsubscribe` is here because giving up a subscription never
+/// widens what the agent can do; `resources/subscribe` is decided.
 pub const PASSTHROUGH_METHODS: &[&str] = &[
     "initialize",
     "ping",
@@ -53,6 +56,7 @@ pub const PASSTHROUGH_METHODS: &[&str] = &[
     METHOD_RESOURCES_LIST,
     METHOD_RESOURCES_TEMPLATES_LIST,
     METHOD_PROMPTS_LIST,
+    METHOD_RESOURCES_UNSUBSCRIBE,
     "logging/setLevel",
 ];
 
@@ -244,7 +248,7 @@ mod tests {
             "prompts/get",
             "completion/complete",
             "sampling/createMessage",
-            "resources/unsubscribe",
+            "resources/Unsubscribe",
             "notification/typo",
             "",
         ] {

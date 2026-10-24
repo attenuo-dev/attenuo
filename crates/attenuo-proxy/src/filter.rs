@@ -217,6 +217,29 @@ pub(crate) fn same_id(request: &Value, response: &Value) -> bool {
     }
 }
 
+/// The list kinds a message answers by its shape, each paired with the message's `id`: for a
+/// response (no `method`, an `id`) whose `result` holds the entry array of a list kind
+/// (`tools`, `resources`, `resourceTemplates`, `prompts`). Empty for anything else.
+///
+/// For streams on which the proxy did not see the request: the `GET` listen stream, where an
+/// upstream replays the buffered events of a broken `POST` stream when the client resumes with
+/// `Last-Event-ID`. The result goes to [`ListFilter::new`] as its pending requests, so such an
+/// answer is filtered by the same code as one on the `POST`. A non-list response that happens
+/// to carry such a member loses the entries the chain could not use; nothing is ever added.
+pub fn list_kinds_by_shape(msg: &Value) -> Vec<(Value, ListKind)> {
+    if msg.get("method").is_some() {
+        return Vec::new();
+    }
+    let (Some(id), Some(result)) = (msg.get("id"), msg.get("result")) else {
+        return Vec::new();
+    };
+    ListKind::ALL
+        .into_iter()
+        .filter(|k| result.get(k.array_key()).is_some_and(Value::is_array))
+        .map(|k| (id.clone(), k))
+        .collect()
+}
+
 /// The list requests of one HTTP request whose responses must be filtered, and what to filter
 /// them with.
 ///
@@ -343,6 +366,40 @@ mod tests {
                 .with_constraint("repo", ArgConstraint::Prefix("acme/".into())),
             Capability::new("slack*", "*"),
         ])
+    }
+
+    #[test]
+    fn list_kinds_by_shape_finds_responses_only() {
+        let kinds = |v: Value| -> Vec<ListKind> {
+            list_kinds_by_shape(&v)
+                .into_iter()
+                .map(|(_, k)| k)
+                .collect()
+        };
+        assert_eq!(
+            kinds(json!({"id": 1, "result": {"tools": [], "nextCursor": "c"}})),
+            vec![ListKind::Tools]
+        );
+        assert_eq!(
+            list_kinds_by_shape(&json!({"id": "x", "result": {"prompts": []}})),
+            vec![(json!("x"), ListKind::Prompts)]
+        );
+        assert_eq!(
+            kinds(json!({"id": 1, "result": {"resources": [], "resourceTemplates": []}})),
+            vec![ListKind::Resources, ListKind::ResourceTemplates]
+        );
+        // A request or notification carrying a `result`, a message without an id, an error,
+        // a member that is not an array, and an ordinary result are not list answers.
+        for v in [
+            json!({"id": 1, "method": "sampling/createMessage", "result": {"tools": []}}),
+            json!({"method": "notifications/x", "result": {"tools": []}}),
+            json!({"result": {"tools": []}}),
+            json!({"id": 1, "error": {"code": -1, "message": "m"}}),
+            json!({"id": 1, "result": {"tools": "all"}}),
+            json!({"id": 1, "result": {"content": []}}),
+        ] {
+            assert!(kinds(v.clone()).is_empty(), "{v}");
+        }
     }
 
     #[test]

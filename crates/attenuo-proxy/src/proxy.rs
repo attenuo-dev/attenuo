@@ -25,7 +25,7 @@ use crate::auth::{
     REASON_APPROVAL_REQUIRED,
 };
 use crate::config::ProxyConfig;
-use crate::filter::{ListFilter, ListKind};
+use crate::filter::{list_kinds_by_shape, ListFilter, ListKind};
 use crate::guard::{guard_stream, StreamGuard};
 use crate::jsonrpc::{
     self, approval_required_response, denied_response, denied_response_with, error_response, id_of,
@@ -118,9 +118,22 @@ struct AppState {
 }
 
 impl AppState {
-    /// The re-check (SR-28) for a response streamed to `chain`'s holder.
-    fn stream_guard(&self, chain: &DelegationChain) -> StreamGuard {
-        StreamGuard::new(self.authorizer.clone(), chain.clone(), self.stream_recheck)
+    /// The re-check (SR-28) for a response streamed to `who` from `server` in `session_id`.
+    /// A stream the re-check ends for a lease or token reason is recorded under
+    /// [`crate::guard::STREAM_END_TOOL`]. `who` passed full verification, so the record names
+    /// a principal attenuo issued a token to (SR-18).
+    fn stream_guard(
+        &self,
+        who: &Authenticated,
+        server: &str,
+        session_id: Option<&str>,
+    ) -> StreamGuard {
+        StreamGuard::new(
+            self.authorizer.clone(),
+            who.chain.clone(),
+            self.stream_recheck,
+        )
+        .recording(server, session_id, who.dpop_bound)
     }
 }
 
@@ -767,24 +780,24 @@ async fn handle_passthrough(
         let mut response = match req.send().await {
             Ok(resp) if is_delete => stream_response(resp, None, None, limit),
             // The listen stream lives as long as the client keeps it open: re-check it
-            // (SR-28). Responses on it to allowed calls are labelled like `POST` answers.
+            // (SR-28). List answers on it (replayed on a resumed stream) are filtered, and
+            // responses to allowed calls labelled, like `POST` answers.
             Ok(resp) if is_event_stream(resp.headers()) => {
                 let labeller = Labeller::listen(
                     state.authorizer.clone(),
                     state.awaited.clone(),
                     ResultScope::new(&server, session_id.as_deref(), &chain),
                 );
-                let guard = state.stream_guard(&chain);
-                stream_response_sse(
-                    resp,
-                    None,
-                    guard,
-                    limit,
-                    None::<fn(&mut Value)>,
-                    Some(labeller),
-                )
+                let guard = state.stream_guard(&who, &server, session_id.as_deref());
+                let filter = listen_list_filter(&state, &chain, &server);
+                stream_response_sse(resp, None, guard, limit, Some(filter), Some(labeller))
             }
-            Ok(resp) => stream_response(resp, None, Some(state.stream_guard(&chain)), limit),
+            Ok(resp) => stream_response(
+                resp,
+                None,
+                Some(state.stream_guard(&who, &server, session_id.as_deref())),
+                limit,
+            ),
             Err(e) => return upstream_error(e),
         };
         match (is_delete, session_id.as_deref()) {
@@ -796,6 +809,41 @@ async fn handle_passthrough(
     }
     .instrument(span)
     .await
+}
+
+/// The list filter of a `GET` listen stream. The proxy did not see the requests answered
+/// there: an upstream replays the buffered events of a broken `POST` stream when the client
+/// resumes with `Last-Event-ID`, and may answer after a `202`. So every response on the stream
+/// whose `result` holds a list array ([`list_kinds_by_shape`]) is filtered for `chain`, the
+/// holder of the stream, through the same [`ListFilter`] as a `POST` answer, and its tools are
+/// recorded for SR-25 the same way ([`observe_listed`]).
+fn listen_list_filter(
+    state: &AppState,
+    chain: &DelegationChain,
+    server: &str,
+) -> impl FnMut(&mut Value) + Send + 'static {
+    let caps = chain.effective_capabilities().cloned().unwrap_or_default();
+    let server = server.to_owned();
+    let listed = state.listed.clone();
+    let authorizer = state.authorizer.clone();
+    move |body: &mut Value| {
+        let messages: Vec<&mut Value> = match body {
+            Value::Array(items) => items.iter_mut().collect(),
+            other => vec![other],
+        };
+        for msg in messages {
+            let pending = list_kinds_by_shape(msg);
+            if pending.is_empty() {
+                continue;
+            }
+            let filter = ListFilter::new(&pending, &caps, &server);
+            observe_listed(&filter, msg, &server, &listed, authorizer.as_ref());
+            let removed = filter.apply_message(msg);
+            if removed > 0 {
+                tracing::debug!(removed, "filtered list result on the listen stream");
+            }
+        }
+    }
 }
 
 /// `502` for a failed upstream request. The `reqwest` error names the internal upstream URL
@@ -1094,7 +1142,7 @@ async fn handle_post_inner(
         // event as it passes; label every response to an allowed call the same way. Replies
         // the proxy generated itself lead the stream.
         let prelude = sse_prelude(&screened.replies);
-        let guard = state.stream_guard(chain);
+        let guard = state.stream_guard(who, server, session_id);
         let filter = has_lists.then(|| {
             let pending = screened.list_requests.clone();
             let caps = chain.effective_capabilities().cloned().unwrap_or_default();
@@ -1159,7 +1207,7 @@ async fn handle_post_inner(
         stream_response(
             resp,
             prelude,
-            Some(state.stream_guard(chain)),
+            Some(state.stream_guard(who, server, session_id)),
             state.max_upstream_body,
         )
     };

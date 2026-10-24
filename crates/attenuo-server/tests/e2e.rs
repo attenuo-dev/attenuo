@@ -68,6 +68,15 @@ impl Harness {
 
     /// As [`start_with`](Self::start_with), with a last chance to change the config.
     async fn start_tweaked(file_db: bool, tweak: impl FnOnce(&mut Config)) -> Self {
+        Self::start_against(file_db, FakeMcpServer::new(TOOLS), tweak).await
+    }
+
+    /// As [`start_tweaked`](Self::start_tweaked), in front of `upstream`.
+    async fn start_against(
+        file_db: bool,
+        upstream: FakeMcpServer,
+        tweak: impl FnOnce(&mut Config),
+    ) -> Self {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_test_writer()
@@ -77,7 +86,6 @@ impl Harness {
         std::fs::write(&policy_path, POLICY_PUBLIC_READS).unwrap();
         let db_path = file_db.then(|| dir.path().join("audit.sqlite"));
 
-        let upstream = FakeMcpServer::new(TOOLS);
         let upstream_task = upstream.spawn().await.unwrap();
 
         let mut cfg = Config::default();
@@ -1800,6 +1808,97 @@ async fn initialize_on_a_revoked_lease_is_audited() {
     }
     assert_eq!(h.audit_entries().await.len(), after.len());
     assert!(h.upstream.recorded_methods().is_empty());
+}
+
+/// SR-28: a listen stream the proxy cuts because its lease was revoked leaves one `deny`
+/// record of `stream.end` against the token's chain and the session's hash tag, so the log
+/// tells a revoked stream from a dropped one. The final event names the record.
+#[tokio::test]
+async fn a_listen_stream_cut_by_revocation_is_audited() {
+    use futures_util::StreamExt;
+    let h = Harness::start_against(
+        false,
+        FakeMcpServer::new(TOOLS).with_listen_stream(true),
+        |cfg| cfg.proxy.stream_recheck_seconds = 1,
+    )
+    .await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let init = h
+        .client
+        .post(h.url("/mcp/github"))
+        .header("accept", "application/json, text/event-stream")
+        .bearer_auth(&root.token)
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(init.status(), StatusCode::OK);
+    let sid = init.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let resp = h
+        .client
+        .get(h.url("/mcp/github"))
+        .header("accept", "text/event-stream")
+        .header("mcp-session-id", &sid)
+        .bearer_auth(&root.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut stream = resp.bytes_stream();
+    let mut text = String::new();
+    while !text.contains("\n\n") {
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("first event")
+            .expect("stream open")
+            .unwrap();
+        text.push_str(std::str::from_utf8(&chunk).unwrap());
+    }
+    assert!(text.contains("listening"), "{text}");
+
+    h.admin_post(
+        &format!("/admin/leases/{}/revoke", root.lease),
+        json!({"reason": "incident"}),
+    )
+    .await;
+    let before = h.audit_entries().await.len();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(Ok(chunk)) = stream.next().await {
+            text.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+    })
+    .await
+    .expect("the stream ends after the revocation");
+    let last: Value = serde_json::from_str(
+        text.split("\n\n")
+            .filter_map(|e| e.lines().find_map(|l| l.strip_prefix("data: ")))
+            .last()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(last["error"]["code"], -32001);
+    assert_eq!(last["error"]["data"]["reason"], "lease_revoked");
+
+    let after = h.audit_entries().await;
+    assert_eq!(after.len(), before + 1);
+    let r = &after.last().unwrap()["record"];
+    assert_eq!(r["decision"], "deny");
+    assert_eq!(r["reason"], "lease_revoked");
+    assert_eq!(r["tool"], "stream.end");
+    assert_eq!(r["server"], "github");
+    assert_eq!(r["originating_subject"], "alice");
+    assert_eq!(r["leases"], json!([root.lease]));
+    assert_eq!(r["session_id"], attenuo_proxy::session::session_tag(&sid));
+    assert_eq!(last["error"]["data"]["decision_id"], r["id"]);
+    assert_eq!(h.admin_get("/admin/audit/verify").await["ok"], true);
+    assert!(h
+        .state
+        .metrics
+        .render()
+        .contains("attenuo_decisions_total{decision=\"deny\",reason=\"lease_revoked\"} 1\n"));
 }
 
 #[tokio::test]
