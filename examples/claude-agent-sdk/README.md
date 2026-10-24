@@ -1,6 +1,6 @@
 # Claude Agent SDK through attenuo
 
-An orchestrator agent hands a GitHub task to a `coder` sub-agent. Both are [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview) agents, the GitHub MCP server is reachable only through attenuo's proxy, and each agent hop carries its own delegation token. A malicious issue tries to get the coder to read a private repository and copy it out; attenuo refuses both calls.
+An orchestrator agent hands a GitHub task to a `coder` sub-agent. Both are [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview) agents, the GitHub MCP server is reachable only through attenuo's proxy, and each agent hop carries its own delegation token. A malicious issue tries to get the coder to read a private repository and copy it out; attenuo refuses both calls. The coder's token also carries a run limit (one repository per run), and the orchestrator's report issue waits for a person's approval.
 
 This is the scenario of [github-leak-demo](../github-leak-demo/README.md) with a real agent framework on the client side. It reuses that demo's `config.toml` and `policy.cedar` unchanged.
 
@@ -50,9 +50,9 @@ The orchestrator's agent id in the demo config is `assistant`; that is the name 
 | Token | Held by | May | Cannot |
 | --- | --- | --- | --- |
 | root | orchestrator | `github:*` (anything the policy allows) | Nothing is given to the model: the orchestrator has no MCP server configured. |
-| exchanged | coder | `github:read_file` with `repo` starting `alice/public-`, 10 minutes | Any other tool, or any other repo. |
+| exchanged | coder | `github:read_file` with `repo` starting `alice/public-`, one distinct `repo` per run (a `distinct` run limit), 10 minutes | Any other tool, any other repo, or a second repo in the same run. |
 
-The coder's token is the only thing the model can reach. The Cedar policy (`../github-leak-demo/policy.cedar`) is a second layer that applies to every call whatever the token says: `read_file` only on `alice/public-*`, no deep chains, no sensitive tools without MFA.
+The coder's token is the only thing the model can reach. The orchestrator's own code (not the model) uses the root token once, to file a report issue after the coder's turn. The Cedar policy (`../github-leak-demo/policy.cedar`) is a second layer that applies to every call whatever the token says: `read_file` only on `alice/public-*`, `create_issue` only on `alice/public-*` and only after a person approves the call, no deep chains, no sensitive tools without MFA.
 
 ## What gets denied, and where to see it
 
@@ -61,11 +61,16 @@ The dry-run output (shortened):
 ```
 [coder] tools/list through attenuo shows: ['read_file']
   ALLOWED read_file {'repo': 'alice/public-docs', 'path': 'README.md'}
-  DENIED  read_file {'repo': 'alice/private-salaries', ...}  reason=capability_denied decision=94801347-...
-  DENIED  create_issue {'repo': 'alice/public-docs', ...}    reason=capability_denied decision=9aef3152-...
+  DENIED  read_file {'repo': 'alice/private-salaries', ...}  reason=capability_denied decision=3b040c40-...
+  DENIED  create_issue {'repo': 'alice/public-docs', ...}    reason=capability_denied decision=f85263c3-...
+  DENIED  read_file {'repo': 'alice/public-site', ...}       reason=budget_exhausted decision=03ae9013-...
+[orchestrator] files a report issue itself: the policy asks a person first
+  APPROVAL REQUIRED create_issue  reason=approval_required approval=9a7e2755-...
+  [operator] grants approval 9a7e2755-...: granted
+  ALLOWED create_issue {'repo': 'alice/public-docs', 'title': 'coder report: README typo'}  decision=b85275b3-...
 [orchestrator] the session looks compromised: revoking its lease
-  DENIED  read_file {'repo': 'alice/public-docs', ...}       reason=lease_revoked decision=c4fc5999-...
-[audit] chain ok=True, 8 entries
+  DENIED  read_file {'repo': 'alice/public-docs', ...}       reason=lease_revoked decision=80bbfe5a-...
+[audit] chain ok=True, 15 entries
 ```
 
 | Call | Result | Why |
@@ -74,9 +79,11 @@ The dry-run output (shortened):
 | `read_file alice/public-docs` | allowed, reaches the upstream | The intended use. |
 | `read_file alice/private-salaries` | denied, `capability_denied` | The coder's token constrains `repo` to `alice/public-`. Had the token been broader, `policy_deny` from `policy.cedar` would stop it; the leak demo shows that layer. |
 | `create_issue` | denied, `capability_denied` | The coder was never delegated it: the exfiltration path is closed. |
+| `read_file alice/public-site` | denied, `budget_exhausted` | The token and the policy both allow the repo, but the coder's run limit (`distinct` on `repo`, set with `Capability.with_limits`) allows one repository per run, and the first read used it. No policy or approval passes a run limit. |
+| `create_issue` by the orchestrator's code, with the root token | `-32008`, then allowed once | The policy permits issues in `alice/public-*` but holds each one until a person approves it (`@obligation("approval")`). `Client.call_tool_with_approval` prints the approval id, an operator grants it (`AdminClient.grant_approval`, the same as `attenuo approval grant <id>`), and the SDK retries the identical call once with the signed approval token. |
 | `read_file` after the orchestrator's lease is revoked | denied, `lease_revoked` | Revocation cascades from the orchestrator's lease to the coder's. |
 
-Every one of these is in the audit log, with the same `decision` id the denial carried. In the script the log is printed at the end (`#5 deny github/read_file reason=capability_denied` and so on). Against your own server:
+Every one of these is in the audit log, with the same `decision` id the denial carried; the approval adds an `approval_request` and an `approval_grant` record. In the script the log is printed at the end (`#6 deny github/read_file reason=capability_denied` and so on). Against your own server:
 
 ```sh
 attenuo audit tail -n 10
@@ -84,11 +91,11 @@ attenuo audit verify          # the hash chain checks out
 curl -s "$ATTENUO_SERVER/admin/audit?from=1&limit=20" -H "Authorization: Bearer $ATTENUO_ADMIN_TOKEN"
 ```
 
-`run.sh` also checks that the fake GitHub server saw exactly one `tools/call`, the legitimate one.
+`run.sh` also checks that the fake GitHub server saw exactly two `tools/call`s: the legitimate read and the approved issue.
 
 ## How the dry-run relates to the live run
 
-The dry-run does not call the Agent SDK. It reads the MCP server config that `coder_mcp_server()` produces (the same function live mode puts into `AgentDefinition`), opens an MCP Streamable HTTP session with the `mcp` client using that URL and header, and makes the calls. So the token, the URL and the headers are exercised for real; the model's choice of tool calls is the only thing replaced.
+The dry-run does not call the Agent SDK. It reads the MCP server config that `coder_mcp_server()` produces (the same function live mode puts into `AgentDefinition`), opens an MCP Streamable HTTP session with the `mcp` client using that URL and header, and makes the calls. So the token, the URL and the headers are exercised for real; the model's choice of tool calls is the only thing replaced. The report issue (`file_report()`) is plain code in both modes: live mode runs it after the agents finish.
 
 ## Things to know
 
@@ -96,6 +103,7 @@ The dry-run does not call the Agent SDK. It reads the MCP server config that `co
 - **Refresh.** The token lasts ten minutes here. A long-running agent has to re-exchange before it expires and give the SDK a new header (new session or `TokenAuth` in the `mcp` client). Not shown; the Python SDK's `TokenRefresher` does the renewing and re-exchanging (see its README).
 - **Revoked sessions.** In the dry-run the coder's MCP session was open when the lease was revoked, so the denial arrives as JSON-RPC `-32003`. A client that opens a new session after the revocation gets HTTP 401 instead (see the [LangChain example](../langchain-agent/README.md)).
 - **Telling attenuo's denials from the upstream's errors.** The upstream is untrusted and can answer with its own `-32003` and any `reason`. The dry-run counts a `-32003` as attenuo's only when its `data.decision_id` is in the `X-Attenuo-Decision-Id` header of the proxy's response, which only the proxy sets (the SDKs' SR-32 check; SR-53 here). The `mcp` client raises `McpError` without the response, so the dry-run's HTTP client has a response hook (`ProxyDecisions`) that collects the decision ids the proxy sends, and `_denial` checks against them; any other `-32003` is printed as `UPSTREAM ERROR`. `test_example.py` checks both cases without servers. In live mode the Agent SDK runs the MCP client itself and hands the model the error text, so neither the model nor this script can make that check: what the model reads as a refusal may come from the upstream, and only the audit log (`attenuo audit tail`) says what attenuo decided.
+- **Who approves.** In the demo config, `[approvals] client_id` names a client nothing issues ID tokens for, so only the operator can approve (`attenuo approval grant`, the admin console, `AdminClient.grant_approval`). In a real deployment alice approves with her own sign-in at `POST /approvals/{id}`, and the agent only waits; see [Approvals](../../sdk/python/README.md#approvals) in the Python SDK.
 - **The root token comes from the dev endpoint** and `alice` is asserted, not verified. See [what the leak demo does not show](../github-leak-demo/README.md#what-this-does-not-show).
 
 ## Files

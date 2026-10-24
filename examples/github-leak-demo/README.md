@@ -42,7 +42,7 @@ Downloading crates on a machine with an empty cargo cache comes on top and was n
 | 3 | `token inspect --verify` | tree: alice, assistant, coder | The chain and capabilities are in the token and can be checked against the server's JWKS. |
 | 4 | `read_file alice/public-docs` | allowed, reaches upstream | Intended use. |
 | 5 | `read_file alice/private-salaries` (the injected call) | denied, `policy_deny` | The token allows `read_file`, but `policy.cedar` only permits repos matching `alice/public-*`. This is the leak, stopped. |
-| 6 | `create_issue` on the public repo (the exfiltration path) | denied, `capability_denied` | `coder` was never delegated it. |
+| 6 | `create_issue` on the public repo (the exfiltration path) | denied, `capability_denied` | `coder` was never delegated it. A token that does hold it would still wait for a person's approval: `policy.cedar` asks before every `create_issue`. |
 | 7 | `lease revoke` on the assistant's lease | 2 leases revoked | Alice pulls the plug; the revocation cascades to `coder`. |
 | 8 | the legitimate `read_file` again | denied, `lease_revoked` | The next call after revocation is refused. |
 | 9 | `audit tail`, `audit verify` | nine entries, chain OK | Every issuance and decision is recorded, denials included, and so are the two admin actions (the dev root mint and the revocation) and the `tool_result` record of the allowed read. |
@@ -51,9 +51,9 @@ At the end the script prints what the fake GitHub server received: one `tools/ca
 
 ## Files
 
-- `config.toml`: server config with the catalog, the upstream, the admin token and alice's root grant. `run.sh` rewrites the ports and the policy path in a copy.
-- `policy.cedar`: the one permit rule, `read_file` only when `repo like "alice/public-*"`, plus two guard-rail forbids (sensitive tools without MFA, chains deeper than three).
-- `policy_test.yaml`: nine cases for that policy, run by `attenuo policy test`.
+- `config.toml`: server config with the catalog, the upstream, the admin token, alice's root grant and the `[approvals]` client id. `run.sh` rewrites the ports and the policy path in a copy.
+- `policy.cedar`: two permits, `read_file` and `create_issue` only when `repo like "alice/public-*"`; a forbid with `@obligation("approval")` that holds every `create_issue` until a person approves it (the Python, TypeScript and Claude Agent SDK examples use it); and two guard-rail forbids (sensitive tools without MFA, chains deeper than three).
+- `policy_test.yaml`: eleven cases for that policy, run by `attenuo policy test`.
 - `config.docker.toml`: the same, for `docker-compose.yml` at the repository root (untested).
 - `run.sh`, `transcript.md`.
 

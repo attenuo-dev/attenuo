@@ -227,7 +227,7 @@ Read beside: [ADR-0005: Policy decision point](../decisions/0005-policy-decision
 | 4 | `crates/attenuo-policy/src/request.rs` | Turns a chain and a call into Cedar entities and context (`context.chain`, `context.input`, `context.originating_user`). `RequestCache` keeps the part that depends only on the chain and tool. Fails closed on anything it cannot represent. | 880 |
 | 5 | `crates/attenuo-policy/src/authzen.rs` | AuthZEN 1.0 request and response types, so any enforcement point can call the engine. | 220 |
 | 6 | `crates/attenuo-policy/src/lint.rs`, `testing.rs` | `attenuo policy lint` and `attenuo policy test` (YAML cases). Skim. | 1600 |
-| 7 | `config/policies/default.cedar`, `examples/github-leak-demo/policy.cedar`, `policy_test.yaml` | Three real policies and nine tests to read as examples. | 150 |
+| 7 | `config/policies/default.cedar`, `examples/github-leak-demo/policy.cedar`, `policy_test.yaml` | Three real policies and eleven tests to read as examples. | 150 |
 
 Check you understood:
 
@@ -243,7 +243,7 @@ cargo test -p attenuo-policy --test engine cached_translations_decide_like_fresh
 cargo test -p attenuo-policy --test engine a_permit_for_one_servers_tool_does_not_match_another_server_sr13
 cargo bench -p attenuo-policy --bench policy_stage               # translation versus evaluation (optional)
 
-attenuo policy test examples/github-leak-demo/policy_test.yaml    # 9 passed, 0 failed
+attenuo policy test examples/github-leak-demo/policy_test.yaml    # 11 passed, 0 failed
 attenuo policy lint examples/github-leak-demo/policy.cedar --config examples/github-leak-demo/config.toml
 # 3 policies, 0 error(s), 0 warning(s). Without --config lint declares the tools from the policy's own action names and prints a note about what it could not check.
 
@@ -466,7 +466,7 @@ Read beside: [Integrating MCP clients](../guides/integrating-mcp-clients.md), th
 | 6 | `sdk/python/src/attenuo/refresh.py` | `TokenRefresher` and `AsyncTokenRefresher`: renew at a third of the lease interval, re-exchange before `exp`, back off, stop on a revoked lease. | 410 |
 | 7 | `sdk/python/src/attenuo/admin.py` | `AdminClient`: revoke, lease status, audit, verify, dev root mint. | 935 |
 | 8 | `sdk/typescript/src/` (`client.ts`, `refresh.ts`, `dpop.ts`, `wire.ts`) | The same, with WebCrypto and `fetch`. | 1100 |
-| 9 | `examples/python-agent/agent.py` | A planner delegates to a coder, the coder meets an injected instruction, the planner revokes (`mcp_client_example.py` beside it shows the raw client). | 130 |
+| 9 | `examples/python-agent/agent.py` | A planner delegates to a coder with a run limit, the coder meets an injected instruction and the limit, the planner's own `create_issue` waits for an approval, the planner revokes (`mcp_client_example.py` beside it shows the raw client). | 165 |
 
 Check you understood:
 
@@ -549,13 +549,11 @@ cargo test -p attenuo-server --test labels                # taint end to end: tr
 cargo test -p attenuo-server --test approvals             # single use, different call hash, revocation, ID token rules
 attenuo policy test config/policies/output-labels_test.yaml   # 15 passed, 0 failed
 
-# A second server on port 18081 beside the section 0 one, with the demo policy plus a permit for
-# create_issue and the approval forbid. It uses the same fake upstream.
-cat examples/github-leak-demo/policy.cedar - > /tmp/ob-labels.cedar <<'CEDAR'
-@id("issues_in_public_repos")
-permit(principal, action == Action::"github/create_issue", resource)
-when { context.input has repo && context.input.repo like "alice/public-*" };
-
+# A second server on port 18081 beside the section 0 one, with the demo policy plus the approval
+# forbid. The demo policy already permits create_issue in public repos and asks for an approval
+# on every one (ask_before_create_issue); the sed drops that forbid so the taint rule decides
+# alone. It uses the same fake upstream.
+{ sed '/@id("ask_before_create_issue")/,/};/d' examples/github-leak-demo/policy.cedar; cat; } > /tmp/ob-labels.cedar <<'CEDAR'
 @id("confirm_destructive_after_untrusted_read")
 @obligation("approval")
 forbid (principal, action, resource)

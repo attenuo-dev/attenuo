@@ -50,7 +50,7 @@ The orchestrator's agent id in the demo config is `assistant`; that is the name 
 | root | orchestrator | `github:*` (anything the policy allows) | Nothing is given to the model: the orchestrator has no MCP tools. |
 | exchanged | coder | `github:read_file` with `repo` starting `alice/public-`, 10 minutes | Any other tool, or any other repo. |
 
-The Cedar policy (`../github-leak-demo/policy.cedar`) is a second layer that applies to every call whatever the token says: `read_file` only on `alice/public-*`, no deep chains, no sensitive tools without MFA.
+The Cedar policy (`../github-leak-demo/policy.cedar`) is a second layer that applies to every call whatever the token says: `read_file` only on `alice/public-*`, `create_issue` only on `alice/public-*` and only after a person approves the call, no deep chains, no sensitive tools without MFA.
 
 ## What gets denied, and where to see it
 
@@ -64,7 +64,7 @@ The dry-run output (shortened):
   DENIED  create_issue {'repo': 'alice/public-docs', ...}    reason=capability_denied decision=0bdab038-...
 [orchestrator] the session looks compromised: revoking its lease
   DENIED  read_file {'repo': 'alice/public-docs', ...}       HTTP 401 (lease gone)
-[audit] chain ok=True, 7 entries
+[audit] chain ok=True, 8 entries
 ```
 
 | Call | Result | Why |
@@ -75,7 +75,7 @@ The dry-run output (shortened):
 | `create_issue` | denied, `capability_denied` | The coder was never delegated it. The dry-run sends it over the adapter's own session, as a hallucinated call would arrive. |
 | `read_file` after the orchestrator's lease is revoked | HTTP 401 | Revocation cascades from the orchestrator's lease to the coder's. |
 
-The two JSON-RPC denials are in the audit log with the `decision` id they carried (`#5` and `#6` in the script's output). The last call is different: `langchain-mcp-adapters` opens a new MCP session for each tool call, and a session cannot start on a revoked lease, so the proxy answers 401 before MCP begins. That is a transport error in the client, not an MCP error, and **it is not an audit record** in this version (the audit shows the revocation itself, `admin.lease.revoke`). The `denial_interceptor` in `agent.py` turns it into `LeaseRevoked` and stops the run. Against your own server:
+The two JSON-RPC denials are in the audit log with the `decision` id they carried (`#6` and `#7` in the script's output; `#5` is the `tool_result` record of the allowed read). The last call is different: `langchain-mcp-adapters` opens a new MCP session for each tool call, and a session cannot start on a revoked lease, so the proxy answers 401 before MCP begins. That is a transport error in the client, not an MCP error, and **it is not an audit record** in this version (the audit shows the revocation itself, `admin.lease.revoke`). The `denial_interceptor` in `agent.py` turns it into `LeaseRevoked` and stops the run. Against your own server:
 
 ```sh
 attenuo audit tail -n 10
@@ -100,6 +100,7 @@ The dry-run builds the same `MultiServerMCPClient` (same connection, same interc
 
 - **`langchain-mcp-adapters` is archived upstream** and its README now points to `langchain[mcp]`. Version 0.3.2 works with `langchain` 1.4.7 as pinned in `requirements.txt`; if you move to `langchain[mcp]`, the connection config and interceptor idea carry over, but this example was not run against it.
 - **Per-call sessions.** Each tool call is a fresh MCP session, so every call re-sends the bearer (good for revocation) and the token must be valid at each call. A long-running agent re-exchanges before it expires; `MCPToolCallRequest.headers` in an interceptor is the place to put a fresh one. Not shown.
+- **Run limits and approvals** are not shown here; the [Claude Agent SDK example](../claude-agent-sdk/README.md) has both, and they carry over unchanged. A run limit goes on the coder's capability before the exchange (`Capability(...).with_limits(distinct=("repo", 1))`), and a call over it is a `-32003` with reason `budget_exhausted`, which `denial_interceptor` already hands to the model. An approval arrives as JSON-RPC `-32008` with `approval_id` in its `data`; `denial_interceptor` only handles `-32003`, so it re-raises this one and the run ends, unless you add a branch that shows the approval id, waits for the grant (`Client.wait_for_approval`) and retries the identical call.
 - **The root token comes from the dev endpoint** and `alice` is asserted, not verified. See [what the leak demo does not show](../github-leak-demo/README.md#what-this-does-not-show).
 
 ## Files

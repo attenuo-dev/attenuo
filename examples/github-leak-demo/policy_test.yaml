@@ -42,13 +42,37 @@ cases:
     expect: deny
     reason: capability_denied
 
-  - name: the assistant's own broad token still gets no permit for create_issue
+  - name: the assistant's own create_issue in a public repo waits for an approval
     chain:
       - { agent: assistant, capabilities: ["github:*"] }
     call:
       server: github
       tool: create_issue
       arguments: { repo: alice/public-docs, title: hi }
+    expect: deny
+    reason: approval_required
+    policy_ids: [ask_before_create_issue]
+
+  - name: once approved, the identical create_issue is allowed
+    chain:
+      - { agent: assistant, capabilities: ["github:*"] }
+    approval: { by: operator }
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: alice/public-docs, title: hi }
+    expect: allow
+    reason: policy_allow
+    policy_ids: [create_issue_public_repos]
+
+  - name: create_issue in a private repo gets no permit, approved or not
+    chain:
+      - { agent: assistant, capabilities: ["github:*"] }
+    approval: { by: user }
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: alice/private-salaries, title: hi }
     expect: deny
     reason: policy_deny
 
