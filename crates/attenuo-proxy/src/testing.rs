@@ -65,6 +65,8 @@ pub struct RecordedCall {
     pub name: String,
     pub arguments: Value,
     pub session_id: Option<String>,
+    /// The whole `params` member as received (with `_meta`, if any).
+    pub params: Value,
 }
 
 /// A minimal Streamable HTTP MCP server: `initialize`, `tools/list`, `tools/call`,
@@ -312,6 +314,7 @@ impl FakeMcpServer {
                     name: name.clone(),
                     arguments: arguments.clone(),
                     session_id: session_id.map(str::to_owned),
+                    params: msg["params"].clone(),
                 });
                 if self.failing_tools.contains(&name) {
                     return Some(error_response(id, -32000, "tool failed", None));
@@ -478,6 +481,7 @@ pub struct StaticAuthorizer {
     fail_results: Arc<std::sync::atomic::AtomicBool>,
     hints: Arc<Mutex<Vec<ObservedHints>>>,
     ask_for: std::collections::HashSet<String>,
+    contexts: Arc<Mutex<Vec<crate::auth::CallContext>>>,
 }
 
 /// A result reported through [`Authorizer::record_result`] to a [`StaticAuthorizer`].
@@ -544,6 +548,12 @@ impl StaticAuthorizer {
     pub fn with_approval_required(mut self, tool: &str) -> Self {
         self.ask_for.insert(tool.to_owned());
         self
+    }
+
+    /// The [`CallContext`](crate::auth::CallContext) of every decision made through
+    /// [`Authorizer::authorize_with`], in order.
+    pub fn contexts(&self) -> Vec<crate::auth::CallContext> {
+        self.contexts.lock().expect("contexts mutex").clone()
     }
 
     /// Every result reported through [`Authorizer::record_result`], in order (failed ones
@@ -639,6 +649,20 @@ impl Authorizer for StaticAuthorizer {
             approval,
             limit: None,
         }
+    }
+
+    async fn authorize_with(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        ctx: &crate::auth::CallContext,
+        now: OffsetDateTime,
+    ) -> AuthDecision {
+        self.contexts
+            .lock()
+            .expect("contexts mutex")
+            .push(ctx.clone());
+        self.authorize(chain, call, now).await
     }
 
     fn knows_tool(&self, server: &str, tool: &str) -> bool {

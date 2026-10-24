@@ -20,7 +20,10 @@ use tower_http::trace::TraceLayer;
 use tracing::Instrument;
 use uuid::Uuid;
 
-use crate::auth::{AuthError, Authenticated, Authorizer, RequestAuth, REASON_APPROVAL_REQUIRED};
+use crate::auth::{
+    AuthError, Authenticated, Authorizer, CallContext, RequestAuth, META_APPROVAL_KEY,
+    REASON_APPROVAL_REQUIRED,
+};
 use crate::config::ProxyConfig;
 use crate::filter::{ListFilter, ListKind};
 use crate::guard::{guard_stream, StreamGuard};
@@ -1103,11 +1106,27 @@ async fn screen_message(
     who: &Authenticated,
     server: &str,
     session_id: Option<&str>,
-    msg: Value,
+    mut msg: Value,
     now: OffsetDateTime,
     out: &mut Screened,
 ) {
     let chain = &who.chain;
+    // The approval token is for the decision, never for the upstream (ADR-0009). Removed
+    // before anything below reads the params, so it is in no `ToolCall` and no call hash.
+    let approval_token = match take_approval_token(&mut msg) {
+        Ok(t) => t,
+        Err(detail) => {
+            if is_request(&msg) {
+                out.replies.push(error_response(
+                    id_of(&msg),
+                    CODE_INVALID_PARAMS,
+                    format!("attenuo: invalid params: {detail}"),
+                    None,
+                ));
+            }
+            return;
+        }
+    };
     let method = method_of(&msg).map(str::to_owned);
     let Some(method) = method else {
         // A response to a server-initiated request, or something malformed: the upstream
@@ -1209,7 +1228,14 @@ async fn screen_message(
         // Policy and the audit log see a stable hash prefix, not the session id (SR-11).
         call = call.with_session(session_tag(sid));
     }
-    let verdict = state.authorizer.authorize(chain, &call, now).await;
+    let ctx = CallContext {
+        approval_token,
+        jkt: who.jkt.clone(),
+    };
+    let verdict = state
+        .authorizer
+        .authorize_with(chain, &call, &ctx, now)
+        .await;
     // Method and tool name are the caller's: Debug-format them so a newline cannot forge a
     // log line (SR-18).
     tracing::info!(
@@ -1244,6 +1270,28 @@ async fn screen_message(
             verdict.decision_id,
             verdict.limit.as_ref(),
         ));
+    }
+}
+
+/// Remove `params._meta["dev.attenuo/approval"]` from `msg` and return it; drop `_meta` when
+/// nothing else is left in it, so the message is what it would be without the token. `Err`
+/// when the value is not a string.
+fn take_approval_token(msg: &mut Value) -> Result<Option<String>, &'static str> {
+    let Some(params) = msg.get_mut("params").and_then(Value::as_object_mut) else {
+        return Ok(None);
+    };
+    let Some(meta) = params.get_mut("_meta").and_then(Value::as_object_mut) else {
+        return Ok(None);
+    };
+    let Some(token) = meta.remove(META_APPROVAL_KEY) else {
+        return Ok(None);
+    };
+    if meta.is_empty() {
+        params.remove("_meta");
+    }
+    match token {
+        Value::String(t) => Ok(Some(t)),
+        _ => Err("params._meta[\"dev.attenuo/approval\"] must be a string"),
     }
 }
 
@@ -1562,6 +1610,37 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(header::AUTHORIZATION, HeaderValue::from_str(value).unwrap());
         h
+    }
+
+    #[test]
+    fn approval_token_is_taken_out_of_meta() {
+        let mut msg = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "t", "arguments": {"a": 1},
+                       "_meta": {"dev.attenuo/approval": "tok"}}});
+        assert_eq!(take_approval_token(&mut msg), Ok(Some("tok".to_string())));
+        assert_eq!(
+            msg["params"],
+            serde_json::json!({"name": "t", "arguments": {"a": 1}})
+        );
+        let mut msg = serde_json::json!({"method": "tools/call", "params": {"name": "t",
+            "_meta": {"progressToken": 7, "dev.attenuo/approval": "tok"}}});
+        assert_eq!(take_approval_token(&mut msg), Ok(Some("tok".to_string())));
+        assert_eq!(
+            msg["params"]["_meta"],
+            serde_json::json!({"progressToken": 7})
+        );
+        let mut msg = serde_json::json!({"method": "tools/call", "params": {"name": "t",
+            "_meta": {"progressToken": 7}}});
+        let before = msg.clone();
+        assert_eq!(take_approval_token(&mut msg), Ok(None));
+        assert_eq!(msg, before);
+        let mut msg = serde_json::json!({"method": "tools/call", "params": {"name": "t",
+            "_meta": {"dev.attenuo/approval": 5}}});
+        assert!(take_approval_token(&mut msg).is_err());
+        assert_eq!(
+            take_approval_token(&mut serde_json::json!({"method": "ping"})),
+            Ok(None)
+        );
     }
 
     #[test]
