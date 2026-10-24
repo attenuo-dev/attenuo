@@ -23,9 +23,10 @@ pub struct VerifiedToken {
 /// of issuer keys, each named by its `kid` (normally the current key plus, during a rotation,
 /// the retired one). A token whose header names a `kid` is checked against that key only; an
 /// unknown `kid` is rejected. A token without a `kid` is tried against each key. The
-/// originating-user signature `ou_sig` (version 2 only) must verify under the trusted key its
+/// originating-user signature `ou_sig` (version 3 only) must verify under the trusted key its
 /// `ou_kid` names: it is made once at the root and copied into children, which may be signed
-/// by a newer key.
+/// by a newer key. Both lookups pick one key, so a miss costs the same however many keys are
+/// trusted; nearly all of it is the two Ed25519 verifications (`benches/verify.rs`).
 #[derive(Clone)]
 pub struct Verifier {
     keys: Vec<TrustedKey>,
@@ -217,6 +218,13 @@ impl Verifier {
             // A missing claim deserializes as 0: a version-1 token from before SR-14.
             return Err(TokenError::UnsupportedOuSig(claims.ou_sig_v.max(1)));
         }
+        // `ou_kid` picks the one key `ou_sig` is checked under. An `ou_kid` that names no
+        // trusted key, or an empty or missing one, fails here instead of falling back to trying
+        // every key: every version-3 token carries `ou_kid` (it came with version 2), so a
+        // fallback would serve no token anyone minted, and it would let the token itself
+        // choose a slow path of one Ed25519 check per trusted key. (Only a token whose outer
+        // signature already verified gets this far, so today that would take a trusted key;
+        // the check stays one key so it never depends on that ordering.)
         let ou_key = self
             .keys
             .iter()

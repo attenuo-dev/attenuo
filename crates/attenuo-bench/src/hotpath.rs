@@ -59,7 +59,10 @@
 //! `--tokens M` mints M root tokens, each its own run, and client `i` uses run `i mod M`, so
 //! `--tokens` equal to `--clients` gives each client a run of its own. One run under many
 //! clients is the case the per-run lock of SR-55 (`Pipeline::run_guard`) serialises; many
-//! runs show that unrelated runs do not wait on each other.
+//! runs show that unrelated runs do not wait on each other. `--rotate-tokens` makes every
+//! client send the next token of the `--tokens` list on every call (and lets `--tokens`
+//! exceed `--clients`); with more tokens than the server's verified-token cache holds (4096),
+//! every call verifies its token from scratch (`token_verify_miss`).
 //!
 //! `--approval-loops N` adds the approval round, timed as one sequence on a separate server
 //! (untrusted `read_file`, an `@obligation("approval")` forbid on destructive calls in a
@@ -223,6 +226,12 @@ pub struct HotPathArgs {
     /// on one run; equal to `--clients` gives each client a run of its own.
     #[arg(long, default_value_t = 1)]
     pub tokens: usize,
+    /// Every client sends the next of the `--tokens` tokens on every call instead of keeping
+    /// one, and `--tokens` may exceed `--clients`. With more tokens than the server's
+    /// verified-token cache holds (4096), every call is a cache miss, so the
+    /// `token_verify_miss` stage is the verifier's full cost. Each token is still its own run.
+    #[arg(long)]
+    pub rotate_tokens: bool,
     /// Approval rounds to time (gated call, grant, retry) after `--approval-warmup` rounds;
     /// 0 skips them.
     #[arg(long, default_value_t = 0)]
@@ -515,13 +524,23 @@ async fn start(
         let log = std::fs::read_to_string(&log_path).unwrap_or_default();
         bail!("{e}; server log:\n{log}");
     }
+    // Concurrently, in batches: `--rotate-tokens` runs mint thousands.
+    const MINT_BATCH: usize = 32;
     let mut tokens = Vec::with_capacity(args.tokens);
-    for i in 0..args.tokens {
-        tokens.push(
-            mint(http, &ep.attenuo, args.depth, limits)
-                .await
-                .with_context(|| format!("[{label}] token {i}"))?,
-        );
+    for start in (0..args.tokens).step_by(MINT_BATCH) {
+        let mut set = tokio::task::JoinSet::new();
+        for i in start..(start + MINT_BATCH).min(args.tokens) {
+            let (http, base, limits) = (http.clone(), ep.attenuo.clone(), limits.clone());
+            let depth = args.depth;
+            set.spawn(async move { (i, mint(&http, &base, depth, &limits).await) });
+        }
+        let mut batch = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            let (i, token) = joined?;
+            batch.push((i, token.with_context(|| format!("[{label}] token {i}"))?));
+        }
+        batch.sort_by_key(|(i, _)| *i);
+        tokens.extend(batch.into_iter().map(|(_, t)| t));
     }
     Ok(Server {
         _fake: fake,
@@ -1045,9 +1064,10 @@ pub async fn run(args: &HotPathArgs) -> Result<()> {
     ensure!(args.duration > 0.0, "--duration must be positive");
     ensure!(args.runs > 0, "--runs must be at least 1");
     ensure!(args.clients > 0, "--clients must be at least 1");
+    ensure!(args.tokens >= 1, "--tokens must be at least 1");
     ensure!(
-        (1..=args.clients).contains(&args.tokens),
-        "--tokens must be 1 to --clients"
+        args.rotate_tokens || args.tokens <= args.clients,
+        "--tokens must be 1 to --clients (or pass --rotate-tokens)"
     );
     ensure!(
         (2..=8).contains(&args.depth),
@@ -1110,12 +1130,19 @@ pub async fn run(args: &HotPathArgs) -> Result<()> {
             for &cell in &cells {
                 let name = format!("[{}] run {run} {}", c.label(), cell.label());
                 eprintln!("{name}");
-                let targets: Vec<Target> = srv
-                    .tokens
+                let rotate: Option<std::sync::Arc<[String]>> =
+                    args.rotate_tokens.then(|| srv.tokens.clone().into());
+                let per_client: &[String] = if args.rotate_tokens {
+                    &srv.tokens[..1]
+                } else {
+                    &srv.tokens
+                };
+                let targets: Vec<Target> = per_client
                     .iter()
                     .map(|token| Target {
                         url: format!("{}/mcp/{UPSTREAM}", srv.ep.attenuo),
                         token: Some(token.clone()),
+                        rotate: rotate.clone(),
                         body: cell.body(*c),
                         expect: Expect::Result {
                             decision_header: true,
@@ -1240,6 +1267,7 @@ pub async fn run(args: &HotPathArgs) -> Result<()> {
             "runs": args.runs,
             "clients": args.clients,
             "tokens": args.tokens,
+            "rotate_tokens": args.rotate_tokens,
             "depth": args.depth,
             "audit": args.audit,
         }),

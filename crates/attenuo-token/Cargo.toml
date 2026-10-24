@@ -23,3 +23,8 @@ jsonwebtoken = { workspace = true }
 ring = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "verify"
+harness = false

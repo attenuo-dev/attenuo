@@ -970,9 +970,14 @@ fn ou_sig_v1_and_unknown_versions_or_kids_are_refused() {
         .trust_previous_key(&issuer.public_key_pem())
         .unwrap();
     assert!(trusting_both.verifier().verify(&r.token, t0()).is_ok());
-    for kid in [json!("nope"), json!(other.key_id()), json!("")] {
+    // `null` stands for a token without the claim: there is no try-every-key fallback.
+    for kid in [json!("nope"), json!(other.key_id()), json!(""), json!(null)] {
         let mut payload = decode_payload(&r.token);
-        payload["ou_kid"] = kid.clone();
+        if kid.is_null() {
+            payload.as_object_mut().unwrap().remove("ou_kid");
+        } else {
+            payload["ou_kid"] = kid.clone();
+        }
         let tok = resign_with_issuer_key(&issuer, &payload);
         assert!(
             matches!(

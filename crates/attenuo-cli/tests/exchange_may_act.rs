@@ -312,6 +312,15 @@ async fn no_delegation_makes_a_token_nobody_may_exchange() {
         "{text}"
     );
     assert!(text.contains("\nverified: "), "{text}");
+    // The key line: the server's one key signed the token and made its `ou_sig`.
+    let kid_line = text
+        .lines()
+        .find(|l| l.starts_with("kid "))
+        .expect("kid line");
+    let kids: Vec<&str> = kid_line.split_whitespace().collect();
+    assert_eq!(kids.len(), 4, "{kid_line}");
+    assert_eq!((kids[0], kids[2]), ("kid", "ou_kid"), "{kid_line}");
+    assert_eq!(kids[1], kids[3], "{kid_line}");
     let text = ok(&run(inspect(&open, true)).await);
     assert!(
         text.contains("\nmay_act (absent): any authenticated agent may exchange this token\n"),
