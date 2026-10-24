@@ -257,6 +257,19 @@ def arm_rates(doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
                 c.get("after_approval") == "denied" and c.get("retry_stage") == "budget"
                 for c in calls
             ),
+            # Every benign call a run limit refused, on the first attempt or on the retry after
+            # a grant, by case: what the limit cost the user's task.
+            "benign_lost_to_limits": [
+                {
+                    "case": c["case"],
+                    "index": c["index"],
+                    "tool": c["tool"],
+                    "when": "first attempt" if c["outcome"] == "deny" else "retry after approval",
+                }
+                for c in ben
+                if (c["outcome"] == "deny" and c["stage"] == "budget")
+                or (c.get("after_approval") == "denied" and c.get("retry_stage") == "budget")
+            ],
         }
     return out
 
@@ -558,6 +571,17 @@ def render_limits(doc: dict[str, Any]) -> list[str]:
             f"| {_pct(r['benign_budget_denied'], r['benign_calls'])} "
             f"| {_ci(r['benign_denied'], r['benign_calls'])} |",
         ]
+        lost = r.get("benign_lost_to_limits") or []
+        if lost:
+            L += [
+                "",
+                "Benign calls a run limit refused, on the first attempt or on the retry after a "
+                "grant (calls numbered from 0 in case order):",
+                "",
+                "| Case | Call | Tool | When |",
+                "|---|---:|---|---|",
+            ]
+            L += [f"| {x['case']} | {x['index']} | `{x['tool']}` | {x['when']} |" for x in lost]
     return L
 
 
