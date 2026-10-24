@@ -180,6 +180,8 @@ Revoke from what you know. All of these need the admin token, take effect on the
 
 Run the selector forms with `--preview` first: it lists the leases that would be revoked and changes nothing. The admin console does the same from a lease page: "Revoke chain…", "Revoke by session…" (you paste the session id; the console shows only its tag) and, when the lease has a recorded user, "Revoke all for <user>…" show the preview, then revoke after you give a reason and type a confirmation, and link to the audit record. The console listener needs `[admin_ui] allow_write = true` for the revocation itself. A user is matched by subject under every trusted issuer. Leases issued before the server recorded subjects are not matched by `--user`; if you upgraded during a user's run, revoke that run by `--chain-id` as well. To stop a user getting new tokens as well, disable them at the IdP: a revocation covers the leases that exist, not the next root token.
 
+From code, the SDKs' admin clients send the same request: Python `admin.revoke_by_selector(chain_id=run, preview=True)`, then without `preview`; TypeScript `admin.revokeBySelector({ chainId: run }, { preview: true })`. `user=` / `{ user }` and `session=` / `{ session }` work the same way.
+
 ## Logging
 
 The server logs through `tracing` to standard output. Control it with `RUST_LOG`.

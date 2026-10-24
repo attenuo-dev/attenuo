@@ -603,6 +603,139 @@ def test_example_mcp_client(stack: Stack) -> None:
     assert "denied:" in proc.stdout
 
 
+# ---- filtered export and revocation by selector ---------------------------------------------
+
+
+@pytest.fixture
+def fresh_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
+    """A stack of its own, for a test that must be the first to open an MCP session (the fake
+    upstream hands every caller the same session id, and the proxy binds it to the first)."""
+    yield from run_stack(tmp_path_factory.mktemp("attenuo-it-fresh"))
+
+
+def test_export_filtered_on_tool_and_decision(stack: Stack, tmp_path: Path) -> None:
+    from attenuo.audit import ExportError, verify_export
+
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    ob = Client(stack.url)
+    root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+    coder = ob.exchange(root, "coder", ["github:read_file"], client_secret=CODER_SECRET)
+    # A widening exchange: refused, and recorded as a `deny` of tool `token.exchange`.
+    with pytest.raises(ApiError) as widen:
+        ob.exchange(coder, "tester", ["github:create_issue"], client_secret=TESTER_SECRET)
+    assert widen.value.error == "invalid_scope"
+
+    lines = list(admin.audit_export(tool="token.exchange", decision="deny"))
+    header, rest = lines[0], lines[1:]
+    assert header["type"] == "header"
+    assert header["filter"] == {"tool": "token.exchange", "decision": "deny"}
+    entries = [o for o in rest if o["type"] == "entry"]
+    assert entries, "the refused exchange should be exported"
+    assert {(e["record"]["tool"], e["record"]["decision"]) for e in entries} == {
+        ("token.exchange", "deny")
+    }
+    assert any(
+        e["record"].get("chain_id") == root.lease
+        and e["record"].get("reason") == "exchange_widening"
+        for e in entries
+    )
+    # The allowed exchange of the same run is not in it.
+    allowed = list(admin.audit_export(tool="token.exchange", decision="allow"))
+    assert any(o["type"] == "entry" and o["record"].get("chain_id") == root.lease for o in allowed)
+
+    # Offline verification refuses the filtered file: its chain has gaps.
+    jwks = httpx.get(f"{stack.url}/.well-known/jwks.json").json()
+    path = tmp_path / "filtered.jsonl"
+    path.write_text("".join(json.dumps(o) + "\n" for o in lines))
+    with pytest.raises(ExportError, match="filtered"):
+        verify_export(path, checkpoint_public_keys=jwks)
+
+    # An unknown decision is the server's 400.
+    with pytest.raises(ApiError) as bad:
+        list(admin.audit_export(decision="maybe"))  # type: ignore[arg-type]
+    assert bad.value.status == 400
+    admin.revoke_lease(root.lease)
+    admin.close()
+    ob.close()
+
+
+def test_revoke_by_chain_id_preview_then_for_real(stack: Stack) -> None:
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    ob = Client(stack.url)
+    user = "alice"  # the demo config grants roots to alice only
+    root = admin.mint_root_dev(user, "https://idp.example", "assistant", ["github:*"])
+    coder = ob.exchange(root, "coder", ["github:read_file"], client_secret=CODER_SECRET)
+    both = sorted([root.lease, coder.lease])
+
+    # A preview changes nothing and writes nothing.
+    head = admin.audit_head()
+    preview = admin.revoke_by_selector(chain_id=root.lease, preview=True)
+    assert preview.preview and preview.selector == {"chain_id": root.lease}
+    assert sorted(preview.matched) == both and sorted(preview.revoked) == both
+    assert (preview.matched_count, preview.revoked_count, preview.truncated) == (2, 2, False)
+    assert preview.reason is None and preview.audit_id is None
+    assert admin.audit_head() == head
+    assert admin.lease_status(root.lease).active
+    by_user = admin.revoke_by_selector(user=user, preview=True)
+    assert by_user.selector == {"user": user} and root.lease in by_user.matched
+    assert ob.call_tool(coder, "github", "read_file", {"repo": "alice/public-docs"}).decision_id
+
+    # For real: the chain is revoked and the revocation is audited.
+    done = admin.revoke_by_selector(chain_id=root.lease, reason="run went wrong")
+    assert not done.preview and sorted(done.matched) == both and sorted(done.revoked) == both
+    assert done.revoked_count == 2 and done.reason == "run went wrong"
+    assert done.audit_id is not None
+    record = admin.audit_record(done.audit_id).entry
+    assert (record.tool, record.kind) == ("admin.lease.revoke", "lease_revoke")
+    assert not admin.lease_status(coder.lease).active
+    with pytest.raises(Denied) as after:
+        ob.call_tool(coder, "github", "read_file", {"repo": "alice/public-docs"})
+    assert after.value.reason == "lease_revoked"
+
+    # Nothing is left to match, and an unknown chain is an empty answer, not an error.
+    again = admin.revoke_by_selector(chain_id=root.lease, preview=True)
+    assert again.matched == [] and again.revoked == [] and again.revoked_count == 0
+    unknown = admin.revoke_by_selector(chain_id="no-such-chain", preview=True)
+    assert unknown.matched == [] and unknown.revoked == []
+    admin.close()
+    ob.close()
+
+
+def test_revoke_by_session(fresh_stack: Stack, caplog: pytest.LogCaptureFixture) -> None:
+    admin = AdminClient(fresh_stack.url, ADMIN_TOKEN)
+    ob = Client(fresh_stack.url)
+
+    # A session the server never recorded resolves to no chain: an empty answer.
+    unknown = admin.revoke_by_selector(session="no-such-session", preview=True)
+    assert unknown.preview and unknown.matched == [] and unknown.revoked == []
+    assert unknown.selector["chain_ids"] == []
+    assert len(unknown.selector["session_tag"]) == 12
+    assert "no-such-session" not in json.dumps(unknown.selector)
+
+    # Open a session through the proxy; the server binds it to the caller's chain.
+    root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+    coder = ob.exchange(root, "coder", ["github:read_file"], client_secret=CODER_SECRET)
+    sid = ob.initialize(coder, "github")
+    assert sid, "the fake upstream assigns a session id"
+    both = sorted([root.lease, coder.lease])
+
+    with caplog.at_level("DEBUG"):
+        preview = admin.revoke_by_selector(session=sid, preview=True)
+        assert preview.selector["chain_ids"] == [root.lease]
+        assert sorted(preview.matched) == both and sorted(preview.revoked) == both
+        assert admin.lease_status(coder.lease).active
+
+        done = admin.revoke_by_selector(session=sid, reason="session hijacked")
+    assert not done.preview and sorted(done.revoked) == both and done.audit_id is not None
+    assert sid not in json.dumps(done.selector) and sid not in repr(done)
+    assert sid not in caplog.text
+    with pytest.raises(Denied) as after:
+        ob.call_tool(coder, "github", "read_file", {"repo": "alice/public-docs"}, session_id=sid)
+    assert after.value.reason == "lease_revoked"
+    admin.close()
+    ob.close()
+
+
 # ---- cross-language export verification ------------------------------------------------------
 
 TS_DIST = ROOT / "sdk" / "typescript" / "dist" / "index.js"

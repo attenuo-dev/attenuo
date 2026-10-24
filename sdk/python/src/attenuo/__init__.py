@@ -33,6 +33,7 @@ from .admin import (
     PolicyReload,
     PolicySet,
     RevokeResult,
+    SelectorRevocation,
     VerifyReport,
 )
 from .approval import (
@@ -106,6 +107,7 @@ __all__ = [
     "RefreshError",
     "RevokeResult",
     "RpcError",
+    "SelectorRevocation",
     "Token",
     "TokenRefresher",
     "Tool",
