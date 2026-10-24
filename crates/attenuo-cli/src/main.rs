@@ -160,8 +160,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 body["actor_token"] = token.into();
                 body["actor_token_type"] = "urn:ietf:params:oauth:token-type:jwt".into();
             }
-            let may_act = a.may_act();
-            if !may_act.is_empty() {
+            if let Some(may_act) = a.may_act_claim()? {
                 body["may_act"] = json!({ "sub": may_act });
             }
             let secret = secrets::resolve(
