@@ -38,6 +38,12 @@ fn fmt_constraint(arg: &str, c: &ArgConstraint) -> String {
             format!("{arg} in [{}]", items.join(", "))
         }
         ArgConstraint::Prefix(p) => format!("{arg} starts with {p:?}"),
+        ArgConstraint::Range { min, max } => match (min, max) {
+            (Some(lo), Some(hi)) => format!("{lo} <= {arg} <= {hi}"),
+            (Some(lo), None) => format!("{arg} >= {lo}"),
+            (None, Some(hi)) => format!("{arg} <= {hi}"),
+            (None, None) => format!("{arg} is an integer"),
+        },
     }
 }
 
@@ -970,6 +976,15 @@ user alice  (issuer https://idp.example)
             .with_constraint("r", ArgConstraint::OneOf(vec![json!("a"), json!("b")]));
         assert_eq!(fmt_capability(&c), "github:x {n == 1, r in [\"a\", \"b\"]}");
         assert_eq!(fmt_capabilities(&CapabilitySet::new()), "(none)");
+        let range = |min, max| ArgConstraint::range(min, max).unwrap();
+        let ranged = Capability::new("bank", "send_money")
+            .with_constraint("amount", range(Some(0), Some(2000)))
+            .with_constraint("fee", range(None, Some(5)))
+            .with_constraint("n", range(Some(-1), None));
+        assert_eq!(
+            fmt_capability(&ranged),
+            "bank:send_money {0 <= amount <= 2000, fee <= 5, n >= -1}"
+        );
         let limited = Capability::new("banking", "send_money").with_limits(
             attenuo_core::Limits::default()
                 .with_calls(1)

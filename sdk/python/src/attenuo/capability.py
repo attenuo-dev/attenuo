@@ -5,6 +5,9 @@
     {"server": "github", "tool": "read_file",
      "constraints": {"repo": {"op": "prefix", "value": "alice/public-"}}}
 
+``Capability("banking", "send_money", amount=Range(0, 2000))`` bounds an integer argument,
+both ends inclusive: ``{"amount": {"op": "range", "value": {"min": 0, "max": 2000}}}``.
+
 ``constraints`` is omitted when empty. ``server`` and ``tool`` are an exact name, ``*``, or a
 prefix glob such as ``read_*``.
 
@@ -69,7 +72,50 @@ class Prefix:
         return {"op": "prefix", "value": self.value}
 
 
-Constraint = Equals | OneOf | Prefix
+# The bounds of a Cedar Long, which is what a range bound and a ranged argument are.
+_LONG_MIN = -(2**63)
+_LONG_MAX = 2**63 - 1
+
+
+def _is_long(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and _LONG_MIN <= v <= _LONG_MAX
+
+
+@dataclass(frozen=True)
+class Range:
+    """The argument must be an integer between ``min`` and ``max``, both inclusive.
+
+    A missing bound is unbounded on that side; at least one is required, and ``min <= max``:
+    ``Range(0, 2000)``, ``Range(max=2000)``. The server reads the argument as Cedar does: an
+    integer, or a float with no fractional part (``5.0`` is ``5``); anything else, a fraction
+    or a numeric string, is outside every range. Serialized as
+    ``{"op": "range", "value": {"min": 0, "max": 2000}}``, a missing bound omitted."""
+
+    min: int | None = None
+    max: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.min is None and self.max is None:
+            raise ValueError("a range constraint needs min, max or both")
+        for name in ("min", "max"):
+            v = getattr(self, name)
+            if v is not None and not _is_long(v):
+                raise ValueError(f"a range constraint's {name} must be a 64-bit integer")
+        if self.min is not None and self.max is not None and self.min > self.max:
+            raise ValueError(
+                f"a range constraint's min {self.min} is greater than its max {self.max}"
+            )
+
+    def to_json(self) -> dict[str, Any]:
+        value: dict[str, int] = {}
+        if self.min is not None:
+            value["min"] = self.min
+        if self.max is not None:
+            value["max"] = self.max
+        return {"op": "range", "value": value}
+
+
+Constraint = Equals | OneOf | Prefix | Range
 
 
 def constraint_from_json(obj: dict[str, Any]) -> Constraint:
@@ -81,6 +127,11 @@ def constraint_from_json(obj: dict[str, Any]) -> Constraint:
         return OneOf(*list(value or []))
     if op == "prefix":
         return Prefix(str(value))
+    if op == "range":
+        # As the server reads it: an object with integer members min and/or max, nothing else.
+        if not isinstance(value, dict) or not set(value) <= {"min", "max"}:
+            raise ValueError('a range constraint\'s value must be {"min"?: int, "max"?: int}')
+        return Range(value.get("min"), value.get("max"))
     raise ValueError(f"unknown constraint op {op!r}")
 
 
@@ -234,9 +285,11 @@ def _limits_from_json(obj: Any) -> dict[str, Any]:
 class Capability:
     """``server:tool`` plus optional per-argument constraints and run limits.
 
-    Constraints are keyword arguments. A bare value is shorthand for ``Equals``::
+    Constraints are keyword arguments, one per argument. A bare value is shorthand for
+    ``Equals``::
 
         Capability("github", "create_issue", repo=OneOf("acme/api", "acme/web"))
+        Capability("banking", "send_money", amount=Range(0, 2000))
 
     Limits are set with :meth:`with_limits`, and read back typed with :attr:`typed_limits`.
     """
@@ -254,7 +307,7 @@ class Capability:
         self.server = server
         self.tool = tool
         self.constraints = {
-            k: v if isinstance(v, (Equals, OneOf, Prefix)) else Equals(v)
+            k: v if isinstance(v, (Equals, OneOf, Prefix, Range)) else Equals(v)
             for k, v in constraints.items()
         }
         self.limits = {}

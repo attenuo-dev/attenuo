@@ -187,6 +187,97 @@ fn capability_argument_constraints_are_enforced_before_cedar() {
     assert_eq!(out.reason, REASON_POLICY_ALLOW);
 }
 
+/// A `range` constraint (RFC-0001 section 3): inclusive bounds on a Cedar `long`, checked in
+/// the capability stage, so no policy can allow a value outside them. The denial names the
+/// argument and the bound, never the value.
+#[test]
+fn range_constraints_are_enforced_before_cedar() {
+    use attenuo_core::ArgConstraint;
+    let engine = engine_with(r#"@id("all") permit(principal, action, resource);"#);
+    let ranged = chain_for(
+        user(),
+        "coder",
+        caps(vec![Capability::new("github", "set_limit")
+            .with_constraint(
+                "count",
+                ArgConstraint::range(Some(10), Some(2000)).unwrap(),
+            )]),
+    );
+    let decide = |args: Value| engine.authorize(&ranged, &call("set_limit", args), now());
+    // Inside, on each bound, and a whole float (which Cedar also reads as a long).
+    for ok in [
+        json!(500),
+        json!(10),
+        json!(2000),
+        json!(5.0e2),
+        json!(2000.0),
+    ] {
+        let out = decide(json!({ "count": ok }));
+        assert_eq!(
+            out.reason, REASON_POLICY_ALLOW,
+            "{ok}: {:?}",
+            out.diagnostics
+        );
+    }
+    // Outside each bound: denied, naming the argument and the bound, not the value.
+    let out = decide(json!({"count": 9}));
+    assert_eq!(out.reason, REASON_CAPABILITY_DENIED);
+    assert!(
+        out.diagnostics[0]
+            .ends_with("; github:set_limit: argument `count` is below the minimum 10"),
+        "{:?}",
+        out.diagnostics
+    );
+    let out = decide(json!({"count": 31337}));
+    assert_eq!(out.reason, REASON_CAPABILITY_DENIED);
+    let d = &out.diagnostics[0];
+    assert!(
+        d.ends_with("argument `count` is above the maximum 2000"),
+        "{d}"
+    );
+    assert!(!d.contains("31337"), "{d}");
+    // Not an integer: a fraction, a numeric string, a number beyond i64. The capability stage
+    // runs before the declared-type check, so these are capability denials too.
+    for bad in [
+        json!(10.5),
+        json!("500"),
+        json!(18_446_744_073_709_551_615u64),
+    ] {
+        let out = decide(json!({ "count": bad }));
+        assert_eq!(out.reason, REASON_CAPABILITY_DENIED, "{bad}");
+        assert!(out.diagnostics[0].ends_with("argument `count` is not an integer"));
+    }
+    // Absent: denied, as for every constraint kind.
+    let out = decide(json!({}));
+    assert_eq!(out.reason, REASON_CAPABILITY_DENIED);
+    assert!(out.diagnostics[0].ends_with("argument `count` is absent"));
+    // A prefix denial gets the same kind of explanation.
+    let prefixed = chain_for(
+        user(),
+        "coder",
+        caps(vec![Capability::new("github", "create_issue")
+            .with_constraint(
+                "repo",
+                ArgConstraint::Prefix("acme/".into()),
+            )]),
+    );
+    let out = engine.authorize(
+        &prefixed,
+        &call("create_issue", json!({"repo": "evil/x"})),
+        now(),
+    );
+    assert!(out.diagnostics[0]
+        .ends_with("; github:create_issue: argument `repo` does not start with \"acme/\""));
+    // A call whose tool no capability names gets no explanation beyond the list.
+    let out = engine.authorize(
+        &ranged,
+        &call("read_file", json!({"repo": "acme/api"})),
+        now(),
+    );
+    assert_eq!(out.reason, REASON_CAPABILITY_DENIED);
+    assert!(out.diagnostics[0].ends_with(']'), "{:?}", out.diagnostics);
+}
+
 // ---------------------------------------------------------------------------------------
 // Stage 2: the starter policies, one by one
 // ---------------------------------------------------------------------------------------

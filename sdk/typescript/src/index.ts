@@ -80,6 +80,7 @@ export {
   oneOf,
   parseCapability,
   prefix,
+  range,
   withLimits,
 } from "./capability.js";
 export type {
@@ -89,6 +90,7 @@ export type {
   Constraint,
   Derive,
   Limits,
+  RangeBounds,
 } from "./capability.js";
 export {
   accessTokenHash,

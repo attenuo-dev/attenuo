@@ -1332,6 +1332,29 @@ mod tests {
         assert!(parse_caps(&["nocolon".into()]).is_err());
         assert!(parse_caps(&["github:".into()]).is_err());
         assert!(parse_caps(&[r#"{"server":1}"#.into()]).is_err());
+        // A `range` constraint passes through; a malformed one is refused before the request.
+        let ranged = parse_caps(&[
+            r#"{"server":"bank","tool":"send_money","constraints":{"amount":{"op":"range","value":{"min":0,"max":2000}}}}"#.into(),
+            r#"{"server":"bank","tool":"refund","constraints":{"amount":{"op":"range","value":{"max":50}}}}"#.into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            ranged[0]["constraints"]["amount"],
+            json!({"op": "range", "value": {"min": 0, "max": 2000}})
+        );
+        assert_eq!(
+            ranged[1]["constraints"]["amount"],
+            json!({"op": "range", "value": {"max": 50}})
+        );
+        for bad in [
+            r#"{"op":"range","value":{}}"#,
+            r#"{"op":"range","value":{"min":3,"max":1}}"#,
+            r#"{"op":"range","value":{"min":0,"maximum":1}}"#,
+            r#"{"op":"range","value":{"max":1.5}}"#,
+        ] {
+            let cap = format!(r#"{{"server":"bank","tool":"t","constraints":{{"amount":{bad}}}}}"#);
+            assert!(parse_caps(&[cap]).is_err(), "{bad}");
+        }
         // Run limits (ADR-0010) pass through; a kind this version does not know is refused.
         let limited = parse_caps(&[
             r#"{"server":"bank","tool":"send_money","limits":{"calls":1,"sum":{"arg":"amount","max":10}}}"#.into(),
