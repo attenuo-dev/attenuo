@@ -1,0 +1,18 @@
+{
+  "_note": "AuthZEN 1.0 section 9 (PDP metadata): GET /.well-known/authzen-configuration returns policy_decision_point and access_evaluation_endpoint (REQUIRED) and access_evaluations_endpoint. Search endpoints are absent because Attenuo does not serve the Search APIs (section 9.1.1: an absent endpoint parameter means the PDP does not support that API).",
+  "steps": [
+    {
+      "method": "GET",
+      "path": "/.well-known/authzen-configuration",
+      "auth": "none",
+      "expect": {
+        "status": 200,
+        "body": {
+          "policy_decision_point": "<base>",
+          "access_evaluation_endpoint": "<base>/access/v1/evaluation",
+          "access_evaluations_endpoint": "<base>/access/v1/evaluations"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,96 @@
+{
+  "_note": "AuthZEN 1.0 sections 7.1, 7.1.1 and 7.2: top-level subject, action, resource and context are defaults that each entry of evaluations overrides; the answer is {evaluations: [...]} in request order, with no top-level decision.",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/evaluations",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "evaluations": [
+          {
+            "context": {
+              "input": {
+                "repo": "alice/public-a"
+              }
+            }
+          },
+          {
+            "context": {
+              "input": {
+                "repo": "alice/private-b"
+              }
+            }
+          },
+          {
+            "action": {
+              "name": "create_issue"
+            },
+            "resource": {
+              "type": "tool",
+              "id": "github/create_issue",
+              "properties": {
+                "server": "github"
+              }
+            },
+            "context": {
+              "input": {
+                "repo": "alice/private-b"
+              }
+            }
+          }
+        ]
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "evaluations": [
+            {
+              "decision": true,
+              "context": {
+                "reason": "policy_allow",
+                "policy_ids": [
+                  "public_reads"
+                ],
+                "diagnostics": [],
+                "decision_id": "<decision_id>"
+              }
+            },
+            {
+              "decision": false,
+              "context": {
+                "reason": "policy_deny",
+                "policy_ids": [],
+                "diagnostics": [],
+                "decision_id": "<decision_id>"
+              }
+            },
+            {
+              "decision": true,
+              "context": {
+                "reason": "policy_allow",
+                "policy_ids": [
+                  "issues"
+                ],
+                "diagnostics": [],
+                "decision_id": "<decision_id>"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

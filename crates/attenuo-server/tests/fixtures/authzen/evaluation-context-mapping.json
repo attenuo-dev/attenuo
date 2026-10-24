@@ -1,0 +1,160 @@
+{
+  "_note": "AuthZEN 1.0 section 5.4 (Context): context.input becomes Cedar's context.input and context.session_id becomes context.session_id. The same token gets allow, then deny when only context.input.repo changes, then deny by the quarantined_sessions forbid when only context.session_id changes. Other context members (here `tenant`) are not passed to Cedar and change nothing.",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/evaluation",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "repo": "alice/public-site"
+          },
+          "tenant": "acme"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "decision": true,
+          "context": {
+            "reason": "policy_allow",
+            "policy_ids": [
+              "public_reads"
+            ],
+            "diagnostics": [],
+            "decision_id": "<decision_id>"
+          }
+        }
+      }
+    },
+    {
+      "path": "/access/v1/evaluation",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "repo": "bob/public-site"
+          },
+          "tenant": "acme"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "decision": false,
+          "context": {
+            "reason": "policy_deny",
+            "policy_ids": [],
+            "diagnostics": [],
+            "decision_id": "<decision_id>"
+          }
+        }
+      }
+    },
+    {
+      "path": "/access/v1/evaluation",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "repo": "alice/public-site"
+          },
+          "session_id": "quarantined"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "decision": false,
+          "context": {
+            "reason": "policy_deny",
+            "policy_ids": [
+              "quarantined_sessions"
+            ],
+            "diagnostics": [],
+            "decision_id": "<decision_id>"
+          }
+        }
+      }
+    },
+    {
+      "path": "/access/v1/evaluation",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "repo": "alice/public-site"
+          },
+          "session_id": "s-1"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "decision": true,
+          "context": {
+            "reason": "policy_allow",
+            "policy_ids": [
+              "public_reads"
+            ],
+            "diagnostics": [],
+            "decision_id": "<decision_id>"
+          }
+        }
+      }
+    }
+  ]
+}

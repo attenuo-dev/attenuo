@@ -1,0 +1,41 @@
+{
+  "_note": "AuthZEN 1.0 sections 10.1.2 and 11.3: a PEP that does not authenticate gets 401 Unauthorized. Attenuo needs the agent's delegation token as a bearer (SR-08) and names the scheme in WWW-Authenticate.",
+  "steps": [
+    {
+      "path": "/access/v1/evaluation",
+      "auth": "none",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "repo": "alice/public-site"
+          }
+        }
+      },
+      "expect": {
+        "status": 401,
+        "headers": {
+          "www-authenticate": "Bearer realm=\"attenuo\""
+        },
+        "body": {
+          "error": "unauthorized",
+          "detail": "<any>",
+          "error_description": "missing_token"
+        }
+      }
+    }
+  ]
+}

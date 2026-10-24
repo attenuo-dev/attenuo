@@ -1,0 +1,81 @@
+{
+  "_note": "AuthZEN 1.0 section 7.1: if the evaluations array is not present or is empty, the request behaves like a single Access Evaluation request, and is answered as one ({decision, context}).",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/evaluations",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "repo": "alice/public-site"
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "decision": true,
+          "context": {
+            "reason": "policy_allow",
+            "policy_ids": [
+              "public_reads"
+            ],
+            "diagnostics": [],
+            "decision_id": "<decision_id>"
+          }
+        }
+      }
+    },
+    {
+      "path": "/access/v1/evaluations",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "repo": "alice/private"
+          }
+        },
+        "evaluations": []
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "decision": false,
+          "context": {
+            "reason": "policy_deny",
+            "policy_ids": [],
+            "diagnostics": [],
+            "decision_id": "<decision_id>"
+          }
+        }
+      }
+    }
+  ]
+}

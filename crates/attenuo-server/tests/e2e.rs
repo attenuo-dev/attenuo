@@ -2419,8 +2419,14 @@ async fn authzen_batches_are_bounded_by_max_batch() {
     // Refused before anything was decided: nothing new in the audit log.
     assert_eq!(h.audit_entries().await.len(), before + 3);
 
+    // No entries: a single evaluation of the defaults (AuthZEN 1.0 section 7.1), answered
+    // with a single decision. The defaults carry no `repo`, so the read is denied.
     let empty = post_batch(&h, &alice.token, &batch_body(0)).await;
-    assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(empty.status(), StatusCode::OK);
+    let v: Value = empty.json().await.unwrap();
+    assert_eq!(v["decision"], false, "{v}");
+    assert!(v.get("evaluations").is_none(), "{v}");
+    assert_eq!(h.audit_entries().await.len(), before + 4);
     let anon = h
         .client
         .post(h.url("/access/v1/evaluations"))

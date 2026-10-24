@@ -52,6 +52,7 @@
   - [CLI commands](reference/cli.md)
   - [Configuration keys](reference/config.md)
   - [HTTP endpoints](reference/http-api.md)
+  - [AuthZEN conformance](reference/authzen.md)
 
 # Decisions
 

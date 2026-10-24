@@ -1,0 +1,42 @@
+{
+  "_note": "AuthZEN 1.0 section 5.5: decision false from the policy itself. The capability covers the call but no Cedar permit matches the repository (reason policy_deny).",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/evaluation",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "repo": "alice/private-salaries"
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "decision": false,
+          "context": {
+            "reason": "policy_deny",
+            "policy_ids": [],
+            "diagnostics": [],
+            "decision_id": "<decision_id>"
+          }
+        }
+      }
+    }
+  ]
+}

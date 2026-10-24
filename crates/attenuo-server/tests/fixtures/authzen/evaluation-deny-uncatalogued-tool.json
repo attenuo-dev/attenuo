@@ -1,0 +1,40 @@
+{
+  "_note": "AuthZEN 1.0 section 5.5: an action the server's tool catalog does not list is denied by default ([policy] unknown_tools), as 200 decision false with reason tool_not_in_catalog.",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/evaluation",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "drop_tables"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/drop_tables",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {}
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "decision": false,
+          "context": {
+            "reason": "tool_not_in_catalog",
+            "policy_ids": [],
+            "diagnostics": [],
+            "decision_id": "<decision_id>"
+          }
+        }
+      }
+    }
+  ]
+}

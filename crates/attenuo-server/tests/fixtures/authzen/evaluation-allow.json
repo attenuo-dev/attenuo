@@ -1,0 +1,44 @@
+{
+  "_note": "AuthZEN 1.0 sections 6.1 and 6.2: a well-formed Access Evaluation request (subject, action, resource, context) that the policy permits answers 200 with decision true. Attenuo extends the response context with reason, policy_ids, diagnostics and decision_id (section 5.5.1 allows any context object).",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/evaluation",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "repo": "alice/public-site"
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "decision": true,
+          "context": {
+            "reason": "policy_allow",
+            "policy_ids": [
+              "public_reads"
+            ],
+            "diagnostics": [],
+            "decision_id": "<decision_id>"
+          }
+        }
+      }
+    }
+  ]
+}

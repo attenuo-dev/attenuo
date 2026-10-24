@@ -1,0 +1,84 @@
+{
+  "_note": "AuthZEN 1.0 section 7.1.1: top-level subject, action and resource MAY be omitted when every entry supplies them.",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/evaluations",
+      "body": {
+        "evaluations": [
+          {
+            "subject": {
+              "type": "agent",
+              "id": ""
+            },
+            "action": {
+              "name": "read_file"
+            },
+            "resource": {
+              "type": "tool",
+              "id": "github/read_file",
+              "properties": {
+                "server": "github"
+              }
+            },
+            "context": {
+              "input": {
+                "repo": "alice/public-a"
+              }
+            }
+          },
+          {
+            "subject": {
+              "type": "agent",
+              "id": ""
+            },
+            "action": {
+              "name": "create_issue"
+            },
+            "resource": {
+              "type": "tool",
+              "id": "github/create_issue",
+              "properties": {
+                "server": "github"
+              }
+            },
+            "context": {
+              "input": {
+                "repo": "alice/x"
+              }
+            }
+          }
+        ]
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "evaluations": [
+            {
+              "decision": true,
+              "context": {
+                "reason": "policy_allow",
+                "policy_ids": [
+                  "public_reads"
+                ],
+                "diagnostics": [],
+                "decision_id": "<decision_id>"
+              }
+            },
+            {
+              "decision": true,
+              "context": {
+                "reason": "policy_allow",
+                "policy_ids": [
+                  "issues"
+                ],
+                "diagnostics": [],
+                "decision_id": "<decision_id>"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "_note": "AuthZEN 1.0 section 5.5: the bearer token still verifies, but its lease was revoked, so the answer is 200 decision false with reason lease_revoked (an Attenuo reason code), not a 401.",
+  "token": {
+    "revoke": true
+  },
+  "steps": [
+    {
+      "path": "/access/v1/evaluation",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "repo": "alice/public-site"
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "decision": false,
+          "context": {
+            "reason": "lease_revoked",
+            "policy_ids": [],
+            "diagnostics": [],
+            "decision_id": "<decision_id>"
+          }
+        }
+      }
+    }
+  ]
+}
