@@ -41,18 +41,33 @@ fn fmt_constraint(arg: &str, c: &ArgConstraint) -> String {
     }
 }
 
-/// `github:read_file`, or `github:create_issue {repo starts with "acme/"}`.
+/// `github:read_file`, or `github:create_issue {repo starts with "acme/"}`, with run limits
+/// (ADR-0010) after them: `banking:send_money [calls <= 1, sum(amount) <= 10]`.
 pub fn fmt_capability(c: &Capability) -> String {
-    let base = format!("{}:{}", c.server, c.tool);
-    if c.constraints.is_empty() {
-        return base;
+    let mut out = format!("{}:{}", c.server, c.tool);
+    if !c.constraints.is_empty() {
+        let cs: Vec<String> = c
+            .constraints
+            .iter()
+            .map(|(arg, con)| fmt_constraint(arg, con))
+            .collect();
+        out.push_str(&format!(" {{{}}}", cs.join(", ")));
     }
-    let cs: Vec<String> = c
-        .constraints
-        .iter()
-        .map(|(arg, con)| fmt_constraint(arg, con))
-        .collect();
-    format!("{base} {{{}}}", cs.join(", "))
+    let l = &c.limits;
+    let mut ls = Vec::new();
+    if let Some(n) = l.calls {
+        ls.push(format!("calls <= {n}"));
+    }
+    if let Some(s) = &l.sum {
+        ls.push(format!("sum({}) <= {}", s.arg, s.max));
+    }
+    if let Some(p) = &l.calls_per {
+        ls.push(format!("calls per {} <= {}", p.arg, p.max));
+    }
+    if !ls.is_empty() {
+        out.push_str(&format!(" [{}]", ls.join(", ")));
+    }
+    out
 }
 
 pub fn fmt_capabilities(set: &CapabilitySet) -> String {
@@ -577,6 +592,16 @@ user alice  (issuer https://idp.example)
             .with_constraint("r", ArgConstraint::OneOf(vec![json!("a"), json!("b")]));
         assert_eq!(fmt_capability(&c), "github:x {n == 1, r in [\"a\", \"b\"]}");
         assert_eq!(fmt_capabilities(&CapabilitySet::new()), "(none)");
+        let limited = Capability::new("banking", "send_money").with_limits(
+            attenuo_core::Limits::default()
+                .with_calls(1)
+                .with_sum("amount", 10)
+                .with_calls_per("recipient", 1),
+        );
+        assert_eq!(
+            fmt_capability(&limited),
+            "banking:send_money [calls <= 1, sum(amount) <= 10, calls per recipient <= 1]"
+        );
     }
 
     fn node(id: &str, parent: Option<&str>, agent: &str, revoked: bool) -> Value {
