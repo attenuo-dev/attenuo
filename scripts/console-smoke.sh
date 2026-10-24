@@ -66,7 +66,8 @@ UI_PORT="$(free_port)"
 while [ "$MCP_PORT" = "$MAIN_PORT" ]; do MCP_PORT="$(free_port)"; done
 while [ "$UI_PORT" = "$MAIN_PORT" ] || [ "$UI_PORT" = "$MCP_PORT" ]; do UI_PORT="$(free_port)"; done
 
-# The demo config with its ports and policy path rewritten (as run.sh does), plus the console.
+# The demo config with its ports and policy path rewritten (as run.sh does), plus the console
+# and root grants for two more users.
 sed -e "s/18080/$MAIN_PORT/g" -e "s/13001/$MCP_PORT/g" \
     -e "s#examples/github-leak-demo/policy.cedar#$DEMO/policy.cedar#" \
     "$DEMO/config.toml" > "$WORK/config.toml"
@@ -76,6 +77,19 @@ cat >> "$WORK/config.toml" <<EOF
 enabled = true
 listen = "127.0.0.1:$UI_PORT"
 allow_write = true
+
+# Users whose chains the lease page's chain and user revocations act on.
+[[root_grants]]
+subject = "bob"
+issuer = "https://idp.example"
+agent = "assistant"
+capabilities = ["github:*"]
+
+[[root_grants]]
+subject = "carol"
+issuer = "https://idp.example"
+agent = "assistant"
+capabilities = ["github:*"]
 EOF
 
 "$FAKE_BIN" --port "$MCP_PORT" > "$WORK/fake-mcp.out" 2> "$WORK/fake-mcp.log" &

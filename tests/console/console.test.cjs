@@ -225,6 +225,132 @@ test('lease page of the coder: run limits match `attenuo lease tree`', async () 
   await bothThemes('lease-coder');
 });
 
+/** GET /admin/leases/{id}: is it revoked, and why. */
+async function leaseRow(id) {
+  return admin(`/admin/leases/${encodeURIComponent(id)}`);
+}
+
+/** The audit record page of `auditId` (from the dialog's link) shows the revocation. */
+async function auditRecordShown(dialog, auditId) {
+  await dialog.getByRole('link', { name: auditId }).click();
+  await c.page.waitForFunction((id) => location.hash === `#/record/${id}`, auditId);
+  await c.page.locator('.verdict').waitFor();
+  assert.equal(await c.page.locator('dialog').count(), 0, 'the dialog outlived the page change');
+  assert.match(await c.page.locator('#main').innerText(), /admin\.lease\.revoke/);
+  const rec = await admin(`/admin/audit/records/${auditId}`);
+  assert.equal(rec.entry.record.tool, 'admin.lease.revoke');
+  assert.equal(rec.entry.record.kind, 'lease_revoke');
+  return rec;
+}
+
+test('lease page: revoke the whole chain through the preview dialog', async () => {
+  const chainId = data.carolRootLease;
+  await c.go(`#/lease/${data.carolChildLease}`);
+  await c.page.locator('ul.leases').waitFor();
+  assert.equal(await kvValue(c.page.locator('section.panel').first(), 'Originating user'), 'carol');
+  const want = cliJson(E, ['lease', 'revoke', '--chain-id', chainId, '--preview']).json;
+  assert.equal(want.revoked_count, 2, 'the CLI previews carol\'s root and coder hop');
+
+  await c.page.getByRole('button', { name: 'Revoke chain…' }).click();
+  const dialog = c.page.locator('dialog[open]');
+  await dialog.locator('#selector-reason').waitFor();
+  // Focus lands on the reason once the preview is in.
+  assert.equal(await c.page.evaluate(() => document.activeElement.id), 'selector-reason');
+  assert.match(await kvValue(dialog, 'Selector'), new RegExp(`chain_id\\s+${chainId}`));
+  assert.equal(await kvValue(dialog, 'Leases matched'), String(want.matched_count));
+  assert.equal(await kvValue(dialog, 'Leases that change'), String(want.revoked_count));
+  const listed = (await dialog.locator('ul.idlist').last().locator('li').allInnerTexts()).map((t) => t.trim());
+  assert.deepEqual(listed, want.revoked, 'the preview lists what the CLI lists');
+  assert.equal(await dialog.locator('#selector-reason').inputValue(), 'revoked by admin');
+  const go = dialog.getByRole('button', { name: 'Revoke', exact: true });
+  assert.equal(await go.isDisabled(), true, 'Revoke is disabled until the chain id tail is typed');
+  await bothThemes('lease-revoke-chain-preview');
+
+  await dialog.locator('#selector-reason').fill('smoke test: carol chain');
+  await dialog.locator('#selector-confirm').fill('wrong');
+  assert.equal(await go.isDisabled(), true);
+  await dialog.locator('#selector-confirm').fill(chainId.slice(-6));
+  await go.click();
+  const close = dialog.locator('#selector-close');
+  await close.waitFor();
+  assert.equal(await c.page.evaluate(() => document.activeElement.id), 'selector-close');
+  assert.equal(await kvValue(dialog, 'Leases revoked'), '2');
+  const auditId = (await kvValue(dialog, 'Audit record')).trim();
+  assert.match(auditId, /^[0-9a-f-]{36}$/);
+  assert.match(await c.page.locator('#status').innerText(), /Revoked 2 leases \(the preview said 2\)/);
+  await bothThemes('lease-revoke-chain-done');
+
+  // The page behind the dialog reloaded: this lease's node is revoked, with the reason.
+  const node = c.page.locator('.lease-node.focus');
+  await node.locator('.pill', { hasText: /^revoked$/ }).waitFor();
+  assert.match(await node.innerText(), /smoke test: carol chain/);
+  for (const id of [data.carolRootLease, data.carolChildLease]) {
+    const row = await leaseRow(id);
+    assert.equal(row.active, false, `${id} is still active`);
+    assert.equal(row.revoke_reason, 'smoke test: carol chain');
+  }
+  assert.equal((await leaseRow(data.rootLease)).active, true, 'alice\'s run was touched');
+
+  const rec = await auditRecordShown(dialog, auditId);
+  assert.deepEqual(rec.entry.record.leases.slice().sort(), [data.carolRootLease, data.carolChildLease].sort());
+  // Back on the lease page, the root is revoked too and a second preview finds nothing.
+  await c.go(`#/lease/${data.carolRootLease}`);
+  await c.page.locator('.lease-node.focus .pill', { hasText: /^revoked$/ }).waitFor();
+  assert.equal(await c.page.locator('.lease-node .pill', { hasText: /^active$/ }).count(), 0);
+});
+
+test('lease page: revoke every lease of the originating user', async () => {
+  const [bobRoot, bobChild, bobSecond] = data.bobLeases;
+  await c.go(`#/lease/${bobRoot}`);
+  await c.page.locator('ul.leases').waitFor();
+  const want = cliJson(E, ['lease', 'revoke', '--user', 'bob', '--preview']).json;
+  assert.deepEqual(want.matched.slice().sort(), data.bobLeases.slice().sort());
+
+  await c.page.getByRole('button', { name: 'Revoke all for bob…' }).click();
+  const dialog = c.page.locator('dialog[open]');
+  await dialog.locator('#selector-reason').waitFor();
+  assert.match(await kvValue(dialog, 'Selector'), /user\s+bob/);
+  assert.equal(await kvValue(dialog, 'Leases matched'), '3');
+  assert.equal(await kvValue(dialog, 'Leases that change'), '3');
+  const matched = (await dialog.locator('ul.idlist').first().locator('li').allInnerTexts()).map((t) => t.trim());
+  assert.deepEqual(matched, want.matched);
+  await bothThemes('lease-revoke-user-preview');
+
+  const go = dialog.getByRole('button', { name: 'Revoke', exact: true });
+  await dialog.locator('#selector-confirm').fill('2');
+  assert.equal(await go.isDisabled(), true, 'the confirmation is the number of leases that change');
+  await dialog.locator('#selector-confirm').fill('3');
+  await go.click();
+  await dialog.locator('#selector-close').waitFor();
+  assert.equal(await kvValue(dialog, 'Leases revoked'), '3');
+  assert.equal(await kvValue(dialog, 'Reason'), 'revoked by admin');
+  const auditId = (await kvValue(dialog, 'Audit record')).trim();
+  await c.page.locator('.lease-node.focus .pill', { hasText: /^revoked$/ }).waitFor();
+  for (const id of [bobRoot, bobChild, bobSecond]) {
+    assert.equal((await leaseRow(id)).active, false, `${id} is still active`);
+  }
+  assert.equal((await leaseRow(data.coderLease)).active, true, 'alice\'s coder was touched');
+  await auditRecordShown(dialog, auditId);
+});
+
+test('selector dialog: Escape and leaving the page close it', async () => {
+  // The run's root: a preview only, nothing is revoked.
+  await c.go(`#/lease/${data.rootLease}`);
+  await c.page.locator('ul.leases').waitFor();
+  assert.equal(await c.page.getByRole('button', { name: 'Revoke all for alice…' }).count(), 1);
+  await c.page.getByRole('button', { name: 'Revoke chain…' }).click();
+  await c.page.locator('dialog[open] #selector-reason').waitFor();
+  await c.page.keyboard.press('Escape');
+  await c.page.waitForFunction(() => document.querySelectorAll('dialog').length === 0);
+
+  await c.page.getByRole('button', { name: 'Revoke all for alice…' }).click();
+  await c.page.locator('dialog[open] #selector-reason').waitFor();
+  await c.go('#/audit');
+  await c.page.locator('#main table tbody tr').first().waitFor();
+  assert.equal(await c.page.locator('dialog').count(), 0, 'the selector dialog stayed open over the audit page');
+  assert.equal((await leaseRow(data.rootLease)).active, true, 'a preview revoked something');
+});
+
 test('approvals: the list, a consumed approval, and granting the pending one', async () => {
   await c.go('#/approvals');
   const rows = c.page.locator('#main table tbody tr');
