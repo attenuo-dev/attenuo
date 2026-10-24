@@ -275,7 +275,7 @@ These three routes change nothing and write no audit record. They answer the que
 - Without `token`, `subject.properties.chain` is required (400 `invalid_request` otherwise) and is only checked structurally, as of now (400 `invalid_chain` if that fails). Nothing checks that this server issued it.
 - An optional `session`, `{"tainted_by": ["<server>/<tool>", ...], "tainted": true, "untrusted_args": ["<argument>", ...], "args_contain_untrusted": true}`, sets the run's output labels for the dry run (`tainted` defaults to whether `tainted_by` is non-empty, `args_contain_untrusted` to whether `untrusted_args` is). Without it, the labels are read from the store for the chain's run, and the call's arguments are matched against the run's span index as a proxied call's would be. Anything else in `session` is a 400 `invalid_request`.
 - An optional `approval`, `{"by": "user" | "operator" | "policy"}`, evaluates the call as a retry that carries a granted approval (`context.approval.present` true, `by` as given). The dry run never looks up or uses a stored approval.
-- An optional `usage`, `{"calls": 1, "amount": 10, "destination_seen": true}` (each member optional, 0 or false; the numbers non-negative integers), sets `context.usage` for the dry run. Without it, the run's usage of a destructive tool is read from the store (all zero for any other tool). Anything else in `usage` is a 400 `invalid_request`.
+- An optional `usage`, `{"calls": 1, "amount": 10, "destination_seen": true}` (each member optional, 0 or false; the numbers non-negative integers), sets `context.usage` for the dry run. Without it, the run's usage of a destructive tool is read from the store (all zero for any other tool), unless the server keeps no run usage at all (no loaded policy reads `context.usage`, the catalog names no `amount` or `destination`, and `[policy] track_usage` is not `true`): then the figures are zero and `usage.source` is `untracked`. Anything else in `usage` is a 400 `invalid_request`.
 
 ```json
 {
@@ -297,7 +297,7 @@ These three routes change nothing and write no audit record. They answer the que
 
 `budget` is `context.budget` as the run's counters stand now: the dry run reads them and never charges. When the call would exceed a limit, the answer is `budget_exhausted` and adds `limit: {hop, kind, arg, max, used}`.
 
-`chain_source` is `token` or `admin_supplied`. `session.source` and `usage.source` are `request` or `store`; usage read from the store is never charged. The decision comes from the capability stage and Cedar, the same code `POST /access/v1/evaluation` runs after its lease check, so for a token with live leases the two agree on decision, reason and policy ids. A revoked or expired lease does not change the dry run's answer (`lease_check` is always `skipped`).
+`chain_source` is `token` or `admin_supplied`. `session.source` is `request` or `store`. `usage.source` is `request`, `store`, or `untracked` when the server keeps no run usage (the zeros are then not a reading of the run); usage read from the store is never charged. The decision comes from the capability stage and Cedar, the same code `POST /access/v1/evaluation` runs after its lease check, so for a token with live leases the two agree on decision, reason and policy ids. A revoked or expired lease does not change the dry run's answer (`lease_check` is always `skipped`).
 
 ## Metrics
 

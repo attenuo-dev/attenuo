@@ -40,7 +40,10 @@
 //! lease check, policy and audit append: the budget charge, building the record, approval
 //! bookkeeping) and the mean `tool_result` append (`attenuo_audit_append_duration_seconds`
 //! minus the decision appends of the `audit_append` stage). The run-label write has no timer;
-//! it sits inside the `response` stage.
+//! it sits inside the `response` stage. For the tail it counts the requests over 3, 5 and
+//! 10 ms at the client and, per stage, the samples above those bucket bounds.
+//! `--audit-set key=value` adds `[audit]` settings to every server (for example
+//! `checkpoint_every=0`), so such a setting can be compared on one binary.
 //!
 //! `--approval-loops N` adds the approval round, timed as one sequence on a separate server
 //! (untrusted `read_file`, an `@obligation("approval")` forbid on destructive calls in a
@@ -154,6 +157,10 @@ pub struct HotPathArgs {
     /// Approval rounds run first and discarded.
     #[arg(long, default_value_t = 100)]
     pub approval_warmup: usize,
+    /// Extra `[audit]` settings for every server, as `key=value` with the value in TOML (for
+    /// example `checkpoint_every=0` or `wal_checkpoint_seconds=3600`); repeatable.
+    #[arg(long = "audit-set", value_name = "KEY=VALUE")]
+    pub audit_set: Vec<String>,
     /// Write the results as JSON here.
     #[arg(long)]
     pub json: Option<PathBuf>,
@@ -266,6 +273,26 @@ fn config_text(base: String, untrusted: bool, track_usage: bool) -> Result<Strin
     Ok(s)
 }
 
+/// `s` with `audit_set` (`--audit-set key=value`, the value in TOML) added to `[audit]`.
+fn with_audit_settings(mut s: String, audit_set: &[String]) -> Result<String> {
+    if !audit_set.is_empty() {
+        let mut extra = String::new();
+        for kv in audit_set {
+            let (k, v) = kv
+                .split_once('=')
+                .filter(|(k, v)| !k.trim().is_empty() && !v.trim().is_empty())
+                .ok_or_else(|| anyhow!("--audit-set takes key=value, got {kv:?}"))?;
+            extra.push_str(&format!("{} = {}\n", k.trim(), v.trim()));
+        }
+        ensure!(
+            s.contains("\n[audit]\n"),
+            "bench config template has no [audit]"
+        );
+        s = s.replacen("\n[audit]\n", &format!("\n[audit]\n{extra}"), 1);
+    }
+    Ok(s)
+}
+
 /// A token of `depth` hops carrying `read_file` and `create_issue`, each with `limits` when
 /// given (the same figures in every hop).
 async fn mint(
@@ -364,6 +391,7 @@ async fn start(
         untrusted,
         track_usage,
     )?;
+    let cfg = with_audit_settings(cfg, &args.audit_set)?;
     let cfg_path = dir.join("config.toml");
     std::fs::write(&cfg_path, cfg)?;
     let fake = Proc {
@@ -474,6 +502,10 @@ struct StageSummary {
     p50_us: f64,
     p90_us: f64,
     p95_us: f64,
+    /// Samples above 3, 5 and 10 ms (`None` if the buckets cannot tell).
+    over_3ms: Option<u64>,
+    over_5ms: Option<u64>,
+    over_10ms: Option<u64>,
 }
 
 fn stage_summaries(h: &[(String, StageHist)]) -> Vec<StageSummary> {
@@ -487,6 +519,9 @@ fn stage_summaries(h: &[(String, StageHist)]) -> Vec<StageSummary> {
             p50_us: us(h.quantile(0.5)),
             p90_us: us(h.quantile(0.9)),
             p95_us: us(h.quantile(0.95)),
+            over_3ms: h.over(0.003),
+            over_5ms: h.over(0.005),
+            over_10ms: h.over(0.01),
         })
         .collect()
 }
@@ -548,6 +583,12 @@ struct CellSummary {
     p95_median_us: f64,
     p99_median_us: f64,
     rps_median: f64,
+    /// Requests over all runs, how many of them took longer than 3 ms, and the slowest.
+    requests: u64,
+    over_3ms: u64,
+    over_5ms: u64,
+    over_10ms: u64,
+    max_us: f64,
     stages: Vec<StageSummary>,
     derived: Derived,
 }
@@ -800,6 +841,35 @@ fn render(r: &HotReport) -> String {
         ));
     }
     s.push_str(
+        "\n### Tail per configuration\n\n\
+         Requests over all runs, how many took longer than 3 / 5 / 10 ms at the client, the \
+         slowest, and per server stage the samples above 3 / 5 / 10 ms \
+         (`attenuo_proxy_stage_seconds`, pooled over the runs' measured windows).\n\n\
+         | config | call | requests | over 3 / 5 / 10 ms | max us | stages over 3 / 5 / 10 ms |\n\
+         |---|---|---|---|---|---|\n",
+    );
+    for x in &r.summary {
+        let stages: Vec<String> = x
+            .stages
+            .iter()
+            .filter_map(|st| match (st.over_3ms, st.over_5ms, st.over_10ms) {
+                (Some(a), Some(b), Some(c)) => Some(format!("{} {a} / {b} / {c}", st.stage)),
+                _ => None,
+            })
+            .collect();
+        s.push_str(&format!(
+            "| {} | {} | {} | {} / {} / {} | {} | {} |\n",
+            x.config,
+            x.cell,
+            x.requests,
+            x.over_3ms,
+            x.over_5ms,
+            x.over_10ms,
+            x.max_us,
+            stages.join(", ")
+        ));
+    }
+    s.push_str(
         "\n### Server stages per configuration\n\n\
          `attenuo_proxy_stage_seconds` pooled over the runs' measured windows; p50 and p95 \
          interpolated inside buckets, mean exact. `decide (unstaged)` is the decision time \
@@ -994,6 +1064,11 @@ pub async fn run(args: &HotPathArgs) -> Result<()> {
                 p95_median_us: median(&mut col(|s| s.p95_us)),
                 p99_median_us: median(&mut col(|s| s.p99_us)),
                 rps_median: median(&mut col(|s| s.rps)),
+                requests: mine.iter().map(|r| r.stats.requests).sum(),
+                over_3ms: mine.iter().map(|r| r.stats.over_3ms).sum(),
+                over_5ms: mine.iter().map(|r| r.stats.over_5ms).sum(),
+                over_10ms: mine.iter().map(|r| r.stats.over_10ms).sum(),
+                max_us: col(|s| s.max_us).into_iter().fold(0.0, f64::max),
                 stages: stage_summaries(stages),
                 derived: derived(stages, sums),
             }
@@ -1074,6 +1149,20 @@ mod tests {
         let untrusted = config_text(base, true, false).unwrap();
         assert!(!untrusted.contains("output ="));
         assert_eq!(untrusted.matches("n = \"long\"").count(), 2);
+    }
+
+    #[test]
+    fn audit_settings_go_into_the_audit_section() {
+        let base = render_config(1, 2, std::path::Path::new("/p"), "/db", "normal", 3);
+        assert_eq!(with_audit_settings(base.clone(), &[]).unwrap(), base);
+        let set = [
+            "checkpoint_every=0".to_string(),
+            " wal_checkpoint_seconds = 60".into(),
+        ];
+        let cfg = with_audit_settings(base, &set).unwrap();
+        let audit = cfg.split("\n[audit]\n").nth(1).unwrap();
+        assert!(audit.starts_with("checkpoint_every = 0\nwal_checkpoint_seconds = 60\n"));
+        assert!(with_audit_settings(cfg, &["no_value".into()]).is_err());
     }
 
     #[test]
