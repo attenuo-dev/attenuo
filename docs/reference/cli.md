@@ -153,15 +153,49 @@ Revoke a lease and every lease delegated from it. Needs the admin token.
 
 Show a lease's state. Needs the admin token.
 
+### `lease tree <ID> [--max-nodes N]`
+
+A dry run of `lease revoke`: shows what a revocation of `ID` would reach and changes nothing (`GET /admin/leases/{id}/tree`). Prints the lease's ancestors nearest first, then the lease and everything delegated from it as an indented tree. Each lease shows the agent it was issued to, its state (`active, expires ...`, `REVOKED <time> (<reason>)` or `expired ...`) and the audit `seq` that issued it. The last line is `would revoke N lease(s)`, the count a revoke sent now would return. `--max-nodes` caps the listing (server default 1000, at most 10000); when the cap cuts it short, a `truncated:` line says so, and `would revoke` still counts the whole subtree. Needs the admin token.
+
+```console
+$ attenuo lease tree 4cf28235-...
+root lease (no ancestors)
+4cf28235-...  planner  active, expires 2026-10-23T22:13:22Z  issued #1
+└─ 0ee3ac8b-...  coder  active, expires 2026-10-23T22:13:22Z  issued #3
+   └─ 6dd4e10a-...  reviewer  REVOKED 2026-10-23T22:08:23Z (rotated)  issued #4
+would revoke 2 lease(s) if revoked now
+```
+
 ### `audit tail`
 
-Show the most recent audit entries. Needs the admin token.
+Show the most recent audit entries, oldest of them first. Filters keep only matching entries, so `audit tail -n 5 --decision deny` is the last five denials. Needs the admin token.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `-n`, `--lines` | 20 | How many entries. |
-| `-f`, `--follow` | off | Keep polling for new entries. |
+| `--before SEQ` | the head | Show the `-n` matching entries just below `SEQ` instead of the newest. To page back, pass the oldest `seq` shown. Not with `--follow`. |
+| `-f`, `--follow` | off | Keep polling for new matching entries. |
 | `--interval-ms` | 1000 | Polling interval with `--follow`. |
+| `--kind` | all | Record kind: `decision`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin`. Repeatable, or comma-separated; any of them matches. |
+| `--decision` | all | `allow` or `deny`. |
+| `--reason` | all | The record's `reason` (`policy_deny`, `lease_revoked`, ...). |
+| `--subject` | all | The originating user. |
+| `--agent` | all | An agent anywhere in the record's chain. |
+| `--lease` | all | A lease anywhere in the record's chain. |
+| `--server` | all | The MCP upstream the call went to. This `--server` comes after `audit tail`; the attenuo server URL is the global `--server` before the subcommand. |
+| `--tool` | all | The tool. |
+| `--chain-id` | all | The delegation chain (the lease id of its first hop). |
+| `--since`, `--until` | | RFC 3339 times: records with `at` in `[since, until)`. |
+
+The filters are the query parameters of `GET /admin/audit` (see [Querying the audit log](http-api.md#querying-the-audit-log)): exact matches, combined with AND. A bad kind, decision or time is refused before any request. The CLI reads newest first (`order=desc&before=N`) and keeps following `prev` until it has `-n` entries, because a filtered page can come back short, even empty, when the server stops scanning. `--follow` then reads forward from the head the same way, following `next`. With `--json` each entry is one JSON line.
+
+### `audit show <SEQ>` / `audit show --id <UUID>`
+
+One entry with its context, from `GET /admin/audit/entries/{seq}` or, with `--id`, `GET /admin/audit/records/{id}` (the `decision_id` that denials and AuthZEN answers return). Prints the entry line as `audit tail` does, then the record's kind, chain, policies and hashes, the state of each lease in its chain now (root first; `unknown to the lease registry` for a lease the registry does not hold), the stored checkpoint that covers the entry (or that none does yet), and whether the policy was reloaded after it. A missing entry is a 404 and a malformed id a 400 (exit 1). `--json` prints the server's `{entry, lease_states, covered_by_checkpoint, policy_reloaded_after}`. Needs the admin token.
+
+### `audit checkpoints [--before SEQ] [--limit N]`
+
+List stored checkpoints, newest first, one line each (`seq`, time, `kid`, head hash), from `GET /admin/audit/checkpoints`. When more are older, the last line gives the `--before` for the next page. Read-only: unlike `GET /admin/audit/checkpoint` it never signs a new checkpoint. `--limit` defaults to the server's 100, at most 1000. Needs the admin token.
 
 ### `audit verify`
 
@@ -196,6 +230,30 @@ Write entries and the checkpoints inside the range. Needs the admin token.
 ### `policy reload`
 
 Ask the server to re-read its policy file. Needs the admin token.
+
+### `policy show`
+
+The policy set the server has in force (`GET /admin/policies`): the file path, the `sha256` and load time of the text it loaded, the policy ids, any validation warnings, then each policy's text. After an edit that was not reloaded, this is still the old text. Needs the admin token.
+
+### `policy check`
+
+Lint the policy file as it is on the server's disk now, against the running schema, without loading it (`GET /admin/policies/check`). Prints the issues as `policy lint` does (`path:line:column: severity[stage] (policy id): message`), the counts, whether the file differs from the loaded set, and whether a reload would succeed. Exit 0 when it would, 2 when the file has errors. Needs the admin token.
+
+### `policy evaluate`
+
+Dry run: what the loaded policies decide for one call (`POST /admin/policies/evaluate`). The capability stage and Cedar run as for a real call; the lease check does not, and nothing is audited or counted. Prints the decision and reason, the policies that decided, where the chain came from and any diagnostics. Exit 0 for allow, 2 for deny. Needs the admin token.
+
+| Option | Meaning |
+| --- | --- |
+| `--token <JWT\|->` (`ATTENUO_TOKEN`) / `--token-file PATH` | The delegation token whose chain makes the call. An expired token is accepted and reported as expired. |
+| `--chain-file PATH` | A delegation chain as JSON instead of a token. The server checks only its shape, so the answer says `admin supplied`. Not with `--token` or `--token-file`. |
+| `--server`, `--upstream` | MCP upstream name. Required. |
+| `--tool` | Tool name. Required. |
+| `--arg` | Tool argument. Repeatable. |
+
+```sh
+ATTENUO_TOKEN="$CODER" attenuo policy evaluate --server github --tool create_issue --arg repo=acme/api
+```
 
 ### `policy test <FILE>...`
 
