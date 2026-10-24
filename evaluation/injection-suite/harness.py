@@ -34,6 +34,11 @@ these arms:
                        labelling phase 2). Approvals are settled as in the labels arm. Runs only
                        when the probe's ``-32008`` names the copied argument in
                        ``untrusted_args``; skipped otherwise.
+``attenuo_usage_soft``  as ``attenuo``, plus ``policies/usage-soft.cedar``: ask for an approval
+                       on the second and later call of the same destructive tool in a run
+                       (``context.usage.calls >= 1``, run-limits phase 2). Approvals are settled
+                       as in the labels arm. Runs only when the probe's second destructive call
+                       gets ``-32008`` with ``usage`` in its data; skipped otherwise.
 
 No LLM is involved. See README.md for the method and its limits.
 """
@@ -121,6 +126,7 @@ ARMS = (
     "attenuo_limits",
     "attenuo_labels_limits",
     "attenuo_labels_args",
+    "attenuo_usage_soft",
 )
 PROXIED = ARMS[1:]
 CONSTRAINED_ARMS = (
@@ -130,13 +136,38 @@ CONSTRAINED_ARMS = (
     "attenuo_limits",
     "attenuo_labels_limits",
     "attenuo_labels_args",
+    "attenuo_usage_soft",
 )
 # Arms that load an @obligation("approval") policy and settle -32008 with the scripted approver.
-LABEL_ARMS = ("attenuo_labels", "attenuo_labels_limits", "attenuo_labels_args")
+LABEL_ARMS = (
+    "attenuo_labels",
+    "attenuo_labels_limits",
+    "attenuo_labels_args",
+    "attenuo_usage_soft",
+)
 LABELS_POLICY = POLICIES_DIR / "labels.cedar"
 # Option (b), argument-level taint (docs/design/output-labelling.md section 3.4).
 ARG_LABEL_ARMS = ("attenuo_labels_args",)
 LABELS_ARGS_POLICY = POLICIES_DIR / "labels-args.cedar"
+# Soft run-usage limits (docs/design/run-limits.md section 3.5, phase 2): ask on the second and
+# later call of one destructive tool in a run, instead of any labels policy.
+USAGE_ARMS = ("attenuo_usage_soft",)
+USAGE_SOFT_POLICY = POLICIES_DIR / "usage-soft.cedar"
+# The dev cases added on 2026-10-24 whose benign task needs a repeated destructive call
+# (docs/design/run-limits.md, "Measured: multi-call benign cases"). Reports split them out.
+MULTI_CALL_CASES = (
+    "banking-12",
+    "banking-13",
+    "banking-14",
+    "banking-15",
+    "workspace-13",
+    "workspace-14",
+    "workspace-15",
+    "slack-10",
+    "slack-11",
+    "travel-08",
+    "github-08",
+)
 # Run limits (docs/design/run-limits.md section 6): these arms add the frozen rule's limits to
 # every capability that is not a read.
 LIMIT_ARMS = ("attenuo_limits", "attenuo_labels_limits")
@@ -568,7 +599,9 @@ def agent_ids(suites: list[Suite]) -> list[str]:
 
 
 def labels_policy(arm: str) -> Path:
-    """The output-labelling policy file a labels arm loads."""
+    """The approval policy file an arm in ``LABEL_ARMS`` loads."""
+    if arm in USAGE_ARMS:
+        return USAGE_SOFT_POLICY
     return LABELS_ARGS_POLICY if arm in ARG_LABEL_ARMS else LABELS_POLICY
 
 
@@ -588,7 +621,7 @@ def write_config(
         text = "\n".join(f"// ---- suite {s.name} ----\n{s.policy}" for s in env)
         if arm in LABEL_ARMS:
             labels = labels_policy(arm)
-            text += f"\n// ---- output labelling ({labels.name}) ----\n{labels.read_text()}"
+            text += f"\n// ---- approval policy ({labels.name}) ----\n{labels.read_text()}"
         policy.write_text(text)
     secret_sha = hashlib.sha256(AGENT_SECRET.encode()).hexdigest()
     lines = [
@@ -781,9 +814,10 @@ def server(
         lines = (lint.stdout + lint.stderr).strip().splitlines()
         first = next((ln for ln in lines if "error" in ln), lines[0] if lines else "no output")
         first = first[first.find("error") :] if "error" in first else first  # drop the tmp path
+        what = "run-usage" if arm in USAGE_ARMS else "output-labelling"
         raise ArmUnsupported(
             f"`attenuo policy lint` rejects policies/{labels_policy(arm).name}, so this server "
-            f"has no output-labelling attributes ({first})"
+            f"has no {what} attributes ({first})"
         )
     if lint.returncode != 0:
         raise RuntimeError(f"policy lint failed for arm {arm}:\n{lint.stdout}{lint.stderr}")
@@ -1419,6 +1453,48 @@ def arg_taint_probe_verdict(reply: dict[str, Any] | None) -> str | None:
     )
 
 
+def probe_usage(stack: Stack, all_upstreams: list[str]) -> str | None:
+    """None if the server keeps run usage and the soft rule gates a repeated destructive call,
+    else why the usage arm cannot run. Two ``update_user_info`` calls with its own root token
+    (its own run): the first is allowed and counted, the second must get ``-32008`` whose data
+    carries ``usage``."""
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    try:
+        root = admin.mint_root_dev(USER, USER_ISSUER, ROOT_AGENT, [f"{u}:*" for u in all_upstreams])
+    finally:
+        admin.close()
+    headers = {
+        "accept": "application/json, text/event-stream",
+        "content-type": "application/json",
+        "authorization": f"Bearer {root}",
+    }
+    write = Call("update_user_info", {"street": "1 Probe Road", "city": "Leeds"}, "benign",
+                 "allow", None)  # fmt: skip
+    msgs: list[dict[str, Any] | None] = []
+    with httpx.Client(timeout=10) as http:
+        for i in (1, 2):
+            resp = http.post(f"{stack.url}/mcp/banking", json=_rpc_body(write, i), headers=headers)
+            msgs.append(next(iter(_parse_messages(resp)), None))
+    return usage_probe_verdict(msgs[1])
+
+
+def usage_probe_verdict(reply: dict[str, Any] | None) -> str | None:
+    """None if ``reply`` (to the probe's second destructive call) is ``-32008
+    approval_required`` whose data carries ``usage`` with ``calls`` at least 1."""
+    why = approval_probe_verdict(reply)
+    if why:
+        return why.replace(
+            "after an untrusted read", "repeated in one run (no run usage, or no soft rule)"
+        )
+    usage = (reply or {})["error"]["data"].get("usage")
+    if isinstance(usage, dict) and isinstance(usage.get("calls"), int) and usage["calls"] >= 1:
+        return None
+    return (
+        "the server's -32008 for a repeated destructive call does not carry data.usage with "
+        f"the earlier call counted (got {usage!r})"
+    )
+
+
 def limits_probe_verdict(reply: dict[str, Any] | None) -> str | None:
     """None if ``reply`` (to the probe's second call on a one-call budget) is ``-32003
     budget_exhausted``."""
@@ -1576,7 +1652,11 @@ def run(
                             why = probe_limits(stack, all_upstreams)
                             if why:
                                 raise ArmUnsupported(why)
-                        if arm in ARG_LABEL_ARMS:
+                        if arm in USAGE_ARMS:
+                            why = probe_usage(stack, all_upstreams)
+                            if why:
+                                raise ArmUnsupported(why)
+                        elif arm in ARG_LABEL_ARMS:
                             why = probe_arg_taint(stack, all_upstreams)
                             if why:
                                 raise ArmUnsupported(why)
