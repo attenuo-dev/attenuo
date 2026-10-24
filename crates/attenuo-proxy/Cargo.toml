@@ -5,7 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 rust-version.workspace = true
+keywords = ["mcp", "proxy", "authorization", "agents", "enforcement"]
+categories = ["network-programming", "web-programming::http-server", "authentication"]
 
 [features]
 default = []

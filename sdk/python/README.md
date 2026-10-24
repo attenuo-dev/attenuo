@@ -1,8 +1,8 @@
 # attenuo (Python SDK)
 
-Python client for the [attenuo](../../README.md) authorization server: exchange delegation tokens, attenuate capabilities, call MCP tools through the enforcing proxy, handle denials, renew leases, and read the audit log.
+Python client for the [attenuo](https://github.com/attenuo-dev/attenuo/blob/main/README.md) authorization server: exchange delegation tokens, attenuate capabilities, call MCP tools through the enforcing proxy, handle denials, renew leases, and read the audit log.
 
-**Status: pre-alpha**, like the server. The API follows the server's wire format as of this repository and will change with it. Not on PyPI yet; install from a checkout.
+**Status: pre-alpha**, like the server. Version 0.1.0, released together with attenuo 0.1.0: the SDK carries the server's version number, follows that release's wire format and will change with it. Once 0.1.0 is on PyPI, `pip install attenuo` installs it; until the maintainer publishes it, install from a checkout.
 
 ```sh
 pip install -e sdk/python            # runtime dependency: httpx
@@ -13,7 +13,7 @@ Python 3.10 or newer.
 
 ## Quickstart
 
-Start a server with the example config (`[dev] allow_root_mint = true` for the dev root token) and an MCP upstream, as in [getting started](../../docs/guides/getting-started.md). Then:
+Start a server with the example config (`[dev] allow_root_mint = true` for the dev root token) and an MCP upstream, as in [getting started](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/getting-started.md). Then:
 
 ```python
 import os
@@ -132,7 +132,7 @@ These serialize to the server's `authorization_details` shape, the same JSON `at
 
 #### Run limits on a child token
 
-A capability can carry run limits ([ADR-0010](../../docs/decisions/0010-run-limits.md)): how many calls, how much in total, how many calls per value and how many different values. Set them with `with_limits` before you exchange:
+A capability can carry run limits ([ADR-0010](https://github.com/attenuo-dev/attenuo/blob/main/docs/decisions/0010-run-limits.md)): how many calls, how much in total, how many calls per value and how many different values. Set them with `with_limits` before you exchange:
 
 ```python
 from attenuo import ArgLimit, Capability
@@ -188,7 +188,7 @@ with Client(url, dpop_key=coder_key) as ob:
     ob.call_tool(coder, "github", "read_file", {"repo": "alice/docs"})  # proof attached
 ```
 
-With a key, every `call_tool`, `list_tools`, `renew` and `authzen_evaluate` sends `Authorization: DPoP <token>` and a fresh proof, and every `exchange` binds the new token. When the parent is bound to another key, its holder's sign-off names the new key and agent and works for that one exchange; a process that holds both keys can pass `subject_dpop_key=planner_key` instead. When the parent is bound to the client's own key, no sign-off is needed. `Token.dpop_jkt` is the thumbprint a token is bound to (`None` for a bearer token), and `AuditEntry.dpop_bound` says whether a decision was made with a proven bound token. A bound token without a proof is `Unauthorized` with `error == "dpop_required"`. See [Binding tokens to keys](../../docs/guides/binding-tokens-to-keys.md).
+With a key, every `call_tool`, `list_tools`, `renew` and `authzen_evaluate` sends `Authorization: DPoP <token>` and a fresh proof, and every `exchange` binds the new token. When the parent is bound to another key, its holder's sign-off names the new key and agent and works for that one exchange; a process that holds both keys can pass `subject_dpop_key=planner_key` instead. When the parent is bound to the client's own key, no sign-off is needed. `Token.dpop_jkt` is the thumbprint a token is bound to (`None` for a bearer token), and `AuditEntry.dpop_bound` says whether a decision was made with a proven bound token. A bound token without a proof is `Unauthorized` with `error == "dpop_required"`. See [Binding tokens to keys](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/binding-tokens-to-keys.md).
 
 Server nonces (RFC 9449 §8, `[token] dpop_nonce = "required"`) need no code. `Client`, `AsyncClient`, `AdminClient.mint_root_dev` and `TokenAuth` keep the latest `DPoP-Nonce` header the server sent and put it in each proof. When the server refuses a proof with `use_dpop_nonce`, they retry the request once with a new proof carrying the nonce from that response. For your own HTTP code, `DpopKey.proof(method, url, token, nonce=...)` adds the claim, and `attenuo.dpop.NonceCache` does the bookkeeping: `update(response)` stores the nonce and returns true when the request should be retried.
 
@@ -227,7 +227,7 @@ with (
 
 ### Approvals
 
-A policy can hold a call until a person approves it (`@obligation("approval")`, see [Writing policies](../../docs/guides/writing-policies.md)). The proxy then answers JSON-RPC `-32008`, which the SDK raises as `ApprovalRequired`, a `Denied` with `reason == "approval_required"` plus `.approval_id`, `.expires_at` and `.call_hash`. The user grants it with their own sign-in (`POST /approvals/{id}`), or an operator does with `attenuo approval grant` or `AdminClient.grant_approval(id)`. The agent's own token can read the approval but never decide it. The grant is good for one retry of the identical call (same server, tool and arguments) by the same hop, until `expires_at`.
+A policy can hold a call until a person approves it (`@obligation("approval")`, see [Writing policies](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/writing-policies.md)). The proxy then answers JSON-RPC `-32008`, which the SDK raises as `ApprovalRequired`, a `Denied` with `reason == "approval_required"` plus `.approval_id`, `.expires_at` and `.call_hash`. The user grants it with their own sign-in (`POST /approvals/{id}`), or an operator does with `attenuo approval grant` or `AdminClient.grant_approval(id)`. The agent's own token can read the approval but never decide it. The grant is good for one retry of the identical call (same server, tool and arguments) by the same hop, until `expires_at`.
 
 ```python
 from attenuo import ApprovalNotGranted, ApprovalRequired
@@ -271,7 +271,7 @@ All SDK errors derive from `AttenuoError`.
 
 | Exception                                   | When                                                                                                                                                                                                                                                                                                                                                                         |
 | ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Denied` (`.reason`, `.decision_id`)        | The proxy said no (JSON-RPC `-32003` with the `X-Attenuo-Decision-Id` header naming `data.decision_id`; an upstream's own `-32003` without that proof is an `RpcError`). Branch on `reason`: `capability_denied`, `policy_deny`, `lease_revoked`, `lease_expired`, ... See the [integration guide](../../docs/guides/integrating-mcp-clients.md#handling-denied-responses). |
+| `Denied` (`.reason`, `.decision_id`)        | The proxy said no (JSON-RPC `-32003` with the `X-Attenuo-Decision-Id` header naming `data.decision_id`; an upstream's own `-32003` without that proof is an `RpcError`). Branch on `reason`: `capability_denied`, `policy_deny`, `lease_revoked`, `lease_expired`, ... See the [integration guide](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/integrating-mcp-clients.md#handling-denied-responses). |
 | `ApprovalRequired` (`.approval_id`, `.expires_at`, `.call_hash`) | A `Denied` for JSON-RPC `-32008`: a policy holds the call until it is approved. See [Approvals](#approvals). |
 | `ApprovalNotGranted` (`.approval_id`, `.state`) | Waiting for an approval ended without a grant: `declined`, `expired`, `consumed` or `timeout`. |
 | `Unauthorized`                              | HTTP 401: missing, bad or expired bearer.                                                                                                                                                                                                                                                                                                                                    |
@@ -284,7 +284,7 @@ A denied `tools/call` is a decision, not a glitch: do not retry it blindly. A `l
 
 ## MCP clients
 
-`attenuo.mcp` produces the URL and headers an MCP client needs; see [`examples/python-agent/mcp_client_example.py`](../../examples/python-agent/mcp_client_example.py) for the official `mcp` package.
+`attenuo.mcp` produces the URL and headers an MCP client needs; see [`examples/python-agent/mcp_client_example.py`](https://github.com/attenuo-dev/attenuo/blob/main/examples/python-agent/mcp_client_example.py) for the official `mcp` package.
 
 ```python
 from attenuo.mcp import mcp_headers, mcp_url
@@ -346,7 +346,7 @@ ATTENUO_INTEGRATION=1 pytest -rf -m integration   # builds and starts the real s
 
 Keep `-rf`: it prints the name of every failed test in the summary, which a long run otherwise scrolls away.
 
-The integration test builds `attenuo-server` and the `fake_mcp` example, starts both on free ports, and replays the [GitHub leak scenario](../../examples/github-leak-demo/README.md) through the SDK: dev root mint, exchange, an allowed call, a policy denial, a capability denial, revocation, `lease_revoked`, and an audit chain check.
+The integration test builds `attenuo-server` and the `fake_mcp` example, starts both on free ports, and replays the [GitHub leak scenario](https://github.com/attenuo-dev/attenuo/blob/main/examples/github-leak-demo/README.md) through the SDK: dev root mint, exchange, an allowed call, a policy denial, a capability denial, revocation, `lease_revoked`, and an audit chain check.
 
 ## Limits
 

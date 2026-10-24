@@ -2,6 +2,8 @@
 
 Engineering checklist for the first public release. It lists what to check and set up, and none of it has been done yet unless a line says so. Maintainers only. Each item points at the file or workflow it concerns, so you can see what exists before you tick the box.
 
+The first release is 0.1.0. Its notes draft, what is already prepared and the exact steps to tag and publish it, including a manual fallback while GitHub Actions are blocked, are in [Release 0.1.0](release/0.1.0.md). `scripts/release-check.sh` runs every local check it needs.
+
 ## Repository settings
 
 - [ ] Branch protection on `main`: pull request required, CI checks required, no direct pushes, as [CONTRIBUTING](https://github.com/attenuo-dev/attenuo/blob/main/CONTRIBUTING.md) and [GOVERNANCE](https://github.com/attenuo-dev/attenuo/blob/main/GOVERNANCE.md) already promise. The required checks are the jobs in `.github/workflows/ci.yml`: `fmt`, `clippy`, `test`, `msrv`, `deny`, `audit`, `demo`, `policy-tests`, `fuzz-build`, `docs`. `.github/CODEOWNERS` says code-owner approval satisfies the rule.
@@ -37,7 +39,7 @@ Engineering checklist for the first public release. It lists what to check and s
 - [ ] Verify the signature of the test image with the command from the workflow header, using the real identity `https://github.com/attenuo-dev/attenuo/.github/workflows/release.yml@` and the issuer `https://token.actions.githubusercontent.com`:
 
   ```sh
-  cosign verify ghcr.io/7mudit/attenuo:<version> \
+  cosign verify ghcr.io/attenuo-dev/attenuo:<version> \
     --certificate-identity-regexp '^https://github.com/attenuo-dev/attenuo/\.github/workflows/release\.yml@' \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com
   ```
@@ -62,9 +64,9 @@ Crate publishing is manual for now (see "Releases" in CONTRIBUTING). The crates 
   cargo publish --dry-run -p attenuo-cli
   ```
 
-  A dry run for a crate whose dependencies are not yet on crates.io fails at the resolve step. Expect that for everything above `attenuo-core` until the earlier crates are published, and decide whether to publish in order or to publish only the libraries.
-- [ ] Each crate has a description, licence, repository and `rust-version` (they inherit from the workspace). Add `readme`, `keywords` and `categories` if you want them on the crate page.
-- [ ] The SDKs (`sdk/python`, `sdk/typescript`) are not published to PyPI or npm today and say so in their READMEs. Decide whether the first release publishes them. If it does, check the package names and the `@attenuo` npm scope are yours first.
+  A dry run for a crate whose dependencies are not yet on crates.io fails at the resolve step. Expect that for everything above `attenuo-core` until the earlier crates are published. `cargo publish --dry-run --workspace --locked` (Cargo 1.90+) verifies all seven against each other through a temporary local registry instead; it passed for 0.1.0 on 2026-10-24 and is a step of `scripts/release-check.sh`.
+- [x] Each crate has a description, licence, repository and `rust-version` (they inherit from the workspace), plus `homepage`, `readme` (the top-level README), `keywords`, `categories` and a `LICENSE` file. Done for 0.1.0 on `release/0.1.0-prep`.
+- [ ] The SDKs (`sdk/python`, `sdk/typescript`) are at 0.1.0, build and pass `twine check` and `npm pack --dry-run`, and say in their READMEs that they are not on PyPI or npm until the release is published. Decide whether the first release publishes them. If it does, check the package names and the `@attenuo` npm scope are yours first.
 
 ## Release notes and changelog
 

@@ -84,6 +84,7 @@
 - [FAQ](faq.md)
 - [Comparison with alternatives](comparison.md)
 - [Launch checklist](launch-checklist.md)
+  - [Release 0.1.0](release/0.1.0.md)
 - [Changelog](project/changelog.md)
 - [Security policy](project/security.md)
 - [Task board](tasks/board.md)

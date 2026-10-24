@@ -1,19 +1,19 @@
 # @attenuo/sdk (TypeScript SDK)
 
-TypeScript client for the [attenuo](../../README.md) authorization server: exchange delegation tokens, attenuate capabilities, call MCP tools through the enforcing proxy, handle denials, renew leases, and read the audit log.
+TypeScript client for the [attenuo](https://github.com/attenuo-dev/attenuo/blob/main/README.md) authorization server: exchange delegation tokens, attenuate capabilities, call MCP tools through the enforcing proxy, handle denials, renew leases, and read the audit log.
 
-**Status: pre-alpha**, like the server. The API follows the server's wire format as of this repository and will change with it. Not on npm yet; build it from a checkout.
+**Status: pre-alpha**, like the server. Version 0.1.0, released together with attenuo 0.1.0: the SDK carries the server's version number, follows that release's wire format and will change with it. Once 0.1.0 is on npm, `npm install @attenuo/sdk` installs it; until the maintainer publishes it, build it from a checkout.
 
 ```sh
 cd sdk/typescript
 npm install && npm run build   # ESM + CJS + .d.ts in dist/
 ```
 
-Node 20 or newer (Ed25519 in WebCrypto needs no flag there: it is available since Node 18.4, still documented as experimental), zero runtime dependencies. It uses the global `fetch` and WebCrypto (`crypto.subtle` with `Ed25519`) for local token verification. It is the same API as the [Python SDK](../python/README.md), with camelCase names and promises.
+Node 20 or newer (Ed25519 in WebCrypto needs no flag there: it is available since Node 18.4, still documented as experimental), zero runtime dependencies. It uses the global `fetch` and WebCrypto (`crypto.subtle` with `Ed25519`) for local token verification. It is the same API as the [Python SDK](https://github.com/attenuo-dev/attenuo/blob/main/sdk/python/README.md), with camelCase names and promises.
 
 ## Quickstart
 
-Start a server with the example config (`[dev] allow_root_mint = true` for the dev root token) and an MCP upstream, as in [getting started](../../docs/guides/getting-started.md). Then:
+Start a server with the example config (`[dev] allow_root_mint = true` for the dev root token) and an MCP upstream, as in [getting started](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/getting-started.md). Then:
 
 ```ts
 import { AdminClient, DeniedError, AttenuoClient, capability, prefix } from "@attenuo/sdk";
@@ -136,7 +136,7 @@ Capabilities serialize as the server expects: `{ server, tool, constraints: { re
 
 #### Run limits on a child token
 
-A capability can carry run limits ([ADR-0010](../../docs/decisions/0010-run-limits.md)): how many calls, how much in total, how many calls per value and how many different values. Set them with `withLimits` before you exchange:
+A capability can carry run limits ([ADR-0010](https://github.com/attenuo-dev/attenuo/blob/main/docs/decisions/0010-run-limits.md)): how many calls, how much in total, how many calls per value and how many different values. Set them with `withLimits` before you exchange:
 
 ```ts
 import { argLimit, capability, withLimits } from "@attenuo/sdk";
@@ -197,7 +197,7 @@ const coder = await ob.exchange(root, "coder", "github:read_file", {
 await ob.callTool(coder, "github", "read_file", { repo: "alice/docs" }); // proof attached
 ```
 
-With a key, every `callTool`, `listTools`, `initialize`, `renew` and `authzenEvaluate` sends `Authorization: DPoP <token>` and a fresh proof, and every `exchange` binds the new token. When the parent is bound to another key, its holder's sign-off names the new key and agent and works for that one exchange; a process that holds both keys can pass `subjectDpopKey: plannerKey` instead. When the parent is bound to the client's own key, no sign-off is needed. `Token.dpopJkt` is the thumbprint a token is bound to (undefined for a bearer token), and `AuditEntry.dpopBound` says whether a decision was made with a proven bound token. A bound token without a proof is an `UnauthorizedError` with `error === "dpop_required"`. See [Binding tokens to keys](../../docs/guides/binding-tokens-to-keys.md).
+With a key, every `callTool`, `listTools`, `initialize`, `renew` and `authzenEvaluate` sends `Authorization: DPoP <token>` and a fresh proof, and every `exchange` binds the new token. When the parent is bound to another key, its holder's sign-off names the new key and agent and works for that one exchange; a process that holds both keys can pass `subjectDpopKey: plannerKey` instead. When the parent is bound to the client's own key, no sign-off is needed. `Token.dpopJkt` is the thumbprint a token is bound to (undefined for a bearer token), and `AuditEntry.dpopBound` says whether a decision was made with a proven bound token. A bound token without a proof is an `UnauthorizedError` with `error === "dpop_required"`. See [Binding tokens to keys](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/binding-tokens-to-keys.md).
 
 Server nonces (RFC 9449 §8, `[token] dpop_nonce = "required"`) need no code. `AttenuoClient`, `AdminClient.mintRootDev` and `mcpFetch` keep the latest `DPoP-Nonce` header the server sent and put it in each proof. When the server refuses a proof with `use_dpop_nonce`, they retry the request once with a new proof carrying the nonce from that response (`mcpFetch` does not retry a request whose body is a stream). For your own HTTP code, `key.proof(method, url, token, { nonce })` adds the claim, and `NonceCache` does the bookkeeping: `await cache.update(response)` stores the nonce and resolves to true when the request should be retried.
 
@@ -237,7 +237,7 @@ await dispose(); // stop the loop
 
 ### Approvals
 
-A policy can hold a call until a person approves it (`@obligation("approval")`, see [Writing policies](../../docs/guides/writing-policies.md)). The proxy then answers JSON-RPC `-32008`, which the SDK throws as `ApprovalRequiredError`, a `DeniedError` with `reason === "approval_required"` plus `approvalId`, `expiresAt` and `callHash`. The user grants it with their own sign-in (`POST /approvals/{id}`), or an operator does with `attenuo approval grant` or `AdminClient.grantApproval(id)`. The agent's own token can read the approval but never decide it. The grant is good for one retry of the identical call (same server, tool and arguments) by the same hop, until `expiresAt`.
+A policy can hold a call until a person approves it (`@obligation("approval")`, see [Writing policies](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/writing-policies.md)). The proxy then answers JSON-RPC `-32008`, which the SDK throws as `ApprovalRequiredError`, a `DeniedError` with `reason === "approval_required"` plus `approvalId`, `expiresAt` and `callHash`. The user grants it with their own sign-in (`POST /approvals/{id}`), or an operator does with `attenuo approval grant` or `AdminClient.grantApproval(id)`. The agent's own token can read the approval but never decide it. The grant is good for one retry of the identical call (same server, tool and arguments) by the same hop, until `expiresAt`.
 
 ```ts
 import { ApprovalNotGrantedError } from "@attenuo/sdk";
@@ -310,7 +310,7 @@ await client.connect(transport);
 console.log((await client.listTools()).tools.map((t) => t.name)); // only what the token may call
 ```
 
-A denied call surfaces as an `McpError` carrying JSON-RPC code `-32003`; `error.data` holds `{ reason, decision_id }`. Complete examples are in [`examples/typescript-agent`](../../examples/typescript-agent): `agent.ts` (planner delegates to coder) and `mcp_client_example.ts` (the official client through the proxy; tested with `@modelcontextprotocol/sdk` 1.32.1).
+A denied call surfaces as an `McpError` carrying JSON-RPC code `-32003`; `error.data` holds `{ reason, decision_id }`. Complete examples are in [`examples/typescript-agent`](https://github.com/attenuo-dev/attenuo/tree/main/examples/typescript-agent): `agent.ts` (planner delegates to coder) and `mcp_client_example.ts` (the official client through the proxy; tested with `@modelcontextprotocol/sdk` 1.32.1).
 
 `requestInit.headers` is fixed when the transport is built. If your token changes (re-exchange before `exp`), or it is bound to a key (each request then needs a fresh DPoP proof), pass `mcpFetch` as the transport's `fetch` instead: it sets `Authorization` (and `DPoP`) per request.
 
@@ -358,7 +358,7 @@ npm test             # vitest: unit tests on a mocked fetch
 npm run lint         # tsc --noEmit, eslint, prettier --check
 ```
 
-The integration test replays the GitHub leak scenario from [`examples/github-leak-demo`](../../examples/github-leak-demo) against a real `attenuo-server` and the `fake_mcp` upstream, then runs both examples. It needs prebuilt binaries:
+The integration test replays the GitHub leak scenario from [`examples/github-leak-demo`](https://github.com/attenuo-dev/attenuo/tree/main/examples/github-leak-demo) against a real `attenuo-server` and the `fake_mcp` upstream, then runs both examples. It needs prebuilt binaries:
 
 ```sh
 cargo build -p attenuo-server -p attenuo-cli && cargo build -p attenuo-proxy --example fake_mcp
@@ -372,7 +372,7 @@ cd sdk/typescript && npm run build && ATTENUO_INTEGRATION=1 npm test
 
 ## Not done
 
-- Not published to npm.
+- Not on npm until the maintainer publishes 0.1.0.
 - No streaming: `callTool` reads the whole response, so a long-lived SSE stream or server-initiated requests are not supported through the SDK's own methods (use the MCP client for those).
 - The detached `ou_sig` over the user block is not checked locally; the server checks it on every request.
 - Hop-0 exchange against a live IdP is untested.
