@@ -61,6 +61,7 @@ The log, newest first, 100 entries a page: seq, local time (hover for UTC), kind
 Open from a seq (`#/entry/42`) or from the `decision_id` a denial returns (`#/record/<uuid>`). It shows:
 
 - the decision, the reason code and one line on what the code means;
+- for a decision on a tainted run, the `tool_result` entries that tainted it (`labels.tainted_by`) and, when an argument copied an untrusted result, each such argument with the match kind (`leaf`, `entity`, `kgram` or `unreadable`) and a link to the result it matched (`labels.untrusted_args`);
 - the delegation chain, the user first, then each hop's agent and lease, with the lease's state **now** (active, expired, or revoked with its reason and time);
 - the ids of the policies that decided, with their current text. If the policies were reloaded after the decision, a warning says so: the text shown may not be the text that decided;
 - the hash fields (`seq`, `prev_hash`, `entry_hash`, `chain_digest`, `arguments_digest`) and the signed checkpoint that covers the entry, or "not yet covered by a signed checkpoint";
@@ -74,7 +75,7 @@ What it cannot show: the tool arguments and the capabilities each hop held. The 
 
 ### Approvals
 
-`#/approvals` lists approvals of gated calls, newest first: id, state (with `expired` when past `expires_at`), call, user, run and expiry. Filter by run (chain id) or state. `#/approval/<id>` shows one: the call with its arguments exactly as the agent sent them, the call hash, the user and agents, the run and the calling hop's lease, the labels the run carried (each links to its `tool_result` entry), the gated decision, the times, and who decided and which decision used it. A pending approval has **Grant** and **Decline**; they need `allow_write` (below) and record the operator as approver (`by = "operator"`). The user can also decide with their own ID token at `POST /approvals/{id}`, which the console does not do.
+`#/approvals` lists approvals of gated calls, newest first: id, state (with `expired` when past `expires_at`), call, user, run and expiry. Filter by run (chain id) or state. `#/approval/<id>` shows one: the call with its arguments exactly as the agent sent them, the call hash, the user and agents, the run and the calling hop's lease, the labels the run carried (each links to its `tool_result` entry), the arguments that matched an untrusted result of the run with the match kind and result, the gated decision, the times, and who decided and which decision used it. A pending approval has **Grant** and **Decline**; they need `allow_write` (below) and record the operator as approver (`by = "operator"`). The user can also decide with their own ID token at `POST /approvals/{id}`, which the console does not do.
 
 ### Policy
 
