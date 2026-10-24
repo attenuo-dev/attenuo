@@ -10,13 +10,16 @@
 //     the identical retry is allowed (the approval is consumed); a second issue is left
 //     pending for the browser to grant;
 //   - carol gets a chain of two leases (root and a coder hop) and bob two chains (one with a
-//     coder hop), for the lease page's "Revoke chain…" and "Revoke all for <user>…" actions.
+//     coder hop), for the lease page's "Revoke chain…" and "Revoke all for <user>…" actions;
+//   - the fake upstream gives every response the session id `fake-session-1`, so the coder's
+//     first call that reaches it binds that session to alice's chain, for "Revoke by session…".
 'use strict';
 
 const { execFileSync } = require('node:child_process');
 
 const CODER_SECRET = 'demo-coder-secret';
 const TESTER_SECRET = 'demo-tester-secret';
+const FAKE_SESSION = 'fake-session-1';
 
 function env() {
   const need = (k) => {
@@ -27,6 +30,8 @@ function env() {
   return {
     server: need('CONSOLE_SMOKE_SERVER'),
     ui: need('CONSOLE_SMOKE_UI'),
+    roServer: need('CONSOLE_SMOKE_RO_SERVER'),
+    roUi: need('CONSOLE_SMOKE_RO_UI'),
     adminToken: need('CONSOLE_SMOKE_ADMIN_TOKEN'),
     cli: need('CONSOLE_SMOKE_CLI'),
     shots: need('CONSOLE_SMOKE_SHOTS'),
@@ -130,7 +135,21 @@ function populate(e) {
     carolRootLease: carolRoot.lease,
     carolChildLease: carolChild.lease,
     bobLeases: [bobRoot.lease, bobChild.lease, bobSecond.lease],
+    // The id the fake upstream assigns (crates/attenuo-proxy/src/testing.rs).
+    session: FAKE_SESSION,
   };
 }
 
-module.exports = { env, cli, cliJson, populate };
+/**
+ * On the read-only server: alice's root token and one allowed call, which binds the fake
+ * upstream's session to that chain there. Returns {lease, session}.
+ */
+function populateReadOnly(e) {
+  const ro = { ...e, server: e.roServer };
+  const root = cliJson(ro, ['token', 'root', '--subject', 'alice', '--agent', 'assistant', '--cap', 'github:*']).json;
+  const res = call(ro, root.access_token, 'read_file', { repo: 'alice/public-docs', path: 'README.md' }, [0]).json;
+  if (res.error) throw new Error('setup: the read-only server refused an allowed call');
+  return { lease: root.lease, session: FAKE_SESSION };
+}
+
+module.exports = { env, cli, cliJson, populate, populateReadOnly };

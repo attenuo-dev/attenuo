@@ -1,7 +1,8 @@
 // Lease tree (#/lease/{id}): where a lease sits in its delegation tree, what a revoke would
 // reach, and (when the listener allows writes) the revoke itself behind a typed confirmation:
-// of this lease and its subtree, of the whole chain, or of every lease of the originating user
-// (the last two through `POST /admin/leases/revoke`, previewed first).
+// of this lease and its subtree, of the whole chain, of every lease of the originating user, or
+// of the chains that opened one MCP session (the last three through `POST /admin/leases/revoke`,
+// previewed first).
 'use strict';
 
 import {
@@ -53,12 +54,17 @@ function render(root, leaseId, tree) {
     type: 'button', class: 'danger', title: `Revoke every lease issued for ${subject}`,
     on: { click: () => openSelectorRevoke({ user: subject }, done) },
   }, `Revoke all for ${clip(subject)}…`) : null;
+  // Not tied to this lease: the session id is typed in, and may resolve to any chain.
+  const sessionBtn = h('button', {
+    type: 'button', class: 'danger', title: 'Revoke the chains that opened an MCP session, by its Mcp-Session-Id',
+    on: { click: () => openSessionRevoke(done) },
+  }, 'Revoke by session…');
 
   replace(root,
     h('section', { class: 'panel', 'aria-labelledby': 'lease-title' },
       h('header', null,
         h('h1', { id: 'lease-title' }, 'Lease ', mono(leaseId)),
-        h('div', { class: 'row lease-actions' }, revokeBtn, chainBtn, userBtn)),
+        h('div', { class: 'row lease-actions' }, revokeBtn, chainBtn, userBtn, sessionBtn)),
       h('div', { class: 'row' }, leaseStatePill(self), self.agent ? h('span', null, 'issued to ', h('strong', null, self.agent)) : null),
       ancestorsPath(tree),
       kv([
@@ -311,11 +317,24 @@ function openRevoke(leaseId, tree, done) {
 
 // ---- revoke by chain or by user (POST /admin/leases/revoke) -------------------------------
 
-/** A selector as the dialog shows it: `chain_id` or `user`, then its value, as text. */
+/**
+ * A selector as the dialog shows it: `chain_id`, `user` or `session`, then its value, as text.
+ * A session selector is shown as the server answers it, by its tag (`session_tag`); the raw id
+ * never comes back.
+ */
 function selectorText(selector) {
+  if ('session_tag' in selector) {
+    return h('span', null, h('span', { class: 'muted' }, 'session '), mono(selector.session_tag));
+  }
   return 'chain_id' in selector
     ? h('span', null, h('span', { class: 'muted' }, 'chain_id '), mono(selector.chain_id))
     : h('span', null, h('span', { class: 'muted' }, 'user '), h('strong', { class: 'subject' }, selector.user));
+}
+
+/** What a selector is called in the dialog's text: `chain`, `user` or `session`. */
+function selectorKind(selector) {
+  if ('session' in selector) return 'session';
+  return 'chain_id' in selector ? 'chain' : 'user';
 }
 
 /** The first PREVIEW_IDS ids of a response list, each a link to its lease page. */
@@ -341,12 +360,12 @@ function openSelectorRevoke(selector, done) {
   const box = h('div', { class: 'stack' });
   let close = () => {};
   let dialog = null;
-  const ctx = { selector, title, box, done, close: () => close(), live: () => dialog.isConnected };
+  const ctx = { selector, shown: selector, title, box, done, close: () => close(), live: () => dialog.isConnected };
   const cancel = h('button', { type: 'button', on: { click: () => close() } }, 'Cancel');
   const status = h('div', { class: 'stack', 'aria-live': 'polite' }, loading());
   append(box, [
     h('h2', { id: 'selector-title' }, title),
-    intro(isChain),
+    intro(selectorKind(selector)),
     kv([['Selector', selectorText(selector)]]),
     status,
     h('div', { class: 'buttons' }, cancel),
@@ -366,17 +385,93 @@ function openSelectorRevoke(selector, done) {
     });
 }
 
-function intro(isChain) {
-  return h('p', null, isChain
-    ? 'This revokes every lease of the delegation chain: its first hop and everything delegated from it.'
-    : 'This revokes every lease issued for this originating user, under any issuer, each with everything delegated from it.',
-  ' Agents holding them are refused on their next call. It cannot be undone.');
+const INTRO = {
+  chain: 'This revokes every lease of the delegation chain: its first hop and everything delegated from it.',
+  user: 'This revokes every lease issued for this originating user, under any issuer, each with everything delegated from it.',
+  session: 'This revokes every lease of each delegation chain that opened this MCP session through the proxy: the whole run, not only the session.',
+};
+
+function intro(kind) {
+  return h('p', null, INTRO[kind], ' Agents holding them are refused on their next call. It cannot be undone.');
+}
+
+/**
+ * Revoke by MCP session (`{"session": "<Mcp-Session-Id>"}`), in four steps inside one dialog:
+ * the session id, typed in; the preview, which shows the session's tag, the chains it resolves
+ * to and the leases they hold; a reason and a typed confirmation; then the result. The raw id
+ * is a secret that grants use of the session, so once it is submitted it lives only in this
+ * closure, for the request bodies: the field is removed, and the dialog and its result show the
+ * `session_tag` the server answers with. It never goes into a URL.
+ */
+function openSessionRevoke(done) {
+  const title = 'Revoke by session';
+  const box = h('div', { class: 'stack' });
+  let close = () => {};
+  let dialog = null;
+  const ctx = { selector: null, shown: null, title, box, done, close: () => close(), live: () => dialog.isConnected };
+  const entry = (problem) => {
+    const input = h('input', { id: 'session-id', autocomplete: 'off', spellcheck: 'false', maxlength: 1024, required: true });
+    const go = h('button', { type: 'submit', class: 'primary', disabled: true }, 'Preview');
+    input.addEventListener('input', () => { go.disabled = !input.value.trim(); });
+    const err = h('p', { class: 'callout bad', role: 'alert' }, problem ?? '');
+    err.hidden = !problem;
+    const form = h('form', {
+      on: {
+        submit: (ev) => {
+          ev.preventDefault();
+          const raw = input.value.trim();
+          if (!raw) return;
+          // Drop the id from the DOM before anything else happens.
+          input.value = '';
+          preview({ session: raw });
+        },
+      },
+    },
+    h('h2', { id: 'selector-title' }, title),
+    intro('session'),
+    h('div', { class: 'field' },
+      h('label', { for: 'session-id' }, 'MCP session id (the Mcp-Session-Id header)'),
+      input,
+      h('p', { class: 'small muted' }, 'The id itself, not the 12-character tag that audit records show. The preview writes nothing.')),
+    err,
+    h('div', { class: 'buttons' }, h('button', { type: 'button', on: { click: () => close() } }, 'Cancel'), go));
+    replace(box, form);
+    input.focus();
+  };
+  const preview = (selector) => {
+    const cancel = h('button', { type: 'button', on: { click: () => close() } }, 'Cancel');
+    replace(box,
+      h('h2', { id: 'selector-title' }, title),
+      intro('session'),
+      h('div', { class: 'stack', 'aria-live': 'polite' }, loading()),
+      h('div', { class: 'buttons' }, cancel));
+    cancel.focus();
+    api(`/admin/leases/revoke${qs({ preview: true })}`, { method: 'POST', body: selector, quiet: [400, 404] })
+      .then((p) => {
+        if (!ctx.live()) return;
+        ctx.selector = selector;
+        ctx.shown = p.selector;
+        replace(box, confirmForm(p, ctx));
+        const focus = box.querySelector(p.revoked_count ? '#selector-reason' : '#selector-again');
+        if (focus) focus.focus();
+      })
+      .catch((e) => {
+        if (!ctx.live() || e.status === 401) return;
+        entry(`Could not preview the revocation: ${e.message}`);
+      });
+  };
+  ({ dialog, close } = modal('selector-title', box));
+  ctx.again = () => entry();
+  entry();
 }
 
 /** Step two: the preview, the reason and confirmation fields, and the Revoke button. */
 function confirmForm(preview, ctx) {
   const { selector } = ctx;
-  const isChain = 'chain_id' in selector;
+  const kind = selectorKind(selector);
+  const isChain = kind === 'chain';
+  const isSession = kind === 'session';
+  const chainIds = isSession && Array.isArray(ctx.shown.chain_ids) ? ctx.shown.chain_ids : [];
   const want = isChain ? selector.chain_id.slice(-CONFIRM_CHARS) : String(preview.revoked_count);
   const reasonInput = h('input', { id: 'selector-reason', autocomplete: 'off', required: true, maxlength: 500, value: 'revoked by admin' });
   const confirmInput = h('input', { id: 'selector-confirm', autocomplete: 'off', spellcheck: 'false', inputmode: isChain ? null : 'numeric', maxlength: 64, required: true });
@@ -422,22 +517,27 @@ function confirmForm(preview, ctx) {
     },
   },
   h('h2', { id: 'selector-title' }, ctx.title),
-  intro(isChain),
+  intro(kind),
   kv([
-    ['Selector', selectorText(selector)],
+    ['Selector', selectorText(ctx.shown)],
+    ...(isSession ? [['Chains', idList(chainIds, chainIds.length, false)]] : []),
     ['Leases matched', h('strong', null, String(preview.matched_count))],
     ['Leases that change', h('strong', null, String(preview.revoked_count))],
     ['Matched', idList(preview.matched, preview.matched_count, preview.truncated)],
     ['Would change', idList(preview.revoked, preview.revoked_count, preview.truncated)],
   ]),
   h('p', { class: 'small muted' }, 'This is a preview: nothing is revoked yet. Leases already revoked are not counted; expired ones are, since a renewal could bring them back.'),
-  nothing ? h('p', { class: 'callout' }, 'Nothing is left to revoke for this selector.') : null,
+  isSession && !chainIds.length
+    ? h('p', { class: 'callout' }, 'No chains are recorded for this session id: it was never opened through this proxy by a verified token, or the id is mistyped. Nothing would be revoked.')
+    : nothing ? h('p', { class: 'callout' }, 'Nothing is left to revoke for this selector.') : null,
   h('div', { class: 'field' }, h('label', { for: 'selector-reason' }, 'Reason (recorded in the audit log)'), reasonInput),
   h('div', { class: 'field' }, h('label', { for: 'selector-confirm' }, isChain
     ? `Type the last ${CONFIRM_CHARS} characters of the chain id (${want})`
     : `Type the number of leases that change (${want})`), confirmInput),
   err,
-  h('div', { class: 'buttons' }, h('button', { type: 'button', on: { click: ctx.close } }, 'Cancel'), go));
+  h('div', { class: 'buttons' },
+    isSession ? h('button', { id: 'selector-again', type: 'button', on: { click: ctx.again } }, 'Another session id') : null,
+    h('button', { type: 'button', on: { click: ctx.close } }, 'Cancel'), go));
 }
 
 /** Step three: what the revocation did, and a link to the audit record it wrote. */
@@ -447,7 +547,8 @@ function resultView(preview, res, ctx) {
     h('p', { class: 'callout good', role: 'status' },
       `Revoked ${res.revoked_count} lease${res.revoked_count === 1 ? '' : 's'}.`),
     kv([
-      ['Selector', selectorText(ctx.selector)],
+      ['Selector', selectorText(res.selector ?? ctx.shown)],
+      ...('chain_ids' in ctx.shown ? [['Chains', idList(ctx.shown.chain_ids, ctx.shown.chain_ids.length, false)]] : []),
       ['Reason', res.reason ?? ''],
       ['Leases matched', h('strong', null, String(res.matched_count))],
       ['Leases revoked', h('strong', null, String(res.revoked_count))],

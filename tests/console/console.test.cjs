@@ -10,7 +10,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { env, cli, cliJson, populate } = require('./lib/populate.cjs');
+const { env, cli, cliJson, populate, populateReadOnly } = require('./lib/populate.cjs');
 const { Console } = require('./lib/browser.cjs');
 
 const E = env();
@@ -467,6 +467,116 @@ test('a system light preference starts the console in the light theme', async ()
     assert.deepEqual(await light.allProblems(), []);
   } finally {
     await light.close();
+  }
+});
+
+/** Neither the page nor its URL holds `secret`. */
+async function notShown(page, secret, where) {
+  const { html, url } = await page.evaluate(() => ({ html: document.documentElement.outerHTML, url: location.href }));
+  assert.ok(!html.includes(secret), `${where}: the raw session id is in the DOM`);
+  assert.ok(!url.includes(secret), `${where}: the raw session id is in the URL`);
+}
+
+/** Open "Revoke by session…" on the current lease page, type `id` and preview it. */
+async function previewSession(page, id) {
+  await page.getByRole('button', { name: 'Revoke by session…' }).click();
+  const dialog = page.locator('dialog[open]');
+  await dialog.locator('#session-id').waitFor();
+  assert.equal(await page.evaluate(() => document.activeElement.id), 'session-id');
+  const preview = dialog.getByRole('button', { name: 'Preview' });
+  assert.equal(await preview.isDisabled(), true, 'Preview is disabled until an id is typed');
+  await dialog.locator('#session-id').fill(id);
+  await preview.click();
+  await dialog.locator('#selector-reason').waitFor();
+  return dialog;
+}
+
+// Runs last among the lease tests: the session the fake upstream assigned is bound to alice's
+// run, which this revokes.
+test('lease page: revoke by session, previewing an unknown id first', async () => {
+  await c.go(`#/lease/${data.rootLease}`);
+  await c.page.locator('ul.leases').waitFor();
+
+  // An id the server never recorded: no chains, nothing to revoke, and the id is not shown.
+  const unknown = 'smoke-unknown-session-id';
+  const dialog = await previewSession(c.page, unknown);
+  await dialog.locator('#selector-again').waitFor();
+  assert.equal(await c.page.evaluate(() => document.activeElement.id), 'selector-again');
+  assert.match(await dialog.locator('.callout:not(.bad)').innerText(), /No chains are recorded for this session id/);
+  assert.equal(await kvValue(dialog, 'Chains'), 'none');
+  assert.equal(await kvValue(dialog, 'Leases matched'), '0');
+  assert.equal(await dialog.getByRole('button', { name: 'Revoke', exact: true }).isDisabled(), true);
+  await notShown(c.page, unknown, 'unknown session preview');
+  await bothThemes('lease-revoke-session-none');
+
+  // The session alice's coder opened: the same tag, chains and counts as the CLI's preview.
+  const want = cliJson(E, ['lease', 'revoke', '--session', data.session, '--preview']).json;
+  assert.deepEqual(want.selector.chain_ids, [data.rootLease], 'the fake upstream\'s session is bound to alice\'s run');
+  await dialog.getByRole('button', { name: 'Another session id' }).click();
+  await dialog.locator('#session-id').fill(data.session);
+  await dialog.getByRole('button', { name: 'Preview' }).click();
+  await dialog.locator('#selector-reason').waitFor();
+  assert.match(await kvValue(dialog, 'Selector'), new RegExp(`session\\s+${want.selector.session_tag}`));
+  const chains = (await dialog.locator('ul.idlist').first().locator('li').allInnerTexts()).map((t) => t.trim());
+  assert.deepEqual(chains, want.selector.chain_ids);
+  assert.equal(await kvValue(dialog, 'Leases matched'), String(want.matched_count));
+  assert.equal(await kvValue(dialog, 'Leases that change'), String(want.revoked_count));
+  assert.ok(want.revoked_count >= 2, 'alice\'s root and coder are live');
+  await notShown(c.page, data.session, 'session preview');
+  await bothThemes('lease-revoke-session-preview');
+
+  const go = dialog.getByRole('button', { name: 'Revoke', exact: true });
+  await dialog.locator('#selector-reason').fill('smoke test: session hijacked');
+  await dialog.locator('#selector-confirm').fill(String(want.revoked_count + 1));
+  assert.equal(await go.isDisabled(), true, 'the confirmation is the number of leases that change');
+  await dialog.locator('#selector-confirm').fill(String(want.revoked_count));
+  await go.click();
+  await dialog.locator('#selector-close').waitFor();
+  assert.equal(await kvValue(dialog, 'Leases revoked'), String(want.revoked_count));
+  assert.match(await kvValue(dialog, 'Selector'), new RegExp(`session\\s+${want.selector.session_tag}`));
+  const auditId = (await kvValue(dialog, 'Audit record')).trim();
+  await notShown(c.page, data.session, 'session result');
+  await c.page.locator('.lease-node.focus .pill', { hasText: /^revoked$/ }).waitFor();
+  for (const id of [data.rootLease, data.coderLease]) {
+    const row = await leaseRow(id);
+    assert.equal(row.active, false, `${id} is still active`);
+    assert.equal(row.revoke_reason, 'smoke test: session hijacked');
+  }
+  const rec = await auditRecordShown(dialog, auditId);
+  assert.ok(!JSON.stringify(rec).includes(data.session), 'the audit record holds the raw session id');
+  await notShown(c.page, data.session, 'audit record page');
+});
+
+test('revoke by session on a console without allow_write: preview yes, revoke refused', async () => {
+  const ro = populateReadOnly(E);
+  const roAdmin = async (path) => {
+    const resp = await fetch(`${E.roUi}${path}`, { headers: { Authorization: `Bearer ${E.adminToken}`, Accept: 'application/json' } });
+    assert.equal(resp.status, 200, `GET ${path}`);
+    return resp.json();
+  };
+  const probe = await Console.open(E.roUi);
+  try {
+    await probe.login(E.adminToken);
+    await probe.go(`#/lease/${ro.lease}`);
+    await probe.page.locator('ul.leases').waitFor();
+    const dialog = await previewSession(probe.page, ro.session);
+    assert.deepEqual((await dialog.locator('ul.idlist').first().locator('li').allInnerTexts()).map((t) => t.trim()), [ro.lease]);
+    const count = await kvValue(dialog, 'Leases that change');
+    assert.equal(count, '1');
+    await dialog.locator('#selector-confirm').fill(count);
+    await dialog.getByRole('button', { name: 'Revoke', exact: true }).click();
+    const err = dialog.locator('.callout.bad');
+    await err.waitFor();
+    assert.match(await err.innerText(), /Writes are disabled on this listener/);
+    await notShown(probe.page, ro.session, 'refused revoke');
+    assert.equal((await roAdmin(`/admin/leases/${encodeURIComponent(ro.lease)}`)).active, true, 'the lease was revoked');
+    // The only problem is the refused revocation itself (the 404, and Chromium's console line
+    // about it).
+    const problems = await probe.allProblems();
+    assert.ok(problems.some((p) => /^HTTP 404: POST .*\/admin\/leases\/revoke$/.test(p)), problems.join('\n'));
+    assert.deepEqual(problems.filter((p) => !/\b404\b/.test(p)), []);
+  } finally {
+    await probe.close();
   }
 });
 
