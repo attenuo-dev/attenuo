@@ -527,7 +527,54 @@ Readings:
 
 - **From one client the change is within noise end to end.** In process it saves about 80 us at p50 (one commit and one lock hand-off between the two connections, about 10 percent of the charge and the append together). At the client, the 10-run medians are equal. The `after` binary also had four runs whose decide mean was 1.5 to 2.9 ms, against at most 1.45 ms for `before`; two of them fell in a load spike on the host, and they were not investigated further. The 0.8 to 1.0 ms a `sum` limit costs is one `fsync` of the call's WAL pages, and the invariant requires it.
 - **With concurrent calls it helps**: 1.3 to 1.8 times the calls per second at 4 and 8 threads in process, in all six rounds (the third 8-thread round was slow for both binaries), because the charge no longer holds the lease store's lock and the database write lock through an `fsync`, and concurrent appends share theirs.
-- **Multi-client cost is dominated by something else.** Under 4 threads both binaries make about one `clock_nanosleep` per call (strace: 1,256 for 1,200 calls before, 1,101 after). That is SQLite's busy handler: when the lease connection and the audit connection want the write lock at the same time, the loser sleeps 1, 2, 5 ms and so on rather than being woken. It sets the 5 to 35 ms per-call latency seen at 4 to 8 threads, with or without this change, and probably the 4 and 8 ms single-client outliers. Making the two connections queue on a lock in the process instead is the next step for concurrent limited calls (and for any lease-store write that runs alongside appends). It was not attempted here.
+- **Multi-client cost is dominated by something else.** Under 4 threads both binaries make about one `clock_nanosleep` per call (strace: 1,256 for 1,200 calls before, 1,101 after). That is SQLite's busy handler: when the lease connection and the audit connection want the write lock at the same time, the loser sleeps 1, 2, 5 ms and so on rather than being woken. It sets the 5 to 35 ms per-call latency seen at 4 to 8 threads, with or without this change, and probably the 4 and 8 ms single-client outliers. Making the two connections queue on a lock in the process instead is the next step for concurrent limited calls (and for any lease-store write that runs alongside appends). It was not attempted here. Done since: see [Write-lock contention between the lease and audit connections](#write-lock-contention-between-the-lease-and-audit-connections-2026-10-24), which removes the sleeps (the single-client outliers turned out not to be the busy handler).
+
+### Write-lock contention between the lease and audit connections (2026-10-24)
+
+Branch `perf/store-write-lock`, main `54aab33`. The section above found that under concurrency SQLite's busy handler sleeps about once per call: the server opens the lease store and the audit log as two connections on one file, SQLite lets one of them write at a time, and the connection that loses the race for `BEGIN IMMEDIATE` sleeps 1, 2, 5 ms and so on instead of being woken when the lock frees. This section measures that directly and removes it.
+
+**Method.** Same shared 4-vCPU container, other agents building on it (load average 1.1 to 5.6 during the runs). Two tools, both run with the before and after builds alternating, built the same way (release, `lto = false`, `codegen-units = 16`, as in the section above, so absolute figures are not comparable with the earlier tables):
+
+- A probe, `crates/attenuo-audit/tests/write_contention.rs` (an `#[ignore]` test, run with `--ignored --nocapture`). It opens `SqliteAudit` and `SqliteLeaseStore` on one file as the server does (WAL checkpointer on, lease autocheckpoint off, `durability = "normal"`), replaces each connection's busy timeout with a handler that counts its calls and otherwise sleeps exactly as SQLite's default one does, and runs 1, 4 and 8 threads of 1,000 calls each. `sum` mode is the pipeline's order for a limited call: a deferred `calls` + `sum` charge on two hops, the synced decision append, and a run label on every fourth call. `calls` mode is a `calls` charge and a plain append. After each run it checks every counter and verifies the chain. Three interleaved rounds per build.
+- `attenuo-bench hot-path --configs limits_calls,limits --runs 1 --duration 5 --warmup 1` at `--clients` 1, 4 and 8 (a server per configuration, file store, 2-hop token), two passes, before and after alternating per client count.
+
+**What the probe showed.** Before, the busy handler ran 0.5 to 1.3 times per call at 4 and 8 threads in `sum` mode and 0.1 to 0.8 times in `calls` mode, sleeping 2 to 15 s in total per run, and never at one thread. It is what collapsed concurrent `calls` charges plus appends from about 6,000 calls/s on one thread to 800 to 2,700 calls/s on four.
+
+**The fix: one write gate per file (candidate a).** Every store of the process opened on one file (keyed by its canonical path in a global registry of weak references) shares a `WriteGate`, held across every write transaction: the audit writer's batch commit, the inline append, a signed checkpoint, the WAL backstop's `TRUNCATE`, and every lease-store write (charges, refunds, labels, spans, renewals, revocations, approvals, registrations). Writers on one file queue on it and the next is woken when the commit is done, so SQLite's lock is never contended within the process and its busy handler is not reached; `BUSY_TIMEOUT` still covers another process. The lease store takes the gate before its connection lock, so its reads (the lease check and the budget read on every call) are not held up by a lease write waiting for the gate; the audit log takes it inside its connection lock, which its writer holds for a batch, and releases it before the checkpoint hook. Reads never take it. An in-memory store has no gate and stores in different files have different ones, so those paths are unchanged. Durability is unchanged: the same commits run at the same `synchronous` levels, and the deferred `sum` charge and group commit work as before.
+
+The gate was tried as a plain `std` mutex and as a FIFO ticket lock (a mutex and a condition variable). Both removed every busy-handler call. The ticket lock is kept: it gave lower p99 in five of the six concurrent cells (`sum`, 4 threads: 6.9 against 17.1 ms; `calls`, 8 threads: 7.3 against 10.1 ms, medians of three rounds), with throughput the same within noise. With the plain mutex the audit writer could take the gate back for its next batch while a charge waited. Routing lease writes through the audit writer's connection (candidate b) was not needed, and neither was a shorter busy handler (candidate c).
+
+**Before and after, probe** (medians of three interleaved rounds, range in brackets; per thread count, 1,000 calls per thread):
+
+| mode, threads | busy calls per call | calls/s | p50 | p99 |
+|---|---|---|---|---|
+| `sum`, 1 | 0 / 0 | 496 (383 to 1,063) / 1,089 (926 to 1,217) | 1,802 / 834 us | 5.4 / 2.2 ms |
+| `sum`, 4 | 0.85 (0.78 to 0.96) / 0 | 608 (256 to 693) / 1,163 (687 to 1,341) | 5.3 / 3.2 ms | 26.1 / 6.9 ms |
+| `sum`, 8 | 0.69 (0.55 to 0.76) / 0 | 766 (531 to 974) / 1,223 (1,152 to 1,272) | 7.6 / 5.7 ms | 64.4 / 17.4 ms |
+| `calls`, 1 | 0 / 0 | 5,875 / 4,167 | 138 / 213 us | 0.54 / 0.75 ms |
+| `calls`, 4 | 0.20 (0.10 to 0.25) / 0 | 2,255 (2,056 to 2,677) / 3,056 (2,932 to 4,769) | 336 / 845 us | 13.5 / 5.4 ms |
+| `calls`, 8 | 0.10 (0.09 to 0.14) / 0 | 2,842 (2,802 to 3,418) / 3,706 (3,000 to 4,330) | 662 / 1,691 us | 23.0 / 7.3 ms |
+
+Each cell is before / after. An earlier set of four rounds (before against the plain-mutex gate) gave the same picture with more contention before: 0.5 to 1.3 busy calls per call at 4 and 8 threads, and `calls` mode at 4 threads 792 to 1,213 calls/s before against 3,110 to 4,857 after.
+
+**Before and after, end to end** (`hot-path`, two passes per cell, `read` and `destructive` pooled, so four values each):
+
+| config, clients | req/s before | req/s after | p99 before | p99 after | `lease_check` mean before / after |
+|---|---|---|---|---|---|
+| `limits_calls`, 1 | 578 to 679 | 620 to 687 | 2.9 to 6.7 ms | 3.5 to 5.2 ms | 43 to 61 / 44 to 56 us |
+| `limits_calls`, 4 | 835 to 967 | 1,045 to 1,361 | 16.1 to 20.0 ms | 12.6 to 13.4 ms | 604 to 729 / 87 to 118 us |
+| `limits_calls`, 8 | 824 to 955 | 965 to 1,103 | 34.0 to 42.2 ms | 32.1 to 42.5 ms | 1,688 to 2,316 / 146 to 162 us |
+| `limits`, 1 | 248 to 433 | 254 to 436 | 4.9 to 11.8 ms | 5.1 to 8.9 ms | 48 to 71 / 48 to 60 us |
+| `limits`, 4 | 214 to 480 | 104 to 602 | 19.3 to 61.0 ms | 25.7 to 203.6 ms | 1,362 to 3,928 / 65 to 93 us |
+| `limits`, 8 | 377 to 511 | 410 to 644 | 47.2 to 86.0 ms | 28.4 to 54.9 ms | 4,858 to 7,252 / 81 to 124 us |
+
+Readings:
+
+- **The busy-handler sleeps are gone**: zero calls in every after run, at every thread count, against 0.1 to 1.3 per call before. The new test `shared_file_writers_never_reach_the_busy_handler` (`crates/attenuo-audit/tests/write_gate.rs`) asserts it and fails without the gate.
+- **In process, concurrent tails fall 2.5 to 4 times**: p99 at 4 and 8 threads went from 13 to 64 ms to 5 to 17 ms, and throughput rose 1.3 to 1.9 times. One thread pays nothing for the gate: five more interleaved one-thread `calls` rounds of 3,000 calls gave 3,895 to 6,209 calls/s before and 5,175 to 6,970 after (p50 123 to 155 against 119 to 146 us); the 4,167 in the table is one slow round. With a `calls` charge the p50 rose (336 to 845 us at 4 threads): calls now queue in turn on the gate instead of a few winning outright while others sleep, so the median waits a little longer and the tail much less.
+- **End to end, the lease check stops waiting**: under 4 and 8 clients its mean fell from 0.6 to 7 ms to under 0.17 ms, because before the lease connection's lock was held by a write sleeping in the busy handler. With a `calls` limit, 4 clients get about 1.3 times the requests per second (medians of the four values 884 against 1,174) and a lower p99; at 8 clients about 1.14 times (922 against 1,050) and p99 is unchanged (32 to 42 ms either way). On this host 8 clients plus the server saturate the 4 vCPUs, and the remaining tail is scheduling, not SQLite.
+- **With a `sum` limit end to end the change is within noise.** Those calls are bound by the one `fsync` per call that the durability rule requires, now paid inside the audit append (whose mean rose as the lease side stopped sleeping). The after cell at 4 clients with 104 req/s and a 204 ms p99 fell in a load spike: its policy stage, which does no I/O, averaged 7.8 ms against 0.4 to 1 ms in the other cells.
+- **The single-client outliers are not the busy handler.** It never ran at one thread, before or after. The 4 to 8 ms single-client outliers stay open.
 
 ### How to run
 
@@ -545,6 +592,8 @@ cargo bench -p attenuo-policy --bench policy_stage -- --warm-up-time 1 --measure
 cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3
 cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3 'budget_read_|charge_'  # run-limit counters
 cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3 'decide_limited_'  # a limited call's whole decision
+cargo test --release -p attenuo-audit --test write_contention -- --ignored --nocapture  # lease writes against appends on one file, busy-handler count
+attenuo-bench hot-path --configs limits_calls,limits --runs 1 --clients 4                # run limits under concurrent clients
 ```
 
 `attenuo-bench --print-config DIR` writes the server config and policy it expects, for pointing the harness at an already running server (`--attenuo-url`, `--upstream-url`, and `--metrics-url` for the stage table). Every answer is checked: a denial counts only as the proxy's `-32003` with the expected reason code and a decision id listed in `X-Attenuo-Decision-Id`, so an `audit_error` denial, a `too_many_sessions` refusal or a `5xx` stops the run after that cell. A one-second smoke run is part of `cargo test --workspace` (`crates/attenuo-bench/tests/smoke.rs`). There is no CI job for the full matrix: it needs a release build and minutes of load, and numbers from shared runners could not be compared.
@@ -556,4 +605,4 @@ cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-t
 - The time outside the proxy's handler (hyper and axum parsing the client's request, relaying a streamed body). The handler's stages are in `attenuo_proxy_stage_seconds`; what lies between them and the client's latency is measured only as a difference.
 - Confidence intervals over repeated runs, open-loop load for the deny outcomes and for more than one hop, and a quiet reference machine. (Open-loop arrivals exist now, for the allow call at one hop and for exchange.)
 - Streaming (SSE) responses and `tools/list` filtering.
-- Output labelling and run limits under concurrency (lock contention between the charge, the run-label write and the appends), on the memory store end to end, with `calls_per` limits, and at `durability = "full"` end to end; the charge and the run-label write have no stage of their own in `attenuo_proxy_stage_seconds` (see [Output labelling and run limits on the hot path](#output-labelling-and-run-limits-on-the-hot-path-2026-10-24)).
+- Output labelling under concurrency end to end (run limits under 1, 4 and 8 clients are in [Write-lock contention between the lease and audit connections](#write-lock-contention-between-the-lease-and-audit-connections-2026-10-24)), run limits on the memory store end to end, with `calls_per` limits, and at `durability = "full"` end to end; the charge and the run-label write have no stage of their own in `attenuo_proxy_stage_seconds` (see [Output labelling and run limits on the hot path](#output-labelling-and-run-limits-on-the-hot-path-2026-10-24)).
