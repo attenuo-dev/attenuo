@@ -4,8 +4,7 @@
 #   examples/multi-hop-demo/run.sh
 #
 # Starts attenuo-server and a fake GitHub MCP server on free local ports, then plays the
-# scenario with the `attenuo` CLI (and curl for the one exchange the CLI cannot express). No
-# model, no real GitHub and no network beyond loopback. Exits non-zero if any step does not come
+# scenario with the `attenuo` CLI. No model, no real GitHub and no network beyond loopback. Exits non-zero if any step does not come
 # out as expected. Re-runnable: nothing is written outside a temp dir, which the exit trap
 # removes.
 #
@@ -111,19 +110,6 @@ export ATTENUO_SERVER="http://127.0.0.1:$OB_PORT"
 export ATTENUO_ADMIN_TOKEN="demo-admin-token"
 unset ATTENUO_TOKEN ATTENUO_CLIENT_SECRET
 
-# Print the interesting members of a /token answer, with the token shortened.
-show_issued() {
-  python3 -c '
-import json, sys
-r = json.load(sys.stdin)
-if "access_token" not in r:
-    print(json.dumps(r)); sys.exit(1)
-print("lease       " + r["lease"])
-print("expires_in  %ss" % r["expires_in"])
-print("token       " + r["access_token"][:24] + "...")
-print("type        " + r["issued_token_type"])'
-}
-
 # --- the scenario --------------------------------------------------------------------------
 say "Setup"
 note "attenuo at $ATTENUO_SERVER proxies a fake GitHub MCP server at port $MCP_PORT as 'github'."
@@ -151,13 +137,9 @@ WIDEN_DECISION="$(field decision)"
 
 say "4. Exchange 2, planner -> coder (hop 2), narrowed at every point"
 note "repo narrowed from acme/ to acme/api, a distinct limit of 1 on repo (one repository per run),"
-note "no list_issues, no create_issue, and may_act: [] so nobody may exchange it. The CLI's --may-act"
-note "cannot say 'nobody', so this one is the raw RFC 8693 request, credentials on stdin:"
-step 0 'cat examples/multi-hop-demo/coder-exchange.json'
-sed "s#\$PLANNER_TOKEN#$PLANNER#" "$HERE/coder-exchange.json" > "$WORK/coder-exchange.json"
-step 0 'printf "user = \"coder:demo-coder-secret\"\n" | curl -sS -K - -H "content-type: application/json" --data-binary @"$WORK/coder-exchange.json" "$ATTENUO_SERVER/token" | tee "$WORK/coder.json" | show_issued'
-CODER="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["access_token"])' "$WORK/coder.json")"
-CODER_LEASE="$(field lease)"
+note "no list_issues, no create_issue, and --no-delegation (may_act: []) so nobody may exchange it."
+step 0 'printf "%s\n" demo-coder-secret | ATTENUO_TOKEN="$PLANNER" attenuo token exchange --actor coder --client-secret-stdin --no-delegation --ttl-seconds 600 --cap '"'"'{"server":"github","tool":"get_file_contents","constraints":{"repo":{"op":"prefix","value":"acme/api"}},"limits":{"distinct":{"arg":"repo","max":1}}}'"'"' --cap '"'"'{"server":"github","tool":"create_or_update_file","constraints":{"repo":{"op":"prefix","value":"acme/api"}},"limits":{"distinct":{"arg":"repo","max":1}}}'"'"''
+CODER="$(field token)"; CODER_LEASE="$(field lease)"
 
 say "5. What the coder's token says: two hops, each narrower than the one above"
 step 0 'attenuo token inspect "$CODER" --verify'
