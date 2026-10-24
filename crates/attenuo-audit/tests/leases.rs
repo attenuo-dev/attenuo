@@ -1117,3 +1117,209 @@ fn a_session_of_an_unknown_chain_is_pruned() {
     assert_eq!(prune_all(&s, t0(), 10), 1);
     assert_eq!(s.sessions(S1).unwrap(), Vec::new());
 }
+
+/// The default `[leases] retention_seconds`: a week.
+const RETAIN: Duration = Duration::weeks(1);
+
+/// Run `prune_leases` passes of `batch` until one wraps; the total pruned.
+fn prune_leases_all(s: &dyn LeaseStore, now: time::OffsetDateTime, batch: usize) -> u64 {
+    let mut pruned = 0;
+    for _ in 0..10_000 {
+        let pass = s.prune_leases(now, RETAIN, batch).unwrap();
+        assert!(pass.examined <= batch as u64, "{pass:?}");
+        pruned += pass.pruned;
+        if pass.wrapped {
+            return pruned;
+        }
+    }
+    panic!("no pass wrapped");
+}
+
+/// Which of `leases` the store still knows.
+fn known(s: &dyn LeaseStore, leases: &[&str]) -> Vec<String> {
+    let ids: Vec<LeaseId> = leases.iter().map(|l| id(l)).collect();
+    let refs: Vec<&LeaseId> = ids.iter().collect();
+    let status = s.check_all(&refs, t0()).unwrap();
+    leases
+        .iter()
+        .filter(|l| !status.unknown.contains(&id(l)))
+        .map(|l| l.to_string())
+        .collect()
+}
+
+const ALICE: &[&str] = &["root", "a", "a1", "a2", "a2x", "b"];
+
+/// Retention of the lease registry, chain by chain (a chain being a root lease and everything
+/// delegated from it): a live chain is kept; a revoked chain is kept for the retention after
+/// its revocation and pruned past it; an expired chain likewise from its expiry, and a renewal
+/// inside the grace period moves the start of the grace period; a chain with one descendant
+/// still live is kept whole, root included. A pruned chain goes with its subjects, bindings,
+/// session bindings and hop limits, and reads as unknown everywhere.
+#[test]
+fn lease_trees_are_pruned_only_once_every_lease_ended() {
+    for (name, s) in stores() {
+        let s = s.as_ref();
+        two_users(s);
+        s.bind(&id("bchild"), "digest").unwrap();
+        s.record_session(S1, "github", &id("broot"), t0()).unwrap();
+        s.record_hop_limits(&id("bchild"), &[]).unwrap();
+        assert_eq!(s.hop_limits(&id("bchild")).unwrap(), Some(vec![]), "{name}");
+        let exp = t0() + Duration::hours(1);
+
+        // Everything live: nothing to prune.
+        assert_eq!(prune_leases_all(s, t0(), 100), 0, "{name}");
+
+        // bob's chain revoked at t0: kept for the retention, pruned past it.
+        s.revoke(&id("broot"), "done", t0()).unwrap();
+        // alice's `a` subtree revoked, `b` renewed far ahead; the root will expire at `exp`.
+        s.revoke(&id("a"), "done", t0()).unwrap();
+        s.renew(&id("b"), exp + Duration::weeks(10), t0()).unwrap();
+        assert_eq!(prune_leases_all(s, t0() + RETAIN, 100), 0, "{name}");
+        assert_eq!(known(s, &["broot", "bchild"]).len(), 2, "{name}");
+
+        let past = exp + RETAIN + Duration::seconds(1);
+        // legacy expired at `exp`: renewed inside its grace period, so kept.
+        s.renew(&id("legacy"), exp + Duration::hours(2), exp + RETAIN)
+            .unwrap();
+        assert_eq!(prune_leases_all(s, past, 100), 2, "{name}: bob's chain");
+        assert!(known(s, &["broot", "bchild"]).is_empty(), "{name}");
+        assert_eq!(known(s, &["legacy"]), ["legacy"], "{name}: renewed in time");
+        // alice's root expired past the grace period and `a` is revoked, but `b` is live:
+        // the whole tree stays, so `b` never loses its parent.
+        assert_eq!(known(s, ALICE), ALICE, "{name}: one live descendant");
+        assert_eq!(s.subject(&id("root")).unwrap().as_deref(), Some("alice"));
+
+        // bob's chain went with everything keyed by it.
+        assert_eq!(s.subject(&id("broot")).unwrap(), None, "{name}");
+        assert_eq!(s.binding(&id("bchild")).unwrap(), None, "{name}");
+        assert_eq!(s.sessions(S1).unwrap(), Vec::new(), "{name}");
+        assert_eq!(s.hop_limits(&id("bchild")).unwrap(), None, "{name}");
+        let status = s.check_all(&[&id("broot"), &id("bchild")], past).unwrap();
+        assert_eq!(status.unknown, [id("broot"), id("bchild")], "{name}");
+        assert!(!status.active);
+        assert!(matches!(
+            s.renew(&id("broot"), past + Duration::hours(1), past),
+            Err(AuditError::UnknownLease(_))
+        ));
+        assert_eq!(
+            s.preview_selected(&LeaseSelector::Subject("bob".into()))
+                .unwrap(),
+            Default::default(),
+            "{name}: revoke-by-user no longer lists it"
+        );
+        assert_eq!(
+            s.preview_selected(&chain("broot")).unwrap(),
+            Default::default(),
+            "{name}"
+        );
+
+        // Once `b` has been expired for longer than the grace period too, alice's tree goes
+        // whole; legacy, expired at `exp + 2 h`, goes once its own grace period is over.
+        let later = exp + Duration::weeks(10) + RETAIN + Duration::seconds(1);
+        assert_eq!(prune_leases_all(s, later, 100), 7, "{name}");
+        assert!(known(s, ALICE).is_empty(), "{name}");
+        assert!(known(s, &["legacy"]).is_empty(), "{name}");
+        assert_eq!(
+            s.preview_selected(&LeaseSelector::Subject("alice".into()))
+                .unwrap(),
+            Default::default(),
+            "{name}"
+        );
+        assert_eq!(prune_leases_all(s, later, 100), 0, "{name}");
+    }
+}
+
+/// The grace period of a revoked lease runs from its revocation, not from its expiry: an
+/// expired lease that a user-wide revocation reaches later was renewable until then.
+#[test]
+fn a_late_revocation_restarts_the_grace_period() {
+    for (name, s) in stores() {
+        let s = s.as_ref();
+        let exp = t0() + Duration::hours(1);
+        s.register(&id("r"), None, exp).unwrap();
+        s.record_subject(&id("r"), "carol").unwrap();
+        let revoked_at = exp + RETAIN - Duration::hours(1);
+        let out = s
+            .revoke_selected(&LeaseSelector::Subject("carol".into()), "x", revoked_at)
+            .unwrap();
+        assert_eq!(ids_of(&out.revoked), ["r"], "{name}");
+        assert_eq!(
+            prune_leases_all(s, exp + RETAIN + Duration::seconds(1), 10),
+            0,
+            "{name}"
+        );
+        assert_eq!(
+            prune_leases_all(s, revoked_at + RETAIN + Duration::seconds(1), 10),
+            1,
+            "{name}"
+        );
+    }
+}
+
+/// One pass looks at no more than its batch of leases and continues where the previous one
+/// stopped; every ended chain is reached, children with their root, and the next sweep finds
+/// nothing more.
+#[test]
+fn lease_prune_passes_are_bounded_and_resume() {
+    for (name, s) in stores() {
+        let s = s.as_ref();
+        let exp = t0() + Duration::hours(1);
+        for n in 0..30 {
+            let root = format!("r{n:02}");
+            s.register(&id(&root), None, exp).unwrap();
+            s.register(&id(&format!("{root}c")), Some(&id(&root)), exp)
+                .unwrap();
+            if n % 2 == 1 {
+                s.revoke(&id(&root), "done", t0()).unwrap();
+            }
+        }
+        let now = t0() + RETAIN + Duration::seconds(1);
+        let mut passes = Vec::new();
+        loop {
+            let pass = s.prune_leases(now, RETAIN, 7).unwrap();
+            assert!(pass.examined <= 7, "{name}: {pass:?}");
+            passes.push(pass);
+            if pass.wrapped {
+                break;
+            }
+        }
+        let pruned: u64 = passes.iter().map(|p| p.pruned).sum();
+        assert_eq!(pruned, 30, "{name}: 15 revoked chains of 2: {passes:?}");
+        assert!(passes.len() >= 5, "{name}: {passes:?}");
+        for n in 0..30 {
+            let root = format!("r{n:02}");
+            let child = format!("{root}c");
+            let left = known(s, &[&root, &child]).len();
+            assert_eq!(left, if n % 2 == 0 { 2 } else { 0 }, "{name} {n}");
+        }
+        assert_eq!(prune_leases_all(s, now, 7), 0, "{name}");
+    }
+}
+
+/// A lease whose parent row is gone (a store that lost rows) is the top of its own tree: it
+/// is pruned once it and its descendants ended, and kept while any is live. Its token was
+/// refused all along, since the chain names the missing parent.
+#[test]
+fn a_lease_whose_parent_is_gone_is_pruned_as_its_own_tree() {
+    let s = SqliteLeaseStore::open_in_memory().unwrap();
+    tree(&s);
+    s.with_connection(|c| {
+        c.execute("DELETE FROM leases WHERE id = 'a'", [])?;
+        Ok(())
+    })
+    .unwrap();
+    let past = t0() + Duration::hours(1) + RETAIN + Duration::seconds(1);
+    s.renew(&id("a2x"), past + Duration::hours(1), t0())
+        .unwrap();
+    // root and b form one tree, a1 one, a2 > a2x another (a2x live).
+    assert_eq!(prune_leases_all(&s, past, 100), 3);
+    assert_eq!(known(&s, &["root", "b", "a1", "a2", "a2x"]), ["a2", "a2x"]);
+    assert_eq!(
+        prune_leases_all(
+            &s,
+            past + Duration::hours(1) + RETAIN + Duration::seconds(1),
+            100
+        ),
+        2
+    );
+}
