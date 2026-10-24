@@ -1,0 +1,7 @@
+{
+  "rule": "url_host_of_web_fetches",
+  "about": "The web-fetching tools of the frozen catalogs and how the two host arms treat them (docs/design/run-limits.md, phase 2, derived destinations). The only catalog tool that fetches a URL is slack/get_webpage; slack/post_webpage also takes a url but publishes to it, and the suite policy and the grants already bound it to acme.example sites, so it is left out. The attenuo_usage_host arm adds `destination` to these tools' catalog entries, so context.usage.destination_seen compares URL hosts. The attenuo_distinct_host arm adds `limits` to every exchanged capability (the case's grant and every delegate step's grant) that names exactly one of these tools (a tool glob is not one): at most `max` different URL hosts per capability in a run. max is 1 because no benign dev task fetches from more than one host (slack-07 and slack-08 fetch one page each) and the test split has no web tool. Case files are not changed. Added on 2026-10-24, after the test cases in ../cases/test/ and the multi-call dev cases were written and read; its SHA-256 is in ../cases/test/POLICY_HASHES.json under added_later.",
+  "tools": { "slack": ["get_webpage"] },
+  "destination": "url#host",
+  "limits": { "distinct": { "arg": "url", "derive": "host", "max": 1 } }
+}

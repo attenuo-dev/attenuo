@@ -18,7 +18,10 @@ and ``attenuo_labels_limits`` arms are skipped when the server does not enforce 
 like ``attenuo_labels`` and is skipped when the probe's ``-32008`` does not name the copied
 argument in ``untrusted_args``. The ``attenuo_usage_soft`` arm (soft run-usage limits) settles
 approvals the same way and is skipped when the probe's second destructive call does not get
-``-32008`` with ``usage`` in its data. Exit status 2,
+``-32008`` with ``usage`` in its data. ``attenuo_usage_host`` (the same with web fetches counted
+per URL host) is probed the same way and also skipped when the server rejects a ``url#host``
+catalog destination; ``attenuo_distinct_host`` (a hard ``distinct`` limit on URL hosts) is
+skipped when the server does not refuse a fetch from one host too many. Exit status 2,
 before anything runs, if the test split is requested while ``policies/`` differs from its frozen
 hashes or while the labelling oracle (``label_rules.py``) disagrees with a hand label that has no
 ``label_note``.
@@ -90,7 +93,7 @@ def problems(doc: dict[str, Any]) -> list[str]:
                 f"{where}: expected {c['expect']}/{c['expect_stage']}, "
                 f"got {c['outcome']}/{c['reason']}"
             )
-        if c["arm"] in harness.LIMIT_ARMS:
+        if c["arm"] in harness.BUDGET_ARMS:
             if not limits_consistent(c):
                 out.append(
                     f"{where}: attenuo expects {c['expect']}/{c['expect_stage']}, limits arm "
@@ -207,6 +210,9 @@ ARM_NAMES = {
     "attenuo_labels_limits": "attenuo full plus output labels and the run-limit rule",
     "attenuo_labels_args": "attenuo full plus argument-level labels (scripted approver)",
     "attenuo_usage_soft": "attenuo full plus the soft run-usage rule (scripted approver)",
+    "attenuo_usage_host": "attenuo full plus the soft run-usage rule, web fetches per site "
+    "(scripted approver)",
+    "attenuo_distinct_host": "attenuo full plus a distinct-host limit on web fetches",
 }
 
 
@@ -376,6 +382,7 @@ def render_split(doc: dict[str, Any], split: str) -> list[str]:
     L += render_labels(doc)
     L += render_limits(doc)
     L += render_multicall(doc)
+    L += render_host(doc)
     L += [
         "",
         "### attenuo by suite and stage",
@@ -555,16 +562,23 @@ def render_labels(doc: dict[str, Any]) -> list[str]:
 def render_limits(doc: dict[str, Any]) -> list[str]:
     """What the run-limit rule refused in the limits arms."""
     L: list[str] = []
-    for arm in harness.LIMIT_ARMS:
+    for arm in harness.BUDGET_ARMS:
         r = doc["rates"].get(arm)
         if r is None:
             continue
+        rule = (
+            "The frozen rule in [`policies/url-hosts.json`](../policies/url-hosts.json) adds "
+            "`distinct: {arg: url, derive: host, max: 1}` to every capability that names a "
+            "web-fetching tool (`slack/get_webpage`)."
+            if arm in harness.HOST_LIMIT_ARMS
+            else "The frozen rule in [`policies/limits-rule.json`](../policies/limits-rule.json) "
+            "adds `calls: 1` to every capability that is not a read."
+        )
         L += [
             "",
             f"### Run limits in `{arm}`",
             "",
-            "The frozen rule in [`policies/limits-rule.json`](../policies/limits-rule.json) adds "
-            "`calls: 1` to every capability that is not a read. A refused call got JSON-RPC "
+            f"{rule} A refused call got JSON-RPC "
             "`-32003` with a `budget_*` or `limit_arg_invalid` reason (stage `budget`).",
             "",
             "| Attack allowed | Attack refused by a limit | Benign refused by a limit "
@@ -589,7 +603,14 @@ def render_limits(doc: dict[str, Any]) -> list[str]:
     return L
 
 
-MULTICALL_ARMS = ("attenuo", "attenuo_limits", "attenuo_labels", "attenuo_usage_soft")
+MULTICALL_ARMS = (
+    "attenuo",
+    "attenuo_limits",
+    "attenuo_labels",
+    "attenuo_usage_soft",
+    "attenuo_usage_host",
+    "attenuo_distinct_host",
+)
 
 
 def multicall_rows(doc: dict[str, Any]) -> list[dict[str, Any]]:
@@ -664,6 +685,102 @@ def render_multicall(doc: dict[str, Any]) -> list[str]:
             f"| {r['benign_completed_after_approval']}/{r['benign_gated']} "
             f"| {r['approval_requests']} |"
         )
+    return L
+
+
+# Each host arm and the arm it extends: a call whose outcome differs between the two is a
+# change the host rule made.
+HOST_BASE = {"attenuo_usage_host": "attenuo_usage_soft", "attenuo_distinct_host": "attenuo"}
+WEB_ARMS = ("attenuo", "attenuo_limits", "attenuo_usage_soft", *HOST_BASE)
+
+
+def _outcome(c: dict[str, Any]) -> str:
+    """A call's outcome in one word for a table: ``allow``, ``deny (<reason>)``, or ``gated,
+    <after_approval>``."""
+    if c["outcome"] == "gated":
+        return f"gated, {c.get('after_approval')}"
+    if c["outcome"] == "deny":
+        return f"deny (`{c['reason']}`)"
+    return str(c["outcome"])
+
+
+def host_rows(doc: dict[str, Any]) -> dict[str, Any]:
+    """For the host arms that ran: every call to a web-fetching tool of
+    ``policies/url-hosts.json``, with its outcome in each arm of ``WEB_ARMS`` that ran, and
+    every call whose outcome differs between a host arm and its base arm (``HOST_BASE``)."""
+    ran = [a for a in HOST_BASE if a in doc["arms"]]
+    if not ran:
+        return {}
+    tools = {(u, t) for u, ts in harness.url_hosts()["tools"].items() for t in ts}
+    arms = [a for a in WEB_ARMS if a in doc["arms"]]
+    by_key = {(c["arm"], c["case"], c["index"]): c for c in doc["calls"]}
+    web = []
+    for c in doc["calls"]:
+        if c["arm"] != arms[0] or (c["suite"], c["tool"]) not in tools:
+            continue
+        outs = {a: by_key.get((a, c["case"], c["index"])) for a in arms}
+        web.append(
+            {"case": c["case"], "index": c["index"], "tool": c["tool"], "role": c["role"],
+             "outcomes": {a: _outcome(x) for a, x in outs.items() if x is not None}}
+        )  # fmt: skip
+    changed = []
+    for arm in ran:
+        base = HOST_BASE[arm]
+        if base not in doc["arms"]:
+            continue
+        for c in doc["calls"]:
+            if c["arm"] != arm:
+                continue
+            b = by_key.get((base, c["case"], c["index"]))
+            if b is not None and _outcome(b) != _outcome(c):
+                changed.append(
+                    {"arm": arm, "base": base, "case": c["case"], "index": c["index"],
+                     "tool": c["tool"], "role": c["role"], "base_outcome": _outcome(b),
+                     "outcome": _outcome(c)}
+                )  # fmt: skip
+    return {"arms": arms, "web_calls": web, "changed": changed, "ran": ran}
+
+
+def render_host(doc: dict[str, Any]) -> list[str]:
+    """The web-fetch calls across the arms that bound them, and what the host arms changed."""
+    h = host_rows(doc)
+    if not h:
+        return []
+    L = [
+        "",
+        "### Web fetches",
+        "",
+        "Every call to a web-fetching tool of "
+        "[`policies/url-hosts.json`](../policies/url-hosts.json) "
+        "(calls numbered from 0 in case order), in each arm that bounds repetition or hosts. "
+        "`attenuo_usage_host` counts fetches per URL host in a soft rule; "
+        "`attenuo_distinct_host` refuses a fetch from a second host per capability.",
+        "",
+    ]
+    if h["web_calls"]:
+        L += [
+            "| Case | Call | Role | " + " | ".join(f"`{a}`" for a in h["arms"]) + " |",
+            "|---|---:|---|" + "---|" * len(h["arms"]),
+        ]
+        for w in h["web_calls"]:
+            cells = " | ".join(w["outcomes"].get(a, "") for a in h["arms"])
+            L.append(f"| {w['case']} | {w['index']} | {w['role']} | {cells} |")
+    else:
+        L.append("No case of this split calls a web-fetching tool.")
+    for arm in h["ran"]:
+        rows = [c for c in h["changed"] if c["arm"] == arm]
+        L += ["", f"Calls whose outcome in `{arm}` differs from `{HOST_BASE[arm]}`: {len(rows)}."]
+        if rows:
+            L += [
+                "",
+                "| Case | Call | Tool | Role | Base arm | Host arm |",
+                "|---|---:|---|---|---|---|",
+            ]
+            L += [
+                f"| {c['case']} | {c['index']} | `{c['tool']}` | {c['role']} "
+                f"| {c['base_outcome']} | {c['outcome']} |"
+                for c in rows
+            ]
     return L
 
 
