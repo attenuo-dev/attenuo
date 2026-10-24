@@ -2898,6 +2898,30 @@ fn subject_in(conn: &Connection, lease: &LeaseId) -> Result<Option<String>, Audi
         .optional()?)
 }
 
+/// The recorded subject of every lease in `leases` that has one, with one `IN (...)` query per
+/// [`LEASES_PER_QUERY`] leases.
+fn subjects_in(
+    conn: &Connection,
+    leases: &[&LeaseId],
+) -> Result<BTreeMap<LeaseId, String>, AuditError> {
+    let mut out = BTreeMap::new();
+    for chunk in leases.chunks(LEASES_PER_QUERY) {
+        // One cached statement per chunk length.
+        let sql = format!(
+            "SELECT id, subject FROM lease_subjects WHERE id IN ({})",
+            vec!["?"; chunk.len()].join(",")
+        );
+        let mut stmt = conn.prepare_cached(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(
+            chunk.iter().map(|l| l.0.as_str()),
+        ))?;
+        while let Some(row) = rows.next()? {
+            out.insert(LeaseId(row.get::<_, String>(0)?), row.get::<_, String>(1)?);
+        }
+    }
+    Ok(out)
+}
+
 fn binding_in(conn: &Connection, lease: &LeaseId) -> Result<Option<String>, AuditError> {
     Ok(conn
         .prepare_cached("SELECT binding FROM lease_bindings WHERE id = ?1")?
@@ -3259,6 +3283,11 @@ impl LeaseStore for SqliteLeaseStore {
     fn subject(&self, lease: &LeaseId) -> Result<Option<String>, AuditError> {
         let conn = self.conn.lock()?;
         subject_in(&conn, lease)
+    }
+
+    fn subjects(&self, leases: &[&LeaseId]) -> Result<BTreeMap<LeaseId, String>, AuditError> {
+        let conn = self.conn.lock()?;
+        subjects_in(&conn, leases)
     }
 
     fn preview_selected(&self, selector: &LeaseSelector) -> Result<SelectorRevocation, AuditError> {

@@ -88,6 +88,21 @@ pub trait LeaseStore: Send + Sync {
     /// The subject recorded by [`record_subject`](Self::record_subject), or `None`.
     fn subject(&self, lease: &LeaseId) -> Result<Option<String>, AuditError>;
 
+    /// [`subject`](Self::subject) for many leases at once: the recorded subject of each lease
+    /// in `leases` that has one. Leases with no recorded subject (unknown, or registered before
+    /// subjects were kept) are absent from the map. The stores answer with one lock (the file
+    /// store with `IN (...)` queries), so a lease tree of thousands of nodes costs no query per
+    /// node; the default asks [`subject`](Self::subject) once per lease.
+    fn subjects(&self, leases: &[&LeaseId]) -> Result<BTreeMap<LeaseId, String>, AuditError> {
+        let mut out = BTreeMap::new();
+        for lease in leases {
+            if let Some(s) = self.subject(lease)? {
+                out.insert((*lease).clone(), s);
+            }
+        }
+        Ok(out)
+    }
+
     /// What [`revoke_selected`](Self::revoke_selected) would do now, without writing:
     /// `matched` is every unrevoked lease the selector names, `revoked` every unrevoked lease
     /// a revocation would change (the matches and their descendants). Read in one
@@ -814,6 +829,14 @@ impl LeaseStore for MemoryLeaseStore {
 
     fn subject(&self, lease: &LeaseId) -> Result<Option<String>, AuditError> {
         Ok(self.subjects.lock()?.get(lease).cloned())
+    }
+
+    fn subjects(&self, leases: &[&LeaseId]) -> Result<BTreeMap<LeaseId, String>, AuditError> {
+        let subjects = self.subjects.lock()?;
+        Ok(leases
+            .iter()
+            .filter_map(|l| Some(((*l).clone(), subjects.get(*l)?.clone())))
+            .collect())
     }
 
     fn preview_selected(&self, selector: &LeaseSelector) -> Result<SelectorRevocation, AuditError> {
