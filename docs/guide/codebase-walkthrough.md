@@ -658,7 +658,7 @@ Read beside: [Injection suite: results](../evaluation/injection-suite.md). Optio
 | 4c | `evaluation/injection-suite/policies/limits-rule.json`, `task-limits-dev.md`; `results/2026-10-24-task-limits-v1.md`, with [run limits, section 7](../design/run-limits.md#7-measured) | The limits arms: the frozen `calls: 1` rule, the host and recipient files, and the per-task figures in 47 dev grants. The "Run limits in ..." tables list every call a limit refused, and "Multi-call cases" splits the dev cases into the original 46, the 11 multi-call and the 6 browsing ones. Read section 7 of the design for what the arms do and do not support. | data |
 | 5 | `crates/attenuo-bench/src/lib.rs`, `hotpath.rs` | End-to-end load generator: proxy versus direct, by chain depth and concurrency. `attenuo-bench hot-path` measures what output labels and each limit kind add to one call (session 11). | 2800 |
 | 6 | `crates/attenuo-core/benches/attenuation.rs`, `crates/attenuo-policy/benches/*.rs`, `crates/attenuo-server/benches/decide.rs` | criterion micro-benchmarks of the hot path; `decide.rs` also times the budget read, each kind of charge, the run-usage write and `record_result`. | 840 |
-| 7 | `fuzz/fuzz_targets/` and `fuzz/README.md` | Twelve libFuzzer targets; they assert properties as well as absence of panics. | 12 files |
+| 7 | `fuzz/fuzz_targets/` and `fuzz/README.md` | Seventeen libFuzzer targets (twelve from the first campaigns, five from round 2 over run limits, budgets, approval tokens, the usage walker and the server routes); they assert properties as well as absence of panics. | 17 files |
 
 Check you understood:
 
