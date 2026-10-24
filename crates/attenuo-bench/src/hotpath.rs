@@ -55,6 +55,12 @@
 //! `--audit-set key=value` adds `[audit]` settings to every server (for example
 //! `checkpoint_every=0`), so such a setting can be compared on one binary.
 //!
+//! `--clients N` runs N closed-loop clients per cell, all on one run (one token) by default.
+//! `--tokens M` mints M root tokens, each its own run, and client `i` uses run `i mod M`, so
+//! `--tokens` equal to `--clients` gives each client a run of its own. One run under many
+//! clients is the case the per-run lock of SR-55 (`Pipeline::run_guard`) serialises; many
+//! runs show that unrelated runs do not wait on each other.
+//!
 //! `--approval-loops N` adds the approval round, timed as one sequence on a separate server
 //! (untrusted `read_file`, an `@obligation("approval")` forbid on destructive calls in a
 //! tainted run): the gated call (`-32008` with an `approval_id`), `POST
@@ -212,6 +218,11 @@ pub struct HotPathArgs {
     /// Closed-loop clients per cell.
     #[arg(long, default_value_t = 1)]
     pub clients: usize,
+    /// Runs the clients are spread over: each is its own root token (and its exchanges), so
+    /// its own delegation run, and client `i` calls with run `i mod N`. 1 puts every client
+    /// on one run; equal to `--clients` gives each client a run of its own.
+    #[arg(long, default_value_t = 1)]
+    pub tokens: usize,
     /// Approval rounds to time (gated call, grant, retry) after `--approval-warmup` rounds;
     /// 0 skips them.
     #[arg(long, default_value_t = 0)]
@@ -428,8 +439,15 @@ struct Server {
     _fake: Proc,
     _server: Proc,
     ep: Endpoints,
-    token: String,
+    /// One token per run (`--tokens`); the probes and the approval rounds use the first.
+    tokens: Vec<String>,
     sent: u64,
+}
+
+impl Server {
+    fn token(&self) -> &str {
+        &self.tokens[0]
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -497,14 +515,19 @@ async fn start(
         let log = std::fs::read_to_string(&log_path).unwrap_or_default();
         bail!("{e}; server log:\n{log}");
     }
-    let token = mint(http, &ep.attenuo, args.depth, limits)
-        .await
-        .with_context(|| format!("[{label}] token"))?;
+    let mut tokens = Vec::with_capacity(args.tokens);
+    for i in 0..args.tokens {
+        tokens.push(
+            mint(http, &ep.attenuo, args.depth, limits)
+                .await
+                .with_context(|| format!("[{label}] token {i}"))?,
+        );
+    }
     Ok(Server {
         _fake: fake,
         _server: server,
         ep,
-        token,
+        tokens,
         sent: 0,
     })
 }
@@ -726,7 +749,7 @@ async fn approval_round(
     body: &str,
 ) -> Result<[u64; 3]> {
     let t0 = Instant::now();
-    let gated = rpc(http, url, &srv.token, body).await?;
+    let gated = rpc(http, url, srv.token(), body).await?;
     let t1 = Instant::now();
     let code = gated.pointer("/error/code").and_then(Value::as_i64);
     let id = gated
@@ -745,7 +768,7 @@ async fn approval_round(
     let text = resp.text().await?;
     ensure!(status.is_success(), "grant answered {status}: {text}");
     let t2 = Instant::now();
-    let retry = rpc(http, url, &srv.token, body).await?;
+    let retry = rpc(http, url, srv.token(), body).await?;
     let t3 = Instant::now();
     ensure!(
         retry.get("result").is_some(),
@@ -762,7 +785,7 @@ async fn run_approvals(
 ) -> Result<ApprovalReport> {
     let url = format!("{}/mcp/{UPSTREAM}", srv.ep.attenuo);
     // Taint the run first: one untrusted read.
-    let read = rpc(http, &url, &srv.token, &Cell::Read.body(HotConfig::Labels)).await?;
+    let read = rpc(http, &url, srv.token(), &Cell::Read.body(HotConfig::Labels)).await?;
     ensure!(read.get("result").is_some(), "taint read failed: {read}");
     let body = Cell::Destructive.body(HotConfig::Labels);
     for _ in 0..args.approval_warmup {
@@ -822,7 +845,7 @@ async fn probe(
 ) -> Result<Value> {
     let resp = http
         .post(format!("{}/mcp/{UPSTREAM}", srv.ep.attenuo))
-        .bearer_auth(&srv.token)
+        .bearer_auth(srv.token())
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
         .body(super::fill_seq(&cell.body(config)))
@@ -1023,6 +1046,10 @@ pub async fn run(args: &HotPathArgs) -> Result<()> {
     ensure!(args.runs > 0, "--runs must be at least 1");
     ensure!(args.clients > 0, "--clients must be at least 1");
     ensure!(
+        (1..=args.clients).contains(&args.tokens),
+        "--tokens must be 1 to --clients"
+    );
+    ensure!(
         (2..=8).contains(&args.depth),
         "--depth must be 2 to 8 (limits charge every hop)"
     );
@@ -1083,17 +1110,21 @@ pub async fn run(args: &HotPathArgs) -> Result<()> {
             for &cell in &cells {
                 let name = format!("[{}] run {run} {}", c.label(), cell.label());
                 eprintln!("{name}");
-                let target = Target {
-                    url: format!("{}/mcp/{UPSTREAM}", srv.ep.attenuo),
-                    token: Some(srv.token.clone()),
-                    body: cell.body(*c),
-                    expect: Expect::Result {
-                        decision_header: true,
-                    },
-                };
+                let targets: Vec<Target> = srv
+                    .tokens
+                    .iter()
+                    .map(|token| Target {
+                        url: format!("{}/mcp/{UPSTREAM}", srv.ep.attenuo),
+                        token: Some(token.clone()),
+                        body: cell.body(*c),
+                        expect: Expect::Result {
+                            decision_header: true,
+                        },
+                    })
+                    .collect();
                 let metrics = srv.ep.metrics.clone();
                 let out = drive(
-                    &target,
+                    &targets,
                     args.clients,
                     warmup,
                     duration,
@@ -1208,6 +1239,7 @@ pub async fn run(args: &HotPathArgs) -> Result<()> {
             "warmup_s": args.warmup,
             "runs": args.runs,
             "clients": args.clients,
+            "tokens": args.tokens,
             "depth": args.depth,
             "audit": args.audit,
         }),
