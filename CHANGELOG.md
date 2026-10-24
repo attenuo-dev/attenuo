@@ -8,6 +8,10 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ## [Unreleased]
 
+### Documentation
+
+- Proposed design for run limits ([docs/design/run-limits.md](docs/design/run-limits.md), [ADR-0010](docs/decisions/0010-run-limits.md)): count, amount and per-destination budgets declared per token hop, charged against every ancestor hop in the decision's audit transaction, exposed to Cedar as `context.budget`; by a hand count of the injection suite it would deny 5 of 10 dev and 5 of 7 test attack calls allowed today, with no benign call lost. Nothing implemented.
+
 ### Evaluation
 
 - First run of the injection suite's `attenuo_labels` arm (output labelling phase 1, server from `ed3a769`): attack calls allowed without approval 1/60 dev and 1/38 test, both reads, against 10/60 and 7/38 for the `attenuo` arm; benign calls gated 18/69 and 2/29. Gated calls were counted, not retried, because the approval endpoints are not built yet. Results in `evaluation/injection-suite/results/2026-10-24-labels-v1.md`.
