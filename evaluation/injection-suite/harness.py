@@ -18,7 +18,9 @@ five arms:
                        suite Cedar policies, leases and audit (arm A2).
 ``attenuo_labels``    as ``attenuo``, plus the two ``@obligation("approval")`` policies of
                        ``policies/labels.cedar`` (output labelling, phase 1). Runs only when the
-                       server answers ``-32008 approval_required``; skipped otherwise.
+                       server answers ``-32008 approval_required``; skipped otherwise. A
+                       gated call is granted or declined by the scripted approver through
+                       ``POST /admin/approvals/{id}``; a granted one is retried once.
 
 No LLM is involved. See README.md for the method and its limits.
 """
@@ -781,9 +783,17 @@ class CallResult:
     note: str | None = None
     detail: str | None = None
     spoof: bool = False
-    approval: str | None = None  # gated calls: what the scripted approver would answer
-    approval_id: str | None = None  # gated calls: data.approval_id of the -32008 (not retried)
+    approval: str | None = None  # gated calls: what the scripted approver answered
+    approval_id: str | None = None  # gated calls: data.approval_id of the -32008
     output_returned: bool | None = None  # the scripted output came back (None: none scripted)
+    # Gated calls in the labels arm, after the scripted approver's decision (see AFTER_APPROVAL).
+    after_approval: str | None = None
+    approval_state: str | None = None  # GET /admin/approvals/{id} after the decision and retry
+    approval_consumed_by: str | None = None  # its consumed_by: the retry's decision id
+    retry_reason: str | None = None
+    retry_decision_id: str | None = None
+    retry_reached_upstream: bool | None = None
+    retry_output_returned: bool | None = None
 
     @property
     def as_expected(self) -> bool:
@@ -846,6 +856,21 @@ def _rpc_body(call: Call, rid: int) -> Any:
         "method": "tools/call",
         "params": {"name": call.tool, "arguments": call.args},
     }
+
+
+# What became of a gated call (labels arm) once the scripted approver answered:
+#   allowed      granted, and the identical retry from the same hop was allowed
+#   denied       granted, but the retry was denied (``-32003``)
+#   declined     declined through the approvals API; not retried
+#   no_decision  the ``-32008`` carried no ``approval_id``, so nothing could be decided
+#   gated        granted, and the retry got ``-32008`` again (a failure: the grant was not used)
+#   error        granted, and the retry got some other error, or the decision was refused
+AFTER_APPROVAL = ("allowed", "denied", "declined", "no_decision", "gated", "error")
+
+
+def after_approval_of(retry_outcome: str) -> str:
+    """The ``after_approval`` value of a granted call whose retry had ``retry_outcome``."""
+    return {"allow": "allowed", "deny": "denied", "gated": "gated"}.get(retry_outcome, "error")
 
 
 def scripted_approver(call: Call) -> bool:
@@ -991,8 +1016,8 @@ class _Replayer:
     # calls
     def _record(self, call: Call, outcome: str, reason: str | None, decision: str | None,
                 reached: bool, intact: bool | None, detail: str | None = None,
-                returned: bool | None = None,
-                approval_id: str | None = None) -> None:  # fmt: skip
+                returned: bool | None = None, approval_id: str | None = None,
+                after: dict[str, Any] | None = None) -> None:  # fmt: skip
         self.out.append(
             CallResult(
                 case=self.case.id,
@@ -1021,9 +1046,79 @@ class _Replayer:
                 ),
                 output_returned=returned,
                 approval_id=approval_id,
+                **(after or {}),
             )
         )
         self.index += 1
+
+    # approvals
+    def _admin_approval(self, method: str, aid: str, body: Any = None) -> httpx.Response:
+        assert self.stack is not None
+        url = f"{self.stack.url}/admin/approvals/{quote(aid, safe='')}"
+        headers = {"authorization": f"Bearer {ADMIN_TOKEN}"}
+        return self.http.request(method, url, json=body, headers=headers)
+
+    def _approval_state(self, aid: str) -> tuple[str | None, str | None]:
+        r = self._admin_approval("GET", aid)
+        if r.status_code != 200:
+            return None, None
+        a = r.json()
+        return a.get("state"), a.get("consumed_by")
+
+    def _settle(self, call: Call, token: Any, dest: str, aid: str | None) -> dict[str, Any]:
+        """Answer a gated call as the scripted approver would, through the operator endpoint
+        ``POST /admin/approvals/{id}``. A grant is followed by one identical retry from the
+        same hop; a decline is not retried. Returns the ``after_approval`` fields."""
+        if aid is None:
+            return {"after_approval": "no_decision"}
+        grant = scripted_approver(call)
+        r = self._admin_approval("POST", aid, {"decision": "grant" if grant else "decline"})
+        if r.status_code != 200:
+            state, _ = self._approval_state(aid)
+            return {"after_approval": "error", "approval_state": state,
+                    "retry_reason": f"decide_http_{r.status_code}"}  # fmt: skip
+        if not grant:
+            state, _ = self._approval_state(aid)
+            return {"after_approval": "declined", "approval_state": state}
+        self.rid += 1
+        rid = self.rid
+        body = _rpc_body(call, rid)
+        raw = _decoy_bytes(call, rid) if call.decoy else None
+        scripted = self.ups.get(dest)
+        if call.output is not None and scripted is not None:
+            scripted.script(self.http, {call.tool: [call.output]})
+        obs = _Observer(self.ups)
+        try:
+            resp = self._post(dest, token, body, raw)
+        finally:
+            if call.output is not None and scripted is not None:
+                scripted.script(self.http, {})
+        new = obs.take()
+        header = [p.strip() for p in resp.headers.get(DECISION_HEADER, "").split(",") if p.strip()]
+        msgs = [m for m in _parse_messages(resp) if isinstance(m, dict)]
+        msg = next((m for m in msgs if m.get("id") == rid), msgs[0] if len(msgs) == 1 else None)
+        outcome, reason, decision = _judge(msg, header)
+        if outcome == "allow" and header:
+            decision = header[0]
+        landed = call.target(self.suite.upstream)
+        reached, _ = _delivered(new, landed if landed in self.ups else None, call)
+        state, consumed_by = self._approval_state(aid)
+        after = after_approval_of(outcome)
+        if after == "gated":
+            print(
+                f"FAILED: {self.arm} {self.case.id}#{self.index} {call.tool}: retry after the "
+                f"grant of approval {aid} got -32008 again",
+                file=sys.stderr,
+            )
+        return {
+            "after_approval": after,
+            "approval_state": state,
+            "approval_consumed_by": consumed_by,
+            "retry_reason": reason,
+            "retry_decision_id": decision,
+            "retry_reached_upstream": reached,
+            "retry_output_returned": _returned(msg, call.output) if outcome == "allow" else None,
+        }
 
     def _post(self, server: str, token: Any, body: Any, raw: bytes | None) -> httpx.Response:
         headers = {
@@ -1083,6 +1178,8 @@ class _Replayer:
         landed = first.resolves_to or first.target(self.suite.upstream)
         if self.arm != "direct":
             landed = first.target(self.suite.upstream)
+        pending: list[tuple[Call, str, str | None, str | None, bool, bool | None,
+                            bool | None, str | None]] = []  # fmt: skip
         for n, (c, rid) in enumerate(zip(calls, ids, strict=True)):
             msg = msgs.get(rid)
             if msg is None and not batch and len(msgs) == 1:
@@ -1098,8 +1195,15 @@ class _Replayer:
                 reached, intact = _delivered(new, landed if landed in self.ups else None, c)
             returned = _returned(msg, c.output) if outcome == "allow" else None
             aid = _approval_id(msg) if outcome == "gated" else None
+            pending.append((c, outcome, reason, decision, reached, intact, returned, aid))
+        # Approvals are decided after the whole request is judged, so a retry's upstream line
+        # is never mistaken for the first attempt's.
+        for c, outcome, reason, decision, reached, intact, returned, aid in pending:
+            after = None
+            if outcome == "gated" and self.arm in LABEL_ARMS:
+                after = self._settle(c, token, dest, aid)
             self._record(c, outcome, reason, decision, reached, intact, returned=returned,
-                         approval_id=aid)  # fmt: skip
+                         approval_id=aid, after=after)  # fmt: skip
 
     def run(self) -> list[CallResult]:
         for step in self.case.steps:
@@ -1211,6 +1315,17 @@ def audit_check(stack: Stack, results: list[CallResult]) -> dict[str, Any]:
             continue
         if e is None or e.decision != want or (r.reason and e.reason != r.reason):
             mismatched.append({"case": r.case, "index": r.index, "decision_id": r.decision_id})
+    # A retry after a grant has its own decision record, which names the approval it used.
+    retries = [r for r in results if r.retry_decision_id]
+    retry_mismatched = []
+    for r in retries:
+        got = entries.get(r.retry_decision_id or "")
+        used = ((got.record.get("approval") or {}).get("id") if got else None) == r.approval_id
+        want = "allow" if r.after_approval == "allowed" else "deny"
+        if got is None or got.decision != want or (want == "allow" and not used):
+            retry_mismatched.append(
+                {"case": r.case, "index": r.index, "decision_id": r.retry_decision_id}
+            )
     admin.audit_checkpoint()
     admin.close()
     verify = stack.cli("audit", "verify")
@@ -1225,6 +1340,8 @@ def audit_check(stack: Stack, results: list[CallResult]) -> dict[str, Any]:
         "decisions_matched": len(checked) - len(mismatched),
         "decisions_unmatched": mismatched,
         "not_audited": len(results) - len(checked),
+        "retries_checked": len(retries),
+        "retries_unmatched": retry_mismatched,
         "cli_verify_exit": verify.returncode,
         "cli_verify_output": verify.stdout.strip(),
         "export_exit": exp.returncode,

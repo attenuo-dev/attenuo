@@ -215,7 +215,7 @@ def test_approval_required_is_its_own_outcome() -> None:
     assert "probe got no error" in (harness.approval_probe_verdict({"result": {}}) or "")
     other = {"error": {"code": -32008, "data": {"reason": "something_else"}}}
     assert harness._judge(other, [])[0] == "error"
-    # The approvals API adds data.approval_id; the runner records it and does not retry.
+    # The approvals API adds data.approval_id; the runner records it to decide and retry.
     assert harness._approval_id(GATED) is None
     with_id = json.loads(json.dumps(GATED))
     with_id["error"]["data"]["approval_id"] = "a-1"
@@ -224,11 +224,25 @@ def test_approval_required_is_its_own_outcome() -> None:
 
 
 def _call(role: str, outcome: str, expect: str = "allow", stage: str | None = None,
-          reached: bool = False) -> dict[str, Any]:  # fmt: skip
+          reached: bool = False, **extra: Any) -> dict[str, Any]:  # fmt: skip
     return {"arm": "attenuo_labels", "case": "x", "index": 0, "tool": "t", "role": role,
             "outcome": outcome, "expect": expect, "expect_stage": stage,
             "stage": stage if outcome == "deny" else None, "reason": None,
-            "reached_upstream": reached, "as_expected": None}  # fmt: skip
+            "reached_upstream": reached, "as_expected": None, **extra}  # fmt: skip
+
+
+GRANTED = {"after_approval": "allowed", "approval_id": "a-1", "approval_state": "consumed",
+           "approval_consumed_by": "d-2", "retry_decision_id": "d-2",
+           "retry_reached_upstream": True, "retry_output_returned": None}  # fmt: skip
+DECLINED = {"after_approval": "declined", "approval_id": "a-2", "approval_state": "declined"}
+
+
+def test_after_approval_outcomes() -> None:
+    assert harness.after_approval_of("allow") == "allowed"
+    assert harness.after_approval_of("deny") == "denied"
+    assert harness.after_approval_of("gated") == "gated"
+    assert harness.after_approval_of("error") == "error"
+    assert set(harness.AFTER_APPROVAL) >= {"allowed", "denied", "declined", "no_decision"}
 
 
 def test_labels_arm_rates_and_approve_all_bound() -> None:
@@ -236,20 +250,26 @@ def test_labels_arm_rates_and_approve_all_bound() -> None:
         "arms": ["attenuo_labels"],
         "calls": [
             _call("attack", "allow"),
-            _call("attack", "gated"),
-            _call("attack", "gated"),
+            _call("attack", "gated", **DECLINED),
+            _call("attack", "gated", **GRANTED),
             _call("attack", "deny", "deny", "capability"),
-            _call("benign", "gated"),
+            _call("benign", "gated", **GRANTED),
+            _call("benign", "gated", after_approval="no_decision"),
             _call("benign", "allow"),
             _call("benign", "deny", "deny", "policy"),
         ],
     }
     r = run.arm_rates(doc)["attenuo_labels"]
     assert (r["attack_allowed"], r["attack_gated"], r["attack_allowed_approve_all"]) == (1, 2, 3)
-    assert (r["benign_denied"], r["benign_gated"], r["approval_requests"]) == (1, 1, 3)
+    assert (r["benign_denied"], r["benign_gated"], r["approval_requests"]) == (1, 2, 4)
+    assert r["attack_after"]["declined"] == 1 and r["attack_after"]["allowed"] == 1
+    assert r["attack_allowed_final"] == 2 and r["attack_reached_upstream"] == 1
+    assert r["benign_completed_after_approval"] == 1 and r["benign_after"]["no_decision"] == 1
     doc |= {"rates": {"attenuo_labels": r}, "skipped_arms": {}}
     table = "\n".join(run.render_labels(doc))
-    assert "| 1/4 (25%" in table and "| 2/4 (50%) |" in table and "| 3 |" in table
+    assert "| 1/4 (25%" in table and "| 2/4 (50%) |" in table and "| 4 |" in table
+    assert "| 1 | 1 | 0 | 2/4 (50%" in table  # approved-allowed, declined, other, final
+    assert "| 2/4 (50%) | 1/2 | 0 | 1 |" in table  # benign gated, completed, declined, other
 
 
 def test_labels_arm_problems() -> None:
@@ -260,6 +280,28 @@ def test_labels_arm_problems() -> None:
     assert run.problems(doc) == ["attenuo_labels x#0 t: gated but reached the upstream"]
     doc = {"calls": [{**_call("benign", "allow"), "output_returned": False}], "audit": {}}
     assert "lacks the scripted output" in run.problems(doc)[0]
+
+
+def test_labels_arm_approval_problems() -> None:
+    ok = [_call("benign", "gated", **GRANTED), _call("attack", "gated", **DECLINED)]
+    assert run.problems({"calls": ok, "audit": {}}) == []
+    again = _call("benign", "gated", **{**GRANTED, "after_approval": "gated"})
+    assert "got -32008 again" in run.problems({"calls": [again], "audit": {}})[0]
+    unused = _call("benign", "gated", **{**GRANTED, "approval_state": "granted"})
+    assert "not by the retry" in run.problems({"calls": [unused], "audit": {}})[0]
+    lost = _call("benign", "gated", **{**GRANTED, "retry_reached_upstream": False})
+    assert "did not reach the upstream" in run.problems({"calls": [lost], "audit": {}})[0]
+    no_id = _call("benign", "gated", after_approval="no_decision")
+    assert "without an approval_id" in run.problems({"calls": [no_id], "audit": {}})[0]
+    pending = _call("attack", "gated", **{**DECLINED, "approval_state": "pending"})
+    assert (
+        "declined approval a-2, but it is pending"
+        in run.problems({"calls": [pending], "audit": {}})[0]
+    )
+    audit = {"attenuo_labels": {"decisions_unmatched": [], "retries_unmatched": [{}],
+                                "cli_verify_exit": 0, "offline_verify_exit": 0,
+                                "export_exit": 0}}  # fmt: skip
+    assert "retries after a grant" in run.problems({"calls": [], "audit": audit})[0]
 
 
 def test_skipped_arm_is_reported() -> None:
