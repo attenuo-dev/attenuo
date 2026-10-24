@@ -20,7 +20,7 @@
 //! | `POST/GET/DELETE /mcp/{server}` | delegation token | MCP proxy |
 //! | `POST /admin/root-token` | admin | dev-only hop-0 mint ([`routes::dev_root`]), mounted only with `[dev] allow_root_mint = true` |
 //! | `POST /admin/leases/{id}/revoke`, `GET /admin/leases/{id}` | admin | leases |
-//! | `POST /admin/leases/revoke?preview` | admin | revoke every lease of one user or one chain, with the cascade, audited ([`routes::admin::revoke_by_selector`]) |
+//! | `POST /admin/leases/revoke?preview` | admin | revoke every lease of one user, one chain, or the chains that opened one MCP session (`session`), with the cascade, audited ([`routes::admin::revoke_by_selector`]) |
 //! | `GET /admin/leases/{id}/tree?max_nodes` | admin | lease subtree, ancestors and how many leases a revoke would change (read-only, [`routes::admin::lease_tree`]) |
 //! | `POST /admin/budgets/refund` | admin | return what one decision charged to the run limits, once, audited ([`routes::admin::refund_budget`]) |
 //! | `GET /admin/audit`, `/admin/audit/verify`, `/admin/audit/checkpoint` | admin | audit |
@@ -29,7 +29,7 @@
 //! | `POST /admin/policies/reload` | admin | hot-reload the Cedar policy file |
 //! | `GET /admin/policies` | admin | the policy set in force: ids, text, file digest, load time ([`routes::policies`]) |
 //! | `GET /admin/policies/check` | admin | lint the policy file on disk against the running schema; swaps nothing |
-//! | `POST /admin/policies/evaluate` | admin | dry run: what the loaded policies say about one call; no lease check, no audit |
+//! | `POST /admin/policies/evaluate` | admin | dry run: what the loaded policies say about one call, optionally with a stated run-limit state (`budget`); no lease check, no charge, no audit |
 //! | `POST /approvals/{id}` | the originating user's IdP ID token (never a delegation token) | grant or decline a pending approval ([`routes::approvals`]) |
 //! | `GET /approvals/{id}` | the user's ID token, or a delegation token of the same run | the approval: exact call, labels, state, expiry |
 //! | `GET /admin/approvals?chain_id`, `GET /admin/approvals/{id}`, `POST /admin/approvals/{id}` | admin | list, show, and grant or decline as an operator |
