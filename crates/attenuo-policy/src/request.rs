@@ -252,7 +252,8 @@ impl PartsKey {
 /// chain and tool: the principal, action and resource, the entity store (user, agents,
 /// server, tool, actions) and the `originating_user` and `chain` context records. Only
 /// `context.input`, `context.session_id`, `context.now_unix` and the output-labelling members
-/// (`session`, `args_contain_untrusted`, `untrusted_args`, `approval`) are built per call.
+/// (`session`, `args_contain_untrusted`, `untrusted_args`, `approval`) and the run-limit
+/// member (`budget`) are built per call.
 #[derive(Debug)]
 pub(crate) struct RequestParts {
     key: PartsKey,
@@ -366,7 +367,8 @@ impl RequestParts {
 /// The output-labelling members of the context (ADR-0009), always present:
 /// `session: {tainted, tainted_by}`, `args_contain_untrusted` and `untrusted_args` (fixed
 /// `false` and empty until argument matching exists), and `approval: {present, by}` (a
-/// granted approval the call consumed, if any).
+/// granted approval the call consumed, if any); and the run-limit member (ADR-0010),
+/// `budget: {limited, calls_remaining, amount_remaining, destination_new}`.
 fn label_pairs(
     labels: &CallLabels,
 ) -> Result<Vec<(String, RestrictedExpression)>, TranslationError> {
@@ -400,6 +402,25 @@ fn label_pairs(
             RestrictedExpression::new_string(labels.approval.by.clone()),
         ),
     ])?;
+    let b = &labels.budget;
+    let budget = record(vec![
+        (
+            "limited".to_string(),
+            RestrictedExpression::new_bool(b.limited),
+        ),
+        (
+            "calls_remaining".to_string(),
+            RestrictedExpression::new_long(b.calls_remaining),
+        ),
+        (
+            "amount_remaining".to_string(),
+            RestrictedExpression::new_long(b.amount_remaining),
+        ),
+        (
+            "destination_new".to_string(),
+            RestrictedExpression::new_bool(b.destination_new),
+        ),
+    ])?;
     Ok(vec![
         ("session".to_string(), session),
         (
@@ -411,6 +432,7 @@ fn label_pairs(
             RestrictedExpression::new_set(std::iter::empty()),
         ),
         ("approval".to_string(), approval),
+        ("budget".to_string(), budget),
     ])
 }
 
@@ -427,6 +449,15 @@ fn label_json(labels: &CallLabels) -> Map<String, Value> {
     m.insert(
         "approval".into(),
         json!({ "present": labels.approval.present, "by": labels.approval.by }),
+    );
+    m.insert(
+        "budget".into(),
+        json!({
+            "limited": labels.budget.limited,
+            "calls_remaining": labels.budget.calls_remaining,
+            "amount_remaining": labels.budget.amount_remaining,
+            "destination_new": labels.budget.destination_new,
+        }),
     );
     m
 }

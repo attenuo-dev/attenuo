@@ -6,8 +6,8 @@
 use std::collections::BTreeMap;
 
 use attenuo_core::{
-    AgentId, ArgConstraint, AttenuationError, Capability, CapabilitySet, DelegationChain, LeaseId,
-    OriginatingUser, ToolCall,
+    AgentId, ArgConstraint, ArgLimit, AttenuationError, Capability, CapabilitySet, DelegationChain,
+    LeaseId, Limits, OriginatingUser, ToolCall,
 };
 use proptest::prelude::*;
 use serde_json::{json, Value};
@@ -51,6 +51,21 @@ fn arg_constraint() -> impl Strategy<Value = ArgConstraint> {
     ]
 }
 
+/// Limits over a small range so that equal and nested figures are common. `sum` counts `n`,
+/// which no constraint names, so every generated capability has well-formed limits.
+fn limits() -> impl Strategy<Value = Limits> {
+    (
+        prop::option::of(0u64..4),
+        prop::option::of(0u64..4),
+        prop::option::of((prop::sample::select(ARGS), 0u64..4)),
+    )
+        .prop_map(|(calls, sum, per)| Limits {
+            calls,
+            sum: sum.map(|max| ArgLimit::new("n", max)),
+            calls_per: per.map(|(arg, max)| ArgLimit::new(arg, max)),
+        })
+}
+
 fn name() -> impl Strategy<Value = String> {
     prop::sample::select(NAMES).prop_map(str::to_owned)
 }
@@ -65,8 +80,9 @@ fn capability() -> impl Strategy<Value = Capability> {
             0..=2,
         ),
         any::<bool>(),
+        prop_oneof![2 => Just(Limits::default()), 1 => limits()],
     )
-        .prop_map(|(server, tool, mut constraints, with_z)| {
+        .prop_map(|(server, tool, mut constraints, with_z, limits)| {
             // up to 3 constraints: a third on an arg outside the shared pool
             if with_z {
                 constraints.insert("z".into(), ArgConstraint::Prefix("a".into()));
@@ -75,6 +91,7 @@ fn capability() -> impl Strategy<Value = Capability> {
                 server,
                 tool,
                 constraints,
+                limits,
             }
         })
 }
@@ -420,16 +437,70 @@ proptest! {
         prop_assert!(early.validate_at(t0(), MAX_DEPTH).is_err());
     }
 
-    /// 6. attenuate succeeds iff the request is covered and non-empty.
+    /// 6. attenuate returns a covered request unchanged, and anything else it returns differs
+    /// from the request only in limits clamped to the parent's (ADR-0010) and is covered.
     #[test]
     fn attenuate_iff_covered_and_nonempty(
         parent in capability_set(),
         requested in capability_set(),
     ) {
-        let expected_ok = parent.covers(&requested) && !requested.is_empty();
+        let covered = parent.covers(&requested) && !requested.is_empty();
         match parent.attenuate(&requested) {
-            Ok(got) => { prop_assert!(expected_ok); prop_assert_eq!(got, requested); }
-            Err(_) => prop_assert!(!expected_ok),
+            Ok(got) => {
+                prop_assert!(parent.covers(&got));
+                if covered {
+                    prop_assert_eq!(got, requested);
+                } else {
+                    // Only limits changed: the calls the request names are all still there.
+                    for c in requested.iter() {
+                        prop_assert!(got.iter().any(|g| g.covers_calls(c) && c.covers_calls(g)));
+                    }
+                }
+            }
+            Err(_) => prop_assert!(!covered),
+        }
+    }
+
+    /// ADR-0010: when a parent covers a child, every limit of the parent appears in the child
+    /// with a max no larger (or, for `calls_per`, is implied by the child's `calls`).
+    #[test]
+    fn child_limit_never_exceeds_parent_limit(parent in capability(), child in capability()) {
+        if parent.covers(&child) {
+            let (p, c) = (&parent.limits, &child.limits);
+            if let Some(pm) = p.calls {
+                prop_assert!(c.calls.is_some_and(|cm| cm <= pm));
+            }
+            if let Some(ps) = &p.sum {
+                prop_assert!(c.sum.as_ref().is_some_and(|cs| cs.arg == ps.arg && cs.max <= ps.max));
+            }
+            if let Some(pp) = &p.calls_per {
+                let same = c.calls_per.as_ref().is_some_and(|cp| cp.arg == pp.arg && cp.max <= pp.max);
+                prop_assert!(same || c.calls.is_some_and(|cm| cm <= pp.max));
+            }
+        }
+    }
+
+    /// ADR-0010: clamping at exchange never yields a figure above what the parent has left.
+    #[test]
+    fn exchange_clamps_child_budget_to_parent_remaining(
+        parent in capability(),
+        requested in capability_set(),
+        left in 0u64..4,
+    ) {
+        let parent_set = CapabilitySet::from_iter([parent.clone()]);
+        if let Ok(got) = parent_set.attenuate_with(&requested, |i, _, max| {
+            assert_eq!(i, 0);
+            Some(left.min(max))
+        }) {
+            prop_assert!(parent_set.covers(&got));
+            for g in got.iter() {
+                if parent.limits.calls.is_some() {
+                    prop_assert!(g.limits.calls.is_some_and(|c| c <= left));
+                }
+                if parent.limits.sum.is_some() {
+                    prop_assert!(g.limits.sum.as_ref().is_some_and(|s| s.max <= left));
+                }
+            }
         }
     }
 

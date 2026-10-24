@@ -78,11 +78,26 @@ pub fn error_response(
 
 /// The error response the proxy returns for a denied `tools/call`.
 pub fn denied_response(id: Value, reason: &str, decision_id: Uuid) -> Value {
+    denied_response_with(id, reason, decision_id, None)
+}
+
+/// [`denied_response`] with the run limit a `budget_exhausted` decision hit (ADR-0010) as
+/// `data.limit`: `{hop, kind, arg, max, used}`, the hop named by its position in the chain.
+pub fn denied_response_with(
+    id: Value,
+    reason: &str,
+    decision_id: Uuid,
+    limit: Option<&Value>,
+) -> Value {
+    let mut data = json!({ "reason": reason, "decision_id": decision_id });
+    if let Some(l) = limit {
+        data["limit"] = l.clone();
+    }
     error_response(
         id,
         CODE_DENIED,
         format!("attenuo: denied: {reason}"),
-        Some(json!({ "reason": reason, "decision_id": decision_id })),
+        Some(data),
     )
 }
 
@@ -146,6 +161,13 @@ mod tests {
         assert_eq!(v["error"]["message"], "attenuo: denied: capability_denied");
         assert_eq!(v["error"]["data"]["reason"], "capability_denied");
         assert_eq!(v["error"]["data"]["decision_id"], id.to_string());
+        assert!(v["error"]["data"].get("limit").is_none());
+        // ADR-0010: a `budget_exhausted` denial names the limit.
+        let limit = json!({"hop": 0, "kind": "calls", "max": 1, "used": 1});
+        let v = denied_response_with(json!(8), "budget_exhausted", id, Some(&limit));
+        assert_eq!(v["error"]["code"], CODE_DENIED);
+        assert_eq!(v["error"]["data"]["reason"], "budget_exhausted");
+        assert_eq!(v["error"]["data"]["limit"], limit);
     }
 
     #[test]

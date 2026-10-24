@@ -414,7 +414,11 @@ async fn forbidden_without_a_configured_admin_token_carries_the_headers() {
 #[tokio::test]
 async fn write_routes_are_absent_without_allow_write() {
     let h = Harness::start(false).await;
-    for path in ["/admin/leases/x/revoke", "/admin/policies/reload"] {
+    for path in [
+        "/admin/leases/x/revoke",
+        "/admin/policies/reload",
+        "/admin/budgets/refund",
+    ] {
         let r = Harness::client()
             .post(h.console.url(path))
             .bearer_auth(ADMIN)

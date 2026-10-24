@@ -7,6 +7,7 @@ import {
   oneOf,
   parseCapability,
   prefix,
+  withLimits,
 } from "../src/index.js";
 
 describe("capability", () => {
@@ -77,5 +78,34 @@ describe("capability", () => {
     expect(formatCapability(capability("g", "t", { r: prefix("a/") }))).toBe(
       'g:t{r={"op":"prefix","value":"a/"}}',
     );
+  });
+
+  it("carries run limits and refuses kinds it does not know", () => {
+    const wire = {
+      server: "banking",
+      tool: "send_money",
+      limits: {
+        calls: 1,
+        sum: { arg: "amount", max: 10 },
+        calls_per: { arg: "recipient", max: 1 },
+      },
+    };
+    const cap = withLimits(capability("banking", "send_money"), wire.limits);
+    expect(cap).toEqual(wire);
+    expect(capabilitiesToJson([wire])).toEqual([wire]);
+    expect(formatCapability(cap)).toBe(
+      "banking:send_money[calls<=1,sum(amount)<=10,calls_per(recipient)<=1]",
+    );
+    expect(withLimits(cap, {})).toEqual({ server: "banking", tool: "send_money" });
+    for (const bad of [
+      { distinct: { arg: "to", max: 1 } },
+      { calls: -1 },
+      { calls: 1.5 },
+      { sum: { arg: "amount" } },
+    ]) {
+      expect(() => capabilitiesToJson([{ server: "b", tool: "t", limits: bad as never }])).toThrow(
+        TypeError,
+      );
+    }
   });
 });

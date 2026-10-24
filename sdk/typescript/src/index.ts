@@ -64,8 +64,9 @@ export {
   oneOf,
   parseCapability,
   prefix,
+  withLimits,
 } from "./capability.js";
-export type { Capability, CapabilityLike, Constraint } from "./capability.js";
+export type { ArgLimit, Capability, CapabilityLike, Constraint, Limits } from "./capability.js";
 export {
   accessTokenHash,
   DpopKey,

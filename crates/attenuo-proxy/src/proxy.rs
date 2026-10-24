@@ -25,7 +25,7 @@ use crate::config::ProxyConfig;
 use crate::filter::{ListFilter, ListKind};
 use crate::guard::{guard_stream, StreamGuard};
 use crate::jsonrpc::{
-    self, approval_required_response, denied_response, error_response, id_of,
+    self, approval_required_response, denied_response, denied_response_with, error_response, id_of,
     is_passthrough_method, is_request, method_of, CODE_INVALID_PARAMS, CODE_INVALID_REQUEST,
     CODE_PARSE_ERROR, CODE_TOO_MANY, CODE_UNAUTHORIZED, CODE_UNAVAILABLE, CODE_UNKNOWN_SERVER,
     CODE_UPSTREAM,
@@ -1238,8 +1238,12 @@ async fn screen_message(
             verdict.approval.as_ref(),
         ));
     } else {
-        out.replies
-            .push(denied_response(id, &verdict.reason, verdict.decision_id));
+        out.replies.push(denied_response_with(
+            id,
+            &verdict.reason,
+            verdict.decision_id,
+            verdict.limit.as_ref(),
+        ));
     }
 }
 

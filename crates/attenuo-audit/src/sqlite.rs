@@ -13,12 +13,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock, TryLockError};
 use std::time::Duration;
 
-use attenuo_core::{DecisionRecord, LeaseId};
+use attenuo_core::{Charge, DecisionRecord, LeaseId, LimitKind};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::approval::{rules, Approval, ApprovalMethod, ApprovalState, Approver};
+use crate::budget::{plan, ChargeOutcome, CounterKey, ValueKey};
 use crate::checkpoint::{
     verify_with_checkpoints, Checkpoint, CheckpointKeys, SignedVerifyReport, Start,
 };
@@ -122,6 +123,36 @@ CREATE TABLE IF NOT EXISTS approvals (
     consumed_by      TEXT NULL
 );
 CREATE INDEX IF NOT EXISTS approvals_call_idx ON approvals(chain_id, call_hash, state);
+-- Run limits (ADR-0010). One row per counter; `value` is the hex HMAC of a `calls_per`
+-- value, or '' for `calls` and `sum`. Keyed by lease id, never joined with `leases`.
+CREATE TABLE IF NOT EXISTS budget_counters (
+    lease TEXT    NOT NULL,
+    cap   INTEGER NOT NULL,
+    kind  TEXT    NOT NULL,
+    arg   TEXT    NOT NULL,
+    value TEXT    NOT NULL,
+    used  INTEGER NOT NULL,
+    PRIMARY KEY (lease, cap, kind, arg, value)
+);
+-- What each decision charged, so that it can be refunded exactly and at most once.
+CREATE TABLE IF NOT EXISTS budget_charges (
+    decision_id TEXT    NOT NULL,
+    lease       TEXT    NOT NULL,
+    cap         INTEGER NOT NULL,
+    kind        TEXT    NOT NULL,
+    arg         TEXT    NOT NULL,
+    value       TEXT    NOT NULL,
+    amount      INTEGER NOT NULL,
+    at          TEXT    NOT NULL,
+    refunded_at TEXT    NULL
+);
+CREATE INDEX IF NOT EXISTS budget_charges_decision_idx ON budget_charges(decision_id);
+-- The key `calls_per` values are hashed under, generated once per store.
+CREATE TABLE IF NOT EXISTS budget_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+INSERT OR IGNORE INTO budget_meta (key, value) VALUES ('value_key', lower(hex(randomblob(32))));
 "#;
 
 /// The record id (`DecisionRecord::id`) of a row, as SQL. `record_json` is the hashed text
@@ -1861,6 +1892,8 @@ pub struct SqliteLeaseStore {
     /// `None` for a connection this crate did not open (or an in-memory one): its pragmas are
     /// left alone.
     durability: Option<Durability>,
+    /// The key `calls_per` values are hashed under (`budget_meta`, ADR-0010).
+    value_key: ValueKey,
 }
 
 impl SqliteLeaseStore {
@@ -1884,9 +1917,17 @@ impl SqliteLeaseStore {
 
     pub fn from_connection(conn: Connection) -> Result<Self, AuditError> {
         conn.execute_batch(LEASE_SCHEMA)?;
+        let key: String = conn.query_row(
+            "SELECT value FROM budget_meta WHERE key = 'value_key'",
+            [],
+            |r| r.get(0),
+        )?;
+        let key = hex::decode(&key)
+            .map_err(|e| AuditError::Storage(format!("budget value key is not hex: {e}")))?;
         Ok(Self {
             conn: Mutex::new(conn),
             durability: None,
+            value_key: ValueKey::new(&key),
         })
     }
 
@@ -1950,6 +1991,115 @@ macro_rules! subtree_ids {
             ") SELECT id FROM sub"
         )
     };
+}
+
+/// What counter `key` holds (0 when it has never been charged).
+fn counter_in(conn: &Connection, key: &CounterKey) -> Result<u64, AuditError> {
+    let used: Option<i64> = conn
+        .prepare_cached(
+            "SELECT used FROM budget_counters \
+             WHERE lease = ?1 AND cap = ?2 AND kind = ?3 AND arg = ?4 AND value = ?5",
+        )?
+        .query_row(
+            params![key.lease, key.cap, key.kind, key.arg, key.value],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let used = used.unwrap_or(0);
+    u64::try_from(used)
+        .map_err(|_| AuditError::Storage(format!("budget counter {used} is negative")))
+}
+
+/// [`LeaseStore::charge`] in one `IMMEDIATE` transaction: the re-check and the writes see the
+/// same counters, and a concurrent charge waits for this one to commit.
+fn charge_in(
+    conn: &mut Connection,
+    keys: &[CounterKey],
+    decision_id: &str,
+    charges: &[Charge],
+    at: OffsetDateTime,
+) -> Result<ChargeOutcome, AuditError> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let already: bool = tx
+        .prepare_cached("SELECT EXISTS (SELECT 1 FROM budget_charges WHERE decision_id = ?1)")?
+        .query_row([decision_id], |r| r.get(0))?;
+    if already {
+        return Err(AuditError::Storage(format!(
+            "decision `{decision_id}` is already charged"
+        )));
+    }
+    let used_after = match plan(keys, charges, |k| counter_in(&tx, k))? {
+        Ok(after) => after,
+        Err(exhausted) => return Ok(exhausted),
+    };
+    let at = fmt_time(at)?;
+    for ((key, charge), after) in keys.iter().zip(charges).zip(&used_after) {
+        let (after, amount) = (to_i64(*after)?, to_i64(charge.amount)?);
+        tx.prepare_cached(
+            "INSERT INTO budget_counters (lease, cap, kind, arg, value, used) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT (lease, cap, kind, arg, value) DO UPDATE SET used = excluded.used",
+        )?
+        .execute(params![
+            key.lease, key.cap, key.kind, key.arg, key.value, after
+        ])?;
+        tx.prepare_cached(
+            "INSERT INTO budget_charges (decision_id, lease, cap, kind, arg, value, amount, at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?
+        .execute(params![
+            decision_id,
+            key.lease,
+            key.cap,
+            key.kind,
+            key.arg,
+            key.value,
+            amount,
+            at
+        ])?;
+    }
+    tx.commit()?;
+    Ok(ChargeOutcome::Charged { used_after })
+}
+
+/// [`LeaseStore::refund`] in one `IMMEDIATE` transaction.
+fn refund_in(
+    conn: &mut Connection,
+    decision_id: &str,
+    at: OffsetDateTime,
+) -> Result<u64, AuditError> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let (rows, refunded): (i64, i64) = tx
+        .prepare_cached(
+            "SELECT COUNT(*), COUNT(refunded_at) FROM budget_charges WHERE decision_id = ?1",
+        )?
+        .query_row([decision_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    if rows == 0 {
+        return Err(AuditError::UnknownCharge(decision_id.to_owned()));
+    }
+    if refunded > 0 {
+        return Err(AuditError::ChargeRefunded(decision_id.to_owned()));
+    }
+    tx.prepare_cached(
+        "UPDATE budget_counters SET used = MAX(0, used - ( \
+             SELECT SUM(c.amount) FROM budget_charges c WHERE c.decision_id = ?1 \
+               AND c.lease = budget_counters.lease AND c.cap = budget_counters.cap \
+               AND c.kind = budget_counters.kind AND c.arg = budget_counters.arg \
+               AND c.value = budget_counters.value)) \
+         WHERE EXISTS (SELECT 1 FROM budget_charges c WHERE c.decision_id = ?1 \
+               AND c.lease = budget_counters.lease AND c.cap = budget_counters.cap \
+               AND c.kind = budget_counters.kind AND c.arg = budget_counters.arg \
+               AND c.value = budget_counters.value)",
+    )?
+    .execute([decision_id])?;
+    tx.prepare_cached("UPDATE budget_charges SET refunded_at = ?2 WHERE decision_id = ?1")?
+        .execute(params![decision_id, fmt_time(at)?])?;
+    tx.commit()?;
+    Ok(rows as u64)
+}
+
+fn to_i64(v: u64) -> Result<i64, AuditError> {
+    i64::try_from(v).map_err(|_| AuditError::Storage(format!("budget figure {v} out of range")))
 }
 
 fn revoke_in(
@@ -2497,6 +2647,52 @@ impl LeaseStore for SqliteLeaseStore {
         let conn = self.conn.lock()?;
         conn.execute("DELETE FROM approvals WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    fn budget_used(&self, charges: &[Charge]) -> Result<Vec<u64>, AuditError> {
+        let keys = charges
+            .iter()
+            .map(|c| self.value_key.counter(c))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut conn = self.conn.lock()?;
+        // One read transaction, so every counter is read at the same moment.
+        let tx = conn.transaction()?;
+        keys.iter().map(|k| counter_in(&tx, k)).collect()
+    }
+
+    fn charge(
+        &self,
+        decision_id: &str,
+        charges: &[Charge],
+        at: OffsetDateTime,
+    ) -> Result<ChargeOutcome, AuditError> {
+        if charges.is_empty() {
+            return Ok(ChargeOutcome::Charged {
+                used_after: Vec::new(),
+            });
+        }
+        let keys = charges
+            .iter()
+            .map(|c| self.value_key.counter(c))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut conn = self.conn.lock()?;
+        // A lost `sum` charge could be spent again after a power failure, so a transaction
+        // that charges one commits with `synchronous=FULL`, as revocations do (design 3.4).
+        let relaxed = if charges.iter().any(|c| c.kind == LimitKind::Sum) {
+            self.durability
+                .filter(|d| *d != Durability::Full)
+                .map(Durability::level)
+        } else {
+            None
+        };
+        with_full_sync(&mut conn, relaxed, |conn| {
+            charge_in(conn, &keys, decision_id, charges, at)
+        })?
+    }
+
+    fn refund(&self, decision_id: &str, at: OffsetDateTime) -> Result<u64, AuditError> {
+        let mut conn = self.conn.lock()?;
+        refund_in(&mut conn, decision_id, at)
     }
 }
 

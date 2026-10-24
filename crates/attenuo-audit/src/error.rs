@@ -47,6 +47,12 @@ pub enum AuditError {
     /// The approval (or the lease it is bound to) has expired.
     #[error("approval or lease `{0}` has expired")]
     ApprovalExpired(String),
+    /// No run-limit charge is recorded for this decision id (ADR-0010).
+    #[error("no budget charge is recorded for decision `{0}`")]
+    UnknownCharge(String),
+    /// What this decision charged was already refunded.
+    #[error("the budget charge of decision `{0}` was already refunded")]
+    ChargeRefunded(String),
 }
 
 impl<T> From<std::sync::PoisonError<T>> for AuditError {

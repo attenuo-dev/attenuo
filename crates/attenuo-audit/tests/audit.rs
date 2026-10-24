@@ -582,6 +582,44 @@ fn approval_records_keep_existing_hashes_and_pin_their_own() {
     );
 }
 
+/// ADR-0010: `budget` is omitted when a call matched no limit, so the golden decision record
+/// keeps its hash, and a decision that drew on limits pins its own.
+#[test]
+fn budget_records_keep_existing_hashes_and_pin_their_own() {
+    let base = serde_json::json!({
+        "agents": ["agent:planner"], "arguments_digest": "ab".repeat(32), "chain_depth": 1,
+        "chain_digest": "cd".repeat(32), "chain_id": "l1", "decision": "allow",
+        "id": "00000000-0000-4000-8000-000000000001", "kind": "decision", "leases": ["l1"],
+        "originating_subject": "user:mudit", "reason": "policy_allow", "server": "github",
+        "tool": "read_file", "at": "2026-10-23T12:00:00Z"
+    });
+    let record: attenuo_core::DecisionRecord = serde_json::from_value(base.clone()).unwrap();
+    assert!(record.budget.is_none());
+    assert!(!attenuo_audit::canonical_record_json(&record).contains("budget"));
+    assert_eq!(
+        compute_entry_hash(7, &"11".repeat(32), &record),
+        "e8ababad86538918f6eee2d5edb7e6aa4bfa8f8f6ea032f2b5fde00dfe52d693"
+    );
+
+    let mut charged = base;
+    charged["budget"] = serde_json::json!({"charged": [
+        {"hop": 0, "cap": 0, "kind": "calls", "used_after": 1, "max": 1},
+        {"hop": 0, "cap": 0, "kind": "sum", "arg": "amount", "used_after": 10, "max": 10}
+    ]});
+    let charged: attenuo_core::DecisionRecord = serde_json::from_value(charged).unwrap();
+    let json = attenuo_audit::canonical_record_json(&charged);
+    assert!(
+        json.contains(
+            r#""budget":{"charged":[{"cap":0,"hop":0,"kind":"calls","max":1,"used_after":1},"#
+        ),
+        "{json}"
+    );
+    assert_eq!(
+        compute_entry_hash(8, &"11".repeat(32), &charged),
+        "aeeec4df27c4b372b736a3d09458a7a9798c0e01f9027d49a6d1acc3fb24e1b6"
+    );
+}
+
 /// Fuzzing F4: an entry whose `seq` is `u64::MAX`, with a correct hash, used to overflow
 /// `seq + 1` in the chain walk (a panic with overflow checks on). It is now a bad entry.
 #[test]

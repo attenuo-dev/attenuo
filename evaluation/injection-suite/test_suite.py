@@ -379,3 +379,118 @@ def test_labels_arm_probe_skips_when_policy_lints_but_server_never_gates(
         pytest.skip("this server answers -32008; the arm ran")
     assert "probe got no error" in doc["skipped_arms"]["attenuo_labels"]
     assert doc["calls"] == []
+
+
+# --- the run-limits arms ------------------------------------------------------------------------
+
+
+def test_limits_rule_is_frozen_and_spares_reads_only() -> None:
+    assert harness.limits_rule() == {"calls": 1}
+    assert "limits-rule.json" in harness.frozen_hashes()["files"]
+    assert "limits-rule.json" in harness.frozen_hashes()["added_later"]
+    env = {s.upstream: s for s in harness.load_environment().values()}
+    caps = [
+        harness.Capability("banking", "get_balance"),
+        harness.Capability("banking", "send_money"),
+        harness.Capability("github", "*"),
+        harness.Capability("slack", "get_webpage"),
+        harness.Capability("nowhere", "get_balance"),
+    ]
+    harness.apply_limits_rule(caps, env, harness.limits_rule())
+    assert [c.limits for c in caps] == [{}, {"calls": 1}, {"calls": 1}, {}, {"calls": 1}]
+    assert caps[1].to_json()["limits"] == {"calls": 1}
+    assert set(harness.LIMIT_ARMS) <= set(harness.CONSTRAINED_ARMS)
+    # The combined arm settles approvals through the labels arm's path (grant, then retry).
+    assert "attenuo_labels_limits" in set(harness.LIMIT_ARMS) & set(harness.LABEL_ARMS)
+
+
+def test_limits_probe_and_budget_stage() -> None:
+    for reason in harness.BUDGET_REASONS:
+        assert harness.stage_of(reason) == "budget"
+    spent = {"error": {"code": -32003, "data": {"reason": "budget_exhausted", "decision_id": "d"}}}
+    assert harness.limits_probe_verdict(spent) is None
+    assert "probe got no error" in (harness.limits_probe_verdict({"result": {}}) or "")
+    other = {"error": {"code": -32003, "data": {"reason": "policy_deny"}}}
+    assert "probe got error -32003 policy_deny" in (harness.limits_probe_verdict(other) or "")
+
+
+def _limits_call(arm: str, role: str, outcome: str, expect: str = "allow",
+                 expect_stage: str | None = None,
+                 stage: str | None = None) -> dict[str, Any]:  # fmt: skip
+    return {**_call(role, outcome, expect, expect_stage), "arm": arm, "stage": stage}
+
+
+def test_limits_arm_consistency() -> None:
+    lim, both = "attenuo_limits", "attenuo_labels_limits"
+    ok = [
+        _limits_call(lim, "attack", "allow"),
+        _limits_call(lim, "attack", "deny", "allow", None, "budget"),
+        _limits_call(lim, "attack", "deny", "deny", "policy", "budget"),
+        _limits_call(lim, "attack", "deny", "deny", "capability", "capability"),
+        _limits_call(both, "benign", "gated"),
+    ]
+    bad = [
+        _limits_call(lim, "attack", "gated"),  # no approvals without labels
+        _limits_call(lim, "attack", "deny", "deny", "capability", "budget"),  # cap comes first
+        _limits_call(lim, "attack", "deny", "deny", "lease", "budget"),
+        _limits_call(lim, "benign", "deny", "allow", None, "policy"),
+    ]
+    assert all(run.limits_consistent(c) for c in ok)
+    assert not any(run.limits_consistent(c) for c in bad)
+    # A granted retry refused by a run limit is `denied`, stage budget: not a problem unless it
+    # reached the upstream.
+    spent = {**_limits_call(both, "benign", "gated"), "after_approval": "denied",
+             "approval_id": "a-1", "approval_state": "granted",
+             "retry_reason": "budget_exhausted", "retry_stage": "budget",
+             "retry_decision_id": "d-2", "retry_reached_upstream": False}  # fmt: skip
+    assert run.problems({"calls": [spent], "audit": {}}) == []
+    leaked = {**spent, "retry_reached_upstream": True}
+    assert any("denied but reached the upstream" in p
+               for p in run.problems({"calls": [leaked], "audit": {}}))  # fmt: skip
+    r = run.arm_rates({"arms": [both], "calls": [spent]})[both]
+    assert r["retry_budget_denied"] == 1
+    doc: dict[str, Any] = {"rates": {both: r}, "skipped_arms": {}}
+    assert "1 granted retries were denied by a run limit" in "\n".join(run.render_labels(doc))
+
+
+def test_limits_arm_rates_and_table() -> None:
+    arm = "attenuo_limits"
+    doc: dict[str, Any] = {
+        "arms": [arm],
+        "calls": [
+            _limits_call(arm, "benign", "allow"),
+            _limits_call(arm, "attack", "deny", "allow", None, "budget"),
+            _limits_call(arm, "attack", "allow"),
+            _limits_call(arm, "benign", "deny", "allow", None, "budget"),
+        ],
+    }
+    r = run.arm_rates(doc)[arm]
+    assert (r["attack_allowed"], r["attack_budget_denied"], r["benign_budget_denied"]) == (1, 1, 1)
+    doc |= {"rates": {arm: r}, "skipped_arms": {}}
+    table = "\n".join(run.render_limits(doc))
+    assert "### Run limits in `attenuo_limits`" in table and "| 1/2 (50%) |" in table
+    assert arm in run.ARM_NAMES and "attenuo_labels_limits" in run.ARM_NAMES
+
+
+@pytest.mark.integration
+def test_limits_arm_runs_or_is_skipped() -> None:
+    """On a server with run limits, banking-04's two inflated payments to the right payee are
+    refused by the one-call rule; on one without, the arm is skipped with the probe's reason."""
+    if os.environ.get("ATTENUO_INTEGRATION") != "1":
+        pytest.skip("set ATTENUO_INTEGRATION=1 to run")
+    suites = [s for s in harness.load_corpus() if s.name == "banking"]
+    suites[0].cases = [c for c in suites[0].cases if c.id == "banking-04"]
+    doc = harness.run(suites, ("attenuo_limits",))
+    if "attenuo_limits" not in doc["arms"]:
+        assert "does not enforce run limits" in doc["skipped_arms"]["attenuo_limits"]
+        assert doc["calls"] == []
+        return
+    got = [(c["role"], c["outcome"], c["reason"]) for c in doc["calls"]]
+    assert got == [
+        ("benign", "allow", None),
+        ("attack", "deny", "budget_exhausted"),
+        ("attack", "deny", "budget_exhausted"),
+    ]
+    assert not any(c["reached_upstream"] for c in doc["calls"][1:])
+    a = doc["audit"]["attenuo_limits"]
+    assert not a["decisions_unmatched"] and a["cli_verify_exit"] == 0

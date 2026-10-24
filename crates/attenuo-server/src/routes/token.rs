@@ -59,7 +59,10 @@
 
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
 use attenuo_audit::LeaseStore;
+use attenuo_core::{CapabilitySet, Charge, Hop, LimitKind};
 use attenuo_token::{ExchangeRequest, AUTHORIZATION_DETAILS_TYPE};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -166,7 +169,7 @@ fn exchange_sync(
         obj.remove("client_secret");
         obj.remove("subject_token_dpop");
     }
-    let req = parse_request(value)?;
+    let mut req = parse_request(value)?;
     let presented = client_secret.is_some() || clientauth::basic_credentials(headers)?.is_some();
     if presented && state.actor_auth == ActorAuth::ActorToken {
         return Err(clientauth::invalid_request(
@@ -288,6 +291,12 @@ fn exchange_sync(
         now,
     )?;
     let dpop_bound = cnf.is_some();
+    // Run limits (ADR-0010): the child's `calls` and `sum` figures are clamped to what the
+    // parent hop has left now, not only to its static figures. What was asked is audited.
+    let asked = req.requested.clone();
+    if let Some(parent_hop) = parent.chain.hops.last() {
+        req.requested = clamp_to_remaining(state, parent_hop, &req.requested)?;
+    }
     let resp = req.execute_with(&state.issuer, now, not_after, cnf)?;
     // A parent token delegates to a given actor once, and an actor token authenticates one
     // exchange, keyed by its `jti` (see `crate::replay`). Recorded only once the exchange has
@@ -323,7 +332,7 @@ fn exchange_sync(
 
     let mut args = json!({
         "actor": req.actor,
-        "requested": req.requested,
+        "requested": asked,
         "parent_lease": parent_lease,
         "actor_auth": actor_auth,
         "dpop_bound": dpop_bound,
@@ -358,6 +367,55 @@ fn exchange_sync(
     let mut out = Json(resp).into_response();
     no_store(out.headers_mut());
     Ok(out)
+}
+
+/// Clamp the run limits of `requested` to what the capabilities of `parent` (the subject
+/// token's last hop) have left, read from the lease store
+/// ([`CapabilitySet::attenuate_with`]). A request the parent does not cover is returned as is,
+/// so the exchange refuses it with the usual error. Counters that cannot be read refuse the
+/// exchange (500): a child's figure cannot be made honest without them.
+fn clamp_to_remaining(
+    state: &AppState,
+    parent: &Hop,
+    requested: &CapabilitySet,
+) -> Result<CapabilitySet, ApiError> {
+    let mut probes = Vec::new();
+    for (i, cap) in parent.capabilities.iter().enumerate() {
+        if let Some(max) = cap.limits.calls {
+            probes.push(Charge::probe(
+                parent.lease.clone(),
+                i,
+                LimitKind::Calls,
+                None,
+                max,
+            ));
+        }
+        if let Some(sum) = &cap.limits.sum {
+            probes.push(Charge::probe(
+                parent.lease.clone(),
+                i,
+                LimitKind::Sum,
+                Some(sum.arg.clone()),
+                sum.max,
+            ));
+        }
+    }
+    if probes.is_empty() {
+        return Ok(requested.clone());
+    }
+    let used = state
+        .leases
+        .budget_used(&probes)
+        .map_err(|e| ApiError::internal(format!("budget counters unreadable: {e}")))?;
+    let left: HashMap<(usize, LimitKind), u64> = probes
+        .iter()
+        .zip(used)
+        .map(|(p, u)| ((p.cap, p.kind), p.max.saturating_sub(u)))
+        .collect();
+    Ok(parent
+        .capabilities
+        .attenuate_with(requested, |i, kind, _| left.get(&(i, kind)).copied())
+        .unwrap_or_else(|_| requested.clone()))
 }
 
 fn is_form(headers: &HeaderMap) -> bool {

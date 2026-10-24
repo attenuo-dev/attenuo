@@ -637,6 +637,7 @@ impl Authorizer for StaticAuthorizer {
             reason: reason.into(),
             decision_id: id,
             approval,
+            limit: None,
         }
     }
 

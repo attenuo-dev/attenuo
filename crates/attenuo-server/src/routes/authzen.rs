@@ -349,6 +349,17 @@ fn evaluate_value(
     if let Some((id, by)) = &d.consumed_approval {
         context["approval"] = json!({ "id": id, "by": by });
     }
+    // Run limits (ADR-0010): an evaluation is charged as a proxied call is. Only when a limit
+    // matched, so answers about unlimited calls are unchanged.
+    if d.budget.limited {
+        context["budget"] = crate::authz::budget_json(&d.budget);
+    }
+    if let Some(hit) = &d.limit {
+        context["limit"] = hit.to_json();
+    }
+    if let Some(charged) = &d.charged {
+        context["charged"] = json!(charged.charged);
+    }
     Ok(EvaluationResponse {
         decision: allow,
         context: Some(context),

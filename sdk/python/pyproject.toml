@@ -32,6 +32,8 @@ packages = ["src/attenuo"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Test this checkout's source even when the environment has another checkout installed.
+pythonpath = ["src"]
 asyncio_mode = "auto"
 markers = [
   "integration: runs the real attenuo-server and a fake MCP server (set ATTENUO_INTEGRATION=1)",

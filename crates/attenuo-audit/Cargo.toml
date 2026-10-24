@@ -24,6 +24,7 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 rusqlite = { workspace = true }
+ring = { workspace = true }
 
 [dev-dependencies]
 # Enables the `testing` hooks for this crate's own integration tests.

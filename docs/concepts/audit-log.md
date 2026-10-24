@@ -67,7 +67,7 @@ A `tool_result` record is written after every allowed mediated call that gets an
 
 The content is not stored. If the record cannot be written, the agent gets a `label_error` denial instead of the answer.
 
-An untrusted result taints the run (see [Writing policies](../guides/writing-policies.md#asking-for-approval-after-untrusted-output)). A decision record of a call on a tainted run has `labels: {tainted_by: [seq, ...]}`, the `seq` of the first `tool_result` record of each source, so an auditor can see what the run had read before a call. `decision_id`, `result`, `labels` and `approval` are omitted when absent, so records without them hash exactly as before.
+An untrusted result taints the run (see [Writing policies](../guides/writing-policies.md#asking-for-approval-after-untrusted-output)). A decision record of a call on a tainted run has `labels: {tainted_by: [seq, ...]}`, the `seq` of the first `tool_result` record of each source, so an auditor can see what the run had read before a call. A call charged against run limits records `budget: {charged: [{hop, cap, kind, arg, used_after, max}]}`, one entry per counter (`arg` absent for `calls`). `decision_id`, `result`, `labels`, `approval` and `budget` are omitted when absent, so records without them hash exactly as before.
 
 ## Approvals
 
@@ -172,6 +172,6 @@ Entries after the last checkpoint are protected by the hash chain only, and the 
 
 The checkpoint sink ships what the server signs; entries after the newest checkpoint are not covered until the next one is signed (at most `checkpoint_every` entries or `checkpoint_interval_seconds`).
 
-Revocations, policy reloads and dev root mints are appended to the log as admin actions (reason `admin_action`, server `attenuo`, subject `urn:attenuo:admin`, which no user can have). To pick out server events, filter on `kind` (anything but `decision`), or on `server = "attenuo"` and the tool (`token.*`, `lease.renew`, `admin.*`); no upstream or agent can use the name `attenuo`. The revoke response carries the `audit_id` of that record, or says that the append failed.
+Revocations, policy reloads, budget refunds (`admin.budget.refund`, naming the refunded decision) and dev root mints are appended to the log as admin actions (reason `admin_action`, server `attenuo`, subject `urn:attenuo:admin`, which no user can have). To pick out server events, filter on `kind` (anything but `decision`), or on `server = "attenuo"` and the tool (`token.*`, `lease.renew`, `admin.*`); no upstream or agent can use the name `attenuo`. The revoke response carries the `audit_id` of that record, or says that the append failed.
 
 More detail: [RFC-0001 section 7](../spec/rfc-0001-attenuo.md#7-audit-record-and-hash-chaining) and [design/server.md](../design/server.md#audit-convention-for-issuance).

@@ -13,6 +13,7 @@ use serde_json::Value;
 use crate::call::ToolCall;
 use crate::error::AttenuationError;
 use crate::jcs::value_eq;
+use crate::limits::{LimitError, LimitKind, Limits};
 use crate::names::NameError;
 
 /// A constraint on a single tool argument.
@@ -137,12 +138,16 @@ fn pattern_matches(pattern: &str, name: &str) -> bool {
 
 /// Permission to call tools matching `tool` on servers matching `server`, subject to
 /// `constraints` on arguments. Arguments not mentioned in `constraints` are unconstrained.
+/// `limits` bound how many matched calls, and how much in total, the run may make under it
+/// ([`crate::limits`]); absent (and omitted from the token) when there are none.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Capability {
     pub server: String,
     pub tool: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub constraints: BTreeMap<String, ArgConstraint>,
+    #[serde(default, skip_serializing_if = "Limits::is_empty")]
+    pub limits: Limits,
 }
 
 impl Capability {
@@ -151,12 +156,23 @@ impl Capability {
             server: server.into(),
             tool: tool.into(),
             constraints: BTreeMap::new(),
+            limits: Limits::default(),
         }
     }
 
     pub fn with_constraint(mut self, arg: impl Into<String>, c: ArgConstraint) -> Self {
         self.constraints.insert(arg.into(), c);
         self
+    }
+
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Check the capability's limits ([`Limits::validate`]).
+    pub fn validate_limits(&self) -> Result<(), LimitError> {
+        self.limits.validate(self)
     }
 
     /// Check the server and tool patterns against [`crate::names`]: `*`, `<prefix>*` or a
@@ -166,8 +182,14 @@ impl Capability {
         crate::names::check_call_pattern(&self.tool)
     }
 
-    /// Does this capability permit every call that `child` permits?
+    /// Does this capability permit every call that `child` permits, with limits no larger
+    /// ([`Limits::narrows`])?
     pub fn covers(&self, child: &Capability) -> bool {
+        self.covers_calls(child) && child.limits.narrows(&self.limits)
+    }
+
+    /// The call half of [`covers`](Self::covers): patterns and constraints, ignoring limits.
+    pub fn covers_calls(&self, child: &Capability) -> bool {
         if !pattern_covers(&self.server, &child.server) || !pattern_covers(&self.tool, &child.tool)
         {
             return false;
@@ -196,9 +218,10 @@ impl Capability {
             })
     }
 
-    /// Human-readable form used in errors and logs, e.g. `github:create_issue{repo=...}`.
+    /// Human-readable form used in errors and logs, e.g. `github:create_issue{repo=...}`,
+    /// with ` limits={...}` appended when the capability has limits.
     pub fn display(&self) -> String {
-        if self.constraints.is_empty() {
+        let mut s = if self.constraints.is_empty() {
             format!("{}:{}", self.server, self.tool)
         } else {
             let cs: Vec<String> = self
@@ -207,7 +230,12 @@ impl Capability {
                 .map(|(k, v)| format!("{k}={}", serde_json::to_string(v).unwrap_or_default()))
                 .collect();
             format!("{}:{}{{{}}}", self.server, self.tool, cs.join(","))
+        };
+        if !self.limits.is_empty() {
+            s.push_str(" limits=");
+            s.push_str(&serde_json::to_string(&self.limits).unwrap_or_default());
         }
+        s
     }
 }
 
@@ -248,6 +276,11 @@ impl CapabilitySet {
         self.0.iter().try_for_each(Capability::validate)
     }
 
+    /// [`Capability::validate_limits`] every member.
+    pub fn validate_limits(&self) -> Result<(), LimitError> {
+        self.0.iter().try_for_each(Capability::validate_limits)
+    }
+
     /// Does this set permit every call that `child` permits?
     ///
     /// Conservative: each child capability must be covered by a *single* parent capability.
@@ -259,19 +292,67 @@ impl CapabilitySet {
 
     /// Derive `requested` from `self`, failing if that would widen anything.
     ///
-    /// This is the attenuation step performed at every delegation hop.
+    /// This is the attenuation step performed at every delegation hop. Limits are clamped, not
+    /// refused ([`attenuate_with`](Self::attenuate_with) with nothing spent yet).
     pub fn attenuate(&self, requested: &CapabilitySet) -> Result<CapabilitySet, AttenuationError> {
+        self.attenuate_with(requested, |_, _, _| None)
+    }
+
+    /// [`attenuate`](Self::attenuate), with each requested capability's limits clamped at
+    /// exchange time (ADR-0010):
+    ///
+    /// - A requested capability that a parent capability covers as it is keeps its limits,
+    ///   lowered by `remaining` below.
+    /// - Otherwise the first parent capability that covers its calls
+    ///   ([`Capability::covers_calls`]) is its parent: limits the parent has and the request
+    ///   lacks are copied, and larger figures are lowered to the parent's
+    ///   ([`Limits::clamp_to`]).
+    /// - Then `calls` and `sum` are lowered further to `remaining(parent_index, kind, max)`
+    ///   when it returns `Some`: what the parent capability (by its index in `self`) has
+    ///   left of `max`. The server reads that from the lease store; the static check cannot.
+    ///
+    /// The result must then be covered by `self`, or the request fails as not covered. A
+    /// child requesting no limit under a limited parent so gets the parent's figure.
+    pub fn attenuate_with(
+        &self,
+        requested: &CapabilitySet,
+        remaining: impl Fn(usize, LimitKind, u64) -> Option<u64>,
+    ) -> Result<CapabilitySet, AttenuationError> {
         if requested.is_empty() {
             return Err(AttenuationError::Empty);
         }
+        let mut out = BTreeSet::new();
         for c in requested.0.iter() {
-            if !self.0.iter().any(|p| p.covers(c)) {
-                return Err(AttenuationError::NotCovered {
-                    requested: c.display(),
-                });
+            let not_covered = || AttenuationError::NotCovered {
+                requested: c.display(),
+            };
+            let (index, parent) = self
+                .0
+                .iter()
+                .enumerate()
+                .find(|(_, p)| p.covers(c))
+                .or_else(|| self.0.iter().enumerate().find(|(_, p)| p.covers_calls(c)))
+                .ok_or_else(not_covered)?;
+            let mut child = c.clone();
+            child.limits = c.limits.clamp_to(&parent.limits);
+            if let (Some(calls), Some(max)) = (child.limits.calls, parent.limits.calls) {
+                if let Some(left) = remaining(index, LimitKind::Calls, max) {
+                    child.limits.calls = Some(calls.min(left));
+                }
             }
+            if let (Some(sum), Some(p)) = (child.limits.sum.as_mut(), parent.limits.sum.as_ref()) {
+                if sum.arg == p.arg {
+                    if let Some(left) = remaining(index, LimitKind::Sum, p.max) {
+                        sum.max = sum.max.min(left);
+                    }
+                }
+            }
+            if !parent.covers(&child) {
+                return Err(not_covered());
+            }
+            out.insert(child);
         }
-        Ok(requested.clone())
+        Ok(CapabilitySet(out))
     }
 
     /// Does any capability in the set permit this call?

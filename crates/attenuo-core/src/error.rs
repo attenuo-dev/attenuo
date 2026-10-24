@@ -69,4 +69,11 @@ pub enum ChainError {
         #[source]
         source: crate::names::NameError,
     },
+    /// A capability of the hop carries a malformed limit (see [`crate::limits`]).
+    #[error("hop {index} has an invalid limit: {source}")]
+    InvalidLimit {
+        index: usize,
+        #[source]
+        source: crate::limits::LimitError,
+    },
 }

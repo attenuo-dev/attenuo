@@ -124,6 +124,7 @@ impl Row {
             result: None,
             labels: None,
             approval: None,
+            budget: None,
         }
     }
 }

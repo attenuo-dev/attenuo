@@ -23,6 +23,7 @@ Every call becomes one Cedar request.
 | `context.session` | output labels of the delegation run: `tainted` (bool) and `tainted_by` (set of `"<server>/<tool>"`); see [Asking for approval after untrusted output](#asking-for-approval-after-untrusted-output) |
 | `context.args_contain_untrusted`, `context.untrusted_args` | `false` and an empty set for now; argument matching is not built yet |
 | `context.approval` | `present` (bool) and `by` (`"user"`, `"operator"`, or `""` without an approval): whether this call carries a granted approval for its exact hash; see [Asking for approval after untrusted output](#asking-for-approval-after-untrusted-output) |
+| `context.budget` | what the token's run limits matching this call have left: `limited` (bool), `calls_remaining`, `amount_remaining` (Long; the largest Long when no such limit applies) and `destination_new` (bool); see [Run limits](#run-limits) |
 
 The action names the server as well as the tool. `action == Action::"github/read_file"` matches `read_file` on the upstream mounted as `github` and nothing else: a second upstream that also has a `read_file` tool (a malicious one, say) is not covered by that permit. To write a rule for every tool of one server, use the resource: `resource in Server::"github"`. To write one for every tool everywhere, leave `action` unconstrained or use `action in Action::"invoke"`.
 
@@ -152,6 +153,24 @@ The run's originating user grants the approval with their own ID token (`POST /a
 
 [`config/policies/output-labels.cedar`](../../config/policies/output-labels.cedar) has this rule and the mail rule from the design, with tests in `output-labels_test.yaml` next to it.
 
+### Run limits
+
+A capability in a token can carry `limits`: `calls` (at most this many calls), `sum: {arg, max}` (a total over one integer argument) and `calls_per: {arg, max}` (at most `max` calls per value of one argument). The server enforces them before Cedar, against every hop of the chain: a call over a limit is denied with `budget_exhausted`, and no policy or approval passes it. A policy cannot raise a limit, only explain or ask earlier, through `context.budget`:
+
+```cedar
+@id("confirm_last_call_of_a_budget")
+@obligation("approval")
+forbid (principal, action, resource)
+when {
+  context.budget.limited &&
+  context.budget.calls_remaining <= 1 &&
+  resource.destructive &&
+  !context.approval.present
+};
+```
+
+`calls_remaining` and `amount_remaining` are what is left before this call, the smallest over every matching limit. `destination_new` is false once the call's `calls_per` value has been used in an earlier allowed call. [`config/policies/run-limits.cedar`](../../config/policies/run-limits.cedar) has this rule and a repeat-payee rule, with tests in `run-limits_test.yaml`.
+
 ### Chain depth
 
 ```cedar
@@ -239,6 +258,7 @@ The harness builds a real `DelegationChain` and calls the same `PolicyEngine::au
 - **Valid chains only.** The chain is validated like a received one. A child wider than its parent, for example, is reported as a failed case with the reason, so a test cannot describe a delegation the server would refuse to issue.
 - **Defaults.** User `alice` at `https://idp.example`, authenticated a minute before `now`; time fixed at 1760000000; each hop lives an hour; lease ids are random. `policy_ids: []` asserts that no policy matched (a default deny).
 - **Output labels.** A case's `session: { tainted_by: [web/fetch] }` evaluates the call as part of a run that has read that source; `tainted: true` with no sources is a run whose taint state could not be read. Without `session` the run is untainted. `reason` also accepts `approval_required`. `approval: { by: user }` evaluates the call as a retry that carries a granted approval (`by` is `user` or `operator`); without it there is none.
+- **Run limits.** The harness keeps no counters. `budget: { calls_remaining: 1 }` sets `context.budget` for the case (`limited` defaults to `true` there; the other members default to an unlimited call's values). Capabilities in `chain` may carry `limits`, which are checked for narrowing like any other part of a capability.
 - **Mistakes in the file** (unknown keys, a missing `expect`, duplicate case names, an empty `cases`) are errors, not silent passes.
 
 ### Running

@@ -14,6 +14,7 @@
 //! Nothing here evaluates policy; the sibling crates call into this one after deciding.
 
 pub mod approval;
+pub mod budget;
 pub mod checkpoint;
 pub mod error;
 pub mod export;
@@ -25,6 +26,7 @@ pub mod shipped;
 pub mod sqlite;
 
 pub use approval::{Approval, ApprovalLabel, ApprovalMethod, ApprovalState, Approver};
+pub use budget::ChargeOutcome;
 pub use checkpoint::{
     verify_with_checkpoints, BadCheckpoint, Checkpoint, CheckpointKeys, SignedVerifyReport, Start,
     CHECKPOINT_CONTEXT,

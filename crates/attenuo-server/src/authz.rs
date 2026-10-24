@@ -6,20 +6,32 @@
 //! 1. **Leases.** Every lease in the chain must be known, unrevoked and unexpired
 //!    (`LeaseStore::check_all`). Otherwise: deny with `lease_revoked`, `lease_expired` or
 //!    `lease_unknown` (checked in that order), or `lease_error` if the store fails.
-//! 2. **Labels.** The taint state of the delegation run (`LeaseStore::labels` for the
-//!    chain id, ADR-0009). A store that cannot be read counts as tainted.
+//! 2. **Labels and budgets.** The taint state of the delegation run (`LeaseStore::labels`
+//!    for the chain id, ADR-0009); a store that cannot be read counts as tainted. And the
+//!    run limits (ADR-0010): every limited capability, in every hop, that matches the call
+//!    ([`attenuo_core::limits::charges_for`]) and what its counters hold
+//!    (`LeaseStore::budget_used`), as `context.budget` and as the limit check of step 4.
+//!    Unreadable counters deny a limited call with `budget_error`; an argument a limit
+//!    cannot count denies it with `limit_arg_invalid`.
 //! 3. **Approval.** A granted, unexpired approval for this call (same run, same calling hop's
 //!    lease, same call hash) is taken from the lease store and marked consumed
 //!    (`LeaseStore::take_approval`); Cedar then sees `context.approval.present` and `by`.
-//! 4. **Policy.** `PolicyEngine::authorize_labelled`: the capability stage, then Cedar, with
-//!    the run's labels as `context.session`. A deny through `@obligation("approval")` forbids
-//!    only is `approval_required`.
-//! 5. **Audit.** A [`DecisionRecord`] is appended to the hash-chained log, and its id is the
+//! 4. **Policy.** `PolicyEngine::authorize_labelled`: the capability stage (including the
+//!    limit check: a call that would take any matching counter past its `max` is denied with
+//!    `budget_exhausted`, before Cedar), then Cedar, with the run's labels as
+//!    `context.session` and the budget figures as `context.budget`. A deny through
+//!    `@obligation("approval")` forbids only is `approval_required`.
+//! 5. **Charge.** For an allowed call that matched limits, every counter is re-checked and
+//!    charged in one store transaction (`LeaseStore::charge`), so concurrent calls cannot
+//!    overspend: if one spent first, the decision becomes `budget_exhausted`; if the store
+//!    fails, `budget_error`. Denied calls are never charged.
+//! 6. **Audit.** A [`DecisionRecord`] is appended to the hash-chained log, and its id is the
 //!    decision id returned to the caller. If the append fails the call is denied with
 //!    `audit_error`: an action that cannot be recorded does not happen. An approval taken in
 //!    step 3 is given back when the call is not allowed or its record cannot be written, so
-//!    it is spent exactly when an allowed decision that names it is in the log.
-//! 6. **Pending approval.** For `approval_required`, a pending approval is stored (or the
+//!    it is spent exactly when an allowed decision that names it is in the log. A charge made
+//!    in step 5 is refunded the same way when the append fails (`LeaseStore::refund`).
+//! 7. **Pending approval.** For `approval_required`, a pending approval is stored (or the
 //!    pending one for the same call reused) and an `approval_request` record appended; the
 //!    caller gets its id and expiry ([`PipelineDecision::approval`]).
 //!
@@ -34,12 +46,20 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use attenuo_audit::{Approval, ApprovalLabel, ApprovalState, AuditSink, LeaseStore, RunLabel};
-use attenuo_core::{
-    chain_id_of, ApprovalInfo, Decision, DecisionRecord, DelegationChain, LeaseId, OutputLabel,
-    RecordKind, RecordLabels, ResultInfo, ToolCall, REASON_APPROVAL_REQUESTED,
+use attenuo_audit::{
+    Approval, ApprovalLabel, ApprovalState, AuditSink, ChargeOutcome, LeaseStore, RunLabel,
 };
-use attenuo_policy::{ApprovalContext, CallLabels, PolicyEngine, SessionLabels};
+use attenuo_core::limits::{
+    charges_for, REASON_BUDGET_ERROR, REASON_BUDGET_EXHAUSTED, REASON_LIMIT_ARG_INVALID,
+};
+use attenuo_core::{
+    chain_id_of, ApprovalInfo, BudgetCharge, Charge, Decision, DecisionRecord, DelegationChain,
+    LeaseId, LimitKind, OutputLabel, RecordBudget, RecordKind, RecordLabels, ResultInfo, ToolCall,
+    REASON_APPROVAL_REQUESTED,
+};
+use attenuo_policy::{
+    ApprovalContext, BudgetContext, BudgetRefusal, CallLabels, PolicyEngine, SessionLabels,
+};
 use attenuo_proxy::{
     ApprovalTicket, AuthDecision, AuthError, Authenticated, Authorizer, RequestAuth, Stage,
 };
@@ -78,6 +98,81 @@ pub struct RunLabels {
     pub error: Option<String>,
 }
 
+/// What [`Pipeline::budget_view`] found for a call: the run limits that match it (ADR-0010).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BudgetView {
+    /// Every counter the call would be charged against. Empty when no limit matches.
+    pub charges: Vec<Charge>,
+    /// What Cedar sees as `context.budget`, with the refusal of the limit check, if any.
+    pub context: BudgetContext,
+    /// For `budget_exhausted`: the limit the call would take past its `max`.
+    pub hit: Option<LimitHit>,
+}
+
+/// A run limit a call would exceed: the `limit` member of a `budget_exhausted` denial
+/// (JSON-RPC `-32003` `data.limit`, AuthZEN `context.limit`). The hop is named by its
+/// position, not its lease id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitHit {
+    pub hop: usize,
+    pub kind: LimitKind,
+    pub arg: Option<String>,
+    pub max: u64,
+    /// What the counter held before the call.
+    pub used: u64,
+}
+
+impl LimitHit {
+    fn of(charge: &Charge, used: u64) -> Self {
+        Self {
+            hop: charge.hop,
+            kind: charge.kind,
+            arg: charge.arg.clone(),
+            max: charge.max,
+            used,
+        }
+    }
+
+    /// `{hop, kind, arg, max, used}`, `arg` only for `sum` and `calls_per`.
+    pub fn to_json(&self) -> Value {
+        let mut v = serde_json::json!({
+            "hop": self.hop,
+            "kind": self.kind.as_str(),
+            "max": self.max,
+            "used": self.used,
+        });
+        if let Some(arg) = &self.arg {
+            v["arg"] = arg.clone().into();
+        }
+        v
+    }
+
+    fn detail(&self) -> String {
+        format!(
+            "limit `{}`{} of hop {} would be exceeded: max {}, used {}",
+            self.kind,
+            self.arg
+                .as_ref()
+                .map(|a| format!(" on `{a}`"))
+                .unwrap_or_default(),
+            self.hop,
+            self.max,
+            self.used
+        )
+    }
+}
+
+/// `context.budget` as JSON: `{limited, calls_remaining, amount_remaining, destination_new}`.
+/// What the AuthZEN response and the admin dry run report.
+pub fn budget_json(b: &BudgetContext) -> Value {
+    serde_json::json!({
+        "limited": b.limited,
+        "calls_remaining": b.calls_remaining,
+        "amount_remaining": b.amount_remaining,
+        "destination_new": b.destination_new,
+    })
+}
+
 /// SHA-256 (hex) and length of the RFC 8785 canonical JSON of an upstream result: what a
 /// `tool_result` record stores instead of the result. `Err` for a value with no canonical
 /// form (nothing parsed from JSON has one).
@@ -105,6 +200,13 @@ pub struct PipelineDecision {
     pub approval: Option<ApprovalTicket>,
     /// For an allowed call that consumed an approval: its id and `by` (`user` or `operator`).
     pub consumed_approval: Option<(Uuid, String)>,
+    /// The run limits that matched the call, as Cedar saw them (ADR-0010). The default when
+    /// none matched or the call was decided before the budget was read.
+    pub budget: BudgetContext,
+    /// For `budget_exhausted`: the limit that was hit.
+    pub limit: Option<LimitHit>,
+    /// For an allowed call that matched limits: what it charged (the record's `budget`).
+    pub charged: Option<RecordBudget>,
 }
 
 impl PipelineDecision {
@@ -218,10 +320,12 @@ impl Pipeline {
         // The record id is fixed first: a taken approval names the decision that consumed it.
         let decision_id = Uuid::new_v4();
         let mut taken: Option<Approval> = None;
-        let (decision, reason, policy_ids, mut diagnostics) = match leases {
+        let mut budget = BudgetView::default();
+        let (mut decision, mut reason, mut policy_ids, mut diagnostics) = match leases {
             Err((reason, detail)) => (Decision::Deny, reason.to_string(), Vec::new(), detail),
             Ok(()) => {
                 let run = self.run_labels(chain);
+                budget = self.budget_view(chain, call);
                 let mut diagnostics = Vec::new();
                 // Leases are live, so a granted approval for this exact call may be used.
                 taken = self.take_approval(chain, call, decision_id, now, &mut diagnostics);
@@ -232,6 +336,7 @@ impl Pipeline {
                         .and_then(|a| a.approver.as_ref())
                         .map(|a| ApprovalContext::by(a.method.by()))
                         .unwrap_or_default(),
+                    budget: budget.context.clone(),
                 };
                 let o = self.evaluate_policy(chain, call, &labels, now);
                 policy_time = Some(t1.elapsed());
@@ -242,6 +347,52 @@ impl Pipeline {
                 (o.decision, o.reason, o.policy_ids, diagnostics)
             }
         };
+        let mut limit = (reason == REASON_BUDGET_EXHAUSTED)
+            .then(|| budget.hit.clone())
+            .flatten();
+        // Charge an allowed call against every matching limit, re-checking in the store's
+        // transaction: a concurrent call may have spent the budget since it was read.
+        let mut charged: Option<RecordBudget> = None;
+        if decision.is_allow() && !budget.charges.is_empty() {
+            match self
+                .leases
+                .charge(&decision_id.to_string(), &budget.charges, now)
+            {
+                Ok(ChargeOutcome::Charged { used_after }) => {
+                    charged = Some(RecordBudget {
+                        charged: budget
+                            .charges
+                            .iter()
+                            .zip(used_after)
+                            .map(|(c, used_after)| BudgetCharge {
+                                hop: c.hop,
+                                cap: c.cap,
+                                kind: c.kind,
+                                arg: c.arg.clone(),
+                                used_after,
+                                max: c.max,
+                            })
+                            .collect(),
+                    });
+                }
+                Ok(ChargeOutcome::Exhausted { index, used }) => {
+                    let hit = LimitHit::of(&budget.charges[index], used);
+                    diagnostics.push(hit.detail());
+                    limit = Some(hit);
+                    (decision, reason, policy_ids) = (
+                        Decision::Deny,
+                        REASON_BUDGET_EXHAUSTED.to_string(),
+                        Vec::new(),
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "budget counters could not be charged; denying");
+                    diagnostics.push(format!("budget counters could not be charged: {e}"));
+                    (decision, reason, policy_ids) =
+                        (Decision::Deny, REASON_BUDGET_ERROR.to_string(), Vec::new());
+                }
+            }
+        }
         // An approval is spent only by a call it let through.
         if !decision.is_allow() {
             if let Some(a) = taken.take() {
@@ -267,6 +418,7 @@ impl Pipeline {
             info.by = Some(by.clone());
             record.approval = Some(info);
         }
+        record.budget = charged.clone();
         // The record moves into the log; the entry hands it back, so it is never cloned.
         let t2 = Instant::now();
         let appended = self.audit.append(record);
@@ -322,6 +474,9 @@ impl Pipeline {
                     diagnostics,
                     approval,
                     consumed_approval,
+                    budget: budget.context,
+                    limit,
+                    charged,
                 }
             }
             Err(e) => {
@@ -329,6 +484,9 @@ impl Pipeline {
                 self.metrics.audit_append_error();
                 if let Some(a) = &taken {
                     self.give_back(a, decision_id);
+                }
+                if charged.is_some() {
+                    self.refund_unrecorded(decision_id, now);
                 }
                 diagnostics.push(format!("audit append failed: {e}"));
                 PipelineDecision {
@@ -340,6 +498,9 @@ impl Pipeline {
                     diagnostics,
                     approval: None,
                     consumed_approval: None,
+                    budget: budget.context,
+                    limit: None,
+                    charged: None,
                 }
             }
         }
@@ -370,6 +531,88 @@ impl Pipeline {
                 diagnostics.push(format!("approval store unreadable: {e}"));
                 None
             }
+        }
+    }
+
+    /// The run limits that match `call` and what their counters hold (ADR-0010), read without
+    /// charging anything. Fails closed: an argument a limit cannot count refuses the call with
+    /// `limit_arg_invalid`, counters that cannot be read refuse it with `budget_error`, and a
+    /// call that would take any counter past its `max` is refused with `budget_exhausted`.
+    /// The admin dry run (`POST /admin/policies/evaluate`) uses this too.
+    pub fn budget_view(&self, chain: &DelegationChain, call: &ToolCall) -> BudgetView {
+        let refused = |reason: &str, detail: String| BudgetContext {
+            limited: true,
+            refusal: Some(BudgetRefusal {
+                reason: reason.to_string(),
+                detail,
+            }),
+            ..BudgetContext::default()
+        };
+        let charges = match charges_for(chain, call) {
+            Ok(c) => c,
+            Err(e) => {
+                return BudgetView {
+                    context: refused(REASON_LIMIT_ARG_INVALID, e.to_string()),
+                    ..BudgetView::default()
+                }
+            }
+        };
+        if charges.is_empty() {
+            return BudgetView::default();
+        }
+        let used = match self.leases.budget_used(&charges) {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::error!(error = %e, "budget counters unreadable; denying the limited call");
+                return BudgetView {
+                    context: refused(
+                        REASON_BUDGET_ERROR,
+                        format!("budget counters unreadable: {e}"),
+                    ),
+                    charges,
+                    hit: None,
+                };
+            }
+        };
+        let left = |c: &Charge, u: u64| i64::try_from(c.max.saturating_sub(u)).unwrap_or(i64::MAX);
+        let mut context = BudgetContext {
+            limited: true,
+            ..BudgetContext::default()
+        };
+        let mut hit = None;
+        for (c, &u) in charges.iter().zip(&used) {
+            match c.kind {
+                LimitKind::Calls => {
+                    context.calls_remaining = context.calls_remaining.min(left(c, u))
+                }
+                LimitKind::Sum => {
+                    context.amount_remaining = context.amount_remaining.min(left(c, u))
+                }
+                LimitKind::CallsPer => context.destination_new &= u == 0,
+            }
+            if hit.is_none() && u.checked_add(c.amount).is_none_or(|n| n > c.max) {
+                hit = Some(LimitHit::of(c, u));
+            }
+        }
+        if let Some(h) = &hit {
+            context.refusal = Some(BudgetRefusal {
+                reason: REASON_BUDGET_EXHAUSTED.to_string(),
+                detail: h.detail(),
+            });
+        }
+        BudgetView {
+            charges,
+            context,
+            hit,
+        }
+    }
+
+    /// Refund the charge of a decision whose record could not be written, so a budget is spent
+    /// exactly when an allowed decision that charged it is in the log. A failed refund leaves
+    /// the budget spent (fails closed) and is logged.
+    fn refund_unrecorded(&self, decision_id: Uuid, now: OffsetDateTime) {
+        if let Err(e) = self.leases.refund(&decision_id.to_string(), now) {
+            tracing::error!(error = %e, decision = %decision_id, "could not refund an unrecorded charge");
         }
     }
 
@@ -867,6 +1110,7 @@ impl Authorizer for ServerAuthorizer {
             reason: d.reason,
             decision_id: d.decision_id,
             approval: d.approval,
+            limit: d.limit.as_ref().map(LimitHit::to_json),
         }
     }
 
@@ -1218,5 +1462,218 @@ mod tests {
         let chains = cache.chains.lock().unwrap();
         assert_eq!(chains.len(), 1);
         assert!(chains.contains_key(&VerifiedTokens::key("c")));
+    }
+}
+
+/// Run limits in the pipeline (ADR-0010). The multi-hop, concurrent and HTTP-level cases are
+/// in `tests/run_limits.rs`; these use the pipeline directly, with a store or a log that can
+/// be made to fail.
+#[cfg(test)]
+mod budget_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+    use attenuo_audit::{
+        AuditEntry, AuditError, MemoryAudit, MemoryLeaseStore, SqliteLeaseStore, VerifyReport,
+    };
+    use attenuo_core::{AgentId, Capability, CapabilitySet, LeaseId, Limits, OriginatingUser};
+    use attenuo_policy::PolicyEngineBuilder;
+    use serde_json::json;
+    use time::Duration;
+
+    /// A memory log whose appends can be made to fail.
+    #[derive(Default)]
+    struct FlakyAudit {
+        inner: MemoryAudit,
+        fail: AtomicBool,
+    }
+
+    impl AuditSink for FlakyAudit {
+        fn append(&self, record: DecisionRecord) -> Result<AuditEntry, AuditError> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(AuditError::Storage("disk full".into()));
+            }
+            self.inner.append(record)
+        }
+        fn head(&self) -> Result<Option<AuditEntry>, AuditError> {
+            self.inner.head()
+        }
+        fn range(&self, from_seq: u64, limit: usize) -> Result<Vec<AuditEntry>, AuditError> {
+            self.inner.range(from_seq, limit)
+        }
+        fn verify_chain(&self) -> Result<VerifyReport, AuditError> {
+            self.inner.verify_chain()
+        }
+    }
+
+    const POLICY: &str = r#"
+permit(principal, action, resource);
+@id("no_big_payments")
+forbid(principal, action == Action::"bank/send", resource)
+when { context.input has amount && context.input.amount > 1000 };
+"#;
+
+    fn chain(limits: Limits, now: OffsetDateTime) -> DelegationChain {
+        DelegationChain::root(
+            OriginatingUser {
+                subject: "alice".into(),
+                issuer: "idp".into(),
+                authenticated_at: now,
+                attributes: Default::default(),
+            },
+            AgentId::new("planner"),
+            CapabilitySet::from_iter([Capability::new("bank", "send").with_limits(limits)]),
+            now,
+            Duration::hours(1),
+            LeaseId::new("l1"),
+        )
+        .unwrap()
+    }
+
+    fn pipeline(leases: Arc<dyn LeaseStore>, audit: Arc<dyn AuditSink>) -> Pipeline {
+        let engine = PolicyEngineBuilder::new()
+            .with_catalog(
+                attenuo_policy::ToolCatalog::new().with(
+                    "bank",
+                    "send",
+                    attenuo_policy::ToolAttrs::new()
+                        .with_input("amount", attenuo_policy::ArgType::Long),
+                ),
+            )
+            .with_policies_str(POLICY)
+            .build()
+            .unwrap();
+        Pipeline::new(Arc::new(RwLock::new(engine)), leases, audit)
+    }
+
+    fn send(amount: Value) -> ToolCall {
+        ToolCall::new("bank", "send", json!({ "to": "emma", "amount": amount }))
+    }
+
+    #[test]
+    fn charges_allowed_calls_and_records_what_was_left() {
+        let now = OffsetDateTime::now_utc();
+        let leases = Arc::new(MemoryLeaseStore::new());
+        leases
+            .register(&LeaseId::new("l1"), None, now + Duration::hours(1))
+            .unwrap();
+        let audit = Arc::new(MemoryAudit::new());
+        let p = pipeline(leases, audit.clone());
+        let c = chain(Limits::default().with_calls(2).with_sum("amount", 50), now);
+
+        let d = p.decide(&c, &send(json!(40)), now);
+        assert!(d.is_allow(), "{d:?}");
+        assert_eq!(
+            d.budget.calls_remaining, 2,
+            "Cedar sees the figures before the call"
+        );
+        assert_eq!(d.budget.amount_remaining, 50);
+        let record = &audit.snapshot().unwrap()[0].record;
+        let charged = record.budget.as_ref().unwrap();
+        assert_eq!(
+            charged
+                .charged
+                .iter()
+                .map(|c| (c.kind, c.used_after, c.max))
+                .collect::<Vec<_>>(),
+            vec![(LimitKind::Calls, 1, 2), (LimitKind::Sum, 40, 50)]
+        );
+
+        // 20 more would take the sum to 60: refused before Cedar, with the limit named.
+        let d = p.decide(&c, &send(json!(20)), now);
+        assert_eq!(d.reason, REASON_BUDGET_EXHAUSTED);
+        let hit = d.limit.unwrap();
+        assert_eq!(
+            (hit.kind, hit.max, hit.used, hit.hop),
+            (LimitKind::Sum, 50, 40, 0)
+        );
+        assert_eq!(hit.to_json()["arg"], "amount");
+        assert!(audit.snapshot().unwrap()[1].record.budget.is_none());
+        // 10 still fits.
+        assert!(p.decide(&c, &send(json!(10)), now).is_allow());
+    }
+
+    #[test]
+    fn denied_call_is_not_charged() {
+        let now = OffsetDateTime::now_utc();
+        let leases = Arc::new(MemoryLeaseStore::new());
+        leases
+            .register(&LeaseId::new("l1"), None, now + Duration::hours(1))
+            .unwrap();
+        let p = pipeline(leases.clone(), Arc::new(MemoryAudit::new()));
+        let c = chain(Limits::default().with_calls(1), now);
+        // Cedar forbids it: nothing is spent, so the next permitted call still has its budget.
+        let d = p.decide(&c, &send(json!(5000)), now);
+        assert_eq!(d.reason, attenuo_policy::REASON_POLICY_DENY);
+        assert!(d.charged.is_none());
+        assert!(p.decide(&c, &send(json!(5)), now).is_allow());
+        assert_eq!(
+            p.decide(&c, &send(json!(5)), now).reason,
+            REASON_BUDGET_EXHAUSTED
+        );
+    }
+
+    #[test]
+    fn negative_or_string_amount_is_refused() {
+        let now = OffsetDateTime::now_utc();
+        let leases = Arc::new(MemoryLeaseStore::new());
+        leases
+            .register(&LeaseId::new("l1"), None, now + Duration::hours(1))
+            .unwrap();
+        let p = pipeline(leases, Arc::new(MemoryAudit::new()));
+        let c = chain(Limits::default().with_sum("amount", 5000), now);
+        for amount in [json!("1500"), json!(-1200), json!(1.5)] {
+            let d = p.decide(&c, &send(amount.clone()), now);
+            assert_eq!(d.reason, REASON_LIMIT_ARG_INVALID, "{amount}");
+            assert!(d.budget.limited);
+        }
+    }
+
+    #[test]
+    fn charge_and_audit_append_commit_together() {
+        let now = OffsetDateTime::now_utc();
+        let leases = Arc::new(MemoryLeaseStore::new());
+        leases
+            .register(&LeaseId::new("l1"), None, now + Duration::hours(1))
+            .unwrap();
+        let audit = Arc::new(FlakyAudit::default());
+        let p = pipeline(leases.clone(), audit.clone());
+        let c = chain(Limits::default().with_calls(1), now);
+        audit.fail.store(true, Ordering::SeqCst);
+        let d = p.decide(&c, &send(json!(1)), now);
+        assert_eq!(d.reason, REASON_AUDIT_ERROR);
+        // The charge was refunded: the call that can be recorded gets the budget.
+        audit.fail.store(false, Ordering::SeqCst);
+        assert!(p.decide(&c, &send(json!(1)), now).is_allow());
+        assert_eq!(
+            p.decide(&c, &send(json!(1)), now).reason,
+            REASON_BUDGET_EXHAUSTED
+        );
+    }
+
+    #[test]
+    fn unreadable_counters_deny() {
+        let now = OffsetDateTime::now_utc();
+        let leases = Arc::new(SqliteLeaseStore::open_in_memory().unwrap());
+        leases
+            .register(&LeaseId::new("l1"), None, now + Duration::hours(1))
+            .unwrap();
+        leases
+            .with_connection(|c| Ok(c.execute_batch("DROP TABLE budget_counters")?))
+            .unwrap();
+        let p = pipeline(leases, Arc::new(MemoryAudit::new()));
+        let d = p.decide(
+            &chain(Limits::default().with_calls(5), now),
+            &send(json!(1)),
+            now,
+        );
+        assert_eq!(d.reason, REASON_BUDGET_ERROR);
+        assert!(
+            d.diagnostics.iter().any(|m| m.contains("unreadable")),
+            "{d:?}"
+        );
+        // A call no limit applies to does not read the counters at all.
+        let free = chain(Limits::default(), now);
+        assert!(p.decide(&free, &send(json!(1)), now).is_allow());
     }
 }

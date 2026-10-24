@@ -1,0 +1,70 @@
+# Policy tests for run-limits.cedar. Run with:
+#   attenuo policy test config/policies/run-limits_test.yaml
+#
+# The harness keeps no counters: `budget` sets what Cedar sees (context.budget). The limits
+# themselves are enforced by the server before Cedar, which these cases do not exercise.
+policies: ./run-limits.cedar
+catalog:
+  banking:
+    get_balance: { readonly: true }
+    send_money: { sensitive: true, inputs: { recipient: string, amount: long } }
+  workspace:
+    send_email: {}
+cases:
+  - name: a call no limit applies to is allowed
+    chain: [assistant]
+    call: { server: workspace, tool: send_email, arguments: { to: carol@acme.example } }
+    expect: allow
+    reason: policy_allow
+
+  - name: a limited call with budget to spare is allowed
+    chain: [assistant]
+    budget: { calls_remaining: 3 }
+    call: { server: workspace, tool: send_email, arguments: { to: carol@acme.example } }
+    expect: allow
+    reason: policy_allow
+
+  - name: the last call of a budget asks the user
+    chain: [assistant]
+    budget: { calls_remaining: 1 }
+    call: { server: workspace, tool: send_email, arguments: { to: carol@acme.example } }
+    expect: deny
+    reason: approval_required
+    policy_ids: [confirm_last_call_of_a_budget]
+
+  - name: with a granted approval the last call goes through
+    chain: [assistant]
+    budget: { calls_remaining: 1 }
+    approval: { by: user }
+    call: { server: workspace, tool: send_email, arguments: { to: carol@acme.example } }
+    expect: allow
+    reason: policy_allow
+
+  - name: a read-only call never asks, whatever is left
+    chain: [assistant]
+    budget: { calls_remaining: 1 }
+    call: { server: banking, tool: get_balance }
+    expect: allow
+    reason: policy_allow
+
+  - name: a first payment to a payee is allowed
+    chain: [assistant]
+    budget: { calls_remaining: 5, amount_remaining: 100, destination_new: true }
+    call:
+      server: banking
+      tool: send_money
+      arguments: { recipient: FR00EMMA00000000000003, amount: 10 }
+    expect: allow
+    reason: policy_allow
+
+  - name: a repeat payment to the same payee is refused outright
+    chain: [assistant]
+    budget: { calls_remaining: 5, amount_remaining: 100, destination_new: false }
+    approval: { by: user }
+    call:
+      server: banking
+      tool: send_money
+      arguments: { recipient: FR00EMMA00000000000003, amount: 10 }
+    expect: deny
+    reason: policy_deny
+    policy_ids: [no_repeat_payment_to_a_payee]

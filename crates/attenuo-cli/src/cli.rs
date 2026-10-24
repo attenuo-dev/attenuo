@@ -120,7 +120,8 @@ pub struct RootArgs {
     /// The root agent.
     #[arg(long)]
     pub agent: String,
-    /// Capability `server:tool` (globs allowed), or a full capability as a JSON object.
+    /// Capability `server:tool` (globs allowed), or a full capability as a JSON object (with
+    /// `constraints` and run `limits`, e.g. `{"server":"bank","tool":"send_money","limits":{"calls":1}}`).
     /// Repeatable; plain `server:tool` values may also be comma-separated. Omit to take the server's `[[root_grants]]` ceiling.
     #[arg(long = "cap")]
     pub caps: Vec<String>,
@@ -233,8 +234,10 @@ pub struct ExchangeArgs {
     /// values may also be comma-separated. Without it, any authenticated agent may.
     #[arg(long = "may-act", value_name = "AGENT")]
     pub may_act: Vec<String>,
-    /// Capability `server:tool`, or a full capability as a JSON object. Repeatable; plain
-    /// `server:tool` values may also be comma-separated. Must be covered by the parent's capabilities.
+    /// Capability `server:tool`, or a full capability as a JSON object (with `constraints` and
+    /// run `limits`). Repeatable; plain `server:tool` values may also be comma-separated. Must
+    /// be covered by the parent's capabilities; limits are inherited from the parent and
+    /// clamped to what it has left.
     #[arg(long = "cap", required = true)]
     pub caps: Vec<String>,
     /// Requested lifetime in seconds (clamped to the parent's expiry).
@@ -699,7 +702,8 @@ pub enum AuthzenCmd {
 }
 
 /// Turn `--cap` values into capability objects. A value starting with `{` is a full
-/// capability (JSON, may carry constraints); anything else is `server:tool[,server:tool...]`.
+/// capability (JSON, may carry constraints and limits); anything else is
+/// `server:tool[,server:tool...]`.
 pub fn parse_caps(raw: &[String]) -> anyhow::Result<Vec<Value>> {
     let mut out = Vec::new();
     for item in raw {
@@ -1082,6 +1086,20 @@ mod tests {
         assert!(parse_caps(&["nocolon".into()]).is_err());
         assert!(parse_caps(&["github:".into()]).is_err());
         assert!(parse_caps(&[r#"{"server":1}"#.into()]).is_err());
+        // Run limits (ADR-0010) pass through; a kind this version does not know is refused.
+        let limited = parse_caps(&[
+            r#"{"server":"bank","tool":"send_money","limits":{"calls":1,"sum":{"arg":"amount","max":10}}}"#.into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            limited[0]["limits"],
+            json!({"calls": 1, "sum": {"arg": "amount", "max": 10}})
+        );
+        assert!(parse_caps(&[
+            r#"{"server":"bank","tool":"send_money","limits":{"distinct":{"arg":"to","max":1}}}"#
+                .into()
+        ])
+        .is_err());
     }
 
     #[test]
