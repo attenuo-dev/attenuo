@@ -35,7 +35,8 @@ pub struct ApiError {
     /// Stable sub-code, sent as `error_description` (RFC 6749 §5.2) when set.
     pub description: Option<&'static str>,
     /// The id of the `deny` audit record this refusal wrote, when it wrote one (a refused
-    /// token exchange whose subject token verified). Sent as `decision_id` in the body and in
+    /// token exchange whose subject token verified, or a refused renewal whose token
+    /// verified). Sent as `decision_id` in the body and in
     /// the `X-Attenuo-Decision-Id` header.
     pub decision_id: Option<uuid::Uuid>,
 }

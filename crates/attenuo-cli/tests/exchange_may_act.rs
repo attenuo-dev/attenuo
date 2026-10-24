@@ -1,4 +1,4 @@
-//! `attenuo token exchange --no-delegation | --may-act` against a real server: what the new
+//! `attenuo token exchange` and `token root` with `--no-delegation | --may-act` against a real server: what the new
 //! token's `may_act` says, and who can exchange it next.
 
 // Configs are built field by field from `Config::default()`, as in the server tests.
@@ -112,6 +112,52 @@ async fn no_delegation_makes_a_token_nobody_may_exchange() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("(may_act)"), "{err}");
     assert!(err.contains("\ndecision "), "{err}");
+    let refused_id = err
+        .lines()
+        .find_map(|l| l.strip_prefix("decision "))
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // The refusal is found by tool and decision (it is kind `decision`, not `exchange`), and
+    // `audit show --id` opens it.
+    let audit = |args: &[&str]| {
+        let mut c = attenuo();
+        c.env("ATTENUO_ADMIN_TOKEN", ADMIN)
+            .args(["--server", &url])
+            .args(args);
+        c
+    };
+    let lines = ok(&run(audit(&[
+        "--json",
+        "audit",
+        "tail",
+        "--tool",
+        "token.exchange",
+        "--decision",
+        "deny",
+    ]))
+    .await);
+    let refused: Vec<Value> = lines
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(refused.len(), 1, "{lines}");
+    let record = &refused[0]["record"];
+    assert_eq!(record["id"], refused_id.as_str());
+    assert_eq!(record["kind"], "decision");
+    assert_eq!(record["reason"], "exchange_actor_not_permitted");
+    let shown = ok(&run(audit(&["audit", "show", "--id", &refused_id])).await);
+    assert!(shown.contains("DENY  attenuo/token.exchange"), "{shown}");
+    assert!(
+        shown.contains("reason=exchange_actor_not_permitted"),
+        "{shown}"
+    );
+    let issued = ok(&run(audit(&["audit", "export", "--kind", "exchange"])).await);
+    assert!(
+        !issued.contains(&refused_id),
+        "--kind exchange lists issued exchanges only"
+    );
 
     // Without either flag the new token carries no `may_act`: anyone authenticated may
     // exchange it (it does not inherit the parent's list).
@@ -137,6 +183,40 @@ async fn no_delegation_makes_a_token_nobody_may_exchange() {
     let open = open["access_token"].as_str().unwrap().to_string();
     assert_eq!(may_act(&open), None);
     ok(&run(exchange(&open, "reviewer", &[])).await);
+
+    // `token root --no-delegation`: the root token carries `may_act: []`, so no agent may
+    // exchange it; an all-empty `--may-act` on `token root` is refused before sending, and the
+    // two flags conflict there too.
+    let root_cmd = |subject: &str, extra: &[&str]| {
+        let mut c = attenuo();
+        c.env("ATTENUO_ADMIN_TOKEN", ADMIN)
+            .args(["--server", &url, "--json", "token", "root"])
+            .args([
+                "--subject",
+                subject,
+                "--agent",
+                "planner",
+                "--cap",
+                "github:*",
+            ])
+            .args(extra);
+        c
+    };
+    let sealed: Value =
+        serde_json::from_str(&ok(&run(root_cmd("carol", &["--no-delegation"])).await)).unwrap();
+    let sealed = sealed["access_token"].as_str().unwrap().to_string();
+    assert_eq!(may_act(&sealed), Some(Vec::new()));
+    for actor in ["coder", "reviewer"] {
+        let out = run(exchange(&sealed, actor, &[])).await;
+        assert_eq!(out.status.code(), Some(1));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("(may_act)"), "{err}");
+    }
+    let out = run(root_cmd("dave", &["--may-act", " , "])).await;
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--no-delegation"));
+    let out = run(root_cmd("dave", &["--no-delegation", "--may-act", "coder"])).await;
+    assert_eq!(out.status.code(), Some(2), "clap usage error");
 
     // An empty --may-act is refused before anything is sent, and the two flags conflict.
     let out = run(exchange(&root, "reviewer", &["--may-act", ""])).await;

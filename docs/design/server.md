@@ -347,18 +347,22 @@ sequenceDiagram
     end
     R->>L: check_all(ancestor leases)
     alt an ancestor is revoked, expired or unknown
-        R-->>C: 400 invalid_grant (lease_revoked / lease_expired / lease_unknown)
+        R->>G: append(deny, lease reason, attenuo / lease.renew)
+        R-->>C: 400 invalid_grant (lease_revoked / lease_expired / lease_unknown), decision_id
     end
     R->>R: new = max(current, min(now + lease_interval, token exp, parent lease expiry))
     R->>L: renew(lease, new, now)
     alt own lease revoked or unknown
-        R-->>C: 400 invalid_grant
+        R->>G: append(deny, lease_revoked / lease_unknown, attenuo / lease.renew)
+        R-->>C: 400 invalid_grant, decision_id
     end
     R->>G: append(allow, lease_renewed, attenuo / lease.renew)
     R-->>C: {lease, expires_at, expires_in}
 ```
 
 Own-lease expiry is not an error: a lapsed but unrevoked lease is revived, provided the token has not expired and the ancestors are live. If the audit append fails the previous expiry is restored and the call fails. `[issuer] lease_interval_seconds` (default 300, must be positive) sets the interval used at issuance and renewal. Agents should renew at a fraction of it, for example every interval / 3.
+
+A refused renewal is audited once the token verified and its DPoP proof passed: `renew_sync` verifies both, then `renew_verified` returns the response or a refusal with a lease reason (`RENEW_REFUSAL_REASONS` in `routes::renew`), which goes through `Pipeline::record_rejection` as a `deny` record of kind `decision` with the token's chain, server `attenuo`, tool `lease.renew`, and the digest of `{lease, ancestor, dpop_bound}`. The 400 carries its id. Tokens or proofs that fail verification and lease store errors are not recorded (SR-18).
 
 ## Operations
 
@@ -396,6 +400,5 @@ Non-MCP endpoints answer errors as `{"error": "<code>", "detail": "<text>"}` wit
 - SQLite calls run on tokio's blocking pool, serialised by one connection per store behind a mutex. That is correct and keeps the chain linear, but write throughput is that of a single SQLite writer; a dedicated writer thread with group commit would batch fsyncs and is not built.
 - Checkpoints are signed by the key the server holds. They detect truncation and rewrites by anyone who does not control the server process; copy them off the host for the rest.
 - No lease cache and no push channel: every request reads the registry, and external PEPs using the AuthZEN endpoint learn of revocation only by asking.
-- Failed renewals are not audited (only successful ones).
 - List filtering does not cover the `GET` listen stream. The spec lets a server send a response on it when resuming a stream (`Last-Event-ID`), and such a replayed list response is passed through unfiltered. Not seen in practice; fixing it means tracking which request ids are in flight per session.
 - List filtering is by capability only, not by Cedar policy; and a resource template is listed whenever any `resources/read` capability for the server exists, even if every `uri` constraint would exclude what the template expands to.

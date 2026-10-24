@@ -418,7 +418,8 @@ impl Metrics {
             "decisions_total",
             "Decision records by outcome and reason code: pipeline decisions (MCP proxy and \
              AuthZEN), requests the proxy refused and recorded before a decision, and \
-             refused token exchanges whose subject token verified. Unauthenticated requests \
+             refused token exchanges and lease renewals whose token verified. \
+             Unauthenticated requests \
              are not counted.",
             "counter",
         );
