@@ -58,7 +58,8 @@ Mint a root (hop 0) token. This uses the development endpoint, so it needs the a
 | `--cap` | Capability to request. Omit to take the `[[root_grants]]` ceiling. |
 | `--ttl-seconds` | Requested lifetime. |
 | `--attr` | User attribute. Repeatable. |
-| `--may-act <AGENT>` | Only this agent may exchange the root token (RFC 8693 `may_act`). Repeatable, or comma-separated. Must be within the `[[root_grants]]` entry's `may_act` when it has one; without the flag the grant's `may_act` applies. |
+| `--may-act <AGENT>` | Only this agent may exchange the root token (RFC 8693 `may_act`). Repeatable, or comma-separated. Must be within the `[[root_grants]]` entry's `may_act` when it has one. Without it and without `--no-delegation` the grant's `may_act` applies; when the grant has none, or the server has no `[[root_grants]]`, the root token has no `may_act`, so any authenticated agent may exchange it. Values that are all empty are refused. |
+| `--no-delegation` | Send `may_act: []`: no agent may exchange the root token. An empty list is within any grant's `may_act`. Cannot be combined with `--may-act`. |
 | `--dpop-key PATH` | Bind the root token to this DPoP key (a private JWK from `key gen --dpop`). |
 | `--print token\|lease` | Print only that value, for scripts. |
 

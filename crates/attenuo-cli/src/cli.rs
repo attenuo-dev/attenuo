@@ -140,10 +140,19 @@ pub struct RootArgs {
     pub attrs: Vec<(String, Value)>,
     /// RFC 8693 `may_act` for the root token: an agent allowed to exchange it next. Repeatable;
     /// values may also be comma-separated. Must be within the `[[root_grants]]` entry's
-    /// `may_act` when it has one. Without it the grant's `may_act` applies (or, if none, any
-    /// authenticated agent may).
-    #[arg(long = "may-act", value_name = "AGENT")]
+    /// `may_act` when it has one. Without it (and without `--no-delegation`) the grant's
+    /// `may_act` applies; when the grant has none, or the server has no `[[root_grants]]`, the
+    /// root token carries no `may_act`, so any authenticated agent may exchange it.
+    #[arg(
+        long = "may-act",
+        value_name = "AGENT",
+        conflicts_with = "no_delegation"
+    )]
     pub may_act: Vec<String>,
+    /// Send `may_act: []`: no agent may exchange the root token. Always within a
+    /// `[[root_grants]]` entry's `may_act`.
+    #[arg(long)]
+    pub no_delegation: bool,
     /// Bind the root token to this DPoP key (a private JWK from `attenuo key gen --dpop`).
     #[arg(long, value_name = "PATH")]
     pub dpop_key: Option<std::path::PathBuf>,
@@ -153,11 +162,6 @@ pub struct RootArgs {
 }
 
 impl RootArgs {
-    /// `--may-act` values, split on commas, without empties.
-    pub fn may_act(&self) -> Vec<String> {
-        split_agents(&self.may_act)
-    }
-
     /// The JSON body for `POST /admin/root-token`.
     pub fn request_body(&self) -> anyhow::Result<Value> {
         let mut body = serde_json::Map::new();
@@ -180,12 +184,38 @@ impl RootArgs {
                     .into(),
             );
         }
-        let may_act = self.may_act();
-        if !may_act.is_empty() {
+        if let Some(may_act) = self.may_act_claim()? {
             body.insert("may_act".into(), serde_json::json!({ "sub": may_act }));
         }
         Ok(Value::Object(body))
     }
+
+    /// The `may_act` to send: `None` without `--may-act` and `--no-delegation` (the grant's
+    /// applies), `Some([])` with `--no-delegation`. `--may-act` values that are all empty are
+    /// refused rather than dropped, since sending nothing would fall back to the grant's list,
+    /// or to none at all.
+    pub fn may_act_claim(&self) -> anyhow::Result<Option<Vec<String>>> {
+        may_act_claim(&self.may_act, self.no_delegation)
+    }
+}
+
+/// The `may_act` a `token root` or `token exchange` sends, from `--may-act` and
+/// `--no-delegation`: `None` when neither is given, `Some([])` for `--no-delegation`, an error
+/// when every `--may-act` value is empty.
+fn may_act_claim(values: &[String], no_delegation: bool) -> anyhow::Result<Option<Vec<String>>> {
+    if no_delegation {
+        return Ok(Some(Vec::new()));
+    }
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let agents = split_agents(values);
+    if agents.is_empty() {
+        anyhow::bail!(
+            "--may-act names no agent; use --no-delegation for a token nobody may exchange"
+        );
+    }
+    Ok(Some(agents))
 }
 
 /// Agent ids from repeatable, comma-separated flag values, trimmed, without empties.
@@ -306,28 +336,11 @@ impl ExchangeArgs {
         Ok(Some(token))
     }
 
-    /// `--may-act` values, split on commas, without empties.
-    pub fn may_act(&self) -> Vec<String> {
-        split_agents(&self.may_act)
-    }
-
     /// The `may_act` to send: `None` without `--may-act` and `--no-delegation`, `Some([])` with
     /// `--no-delegation`. `--may-act` values that are all empty are refused rather than
     /// dropped, since sending nothing would let any agent exchange the token.
     pub fn may_act_claim(&self) -> anyhow::Result<Option<Vec<String>>> {
-        if self.no_delegation {
-            return Ok(Some(Vec::new()));
-        }
-        if self.may_act.is_empty() {
-            return Ok(None);
-        }
-        let agents = self.may_act();
-        if agents.is_empty() {
-            anyhow::bail!(
-                "--may-act names no agent; use --no-delegation for a token nobody may exchange"
-            );
-        }
-        Ok(Some(agents))
+        may_act_claim(&self.may_act, self.no_delegation)
     }
 }
 
@@ -1145,7 +1158,7 @@ mod tests {
             }
         };
         let plain = root(&[]);
-        assert!(plain.may_act().is_empty());
+        assert_eq!(plain.may_act_claim().unwrap(), None);
         assert_eq!(
             plain.request_body().unwrap(),
             serde_json::json!({"subject": "alice", "issuer": "https://idp.example", "agent": "planner"})
@@ -1162,7 +1175,14 @@ mod tests {
             "--attr",
             "mfa:=true",
         ]);
-        assert_eq!(full.may_act(), ["coder", "reviewer", "tester"]);
+        assert_eq!(
+            full.may_act_claim().unwrap(),
+            Some(vec![
+                "coder".to_string(),
+                "reviewer".into(),
+                "tester".into()
+            ])
+        );
         let body = full.request_body().unwrap();
         assert_eq!(
             body["may_act"],
@@ -1171,6 +1191,34 @@ mod tests {
         assert_eq!(body["ttl_seconds"], 60);
         assert_eq!(body["attributes"], serde_json::json!({"mfa": true}));
         assert_eq!(body["capabilities"].as_array().unwrap().len(), 1);
+
+        // --no-delegation sends an explicit empty list; it conflicts with --may-act.
+        let nobody = root(&["--no-delegation"]);
+        assert_eq!(nobody.may_act_claim().unwrap(), Some(Vec::new()));
+        assert_eq!(
+            nobody.request_body().unwrap()["may_act"],
+            serde_json::json!({"sub": []})
+        );
+        assert!(parse(&[
+            "token",
+            "root",
+            "--subject",
+            "alice",
+            "--agent",
+            "planner",
+            "--no-delegation",
+            "--may-act",
+            "coder",
+        ])
+        .is_err());
+        // An all-empty --may-act is refused, not silently dropped (which would fall back to
+        // the grant's list).
+        for empty in ["", " , "] {
+            let r = root(&["--may-act", empty]);
+            assert!(r.may_act_claim().is_err());
+            let err = r.request_body().unwrap_err().to_string();
+            assert!(err.contains("--no-delegation"), "{err}");
+        }
     }
 
     #[test]
@@ -1195,7 +1243,6 @@ mod tests {
         };
         let none = exchange(&[]).unwrap();
         assert_eq!(none.actor_token(std::io::empty()).unwrap(), None);
-        assert!(none.may_act().is_empty());
         assert_eq!(none.may_act_claim().unwrap(), None);
         // Nobody may exchange it: an explicit empty list.
         let nobody = exchange(&["--no-delegation"]).unwrap();
@@ -1220,7 +1267,6 @@ mod tests {
             flag.actor_token(std::io::empty()).unwrap().as_deref(),
             Some("a.b.c")
         );
-        assert_eq!(flag.may_act(), ["x", "y", "z"]);
         assert_eq!(
             flag.may_act_claim().unwrap(),
             Some(vec!["x".to_string(), "y".into(), "z".into()])

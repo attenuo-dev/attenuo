@@ -2029,6 +2029,52 @@ async fn root_grant_may_act_is_applied_and_cannot_be_widened() {
     );
 }
 
+/// `may_act: []` on the dev root mint (`token root --no-delegation`): a root token nobody may
+/// exchange, accepted with and without a `[[root_grants]]` `may_act` ceiling.
+#[tokio::test]
+async fn root_mint_with_an_empty_may_act_is_exchangeable_by_nobody() {
+    for with_grant in [false, true] {
+        let h = Harness::start_tweaked(false, |cfg| {
+            if with_grant {
+                cfg.root_grants = vec![attenuo_server::config::RootGrant {
+                    subject: None,
+                    issuer: "https://idp.example".into(),
+                    agent: "planner".into(),
+                    capabilities: vec![attenuo_server::config::CapSpec::Short("github:*".into())],
+                    attributes: BTreeMap::new(),
+                    may_act: Some(vec!["coder".into()]),
+                }];
+            }
+        })
+        .await;
+        let resp = h
+            .admin_post(
+                "/admin/root-token",
+                json!({"subject": "alice", "issuer": "https://idp.example", "agent": "planner",
+                       "capabilities": ["github:*"], "may_act": {"sub": []}}),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK, "with_grant = {with_grant}");
+        let root: Value = resp.json().await.unwrap();
+        let root = root["access_token"].as_str().unwrap();
+        let claims = h
+            .state
+            .verifier
+            .verify(root, time::OffsetDateTime::now_utc())
+            .unwrap()
+            .claims;
+        assert_eq!(claims.may_act.unwrap().sub, Vec::<String>::new());
+        for actor in ["coder", "reviewer"] {
+            let resp = h.exchange_raw(root, actor, &["github:read_file"]).await;
+            assert_eq!(
+                error_description(resp).await,
+                (StatusCode::BAD_REQUEST, "actor_not_permitted".into()),
+                "with_grant = {with_grant}, actor = {actor}"
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Audit I/O runs on the blocking pool; the chain must survive concurrent callers.
 // ---------------------------------------------------------------------------------------------
