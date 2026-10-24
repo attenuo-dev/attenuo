@@ -143,7 +143,7 @@ fn strs(v: &Value) -> Vec<&str> {
         .collect()
 }
 
-fn sorted<'a>(mut v: Vec<&'a str>) -> Vec<&'a str> {
+fn sorted(mut v: Vec<&str>) -> Vec<&str> {
     v.sort();
     v
 }
