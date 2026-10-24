@@ -340,6 +340,29 @@ async fn console_page_routes_are_mounted_without_allow_write() {
     assert!(entry["lease_states"].is_array());
 }
 
+/// Every path a console script fetches by a literal `fetch('/...')` is served on the console
+/// listener. The Verify page used to probe `/readyz`, which only the main listener serves, so
+/// every visit answered 404 and the browser logged a console error.
+#[tokio::test]
+async fn console_scripts_fetch_only_paths_the_console_listener_serves() {
+    let h = Harness::start(false).await;
+    for asset in ASSETS.iter().filter(|a| a.path.ends_with(".js")) {
+        let text = std::str::from_utf8(asset.bytes).unwrap();
+        for (i, _) in text.match_indices("fetch('/") {
+            let rest = &text[i + "fetch('".len()..];
+            let path = &rest[..rest.find('\'').unwrap()];
+            let r = h.admin_get(path).await;
+            assert_ne!(
+                r.status(),
+                StatusCode::NOT_FOUND,
+                "{} fetches {path}, which the console listener does not serve",
+                asset.path
+            );
+        }
+    }
+    assert_eq!(h.get("/readyz").await.status(), StatusCode::NOT_FOUND);
+}
+
 /// The dry run is mounted read-only, needs JSON, and writes nothing.
 #[tokio::test]
 async fn policy_evaluate_is_a_json_only_dry_run_on_the_console() {
