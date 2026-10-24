@@ -7,6 +7,7 @@ message text.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 
@@ -60,6 +61,46 @@ class Denied(AttenuoError):
         self.message = message or f"attenuo: denied: {reason}"
         text = f"{self.message} (decision {decision_id})" if decision_id else self.message
         super().__init__(text)
+
+
+class ApprovalRequired(Denied):
+    """A policy held the call for an approval (JSON-RPC ``-32008``).
+
+    It is a :class:`Denied` with ``reason == "approval_required"``, so code that already catches
+    ``Denied`` keeps working. ``approval_id`` names the pending approval: show it to the user,
+    who grants it with their own sign-in (``POST /approvals/{id}``), or an operator grants it.
+    Then retry the identical call once (``Client.wait_for_approval`` and
+    ``Client.call_tool_with_approval`` do this). ``approval_id`` is ``None`` when the server
+    could not open an approval; the call is then simply denied. ``expires_at`` is when the
+    approval lapses; ``call_hash`` is the RFC 8785 hash of the call it is bound to.
+    """
+
+    def __init__(
+        self,
+        decision_id: str | None,
+        approval_id: str | None,
+        expires_at: datetime | None = None,
+        call_hash: str | None = None,
+        message: str = "",
+    ) -> None:
+        self.approval_id = approval_id
+        self.expires_at = expires_at
+        self.call_hash = call_hash
+        super().__init__("approval_required", decision_id, message or "attenuo: approval required")
+
+
+class ApprovalNotGranted(AttenuoError):
+    """Waiting for an approval ended without a grant.
+
+    ``state`` is ``declined`` (the user or operator said no), ``expired`` (nobody decided in
+    time), ``consumed`` (a retry already used the grant) or ``timeout`` (the wait's own
+    ``timeout`` ran out while the approval was still pending).
+    """
+
+    def __init__(self, approval_id: str, state: str) -> None:
+        self.approval_id = approval_id
+        self.state = state
+        super().__init__(f"approval {approval_id} was not granted: {state}")
 
 
 class VerificationError(AttenuoError):

@@ -365,8 +365,8 @@ impl RequestParts {
 
 /// The output-labelling members of the context (ADR-0009), always present:
 /// `session: {tainted, tainted_by}`, `args_contain_untrusted` and `untrusted_args` (fixed
-/// `false` and empty until argument matching exists), and `approval: {present, by}` (fixed
-/// absent until approvals exist).
+/// `false` and empty until argument matching exists), and `approval: {present, by}` (a
+/// granted approval the call consumed, if any).
 fn label_pairs(
     labels: &CallLabels,
 ) -> Result<Vec<(String, RestrictedExpression)>, TranslationError> {
@@ -391,10 +391,13 @@ fn label_pairs(
         ),
     ])?;
     let approval = record(vec![
-        ("present".to_string(), RestrictedExpression::new_bool(false)),
+        (
+            "present".to_string(),
+            RestrictedExpression::new_bool(labels.approval.present),
+        ),
         (
             "by".to_string(),
-            RestrictedExpression::new_string(String::new()),
+            RestrictedExpression::new_string(labels.approval.by.clone()),
         ),
     ])?;
     Ok(vec![
@@ -421,7 +424,10 @@ fn label_json(labels: &CallLabels) -> Map<String, Value> {
     );
     m.insert("args_contain_untrusted".into(), json!(false));
     m.insert("untrusted_args".into(), json!([]));
-    m.insert("approval".into(), json!({ "present": false, "by": "" }));
+    m.insert(
+        "approval".into(),
+        json!({ "present": labels.approval.present, "by": labels.approval.by }),
+    );
     m
 }
 
@@ -883,6 +889,7 @@ mod tests {
     fn tainted_labels() -> CallLabels {
         CallLabels {
             session: crate::SessionLabels::from_sources(["web/fetch", "mail/read"]),
+            ..Default::default()
         }
     }
 

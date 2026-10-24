@@ -183,6 +183,11 @@ export const REASONS = {
   lease_renewed: 'A lease was renewed.',
   admin_action: 'An action taken with the admin token.',
   policy_invalid: 'A policy reload was refused because the file did not load.',
+  // Approvals (ADR-0009).
+  approval_required: 'A policy gated the call on an approval; the agent got JSON-RPC -32008.',
+  approval_requested: 'An approval was opened for this exact call.',
+  approval_granted: 'A user or the operator granted the approval; one identical retry may run.',
+  approval_declined: 'A user or the operator declined the approval.',
 };
 
 export function explainReason(code) {

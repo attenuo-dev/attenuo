@@ -10,6 +10,7 @@ use std::sync::Mutex;
 use attenuo_core::LeaseId;
 use time::OffsetDateTime;
 
+use crate::approval::{rules, Approval, ApprovalState, Approver};
 use crate::error::AuditError;
 
 /// Outcome of checking a set of leases together (typically every lease in a chain).
@@ -87,6 +88,59 @@ pub trait LeaseStore: Send + Sync {
     /// `seq`. Empty for a run that has read nothing untrusted. Callers must treat an error as
     /// tainted (fail closed).
     fn labels(&self, chain_id: &LeaseId) -> Result<Vec<RunLabel>, AuditError>;
+
+    /// Store a pending approval (ADR-0009). `approval.state` is ignored (stored as pending);
+    /// `approval.expires_at` is lowered to the expiry of `approval.lease`, which must be known
+    /// and live ([`AuditError::UnknownLease`], [`AuditError::LeaseRevoked`] or
+    /// [`AuditError::ApprovalExpired`] otherwise); the check and the write are one
+    /// transaction. When a pending, unexpired approval for the same run, lease and call hash
+    /// already exists, nothing is written and that one is returned with `false`, so an agent
+    /// that repeats a gated call gets the same approval id. Returns the stored approval and
+    /// whether it is new.
+    fn create_approval(&self, approval: &Approval) -> Result<(Approval, bool), AuditError>;
+
+    /// One approval by id, or `None`.
+    fn approval(&self, id: &str) -> Result<Option<Approval>, AuditError>;
+
+    /// Approvals newest first, at most `limit`; only those of the run `chain_id` when given.
+    fn approvals(
+        &self,
+        chain_id: Option<&LeaseId>,
+        limit: usize,
+    ) -> Result<Vec<Approval>, AuditError>;
+
+    /// Grant (`grant = true`) or decline a pending approval. Refused with
+    /// [`AuditError::UnknownApproval`], [`AuditError::ApprovalNotPending`],
+    /// [`AuditError::ApprovalExpired`] (the approval or its lease), or
+    /// [`AuditError::LeaseRevoked`]; the checks and the write are one transaction.
+    fn decide_approval(
+        &self,
+        id: &str,
+        grant: bool,
+        approver: &Approver,
+        now: OffsetDateTime,
+    ) -> Result<Approval, AuditError>;
+
+    /// Find a granted, unexpired approval for `call_hash` made by the hop holding `lease` in
+    /// the run `chain_id`, and mark it consumed by `decision_id`, in one transaction, so two
+    /// concurrent retries cannot both use it. The lease must be live. `None` when there is
+    /// none.
+    fn take_approval(
+        &self,
+        chain_id: &LeaseId,
+        lease: &LeaseId,
+        call_hash: &str,
+        decision_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<Approval>, AuditError>;
+
+    /// Undo [`take_approval`](Self::take_approval) for a decision that did not go through
+    /// (denied anyway, or its audit append failed): an approval consumed by `decision_id` is
+    /// granted again. Anything else is left alone.
+    fn restore_approval(&self, id: &str, decision_id: &str) -> Result<(), AuditError>;
+
+    /// Delete an approval whose request could not be recorded.
+    fn remove_approval(&self, id: &str) -> Result<(), AuditError>;
 }
 
 /// One output label on a delegation run: an untrusted result the run read (ADR-0009).
@@ -239,6 +293,8 @@ pub struct MemoryLeaseStore {
     bindings: Mutex<BTreeMap<LeaseId, String>>,
     /// Per run, the first label of each source.
     labels: Mutex<BTreeMap<LeaseId, BTreeMap<String, RunLabel>>>,
+    /// Approvals by id.
+    approvals: Mutex<BTreeMap<String, Approval>>,
 }
 
 impl MemoryLeaseStore {
@@ -431,5 +487,112 @@ impl LeaseStore for MemoryLeaseStore {
                 out
             })
             .unwrap_or_default())
+    }
+
+    fn create_approval(&self, approval: &Approval) -> Result<(Approval, bool), AuditError> {
+        // Lock order as in `add_label`: rows, then approvals.
+        let rows = self.rows.lock()?;
+        let now = approval.created_at;
+        let lease_expiry = rules::live_lease(&approval.lease, rows.get(&approval.lease), now)?;
+        let mut approvals = self.approvals.lock()?;
+        if let Some(existing) = approvals
+            .values()
+            .find(|a| rules::reusable(a, approval, now))
+        {
+            return Ok((existing.clone(), false));
+        }
+        let mut stored = approval.clone();
+        stored.state = ApprovalState::Pending;
+        stored.approver = None;
+        stored.decided_at = None;
+        stored.consumed_by = None;
+        stored.expires_at = stored.expires_at.min(lease_expiry);
+        approvals.insert(stored.id.clone(), stored.clone());
+        Ok((stored, true))
+    }
+
+    fn approval(&self, id: &str) -> Result<Option<Approval>, AuditError> {
+        Ok(self.approvals.lock()?.get(id).cloned())
+    }
+
+    fn approvals(
+        &self,
+        chain_id: Option<&LeaseId>,
+        limit: usize,
+    ) -> Result<Vec<Approval>, AuditError> {
+        let mut out: Vec<Approval> = self
+            .approvals
+            .lock()?
+            .values()
+            .filter(|a| chain_id.is_none_or(|c| &a.chain_id == c))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    fn decide_approval(
+        &self,
+        id: &str,
+        grant: bool,
+        approver: &Approver,
+        now: OffsetDateTime,
+    ) -> Result<Approval, AuditError> {
+        let rows = self.rows.lock()?;
+        let mut approvals = self.approvals.lock()?;
+        let a = approvals
+            .get_mut(id)
+            .ok_or_else(|| AuditError::UnknownApproval(id.to_owned()))?;
+        rules::decidable(a, now)?;
+        rules::live_lease(&a.lease, rows.get(&a.lease), now)?;
+        a.state = if grant {
+            ApprovalState::Granted
+        } else {
+            ApprovalState::Declined
+        };
+        a.approver = Some(approver.clone());
+        a.decided_at = Some(now);
+        Ok(a.clone())
+    }
+
+    fn take_approval(
+        &self,
+        chain_id: &LeaseId,
+        lease: &LeaseId,
+        call_hash: &str,
+        decision_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<Approval>, AuditError> {
+        let rows = self.rows.lock()?;
+        if rules::live_lease(lease, rows.get(lease), now).is_err() {
+            return Ok(None);
+        }
+        let mut approvals = self.approvals.lock()?;
+        let Some(a) = approvals
+            .values_mut()
+            .filter(|a| rules::usable(a, chain_id, lease, call_hash, now))
+            .min_by(|a, b| a.created_at.cmp(&b.created_at))
+        else {
+            return Ok(None);
+        };
+        a.state = ApprovalState::Consumed;
+        a.consumed_by = Some(decision_id.to_owned());
+        Ok(Some(a.clone()))
+    }
+
+    fn restore_approval(&self, id: &str, decision_id: &str) -> Result<(), AuditError> {
+        if let Some(a) = self.approvals.lock()?.get_mut(id) {
+            if a.state == ApprovalState::Consumed && a.consumed_by.as_deref() == Some(decision_id) {
+                a.state = ApprovalState::Granted;
+                a.consumed_by = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_approval(&self, id: &str) -> Result<(), AuditError> {
+        self.approvals.lock()?.remove(id);
+        Ok(())
     }
 }

@@ -28,6 +28,9 @@
 //! | `GET /admin/policies` | admin | the policy set in force: ids, text, file digest, load time ([`routes::policies`]) |
 //! | `GET /admin/policies/check` | admin | lint the policy file on disk against the running schema; swaps nothing |
 //! | `POST /admin/policies/evaluate` | admin | dry run: what the loaded policies say about one call; no lease check, no audit |
+//! | `POST /approvals/{id}` | the originating user's IdP ID token (never a delegation token) | grant or decline a pending approval ([`routes::approvals`]) |
+//! | `GET /approvals/{id}` | the user's ID token, or a delegation token of the same run | the approval: exact call, labels, state, expiry |
+//! | `GET /admin/approvals?chain_id`, `GET /admin/approvals/{id}`, `POST /admin/approvals/{id}` | admin | list, show, and grant or decline as an operator |
 //!
 //! **Console listener.** With `[admin_ui] enabled = true` a second listener on
 //! `[admin_ui] listen` (default `127.0.0.1:9101`) serves the embedded console under
@@ -73,7 +76,7 @@ pub fn build(config: &Config) -> anyhow::Result<(Router, Arc<AppState>)> {
 
 /// The full router over an existing state.
 pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Config) -> Router {
-    use routes::{admin, authzen, dev_root, policies, renew, token, wellknown};
+    use routes::{admin, approvals, authzen, dev_root, policies, renew, token, wellknown};
 
     let mut admin_routes = Router::new()
         .route("/admin/leases/{lease_id}", get(admin::lease_status))
@@ -92,7 +95,12 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
             "/admin/policies/evaluate",
             post(policies::evaluate_policies),
         )
-        .route("/admin/policies/reload", post(admin::reload_policies));
+        .route("/admin/policies/reload", post(admin::reload_policies))
+        .route("/admin/approvals", get(approvals::admin_list))
+        .route(
+            "/admin/approvals/{id}",
+            get(approvals::admin_get).post(approvals::admin_decide),
+        );
     if state.dev_allow_root_mint {
         admin_routes = admin_routes.route("/admin/root-token", post(dev_root::mint_root));
     }
@@ -114,6 +122,10 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
         )
         .route("/token", post(token::exchange))
         .route("/token/renew", post(renew::renew))
+        .route(
+            "/approvals/{id}",
+            get(approvals::user_get).post(approvals::user_decide),
+        )
         .route("/access/v1/evaluation", post(authzen::evaluation))
         .route("/access/v1/evaluations", post(authzen::evaluations))
         .merge(admin_routes)

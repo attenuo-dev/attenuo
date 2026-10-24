@@ -8,12 +8,20 @@
 //!    `lease_unknown` (checked in that order), or `lease_error` if the store fails.
 //! 2. **Labels.** The taint state of the delegation run (`LeaseStore::labels` for the
 //!    chain id, ADR-0009). A store that cannot be read counts as tainted.
-//! 3. **Policy.** `PolicyEngine::authorize_labelled`: the capability stage, then Cedar, with
+//! 3. **Approval.** A granted, unexpired approval for this call (same run, same calling hop's
+//!    lease, same call hash) is taken from the lease store and marked consumed
+//!    (`LeaseStore::take_approval`); Cedar then sees `context.approval.present` and `by`.
+//! 4. **Policy.** `PolicyEngine::authorize_labelled`: the capability stage, then Cedar, with
 //!    the run's labels as `context.session`. A deny through `@obligation("approval")` forbids
 //!    only is `approval_required`.
-//! 4. **Audit.** A [`DecisionRecord`] is appended to the hash-chained log, and its id is the
+//! 5. **Audit.** A [`DecisionRecord`] is appended to the hash-chained log, and its id is the
 //!    decision id returned to the caller. If the append fails the call is denied with
-//!    `audit_error`: an action that cannot be recorded does not happen.
+//!    `audit_error`: an action that cannot be recorded does not happen. An approval taken in
+//!    step 3 is given back when the call is not allowed or its record cannot be written, so
+//!    it is spent exactly when an allowed decision that names it is in the log.
+//! 6. **Pending approval.** For `approval_required`, a pending approval is stored (or the
+//!    pending one for the same call reused) and an `approval_request` record appended; the
+//!    caller gets its id and expiry ([`PipelineDecision::approval`]).
 //!
 //! After an allowed mediated call returns, [`Pipeline::record_result`] appends a
 //! `tool_result` record and, for an untrusted result, labels the run; if either fails, the
@@ -26,13 +34,15 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use attenuo_audit::{AuditSink, LeaseStore, RunLabel};
+use attenuo_audit::{Approval, ApprovalLabel, ApprovalState, AuditSink, LeaseStore, RunLabel};
 use attenuo_core::{
-    chain_id_of, Decision, DecisionRecord, DelegationChain, LeaseId, OutputLabel, RecordLabels,
-    ResultInfo, ToolCall,
+    chain_id_of, ApprovalInfo, Decision, DecisionRecord, DelegationChain, LeaseId, OutputLabel,
+    RecordKind, RecordLabels, ResultInfo, ToolCall, REASON_APPROVAL_REQUESTED,
 };
-use attenuo_policy::{CallLabels, PolicyEngine, SessionLabels};
-use attenuo_proxy::{AuthDecision, AuthError, Authenticated, Authorizer, RequestAuth, Stage};
+use attenuo_policy::{ApprovalContext, CallLabels, PolicyEngine, SessionLabels};
+use attenuo_proxy::{
+    ApprovalTicket, AuthDecision, AuthError, Authenticated, Authorizer, RequestAuth, Stage,
+};
 use attenuo_token::Verifier;
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -62,6 +72,8 @@ pub struct RunLabels {
     /// What the decision record carries: the `seq` of the first untrusted result of each
     /// source.
     pub record: RecordLabels,
+    /// The same labels with their sources, for a pending approval.
+    pub sources: Vec<ApprovalLabel>,
     /// Set when the taint state could not be read (the run then counts as tainted).
     pub error: Option<String>,
 }
@@ -88,6 +100,11 @@ pub struct PipelineDecision {
     pub audit_seq: Option<u64>,
     pub policy_ids: Vec<String>,
     pub diagnostics: Vec<String>,
+    /// For `approval_required`: the pending approval stored for the call. `None` otherwise,
+    /// or when it could not be stored or recorded (the diagnostics say why).
+    pub approval: Option<ApprovalTicket>,
+    /// For an allowed call that consumed an approval: its id and `by` (`user` or `operator`).
+    pub consumed_approval: Option<(Uuid, String)>,
 }
 
 impl PipelineDecision {
@@ -102,6 +119,8 @@ pub struct Pipeline {
     leases: Arc<dyn LeaseStore>,
     audit: Arc<dyn AuditSink>,
     metrics: Arc<Metrics>,
+    /// `[approvals] ttl_seconds`.
+    approval_ttl: time::Duration,
 }
 
 impl Pipeline {
@@ -115,7 +134,16 @@ impl Pipeline {
             leases,
             audit,
             metrics: Metrics::new(),
+            approval_ttl: time::Duration::seconds(
+                crate::config::DEFAULT_APPROVAL_TTL_SECONDS as i64,
+            ),
         }
+    }
+
+    /// How long a pending approval stays usable (`[approvals] ttl_seconds`, default 120 s).
+    pub fn with_approval_ttl(mut self, ttl: time::Duration) -> Self {
+        self.approval_ttl = ttl;
+        self
     }
 
     /// Report decisions and audit failures to a shared [`Metrics`] instead of a private one.
@@ -186,25 +214,59 @@ impl Pipeline {
         let t1 = Instant::now();
         let mut policy_time = None;
         let mut record_labels = RecordLabels::default();
-        let (decision, reason, policy_ids, diagnostics) = match leases {
+        let mut label_sources = Vec::new();
+        // The record id is fixed first: a taken approval names the decision that consumed it.
+        let decision_id = Uuid::new_v4();
+        let mut taken: Option<Approval> = None;
+        let (decision, reason, policy_ids, mut diagnostics) = match leases {
             Err((reason, detail)) => (Decision::Deny, reason.to_string(), Vec::new(), detail),
             Ok(()) => {
                 let run = self.run_labels(chain);
+                let mut diagnostics = Vec::new();
+                // Leases are live, so a granted approval for this exact call may be used.
+                taken = self.take_approval(chain, call, decision_id, now, &mut diagnostics);
                 let labels = CallLabels {
                     session: run.session,
+                    approval: taken
+                        .as_ref()
+                        .and_then(|a| a.approver.as_ref())
+                        .map(|a| ApprovalContext::by(a.method.by()))
+                        .unwrap_or_default(),
                 };
                 let o = self.evaluate_policy(chain, call, &labels, now);
                 policy_time = Some(t1.elapsed());
                 record_labels = run.record;
-                let mut diagnostics = o.diagnostics;
+                label_sources = run.sources;
+                diagnostics.extend(o.diagnostics);
                 diagnostics.extend(run.error);
                 (o.decision, o.reason, o.policy_ids, diagnostics)
             }
         };
+        // An approval is spent only by a call it let through.
+        if !decision.is_allow() {
+            if let Some(a) = taken.take() {
+                self.give_back(&a, decision_id);
+            }
+        }
+        let consumed_approval = taken.as_ref().map(|a| {
+            let by = a
+                .approver
+                .as_ref()
+                .map(|p| p.method.by())
+                .unwrap_or_default()
+                .to_string();
+            (Uuid::parse_str(&a.id).unwrap_or_default(), by)
+        });
 
-        let record = DecisionRecord::new(now, decision, reason, chain, call, policy_ids)
-            .with_labels(record_labels);
-        let decision_id = record.id;
+        let mut record =
+            DecisionRecord::new(now, decision, reason, chain, call, policy_ids.clone())
+                .with_labels(record_labels.clone());
+        record.id = decision_id;
+        if let Some((id, by)) = &consumed_approval {
+            let mut info = ApprovalInfo::new(*id);
+            info.by = Some(by.clone());
+            record.approval = Some(info);
+        }
         // The record moves into the log; the entry hands it back, so it is never cloned.
         let t2 = Instant::now();
         let appended = self.audit.append(record);
@@ -237,6 +299,20 @@ impl Pipeline {
                     seq = entry.seq,
                     "decision"
                 );
+                let approval = (record.reason == attenuo_policy::REASON_APPROVAL_REQUIRED)
+                    .then(|| {
+                        self.request_approval(
+                            chain,
+                            call,
+                            decision_id,
+                            &policy_ids,
+                            &record_labels,
+                            label_sources,
+                            now,
+                            &mut diagnostics,
+                        )
+                    })
+                    .flatten();
                 PipelineDecision {
                     decision: record.decision,
                     reason: record.reason,
@@ -244,12 +320,16 @@ impl Pipeline {
                     audit_seq: Some(entry.seq),
                     policy_ids: record.policy_ids,
                     diagnostics,
+                    approval,
+                    consumed_approval,
                 }
             }
             Err(e) => {
                 tracing::error!(error = %e, "audit append failed; denying");
                 self.metrics.audit_append_error();
-                let mut diagnostics = diagnostics;
+                if let Some(a) = &taken {
+                    self.give_back(a, decision_id);
+                }
                 diagnostics.push(format!("audit append failed: {e}"));
                 PipelineDecision {
                     decision: Decision::Deny,
@@ -258,9 +338,126 @@ impl Pipeline {
                     audit_seq: None,
                     policy_ids: Vec::new(),
                     diagnostics,
+                    approval: None,
+                    consumed_approval: None,
                 }
             }
         }
+    }
+
+    /// Take a granted approval for `call` by the last hop of `chain` (ADR-0009), marking it
+    /// consumed by `decision_id`. A store error means no approval (fail closed) and a
+    /// diagnostic.
+    fn take_approval(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        decision_id: Uuid,
+        now: OffsetDateTime,
+        diagnostics: &mut Vec<String>,
+    ) -> Option<Approval> {
+        let (chain_id, hop) = (chain_id_of(chain)?, chain.hops.last()?);
+        match self.leases.take_approval(
+            &LeaseId::new(chain_id),
+            &hop.lease,
+            &call.call_hash(),
+            &decision_id.to_string(),
+            now,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(error = %e, "approval store unreadable; deciding without approval");
+                diagnostics.push(format!("approval store unreadable: {e}"));
+                None
+            }
+        }
+    }
+
+    /// Undo a take for a decision that did not go through.
+    fn give_back(&self, approval: &Approval, decision_id: Uuid) {
+        if let Err(e) = self
+            .leases
+            .restore_approval(&approval.id, &decision_id.to_string())
+        {
+            // The approval stays spent: the user approves again. Fails closed.
+            tracing::error!(error = %e, approval = %approval.id, "could not give an approval back");
+        }
+    }
+
+    /// Store a pending approval for a call the policy gated (or find the pending one for the
+    /// same call) and record an `approval_request` for a new one. `None`, with a diagnostic,
+    /// when either write fails: the call stays gated, with no approval to grant.
+    #[allow(clippy::too_many_arguments)]
+    fn request_approval(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        decision_id: Uuid,
+        policy_ids: &[String],
+        record_labels: &RecordLabels,
+        labels: Vec<ApprovalLabel>,
+        now: OffsetDateTime,
+        diagnostics: &mut Vec<String>,
+    ) -> Option<ApprovalTicket> {
+        let (chain_id, hop) = (chain_id_of(chain)?, chain.hops.last()?);
+        let call_hash = call.call_hash();
+        let wanted = Approval {
+            id: Uuid::new_v4().to_string(),
+            chain_id: LeaseId::new(chain_id),
+            lease: hop.lease.clone(),
+            call_hash: call_hash.clone(),
+            server: call.server.clone(),
+            tool: call.tool.clone(),
+            arguments: serde_json::to_value(&call.arguments).unwrap_or_default(),
+            labels,
+            decision_id: decision_id.to_string(),
+            chain: chain.clone(),
+            created_at: now,
+            // The store lowers this to the lease's expiry; the token's own expiry bounds it too.
+            expires_at: (now + self.approval_ttl).min(hop.expires_at),
+            state: ApprovalState::Pending,
+            approver: None,
+            decided_at: None,
+            consumed_by: None,
+        };
+        let (stored, created) = match self.leases.create_approval(&wanted) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = %e, "pending approval could not be stored");
+                diagnostics.push(format!("pending approval could not be stored: {e}"));
+                return None;
+            }
+        };
+        let approval_id = Uuid::parse_str(&stored.id).ok()?;
+        if created {
+            let mut record = DecisionRecord::new(
+                now,
+                Decision::Deny,
+                REASON_APPROVAL_REQUESTED,
+                chain,
+                call,
+                policy_ids.to_vec(),
+            )
+            .with_kind(RecordKind::ApprovalRequest)
+            .with_labels(record_labels.clone());
+            record.decision_id = Some(decision_id);
+            let mut info = ApprovalInfo::new(approval_id);
+            info.call_hash = Some(call_hash);
+            info.expires_at = Some(stored.expires_at);
+            record.approval = Some(info);
+            if let Err(e) = self.metrics.time_audit_append(|| self.audit.append(record)) {
+                // A request that cannot be recorded is not offered for approval.
+                tracing::error!(error = %e, "approval_request append failed; dropping the approval");
+                self.metrics.audit_append_error();
+                let _ = self.leases.remove_approval(&stored.id);
+                diagnostics.push(format!("approval request could not be recorded: {e}"));
+                return None;
+            }
+        }
+        Some(ApprovalTicket {
+            approval_id,
+            expires_at: stored.expires_at,
+        })
     }
 
     /// The output labels of `chain`'s delegation run (ADR-0009), read from the lease store by
@@ -271,6 +468,7 @@ impl Pipeline {
             return RunLabels {
                 session: SessionLabels::unknown(),
                 record: RecordLabels::default(),
+                sources: Vec::new(),
                 error: Some("chain has no hops: no run to read labels for".into()),
             };
         };
@@ -280,6 +478,13 @@ impl Pipeline {
                 record: RecordLabels {
                     tainted_by: labels.iter().map(|l| l.seq).collect(),
                 },
+                sources: labels
+                    .iter()
+                    .map(|l| ApprovalLabel {
+                        source: l.source.clone(),
+                        seq: l.seq,
+                    })
+                    .collect(),
                 error: None,
             },
             Err(e) => {
@@ -287,6 +492,7 @@ impl Pipeline {
                 RunLabels {
                     session: SessionLabels::unknown(),
                     record: RecordLabels::default(),
+                    sources: Vec::new(),
                     error: Some(format!(
                         "taint state unreadable, run treated as tainted: {e}"
                     )),
@@ -660,6 +866,7 @@ impl Authorizer for ServerAuthorizer {
             decision: d.decision,
             reason: d.reason,
             decision_id: d.decision_id,
+            approval: d.approval,
         }
     }
 

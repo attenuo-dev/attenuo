@@ -1,0 +1,287 @@
+//! Pending approvals in the lease store (ADR-0009): created bound to a lease and a call hash,
+//! granted or declined once, consumed once, and unusable once the lease is revoked or the
+//! approval has expired. Every test runs against both stores.
+
+mod common;
+
+use attenuo_audit::{
+    Approval, ApprovalLabel, ApprovalMethod, ApprovalState, Approver, AuditError, LeaseStore,
+    MemoryLeaseStore, SqliteLeaseStore,
+};
+use attenuo_core::LeaseId;
+use common::{chain, t0};
+use serde_json::json;
+use time::{Duration, OffsetDateTime};
+
+fn stores() -> Vec<(&'static str, Box<dyn LeaseStore>)> {
+    vec![
+        ("memory", Box::new(MemoryLeaseStore::new())),
+        (
+            "sqlite",
+            Box::new(SqliteLeaseStore::open_in_memory().unwrap()),
+        ),
+    ]
+}
+
+fn id(s: &str) -> LeaseId {
+    LeaseId::new(s)
+}
+
+/// `l1` (root) and `l2` (the calling hop), both live for an hour after t0.
+fn leases(store: &dyn LeaseStore) {
+    let exp = t0() + Duration::hours(1);
+    store.register(&id("l1"), None, exp).unwrap();
+    store.register(&id("l2"), Some(&id("l1")), exp).unwrap();
+}
+
+fn pending(n: u32, call_hash: &str, ttl: Duration) -> Approval {
+    Approval {
+        id: format!("00000000-0000-4000-8000-{n:012}"),
+        chain_id: id("l1"),
+        lease: id("l2"),
+        call_hash: call_hash.into(),
+        server: "github".into(),
+        tool: "delete_repo".into(),
+        arguments: json!({"repo": "alice/site"}),
+        labels: vec![ApprovalLabel {
+            source: "github/read_web".into(),
+            seq: 3,
+        }],
+        decision_id: "d-gated".into(),
+        chain: chain("alice", ("l1", "l2")),
+        created_at: t0(),
+        expires_at: t0() + ttl,
+        state: ApprovalState::Pending,
+        approver: None,
+        decided_at: None,
+        consumed_by: None,
+    }
+}
+
+fn user() -> Approver {
+    Approver {
+        subject: "alice".into(),
+        method: ApprovalMethod::IdToken,
+    }
+}
+
+fn take(
+    store: &dyn LeaseStore,
+    hash: &str,
+    decision: &str,
+    now: OffsetDateTime,
+) -> Option<Approval> {
+    store
+        .take_approval(&id("l1"), &id("l2"), hash, decision, now)
+        .unwrap()
+}
+
+#[test]
+fn approval_is_granted_then_consumed_once() {
+    for (name, store) in stores() {
+        let store = store.as_ref();
+        leases(store);
+        let (a, created) = store
+            .create_approval(&pending(1, "h1", Duration::seconds(120)))
+            .unwrap();
+        assert!(created, "{name}");
+        assert_eq!(a.state, ApprovalState::Pending);
+        assert_eq!(
+            store.approval(&a.id).unwrap().unwrap(),
+            a,
+            "{name}: round trip"
+        );
+
+        // Nothing to use while pending.
+        assert!(take(store, "h1", "d1", t0()).is_none(), "{name}");
+        let now = t0() + Duration::seconds(5);
+        let granted = store.decide_approval(&a.id, true, &user(), now).unwrap();
+        assert_eq!(granted.state, ApprovalState::Granted);
+        assert_eq!(granted.approver, Some(user()));
+        assert_eq!(granted.decided_at, Some(now));
+
+        // A different call hash or another hop's lease does not find it.
+        assert!(take(store, "h2", "d1", now).is_none(), "{name}");
+        assert!(store
+            .take_approval(&id("l1"), &id("l1"), "h1", "d1", now)
+            .unwrap()
+            .is_none());
+
+        let used = take(store, "h1", "d1", now).unwrap();
+        assert_eq!(used.state, ApprovalState::Consumed, "{name}");
+        assert_eq!(used.consumed_by.as_deref(), Some("d1"));
+        assert!(take(store, "h1", "d2", now).is_none(), "{name}: single use");
+
+        // A decision that did not go through gives it back; only its own consumer can.
+        store.restore_approval(&a.id, "other").unwrap();
+        assert!(take(store, "h1", "d2", now).is_none(), "{name}");
+        store.restore_approval(&a.id, "d1").unwrap();
+        assert_eq!(
+            store.approval(&a.id).unwrap().unwrap().state,
+            ApprovalState::Granted
+        );
+        assert!(take(store, "h1", "d2", now).is_some(), "{name}");
+
+        // Granting again is refused.
+        assert!(matches!(
+            store.decide_approval(&a.id, true, &user(), now),
+            Err(AuditError::ApprovalNotPending { .. })
+        ));
+    }
+}
+
+#[test]
+fn declined_approval_cannot_be_used_or_granted() {
+    for (name, store) in stores() {
+        let store = store.as_ref();
+        leases(store);
+        let (a, _) = store
+            .create_approval(&pending(1, "h1", Duration::seconds(120)))
+            .unwrap();
+        let d = store.decide_approval(&a.id, false, &user(), t0()).unwrap();
+        assert_eq!(d.state, ApprovalState::Declined, "{name}");
+        assert!(take(store, "h1", "d1", t0()).is_none(), "{name}");
+        assert!(matches!(
+            store.decide_approval(&a.id, true, &user(), t0()),
+            Err(AuditError::ApprovalNotPending { .. })
+        ));
+        // The same call gated again gets a new approval.
+        let (b, created) = store
+            .create_approval(&pending(2, "h1", Duration::seconds(120)))
+            .unwrap();
+        assert!(created, "{name}");
+        assert_ne!(a.id, b.id);
+    }
+}
+
+#[test]
+fn a_repeated_gated_call_reuses_the_pending_approval() {
+    for (name, store) in stores() {
+        let store = store.as_ref();
+        leases(store);
+        let (a, _) = store
+            .create_approval(&pending(1, "h1", Duration::seconds(120)))
+            .unwrap();
+        let (b, created) = store
+            .create_approval(&pending(2, "h1", Duration::seconds(120)))
+            .unwrap();
+        assert!(!created, "{name}");
+        assert_eq!(a, b);
+        let (c, created) = store
+            .create_approval(&pending(3, "h2", Duration::seconds(120)))
+            .unwrap();
+        assert!(created, "{name}: another call hash is another approval");
+        assert_eq!(store.approvals(None, 10).unwrap().len(), 2);
+        assert_eq!(store.approvals(Some(&id("l1")), 10).unwrap()[0], c);
+        assert!(store.approvals(Some(&id("other")), 10).unwrap().is_empty());
+        assert_eq!(store.approvals(None, 1).unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn expiry_is_capped_by_the_lease_and_ends_use() {
+    for (name, store) in stores() {
+        let store = store.as_ref();
+        leases(store);
+        // A TTL past the lease's expiry is cut to it.
+        let (a, _) = store
+            .create_approval(&pending(1, "h1", Duration::hours(5)))
+            .unwrap();
+        assert_eq!(a.expires_at, t0() + Duration::hours(1), "{name}");
+
+        let (b, _) = store
+            .create_approval(&pending(2, "h2", Duration::seconds(120)))
+            .unwrap();
+        let late = t0() + Duration::seconds(121);
+        assert!(matches!(
+            store.decide_approval(&b.id, true, &user(), late),
+            Err(AuditError::ApprovalExpired(_))
+        ));
+        store
+            .decide_approval(&b.id, true, &user(), t0() + Duration::seconds(10))
+            .unwrap();
+        assert!(take(store, "h2", "d1", late).is_none(), "{name}: expired");
+        assert!(take(store, "h2", "d1", t0() + Duration::seconds(119)).is_some());
+    }
+}
+
+/// ADR-0009: revoking the lease kills pending and granted approvals.
+#[test]
+fn revoked_lease_kills_pending_and_granted_approvals() {
+    for (name, store) in stores() {
+        let store = store.as_ref();
+        leases(store);
+        let (granted, _) = store
+            .create_approval(&pending(1, "h1", Duration::seconds(120)))
+            .unwrap();
+        store
+            .decide_approval(&granted.id, true, &user(), t0())
+            .unwrap();
+        let (waiting, _) = store
+            .create_approval(&pending(2, "h2", Duration::seconds(120)))
+            .unwrap();
+        // Revoking the root revokes the calling hop's lease with it.
+        store.revoke(&id("l1"), "test", t0()).unwrap();
+        assert!(take(store, "h1", "d1", t0()).is_none(), "{name}");
+        assert!(matches!(
+            store.decide_approval(&waiting.id, true, &user(), t0()),
+            Err(AuditError::LeaseRevoked(_))
+        ));
+        assert!(matches!(
+            store.create_approval(&pending(3, "h3", Duration::seconds(120))),
+            Err(AuditError::LeaseRevoked(_))
+        ));
+    }
+}
+
+#[test]
+fn unknown_approvals_and_leases_are_errors() {
+    for (name, store) in stores() {
+        let store = store.as_ref();
+        assert!(
+            matches!(
+                store.create_approval(&pending(1, "h1", Duration::seconds(120))),
+                Err(AuditError::UnknownLease(_))
+            ),
+            "{name}"
+        );
+        assert!(store.approval("nope").unwrap().is_none());
+        assert!(matches!(
+            store.decide_approval("nope", true, &user(), t0()),
+            Err(AuditError::UnknownApproval(_))
+        ));
+        leases(store);
+        let (a, _) = store
+            .create_approval(&pending(1, "h1", Duration::seconds(120)))
+            .unwrap();
+        store.remove_approval(&a.id).unwrap();
+        assert!(store.approval(&a.id).unwrap().is_none(), "{name}");
+    }
+}
+
+#[test]
+fn approvals_persist_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("leases.db");
+    let a = {
+        let store = SqliteLeaseStore::open(&path).unwrap();
+        leases(&store);
+        let (a, _) = store
+            .create_approval(&pending(1, "h1", Duration::seconds(120)))
+            .unwrap();
+        store
+            .decide_approval(
+                &a.id,
+                true,
+                &Approver {
+                    subject: "urn:attenuo:admin".into(),
+                    method: ApprovalMethod::AdminToken,
+                },
+                t0(),
+            )
+            .unwrap()
+    };
+    let store = SqliteLeaseStore::open(&path).unwrap();
+    assert_eq!(store.approval(&a.id).unwrap().unwrap(), a);
+    assert_eq!(a.approver.unwrap().method.by(), "operator");
+}

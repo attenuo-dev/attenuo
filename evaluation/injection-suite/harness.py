@@ -94,7 +94,7 @@ AGENT_SECRET = "eval-worker-secret"
 DECISION_HEADER = "x-attenuo-decision-id"
 CODE_DENIED = -32003
 CODE_UNKNOWN_SERVER = -32004
-CODE_APPROVAL = -32008  # proposed in docs/design/output-labelling.md section 3.7
+CODE_APPROVAL = -32008  # docs/design/output-labelling.md section 3.7
 
 ARMS = ("direct", "scope_only", "scope_constraints", "policy_only", "attenuo", "attenuo_labels")
 PROXIED = ARMS[1:]
@@ -782,6 +782,7 @@ class CallResult:
     detail: str | None = None
     spoof: bool = False
     approval: str | None = None  # gated calls: what the scripted approver would answer
+    approval_id: str | None = None  # gated calls: data.approval_id of the -32008 (not retried)
     output_returned: bool | None = None  # the scripted output came back (None: none scripted)
 
     @property
@@ -915,6 +916,14 @@ def _judge(msg: dict[str, Any] | None, header_ids: list[str]) -> tuple[str, str 
     return ("error" if res.get("isError") else "allow"), None, None
 
 
+def _approval_id(msg: dict[str, Any] | None) -> str | None:
+    """``data.approval_id`` of a ``-32008`` reply, if the server opened an approval."""
+    err = (msg or {}).get("error")
+    data = err.get("data") if isinstance(err, dict) else None
+    aid = data.get("approval_id") if isinstance(data, dict) else None
+    return aid if isinstance(aid, str) and aid else None
+
+
 class _Replayer:
     """Replays one case's steps in one arm and records a CallResult per call."""
 
@@ -982,7 +991,8 @@ class _Replayer:
     # calls
     def _record(self, call: Call, outcome: str, reason: str | None, decision: str | None,
                 reached: bool, intact: bool | None, detail: str | None = None,
-                returned: bool | None = None) -> None:  # fmt: skip
+                returned: bool | None = None,
+                approval_id: str | None = None) -> None:  # fmt: skip
         self.out.append(
             CallResult(
                 case=self.case.id,
@@ -1010,6 +1020,7 @@ class _Replayer:
                     else None
                 ),
                 output_returned=returned,
+                approval_id=approval_id,
             )
         )
         self.index += 1
@@ -1086,7 +1097,9 @@ class _Replayer:
             else:
                 reached, intact = _delivered(new, landed if landed in self.ups else None, c)
             returned = _returned(msg, c.output) if outcome == "allow" else None
-            self._record(c, outcome, reason, decision, reached, intact, returned=returned)
+            aid = _approval_id(msg) if outcome == "gated" else None
+            self._record(c, outcome, reason, decision, reached, intact, returned=returned,
+                         approval_id=aid)  # fmt: skip
 
     def run(self) -> list[CallResult]:
         for step in self.case.steps:

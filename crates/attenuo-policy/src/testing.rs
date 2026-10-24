@@ -23,9 +23,11 @@
 //!     session:                      # optional: the run's output labels (ADR-0009)
 //!       tainted_by: [web/fetch]     # sources as server/tool; tainted when non-empty
 //!       tainted: true               # optional; set it alone for an unreadable taint state
+//!     approval: { by: user }        # optional: the call carries a granted approval
 //! ```
 //!
-//! Without `session` the run is untainted, as for a run that has read nothing.
+//! Without `session` the run is untainted, as for a run that has read nothing. Without
+//! `approval`, `context.approval.present` is `false`.
 //!
 //! An inline catalog has the same shape as `[policy.catalog]` in the server config:
 //!
@@ -388,8 +390,19 @@ impl SessionSpec {
         if let Some(t) = self.tainted {
             session.tainted = t || !session.tainted_by.is_empty();
         }
-        CallLabels { session }
+        CallLabels {
+            session,
+            ..Default::default()
+        }
     }
+}
+
+/// A granted approval the case's call carries (`context.approval`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalSpec {
+    /// `context.approval.by`: `user` or `operator`.
+    pub by: String,
 }
 
 /// The decision a case expects.
@@ -439,6 +452,9 @@ pub struct TestCase {
     /// The run's output labels; untainted when absent.
     #[serde(default)]
     pub session: Option<SessionSpec>,
+    /// A granted approval the call carries; none when absent.
+    #[serde(default)]
+    pub approval: Option<ApprovalSpec>,
 }
 
 /// A parsed test file.
@@ -666,11 +682,14 @@ fn run_case(engine: &PolicyEngine, case: &TestCase, now_unix: i64) -> CaseReport
             return report;
         }
     };
-    let labels = case
+    let mut labels = case
         .session
         .as_ref()
         .map(SessionSpec::labels)
         .unwrap_or_default();
+    if let Some(a) = &case.approval {
+        labels.approval = crate::ApprovalContext::by(a.by.clone());
+    }
     let actual = Actual::from(engine.authorize_labelled(&chain, &call, &labels, now));
 
     if !case.expect.matches(&actual.decision) {

@@ -1,13 +1,15 @@
 """Synchronous and asynchronous clients for the attenuo server.
 
 Both classes expose the same methods; the async one has ``await`` in front. They mirror what the
-``attenuo`` CLI does over HTTP: ``POST /token``, ``POST /token/renew``, ``POST /mcp/{server}``
-and ``POST /access/v1/evaluation``.
+``attenuo`` CLI does over HTTP: ``POST /token``, ``POST /token/renew``, ``POST /mcp/{server}``,
+``POST /access/v1/evaluation`` and ``GET /approvals/{id}``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import itertools
+import time
 from collections.abc import Callable, Iterable
 from types import TracebackType
 from typing import Any
@@ -17,7 +19,7 @@ import httpx
 from . import _wire as w
 from .capability import CapabilityLike
 from .dpop import DpopKey, NonceCache, exchange_proofs, presented
-from .errors import AttenuoError
+from .errors import ApprovalNotGranted, ApprovalRequired, AttenuoError
 from .token import Token, decode_token, verify_token
 
 DEFAULT_TIMEOUT = 30.0
@@ -139,17 +141,28 @@ class Client:
     def _post(
         self, path: str, headers: Callable[[str | None], dict[str, str]], **kwargs: Any
     ) -> httpx.Response:
-        """``POST path`` with ``headers(nonce)``; once more with the server's new nonce when it
-        answers ``use_dpop_nonce``."""
-        resp = self._http.post(path, headers=headers(self._nonce.value), **kwargs)
+        return self._request("POST", path, headers, **kwargs)
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        headers: Callable[[str | None], dict[str, str]],
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """``method path`` with ``headers(nonce)``; once more with the server's new nonce when
+        it answers ``use_dpop_nonce``."""
+        resp = self._http.request(method, path, headers=headers(self._nonce.value), **kwargs)
         if self.dpop_key is not None and self._nonce.update(resp):
-            resp = self._http.post(path, headers=headers(self._nonce.value), **kwargs)
+            resp = self._http.request(method, path, headers=headers(self._nonce.value), **kwargs)
             self._nonce.update(resp)
         return resp
 
-    def _auth(self, token: str, path: str) -> Callable[[str | None], dict[str, str]]:
+    def _auth(
+        self, token: str, path: str, method: str = "POST"
+    ) -> Callable[[str | None], dict[str, str]]:
         url = f"{self.server_url}{path}"
-        return lambda nonce: presented(token, self.dpop_key, "POST", url, nonce)
+        return lambda nonce: presented(token, self.dpop_key, method, url, nonce)
 
     def renew(self, token: Token | str | None = None) -> w.Lease:
         """Extend the lease of the token's last hop (``POST /token/renew``)."""
@@ -213,6 +226,66 @@ class Client:
         """``tools/list``; the proxy shows only the tools this token may call."""
         result, _, _ = self._rpc(token, server, "tools/list", {}, session_id)
         return w.tools_from_result(result)
+
+    # -- approvals --
+    def get_approval(self, approval_id: str, token: Token | str | None = None) -> w.Approval:
+        """``GET /approvals/{id}`` with a delegation token of the same run (or the user's ID
+        token). Anyone else gets a 404 :class:`~attenuo.ApiError`."""
+        path = f"/approvals/{w.path_segment(approval_id, 'approval_id')}"
+        resp = self._request("GET", path, self._auth(w.bearer(token, self.token), path, "GET"))
+        return w.approval_from_json(w.json_body(resp))
+
+    def wait_for_approval(
+        self,
+        approval_id: str,
+        token: Token | str | None = None,
+        *,
+        timeout: float | None = None,
+        interval: float = 2.0,
+    ) -> w.Approval:
+        """Poll :meth:`get_approval` every ``interval`` seconds until the approval is granted.
+
+        Returns the granted approval. Raises :class:`~attenuo.ApprovalNotGranted` when it is
+        declined, expires, was already used, or ``timeout`` seconds pass first (without a
+        ``timeout`` the wait ends when the approval expires on the server).
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            approval = self.get_approval(approval_id, token)
+            if w.approval_ready(approval):
+                return approval
+            pause = interval
+            if deadline is not None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise ApprovalNotGranted(approval_id, "timeout")
+                pause = min(interval, left)
+            time.sleep(pause)
+
+    def call_tool_with_approval(
+        self,
+        token: Token | str | None,
+        server: str,
+        tool: str,
+        arguments: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        *,
+        on_approval: Callable[[ApprovalRequired], None] | None = None,
+        timeout: float | None = None,
+        interval: float = 2.0,
+    ) -> w.ToolResult:
+        """:meth:`call_tool`; when the call needs an approval (``-32008``), call
+        ``on_approval`` (to show the user the approval id), wait for the grant, and retry the
+        identical call once. A second ``-32008``, a decline or an expiry is raised."""
+        try:
+            return self.call_tool(token, server, tool, arguments, session_id)
+        except ApprovalRequired as e:
+            if e.approval_id is None:
+                raise
+            if on_approval is not None:
+                on_approval(e)
+            self.wait_for_approval(e.approval_id, token, timeout=timeout, interval=interval)
+        return self.call_tool(token, server, tool, arguments, session_id)
 
     # -- AuthZEN --
     def authzen_evaluate(
@@ -329,15 +402,28 @@ class AsyncClient:
     async def _post(
         self, path: str, headers: Callable[[str | None], dict[str, str]], **kwargs: Any
     ) -> httpx.Response:
-        resp = await self._http.post(path, headers=headers(self._nonce.value), **kwargs)
+        return await self._request("POST", path, headers, **kwargs)
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        headers: Callable[[str | None], dict[str, str]],
+        **kwargs: Any,
+    ) -> httpx.Response:
+        h = headers(self._nonce.value)
+        resp = await self._http.request(method, path, headers=h, **kwargs)
         if self.dpop_key is not None and self._nonce.update(resp):
-            resp = await self._http.post(path, headers=headers(self._nonce.value), **kwargs)
+            h = headers(self._nonce.value)
+            resp = await self._http.request(method, path, headers=h, **kwargs)
             self._nonce.update(resp)
         return resp
 
-    def _auth(self, token: str, path: str) -> Callable[[str | None], dict[str, str]]:
+    def _auth(
+        self, token: str, path: str, method: str = "POST"
+    ) -> Callable[[str | None], dict[str, str]]:
         url = f"{self.server_url}{path}"
-        return lambda nonce: presented(token, self.dpop_key, "POST", url, nonce)
+        return lambda nonce: presented(token, self.dpop_key, method, url, nonce)
 
     async def renew(self, token: Token | str | None = None) -> w.Lease:
         resp = await self._post(
@@ -398,6 +484,56 @@ class AsyncClient:
     ) -> list[w.Tool]:
         result, _, _ = await self._rpc(token, server, "tools/list", {}, session_id)
         return w.tools_from_result(result)
+
+    async def get_approval(self, approval_id: str, token: Token | str | None = None) -> w.Approval:
+        path = f"/approvals/{w.path_segment(approval_id, 'approval_id')}"
+        resp = await self._request(
+            "GET", path, self._auth(w.bearer(token, self.token), path, "GET")
+        )
+        return w.approval_from_json(w.json_body(resp))
+
+    async def wait_for_approval(
+        self,
+        approval_id: str,
+        token: Token | str | None = None,
+        *,
+        timeout: float | None = None,
+        interval: float = 2.0,
+    ) -> w.Approval:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            approval = await self.get_approval(approval_id, token)
+            if w.approval_ready(approval):
+                return approval
+            pause = interval
+            if deadline is not None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise ApprovalNotGranted(approval_id, "timeout")
+                pause = min(interval, left)
+            await asyncio.sleep(pause)
+
+    async def call_tool_with_approval(
+        self,
+        token: Token | str | None,
+        server: str,
+        tool: str,
+        arguments: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        *,
+        on_approval: Callable[[ApprovalRequired], None] | None = None,
+        timeout: float | None = None,
+        interval: float = 2.0,
+    ) -> w.ToolResult:
+        try:
+            return await self.call_tool(token, server, tool, arguments, session_id)
+        except ApprovalRequired as e:
+            if e.approval_id is None:
+                raise
+            if on_approval is not None:
+                on_approval(e)
+            await self.wait_for_approval(e.approval_id, token, timeout=timeout, interval=interval)
+        return await self.call_tool(token, server, tool, arguments, session_id)
 
     async def authzen_evaluate(
         self,

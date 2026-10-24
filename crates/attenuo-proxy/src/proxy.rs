@@ -1203,6 +1203,7 @@ async fn screen_message(
             id,
             verdict.decision_id,
             &call.call_hash(),
+            verdict.approval.as_ref(),
         ));
     } else {
         out.replies

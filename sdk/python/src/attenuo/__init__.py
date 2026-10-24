@@ -15,7 +15,7 @@ with Client("http://127.0.0.1:8080") as ob:
 
 from importlib.metadata import PackageNotFoundError, version
 
-from ._wire import AuthzenDecision, Lease, Tool, ToolResult
+from ._wire import Approval, AuthzenDecision, Lease, Tool, ToolResult
 from .admin import (
     AdminClient,
     AsyncAdminClient,
@@ -40,6 +40,8 @@ from .client import AsyncClient, Client
 from .dpop import DpopKey
 from .errors import (
     ApiError,
+    ApprovalNotGranted,
+    ApprovalRequired,
     AttenuoError,
     Denied,
     RefreshError,
@@ -58,6 +60,9 @@ except PackageNotFoundError:  # pragma: no cover - running from a source tree
 __all__ = [
     "AdminClient",
     "ApiError",
+    "Approval",
+    "ApprovalNotGranted",
+    "ApprovalRequired",
     "AsyncAdminClient",
     "AsyncClient",
     "AsyncTokenRefresher",

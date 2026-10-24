@@ -539,7 +539,8 @@ impl StaticAuthorizer {
     }
 
     /// Deny calls to `tool` (any server) that the capabilities permit with reason
-    /// `approval_required`, as an `@obligation("approval")` forbid would.
+    /// `approval_required`, as an `@obligation("approval")` forbid would. The decision carries
+    /// an approval ticket whose id is the decision id and which expires 120 s later.
     pub fn with_approval_required(mut self, tool: &str) -> Self {
         self.ask_for.insert(tool.to_owned());
         self
@@ -623,10 +624,19 @@ impl Authorizer for StaticAuthorizer {
         let record = DecisionRecord::new(now, decision.clone(), reason, chain, call, vec![]);
         let id = record.id;
         self.decisions.lock().expect("decisions mutex").push(record);
+        // An approval ticket for `approval_required`, as the server would store one: the
+        // approval id is the decision id here, so tests can predict it.
+        let approval = (reason == crate::auth::REASON_APPROVAL_REQUIRED).then(|| {
+            crate::auth::ApprovalTicket {
+                approval_id: id,
+                expires_at: now + time::Duration::seconds(120),
+            }
+        });
         AuthDecision {
             decision,
             reason: reason.into(),
             decision_id: id,
+            approval,
         }
     }
 

@@ -313,6 +313,90 @@ pub fn render_lease_tree(v: &Value) -> String {
     out
 }
 
+/// `approval list`: one line per approval, newest first.
+pub fn render_approvals(v: &Value) -> String {
+    let list = v["approvals"].as_array().cloned().unwrap_or_default();
+    if list.is_empty() {
+        return "no approvals\n".to_string();
+    }
+    let mut out = String::new();
+    for a in &list {
+        let state = if a["expired"] == true && matches!(s(a, "state"), "pending" | "granted") {
+            format!("{} (expired)", s(a, "state"))
+        } else {
+            s(a, "state").to_string()
+        };
+        out.push_str(&format!(
+            "{}  {:<18} {}/{}  run {}  expires {}\n",
+            s(a, "approval_id"),
+            state,
+            s(&a["call"], "server"),
+            s(&a["call"], "tool"),
+            s(a, "chain_id"),
+            s(a, "expires_at"),
+        ));
+    }
+    out
+}
+
+/// `approval show` (and the answer to `grant` / `decline`): the exact call the approval is
+/// for, the run's labels, and its state.
+pub fn render_approval(a: &Value) -> String {
+    let mut out = format!(
+        "approval   {}\nstate      {}{}\ncall       {}/{}\narguments  {}\ncall hash  {}\n",
+        s(a, "approval_id"),
+        s(a, "state"),
+        if a["expired"] == true {
+            " (expired)"
+        } else {
+            ""
+        },
+        s(&a["call"], "server"),
+        s(&a["call"], "tool"),
+        a["call"]["arguments"],
+        s(a, "call_hash"),
+    );
+    out.push_str(&format!(
+        "user       {} ({})\nagents     {}\nrun        {}\nlease      {}\n",
+        s(a, "subject"),
+        s(a, "issuer"),
+        strs(&a["agents"]).join(" > "),
+        s(a, "chain_id"),
+        s(a, "lease"),
+    ));
+    let labels = a["labels"].as_array().cloned().unwrap_or_default();
+    if labels.is_empty() {
+        out.push_str("labels     none\n");
+    } else {
+        for (i, l) in labels.iter().enumerate() {
+            out.push_str(&format!(
+                "{}{} (audit seq {})\n",
+                if i == 0 { "labels     " } else { "           " },
+                s(l, "source"),
+                l["seq"],
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "created    {}\nexpires    {}\n",
+        s(a, "created_at"),
+        s(a, "expires_at")
+    ));
+    if a["approver"].is_object() {
+        out.push_str(&format!(
+            "decided    {} by {} ({}, {})\n",
+            s(a, "decided_at"),
+            s(&a["approver"], "subject"),
+            s(&a["approver"], "by"),
+            s(&a["approver"], "method"),
+        ));
+    }
+    if a["consumed_by"].is_string() {
+        out.push_str(&format!("used by    decision {}\n", s(a, "consumed_by")));
+    }
+    out
+}
+
 /// `policy show`: what the server has loaded, then each policy's text.
 pub fn render_policies(v: &Value) -> String {
     let ids = strs(&v["policy_ids"]);
@@ -568,5 +652,57 @@ truncated: only 4 leases listed (raise --max-nodes); `would revoke` counts the w
         assert!(text.starts_with("DENY  policy_deny\n"), "{text}");
         assert!(text.contains("token (expired"), "{text}");
         assert!(text.contains("diagnostic: no policy matched"), "{text}");
+    }
+
+    fn approval() -> Value {
+        json!({
+            "approval_id": "a-1", "state": "granted", "expired": false, "chain_id": "l1",
+            "lease": "l2", "call_hash": "ab12",
+            "call": {"server": "github", "tool": "delete_repo", "arguments": {"repo": "a/b"}},
+            "labels": [{"source": "github/read_web", "seq": 3}],
+            "decision_id": "d-1", "subject": "alice", "issuer": "https://idp.example",
+            "agents": ["planner", "coder"], "created_at": "2026-10-24T09:00:00Z",
+            "expires_at": "2026-10-24T09:02:00Z", "decided_at": "2026-10-24T09:00:30Z",
+            "approver": {"subject": "alice", "method": "id_token", "by": "user"},
+        })
+    }
+
+    #[test]
+    fn approval_view_shows_the_exact_call_and_its_labels() {
+        let text = render_approval(&approval());
+        assert!(text.contains("call       github/delete_repo\n"), "{text}");
+        assert!(text.contains(r#"arguments  {"repo":"a/b"}"#), "{text}");
+        assert!(
+            text.contains("labels     github/read_web (audit seq 3)\n"),
+            "{text}"
+        );
+        assert!(text.contains("agents     planner > coder\n"), "{text}");
+        assert!(text.contains("by alice (user, id_token)"), "{text}");
+        assert!(!text.contains("used by"), "{text}");
+        let mut a = approval();
+        a["labels"] = json!([]);
+        a["consumed_by"] = json!("d-2");
+        a["expired"] = json!(true);
+        let text = render_approval(&a);
+        assert!(text.contains("labels     none\n"), "{text}");
+        assert!(text.contains("used by    decision d-2\n"), "{text}");
+        assert!(text.contains("state      granted (expired)\n"), "{text}");
+    }
+
+    #[test]
+    fn approval_list_has_one_line_each() {
+        assert_eq!(
+            render_approvals(&json!({"approvals": []})),
+            "no approvals\n"
+        );
+        let mut expired = approval();
+        expired["state"] = json!("pending");
+        expired["expired"] = json!(true);
+        let text = render_approvals(&json!({"approvals": [approval(), expired]}));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(lines[0].starts_with("a-1  granted"), "{text}");
+        assert!(lines[0].contains("github/delete_repo  run l1"), "{text}");
+        assert!(lines[1].contains("pending (expired)"), "{text}");
     }
 }

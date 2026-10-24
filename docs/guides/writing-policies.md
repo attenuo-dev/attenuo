@@ -22,7 +22,7 @@ Every call becomes one Cedar request.
 | `context.now_unix` | evaluation time, unix seconds |
 | `context.session` | output labels of the delegation run: `tainted` (bool) and `tainted_by` (set of `"<server>/<tool>"`); see [Asking for approval after untrusted output](#asking-for-approval-after-untrusted-output) |
 | `context.args_contain_untrusted`, `context.untrusted_args` | `false` and an empty set for now; argument matching is not built yet |
-| `context.approval` | `present` (bool) and `by` (string); `false` and `""` until approvals are built |
+| `context.approval` | `present` (bool) and `by` (`"user"`, `"operator"`, or `""` without an approval): whether this call carries a granted approval for its exact hash; see [Asking for approval after untrusted output](#asking-for-approval-after-untrusted-output) |
 
 The action names the server as well as the tool. `action == Action::"github/read_file"` matches `read_file` on the upstream mounted as `github` and nothing else: a second upstream that also has a `read_file` tool (a malicious one, say) is not covered by that permit. To write a rule for every tool of one server, use the resource: `resource in Server::"github"`. To write one for every tool everywhere, leave `action` unconstrained or use `action in Action::"invoke"`.
 
@@ -146,7 +146,9 @@ when {
 };
 ```
 
-`@obligation("approval")` turns the forbid into a request for approval. When every forbid that applied carries it, and some permit would allow the call without them, the reason is `approval_required` instead of `policy_deny`, and the proxy answers JSON-RPC `-32008` with the call's `call_hash`. A forbid without the annotation still refuses outright, so an approval cannot unlock what another rule forbids. `approval` is the only value; any other value, or the annotation on a `permit`, fails the load and `attenuo policy lint`. Approving a call is not built yet, so for now `approval_required` is a deny that says why.
+`@obligation("approval")` turns the forbid into a request for approval. When every forbid that applied carries it, and some permit would allow the call without them, the reason is `approval_required` instead of `policy_deny`, and the proxy answers JSON-RPC `-32008` with the call's `call_hash`. A forbid without the annotation still refuses outright, so an approval cannot unlock what another rule forbids. `approval` is the only value; any other value, or the annotation on a `permit`, fails the load and `attenuo policy lint`. The `-32008` error also carries an `approval_id` and its `expires_at`.
+
+The run's originating user grants the approval with their own ID token (`POST /approvals/{id}`), or an operator does (`attenuo approval grant`, or the console). The agent then retries the identical call, same server, tool and arguments, with a token of the same hop. That one retry sees `context.approval.present == true` and `context.approval.by` set to `"user"` or `"operator"`, so the forbid above no longer applies; a second retry asks again. An approval expires after `[approvals] ttl_seconds` (default 120) or with the hop's lease, whichever comes first. To accept only the user's own approval, test `context.approval.by == "user"` instead of `present`.
 
 [`config/policies/output-labels.cedar`](../../config/policies/output-labels.cedar) has this rule and the mail rule from the design, with tests in `output-labels_test.yaml` next to it.
 
@@ -236,7 +238,7 @@ The harness builds a real `DelegationChain` and calls the same `PolicyEngine::au
 
 - **Valid chains only.** The chain is validated like a received one. A child wider than its parent, for example, is reported as a failed case with the reason, so a test cannot describe a delegation the server would refuse to issue.
 - **Defaults.** User `alice` at `https://idp.example`, authenticated a minute before `now`; time fixed at 1760000000; each hop lives an hour; lease ids are random. `policy_ids: []` asserts that no policy matched (a default deny).
-- **Output labels.** A case's `session: { tainted_by: [web/fetch] }` evaluates the call as part of a run that has read that source; `tainted: true` with no sources is a run whose taint state could not be read. Without `session` the run is untainted. `reason` also accepts `approval_required`.
+- **Output labels.** A case's `session: { tainted_by: [web/fetch] }` evaluates the call as part of a run that has read that source; `tainted: true` with no sources is a run whose taint state could not be read. Without `session` the run is untainted. `reason` also accepts `approval_required`. `approval: { by: user }` evaluates the call as a retry that carries a granted approval (`by` is `user` or `operator`); without it there is none.
 - **Mistakes in the file** (unknown keys, a missing `expect`, duplicate case names, an empty `cases`) are errors, not silent passes.
 
 ### Running

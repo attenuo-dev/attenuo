@@ -130,8 +130,8 @@ pub mod stage;
 pub mod testing;
 
 pub use auth::{
-    AuthDecision, AuthError, Authenticated, Authorizer, RequestAuth, REASON_APPROVAL_REQUIRED,
-    REASON_LABEL_ERROR,
+    ApprovalTicket, AuthDecision, AuthError, Authenticated, Authorizer, RequestAuth,
+    REASON_APPROVAL_REQUIRED, REASON_LABEL_ERROR,
 };
 pub use config::{ProxyConfig, UpstreamConfig};
 pub use proxy::{

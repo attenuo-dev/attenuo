@@ -8,7 +8,9 @@
 //   context.session.tainted_by      "<server>/<tool>" of every source
 //   resource.destructive            catalog `destructive`, default `!readonly`
 //   context.args_contain_untrusted  always false until argument matching exists
-//   context.approval.present        always false until approvals exist
+//   context.approval.present        the call carries a granted approval for its exact
+//                                   call hash (single use, see `POST /approvals/{id}`)
+//   context.approval.by             "user" or "operator" when present, else ""
 //
 // A forbid annotated @obligation("approval") asks instead of refusing: when it is the only
 // kind of forbid that applied, and a permit would allow the call without it, the decision is

@@ -531,6 +531,57 @@ fn entry_hash_golden_vector() {
     );
 }
 
+/// ADR-0009: the approval fields are omitted when absent, so the golden decision record above
+/// keeps its hash, and a record of the new kinds hashes like any other. Pins the construction
+/// of an `approval_grant` record and of a decision that consumed an approval.
+#[test]
+fn approval_records_keep_existing_hashes_and_pin_their_own() {
+    let base = serde_json::json!({
+        "agents": ["agent:planner"], "arguments_digest": "ab".repeat(32), "chain_depth": 1,
+        "chain_digest": "cd".repeat(32), "chain_id": "l1", "decision": "allow",
+        "id": "00000000-0000-4000-8000-000000000001", "kind": "decision", "leases": ["l1"],
+        "originating_subject": "user:mudit", "reason": "policy_allow", "server": "github",
+        "tool": "read_file", "at": "2026-10-23T12:00:00Z"
+    });
+    let record: attenuo_core::DecisionRecord = serde_json::from_value(base.clone()).unwrap();
+    assert!(record.approval.is_none());
+    assert!(!attenuo_audit::canonical_record_json(&record).contains("approval"));
+    assert_eq!(
+        compute_entry_hash(7, &"11".repeat(32), &record),
+        "e8ababad86538918f6eee2d5edb7e6aa4bfa8f8f6ea032f2b5fde00dfe52d693"
+    );
+
+    let mut consumed = base.clone();
+    consumed["approval"] =
+        serde_json::json!({"id": "00000000-0000-4000-8000-0000000000aa", "by": "user"});
+    let consumed: attenuo_core::DecisionRecord = serde_json::from_value(consumed).unwrap();
+    let json = attenuo_audit::canonical_record_json(&consumed);
+    assert!(
+        json.contains(r#""approval":{"by":"user","id":"00000000-0000-4000-8000-0000000000aa"}"#),
+        "{json}"
+    );
+    assert_eq!(
+        compute_entry_hash(8, &"11".repeat(32), &consumed),
+        "b376c681113872e53feedf22afe80fc1c06328f2a026fa99b5a311c024a062a7"
+    );
+
+    let mut grant = base;
+    grant["kind"] = "approval_grant".into();
+    grant["reason"] = "approval_granted".into();
+    grant["decision_id"] = "00000000-0000-4000-8000-000000000002".into();
+    grant["approval"] = serde_json::json!({
+        "id": "00000000-0000-4000-8000-0000000000aa", "by": "user", "call_hash": "ef".repeat(32),
+        "expires_at": "2026-10-23T12:02:00Z", "approver": "user:mudit", "method": "id_token",
+        "outcome": "grant"
+    });
+    let grant: attenuo_core::DecisionRecord = serde_json::from_value(grant).unwrap();
+    assert_eq!(grant.kind, RecordKind::ApprovalGrant);
+    assert_eq!(
+        compute_entry_hash(9, &"11".repeat(32), &grant),
+        "74c24641e07bd631613bd369283e7d75fb859e570f1bb63a7409ae81f16045b4"
+    );
+}
+
 /// Fuzzing F4: an entry whose `seq` is `u64::MAX`, with a correct hash, used to overflow
 /// `seq + 1` in the chain walk (a panic with overflow checks on). It is now a bad entry.
 #[test]

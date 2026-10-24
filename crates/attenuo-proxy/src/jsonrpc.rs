@@ -27,7 +27,9 @@ pub const CODE_UNAVAILABLE: i64 = -32006;
 pub const CODE_TOO_MANY: i64 = -32007;
 /// attenuo: the policy asks for an approval of this exact call before it may run
 /// (`@obligation("approval")`, ADR-0009). Sent inside a `200` JSON-RPC response, like a
-/// denial; `data` carries `reason: "approval_required"`, `decision_id` and `call_hash`.
+/// denial; `data` carries `reason: "approval_required"`, `decision_id`, `call_hash` and,
+/// when the approval was stored, `approval_id` and `expires_at` (RFC 3339). The code is not
+/// reserved anywhere (design open question 10).
 pub const CODE_APPROVAL_REQUIRED: i64 = -32008;
 
 /// MCP method names the proxy understands.
@@ -85,18 +87,34 @@ pub fn denied_response(id: Value, reason: &str, decision_id: Uuid) -> Value {
 }
 
 /// The error response for a call whose decision is `approval_required`. `call_hash` is
-/// [`attenuo_core::ToolCall::call_hash`], the value an approval is bound to.
-pub fn approval_required_response(id: Value, decision_id: Uuid, call_hash: &str) -> Value {
-    error_response(
-        id,
-        CODE_APPROVAL_REQUIRED,
-        "attenuo: approval required",
-        Some(json!({
-            "reason": crate::auth::REASON_APPROVAL_REQUIRED,
-            "decision_id": decision_id,
-            "call_hash": call_hash,
-        })),
-    )
+/// [`attenuo_core::ToolCall::call_hash`], the value an approval is bound to; `approval` is the
+/// pending approval the authorizer stored, if it could store one.
+pub fn approval_required_response(
+    id: Value,
+    decision_id: Uuid,
+    call_hash: &str,
+    approval: Option<&crate::auth::ApprovalTicket>,
+) -> Value {
+    let mut data = json!({
+        "reason": crate::auth::REASON_APPROVAL_REQUIRED,
+        "decision_id": decision_id,
+        "call_hash": call_hash,
+    });
+    if let Some(a) = approval {
+        data["approval_id"] = json!(a.approval_id);
+        data["expires_at"] = json!(a
+            .expires_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default());
+    }
+    let message = match approval {
+        Some(a) => format!(
+            "attenuo: approval required: ask the user to approve {} (POST /approvals/{})",
+            a.approval_id, a.approval_id
+        ),
+        None => "attenuo: approval required".to_string(),
+    };
+    error_response(id, CODE_APPROVAL_REQUIRED, message, Some(data))
 }
 
 /// The `method` of a request or notification, if it has one.
@@ -133,13 +151,26 @@ mod tests {
     #[test]
     fn approval_required_response_shape() {
         let id = Uuid::nil();
-        let v = approval_required_response(json!("a"), id, "ab12");
+        let v = approval_required_response(json!("a"), id, "ab12", None);
         assert_eq!(v["id"], "a");
         assert_eq!(v["error"]["code"], -32008);
         assert_eq!(v["error"]["data"]["reason"], "approval_required");
         assert_eq!(v["error"]["data"]["decision_id"], id.to_string());
         assert_eq!(v["error"]["data"]["call_hash"], "ab12");
         assert!(v["error"]["data"].get("approval_id").is_none());
+
+        let ticket = crate::auth::ApprovalTicket {
+            approval_id: Uuid::from_u128(7),
+            expires_at: time::macros::datetime!(2026-10-24 12:00 UTC),
+        };
+        let v = approval_required_response(json!("a"), id, "ab12", Some(&ticket));
+        let data = &v["error"]["data"];
+        assert_eq!(data["approval_id"], ticket.approval_id.to_string());
+        assert_eq!(data["expires_at"], "2026-10-24T12:00:00Z");
+        assert!(v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&ticket.approval_id.to_string()));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! HTTP handlers, one module per concern.
 
 pub mod admin;
+pub mod approvals;
 pub mod authzen;
 pub mod dev_root;
 pub mod ops;
@@ -152,6 +153,7 @@ pub(crate) fn audit_admin(
         decision_id: None,
         result: None,
         labels: None,
+        approval: None,
     };
     let id = record.id;
     state

@@ -114,6 +114,15 @@ It also sets sender-constrained tokens (DPoP, RFC 9449; see [Binding tokens to k
 | `dpop_replay_capacity` | 1000000 | Most proof `jti`s kept in memory. When full, new proofs are refused with 503 `dpop_replay_cache_full` until old ones age out. At least 1. |
 | `dpop_nonce` | `"off"` | Server-provided nonces (RFC 9449 §8). `"off"`: a proof's `nonce` claim is ignored. `"required"`: every response to a request with a `DPoP` header, and every `WWW-Authenticate: DPoP` challenge, carries a `DPoP-Nonce` header, and every `DPoP` header proof must carry a current nonce, or the request is refused with 401 `use_dpop_nonce`. Nonces are stateless (an HMAC of a `dpop_max_age_seconds`-wide time bucket, keyed from the issuer's signing key) and live one to two buckets. The exchange sign-off needs none. |
 
+## `[approvals]`
+
+Approvals of calls a policy gates with `@obligation("approval")` (see [Writing policies](../guides/writing-policies.md#asking-for-approval-after-untrusted-output)).
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `ttl_seconds` | 120 | How long a pending or granted approval stays usable. It also ends with the calling hop's token or lease, whichever comes first. 1 to 86400. The default is the one in the output-labelling design, section 3.7. |
+| `client_id` | none | The `aud` an ID token must carry to decide at `POST /approvals/{id}`. Unset, it is the client id hop-0 intake expects for the run's root agent. Set it to a client the agent does not control, such as the approval page's own OAuth client, so that an ID token the agent can get for itself cannot approve its calls. |
+
 ## `[[actor_trust]]`
 
 Issuers of workload identities whose JWTs are accepted as the RFC 8693 `actor_token` of an exchange. Give each entry exactly one key source: `jwks_url` (with `issuer`), or `spiffe_trust_domain` with `spiffe_bundle_url`. Neither is discovered. Hop 0 (IdP intake) still authenticates the agent with `[[agents]]` client credentials.
