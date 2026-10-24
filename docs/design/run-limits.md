@@ -326,7 +326,9 @@ From [performance](performance.md#output-labelling-and-run-limits-on-the-hot-pat
 | Charges a `sum` limit | about 0.8 to 1.0 ms | one `fsync` per call; since #56 it rides the decision append, the same from one client and 1.3 to 1.8 times the throughput under concurrency in process ([follow-up](performance.md#sum-charge-follow-up-2026-10-24)) |
 | Writes run usage (when tracked) | +98 to +144 us | [run usage write](performance.md#run-usage-write-2026-10-24); no write when nothing reads usage |
 | Is gated by a soft limit | about 3.3 ms per approval round | gated call, grant and retry, without the human |
-| Charges `calls_per` or `distinct` | not measured | |
+| Charges `calls_per` | about 100 to 170 us, new or repeated value | as `calls`; the charge transaction is about 75 us (100 us for a new value) ([limit kinds](performance.md#limit-kinds-callsper-and-distinct-2026-10-24)) |
+| Charges `distinct` with a new value | about 190 to 240 us | raw value or URL host alike: four counter writes; the URL parse is under 1 us |
+| Charges `distinct` with a seen value | within noise (-59 to +70 us) | no write; the charge transaction still runs, about 25 us |
 
 ### What an operator should set
 
