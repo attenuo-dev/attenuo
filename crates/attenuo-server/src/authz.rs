@@ -100,7 +100,7 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::metrics::Metrics;
+use crate::metrics::{ExhaustedAt, Metrics, RefundSource};
 
 /// Reason code: a lease in the chain (or an ancestor of one) was revoked.
 pub const REASON_LEASE_REVOKED: &str = "lease_revoked";
@@ -446,12 +446,13 @@ impl Pipeline {
         let chain_id = chain_id_of(chain)?;
         let digest = attenuo_core::digest::sha256_bytes(chain_id.as_bytes());
         let stripe = usize::from_str_radix(&digest[..8], 16).unwrap_or(0) % self.run_locks.len();
+        let waiting = Instant::now();
         // A panic while holding the lock leaves nothing half-written that the lock guards.
-        Some(
-            self.run_locks[stripe]
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        )
+        let guard = self.run_locks[stripe]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.metrics.observe_run_lock_wait(waiting.elapsed());
+        Some(guard)
     }
 
     /// Accept signed approval tokens that verify under `verifier` (the issuer's own verifier:
@@ -619,6 +620,8 @@ impl Pipeline {
         let mut limit = (reason == REASON_BUDGET_EXHAUSTED)
             .then(|| budget.hit.clone())
             .flatten();
+        // Where the limit was met, for `budget_exhausted_total`.
+        let mut exhausted_at = ExhaustedAt::Check;
         // Charge an allowed call against every matching limit, re-checking in the store's
         // transaction: a concurrent call may have spent the budget since it was read.
         let mut charged: Option<RecordBudget> = None;
@@ -641,6 +644,9 @@ impl Pipeline {
             match outcome {
                 Ok(ChargeOutcome::Charged { used_after }) => {
                     any_charged = true;
+                    for c in budget.charges.iter().filter(|c| !c.usage) {
+                        self.metrics.budget_charged(c.kind);
+                    }
                     let limits: Vec<BudgetCharge> = budget
                         .charges
                         .iter()
@@ -658,6 +664,7 @@ impl Pipeline {
                     charged = (!limits.is_empty()).then_some(RecordBudget { charged: limits });
                 }
                 Ok(ChargeOutcome::Exhausted { index, used }) => {
+                    exhausted_at = ExhaustedAt::Charge;
                     let hit = LimitHit::of(&budget.charges[index], used);
                     diagnostics.push(hit.detail());
                     limit = Some(hit);
@@ -739,6 +746,18 @@ impl Pipeline {
         match appended {
             Ok(entry) => {
                 let record = entry.record;
+                if let Some(hit) = limit
+                    .as_ref()
+                    .filter(|_| record.reason == REASON_BUDGET_EXHAUSTED)
+                {
+                    self.metrics.budget_exhausted(hit.kind, exhausted_at);
+                }
+                if let Some((_, by)) = &consumed_approval {
+                    self.metrics.approval_consumed(by);
+                }
+                if !record_labels.untrusted_args.is_empty() {
+                    self.metrics.taint_match(record.decision.is_allow());
+                }
                 // Subject, agent, server and tool come from the caller: Debug-format them so
                 // a newline cannot forge a log line (SR-18).
                 tracing::info!(
@@ -879,7 +898,10 @@ impl Pipeline {
             Ok(Some(a)) => Ok(a),
             Ok(None) => {
                 let state = match self.leases.approval(&claims.jti) {
-                    Ok(Some(a)) if a.is_expired(now) => "expired".to_string(),
+                    Ok(Some(a)) if a.is_expired(now) => {
+                        self.metrics.approval_expired();
+                        "expired".to_string()
+                    }
                     Ok(Some(a)) => a.state.as_str().to_string(),
                     Ok(None) => "unknown".to_string(),
                     Err(_) => "unreadable".to_string(),
@@ -1045,8 +1067,11 @@ impl Pipeline {
     /// exactly when an allowed decision that charged it is in the log. A failed refund leaves
     /// the budget spent (fails closed) and is logged.
     fn refund_unrecorded(&self, decision_id: Uuid, now: OffsetDateTime) {
-        if let Err(e) = self.leases.refund(&decision_id.to_string(), now) {
-            tracing::error!(error = %e, decision = %decision_id, "could not refund an unrecorded charge");
+        match self.leases.refund(&decision_id.to_string(), now) {
+            Ok(_) => self.metrics.budget_refunded(RefundSource::AuditError),
+            Err(e) => {
+                tracing::error!(error = %e, decision = %decision_id, "could not refund an unrecorded charge")
+            }
         }
     }
 
@@ -1133,6 +1158,7 @@ impl Pipeline {
                 diagnostics.push(format!("approval request could not be recorded: {e}"));
                 return None;
             }
+            self.metrics.approval_created();
         }
         Some(ApprovalTicket {
             approval_id,
@@ -1338,6 +1364,7 @@ impl Pipeline {
                     REASON_LABEL_ERROR.to_string()
                 })?;
         }
+        self.metrics.result_recorded(label);
         tracing::debug!(
             server = ?call.server,
             tool = ?call.tool,
@@ -2216,6 +2243,19 @@ when { context.input has amount && context.input.amount > 1000 };
             p.decide(&c, &send(json!(1)), now).reason,
             REASON_BUDGET_EXHAUSTED
         );
+        // On /metrics: two charges (the refunded one and the recorded one), one refund by
+        // the pipeline, one exhaustion at the check.
+        let text = p.metrics().render();
+        for line in [
+            "attenuo_budget_charges_total{kind=\"calls\"} 2\n",
+            "attenuo_budget_refunds_total{source=\"audit_error\"} 1\n",
+            "attenuo_budget_refunds_total{source=\"operator\"} 0\n",
+            "attenuo_budget_exhausted_total{kind=\"calls\",at=\"check\"} 1\n",
+            "attenuo_budget_exhausted_total{kind=\"calls\",at=\"charge\"} 0\n",
+            "attenuo_decisions_total{decision=\"deny\",reason=\"audit_error\"} 1\n",
+        ] {
+            assert!(text.contains(line), "{line}{text}");
+        }
     }
 
     /// A SQLite log that notes which append each decision used, and can be made to fail.
@@ -2902,6 +2942,9 @@ mod run_lock_tests {
         inner: MemoryLeaseStore,
         readers: Mutex<usize>,
         arrived: Condvar,
+        /// Budget reads see empty counters, as if another process had not charged yet; only
+        /// the store's charge transaction sees what was spent.
+        stale: std::sync::atomic::AtomicBool,
     }
 
     impl LeaseStore for Rendezvous {
@@ -2994,6 +3037,9 @@ mod run_lock_tests {
             self.inner.remove_approval(id)
         }
         fn budget_used(&self, c: &[Charge]) -> Result<Vec<u64>, AuditError> {
+            if self.stale.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(vec![0; c.len()]);
+            }
             let mut readers = self.readers.lock().unwrap();
             *readers += 1;
             self.arrived.notify_all();
@@ -3027,11 +3073,20 @@ mod run_lock_tests {
     }
 
     fn run(policies: &str, limits: Limits) -> (Arc<Pipeline>, DelegationChain, OffsetDateTime) {
+        run_with(policies, limits, false)
+    }
+
+    fn run_with(
+        policies: &str,
+        limits: Limits,
+        stale: bool,
+    ) -> (Arc<Pipeline>, DelegationChain, OffsetDateTime) {
         let now = OffsetDateTime::now_utc();
         let leases = Arc::new(Rendezvous {
             inner: MemoryLeaseStore::new(),
             readers: Mutex::new(0),
             arrived: Condvar::new(),
+            stale: stale.into(),
         });
         leases
             .register(&LeaseId::new("l1"), None, now + Duration::hours(1))
@@ -3128,5 +3183,39 @@ when { context.budget.calls_remaining <= 1 && !context.approval.present };
             ]),
             "{out:#?}"
         );
+    }
+
+    /// The run lock is timed for every guarded decision, and a limit met only in the store's
+    /// charge transaction (the read saw room) is counted at `charge`, not `check`.
+    #[test]
+    fn metrics_time_the_run_lock_and_tell_a_charge_time_exhaustion() {
+        let (p, chain, now) = run_with(
+            "permit(principal, action, resource);",
+            Limits::default().with_calls(1),
+            true,
+        );
+        let call = ToolCall::new("bank", "send", json!({"amount": 1}));
+        assert!(p.decide(&chain, &call, now).is_allow());
+        let d = p.decide(&chain, &call, now);
+        assert_eq!(d.reason, REASON_BUDGET_EXHAUSTED);
+        assert_eq!(d.limit.as_ref().map(|l| l.kind), Some(LimitKind::Calls));
+        let text = p.metrics().render();
+        crate::metrics::check_text_format(&text).unwrap();
+        for line in [
+            "attenuo_budget_exhausted_total{kind=\"calls\",at=\"charge\"} 1\n",
+            "attenuo_budget_exhausted_total{kind=\"calls\",at=\"check\"} 0\n",
+            "attenuo_budget_charges_total{kind=\"calls\"} 1\n",
+            "attenuo_run_lock_wait_seconds_count 2\n",
+            "attenuo_run_lock_wait_seconds_bucket{le=\"+Inf\"} 2\n",
+        ] {
+            assert!(text.contains(line), "{line}{text}");
+        }
+        // A decision whose leases are not live never takes the lock.
+        let dead = p.decide(&chain, &call, now + Duration::hours(2));
+        assert_eq!(dead.reason, REASON_LEASE_EXPIRED);
+        assert!(p
+            .metrics()
+            .render()
+            .contains("attenuo_run_lock_wait_seconds_count 2\n"));
     }
 }

@@ -24,6 +24,7 @@ use time::OffsetDateTime;
 
 use super::{audit_admin, bearer_of, now, REASON_ADMIN_ACTION};
 use crate::error::ApiError;
+use crate::metrics::RefundSource;
 use crate::state::AppState;
 use attenuo_core::Decision;
 use sha2::Digest;
@@ -175,6 +176,7 @@ pub async fn refund_budget(
                     ),
                     other => ApiError::internal(other),
                 })?;
+            state.metrics.budget_refunded(RefundSource::Operator);
             tracing::warn!(decision = ?decision_id, reason = ?reason, refunded, "budget refunded");
             let audit_id = audit_admin(
                 state,

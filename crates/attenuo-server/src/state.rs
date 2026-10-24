@@ -469,6 +469,7 @@ fn open_storage(
     metrics: Arc<Metrics>,
     sink: Option<crate::sink::SinkHandle>,
 ) -> anyhow::Result<(Arc<SqliteAudit>, Arc<SqliteLeaseStore>)> {
+    let wal_metrics = Arc::clone(&metrics);
     // Runs after the commit that wrote the checkpoint was synced (SR-50); the sink only queues.
     let count = move |cp: &attenuo_audit::Checkpoint| {
         metrics.audit_checkpoint();
@@ -493,12 +494,18 @@ fn open_storage(
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let wal_interval = std::time::Duration::from_secs(cfg.wal_checkpoint_seconds);
-    let audit = SqliteAudit::open_with(p, cfg.durability)
-        .with_context(|| format!("opening audit log {path}"))?
-        .with_checkpointing(signer, cfg.checkpoint_every)
-        .with_checkpoint_hook(count)
-        .with_wal_checkpoints(wal_interval)
-        .with_context(|| format!("starting the WAL checkpointer for {path}"))?;
+    let audit = Arc::new(
+        SqliteAudit::open_with(p, cfg.durability)
+            .with_context(|| format!("opening audit log {path}"))?
+            .with_checkpointing(signer, cfg.checkpoint_every)
+            .with_checkpoint_hook(count)
+            .with_wal_checkpoints(wal_interval)
+            .with_context(|| format!("starting the WAL checkpointer for {path}"))?,
+    );
+    // Weak: the store's checkpoint hook holds the metrics, so a strong reference back would
+    // keep the store (and its final WAL checkpoint on drop) alive forever.
+    let weak = Arc::downgrade(&audit);
+    wal_metrics.set_wal_source(move || weak.upgrade().and_then(|a| a.wal_stats()));
     let mut leases = SqliteLeaseStore::open_with(p, cfg.durability)
         .with_context(|| format!("opening lease store {path}"))?;
     if !wal_interval.is_zero() {
@@ -511,7 +518,7 @@ fn open_storage(
         wal_checkpoint_seconds = cfg.wal_checkpoint_seconds,
         "audit store opened (WAL)"
     );
-    Ok((Arc::new(audit), Arc::new(leases)))
+    Ok((audit, Arc::new(leases)))
 }
 
 #[cfg(test)]
