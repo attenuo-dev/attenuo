@@ -153,6 +153,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: attenuo policy test
         run: cargo run --locked -q -p attenuo-cli -- policy test examples/github-leak-demo/policy_test.yaml
+      - name: attenuo policy test (config/policies)
+        run: cargo run --locked -q -p attenuo-cli -- policy test --fail-on-unexercised config/policies/*_test.yaml
 
   # Builds the cargo-fuzz targets (nightly, outside the workspace) and runs each over its seed
   # corpus once, so a target that stops compiling or a seed that crashes fails CI. Long fuzzing
