@@ -357,7 +357,17 @@ The last lines of a run list the policies that no case exercised, with the file 
 
 #### Against a running server
 
-The offline run proves the policy file. To check what a deployed server actually decides (its loaded policies, its catalog, its configuration), send the same cases to its AuthZEN endpoint:
+The offline run proves the policy file. To check what a deployed server actually decides (its loaded policies, its catalog, its configuration), send the same cases to it. `--via` picks how:
+
+| `--via` | Decided by | Credential | Chain | Runs | Skips | Audited |
+| --- | --- | --- | --- | --- | --- | --- |
+| `local` (default) | the engine built from the test file, offline | none | the case's | every case | nothing | no |
+| `authzen` | `POST /access/v1/evaluation`, as a PEP would ask | a delegation token | the token's | cases that match the token | `session`, `approval`, `budget`, `usage`, `user.authenticated_at_unix`, another `user` or `chain` | yes, one record per case |
+| `admin-evaluate` | `POST /admin/policies/evaluate`, the admin dry run | the admin token | the case's | every case except `budget` | `budget` | no |
+
+`authzen` checks the path an enforcement point takes, lease check included, for one real token. `admin-evaluate` replays the whole suite against the server's policies, catalog and schema, with no token and nothing left in the audit log, so it is the one to run after a deploy or a policy reload.
+
+The AuthZEN arm:
 
 ```sh
 attenuo --server https://attenuo.internal policy test --via authzen --token-file coder.jwt policy_test.yaml
@@ -370,6 +380,15 @@ Each case's call goes to `POST /access/v1/evaluation` with the token as the bear
 - a `chain`, if the case sets one, naming the token's agents in order, with any explicit `capabilities` equal to that hop's capabilities in the token.
 
 Other cases are listed as skipped, with the reason, and do not fail the run. The file's `catalog`, `unknown_tools` and `now` are ignored, since the server uses its own. Every evaluation is a real decision, so each case leaves an audit record on that server; use a test token and a test run, not a production agent's token. The unexercised list still comes from the test file's local `policies` file, which may differ from what the server has loaded.
+
+The admin dry-run arm:
+
+```sh
+attenuo --server https://attenuo.internal --admin-token-file /run/secrets/attenuo-admin \
+  policy test --via admin-evaluate policy_test.yaml
+```
+
+Each case is sent with the chain it describes, and with its `session`, `approval` and `usage` as the run's state (a case without them is an untainted run with no usage). The server checks the chain's shape and its own `max_depth`, not that it issued the chain, runs the capability stage and Cedar, and answers without a lease check, a charge or an audit record. Only a case that sets `budget` is skipped: the dry run works out `context.budget` from the run limits in the chain's capabilities and the server's counters. The chain is stamped at the current time and the server evaluates at its own clock, so `now` is not sent (a `note:` says so); `user.authenticated_at_unix` keeps its distance from the file's `now`. A case the server refuses (a chain deeper than its `max_depth`, say) fails with the server's reason; a wrong admin token stops the file. The file's `catalog`, `unknown_tools` and `--schema-file` do not apply, as with `authzen`.
 
 #### While editing
 
@@ -418,5 +437,7 @@ Pin the install to a tag or `--rev` once releases exist, so a CLI change cannot 
 - The missing-argument case. A call with no `repo` must be denied, not an error.
 - A capability denial, to prove the chain is narrower than the policy.
 - The boundary of numeric limits (`depth > 3`: three agents pass, four do not).
+
+[`config/policies/default_test.yaml`](../../config/policies/default_test.yaml) does each of these for the starter policy set, `default.cedar`.
 
 A `forbid` that never appears in a passing test is a `forbid` you have not shown works. The unexercised list at the end of every run names the ones no case reached at all.
