@@ -469,6 +469,16 @@ def test_limits_arm_rates_and_table() -> None:
     doc |= {"rates": {arm: r}, "skipped_arms": {}}
     table = "\n".join(run.render_limits(doc))
     assert "### Run limits in `attenuo_limits`" in table and "| 1/2 (50%) |" in table
+    assert r["benign_lost_to_limits"] == [
+        {"case": "x", "index": 0, "tool": "t", "when": "first attempt"}
+    ]
+    assert "| x | 0 | `t` | first attempt |" in table
+    # A benign retry after a grant that a limit refused is a loss too (combined arm).
+    both = "attenuo_labels_limits"
+    spent = {**_limits_call(both, "benign", "gated"), "after_approval": "denied",
+             "retry_stage": "budget"}  # fmt: skip
+    lost = run.arm_rates({"arms": [both], "calls": [spent]})[both]["benign_lost_to_limits"]
+    assert [x["when"] for x in lost] == ["retry after approval"]
     assert arm in run.ARM_NAMES and "attenuo_labels_limits" in run.ARM_NAMES
 
 
