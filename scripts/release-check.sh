@@ -68,7 +68,7 @@ book() {
   mdbook build -d "$out"
   rm -rf "$out"
 }
-policy()  { cargo run -q --locked -p attenuo-cli -- policy test examples/github-leak-demo/policy_test.yaml; }
+policy()  { cargo run -q --locked -p attenuo-cli -- policy test examples/github-leak-demo/policy_test.yaml examples/multi-hop-demo/policy_test.yaml; }
 suite()   { "$PYTHON" -m pytest evaluation/injection-suite -q -rf; }
 sdk_python() {
   (
