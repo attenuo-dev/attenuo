@@ -34,7 +34,7 @@
 - [Fuzzing](design/fuzzing.md)
 - [Admin console](design/admin-console.md)
 - [Output labelling (proposed)](design/output-labelling.md)
-- [Run limits (proposed)](design/run-limits.md)
+- [Run limits](design/run-limits.md)
 
 # Policy
 
