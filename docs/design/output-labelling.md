@@ -1,6 +1,6 @@
 # Output labelling: design
 
-- Status: phase 1 (sections 3.1 to 3.8 without argument-level taint) and approvals are implemented on `main` (#42, #45, #47, 2026-10-24); the signed approval token of section 3.7 is built (`feat/approval-token`, 2026-10-24); phase 2 is open. Kept as the design record; see section 6 for what was measured.
+- Status: phase 1 (sections 3.1 to 3.8 without argument-level taint) and approvals are implemented on `main` (#42, #45, #47, 2026-10-24); the signed approval token of section 3.7 is on `main` (#52); phase 2, argument-level taint (section 3.4 with the phase-2 attributes of 3.6 and the `untrusted_args` field of 3.8), is built on `feat/arg-taint-phase2` (2026-10-24). Kept as the design record; see section 6 for what was measured.
 - Date: 2026-10-24. Base: `main` at 6d2d4a4.
 - Related: [ADR-0009](../decisions/0009-output-labelling.md) (proposed), [threat model](../spec/threat-model.md), [RFC-0001](../spec/rfc-0001-attenuo.md) section 9 open question 5, [injection suite results](../evaluation/injection-suite.md), [evaluation plan](../research/evaluation-plan.md), [server pipeline](server.md), [ADR-0006](../decisions/0006-lease-based-in-flight-revocation.md) (leases), RFC-0001 section 4.1 (DPoP).
 
@@ -72,6 +72,8 @@ The "narrower token" alternative: a planner that still has an untainted context 
 
 ### 3.4 Option (b): argument-level taint
 
+Status: built on `feat/arg-taint-phase2` (2026-10-24): `attenuo_core::fingerprint`, the span index in the lease store (`run_spans` in SQLite), and the match in the server's decision pipeline. Choices the text below leaves open: winnowing window 8 (so a shared run of 31 normalised characters always matches, and "long text" means 31 characters or more); hashes are SHA-256 in the proxy and HMAC-SHA-256 under a per-store key in the index; per result at most 2,000 fingerprints from the first 1 MiB of text and 64 Ki characters of k-gram text, per run at most 20,000 hashes, whole results evicted oldest first; arguments are walked into nested objects and arrays and reported under the top-level name; a tool missing from the catalog counts as destructive; an unreadable index makes every unpinned argument untrusted (kind `unreadable`, no seq); a trusted result stores no fingerprints. The index ends when the root lease is revoked (an expired run keeps it, because a run can be renewed).
+
 Match each destructive call's arguments against recent untrusted outputs of the same run, to detect verbatim flow and say which result an argument came from.
 
 - **Fingerprints.** From each result, the proxy extracts (i) every JSON string leaf (from `structuredContent`, or from text content that parses as JSON), (ii) entity tokens found by fixed patterns regardless of length: URLs and their host, email addresses, IBAN-shaped and long digit strings, file paths, and (iii) for long text, winnowed k-gram hashes ([Schleimer, Wilkerson and Aiken, 2003](https://sschleimer.warwick.ac.uk/Maths/winnowing.pdf)), with k around 24 characters after normalisation (Unicode NFKC, case fold, collapsed whitespace). Hashes are keyed with an HMAC key held by the server, so the span index holds no content. Strings shorter than a minimum (8 characters) are ignored except as entities, so numbers like `98` or `1250` do not match.
@@ -88,6 +90,8 @@ For agents written against attenuo's Python or TypeScript SDK, the SDK can carry
 This only covers values that pass through agent code. Text that goes through the model loses its label, exactly as in CaMeL, where the quarantined model's output is labelled with its inputs. The proxy cannot verify SDK labels (the agent is untrusted), so they can only add restrictions: an SDK label can make a call need approval, never exempt one.
 
 ### 3.6 Policy
+
+Status: every attribute below is set by the server. `args_contain_untrusted` and `untrusted_args` are computed from phase 2 on (`feat/arg-taint-phase2`, 2026-10-24) for destructive calls on tainted runs, and are `false` and empty otherwise. [`config/policies/output-labels.cedar`](../../config/policies/output-labels.cedar) carries both policies below plus `confirm_destructive_with_untrusted_args` (the option (b) shape: ask for any destructive call with a matched argument).
 
 The decision stays in Cedar. The generated schema gains these attributes, always present so policies need no `has` guards:
 
@@ -140,6 +144,8 @@ An approval is bound to one call, one run and a short time.
 - **Not via the agent.** MCP elicitation (a server-to-client request for user input) looks like a natural channel, but the answer comes back through the agent client, which the threat model treats as untrusted. It could carry a prompt that points the user at the approval page; it cannot carry the approval.
 
 ### 3.8 Audit
+
+Status: all of the table is on `main` except `labels.untrusted_args`, which phase 2 adds (`feat/arg-taint-phase2`, 2026-10-24, at most 64 entries) together with the fingerprint count in `tool_result`, which was 0 before. The `-32008` and `-32003` error data, the AuthZEN context and pending approvals carry `untrusted_args` too, when non-empty.
 
 | Record | New or changed | Content |
 |---|---|---|
@@ -201,6 +207,8 @@ Each phase is measured on the injection suite before the next starts. The corpus
 | 3 | SDK `Labelled[T]` values in Python and TypeScript, refusal to place labelled values in destructive calls without an approval token, labels sent in `params._meta`. | On the planned AgentDojo adapter with a model in the loop: utility and attack success for an SDK agent against an unmodified agent behind the same proxy. | A deployable, partial CaMeL: value-level labels in ordinary agent code, enforced at the proxy, with the utility cost compared to CaMeL's reported 77% against 84%. |
 
 **Measured, phase 1 (2026-10-24).** First run of the `attenuo_labels` arm on main `ed3a769`, before the approval endpoints exist, so gated calls were counted and not retried ([results](../evaluation/injection-suite.md#output-labelling-arm-first-run-2026-10-24)). Dev: 1 of 60 attack calls allowed without approval (`github-07`), 9 gated, 18 of 69 benign calls gated, approve-all bound 10 of 60; exactly the section 4 reading. Test: 1 of 38 allowed (`t-banking-04`), 6 gated, 2 of 29 benign gated; section 4's literal count was 3 gated, its count with the implied read present was 6, and the run gave 6. Second run, with the approvals API (#45, main `cf6376c`) and the runner granting or declining each request as the scripted approver and retrying granted calls once ([results](../evaluation/injection-suite.md#second-run-with-retry-after-approval-2026-10-24)): first-pass outcomes identical to the first run in every arm; all 9 dev and 6 test gated attack calls declined, none approved; all 18 dev and 2 test gated benign calls completed on the retry, each consuming its approval. The per-call cost is in [performance.md](performance.md).
+
+**Measured, phase 2 (2026-10-24).** First run of the `attenuo_labels_args` arm, the `attenuo` arm plus the option (b) rule alone, on `feat/arg-taint-phase2` (`9d72093`) ([results](../evaluation/injection-suite.md#argument-level-taint-arm-first-run-2026-10-24)). Dev: 9 of 69 benign calls gated, all completed after approval, against 18 under (a); section 4 counted 10 (up to 12), and the run gated 9 of those 10 and nothing else (`banking-02`'s benign payee is not in the bill). Attack: 3 of 60 allowed without approval against 1 under (a), 7 gated and declined, approve-all bound 10 as before; the two calls given up are `github-02` (a model-written body) and `github-04` (no read in the case). Of the 7 gated, 6 are the ones section 4 named; `banking-04` is gated only because the fake upstream echoes the arguments of the payment before it. Test: 0 of 29 benign gated, 3 of 38 attack allowed, 4 gated, all four through the echo, since the test split has no outputs (section 4: 1 benign, 3 to 4 attack if the reads were present). Approval requests fall from 27 to 16 on dev and from 8 to 4 on test. The outputs are short, so k-gram matching is barely exercised, and no paraphrase run was done.
 
 ## 7. Open questions
 

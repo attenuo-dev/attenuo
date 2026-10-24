@@ -8,7 +8,7 @@ use attenuo_audit::{
     Approval, ApprovalLabel, ApprovalMethod, ApprovalState, Approver, AuditError, LeaseStore,
     MemoryLeaseStore, SqliteLeaseStore,
 };
-use attenuo_core::LeaseId;
+use attenuo_core::{LeaseId, UntrustedArg, UntrustedKind};
 use common::{chain, t0};
 use serde_json::json;
 use time::{Duration, OffsetDateTime};
@@ -46,6 +46,11 @@ fn pending(n: u32, call_hash: &str, ttl: Duration) -> Approval {
         labels: vec![ApprovalLabel {
             source: "github/read_web".into(),
             seq: 3,
+        }],
+        untrusted_args: vec![UntrustedArg {
+            arg: "repo".into(),
+            seq: Some(3),
+            kind: UntrustedKind::Leaf,
         }],
         decision_id: "d-gated".into(),
         chain: chain("alice", ("l1", "l2")),

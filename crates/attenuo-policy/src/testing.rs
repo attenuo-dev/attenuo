@@ -23,6 +23,8 @@
 //!     session:                      # optional: the run's output labels (ADR-0009)
 //!       tainted_by: [web/fetch]     # sources as server/tool; tainted when non-empty
 //!       tainted: true               # optional; set it alone for an unreadable taint state
+//!       untrusted_args: [body]      # optional: arguments that matched an untrusted result
+//!       args_contain_untrusted: true  # optional; defaults to untrusted_args being non-empty
 //!     approval: { by: user }        # optional: the call carries a granted approval
 //!     budget:                       # optional: what the run limits have left (ADR-0010)
 //!       calls_remaining: 1          # each member optional; `limited` defaults to true
@@ -100,8 +102,8 @@ use serde_json::Value;
 use time::{Duration, OffsetDateTime};
 
 use crate::{
-    ArgType, CallLabels, Outcome, PolicyEngine, PolicyEngineBuilder, PolicyError, SessionLabels,
-    ToolAttrs, ToolCatalog, UnknownTools,
+    ArgLabels, ArgType, CallLabels, Outcome, PolicyEngine, PolicyEngineBuilder, PolicyError,
+    SessionLabels, ToolAttrs, ToolCatalog, UnknownTools,
 };
 
 /// The evaluation time used when a test file does not set `now`: 2025-10-09T08:53:20Z.
@@ -389,6 +391,14 @@ pub struct SessionSpec {
     /// server evaluates when the run's taint state cannot be read.
     #[serde(default)]
     pub tainted: Option<bool>,
+    /// Arguments of the call that matched an untrusted result (`context.untrusted_args`,
+    /// output labelling phase 2).
+    #[serde(default)]
+    pub untrusted_args: Vec<String>,
+    /// `context.args_contain_untrusted`. Defaults to whether `untrusted_args` is non-empty;
+    /// `true` may be set alone, and it stays `true` whenever an argument is listed.
+    #[serde(default)]
+    pub args_contain_untrusted: Option<bool>,
 }
 
 impl SessionSpec {
@@ -397,8 +407,13 @@ impl SessionSpec {
         if let Some(t) = self.tainted {
             session.tainted = t || !session.tainted_by.is_empty();
         }
+        let mut args = ArgLabels::from_args(self.untrusted_args.iter().cloned());
+        if let Some(c) = self.args_contain_untrusted {
+            args.contain_untrusted = c || !args.untrusted.is_empty();
+        }
         CallLabels {
             session,
+            args,
             ..Default::default()
         }
     }

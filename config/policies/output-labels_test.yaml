@@ -72,11 +72,56 @@ cases:
     expect: deny
     reason: approval_required
 
-  - name: untrusted spans in mail cannot fire before argument matching exists
+  - name: mail with no matched span on an untainted run is allowed
     chain: [assistant]
     call: { server: workspace, tool: send_email, arguments: { to: bob@example.com } }
     expect: allow
     reason: policy_allow
+
+  - name: a matched span in mail asks, and every rule that applied is named
+    chain: [assistant]
+    session: { tainted_by: [workspace/read_email], untrusted_args: [body] }
+    call:
+      server: workspace
+      tool: send_email
+      arguments: { to: bob@example.com, body: "reset at https://acme-sso.evil.example" }
+    expect: deny
+    reason: approval_required
+    policy_ids:
+      - confirm_destructive_after_untrusted_read
+      - confirm_destructive_with_untrusted_args
+      - confirm_untrusted_spans_in_mail
+
+  - name: a matched span asks on any destructive tool
+    chain: [assistant]
+    session: { untrusted_args: [path] }
+    call: { server: workspace, tool: delete_file, arguments: { path: /tmp/from-the-page } }
+    expect: deny
+    reason: approval_required
+    policy_ids: [confirm_destructive_with_untrusted_args]
+
+  - name: an approval covers a matched span too
+    chain: [assistant]
+    session: { tainted_by: [web/fetch], untrusted_args: [path] }
+    approval: { by: user }
+    call: { server: workspace, tool: delete_file, arguments: { path: /tmp/from-the-page } }
+    expect: allow
+    reason: policy_allow
+
+  - name: a matched span on a non-destructive tool does not ask
+    chain: [assistant]
+    session: { untrusted_args: [title] }
+    call: { server: calendar, tool: create_event, arguments: { title: from the page } }
+    expect: allow
+    reason: policy_allow
+
+  - name: args_contain_untrusted set alone asks as well
+    chain: [assistant]
+    session: { args_contain_untrusted: true }
+    call: { server: workspace, tool: delete_file, arguments: { path: notes.txt } }
+    expect: deny
+    reason: approval_required
+    policy_ids: [confirm_destructive_with_untrusted_args]
 
   - name: the capability stage still runs first
     chain:

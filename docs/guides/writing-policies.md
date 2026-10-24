@@ -21,7 +21,7 @@ Every call becomes one Cedar request.
 | `context.session_id` | present only if the call carries one |
 | `context.now_unix` | evaluation time, unix seconds |
 | `context.session` | output labels of the delegation run: `tainted` (bool) and `tainted_by` (set of `"<server>/<tool>"`); see [Asking for approval after untrusted output](#asking-for-approval-after-untrusted-output) |
-| `context.args_contain_untrusted`, `context.untrusted_args` | `false` and an empty set for now; argument matching is not built yet |
+| `context.args_contain_untrusted`, `context.untrusted_args` | for a destructive call on a tainted run: whether an argument copies a value or span of an untrusted result of the run, and the names of those arguments (an argument pinned by an `equals` or `one_of` constraint never counts); `false` and an empty set otherwise. See [Asking only when an argument copies untrusted output](#asking-only-when-an-argument-copies-untrusted-output) |
 | `context.approval` | `present` (bool) and `by` (`"user"`, `"operator"`, or `""` without an approval): whether this call carries a granted approval for its exact hash; see [Asking for approval after untrusted output](#asking-for-approval-after-untrusted-output) |
 | `context.budget` | what the token's run limits matching this call have left: `limited` (bool), `calls_remaining`, `amount_remaining` (Long; the largest Long when no such limit applies) and `destination_new` (bool); see [Run limits](#run-limits) |
 
@@ -153,7 +153,26 @@ The run's originating user grants the approval with their own ID token (`POST /a
 
 The grant also returns a signed approval token (`approval_token`, `typ: attenuo-approval+jwt`). An agent may send it with the retry in `params._meta["dev.attenuo/approval"]` (the SDK helpers do); the server then uses exactly the approval the token names, after checking that it is for this call, this hop, this run and, for a DPoP-bound agent, this key. Policy sees the same `context.approval`. A token that fails those checks, or whose approval was already used or declined, denies the call with `approval_invalid` whatever the policy says. Because the token is signed with the issuer key, an external PEP can check it offline; see [Approval tokens](../reference/http-api.md#approval-tokens).
 
-[`config/policies/output-labels.cedar`](../../config/policies/output-labels.cedar) has this rule and the mail rule from the design, with tests in `output-labels_test.yaml` next to it.
+[`config/policies/output-labels.cedar`](../../config/policies/output-labels.cedar) has this rule, the mail rule from the design and the rule of the next section, with tests in `output-labels_test.yaml` next to it.
+
+### Asking only when an argument copies untrusted output
+
+Session taint asks for every destructive call after any read. To ask only when the call carries something it read, test the arguments instead (ADR-0009 phase 2):
+
+```cedar
+@id("confirm_destructive_with_untrusted_args")
+@obligation("approval")
+forbid (principal, action, resource)
+when {
+    resource.destructive &&
+    context.args_contain_untrusted &&
+    !context.approval.present
+};
+```
+
+The proxy fingerprints every untrusted result before relaying it: each JSON string leaf of 8 characters or more (text that parses as JSON is read as JSON), entities found by pattern at any length (URLs and their host, e-mail addresses, IBAN-shaped strings, runs of 6 or more digits, file paths), and winnowed 24-character k-grams of long text, all after NFKC, lower-casing and collapsing whitespace. The run keeps keyed hashes of these, not the text, for up to 20,000 per run (oldest results dropped first) until its root lease is revoked. For a destructive call on a tainted run, each argument that no hop's `equals` or `one_of` constraint pins is fingerprinted the same way and looked up; nested values count under the top-level argument name. A match sets `context.args_contain_untrusted` and adds the name to `context.untrusted_args`. If the index cannot be read, every unpinned argument counts as matched.
+
+A miss means no verbatim copy was found, not that the call is clean: a paraphrase or a decision the agent took from the text (which hotel to book) does not match. Keep the session-taint rule for tools where that matters, or test `context.untrusted_args.contains("body")` for one argument. The `-32008` answer, the pending approval and the decision record list the matches as `untrusted_args: [{arg, seq, kind}]`, where `seq` is the `tool_result` record matched and `kind` is `leaf`, `entity`, `kgram` or `unreadable`.
 
 ### Run limits
 
@@ -259,7 +278,7 @@ The harness builds a real `DelegationChain` and calls the same `PolicyEngine::au
 
 - **Valid chains only.** The chain is validated like a received one. A child wider than its parent, for example, is reported as a failed case with the reason, so a test cannot describe a delegation the server would refuse to issue.
 - **Defaults.** User `alice` at `https://idp.example`, authenticated a minute before `now`; time fixed at 1760000000; each hop lives an hour; lease ids are random. `policy_ids: []` asserts that no policy matched (a default deny).
-- **Output labels.** A case's `session: { tainted_by: [web/fetch] }` evaluates the call as part of a run that has read that source; `tainted: true` with no sources is a run whose taint state could not be read. Without `session` the run is untainted. `reason` also accepts `approval_required`. `approval: { by: user }` evaluates the call as a retry that carries a granted approval (`by` is `user` or `operator`); without it there is none.
+- **Output labels.** A case's `session: { tainted_by: [web/fetch] }` evaluates the call as part of a run that has read that source; `tainted: true` with no sources is a run whose taint state could not be read. Without `session` the run is untainted. `reason` also accepts `approval_required`. `approval: { by: user }` evaluates the call as a retry that carries a granted approval (`by` is `user` or `operator`); without it there is none. `session: { untrusted_args: [body] }` sets `context.untrusted_args`, and `args_contain_untrusted` defaults to whether that list is non-empty (it can also be set `true` alone); without them the call has no matched arguments.
 - **Run limits.** The harness keeps no counters. `budget: { calls_remaining: 1 }` sets `context.budget` for the case (`limited` defaults to `true` there; the other members default to an unlimited call's values). Capabilities in `chain` may carry `limits`, which are checked for narrowing like any other part of a capability.
 - **Mistakes in the file** (unknown keys, a missing `expect`, duplicate case names, an empty `cases`) are errors, not silent passes.
 

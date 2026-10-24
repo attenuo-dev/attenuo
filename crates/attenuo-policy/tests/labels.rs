@@ -8,9 +8,9 @@ use attenuo_core::{AgentId, Capability, CapabilitySet, DelegationChain, LeaseId,
 use attenuo_core::{Decision, ToolCall};
 use attenuo_policy::testing::TestFile;
 use attenuo_policy::{
-    AnnotationImport, CallLabels, OutputLabel, PolicyEngine, PolicyEngineBuilder, PolicyError,
-    SessionLabels, ToolAttrs, ToolCatalog, REASON_APPROVAL_REQUIRED, REASON_CAPABILITY_DENIED,
-    REASON_POLICY_ALLOW, REASON_POLICY_DENY,
+    AnnotationImport, ArgLabels, CallLabels, OutputLabel, PolicyEngine, PolicyEngineBuilder,
+    PolicyError, SessionLabels, ToolAttrs, ToolCatalog, REASON_APPROVAL_REQUIRED,
+    REASON_CAPABILITY_DENIED, REASON_POLICY_ALLOW, REASON_POLICY_DENY,
 };
 use serde_json::json;
 use time::macros::datetime;
@@ -206,7 +206,7 @@ fn tainted_by_names_the_sources() {
         e.authorize_labelled(&c, &call, &tainted(), now()).reason,
         REASON_POLICY_ALLOW
     );
-    // The phase 1 constants.
+    // Without matched arguments, phase 2's members are false and empty.
     let e = engine(
         r#"permit (principal, action, resource)
            when { !context.args_contain_untrusted && context.untrusted_args.isEmpty() &&
@@ -215,6 +215,48 @@ fn tainted_by_names_the_sources() {
     );
     assert_eq!(
         e.authorize_labelled(&c, &call, &tainted(), now()).reason,
+        REASON_POLICY_ALLOW
+    );
+}
+
+/// Option (b) of the design (phase 2): a policy that asks only when an argument matched. The
+/// run's taint alone does not ask; `untrusted_args` reaches Cedar as a set of names.
+#[test]
+fn option_b_asks_only_on_matched_arguments() {
+    let e = engine(
+        r#"permit (principal, action, resource);
+           @id("ask_on_spans")
+           @obligation("approval")
+           forbid (principal, action, resource)
+           when { resource.destructive && context.args_contain_untrusted &&
+                  !context.approval.present };
+           @id("never_a_copied_path")
+           forbid (principal, action, resource)
+           when { context.untrusted_args.contains("path") };"#,
+        AnnotationImport::Never,
+    );
+    let c = all_caps();
+    let delete = ToolCall::new("fs", "delete", json!({"name": "x", "path": "/tmp/x"}));
+    assert_eq!(
+        e.authorize_labelled(&c, &delete, &tainted(), now()).reason,
+        REASON_POLICY_ALLOW,
+        "tainted, nothing matched"
+    );
+    let matched = |args: &[&str]| CallLabels {
+        args: ArgLabels::from_args(args.iter().copied()),
+        ..tainted()
+    };
+    let o = e.authorize_labelled(&c, &delete, &matched(&["name"]), now());
+    assert_eq!(o.reason, REASON_APPROVAL_REQUIRED);
+    assert_eq!(o.policy_ids, vec!["ask_on_spans".to_string()]);
+    // A plain forbid on a named argument refuses outright.
+    let o = e.authorize_labelled(&c, &delete, &matched(&["name", "path"]), now());
+    assert_eq!(o.reason, REASON_POLICY_DENY);
+    // Not destructive: the obligation does not apply.
+    let append = ToolCall::new("fs", "append", json!({"name": "x"}));
+    assert_eq!(
+        e.authorize_labelled(&c, &append, &matched(&["name"]), now())
+            .reason,
         REASON_POLICY_ALLOW
     );
 }

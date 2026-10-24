@@ -78,20 +78,26 @@ pub fn error_response(
 
 /// The error response the proxy returns for a denied `tools/call`.
 pub fn denied_response(id: Value, reason: &str, decision_id: Uuid) -> Value {
-    denied_response_with(id, reason, decision_id, None)
+    denied_response_with(id, reason, decision_id, None, None)
 }
 
 /// [`denied_response`] with the run limit a `budget_exhausted` decision hit (ADR-0010) as
-/// `data.limit`: `{hop, kind, arg, max, used}`, the hop named by its position in the chain.
+/// `data.limit`: `{hop, kind, arg, max, used}`, the hop named by its position in the chain;
+/// and the arguments that matched an untrusted result (ADR-0009 phase 2) as
+/// `data.untrusted_args`: `[{arg, seq, kind}]`. Each is left out when `None`.
 pub fn denied_response_with(
     id: Value,
     reason: &str,
     decision_id: Uuid,
     limit: Option<&Value>,
+    untrusted_args: Option<&Value>,
 ) -> Value {
     let mut data = json!({ "reason": reason, "decision_id": decision_id });
     if let Some(l) = limit {
         data["limit"] = l.clone();
+    }
+    if let Some(u) = untrusted_args {
+        data["untrusted_args"] = u.clone();
     }
     error_response(
         id,
@@ -103,18 +109,23 @@ pub fn denied_response_with(
 
 /// The error response for a call whose decision is `approval_required`. `call_hash` is
 /// [`attenuo_core::ToolCall::call_hash`], the value an approval is bound to; `approval` is the
-/// pending approval the authorizer stored, if it could store one.
+/// pending approval the authorizer stored, if it could store one; `untrusted_args` the
+/// arguments that matched an untrusted result (`[{arg, seq, kind}]`), left out when `None`.
 pub fn approval_required_response(
     id: Value,
     decision_id: Uuid,
     call_hash: &str,
     approval: Option<&crate::auth::ApprovalTicket>,
+    untrusted_args: Option<&Value>,
 ) -> Value {
     let mut data = json!({
         "reason": crate::auth::REASON_APPROVAL_REQUIRED,
         "decision_id": decision_id,
         "call_hash": call_hash,
     });
+    if let Some(u) = untrusted_args {
+        data["untrusted_args"] = u.clone();
+    }
     if let Some(a) = approval {
         data["approval_id"] = json!(a.approval_id);
         data["expires_at"] = json!(a
@@ -164,17 +175,24 @@ mod tests {
         assert!(v["error"]["data"].get("limit").is_none());
         // ADR-0010: a `budget_exhausted` denial names the limit.
         let limit = json!({"hop": 0, "kind": "calls", "max": 1, "used": 1});
-        let v = denied_response_with(json!(8), "budget_exhausted", id, Some(&limit));
+        let v = denied_response_with(json!(8), "budget_exhausted", id, Some(&limit), None);
         assert_eq!(v["error"]["code"], CODE_DENIED);
         assert_eq!(v["error"]["data"]["reason"], "budget_exhausted");
         assert_eq!(v["error"]["data"]["limit"], limit);
+        assert!(v["error"]["data"].get("untrusted_args").is_none());
+        // ADR-0009 phase 2: a denial names the arguments that matched an untrusted result.
+        let args = json!([{"arg": "body", "seq": 4, "kind": "kgram"}]);
+        let v = denied_response_with(json!(9), "policy_deny", id, None, Some(&args));
+        assert_eq!(v["error"]["data"]["untrusted_args"], args);
+        assert!(v["error"]["data"].get("limit").is_none());
     }
 
     #[test]
     fn approval_required_response_shape() {
         let id = Uuid::nil();
-        let v = approval_required_response(json!("a"), id, "ab12", None);
+        let v = approval_required_response(json!("a"), id, "ab12", None, None);
         assert_eq!(v["id"], "a");
+        assert!(v["error"]["data"].get("untrusted_args").is_none());
         assert_eq!(v["error"]["code"], -32008);
         assert_eq!(v["error"]["data"]["reason"], "approval_required");
         assert_eq!(v["error"]["data"]["decision_id"], id.to_string());
@@ -185,8 +203,10 @@ mod tests {
             approval_id: Uuid::from_u128(7),
             expires_at: time::macros::datetime!(2026-10-24 12:00 UTC),
         };
-        let v = approval_required_response(json!("a"), id, "ab12", Some(&ticket));
+        let args = json!([{"arg": "to", "seq": 2, "kind": "entity"}]);
+        let v = approval_required_response(json!("a"), id, "ab12", Some(&ticket), Some(&args));
         let data = &v["error"]["data"];
+        assert_eq!(data["untrusted_args"], args);
         assert_eq!(data["approval_id"], ticket.approval_id.to_string());
         assert_eq!(data["expires_at"], "2026-10-24T12:00:00Z");
         assert!(v["error"]["message"]

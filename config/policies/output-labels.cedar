@@ -7,7 +7,10 @@
 //                                   could not be read)
 //   context.session.tainted_by      "<server>/<tool>" of every source
 //   resource.destructive            catalog `destructive`, default `!readonly`
-//   context.args_contain_untrusted  always false until argument matching exists
+//   context.args_contain_untrusted  some argument carries a verbatim span of an untrusted
+//                                   result of the run (phase 2; matched only for destructive
+//                                   tools on a tainted run, `equals`/`one_of` pins exempt)
+//   context.untrusted_args          the names of those arguments
 //   context.approval.present        the call carries a granted approval for its exact
 //                                   call hash (single use, see `POST /approvals/{id}`)
 //   context.approval.by             "user" or "operator" when present, else ""
@@ -27,8 +30,24 @@ when {
   !context.approval.present
 };
 
-// Mail whose arguments carry a span of untrusted output needs an approval. This only fires
-// once argument matching is built; until then `args_contain_untrusted` is always false.
+// Option (b) of the design, argument-level taint: a destructive call whose arguments carry a
+// span of untrusted output needs an approval, and the decision record names each argument
+// with the result it came from (`labels.untrusted_args`). Next to the rule above it changes no
+// decision, only adds its id. To ask only when a span matched, delete
+// `confirm_destructive_after_untrusted_read` and keep this one: fewer approvals on benign
+// calls, but a paraphrased instruction or a choice taken from data (which hotel to book)
+// leaves no span and is not asked about (design section 4).
+@id("confirm_destructive_with_untrusted_args")
+@obligation("approval")
+forbid (principal, action, resource)
+when {
+  resource.destructive &&
+  context.args_contain_untrusted &&
+  !context.approval.present
+};
+
+// The same, for one tool only: mail whose arguments carry a span of untrusted output. The
+// shape to use when only some tools should ask on matched spans.
 @id("confirm_untrusted_spans_in_mail")
 @obligation("approval")
 forbid (principal, action == Action::"workspace/send_email", resource)

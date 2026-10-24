@@ -67,7 +67,9 @@ export interface Tool {
 
 /**
  * An approval as `GET /approvals/{id}` and the `/admin/approvals` routes show it. Fields not
- * named here (`labels`, `decision_id`, `created_at`, ...) are in `raw`. `state` is `pending`, `granted`, `declined` or
+ * named here (`labels`, `decision_id`, `created_at`, ...) are in `raw`, among them
+ * `untrusted_args` (`[{arg, seq, kind}]`, present when an argument of the call matched an
+ * untrusted result of the run). `state` is `pending`, `granted`, `declined` or
  * `consumed`; `expired` is the server's view of whether `expiresAt` has passed. `usable` is true
  * for a grant that a retry of the identical call can still use. `approvalToken` is the signed
  * approval token (`attenuo-approval+jwt`) the server returns while the approval is granted and

@@ -20,7 +20,7 @@
 //! or consumed, whatever its state says. Nor is revocation: a revoked or expired lease makes
 //! every approval bound to it unusable, because grant and consume both check the lease.
 
-use attenuo_core::{DelegationChain, LeaseId};
+use attenuo_core::{DelegationChain, LeaseId, UntrustedArg};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -149,6 +149,10 @@ pub struct Approval {
     pub arguments: Value,
     /// The run's output labels when the call was gated.
     pub labels: Vec<ApprovalLabel>,
+    /// The call's arguments that matched an untrusted result of the run (ADR-0009 phase 2),
+    /// as in the gated decision's `labels.untrusted_args`. Empty when none matched, and for
+    /// approvals stored before phase 2.
+    pub untrusted_args: Vec<UntrustedArg>,
     /// Id of the decision record that answered `approval_required`.
     pub decision_id: String,
     /// The delegation chain that made the call: whose run it is (`originating_user`) and what
