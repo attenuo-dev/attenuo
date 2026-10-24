@@ -6,6 +6,8 @@
 //! - [`DelegationChain`]: the originating user plus every agent hop, with the invariant that
 //!   capabilities only narrow from one hop to the next (monotonic attenuation).
 //! - [`ToolCall`]: a normalized tool invocation to authorize.
+//! - [`limits`]: run limits on a capability (`calls`, `sum`, `calls_per`) and the charges a
+//!   call makes against them (ADR-0010).
 //! - [`names`]: what server and tool names may contain (one rule for every boundary).
 //! - [`jcs`]: RFC 8785 canonical JSON, the encoding of everything that is hashed or signed.
 //! - [`Decision`] and [`DecisionRecord`]: the outcome of authorization and the record that the
@@ -20,6 +22,7 @@ pub mod decision;
 pub mod digest;
 pub mod error;
 pub mod jcs;
+pub mod limits;
 pub mod names;
 
 pub use call::ToolCall;
@@ -31,4 +34,5 @@ pub use decision::{
     REASON_TOOL_RESULT,
 };
 pub use error::{AttenuationError, ChainError};
+pub use limits::{ArgLimit, Charge, LimitKind, Limits};
 pub use names::{NameError, NameKind};

@@ -109,6 +109,9 @@ impl DelegationChain {
         capabilities
             .validate()
             .map_err(|source| ChainError::InvalidName { index: 0, source })?;
+        capabilities
+            .validate_limits()
+            .map_err(|source| ChainError::InvalidLimit { index: 0, source })?;
         Ok(Self {
             originating_user,
             hops: vec![Hop {
@@ -170,6 +173,9 @@ impl DelegationChain {
         requested
             .validate()
             .map_err(|source| ChainError::InvalidName { index, source })?;
+        requested
+            .validate_limits()
+            .map_err(|source| ChainError::InvalidLimit { index, source })?;
         let capabilities = parent
             .capabilities
             .attenuate(&requested)
@@ -202,10 +208,10 @@ impl DelegationChain {
     ///
     /// Checked, in order: a non-empty subject; at least one hop and at most `max_depth`; then
     /// per hop: non-empty agent and lease ids, capability patterns that are valid names
-    /// ([`crate::names`]), `issued_at < expires_at`, not expired at `now`,
+    /// ([`crate::names`]), well-formed limits ([`crate::limits`]), `issued_at < expires_at`, not expired at `now`,
     /// a lease and an agent id that no earlier hop uses, and, against the parent hop,
     /// `issued_at` not before the parent's, an expiry not after the parent's, and capabilities
-    /// the parent covers.
+    /// the parent covers (limits included: each no larger than the parent's).
     ///
     /// `issued_at` is not compared with `now`: chains are validated at arbitrary times (tests,
     /// replays of the audit log), and a chain from a token was stamped by the issuer's clock.
@@ -232,6 +238,9 @@ impl DelegationChain {
             hop.capabilities
                 .validate()
                 .map_err(|source| ChainError::InvalidName { index: i, source })?;
+            hop.capabilities
+                .validate_limits()
+                .map_err(|source| ChainError::InvalidLimit { index: i, source })?;
             if hop.issued_at >= hop.expires_at {
                 return Err(ChainError::IssuedAfterExpiry { index: i });
             }
