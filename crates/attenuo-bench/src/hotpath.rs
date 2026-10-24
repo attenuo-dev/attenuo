@@ -7,8 +7,10 @@
 //! - `destructive`: `create_issue` on the same repo (catalog `destructive`, the default for a
 //!   tool that is not `readonly`), which Cedar allows in every configuration.
 //!
-//! Both bodies carry `n: 1` (declared `long` in the catalog everywhere), so the bodies are
-//! byte for byte the same in every configuration. The configurations:
+//! Both bodies carry `n: 1` (declared `long` in the catalog everywhere), and `create_issue`
+//! also carries `to` (a recipient) and `url` (both declared `string`), so the bodies are byte
+//! for byte the same in every configuration except the `*_new` and `host_same` ones, whose
+//! `to` or `url` holds a number that is new on every call (`fill_seq`). The configurations:
 //!
 //! | `--configs` | Catalog `output` | Extra policy | Token |
 //! |---|---|---|---|
@@ -18,6 +20,14 @@
 //! | `limits_calls` | `trusted` | none | `calls` only (no `sum`, so no `synchronous=FULL` charge) |
 //! | `both` | as `labels` | as `labels` | as `limits` |
 //! | `usage` | as `baseline` | none | no limits; `[policy] track_usage = true` |
+//! | `calls_per_new`, `calls_per_same` | `trusted` | none | `calls_per` on `to` on `create_issue`, in both hops; a new / the same `to` on every call |
+//! | `distinct_new`, `distinct_same` | `trusted` | none | `distinct` on `to` on `create_issue`, in both hops; a new / the same `to` on every call |
+//! | `host_new`, `host_same` | `trusted` | none | `distinct` on `url` with `derive: host`, in both hops; a new host / a new path on the same host on every call |
+//!
+//! The six limit-kind configurations put their limit on `create_issue` only (`read_file` has
+//! no `to` or `url`), with a `max` no run reaches, so their `read` cell is `baseline`'s; run
+//! them with `--cells destructive`. A repeated `distinct` value is planned as no write, but
+//! its charge transaction still runs.
 //!
 //! Run usage (`context.usage`) is kept only when it can matter: no policy here reads it and
 //! no catalog entry names `amount` or `destination`, so in every configuration but `usage`
@@ -55,6 +65,8 @@
 //! cargo build --release -p attenuo-proxy --features testing --example fake_mcp
 //! target/release/attenuo-bench hot-path --runs 5 --duration 10 --approval-loops 2000 \
 //!     --json out.json --markdown out.md
+//! target/release/attenuo-bench hot-path --runs 5 --cells destructive --configs \
+//!     baseline,limits_calls,calls_per_new,calls_per_same,distinct_new,distinct_same,host_new,host_same
 //! ```
 //!
 //! See `docs/design/performance.md` ("Output labelling and run limits on the hot path").
@@ -94,6 +106,24 @@ pub enum HotConfig {
     /// As `baseline`, with `[policy] track_usage = true`: every allowed destructive call
     /// charges the run-usage counters, which no policy here reads.
     Usage,
+    /// `calls_per` on `create_issue`'s `to` in both hops; a new `to` on every call.
+    #[value(name = "calls_per_new")]
+    CallsPerNew,
+    /// `calls_per` on `to` in both hops; the same `to` on every call.
+    #[value(name = "calls_per_same")]
+    CallsPerSame,
+    /// `distinct` on `to` in both hops; a new `to` on every call.
+    #[value(name = "distinct_new")]
+    DistinctNew,
+    /// `distinct` on `to` in both hops; the same `to` on every call.
+    #[value(name = "distinct_same")]
+    DistinctSame,
+    /// `distinct` on the host of `url` (`derive: host`) in both hops; a new host on every call.
+    #[value(name = "host_new")]
+    HostNew,
+    /// `distinct` on the host of `url` in both hops; a new URL on the same host on every call.
+    #[value(name = "host_same")]
+    HostSame,
 }
 
 impl HotConfig {
@@ -105,20 +135,49 @@ impl HotConfig {
             HotConfig::LimitsCalls => "limits_calls",
             HotConfig::Both => "both",
             HotConfig::Usage => "usage",
+            HotConfig::CallsPerNew => "calls_per_new",
+            HotConfig::CallsPerSame => "calls_per_same",
+            HotConfig::DistinctNew => "distinct_new",
+            HotConfig::DistinctSame => "distinct_same",
+            HotConfig::HostNew => "host_new",
+            HotConfig::HostSame => "host_same",
         }
     }
     fn labels(self) -> bool {
         matches!(self, HotConfig::Labels | HotConfig::Both)
     }
-    /// The `limits` member each capability carries, if any.
-    fn limits(self) -> Option<Value> {
+    /// The `limits` member `read_file` and `create_issue` carry, if any, in every hop.
+    fn limits(self) -> [Option<Value>; 2] {
         // Far above anything a run reaches, so no call is refused.
         let calls = 1_000_000_000_000u64;
         let sum = json!({"arg": "n", "max": 1_000_000_000_000_000u64});
+        let to = json!({"arg": "to", "max": calls});
+        let host = json!({"arg": "url", "derive": "host", "max": calls});
+        let both = |l: Value| [Some(l.clone()), Some(l)];
         match self {
-            HotConfig::Limits | HotConfig::Both => Some(json!({"calls": calls, "sum": sum})),
-            HotConfig::LimitsCalls => Some(json!({"calls": calls})),
-            HotConfig::Baseline | HotConfig::Labels | HotConfig::Usage => None,
+            HotConfig::Limits | HotConfig::Both => both(json!({"calls": calls, "sum": sum})),
+            HotConfig::LimitsCalls => both(json!({"calls": calls})),
+            HotConfig::Baseline | HotConfig::Labels | HotConfig::Usage => [None, None],
+            // On `create_issue` only: `read_file` has no `to` or `url` to count.
+            HotConfig::CallsPerNew | HotConfig::CallsPerSame => {
+                [None, Some(json!({"calls_per": to}))]
+            }
+            HotConfig::DistinctNew | HotConfig::DistinctSame => {
+                [None, Some(json!({"distinct": to}))]
+            }
+            HotConfig::HostNew | HotConfig::HostSame => [None, Some(json!({"distinct": host}))],
+        }
+    }
+    /// `create_issue`'s `to` and `url` in this configuration. A `@SEQ@` in either is replaced
+    /// by a new number on every call (`fill_seq`).
+    fn destination(self) -> (&'static str, &'static str) {
+        match self {
+            HotConfig::CallsPerNew | HotConfig::DistinctNew => {
+                ("r@SEQ@@example.com", "https://h0.example/a")
+            }
+            HotConfig::HostNew => ("r0@example.com", "https://h@SEQ@.example/a"),
+            HotConfig::HostSame => ("r0@example.com", "https://h0.example/a@SEQ@"),
+            _ => ("r0@example.com", "https://h0.example/a"),
         }
     }
 }
@@ -137,6 +196,9 @@ pub struct HotPathArgs {
     /// Interleaved repetitions of every cell.
     #[arg(long, default_value_t = 5)]
     pub runs: usize,
+    /// Calls to measure in every configuration.
+    #[arg(long, value_delimiter = ',', value_enum, default_values_t = Cell::ALL)]
+    pub cells: Vec<Cell>,
     /// Configurations to measure.
     #[arg(long, value_delimiter = ',', value_enum,
           default_values_t = [HotConfig::Baseline, HotConfig::Labels, HotConfig::Limits, HotConfig::Both])]
@@ -169,11 +231,13 @@ pub struct HotPathArgs {
     pub markdown: Option<PathBuf>,
 }
 
-/// The two calls every configuration measures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// The two calls a configuration can measure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
-enum Cell {
+pub enum Cell {
+    /// `read_file`.
     Read,
+    /// `create_issue`.
     Destructive,
 }
 
@@ -185,16 +249,22 @@ impl Cell {
             Cell::Destructive => "destructive",
         }
     }
-    fn body(self) -> String {
+    /// The request body in configuration `config`: `create_issue`'s `to` and `url` depend on
+    /// it, and a body that varies per call is filled by `fill_seq`.
+    fn body(self, config: HotConfig) -> String {
         let (name, args) = match self {
             Cell::Read => (
                 "read_file",
                 json!({"repo": "alice/public-docs", "path": "README.md", "n": 1}),
             ),
-            Cell::Destructive => (
-                "create_issue",
-                json!({"repo": "alice/public-docs", "title": "bench", "n": 1}),
-            ),
+            Cell::Destructive => {
+                let (to, url) = config.destination();
+                (
+                    "create_issue",
+                    json!({"repo": "alice/public-docs", "title": "bench", "n": 1,
+                           "to": to, "url": url}),
+                )
+            }
         };
         json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                "params": {"name": name, "arguments": args}})
@@ -253,7 +323,8 @@ fn config_text(base: String, untrusted: bool, track_usage: bool) -> Result<Strin
             ),
             format!(
                 "[policy.catalog.{UPSTREAM}.create_issue]\n{output}\
-                 inputs = {{ repo = \"string\", title = \"string\", n = \"long\" }}\n"
+                 inputs = {{ repo = \"string\", title = \"string\", n = \"long\", \
+                 to = \"string\", url = \"string\" }}\n"
             ),
         ),
     ] {
@@ -293,17 +364,18 @@ fn with_audit_settings(mut s: String, audit_set: &[String]) -> Result<String> {
     Ok(s)
 }
 
-/// A token of `depth` hops carrying `read_file` and `create_issue`, each with `limits` when
-/// given (the same figures in every hop).
+/// A token of `depth` hops carrying `read_file` and `create_issue`, each with its entry of
+/// `limits` when given (the same figures in every hop).
 async fn mint(
     http: &reqwest::Client,
     base: &str,
     depth: usize,
-    limits: Option<&Value>,
+    limits: &[Option<Value>; 2],
 ) -> Result<String> {
     let caps: Vec<Value> = ["read_file", "create_issue"]
         .iter()
-        .map(|tool| {
+        .zip(limits)
+        .map(|(tool, limits)| {
             let mut c = json!({"server": UPSTREAM, "tool": tool});
             if let Some(l) = limits {
                 c["limits"] = l.clone();
@@ -371,7 +443,7 @@ async fn start(
     untrusted: bool,
     track_usage: bool,
     policy: &str,
-    limits: Option<&Value>,
+    limits: &[Option<Value>; 2],
 ) -> Result<Server> {
     let dir = work.0.join(label);
     std::fs::create_dir_all(&dir)?;
@@ -580,6 +652,7 @@ struct CellSummary {
     p50_median_us: f64,
     p50_min_us: f64,
     p50_max_us: f64,
+    p90_median_us: f64,
     p95_median_us: f64,
     p99_median_us: f64,
     rps_median: f64,
@@ -689,9 +762,9 @@ async fn run_approvals(
 ) -> Result<ApprovalReport> {
     let url = format!("{}/mcp/{UPSTREAM}", srv.ep.attenuo);
     // Taint the run first: one untrusted read.
-    let read = rpc(http, &url, &srv.token, &Cell::Read.body()).await?;
+    let read = rpc(http, &url, &srv.token, &Cell::Read.body(HotConfig::Labels)).await?;
     ensure!(read.get("result").is_some(), "taint read failed: {read}");
-    let body = Cell::Destructive.body();
+    let body = Cell::Destructive.body(HotConfig::Labels);
     for _ in 0..args.approval_warmup {
         approval_round(http, srv, &url, &body).await?;
     }
@@ -741,13 +814,18 @@ fn find_key<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
 /// One more call of `cell`, and what its decision record says: how many counters it charged,
 /// how many label sources it names, and whether it carries run usage. Checks that the
 /// configuration does what it claims.
-async fn probe(http: &reqwest::Client, srv: &mut Server, cell: Cell) -> Result<Value> {
+async fn probe(
+    http: &reqwest::Client,
+    srv: &mut Server,
+    config: HotConfig,
+    cell: Cell,
+) -> Result<Value> {
     let resp = http
         .post(format!("{}/mcp/{UPSTREAM}", srv.ep.attenuo))
         .bearer_auth(&srv.token)
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
-        .body(cell.body())
+        .body(super::fill_seq(&cell.body(config)))
         .send()
         .await?;
     srv.sent += 1;
@@ -776,6 +854,13 @@ async fn probe(http: &reqwest::Client, srv: &mut Server, cell: Cell) -> Result<V
         "charged": len("charged"),
         "tainted_by": len("tainted_by"),
         "usage": find_key(&rec, "usage").is_some_and(|u| !u.is_null()),
+        // The first charge's `used_after`: for a `*_new` configuration, about every call
+        // made so far (each value was new); for `distinct_same`, 1.
+        "used_after": find_key(&rec, "charged")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("used_after"))
+            .cloned()
+            .unwrap_or(Value::Null),
     }))
 }
 
@@ -805,36 +890,39 @@ fn render(r: &HotReport) -> String {
     let mut s = String::from(
         "### Configuration check\n\n\
          One extra call per configuration and call after the runs: counters its decision \
-         charged, label sources (`labels.tainted_by`) and whether it carries run usage \
-         (`usage`) in its record.\n\n\
-         | config | call | counters charged | tainted_by | usage |\n|---|---|---|---|---|\n",
+         charged, label sources (`labels.tainted_by`), whether it carries run usage \
+         (`usage`) in its record, and the first charge's `used_after`.\n\n\
+         | config | call | counters charged | tainted_by | usage | used_after |\n\
+         |---|---|---|---|---|---|\n",
     );
     for c in &r.checks {
         s.push_str(&format!(
-            "| {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} |\n",
             c["config"].as_str().unwrap_or(""),
             c["cell"].as_str().unwrap_or(""),
             c["charged"],
             c["tainted_by"],
-            c["usage"]
+            c["usage"],
+            c["used_after"]
         ));
     }
     s.push_str(
         "\n### Client latency per configuration\n\n\
-         Medians over the runs of each run's p50, p95 and p99 (closed loop), and the \
+         Medians over the runs of each run's p50, p90, p95 and p99 (closed loop), and the \
          lowest and highest p50 of the runs.\n\n\
-         | config | call | runs | p50 us | p50 range | p95 us | p99 us | req/s |\n\
-         |---|---|---|---|---|---|---|---|\n",
+         | config | call | runs | p50 us | p50 range | p90 us | p95 us | p99 us | req/s |\n\
+         |---|---|---|---|---|---|---|---|---|\n",
     );
     for x in &r.summary {
         s.push_str(&format!(
-            "| {} | {} | {} | {} | {} to {} | {} | {} | {:.0} |\n",
+            "| {} | {} | {} | {} | {} to {} | {} | {} | {} | {:.0} |\n",
             x.config,
             x.cell,
             x.runs,
             x.p50_median_us,
             x.p50_min_us,
             x.p50_max_us,
+            x.p90_median_us,
             x.p95_median_us,
             x.p99_median_us,
             x.rps_median
@@ -944,6 +1032,11 @@ pub async fn run(args: &HotPathArgs) -> Result<()> {
             configs.push(c);
         }
     }
+    let cells: Vec<Cell> = Cell::ALL
+        .into_iter()
+        .filter(|c| args.cells.contains(c))
+        .collect();
+    ensure!(!cells.is_empty(), "--cells names no call");
     let bin_dir = match &args.bin_dir {
         Some(d) => d.clone(),
         None => default_bin_dir()?,
@@ -975,7 +1068,7 @@ pub async fn run(args: &HotPathArgs) -> Result<()> {
             c.labels(),
             c == HotConfig::Usage,
             &policy,
-            limits.as_ref(),
+            &limits,
         )
         .await?;
         servers.push((c, srv));
@@ -987,13 +1080,13 @@ pub async fn run(args: &HotPathArgs) -> Result<()> {
     let mut pooled: Vec<(HotConfig, Cell, Stages, Sums)> = Vec::new();
     for run in 1..=args.runs {
         for (c, srv) in servers.iter_mut() {
-            for cell in Cell::ALL {
+            for &cell in &cells {
                 let name = format!("[{}] run {run} {}", c.label(), cell.label());
                 eprintln!("{name}");
                 let target = Target {
                     url: format!("{}/mcp/{UPSTREAM}", srv.ep.attenuo),
                     token: Some(srv.token.clone()),
-                    body: cell.body(),
+                    body: cell.body(*c),
                     expect: Expect::Result {
                         decision_header: true,
                     },
@@ -1034,8 +1127,8 @@ pub async fn run(args: &HotPathArgs) -> Result<()> {
     }
     let mut checks = Vec::new();
     for (c, srv) in servers.iter_mut() {
-        for cell in Cell::ALL {
-            let mut p = probe(&http, srv, cell).await?;
+        for &cell in &cells {
+            let mut p = probe(&http, srv, *c, cell).await?;
             p["config"] = json!(c.label());
             eprintln!("[{}] probe {p}", c.label());
             checks.push(p);
@@ -1061,6 +1154,7 @@ pub async fn run(args: &HotPathArgs) -> Result<()> {
                 p50_median_us: median(&mut p50),
                 p50_min_us: p50_min,
                 p50_max_us: p50_max,
+                p90_median_us: median(&mut col(|s| s.p90_us)),
                 p95_median_us: median(&mut col(|s| s.p95_us)),
                 p99_median_us: median(&mut col(|s| s.p99_us)),
                 rps_median: median(&mut col(|s| s.rps)),
@@ -1087,7 +1181,7 @@ pub async fn run(args: &HotPathArgs) -> Result<()> {
             true,
             false,
             &policy,
-            None,
+            &[None, None],
         )
         .await?;
         eprintln!(
@@ -1149,6 +1243,37 @@ mod tests {
         let untrusted = config_text(base, true, false).unwrap();
         assert!(!untrusted.contains("output ="));
         assert_eq!(untrusted.matches("n = \"long\"").count(), 2);
+    }
+
+    #[test]
+    fn limit_kind_configs_limit_create_issue_and_vary_only_their_argument() {
+        let base = render_config(1, 2, std::path::Path::new("/p"), ":memory:", "normal", 3);
+        let cfg = config_text(base, false, false).unwrap();
+        assert_eq!(cfg.matches("to = \"string\", url = \"string\"").count(), 1);
+        let fixed = Cell::Destructive.body(HotConfig::Baseline);
+        assert!(!fixed.contains("@SEQ@"));
+        for (c, kind, varies) in [
+            (HotConfig::CallsPerNew, "calls_per", "\"to\":\"r@SEQ@"),
+            (HotConfig::CallsPerSame, "calls_per", ""),
+            (HotConfig::DistinctNew, "distinct", "\"to\":\"r@SEQ@"),
+            (HotConfig::DistinctSame, "distinct", ""),
+            (HotConfig::HostNew, "distinct", "https://h@SEQ@.example"),
+            (HotConfig::HostSame, "distinct", "https://h0.example/a@SEQ@"),
+        ] {
+            let [read, issue] = c.limits();
+            assert!(read.is_none(), "{c:?}");
+            let issue = issue.unwrap();
+            assert!(issue.get(kind).is_some(), "{c:?}: {issue}");
+            let body = Cell::Destructive.body(c);
+            if varies.is_empty() {
+                assert_eq!(body, fixed, "{c:?}");
+            } else {
+                assert!(body.contains(varies), "{c:?}: {body}");
+            }
+            assert_eq!(Cell::Read.body(c), Cell::Read.body(HotConfig::Baseline));
+        }
+        let [_, host] = HotConfig::HostNew.limits();
+        assert_eq!(host.unwrap()["distinct"]["derive"], "host");
     }
 
     #[test]

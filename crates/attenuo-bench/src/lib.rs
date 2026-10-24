@@ -618,6 +618,19 @@ pub fn check_answer(
     }
 }
 
+/// In a request body, replaced on every request by a number no other request of this process
+/// has had ([`fill_seq`]), so a cell can send a new argument value on every call.
+const SEQ_MARKER: &str = "@SEQ@";
+
+static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `body` with every [`SEQ_MARKER`] replaced by the next number of the process-wide sequence
+/// (one number per call, the same in every marker of one body).
+fn fill_seq(body: &str) -> String {
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    body.replace(SEQ_MARKER, &n.to_string())
+}
+
 #[derive(Clone)]
 struct Target {
     url: String,
@@ -645,16 +658,22 @@ async fn client_loop(
         unexpected: 0,
         first_bad: None,
     };
+    let vary = t.body.contains(SEQ_MARKER);
     loop {
         let start = Instant::now();
         if start >= end {
             break;
         }
+        let body = if vary {
+            fill_seq(&t.body)
+        } else {
+            t.body.clone()
+        };
         let mut req = http
             .post(&t.url)
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
-            .body(t.body.clone());
+            .body(body);
         if let Some(tok) = &t.token {
             req = req.bearer_auth(tok);
         }
@@ -1361,6 +1380,19 @@ mod tests {
             "message": format!("attenuo: denied: {reason}"),
             "data": {"reason": reason, "decision_id": ID}}})
         .to_string()
+    }
+
+    #[test]
+    fn fill_seq_gives_each_body_a_new_number() {
+        // Both markers of one body get the same number; the next body gets another.
+        let a = fill_seq("r@SEQ@ h@SEQ@");
+        let (r, h) = a.split_once(' ').unwrap();
+        assert_eq!(
+            r[1..].parse::<u64>().unwrap(),
+            h[1..].parse::<u64>().unwrap()
+        );
+        assert_ne!(fill_seq("@SEQ@"), fill_seq("@SEQ@"));
+        assert_eq!(fill_seq("no marker"), "no marker");
     }
 
     #[test]

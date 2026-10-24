@@ -18,7 +18,11 @@
 //! background). And the run-usage write of an allowed call to a destructive tool with no
 //! limits (`Pipeline::decide` of `create_issue` on a 2-hop chain, with usage kept by
 //! `[policy] track_usage = true` and with usage elided because nothing reads it, and the
-//! usage charge alone).
+//! usage charge alone). And the per-value limit kinds on `create_issue` in both hops of a
+//! 2-hop chain: `charges_for` (the argument read, and for `derive: host` the URL parse),
+//! `Derive::apply` alone on a few URL shapes, and `LeaseStore::charge` of a `calls_per`, a
+//! `distinct` and a host `distinct` limit with a new value on every call and with the same
+//! value on every call.
 //!
 //! ```text
 //! cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3
@@ -31,7 +35,7 @@ use attenuo_audit::{
     AuditSink, Durability, LeaseStore, SqliteAudit, SqliteLeaseStore,
     DEFAULT_WAL_CHECKPOINT_INTERVAL,
 };
-use attenuo_core::limits::{charges_for, usage_charges, ArgLimit, Limits};
+use attenuo_core::limits::{charges_for, usage_charges, ArgLimit, Derive, Limits};
 use attenuo_core::{
     chain_id_of, AgentId, Capability, CapabilitySet, Decision, DecisionRecord, LeaseId,
     OriginatingUser, ToolCall,
@@ -124,6 +128,49 @@ fn limited_read_file(sum: bool) -> CapabilitySet {
         distinct: None,
     };
     CapabilitySet::from_iter([Capability::new("fake", "read_file").with_limits(limits)])
+}
+
+/// `create_issue` with one per-value limit far above anything a bench reaches: `calls_per` on
+/// `to`, `distinct` on `to`, or `distinct` on the host of `url`.
+fn per_value_create_issue(kind: &str) -> CapabilitySet {
+    let max = 1 << 50;
+    let to = ArgLimit::new("to", max);
+    let host = ArgLimit::new("url", max).derived(Derive::Host);
+    let limits = match kind {
+        "calls_per" => Limits {
+            calls_per: Some(to),
+            ..Limits::default()
+        },
+        "distinct" => Limits {
+            distinct: Some(to),
+            ..Limits::default()
+        },
+        _ => Limits {
+            distinct: Some(host),
+            ..Limits::default()
+        },
+    };
+    CapabilitySet::from_iter([Capability::new("fake", "create_issue").with_limits(limits)])
+}
+
+/// A `create_issue` call whose `to` and `url` carry `n` where the limit `kind` counts it.
+fn issue_call(kind: &str, n: u128) -> ToolCall {
+    let (to, url) = if kind == "host" {
+        (
+            "r0@example.com".to_string(),
+            format!("https://h{n}.example/a"),
+        )
+    } else {
+        (
+            format!("r{n}@example.com"),
+            "https://h0.example/a".to_string(),
+        )
+    };
+    ToolCall::new(
+        "fake",
+        "create_issue",
+        json!({"repo": "alice/public-docs", "title": "t", "to": to, "url": url}),
+    )
 }
 
 /// A token with `depth` hops, its leases registered in `leases`.
@@ -245,6 +292,27 @@ fn bench_decide(c: &mut Criterion) {
     });
 
     let mut group = c.benchmark_group("decide");
+    // The URL parse of a `derive: host` limit, alone.
+    for (shape, url) in [
+        ("short", "https://news.example/a"),
+        (
+            "port_userinfo_case",
+            "https://User:pw@News.Example.:8443/a/b?q=1#frag",
+        ),
+        (
+            "long",
+            "https://cdn.assets.news.example/articles/2026/10/24/a-rather-long-slug-for-an-article\
+             -about-agents?utm_source=feed&utm_medium=rss&utm_campaign=autumn&ref=0123456789abcdef\
+             0123456789abcdef0123456789abcdef#section-3",
+        ),
+        ("idn", "https://b\u{fc}cher.example/kapitel/1"),
+    ] {
+        let v = json!(url);
+        assert!(Derive::Host.apply(&v).is_some(), "{url}");
+        group.bench_function(format!("derive_host/{shape}"), |b| {
+            b.iter(|| Derive::Host.apply(black_box(&v)))
+        });
+    }
     for store in stores() {
         let pipeline = Arc::new(Pipeline::new(
             policy.clone(),
@@ -395,6 +463,41 @@ fn bench_decide(c: &mut Criterion) {
                 BatchSize::SmallInput,
             )
         });
+        // Per-value limits on `create_issue` in both hops of a 2-hop chain. `charges_for` is
+        // the argument read (and the URL parse for a host limit); the charge is the store
+        // transaction, with a value no call has had (`new`) or one every call has (`same`).
+        for kind in ["calls_per", "distinct", "host"] {
+            let tok = token_with(&issuer, store.leases.as_ref(), 2, now, || {
+                per_value_create_issue(kind)
+            });
+            let chain = verifier.verify(&tok, now).expect("verifies").chain;
+            let same = charges_for(&chain, &issue_call(kind, 0)).expect("charges");
+            assert_eq!(same.len(), 2);
+            if s == "memory" {
+                let call = issue_call(kind, 0);
+                group.bench_function(format!("charges_for/{kind}"), |b| {
+                    b.iter(|| charges_for(black_box(&chain), &call).unwrap())
+                });
+            }
+            group.bench_function(format!("charge_{s}/{kind}_new"), |b| {
+                b.iter_batched(
+                    || {
+                        let n = uuid::Uuid::new_v4();
+                        let charges = charges_for(&chain, &issue_call(kind, n.as_u128())).unwrap();
+                        (n.to_string(), charges)
+                    },
+                    |(id, charges)| store.leases.charge(&id, &charges, now).unwrap(),
+                    BatchSize::SmallInput,
+                )
+            });
+            group.bench_function(format!("charge_{s}/{kind}_same"), |b| {
+                b.iter_batched(
+                    || uuid::Uuid::new_v4().to_string(),
+                    |id| store.leases.charge(&id, &same, now).unwrap(),
+                    BatchSize::SmallInput,
+                )
+            });
+        }
         assert!(store.audit.verify_chain().unwrap().ok);
     }
     group.finish();

@@ -491,7 +491,7 @@ Anomalies, measured and not fixed:
 - The in-memory store's charge (78 to 84 us) is slower than the file store's `calls` charge (39 us). The in-memory result append looked the same way in the section above.
 - `lease_check` is 15 to 20 us lower on the B and D servers than on A, C and C', with the same chain and store kind. It does not follow any feature, so it is a per-server or per-file effect; it shows how far two identical servers can differ on this host.
 
-Not measured: the memory store end to end (only in process); more than one client, so contention on the store's connection lock between the charge, the label write and the appends under concurrency; `calls_per` limits (their HMAC of the value); results of realistic size (only the small echo answer); `durability = "full"` end to end; and a quiet reference machine.
+Not measured: the memory store end to end (only in process); more than one client, so contention on the store's connection lock between the charge, the label write and the appends under concurrency; `calls_per` limits (their HMAC of the value; measured since: see [Limit kinds](#limit-kinds-callsper-and-distinct-2026-10-24)); results of realistic size (only the small echo answer); `durability = "full"` end to end; and a quiet reference machine.
 
 ### `sum` charge follow-up (2026-10-24)
 
@@ -647,6 +647,64 @@ Readings:
 - **The 3 to 8 ms outliers are mostly the host, and stay.** The share over 3 ms is the same for all three variants at load below 2 and doubles to triples at load 3 to 4.7; the growth is in `blocking_pool`, `response` and the time outside the handler, stages that wait for a thread to be scheduled. The two storage events now land at 3 to 5 ms, so they still count at 3 ms. On this shared VM that floor is outside the server's control; a quiet machine was not available to measure it.
 - **What remains of the storage tail**: the signed checkpoint still syncs on the request path (3 to 5 ms here, once per 1,000 entries), as SR-50 requires; moving that sync off the path would change the commit's level, which this branch does not do. The locked pass still holds appends about 3 ms for its own two syncs. The first commit after an idle `TRUNCATE` grows the WAL from zero, which the raw probe shows can stall next to a sync (and its first sync after freeing blocks cost 11 to 15 ms on this `discard`-mounted ext4); that path was not measured in the server.
 
+### Limit kinds: `calls_per` and `distinct` (2026-10-24)
+
+Branch `perf/limit-kinds-latency`, main `360ba25`. The run-limits sections measured `calls` and `sum`; this one measures the two per-value kinds, `calls_per` (one counter per value, keyed by a keyed hash of the value) and `distinct` (one row per value seen plus a count row; a repeated value writes nothing), and `distinct` on a URL host (`derive: host`, which parses the URL on every call). Results, raw tables and rerun commands: [`bench/2026-10-24-vm-limit-kinds.md`](bench/2026-10-24-vm-limit-kinds.md) and `.json`.
+
+**Method.** `attenuo-bench hot-path` has six new configurations and a `--cells` option. Each puts one limit, with a `max` no run reaches, on `create_issue` in both hops of a 2-hop token, so every call charges 2 counters and none is refused: `calls_per_new` and `calls_per_same` (`calls_per` on argument `to`), `distinct_new` and `distinct_same` (`distinct` on `to`), `host_new` and `host_same` (`distinct` on the host of `url`). In a `_new` cell the value is new on every call (the harness puts a process-wide sequence number into the body); in a `_same` cell it is the same on every call, except that `host_same` sends a new path on the same host, so it parses a new URL every time. `create_issue` now carries `to` and `url` in every configuration, so `baseline` (no limit) and `limits_calls` (`calls` in both hops) differ from the limited cells only by the limit. File store at `durability = "normal"`, one client, only the `destructive` call, 2 s warm-up and 10 s measured per cell, two passes of 5 interleaved runs, the second in reverse order. Release build with `lto = false` and `codegen-units = 16`, as in the three sections above. Same shared 4-vCPU container with other agents building: load average 1.2 to 5.7 during the runs (14:34 to 14:51 UTC), 0.6 to 3.2 during the criterion runs. The configuration check after the runs shows the first charge's `used_after` growing with every call in the `_new` cells (33,000 to 37,000 values per server) and staying at 1 in `distinct_same` and `host_same`. In process, new `decide` cells: `charge_{store}/{calls_per,distinct,host}_{new,same}` (the charge transaction alone), `charges_for/{calls_per,distinct,host}` (building the call's charges, including the URL parse) and `derive_host/{shape}` (`Derive::Host::apply` on one URL).
+
+Pass 1 / pass 2; client figures are medians of 5 runs, the decision and the charge are means over all measured calls. "Charge" is the decision time outside lease check, policy and audit append, so `baseline`'s 20 to 22 us is record building and the rest is the charge transaction.
+
+| config | client p50 us | p90 us | p99 us | req/s | decide mean us | charge mean us | over 3 / 5 / 10 ms (of about 30,000) |
+|---|---|---|---|---|---|---|---|
+| `baseline` | 1,365 / 1,336 | 1,714 / 1,764 | 3,478 / 3,555 | 702 / 713 | 343 / 315 | 22 / 20 | 614 / 220 / 32; 591 / 196 / 21 |
+| `limits_calls` | 1,464 / 1,475 | 1,841 / 1,908 | 3,566 / 3,832 | 631 / 621 | 449 / 457 | 91 / 91 | 713 / 249 / 31; 687 / 243 / 30 |
+| `calls_per_new` | 1,465 / 1,482 | 1,861 / 1,962 | 4,330 / 4,473 | 610 / 614 | 505 / 536 | 122 / 121 | 867 / 376 / 61; 734 / 322 / 54 |
+| `calls_per_same` | 1,467 / 1,505 | 1,878 / 1,923 | 3,469 / 4,682 | 639 / 620 | 463 / 472 | 97 / 96 | 795 / 315 / 38; 1,170 / 395 / 48 |
+| `distinct_new` | 1,574 / 1,562 | 1,973 / 2,041 | 3,699 / 5,063 | 595 / 587 | 555 / 568 | 144 / 148 | 879 / 384 / 55; 915 / 355 / 61 |
+| `distinct_same` | 1,306 / 1,342 | 1,732 / 1,777 | 3,228 / 4,465 | 697 / 698 | 375 / 391 | 46 / 49 | 757 / 287 / 41; 874 / 275 / 25 |
+| `host_new` | 1,553 / 1,574 | 1,968 / 2,183 | 4,538 / 5,874 | 600 / 571 | 583 / 582 | 148 / 153 | 708 / 265 / 59; 1,493 / 524 / 67 |
+| `host_same` | 1,403 / 1,406 | 1,789 / 1,836 | 4,014 / 4,674 | 672 / 662 | 401 / 401 | 50 / 51 | 593 / 175 / 24; 904 / 286 / 25 |
+
+Against `baseline` of the same pass:
+
+| config | client p50 | decide mean | charge transaction | `policy` mean | `audit_append` mean |
+|---|---|---|---|---|---|
+| `limits_calls` | +99 / +139 us | +106 / +142 us | +69 / +71 us | +16 / +22 us | +21 / +45 us |
+| `calls_per_new` | +100 / +146 us | +162 / +221 us | +100 / +101 us | +28 / +36 us | +32 / +78 us |
+| `calls_per_same` | +102 / +169 us | +120 / +157 us | +75 / +76 us | +22 / +26 us | +22 / +49 us |
+| `distinct_new` | +209 / +226 us | +212 / +253 us | +122 / +128 us | +49 / +52 us | +36 / +66 us |
+| `distinct_same` | -59 / +6 us | +32 / +76 us | +24 / +29 us | +18 / +31 us | -9 / +12 us |
+| `host_new` | +188 / +238 us | +240 / +267 us | +126 / +133 us | +56 / +68 us | +55 / +55 us |
+| `host_same` | +38 / +70 us | +58 / +86 us | +28 / +31 us | +33 / +39 us | -6 / +11 us |
+
+In process (criterion, two runs; `file_full` once):
+
+| cell | memory | file, `normal` | file, `full` |
+|---|---|---|---|
+| `charge`, `calls` (2 counters, for reference) | 75 to 96 us | 38 to 42 us | 456 us |
+| `charge`, `calls_per`, repeated value | 121 to 127 us | 47 to 50 us | 458 us |
+| `charge`, `calls_per`, new value | 205 to 253 us | 73 to 74 us | 698 us |
+| `charge`, `distinct`, repeated value | 12 us | 19 us | 16 us |
+| `charge`, `distinct`, new value | 415 us | 106 to 107 us | 600 us |
+| `charge`, host `distinct`, repeated host | 11 us | 16 to 28 us | 16 us |
+| `charge`, host `distinct`, new host | 422 to 425 us | 94 to 95 us | 357 us |
+| `charges_for`, raw value / host (2 hops) | 0.60 to 0.82 / 1.34 to 1.38 us | | |
+| `Derive::Host::apply`, one URL | 0.28 to 0.30 us (short), 0.70 to 0.71 us (port, user info, upper case), 0.74 to 0.78 us (IDN), 0.97 to 1.06 us (212 bytes) | | |
+
+Readings:
+
+- **`calls_per` costs what `calls` costs.** With a repeated value the client p50 is +102 / +169 us against +99 / +139 us for `calls`, and the charge transaction 75 against 70 us. In process the keyed hash and the longer key add about 8 us (47 to 50 against 38 to 42 us). A new value adds about 25 to 30 us to the charge (100 against 75 us end to end, 73 against 47 to 50 in process): the counter row is inserted, at a random place in the index because the key is a hash, instead of updated in place.
+- **`distinct` with a new value costs about twice a `calls` limit**: +209 / +226 us at the client p50, +122 / +128 us of charge transaction, 15 to 18 percent of single-client throughput. That is what the design says it writes: per hop a value row and the count row, so four counter writes and four charge rows against two of each for `calls`.
+- **`distinct` with a repeated value writes nothing, as designed, and is within noise at the client** (-59 / +6 us p50, 697 / 698 against 702 / 713 req/s). It still runs the charge transaction: the write gate, `BEGIN IMMEDIATE`, the decision check, the counter reads and an empty commit, about 25 us end to end and 19 us in process (16 us at `full`, where a write would cost 360 to 700 us). The decision append does not grow (-9 / +12 us), unlike every cell that writes (+21 to +78 us), which is the WAL hand-off the earlier sections saw; so the empty commit writes no WAL frame. Skipping the transaction when every value is already seen would save those 20 to 25 us, but it would need the counters read outside the write lock, and a concurrent refund can make a seen value new again between that read and the call; not done.
+- **The URL parse is under 1 percent of a host limit.** `Derive::Host::apply` takes 0.3 to 1.1 us per URL, and a call parses once per limited hop: `charges_for` is 1.34 to 1.38 us for the host limit against 0.60 to 0.63 us for a raw-value `distinct`, so the parse adds about 0.75 us per call on a 2-hop token. A new host costs 126 / 133 us of charge transaction, the same as a new raw value (122 / 128 us); the rest is the store write. `host_same` (a new URL on a seen host every call) costs what `distinct_same` costs in the charge (28 / 31 against 24 / 29 us); its client p50 is 60 to 100 us above `distinct_same`, inside the noise of about 100 us these runs show.
+- **The counter read in `policy` grows with the values**: +16 to +22 us for `calls`, +18 to +39 us for the repeated-value cells, +28 to +68 us for the new-value cells. A new value is a lookup of a key that is not in the index; not profiled. It did not grow over the runs as the tables filled (from about 7,000 to 35,000 values per server): the per-run decision means show no trend.
+- **The tail.** Calls over 10 ms were 54 to 67 per pass in the three new-value cells against 21 to 32 in `baseline` and `limits_calls` and 24 to 48 in the repeated-value cells (0.18 to 0.24 % against 0.06 to 0.1 %). That suggests more slow commits when each call inserts rows, but with about 30,000 calls per cell and the host's load moving from 1.2 to 5.7 it is not established. `host_new`'s 1,493 calls over 3 ms in pass 2, against 708 in pass 1, fell in a load spike.
+
+Anomaly, measured and not fixed: on the in-memory store a new-value charge costs 205 to 425 us, two to four times the file store's 73 to 107 us, and a repeated `calls_per` value 121 to 127 us against 47 to 50. The memory store's `calls` charge was already slower than the file store's (the second anomaly of [the labels and limits section](#output-labelling-and-run-limits-on-the-hot-path-2026-10-24)); inserting new keys makes the gap larger. The server's default is the file store. Not investigated.
+
+Not measured: these kinds under concurrent clients, at `durability = "full"` end to end (in process only), on the memory store end to end, with list-valued arguments (one charge per element), with more than one limit kind per capability, and with values that are refused (`max` reached, or `limit_arg_invalid`).
+
 ### How to run
 
 ```
@@ -669,6 +727,8 @@ attenuo-bench hot-path --runs 5 --configs baseline,usage                        
 cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3 'decide_destructive_|charge_.*/usage'  # the same in process
 cargo test --release -p attenuo-audit --test single_client_outliers -- --ignored --nocapture  # one client's slow appends by cause (PROBE_CONFIGS=...)
 attenuo-bench hot-path --configs baseline --runs 3 --audit-set checkpoint_every=0          # counts over 3, 5 and 10 ms per stage; [audit] keys per run
+attenuo-bench hot-path --runs 5 --cells destructive --configs baseline,limits_calls,calls_per_new,calls_per_same,distinct_new,distinct_same,host_new,host_same  # per-value limit kinds
+cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3 'derive_host|charges_for/|charge_.*/(calls_per|distinct|host)'  # the same in process, and the URL parse
 ```
 
 `attenuo-bench --print-config DIR` writes the server config and policy it expects, for pointing the harness at an already running server (`--attenuo-url`, `--upstream-url`, and `--metrics-url` for the stage table). Every answer is checked: a denial counts only as the proxy's `-32003` with the expected reason code and a decision id listed in `X-Attenuo-Decision-Id`, so an `audit_error` denial, a `too_many_sessions` refusal or a `5xx` stops the run after that cell. A one-second smoke run is part of `cargo test --workspace` (`crates/attenuo-bench/tests/smoke.rs`). There is no CI job for the full matrix: it needs a release build and minutes of load, and numbers from shared runners could not be compared.
@@ -680,4 +740,4 @@ attenuo-bench hot-path --configs baseline --runs 3 --audit-set checkpoint_every=
 - The time outside the proxy's handler (hyper and axum parsing the client's request, relaying a streamed body). The handler's stages are in `attenuo_proxy_stage_seconds`; what lies between them and the client's latency is measured only as a difference.
 - Confidence intervals over repeated runs, open-loop load for the deny outcomes and for more than one hop, and a quiet reference machine. (Open-loop arrivals exist now, for the allow call at one hop and for exchange.)
 - Streaming (SSE) responses and `tools/list` filtering.
-- Output labelling under concurrency end to end (run limits under 1, 4 and 8 clients are in [Write-lock contention between the lease and audit connections](#write-lock-contention-between-the-lease-and-audit-connections-2026-10-24)), run limits on the memory store end to end, with `calls_per` limits, and at `durability = "full"` end to end; the charge and the run-label write have no stage of their own in `attenuo_proxy_stage_seconds` (see [Output labelling and run limits on the hot path](#output-labelling-and-run-limits-on-the-hot-path-2026-10-24)).
+- Output labelling under concurrency end to end (run limits under 1, 4 and 8 clients are in [Write-lock contention between the lease and audit connections](#write-lock-contention-between-the-lease-and-audit-connections-2026-10-24)), run limits on the memory store end to end and at `durability = "full"` end to end (`calls_per` and `distinct` from one client are in [Limit kinds](#limit-kinds-callsper-and-distinct-2026-10-24)); the charge and the run-label write have no stage of their own in `attenuo_proxy_stage_seconds` (see [Output labelling and run limits on the hot path](#output-labelling-and-run-limits-on-the-hot-path-2026-10-24)).
