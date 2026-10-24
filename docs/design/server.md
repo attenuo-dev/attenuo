@@ -220,6 +220,8 @@ An actor token is checked in this order (module `actor`): the header `typ` must 
 
 Because the child lease is registered under the parent's, revoking any lease revokes every lease delegated from it, and the child's next call fails the lease step. Even without the cascade, the child's chain lists every ancestor lease, so a revoked ancestor is caught directly.
 
+`POST /admin/leases/revoke` revokes by selector (`LeaseStore::revoke_selected`): a `user` is looked up in `lease_subjects` (the originating subject, written once by `register_issued` next to the chain binding; indexed on `subject`; the table is created at open, so a store from before it has no rows for its older leases), a `chain_id` is the root of a parent-link subtree. Every unrevoked match gets the single-lease cascade, all in one `IMMEDIATE` transaction committed with `synchronous=FULL`, and `?preview=true` runs the same reads without the writes (`preview_selected`).
+
 `GET /admin/leases/{id}/tree` previews that cascade without writing (`SqliteLeaseStore::subtree`): it reads the subtree with the recursive query the revocation's `UPDATE` uses, counts its unrevoked rows as `would_revoke`, and lists at most `max_nodes` of them breadth-first plus the ancestors up to the root. Agents and issuance times come from the chain's `root_token` and `exchange` records, found through the `chain_id` index (the root lease); the hop a record issued is its last lease.
 
 ### Checkpoints, export and verification

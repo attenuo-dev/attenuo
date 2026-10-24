@@ -34,6 +34,13 @@ An operator revokes a lease with `POST /admin/leases/{id}/revoke`, or `attenuo l
 
 Revoking the root lease of a run stops every sub-agent of every agent in it. You do not need to know which tokens exist. The server never stores tokens.
 
+During an incident you may know the user or the run rather than a lease. `POST /admin/leases/revoke` takes one selector, and `attenuo lease revoke` the matching flag:
+
+- `--user alice@example.com` revokes every lease issued for that originating user, across all of their runs. The server records each lease's user when it issues the token. Leases issued by an older server have no recorded user and are not matched.
+- `--chain-id <id>` revokes one run: the root lease named by the `chain_id` of its audit records, and everything below it.
+
+Each match is revoked with its descendants, in one transaction, and expired but unrevoked leases are included, since a renewal could otherwise bring them back. Add `--preview` first to see the list without changing anything. The answer lists every revoked lease, and one `admin.lease.revoke` audit record names them (the first 256, with the full count in its digested arguments). Revoking by MCP session is not supported yet: find the session's `chain_id` in the audit log and revoke that run.
+
 ## Two speeds
 
 - An **explicit revoke** takes effect on the next request. There is no lease cache in v0.
