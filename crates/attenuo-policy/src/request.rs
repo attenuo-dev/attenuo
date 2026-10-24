@@ -365,8 +365,8 @@ impl RequestParts {
 }
 
 /// The output-labelling members of the context (ADR-0009), always present:
-/// `session: {tainted, tainted_by}`, `args_contain_untrusted` and `untrusted_args` (fixed
-/// `false` and empty until argument matching exists), and `approval: {present, by}` (a
+/// `session: {tainted, tainted_by}`, `args_contain_untrusted` and `untrusted_args` (the
+/// arguments that matched the run's span index, phase 2), and `approval: {present, by}` (a
 /// granted approval the call consumed, if any); and the run-limit member (ADR-0010),
 /// `budget: {limited, calls_remaining, amount_remaining, destination_new}`.
 fn label_pairs(
@@ -425,11 +425,17 @@ fn label_pairs(
         ("session".to_string(), session),
         (
             "args_contain_untrusted".to_string(),
-            RestrictedExpression::new_bool(false),
+            RestrictedExpression::new_bool(labels.args.contain_untrusted),
         ),
         (
             "untrusted_args".to_string(),
-            RestrictedExpression::new_set(std::iter::empty()),
+            RestrictedExpression::new_set(
+                labels
+                    .args
+                    .untrusted
+                    .iter()
+                    .map(|a| RestrictedExpression::new_string(a.clone())),
+            ),
         ),
         ("approval".to_string(), approval),
         ("budget".to_string(), budget),
@@ -444,8 +450,11 @@ fn label_json(labels: &CallLabels) -> Map<String, Value> {
         "session".into(),
         json!({ "tainted": labels.session.tainted, "tainted_by": labels.session.tainted_by }),
     );
-    m.insert("args_contain_untrusted".into(), json!(false));
-    m.insert("untrusted_args".into(), json!([]));
+    m.insert(
+        "args_contain_untrusted".into(),
+        json!(labels.args.contain_untrusted),
+    );
+    m.insert("untrusted_args".into(), json!(labels.args.untrusted));
     m.insert(
         "approval".into(),
         json!({ "present": labels.approval.present, "by": labels.approval.by }),
@@ -920,6 +929,7 @@ mod tests {
     fn tainted_labels() -> CallLabels {
         CallLabels {
             session: crate::SessionLabels::from_sources(["web/fetch", "mail/read"]),
+            args: crate::ArgLabels::from_args(["body", "to"]),
             ..Default::default()
         }
     }

@@ -68,9 +68,20 @@ pub const MIN_DIGIT_RUN: usize = 6;
 /// k-gram text.
 pub const MAX_FINGERPRINTS_PER_VALUE: usize = 2_000;
 
+/// Most characters of one value that k-grams are taken from, over all its strings in order.
+/// Winnowing keeps about 2 k-grams in 9 characters, so [`MAX_FINGERPRINTS_PER_VALUE`] is
+/// reached well before this on ordinary text; the bound is for repetitive text, which yields
+/// few distinct k-grams however long it is.
+pub const MAX_KGRAM_CHARS: usize = 64 * 1024;
+
 /// How deep a string that parses as JSON is expanded into its own strings: once, so a JSON
 /// text inside a JSON text inside a result is fingerprinted as text.
 const MAX_JSON_EXPANSION: usize = 1;
+
+/// Most bytes of string content read from one value: the first 1 MiB, in document order. The
+/// proxy fingerprints every result before relaying it, so this bounds the work (NFKC and
+/// scanning) for a huge result; text past it is not fingerprinted.
+pub const MAX_TEXT_BYTES: usize = 1 << 20;
 
 /// Characters that end an entity token, besides whitespace.
 const TOKEN_DELIMITERS: &[char] = &[
@@ -157,7 +168,8 @@ pub fn normalise(s: &str) -> String {
 /// they are fingerprinted the same way.
 pub fn fingerprints(value: &Value) -> Vec<Fingerprint> {
     let mut texts = Vec::new();
-    collect_strings(value, MAX_JSON_EXPANSION, &mut texts);
+    let mut budget = MAX_TEXT_BYTES;
+    collect_strings(value, MAX_JSON_EXPANSION, &mut budget, &mut texts);
     let texts: Vec<String> = texts.into_iter().map(|s| normalise(&s)).collect();
 
     let mut out = Fingerprints::default();
@@ -175,8 +187,17 @@ pub fn fingerprints(value: &Value) -> Vec<Fingerprint> {
             return out.list;
         }
     }
+    let mut kgram_chars = MAX_KGRAM_CHARS;
     for t in &texts {
-        for k in winnowed_kgrams(t) {
+        if kgram_chars == 0 {
+            break;
+        }
+        let end = t
+            .char_indices()
+            .nth(kgram_chars)
+            .map_or(t.len(), |(i, _)| i);
+        kgram_chars -= t[..end].chars().count();
+        for k in winnowed_kgrams(&t[..end]) {
             if !out.push(Fingerprint::of(FingerprintKind::Kgram, &k)) {
                 return out.list;
             }
@@ -205,9 +226,13 @@ impl Fingerprints {
     }
 }
 
-/// Every string in `value`, in document order. A string that parses as a JSON object or array
-/// is replaced by its own strings while `expand` allows.
-fn collect_strings(value: &Value, expand: usize, out: &mut Vec<String>) {
+/// Every string in `value`, in document order, until `budget` bytes have been taken (the
+/// string that crosses it is cut at a character boundary). A string that parses as a JSON
+/// object or array is replaced by its own strings while `expand` allows.
+fn collect_strings(value: &Value, expand: usize, budget: &mut usize, out: &mut Vec<String>) {
+    if *budget == 0 {
+        return;
+    }
     match value {
         Value::String(s) => {
             let trimmed = s.trim_start();
@@ -215,14 +240,27 @@ fn collect_strings(value: &Value, expand: usize, out: &mut Vec<String>) {
                 if let Ok(inner @ (Value::Object(_) | Value::Array(_))) =
                     serde_json::from_str::<Value>(s)
                 {
-                    collect_strings(&inner, expand - 1, out);
+                    collect_strings(&inner, expand - 1, budget, out);
                     return;
                 }
             }
-            out.push(s.clone());
+            let mut end = s.len().min(*budget);
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            *budget -= end;
+            out.push(s[..end].to_owned());
         }
-        Value::Array(items) => items.iter().for_each(|v| collect_strings(v, expand, out)),
-        Value::Object(map) => map.values().for_each(|v| collect_strings(v, expand, out)),
+        Value::Array(items) => {
+            for v in items {
+                collect_strings(v, expand, budget, out);
+            }
+        }
+        Value::Object(map) => {
+            for v in map.values() {
+                collect_strings(v, expand, budget, out);
+            }
+        }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
@@ -518,6 +556,15 @@ mod tests {
         assert_eq!(distinct.len(), fps.len());
         let twice = fingerprints(&json!(["https://a.example/x", "https://a.example/x"]));
         assert_eq!(twice.len(), 3, "url, host and leaf, once each: {twice:?}");
+    }
+
+    #[test]
+    fn text_past_the_byte_budget_is_not_read() {
+        let filler = "x".repeat(MAX_TEXT_BYTES);
+        let fps = fingerprints(&json!([filler, "mallory@evil.example"]));
+        assert!(!has(&fps, FingerprintKind::Entity, "mallory@evil.example"));
+        let fps = fingerprints(&json!(["mallory@evil.example", filler]));
+        assert!(has(&fps, FingerprintKind::Entity, "mallory@evil.example"));
     }
 
     #[test]

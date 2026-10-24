@@ -6,7 +6,7 @@
 //! | Route | Auth | Purpose |
 //! |---|---|---|
 //! | `POST /approvals/{id}` | an ID token of the run's originating user, from a trusted `[[idps]]` | grant or decline (`by = "user"`) |
-//! | `GET /approvals/{id}` | that user's ID token, or a delegation token of the same run | the exact call, labels, state and expiry |
+//! | `GET /approvals/{id}` | that user's ID token, or a delegation token of the same run | the exact call, labels (and matched arguments, `untrusted_args`), state and expiry |
 //! | `POST /admin/approvals/{id}` | admin bearer | grant or decline as an operator (`by = "operator"`) |
 //! | `GET /admin/approvals/{id}`, `GET /admin/approvals?chain_id=` | admin bearer | one approval; the newest approvals of a run (console, CLI) |
 //!
@@ -122,6 +122,10 @@ pub fn approval_json(a: &Approval, now: OffsetDateTime) -> Value {
     }
     if let Some(d) = &a.consumed_by {
         v["consumed_by"] = json!(d);
+    }
+    // The arguments that matched an untrusted result (ADR-0009 phase 2), when any did.
+    if !a.untrusted_args.is_empty() {
+        v["untrusted_args"] = crate::authz::untrusted_args_json(&a.untrusted_args);
     }
     v
 }

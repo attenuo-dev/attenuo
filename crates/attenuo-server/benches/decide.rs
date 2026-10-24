@@ -6,7 +6,8 @@
 //! policy (`PolicyEngine::authorize`), building the `DecisionRecord`, the audit append, and
 //! `Pipeline::decide` as a whole (leases, policy, record, append), and the output-labelling
 //! cost of an allowed call's answer (`result_digest` of a small result, and
-//! `Pipeline::record_result`: the `tool_result` append plus the run label). Chains of 1 and 3
+//! `Pipeline::record_result`: the `tool_result` append, the run label and the result's
+//! fingerprints added to the run's span index; taking the fingerprints is not timed). Chains of 1 and 3
 //! hops, the
 //! `attenuo-bench` policy and catalog, SQLite stores in memory and in a temporary file
 //! (`durability` normal and full, opened as the server opens them: WAL checkpoints in the
@@ -241,13 +242,23 @@ fn bench_decide(c: &mut Criterion) {
                     BatchSize::SmallInput,
                 )
             });
-            // An untrusted result: the tool_result append and the run label, both on the store.
+            // An untrusted result: the tool_result append, the run label and the span index
+            // write, all on the store.
+            let spans = attenuo_core::fingerprint::fingerprints(&result);
             group.bench_function(format!("record_result_{s}/{depth}_hop"), |b| {
                 b.iter_batched(
                     || result_digest(&result).unwrap(),
                     |d| {
                         pipeline
-                            .record_result(&chain, &call, uuid::Uuid::new_v4(), d, false, now)
+                            .record_result(
+                                &chain,
+                                &call,
+                                uuid::Uuid::new_v4(),
+                                d,
+                                &spans,
+                                false,
+                                now,
+                            )
                             .unwrap()
                     },
                     BatchSize::SmallInput,

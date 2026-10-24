@@ -123,7 +123,8 @@ CREATE TABLE IF NOT EXISTS approvals (
     approver_method  TEXT NULL,
     decided_at       TEXT NULL,
     consumed_by      TEXT NULL,
-    jkt              TEXT NULL
+    jkt              TEXT NULL,
+    untrusted_args   TEXT NULL
 );
 CREATE INDEX IF NOT EXISTS approvals_call_idx ON approvals(chain_id, call_hash, state);
 -- Run limits (ADR-0010). One row per counter; `value` is the hex HMAC of a `calls_per`
@@ -1933,7 +1934,7 @@ impl SqliteLeaseStore {
 
     pub fn from_connection(conn: Connection) -> Result<Self, AuditError> {
         conn.execute_batch(LEASE_SCHEMA)?;
-        add_approval_jkt_column(&conn)?;
+        add_approval_columns(&conn)?;
         let key: String = conn.query_row(
             "SELECT value FROM budget_meta WHERE key = 'value_key'",
             [],
@@ -2294,7 +2295,7 @@ fn get_in(conn: &Connection, lease: &LeaseId) -> Result<Option<LeaseRow>, AuditE
 /// Columns of an approval row, in the order [`approval_from_row`] reads them.
 const APPROVAL_COLUMNS: &str = "id, chain_id, lease, call_hash, server, tool, arguments, labels, \
      decision_id, chain, created_at, expires_at, state, approver_subject, approver_method, \
-     decided_at, consumed_by, jkt";
+     decided_at, consumed_by, jkt, untrusted_args";
 
 fn approval_from_row(r: &Row<'_>) -> Result<Approval, AuditError> {
     let text = |i: usize| -> Result<String, AuditError> { Ok(r.get::<_, String>(i)?) };
@@ -2325,6 +2326,10 @@ fn approval_from_row(r: &Row<'_>) -> Result<Approval, AuditError> {
         decided_at: opt(15)?.as_deref().map(parse_time).transpose()?,
         consumed_by: opt(16)?,
         jkt: opt(17)?,
+        untrusted_args: match opt(18)? {
+            Some(json) => serde_json::from_str(&json)?,
+            None => Vec::new(),
+        },
     })
 }
 
@@ -2339,16 +2344,21 @@ fn approval_in(conn: &Connection, id: &str) -> Result<Option<Approval>, AuditErr
     }
 }
 
-/// Add `approvals.jkt` to a lease store created before approval tokens (same release cycle,
-/// never shipped without it, but cheap to carry). A missing value reads as `NULL`: an
-/// approval with no key binding.
-fn add_approval_jkt_column(conn: &Connection) -> Result<(), AuditError> {
+/// Add the `approvals` columns that came after the table: `jkt` (approval tokens) and
+/// `untrusted_args` (output labelling phase 2), each in the same release cycle as the table
+/// and never shipped without it, but cheap to carry. A missing value reads as `NULL`: an
+/// approval with no key binding, or with no matched arguments.
+fn add_approval_columns(conn: &Connection) -> Result<(), AuditError> {
     let cols: Vec<String> = conn
         .prepare("SELECT name FROM pragma_table_info('approvals')")?
         .query_map([], |r| r.get(0))?
         .collect::<Result<_, _>>()?;
-    if !cols.iter().any(|c| c == "jkt") {
-        conn.execute_batch("ALTER TABLE approvals ADD COLUMN jkt TEXT NULL")?;
+    for column in ["jkt", "untrusted_args"] {
+        if !cols.iter().any(|c| c == column) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE approvals ADD COLUMN {column} TEXT NULL"
+            ))?;
+        }
     }
     Ok(())
 }
@@ -2644,8 +2654,8 @@ impl LeaseStore for SqliteLeaseStore {
         stored.expires_at = stored.expires_at.min(lease_expiry);
         tx.prepare_cached(
             "INSERT INTO approvals (id, chain_id, lease, call_hash, server, tool, arguments, \
-             labels, decision_id, chain, created_at, expires_at, state, jkt) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             labels, decision_id, chain, created_at, expires_at, state, jkt, untrusted_args) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         )?
         .execute(params![
             stored.id,
@@ -2662,6 +2672,9 @@ impl LeaseStore for SqliteLeaseStore {
             fmt_time(stored.expires_at)?,
             stored.state.as_str(),
             stored.jkt,
+            (!stored.untrusted_args.is_empty())
+                .then(|| serde_json::to_string(&stored.untrusted_args))
+                .transpose()?,
         ])?;
         tx.commit()?;
         Ok((stored, true))

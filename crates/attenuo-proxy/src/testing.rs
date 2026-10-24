@@ -648,6 +648,7 @@ impl Authorizer for StaticAuthorizer {
             decision_id: id,
             approval,
             limit: None,
+            untrusted_args: None,
         }
     }
 

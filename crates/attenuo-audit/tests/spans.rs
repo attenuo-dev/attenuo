@@ -190,3 +190,42 @@ fn sqlite_rows_hold_keyed_hashes_only() {
         .unwrap();
     assert!(!rows.contains(&theirs));
 }
+
+#[test]
+fn a_store_from_before_phase_2_gains_the_index_and_the_approval_column() {
+    // The lease tables as they were before phase 2: no `run_spans`, no `span_key`, and an
+    // `approvals` table without `jkt` or `untrusted_args`.
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE leases (id TEXT PRIMARY KEY, parent TEXT NULL, expires_at TEXT NOT NULL, \
+           revoked_at TEXT NULL, revoke_reason TEXT NULL);
+         CREATE TABLE approvals (id TEXT PRIMARY KEY, chain_id TEXT NOT NULL, \
+           lease TEXT NOT NULL, call_hash TEXT NOT NULL, server TEXT NOT NULL, \
+           tool TEXT NOT NULL, arguments TEXT NOT NULL, labels TEXT NOT NULL, \
+           decision_id TEXT NOT NULL, chain TEXT NOT NULL, created_at TEXT NOT NULL, \
+           expires_at TEXT NOT NULL, state TEXT NOT NULL, approver_subject TEXT NULL, \
+           approver_method TEXT NULL, decided_at TEXT NULL, consumed_by TEXT NULL);",
+    )
+    .unwrap();
+    let store = SqliteLeaseStore::from_connection(conn).unwrap();
+    let cols: Vec<String> = store
+        .with_connection(|c| {
+            let mut stmt = c.prepare("SELECT name FROM pragma_table_info('approvals')")?;
+            let cols = stmt
+                .query_map([], |r| r.get(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(cols)
+        })
+        .unwrap();
+    assert!(cols.iter().any(|c| c == "jkt"));
+    assert!(cols.iter().any(|c| c == "untrusted_args"));
+    let r = run(&store, "old-run");
+    store.add_spans(&r, 1, &[fp("after the upgrade")]).unwrap();
+    assert_eq!(
+        store
+            .find_spans(&r, &[fp("after the upgrade")])
+            .unwrap()
+            .len(),
+        1
+    );
+}

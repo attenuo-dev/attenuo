@@ -390,6 +390,11 @@ fn evaluate_value(
     if let Some(charged) = &d.charged {
         context["charged"] = json!(charged.charged);
     }
+    // Argument-level taint (ADR-0009 phase 2): only when an argument matched, so other
+    // answers are unchanged.
+    if !d.untrusted_args.is_empty() {
+        context["untrusted_args"] = crate::authz::untrusted_args_json(&d.untrusted_args);
+    }
     Ok(EvaluationResponse {
         decision: allow,
         context: Some(context),
