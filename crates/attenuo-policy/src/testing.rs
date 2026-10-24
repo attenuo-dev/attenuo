@@ -95,8 +95,17 @@
 //! let report = file.run().unwrap();
 //! assert!(report.all_passed());
 //! ```
+//!
+//! # Unexercised policies
+//!
+//! A policy is *exercised* when it is among the determining policies (Cedar's
+//! `diagnostics().reason()`, reported as `policy_ids`) of at least one evaluated case, passing
+//! or not: a `permit` that allowed a call, or a `forbid` that denied one. [`TestReport::policies`]
+//! lists every policy of the file's `policies` with the line it starts on, and [`coverage`]
+//! folds several reports into the policies no case exercised. A `permit` overridden by a
+//! `forbid` in every case it matched is not exercised: no decision depended on it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use attenuo_core::{
@@ -675,10 +684,13 @@ impl TestFile {
     /// Build the engine and run every case.
     pub fn run(&self) -> Result<TestReport, HarnessError> {
         let engine = self.build_engine()?;
-        Ok(self.run_with(&engine))
+        let mut report = self.run_with(&engine);
+        report.policies = self.policy_refs()?;
+        Ok(report)
     }
 
-    /// Run every case against an engine you built yourself.
+    /// Run every case against an engine you built yourself. [`TestReport::policies`] lists
+    /// the engine's policies without a file or line.
     pub fn run_with(&self, engine: &PolicyEngine) -> TestReport {
         let now_unix = self.now.unwrap_or(DEFAULT_NOW_UNIX);
         TestReport {
@@ -688,7 +700,156 @@ impl TestFile {
                 .iter()
                 .map(|c| run_case(engine, c, now_unix))
                 .collect(),
+            policies: engine
+                .policy_ids()
+                .into_iter()
+                .map(|id| PolicyRef {
+                    id,
+                    file: None,
+                    line: None,
+                })
+                .collect(),
         }
+    }
+
+    /// The policy file the test file names, resolved against the test file's directory.
+    pub fn policies_path(&self) -> Option<PathBuf> {
+        self.policies
+            .as_deref()
+            .map(|p| clean_path(&self.resolve(p)))
+    }
+
+    /// Every policy of the file's `policies`, with the line it starts on (empty when it names
+    /// none).
+    pub fn policy_refs(&self) -> Result<Vec<PolicyRef>, HarnessError> {
+        match self.policies_path() {
+            None => Ok(Vec::new()),
+            Some(path) => policy_refs(&read(&path)?, Some(&path)),
+        }
+    }
+}
+
+/// `path` without `.` components, so `dir/./policy.cedar` prints as `dir/policy.cedar`.
+fn clean_path(path: &Path) -> PathBuf {
+    let cleaned: PathBuf = path
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect();
+    if cleaned.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        cleaned
+    }
+}
+
+/// One policy of a policy set: its id as the engine reports it (the `@id` annotation, else
+/// Cedar's `policy<N>`), and where it starts when known.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct PolicyRef {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<PathBuf>,
+    /// 1-based line of the policy's first token (its first annotation, or `permit`/`forbid`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+}
+
+impl std::fmt::Display for PolicyRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (&self.file, self.line) {
+            (Some(file), Some(line)) => write!(f, "{} ({}:{line})", self.id, file.display()),
+            (Some(file), None) => write!(f, "{} ({})", self.id, file.display()),
+            (None, Some(line)) => write!(f, "{} (line {line})", self.id),
+            (None, None) => f.write_str(&self.id),
+        }
+    }
+}
+
+/// The policies (and templates) in Cedar policy text, as the engine names them, each with the
+/// line it starts on, in file order. `file` is only recorded in the result.
+pub fn policy_refs(text: &str, file: Option<&Path>) -> Result<Vec<PolicyRef>, HarnessError> {
+    use std::str::FromStr as _;
+    let parsed = cedar_policy::PolicySet::from_str(text)
+        .map_err(|e| HarnessError::Policy(PolicyError::Parse(e.to_string())))?;
+    let lines = crate::lint::statement_lines(text);
+    let mut refs: Vec<PolicyRef> = parsed
+        .policies()
+        .map(|p| (p.id().to_string(), p.annotation("id").map(str::to_string)))
+        .chain(
+            parsed
+                .templates()
+                .map(|t| (t.id().to_string(), t.annotation("id").map(str::to_string))),
+        )
+        .map(|(default_id, annotated)| {
+            // Cedar numbers the statements of a parsed set `policy0`, `policy1`, ... in order.
+            let line = default_id
+                .strip_prefix("policy")
+                .and_then(|n| n.parse::<usize>().ok())
+                .and_then(|n| lines.get(n).copied());
+            PolicyRef {
+                id: annotated.unwrap_or(default_id),
+                file: file.map(Path::to_path_buf),
+                line,
+            }
+        })
+        .collect();
+    refs.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.id.cmp(&b.id)));
+    Ok(refs)
+}
+
+/// Which policies of one or more test runs no case exercised (see the module docs).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Coverage {
+    /// Distinct policies across the reports (by policy file and id).
+    pub policies: usize,
+    /// The ones no case's decision depended on, in file and line order.
+    pub unexercised: Vec<PolicyRef>,
+}
+
+impl Coverage {
+    pub fn exercised(&self) -> usize {
+        self.policies - self.unexercised.len()
+    }
+}
+
+/// Fold reports into one [`Coverage`]. Reports whose test files name the same policy file
+/// share its policies, so a policy exercised by a case in any of them counts as exercised.
+pub fn coverage<'a>(reports: impl IntoIterator<Item = &'a TestReport>) -> Coverage {
+    type Key = (Option<PathBuf>, String);
+    let key = |p: &PolicyRef| -> Key {
+        let file = p
+            .file
+            .as_ref()
+            .map(|f| std::fs::canonicalize(f).unwrap_or_else(|_| f.clone()));
+        (file, p.id.clone())
+    };
+    let mut all: BTreeMap<Key, PolicyRef> = BTreeMap::new();
+    let mut exercised: BTreeSet<Key> = BTreeSet::new();
+    for report in reports {
+        let ids = report.exercised_ids();
+        for p in &report.policies {
+            let k = key(p);
+            if ids.contains(p.id.as_str()) {
+                exercised.insert(k.clone());
+            }
+            all.entry(k).or_insert_with(|| p.clone());
+        }
+    }
+    let policies = all.len();
+    let mut unexercised: Vec<PolicyRef> = all
+        .into_iter()
+        .filter(|(k, _)| !exercised.contains(k))
+        .map(|(_, p)| p)
+        .collect();
+    unexercised.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then(a.line.cmp(&b.line))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    Coverage {
+        policies,
+        unexercised,
     }
 }
 
@@ -735,9 +896,30 @@ pub struct TestReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<PathBuf>,
     pub cases: Vec<CaseReport>,
+    /// Every policy of the set under test, exercised or not.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub policies: Vec<PolicyRef>,
 }
 
 impl TestReport {
+    /// Ids of the policies some evaluated case's decision depended on.
+    pub fn exercised_ids(&self) -> BTreeSet<&str> {
+        self.cases
+            .iter()
+            .filter_map(|c| c.actual.as_ref())
+            .flat_map(|a| a.policy_ids.iter().map(String::as_str))
+            .collect()
+    }
+
+    /// The policies no case of this report exercised, in file order.
+    pub fn unexercised(&self) -> Vec<&PolicyRef> {
+        let ids = self.exercised_ids();
+        self.policies
+            .iter()
+            .filter(|p| !ids.contains(p.id.as_str()))
+            .collect()
+    }
+
     pub fn passed(&self) -> usize {
         self.cases.iter().filter(|c| c.passed).count()
     }
@@ -1286,5 +1468,111 @@ catalog:
         let v = serde_json::to_value(f.run().unwrap()).unwrap();
         assert_eq!(v["cases"][0]["actual"]["decision"], "deny");
         assert_eq!(v["cases"][0]["passed"], true);
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    const POLICY: &str = "@id(\"read\")\npermit(principal, action == Action::\"github/read_file\", resource);\n\n// no id: Cedar calls it policy1\nforbid(principal, action, resource) when { context.chain.depth > 2 };\n\n@id(\"shadowed\")\npermit(principal, action == Action::\"github/read_file\", resource) when { context.chain.depth > 2 };\n\n@id(\"delete\")\npermit(principal, action == Action::\"github/delete_repo\", resource);\n";
+
+    fn setup(cases: &str) -> (tempfile::TempDir, TestFile) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("p.cedar"), POLICY).unwrap();
+        let path = dir.path().join("t.yaml");
+        std::fs::write(
+            &path,
+            format!("policies: ./p.cedar\ncatalog:\n  github:\n    read_file: {{ readonly: true }}\n    delete_repo: {{}}\ncases:\n{cases}"),
+        )
+        .unwrap();
+        let f = TestFile::load(&path).unwrap();
+        (dir, f)
+    }
+
+    const READ: &str = "  - name: read\n    chain: [a]\n    call: { server: github, tool: read_file }\n    expect: allow\n";
+    const DEEP: &str = "  - name: deep\n    chain: [a, b, c]\n    call: { server: github, tool: read_file }\n    expect: deny\n";
+    const DELETE: &str = "  - name: delete\n    chain: [a]\n    call: { server: github, tool: delete_repo }\n    expect: allow\n";
+
+    #[test]
+    fn policy_refs_name_and_locate_every_policy() {
+        let refs = policy_refs(POLICY, Some(Path::new("p.cedar"))).unwrap();
+        let got: Vec<(&str, Option<usize>)> =
+            refs.iter().map(|r| (r.id.as_str(), r.line)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("read", Some(1)),
+                ("policy1", Some(5)),
+                ("shadowed", Some(7)),
+                ("delete", Some(10))
+            ]
+        );
+        assert_eq!(refs[1].to_string(), "policy1 (p.cedar:5)");
+        assert!(policy_refs("permit(principal action resource);", None).is_err());
+    }
+
+    #[test]
+    fn unexercised_lists_policies_no_decision_depended_on() {
+        let (_d, f) = setup(&format!("{READ}{DEEP}"));
+        let report = f.run().unwrap();
+        assert!(report.all_passed(), "{report:?}");
+        assert_eq!(report.policies.len(), 4);
+        let un: Vec<&str> = report.unexercised().iter().map(|p| p.id.as_str()).collect();
+        // `shadowed` matched the deep call, but the forbid decided it.
+        assert_eq!(un, vec!["shadowed", "delete"]);
+        let file = report.policies[0].file.as_ref().unwrap();
+        assert!(file.ends_with("p.cedar"), "{file:?}");
+        assert!(!file.to_string_lossy().contains("/./"), "{file:?}");
+    }
+
+    #[test]
+    fn failing_cases_still_exercise_and_coverage_merges_files() {
+        // The case fails (expect deny, got allow), yet `delete` decided it.
+        let wrong = "  - name: delete\n    chain: [a]\n    call: { server: github, tool: delete_repo }\n    expect: deny\n";
+        let (d, f1) = setup(wrong);
+        let r1 = f1.run().unwrap();
+        assert_eq!(r1.failed(), 1);
+        assert!(r1.exercised_ids().contains("delete"));
+
+        // A second test file over the same policy file.
+        let p2 = d.path().join("t2.yaml");
+        std::fs::write(
+            &p2,
+            format!("policies: p.cedar\ncatalog:\n  github:\n    read_file: {{ readonly: true }}\n    delete_repo: {{}}\ncases:\n{READ}"),
+        )
+        .unwrap();
+        let r2 = TestFile::load(&p2).unwrap().run().unwrap();
+        let cov = coverage([&r1, &r2]);
+        assert_eq!(cov.policies, 4);
+        assert_eq!(cov.exercised(), 2);
+        let un: Vec<&str> = cov.unexercised.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(un, vec!["policy1", "shadowed"]);
+
+        let (_d, all) = setup(&format!("{READ}{DEEP}{DELETE}"));
+        let cov = coverage([&all.run().unwrap()]);
+        // `shadowed` can never decide: the forbid wins whenever it matches.
+        let un: Vec<&str> = cov.unexercised.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(un, vec!["shadowed"]);
+    }
+
+    #[test]
+    fn run_with_lists_engine_policies_without_location_and_no_policies_means_none() {
+        let (_d, f) = setup(READ);
+        let engine = f.build_engine().unwrap();
+        let r = f.run_with(&engine);
+        assert_eq!(r.policies.len(), 4);
+        assert!(r
+            .policies
+            .iter()
+            .all(|p| p.file.is_none() && p.line.is_none()));
+
+        let none = TestFile::from_yaml_str(
+            "cases:\n  - name: x\n    call: { server: s, tool: t }\n    expect: deny\n",
+        )
+        .unwrap();
+        let r = none.run().unwrap();
+        assert!(r.policies.is_empty());
+        assert_eq!(coverage([&r]), Coverage::default());
     }
 }

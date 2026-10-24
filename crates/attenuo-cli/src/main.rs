@@ -427,9 +427,10 @@ async fn run(cli: Cli) -> Result<Outcome> {
             }
             Ok(if ok { Outcome::Ok } else { Outcome::No })
         }
-        Command::Policy(PolicyCmd::Test { files }) => {
-            finish(policy_cmd::test(&files, json), "policy test failed to run")
-        }
+        Command::Policy(PolicyCmd::Test(args)) => finish(
+            policy_cmd::test(&args.files, &policy_cmd::TestOptions::from(&args), json),
+            "policy test failed to run",
+        ),
         Command::Policy(PolicyCmd::Lint {
             policy,
             config,

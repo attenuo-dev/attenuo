@@ -49,9 +49,23 @@ fn pretty(v: &Value) -> String {
     format!("{}\n", serde_json::to_string_pretty(v).unwrap_or_default())
 }
 
+/// How `policy test` runs and when it fails, beyond the files.
+#[derive(Debug, Clone, Default)]
+pub struct TestOptions {
+    /// Fail (exit 2) when some policy was not exercised by any case.
+    pub fail_on_unexercised: bool,
+}
+
+impl From<&crate::cli::TestArgs> for TestOptions {
+    fn from(a: &crate::cli::TestArgs) -> Self {
+        Self {
+            fail_on_unexercised: a.fail_on_unexercised,
+        }
+    }
+}
+
 /// `attenuo policy test <file>...`
-pub fn test(files: &[PathBuf], json_out: bool) -> Run {
-    let mut run = Run::new();
+pub fn test(files: &[PathBuf], opts: &TestOptions, json_out: bool) -> Run {
     let mut reports: Vec<(&Path, TestReport)> = Vec::new();
     let mut errors: Vec<(&Path, String)> = Vec::new();
     for path in files {
@@ -60,8 +74,21 @@ pub fn test(files: &[PathBuf], json_out: bool) -> Run {
             Err(e) => errors.push((path, e.to_string())),
         }
     }
+    report(&reports, &errors, opts, json_out)
+}
+
+/// Print the reports of a `policy test` run (however the cases were evaluated) and decide its
+/// status.
+fn report(
+    reports: &[(&Path, TestReport)],
+    errors: &[(&Path, String)],
+    opts: &TestOptions,
+    json_out: bool,
+) -> Run {
+    let mut run = Run::new();
     let passed: usize = reports.iter().map(|(_, r)| r.passed()).sum();
     let failed: usize = reports.iter().map(|(_, r)| r.failed()).sum();
+    let coverage = testing::coverage(reports.iter().map(|(_, r)| r));
 
     if json_out {
         let mut entries: Vec<Value> = reports
@@ -73,16 +100,21 @@ pub fn test(files: &[PathBuf], json_out: bool) -> Run {
         entries.extend(errors.iter().map(|(p, e)| json!({"file": p, "error": e})));
         run.stdout = pretty(&json!({
             "files": entries, "passed": passed, "failed": failed, "errors": errors.len(),
+            "coverage": {
+                "policies": coverage.policies,
+                "exercised": coverage.exercised(),
+                "unexercised": coverage.unexercised,
+            },
         }));
     } else {
-        for (path, report) in &reports {
+        for (path, report) in reports {
             let _ = writeln!(run.stdout, "{}", path.display());
             for case in &report.cases {
                 render_case(&mut run.stdout, case);
             }
             run.stdout.push('\n');
         }
-        for (path, e) in &errors {
+        for (path, e) in errors {
             let _ = writeln!(run.stderr, "error: {}: {e}", path.display());
         }
         if !reports.is_empty() {
@@ -97,16 +129,49 @@ pub fn test(files: &[PathBuf], json_out: bool) -> Run {
                 let _ = write!(run.stdout, "; {} file(s) could not be run", errors.len());
             }
             run.stdout.push('\n');
+            render_coverage(&mut run.stdout, &coverage);
         }
     }
+    let unexercised_fails = opts.fail_on_unexercised && !coverage.unexercised.is_empty();
     run.status = if !errors.is_empty() {
         Status::Error
-    } else if failed > 0 {
+    } else if failed > 0 || unexercised_fails {
         Status::Failed
     } else {
         Status::Ok
     };
     run
+}
+
+fn render_coverage(out: &mut String, coverage: &testing::Coverage) {
+    if coverage.policies == 0 {
+        return;
+    }
+    let plural = |n: usize| if n == 1 { "policy" } else { "policies" };
+    if coverage.unexercised.is_empty() {
+        let _ = writeln!(
+            out,
+            "all {} {} exercised",
+            coverage.policies,
+            plural(coverage.policies)
+        );
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "{} of {} {} not exercised:",
+        coverage.unexercised.len(),
+        coverage.policies,
+        plural(coverage.policies)
+    );
+    for p in &coverage.unexercised {
+        let loc = match (&p.file, p.line) {
+            (Some(f), Some(l)) => format!("{}:{l}", f.display()),
+            (Some(f), None) => f.display().to_string(),
+            (None, _) => "-".to_string(),
+        };
+        let _ = writeln!(out, "  {loc}  {}", p.id);
+    }
 }
 
 fn render_case(out: &mut String, case: &CaseReport) {
@@ -314,7 +379,7 @@ mod tests {
     #[test]
     fn passing_file_exits_ok_with_checkmarks() {
         let (_d, t) = setup("allow");
-        let r = test(&[t], false);
+        let r = test(&[t], &TestOptions::default(), false);
         assert_eq!(r.status, Status::Ok);
         assert!(r.stdout.contains("\u{2713} read"), "{}", r.stdout);
         assert!(r.stdout.contains("1 passed, 0 failed (1 cases in 1 file)"));
@@ -323,7 +388,7 @@ mod tests {
     #[test]
     fn failing_case_exits_failed_and_explains() {
         let (_d, t) = setup("deny");
-        let r = test(&[t], false);
+        let r = test(&[t], &TestOptions::default(), false);
         assert_eq!(r.status, Status::Failed);
         assert!(r.stdout.contains("\u{2717} read"));
         assert!(
@@ -337,7 +402,11 @@ mod tests {
     fn unreadable_or_malformed_file_exits_error_but_others_still_run() {
         let (d, t) = setup("allow");
         let bad = write(d.path(), "bad.yaml", "cases: [");
-        let r = test(&[bad, t, d.path().join("missing.yaml")], false);
+        let r = test(
+            &[bad, t, d.path().join("missing.yaml")],
+            &TestOptions::default(),
+            false,
+        );
         assert_eq!(r.status, Status::Error);
         assert!(r.stdout.contains("1 passed"));
         assert_eq!(r.stderr.matches("error:").count(), 2, "{}", r.stderr);
@@ -346,10 +415,56 @@ mod tests {
     #[test]
     fn json_output_is_machine_readable() {
         let (_d, t) = setup("deny");
-        let r = test(&[t], true);
+        let r = test(&[t], &TestOptions::default(), true);
         let v: Value = serde_json::from_str(&r.stdout).unwrap();
         assert_eq!(v["failed"], 1);
         assert_eq!(v["files"][0]["cases"][0]["actual"]["decision"], "allow");
+        assert_eq!(v["coverage"]["policies"], 1);
+        assert_eq!(v["coverage"]["exercised"], 1);
+        assert_eq!(v["coverage"]["unexercised"], json!([]));
+    }
+
+    #[test]
+    fn unexercised_policies_are_listed_and_fail_only_on_request() {
+        let d = tempfile::tempdir().unwrap();
+        write(
+            d.path(),
+            "p.cedar",
+            &format!("{POLICY}\n@id(\"never\")\nforbid(principal, action, resource) when {{ context.chain.depth > 5 }};\n"),
+        );
+        write(d.path(), "c.toml", CONFIG);
+        let t = write(
+            d.path(),
+            "t.yaml",
+            "policies: p.cedar\ncatalog: c.toml\ncases:\n  - name: read\n    chain: [coder]\n    call: { server: github, tool: read_file }\n    expect: allow\n",
+        );
+        let r = test(std::slice::from_ref(&t), &TestOptions::default(), false);
+        assert_eq!(r.status, Status::Ok, "{}", r.stdout);
+        assert!(
+            r.stdout.contains("1 of 2 policies not exercised:"),
+            "{}",
+            r.stdout
+        );
+        let line = format!("  {}:4  never", d.path().join("p.cedar").display());
+        assert!(r.stdout.contains(&line), "{}", r.stdout);
+
+        let strict = TestOptions {
+            fail_on_unexercised: true,
+        };
+        let r = test(std::slice::from_ref(&t), &strict, false);
+        assert_eq!(r.status, Status::Failed, "{}", r.stdout);
+
+        let j = test(std::slice::from_ref(&t), &strict, true);
+        let v: Value = serde_json::from_str(&j.stdout).unwrap();
+        assert_eq!(v["coverage"]["policies"], 2);
+        assert_eq!(v["coverage"]["unexercised"][0]["id"], "never");
+        assert_eq!(v["coverage"]["unexercised"][0]["line"], 4);
+
+        // Every policy exercised: a one-line summary, and the strict run passes.
+        let (_d, t) = setup("allow");
+        let r = test(&[t], &strict, false);
+        assert_eq!(r.status, Status::Ok, "{}", r.stdout);
+        assert!(r.stdout.contains("all 1 policy exercised"), "{}", r.stdout);
     }
 
     #[test]
@@ -393,10 +508,23 @@ mod tests {
         let cli = Cli::try_parse_from(["attenuo", "policy", "test", "a.yaml", "b.yaml", "--json"])
             .unwrap();
         assert!(cli.json);
-        let Command::Policy(PolicyCmd::Test { files }) = cli.command else {
+        let Command::Policy(PolicyCmd::Test(args)) = cli.command else {
             panic!("not policy test")
         };
-        assert_eq!(files.len(), 2);
+        assert_eq!(args.files.len(), 2);
+        assert!(!args.fail_on_unexercised);
+        let cli = Cli::try_parse_from([
+            "attenuo",
+            "policy",
+            "test",
+            "a.yaml",
+            "--fail-on-unexercised",
+        ])
+        .unwrap();
+        let Command::Policy(PolicyCmd::Test(args)) = cli.command else {
+            panic!("not policy test")
+        };
+        assert!(args.fail_on_unexercised);
 
         let cli = Cli::try_parse_from([
             "attenuo", "policy", "lint", "p.cedar", "--config", "s.toml", "--schema",

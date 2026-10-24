@@ -320,7 +320,7 @@ The harness builds a real `DelegationChain` and calls the same `PolicyEngine::au
 ### Running
 
 ```sh
-attenuo policy test policy_test.yaml [more.yaml ...] [--json]
+attenuo policy test policy_test.yaml [more.yaml ...] [--fail-on-unexercised] [--json]
 ```
 
 ```
@@ -330,9 +330,17 @@ examples/github-leak-demo/policy_test.yaml
       expected deny, got allow (policy_allow)
 
 8 passed, 1 failed (9 cases in 1 file)
+1 of 5 policies not exercised:
+  examples/github-leak-demo/policy.cedar:37  forbid_deep_chains
 ```
 
 Exit status: `0` all cases pass, `2` some case fails, `1` a file could not be run (unreadable, malformed, policy that does not parse or validate). `--json` prints one object with every case, the actual decision, the policy ids that decided it and any diagnostics, for tooling.
+
+#### Unexercised policies
+
+The last lines of a run list the policies that no case exercised, with the file and the line the policy starts on (its first annotation, or `permit`/`forbid`), named by `@id` or, without one, by Cedar's `policy<N>` (the N-th statement of the file, counting from 0). A policy is exercised when it decided at least one evaluated case: it is in that case's `policy_ids`, whether the case passed or not. Cases denied before Cedar runs (`capability_denied`, `tool_not_in_catalog`) exercise nothing, and neither does a default deny (no `permit` matched). A `permit` that matched only calls a `forbid` also matched is not exercised either, since the `forbid` decided them. When several test files name the same policy file, a case in any of them counts.
+
+`--fail-on-unexercised` turns the list into a failure (exit `2`) for CI. With `--json` the same information is in `coverage`: `{"policies": 5, "exercised": 4, "unexercised": [{"id": "forbid_deep_chains", "file": "...", "line": 37}]}`.
 
 The same runner is available as a library, `attenuo_policy::testing`, for tests written in Rust.
 
@@ -378,4 +386,4 @@ Pin the install to a tag or `--rev` once releases exist, so a CLI change cannot 
 - A capability denial, to prove the chain is narrower than the policy.
 - The boundary of numeric limits (`depth > 3`: three agents pass, four do not).
 
-A `forbid` that never appears in a passing test is a `forbid` you have not shown works.
+A `forbid` that never appears in a passing test is a `forbid` you have not shown works. The unexercised list at the end of every run names the ones no case reached at all.

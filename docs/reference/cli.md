@@ -315,6 +315,12 @@ ATTENUO_TOKEN="$CODER" attenuo policy evaluate --server github --tool create_iss
 
 Run YAML policy test files offline. Exit 0 if every case passes, 2 if any fails, 1 if a file cannot be run. The format is in [Writing policies](../guides/writing-policies.md).
 
+After the cases, the run lists the policies no case exercised: `N of M policies not exercised:` and one `file:line  id` line each, or `all M policies exercised`. A policy is exercised when it is among the policies that decided at least one evaluated case (the `policy_ids` of the result), whether that case passed or not. Test files that name the same policy file share its policies. With `--json` the output has a `coverage` object: `policies` (the total), `exercised`, and `unexercised` as `[{id, file, line}]`.
+
+| Option | Meaning |
+| --- | --- |
+| `--fail-on-unexercised` | Exit 2 when some policy was not exercised, even if every case passed. Off by default. |
+
 ### `policy lint <POLICY>`
 
 Parse a Cedar policy file and validate it against the generated schema. Prints errors with line and column. Exit 0 if clean, 2 if there are errors.

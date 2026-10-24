@@ -699,12 +699,8 @@ pub enum PolicyCmd {
     /// record. Exit 0 for allow, 2 for deny.
     Evaluate(EvaluateArgs),
     /// Run YAML policy test files offline. Exit 0 if every case passes, 2 if any fails,
-    /// 1 if a file cannot be run.
-    Test {
-        /// Test files (format documented in docs/guides/writing-policies.md).
-        #[arg(required = true)]
-        files: Vec<std::path::PathBuf>,
-    },
+    /// 1 if a file cannot be run. Ends with the policies no case exercised.
+    Test(TestArgs),
     /// Parse a Cedar policy file and validate it against the generated schema, printing
     /// errors with line and column. Exit 0 if clean, 2 if it has errors.
     Lint {
@@ -719,6 +715,18 @@ pub enum PolicyCmd {
         #[arg(long)]
         schema: bool,
     },
+}
+
+/// `policy test`: the files and how to run them.
+#[derive(Debug, Args)]
+pub struct TestArgs {
+    /// Test files (format documented in docs/guides/writing-policies.md).
+    #[arg(required = true)]
+    pub files: Vec<std::path::PathBuf>,
+    /// Exit 2 when some policy was not exercised by any case (no case's decision depended on
+    /// it), even if every case passed.
+    #[arg(long)]
+    pub fail_on_unexercised: bool,
 }
 
 /// `policy evaluate`: the call, and the chain it is made for (from a token or a file).
