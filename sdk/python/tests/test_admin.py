@@ -416,6 +416,7 @@ def _node(lease: str, parent: str | None, active: bool = True) -> dict[str, Any]
         "expires_at": "2026-10-23T19:20:00Z", "revoked_at": None, "revoke_reason": None,
         "issued_at": None if parent is None else "2026-10-23T19:05:00Z",
         "issued_seq": None if parent is None else 42,
+        "budget": None if parent is None else {"recorded": True, "limits": [], "usage": []},
     }  # fmt: skip
 
 
@@ -432,7 +433,8 @@ async def test_lease_tree(make: Any) -> None:
     assert tree.root == "r" and tree.would_revoke == 1 and not tree.truncated
     assert [n.lease_id for n in tree.nodes] == ["l1", "l2"]
     assert tree.nodes[0].issued_seq == 42 and not tree.nodes[1].active
-    assert tree.ancestors[0].issued_at is None
+    assert tree.ancestors[0].issued_at is None and tree.ancestors[0].budget is None
+    assert tree.nodes[0].budget == {"recorded": True, "limits": [], "usage": []}
     await call(client, "lease_tree", "l1")
     assert dict(seen[-1].url.params) == {}
 

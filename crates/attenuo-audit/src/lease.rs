@@ -12,7 +12,10 @@ use attenuo_core::{Charge, LeaseId};
 use time::OffsetDateTime;
 
 use crate::approval::{rules, Approval, ApprovalState, Approver};
-use crate::budget::{plan, ChargeOutcome, CounterKey, ValueKey, USAGE_KINDS};
+use crate::budget::{
+    plan, summarize, ChargeOutcome, CounterKey, CounterSummary, HopLimit, ValueKey,
+    DISTINCT_VALUE_KIND, USAGE_KINDS,
+};
 use crate::error::AuditError;
 use crate::spans::{distinct_hashes, evictions, SpanHit, SpanKey, MAX_SPANS_PER_RUN};
 
@@ -230,6 +233,29 @@ pub trait LeaseStore: Send + Sync {
     /// refunded. Used by the pipeline when a charged decision's audit append fails, and by
     /// the operator refund (`POST /admin/budgets/refund`).
     fn refund(&self, decision_id: &str, at: OffsetDateTime) -> Result<u64, AuditError>;
+
+    /// Keep the limited capabilities of the hop whose lease is `lease`, as issued (ADR-0010),
+    /// for the admin console. Display only: enforcement reads the limits from the token. The
+    /// default keeps nothing.
+    fn record_hop_limits(&self, lease: &LeaseId, limits: &[HopLimit]) -> Result<(), AuditError> {
+        let _ = (lease, limits);
+        Ok(())
+    }
+
+    /// What [`record_hop_limits`](Self::record_hop_limits) kept for `lease`. `None` when
+    /// nothing was kept (a hop without limits, a lease issued before this was recorded, or a
+    /// store that keeps none, the default).
+    fn hop_limits(&self, lease: &LeaseId) -> Result<Option<Vec<HopLimit>>, AuditError> {
+        let _ = lease;
+        Ok(None)
+    }
+
+    /// Every counter under `lease`, grouped ([`CounterSummary`]): its limits' counters and,
+    /// for a run's root lease, the run's usage. Empty when nothing was charged, and by default.
+    fn budget_summary(&self, lease: &LeaseId) -> Result<Vec<CounterSummary>, AuditError> {
+        let _ = lease;
+        Ok(Vec::new())
+    }
 }
 
 /// One logged charge: the counter and what was added to it.
@@ -402,6 +428,8 @@ pub struct MemoryLeaseStore {
     approvals: Mutex<BTreeMap<String, Approval>>,
     /// Run-limit counters and the charges of each decision, under one lock (ADR-0010).
     budgets: Mutex<Budgets>,
+    /// The limited capabilities of each hop, as issued (display only).
+    hop_limits: Mutex<BTreeMap<LeaseId, Vec<HopLimit>>>,
 }
 
 /// The memory store's run-limit state.
@@ -880,22 +908,45 @@ impl LeaseStore for MemoryLeaseStore {
             )));
         }
         let keys = b.keys(charges)?;
-        let used_after = match plan(&keys, charges, |k| {
+        let planned = match plan(&keys, charges, |k| {
             Ok(b.counters.get(k).copied().unwrap_or(0))
         })? {
-            Ok(after) => after,
+            Ok(planned) => planned,
             Err(exhausted) => return Ok(exhausted),
         };
         let mut log = ChargeLog::default();
-        for ((key, charge), after) in keys.into_iter().zip(charges).zip(&used_after) {
-            b.counters.insert(key.clone(), *after);
+        for w in planned.writes {
+            b.counters.insert(w.key.clone(), w.after);
             log.charges.push(LoggedCharge {
-                counter: key,
-                amount: charge.amount,
+                counter: w.key,
+                amount: w.amount,
             });
         }
         b.log.insert(decision_id.to_owned(), log);
-        Ok(ChargeOutcome::Charged { used_after })
+        Ok(ChargeOutcome::Charged {
+            used_after: planned.used_after,
+        })
+    }
+
+    fn record_hop_limits(&self, lease: &LeaseId, limits: &[HopLimit]) -> Result<(), AuditError> {
+        self.hop_limits
+            .lock()?
+            .insert(lease.clone(), limits.to_vec());
+        Ok(())
+    }
+
+    fn hop_limits(&self, lease: &LeaseId) -> Result<Option<Vec<HopLimit>>, AuditError> {
+        Ok(self.hop_limits.lock()?.get(lease).cloned())
+    }
+
+    fn budget_summary(&self, lease: &LeaseId) -> Result<Vec<CounterSummary>, AuditError> {
+        let b = self.budgets.lock()?;
+        Ok(summarize(
+            b.counters
+                .iter()
+                .filter(|(k, _)| k.lease == lease.0)
+                .map(|(k, v)| (k, *v)),
+        ))
     }
 
     fn refund(&self, decision_id: &str, _at: OffsetDateTime) -> Result<u64, AuditError> {
@@ -918,7 +969,9 @@ impl LeaseStore for MemoryLeaseStore {
         Ok(entry
             .charges
             .iter()
-            .filter(|c| !USAGE_KINDS.contains(&c.counter.kind))
+            .filter(|c| {
+                !USAGE_KINDS.contains(&c.counter.kind) && c.counter.kind != DISTINCT_VALUE_KIND
+            })
             .count() as u64)
     }
 }

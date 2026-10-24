@@ -12,6 +12,7 @@ import pytest
 
 from attenuo import (
     ApiError,
+    ArgLimit,
     AsyncClient,
     AttenuoError,
     Capability,
@@ -120,6 +121,27 @@ async def test_exchange_wire_format_and_token(make: Any) -> None:
     assert tok.agent == "coder"
     assert tok.chain.agents == ("planner", "coder")
     assert not tok.verified
+
+
+async def test_exchange_attenuates_with_typed_limits(make: Any) -> None:
+    # A child token with run limits: the capability carries them on the wire, as the server's
+    # `Capability` reads them, and the decoded child shows what the server issued.
+    s = Signer()
+    client, rec = make(lambda r: httpx.Response(200, json=token_response(s.mint(("p", "c")))))
+    caps = [
+        Capability("bank", "send_money", recipient="FR00EMMA").with_limits(
+            calls=1, sum=("amount", 40), calls_per=("recipient", 1)
+        ),
+        Capability("web", "get_webpage").with_limits(distinct=ArgLimit("url", 2, derive="host")),
+    ]
+    await call(client, "exchange", s.mint(("p",)), "c", caps)
+    sent = rec.body()["authorization_details"][0]["capabilities"]
+    assert sent[0]["limits"] == {
+        "calls": 1,
+        "sum": {"arg": "amount", "max": 40},
+        "calls_per": {"arg": "recipient", "max": 1},
+    }
+    assert sent[1]["limits"] == {"distinct": {"arg": "url", "max": 2, "derive": "host"}}
 
 
 async def test_exchange_accepts_token_object_and_hop0(make: Any) -> None:

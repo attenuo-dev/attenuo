@@ -62,7 +62,10 @@ pub fn fmt_capability(c: &Capability) -> String {
         ls.push(format!("sum({}) <= {}", s.arg, s.max));
     }
     if let Some(p) = &l.calls_per {
-        ls.push(format!("calls per {} <= {}", p.arg, p.max));
+        ls.push(format!("calls per {} <= {}", p.counted(), p.max));
+    }
+    if let Some(d) = &l.distinct {
+        ls.push(format!("distinct {} <= {}", d.counted(), d.max));
     }
     if !ls.is_empty() {
         out.push_str(&format!(" [{}]", ls.join(", ")));
@@ -752,6 +755,14 @@ user alice  (issuer https://idp.example)
         assert_eq!(
             fmt_capability(&limited),
             "banking:send_money [calls <= 1, sum(amount) <= 10, calls per recipient <= 1]"
+        );
+        let mut hosts = attenuo_core::Limits::default().with_distinct("url", 2);
+        hosts.distinct = hosts
+            .distinct
+            .map(|d| d.derived(attenuo_core::Derive::Host));
+        assert_eq!(
+            fmt_capability(&Capability::new("web", "get_webpage").with_limits(hosts)),
+            "web:get_webpage [distinct url#host <= 2]"
         );
     }
 

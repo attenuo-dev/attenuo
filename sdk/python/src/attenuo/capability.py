@@ -13,13 +13,24 @@ Run limits (ADR-0010) ride along as ``limits``, omitted when empty::
     Capability("banking", "send_money").with_limits(calls=1, sum=("amount", 10))
     # {"server": "banking", "tool": "send_money",
     #  "limits": {"calls": 1, "sum": {"arg": "amount", "max": 10}}}
+
+``distinct`` bounds how many different values an argument may take, and ``calls_per`` and
+``distinct`` can count the host of a URL argument instead of the whole value::
+
+    Capability("web", "get_webpage").with_limits(distinct=ArgLimit("url", 2, derive="host"))
+    # {"server": "web", "tool": "get_webpage",
+    #  "limits": {"distinct": {"arg": "url", "max": 2, "derive": "host"}}}
+
+A child token is attenuated by passing such capabilities to ``Client.exchange``. The server
+keeps a child's figures no larger than its parent's (it lowers larger ones, and fills in a
+limit the child leaves out), and charges every call to every hop.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(frozen=True)
@@ -73,39 +84,151 @@ def constraint_from_json(obj: dict[str, Any]) -> Constraint:
     raise ValueError(f"unknown constraint op {op!r}")
 
 
-LIMIT_KINDS = ("calls", "sum", "calls_per")
+LIMIT_KINDS = ("calls", "sum", "calls_per", "distinct")
+
+#: What a ``calls_per`` or ``distinct`` limit may count instead of the argument itself.
+#: ``"host"``: the host of a URL argument (lowercased, without port or user info), so two pages
+#: of one site are one value. A value with no host cannot be counted and the call is refused.
+Derive = Literal["host"]
+DERIVATIONS: tuple[str, ...] = ("host",)
+
+# The most a limit may allow: Cedar's largest Long, as on the server.
+MAX_LIMIT = 2**63 - 1
+
+
+@dataclass(frozen=True)
+class ArgLimit:
+    """A limit on one argument: the ``sum``, ``calls_per`` or ``distinct`` of a :class:`Limits`.
+
+    ``max`` is a total for ``sum``, calls per value for ``calls_per`` and values for
+    ``distinct``. ``derive="host"`` (``calls_per`` and ``distinct`` only) counts the host of a
+    URL argument; records and errors then name the argument ``url#host``."""
+
+    arg: str
+    max: int
+    derive: Derive | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.arg, str) or not self.arg:
+            raise ValueError("a limit's arg must be a non-empty string")
+        if not isinstance(self.max, int) or isinstance(self.max, bool):
+            raise ValueError("a limit's max must be an integer")
+        if not 0 <= self.max <= MAX_LIMIT:
+            raise ValueError(f"a limit's max must be between 0 and {MAX_LIMIT}")
+        if self.derive is not None and self.derive not in DERIVATIONS:
+            raise ValueError(
+                f"unknown derivation {self.derive!r} (one of {', '.join(DERIVATIONS)})"
+            )
+
+    @property
+    def counted(self) -> str:
+        """What the limit counts as the server names it: ``arg``, or ``arg#host``."""
+        return f"{self.arg}#{self.derive}" if self.derive else self.arg
+
+    def to_json(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"arg": self.arg, "max": self.max}
+        if self.derive is not None:
+            out["derive"] = self.derive
+        return out
+
+    @classmethod
+    def from_json(cls, kind: str, value: Any) -> ArgLimit:
+        allowed = {"arg", "max"} if kind == "sum" else {"arg", "max", "derive"}
+        if not isinstance(value, dict) or not {"arg", "max"} <= set(value) <= allowed:
+            shape = '{"arg": str, "max": int >= 0}'
+            if kind != "sum":
+                shape = '{"arg": str, "max": int >= 0, "derive"?: "host"}'
+            raise ValueError(f"limits.{kind} must be {shape}")
+        try:
+            return cls(value["arg"], value["max"], value.get("derive"))
+        except ValueError as e:
+            raise ValueError(f"limits.{kind}: {e}") from None
+
+
+ArgLimitLike = ArgLimit | tuple[str, int] | tuple[str, int, Derive | None]
+
+
+def _arg_limit(kind: str, v: ArgLimitLike) -> ArgLimit:
+    if isinstance(v, ArgLimit):
+        lim = v
+    elif isinstance(v, tuple) and len(v) in (2, 3):
+        lim = ArgLimit(*v)
+    else:
+        raise ValueError(f"{kind} must be an ArgLimit or an (arg, max[, derive]) tuple")
+    if kind == "sum" and lim.derive is not None:
+        raise ValueError("a sum counts the argument itself and takes no derive")
+    return lim
+
+
+@dataclass(frozen=True)
+class Limits:
+    """The run limits of one capability (ADR-0010), every member optional.
+
+    - ``calls``: at most this many allowed calls matched by the capability.
+    - ``sum``: the sum of an integer argument over those calls is at most ``max``.
+    - ``calls_per``: at most ``max`` calls per value of an argument (each list element counts).
+    - ``distinct``: at most ``max`` different values of an argument (each list element counts).
+
+    The figures are a ceiling in the signed token; what has been spent lives on the server.
+    """
+
+    calls: int | None = None
+    sum: ArgLimit | None = None
+    calls_per: ArgLimit | None = None
+    distinct: ArgLimit | None = None
+
+    def __post_init__(self) -> None:
+        c = self.calls
+        if c is not None and (
+            not isinstance(c, int) or isinstance(c, bool) or not 0 <= c <= MAX_LIMIT
+        ):
+            raise ValueError("limits.calls must be an integer >= 0")
+        if self.sum is not None and self.sum.derive is not None:
+            raise ValueError("a sum counts the argument itself and takes no derive")
+
+    def is_empty(self) -> bool:
+        return (
+            self.calls is None
+            and self.sum is None
+            and self.calls_per is None
+            and self.distinct is None
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        if self.calls is not None:
+            out["calls"] = self.calls
+        for kind in ("sum", "calls_per", "distinct"):
+            lim = getattr(self, kind)
+            if lim is not None:
+                out[kind] = lim.to_json()
+        return out
+
+    @classmethod
+    def from_json(cls, obj: Any) -> Limits:
+        """Read a ``limits`` object. A kind or derivation this SDK does not know is refused, as
+        the server refuses it, rather than dropped."""
+        if obj is None:
+            return cls()
+        if not isinstance(obj, dict):
+            raise ValueError("limits must be an object")
+        unknown = [k for k in obj if k not in LIMIT_KINDS]
+        if unknown:
+            raise ValueError(f"unknown limit kind {unknown[0]!r} (one of {', '.join(LIMIT_KINDS)})")
+        calls = obj.get("calls")
+        if "calls" in obj and (not isinstance(calls, int) or isinstance(calls, bool) or calls < 0):
+            raise ValueError("limits.calls must be an integer >= 0")
+        args = {
+            kind: ArgLimit.from_json(kind, obj[kind])
+            for kind in ("sum", "calls_per", "distinct")
+            if kind in obj
+        }
+        return cls(calls=calls, **args)
 
 
 def _limits_from_json(obj: Any) -> dict[str, Any]:
-    """Check a ``limits`` object: only ``calls`` (an integer >= 0) and ``sum`` / ``calls_per``
-    (``{"arg": str, "max": int >= 0}``). A kind this SDK does not know is refused, as the
-    server refuses it, rather than dropped."""
-    if obj is None:
-        return {}
-    if not isinstance(obj, dict):
-        raise ValueError("limits must be an object")
-    out: dict[str, Any] = {}
-    for kind, value in obj.items():
-        if kind == "calls":
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                raise ValueError("limits.calls must be an integer >= 0")
-            out[kind] = value
-        elif kind in ("sum", "calls_per"):
-            ok = (
-                isinstance(value, dict)
-                and set(value) == {"arg", "max"}
-                and isinstance(value["arg"], str)
-                and value["arg"]
-                and isinstance(value["max"], int)
-                and not isinstance(value["max"], bool)
-                and value["max"] >= 0
-            )
-            if not ok:
-                raise ValueError(f'limits.{kind} must be {{"arg": str, "max": int >= 0}}')
-            out[kind] = {"arg": value["arg"], "max": value["max"]}
-        else:
-            raise ValueError(f"unknown limit kind {kind!r} (one of {', '.join(LIMIT_KINDS)})")
-    return out
+    """Check a ``limits`` object (see :meth:`Limits.from_json`) and return its wire form."""
+    return Limits.from_json(obj).to_json()
 
 
 class Capability:
@@ -115,7 +238,7 @@ class Capability:
 
         Capability("github", "create_issue", repo=OneOf("acme/api", "acme/web"))
 
-    Limits are set with :meth:`with_limits`.
+    Limits are set with :meth:`with_limits`, and read back typed with :attr:`typed_limits`.
     """
 
     __slots__ = ("constraints", "limits", "server", "tool")
@@ -138,22 +261,36 @@ class Capability:
 
     def with_limits(
         self,
-        calls: int | None = None,
-        sum: tuple[str, int] | None = None,
-        calls_per: tuple[str, int] | None = None,
+        calls: int | Limits | None = None,
+        sum: ArgLimitLike | None = None,
+        calls_per: ArgLimitLike | None = None,
+        distinct: ArgLimitLike | None = None,
     ) -> Capability:
-        """Set run limits (ADR-0010) and return ``self``: at most ``calls`` matched calls, a
-        total of at most ``sum[1]`` over argument ``sum[0]``, at most ``calls_per[1]`` calls per
-        value of argument ``calls_per[0]``."""
-        raw: dict[str, Any] = {}
-        if calls is not None:
-            raw["calls"] = calls
-        if sum is not None:
-            raw["sum"] = {"arg": sum[0], "max": sum[1]}
-        if calls_per is not None:
-            raw["calls_per"] = {"arg": calls_per[0], "max": calls_per[1]}
-        self.limits = _limits_from_json(raw)
+        """Set run limits (ADR-0010) and return ``self``, replacing any set before: at most
+        ``calls`` matched calls, a total of at most ``sum[1]`` over argument ``sum[0]``, at most
+        ``calls_per[1]`` calls per value of argument ``calls_per[0]``, and at most
+        ``distinct[1]`` different values of argument ``distinct[0]``.
+
+        Each argument limit is an ``(arg, max)`` tuple or an :class:`ArgLimit`;
+        ``ArgLimit("url", 2, derive="host")`` (or ``("url", 2, "host")``) counts URL hosts.
+        A whole :class:`Limits` may be passed instead, as the only argument."""
+        if isinstance(calls, Limits):
+            if sum is not None or calls_per is not None or distinct is not None:
+                raise ValueError("pass either a Limits or keyword limits, not both")
+            self.limits = calls.to_json()
+            return self
+        self.limits = Limits(
+            calls=calls,
+            sum=None if sum is None else _arg_limit("sum", sum),
+            calls_per=None if calls_per is None else _arg_limit("calls_per", calls_per),
+            distinct=None if distinct is None else _arg_limit("distinct", distinct),
+        ).to_json()
         return self
+
+    @property
+    def typed_limits(self) -> Limits:
+        """The capability's run limits as a :class:`Limits` (empty when it has none)."""
+        return Limits.from_json(self.limits)
 
     @classmethod
     def parse(cls, text: str) -> Capability:

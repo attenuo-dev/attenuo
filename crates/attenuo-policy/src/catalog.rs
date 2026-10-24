@@ -105,7 +105,9 @@ pub struct ToolAttrs {
     pub amount: Option<String>,
     /// The input that names where the call goes (a payee, a recipient), for
     /// `context.usage.destination_seen`. A list value counts each element. The server keeps
-    /// only keyed hashes of the values, per run.
+    /// only keyed hashes of the values, per run. `"<input>#host"` counts the host of a URL
+    /// input instead of the whole value ([`attenuo_core::Derive::Host`]), so two pages of one
+    /// site are one destination; values with no host all count as one destination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<String>,
 }
@@ -306,7 +308,7 @@ impl ToolCatalog {
     /// Check every server and tool name against [`attenuo_core::names`]: a server name has
     /// no `/`, and a tool is a tool name or an MCP method name (`resources/read`). A tool's
     /// `amount` and `destination` must name an input, and `amount` one not declared other than
-    /// `long`. Called by
+    /// `long`; a `destination` with `#` must end in a known derivation (`#host`). Called by
     /// [`PolicyEngineBuilder::build`](crate::PolicyEngineBuilder::build).
     pub fn validate(&self) -> Result<(), String> {
         for ((server, tool), attrs) in &self.tools {
@@ -322,6 +324,11 @@ impl ToolCatalog {
                         "catalog entry {server:?} / {tool:?}: `{field}` names no input"
                     ));
                 }
+            }
+            if let Some(destination) = &attrs.destination {
+                attenuo_core::limits::parse_arg_ref(destination).map_err(|e| {
+                    format!("catalog entry {server:?} / {tool:?}: `destination` {e}")
+                })?;
             }
             if let Some(input) = &attrs.amount {
                 match attrs.inputs.get(input) {

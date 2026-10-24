@@ -34,6 +34,7 @@ export async function entryView(root, { seq, id }) {
   replace(root,
     verdict(entry),
     h('div', { class: 'grid-2' }, chainPanel(r, view.lease_states), policyPanel(r, view.policy_reloaded_after)),
+    budgetPanel(r),
     integrityPanel(entry, view.covered_by_checkpoint),
     timelinePanel(entry),
     notLoggedPanel());
@@ -105,6 +106,39 @@ function chainPanel(r, leaseStates) {
       r.chain_id ? h('span', { class: 'small muted' }, 'chain ', short(r.chain_id, 14)) : null),
     h('ol', { class: 'chain' }, items),
     h('p', { class: 'small muted' }, 'Lease states are as the registry sees them now, not at the time of the entry.'));
+}
+
+// Run limits (ADR-0010): `budget.charged` lists every counter an allowed call drew on, with
+// what it held afterwards; `usage` is the run's usage of a destructive tool as the policy saw
+// it before the call. Argument names come from tokens and catalogs; h() renders them as text.
+export function budgetPanel(r) {
+  const charged = (r.budget && r.budget.charged) || [];
+  if (!charged.length && !r.usage) return null;
+  const panel = h('section', { class: 'panel' }, h('header', null, h('h2', null, 'Run limits and usage')));
+  if (charged.length) {
+    const rows = charged.map((c) => {
+      const lease = r.leases[c.hop];
+      return h('tr', null,
+        h('td', null, `hop ${c.hop} `, lease ? link(['lease', lease], short(lease, 10)) : null),
+        h('td', { class: 'num' }, mono(c.cap)),
+        h('td', null, h('span', { class: 'tag' }, c.kind)),
+        h('td', null, c.arg ? mono(c.arg) : h('span', { class: 'muted' }, '—')),
+        h('td', { class: 'num' }, mono(c.used_after)),
+        h('td', { class: 'num' }, mono(c.max)),
+        h('td', { class: 'num' }, mono(Math.max(0, c.max - c.used_after))));
+    });
+    append(panel, [
+      h('p', { class: 'small muted' }, 'Every limit this call was charged against, in every hop of the chain, and what its counter held afterwards. For ', mono('distinct'), ', the counter is how many values the limit has seen.'),
+      table(['Hop', 'Capability', 'Kind', 'Argument', 'Used after', 'Max', 'Left'], rows, { short: true })]);
+  }
+  if (r.usage) {
+    append(panel, [kv([
+      ['Run usage of this tool before the call', h('span', null,
+        `${r.usage.calls} call${r.usage.calls === 1 ? '' : 's'}, amount ${r.usage.amount}`)],
+      ['Destination seen before', r.usage.destination_seen ? 'yes' : 'no'],
+    ])]);
+  }
+  return panel;
 }
 
 function policyPanel(r, reloadedAfter) {

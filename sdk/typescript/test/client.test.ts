@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   ApiError,
+  argLimit,
   capability,
   DeniedError,
   AttenuoClient,
@@ -9,6 +10,7 @@ import {
   RpcError,
   UnauthorizedError,
   VerificationError,
+  withLimits,
 } from "../src/index.js";
 import { jsonResponse, mockFetch, rpcErr, rpcOk, Signer, tokenResponse } from "./helpers.js";
 
@@ -66,6 +68,31 @@ describe("exchange", () => {
       ],
       requested_ttl_seconds: 600,
     });
+  });
+
+  it("attenuates a child token with typed run limits", async () => {
+    const { fetch, calls } = mockFetch(() => jsonResponse(tokenResponse(coderJwt)));
+    const ob = new AttenuoClient(URL_, { fetch });
+    await ob.exchange(rootJwt, "coder", [
+      withLimits(capability("bank", "send_money", { recipient: "FR00EMMA" }), {
+        calls: 1,
+        sum: argLimit("amount", 40),
+        calls_per: argLimit("recipient", 1),
+      }),
+      withLimits(capability("web", "get_webpage"), {
+        distinct: argLimit("url", 2, { derive: "host" }),
+      }),
+    ]);
+    const body = calls[0]!.body as {
+      authorization_details: { capabilities: { limits?: unknown }[] }[];
+    };
+    const sent = body.authorization_details[0]!.capabilities;
+    expect(sent[0]!.limits).toEqual({
+      calls: 1,
+      sum: { arg: "amount", max: 40 },
+      calls_per: { arg: "recipient", max: 1 },
+    });
+    expect(sent[1]!.limits).toEqual({ distinct: { arg: "url", max: 2, derive: "host" } });
   });
 
   it("accepts a Token as the subject and string capabilities", async () => {

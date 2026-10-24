@@ -1128,11 +1128,21 @@ mod tests {
             limited[0]["limits"],
             json!({"calls": 1, "sum": {"arg": "amount", "max": 10}})
         );
-        assert!(parse_caps(&[
-            r#"{"server":"bank","tool":"send_money","limits":{"distinct":{"arg":"to","max":1}}}"#
-                .into()
+        // `distinct` and derived values (phase 2) pass through too.
+        let distinct = parse_caps(&[
+            r#"{"server":"web","tool":"get_webpage","limits":{"distinct":{"arg":"url","derive":"host","max":1}}}"#.into(),
         ])
-        .is_err());
+        .unwrap();
+        assert_eq!(
+            distinct[0]["limits"],
+            json!({"distinct": {"arg": "url", "derive": "host", "max": 1}})
+        );
+        for bad in [
+            r#"{"server":"bank","tool":"send_money","limits":{"window":{"arg":"to","max":1}}}"#,
+            r#"{"server":"web","tool":"get","limits":{"distinct":{"arg":"url","derive":"path","max":1}}}"#,
+        ] {
+            assert!(parse_caps(&[bad.into()]).is_err(), "{bad}");
+        }
     }
 
     #[test]

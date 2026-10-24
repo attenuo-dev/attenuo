@@ -354,3 +354,214 @@ fn run_usage_saturates_is_refunded_and_ends_with_the_run() {
         );
     }
 }
+
+fn distinct(lease: &str, value: &str, max: u64) -> Charge {
+    Charge {
+        hop: 0,
+        cap: 2,
+        lease: LeaseId::new(lease),
+        kind: LimitKind::Distinct,
+        arg: Some("url#host".into()),
+        value: Some(format!("\"{value}\"").into_bytes()),
+        amount: 1,
+        max,
+        usage: false,
+    }
+}
+
+/// The count of a `distinct` limit, as the pipeline reads it: a probe with no value.
+fn distinct_count(lease: &str, max: u64) -> Charge {
+    Charge {
+        value: None,
+        ..distinct(lease, "", max)
+    }
+}
+
+/// `distinct` (run-limits phase 2): a new value adds one to the limit's count, a value already
+/// seen costs nothing, a value past `max` is refused with the count as `used`, values new in
+/// one call add up, and a refund takes the decision's values back so they count as new again.
+#[test]
+fn distinct_counts_new_values_once_and_refunds_them() {
+    for (name, store) in stores() {
+        let count = |s: &dyn LeaseStore| s.budget_used(&[distinct_count("root", 2)]).unwrap()[0];
+        assert_eq!(
+            charged(
+                store
+                    .charge("d1", &[distinct("root", "a.example", 2)], t0())
+                    .unwrap()
+            ),
+            vec![1],
+            "{name}"
+        );
+        // The same host again: allowed, nothing added.
+        assert_eq!(
+            charged(
+                store
+                    .charge("d2", &[distinct("root", "a.example", 2)], t0())
+                    .unwrap()
+            ),
+            vec![1],
+            "{name}"
+        );
+        assert_eq!(
+            store
+                .budget_used(&[distinct("root", "a.example", 2)])
+                .unwrap(),
+            vec![1],
+            "{name}: the value's own row says it was seen"
+        );
+        // Two new hosts in one call would take the count to 3: nothing is charged.
+        assert_eq!(
+            store
+                .charge(
+                    "d3",
+                    &[
+                        distinct("root", "b.example", 2),
+                        distinct("root", "c.example", 2)
+                    ],
+                    t0()
+                )
+                .unwrap(),
+            ChargeOutcome::Exhausted { index: 1, used: 2 },
+            "{name}"
+        );
+        assert_eq!(count(store.as_ref()), 1, "{name}");
+        assert_eq!(
+            charged(
+                store
+                    .charge("d4", &[distinct("root", "b.example", 2)], t0())
+                    .unwrap()
+            ),
+            vec![2],
+            "{name}"
+        );
+        // A third host is refused; a seen one still passes.
+        assert_eq!(
+            store
+                .charge("d5", &[distinct("root", "c.example", 2)], t0())
+                .unwrap(),
+            ChargeOutcome::Exhausted { index: 0, used: 2 },
+            "{name}"
+        );
+        assert_eq!(
+            charged(
+                store
+                    .charge("d6", &[distinct("root", "a.example", 2)], t0())
+                    .unwrap()
+            ),
+            vec![2],
+            "{name}"
+        );
+        // A refund of d4 returns b.example: the count drops and c.example fits. The value
+        // row is not a token-limit counter of its own, so `refunded` counts 1.
+        assert_eq!(store.refund("d4", t0()).unwrap(), 1, "{name}");
+        assert_eq!(count(store.as_ref()), 1, "{name}");
+        assert_eq!(
+            charged(
+                store
+                    .charge("d7", &[distinct("root", "c.example", 2)], t0())
+                    .unwrap()
+            ),
+            vec![2],
+            "{name}"
+        );
+        // A decision whose values were all seen charged nothing to refund.
+        assert!(
+            matches!(store.refund("d6", t0()), Err(AuditError::UnknownCharge(_))),
+            "{name}"
+        );
+    }
+}
+
+/// Concurrent calls with new values never take a `distinct` count past `max`.
+#[test]
+fn concurrent_new_values_cannot_overspend_distinct() {
+    for (name, store) in stores() {
+        let store: Arc<dyn LeaseStore> = Arc::from(store);
+        let barrier = Arc::new(Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let (store, barrier) = (store.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let host = format!("h{i}.example");
+                    store
+                        .charge(&format!("d{i}"), &[distinct("root", &host, 3)], t0())
+                        .unwrap()
+                })
+            })
+            .collect();
+        let wins = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|o| matches!(o, ChargeOutcome::Charged { .. }))
+            .count();
+        assert_eq!(wins, 3, "{name}");
+        assert_eq!(
+            store.budget_used(&[distinct_count("root", 3)]).unwrap(),
+            vec![3],
+            "{name}"
+        );
+    }
+}
+
+/// What the console reads: the limits a hop was issued with, and its counters grouped, with
+/// no value hashes.
+#[test]
+fn hop_limits_and_counter_summaries_for_the_console() {
+    use attenuo_audit::{CounterSummary, HopLimit};
+    use attenuo_core::Limits;
+    for (name, store) in stores() {
+        let lease = LeaseId::new("root");
+        assert_eq!(store.hop_limits(&lease).unwrap(), None, "{name}");
+        assert!(store.budget_summary(&lease).unwrap().is_empty(), "{name}");
+        let hop = vec![HopLimit {
+            cap: 0,
+            server: "banking".into(),
+            tool: "send_money".into(),
+            limits: Limits::default()
+                .with_calls(3)
+                .with_distinct("recipient", 2),
+        }];
+        store.record_hop_limits(&lease, &hop).unwrap();
+        assert_eq!(store.hop_limits(&lease).unwrap(), Some(hop), "{name}");
+        charged(
+            store
+                .charge(
+                    "d1",
+                    &[
+                        charge(0, "root", LimitKind::Calls, 1, 3),
+                        per("root", "A", 5),
+                        distinct("root", "a.example", 2),
+                    ],
+                    t0(),
+                )
+                .unwrap(),
+        );
+        charged(
+            store
+                .charge("d2", &[per("root", "A", 5), per("root", "B", 5)], t0())
+                .unwrap(),
+        );
+        let row = |cap, kind: &str, arg: &str, used, values| CounterSummary {
+            cap,
+            kind: kind.into(),
+            arg: arg.into(),
+            used,
+            values,
+        };
+        assert_eq!(
+            store.budget_summary(&lease).unwrap(),
+            vec![
+                row(0, "calls", "", 1, 0),
+                row(1, "calls_per", "recipient", 2, 2),
+                row(2, "distinct", "url#host", 1, 0),
+            ],
+            "{name}"
+        );
+        assert!(store
+            .budget_summary(&LeaseId::new("other"))
+            .unwrap()
+            .is_empty());
+    }
+}

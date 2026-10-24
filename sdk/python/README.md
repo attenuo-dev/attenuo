@@ -130,6 +130,24 @@ Capability("github", "read_*", repo=Prefix("alice/public-"), ref=Equals("main"))
 
 These serialize to the server's `authorization_details` shape, the same JSON `attenuo token exchange --cap` produces. Plain strings (`"github:read_file"`, or comma separated) work anywhere a capability is accepted. A child must constrain every argument its parent constrains, at least as tightly; the server refuses an exchange that widens (`ApiError` with `error == "invalid_scope"`).
 
+#### Run limits on a child token
+
+A capability can carry run limits ([ADR-0010](../../docs/decisions/0010-run-limits.md)): how many calls, how much in total, how many calls per value and how many different values. Set them with `with_limits` before you exchange:
+
+```python
+from attenuo import ArgLimit, Capability
+
+helper = ob.exchange(planner, "helper", [
+    # At most one payment, 40 in total, to Emma only.
+    Capability("banking", "send_money", recipient="FR00EMMA").with_limits(
+        calls=1, sum=("amount", 40), calls_per=("recipient", 1)),
+    # Pages from at most two sites: `derive="host"` counts the host of the URL.
+    Capability("web", "get_webpage").with_limits(distinct=ArgLimit("url", 2, derive="host")),
+])
+```
+
+Argument limits are `(arg, max)` tuples or `ArgLimit`s; `with_limits` also takes a whole `Limits`, and `Capability.typed_limits` reads them back (from a decoded token's hops, too). The server lowers a figure larger than the parent's, fills in a limit the child leaves out, and charges every call to every hop, so a child can spend at most what its parent has left. A call over a limit is `Denied` with `reason == "budget_exhausted"`; one whose argument a limit cannot count (a missing recipient, a URL without a host) is `limit_arg_invalid`. A kind or derivation the SDK does not know raises `ValueError` instead of being dropped.
+
 ### Workload identity and `may_act`
 
 An agent can authenticate with a workload-identity JWT instead of a client secret: an RFC 8693 `actor_token` from an `[[actor_trust]]` issuer, such as a SPIFFE JWT-SVID. It works at hop 0 (with the user's ID token or ID-JAG as the subject token) and on every exchange. Each actor token authenticates one request, and the token it obtains never outlives it.

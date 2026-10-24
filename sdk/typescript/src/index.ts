@@ -49,10 +49,13 @@ export type {
   AuditPage,
   AuditQuery,
   CheckpointPage,
+  LeaseBudget,
+  LeaseLimit,
   LeaseNode,
   LeaseState,
   LeaseStatus,
   LeaseTree,
+  LeaseUsage,
   MintRootOptions,
   PolicyCheck,
   PolicyEvaluateOptions,
@@ -64,8 +67,10 @@ export type {
   VerifyReport,
 } from "./admin.js";
 export {
+  argLimit,
   capabilitiesToJson,
   capability,
+  countedArg,
   equals,
   formatCapability,
   oneOf,
@@ -73,7 +78,14 @@ export {
   prefix,
   withLimits,
 } from "./capability.js";
-export type { ArgLimit, Capability, CapabilityLike, Constraint, Limits } from "./capability.js";
+export type {
+  ArgLimit,
+  Capability,
+  CapabilityLike,
+  Constraint,
+  Derive,
+  Limits,
+} from "./capability.js";
 export {
   accessTokenHash,
   DpopKey,

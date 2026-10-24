@@ -188,6 +188,10 @@ export const REASONS = {
   approval_requested: 'An approval was opened for this exact call.',
   approval_granted: 'A user or the operator granted the approval; one identical retry may run.',
   approval_declined: 'A user or the operator declined the approval.',
+  // Run limits (ADR-0010).
+  budget_exhausted: 'The call would take a run limit in the token past its maximum; no approval passes it.',
+  budget_error: 'The run-limit counters could not be read or written, so the call failed closed.',
+  limit_arg_invalid: 'A run limit could not count the call: its argument was missing or not a value it can count.',
 };
 
 export function explainReason(code) {
