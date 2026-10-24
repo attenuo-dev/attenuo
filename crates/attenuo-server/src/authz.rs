@@ -840,6 +840,7 @@ impl Pipeline {
                 session: SessionLabels::from_sources(labels.iter().map(|l| l.source.clone())),
                 record: RecordLabels {
                     tainted_by: labels.iter().map(|l| l.seq).collect(),
+                    untrusted_args: Vec::new(),
                 },
                 sources: labels
                     .iter()

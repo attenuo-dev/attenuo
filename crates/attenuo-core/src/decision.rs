@@ -285,7 +285,9 @@ pub struct ResultInfo {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub error: bool,
     pub label: OutputLabel,
-    /// Fingerprints taken for argument matching. Always 0 until that is built (phase 2).
+    /// How many fingerprints of the result went into the run's span index for argument
+    /// matching (ADR-0009 phase 2, [`crate::fingerprint`]). 0 for a trusted result, and in
+    /// records written before phase 2.
     pub fingerprints: u64,
 }
 
@@ -296,11 +298,66 @@ pub struct RecordLabels {
     /// result from each source (`<server>/<tool>`), in ascending order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tainted_by: Vec<u64>,
+    /// Arguments of the call that matched an untrusted result of the run (ADR-0009 phase 2):
+    /// one entry per argument, result and kind, ordered by argument, then `seq`, then kind.
+    /// Omitted when empty, so the hashes of records without matches do not change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub untrusted_args: Vec<UntrustedArg>,
 }
 
 impl RecordLabels {
     pub fn is_empty(&self) -> bool {
-        self.tainted_by.is_empty()
+        self.tainted_by.is_empty() && self.untrusted_args.is_empty()
+    }
+}
+
+/// One argument that matched the run's span index: an entry of `labels.untrusted_args`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct UntrustedArg {
+    /// The top-level argument name.
+    pub arg: String,
+    /// Audit `seq` of the `tool_result` record whose fingerprints the argument matched.
+    /// Absent for [`UntrustedKind::Unreadable`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    pub kind: UntrustedKind,
+}
+
+/// How an argument came to count as untrusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UntrustedKind {
+    /// It contains a whole JSON string of the result.
+    Leaf,
+    /// It contains an entity (URL, host, email, IBAN, digits, path) of the result.
+    Entity,
+    /// It shares a winnowed k-gram with a long string of the result.
+    Kgram,
+    /// The span index could not be read, so every unpinned argument with a fingerprint counts
+    /// as untrusted (fail closed). No `seq`.
+    Unreadable,
+}
+
+impl UntrustedKind {
+    /// The wire string: `leaf`, `entity`, `kgram` or `unreadable`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UntrustedKind::Leaf => "leaf",
+            UntrustedKind::Entity => "entity",
+            UntrustedKind::Kgram => "kgram",
+            UntrustedKind::Unreadable => "unreadable",
+        }
+    }
+}
+
+impl From<crate::fingerprint::FingerprintKind> for UntrustedKind {
+    fn from(k: crate::fingerprint::FingerprintKind) -> Self {
+        use crate::fingerprint::FingerprintKind;
+        match k {
+            FingerprintKind::Leaf => UntrustedKind::Leaf,
+            FingerprintKind::Entity => UntrustedKind::Entity,
+            FingerprintKind::Kgram => UntrustedKind::Kgram,
+        }
     }
 }
 
