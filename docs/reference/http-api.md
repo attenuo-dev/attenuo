@@ -183,7 +183,7 @@ With `?preview=true` nothing is written, no lease and no audit record. `revoked`
 
 Each revocation appends one record with tool `admin.lease.revoke` and kind `lease_revoke`, whatever it matched. Its `leases` holds the first 256 revoked ids. Its arguments are `{selector, reason, revoked, listed, truncated}` (the count, how many ids `leases` holds, and whether that list was cut), stored as a digest like every admin record. The `leases_revoked_total` metric counts every revoked lease.
 
-Errors: 400 `invalid_request` for no selector, more than one, an empty value, an unknown field or a body that is not JSON; 400 `unsupported_selector` for `session`; 401 without the admin bearer. The route is not on the console listener.
+Errors: 400 `invalid_request` for no selector, more than one, an empty value, an unknown field or a body that is not JSON; 400 `unsupported_selector` for `session`; 401 without the admin bearer. On the console listener the route needs `Content-Type: application/json`. Without `[admin_ui] allow_write = true` it serves only `?preview=true` there and answers a revocation with 404. The console's lease page uses it for "Revoke chain…" and "Revoke all for <user>…".
 
 ### Lease tree
 
@@ -193,6 +193,7 @@ Errors: 400 `invalid_request` for no selector, more than one, an empty value, an
 - `ancestors`: the leases it was delegated from, nearest first, ending at `root`, the chain's first hop. `root` is also the `chain_id` of the chain's audit records. Empty for a root lease.
 - `would_revoke`: the leases in the whole subtree that are not revoked yet, counted with the same query the revocation runs, so it is the `revoked` count a revoke sent now would return. It ignores `max_nodes`.
 - Per lease: the registry row (`parent`, `expires_at`, `revoked_at`, `revoke_reason`), `active` now, and from the audit record that issued it (`root_token` or `exchange`) the `agent` it was issued to, `issued_at` and `issued_seq`. These three are `null` when no issuance record is found.
+- Per lease, `chain_id` and `subject`: the chain id, which is the same as `root` for every lease of the tree and is what `POST /admin/leases/revoke` takes as `chain_id`; and the originating user's subject the server recorded when it issued the lease, which that route takes as `user`. `subject` is `null` for a lease registered before the server recorded subjects. The subjects of the whole tree are read with one store call. `subject` is the IdP's `sub`, so treat it as untrusted text.
 - Per lease, `budget`: the hop's run limits and what is left of them, `null` when the hop has no limits and nothing was charged under its lease. `{recorded, limits, usage}`: `recorded` says the server kept the hop's limits when it issued the token (a lease issued by an older server has counters but no `max`); `limits` has one entry per limit, `{cap, server, tool, kind, arg, max, used, remaining}` (`arg` is `null` for `calls` and `url#host` for a derived value; `used` is calls, the sum, for `distinct` the values seen, and for `calls_per` the most calls any one value has had, with `values` the number of values seen; `remaining` is `max - used`); `usage`, on a run's root lease, is the run's usage per destructive tool, `{tool, calls, amount, destinations}`. Value hashes are never shown. Calls are charged to every hop, so the smallest `remaining` along the chain is what a lease can still spend.
 
 ```json
@@ -200,17 +201,20 @@ Errors: 400 `invalid_request` for no selector, more than one, an empty value, an
   "root": "0b7c...",
   "ancestors": [
     {"lease_id": "0b7c...", "parent": null, "agent": "planner", "active": true,
+     "chain_id": "0b7c...", "subject": "alice@example.com",
      "expires_at": "2026-10-23T19:20:00Z", "revoked_at": null, "revoke_reason": null,
      "issued_at": "2026-10-23T19:05:00Z", "issued_seq": 41, "budget": null}
   ],
   "nodes": [
     {"lease_id": "5e21...", "parent": "0b7c...", "agent": "coder", "active": true,
+     "chain_id": "0b7c...", "subject": "alice@example.com",
      "expires_at": "2026-10-23T19:20:02Z", "revoked_at": null, "revoke_reason": null,
      "issued_at": "2026-10-23T19:05:02Z", "issued_seq": 42,
      "budget": {"recorded": true, "usage": [], "limits": [
        {"cap": 0, "server": "web", "tool": "get_webpage", "kind": "distinct",
         "arg": "url#host", "max": 2, "used": 1, "remaining": 1}]}},
     {"lease_id": "9a40...", "parent": "5e21...", "agent": "reviewer", "active": false,
+     "chain_id": "0b7c...", "subject": "alice@example.com",
      "expires_at": "2026-10-23T19:20:03Z", "revoked_at": "2026-10-23T19:06:10Z",
      "revoke_reason": "rotated", "issued_at": "2026-10-23T19:05:03Z", "issued_seq": 43,
      "budget": null}

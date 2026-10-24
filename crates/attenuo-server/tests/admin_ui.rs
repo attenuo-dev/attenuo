@@ -649,3 +649,118 @@ async fn server_refuses_to_start_with_a_public_console_listener() {
     cfg.admin_ui.allow_public = true;
     let _ = attenuo_server::build(&cfg).unwrap();
 }
+
+/// Without `allow_write` the console listener serves the selector revocation's dry run, so the
+/// lease page can preview "revoke this chain" and "revoke all for this user", but answers a
+/// real revocation with 404 and revokes nothing. A preview, like every console `POST`, needs
+/// a JSON `Content-Type`.
+#[tokio::test]
+async fn selector_preview_is_served_without_allow_write_but_revocation_is_not() {
+    let h = Harness::start(false).await;
+    let lease = h.mint_root().await;
+    let post = |query: &'static str, body: Value| {
+        Harness::client()
+            .post(h.console.url(&format!("/admin/leases/revoke{query}")))
+            .bearer_auth(ADMIN)
+            .json(&body)
+            .send()
+    };
+    let r = post("?preview=true", json!({"chain_id": lease}))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_security_headers(r.headers());
+    assert_no_store(r.headers());
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["preview"], true);
+    assert_eq!(body["matched_count"], 1);
+    assert_eq!(body["revoked"], json!([lease]));
+    let r = post("?preview=true", json!({"user": "alice"}))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    // Bad selectors are still the route's own 400.
+    let r = post("?preview=true", json!({})).await.unwrap();
+    assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+    for query in ["", "?preview=false"] {
+        let r = post(query, json!({"chain_id": lease, "reason": "x"}))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND, "{query}");
+        assert_security_headers(r.headers());
+        assert_no_store(r.headers());
+    }
+    let r = Harness::client()
+        .post(h.console.url("/admin/leases/revoke?preview=true"))
+        .bearer_auth(ADMIN)
+        .header("content-type", "text/plain")
+        .body(json!({"chain_id": lease}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let r = Harness::client()
+        .post(h.console.url("/admin/leases/revoke?preview=true"))
+        .json(&json!({"chain_id": lease}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+
+    let status: Value = h
+        .admin_get(&format!("/admin/leases/{lease}"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["active"], true, "nothing was revoked");
+}
+
+/// With `allow_write` the console listener revokes by chain and by user, and records it.
+#[tokio::test]
+async fn selector_revocation_works_on_the_console_with_allow_write() {
+    let h = Harness::start(true).await;
+    let first = h.mint_root().await;
+    let second = h.mint_root().await;
+    let before = h.head().await;
+    let r = Harness::client()
+        .post(h.console.url("/admin/leases/revoke"))
+        .bearer_auth(ADMIN)
+        .json(&json!({"chain_id": first, "reason": "from the console"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    assert_security_headers(r.headers());
+    assert_no_store(r.headers());
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["revoked"], json!([first]));
+    assert_eq!(body["reason"], "from the console");
+    assert!(body["audit_id"].is_string());
+    assert_eq!(h.head().await, before + 1);
+    let record: Value = h
+        .admin_get(&format!(
+            "/admin/audit/records/{}",
+            body["audit_id"].as_str().unwrap()
+        ))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(record["entry"]["record"]["tool"], "admin.lease.revoke");
+
+    // Every other lease of alice: the second root.
+    let body: Value = Harness::client()
+        .post(h.console.url("/admin/leases/revoke"))
+        .bearer_auth(ADMIN)
+        .json(&json!({"user": "alice"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["revoked"], json!([second]));
+    assert_eq!(body["reason"], "revoked by admin");
+}
