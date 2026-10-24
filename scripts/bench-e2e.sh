@@ -5,6 +5,9 @@
 #   scripts/bench-e2e.sh                 full matrix (about 9 minutes)
 #   DURATION=10 WARMUP=2 scripts/bench-e2e.sh
 #   scripts/bench-e2e.sh --concurrency 8 --depths 3     extra arguments go to attenuo-bench
+#   DURATION=10 scripts/bench-e2e.sh hot-path --runs 5 --approval-loops 2000
+#                                        labelling and run-limit configurations (attenuo-bench
+#                                        hot-path); writes <date>-<host>-hot-path.{json,md}
 #
 # Environment:
 #   DURATION, WARMUP   seconds per cell (default 5 and 2)
@@ -25,6 +28,12 @@ OUT_DIR="${OUT_DIR:-docs/design/bench}"
 HOST="$(hostname | tr -c 'A-Za-z0-9\n' '-')"
 DATE="$(date -u +%F)"
 BASE="$OUT_DIR/$DATE-$HOST"
+SUB=()
+if [ "${1:-}" = "hot-path" ]; then
+  SUB=(hot-path)
+  shift
+  BASE="$BASE-hot-path"
+fi
 mkdir -p "$OUT_DIR"
 
 echo "building release binaries..." >&2
@@ -39,7 +48,7 @@ trap 'rm -rf "$STAGE"' EXIT
 cp "$BIN/attenuo-bench" "$BIN/attenuo-server" "$STAGE/"
 cp "$BIN/examples/fake_mcp" "$STAGE/"
 
-"$STAGE/attenuo-bench" --bin-dir "$STAGE" --duration "$DURATION" --warmup "$WARMUP" \
+"$STAGE/attenuo-bench" "${SUB[@]}" --bin-dir "$STAGE" --duration "$DURATION" --warmup "$WARMUP" \
   --json "$BASE.json" --markdown "$BASE.tables.md" "$@" >/dev/null
 
 {
@@ -47,6 +56,7 @@ cp "$BIN/examples/fake_mcp" "$STAGE/"
   echo
   echo "Commit \`$(git rev-parse --short HEAD)\`, release profile, $(rustc --version)."
   echo "Per cell: ${WARMUP} s warm-up (discarded), ${DURATION} s measured, closed loop."
+  [ "${#SUB[@]}" -gt 0 ] && echo "Command: attenuo-bench ${SUB[*]} $*, load average $(cut -d' ' -f1-3 /proc/loadavg) at the end."
   [ -n "${NOTE:-}" ] && { echo; echo "$NOTE"; }
   echo
   echo "## Hardware"

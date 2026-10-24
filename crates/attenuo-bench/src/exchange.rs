@@ -51,6 +51,9 @@ pub enum Command {
     Exchange(ExchangeArgs),
     /// Lease renewal load at M live leases, and the revoke-cascade time.
     LeaseRenew(LeaseArgs),
+    /// What output labelling and run limits add to one proxied `tools/call`, and the cost of
+    /// an approval round (see [`crate::hotpath`]).
+    HotPath(crate::hotpath::HotPathArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -389,6 +392,7 @@ fn stats_of(h: &Histogram<u64>, unexpected: u64, rate_count: u64, secs: f64) -> 
         mean_us: us(h.mean()),
         p50_us: us(h.value_at_quantile(0.50) as f64),
         p90_us: us(h.value_at_quantile(0.90) as f64),
+        p95_us: us(h.value_at_quantile(0.95) as f64),
         p99_us: us(h.value_at_quantile(0.99) as f64),
         max_us: us(h.max() as f64),
     }
@@ -1655,6 +1659,7 @@ pub async fn run_command(cmd: &Command) -> Result<()> {
     match cmd {
         Command::Exchange(a) => run_exchange(a).await,
         Command::LeaseRenew(a) => run_lease(a).await,
+        Command::HotPath(a) => crate::hotpath::run(a).await,
     }
 }
 
