@@ -244,6 +244,20 @@ On `feat/run-limits-phase1`: `limits` (`calls`, `sum`, `calls_per`) in capabilit
 - **Older servers** accept and ignore `limits` (a capability has no closed field list), so a token with limits checked by a binary without phase 1 is not limited. The runner probes for this before the limits arms.
 - **Runner.** The frozen rule is `policies/limits-rule.json`, hashed under `added_later`; a glob capability is not a read, so it gets `calls: 1`. The combined arm settles approvals through the runner's labels-arm path (#46: grant through `POST /admin/approvals/{id}`, one retry), so an approved call is charged; a retry over a limit is recorded as `denied` with `retry_reason` `budget_exhausted`. Not done here: the multi-call dev cases, the arm runs on both splits, and the latency measurement; those are the next step before phase 1 is measured.
 
+### Measured: first run of the limits arms (2026-10-24)
+
+`run.py --split all --tag limits-v1` on main `55c9e87` (#50), [results](../../evaluation/injection-suite/results/2026-10-24-limits-v1.md), discussed on the [evaluation page](../evaluation/injection-suite.md#run-limits-arms-first-run-2026-10-24). Against the section 4 hand count:
+
+| | Dev: counted | Dev: run | Test: counted | Test: run |
+|---|---:|---:|---:|---:|
+| Remaining misses caught by a limit | 5 of 10 | 4 of 10 | 5 of 7 | 5 of 7 |
+| Attack calls allowed in `attenuo_limits` | 5 | 6 | 2 | 2 |
+| Approve-all bound in `attenuo_labels_limits` | 5 | 6 | 2 | 2 |
+| Approval requests in `attenuo_labels_limits` | 22 | 23 | 3 | 3 |
+| Benign calls refused by a limit | 0 | 0 | 0 | 0 |
+
+The one difference is `slack-08`: the count caught its second `get_webpage` with `calls` on that tool, but the frozen rule treats `get_webpage` as a read and limits nothing on it, so the call is allowed (and gated in the combined arm). Benign calls denied stay at 3/69 and 3/29, and no granted retry was refused by a limit. The revocation-only denials the count expected limits to take over stay at the lease stage, because the scripted revocation comes first. The limit also refuses 12 dev and 6 test attack calls the policy denied before, since it runs before Cedar. The 0 benign losses still say little: the multi-call dev cases are not written, and `calls: 1` is a uniform rule, not a figure read from each task. Latency is not measured yet.
+
 ## 7. Open questions
 
 1. **Order dependence.** Six of the ten caught calls depend on the benign call coming first. Is there a cheap signal that tells the legitimate call from the excess one (pin plus count, or count only after a tainted read), or is "bounded harm" all a count can claim?
