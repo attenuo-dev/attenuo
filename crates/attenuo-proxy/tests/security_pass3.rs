@@ -2,13 +2,16 @@
 //! (`docs/research/security-review-2026-10-23.md`).
 //!
 //! Both findings here are in `crates/attenuo-proxy/src/proxy.rs`: SR-27 (ambiguous
-//! `Mcp-Session-Id` headers) and SR-28 (long-lived streams outliving revocation).
+//! `Mcp-Session-Id` headers) and SR-28 (long-lived streams outliving revocation, and the
+//! audit record of a stream the proxy ends).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use attenuo_core::{AgentId, Capability, CapabilitySet, DelegationChain, LeaseId};
+use attenuo_core::{AgentId, Capability, CapabilitySet, Decision, DelegationChain, LeaseId};
+use attenuo_proxy::guard::STREAM_END_TOOL;
+use attenuo_proxy::session::session_tag;
 use attenuo_proxy::testing::{spawn_router, test_chain, test_user, Spawned, StaticAuthorizer};
 use attenuo_proxy::{router, ProxyConfig, UpstreamConfig};
 use axum::body::Body;
@@ -345,6 +348,17 @@ async fn open_listen_stream(
     proxy: &Spawned,
     bearer: &str,
 ) -> impl futures_util::Stream<Item = reqwest::Result<axum::body::Bytes>> {
+    open_listen_stream_in(proxy, bearer).await.1
+}
+
+/// [`open_listen_stream`], also returning the session id.
+async fn open_listen_stream_in(
+    proxy: &Spawned,
+    bearer: &str,
+) -> (
+    String,
+    impl futures_util::Stream<Item = reqwest::Result<axum::body::Bytes>>,
+) {
     let sid = post_with_sessions(proxy, bearer, &[]).await.headers()["mcp-session-id"]
         .to_str()
         .unwrap()
@@ -365,7 +379,7 @@ async fn open_listen_stream(
         .expect("stream open")
         .unwrap();
     assert!(String::from_utf8_lossy(&first).contains("notifications/message"));
-    stream
+    (sid, stream)
 }
 
 /// Read `stream` to its end (or `limit`), returning everything received and how long it took.
@@ -398,8 +412,31 @@ fn last_event(text: &str) -> serde_json::Value {
     serde_json::from_str(data).unwrap()
 }
 
-/// SR-28: the stream ends within a few re-check intervals of the revocation, and its last
-/// event says why.
+/// The one record a stream end left: a `deny` of [`STREAM_END_TOOL`] for `reason`, with the
+/// session's hash tag, whose id the final event carries.
+fn assert_stream_end_record(
+    authorizer: &StaticAuthorizer,
+    last: &serde_json::Value,
+    reason: &str,
+    sid: Option<&str>,
+) {
+    let records: Vec<_> = authorizer
+        .decisions()
+        .into_iter()
+        .filter(|r| r.tool == STREAM_END_TOOL)
+        .collect();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let r = &records[0];
+    assert_eq!(r.decision, Decision::Deny);
+    assert_eq!(r.reason, reason);
+    assert_eq!(r.server, SERVER);
+    assert_eq!(r.session_id.as_deref(), sid.map(session_tag).as_deref());
+    assert_eq!(last["error"]["data"]["decision_id"], r.id.to_string());
+}
+
+/// SR-28: the stream ends within a few re-check intervals of the revocation, its last event
+/// says why, and the end is recorded once, against the session, with the event naming the
+/// record.
 #[tokio::test]
 async fn a_revoked_listen_stream_ends_promptly_with_a_reason() {
     let upstream = SessionUpstream::default();
@@ -409,7 +446,8 @@ async fn a_revoked_listen_stream_ends_promptly_with_a_reason() {
         test_chain("user:alice", "agent:a", [Capability::new(SERVER, "read_*")]),
     ));
     let proxy = proxy_with(&up, authorizer.clone()).await;
-    let stream = open_listen_stream(&proxy, "alice").await;
+    let (sid, stream) = open_listen_stream_in(&proxy, "alice").await;
+    assert!(authorizer.decisions().is_empty());
 
     authorizer.revoke("alice");
     let (text, took) = drain(stream, Duration::from_secs(5)).await;
@@ -417,6 +455,65 @@ async fn a_revoked_listen_stream_ends_promptly_with_a_reason() {
     let last = last_event(&text);
     assert_eq!(last["error"]["code"], -32001);
     assert_eq!(last["error"]["data"]["reason"], "lease_revoked");
+    assert_stream_end_record(&authorizer, &last, "lease_revoked", Some(&sid));
+    assert_eq!(authorizer.decisions().len(), 1);
+}
+
+/// SR-28: a listen stream the client drops, or the upstream ends, is not a decision: nothing
+/// is recorded, even when the lease is revoked afterwards.
+#[tokio::test]
+async fn a_dropped_or_finished_listen_stream_leaves_no_record() {
+    let upstream = SessionUpstream::default();
+    let up = spawn_router(upstream.router()).await.unwrap();
+    let authorizer = Arc::new(StaticAuthorizer::new().with_chain(
+        "alice",
+        test_chain("user:alice", "agent:a", [Capability::new(SERVER, "read_*")]),
+    ));
+    let proxy = proxy_with(&up, authorizer.clone()).await;
+    let stream = open_listen_stream(&proxy, "alice").await;
+    drop(stream);
+    tokio::time::sleep(RECHECK * 4).await;
+    authorizer.revoke("alice");
+    tokio::time::sleep(RECHECK * 4).await;
+    assert!(authorizer.decisions().is_empty(), "client drop");
+
+    // An upstream that ends its listen stream after one event.
+    let finite = spawn_router(Router::new().route(
+        "/mcp",
+        post(|| async {
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string(),
+            )
+        })
+        .get(|| async {
+            (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\n\n",
+            )
+        }),
+    ))
+    .await
+    .unwrap();
+    let authorizer = Arc::new(StaticAuthorizer::new().with_chain(
+        "alice",
+        test_chain("user:alice", "agent:a", [Capability::new(SERVER, "read_*")]),
+    ));
+    let proxy = proxy_with(&finite, authorizer.clone()).await;
+    let resp = reqwest::Client::new()
+        .get(proxy.url(&format!("/mcp/{SERVER}")))
+        .bearer_auth("alice")
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (text, _) = drain(resp.bytes_stream(), Duration::from_secs(5)).await;
+    assert!(text.contains("notifications/message"), "{text}");
+    assert!(!text.contains("-32001"), "{text}");
+    authorizer.revoke("alice");
+    tokio::time::sleep(RECHECK * 3).await;
+    assert!(authorizer.decisions().is_empty(), "upstream end");
 }
 
 /// SR-28: a listen stream does not outlive the token that opened it.
@@ -435,14 +532,13 @@ async fn an_expired_tokens_listen_stream_ends() {
     )
     .unwrap();
     let authorizer = Arc::new(StaticAuthorizer::new().with_chain("alice", chain));
-    let proxy = proxy_with(&up, authorizer).await;
-    let stream = open_listen_stream(&proxy, "alice").await;
+    let proxy = proxy_with(&up, authorizer.clone()).await;
+    let (sid, stream) = open_listen_stream_in(&proxy, "alice").await;
 
     let (text, _) = drain(stream, ttl + Duration::from_secs(2)).await;
-    assert_eq!(
-        last_event(&text)["error"]["data"]["reason"],
-        "token_expired"
-    );
+    let last = last_event(&text);
+    assert_eq!(last["error"]["data"]["reason"], "token_expired");
+    assert_stream_end_record(&authorizer, &last, "token_expired", Some(&sid));
 }
 
 /// SR-28: re-checking does not disturb a stream whose lease stays live.
@@ -454,7 +550,7 @@ async fn an_untouched_listen_stream_keeps_flowing() {
         "alice",
         test_chain("user:alice", "agent:a", [Capability::new(SERVER, "read_*")]),
     ));
-    let proxy = proxy_with(&up, authorizer).await;
+    let proxy = proxy_with(&up, authorizer.clone()).await;
     let mut stream = open_listen_stream(&proxy, "alice").await;
 
     // Several re-check intervals' worth of events, all upstream notifications.
@@ -469,6 +565,7 @@ async fn an_untouched_listen_stream_keeps_flowing() {
         events += text.matches("notifications/message").count();
     }
     assert!(events >= 8, "only {events} events in {:?}", RECHECK * 8);
+    assert!(authorizer.decisions().is_empty());
 }
 
 /// SR-28: a `tools/call` answered over a long-lived SSE stream is re-checked too.
@@ -525,8 +622,9 @@ async fn a_revoked_sse_tool_call_response_ends() {
     authorizer.revoke("alice");
     let (text, took) = drain(stream, Duration::from_secs(5)).await;
     assert!(took < RECHECK * 10, "took {took:?}");
-    assert_eq!(
-        last_event(&text)["error"]["data"]["reason"],
-        "lease_revoked"
-    );
+    let last = last_event(&text);
+    assert_eq!(last["error"]["data"]["reason"], "lease_revoked");
+    // The call's own decision, then the end of its answer stream (no session here).
+    assert_eq!(authorizer.decisions()[0].tool, "read_slowly");
+    assert_stream_end_record(&authorizer, &last, "lease_revoked", None);
 }

@@ -116,9 +116,22 @@ struct AppState {
 }
 
 impl AppState {
-    /// The re-check (SR-28) for a response streamed to `chain`'s holder.
-    fn stream_guard(&self, chain: &DelegationChain) -> StreamGuard {
-        StreamGuard::new(self.authorizer.clone(), chain.clone(), self.stream_recheck)
+    /// The re-check (SR-28) for a response streamed to `who` from `server` in `session_id`.
+    /// A stream the re-check ends for a lease or token reason is recorded under
+    /// [`crate::guard::STREAM_END_TOOL`]. `who` passed full verification, so the record names
+    /// a principal attenuo issued a token to (SR-18).
+    fn stream_guard(
+        &self,
+        who: &Authenticated,
+        server: &str,
+        session_id: Option<&str>,
+    ) -> StreamGuard {
+        StreamGuard::new(
+            self.authorizer.clone(),
+            who.chain.clone(),
+            self.stream_recheck,
+        )
+        .recording(server, session_id, who.dpop_bound)
     }
 }
 
@@ -760,11 +773,16 @@ async fn handle_passthrough(
                     state.awaited.clone(),
                     ResultScope::new(&server, session_id.as_deref(), &chain),
                 );
-                let guard = state.stream_guard(&chain);
+                let guard = state.stream_guard(&who, &server, session_id.as_deref());
                 let filter = listen_list_filter(&state, &chain, &server);
                 stream_response_sse(resp, None, guard, limit, Some(filter), Some(labeller))
             }
-            Ok(resp) => stream_response(resp, None, Some(state.stream_guard(&chain)), limit),
+            Ok(resp) => stream_response(
+                resp,
+                None,
+                Some(state.stream_guard(&who, &server, session_id.as_deref())),
+                limit,
+            ),
             Err(e) => return upstream_error(e),
         };
         match (is_delete, session_id.as_deref()) {
@@ -1103,7 +1121,7 @@ async fn handle_post_inner(
         // event as it passes; label every response to an allowed call the same way. Replies
         // the proxy generated itself lead the stream.
         let prelude = sse_prelude(&screened.replies);
-        let guard = state.stream_guard(chain);
+        let guard = state.stream_guard(who, server, session_id);
         let filter = has_lists.then(|| {
             let pending = screened.list_requests.clone();
             let caps = chain.effective_capabilities().cloned().unwrap_or_default();
@@ -1168,7 +1186,7 @@ async fn handle_post_inner(
         stream_response(
             resp,
             prelude,
-            Some(state.stream_guard(chain)),
+            Some(state.stream_guard(who, server, session_id)),
             state.max_upstream_body,
         )
     };
