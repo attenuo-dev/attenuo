@@ -143,6 +143,7 @@ CODER="$(field token)"; CODER_LEASE="$(field lease)"
 
 say "5. What the coder's token says: two hops, each narrower than the one above"
 step 0 'attenuo token inspect "$CODER" --verify'
+expect "may_act []: no agent may exchange this token"
 
 say "6. Exchange 3, refused: the coder tries to hand its token to a reviewer agent"
 note "The reviewer authenticates fine, but the coder's token carries may_act: []."

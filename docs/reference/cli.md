@@ -134,7 +134,7 @@ Decode a token and show its delegation chain as a tree. Use `-` to read the toke
 | `--issuer` | With `--verify`: expected issuer. Default: the token's own. |
 | `--audience` | With `--verify`: expected audience. Default: the token's own. |
 
-For a bound token the text output adds `bound to DPoP key jkt <thumbprint>`.
+The text output has a `may_act` line saying who may exchange the token next: `may_act (absent): any authenticated agent may exchange this token`, `may_act []: no agent may exchange this token`, or `may_act coder, reviewer: only these agents may exchange this token` (agent ids with control characters escaped). With `--verify` it is read from the verified claims, which the signature covers. For a bound token the text output adds `bound to DPoP key jkt <thumbprint>`.
 
 ### `call`
 
