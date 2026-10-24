@@ -137,13 +137,18 @@ A capability can carry run limits ([ADR-0010](https://github.com/attenuo-dev/att
 ```python
 from attenuo import ArgLimit, Capability
 
-helper = ob.exchange(planner, "helper", [
-    # At most one payment, 40 in total, to Emma only.
-    Capability("banking", "send_money", recipient="FR00EMMA").with_limits(
-        calls=1, sum=("amount", 40), calls_per=("recipient", 1)),
-    # Pages from at most two sites: `derive="host"` counts the host of the URL.
-    Capability("web", "get_webpage").with_limits(distinct=ArgLimit("url", 2, derive="host")),
-])
+helper = ob.exchange(
+    planner,
+    "helper",
+    [
+        # At most one payment, 40 in total, to Emma only.
+        Capability("banking", "send_money", recipient="FR00EMMA").with_limits(
+            calls=1, sum=("amount", 40), calls_per=("recipient", 1)
+        ),
+        # Pages from at most two sites: `derive="host"` counts the host of the URL.
+        Capability("web", "get_webpage").with_limits(distinct=ArgLimit("url", 2, derive="host")),
+    ],
+)
 ```
 
 Argument limits are `(arg, max)` tuples or `ArgLimit`s; `with_limits` also takes a whole `Limits`, and `Capability.typed_limits` reads them back (from a decoded token's hops, too). The server lowers a figure larger than the parent's, fills in a limit the child leaves out, and charges every call to every hop, so a child can spend at most what its parent has left. A call over a limit is `Denied` with `reason == "budget_exhausted"`; one whose argument a limit cannot count (a missing recipient, a URL without a host) is `limit_arg_invalid`. A kind or derivation the SDK does not know raises `ValueError` instead of being dropped.
