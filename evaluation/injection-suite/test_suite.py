@@ -494,3 +494,55 @@ def test_limits_arm_runs_or_is_skipped() -> None:
     assert not any(c["reached_upstream"] for c in doc["calls"][1:])
     a = doc["audit"]["attenuo_limits"]
     assert not a["decisions_unmatched"] and a["cli_verify_exit"] == 0
+
+
+# --- the argument-taint arm (option (b)) ---------------------------------------------------------
+
+
+def test_labels_args_arm_loads_its_own_frozen_policy(tmp_path: Path) -> None:
+    hashes = harness.frozen_hashes()
+    assert "labels-args.cedar" in hashes["files"] and "labels-args.cedar" in hashes["added_later"]
+    assert harness.labels_policy("attenuo_labels_args").name == "labels-args.cedar"
+    assert harness.labels_policy("attenuo_labels").name == "labels.cedar"
+    assert harness.labels_policy("attenuo_labels_limits").name == "labels.cedar"
+    # Approvals are settled through the labels arm's path; no run-limit rule.
+    assert "attenuo_labels_args" in harness.LABEL_ARMS and "attenuo_labels_args" in harness.PROXIED
+    assert "attenuo_labels_args" in harness.CONSTRAINED_ARMS
+    assert "attenuo_labels_args" not in harness.LIMIT_ARMS
+    assert "attenuo_labels_args" in run.ARM_NAMES
+    env = list(harness.load_environment().values())
+    harness.write_config(tmp_path, env, 1, {s.upstream: "http://x" for s in env},
+                         "attenuo_labels_args", ["worker"])  # fmt: skip
+    text = (tmp_path / "policy.cedar").read_text()
+    assert "confirm_destructive_with_untrusted_args" in text
+    assert "confirm_destructive_after_untrusted_read" not in text
+
+
+def test_arg_taint_probe_verdict() -> None:
+    assert "does not name it" in (harness.arg_taint_probe_verdict(GATED) or "")
+    named = json.loads(json.dumps(GATED))
+    named["error"]["data"]["untrusted_args"] = [{"arg": "street", "seq": 4, "kind": "leaf"}]
+    assert harness.arg_taint_probe_verdict(named) is None
+    other = json.loads(json.dumps(GATED))
+    other["error"]["data"]["untrusted_args"] = [{"arg": "city", "seq": 4, "kind": "leaf"}]
+    assert harness.arg_taint_probe_verdict(other) is not None
+    got = harness.arg_taint_probe_verdict({"result": {}}) or ""
+    assert "copying an untrusted result (probe got no error)" in got
+
+
+@pytest.mark.integration
+def test_labels_args_arm_runs_or_is_skipped() -> None:
+    """On a server with argument-level taint the arm runs with no problems; on one without, it
+    is skipped with the probe's reason and runs no call."""
+    if os.environ.get("ATTENUO_INTEGRATION") != "1":
+        pytest.skip("set ATTENUO_INTEGRATION=1 to run")
+    suites = [s for s in harness.load_corpus() if s.name == "banking"]
+    suites[0].cases = [c for c in suites[0].cases if c.id == "banking-02"]
+    doc = harness.run(suites, ("attenuo_labels_args",))
+    if "attenuo_labels_args" not in doc["arms"]:
+        why = doc["skipped_arms"]["attenuo_labels_args"]
+        assert "probe got" in why or "does not name" in why
+        assert doc["calls"] == []
+        return
+    doc["rates"] = run.arm_rates(doc)
+    assert run.problems(doc) == []

@@ -14,7 +14,9 @@ answer ``-32008 approval_required``. In that arm a gated call is decided by the 
 through ``POST /admin/approvals/{id}`` and, when granted, retried once; the run also fails if a
 retry gets ``-32008`` again or if the retry did not consume the approval. The ``attenuo_limits``
 and ``attenuo_labels_limits`` arms are skipped when the server does not enforce run limits
-(ADR-0010). Exit status 2,
+(ADR-0010). The ``attenuo_labels_args`` arm (option (b), argument-level taint) settles approvals
+like ``attenuo_labels`` and is skipped when the probe's ``-32008`` does not name the copied
+argument in ``untrusted_args``. Exit status 2,
 before anything runs, if the test split is requested while ``policies/`` differs from its frozen
 hashes or while the labelling oracle (``label_rules.py``) disagrees with a hand label that has no
 ``label_note``.
@@ -201,6 +203,7 @@ ARM_NAMES = {
     "attenuo_labels": "attenuo full plus output labels (scripted approver)",
     "attenuo_limits": "attenuo full plus the frozen run-limit rule",
     "attenuo_labels_limits": "attenuo full plus output labels and the run-limit rule",
+    "attenuo_labels_args": "attenuo full plus argument-level labels (scripted approver)",
 }
 
 
