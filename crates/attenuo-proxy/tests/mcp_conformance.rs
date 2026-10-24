@@ -9,7 +9,8 @@
 //!   `-32003`, a deny decision is recorded under the mapped tool name, and the upstream sees
 //!   nothing.
 //! - **Passthrough** methods (`initialize`, `ping`, the four `*/list` methods,
-//!   `logging/setLevel`) and **notifications** need a live lease and no capability.
+//!   `resources/unsubscribe`, `logging/setLevel`) and **notifications** need a live lease and
+//!   no capability.
 //! - Nothing at all reaches the upstream for a revoked token, and each refused request leaves
 //!   one deny record with the lease reason (passthrough methods and notifications included).
 //!
@@ -194,13 +195,9 @@ fn cases() -> Vec<Case> {
             "completion/complete",
             vec![cap("completion/complete")],
         ),
+        // Giving up a subscription never widens anything: allowlisted.
+        passthrough("resources/unsubscribe", json!({"uri": "file:///public/a"})),
         // Methods the proxy has no mapping for: the method name is the tool.
-        decided(
-            "resources/unsubscribe",
-            json!({"uri": "file:///public/a"}),
-            "resources/unsubscribe",
-            vec![cap("resources/*")],
-        ),
         decided(
             "sampling/createMessage",
             json!({"messages": []}),
@@ -473,6 +470,42 @@ async fn revoked_tokens_reach_nothing() -> anyhow::Result<()> {
         };
         assert_eq!(r.tool, tool, "{}", case.method);
     }
+    Ok(())
+}
+
+/// `resources/unsubscribe` is allowlisted: the agent giving a subscription up is never a
+/// widening. With a live lease it is forwarded with no capability and no decision record; with
+/// a revoked one it is refused, never forwarded, and recorded as one `deny` under its own name.
+#[tokio::test]
+async fn resources_unsubscribe_needs_a_live_lease_and_no_capability() -> anyhow::Result<()> {
+    let unsubscribe = json!({"jsonrpc": "2.0", "id": 7, "method": "resources/unsubscribe",
+                             "params": {"uri": "file:///secret/key.pem"}});
+
+    // Live lease, no capability for anything `resources/*`.
+    let h = Harness::start(chain_with(vec![])).await?;
+    let (status, body) = h.post(&unsubscribe).await?;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["id"], 7);
+    assert_eq!(body["result"], json!({}), "{body}");
+    assert_eq!(h.seen("resources/unsubscribe"), 1);
+    assert!(h.authorizer.decisions().is_empty());
+
+    // Revoked lease.
+    let h = Harness::start(chain_with(vec![cap("*")])).await?;
+    h.authorizer.revoke(TOKEN);
+    let (status, body) = h.post(&unsubscribe).await?;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(body["error"]["data"]["reason"], "lease_revoked");
+    assert!(h.upstream.recorded_methods().is_empty());
+    let records = h.authorizer.decisions();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].decision, Decision::Deny);
+    assert_eq!(records[0].reason, "lease_revoked");
+    assert_eq!(records[0].tool, "resources/unsubscribe");
+    assert_eq!(
+        body["error"]["data"]["decision_id"],
+        records[0].id.to_string()
+    );
     Ok(())
 }
 
