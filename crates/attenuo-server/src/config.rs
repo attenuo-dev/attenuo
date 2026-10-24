@@ -558,6 +558,13 @@ pub struct PolicySection {
     /// and nothing an annotation says makes a tool less restricted (ADR-0009).
     #[serde(default)]
     pub import_annotations: AnnotationImport,
+    /// Whether run usage (`context.usage`) is kept for calls to destructive tools: `"auto"`
+    /// (default) keeps it only when some loaded policy reads `context.usage` or the catalog
+    /// declares `amount` or `destination` for some tool, re-decided on every policy reload;
+    /// `true` always keeps it. Keeping it costs one lease-store write per allowed destructive
+    /// call. `false` is refused.
+    #[serde(default)]
+    pub track_usage: attenuo_policy::TrackUsage,
 }
 
 impl PolicySection {
@@ -1806,6 +1813,20 @@ mod tests {
     }
 
     /// SR-13: actions are server-scoped unless the deprecated switch is on.
+    #[test]
+    fn track_usage_defaults_to_auto_and_takes_true_only() {
+        use attenuo_policy::TrackUsage;
+        assert_eq!(
+            Config::from_toml("").unwrap().policy.track_usage,
+            TrackUsage::Auto
+        );
+        let cfg = Config::from_toml("[policy]\ntrack_usage = true\n").unwrap();
+        assert_eq!(cfg.policy.track_usage, TrackUsage::Always);
+        let cfg = Config::from_toml("[policy]\ntrack_usage = \"auto\"\n").unwrap();
+        assert_eq!(cfg.policy.track_usage, TrackUsage::Auto);
+        assert!(Config::from_toml("[policy]\ntrack_usage = false\n").is_err());
+    }
+
     #[test]
     fn import_annotations_defaults_to_never_and_parses() {
         assert_eq!(
