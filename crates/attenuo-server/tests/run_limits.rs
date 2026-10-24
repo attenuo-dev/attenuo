@@ -346,6 +346,28 @@ async fn exchange_clamps_child_budget_to_parent_remaining() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // A limit kind of a later phase (`distinct`) is refused, not ignored.
+    let resp = h
+        .client
+        .post(h.server.url("/token"))
+        .json(&json!({
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "subject_token": root.token,
+            "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+            "actor": "helper2",
+            "authorization_details": [{"type": "attenuo_capabilities", "capabilities": [
+                {"server": "bank", "tool": "send_money",
+                 "limits": {"calls": 1, "distinct": {"arg": "recipient", "max": 1}}}
+            ]}],
+            "client_id": "helper2",
+            "client_secret": secret("helper2"),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "invalid_request", "{body}");
     // 31 is over what the child (and the root) have left.
     let (reason, limit) = denial(&h.pay(&child.token, 31).await);
     assert_eq!(reason, "budget_exhausted");
