@@ -56,7 +56,7 @@ fn sha256_hex(s: &str) -> String {
 
 struct Harness {
     server: Spawned,
-    _state: Arc<AppState>,
+    state: Arc<AppState>,
     _upstream_task: Spawned,
     client: reqwest::Client,
     _dir: tempfile::TempDir,
@@ -122,7 +122,7 @@ impl Harness {
         let server = spawn_router(router).await.unwrap();
         Self {
             server,
-            _state: state,
+            state,
             _upstream_task: upstream_task,
             client: reqwest::Client::new(),
             _dir: dir,
@@ -486,4 +486,63 @@ async fn authzen_and_dry_run_report_usage() {
         )
         .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// With a stated `budget`, the dry run reads no usage from the store either: `context.usage`
+/// is the request's `usage` (zero when absent), so a soft limit over it is decided on the
+/// stated run, and nothing is charged or audited.
+#[tokio::test]
+async fn dry_run_with_a_stated_budget_decides_soft_limits_on_the_stated_usage() {
+    let h = Harness::start().await;
+    let root = h.mint_root().await;
+    // The real run has paid once: the store says the next payment asks.
+    assert!(allowed(&h.pay(&root.token, "R1", 10).await));
+    let ask = |extra: Value| {
+        let h = &h;
+        let mut body = json!({
+            "token": root.token,
+            "subject": {"type": "agent", "id": ""},
+            "action": {"name": "send_money"},
+            "resource": {"type": "tool", "id": "bank/send_money",
+                         "properties": {"server": "bank"}},
+            "context": {"input": {"recipient": "R1", "amount": 10}},
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        async move {
+            let resp = h.admin_post("/admin/policies/evaluate", body).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            resp.json::<Value>().await.unwrap()
+        }
+    };
+    let audit_before = h.state.audit.len().unwrap();
+
+    let v = ask(json!({})).await;
+    assert_eq!(v["reason"], "approval_required", "{v}");
+    assert_eq!(v["usage"]["source"], "store");
+
+    // A stated run with no usage: the first payment of the run.
+    let v = ask(json!({"budget": {}})).await;
+    assert_eq!(v["decision"], "allow", "{v}");
+    assert_eq!(
+        v["usage"],
+        json!({"calls": 0, "amount": 0, "destination_seen": false,
+                                  "source": "request"})
+    );
+    assert_eq!(v["budget"]["source"], "request");
+
+    // The soft rule over `usage.calls` asks; the hard cap over `usage.amount` refuses.
+    let v = ask(json!({"budget": {}, "usage": {"calls": 1}})).await;
+    assert_eq!(v["reason"], "approval_required", "{v}");
+    assert_eq!(v["policy_ids"], json!(["ask_on_repeat_payment"]));
+    let v = ask(json!({"budget": {}, "usage": {"amount": 95}})).await;
+    assert_eq!(v["reason"], "policy_deny", "{v}");
+    assert_eq!(v["policy_ids"], json!(["run_spend_cap_100"]));
+    let v = ask(json!({"budget": {}, "usage": {"calls": 1}, "approval": {"by": "user"}})).await;
+    assert_eq!(v["decision"], "allow", "{v}");
+
+    // Read-only: the run still holds one payment, and nothing was audited.
+    assert_eq!(h.state.audit.len().unwrap(), audit_before);
+    assert_eq!(h.dry_run_usage(&root.token).await["calls"], 1);
 }
