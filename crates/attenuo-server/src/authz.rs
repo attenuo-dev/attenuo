@@ -2976,6 +2976,26 @@ mod run_lock_tests {
         fn binding(&self, l: &LeaseId) -> Result<Option<String>, AuditError> {
             self.inner.binding(l)
         }
+        fn record_subject(&self, l: &LeaseId, s: &str) -> Result<(), AuditError> {
+            self.inner.record_subject(l, s)
+        }
+        fn subject(&self, l: &LeaseId) -> Result<Option<String>, AuditError> {
+            self.inner.subject(l)
+        }
+        fn preview_selected(
+            &self,
+            s: &attenuo_audit::LeaseSelector,
+        ) -> Result<attenuo_audit::SelectorRevocation, AuditError> {
+            self.inner.preview_selected(s)
+        }
+        fn revoke_selected(
+            &self,
+            s: &attenuo_audit::LeaseSelector,
+            r: &str,
+            n: OffsetDateTime,
+        ) -> Result<attenuo_audit::SelectorRevocation, AuditError> {
+            self.inner.revoke_selected(s, r, n)
+        }
         fn check_all(&self, l: &[&LeaseId], n: OffsetDateTime) -> Result<LeaseStatus, AuditError> {
             self.inner.check_all(l, n)
         }

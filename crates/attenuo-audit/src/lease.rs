@@ -76,6 +76,35 @@ pub trait LeaseStore: Send + Sync {
     /// The binding recorded by [`bind`](Self::bind), or `None` (unknown or never bound).
     fn binding(&self, lease: &LeaseId) -> Result<Option<String>, AuditError>;
 
+    /// Record the originating user's subject (`sub` of the chain's originating-user block) of
+    /// the token `lease` was issued for, so [`LeaseSelector::Subject`] can find it. The issuer
+    /// records it for every lease it registers. Write-once, like [`bind`](Self::bind):
+    /// recording the same subject again is a no-op, a different one is
+    /// [`AuditError::BindingConflict`], and an unknown lease is [`AuditError::UnknownLease`].
+    /// Leases registered before the store kept subjects have none and are never matched by a
+    /// subject selector.
+    fn record_subject(&self, lease: &LeaseId, subject: &str) -> Result<(), AuditError>;
+
+    /// The subject recorded by [`record_subject`](Self::record_subject), or `None`.
+    fn subject(&self, lease: &LeaseId) -> Result<Option<String>, AuditError>;
+
+    /// What [`revoke_selected`](Self::revoke_selected) would do now, without writing:
+    /// `matched` is every unrevoked lease the selector names, `revoked` every unrevoked lease
+    /// a revocation would change (the matches and their descendants). Read in one
+    /// transaction.
+    fn preview_selected(&self, selector: &LeaseSelector) -> Result<SelectorRevocation, AuditError>;
+
+    /// Revoke every unrevoked lease `selector` names, each with the cascade of
+    /// [`revoke`](Self::revoke), in one transaction. Returns the matches and every lease that
+    /// changed from unrevoked to revoked. Matching nothing is not an error (an empty result):
+    /// a selector names a set, and an empty set is a valid answer during an incident.
+    fn revoke_selected(
+        &self,
+        selector: &LeaseSelector,
+        reason: &str,
+        now: OffsetDateTime,
+    ) -> Result<SelectorRevocation, AuditError>;
+
     /// Classify every lease. A lease that is both revoked and expired is reported as revoked.
     fn check_all(
         &self,
@@ -261,6 +290,49 @@ pub trait LeaseStore: Send + Sync {
     }
 }
 
+/// Which leases a selector revocation names (`POST /admin/leases/revoke`).
+///
+/// A selector matches leases that are not revoked. An expired lease matches too: while its
+/// token is valid, `POST /token/renew` can bring it back, so an incident revocation must not
+/// leave it out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LeaseSelector {
+    /// Every lease issued for this originating user (`sub`), as recorded by
+    /// [`LeaseStore::record_subject`]. The subject is matched under every issuer.
+    Subject(String),
+    /// Every lease of one delegation chain: the chain id is the lease of the chain's first
+    /// hop (`attenuo_core::chain_id_of`), so this is that lease and everything delegated
+    /// from it. A lease that has a parent is not a chain id and matches nothing. Found
+    /// through the parent links, so leases registered before subjects were recorded match.
+    Chain(LeaseId),
+}
+
+/// The result of [`LeaseStore::revoke_selected`] or [`LeaseStore::preview_selected`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SelectorRevocation {
+    /// The unrevoked leases the selector named, ordered by id.
+    pub matched: Vec<LeaseId>,
+    /// Every lease the revocation changed (or would change) from unrevoked to revoked: the
+    /// matches first, ordered by id, then the descendants revoked by the cascade that were not
+    /// matches themselves, ordered by id.
+    pub revoked: Vec<LeaseId>,
+}
+
+impl SelectorRevocation {
+    /// Build from the matches and the cascade's ids (in any order, duplicates allowed).
+    pub(crate) fn from_parts(
+        mut matched: Vec<LeaseId>,
+        cascade: impl IntoIterator<Item = LeaseId>,
+    ) -> Self {
+        matched.sort();
+        matched.dedup();
+        let first: BTreeSet<&LeaseId> = matched.iter().collect();
+        let rest: BTreeSet<LeaseId> = cascade.into_iter().filter(|l| !first.contains(l)).collect();
+        let revoked = matched.iter().cloned().chain(rest).collect();
+        Self { matched, revoked }
+    }
+}
+
 /// One logged charge: the counter and what was added to it.
 #[derive(Debug, Clone)]
 struct LoggedCharge {
@@ -398,6 +470,41 @@ pub(crate) fn ancestors_of(
     Ok(out)
 }
 
+/// Walk `lease` and everything delegated from it, breadth-first over the parent links, and
+/// return the unrevoked leases found. With `write`, mark them revoked with that reason and
+/// time. `visited` is shared across calls so one revocation of several leases walks each
+/// subtree once, and guards against a cycle a buggy caller might register; a real tree never
+/// has one.
+fn cascade(
+    rows: &mut BTreeMap<LeaseId, LeaseRow>,
+    lease: &LeaseId,
+    write: Option<(&str, OffsetDateTime)>,
+    visited: &mut BTreeSet<LeaseId>,
+) -> Vec<LeaseId> {
+    let mut changed = Vec::new();
+    let mut queue = VecDeque::from([lease.clone()]);
+    while let Some(id) = queue.pop_front() {
+        if !visited.insert(id.clone()) {
+            continue;
+        }
+        if let Some(row) = rows.get_mut(&id) {
+            if row.revoked_at.is_none() {
+                if let Some((reason, now)) = write {
+                    row.revoked_at = Some(now);
+                    row.revoke_reason = Some(reason.to_string());
+                }
+                changed.push(id.clone());
+            }
+        }
+        queue.extend(
+            rows.iter()
+                .filter(|(_, r)| r.parent.as_ref() == Some(&id))
+                .map(|(child, _)| child.clone()),
+        );
+    }
+    changed
+}
+
 /// Fold per-lease lookups into a [`LeaseStatus`].
 pub(crate) fn classify(
     leases: &[&LeaseId],
@@ -423,6 +530,8 @@ pub(crate) fn classify(
 pub struct MemoryLeaseStore {
     rows: Mutex<BTreeMap<LeaseId, LeaseRow>>,
     bindings: Mutex<BTreeMap<LeaseId, String>>,
+    /// The originating user's subject of each lease (`record_subject`).
+    subjects: Mutex<BTreeMap<LeaseId, String>>,
     /// Per run, the first label of each source.
     labels: Mutex<BTreeMap<LeaseId, BTreeMap<String, RunLabel>>>,
     /// Per run, the span index (ADR-0009 phase 2).
@@ -499,6 +608,64 @@ impl RunSpans {
 impl MemoryLeaseStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// After a revocation: a revoked run's span index ends with it (`crate::spans`), and so
+    /// does its run usage (`crate::budget`). Called with the rows lock held, so the lock order
+    /// is rows, spans, then rows, budgets.
+    fn end_runs(&self, visited: &BTreeSet<LeaseId>) -> Result<(), AuditError> {
+        let mut spans = self.spans.lock()?;
+        for id in visited {
+            spans.runs.remove(id);
+        }
+        drop(spans);
+        let ended = |k: &CounterKey| {
+            USAGE_KINDS.contains(&k.kind) && visited.contains(&LeaseId::new(&k.lease))
+        };
+        let mut b = self.budgets.lock()?;
+        b.counters.retain(|k, _| !ended(k));
+        for entry in b.log.values_mut() {
+            entry.charges.retain(|c| !ended(&c.counter));
+        }
+        Ok(())
+    }
+
+    /// [`LeaseStore::preview_selected`] and [`LeaseStore::revoke_selected`]: `write` carries
+    /// the reason and time of a real revocation, `None` for a preview.
+    fn selected(
+        &self,
+        selector: &LeaseSelector,
+        write: Option<(&str, OffsetDateTime)>,
+    ) -> Result<SelectorRevocation, AuditError> {
+        let mut rows = self.rows.lock()?;
+        let matched: Vec<LeaseId> = match selector {
+            LeaseSelector::Subject(subject) => {
+                let subjects = self.subjects.lock()?;
+                subjects
+                    .iter()
+                    .filter(|(_, s)| *s == subject)
+                    .map(|(id, _)| id)
+                    .filter(|id| rows.get(*id).is_some_and(|r| r.revoked_at.is_none()))
+                    .cloned()
+                    .collect()
+            }
+            LeaseSelector::Chain(root) => match rows.get(root) {
+                Some(r) if r.parent.is_none() => {
+                    let mut visited = BTreeSet::new();
+                    cascade(&mut rows, root, None, &mut visited)
+                }
+                _ => Vec::new(),
+            },
+        };
+        let mut visited = BTreeSet::new();
+        let mut changed = Vec::new();
+        for m in &matched {
+            changed.extend(cascade(&mut rows, m, write, &mut visited));
+        }
+        if write.is_some() {
+            self.end_runs(&visited)?;
+        }
+        Ok(SelectorRevocation::from_parts(matched, changed))
     }
 
     /// Copy of one lease's row, if known.
@@ -579,44 +746,10 @@ impl LeaseStore for MemoryLeaseStore {
         if !rows.contains_key(lease) {
             return Err(AuditError::UnknownLease(lease.0.clone()));
         }
-        // Breadth-first over the parent links. `visited` guards against a cycle a buggy caller
-        // might register; a real tree never has one.
-        let mut queue = VecDeque::from([lease.clone()]);
-        let mut visited = std::collections::BTreeSet::new();
-        let mut revoked = 0u64;
-        while let Some(id) = queue.pop_front() {
-            if !visited.insert(id.clone()) {
-                continue;
-            }
-            if let Some(row) = rows.get_mut(&id) {
-                if row.revoked_at.is_none() {
-                    row.revoked_at = Some(now);
-                    row.revoke_reason = Some(reason.to_string());
-                    revoked += 1;
-                }
-            }
-            queue.extend(
-                rows.iter()
-                    .filter(|(_, r)| r.parent.as_ref() == Some(&id))
-                    .map(|(child, _)| child.clone()),
-            );
-        }
-        // A revoked run's span index ends with it (`crate::spans`). Lock order: rows, spans.
-        let mut spans = self.spans.lock()?;
-        for id in &visited {
-            spans.runs.remove(id);
-        }
-        drop(spans);
-        // So does its run usage (`crate::budget`). Lock order: rows, budgets.
-        let ended = |k: &CounterKey| {
-            USAGE_KINDS.contains(&k.kind) && visited.contains(&LeaseId::new(&k.lease))
-        };
-        let mut b = self.budgets.lock()?;
-        b.counters.retain(|k, _| !ended(k));
-        for entry in b.log.values_mut() {
-            entry.charges.retain(|c| !ended(&c.counter));
-        }
-        Ok(revoked)
+        let mut visited = BTreeSet::new();
+        let changed = cascade(&mut rows, lease, Some((reason, now)), &mut visited);
+        self.end_runs(&visited)?;
+        Ok(changed.len() as u64)
     }
 
     fn renew(
@@ -661,6 +794,39 @@ impl LeaseStore for MemoryLeaseStore {
 
     fn binding(&self, lease: &LeaseId) -> Result<Option<String>, AuditError> {
         Ok(self.bindings.lock()?.get(lease).cloned())
+    }
+
+    fn record_subject(&self, lease: &LeaseId, subject: &str) -> Result<(), AuditError> {
+        let rows = self.rows.lock()?;
+        if !rows.contains_key(lease) {
+            return Err(AuditError::UnknownLease(lease.0.clone()));
+        }
+        let mut subjects = self.subjects.lock()?;
+        match subjects.get(lease) {
+            Some(s) if s == subject => Ok(()),
+            Some(_) => Err(AuditError::BindingConflict(lease.0.clone())),
+            None => {
+                subjects.insert(lease.clone(), subject.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    fn subject(&self, lease: &LeaseId) -> Result<Option<String>, AuditError> {
+        Ok(self.subjects.lock()?.get(lease).cloned())
+    }
+
+    fn preview_selected(&self, selector: &LeaseSelector) -> Result<SelectorRevocation, AuditError> {
+        self.selected(selector, None)
+    }
+
+    fn revoke_selected(
+        &self,
+        selector: &LeaseSelector,
+        reason: &str,
+        now: OffsetDateTime,
+    ) -> Result<SelectorRevocation, AuditError> {
+        self.selected(selector, Some((reason, now)))
     }
 
     fn check_all(
