@@ -484,6 +484,44 @@ pub fn render_refund(v: &Value) -> String {
     )
 }
 
+/// `lease revoke --user/--chain-id [--preview]`: the selector, the counts, then one line per
+/// revoked lease (the matches first, then the cascade), and the audit record.
+pub fn render_selector_revocation(v: &Value) -> String {
+    let preview = v["preview"].as_bool().unwrap_or(false);
+    let selector = match v["selector"].as_object().and_then(|o| o.iter().next()) {
+        Some((k, val)) => format!("{k} {}", val.as_str().unwrap_or("-")),
+        None => "-".to_string(),
+    };
+    let mut out = String::new();
+    if preview {
+        out.push_str("preview: nothing was changed\n");
+    }
+    out.push_str(&format!("selector  {selector}\n"));
+    out.push_str(&format!(
+        "matched   {} lease(s)\n",
+        num(&v["matched_count"])
+    ));
+    let verb = if preview { "would revoke" } else { "revoked" };
+    out.push_str(&format!("{verb} {} lease(s)\n", num(&v["revoked_count"])));
+    for id in v["revoked"].as_array().into_iter().flatten() {
+        out.push_str(&format!("  {}\n", id.as_str().unwrap_or("-")));
+    }
+    if v["truncated"].as_bool().unwrap_or(false) {
+        out.push_str("  (list cut short; the counts are complete, see --json)\n");
+    }
+    if !preview {
+        out.push_str(&format!("reason    {}\n", s(v, "reason")));
+        let audit = match v["audit_id"].as_str() {
+            Some(id) => id.to_string(),
+            None => "- (the revocation stands, but its audit record was not written; see the \
+                     server log)"
+                .to_string(),
+        };
+        out.push_str(&format!("audit     {audit}\n"));
+    }
+    out
+}
+
 /// `approval list`: one line per approval, newest first.
 pub fn render_approvals(v: &Value) -> String {
     let list = v["approvals"].as_array().cloned().unwrap_or_default();
@@ -1003,6 +1041,28 @@ A  coder  active, expires 2026-10-23T10:00:00Z  issued #3
 would revoke 4 lease(s) if revoked now
 ";
         assert_eq!(render_lease_tree(&v), expected);
+    }
+
+    #[test]
+    fn selector_revocation_lists_the_revoked_leases() {
+        let v = json!({"selector": {"user": "alice"}, "preview": false,
+                       "matched": ["L1"], "revoked": ["L1", "L2"], "matched_count": 1,
+                       "revoked_count": 2, "truncated": false, "reason": "stolen",
+                       "audit_id": "A9"});
+        assert_eq!(
+            render_selector_revocation(&v),
+            "selector  user alice\nmatched   1 lease(s)\nrevoked 2 lease(s)\n  L1\n  L2\n\
+             reason    stolen\naudit     A9\n"
+        );
+        let p = json!({"selector": {"chain_id": "L0"}, "preview": true, "matched": [],
+                       "revoked": [], "matched_count": 0, "revoked_count": 0,
+                       "truncated": true, "reason": null, "audit_id": null});
+        let text = render_selector_revocation(&p);
+        assert!(text.starts_with("preview: nothing was changed\n"), "{text}");
+        assert!(text.contains("selector  chain_id L0\n"), "{text}");
+        assert!(text.contains("would revoke 0 lease(s)\n"), "{text}");
+        assert!(text.contains("list cut short"), "{text}");
+        assert!(!text.contains("audit"), "{text}");
     }
 
     #[test]
