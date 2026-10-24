@@ -50,10 +50,10 @@ pub use shipped::{
     ShippedLine, ShippedMismatch, SHIPPED_FORMAT,
 };
 pub use spans::{SpanHit, MAX_SPANS_PER_RUN};
+pub use sqlite::{
+    Durability, SqliteAudit, SqliteLeaseStore, WalCheckpoint, CHECKPOINT_PRESYNC_LEAD,
+    DEFAULT_WAL_CHECKPOINT_INTERVAL, WAL_CHECKPOINT_COMMITS, WAL_WRITER_BACKSTOP_FRAMES,
+};
 #[cfg(feature = "testing")]
 #[doc(hidden)]
-pub use sqlite::WalTimings;
-pub use sqlite::{
-    Durability, SqliteAudit, SqliteLeaseStore, WalCheckpoint, DEFAULT_WAL_CHECKPOINT_INTERVAL,
-    WAL_CHECKPOINT_COMMITS, WAL_WRITER_BACKSTOP_FRAMES,
-};
+pub use sqlite::{WalRound, WalTimings};

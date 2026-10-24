@@ -574,7 +574,7 @@ Readings:
 - **In process, concurrent tails fall 2.5 to 4 times**: p99 at 4 and 8 threads went from 13 to 64 ms to 5 to 17 ms, and throughput rose 1.3 to 1.9 times. One thread pays nothing for the gate: five more interleaved one-thread `calls` rounds of 3,000 calls gave 3,895 to 6,209 calls/s before and 5,175 to 6,970 after (p50 123 to 155 against 119 to 146 us); the 4,167 in the table is one slow round. With a `calls` charge the p50 rose (336 to 845 us at 4 threads): calls now queue in turn on the gate instead of a few winning outright while others sleep, so the median waits a little longer and the tail much less.
 - **End to end, the lease check stops waiting**: under 4 and 8 clients its mean fell from 0.6 to 7 ms to under 0.17 ms, because before the lease connection's lock was held by a write sleeping in the busy handler. With a `calls` limit, 4 clients get about 1.3 times the requests per second (medians of the four values 884 against 1,174) and a lower p99; at 8 clients about 1.14 times (922 against 1,050) and p99 is unchanged (32 to 42 ms either way). On this host 8 clients plus the server saturate the 4 vCPUs, and the remaining tail is scheduling, not SQLite.
 - **With a `sum` limit end to end the change is within noise.** Those calls are bound by the one `fsync` per call that the durability rule requires, now paid inside the audit append (whose mean rose as the lease side stopped sleeping). The after cell at 4 clients with 104 req/s and a 204 ms p99 fell in a load spike: its policy stage, which does no I/O, averaged 7.8 ms against 0.4 to 1 ms in the other cells.
-- **The single-client outliers are not the busy handler.** It never ran at one thread, before or after. The 4 to 8 ms single-client outliers stay open.
+- **The single-client outliers are not the busy handler.** It never ran at one thread, before or after. The 4 to 8 ms single-client outliers stay open. Measured since: see [Single-client outliers](#single-client-outliers-2026-10-24).
 
 ### Run usage write (2026-10-24)
 
@@ -608,6 +608,45 @@ Readings:
 - **At `durability = "full"` it costs much more**: every commit syncs, so the usage charge is about 385 us in process and the tracked decision 1.2 to 1.45 ms against about 0.5 ms elided. This is the case where elision matters most. End to end at `full` was not measured.
 - In process on the memory store the two cells overlap (142 to 173 against 153 to 170 us); the first elided run, measured right after the tracked one, was the slowest. On the file store the tracked cell's intervals are wide (260 to 374 us), as the `decide_limited` cells were in [the `sum` follow-up](#sum-charge-follow-up-2026-10-24).
 
+### Single-client outliers (2026-10-24)
+
+Branch `perf/single-client-outliers`, main `d27c891`. One client against the file store sees about 1 call in 100 take 3 ms or more, with the median near 1.3 ms; the section above showed that SQLite's busy handler is not involved. Results, raw output, the probe sources and the rerun commands: [`bench/2026-10-24-vm-single-client-outliers.md`](bench/2026-10-24-vm-single-client-outliers.md).
+
+**Method.** Four measurements on the shared 4-vCPU container (load average 0.5 to 5.5): raw host probes in C (thread wake-up after a 500 us sleep, `fdatasync` of a small file, appends next to a sync of the same file); an in-process probe that makes one call's store operations in a loop and times each append (`crates/attenuo-audit/tests/single_client_outliers.rs`), with the background checkpointer's rounds and locked passes now recorded by the `testing` feature so each slow append can be matched to them; `attenuo-bench hot-path --configs baseline`, which now counts requests over 3, 5 and 10 ms at the client and per server stage, and takes `--audit-set key=value` so `checkpoint_every=0` runs on the same binary; and `strace` of the probe. Variants interleaved, two passes, the second reversed.
+
+**What the slow calls are.**
+
+| Source | How often, one client | Before | After | In our control |
+|---|---|---|---|---|
+| Signed audit checkpoint: the commit syncs at `FULL` (SR-50), writing every WAL page since the WAL was last synced, up to 256 commits | 1 per 1,000 entries (1 call in 500) | 13 to 16 ms p50, up to 25 ms | 3.4 to 3.9 ms p50, up to 9 ms | yes; changed |
+| The checkpointer's locked pass syncs the database file, which holds every page the unlocked passes copied but did not sync | 1 per WAL restart (about 1,800 commits in the probe) | appends held 10 to 23 ms (median) | 3.0 to 3.4 ms | yes; changed |
+| Scheduling on the shared host (thread wake-ups, blocking pool, the client) | 0.7 to 0.9 % of calls over 3 ms at load 1.5 to 2; 2 to 3.6 % at load 3 to 4.7 | 3 to 10 ms | unchanged | no |
+| Appends that extend the WAL while the checkpointer syncs it | only while the WAL grows after an idle `TRUNCATE` | up to 16 ms (raw probe) | unchanged | not changed |
+| Disk `fsync` tail | quiet: p99.9 0.4 to 1.1 ms; during another build: p50 4 ms, p99 8 ms | magnifies the first two | | no |
+
+The in-memory store had 0 to 1 append over 3 ms in 12,800, and the file store with the checkpointer parked had none, so allocation, hashing and the commit path itself are not the cause. The background `PASSIVE` pass's own sync takes 17 to 31 ms (strace), but appends do not wait for it while they overwrite the WAL, which is the server's steady state (its WAL stayed at about 78 MB through a 10 s cell). The raw probe shows the exception: a write that extends a file being synced stalls (8 and 4 writes in 9,000 over 3 ms, up to 16 ms), and an overwrite does not (none).
+
+**The two changes.** Neither changes what a commit syncs or at which `synchronous` level; each adds one sync on the checkpointer's thread, off the request path.
+
+1. Before its locked pass, the checkpointer `fsync`s the database file from a descriptor of its own. The locked `PASSIVE` then has only the pages it copies itself to sync while appends wait.
+2. When a commit brings the head within `CHECKPOINT_PRESYNC_LEAD` (32) entries of the next signed checkpoint, the writer asks the checkpointer (a new message on its existing channel) to `fsync` the WAL file. The commit that writes the checkpoint still runs at `FULL`, with less left to write. A lead of 8 left that sync running when the checkpoint committed; 64 and 128 left more pages behind (signing append p50 5.4 to 12.3 ms against 3.4 to 4.4 ms at 32). Stores at `durability = "full"`, in memory or without the background checkpointer are unchanged.
+
+**End to end, before and after** (one client, three runs of 10 s per invocation, pooled; load 1.5 to 1.8 for the first pass, 3.0 to 4.7 for the second):
+
+| Variant | calls over 3 ms | over 5 ms | over 10 ms | decision appends over 5 / 10 ms, per cell |
+|---|---|---|---|---|
+| main, pass 1 | 0.72 to 0.92 % | 0.39 to 0.49 % | 0.27 to 0.29 % | 52 to 54 / 43 to 45 |
+| this branch, pass 1 | 0.78 to 1.03 % | 0.35 to 0.38 % | 0.08 to 0.09 % | 13 to 14 / 4 to 5 |
+| main with `checkpoint_every=0`, pass 1 | 0.65 to 0.91 % | 0.26 to 0.34 % | 0.14 to 0.15 % | 12 to 15 / 10 to 15 |
+| main, pass 2 | 1.93 to 2.15 % | 0.57 to 0.70 % | 0.26 to 0.29 % | 45 to 51 / 33 to 42 |
+| this branch, pass 2 | 2.17 to 2.72 % | 0.85 to 0.88 % | 0.14 % | 18 to 25 / 9 to 11 |
+
+Readings:
+
+- **The outliers over 10 ms were storage, and they are about a third of what they were**: client calls over 10 ms fall from 0.27 to 0.29 % to 0.08 to 0.09 % at load below 2, lower than main without signed checkpoints, because the locked pass shrank too. The median and the p99 are unchanged within noise.
+- **The 3 to 8 ms outliers are mostly the host, and stay.** The share over 3 ms is the same for all three variants at load below 2 and doubles to triples at load 3 to 4.7; the growth is in `blocking_pool`, `response` and the time outside the handler, stages that wait for a thread to be scheduled. The two storage events now land at 3 to 5 ms, so they still count at 3 ms. On this shared VM that floor is outside the server's control; a quiet machine was not available to measure it.
+- **What remains of the storage tail**: the signed checkpoint still syncs on the request path (3 to 5 ms here, once per 1,000 entries), as SR-50 requires; moving that sync off the path would change the commit's level, which this branch does not do. The locked pass still holds appends about 3 ms for its own two syncs. The first commit after an idle `TRUNCATE` grows the WAL from zero, which the raw probe shows can stall next to a sync (and its first sync after freeing blocks cost 11 to 15 ms on this `discard`-mounted ext4); that path was not measured in the server.
+
 ### How to run
 
 ```
@@ -628,6 +667,8 @@ cargo test --release -p attenuo-audit --test write_contention -- --ignored --noc
 attenuo-bench hot-path --configs limits_calls,limits --runs 1 --clients 4                # run limits under concurrent clients
 attenuo-bench hot-path --runs 5 --configs baseline,usage                                 # the run-usage write (tracked against elided)
 cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3 'decide_destructive_|charge_.*/usage'  # the same in process
+cargo test --release -p attenuo-audit --test single_client_outliers -- --ignored --nocapture  # one client's slow appends by cause (PROBE_CONFIGS=...)
+attenuo-bench hot-path --configs baseline --runs 3 --audit-set checkpoint_every=0          # counts over 3, 5 and 10 ms per stage; [audit] keys per run
 ```
 
 `attenuo-bench --print-config DIR` writes the server config and policy it expects, for pointing the harness at an already running server (`--attenuo-url`, `--upstream-url`, and `--metrics-url` for the stage table). Every answer is checked: a denial counts only as the proxy's `-32003` with the expected reason code and a decision id listed in `X-Attenuo-Decision-Id`, so an `audit_error` denial, a `too_many_sessions` refusal or a `5xx` stops the run after that cell. A one-second smoke run is part of `cargo test --workspace` (`crates/attenuo-bench/tests/smoke.rs`). There is no CI job for the full matrix: it needs a release build and minutes of load, and numbers from shared runners could not be compared.

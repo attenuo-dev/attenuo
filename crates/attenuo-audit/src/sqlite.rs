@@ -760,6 +760,9 @@ fn wal_checkpoint(conn: &Connection, mode: &str) -> Result<WalCheckpoint, AuditE
 enum WalMsg {
     /// Enough commits since the last checkpoint: run one now.
     Kick,
+    /// A signed audit checkpoint is near: sync the WAL file now, so that the commit writing
+    /// it, which syncs at `FULL`, finds little left to write (see [`CHECKPOINT_PRESYNC_LEAD`]).
+    SyncWal,
     /// The store is closing: run the final checkpoint and exit.
     Stop,
 }
@@ -778,9 +781,11 @@ enum WalMsg {
 ///    syncs; this is where nearly all of the work happens.
 /// 2. If the WAL has grown past [`WAL_RESTART_FRAMES`], more unlocked passes, each copying
 ///    what was committed during the one before, until few frames arrive during a pass (at
-///    most [`WAL_CATCH_UP_PASSES`]), then one more `PASSIVE` while holding the store's
-///    connection lock, which pauses appends in this process for as long as it takes to copy
-///    that remainder and sync. SQLite only starts a WAL over from its
+///    most [`WAL_CATCH_UP_PASSES`]), then an `fsync` of the database file from a descriptor of
+///    this thread's own (the unlocked passes, not having finished, copied pages they did not
+///    sync), then one more `PASSIVE` while holding the store's connection lock, which pauses
+///    appends in this process for as long as it takes to copy that remainder and sync.
+///    SQLite only starts a WAL over from its
 ///    beginning when a write finds every frame already copied, which under continuous load
 ///    step 1 alone never achieves (it copies up to where the WAL ended when it started), so
 ///    without this the WAL file would grow for as long as the load lasts.
@@ -809,6 +814,8 @@ struct WalShared {
     store: Arc<Mutex<Connection>>,
     activity: Arc<Activity>,
     interval: Duration,
+    /// The database file.
+    path: PathBuf,
 }
 
 impl WalCheckpointer {
@@ -817,15 +824,17 @@ impl WalCheckpointer {
         store: Arc<Mutex<Connection>>,
         interval: Duration,
         activity: Arc<Activity>,
-        msgs: mpsc::SyncSender<WalMsg>,
-        rx: mpsc::Receiver<WalMsg>,
+        channel: (mpsc::SyncSender<WalMsg>, mpsc::Receiver<WalMsg>),
+        path: PathBuf,
     ) -> Result<Self, AuditError> {
+        let (msgs, rx) = channel;
         let conn = Arc::new(Mutex::new(conn));
         let shared = WalShared {
             conn: Arc::clone(&conn),
             store,
             activity: Arc::clone(&activity),
             interval,
+            path,
         };
         let thread = std::thread::Builder::new()
             .name("attenuo-audit-wal".into())
@@ -862,6 +871,19 @@ fn wal_loop(shared: &WalShared, msgs: &mpsc::Receiver<WalMsg>) {
     loop {
         match msgs.recv_timeout(shared.interval) {
             Ok(WalMsg::Kick) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(WalMsg::SyncWal) => {
+                let mut wal = shared.path.clone().into_os_string();
+                wal.push("-wal");
+                // Best effort: an extra sync, which no commit relies on.
+                let _synced = sync_file_data(Path::new(&wal));
+                #[cfg(any(test, feature = "testing"))]
+                if _synced.is_ok() {
+                    if let Ok(mut t) = shared.activity.timings.lock() {
+                        t.wal_presyncs += 1;
+                    }
+                }
+                continue;
+            }
             Ok(WalMsg::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // Final checkpoint. The writer thread has stopped (`SqliteAudit`'s drop joins
                 // it first), so waiting for the write lock is fine.
@@ -879,6 +901,49 @@ fn wal_loop(shared: &WalShared, msgs: &mpsc::Receiver<WalMsg>) {
     }
 }
 
+/// `fsync` the file at `path` (the database file or its WAL) from a descriptor of our own:
+/// it writes out every dirty page of that file, whichever connection wrote it. Used before
+/// the locked pass of a checkpoint round (see [`wal_round`]) and before a signed audit
+/// checkpoint (see [`CHECKPOINT_PRESYNC_LEAD`]).
+fn sync_file_data(path: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?
+        .sync_data()
+}
+
+/// [`CHECKPOINT_PRESYNC_LEAD`], or what a test or measurement set instead (see
+/// `SqliteAudit::set_checkpoint_presync_lead`; 0 turns the WAL sync off).
+fn presync_lead(activity: &Activity) -> u64 {
+    #[cfg(any(test, feature = "testing"))]
+    {
+        match activity.presync_lead.load(Ordering::Relaxed) {
+            0 => CHECKPOINT_PRESYNC_LEAD,
+            set => set - 1,
+        }
+    }
+    #[cfg(not(any(test, feature = "testing")))]
+    {
+        let _ = activity;
+        CHECKPOINT_PRESYNC_LEAD
+    }
+}
+
+/// Whether [`wal_round`] syncs the database file before its locked pass: always, except in
+/// tests and measurements that turn it off (see `SqliteAudit::set_wal_presync`).
+fn presync_enabled(activity: &Activity) -> bool {
+    #[cfg(any(test, feature = "testing"))]
+    {
+        !activity.no_presync.load(Ordering::Relaxed)
+    }
+    #[cfg(not(any(test, feature = "testing")))]
+    {
+        let _ = activity;
+        true
+    }
+}
+
 /// One `PRAGMA wal_checkpoint` under the store's checkpoint gate (see [`WalCheckpointer`]).
 fn gated_checkpoint(
     activity: &Activity,
@@ -892,10 +957,18 @@ fn gated_checkpoint(
 /// One round: see [`WalCheckpointer`].
 fn wal_round(shared: &WalShared) -> Result<(), AuditError> {
     let conn = shared.conn.lock()?;
+    #[cfg(any(test, feature = "testing"))]
+    let round_started = std::time::Instant::now();
     let activity = &shared.activity;
     activity.since_wal_checkpoint.store(0, Ordering::Release);
     let committed_before = activity.committed.load(Ordering::Acquire);
     let mut done = gated_checkpoint(activity, &conn, "PASSIVE")?;
+    #[cfg(any(test, feature = "testing"))]
+    let first = done;
+    #[cfg(any(test, feature = "testing"))]
+    let mut locked = None;
+    #[cfg(any(test, feature = "testing"))]
+    let mut presynced = false;
     if done.wal_frames >= WAL_RESTART_FRAMES {
         // Catch up without the lock first: each pass copies what was committed during the
         // previous one, so the frames left for the locked pass (and the pause) stay small.
@@ -909,24 +982,55 @@ fn wal_round(shared: &WalShared) -> Result<(), AuditError> {
         }
     }
     if done.wal_frames >= WAL_RESTART_FRAMES {
+        // The unlocked passes copied nearly everything into the database file, but a
+        // `PASSIVE` that does not finish leaves those pages unsynced, and the locked pass,
+        // which does finish, would sync them all with appends paused (10 to 23 ms at the
+        // median on the dev VM for one client). Sync them here first, so the locked pass syncs only what it
+        // copies itself. An extra sync: no commit becomes less durable.
+        if presync_enabled(activity) {
+            let synced = sync_file_data(&shared.path);
+            if let Err(e) = &synced {
+                eprintln!("attenuo-audit: syncing the database file failed: {e}");
+            }
+            #[cfg(any(test, feature = "testing"))]
+            {
+                presynced = synced.is_ok();
+            }
+        }
         let _store = shared.store.lock()?;
         #[cfg(any(test, feature = "testing"))]
         let started = std::time::Instant::now();
         done = gated_checkpoint(activity, &conn, "PASSIVE")?;
         #[cfg(any(test, feature = "testing"))]
-        activity
-            .timings
-            .lock()?
-            .locked_passes
-            .push((started.elapsed(), done.wal_frames));
+        {
+            activity
+                .timings
+                .lock()?
+                .locked_passes
+                .push((started.elapsed(), done.wal_frames));
+            locked = Some((started, started.elapsed()));
+        }
     }
     let idle = activity.pending.load(Ordering::Acquire) == 0
         && activity.committed.load(Ordering::Acquire) == committed_before;
-    if done.complete() && done.wal_frames > 0 && idle {
+    #[cfg_attr(not(any(test, feature = "testing")), allow(unused_variables))]
+    let truncated = if done.complete() && done.wal_frames > 0 && idle {
         // Busy timeout zero: if an append starts meanwhile, give up rather than make it
         // wait; the next round tries again.
-        let _ = gated_checkpoint(activity, &conn, "TRUNCATE");
-    }
+        gated_checkpoint(activity, &conn, "TRUNCATE").is_ok_and(|t| t.complete())
+    } else {
+        false
+    };
+    #[cfg(any(test, feature = "testing"))]
+    activity.timings.lock()?.rounds.push(WalRound {
+        started: round_started,
+        took: round_started.elapsed(),
+        first,
+        last: done,
+        truncated,
+        locked,
+        presynced,
+    });
     if !done.complete() {
         // Frames were left behind (a reader or the writer was in the way). Do not wait a
         // whole interval, or another WAL_CHECKPOINT_COMMITS commits, to try again: the very
@@ -936,6 +1040,28 @@ fn wal_round(shared: &WalShared) -> Result<(), AuditError> {
             .store(WAL_CHECKPOINT_COMMITS - 1, Ordering::Release);
     }
     Ok(())
+}
+
+/// How many entries before a signed audit checkpoint the writer asks the background WAL
+/// checkpointer to sync the WAL file. The commit that writes the checkpoint syncs at `FULL`
+/// (SR-50), and at `durability = "normal"` that sync writes out every WAL page committed
+/// since the WAL was last synced, up to [`WAL_CHECKPOINT_COMMITS`] commits of them (about
+/// 14 ms for one client on the dev VM). Syncing the WAL off the request path a little
+/// earlier leaves that commit only the pages of the last few entries. Nothing commits at a
+/// different level: this is one more sync, on another thread.
+pub const CHECKPOINT_PRESYNC_LEAD: u64 = 32;
+
+/// Whether the batch of entries `first..=last` brings the head to [`CHECKPOINT_PRESYNC_LEAD`]
+/// entries (or fewer) before the next multiple of `every`, having been further from it
+/// before. Never for a batch that writes the checkpoint itself.
+fn nears_checkpoint(first: u64, last: u64, every: u64, lead: u64) -> bool {
+    if every == 0 || lead == 0 || first == 0 || first > last {
+        return false;
+    }
+    let before = first - 1;
+    let next = (before / every + 1) * every;
+    let point = next.saturating_sub(lead.min(every / 2));
+    before < point && point <= last && last < next
 }
 
 type CheckpointHook = Arc<dyn Fn(&Checkpoint) + Send + Sync>;
@@ -981,6 +1107,9 @@ pub const MAX_BATCH: usize = 256;
 /// out that it crosses a checkpoint after it has read the head inside its transaction, and
 /// SQLite cannot change `synchronous` inside a transaction, so such a batch rolls back
 /// (nothing was written yet) and runs again at `FULL`: one extra transaction per checkpoint.
+/// With the background checkpointer running, the WAL is also synced off the request path
+/// [`CHECKPOINT_PRESYNC_LEAD`] entries before each checkpoint, so that commit's sync has
+/// only the last few entries' pages to write.
 ///
 /// Reads, checkpoints and [`with_connection`](Self::with_connection) take the same lock and
 /// see only committed batches.
@@ -1035,6 +1164,12 @@ struct Activity {
     /// Tests and measurements: how long each pause the checkpointers impose lasted.
     #[cfg(any(test, feature = "testing"))]
     timings: Mutex<WalTimings>,
+    /// Tests and measurements: skip the database-file sync before the locked pass.
+    #[cfg(any(test, feature = "testing"))]
+    no_presync: std::sync::atomic::AtomicBool,
+    /// Tests and measurements: 0 for [`CHECKPOINT_PRESYNC_LEAD`], else the lead plus one.
+    #[cfg(any(test, feature = "testing"))]
+    presync_lead: AtomicU64,
 }
 
 /// Tests and measurements: the pauses the WAL checkpointers imposed on appends, as returned
@@ -1048,6 +1183,31 @@ pub struct WalTimings {
     /// Each locked pass of the background checkpointer: how long it held the store lock and
     /// the WAL frames its `PASSIVE` reported.
     pub locked_passes: Vec<(Duration, i64)>,
+    /// Each round of the background checkpointer.
+    pub rounds: Vec<WalRound>,
+    /// WAL syncs the checkpointer ran ahead of a signed audit checkpoint.
+    pub wal_presyncs: usize,
+}
+
+/// Tests and measurements: one round of the background WAL checkpointer.
+#[cfg(any(test, feature = "testing"))]
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct WalRound {
+    /// When the round started.
+    pub started: std::time::Instant,
+    /// How long it ran.
+    pub took: Duration,
+    /// What its first `PASSIVE` reported.
+    pub first: WalCheckpoint,
+    /// What its last `PASSIVE` reported.
+    pub last: WalCheckpoint,
+    /// It ran the idle `TRUNCATE`, and that succeeded.
+    pub truncated: bool,
+    /// When its locked pass started (store lock taken) and how long it held the lock.
+    pub locked: Option<(std::time::Instant, Duration)>,
+    /// It synced the database file before its locked pass.
+    pub presynced: bool,
 }
 
 impl Drop for SqliteAudit {
@@ -1308,6 +1468,17 @@ impl Inner {
         let n = entries.len() as u64;
         let activity = &self.activity;
         activity.committed.fetch_add(n, Ordering::AcqRel);
+        if let (Some(kick), Some(c), Some(first), true) = (
+            activity.wal_kick.get(),
+            self.checkpointing.as_ref(),
+            entries.first(),
+            self.relaxed_sync.is_some(),
+        ) {
+            if nears_checkpoint(first.seq, seq, c.every, presync_lead(activity)) {
+                // Full means a round or a sync is already waiting; a round syncs the WAL too.
+                let _ = kick.try_send(WalMsg::SyncWal);
+            }
+        }
         if let Some(kick) = activity.wal_kick.get() {
             if i64::from(WAL_PAGES.replace(0)) >= WAL_WRITER_BACKSTOP_FRAMES {
                 self.wal_backstop(conn);
@@ -1496,6 +1667,7 @@ impl SqliteAudit {
             return Ok(self);
         };
         let conn = Connection::open(&path)?;
+        let file = self.inner.file.clone().unwrap_or_else(|| path.clone());
         // Checkpoints sync the WAL and the database file as this setting says.
         conn.pragma_update(None, "synchronous", synchronous)?;
         conn.busy_timeout(Duration::ZERO)?;
@@ -1513,8 +1685,8 @@ impl SqliteAudit {
             Arc::clone(&self.inner.conn),
             interval,
             activity,
-            kick,
-            msgs,
+            (kick, msgs),
+            file,
         )?);
         Ok(self)
     }
@@ -3169,6 +3341,23 @@ impl SqliteAudit {
     pub fn wal_timings(&self) -> WalTimings {
         self.inner.activity.timings.lock().unwrap().clone()
     }
+
+    /// Tests and measurements: whether the background checkpointer syncs the database file
+    /// before its locked pass (on by default), for an A/B on one build.
+    #[doc(hidden)]
+    pub fn set_wal_presync(&self, on: bool) {
+        self.inner.activity.no_presync.store(!on, Ordering::Relaxed);
+    }
+
+    /// Tests and measurements: how many entries before a signed checkpoint the WAL is synced
+    /// off the request path ([`CHECKPOINT_PRESYNC_LEAD`] by default; 0 turns it off).
+    #[doc(hidden)]
+    pub fn set_checkpoint_presync_lead(&self, lead: u64) {
+        self.inner
+            .activity
+            .presync_lead
+            .store(lead.saturating_add(1), Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -4141,5 +4330,29 @@ mod tests {
         assert_eq!(finished, ["append", "renew"]);
         writers.into_iter().for_each(|w| w.join().unwrap());
         assert_eq!(audit.head().unwrap().unwrap().seq, 2);
+    }
+
+    /// The WAL sync ahead of a signed checkpoint is asked for once per checkpoint, by the
+    /// commit that brings the head within the lead of it, and never by the commit that writes
+    /// the checkpoint itself.
+    #[test]
+    fn nears_checkpoint_fires_once_per_checkpoint() {
+        // One entry per commit, every 1,000, lead 32: only the commit of entry 968.
+        let fired: Vec<u64> = (1..=3000)
+            .filter(|&seq| nears_checkpoint(seq, seq, 1000, 32))
+            .collect();
+        assert_eq!(fired, [968, 1968, 2968]);
+        // A batch that steps over the point fires; one that goes past the checkpoint does
+        // not (it writes the checkpoint and syncs at FULL anyway).
+        assert!(nears_checkpoint(960, 975, 1000, 32));
+        assert!(!nears_checkpoint(960, 1000, 1000, 32));
+        assert!(!nears_checkpoint(969, 990, 1000, 32));
+        // The lead is capped at half the interval; off when the lead or `every` is 0.
+        let fired: Vec<u64> = (1..=20)
+            .filter(|&seq| nears_checkpoint(seq, seq, 10, 32))
+            .collect();
+        assert_eq!(fired, [5, 15]);
+        assert!(!nears_checkpoint(968, 968, 1000, 0));
+        assert!(!nears_checkpoint(968, 968, 0, 32));
     }
 }
