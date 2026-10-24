@@ -116,9 +116,13 @@
 //!   are emitted as leading SSE `message` events on the same stream.
 //! - The proxy does not add credentials for the upstream; the bearer token it receives is
 //!   attenuo's, not the upstream's, and is never forwarded.
-//! - A server-to-client stream (the `GET` SSE channel, including a resumed one) is not
-//!   inspected beyond being relayed event by event and re-checked; the client's replies to
-//!   server requests are forwarded after a lease check, not authorized.
+//! - On a server-to-client stream (the `GET` SSE channel, including one resumed with
+//!   `Last-Event-ID`) the proxy did not see the requests, so a response there whose `result`
+//!   holds a list array is filtered by its shape ([`filter::list_kinds_by_shape`]), answers to
+//!   allowed calls are labelled ([`label`]), and everything else is relayed event by event and
+//!   re-checked. A `GET` answered with anything but SSE is relayed as is (MCP allows only SSE
+//!   or `405`). The client's replies to server requests are forwarded after a lease check, not
+//!   authorized.
 //! - Authentication is performed per HTTP request; there is no caching of resolved chains.
 //!
 //! [`DelegationChain`]: attenuo_core::DelegationChain

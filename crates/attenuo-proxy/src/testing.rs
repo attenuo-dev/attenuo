@@ -17,6 +17,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use time::{Duration, OffsetDateTime};
 
@@ -72,7 +73,12 @@ pub struct RecordedCall {
 /// A minimal Streamable HTTP MCP server: `initialize`, `tools/list`, `tools/call`,
 /// `resources/list`, `resources/templates/list`, `prompts/list` (all optionally paginated),
 /// notifications, batches. Mounted at `POST /mcp`; `DELETE /mcp` ends a session and is recorded
-/// ([`FakeMcpServer::deleted_sessions`]).
+/// ([`FakeMcpServer::deleted_sessions`]). `GET /mcp` answers `405`, as a server without a listen
+/// stream does, unless [`FakeMcpServer::with_listen_stream`] or [`FakeMcpServer::with_replay`]
+/// turns it on: then it opens a listen stream that stays open, starting with a
+/// `notifications/message` event, and a `GET` that resumes with `Last-Event-ID` first replays
+/// the messages given to `with_replay`, like a server that buffers the events of a broken
+/// stream.
 #[derive(Clone)]
 pub struct FakeMcpServer {
     tools: Vec<Value>,
@@ -99,6 +105,12 @@ pub struct FakeMcpServer {
     deleted: Arc<Mutex<Vec<String>>>,
     /// `tools/call` names answered with a JSON-RPC error instead of a result.
     failing_tools: Vec<String>,
+    /// Serve `GET /mcp` as a listen stream instead of `405`.
+    listen: bool,
+    /// Messages replayed on a `GET` that carries `Last-Event-ID`.
+    replay: Vec<Value>,
+    /// `Last-Event-ID` of every `GET` that carried one, in order.
+    last_event_ids: Arc<Mutex<Vec<String>>>,
 }
 
 impl FakeMcpServer {
@@ -129,7 +141,34 @@ impl FakeMcpServer {
             sessions_opened: Arc::new(AtomicU64::new(0)),
             deleted: Arc::new(Mutex::new(Vec::new())),
             failing_tools: Vec::new(),
+            listen: false,
+            replay: Vec::new(),
+            last_event_ids: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Serve a `GET` listen stream (one `notifications/message` event, then open until the
+    /// client leaves) instead of answering `GET` with `405`.
+    pub fn with_listen_stream(mut self, on: bool) -> Self {
+        self.listen = on;
+        self
+    }
+
+    /// Serve a `GET` listen stream and replay `messages` (one SSE event each, with ids `1`,
+    /// `2`, ...) at the start of every one that resumes with `Last-Event-ID`, as a server does
+    /// with the buffered events of a stream that broke off.
+    pub fn with_replay(mut self, messages: Vec<Value>) -> Self {
+        self.listen = true;
+        self.replay = messages;
+        self
+    }
+
+    /// The `Last-Event-ID` of every resumed `GET`, in order.
+    pub fn last_event_ids(&self) -> Vec<String> {
+        self.last_event_ids
+            .lock()
+            .expect("last-event-id mutex")
+            .clone()
     }
 
     /// Give tool `name` these MCP `annotations` in `tools/list` (for example
@@ -242,9 +281,13 @@ impl FakeMcpServer {
     }
 
     pub fn router(&self) -> Router {
-        Router::new()
-            .route("/mcp", post(fake_handle).delete(fake_delete))
-            .with_state(self.clone())
+        let routes = post(fake_handle).delete(fake_delete);
+        let routes = if self.listen {
+            routes.get(fake_listen)
+        } else {
+            routes
+        };
+        Router::new().route("/mcp", routes).with_state(self.clone())
     }
 
     pub async fn spawn(&self) -> anyhow::Result<Spawned> {
@@ -331,7 +374,7 @@ impl FakeMcpServer {
             "resources/read" => json!({
                 "contents": [{"uri": msg["params"]["uri"], "text": "fake resource"}]
             }),
-            "resources/subscribe" => json!({}),
+            "resources/subscribe" | "resources/unsubscribe" => json!({}),
             "prompts/get" => json!({
                 "messages": [{"role": "user", "content": {"type": "text", "text": "fake prompt"}}]
             }),
@@ -436,6 +479,43 @@ async fn fake_handle(
         response.headers_mut().insert("mcp-session-id", sid);
     }
     response
+}
+
+async fn fake_listen(
+    axum::extract::State(server): axum::extract::State<FakeMcpServer>,
+    headers: HeaderMap,
+) -> Response {
+    let resumed = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let mut events = vec![format!(
+        "event: message\ndata: {}\n\n",
+        json!({"jsonrpc": "2.0", "method": "notifications/message",
+               "params": {"level": "info", "data": "listening"}})
+    )];
+    if let Some(id) = resumed {
+        server
+            .last_event_ids
+            .lock()
+            .expect("last-event-id mutex")
+            .push(id);
+        for (n, msg) in server.replay.iter().enumerate() {
+            events.push(format!("id: {}\nevent: message\ndata: {msg}\n\n", n + 1));
+        }
+    }
+    let open = futures_util::stream::iter(
+        events
+            .into_iter()
+            .map(|e| Ok::<_, std::io::Error>(Bytes::from(e))),
+    )
+    .chain(futures_util::stream::pending());
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/event-stream")],
+        axum::body::Body::from_stream(open),
+    )
+        .into_response()
 }
 
 async fn fake_delete(

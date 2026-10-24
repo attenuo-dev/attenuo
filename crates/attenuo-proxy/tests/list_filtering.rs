@@ -722,3 +722,111 @@ async fn an_extra_result_member_does_not_skip_the_deny_path() -> anyhow::Result<
     assert!(h.upstream.recorded_calls().is_empty());
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------------
+// List answers replayed on a resumed GET stream
+// ---------------------------------------------------------------------------------------------
+
+/// Read JSON-RPC messages from an open SSE body until `want` of them have arrived (the stream
+/// itself stays open), flattening batches.
+async fn read_messages(resp: reqwest::Response, want: usize) -> anyhow::Result<Vec<Value>> {
+    use futures_util::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+    let mut out = Vec::new();
+    loop {
+        while let Some(end) = buf.find("\n\n") {
+            let event: String = buf.drain(..end + 2).collect();
+            let data: Vec<&str> = event
+                .lines()
+                .filter_map(|l| l.strip_prefix("data:"))
+                .map(|l| l.strip_prefix(' ').unwrap_or(l))
+                .collect();
+            if !data.is_empty() {
+                match serde_json::from_str(&data.join("\n"))? {
+                    Value::Array(items) => out.extend(items),
+                    other => out.push(other),
+                }
+            }
+        }
+        if out.len() >= want {
+            return Ok(out);
+        }
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("stream ended after {out:?}"))??;
+        buf.push_str(std::str::from_utf8(&chunk)?);
+    }
+}
+
+/// The four list answers as a server would have buffered them for a `POST` stream that broke
+/// off, unfiltered (two of them in one batch event), plus a server request that reuses an id
+/// and carries a `result`.
+fn replayed_lists() -> Vec<Value> {
+    vec![
+        json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": [
+            {"name": "read_file"}, {"name": "delete_repo"}], "nextCursor": "c1"}}),
+        json!({"jsonrpc": "2.0", "id": 9, "method": "sampling/createMessage", "params": {},
+               "result": {"tools": [{"name": "delete_repo"}]}}),
+        json!([
+            {"jsonrpc": "2.0", "id": 2, "result": {"resources": [
+                {"uri": "file:///public/a.txt"}, {"uri": "file:///public/b.txt"},
+                {"uri": "file:///secret/key.pem"}]}},
+            {"jsonrpc": "2.0", "id": 3, "result": {"resourceTemplates": [
+                {"uriTemplate": "file:///public/{name}"},
+                {"uriTemplate": "file:///secret/{name}"}]}},
+        ]),
+        json!({"jsonrpc": "2.0", "id": 4, "result": {"prompts": [
+            {"name": "summarize"}, {"name": "review_pr"}, {"name": "deploy"}]}}),
+    ]
+}
+
+/// A client whose `POST` stream broke off resumes it with `GET` and `Last-Event-ID`, and the
+/// upstream replays the buffered list answers there. They reach the client filtered exactly
+/// like the answers of the `POST` itself, batches included; a server request that carries a
+/// `result` is left alone.
+#[tokio::test]
+async fn list_answers_replayed_on_a_resumed_get_stream_are_filtered() -> anyhow::Result<()> {
+    let h = Harness::start(
+        full_upstream().with_replay(replayed_lists()),
+        narrow_chain(),
+    )
+    .await?;
+    let init = h
+        .post(&req(
+            0,
+            "initialize",
+            json!({"protocolVersion": "2025-06-18"}),
+        ))
+        .await?;
+    let sid = init.headers()["mcp-session-id"].to_str()?.to_owned();
+    let resp = h
+        .client
+        .get(h.proxy.url(&format!("/mcp/{SERVER}")))
+        .header("accept", "text/event-stream")
+        .header("mcp-session-id", &sid)
+        .header("last-event-id", "0")
+        .bearer_auth(TOKEN)
+        .send()
+        .await?;
+    assert_eq!(resp.status(), 200);
+    // The listening notification, then the five replayed messages.
+    let msgs = read_messages(resp, 6).await?;
+    assert_eq!(h.upstream.last_event_ids(), vec!["0"]);
+    assert_eq!(msgs[0]["method"], "notifications/message");
+    let responses: Vec<Value> = msgs
+        .iter()
+        .filter(|m| m.get("method").is_none())
+        .cloned()
+        .collect();
+    let text = serde_json::to_string(&responses)?;
+    for hidden in ["delete_repo", "secret/key.pem", "review_pr", "deploy"] {
+        assert!(!text.contains(hidden), "{hidden} in {text}");
+    }
+    assert_narrow(&responses);
+    assert_eq!(responses[0]["result"]["nextCursor"], "c1");
+    // The server's own request is untouched, its `result` member included.
+    let server_request = msgs.iter().find(|m| m["id"] == 9).unwrap();
+    assert_eq!(server_request["result"]["tools"][0]["name"], "delete_repo");
+    Ok(())
+}
