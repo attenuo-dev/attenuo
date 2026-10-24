@@ -253,7 +253,7 @@ impl PartsKey {
 /// server, tool, actions) and the `originating_user` and `chain` context records. Only
 /// `context.input`, `context.session_id`, `context.now_unix` and the output-labelling members
 /// (`session`, `args_contain_untrusted`, `untrusted_args`, `approval`) and the run-limit
-/// member (`budget`) are built per call.
+/// members (`budget`, `usage`) are built per call.
 #[derive(Debug)]
 pub(crate) struct RequestParts {
     key: PartsKey,
@@ -333,7 +333,7 @@ impl RequestParts {
         now: OffsetDateTime,
     ) -> Result<Request, TranslationError> {
         let input = object_from(call.arguments.iter(), "input")?;
-        let mut pairs = Vec::with_capacity(9);
+        let mut pairs = Vec::with_capacity(10);
         pairs.push(("input".to_string(), restricted(&input)?));
         pairs.push((
             "originating_user".to_string(),
@@ -368,7 +368,8 @@ impl RequestParts {
 /// `session: {tainted, tainted_by}`, `args_contain_untrusted` and `untrusted_args` (the
 /// arguments that matched the run's span index, phase 2), and `approval: {present, by}` (a
 /// granted approval the call consumed, if any); and the run-limit member (ADR-0010),
-/// `budget: {limited, calls_remaining, amount_remaining, destination_new}`.
+/// `budget: {limited, calls_remaining, amount_remaining, destination_new}`, and run usage,
+/// `usage: {calls, amount, destination_seen}`.
 fn label_pairs(
     labels: &CallLabels,
 ) -> Result<Vec<(String, RestrictedExpression)>, TranslationError> {
@@ -421,6 +422,18 @@ fn label_pairs(
             RestrictedExpression::new_bool(b.destination_new),
         ),
     ])?;
+    let u = &labels.usage;
+    let usage = record(vec![
+        ("calls".to_string(), RestrictedExpression::new_long(u.calls)),
+        (
+            "amount".to_string(),
+            RestrictedExpression::new_long(u.amount),
+        ),
+        (
+            "destination_seen".to_string(),
+            RestrictedExpression::new_bool(u.destination_seen),
+        ),
+    ])?;
     Ok(vec![
         ("session".to_string(), session),
         (
@@ -439,6 +452,7 @@ fn label_pairs(
         ),
         ("approval".to_string(), approval),
         ("budget".to_string(), budget),
+        ("usage".to_string(), usage),
     ])
 }
 
@@ -466,6 +480,14 @@ fn label_json(labels: &CallLabels) -> Map<String, Value> {
             "calls_remaining": labels.budget.calls_remaining,
             "amount_remaining": labels.budget.amount_remaining,
             "destination_new": labels.budget.destination_new,
+        }),
+    );
+    m.insert(
+        "usage".into(),
+        json!({
+            "calls": labels.usage.calls,
+            "amount": labels.usage.amount,
+            "destination_seen": labels.usage.destination_seen,
         }),
     );
     m

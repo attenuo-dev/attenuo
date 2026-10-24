@@ -1257,20 +1257,26 @@ async fn screen_message(
         }
         out.forward.push(msg);
     } else if verdict.reason == REASON_APPROVAL_REQUIRED {
-        out.replies.push(approval_required_response(
-            id,
-            verdict.decision_id,
-            &call.call_hash(),
-            verdict.approval.as_ref(),
-            verdict.untrusted_args.as_ref(),
+        out.replies.push(jsonrpc::with_usage(
+            approval_required_response(
+                id,
+                verdict.decision_id,
+                &call.call_hash(),
+                verdict.approval.as_ref(),
+                verdict.untrusted_args.as_ref(),
+            ),
+            verdict.usage.as_ref(),
         ));
     } else {
-        out.replies.push(denied_response_with(
-            id,
-            &verdict.reason,
-            verdict.decision_id,
-            verdict.limit.as_ref(),
-            verdict.untrusted_args.as_ref(),
+        out.replies.push(jsonrpc::with_usage(
+            denied_response_with(
+                id,
+                &verdict.reason,
+                verdict.decision_id,
+                verdict.limit.as_ref(),
+                verdict.untrusted_args.as_ref(),
+            ),
+            verdict.usage.as_ref(),
         ));
     }
 }

@@ -46,6 +46,7 @@ fn charges(sum: bool) -> Vec<Charge> {
             value: None,
             amount: 1,
             max: u64::MAX >> 2,
+            usage: false,
         });
     }
     v
@@ -241,6 +242,7 @@ fn concurrent_siblings_cannot_overspend_parent_with_appends_on_the_same_file() {
                                 value: None,
                                 amount: 1,
                                 max: BUDGET,
+                                usage: false,
                             },
                             Charge {
                                 hop: 1,
@@ -251,6 +253,7 @@ fn concurrent_siblings_cannot_overspend_parent_with_appends_on_the_same_file() {
                                 value: None,
                                 amount: 1,
                                 max: 1,
+                                usage: false,
                             },
                         ];
                         barrier.wait();
@@ -290,6 +293,7 @@ fn concurrent_siblings_cannot_overspend_parent_with_appends_on_the_same_file() {
         value: None,
         amount: 1,
         max: BUDGET,
+        usage: false,
     }];
     assert_eq!(leases.budget_used(&root).unwrap(), [BUDGET]);
     let report = audit.verify_chain().unwrap();

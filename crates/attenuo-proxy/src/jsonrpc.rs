@@ -143,6 +143,22 @@ pub fn approval_required_response(
     error_response(id, CODE_APPROVAL_REQUIRED, message, Some(data))
 }
 
+/// Add the run's usage of a destructive tool (run-limits design section 3.5) to the `data` of
+/// a `-32003` or `-32008` error response as `usage: {calls, amount, destination_seen}`.
+/// Unchanged when `usage` is `None` or the response has no error data.
+pub fn with_usage(mut response: Value, usage: Option<&Value>) -> Value {
+    if let (Some(u), Some(data)) = (
+        usage,
+        response
+            .get_mut("error")
+            .and_then(|e| e.get_mut("data"))
+            .and_then(Value::as_object_mut),
+    ) {
+        data.insert("usage".into(), u.clone());
+    }
+    response
+}
+
 /// The `method` of a request or notification, if it has one.
 pub fn method_of(msg: &Value) -> Option<&str> {
     msg.get("method").and_then(Value::as_str)

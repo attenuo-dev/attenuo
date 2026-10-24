@@ -556,3 +556,77 @@ def test_labels_args_arm_runs_or_is_skipped() -> None:
         return
     doc["rates"] = run.arm_rates(doc)
     assert run.problems(doc) == []
+
+
+# --- the soft run-usage arm (run-limits phase 2) -----------------------------------------------
+
+
+def test_usage_soft_arm_loads_its_own_frozen_policy(tmp_path: Path) -> None:
+    hashes = harness.frozen_hashes()
+    assert "usage-soft.cedar" in hashes["files"] and "usage-soft.cedar" in hashes["added_later"]
+    assert harness.labels_policy("attenuo_usage_soft").name == "usage-soft.cedar"
+    # Approvals are settled through the labels arm's path; no labels policy, no run-limit rule.
+    assert "attenuo_usage_soft" in harness.LABEL_ARMS and "attenuo_usage_soft" in harness.PROXIED
+    assert "attenuo_usage_soft" in harness.CONSTRAINED_ARMS
+    assert "attenuo_usage_soft" not in harness.LIMIT_ARMS
+    assert "attenuo_usage_soft" in run.ARM_NAMES
+    env = list(harness.load_environment().values())
+    harness.write_config(tmp_path, env, 1, {s.upstream: "http://x" for s in env},
+                         "attenuo_usage_soft", ["worker"])  # fmt: skip
+    text = (tmp_path / "policy.cedar").read_text()
+    assert "context.usage.calls >= 1" in text
+    assert "confirm_destructive_after_untrusted_read" not in text
+    assert "confirm_destructive_with_untrusted_args" not in text
+
+
+def test_usage_probe_verdict() -> None:
+    assert "does not carry data.usage" in (harness.usage_probe_verdict(GATED) or "")
+    counted = json.loads(json.dumps(GATED))
+    counted["error"]["data"]["usage"] = {"calls": 1, "amount": 0, "destination_seen": False}
+    assert harness.usage_probe_verdict(counted) is None
+    uncounted = json.loads(json.dumps(GATED))
+    uncounted["error"]["data"]["usage"] = {"calls": 0, "amount": 0, "destination_seen": False}
+    assert harness.usage_probe_verdict(uncounted) is not None
+    got = harness.usage_probe_verdict({"result": {}}) or ""
+    assert "repeated in one run" in got and "probe got no error" in got
+
+
+def test_multicall_rows_split_old_and_new_cases() -> None:
+    new = harness.MULTI_CALL_CASES[0]
+    calls = [
+        _call("benign", "allow"),
+        _call("attack", "gated", **DECLINED),
+        _call("benign", "allow", case=new),
+        _call("benign", "gated", case=new, **GRANTED),
+        _call("attack", "gated", case=new, **DECLINED),
+    ]
+    for c in calls:
+        c["arm"] = "attenuo_usage_soft"
+    doc: dict[str, Any] = {"arms": ["attenuo_usage_soft"], "calls": calls}
+    rows = {r["group"]: r for r in run.multicall_rows(doc)}
+    assert rows["old"]["cases"] == 1 and rows["old"]["approval_requests"] == 1
+    m = rows["multi-call"]
+    assert (m["benign_calls"], m["benign_gated"], m["benign_completed_after_approval"]) == (2, 1, 1)
+    assert (m["attack_allowed"], m["attack_gated"], m["approval_requests"]) == (0, 1, 2)
+    assert "### Multi-call cases" in "\n".join(run.render_multicall(doc))
+    assert run.multicall_rows({"arms": ["attenuo"], "calls": [_call("benign", "allow")]}) == []
+
+
+@pytest.mark.integration
+def test_usage_soft_arm_runs_or_is_skipped() -> None:
+    """On a server with run usage the arm runs with no problems and gates the repeated
+    payment; on one without, it is skipped with the probe's reason and runs no call."""
+    if os.environ.get("ATTENUO_INTEGRATION") != "1":
+        pytest.skip("set ATTENUO_INTEGRATION=1 to run")
+    suites = [s for s in harness.load_corpus() if s.name == "banking"]
+    suites[0].cases = [c for c in suites[0].cases if c.id == "banking-12"]
+    doc = harness.run(suites, ("attenuo_usage_soft",))
+    if "attenuo_usage_soft" not in doc["arms"]:
+        why = doc["skipped_arms"]["attenuo_usage_soft"]
+        assert "probe got" in why or "usage" in why
+        assert doc["calls"] == []
+        return
+    doc["rates"] = run.arm_rates(doc)
+    assert run.problems(doc) == []
+    r = doc["rates"]["attenuo_usage_soft"]
+    assert r["benign_gated"] >= 2 and r["benign_completed_after_approval"] == r["benign_gated"]

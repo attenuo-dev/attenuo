@@ -169,6 +169,25 @@ pub struct DecisionRecord {
     /// hashes of older records unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<RecordBudget>,
+    /// For a decision on a call to a destructive tool: the run usage the policy saw
+    /// (`context.usage`, run-limits design section 3.5), before this call. Absent for any other
+    /// tool, and when the call was decided before usage was read (a lease denial), which keeps
+    /// the hashes of older records unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<RecordUsage>,
+}
+
+/// What a decision record says about run usage (see [`DecisionRecord::usage`]): the figures
+/// Cedar saw as `context.usage`, before the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RecordUsage {
+    /// Allowed calls of this server and tool in the run so far, all hops.
+    pub calls: u64,
+    /// Sum of the catalog's `amount` input over those calls; 0 when the catalog names none.
+    pub amount: u64,
+    /// The catalog's `destination` input value appeared in an earlier allowed call of this
+    /// tool in the run.
+    pub destination_seen: bool,
 }
 
 /// What a decision record says about run limits (see [`DecisionRecord::budget`]).
@@ -404,6 +423,7 @@ impl DecisionRecord {
             labels: None,
             approval: None,
             budget: None,
+            usage: None,
         }
     }
 

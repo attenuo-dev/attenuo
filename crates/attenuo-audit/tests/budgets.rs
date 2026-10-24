@@ -1,14 +1,18 @@
 //! Run-limit counters in the lease store (ADR-0010): all-or-nothing charges across hops,
 //! concurrent charges against a budget of one, refunds at most once, and counters that stay
-//! readable after a revocation. Every behaviour test runs against both stores.
+//! readable after a revocation; and run-usage counters (run-limits design section 3.5), which
+//! never refuse, are refunded with their decision and end with their run. Every behaviour test
+//! runs against both stores.
 
 mod common;
 
 use std::sync::{Arc, Barrier};
 
 use attenuo_audit::{AuditError, ChargeOutcome, LeaseStore, MemoryLeaseStore, SqliteLeaseStore};
-use attenuo_core::{Charge, LeaseId, LimitKind};
+use attenuo_core::limits::{usage_charges, MAX_LIMIT};
+use attenuo_core::{Charge, LeaseId, LimitKind, ToolCall};
 use common::t0;
+use serde_json::json;
 use time::Duration;
 
 fn stores() -> Vec<(&'static str, Box<dyn LeaseStore>)> {
@@ -31,6 +35,7 @@ fn charge(hop: usize, lease: &str, kind: LimitKind, amount: u64, max: u64) -> Ch
         value: None,
         amount,
         max,
+        usage: false,
     }
 }
 
@@ -44,6 +49,7 @@ fn per(lease: &str, value: &str, max: u64) -> Charge {
         value: Some(format!("\"{value}\"").into_bytes()),
         amount: 1,
         max,
+        usage: false,
     }
 }
 
@@ -289,4 +295,62 @@ fn sqlite_counters_survive_reopen_and_hold_no_values_in_clear() {
         .unwrap();
     assert!(!dump.is_empty());
     assert!(dump.iter().all(|r| !r.contains("EMMA")), "{dump:?}");
+}
+
+/// Run usage shares the counters' transaction and refund but not their rules: it never
+/// refuses (it saturates), it is keyed apart from any token limit on the same lease, a refund
+/// returns it without counting it, and revoking the run's root lease deletes it while limit
+/// counters stay readable.
+#[test]
+fn run_usage_saturates_is_refunded_and_ends_with_the_run() {
+    for (name, store) in stores() {
+        let exp = t0() + Duration::hours(1);
+        let root = LeaseId::new("root");
+        store.register(&root, None, exp).unwrap();
+        let call = ToolCall::new(
+            "bank",
+            "send_money",
+            json!({"recipient": "FR00EMMA", "amount": 40}),
+        );
+        let usage = usage_charges(&root, &call, Some("amount"), Some("recipient"));
+        let limit = charge(0, "root", LimitKind::Calls, 1, 5);
+        let mut both = vec![limit.clone()];
+        both.extend(usage.clone());
+        assert_eq!(
+            charged(store.charge("d1", &both, t0()).unwrap()),
+            vec![1, 1, 40, 1],
+            "{name}: the usage `calls` counter is not the limit's, though both are on `root`"
+        );
+        assert_eq!(
+            charged(store.charge("d2", &usage, t0()).unwrap()),
+            vec![2, 80, 2],
+            "{name}"
+        );
+        // A refund returns the usage too, but counts only token-limit counters.
+        assert_eq!(store.refund("d2", t0()).unwrap(), 0, "{name}");
+        assert_eq!(store.refund("d1", t0()).unwrap(), 1, "{name}");
+        assert_eq!(
+            store.budget_used(&both).unwrap(),
+            vec![0, 0, 0, 0],
+            "{name}"
+        );
+
+        // Saturates instead of refusing.
+        let mut huge = usage.clone();
+        huge[1].amount = MAX_LIMIT;
+        charged(store.charge("d3", &huge, t0()).unwrap());
+        assert_eq!(
+            charged(store.charge("d4", &huge, t0()).unwrap())[1],
+            MAX_LIMIT,
+            "{name}"
+        );
+
+        charged(store.charge("d5", &both, t0()).unwrap());
+        store.revoke(&root, "test", t0()).unwrap();
+        assert_eq!(
+            store.budget_used(&both).unwrap(),
+            vec![1, 0, 0, 0],
+            "{name}: usage ends with the run, the limit counter stays"
+        );
+    }
 }

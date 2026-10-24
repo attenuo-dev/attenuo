@@ -111,7 +111,7 @@ fn context_type(inputs: &BTreeMap<String, ArgType>) -> String {
     format!(
         "{{ input: {}, originating_user: UserContext, chain: ChainContext, session_id?: String, now_unix: Long, \
          session: SessionContext, args_contain_untrusted: Bool, untrusted_args: Set<String>, approval: ApprovalContext, \
-         budget: BudgetContext }}",
+         budget: BudgetContext, usage: UsageContext }}",
         record(inputs)
     )
 }
@@ -153,6 +153,8 @@ pub fn generate(
     s.push_str(
         "type BudgetContext = { limited: Bool, calls_remaining: Long, amount_remaining: Long, destination_new: Bool };\n",
     );
+    // Run usage (run-limits design section 3.5). Always present.
+    s.push_str("type UsageContext = { calls: Long, amount: Long, destination_seen: Bool };\n");
     let actions = catalog.actions(legacy_bare_actions);
     let mut all_inputs: BTreeMap<String, ArgType> = BTreeMap::new();
     for inputs in actions.values() {
@@ -219,6 +221,8 @@ mod tests {
             "type ApprovalContext = { present: Bool, by: String }",
             "budget: BudgetContext",
             "type BudgetContext = { limited: Bool, calls_remaining: Long, amount_remaining: Long, destination_new: Bool }",
+            "usage: UsageContext",
+            "type UsageContext = { calls: Long, amount: Long, destination_seen: Bool }",
         ] {
             assert!(text.contains(attr), "{attr}");
         }

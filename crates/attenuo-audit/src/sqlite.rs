@@ -20,7 +20,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::approval::{rules, Approval, ApprovalMethod, ApprovalState, Approver};
-use crate::budget::{plan, ChargeOutcome, CounterKey, ValueKey};
+use crate::budget::{plan, ChargeOutcome, CounterKey, ValueKey, USAGE_KINDS};
 use crate::checkpoint::{
     verify_with_checkpoints, Checkpoint, CheckpointKeys, SignedVerifyReport, Start,
 };
@@ -2287,11 +2287,16 @@ fn refund_in(
     at: OffsetDateTime,
 ) -> Result<u64, AuditError> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let (rows, refunded): (i64, i64) = tx
+    let (rows, refunded, limits): (i64, i64, i64) = tx
         .prepare_cached(
-            "SELECT COUNT(*), COUNT(refunded_at) FROM budget_charges WHERE decision_id = ?1",
+            "SELECT COUNT(*), COUNT(refunded_at), \
+                    COUNT(*) FILTER (WHERE kind NOT IN (?2, ?3, ?4)) \
+             FROM budget_charges WHERE decision_id = ?1",
         )?
-        .query_row([decision_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        .query_row(
+            params![decision_id, USAGE_KINDS[0], USAGE_KINDS[1], USAGE_KINDS[2]],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
     if rows == 0 {
         return Err(AuditError::UnknownCharge(decision_id.to_owned()));
     }
@@ -2313,7 +2318,8 @@ fn refund_in(
     tx.prepare_cached("UPDATE budget_charges SET refunded_at = ?2 WHERE decision_id = ?1")?
         .execute(params![decision_id, fmt_time(at)?])?;
     tx.commit()?;
-    Ok(rows as u64)
+    // Token-limit counters only (see `LeaseStore::refund`).
+    Ok(limits as u64)
 }
 
 fn to_i64(v: u64) -> Result<i64, AuditError> {
@@ -2348,6 +2354,17 @@ fn revoke_in(
         ),
         params![lease.0],
     )?;
+    // So does its run usage (`crate::budget`): the counters, and the hashed destinations that
+    // the charge log holds for a refund. Token-limit counters stay readable.
+    for table in ["budget_counters", "budget_charges"] {
+        tx.execute(
+            &format!(
+                "DELETE FROM {table} WHERE kind IN (?2, ?3, ?4) AND lease IN ({})",
+                subtree_ids!("")
+            ),
+            params![lease.0, USAGE_KINDS[0], USAGE_KINDS[1], USAGE_KINDS[2]],
+        )?;
+    }
     tx.commit()?;
     Ok(changed as u64)
 }
@@ -2598,7 +2615,8 @@ impl SqliteLeaseStore {
         let mut conn = self.conn.lock()?;
         // A lost `sum` charge could be spent again after a power failure, so a transaction
         // that charges one commits with `synchronous=FULL`, as revocations do (design 3.4).
-        let relaxed = if charges.iter().any(|c| c.kind == LimitKind::Sum) {
+        // Run usage is not a limit: it never adds the sync (design section 3.5).
+        let relaxed = if charges.iter().any(|c| c.kind == LimitKind::Sum && !c.usage) {
             self.durability
                 .filter(|d| *d != Durability::Full)
                 .map(Durability::level)
@@ -3305,6 +3323,7 @@ mod tests {
             value: None,
             amount: 1,
             max: 100,
+            usage: false,
         }];
         if let Some((amount, max)) = sum {
             out.push(Charge {
@@ -3316,6 +3335,7 @@ mod tests {
                 value: None,
                 amount,
                 max,
+                usage: false,
             });
         }
         out

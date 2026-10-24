@@ -62,7 +62,8 @@
 //!     "calls_remaining": 9223372036854775807,
 //!     "amount_remaining": 9223372036854775807,
 //!     "destination_new": true
-//!   }
+//!   },
+//!   "usage": { "calls": 0, "amount": 0, "destination_seen": false }
 //! }
 //! ```
 //!
@@ -89,6 +90,16 @@
 //! such limit applies). The server enforces the token's limits itself, in the capability
 //! stage before Cedar (`budget_exhausted`, `budget_error`, `limit_arg_invalid`, set through
 //! [`BudgetContext::refusal`]); policies read these figures to explain or to ask earlier.
+//!
+//! `usage` is the run's usage of the called tool (run-limits design section 3.5, phase 2),
+//! always present too ([`UsageContext`]): `usage.calls` is how many calls of this server and
+//! tool the run has had allowed so far, by any hop; `usage.amount` the sum of the catalog's
+//! `amount` input over them (`0` when the catalog names none); `usage.destination_seen` whether
+//! the catalog's `destination` input value appeared in one of them. The server keeps usage only
+//! for tools the catalog marks destructive; for any other tool all three are zero or false.
+//! Nothing refuses a call because of usage unless a policy says so, which is how a deployment
+//! writes limits without a number in every token, hard (`forbid`) or soft
+//! (`@obligation("approval")`).
 //!
 //! # Obligations
 //!
@@ -330,6 +341,23 @@ pub struct CallLabels {
     pub approval: ApprovalContext,
     /// `context.budget`, and a refusal from the run-limit check.
     pub budget: BudgetContext,
+    /// `context.usage`.
+    pub usage: UsageContext,
+}
+
+/// `context.usage` (run-limits design section 3.5): the delegation run's usage of the called
+/// tool before this call, computed by the server from the lease store. The default (all zero,
+/// `destination_seen` false) is what a tool without usage, or a run's first call, sees.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageContext {
+    /// `context.usage.calls`: allowed calls of this server and tool in the run so far, all
+    /// hops.
+    pub calls: i64,
+    /// `context.usage.amount`: the sum of the catalog's `amount` input over those calls.
+    pub amount: i64,
+    /// `context.usage.destination_seen`: the catalog's `destination` input value appeared in an
+    /// earlier allowed call of this tool in the run.
+    pub destination_seen: bool,
 }
 
 /// `context.budget` (ADR-0010): what the run limits that match a call have left, computed by

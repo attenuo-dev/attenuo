@@ -155,6 +155,7 @@ pub(crate) fn audit_admin(
         labels: None,
         approval: None,
         budget: None,
+        usage: None,
     };
     let id = record.id;
     state

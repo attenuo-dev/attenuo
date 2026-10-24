@@ -147,10 +147,13 @@ pub async fn check_policies(State(state): State<Arc<AppState>>) -> Result<Json<V
 /// The decision is [`Pipeline::evaluate_policy`](crate::authz::Pipeline::evaluate_policy), the
 /// same capability stage and Cedar evaluation `POST /access/v1/evaluation` runs after its lease
 /// check. Answers `{decision, reason, policy_ids, diagnostics, lease_check: "skipped",
-/// chain_source: "token" | "admin_supplied", token_expired, session, approval, budget}`, plus
-/// `limit` when a run limit would be exceeded. `budget` is what the run limits matching the
-/// call have left, read from the lease store as `context.budget` (ADR-0010); the dry run
-/// never charges a counter.
+/// chain_source: "token" | "admin_supplied", token_expired, session, approval, budget, usage}`,
+/// plus `limit` when a run limit would be exceeded. `budget` is what the run limits matching
+/// the call have left, read from the lease store as `context.budget` (ADR-0010); the dry run
+/// never charges a counter. `usage` is `context.usage` (run-limits design section 3.5): as
+/// given in the request's optional `usage: {calls, amount, destination_seen}`, or else the
+/// run's usage of a destructive tool read from the store (all zero for any other tool), with
+/// `source` saying which.
 pub async fn evaluate_policies(
     State(state): State<Arc<AppState>>,
     body: Bytes,
@@ -191,6 +194,12 @@ pub async fn evaluate_policies(
             }
         },
     };
+    // `usage: {calls, amount, destination_seen}`: evaluate with this run usage instead of the
+    // store's. Members left out are 0 or false.
+    let usage_given = match obj.remove("usage") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(usage_from_json(&v)?),
+    };
     let mut req: EvaluationRequest = serde_json::from_value(raw)
         .map_err(|e| ApiError::bad_request("invalid_request", e.to_string()))?;
 
@@ -224,11 +233,16 @@ pub async fn evaluate_policies(
     };
     // Run limits (ADR-0010): the counters as they are now. Read, never charged.
     let budget = state.pipeline.budget_view(&chain, &call);
+    let (usage, usage_source) = match usage_given {
+        Some(u) => (u, "request"),
+        None => (budget.usage.unwrap_or_default(), "store"),
+    };
     let labels = CallLabels {
         session: session.clone(),
         args: args.clone(),
         approval: approval.clone(),
         budget: budget.context.clone(),
+        usage,
     };
     let o = state.pipeline.evaluate_policy(&chain, &call, &labels, now);
     let mut out = json!({
@@ -248,11 +262,49 @@ pub async fn evaluate_policies(
         },
         "approval": { "present": approval.present, "by": approval.by },
         "budget": crate::authz::budget_json(&budget.context),
+        "usage": {
+            "calls": usage.calls,
+            "amount": usage.amount,
+            "destination_seen": usage.destination_seen,
+            "source": usage_source,
+        },
     });
     if let Some(hit) = &budget.hit {
         out["limit"] = hit.to_json();
     }
     Ok(Json(out))
+}
+
+/// The optional `usage` member of a dry run: `{"calls": n, "amount": n, "destination_seen":
+/// bool}`, each optional (0 or false), the figures non-negative integers.
+fn usage_from_json(v: &Value) -> Result<attenuo_policy::UsageContext, ApiError> {
+    let bad = |m: &str| ApiError::bad_request("invalid_request", format!("`usage`: {m}"));
+    let obj = v.as_object().ok_or_else(|| bad("expected an object"))?;
+    if let Some(k) = obj
+        .keys()
+        .find(|k| !matches!(k.as_str(), "calls" | "amount" | "destination_seen"))
+    {
+        return Err(bad(&format!("unknown member `{k}`")));
+    }
+    let figure = |key: &str| -> Result<i64, ApiError> {
+        match obj.get(key) {
+            None | Some(Value::Null) => Ok(0),
+            Some(n) => n
+                .as_i64()
+                .filter(|n| *n >= 0)
+                .ok_or_else(|| bad(&format!("`{key}` must be a non-negative integer"))),
+        }
+    };
+    let destination_seen = match obj.get("destination_seen") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return Err(bad("`destination_seen` must be a boolean")),
+    };
+    Ok(attenuo_policy::UsageContext {
+        calls: figure("calls")?,
+        amount: figure("amount")?,
+        destination_seen,
+    })
 }
 
 /// The optional `session` member of a dry run: `{"tainted_by": ["<server>/<tool>", ...],

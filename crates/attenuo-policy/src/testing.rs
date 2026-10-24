@@ -30,13 +30,19 @@
 //!       calls_remaining: 1          # each member optional; `limited` defaults to true
 //!       amount_remaining: 40
 //!       destination_new: false
+//!     usage:                        # optional: the run's usage of this tool so far
+//!       calls: 1                    # each member optional, default 0 / false
+//!       amount: 10
+//!       destination_seen: true
 //! ```
 //!
 //! Without `session` the run is untainted, as for a run that has read nothing. Without
 //! `approval`, `context.approval.present` is `false`. Without `budget`, no limit applies
 //! (`context.budget.limited` is `false`, both remaining figures are Cedar's largest `Long`).
 //! The harness keeps no counters: `budget` sets what Cedar sees, it does not enforce limits
-//! a hop's capabilities carry.
+//! a hop's capabilities carry. Without `usage`, the run has made no call of the tool
+//! (`context.usage` is all zero and false); like `budget`, it sets what Cedar sees and counts
+//! nothing.
 //!
 //! An inline catalog has the same shape as `[policy.catalog]` in the server config:
 //!
@@ -455,6 +461,29 @@ impl BudgetSpec {
     }
 }
 
+/// The run's usage of the case's tool before the call (`context.usage`). Members left out are
+/// 0 or `false`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageSpec {
+    #[serde(default)]
+    pub calls: i64,
+    #[serde(default)]
+    pub amount: i64,
+    #[serde(default)]
+    pub destination_seen: bool,
+}
+
+impl UsageSpec {
+    fn context(&self) -> crate::UsageContext {
+        crate::UsageContext {
+            calls: self.calls,
+            amount: self.amount,
+            destination_seen: self.destination_seen,
+        }
+    }
+}
+
 /// The decision a case expects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -508,6 +537,9 @@ pub struct TestCase {
     /// What the run limits have left; no limit applies when absent.
     #[serde(default)]
     pub budget: Option<BudgetSpec>,
+    /// The run's usage of the tool so far; none when absent.
+    #[serde(default)]
+    pub usage: Option<UsageSpec>,
 }
 
 /// A parsed test file.
@@ -745,6 +777,9 @@ fn run_case(engine: &PolicyEngine, case: &TestCase, now_unix: i64) -> CaseReport
     }
     if let Some(b) = &case.budget {
         labels.budget = b.context();
+    }
+    if let Some(u) = &case.usage {
+        labels.usage = u.context();
     }
     let actual = Actual::from(engine.authorize_labelled(&chain, &call, &labels, now));
 

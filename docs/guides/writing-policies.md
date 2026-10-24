@@ -24,6 +24,7 @@ Every call becomes one Cedar request.
 | `context.args_contain_untrusted`, `context.untrusted_args` | for a destructive call on a tainted run: whether an argument copies a value or span of an untrusted result of the run, and the names of those arguments (an argument pinned by an `equals` or `one_of` constraint never counts); `false` and an empty set otherwise. See [Asking only when an argument copies untrusted output](#asking-only-when-an-argument-copies-untrusted-output) |
 | `context.approval` | `present` (bool) and `by` (`"user"`, `"operator"`, or `""` without an approval): whether this call carries a granted approval for its exact hash; see [Asking for approval after untrusted output](#asking-for-approval-after-untrusted-output) |
 | `context.budget` | what the token's run limits matching this call have left: `limited` (bool), `calls_remaining`, `amount_remaining` (Long; the largest Long when no such limit applies) and `destination_new` (bool); see [Run limits](#run-limits) |
+| `context.usage` | the delegation run's usage of this tool so far, for a destructive tool: `calls` (allowed calls by any hop), `amount` (the catalog's `amount` input summed over them) and `destination_seen` (bool); zero and false for other tools. See [Limits over run usage](#limits-over-run-usage) |
 
 The action names the server as well as the tool. `action == Action::"github/read_file"` matches `read_file` on the upstream mounted as `github` and nothing else: a second upstream that also has a `read_file` tool (a malicious one, say) is not covered by that permit. To write a rule for every tool of one server, use the resource: `resource in Server::"github"`. To write one for every tool everywhere, leave `action` unconstrained or use `action in Action::"invoke"`.
 
@@ -192,6 +193,37 @@ when {
 
 `calls_remaining` and `amount_remaining` are what is left before this call, the smallest over every matching limit. `destination_new` is false once the call's `calls_per` value has been used in an earlier allowed call. [`config/policies/run-limits.cedar`](../../config/policies/run-limits.cedar) has this rule and a repeat-payee rule, with tests in `run-limits_test.yaml`.
 
+### Limits over run usage
+
+A token limit needs someone to put a number in the token. For defaults across a deployment, write the limit in policy instead, over what the run has already done. For every tool the catalog marks destructive, the server keeps per run, across every hop: how many calls were allowed (`context.usage.calls`), the sum of one input over them (`context.usage.amount`) and whether one input's value was seen before (`context.usage.destination_seen`). The catalog names the two inputs:
+
+```toml
+[policy.catalog.banking.send_money]
+inputs = { recipient = "string", amount = "long" }
+amount = "amount"
+destination = "recipient"
+```
+
+Usage refuses nothing by itself. A plain `forbid` makes a hard limit; with `@obligation("approval")` it is a soft one, which asks once the count is reached:
+
+```cedar
+// Soft: the second and every later payment of a run asks the user.
+@id("ask_on_repeat_payment")
+@obligation("approval")
+forbid (principal, action == Action::"banking/send_money", resource)
+when { context.usage.calls >= 1 && !context.approval.present };
+
+// Hard: never more than 2000 in total in one run, approval or not.
+@id("run_spend_cap_2000")
+forbid (principal, action == Action::"banking/send_money", resource)
+when {
+  context.input has amount &&
+  context.usage.amount + context.input.amount > 2000
+};
+```
+
+The gated call gets `-32008` with `usage` in its data; once the user or an operator grants it, the identical retry is allowed and counted, so the next payment asks again. Only allowed calls are counted, and an approval never raises a token's own limits. The figures are what the run had before this call, so `calls >= 1` means "not the first". An `amount` value that is not a non-negative integer adds nothing; a list-valued `destination` counts each element. A rule over `destination_seen` asks only for a repeat to the same payee or recipient, however many others the run has paid. Usage ends with the run: revoking its root lease deletes it. [`config/policies/run-usage.cedar`](../../config/policies/run-usage.cedar) has these rules and a per-recipient mail rule, with tests in `run-usage_test.yaml`.
+
 ### Chain depth
 
 ```cedar
@@ -280,6 +312,7 @@ The harness builds a real `DelegationChain` and calls the same `PolicyEngine::au
 - **Defaults.** User `alice` at `https://idp.example`, authenticated a minute before `now`; time fixed at 1760000000; each hop lives an hour; lease ids are random. `policy_ids: []` asserts that no policy matched (a default deny).
 - **Output labels.** A case's `session: { tainted_by: [web/fetch] }` evaluates the call as part of a run that has read that source; `tainted: true` with no sources is a run whose taint state could not be read. Without `session` the run is untainted. `reason` also accepts `approval_required`. `approval: { by: user }` evaluates the call as a retry that carries a granted approval (`by` is `user` or `operator`); without it there is none. `session: { untrusted_args: [body] }` sets `context.untrusted_args`, and `args_contain_untrusted` defaults to whether that list is non-empty (it can also be set `true` alone); without them the call has no matched arguments.
 - **Run limits.** The harness keeps no counters. `budget: { calls_remaining: 1 }` sets `context.budget` for the case (`limited` defaults to `true` there; the other members default to an unlimited call's values). Capabilities in `chain` may carry `limits`, which are checked for narrowing like any other part of a capability.
+- **Run usage.** `usage: { calls: 1, amount: 10, destination_seen: true }` sets `context.usage` for the case, as if the run had made those calls of the tool before (each member optional, 0 or false). Without it the call is the run's first. The inline catalog takes `amount` and `destination` like the server's.
 - **Mistakes in the file** (unknown keys, a missing `expect`, duplicate case names, an empty `cases`) are errors, not silent passes.
 
 ### Running

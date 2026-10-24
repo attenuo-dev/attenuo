@@ -1,5 +1,6 @@
 //! Run limits in the policy engine (ADR-0010): the always-present `context.budget` attributes
-//! and the refusal the server sets, which denies in the capability stage, before Cedar.
+//! and the refusal the server sets, which denies in the capability stage, before Cedar; and the
+//! always-present `context.usage` attributes of run usage (design section 3.5).
 
 use std::path::Path;
 
@@ -8,8 +9,9 @@ use attenuo_core::{AgentId, Capability, CapabilitySet, DelegationChain, LeaseId,
 use attenuo_core::{Decision, ToolCall};
 use attenuo_policy::testing::TestFile;
 use attenuo_policy::{
-    ApprovalContext, BudgetContext, BudgetRefusal, CallLabels, PolicyEngineBuilder, ToolAttrs,
-    ToolCatalog, REASON_CAPABILITY_DENIED, REASON_POLICY_ALLOW, REASON_POLICY_DENY,
+    ApprovalContext, ArgType, BudgetContext, BudgetRefusal, CallLabels, PolicyEngineBuilder,
+    ToolAttrs, ToolCatalog, UsageContext, REASON_APPROVAL_REQUIRED, REASON_CAPABILITY_DENIED,
+    REASON_POLICY_ALLOW, REASON_POLICY_DENY,
 };
 use serde_json::json;
 use time::macros::datetime;
@@ -151,4 +153,110 @@ fn shipped_run_limit_policies_pass_their_tests() {
         );
     }
     assert!(report.cases.len() >= 7);
+}
+
+/// `context.usage` (run-limits design section 3.5) is always present, zero by default, and
+/// carries the figures the server computes; a soft limit over it asks, and the approved retry
+/// passes.
+#[test]
+fn usage_attributes_are_always_present_and_drive_soft_limits() {
+    let e = engine(
+        r#"
+@id("all") permit (principal, action, resource);
+@id("zero")
+forbid (principal, action, resource)
+when { context.usage.calls != 0 || context.usage.amount != 0 || context.usage.destination_seen };
+"#,
+    );
+    let call = ToolCall::new("bank", "send", json!({"amount": 1}));
+    assert_eq!(
+        e.authorize(&chain(), &call, now()).reason,
+        REASON_POLICY_ALLOW
+    );
+    let used = CallLabels {
+        usage: UsageContext {
+            calls: 2,
+            amount: 40,
+            destination_seen: true,
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        e.authorize_labelled(&chain(), &call, &used, now()).reason,
+        REASON_POLICY_DENY
+    );
+
+    let e = engine(
+        r#"
+@id("all") permit (principal, action, resource);
+@id("ask_on_repeat") @obligation("approval")
+forbid (principal, action == Action::"bank/send", resource)
+when { context.usage.calls >= 1 && !context.approval.present };
+"#,
+    );
+    let second = CallLabels {
+        usage: UsageContext {
+            calls: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert_eq!(
+        e.authorize_labelled(&chain(), &call, &second, now()).reason,
+        REASON_APPROVAL_REQUIRED
+    );
+    let approved = CallLabels {
+        approval: ApprovalContext::by("user"),
+        ..second
+    };
+    assert_eq!(
+        e.authorize_labelled(&chain(), &call, &approved, now())
+            .reason,
+        REASON_POLICY_ALLOW
+    );
+}
+
+#[test]
+fn shipped_run_usage_policies_pass_their_tests() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/policies/run-usage_test.yaml");
+    let report = TestFile::load(&path).unwrap().run().unwrap();
+    for case in &report.cases {
+        assert!(
+            case.passed,
+            "{}: {:?} {:?}",
+            case.name, case.failures, case.error
+        );
+    }
+    assert!(report.cases.len() >= 10);
+}
+
+/// A catalog's `amount` must name an input, and one not declared as anything but `long`.
+#[test]
+fn catalog_usage_fields_are_checked() {
+    let build = |attrs: ToolAttrs| {
+        PolicyEngineBuilder::new()
+            .with_catalog(ToolCatalog::new().with("bank", "send", attrs))
+            .with_policies_str("permit (principal, action, resource);")
+            .build()
+    };
+    assert!(build(
+        ToolAttrs::new()
+            .with_amount("amount")
+            .with_destination("to")
+    )
+    .is_ok());
+    assert!(build(
+        ToolAttrs::new()
+            .with_input("amount", ArgType::Long)
+            .with_amount("amount")
+    )
+    .is_ok());
+    assert!(build(
+        ToolAttrs::new()
+            .with_input("amount", ArgType::String)
+            .with_amount("amount")
+    )
+    .is_err());
+    assert!(build(ToolAttrs::new().with_destination("")).is_err());
 }
