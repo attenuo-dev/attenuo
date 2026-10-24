@@ -5,7 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 rust-version.workspace = true
+keywords = ["audit", "hash-chain", "tamper-evident", "sqlite", "agents"]
+categories = ["authentication", "database"]
 
 [features]
 default = []

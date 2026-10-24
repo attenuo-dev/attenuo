@@ -5,7 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 rust-version.workspace = true
+keywords = ["mcp", "authorization", "delegation", "agents", "cli"]
+categories = ["command-line-utilities", "authentication"]
 
 [[bin]]
 name = "attenuo"
