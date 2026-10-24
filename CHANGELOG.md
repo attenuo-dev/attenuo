@@ -8,6 +8,10 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ## [Unreleased]
 
+### Evaluation
+
+- First run of the injection suite's `attenuo_labels` arm (output labelling phase 1, server from `ed3a769`): attack calls allowed without approval 1/60 dev and 1/38 test, both reads, against 10/60 and 7/38 for the `attenuo` arm; benign calls gated 18/69 and 2/29. Gated calls were counted, not retried, because the approval endpoints are not built yet. Results in `evaluation/injection-suite/results/2026-10-24-labels-v1.md`.
+
 ### Performance
 
 - Measured the output-labelling cost: a `tool_result` append plus the run label is about 150 us on the file store at `normal` durability, about the same as the decision append, so an allowed call spends about twice as long in the audit log. Details in `docs/design/performance.md`.
