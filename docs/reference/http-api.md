@@ -63,7 +63,7 @@ grant_type=urn:ietf:params:oauth:grant-type:token-exchange
 | `GET /mcp/{server}` | bearer delegation token | Passthrough for the streamable HTTP event stream, after the lease check. |
 | `DELETE /mcp/{server}` | bearer delegation token | Passthrough session close, after the lease check. |
 
-A denial is a JSON-RPC error with code `-32003`, carrying `reason` and `decision_id`. A call that a policy sends for approval (reason `approval_required`) gets `-32008` instead, with `reason`, `decision_id`, `call_hash` (SHA-256 of the RFC 8785 JSON of `{server, tool, arguments}`), `approval_id` and `expires_at`, and is not forwarded. Once the approval is granted, the identical call from the same hop is allowed once (see [Approvals](#approvals)). `approval_id` is absent if the server could not open an approval. A call over a run limit gets `-32003` with reason `budget_exhausted` and `data.limit: {hop, kind, arg, max, used}` (`arg` absent for `calls`); `budget_error` means the counters could not be read or written, and `limit_arg_invalid` that the call lacks an argument a limit counts, or has a value it cannot count (a `sum` needs a non-negative integer). No policy or approval passes these. If the answer to an allowed call cannot be recorded in the audit log, the agent gets `-32003` with reason `label_error` and the call's `decision_id` instead of the answer. A missing or bad token is HTTP 401 with `-32001` and `data.reason` set to `missing_token`, `invalid_token`, `token_expired`, `dpop_required`, `invalid_dpop_proof`, `use_dpop_nonce` or, for a lease that is no longer live, `lease_revoked`, `lease_expired` or `lease_unknown`. An upstream the proxy cannot reach is HTTP 502 with `-32005` and `data.reason` `upstream_unreachable`; the upstream URL and transport error are only logged. Allowed responses carry `X-Attenuo-Decision-Id`.
+A denial is a JSON-RPC error with code `-32003`, carrying `reason` and `decision_id`. A call that a policy sends for approval (reason `approval_required`) gets `-32008` instead, with `reason`, `decision_id`, `call_hash` (SHA-256 of the RFC 8785 JSON of `{server, tool, arguments}`), `approval_id` and `expires_at`, and is not forwarded. Once the approval is granted, the identical call from the same hop is allowed once (see [Approvals](#approvals)); or the retry carries the grant's signed approval token in `params._meta["dev.attenuo/approval"]`, which the proxy removes before the upstream and which does not count as an argument (see [Approval tokens](#approval-tokens)). A token that does not verify, is for another call, hop, run or key, or names an approval that is no longer granted gets `-32003` with reason `approval_invalid`. `approval_id` is absent if the server could not open an approval. A call over a run limit gets `-32003` with reason `budget_exhausted` and `data.limit: {hop, kind, arg, max, used}` (`arg` absent for `calls`); `budget_error` means the counters could not be read or written, and `limit_arg_invalid` that the call lacks an argument a limit counts, or has a value it cannot count (a `sum` needs a non-negative integer). No policy or approval passes these. If the answer to an allowed call cannot be recorded in the audit log, the agent gets `-32003` with reason `label_error` and the call's `decision_id` instead of the answer. A missing or bad token is HTTP 401 with `-32001` and `data.reason` set to `missing_token`, `invalid_token`, `token_expired`, `dpop_required`, `invalid_dpop_proof`, `use_dpop_nonce` or, for a lease that is no longer live, `lease_revoked`, `lease_expired` or `lease_unknown`. An upstream the proxy cannot reach is HTTP 502 with `-32005` and `data.reason` `upstream_unreachable`; the upstream URL and transport error are only logged. Allowed responses carry `X-Attenuo-Decision-Id`.
 
 ## Approvals
 
@@ -100,7 +100,22 @@ An approval:
 }
 ```
 
-`state` is `pending`, `granted`, `declined` or `consumed`; `expired` says whether `expires_at` has passed. A decided approval adds `approver: {subject, method, by}` (`id_token`/`user` or `admin_token`/`operator`) and `decided_at`; a used one adds `consumed_by`, the id of the allowed decision.
+`state` is `pending`, `granted`, `declined` or `consumed`; `expired` says whether `expires_at` has passed. A decided approval adds `approver: {subject, method, by}` (`id_token`/`user` or `admin_token`/`operator`) and `decided_at`; a used one adds `consumed_by`, the id of the allowed decision. While it is granted and unexpired, every route above also answers with `approval_token` (below).
+
+### Approval tokens
+
+`approval_token` is a JWT signed with the issuer key that signs delegation tokens (same `kid`, same `/.well-known/jwks.json`), header `typ: attenuo-approval+jwt`, `alg: EdDSA`. Claims:
+
+| Claim | Value |
+|---|---|
+| `iss`, `aud` | the issuer and audience of delegation tokens |
+| `sub`, `by` | the approver (`sub` of the user, or `urn:attenuo:admin`), and `user` or `operator` |
+| `chain_id`, `lease` | the run (its first hop's lease) and the lease of the hop that made the call |
+| `ch` | the call hash, as in the `-32008` data |
+| `iat`, `exp`, `jti` | when it was granted, the approval's `expires_at`, the approval id |
+| `cnf.jkt` | the calling hop's key thumbprint, present only when its token is DPoP-bound |
+
+Every answer for one grant carries the same token. To use it, retry the call with `"_meta": {"dev.attenuo/approval": "<token>"}` in the `tools/call` params (AuthZEN: `context.approval_token`). The server checks the signature, `typ` and `exp`, then that `chain_id`, `lease`, `ch` and `cnf.jkt` are the call's run, the calling hop's lease, the call hash and the hop's key binding, then consumes the approval named by `jti` once. Anything else is denied with `approval_invalid`; a value that is not a string is `-32602` at the proxy and 400 at AuthZEN. The consuming decision record has `approval: {id, by, presented: "token"}`. An external PEP can verify the token offline against the JWKS (`attenuo approval verify`, or the SDKs' `verify_approval_token` / `verifyApprovalToken`); only the server knows whether it was used already.
 
 | Status | `error` | When |
 | --- | --- | --- |

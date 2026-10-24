@@ -23,6 +23,13 @@
  */
 
 export { AdminClient } from "./admin.js";
+export {
+  APPROVAL_TOKEN_TYPE,
+  META_APPROVAL_KEY,
+  callHash,
+  verifyApprovalToken,
+} from "./approval.js";
+export type { ApprovalClaims, ApprovalVerifyOptions } from "./approval.js";
 export { ExportError, SHIPPED_FORMAT, crossCheck, parseShipped, verifyExport } from "./audit.js";
 export type {
   BadCheckpoint,
@@ -80,6 +87,7 @@ export type { DpopKeyLike, Jwk } from "./dpop.js";
 export { AttenuoClient } from "./client.js";
 export type {
   ApprovalWaitOptions,
+  CallToolOptions,
   CallWithApprovalOptions,
   ClientOptions,
   InspectOptions,

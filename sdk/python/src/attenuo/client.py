@@ -213,10 +213,15 @@ class Client:
         tool: str,
         arguments: dict[str, Any] | None = None,
         session_id: str | None = None,
+        *,
+        approval_token: str | None = None,
     ) -> w.ToolResult:
-        """``tools/call`` through the proxy. Raises :class:`~attenuo.Denied` when refused."""
+        """``tools/call`` through the proxy. Raises :class:`~attenuo.Denied` when refused.
+
+        ``approval_token`` (from a granted :class:`~attenuo.Approval`) is sent in
+        ``params._meta["dev.attenuo/approval"]``; the proxy removes it before the upstream."""
         result, decision_id, _ = self._rpc(
-            token, server, "tools/call", {"name": tool, "arguments": arguments or {}}, session_id
+            token, server, "tools/call", w.call_params(tool, arguments, approval_token), session_id
         )
         return w.tool_result(result, decision_id)
 
@@ -276,7 +281,8 @@ class Client:
     ) -> w.ToolResult:
         """:meth:`call_tool`; when the call needs an approval (``-32008``), call
         ``on_approval`` (to show the user the approval id), wait for the grant, and retry the
-        identical call once. A second ``-32008``, a decline or an expiry is raised."""
+        call once: with the grant's signed approval token in ``_meta`` when the server returned
+        one, else identically. A second ``-32008``, a decline or an expiry is raised."""
         try:
             return self.call_tool(token, server, tool, arguments, session_id)
         except ApprovalRequired as e:
@@ -284,8 +290,12 @@ class Client:
                 raise
             if on_approval is not None:
                 on_approval(e)
-            self.wait_for_approval(e.approval_id, token, timeout=timeout, interval=interval)
-        return self.call_tool(token, server, tool, arguments, session_id)
+            granted = self.wait_for_approval(
+                e.approval_id, token, timeout=timeout, interval=interval
+            )
+        return self.call_tool(
+            token, server, tool, arguments, session_id, approval_token=granted.approval_token
+        )
 
     # -- AuthZEN --
     def authzen_evaluate(
@@ -473,9 +483,11 @@ class AsyncClient:
         tool: str,
         arguments: dict[str, Any] | None = None,
         session_id: str | None = None,
+        *,
+        approval_token: str | None = None,
     ) -> w.ToolResult:
         result, decision_id, _ = await self._rpc(
-            token, server, "tools/call", {"name": tool, "arguments": arguments or {}}, session_id
+            token, server, "tools/call", w.call_params(tool, arguments, approval_token), session_id
         )
         return w.tool_result(result, decision_id)
 
@@ -532,8 +544,12 @@ class AsyncClient:
                 raise
             if on_approval is not None:
                 on_approval(e)
-            await self.wait_for_approval(e.approval_id, token, timeout=timeout, interval=interval)
-        return await self.call_tool(token, server, tool, arguments, session_id)
+            granted = await self.wait_for_approval(
+                e.approval_id, token, timeout=timeout, interval=interval
+            )
+        return await self.call_tool(
+            token, server, tool, arguments, session_id, approval_token=granted.approval_token
+        )
 
     async def authzen_evaluate(
         self,

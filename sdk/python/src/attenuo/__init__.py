@@ -35,6 +35,13 @@ from .admin import (
     RevokeResult,
     VerifyReport,
 )
+from .approval import (
+    APPROVAL_TOKEN_TYPE,
+    META_APPROVAL_KEY,
+    ApprovalClaims,
+    call_hash,
+    verify_approval_token,
+)
 from .capability import Capability, Equals, OneOf, Prefix
 from .client import AsyncClient, Client
 from .dpop import DpopKey
@@ -58,9 +65,12 @@ except PackageNotFoundError:  # pragma: no cover - running from a source tree
     __version__ = "0.0.0"
 
 __all__ = [
+    "APPROVAL_TOKEN_TYPE",
+    "META_APPROVAL_KEY",
     "AdminClient",
     "ApiError",
     "Approval",
+    "ApprovalClaims",
     "ApprovalNotGranted",
     "ApprovalRequired",
     "AsyncAdminClient",
@@ -102,6 +112,8 @@ __all__ = [
     "User",
     "VerificationError",
     "VerifyReport",
+    "call_hash",
     "decode_token",
+    "verify_approval_token",
     "verify_token",
 ]

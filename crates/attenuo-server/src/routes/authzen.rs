@@ -21,6 +21,13 @@
 //!   victim's name. Lease ids alone are not secret (they are in every token), which is why they
 //!   are not enough (SR-08).
 //!
+//! **Approval tokens.** A request may carry a signed approval token (output labelling,
+//! ADR-0009) in `context.approval_token`, as the proxy's `params._meta["dev.attenuo/approval"]`
+//! carries it. It is checked against the evaluated call exactly as at the proxy, with the
+//! bearer's `cnf.jkt` as the hop's key binding when the request proved possession of it (an
+//! unsigned body chain has no key binding, so a token minted for a DPoP-bound hop is refused
+//! there). A refused token answers `decision: false` with reason `approval_invalid`.
+//!
 //! The response is the AuthZEN `{decision, context}` with `context.reason`,
 //! `context.policy_ids`, `context.diagnostics` and `context.decision_id` (the audit record).
 //! `context.diagnostics` (effective capabilities, lease ids, Cedar errors) is empty unless
@@ -217,6 +224,8 @@ fn evaluate(
 struct Bearer {
     chain: DelegationChain,
     dpop_bound: bool,
+    /// The token's `cnf.jkt` when `dpop_bound`.
+    jkt: Option<String>,
 }
 
 /// Verify the `Authorization: Bearer` (or `DPoP`) token and its DPoP proof, if the request has
@@ -251,9 +260,13 @@ fn bearer_auth(
         &state.dpop.expected_url_for(headers, path),
         now,
     )?;
+    let jkt = dpop_bound
+        .then(|| v.claims.cnf.as_ref().map(|c| c.jkt.clone()))
+        .flatten();
     Ok(Some(Bearer {
         chain: v.chain,
         dpop_bound,
+        jkt,
     }))
 }
 
@@ -320,7 +333,21 @@ fn evaluate_value(
         tracing::debug!(pep = ?pep, "AuthZEN body chain accepted from an authenticated PEP");
     }
     let call = call.with_dpop_bound(bearer.is_some_and(|b| b.dpop_bound));
-    let mut d = state.pipeline.decide(&chain_value, &call, now);
+    let approval_token = match req.context.as_ref().and_then(|c| c.get("approval_token")) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(t)) => Some(t.clone()),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "invalid_request",
+                "context.approval_token must be a string",
+            ))
+        }
+    };
+    let ctx = attenuo_proxy::CallContext {
+        approval_token,
+        jkt: bearer.and_then(|b| b.jkt.clone()),
+    };
+    let mut d = state.pipeline.decide_with(&chain_value, &call, &ctx, now);
     let allow = d.is_allow();
     // Diagnostics name effective capabilities, lease ids and Cedar errors: reconnaissance for
     // anyone holding a token. Only PEPs get them unless configured otherwise (SR-17).
@@ -348,6 +375,9 @@ fn evaluate_value(
     }
     if let Some((id, by)) = &d.consumed_approval {
         context["approval"] = json!({ "id": id, "by": by });
+        if d.approval_by_token {
+            context["approval"]["presented"] = json!("token");
+        }
     }
     // Run limits (ADR-0010): an evaluation is charged as a proxied call is. Only when a limit
     // matched, so answers about unlimited calls are unchanged.

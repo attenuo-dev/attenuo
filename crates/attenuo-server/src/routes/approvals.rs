@@ -17,6 +17,17 @@
 //! credential an agent redeemed at hop 0 cannot approve that agent's calls. A delegation
 //! token is never accepted for `POST`. `GET` with an ID token does not use the token up.
 //!
+//! **Approval token.** While an approval is granted and unexpired, every answer about it here
+//! (the grant itself and both `GET`s) also carries `approval_token`: a JWT with header
+//! `typ: attenuo-approval+jwt`, signed with the issuer key that signs delegation tokens (same
+//! `kid`, same JWKS), whose claims (`iss`, `aud`, `sub` = the approver, `by`, `chain_id`,
+//! `lease`, `ch` = the call hash, `iat` = when it was granted, `exp` = `expires_at`, `jti` =
+//! the approval id, and `cnf.jkt` when the calling hop's token is DPoP-bound) all come from
+//! the stored approval, so every answer carries the same token
+//! ([`attenuo_token::approval`]). The agent may retry with it in
+//! `params._meta["dev.attenuo/approval"]` (AuthZEN: `context.approval_token`) instead of
+//! relying on the identical-retry lookup; the stored approval still makes it single use.
+//!
 //! The store change and the audit record go together: a grant or decline is written to the
 //! lease store first (which checks the approval is pending and unexpired and its lease live,
 //! in one transaction), then an `approval_grant` record is appended. If the append fails, the
@@ -25,7 +36,7 @@
 
 use std::sync::Arc;
 
-use attenuo_audit::{Approval, ApprovalMethod, Approver, AuditError, LeaseStore};
+use attenuo_audit::{Approval, ApprovalMethod, ApprovalState, Approver, AuditError, LeaseStore};
 use attenuo_core::{
     ApprovalInfo, Decision, DecisionRecord, LeaseId, RecordKind, ToolCall,
     REASON_APPROVAL_DECLINED, REASON_APPROVAL_GRANTED,
@@ -111,6 +122,46 @@ pub fn approval_json(a: &Approval, now: OffsetDateTime) -> Value {
     }
     if let Some(d) = &a.consumed_by {
         v["consumed_by"] = json!(d);
+    }
+    v
+}
+
+/// The approval token for `a` (see the module docs), or `None` unless `a` is granted and
+/// unexpired at `now`.
+pub fn approval_token(
+    issuer: &attenuo_token::Issuer,
+    a: &Approval,
+    now: OffsetDateTime,
+) -> Option<String> {
+    if a.state != ApprovalState::Granted || a.is_expired(now) {
+        return None;
+    }
+    let approver = a.approver.as_ref()?;
+    let grant = attenuo_token::ApprovalGrant {
+        approval_id: &a.id,
+        approver: &approver.subject,
+        by: approver.method.by(),
+        chain_id: &a.chain_id.0,
+        lease: &a.lease.0,
+        call_hash: &a.call_hash,
+        granted_at: a.decided_at.unwrap_or(a.created_at),
+        expires_at: a.expires_at,
+        jkt: a.jkt.as_deref(),
+    };
+    match issuer.issue_approval(&grant) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            tracing::error!(error = %e, approval = %a.id, "approval token could not be signed");
+            None
+        }
+    }
+}
+
+/// [`approval_json`] plus `approval_token` while the approval is granted and unexpired.
+fn approval_body(state: &AppState, a: &Approval, now: OffsetDateTime) -> Value {
+    let mut v = approval_json(a, now);
+    if let Some(t) = approval_token(&state.issuer, a, now) {
+        v["approval_token"] = json!(t);
     }
     v
 }
@@ -286,7 +337,7 @@ pub async fn user_decide(
             decide(s, &id, grant, approver, now)
         })
         .await?;
-    Ok(Json(approval_json(&a, now)))
+    Ok(Json(approval_body(&state, &a, now)))
 }
 
 /// `GET /approvals/{id}`: the approval, for its originating user (ID token, not used up) or
@@ -323,7 +374,7 @@ pub async fn user_get(
     } else {
         verify_user(&state, &a, &token, now).await?;
     }
-    Ok(Json(approval_json(&a, now)))
+    Ok(Json(approval_body(&state, &a, now)))
 }
 
 /// `POST /admin/approvals/{id}` with `{"decision": "grant" | "decline"}`: an operator decides
@@ -343,7 +394,7 @@ pub async fn admin_decide(
                 method: ApprovalMethod::AdminToken,
             };
             let a = decide(s, &id, grant, approver, now)?;
-            Ok(Json(approval_json(&a, now)))
+            Ok(Json(approval_body(s, &a, now)))
         })
         .await
 }
@@ -355,7 +406,7 @@ pub async fn admin_get(
 ) -> Result<Json<Value>, ApiError> {
     let now = now();
     state
-        .blocking(move |s| Ok(Json(approval_json(&load(s, &id)?, now))))
+        .blocking(move |s| Ok(Json(approval_body(s, &load(s, &id)?, now))))
         .await
 }
 

@@ -135,7 +135,23 @@ pub trait LeaseStore: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<Option<Approval>, AuditError>;
 
-    /// Undo [`take_approval`](Self::take_approval) for a decision that did not go through
+    /// [`take_approval`](Self::take_approval) for one approval named by `id` (the `jti` of a
+    /// presented approval token): mark it consumed by `decision_id` only if it is granted,
+    /// unexpired, of the run `chain_id`, of the hop holding `lease` (which must be live) and
+    /// for `call_hash`, in one transaction. `None` otherwise (unknown, pending, declined,
+    /// already consumed, expired, another call or hop, or a dead lease).
+    fn take_approval_by_id(
+        &self,
+        id: &str,
+        chain_id: &LeaseId,
+        lease: &LeaseId,
+        call_hash: &str,
+        decision_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<Approval>, AuditError>;
+
+    /// Undo [`take_approval`](Self::take_approval) (or
+    /// [`take_approval_by_id`](Self::take_approval_by_id)) for a decision that did not go through
     /// (denied anyway, or its audit append failed): an approval consumed by `decision_id` is
     /// granted again. Anything else is left alone.
     fn restore_approval(&self, id: &str, decision_id: &str) -> Result<(), AuditError>;
@@ -633,6 +649,31 @@ impl LeaseStore for MemoryLeaseStore {
             .values_mut()
             .filter(|a| rules::usable(a, chain_id, lease, call_hash, now))
             .min_by(|a, b| a.created_at.cmp(&b.created_at))
+        else {
+            return Ok(None);
+        };
+        a.state = ApprovalState::Consumed;
+        a.consumed_by = Some(decision_id.to_owned());
+        Ok(Some(a.clone()))
+    }
+
+    fn take_approval_by_id(
+        &self,
+        id: &str,
+        chain_id: &LeaseId,
+        lease: &LeaseId,
+        call_hash: &str,
+        decision_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<Approval>, AuditError> {
+        let rows = self.rows.lock()?;
+        if rules::live_lease(lease, rows.get(lease), now).is_err() {
+            return Ok(None);
+        }
+        let mut approvals = self.approvals.lock()?;
+        let Some(a) = approvals
+            .get_mut(id)
+            .filter(|a| rules::usable(a, chain_id, lease, call_hash, now))
         else {
             return Ok(None);
         };

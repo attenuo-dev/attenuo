@@ -151,6 +151,8 @@ when {
 
 The run's originating user grants the approval with their own ID token (`POST /approvals/{id}`), or an operator does (`attenuo approval grant`, or the console). The agent then retries the identical call, same server, tool and arguments, with a token of the same hop. That one retry sees `context.approval.present == true` and `context.approval.by` set to `"user"` or `"operator"`, so the forbid above no longer applies; a second retry asks again. An approval expires after `[approvals] ttl_seconds` (default 120) or with the hop's lease, whichever comes first. To accept only the user's own approval, test `context.approval.by == "user"` instead of `present`.
 
+The grant also returns a signed approval token (`approval_token`, `typ: attenuo-approval+jwt`). An agent may send it with the retry in `params._meta["dev.attenuo/approval"]` (the SDK helpers do); the server then uses exactly the approval the token names, after checking that it is for this call, this hop, this run and, for a DPoP-bound agent, this key. Policy sees the same `context.approval`. A token that fails those checks, or whose approval was already used or declined, denies the call with `approval_invalid` whatever the policy says. Because the token is signed with the issuer key, an external PEP can check it offline; see [Approval tokens](../reference/http-api.md#approval-tokens).
+
 [`config/policies/output-labels.cedar`](../../config/policies/output-labels.cedar) has this rule and the mail rule from the design, with tests in `output-labels_test.yaml` next to it.
 
 ### Run limits

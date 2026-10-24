@@ -32,6 +32,22 @@ pub struct AuthDecision {
     pub limit: Option<serde_json::Value>,
 }
 
+/// The `params._meta` key that carries a signed approval token (output labelling, ADR-0009).
+/// The proxy removes it from every message before the message goes upstream and hands the
+/// token to [`Authorizer::authorize_with`] in [`CallContext::approval_token`].
+pub const META_APPROVAL_KEY: &str = "dev.attenuo/approval";
+
+/// What the proxy knows about a decided call besides the chain and the call itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallContext {
+    /// The signed approval token from `params._meta["dev.attenuo/approval"]`, if the message
+    /// carried one.
+    pub approval_token: Option<String>,
+    /// `cnf.jkt` of the calling hop's token when the request proved possession of its key
+    /// ([`Authenticated::jkt`]).
+    pub jkt: Option<String>,
+}
+
 /// The pending approval behind an `approval_required` decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalTicket {
@@ -196,6 +212,8 @@ pub struct Authenticated {
     pub chain: DelegationChain,
     /// The token is sender-constrained and the request proved possession of its key.
     pub dpop_bound: bool,
+    /// The token's `cnf.jkt` when `dpop_bound`: the key an approval for this hop is bound to.
+    pub jkt: Option<String>,
 }
 
 /// Authentication and authorization, as the proxy sees it.
@@ -221,6 +239,7 @@ pub trait Authorizer: Send + Sync {
         Ok(Authenticated {
             chain: self.authenticate(req.token, now).await?,
             dpop_bound: false,
+            jkt: None,
         })
     }
 
@@ -242,6 +261,21 @@ pub trait Authorizer: Send + Sync {
         call: &ToolCall,
         now: OffsetDateTime,
     ) -> AuthDecision;
+
+    /// [`Authorizer::authorize`] with what the proxy knows about the call besides the chain:
+    /// a presented approval token and the calling hop's key binding. The proxy always calls
+    /// this. The default ignores the context, so authorizers that know nothing of approval
+    /// tokens keep working; the server's authorizer overrides it.
+    async fn authorize_with(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        ctx: &CallContext,
+        now: OffsetDateTime,
+    ) -> AuthDecision {
+        let _ = ctx;
+        self.authorize(chain, call, now).await
+    }
 
     /// Is `(server, tool)` in the tool catalog behind this authorizer? Used by the proxy's
     /// `require_listed_tools` check (SR-25): a `tools/call` whose name the upstream never listed

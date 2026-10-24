@@ -213,18 +213,19 @@ export interface VerifyOptions {
  * required to be present), and that `sub` and `act` agree with `chain`. The detached `ou_sig`
  * over the user block is not checked here; the server checks it on every request.
  */
-export async function verifyToken(
+/**
+ * Check that `alg` is `EdDSA` and the Ed25519 signature of `jwt` verifies under the JWKS key its
+ * `kid` names (the first Ed25519 key without a `kid`). Throws `VerificationError`.
+ */
+export async function checkEd25519Signature(
   jwt: string,
+  header: Record<string, unknown>,
   jwks: Jwks,
-  opts: VerifyOptions = {},
-): Promise<Token> {
-  const tok = decodeToken(jwt);
-  if (tok.header.alg !== "EdDSA") {
-    throw new VerificationError(
-      `unsupported alg ${JSON.stringify(tok.header.alg)}, expected EdDSA`,
-    );
+): Promise<void> {
+  if (header.alg !== "EdDSA") {
+    throw new VerificationError(`unsupported alg ${JSON.stringify(header.alg)}, expected EdDSA`);
   }
-  const kid = tok.header.kid;
+  const kid = header.kid;
   const keys = (jwks.keys ?? []).filter(
     (k) => k.kty === "OKP" && k.crv === "Ed25519" && (kid === undefined || k.kid === kid),
   );
@@ -234,7 +235,7 @@ export async function verifyToken(
       `JWKS has no Ed25519 key${kid === undefined ? "" : ` with kid ${JSON.stringify(kid)}`}`,
     );
   }
-  const [head, payload, sig] = jwt.trim().split(".") as [string, string, string];
+  const [head, payload, sig] = jwt.split(".") as [string, string, string];
   let ok: boolean;
   try {
     const raw = b64urlDecode(key.x ?? "");
@@ -251,6 +252,15 @@ export async function verifyToken(
     throw new VerificationError(`bad JWKS key or signature: ${(e as Error).message}`);
   }
   if (!ok) throw new VerificationError("signature does not match the server's key");
+}
+
+export async function verifyToken(
+  jwt: string,
+  jwks: Jwks,
+  opts: VerifyOptions = {},
+): Promise<Token> {
+  const tok = decodeToken(jwt);
+  await checkEd25519Signature(jwt.trim(), tok.header, jwks);
 
   const c = tok.claims;
   if (c.typ !== TOKEN_TYPE) {

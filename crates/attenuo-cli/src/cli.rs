@@ -419,6 +419,39 @@ pub enum ApprovalCmd {
     Grant { id: String },
     /// Decline a pending approval.
     Decline { id: String },
+    /// Verify a signed approval token (`typ: attenuo-approval+jwt`) offline: the Ed25519
+    /// signature against the issuer's JWKS, `typ`, `iss`, `aud` and `exp`, and, when given, the
+    /// call it must be bound to. Exits 2 when the token does not verify. This proves the grant
+    /// was made; only the server knows whether it was used already.
+    Verify(ApprovalVerifyArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ApprovalVerifyArgs {
+    /// The approval token, or `-` to read it from stdin.
+    pub token: String,
+    /// The issuer's JWKS: an `http(s)://` URL or a file. Default:
+    /// `<server>/.well-known/jwks.json`.
+    #[arg(long, value_name = "URL|PATH")]
+    pub jwks: Option<String>,
+    /// Expected issuer (default: the token's own `iss`).
+    #[arg(long)]
+    pub issuer: Option<String>,
+    /// Expected audience (default: the token's own `aud`).
+    #[arg(long)]
+    pub audience: Option<String>,
+    /// The delegation run the call belongs to (`chain_id`: its first hop's lease).
+    #[arg(long)]
+    pub chain_id: Option<String>,
+    /// The lease of the hop making the call.
+    #[arg(long)]
+    pub lease: Option<String>,
+    /// The call hash (`ch`): SHA-256 of the canonical `{server, tool, arguments}`.
+    #[arg(long)]
+    pub call_hash: Option<String>,
+    /// The calling hop's key thumbprint (`cnf.jkt`); `none` for a bearer hop.
+    #[arg(long)]
+    pub jkt: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1136,6 +1169,26 @@ mod tests {
         assert!(parse(&["approval", "grant", "A"]).is_ok());
         assert!(parse(&["approval", "decline", "A"]).is_ok());
         assert!(parse(&["approval", "grant"]).is_err());
+        let cli = parse(&[
+            "approval",
+            "verify",
+            "a.b.c",
+            "--jwks",
+            "j.json",
+            "--call-hash",
+            "ab",
+            "--jkt",
+            "none",
+        ])
+        .unwrap();
+        let Command::Approval(ApprovalCmd::Verify(v)) = cli.command else {
+            panic!("not verify")
+        };
+        assert_eq!(v.token, "a.b.c");
+        assert_eq!(v.jwks.as_deref(), Some("j.json"));
+        assert_eq!(v.call_hash.as_deref(), Some("ab"));
+        assert_eq!(v.jkt.as_deref(), Some("none"));
+        assert!(parse(&["approval", "verify"]).is_err());
     }
 
     #[test]

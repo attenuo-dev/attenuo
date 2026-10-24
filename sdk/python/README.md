@@ -65,7 +65,7 @@ print(admin.audit_verify())  # VerifyReport(ok=True, entries=..., ...)
 | `exchange(subject_token, actor, capabilities, ttl_seconds=None, client_id=None, client_secret=None, subject_token_type=None, *, actor_token=None, may_act=None)` | RFC 8693 exchange. Returns a `Token`. From a delegation token, `client_secret` is the actor's `[[agents]]` secret (`client_id` defaults to `actor`), which the server requires by default. From any other subject token, `client_id` and `client_secret` make it a hop-0 exchange of an IdP credential (`subject_token_type="...:id-jag"` for an ID-JAG). A parent token can be exchanged for a given actor once. `actor_token` (a workload-identity JWT such as a SPIFFE JWT-SVID from an `[[actor_trust]]` issuer) authenticates the actor instead of a secret, depending on `[token] actor_auth`; each one works for one exchange. `may_act` lists the agents allowed to exchange the new token next. |
 | `renew(token)`                                                                                       | `POST /token/renew`. Returns `Lease(lease, expires_at, expires_in)`.                                                                                                                                                                                                                                                                                                                                              |
 | `call_tool(token, server, tool, arguments, session_id=None)`                                         | `tools/call` through `/mcp/{server}`. Returns `ToolResult` (`.text`, `.content`, `.is_error`, `.decision_id`).                                                                                                                                                                                                                                                                                                    |
-| `call_tool_with_approval(token, server, tool, arguments, *, on_approval=None, timeout=None, interval=2.0)` | `call_tool`; when the call needs an approval (`-32008`), calls `on_approval(err)`, waits for the grant, and retries the identical call once. See [Approvals](#approvals). |
+| `call_tool_with_approval(token, server, tool, arguments, *, on_approval=None, timeout=None, interval=2.0)` | `call_tool`; when the call needs an approval (`-32008`), calls `on_approval(err)`, waits for the grant, and retries the call once, with the grant's `approval_token` when it has one. `call_tool(..., approval_token=...)` sends a token yourself. See [Approvals](#approvals). |
 | `get_approval(approval_id, token)`, `wait_for_approval(approval_id, token, *, timeout=None, interval=2.0)` | `GET /approvals/{id}` as the agent (same run, DPoP signed when the client has a key); `wait_for_approval` polls until granted and raises `ApprovalNotGranted` otherwise. |
 | `list_tools(token, server)`                                                                          | `tools/list`, filtered by the proxy to what the token may call.                                                                                                                                                                                                                                                                                                                                                   |
 | `initialize(token, server)`                                                                          | MCP `initialize`; returns the `Mcp-Session-Id`, if any.                                                                                                                                                                                                                                                                                                                                                           |
@@ -228,6 +228,24 @@ except ApprovalNotGranted as e:
 ```
 
 `approval_id` is `None` when the server could not open an approval; treat that as a plain denial. Like `-32003`, a `-32008` counts only when the `X-Attenuo-Decision-Id` header names its `data.decision_id`; otherwise it is an upstream's own `RpcError`.
+
+A granted `Approval` carries `approval_token`, a JWT signed with the server's issuer key (`typ: attenuo-approval+jwt`) and bound to the run, the hop's lease, the call hash and, for a DPoP-bound agent, its key. `call_tool_with_approval` retries with it in `params._meta["dev.attenuo/approval"]`; a token the server refuses is a `Denied` with reason `approval_invalid`. An external enforcement point can check a token offline against the JWKS:
+
+```python
+from attenuo import call_hash, verify_approval_token
+
+claims = verify_approval_token(
+    token_from_agent,
+    ob.jwks(),
+    chain_id=run_id,
+    lease=hop_lease,
+    call_hash=call_hash("github", "delete_repo", {"repo": "alice/site"}),
+    jkt=None,  # the hop's cnf.jkt, or None for a bearer hop
+)
+print(claims.approval_id, claims.by, claims.expires_at)
+```
+
+It raises `VerificationError` on a bad signature, `typ`, expiry or binding. It proves the grant was made; only the server knows whether it has been used (needs the `verify` extra).
 
 ### Errors
 

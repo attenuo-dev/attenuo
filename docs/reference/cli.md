@@ -285,7 +285,7 @@ Parse a Cedar policy file and validate it against the generated schema. Prints e
 | `--config` | Server config whose `[policy.catalog]` declares the tools, or a JSON catalog. Without it, the tools are declared from the policy's own `<server>/<tool>` action names and a `note:` lists what could not be checked (tool attributes, input types, user attributes). |
 | `--schema` | Also print the generated schema. |
 
-### `approval list` / `show` / `grant` / `decline`
+### `approval list` / `show` / `grant` / `decline` / `verify`
 
 Approvals of gated calls, as the operator (admin token, `ATTENUO_ADMIN_TOKEN`).
 
@@ -295,6 +295,9 @@ Approvals of gated calls, as the operator (admin token, `ATTENUO_ADMIN_TOKEN`).
 | `approval show <ID>` | `GET /admin/approvals/{id}`: the exact call with its arguments, the call hash, user, agents, run and lease, the labels the run carried with their audit seqs, the times, and who decided. |
 | `approval grant <ID>` | `POST /admin/approvals/{id}` with `grant`. The agent's identical retry then runs once. Recorded as `by = "operator"`. |
 | `approval decline <ID>` | The same with `decline`. |
+| `approval verify <TOKEN> [--jwks URL\|PATH] [--issuer S] [--audience S] [--chain-id ID] [--lease ID] [--call-hash HEX] [--jkt JKT\|none]` | Offline: verifies a signed approval token (`typ: attenuo-approval+jwt`) against the issuer's JWKS (an `http(s)` URL, a file, or `<server>/.well-known/jwks.json` by default): signature, `typ`, `iss` and `aud` (default: the token's own), `exp`, and each binding given (`--jkt none` for a bearer hop). Prints the claims and `VALID` or `INVALID: <reason>`, exit 0 or 2; `--json` prints `{header, claims, valid, error}`. `-` reads the token from stdin. It proves the grant was made, not that it is unused. |
+
+The grant's answer (and `approval show` while the approval is granted) carries `approval_token`, which an agent may send with its retry instead of relying on the identical-call lookup ([HTTP API](http-api.md#approval-tokens)).
 
 A grant or decline of an approval that is no longer pending fails with `approval_not_pending`, `approval_expired` or `lease_revoked`. `--json` prints the server's answer. A user approves with their own ID token at `POST /approvals/{id}`; the CLI does not do that for them.
 

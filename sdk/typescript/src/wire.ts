@@ -69,7 +69,9 @@ export interface Tool {
  * An approval as `GET /approvals/{id}` and the `/admin/approvals` routes show it. Fields not
  * named here (`labels`, `decision_id`, `created_at`, ...) are in `raw`. `state` is `pending`, `granted`, `declined` or
  * `consumed`; `expired` is the server's view of whether `expiresAt` has passed. `usable` is true
- * for a grant that a retry of the identical call can still use.
+ * for a grant that a retry of the identical call can still use. `approvalToken` is the signed
+ * approval token (`attenuo-approval+jwt`) the server returns while the approval is granted and
+ * unexpired, else `undefined` (see `verifyApprovalToken`).
  */
 export interface Approval {
   approvalId: string;
@@ -84,6 +86,7 @@ export interface Approval {
   expiresAt: Date | undefined;
   approver: Json | undefined;
   consumedBy: string | undefined;
+  approvalToken: string | undefined;
   raw: Json;
 }
 
@@ -120,6 +123,10 @@ export function approvalFromJson(body: unknown): Approval {
     expiresAt: optTime(body.expires_at),
     approver: isObject(body.approver) ? body.approver : undefined,
     consumedBy: typeof body.consumed_by === "string" ? body.consumed_by : undefined,
+    approvalToken:
+      typeof body.approval_token === "string" && body.approval_token !== ""
+        ? body.approval_token
+        : undefined,
     raw: body,
   };
 }
