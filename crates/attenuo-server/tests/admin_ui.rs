@@ -18,7 +18,7 @@ struct Harness {
     main: Spawned,
     /// The console listener.
     console: Spawned,
-    _state: Arc<AppState>,
+    state: Arc<AppState>,
     _dir: tempfile::TempDir,
 }
 
@@ -48,7 +48,7 @@ impl Harness {
         Self {
             main,
             console,
-            _state: state,
+            state,
             _dir: dir,
         }
     }
@@ -763,4 +763,79 @@ async fn selector_revocation_works_on_the_console_with_allow_write() {
         .unwrap();
     assert_eq!(body["revoked"], json!([second]));
     assert_eq!(body["reason"], "revoked by admin");
+}
+
+/// Revoke by session on the console listener: the dry run is served without `allow_write` (an
+/// unknown session matches nothing, a bound one resolves to its chain), a revocation is a 404
+/// there, and with `allow_write` it revokes the chain. The raw id is never echoed back.
+#[tokio::test]
+async fn session_revocation_on_the_console_previews_without_allow_write_and_revokes_with_it() {
+    use attenuo_audit::LeaseStore;
+    use attenuo_proxy::session::{session_digest, session_tag};
+
+    const RAW: &str = "console-raw-session-id";
+    for allow_write in [false, true] {
+        let h = Harness::start(allow_write).await;
+        let lease = h.mint_root().await;
+        h.state
+            .leases
+            .record_session(
+                &session_digest(RAW),
+                "github",
+                &attenuo_core::LeaseId::new(lease.clone()),
+                time::OffsetDateTime::now_utc(),
+            )
+            .unwrap();
+        let post = |query: &'static str, body: Value| {
+            Harness::client()
+                .post(h.console.url(&format!("/admin/leases/revoke{query}")))
+                .bearer_auth(ADMIN)
+                .json(&body)
+                .send()
+        };
+
+        let r = post("?preview=true", json!({"session": "never-seen"}))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body["selector"]["chain_ids"], json!([]));
+        assert_eq!(body["matched_count"], 0);
+
+        let r = post("?preview=true", json!({"session": RAW}))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let text = r.text().await.unwrap();
+        assert!(!text.contains(RAW), "{text}");
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            body["selector"],
+            json!({"session_tag": session_tag(RAW), "chain_ids": [lease]})
+        );
+        assert_eq!(body["preview"], true);
+        assert_eq!(body["revoked"], json!([lease]));
+
+        let r = post("", json!({"session": RAW, "reason": "hijacked"}))
+            .await
+            .unwrap();
+        let status: Value = h
+            .admin_get(&format!("/admin/leases/{lease}"))
+            .await
+            .json()
+            .await
+            .unwrap();
+        if allow_write {
+            assert_eq!(r.status(), StatusCode::OK);
+            let text = r.text().await.unwrap();
+            assert!(!text.contains(RAW), "{text}");
+            let body: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(body["revoked"], json!([lease]));
+            assert!(body["audit_id"].is_string());
+            assert_eq!(status["active"], false);
+        } else {
+            assert_eq!(r.status(), StatusCode::NOT_FOUND);
+            assert_eq!(status["active"], true, "nothing was revoked");
+        }
+    }
 }

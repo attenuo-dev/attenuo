@@ -85,6 +85,8 @@ impl From<&RecordFilter> for EntryFilter {
         Self {
             kinds: f.kind.into_iter().collect(),
             chain_id: f.chain_id.clone(),
+            tool: f.tool.clone(),
+            decision: f.decision.clone(),
             ..Self::default()
         }
     }
@@ -125,6 +127,7 @@ mod tests {
         let rf = RecordFilter {
             kind: Some(RecordKind::Exchange),
             chain_id: Some("root".into()),
+            ..Default::default()
         };
         let ef = EntryFilter::from(&rf);
         assert_eq!(ef.kinds, vec![RecordKind::Exchange]);

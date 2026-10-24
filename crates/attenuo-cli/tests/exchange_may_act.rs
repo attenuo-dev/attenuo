@@ -159,6 +159,72 @@ async fn no_delegation_makes_a_token_nobody_may_exchange() {
         "--kind exchange lists issued exchanges only"
     );
 
+    // `audit export --tool token.exchange --decision deny` holds exactly the refusal, and its
+    // header names both filters.
+    let export = ok(&run(audit(&[
+        "audit",
+        "export",
+        "--tool",
+        "token.exchange",
+        "--decision",
+        "deny",
+    ]))
+    .await);
+    let lines: Vec<Value> = export
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines[0]["type"], "header", "{export}");
+    assert_eq!(
+        lines[0]["filter"],
+        serde_json::json!({"tool": "token.exchange", "decision": "deny"}),
+        "{export}"
+    );
+    let entries: Vec<&Value> = lines.iter().filter(|l| l["type"] == "entry").collect();
+    assert_eq!(entries.len(), 1, "{export}");
+    assert_eq!(entries[0]["record"]["id"], refused_id.as_str());
+    assert_eq!(entries[0]["record"]["tool"], "token.exchange");
+    assert_eq!(entries[0]["record"]["decision"], "deny");
+
+    // `audit verify --file` refuses it exactly as it refuses a `--kind` export, and accepts
+    // the unfiltered one.
+    let verify_file = |name: &str, args: &[&str]| {
+        let path = dir.path().join(name);
+        let mut c = audit(&["audit", "export", "--out"]);
+        c.arg(&path).args(args);
+        (c, path)
+    };
+    let mut refusals = Vec::new();
+    for (name, args) in [
+        ("kind.jsonl", &["--kind", "exchange"][..]),
+        (
+            "tool.jsonl",
+            &["--tool", "token.exchange", "--decision", "deny"][..],
+        ),
+        ("decision.jsonl", &["--decision", "allow"][..]),
+    ] {
+        let (c, path) = verify_file(name, args);
+        ok(&run(c).await);
+        let mut v = audit(&["audit", "verify", "--allow-unsigned-tail", "--file"]);
+        v.arg(&path);
+        let out = run(v).await;
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(err.contains("the export is filtered"), "{name}: {err}");
+        refusals.push((out.status.code(), err));
+    }
+    assert!(refusals.windows(2).all(|w| w[0] == w[1]), "{refusals:?}");
+    let (c, path) = verify_file("all.jsonl", &[]);
+    ok(&run(c).await);
+    let mut v = audit(&["audit", "verify", "--allow-unsigned-tail", "--file"]);
+    v.arg(&path);
+    ok(&run(v).await);
+
+    // A bad value fails before any request, as on `audit tail`.
+    let out = run(audit(&["audit", "export", "--decision", "maybe"])).await;
+    assert_eq!(out.status.code(), Some(2));
+    let out = run(audit(&["audit", "export", "--tool", ""])).await;
+    assert_eq!(out.status.code(), Some(2));
+
     // Without either flag the new token carries no `may_act`: anyone authenticated may
     // exchange it (it does not inherit the parent's list).
     let root2 = {

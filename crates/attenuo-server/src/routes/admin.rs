@@ -1045,6 +1045,10 @@ pub struct ExportQuery {
     pub kind: Option<String>,
     /// Only records of this delegation chain (the `chain_id` field).
     pub chain_id: Option<String>,
+    /// Only records for this tool (the `tool` field, for example `token.exchange`).
+    pub tool: Option<String>,
+    /// Only records with this decision (`allow` or `deny`).
+    pub decision: Option<String>,
 }
 
 /// Where a streaming export is.
@@ -1059,8 +1063,9 @@ enum ExportPhase {
 /// `attenuo_audit::export`), streamed a page at a time so a large range never sits in memory.
 /// Verify the result offline with `attenuo audit verify --file`.
 ///
-/// `kind` and `chain_id` keep only the matching entries. The header then carries a `filter`
-/// member and the file cannot be verified (its chain has gaps); verify an unfiltered export.
+/// `kind`, `chain_id`, `tool` and `decision` keep only the matching entries. The header then
+/// carries a `filter` member and the file cannot be verified (its chain has gaps); verify an
+/// unfiltered export.
 pub async fn audit_export(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ExportQuery>,
@@ -1085,21 +1090,26 @@ pub async fn audit_export(
             "`to` must not be smaller than `from`",
         ));
     }
-    let filter = attenuo_audit::RecordFilter {
-        kind: q
-            .kind
-            .as_deref()
-            .map(str::parse)
-            .transpose()
-            .map_err(|e: String| ApiError::bad_request("invalid_request", e))?,
+    // Same parsing (and the same 400s) as `GET /admin/audit`'s filters of the same names.
+    let parsed = entry_filter(&AuditQuery {
+        kind: q.kind.clone(),
         chain_id: q.chain_id.clone(),
-    };
-    if filter.chain_id.as_deref() == Some("") {
+        tool: q.tool.clone(),
+        decision: q.decision.clone(),
+        ..AuditQuery::default()
+    })?;
+    if parsed.kinds.len() > 1 {
         return Err(ApiError::bad_request(
             "invalid_request",
-            "`chain_id` must not be empty",
+            "`kind` takes a single kind on an export",
         ));
     }
+    let filter = attenuo_audit::RecordFilter {
+        kind: parsed.kinds.first().copied(),
+        chain_id: parsed.chain_id,
+        tool: parsed.tool,
+        decision: parsed.decision,
+    };
     let exported_at = now().format(&Rfc3339).map_err(ApiError::internal)?;
     let header = attenuo_audit::header_line(
         &attenuo_audit::ExportHeader::new(from, to, exported_at).with_filter(filter.clone()),

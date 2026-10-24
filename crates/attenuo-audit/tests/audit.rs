@@ -440,10 +440,12 @@ fn range_filtered_matches_kind_and_chain_id_within_the_range() {
     let kind = |k| RecordFilter {
         kind: Some(k),
         chain_id: None,
+        ..Default::default()
     };
     let chain = |c: &str| RecordFilter {
         kind: None,
         chain_id: Some(c.into()),
+        ..Default::default()
     };
     assert_eq!(seqs(RecordFilter::default(), 1, 6), [1, 2, 3, 4, 5, 6]);
     assert_eq!(seqs(kind(RecordKind::Decision), 1, 6), [2, 4, 6]);
@@ -455,6 +457,7 @@ fn range_filtered_matches_kind_and_chain_id_within_the_range() {
     let both = RecordFilter {
         kind: Some(RecordKind::Exchange),
         chain_id: Some("m1".into()),
+        ..Default::default()
     };
     assert_eq!(seqs(both, 1, 6), [3]);
     // The limit applies to matches.
@@ -487,6 +490,7 @@ fn a_filtered_export_is_marked_and_refused_by_verification() {
     let f = RecordFilter {
         kind: Some(RecordKind::LeaseRevoke),
         chain_id: None,
+        ..Default::default()
     };
     let line = attenuo_audit::header_line(&h.clone().with_filter(f.clone()));
     assert!(
@@ -509,6 +513,116 @@ fn a_filtered_export_is_marked_and_refused_by_verification() {
     assert_eq!(export.header.unwrap().filter, Some(f));
     let keys = attenuo_audit::CheckpointKeys::from_jwks(&serde_json::json!({"keys": []})).unwrap();
     let export = attenuo_audit::parse_export(&text).unwrap();
+    let err = attenuo_audit::verify_export(&export, &keys).unwrap_err();
+    assert!(err.to_string().contains("filtered"), "{err}");
+}
+
+#[test]
+fn range_filtered_matches_tool_and_decision() {
+    let s = SqliteAudit::open_in_memory().unwrap();
+    let c = chain("user:mudit", ("l1", "l2"));
+    let calls = [
+        ("token.exchange", Decision::Allow),
+        ("token.exchange", Decision::Deny),
+        ("create_issue", Decision::Deny),
+    ];
+    for (i, (tool, d)) in calls.into_iter().enumerate() {
+        let mut r = record_for(&c, i, d);
+        r.tool = tool.into();
+        s.append(r).unwrap();
+    }
+    let seqs = |f: RecordFilter| -> Vec<u64> {
+        s.range_filtered(1, 3, &f, 100)
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect()
+    };
+    let deny = RecordFilter {
+        decision: Some(Decision::Deny),
+        ..Default::default()
+    };
+    assert_eq!(seqs(deny.clone()), [2, 3]);
+    let exchange = RecordFilter {
+        tool: Some("token.exchange".into()),
+        ..Default::default()
+    };
+    assert_eq!(seqs(exchange.clone()), [1, 2]);
+    let both = RecordFilter {
+        decision: Some(Decision::Deny),
+        ..exchange
+    };
+    assert_eq!(seqs(both), [2]);
+    let nope = RecordFilter {
+        tool: Some("no.such.tool".into()),
+        ..Default::default()
+    };
+    assert_eq!(seqs(nope), Vec::<u64>::new());
+    assert!(s.verify_chain().unwrap().ok);
+}
+
+#[test]
+fn an_export_filtered_on_tool_or_decision_names_them_and_is_refused() {
+    let keys = attenuo_audit::CheckpointKeys::from_jwks(&serde_json::json!({"keys": []})).unwrap();
+    let h = ExportHeader::new(1, 6, "2026-10-23T00:00:00Z".into());
+    for f in [
+        RecordFilter {
+            tool: Some("token.exchange".into()),
+            ..Default::default()
+        },
+        RecordFilter {
+            decision: Some(Decision::Deny),
+            ..Default::default()
+        },
+        RecordFilter {
+            tool: Some("token.exchange".into()),
+            decision: Some(Decision::Deny),
+            ..Default::default()
+        },
+    ] {
+        let line = attenuo_audit::header_line(&h.clone().with_filter(f.clone()));
+        let export = attenuo_audit::parse_export(&line).unwrap();
+        assert_eq!(export.header.as_ref().unwrap().filter, Some(f), "{line}");
+        let err = attenuo_audit::verify_export(&export, &keys).unwrap_err();
+        assert!(err.to_string().contains("filtered"), "{err}");
+    }
+    let line = attenuo_audit::header_line(&h.with_filter(RecordFilter {
+        tool: Some("token.exchange".into()),
+        decision: Some(Decision::Deny),
+        ..Default::default()
+    }));
+    assert!(
+        line.contains(r#""filter":{"decision":"deny","tool":"token.exchange"}"#),
+        "{line}"
+    );
+}
+
+/// Headers written before `filter.tool` and `filter.decision` existed: an unfiltered one and a
+/// `--kind`/`--chain-id` one, byte for byte as that version wrote them. Both still parse to
+/// the same header, the unfiltered one still verifies, and the filtered one is still refused.
+#[test]
+fn headers_written_before_tool_and_decision_filters_still_read_the_same() {
+    let plain = r#"{"exported_at":"2026-10-23T00:00:00Z","format":"attenuo-audit-export-v2","from":1,"to":0,"type":"header"}"#;
+    let export = attenuo_audit::parse_export(plain).unwrap();
+    let header = export.header.clone().unwrap();
+    assert_eq!(header.filter, None);
+    assert_eq!(attenuo_audit::header_line(&header).trim_end(), plain);
+    let keys = attenuo_audit::CheckpointKeys::from_jwks(&serde_json::json!({"keys": []})).unwrap();
+    attenuo_audit::verify_export(&export, &keys).unwrap();
+
+    let filtered = r#"{"exported_at":"2026-10-23T00:00:00Z","filter":{"chain_id":"l1","kind":"exchange"},"format":"attenuo-audit-export-v2","from":1,"to":6,"type":"header"}"#;
+    let export = attenuo_audit::parse_export(filtered).unwrap();
+    let header = export.header.clone().unwrap();
+    assert_eq!(
+        header.filter,
+        Some(RecordFilter {
+            kind: Some(RecordKind::Exchange),
+            chain_id: Some("l1".into()),
+            tool: None,
+            decision: None,
+        })
+    );
+    assert_eq!(attenuo_audit::header_line(&header).trim_end(), filtered);
     let err = attenuo_audit::verify_export(&export, &keys).unwrap_err();
     assert!(err.to_string().contains("filtered"), "{err}");
 }

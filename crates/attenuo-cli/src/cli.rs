@@ -640,15 +640,23 @@ pub enum AuditCmd {
         out: Option<std::path::PathBuf>,
         /// Keep only records of this kind: decision, tool_result, exchange, root_token,
         /// lease_renew, lease_revoke or admin. A refused exchange or renewal is a `decision`,
-        /// not an `exchange` or `lease_renew`; `audit tail --tool token.exchange --decision
-        /// deny` lists those. A filtered export has gaps in its hash chain, so
-        /// `audit verify --file` refuses it; verify an unfiltered export, then filter.
+        /// not an `exchange` or `lease_renew`; `--tool token.exchange --decision deny` exports
+        /// those. A filtered export has gaps in its hash chain, so `audit verify --file`
+        /// refuses it; verify an unfiltered export, then filter.
         #[arg(long, value_parser = parse_record_kind)]
         kind: Option<attenuo_core::RecordKind>,
         /// Keep only records of this delegation chain (the `chain_id` field: the lease id of
         /// the chain's first hop). Same verification caveat as `--kind`.
         #[arg(long)]
         chain_id: Option<String>,
+        /// Keep only records for this tool, as `audit tail --tool` (`token.exchange`,
+        /// `lease.renew`, `admin.*` or an MCP tool name). Same verification caveat as `--kind`.
+        #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+        tool: Option<String>,
+        /// Keep only records with this decision, `allow` or `deny`, as `audit tail
+        /// --decision`. Same verification caveat as `--kind`.
+        #[arg(long, value_enum)]
+        decision: Option<DecisionArg>,
     },
 }
 
@@ -661,6 +669,15 @@ fn parse_record_kind(s: &str) -> Result<attenuo_core::RecordKind, String> {
 pub enum DecisionArg {
     Allow,
     Deny,
+}
+
+impl From<DecisionArg> for attenuo_core::Decision {
+    fn from(d: DecisionArg) -> Self {
+        match d {
+            DecisionArg::Allow => Self::Allow,
+            DecisionArg::Deny => Self::Deny,
+        }
+    }
 }
 
 /// Filters of `GET /admin/audit`, all exact matches combined with AND. Checked here as far as
