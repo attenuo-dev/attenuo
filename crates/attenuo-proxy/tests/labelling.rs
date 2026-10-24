@@ -235,3 +235,232 @@ async fn tool_annotations_are_reported_before_filtering() {
         ]
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Answers on the GET listen stream
+// ---------------------------------------------------------------------------------------------
+
+/// An upstream that answers `tools/call` with `202` and sends the response on its `GET`
+/// listen stream instead, as the MCP streamable HTTP transport allows when a stream is resumed.
+/// `inject` puts any other message on that stream.
+#[derive(Clone)]
+struct ListenUpstream {
+    inject: tokio::sync::mpsc::UnboundedSender<Value>,
+    events: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Value>>>>,
+}
+
+const LISTEN_SESSION: &str = "listen-sess";
+
+impl ListenUpstream {
+    fn new() -> Self {
+        let (inject, rx) = tokio::sync::mpsc::unbounded_channel();
+        Self {
+            inject,
+            events: Arc::new(std::sync::Mutex::new(Some(rx))),
+        }
+    }
+
+    fn router(&self) -> axum::Router {
+        use axum::http::{header, HeaderValue, StatusCode};
+        use axum::response::IntoResponse;
+        let (post_me, get_me) = (self.clone(), self.clone());
+        axum::Router::new().route(
+            "/mcp",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                let me = post_me.clone();
+                async move {
+                    let msg: Value = serde_json::from_slice(&body).unwrap();
+                    let mut resp = if msg["method"] == "tools/call" {
+                        me.inject
+                            .send(json!({"jsonrpc": "2.0", "id": msg["id"],
+                                         "result": {"content": [{"type": "text", "text": "late"}],
+                                                    "isError": false}}))
+                            .unwrap();
+                        StatusCode::ACCEPTED.into_response()
+                    } else {
+                        (
+                            [(header::CONTENT_TYPE, "application/json")],
+                            json!({"jsonrpc": "2.0", "id": msg["id"], "result": {}}).to_string(),
+                        )
+                            .into_response()
+                    };
+                    resp.headers_mut()
+                        .insert("mcp-session-id", HeaderValue::from_static(LISTEN_SESSION));
+                    resp
+                }
+            })
+            .get(move || {
+                let me = get_me.clone();
+                async move {
+                    let rx = me.events.lock().unwrap().take().expect("one listen stream");
+                    let ready = json!({"jsonrpc": "2.0", "method": "notifications/message",
+                                       "params": {"level": "info", "data": "ready"}});
+                    let first = futures_util::stream::iter([ready]);
+                    let rest = futures_util::stream::unfold(rx, |mut rx| async move {
+                        rx.recv().await.map(|v| (v, rx))
+                    });
+                    let events = futures_util::StreamExt::map(
+                        futures_util::StreamExt::chain(first, rest),
+                        |v| {
+                            Ok::<_, std::io::Error>(axum::body::Bytes::from(format!(
+                                "event: message\ndata: {v}\n\n"
+                            )))
+                        },
+                    );
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        axum::body::Body::from_stream(events),
+                    )
+                        .into_response()
+                }
+            }),
+        )
+    }
+}
+
+struct Listening {
+    _upstream_task: Spawned,
+    proxy: Spawned,
+    authorizer: Arc<StaticAuthorizer>,
+    upstream: ListenUpstream,
+    stream: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = reqwest::Result<axum::body::Bytes>> + Send>,
+    >,
+    buf: String,
+}
+
+impl Listening {
+    /// Open a session (`initialize`) and its `GET` listen stream, and read the first event.
+    async fn start(authorizer: StaticAuthorizer) -> Self {
+        let upstream = ListenUpstream::new();
+        let upstream_task = spawn_router(upstream.router()).await.unwrap();
+        let chain = test_chain("user:a", "agent:a", [Capability::new("s", "read_*")]);
+        let authorizer = Arc::new(authorizer.with_chain(BEARER, chain));
+        let config = ProxyConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![UpstreamConfig::new("s", upstream_task.url("/mcp"))],
+        );
+        let proxy = spawn_router(router(config, authorizer.clone()))
+            .await
+            .unwrap();
+        let init = reqwest::Client::new()
+            .post(proxy.url("/mcp/s"))
+            .bearer_auth(BEARER)
+            .json(&json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(init.headers()["mcp-session-id"], LISTEN_SESSION);
+        let resp = reqwest::Client::new()
+            .get(proxy.url("/mcp/s"))
+            .bearer_auth(BEARER)
+            .header("accept", "text/event-stream")
+            .header("mcp-session-id", LISTEN_SESSION)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let mut me = Self {
+            _upstream_task: upstream_task,
+            proxy,
+            authorizer,
+            upstream,
+            stream: Box::pin(resp.bytes_stream()),
+            buf: String::new(),
+        };
+        assert_eq!(me.next_message().await["params"]["data"], "ready");
+        me
+    }
+
+    /// The next JSON-RPC message on the listen stream.
+    async fn next_message(&mut self) -> Value {
+        use futures_util::StreamExt;
+        loop {
+            if let Some(end) = self.buf.find("\n\n") {
+                let event: String = self.buf.drain(..end + 2).collect();
+                let data = event
+                    .lines()
+                    .find_map(|l| l.strip_prefix("data: "))
+                    .expect("data line");
+                return serde_json::from_str(data).unwrap();
+            }
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), self.stream.next())
+                .await
+                .expect("an event within 5 s")
+                .expect("stream open")
+                .unwrap();
+            self.buf.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+    }
+
+    /// POST a `tools/call` in the session; the upstream answers `202`.
+    async fn call(&self, id: u64) {
+        let resp = reqwest::Client::new()
+            .post(self.proxy.url("/mcp/s"))
+            .bearer_auth(BEARER)
+            .header("mcp-session-id", LISTEN_SESSION)
+            .json(&call(id, "read_file"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 202);
+    }
+}
+
+#[tokio::test]
+async fn an_answer_on_the_listen_stream_is_recorded_before_relay() {
+    let mut l = Listening::start(StaticAuthorizer::new()).await;
+    l.call(7).await;
+    let m = l.next_message().await;
+    assert_eq!(m["id"], 7);
+    assert_eq!(m["result"]["content"][0]["text"], "late");
+    let recorded = l.authorizer.recorded_results();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].call.tool, "read_file");
+    assert!(!recorded[0].is_error);
+    assert_eq!(recorded[0].result["content"][0]["text"], "late");
+    let decision = &l.authorizer.decisions()[0];
+    assert_eq!(recorded[0].decision_id, decision.id);
+
+    // The call was claimed: the same id again is a response to nothing the proxy allowed.
+    l.upstream
+        .inject
+        .send(json!({"jsonrpc": "2.0", "id": 7, "result": {"again": true}}))
+        .unwrap();
+    assert_eq!(l.next_message().await["result"]["again"], true);
+    assert_eq!(l.authorizer.recorded_results().len(), 1);
+}
+
+#[tokio::test]
+async fn an_answer_on_the_listen_stream_that_cannot_be_recorded_is_withheld() {
+    let auth = StaticAuthorizer::new();
+    auth.fail_results(true);
+    let mut l = Listening::start(auth).await;
+    l.call(3).await;
+    let m = l.next_message().await;
+    assert_eq!(m["id"], 3);
+    assert_eq!(m["error"]["code"], CODE_DENIED, "{m}");
+    assert_eq!(m["error"]["data"]["reason"], "label_error");
+    let decision = &l.authorizer.decisions()[0];
+    assert_eq!(m["error"]["data"]["decision_id"], decision.id.to_string());
+    assert!(m.get("result").is_none());
+}
+
+#[tokio::test]
+async fn unmatched_responses_and_notifications_on_the_listen_stream_pass_through() {
+    let mut l = Listening::start(StaticAuthorizer::new()).await;
+    l.call(1).await;
+    assert_eq!(l.next_message().await["id"], 1);
+    let unmatched = json!({"jsonrpc": "2.0", "id": 99, "result": {"content": []}});
+    let note = json!({"jsonrpc": "2.0", "method": "notifications/progress",
+                      "params": {"progress": 1}});
+    l.upstream.inject.send(unmatched.clone()).unwrap();
+    l.upstream.inject.send(note.clone()).unwrap();
+    assert_eq!(l.next_message().await, unmatched);
+    assert_eq!(l.next_message().await, note);
+    assert_eq!(
+        l.authorizer.recorded_results().len(),
+        1,
+        "only the call's answer"
+    );
+}

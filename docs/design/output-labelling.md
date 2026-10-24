@@ -58,6 +58,8 @@ The unit of taint is the delegation run, keyed by `chain_id` (the lease id of th
 
 If the label cannot be recorded (audit append fails, taint store unavailable) the result is not delivered: the agent gets a JSON-RPC error with reason `label_error`. The call has already executed upstream, but the untrusted content never reaches the model. This mirrors `audit_error` for decisions. Lookups fail the other way: a taint store that cannot be read counts as tainted.
 
+An answer can also arrive on the `GET` listen stream of MCP streamable HTTP, after the upstream answered the `POST` with `202` or when the client resumes a broken-off stream. The proxy remembers each allowed call, keyed by upstream, session, run and request id, until it is answered or 10 minutes pass, and treats a response on the listen stream that answers one exactly like an answer in the `POST` body: recorded before it is relayed, and replaced by the `label_error` error, on the stream, if the record cannot be written. Responses on that stream that answer no remembered call, and notifications, pass through as before ([server](server.md#output-labelling)).
+
 ### 3.3 Option (a): session-level taint
 
 Once a run has read untrusted data, a call to a destructive tool requires a fresh confirmation, or is permitted only through a narrower token.

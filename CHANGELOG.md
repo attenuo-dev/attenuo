@@ -47,6 +47,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ### Changed
 
+- Output labelling: an answer to an allowed `tools/call`, `resources/read`, `prompts/get` or `completion/complete` that the upstream sends on the `GET` listen stream (after answering the `POST` with `202`, or on a resumed stream) is now recorded as a `tool_result` for the call's `decision_id` before it is relayed, and withheld with `-32003` `label_error` on the stream when the record cannot be written, as for an answer in the `POST` body. The proxy remembers allowed calls by upstream, `Mcp-Session-Id`, `chain_id` and request id for at most 10 minutes, at most 256 per session and 10,000 in all (constants in `attenuo_proxy::label`); unmatched responses and notifications on the stream pass through unchanged.
 - SDKs: a `-32008` that the proxy vouches for (its `decision_id` is in `X-Attenuo-Decision-Id`) is now raised as `ApprovalRequired` (Python) or `ApprovalRequiredError` (TypeScript), subclasses of `Denied` / `DeniedError`, instead of `RpcError`.
 - The bundled SQLite (audit and lease stores) goes from 3.46.0 to 3.53.2 with `rusqlite` 0.32 to 0.40 (`libsqlite3-sys` 0.30 to 0.38). The database file format and WAL layout are unchanged, so existing audit and lease databases open as before, and no code changed; the audit, lease and checkpoint tests pass on the new engine.
 
