@@ -371,7 +371,7 @@ fn open_connection(path: &Path, durability: Durability) -> Result<Connection, Au
     conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
     // `journal_mode` answers with the mode in force. A `:memory:` path keeps `memory`, which
     // is fine: there is nothing to sync.
-    let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+    let mode = switch_to_wal(&conn)?;
     if !mode.eq_ignore_ascii_case("wal") && !mode.eq_ignore_ascii_case("memory") {
         return Err(AuditError::Storage(format!(
             "could not switch {} to WAL mode (journal_mode is `{mode}`)",
@@ -380,6 +380,25 @@ fn open_connection(path: &Path, durability: Durability) -> Result<Connection, Au
     }
     conn.pragma_update(None, "synchronous", durability.pragma())?;
     Ok(conn)
+}
+
+/// `PRAGMA journal_mode=WAL`, answering the mode in force. SQLite does not call the busy
+/// handler for a journal-mode change, so a second process opening the same file at the same
+/// moment can get `SQLITE_BUSY` here at once; retry for up to [`BUSY_TIMEOUT`], as the busy
+/// handler would.
+fn switch_to_wal(conn: &Connection) -> Result<String, AuditError> {
+    let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
+    loop {
+        match conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0)) {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            other => return Ok(other?),
+        }
+    }
 }
 
 fn open_memory_connection() -> Result<Connection, AuditError> {
