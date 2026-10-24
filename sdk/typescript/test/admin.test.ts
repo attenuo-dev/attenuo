@@ -382,6 +382,24 @@ describe("AdminClient console endpoints", () => {
       revoke_reason: null,
       issued_at: parent ? "2026-10-23T19:05:00Z" : null,
       issued_seq: parent ? 42 : null,
+      budget: parent
+        ? {
+            recorded: true,
+            limits: [
+              {
+                cap: 0,
+                server: "bank",
+                tool: "pay",
+                kind: "calls",
+                arg: null,
+                max: 2,
+                used: 1,
+                remaining: 1,
+              },
+            ],
+            usage: [],
+          }
+        : null,
     });
     const { fetch, calls } = mockFetch(() =>
       jsonResponse({
@@ -403,6 +421,18 @@ describe("AdminClient console endpoints", () => {
       ["l2", false, 42],
     ]);
     expect(tree.ancestors[0]!.issuedAt).toBeUndefined();
+    expect(tree.ancestors[0]!.budget).toBeUndefined();
+    expect(tree.nodes[0]!.budget!.limits[0]).toEqual({
+      cap: 0,
+      server: "bank",
+      tool: "pay",
+      kind: "calls",
+      arg: undefined,
+      max: 2,
+      used: 1,
+      remaining: 1,
+      values: undefined,
+    });
   });
 
   it("reads the policy set and the on-disk check", async () => {

@@ -190,6 +190,9 @@ class LeaseNode:
     revoke_reason: str | None
     issued_at: str | None
     issued_seq: int | None
+    #: The hop's run limits and what is left (``{"recorded", "limits", "usage"}``, see the
+    #: admin API reference), ``None`` when it has no limits and nothing was charged under it.
+    budget: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -419,6 +422,7 @@ def _lease_node(n: Any) -> LeaseNode:
         n.get("revoke_reason"),
         n.get("issued_at"),
         n.get("issued_seq"),
+        n.get("budget") if isinstance(n.get("budget"), dict) else None,
     )
 
 

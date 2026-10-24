@@ -42,7 +42,7 @@ from .approval import (
     call_hash,
     verify_approval_token,
 )
-from .capability import Capability, Equals, OneOf, Prefix
+from .capability import ArgLimit, Capability, Equals, Limits, OneOf, Prefix
 from .client import AsyncClient, Client
 from .dpop import DpopKey
 from .errors import (
@@ -73,6 +73,7 @@ __all__ = [
     "ApprovalClaims",
     "ApprovalNotGranted",
     "ApprovalRequired",
+    "ArgLimit",
     "AsyncAdminClient",
     "AsyncClient",
     "AsyncTokenRefresher",
@@ -95,6 +96,7 @@ __all__ = [
     "LeaseState",
     "LeaseStatus",
     "LeaseTree",
+    "Limits",
     "OneOf",
     "PolicyCheck",
     "PolicyEvaluation",

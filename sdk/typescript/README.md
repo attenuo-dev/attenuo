@@ -134,6 +134,29 @@ capability("github", "list_issues", { state: "open" }); // a bare value means eq
 
 Capabilities serialize as the server expects: `{ server, tool, constraints: { repo: { op: "prefix", value: "..." } } }`, with `constraints` omitted when empty. `exchange` and `mintRootDev` also take `"server:tool"` strings (comma-separated lists too, like the CLI's `--cap`) and raw objects.
 
+#### Run limits on a child token
+
+A capability can carry run limits ([ADR-0010](../../docs/decisions/0010-run-limits.md)): how many calls, how much in total, how many calls per value and how many different values. Set them with `withLimits` before you exchange:
+
+```ts
+import { argLimit, capability, withLimits } from "@attenuo/sdk";
+
+const helper = await ob.exchange(planner, "helper", [
+  // At most one payment, 40 in total, to Emma only.
+  withLimits(capability("banking", "send_money", { recipient: "FR00EMMA" }), {
+    calls: 1,
+    sum: argLimit("amount", 40),
+    calls_per: argLimit("recipient", 1),
+  }),
+  // Pages from at most two sites: `derive: "host"` counts the host of the URL.
+  withLimits(capability("web", "get_webpage"), {
+    distinct: argLimit("url", 2, { derive: "host" }),
+  }),
+]);
+```
+
+The `Limits` and `ArgLimit` types say what each kind takes. The server lowers a figure larger than the parent's, fills in a limit the child leaves out, and charges every call to every hop, so a child can spend at most what its parent has left. A call over a limit is a `DeniedError` with `reason: "budget_exhausted"`; one whose argument a limit cannot count (a missing recipient, a URL without a host) is `limit_arg_invalid`. A kind or derivation the SDK does not know throws a `TypeError` instead of being dropped.
+
 ### Workload identity and `mayAct`
 
 An agent can authenticate with a workload-identity JWT instead of a client secret: an RFC 8693 `actor_token` from an `[[actor_trust]]` issuer, such as a SPIFFE JWT-SVID. It works at hop 0 (with the user's ID token or ID-JAG as the subject token) and on every exchange. Each actor token authenticates one request, and the token it obtains never outlives it.
