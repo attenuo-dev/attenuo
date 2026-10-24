@@ -54,6 +54,12 @@ these arms:
                        ``policies/distinct-recipients.json`` (at most 1 recipient) added to every
                        exchanged capability that names a listed messaging, mail or sharing tool.
                        Probed with the file's ``probe`` call; skipped when it is not refused.
+``attenuo_task_limits``  as ``attenuo``, with the ``limits`` each case's grant declares (the
+                       optional per-capability ``limits`` of the case schema, the figure a hop 0
+                       would read off the user's task) added to the exchanged capabilities. Every
+                       other arm ignores a grant's ``limits``. Only dev cases declare any (fitted
+                       in ``policies/task-limits-dev.md``); on the test split the arm is
+                       ``attenuo``. Probed like the limits arms.
 
 No LLM is involved. See README.md for the method and its limits.
 """
@@ -116,6 +122,7 @@ from attenuo import (  # noqa: E402
     Capability,
     Client,
     Equals,
+    Limits,
     OneOf,
     Prefix,
 )
@@ -146,6 +153,7 @@ ARMS = (
     "attenuo_distinct_host",
     "attenuo_distinct_host2",
     "attenuo_distinct_recipient",
+    "attenuo_task_limits",
 )
 PROXIED = ARMS[1:]
 CONSTRAINED_ARMS = (
@@ -160,6 +168,7 @@ CONSTRAINED_ARMS = (
     "attenuo_distinct_host",
     "attenuo_distinct_host2",
     "attenuo_distinct_recipient",
+    "attenuo_task_limits",
 )
 # Arms that load an @obligation("approval") policy and settle -32008 with the scripted approver.
 LABEL_ARMS = (
@@ -220,8 +229,13 @@ MULTI_CALL_CASES = (
 # every capability that is not a read.
 LIMIT_ARMS = ("attenuo_limits", "attenuo_labels_limits")
 LIMITS_RULE = POLICIES_DIR / "limits-rule.json"
+# Per-task limits (docs/design/run-limits.md section 7, "What an operator should set"): this arm
+# adds the `limits` a case's grant declares, and only this arm reads them. The fitting of the dev
+# cases' figures to their task text is recorded, frozen, in TASK_LIMITS_FIT.
+TASK_LIMIT_ARMS = ("attenuo_task_limits",)
+TASK_LIMITS_FIT = POLICIES_DIR / "task-limits-dev.md"
 # Every arm whose tokens carry a run limit; their calls may be refused at stage ``budget``.
-BUDGET_ARMS = LIMIT_ARMS + DISTINCT_ARMS
+BUDGET_ARMS = LIMIT_ARMS + DISTINCT_ARMS + TASK_LIMIT_ARMS
 # Refusals by a run limit, in the capability stage after the capability check (ADR-0010).
 BUDGET_REASONS = ("budget_exhausted", "budget_error", "limit_arg_invalid")
 PERMIT_ALL_ARMS = ("scope_only", "scope_constraints")
@@ -445,15 +459,56 @@ def load_environment(policies_dir: Path | None = None) -> dict[str, Suite]:
     return env
 
 
+GRANT_KEYS = frozenset({"server", "tool", "constraints", "limits"})
+
+
 def _grant_ok(where: str, grant: list[dict[str, Any]], env: dict[str, Suite], home: Suite) -> None:
     for g in grant:
+        if not isinstance(g, dict) or set(g) - GRANT_KEYS:
+            extra = sorted(set(g) - GRANT_KEYS) if isinstance(g, dict) else g
+            raise CorpusError(f"{where}: a grant entry has unknown keys {extra}")
         server = g.get("server", home.upstream)
         target = next((s for s in env.values() if s.upstream == server), None)
         if target is None:
             raise CorpusError(f"{where}: granted server {server!r} is not a suite upstream")
-        tool = g["tool"]
+        tool = g.get("tool")
+        if not isinstance(tool, str) or not tool:
+            raise CorpusError(f"{where}: a grant entry needs a tool")
         if tool != "*" and not tool.endswith("*") and tool not in target.catalog:
             raise CorpusError(f"{where}: granted tool {tool!r} is not in the catalog")
+        if "limits" in g:
+            _grant_limits_ok(f"{where} {server}/{tool}", g["limits"], target, tool)
+
+
+def _grant_limits_ok(where: str, limits: Any, suite: Suite, tool: str) -> None:
+    """A grant's ``limits``: the token's shape (``calls``, ``sum``, ``calls_per``, ``distinct``,
+    with ``derive``, checked by the SDK as the server checks it), on one catalog tool, each figure
+    at least 1, each argument an input of that tool, a ``sum`` over a ``long`` and a host
+    derivation over a ``string``."""
+    if not isinstance(limits, dict) or not limits:
+        raise CorpusError(f"{where}: limits must be a non-empty mapping")
+    try:
+        typed = Limits.from_json(limits)
+    except ValueError as e:
+        raise CorpusError(f"{where}: {e}") from None
+    if "*" in tool:
+        raise CorpusError(f"{where}: limits need one catalog tool, not a glob")
+    if typed.calls is not None and typed.calls < 1:
+        raise CorpusError(f"{where}: limits.calls must be at least 1")
+    inputs = suite.catalog[tool].get("inputs") or {}
+    for kind in ("sum", "calls_per", "distinct"):
+        lim = getattr(typed, kind)
+        if lim is None:
+            continue
+        if lim.max < 1:
+            raise CorpusError(f"{where}: limits.{kind}.max must be at least 1")
+        ty = inputs.get(lim.arg)
+        if ty is None:
+            raise CorpusError(f"{where}: limits.{kind}.arg {lim.arg!r} is not an input of {tool}")
+        if kind == "sum" and ty != "long":
+            raise CorpusError(f"{where}: limits.sum.arg {lim.arg!r} is {ty}, not long")
+        if lim.derive == "host" and ty != "string":
+            raise CorpusError(f"{where}: limits.{kind} derives a host from {ty} {lim.arg!r}")
 
 
 def load_cases(path: Path, suite: Suite, env: dict[str, Suite] | None = None) -> list[Case]:
@@ -578,8 +633,10 @@ def _constraint(spec: dict[str, Any]) -> Equals | OneOf | Prefix:
 
 
 def grant_capabilities(
-    upstream: str, grant: list[dict[str, Any]], *, constraints: bool
+    upstream: str, grant: list[dict[str, Any]], *, constraints: bool, limits: bool = False
 ) -> list[Capability]:
+    """The capabilities of a grant. ``limits`` (the per-task arm only) also carries each entry's
+    ``limits``; without it they are ignored, so every other arm's tokens are as before."""
     caps = []
     for g in grant:
         cons = (
@@ -587,12 +644,37 @@ def grant_capabilities(
             if constraints
             else {}
         )
-        caps.append(Capability(g.get("server", upstream), g["tool"], **cons))
+        cap = Capability(g.get("server", upstream), g["tool"], **cons)
+        if limits and g.get("limits"):
+            cap.limits = Capability.from_json(
+                {"server": cap.server, "tool": cap.tool, "limits": g["limits"]}
+            ).limits
+        caps.append(cap)
     return caps
 
 
-def capabilities(suite: Suite, case: Case, *, constraints: bool) -> list[Capability]:
-    return grant_capabilities(suite.upstream, case.grant, constraints=constraints)
+def capabilities(
+    suite: Suite, case: Case, *, constraints: bool, limits: bool = False
+) -> list[Capability]:
+    return grant_capabilities(suite.upstream, case.grant, constraints=constraints, limits=limits)
+
+
+def task_limits(suites: list[Suite]) -> dict[str, list[dict[str, Any]]]:
+    """Every case whose grant (or a delegate step's grant) declares ``limits``, as ``{case id:
+    [{"server", "tool", "limits"}]}`` in grant order. Cases without any are left out."""
+    out: dict[str, list[dict[str, Any]]] = {}
+    for s in suites:
+        for c in s.cases:
+            grants = [c.grant] + [st.grant for st in c.steps if isinstance(st, Delegate)]
+            rows = [
+                {"server": g.get("server", s.upstream), "tool": g["tool"], "limits": g["limits"]}
+                for grant in grants
+                for g in grant
+                if g.get("limits")
+            ]
+            if rows:
+                out[c.id] = rows
+    return out
 
 
 def limits_rule(path: Path | None = None) -> dict[str, Any]:
@@ -1216,7 +1298,12 @@ class _Replayer:
             self.tokens[WORKER] = root
             return
         caps = self._limited(
-            capabilities(self.suite, self.case, constraints=self.arm in CONSTRAINED_ARMS)
+            capabilities(
+                self.suite,
+                self.case,
+                constraints=self.arm in CONSTRAINED_ARMS,
+                limits=self.arm in TASK_LIMIT_ARMS,
+            )
         )
         self.tokens[WORKER] = self.ob.exchange(root, WORKER, caps, client_secret=AGENT_SECRET)
 
@@ -1239,7 +1326,10 @@ class _Replayer:
         assert self.ob is not None
         caps = self._limited(
             grant_capabilities(
-                self.suite.upstream, d.grant, constraints=self.arm in CONSTRAINED_ARMS
+                self.suite.upstream,
+                d.grant,
+                constraints=self.arm in CONSTRAINED_ARMS,
+                limits=self.arm in TASK_LIMIT_ARMS,
             )
         )
         try:
@@ -1826,7 +1916,7 @@ def run(
                     continue
                 try:
                     with server(env, bins, work, ups, arm, agents) as stack:
-                        if arm in LIMIT_ARMS:
+                        if arm in LIMIT_ARMS or arm in TASK_LIMIT_ARMS:
                             why = probe_limits(stack, all_upstreams)
                             if why:
                                 raise ArmUnsupported(why)
