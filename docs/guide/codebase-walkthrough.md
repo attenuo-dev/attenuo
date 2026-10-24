@@ -3,7 +3,7 @@
 A reading-and-running plan for someone who wants to understand every piece of attenuo himself. It has five parts:
 
 1. [A one-page mental model](#1-the-mental-model): the path of one proxied tool call and one token exchange, by file and function.
-2. [Eleven reading sessions](#2-reading-sessions) of 45 to 60 minutes, each with files in order, a document to read beside them, three to six questions and a block of commands that shows the concept working.
+2. [Twelve reading sessions](#2-reading-sessions) of 45 to 60 minutes, each with files in order, a document to read beside them, three to six questions and a block of commands that shows the concept working.
 3. [Why it is this way](#3-why-it-is-this-way): every ADR and design document in one line each.
 4. [A glossary](#4-glossary).
 5. [Things that will surprise you](#5-things-that-will-surprise-you).
@@ -16,6 +16,8 @@ Session 9 (output labelling and approvals) and the labels-arm part of session 10
 
 Session 11 (run limits) was added for the 0.1.0 documentation refresh, and every command in its block except the benchmarks was run against `main` @ a02bc83 on 2026-10-24, with its line counts checked on the same commit. On that commit the demo was run again (9 entries, as quoted) and the session 9 policy tests, whose count had grown, were updated; session 10's suite commands were run again and their quoted output updated for the new cases and arms.
 
+Session 12 (audited refusals, revocation by user, chain and session, typed inputs, the policy harness, listen-stream list filtering and the new metrics) was added on the evening of 2026-10-24 for the merges #77 to #91. Every command in its block was run against `main` @ 471a319 the same day, and its file pointers were checked against that commit. Sessions 1 to 11 were not re-run for it.
+
 ## 0. Setup you need once
 
 ```sh
@@ -27,7 +29,7 @@ export PATH=$BIN:$PATH                # gives you `attenuo` and `attenuo-server`
 
 `fake_mcp` is a stand-in for an MCP server: it has `read_file`, `create_issue` and `delete_repo` tools, echoes calls and does nothing else. It lands in `$BIN/examples/fake_mcp`.
 
-Sessions 2, 5, 6, 7, 8, 9 and 11 use a running server (session 9 starts a second one beside it). Start the demo's server and fake upstream once, in a spare terminal or in the background, from the repository root:
+Sessions 2, 5, 6, 7, 8, 9, 11 and 12 use a running server (session 9 starts a second one beside it, and session 12 restarts it for a clean log). Start the demo's server and fake upstream once, in a spare terminal or in the background, from the repository root:
 
 ```sh
 $BIN/examples/fake_mcp --port 13001 > /tmp/ob-fake.log 2>&1 &
@@ -101,11 +103,13 @@ A sub-agent (or its parent on its behalf) sends `POST /token` with the parent to
 | 8 | Replay protection: "this parent delegated to this actor" and "this actor token was used" are recorded together or not at all. | `attenuo-server/src/replay.rs` `ReplayCache::use_all_once` |
 | 9 | The new lease is registered under the parent's lease, bound to the digest of the chain, and the issuance is audited. | `register_issued` and `audit_issuance` in `routes/mod.rs` |
 
-Renewal (`POST /token/renew`, `routes/renew.rs`) extends a lease, never beyond the token's expiry or the parent lease. Revocation (`POST /admin/leases/{id}/revoke`, `routes/admin.rs` `revoke_lease`) marks a lease and all its descendants; the next call anywhere below it fails step 8 of the first table.
+Renewal (`POST /token/renew`, `routes/renew.rs`) extends a lease, never beyond the token's expiry or the parent lease. Revocation (`POST /admin/leases/{id}/revoke`, `routes/admin.rs` `revoke_lease`) marks a lease and all its descendants; the next call anywhere below it fails step 8 of the first table. `POST /admin/leases/revoke` (`revoke_by_selector`) does the same for every lease of one originating user, one chain or the chains that opened one MCP session (session 12).
+
+A refusal that happens before any pipeline decision (a session opened, an exchange or a renewal refused, a stream cut by the re-check) is also written to the audit log, as a `deny` record with a fixed tool name, through `Pipeline::record_rejection`, but only once the token and its DPoP proof have fully verified (SR-18; session 12).
 
 ## 2. Reading sessions
 
-Eleven sessions: the CLI and the demo get their own, short, session, and output labelling with approvals and run limits, which landed after the others were written, get sessions 9 and 11. In order:
+Twelve sessions: the CLI and the demo get their own, short, session, and output labelling with approvals and run limits, which landed after the others were written, get sessions 9 and 11. Session 12 covers what the evening merges of 2026-10-24 added across the crates. In order:
 
 1. Core types and attenuation (`attenuo-core`).
 2. Tokens, `ou_sig` and DPoP (`attenuo-token`).
@@ -118,8 +122,9 @@ Eleven sessions: the CLI and the demo get their own, short, session, and output 
 9. Output labelling and approvals: taint, `tool_result`, `-32008`, the approval store.
 10. Evaluation suite (with the labels and limits arms), benchmarks and fuzzing.
 11. Run limits and budgets: `limits` in the token, the charge transaction, refunds, run usage and soft limits.
+12. Refusals you can see, and revocation you can aim: audited refusals of session opens, exchanges, renewals and streams; revoke by user, chain or MCP session; typed inputs before Cedar; the policy harness; list filtering on the resumed listen stream; the new metrics.
 
-Sessions 9 and 11 cut across sessions 3 to 8 and are easiest after all of them; read 11 after 9, since soft limits use its approvals. Sessions 7, 8 and 10 are light, so merge them if you have the time.
+Sessions 9, 11 and 12 cut across sessions 3 to 8 and are easiest after all of them; read 11 after 9, since soft limits use its approvals. Session 12 needs only sessions 5 and 6. Sessions 7, 8 and 10 are light, so merge them if you have the time.
 
 Each session has four parts. Read the files in the order given, with the "read beside" document open. Answer the questions without looking, then check the run block. Tests are named so that `cargo test -p <crate> <filter>` runs a handful, not the whole suite; add `-- --nocapture` to see output.
 
@@ -653,7 +658,7 @@ Read beside: [Injection suite: results](../evaluation/injection-suite.md). Optio
 | 4c | `evaluation/injection-suite/policies/limits-rule.json`, `task-limits-dev.md`; `results/2026-10-24-task-limits-v1.md`, with [run limits, section 7](../design/run-limits.md#7-measured) | The limits arms: the frozen `calls: 1` rule, the host and recipient files, and the per-task figures in 47 dev grants. The "Run limits in ..." tables list every call a limit refused, and "Multi-call cases" splits the dev cases into the original 46, the 11 multi-call and the 6 browsing ones. Read section 7 of the design for what the arms do and do not support. | data |
 | 5 | `crates/attenuo-bench/src/lib.rs`, `hotpath.rs` | End-to-end load generator: proxy versus direct, by chain depth and concurrency. `attenuo-bench hot-path` measures what output labels and each limit kind add to one call (session 11). | 2800 |
 | 6 | `crates/attenuo-core/benches/attenuation.rs`, `crates/attenuo-policy/benches/*.rs`, `crates/attenuo-server/benches/decide.rs` | criterion micro-benchmarks of the hot path; `decide.rs` also times the budget read, each kind of charge, the run-usage write and `record_result`. | 840 |
-| 7 | `fuzz/fuzz_targets/` and `fuzz/README.md` | Twelve libFuzzer targets; they assert properties as well as absence of panics. | 12 files |
+| 7 | `fuzz/fuzz_targets/` and `fuzz/README.md` | Seventeen libFuzzer targets (twelve from the first campaigns, five from round 2 over run limits, budgets, approval tokens, the usage walker and the server routes); they assert properties as well as absence of panics. | 17 files |
 
 Check you understood:
 
@@ -784,6 +789,126 @@ unset ATTENUO_TOKEN
 
 The soft limits over `context.usage` need a destructive tool with an `amount` or `destination` in the catalog and a policy that reads them; the demo config has neither, so they are shown by the policy tests above and by `soft_limit_on_usage_asks_and_the_approved_call_is_counted` in `crates/attenuo-server/tests/run_usage.rs`. The race in question 3 is `concurrent_siblings_cannot_overspend_parent`, in both `run_limits.rs` and `crates/attenuo-audit/tests/budgets.rs`, and `crates/attenuo-audit/tests/write_gate.rs` runs it with the audit writer and WAL checkpointer going. The latency of each limit kind is measured with `target/release/attenuo-bench hot-path` (the command is in the `hotpath.rs` crate comment) and `cargo bench -p attenuo-server --bench decide`; neither was run for this page.
 
+### Session 12: refusals you can see, and revocation you can aim
+
+Sessions 5 and 6 left two gaps that an operator meets on the first bad day. Refusals that happened before any decision (a session opened on a revoked lease, a refused exchange or renewal, a stream the re-check cut) were log lines, so the audit log could not show an agent that kept trying. And revocation took one lease id, while an incident report names a person, a run or an MCP session. This session follows what the merges of 2026-10-24 evening (#77 to #91) did about both, then the policy stage's new typed-input check, the policy harness, list filtering on the resumed listen stream and the metrics.
+
+Read beside: [What gets a record](../concepts/audit-log.md#what-gets-a-record) in the audit-log concept, [Revoke by user or chain](../reference/http-api.md#revoke-by-user-or-chain) and [Revoke by session](../reference/http-api.md#revoke-by-session) in the HTTP API reference, then [Revoking during an incident](../guides/deploying.md#revoking-during-an-incident) and [What to monitor](../guides/deploying.md#what-to-monitor) in the deploy guide. Keep [Patterns and `like`](../guides/writing-policies.md#patterns-and-like) and [Unexercised policies](../guides/writing-policies.md#unexercised-policies) in the policy guide open as lookups. The day's log entries from 19:12 to 21:55 UTC in [the 2026-10-24 log](../log/2026-10-24.md) give the reasoning behind each change.
+
+| Order | File | What it does | Lines |
+| --- | --- | --- | --- |
+| 1 | `crates/attenuo-server/src/authz.rs` (`Pipeline::record_rejection`, near line 1390, and its `Authorizer` impl near line 1805) | The one funnel for every refusal that is not a pipeline decision. It counts the reason in `decisions_total{decision="deny",reason}`, builds an ordinary `DecisionRecord` (kind `decision`, `deny`, the verified chain, a `ToolCall` with a fixed tool name) and appends it. The doc comment lists every caller and every reason set. Read this first: everything in rows 2 to 5 ends here. | 60 |
+| 2 | `crates/attenuo-proxy/src/proxy.rs` (`record_lease_refusal` near line 320, `refused_tool_name`, `handle_passthrough`), `jsonrpc.rs` (`PASSTHROUGH_METHODS`) | #80. A request with no per-call decision (`initialize`, `ping`, the four list methods, `resources/unsubscribe`, `logging/setLevel`, notifications, client replies, `GET`, `DELETE`) whose lease check fails becomes one `deny` record per HTTP request. Only `AuthError::LeaseInactive` is recorded; the tool is the allowlisted method or `http.<METHOD>`, never request text. The 401 carries the id in `X-Attenuo-Decision-Id` and `data.decision_id`. | 120 |
+| 3 | `crates/attenuo-server/src/routes/token.rs` (crate comment "Audited refusals", `EXCHANGE_REFUSAL_REASONS` near line 198, `EXCHANGE_TOOL`, `refusal_reason`, the `record_rejection` call in `exchange_sync`) | #86. A refused exchange whose subject token and DPoP proof verified is a `deny` of `attenuo/token.exchange` against the parent's chain, with one of thirteen reasons (`exchange_widening`, `exchange_actor_not_permitted`, ..., or the parent's lease reason). Note the order change: an actor mismatch is now decided after the parent verified, so it can be audited. A refused exchange still uses up nothing but its DPoP proof. | 380 |
+| 4 | `crates/attenuo-server/src/routes/renew.rs` (crate comment, `RENEW_REFUSAL_REASONS` near line 108, `RENEW_TOOL`, `Failure`) | #87. A refused renewal is a `deny` of `attenuo/lease.renew`, the same tool as a successful one, with a lease reason only: once the token verified, a revoked, expired or unknown lease (its own or an ancestor's) is the only refusal the caller can cause. | 250 |
+| 5 | `crates/attenuo-proxy/src/guard.rs` (crate comment, `STREAM_END_TOOL`, `StreamGuard::recording`, `record_end`, `end_event_recorded`), `proxy.rs` (`AppState::stream_guard`) | #90, SR-28. When the re-check cuts a stream because the lease is no longer live or the token expired, the guard writes one `stream.end` record (reason, server, session tag) and puts its id in the final SSE event. `stream_guard` takes the `Authenticated` caller, so only a token that verified when the stream opened can cause a record. A client disconnect or an upstream EOF is a log line, not a record. | 340 |
+| 6 | `crates/attenuo-cli/src/cli.rs` (`AuditFilter`, near line 686), `crates/attenuo-server/src/routes/admin.rs` (`entry_filter`), `crates/attenuo-audit/src/export.rs` (`RecordFilter`) | How the refusals are found. `audit tail --tool X --decision deny` filters on the server; since #91 `audit export` takes `--tool` and `--decision` too, and the export header names them, so `audit verify --file` refuses a filtered export as it refuses one filtered by kind. | 200 |
+| 7 | `crates/attenuo-audit/src/lease.rs` (`LeaseSelector` near line 334, `SessionBinding`, the trait methods `record_subject`, `subjects`, `record_session`, `sessions`, `preview_selected`, `revoke_selected`), `sqlite.rs` (the `lease_subjects` and `lease_sessions` tables near line 105) | #81 and #89. Three selectors: `Subject` (the originating user's `sub`, recorded at issuance), `Chain` (the first hop's lease, found through the parent links, so it matches leases from before the tables), `Session` (a session digest, resolved to the chains that opened it). Each matches unrevoked leases, expired ones included because a renewal could bring them back, and revokes them with the usual cascade in one `IMMEDIATE` transaction. Both tables are created at open, so there is no migration step. | 300 |
+| 8 | `crates/attenuo-server/src/routes/mod.rs` (`register_issued`), `crates/attenuo-proxy/src/proxy.rs` (`new_session_digest`, the `record_session` call in `handle_post` after `adopt_session`), `auth.rs` (`Authorizer::record_session`), `session.rs` (`session_digest`, `session_tag`), `authz.rs` (`Pipeline::record_session`) | Where the selectors' data is written. The subject is written with the lease and a failure fails the issuance. The session binding is written only after the proxy adopted a session the upstream assigned for a verified, live caller (SR-18), keyed by `(session, server)`, write-once, and best effort: a failure is logged and the session still works. | 150 |
+| 9 | `crates/attenuo-server/src/routes/admin.rs` (`SelectorRevokeBody`, `selector_of` near line 168, `resolve_shown`, `selector_response`, `revoke_by_selector` near line 291, `MAX_SELECTOR_AUDIT_IDS`) | `POST /admin/leases/revoke[?preview=true]` with exactly one of `user`, `chain_id`, `session`. The raw session id is hashed on arrival and never echoed: the answer's `selector` is `{session_tag, chain_ids}`. A preview writes nothing, not even an audit record; a revocation writes one `admin.lease.revoke` record listing at most 256 leases, with the full count in its digested arguments. | 200 |
+| 10 | `crates/attenuo-cli/src/cli.rs` (`LeaseCmd::Revoke` near line 432), `crates/attenuo-server/ui/view-lease.js` (`openSelectorRevoke`, `openSessionRevoke`, `confirmForm`, `resultView`), `crates/attenuo-server/src/admin_ui.rs` (crate comment) | The two front ends. `attenuo lease revoke --user SUB | --chain-id ID | --session ID [--preview]` (a clap group, so exactly one). The console (#85, #91) always previews first and then asks for a typed confirmation: the chain id's last six characters, or for a user or session the number of leases that would change. The session id is typed into a field that is cleared on submit and never reaches a URL. Without `[admin_ui] allow_write` the console listener serves the preview and refuses the revocation. | 560 |
+| 11 | `crates/attenuo-policy/src/request.rs` (`check_tool_inputs` near line 183, `input_matches`), `lib.rs` (`REASON_INPUT_TYPE_MISMATCH`, the "Stage 1d" comment in `authorize_labelled` near line 984) | #88. A declared catalog input that is present and not `null` must have its type as Cedar would see it, or the call is denied `input_type_mismatch` with a fixed diagnostic and no policy ids. It runs after the user-attribute check (1c) and before the request cache and Cedar, on every path: proxy, AuthZEN, admin dry run and `policy test`. | 120 |
+| 12 | `config/policies/default.cedar`, `default_test.yaml`; `crates/attenuo-policy/tests/engine.rs` (`shipped_default_policy_passes_its_tests`) | #84 and #88. The starter policy: `like` has one wildcard that also matches `/` and the empty string, so `permit_create_issue_in_acme` pins `acme/<name>` with `!(like "acme/*/*")` and three `!=` guards; `permit_delete_acme_sandbox_repo` gives `forbid_sensitive_without_mfa` a decision it changes. 34 cases, all five policies exercised. The crate's embedded copy must stay byte-identical, which the engine test checks. | 450 |
+| 13 | `crates/attenuo-policy/src/testing.rs` (`policy_refs`, `TestReport::unexercised`, `TestCase::check`, `authzen_skip_reason`, `admin_evaluate_skip_reason`), `crates/attenuo-cli/src/cli.rs` (`TestArgs`, `Via`), `policy_cmd.rs` | #82 and #84. `policy test` lists the policies no case's decision depended on, `--fail-on-unexercised` makes that exit 2, and `--via authzen` or `--via admin-evaluate` sends the same cases to a running server through one loader, checker and reporter. AuthZEN takes the chain from the bearer, so cases that need another chain are skipped; the admin dry run takes the case's chain and skips only `budget` cases. | 900 |
+| 14 | `crates/attenuo-proxy/src/filter.rs` (`list_kinds_by_shape` near line 229, `ListFilter::apply_message`), `proxy.rs` (`listen_list_filter`, `observe_listed`) | #90. An upstream that replays buffered events on a resumed `GET` stream (`Last-Event-ID`) used to send list answers unfiltered, because `ListFilter` matched request ids of the HTTP request it served and a `GET` has none. Now a response whose `result` holds a `tools`, `resources`, `resourceTemplates` or `prompts` array is a list answer by its shape, and goes through the same filter and SR-25 recording as on a `POST`. | 120 |
+| 15 | `crates/attenuo-server/src/metrics.rs` (`ExhaustedAt`, `budget_exhausted`, `observe_run_lock_wait`, `render_limits_approvals_labels`, `render_wal`, `check_text_format`), `crates/attenuo-audit/src/sqlite.rs` (`wal_stats`) | #77. Series for run limits, approvals, output labels, the SR-55 run lock and the WAL checkpointer, labels from fixed sets only. `check_text_format` is a test helper that checks the page against the text format. The three example alert rules are in the deploy guide. | 500 |
+
+Why each piece is shaped this way:
+
+- **One rule for every refusal record: full verification first (SR-18).** Every caller in rows 2 to 5 records only after the token's signature, audience, expiry, chain and DPoP proof verified. Garbage, forged or expired tokens stay log lines. A record names a principal attenuo issued a token to; anything else would let an anonymous caller write to a log that is meant to be evidence. The cost is that a stranger's probing is visible only in the server log.
+- **Ordinary decision records, not a new kind.** A refusal is kind `decision`, `deny`, with a fixed tool name (`initialize`, `http.GET`, `token.exchange`, `lease.renew`, `stream.end`). The schema, the hash input and every reader stay as they were, and `--tool` and `--decision` find them. The price: `audit export --kind exchange` lists issued exchanges only, and a refused one is found by tool and decision.
+- **Fixed reason sets.** `EXCHANGE_REFUSAL_REASONS` and `RENEW_REFUSAL_REASONS` exist so that the metric's label set stays small and a unit test (`refusal_reasons_come_from_the_listed_set`, `renew_refusal_reasons_are_the_lease_reasons`) catches a new code that was not listed.
+- **The session binding stores the full SHA-256, the audit tag is 12 characters.** The tag (`session_tag`) is 48 bits, fine for correlating log lines but not for deciding whose leases to revoke: two sessions sharing a tag would let one revocation hit another user's chain. So the store keys on `session_digest` (the full 64 hex characters), and the tag is defined as its prefix, so a tag in an audit record is still a prefix of the stored value. No raw id is stored, logged or echoed, because a session id grants use of the session.
+- **Preview, then a typed confirmation.** A selector can match far more than the operator expects (every lease a user ever had, expired ones included). The preview runs the same match without writing; the console then asks the operator to type something that comes from the preview (a count, or the end of the chain id), so a stale or mistaken click cannot revoke.
+- **Typed inputs before Cedar.** Before #88 a number in a declared string reached Cedar. Where a policy read it, `like` raised a type error and the call ended as `policy_error`, which the client guide tells clients to retry. Where no policy read it, the call went to the upstream unchecked. A fixed reason before Cedar makes the outcome independent of which policies happen to read the argument, and names the caller's mistake.
+- **Shape beats remembered ids on the listen stream.** Remembering list request ids per session would need state with a TTL, would be lost on a proxy restart, and would miss an answer to an id the proxy never saw. Filtering by shape needs no state. The trade-off is that a non-list response carrying such an array also loses the entries the chain could not use. That only removes entries, never adds one.
+- **`resources/unsubscribe` is allowlisted.** Giving up a subscription in the run's own session cannot widen anything, and requiring a capability only stopped an agent that had lost `subscribe` from cleaning up. It is still lease-checked, and a refusal is recorded under its own name. Capabilities and policies that name it no longer have any effect (CHANGELOG, Changed).
+
+Check you understood:
+
+1. An agent sends `POST /token` with a forged subject token, then with a valid token asking for a tool its parent does not hold. Which of the two leaves an audit record, under which tool and reason, and where does the caller find its id?
+2. LangChain's MCP adapter opens a session per call. After a revocation, what does the audit log show for its next attempt, and why is there one record per HTTP request rather than one per token?
+3. `POST /admin/leases/revoke {"session": "..."}` names a session that two upstreams each assigned to a different chain. What is revoked? What would go wrong if the store were keyed on the 12-character audit tag instead?
+4. A catalog declares `repo = "string"` and an agent sends `repo: 42` to a tool whose policy never reads `repo`. What happened before #88, what happens now, and at which stage?
+5. A test file's suite passes offline with every policy exercised, but `--via authzen --fail-on-unexercised` exits 2 on the same file. Why, and which arm would run every case?
+6. An upstream replays a `tools/list` answer on a resumed `GET` stream. Which function decides that it is a list answer, and what else runs on it besides removing entries?
+
+Run it (against the section 0 setup; the restart gives a clean log, so the sequence numbers below are the ones you will see, and it kills every earlier token):
+
+```sh
+pkill -x attenuo-server; sleep 1
+RUST_LOG=warn attenuo-server --config examples/github-leak-demo/config.toml > /tmp/ob-server.log 2>&1 &
+sleep 2
+ROOT=$(attenuo token root --subject alice --agent assistant --cap 'github:*' --print token)
+CODER=$(printf '%s\n' demo-coder-secret | ATTENUO_TOKEN="$ROOT" \
+  attenuo token exchange --actor coder --client-secret-stdin --cap github:read_file --print token)
+
+# 1. A refused exchange is a deny record against the parent's chain; an unverifiable token leaves nothing.
+printf '%s\n' demo-tester-secret | ATTENUO_TOKEN="$CODER" \
+  attenuo token exchange --actor tester --client-secret-stdin --cap github:create_issue
+# error: server answered 400 Bad Request: invalid_scope: delegation chain is invalid: hop 2 widens capabilities ...
+# decision <uuid>
+printf '%s\n' demo-tester-secret | ATTENUO_TOKEN=not-a-token \
+  attenuo token exchange --actor tester --client-secret-stdin --cap github:read_file
+# error: server answered 400 Bad Request: invalid_grant: malformed token: InvalidToken   (no decision line)
+attenuo audit tail --tool token.exchange --decision deny
+# #4  <time>  DENY  attenuo/token.exchange  assistant > coder for alice  reason=exchange_widening  id=<uuid>
+
+# 2. A declared input of the wrong type is refused before Cedar (the demo catalog declares path as a string).
+ATTENUO_TOKEN="$CODER" attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path:=7
+# DENIED  input_type_mismatch, then the decision id; exit status 2
+ATTENUO_TOKEN="$CODER" attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path:='"7"'   # ALLOWED
+
+# 3. Revoke by MCP session. fake_mcp gives every response the session id fake-session-1, so the coder's
+#    first call since the restart bound it to this run (the call above did). Preview, then revoke.
+attenuo lease revoke --session fake-session-1 --preview
+# preview: nothing was changed
+# selector  session 79a43975a64b          the first 12 hex characters of SHA-256("fake-session-1")
+# chains    <root lease>
+# matched   2 lease(s)
+# would revoke 2 lease(s)
+attenuo lease revoke --session fake-session-1 --reason "session drill"
+# ... revoked 2 lease(s), reason    session drill, audit     <uuid>
+attenuo lease revoke --session no-such-session --preview    # chains    none recorded for this session; 0 lease(s)
+
+# 4. What the coder meets next, each one audited.
+curl -s -i -X POST $ATTENUO_SERVER/mcp/github -H "Authorization: Bearer $CODER" \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"x","version":"0"}}}' \
+  | grep -i -E '^HTTP|^x-attenuo-decision-id|^\{'
+# HTTP/1.1 401 Unauthorized
+# x-attenuo-decision-id: <uuid>
+# {"jsonrpc":"2.0","id":null,"error":{"code":-32001,"message":"attenuo: unauthorized: lease_revoked","data":{"reason":"lease_revoked","decision_id":"<uuid>"}}}
+curl -s -i -X POST $ATTENUO_SERVER/token/renew -H "Authorization: Bearer $CODER" | grep -i -E '^HTTP|^x-attenuo-decision-id|^\{'
+# HTTP/1.1 400 Bad Request ... {"error":"invalid_grant","detail":"an ancestor lease is not live: lease_revoked","decision_id":"<uuid>"}
+curl -s -o /dev/null -w '%{http_code}\n' -X POST $ATTENUO_SERVER/token/renew -H "Authorization: Bearer not-a-token"   # 401, nothing recorded
+attenuo audit tail --decision deny
+# #4   ... DENY  attenuo/token.exchange  ...  reason=exchange_widening
+# #5   ... DENY  github/read_file        ...  reason=input_type_mismatch
+# #11  ... DENY  github/initialize       ...  reason=lease_revoked
+# #12  ... DENY  attenuo/lease.renew     ...  reason=lease_revoked
+attenuo audit verify          # audit chain OK: 12 entries verified
+
+# 5. The policy harness: coverage, and the same cases through a running server.
+attenuo policy test --fail-on-unexercised config/policies/default_test.yaml   # 34 passed, 0 failed ... all 5 policies exercised
+attenuo policy test --via admin-evaluate examples/github-leak-demo/policy_test.yaml   # 11 passed ... all 5 policies exercised
+R=$(attenuo token root --subject alice --agent assistant --cap 'github:*' --print token)
+printf '%s' "$R" > /tmp/ob-root.tok
+attenuo policy test --via authzen --token-file /tmp/ob-root.tok --fail-on-unexercised examples/github-leak-demo/policy_test.yaml
+# 2 passed, 0 failed, 9 skipped (11 cases in 1 file), then "3 of 5 policies not exercised:" with file:line and id; exit status 2
+```
+
+Every command in the block was run against `main` @ 471a319 on 2026-10-24 with debug binaries, and prints what is quoted. Two things cannot be shown with `fake_mcp`, which answers `GET` with `405`. One is a `stream.end` record: `a_listen_stream_cut_by_revocation_is_audited` in `crates/attenuo-server/tests/e2e.rs` cuts a real listen stream with an admin revocation. The other is list filtering on a resumed stream: `list_answers_replayed_on_a_resumed_get_stream_are_filtered` in `crates/attenuo-proxy/tests/list_filtering.rs` replays four list answers, and it failed before the fix. The other server-side proofs are `refused_exchanges_are_audited_against_the_parent_chain`, `refused_renewals_are_audited_against_the_token_chain`, `initialize_on_a_revoked_lease_is_audited`, `unverified_exchanges_leave_no_record` and `unverified_renewals_leave_no_record` (all in `e2e.rs`), `crates/attenuo-server/tests/admin_revoke_session.rs` and `mistyped_declared_input_denies_before_cedar_not_as_policy_error` in `crates/attenuo-policy/tests/engine.rs`. The demo config has no `[metrics]` listener; add `[metrics] enabled = true` with a loopback `listen` to a copy of it to read `/metrics`.
+
+What is still open (from the [task board](../tasks/board.md) and the day's log):
+
+- Revocation: revoking by the audit `session_tag` (48 bits, so the server would have to list every match); pruning `lease_sessions` (one row per session, never deleted, and a client that opens a session per call adds one row per call); a lost session binding is only a log line.
+- Proxy: Cedar-aware list filtering; the per-event re-serialization cost on the listen stream is not measured; a `GET` answered with something other than SSE is relayed unfiltered; listen streams the client dropped are log lines only; every listen stream still open at token expiry adds one `token_expired` record.
+- Policy harness: the admin dry run cannot be given a `budget`, so those cases are skipped.
+- Injection suite: `stage_of` in `evaluation/injection-suite/harness.py` does not know `input_type_mismatch`, so `t-banking-02` and `t-workspace-03` will score their mistyped attack calls as stage `other` (still denied) on the next run.
+- SDKs: `audit_export` and `auditExport` take only `kind` and `chain_id`, not the new `tool` and `decision` (the #91 log entry; not on the board).
+- Metrics: soft-limit asks are not told apart from other `approval_required` decisions (that would need policy ids as labels).
+
 ## 3. Why it is this way
 
 One line per decision. The ADRs record a decision and what was rejected; the design pages record how something works and why it was built that way.
@@ -836,7 +961,7 @@ One line per decision. The ADRs record a decision and what was rejected; the des
 | **`may_act`** | An RFC 8693 claim on a parent token that names the only agents allowed to exchange it. |
 | **`ou_sig`** | The issuer's signature over the issuer, the originating user and the root hop. Copied unchanged into every child token, so a sub-agent cannot change whom the chain acts for. Version 3 is current. |
 | **Decision id** | The UUID of the audit record for one decision. Returned in `X-Attenuo-Decision-Id`, in a denial's `data.decision_id` and in AuthZEN `context.decision_id`; the key for finding a decision in the log. |
-| **Reason** | The short code on a decision: `policy_allow`, `policy_deny`, `approval_required`, `capability_denied`, `lease_revoked`, `lease_expired`, `lease_unknown`, `tool_not_in_catalog`, `tool_not_listed`, `invalid_name`, `audit_error`, `label_error`, `budget_exhausted`, `budget_error`, `limit_arg_invalid`, `approval_invalid`, and others. |
+| **Reason** | The short code on a decision: `policy_allow`, `policy_deny`, `approval_required`, `capability_denied`, `lease_revoked`, `lease_expired`, `lease_unknown`, `tool_not_in_catalog`, `tool_not_listed`, `invalid_name`, `audit_error`, `label_error`, `budget_exhausted`, `budget_error`, `limit_arg_invalid`, `approval_invalid`, `input_type_mismatch`, `attribute_type_mismatch`, `token_expired` (a stream the re-check ended), the `exchange_*` codes of a refused exchange (`EXCHANGE_REFUSAL_REASONS`), and others. |
 | **Catalog** | The `[policy.catalog]` table declaring every tool Cedar may name, with `readonly`, `sensitive`, `destructive` (default: not `readonly`), `output` (`untrusted` by default, or `trusted`) and typed inputs. A tool not in it is denied by default. |
 | **Server-scoped action** | The Cedar action id `Action::"<server>/<tool>"` (for example `github/read_file`). A permit for one upstream's tool cannot match another's (SR-13). The older bare form needs `legacy_bare_actions`. |
 | **Canonical name** | The one accepted spelling of a server or tool name: ASCII letters, digits, `_`, `.`, `-`, at most 128 bytes, compared byte for byte, never case-folded or normalized (`names.rs`). Not to be confused with canonical JSON below. |
@@ -850,7 +975,10 @@ One line per decision. The ADRs record a decision and what was rejected; the des
 | **PEP / PDP** | Policy enforcement point (the proxy, or a gateway) and policy decision point (`Pipeline::decide`, reachable over AuthZEN). |
 | **AuthZEN** | The OpenID AuthZEN 1.0 evaluation API (`/access/v1/evaluation`) for asking the PDP a yes or no question without calling the tool. |
 | **Root grant** | A `[[root_grants]]` entry: the most a root token may carry for a given user, issuer and agent. |
-| **Session binding** | The proxy's record that an `Mcp-Session-Id` belongs to one principal (the chain's root lease), so another user cannot ride it. |
+| **Session binding** | The proxy's record that an `Mcp-Session-Id` belongs to one principal (the chain's root lease), so another user cannot ride it. Since #89 the server also keeps, in `lease_sessions`, the full SHA-256 of each id the proxy bound with the chain that opened it, so the session can be revoked. |
+| **Session tag, session digest** | `session_digest` is the SHA-256 of an `Mcp-Session-Id` in hex, what `lease_sessions` stores; `session_tag` is its first 12 characters, what audit records and logs carry. The raw id is stored nowhere. |
+| **Refusal record** | A `deny` record of kind `decision` written through `Pipeline::record_rejection` for a refusal that had no pipeline decision: a lease refusal of `initialize` or another undecided request, a refused exchange (`token.exchange`) or renewal (`lease.renew`), a stream ended by the re-check (`stream.end`). Only for tokens that fully verified (SR-18). |
+| **Lease selector** | What `POST /admin/leases/revoke` revokes by instead of a lease id: `user` (the originating `sub`, from `lease_subjects`), `chain_id` (the first hop's lease) or `session` (resolved through `lease_sessions`). `LeaseSelector` in `attenuo-audit`. |
 | **Dev / test split** | In the injection suite, 63 development cases (the 46 whose policies were written alongside them, then 11 multi-call and 6 browsing cases written against the frozen policies), and 26 held-out test cases written afterwards against frozen policies. Do not confuse with `[dev] allow_root_mint`, the development-only token mint, or with `cargo test`. |
 | **Run taint** | The output labels of one delegation run, stored by `chain_id` (the first hop's lease) in `run_labels`: one `{source, decision_id, seq}` per tool whose untrusted result the run has read. Every agent of the run shares it, so a sub-agent's read taints its parent. Cedar sees it as `context.session.tainted` and `tainted_by`; a store that cannot be read counts as tainted. |
 | **`tool_result`** | The audit record kind appended after an allowed call's answer and before it is relayed: the call's `decision_id`, the SHA-256 and size of the RFC 8785 JSON of the answer, its label and a fingerprint count. Never the content. |
@@ -898,5 +1026,10 @@ Each of these is deliberate, and most were found by a review or the fuzzers. Whe
 - **Usage is kept only when something can read it.** At every load and reload the engine decides whether any policy reads `context.usage` (or the catalog names `amount` or `destination`, or `[policy] track_usage = true`). If not, a destructive call writes no usage, Cedar sees zeros, and records carry no `usage`. A policy loaded mid-run starts from what was counted while usage was tracked, so it misses the calls in between. `track_usage = false` is refused, since a policy that reads usage must get it.
 - **The upstream's failure is still charged.** The charge happens before forwarding, so a call that times out upstream has spent its budget (`upstream_failure_is_still_charged`). Giving it back is an operator's decision (`attenuo budget refund`), once per decision.
 - **Older servers ignore limits.** A server before 0.1.0, or an external PEP that does not read `limits`, accepts a token with a `limits` block and enforces nothing, without an error or a log line. Until every replica and PEP runs 0.1.0, back a limit with a Cedar `forbid` or an approval. A `decision` record without a `budget` member for a limited capability came from such a server.
+
+- **A forged token cannot write to the audit log, but a revoked one can, once per request.** Refusals are recorded only after full verification (SR-18), so a stranger's garbage is a log line, while a client that keeps calling with a revoked token adds one `deny` record per HTTP request until its `exp`. There is no per-token cache to collapse them.
+- **A session revocation follows whoever opened the session first.** The binding in `lease_sessions` is write-once per session and upstream, so with `fake_mcp`, which gives every response `fake-session-1`, revoking that session revokes the first run that called after the server started. A real upstream assigns a new id per session.
+- **`resources/unsubscribe` needs no capability.** It is on the passthrough allowlist (#90), so a capability or policy that names it has no effect any more; `resources/subscribe` is still decided.
+- **A number in a declared string is no longer `policy_error`.** It is `input_type_mismatch`, decided before Cedar, even when no policy reads the argument. An undeclared argument, or any argument of a tool missing from the catalog, is still passed to Cedar as it is.
 
 When something in the code looks over-cautious, grep its `SR-` or `F` number in the three security reviews, the [fuzzing page](../design/fuzzing.md) and `CHANGELOG.md`; the reason is almost always written down there.
