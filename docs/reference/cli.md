@@ -58,7 +58,8 @@ Mint a root (hop 0) token. This uses the development endpoint, so it needs the a
 | `--cap` | Capability to request. Omit to take the `[[root_grants]]` ceiling. |
 | `--ttl-seconds` | Requested lifetime. |
 | `--attr` | User attribute. Repeatable. |
-| `--may-act <AGENT>` | Only this agent may exchange the root token (RFC 8693 `may_act`). Repeatable, or comma-separated. Must be within the `[[root_grants]]` entry's `may_act` when it has one; without the flag the grant's `may_act` applies. |
+| `--may-act <AGENT>` | Only this agent may exchange the root token (RFC 8693 `may_act`). Repeatable, or comma-separated. Must be within the `[[root_grants]]` entry's `may_act` when it has one. Without it and without `--no-delegation` the grant's `may_act` applies; when the grant has none, or the server has no `[[root_grants]]`, the root token has no `may_act`, so any authenticated agent may exchange it. Values that are all empty are refused. |
+| `--no-delegation` | Send `may_act: []`: no agent may exchange the root token. An empty list is within any grant's `may_act`. Cannot be combined with `--may-act`. |
 | `--dpop-key PATH` | Bind the root token to this DPoP key (a private JWK from `key gen --dpop`). |
 | `--print token\|lease` | Print only that value, for scripts. |
 
@@ -250,9 +251,18 @@ Show the most recent audit entries, oldest of them first. Filters keep only matc
 | `--agent` | all | An agent anywhere in the record's chain. |
 | `--lease` | all | A lease anywhere in the record's chain. |
 | `--server` | all | The MCP upstream the call went to. This `--server` comes after `audit tail`; the attenuo server URL is the global `--server` before the subcommand. |
-| `--tool` | all | The tool. |
+| `--tool` | all | The tool. attenuo's own records use `token.root`, `token.exchange`, `lease.renew` and `admin.*`. |
 | `--chain-id` | all | The delegation chain (the lease id of its first hop). |
 | `--since`, `--until` | | RFC 3339 times: records with `at` in `[since, until)`. |
+
+Refused token exchanges and refused lease renewals are kind `decision`, not `exchange` or `lease_renew`, so `--kind exchange` lists issued exchanges only. Find the refusals by tool and decision, then open one by the `decision <id>` the CLI printed under the error:
+
+```sh
+attenuo audit tail -n 50 --tool token.exchange --decision deny   # refused exchanges
+attenuo audit tail -n 50 --tool lease.renew --decision deny      # refused renewals
+attenuo audit tail --tool token.exchange --reason exchange_widening
+attenuo audit show --id 6685bd7f-cbb3-48e5-ab05-f2b8ceae9a61
+```
 
 The filters are the query parameters of `GET /admin/audit` (see [Querying the audit log](http-api.md#querying-the-audit-log)): exact matches, combined with AND. A bad kind, decision or time is refused before any request. The CLI reads newest first (`order=desc&before=N`) and keeps following `prev` until it has `-n` entries, because a filtered page can come back short, even empty, when the server stops scanning. `--follow` then reads forward from the head the same way, following `next`. With `--json` each entry is one JSON line.
 
@@ -307,7 +317,7 @@ Write entries and the checkpoints inside the range. Needs the admin token.
 | `--kind` | all | Keep only records of this kind: `decision`, `tool_result`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin`. |
 | `--chain-id` | all | Keep only records of this delegation chain (the `chain_id` field: the lease id of the chain's first hop). |
 
-`--kind` and `--chain-id` combine, and apply inside `--from`/`--to`. A filtered export has a `filter` member in its header and cannot be verified with `audit verify --file` (its hash chain has gaps by construction): verify an unfiltered export, then filter. The same filters are `?kind=` and `?chain_id=` on `GET /admin/audit/export`; an unknown kind or an empty `chain_id` is a 400.
+`--kind` and `--chain-id` combine, and apply inside `--from`/`--to`. There is no `--tool` or `--decision` on `audit export`: a refused exchange or renewal is in `--kind decision` together with every tool-call decision, and `audit tail --tool ... --decision deny` (above) lists just those. A filtered export has a `filter` member in its header and cannot be verified with `audit verify --file` (its hash chain has gaps by construction): verify an unfiltered export, then filter. The same filters are `?kind=` and `?chain_id=` on `GET /admin/audit/export`; an unknown kind or an empty `chain_id` is a 400.
 
 ### `policy reload`
 

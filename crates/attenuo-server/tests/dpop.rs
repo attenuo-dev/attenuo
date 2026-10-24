@@ -421,6 +421,58 @@ async fn stolen_bound_token_without_proof_is_refused_sr24() {
     assert_eq!(refusal(resp).await.1, "invalid_dpop_proof");
 }
 
+/// A renewal of a bound token on a revoked lease is audited only once its DPoP proof checked:
+/// without a proof, or with another key's, it is a 401 and no record (SR-18).
+#[tokio::test]
+async fn refused_renewal_of_a_bound_token_is_audited_only_with_its_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start(dir.path(), DpopMode::Optional).await;
+    let (key, thief) = (DpopKey::generate().unwrap(), DpopKey::generate().unwrap());
+    let v: Value = s.root(Some(&key)).await.json().await.unwrap();
+    let token = v["access_token"].as_str().unwrap().to_string();
+    let lease = v["lease"].as_str().unwrap().to_string();
+    let resp = s
+        .client
+        .post(s.url(&format!("/admin/leases/{lease}/revoke")))
+        .bearer_auth(ADMIN)
+        .json(&json!({"reason": "test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let renew_url = s.url("/token/renew");
+    let before = s.audit().await.len();
+    for p in [None, Some(proof(&thief, &renew_url, Some(&token)))] {
+        let resp = s.renew(&token, p).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().get("x-attenuo-decision-id").is_none());
+    }
+    assert_eq!(
+        s.audit().await.len(),
+        before,
+        "no record without a good proof"
+    );
+
+    let resp = s
+        .renew(&token, Some(proof(&key, &renew_url, Some(&token))))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let id = resp.headers()["x-attenuo-decision-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let entries = s.audit().await;
+    assert_eq!(entries.len(), before + 1);
+    let r = &entries.last().unwrap()["record"];
+    assert_eq!(r["id"], id);
+    assert_eq!(r["decision"], "deny");
+    assert_eq!(r["reason"], "lease_revoked");
+    assert_eq!(r["tool"], "lease.renew");
+    assert_eq!(r["dpop_bound"], true);
+}
+
 #[tokio::test]
 async fn child_of_bound_parent_must_be_bound_sr24() {
     let dir = tempfile::tempdir().unwrap();
