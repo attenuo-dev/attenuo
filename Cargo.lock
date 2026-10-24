@@ -290,6 +290,7 @@ version = "0.1.0"
 dependencies = [
  "attenuo-core",
  "base64 0.23.1",
+ "criterion",
  "jsonwebtoken",
  "ring",
  "serde",

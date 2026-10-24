@@ -146,6 +146,21 @@ pub fn fmt_may_act(may_act: Option<&attenuo_token::MayAct>) -> String {
     }
 }
 
+/// `token inspect`'s key line: the header `kid` (the key that signed the token) and `ou_kid`
+/// (the key that made the originating-user signature `ou_sig` at the root, which differs after
+/// a key rotation), each only when present and with control characters escaped. `None` when
+/// neither is there.
+pub fn fmt_kids(kid: Option<&str>, ou_kid: Option<&str>) -> Option<String> {
+    let parts: Vec<String> = [("kid", kid), ("ou_kid", ou_kid)]
+        .into_iter()
+        .filter_map(|(name, v)| {
+            v.filter(|v| !v.is_empty())
+                .map(|v| format!("{name} {}", v.escape_debug()))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("   "))
+}
+
 // -- admin API answers --
 //
 // These read the server's JSON as `Value` rather than typed structs: a field the server adds
@@ -922,6 +937,19 @@ user alice  (issuer https://idp.example)
         let line = fmt_may_act(Some(&MayAct::new(["evil\u{1b}[2J"])));
         assert!(!line.chars().any(char::is_control), "{line}");
         assert!(line.contains("evil\\u{1b}[2J"), "{line}");
+    }
+
+    #[test]
+    fn key_line_shows_the_kids_that_are_present() {
+        assert_eq!(
+            fmt_kids(Some("k1"), Some("k0")).as_deref(),
+            Some("kid k1   ou_kid k0")
+        );
+        assert_eq!(fmt_kids(None, Some("k0")).as_deref(), Some("ou_kid k0"));
+        assert_eq!(fmt_kids(Some("k1"), Some("")).as_deref(), Some("kid k1"));
+        assert_eq!(fmt_kids(None, None), None);
+        let line = fmt_kids(Some("evil\u{1b}[2J"), None).unwrap();
+        assert!(!line.chars().any(char::is_control), "{line}");
     }
 
     #[test]

@@ -1,0 +1,267 @@
+{
+  "meta": {
+    "date_utc": "2026-10-24T22:01:14Z",
+    "host": "vm",
+    "cpus": 4,
+    "loadavg": "5.26 4.66 3.63 2/175 2530",
+    "git_rev": "e91a139",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "profile": "release",
+    "duration_s": 10.0,
+    "warmup_s": 2.0,
+    "runs": 5,
+    "clients": 1,
+    "tokens": 1,
+    "rotate_tokens": false,
+    "depth": 2,
+    "audit": "file"
+  },
+  "runs": [
+    {
+      "config": "baseline",
+      "cell": "read",
+      "run": 1,
+      "requests": 7754,
+      "unexpected": 0,
+      "seconds": 10.0,
+      "rps": 775.4,
+      "mean_us": 1289.6,
+      "p50_us": 1088.5,
+      "p90_us": 1434.6,
+      "p95_us": 2369.5,
+      "p99_us": 5443.6,
+      "max_us": 51675.1,
+      "over_3ms": 311,
+      "over_5ms": 116,
+      "over_10ms": 12,
+      "derived": {
+        "decide_mean_us": 274.4,
+        "decide_unstaged_mean_us": 17.1,
+        "result_append_mean_us": 118.2,
+        "result_appends": 7753
+      }
+    },
+    {
+      "config": "baseline",
+      "cell": "read",
+      "run": 2,
+      "requests": 7201,
+      "unexpected": 0,
+      "seconds": 10.0,
+      "rps": 720.1,
+      "mean_us": 1420.4,
+      "p50_us": 1099.8,
+      "p90_us": 1521.7,
+      "p95_us": 2992.1,
+      "p99_us": 5509.1,
+      "max_us": 303824.9,
+      "over_3ms": 358,
+      "over_5ms": 114,
+      "over_10ms": 16,
+      "derived": {
+        "decide_mean_us": 359.8,
+        "decide_unstaged_mean_us": 17.3,
+        "result_append_mean_us": 127.8,
+        "result_appends": 7202
+      }
+    },
+    {
+      "config": "baseline",
+      "cell": "read",
+      "run": 3,
+      "requests": 7390,
+      "unexpected": 0,
+      "seconds": 10.0,
+      "rps": 739.0,
+      "mean_us": 1352.8,
+      "p50_us": 1070.1,
+      "p90_us": 1545.2,
+      "p95_us": 1988.6,
+      "p99_us": 5054.5,
+      "max_us": 544735.2,
+      "over_3ms": 229,
+      "over_5ms": 79,
+      "over_10ms": 8,
+      "derived": {
+        "decide_mean_us": 351.6,
+        "decide_unstaged_mean_us": 17.1,
+        "result_append_mean_us": 147.5,
+        "result_appends": 7390
+      }
+    },
+    {
+      "config": "baseline",
+      "cell": "read",
+      "run": 4,
+      "requests": 8021,
+      "unexpected": 0,
+      "seconds": 10.0,
+      "rps": 802.1,
+      "mean_us": 1246.2,
+      "p50_us": 1092.6,
+      "p90_us": 1724.4,
+      "p95_us": 2027.5,
+      "p99_us": 3559.4,
+      "max_us": 58228.7,
+      "over_3ms": 121,
+      "over_5ms": 33,
+      "over_10ms": 11,
+      "derived": {
+        "decide_mean_us": 300.5,
+        "decide_unstaged_mean_us": 18.2,
+        "result_append_mean_us": 126.8,
+        "result_appends": 8021
+      }
+    },
+    {
+      "config": "baseline",
+      "cell": "read",
+      "run": 5,
+      "requests": 7083,
+      "unexpected": 0,
+      "seconds": 10.0,
+      "rps": 708.3,
+      "mean_us": 1411.3,
+      "p50_us": 1230.8,
+      "p90_us": 2081.8,
+      "p95_us": 2490.4,
+      "p99_us": 3823.6,
+      "max_us": 64553.0,
+      "over_3ms": 177,
+      "over_5ms": 31,
+      "over_10ms": 8,
+      "derived": {
+        "decide_mean_us": 290.6,
+        "decide_unstaged_mean_us": 17.7,
+        "result_append_mean_us": 130.1,
+        "result_appends": 7083
+      }
+    }
+  ],
+  "summary": [
+    {
+      "config": "baseline",
+      "cell": "read",
+      "runs": 5,
+      "p50_median_us": 1092.6,
+      "p50_min_us": 1070.1,
+      "p50_max_us": 1230.8,
+      "p90_median_us": 1545.2,
+      "p95_median_us": 2369.5,
+      "p99_median_us": 5054.5,
+      "rps_median": 739.0,
+      "requests": 37449,
+      "over_3ms": 1196,
+      "over_5ms": 373,
+      "over_10ms": 55,
+      "max_us": 544735.2,
+      "stages": [
+        {
+          "stage": "token_verify_hit",
+          "count": 37446,
+          "mean_us": 9.4,
+          "p50_us": 8.8,
+          "p90_us": 16.2,
+          "p95_us": 18.4,
+          "over_3ms": 0,
+          "over_5ms": 0,
+          "over_10ms": 0
+        },
+        {
+          "stage": "lease_check",
+          "count": 37447,
+          "mean_us": 30.4,
+          "p50_us": 27.3,
+          "p90_us": 46.5,
+          "p95_us": 49.4,
+          "over_3ms": 0,
+          "over_5ms": 0,
+          "over_10ms": 0
+        },
+        {
+          "stage": "policy",
+          "count": 37447,
+          "mean_us": 108.9,
+          "p50_us": 103.8,
+          "p90_us": 182.8,
+          "p95_us": 192.6,
+          "over_3ms": 4,
+          "over_5ms": 0,
+          "over_10ms": 0
+        },
+        {
+          "stage": "audit_append",
+          "count": 37447,
+          "mean_us": 158.0,
+          "p50_us": 98.0,
+          "p90_us": 182.7,
+          "p95_us": 193.8,
+          "over_3ms": 90,
+          "over_5ms": 47,
+          "over_10ms": 22
+        },
+        {
+          "stage": "blocking_pool",
+          "count": 37447,
+          "mean_us": 106.4,
+          "p50_us": 71.7,
+          "p90_us": 162.7,
+          "p95_us": 195.7,
+          "over_3ms": 104,
+          "over_5ms": 14,
+          "over_10ms": 1
+        },
+        {
+          "stage": "upstream",
+          "count": 37449,
+          "mean_us": 235.4,
+          "p50_us": 214.2,
+          "p90_us": 303.0,
+          "p95_us": 426.3,
+          "over_3ms": 41,
+          "over_5ms": 6,
+          "over_10ms": 0
+        },
+        {
+          "stage": "response",
+          "count": 37449,
+          "mean_us": 454.7,
+          "p50_us": 372.1,
+          "p90_us": 579.0,
+          "p95_us": 856.7,
+          "over_3ms": 460,
+          "over_5ms": 97,
+          "over_10ms": 16
+        },
+        {
+          "stage": "total",
+          "count": 37449,
+          "mean_us": 1157.9,
+          "p50_us": 938.3,
+          "p90_us": 1853.4,
+          "p95_us": 2046.3,
+          "over_3ms": 1016,
+          "over_5ms": 292,
+          "over_10ms": 54
+        }
+      ],
+      "derived": {
+        "decide_mean_us": 314.7,
+        "decide_unstaged_mean_us": 17.5,
+        "result_append_mean_us": 129.9,
+        "result_appends": 37449
+      }
+    }
+  ],
+  "checks": [
+    {
+      "cell": "read",
+      "charged": 0,
+      "tainted_by": 0,
+      "usage": false,
+      "used_after": null,
+      "config": "baseline"
+    }
+  ],
+  "approval": null
+}
