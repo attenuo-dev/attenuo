@@ -8,7 +8,7 @@ A reading-and-running plan for someone who wants to understand every piece of at
 4. [A glossary](#4-glossary).
 5. [Things that will surprise you](#5-things-that-will-surprise-you).
 
-Paths are relative to the repository root. Functions are cited by name, not line number, because lines move: find one with `grep -rn "fn name" crates/`. Line counts are rounded and were taken at the commit this page was written against; use them to size a session, not as a contract.
+Paths are relative to the repository root. Functions are cited by name, not line number, because lines move: find one with `grep -rn "fn name" crates/`. Line counts are rounded and were checked against main @ de3cf75 (2026-10-24); use them to size a session, not as a contract.
 
 Every command below except `cargo bench` and `cargo +nightly fuzz` was run, in this order, on 2026-10-23 against `main` (about 110 commands; the Rust test filters, the Python and TypeScript test suites and the demo included). Where the text quotes output, that is what was printed. Line counts were refreshed the same day; they are rounded, so use them to size a session, not as a contract.
 
@@ -242,8 +242,8 @@ Read beside: [Audit log](../concepts/audit-log.md), then [RFC-0001](../spec/rfc-
 | 3 | `crates/attenuo-audit/src/memory.rs` | An in-memory sink: the smallest implementation to read first. | 60 |
 | 4 | `crates/attenuo-audit/src/checkpoint.rs` | `Checkpoint` (seq, head hash, time, `kid`, signature), `CheckpointKeys` from a JWKS, `verify_with_checkpoints`. | 265 |
 | 5 | `crates/attenuo-audit/src/export.rs` | The `attenuo-audit-export-v2` JSON Lines format, `parse_export`, strict `verify_export`. | 355 |
-| 6 | `crates/attenuo-audit/src/lease.rs` | The `LeaseStore` trait and `MemoryLeaseStore`: register, renew, revoke with cascade, `check_all`. | 240 |
-| 7 | `crates/attenuo-audit/src/sqlite.rs` | `SqliteAudit` and `SqliteLeaseStore`. Read the module comment, `Durability`, `append_locked` and the group-commit writer; skim the rest. WAL mode, background WAL checkpoints (and the writer's own backstop), `checkpoint_signed`. | 2150 |
+| 6 | `crates/attenuo-audit/src/lease.rs` | The `LeaseStore` trait and `MemoryLeaseStore`: register, renew, revoke with cascade, `check_all`. | 375 |
+| 7 | `crates/attenuo-audit/src/sqlite.rs` | `SqliteAudit` and `SqliteLeaseStore`. Read the module comment, `Durability`, `append_locked` and the group-commit writer; skim the rest. WAL mode, background WAL checkpoints (and the writer's own backstop), `checkpoint_signed`. | 2900 |
 
 Check you understood:
 
@@ -340,12 +340,12 @@ Read beside: [ADR-0006: Lease-based in-flight revocation](../decisions/0006-leas
 
 | Order | File | What it does | Lines |
 | --- | --- | --- | --- |
-| 1 | `crates/attenuo-server/src/main.rs`, `lib.rs` | Startup, signal handling, and `router`: every route in one place. | 330 |
-| 2 | `crates/attenuo-server/src/state.rs` | `AppState::from_config`: builds the issuer, verifier, policy engine, stores, replay caches. `blocking` and `initial_lease_expiry`. | 525 |
+| 1 | `crates/attenuo-server/src/main.rs`, `lib.rs` | Startup, signal handling, and `router`: every route in one place. | 395 |
+| 2 | `crates/attenuo-server/src/state.rs` | `AppState::from_config`: builds the issuer, verifier, policy engine, stores, replay caches. `blocking` and `initial_lease_expiry`. | 625 |
 | 3 | `crates/attenuo-server/src/authz.rs` | `Pipeline::decide` (leases, policy, audit), `ServerAuthorizer` (the proxy's `Authorizer`), the verified-token cache. The most important file in the crate. | 810 |
 | 4 | `crates/attenuo-server/src/routes/token.rs` | `exchange` / `exchange_sync`: the token exchange table in section 1, line by line. | 540 |
 | 5 | `crates/attenuo-server/src/routes/renew.rs`, `dev_root.rs` | Lease renewal; the development root mint. | 420 |
-| 6 | `crates/attenuo-server/src/routes/admin.rs` | `require_admin`, revoke, lease status, audit range/verify/checkpoint/export, policy reload. | 410 |
+| 6 | `crates/attenuo-server/src/routes/admin.rs` | `require_admin`, revoke, lease status, audit range/verify/checkpoint/export, policy reload. | 875 |
 | 7 | `crates/attenuo-server/src/routes/authzen.rs` | AuthZEN single and batch evaluation; `check_issued` rejects a chain the server never issued. | 395 |
 | 8 | `crates/attenuo-server/src/dpop.rs`, `replay.rs`, `clientauth.rs`, `actor.rs` | DPoP policy (`bind_new`, `bind_exchange`), single-use caches, client-secret check, actor tokens (SPIFFE). | 2040 |
 | 9 | `crates/attenuo-server/src/idp/` (`mod.rs`, `intake.rs`, `jwks.rs`, `claims.rs`) | Hop 0 from a real identity provider: ID tokens and ID-JAG, JWKS cache. Read last, or skip until you wire an IdP. | 1700 |
@@ -400,10 +400,10 @@ Read beside: [CLI commands](../reference/cli.md), and the demo's own README, `ex
 | --- | --- | --- | --- |
 | 1 | `examples/github-leak-demo/run.sh` | The scenario in nine steps, with checks on every exit status. | 150 |
 | 2 | `examples/github-leak-demo/config.toml`, `policy.cedar`, `policy_test.yaml` | The server config, policy and policy tests it uses. | 190 |
-| 3 | `crates/attenuo-cli/src/cli.rs` | The whole command surface in clap definitions. | 910 |
-| 4 | `crates/attenuo-cli/src/main.rs` | What each command does with the HTTP API. | 845 |
+| 3 | `crates/attenuo-cli/src/cli.rs` | The whole command surface in clap definitions. | 1295 |
+| 4 | `crates/attenuo-cli/src/main.rs` | What each command does with the HTTP API. | 1075 |
 | 5 | `crates/attenuo-cli/src/client.rs`, `secrets.rs` | The HTTP client; how secrets are read (env, file, stdin, flag with a warning). | 700 |
-| 6 | `crates/attenuo-cli/src/jwt.rs`, `render.rs`, `dpop_key.rs`, `policy_cmd.rs` | Local token decoding and display, DPoP key files, `policy test` and `policy lint`. | 1040 |
+| 6 | `crates/attenuo-cli/src/jwt.rs`, `render.rs`, `dpop_key.rs`, `policy_cmd.rs` | Local token decoding and display, DPoP key files, `policy test` and `policy lint`. | 1465 |
 
 Check you understood:
 
@@ -440,7 +440,7 @@ Read beside: [Integrating MCP clients](../guides/integrating-mcp-clients.md), th
 | 4 | `sdk/python/src/attenuo/errors.py`, `token.py` | `Denied` (trusted only if the decision id is in the response header), `Token` and local decoding. | 360 |
 | 5 | `sdk/python/src/attenuo/dpop.py`, `mcp.py` | `DpopKey` (including `sign_off`), `TokenAuth` for `httpx`. | 385 |
 | 6 | `sdk/python/src/attenuo/refresh.py` | `TokenRefresher` and `AsyncTokenRefresher`: renew at a third of the lease interval, re-exchange before `exp`, back off, stop on a revoked lease. | 410 |
-| 7 | `sdk/python/src/attenuo/admin.py` | `AdminClient`: revoke, lease status, audit, verify, dev root mint. | 405 |
+| 7 | `sdk/python/src/attenuo/admin.py` | `AdminClient`: revoke, lease status, audit, verify, dev root mint. | 935 |
 | 8 | `sdk/typescript/src/` (`client.ts`, `refresh.ts`, `dpop.ts`, `wire.ts`) | The same, with WebCrypto and `fetch`. | 1100 |
 | 9 | `examples/python-agent/agent.py` | A planner delegates to a coder, the coder meets an injected instruction, the planner revokes (`mcp_client_example.py` beside it shows the raw client). | 130 |
 
@@ -485,7 +485,7 @@ PYTHONPATH=sdk/python/src python3 -m pytest sdk/python/tests/test_refresh.py -q 
 ATTENUO_INTEGRATION=1 ATTENUO_BIN_DIR=$BIN PYTHONPATH=sdk/python/src python3 -m pytest sdk/python/tests/test_integration.py -q   # builds no Rust; starts its own server
 ```
 
-The TypeScript SDK: `cd sdk/typescript && npm ci && npm test` (150 passed, 7 skipped without `ATTENUO_INTEGRATION`; Node 22, 2026-10-23).
+The TypeScript SDK: `cd sdk/typescript && npm ci && npm test` (158 passed, 7 skipped without `ATTENUO_INTEGRATION`; main @ de3cf75, 2026-10-24).
 
 ### Session 9: evaluation suite, benchmarks and fuzzing
 

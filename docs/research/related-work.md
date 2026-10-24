@@ -3,6 +3,8 @@
 <!-- renamed-note -->
 > Note (2026-10-23): this project was renamed from `onbehalf` to `attenuo`. This historical document keeps the old name.
 
+> Note (2026-10-24): the competitor rows below were re-checked against current documentation in [comparison.md](../comparison.md#product-notes). Where the two differ (Teleport, AgentGateway, Pomerium, Entra Agent ID, Okta and Auth0, Cerbos and OPA audit), comparison.md is current.
+
 - Date: 2026-10-22
 - Related: [RFC-0001](../spec/rfc-0001-attenuo.md), [standards](standards.md), [ADR-0002](../decisions/0002-cedar-for-policy.md)
 

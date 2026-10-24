@@ -286,7 +286,7 @@ If the new file does not parse or does not validate against the catalog, the old
 
 ## Where to go next
 
-- Replay a real incident end to end with [examples/github-leak-demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/github-leak-demo/README.md). `run.sh` does the whole thing in about a minute.
+- Replay a real incident end to end with [examples/github-leak-demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/github-leak-demo/README.md). `run.sh` does the whole thing in about a second once the workspace is built; the first run spends about a minute and a half compiling on a 4-core machine.
 - Replace the development mint with a real login: [Identity providers](identity-providers.md).
 - Put this on something other than your laptop: [Deploying](deploying.md).
 - Write the agent side: [Integrating MCP clients](integrating-mcp-clients.md).
