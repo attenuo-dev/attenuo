@@ -97,6 +97,17 @@ pub struct ToolAttrs {
     /// arguments that are not declared are still passed to Cedar at evaluation time.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub inputs: BTreeMap<String, ArgType>,
+    /// The input whose value run usage sums for this tool, `context.usage.amount`
+    /// (run-limits design section 3.5). Only a destructive tool keeps usage. A value that is
+    /// not a JSON integer of at least 0 adds nothing. When `inputs` declares it, it must be
+    /// `long`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<String>,
+    /// The input that names where the call goes (a payee, a recipient), for
+    /// `context.usage.destination_seen`. A list value counts each element. The server keeps
+    /// only keyed hashes of the values, per run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
 }
 
 fn is_untrusted(label: &OutputLabel) -> bool {
@@ -148,6 +159,18 @@ impl ToolAttrs {
 
     pub fn sensitive(mut self, sensitive: bool) -> Self {
         self.sensitive = sensitive;
+        self
+    }
+
+    /// Name the input run usage sums (see [`ToolAttrs::amount`]).
+    pub fn with_amount(mut self, input: impl Into<String>) -> Self {
+        self.amount = Some(input.into());
+        self
+    }
+
+    /// Name the input that identifies the destination (see [`ToolAttrs::destination`]).
+    pub fn with_destination(mut self, input: impl Into<String>) -> Self {
+        self.destination = Some(input.into());
         self
     }
 
@@ -281,13 +304,37 @@ impl ToolCatalog {
     }
 
     /// Check every server and tool name against [`attenuo_core::names`]: a server name has
-    /// no `/`, and a tool is a tool name or an MCP method name (`resources/read`). Called by
+    /// no `/`, and a tool is a tool name or an MCP method name (`resources/read`). A tool's
+    /// `amount` and `destination` must name an input, and `amount` one not declared other than
+    /// `long`. Called by
     /// [`PolicyEngineBuilder::build`](crate::PolicyEngineBuilder::build).
     pub fn validate(&self) -> Result<(), String> {
-        for (server, tool) in self.tools.keys() {
+        for ((server, tool), attrs) in &self.tools {
             attenuo_core::names::check_server_name(server)
                 .and_then(|()| attenuo_core::names::check_call_name(tool))
                 .map_err(|e| format!("catalog entry {server:?} / {tool:?}: {e}"))?;
+            for (field, input) in [
+                ("amount", &attrs.amount),
+                ("destination", &attrs.destination),
+            ] {
+                if input.as_deref().is_some_and(str::is_empty) {
+                    return Err(format!(
+                        "catalog entry {server:?} / {tool:?}: `{field}` names no input"
+                    ));
+                }
+            }
+            if let Some(input) = &attrs.amount {
+                match attrs.inputs.get(input) {
+                    None | Some(ArgType::Long) => {}
+                    Some(ty) => {
+                        return Err(format!(
+                            "catalog entry {server:?} / {tool:?}: `amount` names input \
+                             {input:?}, declared {}, not long",
+                            ty.cedar()
+                        ))
+                    }
+                }
+            }
         }
         Ok(())
     }

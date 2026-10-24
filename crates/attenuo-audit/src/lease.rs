@@ -12,7 +12,7 @@ use attenuo_core::{Charge, LeaseId};
 use time::OffsetDateTime;
 
 use crate::approval::{rules, Approval, ApprovalState, Approver};
-use crate::budget::{plan, ChargeOutcome, CounterKey, ValueKey};
+use crate::budget::{plan, ChargeOutcome, CounterKey, ValueKey, USAGE_KINDS};
 use crate::error::AuditError;
 use crate::spans::{distinct_hashes, evictions, SpanHit, SpanKey, MAX_SPANS_PER_RUN};
 
@@ -224,7 +224,8 @@ pub trait LeaseStore: Send + Sync {
     }
 
     /// Return what `decision_id` charged to every counter it charged, at most once, in one
-    /// transaction. Returns how many counters were restored. [`AuditError::UnknownCharge`]
+    /// transaction, run-usage counters included. Returns how many token-limit counters were
+    /// restored (run usage is not counted, so a decision that charged only usage returns 0). [`AuditError::UnknownCharge`]
     /// when the decision charged nothing, [`AuditError::ChargeRefunded`] when it was already
     /// refunded. Used by the pipeline when a charged decision's audit append fails, and by
     /// the operator refund (`POST /admin/budgets/refund`).
@@ -571,6 +572,16 @@ impl LeaseStore for MemoryLeaseStore {
         for id in &visited {
             spans.runs.remove(id);
         }
+        drop(spans);
+        // So does its run usage (`crate::budget`). Lock order: rows, budgets.
+        let ended = |k: &CounterKey| {
+            USAGE_KINDS.contains(&k.kind) && visited.contains(&LeaseId::new(&k.lease))
+        };
+        let mut b = self.budgets.lock()?;
+        b.counters.retain(|k, _| !ended(k));
+        for entry in b.log.values_mut() {
+            entry.charges.retain(|c| !ended(&c.counter));
+        }
         Ok(revoked)
     }
 
@@ -890,8 +901,10 @@ impl LeaseStore for MemoryLeaseStore {
     fn refund(&self, decision_id: &str, _at: OffsetDateTime) -> Result<u64, AuditError> {
         let mut b = self.budgets.lock()?;
         let Budgets { counters, log, .. } = &mut *b;
+        // An entry left empty by a revocation that ended its run's usage charged nothing now.
         let entry = log
             .get_mut(decision_id)
+            .filter(|e| !e.charges.is_empty())
             .ok_or_else(|| AuditError::UnknownCharge(decision_id.to_owned()))?;
         if entry.refunded {
             return Err(AuditError::ChargeRefunded(decision_id.to_owned()));
@@ -902,6 +915,10 @@ impl LeaseStore for MemoryLeaseStore {
             }
         }
         entry.refunded = true;
-        Ok(entry.charges.len() as u64)
+        Ok(entry
+            .charges
+            .iter()
+            .filter(|c| !USAGE_KINDS.contains(&c.counter.kind))
+            .count() as u64)
     }
 }

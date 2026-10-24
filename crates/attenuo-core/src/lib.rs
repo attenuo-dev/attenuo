@@ -33,9 +33,9 @@ pub use capability::{ArgConstraint, Capability, CapabilitySet};
 pub use chain::{AgentId, DelegationChain, Hop, LeaseId, OriginatingUser};
 pub use decision::{
     chain_id_of, ApprovalInfo, BudgetCharge, Decision, DecisionRecord, OutputLabel, RecordBudget,
-    RecordKind, RecordLabels, ResultInfo, UntrustedArg, UntrustedKind, REASON_APPROVAL_DECLINED,
-    REASON_APPROVAL_GRANTED, REASON_APPROVAL_INVALID, REASON_APPROVAL_REQUESTED,
-    REASON_TOOL_RESULT,
+    RecordKind, RecordLabels, RecordUsage, ResultInfo, UntrustedArg, UntrustedKind,
+    REASON_APPROVAL_DECLINED, REASON_APPROVAL_GRANTED, REASON_APPROVAL_INVALID,
+    REASON_APPROVAL_REQUESTED, REASON_TOOL_RESULT,
 };
 pub use error::{AttenuationError, ChainError};
 pub use limits::{ArgLimit, Charge, LimitKind, Limits};

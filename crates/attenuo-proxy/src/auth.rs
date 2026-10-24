@@ -34,6 +34,10 @@ pub struct AuthDecision {
     /// (ADR-0009 phase 2), which the `-32008` and `-32003` error data carry as
     /// `untrusted_args`. `None` when none matched.
     pub untrusted_args: Option<serde_json::Value>,
+    /// For a call to a destructive tool: the run's usage of it before the call,
+    /// `{calls, amount, destination_seen}` (run-limits design section 3.5), which the `-32008`
+    /// and `-32003` error data carry as `usage`. `None` for any other tool.
+    pub usage: Option<serde_json::Value>,
 }
 
 /// The `params._meta` key that carries a signed approval token (output labelling, ADR-0009).
@@ -70,6 +74,7 @@ impl AuthDecision {
             approval: None,
             limit: None,
             untrusted_args: None,
+            usage: None,
         }
     }
 
@@ -81,6 +86,7 @@ impl AuthDecision {
             approval: None,
             limit: None,
             untrusted_args: None,
+            usage: None,
         }
     }
 
@@ -99,6 +105,12 @@ impl AuthDecision {
     /// Attach the arguments that matched an untrusted result (`[{arg, seq, kind}]`).
     pub fn with_untrusted_args(mut self, untrusted_args: Option<serde_json::Value>) -> Self {
         self.untrusted_args = untrusted_args;
+        self
+    }
+
+    /// Attach the run's usage of a destructive tool (`{calls, amount, destination_seen}`).
+    pub fn with_usage(mut self, usage: Option<serde_json::Value>) -> Self {
+        self.usage = usage;
         self
     }
 

@@ -390,6 +390,11 @@ fn evaluate_value(
     if let Some(charged) = &d.charged {
         context["charged"] = json!(charged.charged);
     }
+    // Run usage (run-limits design section 3.5): only for a destructive tool, as on the
+    // decision record, so answers about other tools are unchanged.
+    if let Some(u) = &d.usage {
+        context["usage"] = crate::authz::usage_json(u);
+    }
     // Argument-level taint (ADR-0009 phase 2): only when an argument matched, so other
     // answers are unchanged.
     if !d.untrusted_args.is_empty() {

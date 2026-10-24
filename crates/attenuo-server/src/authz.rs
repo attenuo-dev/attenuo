@@ -12,7 +12,12 @@
 //!    ([`attenuo_core::limits::charges_for`]) and what its counters hold
 //!    (`LeaseStore::budget_used`), as `context.budget` and as the limit check of step 4.
 //!    Unreadable counters deny a limited call with `budget_error`; an argument a limit
-//!    cannot count denies it with `limit_arg_invalid`. Then argument matching (ADR-0009
+//!    cannot count denies it with `limit_arg_invalid`. In the same read, for a tool the
+//!    catalog marks destructive, the run's usage of it (design section 3.5,
+//!    [`attenuo_core::limits::usage_charges`]): calls, the catalog's `amount` input summed,
+//!    whether its `destination` was seen, as `context.usage`; with no limit matching,
+//!    unreadable usage is the worst case ([`UNREADABLE_USAGE`]) and the policy decides. Then
+//!    argument matching (ADR-0009
 //!    phase 2, [`Pipeline::arg_taint`]): for a call to a destructive tool on a tainted run,
 //!    every argument not pinned by an `equals` or `one_of` constraint is fingerprinted and
 //!    looked up in the run's span index (`LeaseStore::find_spans`); the hits are
@@ -31,12 +36,15 @@
 //! 4. **Policy.** `PolicyEngine::authorize_labelled`: the capability stage (including the
 //!    limit check: a call that would take any matching counter past its `max` is denied with
 //!    `budget_exhausted`, before Cedar), then Cedar, with the run's labels as
-//!    `context.session` and the budget figures as `context.budget`. A deny through
+//!    `context.session`, the budget figures as `context.budget` and the run usage as
+//!    `context.usage`. A deny through
 //!    `@obligation("approval")` forbids only is `approval_required`.
 //! 5. **Charge.** For an allowed call that matched limits, every counter is re-checked and
 //!    charged in one store transaction (`LeaseStore::charge`), so concurrent calls cannot
 //!    overspend: if one spent first, the decision becomes `budget_exhausted`; if the store
-//!    fails, `budget_error`. Denied calls are never charged.
+//!    fails, `budget_error`. The run-usage counters of a destructive call are charged in the
+//!    same transaction; usage never refuses, and a failed charge of usage alone leaves the
+//!    decision as it is (with a diagnostic). Denied calls are never charged.
 //! 6. **Audit.** A [`DecisionRecord`] is appended to the hash-chained log, and its id is the
 //!    decision id returned to the caller. If the append fails the call is denied with
 //!    `audit_error`: an action that cannot be recorded does not happen. An approval taken in
@@ -64,16 +72,18 @@ use attenuo_audit::{
 };
 use attenuo_core::fingerprint::{fingerprints, pinned_arguments, Fingerprint};
 use attenuo_core::limits::{
-    charges_for, REASON_BUDGET_ERROR, REASON_BUDGET_EXHAUSTED, REASON_LIMIT_ARG_INVALID,
+    charges_for, usage_charges, MAX_LIMIT, REASON_BUDGET_ERROR, REASON_BUDGET_EXHAUSTED,
+    REASON_LIMIT_ARG_INVALID,
 };
 use attenuo_core::{
     chain_id_of, ApprovalInfo, BudgetCharge, Charge, Decision, DecisionRecord, DelegationChain,
-    LeaseId, LimitKind, OutputLabel, RecordBudget, RecordKind, RecordLabels, ResultInfo, ToolCall,
-    UntrustedArg, UntrustedKind, REASON_APPROVAL_INVALID, REASON_APPROVAL_REQUESTED,
+    LeaseId, LimitKind, OutputLabel, RecordBudget, RecordKind, RecordLabels, RecordUsage,
+    ResultInfo, ToolCall, UntrustedArg, UntrustedKind, REASON_APPROVAL_INVALID,
+    REASON_APPROVAL_REQUESTED,
 };
 use attenuo_policy::{
     ApprovalContext, ArgLabels, BudgetContext, BudgetRefusal, CallLabels, PolicyEngine,
-    SessionLabels,
+    SessionLabels, UsageContext,
 };
 use attenuo_proxy::{
     ApprovalTicket, AuthDecision, AuthError, Authenticated, Authorizer, CallContext, RequestAuth,
@@ -137,11 +147,20 @@ pub fn untrusted_args_json(args: &[UntrustedArg]) -> Value {
     serde_json::to_value(args).unwrap_or_default()
 }
 
-/// What [`Pipeline::budget_view`] found for a call: the run limits that match it (ADR-0010).
+/// What [`Pipeline::budget_view`] found for a call: the run limits that match it (ADR-0010)
+/// and, for a destructive tool, the run's usage of it (run-limits design section 3.5).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BudgetView {
-    /// Every counter the call would be charged against. Empty when no limit matches.
+    /// Every counter the call would be charged against: the matching limits, then the run-usage
+    /// counters ([`Charge::usage`]). Empty when no limit matches and the tool is not
+    /// destructive.
     pub charges: Vec<Charge>,
+    /// What Cedar sees as `context.usage`. `None` when the tool keeps no usage (it is not
+    /// destructive), or when the call was refused before usage was read.
+    pub usage: Option<UsageContext>,
+    /// Set when the run's usage could not be read and no limit matched the call: `usage` is
+    /// then the worst case ([`UNREADABLE_USAGE`]) and the call is decided by the policy.
+    pub usage_error: Option<String>,
     /// What Cedar sees as `context.budget`, with the refusal of the limit check, if any.
     pub context: BudgetContext,
     /// For `budget_exhausted`: the limit the call would take past its `max`.
@@ -212,6 +231,35 @@ pub fn budget_json(b: &BudgetContext) -> Value {
     })
 }
 
+/// What Cedar sees as `context.usage` when the run's usage cannot be read: the worst case, as an
+/// unreadable taint state counts as tainted. A count rule asks or refuses, an amount rule that
+/// adds the call's amount overflows (an evaluation error, which denies), and every destination
+/// counts as seen.
+pub const UNREADABLE_USAGE: UsageContext = UsageContext {
+    calls: i64::MAX,
+    amount: i64::MAX,
+    destination_seen: true,
+};
+
+/// `context.usage` as JSON: `{calls, amount, destination_seen}`. What the decision record's
+/// `usage` member, the `-32008` / `-32003` error data, AuthZEN answers and the admin dry run
+/// carry for a destructive tool.
+pub fn usage_json(u: &UsageContext) -> Value {
+    serde_json::json!({
+        "calls": u.calls,
+        "amount": u.amount,
+        "destination_seen": u.destination_seen,
+    })
+}
+
+fn record_usage(u: &UsageContext) -> RecordUsage {
+    RecordUsage {
+        calls: u.calls.max(0) as u64,
+        amount: u.amount.max(0) as u64,
+        destination_seen: u.destination_seen,
+    }
+}
+
 /// SHA-256 (hex) and length of the RFC 8785 canonical JSON of an upstream result: what a
 /// `tool_result` record stores instead of the result. `Err` for a value with no canonical
 /// form (nothing parsed from JSON has one).
@@ -251,6 +299,10 @@ pub struct PipelineDecision {
     /// The arguments that matched the run's span index (the record's
     /// `labels.untrusted_args`). Empty when none did.
     pub untrusted_args: Vec<UntrustedArg>,
+    /// For a call to a destructive tool: the run's usage of it before the call, as Cedar saw
+    /// it (the record's `usage`). `None` for any other tool, or when the call was decided
+    /// before usage was read.
+    pub usage: Option<UsageContext>,
 }
 
 impl PipelineDecision {
@@ -425,6 +477,7 @@ impl Pipeline {
                         diagnostics.push(detail);
                         diagnostics.extend(run.error);
                         diagnostics.extend(args.error);
+                        diagnostics.extend(budget.usage_error.clone());
                         (
                             Decision::Deny,
                             REASON_APPROVAL_INVALID.to_string(),
@@ -443,12 +496,14 @@ impl Pipeline {
                                 .map(|a| ApprovalContext::by(a.method.by()))
                                 .unwrap_or_default(),
                             budget: budget.context.clone(),
+                            usage: budget.usage.unwrap_or_default(),
                         };
                         let o = self.evaluate_policy(chain, call, &labels, now);
                         policy_time = Some(t1.elapsed());
                         diagnostics.extend(o.diagnostics);
                         diagnostics.extend(run.error);
                         diagnostics.extend(args.error);
+                        diagnostics.extend(budget.usage_error.clone());
                         (o.decision, o.reason, o.policy_ids, diagnostics)
                     }
                 }
@@ -460,6 +515,8 @@ impl Pipeline {
         // Charge an allowed call against every matching limit, re-checking in the store's
         // transaction: a concurrent call may have spent the budget since it was read.
         let mut charged: Option<RecordBudget> = None;
+        // Something was charged, a limit or run usage: refunded if the append fails.
+        let mut any_charged = false;
         // The charge left its sync to the decision's append (see `charge_sync_on_append`).
         let mut sync_on_append = false;
         if decision.is_allow() && !budget.charges.is_empty() {
@@ -476,21 +533,22 @@ impl Pipeline {
             };
             match outcome {
                 Ok(ChargeOutcome::Charged { used_after }) => {
-                    charged = Some(RecordBudget {
-                        charged: budget
-                            .charges
-                            .iter()
-                            .zip(used_after)
-                            .map(|(c, used_after)| BudgetCharge {
-                                hop: c.hop,
-                                cap: c.cap,
-                                kind: c.kind,
-                                arg: c.arg.clone(),
-                                used_after,
-                                max: c.max,
-                            })
-                            .collect(),
-                    });
+                    any_charged = true;
+                    let limits: Vec<BudgetCharge> = budget
+                        .charges
+                        .iter()
+                        .zip(used_after)
+                        .filter(|(c, _)| !c.usage)
+                        .map(|(c, used_after)| BudgetCharge {
+                            hop: c.hop,
+                            cap: c.cap,
+                            kind: c.kind,
+                            arg: c.arg.clone(),
+                            used_after,
+                            max: c.max,
+                        })
+                        .collect();
+                    charged = (!limits.is_empty()).then_some(RecordBudget { charged: limits });
                 }
                 Ok(ChargeOutcome::Exhausted { index, used }) => {
                     let hit = LimitHit::of(&budget.charges[index], used);
@@ -501,6 +559,13 @@ impl Pipeline {
                         REASON_BUDGET_EXHAUSTED.to_string(),
                         Vec::new(),
                     );
+                }
+                Err(e) if budget.charges.iter().all(|c| c.usage) => {
+                    // Only run usage: it is a policy input, not a limit, so the decision
+                    // stands (design 3.4 denies only calls a limit applies to). The next read
+                    // of an unreadable store sees the worst case (see `budget_view`).
+                    tracing::error!(error = %e, "run usage could not be charged; deciding anyway");
+                    diagnostics.push(format!("run usage could not be charged: {e}"));
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "budget counters could not be charged; denying");
@@ -538,6 +603,7 @@ impl Pipeline {
             record.approval = Some(info);
         }
         record.budget = charged.clone();
+        record.usage = budget.usage.as_ref().map(record_usage);
         // The record moves into the log; the entry hands it back, so it is never cloned. A
         // deferred `sum` charge is durable once this synced append returns, before the call is
         // answered or forwarded; if the append fails, the charge is refunded below.
@@ -605,6 +671,7 @@ impl Pipeline {
                     limit,
                     charged,
                     untrusted_args: record_labels.untrusted_args,
+                    usage: budget.usage,
                 }
             }
             Err(e) => {
@@ -613,7 +680,7 @@ impl Pipeline {
                 if let Some(a) = &taken {
                     self.give_back(a, decision_id);
                 }
-                if charged.is_some() {
+                if any_charged {
                     self.refund_unrecorded(decision_id, now);
                 }
                 diagnostics.push(format!("audit append failed: {e}"));
@@ -631,6 +698,7 @@ impl Pipeline {
                     limit: None,
                     charged: None,
                     untrusted_args: record_labels.untrusted_args,
+                    usage: budget.usage,
                 }
             }
         }
@@ -719,53 +787,93 @@ impl Pipeline {
         }
     }
 
-    /// The run limits that match `call` and what their counters hold (ADR-0010), read without
-    /// charging anything. Fails closed: an argument a limit cannot count refuses the call with
-    /// `limit_arg_invalid`, counters that cannot be read refuse it with `budget_error`, and a
-    /// call that would take any counter past its `max` is refused with `budget_exhausted`.
-    /// The admin dry run (`POST /admin/policies/evaluate`) uses this too.
+    /// The run limits that match `call` and what their counters hold (ADR-0010), and for a
+    /// destructive tool the run's usage of it (design section 3.5), read without charging
+    /// anything. Fails closed: an argument a limit cannot count refuses the call with
+    /// `limit_arg_invalid`, counters that cannot be read refuse it with `budget_error` (usage
+    /// counters too, when a limit matched; with no limit, unreadable usage is the worst case,
+    /// [`UNREADABLE_USAGE`], and the policy decides), and a call that would
+    /// take any limit counter past its `max` is refused with `budget_exhausted`. The admin dry
+    /// run (`POST /admin/policies/evaluate`) uses this too.
     pub fn budget_view(&self, chain: &DelegationChain, call: &ToolCall) -> BudgetView {
-        let refused = |reason: &str, detail: String| BudgetContext {
-            limited: true,
+        let refused = |limited: bool, reason: &str, detail: String| BudgetContext {
+            limited,
             refusal: Some(BudgetRefusal {
                 reason: reason.to_string(),
                 detail,
             }),
             ..BudgetContext::default()
         };
-        let charges = match charges_for(chain, call) {
+        let mut charges = match charges_for(chain, call) {
             Ok(c) => c,
             Err(e) => {
                 return BudgetView {
-                    context: refused(REASON_LIMIT_ARG_INVALID, e.to_string()),
+                    context: refused(true, REASON_LIMIT_ARG_INVALID, e.to_string()),
                     ..BudgetView::default()
                 }
             }
+        };
+        let limited = !charges.is_empty();
+        let keeps_usage = match (self.usage_inputs(call), chain_id_of(chain)) {
+            (Some((amount, destination)), Some(chain_id)) => {
+                charges.extend(usage_charges(
+                    &LeaseId::new(chain_id),
+                    call,
+                    amount.as_deref(),
+                    destination.as_deref(),
+                ));
+                true
+            }
+            _ => false,
         };
         if charges.is_empty() {
             return BudgetView::default();
         }
         let used = match self.leases.budget_used(&charges) {
             Ok(u) => u,
+            Err(e) if !limited => {
+                // Only run usage: no limit to enforce, so the policy decides on the worst case.
+                tracing::error!(error = %e, "run usage unreadable; deciding on the worst case");
+                return BudgetView {
+                    charges,
+                    usage: Some(UNREADABLE_USAGE),
+                    usage_error: Some(format!("run usage unreadable, worst case assumed: {e}")),
+                    ..BudgetView::default()
+                };
+            }
             Err(e) => {
-                tracing::error!(error = %e, "budget counters unreadable; denying the limited call");
+                tracing::error!(error = %e, "budget counters unreadable; denying the call");
                 return BudgetView {
                     context: refused(
+                        limited,
                         REASON_BUDGET_ERROR,
                         format!("budget counters unreadable: {e}"),
                     ),
                     charges,
+                    usage: None,
+                    usage_error: None,
                     hit: None,
                 };
             }
         };
         let left = |c: &Charge, u: u64| i64::try_from(c.max.saturating_sub(u)).unwrap_or(i64::MAX);
+        let figure = |u: u64| i64::try_from(u.min(MAX_LIMIT)).unwrap_or(i64::MAX);
         let mut context = BudgetContext {
-            limited: true,
+            limited,
             ..BudgetContext::default()
         };
+        let mut usage = keeps_usage.then(UsageContext::default);
         let mut hit = None;
         for (c, &u) in charges.iter().zip(&used) {
+            if c.usage {
+                let usage = usage.get_or_insert_with(UsageContext::default);
+                match c.kind {
+                    LimitKind::Calls => usage.calls = figure(u),
+                    LimitKind::Sum => usage.amount = figure(u),
+                    LimitKind::CallsPer => usage.destination_seen |= u > 0,
+                }
+                continue;
+            }
             match c.kind {
                 LimitKind::Calls => {
                     context.calls_remaining = context.calls_remaining.min(left(c, u))
@@ -787,8 +895,27 @@ impl Pipeline {
         }
         BudgetView {
             charges,
+            usage,
+            usage_error: None,
             context,
             hit,
+        }
+    }
+
+    /// For a tool that keeps run usage (one the catalog marks destructive, design section
+    /// 3.5): the inputs its catalog entry names as `amount` and `destination`. `None` for any
+    /// other tool. A tool the engine knows nothing about, and a poisoned engine lock, count as
+    /// destructive with neither input, as [`Self::is_destructive`] does.
+    fn usage_inputs(&self, call: &ToolCall) -> Option<(Option<String>, Option<String>)> {
+        let attrs = self
+            .policy
+            .read()
+            .ok()
+            .and_then(|e| e.effective_attrs(&call.server, &call.tool));
+        match attrs {
+            None => Some((None, None)),
+            Some(a) if a.is_destructive() => Some((a.amount, a.destination)),
+            Some(_) => None,
         }
     }
 
@@ -1420,6 +1547,7 @@ impl Authorizer for ServerAuthorizer {
             limit: d.limit.as_ref().map(LimitHit::to_json),
             untrusted_args: (!d.untrusted_args.is_empty())
                 .then(|| untrusted_args_json(&d.untrusted_args)),
+            usage: d.usage.as_ref().map(usage_json),
         }
     }
 
@@ -2129,9 +2257,18 @@ when { context.input has amount && context.input.amount > 1000 };
             d.diagnostics.iter().any(|m| m.contains("unreadable")),
             "{d:?}"
         );
-        // A call no limit applies to does not read the counters at all.
+        // A call no limit applies to is not refused: its tool is destructive, so the policy
+        // sees the worst-case run usage and decides (this one permits everything).
         let free = chain(Limits::default(), now);
-        assert!(p.decide(&free, &send(json!(1)), now).is_allow());
+        let d = p.decide(&free, &send(json!(1)), now);
+        assert!(d.is_allow(), "{d:?}");
+        assert_eq!(d.usage, Some(UNREADABLE_USAGE));
+        assert!(
+            d.diagnostics
+                .iter()
+                .any(|m| m.contains("run usage unreadable")),
+            "{d:?}"
+        );
     }
 }
 

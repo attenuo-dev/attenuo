@@ -649,6 +649,7 @@ impl Authorizer for StaticAuthorizer {
             approval,
             limit: None,
             untrusted_args: None,
+            usage: None,
         }
     }
 

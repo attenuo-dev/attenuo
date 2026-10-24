@@ -27,6 +27,13 @@
 //! when `m <= n`, since m calls cannot reach any value more than m times. At exchange the
 //! child's figures are clamped to the parent's ([`Limits::clamp_to`]) and, by the server, to
 //! what the parent has left.
+//!
+//! **Run usage** (design section 3.5, phase 2) uses the same counters without a limit in any
+//! token: for every call to a tool the catalog marks destructive, the server keeps, per run
+//! (`chain_id`) and tool, how many calls were allowed, the sum of the catalog's `amount` input
+//! over them and the keyed hashes of the catalog's `destination` input values
+//! ([`usage_charges`]). Policies read them as `context.usage.*`; they never refuse a call by
+//! themselves.
 
 use std::collections::BTreeSet;
 
@@ -305,6 +312,11 @@ pub struct Charge {
     pub amount: u64,
     /// The limit's `max`.
     pub max: u64,
+    /// A run-usage counter ([`usage_charges`]) rather than a token limit: kept under the run's
+    /// chain id and the tool (`arg` is `"<server>/<tool>"`), never exhausted (it saturates at
+    /// `max`), left out of the decision record's `budget` member, and not synced like a `sum`
+    /// limit.
+    pub usage: bool,
 }
 
 impl Charge {
@@ -325,6 +337,7 @@ impl Charge {
             value: None,
             amount: 0,
             max,
+            usage: false,
         }
     }
 }
@@ -361,6 +374,7 @@ pub fn charges_for(chain: &DelegationChain, call: &ToolCall) -> Result<Vec<Charg
                 value,
                 amount,
                 max,
+                usage: false,
             };
             if let Some(max) = limits.calls {
                 out.push(base(LimitKind::Calls, None, None, 1, max));
@@ -412,6 +426,52 @@ pub fn charges_for(chain: &DelegationChain, call: &ToolCall) -> Result<Vec<Charg
         }
     }
     Ok(out)
+}
+
+/// The run-usage counters a call to a destructive tool is charged against (design section 3.5):
+/// all under the run's `chain_id` and keyed by the tool, `"<server>/<tool>"`.
+///
+/// - always a `calls` counter, charged 1;
+/// - when the catalog names an `amount` input, a `sum` counter charged that argument's value
+///   if it is an amount ([`amount_of`]), else 0: a missing, string, fractional or negative
+///   amount adds nothing (the policy sees it in `context.input` and decides);
+/// - when the catalog names a `destination` input and the call carries a non-null value, one
+///   `calls_per` counter per distinct value (each element of a list), whose canonical JSON the
+///   store keeps only as a keyed hash.
+///
+/// Each has `max` [`MAX_LIMIT`] and [`Charge::usage`] set. Ordered calls, amount, destinations.
+pub fn usage_charges(
+    chain_id: &LeaseId,
+    call: &ToolCall,
+    amount_arg: Option<&str>,
+    destination_arg: Option<&str>,
+) -> Vec<Charge> {
+    let tool = format!("{}/{}", call.server, call.tool);
+    let base = |kind, value, amount| Charge {
+        hop: 0,
+        cap: 0,
+        lease: chain_id.clone(),
+        kind,
+        arg: Some(tool.clone()),
+        value,
+        amount,
+        max: MAX_LIMIT,
+        usage: true,
+    };
+    let mut out = vec![base(LimitKind::Calls, None, 1)];
+    if let Some(arg) = amount_arg {
+        let amount = call.arguments.get(arg).and_then(amount_of).unwrap_or(0);
+        out.push(base(LimitKind::Sum, None, amount));
+    }
+    if let Some(v) = destination_arg
+        .and_then(|arg| call.arguments.get(arg))
+        .filter(|v| !v.is_null())
+    {
+        for value in destinations(v) {
+            out.push(base(LimitKind::CallsPer, Some(value), 1));
+        }
+    }
+    out
 }
 
 /// The values a `calls_per` argument counts, as canonical JSON: each distinct element of a
@@ -738,5 +798,40 @@ mod tests {
             .with_constraint("amount", ArgConstraint::Equals(json!("10")))
             .with_limits(Limits::default().with_sum("amount", 10));
         assert!(pinned_str.validate_limits().is_err());
+    }
+
+    #[test]
+    fn usage_charges_key_by_run_and_tool() {
+        let chain_id = LeaseId::new("run-1");
+        let call = ToolCall::new(
+            "banking",
+            "send_money",
+            json!({"recipient": ["A", "B", "A"], "amount": 40}),
+        );
+        let c = usage_charges(&chain_id, &call, Some("amount"), Some("recipient"));
+        assert_eq!(c.len(), 4, "calls, amount and two distinct destinations");
+        assert!(c
+            .iter()
+            .all(|c| c.usage && c.lease == chain_id && c.max == MAX_LIMIT));
+        assert!(c
+            .iter()
+            .all(|c| c.arg.as_deref() == Some("banking/send_money")));
+        assert_eq!((c[0].kind, c[0].amount), (LimitKind::Calls, 1));
+        assert_eq!((c[1].kind, c[1].amount), (LimitKind::Sum, 40));
+        assert_eq!(c[2].kind, LimitKind::CallsPer);
+        assert_ne!(c[2].value, c[3].value);
+
+        // No catalog fields: only the call count.
+        assert_eq!(usage_charges(&chain_id, &call, None, None).len(), 1);
+        // An amount that is not one adds 0; a missing destination adds no counter.
+        let odd = ToolCall::new("banking", "send_money", json!({"amount": "1500"}));
+        let c = usage_charges(&chain_id, &odd, Some("amount"), Some("recipient"));
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[1].amount, 0);
+        let negative = ToolCall::new("banking", "send_money", json!({"amount": -1200}));
+        assert_eq!(
+            usage_charges(&chain_id, &negative, Some("amount"), None)[1].amount,
+            0
+        );
     }
 }

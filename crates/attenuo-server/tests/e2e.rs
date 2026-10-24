@@ -2092,6 +2092,7 @@ fn append_synthetic(h: &Harness, n: usize) {
             labels: None,
             approval: None,
             budget: None,
+            usage: None,
         };
         h.state.audit.append(record).unwrap();
     }

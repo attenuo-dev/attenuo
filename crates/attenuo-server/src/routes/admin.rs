@@ -143,7 +143,9 @@ pub struct RefundBody {
 /// return to every run-limit counter what that decision charged, at most once, and append an
 /// `admin` record (tool `admin.budget.refund`) naming the decision. For an allowed call whose
 /// effect an operator knows did not happen; neither the agent nor the upstream can refund.
-/// 404 when the decision charged nothing, 409 when it was already refunded.
+/// 404 when the decision charged nothing, 409 when it was already refunded. The run usage the
+/// decision charged (run-limits design section 3.5) is returned too; `refunded` counts only
+/// token-limit counters, so it is 0 for a call that charged usage alone.
 ///
 /// As with a revocation, the refund stands if its record cannot be written; the response
 /// then carries `audit_id: null` and the failure is logged.

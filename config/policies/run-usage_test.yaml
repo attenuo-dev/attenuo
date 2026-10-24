@@ -1,0 +1,110 @@
+# Policy tests for run-usage.cedar. Run with:
+#   attenuo policy test config/policies/run-usage_test.yaml
+#
+# The harness keeps no counters: `usage` sets what Cedar sees (context.usage) for the case, as
+# the server would after the run's earlier allowed calls of the same tool.
+policies: ./run-usage.cedar
+catalog:
+  banking:
+    get_balance: { readonly: true }
+    send_money:
+      sensitive: true
+      inputs: { recipient: string, amount: long }
+      amount: amount
+      destination: recipient
+  workspace:
+    send_email: { inputs: { to: string }, destination: to }
+cases:
+  - name: the first payment of a run is allowed
+    chain: [assistant]
+    call:
+      server: banking
+      tool: send_money
+      arguments: { recipient: FR00EMMA00000000000003, amount: 10 }
+    expect: allow
+    reason: policy_allow
+
+  - name: a second payment asks the user
+    chain: [assistant]
+    usage: { calls: 1, amount: 10, destination_seen: true }
+    call:
+      server: banking
+      tool: send_money
+      arguments: { recipient: FR00EMMA00000000000003, amount: 10 }
+    expect: deny
+    reason: approval_required
+    policy_ids: [ask_on_repeat_payment]
+
+  - name: the approved retry of the second payment goes through
+    chain: [assistant]
+    usage: { calls: 1, amount: 10 }
+    approval: { by: user }
+    call:
+      server: banking
+      tool: send_money
+      arguments: { recipient: DE00UTIL00000000000002, amount: 98 }
+    expect: allow
+    reason: policy_allow
+
+  - name: the third payment asks again, approved second or not
+    chain: [assistant]
+    usage: { calls: 2, amount: 108 }
+    call:
+      server: banking
+      tool: send_money
+      arguments: { recipient: DE00UTIL00000000000002, amount: 98 }
+    expect: deny
+    reason: approval_required
+    policy_ids: [ask_on_repeat_payment]
+
+  - name: a payment that takes the run past 2000 is refused even with an approval
+    chain: [assistant]
+    usage: { calls: 1, amount: 1990 }
+    approval: { by: user }
+    call:
+      server: banking
+      tool: send_money
+      arguments: { recipient: FR00EMMA00000000000003, amount: 20 }
+    expect: deny
+    reason: policy_deny
+    policy_ids: [run_spend_cap_2000]
+
+  - name: a first payment over the run cap is refused outright
+    chain: [assistant]
+    call:
+      server: banking
+      tool: send_money
+      arguments: { recipient: FR00EMMA00000000000003, amount: 2001 }
+    expect: deny
+    reason: policy_deny
+    policy_ids: [run_spend_cap_2000]
+
+  - name: a read is never limited by usage
+    chain: [assistant]
+    usage: { calls: 5 }
+    call: { server: banking, tool: get_balance }
+    expect: allow
+    reason: policy_allow
+
+  - name: mail to a new recipient is allowed after earlier mails
+    chain: [assistant]
+    usage: { calls: 3, destination_seen: false }
+    call: { server: workspace, tool: send_email, arguments: { to: carol@acme.example } }
+    expect: allow
+    reason: policy_allow
+
+  - name: a second mail to the same recipient asks
+    chain: [assistant]
+    usage: { calls: 1, destination_seen: true }
+    call: { server: workspace, tool: send_email, arguments: { to: bob@acme.example } }
+    expect: deny
+    reason: approval_required
+    policy_ids: [ask_on_repeat_mail_to_a_recipient]
+
+  - name: an operator's approval passes the repeat mail
+    chain: [assistant]
+    usage: { calls: 1, destination_seen: true }
+    approval: { by: operator }
+    call: { server: workspace, tool: send_email, arguments: { to: bob@acme.example } }
+    expect: allow
+    reason: policy_allow

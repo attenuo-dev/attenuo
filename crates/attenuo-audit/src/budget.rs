@@ -15,8 +15,13 @@
 //! return exactly what one decision charged, at most once. Counters are keyed by lease id and
 //! never joined with the lease table: revoking or expiring a lease does not stop its counters,
 //! or its ancestors', from being read.
+//!
+//! Run usage (design section 3.5) lives in the same table, under the run's chain id, with the
+//! kinds `usage_calls`, `usage_amount` and `usage_destination` and the tool as `arg`, and
+//! is charged and refunded with the limits of the same decision. Unlike limit counters, usage
+//! rows are deleted when their run's root lease is revoked, as the span index is.
 
-use attenuo_core::Charge;
+use attenuo_core::{Charge, LimitKind};
 use ring::hmac;
 
 use crate::error::AuditError;
@@ -39,6 +44,20 @@ pub(crate) struct CounterKey {
     pub kind: &'static str,
     pub arg: String,
     pub value: String,
+}
+
+/// The `kind` column of run-usage counters: calls, amount and destinations of one tool in one
+/// run. Never a token limit's kind (`calls`, `sum`, `calls_per`).
+pub(crate) const USAGE_KINDS: [&str; 3] = ["usage_calls", "usage_amount", "usage_destination"];
+
+/// The `kind` column of `charge`'s counter.
+fn kind_column(charge: &Charge) -> &'static str {
+    match (charge.usage, charge.kind) {
+        (false, kind) => kind.as_str(),
+        (true, LimitKind::Calls) => USAGE_KINDS[0],
+        (true, LimitKind::Sum) => USAGE_KINDS[1],
+        (true, LimitKind::CallsPer) => USAGE_KINDS[2],
+    }
 }
 
 /// The key that `calls_per` values are hashed under.
@@ -72,7 +91,7 @@ impl ValueKey {
         Ok(CounterKey {
             lease: charge.lease.0.clone(),
             cap,
-            kind: charge.kind.as_str(),
+            kind: kind_column(charge),
             arg: charge.arg.clone().unwrap_or_default(),
             value: charge
                 .value
@@ -85,7 +104,8 @@ impl ValueKey {
 
 /// Apply `charges` to counters read through `used` (which sees the effect of earlier charges
 /// of the same call, so a counter charged twice adds up). Returns the new value of every
-/// charged counter in order, or the first charge that would go over its `max`.
+/// charged counter in order, or the first charge that would go over its `max`. A run-usage
+/// charge never goes over: it saturates at its `max`.
 pub(crate) fn plan(
     keys: &[CounterKey],
     charges: &[Charge],
@@ -98,7 +118,12 @@ pub(crate) fn plan(
             Some((_, v)) => *v,
             None => used(key)?,
         };
-        match current.checked_add(charge.amount) {
+        let next = if charge.usage {
+            Some(current.saturating_add(charge.amount).min(charge.max))
+        } else {
+            current.checked_add(charge.amount)
+        };
+        match next {
             Some(next) if next <= charge.max => {
                 pending.push((key.clone(), next));
                 after.push(next);
