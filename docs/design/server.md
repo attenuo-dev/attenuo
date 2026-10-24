@@ -92,7 +92,9 @@ Phase 1 of [run limits](run-limits.md) (ADR-0010) lets a capability carry `limit
 
 **Two stores again.** The charge and the decision's audit append are in different SQLite connections, like approvals. The charge commits first and is refunded if the append fails; a crash between the two leaves a charge with no allowed decision naming it, which over-counts and so fails closed (design open question 8).
 
-**Not built (phase 2 and later).** `distinct`; catalog `amount` and `destination` fields and derived destinations; `context.usage.*`; time windows and per-user windows; reservations; SDK helpers that mint child tokens with limits; budgets on the console.
+**Run usage (phase 2, first slice).** For a call to a destructive tool, `Pipeline::budget_view` adds the run's usage counters (`attenuo_core::limits::usage_charges`: calls, the catalog's `amount` input summed, keyed hashes of its `destination` input, all under the `chain_id` and the tool) to the same read and the same charge. Cedar sees them as `context.usage.{calls, amount, destination_seen}`, the decision record as `usage`, the `-32008` / `-32003` data and AuthZEN answers as `usage`. Usage never refuses by itself and saturates instead of overflowing; with no limit matching, unreadable usage is the worst case and a failed charge of usage alone keeps the decision. Revoking the run's root lease deletes it. Details in the [design](run-limits.md#implemented-phase-2-first-slice-2026-10-24).
+
+**Not built (phase 2 and later).** `distinct`; derived destinations; time windows and per-user windows; reservations; SDK helpers that mint child tokens with limits; budgets on the console.
 
 ## MCP method coverage
 

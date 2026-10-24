@@ -47,6 +47,8 @@ The built-in user attributes `mfa` (bool), `roles` (set of string), `tenant` and
 | `destructive` | Boolean, default `true` unless `readonly = true`. Tests as `resource.destructive` in policies. |
 | `output` | `"untrusted"` (default) or `"trusted"`. A result of an untrusted tool taints the delegation run (`context.session.tainted`); a trusted tool's result is recorded but taints nothing. |
 | `inputs` | Table of argument name to type. Used to validate `context.input.*`. |
+| `amount` | Name of the input whose value run usage sums for this tool, as `context.usage.amount` ([run limits](../design/run-limits.md#35-policy)). Only destructive tools keep usage. A value that is not a non-negative integer adds 0. If `inputs` declares it, it must be `long`. |
+| `destination` | Name of the input that says where the call goes (payee, recipient), for `context.usage.destination_seen`. A list counts each element. Only keyed hashes of the values are stored, per run. |
 
 Every action a policy names must be in the catalog: the table `[policy.catalog.github.read_file]` declares `Action::"github/read_file"`.
 
