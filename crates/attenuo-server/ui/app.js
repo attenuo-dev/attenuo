@@ -60,6 +60,13 @@ function stopView() {
     try { cleanup(); } catch { /* a failing cleanup must not keep the old view alive */ }
     cleanup = null;
   }
+  // Views open their dialogs (revoke, sign) on <body>, outside the view's container. A dialog
+  // must not outlive its page: after Back or the idle lock, its submit would still act on the
+  // lease or log of the page it came from.
+  for (const d of document.querySelectorAll('dialog')) {
+    if (d.open) d.close();
+    d.remove();
+  }
 }
 
 /** Forget the token and everything cached with it, then show the login screen. */

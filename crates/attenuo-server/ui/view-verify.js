@@ -9,7 +9,10 @@ export async function verifyView(root) {
   const headBox = h('div', null, loading());
   const cpBox = h('div', null, loading());
   const verifyOut = h('div', { class: 'stack' });
-  const readyBox = h('div', { class: 'small muted' });
+  // /readyz is served on the main listener only, never on the console's own listener, so the
+  // page says where to look instead of probing it (a probe here is always a 404, which the
+  // browser logs as a console error).
+  const readyBox = h('p', { class: 'small muted' }, 'Readiness (', mono('/readyz'), ') is served on the main listener, not on the console’s.');
 
   const verifyBtn = h('button', { type: 'button', class: 'primary', on: { click: () => runVerify(verifyBtn, verifyOut) } }, 'Verify now');
   const signBtn = h('button', { type: 'button', on: { click: () => confirmSign(refresh) } }, 'Sign head now…');
@@ -51,21 +54,6 @@ export async function verifyView(root) {
   }
 
   await refresh();
-  readiness(readyBox);
-}
-
-// /readyz is served on the main listener only. Probe it quietly and say so when it is absent.
-async function readiness(box) {
-  try {
-    const resp = await fetch('/readyz', { cache: 'no-store', credentials: 'omit' });
-    if (resp.status === 404) {
-      box.textContent = 'Readiness (/readyz) is served on the main listener, not here.';
-      return;
-    }
-    replace(box, 'Readiness: ', pill(resp.ok ? 'ready' : 'not ready', resp.ok ? 'ok' : 'bad'));
-  } catch {
-    box.textContent = '';
-  }
 }
 
 async function runVerify(btn, out) {
