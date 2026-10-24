@@ -758,6 +758,75 @@ impl WalCheckpoint {
     }
 }
 
+/// What the background WAL checkpointer has done since the store was opened, as returned by
+/// [`SqliteAudit::wal_stats`]. For metrics: every field is read without a lock.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalStats {
+    /// Rounds that left every WAL frame copied into the database file.
+    pub rounds_complete: u64,
+    /// Rounds that left frames behind (a reader or the writer was in the way); the next
+    /// commit starts another round.
+    pub rounds_incomplete: u64,
+    /// Rounds that failed with an error.
+    pub round_errors: u64,
+    /// Catch-up passes run while holding the store's lock, each pausing appends briefly.
+    pub locked_passes: u64,
+    /// Checkpoints the writer ran itself because the WAL outgrew
+    /// [`WAL_WRITER_BACKSTOP_FRAMES`].
+    pub backstops: u64,
+    /// WAL file syncs run ahead of a signed audit checkpoint (see
+    /// [`CHECKPOINT_PRESYNC_LEAD`]).
+    pub wal_presyncs: u64,
+    /// Database file syncs run before a locked pass.
+    pub db_presyncs: u64,
+    /// Unix time (seconds) the last complete round finished; 0 before the first one.
+    pub last_complete_unix: u64,
+    /// Frames in the WAL at the last pass of the last round.
+    pub wal_frames: u64,
+}
+
+/// The always-on counters behind [`WalStats`].
+#[derive(Default)]
+struct WalCounters {
+    rounds_complete: AtomicU64,
+    rounds_incomplete: AtomicU64,
+    round_errors: AtomicU64,
+    locked_passes: AtomicU64,
+    backstops: AtomicU64,
+    wal_presyncs: AtomicU64,
+    db_presyncs: AtomicU64,
+    last_complete_unix: AtomicU64,
+    wal_frames: AtomicU64,
+}
+
+impl WalCounters {
+    fn snapshot(&self) -> WalStats {
+        let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        WalStats {
+            rounds_complete: get(&self.rounds_complete),
+            rounds_incomplete: get(&self.rounds_incomplete),
+            round_errors: get(&self.round_errors),
+            locked_passes: get(&self.locked_passes),
+            backstops: get(&self.backstops),
+            wal_presyncs: get(&self.wal_presyncs),
+            db_presyncs: get(&self.db_presyncs),
+            last_complete_unix: get(&self.last_complete_unix),
+            wal_frames: get(&self.wal_frames),
+        }
+    }
+
+    fn bump(a: &AtomicU64) {
+        a.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Unix time in whole seconds, at least 1 (0 means "never" in [`WalStats`]).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs().max(1))
+}
+
 fn wal_checkpoint(conn: &Connection, mode: &str) -> Result<WalCheckpoint, AuditError> {
     Ok(
         conn.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |r| {
@@ -909,9 +978,12 @@ fn wal_loop(shared: &WalShared, msgs: &mpsc::Receiver<WalMsg>) {
                 let mut wal = shared.path.clone().into_os_string();
                 wal.push("-wal");
                 // Best effort: an extra sync, which no commit relies on.
-                let _synced = sync_file_data(Path::new(&wal));
+                let synced = sync_file_data(Path::new(&wal));
+                if synced.is_ok() {
+                    WalCounters::bump(&shared.activity.wal_stats.wal_presyncs);
+                }
                 #[cfg(any(test, feature = "testing"))]
-                if _synced.is_ok() {
+                if synced.is_ok() {
                     if let Ok(mut t) = shared.activity.timings.lock() {
                         t.wal_presyncs += 1;
                     }
@@ -930,6 +1002,7 @@ fn wal_loop(shared: &WalShared, msgs: &mpsc::Receiver<WalMsg>) {
             }
         }
         if let Err(e) = wal_round(shared) {
+            WalCounters::bump(&shared.activity.wal_stats.round_errors);
             eprintln!("attenuo-audit: WAL checkpoint failed: {e}");
         }
     }
@@ -1027,8 +1100,9 @@ fn wal_round(shared: &WalShared) -> Result<(), AuditError> {
                 Some(f) => f.sync_data(),
                 None => Err(std::io::Error::other("the database file is not open")),
             };
-            if let Err(e) = &synced {
-                eprintln!("attenuo-audit: syncing the database file failed: {e}");
+            match &synced {
+                Ok(()) => WalCounters::bump(&activity.wal_stats.db_presyncs),
+                Err(e) => eprintln!("attenuo-audit: syncing the database file failed: {e}"),
             }
             #[cfg(any(test, feature = "testing"))]
             {
@@ -1039,6 +1113,7 @@ fn wal_round(shared: &WalShared) -> Result<(), AuditError> {
         #[cfg(any(test, feature = "testing"))]
         let started = std::time::Instant::now();
         done = gated_checkpoint(activity, &conn, "PASSIVE")?;
+        WalCounters::bump(&activity.wal_stats.locked_passes);
         #[cfg(any(test, feature = "testing"))]
         {
             activity
@@ -1069,6 +1144,19 @@ fn wal_round(shared: &WalShared) -> Result<(), AuditError> {
         locked,
         presynced,
     });
+    let stats = &activity.wal_stats;
+    stats.wal_frames.store(
+        u64::try_from(done.wal_frames).unwrap_or(0),
+        Ordering::Relaxed,
+    );
+    if done.complete() {
+        WalCounters::bump(&stats.rounds_complete);
+        stats
+            .last_complete_unix
+            .store(unix_now(), Ordering::Relaxed);
+    } else {
+        WalCounters::bump(&stats.rounds_incomplete);
+    }
     if !done.complete() {
         // Frames were left behind (a reader or the writer was in the way). Do not wait a
         // whole interval, or another WAL_CHECKPOINT_COMMITS commits, to try again: the very
@@ -1199,6 +1287,8 @@ struct Activity {
     /// Held for the duration of every `PRAGMA wal_checkpoint` in this process, by the
     /// background thread and by the writer's backstop (see [`WalCheckpointer`]).
     checkpoint_gate: Mutex<()>,
+    /// What the background checkpointer has done, for [`SqliteAudit::wal_stats`].
+    wal_stats: WalCounters,
     /// Tests and measurements: how long each pause the checkpointers impose lasted.
     #[cfg(any(test, feature = "testing"))]
     timings: Mutex<WalTimings>,
@@ -1553,6 +1643,7 @@ impl Inner {
             let _gate = self.gate.hold();
             gated_checkpoint(&self.activity, conn, "TRUNCATE")
         };
+        WalCounters::bump(&self.activity.wal_stats.backstops);
         #[cfg(any(test, feature = "testing"))]
         if let (Ok(_), Ok(mut t)) = (&result, self.activity.timings.lock()) {
             t.backstops.push(started.elapsed());
@@ -1727,6 +1818,15 @@ impl SqliteAudit {
             file,
         )?);
         Ok(self)
+    }
+
+    /// What the background WAL checkpointer has done since the store was opened (for
+    /// metrics). `None` when [`with_wal_checkpoints`](Self::with_wal_checkpoints) started no
+    /// checkpointer (a zero interval, or a store that is not a file in WAL mode).
+    pub fn wal_stats(&self) -> Option<WalStats> {
+        self.wal
+            .as_ref()
+            .map(|_| self.inner.activity.wal_stats.snapshot())
     }
 
     /// Checkpoint the WAL into the database file now and truncate it (`TRUNCATE`), waiting

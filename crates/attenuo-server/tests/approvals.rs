@@ -144,6 +144,19 @@ fn allowed(v: &Value) -> bool {
     v.get("result").is_some()
 }
 
+/// The value of the `/metrics` sample whose series is exactly `series`.
+fn metric(h: &Harness, series: &str) -> u64 {
+    let text = h.state.metrics.render();
+    attenuo_server::metrics::check_text_format(&text).unwrap();
+    let prefix = format!("{series} ");
+    text.lines()
+        .find_map(|l| l.strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| panic!("no {series} in:\n{text}"))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
 impl Harness {
     async fn start() -> Self {
         Self::start_with(|_| {}).await
@@ -446,6 +459,35 @@ async fn user_grant_lets_the_identical_retry_through_once() {
         2
     );
     h.verify_ok().await;
+    // And on /metrics: two approvals stored, one granted by the user and consumed, the
+    // gated calls counted by reason, and the untrusted read that tainted the run.
+    assert_eq!(metric(&h, "attenuo_approvals_created_total"), 2);
+    assert_eq!(
+        metric(
+            &h,
+            "attenuo_approvals_decided_total{outcome=\"granted\",by=\"user\"}"
+        ),
+        1
+    );
+    assert_eq!(
+        metric(
+            &h,
+            "attenuo_approvals_decided_total{outcome=\"granted\",by=\"operator\"}"
+        ),
+        0
+    );
+    assert_eq!(
+        metric(&h, "attenuo_approvals_consumed_total{by=\"user\"}"),
+        1
+    );
+    assert_eq!(
+        metric(
+            &h,
+            "attenuo_decisions_total{decision=\"deny\",reason=\"approval_required\"}"
+        ),
+        3
+    );
+    assert!(metric(&h, "attenuo_results_recorded_total{label=\"untrusted\"}") >= 1);
 }
 
 #[tokio::test]
@@ -475,6 +517,25 @@ async fn decline_then_retry_is_gated_again() {
     assert_eq!(decline["decision"], "deny");
     assert_eq!(decline["reason"], "approval_declined");
     h.verify_ok().await;
+    // The refused grant of a declined approval is not counted.
+    assert_eq!(
+        metric(
+            &h,
+            "attenuo_approvals_decided_total{outcome=\"declined\",by=\"user\"}"
+        ),
+        1
+    );
+    assert_eq!(
+        metric(
+            &h,
+            "attenuo_approvals_decided_total{outcome=\"granted\",by=\"operator\"}"
+        ),
+        0
+    );
+    assert_eq!(
+        metric(&h, "attenuo_approvals_consumed_total{by=\"user\"}"),
+        0
+    );
 }
 
 #[tokio::test]
@@ -500,6 +561,13 @@ async fn expired_approval_is_gated() {
         .admin_get(&format!("/admin/approvals/{}", g.approval_id))
         .await;
     assert_eq!(shown["expired"], true);
+    // The refused grant counts as expired; the granted one that lapsed unused does not
+    // (expiry is not a state, nothing sees it go).
+    assert_eq!(metric(&h, "attenuo_approvals_expired_total"), 1);
+    assert_eq!(
+        metric(&h, "attenuo_approvals_consumed_total{by=\"user\"}"),
+        0
+    );
 }
 
 #[tokio::test]
@@ -734,6 +802,21 @@ async fn operator_grant_on_the_admin_listener() {
         .unwrap();
     assert_eq!(grant["approval"]["method"], "admin_token");
     h.verify_ok().await;
+    assert_eq!(
+        metric(
+            &h,
+            "attenuo_approvals_decided_total{outcome=\"granted\",by=\"operator\"}"
+        ),
+        1
+    );
+    assert_eq!(
+        metric(&h, "attenuo_approvals_consumed_total{by=\"operator\"}"),
+        1
+    );
+    assert_eq!(
+        metric(&h, "attenuo_approvals_consumed_total{by=\"user\"}"),
+        0
+    );
 
     // A read-only console does not mount the grant route.
     let ro = spawn_router(attenuo_server::admin_ui::router(h.state.clone(), &h.cfg))

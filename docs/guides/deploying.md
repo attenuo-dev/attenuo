@@ -11,7 +11,7 @@ attenuo is pre-alpha. Do not treat this guide as a statement that it is ready fo
 - **No high availability.** If the process is down, every call through the proxy fails. That is by design: attenuo fails closed. Do not start a second replica against the same file, or against a copy. Each process would keep its own idea of which leases are revoked.
 - **No TLS.** The server speaks plain HTTP. Terminate TLS in front of it.
 - **One static admin token.** There are no operator accounts or roles. Admin actions (lease revocations, policy reloads, development root mints) are recorded in the audit log as `by urn:attenuo:admin`, a subject no identity provider can issue (the `urn:attenuo:` prefix is reserved).
-- **No metrics endpoint.** You monitor it through logs and the audit log. See [What to monitor](#what-to-monitor).
+- **Metrics on a side listener only.** `GET /metrics` (Prometheus text) is served on its own loopback listener when you enable it, with no authentication. See [What to monitor](#what-to-monitor).
 - **Manual key rotation with no overlap.** See [Key rotation](#key-rotation).
 
 The full list of known gaps is at the end of [design/server.md](../design/server.md#known-limits-v0). The open security findings are in [the security review](../research/security-review-2026-10-22.md) and on the [task board](../tasks/board.md).
@@ -254,26 +254,50 @@ enabled = true
 listen = "127.0.0.1:9100"
 ```
 
-`GET http://127.0.0.1:9100/metrics` has no authentication. Keep it on loopback or a private network and scrape it from there. The server refuses to start when `listen` is not a loopback address, unless you also set `allow_public = true` (it then logs a warning); do that only for a private interface that network policy protects, since decision counts by reason are served to anyone who can connect. The API port does not serve `/metrics`. Series (all prefixed `attenuo_`):
+`GET http://127.0.0.1:9100/metrics` has no authentication. Keep it on loopback or a private network and scrape it from there. The server refuses to start when `listen` is not a loopback address, unless you also set `allow_public = true` (it then logs a warning); do that only for a private interface that network policy protects, since decision counts by reason are served to anyone who can connect. The API port does not serve `/metrics`. Every series is prefixed `attenuo_`; the full list, with types, labels and help text, is in the [HTTP API reference](../reference/http-api.md#metrics). The ones to watch first:
 
-| Series | Type | Labels |
-|---|---|---|
-| `decisions_total` | counter | `decision` (`allow`/`deny`), `reason` |
-| `tokens_issued_total` | counter | `kind` (`root`/`exchange`) |
-| `leases_revoked_total` | counter | none (counts cascaded descendants too) |
-| `audit_append_errors_total` | counter | none |
-| `audit_checkpoints_total` | counter | none (signed checkpoints written) |
-| `audit_sink_delivered_total` | counter | none (checkpoints delivered by `[audit.sink]`) |
-| `audit_sink_failures_total` | counter | none (failed delivery attempts; each is retried) |
-| `audit_sink_dropped_total` | counter | none (checkpoints dropped from a full sink queue) |
-| `audit_sink_queue_depth` | gauge | none |
-| `audit_sink_oldest_undelivered_timestamp_seconds` | gauge | none (unix time the oldest undelivered checkpoint was queued; 0 when none) |
-| `http_requests_total` | counter | `route` (template, e.g. `/mcp/{server}`), `status` |
-| `authorize_duration_seconds` | histogram | none (lease check, policy and audit append) |
-| `audit_append_duration_seconds` | histogram | none (one audit append, including waiting for the store's lock) |
-| `proxy_stage_seconds` | histogram | `stage`: `token_verify_hit`, `token_verify_miss`, `lease_check`, `policy`, `audit_append`, `blocking_pool`, `upstream`, `response`, `total` (time per stage of a proxied call; see [performance](../design/performance.md#time-by-stage-of-a-proxied-call-2026-10-23)) |
+| Series | What it tells you |
+|---|---|
+| `decisions_total{decision, reason}` | Allows and denies by reason code. A jump in one reason is the first sign of a misconfigured client, an expired lease population or a prompt-injected agent. |
+| `audit_append_errors_total` | Every one denied a call (`audit_error`). Should stay at 0. |
+| `authorize_duration_seconds`, `proxy_stage_seconds{stage}` | Decision time and where it goes. |
+| `budget_exhausted_total{kind, at}`, `budget_charges_total{kind}`, `budget_refunds_total{source}` | Run limits (ADR-0010) being hit, spent and given back. `at="charge"` means two calls of one run raced for the last of a budget. |
+| `approvals_created_total`, `approvals_decided_total{outcome, by}`, `approvals_consumed_total{by}`, `approvals_expired_total` | The approval queue: created minus decided is what people still have to answer; expired attempts mean approvals answered too late. |
+| `results_recorded_total{label}`, `taint_matches_total{decision}` | Output labelling (ADR-0009): untrusted results coming in, and destructive calls that carry text copied from them. |
+| `run_lock_wait_seconds` | Contention on the per-run lock (SR-55) between calls of one delegation run that has limits or keeps run usage. |
+| `audit_checkpoint_last_timestamp_seconds`, `audit_wal_last_complete_timestamp_seconds`, `audit_wal_checkpoints_total{result}`, `audit_wal_backstops_total` | Signed checkpoints and the SQLite WAL checkpointer keeping up. |
+| `audit_sink_dropped_total`, `audit_sink_oldest_undelivered_timestamp_seconds` | Checkpoints not leaving the host. |
 
-Alert on any increase of `audit_append_errors_total`, on a rising share of `reason="lease_expired"` and on `readyz` returning 503.
+Alert on any increase of `audit_append_errors_total`, on a rising share of `reason="lease_expired"`, on `audit_sink_dropped_total` and on `readyz` returning 503. Example Prometheus rules for the newer series; tune the thresholds to your traffic:
+
+```yaml
+groups:
+  - name: attenuo
+    rules:
+      # Run limits refusing far more calls than usual: an agent looping on a tool, or limits
+      # set too low for real work.
+      - alert: AttenuoBudgetExhaustedSpike
+        expr: |
+          sum(rate(attenuo_budget_exhausted_total[5m]))
+            > 5 * sum(rate(attenuo_budget_exhausted_total[1h] offset 1h)) + 0.1
+        for: 10m
+      # Calls of one run waiting on each other: many concurrent calls in one limited run.
+      - alert: AttenuoRunLockWaitHigh
+        expr: |
+          histogram_quantile(0.99, sum by (le) (rate(attenuo_run_lock_wait_seconds_bucket[5m])))
+            > 0.05
+        for: 10m
+      # No signed checkpoint for three timer periods although decisions are being made, or
+      # the WAL checkpointer stopped completing rounds (the WAL file then grows).
+      - alert: AttenuoCheckpointStale
+        expr: |
+          (time() - attenuo_audit_checkpoint_last_timestamp_seconds > 900
+            and on() sum(rate(attenuo_decisions_total[15m])) > 0)
+          or (time() - attenuo_audit_wal_last_complete_timestamp_seconds > 300)
+        for: 5m
+```
+
+The 900 seconds assume the default `[audit] checkpoint_interval_seconds = 300`: with entries arriving, a checkpoint is signed at least that often. The checkpoint timestamp is 0 until the process writes its first checkpoint, so a fresh process that takes traffic counts as stale until it does, which the default timer settles within five minutes. `audit_wal_backstops_total` going up means the background checkpointer fell behind the writer (a slow disk under sustained load).
 
 Beyond the metrics, watch these:
 

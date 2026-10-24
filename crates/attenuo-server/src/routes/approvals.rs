@@ -211,7 +211,12 @@ fn decide(
     let a = state
         .leases
         .decide_approval(id, grant, &approver, now)
-        .map_err(decide_error)?;
+        .map_err(|e| {
+            if matches!(e, AuditError::ApprovalExpired(_)) {
+                state.metrics.approval_expired();
+            }
+            decide_error(e)
+        })?;
     let call = ToolCall::new(a.server.clone(), a.tool.clone(), a.arguments.clone());
     let (decision, reason) = if grant {
         (Decision::Allow, REASON_APPROVAL_GRANTED)
@@ -241,6 +246,7 @@ fn decide(
             "approval decision could not be recorded: {e}"
         )));
     }
+    state.metrics.approval_decided(grant, approver.method.by());
     // Subject and tool come from the request and the agent: Debug-format them (SR-18).
     tracing::info!(
         approval = %a.id,
