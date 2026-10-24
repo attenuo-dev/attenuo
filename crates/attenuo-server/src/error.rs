@@ -34,6 +34,10 @@ pub struct ApiError {
     pub detail: String,
     /// Stable sub-code, sent as `error_description` (RFC 6749 §5.2) when set.
     pub description: Option<&'static str>,
+    /// The id of the `deny` audit record this refusal wrote, when it wrote one (a refused
+    /// token exchange whose subject token verified). Sent as `decision_id` in the body and in
+    /// the `X-Attenuo-Decision-Id` header.
+    pub decision_id: Option<uuid::Uuid>,
 }
 
 impl ApiError {
@@ -43,12 +47,19 @@ impl ApiError {
             code: code.into(),
             detail: detail.into(),
             description: None,
+            decision_id: None,
         }
     }
 
     /// Attach a stable `error_description` sub-code.
     pub fn with_description(mut self, description: &'static str) -> Self {
         self.description = Some(description);
+        self
+    }
+
+    /// Attach the id of the audit record that recorded this refusal.
+    pub fn with_decision_id(mut self, id: uuid::Uuid) -> Self {
+        self.decision_id = Some(id);
         self
     }
 
@@ -106,7 +117,19 @@ impl IntoResponse for ApiError {
         if let Some(d) = self.description {
             body["error_description"] = d.into();
         }
+        if let Some(id) = self.decision_id {
+            body["decision_id"] = id.to_string().into();
+        }
         let mut resp = (self.status, Json(body)).into_response();
+        if let Some(v) = self
+            .decision_id
+            .and_then(|id| axum::http::HeaderValue::from_str(&id.to_string()).ok())
+        {
+            resp.headers_mut().insert(
+                axum::http::HeaderName::from_static(attenuo_proxy::DECISION_ID_HEADER),
+                v,
+            );
+        }
         resp.headers_mut().insert(
             axum::http::header::CACHE_CONTROL,
             axum::http::HeaderValue::from_static("no-store"),

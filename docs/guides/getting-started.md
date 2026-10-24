@@ -174,6 +174,7 @@ user alice  (issuer https://idp.example)
         until 2026-10-22T22:29:20Z (in 14m 59s)
         lease c5e66077-7b36-43d2-8333-69d31b0e1e24
 
+may_act (absent): any authenticated agent may exchange this token
 verified: signature, type, issuer, audience, expiry, chain
 ```
 

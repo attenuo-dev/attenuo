@@ -11,7 +11,7 @@ attenuo writes one record for every decision it makes. The records are chained b
 - Every successful lease renewal.
 - Every approval opened for a gated call, and every grant or decline of one.
 
-Requests that carry no decision, such as `tools/list` and `ping`, are not recorded while the token's leases are live. When they are not, the refusal is a `deny` record with the lease reason (`lease_revoked`, ...) and `tool` set to the method (`initialize`, `tools/list`, or `http.POST`, `http.GET`, `http.DELETE`), one per HTTP request, so an agent that keeps opening sessions after a revocation shows up. A token that does not verify is never recorded. Failed exchanges and failed renewals are not recorded in v0.
+Requests that carry no decision, such as `tools/list` and `ping`, are not recorded while the token's leases are live. When they are not, the refusal is a `deny` record with the lease reason (`lease_revoked`, ...) and `tool` set to the method (`initialize`, `tools/list`, or `http.POST`, `http.GET`, `http.DELETE`), one per HTTP request, so an agent that keeps opening sessions after a revocation shows up. A token that does not verify is never recorded. A refused token exchange is a `deny` record when its subject token verified: tool `token.exchange`, kind `decision`, the parent's chain, and a reason such as `exchange_widening` or `exchange_actor_not_permitted` (the full list is in the [HTTP API reference](../reference/http-api.md#token)). Exchanges whose subject token does not verify, and failed renewals, are not recorded.
 
 ## What a record holds
 
@@ -39,11 +39,11 @@ Two top-level fields let you filter and join an export without reading anything 
 
 | `kind` | Written when | `tool` |
 | --- | --- | --- |
-| `decision` | a tool call or AuthZEN evaluation was decided (allow or deny, including refusals before the policy ran) | the tool called |
+| `decision` | a tool call or AuthZEN evaluation was decided (allow or deny, including refusals before the policy ran), or a token exchange was refused | the tool called; `token.exchange` for a refused exchange |
 | `tool_result` | the proxy relayed the upstream's answer to an allowed call | the tool called |
 | `approval_request` | a gated call opened an approval | the tool called |
 | `approval_grant` | the user or the operator granted or declined an approval | the tool called |
-| `exchange` | a token exchange issued a new hop | `token.exchange` |
+| `exchange` | a token exchange issued a new hop (a refused one is a `decision`) | `token.exchange` |
 | `root_token` | a root token was issued (IdP login, or the dev mint) | `token.root` |
 | `lease_renew` | a lease was renewed | `lease.renew` |
 | `lease_revoke` | a lease and its subtree were revoked with the admin bearer | `admin.lease.revoke` |

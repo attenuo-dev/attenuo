@@ -124,6 +124,28 @@ pub fn render_chain_tree(chain: &DelegationChain, now: OffsetDateTime) -> String
     out
 }
 
+/// The `may_act` line of `token inspect`: who may exchange the token next (RFC 8693 §4.4).
+/// Absent means any authenticated agent may; an empty list, none. Agent ids are printed with
+/// control characters escaped, since they come from the token.
+pub fn fmt_may_act(may_act: Option<&attenuo_token::MayAct>) -> String {
+    match may_act {
+        None => "may_act (absent): any authenticated agent may exchange this token".into(),
+        Some(m) if m.sub.is_empty() => "may_act []: no agent may exchange this token".into(),
+        Some(m) => {
+            let agents: Vec<String> = m.sub.iter().map(|a| a.escape_debug().to_string()).collect();
+            format!(
+                "may_act {}: only {} may exchange this token",
+                agents.join(", "),
+                if agents.len() == 1 {
+                    "this agent"
+                } else {
+                    "these agents"
+                }
+            )
+        }
+    }
+}
+
 // -- admin API answers --
 //
 // These read the server's JSON as `Value` rather than typed structs: a field the server adds
@@ -858,6 +880,31 @@ user alice  (issuer https://idp.example)
         let text = render_chain_tree(&chain(), now);
         assert!(text.contains("(expired 5m 0s ago)"), "{text}");
         assert!(text.contains("(in 5m 0s)"), "{text}");
+    }
+
+    #[test]
+    fn may_act_line_says_who_may_exchange() {
+        use attenuo_token::MayAct;
+        assert_eq!(
+            fmt_may_act(None),
+            "may_act (absent): any authenticated agent may exchange this token"
+        );
+        assert_eq!(
+            fmt_may_act(Some(&MayAct::new(Vec::<String>::new()))),
+            "may_act []: no agent may exchange this token"
+        );
+        assert_eq!(
+            fmt_may_act(Some(&MayAct::new(["coder"]))),
+            "may_act coder: only this agent may exchange this token"
+        );
+        assert_eq!(
+            fmt_may_act(Some(&MayAct::new(["coder", "reviewer"]))),
+            "may_act coder, reviewer: only these agents may exchange this token"
+        );
+        // An agent id with a terminal escape in it is printed escaped.
+        let line = fmt_may_act(Some(&MayAct::new(["evil\u{1b}[2J"])));
+        assert!(!line.chars().any(char::is_control), "{line}");
+        assert!(line.contains("evil\\u{1b}[2J"), "{line}");
     }
 
     #[test]

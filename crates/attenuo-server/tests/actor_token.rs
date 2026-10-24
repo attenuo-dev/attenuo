@@ -413,12 +413,17 @@ async fn bad_actor_tokens_are_refused_with_stable_codes() {
         )
         .await;
     assert_eq!(code(&v).1, "actor_token_type_unsupported", "{v}");
-    // Nothing was issued.
-    assert!(!h
+    // Nothing was issued. The one refusal by a verified actor token naming another agent is
+    // audited as a denial; the actor tokens that did not verify left no record.
+    let exchanges: Vec<Value> = h
         .audit()
         .await
-        .iter()
-        .any(|e| e["record"]["tool"] == "token.exchange"));
+        .into_iter()
+        .filter(|e| e["record"]["tool"] == "token.exchange")
+        .collect();
+    assert_eq!(exchanges.len(), 1, "{exchanges:?}");
+    assert_eq!(exchanges[0]["record"]["decision"], "deny");
+    assert_eq!(exchanges[0]["record"]["reason"], "exchange_actor_mismatch");
 }
 
 #[tokio::test]

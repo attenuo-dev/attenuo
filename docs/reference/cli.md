@@ -79,7 +79,8 @@ RFC 8693 exchange: delegate a subset of a token's capabilities to a sub-agent.
 | `--ttl-seconds` | Requested lifetime, clamped to the parent's expiry. |
 | `--actor-token <JWT\|->` | Authenticate `--actor` with an RFC 8693 actor token, such as a SPIFFE JWT-SVID from an `[[actor_trust]]` issuer, instead of a client secret. `-` reads it from stdin. Each token works for one exchange. |
 | `--actor-token-file <PATH>` | Read the actor token from a file, for example the JWT-SVID a SPIFFE helper writes. Cannot be combined with `--actor-token`. |
-| `--may-act <AGENT>` | Only this agent may exchange the new token (RFC 8693 `may_act`). Repeatable, or comma-separated. |
+| `--may-act <AGENT>` | Only this agent may exchange the new token (RFC 8693 `may_act`). Repeatable, or comma-separated. Without it and without `--no-delegation` the new token has no `may_act`, so any authenticated agent may exchange it; it does not inherit the parent's list. Values that are all empty are refused. |
+| `--no-delegation` | Send `may_act: []`: no agent may exchange the new token. Cannot be combined with `--may-act`. |
 | `--dpop-key PATH` | Bind the new token to this DPoP key. Required when the parent is bound. When the parent is bound to the same key, the proof also covers the parent. |
 | `--subject-token-dpop-file PATH` | The parent holder's sign-off (`subject_token_dpop`), made with `token sign-off` for this exchange's `--dpop-key` and `--actor`. Required when the parent is bound to a key other than `--dpop-key`. |
 | `--subject-dpop-key PATH` | Instead of `--subject-token-dpop-file`, when this process may hold the parent's key too: the sign-off is made here. Cannot be combined with `--subject-token-dpop-file`. |
@@ -88,6 +89,13 @@ RFC 8693 exchange: delegate a subset of a token's capabilities to a sub-agent.
 ```sh
 ATTENUO_TOKEN="$PARENT" attenuo token exchange --actor coder \
   --cap github:read_file --actor-token-file /run/spiffe/coder.jwt --may-act reviewer
+```
+
+A refused exchange that the server audited (its subject token verified) prints the record id under the error, as `decision <id>`, for `audit show --id`:
+
+```text
+error: server answered 400 Bad Request: invalid_request: agent `reviewer` is not permitted to act on this token (may_act)
+decision 6685bd7f-cbb3-48e5-ab05-f2b8ceae9a61
 ```
 
 ### `token sign-off`
@@ -126,7 +134,7 @@ Decode a token and show its delegation chain as a tree. Use `-` to read the toke
 | `--issuer` | With `--verify`: expected issuer. Default: the token's own. |
 | `--audience` | With `--verify`: expected audience. Default: the token's own. |
 
-For a bound token the text output adds `bound to DPoP key jkt <thumbprint>`.
+The text output has a `may_act` line saying who may exchange the token next: `may_act (absent): any authenticated agent may exchange this token`, `may_act []: no agent may exchange this token`, or `may_act coder, reviewer: only these agents may exchange this token` (agent ids with control characters escaped). With `--verify` it is read from the verified claims, which the signature covers. For a bound token the text output adds `bound to DPoP key jkt <thumbprint>`.
 
 ### `call`
 

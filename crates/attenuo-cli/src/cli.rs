@@ -238,9 +238,18 @@ pub struct ExchangeArgs {
     #[arg(long, value_name = "PATH")]
     pub actor_token_file: Option<std::path::PathBuf>,
     /// RFC 8693 `may_act` for the new token: an agent allowed to exchange it next. Repeatable;
-    /// values may also be comma-separated. Without it, any authenticated agent may.
-    #[arg(long = "may-act", value_name = "AGENT")]
+    /// values may also be comma-separated. Without it (and without `--no-delegation`) the new
+    /// token carries no `may_act`, so any authenticated agent may exchange it: it does not
+    /// inherit the parent's list.
+    #[arg(
+        long = "may-act",
+        value_name = "AGENT",
+        conflicts_with = "no_delegation"
+    )]
     pub may_act: Vec<String>,
+    /// Send `may_act: []`: no agent may exchange the new token.
+    #[arg(long)]
+    pub no_delegation: bool,
     /// Capability `server:tool`, or a full capability as a JSON object (with `constraints` and
     /// run `limits`). Repeatable; plain `server:tool` values may also be comma-separated. Must
     /// be covered by the parent's capabilities; limits are inherited from the parent and
@@ -300,6 +309,25 @@ impl ExchangeArgs {
     /// `--may-act` values, split on commas, without empties.
     pub fn may_act(&self) -> Vec<String> {
         split_agents(&self.may_act)
+    }
+
+    /// The `may_act` to send: `None` without `--may-act` and `--no-delegation`, `Some([])` with
+    /// `--no-delegation`. `--may-act` values that are all empty are refused rather than
+    /// dropped, since sending nothing would let any agent exchange the token.
+    pub fn may_act_claim(&self) -> anyhow::Result<Option<Vec<String>>> {
+        if self.no_delegation {
+            return Ok(Some(Vec::new()));
+        }
+        if self.may_act.is_empty() {
+            return Ok(None);
+        }
+        let agents = self.may_act();
+        if agents.is_empty() {
+            anyhow::bail!(
+                "--may-act names no agent; use --no-delegation for a token nobody may exchange"
+            );
+        }
+        Ok(Some(agents))
     }
 }
 
@@ -1168,6 +1196,16 @@ mod tests {
         let none = exchange(&[]).unwrap();
         assert_eq!(none.actor_token(std::io::empty()).unwrap(), None);
         assert!(none.may_act().is_empty());
+        assert_eq!(none.may_act_claim().unwrap(), None);
+        // Nobody may exchange it: an explicit empty list.
+        let nobody = exchange(&["--no-delegation"]).unwrap();
+        assert_eq!(nobody.may_act_claim().unwrap(), Some(Vec::new()));
+        assert!(exchange(&["--no-delegation", "--may-act", "x"]).is_err());
+        // An empty --may-act is refused, not silently dropped.
+        let empty = exchange(&["--may-act", ""]).unwrap();
+        assert!(empty.may_act_claim().is_err());
+        let commas = exchange(&["--may-act", " , "]).unwrap();
+        assert!(commas.may_act_claim().is_err());
 
         let flag = exchange(&[
             "--actor-token",
@@ -1183,6 +1221,10 @@ mod tests {
             Some("a.b.c")
         );
         assert_eq!(flag.may_act(), ["x", "y", "z"]);
+        assert_eq!(
+            flag.may_act_claim().unwrap(),
+            Some(vec!["x".to_string(), "y".into(), "z".into()])
+        );
 
         let stdin = exchange(&["--actor-token", "-"]).unwrap();
         assert_eq!(

@@ -1803,6 +1803,178 @@ async fn may_act_on_the_parent_limits_who_may_exchange_it() {
         .await;
 }
 
+/// The refused exchange's response names the audit record, in the header and the body; the
+/// record is the log's last entry. Returns the record.
+async fn refused_exchange_record(
+    h: &Harness,
+    resp: reqwest::Response,
+    want: (&str, &str),
+) -> Value {
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let id = resp.headers()["x-attenuo-decision-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], want.0, "{body}");
+    assert_eq!(
+        body["error_description"].as_str().unwrap_or_default(),
+        want.1,
+        "{body}"
+    );
+    assert_eq!(body["decision_id"], id, "{body}");
+    let entries = h.audit_entries().await;
+    let r = entries.last().unwrap()["record"].clone();
+    assert_eq!(r["id"], id);
+    assert_eq!(r["decision"], "deny");
+    assert_eq!(r["kind"], "decision");
+    assert_eq!(r["server"], "attenuo");
+    assert_eq!(r["tool"], "token.exchange");
+    assert_eq!(r["originating_subject"], "alice");
+    r
+}
+
+/// A refused exchange whose subject token verified is audited: one `deny` record against the
+/// parent chain, with a fixed reason code, whose id the 400 carries.
+#[tokio::test]
+async fn refused_exchanges_are_audited_against_the_parent_chain() {
+    let h = Harness::start().await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let child = h
+        .exchange(&root.token, "coder", &["github:read_file"])
+        .await;
+
+    // Widening: the child asks for more than it holds.
+    let before = h.audit_entries().await.len();
+    let resp = h.exchange_raw(&child.token, "sneaky", &["github:*"]).await;
+    let r = refused_exchange_record(&h, resp, ("invalid_scope", "")).await;
+    assert_eq!(h.audit_entries().await.len(), before + 1);
+    assert_eq!(r["reason"], "exchange_widening");
+    assert_eq!(r["agents"], json!(["planner", "coder"]));
+    assert_eq!(r["leases"], json!([root.lease, child.lease]));
+    assert_eq!(r["chain_id"], root.lease);
+    assert_eq!(r["chain_depth"], 2);
+
+    // An authenticated agent naming another agent as the actor.
+    let resp = h
+        .exchange_as(
+            &root.token,
+            "reviewer",
+            &["github:read_file"],
+            Some(("sneaky", "sneaky-secret")),
+        )
+        .await;
+    let r = refused_exchange_record(&h, resp, ("invalid_request", "actor_mismatch")).await;
+    assert_eq!(r["reason"], "exchange_actor_mismatch");
+    assert_eq!(r["agents"], json!(["planner"]));
+
+    // A cycle back to an agent above.
+    let resp = h
+        .exchange_raw(&child.token, "coder", &["github:read_file"])
+        .await;
+    let r = refused_exchange_record(&h, resp, ("invalid_request", "duplicate_actor")).await;
+    assert_eq!(r["reason"], "exchange_duplicate_actor");
+
+    // A second delegation of the same parent to the same actor.
+    let resp = h
+        .exchange_raw(&root.token, "coder", &["github:read_file"])
+        .await;
+    let r = refused_exchange_record(&h, resp, ("invalid_grant", "replayed")).await;
+    assert_eq!(r["reason"], "exchange_replayed");
+
+    // A revoked parent cannot delegate.
+    h.admin_post(
+        &format!("/admin/leases/{}/revoke", root.lease),
+        json!({"reason": "test"}),
+    )
+    .await;
+    let resp = h
+        .exchange_raw(&child.token, "reviewer", &["github:read_file"])
+        .await;
+    let r = refused_exchange_record(&h, resp, ("invalid_grant", "")).await;
+    assert_eq!(r["reason"], "lease_revoked");
+    assert_eq!(r["agents"], json!(["planner", "coder"]));
+
+    assert_eq!(h.admin_get("/admin/audit/verify").await["ok"], true);
+    let metrics = h.state.metrics.render();
+    for reason in [
+        "exchange_widening",
+        "exchange_actor_mismatch",
+        "exchange_duplicate_actor",
+        "exchange_replayed",
+        "lease_revoked",
+    ] {
+        assert!(
+            metrics.contains(&format!(
+                "attenuo_decisions_total{{decision=\"deny\",reason=\"{reason}\"}} 1\n"
+            )),
+            "{reason}: {metrics}"
+        );
+    }
+}
+
+/// A `may_act` refusal is audited with the parent's chain.
+#[tokio::test]
+async fn a_may_act_refusal_is_audited() {
+    let h = Harness::start().await;
+    let resp = h
+        .admin_post(
+            "/admin/root-token",
+            json!({"subject": "alice", "issuer": "https://idp.example", "agent": "planner",
+                   "capabilities": ["github:*"], "may_act": ["coder"]}),
+        )
+        .await;
+    let root: Value = resp.json().await.unwrap();
+    let (token, lease) = (
+        root["access_token"].as_str().unwrap(),
+        root["lease"].as_str().unwrap(),
+    );
+    let resp = h
+        .exchange_raw(token, "reviewer", &["github:read_file"])
+        .await;
+    let r = refused_exchange_record(&h, resp, ("invalid_request", "actor_not_permitted")).await;
+    assert_eq!(r["reason"], "exchange_actor_not_permitted");
+    assert_eq!(r["agents"], json!(["planner"]));
+    assert_eq!(r["leases"], json!([lease]));
+    // A refused exchange uses up nothing: the listed actor still gets its delegation.
+    h.exchange(token, "coder", &["github:read_file"]).await;
+    assert!(h.state.metrics.render().contains(
+        "attenuo_decisions_total{decision=\"deny\",reason=\"exchange_actor_not_permitted\"} 1\n"
+    ));
+}
+
+/// A subject token that does not verify leaves no record (SR-18), and neither does a caller
+/// that fails actor authentication with a good subject token.
+#[tokio::test]
+async fn unverified_exchanges_leave_no_record() {
+    let h = Harness::start().await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let before = h.audit_entries().await.len();
+    let (head, sig) = root.token.rsplit_once('.').unwrap();
+    let flipped = if sig.starts_with('A') { 'B' } else { 'A' };
+    let forged = format!("{head}.{flipped}{}", &sig[1..]);
+    for token in ["not-a-token", forged.as_str()] {
+        let resp = h.exchange_raw(token, "coder", &["github:*"]).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(resp.headers().get("x-attenuo-decision-id").is_none());
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], "invalid_grant", "{body}");
+        assert!(body.get("decision_id").is_none(), "{body}");
+    }
+    let resp = h
+        .exchange_as(
+            &root.token,
+            "coder",
+            &["github:read_file"],
+            Some(("coder", "wrong")),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(resp.headers().get("x-attenuo-decision-id").is_none());
+    assert_eq!(h.audit_entries().await.len(), before);
+    assert!(!h.state.metrics.render().contains("reason=\"exchange_"));
+}
+
 /// `[[root_grants]] may_act` is a ceiling for the root token's `may_act`.
 #[tokio::test]
 async fn root_grant_may_act_is_applied_and_cannot_be_widened() {

@@ -55,6 +55,7 @@ user alice  (issuer https://idp.example)
 
 iss http://127.0.0.1:34201   aud attenuo   jti 67dfeae5-2805-4be2-b39f-af3d82a60ec7
 exp 2026-10-24T16:35:29Z (in 14m 59s)
+may_act (absent): any authenticated agent may exchange this token
 verified: signature, type, issuer, audience, expiry, chain
 
 == 4. The coder reads a public repo as intended: allowed

@@ -417,8 +417,9 @@ impl Metrics {
             &mut out,
             "decisions_total",
             "Decision records by outcome and reason code: pipeline decisions (MCP proxy and \
-             AuthZEN) and requests the proxy refused and recorded before a decision. \
-             Unauthenticated requests are not counted.",
+             AuthZEN), requests the proxy refused and recorded before a decision, and \
+             refused token exchanges whose subject token verified. Unauthenticated requests \
+             are not counted.",
             "counter",
         );
         if let Ok(m) = self.decisions.lock() {

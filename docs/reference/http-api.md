@@ -32,7 +32,28 @@ Optional, RFC 9449. See [Binding tokens to keys](../guides/binding-tokens-to-key
 
 A capability may carry run `limits` (`calls`, `sum: {arg, max}`, `calls_per: {arg, max}`, `distinct: {arg, max}`; [run limits](../design/server.md#run-limits)). `distinct` allows at most `max` different values of `arg`. `calls_per` and `distinct` may add `"derive": "host"` to count the host of a URL argument instead of the whole value (`{"arg": "url", "derive": "host", "max": 2}`). A child must keep every limit of the parent capability that covers it, on the same argument and derivation, at most as large (`calls: m` also satisfies a parent's `calls_per` or `distinct` with `max >= m`); one it leaves out or asks larger is filled in or lowered (a `sum`, `calls_per` or `distinct` over another argument or derivation is refused as not covered), and its `calls` and `sum` are lowered further to what the parent hop has left. An unknown limit kind or derivation, or `derive` on a `sum`, is 400 `invalid_request`.
 
-A later-hop request authenticates its `actor` with `client_id` / `client_secret` (or HTTP Basic), or with `actor_token` and `actor_token_type` = `urn:ietf:params:oauth:token-type:jwt` (RFC 8693 §2.1): a workload-identity JWT, such as a SPIFFE JWT-SVID, from an `[[actor_trust]]` issuer. `[token] actor_auth` decides which are accepted. An actor token works for one exchange, and the child expires no later than it does. If the parent token carries `may_act`, the `actor` must be listed (`actor_not_permitted` otherwise).
+A later-hop request authenticates its `actor` with `client_id` / `client_secret` (or HTTP Basic), or with `actor_token` and `actor_token_type` = `urn:ietf:params:oauth:token-type:jwt` (RFC 8693 §2.1): a workload-identity JWT, such as a SPIFFE JWT-SVID, from an `[[actor_trust]]` issuer. `[token] actor_auth` decides which are accepted. An actor token works for one exchange, and the child expires no later than it does. If the parent token carries `may_act`, the `actor` must be listed (`actor_not_permitted` otherwise). `may_act` on the request sets the new token's own list: absent means any authenticated agent may exchange the new token (it does not inherit the parent's list), and `[]` means none may.
+
+**Refused exchanges are audited.** When the subject token verified (signature, issuer, audience, expiry, chain) and so did its DPoP proof, a refusal the request caused is a `deny` record against the parent's chain: server `attenuo`, tool `token.exchange`, kind `decision`, the parent's subject, agents, leases and `chain_id`. The 400 carries the record id in `X-Attenuo-Decision-Id` and as `decision_id` in the body:
+
+```json
+{"error": "invalid_scope", "detail": "delegation chain is invalid: ...", "decision_id": "10ce6d75-b2e0-4aa7-a563-7b2fc5a8b223"}
+```
+
+| Refusal | `error` / `error_description` | Audit `reason` |
+| --- | --- | --- |
+| asks for more than the parent holds | `invalid_scope` | `exchange_widening` |
+| chain deeper than `[issuer] max_depth` | `invalid_scope` | `exchange_too_deep` |
+| actor not in the parent's `may_act` | `invalid_request` / `actor_not_permitted` | `exchange_actor_not_permitted` |
+| authenticated agent or actor token is not `actor` | `invalid_request` / `actor_mismatch` | `exchange_actor_mismatch` |
+| `actor` already in the chain | `invalid_request` / `duplicate_actor` | `exchange_duplicate_actor` |
+| `actor` is `attenuo` | `invalid_request` / `reserved_agent` | `exchange_reserved_agent` |
+| actor token expires now | `invalid_request` / `actor_token_expired`, `no_lifetime_left` | `exchange_no_lifetime_left` |
+| parent already delegated to this actor, or actor token reused | `invalid_grant` / `replayed` | `exchange_replayed` |
+| a requested capability has an invalid name or limit | `invalid_grant` | `exchange_invalid_capability` |
+| parent lease revoked, expired or unknown | `invalid_grant` | `lease_revoked`, `lease_expired`, `lease_unknown` |
+
+Not recorded, a server log line only: a malformed request, failed client or actor-token authentication, a subject token or DPoP proof that does not verify (so an anonymous caller cannot write to the log, SR-18), and server errors. A `requested_ttl_seconds` beyond the parent's expiry is not a refusal: the child is clamped to the parent. A refused exchange uses up nothing: the parent can still delegate once to that actor, an actor token can be presented again, and no run limit is charged; only its DPoP proof (its `jti`) is spent. It is counted in `decisions_total{decision="deny",reason}`.
 
 ```http
 POST /token
@@ -346,7 +367,7 @@ Every series is prefixed `attenuo_`. Label values come from fixed sets, so the n
 
 | Series | Type | Labels | Help |
 |---|---|---|---|
-| `decisions_total` | counter | `decision` (`allow`, `deny`), `reason` | Decision records by outcome and reason code: pipeline decisions (MCP proxy and AuthZEN) and the requests the proxy refuses and records before a decision. `reason` is one of `policy_allow`, `policy_deny`, `policy_error`, `approval_required`, `approval_invalid`, `capability_denied`, `tool_not_in_catalog`, `attribute_type_mismatch`, `invalid_name`, `tool_not_listed`, `session_mismatch`, `budget_exhausted`, `budget_error`, `limit_arg_invalid`, `lease_revoked`, `lease_expired`, `lease_unknown`, `lease_error`, `audit_error`. A lease refusal of `initialize` or another undecided request counts under its lease reason. Unauthenticated requests (bad token, DPoP) are not counted here. |
+| `decisions_total` | counter | `decision` (`allow`, `deny`), `reason` | Decision records by outcome and reason code: pipeline decisions (MCP proxy and AuthZEN) and the requests the proxy refuses and records before a decision. `reason` is one of `policy_allow`, `policy_deny`, `policy_error`, `approval_required`, `approval_invalid`, `capability_denied`, `tool_not_in_catalog`, `attribute_type_mismatch`, `invalid_name`, `tool_not_listed`, `session_mismatch`, `budget_exhausted`, `budget_error`, `limit_arg_invalid`, `lease_revoked`, `lease_expired`, `lease_unknown`, `lease_error`, `audit_error`, and for a refused token exchange `exchange_widening`, `exchange_too_deep`, `exchange_actor_not_permitted`, `exchange_actor_mismatch`, `exchange_duplicate_actor`, `exchange_reserved_agent`, `exchange_no_lifetime_left`, `exchange_replayed`, `exchange_invalid_capability`, `exchange_refused`. A lease refusal of `initialize` or another undecided request, or of an exchange's parent, counts under its lease reason. Unauthenticated requests (bad token, DPoP) are not counted here. |
 | `tokens_issued_total` | counter | `kind` (`root`, `exchange`) | Delegation tokens issued. |
 | `leases_revoked_total` | counter | none | Leases moved to revoked, including cascaded descendants. |
 | `audit_append_errors_total` | counter | none | Audit log appends that failed. |

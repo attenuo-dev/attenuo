@@ -249,7 +249,9 @@ The audit crate stores decision records only. An issuance is recorded as a decis
 | chain fields | the **new** chain, so `agents` and `leases` include the new hop |
 | `arguments_digest` | digest of `{actor, requested, parent_lease}`; IdP intake: `{agent, requested, credential, idp}`; dev mint: `{agent, requested}` |
 
-If that append fails, the new lease is revoked before the error is returned, so an unrecorded token is unusable. Failed exchanges are not audited in v0.
+If that append fails, the new lease is revoked before the error is returned, so an unrecorded token is unusable.
+
+A refused exchange is audited once its subject token verified (signature through chain) and the DPoP check passed: `exchange_sync` verifies the parent and runs `bind_exchange` first, then `exchange_verified` returns either the response or a refusal with a fixed reason (`EXCHANGE_REFUSAL_REASONS` in `routes::token`: `exchange_widening`, `exchange_too_deep`, `exchange_actor_not_permitted`, `exchange_actor_mismatch`, `exchange_duplicate_actor`, `exchange_reserved_agent`, `exchange_no_lifetime_left`, `exchange_replayed`, `exchange_invalid_capability`, `exchange_refused`, or the parent's `lease_revoked` / `lease_expired` / `lease_unknown`), which goes through `Pipeline::record_rejection`: a `deny` record of kind `decision` with the **parent** chain, server `attenuo`, tool `token.exchange`, and the digest of `{actor, requested, parent_lease, actor_auth, dpop_bound}`. The 400 carries its id (`X-Attenuo-Decision-Id`, `decision_id`). So that an actor mismatch is audited too, it is decided after the parent verified (client authentication itself still comes first). Malformed requests, failed client or actor-token authentication, subject tokens or DPoP proofs that fail, and server errors are not recorded (SR-18). A refused exchange takes no replay slot (the parent-per-actor and actor-token keys are written only on success) and charges nothing; its DPoP proof `jti` is spent. A TTL beyond the parent is clamped, not refused.
 
 ## Hop 0: intake from an identity provider
 
@@ -369,7 +371,7 @@ Own-lease expiry is not an error: a lapsed but unrevoked lease is revived, provi
 
 ## Errors
 
-Non-MCP endpoints answer errors as `{"error": "<code>", "detail": "<text>"}` with a matching status. `/token` uses OAuth codes (`invalid_request`, `unsupported_grant_type`, `invalid_client`, `invalid_grant`, `invalid_scope`, `temporarily_unavailable`); hop-0 intake errors add a stable `error_description` (table above). Admin endpoints answer 401 without the admin bearer and 403 `admin_disabled` when no admin token is configured. MCP routes keep the proxy's JSON-RPC errors:
+Non-MCP endpoints answer errors as `{"error": "<code>", "detail": "<text>"}` with a matching status. `/token` uses OAuth codes (`invalid_request`, `unsupported_grant_type`, `invalid_client`, `invalid_grant`, `invalid_scope`, `temporarily_unavailable`); hop-0 intake errors add a stable `error_description` (table above), and a refused exchange that was audited adds `decision_id`. Admin endpoints answer 401 without the admin bearer and 403 `admin_disabled` when no admin token is configured. MCP routes keep the proxy's JSON-RPC errors:
 
 | JSON-RPC code | HTTP status | `data.reason` |
 |---|---|---|

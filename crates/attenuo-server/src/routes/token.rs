@@ -56,13 +56,28 @@
 //! subject token needs a proof by its key (in the header, with `ath`, or in the body field
 //! `subject_token_dpop` when the child is bound to another key), and its child is always
 //! bound. See [`crate::dpop`] for the rule and `[token] dpop`.
+//!
+//! **Audited refusals.** Once the subject token has verified (signature, type, issuer,
+//! audience, expiry, chain) and so has its DPoP proof, a refusal the caller caused is recorded
+//! through [`crate::authz::Pipeline::record_rejection`]: one `deny` record against the
+//! parent's chain, server `attenuo`, tool `token.exchange`, and a reason from
+//! [`EXCHANGE_REFUSAL_REASONS`] (`exchange_widening`, `exchange_too_deep`,
+//! `exchange_actor_not_permitted`, `exchange_actor_mismatch`, `exchange_duplicate_actor`,
+//! `exchange_reserved_agent`, `exchange_no_lifetime_left`, `exchange_replayed`,
+//! `exchange_invalid_capability`, `exchange_refused`, or the lease reason of a parent that
+//! cannot delegate). The 400 carries the record id in `X-Attenuo-Decision-Id` and
+//! `decision_id`. An authenticated agent naming another agent as `actor` is therefore refused
+//! only after the subject token verified. Not recorded: malformed requests, failed client or
+//! actor-token authentication, and subject tokens or DPoP proofs that do not verify (a log line
+//! only, SR-18), and server faults. A refused exchange uses up nothing: not the parent's one
+//! delegation per actor, not the actor token, not run limits. It does use up its DPoP proof.
 
 use std::sync::Arc;
 
 use std::collections::HashMap;
 
 use attenuo_audit::LeaseStore;
-use attenuo_core::{CapabilitySet, Charge, Hop, LimitKind};
+use attenuo_core::{CapabilitySet, Charge, Hop, LimitKind, ToolCall};
 use attenuo_token::{ExchangeRequest, AUTHORIZATION_DETAILS_TYPE};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -153,6 +168,85 @@ pub(crate) fn take_actor_token(
     Ok(Some(token))
 }
 
+/// Audit `reason` of a refused exchange whose request widens the parent's capabilities
+/// (`invalid_scope`).
+pub const REASON_EXCHANGE_WIDENING: &str = "exchange_widening";
+/// Audit `reason`: the new chain would be deeper than `[issuer] max_depth` (`invalid_scope`).
+pub const REASON_EXCHANGE_TOO_DEEP: &str = "exchange_too_deep";
+/// Audit `reason`: the parent's `may_act` does not list the actor (`actor_not_permitted`).
+pub const REASON_EXCHANGE_ACTOR_NOT_PERMITTED: &str = "exchange_actor_not_permitted";
+/// Audit `reason`: the authenticated client or actor token is another agent than `actor`
+/// (`actor_mismatch`).
+pub const REASON_EXCHANGE_ACTOR_MISMATCH: &str = "exchange_actor_mismatch";
+/// Audit `reason`: `actor` already acts in the parent chain (`duplicate_actor`).
+pub const REASON_EXCHANGE_DUPLICATE_ACTOR: &str = "exchange_duplicate_actor";
+/// Audit `reason`: `actor` is the reserved agent id `attenuo` (`reserved_agent`).
+pub const REASON_EXCHANGE_RESERVED_AGENT: &str = "exchange_reserved_agent";
+/// Audit `reason`: a cap on the child's lifetime (the actor token's `exp`) leaves none
+/// (`actor_token_expired`, `no_lifetime_left`).
+pub const REASON_EXCHANGE_NO_LIFETIME_LEFT: &str = "exchange_no_lifetime_left";
+/// Audit `reason`: the parent already delegated to this actor, or the actor token was already
+/// used (`invalid_grant` / `replayed`).
+pub const REASON_EXCHANGE_REPLAYED: &str = "exchange_replayed";
+/// Audit `reason`: a requested capability has an invalid name or a malformed limit.
+pub const REASON_EXCHANGE_INVALID_CAPABILITY: &str = "exchange_invalid_capability";
+/// Audit `reason`: any other refusal of the minting step that the request caused.
+pub const REASON_EXCHANGE_REFUSED: &str = "exchange_refused";
+
+/// Every reason code a refused exchange can be audited with: the `exchange_*` codes above and
+/// the lease reasons of a parent that cannot delegate.
+pub const EXCHANGE_REFUSAL_REASONS: [&str; 13] = [
+    REASON_EXCHANGE_WIDENING,
+    REASON_EXCHANGE_TOO_DEEP,
+    REASON_EXCHANGE_ACTOR_NOT_PERMITTED,
+    REASON_EXCHANGE_ACTOR_MISMATCH,
+    REASON_EXCHANGE_DUPLICATE_ACTOR,
+    REASON_EXCHANGE_RESERVED_AGENT,
+    REASON_EXCHANGE_NO_LIFETIME_LEFT,
+    REASON_EXCHANGE_REPLAYED,
+    REASON_EXCHANGE_INVALID_CAPABILITY,
+    REASON_EXCHANGE_REFUSED,
+    crate::authz::REASON_LEASE_REVOKED,
+    crate::authz::REASON_LEASE_EXPIRED,
+    crate::authz::REASON_LEASE_UNKNOWN,
+];
+
+/// The audit `tool` of an exchange, issued or refused.
+const EXCHANGE_TOOL: &str = "token.exchange";
+
+/// Why an exchange failed once its subject token verified.
+enum Failure {
+    /// Refused for a reason that is the caller's doing: audited as a `deny` record with this
+    /// reason code, whose id the response carries.
+    Refused(&'static str, ApiError),
+    /// Anything else (a server fault): not audited.
+    Other(ApiError),
+}
+
+impl From<ApiError> for Failure {
+    fn from(e: ApiError) -> Self {
+        Failure::Other(e)
+    }
+}
+
+/// The audit reason of a minting failure, `None` for one that is not the caller's doing.
+fn refusal_reason(e: &attenuo_token::TokenError) -> Option<&'static str> {
+    use attenuo_core::ChainError;
+    use attenuo_token::TokenError;
+    Some(match e {
+        TokenError::Key(_) | TokenError::BindingRequired => return None,
+        TokenError::Chain(ChainError::AttenuationViolated { .. }) => REASON_EXCHANGE_WIDENING,
+        TokenError::Chain(ChainError::TooDeep { .. }) => REASON_EXCHANGE_TOO_DEEP,
+        TokenError::Chain(ChainError::DuplicateAgent { .. }) => REASON_EXCHANGE_DUPLICATE_ACTOR,
+        TokenError::Chain(ChainError::InvalidName { .. } | ChainError::InvalidLimit { .. }) => {
+            REASON_EXCHANGE_INVALID_CAPABILITY
+        }
+        TokenError::ActorNotPermitted(_) => REASON_EXCHANGE_ACTOR_NOT_PERMITTED,
+        TokenError::NoLifetimeLeft(_) => REASON_EXCHANGE_NO_LIFETIME_LEFT,
+        _ => REASON_EXCHANGE_REFUSED,
+    })
+}
+
 fn exchange_sync(
     state: &AppState,
     headers: &HeaderMap,
@@ -177,10 +271,13 @@ fn exchange_sync(
             "this server authenticates actors with an actor_token only ([token] actor_auth = \"actor_token\")",
         ));
     }
+    // An authenticated agent that names another agent as `actor` is refused, but only once the
+    // subject token has verified, so that the refusal is audited against its chain.
+    let mut mismatch = None;
     let mut actor_auth = "none";
     if let Some((verified, _)) = &actor {
         if verified.agent != req.actor.0 {
-            return Err(clientauth::invalid_request(
+            mismatch = Some(clientauth::invalid_request(
                 "actor_mismatch",
                 format!(
                     "actor `{}` is not the agent `{}` the actor_token identifies",
@@ -204,8 +301,8 @@ fn exchange_sync(
             client_id.as_deref(),
             client_secret.as_deref(),
         )?;
-        if agent != req.actor.0 {
-            return Err(clientauth::invalid_request(
+        if agent != req.actor.0 && mismatch.is_none() {
+            mismatch = Some(clientauth::invalid_request(
                 "actor_mismatch",
                 format!(
                     "actor `{}` is not the authenticated client `{agent}`",
@@ -225,60 +322,9 @@ fn exchange_sync(
             format!("authorization_details must contain a `{AUTHORIZATION_DETAILS_TYPE}` entry with at least one capability"),
         ));
     }
+    // A subject token that does not verify, or whose DPoP proof does not, is refused with a
+    // server log line only, so an anonymous caller cannot write to the audit log (SR-18).
     let parent = state.verifier.verify(&req.subject_token, now)?;
-    state
-        .pipeline
-        .check_leases(&parent.chain, now)
-        .map_err(|(reason, detail)| {
-            if reason == crate::authz::REASON_LEASE_ERROR {
-                // The detail is the lease store's error text: logged by `internal`, not returned
-                // (SR-43). A storage failure is the server's, not the grant's.
-                return ApiError::internal(format!("lease check failed: {}", detail.join("; ")));
-            }
-            ApiError::bad_request(
-                "invalid_grant",
-                format!(
-                    "subject token cannot delegate: {reason} ({})",
-                    detail.join("; ")
-                ),
-            )
-        })?;
-
-    if req.actor.0 == super::AUDIT_SERVER {
-        // The agent id `attenuo` is reserved for the server's own audit records (SR-34). The
-        // config check covers `[[agents]]`, but an exchange without actor authentication, or
-        // an `[[actor_trust]]` mapping, can still name it (SR-45).
-        return Err(clientauth::invalid_request(
-            "reserved_agent",
-            "agent id `attenuo` is reserved for the server's own records",
-        ));
-    }
-    if parent.chain.hops.iter().any(|h| h.agent == req.actor) {
-        return Err(clientauth::invalid_request(
-            "duplicate_actor",
-            format!(
-                "agent `{}` already acts in this delegation chain; an agent cannot delegate to \
-                 itself or to an agent above it",
-                req.actor.0
-            ),
-        ));
-    }
-    // The child never outlives the actor token that authenticated the exchange.
-    let not_after = match &actor {
-        Some((verified, _)) => {
-            if verified.expires_at - now.unix_timestamp() < 1 {
-                return Err(clientauth::invalid_request(
-                    "actor_token_expired",
-                    "the actor_token expires now; present a fresh one",
-                ));
-            }
-            Some(
-                OffsetDateTime::from_unix_timestamp(verified.expires_at)
-                    .map_err(|e| ApiError::bad_request("invalid_request", e.to_string()))?,
-            )
-        }
-        None => None,
-    };
     // DPoP (SR-24): bind the child to the header proof's key; a bound parent needs proof of
     // its key and a bound child.
     let cnf = state.dpop.bind_exchange(
@@ -290,6 +336,131 @@ fn exchange_sync(
         &state.dpop.expected_url_for(headers, "/token"),
         now,
     )?;
+    let asked = req.requested.clone();
+    let dpop_bound = cnf.is_some();
+    let verified = Verified {
+        parent: &parent,
+        mismatch,
+        actor_auth,
+        cnf,
+    };
+    match exchange_verified(state, &mut req, verified, actor.as_ref(), now) {
+        Ok(resp) => Ok(resp),
+        Err(Failure::Other(e)) => Err(e),
+        Err(Failure::Refused(reason, e)) => {
+            // One `deny` record against the verified parent chain, under a fixed tool name.
+            // The request's own strings reach the record only digested, in the arguments.
+            let call = ToolCall::new(
+                super::AUDIT_SERVER,
+                EXCHANGE_TOOL,
+                json!({
+                    "actor": req.actor,
+                    "requested": asked,
+                    "parent_lease": parent.chain.hops.last().map(|h| &h.lease),
+                    "actor_auth": actor_auth,
+                    "dpop_bound": dpop_bound,
+                }),
+            )
+            .with_dpop_bound(dpop_bound);
+            let id = state
+                .pipeline
+                .record_rejection(&parent.chain, &call, reason, now);
+            Err(e.with_decision_id(id))
+        }
+    }
+}
+
+/// What [`exchange_sync`] established before the subject token's chain is used.
+struct Verified<'a> {
+    parent: &'a attenuo_token::VerifiedToken,
+    mismatch: Option<ApiError>,
+    actor_auth: &'static str,
+    cnf: Option<attenuo_token::Confirmation>,
+}
+
+/// The exchange once the subject token (and its DPoP proof) verified: every refusal the
+/// caller caused from here on is a [`Failure::Refused`].
+fn exchange_verified(
+    state: &AppState,
+    req: &mut ExchangeRequest,
+    verified: Verified<'_>,
+    actor: Option<&(VerifiedActor, String)>,
+    now: OffsetDateTime,
+) -> Result<Response, Failure> {
+    let Verified {
+        parent,
+        mismatch,
+        actor_auth,
+        cnf,
+    } = verified;
+    if let Some(e) = mismatch {
+        return Err(Failure::Refused(REASON_EXCHANGE_ACTOR_MISMATCH, e));
+    }
+    if let Err((reason, detail)) = state.pipeline.check_leases(&parent.chain, now) {
+        if reason == crate::authz::REASON_LEASE_ERROR {
+            // The detail is the lease store's error text: logged by `internal`, not returned
+            // (SR-43). A storage failure is the server's, not the grant's.
+            return Err(Failure::Other(ApiError::internal(format!(
+                "lease check failed: {}",
+                detail.join("; ")
+            ))));
+        }
+        return Err(Failure::Refused(
+            reason,
+            ApiError::bad_request(
+                "invalid_grant",
+                format!(
+                    "subject token cannot delegate: {reason} ({})",
+                    detail.join("; ")
+                ),
+            ),
+        ));
+    }
+
+    if req.actor.0 == super::AUDIT_SERVER {
+        // The agent id `attenuo` is reserved for the server's own audit records (SR-34). The
+        // config check covers `[[agents]]`, but an exchange without actor authentication, or
+        // an `[[actor_trust]]` mapping, can still name it (SR-45).
+        return Err(Failure::Refused(
+            REASON_EXCHANGE_RESERVED_AGENT,
+            clientauth::invalid_request(
+                "reserved_agent",
+                "agent id `attenuo` is reserved for the server's own records",
+            ),
+        ));
+    }
+    if parent.chain.hops.iter().any(|h| h.agent == req.actor) {
+        return Err(Failure::Refused(
+            REASON_EXCHANGE_DUPLICATE_ACTOR,
+            clientauth::invalid_request(
+                "duplicate_actor",
+                format!(
+                    "agent `{}` already acts in this delegation chain; an agent cannot delegate \
+                     to itself or to an agent above it",
+                    req.actor.0
+                ),
+            ),
+        ));
+    }
+    // The child never outlives the actor token that authenticated the exchange.
+    let not_after = match actor {
+        Some((verified, _)) => {
+            if verified.expires_at - now.unix_timestamp() < 1 {
+                return Err(Failure::Refused(
+                    REASON_EXCHANGE_NO_LIFETIME_LEFT,
+                    clientauth::invalid_request(
+                        "actor_token_expired",
+                        "the actor_token expires now; present a fresh one",
+                    ),
+                ));
+            }
+            Some(
+                OffsetDateTime::from_unix_timestamp(verified.expires_at)
+                    .map_err(|e| ApiError::bad_request("invalid_request", e.to_string()))?,
+            )
+        }
+        None => None,
+    };
     let dpop_bound = cnf.is_some();
     // Run limits (ADR-0010): the child's `calls` and `sum` figures are clamped to what the
     // parent hop has left now, not only to its static figures. What was asked is audited.
@@ -297,7 +468,12 @@ fn exchange_sync(
     if let Some(parent_hop) = parent.chain.hops.last() {
         req.requested = clamp_to_remaining(state, parent_hop, &req.requested)?;
     }
-    let resp = req.execute_with(&state.issuer, now, not_after, cnf)?;
+    let resp = req
+        .execute_with(&state.issuer, now, not_after, cnf)
+        .map_err(|e| match refusal_reason(&e) {
+            Some(reason) => Failure::Refused(reason, e.into()),
+            None => Failure::Other(e.into()),
+        })?;
     // A parent token delegates to a given actor once, and an actor token authenticates one
     // exchange, keyed by its `jti` (see `crate::replay`). Recorded only once the exchange has
     // succeeded, so a refused request (say `invalid_scope`) does not use up the slot, and
@@ -305,16 +481,24 @@ fn exchange_sync(
     // at hop 0. If this refuses, the token just minted is dropped before its lease is
     // registered, so it could not be used anyway.
     let exchange_key = format!("exchange\n{}\n{}", parent.claims.jti, req.actor.0);
-    let actor_key = actor
-        .as_ref()
-        .map(|(verified, token)| (verified.replay_key(token), verified.replay_until()));
+    let actor_key =
+        actor.map(|(verified, token)| (verified.replay_key(token), verified.replay_until()));
     let mut keys = vec![(exchange_key.as_str(), parent.claims.exp)];
     if let Some((key, until)) = &actor_key {
         keys.push((key.as_str(), *until));
     }
-    state.replay.use_all_once(&keys, now)?;
+    state.replay.use_all_once(&keys, now).map_err(|e| {
+        if e.description == Some("replayed") {
+            Failure::Refused(REASON_EXCHANGE_REPLAYED, e)
+        } else {
+            Failure::Other(e)
+        }
+    })?;
     // The response carries no chain; read it back from the token we just minted.
-    let issued = state.verifier.verify(&resp.access_token, now)?;
+    let issued = state
+        .verifier
+        .verify(&resp.access_token, now)
+        .map_err(ApiError::from)?;
     let hop = issued
         .chain
         .hops
@@ -337,28 +521,21 @@ fn exchange_sync(
         "actor_auth": actor_auth,
         "dpop_bound": dpop_bound,
     });
-    if let Some((verified, _)) = &actor {
+    if let Some((verified, _)) = actor {
         args["actor_subject"] = verified.subject.clone().into();
         args["actor_trust"] = verified.trust.clone().into();
     }
-    if let Err(e) = audit_issuance(
-        state,
-        "token.exchange",
-        &issued.chain,
-        args,
-        dpop_bound,
-        now,
-    ) {
+    if let Err(e) = audit_issuance(state, EXCHANGE_TOOL, &issued.chain, args, dpop_bound, now) {
         // An issuance we cannot record must not be usable.
         let _ = state.leases.revoke(&resp.lease, "audit_error", now);
-        return Err(e);
+        return Err(e.into());
     }
     tracing::info!(
         // Caller-controlled strings are Debug-formatted (SR-18).
         subject = ?issued.chain.originating_user.subject,
         actor = ?req.actor,
         actor_auth,
-        actor_subject = ?actor.as_ref().map(|(v, _)| v.subject.as_str()),
+        actor_subject = ?actor.map(|(v, _)| v.subject.as_str()),
         lease = %resp.lease.0,
         depth = issued.chain.depth(),
         dpop_bound,
@@ -584,6 +761,48 @@ mod tests {
             take_actor_token(&mut none, ActorAuth::Secret).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn refusal_reasons_come_from_the_listed_set() {
+        use attenuo_core::ChainError;
+        use attenuo_token::TokenError;
+        let cases = [
+            (
+                TokenError::Chain(ChainError::TooDeep { depth: 9, max: 8 }),
+                Some(REASON_EXCHANGE_TOO_DEEP),
+            ),
+            (
+                TokenError::ActorNotPermitted("x".into()),
+                Some(REASON_EXCHANGE_ACTOR_NOT_PERMITTED),
+            ),
+            (
+                TokenError::NoLifetimeLeft("x".into()),
+                Some(REASON_EXCHANGE_NO_LIFETIME_LEFT),
+            ),
+            (
+                TokenError::Chain(ChainError::DuplicateAgent {
+                    index: 1,
+                    first: 0,
+                    agent: "x".into(),
+                }),
+                Some(REASON_EXCHANGE_DUPLICATE_ACTOR),
+            ),
+            (
+                TokenError::Malformed("x".into()),
+                Some(REASON_EXCHANGE_REFUSED),
+            ),
+            (TokenError::Key("x".into()), None),
+            (TokenError::BindingRequired, None),
+        ];
+        for (e, want) in cases {
+            assert_eq!(refusal_reason(&e), want, "{e}");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for r in EXCHANGE_REFUSAL_REASONS {
+            assert!(seen.insert(r), "{r} listed twice");
+            assert!(r.starts_with("exchange_") || r.starts_with("lease_"), "{r}");
+        }
     }
 
     #[test]
