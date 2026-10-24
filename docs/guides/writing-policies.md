@@ -132,6 +132,38 @@ when { context.input has repo && context.input.repo like "alice/public-*" };
 
 This is the rule that stops the prompt-injected "read my private repo" in the [GitHub leak demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/github-leak-demo/README.md), even though the token allows `read_file`. Prefer an allow-list (`permit ... when repo like ...`) to a deny-list (`forbid ... when repo like "*private*"`): the deny-list fails open for names you did not think of. For constraints that must travel with the token and survive delegation, put them in the capability itself (`ArgConstraint`) rather than in policy.
 
+### Patterns and `like`
+
+`like` is the only pattern match Cedar has. Its one wildcard, `*`, matches any run of characters, including none and including `/`. There is no single-character wildcard, no character class and no regular expression; `\*` matches a literal star. So `context.input.repo like "acme/*"` holds for `acme/api`, but also for:
+
+- `acme/`, an empty name, because `*` may match nothing;
+- `acme/a/b`, because `*` crosses `/`;
+- `acme/../x` and `acme/..`, which an upstream that builds a URL or path from the value may resolve outside `acme`.
+
+To pin a shape, add the cases the wildcard should not cover. The starter policy's issue rule allows exactly one `/` and a name that is not empty, `.` or `..`:
+
+```cedar
+@id("permit_create_issue_in_acme")
+permit(principal, action == Action::"github/create_issue", resource)
+when {
+    context.input has repo &&
+    context.input.repo like "acme/*" &&
+    !(context.input.repo like "acme/*/*") &&
+    context.input.repo != "acme/" &&
+    context.input.repo != "acme/." &&
+    context.input.repo != "acme/.."
+};
+```
+
+`!(... like "acme/*/*")` is what rules out a second `/`, and with it every `..` path that leaves the owner. A longer fixed prefix needs the same treatment: `like "acme/sandbox-*"` matches `acme/sandbox-x/../api`, so the starter's sandbox permit also carries `!(... like "acme/*/*")` and `!= "acme/sandbox-"`. Patterns are case-sensitive (`ACME/api` does not match), which is what you want when the upstream is too, and a trap when it is not. Which characters a name may contain cannot be said with `like`. Leave that to the upstream, or list the allowed values (`["acme/api", "acme/web"].contains(context.input.repo)`, or a `one_of` constraint in the token).
+
+A pattern in policy and a `prefix` constraint in the token's capability do different jobs:
+
+- A capability constraint (`{ op: prefix, value: "acme/" }`, `equals`, `one_of`) is checked before Cedar, travels with the token, and can only be narrowed by each delegation (`acme/` to `acme/api`). Use it for "this agent, for this task, may only touch these repositories": it is per token, and a policy cannot widen it. `prefix` is a plain string prefix with the same blind spots as `*` (it accepts `acme/` and `acme/a/../b`), so for a whole repository name prefer `equals` or `one_of`.
+- A policy pattern applies to every token the server sees and can say what a prefix cannot (no second `/`, not empty). Use it for the organisation-wide rule, the shape every value must have whatever a token says.
+
+The two compose: the token narrows to `prefix: acme/`, the policy rejects the malformed names inside it. The "capability stage" cases in [`config/policies/default_test.yaml`](https://github.com/attenuo-dev/attenuo/blob/main/config/policies/default_test.yaml) show both together.
+
 ### MFA for sensitive tools
 
 ```cedar
@@ -145,6 +177,8 @@ when {
 ```
 
 A missing `mfa` attribute counts as no MFA. A `forbid` always wins over a `permit`, so this holds whatever permits are added later. The `mfa` attribute is derived from the IdP's `amr` claim when hop 0 is minted; see the top-level README.
+
+A forbid like this only ever removes access; something has to permit the sensitive tool for MFA to make a difference. In the starter policy that is `permit_delete_acme_sandbox_repo`: `delete_repo` (sensitive in the example catalog) on `acme/sandbox-<name>` only. With MFA the delete of `acme/sandbox-demo` is allowed by that permit; without MFA the same call is denied by `forbid_sensitive_without_mfa`; any other repository is denied by default either way. Drop the permit if your agents should never delete a repository, and the forbid stays as a guard rail for whatever sensitive permit you write next.
 
 ### Asking for approval after untrusted output
 

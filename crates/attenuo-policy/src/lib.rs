@@ -246,8 +246,8 @@ pub use usage::{policies_read_usage, TrackUsage};
 
 /// The starter policy set shipped with the crate (`policies/default.cedar`).
 ///
-/// It references `Action::"github/create_issue"`, so it validates only when the catalog
-/// registers a `create_issue` tool on server `github`.
+/// It references `Action::"github/create_issue"` and `Action::"github/delete_repo"`, so it
+/// validates only when the catalog registers both tools on server `github`.
 pub const DEFAULT_POLICIES: &str = include_str!("../policies/default.cedar");
 
 /// Reason code when the capability stage denies.

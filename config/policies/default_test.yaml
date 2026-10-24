@@ -3,7 +3,7 @@
 #
 # The catalog is read from config/example.toml, the config that loads default.cedar, so the
 # cases see the tools the shipped server does: github read_file (readonly), create_issue and
-# delete_repo (sensitive), with unknown_tools = "deny". The crate's copy,
+# delete_repo (sensitive), each with `repo` declared as a string, and unknown_tools = "deny". The crate's copy,
 # crates/attenuo-policy/policies/default.cedar, must stay byte-identical to this policy file;
 # the attenuo-policy test that runs this suite checks that.
 #
@@ -30,7 +30,7 @@ cases:
     reason: policy_allow
     policy_ids: [permit_readonly_tools]
 
-  - name: a tool that is neither read-only nor permitted is denied by default
+  - name: a call no permit covers is denied by default
     user: { attributes: { mfa: true } }
     chain: [assistant]
     call: { server: github, tool: delete_repo, arguments: { repo: acme/api } }
@@ -69,14 +69,55 @@ cases:
     reason: policy_deny
     policy_ids: []
 
-  # `like "acme/*"` lets `*` match nothing, a further `/` or `..`: the rule checks the
-  # owner prefix only and leaves the repository name to the upstream.
-  - name: the acme pattern accepts any text after the owner, even none
+  # `*` in `like` matches any text, nothing and `/` included, so `like "acme/*"` alone would
+  # allow each of the next four. The permit pins the shape "acme/<name>": one `/`, and a
+  # name that is not empty, "." or "..".
+  - name: an acme repository with an empty name is denied
     chain: [assistant]
     call:
       server: github
       tool: create_issue
       arguments: { repo: "acme/", title: hi }
+    expect: deny
+    reason: policy_deny
+    policy_ids: []
+
+  - name: a second slash after the owner is denied
+    chain: [assistant]
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: acme/a/b, title: hi }
+    expect: deny
+    reason: policy_deny
+    policy_ids: []
+
+  - name: a path that climbs out of the acme organisation is denied
+    chain: [assistant]
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: acme/../x, title: hi }
+    expect: deny
+    reason: policy_deny
+    policy_ids: []
+
+  - name: a repository name of two dots is denied
+    chain: [assistant]
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: acme/.., title: hi }
+    expect: deny
+    reason: policy_deny
+    policy_ids: []
+
+  - name: a repository name that starts with a dot is still allowed
+    chain: [assistant]
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: acme/.github, title: hi }
     expect: allow
     reason: policy_allow
     policy_ids: [permit_create_issue_in_acme]
@@ -167,10 +208,28 @@ cases:
     reason: attribute_type_mismatch
     policy_ids: []
 
-  # With MFA the forbid no longer applies, but nothing in this file permits delete_repo (it
-  # is neither read-only nor create_issue), so with the shipped catalog the call is still
-  # denied by default. The MFA rule only ever adds a reason to deny here; it matters once a
-  # policy permits a sensitive tool.
+  # A forbid wins over a permit: the sandbox permit matches, the MFA rule still denies.
+  - name: a sandbox repository cannot be deleted without MFA
+    user: { attributes: { mfa: false } }
+    chain: [assistant]
+    call: { server: github, tool: delete_repo, arguments: { repo: acme/sandbox-demo } }
+    expect: deny
+    reason: policy_deny
+    policy_ids: [forbid_sensitive_without_mfa]
+
+  # --- permit_delete_acme_sandbox_repo ----------------------------------------------------
+  # The allow side of the MFA rule: with MFA the forbid no longer applies and the sandbox
+  # permit decides.
+  - name: with MFA a sandbox repository may be deleted
+    user: { attributes: { mfa: true } }
+    chain: [assistant]
+    call: { server: github, tool: delete_repo, arguments: { repo: acme/sandbox-demo } }
+    expect: allow
+    reason: policy_allow
+    policy_ids: [permit_delete_acme_sandbox_repo]
+
+  # With MFA the forbid no longer applies, but the sandbox permit does not cover acme/api,
+  # so the call is denied by default.
   - name: with MFA a sensitive tool is still denied when nothing permits it
     user: { attributes: { mfa: true } }
     chain: [assistant]
@@ -179,7 +238,48 @@ cases:
     reason: policy_deny
     policy_ids: []
 
+  - name: the sandbox prefix needs a name after it
+    user: { attributes: { mfa: true } }
+    chain: [assistant]
+    call: { server: github, tool: delete_repo, arguments: { repo: acme/sandbox- } }
+    expect: deny
+    reason: policy_deny
+    policy_ids: []
+
+  - name: a path from a sandbox name into another repository is denied
+    user: { attributes: { mfa: true } }
+    chain: [assistant]
+    call: { server: github, tool: delete_repo, arguments: { repo: acme/sandbox-x/../api } }
+    expect: deny
+    reason: policy_deny
+    policy_ids: []
+
+  - name: a sandbox repository of another organisation is denied
+    user: { attributes: { mfa: true } }
+    chain: [assistant]
+    call: { server: github, tool: delete_repo, arguments: { repo: evil/sandbox-demo } }
+    expect: deny
+    reason: policy_deny
+    policy_ids: []
+
+  - name: deleting a sandbox repository without a repo argument is denied
+    user: { attributes: { mfa: true } }
+    chain: [assistant]
+    call: { server: github, tool: delete_repo }
+    expect: deny
+    reason: policy_deny
+    policy_ids: []
+
   # --- capability stage, before Cedar -----------------------------------------------------
+  - name: the sandbox permit cannot delete with a token that does not grant delete_repo
+    user: { attributes: { mfa: true } }
+    chain:
+      - { agent: assistant, capabilities: ["github:read_file", "github:create_issue"] }
+    call: { server: github, tool: delete_repo, arguments: { repo: acme/sandbox-demo } }
+    expect: deny
+    reason: capability_denied
+    policy_ids: []
+
   - name: a tool the chain did not grant is denied before any policy runs
     chain:
       - { agent: assistant, capabilities: ["github:read_file"] }

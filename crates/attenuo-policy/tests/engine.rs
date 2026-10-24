@@ -622,6 +622,7 @@ fn shipped_default_policy_file_loads_from_disk() {
             "forbid_deep_chains",
             "forbid_sensitive_without_mfa",
             "permit_create_issue_in_acme",
+            "permit_delete_acme_sandbox_repo",
             "permit_readonly_tools",
         ]
     );
@@ -654,7 +655,7 @@ fn shipped_default_policy_passes_its_tests() {
         );
     }
     let cov = coverage([&report]);
-    assert_eq!(cov.policies, 4);
+    assert_eq!(cov.policies, 5);
     assert!(cov.unexercised.is_empty(), "{:?}", cov.unexercised);
 }
 
