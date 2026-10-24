@@ -184,6 +184,13 @@ ttl_seconds = 120
 # ID tokens for the user by itself.
 # allow_unset_client_id = false
 
+[leases]
+# Seconds a session binding (revoke by session) is kept after its chain's root lease expired;
+# a revoked chain's bindings go at the next pass (every minute). Keep it above the longest
+# token lifetime you issue: an expired lease can be renewed while its token is valid. 0 keeps
+# every binding.
+session_retention_seconds = 86400
+
 # Workload identities accepted as `actor_token` on an exchange or at hop 0. Each actor token
 # works for one request, and the token it obtains never outlives it. A SPIFFE trust domain, keys from the SPIRE
 # server's bundle endpoint (given explicitly, never discovered):

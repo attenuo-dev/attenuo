@@ -128,6 +128,14 @@ Approvals of calls a policy gates with `@obligation("approval")` (see [Writing p
 | `client_id` | none | The `aud` an ID token must carry to decide at `POST /approvals/{id}`. Unset, it is the client id hop-0 intake expects for the run's root agent. Set it to a client the agent does not control, such as the approval page's own OAuth client, so that an ID token the agent can get for itself cannot approve its calls. When a loaded policy carries `@obligation("approval")` and this is unset, the server logs a warning at startup and after every policy reload, and refuses to start when `[server] listen` is not a loopback address (SR-64), unless `allow_unset_client_id` is set. |
 | `allow_unset_client_id` | false | Start with `client_id` unset off loopback although a loaded policy asks for approvals. The default refuses, because an agent that can get ID tokens for its user (silent re-authentication, a refresh token with `openid`) could then approve its own gated calls, and the audit record would show `by: user`. Set it only where the agent cannot obtain ID tokens for the user by itself; the warning is still logged. |
 
+## `[leases]`
+
+Retention of what the lease registry records beside the leases (see [Leases and revocation](../concepts/leases-and-revocation.md)).
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `session_retention_seconds` | 86400 | How long the record of an MCP session (revoke by session, SQLite table `lease_sessions`) is kept after its run's root lease expired. A background pass every minute deletes the records of runs whose root lease is revoked (at once, whatever this says), has been expired for longer than this, or is unknown: at most 1,000 records per pass and 100 passes per minute, each pass one short write transaction, counted in `lease_sessions_pruned_total`. An expired lease can still be renewed while its token is valid, so keep this above the longest token lifetime the server issues (a root token never outlives the IdP credential it came from); a shorter value lets a renewed run's sessions drop out of revoke-by-session, though `chain_id` and `user` still reach it. A pruned session resolves to no run, as an unknown one does. 0 keeps every record. Lease rows and recorded users are never pruned. |
+
 ## `[[actor_trust]]`
 
 Issuers of workload identities whose JWTs are accepted as the RFC 8693 `actor_token` of an exchange. Give each entry exactly one key source: `jwks_url` (with `issuer`), or `spiffe_trust_domain` with `spiffe_bundle_url`. Neither is discovered. Hop 0 (IdP intake) still authenticates the agent with `[[agents]]` client credentials.

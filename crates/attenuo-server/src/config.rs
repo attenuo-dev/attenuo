@@ -83,6 +83,9 @@ pub struct Config {
     /// [`ApprovalsSection`].
     #[serde(default)]
     pub approvals: ApprovalsSection,
+    /// Retention of session bindings (revoke by session). See [`LeasesSection`].
+    #[serde(default)]
+    pub leases: LeasesSection,
     /// Policy enforcement points allowed to send unsigned chains to the AuthZEN endpoint when
     /// `[authzen] allow_unsigned_chain = true`. Same shape as `[[agents]]`.
     #[serde(default)]
@@ -981,6 +984,45 @@ impl ApprovalsSection {
     }
 }
 
+/// `[leases]`: retention of the lease registry's side tables.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeasesSection {
+    /// How long a session binding (revoke by session) is kept after its chain's root lease
+    /// expired, in seconds. Default 86400 (a day). A binding of a revoked chain goes at the
+    /// next pruning pass whatever this says. An expired lease can still be renewed while its
+    /// token is valid, so keep this above the longest token lifetime the server issues. 0
+    /// keeps every binding (no pruning).
+    #[serde(default = "default_session_retention_seconds")]
+    pub session_retention_seconds: u64,
+}
+
+/// Default of `[leases] session_retention_seconds`.
+pub const DEFAULT_SESSION_RETENTION_SECONDS: u64 = 86_400;
+
+fn default_session_retention_seconds() -> u64 {
+    DEFAULT_SESSION_RETENTION_SECONDS
+}
+
+impl Default for LeasesSection {
+    fn default() -> Self {
+        Self {
+            session_retention_seconds: DEFAULT_SESSION_RETENTION_SECONDS,
+        }
+    }
+}
+
+impl LeasesSection {
+    /// `session_retention_seconds` as a duration; `None` when pruning is off (0).
+    pub fn session_retention(&self) -> Option<time::Duration> {
+        (self.session_retention_seconds > 0).then(|| {
+            time::Duration::seconds(
+                i64::try_from(self.session_retention_seconds).unwrap_or(i64::MAX),
+            )
+        })
+    }
+}
+
 /// `[admin]`
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1622,6 +1664,23 @@ mod tests {
         );
         let cfg = super::Config::from_toml("[proxy]\nstream_recheck_seconds = 0\n").unwrap();
         assert!(cfg.proxy.stream_recheck().is_err());
+    }
+
+    #[test]
+    fn session_retention_defaults_to_a_day_and_zero_turns_it_off() {
+        let cfg = super::Config::from_toml("").unwrap();
+        assert_eq!(
+            cfg.leases.session_retention(),
+            Some(time::Duration::hours(24))
+        );
+        let cfg = super::Config::from_toml("[leases]\nsession_retention_seconds = 7200\n").unwrap();
+        assert_eq!(
+            cfg.leases.session_retention(),
+            Some(time::Duration::hours(2))
+        );
+        let cfg = super::Config::from_toml("[leases]\nsession_retention_seconds = 0\n").unwrap();
+        assert_eq!(cfg.leases.session_retention(), None);
+        assert!(super::Config::from_toml("[leases]\nsession_retention = 1\n").is_err());
     }
 
     use super::*;

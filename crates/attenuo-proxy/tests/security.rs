@@ -204,7 +204,13 @@ fn session_upstream(hits: Arc<Mutex<Vec<String>>>) -> Router {
             let hits = h2.clone();
             async move {
                 hits.lock().unwrap().push("GET".into());
-                StatusCode::OK
+                // A listen stream that ends at once (a bare `200` is refused, as MCP allows
+                // only SSE or `405` here).
+                (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                    "",
+                )
             }
         })
         .delete(move || {

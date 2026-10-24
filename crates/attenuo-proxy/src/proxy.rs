@@ -77,6 +77,12 @@ pub const REASON_UPSTREAM_BODY_TOO_LARGE: &str = "upstream_body_too_large";
 /// transport error itself is only logged (SR-17).
 pub const REASON_UPSTREAM_UNREACHABLE: &str = "upstream_unreachable";
 
+/// Reason code (HTTP 502, JSON-RPC `data.reason`) when an upstream answers a `GET` with a
+/// success status but not `text/event-stream`. MCP allows only an SSE listen stream or `405`
+/// there, and such a body would reach the client without the list filter or result labelling
+/// the proxy applies to the listen stream, so it is refused rather than relayed.
+pub const REASON_UPSTREAM_NOT_EVENT_STREAM: &str = "upstream_not_event_stream";
+
 /// Reason code for a `tools/call` whose name the upstream never listed and the catalog does not
 /// know, with [`ProxyConfig::require_listed_tools`] on (SR-25).
 pub const REASON_TOOL_NOT_LISTED: &str = "tool_not_listed";
@@ -792,6 +798,9 @@ async fn handle_passthrough(
                 let filter = listen_list_filter(&state, &chain, &server);
                 stream_response_sse(resp, None, guard, limit, Some(filter), Some(labeller))
             }
+            // Any other success answer to a `GET` is a protocol violation, and the one body
+            // that would pass the list filter by: refused. `405` and errors are relayed.
+            Ok(resp) if resp.status().is_success() => return upstream_not_event_stream(&resp),
             Ok(resp) => stream_response(
                 resp,
                 None,
@@ -844,6 +853,29 @@ fn listen_list_filter(
             }
         }
     }
+}
+
+/// `502` for an upstream that answered a `GET` with a success status and a body that is not
+/// SSE ([`REASON_UPSTREAM_NOT_EVENT_STREAM`]). The status and content type are logged; the
+/// body is dropped unread, which closes the upstream connection, and no session it may
+/// assign is bound.
+fn upstream_not_event_stream(resp: &reqwest::Response) -> Response {
+    let content_type = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+    tracing::error!(
+        status = resp.status().as_u16(),
+        content_type = ?content_type,
+        "upstream answered GET with a success status that is not an SSE stream; refused"
+    );
+    let body = error_response(
+        Value::Null,
+        CODE_UPSTREAM,
+        "attenuo: upstream answered GET without an event stream",
+        Some(serde_json::json!({ "reason": REASON_UPSTREAM_NOT_EVENT_STREAM })),
+    );
+    json_response(StatusCode::BAD_GATEWAY, &body)
 }
 
 /// `502` for a failed upstream request. The `reqwest` error names the internal upstream URL

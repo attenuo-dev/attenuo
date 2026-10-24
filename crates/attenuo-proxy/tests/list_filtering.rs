@@ -830,3 +830,87 @@ async fn list_answers_replayed_on_a_resumed_get_stream_are_filtered() -> anyhow:
     assert_eq!(server_request["result"]["tools"][0]["name"], "delete_repo");
     Ok(())
 }
+
+/// An upstream that answers `GET` with `status`, `content_type` and `body`.
+fn get_upstream(status: u16, content_type: &'static str, body: String) -> axum::Router {
+    axum::Router::new().route(
+        "/mcp",
+        axum::routing::get(move || {
+            let body = body.clone();
+            async move {
+                axum::response::Response::builder()
+                    .status(status)
+                    .header("content-type", content_type)
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+            }
+        }),
+    )
+}
+
+async fn get_listen(h: &Harness) -> anyhow::Result<reqwest::Response> {
+    Ok(h.client
+        .get(h.proxy.url(&format!("/mcp/{SERVER}")))
+        .header("accept", "text/event-stream")
+        .bearer_auth(TOKEN)
+        .send()
+        .await?)
+}
+
+/// MCP answers a `GET` with an SSE stream or `405`. A success answer that is not SSE would
+/// reach the client without the list filter (here an unfiltered `tools/list` answer in a JSON
+/// body), so the proxy refuses it with `502` `upstream_not_event_stream` and relays none of
+/// it, whatever the success status.
+#[tokio::test]
+async fn a_get_answered_without_an_event_stream_is_refused() -> anyhow::Result<()> {
+    let tools = json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": [
+        {"name": "read_file"}, {"name": "delete_repo"}]}})
+    .to_string();
+    for (status, content_type) in [
+        (200, "application/json"),
+        (200, "text/plain"),
+        (202, "application/json"),
+    ] {
+        let up = get_upstream(status, content_type, tools.clone());
+        let h = Harness::start_router(up, narrow_chain()).await?;
+        let resp = get_listen(&h).await?;
+        assert_eq!(resp.status(), 502, "{status} {content_type}");
+        let body: Value = resp.json().await?;
+        assert_eq!(body["error"]["code"], -32005, "{body}");
+        assert_eq!(
+            body["error"]["data"]["reason"],
+            attenuo_proxy::REASON_UPSTREAM_NOT_EVENT_STREAM
+        );
+        assert!(!body.to_string().contains("delete_repo"), "{body}");
+    }
+    Ok(())
+}
+
+/// `405` (no listen stream) and error answers are relayed as before, and an SSE stream whose
+/// content type carries parameters is still a listen stream, filtered.
+#[tokio::test]
+async fn a_get_answered_with_405_or_an_error_is_relayed() -> anyhow::Result<()> {
+    for status in [405, 404, 500] {
+        let up = get_upstream(status, "text/plain", "no".into());
+        let h = Harness::start_router(up, narrow_chain()).await?;
+        let resp = get_listen(&h).await?;
+        assert_eq!(resp.status(), status);
+        assert_eq!(resp.text().await?, "no");
+    }
+    let tools = json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": [
+        {"name": "read_file"}, {"name": "delete_repo"}]}});
+    let up = get_upstream(
+        200,
+        "text/event-stream; charset=utf-8",
+        format!("event: message\ndata: {tools}\n\n"),
+    );
+    let h = Harness::start_router(up, narrow_chain()).await?;
+    let resp = get_listen(&h).await?;
+    assert_eq!(resp.status(), 200);
+    let msgs = read_messages(resp, 1).await?;
+    assert_eq!(
+        names(&msgs[0]["result"], "tools", "name"),
+        vec!["read_file"]
+    );
+    Ok(())
+}

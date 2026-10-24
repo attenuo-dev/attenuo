@@ -28,6 +28,8 @@ pub struct AppState {
     /// `[audit] checkpoint_interval_seconds`; zero means no timer.
     pub checkpoint_interval: std::time::Duration,
     pub leases: Arc<SqliteLeaseStore>,
+    /// `[leases] session_retention_seconds`; `None` when session bindings are never pruned.
+    pub session_retention: Option<Duration>,
     /// Policy file to re-read on reload; `None` when no policy file is configured.
     pub policies_path: Option<PathBuf>,
     /// Digest and load time of the policy set in force, for `GET /admin/policies`. The engine
@@ -221,6 +223,7 @@ impl AppState {
                 config.audit.checkpoint_interval_seconds,
             ),
             leases,
+            session_retention: config.leases.session_retention(),
             policies_path: config.policy.policies_path.clone(),
             loaded_policies,
             admin_token: config.admin.token.clone(),

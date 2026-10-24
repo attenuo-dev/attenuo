@@ -39,8 +39,8 @@ pub use export::{
     EXPORT_FORMAT,
 };
 pub use lease::{
-    LeaseNode, LeaseSelector, LeaseStatus, LeaseStore, LeaseSubtree, MemoryLeaseStore, RunLabel,
-    SelectorRevocation, SessionBinding,
+    session_prunable, LeaseNode, LeaseSelector, LeaseStatus, LeaseStore, LeaseSubtree,
+    MemoryLeaseStore, RunLabel, SelectorRevocation, SessionBinding, SessionPrune,
 };
 pub use log::{
     canonical_record_json, compute_entry_hash, entry_hash_from_json, verify_entries, AuditEntry,
