@@ -141,6 +141,12 @@ fn strs(v: &Value) -> Vec<&str> {
 }
 
 /// One line per audit entry.
+///
+/// Decisions, token issuance, lease and admin records print `ALLOW`/`DENY` and the reason as
+/// they always did (the latter three name themselves in `server/tool`, e.g.
+/// `attenuo/token.exchange`). The records that are not decisions but would read like one,
+/// `tool_result`, `approval_request` and `approval_grant`, print their kind in place of
+/// `ALLOW`/`DENY` and the details that matter for that kind.
 pub fn fmt_audit_entry(e: &Value) -> String {
     let r = &e["record"];
     let agents = strs(&r["agents"]);
@@ -150,16 +156,69 @@ pub fn fmt_audit_entry(e: &Value) -> String {
     } else {
         format!("{} for", agents.join(" > "))
     };
+    let seq = e["seq"].as_u64().unwrap_or(0);
+    let kind = r["kind"].as_str().unwrap_or("decision");
+    let detail = match kind {
+        "tool_result" => {
+            let res = &r["result"];
+            let mut d = format!(
+                "decision={}  label={} size={}",
+                s(r, "decision_id"),
+                s(res, "label"),
+                res["size"]
+                    .as_u64()
+                    .map_or("-".to_string(), |n| n.to_string()),
+            );
+            if res["error"] == true {
+                d.push_str(" error");
+            }
+            d
+        }
+        "approval_request" => {
+            let a = &r["approval"];
+            format!(
+                "decision={}  approval={} expires={}",
+                s(r, "decision_id"),
+                s(a, "id"),
+                s(a, "expires_at")
+            )
+        }
+        "approval_grant" => {
+            let a = &r["approval"];
+            format!(
+                "decision={}  approval={} outcome={} by={}",
+                s(r, "decision_id"),
+                s(a, "id"),
+                s(a, "outcome"),
+                s(a, "by")
+            )
+        }
+        _ => String::new(),
+    };
+    if detail.is_empty() {
+        return format!(
+            "#{:<4} {}  {:<5} {}/{}  {} {}  reason={}  id={}",
+            seq,
+            s(r, "at"),
+            s(r, "decision").to_uppercase(),
+            s(r, "server"),
+            s(r, "tool"),
+            who,
+            s(r, "originating_subject"),
+            s(r, "reason"),
+            s(r, "id"),
+        );
+    }
     format!(
-        "#{:<4} {}  {:<5} {}/{}  {} {}  reason={}  id={}",
-        e["seq"].as_u64().unwrap_or(0),
+        "#{:<4} {}  {}  {}/{}  {} {}  {}  id={}",
+        seq,
         s(r, "at"),
-        s(r, "decision").to_uppercase(),
+        kind,
         s(r, "server"),
         s(r, "tool"),
         who,
         s(r, "originating_subject"),
-        s(r, "reason"),
+        detail,
         s(r, "id"),
     )
 }
@@ -509,6 +568,98 @@ pub fn render_evaluation(v: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// An entry as `GET /admin/audit` returns it, with `extra` merged into the record.
+    fn entry(seq: u64, kind: &str, extra: Value) -> Value {
+        let mut record = json!({
+            "id": "rec1", "at": "2026-10-24T10:00:00Z", "kind": kind, "decision": "allow",
+            "reason": "r", "originating_subject": "alice", "agents": ["planner", "coder"],
+            "server": "github", "tool": "read_file"});
+        for (k, v) in extra.as_object().unwrap() {
+            record[k] = v.clone();
+        }
+        json!({"seq": seq, "record": record})
+    }
+
+    #[test]
+    fn decision_line_is_unchanged_with_or_without_a_kind() {
+        let want = "#4    2026-10-24T10:00:00Z  ALLOW github/read_file  planner > coder for alice  reason=policy_allow  id=rec1";
+        let with = entry(4, "decision", json!({"reason": "policy_allow"}));
+        assert_eq!(fmt_audit_entry(&with), want);
+        let mut without = with.clone();
+        without["record"].as_object_mut().unwrap().remove("kind");
+        assert_eq!(fmt_audit_entry(&without), want);
+    }
+
+    #[test]
+    fn tool_result_line_names_kind_decision_label_and_size() {
+        let e = entry(
+            5,
+            "tool_result",
+            json!({"reason": "tool_result", "decision_id": "dec1",
+                   "result": {"digest": "ab", "size": 149, "label": "untrusted", "fingerprints": 0}}),
+        );
+        assert_eq!(
+            fmt_audit_entry(&e),
+            "#5    2026-10-24T10:00:00Z  tool_result  github/read_file  planner > coder for alice  decision=dec1  label=untrusted size=149  id=rec1"
+        );
+        let mut err = e.clone();
+        err["record"]["result"]["error"] = json!(true);
+        assert!(fmt_audit_entry(&err).contains("size=149 error  id="));
+    }
+
+    #[test]
+    fn approval_request_line_names_approval_and_expiry() {
+        let e = entry(
+            6,
+            "approval_request",
+            json!({"decision": "deny", "reason": "approval_requested", "decision_id": "dec2",
+                   "approval": {"id": "ap1", "expires_at": "2026-10-24T10:02:00Z"}}),
+        );
+        assert_eq!(
+            fmt_audit_entry(&e),
+            "#6    2026-10-24T10:00:00Z  approval_request  github/read_file  planner > coder for alice  decision=dec2  approval=ap1 expires=2026-10-24T10:02:00Z  id=rec1"
+        );
+    }
+
+    #[test]
+    fn approval_grant_line_names_outcome_and_approver() {
+        let e = entry(
+            7,
+            "approval_grant",
+            json!({"reason": "approval_granted", "decision_id": "dec2",
+                   "approval": {"id": "ap1", "by": "operator", "outcome": "grant"}}),
+        );
+        assert_eq!(
+            fmt_audit_entry(&e),
+            "#7    2026-10-24T10:00:00Z  approval_grant  github/read_file  planner > coder for alice  decision=dec2  approval=ap1 outcome=grant by=operator  id=rec1"
+        );
+        let mut declined = e.clone();
+        declined["record"]["approval"]["outcome"] = json!("decline");
+        declined["record"]["approval"]["by"] = json!("user");
+        assert!(fmt_audit_entry(&declined).contains("outcome=decline by=user"));
+    }
+
+    #[test]
+    fn exchange_admin_and_lease_rows_keep_their_look() {
+        for (kind, tool) in [
+            ("exchange", "token.exchange"),
+            ("root_token", "token.root"),
+            ("lease_renew", "lease.renew"),
+            ("lease_revoke", "admin.lease.revoke"),
+            ("admin", "admin.policy.reload"),
+        ] {
+            let e = entry(
+                1,
+                kind,
+                json!({"server": "attenuo", "tool": tool, "reason": "admin_action", "agents": []}),
+            );
+            assert_eq!(
+                fmt_audit_entry(&e),
+                format!("#1    2026-10-24T10:00:00Z  ALLOW attenuo/{tool}  by alice  reason=admin_action  id=rec1")
+            );
+        }
+    }
+
     use super::*;
     use attenuo_core::{AgentId, LeaseId, OriginatingUser};
     use serde_json::json;

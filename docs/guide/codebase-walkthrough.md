@@ -589,8 +589,8 @@ curl -s -D - -X POST $ATTENUO_SERVER/mcp/github \
 # {"jsonrpc":"2.0","id":7,"error":{"code":-32008,"message":"attenuo: approval required: ask the user to approve <id> (POST /approvals/<id>)",
 #  "data":{"reason":"approval_required","decision_id":"<uuid>","call_hash":"...","approval_id":"<id>","expires_at":"..."}}}
 
-# What the log holds. tail prints no kind: a tool_result shows as "ALLOW ... reason=tool_result", an
-# approval_request as "DENY ... reason=approval_requested" and an approval_grant as "ALLOW ... reason=approval_granted".
+# What the log holds. Decisions print ALLOW or DENY; tool_result, approval_request and approval_grant print their
+# kind instead, e.g. "#4  <time>  tool_result  github/read_file  assistant for alice  decision=<id>  label=untrusted size=149  id=<id>".
 attenuo audit tail -n 12
 curl -s -H "Authorization: Bearer $ATTENUO_ADMIN_TOKEN" "$ATTENUO_SERVER/admin/audit?kind=tool_result&limit=1"
 # "kind":"tool_result", "decision_id" of the read, "result":{"digest":"...","size":149,"label":"untrusted","fingerprints":0}; no content
@@ -794,6 +794,5 @@ Each of these is deliberate, and most were found by a review or the fuzzers. Whe
 - **A grant is used by the identical retry only, once.** The approval is bound to the `call_hash` and the calling hop's lease. A retry with any argument changed gets `-32008` with a new approval; the second identical retry after the grant gets a new approval too; another agent of the same run cannot use it. If the retry's decision cannot be written, the approval is given back (`give_back`), so a grant is spent exactly when an allowed decision naming it is in the log.
 - **`-32008` never appears on the `GET` listen stream, but `label_error` can, without a decision header.** A gated call is decided on its `POST` and never forwarded, so there is nothing for the upstream to answer later. An allowed call answered on the listen stream is labelled there, and if that fails the answer is replaced by `-32003` `label_error` with no `X-Attenuo-Decision-Id` (the stream's headers went out when it opened), so the SDKs see an upstream `RpcError`, not `Denied`. An answer that arrives after its ten minutes, or after its entry was evicted, is relayed unrecorded ([server design](../design/server.md), "Limits").
 - **The approver in the injection suite is a script that knows the labels.** "0 attack calls approved" in the labels results is true by construction. The number that measures attenuo is "attack allowed without approval" (1/60 dev, 1/38 test); the approve-all bound (10/60, 7/38) is what a user who grants everything would get. ADR-0010's run limits aim at the gap between the two.
-- **`attenuo audit tail` does not print the record kind.** A `tool_result` reads as `ALLOW ... reason=tool_result`, an `approval_request` as `DENY ... reason=approval_requested` and an `approval_grant` as `ALLOW ... reason=approval_granted`, next to the decisions. Filter with `GET /admin/audit?kind=decision` when you want decisions only.
 
 When something in the code looks over-cautious, grep its `SR-` or `F` number in the three security reviews, the [fuzzing page](../design/fuzzing.md) and `CHANGELOG.md`; the reason is almost always written down there.
