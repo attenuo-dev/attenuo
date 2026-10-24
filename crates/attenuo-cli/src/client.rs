@@ -295,20 +295,47 @@ fn is_use_dpop_nonce(status: StatusCode, headers: &HeaderMap, body: &str) -> boo
             .is_ok_and(|v| v["error"].as_str() == Some(USE_DPOP_NONCE))
 }
 
-/// A server error as `{"error": code, "detail": text}`, or the raw body when it is not that.
-fn api_error(status: StatusCode, body: &str) -> anyhow::Error {
-    match serde_json::from_str::<Value>(body) {
-        Ok(v) if v["error"].is_string() => anyhow!(
-            "server answered {status}: {}{}",
-            v["error"].as_str().unwrap_or_default(),
-            v["detail"]
-                .as_str()
-                .map(|d| format!(": {d}"))
-                .unwrap_or_default()
-        ),
-        _ if body.trim().is_empty() => anyhow!("server answered {status}"),
-        _ => anyhow!("server answered {status}: {}", body.trim()),
+/// A non-success answer from the server. Its text is `server answered <status>: <code>:
+/// <detail>` (or the raw body); a command that gives some statuses a meaning of its own (as
+/// `budget refund` does for 404 and 409) finds it with `anyhow::Error::downcast_ref`.
+#[derive(Debug)]
+pub struct ApiError {
+    pub status: StatusCode,
+    /// The JSON body's `error` code, when the body is `{"error": code, ...}`.
+    pub code: Option<String>,
+    message: String,
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
     }
+}
+
+impl std::error::Error for ApiError {}
+
+/// A server error as `{"error": code, "detail": text}`, or the raw body when it is not that.
+pub(crate) fn api_error(status: StatusCode, body: &str) -> anyhow::Error {
+    let (code, message) = match serde_json::from_str::<Value>(body) {
+        Ok(v) if v["error"].is_string() => {
+            let code = v["error"].as_str().unwrap_or_default().to_string();
+            let message = format!(
+                "server answered {status}: {code}{}",
+                v["detail"]
+                    .as_str()
+                    .map(|d| format!(": {d}"))
+                    .unwrap_or_default()
+            );
+            (Some(code), message)
+        }
+        _ if body.trim().is_empty() => (None, format!("server answered {status}")),
+        _ => (None, format!("server answered {status}: {}", body.trim())),
+    };
+    anyhow::Error::new(ApiError {
+        status,
+        code,
+        message,
+    })
 }
 
 /// The JSON-RPC response in a plain JSON or `text/event-stream` body.
@@ -363,6 +390,24 @@ mod tests {
             api_error(StatusCode::BAD_GATEWAY, "oops").to_string(),
             "server answered 502 Bad Gateway: oops"
         );
+    }
+
+    #[test]
+    fn api_error_keeps_status_and_code_for_callers() {
+        let e = api_error(
+            StatusCode::CONFLICT,
+            r#"{"error":"already_refunded","detail":"once"}"#,
+        );
+        let api = e.downcast_ref::<ApiError>().unwrap();
+        assert_eq!(api.status, StatusCode::CONFLICT);
+        assert_eq!(api.code.as_deref(), Some("already_refunded"));
+        let e = api_error(StatusCode::NOT_FOUND, "");
+        let api = e.downcast_ref::<ApiError>().unwrap();
+        assert_eq!(
+            (api.status, api.code.as_deref()),
+            (StatusCode::NOT_FOUND, None)
+        );
+        assert_eq!(e.to_string(), "server answered 404 Not Found");
     }
 
     #[test]
