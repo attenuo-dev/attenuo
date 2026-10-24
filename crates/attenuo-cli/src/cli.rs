@@ -379,9 +379,25 @@ pub struct ToolsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum LeaseCmd {
-    /// Revoke a lease and every lease delegated from it.
+    /// Revoke a lease and every lease delegated from it. With `--user` or `--chain-id`
+    /// instead of an id, revoke every unrevoked lease of that originating user or delegation
+    /// chain, each with its descendants (`POST /admin/leases/revoke`), and list them.
+    #[command(group(clap::ArgGroup::new("selector").args(["user", "chain_id"]).multiple(false)))]
     Revoke {
-        id: String,
+        /// The lease to revoke.
+        #[arg(required_unless_present_any = ["user", "chain_id"], conflicts_with_all = ["user", "chain_id"])]
+        id: Option<String>,
+        /// Revoke every lease issued for this originating user (the `sub` of the chain's
+        /// originating user, under any issuer).
+        #[arg(long, conflicts_with = "chain_id", value_parser = NonEmptyStringValueParser::new())]
+        user: Option<String>,
+        /// Revoke one whole delegation chain: the `chain_id` of its audit records, which is the
+        /// lease of its first hop.
+        #[arg(long, value_parser = NonEmptyStringValueParser::new())]
+        chain_id: Option<String>,
+        /// With `--user` or `--chain-id`: list what would be revoked and change nothing.
+        #[arg(long, requires = "selector")]
+        preview: bool,
         /// Recorded with the revocation.
         #[arg(long)]
         reason: Option<String>,
@@ -1236,10 +1252,21 @@ mod tests {
     #[test]
     fn lease_and_policy_subcommands() {
         let cli = parse(&["lease", "revoke", "L1", "--reason", "demo"]).unwrap();
-        let Command::Lease(LeaseCmd::Revoke { id, reason }) = cli.command else {
+        let Command::Lease(LeaseCmd::Revoke {
+            id,
+            reason,
+            user,
+            chain_id,
+            preview,
+        }) = cli.command
+        else {
             panic!("not revoke")
         };
-        assert_eq!((id.as_str(), reason.as_deref()), ("L1", Some("demo")));
+        assert_eq!(
+            (id.as_deref(), reason.as_deref()),
+            (Some("L1"), Some("demo"))
+        );
+        assert_eq!((user, chain_id, preview), (None, None, false));
         assert!(parse(&["policy", "reload"]).is_ok());
         assert!(parse(&["audit", "verify"]).is_ok());
         assert!(parse(&["audit", "verify", "--file", "a.jsonl", "--jwks", "j.json"]).is_ok());
@@ -1396,6 +1423,39 @@ mod tests {
         );
         assert!(cps(&["--before", "0"]).is_err());
         assert!(cps(&["--limit", "0"]).is_err());
+    }
+
+    #[test]
+    fn lease_revoke_takes_exactly_one_target() {
+        let Command::Lease(LeaseCmd::Revoke {
+            id, user, preview, ..
+        }) = parse(&["lease", "revoke", "--user", "alice", "--preview"])
+            .unwrap()
+            .command
+        else {
+            panic!("not revoke")
+        };
+        assert_eq!((id, user.as_deref(), preview), (None, Some("alice"), true));
+        let Command::Lease(LeaseCmd::Revoke { chain_id, .. }) =
+            parse(&["lease", "revoke", "--chain-id", "L0", "--reason", "x"])
+                .unwrap()
+                .command
+        else {
+            panic!("not revoke")
+        };
+        assert_eq!(chain_id.as_deref(), Some("L0"));
+        for bad in [
+            &["lease", "revoke"][..],
+            &["lease", "revoke", "--preview"],
+            &["lease", "revoke", "L1", "--preview"],
+            &["lease", "revoke", "L1", "--user", "alice"],
+            &["lease", "revoke", "L1", "--chain-id", "L0"],
+            &["lease", "revoke", "--user", "alice", "--chain-id", "L0"],
+            &["lease", "revoke", "--user", ""],
+            &["lease", "revoke", "--session", "s1"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
