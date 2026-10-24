@@ -187,7 +187,7 @@ would revoke 1 lease(s) if revoked now
 
 ### `budget refund <ID> --reason TEXT`
 
-Give back to every run-limit counter what one allowed decision charged, once, for a call whose effect did not happen (`POST /admin/budgets/refund`). `ID` is the decision record's id: the `id=` that `audit tail` prints for the allowed call, or the AuthZEN `context.decision_id`. `--reason` is required and must not be blank; it is recorded in the `admin.budget.refund` audit record the server appends. The run usage the decision charged is given back too, but `refunded` counts only the token-limit counters, so a call that charged usage alone answers 0. `--json` prints the server's `{decision_id, refunded, reason, audit_id}`. Needs the admin token.
+Give back to every run-limit counter what one allowed decision charged, once, for a call whose effect did not happen (`POST /admin/budgets/refund`). `ID` is the decision record's id: the `id=` that `audit tail` prints for the allowed call, or the AuthZEN `context.decision_id`. `--reason` is required and must not be blank; it is recorded in the `admin.budget.refund` audit record the server appends. The run usage the decision charged is given back too, but `refunded` counts only the token-limit counters, so a call that charged usage alone answers 0. A `distinct` value counts as refunded only when no other unrefunded decision used it (SR-62): until then it stays counted, and a refund that frees nothing answers 0. `--json` prints the server's `{decision_id, refunded, reason, audit_id}`. Needs the admin token.
 
 ```console
 $ attenuo budget refund 9f35c2a1-... --reason "upstream timed out"

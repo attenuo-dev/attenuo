@@ -154,6 +154,9 @@ CREATE TABLE IF NOT EXISTS budget_charges (
     refunded_at TEXT    NULL
 );
 CREATE INDEX IF NOT EXISTS budget_charges_decision_idx ON budget_charges(decision_id);
+-- A refund looks up the other decisions that used a `distinct` value (SR-62).
+CREATE INDEX IF NOT EXISTS budget_charges_counter_idx
+    ON budget_charges(lease, cap, kind, arg, value);
 -- The key `calls_per` values are hashed under, generated once per store.
 CREATE TABLE IF NOT EXISTS budget_meta (
     key   TEXT PRIMARY KEY,
@@ -2488,17 +2491,20 @@ fn charge_in(
     })
 }
 
-/// [`LeaseStore::refund`] in one `IMMEDIATE` transaction.
+/// [`LeaseStore::refund`] in one `IMMEDIATE` transaction. The value rows of a `distinct` limit
+/// are freed only when no other unrefunded decision logged them (SR-62); every other counter
+/// gets back what the decision logged.
 fn refund_in(
     conn: &mut Connection,
     decision_id: &str,
     at: OffsetDateTime,
 ) -> Result<u64, AuditError> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let distinct = LimitKind::Distinct.as_str();
     let (rows, refunded, limits): (i64, i64, i64) = tx
         .prepare_cached(
             "SELECT COUNT(*), COUNT(refunded_at), \
-                    COUNT(*) FILTER (WHERE kind NOT IN (?2, ?3, ?4, ?5)) \
+                    COUNT(*) FILTER (WHERE kind NOT IN (?2, ?3, ?4, ?5, ?6)) \
              FROM budget_charges WHERE decision_id = ?1",
         )?
         .query_row(
@@ -2507,7 +2513,8 @@ fn refund_in(
                 USAGE_KINDS[0],
                 USAGE_KINDS[1],
                 USAGE_KINDS[2],
-                DISTINCT_VALUE_KIND
+                DISTINCT_VALUE_KIND,
+                distinct
             ],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
@@ -2517,23 +2524,60 @@ fn refund_in(
     if refunded > 0 {
         return Err(AuditError::ChargeRefunded(decision_id.to_owned()));
     }
+    // The values this decision used, and whether another unrefunded decision used each too.
+    let values: Vec<(String, i64, String, String, bool)> = tx
+        .prepare_cached(
+            "SELECT DISTINCT c.lease, c.cap, c.arg, c.value, EXISTS ( \
+                 SELECT 1 FROM budget_charges o WHERE o.lease = c.lease AND o.cap = c.cap \
+                   AND o.kind = c.kind AND o.arg = c.arg AND o.value = c.value \
+                   AND o.decision_id <> c.decision_id AND o.refunded_at IS NULL) \
+             FROM budget_charges c WHERE c.decision_id = ?1 AND c.kind = ?2",
+        )?
+        .query_map(params![decision_id, DISTINCT_VALUE_KIND], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    let mut freed: u64 = 0;
+    for (lease, cap, arg, value, shared) in values {
+        if shared {
+            continue;
+        }
+        let cleared = tx
+            .prepare_cached(
+                "UPDATE budget_counters SET used = 0 \
+                 WHERE lease = ?1 AND cap = ?2 AND kind = ?3 AND arg = ?4 AND value = ?5 \
+                   AND used > 0",
+            )?
+            .execute(params![lease, cap, DISTINCT_VALUE_KIND, arg, value])?;
+        if cleared > 0 {
+            tx.prepare_cached(
+                "UPDATE budget_counters SET used = MAX(0, used - 1) \
+                 WHERE lease = ?1 AND cap = ?2 AND kind = ?3 AND arg = ?4 AND value = ''",
+            )?
+            .execute(params![lease, cap, distinct, arg])?;
+            freed += 1;
+        }
+    }
+    // Every other counter: what the decision logged. A `distinct` limit's count moves with
+    // its values, above, not with the amounts logged for it.
     tx.prepare_cached(
         "UPDATE budget_counters SET used = MAX(0, used - ( \
              SELECT SUM(c.amount) FROM budget_charges c WHERE c.decision_id = ?1 \
                AND c.lease = budget_counters.lease AND c.cap = budget_counters.cap \
                AND c.kind = budget_counters.kind AND c.arg = budget_counters.arg \
                AND c.value = budget_counters.value)) \
-         WHERE EXISTS (SELECT 1 FROM budget_charges c WHERE c.decision_id = ?1 \
+         WHERE kind NOT IN (?2, ?3) \
+           AND EXISTS (SELECT 1 FROM budget_charges c WHERE c.decision_id = ?1 \
                AND c.lease = budget_counters.lease AND c.cap = budget_counters.cap \
                AND c.kind = budget_counters.kind AND c.arg = budget_counters.arg \
                AND c.value = budget_counters.value)",
     )?
-    .execute([decision_id])?;
+    .execute(params![decision_id, DISTINCT_VALUE_KIND, distinct])?;
     tx.prepare_cached("UPDATE budget_charges SET refunded_at = ?2 WHERE decision_id = ?1")?
         .execute(params![decision_id, fmt_time(at)?])?;
     tx.commit()?;
     // Token-limit counters only (see `LeaseStore::refund`).
-    Ok(limits as u64)
+    Ok(limits as u64 + freed)
 }
 
 fn to_i64(v: u64) -> Result<i64, AuditError> {

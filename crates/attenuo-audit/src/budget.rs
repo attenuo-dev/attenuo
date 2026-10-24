@@ -19,8 +19,11 @@
 //! A `distinct` limit keeps two kinds of row: one per value seen (kind `distinct_value`, the
 //! value's keyed hash, holding 1), and its count of values (kind `distinct`, empty value). A
 //! charge adds to the count only when the value's row is new, in the same transaction, so a
-//! repeat of a value already seen costs nothing. A refund removes the value rows the decision
-//! added, so a refunded value counts as new again.
+//! repeat of a value already seen costs nothing. Every decision that used a value logs a row
+//! for it, with amount 1 when it added the value and 0 when the value was already seen. A
+//! refund frees a value (removes its row and takes 1 off the count, so the value counts as new
+//! again) only when no other unrefunded decision logged it; otherwise the value stays counted
+//! for those decisions, and the last of them to be refunded frees it (SR-62).
 //!
 //! Run usage (design section 3.5) lives in the same table, under the run's chain id, with the
 //! kinds `usage_calls`, `usage_amount` and `usage_destination` and the tool as `arg`, and
@@ -218,8 +221,9 @@ pub(crate) struct Planned {
 /// of the same call, so a counter charged twice adds up). Returns the new value of every
 /// charged counter in order with the rows to write, or the first charge that would go over its
 /// `max`. A run-usage charge never goes over: it saturates at its `max`. A `distinct` charge
-/// whose value was already seen writes nothing; a new value adds its row and 1 to the limit's
-/// count, which must stay within `max`.
+/// whose value was already seen leaves the counters as they are and logs a zero-amount row
+/// for the value; a new value adds its row and 1 to the limit's count, which must stay within
+/// `max`.
 pub(crate) fn plan(
     keys: &[CounterKey],
     charges: &[Charge],
@@ -244,7 +248,18 @@ pub(crate) fn plan(
                 ..key.clone()
             };
             let count = current_of(&count_key, &pending)?;
-            if current_of(key, &pending)? > 0 {
+            let seen = current_of(key, &pending)?;
+            if seen > 0 {
+                // A zero-amount row in the charge log records that this decision used the
+                // value too, so a refund of the decision that added it keeps it (SR-62).
+                if !pending.iter().any(|(p, _)| p == key) {
+                    pending.push((key.clone(), seen));
+                    writes.push(Write {
+                        key: key.clone(),
+                        after: seen,
+                        amount: 0,
+                    });
+                }
                 after.push(count);
                 continue;
             }

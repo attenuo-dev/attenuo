@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Mutex;
 
 use attenuo_core::fingerprint::Fingerprint;
-use attenuo_core::{Charge, LeaseId};
+use attenuo_core::{Charge, LeaseId, LimitKind};
 use time::OffsetDateTime;
 
 use crate::approval::{rules, Approval, ApprovalState, Approver};
@@ -228,7 +228,9 @@ pub trait LeaseStore: Send + Sync {
 
     /// Return what `decision_id` charged to every counter it charged, at most once, in one
     /// transaction, run-usage counters included. Returns how many token-limit counters were
-    /// restored (run usage is not counted, so a decision that charged only usage returns 0). [`AuditError::UnknownCharge`]
+    /// restored (run usage is not counted, so a decision that charged only usage returns 0).
+    /// A `distinct` value is freed, and counted, only when no other unrefunded decision used
+    /// it (SR-62; see [`crate::budget`]). [`AuditError::UnknownCharge`]
     /// when the decision charged nothing, [`AuditError::ChargeRefunded`] when it was already
     /// refunded. Used by the pipeline when a charged decision's audit append fails, and by
     /// the operator refund (`POST /admin/budgets/refund`).
@@ -439,6 +441,9 @@ struct Budgets {
     key: Option<ValueKey>,
     counters: BTreeMap<CounterKey, u64>,
     log: BTreeMap<String, ChargeLog>,
+    /// For each `distinct` value row, how many unrefunded decisions logged it: a refund frees
+    /// the value only when it was the last (SR-62).
+    holders: BTreeMap<CounterKey, usize>,
 }
 
 impl Budgets {
@@ -916,6 +921,9 @@ impl LeaseStore for MemoryLeaseStore {
         };
         let mut log = ChargeLog::default();
         for w in planned.writes {
+            if w.key.kind == DISTINCT_VALUE_KIND {
+                *b.holders.entry(w.key.clone()).or_insert(0) += 1;
+            }
             b.counters.insert(w.key.clone(), w.after);
             log.charges.push(LoggedCharge {
                 counter: w.key,
@@ -951,7 +959,12 @@ impl LeaseStore for MemoryLeaseStore {
 
     fn refund(&self, decision_id: &str, _at: OffsetDateTime) -> Result<u64, AuditError> {
         let mut b = self.budgets.lock()?;
-        let Budgets { counters, log, .. } = &mut *b;
+        let Budgets {
+            counters,
+            log,
+            holders,
+            ..
+        } = &mut *b;
         // An entry left empty by a revocation that ended its run's usage charged nothing now.
         let entry = log
             .get_mut(decision_id)
@@ -960,18 +973,45 @@ impl LeaseStore for MemoryLeaseStore {
         if entry.refunded {
             return Err(AuditError::ChargeRefunded(decision_id.to_owned()));
         }
+        let distinct = LimitKind::Distinct.as_str();
+        let mut restored = 0u64;
         for c in &entry.charges {
-            if let Some(v) = counters.get_mut(&c.counter) {
+            let key = &c.counter;
+            if key.kind == DISTINCT_VALUE_KIND {
+                // Free the value only when no other unrefunded decision used it (SR-62); the
+                // limit's count moves with it.
+                let left = holders.get_mut(key).map_or(0, |n| {
+                    *n = n.saturating_sub(1);
+                    *n
+                });
+                if left == 0 {
+                    holders.remove(key);
+                    if counters.get(key).is_some_and(|v| *v > 0) {
+                        counters.insert(key.clone(), 0);
+                        let count_key = CounterKey {
+                            kind: distinct,
+                            value: String::new(),
+                            ..key.clone()
+                        };
+                        if let Some(v) = counters.get_mut(&count_key) {
+                            *v = v.saturating_sub(1);
+                        }
+                        restored += 1;
+                    }
+                }
+                continue;
+            }
+            if key.kind == distinct {
+                continue;
+            }
+            if let Some(v) = counters.get_mut(key) {
                 *v = v.saturating_sub(c.amount);
+            }
+            if !USAGE_KINDS.contains(&key.kind) {
+                restored += 1;
             }
         }
         entry.refunded = true;
-        Ok(entry
-            .charges
-            .iter()
-            .filter(|c| {
-                !USAGE_KINDS.contains(&c.counter.kind) && c.counter.kind != DISTINCT_VALUE_KIND
-            })
-            .count() as u64)
+        Ok(restored)
     }
 }

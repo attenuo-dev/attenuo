@@ -107,7 +107,8 @@ pub struct ToolAttrs {
     /// `context.usage.destination_seen`. A list value counts each element. The server keeps
     /// only keyed hashes of the values, per run. `"<input>#host"` counts the host of a URL
     /// input instead of the whole value ([`attenuo_core::Derive::Host`]), so two pages of one
-    /// site are one destination; values with no host all count as one destination.
+    /// site are one destination; a value with no host counts as itself, wrapped as
+    /// `{"raw": value}` so it collides with no host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<String>,
 }

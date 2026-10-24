@@ -616,10 +616,11 @@ pub fn charges_for(chain: &DelegationChain, call: &ToolCall) -> Result<Vec<Charg
 /// - when the catalog names a `destination` input and the call carries a non-null value, one
 ///   `calls_per` counter per distinct value (each element of a list), whose canonical JSON the
 ///   store keeps only as a keyed hash. A destination written `input#host` counts the host of
-///   each value ([`Derive::Host`]); values with no host all count as one destination, the
-///   JSON `null` (a host is never `null`, so it collides with none). A list of more than
-///   [`MAX_COUNTED_VALUES`] elements is one destination, the whole list. A `destination` that
-///   [`parse_arg_ref`] refuses counts nothing; the catalog refuses it at load.
+///   each value ([`Derive::Host`]); a value with no host counts as itself, wrapped as
+///   `{"raw": value}` (a host is a string, so it collides with none), so a new unparseable
+///   value is a new destination (SR-63). A list of more than [`MAX_COUNTED_VALUES`] elements
+///   is one destination, the whole list (wrapped the same way under `#host`). A `destination`
+///   that [`parse_arg_ref`] refuses counts nothing; the catalog refuses it at load.
 ///
 /// Each has `max` [`MAX_LIMIT`] and [`Charge::usage`] set. Ordered calls, amount, destinations.
 pub fn usage_charges(
@@ -654,11 +655,14 @@ pub fn usage_charges(
         let values = match derive {
             // More values than a call may count (SR-57): the list as a whole is one
             // destination, new unless the very same list was seen.
-            _ if v.as_array().is_some_and(|a| a.len() > MAX_COUNTED_VALUES) => {
+            None if v.as_array().is_some_and(|a| a.len() > MAX_COUNTED_VALUES) => {
                 vec![canonical(v)]
             }
+            Some(_) if v.as_array().is_some_and(|a| a.len() > MAX_COUNTED_VALUES) => {
+                vec![canonical(&raw(v))]
+            }
             None => destinations(v),
-            Some(d) => hosts_or_null(v, d),
+            Some(d) => hosts_or_raw(v, d),
         };
         for value in values {
             out.push(base(LimitKind::CallsPer, Some(value), 1));
@@ -689,12 +693,18 @@ fn derived_destinations(v: &Value, derive: Derive) -> Option<Vec<Vec<u8>>> {
     Some(out.into_iter().collect())
 }
 
+/// A value with no derived value, as run usage counts it: `{"raw": value}`, which no derived
+/// value (a JSON string) can equal (SR-63).
+fn raw(v: &Value) -> Value {
+    serde_json::json!({ "raw": v })
+}
+
 /// As [`derived_destinations`], for run usage: an element with no derived value counts as
-/// JSON `null` instead of refusing the call.
-fn hosts_or_null(v: &Value, derive: Derive) -> Vec<Vec<u8>> {
+/// itself, [`raw`], instead of refusing the call.
+fn hosts_or_raw(v: &Value, derive: Derive) -> Vec<Vec<u8>> {
     elements(v)
         .into_iter()
-        .map(|item| canonical(&derive.apply(item).map_or(Value::Null, Value::String)))
+        .map(|item| canonical(&derive.apply(item).map_or_else(|| raw(item), Value::String)))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -1166,7 +1176,10 @@ mod tests {
         );
         assert_eq!(charges_for(&chain, &call).unwrap_err().arg, "url#host");
         let usage = usage_charges(&LeaseId::new("run"), &call, None, Some("url#host"));
-        assert_eq!(usage[1].value.as_deref(), Some(&b"null"[..]));
+        assert_eq!(
+            usage[1].value.as_deref(),
+            Some(canonical(&json!({"raw": "https://a.example\\@b.example/?q=secret"})).as_slice())
+        );
     }
 
     /// SR-57: a list argument counts at most `MAX_COUNTED_VALUES` values per limit and call.
@@ -1230,6 +1243,38 @@ mod tests {
         assert!(ok.validate_limits().is_ok());
     }
 
+    /// SR-63: in run usage a value with no host counts as itself, wrapped as `{"raw": value}`
+    /// so it collides with no host: two different unparseable URLs are two destinations, the
+    /// same one twice is one.
+    #[test]
+    fn hostless_usage_values_are_destinations_of_their_own_sr63() {
+        let run = LeaseId::new("run");
+        let dest = |url: Value| {
+            let call = ToolCall::new("web", "get_webpage", json!({ "url": url }));
+            usage_charges(&run, &call, None, Some("url#host"))
+                .into_iter()
+                .skip(1)
+                .map(|c| c.value.unwrap())
+                .collect::<Vec<_>>()
+        };
+        let a = dest(json!("docs.example/page"));
+        let b = dest(json!("evil.example/?d=secret"));
+        assert_eq!(a.len(), 1);
+        assert_ne!(a, b, "two hostless values must be two destinations");
+        assert_eq!(a, dest(json!("docs.example/page")), "the same one is one");
+        assert_eq!(
+            dest(json!(["docs.example/page", "docs.example/page"])).len(),
+            1
+        );
+        assert_eq!(
+            dest(json!(["docs.example/page", "evil.example/?d=secret"])).len(),
+            2
+        );
+        assert_eq!(a[0], canonical(&json!({"raw": "docs.example/page"})));
+        // A hostless value never collides with a host, even one spelled like the raw value.
+        assert_ne!(dest(json!("a.example")), dest(json!("https://a.example/")));
+    }
+
     #[test]
     fn usage_destinations_may_be_hosts() {
         let chain_id = LeaseId::new("run-1");
@@ -1240,8 +1285,15 @@ mod tests {
         );
         let c = usage_charges(&chain_id, &call, None, Some("url#host"));
         let values: Vec<_> = c.iter().skip(1).map(|c| c.value.clone().unwrap()).collect();
-        // One host, and every value without one as `null`.
-        assert_eq!(values, vec![b"\"a.example\"".to_vec(), b"null".to_vec()]);
+        // One host, and every value without one as itself, wrapped (SR-63).
+        assert_eq!(
+            values,
+            vec![
+                b"\"a.example\"".to_vec(),
+                canonical(&json!({"raw": "not a url"})),
+                canonical(&json!({"raw": "x:y"})),
+            ]
+        );
         // A destination the catalog would refuse counts nothing.
         assert_eq!(
             usage_charges(&chain_id, &call, None, Some("url#path")).len(),

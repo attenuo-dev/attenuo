@@ -898,7 +898,23 @@ pub struct ApprovalsSection {
     /// approve its calls.
     #[serde(default)]
     pub client_id: Option<String>,
+    /// Start a server whose public listener is not loopback although a loaded policy asks for
+    /// approvals and `client_id` is unset (SR-64). Default `false`: such a server refuses to
+    /// start, because the root agent's own OAuth client could then obtain ID tokens that
+    /// approve its gated calls. Set it only where the agent cannot obtain ID tokens for the
+    /// user by itself.
+    #[serde(default)]
+    pub allow_unset_client_id: bool,
 }
+
+/// What the server logs when a loaded policy asks for approvals and `[approvals] client_id`
+/// is unset (SR-64), at startup and after a policy reload.
+pub const UNSET_APPROVAL_CLIENT_ID: &str = "a loaded policy carries @obligation(\"approval\") \
+     and [approvals] client_id is unset: POST /approvals/{id} accepts ID tokens whose audience \
+     is the root agent's own OAuth client, so an agent that can get ID tokens for its user \
+     (silent re-authentication, a refresh token with `openid`) can approve its own gated calls \
+     (SR-64). Set [approvals] client_id to a client the agent does not control, such as the \
+     approval page's own";
 
 /// Default of `[approvals] ttl_seconds`.
 pub const DEFAULT_APPROVAL_TTL_SECONDS: u64 = 120;
@@ -912,6 +928,7 @@ impl Default for ApprovalsSection {
         Self {
             ttl_seconds: DEFAULT_APPROVAL_TTL_SECONDS,
             client_id: None,
+            allow_unset_client_id: false,
         }
     }
 }
@@ -929,6 +946,26 @@ impl ApprovalsSection {
             anyhow::bail!("[approvals] client_id must not be empty when set");
         }
         Ok(())
+    }
+
+    /// The approval audience check at startup (SR-64). With a loaded policy that asks for
+    /// approvals (`asks`) and `client_id` unset, an ID token for the root agent's own OAuth
+    /// client approves its calls. Returns whether to log [`UNSET_APPROVAL_CLIENT_ID`]; an error
+    /// instead when the public listener `listen` is not loopback, unless
+    /// `allow_unset_client_id` is set. A policy reload only warns.
+    pub fn audience_check(&self, asks: bool, listen: std::net::SocketAddr) -> anyhow::Result<bool> {
+        if !asks || self.client_id.is_some() {
+            return Ok(false);
+        }
+        if !listen.ip().is_loopback() && !self.allow_unset_client_id {
+            anyhow::bail!(
+                "{UNSET_APPROVAL_CLIENT_ID}. [server] listen = {listen} is not a loopback \
+                 address, so the server refuses to start: set [approvals] client_id, or \
+                 [approvals] allow_unset_client_id = true if the agent cannot obtain ID tokens \
+                 for the user"
+            );
+        }
+        Ok(true)
     }
 
     /// `ttl_seconds` as a duration.

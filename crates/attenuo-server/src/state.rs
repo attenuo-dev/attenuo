@@ -105,6 +105,12 @@ impl AppState {
         let jwks = crate::jwks::jwks_from_keys(&issuer.trusted_public_keys())?;
 
         let (engine, policies_sha256) = build_engine(config)?;
+        if config
+            .approvals
+            .audience_check(engine.asks_for_approval(), config.server.listen)?
+        {
+            tracing::warn!("{}", crate::config::UNSET_APPROVAL_CLIENT_ID);
+        }
         let loaded_policies = RwLock::new(LoadedPolicies {
             sha256: policies_sha256,
             loaded_at: OffsetDateTime::now_utc(),
@@ -526,6 +532,71 @@ mod tests {
         let ids = state.pipeline.policy().read().unwrap().policy_ids();
         assert!(ids.contains(&"permit_readonly_tools".to_string()));
         assert_eq!(state.admin_token, None);
+    }
+
+    /// SR-64: a policy that asks for approvals with `[approvals] client_id` unset warns on a
+    /// loopback listener, refuses to start off loopback, and starts there with
+    /// `allow_unset_client_id`. Setting `client_id`, or loading no approval policy, is quiet.
+    #[test]
+    fn unset_approval_client_id_warns_or_refuses_sr64() {
+        let dir = tempfile::tempdir().unwrap();
+        let asks = dir.path().join("asks.cedar");
+        std::fs::write(
+            &asks,
+            "@id(\"ask_everything\")\n@obligation(\"approval\")\n\
+             forbid (principal, action, resource) unless { context.approval.present };\n\
+             @id(\"permit_all\")\npermit (principal, action, resource);\n",
+        )
+        .unwrap();
+        let plain = dir.path().join("plain.cedar");
+        std::fs::write(&plain, "permit (principal, action, resource);\n").unwrap();
+        let config = |listen: &str, policies: &Path, client_id: Option<&str>, allow: bool| {
+            let mut cfg = Config::default();
+            cfg.server.listen = listen.parse().unwrap();
+            cfg.server.public_url = Some("https://attenuo.example".into());
+            cfg.admin.token = Some("0123456789abcdef0123456789abcdef".into());
+            cfg.policy.policies_path = Some(policies.to_path_buf());
+            cfg.approvals.client_id = client_id.map(str::to_string);
+            cfg.approvals.allow_unset_client_id = allow;
+            cfg
+        };
+        let state = AppState::from_config(&config("127.0.0.1:8080", &asks, None, false)).unwrap();
+        assert!(state.pipeline.policy().read().unwrap().asks_for_approval());
+        // Loopback: starts, and the check says to warn.
+        let cfg = config("127.0.0.1:8080", &asks, None, false);
+        assert!(cfg
+            .approvals
+            .audience_check(true, cfg.server.listen)
+            .unwrap());
+        // Off loopback: refuses, naming the key.
+        let err = AppState::from_config(&config("0.0.0.0:8080", &asks, None, false))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("[approvals] client_id"), "{err}");
+        assert!(err.contains("allow_unset_client_id"), "{err}");
+        assert!(err.contains("SR-64"), "{err}");
+        // The override starts it, still with the warning.
+        let cfg = config("0.0.0.0:8080", &asks, None, true);
+        AppState::from_config(&cfg).unwrap();
+        assert!(cfg
+            .approvals
+            .audience_check(true, cfg.server.listen)
+            .unwrap());
+        // A client id, or no approval policy, needs neither.
+        let cfg = config("0.0.0.0:8080", &asks, Some("attenuo-approvals"), false);
+        AppState::from_config(&cfg).unwrap();
+        assert!(!cfg
+            .approvals
+            .audience_check(true, cfg.server.listen)
+            .unwrap());
+        let cfg = config("0.0.0.0:8080", &plain, None, false);
+        let state = AppState::from_config(&cfg).unwrap();
+        assert!(!state.pipeline.policy().read().unwrap().asks_for_approval());
+        assert!(!cfg
+            .approvals
+            .audience_check(false, cfg.server.listen)
+            .unwrap());
     }
 
     #[test]

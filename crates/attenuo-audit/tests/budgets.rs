@@ -465,11 +465,59 @@ fn distinct_counts_new_values_once_and_refunds_them() {
             vec![2],
             "{name}"
         );
-        // A decision whose values were all seen charged nothing to refund.
+        // A decision whose values were all seen logged them (SR-62), so it can be refunded,
+        // once; a.example is still d1's, so nothing is freed.
+        assert_eq!(store.refund("d6", t0()).unwrap(), 0, "{name}");
         assert!(
-            matches!(store.refund("d6", t0()), Err(AuditError::UnknownCharge(_))),
+            matches!(store.refund("d6", t0()), Err(AuditError::ChargeRefunded(_))),
             "{name}"
         );
+        assert!(
+            matches!(
+                store.refund("d-none", t0()),
+                Err(AuditError::UnknownCharge(_))
+            ),
+            "{name}"
+        );
+    }
+}
+
+/// SR-62: a refund frees a `distinct` value only when no other unrefunded decision used it.
+/// Two calls send to the same value; refunding the first leaves the value counted (the second
+/// reached it), refunding both frees it.
+#[test]
+fn a_distinct_refund_keeps_a_value_a_later_call_used_sr62() {
+    for (name, store) in stores() {
+        let count = |s: &dyn LeaseStore| s.budget_used(&[distinct_count("root", 1)]).unwrap()[0];
+        let x = || [distinct("root", "x.example", 1)];
+        let y = || [distinct("root", "y.example", 1)];
+        assert_eq!(charged(store.charge("a", &x(), t0()).unwrap()), vec![1]);
+        assert_eq!(charged(store.charge("b", &x(), t0()).unwrap()), vec![1]);
+        // A's effect did not happen, B's did: x stays counted, so y is still a second value.
+        assert_eq!(store.refund("a", t0()).unwrap(), 0, "{name}");
+        assert_eq!(count(store.as_ref()), 1, "{name}");
+        assert_eq!(
+            store.charge("c", &y(), t0()).unwrap(),
+            ChargeOutcome::Exhausted { index: 0, used: 1 },
+            "{name}: y must not fit while b's x counts"
+        );
+        // A repeat of x after A's refund still passes and is logged too.
+        assert_eq!(charged(store.charge("d", &x(), t0()).unwrap()), vec![1]);
+        assert_eq!(store.refund("b", t0()).unwrap(), 0, "{name}");
+        assert_eq!(count(store.as_ref()), 1, "{name}");
+        // The last decision that used x is refunded: x is freed and y fits.
+        assert_eq!(store.refund("d", t0()).unwrap(), 1, "{name}");
+        assert_eq!(count(store.as_ref()), 0, "{name}");
+        assert_eq!(
+            store.budget_used(&x()).unwrap(),
+            vec![0],
+            "{name}: x no longer counts"
+        );
+        assert!(
+            matches!(store.refund("d", t0()), Err(AuditError::ChargeRefunded(_))),
+            "{name}"
+        );
+        assert_eq!(charged(store.charge("e", &y(), t0()).unwrap()), vec![1]);
     }
 }
 

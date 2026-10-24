@@ -49,7 +49,7 @@ The built-in user attributes `mfa` (bool), `roles` (set of string), `tenant` and
 | `output` | `"untrusted"` (default) or `"trusted"`. A result of an untrusted tool taints the delegation run (`context.session.tainted`); a trusted tool's result is recorded but taints nothing. |
 | `inputs` | Table of argument name to type. Used to validate `context.input.*`. |
 | `amount` | Name of the input whose value run usage sums for this tool, as `context.usage.amount` ([run limits](../design/run-limits.md#35-policy)). Only destructive tools keep usage, and naming `amount` or `destination` on any tool makes the server keep it (see `track_usage`). A value that is not a non-negative integer adds 0. If `inputs` declares it, it must be `long`. |
-| `destination` | Name of the input that says where the call goes (payee, recipient), for `context.usage.destination_seen`. A list counts each element. Only keyed hashes of the values are stored, per run. `"<input>#host"` (for example `destination = "url#host"`) counts the host of a URL input instead of the whole value, so pages of one site are one destination; values with no host all count as one destination. A `#` followed by anything but `host` is refused at load. |
+| `destination` | Name of the input that says where the call goes (payee, recipient), for `context.usage.destination_seen`. A list counts each element. Only keyed hashes of the values are stored, per run. `"<input>#host"` (for example `destination = "url#host"`) counts the host of a URL input instead of the whole value, so pages of one site are one destination; a value with no host counts as itself (wrapped as `{"raw": value}`, so it never equals a host), so each different unparseable value is a new destination. A `#` followed by anything but `host` is refused at load. |
 
 Every action a policy names must be in the catalog: the table `[policy.catalog.github.read_file]` declares `Action::"github/read_file"`.
 
@@ -124,7 +124,8 @@ Approvals of calls a policy gates with `@obligation("approval")` (see [Writing p
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `ttl_seconds` | 120 | How long a pending or granted approval stays usable. It also ends with the calling hop's token or lease, whichever comes first. 1 to 86400. The default is the one in the output-labelling design, section 3.7. |
-| `client_id` | none | The `aud` an ID token must carry to decide at `POST /approvals/{id}`. Unset, it is the client id hop-0 intake expects for the run's root agent. Set it to a client the agent does not control, such as the approval page's own OAuth client, so that an ID token the agent can get for itself cannot approve its calls. |
+| `client_id` | none | The `aud` an ID token must carry to decide at `POST /approvals/{id}`. Unset, it is the client id hop-0 intake expects for the run's root agent. Set it to a client the agent does not control, such as the approval page's own OAuth client, so that an ID token the agent can get for itself cannot approve its calls. When a loaded policy carries `@obligation("approval")` and this is unset, the server logs a warning at startup and after every policy reload, and refuses to start when `[server] listen` is not a loopback address (SR-64), unless `allow_unset_client_id` is set. |
+| `allow_unset_client_id` | false | Start with `client_id` unset off loopback although a loaded policy asks for approvals. The default refuses, because an agent that can get ID tokens for its user (silent re-authentication, a refresh token with `openid`) could then approve its own gated calls, and the audit record would show `by: user`. Set it only where the agent cannot obtain ID tokens for the user by itself; the warning is still logged. |
 
 ## `[[actor_trust]]`
 
