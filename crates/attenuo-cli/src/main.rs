@@ -764,6 +764,9 @@ async fn inspect(client: Option<Client>, args: cli::InspectArgs, json: bool) -> 
         print!("{}", render::render_chain_tree(&c.chain, now));
         println!();
         println!("iss {}   aud {}   jti {}", c.iss, c.aud, c.jti);
+        if let Some(kids) = render::fmt_kids(decoded.header["kid"].as_str(), Some(&c.ou_kid)) {
+            println!("{kids}");
+        }
         if let Ok(exp) = OffsetDateTime::from_unix_timestamp(c.exp) {
             println!(
                 "exp {} ({})",

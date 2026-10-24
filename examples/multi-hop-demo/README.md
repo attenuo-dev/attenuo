@@ -125,6 +125,7 @@ user alice  (issuer https://idp.example)
         lease 254a57a7-504a-4e01-870f-06d66a034687
 
 iss http://127.0.0.1:53831   aud attenuo   jti 7aeb93d4-aea1-49d5-ab4d-e5868777549b
+kid TVMUVqtMRfIgwfaiuNOssA   ou_kid TVMUVqtMRfIgwfaiuNOssA
 exp 2026-10-24T20:46:39Z (in 9m 59s)
 may_act []: no agent may exchange this token
 verified: signature, type, issuer, audience, expiry, chain

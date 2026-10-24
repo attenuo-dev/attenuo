@@ -135,7 +135,7 @@ Decode a token and show its delegation chain as a tree. Use `-` to read the toke
 | `--issuer` | With `--verify`: expected issuer. Default: the token's own. |
 | `--audience` | With `--verify`: expected audience. Default: the token's own. |
 
-The text output has a `may_act` line saying who may exchange the token next: `may_act (absent): any authenticated agent may exchange this token`, `may_act []: no agent may exchange this token`, or `may_act coder, reviewer: only these agents may exchange this token` (agent ids with control characters escaped). With `--verify` it is read from the verified claims, which the signature covers. For a bound token the text output adds `bound to DPoP key jkt <thumbprint>`.
+The text output has a `may_act` line saying who may exchange the token next: `may_act (absent): any authenticated agent may exchange this token`, `may_act []: no agent may exchange this token`, or `may_act coder, reviewer: only these agents may exchange this token` (agent ids with control characters escaped). With `--verify` it is read from the verified claims, which the signature covers. For a bound token the text output adds `bound to DPoP key jkt <thumbprint>`. A key line follows `iss`/`aud`/`jti`: `kid <kid>` is the key that signed the token (the JWT header) and `ou_kid <kid>` the key that made the originating-user signature at the root; each is shown only when present. They differ for a token exchanged after a key rotation from a root minted before it. The `--json` output has both already, in `header.kid` and `claims.ou_kid`.
 
 ### `call`
 
