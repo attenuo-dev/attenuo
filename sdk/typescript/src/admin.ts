@@ -1,5 +1,6 @@
 /**
- * Operator API: revoke leases, read and verify the audit log, reload policy, mint dev roots.
+ * Operator API: revoke leases, read and verify the audit log, reload policy, decide approvals,
+ * mint dev roots.
  *
  * Every route needs the static admin bearer (`[admin] token` in the server config). Keep that
  * token out of agents: it can revoke anything and read every decision.
@@ -226,6 +227,16 @@ export interface PolicyEvaluateOptions {
   token?: Token | string;
   /** A chain object instead of a token, checked only structurally. */
   chain?: Json;
+}
+
+/** Filters for `approvals`. */
+export interface ApprovalQuery {
+  /** Only the approvals of this delegation run. */
+  chainId?: string;
+  /** Only approvals in this state: `pending`, `granted`, `declined` or `consumed`. */
+  state?: string;
+  /** At most this many (server default and maximum 500). */
+  limit?: number;
 }
 
 export interface MintRootOptions {
@@ -632,6 +643,51 @@ export class AdminClient {
       chainSource: String(b.chain_source ?? ""),
       tokenExpired: b.token_expired === true,
     };
+  }
+
+  /**
+   * The newest approvals, newest first, filtered by `query`. An unknown `state` is an `ApiError`
+   * (400).
+   */
+  async approvals(query: ApprovalQuery = {}): Promise<w.Approval[]> {
+    const q: Record<string, string | number> = {};
+    if (query.chainId) q.chain_id = query.chainId;
+    if (query.state) q.state = query.state;
+    if (query.limit !== undefined) q.limit = query.limit;
+    const res = await this.http.get("/admin/approvals", { query: q });
+    const b = w.asObject(await w.jsonBody(res), "approvals");
+    return Array.isArray(b.approvals) ? b.approvals.map(w.approvalFromJson) : [];
+  }
+
+  /**
+   * One approval: the exact call, the run's labels, state, approver and expiry. `ApiError` (404)
+   * when it is unknown.
+   */
+  async approval(approvalId: string): Promise<w.Approval> {
+    const res = await this.http.get(`/admin/approvals/${encodeURIComponent(approvalId)}`);
+    return w.approvalFromJson(await w.jsonBody(res));
+  }
+
+  /**
+   * Grant a pending approval as the operator (`by = "operator"`); returns it. The grant is good
+   * for one retry of the identical call by the same hop. `ApiError` 409
+   * (`approval_not_pending`, `approval_expired`, `lease_revoked`) when it cannot be decided any
+   * more, 404 when it is unknown.
+   */
+  async grantApproval(approvalId: string): Promise<w.Approval> {
+    return this.decideApproval(approvalId, "grant");
+  }
+
+  /** Decline a pending approval as the operator; returns it. Errors as `grantApproval`. */
+  async declineApproval(approvalId: string): Promise<w.Approval> {
+    return this.decideApproval(approvalId, "decline");
+  }
+
+  private async decideApproval(approvalId: string, decision: string): Promise<w.Approval> {
+    const res = await this.http.post(`/admin/approvals/${encodeURIComponent(approvalId)}`, {
+      json: { decision },
+    });
+    return w.approvalFromJson(await w.jsonBody(res));
   }
 
   /** **Development only.** Mint a root token for an asserted, unverified user. */

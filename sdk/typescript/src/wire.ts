@@ -66,7 +66,8 @@ export interface Tool {
 }
 
 /**
- * An approval as `GET /approvals/{id}` shows it. `state` is `pending`, `granted`, `declined` or
+ * An approval as `GET /approvals/{id}` and the `/admin/approvals` routes show it. Fields not
+ * named here (`labels`, `decision_id`, `created_at`, ...) are in `raw`. `state` is `pending`, `granted`, `declined` or
  * `consumed`; `expired` is the server's view of whether `expiresAt` has passed. `usable` is true
  * for a grant that a retry of the identical call can still use.
  */

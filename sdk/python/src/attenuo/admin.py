@@ -1,4 +1,5 @@
-"""Operator API: revoke leases, read and verify the audit log, reload policy, mint dev roots.
+"""Operator API: revoke leases, read and verify the audit log, reload policy, decide
+approvals, mint dev roots.
 
 Every route needs the static admin bearer (``[admin] token`` in the server config). Keep that
 token out of agents: it can revoke anything and read every decision.
@@ -485,6 +486,26 @@ def _policy_evaluation(b: Any) -> PolicyEvaluation:
     )
 
 
+def _approval_params(chain_id: str | None, state: str | None, limit: int | None) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    if chain_id:
+        params["chain_id"] = chain_id
+    if state:
+        params["state"] = state
+    if limit is not None:
+        params["limit"] = limit
+    return params
+
+
+def _approvals(b: Any) -> list[w.Approval]:
+    items = b.get("approvals") if isinstance(b, dict) else None
+    return [w.approval_from_json(a) for a in items or []]
+
+
+def _approval_path(approval_id: str) -> str:
+    return f"/admin/approvals/{w.path_segment(approval_id, 'approval_id')}"
+
+
 class AdminClient:
     """Operator client. ``mint_root_dev`` needs ``[dev] allow_root_mint = true`` on the server."""
 
@@ -701,6 +722,40 @@ class AdminClient:
             w.json_body(self._http.post("/admin/policies/evaluate", json=body))
         )
 
+    def approvals(
+        self,
+        chain_id: str | None = None,
+        *,
+        state: str | None = None,
+        limit: int | None = None,
+    ) -> list[w.Approval]:
+        """The newest approvals, newest first: of one delegation run with ``chain_id``, in one
+        ``state`` (``pending``, ``granted``, ``declined``, ``consumed``), at most ``limit``
+        (server default and maximum 500). An unknown state is an ``ApiError`` (400)."""
+        params = _approval_params(chain_id, state, limit)
+        return _approvals(w.json_body(self._http.get("/admin/approvals", params=params)))
+
+    def approval(self, approval_id: str) -> w.Approval:
+        """One approval: the exact call, the run's labels, state, approver and expiry.
+        ``ApiError`` (404) when it is unknown."""
+        return w.approval_from_json(w.json_body(self._http.get(_approval_path(approval_id))))
+
+    def grant_approval(self, approval_id: str) -> w.Approval:
+        """Grant a pending approval as the operator (``by = "operator"``); returns it. The
+        grant is good for one retry of the identical call by the same hop. ``ApiError`` 409
+        (``approval_not_pending``, ``approval_expired``, ``lease_revoked``) when it cannot be
+        decided any more, 404 when it is unknown."""
+        return self._decide(approval_id, "grant")
+
+    def decline_approval(self, approval_id: str) -> w.Approval:
+        """Decline a pending approval as the operator; returns it. Errors as
+        :meth:`grant_approval`."""
+        return self._decide(approval_id, "decline")
+
+    def _decide(self, approval_id: str, decision: str) -> w.Approval:
+        path = _approval_path(approval_id)
+        return w.approval_from_json(w.json_body(self._http.post(path, json={"decision": decision})))
+
     def mint_root_dev(
         self,
         subject: str,
@@ -912,6 +967,31 @@ class AsyncAdminClient:
         body = _evaluate_body(server, tool, arguments, token, chain)
         return _policy_evaluation(
             w.json_body(await self._http.post("/admin/policies/evaluate", json=body))
+        )
+
+    async def approvals(
+        self,
+        chain_id: str | None = None,
+        *,
+        state: str | None = None,
+        limit: int | None = None,
+    ) -> list[w.Approval]:
+        params = _approval_params(chain_id, state, limit)
+        return _approvals(w.json_body(await self._http.get("/admin/approvals", params=params)))
+
+    async def approval(self, approval_id: str) -> w.Approval:
+        return w.approval_from_json(w.json_body(await self._http.get(_approval_path(approval_id))))
+
+    async def grant_approval(self, approval_id: str) -> w.Approval:
+        return await self._decide(approval_id, "grant")
+
+    async def decline_approval(self, approval_id: str) -> w.Approval:
+        return await self._decide(approval_id, "decline")
+
+    async def _decide(self, approval_id: str, decision: str) -> w.Approval:
+        path = _approval_path(approval_id)
+        return w.approval_from_json(
+            w.json_body(await self._http.post(path, json={"decision": decision}))
         )
 
     async def mint_root_dev(

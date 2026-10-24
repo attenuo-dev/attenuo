@@ -121,7 +121,9 @@ class AuthzenDecision:
 
 @dataclass(frozen=True)
 class Approval:
-    """An approval as ``GET /approvals/{id}`` shows it.
+    """An approval as ``GET /approvals/{id}`` and the ``/admin/approvals`` routes show it.
+    Fields the dataclass does not name (``labels``, ``decision_id``, ``created_at``, ...) are
+    in ``raw``.
 
     ``state`` is ``pending``, ``granted``, ``declined`` or ``consumed``; ``expired`` is the
     server's view of whether ``expires_at`` has passed. ``usable`` is true for a grant that a
