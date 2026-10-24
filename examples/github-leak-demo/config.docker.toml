@@ -33,6 +33,13 @@ inputs = { repo = "string" }
 [audit]
 sqlite_path = ":memory:"
 
+# create_issue asks for an approval (policy.cedar). Only an ID token with this audience may
+# approve at POST /approvals/{id}; nothing in the demo issues one, so approvals here come from
+# the operator (`attenuo approval grant`, AdminClient.grant_approval). Unset, the server warns,
+# and off loopback refuses to start (SR-64).
+[approvals]
+client_id = "demo-approval-page"
+
 [[upstreams]]
 name = "github"
 url = "http://fake-mcp:3001/mcp"
@@ -54,7 +61,7 @@ capabilities = ["github:*"]
 id = "coder"
 secret_sha256 = "f0f962bada9d92c8a30f5c55a388ce47d1074ddff4bfdb099ef67ad43003baeb"
 
-# A third agent, used by the Python SDK's integration test (examples/python-agent too).
+# A third agent, used by the Python SDK's integration test.
 # secret_sha256 = printf %s demo-tester-secret | sha256sum
 [[agents]]
 id = "tester"

@@ -103,7 +103,7 @@ export ATTENUO_ADMIN_TOKEN="demo-admin-token"
 # --- the scenario --------------------------------------------------------------------------
 say "Setup"
 note "attenuo at $ATTENUO_SERVER proxies a fake GitHub MCP server at port $MCP_PORT as 'github'."
-note "Policy: read_file only when repo like \"alice/public-*\". See policy.cedar."
+note "Policy: read_file only when repo like \"alice/public-*\"; create_issue there only after an approval. See policy.cedar."
 note "The policy has its own tests (policy_test.yaml). They run offline, before any server traffic."
 step 0 'attenuo policy test examples/github-leak-demo/policy_test.yaml'
 

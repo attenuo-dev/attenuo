@@ -310,7 +310,7 @@ await client.connect(transport);
 console.log((await client.listTools()).tools.map((t) => t.name)); // only what the token may call
 ```
 
-A denied call surfaces as an `McpError` carrying JSON-RPC code `-32003`; `error.data` holds `{ reason, decision_id }`. Complete examples are in [`examples/typescript-agent`](https://github.com/attenuo-dev/attenuo/tree/main/examples/typescript-agent): `agent.ts` (planner delegates to coder) and `mcp_client_example.ts` (the official client through the proxy; tested with `@modelcontextprotocol/sdk` 1.32.1).
+A denied call surfaces as an `McpError` carrying JSON-RPC code `-32003`; `error.data` holds `{ reason, decision_id }`. Complete examples are in [`examples/typescript-agent`](https://github.com/attenuo-dev/attenuo/tree/main/examples/typescript-agent): `agent.ts` (planner delegates to coder, with a run limit and an approval) and `mcp_client_example.ts` (the official client through the proxy; tested with `@modelcontextprotocol/sdk` 1.32.1).
 
 `requestInit.headers` is fixed when the transport is built. If your token changes (re-exchange before `exp`), or it is bound to a key (each request then needs a fresh DPoP proof), pass `mcpFetch` as the transport's `fetch` instead: it sets `Authorization` (and `DPoP`) per request.
 

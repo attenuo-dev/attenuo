@@ -106,6 +106,6 @@ if [ "$MODE" = --dry-run ]; then
   echo "What reached the fake GitHub server:"
   grep 'tools/call' "$WORK/fake-mcp.log" | sed 's/^/  /'
   CALLS="$(grep -c 'tools/call' "$WORK/fake-mcp.log" || true)"
-  [ "$CALLS" = 1 ] || { echo "!! expected exactly 1 upstream tools/call, saw $CALLS" >&2; exit 1; }
-  echo "  -> 1 tools/call reached upstream; nothing denied ever left attenuo."
+  [ "$CALLS" = 2 ] || { echo "!! expected exactly 2 upstream tools/calls, saw $CALLS" >&2; exit 1; }
+  echo "  -> 2 tools/calls reached upstream (the read and the approved issue); nothing denied ever left attenuo."
 fi

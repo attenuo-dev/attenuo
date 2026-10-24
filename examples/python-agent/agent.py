@@ -11,12 +11,20 @@ What happens:
 
 1. The planner holds a broad root token for `github:*` (dev mint; in production it comes from
    your IdP, see `Client.exchange(..., client_id=..., client_secret=...)`).
-2. The planner decides the coder needs only `read_file`, and only in repositories under
-   `alice/public-`. It exchanges its token for a narrower one and hands that to the coder.
+2. The planner decides the coder needs only `read_file`, only in repositories under
+   `alice/public-`, and only in one of them (a `distinct` run limit on `repo`). It exchanges
+   its token for a narrower one and hands that to the coder.
 3. The coder does its job through the proxy. A prompt-injected instruction makes it try a private
    repo and then `create_issue`; both are denied, and the coder treats the denial as a plain
    "not available" instead of retrying.
-4. The planner revokes its own lease (here through the admin API). The coder's next call is
+4. Run limit: the coder reads from a second public repository. The token and the policy both
+   allow the repo, but the run limit allows one, so the call is denied with `budget_exhausted`.
+5. Approval: the planner opens an issue with its own broad token. The demo policy holds every
+   `create_issue` until a person approves it, so the proxy answers JSON-RPC `-32008`.
+   `call_tool_with_approval` reports the approval id, waits for the grant (here an operator
+   grants it with `AdminClient.grant_approval`, which is what `attenuo approval grant` does) and
+   retries the identical call once, which is allowed.
+6. The planner revokes its own lease (here through the admin API). The coder's next call is
    denied with `lease_revoked`, and the coder stops.
 
 Everything the agents do is recorded in the audit log, whose chain is verified at the end.
@@ -29,6 +37,7 @@ import sys
 
 from attenuo import (
     AdminClient,
+    ApprovalRequired,
     Capability,
     Client,
     Denied,
@@ -81,11 +90,16 @@ def run(server: str = SERVER, admin_token: str = ADMIN_TOKEN) -> int:
         print("[planner] gets a root token for alice (dev mint)")
         root = admin.mint_root_dev("alice", "https://idp.example", PLANNER_AGENT, ["github:*"])
 
-        print("[planner] delegates read_file on alice/public-* to the coder")
+        print("[planner] delegates read_file on alice/public-* to the coder, one repo per run")
         coder_token = ob.exchange(
             root,
             "coder",
-            [Capability("github", "read_file", repo=Prefix("alice/public-"))],
+            [
+                # A run limit (ADR-0010): at most one distinct value of `repo` over the run.
+                Capability("github", "read_file", repo=Prefix("alice/public-")).with_limits(
+                    distinct=("repo", 1)
+                )
+            ],
             ttl_seconds=600,
             client_secret=CODER_SECRET,
         )
@@ -103,6 +117,27 @@ def run(server: str = SERVER, admin_token: str = ADMIN_TOKEN) -> int:
         assert coder.read_file("alice/private-salaries", "2025.csv") is None
         assert not coder.create_issue("alice/public-docs", "salaries: ...")
 
+        print("[coder] reads from a second public repo: the run limit allows one repo")
+        assert coder.read_file("alice/public-site", "index.html") is None
+
+        print("[planner] opens an issue itself: the policy asks a person first")
+
+        def approve(err: ApprovalRequired) -> None:
+            print(f"  {err.reason} (-32008), approval {err.approval_id}")
+            # Alice would approve with her own sign-in; here the operator does it.
+            granted = admin.grant_approval(str(err.approval_id))
+            print(f"  [operator] approval {granted.approval_id}: {granted.state}")
+
+        issue = ob.call_tool_with_approval(
+            root,
+            "github",
+            "create_issue",
+            {"repo": "alice/public-docs", "title": "README: fix typo"},
+            on_approval=approve,
+            interval=0.2,
+        )
+        print(f"  retried once with the grant: allowed (decision {issue.decision_id})")
+
         lease = ob.renew(coder_token)
         print(f"[coder] renewed its lease, good for {lease.expires_in}s")
 
@@ -119,7 +154,7 @@ def run(server: str = SERVER, admin_token: str = ADMIN_TOKEN) -> int:
 
     report = admin.audit_verify()
     print(f"[audit] chain ok={report.ok}, {report.entries} entries")
-    for e in admin.audit_tail(5):
+    for e in admin.audit_tail(8):
         print(f"  #{e.seq} {e.decision:<5} {e.server}/{e.tool}  reason={e.reason}")
     admin.close()
     return 0 if report.ok else 1

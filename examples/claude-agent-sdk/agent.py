@@ -15,6 +15,11 @@ Two modes, the same tool calls:
   carries an inline MCP server whose bearer is the narrowed token. The orchestrator itself has
   no MCP server at all.
 
+In both modes the coder's token carries a run limit (one distinct ``repo`` per run), and after
+the coder's turn the orchestrator's own code files a report issue with its root token. The demo
+policy asks a person to approve every ``create_issue`` (JSON-RPC ``-32008``); here the operator
+grants it through the admin API and the SDK retries the identical call once.
+
 Run it with ``examples/claude-agent-sdk/run.sh`` (which starts the servers and sets the
 environment), or by hand against a server started from ``examples/github-leak-demo/config.toml``.
 
@@ -31,7 +36,7 @@ import os
 from collections.abc import Callable
 from typing import Any
 
-from attenuo import AdminClient, Capability, Client, Prefix, Token
+from attenuo import AdminClient, ApprovalRequired, Capability, Client, Prefix, Token
 from attenuo.mcp import mcp_headers, mcp_url
 
 SERVER = os.environ.get("ATTENUO_SERVER", "http://127.0.0.1:8080")
@@ -54,11 +59,16 @@ ISSUE = (
 
 
 def delegate_to_coder(ob: Client, root: Token | str) -> Token:
-    """Hop 1: trade the orchestrator's root token for one that only reads alice/public-* repos."""
+    """Hop 1: trade the orchestrator's root token for one that only reads alice/public-* repos,
+    and at most one of them per run (a ``distinct`` run limit on ``repo``, ADR-0010)."""
     return ob.exchange(
         root,
         "coder",
-        [Capability(UPSTREAM, "read_file", repo=Prefix("alice/public-"))],
+        [
+            Capability(UPSTREAM, "read_file", repo=Prefix("alice/public-")).with_limits(
+                distinct=("repo", 1)
+            )
+        ],
         ttl_seconds=600,
         client_secret=CODER_SECRET,
     )
@@ -165,7 +175,27 @@ def _denial(exc: BaseException, decisions: ProxyDecisions) -> tuple[str, str] | 
     return str(data.get("reason", "?")), decision
 
 
-async def run_dry(token: Token, revoke: Callable[[], None]) -> bool:
+def file_report(ob: Client, admin: AdminClient, root: Token | str) -> bool:
+    """The orchestrator's own code (not the model) opens an issue with its root token. The demo
+    policy holds every ``create_issue`` for an approval; the operator grants it here, as
+    ``attenuo approval grant <id>`` would, and the SDK retries the identical call once."""
+
+    def approve(err: ApprovalRequired) -> None:
+        print(f"  APPROVAL REQUIRED create_issue  reason={err.reason} approval={err.approval_id}")
+        granted = admin.grant_approval(str(err.approval_id))
+        print(f"  [operator] grants approval {granted.approval_id}: {granted.state}")
+
+    args = {"repo": "alice/public-docs", "title": "coder report: README typo"}
+    result = ob.call_tool_with_approval(
+        root, UPSTREAM, "create_issue", args, on_approval=approve, interval=0.2
+    )
+    print(f"  ALLOWED create_issue {args}  decision={result.decision_id}")
+    return result.decision_id is not None
+
+
+async def run_dry(
+    token: Token, revoke: Callable[[], None], report: Callable[[], bool] = lambda: True
+) -> bool:
     """Play the coder's calls with the MCP config that live mode gives the SDK."""
     from mcp import ClientSession
     from mcp.client import streamable_http
@@ -215,6 +245,13 @@ async def run_dry(token: Token, revoke: Callable[[], None]) -> bool:
         issue = {"repo": "alice/public-docs", "title": "salaries"}
         checks.append(await call(session, "create_issue", issue) == "capability_denied")
 
+        print("[coder] reads from a second public repo: the run limit allows one repo")
+        site = {"repo": "alice/public-site", "path": "index.html"}
+        checks.append(await call(session, "read_file", site) == "budget_exhausted")
+
+        print("[orchestrator] files a report issue itself: the policy asks a person first")
+        checks.append(report())
+
         print("[orchestrator] the session looks compromised: revoking its lease")
         revoke()
 
@@ -240,26 +277,32 @@ def main(argv: list[str] | None = None) -> int:
         root_jwt, root_lease = root.jwt, root.lease
     lease = root_lease
 
-    with Client(SERVER) as ob:
-        print("[orchestrator] holds a root token for alice: github:*")
-        token = delegate_to_coder(ob, root_jwt)
-        print("[orchestrator] delegates read_file on alice/public-* to the coder")
-        print(f"  chain: {' > '.join(token.chain.agents)}  lease: {token.lease}")
+    ob = Client(SERVER)
+    print("[orchestrator] holds a root token for alice: github:*")
+    token = delegate_to_coder(ob, root_jwt)
+    print("[orchestrator] delegates read_file on alice/public-* to the coder, one repo per run")
+    print(f"  chain: {' > '.join(token.chain.agents)}  lease: {token.lease}")
 
     def revoke() -> None:
         r = admin.revoke_lease(lease, "agent session compromised")
         print(f"  {r.revoked} leases revoked (the orchestrator's and the coder's)")
 
+    def report() -> bool:
+        return file_report(ob, admin, root_jwt)
+
     ok = True
     if live:
         asyncio.run(run_live(token))
+        print("[orchestrator] files a report issue itself: the policy asks a person first")
+        ok = report()
         revoke()
     else:
-        ok = asyncio.run(run_dry(token, revoke))
+        ok = asyncio.run(run_dry(token, revoke, report))
+    ob.close()
 
     report = admin.audit_verify()
     print(f"[audit] chain ok={report.ok}, {report.entries} entries")
-    for e in admin.audit_tail(8):
+    for e in admin.audit_tail(10):
         print(f"  #{e.seq} {e.decision:<5} {e.server}/{e.tool}  reason={e.reason}")
     admin.close()
     good = ok and report.ok
