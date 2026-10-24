@@ -16,6 +16,13 @@
 //! 3. **Approval.** A granted, unexpired approval for this call (same run, same calling hop's
 //!    lease, same call hash) is taken from the lease store and marked consumed
 //!    (`LeaseStore::take_approval`); Cedar then sees `context.approval.present` and `by`.
+//!    When the call presents a signed approval token ([`CallContext::approval_token`]), that
+//!    token decides instead: its signature, `typ` and `exp` must verify under the issuer key,
+//!    its `chain_id`, `lease`, `ch` and `cnf.jkt` must be the call's run, the calling hop's
+//!    lease, the call hash and the hop's key binding, and the approval it names (`jti`) is
+//!    taken by id (`LeaseStore::take_approval_by_id`). A token that fails any of this, or
+//!    names an approval that is consumed, declined, expired or bound to a dead lease, denies
+//!    the call with `approval_invalid` before the policy runs.
 //! 4. **Policy.** `PolicyEngine::authorize_labelled`: the capability stage (including the
 //!    limit check: a call that would take any matching counter past its `max` is denied with
 //!    `budget_exhausted`, before Cedar), then Cedar, with the run's labels as
@@ -55,13 +62,14 @@ use attenuo_core::limits::{
 use attenuo_core::{
     chain_id_of, ApprovalInfo, BudgetCharge, Charge, Decision, DecisionRecord, DelegationChain,
     LeaseId, LimitKind, OutputLabel, RecordBudget, RecordKind, RecordLabels, ResultInfo, ToolCall,
-    REASON_APPROVAL_REQUESTED,
+    REASON_APPROVAL_INVALID, REASON_APPROVAL_REQUESTED,
 };
 use attenuo_policy::{
     ApprovalContext, BudgetContext, BudgetRefusal, CallLabels, PolicyEngine, SessionLabels,
 };
 use attenuo_proxy::{
-    ApprovalTicket, AuthDecision, AuthError, Authenticated, Authorizer, RequestAuth, Stage,
+    ApprovalTicket, AuthDecision, AuthError, Authenticated, Authorizer, CallContext, RequestAuth,
+    Stage,
 };
 use attenuo_token::Verifier;
 use serde_json::Value;
@@ -200,6 +208,8 @@ pub struct PipelineDecision {
     pub approval: Option<ApprovalTicket>,
     /// For an allowed call that consumed an approval: its id and `by` (`user` or `operator`).
     pub consumed_approval: Option<(Uuid, String)>,
+    /// The consumed approval was presented as a signed approval token.
+    pub approval_by_token: bool,
     /// The run limits that matched the call, as Cedar saw them (ADR-0010). The default when
     /// none matched or the call was decided before the budget was read.
     pub budget: BudgetContext,
@@ -223,6 +233,9 @@ pub struct Pipeline {
     metrics: Arc<Metrics>,
     /// `[approvals] ttl_seconds`.
     approval_ttl: time::Duration,
+    /// Checks presented approval tokens: the issuer's public keys, `iss` and `aud`. `None`
+    /// refuses every presented token (`approval_invalid`).
+    approval_verifier: Option<Verifier>,
 }
 
 impl Pipeline {
@@ -239,7 +252,15 @@ impl Pipeline {
             approval_ttl: time::Duration::seconds(
                 crate::config::DEFAULT_APPROVAL_TTL_SECONDS as i64,
             ),
+            approval_verifier: None,
         }
+    }
+
+    /// Accept signed approval tokens that verify under `verifier` (the issuer's own verifier:
+    /// its public keys, `iss` and `aud`). Without this every presented token is refused.
+    pub fn with_approval_verifier(mut self, verifier: Verifier) -> Self {
+        self.approval_verifier = Some(verifier);
+        self
     }
 
     /// How long a pending approval stays usable (`[approvals] ttl_seconds`, default 120 s).
@@ -271,8 +292,22 @@ impl Pipeline {
         call: &ToolCall,
         now: OffsetDateTime,
     ) -> PipelineDecision {
+        self.decide_with(chain, call, &CallContext::default(), now)
+    }
+
+    /// [`decide`](Self::decide) with what the caller knows besides the chain: a presented
+    /// approval token and the calling hop's key binding (`cnf.jkt`, when the request proved
+    /// possession). The key binding is also stored with a pending approval, so the approval
+    /// token a grant returns is bound to the same key.
+    pub fn decide_with(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        ctx: &CallContext,
+        now: OffsetDateTime,
+    ) -> PipelineDecision {
         let started = Instant::now();
-        let out = self.decide_inner(chain, call, now);
+        let out = self.decide_inner(chain, call, ctx, now);
         self.metrics.observe_authorize(started.elapsed());
         self.metrics
             .decision(if out.is_allow() { "allow" } else { "deny" }, &out.reason);
@@ -308,6 +343,7 @@ impl Pipeline {
         &self,
         chain: &DelegationChain,
         call: &ToolCall,
+        ctx: &CallContext,
         now: OffsetDateTime,
     ) -> PipelineDecision {
         // Stage timings: one `Instant::now()` per boundary (see `Stage`).
@@ -327,24 +363,46 @@ impl Pipeline {
                 let run = self.run_labels(chain);
                 budget = self.budget_view(chain, call);
                 let mut diagnostics = Vec::new();
-                // Leases are live, so a granted approval for this exact call may be used.
-                taken = self.take_approval(chain, call, decision_id, now, &mut diagnostics);
-                let labels = CallLabels {
-                    session: run.session,
-                    approval: taken
-                        .as_ref()
-                        .and_then(|a| a.approver.as_ref())
-                        .map(|a| ApprovalContext::by(a.method.by()))
-                        .unwrap_or_default(),
-                    budget: budget.context.clone(),
-                };
-                let o = self.evaluate_policy(chain, call, &labels, now);
-                policy_time = Some(t1.elapsed());
                 record_labels = run.record;
                 label_sources = run.sources;
-                diagnostics.extend(o.diagnostics);
-                diagnostics.extend(run.error);
-                (o.decision, o.reason, o.policy_ids, diagnostics)
+                // Leases are live, so a granted approval for this exact call may be used: the
+                // one a presented token names, or else the one the identical retry finds.
+                let took = match ctx.approval_token.as_deref() {
+                    Some(token) => self
+                        .take_presented(chain, call, token, ctx.jkt.as_deref(), decision_id, now)
+                        .map(Some),
+                    None => Ok(self.take_approval(chain, call, decision_id, now, &mut diagnostics)),
+                };
+                match took {
+                    Err(detail) => {
+                        tracing::info!(detail = ?detail, "approval token refused");
+                        diagnostics.push(detail);
+                        diagnostics.extend(run.error);
+                        (
+                            Decision::Deny,
+                            REASON_APPROVAL_INVALID.to_string(),
+                            Vec::new(),
+                            diagnostics,
+                        )
+                    }
+                    Ok(t) => {
+                        taken = t;
+                        let labels = CallLabels {
+                            session: run.session,
+                            approval: taken
+                                .as_ref()
+                                .and_then(|a| a.approver.as_ref())
+                                .map(|a| ApprovalContext::by(a.method.by()))
+                                .unwrap_or_default(),
+                            budget: budget.context.clone(),
+                        };
+                        let o = self.evaluate_policy(chain, call, &labels, now);
+                        policy_time = Some(t1.elapsed());
+                        diagnostics.extend(o.diagnostics);
+                        diagnostics.extend(run.error);
+                        (o.decision, o.reason, o.policy_ids, diagnostics)
+                    }
+                }
             }
         };
         let mut limit = (reason == REASON_BUDGET_EXHAUSTED)
@@ -413,9 +471,11 @@ impl Pipeline {
             DecisionRecord::new(now, decision, reason, chain, call, policy_ids.clone())
                 .with_labels(record_labels.clone());
         record.id = decision_id;
+        let approval_by_token = consumed_approval.is_some() && ctx.approval_token.is_some();
         if let Some((id, by)) = &consumed_approval {
             let mut info = ApprovalInfo::new(*id);
             info.by = Some(by.clone());
+            info.presented = approval_by_token.then(|| "token".to_string());
             record.approval = Some(info);
         }
         record.budget = charged.clone();
@@ -456,6 +516,7 @@ impl Pipeline {
                         self.request_approval(
                             chain,
                             call,
+                            ctx.jkt.as_deref(),
                             decision_id,
                             &policy_ids,
                             &record_labels,
@@ -474,6 +535,7 @@ impl Pipeline {
                     diagnostics,
                     approval,
                     consumed_approval,
+                    approval_by_token,
                     budget: budget.context,
                     limit,
                     charged,
@@ -498,6 +560,7 @@ impl Pipeline {
                     diagnostics,
                     approval: None,
                     consumed_approval: None,
+                    approval_by_token: false,
                     budget: budget.context,
                     limit: None,
                     charged: None,
@@ -530,6 +593,61 @@ impl Pipeline {
                 tracing::error!(error = %e, "approval store unreadable; deciding without approval");
                 diagnostics.push(format!("approval store unreadable: {e}"));
                 None
+            }
+        }
+    }
+
+    /// Take the approval a presented approval token names, after checking the token (see the
+    /// module docs, step 3). `Err` is the reason it was refused, for the diagnostics; the
+    /// decision is then `approval_invalid`. A store error refuses too (fail closed).
+    fn take_presented(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        token: &str,
+        jkt: Option<&str>,
+        decision_id: Uuid,
+        now: OffsetDateTime,
+    ) -> Result<Approval, String> {
+        let verifier = self
+            .approval_verifier
+            .as_ref()
+            .ok_or("approval tokens are not accepted here (no issuer key to check them with)")?;
+        let claims = verifier
+            .verify_approval(token, now)
+            .map_err(|e| format!("approval token refused: {e}"))?;
+        let (Some(chain_id), Some(hop)) = (chain_id_of(chain), chain.hops.last()) else {
+            return Err("chain has no hops".into());
+        };
+        let call_hash = call.call_hash();
+        claims
+            .check_binding(&chain_id, &hop.lease.0, &call_hash, jkt)
+            .map_err(|e| e.to_string())?;
+        let chain_id = LeaseId::new(chain_id);
+        match self.leases.take_approval_by_id(
+            &claims.jti,
+            &chain_id,
+            &hop.lease,
+            &call_hash,
+            &decision_id.to_string(),
+            now,
+        ) {
+            Ok(Some(a)) => Ok(a),
+            Ok(None) => {
+                let state = match self.leases.approval(&claims.jti) {
+                    Ok(Some(a)) if a.is_expired(now) => "expired".to_string(),
+                    Ok(Some(a)) => a.state.as_str().to_string(),
+                    Ok(None) => "unknown".to_string(),
+                    Err(_) => "unreadable".to_string(),
+                };
+                Err(format!(
+                    "approval `{}` cannot be used (state: {state}; or its lease is not live)",
+                    claims.jti
+                ))
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "approval store unreadable; refusing the approval token");
+                Err(format!("approval store unreadable: {e}"))
             }
         }
     }
@@ -635,6 +753,7 @@ impl Pipeline {
         &self,
         chain: &DelegationChain,
         call: &ToolCall,
+        jkt: Option<&str>,
         decision_id: Uuid,
         policy_ids: &[String],
         record_labels: &RecordLabels,
@@ -662,6 +781,7 @@ impl Pipeline {
             approver: None,
             decided_at: None,
             consumed_by: None,
+            jkt: jkt.map(str::to_owned),
         };
         let (stored, created) = match self.leases.create_approval(&wanted) {
             Ok(v) => v,
@@ -1062,9 +1182,14 @@ impl Authorizer for ServerAuthorizer {
             None if v.claims.cnf.is_some() => return Err(AuthError::DpopRequired),
             None => false,
         };
+        // The key an approval for this hop is bound to: only when the request proved it.
+        let jkt = dpop_bound
+            .then(|| v.claims.cnf.as_ref().map(|c| c.jkt.clone()))
+            .flatten();
         Ok(Authenticated {
             chain: v.chain,
             dpop_bound,
+            jkt,
         })
     }
 
@@ -1088,11 +1213,22 @@ impl Authorizer for ServerAuthorizer {
         call: &ToolCall,
         now: OffsetDateTime,
     ) -> AuthDecision {
-        let (chain, call) = (chain.clone(), call.clone());
+        self.authorize_with(chain, call, &CallContext::default(), now)
+            .await
+    }
+
+    async fn authorize_with(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        ctx: &CallContext,
+        now: OffsetDateTime,
+    ) -> AuthDecision {
+        let (chain, call, ctx) = (chain.clone(), call.clone(), ctx.clone());
         let started = Instant::now();
         let (d, decide_time) = on_blocking_pool(&self.pipeline, move |p| {
             let t = Instant::now();
-            let d = p.decide(&chain, &call, now);
+            let d = p.decide_with(&chain, &call, &ctx, now);
             (d, t.elapsed())
         })
         .await;
