@@ -167,7 +167,7 @@ All admin routes need `Authorization: Bearer <admin token>`. They answer 401 wit
 | Method and path | Purpose |
 | --- | --- |
 | `GET /admin/leases/{lease_id}` | Lease state. |
-| `POST /admin/leases/{lease_id}/revoke` | Revoke the lease and all descendants. |
+| `POST /admin/leases/{lease_id}/revoke` | Revoke the lease and all descendants. Body `{"reason": "..."}` (optional). Answers `{lease_id, revoked, reason, audit_id}`: `revoked` counts the leases that changed, `audit_id` is the `admin.lease.revoke` record (null when it could not be written; the revocation stands). The SDKs return it: Python `revoke_lease(...).audit_id`, TypeScript `(await revokeLease(...)).auditId`. |
 | `POST /admin/leases/revoke?preview` | Revoke every lease of one originating user, one delegation chain or the chain that opened one MCP session, each with its descendants, in one transaction; `preview=true` is a dry run. See [Revoke by user or chain](#revoke-by-user-or-chain) and [Revoke by session](#revoke-by-session). |
 | `GET /admin/leases/{lease_id}/tree?max_nodes` | The lease, its descendants and its ancestors, and how many leases a revoke would change now. Read-only; see [Lease tree](#lease-tree). 404 for an unknown lease. |
 | `GET /admin/audit` | Audit entries in ascending `seq` order, paged with `from` and `limit` (default 100, at most 1000). Also returns `next` (when the page was full) and `head`, the newest `seq`. Filters and newest-first paging are below. |
@@ -405,6 +405,8 @@ The counters are then checked by the same code a live call goes through, before 
   "usage": {"calls": 0, "amount": 0, "destination_seen": false, "source": "store"}
 }
 ```
+
+The SDKs send the block from Python `policy_evaluate(..., budget=StatedBudget(...))` and TypeScript `policyEvaluate(..., { budget })` and type the answer below; the console's dry-run form has a "Budget" section for it.
 
 `budget` is `context.budget`: as the run's counters stand now (`source: "store"`; the dry run reads them and never charges), or as the request's `budget` block states them (`source: "request"`). When the call would exceed a limit, the answer is `budget_exhausted` and adds `limit: {hop, kind, arg, max, used}`.
 

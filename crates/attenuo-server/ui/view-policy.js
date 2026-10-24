@@ -1,5 +1,5 @@
 // Policy page (#/policy): the policy set in force, a lint of the file on disk, reload after a
-// clean check, and a dry-run "evaluate this call" form.
+// clean check, and a dry-run "evaluate this call" form with an optional stated budget.
 'use strict';
 
 import {
@@ -128,6 +128,7 @@ function evaluatePanel() {
   const serverIn = h('input', { id: 'ev-server', required: true, placeholder: 'github', autocomplete: 'off' });
   const toolIn = h('input', { id: 'ev-tool', required: true, placeholder: 'read_file', autocomplete: 'off' });
   const argsIn = h('textarea', { id: 'ev-args', rows: 3, spellcheck: 'false', placeholder: '{"repo": "alice/public-docs"}' });
+  const budget = budgetFields(field);
   const out = h('div', { class: 'stack' });
 
   const form = h('form', {
@@ -138,6 +139,8 @@ function evaluatePanel() {
         let body;
         try {
           body = buildRequest(tokenIn.value.trim(), chainIn.value.trim(), serverIn.value.trim(), toolIn.value.trim(), argsIn.value.trim());
+          const stated = budget.read();
+          if (stated) body.budget = stated;
         } catch (e) {
           replace(out, h('p', { class: 'callout bad' }, e.message));
           return;
@@ -158,6 +161,7 @@ function evaluatePanel() {
   field('ev-server', 'Server', serverIn),
   field('ev-tool', 'Tool', toolIn),
   field('ev-args', 'Arguments (JSON object)', argsIn, true),
+  budget.node,
   h('div', { class: 'wide row' },
     h('button', { type: 'submit', class: 'primary' }, 'Evaluate'),
     h('span', { class: 'small muted' }, 'A dry run: no lease check, no audit record, no metrics. The token is sent to this server only.')));
@@ -204,6 +208,100 @@ function buildRequest(token, chainText, server, tool, argsText) {
   return req;
 }
 
+// The optional `budget` block: the run-limit counters to decide the call in instead of the
+// store's. Left empty, nothing is sent and the dry run reads the store.
+function budgetFields(field) {
+  // Text inputs, not type=number: a number input hides what it cannot parse, and its native
+  // validation would block the submit without saying which field is wrong.
+  const num = (id, placeholder) => h('input', { id, inputmode: 'numeric', autocomplete: 'off', spellcheck: 'false', placeholder });
+  const flag = (id, unset) => h('select', { id },
+    h('option', { value: '' }, unset),
+    h('option', { value: 'true' }, 'true'),
+    h('option', { value: 'false' }, 'false'));
+  const callsIn = num('ev-budget-calls', 'not stated');
+  const amountIn = num('ev-budget-amount', 'not stated');
+  const destIn = flag('ev-budget-dest', 'not stated (new)');
+  const limitedIn = flag('ev-budget-limited', 'not stated (true)');
+  const limitsIn = h('textarea', {
+    id: 'ev-budget-limits', rows: 3, spellcheck: 'false',
+    placeholder: '[{"hop": 1, "kind": "distinct", "arg": "repo", "used": 1}]  (a refusal\'s limit can be pasted back)',
+  });
+  const node = h('details', { class: 'wide budget-form' },
+    h('summary', null, 'Budget (optional): state the run-limit counters instead of reading the store'),
+    h('div', { class: 'eval-form' },
+      field('ev-budget-calls', 'Calls remaining', callsIn),
+      field('ev-budget-amount', 'Amount remaining', amountIn),
+      field('ev-budget-dest', 'Destination new', destIn),
+      field('ev-budget-limited', 'Limited (no matching limit)', limitedIn),
+      field('ev-budget-limits', 'Single counters (JSON list of {hop, kind, arg, used, max})', limitsIn, true),
+      h('p', { class: 'wide small muted' }, 'Leave every field empty to read the run\'s counters from the store. A stated budget is checked by the same code a live call goes through and never touches the store.')));
+
+  const figure = (input, name) => {
+    const v = input.value.trim();
+    if (!v) return undefined;
+    if (!/^\d+$/.test(v)) throw new Error(`${name} must be a whole number of 0 or more.`);
+    return Number(v);
+  };
+
+  /** The block to send, or null when nothing is stated. Throws on input the form can tell is wrong. */
+  function read() {
+    const b = {};
+    const calls = figure(callsIn, 'Calls remaining');
+    const amount = figure(amountIn, 'Amount remaining');
+    if (calls !== undefined) b.calls_remaining = calls;
+    if (amount !== undefined) b.amount_remaining = amount;
+    if (destIn.value) b.destination_new = destIn.value === 'true';
+    if (limitedIn.value) b.limited = limitedIn.value === 'true';
+    const text = limitsIn.value.trim();
+    if (text) {
+      let limits;
+      try {
+        limits = JSON.parse(text);
+      } catch (e) {
+        throw new Error(`The single counters are not valid JSON: ${e.message}`);
+      }
+      // One pasted `limit` object is taken as a list of one.
+      if (limits !== null && typeof limits === 'object' && !Array.isArray(limits)) limits = [limits];
+      if (!Array.isArray(limits)) throw new Error('The single counters must be a JSON list of objects.');
+      b.limits = limits;
+    }
+    return Object.keys(b).length ? b : null;
+  }
+
+  return { node, read };
+}
+
+const I64_MAX = 9223372036854775807;
+
+/** A remaining figure; the server's 2^63 - 1 means no limit of that kind matches. */
+function remainingText(v) {
+  return typeof v === 'number' && v >= I64_MAX ? h('span', { class: 'muted' }, 'no limit') : mono(String(v));
+}
+
+/** The answer's `budget` (context.budget) and, on budget_exhausted, the `limit` it hit. */
+function budgetResult(b, limit) {
+  if (!b) return null;
+  const rows = limit ? [h('tr', null,
+    h('td', { class: 'num' }, mono(limit.hop)),
+    h('td', null, mono(limit.kind)),
+    h('td', null, limit.arg ? mono(limit.arg) : '—'),
+    h('td', { class: 'num' }, mono(limit.used)),
+    h('td', { class: 'num' }, mono(limit.max ?? '—')))] : [];
+  return h('section', { class: 'stack budget-result' },
+    h('h3', null, 'Budget ', pill(b.source === 'request' ? 'stated in the request' : 'read from the store', b.source === 'request' ? 'warn' : '')),
+    kv([
+      ['Limited', b.limited ? 'yes' : 'no (no limit of the chain matches the call)'],
+      ['Calls remaining', remainingText(b.calls_remaining)],
+      ['Amount remaining', remainingText(b.amount_remaining)],
+      ['Destination new', b.destination_new ? 'yes' : 'no'],
+    ]),
+    rows.length
+      ? h('div', null,
+        h('p', { class: 'small' }, 'The call would take this limit past its maximum:'),
+        table(['Hop', 'Kind', 'Argument', 'Used', 'Max'], rows, { short: true }))
+      : h('p', { class: 'small muted' }, 'No limit would be exceeded.'));
+}
+
 function evalResult(r) {
   return h('div', { class: 'stack' },
     h('div', { class: 'verdict' },
@@ -217,6 +315,7 @@ function evalResult(r) {
       ['Chain source', h('span', null, mono(r.chain_source), r.chain_source === 'admin_supplied' ? ' (not checked to be issued by this server)' : '')],
       ['Token expired', r.token_expired ? 'yes' : 'no'],
     ]),
+    budgetResult(r.budget, r.limit),
     r.diagnostics && r.diagnostics.length
       ? h('div', null, h('h3', null, 'Diagnostics'), jsonTree(r.diagnostics, true))
       : h('p', { class: 'small muted' }, 'No diagnostics.'));

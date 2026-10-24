@@ -16,8 +16,14 @@ from attenuo import (
     AttenuoError,
     AuditEntry,
     AuditFilter,
+    BudgetLimit,
     Capability,
+    EvaluationBudget,
+    EvaluationLabels,
+    EvaluationUsage,
     Prefix,
+    RevokeResult,
+    StatedBudget,
     Unauthorized,
 )
 
@@ -59,8 +65,23 @@ async def test_revoke_lease(make: Any) -> None:
     assert seen[-1].headers["authorization"] == "Bearer adm"
     assert json.loads(seen[-1].content) == {"reason": "demo"}
     assert (res.lease_id, res.revoked, res.reason) == ("L1", 2, "demo")
+    assert res.audit_id is None  # an answer without the member
     await call(client, "revoke_lease", "L1")
     assert json.loads(seen[-1].content) == {}
+
+
+async def test_revoke_lease_returns_the_audit_id(make: Any) -> None:
+    answers = iter(
+        [
+            {"lease_id": "L1", "revoked": 1, "reason": "r", "audit_id": "a-1"},
+            {"lease_id": "L1", "revoked": 0, "reason": "r", "audit_id": None},
+        ]
+    )
+    client, _ = make(lambda r: httpx.Response(200, json=next(answers)))
+    res = await call(client, "revoke_lease", "L1", "r")
+    assert res == RevokeResult("L1", 1, "r", "a-1")
+    # The record could not be written: the revocation stands, the id is None.
+    assert (await call(client, "revoke_lease", "L1", "r")).audit_id is None
 
 
 async def test_lease_status(make: Any) -> None:
@@ -579,6 +600,89 @@ async def test_policy_evaluate(make: Any) -> None:
     assert "token" not in sent and sent["subject"]["properties"] == {"chain": {"hops": []}}
     with pytest.raises(ValueError):
         await call(client, "policy_evaluate", "github", "read_file")
+    # An answer without the newer members leaves them None, and no `budget` is sent.
+    assert "budget" not in json.loads(seen[0].content)
+    assert (ev.budget, ev.limit, ev.labels, ev.usage, ev.approval_by) == (None,) * 5
+
+
+_EXHAUSTED: dict[str, Any] = {
+    "decision": "deny", "reason": "budget_exhausted", "policy_ids": [],
+    "diagnostics": ["limit `distinct` on `repo` of hop 1 would be exceeded: max 1, used 1"],
+    "lease_check": "skipped", "chain_source": "token", "token_expired": False,
+    "session": {"tainted": True, "tainted_by": ["github/read_file"],
+                "args_contain_untrusted": False, "untrusted_args": [], "source": "store"},
+    "approval": {"present": False, "by": ""},
+    "budget": {"limited": True, "calls_remaining": 9223372036854775807,
+               "amount_remaining": 9223372036854775807, "destination_new": True,
+               "source": "request"},
+    "usage": {"calls": 0, "amount": 0, "destination_seen": False, "source": "request"},
+    "limit": {"hop": 1, "kind": "distinct", "arg": "repo", "max": 1, "used": 1},
+}  # fmt: skip
+
+
+async def test_policy_evaluate_with_a_stated_budget(make: Any) -> None:
+    client, seen = make(lambda r: httpx.Response(200, json=_EXHAUSTED))
+    stated = StatedBudget(
+        calls_remaining=0,
+        destination_new=False,
+        limits=[BudgetLimit(hop=1, kind="distinct", arg="repo", used=1, max=1)],
+    )
+    ev = await call(
+        client, "policy_evaluate", "github", "read_file", {"repo": "b"}, token="t", budget=stated
+    )
+    sent = json.loads(seen[-1].content)
+    # Members left None are not sent; the entry has the server's spelling.
+    assert sent["budget"] == {
+        "calls_remaining": 0,
+        "destination_new": False,
+        "limits": [{"hop": 1, "kind": "distinct", "arg": "repo", "used": 1, "max": 1}],
+    }
+    assert not ev.allowed and ev.reason == "budget_exhausted"
+    assert ev.budget == EvaluationBudget(True, 2**63 - 1, 2**63 - 1, True, "request")
+    assert ev.limit == BudgetLimit(hop=1, kind="distinct", arg="repo", used=1, max=1)
+    assert ev.labels == EvaluationLabels(True, ["github/read_file"], False, [], "store")
+    assert ev.usage == EvaluationUsage(0, 0, False, "request")
+    assert ev.approval_by is None
+
+    # A refusal's `limit` can be stated back as it came, as a raw dict.
+    raw = {"limits": [_EXHAUSTED["limit"]]}
+    await call(client, "policy_evaluate", "github", "read_file", token="t", budget=raw)
+    assert json.loads(seen[-1].content)["budget"] == raw
+    # An empty block is sent as `{}`; a `calls` entry carries no `arg`.
+    await call(client, "policy_evaluate", "github", "read_file", token="t", budget=StatedBudget())
+    assert json.loads(seen[-1].content)["budget"] == {}
+    assert BudgetLimit(hop=0, kind="calls", used=3).to_json() == {
+        "hop": 0,
+        "kind": "calls",
+        "used": 3,
+    }
+
+
+async def test_policy_evaluate_reads_an_approval_and_a_hit_without_arg(make: Any) -> None:
+    answer = dict(
+        _EXHAUSTED,
+        approval={"present": True, "by": "operator"},
+        limit={"hop": 0, "kind": "calls", "max": 2, "used": 2},
+    )
+    client, _ = make(lambda r: httpx.Response(200, json=answer))
+    ev = await call(client, "policy_evaluate", "github", "read_file", token="t")
+    assert ev.approval_by == "operator"
+    assert ev.limit == BudgetLimit(hop=0, kind="calls", used=2, arg=None, max=2)
+
+
+async def test_policy_evaluate_passes_a_budget_refusal_on(make: Any) -> None:
+    # The server checks the block; a malformed one is its 400, raised as ApiError.
+    client, _ = make(lambda r: httpx.Response(400, json={"error": "invalid_request"}))
+    with pytest.raises(ApiError) as e:
+        await call(
+            client,
+            "policy_evaluate",
+            "github",
+            "read_file",
+            token="t",
+            budget=StatedBudget(calls_remaining=-1),
+        )
+    assert (e.value.status, e.value.error) == (400, "invalid_request")
 
 
 def _approval_body(state: str = "pending", **extra: Any) -> dict[str, Any]:
