@@ -216,14 +216,27 @@ fn limits_json(u: &mut Unstructured<'_>) -> Result<Value> {
 }
 
 fn constraint(u: &mut Unstructured<'_>) -> Result<ArgConstraint> {
-    Ok(match u.int_in_range(0u8..=2)? {
+    Ok(match u.int_in_range(0u8..=3)? {
         0 => ArgConstraint::Equals(arg_value(u)?),
         1 => ArgConstraint::OneOf(
             (0..u.int_in_range(0usize..=3)?)
                 .map(|_| arg_value(u))
                 .collect::<Result<_>>()?,
         ),
-        _ => ArgConstraint::Prefix(edge_string(u)?),
+        2 => ArgConstraint::Prefix(edge_string(u)?),
+        _ => {
+            let mut bound = || -> Result<Option<i64>> {
+                Ok(if u.arbitrary()? {
+                    Some(u.int_in_range(-2i64..=40)?)
+                } else {
+                    None
+                })
+            };
+            ArgConstraint::Range {
+                min: bound()?,
+                max: bound()?,
+            }
+        }
     })
 }
 

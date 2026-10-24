@@ -38,9 +38,20 @@ fn small_string() -> impl Strategy<Value = String> {
 
 fn small_value() -> impl Strategy<Value = Value> {
     prop_oneof![
-        small_string().prop_map(Value::String),
-        (0i64..3).prop_map(|n| json!(n)),
+        3 => small_string().prop_map(Value::String),
+        3 => (-1i64..4).prop_map(|n| json!(n)),
+        // Whole floats are the integer they spell; fractions are no integer at all.
+        1 => prop::sample::select(&[1.0f64, 2.0, 0.5, 2.5][..]).prop_map(|f| json!(f)),
     ]
+}
+
+/// A checked `range` with small bounds, either side possibly missing, so nested, equal and
+/// single-integer ranges are common.
+fn range() -> impl Strategy<Value = ArgConstraint> {
+    (prop::option::of(-1i64..4), prop::option::of(-1i64..4))
+        .prop_filter_map("a range needs a bound and min <= max", |(min, max)| {
+            ArgConstraint::range(min, max).ok()
+        })
 }
 
 fn arg_constraint() -> impl Strategy<Value = ArgConstraint> {
@@ -48,6 +59,7 @@ fn arg_constraint() -> impl Strategy<Value = ArgConstraint> {
         small_value().prop_map(ArgConstraint::Equals),
         prop::collection::vec(small_value(), 0..4).prop_map(ArgConstraint::OneOf),
         "[ab]{0,2}".prop_map(ArgConstraint::Prefix),
+        range(),
     ]
 }
 
@@ -239,9 +251,13 @@ fn value_pool() -> impl Strategy<Value = Vec<Value>> {
         for s in ["", "a", "b", "aa", "ab", "ba", "bb", "abb", "aab", "abab"] {
             pool.push(json!(s));
         }
-        for n in 0..3 {
+        for n in -2..6 {
             pool.push(json!(n));
         }
+        for f in [1.0, 2.0, 0.5, 2.5] {
+            pool.push(json!(f));
+        }
+        pool.push(json!("1"));
         pool.push(Value::Null);
         pool.push(json!(true));
         pool
@@ -355,6 +371,60 @@ proptest! {
         for w in chain.hops.windows(3) {
             prop_assert!(w[0].capabilities.covers(&w[2].capabilities));
         }
+    }
+
+    /// Ranges: tightening a bound narrows (the result implies the original and the original
+    /// covers a capability carrying it); loosening a bound widens (refused), and a value just
+    /// past the original bound is the witness.
+    #[test]
+    fn range_tightening_narrows_and_loosening_widens(
+        r in range(),
+        by in 1i64..3,
+        side in any::<bool>(),
+    ) {
+        let ArgConstraint::Range { min, max } = r.clone() else { unreachable!() };
+        let parent = Capability::new("bank", "send").with_constraint("amount", r.clone());
+        // Tighten one side: raise min or lower max, if the range stays non-empty.
+        let tighter = if side {
+            ArgConstraint::range(Some(min.unwrap_or(-10) + by), max)
+        } else {
+            ArgConstraint::range(min, Some(max.unwrap_or(10) - by))
+        };
+        if let Ok(t) = tighter {
+            prop_assert!(t.implies(&r), "{t:?} should imply {r:?}");
+            let child = Capability::new("bank", "send").with_constraint("amount", t);
+            prop_assert!(parent.covers(&child));
+        }
+        // Loosen one side that has a bound: the value just past it is admitted by the child,
+        // refused by the parent, and the child is not covered.
+        let (looser, witness) = match (side, min, max) {
+            (true, Some(lo), _) | (false, Some(lo), None) => {
+                (ArgConstraint::range(Some(lo - by), max).unwrap(), lo - 1)
+            }
+            (_, _, Some(hi)) => (ArgConstraint::range(min, Some(hi + by)).unwrap(), hi + 1),
+            (_, None, None) => unreachable!("a checked range has a bound"),
+        };
+        prop_assert!(!looser.implies(&r), "{looser:?} must not imply {r:?}");
+        prop_assert!(looser.satisfied_by(&json!(witness)) && !r.satisfied_by(&json!(witness)));
+        let child = Capability::new("bank", "send").with_constraint("amount", looser);
+        let set = CapabilitySet::from_iter([parent]);
+        prop_assert!(matches!(
+            set.attenuate(&CapabilitySet::from_iter([child])),
+            Err(AttenuationError::NotCovered { .. })
+        ), "a loosened range must be refused");
+    }
+
+    /// Range implication is exact, not only sound: `a` implies `b` exactly when every integer
+    /// `a` admits is admitted by `b`.
+    #[test]
+    fn range_implication_matches_integer_containment(a in range(), b in range()) {
+        let in_a = |n: i64| a.satisfied_by(&json!(n));
+        let in_b = |n: i64| b.satisfied_by(&json!(n));
+        // Bounds are in -1..4, so the window -3..=6 shows every difference between finite
+        // bounds; a missing bound reaches the end of i64, which the two extremes check.
+        let window_subset = (-3i64..=6).all(|n| !in_a(n) || in_b(n));
+        let ends_subset = [i64::MIN, i64::MAX].iter().all(|&n| !in_a(n) || in_b(n));
+        prop_assert_eq!(a.implies(&b), window_subset && ends_subset, "{:?} vs {:?}", a, b);
     }
 
     /// 4. Attenuation never widens along a chain built by `extend`.
