@@ -166,7 +166,7 @@ All admin routes need `Authorization: Bearer <admin token>`. They answer 401 wit
 | --- | --- |
 | `GET /admin/leases/{lease_id}` | Lease state. |
 | `POST /admin/leases/{lease_id}/revoke` | Revoke the lease and all descendants. |
-| `POST /admin/leases/revoke?preview` | Revoke every lease of one originating user or one delegation chain, each with its descendants, in one transaction; `preview=true` is a dry run. See [Revoke by user or chain](#revoke-by-user-or-chain). |
+| `POST /admin/leases/revoke?preview` | Revoke every lease of one originating user, one delegation chain or the chain that opened one MCP session, each with its descendants, in one transaction; `preview=true` is a dry run. See [Revoke by user or chain](#revoke-by-user-or-chain) and [Revoke by session](#revoke-by-session). |
 | `GET /admin/leases/{lease_id}/tree?max_nodes` | The lease, its descendants and its ancestors, and how many leases a revoke would change now. Read-only; see [Lease tree](#lease-tree). 404 for an unknown lease. |
 | `GET /admin/audit` | Audit entries in ascending `seq` order, paged with `from` and `limit` (default 100, at most 1000). Also returns `next` (when the page was full) and `head`, the newest `seq`. Filters and newest-first paging are below. |
 | `GET /admin/audit/entries/{seq}` | One entry with its context, `{entry, lease_states, covered_by_checkpoint, policy_reloaded_after}` (below). 404 when there is no entry at `seq`. |
@@ -189,11 +189,18 @@ All admin routes need `Authorization: Bearer <admin token>`. They answer 401 wit
 ```json
 {"user": "alice@example.com", "reason": "laptop stolen"}
 {"chain_id": "6f1c2d9e-...", "reason": "run went wrong"}
+{"session": "<Mcp-Session-Id>", "reason": "session hijacked"}
 ```
 
 - `user` matches every lease issued for that originating user: the `sub` of the chain's originating-user block, compared exactly, under any issuer. The server records the subject when it registers a lease. Leases registered by a server older than this route have no recorded subject and are not matched; revoke them by `chain_id` or by id.
 - `chain_id` matches one delegation chain: the lease of its first hop (the `chain_id` of its audit records, and the `root` of the lease tree) and everything delegated from it. A lease that has a parent is not a chain id and matches nothing. Found through the parent links, so older leases are matched too.
-- `session` is refused with 400 `unsupported_selector`. An MCP session is bound to its chain's root lease, so revoke the chain of the session's audit records with `chain_id`.
+- `session` takes a raw MCP session id (the `Mcp-Session-Id` header) and matches, as `chain_id` would, the chain that opened that session through the proxy. See [Revoke by session](#revoke-by-session).
+
+| Selector | Value | Matches | `selector` in the answer and the audit arguments |
+| --- | --- | --- | --- |
+| `user` | the originating user's `sub` | every lease recorded for that subject, any issuer | `{"user": "<sub>"}` |
+| `chain_id` | a first-hop lease id | that lease and everything delegated from it | `{"chain_id": "<id>"}` |
+| `session` | a raw `Mcp-Session-Id` | each chain that opened the session, as `chain_id` | `{"session_tag": "<12 hex>", "chain_ids": ["<id>", ...]}` |
 
 A selector matches leases that are not revoked, expired ones included (`POST /token/renew` could renew those while the token is valid). Each match is revoked with the same cascade as `POST /admin/leases/{lease_id}/revoke`. Matching nothing is a 200 with empty lists, not an error. The answer:
 
@@ -212,9 +219,15 @@ A selector matches leases that are not revoked, expired ones included (`POST /to
 
 With `?preview=true` nothing is written, no lease and no audit record. `revoked` is then what a revocation sent now would change, and `reason` and `audit_id` are `null`.
 
-Each revocation appends one record with tool `admin.lease.revoke` and kind `lease_revoke`, whatever it matched. Its `leases` holds the first 256 revoked ids. Its arguments are `{selector, reason, revoked, listed, truncated}` (the count, how many ids `leases` holds, and whether that list was cut), stored as a digest like every admin record. The `leases_revoked_total` metric counts every revoked lease.
+Each revocation appends one record with tool `admin.lease.revoke` and kind `lease_revoke`, whatever it matched. Its `leases` holds the first 256 revoked ids. Its arguments are `{selector, reason, revoked, listed, truncated}` (the `selector` as the answer shows it, so a session revocation names the resolved chains; the count, how many ids `leases` holds, and whether that list was cut), stored as a digest like every admin record. The `leases_revoked_total` metric counts every revoked lease.
 
-Errors: 400 `invalid_request` for no selector, more than one, an empty value, an unknown field or a body that is not JSON; 400 `unsupported_selector` for `session`; 401 without the admin bearer. On the console listener the route needs `Content-Type: application/json`. Without `[admin_ui] allow_write = true` it serves only `?preview=true` there and answers a revocation with 404. The console's lease page uses it for "Revoke chain…" and "Revoke all for <user>…".
+Errors: 400 `invalid_request` for no selector, more than one, an empty value, an unknown field or a body that is not JSON; 401 without the admin bearer. On the console listener the route needs `Content-Type: application/json`. Without `[admin_ui] allow_write = true` it serves only `?preview=true` there and answers a revocation with 404. The console's lease page uses it for "Revoke chain…" and "Revoke all for <user>…".
+
+#### Revoke by session
+
+When the proxy binds a new MCP session (the upstream assigns an `Mcp-Session-Id`, normally in its answer to `initialize`), the server records the session's SHA-256, the upstream server name and the chain id of the caller (`LeaseStore::record_session`; SQLite table `lease_sessions`). Only a request whose token and DPoP proof verified and whose leases are live can open a session, so nothing else can write a binding. The raw id is never stored; the session tag in audit records and logs is the first 12 hex characters of the same hash. A binding is write-once per session and server: the first chain is kept.
+
+`{"session": "<id>"}` hashes the id, looks up the chains recorded for it (one per upstream the session was opened with, normally one) and then behaves as `chain_id` for each of them, preview included. The answer's `selector` is `{"session_tag": "...", "chain_ids": [...]}`, never the raw id. A session the server has no record of (a wrong id, or one opened before the server recorded sessions) resolves to `chain_ids: []` and matches nothing: a 200 with empty lists, as for an unknown `chain_id`. The proxy's next request on a revoked session's chain is refused (HTTP 401 `lease_revoked` for `initialize`, `ping`, `tools/list` and session `GET`s; a `-32003` denial for `tools/call`).
 
 ### Lease tree
 
