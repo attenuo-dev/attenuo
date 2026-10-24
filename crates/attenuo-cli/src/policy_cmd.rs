@@ -187,13 +187,13 @@ fn authzen_body(call: &attenuo_core::ToolCall) -> Value {
 /// `attenuo policy test --via admin-evaluate <file>...`: every case, with the chain it
 /// describes, is decided by the server's admin dry run (`POST /admin/policies/evaluate`, the
 /// client's admin token). The dry run takes an admin-supplied chain, the case's `session`,
-/// `approval` and `usage`, checks no lease and writes no audit record, so nearly every case
-/// replays as written; only cases that set `budget` are skipped (see
-/// [`testing::TestCase::admin_evaluate_skip_reason`]). The server validates the chain at its own
-/// clock, so each chain is stamped at the current time (see [`testing::TestCase::input_at`]).
-/// A case the server refuses with 400 (a chain deeper than its `max_depth`, an approval `by` it
-/// does not know) is reported as that case's error; any other refusal (a bad admin token, a
-/// server without the route) or a transport error stops the file.
+/// `approval`, `usage` and `budget`, checks no lease, charges no counter and writes no audit
+/// record, so every case replays as written, none is skipped. The server validates the chain at
+/// its own clock, so each chain is stamped at the current time (see
+/// [`testing::TestCase::input_at`]). A case the server refuses with 400 (a chain deeper than its
+/// `max_depth`, an approval `by` it does not know, a negative `budget` figure) is reported as
+/// that case's error; any other refusal (a bad admin token, a server without the route) or a
+/// transport error stops the file.
 pub async fn test_admin_evaluate(
     files: &[PathBuf],
     client: &crate::client::Client,
@@ -221,10 +221,6 @@ pub async fn test_admin_evaluate(
         let mut cases = Vec::with_capacity(file.cases.len());
         let mut failure = None;
         for case in &file.cases {
-            if let Some(why) = case.admin_evaluate_skip_reason() {
-                cases.push(case.skip(why));
-                continue;
-            }
             let at = time::OffsetDateTime::now_utc().unix_timestamp();
             let input = match case.input_at(file.now_unix(), at) {
                 Ok(i) => i,
@@ -233,7 +229,7 @@ pub async fn test_admin_evaluate(
                     continue;
                 }
             };
-            let body = admin_evaluate_body(&input);
+            let body = admin_evaluate_body(&input, case.budget.as_ref());
             let answer = client
                 .admin_post("/admin/policies/evaluate", &body)
                 .await
@@ -264,8 +260,11 @@ pub async fn test_admin_evaluate(
 
 /// The admin dry-run request for a case: the AuthZEN request with the case's chain, plus its
 /// labels as the run's state. `session` and `usage` are always sent, so the dry run never reads
-/// them from the server's store; `approval` only when the case carries one.
-fn admin_evaluate_body(input: &testing::CaseInput) -> Value {
+/// them from the server's store; `approval` only when the case carries one. `budget` is sent
+/// as the case states it (only the members it sets), and only when it sets one: the server
+/// then decides the run limits on it instead of its counters (with no limit in the chain,
+/// Cedar sees the figures as given, as offline).
+fn admin_evaluate_body(input: &testing::CaseInput, budget: Option<&testing::BudgetSpec>) -> Value {
     let mut body = serde_json::to_value(attenuo_policy::authzen::to_request(
         &input.chain,
         &input.call,
@@ -285,6 +284,21 @@ fn admin_evaluate_body(input: &testing::CaseInput) -> Value {
     });
     if l.approval.present {
         body["approval"] = json!({ "by": l.approval.by });
+    }
+    if let Some(b) = budget {
+        let mut stated = serde_json::Map::new();
+        let figures = [
+            ("limited", b.limited.map(Value::from)),
+            ("calls_remaining", b.calls_remaining.map(Value::from)),
+            ("amount_remaining", b.amount_remaining.map(Value::from)),
+            ("destination_new", b.destination_new.map(Value::from)),
+        ];
+        for (key, v) in figures {
+            if let Some(v) = v {
+                stated.insert(key.to_string(), v);
+            }
+        }
+        body["budget"] = Value::Object(stated);
     }
     body
 }
@@ -797,6 +811,7 @@ cases:
     session: { tainted_by: [web/fetch] }
     approval: { by: user }
     usage: { calls: 3 }
+    budget: { calls_remaining: 0, destination_new: false }
     call: { server: github, tool: create_issue, arguments: { repo: acme/api } }
     expect: deny
   - name: plain
@@ -806,7 +821,7 @@ cases:
         )
         .unwrap();
         let input = f.cases[0].input(f.now_unix()).unwrap();
-        let body = admin_evaluate_body(&input);
+        let body = admin_evaluate_body(&input, f.cases[0].budget.as_ref());
         assert_eq!(body["subject"]["id"], "b");
         assert_eq!(
             body["subject"]["properties"]["chain"]["hops"]
@@ -821,12 +836,18 @@ cases:
         assert_eq!(body["session"]["tainted_by"], json!(["web/fetch"]));
         assert_eq!(body["approval"], json!({"by": "user"}));
         assert_eq!(body["usage"]["calls"], 3);
+        // `budget` as the case states it, members it leaves out left out.
+        assert_eq!(
+            body["budget"],
+            json!({"calls_remaining": 0, "destination_new": false})
+        );
         assert!(body.get("token").is_none());
         // Without labels the run is sent as untainted with no usage, and no approval.
-        let plain = admin_evaluate_body(&f.cases[1].input(f.now_unix()).unwrap());
+        let plain = admin_evaluate_body(&f.cases[1].input(f.now_unix()).unwrap(), None);
         assert_eq!(plain["session"]["tainted"], false);
         assert_eq!(plain["usage"]["calls"], 0);
         assert!(plain.get("approval").is_none());
+        assert!(plain.get("budget").is_none());
 
         let a = admin_evaluate_actual(&json!({
             "decision": "deny", "reason": "policy_deny", "policy_ids": ["p"],

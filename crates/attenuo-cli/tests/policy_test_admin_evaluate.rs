@@ -153,8 +153,8 @@ async fn fixture() -> Fixture {
     }
 }
 
-/// Cases the AuthZEN arm would skip (another chain and user, labels, an authentication time)
-/// and one it cannot run either (`budget`).
+/// Cases the AuthZEN arm would skip (another chain and user, labels, an authentication time,
+/// `budget`).
 const PASSING: &str = r#"  - name: bob's coder reads a public repo
     user: { subject: bob, attributes: { mfa: true } }
     chain: [assistant, coder]
@@ -224,7 +224,7 @@ async fn policy_test_replays_cases_through_the_admin_dry_run() {
     let passing = f.suite("passing.yaml", "now: 1760000000\n", PASSING);
     let before = f.audit_len();
 
-    // Every case but the budget one replays as written, and passes; nothing is audited.
+    // Every case replays as written, the budget one too, and passes; nothing is audited.
     let out = run(f.test(&[&passing], &[])).await;
     let t = text(&out);
     assert_eq!(out.status.code(), Some(0), "{t}");
@@ -249,17 +249,15 @@ async fn policy_test_replays_cases_through_the_admin_dry_run() {
         "{t}"
     );
     assert!(
-        t.contains("- with a budget  (skipped: `budget` cannot be sent to the admin dry run"),
+        t.contains("\u{2713} with a budget  (allow: policy_allow [issues])"),
         "{t}"
     );
+    assert!(!t.contains("skipped"), "{t}");
     assert!(
         t.contains("note: ") && t.contains("`now` is not sent"),
         "{t}"
     );
-    assert!(
-        t.contains("7 passed, 0 failed, 1 skipped (8 cases in 1 file)"),
-        "{t}"
-    );
+    assert!(t.contains("8 passed, 0 failed (8 cases in 1 file)"), "{t}");
     assert_eq!(f.audit_len(), before, "the dry run wrote audit records");
 
     // The unexercised report runs over the arm's results: `never` decided nothing, and
@@ -269,7 +267,7 @@ async fn policy_test_replays_cases_through_the_admin_dry_run() {
     let out = run(f.test(&[&passing], &["--fail-on-unexercised"])).await;
     assert_eq!(out.status.code(), Some(2), "{}", text(&out));
 
-    // The offline run of the same file agrees case by case (it also runs the budget case).
+    // The offline run of the same file agrees case by case.
     let mut c = attenuo();
     c.args(["policy", "test"]).arg(&passing);
     let out = run(c).await;
@@ -304,15 +302,15 @@ async fn policy_test_replays_cases_through_the_admin_dry_run() {
         "{t}"
     );
     assert!(
-        t.contains("7 passed, 3 failed, 1 skipped (11 cases in 2 files)"),
+        t.contains("8 passed, 3 failed (11 cases in 2 files)"),
         "{t}"
     );
 
     // The JSON form carries the server's answers and the coverage over them.
     let out = run(f.test(&[&passing], &["--json"])).await;
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["passed"], 7);
-    assert_eq!(v["skipped"], 1);
+    assert_eq!(v["passed"], 8);
+    assert_eq!(v["skipped"], 0);
     assert_eq!(v["files"][0]["cases"][0]["actual"]["decision"], "allow");
     assert_eq!(v["coverage"]["policies"], 5);
     assert_eq!(v["coverage"]["exercised"], 4);
@@ -387,4 +385,89 @@ async fn policy_test_admin_evaluate_refuses_bad_credentials_and_flags() {
     let out = run(f.test(&[&passing], &["--token", "x"])).await;
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
     assert!(text(&out).contains("need --via authzen"), "{}", text(&out));
+}
+
+/// A server set up as `file` describes: its policies, its catalog, `unknown_tools`,
+/// `legacy_bare_actions` and base schema, so the dry run decides what the offline run does.
+async fn server_for(
+    file: &attenuo_policy::testing::TestFile,
+    dir: &Path,
+) -> (Spawned, Arc<attenuo_server::AppState>, String) {
+    let mut cfg = Config::default();
+    cfg.issuer.issuer = "https://attenuo.test".into();
+    cfg.issuer.audience = "attenuo-test".into();
+    cfg.issuer.max_depth = 16;
+    cfg.issuer.private_key_pem_path = Some(dir.join("issuer.pem"));
+    cfg.policy.policies_path = file.policies_path();
+    let mut catalog: BTreeMap<String, BTreeMap<String, ToolAttrs>> = BTreeMap::new();
+    for ((server, tool), attrs) in file.load_catalog().unwrap().iter() {
+        catalog
+            .entry(server.clone())
+            .or_default()
+            .insert(tool.clone(), attrs.clone());
+    }
+    cfg.policy.catalog = catalog;
+    cfg.policy.unknown_tools = file.load_unknown_tools().unwrap();
+    cfg.policy.legacy_bare_actions = file.load_legacy_bare_actions().unwrap();
+    cfg.policy.schema_path = file.base_schema_path().unwrap();
+    cfg.audit.sqlite_path = dir.join("audit.sqlite").to_string_lossy().into_owned();
+    cfg.admin.token = Some(ADMIN.into());
+    let (router, state) = attenuo_server::build(&cfg).unwrap();
+    let server = spawn_router(router).await.unwrap();
+    let url = server.url("").trim_end_matches('/').to_string();
+    (server, state, url)
+}
+
+/// The repository's suites (`config/policies/*_test.yaml` and the two example suites) replay
+/// through the admin dry run with nothing skipped, the `budget` cases included, each against a
+/// server loaded with that suite's policies and catalog, and nothing is audited.
+#[tokio::test(flavor = "multi_thread")]
+async fn repository_suites_replay_through_the_admin_dry_run_with_nothing_skipped() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(root.join("config/policies"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.to_string_lossy().ends_with("_test.yaml"))
+        .collect();
+    files.sort();
+    assert_eq!(files.len(), 4, "{files:?}");
+    files.push(root.join("examples/github-leak-demo/policy_test.yaml"));
+    files.push(root.join("examples/multi-hop-demo/policy_test.yaml"));
+
+    let mut budget_cases = 0;
+    for path in &files {
+        let file = attenuo_policy::testing::TestFile::load(path).unwrap();
+        budget_cases += file.cases.iter().filter(|c| c.budget.is_some()).count();
+        let dir = tempfile::tempdir().unwrap();
+        let (_server, state, url) = server_for(&file, dir.path()).await;
+        let admin_file = dir.path().join("admin-token");
+        std::fs::write(&admin_file, ADMIN).unwrap();
+        let before = state.audit.len().unwrap();
+
+        let mut c = attenuo();
+        c.args([
+            "--server",
+            &url,
+            "policy",
+            "test",
+            "--via",
+            "admin-evaluate",
+        ])
+        .arg("--admin-token-file")
+        .arg(&admin_file)
+        .args(["--json", "--fail-on-unexercised"])
+        .arg(path);
+        let out = run(c).await;
+        let t = text(&out);
+        assert_eq!(out.status.code(), Some(0), "{}: {t}", path.display());
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["passed"], file.cases.len(), "{}: {t}", path.display());
+        assert_eq!(v["failed"], 0, "{}: {t}", path.display());
+        assert_eq!(v["skipped"], 0, "{}: {t}", path.display());
+        assert_eq!(state.audit.len().unwrap(), before, "{}", path.display());
+    }
+    assert!(
+        budget_cases >= 6,
+        "the suites have {budget_cases} budget cases"
+    );
 }

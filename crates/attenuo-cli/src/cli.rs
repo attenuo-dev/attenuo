@@ -836,7 +836,7 @@ pub struct TestArgs {
     /// `authzen` (each case is sent to `POST /access/v1/evaluation` of the server named by the
     /// global `--server`, with `--token` as the bearer) or `admin-evaluate` (each case, with its
     /// own chain, is sent to that server's `POST /admin/policies/evaluate` dry run, with the
-    /// admin token; nothing is audited).
+    /// admin token, its `budget` too; nothing is audited or charged).
     #[arg(long, value_enum, default_value_t = Via::Local)]
     pub via: Via,
     /// With `--via authzen`: the delegation token whose chain makes every call.
