@@ -7,10 +7,10 @@
 //! process; across processes SQLite's write lock plus the `UNIQUE` constraint on `entry_hash`
 //! and the primary key on `seq` make a fork fail rather than succeed.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, OnceLock, TryLockError};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, PoisonError, TryLockError, Weak};
 use std::time::Duration;
 
 use attenuo_core::fingerprint::Fingerprint;
@@ -197,8 +197,8 @@ const ENTRY_COLUMNS: &str = "seq, prev_hash, entry_hash, decision, reason, origi
      policy_ids, record_json, kind, chain_id";
 
 /// How long a connection waits for another connection's write lock before giving up with
-/// `SQLITE_BUSY`. Within one process the store's own lock serializes writers; this covers a
-/// second process (and the audit and lease connections of one server, which share a file).
+/// `SQLITE_BUSY`. Within one process the stores' [`WriteGate`] serializes writers on one file,
+/// including the audit and lease connections of one server; this covers a second process.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Prepared statements kept per connection (`prepare_cached`). The stores use about a dozen.
@@ -288,6 +288,91 @@ fn file_of(conn: &Connection) -> Option<PathBuf> {
     conn.path()
         .filter(|p| !p.is_empty())
         .and_then(|p| std::fs::canonicalize(p).ok())
+}
+
+/// In-process lock on one database file's writes, shared by every store of this process
+/// opened on that file (keyed by canonical path).
+///
+/// The server opens the audit log and the lease store as two connections on one file, and
+/// SQLite lets only one of them write at a time. Without this gate the connection that loses
+/// the race for `BEGIN IMMEDIATE` gets `SQLITE_BUSY` and SQLite's busy handler sleeps (1, 2,
+/// 5 ms and so on) instead of being woken when the lock frees; under four to eight concurrent
+/// calls that happened about once per call. Holding the gate across every write transaction
+/// makes writers queue instead, and the next one is woken as soon as the commit is done. The
+/// gate is a ticket lock, so writers get the file in arrival order: a plain mutex let the
+/// audit writer take it back for its next batch while a charge waited, which measured
+/// higher p99 latency (see `docs/design/performance.md`, "Write-lock contention between the
+/// lease and audit connections").
+///
+/// Lock order: [`SqliteLeaseStore`] takes the gate before its connection lock, so its reads
+/// (the lease check on every call) are not held up by a lease write waiting for the gate.
+/// [`SqliteAudit`] takes it after its connection lock, which its writer thread holds for a
+/// whole batch, and releases it before the checkpoint hook or any other call out. While
+/// holding the gate a thread waits at most for its own store's connection (held only by
+/// readers, or by the audit writer that already holds the gate) or for the WAL checkpoint
+/// gate (held only around a checkpoint that does not wait for the gate), so no cycle can
+/// form. Reads never take the gate. An in-memory store has no gate, stores on
+/// different files have different gates, and another process is still kept out by SQLite's
+/// lock and [`BUSY_TIMEOUT`].
+#[derive(Debug, Clone, Default)]
+struct WriteGate(Option<Arc<Ticket>>);
+
+/// A FIFO lock: each writer draws the next ticket and waits until it is served.
+#[derive(Debug, Default)]
+struct Ticket {
+    /// (next ticket to hand out, ticket now served).
+    state: Mutex<(u64, u64)>,
+    turn: Condvar,
+}
+
+/// Holds a [`Ticket`] until dropped (also when unwinding), which serves the next ticket.
+struct TicketGuard<'a>(&'a Ticket);
+
+impl Drop for TicketGuard<'_> {
+    fn drop(&mut self) {
+        let mut s = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
+        s.1 += 1;
+        self.0.turn.notify_all();
+    }
+}
+
+/// Live gates by canonical database path. Entries whose stores are all gone are pruned when
+/// the next store opens.
+static WRITE_GATES: OnceLock<Mutex<HashMap<PathBuf, Weak<Ticket>>>> = OnceLock::new();
+
+impl WriteGate {
+    /// The gate of `file` (a canonical path, see [`file_of`]); none for `None`.
+    fn for_file(file: Option<&Path>) -> Self {
+        let Some(file) = file else {
+            return Self(None);
+        };
+        let mut gates = WRITE_GATES
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        gates.retain(|_, g| g.strong_count() > 0);
+        if let Some(gate) = gates.get(file).and_then(Weak::upgrade) {
+            return Self(Some(gate));
+        }
+        let gate = Arc::new(Ticket::default());
+        gates.insert(file.to_path_buf(), Arc::downgrade(&gate));
+        Self(Some(gate))
+    }
+
+    /// Wait for this caller's turn and hold the gate until the guard drops. The gate guards
+    /// no data, so a panic while it was held leaves nothing inconsistent: poisoning is
+    /// ignored.
+    fn hold(&self) -> Option<TicketGuard<'_>> {
+        self.0.as_ref().map(|t| {
+            let mut s = t.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let mine = s.0;
+            s.0 += 1;
+            while s.1 != mine {
+                s = t.turn.wait(s).unwrap_or_else(PoisonError::into_inner);
+            }
+            TicketGuard(t)
+        })
+    }
 }
 
 /// The `synchronous` level of `conn` if it is below `FULL` and there is a file to sync.
@@ -919,6 +1004,8 @@ struct Inner {
     relaxed_sync: Option<i64>,
     /// The database file, if there is one (canonical path): what a synced commit covers.
     file: Option<PathBuf>,
+    /// Held across every write transaction (see [`WriteGate`]).
+    gate: WriteGate,
     /// Tests: every commit and the `synchronous` level it ran at, in one log with the hook.
     #[cfg(test)]
     probe: Option<Arc<Mutex<Vec<String>>>>,
@@ -1149,6 +1236,8 @@ impl Inner {
         records: Vec<DecisionRecord>,
         synced: bool,
     ) -> Result<Vec<AuditEntry>, CommitFailure> {
+        // Declared before the transaction, so an early return rolls back before releasing it.
+        let gate = self.gate.hold();
         let tx = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
             Ok(tx) => tx,
             Err(e) => return Err(CommitFailure::Error(e.into(), records)),
@@ -1208,6 +1297,8 @@ impl Inner {
                 self.probe_commit(&tx, format!("commit {}", seq));
                 Ok(tx.commit()?)
             });
+        // Before the backstop and the hook: neither may run under the gate.
+        drop(gate);
         if let Err(e) = written {
             return Err(CommitFailure::Error(
                 e,
@@ -1247,7 +1338,12 @@ impl Inner {
     fn wal_backstop(&self, conn: &Connection) {
         #[cfg(any(test, feature = "testing"))]
         let started = std::time::Instant::now();
-        let result = gated_checkpoint(&self.activity, conn, "TRUNCATE");
+        // `TRUNCATE` takes the write lock: queue behind the lease store's writes rather than
+        // sleep in the busy handler.
+        let result = {
+            let _gate = self.gate.hold();
+            gated_checkpoint(&self.activity, conn, "TRUNCATE")
+        };
         #[cfg(any(test, feature = "testing"))]
         if let (Ok(_), Ok(mut t)) = (&result, self.activity.timings.lock()) {
             t.backstops.push(started.elapsed());
@@ -1357,6 +1453,7 @@ impl SqliteAudit {
                 checkpointing: None,
                 activity: Arc::new(Activity::default()),
                 relaxed_sync,
+                gate: WriteGate::for_file(file.as_deref()),
                 file,
                 #[cfg(test)]
                 probe: None,
@@ -1480,6 +1577,7 @@ impl SqliteAudit {
             .as_ref()
             .ok_or(AuditError::NoCheckpointSigner)?;
         let mut conn = self.inner.conn.lock()?;
+        let gate = self.inner.gate.hold();
         // Synced like an append batch that writes a checkpoint (SR-50).
         let (cp, created) = with_full_sync(&mut conn, self.inner.relaxed_sync, |conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1504,6 +1602,7 @@ impl SqliteAudit {
             tx.commit()?;
             Ok::<_, AuditError>((cp, true))
         })??;
+        drop(gate);
         if created {
             if let Some(hook) = &c.on_created {
                 hook(&cp);
@@ -1986,6 +2085,9 @@ pub struct SqliteLeaseStore {
     /// The database file (canonical path) of a store this crate opened on a file: the file a
     /// deferred `sum` charge's sync must cover. `None` otherwise, and then nothing is deferred.
     file: Option<PathBuf>,
+    /// Held across every write (see [`WriteGate`]); shared with a [`SqliteAudit`] on the same
+    /// file.
+    gate: WriteGate,
     /// The key `calls_per` values are hashed under (`budget_meta`, ADR-0010).
     value_key: ValueKey,
     /// The key span-index fingerprints are hashed under (`budget_meta`, ADR-0009 phase 2).
@@ -2034,10 +2136,12 @@ impl SqliteLeaseStore {
         )?;
         let span_key = hex::decode(&span_key)
             .map_err(|e| AuditError::Storage(format!("span key is not hex: {e}")))?;
+        let gate = WriteGate::for_file(file_of(&conn).as_deref());
         Ok(Self {
             conn: Mutex::new(conn),
             durability: None,
             file: None,
+            gate,
             value_key: ValueKey::new(&key),
             span_key: SpanKey::new(&span_key),
             #[cfg(test)]
@@ -2507,6 +2611,7 @@ impl SqliteLeaseStore {
             .iter()
             .map(|c| self.value_key.counter(c))
             .collect::<Result<Vec<_>, _>>()?;
+        let _gate = self.gate.hold();
         let mut conn = self.conn.lock()?;
         // A lost `sum` charge could be spent again after a power failure, so a transaction
         // that charges one commits with `synchronous=FULL`, as revocations do (design 3.4).
@@ -2561,6 +2666,7 @@ impl LeaseStore for SqliteLeaseStore {
         parent: Option<&LeaseId>,
         expires_at: OffsetDateTime,
     ) -> Result<(), AuditError> {
+        let _gate = self.gate.hold();
         let conn = self.conn.lock()?;
         conn.prepare_cached(
             "INSERT INTO leases (id, parent, expires_at) VALUES (?1, ?2, ?3) \
@@ -2581,6 +2687,7 @@ impl LeaseStore for SqliteLeaseStore {
         reason: &str,
         now: OffsetDateTime,
     ) -> Result<u64, AuditError> {
+        let _gate = self.gate.hold();
         let mut conn = self.conn.lock()?;
         // A revocation must survive a power failure even when the store runs at `normal`. The
         // answer is the revocation's: a failure to lower `synchronous` again afterwards is
@@ -2600,6 +2707,7 @@ impl LeaseStore for SqliteLeaseStore {
         new_expires_at: OffsetDateTime,
         _now: OffsetDateTime,
     ) -> Result<(), AuditError> {
+        let _gate = self.gate.hold();
         let mut conn = self.conn.lock()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         match get_in(&tx, lease)? {
@@ -2623,6 +2731,7 @@ impl LeaseStore for SqliteLeaseStore {
     }
 
     fn bind(&self, lease: &LeaseId, binding: &str) -> Result<(), AuditError> {
+        let _gate = self.gate.hold();
         let mut conn = self.conn.lock()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if get_in(&tx, lease)?.is_none() {
@@ -2666,6 +2775,7 @@ impl LeaseStore for SqliteLeaseStore {
     }
 
     fn add_label(&self, chain_id: &LeaseId, label: &RunLabel) -> Result<(), AuditError> {
+        let _gate = self.gate.hold();
         let mut conn = self.conn.lock()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if get_in(&tx, chain_id)?.is_none() {
@@ -2732,6 +2842,7 @@ impl LeaseStore for SqliteLeaseStore {
             .map_err(|_| AuditError::Storage(format!("span seq {seq} out of range")))?;
         let mut hashes = distinct_hashes(&self.span_key, spans);
         hashes.truncate(MAX_SPANS_PER_RUN);
+        let _gate = self.gate.hold();
         let mut conn = self.conn.lock()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if get_in(&tx, chain_id)?.is_none() {
@@ -2801,6 +2912,7 @@ impl LeaseStore for SqliteLeaseStore {
     }
 
     fn create_approval(&self, approval: &Approval) -> Result<(Approval, bool), AuditError> {
+        let _gate = self.gate.hold();
         let mut conn = self.conn.lock()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let now = approval.created_at;
@@ -2883,6 +2995,7 @@ impl LeaseStore for SqliteLeaseStore {
         approver: &Approver,
         now: OffsetDateTime,
     ) -> Result<Approval, AuditError> {
+        let _gate = self.gate.hold();
         let mut conn = self.conn.lock()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut a =
@@ -2919,6 +3032,7 @@ impl LeaseStore for SqliteLeaseStore {
         decision_id: &str,
         now: OffsetDateTime,
     ) -> Result<Option<Approval>, AuditError> {
+        let _gate = self.gate.hold();
         let mut conn = self.conn.lock()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if rules::live_lease(lease, get_in(&tx, lease)?.as_ref(), now).is_err() {
@@ -2954,6 +3068,7 @@ impl LeaseStore for SqliteLeaseStore {
         decision_id: &str,
         now: OffsetDateTime,
     ) -> Result<Option<Approval>, AuditError> {
+        let _gate = self.gate.hold();
         let mut conn = self.conn.lock()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if rules::live_lease(lease, get_in(&tx, lease)?.as_ref(), now).is_err() {
@@ -2979,6 +3094,7 @@ impl LeaseStore for SqliteLeaseStore {
     }
 
     fn restore_approval(&self, id: &str, decision_id: &str) -> Result<(), AuditError> {
+        let _gate = self.gate.hold();
         let conn = self.conn.lock()?;
         conn.execute(
             "UPDATE approvals SET state = 'granted', consumed_by = NULL \
@@ -2989,6 +3105,7 @@ impl LeaseStore for SqliteLeaseStore {
     }
 
     fn remove_approval(&self, id: &str) -> Result<(), AuditError> {
+        let _gate = self.gate.hold();
         let conn = self.conn.lock()?;
         conn.execute("DELETE FROM approvals WHERE id = ?1", params![id])?;
         Ok(())
@@ -3031,6 +3148,7 @@ impl LeaseStore for SqliteLeaseStore {
     }
 
     fn refund(&self, decision_id: &str, at: OffsetDateTime) -> Result<u64, AuditError> {
+        let _gate = self.gate.hold();
         let mut conn = self.conn.lock()?;
         refund_in(&mut conn, decision_id, at)
     }
@@ -3935,5 +4053,93 @@ mod tests {
         let log = SqliteAudit::open(&path).expect("a damaged row must not stop the open");
         assert!(index_exists(&log));
         assert_eq!(log.verify_chain().unwrap().first_bad_seq, Some(2));
+    }
+
+    fn gate_of(g: &WriteGate) -> Arc<Ticket> {
+        g.0.clone().expect("a file-backed store has a write gate")
+    }
+
+    /// One gate per canonical file: the audit log and the lease store on one file share it
+    /// (also through another spelling of the path), stores on other files do not, and an
+    /// in-memory store has none.
+    #[test]
+    fn write_gate_is_shared_per_file_and_absent_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.db");
+        let audit = SqliteAudit::open(&a).unwrap();
+        let leases = SqliteLeaseStore::open(&a).unwrap();
+        let spelled = SqliteLeaseStore::open(dir.path().join(".").join("a.db")).unwrap();
+        let other = SqliteLeaseStore::open(dir.path().join("b.db")).unwrap();
+        let shared = gate_of(&audit.inner.gate);
+        assert!(Arc::ptr_eq(&shared, &gate_of(&leases.gate)));
+        assert!(Arc::ptr_eq(&shared, &gate_of(&spelled.gate)));
+        assert!(!Arc::ptr_eq(&shared, &gate_of(&other.gate)));
+        assert!(SqliteLeaseStore::open_in_memory().unwrap().gate.0.is_none());
+        assert!(SqliteAudit::open_in_memory()
+            .unwrap()
+            .inner
+            .gate
+            .0
+            .is_none());
+        assert!(SqliteAudit::open(":memory:")
+            .unwrap()
+            .inner
+            .gate
+            .0
+            .is_none());
+        // Once every store on a file is gone its gate goes too, and a new store gets a new one.
+        let weak = Arc::downgrade(&shared);
+        drop((shared, audit, leases, spelled));
+        assert!(weak.upgrade().is_none());
+        let again = SqliteLeaseStore::open(&a).unwrap();
+        assert!(again.gate.0.is_some());
+    }
+
+    /// Writes on either connection wait for the gate; reads do not.
+    #[test]
+    fn writes_wait_for_the_gate_and_reads_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.db");
+        let audit = Arc::new(SqliteAudit::open(&path).unwrap());
+        let leases = Arc::new(SqliteLeaseStore::open(&path).unwrap());
+        let at = datetime!(2026-10-23 12:00 UTC);
+        leases.register(&LeaseId::new("l1"), None, at).unwrap();
+        audit.append(record(1)).unwrap();
+
+        let held = leases.gate.hold();
+        let (done_tx, done) = mpsc::channel();
+        let writers = [
+            {
+                let (leases, done_tx) = (leases.clone(), done_tx.clone());
+                std::thread::spawn(move || {
+                    leases.renew(&LeaseId::new("l1"), at, at).unwrap();
+                    done_tx.send("renew").unwrap();
+                })
+            },
+            {
+                let (audit, done_tx) = (audit.clone(), done_tx.clone());
+                std::thread::spawn(move || {
+                    audit.append(record(2)).unwrap();
+                    done_tx.send("append").unwrap();
+                })
+            },
+        ];
+        // Lease-store reads go through while the gate is held, even with a lease write
+        // waiting for it (the lease store takes the gate before its connection).
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(leases.get(&LeaseId::new("l1")).unwrap().is_some());
+        assert!(leases.labels(&LeaseId::new("l1")).unwrap().is_empty());
+        assert!(
+            done.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a write went through while the gate was held"
+        );
+        drop(held);
+        let mut finished: Vec<_> = (0..2)
+            .map(|_| done.recv_timeout(Duration::from_secs(10)).unwrap())
+            .collect();
+        finished.sort_unstable();
+        assert_eq!(finished, ["append", "renew"]);
+        writers.into_iter().for_each(|w| w.join().unwrap());
+        assert_eq!(audit.head().unwrap().unwrap().seq, 2);
     }
 }
