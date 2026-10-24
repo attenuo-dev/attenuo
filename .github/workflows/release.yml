@@ -22,7 +22,7 @@
 # first push, set the package visibility to public in the repository's Packages settings.
 #
 # Verify a published image:
-#   cosign verify ghcr.io/7mudit/attenuo:<version> \
+#   cosign verify ghcr.io/attenuo-dev/attenuo:<version> \
 #     --certificate-identity-regexp '^https://github.com/attenuo-dev/attenuo/\.github/workflows/release\.yml@' \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
 #

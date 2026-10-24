@@ -5,7 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 rust-version.workspace = true
+keywords = ["delegation", "rfc8693", "token-exchange", "jwt", "agents"]
+categories = ["authentication", "cryptography"]
 
 [dependencies]
 attenuo-core = { workspace = true }

@@ -1,8 +1,17 @@
 {
   "name": "@attenuo/sdk",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "TypeScript client for the attenuo authorization server: token exchange, attenuated capabilities, MCP calls through the enforcing proxy, lease renewal and the audit log.",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/attenuo-dev/attenuo.git",
+    "directory": "sdk/typescript"
+  },
+  "homepage": "https://github.com/attenuo-dev/attenuo/tree/main/sdk/typescript#readme",
+  "bugs": {
+    "url": "https://github.com/attenuo-dev/attenuo/issues"
+  },
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -22,11 +31,15 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "sideEffects": false,
   "engines": {
     "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "scripts": {
     "build": "tsup",

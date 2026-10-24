@@ -23,7 +23,8 @@ per URL host) is probed the same way and also skipped when the server rejects a 
 catalog destination; ``attenuo_distinct_host`` and ``attenuo_distinct_host2`` (a hard
 ``distinct`` limit of 1 or 2 URL hosts) and ``attenuo_distinct_recipient`` (a hard ``distinct``
 limit of 1 recipient on messaging, mail and sharing tools) are skipped when the server does not
-refuse a call with one value too many. Exit status 2,
+refuse a call with one value too many. ``attenuo_task_limits`` (the ``limits`` each case's grant
+declares, dev cases only) is skipped when the server does not enforce run limits. Exit status 2,
 before anything runs, if the test split is requested while ``policies/`` differs from its frozen
 hashes or while the labelling oracle (``label_rules.py``) disagrees with a hand label that has no
 ``label_note``.
@@ -217,6 +218,7 @@ ARM_NAMES = {
     "attenuo_distinct_host": "attenuo full plus a distinct-host limit on web fetches",
     "attenuo_distinct_host2": "attenuo full plus a distinct-host limit of 2 on web fetches",
     "attenuo_distinct_recipient": "attenuo full plus a distinct-recipient limit on messages",
+    "attenuo_task_limits": "attenuo full plus the per-task limits in each case's grant",
 }
 
 
@@ -389,6 +391,7 @@ def render_split(doc: dict[str, Any], split: str) -> list[str]:
     L += render_host(doc)
     L += render_browsing(doc)
     L += render_recipient(doc)
+    L += render_task_limits(doc)
     L += [
         "",
         "### attenuo by suite and stage",
@@ -624,6 +627,13 @@ def distinct_rule_text(arm: str) -> str:
             f"The frozen rule in [`policies/{f}`](../policies/{f}) adds a `distinct` limit with "
             f"`max: 1` on the recipient argument to every capability that names one of {tools}."
         )
+    if arm in harness.TASK_LIMIT_ARMS:
+        f = harness.TASK_LIMITS_FIT.name
+        return (
+            "No frozen rule: each capability carries the `limits` its case's grant declares, the "
+            f"figures fitted to the task text in [`policies/{f}`](../policies/{f}); a capability "
+            "whose grant declares none has no limit."
+        )
     return (
         "The frozen rule in [`policies/limits-rule.json`](../policies/limits-rule.json) "
         "adds `calls: 1` to every capability that is not a read."
@@ -639,6 +649,7 @@ MULTICALL_ARMS = (
     "attenuo_distinct_host",
     "attenuo_distinct_host2",
     "attenuo_distinct_recipient",
+    "attenuo_task_limits",
 )
 
 
@@ -822,12 +833,120 @@ def render_recipient(doc: dict[str, Any]) -> list[str]:
     return L
 
 
+def _limits_text(lim: dict[str, Any]) -> str:
+    """A grant's ``limits`` in one line, as the case file writes it."""
+    parts = []
+    for kind, v in lim.items():
+        if isinstance(v, dict):
+            derive = f", derive: {v['derive']}" if v.get("derive") else ""
+            parts.append(f"{kind}: {{arg: {v['arg']}{derive}, max: {v['max']}}}")
+        else:
+            parts.append(f"{kind}: {v}")
+    return "`" + "; ".join(parts) + "`"
+
+
+def task_limit_losses(doc: dict[str, Any], arm: str) -> list[dict[str, Any]]:
+    """Every benign call a run limit refused in ``arm``, with the calls of the same tool in the
+    same case that were allowed before it (what spent the limit)."""
+    calls = [c for c in doc["calls"] if c["arm"] == arm]
+    out = []
+    for c in calls:
+        if c["role"] != "benign" or c["outcome"] != "deny" or c["stage"] != "budget":
+            continue
+        spent = [
+            f"{x['role']} call {x['index']}"
+            for x in calls
+            if x["case"] == c["case"]
+            and x["tool"] == c["tool"]
+            and x["index"] < c["index"]
+            and x["outcome"] == "allow"
+        ]
+        out.append(
+            {"case": c["case"], "index": c["index"], "tool": c["tool"], "reason": c["reason"],
+             "spent_by": spent}
+        )  # fmt: skip
+    return out
+
+
+def render_task_limits(doc: dict[str, Any]) -> list[str]:
+    """The per-task arm: which cases carry a limit and which do not (and why), what it changed
+    against ``attenuo``, the benign calls it lost and its approve-all bound."""
+    L: list[str] = []
+    for arm in harness.TASK_LIMIT_ARMS:
+        r = (doc.get("rates") or {}).get(arm)
+        if arm not in doc["arms"]:
+            continue
+        declared = doc.get("task_limits") or {}
+        unset = doc.get("task_limits_unset") or {}
+        cases = sorted(doc["case_meta"])
+        rows = changed_calls(doc, arm, "attenuo")
+        f = harness.TASK_LIMITS_FIT.name
+        L += ["", f"### Per-task limits in `{arm}`", ""]
+        if not declared:
+            L.append(
+                f"No case of this split declares `limits` in its grant, so `{arm}` is `attenuo` "
+                f"with no run limit. Calls whose outcome differs from `attenuo`: {len(rows)}."
+            )
+            L += _changed_table(rows)
+            continue
+        L += [
+            f"{len(declared)} of {len(cases)} cases declare `limits` in their grant, fitted by "
+            f"rule to the task text and recorded, with the phrase that states each figure, in "
+            f"[`policies/{f}`](../policies/{f}).",
+            "",
+            "| Case | Capability | Limits |",
+            "|---|---|---|",
+        ]
+        for cid in cases:
+            for d in declared.get(cid, []):
+                L.append(f"| {cid} | `{d['server']}/{d['tool']}` | {_limits_text(d['limits'])} |")
+        missing = [c for c in cases if c not in declared]
+        if missing:
+            L += ["", "Cases with no limit:", "", "| Case | Why |", "|---|---|"]
+            L += [f"| {c} | {unset.get(c, '')} |" for c in missing]
+        L += [
+            "",
+            "Calls whose outcome differs from `attenuo` (calls numbered from 0 in case order): "
+            f"{len(rows)}.",
+            *_changed_table(rows),
+        ]
+        losses = task_limit_losses(doc, arm)
+        L += ["", f"Benign calls a per-task limit refused: {len(losses)}."]
+        if losses:
+            L += [
+                "",
+                "| Case | Call | Tool | Reason | Allowed before it, same tool |",
+                "|---|---:|---|---|---|",
+            ]
+            L += [
+                f"| {x['case']} | {x['index']} | `{x['tool']}` | `{x['reason']}` "
+                f"| {', '.join(x['spent_by']) or 'none'} |"
+                for x in losses
+            ]
+        if r is not None:
+            L += [
+                "",
+                "The arm asks for no approval, so its approve-all bound is its attack calls "
+                f"allowed, {_ci(r['attack_allowed'], r['attack_calls'])}.",
+            ]
+        L += [
+            "",
+            "What this measures: that the server enforces a per-task figure, given the right "
+            "one, on these sequences. What it does not: whether a planner or hop 0 writes that "
+            "figure. A per-task limit is only as good as the hop that writes it, and these "
+            "figures were written by the same agent family that wrote the cases, after reading "
+            "them and every earlier result.",
+        ]
+    return L
+
+
 BROWSING_ARMS = (
     "attenuo",
     "attenuo_usage_soft",
     "attenuo_usage_host",
     "attenuo_distinct_host",
     "attenuo_distinct_host2",
+    "attenuo_task_limits",
 )
 
 
@@ -1032,6 +1151,8 @@ def main(argv: list[str] | None = None) -> int:
         doc["taxonomy"] = taxonomy_rows(doc)
         doc["multicall"] = multicall_rows(doc)
         doc["browsing"] = browsing_rows(doc)
+        doc["task_limits"] = harness.task_limits(suites)
+        doc["task_limits_unset"] = harness.task_limits_unset(suites)
         doc["summary"] = harness.summarise(doc)
         docs[sp] = doc
     if not docs:
