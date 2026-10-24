@@ -239,7 +239,9 @@ pub use catalog::{
 };
 pub use lint::{lint, LintIssue, LintReport, LintSeverity};
 pub use lint::{lint_with_options, policy_action_names, LintOptions};
-pub use schema::{action_id, default_user_attrs, DEFAULT_SCHEMA, GENERIC_ACTION};
+pub use schema::{
+    action_id, default_user_attrs, DEFAULT_SCHEMA, GENERIC_ACTION, REQUIRED_ENTITY_TYPES,
+};
 pub use usage::{policies_read_usage, TrackUsage};
 
 /// The starter policy set shipped with the crate (`policies/default.cedar`).
@@ -590,11 +592,47 @@ impl PolicyEngineBuilder {
         )
     }
 
+    /// Parse the complete schema and, when the base schema was replaced
+    /// ([`with_schema_str`](Self::with_schema_str)), check that it still declares what the
+    /// engine builds requests from: the entity types `User`, `Agent`, `Server` and `Tool` with
+    /// every attribute of [`DEFAULT_SCHEMA`] (required, same type), `Agent in [User, Agent]`
+    /// and `Tool in [Server]`. Actions are always generated, so a base that declares
+    /// `Action::"invoke"` or a catalog action fails to parse. [`build`](Self::build) runs this
+    /// too.
+    pub fn check_schema(&self) -> Result<(), PolicyError> {
+        self.parse_schema().map(|_| ())
+    }
+
+    fn parse_schema(&self) -> Result<Schema, PolicyError> {
+        let custom = self.base_schema != DEFAULT_SCHEMA;
+        let what = |e: String| {
+            if custom {
+                PolicyError::Schema(format!("custom base schema: {e}"))
+            } else {
+                PolicyError::Schema(e)
+            }
+        };
+        if custom {
+            let missing = schema::missing_entity_types(&self.base_schema);
+            if !missing.is_empty() {
+                return Err(what(format!(
+                    "it does not declare the entity type(s) {}",
+                    missing.join(", ")
+                )));
+            }
+        }
+        let (schema, _warnings) =
+            Schema::from_cedarschema_str(&self.schema_text()).map_err(|e| what(e.to_string()))?;
+        if custom {
+            schema::check_required_shape(&schema).map_err(what)?;
+        }
+        Ok(schema)
+    }
+
     pub fn build(self) -> Result<PolicyEngine, PolicyError> {
         self.catalog.validate().map_err(PolicyError::Catalog)?;
         let schema_text = self.schema_text();
-        let (schema, _warnings) = Schema::from_cedarschema_str(&schema_text)
-            .map_err(|e| PolicyError::Schema(e.to_string()))?;
+        let schema = self.parse_schema()?;
         let mut text = String::new();
         for src in &self.policy_sources {
             match src {

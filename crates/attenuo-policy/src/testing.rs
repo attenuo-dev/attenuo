@@ -95,8 +95,17 @@
 //! let report = file.run().unwrap();
 //! assert!(report.all_passed());
 //! ```
+//!
+//! # Unexercised policies
+//!
+//! A policy is *exercised* when it is among the determining policies (Cedar's
+//! `diagnostics().reason()`, reported as `policy_ids`) of at least one evaluated case, passing
+//! or not: a `permit` that allowed a call, or a `forbid` that denied one. [`TestReport::policies`]
+//! lists every policy of the file's `policies` with the line it starts on, and [`coverage`]
+//! folds several reports into the policies no case exercised. A `permit` overridden by a
+//! `forbid` in every case it matched is not exercised: no decision depended on it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use attenuo_core::{
@@ -254,6 +263,32 @@ pub fn load_legacy_bare_actions_from_config(path: &Path) -> Result<Option<bool>,
         Some(other) => Err(HarnessError::invalid(
             &what,
             format!("expected a boolean, got {other}"),
+        )),
+    }
+}
+
+/// Read `[policy] schema_path` from a server config, resolved against the config's directory
+/// as `catalog_path` is; `None` when it is not set or the path is a JSON catalog.
+pub fn load_schema_path_from_config(path: &Path) -> Result<Option<PathBuf>, HarnessError> {
+    if path.extension().and_then(|e| e.to_str()) == Some("json") {
+        return Ok(None);
+    }
+    let what = format!("schema_path in {}", path.display());
+    let doc: toml::Table = read(path)?
+        .parse()
+        .map_err(|e: toml::de::Error| HarnessError::invalid(&what, e))?;
+    match doc
+        .get("policy")
+        .and_then(|p| p.as_table())
+        .and_then(|p| p.get("schema_path"))
+    {
+        None => Ok(None),
+        Some(toml::Value::String(rel)) => {
+            Ok(Some(path.parent().unwrap_or(Path::new(".")).join(rel)))
+        }
+        Some(other) => Err(HarnessError::invalid(
+            &what,
+            format!("expected a path, got {other}"),
         )),
     }
 }
@@ -563,6 +598,9 @@ pub struct TestFile {
     /// Path the file was loaded from, for reports.
     #[serde(skip)]
     source: Option<PathBuf>,
+    /// Base schema override, see [`TestFile::with_schema_file`].
+    #[serde(skip)]
+    schema_file: Option<PathBuf>,
 }
 
 impl TestFile {
@@ -666,21 +704,72 @@ impl TestFile {
                 builder = builder.with_user_attr(name, ty);
             }
         }
+        if let Some(base) = self.load_base_schema()? {
+            builder = builder.with_schema_str(&base);
+        }
         if let Some(p) = &self.policies {
             builder = builder.with_policies_file(self.resolve(p));
         }
         Ok(builder.build()?)
     }
 
+    /// Replace the base schema with the Cedar schema in `path` (the CLI's `--schema-file`),
+    /// whatever the config `catalog` names says.
+    pub fn with_schema_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.schema_file = Some(path.into());
+        self
+    }
+
+    /// The base schema file in force: [`with_schema_file`](Self::with_schema_file), else the
+    /// `[policy] schema_path` of the server config `catalog` names (relative to that config),
+    /// else none (the built-in [`DEFAULT_SCHEMA`](crate::DEFAULT_SCHEMA)).
+    pub fn base_schema_path(&self) -> Result<Option<PathBuf>, HarnessError> {
+        if let Some(p) = &self.schema_file {
+            return Ok(Some(p.clone()));
+        }
+        match &self.catalog {
+            Some(CatalogSpec::Path(p)) => load_schema_path_from_config(&self.resolve(p)),
+            _ => Ok(None),
+        }
+    }
+
+    /// The text of [`base_schema_path`](Self::base_schema_path), if any.
+    pub fn load_base_schema(&self) -> Result<Option<String>, HarnessError> {
+        self.base_schema_path()?.map(|p| read(&p)).transpose()
+    }
+
     /// Build the engine and run every case.
     pub fn run(&self) -> Result<TestReport, HarnessError> {
         let engine = self.build_engine()?;
-        Ok(self.run_with(&engine))
+        let mut report = self.run_with(&engine);
+        report.policies = self.policy_refs()?;
+        Ok(report)
     }
 
-    /// Run every case against an engine you built yourself.
+    /// The evaluation time of the cases: the file's `now`, else [`DEFAULT_NOW_UNIX`].
+    pub fn now_unix(&self) -> i64 {
+        self.now.unwrap_or(DEFAULT_NOW_UNIX)
+    }
+
+    /// Whether the file sets `now` itself.
+    pub fn sets_now(&self) -> bool {
+        self.now.is_some()
+    }
+
+    /// A report for case results produced some other way (for instance by a remote server),
+    /// with the file's source and its policies (see [`TestFile::policy_refs`]).
+    pub fn report_for(&self, cases: Vec<CaseReport>) -> Result<TestReport, HarnessError> {
+        Ok(TestReport {
+            source: self.source.clone(),
+            cases,
+            policies: self.policy_refs()?,
+        })
+    }
+
+    /// Run every case against an engine you built yourself. [`TestReport::policies`] lists
+    /// the engine's policies without a file or line.
     pub fn run_with(&self, engine: &PolicyEngine) -> TestReport {
-        let now_unix = self.now.unwrap_or(DEFAULT_NOW_UNIX);
+        let now_unix = self.now_unix();
         TestReport {
             source: self.source.clone(),
             cases: self
@@ -688,7 +777,170 @@ impl TestFile {
                 .iter()
                 .map(|c| run_case(engine, c, now_unix))
                 .collect(),
+            policies: engine
+                .policy_ids()
+                .into_iter()
+                .map(|id| PolicyRef {
+                    id,
+                    file: None,
+                    line: None,
+                })
+                .collect(),
         }
+    }
+
+    /// The files a run of this test file reads besides itself: its policy file, the catalog file
+    /// or server config `catalog` names, and the base schema file in force. Paths that cannot
+    /// be worked out (an unreadable config) are left out.
+    pub fn input_paths(&self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = self.policies_path().into_iter().collect();
+        if let Some(CatalogSpec::Path(p)) = &self.catalog {
+            out.push(clean_path(&self.resolve(p)));
+        }
+        if let Ok(Some(s)) = self.base_schema_path() {
+            out.push(clean_path(&s));
+        }
+        out
+    }
+
+    /// The policy file the test file names, resolved against the test file's directory.
+    pub fn policies_path(&self) -> Option<PathBuf> {
+        self.policies
+            .as_deref()
+            .map(|p| clean_path(&self.resolve(p)))
+    }
+
+    /// Every policy of the file's `policies`, with the line it starts on (empty when it names
+    /// none).
+    pub fn policy_refs(&self) -> Result<Vec<PolicyRef>, HarnessError> {
+        match self.policies_path() {
+            None => Ok(Vec::new()),
+            Some(path) => policy_refs(&read(&path)?, Some(&path)),
+        }
+    }
+}
+
+/// `path` without `.` components, so `dir/./policy.cedar` prints as `dir/policy.cedar`.
+fn clean_path(path: &Path) -> PathBuf {
+    let cleaned: PathBuf = path
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect();
+    if cleaned.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        cleaned
+    }
+}
+
+/// One policy of a policy set: its id as the engine reports it (the `@id` annotation, else
+/// Cedar's `policy<N>`), and where it starts when known.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct PolicyRef {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<PathBuf>,
+    /// 1-based line of the policy's first token (its first annotation, or `permit`/`forbid`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+}
+
+impl std::fmt::Display for PolicyRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (&self.file, self.line) {
+            (Some(file), Some(line)) => write!(f, "{} ({}:{line})", self.id, file.display()),
+            (Some(file), None) => write!(f, "{} ({})", self.id, file.display()),
+            (None, Some(line)) => write!(f, "{} (line {line})", self.id),
+            (None, None) => f.write_str(&self.id),
+        }
+    }
+}
+
+/// The policies (and templates) in Cedar policy text, as the engine names them, each with the
+/// line it starts on, in file order. `file` is only recorded in the result.
+pub fn policy_refs(text: &str, file: Option<&Path>) -> Result<Vec<PolicyRef>, HarnessError> {
+    use std::str::FromStr as _;
+    let parsed = cedar_policy::PolicySet::from_str(text)
+        .map_err(|e| HarnessError::Policy(PolicyError::Parse(e.to_string())))?;
+    let lines = crate::lint::statement_lines(text);
+    let mut refs: Vec<PolicyRef> = parsed
+        .policies()
+        .map(|p| (p.id().to_string(), p.annotation("id").map(str::to_string)))
+        .chain(
+            parsed
+                .templates()
+                .map(|t| (t.id().to_string(), t.annotation("id").map(str::to_string))),
+        )
+        .map(|(default_id, annotated)| {
+            // Cedar numbers the statements of a parsed set `policy0`, `policy1`, ... in order.
+            let line = default_id
+                .strip_prefix("policy")
+                .and_then(|n| n.parse::<usize>().ok())
+                .and_then(|n| lines.get(n).copied());
+            PolicyRef {
+                id: annotated.unwrap_or(default_id),
+                file: file.map(Path::to_path_buf),
+                line,
+            }
+        })
+        .collect();
+    refs.sort_by(|a, b| a.line.cmp(&b.line).then_with(|| a.id.cmp(&b.id)));
+    Ok(refs)
+}
+
+/// Which policies of one or more test runs no case exercised (see the module docs).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Coverage {
+    /// Distinct policies across the reports (by policy file and id).
+    pub policies: usize,
+    /// The ones no case's decision depended on, in file and line order.
+    pub unexercised: Vec<PolicyRef>,
+}
+
+impl Coverage {
+    pub fn exercised(&self) -> usize {
+        self.policies - self.unexercised.len()
+    }
+}
+
+/// Fold reports into one [`Coverage`]. Reports whose test files name the same policy file
+/// share its policies, so a policy exercised by a case in any of them counts as exercised.
+pub fn coverage<'a>(reports: impl IntoIterator<Item = &'a TestReport>) -> Coverage {
+    type Key = (Option<PathBuf>, String);
+    let key = |p: &PolicyRef| -> Key {
+        let file = p
+            .file
+            .as_ref()
+            .map(|f| std::fs::canonicalize(f).unwrap_or_else(|_| f.clone()));
+        (file, p.id.clone())
+    };
+    let mut all: BTreeMap<Key, PolicyRef> = BTreeMap::new();
+    let mut exercised: BTreeSet<Key> = BTreeSet::new();
+    for report in reports {
+        let ids = report.exercised_ids();
+        for p in &report.policies {
+            let k = key(p);
+            if ids.contains(p.id.as_str()) {
+                exercised.insert(k.clone());
+            }
+            all.entry(k).or_insert_with(|| p.clone());
+        }
+    }
+    let policies = all.len();
+    let mut unexercised: Vec<PolicyRef> = all
+        .into_iter()
+        .filter(|(k, _)| !exercised.contains(k))
+        .map(|(_, p)| p)
+        .collect();
+    unexercised.sort_by(|a, b| {
+        a.file
+            .cmp(&b.file)
+            .then(a.line.cmp(&b.line))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    Coverage {
+        policies,
+        unexercised,
     }
 }
 
@@ -727,6 +979,10 @@ pub struct CaseReport {
     /// Set when the case itself is malformed, for instance a chain that violates attenuation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Set when the case was deliberately not run, with the reason; `passed` is then `false`
+    /// but the case does not count as failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
 }
 
 /// The result of one test file.
@@ -735,15 +991,42 @@ pub struct TestReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<PathBuf>,
     pub cases: Vec<CaseReport>,
+    /// Every policy of the set under test, exercised or not.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub policies: Vec<PolicyRef>,
 }
 
 impl TestReport {
+    /// Ids of the policies some evaluated case's decision depended on.
+    pub fn exercised_ids(&self) -> BTreeSet<&str> {
+        self.cases
+            .iter()
+            .filter_map(|c| c.actual.as_ref())
+            .flat_map(|a| a.policy_ids.iter().map(String::as_str))
+            .collect()
+    }
+
+    /// The policies no case of this report exercised, in file order.
+    pub fn unexercised(&self) -> Vec<&PolicyRef> {
+        let ids = self.exercised_ids();
+        self.policies
+            .iter()
+            .filter(|p| !ids.contains(p.id.as_str()))
+            .collect()
+    }
+
     pub fn passed(&self) -> usize {
         self.cases.iter().filter(|c| c.passed).count()
     }
 
+    /// Cases that ran (or could not be built) and did not pass. Skipped cases are not failed.
     pub fn failed(&self) -> usize {
-        self.cases.len() - self.passed()
+        self.cases.len() - self.passed() - self.skipped()
+    }
+
+    /// Cases deliberately not run, for instance ones the AuthZEN endpoint cannot express.
+    pub fn skipped(&self) -> usize {
+        self.cases.iter().filter(|c| c.skipped.is_some()).count()
     }
 
     pub fn all_passed(&self) -> bool {
@@ -752,68 +1035,189 @@ impl TestReport {
 }
 
 fn run_case(engine: &PolicyEngine, case: &TestCase, now_unix: i64) -> CaseReport {
-    let mut report = CaseReport {
-        name: case.name.clone(),
-        passed: false,
-        expected: case.expect,
-        actual: None,
-        failures: Vec::new(),
-        error: None,
-    };
-    let (chain, call, now) = match build_case(case, now_unix) {
-        Ok(v) => v,
-        Err(e) => {
-            report.error = Some(e);
-            return report;
-        }
-    };
-    let mut labels = case
-        .session
-        .as_ref()
-        .map(SessionSpec::labels)
-        .unwrap_or_default();
-    if let Some(a) = &case.approval {
-        labels.approval = crate::ApprovalContext::by(a.by.clone());
+    match case.input(now_unix) {
+        Ok(i) => case.check(Actual::from(
+            engine.authorize_labelled(&i.chain, &i.call, &i.labels, i.now),
+        )),
+        Err(e) => case.errored(e),
     }
-    if let Some(b) = &case.budget {
-        labels.budget = b.context();
-    }
-    if let Some(u) = &case.usage {
-        labels.usage = u.context();
-    }
-    let actual = Actual::from(engine.authorize_labelled(&chain, &call, &labels, now));
+}
 
-    if !case.expect.matches(&actual.decision) {
-        report.failures.push(format!(
-            "expected {}, got {} ({})",
-            case.expect,
-            decision_str(&actual.decision),
-            actual.reason
-        ));
+/// What a case evaluates: the chain and call it describes, the run's labels and the time.
+#[derive(Debug, Clone)]
+pub struct CaseInput {
+    pub chain: DelegationChain,
+    pub call: ToolCall,
+    pub labels: CallLabels,
+    pub now: OffsetDateTime,
+}
+
+impl TestCase {
+    /// Build what the case evaluates at `now_unix` (the file's [`TestFile::now_unix`]), exactly
+    /// as the in-process run does. `Err` describes a malformed case, for instance a chain that
+    /// violates attenuation.
+    pub fn input(&self, now_unix: i64) -> Result<CaseInput, String> {
+        let (chain, call, now) = build_case(self, now_unix)?;
+        let mut labels = self
+            .session
+            .as_ref()
+            .map(SessionSpec::labels)
+            .unwrap_or_default();
+        if let Some(a) = &self.approval {
+            labels.approval = crate::ApprovalContext::by(a.by.clone());
+        }
+        if let Some(b) = &self.budget {
+            labels.budget = b.context();
+        }
+        if let Some(u) = &self.usage {
+            labels.usage = u.context();
+        }
+        Ok(CaseInput {
+            chain,
+            call,
+            labels,
+            now,
+        })
     }
-    if let Some(want) = &case.reason {
-        if *want != actual.reason {
-            report
-                .failures
-                .push(format!("expected reason {want}, got {}", actual.reason));
+
+    fn report(&self) -> CaseReport {
+        CaseReport {
+            name: self.name.clone(),
+            passed: false,
+            expected: self.expect,
+            actual: None,
+            failures: Vec::new(),
+            error: None,
+            skipped: None,
         }
     }
-    if let Some(want) = &case.policy_ids {
-        let mut w = want.clone();
-        let mut g = actual.policy_ids.clone();
-        w.sort();
-        g.sort();
-        if w != g {
-            report.failures.push(format!(
-                "expected policy_ids [{}], got [{}]",
-                want.join(", "),
-                actual.policy_ids.join(", ")
+
+    /// The report of a case that could not be evaluated.
+    pub fn errored(&self, error: impl Into<String>) -> CaseReport {
+        CaseReport {
+            error: Some(error.into()),
+            ..self.report()
+        }
+    }
+
+    /// The report of a case that was deliberately not run (neither passed nor failed).
+    pub fn skip(&self, why: impl Into<String>) -> CaseReport {
+        CaseReport {
+            skipped: Some(why.into()),
+            ..self.report()
+        }
+    }
+
+    /// Why this case cannot be sent to a server's AuthZEN endpoint with a token whose chain is
+    /// `token_chain`, or `None` when it can. The server takes the chain from the token and the
+    /// run's labels, approvals, budget and usage from its own state, so a case that sets any of
+    /// those must match the token or be skipped:
+    ///
+    /// - `session`, `approval`, `budget`, `usage` and `user.authenticated_at_unix` cannot be sent;
+    /// - a `user` other than the default must equal the token's user (subject, issuer and the
+    ///   exact attributes);
+    /// - a non-empty `chain` must name the token's agents in order, and a hop with explicit
+    ///   `capabilities` must carry exactly the token hop's capabilities.
+    pub fn authzen_skip_reason(&self, token_chain: &DelegationChain) -> Option<String> {
+        for (set, field) in [
+            (self.session.is_some(), "session"),
+            (self.approval.is_some(), "approval"),
+            (self.budget.is_some(), "budget"),
+            (self.usage.is_some(), "usage"),
+            (
+                self.user.authenticated_at_unix.is_some(),
+                "user.authenticated_at_unix",
+            ),
+        ] {
+            if set {
+                return Some(format!(
+                    "`{field}` cannot be sent through AuthZEN (the server uses its own state)"
+                ));
+            }
+        }
+        let ou = &token_chain.originating_user;
+        if self.user != UserSpec::default()
+            && (self.user.subject != ou.subject
+                || self.user.issuer != ou.issuer
+                || self.user.attributes != ou.attributes)
+        {
+            return Some(format!(
+                "`user` differs from the token's user ({} at {})",
+                ou.subject, ou.issuer
             ));
         }
+        if self.chain.is_empty() {
+            return None;
+        }
+        let agents = |names: Vec<&str>| names.join(" > ");
+        let case_agents: Vec<&str> = self.chain.iter().map(HopSpec::agent).collect();
+        let token_agents: Vec<&str> = token_chain
+            .hops
+            .iter()
+            .map(|h| h.agent.0.as_str())
+            .collect();
+        if case_agents != token_agents {
+            return Some(format!(
+                "`chain` {} differs from the token's chain {}",
+                agents(case_agents),
+                agents(token_agents)
+            ));
+        }
+        for (spec, hop) in self.chain.iter().zip(&token_chain.hops) {
+            let Some(caps) = spec.capabilities() else {
+                continue;
+            };
+            let same = caps
+                .iter()
+                .map(CapSpec::to_capability)
+                .collect::<Result<CapabilitySet, _>>()
+                .is_ok_and(|c| c == hop.capabilities);
+            if !same {
+                return Some(format!(
+                    "the capabilities of hop `{}` differ from the token's",
+                    spec.agent()
+                ));
+            }
+        }
+        None
     }
-    report.passed = report.failures.is_empty();
-    report.actual = Some(actual);
-    report
+
+    /// Compare what was decided with what the case expects.
+    pub fn check(&self, actual: Actual) -> CaseReport {
+        let case = self;
+        let mut report = self.report();
+        if !case.expect.matches(&actual.decision) {
+            report.failures.push(format!(
+                "expected {}, got {} ({})",
+                case.expect,
+                decision_str(&actual.decision),
+                actual.reason
+            ));
+        }
+        if let Some(want) = &case.reason {
+            if *want != actual.reason {
+                report
+                    .failures
+                    .push(format!("expected reason {want}, got {}", actual.reason));
+            }
+        }
+        if let Some(want) = &case.policy_ids {
+            let mut w = want.clone();
+            let mut g = actual.policy_ids.clone();
+            w.sort();
+            g.sort();
+            if w != g {
+                report.failures.push(format!(
+                    "expected policy_ids [{}], got [{}]",
+                    want.join(", "),
+                    actual.policy_ids.join(", ")
+                ));
+            }
+        }
+        report.passed = report.failures.is_empty();
+        report.actual = Some(actual);
+        report
+    }
 }
 
 fn decision_str(d: &Decision) -> &'static str {
@@ -1286,5 +1690,168 @@ catalog:
         let v = serde_json::to_value(f.run().unwrap()).unwrap();
         assert_eq!(v["cases"][0]["actual"]["decision"], "deny");
         assert_eq!(v["cases"][0]["passed"], true);
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    const POLICY: &str = "@id(\"read\")\npermit(principal, action == Action::\"github/read_file\", resource);\n\n// no id: Cedar calls it policy1\nforbid(principal, action, resource) when { context.chain.depth > 2 };\n\n@id(\"shadowed\")\npermit(principal, action == Action::\"github/read_file\", resource) when { context.chain.depth > 2 };\n\n@id(\"delete\")\npermit(principal, action == Action::\"github/delete_repo\", resource);\n";
+
+    fn setup(cases: &str) -> (tempfile::TempDir, TestFile) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("p.cedar"), POLICY).unwrap();
+        let path = dir.path().join("t.yaml");
+        std::fs::write(
+            &path,
+            format!("policies: ./p.cedar\ncatalog:\n  github:\n    read_file: {{ readonly: true }}\n    delete_repo: {{}}\ncases:\n{cases}"),
+        )
+        .unwrap();
+        let f = TestFile::load(&path).unwrap();
+        (dir, f)
+    }
+
+    const READ: &str = "  - name: read\n    chain: [a]\n    call: { server: github, tool: read_file }\n    expect: allow\n";
+    const DEEP: &str = "  - name: deep\n    chain: [a, b, c]\n    call: { server: github, tool: read_file }\n    expect: deny\n";
+    const DELETE: &str = "  - name: delete\n    chain: [a]\n    call: { server: github, tool: delete_repo }\n    expect: allow\n";
+
+    #[test]
+    fn policy_refs_name_and_locate_every_policy() {
+        let refs = policy_refs(POLICY, Some(Path::new("p.cedar"))).unwrap();
+        let got: Vec<(&str, Option<usize>)> =
+            refs.iter().map(|r| (r.id.as_str(), r.line)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("read", Some(1)),
+                ("policy1", Some(5)),
+                ("shadowed", Some(7)),
+                ("delete", Some(10))
+            ]
+        );
+        assert_eq!(refs[1].to_string(), "policy1 (p.cedar:5)");
+        assert!(policy_refs("permit(principal action resource);", None).is_err());
+    }
+
+    #[test]
+    fn unexercised_lists_policies_no_decision_depended_on() {
+        let (_d, f) = setup(&format!("{READ}{DEEP}"));
+        let report = f.run().unwrap();
+        assert!(report.all_passed(), "{report:?}");
+        assert_eq!(report.policies.len(), 4);
+        let un: Vec<&str> = report.unexercised().iter().map(|p| p.id.as_str()).collect();
+        // `shadowed` matched the deep call, but the forbid decided it.
+        assert_eq!(un, vec!["shadowed", "delete"]);
+        let file = report.policies[0].file.as_ref().unwrap();
+        assert!(file.ends_with("p.cedar"), "{file:?}");
+        assert!(!file.to_string_lossy().contains("/./"), "{file:?}");
+    }
+
+    #[test]
+    fn failing_cases_still_exercise_and_coverage_merges_files() {
+        // The case fails (expect deny, got allow), yet `delete` decided it.
+        let wrong = "  - name: delete\n    chain: [a]\n    call: { server: github, tool: delete_repo }\n    expect: deny\n";
+        let (d, f1) = setup(wrong);
+        let r1 = f1.run().unwrap();
+        assert_eq!(r1.failed(), 1);
+        assert!(r1.exercised_ids().contains("delete"));
+
+        // A second test file over the same policy file.
+        let p2 = d.path().join("t2.yaml");
+        std::fs::write(
+            &p2,
+            format!("policies: p.cedar\ncatalog:\n  github:\n    read_file: {{ readonly: true }}\n    delete_repo: {{}}\ncases:\n{READ}"),
+        )
+        .unwrap();
+        let r2 = TestFile::load(&p2).unwrap().run().unwrap();
+        let cov = coverage([&r1, &r2]);
+        assert_eq!(cov.policies, 4);
+        assert_eq!(cov.exercised(), 2);
+        let un: Vec<&str> = cov.unexercised.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(un, vec!["policy1", "shadowed"]);
+
+        let (_d, all) = setup(&format!("{READ}{DEEP}{DELETE}"));
+        let cov = coverage([&all.run().unwrap()]);
+        // `shadowed` can never decide: the forbid wins whenever it matches.
+        let un: Vec<&str> = cov.unexercised.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(un, vec!["shadowed"]);
+    }
+
+    #[test]
+    fn authzen_skip_reason_matches_cases_against_the_token_chain() {
+        let f = TestFile::from_yaml_str(
+            r#"
+cases:
+  - name: same
+    user: { subject: carol, attributes: { mfa: true } }
+    chain:
+      - { agent: a, capabilities: ["github:*"] }
+      - b
+    call: { server: github, tool: read_file }
+    expect: allow
+  - name: any chain
+    call: { server: github, tool: read_file }
+    expect: allow
+  - name: narrower hop
+    chain:
+      - { agent: a, capabilities: ["github:*"] }
+      - { agent: b, capabilities: ["github:read_file"] }
+    call: { server: github, tool: read_file }
+    expect: allow
+  - name: other attrs
+    user: { subject: carol }
+    call: { server: github, tool: read_file }
+    expect: allow
+  - name: with usage
+    usage: { calls: 1 }
+    call: { server: github, tool: read_file }
+    expect: allow
+"#,
+        )
+        .unwrap();
+        // The token's chain is the one the first case describes.
+        let token = f.cases[0].input(f.now_unix()).unwrap().chain;
+        let why = |i: usize| f.cases[i].authzen_skip_reason(&token);
+        assert_eq!(why(0), None);
+        assert_eq!(why(1), None);
+        assert!(why(2).unwrap().contains("hop `b`"), "{:?}", why(2));
+        assert!(why(3).unwrap().contains("`user` differs"), "{:?}", why(3));
+        assert!(
+            why(4).unwrap().starts_with("`usage` cannot"),
+            "{:?}",
+            why(4)
+        );
+        let skipped = f.cases[4].skip("x");
+        assert!(!skipped.passed && skipped.skipped.is_some());
+        let report = TestReport {
+            source: None,
+            cases: vec![skipped, f.cases[0].errored("broken")],
+            policies: Vec::new(),
+        };
+        assert_eq!(
+            (report.passed(), report.failed(), report.skipped()),
+            (0, 1, 1)
+        );
+    }
+
+    #[test]
+    fn run_with_lists_engine_policies_without_location_and_no_policies_means_none() {
+        let (_d, f) = setup(READ);
+        let engine = f.build_engine().unwrap();
+        let r = f.run_with(&engine);
+        assert_eq!(r.policies.len(), 4);
+        assert!(r
+            .policies
+            .iter()
+            .all(|p| p.file.is_none() && p.line.is_none()));
+
+        let none = TestFile::from_yaml_str(
+            "cases:\n  - name: x\n    call: { server: s, tool: t }\n    expect: deny\n",
+        )
+        .unwrap();
+        let r = none.run().unwrap();
+        assert!(r.policies.is_empty());
+        assert_eq!(coverage([&r]), Coverage::default());
     }
 }

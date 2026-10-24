@@ -91,6 +91,19 @@ when {
 
 Declaring an attribute does not make it appear. The value comes from the verified IdP token: add the claim to `attribute_claims` in the `[[idps]]` entry (`groups` is there by default). If a token carries a value of a different type than declared, for example a string where you declared `set<string>`, attenuo denies the call before any policy runs, with reason `attribute_type_mismatch` (audited, and shown by `attenuo policy test`). Nothing is coerced. This matters because Cedar's `!=` across types is `true` without an error: `attributes.status != "suspended"` would otherwise permit `["suspended"]`. Still guard each use with `has` and prefer `.contains` and `like` over `!=` for exclusions. `attenuo policy lint --config server.toml` and `attenuo policy test` (when the test file's `catalog:` points at the server config) read `user_attributes` too, so tests and lint see the same schema as the server.
 
+### A custom base schema
+
+The schema has two parts: a base that declares the entity types (`User`, `Agent`, `Server`, `Tool` and their attributes; `attenuo_policy::DEFAULT_SCHEMA`, printed at the top of `attenuo policy lint --schema`), and the actions and context types generated from the catalog. You can replace the base with your own Cedar schema file, to declare an extra entity type your policies name or an optional attribute:
+
+```toml
+[policy]
+schema_path = "config/base.cedarschema"
+```
+
+`attenuo policy test --schema-file F` and `attenuo policy lint --schema-file F` take the same file (and both read `schema_path` from the config they are given). The file must keep what attenuo builds every request from: the four entity types with every attribute of the default, each required and of the same type, `Agent in [User, Agent]` and `Tool in [Server]`. Start from the default and add to it. A file that drops or changes any of that is refused, by the server at start and by the CLI before any case runs, with the missing part named, for example `custom base schema: it does not declare the entity type(s) Server`. Leave actions out: they are generated, and a declared one with a generated name (`invoke`, `<server>/<tool>`) fails to parse.
+
+The request data does not change: attenuo fills only the default attributes. Declare anything you add as optional (`owner?: String`) and guard it with `has`; a required attribute that is never filled makes every policy that reads it fail at evaluation, and the call is denied with `policy_error`.
+
 ## Patterns
 
 All of these assume the catalog above.
@@ -320,7 +333,7 @@ The harness builds a real `DelegationChain` and calls the same `PolicyEngine::au
 ### Running
 
 ```sh
-attenuo policy test policy_test.yaml [more.yaml ...] [--json]
+attenuo policy test policy_test.yaml [more.yaml ...] [--fail-on-unexercised] [--schema-file F] [--watch] [--json]
 ```
 
 ```
@@ -330,9 +343,37 @@ examples/github-leak-demo/policy_test.yaml
       expected deny, got allow (policy_allow)
 
 8 passed, 1 failed (9 cases in 1 file)
+1 of 5 policies not exercised:
+  examples/github-leak-demo/policy.cedar:37  forbid_deep_chains
 ```
 
 Exit status: `0` all cases pass, `2` some case fails, `1` a file could not be run (unreadable, malformed, policy that does not parse or validate). `--json` prints one object with every case, the actual decision, the policy ids that decided it and any diagnostics, for tooling.
+
+#### Unexercised policies
+
+The last lines of a run list the policies that no case exercised, with the file and the line the policy starts on (its first annotation, or `permit`/`forbid`), named by `@id` or, without one, by Cedar's `policy<N>` (the N-th statement of the file, counting from 0). A policy is exercised when it decided at least one evaluated case: it is in that case's `policy_ids`, whether the case passed or not. Cases denied before Cedar runs (`capability_denied`, `tool_not_in_catalog`) exercise nothing, and neither does a default deny (no `permit` matched). A `permit` that matched only calls a `forbid` also matched is not exercised either, since the `forbid` decided them. When several test files name the same policy file, a case in any of them counts.
+
+`--fail-on-unexercised` turns the list into a failure (exit `2`) for CI. With `--json` the same information is in `coverage`: `{"policies": 5, "exercised": 4, "unexercised": [{"id": "forbid_deep_chains", "file": "...", "line": 37}]}`.
+
+#### Against a running server
+
+The offline run proves the policy file. To check what a deployed server actually decides (its loaded policies, its catalog, its configuration), send the same cases to its AuthZEN endpoint:
+
+```sh
+attenuo --server https://attenuo.internal policy test --via authzen --token-file coder.jwt policy_test.yaml
+```
+
+Each case's call goes to `POST /access/v1/evaluation` with the token as the bearer, and the answer is compared with the case's `expect`, `reason` and `policy_ids` exactly as offline; the output and exit status are the same. The server takes the chain from the token, not from the case, and keeps the run's labels, approvals, budgets and usage itself. So a case runs only when what it describes is what the token is:
+
+- no `session`, `approval`, `budget`, `usage` or `user.authenticated_at_unix`;
+- a `user`, if the case sets one, equal to the token's user (subject, issuer and exactly the same attributes);
+- a `chain`, if the case sets one, naming the token's agents in order, with any explicit `capabilities` equal to that hop's capabilities in the token.
+
+Other cases are listed as skipped, with the reason, and do not fail the run. The file's `catalog`, `unknown_tools` and `now` are ignored, since the server uses its own. Every evaluation is a real decision, so each case leaves an audit record on that server; use a test token and a test run, not a production agent's token. The unexercised list still comes from the test file's local `policies` file, which may differ from what the server has loaded.
+
+#### While editing
+
+`attenuo policy test --watch policy_test.yaml` runs the suite, then runs it again every time you save the test file, its policy file, its catalog or server config, or the base schema file. It polls every 250 ms and waits until the files have been quiet for 200 ms, so an editor that writes in several steps causes one run. Each run clears the screen first. Stop it with Ctrl-C.
 
 The same runner is available as a library, `attenuo_policy::testing`, for tests written in Rust.
 
@@ -378,4 +419,4 @@ Pin the install to a tag or `--rev` once releases exist, so a CLI change cannot 
 - A capability denial, to prove the chain is narrower than the policy.
 - The boundary of numeric limits (`depth > 3`: three agents pass, four do not).
 
-A `forbid` that never appears in a passing test is a `forbid` you have not shown works.
+A `forbid` that never appears in a passing test is a `forbid` you have not shown works. The unexercised list at the end of every run names the ones no case reached at all.

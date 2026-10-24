@@ -239,6 +239,45 @@ fn action_refs(text: &str) -> Vec<ActionRef> {
     out
 }
 
+/// The 1-based line each policy statement of `text` starts on, in file order, so entry `n` is
+/// the statement Cedar names `policy<n>`. A small scanner like [`action_refs`]: it skips `//`
+/// comments and string literals and splits statements at `;`. Only run on text that already
+/// parsed.
+pub(crate) fn statement_lines(text: &str) -> Vec<usize> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut in_statement = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if b == b';' {
+            in_statement = false;
+            i += 1;
+            continue;
+        }
+        if !in_statement {
+            in_statement = true;
+            out.push(line_col(text, i).0);
+        }
+        i = if b == b'"' {
+            read_string(text, i).1
+        } else {
+            i + 1
+        };
+    }
+    out
+}
+
 /// Distinct action ids named as `Action::"<id>"` in `policy_text`, sorted. Used by the CLI to
 /// declare the policy's own server-scoped tools when no catalog is available.
 pub fn policy_action_names(policy_text: &str) -> Vec<String> {
@@ -522,6 +561,13 @@ mod tests {
         let refs = action_refs(text);
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].policy_id, "policy1");
+    }
+
+    #[test]
+    fn statement_lines_skip_comments_and_strings() {
+        let text = "// header; with a semicolon\n@id(\"a;b\")\npermit(principal, action, resource);\n\n  forbid(principal, action, resource)\n  when { context.input.x == \";\" }; // trailing; comment\npermit(principal, action, resource);";
+        assert_eq!(statement_lines(text), vec![2, 5, 7]);
+        assert!(statement_lines("// only a comment\n").is_empty());
     }
 
     #[test]

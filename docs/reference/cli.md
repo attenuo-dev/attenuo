@@ -1,6 +1,6 @@
 # CLI commands
 
-The `attenuo` binary comes from the `attenuo-cli` crate. It talks to a running attenuo server over HTTP, except for `policy test` and `policy lint`, which run offline.
+The `attenuo` binary comes from the `attenuo-cli` crate. It talks to a running attenuo server over HTTP, except for `policy test` (unless `--via authzen`) and `policy lint`, which run offline.
 
 ```
 attenuo [--server URL] [--json] <command>
@@ -333,6 +333,22 @@ ATTENUO_TOKEN="$CODER" attenuo policy evaluate --server github --tool create_iss
 
 Run YAML policy test files offline. Exit 0 if every case passes, 2 if any fails, 1 if a file cannot be run. The format is in [Writing policies](../guides/writing-policies.md).
 
+After the cases, the run lists the policies no case exercised: `N of M policies not exercised:` and one `file:line  id` line each, or `all M policies exercised`. A policy is exercised when it is among the policies that decided at least one evaluated case (the `policy_ids` of the result), whether that case passed or not. Test files that name the same policy file share its policies. With `--json` the output has a `coverage` object: `policies` (the total), `exercised`, and `unexercised` as `[{id, file, line}]`.
+
+| Option | Meaning |
+| --- | --- |
+| `--fail-on-unexercised` | Exit 2 when some policy was not exercised, even if every case passed. Off by default. |
+| `--via local\|authzen` | Where the cases are decided. `local` (default) builds the engine from the test file and runs offline. `authzen` sends each case to `POST /access/v1/evaluation` of the server named by the global `--server`, with the token below as the bearer. |
+| `--token <JWT\|->` (`ATTENUO_TOKEN`) / `--token-file PATH` / `--dpop-key PATH` | With `--via authzen`: the delegation token whose chain makes every call, and its DPoP key if it is bound to one. Refused without `--via authzen`. |
+| `--schema-file PATH` | Cedar schema file replacing the built-in base schema (the entity types) for every test file, over the `[policy] schema_path` of a server config named by `catalog:`. It must still declare `User`, `Agent in [User, Agent]`, `Server` and `Tool in [Server]` with every attribute of the default, required and of the same type; otherwise the file cannot be run (exit 1) and the error says what is missing. Not with `--via authzen`. |
+| `--watch` | Run again whenever a test file, or the policy file, catalog or server config, or base schema file one of them reads, changes. The files are polled every 250 ms (no file-notification dependency); a change runs the suite once it has stayed unchanged for 200 ms. The screen is cleared before each run (not with `--json`), and a `watching N file(s)` line goes to stderr. Exit with Ctrl-C. Works with `--via authzen` too. |
+
+With `--via authzen` the server decides with its own policies, catalog and clock, and takes the chain from the token, so the test file's `catalog`, `unknown_tools` and `now` do not apply (a `note:` says so for `now`), and the unexercised list is computed against the test file's local `policies` file. A case that sets something the endpoint cannot carry is skipped, not failed, and the run prints why: `session`, `approval`, `budget`, `usage` or `user.authenticated_at_unix`; a `user` other than the default that differs from the token's user (subject, issuer, attributes); a `chain` whose agents differ from the token's, or whose explicit `capabilities` differ from the token hop's. The summary then reads `N passed, M failed, K skipped`, and `--json` has `skipped` per file and in total. A refused token or an unreachable server stops that file with an error (exit 1). Each evaluation is a real decision, so the server writes an audit record for every case it decides.
+
+```sh
+attenuo --server https://attenuo.internal policy test --via authzen --token-file coder.jwt policy_test.yaml
+```
+
 ### `policy lint <POLICY>`
 
 Parse a Cedar policy file and validate it against the generated schema. Prints errors with line and column. Exit 0 if clean, 2 if there are errors.
@@ -340,6 +356,7 @@ Parse a Cedar policy file and validate it against the generated schema. Prints e
 | Option | Meaning |
 | --- | --- |
 | `--config` | Server config whose `[policy.catalog]` declares the tools, or a JSON catalog. Without it, the tools are declared from the policy's own `<server>/<tool>` action names and a `note:` lists what could not be checked (tool attributes, input types, user attributes). |
+| `--schema-file PATH` | Cedar schema file replacing the built-in base schema, over the config's `[policy] schema_path`. Checked as the server checks it at start: a file without the required entity types, attributes or hierarchy is an error (exit 1). |
 | `--schema` | Also print the generated schema. |
 
 ### `approval list` / `show` / `grant` / `decline` / `verify`

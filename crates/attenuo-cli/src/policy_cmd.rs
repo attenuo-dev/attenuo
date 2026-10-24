@@ -1,5 +1,6 @@
 //! `attenuo policy test` and `attenuo policy lint`: offline checks of a policy set. They
-//! never talk to a server.
+//! never talk to a server, except `policy test --via authzen`, which sends the cases to a
+//! running server's AuthZEN endpoint.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -49,47 +50,197 @@ fn pretty(v: &Value) -> String {
     format!("{}\n", serde_json::to_string_pretty(v).unwrap_or_default())
 }
 
+/// How `policy test` runs and when it fails, beyond the files.
+#[derive(Debug, Clone, Default)]
+pub struct TestOptions {
+    /// Fail (exit 2) when some policy was not exercised by any case.
+    pub fail_on_unexercised: bool,
+    /// Base schema replacing the built-in one (and any config's `[policy] schema_path`).
+    pub schema_file: Option<PathBuf>,
+}
+
+impl From<&crate::cli::TestArgs> for TestOptions {
+    fn from(a: &crate::cli::TestArgs) -> Self {
+        Self {
+            fail_on_unexercised: a.fail_on_unexercised,
+            schema_file: a.schema_file.clone(),
+        }
+    }
+}
+
 /// `attenuo policy test <file>...`
-pub fn test(files: &[PathBuf], json_out: bool) -> Run {
-    let mut run = Run::new();
+pub fn test(files: &[PathBuf], opts: &TestOptions, json_out: bool) -> Run {
     let mut reports: Vec<(&Path, TestReport)> = Vec::new();
     let mut errors: Vec<(&Path, String)> = Vec::new();
     for path in files {
-        match TestFile::load(path).and_then(|f| f.run()) {
+        let loaded = TestFile::load(path).map(|f| match &opts.schema_file {
+            Some(s) => f.with_schema_file(s),
+            None => f,
+        });
+        match loaded.and_then(|f| f.run()) {
             Ok(report) => reports.push((path, report)),
             Err(e) => errors.push((path, e.to_string())),
         }
     }
+    report(&reports, &errors, &[], opts, json_out)
+}
+
+/// The server and credentials of `policy test --via authzen`.
+pub struct Remote<'a> {
+    pub client: &'a crate::client::Client,
+    pub token: &'a str,
+    pub dpop_key: Option<&'a attenuo_token::DpopKey>,
+}
+
+/// `attenuo policy test --via authzen <file>...`: every case is decided by the server's
+/// `POST /access/v1/evaluation`, with the token's chain. Cases the endpoint cannot express
+/// (see [`testing::TestCase::authzen_skip_reason`]) are skipped and listed as such. Every
+/// evaluation is a real decision on the server, so each one writes an audit record there.
+pub async fn test_authzen(
+    files: &[PathBuf],
+    remote: &Remote<'_>,
+    opts: &TestOptions,
+    json_out: bool,
+) -> Run {
+    let token_chain = match crate::jwt::decode_unverified(remote.token) {
+        Ok(d) => d.claims.chain,
+        Err(e) => return Run::error(format!("--token: {e:#}")),
+    };
+    let mut reports: Vec<(&Path, TestReport)> = Vec::new();
+    let mut errors: Vec<(&Path, String)> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    for path in files {
+        let file = match TestFile::load(path) {
+            Ok(f) => f,
+            Err(e) => {
+                errors.push((path, e.to_string()));
+                continue;
+            }
+        };
+        if file.sets_now() {
+            notes.push(format!(
+                "{}: `now` is not sent; the server evaluates at its own clock",
+                path.display()
+            ));
+        }
+        let mut cases = Vec::with_capacity(file.cases.len());
+        let mut failure = None;
+        for case in &file.cases {
+            if let Some(why) = case.authzen_skip_reason(&token_chain) {
+                cases.push(case.skip(why));
+                continue;
+            }
+            let input = match case.input(file.now_unix()) {
+                Ok(i) => i,
+                Err(e) => {
+                    cases.push(case.errored(e));
+                    continue;
+                }
+            };
+            let body = authzen_body(&input.call);
+            match remote
+                .client
+                .authzen(remote.token, &body, remote.dpop_key)
+                .await
+                .and_then(|v| {
+                    serde_json::from_value::<attenuo_policy::authzen::EvaluationResponse>(v)
+                        .map_err(|e| anyhow::anyhow!("the server's answer is not AuthZEN: {e}"))
+                }) {
+                Ok(resp) => cases.push(case.check(testing::Actual::from(
+                    attenuo_policy::authzen::to_outcome(&resp),
+                ))),
+                Err(e) => {
+                    // A refused token or an unreachable server fails every case the same way.
+                    failure = Some(format!("case `{}`: {e:#}", case.name));
+                    break;
+                }
+            }
+        }
+        match failure {
+            Some(e) => errors.push((path, e)),
+            None => match file.report_for(cases) {
+                Ok(r) => reports.push((path, r)),
+                Err(e) => errors.push((path, e.to_string())),
+            },
+        }
+    }
+    report(&reports, &errors, &notes, opts, json_out)
+}
+
+/// The AuthZEN request for a case's call. The subject id is left empty: the server fills it
+/// from the bearer's chain, which is the chain that makes the call.
+fn authzen_body(call: &attenuo_core::ToolCall) -> Value {
+    let mut context =
+        json!({ "input": Value::Object(call.arguments.clone().into_iter().collect()) });
+    if let Some(sid) = &call.session_id {
+        context["session_id"] = json!(sid);
+    }
+    json!({
+        "subject": {"type": "agent", "id": ""},
+        "action": {"name": call.tool, "properties": {"server": call.server}},
+        "resource": {"type": "tool", "id": format!("{}/{}", call.server, call.tool),
+                     "properties": {"server": call.server, "tool": call.tool}},
+        "context": context,
+    })
+}
+
+/// Print the reports of a `policy test` run (however the cases were evaluated) and decide its
+/// status.
+fn report(
+    reports: &[(&Path, TestReport)],
+    errors: &[(&Path, String)],
+    notes: &[String],
+    opts: &TestOptions,
+    json_out: bool,
+) -> Run {
+    let mut run = Run::new();
     let passed: usize = reports.iter().map(|(_, r)| r.passed()).sum();
     let failed: usize = reports.iter().map(|(_, r)| r.failed()).sum();
+    let skipped: usize = reports.iter().map(|(_, r)| r.skipped()).sum();
+    let coverage = testing::coverage(reports.iter().map(|(_, r)| r));
 
     if json_out {
         let mut entries: Vec<Value> = reports
             .iter()
             .map(|(p, r)| {
-                json!({"file": p, "cases": r.cases, "passed": r.passed(), "failed": r.failed()})
+                json!({"file": p, "cases": r.cases, "passed": r.passed(), "failed": r.failed(),
+                       "skipped": r.skipped()})
             })
             .collect();
         entries.extend(errors.iter().map(|(p, e)| json!({"file": p, "error": e})));
         run.stdout = pretty(&json!({
-            "files": entries, "passed": passed, "failed": failed, "errors": errors.len(),
+            "files": entries, "passed": passed, "failed": failed, "skipped": skipped,
+            "errors": errors.len(),
+            "notes": notes,
+            "coverage": {
+                "policies": coverage.policies,
+                "exercised": coverage.exercised(),
+                "unexercised": coverage.unexercised,
+            },
         }));
     } else {
-        for (path, report) in &reports {
+        for n in notes {
+            let _ = writeln!(run.stdout, "note: {n}");
+        }
+        for (path, report) in reports {
             let _ = writeln!(run.stdout, "{}", path.display());
             for case in &report.cases {
                 render_case(&mut run.stdout, case);
             }
             run.stdout.push('\n');
         }
-        for (path, e) in &errors {
+        for (path, e) in errors {
             let _ = writeln!(run.stderr, "error: {}: {e}", path.display());
         }
         if !reports.is_empty() {
+            let _ = write!(run.stdout, "{passed} passed, {failed} failed");
+            if skipped > 0 {
+                let _ = write!(run.stdout, ", {skipped} skipped");
+            }
             let _ = write!(
                 run.stdout,
-                "{passed} passed, {failed} failed ({} cases in {} file{})",
-                passed + failed,
+                " ({} cases in {} file{})",
+                passed + failed + skipped,
                 reports.len(),
                 if reports.len() == 1 { "" } else { "s" }
             );
@@ -97,11 +248,13 @@ pub fn test(files: &[PathBuf], json_out: bool) -> Run {
                 let _ = write!(run.stdout, "; {} file(s) could not be run", errors.len());
             }
             run.stdout.push('\n');
+            render_coverage(&mut run.stdout, &coverage);
         }
     }
+    let unexercised_fails = opts.fail_on_unexercised && !coverage.unexercised.is_empty();
     run.status = if !errors.is_empty() {
         Status::Error
-    } else if failed > 0 {
+    } else if failed > 0 || unexercised_fails {
         Status::Failed
     } else {
         Status::Ok
@@ -109,7 +262,42 @@ pub fn test(files: &[PathBuf], json_out: bool) -> Run {
     run
 }
 
+fn render_coverage(out: &mut String, coverage: &testing::Coverage) {
+    if coverage.policies == 0 {
+        return;
+    }
+    let plural = |n: usize| if n == 1 { "policy" } else { "policies" };
+    if coverage.unexercised.is_empty() {
+        let _ = writeln!(
+            out,
+            "all {} {} exercised",
+            coverage.policies,
+            plural(coverage.policies)
+        );
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "{} of {} {} not exercised:",
+        coverage.unexercised.len(),
+        coverage.policies,
+        plural(coverage.policies)
+    );
+    for p in &coverage.unexercised {
+        let loc = match (&p.file, p.line) {
+            (Some(f), Some(l)) => format!("{}:{l}", f.display()),
+            (Some(f), None) => f.display().to_string(),
+            (None, _) => "-".to_string(),
+        };
+        let _ = writeln!(out, "  {loc}  {}", p.id);
+    }
+}
+
 fn render_case(out: &mut String, case: &CaseReport) {
+    if let Some(why) = &case.skipped {
+        let _ = writeln!(out, "  - {}  (skipped: {why})", case.name);
+        return;
+    }
     let mark = if case.passed { "\u{2713}" } else { "\u{2717}" };
     let detail = match &case.actual {
         Some(a) => {
@@ -162,7 +350,21 @@ fn catalog_from_policy(text: &str) -> (attenuo_policy::ToolCatalog, Vec<String>)
 }
 
 /// `attenuo policy lint <policy.cedar> [--config server.toml] [--schema]`
+#[cfg(test)]
 pub fn lint(policy: &Path, config: Option<&Path>, show_schema: bool, json_out: bool) -> Run {
+    lint_with_schema(policy, config, None, show_schema, json_out)
+}
+
+/// `attenuo policy lint <policy.cedar> [--config server.toml] [--schema-file F] [--schema]`.
+/// The base schema is `schema_file`, else the config's `[policy] schema_path`, else the
+/// built-in one.
+pub fn lint_with_schema(
+    policy: &Path,
+    config: Option<&Path>,
+    schema_file: Option<&Path>,
+    show_schema: bool,
+    json_out: bool,
+) -> Run {
     let mut run = Run::new();
     let text = match std::fs::read_to_string(policy) {
         Ok(t) => t,
@@ -211,6 +413,25 @@ pub fn lint(policy: &Path, config: Option<&Path>, show_schema: bool, json_out: b
         .with_legacy_bare_actions(legacy_bare_actions);
     for (name, ty) in user_attrs {
         builder = builder.with_user_attr(name, ty);
+    }
+    let base_path = match schema_file {
+        Some(p) => Some(p.to_path_buf()),
+        None => match config
+            .map(testing::load_schema_path_from_config)
+            .transpose()
+        {
+            Ok(p) => p.flatten(),
+            Err(e) => return Run::error(e.to_string()),
+        },
+    };
+    if let Some(p) = &base_path {
+        match std::fs::read_to_string(p) {
+            Ok(base) => builder = builder.with_schema_str(&base),
+            Err(e) => return Run::error(format!("reading {}: {e}", p.display())),
+        }
+        if let Err(e) = builder.check_schema() {
+            return Run::error(format!("{}: {e}", p.display()));
+        }
     }
     let schema = builder.schema_text();
     let report = attenuo_policy::lint_with_options(
@@ -314,7 +535,7 @@ mod tests {
     #[test]
     fn passing_file_exits_ok_with_checkmarks() {
         let (_d, t) = setup("allow");
-        let r = test(&[t], false);
+        let r = test(&[t], &TestOptions::default(), false);
         assert_eq!(r.status, Status::Ok);
         assert!(r.stdout.contains("\u{2713} read"), "{}", r.stdout);
         assert!(r.stdout.contains("1 passed, 0 failed (1 cases in 1 file)"));
@@ -323,7 +544,7 @@ mod tests {
     #[test]
     fn failing_case_exits_failed_and_explains() {
         let (_d, t) = setup("deny");
-        let r = test(&[t], false);
+        let r = test(&[t], &TestOptions::default(), false);
         assert_eq!(r.status, Status::Failed);
         assert!(r.stdout.contains("\u{2717} read"));
         assert!(
@@ -337,7 +558,11 @@ mod tests {
     fn unreadable_or_malformed_file_exits_error_but_others_still_run() {
         let (d, t) = setup("allow");
         let bad = write(d.path(), "bad.yaml", "cases: [");
-        let r = test(&[bad, t, d.path().join("missing.yaml")], false);
+        let r = test(
+            &[bad, t, d.path().join("missing.yaml")],
+            &TestOptions::default(),
+            false,
+        );
         assert_eq!(r.status, Status::Error);
         assert!(r.stdout.contains("1 passed"));
         assert_eq!(r.stderr.matches("error:").count(), 2, "{}", r.stderr);
@@ -346,10 +571,57 @@ mod tests {
     #[test]
     fn json_output_is_machine_readable() {
         let (_d, t) = setup("deny");
-        let r = test(&[t], true);
+        let r = test(&[t], &TestOptions::default(), true);
         let v: Value = serde_json::from_str(&r.stdout).unwrap();
         assert_eq!(v["failed"], 1);
         assert_eq!(v["files"][0]["cases"][0]["actual"]["decision"], "allow");
+        assert_eq!(v["coverage"]["policies"], 1);
+        assert_eq!(v["coverage"]["exercised"], 1);
+        assert_eq!(v["coverage"]["unexercised"], json!([]));
+    }
+
+    #[test]
+    fn unexercised_policies_are_listed_and_fail_only_on_request() {
+        let d = tempfile::tempdir().unwrap();
+        write(
+            d.path(),
+            "p.cedar",
+            &format!("{POLICY}\n@id(\"never\")\nforbid(principal, action, resource) when {{ context.chain.depth > 5 }};\n"),
+        );
+        write(d.path(), "c.toml", CONFIG);
+        let t = write(
+            d.path(),
+            "t.yaml",
+            "policies: p.cedar\ncatalog: c.toml\ncases:\n  - name: read\n    chain: [coder]\n    call: { server: github, tool: read_file }\n    expect: allow\n",
+        );
+        let r = test(std::slice::from_ref(&t), &TestOptions::default(), false);
+        assert_eq!(r.status, Status::Ok, "{}", r.stdout);
+        assert!(
+            r.stdout.contains("1 of 2 policies not exercised:"),
+            "{}",
+            r.stdout
+        );
+        let line = format!("  {}:4  never", d.path().join("p.cedar").display());
+        assert!(r.stdout.contains(&line), "{}", r.stdout);
+
+        let strict = TestOptions {
+            fail_on_unexercised: true,
+            ..TestOptions::default()
+        };
+        let r = test(std::slice::from_ref(&t), &strict, false);
+        assert_eq!(r.status, Status::Failed, "{}", r.stdout);
+
+        let j = test(std::slice::from_ref(&t), &strict, true);
+        let v: Value = serde_json::from_str(&j.stdout).unwrap();
+        assert_eq!(v["coverage"]["policies"], 2);
+        assert_eq!(v["coverage"]["unexercised"][0]["id"], "never");
+        assert_eq!(v["coverage"]["unexercised"][0]["line"], 4);
+
+        // Every policy exercised: a one-line summary, and the strict run passes.
+        let (_d, t) = setup("allow");
+        let r = test(&[t], &strict, false);
+        assert_eq!(r.status, Status::Ok, "{}", r.stdout);
+        assert!(r.stdout.contains("all 1 policy exercised"), "{}", r.stdout);
     }
 
     #[test]
@@ -393,10 +665,34 @@ mod tests {
         let cli = Cli::try_parse_from(["attenuo", "policy", "test", "a.yaml", "b.yaml", "--json"])
             .unwrap();
         assert!(cli.json);
-        let Command::Policy(PolicyCmd::Test { files }) = cli.command else {
+        let Command::Policy(PolicyCmd::Test(args)) = cli.command else {
             panic!("not policy test")
         };
-        assert_eq!(files.len(), 2);
+        assert_eq!(args.files.len(), 2);
+        assert!(!args.fail_on_unexercised);
+        let cli = Cli::try_parse_from([
+            "attenuo",
+            "policy",
+            "test",
+            "a.yaml",
+            "--fail-on-unexercised",
+            "--watch",
+            "--schema-file",
+            "base.cedarschema",
+            "--via",
+            "authzen",
+            "--token-file",
+            "t.jwt",
+        ])
+        .unwrap();
+        let Command::Policy(PolicyCmd::Test(args)) = cli.command else {
+            panic!("not policy test")
+        };
+        assert!(args.fail_on_unexercised);
+        assert!(args.watch);
+        assert_eq!(args.schema_file, Some(PathBuf::from("base.cedarschema")));
+        assert_eq!(args.via, crate::cli::Via::Authzen);
+        assert_eq!(args.token.token_file, Some(PathBuf::from("t.jwt")));
 
         let cli = Cli::try_parse_from([
             "attenuo", "policy", "lint", "p.cedar", "--config", "s.toml", "--schema",
@@ -405,6 +701,7 @@ mod tests {
         let Command::Policy(PolicyCmd::Lint {
             policy,
             config,
+            schema_file,
             schema,
         }) = cli.command
         else {
@@ -413,6 +710,7 @@ mod tests {
         assert_eq!(policy, PathBuf::from("p.cedar"));
         assert_eq!(config, Some(PathBuf::from("s.toml")));
         assert!(schema);
+        assert_eq!(schema_file, None);
 
         assert!(Cli::try_parse_from(["attenuo", "policy", "test"]).is_err());
     }
@@ -448,5 +746,104 @@ mod tests {
     fn lint_missing_file_is_an_error() {
         let r = lint(Path::new("/nonexistent.cedar"), None, false, false);
         assert_eq!(r.status, Status::Error);
+    }
+
+    /// A base schema that adds an optional `owner` to `Tool`, and a policy that reads it.
+    fn custom_schema_setup() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let base = attenuo_policy::DEFAULT_SCHEMA.replace(
+            "    destructive: Bool,\n",
+            "    destructive: Bool,\n    owner?: String,\n",
+        );
+        let schema = write(d.path(), "base.cedarschema", &base);
+        let policy = write(
+            d.path(),
+            "p.cedar",
+            "@id(\"owned\")\npermit(principal, action == Action::\"github/read_file\", resource)\nwhen { resource has owner && resource.owner == \"alice\" };\n",
+        );
+        let t = write(
+            d.path(),
+            "t.yaml",
+            "policies: p.cedar\ncatalog: c.toml\ncases:\n  - name: no owner attribute at run time\n    call: { server: github, tool: read_file }\n    expect: deny\n",
+        );
+        write(d.path(), "c.toml", CONFIG);
+        (d, schema, policy, t)
+    }
+
+    #[test]
+    fn schema_file_replaces_the_base_schema_in_test_and_lint() {
+        let (d, schema, policy, t) = custom_schema_setup();
+        // The built-in base does not declare `owner`: the policy is impossible, so a warning.
+        let plain = lint(&policy, Some(&d.path().join("c.toml")), false, false);
+        assert!(plain.stdout.contains("1 warning(s)"), "{}", plain.stdout);
+
+        let opts = TestOptions {
+            schema_file: Some(schema.clone()),
+            ..TestOptions::default()
+        };
+        let r = test(std::slice::from_ref(&t), &opts, false);
+        assert_eq!(r.status, Status::Ok, "{}{}", r.stdout, r.stderr);
+        let l = lint_with_schema(
+            &policy,
+            Some(&d.path().join("c.toml")),
+            Some(&schema),
+            true,
+            false,
+        );
+        assert_eq!(l.status, Status::Ok, "{}{}", l.stdout, l.stderr);
+        assert!(l.stdout.contains("owner?: String"), "{}", l.stdout);
+        assert!(
+            l.stdout.contains("0 error(s), 0 warning(s)"),
+            "{}",
+            l.stdout
+        );
+
+        // The config's `[policy] schema_path` (relative to the config) works the same way.
+        write(
+            d.path(),
+            "c.toml",
+            &format!("[policy]\nschema_path = \"base.cedarschema\"\n{CONFIG}"),
+        );
+        let r = test(std::slice::from_ref(&t), &TestOptions::default(), false);
+        assert_eq!(r.status, Status::Ok, "{}{}", r.stdout, r.stderr);
+        let l = lint(&policy, Some(&d.path().join("c.toml")), false, false);
+        assert!(l.stdout.contains("0 warning(s)"), "{}", l.stdout);
+    }
+
+    #[test]
+    fn a_schema_file_without_the_required_entities_is_refused() {
+        let (d, _schema, policy, t) = custom_schema_setup();
+        let bad = write(
+            d.path(),
+            "bad.cedarschema",
+            &attenuo_policy::DEFAULT_SCHEMA.replace("chain_depth: Long", "chain_depth?: Long"),
+        );
+        let opts = TestOptions {
+            schema_file: Some(bad.clone()),
+            ..TestOptions::default()
+        };
+        let r = test(std::slice::from_ref(&t), &opts, false);
+        assert_eq!(r.status, Status::Error);
+        assert!(r.stderr.contains("custom base schema"), "{}", r.stderr);
+        assert!(r.stderr.contains("chain_depth"), "{}", r.stderr);
+
+        let l = lint_with_schema(&policy, None, Some(&bad), false, false);
+        assert_eq!(l.status, Status::Error);
+        assert!(l.stderr.contains("custom base schema"), "{}", l.stderr);
+
+        let no_server = write(
+            d.path(),
+            "noserver.cedarschema",
+            "entity User; entity Agent in [User, Agent]; entity Tool;",
+        );
+        let l = lint_with_schema(&policy, None, Some(&no_server), false, false);
+        assert!(
+            l.stderr
+                .contains("does not declare the entity type(s) Server"),
+            "{}",
+            l.stderr
+        );
+        let missing = lint_with_schema(&policy, None, Some(&d.path().join("nope")), false, false);
+        assert_eq!(missing.status, Status::Error);
     }
 }

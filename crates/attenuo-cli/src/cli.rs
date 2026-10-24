@@ -715,12 +715,8 @@ pub enum PolicyCmd {
     /// record. Exit 0 for allow, 2 for deny.
     Evaluate(EvaluateArgs),
     /// Run YAML policy test files offline. Exit 0 if every case passes, 2 if any fails,
-    /// 1 if a file cannot be run.
-    Test {
-        /// Test files (format documented in docs/guides/writing-policies.md).
-        #[arg(required = true)]
-        files: Vec<std::path::PathBuf>,
-    },
+    /// 1 if a file cannot be run. Ends with the policies no case exercised.
+    Test(TestArgs),
     /// Parse a Cedar policy file and validate it against the generated schema, printing
     /// errors with line and column. Exit 0 if clean, 2 if it has errors.
     Lint {
@@ -731,10 +727,54 @@ pub enum PolicyCmd {
         /// and a note says what could not be checked (tool attributes, input types).
         #[arg(long)]
         config: Option<std::path::PathBuf>,
+        /// Cedar schema file replacing the built-in base schema (the entity types), over the
+        /// config's `[policy] schema_path`. It must keep the default's entity types, attributes
+        /// and hierarchy.
+        #[arg(long, value_name = "PATH")]
+        schema_file: Option<std::path::PathBuf>,
         /// Also print the generated schema the policy was validated against.
         #[arg(long)]
         schema: bool,
     },
+}
+
+/// `policy test`: the files and how to run them.
+#[derive(Debug, Args)]
+pub struct TestArgs {
+    /// Test files (format documented in docs/guides/writing-policies.md).
+    #[arg(required = true)]
+    pub files: Vec<std::path::PathBuf>,
+    /// Exit 2 when some policy was not exercised by any case (no case's decision depended on
+    /// it), even if every case passed.
+    #[arg(long)]
+    pub fail_on_unexercised: bool,
+    /// Cedar schema file replacing the built-in base schema (the entity types) for every test
+    /// file, over any `[policy] schema_path` of the config a test file's `catalog` names. It
+    /// must keep the default's entity types, attributes and hierarchy. Not with `--via authzen`.
+    #[arg(long, value_name = "PATH")]
+    pub schema_file: Option<std::path::PathBuf>,
+    /// Run again whenever a test file, or a policy, catalog, config or schema file one of them
+    /// reads, changes (polled every 250 ms, settled for 200 ms). Clears the screen before each
+    /// run; stop with Ctrl-C.
+    #[arg(long)]
+    pub watch: bool,
+    /// Where the cases are decided: `local` (default, the in-process engine, offline) or
+    /// `authzen` (each case is sent to `POST /access/v1/evaluation` of the server named by the
+    /// global `--server`, with `--token` as the bearer).
+    #[arg(long, value_enum, default_value_t = Via::Local)]
+    pub via: Via,
+    /// With `--via authzen`: the delegation token whose chain makes every call.
+    #[command(flatten)]
+    pub token: TokenSource,
+}
+
+/// Where `policy test` decides the cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Via {
+    /// The in-process engine built from the test file (offline).
+    Local,
+    /// A running server's AuthZEN endpoint.
+    Authzen,
 }
 
 /// `policy evaluate`: the call, and the chain it is made for (from a token or a file).

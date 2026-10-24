@@ -380,6 +380,12 @@ fn build_engine(config: &Config) -> anyhow::Result<(PolicyEngine, Option<String>
         .with_legacy_bare_actions(config.policy.legacy_bare_actions)
         .with_annotation_import(config.policy.import_annotations)
         .with_track_usage(config.policy.track_usage);
+    if let Some(path) = &config.policy.schema_path {
+        let base = std::fs::read_to_string(path)
+            .with_context(|| format!("[policy] schema_path: reading {}", path.display()))?;
+        builder = builder.with_schema_str(&base);
+        tracing::info!(path = %path.display(), "custom base schema");
+    }
     if config.policy.legacy_bare_actions {
         tracing::warn!(
             "[policy] legacy_bare_actions = true is deprecated: policies name actions as \
@@ -695,6 +701,58 @@ mod tests {
         cfg.policy.user_attributes = [("groups".to_string(), "list".to_string())].into();
         let err = AppState::from_config(&cfg).err().unwrap().to_string();
         assert!(err.contains("user_attributes.groups"), "{err}");
+    }
+
+    #[test]
+    fn a_custom_base_schema_is_used_and_checked_at_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = dir.path().join("p.cedar");
+        std::fs::write(
+            &policy,
+            r#"@id("owned") permit(principal, action, resource)
+               when { resource has owner && resource.owner == "alice" };"#,
+        )
+        .unwrap();
+        let schema = dir.path().join("base.cedarschema");
+        let extended = attenuo_policy::DEFAULT_SCHEMA.replace(
+            "    destructive: Bool,\n",
+            "    destructive: Bool,\n    owner?: String,\n",
+        );
+        std::fs::write(&schema, &extended).unwrap();
+        let mut cfg = Config::default();
+        cfg.policy.policies_path = Some(policy);
+
+        // Against the default base the policy reads an undeclared attribute: impossible.
+        let state = AppState::from_config(&cfg).unwrap();
+        let warned = !state
+            .pipeline
+            .policy()
+            .read()
+            .unwrap()
+            .validation_warnings()
+            .is_empty();
+        assert!(warned);
+
+        cfg.policy.schema_path = Some(schema.clone());
+        let state = AppState::from_config(&cfg).unwrap();
+        let engine = state.pipeline.policy().read().unwrap();
+        assert!(engine.validation_warnings().is_empty());
+        assert!(engine.schema_text().contains("owner?: String"));
+        drop(engine);
+
+        // A base without what the engine needs refuses to start, and says why.
+        std::fs::write(
+            &schema,
+            extended.replace("sensitive: Bool", "sensitive?: Bool"),
+        )
+        .unwrap();
+        let err = format!("{:#}", AppState::from_config(&cfg).err().unwrap());
+        assert!(err.contains("custom base schema"), "{err}");
+        assert!(err.contains("sensitive"), "{err}");
+
+        cfg.policy.schema_path = Some(dir.path().join("missing.cedarschema"));
+        let err = format!("{:#}", AppState::from_config(&cfg).err().unwrap());
+        assert!(err.contains("[policy] schema_path"), "{err}");
     }
 
     #[test]
