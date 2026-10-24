@@ -724,10 +724,12 @@ struct DriveOut {
     metrics_raw: Option<(String, String)>,
 }
 
-/// Run `conc` closed-loop clients. With `metrics` (the server's `/metrics` URL), scrape the
-/// stage histograms when the warm-up ends and when the clients stop.
+/// Run `conc` closed-loop clients, client `i` on `targets[i % targets.len()]` (one target for
+/// all of them, or one each, such as a token per client). With `metrics` (the server's
+/// `/metrics` URL), scrape the stage histograms when the warm-up ends and when the clients
+/// stop.
 async fn drive(
-    target: &Target,
+    targets: &[Target],
     conc: usize,
     warmup: Duration,
     duration: Duration,
@@ -740,8 +742,12 @@ async fn drive(
     let t0 = Instant::now();
     let warm_end = t0 + warmup;
     let end = warm_end + duration;
+    ensure!(!targets.is_empty(), "no target to drive");
     let tasks: Vec<_> = (0..conc)
-        .map(|_| tokio::spawn(client_loop(http.clone(), target.clone(), warm_end, end)))
+        .map(|i| {
+            let t = targets[i % targets.len()].clone();
+            tokio::spawn(client_loop(http.clone(), t, warm_end, end))
+        })
         .collect();
     let before = match metrics {
         Some((client, url)) => {
@@ -999,7 +1005,14 @@ async fn run_group(
     let mut direct: Vec<(usize, Stats)> = Vec::new();
     for &c in &opts.concurrency {
         eprintln!("[{mode_label}] direct, {c} clients");
-        let out = drive(&direct_target, c, warmup, duration, None).await?;
+        let out = drive(
+            std::slice::from_ref(&direct_target),
+            c,
+            warmup,
+            duration,
+            None,
+        )
+        .await?;
         ensure_expected(&format!("[{mode_label}] direct, {c} clients"), &out)?;
         let stats = out.stats;
         report.direct.push(DirectRow {
@@ -1025,7 +1038,7 @@ async fn run_group(
                     expect: outcome.expect(),
                 };
                 let probe = ep.metrics.as_deref().map(|u| (http, u));
-                let out = drive(&target, c, warmup, duration, probe).await?;
+                let out = drive(std::slice::from_ref(&target), c, warmup, duration, probe).await?;
                 proxied_sent += out.sent;
                 ensure_expected(
                     &format!(
