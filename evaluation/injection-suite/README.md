@@ -4,7 +4,7 @@ A replay benchmark for one question from the [evaluation plan](../../docs/resear
 
 There is no model in the loop. Each case is a fixed sequence of `tools/call` requests that a compromised agent would plausibly send for one user task: the calls the task needs, plus the injected ones. The runner replays every sequence in five arms, from no attenuo at all to attenuo as configured, and records what each call got.
 
-Current results, both splits: [results/2026-10-23-v2.md](results/2026-10-23-v2.md). First results (dev corpus, three arms): [results/2026-10-23.md](results/2026-10-23.md). Summary and discussion: [docs/evaluation/injection-suite.md](../../docs/evaluation/injection-suite.md).
+Current results, both splits: [results/2026-10-23-v2.md](results/2026-10-23-v2.md); re-run unchanged on main `de3cf75` after the admin console, CLI and SDK merges: [results/2026-10-24-recheck.md](results/2026-10-24-recheck.md). First results (dev corpus, three arms): [results/2026-10-23.md](results/2026-10-23.md). Summary and discussion: [docs/evaluation/injection-suite.md](../../docs/evaluation/injection-suite.md).
 
 ## Method
 
