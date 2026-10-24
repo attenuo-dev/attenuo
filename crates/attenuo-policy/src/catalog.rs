@@ -13,7 +13,8 @@ use std::collections::BTreeMap;
 pub use attenuo_core::OutputLabel;
 use serde::{Deserialize, Serialize};
 
-/// Cedar type of a tool argument, used only for schema generation and policy validation.
+/// Cedar type of a tool argument or user attribute: used for schema generation and policy
+/// validation, and checked against the call's value before Cedar runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArgType {
@@ -93,8 +94,9 @@ pub struct ToolAttrs {
     /// the user's own bank, a clock).
     #[serde(default, skip_serializing_if = "is_untrusted")]
     pub output: OutputLabel,
-    /// Declared argument types. Only used to type `context.input` for policy validation;
-    /// arguments that are not declared are still passed to Cedar at evaluation time.
+    /// Declared argument types. They type `context.input` for policy validation, and a call
+    /// whose argument has another type is denied before Cedar (`input_type_mismatch`);
+    /// arguments that are not declared are passed to Cedar unchecked.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub inputs: BTreeMap<String, ArgType>,
     /// The input whose value run usage sums for this tool, `context.usage.amount`

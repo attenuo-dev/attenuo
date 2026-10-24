@@ -493,28 +493,53 @@ fn nested_and_numeric_arguments_are_available_to_policies() {
 
 #[test]
 fn evaluation_errors_deny_even_when_a_permit_matches() {
-    // `count` is declared Long; a string at runtime makes the forbid error out. Cedar would
-    // skip the erroring forbid and let the permit through; we must not.
+    // `count` is declared Long. A long that overflows `* 2` makes the forbid error out at
+    // evaluation. Cedar would skip the erroring forbid and let the permit through; we must not.
     let engine = engine_with(
         r#"
         @id("all") permit(principal, action, resource);
         @id("cap") forbid(principal, action == Action::"github/set_limit", resource)
-        when { context.input has count && context.input.count > 10 };
+        when { context.input has count && context.input.count * 2 > 10 };
         "#,
     );
+    let out = engine.authorize(
+        &chain(),
+        &call("set_limit", json!({"count": i64::MAX})),
+        now(),
+    );
+    assert_eq!(out.decision, Decision::Deny);
+    assert_eq!(out.reason, REASON_POLICY_ERROR);
+    assert!(!out.diagnostics.is_empty());
+
+    // A string where the long is declared was this test's way to make the forbid error out;
+    // it is now refused before Cedar, and still denied.
     let out = engine.authorize(
         &chain(),
         &call("set_limit", json!({"count": "lots"})),
         now(),
     );
     assert_eq!(out.decision, Decision::Deny);
-    assert_eq!(out.reason, REASON_POLICY_ERROR);
-    assert!(!out.diagnostics.is_empty());
+    assert_eq!(out.reason, attenuo_policy::REASON_INPUT_TYPE_MISMATCH);
 }
 
 #[test]
 fn reserved_argument_keys_are_rejected() {
     let engine = engine_with(r#"@id("all") permit(principal, action, resource);"#);
+    // In an argument the catalog declares no type for, so it reaches the translation.
+    let out = engine.authorize(
+        &chain(),
+        &call(
+            "read_file",
+            json!({"ref": {"__entity": {"type": "User", "id": "admin"}}}),
+        ),
+        now(),
+    );
+    assert_eq!(out.decision, Decision::Deny);
+    assert_eq!(out.reason, REASON_POLICY_ERROR);
+    assert!(out.diagnostics[0].contains("__entity"));
+
+    // In a declared string argument it is an object where a string belongs: refused before
+    // the translation, and still denied.
     let out = engine.authorize(
         &chain(),
         &call(
@@ -524,8 +549,7 @@ fn reserved_argument_keys_are_rejected() {
         now(),
     );
     assert_eq!(out.decision, Decision::Deny);
-    assert_eq!(out.reason, REASON_POLICY_ERROR);
-    assert!(out.diagnostics[0].contains("__entity"));
+    assert_eq!(out.reason, attenuo_policy::REASON_INPUT_TYPE_MISMATCH);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -622,6 +646,7 @@ fn shipped_default_policy_file_loads_from_disk() {
             "forbid_deep_chains",
             "forbid_sensitive_without_mfa",
             "permit_create_issue_in_acme",
+            "permit_delete_acme_sandbox_repo",
             "permit_readonly_tools",
         ]
     );
@@ -654,7 +679,7 @@ fn shipped_default_policy_passes_its_tests() {
         );
     }
     let cov = coverage([&report]);
-    assert_eq!(cov.policies, 4);
+    assert_eq!(cov.policies, 5);
     assert!(cov.unexercised.is_empty(), "{:?}", cov.unexercised);
 }
 
@@ -948,6 +973,99 @@ fn mistyped_declared_attribute_denies_instead_of_matching_ne_permit() {
             assert_eq!(out.reason, REASON_ATTRIBUTE_TYPE_MISMATCH, "{attrs}");
         }
     }
+}
+
+/// A call argument of another type than the catalog declares is denied before Cedar with a
+/// fixed reason, whether or not a policy reads it; nothing changes for arguments and tools the
+/// catalog declares no type for.
+#[test]
+fn mistyped_declared_input_denies_before_cedar_not_as_policy_error() {
+    use attenuo_policy::REASON_INPUT_TYPE_MISMATCH;
+    let engine = default_engine();
+
+    // The acme permit reads `repo` with `like`; before the check a number made Cedar raise a
+    // type error and the call ended as `policy_error`.
+    let out = engine.authorize(
+        &chain(),
+        &call("create_issue", json!({"repo": 42, "title": "hi"})),
+        now(),
+    );
+    assert_eq!(out.decision, Decision::Deny);
+    assert_eq!(out.reason, REASON_INPUT_TYPE_MISMATCH);
+    assert!(out.policy_ids.is_empty());
+    assert_eq!(
+        out.diagnostics,
+        vec!["input.repo: expected String, got long".to_string()]
+    );
+    // Deterministic, and the same through the request cache.
+    for _ in 0..3 {
+        assert_eq!(
+            engine.authorize(
+                &chain(),
+                &call("create_issue", json!({"repo": 42, "title": "hi"})),
+                now()
+            ),
+            out
+        );
+    }
+
+    // No policy reads `path`: before, the number passed unread to the upstream.
+    let out = engine.authorize(
+        &chain(),
+        &call("read_file", json!({"repo": "acme/api", "path": 7})),
+        now(),
+    );
+    assert_eq!(out.reason, REASON_INPUT_TYPE_MISMATCH, "{out:?}");
+
+    for (tool, args) in [
+        ("set_limit", json!({"count": "3"})),
+        ("set_limit", json!({"count": 2.5})),
+        ("delete_repo", json!({"repo": ["acme/sandbox-x"]})),
+        ("create_issue", json!({"repo": "acme/api", "title": false})),
+    ] {
+        let out = engine.authorize(&chain(), &call(tool, args.clone()), now());
+        assert_eq!(out.decision, Decision::Deny, "{tool} {args}");
+        assert_eq!(out.reason, REASON_INPUT_TYPE_MISMATCH, "{tool} {args}");
+    }
+
+    // Unchanged: a well-typed call, an integral float for a long, a null (dropped), an
+    // argument the catalog does not declare, and a tool that declares no inputs.
+    for (tool, args, reason) in [
+        (
+            "create_issue",
+            json!({"repo": "acme/api"}),
+            REASON_POLICY_ALLOW,
+        ),
+        ("set_limit", json!({"count": 3.0}), REASON_POLICY_DENY),
+        (
+            "read_file",
+            json!({"repo": null, "path": null}),
+            REASON_POLICY_ALLOW,
+        ),
+        (
+            "read_file",
+            json!({"repo": "acme/api", "ref": 7}),
+            REASON_POLICY_ALLOW,
+        ),
+        ("list_issues", json!({"repo": 42}), REASON_POLICY_ALLOW),
+    ] {
+        let out = engine.authorize(&chain(), &call(tool, args.clone()), now());
+        assert_eq!(out.reason, reason, "{tool} {args}: {out:?}");
+    }
+
+    // A tool outside the catalog evaluated with default attributes declares nothing either.
+    let lenient = PolicyEngineBuilder::new()
+        .with_catalog(catalog())
+        .with_unknown_tools(UnknownTools::Allow)
+        .with_policies_str(r#"@id("all") permit(principal, action, resource);"#)
+        .build()
+        .unwrap();
+    let out = lenient.authorize(
+        &chain(),
+        &call("merge_pull_request", json!({"repo": 42})),
+        now(),
+    );
+    assert_eq!(out.reason, REASON_POLICY_ALLOW, "{out:?}");
 }
 
 // ---------------------------------------------------------------------------------------------

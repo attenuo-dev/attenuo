@@ -60,10 +60,11 @@ readonly = true
 output = "trusted"
 ```
 
-It does two jobs:
+It does three jobs:
 
 1. **Tool attributes** (`readonly`, `sensitive`, `destructive`) become `resource.readonly`, `resource.sensitive` and `resource.destructive`. `destructive` defaults to the opposite of `readonly`. `output` (`untrusted` by default, or `trusted`) says whether the tool's results taint the run; it is not a Cedar attribute. A tool that is not in the catalog is denied before Cedar runs, with reason `tool_not_in_catalog`, unless `[policy] unknown_tools` is `sensitive` (evaluated as `sensitive = true`) or `allow` (evaluated as neither, so a `forbid` keyed on `sensitive` silently skips it). Register every tool the server exposes (MCP `tools/list` is the natural source).
 2. **Schema generation.** Each catalog entry becomes a declared action, `Action::"<server>/<tool>"`, and each `inputs` entry a typed, optional attribute of `context.input`. Policies are validated against this schema at load time, so a typo in an argument name or a comparison of a string to a number fails the load instead of misbehaving on a call. A policy that names `Action::"github/x"` validates only if the catalog has a tool `x` under `github`. Argument types are `string`, `long`, `bool`, or `{ set = "string" }`.
+3. **Argument types on every call.** Evaluation itself is schema-free, so the types are also checked on each call, before Cedar: a present, non-null argument of another type than declared (a number where `repo` is a `string`, a single string where a set is declared, `2.5` for a `long`) is denied with reason `input_type_mismatch`, whether or not a policy reads it. Integral numbers, `5.0` included, count as `long`, as Cedar sees them. Nothing is coerced. Arguments the catalog declares no type for are not checked and reach Cedar as sent, and so do all arguments of a tool evaluated under `unknown_tools = "sensitive"` or `"allow"`. Before this check a mistyped argument that a policy read ended as `policy_error`, and one that no policy read went to the upstream.
 
 Server names (the `[[upstreams]]` names and the catalog's server keys) and tool names may not contain `/`, so `"<server>/<tool>"` always splits one way. The one exception is on the tool side: the proxy authorizes MCP methods other than `tools/call` under their method name (`resources/read`, `prompts/get`), so those catalog entries are `[policy.catalog.github."resources/read"]` and their action is `Action::"github/resources/read"`. A `tools/call` can never carry a `/` in its tool name, so a tool cannot pose as one of these methods. The server refuses to start with a catalog entry that breaks these rules.
 
@@ -132,6 +133,38 @@ when { context.input has repo && context.input.repo like "alice/public-*" };
 
 This is the rule that stops the prompt-injected "read my private repo" in the [GitHub leak demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/github-leak-demo/README.md), even though the token allows `read_file`. Prefer an allow-list (`permit ... when repo like ...`) to a deny-list (`forbid ... when repo like "*private*"`): the deny-list fails open for names you did not think of. For constraints that must travel with the token and survive delegation, put them in the capability itself (`ArgConstraint`) rather than in policy.
 
+### Patterns and `like`
+
+`like` is the only pattern match Cedar has. Its one wildcard, `*`, matches any run of characters, including none and including `/`. There is no single-character wildcard, no character class and no regular expression; `\*` matches a literal star. So `context.input.repo like "acme/*"` holds for `acme/api`, but also for:
+
+- `acme/`, an empty name, because `*` may match nothing;
+- `acme/a/b`, because `*` crosses `/`;
+- `acme/../x` and `acme/..`, which an upstream that builds a URL or path from the value may resolve outside `acme`.
+
+To pin a shape, add the cases the wildcard should not cover. The starter policy's issue rule allows exactly one `/` and a name that is not empty, `.` or `..`:
+
+```cedar
+@id("permit_create_issue_in_acme")
+permit(principal, action == Action::"github/create_issue", resource)
+when {
+    context.input has repo &&
+    context.input.repo like "acme/*" &&
+    !(context.input.repo like "acme/*/*") &&
+    context.input.repo != "acme/" &&
+    context.input.repo != "acme/." &&
+    context.input.repo != "acme/.."
+};
+```
+
+`!(... like "acme/*/*")` is what rules out a second `/`, and with it every `..` path that leaves the owner. A longer fixed prefix needs the same treatment: `like "acme/sandbox-*"` matches `acme/sandbox-x/../api`, so the starter's sandbox permit also carries `!(... like "acme/*/*")` and `!= "acme/sandbox-"`. Patterns are case-sensitive (`ACME/api` does not match), which is what you want when the upstream is too, and a trap when it is not. Which characters a name may contain cannot be said with `like`. Leave that to the upstream, or list the allowed values (`["acme/api", "acme/web"].contains(context.input.repo)`, or a `one_of` constraint in the token).
+
+A pattern in policy and a `prefix` constraint in the token's capability do different jobs:
+
+- A capability constraint (`{ op: prefix, value: "acme/" }`, `equals`, `one_of`) is checked before Cedar, travels with the token, and can only be narrowed by each delegation (`acme/` to `acme/api`). Use it for "this agent, for this task, may only touch these repositories": it is per token, and a policy cannot widen it. `prefix` is a plain string prefix with the same blind spots as `*` (it accepts `acme/` and `acme/a/../b`), so for a whole repository name prefer `equals` or `one_of`.
+- A policy pattern applies to every token the server sees and can say what a prefix cannot (no second `/`, not empty). Use it for the organisation-wide rule, the shape every value must have whatever a token says.
+
+The two compose: the token narrows to `prefix: acme/`, the policy rejects the malformed names inside it. The "capability stage" cases in [`config/policies/default_test.yaml`](https://github.com/attenuo-dev/attenuo/blob/main/config/policies/default_test.yaml) show both together.
+
 ### MFA for sensitive tools
 
 ```cedar
@@ -145,6 +178,8 @@ when {
 ```
 
 A missing `mfa` attribute counts as no MFA. A `forbid` always wins over a `permit`, so this holds whatever permits are added later. The `mfa` attribute is derived from the IdP's `amr` claim when hop 0 is minted; see the top-level README.
+
+A forbid like this only ever removes access; something has to permit the sensitive tool for MFA to make a difference. In the starter policy that is `permit_delete_acme_sandbox_repo`: `delete_repo` (sensitive in the example catalog) on `acme/sandbox-<name>` only. With MFA the delete of `acme/sandbox-demo` is allowed by that permit; without MFA the same call is denied by `forbid_sensitive_without_mfa`; any other repository is denied by default either way. Drop the permit if your agents should never delete a repository, and the forbid stays as a guard rail for whatever sensitive permit you write next.
 
 ### Asking for approval after untrusted output
 
@@ -300,7 +335,7 @@ cases:
       arguments: { repo: alice/public-docs, path: README.md }
     expect: allow                   # or deny
     reason: policy_allow            # optional: policy_allow | policy_deny | approval_required |
-                                    # capability_denied | policy_error
+                                    # capability_denied | input_type_mismatch | policy_error
     policy_ids: [read_file_public_repos_only]   # optional; the policies that decided it, as a set
 ```
 

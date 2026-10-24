@@ -191,6 +191,7 @@ What each reason means for the agent:
 | `lease_expired` | The lease ran out before it was renewed | Call `POST /token/renew`, then retry once. If renewal fails, stop |
 | `lease_unknown` | The server does not know a lease in the chain | Treat as fatal. The token was not issued by this server, or the database was reset |
 | `tool_not_in_catalog` | The tool is not in the server's catalog, and the operator denies unknown tools (the default) | Do not retry. The operator has to add the tool to `[policy.catalog]` |
+| `input_type_mismatch` | An argument does not have the type the catalog declares for it (a number where a string is declared, for example) | Do not retry as is. Send each argument with the type the catalog declares (`tools/list` input schemas usually say the same) |
 | `audit_error`, `lease_error`, `policy_error` | Internal failure. The server fails closed | Retry with backoff a few times, then give up and alert an operator |
 
 A request with no valid token is different: HTTP 401, JSON-RPC `-32001`, and `"id": null` when the proxy could not read the request id. The message ends in the cause, for example `lease inactive: lease_revoked` on a request that carries no per-call decision, such as `tools/list`. An expired or malformed token is a 401 as well. On a 401, a client that holds a fresh credential can re-run its exchange. One that does not should stop.
