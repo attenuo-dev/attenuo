@@ -34,6 +34,12 @@ Changelog = "https://github.com/attenuo-dev/attenuo/blob/main/CHANGELOG.md"
 [tool.hatch.build.targets.wheel]
 packages = ["src/attenuo"]
 
+# Only these go into the source distribution. Without the list, hatchling takes every file
+# under sdk/python that git does not ignore, tracked or not, so a stray local file (notes, a
+# token saved while testing) would be published (SR-61).
+[tool.hatch.build.targets.sdist]
+include = ["/src/attenuo", "/tests", "/README.md", "/LICENSE", "/pyproject.toml"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # Test this checkout's source even when the environment has another checkout installed.

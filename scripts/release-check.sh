@@ -13,8 +13,9 @@
 #   PYTHON       interpreter with the Python SDK's dev extras, the suite's needs, build and
 #                twine installed (default: python3). For example a venv made with
 #                `pip install -e 'sdk/python[dev]' -r evaluation/injection-suite/requirements.txt mcp build twine`.
-#   ALLOW_DIRTY  set to 1 to pass --allow-dirty to the crates dry run. Leave it unset for the
-#                real pre-tag run, so the crates are packaged from committed files only.
+#   ALLOW_DIRTY  set to 1 to pass --allow-dirty to the crates dry run and to let python-dist
+#                build with untracked files under sdk/python. Leave it unset for the real
+#                pre-tag run, so everything is packaged from committed files only.
 #
 # It needs cargo, node 20+ and npm. It publishes nothing: the crates step is
 # `cargo publish --dry-run --workspace`, which verifies every publishable crate against the
@@ -97,6 +98,14 @@ crates_dry_run() {
   rm -rf "${CARGO_TARGET_DIR:-$ROOT/target}/package"
 }
 python_dist() {
+  # The distributions are built from the working tree: an untracked file under the package
+  # (not ignored by git) would be packed into the wheel or the test tree of the sdist (SR-61).
+  local stray
+  stray=$(git status --porcelain --untracked-files=all -- sdk/python | grep '^??' || true)
+  if [[ -n $stray && "${ALLOW_DIRTY:-}" != 1 ]]; then
+    printf 'untracked files under sdk/python would be packaged:\n%s\n' "$stray" >&2
+    return 1
+  fi
   local out
   out=$(mktemp -d)
   "$PYTHON" -m build --outdir "$out" sdk/python
