@@ -296,7 +296,8 @@ fn is_use_dpop_nonce(status: StatusCode, headers: &HeaderMap, body: &str) -> boo
 }
 
 /// A non-success answer from the server. Its text is `server answered <status>: <code>:
-/// <detail>` (or the raw body); a command that gives some statuses a meaning of its own (as
+/// <detail>` (or the raw body), and a second line `decision <id>` when the body names the
+/// audit record of the refusal; a command that gives some statuses a meaning of its own (as
 /// `budget refund` does for 404 and 409) finds it with `anyhow::Error::downcast_ref`.
 #[derive(Debug)]
 pub struct ApiError {
@@ -319,11 +320,16 @@ pub(crate) fn api_error(status: StatusCode, body: &str) -> anyhow::Error {
     let (code, message) = match serde_json::from_str::<Value>(body) {
         Ok(v) if v["error"].is_string() => {
             let code = v["error"].as_str().unwrap_or_default().to_string();
+            // A refusal the server audited (a refused token exchange) names its record.
             let message = format!(
-                "server answered {status}: {code}{}",
+                "server answered {status}: {code}{}{}",
                 v["detail"]
                     .as_str()
                     .map(|d| format!(": {d}"))
+                    .unwrap_or_default(),
+                v["decision_id"]
+                    .as_str()
+                    .map(|id| format!("\ndecision {id}"))
                     .unwrap_or_default()
             );
             (Some(code), message)
@@ -385,6 +391,14 @@ mod tests {
         assert_eq!(
             e.to_string(),
             "server answered 403 Forbidden: no_root_grant: no entry"
+        );
+        assert_eq!(
+            api_error(
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"invalid_scope","detail":"wider","decision_id":"d-1"}"#,
+            )
+            .to_string(),
+            "server answered 400 Bad Request: invalid_scope: wider\ndecision d-1"
         );
         assert_eq!(
             api_error(StatusCode::BAD_GATEWAY, "oops").to_string(),
