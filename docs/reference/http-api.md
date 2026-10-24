@@ -221,7 +221,7 @@ With `?preview=true` nothing is written, no lease and no audit record. `revoked`
 
 Each revocation appends one record with tool `admin.lease.revoke` and kind `lease_revoke`, whatever it matched. Its `leases` holds the first 256 revoked ids. Its arguments are `{selector, reason, revoked, listed, truncated}` (the `selector` as the answer shows it, so a session revocation names the resolved chains; the count, how many ids `leases` holds, and whether that list was cut), stored as a digest like every admin record. The `leases_revoked_total` metric counts every revoked lease.
 
-Errors: 400 `invalid_request` for no selector, more than one, an empty value, an unknown field or a body that is not JSON; 401 without the admin bearer. On the console listener the route needs `Content-Type: application/json`. Without `[admin_ui] allow_write = true` it serves only `?preview=true` there and answers a revocation with 404. The console's lease page uses it for "Revoke chain…" and "Revoke all for <user>…".
+Errors: 400 `invalid_request` for no selector, more than one, an empty value, an unknown field or a body that is not JSON; 401 without the admin bearer. On the console listener the route needs `Content-Type: application/json`. Without `[admin_ui] allow_write = true` it serves only `?preview=true` there and answers a revocation with 404. The console's lease page uses it for "Revoke chain…", "Revoke all for <user>…" and "Revoke by session…".
 
 #### Revoke by session
 
