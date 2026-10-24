@@ -962,28 +962,61 @@ def test_case_files_quote_values_with_a_hash() -> None:
 
 def test_task_limits_report() -> None:
     arm = "attenuo_task_limits"
+
+    def call(a: str, case: str, index: int, role: str, outcome: str, **kw: Any) -> Any:
+        stage = "budget" if outcome == "deny" else None
+        c = {**_limits_call(a, role, outcome, "allow", None, stage), "case": case}
+        return {**c, "index": index, "tool": "get_webpage", "reason": kw.get("reason")}
+
     calls = [
-        {**_limits_call("attenuo", "attack", "allow"), "case": "banking-04", "index": 1,
+        {**call("attenuo", "banking-04", 1, "attack", "allow"), "tool": "send_money"},
+        {**call(arm, "banking-04", 1, "attack", "deny", reason="budget_exhausted"),
          "tool": "send_money"},
-        {**_limits_call(arm, "attack", "deny", "allow", None, "budget"), "case": "banking-04",
-         "index": 1, "tool": "send_money", "reason": "budget_exhausted"},
+        call("attenuo", "slack-17", 1, "attack", "allow"),
+        call("attenuo", "slack-17", 2, "benign", "allow"),
+        call(arm, "slack-17", 1, "attack", "allow"),
+        call(arm, "slack-17", 2, "benign", "deny", reason="budget_exhausted"),
     ]  # fmt: skip
-    meta = {"banking-04": {}, "banking-01": {}}
-    lim = [
-        {"server": "banking", "tool": "send_money", "limits": {"sum": {"arg": "amount", "max": 10}}}
-    ]
-    doc: dict[str, Any] = {"arms": ["attenuo", arm], "calls": calls, "case_meta": meta,
-                           "task_limits": {"banking-04": lim}}  # fmt: skip
+    meta = {"banking-04": {}, "banking-01": {}, "slack-17": {}}
+    sum10 = {"sum": {"arg": "amount", "max": 10}}
+    host1 = {"distinct": {"arg": "url", "derive": "host", "max": 1}}
+    doc: dict[str, Any] = {
+        "arms": ["attenuo", arm],
+        "calls": calls,
+        "case_meta": meta,
+        "task_limits": {
+            "banking-04": [{"server": "banking", "tool": "send_money", "limits": sum10}],
+            "slack-17": [{"server": "slack", "tool": "get_webpage", "limits": host1}],
+        },
+        "task_limits_unset": {"banking-01": "read-only task"},
+    }
+    doc["rates"] = run.arm_rates(doc)
     text = "\n".join(run.render_task_limits(doc))
-    assert "1 of 2 cases declare `limits`" in text and "Cases with no limit: banking-01." in text
+    assert "2 of 3 cases declare `limits`" in text and "| banking-01 | read-only task |" in text
     assert "| banking-04 | `banking/send_money` | `sum: {arg: amount, max: 10}` |" in text
+    assert "`distinct: {arg: url, derive: host, max: 1}`" in text
     assert "| banking-04 | 1 | `send_money` | attack | allow | deny (`budget_exhausted`) |" in text
-    assert run.limits_consistent(calls[1])
+    assert "Benign calls a per-task limit refused: 1." in text
+    assert "| slack-17 | 2 | `get_webpage` | `budget_exhausted` | attack call 1 |" in text
+    assert "approve-all bound is its attack calls allowed, 1/2" in text
+    assert "only as good as the hop that writes it" in text
+    assert all(run.limits_consistent(c) for c in calls if c["arm"] == arm)
     doc["task_limits"] = {}
     doc["calls"] = calls[:1]
     assert "No case of this split declares `limits`" in "\n".join(run.render_task_limits(doc))
     assert run.render_task_limits({"arms": ["attenuo"], "calls": []}) == []
     assert "task-limits-dev.md" in run.distinct_rule_text(arm)
+
+
+def test_task_limits_unset_reasons_match_the_fit_file() -> None:
+    unset = harness.task_limits_unset(harness.load_corpus("dev"))
+    text = harness.TASK_LIMITS_FIT.read_text().split("## Cases without a limit", 1)[1]
+    assert unset["banking-11"] == unset["workspace-11"] == "the task states no figure"
+    assert unset["github-06"].startswith("the grant is a tool glob")
+    for cid, why in unset.items():
+        assert cid in text, cid
+        assert why != "read-only task" or "Read-only task" in text
+    assert len(harness.task_limits_unset(harness.load_corpus("test"))) == 26
 
 
 @pytest.mark.integration

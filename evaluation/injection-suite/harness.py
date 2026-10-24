@@ -677,6 +677,27 @@ def task_limits(suites: list[Suite]) -> dict[str, list[dict[str, Any]]]:
     return out
 
 
+def task_limits_unset(suites: list[Suite]) -> dict[str, str]:
+    """Why each case that declares no ``limits`` has none, in the words of
+    ``policies/task-limits-dev.md``: a tool glob in the grant, a grant of reads only, or (any
+    other) a task that states no figure."""
+    env = {s.upstream: s for s in load_environment().values()}
+    declared = task_limits(suites)
+    out: dict[str, str] = {}
+    for s in suites:
+        for c in s.cases:
+            if c.id in declared:
+                continue
+            caps = grant_capabilities(s.upstream, c.grant, constraints=False)
+            if any("*" in cap.tool for cap in caps):
+                out[c.id] = "the grant is a tool glob, which takes no limit"
+            elif all(is_read_capability(cap, env) for cap in caps):
+                out[c.id] = "read-only task"
+            else:
+                out[c.id] = "the task states no figure"
+    return out
+
+
 def limits_rule(path: Path | None = None) -> dict[str, Any]:
     """The frozen rule's ``limits`` object (``policies/limits-rule.json``), checked the way the
     SDK checks a capability's limits."""
