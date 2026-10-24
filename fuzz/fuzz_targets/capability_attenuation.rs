@@ -35,13 +35,27 @@ fn value(u: &mut Unstructured<'_>) -> Result<Value> {
 }
 
 fn constraint(u: &mut Unstructured<'_>) -> Result<ArgConstraint> {
-    Ok(match u.int_in_range(0u8..=2)? {
+    Ok(match u.int_in_range(0u8..=3)? {
         0 => ArgConstraint::Equals(value(u)?),
         1 => {
             let n = u.int_in_range(0usize..=3)?;
             ArgConstraint::OneOf((0..n).map(|_| value(u)).collect::<Result<_>>()?)
         }
-        _ => ArgConstraint::Prefix((*u.choose(STRS)?).to_string()),
+        2 => ArgConstraint::Prefix((*u.choose(STRS)?).to_string()),
+        // Bounds around the generated integers, either side possibly missing. Built unchecked,
+        // so inverted and unbounded ranges (which deserialization refuses) are covered too.
+        _ => ArgConstraint::Range {
+            min: bound(u)?,
+            max: bound(u)?,
+        },
+    })
+}
+
+fn bound(u: &mut Unstructured<'_>) -> Result<Option<i64>> {
+    Ok(match u.int_in_range(0u8..=7)? {
+        0 => None,
+        1 => Some(*u.choose(&[i64::MIN, i64::MAX])?),
+        _ => Some(u.int_in_range(-2i64..=3)?),
     })
 }
 

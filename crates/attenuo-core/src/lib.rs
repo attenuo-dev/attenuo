@@ -29,7 +29,7 @@ pub mod limits;
 pub mod names;
 
 pub use call::ToolCall;
-pub use capability::{ArgConstraint, Capability, CapabilitySet};
+pub use capability::{as_long, ArgConstraint, Capability, CapabilitySet, RangeError};
 pub use chain::{AgentId, DelegationChain, Hop, LeaseId, OriginatingUser};
 pub use decision::{
     chain_id_of, ApprovalInfo, BudgetCharge, Decision, DecisionRecord, OutputLabel, RecordBudget,

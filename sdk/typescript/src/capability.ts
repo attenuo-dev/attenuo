@@ -7,6 +7,8 @@
  * //   constraints: { repo: { op: "prefix", value: "alice/public-" } } }
  * ```
  *
+ * `range({ min: 0, max: 2000 })` bounds an integer argument, both ends inclusive.
+ *
  * `constraints` is omitted when empty. `server` and `tool` are an exact name, `*`, or a prefix
  * glob such as `read_*`.
  *
@@ -32,7 +34,14 @@
 export type Constraint =
   | { op: "equals"; value: unknown }
   | { op: "one_of"; value: unknown[] }
-  | { op: "prefix"; value: string };
+  | { op: "prefix"; value: string }
+  | { op: "range"; value: RangeBounds };
+
+/** Inclusive integer bounds of a `range` constraint; at least one, and `min <= max`. */
+export interface RangeBounds {
+  min?: number;
+  max?: number;
+}
 
 /**
  * What a `calls_per` or `distinct` limit may count instead of the argument itself. `"host"`: the
@@ -98,21 +107,64 @@ export function prefix(value: string): Constraint {
   return { op: "prefix", value };
 }
 
+/**
+ * Why `bounds` is not a valid `range`, or `undefined` when it is: an object with integer members
+ * `min` and/or `max` and nothing else, `min <= max`. A bound must be a safe integer, the integers
+ * a JavaScript number holds exactly.
+ */
+function rangeProblem(bounds: unknown): string | undefined {
+  if (typeof bounds !== "object" || bounds === null || Array.isArray(bounds)) {
+    return "a range constraint's value must be {min?: integer, max?: integer}";
+  }
+  const o = bounds as Record<string, unknown>;
+  const extra = Object.keys(o).find((k) => k !== "min" && k !== "max");
+  if (extra !== undefined) return `unknown range member ${JSON.stringify(extra)}`;
+  if (o.min === undefined && o.max === undefined)
+    return "a range constraint needs min, max or both";
+  for (const k of ["min", "max"] as const) {
+    if (o[k] !== undefined && !Number.isSafeInteger(o[k])) {
+      return `a range constraint's ${k} must be an integer`;
+    }
+  }
+  if (o.min !== undefined && o.max !== undefined && (o.min as number) > (o.max as number)) {
+    return `a range constraint's min ${String(o.min)} is greater than its max ${String(o.max)}`;
+  }
+  return undefined;
+}
+
+/**
+ * The argument must be an integer between `min` and `max`, both inclusive; a missing bound is
+ * unbounded on that side. `range({ min: 0, max: 2000 })`, `range({ max: 2000 })`. The server reads
+ * the argument as Cedar does: an integer, or a whole float (`5.0` is `5`); a fraction or a numeric
+ * string is outside every range. Throws a `TypeError` for no bound, `min > max` or a non-integer.
+ */
+export function range(bounds: RangeBounds): Constraint {
+  const problem = rangeProblem(bounds);
+  if (problem !== undefined) throw new TypeError(problem);
+  const value: RangeBounds = {};
+  if (bounds.min !== undefined) value.min = bounds.min;
+  if (bounds.max !== undefined) value.max = bounds.max;
+  return { op: "range", value };
+}
+
 function isConstraint(v: unknown): v is Constraint {
   if (typeof v !== "object" || v === null) return false;
   const o = v as Record<string, unknown>;
   return (
     (o.op === "equals" && "value" in o) ||
     (o.op === "one_of" && Array.isArray(o.value)) ||
-    (o.op === "prefix" && typeof o.value === "string")
+    (o.op === "prefix" && typeof o.value === "string") ||
+    (o.op === "range" && rangeProblem(o.value) === undefined)
   );
 }
 
 /**
- * `server:tool` plus optional per-argument constraints. A bare value is shorthand for `equals`:
+ * `server:tool` plus optional per-argument constraints, one per argument. A bare value is
+ * shorthand for `equals`:
  *
  * ```ts
  * capability("github", "create_issue", { repo: oneOf("acme/api", "acme/web"), draft: false })
+ * capability("banking", "send_money", { amount: range({ min: 0, max: 2000 }) })
  * ```
  */
 export function capability(

@@ -26,8 +26,20 @@ use crate::names::NameError;
 /// numbers by value (`1` equals `1.0`, as in JavaScript and in the Cedar translation) and
 /// objects regardless of member order. Equality, ordering and the chain digest all use that
 /// one notion, so two constraints with the same digest also admit the same arguments.
+///
+/// An argument carries at most one constraint (a capability maps each argument name to one
+/// `ArgConstraint`), so kinds are never combined on one argument: a range that also excludes
+/// a value is a Cedar rule, not a constraint.
+///
+/// Deserialization checks a `range`: at least one bound, `min <= max`, integer bounds and no
+/// other members ([`ArgConstraint::range`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "op", content = "value", rename_all = "snake_case")]
+#[serde(
+    tag = "op",
+    content = "value",
+    rename_all = "snake_case",
+    try_from = "RawConstraint"
+)]
 pub enum ArgConstraint {
     /// Argument must equal this JSON value (canonically; see above).
     Equals(Value),
@@ -35,13 +47,152 @@ pub enum ArgConstraint {
     OneOf(Vec<Value>),
     /// Argument must be a string starting with this prefix.
     Prefix(String),
+    /// Argument must be an integer (a Cedar `long`, read as [`as_long`] reads it) between the
+    /// bounds, both inclusive. A missing bound is unbounded on that side. Serialized as
+    /// `{"op": "range", "value": {"min": 0, "max": 2000}}`, a missing bound omitted. Build it
+    /// with [`ArgConstraint::range`], which checks the bounds.
+    Range {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<i64>,
+    },
+}
+
+/// The wire form of [`ArgConstraint`], checked by `TryFrom` on the way in.
+#[derive(Deserialize)]
+#[serde(tag = "op", content = "value", rename_all = "snake_case")]
+enum RawConstraint {
+    Equals(Value),
+    OneOf(Vec<Value>),
+    Prefix(String),
+    Range(RawRange),
+}
+
+/// The `value` of a `range`: an object with optional integer members `min` and `max` and
+/// nothing else. Read by hand so that a list (`[0, 5]`, which a derived struct would accept as
+/// a tuple), a repeated member or a misspelt one (`maximum`, which would otherwise read as no
+/// upper bound) is refused.
+struct RawRange {
+    min: Option<i64>,
+    max: Option<i64>,
+}
+
+impl<'de> Deserialize<'de> for RawRange {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = RawRange;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an object with integer members `min` and/or `max`")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<RawRange, A::Error> {
+                use serde::de::Error;
+                let mut out = RawRange {
+                    min: None,
+                    max: None,
+                };
+                while let Some(key) = map.next_key::<String>()? {
+                    let slot = match key.as_str() {
+                        "min" => &mut out.min,
+                        "max" => &mut out.max,
+                        other => return Err(A::Error::unknown_field(other, &["min", "max"])),
+                    };
+                    if slot.is_some() {
+                        return Err(A::Error::custom(format!("duplicate range member `{key}`")));
+                    }
+                    *slot = Some(map.next_value::<i64>()?);
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_map(V)
+    }
+}
+
+impl TryFrom<RawConstraint> for ArgConstraint {
+    type Error = RangeError;
+
+    fn try_from(raw: RawConstraint) -> Result<Self, RangeError> {
+        Ok(match raw {
+            RawConstraint::Equals(v) => ArgConstraint::Equals(v),
+            RawConstraint::OneOf(vs) => ArgConstraint::OneOf(vs),
+            RawConstraint::Prefix(p) => ArgConstraint::Prefix(p),
+            RawConstraint::Range(r) => ArgConstraint::range(r.min, r.max)?,
+        })
+    }
+}
+
+/// Why a `range` constraint is malformed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RangeError {
+    /// Neither `min` nor `max`: it would constrain nothing but the type.
+    #[error("a range constraint needs `min`, `max` or both")]
+    Unbounded,
+    /// `min > max`: no value could satisfy it.
+    #[error("a range constraint's min {min} is greater than its max {max}")]
+    Inverted { min: i64, max: i64 },
+}
+
+/// Largest magnitude of a float that counts as a whole number, as the Cedar translation in
+/// `attenuo-policy` reads it (its `DECIMAL_MAX`, inside Cedar's `decimal` range and below
+/// 2^53, so every such float is exactly one integer).
+const WHOLE_FLOAT_MAX: f64 = 922_337_203_685_477.0;
+
+/// A JSON value as the Cedar `long` the policy engine would see, or `None` when it is not one:
+/// an integer that fits in `i64`, or a float with no fractional part and a magnitude of at
+/// most 922337203685477 (`5.0` is `5`). A fraction, a string, a larger number, `null` or
+/// anything else is `None`, and satisfies no `range`.
+pub fn as_long(value: &Value) -> Option<i64> {
+    let n = value.as_number()?;
+    if let Some(i) = n.as_i64() {
+        return Some(i);
+    }
+    let f = n.as_f64()?;
+    // |f| <= WHOLE_FLOAT_MAX < 2^63, so the cast is exact.
+    (f.is_finite() && f.fract() == 0.0 && f.abs() <= WHOLE_FLOAT_MAX).then_some(f as i64)
 }
 
 impl ArgConstraint {
+    /// A checked `range`: at least one bound, and `min <= max` when both are given.
+    pub fn range(min: Option<i64>, max: Option<i64>) -> Result<Self, RangeError> {
+        match (min, max) {
+            (None, None) => Err(RangeError::Unbounded),
+            (Some(lo), Some(hi)) if lo > hi => Err(RangeError::Inverted { min: lo, max: hi }),
+            _ => Ok(ArgConstraint::Range { min, max }),
+        }
+    }
+
     /// Canonical (RFC 8785) JSON form; equality and ordering are defined on it, so
     /// constraints can live in `BTreeSet`/`BTreeMap`.
     fn canonical(&self) -> Vec<u8> {
         crate::jcs::to_vec(self).expect("a constraint has a canonical JSON form")
+    }
+
+    /// A range's inclusive bounds over `i64`, a missing bound as the end of the type. `None`
+    /// for other kinds. A range built unchecked with `min > max` has `lo > hi`: it is empty.
+    fn bounds(&self) -> Option<(i64, i64)> {
+        match self {
+            ArgConstraint::Range { min, max } => {
+                Some((min.unwrap_or(i64::MIN), max.unwrap_or(i64::MAX)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Does no value satisfy this constraint (an empty `one_of`, or a range with `min > max`,
+    /// which only the unchecked variant can spell)?
+    fn is_empty(&self) -> bool {
+        match self {
+            ArgConstraint::OneOf(vs) => vs.is_empty(),
+            ArgConstraint::Range { .. } => self.bounds().is_some_and(|(lo, hi)| lo > hi),
+            _ => false,
+        }
     }
 
     /// Does a concrete argument value satisfy this constraint?
@@ -53,11 +204,45 @@ impl ArgConstraint {
                 .as_str()
                 .map(|s| s.starts_with(prefix))
                 .unwrap_or(false),
+            ArgConstraint::Range { .. } => match (self.bounds(), as_long(value)) {
+                (Some((lo, hi)), Some(n)) => lo <= n && n <= hi,
+                _ => false,
+            },
         }
+    }
+
+    /// Why `value` (`None`: the argument is absent) does not satisfy this constraint, or `None`
+    /// when it does. The text names the constraint's own figures (already in the token), never
+    /// the value, which may be sensitive.
+    pub fn violation(&self, value: Option<&Value>) -> Option<String> {
+        let Some(value) = value else {
+            return Some("is absent".into());
+        };
+        if self.satisfied_by(value) {
+            return None;
+        }
+        Some(match self {
+            ArgConstraint::Equals(_) => "does not equal the permitted value".into(),
+            ArgConstraint::OneOf(_) => "is not one of the permitted values".into(),
+            ArgConstraint::Prefix(p) => format!("does not start with {p:?}"),
+            ArgConstraint::Range { min, max } => match (as_long(value), min, max) {
+                (None, _, _) => "is not an integer".into(),
+                (Some(n), Some(lo), _) if n < *lo => format!("is below the minimum {lo}"),
+                (Some(n), _, Some(hi)) if n > *hi => format!("is above the maximum {hi}"),
+                // Only an unchecked inverted range gets here.
+                _ => "is outside the range".into(),
+            },
+        })
     }
 
     /// Does every value satisfying `self` also satisfy `other`?
     pub fn implies(&self, other: &ArgConstraint) -> bool {
+        // A constraint no value satisfies (an empty `OneOf`, an unchecked inverted range)
+        // vacuously implies every constraint. That is sound: a capability carrying it permits
+        // nothing, and it can still be re-delegated unchanged.
+        if self.is_empty() {
+            return true;
+        }
         match (self, other) {
             (ArgConstraint::Equals(a), ArgConstraint::Equals(b)) => value_eq(a, b),
             (ArgConstraint::Equals(a), ArgConstraint::OneOf(bs)) => {
@@ -67,9 +252,6 @@ impl ArgConstraint {
                 .as_str()
                 .map(|s| s.starts_with(p.as_str()))
                 .unwrap_or(false),
-            // An empty `OneOf` is satisfied by no value, so it vacuously implies every
-            // constraint (`all` over an empty set is true). That is sound: a capability
-            // carrying it permits nothing, and it can still be re-delegated unchanged.
             (ArgConstraint::OneOf(as_), ArgConstraint::Equals(b)) => {
                 as_.iter().all(|a| value_eq(a, b))
             }
@@ -85,6 +267,29 @@ impl ArgConstraint {
             // A prefix admits infinitely many values; it cannot imply an exact or finite set.
             (ArgConstraint::Prefix(_), ArgConstraint::Equals(_))
             | (ArgConstraint::Prefix(_), ArgConstraint::OneOf(_)) => false,
+            // A value implies a range when it is an integer in it; a set, when every member is.
+            (ArgConstraint::Equals(a), ArgConstraint::Range { .. }) => other.satisfied_by(a),
+            (ArgConstraint::OneOf(as_), ArgConstraint::Range { .. }) => {
+                as_.iter().all(|a| other.satisfied_by(a))
+            }
+            // Containment of intervals over i64 (a missing bound is the end of the type).
+            (ArgConstraint::Range { .. }, ArgConstraint::Range { .. }) => {
+                match (self.bounds(), other.bounds()) {
+                    (Some((a, b)), Some((c, d))) => c <= a && b <= d,
+                    _ => false,
+                }
+            }
+            // A range implies a value or a set only when it holds exactly one integer and that
+            // integer is the value or in the set (`5` and `5.0` are the same value).
+            (ArgConstraint::Range { .. }, ArgConstraint::Equals(_) | ArgConstraint::OneOf(_)) => {
+                match self.bounds() {
+                    Some((lo, hi)) if lo == hi => other.satisfied_by(&Value::from(lo)),
+                    _ => false,
+                }
+            }
+            // Strings and integers never meet.
+            (ArgConstraint::Prefix(_), ArgConstraint::Range { .. })
+            | (ArgConstraint::Range { .. }, ArgConstraint::Prefix(_)) => false,
         }
     }
 }
@@ -216,6 +421,21 @@ impl Capability {
                     .map(|v| c.satisfied_by(v))
                     .unwrap_or(false)
             })
+    }
+
+    /// Why this capability does not permit `call` although its server and tool patterns match
+    /// it: the first constraint the call fails, as ``argument `amount` is above the maximum
+    /// 2000`` ([`ArgConstraint::violation`]; the argument's value is never echoed). `None` when
+    /// the patterns do not match or every constraint is met.
+    pub fn explain_denial(&self, call: &ToolCall) -> Option<String> {
+        if !pattern_matches(&self.server, &call.server) || !pattern_matches(&self.tool, &call.tool)
+        {
+            return None;
+        }
+        self.constraints.iter().find_map(|(arg, c)| {
+            c.violation(call.arguments.get(arg))
+                .map(|why| format!("argument `{arg}` {why}"))
+        })
     }
 
     /// Human-readable form used in errors and logs, e.g. `github:create_issue{repo=...}`,
@@ -520,6 +740,219 @@ mod tests {
         assert!(!all.permits(&call("evil/x", "read_file", json!({}))));
         assert!(!all.permits(&call("github", "", json!({}))));
         assert!(!all.permits(&call("github", "a//b", json!({}))));
+    }
+
+    fn range(min: Option<i64>, max: Option<i64>) -> ArgConstraint {
+        ArgConstraint::range(min, max).unwrap()
+    }
+
+    #[test]
+    fn range_serde_round_trip_and_validation() {
+        let r = range(Some(0), Some(2000));
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(s, r#"{"op":"range","value":{"min":0,"max":2000}}"#);
+        assert_eq!(serde_json::from_str::<ArgConstraint>(&s).unwrap(), r);
+        // A missing bound is omitted, and read back as unbounded.
+        let upper = range(None, Some(5));
+        assert_eq!(
+            serde_json::to_value(&upper).unwrap(),
+            json!({"op": "range", "value": {"max": 5}})
+        );
+        let lower: ArgConstraint =
+            serde_json::from_value(json!({"op": "range", "value": {"min": -3}})).unwrap();
+        assert_eq!(
+            lower,
+            ArgConstraint::Range {
+                min: Some(-3),
+                max: None
+            }
+        );
+        // A capability carrying it round-trips, and its canonical form sorts the bounds.
+        let cap = Capability::new("bank", "send_money").with_constraint("amount", r.clone());
+        let back: Capability = serde_json::from_str(&serde_json::to_string(&cap).unwrap()).unwrap();
+        assert_eq!(back, cap);
+        assert_eq!(
+            crate::jcs::to_vec(&r).unwrap(),
+            br#"{"op":"range","value":{"max":2000,"min":0}}"#
+        );
+
+        let bad = |v: Value| {
+            serde_json::from_value::<ArgConstraint>(v)
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(bad(json!({"op": "range", "value": {}})).contains("needs `min`, `max` or both"));
+        assert!(bad(json!({"op": "range", "value": {"min": 3, "max": 2}}))
+            .contains("min 3 is greater than its max 2"));
+        // Bounds are integers; a typo is refused rather than read as a missing bound.
+        bad(json!({"op": "range", "value": {"min": 1.5}}));
+        bad(json!({"op": "range", "value": {"min": "1"}}));
+        bad(json!({"op": "range", "value": {"min": 1, "maximum": 5}}));
+        bad(json!({"op": "range", "value": [0, 5]}));
+        bad(json!({"op": "range", "value": {"min": null}}));
+        let dup = r#"{"op":"range","value":{"max":5,"max":5000}}"#;
+        assert!(serde_json::from_str::<ArgConstraint>(dup)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate range member `max`"));
+        bad(json!({"op": "range", "value": {"max": 9_223_372_036_854_775_808u64}}));
+        assert_eq!(ArgConstraint::range(None, None), Err(RangeError::Unbounded));
+        assert_eq!(
+            ArgConstraint::range(Some(1), Some(0)),
+            Err(RangeError::Inverted { min: 1, max: 0 })
+        );
+        assert!(ArgConstraint::range(Some(7), Some(7)).is_ok());
+    }
+
+    #[test]
+    fn range_is_satisfied_by_integers_in_bounds() {
+        let r = range(Some(0), Some(2000));
+        for ok in [json!(0), json!(1), json!(2000), json!(5.0), json!(2000.0)] {
+            assert!(r.satisfied_by(&ok), "{ok}");
+        }
+        for no in [
+            json!(-1),
+            json!(2001),
+            json!(1.5),
+            json!("5"),
+            json!(null),
+            json!(true),
+            json!([5]),
+            json!({"v": 5}),
+            json!(1e300),
+            json!(18_446_744_073_709_551_615u64),
+        ] {
+            assert!(!r.satisfied_by(&no), "{no}");
+        }
+        // Unbounded sides reach the ends of i64, and no further.
+        let neg = range(None, Some(-1));
+        assert!(neg.satisfied_by(&json!(i64::MIN)));
+        assert!(!neg.satisfied_by(&json!(0)));
+        let big = range(Some(0), None);
+        assert!(big.satisfied_by(&json!(i64::MAX)));
+        assert!(!big.satisfied_by(&json!(9_223_372_036_854_775_808u64)));
+        // A whole float beyond Cedar's decimal range is not a long the engine would see.
+        assert!(!big.satisfied_by(&json!(1e15)));
+        assert_eq!(
+            as_long(&json!(922_337_203_685_477.0)),
+            Some(922_337_203_685_477)
+        );
+    }
+
+    #[test]
+    fn range_violation_names_the_bound_not_the_value() {
+        let r = range(Some(10), Some(2000));
+        assert_eq!(r.violation(Some(&json!(500))), None);
+        assert_eq!(
+            r.violation(Some(&json!(9))).unwrap(),
+            "is below the minimum 10"
+        );
+        assert_eq!(
+            r.violation(Some(&json!(2001))).unwrap(),
+            "is above the maximum 2000"
+        );
+        assert_eq!(r.violation(Some(&json!(2.5))).unwrap(), "is not an integer");
+        assert_eq!(r.violation(None).unwrap(), "is absent");
+        let cap = Capability::new("bank", "send_money").with_constraint("amount", r);
+        let why = cap
+            .explain_denial(&call("bank", "send_money", json!({"amount": 31337})))
+            .unwrap();
+        assert_eq!(why, "argument `amount` is above the maximum 2000");
+        assert!(!why.contains("31337"));
+        assert_eq!(
+            cap.explain_denial(&call("bank", "send_money", json!({"amount": 20}))),
+            None
+        );
+        assert_eq!(
+            cap.explain_denial(&call("bank", "other", json!({"amount": 1}))),
+            None
+        );
+    }
+
+    #[test]
+    fn range_implication() {
+        let r = range(Some(0), Some(2000));
+        // range ⊑ range: containment, a missing bound unbounded.
+        assert!(r.implies(&r));
+        assert!(range(Some(10), Some(500)).implies(&r));
+        assert!(range(Some(0), Some(0)).implies(&r));
+        assert!(!range(Some(-1), Some(500)).implies(&r));
+        assert!(!range(Some(10), Some(2001)).implies(&r));
+        assert!(!range(Some(10), None).implies(&r));
+        assert!(range(Some(10), None).implies(&range(Some(0), None)));
+        assert!(r.implies(&range(None, Some(2000))));
+        assert!(!range(None, Some(5)).implies(&r));
+        // A missing bound is the end of i64, so it equals the explicit extreme.
+        assert!(range(None, Some(5)).implies(&range(Some(i64::MIN), Some(5))));
+        assert!(range(Some(i64::MIN), Some(5)).implies(&range(None, Some(5))));
+        // equals / one_of ⊑ range: every member an integer in range.
+        assert!(ArgConstraint::Equals(json!(2000)).implies(&r));
+        assert!(ArgConstraint::Equals(json!(5.0)).implies(&r));
+        assert!(!ArgConstraint::Equals(json!(2001)).implies(&r));
+        assert!(!ArgConstraint::Equals(json!(1.5)).implies(&r));
+        assert!(!ArgConstraint::Equals(json!("5")).implies(&r));
+        assert!(ArgConstraint::OneOf(vec![json!(0), json!(7), json!(2000)]).implies(&r));
+        assert!(!ArgConstraint::OneOf(vec![json!(0), json!("7")]).implies(&r));
+        assert!(!ArgConstraint::OneOf(vec![json!(0), json!(2001)]).implies(&r));
+        assert!(ArgConstraint::OneOf(vec![]).implies(&r));
+        // range ⊑ equals / one_of: only a single-integer range whose integer is covered.
+        let seven = range(Some(7), Some(7));
+        assert!(seven.implies(&ArgConstraint::Equals(json!(7))));
+        assert!(seven.implies(&ArgConstraint::Equals(json!(7.0))));
+        assert!(seven.implies(&ArgConstraint::OneOf(vec![json!(1), json!(7)])));
+        assert!(!seven.implies(&ArgConstraint::Equals(json!(8))));
+        assert!(!seven.implies(&ArgConstraint::Equals(json!("7"))));
+        assert!(!range(Some(7), Some(8)).implies(&ArgConstraint::OneOf(vec![json!(7), json!(8)])));
+        assert!(!r.implies(&ArgConstraint::Equals(json!(0))));
+        // prefix never relates to range.
+        let p = ArgConstraint::Prefix("1".into());
+        assert!(!p.implies(&r));
+        assert!(!r.implies(&p));
+        assert!(!seven.implies(&ArgConstraint::Prefix(String::new())));
+        // An inverted range, which only the unchecked variant can spell, admits nothing.
+        let empty = ArgConstraint::Range {
+            min: Some(1),
+            max: Some(0),
+        };
+        assert!(!empty.satisfied_by(&json!(0)) && !empty.satisfied_by(&json!(1)));
+        assert!(empty.implies(&p) && empty.implies(&ArgConstraint::Equals(json!(3))));
+    }
+
+    #[test]
+    fn range_attenuation_narrows_and_refuses_widening() {
+        let parent = CapabilitySet::from_iter([Capability::new("bank", "send_money")
+            .with_constraint("amount", range(Some(0), Some(2000)))]);
+        let narrower = CapabilitySet::from_iter([Capability::new("bank", "send_money")
+            .with_constraint("amount", range(Some(0), Some(500)))]);
+        assert_eq!(parent.attenuate(&narrower).unwrap(), narrower);
+        let pinned = CapabilitySet::from_iter([Capability::new("bank", "send_money")
+            .with_constraint("amount", ArgConstraint::OneOf(vec![json!(10), json!(20)]))]);
+        assert_eq!(parent.attenuate(&pinned).unwrap(), pinned);
+        for wider in [
+            range(Some(0), Some(5000)),
+            range(Some(-1), Some(2000)),
+            range(None, Some(2000)),
+            range(Some(0), None),
+        ] {
+            let child = CapabilitySet::from_iter([
+                Capability::new("bank", "send_money").with_constraint("amount", wider.clone())
+            ]);
+            assert!(
+                matches!(
+                    parent.attenuate(&child),
+                    Err(AttenuationError::NotCovered { .. })
+                ),
+                "{wider:?}"
+            );
+        }
+        // Dropping the constraint widens too.
+        let bare = CapabilitySet::from_iter([Capability::new("bank", "send_money")]);
+        assert!(parent.attenuate(&bare).is_err());
+        // The range is enforced on calls, absent argument included.
+        let cap = parent.iter().next().unwrap();
+        assert!(cap.permits(&call("bank", "send_money", json!({"amount": 2000}))));
+        assert!(!cap.permits(&call("bank", "send_money", json!({"amount": 2001}))));
+        assert!(!cap.permits(&call("bank", "send_money", json!({}))));
     }
 
     #[test]

@@ -463,6 +463,10 @@ fn admits_amount(c: &ArgConstraint) -> bool {
         ArgConstraint::Equals(v) => amount_of(v).is_some(),
         ArgConstraint::OneOf(vs) => vs.iter().any(|v| amount_of(v).is_some()),
         ArgConstraint::Prefix(_) => false,
+        // Some integer in [max(min, 0), max]: every in-range integer is at most MAX_LIMIT.
+        ArgConstraint::Range { min, max } => {
+            max.is_none_or(|hi| hi >= 0 && min.is_none_or(|lo| lo <= hi))
+        }
     }
 }
 
@@ -1429,6 +1433,19 @@ mod tests {
             .with_constraint("amount", ArgConstraint::Equals(json!("10")))
             .with_limits(Limits::default().with_sum("amount", 10));
         assert!(pinned_str.validate_limits().is_err());
+        // A per-call range and a per-run sum on the same argument combine; a range holding no
+        // non-negative integer could never be charged.
+        let ranged = |min, max| {
+            Capability::new("bank", "send")
+                .with_constraint("amount", ArgConstraint::range(min, max).unwrap())
+                .with_limits(Limits::default().with_sum("amount", 10))
+        };
+        assert!(ranged(Some(0), Some(2000)).validate_limits().is_ok());
+        assert!(ranged(Some(-5), Some(0)).validate_limits().is_ok());
+        assert!(ranged(None, Some(3)).validate_limits().is_ok());
+        assert!(ranged(Some(7), None).validate_limits().is_ok());
+        assert!(ranged(None, Some(-1)).validate_limits().is_err());
+        assert!(ranged(Some(-9), Some(-2)).validate_limits().is_err());
     }
 
     #[test]

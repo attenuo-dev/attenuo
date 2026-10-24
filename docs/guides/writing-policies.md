@@ -133,6 +133,20 @@ when { context.input has repo && context.input.repo like "alice/public-*" };
 
 This is the rule that stops the prompt-injected "read my private repo" in the [GitHub leak demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/github-leak-demo/README.md), even though the token allows `read_file`. Prefer an allow-list (`permit ... when repo like ...`) to a deny-list (`forbid ... when repo like "*private*"`): the deny-list fails open for names you did not think of. For constraints that must travel with the token and survive delegation, put them in the capability itself (`ArgConstraint`) rather than in policy.
 
+### Bounding a number: `range`, Cedar or `sum`
+
+Three tools bound an amount, and they answer different questions:
+
+| You want | Use | Where it lives |
+|---|---|---|
+| this token, and everything delegated from it, never pays more than 2000 in one call | a `range` constraint, `{"amount": {"op": "range", "value": {"min": 1, "max": 2000}}}` | the signed token; a child can only narrow it |
+| no agent of this deployment pays more than 2000 in one call, whatever its token says | Cedar: `forbid ... when { context.input has amount && context.input.amount > 2000 }` | the policy file; changes take effect on reload, for every token |
+| a run pays at most 5000 in all, however it splits the payments | a `sum` limit in the token, or `context.usage.amount` in policy ([below](#run-limits)) | counters on the server, per run |
+
+A `range` is the right tool when the bound is part of what the user or planner delegated: it is chosen per token, it is checked before Cedar, so no policy or approval passes a value outside it, and the exchange refuses a child whose range is wider (`exchange_widening`). The Cedar rule is a deployment ceiling that no one has to put in a token, and it can depend on anything in the request, such as the user's attributes. A `range` and a `sum` combine: `0..2000` per call with `sum <= 5000` stops one large payment and many small ones. Neither replaces the other: a `range` alone lets a run make any number of in-range payments, and a `sum` alone lets the first payment take the whole budget.
+
+A value outside the range, a fraction, or a numeric string is denied with `capability_denied`; the diagnostic names the argument and the bound (``argument `amount` is above the maximum 2000``), never the value. Declare the argument as `long` in the catalog too, so Cedar rules that read it see the same type.
+
 ### Patterns and `like`
 
 `like` is the only pattern match Cedar has. Its one wildcard, `*`, matches any run of characters, including none and including `/`. There is no single-character wildcard, no character class and no regular expression; `\*` matches a literal star. So `context.input.repo like "acme/*"` holds for `acme/api`, but also for:
@@ -356,6 +370,17 @@ The harness builds a real `DelegationChain` and calls the same `PolicyEngine::au
   chain:
     - { agent: assistant, capabilities: ["github:*"] }
     - { agent: coder, capabilities: ["github:read_file"] }
+  ```
+
+  A full capability object takes any constraint kind, a `range` included:
+
+  ```yaml
+  chain:
+    - agent: payer
+      capabilities:
+        - server: banking
+          tool: send_money
+          constraints: { amount: { op: range, value: { min: 1, max: 2000 } } }
   ```
 
 - **Valid chains only.** The chain is validated like a received one. A child wider than its parent, for example, is reported as a failed case with the reason, so a test cannot describe a delegation the server would refuse to issue.

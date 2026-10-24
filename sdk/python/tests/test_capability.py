@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from attenuo import ArgLimit, Capability, Equals, Limits, OneOf, Prefix
+from attenuo import ArgLimit, Capability, Equals, Limits, OneOf, Prefix, Range
 from attenuo.capability import capabilities_to_json
 
 
@@ -143,3 +143,38 @@ def test_distinct_and_derived_limits_are_typed() -> None:
         ArgLimit("url", 1, "path")  # type: ignore[arg-type]
     with pytest.raises(ValueError):
         ArgLimit("url", -1)
+
+
+def test_range_serializes_like_the_server() -> None:
+    cap = Capability("banking", "send_money", amount=Range(0, 2000), fee=Range(max=5))
+    c = cap.to_json()["constraints"]
+    assert c["amount"] == {"op": "range", "value": {"min": 0, "max": 2000}}
+    assert c["fee"] == {"op": "range", "value": {"max": 5}}  # a missing bound is omitted
+    assert Range(min=-3).to_json() == {"op": "range", "value": {"min": -3}}
+    assert Capability.from_json(cap.to_json()) == cap
+    assert Range(7, 7).to_json()["value"] == {"min": 7, "max": 7}
+
+
+def test_range_is_validated_on_both_paths() -> None:
+    bad: list[tuple[tuple[object, ...], dict[str, object]]] = [
+        ((), {}),  # no bound
+        ((3, 2), {}),  # min > max
+        ((1.5,), {}),  # not an integer
+        (("1",), {}),
+        ((True,), {}),  # a bool is not a bound
+        ((), {"max": 2**63}),  # beyond a Cedar Long
+    ]
+    for args, kwargs in bad:
+        with pytest.raises(ValueError):
+            Range(*args, **kwargs)  # type: ignore[arg-type]
+    for value in [
+        {},
+        {"min": 3, "max": 2},
+        {"min": 0, "maximum": 10},  # a typo is refused, not read as no upper bound
+        [0, 10],
+        {"max": 10.5},
+    ]:
+        with pytest.raises(ValueError):
+            Capability.from_json(
+                {"server": "s", "tool": "t", "constraints": {"n": {"op": "range", "value": value}}}
+            )
