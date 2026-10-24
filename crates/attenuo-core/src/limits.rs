@@ -80,13 +80,17 @@ pub const REASON_LIMIT_ARG_INVALID: &str = "limit_arg_invalid";
 #[serde(rename_all = "snake_case")]
 pub enum Derive {
     /// The host of a URL argument: parsed as a WHATWG URL, lowercased, without port, user
-    /// info or one trailing dot. A value that is not a string, or not an absolute URL with a
+    /// info or trailing dots. A value that is not a string, or not an absolute URL with a
     /// host (`example.com/x`, `mailto:a@b`), has none. Nor does a string with a backslash,
     /// whitespace or a control character in it: WHATWG reads `https://a.example\@b.example/`
     /// as host `a.example`, while common HTTP clients (Python's `urllib` and `httpx`, among
     /// others) fetch `b.example`, so the host counted would not be the host reached (SR-56).
     Host,
 }
+
+/// The URL schemes whose hosts WHATWG parses as domains or IP addresses (its "special"
+/// schemes). Other schemes have opaque hosts.
+const SPECIAL_SCHEMES: &[&str] = &["http", "https", "ws", "wss", "ftp", "file"];
 
 impl Derive {
     /// The wire name: `host`.
@@ -118,8 +122,23 @@ impl Derive {
                 }
                 let url = url::Url::parse(raw).ok()?;
                 let host = url.host_str()?.to_ascii_lowercase();
-                let host = host.strip_suffix('.').unwrap_or(&host);
-                (!host.is_empty()).then(|| host.to_string())
+                // Every trailing dot: `a.example.` and `a.example..` are spellings of
+                // `a.example`, and counting them apart would give each its own `calls_per`
+                // budget (fuzzing round 2, FZ2-1).
+                let trimmed = host.trim_end_matches('.');
+                if trimmed.is_empty() {
+                    return None;
+                }
+                // WHATWG drops one trailing dot before it tries an IPv4 reading, so with more
+                // than one it keeps `0x7f.1..` as a domain. Parse what is left again, so that
+                // such a host counts as the address (`127.0.0.1`), as `0x7f.1` does.
+                if trimmed.len() + 1 < host.len() && SPECIAL_SCHEMES.contains(&url.scheme()) {
+                    let again = url::Url::parse(&format!("https://{trimmed}/")).ok()?;
+                    let host = again.host_str()?.to_ascii_lowercase();
+                    let host = host.trim_end_matches('.');
+                    return (!host.is_empty()).then(|| host.to_string());
+                }
+                Some(trimmed.to_string())
             }
         }
     }
@@ -1136,6 +1155,36 @@ mod tests {
             ..Limits::default()
         });
         assert!(cap.validate_limits().is_err());
+    }
+
+    /// FZ2-1 (fuzzing round 2): only one trailing dot was stripped, so `https://a.example../`
+    /// counted as host `a.example.`, apart from `a.example`, and counting that host again
+    /// (`https://a.example./`) gave `a.example`. Every spelling now counts as one host, and a
+    /// derived host is a fixpoint.
+    #[test]
+    fn trailing_dots_are_one_host_fz2_1() {
+        let h = |s: &str| Derive::Host.apply(&json!(s));
+        for url in [
+            "https://a.example/",
+            "https://a.example./",
+            "https://a.example../",
+            "https://A.EXAMPLE.../x",
+        ] {
+            assert_eq!(h(url).as_deref(), Some("a.example"), "{url:?}");
+        }
+        assert_eq!(h("https://../"), None);
+        // With the dots gone, an IPv4 spelling is the address, as without them.
+        assert_eq!(h("https://0x7f.1../").as_deref(), Some("127.0.0.1"));
+        assert_eq!(h("http://127.1.../").as_deref(), Some("127.0.0.1"));
+        let chain = root(vec![Capability::new("mail", "send").with_limits(Limits {
+            calls_per: Some(ArgLimit::new("url", 1).derived(Derive::Host)),
+            ..Limits::default()
+        })]);
+        let value = |url: &str| {
+            let call = ToolCall::new("mail", "send", json!({ "url": url }));
+            charges_for(&chain, &call).unwrap()[0].value.clone()
+        };
+        assert_eq!(value("https://a.example../"), value("https://a.example/"));
     }
 
     /// SR-56: WHATWG and common HTTP clients disagree on where the host of

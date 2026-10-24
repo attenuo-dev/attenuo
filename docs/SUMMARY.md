@@ -32,6 +32,7 @@
 - [Performance](design/performance.md)
   - [End-to-end benchmark, 2026-10-23](design/bench/2026-10-23-vm.md)
 - [Fuzzing](design/fuzzing.md)
+  - [Fuzzing, round 2](research/fuzzing-2026-10-24-round2.md)
 - [Admin console](design/admin-console.md)
 - [Output labelling (proposed)](design/output-labelling.md)
 - [Run limits](design/run-limits.md)

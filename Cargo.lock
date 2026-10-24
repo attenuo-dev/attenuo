@@ -141,6 +141,7 @@ dependencies = [
  "attenuo-token",
  "base64 0.23.1",
  "hex",
+ "proptest",
  "ring",
  "rusqlite",
  "serde",

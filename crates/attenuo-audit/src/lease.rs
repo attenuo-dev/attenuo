@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Mutex;
 
 use attenuo_core::fingerprint::Fingerprint;
+use attenuo_core::limits::MAX_LIMIT;
 use attenuo_core::{Charge, LeaseId, LimitKind};
 use time::OffsetDateTime;
 
@@ -1004,14 +1005,34 @@ impl LeaseStore for MemoryLeaseStore {
             if key.kind == distinct {
                 continue;
             }
+            if USAGE_KINDS.contains(&key.kind) {
+                continue; // Recomputed below.
+            }
             if let Some(v) = counters.get_mut(key) {
                 *v = v.saturating_sub(c.amount);
             }
-            if !USAGE_KINDS.contains(&key.kind) {
-                restored += 1;
-            }
+            restored += 1;
         }
         entry.refunded = true;
+        // A run-usage counter saturates at `MAX_LIMIT`, so what one decision logged is not
+        // what it added once the counter was full: recompute it from the decisions left
+        // (fuzzing round 2, FZ2-4).
+        let usage: Vec<CounterKey> = entry
+            .charges
+            .iter()
+            .filter(|c| USAGE_KINDS.contains(&c.counter.kind))
+            .map(|c| c.counter.clone())
+            .collect();
+        for key in usage {
+            let total = log
+                .values()
+                .filter(|e| !e.refunded)
+                .flat_map(|e| &e.charges)
+                .filter(|c| c.counter == key)
+                .fold(0u64, |t, c| t.saturating_add(c.amount))
+                .min(MAX_LIMIT);
+            counters.insert(key, total);
+        }
         Ok(restored)
     }
 }

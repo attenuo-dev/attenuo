@@ -613,3 +613,69 @@ fn hop_limits_and_counter_summaries_for_the_console() {
             .is_empty());
     }
 }
+
+fn usage_amount(amount: u64) -> Charge {
+    Charge {
+        hop: 0,
+        cap: 0,
+        lease: LeaseId::new("run"),
+        kind: LimitKind::Sum,
+        arg: Some("bank/send".into()),
+        value: None,
+        amount,
+        max: MAX_LIMIT,
+        usage: true,
+    }
+}
+
+/// FZ2-4 (fuzzing round 2): a run-usage counter saturates at `MAX_LIMIT`, so refunding one
+/// decision by the amount it logged took the counter below what the decisions left had
+/// charged (or kept it below `MAX_LIMIT` when the refunded one was charged after the counter
+/// was full). A refund now recomputes a usage counter from the unrefunded charges.
+#[test]
+fn usage_refund_after_saturation_keeps_the_rest_fz2_4() {
+    for (name, store) in stores() {
+        let probe = [usage_amount(0)];
+        charged(
+            store
+                .charge("big", &[usage_amount(MAX_LIMIT)], t0())
+                .unwrap(),
+        );
+        charged(store.charge("small", &[usage_amount(5)], t0()).unwrap());
+        assert_eq!(
+            store.budget_used(&probe).unwrap(),
+            vec![MAX_LIMIT],
+            "{name}"
+        );
+        // The later, smaller call: the first still fills the counter.
+        store.refund("small", t0()).unwrap();
+        assert_eq!(
+            store.budget_used(&probe).unwrap(),
+            vec![MAX_LIMIT],
+            "{name}"
+        );
+        charged(store.charge("small2", &[usage_amount(5)], t0()).unwrap());
+        // The big one: the 5 left must still count, not 0.
+        store.refund("big", t0()).unwrap();
+        assert_eq!(store.budget_used(&probe).unwrap(), vec![5], "{name}");
+        store.refund("small2", t0()).unwrap();
+        assert_eq!(store.budget_used(&probe).unwrap(), vec![0], "{name}");
+    }
+}
+
+/// FZ2-3 (fuzzing round 2): the SQLite refund summed a decision's rows per counter with an
+/// integer `SUM`, which overflowed (and failed the refund) for two usage rows near
+/// `MAX_LIMIT` on one counter; the memory store refunded them. Both refund it now.
+#[test]
+fn refund_of_two_large_rows_on_one_counter_fz2_3() {
+    for (name, store) in stores() {
+        let call = [usage_amount(1), usage_amount(MAX_LIMIT)];
+        assert_eq!(
+            charged(store.charge("d", &call, t0()).unwrap()),
+            vec![1, MAX_LIMIT],
+            "{name}"
+        );
+        assert_eq!(store.refund("d", t0()).unwrap(), 0, "{name}");
+        assert_eq!(store.budget_used(&call[..1]).unwrap(), vec![0], "{name}");
+    }
+}
