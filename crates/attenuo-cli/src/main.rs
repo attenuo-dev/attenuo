@@ -480,7 +480,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
             // Where the cases go: the in-process engine, or a server and its credentials.
             enum Target {
                 Local,
-                Authzen(Client, String, Option<attenuo_token::DpopKey>),
+                Authzen(Client, String, Option<Box<attenuo_token::DpopKey>>),
                 AdminEvaluate(Client),
             }
             let target = match args.via {
@@ -494,7 +494,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
                         &mut stdin,
                     )?;
                     let key = dpop_key::load_opt(args.token.dpop_key.as_deref())?;
-                    Target::Authzen(client, token, key)
+                    Target::Authzen(client, token, key.map(Box::new))
                 }
                 cli::Via::AdminEvaluate => {
                     let client = client?;
@@ -514,7 +514,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
                         let remote = policy_cmd::Remote {
                             client,
                             token,
-                            dpop_key: key.as_ref(),
+                            dpop_key: key.as_deref(),
                         };
                         policy_cmd::test_authzen(&args.files, &remote, &opts, json).await
                     }
