@@ -110,7 +110,8 @@ fn record(attrs: &BTreeMap<String, ArgType>) -> String {
 fn context_type(inputs: &BTreeMap<String, ArgType>) -> String {
     format!(
         "{{ input: {}, originating_user: UserContext, chain: ChainContext, session_id?: String, now_unix: Long, \
-         session: SessionContext, args_contain_untrusted: Bool, untrusted_args: Set<String>, approval: ApprovalContext }}",
+         session: SessionContext, args_contain_untrusted: Bool, untrusted_args: Set<String>, approval: ApprovalContext, \
+         budget: BudgetContext }}",
         record(inputs)
     )
 }
@@ -148,6 +149,10 @@ pub fn generate(
     // Output labelling (ADR-0009). Always present in the context, so policies need no `has`.
     s.push_str("type SessionContext = { tainted: Bool, tainted_by: Set<String> };\n");
     s.push_str("type ApprovalContext = { present: Bool, by: String };\n");
+    // Run limits (ADR-0010). Always present too.
+    s.push_str(
+        "type BudgetContext = { limited: Bool, calls_remaining: Long, amount_remaining: Long, destination_new: Bool };\n",
+    );
     let actions = catalog.actions(legacy_bare_actions);
     let mut all_inputs: BTreeMap<String, ArgType> = BTreeMap::new();
     for inputs in actions.values() {
@@ -212,6 +217,8 @@ mod tests {
             "approval: ApprovalContext",
             "type SessionContext = { tainted: Bool, tainted_by: Set<String> }",
             "type ApprovalContext = { present: Bool, by: String }",
+            "budget: BudgetContext",
+            "type BudgetContext = { limited: Bool, calls_remaining: Long, amount_remaining: Long, destination_new: Bool }",
         ] {
             assert!(text.contains(attr), "{attr}");
         }

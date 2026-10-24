@@ -24,10 +24,17 @@
 //!       tainted_by: [web/fetch]     # sources as server/tool; tainted when non-empty
 //!       tainted: true               # optional; set it alone for an unreadable taint state
 //!     approval: { by: user }        # optional: the call carries a granted approval
+//!     budget:                       # optional: what the run limits have left (ADR-0010)
+//!       calls_remaining: 1          # each member optional; `limited` defaults to true
+//!       amount_remaining: 40
+//!       destination_new: false
 //! ```
 //!
 //! Without `session` the run is untainted, as for a run that has read nothing. Without
-//! `approval`, `context.approval.present` is `false`.
+//! `approval`, `context.approval.present` is `false`. Without `budget`, no limit applies
+//! (`context.budget.limited` is `false`, both remaining figures are Cedar's largest `Long`).
+//! The harness keeps no counters: `budget` sets what Cedar sees, it does not enforce limits
+//! a hop's capabilities carry.
 //!
 //! An inline catalog has the same shape as `[policy.catalog]` in the server config:
 //!
@@ -405,6 +412,34 @@ pub struct ApprovalSpec {
     pub by: String,
 }
 
+/// What the run limits matching the case's call have left (`context.budget`). Members left out
+/// take the values of a call no limit applies to; `limited` defaults to `true`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetSpec {
+    #[serde(default)]
+    pub limited: Option<bool>,
+    #[serde(default)]
+    pub calls_remaining: Option<i64>,
+    #[serde(default)]
+    pub amount_remaining: Option<i64>,
+    #[serde(default)]
+    pub destination_new: Option<bool>,
+}
+
+impl BudgetSpec {
+    fn context(&self) -> crate::BudgetContext {
+        let d = crate::BudgetContext::default();
+        crate::BudgetContext {
+            limited: self.limited.unwrap_or(true),
+            calls_remaining: self.calls_remaining.unwrap_or(d.calls_remaining),
+            amount_remaining: self.amount_remaining.unwrap_or(d.amount_remaining),
+            destination_new: self.destination_new.unwrap_or(d.destination_new),
+            refusal: None,
+        }
+    }
+}
+
 /// The decision a case expects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -455,6 +490,9 @@ pub struct TestCase {
     /// A granted approval the call carries; none when absent.
     #[serde(default)]
     pub approval: Option<ApprovalSpec>,
+    /// What the run limits have left; no limit applies when absent.
+    #[serde(default)]
+    pub budget: Option<BudgetSpec>,
 }
 
 /// A parsed test file.
@@ -689,6 +727,9 @@ fn run_case(engine: &PolicyEngine, case: &TestCase, now_unix: i64) -> CaseReport
         .unwrap_or_default();
     if let Some(a) = &case.approval {
         labels.approval = crate::ApprovalContext::by(a.by.clone());
+    }
+    if let Some(b) = &case.budget {
+        labels.budget = b.context();
     }
     let actual = Actual::from(engine.authorize_labelled(&chain, &call, &labels, now));
 

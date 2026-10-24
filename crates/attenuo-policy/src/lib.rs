@@ -56,7 +56,13 @@
 //!   "session": { "tainted": true, "tainted_by": ["web/fetch"] },
 //!   "args_contain_untrusted": false,
 //!   "untrusted_args": [],
-//!   "approval": { "present": false, "by": "" }
+//!   "approval": { "present": false, "by": "" },
+//!   "budget": {
+//!     "limited": false,
+//!     "calls_remaining": 9223372036854775807,
+//!     "amount_remaining": 9223372036854775807,
+//!     "destination_new": true
+//!   }
 //! }
 //! ```
 //!
@@ -70,6 +76,16 @@
 //! empty until argument matching is built. `approval.present` is `true` only when the call
 //! carries a granted approval for its exact call hash ([`ApprovalContext`]), with
 //! `approval.by` set to `user` or `operator`; otherwise it is `false` and `by` is empty.
+//!
+//! `budget` comes from run limits (ADR-0010) and is always present too ([`BudgetContext`]).
+//! `budget.limited` is true when some limit in the chain matches the call;
+//! `budget.calls_remaining` and `budget.amount_remaining` are, before this call, the smallest
+//! `max - used` over every matching `calls` (or `sum`) limit in the chain, or Cedar's largest
+//! `Long` when none applies; `budget.destination_new` is false when the call's value of a
+//! `calls_per` argument appeared in an earlier allowed call under that limit (`true` when no
+//! such limit applies). The server enforces the token's limits itself, in the capability
+//! stage before Cedar (`budget_exhausted`, `budget_error`, `limit_arg_invalid`, set through
+//! [`BudgetContext::refusal`]); policies read these figures to explain or to ask earlier.
 //!
 //! # Obligations
 //!
@@ -275,14 +291,59 @@ impl SessionLabels {
     }
 }
 
-/// The per-call inputs to the Cedar context that come from output labelling (ADR-0009).
-/// The default is an untainted run.
+/// The per-call inputs to the Cedar context that the server computes from run state: output
+/// labelling (ADR-0009) and run limits (ADR-0010). The default is an untainted run with no
+/// limit.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CallLabels {
     /// `context.session`.
     pub session: SessionLabels,
     /// `context.approval`.
     pub approval: ApprovalContext,
+    /// `context.budget`, and a refusal from the run-limit check.
+    pub budget: BudgetContext,
+}
+
+/// `context.budget` (ADR-0010): what the run limits that match a call have left, computed by
+/// the server from the lease store before evaluation. The default is a call no limit applies
+/// to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetContext {
+    /// `context.budget.limited`: some limit in the chain matches the call.
+    pub limited: bool,
+    /// `context.budget.calls_remaining`: before this call, the smallest `max - used` over
+    /// every matching `calls` limit; `i64::MAX` when none applies.
+    pub calls_remaining: i64,
+    /// `context.budget.amount_remaining`: the same for `sum` limits.
+    pub amount_remaining: i64,
+    /// `context.budget.destination_new`: no value of the call's `calls_per` argument has
+    /// appeared in an earlier allowed call under that limit; `true` when none applies.
+    pub destination_new: bool,
+    /// When set, the call is denied in the capability stage, after the capability check and
+    /// before the catalog and Cedar, with this reason (`budget_exhausted`, `budget_error` or
+    /// `limit_arg_invalid`). Token limits are hard: no policy or approval can pass the call.
+    pub refusal: Option<BudgetRefusal>,
+}
+
+impl Default for BudgetContext {
+    fn default() -> Self {
+        Self {
+            limited: false,
+            calls_remaining: i64::MAX,
+            amount_remaining: i64::MAX,
+            destination_new: true,
+            refusal: None,
+        }
+    }
+}
+
+/// Why the run-limit check refuses a call (see [`BudgetContext::refusal`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetRefusal {
+    /// The reason code.
+    pub reason: String,
+    /// A diagnostic naming the limit.
+    pub detail: String,
 }
 
 /// `context.approval` (ADR-0009): whether the call carries a granted approval for its exact
@@ -751,6 +812,13 @@ impl PolicyEngine {
                     have.join(", ")
                 )],
             );
+        }
+
+        // Stage 1a: run limits (ADR-0010). The server read the counters; a limit the call
+        // would exceed, an argument a limit cannot count, or unreadable counters deny here,
+        // before the catalog and Cedar, so no policy or approval can pass the call.
+        if let Some(r) = &labels.budget.refusal {
+            return Outcome::deny(&r.reason, vec![r.detail.clone()]);
         }
 
         // Stage 1b: the catalog. An unclassified tool would otherwise get default attributes,

@@ -164,6 +164,37 @@ pub struct DecisionRecord {
     /// other record, which keeps the hashes of older records unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<ApprovalInfo>,
+    /// For an allowed decision that drew on run limits (ADR-0010): every counter it charged
+    /// and what each held afterwards. Absent when the call matched no limit, which keeps the
+    /// hashes of older records unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<RecordBudget>,
+}
+
+/// What a decision record says about run limits (see [`DecisionRecord::budget`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordBudget {
+    /// Every counter the call was charged against, in the order of
+    /// [`crate::limits::charges_for`].
+    pub charged: Vec<BudgetCharge>,
+}
+
+/// One counter a decision charged: which limit, of which capability of which hop, and what it
+/// held after the charge. The hop is named by its position, not its lease id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetCharge {
+    /// Position of the hop in the chain (0 is the root).
+    pub hop: usize,
+    /// Index of the capability in the hop's capability set.
+    pub cap: usize,
+    pub kind: crate::limits::LimitKind,
+    /// The argument a `sum` or `calls_per` limit counts; absent for `calls`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg: Option<String>,
+    /// What the counter holds after this call.
+    pub used_after: u64,
+    /// The limit's `max`.
+    pub max: u64,
 }
 
 /// What a record says about an approval (see [`DecisionRecord::approval`]). Every member but
@@ -309,6 +340,7 @@ impl DecisionRecord {
             result: None,
             labels: None,
             approval: None,
+            budget: None,
         }
     }
 

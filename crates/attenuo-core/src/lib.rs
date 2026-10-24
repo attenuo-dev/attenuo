@@ -29,9 +29,9 @@ pub use call::ToolCall;
 pub use capability::{ArgConstraint, Capability, CapabilitySet};
 pub use chain::{AgentId, DelegationChain, Hop, LeaseId, OriginatingUser};
 pub use decision::{
-    chain_id_of, ApprovalInfo, Decision, DecisionRecord, OutputLabel, RecordKind, RecordLabels,
-    ResultInfo, REASON_APPROVAL_DECLINED, REASON_APPROVAL_GRANTED, REASON_APPROVAL_REQUESTED,
-    REASON_TOOL_RESULT,
+    chain_id_of, ApprovalInfo, BudgetCharge, Decision, DecisionRecord, OutputLabel, RecordBudget,
+    RecordKind, RecordLabels, ResultInfo, REASON_APPROVAL_DECLINED, REASON_APPROVAL_GRANTED,
+    REASON_APPROVAL_REQUESTED, REASON_TOOL_RESULT,
 };
 pub use error::{AttenuationError, ChainError};
 pub use limits::{ArgLimit, Charge, LimitKind, Limits};
