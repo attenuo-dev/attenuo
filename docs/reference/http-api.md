@@ -178,7 +178,7 @@ All admin routes need `Authorization: Bearer <admin token>`. They answer 401 wit
 | `POST /admin/policies/reload` | Re-read the policy file. On failure the old policy stays. |
 | `GET /admin/policies` | The policy set in force: file path, its `sha256` and `loaded_at` (startup or last successful reload), `policy_ids`, validation `warnings`, and `policies: [{id, text}]`. |
 | `GET /admin/policies/check` | Lint the policy file as it is on disk now against the running schema, with line and column for each issue, and say whether it differs from the loaded one. Loads nothing, audits nothing. 409 `check_unavailable` without `policy.policies_path`. |
-| `POST /admin/policies/evaluate` | Dry run: what the loaded policies decide for one call, given a token or a chain. No lease check, no audit record, no decision metric. |
+| `POST /admin/policies/evaluate` | Dry run: what the loaded policies decide for one call, given a token or a chain, and optionally the run-limit state to assume (`budget`). No lease check, no charge, no audit record, no decision metric. |
 | `POST /admin/budgets/refund` | Body `{"decision_id": "<uuid>", "reason": "..."}`: give back to every run-limit counter what that decision charged, once, for an allowed call whose effect did not happen. Answers `{decision_id, refunded, reason, audit_id}` (`refunded` counts the token-limit counters credited; the run usage the decision charged is returned too but not counted, so a call that charged only usage answers 0; a `distinct` value is freed, and counted, only when no other unrefunded decision used it, SR-62) and appends an `admin.budget.refund` record. 404 when the decision charged nothing, 409 `already_refunded`. Also on the console listener with `[admin_ui] allow_write = true`. |
 | `POST /admin/root-token` | Development root mint. Mounted only when `[dev] allow_root_mint = true`. |
 
@@ -358,7 +358,30 @@ These three routes change nothing and write no audit record. They answer the que
 - Without `token`, `subject.properties.chain` is required (400 `invalid_request` otherwise) and is only checked structurally, as of now (400 `invalid_chain` if that fails). Nothing checks that this server issued it.
 - An optional `session`, `{"tainted_by": ["<server>/<tool>", ...], "tainted": true, "untrusted_args": ["<argument>", ...], "args_contain_untrusted": true}`, sets the run's output labels for the dry run (`tainted` defaults to whether `tainted_by` is non-empty, `args_contain_untrusted` to whether `untrusted_args` is). Without it, the labels are read from the store for the chain's run, and the call's arguments are matched against the run's span index as a proxied call's would be. Anything else in `session` is a 400 `invalid_request`.
 - An optional `approval`, `{"by": "user" | "operator" | "policy"}`, evaluates the call as a retry that carries a granted approval (`context.approval.present` true, `by` as given). The dry run never looks up or uses a stored approval.
-- An optional `usage`, `{"calls": 1, "amount": 10, "destination_seen": true}` (each member optional, 0 or false; the numbers non-negative integers), sets `context.usage` for the dry run. Without it, the run's usage of a destructive tool is read from the store (all zero for any other tool), unless the server keeps no run usage at all (no loaded policy reads `context.usage`, the catalog names no `amount` or `destination`, and `[policy] track_usage` is not `true`): then the figures are zero and `usage.source` is `untracked`. Anything else in `usage` is a 400 `invalid_request`.
+- An optional `usage`, `{"calls": 1, "amount": 10, "destination_seen": true}` (each member optional, 0 or false; the numbers non-negative integers), sets `context.usage` for the dry run. Without it, the run's usage of a destructive tool is read from the store (all zero for any other tool), unless the server keeps no run usage at all (no loaded policy reads `context.usage`, the catalog names no `amount` or `destination`, and `[policy] track_usage` is not `true`): then the figures are zero and `usage.source` is `untracked`. With a `budget` (below) and no `usage`, the figures are zero and nothing is read. Anything else in `usage` is a 400 `invalid_request`.
+- An optional `budget` states the run-limit situation to decide the call in, instead of the store's counters, in the vocabulary of a `policy test` case's `budget` (see below).
+
+The `budget` block (every member optional):
+
+```json
+{
+  "calls_remaining": 1,
+  "amount_remaining": 40,
+  "destination_new": false,
+  "limited": true,
+  "limits": [{"hop": 0, "kind": "distinct", "arg": "recipient", "max": 3, "used": 3}]
+}
+```
+
+| Member | Type | Meaning |
+|---|---|---|
+| `calls_remaining` | non-negative integer | What every `calls` limit of the chain that matches the call has left before it: its counter is taken as `max - calls_remaining` (0 when that is negative). Left out: nothing used. |
+| `amount_remaining` | non-negative integer | The same for `sum` limits. |
+| `destination_new` | boolean | `false`: the call's value was already counted, once by each matching `calls_per` limit and by each `distinct` limit. Left out or `true`: the value is new. |
+| `limited` | boolean | `context.budget.limited` when no limit of the chain matches the call (default `true`). Ignored when one does. |
+| `limits` | list, at most 64 entries | The counter of single limits, over the figures above, in the shape of the `limit` member of a `budget_exhausted` answer: `hop` (position in the chain, root 0), `kind` (`calls`, `sum`, `calls_per` or `distinct`), `arg` (the counted argument as the limit names it, `arg#host` for a derived one; required for every kind but `calls`, refused for `calls`), `used` (required: calls or summed amount; for `calls_per` the calls with this call's value; for `distinct` how many values the limit has seen) and `max` (optional; must equal the limit's). |
+
+The counters are then checked by the same code a live call goes through, before Cedar, so a call that would take a hard limit past its `max` answers `budget_exhausted` with the same `limit` member and diagnostic as a run whose store held those counters. When no limit of the chain matches the call, there is nothing to check, and Cedar sees the figures as given (`context.budget`, members left out as for an unlimited call), as `attenuo policy test` sets them offline. A stated `budget` is never read from or written to the lease store, and nothing is audited. 400 `invalid_request`, with a diagnostic starting `` `budget`: ``, for: a block that is not an object, an unknown member (also inside a `limits` entry), a figure that is negative or not an integer, a flag that is not a boolean, `limits` that is not a list or has more than 64 entries, an unknown `kind`, a missing `hop`, `kind` or `used`, `arg` on a `calls` entry or missing on another, two entries naming the same limit, and an entry that names no limit of the chain matching the call (wrong hop, kind, argument or `max`).
 
 ```json
 {
@@ -373,12 +396,13 @@ These three routes change nothing and write no audit record. They answer the que
               "untrusted_args": [], "source": "store"},
   "approval": {"present": false, "by": ""},
   "budget": {"limited": false, "calls_remaining": 9223372036854775807,
-             "amount_remaining": 9223372036854775807, "destination_new": true},
+             "amount_remaining": 9223372036854775807, "destination_new": true,
+             "source": "store"},
   "usage": {"calls": 0, "amount": 0, "destination_seen": false, "source": "store"}
 }
 ```
 
-`budget` is `context.budget` as the run's counters stand now: the dry run reads them and never charges. When the call would exceed a limit, the answer is `budget_exhausted` and adds `limit: {hop, kind, arg, max, used}`.
+`budget` is `context.budget`: as the run's counters stand now (`source: "store"`; the dry run reads them and never charges), or as the request's `budget` block states them (`source: "request"`). When the call would exceed a limit, the answer is `budget_exhausted` and adds `limit: {hop, kind, arg, max, used}`.
 
 `chain_source` is `token` or `admin_supplied`. `session.source` is `request` or `store`. `usage.source` is `request`, `store`, or `untracked` when the server keeps no run usage (the zeros are then not a reading of the run); usage read from the store is never charged. The decision comes from the capability stage and Cedar, the same code `POST /access/v1/evaluation` runs after its lease check, so for a token with live leases the two agree on decision, reason and policy ids. A revoked or expired lease does not change the dry run's answer (`lease_check` is always `skipped`).
 
