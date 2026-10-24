@@ -4,15 +4,17 @@
 //! revoking one revokes everything delegated from it. A lease the store does not know is
 //! reported as `unknown` and counts as inactive: a store that lost rows fails closed.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Mutex;
 
+use attenuo_core::fingerprint::Fingerprint;
 use attenuo_core::{Charge, LeaseId};
 use time::OffsetDateTime;
 
 use crate::approval::{rules, Approval, ApprovalState, Approver};
 use crate::budget::{plan, ChargeOutcome, CounterKey, ValueKey};
 use crate::error::AuditError;
+use crate::spans::{distinct_hashes, evictions, SpanHit, SpanKey, MAX_SPANS_PER_RUN};
 
 /// Outcome of checking a set of leases together (typically every lease in a chain).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -89,6 +91,28 @@ pub trait LeaseStore: Send + Sync {
     /// `seq`. Empty for a run that has read nothing untrusted. Callers must treat an error as
     /// tainted (fail closed).
     fn labels(&self, chain_id: &LeaseId) -> Result<Vec<RunLabel>, AuditError>;
+
+    /// Add the fingerprints of one untrusted result to the span index of the run `chain_id`
+    /// (ADR-0009 phase 2, [`crate::spans`]), tagged with `seq`, the audit `seq` of the result's
+    /// `tool_result` record. The run's lease must be known ([`AuditError::UnknownLease`]
+    /// otherwise). Keeps at most [`MAX_SPANS_PER_RUN`] per run, evicting the oldest results'
+    /// sets first; the check, the eviction and the write are one transaction. Nothing is
+    /// written for an empty `spans`.
+    fn add_spans(
+        &self,
+        chain_id: &LeaseId,
+        seq: u64,
+        spans: &[Fingerprint],
+    ) -> Result<(), AuditError>;
+
+    /// Look `probes` up in the span index of the run `chain_id`: one [`SpanHit`] per probe and
+    /// stored result that holds it, ordered by probe, then `seq`. Empty for a run with no
+    /// index. Callers must treat an error as a match (fail closed).
+    fn find_spans(
+        &self,
+        chain_id: &LeaseId,
+        probes: &[Fingerprint],
+    ) -> Result<Vec<SpanHit>, AuditError>;
 
     /// Store a pending approval (ADR-0009). `approval.state` is ignored (stored as pending);
     /// `approval.expires_at` is lowered to the expiry of `approval.lease`, which must be known
@@ -348,6 +372,8 @@ pub struct MemoryLeaseStore {
     bindings: Mutex<BTreeMap<LeaseId, String>>,
     /// Per run, the first label of each source.
     labels: Mutex<BTreeMap<LeaseId, BTreeMap<String, RunLabel>>>,
+    /// Per run, the span index (ADR-0009 phase 2).
+    spans: Mutex<Spans>,
     /// Approvals by id.
     approvals: Mutex<BTreeMap<String, Approval>>,
     /// Run-limit counters and the charges of each decision, under one lock (ADR-0010).
@@ -370,6 +396,45 @@ impl Budgets {
         }
         let key = self.key.as_ref().expect("set above");
         charges.iter().map(|c| key.counter(c)).collect()
+    }
+}
+
+/// The memory store's span indexes.
+#[derive(Debug, Default)]
+struct Spans {
+    /// Created on first use: generating a key can fail, and `Default` cannot.
+    key: Option<SpanKey>,
+    runs: BTreeMap<LeaseId, RunSpans>,
+}
+
+impl Spans {
+    fn key(&mut self) -> Result<SpanKey, AuditError> {
+        if self.key.is_none() {
+            self.key = Some(SpanKey::random()?);
+        }
+        Ok(self.key.clone().expect("set above"))
+    }
+}
+
+/// One run's span index: each result's hashes by `seq`, and the reverse map for lookups.
+#[derive(Debug, Default)]
+struct RunSpans {
+    by_seq: BTreeMap<u64, Vec<[u8; 32]>>,
+    index: HashMap<[u8; 32], BTreeSet<u64>>,
+    len: usize,
+}
+
+impl RunSpans {
+    fn remove(&mut self, seq: u64) {
+        for h in self.by_seq.remove(&seq).unwrap_or_default() {
+            if let Some(seqs) = self.index.get_mut(&h) {
+                seqs.remove(&seq);
+                if seqs.is_empty() {
+                    self.index.remove(&h);
+                }
+            }
+            self.len -= 1;
+        }
     }
 }
 
@@ -478,6 +543,11 @@ impl LeaseStore for MemoryLeaseStore {
                     .map(|(child, _)| child.clone()),
             );
         }
+        // A revoked run's span index ends with it (`crate::spans`). Lock order: rows, spans.
+        let mut spans = self.spans.lock()?;
+        for id in &visited {
+            spans.runs.remove(id);
+        }
         Ok(revoked)
     }
 
@@ -563,6 +633,57 @@ impl LeaseStore for MemoryLeaseStore {
                 out
             })
             .unwrap_or_default())
+    }
+
+    fn add_spans(
+        &self,
+        chain_id: &LeaseId,
+        seq: u64,
+        spans: &[Fingerprint],
+    ) -> Result<(), AuditError> {
+        // As in `add_label`, the rows lock is held across the write.
+        let rows = self.rows.lock()?;
+        if !rows.contains_key(chain_id) {
+            return Err(AuditError::UnknownLease(chain_id.0.clone()));
+        }
+        if spans.is_empty() {
+            return Ok(());
+        }
+        let mut all = self.spans.lock()?;
+        let key = all.key()?;
+        let mut hashes = distinct_hashes(&key, spans);
+        hashes.truncate(MAX_SPANS_PER_RUN);
+        let run = all.runs.entry(chain_id.clone()).or_default();
+        let stored: Vec<(u64, usize)> = run.by_seq.iter().map(|(s, v)| (*s, v.len())).collect();
+        for old in evictions(&stored, hashes.len()) {
+            run.remove(old);
+        }
+        run.remove(seq);
+        for h in &hashes {
+            run.index.entry(*h).or_default().insert(seq);
+        }
+        run.len += hashes.len();
+        run.by_seq.insert(seq, hashes);
+        Ok(())
+    }
+
+    fn find_spans(
+        &self,
+        chain_id: &LeaseId,
+        probes: &[Fingerprint],
+    ) -> Result<Vec<SpanHit>, AuditError> {
+        let mut all = self.spans.lock()?;
+        let key = all.key()?;
+        let Some(run) = all.runs.get(chain_id) else {
+            return Ok(Vec::new());
+        };
+        let mut hits = Vec::new();
+        for (probe, f) in probes.iter().enumerate() {
+            if let Some(seqs) = run.index.get(&key.hash(f)) {
+                hits.extend(seqs.iter().map(|&seq| SpanHit { probe, seq }));
+            }
+        }
+        Ok(hits)
     }
 
     fn create_approval(&self, approval: &Approval) -> Result<(Approval, bool), AuditError> {

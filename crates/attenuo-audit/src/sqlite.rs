@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock, TryLockError};
 use std::time::Duration;
 
+use attenuo_core::fingerprint::Fingerprint;
 use attenuo_core::{Charge, DecisionRecord, LeaseId, LimitKind};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use time::format_description::well_known::Rfc3339;
@@ -34,6 +35,7 @@ use crate::log::{
     VerifyReport, ENTRY_HASH_VERSION, GENESIS_HASH,
 };
 use crate::query::{like_contains, EntryFilter, Order};
+use crate::spans::{distinct_hashes, evictions, SpanHit, SpanKey, MAX_SPANS_PER_RUN};
 
 const AUDIT_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS audit (
@@ -154,6 +156,17 @@ CREATE TABLE IF NOT EXISTS budget_meta (
     value TEXT NOT NULL
 );
 INSERT OR IGNORE INTO budget_meta (key, value) VALUES ('value_key', lower(hex(randomblob(32))));
+-- Output labelling phase 2 (ADR-0009): the span index of each run. `hash` is the HMAC-SHA-256
+-- of a result fingerprint under `span_key` (no content); `seq` is the audit seq of the result's
+-- `tool_result` record. Created at open on stores that predate it.
+CREATE TABLE IF NOT EXISTS run_spans (
+    chain_id TEXT    NOT NULL,
+    hash     BLOB    NOT NULL,
+    seq      INTEGER NOT NULL,
+    PRIMARY KEY (chain_id, hash, seq)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS run_spans_seq_idx ON run_spans(chain_id, seq);
+INSERT OR IGNORE INTO budget_meta (key, value) VALUES ('span_key', lower(hex(randomblob(32))));
 "#;
 
 /// The record id (`DecisionRecord::id`) of a row, as SQL. `record_json` is the hashed text
@@ -1895,6 +1908,8 @@ pub struct SqliteLeaseStore {
     durability: Option<Durability>,
     /// The key `calls_per` values are hashed under (`budget_meta`, ADR-0010).
     value_key: ValueKey,
+    /// The key span-index fingerprints are hashed under (`budget_meta`, ADR-0009 phase 2).
+    span_key: SpanKey,
 }
 
 impl SqliteLeaseStore {
@@ -1926,10 +1941,18 @@ impl SqliteLeaseStore {
         )?;
         let key = hex::decode(&key)
             .map_err(|e| AuditError::Storage(format!("budget value key is not hex: {e}")))?;
+        let span_key: String = conn.query_row(
+            "SELECT value FROM budget_meta WHERE key = 'span_key'",
+            [],
+            |r| r.get(0),
+        )?;
+        let span_key = hex::decode(&span_key)
+            .map_err(|e| AuditError::Storage(format!("span key is not hex: {e}")))?;
         Ok(Self {
             conn: Mutex::new(conn),
             durability: None,
             value_key: ValueKey::new(&key),
+            span_key: SpanKey::new(&span_key),
         })
     }
 
@@ -2122,6 +2145,15 @@ fn revoke_in(
             ")"
         ),
         params![lease.0, fmt_time(now)?, reason],
+    )?;
+    // A revoked run's span index ends with it (`crate::spans`): chain ids are root leases.
+    tx.execute(
+        concat!(
+            "DELETE FROM run_spans WHERE chain_id IN (",
+            subtree_ids!(""),
+            ")"
+        ),
+        params![lease.0],
     )?;
     tx.commit()?;
     Ok(changed as u64)
@@ -2507,6 +2539,84 @@ impl LeaseStore for SqliteLeaseStore {
             });
         }
         Ok(out)
+    }
+
+    fn add_spans(
+        &self,
+        chain_id: &LeaseId,
+        seq: u64,
+        spans: &[Fingerprint],
+    ) -> Result<(), AuditError> {
+        let seq = i64::try_from(seq)
+            .map_err(|_| AuditError::Storage(format!("span seq {seq} out of range")))?;
+        let mut hashes = distinct_hashes(&self.span_key, spans);
+        hashes.truncate(MAX_SPANS_PER_RUN);
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if get_in(&tx, chain_id)?.is_none() {
+            return Err(AuditError::UnknownLease(chain_id.0.clone()));
+        }
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let stored: Vec<(u64, usize)> = tx
+            .prepare_cached(
+                "SELECT seq, COUNT(*) FROM run_spans WHERE chain_id = ?1 GROUP BY seq ORDER BY seq",
+            )?
+            .query_map(params![chain_id.0], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?
+            .map(|row| {
+                let (s, n) = row?;
+                Ok((
+                    u64::try_from(s).unwrap_or_default(),
+                    usize::try_from(n).unwrap_or_default(),
+                ))
+            })
+            .collect::<Result<_, AuditError>>()?;
+        {
+            let mut delete =
+                tx.prepare_cached("DELETE FROM run_spans WHERE chain_id = ?1 AND seq = ?2")?;
+            for old in evictions(&stored, hashes.len()) {
+                delete.execute(params![chain_id.0, i64::try_from(old).unwrap_or(i64::MAX)])?;
+            }
+            delete.execute(params![chain_id.0, seq])?;
+            let mut insert = tx.prepare_cached(
+                "INSERT OR IGNORE INTO run_spans (chain_id, hash, seq) VALUES (?1, ?2, ?3)",
+            )?;
+            for h in &hashes {
+                insert.execute(params![chain_id.0, &h[..], seq])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn find_spans(
+        &self,
+        chain_id: &LeaseId,
+        probes: &[Fingerprint],
+    ) -> Result<Vec<SpanHit>, AuditError> {
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction()?;
+        let mut hits = Vec::new();
+        {
+            let mut stmt = tx.prepare_cached(
+                "SELECT seq FROM run_spans WHERE chain_id = ?1 AND hash = ?2 ORDER BY seq",
+            )?;
+            for (probe, f) in probes.iter().enumerate() {
+                let h = self.span_key.hash(f);
+                let seqs = stmt.query_map(params![chain_id.0, &h[..]], |r| r.get::<_, i64>(0))?;
+                for seq in seqs {
+                    let seq = seq?;
+                    let seq = u64::try_from(seq)
+                        .map_err(|_| AuditError::Storage(format!("span seq {seq} out of range")))?;
+                    hits.push(SpanHit { probe, seq });
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(hits)
     }
 
     fn create_approval(&self, approval: &Approval) -> Result<(Approval, bool), AuditError> {
