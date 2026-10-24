@@ -78,6 +78,7 @@ fn charges(sum: bool) -> Vec<Charge> {
             value: None,
             amount: 1,
             max: u64::MAX >> 2,
+            usage: false,
         };
         v.push(c.clone());
         if sum {
