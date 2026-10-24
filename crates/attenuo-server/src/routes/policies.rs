@@ -24,6 +24,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use super::{now, parse_json};
+use crate::authz::{CounterSource, StatedBudget, StatedLimit, MAX_STATED_LIMITS};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -149,13 +150,19 @@ pub async fn check_policies(State(state): State<Arc<AppState>>) -> Result<Json<V
 /// check. Answers `{decision, reason, policy_ids, diagnostics, lease_check: "skipped",
 /// chain_source: "token" | "admin_supplied", token_expired, session, approval, budget, usage}`,
 /// plus `limit` when a run limit would be exceeded. `budget` is what the run limits matching
-/// the call have left, read from the lease store as `context.budget` (ADR-0010); the dry run
-/// never charges a counter. `usage` is `context.usage` (run-limits design section 3.5): as
-/// given in the request's optional `usage: {calls, amount, destination_seen}`, or else the
-/// run's usage of a destructive tool read from the store (all zero for any other tool), with
-/// `source` saying which: `request`, `store`, or `untracked` when the engine keeps no run
-/// usage at all ([`attenuo_policy::PolicyEngine::tracks_usage`]), so the zeros are not a
-/// reading of the run.
+/// the call have left, as `context.budget` (ADR-0010), with `source`: `store` when read from
+/// the lease store, `request` when the body states the run's limits in its optional `budget`
+/// block (see `budget_from_json`). Either way the counters go through the pipeline's own
+/// limit check ([`Pipeline::budget_view_from`](crate::authz::Pipeline::budget_view_from)), so
+/// a spent hard limit answers `budget_exhausted` with the live diagnostic; the dry run never
+/// charges a counter, and a stated `budget` is never read from or written to the store.
+/// `usage` is `context.usage` (run-limits design section 3.5): as given in the request's
+/// optional `usage: {calls, amount, destination_seen}`, or else the run's usage of a
+/// destructive tool read from the store (all zero for any other tool, and all zero when the
+/// body states a `budget`), with `source` saying which: `request`, `store`, or `untracked`
+/// when the engine keeps no run usage at all
+/// ([`attenuo_policy::PolicyEngine::tracks_usage`]), so the zeros are not a reading of the
+/// run.
 pub async fn evaluate_policies(
     State(state): State<Arc<AppState>>,
     body: Bytes,
@@ -202,6 +209,12 @@ pub async fn evaluate_policies(
         None | Some(Value::Null) => None,
         Some(v) => Some(usage_from_json(&v)?),
     };
+    // `budget: {calls_remaining, amount_remaining, destination_new, limited, limits}`: the run
+    // limits' state the call is decided against, instead of the store's counters.
+    let stated = match obj.remove("budget") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(budget_from_json(&v, usage_given.unwrap_or_default())?),
+    };
     let mut req: EvaluationRequest = serde_json::from_value(raw)
         .map_err(|e| ApiError::bad_request("invalid_request", e.to_string()))?;
 
@@ -233,10 +246,37 @@ pub async fn evaluate_policies(
             (s, args, "store")
         }
     };
-    // Run limits (ADR-0010): the counters as they are now. Read, never charged.
-    let budget = state.pipeline.budget_view(&chain, &call);
+    // Run limits (ADR-0010): the counters as they are now, or as the request states them.
+    // Read, never charged.
+    let (budget, budget_source) = match &stated {
+        None => (state.pipeline.budget_view(&chain, &call), "store"),
+        Some(s) => {
+            let mut view = state
+                .pipeline
+                .budget_view_from(&chain, &call, CounterSource::Stated(s));
+            let arg_invalid = view
+                .context
+                .refusal
+                .as_ref()
+                .is_some_and(|r| r.reason == attenuo_core::limits::REASON_LIMIT_ARG_INVALID);
+            if !arg_invalid {
+                if let Some(m) = s.unmatched(&view.charges) {
+                    return Err(ApiError::bad_request(
+                        "invalid_request",
+                        format!("`budget`: {m}"),
+                    ));
+                }
+            }
+            if !view.context.limited {
+                // No limit to check: Cedar sees the figures as stated, as in `policy test`.
+                view.context = s.unlimited_context();
+            }
+            (view, "request")
+        }
+    };
     let (usage, usage_source) = match usage_given {
         Some(u) => (u, "request"),
+        None if stated.is_some() => (budget.usage.unwrap_or_default(), "request"),
         None => {
             // A poisoned engine lock counts as tracking, as the pipeline treats it.
             let tracked = state
@@ -280,10 +320,134 @@ pub async fn evaluate_policies(
             "source": usage_source,
         },
     });
+    out["budget"]["source"] = budget_source.into();
     if let Some(hit) = &budget.hit {
         out["limit"] = hit.to_json();
     }
     Ok(Json(out))
+}
+
+/// The optional `budget` member of a dry run: the state of the run limits the call is decided
+/// against, in the vocabulary of a `policy test` case's `budget`, plus single counters:
+///
+/// ```json
+/// {"calls_remaining": 0, "amount_remaining": 40, "destination_new": false, "limited": true,
+///  "limits": [{"hop": 0, "kind": "distinct", "arg": "to", "used": 3, "max": 3}]}
+/// ```
+///
+/// Every member is optional. The figures are non-negative integers (`destination_new` and
+/// `limited` booleans); `limits` holds at most [`MAX_STATED_LIMITS`] entries, each with `hop`
+/// (non-negative integer), `kind` (`calls`, `sum`, `calls_per` or `distinct`), `arg` (a string,
+/// required for every kind but `calls`, refused for `calls`), `used` (required) and `max`
+/// (checked against the limit's), no two naming the same limit. Anything else is 400
+/// `invalid_request` naming the member. `usage` is the request's `usage` (zero when absent).
+fn budget_from_json(
+    v: &Value,
+    usage: attenuo_policy::UsageContext,
+) -> Result<StatedBudget, ApiError> {
+    let bad = |m: &str| ApiError::bad_request("invalid_request", format!("`budget`: {m}"));
+    let obj = v.as_object().ok_or_else(|| bad("expected an object"))?;
+    const KNOWN: [&str; 5] = [
+        "limited",
+        "calls_remaining",
+        "amount_remaining",
+        "destination_new",
+        "limits",
+    ];
+    if let Some(k) = obj.keys().find(|k| !KNOWN.contains(&k.as_str())) {
+        return Err(bad(&format!("unknown member `{k}`")));
+    }
+    let count = |o: &serde_json::Map<String, Value>, key: &str, at: &str| match o.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(n) => n
+            .as_i64()
+            .filter(|n| *n >= 0)
+            .map(|n| Some(n as u64))
+            .ok_or_else(|| bad(&format!("`{at}{key}` must be a non-negative integer"))),
+    };
+    let flag = |key: &str| match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(bad(&format!("`{key}` must be a boolean"))),
+    };
+    let entries = match obj.get("limits") {
+        None | Some(Value::Null) => &[][..],
+        Some(Value::Array(items)) if items.len() <= MAX_STATED_LIMITS => items.as_slice(),
+        Some(Value::Array(items)) => {
+            return Err(bad(&format!(
+                "`limits` lists {} entries; at most {MAX_STATED_LIMITS}",
+                items.len()
+            )))
+        }
+        Some(_) => return Err(bad("`limits` must be a list")),
+    };
+    let mut limits: Vec<StatedLimit> = Vec::with_capacity(entries.len());
+    for (i, e) in entries.iter().enumerate() {
+        let at = format!("limits[{i}].");
+        let o = e
+            .as_object()
+            .ok_or_else(|| bad(&format!("`limits[{i}]` must be an object")))?;
+        if let Some(k) = o
+            .keys()
+            .find(|k| !matches!(k.as_str(), "hop" | "kind" | "arg" | "used" | "max"))
+        {
+            return Err(bad(&format!("unknown member `{at}{k}`")));
+        }
+        let hop = count(o, "hop", &at)?.ok_or_else(|| bad(&format!("`{at}hop` is required")))?;
+        let used = count(o, "used", &at)?.ok_or_else(|| bad(&format!("`{at}used` is required")))?;
+        let max = count(o, "max", &at)?;
+        let kind = match o.get("kind") {
+            Some(Value::String(k)) => attenuo_core::LimitKind::parse(k).ok_or_else(|| {
+                bad(&format!(
+                    "`{at}kind`: unknown limit kind `{k}` (calls, sum, calls_per or distinct)"
+                ))
+            })?,
+            _ => return Err(bad(&format!("`{at}kind` must be a string"))),
+        };
+        let arg = match o.get("arg") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(a)) if a.len() <= 256 => Some(a.clone()),
+            Some(_) => {
+                return Err(bad(&format!(
+                    "`{at}arg` must be a string of at most 256 bytes"
+                )))
+            }
+        };
+        match (kind, &arg) {
+            (attenuo_core::LimitKind::Calls, Some(_)) => {
+                return Err(bad(&format!(
+                    "`{at}arg`: a `calls` limit counts no argument"
+                )))
+            }
+            (attenuo_core::LimitKind::Calls, None) => {}
+            (_, None) => return Err(bad(&format!("`{at}arg` is required for `{kind}`"))),
+            (_, Some(_)) => {}
+        }
+        let entry = StatedLimit {
+            hop: usize::try_from(hop).unwrap_or(usize::MAX),
+            kind,
+            arg,
+            max,
+            used,
+        };
+        if limits
+            .iter()
+            .any(|l| (l.hop, l.kind, &l.arg) == (entry.hop, entry.kind, &entry.arg))
+        {
+            return Err(bad(&format!(
+                "`limits[{i}]` names the same limit as an earlier entry"
+            )));
+        }
+        limits.push(entry);
+    }
+    Ok(StatedBudget {
+        limited: flag("limited")?,
+        calls_remaining: count(obj, "calls_remaining", "")?,
+        amount_remaining: count(obj, "amount_remaining", "")?,
+        destination_new: flag("destination_new")?,
+        limits,
+        usage,
+    })
 }
 
 /// The optional `usage` member of a dry run: `{"calls": n, "amount": n, "destination_seen":

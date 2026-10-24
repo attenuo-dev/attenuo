@@ -227,6 +227,137 @@ impl LimitHit {
     }
 }
 
+/// Where [`Pipeline::budget_view_from`] reads the counters a call would be charged against.
+#[derive(Debug, Clone, Copy)]
+pub enum CounterSource<'a> {
+    /// The lease store: what the live pipeline reads ([`Pipeline::budget_view`]).
+    Store,
+    /// A run-limit situation the caller states (the admin dry run's `budget` block). The
+    /// store is never read, and nothing here can write to it.
+    Stated(&'a StatedBudget),
+}
+
+/// The most entries [`StatedBudget::limits`] may hold.
+pub const MAX_STATED_LIMITS: usize = 64;
+
+/// A run-limit situation stated instead of read from the lease store, for the admin dry run
+/// (`POST /admin/policies/evaluate` with `budget`). The figures are a test case's `budget`
+/// (`limited`, `calls_remaining`, `amount_remaining`, `destination_new`); `limits` pins the
+/// counter of single limits; `usage` is the run's usage of the tool (`context.usage`).
+///
+/// [`counters`](Self::counters) turns this into what the store would hold for each limit of
+/// the chain that matches the call, so [`Pipeline::budget_view_from`] runs the same limit check
+/// (and `budget_exhausted`) as the live pipeline.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatedBudget {
+    /// `context.budget.limited` when no limit of the chain matches the call (default `true`).
+    pub limited: Option<bool>,
+    /// What every matching `calls` limit has left before the call: its counter is `max -
+    /// calls_remaining` (0 when that is negative). Unset: nothing used.
+    pub calls_remaining: Option<u64>,
+    /// The same for `sum` limits.
+    pub amount_remaining: Option<u64>,
+    /// `false`: the call's value was already counted by every matching `calls_per` limit (once)
+    /// and `distinct` limit. Unset or `true`: the value is new.
+    pub destination_new: Option<bool>,
+    /// Counters of single limits, over the figures above.
+    pub limits: Vec<StatedLimit>,
+    /// The run's usage of the tool, for its run-usage counters.
+    pub usage: UsageContext,
+}
+
+/// One entry of [`StatedBudget::limits`]: the counter of the limit of `kind` (on `arg`) in hop
+/// `hop`, the shape of the `limit` member of a `budget_exhausted` answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatedLimit {
+    pub hop: usize,
+    pub kind: LimitKind,
+    /// The counted argument, as [`Charge::arg`] names it; `None` for `calls`.
+    pub arg: Option<String>,
+    /// When set, the limit's `max` must be this.
+    pub max: Option<u64>,
+    /// What the counter holds before the call: calls or the summed amount, for `calls_per`
+    /// the calls with the call's value, for `distinct` how many values the limit has seen.
+    pub used: u64,
+}
+
+impl StatedLimit {
+    fn matches(&self, c: &Charge) -> bool {
+        !c.usage
+            && self.hop == c.hop
+            && self.kind == c.kind
+            && self.arg == c.arg
+            && self.max.is_none_or(|m| m == c.max)
+    }
+}
+
+impl StatedBudget {
+    /// What the store would hold for each of `charges`, in the shape of `read_counters`: per
+    /// charge its counter, and for a `distinct` limit also its count of values.
+    pub fn counters(&self, charges: &[Charge]) -> (Vec<u64>, Vec<u64>) {
+        let seen = u64::from(self.destination_new == Some(false));
+        let spent = |max: u64, left: Option<u64>| left.map_or(0, |l| max.saturating_sub(l));
+        let figure = |n: i64| u64::try_from(n).unwrap_or(0);
+        charges
+            .iter()
+            .map(|c| {
+                if c.usage {
+                    let u = match c.kind {
+                        LimitKind::Calls => figure(self.usage.calls),
+                        LimitKind::Sum => figure(self.usage.amount),
+                        LimitKind::CallsPer | LimitKind::Distinct => {
+                            u64::from(self.usage.destination_seen)
+                        }
+                    };
+                    return (u, 0);
+                }
+                let pinned = self.limits.iter().find(|l| l.matches(c)).map(|l| l.used);
+                match c.kind {
+                    LimitKind::Calls => (pinned.unwrap_or(spent(c.max, self.calls_remaining)), 0),
+                    LimitKind::Sum => (pinned.unwrap_or(spent(c.max, self.amount_remaining)), 0),
+                    LimitKind::CallsPer => (pinned.unwrap_or(seen), 0),
+                    LimitKind::Distinct => (seen, pinned.unwrap_or(0).max(seen)),
+                }
+            })
+            .unzip()
+    }
+
+    /// The first entry of [`limits`](Self::limits) that names no limit among `charges`, as a
+    /// diagnostic: a stated counter the call would not read is a mistake in the request.
+    pub fn unmatched(&self, charges: &[Charge]) -> Option<String> {
+        self.limits.iter().enumerate().find_map(|(i, l)| {
+            (!charges.iter().any(|c| l.matches(c))).then(|| {
+                format!(
+                    "`limits[{i}]` (hop {}, `{}`{}{}) names no limit of the chain that matches \
+                     the call",
+                    l.hop,
+                    l.kind,
+                    l.arg
+                        .as_ref()
+                        .map(|a| format!(" on `{a}`"))
+                        .unwrap_or_default(),
+                    l.max.map(|m| format!(", max {m}")).unwrap_or_default(),
+                )
+            })
+        })
+    }
+
+    /// `context.budget` for a call no limit of the chain matches: the stated figures as given,
+    /// as `attenuo policy test` sets them (members left out are those of an unlimited call;
+    /// `limited` defaults to `true`). There is no limit, so nothing is refused.
+    pub fn unlimited_context(&self) -> BudgetContext {
+        let d = BudgetContext::default();
+        let long = |n: Option<u64>, d: i64| n.map_or(d, |n| i64::try_from(n).unwrap_or(i64::MAX));
+        BudgetContext {
+            limited: self.limited.unwrap_or(true),
+            calls_remaining: long(self.calls_remaining, d.calls_remaining),
+            amount_remaining: long(self.amount_remaining, d.amount_remaining),
+            destination_new: self.destination_new.unwrap_or(d.destination_new),
+            refusal: None,
+        }
+    }
+}
+
 /// `context.budget` as JSON: `{limited, calls_remaining, amount_remaining, destination_new}`.
 /// What the AuthZEN response and the admin dry run report.
 pub fn budget_json(b: &BudgetContext) -> Value {
@@ -928,6 +1059,21 @@ impl Pipeline {
     /// take any limit counter past its `max` is refused with `budget_exhausted`. The admin dry
     /// run (`POST /admin/policies/evaluate`) uses this too.
     pub fn budget_view(&self, chain: &DelegationChain, call: &ToolCall) -> BudgetView {
+        self.budget_view_from(chain, call, CounterSource::Store)
+    }
+
+    /// [`budget_view`](Self::budget_view) with the counters read from `source`: the lease store
+    /// ([`CounterSource::Store`], what `budget_view` does), or a stated run
+    /// ([`CounterSource::Stated`], the admin dry run's `budget` block), which never touches the
+    /// store. The matching limits, the limit check and the figures are the same code either
+    /// way, so a stated run is refused with `budget_exhausted` exactly when a stored one
+    /// holding the same counters would be.
+    pub fn budget_view_from(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        source: CounterSource<'_>,
+    ) -> BudgetView {
         let refused = |limited: bool, reason: &str, detail: String| BudgetContext {
             limited,
             refusal: Some(BudgetRefusal {
@@ -961,7 +1107,11 @@ impl Pipeline {
         if charges.is_empty() {
             return BudgetView::default();
         }
-        let (used, counts) = match read_counters(self.leases.as_ref(), &charges) {
+        let read = match source {
+            CounterSource::Store => read_counters(self.leases.as_ref(), &charges),
+            CounterSource::Stated(stated) => Ok(stated.counters(&charges)),
+        };
+        let (used, counts) = match read {
             Ok(u) => u,
             Err(e) if !limited => {
                 // Only run usage: no limit to enforce, so the policy decides on the worst case.
@@ -2500,6 +2650,152 @@ when { context.input has amount && context.input.amount > 1000 };
                 .any(|m| m.contains("run usage unreadable")),
             "{d:?}"
         );
+    }
+
+    /// The seam of the admin dry run: counters stated as a store would hold them give the view
+    /// a store holding them gives (figures, limit hit, usage), through the same code.
+    #[test]
+    fn stated_counters_give_the_view_a_store_holding_them_gives() {
+        let now = OffsetDateTime::now_utc();
+        let leases = Arc::new(MemoryLeaseStore::new());
+        leases
+            .register(&LeaseId::new("l1"), None, now + Duration::hours(1))
+            .unwrap();
+        let p = pipeline(leases, Arc::new(MemoryAudit::new()));
+        let c = chain(
+            Limits::default()
+                .with_calls(3)
+                .with_sum("amount", 50)
+                .with_calls_per("to", 2)
+                .with_distinct("to", 2),
+            now,
+        );
+        assert!(p.decide(&c, &send(json!(40)), now).is_allow());
+
+        for amount in [5, 20] {
+            let call = send(json!(amount));
+            let stored = p.budget_view(&c, &call);
+            let stated = StatedBudget {
+                calls_remaining: Some(2),
+                amount_remaining: Some(10),
+                destination_new: Some(false),
+                limits: vec![
+                    StatedLimit {
+                        hop: 0,
+                        kind: LimitKind::CallsPer,
+                        arg: Some("to".into()),
+                        max: Some(2),
+                        used: 1,
+                    },
+                    StatedLimit {
+                        hop: 0,
+                        kind: LimitKind::Distinct,
+                        arg: Some("to".into()),
+                        max: None,
+                        used: 1,
+                    },
+                ],
+                usage: UsageContext {
+                    calls: 1,
+                    ..UsageContext::default()
+                },
+                ..StatedBudget::default()
+            };
+            assert_eq!(stated.unmatched(&stored.charges), None);
+            let from_stated = p.budget_view_from(&c, &call, CounterSource::Stated(&stated));
+            assert_eq!(from_stated, stored, "amount {amount}");
+        }
+        let over = p.budget_view(&c, &send(json!(20)));
+        assert_eq!(over.hit.as_ref().map(|h| h.kind), Some(LimitKind::Sum));
+        assert_eq!(
+            over.context.refusal.as_ref().map(|r| r.reason.as_str()),
+            Some(REASON_BUDGET_EXHAUSTED)
+        );
+    }
+
+    /// A stated run never reads the store: with the counter table gone, the store read fails
+    /// closed while the stated one decides, and a spent stated limit is `budget_exhausted`
+    /// with the live diagnostic.
+    #[test]
+    fn stated_counters_never_read_the_store() {
+        let now = OffsetDateTime::now_utc();
+        let leases = Arc::new(SqliteLeaseStore::open_in_memory().unwrap());
+        leases
+            .with_connection(|c| Ok(c.execute_batch("DROP TABLE budget_counters")?))
+            .unwrap();
+        let p = pipeline(leases, Arc::new(MemoryAudit::new()));
+        let c = chain(Limits::default().with_calls(5), now);
+        let call = send(json!(1));
+        let stored = p.budget_view(&c, &call);
+        assert_eq!(
+            stored.context.refusal.map(|r| r.reason),
+            Some(REASON_BUDGET_ERROR.to_string())
+        );
+
+        let fresh = StatedBudget::default();
+        let v = p.budget_view_from(&c, &call, CounterSource::Stated(&fresh));
+        assert_eq!(v.context.refusal, None);
+        assert_eq!(v.context.calls_remaining, 5);
+        assert_eq!(v.usage, Some(UsageContext::default()));
+
+        let spent = StatedBudget {
+            calls_remaining: Some(0),
+            ..StatedBudget::default()
+        };
+        let v = p.budget_view_from(&c, &call, CounterSource::Stated(&spent));
+        let refusal = v.context.refusal.unwrap();
+        assert_eq!(refusal.reason, REASON_BUDGET_EXHAUSTED);
+        assert_eq!(
+            refusal.detail,
+            "limit `calls` of hop 0 would be exceeded: max 5, used 5"
+        );
+        assert_eq!(v.context.calls_remaining, 0);
+    }
+
+    #[test]
+    fn stated_entries_must_name_a_matching_limit_and_unlimited_figures_pass_through() {
+        let now = OffsetDateTime::now_utc();
+        let p = pipeline(
+            Arc::new(MemoryLeaseStore::new()),
+            Arc::new(MemoryAudit::new()),
+        );
+        let c = chain(Limits::default().with_calls(5), now);
+        let stated = StatedBudget {
+            limits: vec![StatedLimit {
+                hop: 0,
+                kind: LimitKind::Sum,
+                arg: Some("amount".into()),
+                max: None,
+                used: 1,
+            }],
+            ..StatedBudget::default()
+        };
+        let v = p.budget_view_from(&c, &send(json!(1)), CounterSource::Stated(&stated));
+        assert_eq!(
+            stated.unmatched(&v.charges).as_deref(),
+            Some(
+                "`limits[0]` (hop 0, `sum` on `amount`) names no limit of the chain that \
+                 matches the call"
+            )
+        );
+
+        let figures = StatedBudget {
+            calls_remaining: Some(1),
+            ..StatedBudget::default()
+        };
+        assert_eq!(
+            figures.unlimited_context(),
+            BudgetContext {
+                limited: true,
+                calls_remaining: 1,
+                ..BudgetContext::default()
+            }
+        );
+        let off = StatedBudget {
+            limited: Some(false),
+            ..StatedBudget::default()
+        };
+        assert_eq!(off.unlimited_context(), BudgetContext::default());
     }
 }
 

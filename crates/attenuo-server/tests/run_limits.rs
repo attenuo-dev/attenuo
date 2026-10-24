@@ -883,3 +883,231 @@ async fn metrics_count_charges_exhaustion_refunds_and_the_run_lock() {
         5
     );
 }
+
+/// The admin dry-run body for a payment of `amount` with `token`, plus `extra` members.
+fn dry_run_body(token: &str, amount: i64, extra: Value) -> Value {
+    let mut body = json!({
+        "token": token,
+        "subject": {"type": "agent", "id": ""},
+        "action": {"name": "send_money"},
+        "resource": {"type": "tool", "id": "bank/send_money", "properties": {"server": "bank"}},
+        "context": {"input": {"recipient": "FR00EMMA", "amount": amount}},
+    });
+    for (k, v) in extra.as_object().unwrap() {
+        body[k] = v.clone();
+    }
+    body
+}
+
+/// A stated `budget` goes through the pipeline's own limit check: a spent hard limit answers
+/// `budget_exhausted` with the same limit and diagnostic as a run whose store holds those
+/// counters, and nothing is charged or audited.
+#[tokio::test]
+async fn dry_run_with_a_stated_budget_refuses_as_the_live_run_does() {
+    let h = Harness::start().await;
+    let limits = json!({"calls": 3, "sum": {"arg": "amount", "max": 50}});
+    // A run that really spent 40 of its 50: the live call and the store-read dry run refuse.
+    let spent = h.mint_root(send_money(limits.clone())).await;
+    assert!(allowed(&h.pay(&spent.token, 40).await));
+    let (reason, live_limit) = denial(&h.pay(&spent.token, 20).await);
+    assert_eq!(reason, "budget_exhausted");
+    let from_store: Value = h
+        .admin_post(
+            "/admin/policies/evaluate",
+            dry_run_body(&spent.token, 20, json!({})),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(from_store["reason"], "budget_exhausted", "{from_store}");
+    assert_eq!(from_store["budget"]["source"], "store");
+
+    // A fresh run, nothing spent, stated as the spent one: the same answer.
+    let fresh = h.mint_root(send_money(limits)).await;
+    let audit_before = h.state.audit.len().unwrap();
+    let stated = json!({"budget": {"calls_remaining": 2, "amount_remaining": 10}});
+    let v: Value = h
+        .admin_post(
+            "/admin/policies/evaluate",
+            dry_run_body(&fresh.token, 20, stated),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["decision"], "deny", "{v}");
+    assert_eq!(v["reason"], "budget_exhausted");
+    assert_eq!(v["limit"], live_limit);
+    assert_eq!(v["limit"], from_store["limit"]);
+    assert_eq!(v["diagnostics"], from_store["diagnostics"]);
+    assert_eq!(v["policy_ids"], json!([]));
+    assert_eq!(v["budget"]["source"], "request");
+    assert_eq!(v["budget"]["calls_remaining"], 2);
+    assert_eq!(v["budget"]["amount_remaining"], 10);
+    assert_eq!(v["budget"]["limited"], true);
+
+    // Within the stated figures it is allowed.
+    let v: Value = h
+        .admin_post(
+            "/admin/policies/evaluate",
+            dry_run_body(
+                &fresh.token,
+                10,
+                json!({"budget": {"amount_remaining": 10}}),
+            ),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["decision"], "allow", "{v}");
+    assert_eq!(v["budget"]["calls_remaining"], 3);
+    assert!(v.get("limit").is_none(), "{v}");
+
+    // A single counter, in the shape of the `limit` member of a refusal.
+    let pinned = json!({"budget": {"limits": [{"hop": 0, "kind": "calls", "max": 3, "used": 3}]}});
+    let v: Value = h
+        .admin_post(
+            "/admin/policies/evaluate",
+            dry_run_body(&fresh.token, 1, pinned),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["reason"], "budget_exhausted", "{v}");
+    assert_eq!(
+        v["limit"],
+        json!({"hop": 0, "kind": "calls", "max": 3, "used": 3})
+    );
+    assert_eq!(v["budget"]["calls_remaining"], 0);
+
+    // Nothing was written: no audit record, no counter, and the fresh run's whole budget is
+    // still there for a live call.
+    assert_eq!(h.state.audit.len().unwrap(), audit_before);
+    use attenuo_audit::LeaseStore;
+    let lease = attenuo_core::LeaseId::new(fresh.lease.clone());
+    assert!(h.state.leases.budget_summary(&lease).unwrap().is_empty());
+    assert!(allowed(&h.pay(&fresh.token, 50).await));
+}
+
+/// With no limit in the chain, the stated figures are what Cedar sees, as `policy test` sets
+/// them; there is nothing to refuse.
+#[tokio::test]
+async fn dry_run_with_a_stated_budget_and_no_limit_passes_the_figures_through() {
+    let h = Harness::start().await;
+    let root = h
+        .mint_root(json!([{"server": "bank", "tool": "send_money"}]))
+        .await;
+    let v: Value = h
+        .admin_post(
+            "/admin/policies/evaluate",
+            dry_run_body(&root.token, 5, json!({"budget": {"calls_remaining": 0}})),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["decision"], "allow", "{v}");
+    assert_eq!(
+        v["budget"],
+        json!({"limited": true, "calls_remaining": 0, "amount_remaining": i64::MAX,
+               "destination_new": true, "source": "request"})
+    );
+    let v: Value = h
+        .admin_post(
+            "/admin/policies/evaluate",
+            dry_run_body(&root.token, 5, json!({"budget": {"limited": false}})),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["budget"]["limited"], false, "{v}");
+}
+
+/// A malformed `budget` block is 400 `invalid_request` naming what is wrong.
+#[tokio::test]
+async fn dry_run_refuses_a_malformed_budget() {
+    let h = Harness::start().await;
+    let root = h.mint_root(send_money(json!({"calls": 3}))).await;
+    let too_many: Vec<Value> = (0..65)
+        .map(|i| json!({"hop": i, "kind": "calls", "used": 0}))
+        .collect();
+    let cases = [
+        (json!([1]), "expected an object"),
+        (json!({"remaining": 1}), "unknown member `remaining`"),
+        (
+            json!({"calls_remaining": -1}),
+            "`calls_remaining` must be a non-negative integer",
+        ),
+        (
+            json!({"amount_remaining": 1.5}),
+            "`amount_remaining` must be a non-negative integer",
+        ),
+        (
+            json!({"destination_new": "no"}),
+            "`destination_new` must be a boolean",
+        ),
+        (json!({"limits": {}}), "`limits` must be a list"),
+        (
+            json!({ "limits": too_many }),
+            "`limits` lists 65 entries; at most 64",
+        ),
+        (
+            json!({"limits": [{"hop": 0, "kind": "rate", "used": 1}]}),
+            "unknown limit kind `rate`",
+        ),
+        (
+            json!({"limits": [{"hop": 0, "kind": "calls", "used": -2}]}),
+            "`limits[0].used` must be a non-negative integer",
+        ),
+        (
+            json!({"limits": [{"hop": 0, "kind": "calls"}]}),
+            "`limits[0].used` is required",
+        ),
+        (
+            json!({"limits": [{"hop": 0, "kind": "calls", "used": 1, "lease": "l"}]}),
+            "unknown member `limits[0].lease`",
+        ),
+        (
+            json!({"limits": [{"hop": 0, "kind": "calls", "arg": "amount", "used": 1}]}),
+            "a `calls` limit counts no argument",
+        ),
+        (
+            json!({"limits": [{"hop": 0, "kind": "sum", "used": 1}]}),
+            "`limits[0].arg` is required for `sum`",
+        ),
+        (
+            json!({"limits": [{"hop": 0, "kind": "calls", "used": 1},
+                              {"hop": 0, "kind": "calls", "used": 2}]}),
+            "`limits[1]` names the same limit as an earlier entry",
+        ),
+        // Well formed, but naming no limit the call would read.
+        (
+            json!({"limits": [{"hop": 1, "kind": "calls", "used": 1}]}),
+            "`limits[0]` (hop 1, `calls`) names no limit of the chain that matches the call",
+        ),
+        (
+            json!({"limits": [{"hop": 0, "kind": "calls", "max": 9, "used": 1}]}),
+            "names no limit of the chain",
+        ),
+    ];
+    let audit_before = h.state.audit.len().unwrap();
+    for (budget, want) in cases {
+        let resp = h
+            .admin_post(
+                "/admin/policies/evaluate",
+                dry_run_body(&root.token, 1, json!({ "budget": budget })),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{budget}");
+        let v: Value = resp.json().await.unwrap();
+        let text = v.to_string();
+        assert!(text.contains("invalid_request"), "{v}");
+        assert!(text.contains("`budget`: "), "{v}");
+        assert!(text.contains(want), "{budget}: want {want:?} in {v}");
+    }
+    assert_eq!(h.state.audit.len().unwrap(), audit_before);
+}

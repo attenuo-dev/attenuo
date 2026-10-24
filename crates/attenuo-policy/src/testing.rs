@@ -1182,19 +1182,6 @@ impl TestCase {
         None
     }
 
-    /// Why this case cannot be sent to a server's admin dry run (`POST /admin/policies/evaluate`
-    /// with the case's chain), or `None` when it can. The dry run takes the chain, the call,
-    /// `session`, `approval` and `usage` as given, but reads `context.budget` from the run
-    /// limits in the chain's capabilities and the server's counters, so only `budget` cannot
-    /// be sent.
-    pub fn admin_evaluate_skip_reason(&self) -> Option<String> {
-        self.budget.as_ref().map(|_| {
-            "`budget` cannot be sent to the admin dry run (it reads the run limits from the \
-             chain's capabilities and the server's counters)"
-                .to_string()
-        })
-    }
-
     /// [`input`](Self::input) for a case evaluated at `at_unix` instead of the file's
     /// `file_now_unix`: the chain is stamped at `at_unix`, and an explicit
     /// `user.authenticated_at_unix` moves by the same amount, so the user's authentication keeps
@@ -1865,7 +1852,7 @@ cases:
     }
 
     #[test]
-    fn admin_evaluate_skips_only_budget_and_input_at_keeps_the_authentication_age() {
+    fn input_at_keeps_the_authentication_age() {
         let f = TestFile::from_yaml_str(
             r#"
 now: 1000000
@@ -1890,11 +1877,6 @@ cases:
 "#,
         )
         .unwrap();
-        assert_eq!(f.cases[0].admin_evaluate_skip_reason(), None);
-        assert_eq!(f.cases[2].admin_evaluate_skip_reason(), None);
-        let why = f.cases[1].admin_evaluate_skip_reason().unwrap();
-        assert!(why.starts_with("`budget` cannot"), "{why}");
-
         let at = 2_000_000;
         let i = f.cases[0].input_at(f.now_unix(), at).unwrap();
         let stamp = |t: i64| OffsetDateTime::from_unix_timestamp(t).unwrap();
