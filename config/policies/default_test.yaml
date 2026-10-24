@@ -1,0 +1,244 @@
+# Policy tests for default.cedar, the starter policy set. Run with:
+#   attenuo policy test --fail-on-unexercised config/policies/default_test.yaml
+#
+# The catalog is read from config/example.toml, the config that loads default.cedar, so the
+# cases see the tools the shipped server does: github read_file (readonly), create_issue and
+# delete_repo (sensitive), with unknown_tools = "deny". The crate's copy,
+# crates/attenuo-policy/policies/default.cedar, must stay byte-identical to this policy file;
+# the attenuo-policy test that runs this suite checks that.
+#
+# Hops without `capabilities` get exactly the call's server:tool, so most cases pass the
+# capability stage and test Cedar. The cases under "capability stage" give the hops narrower
+# capabilities to show that no policy here can allow what the chain did not grant.
+policies: ./default.cedar
+catalog: ../example.toml
+
+cases:
+  # --- permit_readonly_tools --------------------------------------------------------------
+  - name: a read-only tool is allowed for any agent
+    chain: [assistant]
+    call: { server: github, tool: read_file, arguments: { repo: alice/notes, path: README.md } }
+    expect: allow
+    reason: policy_allow
+    policy_ids: [permit_readonly_tools]
+
+  - name: a read-only tool needs no repo argument and no MFA
+    user: { subject: bob, attributes: { mfa: false } }
+    chain: [assistant, coder]
+    call: { server: github, tool: read_file }
+    expect: allow
+    reason: policy_allow
+    policy_ids: [permit_readonly_tools]
+
+  - name: a tool that is neither read-only nor permitted is denied by default
+    user: { attributes: { mfa: true } }
+    chain: [assistant]
+    call: { server: github, tool: delete_repo, arguments: { repo: acme/api } }
+    expect: deny
+    reason: policy_deny
+    policy_ids: []
+
+  # --- permit_create_issue_in_acme --------------------------------------------------------
+  - name: an issue in an acme repository is allowed
+    chain: [assistant, coder]
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: acme/api, title: flaky test }
+    expect: allow
+    reason: policy_allow
+    policy_ids: [permit_create_issue_in_acme]
+
+  - name: an issue in another organisation's repository is denied
+    chain: [assistant, coder]
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: evil/api, title: flaky test }
+    expect: deny
+    reason: policy_deny
+    policy_ids: []
+
+  - name: a look-alike organisation prefix is denied
+    chain: [assistant]
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: acme-evil/api, title: hi }
+    expect: deny
+    reason: policy_deny
+    policy_ids: []
+
+  # `like "acme/*"` lets `*` match nothing, a further `/` or `..`: the rule checks the
+  # owner prefix only and leaves the repository name to the upstream.
+  - name: the acme pattern accepts any text after the owner, even none
+    chain: [assistant]
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: "acme/", title: hi }
+    expect: allow
+    reason: policy_allow
+    policy_ids: [permit_create_issue_in_acme]
+
+  - name: the organisation match is case-sensitive
+    chain: [assistant]
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: ACME/api, title: hi }
+    expect: deny
+    reason: policy_deny
+    policy_ids: []
+
+  - name: create_issue without a repo argument is denied
+    chain: [assistant]
+    call: { server: github, tool: create_issue, arguments: { title: hi } }
+    expect: deny
+    reason: policy_deny
+    policy_ids: []
+
+  # The catalog declares repo as a string. A number reaches Cedar, the `like` raises a type
+  # error, and the engine fails closed instead of skipping the policy.
+  - name: a repo argument of the wrong type fails closed
+    chain: [assistant]
+    call: { server: github, tool: create_issue, arguments: { repo: 42, title: hi } }
+    expect: deny
+    reason: policy_error
+    policy_ids: []
+
+  - name: the acme rule names the github server only
+    chain: [assistant]
+    call:
+      server: gitlab
+      tool: create_issue
+      arguments: { repo: acme/api, title: hi }
+    expect: deny
+    reason: tool_not_in_catalog
+
+  # --- forbid_deep_chains -----------------------------------------------------------------
+  - name: a chain of three hops may still read
+    chain: [planner, assistant, coder]
+    call: { server: github, tool: read_file, arguments: { repo: acme/api } }
+    expect: allow
+    reason: policy_allow
+    policy_ids: [permit_readonly_tools]
+
+  - name: a chain of four hops is denied even for a read-only tool
+    chain: [planner, assistant, coder, helper]
+    call: { server: github, tool: read_file, arguments: { repo: acme/api } }
+    expect: deny
+    reason: policy_deny
+    policy_ids: [forbid_deep_chains]
+
+  - name: a chain of four hops cannot create an acme issue either
+    chain: [planner, assistant, coder, helper]
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: acme/api, title: hi }
+    expect: deny
+    reason: policy_deny
+    policy_ids: [forbid_deep_chains]
+
+  # --- forbid_sensitive_without_mfa -------------------------------------------------------
+  - name: a sensitive tool without the mfa attribute is forbidden
+    chain: [assistant]
+    call: { server: github, tool: delete_repo, arguments: { repo: acme/api } }
+    expect: deny
+    reason: policy_deny
+    policy_ids: [forbid_sensitive_without_mfa]
+
+  - name: a sensitive tool with mfa false is forbidden
+    user: { attributes: { mfa: false } }
+    chain: [assistant]
+    call: { server: github, tool: delete_repo, arguments: { repo: acme/api } }
+    expect: deny
+    reason: policy_deny
+    policy_ids: [forbid_sensitive_without_mfa]
+
+  # mfa is declared bool. The string "true" is refused at the boundary, before Cedar, so it
+  # can neither satisfy nor dodge the rule.
+  - name: an mfa attribute of the wrong type is refused before Cedar
+    user: { attributes: { mfa: "true" } }
+    chain: [assistant]
+    call: { server: github, tool: delete_repo, arguments: { repo: acme/api } }
+    expect: deny
+    reason: attribute_type_mismatch
+    policy_ids: []
+
+  # With MFA the forbid no longer applies, but nothing in this file permits delete_repo (it
+  # is neither read-only nor create_issue), so with the shipped catalog the call is still
+  # denied by default. The MFA rule only ever adds a reason to deny here; it matters once a
+  # policy permits a sensitive tool.
+  - name: with MFA a sensitive tool is still denied when nothing permits it
+    user: { attributes: { mfa: true } }
+    chain: [assistant]
+    call: { server: github, tool: delete_repo, arguments: { repo: acme/api } }
+    expect: deny
+    reason: policy_deny
+    policy_ids: []
+
+  # --- capability stage, before Cedar -----------------------------------------------------
+  - name: a tool the chain did not grant is denied before any policy runs
+    chain:
+      - { agent: assistant, capabilities: ["github:read_file"] }
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: acme/api, title: hi }
+    expect: deny
+    reason: capability_denied
+    policy_ids: []
+
+  - name: a delegate cannot use what its parent kept for itself
+    chain:
+      - { agent: assistant, capabilities: ["github:*"] }
+      - { agent: coder, capabilities: ["github:read_file"] }
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: acme/api, title: hi }
+    expect: deny
+    reason: capability_denied
+    policy_ids: []
+
+  # permit_create_issue_in_acme would allow acme/web; the capability's constraint does not,
+  # and a policy can only narrow what the chain grants.
+  - name: a policy cannot widen a capability's argument constraint
+    chain:
+      - agent: assistant
+        capabilities:
+          - server: github
+            tool: create_issue
+            constraints: { repo: { op: equals, value: acme/api } }
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: acme/web, title: hi }
+    expect: deny
+    reason: capability_denied
+    policy_ids: []
+
+  - name: within the capability's constraint the policy decides
+    chain:
+      - agent: assistant
+        capabilities:
+          - server: github
+            tool: create_issue
+            constraints: { repo: { op: prefix, value: acme/ } }
+      - { agent: coder }
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: acme/web, title: hi }
+    expect: allow
+    reason: policy_allow
+    policy_ids: [permit_create_issue_in_acme]
+
+  - name: a tool missing from the catalog is denied before Cedar
+    chain:
+      - { agent: assistant, capabilities: ["github:*"] }
+    call: { server: github, tool: merge_pull_request, arguments: { repo: acme/api } }
+    expect: deny
+    reason: tool_not_in_catalog

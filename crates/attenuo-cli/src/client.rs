@@ -69,6 +69,11 @@ impl Client {
         })
     }
 
+    /// Whether an admin token was given (flag, file, stdin or `ATTENUO_ADMIN_TOKEN`).
+    pub fn has_admin_token(&self) -> bool {
+        self.admin_token.is_some()
+    }
+
     /// The nonce to put in the next proof, if the server has sent one.
     fn current_nonce(&self) -> Option<String> {
         self.nonce.lock().ok().and_then(|n| n.clone())

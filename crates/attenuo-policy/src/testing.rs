@@ -1182,6 +1182,35 @@ impl TestCase {
         None
     }
 
+    /// Why this case cannot be sent to a server's admin dry run (`POST /admin/policies/evaluate`
+    /// with the case's chain), or `None` when it can. The dry run takes the chain, the call,
+    /// `session`, `approval` and `usage` as given, but reads `context.budget` from the run
+    /// limits in the chain's capabilities and the server's counters, so only `budget` cannot
+    /// be sent.
+    pub fn admin_evaluate_skip_reason(&self) -> Option<String> {
+        self.budget.as_ref().map(|_| {
+            "`budget` cannot be sent to the admin dry run (it reads the run limits from the \
+             chain's capabilities and the server's counters)"
+                .to_string()
+        })
+    }
+
+    /// [`input`](Self::input) for a case evaluated at `at_unix` instead of the file's
+    /// `file_now_unix`: the chain is stamped at `at_unix`, and an explicit
+    /// `user.authenticated_at_unix` moves by the same amount, so the user's authentication keeps
+    /// the age the case gives it. For a server that validates the chain at its own clock.
+    pub fn input_at(&self, file_now_unix: i64, at_unix: i64) -> Result<CaseInput, String> {
+        let Some(t) = self.user.authenticated_at_unix else {
+            return self.input(at_unix);
+        };
+        let shifted = t
+            .checked_add(at_unix.saturating_sub(file_now_unix))
+            .ok_or_else(|| "`authenticated_at_unix` is out of range".to_string())?;
+        let mut case = self.clone();
+        case.user.authenticated_at_unix = Some(shifted);
+        case.input(at_unix)
+    }
+
     /// Compare what was decided with what the case expects.
     pub fn check(&self, actual: Actual) -> CaseReport {
         let case = self;
@@ -1833,6 +1862,51 @@ cases:
             (report.passed(), report.failed(), report.skipped()),
             (0, 1, 1)
         );
+    }
+
+    #[test]
+    fn admin_evaluate_skips_only_budget_and_input_at_keeps_the_authentication_age() {
+        let f = TestFile::from_yaml_str(
+            r#"
+now: 1000000
+cases:
+  - name: everything the dry run takes
+    user: { subject: carol, attributes: { mfa: true }, authenticated_at_unix: 999000 }
+    chain:
+      - { agent: a, capabilities: ["github:*"] }
+      - b
+    session: { tainted_by: [web/fetch], untrusted_args: [repo] }
+    approval: { by: user }
+    usage: { calls: 2 }
+    call: { server: github, tool: read_file }
+    expect: allow
+  - name: with budget
+    budget: { calls_remaining: 1 }
+    call: { server: github, tool: read_file }
+    expect: allow
+  - name: default user
+    call: { server: github, tool: read_file }
+    expect: allow
+"#,
+        )
+        .unwrap();
+        assert_eq!(f.cases[0].admin_evaluate_skip_reason(), None);
+        assert_eq!(f.cases[2].admin_evaluate_skip_reason(), None);
+        let why = f.cases[1].admin_evaluate_skip_reason().unwrap();
+        assert!(why.starts_with("`budget` cannot"), "{why}");
+
+        let at = 2_000_000;
+        let i = f.cases[0].input_at(f.now_unix(), at).unwrap();
+        let stamp = |t: i64| OffsetDateTime::from_unix_timestamp(t).unwrap();
+        assert_eq!(i.now, stamp(at));
+        assert!(i.chain.hops.iter().all(|h| h.issued_at == stamp(at)));
+        // Authenticated 1000 s before `now` in the file, and still 1000 s before `at`.
+        assert_eq!(i.chain.originating_user.authenticated_at, stamp(at - 1000));
+        assert!(i.labels.session.tainted && i.labels.args.contain_untrusted);
+        assert_eq!(i.labels.usage.calls, 2);
+        // Without an explicit time, the default (a minute before) applies at `at`.
+        let d = f.cases[2].input_at(f.now_unix(), at).unwrap();
+        assert_eq!(d.chain.originating_user.authenticated_at, stamp(at - 60));
     }
 
     #[test]

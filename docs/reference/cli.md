@@ -11,7 +11,7 @@ attenuo [--server URL] [--json] <command>
 | Option | Environment | Default | Meaning |
 | --- | --- | --- | --- |
 | `--server`, `--url` | `ATTENUO_SERVER` | `http://127.0.0.1:8080` | Base URL of the attenuo server. Goes before the subcommand. |
-| `--admin-token-stdin` | | off | Read the admin token from the first line of standard input. |
+| `--admin-token-stdin` | | off | Read the admin token from the first line of standard input. The three admin token options go before or after the subcommand. |
 | `--admin-token-file PATH` | | none | Read the admin token from the first line of a file. |
 | `--admin-token TOKEN` | `ATTENUO_ADMIN_TOKEN` | none | Bearer for `/admin/*`. Prefer the environment variable, stdin or a file: an argument is readable by other local users (`ps`, `/proc/<pid>/cmdline`) and lands in shell history, so the CLI prints a warning to stderr when it is used. |
 | `--json` | | off | Print machine-readable JSON instead of text. Works after any subcommand. |
@@ -331,22 +331,29 @@ ATTENUO_TOKEN="$CODER" attenuo policy evaluate --server github --tool create_iss
 
 ### `policy test <FILE>...`
 
-Run YAML policy test files offline. Exit 0 if every case passes, 2 if any fails, 1 if a file cannot be run. The format is in [Writing policies](../guides/writing-policies.md).
+Run YAML policy test files, offline by default (`--via` sends the cases to a running server instead). Exit 0 if every case passes, 2 if any fails, 1 if a file cannot be run. The format is in [Writing policies](../guides/writing-policies.md).
 
 After the cases, the run lists the policies no case exercised: `N of M policies not exercised:` and one `file:line  id` line each, or `all M policies exercised`. A policy is exercised when it is among the policies that decided at least one evaluated case (the `policy_ids` of the result), whether that case passed or not. Test files that name the same policy file share its policies. With `--json` the output has a `coverage` object: `policies` (the total), `exercised`, and `unexercised` as `[{id, file, line}]`.
 
 | Option | Meaning |
 | --- | --- |
 | `--fail-on-unexercised` | Exit 2 when some policy was not exercised, even if every case passed. Off by default. |
-| `--via local\|authzen` | Where the cases are decided. `local` (default) builds the engine from the test file and runs offline. `authzen` sends each case to `POST /access/v1/evaluation` of the server named by the global `--server`, with the token below as the bearer. |
-| `--token <JWT\|->` (`ATTENUO_TOKEN`) / `--token-file PATH` / `--dpop-key PATH` | With `--via authzen`: the delegation token whose chain makes every call, and its DPoP key if it is bound to one. Refused without `--via authzen`. |
-| `--schema-file PATH` | Cedar schema file replacing the built-in base schema (the entity types) for every test file, over the `[policy] schema_path` of a server config named by `catalog:`. It must still declare `User`, `Agent in [User, Agent]`, `Server` and `Tool in [Server]` with every attribute of the default, required and of the same type; otherwise the file cannot be run (exit 1) and the error says what is missing. Not with `--via authzen`. |
-| `--watch` | Run again whenever a test file, or the policy file, catalog or server config, or base schema file one of them reads, changes. The files are polled every 250 ms (no file-notification dependency); a change runs the suite once it has stayed unchanged for 200 ms. The screen is cleared before each run (not with `--json`), and a `watching N file(s)` line goes to stderr. Exit with Ctrl-C. Works with `--via authzen` too. |
+| `--via local\|authzen\|admin-evaluate` | Where the cases are decided. `local` (default) builds the engine from the test file and runs offline. `authzen` sends each case to `POST /access/v1/evaluation` of the server named by the global `--server`, with the token below as the bearer. `admin-evaluate` sends each case, with its own chain, to that server's admin dry run `POST /admin/policies/evaluate`, with the admin token (`ATTENUO_ADMIN_TOKEN`, `--admin-token-file`, `--admin-token-stdin` or `--admin-token`, before or after `policy test`). |
+| `--token <JWT\|->` (`ATTENUO_TOKEN`) / `--token-file PATH` / `--dpop-key PATH` | With `--via authzen`: the delegation token whose chain makes every call, and its DPoP key if it is bound to one. Refused with the other arms. |
+| `--schema-file PATH` | Cedar schema file replacing the built-in base schema (the entity types) for every test file, over the `[policy] schema_path` of a server config named by `catalog:`. It must still declare `User`, `Agent in [User, Agent]`, `Server` and `Tool in [Server]` with every attribute of the default, required and of the same type; otherwise the file cannot be run (exit 1) and the error says what is missing. Only with `--via local`: refused with the other arms, since the server validates with its own schema. |
+| `--watch` | Run again whenever a test file, or the policy file, catalog or server config, or base schema file one of them reads, changes. The files are polled every 250 ms (no file-notification dependency); a change runs the suite once it has stayed unchanged for 200 ms. The screen is cleared before each run (not with `--json`), and a `watching N file(s)` line goes to stderr. Exit with Ctrl-C. Works with every `--via`. |
 
 With `--via authzen` the server decides with its own policies, catalog and clock, and takes the chain from the token, so the test file's `catalog`, `unknown_tools` and `now` do not apply (a `note:` says so for `now`), and the unexercised list is computed against the test file's local `policies` file. A case that sets something the endpoint cannot carry is skipped, not failed, and the run prints why: `session`, `approval`, `budget`, `usage` or `user.authenticated_at_unix`; a `user` other than the default that differs from the token's user (subject, issuer, attributes); a `chain` whose agents differ from the token's, or whose explicit `capabilities` differ from the token hop's. The summary then reads `N passed, M failed, K skipped`, and `--json` has `skipped` per file and in total. A refused token or an unreachable server stops that file with an error (exit 1). Each evaluation is a real decision, so the server writes an audit record for every case it decides.
 
 ```sh
 attenuo --server https://attenuo.internal policy test --via authzen --token-file coder.jwt policy_test.yaml
+```
+
+With `--via admin-evaluate` the server also decides with its own policies, catalog and clock, but each case's own chain is sent (`subject.properties.chain`, checked by the server for shape and against its `max_depth`, not for having been issued by it), with the case's `session`, `approval` and `usage` as the run's state. The route checks no lease, charges nothing and writes no audit record. So every case replays as written except one that sets `budget`, which is skipped with the reason: the dry run reads `context.budget` from the run limits in the chain's capabilities and the server's counters. The chain is stamped at the current time, because the server validates it at its own clock; an explicit `user.authenticated_at_unix` moves with it, keeping its distance from the file's `now`, and a `note:` says that `now` is not sent. A case without `session` or `usage` is sent as an untainted run with no usage, so nothing is read from the server's store. A case the server refuses with 400 (a chain deeper than its `max_depth`, an approval `by` other than `user`, `operator` or `policy`) is that case's error, reported as failed; any other refusal (a wrong admin token, a server without the route) or an unreachable server stops that file (exit 1). The unexercised list is computed against the test file's local `policies` file, as with `authzen`.
+
+```sh
+attenuo --server https://attenuo.internal --admin-token-file /run/secrets/attenuo-admin \
+  policy test --via admin-evaluate config/policies/default_test.yaml
 ```
 
 ### `policy lint <POLICY>`

@@ -25,15 +25,19 @@ pub struct Cli {
     ///
     /// Prefer `ATTENUO_ADMIN_TOKEN`, `--admin-token-stdin` or `--admin-token-file`: an argument
     /// is visible to other local users in `ps` and ends up in shell history.
-    #[arg(long, conflicts_with_all = ["admin_token_stdin", "admin_token_file"])]
+    #[arg(
+        long,
+        global = true,
+        conflicts_with_all = ["admin_token_stdin", "admin_token_file"]
+    )]
     pub admin_token: Option<String>,
 
     /// Read the admin token from the first line of standard input.
-    #[arg(long, conflicts_with = "admin_token_file")]
+    #[arg(long, global = true, conflicts_with = "admin_token_file")]
     pub admin_token_stdin: bool,
 
     /// Read the admin token from the first line of this file.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, global = true, value_name = "PATH")]
     pub admin_token_file: Option<std::path::PathBuf>,
 
     /// Print machine-readable JSON instead of text.
@@ -714,8 +718,9 @@ pub enum PolicyCmd {
     /// Dry run: what the loaded policies decide for one call. No lease check and no audit
     /// record. Exit 0 for allow, 2 for deny.
     Evaluate(EvaluateArgs),
-    /// Run YAML policy test files offline. Exit 0 if every case passes, 2 if any fails,
-    /// 1 if a file cannot be run. Ends with the policies no case exercised.
+    /// Run YAML policy test files, offline by default (`--via` sends them to a server). Exit 0
+    /// if every case passes, 2 if any fails, 1 if a file cannot be run. Ends with the policies
+    /// no case exercised.
     Test(TestArgs),
     /// Parse a Cedar policy file and validate it against the generated schema, printing
     /// errors with line and column. Exit 0 if clean, 2 if it has errors.
@@ -750,7 +755,7 @@ pub struct TestArgs {
     pub fail_on_unexercised: bool,
     /// Cedar schema file replacing the built-in base schema (the entity types) for every test
     /// file, over any `[policy] schema_path` of the config a test file's `catalog` names. It
-    /// must keep the default's entity types, attributes and hierarchy. Not with `--via authzen`.
+    /// must keep the default's entity types, attributes and hierarchy. Only with `--via local`.
     #[arg(long, value_name = "PATH")]
     pub schema_file: Option<std::path::PathBuf>,
     /// Run again whenever a test file, or a policy, catalog, config or schema file one of them
@@ -758,9 +763,11 @@ pub struct TestArgs {
     /// run; stop with Ctrl-C.
     #[arg(long)]
     pub watch: bool,
-    /// Where the cases are decided: `local` (default, the in-process engine, offline) or
+    /// Where the cases are decided: `local` (default, the in-process engine, offline),
     /// `authzen` (each case is sent to `POST /access/v1/evaluation` of the server named by the
-    /// global `--server`, with `--token` as the bearer).
+    /// global `--server`, with `--token` as the bearer) or `admin-evaluate` (each case, with its
+    /// own chain, is sent to that server's `POST /admin/policies/evaluate` dry run, with the
+    /// admin token; nothing is audited).
     #[arg(long, value_enum, default_value_t = Via::Local)]
     pub via: Via,
     /// With `--via authzen`: the delegation token whose chain makes every call.
@@ -775,6 +782,8 @@ pub enum Via {
     Local,
     /// A running server's AuthZEN endpoint.
     Authzen,
+    /// A running server's admin dry run, `POST /admin/policies/evaluate`.
+    AdminEvaluate,
 }
 
 /// `policy evaluate`: the call, and the chain it is made for (from a token or a file).

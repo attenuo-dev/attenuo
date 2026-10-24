@@ -26,9 +26,10 @@ demo:
     bash examples/github-leak-demo/run.sh
     bash examples/multi-hop-demo/run.sh
 
-# the demos' Cedar policy tests, offline
+# the Cedar policy tests (both demos' and config/policies/), offline
 policy:
     cargo run -q -p attenuo-cli -- policy test examples/github-leak-demo/policy_test.yaml examples/multi-hop-demo/policy_test.yaml
+    cargo run -q -p attenuo-cli -- policy test --fail-on-unexercised config/policies/*_test.yaml
 
 # rustdoc with warnings as errors
 docs:
