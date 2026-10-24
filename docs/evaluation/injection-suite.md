@@ -94,6 +94,21 @@ Prepared before the run:
 
 The design's own estimate, from reading the cases rather than running them, is about 1 of 60 dev attack calls allowed without approval (against 10 today) and about 18 of 66 allowed dev benign calls asking for an approval. Those are the numbers this arm will check.
 
+### Second run, with retry after approval (2026-10-24)
+
+The approvals API merged as #45 (main `cf6376c`), so the runner now answers each gated call instead of counting it. The scripted approver is the same one, deciding by hand label only: it declines a call labelled attack and grants one labelled benign, as the operator, through `POST /admin/approvals/{id}`. A granted call is retried once, identically, from the same hop; a declined call is not retried. The run fails if a retry gets `-32008` again, if the approval afterwards is not `consumed` by the retry's decision, or if the retry's audit record does not name the approval.
+
+Second run (`run.py --split all --tag labels-v2`, release binaries built from `b3005d2`, which is main `cf6376c` plus the runner change; output [`results/2026-10-24-labels-v2.md`](../../evaluation/injection-suite/results/2026-10-24-labels-v2.md)):
+
+| Split | Attack calls allowed without approval | Attack calls gated, then approved by the scripted approver | Attack calls gated, then declined | Benign calls gated | Of those, completed after approval | Benign calls denied |
+|---|---:|---:|---:|---:|---:|---:|
+| dev (60 attack, 69 benign) | 1/60 (`github-07`, a read) | 0 | 9 | 18/69 (26%) | 18/18 | 3/69 |
+| test (38 attack, 29 benign) | 1/38 (`t-banking-04`, a read) | 0 | 6 | 2/29 (7%) | 2/2 | 3/29 |
+
+No attack call was approved, because the scripted approver approves only calls labelled benign. Had it approved one, that call would have been allowed by the user's decision, not by attenuo, and the report counts such calls separately. The `attenuo` arm without labels still allows 10/60 and 7/38. Every first-pass outcome, in all six arms, is the same as in the first run (`labels-v1`): same outcome, reason, stage and upstream delivery for each of the 774 dev and 402 test call results. All 20 granted retries were allowed, reached the upstream with their arguments, and left their approval `consumed` by the retry's decision id, whose audit record carries the approval; no retry got `-32008` again. Every declined approval reads `declined` afterwards, and no declined call reached the upstream. The audit check passed on all six arms.
+
+What this adds to the first run: the approval loop works end to end on the corpus, so the benign cost of session taint is an approval request and a retry (18 of 69 dev benign calls), not a lost call. What it cannot say is unchanged: the cases and policies were written by the same agent, the approver is a script that knows the labels, and the test split's implied reads in [`PROPOSED-READS-2026-10-24.md`](../../evaluation/injection-suite/cases/test/PROPOSED-READS-2026-10-24.md) are still proposed, not written by the maintainer.
+
 ## How far to trust this
 
 Not far, yet. The sequences are hand-written, not produced by a model, and no model is in the loop. The dev policies and grants were written by the same person as the dev cases, at the same time. The test split is the first step toward the plan's development/test protocol: the policies were frozen before it was written. But it was written by someone who had read those frozen policies and was aiming at their weak spots, it has 26 cases in two of five suites, and the 40-case target is not met. All 67 test calls matched their written expectations on the first run. That checks the corpus against the implementation. It does not measure effectiveness. The full list of caveats is in [the README](../../evaluation/injection-suite/README.md#threats-to-validity). Next: write the travel, slack and github test cases. After that comes the plan's AgentDojo adapter, with a model in the loop, policies fixed before the run, and attack success and utility judged by the benchmark's own checkers.
