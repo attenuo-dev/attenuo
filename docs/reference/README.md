@@ -5,3 +5,4 @@ Lookup tables for the command line, the configuration file and the HTTP endpoint
 - [CLI commands](cli.md)
 - [Configuration keys](config.md)
 - [HTTP endpoints](http-api.md)
+- [AuthZEN conformance](authzen.md): what of the OpenID AuthZEN 1.0 specification the decision endpoint implements, extends and leaves out

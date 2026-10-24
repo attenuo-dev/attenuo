@@ -81,10 +81,12 @@ grant_type=urn:ietf:params:oauth:grant-type:token-exchange
 
 ## Decision
 
+Both endpoints echo a request's `X-Request-ID` header on the response, whatever its status (AuthZEN 1.0 section 10.1.3). What of the AuthZEN specification is implemented, extended and left out, with the conformance fixtures that check it: [AuthZEN conformance](authzen.md).
+
 | Method and path | Auth | Purpose |
 | --- | --- | --- |
 | `POST /access/v1/evaluation` | bearer token, or a trusted PEP | AuthZEN evaluation. Same pipeline as the proxy, run limits included: an allowed evaluation is charged as a proxied call is, and its answer carries `context.budget` (`limited`, `calls_remaining`, `amount_remaining`, `destination_new`) when a limit matched, `context.charged` when it was charged, `context.limit` on `budget_exhausted`, `context.untrusted_args` (`[{arg, seq, kind}]`, as in the proxy's error data) when an argument matched an untrusted result of the run, and `context.usage` (`{calls, amount, destination_seen}`, as in the proxy's error data) for a destructive tool; an allowed evaluation is counted in the run's usage, and anything the PEP sends under `context.usage` is ignored. `context.diagnostics` is filled only for callers `[authzen] diagnostics` allows: by default a `[[peps]]` entry, which can authenticate next to a bearer token with `pep_id` and `pep_secret` in the body. |
-| `POST /access/v1/evaluations` | same | AuthZEN batch: top-level `subject`, `action`, `resource`, `context` are defaults and each entry of `evaluations` overrides them. Answers `{"evaluations": [{decision, context}, ...]}`, one per entry, each decided and audited like a single evaluation. At most `[authzen] max_batch` entries (default 64): more is 400 `batch_too_large`, none is 400 `invalid_request`. Only the default `execute_all` semantic is supported. |
+| `POST /access/v1/evaluations` | same | AuthZEN batch: top-level `subject`, `action`, `resource`, `context` are defaults and each entry of `evaluations` overrides them. Answers `{"evaluations": [{decision, context}, ...]}`, one per entry, each decided and audited like a single evaluation. At most `[authzen] max_batch` entries (default 64): more is 400 `batch_too_large`. Without `evaluations`, or with an empty one, the request is a single evaluation and is answered with a single `{decision, context}` (AuthZEN 1.0 section 7.1). Only the default `execute_all` semantic is supported. |
 
 ## MCP proxy
 
