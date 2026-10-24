@@ -10,6 +10,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ### Documentation
 
+- Deploy guide: an upgrade note that run limits are enforced only once every replica and external PEP runs 0.2 or later, since older servers accept and ignore `limits`, with how to spot the mixed-version window in `audit tail`. Threat model: a residual-risk entry for the approval-token channel (`GET /approvals/{id}` answers any hop of the run; the token is bound to the calling hop, so the leak is the fact of the approval, not the ability to spend it).
 - Proposed design for run limits ([docs/design/run-limits.md](docs/design/run-limits.md), [ADR-0010](docs/decisions/0010-run-limits.md)): count, amount and per-destination budgets declared per token hop, charged against every ancestor hop in the decision's audit transaction, exposed to Cedar as `context.budget`; by a hand count of the injection suite it would deny 5 of 10 dev and 5 of 7 test attack calls allowed today, with no benign call lost. Nothing implemented.
 
 ### Evaluation
