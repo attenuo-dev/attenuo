@@ -258,7 +258,8 @@ impl Metrics {
         Arc::new(Self::default())
     }
 
-    /// Count one pipeline decision (`decision` is `allow` or `deny`).
+    /// Count one decision record (`decision` is `allow` or `deny`): a pipeline decision or a
+    /// recorded proxy refusal.
     pub fn decision(&self, decision: &str, reason: &str) {
         if let Ok(mut m) = self.decisions.lock() {
             *m.entry((decision.to_string(), reason.to_string()))
@@ -415,7 +416,9 @@ impl Metrics {
         header_lines(
             &mut out,
             "decisions_total",
-            "Pipeline decisions (MCP proxy and AuthZEN) by outcome and reason code.",
+            "Decision records by outcome and reason code: pipeline decisions (MCP proxy and \
+             AuthZEN) and requests the proxy refused and recorded before a decision. \
+             Unauthenticated requests are not counted.",
             "counter",
         );
         if let Ok(m) = self.decisions.lock() {

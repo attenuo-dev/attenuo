@@ -813,3 +813,96 @@ async fn revoked_token_cannot_list_tools_or_use_session_requests() -> anyhow::Re
     assert_eq!(h.upstream.recorded_methods(), vec!["tools/list"]);
     Ok(())
 }
+
+/// A client that opens a session per call (LangChain's MCP adapter) meets revocation at
+/// `initialize`, not at a `tools/call`. The refusal is recorded once per request under a fixed
+/// name, and the 401 names the record; a token that does not verify records nothing.
+#[tokio::test]
+async fn refused_session_opens_on_a_revoked_lease_are_recorded() -> anyhow::Result<()> {
+    let h = Harness::start(&["read_file"], false, vec![("tok", reader_chain())]).await?;
+    h.authorizer.revoke("tok");
+    let init = rpc_msg(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {},
+               "clientInfo": {"name": "t", "version": "0"}}),
+    );
+
+    let resp = h.rpc(Some("tok"), &init).await?;
+    assert_eq!(resp.status(), 401);
+    let header = resp.headers()[DECISION_ID_HEADER].to_str()?.to_owned();
+    let body: Value = resp.json().await?;
+    assert_eq!(body["error"]["code"], CODE_UNAUTHORIZED);
+    assert_eq!(body["error"]["data"]["reason"], "lease_revoked");
+    assert_eq!(body["error"]["data"]["decision_id"], header);
+
+    let records = h.authorizer.decisions();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let r = &records[0];
+    assert_eq!(r.id.to_string(), header);
+    assert_eq!(r.decision, attenuo_core::Decision::Deny);
+    assert_eq!(r.reason, "lease_revoked");
+    assert_eq!(r.server, SERVER);
+    assert_eq!(r.tool, "initialize");
+    assert_eq!(r.originating_subject, "user:alice");
+    assert_eq!(
+        r.agents,
+        reader_chain()
+            .hops
+            .iter()
+            .map(|h| h.agent.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // A batch of undecided messages is one request: one record, named in every reply.
+    let batch = json!([
+        rpc_msg(2, "ping", json!({})),
+        rpc_msg(3, "tools/list", json!({}))
+    ]);
+    let resp = h.rpc(Some("tok"), &batch).await?;
+    let items: Vec<Value> = resp.json().await?;
+    assert_eq!(h.authorizer.decisions().len(), 2);
+    let batch_id = h.authorizer.decisions()[1].id.to_string();
+    assert_eq!(h.authorizer.decisions()[1].tool, "ping");
+    for item in &items {
+        assert_eq!(item["error"]["data"]["decision_id"], batch_id, "{item}");
+    }
+
+    // GET (listen stream) and DELETE (end session) are recorded as `http.<METHOD>`.
+    for (method, tool) in [
+        (reqwest::Method::GET, "http.GET"),
+        (reqwest::Method::DELETE, "http.DELETE"),
+    ] {
+        let resp = h
+            .client
+            .request(method.clone(), h.proxy.url(&format!("/mcp/{SERVER}")))
+            .bearer_auth("tok")
+            .send()
+            .await?;
+        assert_eq!(resp.status(), 401, "{method}");
+        let last = h.authorizer.decisions().last().cloned().unwrap();
+        assert_eq!(last.tool, tool);
+        assert_eq!(last.reason, "lease_revoked");
+        assert_eq!(
+            resp.headers()[DECISION_ID_HEADER].to_str()?,
+            last.id.to_string()
+        );
+    }
+    assert_eq!(h.authorizer.decisions().len(), 4);
+
+    // A token that does not verify is unauthenticated noise: a 401, a log line, no record.
+    for bearer in [
+        "garbage",
+        "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ1c2VyOmFsaWNlIn0.",
+    ] {
+        let resp = h.rpc(Some(bearer), &init).await?;
+        assert_eq!(resp.status(), 401);
+        assert!(!resp.headers().contains_key(DECISION_ID_HEADER));
+        let body: Value = resp.json().await?;
+        assert_eq!(body["error"]["data"]["reason"], "invalid_token");
+        assert!(body["error"]["data"].get("decision_id").is_none(), "{body}");
+    }
+    assert_eq!(h.authorizer.decisions().len(), 4);
+    assert!(h.upstream.recorded_methods().is_empty());
+    Ok(())
+}
