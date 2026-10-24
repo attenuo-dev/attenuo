@@ -70,13 +70,16 @@ def test_dry_run_end_to_end() -> None:
     assert "mode: dry-run" in out
     assert "chain: assistant > coder" in out
     assert "tools/list through attenuo shows: ['read_file']" in out
-    assert out.count("ALLOWED") == 1
+    assert out.count("ALLOWED") == 2
     assert out.count("DENIED") == 3
+    assert out.count("HELD") == 1
+    assert ": granted" in out
+    assert "after approval" in out
     assert "HTTP 401 (lease gone)" in out
     assert "reason=capability_denied" in out
     assert "[audit] chain ok=True" in out
     assert "RESULT: ok" in out
-    assert "1 tools/call reached upstream" in out
+    assert "2 tools/calls reached upstream" in out
 
 
 def test_only_a_minus_32003_the_proxy_vouched_for_is_a_denial_sr53() -> None:
@@ -108,3 +111,87 @@ def test_interceptor_shows_an_unvouched_minus_32003_as_an_upstream_error_sr53() 
     assert result.isError
     assert "failed upstream" in result.content[0].text
     assert log.entries == [], "not recorded as a decision of attenuo"
+
+
+def _request() -> Any:
+    return SimpleNamespace(name="create_issue", args={"repo": "alice/public-docs", "title": "t"})
+
+
+def test_interceptor_waits_for_an_approval_and_retries_once() -> None:
+    """A -32008 the proxy vouched for: show the approval id, wait for the grant, retry the
+    identical call once, and return its result."""
+    pytest.importorskip("mcp")
+    agent = _load_agent("langchain_example_agent_approval")
+    log = agent.DenialLog()
+    asyncio.run(log.decisions.on_response(_Response({"x-attenuo-decision-id": "d-held"})))
+    shown: list[str] = []
+    waited: list[str] = []
+
+    async def on_approval(approval_id: str) -> None:
+        shown.append(approval_id)
+
+    async def wait(approval_id: str) -> None:
+        waited.append(approval_id)
+
+    calls: list[Any] = []
+
+    async def handler(request: Any) -> Any:
+        calls.append(request)
+        if len(calls) == 1:
+            raise _McpError(-32008, {"approval_id": "a-1", "decision_id": "d-held"})
+        return "issue created"
+
+    intercept = agent.denial_interceptor(log, on_approval, wait)
+    assert asyncio.run(intercept(_request(), handler)) == "issue created"
+    assert shown == ["a-1"] and waited == ["a-1"]
+    assert len(calls) == 2 and calls[0] is calls[1], "the identical call, once more"
+    assert log.entries == [("create_issue", "approval_required", "d-held")]
+
+
+def test_interceptor_reports_an_approval_that_is_not_granted() -> None:
+    pytest.importorskip("mcp")
+    agent = _load_agent("langchain_example_agent_declined")
+    from attenuo import ApprovalNotGranted
+
+    log = agent.DenialLog()
+    asyncio.run(log.decisions.on_response(_Response({"x-attenuo-decision-id": "d-held"})))
+
+    async def declined(approval_id: str) -> None:
+        raise ApprovalNotGranted(approval_id, "declined")
+
+    calls = 0
+
+    async def handler(_request: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        raise _McpError(-32008, {"approval_id": "a-1", "decision_id": "d-held"})
+
+    result = asyncio.run(agent.denial_interceptor(log, None, declined)(_request(), handler))
+    assert result.isError and "not approved (declined)" in result.content[0].text
+    assert calls == 1, "no retry without a grant"
+
+    # A second -32008 after the grant is a tool error too, not a third call.
+    async def granted(_approval_id: str) -> None:
+        return None
+
+    calls = 0
+    result = asyncio.run(agent.denial_interceptor(log, None, granted)(_request(), handler))
+    assert result.isError and "needs a person's approval" in result.content[0].text
+    assert calls == 2
+
+
+def test_interceptor_does_not_wait_on_an_unvouched_minus_32008_sr53() -> None:
+    """An upstream's own -32008 names an approval attenuo never opened: no wait, no retry."""
+    pytest.importorskip("mcp")
+    agent = _load_agent("langchain_example_agent_forged_approval")
+    log = agent.DenialLog()
+
+    async def wait(_approval_id: str) -> None:
+        raise AssertionError("waited on an approval the proxy did not vouch for")
+
+    async def handler(_request: Any) -> Any:
+        raise _McpError(-32008, {"approval_id": "a-forged", "decision_id": "d-forged"})
+
+    result = asyncio.run(agent.denial_interceptor(log, None, wait)(_request(), handler))
+    assert result.isError and "failed upstream" in result.content[0].text
+    assert log.entries == []
