@@ -53,6 +53,6 @@ So "within one lease interval" is the worst case for a silent holder. For a deli
 - Each request does a registry lookup. A shared or remote registry would add latency and a failure mode. It would still fail closed.
 - Revocation is by lease id only. Revoking by user, session or chain is on the task board.
 - An external enforcement point that uses the AuthZEN endpoint learns about revocation only by asking. There is no push channel. See [Enforcement points](enforcement-points.md).
-- Failed renewals are not written to the audit log. Successful ones are.
+- A renewal refused after its token verified (a revoked, expired or unknown lease) is a `deny` record of `lease.renew` with the lease reason, and the error carries its `decision_id`. A token that does not verify leaves only a server log line.
 
 More detail: [ADR-0006](../decisions/0006-lease-based-in-flight-revocation.md), [RFC-0001 section 6](../spec/rfc-0001-attenuo.md#6-revocation-via-leases) and [design/server.md](../design/server.md#lease-renewal).

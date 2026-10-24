@@ -14,18 +14,33 @@
 //! ([`crate::dpop`]). Every renewal is appended to the audit log (`attenuo` / `lease.renew`,
 //! reason `lease_renewed`, with `dpop_bound`).
 //!
+//! **Audited refusals.** Once the token has verified (signature, audience, expiry, chain) and
+//! so has its DPoP proof, a refused renewal is recorded through
+//! [`crate::authz::Pipeline::record_rejection`]: one `deny` record of kind `decision` against
+//! the token's chain, server `attenuo`, tool `lease.renew` (the tool of a successful renewal,
+//! so `--tool lease.renew` finds both), and a reason from [`RENEW_REFUSAL_REASONS`]:
+//! `lease_revoked`, `lease_expired` (an ancestor's) or `lease_unknown`. The arguments digest
+//! covers `{lease, ancestor, dpop_bound}`, `ancestor` saying whether an ancestor lease or the
+//! token's own lease refused. The 400 carries the record id in `X-Attenuo-Decision-Id` and
+//! `decision_id`, and the record is counted in `decisions_total{decision="deny",reason}`. Not
+//! recorded: a missing token, a token or DPoP proof that does not verify (a log line only,
+//! SR-18), and lease store faults (500).
+//!
 //! Response: `{ "lease": "<id>", "expires_at": "<RFC 3339>", "expires_in": <seconds> }`.
 
 use std::sync::Arc;
 
 use attenuo_audit::{AuditError, LeaseStore};
-use attenuo_core::RecordKind;
+use attenuo_core::{DelegationChain, RecordKind, ToolCall};
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
 use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+
+use crate::authz::{REASON_LEASE_EXPIRED, REASON_LEASE_REVOKED, REASON_LEASE_UNKNOWN};
 
 use super::{audit_event, bearer_of, no_store, now};
 use crate::error::ApiError;
@@ -60,6 +75,87 @@ fn renew_sync(state: &AppState, headers: &HeaderMap) -> Result<Response, ApiErro
         now,
     )?;
     let chain = verified.chain;
+    match renew_verified(state, &chain, dpop_bound, now) {
+        Ok(resp) => Ok(resp),
+        Err(Failure::Other(e)) => Err(e),
+        Err(Failure::Refused {
+            reason,
+            ancestor,
+            error,
+        }) => {
+            // One `deny` record against the verified chain, under the fixed tool name of a
+            // renewal. Lease ids are not secret and come from the signed token.
+            let call = ToolCall::new(
+                super::AUDIT_SERVER,
+                RENEW_TOOL,
+                json!({
+                    "lease": chain.hops.last().map(|h| &h.lease),
+                    "ancestor": ancestor,
+                    "dpop_bound": dpop_bound,
+                }),
+            )
+            .with_dpop_bound(dpop_bound);
+            let id = state.pipeline.record_rejection(&chain, &call, reason, now);
+            Err(error.with_decision_id(id))
+        }
+    }
+}
+
+/// Every reason code a refused renewal can be audited with. All are lease reasons: once the
+/// token verified, the only refusals the caller causes are a lease (its own, or an ancestor's)
+/// that is revoked or unknown, or an ancestor that has expired; the token's own lease may have
+/// lapsed, which is what renewal repairs. So there is no `renew_*` code.
+pub const RENEW_REFUSAL_REASONS: [&str; 3] = [
+    REASON_LEASE_REVOKED,
+    REASON_LEASE_EXPIRED,
+    REASON_LEASE_UNKNOWN,
+];
+
+/// The audit `tool` of a renewal, successful or refused.
+const RENEW_TOOL: &str = "lease.renew";
+
+/// Why a renewal failed once its token verified.
+enum Failure {
+    /// Refused for a lease reason: audited as a `deny` record whose id the response carries.
+    /// `ancestor` says whether an ancestor lease or the token's own lease refused.
+    Refused {
+        reason: &'static str,
+        ancestor: bool,
+        error: ApiError,
+    },
+    /// A server fault (lease store, audit append): not audited.
+    Other(ApiError),
+}
+
+impl From<ApiError> for Failure {
+    fn from(e: ApiError) -> Self {
+        Failure::Other(e)
+    }
+}
+
+impl From<AuditError> for Failure {
+    fn from(e: AuditError) -> Self {
+        Failure::Other(e.into())
+    }
+}
+
+/// A refusal of the token's own lease.
+fn own_lease_refused(reason: &'static str) -> Failure {
+    Failure::Refused {
+        reason,
+        ancestor: false,
+        error: ApiError::bad_request("invalid_grant", reason),
+    }
+}
+
+/// The renewal once the token (and its DPoP proof) verified: every refusal from here on that
+/// the caller caused is a [`Failure::Refused`].
+fn renew_verified(
+    state: &AppState,
+    chain: &DelegationChain,
+    dpop_bound: bool,
+    now: OffsetDateTime,
+) -> Result<Response, Failure> {
     let hop = chain
         .hops
         .last()
@@ -72,22 +168,25 @@ fn renew_sync(state: &AppState, headers: &HeaderMap) -> Result<Response, ApiErro
     let status = state.leases.check_all(ancestors, now)?;
     if !status.active {
         let reason = if !status.revoked.is_empty() {
-            "lease_revoked"
+            REASON_LEASE_REVOKED
         } else if !status.expired.is_empty() {
-            "lease_expired"
+            REASON_LEASE_EXPIRED
         } else {
-            "lease_unknown"
+            REASON_LEASE_UNKNOWN
         };
-        return Err(ApiError::bad_request(
-            "invalid_grant",
-            format!("an ancestor lease is not live: {reason}"),
-        ));
+        return Err(Failure::Refused {
+            reason,
+            ancestor: true,
+            error: ApiError::bad_request(
+                "invalid_grant",
+                format!("an ancestor lease is not live: {reason}"),
+            ),
+        });
     }
 
-    let previous = state
-        .leases
-        .get(&hop.lease)?
-        .ok_or_else(|| ApiError::bad_request("invalid_grant", "lease_unknown"))?;
+    let Some(previous) = state.leases.get(&hop.lease)? else {
+        return Err(own_lease_refused(REASON_LEASE_UNKNOWN));
+    };
     let mut new_expiry = state.initial_lease_expiry(now, hop.expires_at);
     if chain.hops.len() >= 2 {
         let parent_lease = &chain.hops[chain.hops.len() - 2].lease;
@@ -102,8 +201,8 @@ fn renew_sync(state: &AppState, headers: &HeaderMap) -> Result<Response, ApiErro
         .leases
         .renew(&hop.lease, new_expiry, now)
         .map_err(|e| match e {
-            AuditError::LeaseRevoked(_) => ApiError::bad_request("invalid_grant", "lease_revoked"),
-            AuditError::UnknownLease(_) => ApiError::bad_request("invalid_grant", "lease_unknown"),
+            AuditError::LeaseRevoked(_) => own_lease_refused(REASON_LEASE_REVOKED),
+            AuditError::UnknownLease(_) => own_lease_refused(REASON_LEASE_UNKNOWN),
             other => other.into(),
         })?;
 
@@ -115,15 +214,15 @@ fn renew_sync(state: &AppState, headers: &HeaderMap) -> Result<Response, ApiErro
     if let Err(e) = audit_event(
         state,
         RecordKind::LeaseRenew,
-        "lease.renew",
-        &chain,
+        RENEW_TOOL,
+        chain,
         args,
         dpop_bound,
         now,
     ) {
         // A renewal we cannot record does not happen.
         let _ = state.leases.renew(&hop.lease, previous.expires_at, now);
-        return Err(e);
+        return Err(e.into());
     }
     tracing::info!(lease = %hop.lease.0, expires_at = %new_expiry, "lease renewed");
 
@@ -136,4 +235,20 @@ fn renew_sync(state: &AppState, headers: &HeaderMap) -> Result<Response, ApiErro
     .into_response();
     no_store(out.headers_mut());
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renew_refusal_reasons_are_the_lease_reasons() {
+        // The metric label set stays fixed: every reason is a known lease code, none is
+        // `lease_error` (a store fault is a 500, not a refusal).
+        for r in RENEW_REFUSAL_REASONS {
+            assert!(r.starts_with("lease_"), "{r}");
+            assert_ne!(r, crate::authz::REASON_LEASE_ERROR);
+        }
+        assert_eq!(RENEW_TOOL, "lease.renew");
+    }
 }

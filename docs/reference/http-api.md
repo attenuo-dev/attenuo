@@ -28,7 +28,7 @@ Optional, RFC 9449. See [Binding tokens to keys](../guides/binding-tokens-to-key
 | Method and path | Auth | Purpose |
 | --- | --- | --- |
 | `POST /token` | agent client credentials at hop 0; at later hops the parent token, plus the actor's client credentials or an `actor_token` | RFC 8693 token exchange, as a form or JSON. Hop 0 takes an OIDC ID token or an ID-JAG. Later hops take a parent delegation token and `authorization_details`. Optional `may_act` (agent ids) sets who may exchange the new token next. A `DPoP` header binds the new token to a key (`token_type` `DPoP`); `subject_token_dpop` is the parent key's sign-off, naming the new key and `actor`, when the parent is bound to another key. |
-| `POST /token/renew` | bearer delegation token (and a DPoP proof if it is bound) | Extend the lease of the token's last hop. Returns `{lease, expires_at, expires_in}`. |
+| `POST /token/renew` | bearer delegation token (and a DPoP proof if it is bound) | Extend the lease of the token's last hop. Returns `{lease, expires_at, expires_in}`. A refusal of a token that verified is audited (below). |
 
 A capability may carry run `limits` (`calls`, `sum: {arg, max}`, `calls_per: {arg, max}`, `distinct: {arg, max}`; [run limits](../design/server.md#run-limits)). `distinct` allows at most `max` different values of `arg`. `calls_per` and `distinct` may add `"derive": "host"` to count the host of a URL argument instead of the whole value (`{"arg": "url", "derive": "host", "max": 2}`). A child must keep every limit of the parent capability that covers it, on the same argument and derivation, at most as large (`calls: m` also satisfies a parent's `calls_per` or `distinct` with `max >= m`); one it leaves out or asks larger is filled in or lowered (a `sum`, `calls_per` or `distinct` over another argument or derivation is refused as not covered), and its `calls` and `sum` are lowered further to what the parent hop has left. An unknown limit kind or derivation, or `derive` on a `sum`, is 400 `invalid_request`.
 
@@ -54,6 +54,16 @@ A later-hop request authenticates its `actor` with `client_id` / `client_secret`
 | parent lease revoked, expired or unknown | `invalid_grant` | `lease_revoked`, `lease_expired`, `lease_unknown` |
 
 Not recorded, a server log line only: a malformed request, failed client or actor-token authentication, a subject token or DPoP proof that does not verify (so an anonymous caller cannot write to the log, SR-18), and server errors. A `requested_ttl_seconds` beyond the parent's expiry is not a refusal: the child is clamped to the parent. A refused exchange uses up nothing: the parent can still delegate once to that actor, an actor token can be presented again, and no run limit is charged; only its DPoP proof (its `jti`) is spent. It is counted in `decisions_total{decision="deny",reason}`.
+
+**Refused renewals are audited.** When the token of a `POST /token/renew` verified (signature, issuer, audience, expiry, chain) and so did its DPoP proof, a refusal is a `deny` record against the token's chain: server `attenuo`, tool `lease.renew` (the tool of a successful renewal, so `audit export --tool lease.renew --decision deny` lists the refused ones), kind `decision`, and the arguments digest of `{lease, ancestor, dpop_bound}`. The 400 carries the id in `X-Attenuo-Decision-Id` and `decision_id`:
+
+| Refusal | `error` | Audit `reason` |
+| --- | --- | --- |
+| the token's own lease, or an ancestor's, is revoked | `invalid_grant` | `lease_revoked` |
+| an ancestor lease has expired (stopped renewing) | `invalid_grant` | `lease_expired` |
+| the token's own lease, or an ancestor's, is unknown to the lease store | `invalid_grant` | `lease_unknown` |
+
+The token's own lease having lapsed is not a refusal: renewal revives it. Not recorded, a server log line only: a missing token, a token or DPoP proof that does not verify (401, SR-18), and lease store errors (500).
 
 ```http
 POST /token
@@ -367,7 +377,7 @@ Every series is prefixed `attenuo_`. Label values come from fixed sets, so the n
 
 | Series | Type | Labels | Help |
 |---|---|---|---|
-| `decisions_total` | counter | `decision` (`allow`, `deny`), `reason` | Decision records by outcome and reason code: pipeline decisions (MCP proxy and AuthZEN) and the requests the proxy refuses and records before a decision. `reason` is one of `policy_allow`, `policy_deny`, `policy_error`, `approval_required`, `approval_invalid`, `capability_denied`, `tool_not_in_catalog`, `attribute_type_mismatch`, `invalid_name`, `tool_not_listed`, `session_mismatch`, `budget_exhausted`, `budget_error`, `limit_arg_invalid`, `lease_revoked`, `lease_expired`, `lease_unknown`, `lease_error`, `audit_error`, and for a refused token exchange `exchange_widening`, `exchange_too_deep`, `exchange_actor_not_permitted`, `exchange_actor_mismatch`, `exchange_duplicate_actor`, `exchange_reserved_agent`, `exchange_no_lifetime_left`, `exchange_replayed`, `exchange_invalid_capability`, `exchange_refused`. A lease refusal of `initialize` or another undecided request, or of an exchange's parent, counts under its lease reason. Unauthenticated requests (bad token, DPoP) are not counted here. |
+| `decisions_total` | counter | `decision` (`allow`, `deny`), `reason` | Decision records by outcome and reason code: pipeline decisions (MCP proxy and AuthZEN) and the requests the proxy refuses and records before a decision. `reason` is one of `policy_allow`, `policy_deny`, `policy_error`, `approval_required`, `approval_invalid`, `capability_denied`, `tool_not_in_catalog`, `attribute_type_mismatch`, `invalid_name`, `tool_not_listed`, `session_mismatch`, `budget_exhausted`, `budget_error`, `limit_arg_invalid`, `lease_revoked`, `lease_expired`, `lease_unknown`, `lease_error`, `audit_error`, and for a refused token exchange `exchange_widening`, `exchange_too_deep`, `exchange_actor_not_permitted`, `exchange_actor_mismatch`, `exchange_duplicate_actor`, `exchange_reserved_agent`, `exchange_no_lifetime_left`, `exchange_replayed`, `exchange_invalid_capability`, `exchange_refused`. A lease refusal of `initialize` or another undecided request, of an exchange's parent, or of a renewal, counts under its lease reason. Unauthenticated requests (bad token, DPoP) are not counted here. |
 | `tokens_issued_total` | counter | `kind` (`root`, `exchange`) | Delegation tokens issued. |
 | `leases_revoked_total` | counter | none | Leases moved to revoked, including cascaded descendants. |
 | `audit_append_errors_total` | counter | none | Audit log appends that failed. |

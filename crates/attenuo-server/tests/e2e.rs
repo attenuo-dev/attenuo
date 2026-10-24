@@ -1554,6 +1554,134 @@ async fn revoked_lease_cannot_be_renewed_and_token_problems_are_401() {
     );
 }
 
+/// A refused renewal of a verified token leaves one `deny` record against its chain, tool
+/// `lease.renew`, whose id the 400 carries.
+async fn refused_renewal_record(h: &Harness, token: &str, reason: &str) -> Value {
+    let before = h.audit_entries().await.len();
+    let resp = h.renew_raw(Some(token)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let id = resp.headers()["x-attenuo-decision-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"], "invalid_grant", "{body}");
+    assert!(body["detail"].as_str().unwrap().contains(reason), "{body}");
+    assert_eq!(body["decision_id"], id, "{body}");
+    let entries = h.audit_entries().await;
+    assert_eq!(entries.len(), before + 1, "exactly one record");
+    let r = entries.last().unwrap()["record"].clone();
+    assert_eq!(r["id"], id);
+    assert_eq!(r["decision"], "deny");
+    assert_eq!(r["kind"], "decision");
+    assert_eq!(r["reason"], reason);
+    assert_eq!(r["server"], "attenuo");
+    assert_eq!(r["tool"], "lease.renew");
+    r
+}
+
+/// Refused renewals of a token that verified are audited with the lease reason: the token's
+/// own lease revoked, an ancestor revoked, an ancestor expired. A successful renewal is
+/// unchanged (one `allow` of kind `lease_renew`, no decision id).
+#[tokio::test]
+async fn refused_renewals_are_audited_against_the_token_chain() {
+    let h = Harness::start().await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let child = h
+        .exchange(&root.token, "coder", &["github:read_file"])
+        .await;
+
+    // The token's own lease revoked.
+    h.admin_post(
+        &format!("/admin/leases/{}/revoke", child.lease),
+        json!({"reason": "test"}),
+    )
+    .await;
+    let r = refused_renewal_record(&h, &child.token, "lease_revoked").await;
+    assert_eq!(r["agents"], json!(["planner", "coder"]));
+    assert_eq!(r["originating_subject"], "alice");
+
+    // An ancestor revoked: the root's lease, refusing a second child.
+    let other = h
+        .exchange(&root.token, "reviewer", &["github:read_file"])
+        .await;
+    h.admin_post(
+        &format!("/admin/leases/{}/revoke", root.lease),
+        json!({"reason": "test"}),
+    )
+    .await;
+    let r = refused_renewal_record(&h, &other.token, "lease_revoked").await;
+    assert_eq!(r["agents"], json!(["planner", "reviewer"]));
+
+    // An ancestor that stopped renewing.
+    let bob = h.mint_root("bob", "planner", &["github:*"]).await;
+    let bob_child = h.exchange(&bob.token, "coder", &["github:read_file"]).await;
+    h.set_lease_expiry(&bob.lease, OffsetDateTime::now_utc() - Duration::seconds(1));
+    let r = refused_renewal_record(&h, &bob_child.token, "lease_expired").await;
+    assert_eq!(r["originating_subject"], "bob");
+
+    // A successful renewal is as before: one `allow` record, no decision id.
+    let before = h.audit_entries().await.len();
+    let resp = h.renew_raw(Some(&bob.token)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get("x-attenuo-decision-id").is_none());
+    let body: Value = resp.json().await.unwrap();
+    assert!(body.get("decision_id").is_none(), "{body}");
+    let entries = h.audit_entries().await;
+    assert_eq!(entries.len(), before + 1);
+    let r = &entries.last().unwrap()["record"];
+    assert_eq!(r["decision"], "allow");
+    assert_eq!(r["kind"], "lease_renew");
+    assert_eq!(r["reason"], "lease_renewed");
+    assert_eq!(r["tool"], "lease.renew");
+
+    assert_eq!(h.admin_get("/admin/audit/verify").await["ok"], true);
+    let metrics = h.state.metrics.render();
+    for (reason, n) in [("lease_revoked", 2), ("lease_expired", 1)] {
+        assert!(
+            metrics.contains(&format!(
+                "attenuo_decisions_total{{decision=\"deny\",reason=\"{reason}\"}} {n}\n"
+            )),
+            "{reason}: {metrics}"
+        );
+    }
+}
+
+/// A renewal whose token does not verify (garbage, a forged signature, the admin token, no
+/// token) is a 401 and a log line only (SR-18): no record, no decision id, no metric.
+#[tokio::test]
+async fn unverified_renewals_leave_no_record() {
+    let h = Harness::start().await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    h.admin_post(
+        &format!("/admin/leases/{}/revoke", root.lease),
+        json!({"reason": "test"}),
+    )
+    .await;
+    let before = h.audit_entries().await.len();
+    let (head, sig) = root.token.rsplit_once('.').unwrap();
+    let flipped = if sig.starts_with('A') { 'B' } else { 'A' };
+    let forged = format!("{head}.{flipped}{}", &sig[1..]);
+    for token in [
+        Some("not-a-token"),
+        Some(forged.as_str()),
+        Some(ADMIN),
+        None,
+    ] {
+        let resp = h.renew_raw(token).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().get("x-attenuo-decision-id").is_none());
+        let body: Value = resp.json().await.unwrap();
+        assert!(body.get("decision_id").is_none(), "{body}");
+    }
+    assert_eq!(h.audit_entries().await.len(), before);
+    assert!(!h
+        .state
+        .metrics
+        .render()
+        .contains("decision=\"deny\",reason=\"lease_"));
+}
+
 #[tokio::test]
 async fn revoked_token_cannot_list_tools_over_the_proxy() {
     let h = Harness::start().await;

@@ -1378,12 +1378,14 @@ impl Pipeline {
     /// Append a `deny` record for a request refused before any decision (the proxy's
     /// `session_mismatch`, `invalid_name` and `tool_not_listed`, or a lease refusal of a
     /// request that has no per-call decision, such as `initialize` on a revoked lease, or a
-    /// refused token exchange whose subject token verified, tool `token.exchange`) and count it in `decisions_total{decision="deny",reason}`, so every decision record in the
-    /// log is counted there. Returns the record id, which is not in the log if the append
-    /// failed.
+    /// refused token exchange whose subject token verified, tool `token.exchange`, or a
+    /// refused lease renewal whose token verified, tool `lease.renew`) and count it in
+    /// `decisions_total{decision="deny",reason}`, so every decision record in the log is
+    /// counted there. Returns the record id, which is not in the log if the append failed.
     ///
-    /// `reason` comes from a fixed set of codes (the proxy's constants, the lease reasons and
-    /// [`crate::routes::token::EXCHANGE_REFUSAL_REASONS`]), so the metric's label set stays
+    /// `reason` comes from a fixed set of codes (the proxy's constants, the lease reasons,
+    /// [`crate::routes::token::EXCHANGE_REFUSAL_REASONS`] and
+    /// [`crate::routes::renew::RENEW_REFUSAL_REASONS`]), so the metric's label set stays
     /// small.
     pub fn record_rejection(
         &self,
