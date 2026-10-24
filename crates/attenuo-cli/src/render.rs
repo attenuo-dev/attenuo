@@ -332,8 +332,85 @@ fn fmt_tree_node(n: &Value) -> String {
     )
 }
 
+/// A JSON number as text, `-` when absent or null.
+fn num(v: &Value) -> String {
+    if v.is_null() {
+        "-".to_string()
+    } else {
+        v.to_string()
+    }
+}
+
+/// The lines a lease tree node's `budget` adds under it: `limits not recorded` for a lease
+/// issued by a server that did not keep its limits, then one `limit` line per limit
+/// (`<server>/<tool> <kind> [<arg>] <used>/<max> (<remaining> left)`, with the number of
+/// values seen for `calls_per`), then one `usage` line per destructive tool on a run's root
+/// lease. Nothing for a `null` budget.
+pub fn fmt_budget(b: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if b.is_null() {
+        return out;
+    }
+    if b["recorded"] == false {
+        out.push("limits not recorded".to_string());
+    }
+    for l in b["limits"].as_array().into_iter().flatten() {
+        let target = match (l["server"].as_str(), l["tool"].as_str()) {
+            (Some(server), Some(tool)) => format!("{server}/{tool}"),
+            _ => format!("cap {}", num(&l["cap"])),
+        };
+        let mut line = format!("limit {target} {}", s(l, "kind"));
+        if let Some(arg) = l["arg"].as_str() {
+            line.push_str(&format!(" {arg}"));
+        }
+        let values = (l["kind"] == "calls_per").then(|| format!("{} values", num(&l["values"])));
+        if l["max"].is_null() {
+            line.push_str(&format!(" {} used", num(&l["used"])));
+            if let Some(v) = values {
+                line.push_str(&format!(" ({v})"));
+            }
+        } else {
+            let mut paren = format!("{} left", num(&l["remaining"]));
+            if let Some(v) = values {
+                paren.push_str(&format!(", {v}"));
+            }
+            line.push_str(&format!(
+                " {}/{} ({paren})",
+                num(&l["used"]),
+                num(&l["max"])
+            ));
+        }
+        out.push(line);
+    }
+    for u in b["usage"].as_array().into_iter().flatten() {
+        out.push(format!(
+            "usage {}: {} calls, amount {}, {} destinations",
+            s(u, "tool"),
+            num(&u["calls"]),
+            num(&u["amount"]),
+            num(&u["destinations"])
+        ));
+    }
+    out
+}
+
+type Children<'a> = std::collections::BTreeMap<&'a str, Vec<&'a Value>>;
+
+/// The budget lines of tree node `n`, whose children are drawn below it at `deeper`; a `│`
+/// keeps the line down to its first child unbroken.
+fn tree_budget(out: &mut String, n: &Value, deeper: &str, children: &Children) {
+    let has_kids = children.contains_key(s(n, "lease_id"));
+    for line in fmt_budget(&n["budget"]) {
+        out.push_str(&format!(
+            "{deeper}{}{line}\n",
+            if has_kids { "│    " } else { "     " }
+        ));
+    }
+}
+
 /// `lease tree`: the ancestors nearest first, then the lease and its descendants drawn as a
-/// tree, then what a revoke would change.
+/// tree, then what a revoke would change. Each lease with a `budget` has its limit and usage
+/// lines under it, indented to stay inside its branch.
 pub fn render_lease_tree(v: &Value) -> String {
     let nodes = v["nodes"].as_array().cloned().unwrap_or_default();
     let mut out = String::new();
@@ -347,20 +424,18 @@ pub fn render_lease_tree(v: &Value) -> String {
         ));
         for a in &ancestors {
             out.push_str(&format!("  {}\n", fmt_tree_node(a)));
+            for line in fmt_budget(&a["budget"]) {
+                out.push_str(&format!("       {line}\n"));
+            }
         }
     }
     // Breadth-first order puts every parent before its children, so a parent-to-children
     // map drawn from the first node reaches every listed lease.
-    let mut children: std::collections::BTreeMap<&str, Vec<&Value>> = Default::default();
+    let mut children: Children = Default::default();
     for n in nodes.iter().skip(1) {
         children.entry(s(n, "parent")).or_default().push(n);
     }
-    fn draw(
-        out: &mut String,
-        n: &Value,
-        prefix: &str,
-        children: &std::collections::BTreeMap<&str, Vec<&Value>>,
-    ) {
+    fn draw(out: &mut String, n: &Value, prefix: &str, children: &Children) {
         let kids = children.get(s(n, "lease_id")).cloned().unwrap_or_default();
         for (i, k) in kids.iter().enumerate() {
             let last = i + 1 == kids.len();
@@ -370,11 +445,13 @@ pub fn render_lease_tree(v: &Value) -> String {
                 fmt_tree_node(k)
             ));
             let deeper = format!("{prefix}{}", if last { "   " } else { "│  " });
+            tree_budget(out, k, &deeper, children);
             draw(out, k, &deeper, children);
         }
     }
     if let Some(first) = nodes.first() {
         out.push_str(&format!("{}\n", fmt_tree_node(first)));
+        tree_budget(&mut out, first, "", &children);
         draw(&mut out, first, "", &children);
     }
     out.push_str(&format!(
@@ -388,6 +465,21 @@ pub fn render_lease_tree(v: &Value) -> String {
         ));
     }
     out
+}
+
+/// `budget refund`: what was given back and the audit record that says so.
+pub fn render_refund(v: &Value) -> String {
+    let audit = match v["audit_id"].as_str() {
+        Some(id) => id.to_string(),
+        None => "- (the refund stands, but its audit record was not written; see the server log)"
+            .to_string(),
+    };
+    format!(
+        "decision  {}\nrefunded  {} limit counter(s)\nreason    {}\naudit     {audit}\n",
+        s(v, "decision_id"),
+        num(&v["refunded"]),
+        s(v, "reason"),
+    )
 }
 
 /// `approval list`: one line per approval, newest first.
@@ -799,6 +891,120 @@ would revoke 3 lease(s) if revoked now
 truncated: only 4 leases listed (raise --max-nodes); `would revoke` counts the whole subtree
 ";
         assert_eq!(render_lease_tree(&v), expected);
+    }
+
+    fn limit(
+        server: &str,
+        tool: &str,
+        kind: &str,
+        arg: Option<&str>,
+        max: u64,
+        used: u64,
+    ) -> Value {
+        json!({"cap": 0, "server": server, "tool": tool, "kind": kind, "arg": arg,
+               "max": max, "used": used, "remaining": max - used})
+    }
+
+    #[test]
+    fn budget_lines_for_every_limit_kind_and_usage() {
+        let mut per = limit("bank", "send_money", "calls_per", Some("to"), 3, 2);
+        per["values"] = json!(4);
+        let b = json!({"recorded": true, "limits": [
+            limit("bank", "send_money", "calls", None, 5, 1),
+            limit("bank", "send_money", "sum", Some("amount"), 100, 30),
+            per,
+            limit("web", "get_webpage", "distinct", Some("url#host"), 2, 2),
+        ], "usage": [
+            {"tool": "bank/send_money", "calls": 2, "amount": 30, "destinations": 1},
+        ]});
+        assert_eq!(
+            fmt_budget(&b),
+            [
+                "limit bank/send_money calls 1/5 (4 left)",
+                "limit bank/send_money sum amount 30/100 (70 left)",
+                "limit bank/send_money calls_per to 2/3 (1 left, 4 values)",
+                "limit web/get_webpage distinct url#host 2/2 (0 left)",
+                "usage bank/send_money: 2 calls, amount 30, 1 destinations",
+            ]
+        );
+        assert!(fmt_budget(&Value::Null).is_empty());
+        // Usage alone (a root lease with no token limits) is still shown.
+        let usage_only = json!({"recorded": true, "limits": [], "usage": [
+            {"tool": "github/create_issue", "calls": 1, "amount": 0, "destinations": 0}]});
+        assert_eq!(
+            fmt_budget(&usage_only),
+            ["usage github/create_issue: 1 calls, amount 0, 0 destinations"]
+        );
+    }
+
+    #[test]
+    fn budget_lines_when_the_limits_were_not_recorded() {
+        // An older server kept the counters but not the hop's limits: no server, tool or max.
+        let b = json!({"recorded": false, "usage": [], "limits": [
+            {"cap": 0, "server": null, "tool": null, "kind": "calls", "arg": null,
+             "max": null, "used": 2, "remaining": null},
+            {"cap": 1, "server": null, "tool": null, "kind": "calls_per", "arg": "to",
+             "max": null, "used": 1, "remaining": null, "values": 3},
+        ]});
+        assert_eq!(
+            fmt_budget(&b),
+            [
+                "limits not recorded",
+                "limit cap 0 calls 2 used",
+                "limit cap 1 calls_per to 1 used (3 values)",
+            ]
+        );
+    }
+
+    #[test]
+    fn lease_tree_puts_budgets_under_their_lease() {
+        let mut root = node("R", None, "planner", false);
+        root["budget"] = json!({"recorded": true, "limits": [], "usage": [
+            {"tool": "bank/send_money", "calls": 1, "amount": 10, "destinations": 1}]});
+        let mut a = node("A", Some("R"), "coder", false);
+        a["budget"] = json!({"recorded": true, "usage": [], "limits": [
+            limit("bank", "send_money", "calls", None, 2, 1)]});
+        let mut b = node("B", Some("A"), "reviewer", false);
+        b["budget"] = json!({"recorded": false, "usage": [], "limits": []});
+        let mut c = node("C", Some("A"), "tester", false);
+        c["budget"] = json!({"recorded": true, "usage": [], "limits": [
+            limit("web", "get_webpage", "distinct", Some("url#host"), 2, 1)]});
+        let v = json!({
+            "root": "R",
+            "ancestors": [root],
+            "nodes": [a, b, c, node("D", Some("B"), "linter", false)],
+            "would_revoke": 4,
+            "truncated": false,
+        });
+        let expected = "\
+ancestors (nearest first, chain root R)
+  R  planner  active, expires 2026-10-23T10:00:00Z  issued #3
+       usage bank/send_money: 1 calls, amount 10, 1 destinations
+A  coder  active, expires 2026-10-23T10:00:00Z  issued #3
+│    limit bank/send_money calls 1/2 (1 left)
+├─ B  reviewer  active, expires 2026-10-23T10:00:00Z  issued #3
+│  │    limits not recorded
+│  └─ D  linter  active, expires 2026-10-23T10:00:00Z  issued #3
+└─ C  tester  active, expires 2026-10-23T10:00:00Z  issued #3
+        limit web/get_webpage distinct url#host 1/2 (1 left)
+would revoke 4 lease(s) if revoked now
+";
+        assert_eq!(render_lease_tree(&v), expected);
+    }
+
+    #[test]
+    fn refund_answer_names_decision_count_and_audit_record() {
+        let v = json!({"decision_id": "D1", "refunded": 2, "reason": "upstream timed out",
+                       "audit_id": "A9"});
+        assert_eq!(
+            render_refund(&v),
+            "decision  D1\nrefunded  2 limit counter(s)\nreason    upstream timed out\naudit     A9\n"
+        );
+        let unaudited = json!({"decision_id": "D1", "refunded": 0, "reason": "r",
+                               "audit_id": null});
+        let text = render_refund(&unaudited);
+        assert!(text.contains("refunded  0 limit counter(s)"), "{text}");
+        assert!(text.contains("audit     - (the refund stands"), "{text}");
     }
 
     #[test]

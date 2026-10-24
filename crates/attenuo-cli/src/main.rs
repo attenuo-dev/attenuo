@@ -2,6 +2,8 @@
 //!
 //! Exit status: 0 on success, 1 on an error, 2 when the server answered but said no (a denied
 //! call, a negative AuthZEN decision, a broken audit chain), so scripts can tell the two apart.
+//! `budget refund` also exits 3 when the decision was already refunded, so a retried refund can
+//! be told from one that found nothing to refund (2).
 
 mod cli;
 mod client;
@@ -21,8 +23,8 @@ use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
 
 use cli::{
-    ApprovalCmd, AuditCmd, AuthzenCmd, Cli, Command, ExportFormat, Field, KeyCmd, LeaseCmd,
-    PolicyCmd, TokenCmd,
+    ApprovalCmd, AuditCmd, AuthzenCmd, BudgetCmd, Cli, Command, ExportFormat, Field, KeyCmd,
+    LeaseCmd, PolicyCmd, TokenCmd,
 };
 use client::{query_escape, Client};
 use render::fmt_audit_entry;
@@ -37,6 +39,9 @@ enum Outcome {
     Ok,
     /// The server answered, and the answer was "no".
     No,
+    /// The server answered with a refusal that has an exit status of its own (the message is
+    /// already on stderr).
+    Exit(u8),
 }
 
 #[tokio::main]
@@ -48,6 +53,7 @@ async fn main() -> ExitCode {
     match run(cli).await {
         Ok(Outcome::Ok) => ExitCode::SUCCESS,
         Ok(Outcome::No) => ExitCode::from(2),
+        Ok(Outcome::Exit(code)) => ExitCode::from(code),
         Err(e) => {
             eprintln!("error: {e:#}");
             ExitCode::FAILURE
@@ -299,6 +305,10 @@ async fn run(cli: Cli) -> Result<Outcome> {
             approval_decide(&client?, &id, "decline", json).await
         }
         Command::Approval(ApprovalCmd::Verify(args)) => approval_verify(client, args, json).await,
+        Command::Budget(BudgetCmd::Refund {
+            decision_id,
+            reason,
+        }) => budget_refund(&client?, &decision_id, &reason, json).await,
         Command::Lease(LeaseCmd::Show { id }) => {
             let resp = client?
                 .admin_get(&format!("/admin/leases/{}", query_escape(&id)))
@@ -651,6 +661,57 @@ async fn inspect(client: Option<Client>, args: cli::InspectArgs, json: bool) -> 
 
 /// Print a `tools/call` response. A policy denial is reported with its reason and decision id.
 /// `approval grant` / `approval decline`: decide as the operator and print the approval.
+/// Exit status of `budget refund` when the decision charged nothing (404).
+const EXIT_NOTHING_CHARGED: u8 = 2;
+/// Exit status of `budget refund` when the decision was already refunded (409).
+const EXIT_ALREADY_REFUNDED: u8 = 3;
+
+/// `budget refund`: `POST /admin/budgets/refund`. The two refusals a script may want to tell
+/// apart get one line on stderr and exit statuses of their own; anything else is an error.
+async fn budget_refund(
+    client: &Client,
+    decision_id: &str,
+    reason: &str,
+    json: bool,
+) -> Result<Outcome> {
+    let body = json!({ "decision_id": decision_id, "reason": reason });
+    match client.admin_post("/admin/budgets/refund", &body).await {
+        Ok(resp) => {
+            if json {
+                print_json(&resp);
+            } else {
+                print!("{}", render::render_refund(&resp));
+            }
+            Ok(Outcome::Ok)
+        }
+        Err(e) => match refund_refusal(&e, decision_id) {
+            Some((code, line)) => {
+                eprintln!("error: {line}");
+                Ok(Outcome::Exit(code))
+            }
+            None => Err(e),
+        },
+    }
+}
+
+/// The exit status and message for a refund the server refused as nothing charged (404
+/// `not_found`) or already refunded (409 `already_refunded`). A 404 without that code (a
+/// server too old to have the route) stays an ordinary error.
+fn refund_refusal(e: &anyhow::Error, decision_id: &str) -> Option<(u8, String)> {
+    let api = e.downcast_ref::<client::ApiError>()?;
+    match (api.status.as_u16(), api.code.as_deref()?) {
+        (404, "not_found") => Some((
+            EXIT_NOTHING_CHARGED,
+            format!("decision {decision_id} charged no run limit or run usage; nothing to refund"),
+        )),
+        (409, "already_refunded") => Some((
+            EXIT_ALREADY_REFUNDED,
+            format!("the charge of decision {decision_id} was already refunded"),
+        )),
+        _ => None,
+    }
+}
+
 async fn approval_decide(client: &Client, id: &str, decision: &str, json: bool) -> Result<Outcome> {
     let resp = client
         .admin_post(
@@ -1119,6 +1180,41 @@ async fn audit_tail(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refund_refusals_get_their_own_line_and_exit_status() {
+        use reqwest::StatusCode;
+        let err = |status, body: &str| client::api_error(status, body);
+        let nothing = err(
+            StatusCode::NOT_FOUND,
+            r#"{"error":"not_found","detail":"no budget charge"}"#,
+        );
+        let (code, line) = refund_refusal(&nothing, "D1").unwrap();
+        assert_eq!(code, 2);
+        assert_eq!(
+            line,
+            "decision D1 charged no run limit or run usage; nothing to refund"
+        );
+        let twice = err(
+            StatusCode::CONFLICT,
+            r#"{"error":"already_refunded","detail":"once"}"#,
+        );
+        assert_eq!(
+            refund_refusal(&twice, "D1"),
+            Some((
+                3,
+                "the charge of decision D1 was already refunded".to_string()
+            ))
+        );
+        // A 404 with no code (no such route on an older server), another 409 code, or a
+        // transport error stays an ordinary error (exit 1).
+        assert_eq!(refund_refusal(&err(StatusCode::NOT_FOUND, ""), "D1"), None);
+        let other = err(StatusCode::CONFLICT, r#"{"error":"other"}"#);
+        assert_eq!(refund_refusal(&other, "D1"), None);
+        let forbidden = err(StatusCode::UNAUTHORIZED, r#"{"error":"not_found"}"#);
+        assert_eq!(refund_refusal(&forbidden, "D1"), None);
+        assert_eq!(refund_refusal(&anyhow::anyhow!("no route"), "D1"), None);
+    }
 
     #[test]
     fn export_lines_describe_coverage_and_problems() {
