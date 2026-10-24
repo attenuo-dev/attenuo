@@ -585,6 +585,11 @@ def test_example_agent(stack: Stack) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     # The delegated Prefix constraint stops the private repo before policy is even asked.
     assert proc.stdout.count("not allowed (capability_denied") == 2
+    # The run limit (one distinct repo) stops the second public repo.
+    assert "not allowed (budget_exhausted" in proc.stdout
+    # create_issue asks for an approval; after the operator's grant the retry is allowed.
+    assert "approval_required (-32008)" in proc.stdout
+    assert "retried once with the grant: allowed" in proc.stdout
     assert "stopping: lease_revoked" in proc.stdout
     assert "chain ok=True" in proc.stdout
 

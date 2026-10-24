@@ -12,12 +12,20 @@
  *
  * 1. The planner holds a broad root token for `github:*` (dev mint; in production it comes from
  *    your IdP, see `exchange(..., { clientId, clientSecret })`).
- * 2. The planner decides the coder needs only `read_file`, and only in repositories under
- *    `alice/public-`. It exchanges its token for a narrower one and hands that to the coder.
+ * 2. The planner decides the coder needs only `read_file`, only in repositories under
+ *    `alice/public-`, and only in one of them (a `distinct` run limit on `repo`). It exchanges
+ *    its token for a narrower one and hands that to the coder.
  * 3. The coder does its job through the proxy. A prompt-injected instruction makes it try a
  *    private repo and then `create_issue`; both are denied, and the coder treats the denial as a
  *    plain "not available" instead of retrying.
- * 4. The planner revokes its own lease (here through the admin API). The coder's next call is
+ * 4. Run limit: the coder reads from a second public repository. The token and the policy both
+ *    allow the repo, but the run limit allows one, so the call is denied with `budget_exhausted`.
+ * 5. Approval: the planner opens an issue with its own broad token. The demo policy holds every
+ *    `create_issue` until a person approves it, so the proxy answers JSON-RPC `-32008`.
+ *    `callToolWithApproval` reports the approval id, waits for the grant (here an operator grants
+ *    it with `AdminClient.grantApproval`, which is what `attenuo approval grant` does) and
+ *    retries the identical call once, which is allowed.
+ * 6. The planner revokes its own lease (here through the admin API). The coder's next call is
  *    denied with `lease_revoked`, and the coder stops.
  *
  * Everything the agents do is recorded in the audit log, whose chain is verified at the end.
@@ -25,10 +33,12 @@
 
 import {
   AdminClient,
+  argLimit,
   capability,
   DeniedError,
   AttenuoClient,
   prefix,
+  withLimits,
   type Token,
 } from "@attenuo/sdk";
 
@@ -81,11 +91,16 @@ async function run(server = SERVER, adminToken = ADMIN_TOKEN): Promise<number> {
     capabilities: "github:*",
   });
 
-  console.log("[planner] delegates read_file on alice/public-* to the coder");
+  console.log("[planner] delegates read_file on alice/public-* to the coder, one repo per run");
   const coderToken = await ob.exchange(
     root,
     CODER_AGENT,
-    [capability("github", "read_file", { repo: prefix("alice/public-") })],
+    [
+      // A run limit (ADR-0010): at most one distinct value of `repo` over the run.
+      withLimits(capability("github", "read_file", { repo: prefix("alice/public-") }), {
+        distinct: argLimit("repo", 1),
+      }),
+    ],
     // The coder's [[agents]] secret: every hop n+1 exchange authenticates as its actor.
     { ttlSeconds: 600, clientSecret: process.env.ATTENUO_CLIENT_SECRET ?? "demo-coder-secret" },
   );
@@ -107,6 +122,29 @@ async function run(server = SERVER, adminToken = ADMIN_TOKEN): Promise<number> {
     throw new Error("create_issue must be denied");
   }
 
+  console.log("[coder] reads from a second public repo: the run limit allows one repo");
+  if ((await coder.readFile("alice/public-site", "index.html")) !== undefined) {
+    throw new Error("the second repo must be over the run limit");
+  }
+
+  console.log("[planner] opens an issue itself: the policy asks a person first");
+  const issue = await ob.callToolWithApproval(
+    root,
+    "github",
+    "create_issue",
+    { repo: "alice/public-docs", title: "README: fix typo" },
+    {
+      onApproval: async (e) => {
+        console.log(`  ${e.reason} (-32008), approval ${e.approvalId}`);
+        // Alice would approve with her own sign-in; here the operator does it.
+        const granted = await admin.grantApproval(String(e.approvalId));
+        console.log(`  [operator] approval ${granted.approvalId}: ${granted.state}`);
+      },
+      intervalMs: 200,
+    },
+  );
+  console.log(`  retried once with the grant: allowed (decision ${issue.decisionId})`);
+
   const lease = await ob.renew(coderToken);
   console.log(`[coder] renewed its lease, good for ${lease.expiresIn}s`);
 
@@ -122,7 +160,7 @@ async function run(server = SERVER, adminToken = ADMIN_TOKEN): Promise<number> {
 
   const report = await admin.auditVerify();
   console.log(`[audit] chain ok=${report.ok}, ${report.entries} entries`);
-  for (const e of await admin.auditTail(5)) {
+  for (const e of await admin.auditTail(8)) {
     const r = e.record;
     console.log(
       `  #${e.seq} ${String(r.decision).padEnd(5)} ${r.server}/${r.tool}  reason=${r.reason}`,

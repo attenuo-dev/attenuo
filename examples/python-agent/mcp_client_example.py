@@ -8,8 +8,9 @@ the header; the rest is the MCP client's normal setup.
     ATTENUO_SERVER=http://127.0.0.1:8080 ATTENUO_ADMIN_TOKEN=demo-admin-token \\
         python examples/python-agent/mcp_client_example.py
 
-Tested with `mcp` 2.3.0 (which builds on `httpx2`) against the fake GitHub MCP server of the demo.
-The fallback for `mcp` 1.x (`streamablehttp_client(url, headers=...)`) is NOT tested. Note that
+Tested with `mcp` 2.3.0 (which builds on `httpx2`) and with `mcp` 1.30.0 against the fake GitHub
+MCP server of the demo; both have `streamable_http_client`. The fallback for older `mcp` 1.x
+(`streamablehttp_client(url, headers=...)`) is NOT tested. Note that
 a full MCP client opens a session with `initialize` first; the fake upstream accepts that, but a
 real one may assign an `Mcp-Session-Id` that the client library then carries by itself.
 
@@ -42,10 +43,10 @@ async def main() -> None:
 
     def open_transport(url: str, headers: dict[str, str]) -> Any:
         if hasattr(transport, "streamable_http_client"):
-            # mcp >= 2: the transport takes a pre-configured http client
+            # mcp 1.30 and 2.x: the transport takes a pre-configured http client
             client = transport.create_mcp_http_client(headers=headers)
             return transport.streamable_http_client(url, http_client=client)
-        # mcp 1.x (untested)
+        # older mcp 1.x (untested)
         return transport.streamablehttp_client(url, headers=headers)
 
     admin = AdminClient(SERVER, ADMIN_TOKEN)

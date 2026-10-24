@@ -70,13 +70,15 @@ def test_dry_run_end_to_end() -> None:
     assert "mode: dry-run" in out
     assert "chain: assistant > coder" in out
     assert "tools/list through attenuo shows: ['read_file']" in out
-    assert out.count("ALLOWED") == 1
-    assert out.count("DENIED") == 3
+    assert out.count("ALLOWED") == 2
+    assert out.count("DENIED") == 4
     assert "reason=lease_revoked" in out
     assert "reason=capability_denied" in out
+    assert "reason=budget_exhausted" in out
+    assert "APPROVAL REQUIRED create_issue  reason=approval_required" in out
     assert "[audit] chain ok=True" in out
     assert "RESULT: ok" in out
-    assert "1 tools/call reached upstream" in out
+    assert "2 tools/calls reached upstream" in out
 
 
 def test_only_a_minus_32003_the_proxy_vouched_for_is_a_denial_sr53() -> None:

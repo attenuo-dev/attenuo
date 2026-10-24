@@ -486,6 +486,11 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
     expect(proc.status, proc.stdout + proc.stderr).toBe(0);
     // The delegated prefix constraint stops the private repo before policy is even asked.
     expect(proc.stdout.match(/not allowed \(capability_denied/g)).toHaveLength(2);
+    // The run limit (one distinct repo) stops the second public repo.
+    expect(proc.stdout).toContain("not allowed (budget_exhausted");
+    // create_issue asks for an approval; after the operator's grant the retry is allowed.
+    expect(proc.stdout).toContain("approval_required (-32008)");
+    expect(proc.stdout).toContain("retried once with the grant: allowed");
     expect(proc.stdout).toContain("stopping: lease_revoked");
     expect(proc.stdout).toContain("chain ok=true");
   });
