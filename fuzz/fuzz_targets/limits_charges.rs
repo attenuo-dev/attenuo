@@ -15,8 +15,9 @@
 //!   JSON; a `LimitArgError` names an argument that really is missing or unusable;
 //! - `usage_charges` starts with one `calls` charge, has distinct destination values, at most
 //!   `MAX_COUNTED_VALUES` of them, and never fails;
-//! - a derived host is non-empty, lowercase, without characters URL parsers disagree on, and
-//!   for a special scheme (`https`, `http`, ...) counting it again gives the same host;
+//! - a derived host is non-empty, lowercase, without characters URL parsers disagree on, comes
+//!   from a URL of a special scheme (`https`, `http`, ...) only, and counting it again gives
+//!   the same host;
 //! - canonical JSON is a fixpoint (parse and canonicalise again gives the same bytes) and
 //!   `jcs::value_eq` agrees with byte equality of the canonical forms.
 #![no_main]
@@ -71,6 +72,8 @@ const URLS: &[&str] = &[
     "ftp://a.example",
     "ws://a.example",
     "foo://a.example",
+    "ssh://a.ex%61mple/",
+    "git://\u{3b2}\u{3cc}\u{3bb}\u{3bf}\u{3c2}/",
     "https://a.example\u{3002}com/",
     "https://a\u{ad}.example/",
     "https://a\u{200b}.example/",
@@ -388,19 +391,19 @@ fn check_host_shape(host: &str) {
 /// The schemes whose hosts WHATWG parses as domains or IP addresses.
 const SPECIAL: &[&str] = &["http", "https", "ws", "wss", "ftp", "file"];
 
-/// `host` was derived from `source`. For a special scheme, counting the host again gives the
-/// same host: one destination, one spelling. A URL of another scheme (`foo://`, `ssh://`) has
-/// an opaque host, which WHATWG neither percent-decodes nor maps through IDNA, so it is not a
-/// host an `https://` URL can spell (FZ2-2, open); only its shape is checked.
+/// `host` was derived from `source`. Only a special scheme has a host: any other scheme has
+/// an opaque host, which WHATWG neither percent-decodes nor maps through IDNA (FZ2-2). Counting
+/// the host again gives the same host: one destination, one spelling.
 fn check_host(host: &str, source: &str) {
     check_host_shape(host);
     let scheme = source
         .split_once(':')
         .map(|(s, _)| s.to_ascii_lowercase())
         .unwrap_or_default();
-    if !SPECIAL.contains(&scheme.as_str()) {
-        return;
-    }
+    assert!(
+        SPECIAL.contains(&scheme.as_str()),
+        "{source:?} has a host ({host:?}) under a non-special scheme"
+    );
     let again = Derive::Host.apply(&Value::String(format!("https://{host}/")));
     assert_eq!(
         again.as_deref(),
