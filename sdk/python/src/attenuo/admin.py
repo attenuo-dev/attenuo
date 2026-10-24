@@ -27,9 +27,14 @@ _MAX_PAGE = 1000
 
 @dataclass(frozen=True)
 class RevokeResult:
+    """The answer of :meth:`AdminClient.revoke_lease`. ``audit_id`` is the id of the
+    ``admin.lease.revoke`` record, ``None`` when the server could not write it (the revocation
+    stands)."""
+
     lease_id: str
     revoked: int
     reason: str
+    audit_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -265,10 +270,110 @@ class PolicyCheck:
     policy_ids: list[str]
 
 
+LimitKind = Literal["calls", "sum", "calls_per", "distinct"]
+
+
+@dataclass(frozen=True)
+class BudgetLimit:
+    """One run-limit counter: ``hop`` (position in the chain, root 0), ``kind``, ``arg`` (the
+    counted argument as the limit names it, ``arg#host`` for a derived one; ``None`` for
+    ``calls``), ``used`` (calls or summed amount; for ``calls_per`` the calls with this value;
+    for ``distinct`` how many values the limit has seen) and ``max``.
+
+    The ``limit`` of a ``budget_exhausted`` dry run has this shape, and so does an entry of
+    :attr:`StatedBudget.limits`, where ``max`` is optional (when given it must equal the
+    limit's). A refusal's ``limit`` can be stated back as it came."""
+
+    hop: int
+    kind: LimitKind
+    used: int
+    arg: str | None = None
+    max: int | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"hop": self.hop, "kind": self.kind, "used": self.used}
+        if self.arg is not None:
+            out["arg"] = self.arg
+        if self.max is not None:
+            out["max"] = self.max
+        return out
+
+
+@dataclass(frozen=True)
+class StatedBudget:
+    """The run-limit state a dry run decides the call in, instead of the store's counters (the
+    ``budget`` block of ``POST /admin/policies/evaluate``, in the vocabulary of a
+    ``policy test`` case's ``budget``). Members left ``None`` are not sent.
+
+    ``calls_remaining`` / ``amount_remaining``: what every matching ``calls`` / ``sum`` limit
+    has left. ``destination_new=False``: the call's value was already counted by each matching
+    ``calls_per`` and ``distinct`` limit. ``limited``: ``context.budget.limited`` when no limit
+    of the chain matches the call (server default ``True``). ``limits``: at most 64 single
+    counters over those figures. The server checks everything and answers 400
+    ``invalid_request`` for a malformed block or an entry that names no matching limit."""
+
+    calls_remaining: int | None = None
+    amount_remaining: int | None = None
+    destination_new: bool | None = None
+    limited: bool | None = None
+    limits: Sequence[BudgetLimit] = ()
+
+    def to_json(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for name in ("calls_remaining", "amount_remaining", "destination_new", "limited"):
+            value = getattr(self, name)
+            if value is not None:
+                out[name] = value
+        if self.limits:
+            out["limits"] = [lim.to_json() for lim in self.limits]
+        return out
+
+
+@dataclass(frozen=True)
+class EvaluationBudget:
+    """``context.budget`` of a dry run: what the run limits matching the call have left.
+
+    ``calls_remaining`` and ``amount_remaining`` are ``2**63 - 1`` when no limit of that kind
+    matches. ``source`` is ``store`` (the run's counters as they stand, read and never
+    charged) or ``request`` (as the request's ``budget`` stated them)."""
+
+    limited: bool
+    calls_remaining: int
+    amount_remaining: int
+    destination_new: bool
+    source: str
+
+
+@dataclass(frozen=True)
+class EvaluationLabels:
+    """The run's output labels the dry run decided with (ADR-0009); ``source`` is ``store``
+    or ``request``."""
+
+    tainted: bool
+    tainted_by: list[str]
+    args_contain_untrusted: bool
+    untrusted_args: list[str]
+    source: str
+
+
+@dataclass(frozen=True)
+class EvaluationUsage:
+    """``context.usage`` of a dry run; ``source`` is ``request``, ``store`` or ``untracked``
+    (the server keeps no run usage, so the zeros are not a reading of the run)."""
+
+    calls: int
+    amount: int
+    destination_seen: bool
+    source: str
+
+
 @dataclass(frozen=True)
 class PolicyEvaluation:
     """A dry-run decision. ``lease_check`` is always ``skipped``; ``chain_source`` is ``token``
-    or ``admin_supplied``."""
+    or ``admin_supplied``. ``limit`` is set when the call would take a run limit past its
+    ``max`` (reason ``budget_exhausted``). ``budget``, ``labels`` and ``usage`` are ``None``
+    only for a server that does not send them. ``approval_by`` is the ``by`` of the granted
+    approval the call was evaluated with, ``None`` without one."""
 
     decision: str
     reason: str
@@ -277,6 +382,11 @@ class PolicyEvaluation:
     lease_check: str
     chain_source: str
     token_expired: bool
+    budget: EvaluationBudget | None = None
+    limit: BudgetLimit | None = None
+    labels: EvaluationLabels | None = None
+    usage: EvaluationUsage | None = None
+    approval_by: str | None = None
 
     @property
     def allowed(self) -> bool:
@@ -535,6 +645,7 @@ def _evaluate_body(
     arguments: dict[str, Any] | None,
     token: Token | str | None,
     chain: dict[str, Any] | None,
+    budget: StatedBudget | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if token is None and chain is None:
         raise ValueError("policy_evaluate needs a token or a chain")
@@ -543,10 +654,66 @@ def _evaluate_body(
         body["token"] = w.bearer(token)
     if chain is not None:
         body["subject"]["properties"] = {"chain": chain}
+    if budget is not None:
+        body["budget"] = budget.to_json() if isinstance(budget, StatedBudget) else dict(budget)
     return body
 
 
+def _int(v: Any) -> int:
+    return v if isinstance(v, int) and not isinstance(v, bool) else 0
+
+
+def _budget_limit(v: Any) -> BudgetLimit | None:
+    if not isinstance(v, dict):
+        return None
+    arg, mx = v.get("arg"), v.get("max")
+    return BudgetLimit(
+        hop=_int(v.get("hop")),
+        kind=str(v.get("kind", "")),  # type: ignore[arg-type]
+        used=_int(v.get("used")),
+        arg=None if arg is None else str(arg),
+        max=mx if isinstance(mx, int) and not isinstance(mx, bool) else None,
+    )
+
+
+def _evaluation_budget(v: Any) -> EvaluationBudget | None:
+    if not isinstance(v, dict):
+        return None
+    return EvaluationBudget(
+        limited=v.get("limited") is True,
+        calls_remaining=_int(v.get("calls_remaining")),
+        amount_remaining=_int(v.get("amount_remaining")),
+        destination_new=v.get("destination_new") is True,
+        source=str(v.get("source", "")),
+    )
+
+
+def _evaluation_labels(v: Any) -> EvaluationLabels | None:
+    if not isinstance(v, dict):
+        return None
+    return EvaluationLabels(
+        tainted=v.get("tainted") is True,
+        tainted_by=[str(x) for x in v.get("tainted_by") or []],
+        args_contain_untrusted=v.get("args_contain_untrusted") is True,
+        untrusted_args=[str(x) for x in v.get("untrusted_args") or []],
+        source=str(v.get("source", "")),
+    )
+
+
+def _evaluation_usage(v: Any) -> EvaluationUsage | None:
+    if not isinstance(v, dict):
+        return None
+    return EvaluationUsage(
+        calls=_int(v.get("calls")),
+        amount=_int(v.get("amount")),
+        destination_seen=v.get("destination_seen") is True,
+        source=str(v.get("source", "")),
+    )
+
+
 def _policy_evaluation(b: Any) -> PolicyEvaluation:
+    approval = b.get("approval")
+    present = isinstance(approval, dict) and approval.get("present") is True
     return PolicyEvaluation(
         decision=str(b.get("decision", "")),
         reason=str(b.get("reason", "")),
@@ -555,6 +722,21 @@ def _policy_evaluation(b: Any) -> PolicyEvaluation:
         lease_check=str(b.get("lease_check", "")),
         chain_source=str(b.get("chain_source", "")),
         token_expired=b.get("token_expired") is True,
+        budget=_evaluation_budget(b.get("budget")),
+        limit=_budget_limit(b.get("limit")),
+        labels=_evaluation_labels(b.get("session")),
+        usage=_evaluation_usage(b.get("usage")),
+        approval_by=str(approval.get("by", "")) if present else None,
+    )
+
+
+def _revoke_result(b: Any) -> RevokeResult:
+    audit_id = b.get("audit_id")
+    return RevokeResult(
+        b["lease_id"],
+        int(b["revoked"]),
+        str(b["reason"]),
+        None if audit_id is None else str(audit_id),
     )
 
 
@@ -620,7 +802,7 @@ class AdminClient:
                 json={"reason": reason} if reason else {},
             )
         )
-        return RevokeResult(body["lease_id"], int(body["revoked"]), str(body["reason"]))
+        return _revoke_result(body)
 
     def revoke_by_selector(
         self,
@@ -811,11 +993,18 @@ class AdminClient:
         *,
         token: Token | str | None = None,
         chain: dict[str, Any] | None = None,
+        budget: StatedBudget | dict[str, Any] | None = None,
     ) -> PolicyEvaluation:
-        """Dry run: what the loaded policies decide for this call. No lease check, no audit
-        record. Pass a delegation ``token`` (verified by the server; an expired one is accepted
-        and flagged ``token_expired``) or a ``chain`` object, checked only structurally."""
-        body = _evaluate_body(server, tool, arguments, token, chain)
+        """Dry run: what the loaded policies decide for this call. No lease check, no charge,
+        no audit record. Pass a delegation ``token`` (verified by the server; an expired one is
+        accepted and flagged ``token_expired``) or a ``chain`` object, checked only
+        structurally.
+
+        ``budget`` states the run-limit counters to decide in (a :class:`StatedBudget`, or the
+        raw block as a dict) instead of the store's; the answer's ``budget.source`` is then
+        ``request``. A spent hard limit answers ``budget_exhausted`` with ``limit`` set, as the
+        live call would."""
+        body = _evaluate_body(server, tool, arguments, token, chain, budget)
         return _policy_evaluation(
             w.json_body(self._http.post("/admin/policies/evaluate", json=body))
         )
@@ -924,7 +1113,7 @@ class AsyncAdminClient:
                 json={"reason": reason} if reason else {},
             )
         )
-        return RevokeResult(body["lease_id"], int(body["revoked"]), str(body["reason"]))
+        return _revoke_result(body)
 
     async def revoke_by_selector(
         self,
@@ -1076,8 +1265,9 @@ class AsyncAdminClient:
         *,
         token: Token | str | None = None,
         chain: dict[str, Any] | None = None,
+        budget: StatedBudget | dict[str, Any] | None = None,
     ) -> PolicyEvaluation:
-        body = _evaluate_body(server, tool, arguments, token, chain)
+        body = _evaluate_body(server, tool, arguments, token, chain, budget)
         return _policy_evaluation(
             w.json_body(await self._http.post("/admin/policies/evaluate", json=body))
         )

@@ -1,5 +1,17 @@
-import { beforeAll, describe, expect, it } from "vitest";
-import { AdminClient, ApiError, capability, AttenuoError, prefix } from "../src/index.js";
+import { beforeAll, describe, expect, expectTypeOf, it } from "vitest";
+import {
+  AdminClient,
+  ApiError,
+  capability,
+  AttenuoError,
+  prefix,
+  type AuditQuery,
+  type BudgetLimit,
+  type Decision,
+  type EvaluationBudget,
+  type PolicyEvaluation,
+  type StatedBudget,
+} from "../src/index.js";
 import { jsonResponse, mockFetch, Signer, tokenResponse } from "./helpers.js";
 
 const URL_ = "http://ob.test";
@@ -655,6 +667,147 @@ describe("AdminClient console endpoints", () => {
     expect(sent.token).toBeUndefined();
     expect(sent.subject!.properties).toEqual({ chain: { hops: [] } });
     await expect(admin.policyEvaluate("github", "read_file")).rejects.toThrow(TypeError);
+    expect(calls[0]!.body).not.toHaveProperty("budget");
+  });
+
+  // The `2^63 - 1` of an unlimited figure is written out, as the server sends it.
+  const exhausted = `{
+    "decision": "deny", "reason": "budget_exhausted", "policy_ids": [],
+    "diagnostics": ["limit"], "lease_check": "skipped", "chain_source": "token",
+    "token_expired": false,
+    "session": {"tainted": true, "tainted_by": ["github/read_file"],
+                "args_contain_untrusted": false, "untrusted_args": [], "source": "store"},
+    "approval": {"present": false, "by": ""},
+    "budget": {"limited": true, "calls_remaining": 9223372036854775807,
+               "amount_remaining": 40, "destination_new": true, "source": "request"},
+    "usage": {"calls": 0, "amount": 0, "destination_seen": false, "source": "request"},
+    "limit": {"hop": 1, "kind": "distinct", "arg": "repo", "max": 1, "used": 1}
+  }`;
+
+  it("states a budget for the dry run and types the answer's budget", async () => {
+    const { fetch, calls } = mockFetch(
+      () => new Response(exhausted, { headers: { "content-type": "application/json" } }),
+    );
+    const admin = new AdminClient(URL_, "adm", { fetch });
+    const stated: StatedBudget = {
+      callsRemaining: 0,
+      destinationNew: false,
+      limits: [{ hop: 1, kind: "distinct", arg: "repo", used: 1, max: 1 }],
+    };
+    const ev = await admin.policyEvaluate(
+      "github",
+      "read_file",
+      { repo: "b" },
+      { token: "t", budget: stated },
+    );
+    // Members left out are not sent; names are the server's.
+    expect((calls[0]!.body as Record<string, unknown>).budget).toEqual({
+      calls_remaining: 0,
+      destination_new: false,
+      limits: [{ hop: 1, kind: "distinct", arg: "repo", used: 1, max: 1 }],
+    });
+    expect(ev.allowed).toBe(false);
+    expect(ev.reason).toBe("budget_exhausted");
+    expect(ev.budget).toEqual({
+      limited: true,
+      callsRemaining: Infinity,
+      amountRemaining: 40,
+      destinationNew: true,
+      source: "request",
+    });
+    expect(ev.limit).toEqual({ hop: 1, kind: "distinct", arg: "repo", used: 1, max: 1 });
+    expect(ev.labels).toEqual({
+      tainted: true,
+      taintedBy: ["github/read_file"],
+      argsContainUntrusted: false,
+      untrustedArgs: [],
+      source: "store",
+    });
+    expect(ev.usage).toEqual({ calls: 0, amount: 0, destinationSeen: false, source: "request" });
+    expect(ev.approvalBy).toBeUndefined();
+
+    // A refusal's `limit` goes back as it came; an empty block is `{}`; `calls` has no `arg`.
+    await admin.policyEvaluate("github", "read_file", undefined, {
+      token: "t",
+      budget: { limits: [ev.limit!, { hop: 0, kind: "calls", used: 2 }] },
+    });
+    expect((calls[1]!.body as Record<string, unknown>).budget).toEqual({
+      limits: [
+        { hop: 1, kind: "distinct", arg: "repo", used: 1, max: 1 },
+        { hop: 0, kind: "calls", used: 2 },
+      ],
+    });
+    await admin.policyEvaluate("github", "read_file", undefined, { token: "t", budget: {} });
+    expect((calls[2]!.body as Record<string, unknown>).budget).toEqual({});
+
+    // Type level: the kind and the source are unions, not strings.
+    expectTypeOf<BudgetLimit["kind"]>().toEqualTypeOf<"calls" | "sum" | "calls_per" | "distinct">();
+    expectTypeOf<EvaluationBudget["source"]>().toEqualTypeOf<"store" | "request">();
+    // @ts-expect-error: not a limit kind
+    const bad: BudgetLimit = { hop: 0, kind: "count", used: 1 };
+    void bad;
+  });
+
+  it("reads a granted approval and a hit without arg", async () => {
+    const answer = JSON.parse(exhausted.replace("9223372036854775807", "0")) as Record<
+      string,
+      unknown
+    >;
+    answer.approval = { present: true, by: "operator" };
+    answer.limit = { hop: 0, kind: "calls", max: 2, used: 2 };
+    const { fetch } = mockFetch(() => jsonResponse(answer));
+    const ev = await new AdminClient(URL_, "adm", { fetch }).policyEvaluate(
+      "github",
+      "read_file",
+      undefined,
+      { token: "t" },
+    );
+    expect(ev.approvalBy).toBe("operator");
+    expect(ev.limit).toEqual({ hop: 0, kind: "calls", used: 2, max: 2 });
+    expect(ev.budget!.callsRemaining).toBe(0);
+  });
+
+  it("passes the server's refusal of a malformed budget on as ApiError", async () => {
+    const { fetch } = mockFetch(() => jsonResponse({ error: "invalid_request" }, 400));
+    const admin = new AdminClient(URL_, "adm", { fetch });
+    await expect(
+      admin.policyEvaluate("github", "read_file", undefined, {
+        token: "t",
+        budget: { callsRemaining: -1 },
+      }),
+    ).rejects.toBeInstanceOf(ApiError);
+  });
+});
+
+describe("revokeLease audit id and the decision type", () => {
+  it("returns the server's audit_id, undefined when the record was not written", async () => {
+    const answers = [
+      { lease_id: "l1", revoked: 1, reason: "r", audit_id: "a-1" },
+      { lease_id: "l1", revoked: 0, reason: "r", audit_id: null },
+    ];
+    const { fetch } = mockFetch(() => jsonResponse(answers.shift()));
+    const admin = new AdminClient(URL_, "adm", { fetch });
+    expect(await admin.revokeLease("l1", "r")).toEqual({
+      leaseId: "l1",
+      revoked: 1,
+      reason: "r",
+      auditId: "a-1",
+    });
+    const second = await admin.revokeLease("l1", "r");
+    expect(second.auditId).toBeUndefined();
+    expect(second).toHaveProperty("auditId");
+  });
+
+  it("types AuditQuery.decision as the server's decisions", async () => {
+    expectTypeOf<AuditQuery["decision"]>().toEqualTypeOf<Decision | undefined>();
+    expectTypeOf<Decision>().toEqualTypeOf<"allow" | "deny">();
+    expectTypeOf<PolicyEvaluation["decision"]>().toEqualTypeOf<Decision>();
+    // @ts-expect-error: not a decision the server emits
+    const bad: AuditQuery = { decision: "maybe" };
+    void bad;
+    const { fetch, calls } = mockFetch(() => jsonResponse({ entries: [], head: 0 }));
+    await new AdminClient(URL_, "adm", { fetch }).auditQuery({ decision: "deny" });
+    expect(calls[0]!.url.searchParams.get("decision")).toBe("deny");
   });
 });
 
