@@ -2840,8 +2840,43 @@ async fn every_record_has_a_kind_and_chains_share_a_chain_id_and_export_filters_
     let err = attenuo_audit::verify_export(&export, &keys).unwrap_err();
     assert!(err.to_string().contains("filtered"), "{err}");
 
-    // Unknown kinds and empty chain ids are a 400.
-    for q in ["?kind=checkpoint", "?kind=", "?chain_id="] {
+    // `tool` and `decision` filter on the server too, and are named in the header.
+    let all = attenuo_audit::parse_export(&export_text(&h, "").await).unwrap();
+    let tool = all.entries[0].record.tool.clone();
+    let export = attenuo_audit::parse_export(
+        &export_text(&h, &format!("?tool={tool}&decision=allow")).await,
+    )
+    .unwrap();
+    let want: Vec<u64> = all
+        .entries
+        .iter()
+        .filter(|e| e.record.tool == tool && e.record.decision.is_allow())
+        .map(|e| e.seq)
+        .collect();
+    assert!(!want.is_empty());
+    assert_eq!(
+        export.entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        want
+    );
+    let filter = export.header.as_ref().unwrap().filter.clone().unwrap();
+    assert_eq!(filter.tool.as_deref(), Some(tool.as_str()));
+    assert_eq!(filter.decision, Some(attenuo_core::Decision::Allow));
+    assert_eq!((filter.kind, filter.chain_id), (None, None));
+    let err = attenuo_audit::verify_export(&export, &keys).unwrap_err();
+    assert!(err.to_string().contains("filtered"), "{err}");
+    let export = attenuo_audit::parse_export(&export_text(&h, "?tool=no.such.tool").await).unwrap();
+    assert!(export.entries.is_empty());
+
+    // Unknown kinds and decisions, more than one kind, and empty values are a 400.
+    for q in [
+        "?kind=checkpoint",
+        "?kind=",
+        "?kind=decision,exchange",
+        "?chain_id=",
+        "?tool=",
+        "?decision=",
+        "?decision=maybe",
+    ] {
         let resp = h
             .client
             .get(h.url(&format!("/admin/audit/export{q}")))

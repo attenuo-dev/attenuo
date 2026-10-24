@@ -447,8 +447,15 @@ async fn run(cli: Cli) -> Result<Outcome> {
             out,
             kind,
             chain_id,
+            tool,
+            decision,
         }) => {
-            let filter = attenuo_audit::RecordFilter { kind, chain_id };
+            let filter = attenuo_audit::RecordFilter {
+                kind,
+                chain_id,
+                tool,
+                decision: decision.map(Into::into),
+            };
             audit_export(&client?, from, to, &filter, format, out.as_deref()).await
         }
         Command::Audit(AuditCmd::Verify { .. }) => {
@@ -1077,6 +1084,14 @@ fn export_path(from: u64, to: Option<u64>, filter: &attenuo_audit::RecordFilter)
     if let Some(chain_id) = &filter.chain_id {
         path.push_str(&format!("&chain_id={}", query_escape(chain_id)));
     }
+    if let Some(tool) = &filter.tool {
+        path.push_str(&format!("&tool={}", query_escape(tool)));
+    }
+    match filter.decision {
+        Some(attenuo_core::Decision::Allow) => path.push_str("&decision=allow"),
+        Some(attenuo_core::Decision::Deny) => path.push_str("&decision=deny"),
+        None => {}
+    }
     path
 }
 
@@ -1420,10 +1435,20 @@ mod tests {
         let f = RecordFilter {
             kind: Some(attenuo_core::RecordKind::LeaseRenew),
             chain_id: Some("l 1&x=é".into()),
+            ..Default::default()
         };
         assert_eq!(
             export_path(5, Some(9), &f),
             "/admin/audit/export?from=5&to=9&kind=lease_renew&chain_id=l%201%26x%3D%C3%A9"
+        );
+        let f = RecordFilter {
+            tool: Some("token.exchange".into()),
+            decision: Some(attenuo_core::Decision::Deny),
+            ..Default::default()
+        };
+        assert_eq!(
+            export_path(1, None, &f),
+            "/admin/audit/export?from=1&tool=token.exchange&decision=deny"
         );
     }
 

@@ -4608,6 +4608,7 @@ mod tests {
         let f = RecordFilter {
             kind: Some(RecordKind::Exchange),
             chain_id: None,
+            ..Default::default()
         };
         let got: Vec<u64> = log
             .range_filtered(1, 12, &f, 100)
