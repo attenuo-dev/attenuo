@@ -236,6 +236,11 @@ pub struct Pipeline {
     /// Checks presented approval tokens: the issuer's public keys, `iss` and `aud`. `None`
     /// refuses every presented token (`approval_invalid`).
     approval_verifier: Option<Verifier>,
+    /// The lease store and the audit log are the same database file, so the synced append of
+    /// a decision also makes its `sum` charge durable: the charge leaves its sync to the
+    /// append (one `fsync` per call instead of a synced charge then an append, and under load
+    /// the append's group commit shares it). See [`LeaseStore::charge_sync_deferred`].
+    charge_sync_on_append: bool,
 }
 
 impl Pipeline {
@@ -244,7 +249,12 @@ impl Pipeline {
         leases: Arc<dyn LeaseStore>,
         audit: Arc<dyn AuditSink>,
     ) -> Self {
+        let charge_sync_on_append = matches!(
+            (leases.sync_file(), audit.sync_file()),
+            (Some(a), Some(b)) if a == b
+        );
         Self {
+            charge_sync_on_append,
             policy,
             leases,
             audit,
@@ -411,11 +421,21 @@ impl Pipeline {
         // Charge an allowed call against every matching limit, re-checking in the store's
         // transaction: a concurrent call may have spent the budget since it was read.
         let mut charged: Option<RecordBudget> = None;
+        // The charge left its sync to the decision's append (see `charge_sync_on_append`).
+        let mut sync_on_append = false;
         if decision.is_allow() && !budget.charges.is_empty() {
-            match self
-                .leases
-                .charge(&decision_id.to_string(), &budget.charges, now)
-            {
+            let id = decision_id.to_string();
+            let outcome = if self.charge_sync_on_append {
+                self.leases
+                    .charge_sync_deferred(&id, &budget.charges, now)
+                    .map(|(outcome, owed)| {
+                        sync_on_append = owed;
+                        outcome
+                    })
+            } else {
+                self.leases.charge(&id, &budget.charges, now)
+            };
+            match outcome {
                 Ok(ChargeOutcome::Charged { used_after }) => {
                     charged = Some(RecordBudget {
                         charged: budget
@@ -479,9 +499,15 @@ impl Pipeline {
             record.approval = Some(info);
         }
         record.budget = charged.clone();
-        // The record moves into the log; the entry hands it back, so it is never cloned.
+        // The record moves into the log; the entry hands it back, so it is never cloned. A
+        // deferred `sum` charge is durable once this synced append returns, before the call is
+        // answered or forwarded; if the append fails, the charge is refunded below.
         let t2 = Instant::now();
-        let appended = self.audit.append(record);
+        let appended = if sync_on_append {
+            self.audit.append_synced(record)
+        } else {
+            self.audit.append(record)
+        };
         let append_time = t2.elapsed();
         self.metrics.observe_audit_append(append_time);
         let lease_time = t1 - t0;
@@ -1610,7 +1636,8 @@ mod budget_tests {
 
     use super::*;
     use attenuo_audit::{
-        AuditEntry, AuditError, MemoryAudit, MemoryLeaseStore, SqliteLeaseStore, VerifyReport,
+        AuditEntry, AuditError, Durability, MemoryAudit, MemoryLeaseStore, SqliteAudit,
+        SqliteLeaseStore, VerifyReport,
     };
     use attenuo_core::{AgentId, Capability, CapabilitySet, LeaseId, Limits, OriginatingUser};
     use attenuo_policy::PolicyEngineBuilder;
@@ -1781,6 +1808,149 @@ when { context.input has amount && context.input.amount > 1000 };
         // The charge was refunded: the call that can be recorded gets the budget.
         audit.fail.store(false, Ordering::SeqCst);
         assert!(p.decide(&c, &send(json!(1)), now).is_allow());
+        assert_eq!(
+            p.decide(&c, &send(json!(1)), now).reason,
+            REASON_BUDGET_EXHAUSTED
+        );
+    }
+
+    /// A SQLite log that notes which append each decision used, and can be made to fail.
+    struct SpyAudit {
+        inner: SqliteAudit,
+        fail: AtomicBool,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl SpyAudit {
+        fn new(inner: SqliteAudit) -> Self {
+            Self {
+                inner,
+                fail: AtomicBool::new(false),
+                calls: Default::default(),
+            }
+        }
+
+        fn take_calls(&self) -> Vec<&'static str> {
+            std::mem::take(&mut *self.calls.lock().unwrap())
+        }
+
+        fn note(&self, what: &'static str) -> Result<(), AuditError> {
+            self.calls.lock().unwrap().push(what);
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(AuditError::Storage("disk full".into()));
+            }
+            Ok(())
+        }
+    }
+
+    impl AuditSink for SpyAudit {
+        fn append(&self, record: DecisionRecord) -> Result<AuditEntry, AuditError> {
+            self.note("append")?;
+            self.inner.append(record)
+        }
+        fn append_synced(&self, record: DecisionRecord) -> Result<AuditEntry, AuditError> {
+            self.note("append_synced")?;
+            self.inner.append_synced(record)
+        }
+        fn sync_file(&self) -> Option<&std::path::Path> {
+            self.inner.sync_file()
+        }
+        fn head(&self) -> Result<Option<AuditEntry>, AuditError> {
+            self.inner.head()
+        }
+        fn range(&self, from_seq: u64, limit: usize) -> Result<Vec<AuditEntry>, AuditError> {
+            self.inner.range(from_seq, limit)
+        }
+        fn verify_chain(&self) -> Result<VerifyReport, AuditError> {
+            self.inner.verify_chain()
+        }
+    }
+
+    /// A log and a lease store at `durability`, the lease store in the log's file or, with
+    /// `apart`, in a file of its own.
+    fn file_stores(
+        dir: &tempfile::TempDir,
+        durability: Durability,
+        apart: bool,
+        now: OffsetDateTime,
+    ) -> (Arc<SqliteLeaseStore>, Arc<SpyAudit>) {
+        let path = dir.path().join("audit.db");
+        let audit = SqliteAudit::open_with(&path, durability).unwrap();
+        let lease_path = if apart {
+            dir.path().join("leases.db")
+        } else {
+            path
+        };
+        let leases = SqliteLeaseStore::open_with(lease_path, durability).unwrap();
+        leases
+            .register(&LeaseId::new("l1"), None, now + Duration::hours(1))
+            .unwrap();
+        (Arc::new(leases), Arc::new(SpyAudit::new(audit)))
+    }
+
+    /// Lease store and log in one file at `normal`: an allowed call that charges a `sum`
+    /// limit appends its decision with `append_synced` (the sync that makes the charge
+    /// durable); a `calls`-only charge, an unlimited call and a refused one append as before.
+    #[test]
+    fn sum_charge_is_synced_by_the_decision_append_on_a_shared_file() {
+        let now = OffsetDateTime::now_utc();
+        let dir = tempfile::tempdir().unwrap();
+        let (leases, audit) = file_stores(&dir, Durability::Normal, false, now);
+        let p = pipeline(leases.clone(), audit.clone());
+        assert!(p.charge_sync_on_append);
+
+        let sum = chain(Limits::default().with_sum("amount", 50), now);
+        let d = p.decide(&sum, &send(json!(40)), now);
+        assert!(d.is_allow(), "{d:?}");
+        assert_eq!(audit.take_calls(), ["append_synced"]);
+        // Over the limit: nothing charged, nothing to sync.
+        let d = p.decide(&sum, &send(json!(20)), now);
+        assert_eq!(d.reason, REASON_BUDGET_EXHAUSTED);
+        let calls = chain(Limits::default().with_calls(5), now);
+        assert!(p.decide(&calls, &send(json!(1)), now).is_allow());
+        let free = chain(Limits::default(), now);
+        assert!(p.decide(&free, &send(json!(1)), now).is_allow());
+        assert_eq!(audit.take_calls(), ["append", "append", "append"]);
+        // The first decision's record carries what it charged.
+        let first = &audit.range(1, 1).unwrap()[0].record;
+        assert_eq!(first.budget.as_ref().unwrap().charged[0].used_after, 40);
+        assert!(audit.verify_chain().unwrap().ok);
+    }
+
+    /// Where the log's sync would not cover the lease store (another file) or every commit is
+    /// synced anyway (`full`), the charge syncs itself as before and the append is plain.
+    #[test]
+    fn sum_charge_syncs_itself_when_the_append_cannot_cover_it() {
+        let now = OffsetDateTime::now_utc();
+        for (durability, apart, defers) in [
+            (Durability::Normal, true, false),
+            (Durability::Full, false, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (leases, audit) = file_stores(&dir, durability, apart, now);
+            let p = pipeline(leases, audit.clone());
+            assert_eq!(p.charge_sync_on_append, defers, "{durability}");
+            let sum = chain(Limits::default().with_sum("amount", 50), now);
+            assert!(p.decide(&sum, &send(json!(40)), now).is_allow());
+            assert_eq!(audit.take_calls(), ["append"], "{durability} apart={apart}");
+        }
+    }
+
+    /// A deferred `sum` charge whose synced append fails is refunded, as any charge is: the
+    /// call is denied with `audit_error` and the budget is whole for the next call.
+    #[test]
+    fn deferred_sum_charge_is_refunded_when_the_synced_append_fails() {
+        let now = OffsetDateTime::now_utc();
+        let dir = tempfile::tempdir().unwrap();
+        let (leases, audit) = file_stores(&dir, Durability::Normal, false, now);
+        let p = pipeline(leases.clone(), audit.clone());
+        let c = chain(Limits::default().with_sum("amount", 50), now);
+        audit.fail.store(true, Ordering::SeqCst);
+        let d = p.decide(&c, &send(json!(50)), now);
+        assert_eq!(d.reason, REASON_AUDIT_ERROR);
+        assert_eq!(audit.take_calls(), ["append_synced"]);
+        audit.fail.store(false, Ordering::SeqCst);
+        assert!(p.decide(&c, &send(json!(50)), now).is_allow());
         assert_eq!(
             p.decide(&c, &send(json!(1)), now).reason,
             REASON_BUDGET_EXHAUSTED

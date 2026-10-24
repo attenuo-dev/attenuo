@@ -269,6 +269,13 @@ fn with_full_sync<T>(
     Ok(out)
 }
 
+/// The canonical path of `conn`'s database file; `None` for an in-memory database.
+fn file_of(conn: &Connection) -> Option<PathBuf> {
+    conn.path()
+        .filter(|p| !p.is_empty())
+        .and_then(|p| std::fs::canonicalize(p).ok())
+}
+
 /// The `synchronous` level of `conn` if it is below `FULL` and there is a file to sync.
 fn relaxed_sync_of(conn: &Connection) -> Result<Option<i64>, AuditError> {
     let file_backed = conn.path().is_some_and(|p| !p.is_empty());
@@ -877,6 +884,8 @@ struct Inner {
     /// The connection's `synchronous` level when it is below `FULL` on a file: commits that
     /// write a signed checkpoint raise it to `FULL` for themselves (SR-50).
     relaxed_sync: Option<i64>,
+    /// The database file, if there is one (canonical path): what a synced commit covers.
+    file: Option<PathBuf>,
     /// Tests: every commit and the `synchronous` level it ran at, in one log with the hook.
     #[cfg(test)]
     probe: Option<Arc<Mutex<Vec<String>>>>,
@@ -943,6 +952,8 @@ impl std::fmt::Debug for SqliteAudit {
 /// One append waiting for the writer.
 struct Job {
     record: DecisionRecord,
+    /// [`AuditSink::append_synced`]: the batch that carries this record commits at `FULL`.
+    sync: bool,
     reply: mpsc::SyncSender<Result<AuditEntry, AuditError>>,
 }
 
@@ -975,11 +986,16 @@ impl Writer {
         }
     }
 
-    fn append(&self, record: DecisionRecord) -> Result<AuditEntry, AuditError> {
+    fn append(&self, record: DecisionRecord, sync: bool) -> Result<AuditEntry, AuditError> {
         let stopped = || AuditError::Storage("the audit writer is not running".into());
         let jobs = self.jobs.as_ref().ok_or_else(stopped)?;
         let (reply, answer) = mpsc::sync_channel(1);
-        jobs.send(Job { record, reply }).map_err(|_| stopped())?;
+        jobs.send(Job {
+            record,
+            reply,
+            sync,
+        })
+        .map_err(|_| stopped())?;
         // A writer that panicked drops the reply sender: the append fails, it is not assumed.
         answer.recv().map_err(|_| stopped())?
     }
@@ -1003,9 +1019,12 @@ fn writer_loop(inner: &Inner, jobs: &mpsc::Receiver<Job>) {
                 Err(_) => break,
             }
         }
+        // One record that must be synced makes the whole batch commit at `FULL`: one sync
+        // covers them all.
+        let sync = batch.iter().any(|j| j.sync);
         let (records, replies): (Vec<_>, Vec<_>) =
             batch.into_iter().map(|j| (j.record, j.reply)).unzip();
-        for (reply, result) in replies.into_iter().zip(inner.append_batch(records)) {
+        for (reply, result) in replies.into_iter().zip(inner.append_batch(records, sync)) {
             // The caller always waits for its answer; a send can only fail if it panicked.
             let _ = reply.send(result);
         }
@@ -1014,13 +1033,18 @@ fn writer_loop(inner: &Inner, jobs: &mpsc::Receiver<Job>) {
 
 impl Inner {
     /// Commit `records` in order, as one transaction when possible. One result per record.
-    fn append_batch(&self, records: Vec<DecisionRecord>) -> Vec<Result<AuditEntry, AuditError>> {
+    /// With `sync`, every commit runs at `synchronous=FULL`.
+    fn append_batch(
+        &self,
+        records: Vec<DecisionRecord>,
+        sync: bool,
+    ) -> Vec<Result<AuditEntry, AuditError>> {
         let n = records.len();
         let mut conn = match self.conn.lock() {
             Ok(c) => c,
             Err(_) => return (0..n).map(|_| Err(AuditError::Poisoned)).collect(),
         };
-        self.append_locked(&mut conn, records)
+        self.append_locked(&mut conn, records, sync)
     }
 
     /// [`append_batch`](Self::append_batch) with the connection already locked.
@@ -1028,16 +1052,17 @@ impl Inner {
         &self,
         conn: &mut Connection,
         records: Vec<DecisionRecord>,
+        sync: bool,
     ) -> Vec<Result<AuditEntry, AuditError>> {
         let n = records.len();
-        match self.commit(conn, records) {
+        match self.commit(conn, records, sync) {
             Ok(entries) => entries.into_iter().map(Ok).collect(),
             Err((e, _)) if n == 1 => vec![Err(e)],
             // Something in the batch failed and the transaction rolled back. Find out which
             // record it was by committing them one at a time, in the same order.
             Err((_, records)) => records
                 .into_iter()
-                .map(|r| match self.commit(conn, vec![r]) {
+                .map(|r| match self.commit(conn, vec![r], sync) {
                     Ok(mut one) => Ok(one.pop().expect("one record, one entry")),
                     Err((e, _)) => Err(e),
                 })
@@ -1047,18 +1072,26 @@ impl Inner {
 
     /// One transaction: read the head, chain and insert every record, sign the checkpoints
     /// that fall in the batch, commit. On failure nothing is written and the records come back.
-    /// A batch that writes a signed checkpoint commits with `synchronous=FULL` (SR-50).
+    /// A batch that writes a signed checkpoint commits with `synchronous=FULL` (SR-50), and so
+    /// does every batch with `sync` (it holds a record appended with
+    /// [`append_synced`](AuditSink::append_synced)).
     fn commit(
         &self,
         conn: &mut Connection,
         records: Vec<DecisionRecord>,
+        sync: bool,
     ) -> Result<Vec<AuditEntry>, (AuditError, Vec<DecisionRecord>)> {
-        let records = match self.commit_tx(conn, records, false) {
-            Ok(entries) => return Ok(entries),
-            Err(CommitFailure::Error(e, records)) => return Err((e, records)),
-            Err(CommitFailure::NeedsSync(records)) => records,
+        // Without `relaxed_sync` every commit is synced already, or there is no file to sync.
+        let records = if sync && self.relaxed_sync.is_some() {
+            records
+        } else {
+            match self.commit_tx(conn, records, false) {
+                Ok(entries) => return Ok(entries),
+                Err(CommitFailure::Error(e, records)) => return Err((e, records)),
+                Err(CommitFailure::NeedsSync(records)) => records,
+            }
         };
-        // `commit_tx` asks for a sync only when `relaxed_sync` is set.
+        // Only reached when `relaxed_sync` is set.
         let level = self.relaxed_sync.unwrap_or(SYNC_NORMAL);
         if let Err(e) = conn.pragma_update(None, "synchronous", SYNC_FULL) {
             return Err((e.into(), records));
@@ -1284,12 +1317,14 @@ impl SqliteAudit {
         // After the version check, so a log this version refuses is not changed by it.
         create_record_id_index(&conn)?;
         let relaxed_sync = relaxed_sync_of(&conn)?;
+        let file = file_of(&conn);
         Ok(Self {
             inner: Arc::new(Inner {
                 conn: Arc::new(Mutex::new(conn)),
                 checkpointing: None,
                 activity: Arc::new(Activity::default()),
                 relaxed_sync,
+                file,
                 #[cfg(test)]
                 probe: None,
             }),
@@ -1825,8 +1860,9 @@ impl SqliteAudit {
     }
 }
 
-impl AuditSink for SqliteAudit {
-    fn append(&self, record: DecisionRecord) -> Result<AuditEntry, AuditError> {
+impl SqliteAudit {
+    /// [`AuditSink::append`] and [`AuditSink::append_synced`].
+    fn append_with(&self, record: DecisionRecord, sync: bool) -> Result<AuditEntry, AuditError> {
         let activity = &self.inner.activity;
         // Nothing queued for the writer and the connection free: commit on this thread and
         // skip the hand-off. Anything else (a batch in progress, appends waiting, a reader
@@ -1834,7 +1870,7 @@ impl AuditSink for SqliteAudit {
         if activity.pending.load(Ordering::Acquire) == 0 {
             match self.inner.conn.try_lock() {
                 Ok(mut conn) => {
-                    let mut out = self.inner.append_locked(&mut conn, vec![record]);
+                    let mut out = self.inner.append_locked(&mut conn, vec![record], sync);
                     return out.pop().expect("one record, one result");
                 }
                 Err(TryLockError::Poisoned(_)) => return Err(AuditError::Poisoned),
@@ -1845,9 +1881,26 @@ impl AuditSink for SqliteAudit {
         let result = self
             .writer
             .get_or_init(|| Writer::start(Arc::clone(&self.inner)))
-            .append(record);
+            .append(record, sync);
         activity.pending.fetch_sub(1, Ordering::AcqRel);
         result
+    }
+}
+
+impl AuditSink for SqliteAudit {
+    fn append(&self, record: DecisionRecord) -> Result<AuditEntry, AuditError> {
+        self.append_with(record, false)
+    }
+
+    /// The record's batch commits with `synchronous=FULL` (at `durability = "full"` every
+    /// batch does). Under load, the records appended meanwhile share that commit and its
+    /// `fsync`, as at `full` (group commit).
+    fn append_synced(&self, record: DecisionRecord) -> Result<AuditEntry, AuditError> {
+        self.append_with(record, true)
+    }
+
+    fn sync_file(&self) -> Option<&Path> {
+        self.inner.file.as_deref()
     }
 
     fn head(&self) -> Result<Option<AuditEntry>, AuditError> {
@@ -1886,15 +1939,25 @@ impl AuditSink for SqliteAudit {
 /// A file-backed store runs at the [`Durability`] it was opened with, except that
 /// [`revoke`](LeaseStore::revoke) always commits with `synchronous=FULL`: losing a revocation
 /// to a power failure would bring a revoked lease back, and revocations are rare enough that
-/// their `fsync` does not matter.
+/// their `fsync` does not matter. A [`charge`](LeaseStore::charge) that charges a `sum` limit
+/// commits with `synchronous=FULL` too, unless it is made with
+/// [`charge_sync_deferred`](LeaseStore::charge_sync_deferred), which commits it at the
+/// store's level and leaves the sync to the caller's
+/// [`append_synced`](crate::AuditSink::append_synced) on a [`SqliteAudit`] in the same file.
 #[derive(Debug)]
 pub struct SqliteLeaseStore {
     conn: Mutex<Connection>,
     /// `None` for a connection this crate did not open (or an in-memory one): its pragmas are
     /// left alone.
     durability: Option<Durability>,
+    /// The database file (canonical path) of a store this crate opened on a file: the file a
+    /// deferred `sum` charge's sync must cover. `None` otherwise, and then nothing is deferred.
+    file: Option<PathBuf>,
     /// The key `calls_per` values are hashed under (`budget_meta`, ADR-0010).
     value_key: ValueKey,
+    /// Tests: every charge commit and the `synchronous` level it ran at.
+    #[cfg(test)]
+    probe: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 impl SqliteLeaseStore {
@@ -1907,8 +1970,11 @@ impl SqliteLeaseStore {
     /// Open (or create) the registry at `path` in WAL mode with the given durability.
     /// Revocations commit with `synchronous=FULL` whatever `durability` says.
     pub fn open_with(path: impl AsRef<Path>, durability: Durability) -> Result<Self, AuditError> {
-        let mut store = Self::from_connection(open_connection(path.as_ref(), durability)?)?;
+        let conn = open_connection(path.as_ref(), durability)?;
+        let file = file_of(&conn);
+        let mut store = Self::from_connection(conn)?;
         store.durability = Some(durability);
+        store.file = file;
         Ok(store)
     }
 
@@ -1929,7 +1995,10 @@ impl SqliteLeaseStore {
         Ok(Self {
             conn: Mutex::new(conn),
             durability: None,
+            file: None,
             value_key: ValueKey::new(&key),
+            #[cfg(test)]
+            probe: None,
         })
     }
 
@@ -2341,6 +2410,71 @@ fn approvals_for_call(
     Ok(out)
 }
 
+impl SqliteLeaseStore {
+    /// [`LeaseStore::charge`], or with `defer` [`LeaseStore::charge_sync_deferred`].
+    fn charge_with(
+        &self,
+        decision_id: &str,
+        charges: &[Charge],
+        at: OffsetDateTime,
+        defer: bool,
+    ) -> Result<(ChargeOutcome, bool), AuditError> {
+        if charges.is_empty() {
+            let none = ChargeOutcome::Charged {
+                used_after: Vec::new(),
+            };
+            return Ok((none, false));
+        }
+        let keys = charges
+            .iter()
+            .map(|c| self.value_key.counter(c))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut conn = self.conn.lock()?;
+        // A lost `sum` charge could be spent again after a power failure, so a transaction
+        // that charges one commits with `synchronous=FULL`, as revocations do (design 3.4).
+        let relaxed = if charges.iter().any(|c| c.kind == LimitKind::Sum) {
+            self.durability
+                .filter(|d| *d != Durability::Full)
+                .map(Durability::level)
+        } else {
+            None
+        };
+        if defer && relaxed.is_some() && self.file.is_some() {
+            // Committed at the store's own level. The caller's synced append on the same
+            // file syncs the WAL, which holds this commit, before the call goes anywhere.
+            let outcome = charge_in(&mut conn, &keys, decision_id, charges, at)?;
+            self.probe_charge(&conn, &outcome);
+            let owed = matches!(outcome, ChargeOutcome::Charged { .. });
+            return Ok((outcome, owed));
+        }
+        let outcome = with_full_sync(&mut conn, relaxed, |conn| {
+            let outcome = charge_in(conn, &keys, decision_id, charges, at);
+            if let Ok(o) = &outcome {
+                self.probe_charge(conn, o);
+            }
+            outcome
+        })??;
+        Ok((outcome, false))
+    }
+
+    /// Tests: note a charge that committed and the `synchronous` level it committed at.
+    #[cfg(not(test))]
+    fn probe_charge(&self, _: &Connection, _: &ChargeOutcome) {}
+
+    /// Tests: note a charge that committed and the `synchronous` level it committed at.
+    #[cfg(test)]
+    fn probe_charge(&self, conn: &Connection, outcome: &ChargeOutcome) {
+        if let (Some(log), ChargeOutcome::Charged { .. }) = (&self.probe, outcome) {
+            let level: i64 = conn
+                .query_row("PRAGMA synchronous", [], |r| r.get(0))
+                .unwrap_or(-1);
+            log.lock()
+                .unwrap()
+                .push(format!("charge synchronous={level}"));
+        }
+    }
+}
+
 impl LeaseStore for SqliteLeaseStore {
     fn register(
         &self,
@@ -2717,28 +2851,23 @@ impl LeaseStore for SqliteLeaseStore {
         charges: &[Charge],
         at: OffsetDateTime,
     ) -> Result<ChargeOutcome, AuditError> {
-        if charges.is_empty() {
-            return Ok(ChargeOutcome::Charged {
-                used_after: Vec::new(),
-            });
-        }
-        let keys = charges
-            .iter()
-            .map(|c| self.value_key.counter(c))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut conn = self.conn.lock()?;
-        // A lost `sum` charge could be spent again after a power failure, so a transaction
-        // that charges one commits with `synchronous=FULL`, as revocations do (design 3.4).
-        let relaxed = if charges.iter().any(|c| c.kind == LimitKind::Sum) {
-            self.durability
-                .filter(|d| *d != Durability::Full)
-                .map(Durability::level)
-        } else {
-            None
-        };
-        with_full_sync(&mut conn, relaxed, |conn| {
-            charge_in(conn, &keys, decision_id, charges, at)
-        })?
+        self.charge_with(decision_id, charges, at, false)
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// Defers the sync of a `sum` charge on a file store below `durability = "full"`; any
+    /// other charge commits exactly as [`charge`](LeaseStore::charge) does.
+    fn charge_sync_deferred(
+        &self,
+        decision_id: &str,
+        charges: &[Charge],
+        at: OffsetDateTime,
+    ) -> Result<(ChargeOutcome, bool), AuditError> {
+        self.charge_with(decision_id, charges, at, true)
+    }
+
+    fn sync_file(&self) -> Option<&Path> {
+        self.file.as_deref()
     }
 
     fn refund(&self, decision_id: &str, at: OffsetDateTime) -> Result<u64, AuditError> {
@@ -2770,6 +2899,15 @@ impl SqliteAudit {
     /// checkpoint hook writes to as well.
     fn with_probe(mut self, log: Arc<Mutex<Vec<String>>>) -> Self {
         self.inner_mut().probe = Some(log);
+        self
+    }
+}
+
+#[cfg(test)]
+impl SqliteLeaseStore {
+    /// Log every charge that commits (with its `synchronous` level) into `log`.
+    fn with_probe(mut self, log: Arc<Mutex<Vec<String>>>) -> Self {
+        self.probe = Some(log);
         self
     }
 }
@@ -2878,7 +3016,7 @@ mod tests {
         let entries = {
             let mut conn = log.inner.conn.lock().unwrap();
             log.inner
-                .append_locked(&mut conn, (0..6).map(record).collect())
+                .append_locked(&mut conn, (0..6).map(record).collect(), false)
                 .into_iter()
                 .map(Result::unwrap)
                 .collect::<Vec<_>>()
@@ -2893,6 +3031,184 @@ mod tests {
         );
         assert_eq!(synchronous(&log), SYNC_NORMAL);
         assert_eq!(log.len().unwrap(), 6);
+    }
+
+    /// Charges against lease `l1`: `calls` (max 100), and with `sum` a `sum` on `n`
+    /// (max `sum_max`) adding `amount`.
+    fn charges(sum: Option<(u64, u64)>) -> Vec<Charge> {
+        let mut out = vec![Charge {
+            hop: 0,
+            cap: 0,
+            lease: LeaseId::new("l1"),
+            kind: LimitKind::Calls,
+            arg: None,
+            value: None,
+            amount: 1,
+            max: 100,
+        }];
+        if let Some((amount, max)) = sum {
+            out.push(Charge {
+                hop: 0,
+                cap: 0,
+                lease: LeaseId::new("l1"),
+                kind: LimitKind::Sum,
+                arg: Some("n".into()),
+                value: None,
+                amount,
+                max,
+            });
+        }
+        out
+    }
+
+    /// A log and a lease store on one file at `durability`, both writing to `events`.
+    fn shared_file(
+        dir: &tempfile::TempDir,
+        durability: Durability,
+        events: &Arc<Mutex<Vec<String>>>,
+    ) -> (SqliteAudit, SqliteLeaseStore) {
+        let path = dir.path().join("audit.db");
+        let log = SqliteAudit::open_with(&path, durability)
+            .unwrap()
+            .with_probe(Arc::clone(events));
+        let leases = SqliteLeaseStore::open_with(&path, durability)
+            .unwrap()
+            .with_probe(Arc::clone(events));
+        (log, leases)
+    }
+
+    fn lease_synchronous(leases: &SqliteLeaseStore) -> i64 {
+        leases
+            .with_connection(|c| Ok(c.query_row("PRAGMA synchronous", [], |r| r.get(0))?))
+            .unwrap()
+    }
+
+    /// Design 3.4 at `durability = "normal"`: a `sum` charge is synced before the call goes
+    /// on. `charge` syncs its own commit; `charge_sync_deferred` commits at `NORMAL` and says
+    /// so, and the decision's `append_synced` on the same file then commits at `FULL`, which
+    /// syncs the WAL holding both. A `calls`-only charge and a plain append are unchanged.
+    #[test]
+    fn a_deferred_sum_charge_is_synced_by_the_decision_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (log, leases) = shared_file(&dir, Durability::Normal, &events);
+        assert!(leases.sync_file().is_some());
+        assert_eq!(leases.sync_file(), log.sync_file());
+        let at = datetime!(2026-10-24 12:00 UTC);
+        leases
+            .register(&LeaseId::new("l1"), None, at + time::Duration::hours(1))
+            .unwrap();
+        let sum = charges(Some((1, 1000)));
+
+        assert!(matches!(
+            leases.charge("d1", &sum, at).unwrap(),
+            ChargeOutcome::Charged { .. }
+        ));
+        let (outcome, owed) = leases.charge_sync_deferred("d2", &sum, at).unwrap();
+        assert!(matches!(outcome, ChargeOutcome::Charged { .. }) && owed);
+        log.append_synced(record(1)).unwrap();
+        let (_, owed) = leases
+            .charge_sync_deferred("d3", &charges(None), at)
+            .unwrap();
+        assert!(!owed, "a calls-only charge owes no sync");
+        log.append(record(2)).unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "charge synchronous=2",
+                "charge synchronous=1",
+                "commit 1 synchronous=2",
+                "charge synchronous=1",
+                "commit 2 synchronous=1",
+            ]
+        );
+        // Both connections are back at the store's level.
+        assert_eq!(synchronous(&log), SYNC_NORMAL);
+        assert_eq!(lease_synchronous(&leases), SYNC_NORMAL);
+    }
+
+    /// The deferred charge keeps the exhaustion check of `charge`: the re-check and the
+    /// writes stay in one transaction, a charge that would go over writes nothing and owes
+    /// no sync, and concurrent deferred charges never spend more than `max`.
+    #[test]
+    fn a_deferred_sum_charge_is_still_checked_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (_log, leases) = shared_file(&dir, Durability::Normal, &events);
+        let at = datetime!(2026-10-24 12:00 UTC);
+        leases
+            .register(&LeaseId::new("l1"), None, at + time::Duration::hours(1))
+            .unwrap();
+        let leases = Arc::new(leases);
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let leases = Arc::clone(&leases);
+                std::thread::spawn(move || {
+                    (0..5)
+                        .filter(|i| {
+                            let id = format!("d{t}-{i}");
+                            let (outcome, owed) = leases
+                                .charge_sync_deferred(&id, &charges(Some((3, 30))), at)
+                                .unwrap();
+                            let charged = matches!(outcome, ChargeOutcome::Charged { .. });
+                            assert_eq!(charged, owed, "{outcome:?}");
+                            charged
+                        })
+                        .count()
+                })
+            })
+            .collect();
+        let charged: usize = threads.into_iter().map(|t| t.join().unwrap()).sum();
+        assert_eq!(charged, 10, "30 / 3: exactly ten charges fit");
+        assert_eq!(
+            leases.budget_used(&charges(Some((0, 30)))).unwrap(),
+            [10, 30]
+        );
+        // Only the charges that went through committed anything.
+        assert_eq!(events.lock().unwrap().len(), 10);
+    }
+
+    /// Nothing is deferred where `charge` has no sync to skip: a store at `full` syncs every
+    /// commit, and an in-memory store has no file.
+    #[test]
+    fn full_and_in_memory_stores_never_defer_a_charge() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (log, leases) = shared_file(&dir, Durability::Full, &events);
+        let memory = SqliteLeaseStore::open_in_memory().unwrap();
+        assert_eq!(memory.sync_file(), None);
+        let at = datetime!(2026-10-24 12:00 UTC);
+        for store in [&leases, &memory] {
+            let (outcome, owed) = store
+                .charge_sync_deferred("d1", &charges(Some((1, 10))), at)
+                .unwrap();
+            assert!(matches!(outcome, ChargeOutcome::Charged { .. }) && !owed);
+        }
+        log.append_synced(record(1)).unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["charge synchronous=2", "commit 1 synchronous=2"]
+        );
+    }
+
+    /// Group commit: one record appended with `append_synced` makes its whole batch commit at
+    /// `FULL`, so one sync covers every record in it.
+    #[test]
+    fn a_batch_with_a_synced_record_commits_at_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let log = SqliteAudit::open_with(dir.path().join("audit.db"), Durability::Normal)
+            .unwrap()
+            .with_probe(Arc::clone(&events));
+        for sync in [false, true] {
+            let results = log.inner.append_batch((0..3).map(record).collect(), sync);
+            assert!(results.iter().all(Result::is_ok));
+        }
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["commit 3 synchronous=1", "commit 6 synchronous=2"]
+        );
+        assert_eq!(synchronous(&log), SYNC_NORMAL);
     }
 
     /// A store opened at `full` (or in memory) needs no extra step.

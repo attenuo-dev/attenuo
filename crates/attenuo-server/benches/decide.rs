@@ -11,7 +11,8 @@
 //! `attenuo-bench` policy and catalog, and the run-limit counters of a 2-hop chain with
 //! `calls` and `sum` limits (`LeaseStore::budget_used`, the read in the policy stage, and
 //! `LeaseStore::charge`, the transaction between policy and append; a `sum` charge commits
-//! with `synchronous=FULL`), SQLite stores in memory and in a temporary file
+//! with `synchronous=FULL`; and `Pipeline::decide` of the limited call, where a `sum` charge
+//! leaves its sync to the decision append), SQLite stores in memory and in a temporary file
 //! (`durability` normal and full, opened as the server opens them: WAL checkpoints in the
 //! background).
 //!
@@ -65,7 +66,8 @@ fn engine() -> PolicyEngine {
             ToolAttrs::new()
                 .readonly(true)
                 .with_input("repo", ArgType::String)
-                .with_input("path", ArgType::String),
+                .with_input("path", ArgType::String)
+                .with_input("n", ArgType::Long),
         )
         .with(
             "fake",
@@ -306,6 +308,12 @@ fn bench_decide(c: &mut Criterion) {
                     |id| store.leases.charge(&id, &charges, now).unwrap(),
                     BatchSize::SmallInput,
                 )
+            });
+            // The whole decision of a limited call: leases, counter read, policy, the charge
+            // and the decision append, in the pipeline's order.
+            assert!(pipeline.decide(&chain, &limited_call, now).is_allow());
+            group.bench_function(format!("decide_limited_{s}/{kinds}"), |b| {
+                b.iter(|| pipeline.decide(black_box(&chain), &limited_call, now))
             });
         }
         assert!(store.audit.verify_chain().unwrap().ok);
