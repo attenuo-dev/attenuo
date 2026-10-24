@@ -6,7 +6,7 @@
 //! | Route | Auth | Purpose |
 //! |---|---|---|
 //! | `POST /approvals/{id}` | an ID token of the run's originating user, from a trusted `[[idps]]` | grant or decline (`by = "user"`) |
-//! | `GET /approvals/{id}` | that user's ID token, or a delegation token of the same run | the exact call, labels (and matched arguments, `untrusted_args`), state and expiry |
+//! | `GET /approvals/{id}` | that user's ID token, or a delegation token of the same run with live leases | the exact call, labels (and matched arguments, `untrusted_args`), state and expiry |
 //! | `POST /admin/approvals/{id}` | admin bearer | grant or decline as an operator (`by = "operator"`) |
 //! | `GET /admin/approvals/{id}`, `GET /admin/approvals?chain_id=` | admin bearer | one approval; the newest approvals of a run (console, CLI) |
 //!
@@ -373,6 +373,16 @@ pub async fn user_get(
         )?;
         if attenuo_core::chain_id_of(&verified.chain).as_deref() != Some(a.chain_id.0.as_str()) {
             // Not this run's: do not confirm the approval exists.
+            return Err(ApiError::not_found(format!("unknown approval `{id}`")));
+        }
+        // A token whose lease (or an ancestor's) was revoked or has expired speaks for no
+        // agent any more, though its signature still verifies (SR-60): answer it as one of
+        // another run.
+        let chain = verified.chain.clone();
+        let live = state
+            .blocking(move |s| s.leases.check_all(&chain.leases(), now).map(|st| st.active))
+            .await?;
+        if !live {
             return Err(ApiError::not_found(format!("unknown approval `{id}`")));
         }
     } else {

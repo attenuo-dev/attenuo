@@ -1289,3 +1289,41 @@ async fn authzen_takes_the_approval_token_in_context() {
     assert_eq!(v["decision"], false, "{v}");
     assert_eq!(v["context"]["reason"], "approval_invalid");
 }
+
+/// SR-60: a sub-agent whose lease was revoked still holds a token whose signature verifies.
+/// `GET /approvals/{id}` must not show it its run's approvals (the exact call, the labels, and
+/// for a granted one the approval token) any more than a call would be allowed.
+#[tokio::test]
+async fn a_revoked_hop_cannot_read_its_runs_approvals_sr60() {
+    let h = Harness::start_with(|c| c.token.require_actor_auth = false).await;
+    let root = h.root().await;
+    let coder = h.exchange(&root, "coder").await;
+    let reviewer = h.exchange(&root, "reviewer").await;
+    h.taint(&coder).await;
+    let g = h.gated(&coder, "alice/site").await;
+    h.grant_as_alice(&g.approval_id).await;
+    let get = |bearer: String| {
+        let url = h.server.url(&format!("/approvals/{}", g.approval_id));
+        let client = h.client.clone();
+        async move { client.get(url).bearer_auth(bearer).send().await.unwrap() }
+    };
+    let v: Value = get(reviewer.clone()).await.json().await.unwrap();
+    assert!(v["approval_token"].is_string(), "{v}");
+    let (_, reviewer_lease) = h.run_of(&reviewer);
+    let resp = h
+        .client
+        .post(
+            h.server
+                .url(&format!("/admin/leases/{reviewer_lease}/revoke")),
+        )
+        .bearer_auth(ADMIN)
+        .json(&json!({"reason": "compromised"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(get(reviewer).await.status(), StatusCode::NOT_FOUND);
+    // The live hops of the run still see it.
+    assert_eq!(get(coder).await.status(), StatusCode::OK);
+    assert_eq!(get(root).await.status(), StatusCode::OK);
+}
