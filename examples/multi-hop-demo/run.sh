@@ -146,6 +146,8 @@ note "The coder authenticates as itself (its secret on stdin). The parent's last
 note "get_file_contents only under acme/, so a capability with no repo constraint is wider: refused."
 step 1 'printf "%s\n" demo-coder-secret | ATTENUO_TOKEN="$PLANNER" attenuo token exchange --actor coder --client-secret-stdin --cap github:get_file_contents'
 expect "is not covered by the parent"
+WIDEN_DECISION="$(field decision)"
+[ -n "$WIDEN_DECISION" ] || { echo "!! expected the refusal to name its audit record" >&2; exit 1; }
 
 say "4. Exchange 2, planner -> coder (hop 2), narrowed at every point"
 note "repo narrowed from acme/ to acme/api, a distinct limit of 1 on repo (one repository per run),"
@@ -164,6 +166,7 @@ say "6. Exchange 3, refused: the coder tries to hand its token to a reviewer age
 note "The reviewer authenticates fine, but the coder's token carries may_act: []."
 step 1 'printf "%s\n" demo-reviewer-secret | ATTENUO_TOKEN="$CODER" attenuo token exchange --actor reviewer --client-secret-stdin --cap '"'"'{"server":"github","tool":"get_file_contents","constraints":{"repo":{"op":"equals","value":"acme/api"}}}'"'"''
 expect "is not permitted to act on this token (may_act)"
+expect "decision "
 
 say "7. The coder reads the file it was asked to fix: allowed"
 step 0 'ATTENUO_TOKEN="$CODER" attenuo call --server github --tool get_file_contents --arg repo=acme/api --arg path=src/lib.rs'
@@ -201,9 +204,14 @@ expect lease_revoked
 say "14. The audit log records every decision, and its hash chain checks out"
 step 0 'attenuo audit tail -n 50'
 step 0 'attenuo audit verify'
-expect "audit chain OK: 12 entries verified"
+expect "audit chain OK: 14 entries verified"
 
-say "15. The decision chain of the refused write"
+say "15. The refused widening exchange is in the log too"
+note "A refused exchange whose subject token verified is a deny record against the parent's chain."
+step 0 'attenuo audit show --id "$WIDEN_DECISION"'
+expect exchange_widening
+
+say "16. The decision chain of the refused write"
 note "The record names both hops, the policy that decided, the leases (revoked now) and its hashes."
 step 0 'attenuo audit show --id "$WRITE_DECISION"'
 expect no_writes_to_default_branch
