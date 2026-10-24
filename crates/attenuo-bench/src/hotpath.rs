@@ -17,6 +17,13 @@
 //! | `limits` | `trusted` | none | `calls` and `sum` (on `n`) on both capabilities, in both hops |
 //! | `limits_calls` | `trusted` | none | `calls` only (no `sum`, so no `synchronous=FULL` charge) |
 //! | `both` | as `labels` | as `labels` | as `limits` |
+//! | `usage` | as `baseline` | none | no limits; `[policy] track_usage = true` |
+//!
+//! Run usage (`context.usage`) is kept only when it can matter: no policy here reads it and
+//! no catalog entry names `amount` or `destination`, so in every configuration but `usage`
+//! an allowed `destructive` call makes no usage write. `usage` forces it, so `usage` against
+//! `baseline` is the cost of that write (one lease-store transaction per allowed destructive
+//! call, as every such call paid between #59 and the elision).
 //!
 //! Every allowed call's answer is recorded since #42 (a `tool_result` append), trusted or not,
 //! so `baseline` already has the result append; an untrusted answer adds the run-label write
@@ -81,6 +88,9 @@ pub enum HotConfig {
     LimitsCalls,
     /// Labels and limits together.
     Both,
+    /// As `baseline`, with `[policy] track_usage = true`: every allowed destructive call
+    /// charges the run-usage counters, which no policy here reads.
+    Usage,
 }
 
 impl HotConfig {
@@ -91,6 +101,7 @@ impl HotConfig {
             HotConfig::Limits => "limits",
             HotConfig::LimitsCalls => "limits_calls",
             HotConfig::Both => "both",
+            HotConfig::Usage => "usage",
         }
     }
     fn labels(self) -> bool {
@@ -104,7 +115,7 @@ impl HotConfig {
         match self {
             HotConfig::Limits | HotConfig::Both => Some(json!({"calls": calls, "sum": sum})),
             HotConfig::LimitsCalls => Some(json!({"calls": calls})),
-            HotConfig::Baseline | HotConfig::Labels => None,
+            HotConfig::Baseline | HotConfig::Labels | HotConfig::Usage => None,
         }
     }
 }
@@ -208,8 +219,9 @@ when { resource.destructive && context.session.tainted && !context.approval.pres
 "#;
 
 /// The bench's server config with the catalog this module needs: an `n` argument on both
-/// tools, and `output = "trusted"` on both unless `untrusted`.
-fn config_text(base: String, untrusted: bool) -> Result<String> {
+/// tools, `output = "trusted"` on both unless `untrusted`, and `track_usage = true` when
+/// `track_usage`.
+fn config_text(base: String, untrusted: bool, track_usage: bool) -> Result<String> {
     let output = if untrusted {
         ""
     } else {
@@ -243,6 +255,13 @@ fn config_text(base: String, untrusted: bool) -> Result<String> {
             "bench config template changed; cannot patch {from}"
         );
         s = s.replace(&from, &to);
+    }
+    if track_usage {
+        ensure!(
+            s.contains("\n[policy]\n"),
+            "bench config template has no [policy]"
+        );
+        s = s.replacen("\n[policy]\n", "\n[policy]\ntrack_usage = true\n", 1);
     }
     Ok(s)
 }
@@ -323,6 +342,7 @@ async fn start(
     args: &HotPathArgs,
     label: &str,
     untrusted: bool,
+    track_usage: bool,
     policy: &str,
     limits: Option<&Value>,
 ) -> Result<Server> {
@@ -342,6 +362,7 @@ async fn start(
             metrics_port,
         ),
         untrusted,
+        track_usage,
     )?;
     let cfg_path = dir.join("config.toml");
     std::fs::write(&cfg_path, cfg)?;
@@ -676,8 +697,9 @@ fn find_key<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
     }
 }
 
-/// One more call of `cell`, and what its decision record says: how many counters it charged
-/// and how many label sources it names. Checks that the configuration does what it claims.
+/// One more call of `cell`, and what its decision record says: how many counters it charged,
+/// how many label sources it names, and whether it carries run usage. Checks that the
+/// configuration does what it claims.
 async fn probe(http: &reqwest::Client, srv: &mut Server, cell: Cell) -> Result<Value> {
     let resp = http
         .post(format!("{}/mcp/{UPSTREAM}", srv.ep.attenuo))
@@ -708,7 +730,12 @@ async fn probe(http: &reqwest::Client, srv: &mut Server, cell: Cell) -> Result<V
             .and_then(Value::as_array)
             .map_or(0, Vec::len)
     };
-    Ok(json!({"cell": cell.label(), "charged": len("charged"), "tainted_by": len("tainted_by")}))
+    Ok(json!({
+        "cell": cell.label(),
+        "charged": len("charged"),
+        "tainted_by": len("tainted_by"),
+        "usage": find_key(&rec, "usage").is_some_and(|u| !u.is_null()),
+    }))
 }
 
 async fn verify(http: &reqwest::Client, label: &str, srv: &Server) -> Result<()> {
@@ -737,16 +764,18 @@ fn render(r: &HotReport) -> String {
     let mut s = String::from(
         "### Configuration check\n\n\
          One extra call per configuration and call after the runs: counters its decision \
-         charged and label sources (`labels.tainted_by`) in its record.\n\n\
-         | config | call | counters charged | tainted_by |\n|---|---|---|---|\n",
+         charged, label sources (`labels.tainted_by`) and whether it carries run usage \
+         (`usage`) in its record.\n\n\
+         | config | call | counters charged | tainted_by | usage |\n|---|---|---|---|---|\n",
     );
     for c in &r.checks {
         s.push_str(&format!(
-            "| {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} |\n",
             c["config"].as_str().unwrap_or(""),
             c["cell"].as_str().unwrap_or(""),
             c["charged"],
-            c["tainted_by"]
+            c["tainted_by"],
+            c["usage"]
         ));
     }
     s.push_str(
@@ -874,6 +903,7 @@ pub async fn run(args: &HotPathArgs) -> Result<()> {
             args,
             c.label(),
             c.labels(),
+            c == HotConfig::Usage,
             &policy,
             limits.as_ref(),
         )
@@ -980,6 +1010,7 @@ pub async fn run(args: &HotPathArgs) -> Result<()> {
             args,
             "approval",
             true,
+            false,
             &policy,
             None,
         )
@@ -1034,10 +1065,13 @@ mod tests {
     #[test]
     fn config_patch_applies_to_the_bench_template() {
         let base = render_config(1, 2, std::path::Path::new("/p"), ":memory:", "normal", 3);
-        let trusted = config_text(base.clone(), false).unwrap();
+        let trusted = config_text(base.clone(), false, false).unwrap();
+        assert!(!trusted.contains("track_usage"));
+        let tracked = config_text(base.clone(), false, true).unwrap();
+        assert_eq!(tracked.matches("track_usage = true").count(), 1);
         assert_eq!(trusted.matches("output = \"trusted\"").count(), 2);
         assert_eq!(trusted.matches("n = \"long\"").count(), 2);
-        let untrusted = config_text(base, true).unwrap();
+        let untrusted = config_text(base, true, false).unwrap();
         assert!(!untrusted.contains("output ="));
         assert_eq!(untrusted.matches("n = \"long\"").count(), 2);
     }

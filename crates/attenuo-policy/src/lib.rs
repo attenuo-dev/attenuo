@@ -97,6 +97,9 @@
 //! `amount` input over them (`0` when the catalog names none); `usage.destination_seen` whether
 //! the catalog's `destination` input value appeared in one of them. The server keeps usage only
 //! for tools the catalog marks destructive; for any other tool all three are zero or false.
+//! It keeps it at all only when it can matter ([`PolicyEngine::tracks_usage`]): some loaded
+//! policy reads `context.usage`, the catalog declares `amount` or `destination`, or
+//! [`TrackUsage::Always`]; otherwise every tool sees zeros, which no loaded policy reads.
 //! Nothing refuses a call because of usage unless a policy says so, which is how a deployment
 //! writes limits without a number in every token, hard (`forbid`) or soft
 //! (`@obligation("approval")`).
@@ -216,6 +219,7 @@ mod lint;
 mod request;
 mod schema;
 pub mod testing;
+mod usage;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -236,6 +240,7 @@ pub use catalog::{
 pub use lint::{lint, LintIssue, LintReport, LintSeverity};
 pub use lint::{lint_with_options, policy_action_names, LintOptions};
 pub use schema::{action_id, default_user_attrs, DEFAULT_SCHEMA, GENERIC_ACTION};
+pub use usage::{policies_read_usage, TrackUsage};
 
 /// The starter policy set shipped with the crate (`policies/default.cedar`).
 ///
@@ -487,6 +492,7 @@ pub struct PolicyEngineBuilder {
     unknown_tools: UnknownTools,
     legacy_bare_actions: bool,
     annotation_import: AnnotationImport,
+    track_usage: TrackUsage,
 }
 
 impl Default for PolicyEngineBuilder {
@@ -505,7 +511,15 @@ impl PolicyEngineBuilder {
             unknown_tools: UnknownTools::default(),
             legacy_bare_actions: false,
             annotation_import: AnnotationImport::default(),
+            track_usage: TrackUsage::default(),
         }
+    }
+
+    /// Whether the server keeps run usage when nothing reads it (`[policy] track_usage`).
+    /// Default [`TrackUsage::Auto`]; see [`PolicyEngine::tracks_usage`].
+    pub fn with_track_usage(mut self, track_usage: TrackUsage) -> Self {
+        self.track_usage = track_usage;
+        self
     }
 
     /// Whether MCP tool annotations reported through [`PolicyEngine::import_annotations`] are
@@ -590,7 +604,14 @@ impl PolicyEngineBuilder {
             text.push('\n');
         }
         let loaded = load_policies(&text, &schema)?;
+        let catalog_names_usage = self
+            .catalog
+            .iter()
+            .any(|(_, a)| a.amount.is_some() || a.destination.is_some());
         Ok(PolicyEngine {
+            policies_read_usage: loaded.reads_usage,
+            catalog_names_usage,
+            track_usage: self.track_usage,
             schema,
             schema_text,
             policies: loaded.policies,
@@ -613,6 +634,8 @@ struct LoadedPolicies {
     policies: PolicySet,
     obligations: Obligations,
     warnings: Vec<String>,
+    /// Some policy may read `context.usage` ([`policies_read_usage`]).
+    reads_usage: bool,
 }
 
 /// The forbids annotated `@obligation("approval")`, and the policy set without them, used to
@@ -712,6 +735,7 @@ fn load_policies(text: &str, schema: &Schema) -> Result<LoadedPolicies, PolicyEr
         Some(set)
     };
     Ok(LoadedPolicies {
+        reads_usage: policies_read_usage(&policies),
         policies,
         obligations: Obligations {
             approval_ids,
@@ -818,6 +842,11 @@ pub struct PolicyEngine {
     authorizer: Authorizer,
     validation_warnings: Vec<String>,
     request_cache: request::RequestCache,
+    /// Some loaded policy may read `context.usage`; recomputed on reload.
+    policies_read_usage: bool,
+    /// The catalog declares `amount` or `destination` for some tool.
+    catalog_names_usage: bool,
+    track_usage: TrackUsage,
 }
 
 impl PolicyEngine {
@@ -1107,6 +1136,7 @@ impl PolicyEngine {
         self.policies = loaded.policies;
         self.obligations = loaded.obligations;
         self.validation_warnings = loaded.warnings;
+        self.policies_read_usage = loaded.reads_usage;
         // The cached request parts do not depend on the policies, but a reload is the
         // operator's "start from scratch", so it starts with an empty cache too.
         self.request_cache.clear();
@@ -1167,6 +1197,33 @@ impl PolicyEngine {
     /// The policy for tools that are not in the catalog.
     pub fn unknown_tools(&self) -> UnknownTools {
         self.unknown_tools
+    }
+
+    /// Whether the server should keep run usage (`context.usage`, run-limits design section
+    /// 3.5) for calls to destructive tools under this engine: some loaded policy may read
+    /// `context.usage` ([`policies_read_usage`]), the catalog declares `amount` or
+    /// `destination` for some tool, or `[policy] track_usage = true`. Decided at build and at
+    /// every [`reload_policies_str`](Self::reload_policies_str), so a call pays nothing to find
+    /// out. When `false`, keeping usage would cost a store write per allowed destructive call
+    /// for figures no loaded policy can observe, so the server skips it and evaluates with
+    /// zeros.
+    pub fn tracks_usage(&self) -> bool {
+        self.track_usage == TrackUsage::Always
+            || self.policies_read_usage
+            || self.catalog_names_usage
+    }
+
+    /// Why [`tracks_usage`](Self::tracks_usage) is what it is, for the server's log: the
+    /// reasons that hold (`"policy"`, `"catalog"`, `"config"`), empty when usage is not kept.
+    pub fn usage_tracking_reasons(&self) -> Vec<&'static str> {
+        [
+            (self.policies_read_usage, "policy"),
+            (self.catalog_names_usage, "catalog"),
+            (self.track_usage == TrackUsage::Always, "config"),
+        ]
+        .into_iter()
+        .filter_map(|(on, why)| on.then_some(why))
+        .collect()
     }
 
     /// Whether the deprecated bare action ids are in use
