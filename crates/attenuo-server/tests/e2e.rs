@@ -1583,6 +1583,84 @@ async fn revoked_token_cannot_list_tools_over_the_proxy() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// LangChain's MCP adapter opens a session per call, so after a revocation its next call fails
+/// at `initialize`, before any `tools/call`. That refusal is a `deny` record with the lease
+/// reason, the verified token's subject and chain, and the proxied server, and it is counted in
+/// `decisions_total`. A token that does not verify leaves no record.
+#[tokio::test]
+async fn initialize_on_a_revoked_lease_is_audited() {
+    let h = Harness::start().await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let child = h
+        .exchange(&root.token, "coder", &["github:read_file"])
+        .await;
+    h.admin_post(
+        &format!("/admin/leases/{}/revoke", root.lease),
+        json!({"reason": "agent session compromised"}),
+    )
+    .await;
+    let before = h.audit_entries().await;
+    assert_eq!(
+        before.last().unwrap()["record"]["tool"],
+        "admin.lease.revoke"
+    );
+
+    let initialize = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                   "clientInfo": {"name": "langchain-mcp-adapters", "version": "0"}}});
+    let open = |token: String| {
+        let req = h
+            .client
+            .post(h.url("/mcp/github"))
+            .header("accept", "application/json, text/event-stream")
+            .bearer_auth(token)
+            .json(&initialize);
+        async move { req.send().await.unwrap() }
+    };
+    let resp = open(child.token.clone()).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let decision_id = resp.headers()["x-attenuo-decision-id"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["data"]["reason"], "lease_revoked");
+    assert_eq!(body["error"]["data"]["decision_id"], decision_id);
+
+    let after = h.audit_entries().await;
+    assert_eq!(after.len(), before.len() + 1);
+    let r = &after.last().unwrap()["record"];
+    assert_eq!(r["id"], decision_id);
+    assert_eq!(r["decision"], "deny");
+    assert_eq!(r["reason"], "lease_revoked");
+    assert_eq!(r["originating_subject"], "alice");
+    assert_eq!(r["agents"], json!(["planner", "coder"]));
+    assert_eq!(r["server"], "github");
+    assert_eq!(r["tool"], "initialize");
+    assert_eq!(r["leases"], json!([root.lease, child.lease]));
+    assert_eq!(h.admin_get("/admin/audit/verify").await["ok"], true);
+    assert!(h
+        .state
+        .metrics
+        .render()
+        .contains("attenuo_decisions_total{decision=\"deny\",reason=\"lease_revoked\"} 1\n"));
+
+    // Unauthenticated noise leaves no record: garbage, and the child token with its signature
+    // changed.
+    let (head, sig) = child.token.rsplit_once('.').unwrap();
+    let flipped = if sig.starts_with('A') { 'B' } else { 'A' };
+    let forged = format!("{head}.{flipped}{}", &sig[1..]);
+    for token in ["not-a-token".to_string(), forged] {
+        let resp = open(token).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(resp.headers().get("x-attenuo-decision-id").is_none());
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["data"]["reason"], "invalid_token");
+    }
+    assert_eq!(h.audit_entries().await.len(), after.len());
+    assert!(h.upstream.recorded_methods().is_empty());
+}
+
 #[tokio::test]
 async fn resources_and_unknown_methods_are_authorized_through_the_pipeline() {
     let h = Harness::start().await;

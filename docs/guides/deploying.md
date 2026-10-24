@@ -324,7 +324,7 @@ From the logs:
 
 From the audit log (`GET /admin/audit`, `attenuo audit tail`):
 
-- The count of denies by reason. A jump in `capability_denied` or `policy_deny` for one agent often means a prompt-injected agent. A jump in `lease_expired` means agents that stopped renewing.
+- The count of denies by reason. A jump in `capability_denied` or `policy_deny` for one agent often means a prompt-injected agent. A jump in `lease_expired` means agents that stopped renewing. `lease_revoked` denies after a revocation, under `initialize`, `tools/list` or a tool, mean an agent or its client is still using the revoked token.
 - Any `audit_error`, `lease_error` or `policy_error`. These are internal failures and every one denied a call.
 - `token.root` rows per user and agent. Root mints are the entry point of every chain.
 - `audit verify` on a schedule. It exits 1 on a broken chain.

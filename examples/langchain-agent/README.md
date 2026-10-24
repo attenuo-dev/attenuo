@@ -68,7 +68,7 @@ The dry-run output (shortened):
   ALLOWED create_issue {'repo': 'alice/public-docs', 'title': 'README: fix typo'}  after approval b89c31a2-... (one retry)
 [orchestrator] the session looks compromised: revoking its lease
   DENIED  read_file {'repo': 'alice/public-docs', ...}       HTTP 401 (lease gone)
-[audit] chain ok=True, 13 entries
+[audit] chain ok=True, 14 entries
 ```
 
 | Call | Result | Why |
@@ -80,7 +80,7 @@ The dry-run output (shortened):
 | `create_issue alice/public-docs` with the orchestrator's root token | held (`-32008`), then allowed | The token allows it, but `policy.cedar` holds every `create_issue` until a person approves it. The interceptor prints the approval id, the operator grants it (`AdminClient.grant_approval`, as `attenuo approval grant` does), and the interceptor retries the identical call once. |
 | `read_file` after the orchestrator's lease is revoked | HTTP 401 | Revocation cascades from the orchestrator's lease to the coder's. |
 
-The two JSON-RPC denials are in the audit log with the `decision` id they carried (`#6` and `#7` in the script's output; `#5` is the `tool_result` record of the allowed read). The approval is `#8` to `#12`: the held call (`approval_required`), the approval it opened (`approval_requested`), the grant (`approval_granted`), and the retry with its result (`policy_allow`, `tool_result`). The last call is different: `langchain-mcp-adapters` opens a new MCP session for each tool call, and a session cannot start on a revoked lease, so the proxy answers 401 before MCP begins. That is a transport error in the client, not an MCP error, and **it is not an audit record** in this version (the audit shows the revocation itself, `admin.lease.revoke`). The `denial_interceptor` in `agent.py` turns it into `LeaseRevoked` and stops the run. Against your own server:
+The two JSON-RPC denials are in the audit log with the `decision` id they carried (`#6` and `#7` in the script's output; `#5` is the `tool_result` record of the allowed read). The approval is `#8` to `#12`: the held call (`approval_required`), the approval it opened (`approval_requested`), the grant (`approval_granted`), and the retry with its result (`policy_allow`, `tool_result`). The last call is different: `langchain-mcp-adapters` opens a new MCP session for each tool call, and a session cannot start on a revoked lease, so the proxy answers 401 before MCP begins. That is a transport error in the client, not an MCP error. The audit log still records it: after the revocation itself (`#13`, `admin.lease.revoke`) comes `#14`, a `deny` of `github/initialize` with reason `lease_revoked`, the coder's chain and the id the 401 carried in `X-Attenuo-Decision-Id`, so the log shows the agent kept trying. The `denial_interceptor` in `agent.py` turns it into `LeaseRevoked` and stops the run. Against your own server:
 
 ```sh
 attenuo audit tail -n 10

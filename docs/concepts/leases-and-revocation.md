@@ -12,7 +12,7 @@ A lease is created when its token is issued. Its expiry is the earlier of "now p
 
 Before policy runs, the server checks every lease in the chain. A lease must be known, not revoked and not expired. If any check fails, the call is denied with one of these reasons: `lease_revoked`, `lease_expired` or `lease_unknown`. The token can still verify as a JWT. It makes no difference.
 
-Requests that carry no decision, such as `tools/list` or a session `GET`, get the same check. They are refused with HTTP 401.
+Requests that carry no decision, such as `initialize`, `tools/list` or a session `GET`, get the same check. They are refused with HTTP 401, and the refusal is a `deny` record with the same reason, so a client that opens a new session for every call still leaves a trace after the revocation.
 
 If the store cannot be read, the answer is deny (`lease_error`). Losing a row denies. It never allows.
 

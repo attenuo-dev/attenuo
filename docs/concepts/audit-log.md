@@ -11,7 +11,7 @@ attenuo writes one record for every decision it makes. The records are chained b
 - Every successful lease renewal.
 - Every approval opened for a gated call, and every grant or decline of one.
 
-Requests that carry no decision, such as `tools/list` and `ping`, are not recorded. Failed exchanges and failed renewals are not recorded either in v0.
+Requests that carry no decision, such as `tools/list` and `ping`, are not recorded while the token's leases are live. When they are not, the refusal is a `deny` record with the lease reason (`lease_revoked`, ...) and `tool` set to the method (`initialize`, `tools/list`, or `http.POST`, `http.GET`, `http.DELETE`), one per HTTP request, so an agent that keeps opening sessions after a revocation shows up. A token that does not verify is never recorded. Failed exchanges and failed renewals are not recorded in v0.
 
 ## What a record holds
 

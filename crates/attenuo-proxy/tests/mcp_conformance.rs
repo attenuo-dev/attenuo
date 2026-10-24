@@ -10,7 +10,8 @@
 //!   nothing.
 //! - **Passthrough** methods (`initialize`, `ping`, the four `*/list` methods,
 //!   `logging/setLevel`) and **notifications** need a live lease and no capability.
-//! - Nothing at all reaches the upstream for a revoked token.
+//! - Nothing at all reaches the upstream for a revoked token, and each refused request leaves
+//!   one deny record with the lease reason (passthrough methods and notifications included).
 //!
 //! Mapping and allowlist: `docs/design/server.md`, "MCP method coverage".
 
@@ -455,6 +456,22 @@ async fn revoked_tokens_reach_nothing() -> anyhow::Result<()> {
             "{} reached the upstream",
             case.method
         );
+        // Every refusal of a verified token leaves exactly one deny record with the lease
+        // reason: a decided method under its mapped tool (the decision), anything else under
+        // the allowlisted method or `http.POST` (the proxy's own record, so a client that
+        // opens a session per call still shows up after revocation).
+        let records = h.authorizer.decisions();
+        assert_eq!(records.len(), 1, "{}: {records:?}", case.method);
+        let r = &records[0];
+        assert_eq!(r.decision, Decision::Deny, "{}", case.method);
+        assert_eq!(r.reason, "lease_revoked", "{}", case.method);
+        assert_eq!(r.server, SERVER, "{}", case.method);
+        let tool = match case.class {
+            Class::Decided => case.tool,
+            Class::Passthrough => case.method,
+            Class::Notification => "http.POST",
+        };
+        assert_eq!(r.tool, tool, "{}", case.method);
     }
     Ok(())
 }
