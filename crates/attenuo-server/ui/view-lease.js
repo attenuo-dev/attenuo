@@ -1,5 +1,7 @@
 // Lease tree (#/lease/{id}): where a lease sits in its delegation tree, what a revoke would
-// reach, and (when the listener allows writes) the revoke itself behind a typed confirmation.
+// reach, and (when the listener allows writes) the revoke itself behind a typed confirmation:
+// of this lease and its subtree, of the whole chain, or of every lease of the originating user
+// (the last two through `POST /admin/leases/revoke`, previewed first).
 'use strict';
 
 import {
@@ -8,6 +10,10 @@ import {
 import { api, qs, showNotice } from './api.js';
 
 const CONFIRM_CHARS = 6;
+// Ids of each list a selector preview shows; the counts are always complete.
+const PREVIEW_IDS = 8;
+// Characters of a subject shown on a button; the whole subject is in its title.
+const SUBJECT_CHARS = 32;
 
 export async function leaseView(root, leaseId) {
   append(root, loading());
@@ -27,21 +33,39 @@ export async function leaseView(root, leaseId) {
 
 function render(root, leaseId, tree) {
   const self = tree.nodes[0];
+  const done = () => reload(root, leaseId);
   const revokeBtn = h('button', {
     type: 'button', class: 'danger', disabled: tree.would_revoke === 0,
     title: tree.would_revoke === 0 ? 'Nothing left to revoke in this subtree' : null,
-    on: { click: () => openRevoke(leaseId, tree, () => reload(root, leaseId)) },
+    on: { click: () => openRevoke(leaseId, tree, done) },
   }, 'Revoke…');
+  // An older server sends no chain_id; the tree's root is the same lease.
+  const chainId = self.chain_id ?? tree.root;
+  const chainBtn = h('button', {
+    type: 'button', class: 'danger', title: `Revoke every lease of the chain ${chainId}`,
+    on: { click: () => openSelectorRevoke({ chain_id: chainId }, done) },
+  }, 'Revoke chain…');
+  // Only a lease whose originating user was recorded at issue gets the user action; leases
+  // registered before the server kept subjects have none. The subject is caller-controlled
+  // text: it only ever becomes text nodes and attribute values (h() never parses HTML).
+  const subject = typeof self.subject === 'string' && self.subject !== '' ? self.subject : null;
+  const userBtn = subject !== null ? h('button', {
+    type: 'button', class: 'danger', title: `Revoke every lease issued for ${subject}`,
+    on: { click: () => openSelectorRevoke({ user: subject }, done) },
+  }, `Revoke all for ${clip(subject)}…`) : null;
 
   replace(root,
     h('section', { class: 'panel', 'aria-labelledby': 'lease-title' },
       h('header', null,
         h('h1', { id: 'lease-title' }, 'Lease ', mono(leaseId)),
-        revokeBtn),
+        h('div', { class: 'row lease-actions' }, revokeBtn, chainBtn, userBtn)),
       h('div', { class: 'row' }, leaseStatePill(self), self.agent ? h('span', null, 'issued to ', h('strong', null, self.agent)) : null),
       ancestorsPath(tree),
       kv([
         ['Chain (root lease)', link(['lease', tree.root], mono(tree.root))],
+        ['Originating user', subject !== null
+          ? h('strong', { class: 'subject' }, subject)
+          : h('span', { class: 'muted' }, 'not recorded (issued before the server kept subjects)')],
         ['Expires', time(self.expires_at)],
         ['Issued', self.issued_seq !== null ? h('span', null, time(self.issued_at), ' at ', link(['entry', self.issued_seq], `seq ${self.issued_seq}`)) : h('span', { class: 'muted' }, 'no issuance record found')],
         ['A revoke now would change', h('strong', null, `${tree.would_revoke} lease${tree.would_revoke === 1 ? '' : 's'}`)],
@@ -209,6 +233,28 @@ async function loadRenewals(box, leaseId, root) {
 
 // ---- revoke -------------------------------------------------------------------------------
 
+/** A subject cut to SUBJECT_CHARS for a button label. */
+function clip(text) {
+  return text.length > SUBJECT_CHARS ? `${text.slice(0, SUBJECT_CHARS)}…` : text;
+}
+
+/**
+ * Open a modal dialog on <body>, labelled by the element with id `labelledBy`, holding
+ * `content`. Escape removes it, and so does leaving the page (the router removes every
+ * dialog, so a dialog never acts for a page that is gone). Returns {dialog, close}.
+ */
+function modal(labelledBy, content) {
+  const dialog = h('dialog', { 'aria-labelledby': labelledBy }, content);
+  const close = () => {
+    if (dialog.open) dialog.close();
+    dialog.remove();
+  };
+  dialog.addEventListener('cancel', () => dialog.remove());
+  document.body.append(dialog);
+  dialog.showModal();
+  return { dialog, close };
+}
+
 function openRevoke(leaseId, tree, done) {
   const tail = leaseId.slice(-CONFIRM_CHARS);
   const activeAgents = [...new Set(tree.nodes.filter((n) => n.active).map((n) => n.agent || 'unknown agent'))];
@@ -223,11 +269,7 @@ function openRevoke(leaseId, tree, done) {
   confirmInput.addEventListener('input', check);
   reasonInput.addEventListener('input', check);
 
-  const dialog = h('dialog', { 'aria-labelledby': 'revoke-title' });
-  const close = () => {
-    dialog.close();
-    dialog.remove();
-  };
+  let close = () => {};
   const form = h('form', {
     on: {
       submit: async (ev) => {
@@ -262,10 +304,158 @@ function openRevoke(leaseId, tree, done) {
   h('div', { class: 'field' }, h('label', { for: 'revoke-reason' }, 'Reason (recorded in the audit log)'), reasonInput),
   h('div', { class: 'field' }, h('label', { for: 'revoke-confirm' }, `Type the last ${CONFIRM_CHARS} characters of the lease id (${tail})`), confirmInput),
   err,
-  h('div', { class: 'buttons' }, h('button', { type: 'button', on: { click: close } }, 'Cancel'), go));
-  append(dialog, [form]);
-  dialog.addEventListener('cancel', () => dialog.remove());
-  document.body.append(dialog);
-  dialog.showModal();
+  h('div', { class: 'buttons' }, h('button', { type: 'button', on: { click: () => close() } }, 'Cancel'), go));
+  ({ close } = modal('revoke-title', form));
   reasonInput.focus();
+}
+
+// ---- revoke by chain or by user (POST /admin/leases/revoke) -------------------------------
+
+/** A selector as the dialog shows it: `chain_id` or `user`, then its value, as text. */
+function selectorText(selector) {
+  return 'chain_id' in selector
+    ? h('span', null, h('span', { class: 'muted' }, 'chain_id '), mono(selector.chain_id))
+    : h('span', null, h('span', { class: 'muted' }, 'user '), h('strong', { class: 'subject' }, selector.user));
+}
+
+/** The first PREVIEW_IDS ids of a response list, each a link to its lease page. */
+function idList(ids, count, truncated) {
+  if (!count) return h('span', { class: 'muted' }, 'none');
+  const shown = ids.slice(0, PREVIEW_IDS);
+  const more = count - shown.length;
+  return h('div', null,
+    h('ul', { class: 'idlist' }, shown.map((id) => h('li', null, link(['lease', id], mono(id))))),
+    more > 0 ? h('p', { class: 'small muted' }, `and ${more} more`) : null,
+    truncated ? h('p', { class: 'small muted' }, 'The server cut its id lists short; the counts are complete.') : null);
+}
+
+/**
+ * Revoke a whole chain ({chain_id}) or every lease of one originating user ({user}) through
+ * `POST /admin/leases/revoke`, in three steps inside one dialog: the preview
+ * (`?preview=true`, which writes nothing) with what the selector matched and what would
+ * change; a reason and a typed confirmation; then the result with the audit record it wrote.
+ */
+function openSelectorRevoke(selector, done) {
+  const isChain = 'chain_id' in selector;
+  const title = isChain ? 'Revoke chain' : 'Revoke all leases of a user';
+  const box = h('div', { class: 'stack' });
+  let close = () => {};
+  let dialog = null;
+  const ctx = { selector, title, box, done, close: () => close(), live: () => dialog.isConnected };
+  const cancel = h('button', { type: 'button', on: { click: () => close() } }, 'Cancel');
+  const status = h('div', { class: 'stack', 'aria-live': 'polite' }, loading());
+  append(box, [
+    h('h2', { id: 'selector-title' }, title),
+    intro(isChain),
+    kv([['Selector', selectorText(selector)]]),
+    status,
+    h('div', { class: 'buttons' }, cancel),
+  ]);
+  ({ dialog, close } = modal('selector-title', box));
+  cancel.focus();
+
+  api(`/admin/leases/revoke${qs({ preview: true })}`, { method: 'POST', body: selector, quiet: [400, 404] })
+    .then((preview) => {
+      if (!ctx.live()) return;
+      replace(box, confirmForm(preview, ctx));
+      box.querySelector('#selector-reason').focus();
+    })
+    .catch((e) => {
+      if (!ctx.live() || e.status === 401) return;
+      replace(status, h('p', { class: 'callout bad', role: 'alert' }, `Could not preview the revocation: ${e.message}`));
+    });
+}
+
+function intro(isChain) {
+  return h('p', null, isChain
+    ? 'This revokes every lease of the delegation chain: its first hop and everything delegated from it.'
+    : 'This revokes every lease issued for this originating user, under any issuer, each with everything delegated from it.',
+  ' Agents holding them are refused on their next call. It cannot be undone.');
+}
+
+/** Step two: the preview, the reason and confirmation fields, and the Revoke button. */
+function confirmForm(preview, ctx) {
+  const { selector } = ctx;
+  const isChain = 'chain_id' in selector;
+  const want = isChain ? selector.chain_id.slice(-CONFIRM_CHARS) : String(preview.revoked_count);
+  const reasonInput = h('input', { id: 'selector-reason', autocomplete: 'off', required: true, maxlength: 500, value: 'revoked by admin' });
+  const confirmInput = h('input', { id: 'selector-confirm', autocomplete: 'off', spellcheck: 'false', inputmode: isChain ? null : 'numeric', maxlength: 64, required: true });
+  const nothing = preview.revoked_count === 0;
+  const go = h('button', { type: 'submit', class: 'danger', disabled: true }, 'Revoke');
+  const err = h('p', { class: 'callout bad', role: 'alert' });
+  err.hidden = true;
+  const check = () => {
+    go.disabled = nothing || !(confirmInput.value.trim() === want && reasonInput.value.trim());
+  };
+  confirmInput.addEventListener('input', check);
+  reasonInput.addEventListener('input', check);
+
+  return h('form', {
+    on: {
+      submit: async (ev) => {
+        ev.preventDefault();
+        if (go.disabled) return;
+        go.disabled = true;
+        err.hidden = true;
+        let res;
+        try {
+          res = await api('/admin/leases/revoke', {
+            method: 'POST', body: { ...selector, reason: reasonInput.value.trim() }, quiet: [400, 404],
+          });
+        } catch (e) {
+          if (e.status === 401 || !ctx.live()) return;
+          err.textContent = e.status === 404
+            ? 'Writes are disabled on this listener. Set [admin_ui] allow_write = true to revoke from the console, or use attenuo lease revoke against the main listener.'
+            : `The revoke failed: ${e.message}`;
+          err.hidden = false;
+          check();
+          return;
+        }
+        // The page changed while the revocation ran: the router has removed the dialog.
+        if (!ctx.live()) return;
+        replace(ctx.box, resultView(preview, res, ctx));
+        ctx.box.querySelector('#selector-close').focus();
+        showNotice(`Revoked ${res.revoked_count} lease${res.revoked_count === 1 ? '' : 's'} (the preview said ${preview.revoked_count}).`);
+        // Refresh the page behind the dialog so the tree shows the revoked leases.
+        await ctx.done();
+      },
+    },
+  },
+  h('h2', { id: 'selector-title' }, ctx.title),
+  intro(isChain),
+  kv([
+    ['Selector', selectorText(selector)],
+    ['Leases matched', h('strong', null, String(preview.matched_count))],
+    ['Leases that change', h('strong', null, String(preview.revoked_count))],
+    ['Matched', idList(preview.matched, preview.matched_count, preview.truncated)],
+    ['Would change', idList(preview.revoked, preview.revoked_count, preview.truncated)],
+  ]),
+  h('p', { class: 'small muted' }, 'This is a preview: nothing is revoked yet. Leases already revoked are not counted; expired ones are, since a renewal could bring them back.'),
+  nothing ? h('p', { class: 'callout' }, 'Nothing is left to revoke for this selector.') : null,
+  h('div', { class: 'field' }, h('label', { for: 'selector-reason' }, 'Reason (recorded in the audit log)'), reasonInput),
+  h('div', { class: 'field' }, h('label', { for: 'selector-confirm' }, isChain
+    ? `Type the last ${CONFIRM_CHARS} characters of the chain id (${want})`
+    : `Type the number of leases that change (${want})`), confirmInput),
+  err,
+  h('div', { class: 'buttons' }, h('button', { type: 'button', on: { click: ctx.close } }, 'Cancel'), go));
+}
+
+/** Step three: what the revocation did, and a link to the audit record it wrote. */
+function resultView(preview, res, ctx) {
+  return h('div', { class: 'stack' },
+    h('h2', { id: 'selector-title' }, `${ctx.title}: done`),
+    h('p', { class: 'callout good', role: 'status' },
+      `Revoked ${res.revoked_count} lease${res.revoked_count === 1 ? '' : 's'}.`),
+    kv([
+      ['Selector', selectorText(ctx.selector)],
+      ['Reason', res.reason ?? ''],
+      ['Leases matched', h('strong', null, String(res.matched_count))],
+      ['Leases revoked', h('strong', null, String(res.revoked_count))],
+      ['The preview said', String(preview.revoked_count)],
+      ['Revoked', idList(res.revoked, res.revoked_count, res.truncated)],
+      ['Audit record', res.audit_id
+        ? link(['record', res.audit_id], mono(res.audit_id), { title: 'Open the audit record of this revocation' })
+        : h('span', null, 'not written: the revocation stands, but the server could not record it (see its log)')],
+    ]),
+    h('div', { class: 'buttons' }, h('button', { id: 'selector-close', type: 'button', class: 'primary', on: { click: ctx.close } }, 'Close')));
 }

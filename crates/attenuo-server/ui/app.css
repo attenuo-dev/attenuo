@@ -515,6 +515,12 @@ ul.leases ul { padding-left: var(--s5); border-left: 1px dashed var(--border); m
 .lease-node .mono { overflow-wrap: anywhere; }
 .renewals { padding: 0 var(--s2) var(--s2) var(--s4); font-size: var(--t-sm); }
 
+.lease-actions { margin-left: auto; }
+/* Subjects are caller-controlled and may be long or have no break points. */
+strong.subject { overflow-wrap: anywhere; }
+ul.idlist { list-style: none; margin: 0; padding: 0; max-height: 12rem; overflow-y: auto; }
+ul.idlist .mono { overflow-wrap: anywhere; }
+
 .path { display: flex; flex-wrap: wrap; gap: var(--s1) var(--s2); align-items: center; font-size: var(--t-sm); }
 .path .sep { color: var(--muted); }
 
