@@ -14,6 +14,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, PoisonError, TryLockError, 
 use std::time::Duration;
 
 use attenuo_core::fingerprint::Fingerprint;
+use attenuo_core::limits::MAX_LIMIT;
 use attenuo_core::{Charge, DecisionRecord, LeaseId, LimitKind};
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use time::format_description::well_known::Rfc3339;
@@ -2558,23 +2559,61 @@ fn refund_in(
             freed += 1;
         }
     }
-    // Every other counter: what the decision logged. A `distinct` limit's count moves with
-    // its values, above, not with the amounts logged for it.
-    tx.prepare_cached(
-        "UPDATE budget_counters SET used = MAX(0, used - ( \
-             SELECT SUM(c.amount) FROM budget_charges c WHERE c.decision_id = ?1 \
-               AND c.lease = budget_counters.lease AND c.cap = budget_counters.cap \
-               AND c.kind = budget_counters.kind AND c.arg = budget_counters.arg \
-               AND c.value = budget_counters.value)) \
-         WHERE kind NOT IN (?2, ?3) \
-           AND EXISTS (SELECT 1 FROM budget_charges c WHERE c.decision_id = ?1 \
-               AND c.lease = budget_counters.lease AND c.cap = budget_counters.cap \
-               AND c.kind = budget_counters.kind AND c.arg = budget_counters.arg \
-               AND c.value = budget_counters.value)",
-    )?
-    .execute(params![decision_id, DISTINCT_VALUE_KIND, distinct])?;
+    // Every other counter: what the decision logged, row by row, saturating at 0. One
+    // `UPDATE` per logged row rather than a `SUM` of them: two rows of one decision on one
+    // counter (run usage of up to `MAX_LIMIT` each) would overflow SQLite's integer `SUM`
+    // and fail the refund, where the memory store succeeds (fuzzing round 2, FZ2-3). A
+    // `distinct` limit's count moves with its values, above, not with the amounts logged.
+    let rows: Vec<(String, i64, String, String, String, i64)> = tx
+        .prepare_cached(
+            "SELECT lease, cap, kind, arg, value, amount FROM budget_charges \
+             WHERE decision_id = ?1 AND kind NOT IN (?2, ?3)",
+        )?
+        .query_map(params![decision_id, DISTINCT_VALUE_KIND, distinct], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+    let mut usage = Vec::new();
+    for (lease, cap, kind, arg, value, amount) in rows {
+        if USAGE_KINDS.contains(&kind.as_str()) {
+            usage.push((lease, cap, kind, arg, value));
+            continue;
+        }
+        tx.prepare_cached(
+            "UPDATE budget_counters SET used = MAX(0, used - ?6) \
+             WHERE lease = ?1 AND cap = ?2 AND kind = ?3 AND arg = ?4 AND value = ?5",
+        )?
+        .execute(params![lease, cap, kind, arg, value, amount])?;
+    }
     tx.prepare_cached("UPDATE budget_charges SET refunded_at = ?2 WHERE decision_id = ?1")?
         .execute(params![decision_id, fmt_time(at)?])?;
+    // A run-usage counter saturates at `MAX_LIMIT`, so what one decision logged is not what it
+    // added once the counter was full: recompute it from the unrefunded rows left (FZ2-4).
+    for (lease, cap, kind, arg, value) in usage {
+        let amounts: Vec<i64> = tx
+            .prepare_cached(
+                "SELECT amount FROM budget_charges WHERE lease = ?1 AND cap = ?2 AND kind = ?3 \
+                 AND arg = ?4 AND value = ?5 AND refunded_at IS NULL",
+            )?
+            .query_map(params![lease, cap, kind, arg, value], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        let total = amounts
+            .into_iter()
+            .fold(0u64, |t, a| t.saturating_add(u64::try_from(a).unwrap_or(0)))
+            .min(MAX_LIMIT);
+        tx.prepare_cached(
+            "UPDATE budget_counters SET used = ?6 \
+             WHERE lease = ?1 AND cap = ?2 AND kind = ?3 AND arg = ?4 AND value = ?5",
+        )?
+        .execute(params![lease, cap, kind, arg, value, to_i64(total)?])?;
+    }
     tx.commit()?;
     // Token-limit counters only (see `LeaseStore::refund`).
     Ok(limits as u64 + freed)
