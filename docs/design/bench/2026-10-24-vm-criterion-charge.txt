@@ -1,0 +1,32 @@
+# cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3 'budget_read_|charge_|append_file/1_hop|decide_file/1_hop'
+# 2026-10-24, main 77b5e8f plus the charge cells of perf/labels-limits-cost, rustc 1.99.1, 4-core shared VM, load average 5.9 at the start and 3.4 at the end
+# charge_*/calls_sum: 4 counters (calls and sum, 2 hops), the sum makes the transaction commit with synchronous=FULL; charge_*/calls: 2 counters, commits at the store's durability
+
+decide/budget_read_memory/calls_sum
+                        time:   [3.3506 µs 3.4792 µs 3.6123 µs]
+decide/charge_memory/calls_sum
+                        time:   [77.759 µs 83.559 µs 88.577 µs]
+decide/budget_read_memory/calls
+                        time:   [1.9996 µs 2.0311 µs 2.0697 µs]
+decide/charge_memory/calls
+                        time:   [75.744 µs 77.773 µs 79.767 µs]
+decide/append_file/1_hop
+                        time:   [123.43 µs 160.60 µs 204.81 µs]
+decide/decide_file/1_hop
+                        time:   [143.16 µs 160.59 µs 182.39 µs]
+decide/budget_read_file/calls_sum
+                        time:   [4.6303 µs 4.7080 µs 4.8263 µs]
+decide/charge_file/calls_sum
+                        time:   [573.93 µs 622.99 µs 680.24 µs]
+decide/budget_read_file/calls
+                        time:   [3.5194 µs 3.6239 µs 3.7579 µs]
+decide/charge_file/calls
+                        time:   [37.247 µs 38.976 µs 40.875 µs]
+decide/budget_read_file_full/calls_sum
+                        time:   [4.5371 µs 4.5729 µs 4.6111 µs]
+decide/charge_file_full/calls_sum
+                        time:   [426.30 µs 447.68 µs 471.18 µs]
+decide/budget_read_file_full/calls
+                        time:   [3.3756 µs 3.4104 µs 3.4528 µs]
+decide/charge_file_full/calls
+                        time:   [405.44 µs 422.07 µs 440.24 µs]

@@ -10,6 +10,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ### Documentation
 
+- Deploy guide: an upgrade note that run limits are enforced only once every replica and external PEP runs 0.2 or later, since older servers accept and ignore `limits`, with how to spot the mixed-version window in `audit tail`. Threat model: a residual-risk entry for the approval-token channel (`GET /approvals/{id}` answers any hop of the run; the token is bound to the calling hop, so the leak is the fact of the approval, not the ability to spend it).
 - Proposed design for run limits ([docs/design/run-limits.md](docs/design/run-limits.md), [ADR-0010](docs/decisions/0010-run-limits.md)): count, amount and per-destination budgets declared per token hop, charged against every ancestor hop in the decision's audit transaction, exposed to Cedar as `context.budget`; by a hand count of the injection suite it would deny 5 of 10 dev and 5 of 7 test attack calls allowed today, with no benign call lost. Nothing implemented.
 
 ### Evaluation
@@ -21,6 +22,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ### Performance
 
+- Measured what output labelling and run limits add to one proxied call (new `attenuo-bench hot-path`, file store, one client, 2-hop token, 5 interleaved runs): an untrusted-output label adds nothing measurable at the client (about 15 us server-side for the run-label write; the `tool_result` append of about 140 us is paid by every allowed call since #42); a `calls` limit adds about 120 to 190 us at p50; a `sum` limit adds about 0.8 to 1.0 ms and halves single-client throughput, because its charge commits with `synchronous=FULL`; an approval round (gated call, operator grant, retry) is about 3.3 ms at p50. New `decide` bench cells for the counter read and the charge. Details in `docs/design/performance.md`.
 - Measured the output-labelling cost: a `tool_result` append plus the run label is about 150 us on the file store at `normal` durability, about the same as the decision append, so an allowed call spends about twice as long in the audit log. Details in `docs/design/performance.md`.
 - Investigated the proxy's upstream round trip and the `blocking_pool` stage (`perf/proxy-upstream-hop`); no code change. The upstream client already shares one keep-alive pooled `reqwest::Client` and sends each request in one write; the gap to a direct call is CPU wake-up latency between calls on the test VM. Running decisions inline removed the blocking-pool hop but moved the time into the `upstream` stage and cut 8-client throughput, so decisions stay on the blocking pool. Details in `docs/design/performance.md`.
 
