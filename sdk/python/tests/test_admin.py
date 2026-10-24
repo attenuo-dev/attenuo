@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -14,6 +15,7 @@ from attenuo import (
     AsyncAdminClient,
     AttenuoError,
     AuditEntry,
+    AuditFilter,
     Capability,
     Prefix,
     Unauthorized,
@@ -289,3 +291,195 @@ async def test_async_context_manager() -> None:
         BASE, "t", transport=httpx.MockTransport(lambda r: httpx.Response(200))
     ) as a:
         assert a.server_url == BASE
+
+
+async def _iter(client: Any, *args: Any, **kwargs: Any) -> list[AuditEntry]:
+    it = client.audit_iter(*args, **kwargs)
+    if hasattr(it, "__aiter__"):
+        return [x async for x in it]
+    return list(it)
+
+
+async def test_audit_query_filter_and_desc_paging(make: Any) -> None:
+    # Newest first, filtered: the first page comes back short but `prev` says read on.
+    def handler(r: httpx.Request) -> httpx.Response:
+        q = dict(r.url.params)
+        if "before" not in q:
+            return httpx.Response(
+                200, json={"entries": [_entry(9, "deny")], "next": None, "prev": 9, "head": 12}
+            )
+        assert q["before"] == "9"
+        return httpx.Response(
+            200,
+            json={"entries": [_entry(4, "deny"), _entry(2, "deny")], "next": 10, "prev": None,
+                  "head": 12},
+        )  # fmt: skip
+
+    client, seen = make(handler)
+    flt = AuditFilter(decision="deny", kind=["decision", "exchange"], lease="l 1")
+    page = await call(client, "audit_query", flt, order="desc", limit=3)
+    assert (page.next, page.prev, page.head) == (None, 9, 12)
+    assert dict(seen[-1].url.params) == {
+        "order": "desc",
+        "limit": "3",
+        "decision": "deny",
+        "kind": "decision,exchange",
+        "lease": "l 1",
+    }
+    entries = await _iter(client, flt, order="desc", limit=3)
+    assert [e.seq for e in entries] == [9, 4, 2]
+    assert all(e.decision == "deny" for e in entries)
+    assert dict(seen[-1].url.params)["before"] == "9"
+
+
+async def test_audit_iter_asc_follows_next_and_formats_times(make: Any) -> None:
+    def handler(r: httpx.Request) -> httpx.Response:
+        start = int(r.url.params.get("from", "1"))
+        nxt = None if start >= 5 else start + 4
+        return httpx.Response(200, json={"entries": [_entry(start)], "next": nxt, "head": 5})
+
+    client, seen = make(handler)
+    since = datetime(2026, 10, 23, 9, 0, tzinfo=timezone.utc)
+    entries = await _iter(client, AuditFilter(since=since, until="2026-10-24T00:00:00Z"))
+    assert [e.seq for e in entries] == [1, 5]
+    assert dict(seen[0].url.params) == {
+        "order": "asc",
+        "limit": "1000",
+        "since": "2026-10-23T09:00:00+00:00",
+        "until": "2026-10-24T00:00:00Z",
+    }
+    with pytest.raises(ValueError):
+        await _iter(client, AuditFilter(since=datetime(2026, 10, 23)))
+
+
+async def test_audit_iter_refuses_a_cursor_that_does_not_move(make: Any) -> None:
+    client, _ = make(lambda r: httpx.Response(200, json={"entries": [], "prev": 5, "head": 9}))
+    with pytest.raises(AttenuoError):
+        await _iter(client, order="desc", before=5)
+
+
+def _detail(seq: int) -> dict[str, Any]:
+    return {
+        "entry": {"seq": seq, "hash": "h", "record": {"id": "0b7c", "kind": "decision",
+                  "chain_id": "root"}},
+        "lease_states": [
+            {"lease_id": "root", "known": True, "active": True, "parent": None,
+             "expires_at": "2026-10-23T10:00:00Z", "revoked_at": None, "revoke_reason": None},
+            {"lease_id": "gone", "known": False},
+        ],
+        "covered_by_checkpoint": {"seq": 10, "head_hash": "hh"},
+        "policy_reloaded_after": None,
+    }  # fmt: skip
+
+
+async def test_audit_entry_by_seq_and_by_record_id(make: Any) -> None:
+    client, seen = make(lambda r: httpx.Response(200, json=_detail(7)))
+    d = await call(client, "audit_entry", 7)
+    assert seen[-1].url.path == "/admin/audit/entries/7"
+    assert d.entry.seq == 7 and d.entry.chain_id == "root"
+    assert [(s.lease_id, s.known, s.active) for s in d.lease_states] == [
+        ("root", True, True),
+        ("gone", False, False),
+    ]
+    assert d.covered_by_checkpoint == {"seq": 10, "head_hash": "hh"}
+    assert d.policy_reloaded_after is None
+    d = await call(client, "audit_record", "0b7c-uuid")
+    assert seen[-1].url.path == "/admin/audit/records/0b7c-uuid"
+    assert d.entry.id == "0b7c"
+    with pytest.raises(ValueError):
+        await call(client, "audit_record", "..")
+
+
+async def test_audit_entry_not_found(make: Any) -> None:
+    client, _ = make(
+        lambda r: httpx.Response(404, json={"error": "not_found", "detail": "no entry at seq 99"})
+    )
+    with pytest.raises(ApiError) as e:
+        await call(client, "audit_entry", 99)
+    assert e.value.status == 404 and e.value.error == "not_found"
+
+
+async def test_audit_checkpoints(make: Any) -> None:
+    cps = [{"seq": 20, "head_hash": "a"}, {"seq": 10, "head_hash": "b"}]
+    client, seen = make(lambda r: httpx.Response(200, json={"checkpoints": cps, "prev": 10}))
+    page = await call(client, "audit_checkpoints", 30, 2)
+    assert seen[-1].url.path == "/admin/audit/checkpoints"
+    assert dict(seen[-1].url.params) == {"before": "30", "limit": "2"}
+    assert page.checkpoints == cps and page.prev == 10
+    await call(client, "audit_checkpoints")
+    assert dict(seen[-1].url.params) == {}
+
+
+def _node(lease: str, parent: str | None, active: bool = True) -> dict[str, Any]:
+    return {
+        "lease_id": lease, "parent": parent, "agent": "coder", "active": active,
+        "expires_at": "2026-10-23T19:20:00Z", "revoked_at": None, "revoke_reason": None,
+        "issued_at": None if parent is None else "2026-10-23T19:05:00Z",
+        "issued_seq": None if parent is None else 42,
+    }  # fmt: skip
+
+
+async def test_lease_tree(make: Any) -> None:
+    body = {
+        "root": "r", "ancestors": [_node("r", None)],
+        "nodes": [_node("l1", "r"), _node("l2", "l1", active=False)],
+        "would_revoke": 1, "truncated": False,
+    }  # fmt: skip
+    client, seen = make(lambda r: httpx.Response(200, json=body))
+    tree = await call(client, "lease_tree", "l1", max_nodes=50)
+    assert seen[-1].url.path == "/admin/leases/l1/tree"
+    assert dict(seen[-1].url.params) == {"max_nodes": "50"}
+    assert tree.root == "r" and tree.would_revoke == 1 and not tree.truncated
+    assert [n.lease_id for n in tree.nodes] == ["l1", "l2"]
+    assert tree.nodes[0].issued_seq == 42 and not tree.nodes[1].active
+    assert tree.ancestors[0].issued_at is None
+    await call(client, "lease_tree", "l1")
+    assert dict(seen[-1].url.params) == {}
+
+
+async def test_policies_and_check(make: Any) -> None:
+    listing = {
+        "path": "/etc/p.cedar", "sha256": "9f", "loaded_at": "2026-10-23T19:02:11Z",
+        "policy_ids": ["a"], "warnings": [], "policies": [{"id": "a", "text": "permit(...);"}],
+    }  # fmt: skip
+    check = {
+        "path": "/etc/p.cedar", "sha256": "41", "loaded_sha256": "9f",
+        "differs_from_loaded": True, "ok": False, "error_count": 1, "warning_count": 0,
+        "issues": [{"severity": "error", "stage": "validate", "message": "m", "line": 3}],
+        "policy_ids": ["a"],
+    }  # fmt: skip
+
+    def handler(r: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=check if r.url.path.endswith("/check") else listing)
+
+    client, seen = make(handler)
+    ps = await call(client, "policies")
+    assert seen[-1].url.path == "/admin/policies"
+    assert ps.policies == {"a": "permit(...);"} and ps.sha256 == "9f"
+    pc = await call(client, "policy_check")
+    assert seen[-1].url.path == "/admin/policies/check"
+    assert pc.differs_from_loaded and not pc.ok and pc.issues[0]["line"] == 3
+
+
+async def test_policy_evaluate(make: Any) -> None:
+    answer = {
+        "decision": "allow", "reason": "policy_allow", "policy_ids": ["a"], "diagnostics": [],
+        "lease_check": "skipped", "chain_source": "token", "token_expired": True,
+    }  # fmt: skip
+    client, seen = make(lambda r: httpx.Response(200, json=answer))
+    ev = await call(
+        client, "policy_evaluate", "github", "read_file", {"repo": "alice/x"}, token=" tok "
+    )
+    assert (seen[-1].method, seen[-1].url.path) == ("POST", "/admin/policies/evaluate")
+    sent = json.loads(seen[-1].content)
+    assert sent["token"] == "tok"
+    assert sent["resource"] == {"type": "tool", "id": "github/read_file"}
+    assert sent["context"] == {"input": {"repo": "alice/x"}}
+    assert ev.allowed and ev.token_expired and ev.policy_ids == ["a"]
+    assert ev.chain_source == "token" and ev.lease_check == "skipped"
+
+    await call(client, "policy_evaluate", "github", "read_file", chain={"hops": []})
+    sent = json.loads(seen[-1].content)
+    assert "token" not in sent and sent["subject"]["properties"] == {"chain": {"hops": []}}
+    with pytest.raises(ValueError):
+        await call(client, "policy_evaluate", "github", "read_file")
