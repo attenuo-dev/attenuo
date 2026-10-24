@@ -535,6 +535,13 @@ pub struct PolicySection {
     /// Merged over the inline catalog.
     #[serde(default)]
     pub catalog_path: Option<PathBuf>,
+    /// Cedar schema file (Cedar schema syntax) that replaces the built-in base schema, the
+    /// entity types the policies are validated against. Actions, context types and
+    /// `UserAttributes` are still generated and appended. It must keep the entity types,
+    /// attributes and hierarchy of the default (`attenuo_policy::DEFAULT_SCHEMA`), or the server
+    /// refuses to start; it may add entity types and optional attributes. Read once at start.
+    #[serde(default)]
+    pub schema_path: Option<PathBuf>,
     /// Extra attributes of `originating_user.attributes` to declare in the Cedar schema, as
     /// `name = "string" | "long" | "bool" | "set<string>"` (any scalar inside `set<...>`).
     /// Merged over the built-in `mfa`, `roles`, `tenant` and `email`. Without a declaration, a

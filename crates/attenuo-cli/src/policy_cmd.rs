@@ -55,12 +55,15 @@ fn pretty(v: &Value) -> String {
 pub struct TestOptions {
     /// Fail (exit 2) when some policy was not exercised by any case.
     pub fail_on_unexercised: bool,
+    /// Base schema replacing the built-in one (and any config's `[policy] schema_path`).
+    pub schema_file: Option<PathBuf>,
 }
 
 impl From<&crate::cli::TestArgs> for TestOptions {
     fn from(a: &crate::cli::TestArgs) -> Self {
         Self {
             fail_on_unexercised: a.fail_on_unexercised,
+            schema_file: a.schema_file.clone(),
         }
     }
 }
@@ -70,7 +73,11 @@ pub fn test(files: &[PathBuf], opts: &TestOptions, json_out: bool) -> Run {
     let mut reports: Vec<(&Path, TestReport)> = Vec::new();
     let mut errors: Vec<(&Path, String)> = Vec::new();
     for path in files {
-        match TestFile::load(path).and_then(|f| f.run()) {
+        let loaded = TestFile::load(path).map(|f| match &opts.schema_file {
+            Some(s) => f.with_schema_file(s),
+            None => f,
+        });
+        match loaded.and_then(|f| f.run()) {
             Ok(report) => reports.push((path, report)),
             Err(e) => errors.push((path, e.to_string())),
         }
@@ -343,7 +350,21 @@ fn catalog_from_policy(text: &str) -> (attenuo_policy::ToolCatalog, Vec<String>)
 }
 
 /// `attenuo policy lint <policy.cedar> [--config server.toml] [--schema]`
+#[cfg(test)]
 pub fn lint(policy: &Path, config: Option<&Path>, show_schema: bool, json_out: bool) -> Run {
+    lint_with_schema(policy, config, None, show_schema, json_out)
+}
+
+/// `attenuo policy lint <policy.cedar> [--config server.toml] [--schema-file F] [--schema]`.
+/// The base schema is `schema_file`, else the config's `[policy] schema_path`, else the
+/// built-in one.
+pub fn lint_with_schema(
+    policy: &Path,
+    config: Option<&Path>,
+    schema_file: Option<&Path>,
+    show_schema: bool,
+    json_out: bool,
+) -> Run {
     let mut run = Run::new();
     let text = match std::fs::read_to_string(policy) {
         Ok(t) => t,
@@ -392,6 +413,25 @@ pub fn lint(policy: &Path, config: Option<&Path>, show_schema: bool, json_out: b
         .with_legacy_bare_actions(legacy_bare_actions);
     for (name, ty) in user_attrs {
         builder = builder.with_user_attr(name, ty);
+    }
+    let base_path = match schema_file {
+        Some(p) => Some(p.to_path_buf()),
+        None => match config
+            .map(testing::load_schema_path_from_config)
+            .transpose()
+        {
+            Ok(p) => p.flatten(),
+            Err(e) => return Run::error(e.to_string()),
+        },
+    };
+    if let Some(p) = &base_path {
+        match std::fs::read_to_string(p) {
+            Ok(base) => builder = builder.with_schema_str(&base),
+            Err(e) => return Run::error(format!("reading {}: {e}", p.display())),
+        }
+        if let Err(e) = builder.check_schema() {
+            return Run::error(format!("{}: {e}", p.display()));
+        }
     }
     let schema = builder.schema_text();
     let report = attenuo_policy::lint_with_options(
@@ -566,6 +606,7 @@ mod tests {
 
         let strict = TestOptions {
             fail_on_unexercised: true,
+            ..TestOptions::default()
         };
         let r = test(std::slice::from_ref(&t), &strict, false);
         assert_eq!(r.status, Status::Failed, "{}", r.stdout);
@@ -649,6 +690,7 @@ mod tests {
         let Command::Policy(PolicyCmd::Lint {
             policy,
             config,
+            schema_file,
             schema,
         }) = cli.command
         else {
@@ -657,6 +699,7 @@ mod tests {
         assert_eq!(policy, PathBuf::from("p.cedar"));
         assert_eq!(config, Some(PathBuf::from("s.toml")));
         assert!(schema);
+        assert_eq!(schema_file, None);
 
         assert!(Cli::try_parse_from(["attenuo", "policy", "test"]).is_err());
     }
@@ -692,5 +735,104 @@ mod tests {
     fn lint_missing_file_is_an_error() {
         let r = lint(Path::new("/nonexistent.cedar"), None, false, false);
         assert_eq!(r.status, Status::Error);
+    }
+
+    /// A base schema that adds an optional `owner` to `Tool`, and a policy that reads it.
+    fn custom_schema_setup() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let base = attenuo_policy::DEFAULT_SCHEMA.replace(
+            "    destructive: Bool,\n",
+            "    destructive: Bool,\n    owner?: String,\n",
+        );
+        let schema = write(d.path(), "base.cedarschema", &base);
+        let policy = write(
+            d.path(),
+            "p.cedar",
+            "@id(\"owned\")\npermit(principal, action == Action::\"github/read_file\", resource)\nwhen { resource has owner && resource.owner == \"alice\" };\n",
+        );
+        let t = write(
+            d.path(),
+            "t.yaml",
+            "policies: p.cedar\ncatalog: c.toml\ncases:\n  - name: no owner attribute at run time\n    call: { server: github, tool: read_file }\n    expect: deny\n",
+        );
+        write(d.path(), "c.toml", CONFIG);
+        (d, schema, policy, t)
+    }
+
+    #[test]
+    fn schema_file_replaces_the_base_schema_in_test_and_lint() {
+        let (d, schema, policy, t) = custom_schema_setup();
+        // The built-in base does not declare `owner`: the policy is impossible, so a warning.
+        let plain = lint(&policy, Some(&d.path().join("c.toml")), false, false);
+        assert!(plain.stdout.contains("1 warning(s)"), "{}", plain.stdout);
+
+        let opts = TestOptions {
+            schema_file: Some(schema.clone()),
+            ..TestOptions::default()
+        };
+        let r = test(std::slice::from_ref(&t), &opts, false);
+        assert_eq!(r.status, Status::Ok, "{}{}", r.stdout, r.stderr);
+        let l = lint_with_schema(
+            &policy,
+            Some(&d.path().join("c.toml")),
+            Some(&schema),
+            true,
+            false,
+        );
+        assert_eq!(l.status, Status::Ok, "{}{}", l.stdout, l.stderr);
+        assert!(l.stdout.contains("owner?: String"), "{}", l.stdout);
+        assert!(
+            l.stdout.contains("0 error(s), 0 warning(s)"),
+            "{}",
+            l.stdout
+        );
+
+        // The config's `[policy] schema_path` (relative to the config) works the same way.
+        write(
+            d.path(),
+            "c.toml",
+            &format!("[policy]\nschema_path = \"base.cedarschema\"\n{CONFIG}"),
+        );
+        let r = test(std::slice::from_ref(&t), &TestOptions::default(), false);
+        assert_eq!(r.status, Status::Ok, "{}{}", r.stdout, r.stderr);
+        let l = lint(&policy, Some(&d.path().join("c.toml")), false, false);
+        assert!(l.stdout.contains("0 warning(s)"), "{}", l.stdout);
+    }
+
+    #[test]
+    fn a_schema_file_without_the_required_entities_is_refused() {
+        let (d, _schema, policy, t) = custom_schema_setup();
+        let bad = write(
+            d.path(),
+            "bad.cedarschema",
+            &attenuo_policy::DEFAULT_SCHEMA.replace("chain_depth: Long", "chain_depth?: Long"),
+        );
+        let opts = TestOptions {
+            schema_file: Some(bad.clone()),
+            ..TestOptions::default()
+        };
+        let r = test(std::slice::from_ref(&t), &opts, false);
+        assert_eq!(r.status, Status::Error);
+        assert!(r.stderr.contains("custom base schema"), "{}", r.stderr);
+        assert!(r.stderr.contains("chain_depth"), "{}", r.stderr);
+
+        let l = lint_with_schema(&policy, None, Some(&bad), false, false);
+        assert_eq!(l.status, Status::Error);
+        assert!(l.stderr.contains("custom base schema"), "{}", l.stderr);
+
+        let no_server = write(
+            d.path(),
+            "noserver.cedarschema",
+            "entity User; entity Agent in [User, Agent]; entity Tool;",
+        );
+        let l = lint_with_schema(&policy, None, Some(&no_server), false, false);
+        assert!(
+            l.stderr
+                .contains("does not declare the entity type(s) Server"),
+            "{}",
+            l.stderr
+        );
+        let missing = lint_with_schema(&policy, None, Some(&d.path().join("nope")), false, false);
+        assert_eq!(missing.status, Status::Error);
     }
 }

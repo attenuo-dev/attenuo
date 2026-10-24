@@ -59,6 +59,122 @@ entity Tool in [Server] {
 };
 "#;
 
+/// Entity types a base schema must declare, without a namespace.
+pub const REQUIRED_ENTITY_TYPES: [&str; 4] = ["User", "Agent", "Server", "Tool"];
+
+/// Policies that type-check without errors or warnings only when a schema declares what the
+/// engine relies on: the entity types of [`DEFAULT_SCHEMA`] with each of their attributes
+/// (required, of the same type), `Agent in [User, Agent]` and `Tool in [Server]`. They are
+/// validated, never loaded.
+const REQUIRED_SHAPE_PROBES: &str = r#"
+@id("User, Agent, Server and Tool attributes")
+permit(principal, action in Action::"invoke", resource) when {
+  principal.id like "*" && principal.chain_depth > 0 &&
+  resource.server like "*" && resource.name like "*" &&
+  resource.readonly && resource.sensitive && resource.destructive &&
+  User::"u".subject like "*" && User::"u".issuer like "*" &&
+  User::"u".authenticated_at_unix > 0 &&
+  User::"u".attributes == context.originating_user.attributes
+};
+@id("Agent in User")
+permit(principal in User::"u", action in Action::"invoke", resource);
+@id("Agent in Agent")
+permit(principal in Agent::"a", action in Action::"invoke", resource);
+@id("Tool in Server")
+permit(principal, action in Action::"invoke", resource in Server::"s");
+"#;
+
+/// The required entity types a base schema's text does not declare (`entity A, B ...`), found
+/// with a small tokenizer that skips `//` comments. Run before parsing, because the generated
+/// fragment names `Agent` and `Tool`, so a base without them fails to parse with a less
+/// helpful "failed to resolve types".
+pub(crate) fn missing_entity_types(base: &str) -> Vec<&'static str> {
+    let mut tokens: Vec<String> = Vec::new();
+    for line in base.lines() {
+        let code = line.split("//").next().unwrap_or("");
+        let mut ident = String::new();
+        for c in code.chars() {
+            if c.is_alphanumeric() || c == '_' {
+                ident.push(c);
+                continue;
+            }
+            if !ident.is_empty() {
+                tokens.push(std::mem::take(&mut ident));
+            }
+            if !c.is_whitespace() {
+                tokens.push(c.to_string());
+            }
+        }
+        if !ident.is_empty() {
+            tokens.push(ident);
+        }
+    }
+    let mut declared = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i] == "entity" {
+            i += 1;
+            while i < tokens.len() {
+                declared.push(tokens[i].clone());
+                if tokens.get(i + 1).map(String::as_str) == Some(",") {
+                    i += 2;
+                } else {
+                    break;
+                }
+            }
+        }
+        i += 1;
+    }
+    REQUIRED_ENTITY_TYPES
+        .iter()
+        .copied()
+        .filter(|t| !declared.iter().any(|d| d == t))
+        .collect()
+}
+
+/// Check that a complete schema (a custom base plus the generated fragment) still declares
+/// what the engine builds requests from. `Err` lists what is missing.
+pub(crate) fn check_required_shape(schema: &cedar_policy::Schema) -> Result<(), String> {
+    let declared: Vec<String> = schema.entity_types().map(|t| t.to_string()).collect();
+    let missing: Vec<&str> = REQUIRED_ENTITY_TYPES
+        .iter()
+        .copied()
+        .filter(|t| !declared.iter().any(|d| d == t))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "it does not declare the entity type(s) {}",
+            missing.join(", ")
+        ));
+    }
+    let probes: cedar_policy::PolicySet = REQUIRED_SHAPE_PROBES
+        .parse()
+        .map_err(|e| format!("internal: probe policies: {e}"))?;
+    let probes = crate::apply_id_annotations(&probes).map_err(|e| e.to_string())?;
+    let result = cedar_policy::Validator::new(schema.clone())
+        .validate(&probes, cedar_policy::ValidationMode::Strict);
+    let mut problems: Vec<String> = result
+        .validation_errors()
+        .map(|e| format!("[{}] {e}", e.policy_id()))
+        .chain(
+            result
+                .validation_warnings()
+                .map(|w| format!("[{}] {w}", w.policy_id())),
+        )
+        .collect();
+    problems.dedup();
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "it does not declare the entities attenuo builds requests from as the default \
+             schema does (each attribute required and of the same type, `Agent in [User, Agent]`, \
+             `Tool in [Server]`): {}",
+            problems.join("; ")
+        ))
+    }
+}
+
 /// Attributes of the originating user that the default schema declares, so the starter
 /// policies validate out of the box. All optional; override or extend them with
 /// `PolicyEngineBuilder::with_user_attr`.
@@ -185,6 +301,81 @@ pub fn generate(
 mod tests {
     use super::*;
     use crate::catalog::ToolAttrs;
+
+    fn build_with_base(base: &str, policies: &str) -> Result<crate::PolicyEngine, String> {
+        crate::PolicyEngineBuilder::new()
+            .with_catalog(ToolCatalog::new().with("github", "read_file", ToolAttrs::new()))
+            .with_schema_str(base)
+            .with_policies_str(policies)
+            .build()
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn a_custom_base_that_extends_the_default_is_accepted() {
+        let base = DEFAULT_SCHEMA.replace(
+            "    destructive: Bool,\n",
+            "    destructive: Bool,\n    owner?: String,\n",
+        ) + "\nentity Team;\n";
+        assert!(base.contains("owner?: String"));
+        let engine = build_with_base(
+            &base,
+            r#"@id("own") permit(principal, action, resource) when { resource has owner && resource.owner == "alice" };"#,
+        )
+        .unwrap();
+        assert!(engine.schema_text().contains("entity Team;"));
+        // The same policy does not validate against the default base.
+        let err = build_with_base(
+            DEFAULT_SCHEMA,
+            r#"permit(principal, action, resource) when { resource.owner == "alice" };"#,
+        );
+        assert!(err.is_err());
+        // The default base passes the shape check itself.
+        let default = cedar_policy::Schema::from_cedarschema_str(&generate(
+            DEFAULT_SCHEMA,
+            &ToolCatalog::new(),
+            &default_user_attrs(),
+            false,
+        ))
+        .unwrap()
+        .0;
+        check_required_shape(&default).unwrap();
+    }
+
+    #[test]
+    fn a_custom_base_missing_what_the_engine_needs_is_refused() {
+        let refused = |base: String, want: &str| {
+            let err = build_with_base(&base, "").unwrap_err();
+            assert!(
+                err.starts_with("schema error: custom base schema: "),
+                "{err}"
+            );
+            assert!(err.contains(want), "want {want:?} in {err}");
+        };
+        // A missing entity type.
+        let no_tool = DEFAULT_SCHEMA
+            .split("entity Tool")
+            .next()
+            .unwrap()
+            .replace("Tool in [Server]", "")
+            .to_string();
+        refused(no_tool, "does not declare the entity type(s) Tool");
+        // An attribute made optional, or retyped.
+        refused(
+            DEFAULT_SCHEMA.replace("readonly: Bool", "readonly?: Bool"),
+            "readonly",
+        );
+        refused(DEFAULT_SCHEMA.replace("id: String", "id: Long"), "Agent");
+        // The hierarchy: an agent must be `in` its user.
+        refused(
+            DEFAULT_SCHEMA.replace("entity Agent in [User, Agent]", "entity Agent in [Agent]"),
+            "Agent in User",
+        );
+        // Actions are generated; declaring one collides.
+        refused(format!("{DEFAULT_SCHEMA}\naction \"invoke\";\n"), "invoke");
+        // A base that does not parse at all.
+        refused("entity User {".to_string(), "custom base schema");
+    }
 
     #[test]
     fn quotes_and_escapes_names() {

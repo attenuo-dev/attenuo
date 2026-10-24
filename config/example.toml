@@ -39,6 +39,9 @@ policies_path = "config/policies/default.cedar"
 # Alternatively (or additionally) point catalog_path at a JSON file of the same shape:
 # { "github": { "read_file": { "readonly": true, "inputs": { "repo": "string" } } } }
 # catalog_path = "config/catalog.json"
+# A Cedar schema file replacing the built-in entity types (it must keep them, their attributes
+# and hierarchy; it may add entity types and optional attributes). Actions are still generated.
+# schema_path = "config/base.cedarschema"
 # Calls to a (server, tool) pair missing from the catalog: "deny" (default, reason
 # tool_not_in_catalog), "sensitive" (evaluated with resource.sensitive = true) or "allow"
 # (default attributes; forbids keyed on resource.sensitive do not apply).

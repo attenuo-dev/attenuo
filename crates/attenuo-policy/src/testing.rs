@@ -267,6 +267,32 @@ pub fn load_legacy_bare_actions_from_config(path: &Path) -> Result<Option<bool>,
     }
 }
 
+/// Read `[policy] schema_path` from a server config, resolved against the config's directory
+/// as `catalog_path` is; `None` when it is not set or the path is a JSON catalog.
+pub fn load_schema_path_from_config(path: &Path) -> Result<Option<PathBuf>, HarnessError> {
+    if path.extension().and_then(|e| e.to_str()) == Some("json") {
+        return Ok(None);
+    }
+    let what = format!("schema_path in {}", path.display());
+    let doc: toml::Table = read(path)?
+        .parse()
+        .map_err(|e: toml::de::Error| HarnessError::invalid(&what, e))?;
+    match doc
+        .get("policy")
+        .and_then(|p| p.as_table())
+        .and_then(|p| p.get("schema_path"))
+    {
+        None => Ok(None),
+        Some(toml::Value::String(rel)) => {
+            Ok(Some(path.parent().unwrap_or(Path::new(".")).join(rel)))
+        }
+        Some(other) => Err(HarnessError::invalid(
+            &what,
+            format!("expected a path, got {other}"),
+        )),
+    }
+}
+
 /// Read a JSON catalog file: `{ "<server>": { "<tool>": { "readonly": true, ... } } }`.
 pub fn load_catalog_json(path: &Path) -> Result<ToolCatalog, HarnessError> {
     let tables: CatalogTables = serde_json::from_str(&read(path)?)
@@ -572,6 +598,9 @@ pub struct TestFile {
     /// Path the file was loaded from, for reports.
     #[serde(skip)]
     source: Option<PathBuf>,
+    /// Base schema override, see [`TestFile::with_schema_file`].
+    #[serde(skip)]
+    schema_file: Option<PathBuf>,
 }
 
 impl TestFile {
@@ -675,10 +704,38 @@ impl TestFile {
                 builder = builder.with_user_attr(name, ty);
             }
         }
+        if let Some(base) = self.load_base_schema()? {
+            builder = builder.with_schema_str(&base);
+        }
         if let Some(p) = &self.policies {
             builder = builder.with_policies_file(self.resolve(p));
         }
         Ok(builder.build()?)
+    }
+
+    /// Replace the base schema with the Cedar schema in `path` (the CLI's `--schema-file`),
+    /// whatever the config `catalog` names says.
+    pub fn with_schema_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.schema_file = Some(path.into());
+        self
+    }
+
+    /// The base schema file in force: [`with_schema_file`](Self::with_schema_file), else the
+    /// `[policy] schema_path` of the server config `catalog` names (relative to that config),
+    /// else none (the built-in [`DEFAULT_SCHEMA`](crate::DEFAULT_SCHEMA)).
+    pub fn base_schema_path(&self) -> Result<Option<PathBuf>, HarnessError> {
+        if let Some(p) = &self.schema_file {
+            return Ok(Some(p.clone()));
+        }
+        match &self.catalog {
+            Some(CatalogSpec::Path(p)) => load_schema_path_from_config(&self.resolve(p)),
+            _ => Ok(None),
+        }
+    }
+
+    /// The text of [`base_schema_path`](Self::base_schema_path), if any.
+    pub fn load_base_schema(&self) -> Result<Option<String>, HarnessError> {
+        self.base_schema_path()?.map(|p| read(&p)).transpose()
     }
 
     /// Build the engine and run every case.

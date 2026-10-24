@@ -711,6 +711,11 @@ pub enum PolicyCmd {
         /// and a note says what could not be checked (tool attributes, input types).
         #[arg(long)]
         config: Option<std::path::PathBuf>,
+        /// Cedar schema file replacing the built-in base schema (the entity types), over the
+        /// config's `[policy] schema_path`. It must keep the default's entity types, attributes
+        /// and hierarchy.
+        #[arg(long, value_name = "PATH")]
+        schema_file: Option<std::path::PathBuf>,
         /// Also print the generated schema the policy was validated against.
         #[arg(long)]
         schema: bool,
@@ -727,6 +732,11 @@ pub struct TestArgs {
     /// it), even if every case passed.
     #[arg(long)]
     pub fail_on_unexercised: bool,
+    /// Cedar schema file replacing the built-in base schema (the entity types) for every test
+    /// file, over any `[policy] schema_path` of the config a test file's `catalog` names. It
+    /// must keep the default's entity types, attributes and hierarchy. Not with `--via authzen`.
+    #[arg(long, value_name = "PATH")]
+    pub schema_file: Option<std::path::PathBuf>,
     /// Where the cases are decided: `local` (default, the in-process engine, offline) or
     /// `authzen` (each case is sent to `POST /access/v1/evaluation` of the server named by the
     /// global `--server`, with `--token` as the bearer).

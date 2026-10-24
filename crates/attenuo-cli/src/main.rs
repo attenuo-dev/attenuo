@@ -440,6 +440,12 @@ async fn run(cli: Cli) -> Result<Outcome> {
                     )
                 }
                 cli::Via::Authzen => {
+                    if args.schema_file.is_some() {
+                        anyhow::bail!(
+                            "--schema-file has no effect with --via authzen: the server validates \
+                             with its own schema"
+                        );
+                    }
                     let client = client?;
                     let token = secrets::resolve_token(
                         "--token",
@@ -463,9 +469,16 @@ async fn run(cli: Cli) -> Result<Outcome> {
         Command::Policy(PolicyCmd::Lint {
             policy,
             config,
+            schema_file,
             schema,
         }) => finish(
-            policy_cmd::lint(&policy, config.as_deref(), schema, json),
+            policy_cmd::lint_with_schema(
+                &policy,
+                config.as_deref(),
+                schema_file.as_deref(),
+                schema,
+                json,
+            ),
             "policy lint failed to run",
         ),
         Command::Policy(PolicyCmd::Show) => {

@@ -91,6 +91,19 @@ when {
 
 Declaring an attribute does not make it appear. The value comes from the verified IdP token: add the claim to `attribute_claims` in the `[[idps]]` entry (`groups` is there by default). If a token carries a value of a different type than declared, for example a string where you declared `set<string>`, attenuo denies the call before any policy runs, with reason `attribute_type_mismatch` (audited, and shown by `attenuo policy test`). Nothing is coerced. This matters because Cedar's `!=` across types is `true` without an error: `attributes.status != "suspended"` would otherwise permit `["suspended"]`. Still guard each use with `has` and prefer `.contains` and `like` over `!=` for exclusions. `attenuo policy lint --config server.toml` and `attenuo policy test` (when the test file's `catalog:` points at the server config) read `user_attributes` too, so tests and lint see the same schema as the server.
 
+### A custom base schema
+
+The schema has two parts: a base that declares the entity types (`User`, `Agent`, `Server`, `Tool` and their attributes; `attenuo_policy::DEFAULT_SCHEMA`, printed at the top of `attenuo policy lint --schema`), and the actions and context types generated from the catalog. You can replace the base with your own Cedar schema file, to declare an extra entity type your policies name or an optional attribute:
+
+```toml
+[policy]
+schema_path = "config/base.cedarschema"
+```
+
+`attenuo policy test --schema-file F` and `attenuo policy lint --schema-file F` take the same file (and both read `schema_path` from the config they are given). The file must keep what attenuo builds every request from: the four entity types with every attribute of the default, each required and of the same type, `Agent in [User, Agent]` and `Tool in [Server]`. Start from the default and add to it. A file that drops or changes any of that is refused, by the server at start and by the CLI before any case runs, with the missing part named, for example `custom base schema: it does not declare the entity type(s) Server`. Leave actions out: they are generated, and a declared one with a generated name (`invoke`, `<server>/<tool>`) fails to parse.
+
+The request data does not change: attenuo fills only the default attributes. Declare anything you add as optional (`owner?: String`) and guard it with `has`; a required attribute that is never filled makes every policy that reads it fail at evaluation, and the call is denied with `policy_error`.
+
 ## Patterns
 
 All of these assume the catalog above.
