@@ -65,6 +65,7 @@
 //! assert_eq!(verified.claims.act.act.unwrap().sub, "agent:planner");
 //! ```
 
+pub mod approval;
 pub mod claims;
 pub mod detached;
 pub mod dpop;
@@ -74,6 +75,7 @@ pub mod issuer;
 mod keys;
 pub mod verifier;
 
+pub use approval::{ApprovalClaims, ApprovalGrant, ApprovalMismatch, APPROVAL_TOKEN_TYPE};
 pub use claims::{
     ActClaim, Claims, MayAct, JWT_TOKEN_TYPE_URN, OU_SIG_CONTEXT, OU_SIG_VERSION, TOKEN_TYPE,
 };
