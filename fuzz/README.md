@@ -4,7 +4,7 @@
 checks an attacker can reach: tokens, DPoP proofs, names and capabilities, the MCP proxy's
 JSON-RPC and SSE handling, the policy engine's context building, and audit export
 verification. Each target calls public APIs only. Why, how they are built and what they found:
-[docs/design/fuzzing.md](../docs/design/fuzzing.md).
+[docs/design/fuzzing.md](../docs/design/fuzzing.md) and, for the second round, [docs/research/fuzzing-2026-10-24-round2.md](../docs/research/fuzzing-2026-10-24-round2.md).
 
 This crate is not a member of the main workspace (the root `Cargo.toml` excludes it): it
 needs a nightly toolchain and has its own `Cargo.lock`.
@@ -54,6 +54,11 @@ artifact itself is not kept.
 | `policy_context` | `PolicyEngine::authorize` with arbitrary arguments and user attributes; `PolicyEngine::evaluate` (AuthZEN) on arbitrary JSON | a documented reason every time; an allow passed the capability stage; deterministic |
 | `audit_export_bytes` | `parse_export` + `verify_export` on arbitrary text | countersigned entries are the original ones |
 | `audit_export_mutated` | `verify_export` on edits of a signed export (entries, checkpoints, header, bytes; with or without re-hashing) | a verified export never alters an entry at or below the last good checkpoint |
+| `limits_charges` | `Limits` deserialisation and `validate`, `narrows`, `clamp_to`, `charges_for`, `usage_charges`, `Derive::Host`, `jcs` | clamping is idempotent and narrows; each value counted once, at most `MAX_COUNTED_VALUES`; a `limit_arg_invalid` has a cause; a derived host comes from a special scheme only and is a fixpoint; canonical JSON is a fixpoint and agrees with `value_eq` |
+| `budget_plan` | `LeaseStore::charge` and `refund` (`budget::plan`) on random sequences, memory and SQLite (temp file) side by side | both stores agree with each other and a model; `distinct` counts equal their value rows; no counter over `max` or below 0; all 0 after every refund |
+| `approval_token` | `Verifier::verify_approval` on mutated and re-signed tokens, `check_binding`, `take_approval` and `take_approval_by_id` with mutated arguments | byte-mutated tokens never verify with other claims; accepted tokens are well formed; an approval is taken exactly when the canonical arguments match, once |
+| `policy_usage` | `policies_read_usage` on generated and raw Cedar | never "nobody reads usage" for a policy naming `context.usage`, or one whose answer changes with `context.usage` |
+| `server_http` | the server router: `POST /access/v1/evaluation(s)`, `POST /approvals/{id}`, `POST /admin/approvals/{id}` | no 5xx; an allow has `policy_allow`; one result per batch entry; no decision on a missing approval |
 
 `src/lib.rs` holds the shared pieces: JSON and string generators biased to edge cases, a token
 issuer with a fixed key (so targets can re-sign mutated tokens) and a signed audit export.

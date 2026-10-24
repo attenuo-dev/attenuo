@@ -1,6 +1,6 @@
 # Fuzzing
 
-- Status: first campaign 2026-10-23 (`test/fuzz-targets`); second campaign, 10 minutes per target, 2026-10-23 evening (below)
+- Status: first campaign 2026-10-23 (`test/fuzz-targets`); second campaign, 10 minutes per target, 2026-10-23 evening (below); round 2 over run limits, budgets, approval tokens, the usage walker and the server routes, 2026-10-24 ([write-up](../research/fuzzing-2026-10-24-round2.md))
 - Crate: `fuzz/` (cargo-fuzz, libFuzzer), outside the workspace
 - Related: [threat model](../spec/threat-model.md), [security review pass 3](../research/security-review-2026-10-23.md)
 

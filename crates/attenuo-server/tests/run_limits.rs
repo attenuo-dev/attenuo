@@ -34,7 +34,7 @@ fn sha256_hex(s: &str) -> String {
 
 struct Harness {
     server: Spawned,
-    _state: Arc<AppState>,
+    state: Arc<AppState>,
     _upstream_task: Spawned,
     client: reqwest::Client,
     _dir: tempfile::TempDir,
@@ -92,7 +92,7 @@ impl Harness {
         let server = spawn_router(router).await.unwrap();
         Self {
             server,
-            _state: state,
+            state,
             _upstream_task: upstream_task,
             client: reqwest::Client::new(),
             _dir: dir,
@@ -734,4 +734,152 @@ async fn distinct_hosts_bound_the_sites_a_run_can_reach() {
     );
     refund(authzen_docs["id"].clone()).await;
     assert!(allowed(&fetch("https://evil.example/?d=fine-now").await));
+}
+
+/// The value of the sample whose series is exactly `series` (name and labels).
+fn metric(text: &str, series: &str) -> u64 {
+    let prefix = format!("{series} ");
+    text.lines()
+        .find_map(|l| l.strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| panic!("no {series} in:\n{text}"))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// `/metrics` counts run-limit charges by kind, `budget_exhausted` by kind and where, refunds
+/// by source, and the run lock: every limited call waits for it once.
+#[tokio::test]
+async fn metrics_count_charges_exhaustion_refunds_and_the_run_lock() {
+    let h = Harness::start().await;
+    let root = h
+        .mint_root(send_money(json!({
+            "calls": 3,
+            "sum": {"arg": "amount", "max": 100},
+            "calls_per": {"arg": "recipient", "max": 1},
+        })))
+        .await;
+    let render = || h.state.metrics.render();
+    let before = render();
+    assert_eq!(metric(&before, "attenuo_run_lock_wait_seconds_count"), 0);
+
+    // One allowed call charges each of its three limits once.
+    assert!(allowed(&h.pay(&root.token, 60).await));
+    let decision_id = h.decisions().await.last().unwrap()["id"].clone();
+    // The same payee again: calls_per is hit at the check.
+    let (reason, limit) = denial(
+        &h.call(
+            &root.token,
+            "send_money",
+            json!({"recipient": "FR00EMMA", "amount": 1}),
+        )
+        .await,
+    );
+    assert_eq!(
+        (reason.as_str(), limit["kind"].as_str()),
+        ("budget_exhausted", Some("calls_per"))
+    );
+    // Another payee, too much money: sum is hit.
+    let (reason, limit) = denial(
+        &h.call(
+            &root.token,
+            "send_money",
+            json!({"recipient": "FR00RENT", "amount": 50}),
+        )
+        .await,
+    );
+    assert_eq!(
+        (reason.as_str(), limit["kind"].as_str()),
+        ("budget_exhausted", Some("sum"))
+    );
+    // A call with no recipient cannot be counted.
+    assert_eq!(
+        denial(
+            &h.call(&root.token, "send_money", json!({"amount": 1}))
+                .await
+        )
+        .0,
+        "limit_arg_invalid"
+    );
+    // A read matches no limit, but the hop is limited, so it still takes the run lock.
+    assert!(allowed(
+        &h.call(&root.token, "get_balance", json!({})).await
+    ));
+    let resp = h
+        .admin_post(
+            "/admin/budgets/refund",
+            json!({"decision_id": decision_id, "reason": "bounced"}),
+        )
+        .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let text = render();
+    attenuo_server::metrics::check_text_format(&text).unwrap();
+    for kind in ["calls", "sum", "calls_per"] {
+        assert_eq!(
+            metric(
+                &text,
+                &format!("attenuo_budget_charges_total{{kind=\"{kind}\"}}")
+            ),
+            1,
+            "{kind}"
+        );
+    }
+    assert_eq!(
+        metric(&text, "attenuo_budget_charges_total{kind=\"distinct\"}"),
+        0
+    );
+    assert_eq!(
+        metric(
+            &text,
+            "attenuo_budget_exhausted_total{kind=\"calls_per\",at=\"check\"}"
+        ),
+        1
+    );
+    assert_eq!(
+        metric(
+            &text,
+            "attenuo_budget_exhausted_total{kind=\"sum\",at=\"check\"}"
+        ),
+        1
+    );
+    assert_eq!(
+        metric(
+            &text,
+            "attenuo_budget_exhausted_total{kind=\"calls\",at=\"check\"}"
+        ),
+        0
+    );
+    assert_eq!(
+        metric(
+            &text,
+            "attenuo_decisions_total{decision=\"deny\",reason=\"budget_exhausted\"}"
+        ),
+        2
+    );
+    assert_eq!(
+        metric(
+            &text,
+            "attenuo_decisions_total{decision=\"deny\",reason=\"limit_arg_invalid\"}"
+        ),
+        1
+    );
+    assert_eq!(
+        metric(&text, "attenuo_budget_refunds_total{source=\"operator\"}"),
+        1
+    );
+    assert_eq!(
+        metric(
+            &text,
+            "attenuo_budget_refunds_total{source=\"audit_error\"}"
+        ),
+        0
+    );
+    // Every decision of the limited run took the lock, the `limit_arg_invalid` refusal too (it
+    // is decided while the budget is read): five decisions.
+    assert_eq!(metric(&text, "attenuo_run_lock_wait_seconds_count"), 5);
+    assert_eq!(
+        metric(&text, "attenuo_run_lock_wait_seconds_bucket{le=\"+Inf\"}"),
+        5
+    );
 }

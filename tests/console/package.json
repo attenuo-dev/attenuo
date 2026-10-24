@@ -1,0 +1,17 @@
+{
+  "name": "attenuo-console-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Browser smoke test of the attenuo admin console (Playwright and node:test). Run it with scripts/console-smoke.sh.",
+  "license": "Apache-2.0",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "bash ../../scripts/console-smoke.sh"
+  },
+  "devDependencies": {
+    "playwright": "1.56.1"
+  }
+}

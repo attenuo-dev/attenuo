@@ -198,6 +198,7 @@ async fn metrics_endpoint_reports_pipeline_and_token_activity() {
     assert!(ct.starts_with("text/plain; version=0.0.4"), "{ct}");
     let text = r.text().await.unwrap();
 
+    attenuo_server::metrics::check_text_format(&text).unwrap();
     assert!(text.contains("# TYPE attenuo_decisions_total counter"));
     assert_eq!(decisions_total(&text), 3);
     assert_eq!(
@@ -242,6 +243,87 @@ async fn metrics_endpoint_reports_pipeline_and_token_activity() {
         ),
         3
     );
+}
+
+/// The WAL checkpointer and the signed-checkpoint presync are exported: rounds by result,
+/// the WAL sync ahead of a signed checkpoint, the time of the last complete round and of the
+/// newest signed checkpoint. A file-backed store with a one-second checkpointer.
+#[tokio::test]
+async fn metrics_report_the_wal_checkpointer_and_presync() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::default();
+    cfg.audit.sqlite_path = dir.path().join("a.sqlite").to_string_lossy().into_owned();
+    cfg.audit.wal_checkpoint_seconds = 1;
+    // A presync is asked for `min(32, every / 2)` entries before each checkpoint: at 20 here.
+    cfg.audit.checkpoint_every = 40;
+    cfg.admin.token = Some("admin".into());
+    cfg.dev.allow_root_mint = true;
+    let (router, state) = attenuo_server::build(&cfg).unwrap();
+    let server = spawn_router(router).await.unwrap();
+    let h = Harness {
+        server,
+        state,
+        _dir: dir,
+    };
+    let text = h.state.metrics.render();
+    attenuo_server::metrics::check_text_format(&text).unwrap();
+    assert!(text.contains("# TYPE attenuo_audit_wal_checkpoints_total counter\n"));
+    assert!(text.contains("attenuo_audit_checkpoint_last_timestamp_seconds 0\n"));
+
+    let root = h
+        .admin_post(
+            "/admin/root-token",
+            json!({"subject": "alice", "issuer": "https://idp.example", "agent": "planner",
+                   "capabilities": ["github:*"]}),
+        )
+        .await;
+    let token = root["access_token"].as_str().unwrap().to_string();
+    let now = time::OffsetDateTime::now_utc();
+    let chain = h.state.verifier.verify(&token, now).unwrap().chain;
+    let call = ToolCall::new("github", "read_file", json!({}));
+    // Past seq 40: one presync on the way, then a signed checkpoint.
+    for _ in 0..40 {
+        h.state.pipeline.decide(&chain, &call, now);
+    }
+    let mut text = String::new();
+    for _ in 0..50 {
+        text = h.state.metrics.render();
+        let complete = line_value(
+            &text,
+            "attenuo_audit_wal_checkpoints_total{result=\"complete\"} ",
+        );
+        let presyncs = line_value(&text, "attenuo_audit_wal_presyncs_total{file=\"wal\"} ");
+        if complete > 0 && presyncs > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    attenuo_server::metrics::check_text_format(&text).unwrap();
+    assert!(
+        line_value(
+            &text,
+            "attenuo_audit_wal_checkpoints_total{result=\"complete\"} "
+        ) > 0,
+        "{text}"
+    );
+    assert_eq!(
+        line_value(&text, "attenuo_audit_wal_presyncs_total{file=\"wal\"} "),
+        1,
+        "{text}"
+    );
+    assert_eq!(
+        line_value(
+            &text,
+            "attenuo_audit_wal_checkpoints_total{result=\"error\"} "
+        ),
+        0
+    );
+    let unix = time::OffsetDateTime::now_utc().unix_timestamp() as u64;
+    let last = line_value(&text, "attenuo_audit_wal_last_complete_timestamp_seconds ");
+    assert!(last > 0 && last <= unix, "{last}");
+    assert_eq!(line_value(&text, "attenuo_audit_checkpoints_total "), 1);
+    let cp = line_value(&text, "attenuo_audit_checkpoint_last_timestamp_seconds ");
+    assert!(cp > 0 && cp <= unix, "{cp}");
 }
 
 #[tokio::test]

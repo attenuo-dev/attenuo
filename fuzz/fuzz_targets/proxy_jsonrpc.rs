@@ -19,18 +19,18 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use arbitrary::{Arbitrary, Result, Unstructured};
 use async_trait::async_trait;
+use attenuo_core::{
+    AgentId, ArgConstraint, Capability, CapabilitySet, DelegationChain, LeaseId, OriginatingUser,
+    ToolCall,
+};
+use attenuo_fuzz::{edge_number, edge_string, json_value};
+use attenuo_proxy::jsonrpc::is_passthrough_method;
+use attenuo_proxy::{AuthDecision, AuthError, Authorizer, ProxyConfig, UpstreamConfig};
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use libfuzzer_sys::fuzz_target;
-use attenuo_core::{
-    AgentId, ArgConstraint, Capability, CapabilitySet, Decision, DelegationChain, LeaseId,
-    OriginatingUser, ToolCall,
-};
-use attenuo_fuzz::{edge_number, edge_string, json_value};
-use attenuo_proxy::jsonrpc::is_passthrough_method;
-use attenuo_proxy::{AuthDecision, AuthError, Authorizer, ProxyConfig, UpstreamConfig};
 use serde_json::{json, Value};
 use time::OffsetDateTime;
 use tower::ServiceExt;
@@ -106,12 +106,7 @@ impl Authorizer for FuzzAuth {
         {
             AuthDecision::allow("capability_allow", id)
         } else {
-            AuthDecision {
-                decision: Decision::Deny,
-                reason: "capability_denied".into(),
-                decision_id: id,
-                approval: None,
-            }
+            AuthDecision::deny("capability_denied", id)
         }
     }
     fn knows_tool(&self, server: &str, tool: &str) -> bool {

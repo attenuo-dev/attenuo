@@ -33,6 +33,7 @@ async-trait = "0.1"
 base64 = "0.23"
 ring = "0.17"
 jsonwebtoken = "9"
+cedar-policy = "4"
 uuid = "1"
 
 [profile.release]
@@ -119,6 +120,41 @@ bench = false
 [[bin]]
 name = "audit_export_mutated"
 path = "fuzz_targets/audit_export_mutated.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "limits_charges"
+path = "fuzz_targets/limits_charges.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "budget_plan"
+path = "fuzz_targets/budget_plan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "approval_token"
+path = "fuzz_targets/approval_token.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_usage"
+path = "fuzz_targets/policy_usage.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_http"
+path = "fuzz_targets/server_http.rs"
 test = false
 doc = false
 bench = false

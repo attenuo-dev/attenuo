@@ -253,6 +253,12 @@ Changes: `docs/guides/admin-console.md` (enable, reach over SSH tunnel, what eac
 
 Acceptance: `mdbook build` and `scripts/check-links.py` pass; the guide's commands run as written.
 
+### As built: browser smoke test
+
+`scripts/console-smoke.sh` is the Playwright test PR 5 deferred, and it runs in CI as the `console-browser` job of `ci.yml`. It starts the server with `examples/github-leak-demo/config.toml` plus `[admin_ui] enabled = true` and `allow_write = true`, then `tests/console/console.test.cjs` (Node's `node:test`, no other dependency than Playwright) fills the log with the `attenuo` CLI: a delegation chain with a `distinct` run limit, a policy denial, a `budget_exhausted` denial, a `capability_denied` denial, a revoked lease, one approval granted and used, and one left pending. In one headless Chromium page it logs in and visits the audit explorer (with and without a filter), both decision views (verdict, chain, run-limit panel, token decoder), the lease tree with the revoke dialog, the coder's lease, the approvals list and both approval pages (granting the pending one), the policy page (check and three dry runs) and the Verify page (verify and sign). On each page it checks the dark and the light theme: text contrast at least 4.5:1, no sideways scroll, a different background, and a full-page screenshot. A second page checks that a system light preference starts in the light theme. Across the run it allows no console error or warning, no page error, no failed or 4xx/5xx request and no `securitypolicyviolation` event; a separate page proves the recorder works by adding an inline style that the CSP blocks. The lease page's node list, states, revoke count and limit figures are compared with `attenuo lease tree` for the same lease.
+
+Run it with `scripts/console-smoke.sh` after `npm ci` and `npx playwright install --with-deps chromium` in `tests/console/`. `ATTENUO_BIN_DIR` reuses prebuilt binaries; `CONSOLE_SMOKE_SHOTS=DIR` keeps the screenshots, which are never committed.
+
 ## 6. Open questions for the owner
 
 1. **Token in the browser: header-only in memory, or a session cookie?** Recommended: header-only for v1, because it adds no auth code and no CSRF surface; switch to a `__Host-`, `HttpOnly`, `SameSite=Strict` session with CSRF token when per-operator admin auth exists.

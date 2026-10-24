@@ -134,6 +134,7 @@ dependencies = [
  "attenuo-token",
  "base64 0.23.1",
  "hex",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",
@@ -154,6 +155,7 @@ dependencies = [
  "thiserror",
  "time",
  "unicode-normalization",
+ "url",
  "uuid",
 ]
 
@@ -171,6 +173,7 @@ dependencies = [
  "attenuo-token",
  "axum",
  "base64 0.23.1",
+ "cedar-policy",
  "jsonwebtoken",
  "libfuzzer-sys",
  "ring",

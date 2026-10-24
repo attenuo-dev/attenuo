@@ -257,6 +257,19 @@ async fn untrusted_read_then_destructive_call_requires_approval() {
     assert!(read.get("labels").is_none());
 }
 
+/// The value of the `/metrics` sample whose series is exactly `series`.
+fn metric(h: &Harness, series: &str) -> u64 {
+    let text = h.state.metrics.render();
+    attenuo_server::metrics::check_text_format(&text).unwrap();
+    let prefix = format!("{series} ");
+    text.lines()
+        .find_map(|l| l.strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| panic!("no {series} in:\n{text}"))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
 #[tokio::test]
 async fn a_trusted_output_read_does_not_taint() {
     let h = Harness::default(POLICY).await;
@@ -270,6 +283,10 @@ async fn a_trusted_output_read_does_not_taint() {
         .find(|r| r["kind"] == "tool_result" && r["tool"] == "read_balance")
         .unwrap();
     assert_eq!(result["result"]["label"], "trusted");
+    assert_eq!(
+        metric(&h, "attenuo_results_recorded_total{label=\"trusted\"}"),
+        1
+    );
 }
 
 #[tokio::test]
@@ -468,6 +485,17 @@ async fn an_argument_copied_from_a_result_asks_and_names_the_result() {
         .find(|r| r["id"] == v["error"]["data"]["decision_id"])
         .unwrap();
     assert_eq!(gated["labels"]["untrusted_args"], expected);
+    // On /metrics: the untrusted read, and one decision on a destructive call whose argument
+    // matched (the agent's own value matched nothing and is not counted).
+    assert!(metric(&h, "attenuo_results_recorded_total{label=\"untrusted\"}") >= 1);
+    assert_eq!(
+        metric(&h, "attenuo_taint_matches_total{decision=\"deny\"}"),
+        1
+    );
+    assert_eq!(
+        metric(&h, "attenuo_taint_matches_total{decision=\"allow\"}"),
+        0
+    );
     // The allowed call's record has the taint but no `untrusted_args` member.
     let own_record = records
         .iter()

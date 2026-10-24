@@ -302,3 +302,41 @@ These three routes change nothing and write no audit record. They answer the que
 ## Metrics
 
 `GET /metrics` is served by a separate listener, never on the proxy port. It is enabled with `[metrics] enabled = true`, has no authentication and returns Prometheus text format 0.0.4.
+
+Every series is prefixed `attenuo_`. Label values come from fixed sets, so the number of series is bounded: nothing is labelled by lease, user, run, agent, tool or argument value. Series with fixed label sets are written at zero before anything happens, so a rate over them is defined from the first scrape. Counters start at zero when the process starts.
+
+| Series | Type | Labels | Help |
+|---|---|---|---|
+| `decisions_total` | counter | `decision` (`allow`, `deny`), `reason` | Pipeline decisions (MCP proxy and AuthZEN) by outcome and reason code. `reason` is one of `policy_allow`, `policy_deny`, `policy_error`, `approval_required`, `approval_invalid`, `capability_denied`, `tool_not_in_catalog`, `attribute_type_mismatch`, `invalid_name`, `budget_exhausted`, `budget_error`, `limit_arg_invalid`, `lease_revoked`, `lease_expired`, `lease_unknown`, `lease_error`, `audit_error`. Requests refused before a decision (bad token, DPoP, session mismatch) are not counted here. |
+| `tokens_issued_total` | counter | `kind` (`root`, `exchange`) | Delegation tokens issued. |
+| `leases_revoked_total` | counter | none | Leases moved to revoked, including cascaded descendants. |
+| `audit_append_errors_total` | counter | none | Audit log appends that failed. |
+| `audit_checkpoints_total` | counter | none | Signed audit checkpoints written. |
+| `audit_checkpoint_last_timestamp_seconds` | gauge | none | Unix time this process wrote the newest signed audit checkpoint; 0 when none. |
+| `audit_sink_delivered_total` | counter | none | Signed checkpoints delivered off the host by `[audit.sink]`. |
+| `audit_sink_failures_total` | counter | none | Deliveries by `[audit.sink]` that failed and will be retried. |
+| `audit_sink_dropped_total` | counter | none | Checkpoints dropped from a full `[audit.sink]` queue before delivery. |
+| `audit_sink_queue_depth` | gauge | none | Checkpoints waiting in the `[audit.sink]` queue. |
+| `audit_sink_oldest_undelivered_timestamp_seconds` | gauge | none | Unix time the oldest undelivered checkpoint was queued; 0 when none. |
+| `audit_wal_checkpoints_total` | counter | `result` (`complete`, `incomplete`, `error`) | Background WAL checkpoint rounds: `complete` left nothing in the WAL, `incomplete` left frames behind (a reader or the writer was in the way; the next commit starts another round). |
+| `audit_wal_locked_passes_total` | counter | none | WAL catch-up passes run holding the store's lock, each pausing appends briefly (only when the WAL passes 64 MB under load). |
+| `audit_wal_backstops_total` | counter | none | WAL checkpoints the audit writer ran itself because the WAL outgrew the backstop (128 MB): the background thread fell behind. |
+| `audit_wal_presyncs_total` | counter | `file` (`wal`, `db`) | Syncs run off the request path: `wal` ahead of a signed checkpoint, `db` before a locked pass. |
+| `audit_wal_frames` | gauge | none | Frames in the WAL at the last checkpoint pass. |
+| `audit_wal_last_complete_timestamp_seconds` | gauge | none | Unix time the last complete WAL checkpoint round finished; 0 before the first. |
+| `http_requests_total` | counter | `route` (route template, for example `/mcp/{server}`), `status` | HTTP requests by route template and status. |
+| `authorize_duration_seconds` | histogram | none | Time to decide one tool call: leases, labels, run limits, run lock, approval, policy, charge and audit append. |
+| `audit_append_duration_seconds` | histogram | none | Time for one audit log append, including waiting for the store's lock. |
+| `proxy_stage_seconds` | histogram | `stage` (`token_verify_hit`, `token_verify_miss`, `lease_check`, `policy`, `audit_append`, `blocking_pool`, `upstream`, `response`, `total`) | Time per stage of a proxied call. `policy` runs from the end of the lease check to the policy's answer, so it includes the label and budget reads and the wait for the run lock. |
+| `budget_charges_total` | counter | `kind` (`calls`, `sum`, `calls_per`, `distinct`) | Run-limit counters charged by allowed calls, one per matching limit in every hop (a call charged to three hops adds 3). Run usage is not counted. |
+| `budget_exhausted_total` | counter | `kind`, `at` (`check`, `charge`) | Calls denied with `budget_exhausted`, by the limit kind hit and where: `check` on the counters as read, `charge` in the store's re-check because a concurrent call of the run spent the budget first. |
+| `budget_refunds_total` | counter | `source` (`operator`, `audit_error`) | Decisions whose run-limit charge was returned: `operator` through `POST /admin/budgets/refund`, `audit_error` by the pipeline when the allowed decision could not be recorded. |
+| `approvals_created_total` | counter | none | Pending approvals stored for `approval_required` calls. A repeated gated call that finds the pending one does not count. |
+| `approvals_decided_total` | counter | `outcome` (`granted`, `declined`), `by` (`user`, `operator`) | Approvals granted or declined. Refused attempts (not pending, expired, revoked lease) are not counted. |
+| `approvals_consumed_total` | counter | `by` (`user`, `operator`) | Granted approvals spent by the allowed call they were for, by who granted them. |
+| `approvals_expired_total` | counter | none | Attempts to grant, decline or present (as an approval token) an approval that had expired. Expiry is not a state, so an approval that lapses with nobody asking is not counted. |
+| `results_recorded_total` | counter | `label` (`trusted`, `untrusted`) | Tool results recorded after an allowed call, by output label. Each untrusted one labels its run. A result that could not be recorded is withheld (`label_error`) and not counted. |
+| `taint_matches_total` | counter | `decision` (`allow`, `deny`) | Decisions on destructive calls in a tainted run with at least one argument found in the run's untrusted results (or not checkable because the span index could not be read). |
+| `run_lock_wait_seconds` | histogram | none | Time a decision waited for its run's lock (SR-55), from 1 us to 1 s, five buckets per decade. Only decisions on a hop with run limits or on a tool that keeps run usage take it, so `run_lock_wait_seconds_count` is the number of guarded decisions. |
+
+The `audit_wal_*` series appear only when the background WAL checkpointer runs (a file-backed store with `[audit] wal_checkpoint_seconds` above 0, the default). Soft limits (a policy over `context.usage` or `context.budget` that asks for an approval) are not told apart from other `approval_required` decisions: the reason is the same and the deciding policy ids are not labels.

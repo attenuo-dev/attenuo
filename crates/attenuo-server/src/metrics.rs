@@ -1,15 +1,18 @@
 //! Prometheus metrics: hand-rolled counters and histograms, plus the text exposition writer.
 //!
 //! No dependency: a few atomics and two small maps behind mutexes. Label values come from
-//! fixed sets (reason codes, route templates, status codes), so cardinality stays bounded.
+//! fixed sets (reason codes, route templates, status codes, limit kinds, approver kinds), so
+//! cardinality stays bounded: nothing is labelled by lease, user, run or argument value.
 //! The endpoint lives on its own listener (`[metrics] listen`), never on the proxy port.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use attenuo_audit::WalStats;
+use attenuo_core::{LimitKind, OutputLabel};
 use attenuo_proxy::Stage;
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{header, HeaderValue};
@@ -31,6 +34,59 @@ pub const STAGE_BUCKETS: [f64; 31] = [
 ];
 
 const PREFIX: &str = "attenuo";
+
+/// The `kind` label values of the run-limit series, in index order (see [`kind_index`]).
+const LIMIT_KINDS: [LimitKind; 4] = [
+    LimitKind::Calls,
+    LimitKind::Sum,
+    LimitKind::CallsPer,
+    LimitKind::Distinct,
+];
+
+fn kind_index(kind: LimitKind) -> usize {
+    match kind {
+        LimitKind::Calls => 0,
+        LimitKind::Sum => 1,
+        LimitKind::CallsPer => 2,
+        LimitKind::Distinct => 3,
+    }
+}
+
+/// The `by` label values of the approval series, in index order.
+const APPROVER_KINDS: [&str; 2] = ["user", "operator"];
+
+fn approver_index(by: &str) -> Option<usize> {
+    APPROVER_KINDS.iter().position(|k| *k == by)
+}
+
+/// Where a decision met an exhausted run limit (the `at` label of
+/// `budget_exhausted_total`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExhaustedAt {
+    /// The limit check before Cedar, on the counters as read.
+    Check = 0,
+    /// The store's re-check in the charge transaction: a concurrent call of the run spent the
+    /// budget after this one read it.
+    Charge = 1,
+}
+
+/// Who returned a run-limit charge (the `source` label of `budget_refunds_total`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefundSource {
+    /// `POST /admin/budgets/refund`.
+    Operator = 0,
+    /// The pipeline, because the allowed decision's record could not be written.
+    AuditError = 1,
+}
+
+/// Reads the WAL checkpointer's counters at render time (see [`Metrics::set_wal_source`]).
+struct WalSource(Box<dyn Fn() -> Option<WalStats> + Send + Sync>);
+
+impl std::fmt::Debug for WalSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WalSource")
+    }
+}
 
 /// All server metrics. Cheap to share: clone the `Arc`.
 #[derive(Debug)]
@@ -58,6 +114,30 @@ pub struct Metrics {
     audit_append: Histogram,
     /// Per-stage time of proxied calls, indexed by [`Stage::index`].
     stages: [Histogram; Stage::ALL.len()],
+    /// Unix time of the newest signed audit checkpoint this process wrote, 0 before the first.
+    audit_checkpoint_last_unix: AtomicU64,
+    /// Run limits (ADR-0010), by [`kind_index`]: limit counters charged by allowed calls,
+    /// and `budget_exhausted` decisions by where the limit was met ([`ExhaustedAt`]).
+    budget_charges: [AtomicU64; 4],
+    budget_exhausted: [[AtomicU64; 2]; 4],
+    /// Charges returned, by [`RefundSource`].
+    budget_refunds: [AtomicU64; 2],
+    /// Approvals (ADR-0009): pending approvals stored, decided by (outcome granted/declined,
+    /// approver kind), consumed by approver kind, and refused because they had expired.
+    approvals_created: AtomicU64,
+    approvals_decided: [[AtomicU64; 2]; 2],
+    approvals_consumed: [AtomicU64; 2],
+    approvals_expired: AtomicU64,
+    /// Output labelling (ADR-0009): results recorded, by label (trusted, untrusted), and
+    /// decisions on destructive calls whose arguments matched the run's span index, by
+    /// decision (allow, deny).
+    results_recorded: [AtomicU64; 2],
+    taint_matches: [AtomicU64; 2],
+    /// SR-55: time to acquire a run's lock, observed once per guarded decision (its count is
+    /// the guarded decisions).
+    run_lock_wait: Histogram,
+    /// The background WAL checkpointer of the audit store, when there is one.
+    wal: OnceLock<WalSource>,
 }
 
 impl Default for Metrics {
@@ -78,6 +158,18 @@ impl Default for Metrics {
             authorize: Histogram::new(&BUCKETS),
             audit_append: Histogram::new(&BUCKETS),
             stages: std::array::from_fn(|_| Histogram::new(&STAGE_BUCKETS)),
+            audit_checkpoint_last_unix: AtomicU64::default(),
+            budget_charges: Default::default(),
+            budget_exhausted: Default::default(),
+            budget_refunds: Default::default(),
+            approvals_created: AtomicU64::default(),
+            approvals_decided: Default::default(),
+            approvals_consumed: Default::default(),
+            approvals_expired: AtomicU64::default(),
+            results_recorded: Default::default(),
+            taint_matches: Default::default(),
+            run_lock_wait: Histogram::new(&STAGE_BUCKETS),
+            wal: OnceLock::new(),
         }
     }
 }
@@ -221,9 +313,77 @@ impl Metrics {
         self.stages[stage.index()].observe(d);
     }
 
-    /// Count one signed audit checkpoint.
+    /// Count one signed audit checkpoint, written now.
     pub fn audit_checkpoint(&self) {
         self.audit_checkpoints.fetch_add(1, Ordering::Relaxed);
+        self.audit_checkpoint_last_unix
+            .store(unix_secs(std::time::SystemTime::now()), Ordering::Relaxed);
+    }
+
+    /// Read the audit store's WAL checkpointer through `source` at every render. Set once;
+    /// later calls are ignored. `source` returns `None` when no checkpointer runs, and the WAL
+    /// series are then left out.
+    pub fn set_wal_source(&self, source: impl Fn() -> Option<WalStats> + Send + Sync + 'static) {
+        let _ = self.wal.set(WalSource(Box::new(source)));
+    }
+
+    /// Count one run-limit counter charged by an allowed call (ADR-0010).
+    pub fn budget_charged(&self, kind: LimitKind) {
+        self.budget_charges[kind_index(kind)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one `budget_exhausted` decision: the limit kind that was hit and where.
+    pub fn budget_exhausted(&self, kind: LimitKind, at: ExhaustedAt) {
+        self.budget_exhausted[kind_index(kind)][at as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one decision's charge returned to the run-limit counters.
+    pub fn budget_refunded(&self, source: RefundSource) {
+        self.budget_refunds[source as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one pending approval stored (a repeated gated call that finds the pending one
+    /// does not count).
+    pub fn approval_created(&self) {
+        self.approvals_created.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one approval granted or declined, by `by` (`user` or `operator`; anything else
+    /// is not counted).
+    pub fn approval_decided(&self, granted: bool, by: &str) {
+        if let Some(i) = approver_index(by) {
+            self.approvals_decided[usize::from(!granted)][i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Count one granted approval consumed by an allowed call, by who granted it.
+    pub fn approval_consumed(&self, by: &str) {
+        if let Some(i) = approver_index(by) {
+            self.approvals_consumed[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Count one attempt to decide or use an approval that had expired (expiry is not a
+    /// state: an approval that lapses unseen is not counted).
+    pub fn approval_expired(&self) {
+        self.approvals_expired.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one tool result recorded, by its output label.
+    pub fn result_recorded(&self, label: OutputLabel) {
+        let i = usize::from(label == OutputLabel::Untrusted);
+        self.results_recorded[i].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one decision on a destructive call with an argument that matched the run's span
+    /// index (or could not be checked against it).
+    pub fn taint_match(&self, allowed: bool) {
+        self.taint_matches[usize::from(!allowed)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record how long a guarded decision waited for its run's lock (SR-55).
+    pub fn observe_run_lock_wait(&self, d: Duration) {
+        self.run_lock_wait.observe(d);
     }
 
     /// Count one checkpoint delivered by `[audit.sink]`.
@@ -245,10 +405,8 @@ impl Metrics {
     /// (queued or in flight) was queued.
     pub fn audit_sink_queue(&self, depth: u64, oldest: Option<std::time::SystemTime>) {
         self.audit_sink_queue_depth.store(depth, Ordering::Relaxed);
-        let unix = oldest
-            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_secs().max(1));
-        self.audit_sink_oldest_unix.store(unix, Ordering::Relaxed);
+        self.audit_sink_oldest_unix
+            .store(oldest.map_or(0, unix_secs), Ordering::Relaxed);
     }
 
     /// Prometheus text exposition format (version 0.0.4).
@@ -257,7 +415,7 @@ impl Metrics {
         header_lines(
             &mut out,
             "decisions_total",
-            "Authorization decisions by outcome and reason.",
+            "Pipeline decisions (MCP proxy and AuthZEN) by outcome and reason code.",
             "counter",
         );
         if let Ok(m) = self.decisions.lock() {
@@ -304,6 +462,16 @@ impl Metrics {
             "Signed audit checkpoints written.",
             &self.audit_checkpoints,
         );
+        simple_gauge(
+            &mut out,
+            "audit_checkpoint_last_timestamp_seconds",
+            "Unix time the newest signed audit checkpoint was written by this process; 0 when \
+             none.",
+            &self.audit_checkpoint_last_unix,
+        );
+        if let Some(stats) = self.wal.get().and_then(|w| (w.0)()) {
+            render_wal(&mut out, &stats);
+        }
         simple_counter(
             &mut out,
             "audit_sink_delivered_total",
@@ -352,7 +520,8 @@ impl Metrics {
         self.authorize.render(
             &mut out,
             "authorize_duration_seconds",
-            "Time to decide one tool call (leases, policy, audit append).",
+            "Time to decide one tool call (leases, labels, run limits, run lock, approval, \
+             policy, charge, audit append).",
         );
         self.audit_append.render(
             &mut out,
@@ -374,8 +543,201 @@ impl Metrics {
                 &format!("stage=\"{}\",", stage.as_str()),
             );
         }
+        self.render_limits_approvals_labels(&mut out);
+        self.run_lock_wait.render(
+            &mut out,
+            "run_lock_wait_seconds",
+            "Time a decision waited for its delegation run's lock (SR-55); only decisions whose \
+             policy input includes run limits or run usage take it.",
+        );
         out
     }
+
+    fn render_limits_approvals_labels(&self, out: &mut String) {
+        header_lines(
+            out,
+            "budget_charges_total",
+            "Run-limit counters charged by allowed calls, by limit kind (one per matching \
+             limit in every hop).",
+            "counter",
+        );
+        for kind in LIMIT_KINDS {
+            let n = self.budget_charges[kind_index(kind)].load(Ordering::Relaxed);
+            let _ = writeln!(
+                out,
+                "{PREFIX}_budget_charges_total{{kind=\"{}\"}} {n}",
+                kind.as_str()
+            );
+        }
+        header_lines(
+            out,
+            "budget_exhausted_total",
+            "Calls denied with budget_exhausted, by the limit kind hit and where: check (the \
+             counters as read) or charge (spent by a concurrent call of the run).",
+            "counter",
+        );
+        for kind in LIMIT_KINDS {
+            for (at, name) in ["check", "charge"].iter().enumerate() {
+                let n = self.budget_exhausted[kind_index(kind)][at].load(Ordering::Relaxed);
+                let _ = writeln!(
+                    out,
+                    "{PREFIX}_budget_exhausted_total{{kind=\"{}\",at=\"{name}\"}} {n}",
+                    kind.as_str()
+                );
+            }
+        }
+        header_lines(
+            out,
+            "budget_refunds_total",
+            "Decisions whose run-limit charge was returned, by source: operator (POST \
+             /admin/budgets/refund) or audit_error (the decision could not be recorded).",
+            "counter",
+        );
+        for (i, source) in ["operator", "audit_error"].iter().enumerate() {
+            let n = self.budget_refunds[i].load(Ordering::Relaxed);
+            let _ = writeln!(
+                out,
+                "{PREFIX}_budget_refunds_total{{source=\"{source}\"}} {n}"
+            );
+        }
+        simple_counter(
+            out,
+            "approvals_created_total",
+            "Pending approvals stored for approval_required calls.",
+            &self.approvals_created,
+        );
+        header_lines(
+            out,
+            "approvals_decided_total",
+            "Approvals granted or declined, by outcome and approver kind.",
+            "counter",
+        );
+        for (o, outcome) in ["granted", "declined"].iter().enumerate() {
+            for (i, by) in APPROVER_KINDS.iter().enumerate() {
+                let n = self.approvals_decided[o][i].load(Ordering::Relaxed);
+                let _ = writeln!(
+                    out,
+                    "{PREFIX}_approvals_decided_total{{outcome=\"{outcome}\",by=\"{by}\"}} {n}"
+                );
+            }
+        }
+        header_lines(
+            out,
+            "approvals_consumed_total",
+            "Granted approvals spent by the allowed call they were for, by approver kind.",
+            "counter",
+        );
+        for (i, by) in APPROVER_KINDS.iter().enumerate() {
+            let n = self.approvals_consumed[i].load(Ordering::Relaxed);
+            let _ = writeln!(out, "{PREFIX}_approvals_consumed_total{{by=\"{by}\"}} {n}");
+        }
+        simple_counter(
+            out,
+            "approvals_expired_total",
+            "Attempts to grant, decline or present an approval that had expired.",
+            &self.approvals_expired,
+        );
+        header_lines(
+            out,
+            "results_recorded_total",
+            "Tool results recorded after an allowed call, by output label; untrusted ones \
+             label the run.",
+            "counter",
+        );
+        for (i, label) in ["trusted", "untrusted"].iter().enumerate() {
+            let n = self.results_recorded[i].load(Ordering::Relaxed);
+            let _ = writeln!(
+                out,
+                "{PREFIX}_results_recorded_total{{label=\"{label}\"}} {n}"
+            );
+        }
+        header_lines(
+            out,
+            "taint_matches_total",
+            "Decisions on destructive calls with an argument found in the run's untrusted \
+             results (or not checkable), by decision.",
+            "counter",
+        );
+        for (i, decision) in ["allow", "deny"].iter().enumerate() {
+            let n = self.taint_matches[i].load(Ordering::Relaxed);
+            let _ = writeln!(
+                out,
+                "{PREFIX}_taint_matches_total{{decision=\"{decision}\"}} {n}"
+            );
+        }
+    }
+}
+
+/// The WAL checkpointer's series.
+fn render_wal(out: &mut String, s: &WalStats) {
+    header_lines(
+        out,
+        "audit_wal_checkpoints_total",
+        "Background WAL checkpoint rounds, by result: complete (nothing left in the WAL), \
+         incomplete (frames left behind) or error.",
+        "counter",
+    );
+    for (result, n) in [
+        ("complete", s.rounds_complete),
+        ("incomplete", s.rounds_incomplete),
+        ("error", s.round_errors),
+    ] {
+        let _ = writeln!(
+            out,
+            "{PREFIX}_audit_wal_checkpoints_total{{result=\"{result}\"}} {n}"
+        );
+    }
+    let counter = |out: &mut String, name: &str, help: &str, n: u64| {
+        header_lines(out, name, help, "counter");
+        let _ = writeln!(out, "{PREFIX}_{name} {n}");
+    };
+    counter(
+        out,
+        "audit_wal_locked_passes_total",
+        "WAL catch-up passes run holding the store's lock (each pauses appends briefly).",
+        s.locked_passes,
+    );
+    counter(
+        out,
+        "audit_wal_backstops_total",
+        "WAL checkpoints the audit writer ran itself because the WAL outgrew the backstop.",
+        s.backstops,
+    );
+    header_lines(
+        out,
+        "audit_wal_presyncs_total",
+        "Syncs run off the request path: wal (ahead of a signed checkpoint) or db (before a \
+         locked pass).",
+        "counter",
+    );
+    for (file, n) in [("wal", s.wal_presyncs), ("db", s.db_presyncs)] {
+        let _ = writeln!(
+            out,
+            "{PREFIX}_audit_wal_presyncs_total{{file=\"{file}\"}} {n}"
+        );
+    }
+    let gauge = |out: &mut String, name: &str, help: &str, n: u64| {
+        header_lines(out, name, help, "gauge");
+        let _ = writeln!(out, "{PREFIX}_{name} {n}");
+    };
+    gauge(
+        out,
+        "audit_wal_frames",
+        "Frames in the WAL at the last checkpoint pass.",
+        s.wal_frames,
+    );
+    gauge(
+        out,
+        "audit_wal_last_complete_timestamp_seconds",
+        "Unix time the last complete WAL checkpoint round finished; 0 before the first.",
+        s.last_complete_unix,
+    );
+}
+
+/// Unix seconds, at least 1 (0 is the gauges' "none").
+fn unix_secs(t: std::time::SystemTime) -> u64 {
+    t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs().max(1))
 }
 
 fn header_lines(out: &mut String, name: &str, help: &str, kind: &str) {
@@ -398,6 +760,140 @@ fn escape(v: &str) -> String {
     v.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
+}
+
+/// Check `text` against the Prometheus text exposition format 0.0.4, as far as the server
+/// uses it: `# HELP` and `# TYPE` lines, one `# TYPE` per family placed before its samples,
+/// valid metric and label names, quoted label values with only `\\`, `\"` and `\n`
+/// escapes, no repeated series, a numeric value on every sample, and histogram samples only
+/// as `_bucket` (with `le`), `_sum` and `_count`. `Err` names the first offending line. For
+/// tests.
+#[doc(hidden)]
+pub fn check_text_format(text: &str) -> Result<(), String> {
+    use std::collections::{BTreeSet, HashMap};
+    fn valid_name(n: &str, colon: bool) -> bool {
+        let mut chars = n.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || (colon && c == ':'))
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || (colon && c == ':'))
+    }
+    let mut types: HashMap<String, String> = HashMap::new();
+    let mut helps: BTreeSet<String> = BTreeSet::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    if !text.is_empty() && !text.ends_with('\n') {
+        return Err("the text does not end with a newline".into());
+    }
+    for (i, line) in text.lines().enumerate() {
+        let bad = |why: &str| Err(format!("line {}: {why}: {line}", i + 1));
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("# ") {
+            let mut parts = rest.splitn(3, ' ');
+            let (kw, name, tail) = (parts.next(), parts.next(), parts.next());
+            let Some(name) = name.filter(|n| valid_name(n, true)) else {
+                return bad("bad metric name in a comment");
+            };
+            match kw {
+                Some("HELP") => {
+                    if !helps.insert(name.to_string()) {
+                        return bad("second HELP for a family");
+                    }
+                }
+                Some("TYPE") => {
+                    let kind = tail.unwrap_or_default();
+                    if !["counter", "gauge", "histogram", "summary", "untyped"].contains(&kind) {
+                        return bad("unknown type");
+                    }
+                    if types.insert(name.to_string(), kind.to_string()).is_some() {
+                        return bad("second TYPE for a family");
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+        let (series, value) = match line.rsplit_once(' ') {
+            Some(v) => v,
+            None => return bad("no value"),
+        };
+        if value.parse::<f64>().is_err() && !["+Inf", "-Inf", "NaN"].contains(&value) {
+            return bad("value is not a number");
+        }
+        let (name, labels) = match series.split_once('{') {
+            Some((n, l)) => match l.strip_suffix('}') {
+                Some(l) => (n, l),
+                None => return bad("unclosed label set"),
+            },
+            None => (series, ""),
+        };
+        if !valid_name(name, true) {
+            return bad("bad metric name");
+        }
+        let mut label_names = Vec::new();
+        let mut rest = labels;
+        while !rest.is_empty() {
+            let Some((lname, after)) = rest.split_once("=\"") else {
+                return bad("label without a quoted value");
+            };
+            if !valid_name(lname, false) || label_names.contains(&lname) {
+                return bad("bad or repeated label name");
+            }
+            label_names.push(lname);
+            let mut end = None;
+            let mut escaped = false;
+            for (j, c) in after.char_indices() {
+                match (escaped, c) {
+                    (true, '\\' | '"' | 'n') => escaped = false,
+                    (true, _) => return bad("bad escape in a label value"),
+                    (false, '\\') => escaped = true,
+                    (false, '"') => {
+                        end = Some(j);
+                        break;
+                    }
+                    (false, _) => {}
+                }
+            }
+            let Some(end) = end else {
+                return bad("unterminated label value");
+            };
+            rest = &after[end + 1..];
+            if let Some(r) = rest.strip_prefix(',') {
+                rest = r;
+            } else if !rest.is_empty() {
+                return bad("labels not separated by commas");
+            }
+        }
+        let family = match types.get(name) {
+            Some(_) => name,
+            None => {
+                let base = ["_bucket", "_sum", "_count"]
+                    .iter()
+                    .find_map(|s| name.strip_suffix(s))
+                    .filter(|b| types.get(*b).is_some_and(|t| t == "histogram"));
+                match base {
+                    Some(b) => b,
+                    None => return bad("sample before its TYPE line"),
+                }
+            }
+        };
+        if types[family] == "histogram" {
+            if name == family {
+                return bad("histogram sample without _bucket, _sum or _count");
+            }
+            if name.ends_with("_bucket") != label_names.contains(&"le") {
+                return bad("le belongs on _bucket samples only");
+            }
+        }
+        if !seen.insert(series.to_string()) {
+            return bad("repeated series");
+        }
+    }
+    Ok(())
 }
 
 /// A router serving `GET /metrics` for `metrics`. Mount it on its own listener.
@@ -486,6 +982,117 @@ mod tests {
         assert!(text.contains("attenuo_audit_checkpoints_total 2\n"));
         // The two histograms are independent.
         assert!(text.contains("attenuo_authorize_duration_seconds_count 0\n"));
+    }
+
+    #[test]
+    fn renders_limits_approvals_labels_and_run_lock() {
+        let m = Metrics::new();
+        let text = m.render();
+        check_text_format(&text).unwrap();
+        // Every fixed label combination is there at zero before anything happens.
+        for kind in ["calls", "sum", "calls_per", "distinct"] {
+            assert!(text.contains(&format!(
+                "attenuo_budget_charges_total{{kind=\"{kind}\"}} 0\n"
+            )));
+            for at in ["check", "charge"] {
+                assert!(text.contains(&format!(
+                    "attenuo_budget_exhausted_total{{kind=\"{kind}\",at=\"{at}\"}} 0\n"
+                )));
+            }
+        }
+        assert!(text
+            .contains("attenuo_approvals_decided_total{outcome=\"declined\",by=\"operator\"} 0\n"));
+        assert!(text.contains("attenuo_run_lock_wait_seconds_count 0\n"));
+        assert!(text.contains("attenuo_audit_checkpoint_last_timestamp_seconds 0\n"));
+        // No WAL source, no WAL series.
+        assert!(!text.contains("audit_wal_"));
+
+        m.budget_charged(LimitKind::Calls);
+        m.budget_charged(LimitKind::Calls);
+        m.budget_charged(LimitKind::Distinct);
+        m.budget_exhausted(LimitKind::Sum, ExhaustedAt::Check);
+        m.budget_exhausted(LimitKind::CallsPer, ExhaustedAt::Charge);
+        m.budget_refunded(RefundSource::Operator);
+        m.budget_refunded(RefundSource::AuditError);
+        m.budget_refunded(RefundSource::AuditError);
+        m.approval_created();
+        m.approval_decided(true, "user");
+        m.approval_decided(false, "operator");
+        m.approval_decided(true, "somebody"); // not a known kind: not counted
+        m.approval_consumed("user");
+        m.approval_expired();
+        m.result_recorded(OutputLabel::Untrusted);
+        m.result_recorded(OutputLabel::Trusted);
+        m.result_recorded(OutputLabel::Untrusted);
+        m.taint_match(false);
+        m.observe_run_lock_wait(Duration::from_micros(3));
+        m.observe_run_lock_wait(Duration::from_millis(4));
+        m.audit_checkpoint();
+        m.set_wal_source(|| {
+            Some(WalStats {
+                rounds_complete: 5,
+                rounds_incomplete: 1,
+                wal_presyncs: 2,
+                last_complete_unix: 1_790_000_000,
+                wal_frames: 12,
+                ..WalStats::default()
+            })
+        });
+        let text = m.render();
+        check_text_format(&text).unwrap();
+        for line in [
+            "attenuo_budget_charges_total{kind=\"calls\"} 2",
+            "attenuo_budget_charges_total{kind=\"distinct\"} 1",
+            "attenuo_budget_charges_total{kind=\"sum\"} 0",
+            "attenuo_budget_exhausted_total{kind=\"sum\",at=\"check\"} 1",
+            "attenuo_budget_exhausted_total{kind=\"calls_per\",at=\"charge\"} 1",
+            "attenuo_budget_refunds_total{source=\"operator\"} 1",
+            "attenuo_budget_refunds_total{source=\"audit_error\"} 2",
+            "attenuo_approvals_created_total 1",
+            "attenuo_approvals_decided_total{outcome=\"granted\",by=\"user\"} 1",
+            "attenuo_approvals_decided_total{outcome=\"granted\",by=\"operator\"} 0",
+            "attenuo_approvals_decided_total{outcome=\"declined\",by=\"operator\"} 1",
+            "attenuo_approvals_consumed_total{by=\"user\"} 1",
+            "attenuo_approvals_expired_total 1",
+            "attenuo_results_recorded_total{label=\"untrusted\"} 2",
+            "attenuo_results_recorded_total{label=\"trusted\"} 1",
+            "attenuo_taint_matches_total{decision=\"deny\"} 1",
+            "attenuo_taint_matches_total{decision=\"allow\"} 0",
+            "attenuo_run_lock_wait_seconds_bucket{le=\"0.000003\"} 1",
+            "attenuo_run_lock_wait_seconds_bucket{le=\"+Inf\"} 2",
+            "attenuo_run_lock_wait_seconds_count 2",
+            "attenuo_audit_wal_checkpoints_total{result=\"complete\"} 5",
+            "attenuo_audit_wal_checkpoints_total{result=\"incomplete\"} 1",
+            "attenuo_audit_wal_checkpoints_total{result=\"error\"} 0",
+            "attenuo_audit_wal_presyncs_total{file=\"wal\"} 2",
+            "attenuo_audit_wal_presyncs_total{file=\"db\"} 0",
+            "attenuo_audit_wal_locked_passes_total 0",
+            "attenuo_audit_wal_backstops_total 0",
+            "attenuo_audit_wal_frames 12",
+            "attenuo_audit_wal_last_complete_timestamp_seconds 1790000000",
+        ] {
+            assert!(text.contains(&format!("{line}\n")), "{line}\n{text}");
+        }
+        assert!(!text.contains("attenuo_audit_checkpoint_last_timestamp_seconds 0\n"));
+    }
+
+    #[test]
+    fn text_format_check_rejects_malformed_output() {
+        let ok = "# HELP attenuo_x_total X.\n# TYPE attenuo_x_total counter\nattenuo_x_total{a=\"q\\\"\"} 1\n";
+        check_text_format(ok).unwrap();
+        for bad in [
+            "attenuo_x_total 1\n",                                  // no TYPE
+            "# TYPE attenuo_x counter\nattenuo_x{a=\"1\"} one\n",   // value
+            "# TYPE attenuo_x counter\nattenuo_x{a=1} 1\n",         // unquoted
+            "# TYPE attenuo_x counter\nattenuo_x 1\nattenuo_x 2\n", // repeated
+            "# TYPE attenuo_x counter\n# TYPE attenuo_x counter\n", // two TYPEs
+            "# TYPE attenuo_h histogram\nattenuo_h 1\n",            // bare histogram
+            "# TYPE attenuo_h histogram\nattenuo_h_bucket 1\n",     // no le
+            "# TYPE attenuo_x counter\nattenuo_x{a=\"\\t\"} 1\n",   // bad escape
+            "# TYPE attenuo_x counter\nattenuo_x 1",                // no newline
+        ] {
+            assert!(check_text_format(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
