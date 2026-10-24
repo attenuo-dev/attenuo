@@ -7,7 +7,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use attenuo_audit::{
-    AuditEntry, AuditSink, EntryFilter, LeaseNode, LeaseStore, Order, SignedVerifyReport,
+    AuditEntry, AuditError, AuditSink, EntryFilter, LeaseNode, LeaseStore, Order,
+    SignedVerifyReport,
 };
 use attenuo_core::{AgentId, LeaseId, RecordKind};
 use axum::body::Bytes;
@@ -120,6 +121,73 @@ pub async fn revoke_lease(
             Ok(Json(json!({
                 "lease_id": lease,
                 "revoked": revoked,
+                "reason": reason,
+                "audit_id": audit_id,
+            })))
+        })
+        .await
+}
+
+/// Body of `POST /admin/budgets/refund`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefundBody {
+    /// The decision whose run-limit charge to return: the id of the allowed call's decision
+    /// record (the AuthZEN `context.decision_id`).
+    pub decision_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// `POST /admin/budgets/refund` with `{"decision_id": "...", "reason": "..."}` (ADR-0010):
+/// return to every run-limit counter what that decision charged, at most once, and append an
+/// `admin` record (tool `admin.budget.refund`) naming the decision. For an allowed call whose
+/// effect an operator knows did not happen; neither the agent nor the upstream can refund.
+/// 404 when the decision charged nothing, 409 when it was already refunded.
+///
+/// As with a revocation, the refund stands if its record cannot be written; the response
+/// then carries `audit_id: null` and the failure is logged.
+pub async fn refund_budget(
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let body: RefundBody = super::parse_json(&body)?;
+    let reason = body
+        .reason
+        .unwrap_or_else(|| "refunded by admin".to_string());
+    let decision_id = body.decision_id;
+    let now = now();
+    state
+        .blocking(move |state| {
+            let refunded = state
+                .leases
+                .refund(&decision_id, now)
+                .map_err(|e| match e {
+                    AuditError::UnknownCharge(_) => ApiError::not_found(format!(
+                        "no budget charge is recorded for decision `{decision_id}`"
+                    )),
+                    AuditError::ChargeRefunded(_) => ApiError::new(
+                        StatusCode::CONFLICT,
+                        "already_refunded",
+                        format!("the charge of decision `{decision_id}` was already refunded"),
+                    ),
+                    other => ApiError::internal(other),
+                })?;
+            tracing::warn!(decision = ?decision_id, reason = ?reason, refunded, "budget refunded");
+            let audit_id = audit_admin(
+                state,
+                "admin.budget.refund",
+                Decision::Allow,
+                REASON_ADMIN_ACTION,
+                Vec::new(),
+                json!({ "decision_id": decision_id, "reason": reason, "refunded": refunded }),
+                now,
+            )
+            .inspect_err(|e| tracing::error!(error = ?e.detail, "budget refund was not audited"))
+            .ok();
+            Ok(Json(json!({
+                "decision_id": decision_id,
+                "refunded": refunded,
                 "reason": reason,
                 "audit_id": audit_id,
             })))

@@ -147,7 +147,10 @@ pub async fn check_policies(State(state): State<Arc<AppState>>) -> Result<Json<V
 /// The decision is [`Pipeline::evaluate_policy`](crate::authz::Pipeline::evaluate_policy), the
 /// same capability stage and Cedar evaluation `POST /access/v1/evaluation` runs after its lease
 /// check. Answers `{decision, reason, policy_ids, diagnostics, lease_check: "skipped",
-/// chain_source: "token" | "admin_supplied", token_expired}`.
+/// chain_source: "token" | "admin_supplied", token_expired, session, approval, budget}`, plus
+/// `limit` when a run limit would be exceeded. `budget` is what the run limits matching the
+/// call have left, read from the lease store as `context.budget` (ADR-0010); the dry run
+/// never charges a counter.
 pub async fn evaluate_policies(
     State(state): State<Arc<AppState>>,
     body: Bytes,
@@ -214,12 +217,15 @@ pub async fn evaluate_policies(
         Some(s) => (s, "request"),
         None => (state.pipeline.run_labels(&chain).session, "store"),
     };
+    // Run limits (ADR-0010): the counters as they are now. Read, never charged.
+    let budget = state.pipeline.budget_view(&chain, &call);
     let labels = CallLabels {
         session: session.clone(),
         approval: approval.clone(),
+        budget: budget.context.clone(),
     };
     let o = state.pipeline.evaluate_policy(&chain, &call, &labels, now);
-    Ok(Json(json!({
+    let mut out = json!({
         "decision": o.decision,
         "reason": o.reason,
         "policy_ids": o.policy_ids,
@@ -233,7 +239,12 @@ pub async fn evaluate_policies(
             "source": session_source,
         },
         "approval": { "present": approval.present, "by": approval.by },
-    })))
+        "budget": crate::authz::budget_json(&budget.context),
+    });
+    if let Some(hit) = &budget.hit {
+        out["limit"] = hit.to_json();
+    }
+    Ok(Json(out))
 }
 
 /// The optional `session` member of a dry run: `{"tainted_by": ["<server>/<tool>", ...],

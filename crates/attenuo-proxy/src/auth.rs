@@ -27,6 +27,9 @@ pub struct AuthDecision {
     /// the `-32008` error data names (ADR-0009). `None` otherwise, or when it could not be
     /// stored.
     pub approval: Option<ApprovalTicket>,
+    /// For a `budget_exhausted` decision: the run limit that was hit, `{hop, kind, arg, max,
+    /// used}` (ADR-0010), which the `-32003` error data carries as `limit`. `None` otherwise.
+    pub limit: Option<serde_json::Value>,
 }
 
 /// The pending approval behind an `approval_required` decision.
@@ -45,6 +48,7 @@ impl AuthDecision {
             reason: reason.into(),
             decision_id,
             approval: None,
+            limit: None,
         }
     }
 
@@ -54,12 +58,19 @@ impl AuthDecision {
             reason: reason.into(),
             decision_id,
             approval: None,
+            limit: None,
         }
     }
 
     /// Attach the pending approval of an `approval_required` decision.
     pub fn with_approval(mut self, approval: Option<ApprovalTicket>) -> Self {
         self.approval = approval;
+        self
+    }
+
+    /// Attach the run limit a `budget_exhausted` decision hit.
+    pub fn with_limit(mut self, limit: Option<serde_json::Value>) -> Self {
+        self.limit = limit;
         self
     }
 

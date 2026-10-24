@@ -1033,8 +1033,9 @@ pub struct AdminUiSection {
     /// same strength check as for a public `[server] listen`.
     #[serde(default)]
     pub allow_public: bool,
-    /// Mount the routes that change state (`POST /admin/leases/{id}/revoke` and
-    /// `POST /admin/policies/reload`) on the console listener. Default `false`, so read-only is
+    /// Mount the routes that change state (`POST /admin/leases/{id}/revoke`,
+    /// `POST /admin/policies/reload`, `POST /admin/approvals/{id}` and
+    /// `POST /admin/budgets/refund`) on the console listener. Default `false`, so read-only is
     /// enforced by the server and not only by the page: those paths answer 404 there. The main
     /// listener keeps every admin route whatever this says.
     #[serde(default)]

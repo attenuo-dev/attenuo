@@ -199,6 +199,7 @@ pub fn read_routes() -> Router<Arc<AppState>> {
 pub fn write_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/admin/leases/{lease_id}/revoke", post(admin::revoke_lease))
+        .route("/admin/budgets/refund", post(admin::refund_budget))
         .route("/admin/policies/reload", post(admin::reload_policies))
         .route("/admin/approvals/{id}", post(approvals::admin_decide))
         .route_layer(middleware::from_fn(require_json))
