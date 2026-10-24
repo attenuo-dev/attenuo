@@ -483,3 +483,74 @@ async def test_policy_evaluate(make: Any) -> None:
     assert "token" not in sent and sent["subject"]["properties"] == {"chain": {"hops": []}}
     with pytest.raises(ValueError):
         await call(client, "policy_evaluate", "github", "read_file")
+
+
+def _approval_body(state: str = "pending", **extra: Any) -> dict[str, Any]:
+    body = {
+        "approval_id": "a1", "state": state, "expired": False, "chain_id": "c1",
+        "lease": "l1", "call_hash": "h", "decision_id": "d1",
+        "call": {"server": "github", "tool": "delete_repo", "arguments": {"repo": "x"}},
+        "labels": [{"seq": 4}], "subject": "alice", "issuer": "https://idp",
+        "agents": ["planner"], "created_at": "2026-10-24T10:00:00Z",
+        "expires_at": "2026-10-24T10:02:00Z",
+    }  # fmt: skip
+    body.update(extra)
+    return body
+
+
+async def test_approvals_list_and_get(make: Any) -> None:
+    def handler(r: httpx.Request) -> httpx.Response:
+        if r.url.path == "/admin/approvals":
+            return httpx.Response(200, json={"approvals": [_approval_body()]})
+        return httpx.Response(200, json=_approval_body())
+
+    client, seen = make(handler)
+    items = await call(client, "approvals", "c1", state="pending", limit=10)
+    assert (seen[-1].method, seen[-1].url.path) == ("GET", "/admin/approvals")
+    assert dict(seen[-1].url.params) == {"chain_id": "c1", "state": "pending", "limit": "10"}
+    assert seen[-1].headers["authorization"] == "Bearer adm"
+    assert [a.approval_id for a in items] == ["a1"]
+    assert items[0].tool == "delete_repo" and items[0].arguments == {"repo": "x"}
+    assert items[0].raw["decision_id"] == "d1" and not items[0].usable
+    await call(client, "approvals")
+    assert dict(seen[-1].url.params) == {}
+
+    a = await call(client, "approval", "a1")
+    assert (seen[-1].method, seen[-1].url.path) == ("GET", "/admin/approvals/a1")
+    assert a.state == "pending" and a.chain_id == "c1"
+    await call(client, "approval", "../a1")
+    assert seen[-1].url.raw_path == b"/admin/approvals/..%2Fa1"
+
+
+async def test_approval_grant_and_decline(make: Any) -> None:
+    def handler(r: httpx.Request) -> httpx.Response:
+        decision = json.loads(r.content)["decision"]
+        state = "granted" if decision == "grant" else "declined"
+        approver = {"subject": "urn:attenuo:admin", "method": "admin_token", "by": "operator"}
+        return httpx.Response(200, json=_approval_body(state, approver=approver))
+
+    client, seen = make(handler)
+    a = await call(client, "grant_approval", "a1")
+    assert (seen[-1].method, seen[-1].url.path) == ("POST", "/admin/approvals/a1")
+    assert json.loads(seen[-1].content) == {"decision": "grant"}
+    assert a.usable and a.approver is not None and a.approver["by"] == "operator"
+    a = await call(client, "decline_approval", "a1")
+    assert json.loads(seen[-1].content) == {"decision": "decline"}
+    assert a.state == "declined" and not a.usable
+
+
+async def test_approval_errors(make: Any) -> None:
+    def handler(r: httpx.Request) -> httpx.Response:
+        if r.method == "POST":
+            return httpx.Response(
+                409, json={"error": "approval_not_pending", "detail": "already granted"}
+            )
+        return httpx.Response(404, json={"error": "not_found", "detail": "unknown approval"})
+
+    client, _ = make(handler)
+    with pytest.raises(ApiError) as e:
+        await call(client, "grant_approval", "a1")
+    assert e.value.status == 409 and e.value.error == "approval_not_pending"
+    with pytest.raises(ApiError) as e:
+        await call(client, "approval", "nope")
+    assert e.value.status == 404
