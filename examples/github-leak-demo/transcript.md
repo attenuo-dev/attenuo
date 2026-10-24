@@ -96,7 +96,7 @@ $ attenuo audit tail -n 10
 #7    2026-10-23T01:43:42.169715443Z  ALLOW attenuo/admin.lease.revoke  by urn:attenuo:admin  reason=admin_action  id=26a60386-a01e-436c-901f-156b9a336a30
 #8    2026-10-23T01:43:42.186751983Z  DENY  github/read_file  assistant > coder for alice  reason=lease_revoked  id=abe9f8f9-0724-4784-9172-6745c6e628f9
 $ attenuo audit verify
-audit chain OK: 8 entries verified
+audit chain OK: 9 entries verified
 checkpoints: none signed yet
 
 == What reached the GitHub server

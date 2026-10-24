@@ -29,7 +29,7 @@ The first run compiles the workspace: about a minute and a half on a 4-core mach
 - The injected call reads `alice/private-salaries`: `DENIED policy_deny`. The token allows `read_file`, but the policy only permits repos matching `alice/public-*`.
 - The injected `create_issue` that would copy the data out: `DENIED capability_denied`, because it was never delegated.
 - Alice revokes the assistant's lease. `coder`'s next call, even the legitimate one, is `DENIED lease_revoked`.
-- The audit chain verifies (8 entries), and the fake GitHub server received exactly one call.
+- The audit chain verifies (9 entries, one of them the `tool_result` record of the allowed read), and the fake GitHub server received exactly one call.
 
 A recorded run is in [transcript.md](examples/github-leak-demo/transcript.md), and the step table is in the [demo README](examples/github-leak-demo/README.md). The demo mints Alice's root token through a development-only endpoint. A real deployment mints it from an OIDC ID token, as shown in [getting started](docs/guides/getting-started.md) and [identity providers](docs/guides/identity-providers.md).
 

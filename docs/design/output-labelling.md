@@ -1,6 +1,6 @@
 # Output labelling: design
 
-- Status: draft for discussion. Nothing here is implemented.
+- Status: phase 1 (sections 3.1 to 3.8 without argument-level taint) and approvals are implemented on `main` (#42, #45, #47, 2026-10-24); phase 2 and the signed approval token are open. Kept as the design record; see section 6 for what was measured.
 - Date: 2026-10-24. Base: `main` at 6d2d4a4.
 - Related: [ADR-0009](../decisions/0009-output-labelling.md) (proposed), [threat model](../spec/threat-model.md), [RFC-0001](../spec/rfc-0001-attenuo.md) section 9 open question 5, [injection suite results](../evaluation/injection-suite.md), [evaluation plan](../research/evaluation-plan.md), [server pipeline](server.md), [ADR-0006](../decisions/0006-lease-based-in-flight-revocation.md) (leases), RFC-0001 section 4.1 (DPoP).
 
