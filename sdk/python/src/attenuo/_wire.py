@@ -123,7 +123,8 @@ class AuthzenDecision:
 class Approval:
     """An approval as ``GET /approvals/{id}`` and the ``/admin/approvals`` routes show it.
     Fields the dataclass does not name (``labels``, ``decision_id``, ``created_at``, ...) are
-    in ``raw``.
+    in ``raw``, among them ``untrusted_args`` (``[{arg, seq, kind}]``, present when an argument
+    of the call matched an untrusted result of the run).
 
     ``state`` is ``pending``, ``granted``, ``declined`` or ``consumed``; ``expired`` is the
     server's view of whether ``expires_at`` has passed. ``usable`` is true for a grant that a

@@ -63,11 +63,11 @@ A `tool_result` record is written after every allowed mediated call that gets an
 | `size` | length in bytes of that canonical JSON |
 | `error` | `true` when the upstream answered with a JSON-RPC error; absent otherwise |
 | `label` | `untrusted`, or `trusted` when the catalog marks the tool's output trusted |
-| `fingerprints` | number of span fingerprints kept for argument matching; `0` until that is built |
+| `fingerprints` | number of span fingerprints kept in the run's index for argument matching; `0` for a trusted result |
 
 The content is not stored. If the record cannot be written, the agent gets a `label_error` denial instead of the answer.
 
-An untrusted result taints the run (see [Writing policies](../guides/writing-policies.md#asking-for-approval-after-untrusted-output)). A decision record of a call on a tainted run has `labels: {tainted_by: [seq, ...]}`, the `seq` of the first `tool_result` record of each source, so an auditor can see what the run had read before a call. A call charged against run limits records `budget: {charged: [{hop, cap, kind, arg, used_after, max}]}`, one entry per counter (`arg` absent for `calls`). `decision_id`, `result`, `labels`, `approval` and `budget` are omitted when absent, so records without them hash exactly as before.
+An untrusted result taints the run (see [Writing policies](../guides/writing-policies.md#asking-for-approval-after-untrusted-output)). A decision record of a call on a tainted run has `labels: {tainted_by: [seq, ...]}`, the `seq` of the first `tool_result` record of each source, so an auditor can see what the run had read before a call. When an argument of the call copied a value or span of an untrusted result, `labels.untrusted_args: [{arg, seq, kind}]` names it, the `tool_result` record it matched and how (`leaf`, `entity`, `kgram`, or `unreadable` when the index could not be read; then without `seq`), at most 64 entries. A call charged against run limits records `budget: {charged: [{hop, cap, kind, arg, used_after, max}]}`, one entry per counter (`arg` absent for `calls`). `decision_id`, `result`, `labels`, `approval` and `budget` are omitted when absent, so records without them hash exactly as before.
 
 ## Approvals
 
