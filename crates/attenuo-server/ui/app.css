@@ -544,6 +544,7 @@ dialog .buttons { display: flex; justify-content: flex-end; gap: var(--s2); flex
 .policy-item { display: flex; flex-direction: column; gap: var(--s1); }
 .eval-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); gap: var(--s3); }
 .eval-form .wide { grid-column: 1 / -1; }
+.budget-form > .eval-form { padding-top: var(--s1); }
 
 @media (prefers-reduced-motion: no-preference) {
   tbody tr.fresh td { transition: background-color 1.5s ease; }
