@@ -64,6 +64,13 @@
 //!    `data.reason` (`token_expired`, `lease_revoked`, ...), any other body with a transport
 //!    error (SR-28). See [`guard`].
 //!
+//! 10. removes a signed approval token from `params._meta["dev.attenuo/approval"]`
+//!     ([`auth::META_APPROVAL_KEY`]) of every message before it goes upstream (and `_meta`
+//!     itself when nothing else is left in it), and hands the token to the decision in
+//!     [`CallContext::approval_token`] (output labelling, ADR-0009). The key is removed before
+//!     the [`ToolCall`](attenuo_core::ToolCall) is built, so it never reaches the arguments or
+//!     the call hash. A value that is not a string gets `-32602`.
+//!
 //! Every authorized request's response carries an `X-Attenuo-Decision-Id` header with the
 //! id(s) of the decision record(s) the authorizer produced, so a client can correlate a reply
 //! with the audit log.
@@ -130,8 +137,8 @@ pub mod stage;
 pub mod testing;
 
 pub use auth::{
-    ApprovalTicket, AuthDecision, AuthError, Authenticated, Authorizer, RequestAuth,
-    REASON_APPROVAL_REQUIRED, REASON_LABEL_ERROR,
+    ApprovalTicket, AuthDecision, AuthError, Authenticated, Authorizer, CallContext, RequestAuth,
+    META_APPROVAL_KEY, REASON_APPROVAL_REQUIRED, REASON_LABEL_ERROR,
 };
 pub use config::{ProxyConfig, UpstreamConfig};
 pub use proxy::{

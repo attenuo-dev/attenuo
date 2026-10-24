@@ -1,4 +1,6 @@
-# For run.py and test_suite.py. The attenuo SDK itself is imported from sdk/python/src.
+# For run.py and test_suite.py. The attenuo SDK itself is imported from sdk/python/src,
+# so its runtime dependencies are listed here too (rfc8785 for call hashes).
 httpx>=0.25
 pyyaml>=6
 pytest>=8
+rfc8785==0.1.4

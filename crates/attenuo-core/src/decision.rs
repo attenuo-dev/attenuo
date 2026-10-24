@@ -227,6 +227,11 @@ pub struct ApprovalInfo {
     /// On a grant record: `grant` or `decline`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
+    /// On a consuming decision: `token` when the call presented a signed approval token.
+    /// Omitted when the approval was found by the identical-retry lookup, so those records
+    /// hash as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presented: Option<String>,
 }
 
 impl ApprovalInfo {
@@ -240,6 +245,7 @@ impl ApprovalInfo {
             approver: None,
             method: None,
             outcome: None,
+            presented: None,
         }
     }
 }
@@ -380,6 +386,11 @@ pub const REASON_APPROVAL_REQUESTED: &str = "approval_requested";
 pub const REASON_APPROVAL_GRANTED: &str = "approval_granted";
 /// `reason` of an [`RecordKind::ApprovalGrant`] record that declined the approval.
 pub const REASON_APPROVAL_DECLINED: &str = "approval_declined";
+/// `reason` of a decision that refused a presented approval token (`params._meta
+/// ["dev.attenuo/approval"]`, AuthZEN `context.approval_token`): its signature, type or expiry
+/// does not verify, it is bound to another run, hop, call or key, or the approval it names is
+/// not granted any more (consumed, declined, expired, or its lease revoked). A deny.
+pub const REASON_APPROVAL_INVALID: &str = "approval_invalid";
 
 /// `reason` of every [`RecordKind::ToolResult`] record.
 pub const REASON_TOOL_RESULT: &str = "tool_result";

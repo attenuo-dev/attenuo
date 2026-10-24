@@ -150,6 +150,94 @@ async fn operator_lists_shows_grants_and_declines_approvals() {
     assert_eq!(granted["state"], "granted");
     assert_eq!(granted["approver"]["by"], "operator");
 
+    // The grant carries a signed approval token, which `approval verify` checks offline.
+    let approval_token = granted["approval_token"].as_str().unwrap().to_string();
+    let call_hash = attenuo_core::ToolCall::new(
+        "github",
+        "delete_repo",
+        serde_json::json!({"repo": "alice/site"}),
+    )
+    .call_hash();
+    let verify = |extra: &[&str]| {
+        let mut c = attenuo();
+        c.args(["--server", &url, "approval", "verify", &approval_token])
+            .args(extra);
+        c
+    };
+    let out = ok(&run(verify(&[
+        "--call-hash",
+        &call_hash,
+        "--chain-id",
+        &chain_id,
+        "--jkt",
+        "none",
+    ]))
+    .await);
+    assert!(out.contains(&format!("approval  {approval_id}\n")), "{out}");
+    assert!(
+        out.contains("by        urn:attenuo:admin (operator)"),
+        "{out}"
+    );
+    assert!(out.contains("VALID"), "{out}");
+    // Another call, run or key binding: exit 2.
+    for wrong in [
+        vec!["--call-hash", "00"],
+        vec!["--chain-id", "other-run"],
+        vec!["--lease", "other-hop"],
+        vec!["--jkt", "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I"],
+    ] {
+        let out = run(verify(&wrong)).await;
+        assert_eq!(out.status.code(), Some(2), "{wrong:?}: {}", stdout(&out));
+        assert!(stdout(&out).contains("INVALID: "), "{}", stdout(&out));
+    }
+    // The JWKS from a file or a URL, with --json; and another issuer's JWKS fails.
+    let jwks_file = dir.path().join("jwks.json");
+    let jwks_url = format!("{url}/.well-known/jwks.json");
+    let jwks_text = reqwest::get(&jwks_url).await.unwrap().text().await.unwrap();
+    std::fs::write(&jwks_file, &jwks_text).unwrap();
+    for source in [jwks_file.to_string_lossy().into_owned(), jwks_url] {
+        let mut c = attenuo();
+        c.args([
+            "--json",
+            "approval",
+            "verify",
+            &approval_token,
+            "--jwks",
+            &source,
+        ]);
+        let v: Value = serde_json::from_str(&ok(&run(c).await)).unwrap();
+        assert_eq!(v["valid"], true, "{v}");
+        assert_eq!(v["header"]["typ"], "attenuo-approval+jwt");
+        assert_eq!(v["claims"]["jti"], approval_id.as_str());
+    }
+    let stranger = attenuo_token::Issuer::generate(attenuo_token::IssuerConfig {
+        issuer: "x".into(),
+        audience: "y".into(),
+        max_depth: 4,
+        default_ttl: time::Duration::minutes(5),
+    });
+    let mut other_jwks: Value = serde_json::from_str(&jwks_text).unwrap();
+    let stranger_token = stranger
+        .issue_approval(&attenuo_token::ApprovalGrant {
+            approval_id: "a",
+            approver: "b",
+            by: "user",
+            chain_id: "c",
+            lease: "d",
+            call_hash: "e",
+            granted_at: time::OffsetDateTime::now_utc(),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::minutes(1),
+            jkt: None,
+        })
+        .unwrap();
+    other_jwks["keys"][0]["kid"] = stranger.key_id().into();
+    std::fs::write(&jwks_file, other_jwks.to_string()).unwrap();
+    let mut c = attenuo();
+    c.args(["approval", "verify", &stranger_token, "--jwks"])
+        .arg(&jwks_file);
+    let out = run(c).await;
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+
     // The identical retry runs.
     ok(&run(call("delete_repo", "alice/site")).await);
     assert_eq!(

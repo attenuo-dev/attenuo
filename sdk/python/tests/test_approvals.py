@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import inspect
 import json
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -21,7 +23,12 @@ from attenuo import (
     Denied,
     DpopKey,
     RpcError,
+    VerificationError,
+    call_hash,
+    verify_approval_token,
 )
+
+from .helpers import Signer, b64
 
 BASE = "http://ob.test"
 APPROVAL_ID = "0f8e6c1a-4b7d-4f61-9a39-2f4f5b0e8d11"
@@ -229,3 +236,176 @@ async def test_call_tool_with_approval_gives_up_after_one_retry(make: Any) -> No
     with pytest.raises(ApprovalRequired):
         await call(client, "call_tool_with_approval", "TOK", "github", "delete_repo")
     assert len(seen) == 1
+
+
+# --- signed approval tokens --------------------------------------------------------------------
+
+JKT = "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I"
+
+
+def approval_token(
+    signer: Any, *, typ: str = "attenuo-approval+jwt", exp_delta: int = 120, **claims: Any
+) -> str:
+    now = int(time.time())
+    payload: dict[str, Any] = {
+        "iss": "http://ob.test",
+        "aud": "attenuo",
+        "sub": "alice",
+        "by": "user",
+        "chain_id": "lease-0",
+        "lease": "lease-1",
+        "ch": "ab" * 32,
+        "iat": now,
+        "exp": now + exp_delta,
+        "jti": APPROVAL_ID,
+        **claims,
+    }
+    head = {"alg": "EdDSA", "typ": typ, "kid": "k1"}
+    signing = f"{b64(json.dumps(head).encode())}.{b64(json.dumps(payload).encode())}"
+    return f"{signing}.{b64(signer.key.sign(signing.encode()))}"
+
+
+def test_call_hash_matches_the_server() -> None:
+    # The vector of `ToolCall::call_hash` in attenuo-core: keys sorted, no whitespace.
+    expected = hashlib.sha256(
+        b'{"arguments":{"n":1,"to":"bob"},"server":"mail","tool":"send"}'
+    ).hexdigest()
+    assert call_hash("mail", "send", {"to": "bob", "n": 1}) == expected
+    assert call_hash("mail", "send", {"n": 1.0, "to": "bob"}) == expected
+    assert call_hash("mail", "send", {"to": "eve", "n": 1}) != expected
+    assert call_hash("mail", "send") == call_hash("mail", "send", {})
+
+
+def test_verify_approval_token_checks_signature_type_expiry_and_binding() -> None:
+    signer = Signer()
+    token = approval_token(signer, cnf={"jkt": JKT})
+    claims = verify_approval_token(
+        token,
+        signer.jwks,
+        chain_id="lease-0",
+        lease="lease-1",
+        call_hash="ab" * 32,
+        jkt=JKT,
+        issuer="http://ob.test",
+        audience="attenuo",
+    )
+    assert claims.approval_id == APPROVAL_ID
+    assert claims.approver == "alice"
+    assert claims.by == "user"
+    assert claims.jkt == JKT
+    assert claims.expires_at > claims.issued_at
+    # Each binding, the issuer and the audience are checked when given.
+    for kw in (
+        {"chain_id": "other"},
+        {"lease": "lease-2"},
+        {"call_hash": "cd" * 32},
+        {"jkt": None},
+        {"jkt": "other"},
+        {"issuer": "http://evil"},
+        {"audience": "x"},
+    ):
+        with pytest.raises(VerificationError):
+            verify_approval_token(token, signer.jwks, **kw)
+    # A bearer hop's token has no cnf, and must have none when jkt=None is asked for.
+    bearer = approval_token(signer)
+    assert verify_approval_token(bearer, signer.jwks, jkt=None).jkt is None
+    with pytest.raises(VerificationError):
+        verify_approval_token(bearer, signer.jwks, jkt=JKT)
+    # Expired, wrong typ, another key, a tampered payload.
+    with pytest.raises(VerificationError, match="expired"):
+        verify_approval_token(approval_token(signer, exp_delta=-1), signer.jwks)
+    with pytest.raises(VerificationError, match="typ"):
+        verify_approval_token(approval_token(signer, typ="attenuo+jwt"), signer.jwks)
+    with pytest.raises(VerificationError):
+        verify_approval_token(token, Signer().jwks)
+    head, _, sig = token.split(".")
+    other = approval_token(signer, ch="cd" * 32).split(".")[1]
+    with pytest.raises(VerificationError):
+        verify_approval_token(f"{head}.{other}.{sig}", signer.jwks)
+    with pytest.raises(VerificationError):
+        verify_approval_token("not-a-token", signer.jwks)
+
+
+async def test_approval_carries_its_token(make: Any) -> None:
+    client, _ = make(lambda r: approval("granted", approval_token="APPROVAL.TOKEN.X"))
+    got = await call(client, "get_approval", APPROVAL_ID, "TOK")
+    assert isinstance(got, Approval)
+    assert got.approval_token == "APPROVAL.TOKEN.X"
+    client, _ = make(lambda r: approval("pending"))
+    assert (await call(client, "get_approval", APPROVAL_ID, "TOK")).approval_token is None
+
+
+async def test_call_tool_with_approval_retries_with_the_token(make: Any) -> None:
+    answers = [gated(), approval("granted", approval_token="APPROVAL.TOKEN.X"), allowed()]
+    client, seen = make(lambda r: answers.pop(0))
+    result = await call(
+        client,
+        "call_tool_with_approval",
+        "TOK",
+        "github",
+        "delete_repo",
+        {"repo": "alice/site"},
+        interval=0,
+    )
+    assert result.text == "done"
+    first, retry = (json.loads(r.content) for r in seen if r.method == "POST")
+    assert "_meta" not in first["params"]
+    assert retry["params"] == {
+        "name": "delete_repo",
+        "arguments": {"repo": "alice/site"},
+        "_meta": {"dev.attenuo/approval": "APPROVAL.TOKEN.X"},
+    }
+
+
+async def test_call_tool_sends_an_approval_token_in_meta(make: Any) -> None:
+    client, seen = make(lambda r: allowed())
+    await call(
+        client, "call_tool", "TOK", "github", "delete_repo", {"repo": "a"}, approval_token="T"
+    )
+    body = json.loads(seen[0].content)
+    assert body["params"]["_meta"] == {"dev.attenuo/approval": "T"}
+
+
+# Signed by the Rust issuer (`wire_format_is_pinned_for_the_sdks` in attenuo-token), so the SDK
+# and the server agree on the format.
+RUST_TOKEN = (
+    "eyJ0eXAiOiJhdHRlbnVvLWFwcHJvdmFsK2p3dCIsImFsZyI6IkVkRFNBIiwia2lkIjoiMU9pU0E5bUd3Um54azdwZl"
+    "AyQ0NHdyJ9.eyJpc3MiOiJodHRwczovL2F0dGVudW8udGVzdCIsImF1ZCI6ImF0dGVudW8iLCJzdWIiOiJhbGljZSI"
+    "sImJ5IjoidXNlciIsImNoYWluX2lkIjoibGVhc2Utcm9vdCIsImxlYXNlIjoibGVhc2UtaG9wIiwiY2giOiJhYmFiY"
+    "WJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiIiwiaWF0Ijo"
+    "xNzkyODQzMjAwLCJleHAiOjE3OTI4NDMzMjAsImp0aSI6IjBmOGU2YzFhLTRiN2QtNGY2MS05YTM5LTJmNGY1YjBlO"
+    "GQxMSIsImNuZiI6eyJqa3QiOiIwWmNPQ09SWk5ZeS1EV3BxcTMwalp5SkdIVE4wZDJIZ2xCVjN1aWd1QTRJIn19.YM"
+    "QGXdHjU1Mzr1i15LY7f74Zl6XliQFvHVBs1FzW0mahmH_ngo3PHkfsZWltnvBvsLrv5GQuSXmCxg-IP45kAw"
+)
+RUST_JWKS = {
+    "keys": [
+        {
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "alg": "EdDSA",
+            "use": "sig",
+            "kid": "1OiSA9mGwRnxk7pfP2CCGw",
+            "x": "psIk2NjWmiuoUxoim49SIawYPoOBE8gaMWWVX9fpjVU",
+        }
+    ]
+}
+RUST_IAT = 1792843200
+
+
+def test_verify_approval_token_signed_by_the_server() -> None:
+    claims = verify_approval_token(
+        RUST_TOKEN,
+        RUST_JWKS,
+        chain_id="lease-root",
+        lease="lease-hop",
+        call_hash="ab" * 32,
+        jkt=JKT,
+        issuer="https://attenuo.test",
+        audience="attenuo",
+        now=RUST_IAT,
+    )
+    assert claims.approval_id == APPROVAL_ID
+    assert claims.approver == "alice"
+    assert int(claims.expires_at.timestamp()) == RUST_IAT + 120
+    with pytest.raises(VerificationError, match="expired"):
+        verify_approval_token(RUST_TOKEN, RUST_JWKS, now=RUST_IAT + 120)

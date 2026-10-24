@@ -55,6 +55,7 @@ fn pending(n: u32, call_hash: &str, ttl: Duration) -> Approval {
         approver: None,
         decided_at: None,
         consumed_by: None,
+        jkt: None,
     }
 }
 
@@ -284,4 +285,68 @@ fn approvals_persist_across_reopen() {
     let store = SqliteLeaseStore::open(&path).unwrap();
     assert_eq!(store.approval(&a.id).unwrap().unwrap(), a);
     assert_eq!(a.approver.unwrap().method.by(), "operator");
+}
+
+/// A presented approval token names its approval by id (`jti`): taking it by id checks the
+/// same things as the identical-retry lookup, and is single use too.
+#[test]
+fn approval_taken_by_id_checks_run_hop_call_and_state() {
+    for (name, store) in stores() {
+        let store = store.as_ref();
+        leases(store);
+        let mut wanted = pending(1, "h1", Duration::seconds(120));
+        wanted.jkt = Some("jkt-1".into());
+        let (a, _) = store.create_approval(&wanted).unwrap();
+        assert_eq!(a.jkt.as_deref(), Some("jkt-1"), "{name}");
+        assert_eq!(
+            store.approval(&a.id).unwrap().unwrap().jkt.as_deref(),
+            Some("jkt-1"),
+            "{name}: jkt round trip"
+        );
+        let by_id = |id_: &str, chain: &str, lease: &str, hash: &str, d: &str, now| {
+            store
+                .take_approval_by_id(id_, &id(chain), &id(lease), hash, d, now)
+                .unwrap()
+        };
+        let now = t0() + Duration::seconds(5);
+        assert!(
+            by_id(&a.id, "l1", "l2", "h1", "d1", now).is_none(),
+            "{name}: pending"
+        );
+        store.decide_approval(&a.id, true, &user(), now).unwrap();
+        assert!(
+            by_id("nope", "l1", "l2", "h1", "d1", now).is_none(),
+            "{name}"
+        );
+        assert!(
+            by_id(&a.id, "l9", "l2", "h1", "d1", now).is_none(),
+            "{name}: run"
+        );
+        assert!(
+            by_id(&a.id, "l1", "l1", "h1", "d1", now).is_none(),
+            "{name}: hop"
+        );
+        assert!(
+            by_id(&a.id, "l1", "l2", "h2", "d1", now).is_none(),
+            "{name}: call"
+        );
+        let late = t0() + Duration::seconds(121);
+        assert!(
+            by_id(&a.id, "l1", "l2", "h1", "d1", late).is_none(),
+            "{name}: expired"
+        );
+        let used = by_id(&a.id, "l1", "l2", "h1", "d1", now).unwrap();
+        assert_eq!(used.state, ApprovalState::Consumed, "{name}");
+        assert!(
+            by_id(&a.id, "l1", "l2", "h1", "d2", now).is_none(),
+            "{name}: single use"
+        );
+        store.restore_approval(&a.id, "d1").unwrap();
+        // Revoking the hop's lease kills it.
+        store.revoke(&id("l2"), "test", now).unwrap();
+        assert!(
+            by_id(&a.id, "l1", "l2", "h1", "d3", now).is_none(),
+            "{name}: revoked"
+        );
+    }
 }

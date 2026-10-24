@@ -166,6 +166,11 @@ impl Issuer {
         DetachedSigner::new(Arc::clone(&self.key))
     }
 
+    /// The key that signs tokens (for approval tokens, [`crate::approval`]).
+    pub(crate) fn encoding_key(&self) -> &EncodingKey {
+        &self.encoding_key
+    }
+
     /// The configuration this issuer was built with.
     pub fn config(&self) -> &IssuerConfig {
         &self.config

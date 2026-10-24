@@ -6,6 +6,7 @@
 
 import type { CapabilityLike } from "./capability.js";
 import { DpopKey, NonceCache, exchangeProofs, presented, type DpopKeyLike } from "./dpop.js";
+import { META_APPROVAL_KEY } from "./approval.js";
 import { ApprovalNotGrantedError, ApprovalRequiredError, AttenuoError } from "./errors.js";
 import { Http, type HttpOptions } from "./http.js";
 import { bearer, decodeToken, verifyToken, type Jwks, type Token } from "./token.js";
@@ -39,6 +40,15 @@ export interface InspectOptions {
 export interface McpOptions {
   /** `Mcp-Session-Id` from `initialize`, for upstreams that keep sessions. */
   sessionId?: string;
+}
+
+/** Options of `callTool`. */
+export interface CallToolOptions extends McpOptions {
+  /**
+   * A signed approval token (from a granted `Approval`), sent in
+   * `params._meta["dev.attenuo/approval"]`; the proxy removes it before the upstream.
+   */
+  approvalToken?: string;
 }
 
 export interface ApprovalWaitOptions {
@@ -207,13 +217,15 @@ export class AttenuoClient {
     server: string,
     tool: string,
     args: Record<string, unknown> = {},
-    opts: McpOptions = {},
+    opts: CallToolOptions = {},
   ): Promise<w.ToolResult> {
+    const params: Record<string, unknown> = { name: tool, arguments: args };
+    if (opts.approvalToken) params._meta = { [META_APPROVAL_KEY]: opts.approvalToken };
     const { result, decisionId } = await this.rpc(
       token,
       server,
       "tools/call",
-      { name: tool, arguments: args },
+      params,
       opts.sessionId,
     );
     return w.toolResult(result, decisionId);
@@ -274,7 +286,8 @@ export class AttenuoClient {
 
   /**
    * `callTool`; when the call needs an approval (`-32008`), call `onApproval`, wait for the
-   * grant, and retry the identical call once. A second `-32008`, a decline or an expiry is thrown.
+   * grant, and retry the call once: with the grant's signed approval token in `_meta` when the
+   * server returned one, else identically. A second `-32008`, a decline or an expiry is thrown.
    */
   async callToolWithApproval(
     token: Token | string | undefined,
@@ -284,14 +297,17 @@ export class AttenuoClient {
     opts: CallWithApprovalOptions = {},
   ): Promise<w.ToolResult> {
     const mcp: McpOptions = opts.sessionId === undefined ? {} : { sessionId: opts.sessionId };
+    let granted: w.Approval;
     try {
       return await this.callTool(token, server, tool, args, mcp);
     } catch (e) {
       if (!(e instanceof ApprovalRequiredError) || e.approvalId === undefined) throw e;
       await opts.onApproval?.(e);
-      await this.waitForApproval(e.approvalId, token, opts);
+      granted = await this.waitForApproval(e.approvalId, token, opts);
     }
-    return this.callTool(token, server, tool, args, mcp);
+    const retry: CallToolOptions =
+      granted.approvalToken === undefined ? mcp : { ...mcp, approvalToken: granted.approvalToken };
+    return this.callTool(token, server, tool, args, retry);
   }
 
   /** Ask for a decision without calling the tool. A deny is returned, not thrown. */

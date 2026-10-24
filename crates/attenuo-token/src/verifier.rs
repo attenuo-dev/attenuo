@@ -128,16 +128,15 @@ impl Verifier {
         self.max_depth
     }
 
-    /// Verify `token` as of `now`.
-    ///
-    /// Checks, in order: EdDSA signature; header and claim `typ`; `iss`; `aud`; `exp` against
-    /// `now`; `sub`/`act` consistency with the chain; `ou_sig_v` (only 3 is accepted) and
-    /// `ou_sig` over `iss`, the originating-user block and the root hop, under the `ou_kid` key;
-    /// and finally `chain.validate_at(now, max_depth)`. Time is taken from `now`, never from the
-    /// system clock, so callers control leeway and tests are deterministic.
-    pub fn verify(&self, token: &str, now: OffsetDateTime) -> Result<VerifiedToken, TokenError> {
-        // Let jsonwebtoken check only the signature and algorithm; every other check below
-        // uses the caller's clock and maps to a precise TokenError variant.
+    /// Check the EdDSA signature of `token` under the trusted key its header `kid` names (or
+    /// under each trusted key, without a `kid`) and decode its header and claims. Nothing but
+    /// the signature and the algorithm is checked.
+    pub(crate) fn decode_signed<T: serde::de::DeserializeOwned>(
+        &self,
+        token: &str,
+    ) -> Result<(jsonwebtoken::Header, T), TokenError> {
+        // Let jsonwebtoken check only the signature and algorithm; every other check is the
+        // caller's, with the caller's clock, mapped to a precise TokenError variant.
         let mut validation = Validation::new(Algorithm::EdDSA);
         validation.validate_exp = false;
         validation.validate_nbf = false;
@@ -154,7 +153,7 @@ impl Verifier {
         };
         let mut result = Err(TokenError::InvalidSignature);
         for key in candidates {
-            match jsonwebtoken::decode::<Claims>(token, &key.decoding_key, &validation) {
+            match jsonwebtoken::decode::<T>(token, &key.decoding_key, &validation) {
                 Ok(d) => {
                     result = Ok(d);
                     break;
@@ -163,9 +162,20 @@ impl Verifier {
             }
         }
         let data = result?;
-        let claims = data.claims;
+        Ok((data.header, data.claims))
+    }
 
-        if data.header.typ.as_deref() != Some(TOKEN_TYPE) || claims.typ != TOKEN_TYPE {
+    /// Verify `token` as of `now`.
+    ///
+    /// Checks, in order: EdDSA signature; header and claim `typ`; `iss`; `aud`; `exp` against
+    /// `now`; `sub`/`act` consistency with the chain; `ou_sig_v` (only 3 is accepted) and
+    /// `ou_sig` over `iss`, the originating-user block and the root hop, under the `ou_kid` key;
+    /// and finally `chain.validate_at(now, max_depth)`. Time is taken from `now`, never from the
+    /// system clock, so callers control leeway and tests are deterministic.
+    pub fn verify(&self, token: &str, now: OffsetDateTime) -> Result<VerifiedToken, TokenError> {
+        let (header, claims) = self.decode_signed::<Claims>(token)?;
+
+        if header.typ.as_deref() != Some(TOKEN_TYPE) || claims.typ != TOKEN_TYPE {
             return Err(TokenError::WrongType);
         }
         if claims.iss != self.issuer {

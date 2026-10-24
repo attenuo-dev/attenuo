@@ -3,7 +3,10 @@
 //! When the policy answers `approval_required` for a call, the server stores an [`Approval`]
 //! bound to the delegation run (`chain_id`), the calling hop's lease and the call hash
 //! (`ToolCall::call_hash`). The originating user or an operator then grants or declines it, and
-//! the agent retries the identical call, which consumes a granted approval once.
+//! the agent retries the identical call, which consumes a granted approval once. Instead of
+//! relying on the identical-retry lookup, a retry may present the signed approval token
+//! (`attenuo-approval+jwt`) the grant returned; the server then takes the approval by its id
+//! ([`crate::LeaseStore::take_approval_by_id`]), with the same checks.
 //!
 //! Approvals live in the lease store, next to the leases they are bound to, so that every
 //! state change checks the lease in the same transaction. The life of one approval:
@@ -162,6 +165,10 @@ pub struct Approval {
     pub decided_at: Option<OffsetDateTime>,
     /// Id of the decision record that consumed it.
     pub consumed_by: Option<String>,
+    /// `cnf.jkt` of the calling hop's token when the request proved possession of its key
+    /// (DPoP). Copied into the approval token, which a retry must then present with a proof
+    /// by the same key.
+    pub jkt: Option<String>,
 }
 
 impl Approval {

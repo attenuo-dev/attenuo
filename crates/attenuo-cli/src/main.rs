@@ -298,6 +298,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
         Command::Approval(ApprovalCmd::Decline { id }) => {
             approval_decide(&client?, &id, "decline", json).await
         }
+        Command::Approval(ApprovalCmd::Verify(args)) => approval_verify(client, args, json).await,
         Command::Lease(LeaseCmd::Show { id }) => {
             let resp = client?
                 .admin_get(&format!("/admin/leases/{}", query_escape(&id)))
@@ -663,6 +664,92 @@ async fn approval_decide(client: &Client, id: &str, decision: &str, json: bool) 
         print!("{}", render::render_approval(&resp));
     }
     Ok(Outcome::Ok)
+}
+
+/// `approval verify`: check an approval token offline against the issuer's JWKS.
+async fn approval_verify(
+    client: Result<Client>,
+    args: cli::ApprovalVerifyArgs,
+    json: bool,
+) -> Result<Outcome> {
+    let token = if args.token == "-" {
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        s.trim().to_string()
+    } else {
+        args.token.trim().to_string()
+    };
+    let (header, claims) = jwt::decode_approval_unverified(&token)?;
+    let jwks: Value = match args.jwks.as_deref() {
+        Some(u) if u.starts_with("http://") || u.starts_with("https://") => reqwest::get(u)
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .with_context(|| format!("fetching the JWKS from {u}"))?
+            .json()
+            .await
+            .context("the JWKS is not JSON")?,
+        Some(p) => serde_json::from_str(
+            &std::fs::read_to_string(p).with_context(|| format!("reading {p}"))?,
+        )
+        .with_context(|| format!("{p} is not JSON"))?,
+        None => client?
+            .get("/.well-known/jwks.json")
+            .await
+            .context("fetching the JWKS (or pass --jwks <url|file>)")?,
+    };
+    let binding = jwt::ApprovalBinding {
+        chain_id: args.chain_id.as_deref(),
+        lease: args.lease.as_deref(),
+        call_hash: args.call_hash.as_deref(),
+        jkt: args.jkt.as_deref().map(|k| (k != "none").then_some(k)),
+    };
+    let verdict = jwt::verify_approval_with_jwks(
+        &token,
+        &jwks,
+        args.issuer.as_deref(),
+        args.audience.as_deref(),
+        &binding,
+        OffsetDateTime::now_utc(),
+    );
+    let error = verdict.as_ref().err().map(|e| format!("{e:#}"));
+    if json {
+        print_json(&json!({
+            "header": header,
+            "claims": claims,
+            "valid": verdict.is_ok(),
+            "error": error,
+        }));
+    } else {
+        let s = |k: &str| claims[k].as_str().unwrap_or("-").to_string();
+        let exp = claims["exp"]
+            .as_i64()
+            .and_then(|t| OffsetDateTime::from_unix_timestamp(t).ok())
+            .and_then(|t| {
+                t.format(&time::format_description::well_known::Rfc3339)
+                    .ok()
+            })
+            .unwrap_or_else(|| "-".into());
+        println!("approval  {}", s("jti"));
+        println!("by        {} ({})", s("sub"), s("by"));
+        println!("chain_id  {}", s("chain_id"));
+        println!("lease     {}", s("lease"));
+        println!("call hash {}", s("ch"));
+        println!("expires   {exp}");
+        println!(
+            "cnf.jkt   {}",
+            claims["cnf"]["jkt"].as_str().unwrap_or("- (bearer hop)")
+        );
+        println!("iss {}   aud {}", s("iss"), s("aud"));
+        match &error {
+            None => println!("VALID (signature, typ, iss, aud, exp and the given binding)"),
+            Some(e) => println!("INVALID: {e}"),
+        }
+    }
+    Ok(if verdict.is_ok() {
+        Outcome::Ok
+    } else {
+        Outcome::No
+    })
 }
 
 fn print_call(resp: &Value, json: bool) -> Outcome {

@@ -1,7 +1,8 @@
-//! Decoding delegation tokens locally, and verifying them against a JWKS.
+//! Decoding delegation tokens locally, and verifying them (and approval tokens) against a
+//! JWKS.
 
 use anyhow::{anyhow, bail, Context, Result};
-use attenuo_token::{Claims, VerifiedToken, Verifier};
+use attenuo_token::{ApprovalClaims, Claims, VerifiedToken, Verifier};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use serde_json::Value;
@@ -110,6 +111,100 @@ pub fn verify_with_jwks(
         }
     }
     Ok(verifier.verify(token, now)?)
+}
+
+/// A verifier for `iss`/`aud` trusting every Ed25519 key of `jwks`, the one named `kid` first.
+fn jwks_verifier(
+    jwks: &Value,
+    kid: Option<&str>,
+    issuer: &str,
+    audience: &str,
+) -> Result<Verifier> {
+    let pem = pem_from_jwks(jwks, kid)?;
+    let mut verifier = Verifier::from_public_pem(
+        issuer,
+        audience,
+        attenuo_core::chain::DEFAULT_MAX_DEPTH,
+        &pem,
+    )?;
+    for other in jwks["keys"].as_array().into_iter().flatten() {
+        if let Some(k) = other["kid"].as_str() {
+            if let Ok(extra) = pem_from_jwks(jwks, Some(k)) {
+                verifier = verifier.with_public_pem(&extra)?;
+            }
+        }
+    }
+    Ok(verifier)
+}
+
+/// The binding an approval token is checked against; `None` members are not checked.
+#[derive(Debug, Default)]
+pub struct ApprovalBinding<'a> {
+    pub chain_id: Option<&'a str>,
+    pub lease: Option<&'a str>,
+    pub call_hash: Option<&'a str>,
+    /// `Some(None)`: the hop is a bearer hop, so the token must carry no `cnf`.
+    pub jkt: Option<Option<&'a str>>,
+}
+
+/// Header and claims of an approval token, decoded without checking anything.
+pub fn decode_approval_unverified(token: &str) -> Result<(Value, Value)> {
+    let mut parts = token.trim().split('.');
+    let (Some(h), Some(p), Some(_sig), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        bail!("not a JWT: expected three dot-separated parts");
+    };
+    let decode = |part: &str, what: &str| -> Result<Value> {
+        serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(part)
+                .with_context(|| format!("JWT {what} is not base64url"))?,
+        )
+        .with_context(|| format!("JWT {what} is not JSON"))
+    };
+    Ok((decode(h, "header")?, decode(p, "payload")?))
+}
+
+/// Verify an approval token with the JWKS keys: signature, `typ`, `iss`, `aud` (both default to
+/// the token's own), `exp`, then each binding member that is given.
+pub fn verify_approval_with_jwks(
+    token: &str,
+    jwks: &Value,
+    issuer: Option<&str>,
+    audience: Option<&str>,
+    binding: &ApprovalBinding<'_>,
+    now: OffsetDateTime,
+) -> Result<ApprovalClaims> {
+    let (header, claims) = decode_approval_unverified(token)?;
+    let own = |k: &str| claims[k].as_str().unwrap_or_default().to_string();
+    let verifier = jwks_verifier(
+        jwks,
+        header["kid"].as_str(),
+        issuer.map_or_else(|| own("iss"), str::to_owned).as_str(),
+        audience.map_or_else(|| own("aud"), str::to_owned).as_str(),
+    )?;
+    let c = verifier.verify_approval(token.trim(), now)?;
+    let differs = |want: Option<&str>, got: &str, claim: &str| -> Result<()> {
+        match want {
+            Some(w) if w != got => bail!("`{claim}` is `{got}`, expected `{w}`"),
+            _ => Ok(()),
+        }
+    };
+    differs(binding.chain_id, &c.chain_id, "chain_id")?;
+    differs(binding.lease, &c.lease, "lease")?;
+    differs(binding.call_hash, &c.ch, "ch")?;
+    if let Some(want) = binding.jkt {
+        let got = c.cnf.as_ref().map(|k| k.jkt.as_str());
+        if got != want {
+            bail!(
+                "`cnf.jkt` is {}, expected {}",
+                got.unwrap_or("absent"),
+                want.unwrap_or("absent")
+            );
+        }
+    }
+    Ok(c)
 }
 
 #[cfg(test)]

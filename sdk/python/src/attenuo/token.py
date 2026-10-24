@@ -200,6 +200,43 @@ def _act_agents(act: Any) -> list[str]:
     return out[::-1]
 
 
+def _check_ed25519_signature(jwt: str, header: dict[str, Any], jwks: dict[str, Any]) -> None:
+    """Check that ``alg`` is ``EdDSA`` and the Ed25519 signature of ``jwt`` verifies under the
+    JWKS key its ``kid`` names (the first Ed25519 key without a ``kid``). Raises
+    :class:`VerificationError`. Needs the ``verify`` extra (``cryptography``)."""
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except ImportError as e:  # pragma: no cover - exercised only without the extra
+        raise AttenuoError(
+            "verifying a token needs the 'cryptography' package: pip install 'attenuo[verify]'"
+        ) from e
+
+    if header.get("alg") != "EdDSA":
+        raise VerificationError(f"unsupported alg {header.get('alg')!r}, expected EdDSA")
+    kid = header.get("kid")
+    keys = [
+        k
+        for k in jwks.get("keys", [])
+        if k.get("kty") == "OKP"
+        and k.get("crv") == "Ed25519"
+        and (kid is None or k.get("kid") == kid)
+    ]
+    if not keys:
+        raise VerificationError(f"JWKS has no Ed25519 key{f' with kid {kid!r}' if kid else ''}")
+    try:
+        raw = _b64url_decode(keys[0]["x"])
+        if len(raw) != 32:
+            raise VerificationError(f"JWK x is {len(raw)} bytes, expected 32")
+        public = Ed25519PublicKey.from_public_bytes(raw)
+        head_b64, payload_b64, sig_b64 = jwt.split(".")
+        public.verify(_b64url_decode(sig_b64), f"{head_b64}.{payload_b64}".encode("ascii"))
+    except InvalidSignature as e:
+        raise VerificationError("signature does not match the server's key") from e
+    except (KeyError, AttenuoError, ValueError) as e:
+        raise VerificationError(f"bad JWKS key: {e}") from e
+
+
 def verify_token(
     jwt: str,
     jwks: dict[str, Any],
@@ -216,38 +253,8 @@ def verify_token(
     The detached ``ou_sig`` over the user block is not checked here; the server checks it on
     every request. Needs the ``verify`` extra (``cryptography``).
     """
-    try:
-        from cryptography.exceptions import InvalidSignature
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-    except ImportError as e:  # pragma: no cover - exercised only without the extra
-        raise AttenuoError(
-            "verifying a token needs the 'cryptography' package: pip install 'attenuo[verify]'"
-        ) from e
-
     tok = decode_token(jwt)
-    if tok.header.get("alg") != "EdDSA":
-        raise VerificationError(f"unsupported alg {tok.header.get('alg')!r}, expected EdDSA")
-    kid = tok.header.get("kid")
-    keys = [
-        k
-        for k in jwks.get("keys", [])
-        if k.get("kty") == "OKP"
-        and k.get("crv") == "Ed25519"
-        and (kid is None or k.get("kid") == kid)
-    ]
-    if not keys:
-        raise VerificationError(f"JWKS has no Ed25519 key{f' with kid {kid!r}' if kid else ''}")
-    try:
-        raw = _b64url_decode(keys[0]["x"])
-        if len(raw) != 32:
-            raise VerificationError(f"JWK x is {len(raw)} bytes, expected 32")
-        public = Ed25519PublicKey.from_public_bytes(raw)
-        head_b64, payload_b64, sig_b64 = jwt.strip().split(".")
-        public.verify(_b64url_decode(sig_b64), f"{head_b64}.{payload_b64}".encode("ascii"))
-    except InvalidSignature as e:
-        raise VerificationError("signature does not match the server's key") from e
-    except (KeyError, AttenuoError, ValueError) as e:
-        raise VerificationError(f"bad JWKS key: {e}") from e
+    _check_ed25519_signature(jwt.strip(), tok.header, jwks)
 
     c = tok.claims
     if c.get("typ") != TOKEN_TYPE:

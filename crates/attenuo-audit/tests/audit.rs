@@ -565,6 +565,21 @@ fn approval_records_keep_existing_hashes_and_pin_their_own() {
         "b376c681113872e53feedf22afe80fc1c06328f2a026fa99b5a311c024a062a7"
     );
 
+    // A decision that consumed an approval through a presented approval token says so;
+    // the record above, without `presented`, keeps its hash.
+    let mut by_token = base.clone();
+    by_token["approval"] = serde_json::json!({
+        "id": "00000000-0000-4000-8000-0000000000aa", "by": "user", "presented": "token"
+    });
+    let by_token: attenuo_core::DecisionRecord = serde_json::from_value(by_token).unwrap();
+    assert!(attenuo_audit::canonical_record_json(&by_token).contains(
+        r#""approval":{"by":"user","id":"00000000-0000-4000-8000-0000000000aa","presented":"token"}"#
+    ));
+    assert_eq!(
+        compute_entry_hash(8, &"11".repeat(32), &by_token),
+        "9d589abce954cbd4f96e3ea55404706600ef9992c6a300832326a9ca18d25d58"
+    );
+
     let mut grant = base;
     grant["kind"] = "approval_grant".into();
     grant["reason"] = "approval_granted".into();

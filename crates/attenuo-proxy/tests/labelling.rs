@@ -464,3 +464,74 @@ async fn unmatched_responses_and_notifications_on_the_listen_stream_pass_through
         "only the call's answer"
     );
 }
+
+/// A signed approval token rides in `params._meta["dev.attenuo/approval"]` (ADR-0009). The
+/// proxy takes it out before the message goes upstream, keeps any other `_meta` member, hands
+/// the token and the hop's key binding to the decision, and builds the call (and so the call
+/// hash) from the arguments alone.
+#[tokio::test]
+async fn approval_token_is_stripped_before_upstream_and_passed_to_the_decision() {
+    let h = Harness::start(FakeMcpServer::new(&["read_file"]), StaticAuthorizer::new()).await;
+    let out = h
+        .post(json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "read_file", "arguments": {"path": "a"},
+                        "_meta": {"dev.attenuo/approval": "tok-1"}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "read_file", "arguments": {"path": "a"},
+                        "_meta": {"progressToken": 9, "dev.attenuo/approval": "tok-2"}}},
+            call(3, "read_file"),
+        ]))
+        .await;
+    assert_eq!(out.len(), 3, "{out:?}");
+    assert!(out.iter().all(|m| m.get("result").is_some()), "{out:?}");
+
+    let upstream = h.upstream.recorded_calls();
+    assert_eq!(upstream.len(), 3);
+    assert_eq!(
+        upstream[0].params,
+        json!({"name": "read_file", "arguments": {"path": "a"}}),
+        "an emptied _meta is dropped"
+    );
+    assert_eq!(
+        upstream[1].params,
+        json!({"name": "read_file", "arguments": {"path": "a"}, "_meta": {"progressToken": 9}})
+    );
+    assert!(!serde_json::to_string(&upstream[1].params)
+        .unwrap()
+        .contains("dev.attenuo/approval"));
+
+    let tokens: Vec<Option<String>> = h
+        .authorizer
+        .contexts()
+        .into_iter()
+        .map(|c| c.approval_token)
+        .collect();
+    assert_eq!(
+        tokens,
+        vec![Some("tok-1".to_string()), Some("tok-2".to_string()), None]
+    );
+    // `_meta` is not an argument: the three calls are one call, with one call hash.
+    let decisions = h.authorizer.decisions();
+    let hashes: Vec<String> = decisions
+        .iter()
+        .map(|d| d.arguments_digest.clone())
+        .collect();
+    assert_eq!(hashes[0], hashes[1]);
+    assert_eq!(hashes[1], hashes[2]);
+    let plain = ToolCall::new("s", "read_file", json!({"path": "a"}));
+    assert_eq!(hashes[0], plain.arguments_digest());
+}
+
+#[tokio::test]
+async fn approval_token_that_is_not_a_string_is_invalid_params() {
+    let h = Harness::start(FakeMcpServer::new(&["read_file"]), StaticAuthorizer::new()).await;
+    let out = h
+        .post(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "read_file", "arguments": {"path": "a"},
+                        "_meta": {"dev.attenuo/approval": {"t": 1}}}}))
+        .await;
+    assert_eq!(out[0]["error"]["code"], -32602, "{out:?}");
+    assert!(h.upstream.recorded_calls().is_empty());
+    assert!(h.authorizer.decisions().is_empty());
+}

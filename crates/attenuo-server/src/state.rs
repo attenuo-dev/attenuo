@@ -136,7 +136,8 @@ impl AppState {
         let pipeline = Arc::new(
             Pipeline::new(policy, leases.clone(), audit.clone())
                 .with_metrics(metrics.clone())
-                .with_approval_ttl(config.approvals.ttl()),
+                .with_approval_ttl(config.approvals.ttl())
+                .with_approval_verifier(verifier.clone()),
         );
         let idps = IdpRegistry::from_config(&config.idps, &config.issuer.issuer)?;
         let agents = crate::idp::intake::validate_agents(&config.agents)?;

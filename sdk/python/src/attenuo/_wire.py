@@ -127,7 +127,9 @@ class Approval:
 
     ``state`` is ``pending``, ``granted``, ``declined`` or ``consumed``; ``expired`` is the
     server's view of whether ``expires_at`` has passed. ``usable`` is true for a grant that a
-    retry of the identical call can still use.
+    retry of the identical call can still use. ``approval_token`` is the signed approval token
+    (``attenuo-approval+jwt``) the server returns while the approval is granted and unexpired,
+    else ``None``; see :mod:`attenuo.approval`.
     """
 
     approval_id: str
@@ -142,6 +144,7 @@ class Approval:
     approver: dict[str, Any] | None
     consumed_by: str | None
     raw: dict[str, Any] = field(repr=False)
+    approval_token: str | None = field(default=None, repr=False)
 
     @property
     def usable(self) -> bool:
@@ -302,6 +305,16 @@ def mcp_headers(token: str, session_id: str | None = None) -> dict[str, str]:
     return h
 
 
+def call_params(
+    tool: str, arguments: dict[str, Any] | None, approval_token: str | None = None
+) -> dict[str, Any]:
+    """``tools/call`` params; an approval token goes in ``_meta["dev.attenuo/approval"]``."""
+    params: dict[str, Any] = {"name": tool, "arguments": arguments or {}}
+    if approval_token:
+        params["_meta"] = {"dev.attenuo/approval": approval_token}
+    return params
+
+
 def rpc_request(method: str, params: dict[str, Any], request_id: int) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
 
@@ -363,6 +376,7 @@ def approval_from_json(body: Any) -> Approval:
     args = call.get("arguments")
     approver = body.get("approver")
     consumed = body.get("consumed_by")
+    approval_token = body.get("approval_token")
     return Approval(
         approval_id=body["approval_id"],
         state=str(body.get("state", "")),
@@ -376,6 +390,9 @@ def approval_from_json(body: Any) -> Approval:
         approver=approver if isinstance(approver, dict) else None,
         consumed_by=consumed if isinstance(consumed, str) else None,
         raw=body,
+        approval_token=approval_token
+        if isinstance(approval_token, str) and approval_token
+        else None,
     )
 
 

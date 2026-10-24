@@ -602,7 +602,10 @@ async fn revoked_lease_kills_pending_and_granted_approvals() {
     let token = h.root().await;
     h.taint(&token).await;
     let granted = h.gated(&token, "alice/site").await;
-    h.grant_as_alice(&granted.approval_id).await;
+    let approval_token = h.grant_as_alice(&granted.approval_id).await["approval_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let pending = h.gated(&token, "alice/other").await;
     let chain = h
         .state
@@ -625,6 +628,11 @@ async fn revoked_lease_kills_pending_and_granted_approvals() {
     let v = h.delete(&token, "alice/site").await;
     assert_eq!(v["error"]["code"], -32003, "{v}");
     assert_eq!(v["error"]["data"]["reason"], "lease_revoked");
+    // So is the call presenting the approval token: leases come first (ADR-0006).
+    let v = h
+        .delete_presenting(&token, None, "alice/site", &approval_token)
+        .await;
+    assert_eq!(v["error"]["data"]["reason"], "lease_revoked", "{v}");
     assert_eq!(h.deletes_upstream(), 0);
     // The approval was not spent by the denied call.
     let shown = h
@@ -885,4 +893,399 @@ async fn authzen_answers_carry_the_approval() {
     assert_eq!(v["decision"], true, "{v}");
     assert_eq!(v["context"]["approval"]["id"], id.as_str());
     assert_eq!(v["context"]["approval"]["by"], "user");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Signed approval tokens (design section 3.7): issued with a grant, presented in
+// `params._meta["dev.attenuo/approval"]`, checked against the call and taken by id.
+// ---------------------------------------------------------------------------------------------
+
+impl Harness {
+    /// `tools/call delete_repo {repo}` with `token` in `_meta` (and another `_meta` member, which
+    /// must reach the upstream untouched).
+    async fn delete_presenting(
+        &self,
+        token: &str,
+        key: Option<&DpopKey>,
+        repo: &str,
+        approval_token: &str,
+    ) -> Value {
+        let resp = self
+            .rpc(
+                token,
+                key,
+                json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": "delete_repo", "arguments": {"repo": repo},
+                                  "_meta": {"progressToken": 7,
+                                            "dev.attenuo/approval": approval_token}}}),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.json().await.unwrap()
+    }
+
+    /// The `(chain_id, lease)` of a delegation token's run and last hop.
+    fn run_of(&self, token: &str) -> (String, String) {
+        let chain = self
+            .state
+            .verifier
+            .verify(token, OffsetDateTime::now_utc())
+            .unwrap()
+            .chain;
+        (
+            chain.hops[0].lease.0.clone(),
+            chain.hops.last().unwrap().lease.0.clone(),
+        )
+    }
+
+    async fn exchange(&self, parent: &str, actor: &str) -> String {
+        let resp = self
+            .client
+            .post(self.server.url("/token"))
+            .json(&json!({
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "subject_token": parent,
+                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                "actor": actor,
+                "authorization_details": [{"type": "attenuo_capabilities",
+                    "capabilities": [{"server": "github", "tool": "*"}]}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: Value = resp.json().await.unwrap();
+        v["access_token"].as_str().unwrap().to_string()
+    }
+}
+
+fn expect_approval_invalid(v: &Value) {
+    assert_eq!(v["error"]["code"], -32003, "{v}");
+    assert_eq!(v["error"]["data"]["reason"], "approval_invalid", "{v}");
+}
+
+#[tokio::test]
+async fn approval_token_is_issued_with_the_grant_and_used_once() {
+    let h = Harness::start().await;
+    let token = h.root().await;
+    h.taint(&token).await;
+    let g = h.gated(&token, "alice/site").await;
+    let (chain_id, lease) = h.run_of(&token);
+
+    // No token while pending.
+    let pending = h
+        .admin_get(&format!("/admin/approvals/{}", g.approval_id))
+        .await;
+    assert!(pending.get("approval_token").is_none(), "{pending}");
+
+    let granted = h.grant_as_alice(&g.approval_id).await;
+    let approval_token = granted["approval_token"].as_str().expect("approval_token");
+
+    // Signed with the issuer key (same kid as the JWKS), typ attenuo-approval+jwt.
+    let header = jsonwebtoken::decode_header(approval_token).unwrap();
+    assert_eq!(header.typ.as_deref(), Some("attenuo-approval+jwt"));
+    assert_eq!(
+        header.kid.as_deref(),
+        Some(h.state.issuer.key_id().as_str())
+    );
+    let jwks: Value = h
+        .client
+        .get(h.server.url("/.well-known/jwks.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(jwks["keys"][0]["kid"], h.state.issuer.key_id().as_str());
+    let claims = h
+        .state
+        .verifier
+        .verify_approval(approval_token, OffsetDateTime::now_utc())
+        .unwrap();
+    assert_eq!(claims.jti, g.approval_id);
+    assert_eq!(claims.ch, g.call_hash);
+    assert_eq!(claims.chain_id, chain_id);
+    assert_eq!(claims.lease, lease);
+    assert_eq!(claims.sub, "alice");
+    assert_eq!(claims.by, "user");
+    assert_eq!(claims.iss, h.state.issuer.config().issuer);
+    assert_eq!(claims.aud, h.state.issuer.config().audience);
+    assert!(claims.cnf.is_none());
+    let expires = OffsetDateTime::parse(
+        &g.expires_at,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    assert_eq!(claims.exp, expires.unix_timestamp());
+
+    // Every GET of the granted approval carries the same token: the agent's, the operator's.
+    let agent_view: Value = h
+        .client
+        .get(h.server.url(&format!("/approvals/{}", g.approval_id)))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(agent_view["approval_token"], approval_token);
+    let admin_view = h
+        .admin_get(&format!("/admin/approvals/{}", g.approval_id))
+        .await;
+    assert_eq!(admin_view["approval_token"], approval_token);
+
+    // Presented with the call, it lets the call through; `_meta` does not change the call.
+    let v = h
+        .delete_presenting(&token, None, "alice/site", approval_token)
+        .await;
+    assert!(allowed(&v), "{v}");
+    assert_eq!(h.deletes_upstream(), 1);
+    let upstream = h.upstream.recorded_calls();
+    let sent = &upstream.last().unwrap().params;
+    assert_eq!(
+        *sent,
+        json!({"name": "delete_repo", "arguments": {"repo": "alice/site"},
+               "_meta": {"progressToken": 7}}),
+        "the approval token never reaches the upstream"
+    );
+    let records = h.records().await;
+    let used = records
+        .iter()
+        .find(|r| {
+            r["kind"] == "decision" && r["reason"] == "policy_allow" && r["tool"] == "delete_repo"
+        })
+        .unwrap();
+    assert_eq!(
+        used["approval"],
+        json!({"id": g.approval_id, "by": "user", "presented": "token"})
+    );
+    // The call hash ignores `_meta`: the consuming decision's digest is the bare call's.
+    let bare = ToolCall::new("github", "delete_repo", json!({"repo": "alice/site"}));
+    assert_eq!(used["arguments_digest"], bare.arguments_digest());
+    let after = h
+        .admin_get(&format!("/admin/approvals/{}", g.approval_id))
+        .await;
+    assert_eq!(after["state"], "consumed");
+    assert_eq!(after["consumed_by"], used["id"]);
+    assert!(after.get("approval_token").is_none(), "{after}");
+
+    // Single use: the same token again is refused with approval_invalid, not gated.
+    let v = h
+        .delete_presenting(&token, None, "alice/site", approval_token)
+        .await;
+    expect_approval_invalid(&v);
+    assert_eq!(h.deletes_upstream(), 1);
+    let records = h.records().await;
+    assert!(records
+        .iter()
+        .any(|r| r["reason"] == "approval_invalid" && r["decision"] == "deny"));
+    h.verify_ok().await;
+}
+
+#[tokio::test]
+async fn approval_token_for_another_call_is_refused_and_the_approval_kept() {
+    let h = Harness::start().await;
+    let token = h.root().await;
+    h.taint(&token).await;
+    let g = h.gated(&token, "alice/site").await;
+    let granted = h.grant_as_alice(&g.approval_id).await;
+    let approval_token = granted["approval_token"].as_str().unwrap();
+    // Wrong `ch`: another repo.
+    let v = h
+        .delete_presenting(&token, None, "alice/other", approval_token)
+        .await;
+    expect_approval_invalid(&v);
+    assert_eq!(h.deletes_upstream(), 0);
+    // The approval is untouched: the identical retry (no token) still uses it.
+    let shown = h
+        .admin_get(&format!("/admin/approvals/{}", g.approval_id))
+        .await;
+    assert_eq!(shown["state"], "granted");
+    assert!(allowed(&h.delete(&token, "alice/site").await));
+    assert_eq!(h.deletes_upstream(), 1);
+    // A token that is not a JWT at all is refused the same way.
+    let v = h
+        .delete_presenting(&token, None, "alice/site", "not-a-token")
+        .await;
+    expect_approval_invalid(&v);
+    // So is a delegation token in the approval slot.
+    let v = h
+        .delete_presenting(&token, None, "alice/site", &token)
+        .await;
+    expect_approval_invalid(&v);
+}
+
+#[tokio::test]
+async fn approval_token_for_a_declined_approval_is_refused() {
+    let h = Harness::start().await;
+    let token = h.root().await;
+    h.taint(&token).await;
+    let g = h.gated(&token, "alice/site").await;
+    let (chain_id, lease) = h.run_of(&token);
+    let (status, v) = h.admin_decide(&g.approval_id, "decline").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(v.get("approval_token").is_none(), "{v}");
+    // A correctly signed token naming the declined approval (as an attacker who had the key
+    // could not make, but a stale or replayed one would look) is refused by the store state.
+    let now = OffsetDateTime::now_utc();
+    let forged = h
+        .state
+        .issuer
+        .issue_approval(&attenuo_token::ApprovalGrant {
+            approval_id: &g.approval_id,
+            approver: "urn:attenuo:admin",
+            by: "operator",
+            chain_id: &chain_id,
+            lease: &lease,
+            call_hash: &g.call_hash,
+            granted_at: now,
+            expires_at: now + time::Duration::seconds(60),
+            jkt: None,
+        })
+        .unwrap();
+    let v = h
+        .delete_presenting(&token, None, "alice/site", &forged)
+        .await;
+    expect_approval_invalid(&v);
+    assert_eq!(h.deletes_upstream(), 0);
+}
+
+/// An approval is bound to the hop that asked: a sibling hop of the same run cannot use it,
+/// with or without the token.
+#[tokio::test]
+async fn approval_token_of_a_sibling_hop_is_refused() {
+    let h = Harness::start_with(|c| c.token.require_actor_auth = false).await;
+    let root = h.root().await;
+    let coder = h.exchange(&root, "coder").await;
+    let reviewer = h.exchange(&root, "reviewer").await;
+    h.taint(&coder).await;
+    let g = h.gated(&coder, "alice/site").await;
+    let granted = h.grant_as_alice(&g.approval_id).await;
+    let approval_token = granted["approval_token"].as_str().unwrap();
+    let (_, coder_lease) = h.run_of(&coder);
+    let claims = h
+        .state
+        .verifier
+        .verify_approval(approval_token, OffsetDateTime::now_utc())
+        .unwrap();
+    assert_eq!(claims.lease, coder_lease);
+    // Same run, same call, other hop: refused.
+    let v = h
+        .delete_presenting(&reviewer, None, "alice/site", approval_token)
+        .await;
+    expect_approval_invalid(&v);
+    assert_eq!(h.deletes_upstream(), 0);
+    // The hop it was granted to can use it.
+    let v = h
+        .delete_presenting(&coder, None, "alice/site", approval_token)
+        .await;
+    assert!(allowed(&v), "{v}");
+}
+
+/// For a DPoP-bound hop the token carries the hop's `cnf.jkt`, and only a token bound to the
+/// key the request proved is accepted.
+#[tokio::test]
+async fn approval_token_of_a_dpop_bound_hop_is_bound_to_its_key() {
+    let h = Harness::start_with(|c| c.token.dpop = DpopMode::Optional).await;
+    let key = DpopKey::generate().unwrap();
+    let token = h.root_for("alice", Some(&key)).await;
+    let (chain_id, lease) = h.run_of(&token);
+    assert!(allowed(
+        &h.call_with(&token, Some(&key), "read_web", "x").await
+    ));
+    let g = Harness::expect_gated(
+        &h.call_with(&token, Some(&key), "delete_repo", "alice/site")
+            .await,
+    );
+    let granted = h.grant_as_alice(&g.approval_id).await;
+    let approval_token = granted["approval_token"].as_str().unwrap();
+    let claims = h
+        .state
+        .verifier
+        .verify_approval(approval_token, OffsetDateTime::now_utc())
+        .unwrap();
+    assert_eq!(claims.cnf.unwrap().jkt, key.thumbprint());
+
+    // A token for the same approval but minted for another key, or for no key, is refused
+    // even with the right key's proof.
+    let other = DpopKey::generate().unwrap();
+    let now = OffsetDateTime::now_utc();
+    let mint = |jkt: Option<&str>| {
+        h.state
+            .issuer
+            .issue_approval(&attenuo_token::ApprovalGrant {
+                approval_id: &g.approval_id,
+                approver: "alice",
+                by: "user",
+                chain_id: &chain_id,
+                lease: &lease,
+                call_hash: &g.call_hash,
+                granted_at: now,
+                expires_at: now + time::Duration::seconds(60),
+                jkt,
+            })
+            .unwrap()
+    };
+    for wrong in [mint(Some(other.thumbprint())), mint(None)] {
+        let v = h
+            .delete_presenting(&token, Some(&key), "alice/site", &wrong)
+            .await;
+        expect_approval_invalid(&v);
+    }
+    assert_eq!(h.deletes_upstream(), 0);
+    // The real one, with the key's proof, goes through.
+    let v = h
+        .delete_presenting(&token, Some(&key), "alice/site", approval_token)
+        .await;
+    assert!(allowed(&v), "{v}");
+    assert_eq!(h.deletes_upstream(), 1);
+}
+
+/// AuthZEN takes the token in `context.approval_token`.
+#[tokio::test]
+async fn authzen_takes_the_approval_token_in_context() {
+    let h = Harness::start().await;
+    let token = h.root().await;
+    h.taint(&token).await;
+    let eval = |approval_token: Option<String>| {
+        let h = &h;
+        let token = token.clone();
+        async move {
+            let mut context = json!({"input": {"repo": "alice/site"}});
+            if let Some(t) = approval_token {
+                context["approval_token"] = json!(t);
+            }
+            let resp = h
+                .client
+                .post(h.server.url("/access/v1/evaluation"))
+                .bearer_auth(&token)
+                .json(&json!({
+                    "subject": {"type": "agent", "id": ""},
+                    "action": {"name": "delete_repo"},
+                    "resource": {"type": "tool", "id": "github/delete_repo",
+                                 "properties": {"server": "github"}},
+                    "context": context,
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            resp.json::<Value>().await.unwrap()
+        }
+    };
+    let v = eval(None).await;
+    let id = v["context"]["approval_id"].as_str().unwrap().to_string();
+    let granted = h.grant_as_alice(&id).await;
+    let approval_token = granted["approval_token"].as_str().unwrap().to_string();
+    let v = eval(Some(approval_token.clone())).await;
+    assert_eq!(v["decision"], true, "{v}");
+    assert_eq!(
+        v["context"]["approval"],
+        json!({"id": id, "by": "user", "presented": "token"})
+    );
+    let v = eval(Some(approval_token)).await;
+    assert_eq!(v["decision"], false, "{v}");
+    assert_eq!(v["context"]["reason"], "approval_invalid");
 }

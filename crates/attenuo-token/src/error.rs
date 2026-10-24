@@ -36,8 +36,10 @@ pub enum TokenError {
     /// `aud` does not match the configured audience.
     #[error("token audience does not match")]
     WrongAudience,
-    /// The header `typ` or the `typ` claim is not `attenuo+jwt`.
-    #[error("token type is not a delegation token")]
+    /// The header `typ` or the `typ` claim is not `attenuo+jwt` (for [`crate::Verifier::verify`]),
+    /// or the header `typ` is not `attenuo-approval+jwt` (for
+    /// [`crate::Verifier::verify_approval`]).
+    #[error("token type (`typ`) is not the one expected here")]
     WrongType,
     /// The token is not a well-formed JWT, or its claims do not have the expected shape.
     #[error("malformed token: {0}")]

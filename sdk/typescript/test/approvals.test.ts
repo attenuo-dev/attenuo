@@ -7,8 +7,11 @@ import {
   DeniedError,
   DpopKey,
   RpcError,
+  VerificationError,
+  callHash,
+  verifyApprovalToken,
 } from "../src/index.js";
-import { jsonResponse, mockFetch, rpcErr, rpcOk, type Seen } from "./helpers.js";
+import { Signer, jsonResponse, mockFetch, rpcErr, rpcOk, type Seen } from "./helpers.js";
 
 const URL_ = "http://ob.test";
 const APPROVAL_ID = "0f8e6c1a-4b7d-4f61-9a39-2f4f5b0e8d11";
@@ -237,5 +240,170 @@ describe("callToolWithApproval", () => {
       new AttenuoClient(URL_, { fetch: s.fetch }).callToolWithApproval("TOK", "g", "t"),
     ).rejects.toBeInstanceOf(ApprovalRequiredError);
     expect(s.calls).toHaveLength(1);
+  });
+});
+
+// --- signed approval tokens ---------------------------------------------------------------------
+
+const JKT = "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I";
+
+function approvalToken(
+  signer: Signer,
+  o: { typ?: string; expDelta?: number; claims?: Record<string, unknown> } = {},
+): Promise<string> {
+  return signer.mint({
+    header: { typ: o.typ ?? "attenuo-approval+jwt" },
+    expDelta: o.expDelta ?? 120,
+    claims: {
+      by: "user",
+      chain_id: "lease-0",
+      lease: "lease-1",
+      ch: HASH,
+      jti: APPROVAL_ID,
+      ...o.claims,
+    },
+  });
+}
+
+describe("approval tokens", () => {
+  it("computes the call hash as the server does", async () => {
+    const digest = new Uint8Array(
+      await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode('{"arguments":{"n":1,"to":"bob"},"server":"mail","tool":"send"}'),
+      ),
+    );
+    const expected = Buffer.from(digest).toString("hex");
+    expect(await callHash("mail", "send", { to: "bob", n: 1 })).toBe(expected);
+    expect(await callHash("mail", "send", { to: "eve", n: 1 })).not.toBe(expected);
+    expect(await callHash("mail", "send")).toBe(await callHash("mail", "send", {}));
+  });
+
+  it("verifies signature, typ, expiry and the binding", async () => {
+    const signer = await Signer.create();
+    const token = await approvalToken(signer, { claims: { cnf: { jkt: JKT } } });
+    const c = await verifyApprovalToken(token, signer.jwks, {
+      chainId: "lease-0",
+      lease: "lease-1",
+      callHash: HASH,
+      jkt: JKT,
+      issuer: "http://ob.test",
+      audience: "attenuo",
+    });
+    expect(c).toMatchObject({ approvalId: APPROVAL_ID, approver: "alice", by: "user", jkt: JKT });
+    for (const opts of [
+      { chainId: "other" },
+      { lease: "lease-2" },
+      { callHash: "cd".repeat(32) },
+      { jkt: null },
+      { jkt: "other" },
+      { issuer: "http://evil" },
+      { audience: "x" },
+    ]) {
+      await expect(verifyApprovalToken(token, signer.jwks, opts)).rejects.toBeInstanceOf(
+        VerificationError,
+      );
+    }
+    const bearer = await approvalToken(signer);
+    expect((await verifyApprovalToken(bearer, signer.jwks, { jkt: null })).jkt).toBeUndefined();
+    await expect(verifyApprovalToken(bearer, signer.jwks, { jkt: JKT })).rejects.toThrow("cnf.jkt");
+    await expect(
+      verifyApprovalToken(await approvalToken(signer, { expDelta: -1 }), signer.jwks),
+    ).rejects.toThrow("expired");
+    await expect(
+      verifyApprovalToken(await approvalToken(signer, { typ: "attenuo+jwt" }), signer.jwks),
+    ).rejects.toThrow("typ");
+    await expect(verifyApprovalToken(token, (await Signer.create()).jwks)).rejects.toBeInstanceOf(
+      VerificationError,
+    );
+    const [head, , sig] = token.split(".");
+    const other = (await approvalToken(signer, { claims: { ch: "cd".repeat(32) } })).split(".")[1];
+    await expect(
+      verifyApprovalToken(`${head}.${other}.${sig}`, signer.jwks),
+    ).rejects.toBeInstanceOf(VerificationError);
+    await expect(verifyApprovalToken("nope", signer.jwks)).rejects.toBeInstanceOf(
+      VerificationError,
+    );
+  });
+
+  // Signed by the Rust issuer (`wire_format_is_pinned_for_the_sdks` in attenuo-token).
+  const RUST_TOKEN =
+    "eyJ0eXAiOiJhdHRlbnVvLWFwcHJvdmFsK2p3dCIsImFsZyI6IkVkRFNBIiwia2lkIjoiMU9pU0E5bUd3Um54azdwZl" +
+    "AyQ0NHdyJ9.eyJpc3MiOiJodHRwczovL2F0dGVudW8udGVzdCIsImF1ZCI6ImF0dGVudW8iLCJzdWIiOiJhbGljZSI" +
+    "sImJ5IjoidXNlciIsImNoYWluX2lkIjoibGVhc2Utcm9vdCIsImxlYXNlIjoibGVhc2UtaG9wIiwiY2giOiJhYmFiY" +
+    "WJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiIiwiaWF0Ijo" +
+    "xNzkyODQzMjAwLCJleHAiOjE3OTI4NDMzMjAsImp0aSI6IjBmOGU2YzFhLTRiN2QtNGY2MS05YTM5LTJmNGY1YjBlO" +
+    "GQxMSIsImNuZiI6eyJqa3QiOiIwWmNPQ09SWk5ZeS1EV3BxcTMwalp5SkdIVE4wZDJIZ2xCVjN1aWd1QTRJIn19.YM" +
+    "QGXdHjU1Mzr1i15LY7f74Zl6XliQFvHVBs1FzW0mahmH_ngo3PHkfsZWltnvBvsLrv5GQuSXmCxg-IP45kAw";
+  const RUST_JWKS = {
+    keys: [
+      {
+        kty: "OKP",
+        crv: "Ed25519",
+        alg: "EdDSA",
+        use: "sig",
+        kid: "1OiSA9mGwRnxk7pfP2CCGw",
+        x: "psIk2NjWmiuoUxoim49SIawYPoOBE8gaMWWVX9fpjVU",
+      },
+    ],
+  };
+  const RUST_IAT = 1792843200;
+
+  it("verifies a token signed by the server", async () => {
+    const c = await verifyApprovalToken(RUST_TOKEN, RUST_JWKS, {
+      chainId: "lease-root",
+      lease: "lease-hop",
+      callHash: HASH,
+      jkt: JKT,
+      issuer: "https://attenuo.test",
+      audience: "attenuo",
+      now: RUST_IAT,
+    });
+    expect(c.approvalId).toBe(APPROVAL_ID);
+    expect(c.expiresAt.getTime() / 1000).toBe(RUST_IAT + 120);
+    await expect(
+      verifyApprovalToken(RUST_TOKEN, RUST_JWKS, { now: RUST_IAT + 120 }),
+    ).rejects.toThrow("expired");
+  });
+
+  it("parses approvalToken and retries with it in _meta", async () => {
+    const { fetch, calls } = sequence(
+      () => gated(),
+      () => approval("granted", false, { approval_token: "APPROVAL.TOKEN.X" }),
+      () => allowed(),
+    );
+    const r = await new AttenuoClient(URL_, { fetch }).callToolWithApproval(
+      "TOK",
+      "github",
+      "delete_repo",
+      { repo: "alice/site" },
+      { intervalMs: 0 },
+    );
+    expect(r.text).toBe("done");
+    const [first, retry] = calls
+      .filter((c) => c.method === "POST")
+      .map((c) => (c.body as Record<string, unknown>).params);
+    expect(first).toEqual({ name: "delete_repo", arguments: { repo: "alice/site" } });
+    expect(retry).toEqual({
+      name: "delete_repo",
+      arguments: { repo: "alice/site" },
+      _meta: { "dev.attenuo/approval": "APPROVAL.TOKEN.X" },
+    });
+    const { fetch: f2 } = mockFetch(() => approval("pending"));
+    const pending = await new AttenuoClient(URL_, { fetch: f2 }).getApproval(APPROVAL_ID, "TOK");
+    expect(pending.approvalToken).toBeUndefined();
+  });
+
+  it("callTool sends approvalToken in _meta", async () => {
+    const { fetch, calls } = mockFetch(() => allowed());
+    await new AttenuoClient(URL_, { fetch }).callTool(
+      "TOK",
+      "github",
+      "delete_repo",
+      { repo: "a" },
+      { approvalToken: "T" },
+    );
+    const params = (calls[0]?.body as Record<string, Record<string, unknown>>).params;
+    expect(params?._meta).toEqual({ "dev.attenuo/approval": "T" });
   });
 });
