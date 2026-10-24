@@ -64,6 +64,7 @@ Open from a seq (`#/entry/42`) or from the `decision_id` a denial returns (`#/re
 - for a decision on a tainted run, the `tool_result` entries that tainted it (`labels.tainted_by`) and, when an argument copied an untrusted result, each such argument with the match kind (`leaf`, `entity`, `kgram` or `unreadable`) and a link to the result it matched (`labels.untrusted_args`);
 - the delegation chain, the user first, then each hop's agent and lease, with the lease's state **now** (active, expired, or revoked with its reason and time);
 - the ids of the policies that decided, with their current text. If the policies were reloaded after the decision, a warning says so: the text shown may not be the text that decided;
+- for a call that drew on run limits, **Run limits and usage**: each limit it was charged against (hop and lease, capability index, kind, argument, what the counter held afterwards, the maximum and what was left; for `distinct` the counter is the number of values seen, and a host-derived argument shows as `url#host`), from the record's `budget` member; and for a destructive tool, the run's usage of it before the call (`usage`: calls, amount, whether the destination was seen before);
 - the hash fields (`seq`, `prev_hash`, `entry_hash`, `chain_digest`, `arguments_digest`) and the signed checkpoint that covers the entry, or "not yet covered by a signed checkpoint";
 - every other record of the same chain, oldest first.
 
@@ -72,6 +73,8 @@ What it cannot show: the tool arguments and the capabilities each hop held. The 
 ### Lease tree
 
 `#/lease/<id>` shows the leases the lease was delegated from (root first), and the lease with everything delegated from it as an indented tree: lease id, agent, expiry, state (with revocation reason and time), and the seq of the record that issued it. **renewals** lists the renewals of one lease. **Revoke…** opens a confirmation (below).
+
+**Run limits** lists the limits each hop of the chain was issued with, root first down to this lease: the capability, the kind (`calls`, `sum`, `calls_per`, `distinct`), the argument (`url#host` when a limit counts URL hosts), what is used now, the maximum and what is left. For `calls_per` the used figure is the most calls any one value has had, with the number of values seen. Every call is charged to every hop it passes through, so the smallest figure left along the chain is what this lease can still spend. On a run's root lease, **Run usage** shows the run's calls, amount and number of destinations per destructive tool (`context.usage`). Each node of the tree also shows its limits on one line as `kind used/max`. The figures are what the counters hold when the page loads; reload for fresh ones. A hop issued by a server older than this console has counters but no recorded maximum, shown as "not recorded".
 
 ### Approvals
 
@@ -121,5 +124,6 @@ One action writes even when `allow_write` is off, because it changes no lease, p
 
 - One shared admin token, no per-user accounts or roles, and no record of which person used the console. Admin actions are audited as `urn:attenuo:admin`.
 - The decision view shows lease states and policy text as they are now, not as they were when the decision was made.
+- The lease page shows run-limit counters as they are now. Refunding a charge is not a console action; use `POST /admin/budgets/refund` on the admin API.
 - Readiness (`/readyz`) is served on the main listener only; the Verify page says so instead of showing it.
 - The console is tested in current Chromium. Other browsers are untested.

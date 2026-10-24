@@ -177,7 +177,7 @@ A miss means no verbatim copy was found, not that the call is clean: a paraphras
 
 ### Run limits
 
-A capability in a token can carry `limits`: `calls` (at most this many calls), `sum: {arg, max}` (a total over one integer argument) and `calls_per: {arg, max}` (at most `max` calls per value of one argument). The server enforces them before Cedar, against every hop of the chain: a call over a limit is denied with `budget_exhausted`, and no policy or approval passes it. A policy cannot raise a limit, only explain or ask earlier, through `context.budget`:
+A capability in a token can carry `limits`: `calls` (at most this many calls), `sum: {arg, max}` (a total over one integer argument), `calls_per: {arg, max}` (at most `max` calls per value of one argument) and `distinct: {arg, max}` (at most `max` different values of one argument). `calls_per` and `distinct` take `"derive": "host"` to count the host of a URL argument. The server enforces them before Cedar, against every hop of the chain: a call over a limit is denied with `budget_exhausted`, and no policy or approval passes it. A policy cannot raise a limit, only explain or ask earlier, through `context.budget`:
 
 ```cedar
 @id("confirm_last_call_of_a_budget")
@@ -191,7 +191,7 @@ when {
 };
 ```
 
-`calls_remaining` and `amount_remaining` are what is left before this call, the smallest over every matching limit. `destination_new` is false once the call's `calls_per` value has been used in an earlier allowed call. [`config/policies/run-limits.cedar`](../../config/policies/run-limits.cedar) has this rule and a repeat-payee rule, with tests in `run-limits_test.yaml`.
+`calls_remaining` and `amount_remaining` are what is left before this call, the smallest over every matching limit. `destination_new` is false once the call's `calls_per` or `distinct` value has been used in an earlier allowed call. [`config/policies/run-limits.cedar`](../../config/policies/run-limits.cedar) has this rule and a repeat-payee rule, with tests in `run-limits_test.yaml`.
 
 ### Limits over run usage
 
@@ -222,7 +222,7 @@ when {
 };
 ```
 
-The gated call gets `-32008` with `usage` in its data; once the user or an operator grants it, the identical retry is allowed and counted, so the next payment asks again. Only allowed calls are counted, and an approval never raises a token's own limits. The figures are what the run had before this call, so `calls >= 1` means "not the first". An `amount` value that is not a non-negative integer adds nothing; a list-valued `destination` counts each element. A rule over `destination_seen` asks only for a repeat to the same payee or recipient, however many others the run has paid. Usage ends with the run: revoking its root lease deletes it. [`config/policies/run-usage.cedar`](../../config/policies/run-usage.cedar) has these rules and a per-recipient mail rule, with tests in `run-usage_test.yaml`.
+The gated call gets `-32008` with `usage` in its data; once the user or an operator grants it, the identical retry is allowed and counted, so the next payment asks again. Only allowed calls are counted, and an approval never raises a token's own limits. The figures are what the run had before this call, so `calls >= 1` means "not the first". An `amount` value that is not a non-negative integer adds nothing; a list-valued `destination` counts each element. A rule over `destination_seen` asks only for a repeat to the same payee or recipient, however many others the run has paid. With `destination = "url#host"` in the catalog, `destination_seen` compares the hosts of a URL input, so a rule can ask when a run fetches from a site it has not used before. Usage ends with the run: revoking its root lease deletes it. [`config/policies/run-usage.cedar`](../../config/policies/run-usage.cedar) has these rules, a per-recipient mail rule and a per-site fetch rule, with tests in `run-usage_test.yaml`.
 
 ### Chain depth
 

@@ -40,7 +40,7 @@ printf '%s\n' "$CODER" | attenuo call --token - --server github --tool read_file
 
 ## Argument forms
 
-- `--cap server:tool` is a capability. Globs are allowed. Repeat the flag, or comma-separate plain values. A value that starts with `{` is a full capability as JSON, which can carry constraints and run `limits` (`{"server":"banking","tool":"send_money","limits":{"calls":1,"sum":{"arg":"amount","max":100}}}`). Commands that print capabilities show limits after the constraints: `banking:send_money [calls <= 1, sum(amount) <= 100]`.
+- `--cap server:tool` is a capability. Globs are allowed. Repeat the flag, or comma-separate plain values. A value that starts with `{` is a full capability as JSON, which can carry constraints and run `limits` (`{"server":"banking","tool":"send_money","limits":{"calls":1,"sum":{"arg":"amount","max":100}}}`). Commands that print capabilities show limits after the constraints: `banking:send_money [calls <= 1, sum(amount) <= 100]`. `distinct` and a derived value work the same way: `--cap '{"server":"web","tool":"get_webpage","limits":{"distinct":{"arg":"url","derive":"host","max":2}}}'` prints as `web:get_webpage [distinct url#host <= 2]`. A limit kind or derivation the CLI does not know is refused before anything is sent.
 - `--arg key=value` sets a string argument. `--arg key:=json` sets any JSON value, such as a number or an object.
 - `--attr key=value` follows the same rule for user attributes.
 
