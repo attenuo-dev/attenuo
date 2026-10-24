@@ -9,7 +9,10 @@ Two modes, the same tool calls:
 
 * ``--dry-run`` (the default without ``ANTHROPIC_API_KEY``): no model. The script loads the
   coder's tools with ``MultiServerMCPClient`` exactly as live mode does and invokes them in the
-  order the coder would. Deterministic; CI runs it.
+  order the coder would, then has the orchestrator open an issue with its own token, which
+  the demo policy holds for a person's approval: the interceptor shows the approval id,
+  waits for the grant (given here through the admin API) and retries the call once.
+  Deterministic; CI runs it.
 * live (``ANTHROPIC_API_KEY`` set, or ``--live``): the orchestrator agent calls its only tool,
   ``ask_coder``, which runs the coder agent; the coder's tools are the MCP tools behind the
   narrowed token. The orchestrator has no MCP tools and no token of its own in the agent graph.
@@ -31,7 +34,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from attenuo import AdminClient, Capability, Client, Prefix, Token
+from attenuo import AdminClient, ApprovalNotGranted, AsyncClient, Capability, Client, Prefix, Token
 from attenuo.mcp import mcp_headers, mcp_url
 
 SERVER = os.environ.get("ATTENUO_SERVER", "http://127.0.0.1:8080")
@@ -43,6 +46,7 @@ ORCHESTRATOR_AGENT = "assistant"
 MODEL = os.environ.get("EXAMPLE_MODEL", "claude-opus-5-5")
 UPSTREAM = "github"
 DENIED_CODE = -32003  # attenuo's JSON-RPC error code for a denied call
+APPROVAL_CODE = -32008  # attenuo's JSON-RPC error code for a call held for a person's approval
 DECISION_ID_HEADER = "x-attenuo-decision-id"
 
 # A simulated malicious issue. In the real incident this text came from a public issue.
@@ -114,7 +118,7 @@ def delegate_to_coder(ob: Client, root: Token | str) -> Token:
     )
 
 
-def connections(token: Token, decisions: ProxyDecisions) -> dict[str, Any]:
+def connections(token: Token | str, decisions: ProxyDecisions) -> dict[str, Any]:
     """The langchain-mcp-adapters connection: attenuo's URL, the token as bearer, and an HTTP
     client that records the decision ids the proxy vouches for."""
     return {
@@ -132,20 +136,43 @@ def is_denied_code(exc: BaseException) -> bool:
     return getattr(getattr(exc, "error", None), "code", None) == DENIED_CODE
 
 
+def _vouched(exc: BaseException, code: int, decisions: ProxyDecisions) -> dict[str, Any] | None:
+    """The ``data`` of a JSON-RPC error ``code`` whose decision id the proxy vouched for."""
+    error = getattr(exc, "error", None)
+    if getattr(error, "code", None) != code:
+        return None
+    data = getattr(error, "data", None)
+    data = data if isinstance(data, dict) else {}
+    decision = data.get("decision_id")
+    if not isinstance(decision, str) or decision not in decisions.ids:
+        return None
+    return data
+
+
 def denial_of(exc: BaseException, decisions: ProxyDecisions) -> tuple[str, str] | None:
     """(reason, decision_id) when ``exc`` is a -32003 the proxy vouched for, else None.
 
     A -32003 whose ``data.decision_id`` is not in an ``X-Attenuo-Decision-Id`` header the
     proxy sent is the upstream's own error, not a decision of attenuo (SR-53).
     """
-    if not is_denied_code(exc):
+    data = _vouched(exc, DENIED_CODE, decisions)
+    if data is None:
         return None
-    data = getattr(getattr(exc, "error", None), "data", None)
-    data = data if isinstance(data, dict) else {}
-    decision = data.get("decision_id")
-    if not isinstance(decision, str) or decision not in decisions.ids:
+    return str(data.get("reason", "?")), data["decision_id"]
+
+
+def approval_of(exc: BaseException, decisions: ProxyDecisions) -> tuple[str | None, str] | None:
+    """(approval_id, decision_id) when ``exc`` is a -32008 the proxy vouched for, else None.
+
+    ``approval_id`` is None when the server could not open an approval; the call is then
+    simply denied. The same SR-53 check as :func:`denial_of` applies: an upstream can send a
+    -32008 of its own, and waiting on an approval it names would only stall the run.
+    """
+    data = _vouched(exc, APPROVAL_CODE, decisions)
+    if data is None:
         return None
-    return str(data.get("reason", "?")), decision
+    approval = data.get("approval_id")
+    return (approval if isinstance(approval, str) and approval else None), data["decision_id"]
 
 
 def leaves(exc: BaseException) -> list[BaseException]:
@@ -165,49 +192,126 @@ def is_unauthorized(exc: BaseException) -> bool:
     )
 
 
-def denial_interceptor(log: DenialLog) -> Callable[..., Awaitable[Any]]:
+# Called with the approval id when a call is held: show it to the person who approves.
+OnApproval = Callable[[str], Awaitable[None]]
+# Waits until the approval is granted; raises ApprovalNotGranted when it will not be.
+WaitForApproval = Callable[[str], Awaitable[None]]
+
+
+def _tool_error(text: str) -> Any:
+    from mcp.types import CallToolResult, TextContent
+
+    return CallToolResult(content=[TextContent(type="text", text=text)], isError=True)
+
+
+def denial_interceptor(
+    log: DenialLog,
+    on_approval: OnApproval | None = None,
+    wait_for_approval: WaitForApproval | None = None,
+) -> Callable[..., Awaitable[Any]]:
     """A langchain-mcp-adapters tool interceptor that turns a denial into a tool result.
 
     The adapter lets JSON-RPC errors escape as exceptions, which would crash the agent run. A
     denial is a decision, so the model gets it as an ordinary tool error ("not allowed") and
     the decision id goes to the log. A revoked lease is different: that stops the run.
+
+    A call held for approval (-32008) is shown with its approval id (``on_approval``), the
+    interceptor waits for the grant (``wait_for_approval``) and retries the identical call
+    once, as ``Client.call_tool_with_approval`` does in the SDK. A decline, an expiry or a
+    second -32008 reaches the model as a tool error. Without ``wait_for_approval`` a held
+    call is a tool error that names the approval id.
     """
-    from mcp.types import CallToolResult, TextContent
+
+    def failed(request: Any, exc: BaseException) -> Any:
+        """The tool result for a failed call, or raise when the run must stop."""
+        if is_unauthorized(exc):
+            log.entries.append((request.name, "unauthorized", "-"))
+            print(f"  DENIED  {request.name} {request.args}  HTTP 401 (lease gone)")
+            raise LeaseRevoked("401") from exc
+        held = next((a for e in leaves(exc) if (a := approval_of(e, log.decisions))), None)
+        if held is not None:
+            approval, decision = held
+            log.entries.append((request.name, "approval_required", decision))
+            print(f"  HELD    {request.name} {request.args}  approval={approval} (not granted)")
+            return _tool_error(
+                f"{request.name} needs a person's approval (approval {approval}) and does not "
+                "have it. Tell the user; do not retry it."
+            )
+        found = next((d for e in leaves(exc) if (d := denial_of(e, log.decisions))), None)
+        if found is None:
+            forged = next(
+                (e for e in leaves(exc) if is_denied_code(e) or _code(e) == APPROVAL_CODE), None
+            )
+            if forged is None:
+                raise exc
+            # A -32003 or -32008 attenuo did not vouch for: the upstream's own error.
+            print(f"  UPSTREAM ERROR {request.name} {request.args}  {forged}")
+            return _tool_error(f"{request.name} failed upstream: {forged}")
+        reason, decision = found
+        log.entries.append((request.name, reason, decision))
+        print(f"  DENIED  {request.name} {request.args}  reason={reason} decision={decision}")
+        if reason == "lease_revoked":  # when the session was already open
+            raise LeaseRevoked(decision) from exc
+        return _tool_error(
+            f"{request.name} is not allowed for this agent ({reason}). Do not retry it."
+        )
 
     async def intercept(request: Any, handler: Callable[[Any], Awaitable[Any]]) -> Any:
         try:
             return await handler(request)
         except BaseException as exc:
-            if is_unauthorized(exc):
-                log.entries.append((request.name, "unauthorized", "-"))
-                print(f"  DENIED  {request.name} {request.args}  HTTP 401 (lease gone)")
-                raise LeaseRevoked("401") from exc
-            found = next((d for e in leaves(exc) if (d := denial_of(e, log.decisions))), None)
-            if found is None:
-                forged = next((e for e in leaves(exc) if is_denied_code(e)), None)
-                if forged is None:
-                    raise
-                # A -32003 attenuo did not vouch for: the upstream's own error, shown as such.
-                print(f"  UPSTREAM ERROR {request.name} {request.args}  {forged}")
-                text = f"{request.name} failed upstream: {forged}"
-                return CallToolResult(content=[TextContent(type="text", text=text)], isError=True)
-            reason, decision = found
-            log.entries.append((request.name, reason, decision))
-            print(f"  DENIED  {request.name} {request.args}  reason={reason} decision={decision}")
-            if reason == "lease_revoked":  # when the session was already open
-                raise LeaseRevoked(decision) from exc
-            text = f"{request.name} is not allowed for this agent ({reason}). Do not retry it."
-            return CallToolResult(content=[TextContent(type="text", text=text)], isError=True)
+            held = next((a for e in leaves(exc) if (a := approval_of(e, log.decisions))), None)
+            if held is None or held[0] is None or wait_for_approval is None:
+                return failed(request, exc)
+        approval, decision = held
+        log.entries.append((request.name, "approval_required", decision))
+        print(f"  HELD    {request.name} {request.args}  approval={approval} decision={decision}")
+        if on_approval is not None:
+            await on_approval(approval)
+        try:
+            await wait_for_approval(approval)
+        except ApprovalNotGranted as e:
+            print(f"  NOT APPROVED {request.name}  approval={approval} state={e.state}")
+            return _tool_error(
+                f"{request.name} was not approved ({e.state}). Tell the user; do not retry it."
+            )
+        # Retry the identical call once: the server finds the grant by the call's hash.
+        try:
+            result = await handler(request)
+        except BaseException as exc:
+            return failed(request, exc)
+        print(f"  ALLOWED {request.name} {request.args}  after approval {approval} (one retry)")
+        return result
 
     return intercept
 
 
-def mcp_client(token: Token, log: DenialLog) -> Any:
+def _code(exc: BaseException) -> Any:
+    return getattr(getattr(exc, "error", None), "code", None)
+
+
+def approval_waiter(token: Token | str) -> WaitForApproval:
+    """Poll ``GET /approvals/{id}`` with the caller's own token until the approval is granted
+    (``AsyncClient.wait_for_approval``); without a timeout the wait ends when the approval
+    expires on the server."""
+
+    async def wait(approval_id: str) -> None:
+        async with AsyncClient(SERVER) as ob:
+            await ob.wait_for_approval(approval_id, token, interval=0.2)
+
+    return wait
+
+
+def mcp_client(token: Token | str, log: DenialLog, on_approval: OnApproval | None = None) -> Any:
     from langchain_mcp_adapters.client import MultiServerMCPClient
 
-    return MultiServerMCPClient(
-        connections(token, log.decisions), tool_interceptors=[denial_interceptor(log)]
-    )
+    interceptor = denial_interceptor(log, on_approval or print_approval, approval_waiter(token))
+    return MultiServerMCPClient(connections(token, log.decisions), tool_interceptors=[interceptor])
+
+
+async def print_approval(approval_id: str) -> None:
+    """Live mode: tell the operator how to grant the held call; the run waits for it."""
+    print(f"  waiting for a person: attenuo approval grant {approval_id}")
 
 
 def _text(content: Any) -> str:
@@ -254,7 +358,13 @@ async def run_live(token: Token, log: DenialLog) -> None:
     print(f"[orchestrator] {_text(result['messages'][-1].content)}")
 
 
-async def run_dry(token: Token, log: DenialLog, revoke: Callable[[], None]) -> bool:
+async def run_dry(
+    token: Token,
+    log: DenialLog,
+    revoke: Callable[[], None],
+    root: Token | str,
+    admin: AdminClient,
+) -> bool:
     """Invoke the coder's LangChain tools in the order the coder would."""
     from mcp.shared.exceptions import McpError
 
@@ -293,6 +403,21 @@ async def run_dry(token: Token, log: DenialLog, revoke: Callable[[], None]) -> b
             checks.append(found is not None and found[0] == "capability_denied")
         else:
             checks.append(False)
+
+    print("[orchestrator] reports the typo itself: create_issue with its own token")
+    print("  (the policy holds every create_issue until a person approves it)")
+
+    async def grant(approval_id: str) -> None:
+        # Alice would approve with her own sign-in; here the operator does it, as
+        # `attenuo approval grant` would.
+        granted = await asyncio.to_thread(admin.grant_approval, approval_id)
+        print(f"  [operator] approval {granted.approval_id}: {granted.state}")
+
+    orchestrator_tools = {t.name: t for t in await mcp_client(root, log, grant).get_tools()}
+    typo = {"repo": "alice/public-docs", "title": "README: fix typo"}
+    out = await orchestrator_tools["create_issue"].ainvoke(typo)
+    held = [e for e in log.entries if e[1] == "approval_required"]
+    checks.append(len(held) == 1 and "not approved" not in _text(out) and bool(out))
 
     print("[orchestrator] the session looks compromised: revoking its lease")
     revoke()
@@ -346,11 +471,11 @@ def main(argv: list[str] | None = None) -> int:
             print("[coder] stopped: lease revoked")
         revoke()
     else:
-        ok = asyncio.run(run_dry(token, log, revoke))
+        ok = asyncio.run(run_dry(token, log, revoke, root_jwt, admin))
 
     report = admin.audit_verify()
     print(f"[audit] chain ok={report.ok}, {report.entries} entries")
-    for e in admin.audit_tail(8):
+    for e in admin.audit_tail(10):
         print(f"  #{e.seq} {e.decision:<5} {e.server}/{e.tool}  reason={e.reason}")
     admin.close()
     good = ok and report.ok

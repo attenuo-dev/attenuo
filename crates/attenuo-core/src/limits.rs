@@ -85,6 +85,10 @@ pub enum Derive {
     /// whitespace or a control character in it: WHATWG reads `https://a.example\@b.example/`
     /// as host `a.example`, while common HTTP clients (Python's `urllib` and `httpx`, among
     /// others) fetch `b.example`, so the host counted would not be the host reached (SR-56).
+    /// Only a URL of a special scheme (`http`, `https`, `ws`, `wss`, `ftp`, `file`) has a
+    /// host: any other scheme (`ssh://`, `git://`) has an opaque host, which WHATWG neither
+    /// percent-decodes nor maps through IDNA, so `ssh://a.ex%61mple/` and `ssh://a.example/`
+    /// would count as two hosts where a client that decodes the host reaches one (FZ2-2).
     Host,
 }
 
@@ -121,6 +125,11 @@ impl Derive {
                     return None;
                 }
                 let url = url::Url::parse(raw).ok()?;
+                // An opaque host is not normalised, so it could be spelled several ways for
+                // one destination (fuzzing round 2, FZ2-2).
+                if !SPECIAL_SCHEMES.contains(&url.scheme()) {
+                    return None;
+                }
                 let host = url.host_str()?.to_ascii_lowercase();
                 // Every trailing dot: `a.example.` and `a.example..` are spellings of
                 // `a.example`, and counting them apart would give each its own `calls_per`
@@ -132,7 +141,7 @@ impl Derive {
                 // WHATWG drops one trailing dot before it tries an IPv4 reading, so with more
                 // than one it keeps `0x7f.1..` as a domain. Parse what is left again, so that
                 // such a host counts as the address (`127.0.0.1`), as `0x7f.1` does.
-                if trimmed.len() + 1 < host.len() && SPECIAL_SCHEMES.contains(&url.scheme()) {
+                if trimmed.len() + 1 < host.len() {
                     let again = url::Url::parse(&format!("https://{trimmed}/")).ok()?;
                     let host = again.host_str()?.to_ascii_lowercase();
                     let host = host.trim_end_matches('.');
@@ -1185,6 +1194,40 @@ mod tests {
             charges_for(&chain, &call).unwrap()[0].value.clone()
         };
         assert_eq!(value("https://a.example../"), value("https://a.example/"));
+    }
+
+    /// FZ2-2 (fuzzing round 2): a non-special scheme has an opaque host, which WHATWG neither
+    /// percent-decodes nor maps through IDNA, so `ssh://a.ex%61mple/` and `ssh://a.example/`
+    /// counted as two hosts. Only special schemes have a host now; any other URL has none, so
+    /// a limit refuses it and run usage counts it as a value with no host.
+    #[test]
+    fn non_special_schemes_have_no_host_fz2_2() {
+        let h = |s: &str| Derive::Host.apply(&json!(s));
+        for url in [
+            "ssh://a.example/",
+            "ssh://a.ex%61mple/",
+            "SSH://git@a.example:22/repo",
+            "git://a.example/x",
+            "git://\u{3b2}\u{3cc}\u{3bb}\u{3bf}\u{3c2}/",
+            "foo://a.example",
+        ] {
+            assert_eq!(h(url), None, "{url:?}");
+        }
+        assert_eq!(h("https://a.ex%61mple/").as_deref(), Some("a.example"));
+        assert_eq!(h("ws://a.example/").as_deref(), Some("a.example"));
+        assert_eq!(h("ftp://a.example/").as_deref(), Some("a.example"));
+        assert_eq!(h("file://a.example/x").as_deref(), Some("a.example"));
+        let chain = root(vec![Capability::new("vcs", "clone").with_limits(Limits {
+            calls_per: Some(ArgLimit::new("url", 1).derived(Derive::Host)),
+            ..Limits::default()
+        })]);
+        let call = ToolCall::new("vcs", "clone", json!({"url": "ssh://a.example/"}));
+        assert_eq!(charges_for(&chain, &call).unwrap_err().arg, "url#host");
+        let usage = usage_charges(&LeaseId::new("run"), &call, None, Some("url#host"));
+        assert_eq!(
+            usage[1].value.as_deref(),
+            Some(canonical(&json!({"raw": "ssh://a.example/"})).as_slice())
+        );
     }
 
     /// SR-56: WHATWG and common HTTP clients disagree on where the host of
