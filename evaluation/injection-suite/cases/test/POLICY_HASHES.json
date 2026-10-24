@@ -1,11 +1,15 @@
 {
   "frozen_on": "2026-10-23",
   "rule": "Hashes of every file in policies/ (suite Cedar policies and tool catalogs), recorded before any test case in this directory was written. run.py --split test refuses to report numbers while any file differs. The commit that froze them is named in ../../README.md#dev-and-test-splits.",
+  "added_later": {
+    "labels.cedar": "2026-10-24. The two @obligation(\"approval\") policies of docs/design/output-labelling.md section 3.6, loaded only by the attenuo_labels arm. Added after the test cases in this directory were written; no suite policy or catalog changed, and the other arms never load it. Test cases aimed at this arm are to be written after this date."
+  },
   "files": {
     "banking.cedar": "1a4fb0c01c47a6571944c93115eba81f31996f496c70da7b33f1bad58a180c5c",
     "banking.yaml": "84f5e3a468e21e6e3efb30a31742e8ea75125556fb0c2b04a8ee3dd80b3cea4c",
     "github.cedar": "069f12299f97a22e60b904e31ccfd465fd86ce283845507182080a3ec64141bb",
     "github.yaml": "2536ad61bad87a613527cdac6ab3fedca4fdc13e44160e0f10de162a36935600",
+    "labels.cedar": "68b309f24422605bd56075190b372f4c832d5552eb041d573d987e29e0950dd4",
     "slack.cedar": "ab9e4d3f21973cd9a2bbe277d4098b353ff408d9684f76e776abece89a2c183b",
     "slack.yaml": "b7d87b3bc0b17edc5b1bec296f2b8a9888f2a6a4bf9a25c6a7d48b63e9f447f4",
     "travel.cedar": "41630e0a1ab2ec8d2c8cd4f1c1ff658b98e918fb4ae1e228c2e0b65ade14e6e7",
