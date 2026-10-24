@@ -5,7 +5,7 @@ corpus (``cases/dev/*.yaml`` and ``cases/test/*.yaml``) describes, per case, the
 a user task needs and the tool calls a compromised agent would emit, each with the expected
 outcome. This module loads both, writes a server config, catalog and Cedar policy, starts
 ``attenuo-server`` and one echoing ``fake_mcp`` upstream per suite, and replays the calls in
-five arms:
+these arms:
 
 ``direct``             no attenuo: JSON-RPC straight to the upstream (the baseline).
 ``scope_only``         tool-level capabilities only (argument constraints dropped) and a
@@ -19,6 +19,13 @@ five arms:
 ``attenuo_labels``    as ``attenuo``, plus the two ``@obligation("approval")`` policies of
                        ``policies/labels.cedar`` (output labelling, phase 1). Runs only when the
                        server answers ``-32008 approval_required``; skipped otherwise.
+``attenuo_limits``    as ``attenuo``, with the frozen run-limit rule of
+                       ``policies/limits-rule.json`` (``calls: 1`` on every capability that is
+                       not a read) added to every exchanged token. Runs only when the server
+                       enforces ``limits``; skipped otherwise.
+``attenuo_labels_limits``  ``attenuo_labels`` plus the same rule. A gated call the scripted
+                       approver approves is granted through the admin API and sent again, so
+                       that it is charged.
 
 No LLM is involved. See README.md for the method and its limits.
 """
@@ -96,11 +103,35 @@ CODE_DENIED = -32003
 CODE_UNKNOWN_SERVER = -32004
 CODE_APPROVAL = -32008  # docs/design/output-labelling.md section 3.7
 
-ARMS = ("direct", "scope_only", "scope_constraints", "policy_only", "attenuo", "attenuo_labels")
+ARMS = (
+    "direct",
+    "scope_only",
+    "scope_constraints",
+    "policy_only",
+    "attenuo",
+    "attenuo_labels",
+    "attenuo_limits",
+    "attenuo_labels_limits",
+)
 PROXIED = ARMS[1:]
-CONSTRAINED_ARMS = ("scope_constraints", "attenuo", "attenuo_labels")
-LABEL_ARMS = ("attenuo_labels",)
+CONSTRAINED_ARMS = (
+    "scope_constraints",
+    "attenuo",
+    "attenuo_labels",
+    "attenuo_limits",
+    "attenuo_labels_limits",
+)
+LABEL_ARMS = ("attenuo_labels", "attenuo_labels_limits")
 LABELS_POLICY = POLICIES_DIR / "labels.cedar"
+# Run limits (docs/design/run-limits.md section 6): these arms add the frozen rule's limits to
+# every capability that is not a read.
+LIMIT_ARMS = ("attenuo_limits", "attenuo_labels_limits")
+LIMITS_RULE = POLICIES_DIR / "limits-rule.json"
+# Arms where the scripted approver's "approve" is carried out (granted through the admin API,
+# then the call is sent again), so that an approved call is charged against the run's limits.
+RETRY_ARMS = ("attenuo_labels_limits",)
+# Refusals by a run limit, in the capability stage after the capability check (ADR-0010).
+BUDGET_REASONS = ("budget_exhausted", "budget_error", "limit_arg_invalid")
 PERMIT_ALL_ARMS = ("scope_only", "scope_constraints")
 STAGES = ("name", "lease", "capability", "policy", "exchange")
 ROLES = ("benign", "attack")
@@ -472,6 +503,33 @@ def capabilities(suite: Suite, case: Case, *, constraints: bool) -> list[Capabil
     return grant_capabilities(suite.upstream, case.grant, constraints=constraints)
 
 
+def limits_rule(path: Path | None = None) -> dict[str, Any]:
+    """The frozen rule's ``limits`` object (``policies/limits-rule.json``), checked the way the
+    SDK checks a capability's limits."""
+    limits = dict(json.loads((path or LIMITS_RULE).read_text())["limits"])
+    Capability.from_json({"server": "x", "tool": "y", "limits": limits})  # raises if malformed
+    return limits
+
+
+def is_read_capability(cap: Capability, env: dict[str, Suite]) -> bool:
+    """A capability that names exactly one read (``env`` is keyed by upstream). A glob is not
+    a read, whatever it matches."""
+    suite = env.get(cap.server)
+    return "*" not in cap.tool and suite is not None and is_read(suite, cap.tool)
+
+
+def apply_limits_rule(
+    caps: list[Capability], env: dict[str, Suite], limits: dict[str, Any]
+) -> list[Capability]:
+    """Add ``limits`` to every capability in ``caps`` that is not a read (in place)."""
+    for cap in caps:
+        if not is_read_capability(cap, env):
+            cap.limits = Capability.from_json(
+                {"server": cap.server, "tool": cap.tool, "limits": limits}
+            ).limits
+    return caps
+
+
 # --- config generation ------------------------------------------------------------------------
 
 
@@ -749,6 +807,8 @@ def stage_of(reason: str | None) -> str | None:
         return "name"
     if reason.startswith("exchange_refused"):
         return "exchange"
+    if reason in BUDGET_REASONS:
+        return "budget"
     if reason.startswith("capability_"):
         return "capability"
     if reason.startswith("policy_") or reason == "attribute_type_mismatch":
@@ -784,6 +844,9 @@ class CallResult:
     approval: str | None = None  # gated calls: what the scripted approver would answer
     approval_id: str | None = None  # gated calls: data.approval_id of the -32008 (not retried)
     output_returned: bool | None = None  # the scripted output came back (None: none scripted)
+    # RETRY_ARMS: the approved call sent again after the grant (outcome, reason, stage,
+    # decision_id, reached_upstream, args_intact, output_returned); None: not retried.
+    retry: dict[str, Any] | None = None
 
     @property
     def as_expected(self) -> bool:
@@ -940,6 +1003,11 @@ class _Replayer:
     ) -> None:
         self.arm, self.suite, self.case, self.ups, self.http = arm, suite, case, ups, http
         self.stack, self.ob, self.admin = stack, ob, admin
+        self.env: dict[str, Suite] = {}
+        self.limits: dict[str, Any] | None = None
+        if arm in LIMIT_ARMS:
+            self.env = {s.upstream: s for s in load_environment().values()}
+            self.limits = limits_rule()
         self.tokens: dict[str, Any] = {}
         self.refused: dict[str, str] = {}
         self.out: list[CallResult] = []
@@ -957,8 +1025,15 @@ class _Replayer:
         if self.arm == "policy_only":
             self.tokens[WORKER] = root
             return
-        caps = capabilities(self.suite, self.case, constraints=self.arm in CONSTRAINED_ARMS)
+        caps = self._limited(
+            capabilities(self.suite, self.case, constraints=self.arm in CONSTRAINED_ARMS)
+        )
         self.tokens[WORKER] = self.ob.exchange(root, WORKER, caps, client_secret=AGENT_SECRET)
+
+    def _limited(self, caps: list[Capability]) -> list[Capability]:
+        if self.limits is None:
+            return caps
+        return apply_limits_rule(caps, self.env, self.limits)
 
     def delegate(self, d: Delegate) -> None:
         if self.arm == "direct":
@@ -970,8 +1045,10 @@ class _Replayer:
             self.tokens[d.agent] = self.tokens[d.parent]
             return
         assert self.ob is not None
-        caps = grant_capabilities(
-            self.suite.upstream, d.grant, constraints=self.arm in CONSTRAINED_ARMS
+        caps = self._limited(
+            grant_capabilities(
+                self.suite.upstream, d.grant, constraints=self.arm in CONSTRAINED_ARMS
+            )
         )
         try:
             self.tokens[d.agent] = self.ob.exchange(
@@ -1083,6 +1160,7 @@ class _Replayer:
         landed = first.resolves_to or first.target(self.suite.upstream)
         if self.arm != "direct":
             landed = first.target(self.suite.upstream)
+        approved: list[tuple[Call, CallResult]] = []
         for n, (c, rid) in enumerate(zip(calls, ids, strict=True)):
             msg = msgs.get(rid)
             if msg is None and not batch and len(msgs) == 1:
@@ -1100,6 +1178,52 @@ class _Replayer:
             aid = _approval_id(msg) if outcome == "gated" else None
             self._record(c, outcome, reason, decision, reached, intact, returned=returned,
                          approval_id=aid)  # fmt: skip
+            if self.arm in RETRY_ARMS and aid and scripted_approver(c):
+                approved.append((c, self.out[-1]))
+        for c, rec in approved:
+            self._retry_approved(c, rec, token)
+
+    def _retry_approved(self, call: Call, rec: CallResult, token: Any) -> None:
+        """Grant ``rec``'s approval through the admin API and send ``call`` once more, alone
+        (RETRY_ARMS). The result goes to ``rec.retry``; the gated record stays as it was."""
+        assert self.stack is not None and rec.approval_id is not None
+        r = self.http.post(
+            f"{self.stack.url}/admin/approvals/{quote(rec.approval_id, safe='')}",
+            json={"decision": "grant"},
+            headers={"authorization": f"Bearer {ADMIN_TOKEN}"},
+        )
+        if r.status_code != 200:
+            rec.retry = {"outcome": "error", "reason": f"grant_http_{r.status_code}",
+                         "stage": None, "decision_id": None, "reached_upstream": False,
+                         "args_intact": None, "output_returned": None}  # fmt: skip
+            return
+        self.rid += 1
+        dest = call.target(self.suite.upstream)
+        scripted = self.ups.get(dest)
+        if call.output is not None and scripted is not None:
+            scripted.script(self.http, {call.tool: [call.output]})
+        obs = _Observer(self.ups)
+        try:
+            resp = self._post(dest, token, _rpc_body(call, self.rid), None)
+        finally:
+            if call.output is not None and scripted is not None:
+                scripted.script(self.http, {})
+        new = obs.take()
+        header = [p.strip() for p in resp.headers.get(DECISION_HEADER, "").split(",") if p.strip()]
+        msg = next((m for m in _parse_messages(resp) if m.get("id") == self.rid), None)
+        outcome, reason, decision = _judge(msg, header)
+        if outcome == "allow" and header:
+            decision = header[0]
+        reached, intact = _delivered(new, dest if dest in self.ups else None, call)
+        rec.retry = {
+            "outcome": outcome,
+            "reason": reason,
+            "stage": stage_of(reason),
+            "decision_id": decision,
+            "reached_upstream": reached,
+            "args_intact": intact,
+            "output_returned": _returned(msg, call.output) if outcome == "allow" else None,
+        }
 
     def run(self) -> list[CallResult]:
         for step in self.case.steps:
@@ -1148,6 +1272,49 @@ def approval_probe_verdict(reply: dict[str, Any] | None) -> str | None:
     return (
         "the server does not answer -32008 approval_required for a destructive call after an "
         f"untrusted read (probe got {got})"
+    )
+
+
+def probe_limits(stack: Stack, all_upstreams: list[str]) -> str | None:
+    """None if the server enforces a token's ``limits``, else why the limits arms cannot run. A
+    server without run limits ignores the member, so the probe spends a one-call budget twice,
+    with its own tokens."""
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    try:
+        root = admin.mint_root_dev(USER, USER_ISSUER, ROOT_AGENT, [f"{u}:*" for u in all_upstreams])
+    finally:
+        admin.close()
+    cap = Capability("banking", "get_balance").with_limits(calls=1)
+    with Client(stack.url) as ob:
+        try:
+            token = ob.exchange(root, WORKER, [cap], client_secret=AGENT_SECRET)
+        except ApiError as e:
+            return f"the server refuses a token with limits ({e.error}: {e.detail or ''})"
+    headers = {
+        "accept": "application/json, text/event-stream",
+        "content-type": "application/json",
+        "authorization": f"Bearer {token}",
+    }
+    call = Call("get_balance", {}, "benign", "allow", None)
+    msgs: list[dict[str, Any] | None] = []
+    with httpx.Client(timeout=10) as http:
+        for i in (1, 2):
+            resp = http.post(f"{stack.url}/mcp/banking", json=_rpc_body(call, i), headers=headers)
+            msgs.append(next(iter(_parse_messages(resp)), None))
+    return limits_probe_verdict(msgs[1])
+
+
+def limits_probe_verdict(reply: dict[str, Any] | None) -> str | None:
+    """None if ``reply`` (to the probe's second call on a one-call budget) is ``-32003
+    budget_exhausted``."""
+    err: dict[str, Any] = (reply or {}).get("error") or {}
+    data: dict[str, Any] = err["data"] if isinstance(err.get("data"), dict) else {}
+    if err.get("code") == CODE_DENIED and data.get("reason") == "budget_exhausted":
+        return None
+    got = f"error {err.get('code')} {data.get('reason')}" if err else "no error"
+    return (
+        "the server does not enforce run limits: a second call on a `calls: 1` capability "
+        f"was not refused with budget_exhausted (probe got {got})"
     )
 
 
@@ -1202,6 +1369,13 @@ def audit_check(stack: Stack, results: list[CallResult]) -> dict[str, Any]:
     mismatched = []
     checked = [r for r in results if r.audited]
     for r in checked:
+        if r.retry is not None and r.retry["decision_id"]:
+            e = entries.get(r.retry["decision_id"])
+            want = "deny" if r.retry["outcome"] == "deny" else "allow"
+            if e is None or e.decision != want:
+                mismatched.append(
+                    {"case": r.case, "index": r.index, "decision_id": r.retry["decision_id"]}
+                )
         e = entries.get(r.decision_id or "")
         want = "deny" if r.outcome == "deny" else "allow"
         if r.outcome == "gated":
@@ -1277,6 +1451,10 @@ def run(
                     continue
                 try:
                     with server(env, bins, work, ups, arm, agents) as stack:
+                        if arm in LIMIT_ARMS:
+                            why = probe_limits(stack, all_upstreams)
+                            if why:
+                                raise ArmUnsupported(why)
                         if arm in LABEL_ARMS:
                             why = probe_approval(stack, all_upstreams)
                             if why:

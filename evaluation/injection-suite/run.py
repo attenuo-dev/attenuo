@@ -10,7 +10,8 @@ generated configs, logs and audit export.
 Exit status 1 if any attenuo-arm call does not match its expected outcome, if a denied call
 reached the upstream, if an allowed call did not return its scripted ``output:``, or if the audit
 check fails. The ``attenuo_labels`` arm is skipped, with a message, when the server does not
-answer ``-32008 approval_required`` (output labelling, phase 1, not yet on main). Exit status 2,
+answer ``-32008 approval_required`` (output labelling, phase 1), and the ``attenuo_limits`` and
+``attenuo_labels_limits`` arms when it does not enforce run limits (ADR-0010). Exit status 2,
 before anything runs, if the test split is requested while ``policies/`` differs from its frozen
 hashes or while the labelling oracle (``label_rules.py``) disagrees with a hand label that has no
 ``label_note``.
@@ -82,11 +83,27 @@ def problems(doc: dict[str, Any]) -> list[str]:
                 f"{where}: expected {c['expect']}/{c['expect_stage']}, "
                 f"got {c['outcome']}/{c['reason']}"
             )
-        if c["arm"] in harness.LABEL_ARMS and not labels_consistent(c):
+        if c["arm"] in harness.LIMIT_ARMS:
+            if not limits_consistent(c):
+                out.append(
+                    f"{where}: attenuo expects {c['expect']}/{c['expect_stage']}, limits arm "
+                    f"got {c['outcome']}/{c['reason']}"
+                )
+        elif c["arm"] in harness.LABEL_ARMS and not labels_consistent(c):
             out.append(
                 f"{where}: attenuo expects {c['expect']}/{c['expect_stage']}, labels arm got "
                 f"{c['outcome']}/{c['reason']}"
             )
+        retry = c.get("retry")
+        if retry is not None:
+            if retry["outcome"] != "allow":
+                out.append(
+                    f"{where}: approved, but the retry got {retry['outcome']}/{retry['reason']}"
+                )
+            if retry["outcome"] != "allow" and retry["reached_upstream"]:
+                out.append(f"{where}: retry {retry['outcome']} but reached the upstream")
+            if retry.get("output_returned") is False:
+                out.append(f"{where}: retried, but the reply lacks the scripted output")
         if c["outcome"] in ("deny", "gated") and c["reached_upstream"]:
             out.append(f"{where}: {c['outcome']} but reached the upstream")
         if c.get("output_returned") is False:
@@ -109,6 +126,17 @@ def labels_consistent(c: dict[str, Any]) -> bool:
     if c["expect"] == "deny":
         return bool(c["outcome"] == "deny" and c["stage"] == c["expect_stage"])
     return c["outcome"] in ("allow", "gated")
+
+
+def limits_consistent(c: dict[str, Any]) -> bool:
+    """A call in a limits arm keeps its attenuo label, except that a run limit may refuse it
+    (stage ``budget``): an allowed call, or one the policy would deny, since the limit check
+    comes before the policy. In the combined arm an allowed call may also be gated."""
+    if c["outcome"] == "deny" and c["stage"] == "budget":
+        return c["expect"] == "allow" or c["expect_stage"] == "policy"
+    if c["expect"] == "deny":
+        return bool(c["outcome"] == "deny" and c["stage"] == c["expect_stage"])
+    return c["outcome"] in (("allow", "gated") if c["arm"] in harness.LABEL_ARMS else ("allow",))
 
 
 def _pct(n: int, d: int) -> str:
@@ -140,6 +168,8 @@ ARM_NAMES = {
     "policy_only": "Suite policy with the root token (no attenuation)",
     "attenuo": "attenuo full",
     "attenuo_labels": "attenuo full plus output labels (scripted approver)",
+    "attenuo_limits": "attenuo full plus the frozen run-limit rule",
+    "attenuo_labels_limits": "attenuo full plus output labels and the run-limit rule",
 }
 
 
@@ -160,6 +190,7 @@ def arm_rates(doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
         ag = sum(c["outcome"] == "gated" for c in att)
         bd = sum(c["outcome"] == "deny" for c in ben)
         bg = sum(c["outcome"] == "gated" for c in ben)
+        budget = [c for c in calls if c["outcome"] == "deny" and c["stage"] == "budget"]
         out[arm] = {
             "attack_calls": len(att),
             "attack_allowed": aa,
@@ -173,6 +204,10 @@ def arm_rates(doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
             "approval_requests": ag + bg,
             "attack_allowed_approve_all": aa + ag,
             "attack_allowed_approve_all_wilson95": wilson(aa + ag, len(att)),
+            "attack_budget_denied": sum(c["role"] == "attack" for c in budget),
+            "benign_budget_denied": sum(c["role"] == "benign" for c in budget),
+            "approved_retried": sum(c.get("retry") is not None for c in calls),
+            "retry_allowed": sum((c.get("retry") or {}).get("outcome") == "allow" for c in calls),
         }
     return out
 
@@ -257,10 +292,11 @@ def render_split(doc: dict[str, Any], split: str) -> list[str]:
     if any(a in harness.LABEL_ARMS for a in doc["rates"]):
         L.append("")
         L.append(
-            "For the labels arm, attack calls that needed an approval count as declined and "
+            "For the labels arms, attack calls that needed an approval count as declined and "
             "benign ones as approved (scripted approver); see the next table."
         )
     L += render_labels(doc)
+    L += render_limits(doc)
     L += [
         "",
         "### attenuo by suite and stage",
@@ -390,14 +426,20 @@ def render_labels(doc: dict[str, Any]) -> list[str]:
         r = doc["rates"].get(arm)
         if r is None:
             continue
+        retry = (
+            f"The runner grants each approved request through the admin API and sends the call "
+            f"again, so that it is charged against the run's limits: {r['retry_allowed']} of "
+            f"{r['approved_retried']} retries were allowed."
+            if arm in harness.RETRY_ARMS
+            else "The runner does not grant or retry, so gated calls are counted, not retried."
+        )
         L += [
             "",
             f"### Approvals in `{arm}`",
             "",
             'A gated call got JSON-RPC `-32008` with `data.reason = "approval_required"`. '
             "The scripted approver approves a call labelled benign and declines one labelled "
-            "attack. The runner does not grant or retry, so gated calls are counted, not "
-            "retried. The approve-all bound treats every request as granted.",
+            f"attack. {retry} The approve-all bound treats every request as granted.",
             "",
             "| Attack allowed without approval | Attack gated | Attack allowed, approve-all "
             "| Benign gated | Benign denied | Approval requests |",
@@ -408,6 +450,32 @@ def render_labels(doc: dict[str, Any]) -> list[str]:
             f"| {_pct(r['benign_gated'], r['benign_calls'])} "
             f"| {_pct(r['benign_denied'], r['benign_calls'])} "
             f"| {r['approval_requests']} |",
+        ]
+    return L
+
+
+def render_limits(doc: dict[str, Any]) -> list[str]:
+    """What the run-limit rule refused in the limits arms."""
+    L: list[str] = []
+    for arm in harness.LIMIT_ARMS:
+        r = doc["rates"].get(arm)
+        if r is None:
+            continue
+        L += [
+            "",
+            f"### Run limits in `{arm}`",
+            "",
+            "The frozen rule in [`policies/limits-rule.json`](../policies/limits-rule.json) adds "
+            "`calls: 1` to every capability that is not a read. A refused call got JSON-RPC "
+            "`-32003` with a `budget_*` or `limit_arg_invalid` reason (stage `budget`).",
+            "",
+            "| Attack allowed | Attack refused by a limit | Benign refused by a limit "
+            "| Benign denied (any stage) |",
+            "|---:|---:|---:|---:|",
+            f"| {_ci(r['attack_allowed'], r['attack_calls'])} "
+            f"| {_pct(r['attack_budget_denied'], r['attack_calls'])} "
+            f"| {_pct(r['benign_budget_denied'], r['benign_calls'])} "
+            f"| {_ci(r['benign_denied'], r['benign_calls'])} |",
         ]
     return L
 

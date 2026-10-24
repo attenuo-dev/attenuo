@@ -1,0 +1,5 @@
+{
+  "rule": "one_call_per_non_read_only_capability",
+  "about": "The frozen run-limit rule of the attenuo_limits and attenuo_labels_limits arms (docs/design/run-limits.md, section 6). The runner adds these limits to every capability it puts in an exchanged token (the case's grant and every delegate step's grant) unless the capability names one read: a catalog tool marked readonly, or get_webpage. A capability with a tool glob (\"*\", \"read_*\") is not a read. Case files are not changed. Added on 2026-10-24, after the test cases in ../cases/test/ were written and read; its SHA-256 is in ../cases/test/POLICY_HASHES.json under added_later.",
+  "limits": { "calls": 1 }
+}
