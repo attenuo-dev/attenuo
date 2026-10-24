@@ -65,9 +65,50 @@ fn the_locked_pass_comes_after_a_sync_of_the_database_file() {
     let round = timings.rounds.iter().find(|r| r.locked.is_some()).unwrap();
     assert!(round.presynced, "{round:?}");
     assert!(round.last.complete(), "{round:?}");
+    // SR-58: the sync must not have released this process's POSIX locks on the database
+    // file. Closing any descriptor of a file drops every `fcntl` lock the process holds on it,
+    // including the SHARED lock SQLite keeps on the database file in WAL mode, which tells
+    // other processes the WAL is in use. Without it, another process that opens and closes the
+    // file (an operator's `sqlite3`, a backup tool) can take it for unused, checkpoint it and
+    // delete the WAL under the live store; SQLite 3.45's shell does.
+    audit.append(record(i)).unwrap();
+    i += 1;
+    let probe = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "probe_the_lock_on_the_store", "--nocapture"])
+        .env(PROBE_DB, &path)
+        .status()
+        .unwrap();
+    assert!(
+        probe.success(),
+        "another process could lock a store this process has open"
+    );
+    assert!(wal_path(&path).exists());
     let report = audit.verify_chain().unwrap();
     assert!(report.ok);
     assert_eq!(report.entries, i as u64);
+}
+
+/// Names the database the probe below opens.
+const PROBE_DB: &str = "ATTENUO_TEST_PROBE_DB";
+
+/// Run as a separate process by the test above (does nothing otherwise): open the store with
+/// plain SQLite in exclusive locking mode, which reads only once it holds an EXCLUSIVE lock
+/// on the database file. A store open in another process holds SHARED, so the read must fail
+/// as busy.
+#[test]
+fn probe_the_lock_on_the_store() {
+    let Some(path) = std::env::var_os(PROBE_DB) else {
+        return;
+    };
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.busy_timeout(Duration::ZERO).unwrap();
+    conn.pragma_update(None, "locking_mode", "EXCLUSIVE")
+        .unwrap();
+    let read = conn.query_row("SELECT count(*) FROM audit", [], |r| r.get::<_, i64>(0));
+    assert!(
+        matches!(&read, Err(e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)),
+        "{read:?}"
+    );
 }
 
 /// At `durability = "normal"` with signed checkpoints, the commit that brings the head within

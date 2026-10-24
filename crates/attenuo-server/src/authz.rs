@@ -46,7 +46,11 @@
 //!    overspend: if one spent first, the decision becomes `budget_exhausted`; if the store
 //!    fails, `budget_error`. The run-usage counters of a destructive call are charged in the
 //!    same transaction; usage never refuses, and a failed charge of usage alone leaves the
-//!    decision as it is (with a diagnostic). Denied calls are never charged.
+//!    decision as it is (with a diagnostic). Denied calls are never charged. From the budget
+//!    read in step 2 to this charge, a call that matches a limited hop or keeps run usage
+//!    holds its run's lock (`Pipeline::run_guard`), so a policy over `context.usage` or
+//!    `context.budget`, which the charge does not re-check, sees what every earlier call of
+//!    the run charged (SR-55).
 //! 6. **Audit.** A [`DecisionRecord`] is appended to the hash-chained log, and its id is the
 //!    decision id returned to the caller. If the append fails the call is denied with
 //!    `audit_error`: an action that cannot be recorded does not happen. An approval taken in
@@ -383,7 +387,16 @@ pub struct Pipeline {
     /// append (one `fsync` per call instead of a synced charge then an append, and under load
     /// the append's group commit shares it). See [`LeaseStore::charge_sync_deferred`].
     charge_sync_on_append: bool,
+    /// Serialises, per delegation run, the decisions whose policy input includes run usage or
+    /// budget figures, from reading those figures to charging them (SR-55). See
+    /// `Pipeline::run_guard`.
+    run_locks: Box<[Mutex<()>]>,
 }
+
+/// How many locks `Pipeline::run_guard` spreads runs over. Two runs that share one only
+/// wait for each other's budgeted decisions; correctness needs only that one run always maps
+/// to the same lock.
+const RUN_LOCK_STRIPES: usize = 64;
 
 impl Pipeline {
     pub fn new(
@@ -405,7 +418,40 @@ impl Pipeline {
                 crate::config::DEFAULT_APPROVAL_TTL_SECONDS as i64,
             ),
             approval_verifier: None,
+            run_locks: (0..RUN_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
         }
+    }
+
+    /// Hold the run's lock while a decision reads budget or usage figures, evaluates the
+    /// policy over them and charges them, so that the next decision of the same run sees what
+    /// this one charged (SR-55). The store's charge re-checks token limits on its own, but
+    /// nothing re-checks a policy over `context.usage` (a "hard" rule such as
+    /// `usage.amount + input.amount > 2000`, or a soft rule that asks on the second call) or
+    /// over `context.budget`: without the lock, concurrent calls of one run all read the same
+    /// figures and are all allowed. `None` (no lock) for a call that neither matches a token
+    /// limit's hop nor keeps run usage, so other calls never wait. In process only: two
+    /// servers on one store would not share it (not a supported deployment).
+    fn run_guard(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+    ) -> Option<std::sync::MutexGuard<'_, ()>> {
+        let limited = chain
+            .hops
+            .iter()
+            .any(|h| h.capabilities.iter().any(|c| !c.limits.is_empty()));
+        if !limited && self.usage_inputs(call).is_none() {
+            return None;
+        }
+        let chain_id = chain_id_of(chain)?;
+        let digest = attenuo_core::digest::sha256_bytes(chain_id.as_bytes());
+        let stripe = usize::from_str_radix(&digest[..8], 16).unwrap_or(0) % self.run_locks.len();
+        // A panic while holding the lock leaves nothing half-written that the lock guards.
+        Some(
+            self.run_locks[stripe]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
     }
 
     /// Accept signed approval tokens that verify under `verifier` (the issuer's own verifier:
@@ -509,6 +555,11 @@ impl Pipeline {
         let decision_id = Uuid::new_v4();
         let mut taken: Option<Approval> = None;
         let mut budget = BudgetView::default();
+        // Held from the budget read to the charge (SR-55).
+        let run_guard = leases
+            .is_ok()
+            .then(|| self.run_guard(chain, call))
+            .flatten();
         let (mut decision, mut reason, mut policy_ids, mut diagnostics) = match leases {
             Err((reason, detail)) => (Decision::Deny, reason.to_string(), Vec::new(), detail),
             Ok(()) => {
@@ -631,6 +682,8 @@ impl Pipeline {
                 }
             }
         }
+        // The charge is committed: the run's next decision may read the figures.
+        drop(run_guard);
         // An approval is spent only by a call it let through.
         if !decision.is_allow() {
             if let Some(a) = taken.take() {
@@ -2823,5 +2876,257 @@ when { context.usage.calls >= 2 };
         assert_eq!(s.pay().usage, None);
         assert!(!s.last_record_has_usage());
         assert_eq!(s.usage_rows(), rows, "no usage written after the reload");
+    }
+}
+
+#[cfg(test)]
+mod run_lock_tests {
+    //! SR-55: a policy over run usage (or budget figures) is evaluated on figures read before
+    //! the call is charged. Without a per-run lock, concurrent calls of one run all read the
+    //! same figures and all pass a rule that should stop the second.
+
+    use super::*;
+    use attenuo_audit::{
+        Approver, AuditError, CounterSummary, HopLimit, LeaseStatus, MemoryAudit, MemoryLeaseStore,
+        SpanHit,
+    };
+    use attenuo_core::{AgentId, Capability, CapabilitySet, Limits, OriginatingUser};
+    use attenuo_policy::{ArgType, PolicyEngineBuilder, ToolAttrs, ToolCatalog};
+    use serde_json::json;
+    use std::sync::{Barrier, Condvar};
+    use time::Duration;
+
+    /// A lease store whose budget reads wait (up to a bound) for a second reader, so two
+    /// concurrent decisions both read before either charges unless something serialises them.
+    struct Rendezvous {
+        inner: MemoryLeaseStore,
+        readers: Mutex<usize>,
+        arrived: Condvar,
+    }
+
+    impl LeaseStore for Rendezvous {
+        fn register(
+            &self,
+            l: &LeaseId,
+            p: Option<&LeaseId>,
+            e: OffsetDateTime,
+        ) -> Result<(), AuditError> {
+            self.inner.register(l, p, e)
+        }
+        fn revoke(&self, l: &LeaseId, r: &str, n: OffsetDateTime) -> Result<u64, AuditError> {
+            self.inner.revoke(l, r, n)
+        }
+        fn renew(
+            &self,
+            l: &LeaseId,
+            e: OffsetDateTime,
+            n: OffsetDateTime,
+        ) -> Result<(), AuditError> {
+            self.inner.renew(l, e, n)
+        }
+        fn is_active(&self, l: &LeaseId, n: OffsetDateTime) -> Result<bool, AuditError> {
+            self.inner.is_active(l, n)
+        }
+        fn bind(&self, l: &LeaseId, b: &str) -> Result<(), AuditError> {
+            self.inner.bind(l, b)
+        }
+        fn binding(&self, l: &LeaseId) -> Result<Option<String>, AuditError> {
+            self.inner.binding(l)
+        }
+        fn check_all(&self, l: &[&LeaseId], n: OffsetDateTime) -> Result<LeaseStatus, AuditError> {
+            self.inner.check_all(l, n)
+        }
+        fn add_label(&self, c: &LeaseId, l: &RunLabel) -> Result<(), AuditError> {
+            self.inner.add_label(c, l)
+        }
+        fn labels(&self, c: &LeaseId) -> Result<Vec<RunLabel>, AuditError> {
+            self.inner.labels(c)
+        }
+        fn add_spans(&self, c: &LeaseId, s: u64, f: &[Fingerprint]) -> Result<(), AuditError> {
+            self.inner.add_spans(c, s, f)
+        }
+        fn find_spans(&self, c: &LeaseId, f: &[Fingerprint]) -> Result<Vec<SpanHit>, AuditError> {
+            self.inner.find_spans(c, f)
+        }
+        fn create_approval(&self, a: &Approval) -> Result<(Approval, bool), AuditError> {
+            self.inner.create_approval(a)
+        }
+        fn approval(&self, id: &str) -> Result<Option<Approval>, AuditError> {
+            self.inner.approval(id)
+        }
+        fn approvals(&self, c: Option<&LeaseId>, n: usize) -> Result<Vec<Approval>, AuditError> {
+            self.inner.approvals(c, n)
+        }
+        fn decide_approval(
+            &self,
+            id: &str,
+            g: bool,
+            a: &Approver,
+            n: OffsetDateTime,
+        ) -> Result<Approval, AuditError> {
+            self.inner.decide_approval(id, g, a, n)
+        }
+        fn take_approval(
+            &self,
+            c: &LeaseId,
+            l: &LeaseId,
+            h: &str,
+            d: &str,
+            n: OffsetDateTime,
+        ) -> Result<Option<Approval>, AuditError> {
+            self.inner.take_approval(c, l, h, d, n)
+        }
+        fn take_approval_by_id(
+            &self,
+            id: &str,
+            c: &LeaseId,
+            l: &LeaseId,
+            h: &str,
+            d: &str,
+            n: OffsetDateTime,
+        ) -> Result<Option<Approval>, AuditError> {
+            self.inner.take_approval_by_id(id, c, l, h, d, n)
+        }
+        fn restore_approval(&self, id: &str, d: &str) -> Result<(), AuditError> {
+            self.inner.restore_approval(id, d)
+        }
+        fn remove_approval(&self, id: &str) -> Result<(), AuditError> {
+            self.inner.remove_approval(id)
+        }
+        fn budget_used(&self, c: &[Charge]) -> Result<Vec<u64>, AuditError> {
+            let mut readers = self.readers.lock().unwrap();
+            *readers += 1;
+            self.arrived.notify_all();
+            let (readers, _) = self
+                .arrived
+                .wait_timeout_while(readers, std::time::Duration::from_millis(300), |r| *r < 2)
+                .unwrap();
+            drop(readers);
+            self.inner.budget_used(c)
+        }
+        fn charge(
+            &self,
+            d: &str,
+            c: &[Charge],
+            at: OffsetDateTime,
+        ) -> Result<ChargeOutcome, AuditError> {
+            self.inner.charge(d, c, at)
+        }
+        fn refund(&self, d: &str, at: OffsetDateTime) -> Result<u64, AuditError> {
+            self.inner.refund(d, at)
+        }
+        fn record_hop_limits(&self, l: &LeaseId, h: &[HopLimit]) -> Result<(), AuditError> {
+            self.inner.record_hop_limits(l, h)
+        }
+        fn hop_limits(&self, l: &LeaseId) -> Result<Option<Vec<HopLimit>>, AuditError> {
+            self.inner.hop_limits(l)
+        }
+        fn budget_summary(&self, l: &LeaseId) -> Result<Vec<CounterSummary>, AuditError> {
+            self.inner.budget_summary(l)
+        }
+    }
+
+    fn run(policies: &str, limits: Limits) -> (Arc<Pipeline>, DelegationChain, OffsetDateTime) {
+        let now = OffsetDateTime::now_utc();
+        let leases = Arc::new(Rendezvous {
+            inner: MemoryLeaseStore::new(),
+            readers: Mutex::new(0),
+            arrived: Condvar::new(),
+        });
+        leases
+            .register(&LeaseId::new("l1"), None, now + Duration::hours(1))
+            .unwrap();
+        let attrs = ToolAttrs::new()
+            .with_input("amount", ArgType::Long)
+            .with_amount("amount");
+        let engine = PolicyEngineBuilder::new()
+            .with_catalog(ToolCatalog::new().with("bank", "send", attrs))
+            .with_policies_str(policies)
+            .build()
+            .unwrap();
+        let pipeline = Pipeline::new(
+            Arc::new(RwLock::new(engine)),
+            leases,
+            Arc::new(MemoryAudit::new()),
+        );
+        let chain = DelegationChain::root(
+            OriginatingUser {
+                subject: "alice".into(),
+                issuer: "idp".into(),
+                authenticated_at: now,
+                attributes: Default::default(),
+            },
+            AgentId::new("planner"),
+            CapabilitySet::from_iter([Capability::new("bank", "send").with_limits(limits)]),
+            now,
+            Duration::hours(1),
+            LeaseId::new("l1"),
+        )
+        .unwrap();
+        (Arc::new(pipeline), chain, now)
+    }
+
+    /// Two payments of one run, sent at the same moment.
+    fn pay_twice_at_once(
+        p: &Arc<Pipeline>,
+        chain: &DelegationChain,
+        now: OffsetDateTime,
+    ) -> Vec<PipelineDecision> {
+        let start = Arc::new(Barrier::new(2));
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let (p, chain, start) = (p.clone(), chain.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    let call = ToolCall::new("bank", "send", json!({"amount": 1500}));
+                    p.decide(&chain, &call, now)
+                })
+            })
+            .collect();
+        threads.into_iter().map(|t| t.join().unwrap()).collect()
+    }
+
+    #[test]
+    fn concurrent_calls_cannot_both_pass_a_run_usage_cap_sr55() {
+        // The shipped example's "hard" cap: a run never sends more than 2000 in total.
+        let (p, chain, now) = run(
+            r#"
+permit(principal, action, resource);
+@id("run_spend_cap_2000")
+forbid (principal, action == Action::"bank/send", resource)
+when { context.input has amount && context.usage.amount + context.input.amount > 2000 };
+"#,
+            Limits::default(),
+        );
+        let out = pay_twice_at_once(&p, &chain, now);
+        assert_eq!(out.iter().filter(|d| d.is_allow()).count(), 1, "{out:#?}");
+        let denied = out.iter().find(|d| !d.is_allow()).unwrap();
+        assert_eq!(denied.reason, attenuo_policy::REASON_POLICY_DENY);
+        assert_eq!(denied.usage.map(|u| u.amount), Some(1500));
+    }
+
+    #[test]
+    fn concurrent_calls_cannot_both_pass_a_budget_rule_sr55() {
+        // A policy over `context.budget`, which the store's charge does not re-check.
+        let (p, chain, now) = run(
+            r#"
+permit(principal, action, resource);
+@id("last_call_needs_an_approval")
+@obligation("approval")
+forbid (principal, action == Action::"bank/send", resource)
+when { context.budget.calls_remaining <= 1 && !context.approval.present };
+"#,
+            Limits::default().with_calls(2),
+        );
+        let out = pay_twice_at_once(&p, &chain, now);
+        let reasons: BTreeSet<&str> = out.iter().map(|d| d.reason.as_str()).collect();
+        assert_eq!(
+            reasons,
+            BTreeSet::from([
+                attenuo_policy::REASON_POLICY_ALLOW,
+                attenuo_policy::REASON_APPROVAL_REQUIRED
+            ]),
+            "{out:#?}"
+        );
     }
 }
