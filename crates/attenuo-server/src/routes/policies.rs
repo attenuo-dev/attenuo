@@ -153,7 +153,9 @@ pub async fn check_policies(State(state): State<Arc<AppState>>) -> Result<Json<V
 /// never charges a counter. `usage` is `context.usage` (run-limits design section 3.5): as
 /// given in the request's optional `usage: {calls, amount, destination_seen}`, or else the
 /// run's usage of a destructive tool read from the store (all zero for any other tool), with
-/// `source` saying which.
+/// `source` saying which: `request`, `store`, or `untracked` when the engine keeps no run
+/// usage at all ([`attenuo_policy::PolicyEngine::tracks_usage`]), so the zeros are not a
+/// reading of the run.
 pub async fn evaluate_policies(
     State(state): State<Arc<AppState>>,
     body: Bytes,
@@ -235,7 +237,16 @@ pub async fn evaluate_policies(
     let budget = state.pipeline.budget_view(&chain, &call);
     let (usage, usage_source) = match usage_given {
         Some(u) => (u, "request"),
-        None => (budget.usage.unwrap_or_default(), "store"),
+        None => {
+            // A poisoned engine lock counts as tracking, as the pipeline treats it.
+            let tracked = state
+                .pipeline
+                .policy()
+                .read()
+                .map_or(true, |e| e.tracks_usage());
+            let source = if tracked { "store" } else { "untracked" };
+            (budget.usage.unwrap_or_default(), source)
+        }
     };
     let labels = CallLabels {
         session: session.clone(),
