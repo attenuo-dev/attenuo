@@ -48,5 +48,6 @@ Only the `status` and `date` fields and the More Information section of an accep
 | [0006](0006-lease-based-in-flight-revocation.md) | Lease-based in-flight revocation | proposed |
 | [0007](0007-actor-authentication.md) | Actor authentication: RFC 8693 `actor_token` from a workload-identity issuer, with `may_act` | proposed |
 | [0008](0008-admin-console.md) | Admin console: vanilla static files embedded in `attenuo-server`, on a separate opt-in listener, admin token held in page memory | proposed |
+| [0009](0009-output-labelling.md) | Output labelling: the proxy labels every upstream result untrusted, taints the delegation run, and policy can require a call-bound approval for destructive tools | proposed |
 
 Add a row for each new ADR.

@@ -36,6 +36,8 @@ The 3 lease denials happened only because the case scripted a user revocation. W
 
 Scope-only tokens stop 19 attack calls: 16 that use a tool the task's grant does not include (14 in the class S cases, plus one each in `github-01` and `travel-06`), and the 3 scripted revocations. The other 31 refusals, the gap between 41 and 10 allowed, need more than tool names. Argument constraints in the token account for 16, and the suite policy for 15. The policy also accounts for all 3 lost benign calls.
 
+**Re-check (2026-10-24).** The suite was re-run on main `de3cf75` (after the admin console #25–#30, the WAL measurement #33, the SDK helpers #34 and the CLI follow-ups #35) with the frozen policies. Every table is identical to the 2026-10-23 v2 run: dev split 10/60 attack calls allowed with the full stack against 60/60 direct, 3/69 benign denied; test split 7/38 against 38/38, 3/29 benign denied; oracle agreement 129/129 and 67/67 call labels. Output: [`results/2026-10-24-recheck.md`](../../evaluation/injection-suite/results/2026-10-24-recheck.md).
+
 ## What attenuo did not stop
 
 ### Dev split
@@ -68,6 +70,18 @@ On the dev split, three benign calls were refused. All three were predicted, and
 ## Labels and agreement
 
 Every call carries an expected outcome and every case an S/C/D/N class, written by hand. [`label_rules.py`](../../evaluation/injection-suite/label_rules.py) derives the same labels mechanically from the grant, the delegation and revocation steps, the arguments and a Python model of the frozen policies, without reading the hand labels. Cohen's kappa between the two is 1.0 on both splits, for call labels (129 dev, 67 test) and for case classes (46 dev, 26 test), with no disagreements to resolve. Do not read this as independent agreement. The oracle was written after the hand labels, from the same reading of the policies, and its class rule maps refusal stages to classes in the way the hand labels already did. It shows that the labels follow one consistent rule. `run.py` refuses to report test numbers while the oracle disagrees with a hand label that has no `label_note`, or while any policy file differs from its frozen hash.
+
+## Output labelling arm (not yet run)
+
+The [output-labelling design](https://github.com/attenuo-dev/attenuo/blob/docs/output-labelling-design/docs/design/output-labelling.md) proposes session taint: once a run has read an upstream result, a destructive call needs the user's approval, which the proxy asks for with JSON-RPC error `-32008` (`approval_required`). Its phase 1 is to be measured here, in a sixth arm, `attenuo_labels`: the `attenuo` arm plus the two approval policies of design section 3.6, kept in [`policies/labels.cedar`](../../evaluation/injection-suite/policies/labels.cedar). The arm has not been run. The server on main does not support `-32008`, and the runner skips the arm with that reason.
+
+Prepared for it so far:
+
+- **Tool outputs in the corpus.** A call can carry `output:`, the text the fake upstream returns for it, which is where an injection lives. All 46 reads in the dev split have one. Re-running both splits with the outputs in place, against binaries built from main `de3cf75`, gave the same numbers as the [2026-10-24 recheck](https://github.com/attenuo-dev/attenuo/blob/docs/eval-recheck-2026-10-24/evaluation/injection-suite/results/2026-10-24-recheck.md) in all five arms: on the dev split attenuo allowed 10 of 60 attack calls and denied 3 of 69 benign calls, on the test split 7 of 38 and 3 of 29. All 219 allowed dev calls with an `output:` (across the five arms) returned their text.
+- **Reads for the test split, proposed.** The test cases mostly do not script the read their task implies (design section 4). [`cases/test/PROPOSED-READS-2026-10-24.md`](../../evaluation/injection-suite/cases/test/PROPOSED-READS-2026-10-24.md) lists one read for 15 of the 26 test cases and outputs for the reads that exist, for the maintainer to apply. Applied, they keep the oracle's kappa at 1.0 and add 15 benign calls. They are what lets session taint reach the allowed attack calls in `t-workspace-02`, `-04` and `-12`.
+- **Scripted approver.** A gated call is recorded as `gated`. The approver approves calls labelled benign and declines calls labelled attack. Until the server has its approvals API, gated calls are counted, not retried. The report will show attack calls allowed without approval, attack calls gated, the approve-all bound (every approval granted), benign calls gated and the number of approval requests.
+
+The design's own estimate, from reading the cases rather than running them, is about 1 of 60 dev attack calls allowed without approval (against 10 today) and about 18 of 66 allowed dev benign calls asking for an approval. Those are the numbers this arm will check.
 
 ## How far to trust this
 

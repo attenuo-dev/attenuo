@@ -8,9 +8,12 @@ Options: ``--split dev|test|all`` (default dev), ``--seed N`` to shuffle the ord
 generated configs, logs and audit export.
 
 Exit status 1 if any attenuo-arm call does not match its expected outcome, if a denied call
-reached the upstream, or if the audit check fails. Exit status 2, before anything runs, if the
-test split is requested while ``policies/`` differs from its frozen hashes or while the labelling
-oracle (``label_rules.py``) disagrees with a hand label that has no ``label_note``.
+reached the upstream, if an allowed call did not return its scripted ``output:``, or if the audit
+check fails. The ``attenuo_labels`` arm is skipped, with a message, when the server does not
+answer ``-32008 approval_required`` (output labelling, phase 1, not yet on main). Exit status 2,
+before anything runs, if the test split is requested while ``policies/`` differs from its frozen
+hashes or while the labelling oracle (``label_rules.py``) disagrees with a hand label that has no
+``label_note``.
 """
 
 from __future__ import annotations
@@ -79,8 +82,15 @@ def problems(doc: dict[str, Any]) -> list[str]:
                 f"{where}: expected {c['expect']}/{c['expect_stage']}, "
                 f"got {c['outcome']}/{c['reason']}"
             )
-        if c["outcome"] == "deny" and c["reached_upstream"]:
-            out.append(f"{where}: denied but reached the upstream")
+        if c["arm"] in harness.LABEL_ARMS and not labels_consistent(c):
+            out.append(
+                f"{where}: attenuo expects {c['expect']}/{c['expect_stage']}, labels arm got "
+                f"{c['outcome']}/{c['reason']}"
+            )
+        if c["outcome"] in ("deny", "gated") and c["reached_upstream"]:
+            out.append(f"{where}: {c['outcome']} but reached the upstream")
+        if c.get("output_returned") is False:
+            out.append(f"{where}: allowed, but the reply lacks the scripted output")
         if c["arm"] != "attenuo" and c["outcome"] == "error":
             out.append(f"{where}: upstream returned an error")
     for arm, a in doc["audit"].items():
@@ -91,6 +101,14 @@ def problems(doc: dict[str, Any]) -> list[str]:
         if a["cli_verify_exit"] != 0 or a["offline_verify_exit"] != 0 or a["export_exit"] != 0:
             out.append(f"{arm}: audit verification failed")
     return out
+
+
+def labels_consistent(c: dict[str, Any]) -> bool:
+    """A call in the labels arm keeps its attenuo label, except that an allowed call may be
+    gated: an approval obligation can only ask, and a deny stays a deny at the same stage."""
+    if c["expect"] == "deny":
+        return bool(c["outcome"] == "deny" and c["stage"] == c["expect_stage"])
+    return c["outcome"] in ("allow", "gated")
 
 
 def _pct(n: int, d: int) -> str:
@@ -121,18 +139,27 @@ ARM_NAMES = {
     "scope_constraints": "Tokens with argument constraints, permit-all policy",
     "policy_only": "Suite policy with the root token (no attenuation)",
     "attenuo": "attenuo full",
+    "attenuo_labels": "attenuo full plus output labels (scripted approver)",
 }
 
 
 def arm_rates(doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Per arm: attack calls allowed and benign calls denied, with Wilson 95% intervals."""
+    """Per arm: attack calls allowed and benign calls denied, with Wilson 95% intervals.
+
+    A gated call (``-32008 approval_required``, labels arm only) is counted the way the scripted
+    approver answers it: a gated attack call is declined, so not allowed, and a gated benign call
+    is approved, so not denied. ``attack_allowed_approve_all`` is the bound for an approver who
+    grants everything. Arms without approvals have no gated calls, so their numbers are as before.
+    """
     out: dict[str, dict[str, Any]] = {}
     for arm in doc["arms"]:
         calls = [c for c in doc["calls"] if c["arm"] == arm]
         att = [c for c in calls if c["role"] == "attack"]
         ben = [c for c in calls if c["role"] == "benign"]
-        aa = sum(c["outcome"] != "deny" for c in att)
+        aa = sum(c["outcome"] not in ("deny", "gated") for c in att)
+        ag = sum(c["outcome"] == "gated" for c in att)
         bd = sum(c["outcome"] == "deny" for c in ben)
+        bg = sum(c["outcome"] == "gated" for c in ben)
         out[arm] = {
             "attack_calls": len(att),
             "attack_allowed": aa,
@@ -141,6 +168,11 @@ def arm_rates(doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
             "benign_calls": len(ben),
             "benign_denied": bd,
             "benign_denied_wilson95": wilson(bd, len(ben)),
+            "attack_gated": ag,
+            "benign_gated": bg,
+            "approval_requests": ag + bg,
+            "attack_allowed_approve_all": aa + ag,
+            "attack_allowed_approve_all_wilson95": wilson(aa + ag, len(att)),
         }
     return out
 
@@ -222,6 +254,13 @@ def render_split(doc: dict[str, Any], split: str) -> list[str]:
             f"| {_pct(r['attack_reached_upstream'], r['attack_calls'])} "
             f"| {_ci(r['benign_denied'], r['benign_calls'])} |"
         )
+    if any(a in harness.LABEL_ARMS for a in doc["rates"]):
+        L.append("")
+        L.append(
+            "For the labels arm, attack calls that needed an approval count as declined and "
+            "benign ones as approved (scripted approver); see the next table."
+        )
+    L += render_labels(doc)
     L += [
         "",
         "### attenuo by suite and stage",
@@ -339,6 +378,37 @@ def render_split(doc: dict[str, Any], split: str) -> list[str]:
     probs = problems(doc)
     L += ["", "### Problems", ""]
     L += [f"- {p}" for p in probs] if probs else ["None."]
+    return L
+
+
+def render_labels(doc: dict[str, Any]) -> list[str]:
+    """The approval columns of the labels arm, or why it did not run."""
+    L: list[str] = []
+    for arm, why in (doc.get("skipped_arms") or {}).items():
+        L += ["", f"Arm `{arm}` was not run: {why}."]
+    for arm in harness.LABEL_ARMS:
+        r = doc["rates"].get(arm)
+        if r is None:
+            continue
+        L += [
+            "",
+            f"### Approvals in `{arm}`",
+            "",
+            'A gated call got JSON-RPC `-32008` with `data.reason = "approval_required"`. '
+            "The scripted approver approves a call labelled benign and declines one labelled "
+            "attack. Retrying an approved call needs the approvals API, so gated calls are "
+            "counted, not retried. The approve-all bound treats every request as granted.",
+            "",
+            "| Attack allowed without approval | Attack gated | Attack allowed, approve-all "
+            "| Benign gated | Benign denied | Approval requests |",
+            "|---:|---:|---:|---:|---:|---:|",
+            f"| {_ci(r['attack_allowed'], r['attack_calls'])} "
+            f"| {_pct(r['attack_gated'], r['attack_calls'])} "
+            f"| {_ci(r['attack_allowed_approve_all'], r['attack_calls'])} "
+            f"| {_pct(r['benign_gated'], r['benign_calls'])} "
+            f"| {_pct(r['benign_denied'], r['benign_calls'])} "
+            f"| {r['approval_requests']} |",
+        ]
     return L
 
 

@@ -12,7 +12,7 @@ This demo replays that shape against attenuo, with a fake GitHub MCP server so i
 examples/github-leak-demo/run.sh
 ```
 
-It needs a Rust toolchain, `curl` and `python3`. The first run compiles the workspace. Ports are picked at random, everything lives in a temp directory, and an exit trap stops both servers and removes the directory (`KEEP=1` keeps it for the logs). The script exits non-zero if any step does not come out as described below, so it can also run in CI. A real run is in [transcript.md](transcript.md).
+It needs a Rust toolchain, `curl` and `python3`. The first run compiles the workspace (about a minute and a half on 4 cores, see [How long it takes](#how-long-it-takes)). Ports are picked at random, everything lives in a temp directory, and an exit trap stops both servers and removes the directory (`KEEP=1` keeps it for the logs). The script exits non-zero if any step does not come out as described below, so it can also run in CI. A real run is in [transcript.md](transcript.md).
 
 The policy has its own tests, which need no server (`run.sh` runs them first):
 
@@ -22,6 +22,16 @@ cargo run -q -p attenuo-cli -- policy lint examples/github-leak-demo/policy.ceda
 ```
 
 See [writing-policies](../../docs/guides/writing-policies.md#testing-policies).
+
+### How long it takes
+
+Measured 2026-10-24 at commit `de3cf75` on a 4-vCPU container (Intel Xeon @ 2.10GHz, 15 GB RAM, rustc 1.99.1), with an empty target directory and crates already downloaded:
+
+- cold, cargo defaults: 1 min 31 s wall clock, nearly all of it compiling;
+- cold, debug info and incremental off (`CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0`): 1 min 22 s;
+- warm: 0.9 s, of which the nine steps take about 0.2 s and the rest is cargo checking that nothing changed.
+
+Downloading crates on a machine with an empty cargo cache comes on top and was not measured. Raw output: [2026-10-24-vm-demo-cold-timing.md](../../docs/design/bench/2026-10-24-vm-demo-cold-timing.md).
 
 ## What happens
 
