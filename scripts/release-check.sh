@@ -135,4 +135,8 @@ if [[ $started == 0 ]]; then
   echo "unknown step: $from (see --list)" >&2
   exit 2
 fi
-printf '\nrelease-check: all %d steps passed from %s\n' "${#STEPS[@]}" "$from"
+if [[ $from == "${STEPS[0]}" ]]; then
+  printf '\nrelease-check: all %d steps passed\n' "${#STEPS[@]}"
+else
+  printf '\nrelease-check: every step from %s on passed (earlier steps not run)\n' "$from"
+fi
