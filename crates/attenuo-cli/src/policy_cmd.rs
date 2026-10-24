@@ -1,6 +1,6 @@
 //! `attenuo policy test` and `attenuo policy lint`: offline checks of a policy set. They
-//! never talk to a server, except `policy test --via authzen`, which sends the cases to a
-//! running server's AuthZEN endpoint.
+//! never talk to a server, except `policy test --via authzen` and `--via admin-evaluate`, which
+//! send the cases to a running server's AuthZEN endpoint or its admin dry run.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -181,6 +181,135 @@ fn authzen_body(call: &attenuo_core::ToolCall) -> Value {
         "resource": {"type": "tool", "id": format!("{}/{}", call.server, call.tool),
                      "properties": {"server": call.server, "tool": call.tool}},
         "context": context,
+    })
+}
+
+/// `attenuo policy test --via admin-evaluate <file>...`: every case, with the chain it
+/// describes, is decided by the server's admin dry run (`POST /admin/policies/evaluate`, the
+/// client's admin token). The dry run takes an admin-supplied chain, the case's `session`,
+/// `approval` and `usage`, checks no lease and writes no audit record, so nearly every case
+/// replays as written; only cases that set `budget` are skipped (see
+/// [`testing::TestCase::admin_evaluate_skip_reason`]). The server validates the chain at its own
+/// clock, so each chain is stamped at the current time (see [`testing::TestCase::input_at`]).
+/// A case the server refuses with 400 (a chain deeper than its `max_depth`, an approval `by` it
+/// does not know) is reported as that case's error; any other refusal (a bad admin token, a
+/// server without the route) or a transport error stops the file.
+pub async fn test_admin_evaluate(
+    files: &[PathBuf],
+    client: &crate::client::Client,
+    opts: &TestOptions,
+    json_out: bool,
+) -> Run {
+    let mut reports: Vec<(&Path, TestReport)> = Vec::new();
+    let mut errors: Vec<(&Path, String)> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    for path in files {
+        let file = match TestFile::load(path) {
+            Ok(f) => f,
+            Err(e) => {
+                errors.push((path, e.to_string()));
+                continue;
+            }
+        };
+        if file.sets_now() {
+            notes.push(format!(
+                "{}: `now` is not sent; chains are stamped at the current time and the server \
+                 evaluates at its own clock",
+                path.display()
+            ));
+        }
+        let mut cases = Vec::with_capacity(file.cases.len());
+        let mut failure = None;
+        for case in &file.cases {
+            if let Some(why) = case.admin_evaluate_skip_reason() {
+                cases.push(case.skip(why));
+                continue;
+            }
+            let at = time::OffsetDateTime::now_utc().unix_timestamp();
+            let input = match case.input_at(file.now_unix(), at) {
+                Ok(i) => i,
+                Err(e) => {
+                    cases.push(case.errored(e));
+                    continue;
+                }
+            };
+            let body = admin_evaluate_body(&input);
+            let answer = client
+                .admin_post("/admin/policies/evaluate", &body)
+                .await
+                .and_then(|v| admin_evaluate_actual(&v));
+            match answer {
+                Ok(actual) => cases.push(case.check(actual)),
+                Err(e) => match e.downcast_ref::<crate::client::ApiError>() {
+                    Some(api) if api.status == reqwest::StatusCode::BAD_REQUEST => {
+                        cases.push(case.errored(format!("the server refused the case: {api}")));
+                    }
+                    _ => {
+                        failure = Some(format!("case `{}`: {e:#}", case.name));
+                        break;
+                    }
+                },
+            }
+        }
+        match failure {
+            Some(e) => errors.push((path, e)),
+            None => match file.report_for(cases) {
+                Ok(r) => reports.push((path, r)),
+                Err(e) => errors.push((path, e.to_string())),
+            },
+        }
+    }
+    report(&reports, &errors, &notes, opts, json_out)
+}
+
+/// The admin dry-run request for a case: the AuthZEN request with the case's chain, plus its
+/// labels as the run's state. `session` and `usage` are always sent, so the dry run never reads
+/// them from the server's store; `approval` only when the case carries one.
+fn admin_evaluate_body(input: &testing::CaseInput) -> Value {
+    let mut body = serde_json::to_value(attenuo_policy::authzen::to_request(
+        &input.chain,
+        &input.call,
+    ))
+    .unwrap_or_default();
+    let l = &input.labels;
+    body["session"] = json!({
+        "tainted": l.session.tainted,
+        "tainted_by": l.session.tainted_by,
+        "untrusted_args": l.args.untrusted,
+        "args_contain_untrusted": l.args.contain_untrusted,
+    });
+    body["usage"] = json!({
+        "calls": l.usage.calls,
+        "amount": l.usage.amount,
+        "destination_seen": l.usage.destination_seen,
+    });
+    if l.approval.present {
+        body["approval"] = json!({ "by": l.approval.by });
+    }
+    body
+}
+
+/// Read the dry run's answer (`{decision: "allow" | "deny", reason, policy_ids, diagnostics,
+/// ...}`) as what was decided.
+fn admin_evaluate_actual(v: &Value) -> anyhow::Result<testing::Actual> {
+    let decision: attenuo_core::Decision = serde_json::from_value(v["decision"].clone())
+        .map_err(|e| anyhow::anyhow!("the server's answer has no decision: {e}"))?;
+    let strings = |key: &str| -> Vec<String> {
+        v[key]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Ok(testing::Actual {
+        decision,
+        reason: v["reason"].as_str().unwrap_or_default().to_string(),
+        policy_ids: strings("policy_ids"),
+        diagnostics: strings("diagnostics"),
     })
 }
 
@@ -659,6 +788,60 @@ mod tests {
     }
 
     #[test]
+    fn admin_evaluate_body_carries_the_chain_and_labels_and_reads_the_answer() {
+        let f = TestFile::from_yaml_str(
+            r#"
+cases:
+  - name: labelled
+    chain: [a, b]
+    session: { tainted_by: [web/fetch] }
+    approval: { by: user }
+    usage: { calls: 3 }
+    call: { server: github, tool: create_issue, arguments: { repo: acme/api } }
+    expect: deny
+  - name: plain
+    call: { server: github, tool: read_file }
+    expect: allow
+"#,
+        )
+        .unwrap();
+        let input = f.cases[0].input(f.now_unix()).unwrap();
+        let body = admin_evaluate_body(&input);
+        assert_eq!(body["subject"]["id"], "b");
+        assert_eq!(
+            body["subject"]["properties"]["chain"]["hops"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(body["action"]["properties"]["server"], "github");
+        assert_eq!(body["context"]["input"]["repo"], "acme/api");
+        assert_eq!(body["session"]["tainted"], true);
+        assert_eq!(body["session"]["tainted_by"], json!(["web/fetch"]));
+        assert_eq!(body["approval"], json!({"by": "user"}));
+        assert_eq!(body["usage"]["calls"], 3);
+        assert!(body.get("token").is_none());
+        // Without labels the run is sent as untainted with no usage, and no approval.
+        let plain = admin_evaluate_body(&f.cases[1].input(f.now_unix()).unwrap());
+        assert_eq!(plain["session"]["tainted"], false);
+        assert_eq!(plain["usage"]["calls"], 0);
+        assert!(plain.get("approval").is_none());
+
+        let a = admin_evaluate_actual(&json!({
+            "decision": "deny", "reason": "policy_deny", "policy_ids": ["p"],
+            "diagnostics": [], "lease_check": "skipped"
+        }))
+        .unwrap();
+        assert!(!a.decision.is_allow());
+        assert_eq!(
+            (a.reason.as_str(), a.policy_ids.clone()),
+            ("policy_deny", vec!["p".to_string()])
+        );
+        assert!(admin_evaluate_actual(&json!({"reason": "x"})).is_err());
+    }
+
+    #[test]
     fn test_and_lint_subcommands_parse() {
         use crate::cli::{Cli, Command, PolicyCmd};
         use clap::Parser;
@@ -693,6 +876,21 @@ mod tests {
         assert_eq!(args.schema_file, Some(PathBuf::from("base.cedarschema")));
         assert_eq!(args.via, crate::cli::Via::Authzen);
         assert_eq!(args.token.token_file, Some(PathBuf::from("t.jwt")));
+
+        // The admin token flags are global: before `policy test` or after it.
+        for argv in [
+            &["attenuo", "--admin-token-file", "a.txt", "policy", "test"][..],
+            &["attenuo", "policy", "test", "--admin-token-file", "a.txt"][..],
+        ] {
+            let mut argv = argv.to_vec();
+            argv.extend(["a.yaml", "--via", "admin-evaluate"]);
+            let cli = Cli::try_parse_from(argv).unwrap();
+            assert_eq!(cli.admin_token_file, Some(PathBuf::from("a.txt")));
+            let Command::Policy(PolicyCmd::Test(args)) = cli.command else {
+                panic!("not policy test")
+            };
+            assert_eq!(args.via, crate::cli::Via::AdminEvaluate);
+        }
 
         let cli = Cli::try_parse_from([
             "attenuo", "policy", "lint", "p.cedar", "--config", "s.toml", "--schema",

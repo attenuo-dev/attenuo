@@ -462,21 +462,30 @@ async fn run(cli: Cli) -> Result<Outcome> {
         }
         Command::Policy(PolicyCmd::Test(args)) => {
             let opts = policy_cmd::TestOptions::from(&args);
-            // `Some` with --via authzen: the server and the bearer.
-            let remote = match args.via {
-                cli::Via::Local => {
-                    if args.token.token.is_some() || args.token.token_file.is_some() {
-                        anyhow::bail!("--token and --token-file need --via authzen");
+            let token_given = args.token.token.is_some() || args.token.token_file.is_some();
+            if token_given && args.via != cli::Via::Authzen {
+                anyhow::bail!("--token and --token-file need --via authzen");
+            }
+            if args.schema_file.is_some() && args.via != cli::Via::Local {
+                anyhow::bail!(
+                    "--schema-file has no effect with --via {}: the server validates with its \
+                     own schema",
+                    if args.via == cli::Via::Authzen {
+                        "authzen"
+                    } else {
+                        "admin-evaluate"
                     }
-                    None
-                }
+                );
+            }
+            // Where the cases go: the in-process engine, or a server and its credentials.
+            enum Target {
+                Local,
+                Authzen(Client, String, Option<attenuo_token::DpopKey>),
+                AdminEvaluate(Client),
+            }
+            let target = match args.via {
+                cli::Via::Local => Target::Local,
                 cli::Via::Authzen => {
-                    if args.schema_file.is_some() {
-                        anyhow::bail!(
-                            "--schema-file has no effect with --via authzen: the server validates \
-                             with its own schema"
-                        );
-                    }
                     let client = client?;
                     let token = secrets::resolve_token(
                         "--token",
@@ -485,19 +494,32 @@ async fn run(cli: Cli) -> Result<Outcome> {
                         &mut stdin,
                     )?;
                     let key = dpop_key::load_opt(args.token.dpop_key.as_deref())?;
-                    Some((client, token, key))
+                    Target::Authzen(client, token, key)
+                }
+                cli::Via::AdminEvaluate => {
+                    let client = client?;
+                    if !client.has_admin_token() {
+                        anyhow::bail!(
+                            "--via admin-evaluate needs the admin token: pass --admin-token-file, \
+                             --admin-token-stdin or --admin-token, or set ATTENUO_ADMIN_TOKEN"
+                        );
+                    }
+                    Target::AdminEvaluate(client)
                 }
             };
             let run_once = || async {
-                match &remote {
-                    None => policy_cmd::test(&args.files, &opts, json),
-                    Some((client, token, key)) => {
+                match &target {
+                    Target::Local => policy_cmd::test(&args.files, &opts, json),
+                    Target::Authzen(client, token, key) => {
                         let remote = policy_cmd::Remote {
                             client,
                             token,
                             dpop_key: key.as_ref(),
                         };
                         policy_cmd::test_authzen(&args.files, &remote, &opts, json).await
+                    }
+                    Target::AdminEvaluate(client) => {
+                        policy_cmd::test_admin_evaluate(&args.files, client, &opts, json).await
                     }
                 }
             };
