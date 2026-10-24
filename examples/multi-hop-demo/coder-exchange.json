@@ -1,0 +1,27 @@
+{
+  "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+  "subject_token": "$PLANNER_TOKEN",
+  "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+  "actor": "coder",
+  "authorization_details": [
+    {
+      "type": "attenuo_capabilities",
+      "capabilities": [
+        {
+          "server": "github",
+          "tool": "get_file_contents",
+          "constraints": { "repo": { "op": "prefix", "value": "acme/api" } },
+          "limits": { "distinct": { "arg": "repo", "max": 1 } }
+        },
+        {
+          "server": "github",
+          "tool": "create_or_update_file",
+          "constraints": { "repo": { "op": "prefix", "value": "acme/api" } },
+          "limits": { "distinct": { "arg": "repo", "max": 1 } }
+        }
+      ]
+    }
+  ],
+  "may_act": [],
+  "requested_ttl_seconds": 600
+}
