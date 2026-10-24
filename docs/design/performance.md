@@ -1,6 +1,6 @@
 # Performance: micro-benchmarks and end to end
 
-- Status: third measurement, after the policy-stage and WAL work (`perf/policy-stage-and-wal-checkpoints`); exchange, lease renewal and open-loop cells added 2026-10-23 (`perf/exchange-lease-bench`)
+- Status: third measurement, after the policy-stage and WAL work (`perf/policy-stage-and-wal-checkpoints`); exchange, lease renewal and open-loop cells added 2026-10-23 (`perf/exchange-lease-bench`); output labelling and run limits on the hot path added 2026-10-24 (`perf/labels-limits-cost`)
 - Crates: `attenuo-policy` (`benches/authorize.rs`, `benches/policy_stage.rs`), `attenuo-core` (`benches/attenuation.rs`), `attenuo-server` (`benches/decide.rs`, the decision path by stage), `attenuo-bench` (end to end)
 - Related: [server pipeline](server.md), [ADR-0006](../decisions/0006-lease-based-in-flight-revocation.md)
 - Sources: every figure links the committed file it comes from in [`bench/`](bench/). A figure with no file says "(unrecorded)". Where a rerun of 2026-10-23 gave a different number, the rerun is in the text and the earlier figure is kept in a "quoted earlier, unrecorded" note.
@@ -407,7 +407,91 @@ Readings:
 - **`durability = full` roughly doubles the cost** (two fsyncs, one per transaction).
 - The in-memory cells are slower than expected next to the file cells (213 us at 3 hops). Not investigated; one run on a shared VM.
 
-Not measured: results of realistic sizes (tens of kilobytes), the end-to-end effect through the proxy, and SSE responses with many events.
+Not measured: results of realistic sizes (tens of kilobytes) and SSE responses with many events. The end-to-end effect is in the next section.
+
+### Output labelling and run limits on the hot path (2026-10-24)
+
+Branch `perf/labels-limits-cost`, main `77b5e8f`. The section above measured the result append in process; this one measures what output labelling (#42, #47) and run limits (#50) add to one proxied call end to end, and on which stage. Results: [`bench/2026-10-24-vm-labels-limits.md`](bench/2026-10-24-vm-labels-limits.md) and `.json`; the in-process charge cells: [`bench/2026-10-24-vm-criterion-charge.txt`](bench/2026-10-24-vm-criterion-charge.txt).
+
+**Method.** New subcommand `attenuo-bench hot-path` (`crates/attenuo-bench/src/hotpath.rs`). It starts one server and one `fake_mcp` per configuration, each with a SQLite file store at `durability = "normal"`, and a 2-hop token (the root and one exchange). It drives two calls through each server: `read` (`read_file` on `alice/public-docs`) and `destructive` (`create_issue` on the same repo, catalog `destructive` by default, allowed by a permit in every configuration). Both bodies carry `n: 1`, declared `long` in every catalog, so the bodies are the same everywhere. One client, closed loop, 2 s warm-up and 10 s measured per cell. Five runs, interleaved: each run measures every configuration's two cells before the next run starts, so drift on the host spreads over all of them. The tables give the median of the five runs' p50, p95 and p99. The p50 of a single run moved by up to 350 us (baseline `read`: 1,009 to 1,357 us; two outlying runs of D at 2.8 and 3.9 ms). The median of runs 1 to 3 and the median of runs 3 to 5 differ by up to 100 us for A, B and C' and by up to 215 us for C. So read client differences under about 100 us as noise. The server's stage figures, pooled over 20,000 to 40,000 calls per cell, are steadier, and the readings below rest on them. After the runs the harness makes one more call of each kind and reads its decision record, to check that each configuration does what it says (counters charged, `labels.tainted_by` entries). Then it verifies each audit chain.
+
+| Configuration | Catalog `output` | Policy beyond the bench's | Token | Check: counters charged / `tainted_by` |
+|---|---|---|---|---|
+| A, `baseline` | `trusted` on both tools | permit `create_issue` | no limits | 0 / 0 |
+| B, `labels` | `untrusted` (the default) | also a forbid on `context.session.tainted` that does not fire for these calls | no limits | 0 / 2 |
+| C, `limits` | `trusted` | as A | `calls` and `sum` (on `n`) on both capabilities, in both hops | 4 / 0 |
+| C', `limits_calls` | `trusted` | as A | `calls` only | 2 / 0 |
+| D, `both` | as B | as B | as C | 4 / 2 |
+
+Two things are true of every configuration, A included, because they are on main for every allowed call. Every answer is recorded with a `tool_result` append (#42; `trusted` only skips the run label). And every decision reads the run's labels and builds `context.session`. So A is the floor today, not "labelling off". What B adds over A is the run-label write after each answer, a label set that is not empty, and `labels.tainted_by` in each decision record. The `read` cell runs first, so in B and D every measured `destructive` call is on a tainted run. C' was added to separate the counter writes from the `synchronous=FULL` commit that a `sum` charge forces.
+
+**Stages.** The charge and the run-label write have no stage of their own in `attenuo_proxy_stage_seconds`, and this branch leaves the server's timers alone. The harness derives two means from histograms the server already exports: **decide (unstaged)**, which is `attenuo_authorize_duration_seconds` minus `lease_check`, `policy` and `audit_append` (the charge, building the record, approval bookkeeping), and **result append**, which is `attenuo_audit_append_duration_seconds` minus the decision appends. The run-label write (`LeaseStore::add_label`) runs inside the `response` stage. The counter read (`budget_view`) and the label read run inside `policy`.
+
+**Environment.** The 4-vCPU shared dev container described at the top of the page, not a reference machine; rustc 1.99.1, release profile. Other agents were working on the host: load average 1.7 at the start (09:18 UTC) and 4.9 at the end (09:28 UTC). The load generator, the servers and the upstreams share the four cores.
+
+Client latency, one client, microseconds, and calls per second (median of 5 runs):
+
+| Configuration | `read` p50 / p95 / p99 | req/s | `destructive` p50 / p95 / p99 | req/s |
+|---|---|---|---|---|
+| A, baseline | 1,141 / 1,788 / 3,037 | 794 | 1,179 / 1,779 / 2,953 | 787 |
+| B, labels | 1,115 / 1,768 / 2,877 | 810 | 1,203 / 1,761 / 2,849 | 767 |
+| C, limits (`calls` + `sum`) | 1,968 / 3,072 / 4,977 | 445 | 2,165 / 3,471 / 5,849 | 418 |
+| C', limits (`calls` only) | 1,263 / 1,893 / 2,918 | 714 | 1,370 / 2,018 / 3,258 | 654 |
+| D, both | 2,078 / 3,056 / 4,551 | 451 | 2,109 / 2,982 / 4,469 | 440 |
+
+Per stage, `read` call, pooled over the five runs (20,000 to 40,000 calls each), p50 / mean in microseconds; "unstaged" and "result append" are means. The `destructive` column moves the same way; both are in the results file.
+
+| Stage | A | B | C | C' | D |
+|---|---|---|---|---|---|
+| `lease_check` | 41 / 44 | 24 / 27 | 43 / 45 | 42 / 44 | 29 / 32 |
+| `policy` (label read, counter read, Cedar) | 97 / 103 | 99 / 105 | 138 / 122 | 124 / 115 | 149 / 132 |
+| decide (unstaged): the charge | 17 | 16 | 784 | 79 | 916 |
+| `audit_append` (decision record) | 97 / 147 | 94 / 142 | 158 / 174 | 148 / 171 | 160 / 179 |
+| whole decision (mean) | 311 | 290 | 1,126 | 408 | 1,259 |
+| `blocking_pool` | 93 / 122 | 86 / 104 | 132 / 148 | 95 / 123 | 132 / 149 |
+| `upstream` | 255 / 277 | 248 / 266 | 295 / 316 | 256 / 273 | 291 / 317 |
+| `response` (result append, label write) | 262 / 308 | 275 / 319 | 286 / 341 | 267 / 343 | 347 / 385 |
+| result append (`tool_result`, mean) | 138 | 135 | 152 | 165 | 154 |
+| `total` (handler) | 945 / 1,070 | 921 / 1,029 | 1,710 / 1,990 | 1,120 / 1,200 | 1,779 / 2,171 |
+
+Deltas against A, `read` / `destructive`, client p50: B -26 / +25 us; C +827 / +986 us; C' +122 / +192 us; D +937 / +931 us.
+
+In process (`cargo bench -p attenuo-server --bench decide`, new cells; 2-hop chain; criterion point estimate with the interval in brackets; load average 3.4 to 5.9):
+
+| Cell | memory | file, `normal` | file, `full` |
+|---|---|---|---|
+| `budget_read`, 4 counters | 3.5 us | 4.7 us | 4.6 us |
+| `charge`, `calls` only (2 counters) | 78 us [76, 80] | 39 us [37, 41] | 422 us [405, 440] |
+| `charge`, `calls` + `sum` (4 counters, commits with `synchronous=FULL`) | 84 us [78, 89] | 623 us [574, 680] | 448 us [426, 471] |
+
+**E: an approval round**, measured separately on its own server (labels as in B, plus `@obligation("approval")` on destructive calls in a tainted run, no limits): the gated call (`-32008` with an `approval_id`), `POST /admin/approvals/{id}` with `{"decision": "grant"}`, and the identical retry, which is allowed and consumes the approval. 100 rounds discarded, then 2,000 timed one after the other, microseconds:
+
+| Step | p50 | p95 | p99 | mean |
+|---|---|---|---|---|
+| gated call (approval stored, `approval_request` appended) | 996 | 1,705 | 3,793 | 1,103 |
+| operator grant | 704 | 1,325 | 3,557 | 796 |
+| retry (approval taken, allowed, forwarded, result recorded) | 1,505 | 2,822 | 6,459 | 1,897 |
+| whole round | 3,314 | 5,939 | 9,347 | 3,796 |
+
+Over those rounds the `policy` stage averaged 174 us, against 105 in B, because every decision tries to take an approval (a lease-store write when one is granted).
+
+What this means:
+
+- **Labelling an answer untrusted costs nothing measurable at the client.** B is within noise of A in both cells (-26 and +25 us at p50; p95 and p99 a little lower). On the server, the run-label write shows as about 12 to 20 us more at p50 on `response` (`read` and `destructive`), and the session-aware forbid and the non-empty label set add 2 to 11 us at p50 on `policy`. The larger part of what output labelling costs is in every configuration, A included: the `tool_result` append, about 135 to 140 us mean per allowed call on this store, inside `response`. That is the figure of the section above (about 150 us in process), now seen end to end.
+- **A `sum` limit costs about 0.8 to 1.0 ms per call and halves single-client throughput.** Almost all of it is the charge transaction (784 to 858 us mean, against 17 us unstaged in A). The cause is the commit with `synchronous=FULL` that every `sum` charge forces (design 3.4), which is one `fsync` on this container's disk. In process, that charge costs 623 us, against 39 us for a `calls`-only charge on the same store.
+- **A `calls` limit costs about 120 to 190 us per call at p50** at the client, which is near the noise floor; the handler's `total` agrees (+175 us at p50, +130 us mean). The charge transaction is about 60 to 65 us of it (79 and 82 us unstaged, against 17). The rest is spread out: `policy` grows by 12 to 29 us mean (27 to 52 us at p50), although reading the counters takes only 4 to 5 us in process. The decision append also grows by 23 to 32 us mean (51 to 63 us at p50) whenever limits are on (see the list of anomalies below).
+- **Which extra store transaction dominates.** With a `sum` limit, the charge (about 800 us) is five to six times the result append (about 140 us). With `calls` only, the result append is the larger of the two: 135 to 165 us, against a charge of 60 to 65 us. The run-label write is the smallest at about 15 us.
+- **Both together cost about the sum of the parts** (D: +931 to +937 us at p50), and D's `response` is the highest of the five (347 us at p50).
+- **An approval round costs about 3.3 ms at p50**, about 2.8 times one allowed destructive call in B. It happens once per gated call, not once per call. A human approver adds seconds on top.
+
+Anomalies, measured and not fixed:
+
+- A `sum` charge on a `normal` store costs more than on a `full` store: 623 us [574, 680] against 448 us [426, 471] in process. Switching `synchronous` to `FULL` for one transaction and back (`with_full_sync`) may cost more than the sync itself, or force more than one `fsync`. Not profiled.
+- With limits on, the decision append grows by about 50 to 60 us at p50, with or without `sum`. The charge commits on the lease store's own connection just before the append commits on the audit connection, on the same file and WAL; a hand-off of the WAL write lock or the shared memory index is the likely cause. Not investigated.
+- The in-memory store's charge (78 to 84 us) is slower than the file store's `calls` charge (39 us). The in-memory result append looked the same way in the section above.
+- `lease_check` is 15 to 20 us lower on the B and D servers than on A, C and C', with the same chain and store kind. It does not follow any feature, so it is a per-server or per-file effect; it shows how far two identical servers can differ on this host.
+
+Not measured: the memory store end to end (only in process); more than one client, so contention on the store's connection lock between the charge, the label write and the appends under concurrency; `calls_per` limits (their HMAC of the value); results of realistic size (only the small echo answer); `durability = "full"` end to end; and a quiet reference machine.
 
 ### How to run
 
@@ -419,8 +503,11 @@ attenuo-bench exchange --audit memory,file --clients 1,8 --depths 1,3          #
 attenuo-bench exchange --audit memory --depths 1 --open-loop 500,1500          # open loop
 attenuo-bench lease-renew --cells 100:1,1000:1,5000:1 --cascade-runs 5         # lease renewal and revoke cascade
 attenuo-bench --open-loop 500,2000 --depths 1 --outcomes allow --audit memory  # proxied call, open loop
+attenuo-bench hot-path --runs 5 --configs baseline,labels,limits,limits_calls,both --approval-loops 2000  # labels and limits
+DURATION=10 scripts/bench-e2e.sh hot-path --runs 5 --approval-loops 2000        # the same, built and written to docs/design/bench/
 cargo bench -p attenuo-policy --bench policy_stage -- --warm-up-time 1 --measurement-time 3
 cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3
+cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3 'budget_read_|charge_'  # run-limit counters
 ```
 
 `attenuo-bench --print-config DIR` writes the server config and policy it expects, for pointing the harness at an already running server (`--attenuo-url`, `--upstream-url`, and `--metrics-url` for the stage table). Every answer is checked: a denial counts only as the proxy's `-32003` with the expected reason code and a decision id listed in `X-Attenuo-Decision-Id`, so an `audit_error` denial, a `too_many_sessions` refusal or a `5xx` stops the run after that cell. A one-second smoke run is part of `cargo test --workspace` (`crates/attenuo-bench/tests/smoke.rs`). There is no CI job for the full matrix: it needs a release build and minutes of load, and numbers from shared runners could not be compared.
@@ -432,3 +519,4 @@ cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-t
 - The time outside the proxy's handler (hyper and axum parsing the client's request, relaying a streamed body). The handler's stages are in `attenuo_proxy_stage_seconds`; what lies between them and the client's latency is measured only as a difference.
 - Confidence intervals over repeated runs, open-loop load for the deny outcomes and for more than one hop, and a quiet reference machine. (Open-loop arrivals exist now, for the allow call at one hop and for exchange.)
 - Streaming (SSE) responses and `tools/list` filtering.
+- Output labelling and run limits under concurrency (lock contention between the charge, the run-label write and the appends), on the memory store end to end, with `calls_per` limits, and at `durability = "full"` end to end; the charge and the run-label write have no stage of their own in `attenuo_proxy_stage_seconds` (see [Output labelling and run limits on the hot path](#output-labelling-and-run-limits-on-the-hot-path-2026-10-24)).
