@@ -7,6 +7,7 @@ import {
   oneOf,
   parseCapability,
   prefix,
+  range,
   withLimits,
   argLimit,
   countedArg,
@@ -74,6 +75,31 @@ describe("capability", () => {
   it("rejects an unknown constraint op in raw JSON", () => {
     const bad = { server: "a", tool: "b", constraints: { x: { op: "glob", value: "*" } } };
     expect(() => capabilitiesToJson([bad as never])).toThrow(/unknown constraint/);
+  });
+
+  it("serializes a range like the server, a missing bound omitted", () => {
+    const cap = capability("banking", "send_money", {
+      amount: range({ min: 0, max: 2000 }),
+      fee: range({ max: 5 }),
+    });
+    expect(cap.constraints).toEqual({
+      amount: { op: "range", value: { min: 0, max: 2000 } },
+      fee: { op: "range", value: { max: 5 } },
+    });
+    expect(JSON.stringify(range({ min: -3, max: undefined }))).toBe(
+      '{"op":"range","value":{"min":-3}}',
+    );
+    expect(capabilitiesToJson([cap])).toEqual([cap]);
+  });
+
+  it("refuses a malformed range in the builder and in raw JSON", () => {
+    for (const bad of [{}, { min: 3, max: 2 }, { min: 1.5 }, { max: 2 ** 63 }]) {
+      expect(() => range(bad)).toThrow(TypeError);
+    }
+    for (const value of [{}, { min: 3, max: 2 }, { min: 0, maximum: 10 }, [0, 10], { max: "5" }]) {
+      const raw = { server: "s", tool: "t", constraints: { n: { op: "range", value } } };
+      expect(() => capabilitiesToJson([raw as never])).toThrow(/unknown constraint/);
+    }
   });
 
   it("formats for humans", () => {
