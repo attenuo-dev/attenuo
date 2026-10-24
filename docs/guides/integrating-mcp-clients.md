@@ -141,7 +141,7 @@ Rules to know:
 - A parent can name who may exchange it next with `may_act` (RFC 8693 §4.4). Send `"may_act": ["coder"]` on the exchange that mints it (or let `[[root_grants]] may_act` set it at hop 0). Exchanging such a token for an agent that is not listed fails with `actor_not_permitted`. Without `may_act`, any authenticated agent may.
 - An agent cannot appear twice in a chain (`duplicate_actor`).
 - A parent token delegates to a given actor once. A second exchange of the same token for the same actor is `invalid_grant` / `replayed`; renew the child's lease (below) to keep it alive instead.
-- Failed exchanges answer `{"error": "...", "detail": "..."}`. `invalid_scope` means you asked for too much. `invalid_grant` means the parent token or one of its leases is no good.
+- Failed exchanges answer `{"error": "...", "detail": "..."}`. `invalid_scope` means you asked for too much. `invalid_grant` means the parent token or one of its leases is no good. When the parent token verified, the refusal is also a `deny` audit record and the body carries its `decision_id` (also in `X-Attenuo-Decision-Id`).
 
 Each hop gets its own lease. Revoking a lease revokes its whole subtree. So if the tester misbehaves, revoke the tester's lease and only the tester stops. If the planner's lease is revoked, all three stop.
 
