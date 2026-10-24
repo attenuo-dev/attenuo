@@ -34,6 +34,7 @@
 - [Fuzzing](design/fuzzing.md)
 - [Admin console](design/admin-console.md)
 - [Output labelling (proposed)](design/output-labelling.md)
+- [Run limits (proposed)](design/run-limits.md)
 
 # Policy
 
@@ -64,6 +65,7 @@
   - [ADR-0007: Actor authentication](decisions/0007-actor-authentication.md)
   - [ADR-0008: Admin console](decisions/0008-admin-console.md)
   - [ADR-0009: Output labelling](decisions/0009-output-labelling.md)
+  - [ADR-0010: Run limits](decisions/0010-run-limits.md)
 
 # Research
 
