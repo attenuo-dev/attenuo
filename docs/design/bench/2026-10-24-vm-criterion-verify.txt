@@ -1,0 +1,13 @@
+# cargo bench -p attenuo-token --bench verify -- --warm-up-time 1 --measurement-time 5
+# 2026-10-24 21:50 UTC, main e91a139 plus the bench of perf/ou-sig-kid (verifier code unchanged), rustc 1.99.1, release profile of the workspace (thin LTO, codegen-units 1), 4-core shared VM, load average 0.8 at the start and 1.4 at the end
+# verify: one trusted key; verify_3_keys: three trusted keys, the token's own last (header kid and ou_kid each pick one); chain_clone: the clone verify makes to return the chain; ou_sig_message: the bytes ou_sig signs; ed25519_verify: one bare ring Ed25519 verification of 1 KiB
+
+token/verify/1          time:   [113.99 µs 115.73 µs 117.82 µs]
+token/verify_3_keys/1   time:   [116.75 µs 121.17 µs 126.38 µs]
+token/chain_clone/1     time:   [445.33 ns 455.23 ns 466.62 ns]
+token/ou_sig_message/1  time:   [2.0092 µs 2.0588 µs 2.1198 µs]
+token/verify/3          time:   [124.49 µs 126.18 µs 128.21 µs]
+token/verify_3_keys/3   time:   [127.87 µs 132.96 µs 139.03 µs]
+token/chain_clone/3     time:   [1.4130 µs 1.4415 µs 1.4779 µs]
+token/ou_sig_message/3  time:   [2.0449 µs 2.1111 µs 2.1954 µs]
+token/ed25519_verify    time:   [51.256 µs 53.306 µs 55.787 µs]
