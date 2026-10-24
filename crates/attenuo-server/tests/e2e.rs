@@ -1635,6 +1635,19 @@ async fn refused_renewals_are_audited_against_the_token_chain() {
     assert_eq!(r["reason"], "lease_renewed");
     assert_eq!(r["tool"], "lease.renew");
 
+    // `audit tail --tool lease.renew --decision deny` finds the three refusals and nothing
+    // else.
+    let refused = h
+        .admin_get("/admin/audit?tool=lease.renew&decision=deny&limit=100")
+        .await;
+    let reasons: Vec<&str> = refused["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["record"]["reason"].as_str().unwrap())
+        .collect();
+    assert_eq!(reasons, ["lease_revoked", "lease_revoked", "lease_expired"]);
+
     assert_eq!(h.admin_get("/admin/audit/verify").await["ok"], true);
     let metrics = h.state.metrics.render();
     for (reason, n) in [("lease_revoked", 2), ("lease_expired", 1)] {

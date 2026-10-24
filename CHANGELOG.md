@@ -110,6 +110,7 @@ The injection-suite figures in the docs come from synthetic, model-free cases wr
 - `attenuo token inspect` prints who may exchange the token next: `may_act (absent): any authenticated agent may exchange this token`, `may_act []: no agent may exchange this token`, or the listed agents. With `--verify` the line comes from the verified claims.
 
 ### Changed
+- The help of `attenuo audit tail --tool` and `audit export --kind`, the CLI reference and the audit-log concept say how to find refused exchanges and renewals: they are kind `decision`, so `audit tail --tool token.exchange --decision deny` (or `--tool lease.renew`) lists them and `audit export --kind exchange` lists issued exchanges only.
 - `POST /token/renew`: a refusal of a token that verified (400 `invalid_grant`) carries the id of its audit record as `decision_id` in the body and in the `X-Attenuo-Decision-Id` header. The other fields are unchanged.
 - `POST /token`: a refused exchange whose request authenticated as another agent than `actor` (`actor_mismatch`) is decided after the subject token verified, so a request with both a mismatched actor and a bad subject token now gets the subject token's `invalid_grant`. An audited refusal adds `decision_id` to the error body and the `X-Attenuo-Decision-Id` header.
 

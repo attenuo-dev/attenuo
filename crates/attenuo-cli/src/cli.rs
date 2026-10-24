@@ -632,7 +632,9 @@ pub enum AuditCmd {
         #[arg(long)]
         out: Option<std::path::PathBuf>,
         /// Keep only records of this kind: decision, tool_result, exchange, root_token,
-        /// lease_renew, lease_revoke or admin. A filtered export has gaps in its hash chain, so
+        /// lease_renew, lease_revoke or admin. A refused exchange or renewal is a `decision`,
+        /// not an `exchange` or `lease_renew`; `audit tail --tool token.exchange --decision
+        /// deny` lists those. A filtered export has gaps in its hash chain, so
         /// `audit verify --file` refuses it; verify an unfiltered export, then filter.
         #[arg(long, value_parser = parse_record_kind)]
         kind: Option<attenuo_core::RecordKind>,
@@ -681,7 +683,9 @@ pub struct AuditFilter {
     /// `--server` before the subcommand).
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     pub server: Option<String>,
-    /// The tool.
+    /// The tool. attenuo's own records use `token.root`, `token.exchange`, `lease.renew` and
+    /// `admin.*`: `--tool token.exchange --decision deny` lists refused exchanges, `--tool
+    /// lease.renew --decision deny` refused renewals.
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     pub tool: Option<String>,
     /// The delegation chain (`chain_id`: the lease id of its first hop).

@@ -112,6 +112,52 @@ async fn no_delegation_makes_a_token_nobody_may_exchange() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("(may_act)"), "{err}");
     assert!(err.contains("\ndecision "), "{err}");
+    let refused_id = err
+        .lines()
+        .find_map(|l| l.strip_prefix("decision "))
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // The refusal is found by tool and decision (it is kind `decision`, not `exchange`), and
+    // `audit show --id` opens it.
+    let audit = |args: &[&str]| {
+        let mut c = attenuo();
+        c.env("ATTENUO_ADMIN_TOKEN", ADMIN)
+            .args(["--server", &url])
+            .args(args);
+        c
+    };
+    let lines = ok(&run(audit(&[
+        "--json",
+        "audit",
+        "tail",
+        "--tool",
+        "token.exchange",
+        "--decision",
+        "deny",
+    ]))
+    .await);
+    let refused: Vec<Value> = lines
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(refused.len(), 1, "{lines}");
+    let record = &refused[0]["record"];
+    assert_eq!(record["id"], refused_id.as_str());
+    assert_eq!(record["kind"], "decision");
+    assert_eq!(record["reason"], "exchange_actor_not_permitted");
+    let shown = ok(&run(audit(&["audit", "show", "--id", &refused_id])).await);
+    assert!(shown.contains("DENY  attenuo/token.exchange"), "{shown}");
+    assert!(
+        shown.contains("reason=exchange_actor_not_permitted"),
+        "{shown}"
+    );
+    let issued = ok(&run(audit(&["audit", "export", "--kind", "exchange"])).await);
+    assert!(
+        !issued.contains(&refused_id),
+        "--kind exchange lists issued exchanges only"
+    );
 
     // Without either flag the new token carries no `may_act`: anyone authenticated may
     // exchange it (it does not inherit the parent's list).
