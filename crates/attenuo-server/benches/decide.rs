@@ -15,7 +15,10 @@
 //! with `synchronous=FULL`; and `Pipeline::decide` of the limited call, where a `sum` charge
 //! leaves its sync to the decision append), SQLite stores in memory and in a temporary file
 //! (`durability` normal and full, opened as the server opens them: WAL checkpoints in the
-//! background).
+//! background). And the run-usage write of an allowed call to a destructive tool with no
+//! limits (`Pipeline::decide` of `create_issue` on a 2-hop chain, with usage kept by
+//! `[policy] track_usage = true` and with usage elided because nothing reads it, and the
+//! usage charge alone).
 //!
 //! ```text
 //! cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3
@@ -28,11 +31,14 @@ use attenuo_audit::{
     AuditSink, Durability, LeaseStore, SqliteAudit, SqliteLeaseStore,
     DEFAULT_WAL_CHECKPOINT_INTERVAL,
 };
-use attenuo_core::limits::{charges_for, ArgLimit, Limits};
+use attenuo_core::limits::{charges_for, usage_charges, ArgLimit, Limits};
 use attenuo_core::{
-    AgentId, Capability, CapabilitySet, Decision, DecisionRecord, OriginatingUser, ToolCall,
+    chain_id_of, AgentId, Capability, CapabilitySet, Decision, DecisionRecord, LeaseId,
+    OriginatingUser, ToolCall,
 };
-use attenuo_policy::{ArgType, PolicyEngine, PolicyEngineBuilder, ToolAttrs, ToolCatalog};
+use attenuo_policy::{
+    ArgType, PolicyEngine, PolicyEngineBuilder, ToolAttrs, ToolCatalog, TrackUsage,
+};
 use attenuo_proxy::Authorizer;
 use attenuo_server::authz::result_digest;
 use attenuo_server::{Pipeline, ServerAuthorizer};
@@ -60,6 +66,18 @@ when { context.chain.depth > 3 };
 "#;
 
 fn engine() -> PolicyEngine {
+    engine_with(TrackUsage::Auto, "")
+}
+
+/// `attenuo-bench`'s `create_issue` permit: a destructive call no policy here refuses.
+const PERMIT_CREATE_ISSUE: &str = r#"
+@id("permit_create_issue")
+permit(principal, action == Action::"fake/create_issue", resource);
+"#;
+
+/// The bench engine with `create_issue` (destructive, the default) in the catalog,
+/// `extra` policy text, and `track_usage`.
+fn engine_with(track_usage: TrackUsage, extra: &str) -> PolicyEngine {
     let catalog = ToolCatalog::new()
         .with(
             "fake",
@@ -76,10 +94,19 @@ fn engine() -> PolicyEngine {
             ToolAttrs::new()
                 .sensitive(true)
                 .with_input("repo", ArgType::String),
+        )
+        .with(
+            "fake",
+            "create_issue",
+            ToolAttrs::new()
+                .with_input("repo", ArgType::String)
+                .with_input("title", ArgType::String),
         );
     PolicyEngineBuilder::new()
         .with_catalog(catalog)
         .with_policies_str(POLICY)
+        .with_policies_str(extra)
+        .with_track_usage(track_usage)
         .build()
         .expect("bench policy loads")
 }
@@ -327,6 +354,46 @@ fn bench_decide(c: &mut Criterion) {
                 b.iter(|| pipeline.decide(black_box(&chain), &limited_call, now))
             });
         }
+        // Run usage of a destructive tool with no limits on a 2-hop chain: the decision with
+        // usage kept (one charge transaction of the `usage_calls` counter) and elided (no
+        // policy reads `context.usage`, no catalog `amount` or `destination`), and the usage
+        // charge alone.
+        let issue = ToolCall::new(
+            "fake",
+            "create_issue",
+            json!({"repo": "alice/public-docs", "title": "t"}),
+        );
+        let caps = || CapabilitySet::from_iter([Capability::new("fake", "create_issue")]);
+        let tok = token_with(&issuer, store.leases.as_ref(), 2, now, caps);
+        let chain = verifier.verify(&tok, now).expect("verifies").chain;
+        let s = store.name;
+        for (mode, track) in [
+            ("tracked", TrackUsage::Always),
+            ("elided", TrackUsage::Auto),
+        ] {
+            let engine = engine_with(track, PERMIT_CREATE_ISSUE);
+            assert_eq!(engine.tracks_usage(), track == TrackUsage::Always);
+            let p = Pipeline::new(
+                Arc::new(RwLock::new(engine)),
+                store.leases.clone(),
+                store.audit.clone(),
+            );
+            let d = p.decide(&chain, &issue, now);
+            assert!(d.is_allow(), "{d:?}");
+            assert_eq!(d.usage.is_some(), track == TrackUsage::Always);
+            group.bench_function(format!("decide_destructive_{s}/{mode}"), |b| {
+                b.iter(|| p.decide(black_box(&chain), &issue, now))
+            });
+        }
+        let run = LeaseId::new(chain_id_of(&chain).expect("chain id"));
+        let usage = usage_charges(&run, &issue, None, None);
+        group.bench_function(format!("charge_{s}/usage"), |b| {
+            b.iter_batched(
+                || uuid::Uuid::new_v4().to_string(),
+                |id| store.leases.charge(&id, &usage, now).unwrap(),
+                BatchSize::SmallInput,
+            )
+        });
         assert!(store.audit.verify_chain().unwrap().ok);
     }
     group.finish();

@@ -576,6 +576,38 @@ Readings:
 - **With a `sum` limit end to end the change is within noise.** Those calls are bound by the one `fsync` per call that the durability rule requires, now paid inside the audit append (whose mean rose as the lease side stopped sleeping). The after cell at 4 clients with 104 req/s and a 204 ms p99 fell in a load spike: its policy stage, which does no I/O, averaged 7.8 ms against 0.4 to 1 ms in the other cells.
 - **The single-client outliers are not the busy handler.** It never ran at one thread, before or after. The 4 to 8 ms single-client outliers stay open.
 
+### Run usage write (2026-10-24)
+
+Branch `perf/usage-write-elision`, main `8dca83d`. Since #59 every allowed call to a destructive tool charged the run-usage counters (`context.usage`) in one lease-store transaction, whether or not anything could read them. The server now keeps usage only when a loaded policy references `context.usage`, the catalog names `amount` or `destination`, or `[policy] track_usage = true` (see [run limits](run-limits.md#usage-kept-only-when-something-can-read-it-2026-10-24)). This section measures that write. Results: [`bench/2026-10-24-vm-usage-write.md`](bench/2026-10-24-vm-usage-write.md).
+
+**Method.** `attenuo-bench hot-path` has a new configuration, `usage`: `baseline` (trusted output, no token limits, the bench's policy, which does not read `context.usage`) plus `track_usage = true`. So `usage` is what every allowed destructive call did on main since #59, and `baseline` is what it does now; the `destructive` cell (`create_issue`) is the one that differs, and `read` is a control. File store at `durability = "normal"`, one client, 2-hop token, 2 s warm-up and 10 s measured per cell, two passes of 5 interleaved runs (`--configs baseline,usage`, then `usage,baseline`). Release build with `lto = false` and `codegen-units = 16`, as in the two sections above, so the absolute figures are not comparable with the #53 tables. Same shared 4-vCPU container, load average 1.0 to 5.9. The configuration check confirms that only `usage`'s destructive call carries a `usage` member. In process, new `decide` cells: `decide_destructive_{store}/{tracked,elided}` (`Pipeline::decide` of `create_issue` on a 2-hop chain with no limits) and `charge_{store}/usage` (the usage charge alone).
+
+| | `baseline` (elided) | `usage` (tracked) | difference |
+|---|---|---|---|
+| `destructive` client p50, pass 1 / pass 2 (median of 5 runs) | 1,229 / 1,282 us | 1,327 / 1,426 us | +98 / +144 us |
+| `destructive` req/s, pass 1 / pass 2 | 747 / 689 | 666 / 659 | -11 / -4 % |
+| `destructive` whole decision, mean | 340 / 361 us | 448 / 447 us | +108 / +86 us |
+| decide (unstaged): the charge, mean | 20 / 21 us | 77 / 77 us | +56 us |
+| `policy` (includes the counter read), mean | 120 / 125 us | 135 / 137 us | +12 to +15 us |
+| `audit_append`, mean (p50) | 155 / 165 us (107 / 119) | 189 / 185 us (154 / 154) | +20 to +34 us (+35 to +47) |
+| `read` client p50 (control) | 1,208 / 1,191 us | 1,254 / 1,213 us | within noise |
+
+In process (criterion point estimates; three runs of each cell, in [the results](bench/2026-10-24-vm-usage-write.md)):
+
+| Cell | memory | file, `normal` | file, `full` |
+|---|---|---|---|
+| `decide_destructive`, elided | 142 to 173 us | 140 to 154 us | 476 to 565 us |
+| `decide_destructive`, tracked | 153 to 170 us | 290 to 324 us | 1.22 to 1.45 ms |
+| `charge`, usage alone (1 counter) | 28 us | 34 us | 385 us |
+
+Readings:
+
+- **The usage write costs about 0.1 ms per allowed destructive call from one client on the file store**: +86 to +108 us on the server's decision mean, +98 to +144 us at the client's p50, and 4 to 11 percent of single-client throughput. Calls that are not destructive are unaffected (the `read` control).
+- **Where it goes.** The charge transaction is about 56 us (unstaged mean, 20 to 77 us). The counter read adds 12 to 15 us to `policy`, and the decision append grows by 20 to 34 us mean (35 to 47 us at p50). That growth is the same as the one a `calls` limit causes (the second anomaly of [the labels and limits section](#output-labelling-and-run-limits-on-the-hot-path-2026-10-24)): the charge commits on the lease connection just before the append commits on the audit connection, on the same file.
+- **Against the #53 numbers.** #53 put a `calls` limit (two counters in one transaction) at +122 to +192 us over its baseline at p50. The usage write is one counter in the same kind of transaction and costs a little less, as expected. #53's baseline was measured before #59 and so had no usage write, which is why its `destructive` cell was within noise of `read`; on main since #59, the `destructive` cell had about this 0.1 ms on top, and with this change it no longer does unless something reads usage.
+- **At `durability = "full"` it costs much more**: every commit syncs, so the usage charge is about 385 us in process and the tracked decision 1.2 to 1.45 ms against about 0.5 ms elided. This is the case where elision matters most. End to end at `full` was not measured.
+- In process on the memory store the two cells overlap (142 to 173 against 153 to 170 us); the first elided run, measured right after the tracked one, was the slowest. On the file store the tracked cell's intervals are wide (260 to 374 us), as the `decide_limited` cells were in [the `sum` follow-up](#sum-charge-follow-up-2026-10-24).
+
 ### How to run
 
 ```
@@ -594,6 +626,8 @@ cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-t
 cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3 'decide_limited_'  # a limited call's whole decision
 cargo test --release -p attenuo-audit --test write_contention -- --ignored --nocapture  # lease writes against appends on one file, busy-handler count
 attenuo-bench hot-path --configs limits_calls,limits --runs 1 --clients 4                # run limits under concurrent clients
+attenuo-bench hot-path --runs 5 --configs baseline,usage                                 # the run-usage write (tracked against elided)
+cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3 'decide_destructive_|charge_.*/usage'  # the same in process
 ```
 
 `attenuo-bench --print-config DIR` writes the server config and policy it expects, for pointing the harness at an already running server (`--attenuo-url`, `--upstream-url`, and `--metrics-url` for the stage table). Every answer is checked: a denial counts only as the proxy's `-32003` with the expected reason code and a decision id listed in `X-Attenuo-Decision-Id`, so an `audit_error` denial, a `too_many_sessions` refusal or a `5xx` stops the run after that cell. A one-second smoke run is part of `cargo test --workspace` (`crates/attenuo-bench/tests/smoke.rs`). There is no CI job for the full matrix: it needs a release build and minutes of load, and numbers from shared runners could not be compared.
