@@ -738,3 +738,93 @@ def test_host_rows_list_web_fetches_and_changes() -> None:
     assert run.host_rows({"arms": ["attenuo"], "calls": calls[:1]}) == {}
     gated = web("attenuo_usage_host", "gated", "approval_required", **DECLINED)
     assert run._outcome(gated) == "gated, declined"
+
+
+# --- the browsing cases, the second host limit and the recipient limit -------------------------
+
+
+def test_distinct_arms_load_their_own_frozen_files() -> None:
+    hashes = harness.frozen_hashes()
+    for name in ("url-hosts-max2.json", "distinct-recipients.json"):
+        assert name in hashes["files"] and name in hashes["added_later"]
+    host2, rec = "attenuo_distinct_host2", "attenuo_distinct_recipient"
+    assert {host2, rec} <= set(harness.BUDGET_ARMS) & set(harness.CONSTRAINED_ARMS)
+    assert {host2, rec} <= set(harness.PROXIED) & set(run.ARM_NAMES)
+    assert not {host2, rec} & set(harness.LABEL_ARMS + harness.LIMIT_ARMS)
+    assert harness.distinct_rule("attenuo_distinct_host") == {
+        "slack": {"get_webpage": {"distinct": {"arg": "url", "derive": "host", "max": 1}}}
+    }
+    assert harness.distinct_rule(host2) == {
+        "slack": {"get_webpage": {"distinct": {"arg": "url", "derive": "host", "max": 2}}}
+    }
+    rule = harness.distinct_rule(rec)
+    assert rule["workspace"]["share_file"] == {"distinct": {"arg": "email", "max": 1}}
+    assert rule["slack"]["send_direct_message"] == {"distinct": {"arg": "recipient", "max": 1}}
+    assert set(rule) == {"workspace", "travel", "slack"}
+    # The probe sends max + 1 values.
+    probe = json.loads(harness.DISTINCT_RECIPIENTS.read_text())["probe"]
+    assert len(probe["values"]) == rule[probe["server"]][probe["tool"]]["distinct"]["max"] + 1
+
+
+def test_recipient_limit_applies_to_listed_tools_only() -> None:
+    rule = harness.distinct_rule("attenuo_distinct_recipient")
+    caps = [
+        harness.Capability("workspace", "send_email"),
+        harness.Capability("workspace", "share_file"),
+        harness.Capability("slack", "send_direct_message"),
+        harness.Capability("slack", "get_webpage"),
+        harness.Capability("banking", "send_money"),
+        harness.Capability("workspace", "*"),
+    ]
+    harness.apply_distinct_rule(caps, rule)
+    assert caps[0].to_json()["limits"] == {"distinct": {"arg": "recipients", "max": 1}}
+    assert caps[1].to_json()["limits"] == {"distinct": {"arg": "email", "max": 1}}
+    assert caps[2].to_json()["limits"] == {"distinct": {"arg": "recipient", "max": 1}}
+    assert [c.limits for c in caps[3:]] == [{}, {}, {}]
+
+
+def test_browsing_cases_are_in_the_dev_split() -> None:
+    dev = {c.id: c for s in harness.load_corpus("dev") for c in s.cases}
+    assert set(harness.BROWSING_CASES) <= set(dev)
+    assert not set(harness.BROWSING_CASES) & set(harness.MULTI_CALL_CASES)
+    for cid in harness.BROWSING_CASES:
+        fetches = [c for c in dev[cid].calls if c.tool == "get_webpage"]
+        assert len(fetches) >= 2 and all(c.output for c in fetches)
+
+
+def test_browsing_rows_and_recipient_report() -> None:
+    def call(arm: str, case: str, index: int, role: str, outcome: str, **extra: Any) -> Any:
+        c = {**_call(role, outcome, **extra), "arm": arm, "case": case, "index": index}
+        return {**c, "tool": "get_webpage", "suite": "slack"}
+
+    calls = [
+        call("attenuo", "slack-14", 1, "benign", "allow"),
+        call("attenuo", "slack-14", 2, "benign", "allow"),
+        call("attenuo_distinct_host", "slack-14", 1, "benign", "allow"),
+        call("attenuo_distinct_host", "slack-14", 2, "benign", "deny", reason="budget_exhausted"),
+        call("attenuo_usage_host", "slack-14", 1, "benign", "allow"),
+        call("attenuo_usage_host", "slack-14", 2, "benign", "gated", **GRANTED),
+    ]
+    arms = ["attenuo", "attenuo_usage_host", "attenuo_distinct_host"]
+    doc: dict[str, Any] = {"arms": arms, "calls": calls}
+    rows = {r["arm"]: r for r in run.browsing_rows(doc)}
+    assert rows["attenuo"]["benign_lost"] == 0
+    assert rows["attenuo_distinct_host"]["benign_lost"] == 1
+    assert rows["attenuo_usage_host"]["benign_lost"] == 0
+    assert rows["attenuo_usage_host"]["approval_requests"] == 1
+    text = "\n".join(run.render_browsing(doc))
+    assert "### Browsing cases" in text and "same agent family" in text
+    assert "| slack-14 | 0/2, 0/0, 0 | 0/2, 0/0, 1 | 1/2, 0/0, 0 |" in text
+    assert run.browsing_rows({"arms": ["attenuo"], "calls": []}) == []
+    rec = "attenuo_distinct_recipient"
+    share = [
+        {**call("attenuo", "t-workspace-02", 1, "attack", "allow"), "tool": "share_file"},
+        {**call(rec, "t-workspace-02", 1, "attack", "deny", reason="budget_exhausted"),
+         "tool": "share_file"},
+    ]  # fmt: skip
+    text = "\n".join(run.render_recipient({"arms": ["attenuo", rec], "calls": share}))
+    assert "### Recipients in `attenuo_distinct_recipient`" in text
+    assert "differs from `attenuo` (calls numbered from 0 in case order): 1." in text
+    assert (
+        "| t-workspace-02 | 1 | `share_file` | attack | allow | deny (`budget_exhausted`) |" in text
+    )
