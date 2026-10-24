@@ -95,6 +95,8 @@ pub struct FakeMcpServer {
     sessions_opened: Arc<AtomicU64>,
     /// `Mcp-Session-Id` of every `DELETE` received, in order.
     deleted: Arc<Mutex<Vec<String>>>,
+    /// `tools/call` names answered with a JSON-RPC error instead of a result.
+    failing_tools: Vec<String>,
 }
 
 impl FakeMcpServer {
@@ -124,7 +126,25 @@ impl FakeMcpServer {
             fresh_sessions: false,
             sessions_opened: Arc::new(AtomicU64::new(0)),
             deleted: Arc::new(Mutex::new(Vec::new())),
+            failing_tools: Vec::new(),
         }
+    }
+
+    /// Give tool `name` these MCP `annotations` in `tools/list` (for example
+    /// `{"readOnlyHint": true}`).
+    pub fn with_tool_annotations(mut self, name: &str, annotations: Value) -> Self {
+        for t in &mut self.tools {
+            if t["name"] == name {
+                t["annotations"] = annotations.clone();
+            }
+        }
+        self
+    }
+
+    /// Answer `tools/call` for `name` with a JSON-RPC error (`-32000`, "tool failed").
+    pub fn with_failing_tool(mut self, name: &str) -> Self {
+        self.failing_tools.push(name.to_owned());
+        self
     }
 
     /// Open a new session on every `initialize` (`{session_id}-1`, `{session_id}-2`, ...), and
@@ -293,6 +313,9 @@ impl FakeMcpServer {
                     arguments: arguments.clone(),
                     session_id: session_id.map(str::to_owned),
                 });
+                if self.failing_tools.contains(&name) {
+                    return Some(error_response(id, -32000, "tool failed", None));
+                }
                 json!({
                     "content": [{
                         "type": "text",
@@ -431,18 +454,39 @@ async fn fake_delete(
 // StaticAuthorizer
 // ---------------------------------------------------------------------------------------------
 
+/// One `observe_tool_hints` report: server, tool, `readOnlyHint`, `destructiveHint`.
+pub type ObservedHints = (String, String, Option<bool>, Option<bool>);
+
 /// Maps bearer strings to pre-built chains and decides purely from
 /// `chain.effective_capabilities().permits(call)`. Every decision is recorded.
 ///
 /// Without [`with_catalog`](Self::with_catalog) every tool counts as catalogued
 /// ([`Authorizer::knows_tool`] is always true), so the proxy's `require_listed_tools` check
 /// never refuses anything; with a catalog, only the listed `(server, tool)` pairs are known.
+///
+/// Results the proxy reports ([`Authorizer::record_result`]) are kept
+/// ([`recorded_results`](Self::recorded_results)) and can be made to fail
+/// ([`fail_results`](Self::fail_results)); tool annotations are kept too
+/// ([`observed_hints`](Self::observed_hints)).
 #[derive(Default)]
 pub struct StaticAuthorizer {
     chains: HashMap<String, DelegationChain>,
     revoked: Arc<Mutex<std::collections::HashSet<String>>>,
     decisions: Arc<Mutex<Vec<DecisionRecord>>>,
     catalog: Option<std::collections::HashSet<(String, String)>>,
+    results: Arc<Mutex<Vec<RecordedResult>>>,
+    fail_results: Arc<std::sync::atomic::AtomicBool>,
+    hints: Arc<Mutex<Vec<ObservedHints>>>,
+    ask_for: std::collections::HashSet<String>,
+}
+
+/// A result reported through [`Authorizer::record_result`] to a [`StaticAuthorizer`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordedResult {
+    pub call: ToolCall,
+    pub decision_id: uuid::Uuid,
+    pub result: Value,
+    pub is_error: bool,
 }
 
 impl StaticAuthorizer {
@@ -493,6 +537,31 @@ impl StaticAuthorizer {
     pub fn decisions(&self) -> Vec<DecisionRecord> {
         self.decisions.lock().expect("decisions mutex").clone()
     }
+
+    /// Deny calls to `tool` (any server) that the capabilities permit with reason
+    /// `approval_required`, as an `@obligation("approval")` forbid would.
+    pub fn with_approval_required(mut self, tool: &str) -> Self {
+        self.ask_for.insert(tool.to_owned());
+        self
+    }
+
+    /// Every result reported through [`Authorizer::record_result`], in order (failed ones
+    /// included).
+    pub fn recorded_results(&self) -> Vec<RecordedResult> {
+        self.results.lock().expect("results mutex").clone()
+    }
+
+    /// Make [`Authorizer::record_result`] fail with `label_error` (or succeed again).
+    pub fn fail_results(&self, fail: bool) {
+        self.fail_results
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Every tool annotation reported through [`Authorizer::observe_tool_hints`], as
+    /// `(server, tool, readOnlyHint, destructiveHint)`.
+    pub fn observed_hints(&self) -> Vec<ObservedHints> {
+        self.hints.lock().expect("hints mutex").clone()
+    }
 }
 
 #[async_trait]
@@ -539,7 +608,12 @@ impl Authorizer for StaticAuthorizer {
                 .effective_capabilities()
                 .map(|caps| caps.permits(call))
                 .unwrap_or(false);
-        let (decision, reason) = if allowed {
+        let (decision, reason) = if allowed && self.ask_for.contains(&call.tool) {
+            (
+                attenuo_core::Decision::Deny,
+                crate::auth::REASON_APPROVAL_REQUIRED,
+            )
+        } else if allowed {
             (attenuo_core::Decision::Allow, Self::REASON_ALLOW)
         } else if revoked {
             (attenuo_core::Decision::Deny, "lease_revoked")
@@ -580,6 +654,46 @@ impl Authorizer for StaticAuthorizer {
         let id = record.id;
         self.decisions.lock().expect("decisions mutex").push(record);
         id
+    }
+
+    async fn record_result(
+        &self,
+        _chain: &DelegationChain,
+        call: &ToolCall,
+        decision_id: uuid::Uuid,
+        result: &Value,
+        is_error: bool,
+        _now: OffsetDateTime,
+    ) -> Result<(), String> {
+        self.results
+            .lock()
+            .expect("results mutex")
+            .push(RecordedResult {
+                call: call.clone(),
+                decision_id,
+                result: result.clone(),
+                is_error,
+            });
+        if self.fail_results.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(crate::auth::REASON_LABEL_ERROR.to_owned())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn observe_tool_hints(
+        &self,
+        server: &str,
+        tool: &str,
+        read_only_hint: Option<bool>,
+        destructive_hint: Option<bool>,
+    ) {
+        self.hints.lock().expect("hints mutex").push((
+            server.to_owned(),
+            tool.to_owned(),
+            read_only_hint,
+            destructive_hint,
+        ));
     }
 }
 

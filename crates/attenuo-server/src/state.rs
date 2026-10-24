@@ -364,7 +364,8 @@ fn build_engine(config: &Config) -> anyhow::Result<(PolicyEngine, Option<String>
     let mut builder = PolicyEngineBuilder::new()
         .with_catalog(catalog)
         .with_unknown_tools(config.policy.unknown_tools)
-        .with_legacy_bare_actions(config.policy.legacy_bare_actions);
+        .with_legacy_bare_actions(config.policy.legacy_bare_actions)
+        .with_annotation_import(config.policy.import_annotations);
     if config.policy.legacy_bare_actions {
         tracing::warn!(
             "[policy] legacy_bare_actions = true is deprecated: policies name actions as \

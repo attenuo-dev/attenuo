@@ -25,6 +25,7 @@ use crate::error::AuditError;
 use crate::export::RecordFilter;
 use crate::lease::{
     ancestors_of, breadth_first, classify, LeaseRow, LeaseStatus, LeaseStore, LeaseSubtree,
+    RunLabel,
 };
 use crate::log::{
     canonical_record_json, entry_hash_from_json, verify_entries, AuditEntry, AuditSink,
@@ -91,6 +92,14 @@ CREATE INDEX IF NOT EXISTS leases_parent_idx ON leases(parent);
 CREATE TABLE IF NOT EXISTS lease_bindings (
     id      TEXT PRIMARY KEY,
     binding TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS run_labels (
+    chain_id    TEXT    NOT NULL,
+    source      TEXT    NOT NULL,
+    decision_id TEXT    NOT NULL,
+    seq         INTEGER NOT NULL,
+    at          TEXT    NOT NULL,
+    PRIMARY KEY (chain_id, source)
 );
 "#;
 
@@ -2186,6 +2195,63 @@ impl LeaseStore for SqliteLeaseStore {
                 .find(|(r, _)| *r == id.0)
                 .map(|(_, row)| row.clone()))
         })
+    }
+
+    fn add_label(&self, chain_id: &LeaseId, label: &RunLabel) -> Result<(), AuditError> {
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if get_in(&tx, chain_id)?.is_none() {
+            return Err(AuditError::UnknownLease(chain_id.0.clone()));
+        }
+        let seq = i64::try_from(label.seq)
+            .map_err(|_| AuditError::Storage(format!("label seq {} out of range", label.seq)))?;
+        tx.prepare_cached(
+            // One row per source: the label with the smallest seq wins.
+            "INSERT INTO run_labels (chain_id, source, decision_id, seq, at) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (chain_id, source) DO UPDATE SET \
+               decision_id = excluded.decision_id, seq = excluded.seq, at = excluded.at \
+             WHERE excluded.seq < run_labels.seq",
+        )?
+        .execute(params![
+            chain_id.0,
+            label.source,
+            label.decision_id,
+            seq,
+            fmt_time(label.at)?
+        ])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn labels(&self, chain_id: &LeaseId) -> Result<Vec<RunLabel>, AuditError> {
+        let conn = self.conn.lock()?;
+        // One row per source, already the first (see `add_label`).
+        let mut stmt = conn.prepare_cached(
+            "SELECT source, decision_id, seq, at FROM run_labels WHERE chain_id = ?1 \
+             ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![chain_id.0], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (source, decision_id, seq, at) = row?;
+            let seq = u64::try_from(seq)
+                .map_err(|_| AuditError::Storage(format!("label seq {seq} out of range")))?;
+            out.push(RunLabel {
+                source,
+                decision_id,
+                seq,
+                at: parse_time(&at)?,
+            });
+        }
+        Ok(out)
     }
 }
 

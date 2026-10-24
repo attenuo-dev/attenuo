@@ -64,4 +64,43 @@ impl ToolCall {
     pub fn arguments_digest(&self) -> String {
         sha256_json(&self.arguments)
     }
+
+    /// The hash an approval is bound to (ADR-0009): SHA-256, hex, of the RFC 8785 canonical
+    /// JSON of `{"server", "tool", "arguments"}`. Any change to the server, the tool or one
+    /// argument gives another hash; the session and the DPoP flag are not part of it.
+    pub fn call_hash(&self) -> String {
+        sha256_json(&serde_json::json!({
+            "server": self.server,
+            "tool": self.tool,
+            "arguments": self.arguments,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn call_hash_covers_server_tool_and_arguments() {
+        let call = ToolCall::new("mail", "send", serde_json::json!({"to": "bob", "n": 1}));
+        // Canonical form: keys sorted, no whitespace.
+        assert_eq!(
+            call.call_hash(),
+            crate::digest::sha256_bytes(
+                br#"{"arguments":{"n":1,"to":"bob"},"server":"mail","tool":"send"}"#
+            )
+        );
+        let same = ToolCall::new("mail", "send", serde_json::json!({"n": 1.0, "to": "bob"}));
+        assert_eq!(call.call_hash(), same.call_hash());
+        for other in [
+            ToolCall::new("mail", "send", serde_json::json!({"to": "eve", "n": 1})),
+            ToolCall::new("mail", "draft", serde_json::json!({"to": "bob", "n": 1})),
+            ToolCall::new("mail2", "send", serde_json::json!({"to": "bob", "n": 1})),
+        ] {
+            assert_ne!(call.call_hash(), other.call_hash());
+        }
+        let tagged = call.clone().with_session("abc").with_dpop_bound(true);
+        assert_eq!(call.call_hash(), tagged.call_hash());
+    }
 }

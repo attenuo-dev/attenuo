@@ -192,7 +192,7 @@ pub fn filter_list_response(
 /// spelled differently, and `serde_json` may parse the two spellings a unit in the last place
 /// apart, so doubles match within a few ULPs. Ids that collide this way are both filtered,
 /// which can only remove entries.
-fn same_id(request: &Value, response: &Value) -> bool {
+pub(crate) fn same_id(request: &Value, response: &Value) -> bool {
     match (request, response) {
         (Value::Number(a), Value::Number(b)) => {
             a == b
@@ -263,11 +263,39 @@ impl<'a> ListFilter<'a> {
     /// answers a pending `tools/list` request, unfiltered. Matching is the same as for
     /// [`apply`](Self::apply). Call it before filtering.
     pub fn listed_tool_names(&self, body: &Value) -> Vec<String> {
+        self.listed_tools(body)
+            .into_iter()
+            .filter_map(|t| t.get("name").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The MCP annotations of every tool in the `tools/list` results of `body` (matched as
+    /// for [`listed_tool_names`](Self::listed_tool_names)), as
+    /// `(name, readOnlyHint, destructiveHint)`; a hint that is absent or not a boolean is
+    /// `None`. Call it before filtering. Tools with neither hint are left out.
+    pub fn listed_tool_hints(&self, body: &Value) -> Vec<(String, Option<bool>, Option<bool>)> {
+        self.listed_tools(body)
+            .into_iter()
+            .filter_map(|t| {
+                let name = t.get("name").and_then(Value::as_str)?;
+                let ann = t.get("annotations")?;
+                let read_only = ann.get("readOnlyHint").and_then(Value::as_bool);
+                let destructive = ann.get("destructiveHint").and_then(Value::as_bool);
+                (read_only.is_some() || destructive.is_some())
+                    .then(|| (name.to_owned(), read_only, destructive))
+            })
+            .collect()
+    }
+
+    /// The tool objects of every `tools/list` result in `body` that answers a pending
+    /// `tools/list` request.
+    fn listed_tools<'b>(&self, body: &'b Value) -> Vec<&'b Value> {
         let messages: Vec<&Value> = match body {
             Value::Array(items) => items.iter().collect(),
             other => vec![other],
         };
-        let mut names = Vec::new();
+        let mut found = Vec::new();
         for msg in messages {
             if msg.get("method").is_some() {
                 continue;
@@ -287,15 +315,10 @@ impl<'a> ListFilter<'a> {
                 .and_then(|r| r.get("tools"))
                 .and_then(Value::as_array)
             {
-                names.extend(
-                    tools
-                        .iter()
-                        .filter_map(|t| t.get("name").and_then(Value::as_str))
-                        .map(str::to_owned),
-                );
+                found.extend(tools.iter());
             }
         }
-        names
+        found
     }
 
     /// Filter a JSON body: a single message or a batch.

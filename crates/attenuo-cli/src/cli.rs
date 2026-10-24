@@ -474,8 +474,8 @@ pub enum AuditCmd {
         /// Write here instead of stdout.
         #[arg(long)]
         out: Option<std::path::PathBuf>,
-        /// Keep only records of this kind: decision, exchange, root_token, lease_renew,
-        /// lease_revoke or admin. A filtered export has gaps in its hash chain, so
+        /// Keep only records of this kind: decision, tool_result, exchange, root_token,
+        /// lease_renew, lease_revoke or admin. A filtered export has gaps in its hash chain, so
         /// `audit verify --file` refuses it; verify an unfiltered export, then filter.
         #[arg(long, value_parser = parse_record_kind)]
         kind: Option<attenuo_core::RecordKind>,
@@ -501,8 +501,8 @@ pub enum DecisionArg {
 /// the server would check them, so a typo fails before any request.
 #[derive(Debug, Default, Args)]
 pub struct AuditFilter {
-    /// Record kind: decision, exchange, root_token, lease_renew, lease_revoke or admin.
-    /// Repeatable, or comma-separated; any of them matches.
+    /// Record kind: decision, tool_result, exchange, root_token, lease_renew, lease_revoke or
+    /// admin. Repeatable, or comma-separated; any of them matches.
     #[arg(long, value_parser = parse_record_kind, value_delimiter = ',')]
     pub kind: Vec<attenuo_core::RecordKind>,
     /// `allow` or `deny`.

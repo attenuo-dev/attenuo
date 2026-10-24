@@ -33,6 +33,7 @@ The names reserved for the server's own audit records are refused at start: `att
 | `catalog_path` | none | JSON tool catalog. Can be combined with `[policy.catalog]`. |
 | `user_attributes` | none | Extra `originating_user.attributes` for the Cedar schema, as `{ name = "type" }`. Types: `string`, `long`, `bool`, `set<string>`. A value of another type is denied with `attribute_type_mismatch`. |
 | `unknown_tools` | `"deny"` | A call to a `(server, tool)` pair missing from the catalog: `"deny"` (reason `tool_not_in_catalog`), `"sensitive"` (evaluated with `resource.sensitive = true`) or `"allow"` (default attributes). |
+| `import_annotations` | `"never"` | What MCP tool annotations from `tools/list` may change in the catalog: `"never"`, or `"narrowing"`, where an explicit `readOnlyHint: false` clears `readonly` and `destructiveHint: true` sets `destructive` for a catalog tool. Nothing an annotation says makes a tool less restricted, and tools missing from the catalog are not affected. |
 | `legacy_bare_actions` | `false` | **Deprecated.** Evaluate with the pre-2026-10-23 action ids, `Action::"<tool>"`, instead of `Action::"<server>/<tool>"`. A bare action matches that tool on every server (SR-13). Logged as a warning at start; `attenuo policy lint` lists bare actions. |
 
 The built-in user attributes `mfa` (bool), `roles` (set of string), `tenant` and `email` are always declared.
@@ -43,6 +44,8 @@ The built-in user attributes `mfa` (bool), `roles` (set of string), `tenant` and
 | --- | --- |
 | `readonly` | Boolean. Tests as `resource.readonly` in policies. |
 | `sensitive` | Boolean. Tests as `resource.sensitive` in policies. |
+| `destructive` | Boolean, default `true` unless `readonly = true`. Tests as `resource.destructive` in policies. |
+| `output` | `"untrusted"` (default) or `"trusted"`. A result of an untrusted tool taints the delegation run (`context.session.tainted`); a trusted tool's result is recorded but taints nothing. |
 | `inputs` | Table of argument name to type. Used to validate `context.input.*`. |
 
 Every action a policy names must be in the catalog: the table `[policy.catalog.github.read_file]` declares `Action::"github/read_file"`.

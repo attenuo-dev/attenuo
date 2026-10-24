@@ -20,15 +20,17 @@ use tower_http::trace::TraceLayer;
 use tracing::Instrument;
 use uuid::Uuid;
 
-use crate::auth::{AuthError, Authenticated, Authorizer, RequestAuth};
+use crate::auth::{AuthError, Authenticated, Authorizer, RequestAuth, REASON_APPROVAL_REQUIRED};
 use crate::config::ProxyConfig;
 use crate::filter::{ListFilter, ListKind};
 use crate::guard::{guard_stream, StreamGuard};
 use crate::jsonrpc::{
-    self, denied_response, error_response, id_of, is_passthrough_method, is_request, method_of,
-    CODE_INVALID_PARAMS, CODE_INVALID_REQUEST, CODE_PARSE_ERROR, CODE_TOO_MANY, CODE_UNAUTHORIZED,
-    CODE_UNAVAILABLE, CODE_UNKNOWN_SERVER, CODE_UPSTREAM,
+    self, approval_required_response, denied_response, error_response, id_of,
+    is_passthrough_method, is_request, method_of, CODE_INVALID_PARAMS, CODE_INVALID_REQUEST,
+    CODE_PARSE_ERROR, CODE_TOO_MANY, CODE_UNAUTHORIZED, CODE_UNAVAILABLE, CODE_UNKNOWN_SERVER,
+    CODE_UPSTREAM,
 };
+use crate::label::{label_stream, Labeller, PendingResult, LABELLED_METHODS};
 use crate::listed::ListedTools;
 use crate::session::{session_tag, BindOutcome, SessionCheck, SessionOwner, SessionRegistry};
 use crate::stage::Stage;
@@ -719,6 +721,9 @@ struct Screened {
     /// Result of the lease check made for messages forwarded without a per-call decision;
     /// made at most once per HTTP request.
     lease_check: Option<Result<(), AuthError>>,
+    /// Allowed mediated calls whose responses must be labelled before they are relayed
+    /// (ADR-0009).
+    results: Vec<PendingResult>,
 }
 
 /// Stage timings of one `POST`, filled in by [`handle_post_inner`] and reported by
@@ -927,7 +932,14 @@ async fn handle_post_inner(
     timing.upstream_done = Some(headers_in);
 
     let has_lists = !screened.list_requests.is_empty();
-    let needs_buffer = has_lists || !screened.replies.is_empty();
+    let labeller = (!screened.results.is_empty()).then(|| {
+        Labeller::new(
+            state.authorizer.clone(),
+            chain.clone(),
+            std::mem::take(&mut screened.results),
+        )
+    });
+    let needs_buffer = has_lists || !screened.replies.is_empty() || labeller.is_some();
     let content_type = resp
         .headers()
         .get(header::CONTENT_TYPE)
@@ -938,27 +950,66 @@ async fn handle_post_inner(
     let is_sse = content_type.starts_with("text/event-stream");
 
     let mut response = if needs_buffer && is_json {
-        buffer_and_rewrite(state, resp, chain, server, &screened, is_batch).await
-    } else if has_lists && is_sse {
+        buffer_and_rewrite(
+            state,
+            resp,
+            chain,
+            server,
+            &screened,
+            labeller.as_ref(),
+            is_batch,
+        )
+        .await
+    } else if (has_lists || labeller.is_some()) && is_sse {
         // The list response is an event of the stream, alone or inside a batch: filter each
-        // event as it passes. Replies the proxy generated itself lead the stream.
-        let pending = screened.list_requests.clone();
-        let caps = chain.effective_capabilities().cloned().unwrap_or_default();
-        let server = server.to_owned();
+        // event as it passes; label every response to an allowed call the same way. Replies
+        // the proxy generated itself lead the stream.
         let prelude = sse_prelude(&screened.replies);
         let guard = state.stream_guard(chain);
-        let listed = state.listed.clone();
-        stream_response_filtered(resp, prelude, guard, state.max_upstream_body, move |msg| {
-            let filter = ListFilter::new(&pending, &caps, &server);
-            let names = filter.listed_tool_names(msg);
-            if !names.is_empty() {
-                listed.record(&server, names.iter().map(String::as_str));
+        let filter = has_lists.then(|| {
+            let pending = screened.list_requests.clone();
+            let caps = chain.effective_capabilities().cloned().unwrap_or_default();
+            let server = server.to_owned();
+            let listed = state.listed.clone();
+            let authorizer = state.authorizer.clone();
+            move |msg: &mut Value| {
+                let filter = ListFilter::new(&pending, &caps, &server);
+                observe_listed(&filter, msg, &server, &listed, authorizer.as_ref());
+                let removed = filter.apply(msg);
+                if removed > 0 {
+                    tracing::debug!(removed, "filtered list result in SSE stream");
+                }
             }
-            let removed = filter.apply(msg);
-            if removed > 0 {
-                tracing::debug!(removed, "filtered list result in SSE stream");
+        });
+        stream_response_sse(
+            resp,
+            prelude,
+            guard,
+            state.max_upstream_body,
+            filter,
+            labeller,
+        )
+    } else if let Some(labeller) = labeller
+        .as_ref()
+        .filter(|_| !has_lists && !matches!(resp.status().as_u16(), 202 | 204))
+    {
+        // Neither JSON nor SSE: the proxy cannot find the results in it, so it cannot record
+        // them, and an unrecorded result must not reach the agent (ADR-0009). An empty body
+        // (a redirect, say) carries nothing and keeps its status; anything else fails closed.
+        let status = resp.status();
+        let upstream_headers = resp.headers().clone();
+        match read_upstream_body(resp, state.max_upstream_body).await {
+            Ok(b) if b.is_empty() => build_response(status, &upstream_headers, Body::empty()),
+            Ok(_) | Err(UpstreamBodyError::TooLarge) => {
+                tracing::error!(
+                    content_type = ?content_type,
+                    status = %status,
+                    "upstream answered a mediated call with a body the proxy cannot label"
+                );
+                label_failure(&screened, labeller, is_batch)
             }
-        })
+            Err(UpstreamBodyError::Transport(e)) => upstream_error(e),
+        }
     } else if has_lists && !matches!(resp.status().as_u16(), 202 | 204) {
         // Neither JSON nor SSE: the proxy cannot tell what is in it, and a list result must
         // not reach the client unfiltered. Fail closed.
@@ -1139,7 +1190,20 @@ async fn screen_message(
     );
     out.decision_ids.push(verdict.decision_id);
     if verdict.is_allow() {
+        if LABELLED_METHODS.contains(&method.as_str()) && is_request(&msg) {
+            out.results.push(PendingResult {
+                id,
+                call,
+                decision_id: verdict.decision_id,
+            });
+        }
         out.forward.push(msg);
+    } else if verdict.reason == REASON_APPROVAL_REQUIRED {
+        out.replies.push(approval_required_response(
+            id,
+            verdict.decision_id,
+            &call.call_hash(),
+        ));
     } else {
         out.replies
             .push(denied_response(id, &verdict.reason, verdict.decision_id));
@@ -1223,6 +1287,7 @@ async fn buffer_and_rewrite(
     chain: &DelegationChain,
     server: &str,
     screened: &Screened,
+    labeller: Option<&Labeller>,
     is_batch: bool,
 ) -> Response {
     let status = resp.status();
@@ -1251,6 +1316,14 @@ async fn buffer_and_rewrite(
                 );
                 return json_response(StatusCode::BAD_GATEWAY, &body);
             }
+            if let Some(labeller) = labeller {
+                // A result the proxy cannot parse is one it cannot record (ADR-0009).
+                tracing::error!(
+                    error = ?e.to_string(),
+                    "upstream answered a mediated call with invalid JSON; withheld"
+                );
+                return label_failure(screened, labeller, is_batch);
+            }
             tracing::warn!(
                 error = ?e.to_string(),
                 "upstream JSON response did not parse; passing through"
@@ -1263,15 +1336,22 @@ async fn buffer_and_rewrite(
     let no_caps = CapabilitySet::new();
     let caps = chain.effective_capabilities().unwrap_or(&no_caps);
     let filter = ListFilter::new(&screened.list_requests, caps, server);
-    let names = filter.listed_tool_names(&value);
-    if !names.is_empty() {
-        state
-            .listed
-            .record(server, names.iter().map(String::as_str));
-    }
+    observe_listed(
+        &filter,
+        &value,
+        server,
+        &state.listed,
+        state.authorizer.as_ref(),
+    );
     let removed = filter.apply(&mut value);
     if removed > 0 {
         tracing::debug!(removed, "filtered list result");
+    }
+    if let Some(labeller) = labeller {
+        let withheld = labeller.label_value(&mut value).await;
+        if withheld > 0 {
+            tracing::warn!(withheld, "results withheld: they could not be labelled");
+        }
     }
 
     if !screened.replies.is_empty() || (is_batch && !value.is_array()) {
@@ -1286,6 +1366,39 @@ async fn buffer_and_rewrite(
 
     let body = serde_json::to_vec(&value).unwrap_or_default();
     build_response(status, &headers, Body::from(body))
+}
+
+/// Record the tool names of the `tools/list` results in `body` (SR-25) and report the tools'
+/// MCP annotations to the authorizer ([`Authorizer::observe_tool_hints`]). Before filtering,
+/// so every tool the upstream lists is seen.
+fn observe_listed(
+    filter: &ListFilter<'_>,
+    body: &Value,
+    server: &str,
+    listed: &ListedTools,
+    authorizer: &dyn Authorizer,
+) {
+    let names = filter.listed_tool_names(body);
+    if !names.is_empty() {
+        listed.record(server, names.iter().map(String::as_str));
+    }
+    for (tool, read_only, destructive) in filter.listed_tool_hints(body) {
+        authorizer.observe_tool_hints(server, &tool, read_only, destructive);
+    }
+}
+
+/// The answer when the upstream's body to a request with allowed mediated calls cannot be
+/// read (ADR-0009): the proxy's own replies, then a `label_error` denial for each call, as
+/// one JSON body (an array for a batch).
+fn label_failure(screened: &Screened, labeller: &Labeller, is_batch: bool) -> Response {
+    let mut items = screened.replies.clone();
+    items.extend(labeller.failure_replies());
+    let body = if is_batch || items.len() > 1 {
+        Value::Array(items)
+    } else {
+        items.pop().unwrap_or(Value::Null)
+    };
+    json_response(StatusCode::OK, &body)
 }
 
 /// SSE events for locally generated replies, to prepend to an upstream event stream.
@@ -1349,20 +1462,34 @@ fn stream_response(
     build_response(status, &headers, body)
 }
 
-/// Like [`stream_response`] for an SSE body, with `filter` run over every JSON-RPC message in
-/// its events (see [`crate::sse`]), and always re-checked.
-fn stream_response_filtered(
+/// Like [`stream_response`] for an SSE body, always re-checked: with a `filter`, it runs over
+/// every JSON-RPC message in the events (see [`crate::sse`]); with a `labeller`, every
+/// response to an allowed call is recorded before its event is relayed ([`crate::label`]).
+fn stream_response_sse<F>(
     resp: reqwest::Response,
     prelude: Option<Bytes>,
     guard: StreamGuard,
     limit: usize,
-    filter: impl FnMut(&mut Value) + Send + 'static,
-) -> Response {
+    filter: Option<F>,
+    labeller: Option<Labeller>,
+) -> Response
+where
+    F: FnMut(&mut Value) + Send + 'static,
+{
+    type Events =
+        std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
     let status = resp.status();
     let headers = resp.headers().clone();
-    let filtered = crate::sse::rewrite_stream(resp.bytes_stream(), limit, filter);
+    let events: Events = match filter {
+        Some(f) => Box::pin(crate::sse::rewrite_stream(resp.bytes_stream(), limit, f)),
+        None => Box::pin(crate::sse::frame_stream(resp.bytes_stream(), limit)),
+    };
+    let events: Events = match labeller {
+        Some(l) => Box::pin(label_stream(events, l)),
+        None => events,
+    };
     let prelude = futures_util::stream::iter(prelude.map(Ok::<_, std::io::Error>));
-    let body = Body::from_stream(guard_stream(prelude.chain(filtered), guard, true));
+    let body = Body::from_stream(guard_stream(prelude.chain(events), guard, true));
     build_response(status, &headers, body)
 }
 

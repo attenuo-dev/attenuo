@@ -336,7 +336,8 @@ async fn bound_chain_end_to_end_through_the_proxy_sr24() {
     };
     assert_eq!(flagged("token.root"), vec![true]);
     assert_eq!(flagged("token.exchange"), vec![true, true]);
-    assert_eq!(flagged("read_file"), vec![true, true, true]);
+    // Three decisions plus the `tool_result` records of the two calls that went upstream.
+    assert_eq!(flagged("read_file"), vec![true; 5]);
     assert_eq!(flagged("lease.renew"), vec![true]);
 
     // An unbound chain still works as before, and its records carry no flag.

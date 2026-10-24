@@ -386,6 +386,29 @@ What this means:
 
 What was not measured: renewal traffic and `tools/call` traffic at the same time (so the effect of a renewal load on call latency, which is what RQ2 asks, is inferred from the CPU figures, not observed); renewals with a DPoP-bound token; exchanges with client-secret checking; trees larger than 100 descendants; more than one run per cell. The generator's own cost is in every number: its 1 ms timer lag is shown, its CPU share is not.
 
+### Output labelling: result append (2026-10-24)
+
+Branch `feat/output-labels-phase1`, based on de3cf75. Output labelling adds work to every allowed call that gets an answer: the server hashes the answer (`result_digest`, RFC 8785 JSON and SHA-256), appends a `tool_result` record, and for an untrusted tool adds a label row to the run (`Pipeline::record_result`, two transactions on the store). Every decision also reads the run's labels. The `decide` bench has new cells for these. One run, criterion, 1 s warm-up, 3 s measurement, the same 4-core shared VM, load average 1.5 to 2.1 ([`bench/2026-10-24-vm-criterion-tool-result.txt`](bench/2026-10-24-vm-criterion-tool-result.txt)). Small result (one text item).
+
+| Cell, microseconds (criterion estimate, interval in brackets) | 1 hop | 3 hops |
+|---|---|---|
+| `result_digest` | 0.68 (0.66 to 0.71) | 0.72 (0.69 to 0.74) |
+| `record_result_file` (`durability = normal`) | 147 (115 to 187) | 155 (126 to 189) |
+| `append_file`, a decision record, same run | 136 (104 to 173) | 154 (113 to 201) |
+| `decide_file`, now including the label read | 143 (123 to 168) | 161 (141 to 184) |
+| `record_result_file_full` (`durability = full`) | 329 (316 to 344) | 425 (399 to 451) |
+| `record_result_memory` | 136 (129 to 143) | 213 (206 to 221) |
+
+Readings:
+
+- **On the file store, recording a result costs about as much as recording the decision**, roughly 150 us at `normal` durability, so an allowed call now spends about twice as long in the audit log as before. The intervals of `record_result_file` and `append_file` overlap, so the label row adds little on top of the append in this run. The design note's estimate (60 to 140 us for a file append) was about right.
+- **Hashing the result is negligible** for a small result (under 1 us). It grows with the size of the result; large results were not measured.
+- **The label read did not move `decide_file` measurably** (143 us against 136 us for the bare append in the same run, within noise). The store keeps one label row per source, so the read does not grow with the number of results a run reads.
+- **`durability = full` roughly doubles the cost** (two fsyncs, one per transaction).
+- The in-memory cells are slower than expected next to the file cells (213 us at 3 hops). Not investigated; one run on a shared VM.
+
+Not measured: results of realistic sizes (tens of kilobytes), the end-to-end effect through the proxy, and SSE responses with many events.
+
 ### How to run
 
 ```

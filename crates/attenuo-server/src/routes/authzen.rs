@@ -329,14 +329,19 @@ fn evaluate_value(
     } else {
         Vec::new()
     };
+    let mut context = json!({
+        "reason": d.reason,
+        "policy_ids": d.policy_ids,
+        "diagnostics": diagnostics,
+        "decision_id": d.decision_id,
+    });
+    if d.reason == attenuo_policy::REASON_APPROVAL_REQUIRED {
+        // What an approval would be bound to (ADR-0009), as the proxy's `-32008` carries it.
+        context["call_hash"] = json!(call.call_hash());
+    }
     Ok(EvaluationResponse {
         decision: allow,
-        context: Some(json!({
-            "reason": d.reason,
-            "policy_ids": d.policy_ids,
-            "diagnostics": diagnostics,
-            "decision_id": d.decision_id,
-        })),
+        context: Some(context),
     })
 }
 

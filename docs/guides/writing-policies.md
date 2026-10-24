@@ -20,12 +20,15 @@ Every call becomes one Cedar request.
 | `context.chain` | `depth`, `agents` (root first), `root_agent`, `leases` |
 | `context.session_id` | present only if the call carries one |
 | `context.now_unix` | evaluation time, unix seconds |
+| `context.session` | output labels of the delegation run: `tainted` (bool) and `tainted_by` (set of `"<server>/<tool>"`); see [Asking for approval after untrusted output](#asking-for-approval-after-untrusted-output) |
+| `context.args_contain_untrusted`, `context.untrusted_args` | `false` and an empty set for now; argument matching is not built yet |
+| `context.approval` | `present` (bool) and `by` (string); `false` and `""` until approvals are built |
 
 The action names the server as well as the tool. `action == Action::"github/read_file"` matches `read_file` on the upstream mounted as `github` and nothing else: a second upstream that also has a `read_file` tool (a malicious one, say) is not covered by that permit. To write a rule for every tool of one server, use the resource: `resource in Server::"github"`. To write one for every tool everywhere, leave `action` unconstrained or use `action in Action::"invoke"`.
 
 The principal is an `Agent`, and an agent is `in` the originating `User` and in every earlier agent of the chain. So `principal in User::"alice"` and `principal in Agent::"planner"` both work, the latter matching `planner` and anything it delegated to.
 
-`resource` carries `readonly` and `sensitive`, taken from the catalog (below). `principal.chain_depth` is the 1-based position of the agent in the chain.
+`resource` carries `readonly`, `sensitive` and `destructive`, taken from the catalog (below). `principal.chain_depth` is the 1-based position of the agent in the chain.
 
 Four things trip people up:
 
@@ -49,11 +52,15 @@ inputs = { repo = "string", title = "string" }
 [policy.catalog.github.delete_repo]
 sensitive = true
 inputs = { repo = "string" }
+
+[policy.catalog.bank.get_balance]
+readonly = true
+output = "trusted"
 ```
 
 It does two jobs:
 
-1. **Tool attributes** (`readonly`, `sensitive`) become `resource.readonly` and `resource.sensitive`. A tool that is not in the catalog is denied before Cedar runs, with reason `tool_not_in_catalog`, unless `[policy] unknown_tools` is `sensitive` (evaluated as `sensitive = true`) or `allow` (evaluated as neither, so a `forbid` keyed on `sensitive` silently skips it). Register every tool the server exposes (MCP `tools/list` is the natural source).
+1. **Tool attributes** (`readonly`, `sensitive`, `destructive`) become `resource.readonly`, `resource.sensitive` and `resource.destructive`. `destructive` defaults to the opposite of `readonly`. `output` (`untrusted` by default, or `trusted`) says whether the tool's results taint the run; it is not a Cedar attribute. A tool that is not in the catalog is denied before Cedar runs, with reason `tool_not_in_catalog`, unless `[policy] unknown_tools` is `sensitive` (evaluated as `sensitive = true`) or `allow` (evaluated as neither, so a `forbid` keyed on `sensitive` silently skips it). Register every tool the server exposes (MCP `tools/list` is the natural source).
 2. **Schema generation.** Each catalog entry becomes a declared action, `Action::"<server>/<tool>"`, and each `inputs` entry a typed, optional attribute of `context.input`. Policies are validated against this schema at load time, so a typo in an argument name or a comparison of a string to a number fails the load instead of misbehaving on a call. A policy that names `Action::"github/x"` validates only if the catalog has a tool `x` under `github`. Argument types are `string`, `long`, `bool`, or `{ set = "string" }`.
 
 Server names (the `[[upstreams]]` names and the catalog's server keys) and tool names may not contain `/`, so `"<server>/<tool>"` always splits one way. The one exception is on the tool side: the proxy authorizes MCP methods other than `tools/call` under their method name (`resources/read`, `prompts/get`), so those catalog entries are `[policy.catalog.github."resources/read"]` and their action is `Action::"github/resources/read"`. A `tools/call` can never carry a `/` in its tool name, so a tool cannot pose as one of these methods. The server refuses to start with a catalog entry that breaks these rules.
@@ -124,6 +131,25 @@ when {
 
 A missing `mfa` attribute counts as no MFA. A `forbid` always wins over a `permit`, so this holds whatever permits are added later. The `mfa` attribute is derived from the IdP's `amr` claim when hop 0 is minted; see the top-level README.
 
+### Asking for approval after untrusted output
+
+Every result an upstream returns is recorded, and unless the catalog marks the tool `output = "trusted"`, it taints the delegation run: every later call made with any token of that run sees `context.session.tainted == true` and the source in `context.session.tainted_by`. A run whose taint state cannot be read counts as tainted. A denied call reads nothing, so it taints nothing.
+
+```cedar
+@id("confirm_destructive_after_untrusted_read")
+@obligation("approval")
+forbid(principal, action, resource)
+when {
+    resource.destructive &&
+    context.session.tainted &&
+    !context.approval.present
+};
+```
+
+`@obligation("approval")` turns the forbid into a request for approval. When every forbid that applied carries it, and some permit would allow the call without them, the reason is `approval_required` instead of `policy_deny`, and the proxy answers JSON-RPC `-32008` with the call's `call_hash`. A forbid without the annotation still refuses outright, so an approval cannot unlock what another rule forbids. `approval` is the only value; any other value, or the annotation on a `permit`, fails the load and `attenuo policy lint`. Approving a call is not built yet, so for now `approval_required` is a deny that says why.
+
+[`config/policies/output-labels.cedar`](../../config/policies/output-labels.cedar) has this rule and the mail rule from the design, with tests in `output-labels_test.yaml` next to it.
+
 ### Chain depth
 
 ```cedar
@@ -184,7 +210,8 @@ cases:
       tool: read_file
       arguments: { repo: alice/public-docs, path: README.md }
     expect: allow                   # or deny
-    reason: policy_allow            # optional: policy_allow | policy_deny | capability_denied | policy_error
+    reason: policy_allow            # optional: policy_allow | policy_deny | approval_required |
+                                    # capability_denied | policy_error
     policy_ids: [read_file_public_repos_only]   # optional; the policies that decided it, as a set
 ```
 
@@ -209,6 +236,7 @@ The harness builds a real `DelegationChain` and calls the same `PolicyEngine::au
 
 - **Valid chains only.** The chain is validated like a received one. A child wider than its parent, for example, is reported as a failed case with the reason, so a test cannot describe a delegation the server would refuse to issue.
 - **Defaults.** User `alice` at `https://idp.example`, authenticated a minute before `now`; time fixed at 1760000000; each hop lives an hour; lease ids are random. `policy_ids: []` asserts that no policy matched (a default deny).
+- **Output labels.** A case's `session: { tainted_by: [web/fetch] }` evaluates the call as part of a run that has read that source; `tainted: true` with no sources is a run whose taint state could not be read. Without `session` the run is untainted. `reason` also accepts `approval_required`.
 - **Mistakes in the file** (unknown keys, a missing `expect`, duplicate case names, an empty `cases`) are errors, not silent passes.
 
 ### Running

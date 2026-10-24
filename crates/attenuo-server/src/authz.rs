@@ -6,10 +6,18 @@
 //! 1. **Leases.** Every lease in the chain must be known, unrevoked and unexpired
 //!    (`LeaseStore::check_all`). Otherwise: deny with `lease_revoked`, `lease_expired` or
 //!    `lease_unknown` (checked in that order), or `lease_error` if the store fails.
-//! 2. **Policy.** `PolicyEngine::authorize`: the capability stage, then Cedar.
-//! 3. **Audit.** A [`DecisionRecord`] is appended to the hash-chained log, and its id is the
+//! 2. **Labels.** The taint state of the delegation run (`LeaseStore::labels` for the
+//!    chain id, ADR-0009). A store that cannot be read counts as tainted.
+//! 3. **Policy.** `PolicyEngine::authorize_labelled`: the capability stage, then Cedar, with
+//!    the run's labels as `context.session`. A deny through `@obligation("approval")` forbids
+//!    only is `approval_required`.
+//! 4. **Audit.** A [`DecisionRecord`] is appended to the hash-chained log, and its id is the
 //!    decision id returned to the caller. If the append fails the call is denied with
 //!    `audit_error`: an action that cannot be recorded does not happen.
+//!
+//! After an allowed mediated call returns, [`Pipeline::record_result`] appends a
+//! `tool_result` record and, for an untrusted result, labels the run; if either fails, the
+//! proxy withholds the result (`label_error`).
 //!
 //! The chain is assumed to be verified already (token signature, structure, expiry).
 
@@ -18,11 +26,15 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use attenuo_audit::{AuditSink, LeaseStore};
-use attenuo_core::{Decision, DecisionRecord, DelegationChain, ToolCall};
-use attenuo_policy::PolicyEngine;
+use attenuo_audit::{AuditSink, LeaseStore, RunLabel};
+use attenuo_core::{
+    chain_id_of, Decision, DecisionRecord, DelegationChain, LeaseId, OutputLabel, RecordLabels,
+    ResultInfo, ToolCall,
+};
+use attenuo_policy::{CallLabels, PolicyEngine, SessionLabels};
 use attenuo_proxy::{AuthDecision, AuthError, Authenticated, Authorizer, RequestAuth, Stage};
 use attenuo_token::Verifier;
+use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -38,6 +50,32 @@ pub const REASON_LEASE_UNKNOWN: &str = "lease_unknown";
 pub const REASON_LEASE_ERROR: &str = "lease_error";
 /// Reason code: the decision could not be written to the audit log (fail closed).
 pub const REASON_AUDIT_ERROR: &str = "audit_error";
+/// Reason code: a result's `tool_result` record or the run's label could not be written, so
+/// the result is withheld (ADR-0009).
+pub const REASON_LABEL_ERROR: &str = attenuo_proxy::REASON_LABEL_ERROR;
+
+/// What [`Pipeline::run_labels`] found for a call's delegation run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunLabels {
+    /// What Cedar sees as `context.session`.
+    pub session: SessionLabels,
+    /// What the decision record carries: the `seq` of the first untrusted result of each
+    /// source.
+    pub record: RecordLabels,
+    /// Set when the taint state could not be read (the run then counts as tainted).
+    pub error: Option<String>,
+}
+
+/// SHA-256 (hex) and length of the RFC 8785 canonical JSON of an upstream result: what a
+/// `tool_result` record stores instead of the result. `Err` for a value with no canonical
+/// form (nothing parsed from JSON has one).
+pub fn result_digest(result: &Value) -> Result<(String, u64), String> {
+    let bytes = attenuo_core::jcs::to_vec(result).map_err(|e| e.to_string())?;
+    Ok((
+        attenuo_core::digest::sha256_bytes(&bytes),
+        bytes.len() as u64,
+    ))
+}
 
 /// The result of running the pipeline once.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,20 +149,22 @@ impl Pipeline {
         out
     }
 
-    /// Stage 2 alone: `PolicyEngine::authorize` (the capability stage, the catalog, then
-    /// Cedar) on the shared engine. No lease check, no audit record, no metrics.
+    /// The policy stage alone: `PolicyEngine::authorize_labelled` (the capability stage, the
+    /// catalog, then Cedar) on the shared engine, with `labels` as the run's output labels. No
+    /// lease check, no audit record, no metrics.
     ///
-    /// [`decide`](Self::decide) runs this after the lease check, and the admin dry run
-    /// (`POST /admin/policies/evaluate`) runs it on its own, so the two cannot disagree about
-    /// what the policy says. A poisoned engine lock denies with `policy_error`.
+    /// [`decide`](Self::decide) runs this after the lease check and the label read, and the
+    /// admin dry run (`POST /admin/policies/evaluate`) runs it on its own, so the two cannot
+    /// disagree about what the policy says. A poisoned engine lock denies with `policy_error`.
     pub fn evaluate_policy(
         &self,
         chain: &DelegationChain,
         call: &ToolCall,
+        labels: &CallLabels,
         now: OffsetDateTime,
     ) -> attenuo_policy::Outcome {
         match self.policy.read() {
-            Ok(engine) => engine.authorize(chain, call, now),
+            Ok(engine) => engine.authorize_labelled(chain, call, labels, now),
             Err(_) => attenuo_policy::Outcome {
                 decision: Decision::Deny,
                 reason: attenuo_policy::REASON_POLICY_ERROR.to_string(),
@@ -145,16 +185,25 @@ impl Pipeline {
         let leases = self.check_leases(chain, now);
         let t1 = Instant::now();
         let mut policy_time = None;
+        let mut record_labels = RecordLabels::default();
         let (decision, reason, policy_ids, diagnostics) = match leases {
             Err((reason, detail)) => (Decision::Deny, reason.to_string(), Vec::new(), detail),
             Ok(()) => {
-                let o = self.evaluate_policy(chain, call, now);
+                let run = self.run_labels(chain);
+                let labels = CallLabels {
+                    session: run.session,
+                };
+                let o = self.evaluate_policy(chain, call, &labels, now);
                 policy_time = Some(t1.elapsed());
-                (o.decision, o.reason, o.policy_ids, o.diagnostics)
+                record_labels = run.record;
+                let mut diagnostics = o.diagnostics;
+                diagnostics.extend(run.error);
+                (o.decision, o.reason, o.policy_ids, diagnostics)
             }
         };
 
-        let record = DecisionRecord::new(now, decision, reason, chain, call, policy_ids);
+        let record = DecisionRecord::new(now, decision, reason, chain, call, policy_ids)
+            .with_labels(record_labels);
         let decision_id = record.id;
         // The record moves into the log; the entry hands it back, so it is never cloned.
         let t2 = Instant::now();
@@ -212,6 +261,102 @@ impl Pipeline {
                 }
             }
         }
+    }
+
+    /// The output labels of `chain`'s delegation run (ADR-0009), read from the lease store by
+    /// chain id. Fails closed: a store error, or a chain with no hops, is a tainted run with no
+    /// known source.
+    pub fn run_labels(&self, chain: &DelegationChain) -> RunLabels {
+        let Some(chain_id) = chain_id_of(chain) else {
+            return RunLabels {
+                session: SessionLabels::unknown(),
+                record: RecordLabels::default(),
+                error: Some("chain has no hops: no run to read labels for".into()),
+            };
+        };
+        match self.leases.labels(&LeaseId::new(chain_id)) {
+            Ok(labels) => RunLabels {
+                session: SessionLabels::from_sources(labels.iter().map(|l| l.source.clone())),
+                record: RecordLabels {
+                    tainted_by: labels.iter().map(|l| l.seq).collect(),
+                },
+                error: None,
+            },
+            Err(e) => {
+                tracing::error!(error = %e, "run taint state unreadable; treating the run as tainted");
+                RunLabels {
+                    session: SessionLabels::unknown(),
+                    record: RecordLabels::default(),
+                    error: Some(format!(
+                        "taint state unreadable, run treated as tainted: {e}"
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Record the upstream's answer to an allowed mediated call (ADR-0009): append a
+    /// `tool_result` record (digest and size from [`result_digest`], no content) and, unless
+    /// the catalog marks the tool's output trusted, add a label `{source, decision_id, seq,
+    /// at}` to the run's taint state. Returns the record's `seq`. `Err` (reason
+    /// `label_error`) when either write fails; the caller must then withhold the result.
+    pub fn record_result(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        decision_id: Uuid,
+        digest: (String, u64),
+        is_error: bool,
+        now: OffsetDateTime,
+    ) -> Result<u64, String> {
+        // A poisoned engine lock cannot say the tool is trusted: label the result untrusted.
+        let label = self
+            .policy
+            .read()
+            .ok()
+            .and_then(|e| e.effective_attrs(&call.server, &call.tool))
+            .map(|a| a.output)
+            .unwrap_or_default();
+        let (digest, size) = digest;
+        let info = ResultInfo {
+            digest,
+            size,
+            error: is_error,
+            label,
+            fingerprints: 0,
+        };
+        let record = DecisionRecord::tool_result(now, chain, call, decision_id, info);
+        let entry = self
+            .metrics
+            .time_audit_append(|| self.audit.append(record))
+            .map_err(|e| {
+                tracing::error!(error = %e, "tool_result append failed; withholding the result");
+                self.metrics.audit_append_error();
+                REASON_LABEL_ERROR.to_string()
+            })?;
+        if label == OutputLabel::Untrusted {
+            let chain_id = chain_id_of(chain).ok_or_else(|| REASON_LABEL_ERROR.to_string())?;
+            let run_label = RunLabel {
+                source: format!("{}/{}", call.server, call.tool),
+                decision_id: decision_id.to_string(),
+                seq: entry.seq,
+                at: now,
+            };
+            self.leases
+                .add_label(&LeaseId::new(chain_id), &run_label)
+                .map_err(|e| {
+                    tracing::error!(error = %e, "run label write failed; withholding the result");
+                    REASON_LABEL_ERROR.to_string()
+                })?;
+        }
+        tracing::debug!(
+            server = ?call.server,
+            tool = ?call.tool,
+            label = label.as_str(),
+            seq = entry.seq,
+            "result recorded"
+        );
+        Ok(entry.seq)
     }
 
     /// Append a `deny` record for a request refused before any decision (for example the
@@ -515,6 +660,51 @@ impl Authorizer for ServerAuthorizer {
             decision: d.decision,
             reason: d.reason,
             decision_id: d.decision_id,
+        }
+    }
+
+    async fn record_result(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        decision_id: Uuid,
+        result: &Value,
+        is_error: bool,
+        now: OffsetDateTime,
+    ) -> Result<(), String> {
+        // The canonical form is computed here, so the result itself is not copied to the
+        // blocking pool; only its digest is.
+        let digest = result_digest(result).map_err(|e| {
+            tracing::error!(error = %e, "result has no canonical form; withholding it");
+            REASON_LABEL_ERROR.to_string()
+        })?;
+        let (chain, call) = (chain.clone(), call.clone());
+        on_blocking_pool(&self.pipeline, move |p| {
+            p.record_result(&chain, &call, decision_id, digest, is_error, now)
+        })
+        .await
+        .map(|_| ())
+    }
+
+    fn observe_tool_hints(
+        &self,
+        server: &str,
+        tool: &str,
+        read_only_hint: Option<bool>,
+        destructive_hint: Option<bool>,
+    ) {
+        let Ok(engine) = self.pipeline.policy().read() else {
+            return;
+        };
+        if engine.import_annotations(server, tool, read_only_hint, destructive_hint) {
+            // Server and tool come from the upstream: Debug-format them (SR-18).
+            tracing::info!(
+                server = ?server,
+                tool = ?tool,
+                read_only_hint = ?read_only_hint,
+                destructive_hint = ?destructive_hint,
+                "tool annotations narrowed a catalog entry"
+            );
         }
     }
 

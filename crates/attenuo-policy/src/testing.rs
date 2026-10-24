@@ -20,7 +20,12 @@
 //!     expect: allow                 # or deny
 //!     reason: policy_allow          # optional
 //!     policy_ids: [read_public]     # optional, compared as a set
+//!     session:                      # optional: the run's output labels (ADR-0009)
+//!       tainted_by: [web/fetch]     # sources as server/tool; tainted when non-empty
+//!       tainted: true               # optional; set it alone for an unreadable taint state
 //! ```
+//!
+//! Without `session` the run is untainted, as for a run that has read nothing.
 //!
 //! An inline catalog has the same shape as `[policy.catalog]` in the server config:
 //!
@@ -29,6 +34,8 @@
 //!   github:
 //!     read_file: { readonly: true, inputs: { repo: string } }
 //!     delete_repo: { sensitive: true }
+//!     create_event: { destructive: false }   # destructive defaults to !readonly
+//!     get_balance: { readonly: true, output: trusted }
 //! ```
 //!
 //! Calls to tools missing from the catalog are handled as the server handles them
@@ -84,8 +91,8 @@ use serde_json::Value;
 use time::{Duration, OffsetDateTime};
 
 use crate::{
-    ArgType, Outcome, PolicyEngine, PolicyEngineBuilder, PolicyError, ToolAttrs, ToolCatalog,
-    UnknownTools,
+    ArgType, CallLabels, Outcome, PolicyEngine, PolicyEngineBuilder, PolicyError, SessionLabels,
+    ToolAttrs, ToolCatalog, UnknownTools,
 };
 
 /// The evaluation time used when a test file does not set `now`: 2025-10-09T08:53:20Z.
@@ -362,6 +369,29 @@ fn empty_object() -> Value {
     Value::Object(Default::default())
 }
 
+/// The output labels of the case's delegation run (`context.session`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSpec {
+    /// Sources that labelled the run, as `server/tool`.
+    #[serde(default)]
+    pub tainted_by: Vec<String>,
+    /// Defaults to `true` when `tainted_by` is non-empty. `true` with no sources is what the
+    /// server evaluates when the run's taint state cannot be read.
+    #[serde(default)]
+    pub tainted: Option<bool>,
+}
+
+impl SessionSpec {
+    fn labels(&self) -> CallLabels {
+        let mut session = SessionLabels::from_sources(self.tainted_by.iter().cloned());
+        if let Some(t) = self.tainted {
+            session.tainted = t || !session.tainted_by.is_empty();
+        }
+        CallLabels { session }
+    }
+}
+
 /// The decision a case expects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -406,6 +436,9 @@ pub struct TestCase {
     /// Expected policy ids that determined the decision, compared as a set.
     #[serde(default)]
     pub policy_ids: Option<Vec<String>>,
+    /// The run's output labels; untainted when absent.
+    #[serde(default)]
+    pub session: Option<SessionSpec>,
 }
 
 /// A parsed test file.
@@ -633,7 +666,12 @@ fn run_case(engine: &PolicyEngine, case: &TestCase, now_unix: i64) -> CaseReport
             return report;
         }
     };
-    let actual = Actual::from(engine.authorize(&chain, &call, now));
+    let labels = case
+        .session
+        .as_ref()
+        .map(SessionSpec::labels)
+        .unwrap_or_default();
+    let actual = Actual::from(engine.authorize_labelled(&chain, &call, &labels, now));
 
     if !case.expect.matches(&actual.decision) {
         report.failures.push(format!(

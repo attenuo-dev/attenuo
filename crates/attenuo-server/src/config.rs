@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use attenuo_core::{Capability, CapabilitySet};
-use attenuo_policy::{ToolAttrs, ToolCatalog, UnknownTools};
+use attenuo_policy::{AnnotationImport, ToolAttrs, ToolCatalog, UnknownTools};
 use attenuo_proxy::UpstreamConfig;
 use attenuo_token::MayAct;
 use serde::{Deserialize, Serialize};
@@ -548,6 +548,12 @@ pub struct PolicySection {
     /// that tool on every server. Default `false`; the server logs a warning when it is on.
     #[serde(default)]
     pub legacy_bare_actions: bool,
+    /// Whether MCP tool annotations from `tools/list` (`readOnlyHint`, `destructiveHint`)
+    /// change catalog entries: `"never"` (default) or `"narrowing"`, where an explicit
+    /// `readOnlyHint: false` clears `readonly` and `destructiveHint: true` sets `destructive`,
+    /// and nothing an annotation says makes a tool less restricted (ADR-0009).
+    #[serde(default)]
+    pub import_annotations: AnnotationImport,
 }
 
 impl PolicySection {
@@ -1739,6 +1745,30 @@ mod tests {
     }
 
     /// SR-13: actions are server-scoped unless the deprecated switch is on.
+    #[test]
+    fn import_annotations_defaults_to_never_and_parses() {
+        assert_eq!(
+            Config::from_toml("").unwrap().policy.import_annotations,
+            AnnotationImport::Never
+        );
+        let cfg = Config::from_toml("[policy]\nimport_annotations = \"narrowing\"\n").unwrap();
+        assert_eq!(cfg.policy.import_annotations, AnnotationImport::Narrowing);
+        assert!(Config::from_toml("[policy]\nimport_annotations = \"always\"\n").is_err());
+        // Catalog entries take `destructive` and `output` next to `readonly` and `sensitive`.
+        let cfg = Config::from_toml(
+            "[policy.catalog.bank.get_balance]\nreadonly = true\noutput = \"trusted\"\n\
+             [policy.catalog.cal.create_event]\ndestructive = false\n",
+        )
+        .unwrap();
+        let catalog = cfg.policy.load_catalog().unwrap();
+        assert_eq!(
+            catalog.get("bank", "get_balance").output,
+            attenuo_policy::OutputLabel::Trusted
+        );
+        assert!(!catalog.get("cal", "create_event").is_destructive());
+        assert!(Config::from_toml("[policy.catalog.a.b]\noutput = \"maybe\"\n").is_err());
+    }
+
     #[test]
     fn legacy_bare_actions_defaults_to_off() {
         assert!(!Config::from_toml("").unwrap().policy.legacy_bare_actions);

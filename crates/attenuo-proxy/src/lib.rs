@@ -119,6 +119,7 @@ pub mod config;
 pub mod filter;
 pub mod guard;
 pub mod jsonrpc;
+pub mod label;
 pub mod listed;
 pub mod proxy;
 pub mod session;
@@ -128,7 +129,10 @@ pub mod stage;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
-pub use auth::{AuthDecision, AuthError, Authenticated, Authorizer, RequestAuth};
+pub use auth::{
+    AuthDecision, AuthError, Authenticated, Authorizer, RequestAuth, REASON_APPROVAL_REQUIRED,
+    REASON_LABEL_ERROR,
+};
 pub use config::{ProxyConfig, UpstreamConfig};
 pub use proxy::{
     router, serve, DECISION_ID_HEADER, REASON_INVALID_NAME, REASON_REQUEST_TOO_LARGE,
