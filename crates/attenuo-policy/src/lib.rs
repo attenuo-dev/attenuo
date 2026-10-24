@@ -935,15 +935,26 @@ impl PolicyEngine {
         };
         if !caps.permits(call) {
             let have: Vec<String> = caps.iter().map(|c| c.display()).collect();
-            return Outcome::deny(
-                REASON_CAPABILITY_DENIED,
-                vec![format!(
-                    "call {}:{} is not permitted by the effective capabilities [{}]",
-                    call.server,
-                    call.tool,
-                    have.join(", ")
-                )],
+            // For each capability whose patterns match, the first constraint the call fails,
+            // naming the argument and the bound or value the capability allows (already in the
+            // list above), never the argument's value.
+            let why: Vec<String> = caps
+                .iter()
+                .filter_map(|c| {
+                    c.explain_denial(call)
+                        .map(|w| format!("{}:{}: {w}", c.server, c.tool))
+                })
+                .collect();
+            let mut detail = format!(
+                "call {}:{} is not permitted by the effective capabilities [{}]",
+                call.server,
+                call.tool,
+                have.join(", ")
             );
+            if !why.is_empty() {
+                detail.push_str(&format!("; {}", why.join("; ")));
+            }
+            return Outcome::deny(REASON_CAPABILITY_DENIED, vec![detail]);
         }
 
         // Stage 1a: run limits (ADR-0010). The server read the counters; a limit the call
