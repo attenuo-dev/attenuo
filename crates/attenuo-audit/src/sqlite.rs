@@ -32,7 +32,7 @@ use crate::error::AuditError;
 use crate::export::RecordFilter;
 use crate::lease::{
     ancestors_of, breadth_first, classify, LeaseRow, LeaseSelector, LeaseStatus, LeaseStore,
-    LeaseSubtree, RunLabel, SelectorRevocation,
+    LeaseSubtree, RunLabel, SelectorRevocation, SessionBinding,
 };
 use crate::log::{
     canonical_record_json, entry_hash_from_json, verify_entries, AuditEntry, AuditSink,
@@ -109,6 +109,17 @@ CREATE TABLE IF NOT EXISTS lease_subjects (
     subject TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS lease_subjects_subject_idx ON lease_subjects(subject);
+-- MCP sessions opened through the proxy and the chain that opened each
+-- (`LeaseStore::record_session`), for revoking by session. `session` is the SHA-256 of the
+-- `Mcp-Session-Id` in hex, never the id. Write-once per (session, server). Created at open on
+-- stores that predate it; a session opened before then has no row and matches nothing.
+CREATE TABLE IF NOT EXISTS lease_sessions (
+    session  TEXT NOT NULL,
+    server   TEXT NOT NULL,
+    chain_id TEXT NOT NULL,
+    bound_at TEXT NOT NULL,
+    PRIMARY KEY (session, server)
+);
 CREATE TABLE IF NOT EXISTS run_labels (
     chain_id    TEXT    NOT NULL,
     source      TEXT    NOT NULL,
@@ -2782,10 +2793,14 @@ fn selected_in(
             .query_map([subject], |r| r.get::<_, String>(0))?
             .map(|r| r.map(LeaseId))
             .collect::<Result<_, _>>()?,
-        LeaseSelector::Chain(root) => match get_in(&tx, root)? {
-            Some(row) if row.parent.is_none() => unrevoked_subtree(&tx, root)?,
-            _ => Vec::new(),
-        },
+        LeaseSelector::Chain(root) => chain_matches_in(&tx, root)?,
+        LeaseSelector::Session(session) => {
+            let mut matched = Vec::new();
+            for b in sessions_in(&tx, session)? {
+                matched.extend(chain_matches_in(&tx, &b.chain_id)?);
+            }
+            matched
+        }
     };
     let mut cascade = Vec::new();
     for m in &matched {
@@ -2889,6 +2904,34 @@ fn subtree_in(
         would_revoke: u64::try_from(would_revoke).unwrap_or(0),
         truncated,
     }))
+}
+
+/// What [`LeaseSelector::Chain`] matches: the unrevoked leases of the subtree of `root`, or
+/// nothing when `root` is unknown or has a parent.
+fn chain_matches_in(conn: &Connection, root: &LeaseId) -> Result<Vec<LeaseId>, AuditError> {
+    match get_in(conn, root)? {
+        Some(row) if row.parent.is_none() => unrevoked_subtree(conn, root),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn sessions_in(conn: &Connection, session: &str) -> Result<Vec<SessionBinding>, AuditError> {
+    let rows: Vec<(String, String, String)> = conn
+        .prepare_cached(
+            "SELECT server, chain_id, bound_at FROM lease_sessions WHERE session = ?1 \
+             ORDER BY server",
+        )?
+        .query_map([session], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    rows.into_iter()
+        .map(|(server, chain_id, at)| {
+            Ok(SessionBinding {
+                server,
+                chain_id: LeaseId(chain_id),
+                bound_at: parse_time(&at)?,
+            })
+        })
+        .collect()
 }
 
 fn subject_in(conn: &Connection, lease: &LeaseId) -> Result<Option<String>, AuditError> {
@@ -3288,6 +3331,34 @@ impl LeaseStore for SqliteLeaseStore {
     fn subjects(&self, leases: &[&LeaseId]) -> Result<BTreeMap<LeaseId, String>, AuditError> {
         let conn = self.conn.lock()?;
         subjects_in(&conn, leases)
+    }
+
+    fn record_session(
+        &self,
+        session: &str,
+        server: &str,
+        chain_id: &LeaseId,
+        now: OffsetDateTime,
+    ) -> Result<bool, AuditError> {
+        let _gate = self.gate.hold();
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if get_in(&tx, chain_id)?.is_none() {
+            return Err(AuditError::UnknownLease(chain_id.0.clone()));
+        }
+        let inserted = tx
+            .prepare_cached(
+                "INSERT OR IGNORE INTO lease_sessions (session, server, chain_id, bound_at) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?
+            .execute(params![session, server, chain_id.0, fmt_time(now)?])?;
+        tx.commit()?;
+        Ok(inserted == 1)
+    }
+
+    fn sessions(&self, session: &str) -> Result<Vec<SessionBinding>, AuditError> {
+        let conn = self.conn.lock()?;
+        sessions_in(&conn, session)
     }
 
     fn preview_selected(&self, selector: &LeaseSelector) -> Result<SelectorRevocation, AuditError> {

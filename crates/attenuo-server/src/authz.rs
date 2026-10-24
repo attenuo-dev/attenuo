@@ -2996,6 +2996,18 @@ mod run_lock_tests {
         fn subject(&self, l: &LeaseId) -> Result<Option<String>, AuditError> {
             self.inner.subject(l)
         }
+        fn record_session(
+            &self,
+            s: &str,
+            v: &str,
+            c: &LeaseId,
+            n: OffsetDateTime,
+        ) -> Result<bool, AuditError> {
+            self.inner.record_session(s, v, c, n)
+        }
+        fn sessions(&self, s: &str) -> Result<Vec<attenuo_audit::SessionBinding>, AuditError> {
+            self.inner.sessions(s)
+        }
         fn preview_selected(
             &self,
             s: &attenuo_audit::LeaseSelector,

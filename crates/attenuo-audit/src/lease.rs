@@ -103,6 +103,26 @@ pub trait LeaseStore: Send + Sync {
         Ok(out)
     }
 
+    /// Record that the MCP session whose id hashes to `session` was opened through the proxy
+    /// to upstream `server` by a caller of the chain `chain_id` (the lease of the chain's
+    /// first hop), at `now`, so [`LeaseSelector::Session`] can find the chain. `session` is the
+    /// SHA-256 of the `Mcp-Session-Id` in lowercase hex (`attenuo_proxy::session::session_digest`;
+    /// the audit tag of the session is its first 12 characters): raw session ids are never
+    /// stored. Write-once per `(session, server)`: returns `true` when the binding is new and
+    /// `false` when one was already recorded, whatever its chain, which is then kept. An
+    /// unknown `chain_id` is [`AuditError::UnknownLease`].
+    fn record_session(
+        &self,
+        session: &str,
+        server: &str,
+        chain_id: &LeaseId,
+        now: OffsetDateTime,
+    ) -> Result<bool, AuditError>;
+
+    /// The bindings [`record_session`](Self::record_session) recorded for the session digest
+    /// `session`, ordered by server; empty for an unknown session.
+    fn sessions(&self, session: &str) -> Result<Vec<SessionBinding>, AuditError>;
+
     /// What [`revoke_selected`](Self::revoke_selected) would do now, without writing:
     /// `matched` is every unrevoked lease the selector names, `revoked` every unrevoked lease
     /// a revocation would change (the matches and their descendants). Read in one
@@ -320,6 +340,23 @@ pub enum LeaseSelector {
     /// from it. A lease that has a parent is not a chain id and matches nothing. Found
     /// through the parent links, so leases registered before subjects were recorded match.
     Chain(LeaseId),
+    /// Every lease of the chains an MCP session was opened by, as recorded by
+    /// [`LeaseStore::record_session`]: the value is the session digest (SHA-256 of the
+    /// `Mcp-Session-Id`, lowercase hex), and each bound chain is matched as
+    /// [`LeaseSelector::Chain`] matches it. A session opened through more than one upstream
+    /// can name more than one chain; an unknown session matches nothing.
+    Session(String),
+}
+
+/// One recorded session binding ([`LeaseStore::record_session`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionBinding {
+    /// The upstream server the session was opened with.
+    pub server: String,
+    /// The chain id (the lease of the chain's first hop) of the caller that opened it.
+    pub chain_id: LeaseId,
+    /// When the proxy bound it.
+    pub bound_at: OffsetDateTime,
 }
 
 /// The result of [`LeaseStore::revoke_selected`] or [`LeaseStore::preview_selected`].
@@ -520,6 +557,18 @@ fn cascade(
     changed
 }
 
+/// What [`LeaseSelector::Chain`] matches in the memory store: the unrevoked leases of the
+/// subtree of `root`, or nothing when `root` is unknown or has a parent.
+fn chain_matches(rows: &mut BTreeMap<LeaseId, LeaseRow>, root: &LeaseId) -> Vec<LeaseId> {
+    match rows.get(root) {
+        Some(r) if r.parent.is_none() => {
+            let mut visited = BTreeSet::new();
+            cascade(rows, root, None, &mut visited)
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Fold per-lease lookups into a [`LeaseStatus`].
 pub(crate) fn classify(
     leases: &[&LeaseId],
@@ -547,6 +596,8 @@ pub struct MemoryLeaseStore {
     bindings: Mutex<BTreeMap<LeaseId, String>>,
     /// The originating user's subject of each lease (`record_subject`).
     subjects: Mutex<BTreeMap<LeaseId, String>>,
+    /// Session bindings by `(session digest, server)` (`record_session`).
+    sessions: Mutex<BTreeMap<(String, String), (LeaseId, OffsetDateTime)>>,
     /// Per run, the first label of each source.
     labels: Mutex<BTreeMap<LeaseId, BTreeMap<String, RunLabel>>>,
     /// Per run, the span index (ADR-0009 phase 2).
@@ -664,13 +715,20 @@ impl MemoryLeaseStore {
                     .cloned()
                     .collect()
             }
-            LeaseSelector::Chain(root) => match rows.get(root) {
-                Some(r) if r.parent.is_none() => {
-                    let mut visited = BTreeSet::new();
-                    cascade(&mut rows, root, None, &mut visited)
-                }
-                _ => Vec::new(),
-            },
+            LeaseSelector::Chain(root) => chain_matches(&mut rows, root),
+            LeaseSelector::Session(session) => {
+                let roots: Vec<LeaseId> = self
+                    .sessions
+                    .lock()?
+                    .range((session.clone(), String::new())..)
+                    .take_while(|((s, _), _)| s == session)
+                    .map(|(_, (chain, _))| chain.clone())
+                    .collect();
+                roots
+                    .iter()
+                    .flat_map(|root| chain_matches(&mut rows, root))
+                    .collect()
+            }
         };
         let mut visited = BTreeSet::new();
         let mut changed = Vec::new();
@@ -836,6 +894,40 @@ impl LeaseStore for MemoryLeaseStore {
         Ok(leases
             .iter()
             .filter_map(|l| Some(((*l).clone(), subjects.get(*l)?.clone())))
+            .collect())
+    }
+
+    fn record_session(
+        &self,
+        session: &str,
+        server: &str,
+        chain_id: &LeaseId,
+        now: OffsetDateTime,
+    ) -> Result<bool, AuditError> {
+        let rows = self.rows.lock()?;
+        if !rows.contains_key(chain_id) {
+            return Err(AuditError::UnknownLease(chain_id.0.clone()));
+        }
+        let mut sessions = self.sessions.lock()?;
+        let key = (session.to_owned(), server.to_owned());
+        if sessions.contains_key(&key) {
+            return Ok(false);
+        }
+        sessions.insert(key, (chain_id.clone(), now));
+        Ok(true)
+    }
+
+    fn sessions(&self, session: &str) -> Result<Vec<SessionBinding>, AuditError> {
+        Ok(self
+            .sessions
+            .lock()?
+            .range((session.to_owned(), String::new())..)
+            .take_while(|((s, _), _)| s == session)
+            .map(|((_, server), (chain_id, bound_at))| SessionBinding {
+                server: server.clone(),
+                chain_id: chain_id.clone(),
+                bound_at: *bound_at,
+            })
             .collect())
     }
 
