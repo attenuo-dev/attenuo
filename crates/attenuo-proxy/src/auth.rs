@@ -327,6 +327,24 @@ pub trait Authorizer: Send + Sync {
         Uuid::new_v4()
     }
 
+    /// Record that upstream `server` assigned a new MCP session to a caller of `chain`, so
+    /// the session can later be revoked by its id (`POST /admin/leases/revoke` with
+    /// `session`). `session_digest` is [`crate::session::session_digest`] of the
+    /// `Mcp-Session-Id`, never the id. Called after the proxy bound the session (SR-11), which
+    /// happens only for a request whose token and DPoP proof verified and whose lease chain is
+    /// live, so an unauthenticated caller cannot cause a write (SR-18). Best effort: the
+    /// session is already in use when this runs, and an implementation logs its own failures.
+    /// The default records nothing.
+    async fn record_session(
+        &self,
+        chain: &DelegationChain,
+        server: &str,
+        session_digest: &str,
+        now: OffsetDateTime,
+    ) {
+        let _ = (chain, server, session_digest, now);
+    }
+
     /// Record the upstream's answer to an allowed mediated call (`tools/call`,
     /// `resources/read`, `prompts/get`, `completion/complete`) before the proxy relays it
     /// (output labelling, ADR-0009). `result` is the JSON-RPC `result` member, or the `error`

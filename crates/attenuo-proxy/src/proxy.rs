@@ -37,7 +37,9 @@ use crate::label::{
     label_stream, AwaitedResults, Labeller, PendingResult, ResultScope, LABELLED_METHODS,
 };
 use crate::listed::ListedTools;
-use crate::session::{session_tag, BindOutcome, SessionCheck, SessionOwner, SessionRegistry};
+use crate::session::{
+    session_digest, session_tag, BindOutcome, SessionCheck, SessionOwner, SessionRegistry,
+};
 use crate::stage::Stage;
 
 /// Response header carrying the decision record id(s) of every `tools/call` in the request,
@@ -508,6 +510,19 @@ async fn adopt_session(
     }
 }
 
+/// After [`adopt_session`]: the digest of the session id the response still carries when the
+/// request did not carry it (an `initialize` the upstream answered with a new session that
+/// the proxy bound to the caller), for [`Authorizer::record_session`], so the session can be
+/// revoked by id. A session id that was refused has been removed from the response by then,
+/// so only a binding the proxy made is recorded, and only for a caller whose token verified.
+fn new_session_digest(requested: Option<&str>, response: &Response) -> Option<String> {
+    if !response.status().is_success() {
+        return None;
+    }
+    let sid = header_str(response.headers(), HEADER_MCP_SESSION_ID)?;
+    (requested != Some(sid)).then(|| session_digest(sid))
+}
+
 /// End, at the upstream, a session the proxy refused to bind (SR-49): the MCP `DELETE` with
 /// its `Mcp-Session-Id`. Best effort: a failure or a timeout is logged, and the refusal stands.
 async fn delete_upstream_session(state: &AppState, upstream: &str, session_id: &str) {
@@ -891,6 +906,12 @@ async fn handle_post(
         )
         .await;
         adopt_session(&state, upstream, owner.as_ref(), &mut response).await;
+        if let Some(digest) = new_session_digest(session_id.as_deref(), &response) {
+            state
+                .authorizer
+                .record_session(&who.chain, &server, &digest, now)
+                .await;
+        }
         if timing.decided {
             report_post_timing(&state, &timing, started);
         }

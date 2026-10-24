@@ -268,10 +268,17 @@ impl SessionRegistry {
     }
 }
 
+/// The SHA-256 of a session id, in lowercase hex: what the server stores to find the chain
+/// that opened a session (`LeaseStore::record_session`), so a raw session id is never stored.
+/// [`session_tag`] is its first 12 characters.
+pub fn session_digest(session_id: &str) -> String {
+    hex::encode(Sha256::digest(session_id.as_bytes()))
+}
+
 /// A short, stable tag for a session id that is safe to log: the first 12 hex characters of
-/// its SHA-256.
+/// its SHA-256 ([`session_digest`]).
 pub fn session_tag(session_id: &str) -> String {
-    let mut s = hex::encode(Sha256::digest(session_id.as_bytes()));
+    let mut s = session_digest(session_id);
     s.truncate(12);
     s
 }
