@@ -111,7 +111,7 @@ print(ev.decision, ev.reason, ev.policy_ids)  # no lease check, no audit record
 | `lease_tree(lease_id, max_nodes=None)` | `GET /admin/leases/{id}/tree` | `LeaseTree(root, ancestors, nodes, would_revoke, truncated)` |
 | `policies()` | `GET /admin/policies` | `PolicySet(path, sha256, loaded_at, policy_ids, warnings, policies)` |
 | `policy_check()` | `GET /admin/policies/check` | `PolicyCheck(ok, issues, differs_from_loaded, ...)` |
-| `policy_evaluate(server, tool, arguments=None, *, token=None, chain=None)` | `POST /admin/policies/evaluate` | `PolicyEvaluation(decision, reason, policy_ids, ..., token_expired)`; `.allowed` |
+| `policy_evaluate(server, tool, arguments=None, *, token=None, chain=None, budget=None)` | `POST /admin/policies/evaluate` | `PolicyEvaluation(decision, reason, policy_ids, ..., token_expired, budget, limit, labels, usage, approval_by)`; `.allowed` |
 | `approvals(chain_id=None, *, state=None, limit=None)` | `GET /admin/approvals` | `list[Approval]`, newest first |
 | `approval(approval_id)` | `GET /admin/approvals/{id}` | `Approval` |
 | `grant_approval(approval_id)`, `decline_approval(approval_id)` | `POST /admin/approvals/{id}` | `Approval` after the decision (`by = \"operator\"`); `ApiError` 409 when it is no longer pending |
@@ -124,6 +124,28 @@ print(ev.decision, ev.reason, ev.policy_ids)  # no lease check, no audit record
 denied = list(admin.audit_export(tool="token.exchange", decision="deny"))
 assert denied[0]["filter"] == {"tool": "token.exchange", "decision": "deny"}
 ```
+
+### Admin: a dry run with a stated budget
+
+`policy_evaluate` reads the run's limit counters from the store unless you state them. `budget=` takes a `StatedBudget` (or the raw block as a dict) in the vocabulary of a `policy test` case's `budget`: `calls_remaining`, `amount_remaining`, `destination_new`, `limited`, and `limits`, single counters as `BudgetLimit(hop, kind, used, arg=None, max=None)`. Members left `None` are not sent. The server checks the counters with the same code a live call goes through, never touches the store and writes no audit record; a malformed block is its 400 `invalid_request`, raised as `ApiError`.
+
+```python
+from attenuo import BudgetLimit, StatedBudget
+
+# The coder's token carries a `distinct` limit of one `repo` at hop 1. Is a second repo refused?
+ev = admin.policy_evaluate(
+    "github",
+    "read_file",
+    {"repo": "alice/other"},
+    token=coder,
+    budget=StatedBudget(limits=[BudgetLimit(hop=1, kind="distinct", arg="repo", used=1)]),
+)
+assert ev.reason == "budget_exhausted"
+print(ev.limit)  # BudgetLimit(hop=1, kind='distinct', used=1, arg='repo', max=1)
+print(ev.budget.source)  # "request"; "store" when no budget was stated
+```
+
+The answer's `budget` is an `EvaluationBudget(limited, calls_remaining, amount_remaining, destination_new, source)`, where a remaining figure is `2**63 - 1` when no limit of that kind matches. `limit` is set only on `budget_exhausted` and has the `BudgetLimit` shape, so it can be stated back as it came. `labels` (the run's output labels), `usage` (`context.usage`) and `approval_by` complete the picture the policy saw.
 
 ### Admin: revoking by user, chain or session
 
@@ -143,7 +165,7 @@ print(r.matched_count, r.revoked_count, r.audit_id)
 | `chain_id` | that chain's first-hop lease and everything delegated from it (a lease with a parent matches nothing) |
 | `session` | the raw `Mcp-Session-Id`; the server hashes it and revokes, as `chain_id`, each chain that opened the session through the proxy |
 
-It returns a `SelectorRevocation`: `selector` (as the server shows it), `preview`, `matched`, `revoked` (matches first, then the cascade; each list cut at 10,000 ids, `truncated` says so), `matched_count`, `revoked_count`, `reason` and `audit_id`. With `preview=True` nothing changes and no audit record is written; `revoked` is what a revocation sent now would change, and `reason` and `audit_id` are `None`. Matching nothing is not an error: the lists come back empty, also for a session the server never recorded. The SDK never logs the session id and no error message it raises contains it. `revoke_lease(lease_id)` still revokes one lease by id. See [Revoke by user or chain](https://github.com/attenuo-dev/attenuo/blob/main/docs/reference/http-api.md#revoke-by-user-or-chain) for the server side.
+It returns a `SelectorRevocation`: `selector` (as the server shows it), `preview`, `matched`, `revoked` (matches first, then the cascade; each list cut at 10,000 ids, `truncated` says so), `matched_count`, `revoked_count`, `reason` and `audit_id`. With `preview=True` nothing changes and no audit record is written; `revoked` is what a revocation sent now would change, and `reason` and `audit_id` are `None`. Matching nothing is not an error: the lists come back empty, also for a session the server never recorded. The SDK never logs the session id and no error message it raises contains it. `revoke_lease(lease_id)` still revokes one lease by id; its `RevokeResult` carries the `audit_id` of the `admin.lease.revoke` record (`None` when the server could not write it). See [Revoke by user or chain](https://github.com/attenuo-dev/attenuo/blob/main/docs/reference/http-api.md#revoke-by-user-or-chain) for the server side.
 
 ### Capabilities
 

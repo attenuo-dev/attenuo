@@ -17,11 +17,19 @@ const MAX_PAGE = 1000;
 
 type Json = Record<string, unknown>;
 
+/**
+ * The answer of `revokeLease`. `auditId` is the id of the `admin.lease.revoke` record,
+ * `undefined` when the server could not write it (the revocation stands).
+ */
 export interface RevokeResult {
   leaseId: string;
   revoked: number;
   reason: string;
+  auditId: string | undefined;
 }
+
+/** What a decision record says, and what the audit filters take: the server's `Decision`. */
+export type Decision = "allow" | "deny";
 
 /**
  * Exactly one selector for `revokeBySelector`: an originating user's `sub` (any issuer), a
@@ -70,7 +78,7 @@ export interface AuditExportFilter {
   chainId?: string;
   /** The record's `tool`, for example `token.exchange`. */
   tool?: string;
-  decision?: "allow" | "deny";
+  decision?: Decision;
 }
 
 export interface LeaseStatus {
@@ -144,8 +152,7 @@ export interface AuditQuery {
   limit?: number;
   /** One kind or several: `decision`, `exchange`, `root_token`, `lease_renew`, `lease_revoke`, `admin`. */
   kind?: string | readonly string[];
-  /** `allow` or `deny`. */
-  decision?: string;
+  decision?: Decision;
   reason?: string;
   /** The record's `originating_subject`. */
   subject?: string;
@@ -293,10 +300,86 @@ export interface PolicyCheck {
   policyIds: string[];
 }
 
-/** A dry-run decision from `policyEvaluate`. */
+export type LimitKind = "calls" | "sum" | "calls_per" | "distinct";
+
+/**
+ * One run-limit counter: `hop` (position in the chain, root 0), `kind`, `arg` (the counted
+ * argument as the limit names it, `arg#host` for a derived one; absent for `calls`), `used`
+ * (calls or summed amount; for `calls_per` the calls with this value; for `distinct` how many
+ * values the limit has seen) and `max`.
+ *
+ * The `limit` of a `budget_exhausted` dry run has this shape, and so does an entry of
+ * `StatedBudget.limits`, where `max` is optional (when given it must equal the limit's). The
+ * SDK sends entries as given, so a refusal's `limit` can be stated back as it came.
+ */
+export interface BudgetLimit {
+  hop: number;
+  kind: LimitKind;
+  arg?: string;
+  used: number;
+  max?: number;
+}
+
+/**
+ * The run-limit state a dry run decides the call in, instead of the store's counters (the
+ * `budget` block of `POST /admin/policies/evaluate`, in the vocabulary of a `policy test`
+ * case's `budget`). Members left out are not sent. The server checks the block: a malformed
+ * one, or an entry that names no limit of the chain matching the call, is its 400
+ * `invalid_request`.
+ */
+export interface StatedBudget {
+  /** What every matching `calls` limit has left. */
+  callsRemaining?: number;
+  /** What every matching `sum` limit has left. */
+  amountRemaining?: number;
+  /** `false`: the call's value was already counted by each matching `calls_per` and `distinct` limit. */
+  destinationNew?: boolean;
+  /** `context.budget.limited` when no limit of the chain matches the call (server default `true`). */
+  limited?: boolean;
+  /** At most 64 single counters, over the figures above. */
+  limits?: readonly BudgetLimit[];
+}
+
+/**
+ * `context.budget` of a dry run: what the run limits matching the call have left.
+ * `callsRemaining` and `amountRemaining` are `Infinity` when no limit of that kind matches (the
+ * server sends `2^63 - 1`, which a JavaScript number cannot hold).
+ */
+export interface EvaluationBudget {
+  limited: boolean;
+  callsRemaining: number;
+  amountRemaining: number;
+  destinationNew: boolean;
+  /** `store`: the run's counters as they stand (read, never charged); `request`: as stated. */
+  source: "store" | "request";
+}
+
+/** The run's output labels the dry run decided with (ADR-0009). */
+export interface EvaluationLabels {
+  tainted: boolean;
+  taintedBy: string[];
+  argsContainUntrusted: boolean;
+  untrustedArgs: string[];
+  source: "store" | "request";
+}
+
+/** `context.usage` of a dry run. */
+export interface EvaluationUsage {
+  calls: number;
+  amount: number;
+  destinationSeen: boolean;
+  /** `untracked`: the server keeps no run usage, so the zeros are not a reading of the run. */
+  source: "request" | "store" | "untracked";
+}
+
+/**
+ * A dry-run decision from `policyEvaluate`. `limit` is set when the call would take a run limit
+ * past its `max` (reason `budget_exhausted`). `budget`, `labels` and `usage` are `undefined`
+ * only for a server that does not send them; `approvalBy` is the `by` of the granted approval
+ * the call was evaluated with.
+ */
 export interface PolicyEvaluation {
-  /** `allow` or `deny`. */
-  decision: string;
+  decision: Decision;
   allowed: boolean;
   reason: string;
   policyIds: string[];
@@ -306,6 +389,11 @@ export interface PolicyEvaluation {
   /** `token` or `admin_supplied`. */
   chainSource: string;
   tokenExpired: boolean;
+  budget?: EvaluationBudget;
+  limit?: BudgetLimit;
+  labels?: EvaluationLabels;
+  usage?: EvaluationUsage;
+  approvalBy?: string;
 }
 
 export interface PolicyEvaluateOptions {
@@ -313,6 +401,8 @@ export interface PolicyEvaluateOptions {
   token?: Token | string;
   /** A chain object instead of a token, checked only structurally. */
   chain?: Json;
+  /** The run-limit counters to decide in, instead of the store's (`budget.source: "request"`). */
+  budget?: StatedBudget;
 }
 
 /** Filters for `approvals`. */
@@ -471,6 +561,93 @@ function budgetOf(v: unknown): LeaseBudget | undefined {
   };
 }
 
+function statedBudgetJson(b: StatedBudget): Json {
+  const out: Json = {};
+  if (b.callsRemaining !== undefined) out.calls_remaining = b.callsRemaining;
+  if (b.amountRemaining !== undefined) out.amount_remaining = b.amountRemaining;
+  if (b.destinationNew !== undefined) out.destination_new = b.destinationNew;
+  if (b.limited !== undefined) out.limited = b.limited;
+  if (b.limits !== undefined && b.limits.length > 0) {
+    out.limits = b.limits.map((l) => {
+      const e: Json = { hop: l.hop, kind: l.kind, used: l.used };
+      if (l.arg !== undefined) e.arg = l.arg;
+      if (l.max !== undefined) e.max = l.max;
+      return e;
+    });
+  }
+  return out;
+}
+
+/** A remaining figure; `2^63 - 1` (no limit of that kind) parses past the safe range. */
+function remaining(v: unknown): number {
+  if (typeof v !== "number") return 0;
+  return Number.isSafeInteger(v) ? v : Infinity;
+}
+
+function obj(v: unknown): Json | undefined {
+  return typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Json) : undefined;
+}
+
+function budgetLimitOf(v: unknown): BudgetLimit | undefined {
+  const l = obj(v);
+  if (!l) return undefined;
+  const out: BudgetLimit = {
+    hop: Number(l.hop),
+    kind: String(l.kind) as LimitKind,
+    used: Number(l.used),
+  };
+  if (typeof l.arg === "string") out.arg = l.arg;
+  if (typeof l.max === "number") out.max = l.max;
+  return out;
+}
+
+function evaluationOf(b: Json): PolicyEvaluation {
+  const out: PolicyEvaluation = {
+    decision: (b.decision === "allow" ? "allow" : "deny") as Decision,
+    allowed: b.decision === "allow",
+    reason: String(b.reason ?? ""),
+    policyIds: strs(b.policy_ids),
+    diagnostics: Array.isArray(b.diagnostics) ? b.diagnostics : [],
+    leaseCheck: String(b.lease_check ?? ""),
+    chainSource: String(b.chain_source ?? ""),
+    tokenExpired: b.token_expired === true,
+  };
+  const budget = obj(b.budget);
+  if (budget) {
+    out.budget = {
+      limited: budget.limited === true,
+      callsRemaining: remaining(budget.calls_remaining),
+      amountRemaining: remaining(budget.amount_remaining),
+      destinationNew: budget.destination_new === true,
+      source: String(budget.source ?? "") as EvaluationBudget["source"],
+    };
+  }
+  const limit = budgetLimitOf(b.limit);
+  if (limit) out.limit = limit;
+  const session = obj(b.session);
+  if (session) {
+    out.labels = {
+      tainted: session.tainted === true,
+      taintedBy: strs(session.tainted_by).map(String),
+      argsContainUntrusted: session.args_contain_untrusted === true,
+      untrustedArgs: strs(session.untrusted_args).map(String),
+      source: String(session.source ?? "") as EvaluationLabels["source"],
+    };
+  }
+  const usage = obj(b.usage);
+  if (usage) {
+    out.usage = {
+      calls: Number(usage.calls ?? 0),
+      amount: Number(usage.amount ?? 0),
+      destinationSeen: usage.destination_seen === true,
+      source: String(usage.source ?? "") as EvaluationUsage["source"],
+    };
+  }
+  const approval = obj(b.approval);
+  if (approval?.present === true) out.approvalBy = String(approval.by ?? "");
+  return out;
+}
+
 function leaseNodes(v: unknown): LeaseNode[] {
   return Array.isArray(v) ? (v as Json[]).map(leaseNodeOf) : [];
 }
@@ -537,7 +714,12 @@ export class AdminClient {
       json: reason ? { reason } : {},
     });
     const b = w.asObject(await w.jsonBody(res), "revoke");
-    return { leaseId: String(b.lease_id), revoked: Number(b.revoked), reason: String(b.reason) };
+    return {
+      leaseId: String(b.lease_id),
+      revoked: Number(b.revoked),
+      reason: String(b.reason),
+      auditId: b.audit_id == null ? undefined : String(b.audit_id),
+    };
   }
 
   /**
@@ -805,8 +987,11 @@ export class AdminClient {
   }
 
   /**
-   * Dry run: what the loaded policies decide for this call. No lease check, no audit record.
-   * Pass `opts.token` (verified by the server) or `opts.chain` (checked only structurally).
+   * Dry run: what the loaded policies decide for this call. No lease check, no charge, no audit
+   * record. Pass `opts.token` (verified by the server) or `opts.chain` (checked only
+   * structurally). `opts.budget` states the run-limit counters to decide in instead of the
+   * store's; a spent hard limit then answers `budget_exhausted` with `limit` set, as the live
+   * call would.
    */
   async policyEvaluate(
     server: string,
@@ -822,18 +1007,9 @@ export class AdminClient {
     if (opts.chain !== undefined) {
       body.subject = { ...(body.subject as Json), properties: { chain: opts.chain } };
     }
+    if (opts.budget !== undefined) body.budget = statedBudgetJson(opts.budget);
     const res = await this.http.post("/admin/policies/evaluate", { json: body });
-    const b = w.asObject(await w.jsonBody(res), "policy evaluation");
-    return {
-      decision: String(b.decision ?? ""),
-      allowed: b.decision === "allow",
-      reason: String(b.reason ?? ""),
-      policyIds: strs(b.policy_ids),
-      diagnostics: Array.isArray(b.diagnostics) ? b.diagnostics : [],
-      leaseCheck: String(b.lease_check ?? ""),
-      chainSource: String(b.chain_source ?? ""),
-      tokenExpired: b.token_expired === true,
-    };
+    return evaluationOf(w.asObject(await w.jsonBody(res), "policy evaluation"));
   }
 
   /**

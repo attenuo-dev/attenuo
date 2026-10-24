@@ -417,6 +417,34 @@ test('policy page: loaded set, file check and a dry-run evaluation', async () =>
   assert.deepEqual(await evaluate(data.coderToken, 'alice/public-site'), ['deny', 'budget_exhausted']);
   assert.deepEqual(await evaluate(data.coderToken, 'alice/public-docs'), ['allow', 'policy_allow']);
   assert.deepEqual(await evaluate(data.rootToken, 'alice/private-salaries'), ['deny', 'policy_deny']);
+  const budgetBox = evalPanel.locator('.budget-result');
+  assert.match(await budgetBox.locator('h3 .pill').textContent(), /^read from the store$/);
+  assert.equal(await kvValue(budgetBox, 'Limited'), 'no (no limit of the chain matches the call)');
+  assert.equal(await kvValue(budgetBox, 'Calls remaining'), 'no limit');
+
+  // A stated budget instead of the store. The store holds public-docs as the coder's one repo
+  // (allowed above); stated counters that say the limit has seen one value, and not this one,
+  // refuse it, with the limit hit in the budget block.
+  await evalPanel.locator('details.budget-form summary').click();
+  await c.page.locator('#ev-budget-limits').fill(JSON.stringify([{ hop: 1, kind: 'distinct', arg: 'repo', used: 1 }]));
+  assert.deepEqual(await evaluate(data.coderToken, 'alice/public-docs'), ['deny', 'budget_exhausted']);
+  assert.match(await budgetBox.locator('h3 .pill').textContent(), /^stated in the request$/);
+  assert.equal(await kvValue(budgetBox, 'Limited'), 'yes');
+  assert.equal(await kvValue(budgetBox, 'Destination new'), 'yes');
+  assert.deepEqual(await budgetBox.locator('tbody tr td').allInnerTexts(), ['1', 'distinct', 'repo', '1', '1']);
+  // The same counters with the value already counted: public-site, over the limit in the
+  // store, passes, and nothing is exceeded.
+  await c.page.locator('#ev-budget-dest').selectOption('false');
+  assert.deepEqual(await evaluate(data.coderToken, 'alice/public-site'), ['allow', 'policy_allow']);
+  assert.equal(await kvValue(budgetBox, 'Destination new'), 'no');
+  assert.match(await budgetBox.innerText(), /No limit would be exceeded/);
+  // Input the form can tell is wrong never reaches the server.
+  await c.page.locator('#ev-budget-calls').fill('-1');
+  await c.page.getByRole('button', { name: 'Evaluate' }).click();
+  await evalPanel.locator('.callout.bad', { hasText: 'Calls remaining must be a whole number' }).waitFor();
+  await c.page.locator('#ev-budget-calls').fill('');
+  // Shown in both themes with the budget form open and a stated answer on screen.
+  assert.deepEqual(await evaluate(data.coderToken, 'alice/public-site'), ['allow', 'policy_allow']);
   await bothThemes('policy');
 });
 
