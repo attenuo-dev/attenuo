@@ -1,10 +1,13 @@
-//! `attenuo lease revoke --user | --chain-id [--preview]` against a real server.
+//! `attenuo lease revoke --user | --chain-id | --session [--preview]` against a real server.
 
 // Configs are built field by field from `Config::default()`, as in the server tests.
 #![allow(clippy::field_reassign_with_default)]
 
 use std::process::{Command, Output};
 
+use attenuo_audit::LeaseStore;
+use attenuo_core::LeaseId;
+use attenuo_proxy::session::{session_digest, session_tag};
 use attenuo_proxy::testing::spawn_router;
 use attenuo_server::config::AgentConfig;
 use attenuo_server::Config;
@@ -45,7 +48,7 @@ fn ok(out: &Output) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn lease_revoke_by_user_and_by_chain() {
+async fn lease_revoke_by_user_by_chain_and_by_session() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = Config::default();
     cfg.issuer.private_key_pem_path = Some(dir.path().join("issuer.pem"));
@@ -63,7 +66,7 @@ async fn lease_revoke_by_user_and_by_chain() {
             hex::encode(sha2::Sha256::digest(b"coder-secret"))
         },
     }];
-    let (router, _state) = attenuo_server::build(&cfg).unwrap();
+    let (router, state) = attenuo_server::build(&cfg).unwrap();
     let server = spawn_router(router).await.unwrap();
     let url = server.url("").trim_end_matches('/').to_string();
     let admin = || {
@@ -73,7 +76,7 @@ async fn lease_revoke_by_user_and_by_chain() {
     };
 
     let mut minted = Vec::new();
-    for subject in ["alice", "bob"] {
+    for subject in ["alice", "bob", "carol"] {
         let mut c = admin();
         c.args(["--json", "token", "root", "--subject", subject])
             .args(["--agent", "planner", "--cap", "github:*"]);
@@ -133,9 +136,71 @@ async fn lease_revoke_by_user_and_by_chain() {
     assert!(text.contains("reason    revoked by admin\n"), "{text}");
     assert!(text.contains("audit     "), "{text}");
 
-    // The per-lease form still takes an id, and refuses an id with a selector.
+    // By session: carol's chain opened a session through the proxy (bound here as the proxy
+    // binds it, by digest). An unknown session resolves to no chain.
+    let (carol_root, carol_child) = &minted[2];
+    let sid = "cli-test-session-1";
+    let bound = state
+        .leases
+        .record_session(
+            &session_digest(sid),
+            "github",
+            &LeaseId::new(carol_root),
+            time::OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+    assert!(bound);
     let mut c = admin();
-    c.args(["lease", "revoke", alice_root, "--user", "alice"]);
-    assert_eq!(run(c).await.status.code(), Some(2), "clap usage error");
+    c.args(["lease", "revoke", "--session", sid, "--preview"]);
+    let text = ok(&run(c).await);
+    assert!(text.starts_with("preview: nothing was changed\n"), "{text}");
+    assert!(
+        text.contains(&format!("selector  session {}\n", session_tag(sid))),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("chains    {carol_root}\n")),
+        "{text}"
+    );
+    assert!(text.contains("would revoke 2 lease(s)\n"), "{text}");
+    assert!(
+        !text.contains(sid),
+        "the raw session id is not echoed: {text}"
+    );
+    let mut c = admin();
+    c.args(["lease", "revoke", "--session", "never-seen", "--preview"]);
+    let text = ok(&run(c).await);
+    assert!(
+        text.contains("chains    none recorded for this session\n"),
+        "{text}"
+    );
+    assert!(text.contains("matched   0 lease(s)\n"), "{text}");
+    let mut c = admin();
+    c.args(["--json", "lease", "revoke", "--session", sid])
+        .args(["--reason", "session hijacked"]);
+    let v: Value = serde_json::from_str(&ok(&run(c).await)).unwrap();
+    assert_eq!(v["revoked_count"], 2, "{v}");
+    assert_eq!(v["selector"]["chain_ids"][0], carol_root.as_str(), "{v}");
+    assert!(v["audit_id"].is_string(), "{v}");
+    let mut c = admin();
+    c.args(["--json", "lease", "show", carol_child]);
+    let show: Value = serde_json::from_str(&ok(&run(c).await)).unwrap();
+    assert_eq!(show["active"], false, "{show}");
+
+    // The per-lease form still takes an id, and refuses an id with a selector; selectors
+    // exclude each other.
+    for args in [
+        &["lease", "revoke", alice_root, "--user", "alice"][..],
+        &["lease", "revoke", alice_root, "--session", sid],
+        &["lease", "revoke", "--session", sid, "--chain-id", bob_root],
+    ] {
+        let mut c = admin();
+        c.args(args);
+        assert_eq!(
+            run(c).await.status.code(),
+            Some(2),
+            "clap usage error: {args:?}"
+        );
+    }
     drop(server);
 }

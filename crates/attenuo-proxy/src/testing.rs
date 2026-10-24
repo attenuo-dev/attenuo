@@ -470,7 +470,8 @@ pub type ObservedHints = (String, String, Option<bool>, Option<bool>);
 /// Results the proxy reports ([`Authorizer::record_result`]) are kept
 /// ([`recorded_results`](Self::recorded_results)) and can be made to fail
 /// ([`fail_results`](Self::fail_results)); tool annotations are kept too
-/// ([`observed_hints`](Self::observed_hints)).
+/// ([`observed_hints`](Self::observed_hints)), and so are new sessions
+/// ([`recorded_sessions`](Self::recorded_sessions)).
 #[derive(Default)]
 pub struct StaticAuthorizer {
     chains: HashMap<String, DelegationChain>,
@@ -482,7 +483,12 @@ pub struct StaticAuthorizer {
     hints: Arc<Mutex<Vec<ObservedHints>>>,
     ask_for: std::collections::HashSet<String>,
     contexts: Arc<Mutex<Vec<crate::auth::CallContext>>>,
+    sessions: Arc<Mutex<Vec<RecordedSession>>>,
 }
+
+/// A session reported through [`Authorizer::record_session`] to a [`StaticAuthorizer`]:
+/// the root lease of the chain, the server and the session digest.
+pub type RecordedSession = (attenuo_core::LeaseId, String, String);
 
 /// A result reported through [`Authorizer::record_result`] to a [`StaticAuthorizer`].
 #[derive(Debug, Clone, PartialEq)]
@@ -566,6 +572,11 @@ impl StaticAuthorizer {
     pub fn fail_results(&self, fail: bool) {
         self.fail_results
             .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Every session reported through [`Authorizer::record_session`], in order.
+    pub fn recorded_sessions(&self) -> Vec<RecordedSession> {
+        self.sessions.lock().expect("sessions mutex").clone()
     }
 
     /// Every tool annotation reported through [`Authorizer::observe_tool_hints`], as
@@ -691,6 +702,24 @@ impl Authorizer for StaticAuthorizer {
         let id = record.id;
         self.decisions.lock().expect("decisions mutex").push(record);
         id
+    }
+
+    async fn record_session(
+        &self,
+        chain: &DelegationChain,
+        server: &str,
+        session_digest: &str,
+        _now: OffsetDateTime,
+    ) {
+        let root = chain
+            .hops
+            .first()
+            .map_or_else(|| attenuo_core::LeaseId::new(""), |h| h.lease.clone());
+        self.sessions.lock().expect("sessions mutex").push((
+            root,
+            server.to_owned(),
+            session_digest.to_owned(),
+        ));
     }
 
     async fn record_result(

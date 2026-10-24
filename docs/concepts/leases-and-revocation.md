@@ -38,8 +38,9 @@ During an incident you may know the user or the run rather than a lease. `POST /
 
 - `--user alice@example.com` revokes every lease issued for that originating user, across all of their runs. The server records each lease's user when it issues the token. Leases issued by an older server have no recorded user and are not matched.
 - `--chain-id <id>` revokes one run: the root lease named by the `chain_id` of its audit records, and everything below it.
+- `--session <id>` revokes the run that opened one MCP session through the proxy. When the proxy binds a new session for a verified token, the server records the session id's SHA-256 with the run's `chain_id`; the admin gives the raw id, the server hashes it and revokes that run as `--chain-id` would. Sessions opened before the server kept these records are not found.
 
-Each match is revoked with its descendants, in one transaction, and expired but unrevoked leases are included, since a renewal could otherwise bring them back. Add `--preview` first to see the list without changing anything. The answer lists every revoked lease, and one `admin.lease.revoke` audit record names them (the first 256, with the full count in its digested arguments). Revoking by MCP session is not supported yet: find the session's `chain_id` in the audit log and revoke that run.
+Each match is revoked with its descendants, in one transaction, and expired but unrevoked leases are included, since a renewal could otherwise bring them back. Add `--preview` first to see the list without changing anything. The answer lists every revoked lease, and one `admin.lease.revoke` audit record names them (the first 256, with the full count in its digested arguments, which also name the selector and, for a session, the resolved `chain_id`).
 
 ## Two speeds
 
@@ -51,7 +52,8 @@ So "within one lease interval" is the worst case for a silent holder. For a deli
 ## Cost and limits
 
 - Each request does a registry lookup. A shared or remote registry would add latency and a failure mode. It would still fail closed.
-- Revocation is by lease id only. Revoking by user, session or chain is on the task board.
+- Revocation names leases: by id, or by a selector (user, chain, session) that the server resolves to leases at the time of the call. Leases issued after the call are not covered; a user's next root token is stopped at the IdP, not here.
+- A session id resolves only through the server's own record of it, written when the proxy bound the session. A session opened through another server that does not share the store is not found.
 - An external enforcement point that uses the AuthZEN endpoint learns about revocation only by asking. There is no push channel. See [Enforcement points](enforcement-points.md).
 - A renewal refused after its token verified (a revoked, expired or unknown lease) is a `deny` record of `lease.renew` with the lease reason, and the error carries its `decision_id`. A token that does not verify leaves only a server log line.
 

@@ -332,7 +332,7 @@ async fn exactly_one_selector_is_required() {
         (json!({"chain_id": ""}), "invalid_request"),
         (json!({"user": "alice", "lease": "x"}), "invalid_request"),
         (json!({"user": 7}), "invalid_request"),
-        (json!({"session": "s1"}), "unsupported_selector"),
+        (json!({"session": ""}), "invalid_request"),
     ] {
         let resp = h.post("", &body).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");

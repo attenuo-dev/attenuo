@@ -27,6 +27,7 @@ use crate::error::ApiError;
 use crate::metrics::RefundSource;
 use crate::state::AppState;
 use attenuo_core::Decision;
+use attenuo_proxy::session::{session_digest, session_tag};
 use sha2::Digest;
 
 /// Largest page `GET /admin/audit` returns.
@@ -146,7 +147,8 @@ pub struct SelectorRevokeBody {
     /// A delegation chain id: the lease of the chain's first hop.
     #[serde(default)]
     pub chain_id: Option<String>,
-    /// Not supported yet; refused with 400 `unsupported_selector`.
+    /// An MCP session id (`Mcp-Session-Id`), as the client or upstream saw it. The server
+    /// hashes it and resolves it to the chains that opened it through the proxy.
     #[serde(default)]
     pub session: Option<String>,
     #[serde(default)]
@@ -199,13 +201,33 @@ fn selector_of(body: &SelectorRevokeBody) -> Result<(LeaseSelector, Value), ApiE
             json!({ "chain_id": chain }),
         ));
     }
-    // An MCP session is bound to its chain's root lease (SR-11), but the binding lives only
-    // in the proxy's memory and the audit log carries a hash tag of the id, not the id.
-    Err(ApiError::bad_request(
-        "unsupported_selector",
-        "revoking by session is not supported yet; revoke the session's chain with `chain_id` \
-         (the `chain_id` of the session's audit records)",
+    let session = body.session.as_deref().unwrap_or_default();
+    non_empty("session", session)?;
+    // The raw id is a secret that grants use of the session: only its digest is looked up,
+    // and only its audit tag is shown (the resolved chains are added by the caller).
+    Ok((
+        LeaseSelector::Session(session_digest(session)),
+        json!({ "session_tag": session_tag(session) }),
     ))
+}
+
+/// For a session selector, add the chains the session resolves to (`chain_ids`, ordered by
+/// server, one per upstream the session was opened with) to how the response shows it.
+fn resolve_shown(
+    state: &AppState,
+    selector: &LeaseSelector,
+    shown: &mut Value,
+) -> Result<(), AuditError> {
+    if let LeaseSelector::Session(digest) = selector {
+        let chains: Vec<LeaseId> = state
+            .leases
+            .sessions(digest)?
+            .into_iter()
+            .map(|b| b.chain_id)
+            .collect();
+        shown["chain_ids"] = json!(chains);
+    }
+    Ok(())
 }
 
 /// The response of `POST /admin/leases/revoke`, each list cut at
@@ -236,8 +258,8 @@ fn selector_response(
     }))
 }
 
-/// `POST /admin/leases/revoke[?preview=true]` with `{"user": "..."}` or
-/// `{"chain_id": "..."}` (exactly one) and an optional `"reason"`: revoke every unrevoked
+/// `POST /admin/leases/revoke[?preview=true]` with `{"user": "..."}`, `{"chain_id": "..."}`
+/// or `{"session": "..."}` (exactly one) and an optional `"reason"`: revoke every unrevoked
 /// lease the selector names, each with the descendant cascade of
 /// `POST /admin/leases/{id}/revoke`, in one transaction. An expired lease is matched too,
 /// since `POST /token/renew` could bring it back while its token is valid.
@@ -247,7 +269,12 @@ fn selector_response(
 ///   not matched; revoke them by `chain_id` or by id.
 /// - `chain_id` matches that chain's first-hop lease and everything delegated from it. A
 ///   lease with a parent is not a chain id and matches nothing.
-/// - `session` is refused with 400 `unsupported_selector` (not supported yet).
+/// - `session` takes a raw MCP session id, hashes it ([`session_digest`]) and matches, as
+///   `chain_id` would, the chain of each caller that opened the session through the proxy
+///   (`LeaseStore::record_session`, written when the proxy binds a new session for a verified
+///   token). The response's `selector` is `{session_tag, chain_ids}`: the session's audit
+///   tag and the resolved chains, never the id. A session the server never recorded (unknown,
+///   or opened before this route existed) resolves to no chain and matches nothing.
 ///
 /// Answers `{selector, preview, matched, revoked, matched_count, revoked_count, truncated,
 /// reason, audit_id}`: `matched` the leases the selector named, `revoked` every lease that
@@ -271,13 +298,14 @@ pub async fn revoke_by_selector(
     } else {
         super::parse_json(&body)?
     };
-    let (selector, shown) = selector_of(&body)?;
+    let (selector, mut shown) = selector_of(&body)?;
     let reason = body
         .reason
         .unwrap_or_else(|| "revoked by admin".to_string());
     let now = now();
     state
         .blocking(move |state| {
+            resolve_shown(state, &selector, &mut shown)?;
             if q.preview {
                 let out = state.leases.preview_selected(&selector)?;
                 return Ok(selector_response(shown, &out, None, None));
@@ -286,7 +314,7 @@ pub async fn revoke_by_selector(
             let revoked = out.revoked.len() as u64;
             state.metrics.leases_revoked(revoked);
             tracing::warn!(
-                selector = ?selector,
+                selector = %shown,
                 reason = ?reason,
                 matched = out.matched.len(),
                 revoked,

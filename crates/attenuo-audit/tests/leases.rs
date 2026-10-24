@@ -1,11 +1,11 @@
-//! Lease registry: register, revoke with cascade, revoke by user or chain, expiry,
+//! Lease registry: register, revoke with cascade, revoke by user, chain or session, expiry,
 //! unknown-fails-closed, persistence.
 
 mod common;
 
 use attenuo_audit::{
     AuditError, AuditSink, LeaseNode, LeaseSelector, LeaseStatus, LeaseStore, LeaseSubtree,
-    MemoryLeaseStore, SqliteAudit, SqliteLeaseStore,
+    MemoryLeaseStore, SessionBinding, SqliteAudit, SqliteLeaseStore,
 };
 use attenuo_core::LeaseId;
 use attenuo_core::{Decision, DelegationChain, RecordKind};
@@ -838,4 +838,152 @@ fn sqlite_selector_revocation_persists() {
     assert_eq!(row.revoked_at, Some(t0()));
     assert_eq!(row.revoke_reason.as_deref(), Some("persist"));
     assert!(s.is_active(&id("root"), t0()).unwrap());
+}
+
+fn session(s: &str) -> LeaseSelector {
+    LeaseSelector::Session(s.into())
+}
+
+/// A session digest stand-in (the stores take any string; the proxy passes SHA-256 hex).
+const S1: &str = "5e55101100000000000000000000000000000000000000000000000000000001";
+const S2: &str = "5e55101100000000000000000000000000000000000000000000000000000002";
+
+/// A session binds once per `(session, server)`: the first chain is kept, a second bind (same
+/// or another chain) changes nothing, an unknown chain is refused, and a session opened with
+/// two upstreams resolves to both.
+#[test]
+fn session_bindings_are_write_once_per_server() {
+    for (name, s) in stores() {
+        two_users(s.as_ref());
+        assert_eq!(s.sessions(S1).unwrap(), Vec::new(), "{name}");
+        assert!(
+            s.record_session(S1, "github", &id("root"), t0()).unwrap(),
+            "{name}"
+        );
+        assert!(
+            !s.record_session(S1, "github", &id("root"), t0()).unwrap(),
+            "{name}"
+        );
+        let later = t0() + Duration::minutes(1);
+        assert!(
+            !s.record_session(S1, "github", &id("broot"), later).unwrap(),
+            "{name}"
+        );
+        assert_eq!(
+            s.sessions(S1).unwrap(),
+            vec![SessionBinding {
+                server: "github".into(),
+                chain_id: id("root"),
+                bound_at: t0(),
+            }],
+            "{name}"
+        );
+        assert!(matches!(
+            s.record_session(S2, "github", &id("nope"), t0()),
+            Err(AuditError::UnknownLease(_))
+        ));
+        assert_eq!(s.sessions(S2).unwrap(), Vec::new(), "{name}");
+
+        // The same session id from another upstream is another binding.
+        assert!(
+            s.record_session(S1, "fs", &id("broot"), later).unwrap(),
+            "{name}"
+        );
+        let servers: Vec<(String, String)> = s
+            .sessions(S1)
+            .unwrap()
+            .into_iter()
+            .map(|b| (b.server, b.chain_id.0))
+            .collect();
+        assert_eq!(
+            servers,
+            [
+                ("fs".to_string(), "broot".to_string()),
+                ("github".to_string(), "root".to_string())
+            ],
+            "{name}"
+        );
+    }
+}
+
+/// A session selector revokes the chain that opened the session, exactly as the chain id
+/// would, and nothing else; an unknown session matches nothing; the preview agrees.
+#[test]
+fn revoke_by_session_revokes_the_chain_that_opened_it() {
+    for (name, s) in stores() {
+        two_users(s.as_ref());
+        s.record_session(S1, "github", &id("root"), t0()).unwrap();
+        assert!(
+            s.preview_selected(&session(S2)).unwrap().matched.is_empty(),
+            "{name}"
+        );
+        let preview = s.preview_selected(&session(S1)).unwrap();
+        assert_eq!(
+            preview,
+            s.preview_selected(&chain("root")).unwrap(),
+            "{name}"
+        );
+        assert_eq!(preview.revoked.len(), 6, "{name}");
+        assert!(s.is_active(&id("a2x"), t0()).unwrap(), "{name}");
+
+        let out = s.revoke_selected(&session(S1), "stolen", t0()).unwrap();
+        assert_eq!(out, preview, "{name}");
+        for l in ["root", "a", "a1", "a2", "a2x", "b"] {
+            assert!(!s.is_active(&id(l), t0()).unwrap(), "{name} {l}");
+        }
+        for l in ["broot", "bchild", "legacy"] {
+            assert!(s.is_active(&id(l), t0()).unwrap(), "{name} {l}");
+        }
+        let out = s.revoke_selected(&session(S1), "again", t0()).unwrap();
+        assert!(out.revoked.is_empty(), "{name}");
+        let out = s.revoke_selected(&session(S2), "x", t0()).unwrap();
+        assert!(out.matched.is_empty(), "{name}");
+    }
+}
+
+/// A session bound to two chains (through two upstreams) revokes both; one bound to a lease
+/// with a parent matches nothing, as a chain selector would.
+#[test]
+fn a_session_bound_to_two_chains_revokes_both() {
+    for (name, s) in stores() {
+        two_users(s.as_ref());
+        s.record_session(S1, "github", &id("root"), t0()).unwrap();
+        s.record_session(S1, "fs", &id("broot"), t0()).unwrap();
+        s.record_session(S2, "github", &id("a"), t0()).unwrap();
+        assert!(
+            s.preview_selected(&session(S2)).unwrap().matched.is_empty(),
+            "{name}"
+        );
+        let out = s.revoke_selected(&session(S1), "x", t0()).unwrap();
+        assert_eq!(out.revoked.len(), 8, "{name}");
+        assert!(s.is_active(&id("legacy"), t0()).unwrap(), "{name}");
+    }
+}
+
+/// A file store written before `lease_sessions` existed gains the table at open: nothing
+/// matches a session until one is recorded, and then it does; bindings survive a reopen.
+#[test]
+fn sqlite_store_from_before_sessions_gains_the_table_at_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("leases.db");
+    {
+        let s = SqliteLeaseStore::open(&path).unwrap();
+        two_users(&s);
+        s.with_connection(|c| {
+            c.execute_batch("DROP TABLE lease_sessions;")?;
+            Ok(())
+        })
+        .unwrap();
+    }
+    {
+        let s = SqliteLeaseStore::open(&path).unwrap();
+        assert_eq!(s.sessions(S1).unwrap(), Vec::new());
+        assert!(s.preview_selected(&session(S1)).unwrap().matched.is_empty());
+        assert!(s.record_session(S1, "github", &id("broot"), t0()).unwrap());
+    }
+    let s = SqliteLeaseStore::open(&path).unwrap();
+    assert_eq!(s.sessions(S1).unwrap()[0].chain_id, id("broot"));
+    assert!(!s.record_session(S1, "github", &id("root"), t0()).unwrap());
+    let out = s.revoke_selected(&session(S1), "x", t0()).unwrap();
+    assert_eq!(ids_of(&out.revoked), ["bchild", "broot"]);
 }
