@@ -21,6 +21,8 @@ Legend: **Yes** is a built-in feature. **No** means the category does not do thi
 | Self-hosted | Yes (Apache-2.0) | n/a | Yes for AgentGateway, Pomerium and Envoy (Apache-2.0) and for Kong, whose MCP plugin needs an Enterprise licence. No for AgentCore | Yes (all Apache-2.0) | No: hosted products | Yes. SPIRE is Apache-2.0; Teleport source is AGPLv3 and its free binaries are limited to companies under 100 employees and $10M revenue |
 | MCP-native | Yes for tool calls, through its proxy or the AuthZEN endpoint | Yes at the transport: MCP servers are OAuth 2.1 resource servers. Per-call decisions are left to the server or a gateway | Yes: AgentGateway, Pomerium, Kong's AI MCP Proxy and AgentCore Gateway all parse MCP. Envoy has an MCP filter that is "actively under development" | No: not in the request path (Cerbos ships a FastMCP middleware) | Partial: ID-JAG is the basis of MCP's Enterprise-Managed Authorization extension. Entra and Auth0: unknown | Teleport: yes, MCP Access. SPIRE: No |
 
+The table has no rows for two attenuo features, because we did not check the other products for them. **Run limits** cap how many calls, how much in total or how many destinations a delegation run may use, per hop and enforced before policy ([run limits](design/run-limits.md)). **Approvals** let a policy ask the user or an operator before one specific call, for example a destructive call after the run read untrusted tool output, and let exactly that call through once ([output labelling](design/output-labelling.md)). Auth0's asynchronous approval, noted below, is documented as an approval before an agent gets a token.
+
 ## Reading the columns
 
 **OAuth scopes alone.** MCP's authorization model is OAuth 2.1, and attenuo keeps it: it uses RFC 8693 token exchange and your IdP for login. What scopes lack is a slot for the human across hops, argument-level control, and a way to pull back a token mid-run. See the [FAQ](faq.md#why-not-just-use-oauth-scopes).
@@ -78,6 +80,7 @@ Further reading: [FAQ](faq.md), [related work](research/related-work.md), [stand
 
 ## Changelog
 
+- 2026-10-24 (later): Added a note under the table on attenuo's run limits and approvals, which have no row because the other products were not checked for them.
 - 2026-10-24: Re-checked every competitor claim against current primary docs and added the product notes with dated links.
   - Per-call policy: MCP gateways now allow or deny by tool name (AgentGateway, Pomerium, Kong Enterprise, Envoy's MCP filter). Was "Partial; Pomerium unknown". AgentGateway's MCP rules cannot read arguments.
   - Added Amazon Bedrock AgentCore Policy, which evaluates Cedar on tool-call arguments. This overlaps attenuo's policy stage.

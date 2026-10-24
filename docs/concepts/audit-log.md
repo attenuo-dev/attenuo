@@ -25,7 +25,9 @@ A record names the agent chain and the originating user separately. That is the 
 - the chain depth, a digest of the chain, and the lease ids,
 - the server and tool,
 - a digest of the arguments,
-- the session id and the ids of the policies that decided.
+- the session id and the ids of the policies that decided,
+- for an allowed call that matched run limits, `budget.charged`: each counter it was charged against and what it held afterwards,
+- for a call to a destructive tool, `usage`: the run's calls, amount and whether the destination was seen before, as the policy saw them (when usage is tracked).
 
 The log stores a digest of the arguments, not the arguments. Secrets and personal data in tool inputs do not end up in the log.
 
@@ -45,7 +47,7 @@ Two top-level fields let you filter and join an export without reading anything 
 | `root_token` | a root token was issued (IdP login, or the dev mint) | `token.root` |
 | `lease_renew` | a lease was renewed | `lease.renew` |
 | `lease_revoke` | a lease and its subtree were revoked with the admin bearer | `admin.lease.revoke` |
-| `admin` | any other admin action (policy reload, dev root mint) | `admin.*` |
+| `admin` | any other admin action (policy reload, budget refund, dev root mint) | `admin.*` |
 
 Checkpoints are not records, so they have no kind: they sit in their own table and appear as `checkpoint` lines in an export.
 
