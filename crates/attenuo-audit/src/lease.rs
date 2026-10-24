@@ -7,10 +7,11 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Mutex;
 
-use attenuo_core::LeaseId;
+use attenuo_core::{Charge, LeaseId};
 use time::OffsetDateTime;
 
 use crate::approval::{rules, Approval, ApprovalState, Approver};
+use crate::budget::{plan, ChargeOutcome, CounterKey, ValueKey};
 use crate::error::AuditError;
 
 /// Outcome of checking a set of leases together (typically every lease in a chain).
@@ -141,6 +142,44 @@ pub trait LeaseStore: Send + Sync {
 
     /// Delete an approval whose request could not be recorded.
     fn remove_approval(&self, id: &str) -> Result<(), AuditError>;
+
+    /// Run limits (ADR-0010): what the counter of each charge holds now, in order. A counter
+    /// never charged holds 0. The charges' `amount` and `max` are ignored. Reading does not
+    /// look at the leases, so the counters of a revoked or expired lease can still be read.
+    /// Callers must deny a limited call when this fails (`budget_error`).
+    fn budget_used(&self, charges: &[Charge]) -> Result<Vec<u64>, AuditError>;
+
+    /// Charge one allowed call (ADR-0010): check every charge against its counter and either
+    /// apply all of them, logged under `decision_id`, or none (`Exhausted`, naming the first
+    /// that would go over its `max`), in one transaction. An empty `charges` writes nothing.
+    /// A decision id that already has charges is refused, so a decision is charged once.
+    fn charge(
+        &self,
+        decision_id: &str,
+        charges: &[Charge],
+        at: OffsetDateTime,
+    ) -> Result<ChargeOutcome, AuditError>;
+
+    /// Return what `decision_id` charged to every counter it charged, at most once, in one
+    /// transaction. Returns how many counters were restored. [`AuditError::UnknownCharge`]
+    /// when the decision charged nothing, [`AuditError::ChargeRefunded`] when it was already
+    /// refunded. Used by the pipeline when a charged decision's audit append fails, and by
+    /// the operator refund (`POST /admin/budgets/refund`).
+    fn refund(&self, decision_id: &str, at: OffsetDateTime) -> Result<u64, AuditError>;
+}
+
+/// One logged charge: the counter and what was added to it.
+#[derive(Debug, Clone)]
+struct LoggedCharge {
+    counter: CounterKey,
+    amount: u64,
+}
+
+/// What a decision charged, and whether it was refunded.
+#[derive(Debug, Clone, Default)]
+struct ChargeLog {
+    charges: Vec<LoggedCharge>,
+    refunded: bool,
 }
 
 /// One output label on a delegation run: an untrusted result the run read (ADR-0009).
@@ -295,6 +334,27 @@ pub struct MemoryLeaseStore {
     labels: Mutex<BTreeMap<LeaseId, BTreeMap<String, RunLabel>>>,
     /// Approvals by id.
     approvals: Mutex<BTreeMap<String, Approval>>,
+    /// Run-limit counters and the charges of each decision, under one lock (ADR-0010).
+    budgets: Mutex<Budgets>,
+}
+
+/// The memory store's run-limit state.
+#[derive(Debug, Default)]
+struct Budgets {
+    /// Created on first use: generating a key can fail, and `Default` cannot.
+    key: Option<ValueKey>,
+    counters: BTreeMap<CounterKey, u64>,
+    log: BTreeMap<String, ChargeLog>,
+}
+
+impl Budgets {
+    fn keys(&mut self, charges: &[Charge]) -> Result<Vec<CounterKey>, AuditError> {
+        if self.key.is_none() {
+            self.key = Some(ValueKey::random()?);
+        }
+        let key = self.key.as_ref().expect("set above");
+        charges.iter().map(|c| key.counter(c)).collect()
+    }
 }
 
 impl MemoryLeaseStore {
@@ -594,5 +654,69 @@ impl LeaseStore for MemoryLeaseStore {
     fn remove_approval(&self, id: &str) -> Result<(), AuditError> {
         self.approvals.lock()?.remove(id);
         Ok(())
+    }
+
+    fn budget_used(&self, charges: &[Charge]) -> Result<Vec<u64>, AuditError> {
+        let mut b = self.budgets.lock()?;
+        let keys = b.keys(charges)?;
+        Ok(keys
+            .iter()
+            .map(|k| b.counters.get(k).copied().unwrap_or(0))
+            .collect())
+    }
+
+    fn charge(
+        &self,
+        decision_id: &str,
+        charges: &[Charge],
+        _at: OffsetDateTime,
+    ) -> Result<ChargeOutcome, AuditError> {
+        if charges.is_empty() {
+            return Ok(ChargeOutcome::Charged {
+                used_after: Vec::new(),
+            });
+        }
+        // The lock is held from the check to the write: the memory store's transaction.
+        let mut b = self.budgets.lock()?;
+        if b.log.contains_key(decision_id) {
+            return Err(AuditError::Storage(format!(
+                "decision `{decision_id}` is already charged"
+            )));
+        }
+        let keys = b.keys(charges)?;
+        let used_after = match plan(&keys, charges, |k| {
+            Ok(b.counters.get(k).copied().unwrap_or(0))
+        })? {
+            Ok(after) => after,
+            Err(exhausted) => return Ok(exhausted),
+        };
+        let mut log = ChargeLog::default();
+        for ((key, charge), after) in keys.into_iter().zip(charges).zip(&used_after) {
+            b.counters.insert(key.clone(), *after);
+            log.charges.push(LoggedCharge {
+                counter: key,
+                amount: charge.amount,
+            });
+        }
+        b.log.insert(decision_id.to_owned(), log);
+        Ok(ChargeOutcome::Charged { used_after })
+    }
+
+    fn refund(&self, decision_id: &str, _at: OffsetDateTime) -> Result<u64, AuditError> {
+        let mut b = self.budgets.lock()?;
+        let Budgets { counters, log, .. } = &mut *b;
+        let entry = log
+            .get_mut(decision_id)
+            .ok_or_else(|| AuditError::UnknownCharge(decision_id.to_owned()))?;
+        if entry.refunded {
+            return Err(AuditError::ChargeRefunded(decision_id.to_owned()));
+        }
+        for c in &entry.charges {
+            if let Some(v) = counters.get_mut(&c.counter) {
+                *v = v.saturating_sub(c.amount);
+            }
+        }
+        entry.refunded = true;
+        Ok(entry.charges.len() as u64)
     }
 }
