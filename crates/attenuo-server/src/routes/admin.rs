@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use attenuo_audit::{
-    AuditEntry, AuditError, AuditSink, EntryFilter, LeaseNode, LeaseStore, Order,
-    SignedVerifyReport,
+    AuditEntry, AuditError, AuditSink, EntryFilter, LeaseNode, LeaseSelector, LeaseStore, Order,
+    SelectorRevocation, SignedVerifyReport,
 };
 use attenuo_core::{AgentId, LeaseId, RecordKind};
 use axum::body::Bytes;
@@ -125,6 +125,199 @@ pub async fn revoke_lease(
                 "reason": reason,
                 "audit_id": audit_id,
             })))
+        })
+        .await
+}
+
+/// Most lease ids `POST /admin/leases/revoke` lists in its response, per list (`matched`,
+/// `revoked`). The counts are always complete; `truncated` says a list was cut.
+pub const MAX_SELECTOR_RESPONSE_IDS: usize = 10_000;
+/// Most lease ids the audit record of a selector revocation names in `leases`. The record's
+/// arguments carry the full count.
+pub const MAX_SELECTOR_AUDIT_IDS: usize = 256;
+
+/// Body of `POST /admin/leases/revoke`: exactly one selector, and an optional reason.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectorRevokeBody {
+    /// The originating user's subject (`sub`).
+    #[serde(default)]
+    pub user: Option<String>,
+    /// A delegation chain id: the lease of the chain's first hop.
+    #[serde(default)]
+    pub chain_id: Option<String>,
+    /// Not supported yet; refused with 400 `unsupported_selector`.
+    #[serde(default)]
+    pub session: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Query of `POST /admin/leases/revoke`.
+#[derive(Debug, Default, Deserialize)]
+pub struct SelectorRevokeQuery {
+    /// Dry run: answer what would be revoked and write nothing.
+    #[serde(default)]
+    pub preview: bool,
+}
+
+/// The selector of a [`SelectorRevokeBody`] and how the response shows it, or 400 unless
+/// exactly one non-empty selector is given.
+fn selector_of(body: &SelectorRevokeBody) -> Result<(LeaseSelector, Value), ApiError> {
+    let given = [
+        body.user.is_some(),
+        body.chain_id.is_some(),
+        body.session.is_some(),
+    ];
+    if given.iter().filter(|g| **g).count() != 1 {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "give exactly one of `user`, `chain_id`, `session`",
+        ));
+    }
+    let non_empty = |field: &str, v: &str| {
+        if v.is_empty() {
+            Err(ApiError::bad_request(
+                "invalid_request",
+                format!("`{field}` must not be empty"),
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    if let Some(user) = &body.user {
+        non_empty("user", user)?;
+        return Ok((
+            LeaseSelector::Subject(user.clone()),
+            json!({ "user": user }),
+        ));
+    }
+    if let Some(chain) = &body.chain_id {
+        non_empty("chain_id", chain)?;
+        return Ok((
+            LeaseSelector::Chain(LeaseId::new(chain.clone())),
+            json!({ "chain_id": chain }),
+        ));
+    }
+    // An MCP session is bound to its chain's root lease (SR-11), but the binding lives only
+    // in the proxy's memory and the audit log carries a hash tag of the id, not the id.
+    Err(ApiError::bad_request(
+        "unsupported_selector",
+        "revoking by session is not supported yet; revoke the session's chain with `chain_id` \
+         (the `chain_id` of the session's audit records)",
+    ))
+}
+
+/// The response of `POST /admin/leases/revoke`, each list cut at
+/// [`MAX_SELECTOR_RESPONSE_IDS`].
+fn selector_response(
+    shown: Value,
+    out: &SelectorRevocation,
+    reason: Option<&str>,
+    audit_id: Option<uuid::Uuid>,
+) -> Json<Value> {
+    let list = |ids: &[LeaseId]| -> Vec<LeaseId> {
+        ids.iter()
+            .take(MAX_SELECTOR_RESPONSE_IDS)
+            .cloned()
+            .collect()
+    };
+    Json(json!({
+        "selector": shown,
+        "preview": reason.is_none(),
+        "matched": list(&out.matched),
+        "revoked": list(&out.revoked),
+        "matched_count": out.matched.len(),
+        "revoked_count": out.revoked.len(),
+        "truncated": out.matched.len() > MAX_SELECTOR_RESPONSE_IDS
+            || out.revoked.len() > MAX_SELECTOR_RESPONSE_IDS,
+        "reason": reason,
+        "audit_id": audit_id,
+    }))
+}
+
+/// `POST /admin/leases/revoke[?preview=true]` with `{"user": "..."}` or
+/// `{"chain_id": "..."}` (exactly one) and an optional `"reason"`: revoke every unrevoked
+/// lease the selector names, each with the descendant cascade of
+/// `POST /admin/leases/{id}/revoke`, in one transaction. An expired lease is matched too,
+/// since `POST /token/renew` could bring it back while its token is valid.
+///
+/// - `user` matches the leases issued for that originating user (`sub`), under any issuer.
+///   Leases registered by a server older than this route have no recorded subject and are
+///   not matched; revoke them by `chain_id` or by id.
+/// - `chain_id` matches that chain's first-hop lease and everything delegated from it. A
+///   lease with a parent is not a chain id and matches nothing.
+/// - `session` is refused with 400 `unsupported_selector` (not supported yet).
+///
+/// Answers `{selector, preview, matched, revoked, matched_count, revoked_count, truncated,
+/// reason, audit_id}`: `matched` the leases the selector named, `revoked` every lease that
+/// changed (the matches first, then the cascade), each list cut at
+/// [`MAX_SELECTOR_RESPONSE_IDS`]. Matching nothing is a 200 with empty lists. With
+/// `preview=true` nothing is written, not even an audit record, and `revoked` is what a
+/// revocation sent now would change (`reason` and `audit_id` are null).
+///
+/// A revocation appends one `admin.lease.revoke` record (kind `lease_revoke`) whose `leases`
+/// holds the first [`MAX_SELECTOR_AUDIT_IDS`] revoked ids and whose arguments (stored as a
+/// digest, like every admin record) are the selector, the reason, the count and whether the
+/// list was cut. As with a single revocation, the revocation stands if the record cannot be
+/// written; `audit_id` is then null.
+pub async fn revoke_by_selector(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<SelectorRevokeQuery>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let body: SelectorRevokeBody = if body.is_empty() {
+        SelectorRevokeBody::default()
+    } else {
+        super::parse_json(&body)?
+    };
+    let (selector, shown) = selector_of(&body)?;
+    let reason = body
+        .reason
+        .unwrap_or_else(|| "revoked by admin".to_string());
+    let now = now();
+    state
+        .blocking(move |state| {
+            if q.preview {
+                let out = state.leases.preview_selected(&selector)?;
+                return Ok(selector_response(shown, &out, None, None));
+            }
+            let out = state.leases.revoke_selected(&selector, &reason, now)?;
+            let revoked = out.revoked.len() as u64;
+            state.metrics.leases_revoked(revoked);
+            tracing::warn!(
+                selector = ?selector,
+                reason = ?reason,
+                matched = out.matched.len(),
+                revoked,
+                "leases revoked by selector"
+            );
+            // The revocation stands even if it cannot be recorded (see `revoke_lease`).
+            let audited: Vec<LeaseId> = out
+                .revoked
+                .iter()
+                .take(MAX_SELECTOR_AUDIT_IDS)
+                .cloned()
+                .collect();
+            let listed = audited.len();
+            let audit_id = audit_admin(
+                state,
+                "admin.lease.revoke",
+                Decision::Allow,
+                REASON_ADMIN_ACTION,
+                audited,
+                json!({
+                    "selector": shown,
+                    "reason": reason,
+                    "revoked": revoked,
+                    "listed": listed,
+                    "truncated": out.revoked.len() > listed,
+                }),
+                now,
+            )
+            .inspect_err(|e| tracing::error!(error = ?e.detail, "admin revoke was not audited"))
+            .ok();
+            Ok(selector_response(shown, &out, Some(&reason), audit_id))
         })
         .await
 }

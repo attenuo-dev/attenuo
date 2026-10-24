@@ -68,7 +68,9 @@ pub(crate) fn no_store(headers: &mut HeaderMap) {
     headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
 }
 
-/// Register the lease of a token this server just minted, and bind it to the token's chain.
+/// Register the lease of a token this server just minted, bind it to the token's chain, and
+/// record the chain's originating user (`LeaseStore::record_subject`) so the lease can be
+/// revoked by user.
 ///
 /// The lease expiry is [`AppState::initial_lease_expiry`]. The binding is the digest of the
 /// chain exactly as the signed token carries it (`LeaseStore::bind`), so an AuthZEN body chain
@@ -90,6 +92,10 @@ pub(crate) fn register_issued(
         .leases
         .register(lease, parent, state.initial_lease_expiry(now, token_exp))?;
     state.leases.bind(lease, &chain.digest())?;
+    // So that `POST /admin/leases/revoke` with `{"user": ...}` finds this lease.
+    state
+        .leases
+        .record_subject(lease, &chain.originating_user.subject)?;
     // Run limits (ADR-0010): keep the hop's limits as issued (after clamping), for the admin
     // console. Display only, so a failure is logged and the issuance stands.
     if let Some(hop) = chain.hops.last() {
