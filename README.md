@@ -22,7 +22,7 @@ cd attenuo
 examples/github-leak-demo/run.sh
 ```
 
-The first run compiles the workspace, which takes a few minutes. After that the script takes about a minute. It starts attenuo and the fake server on free ports, plays nine steps with the `attenuo` CLI, and exits non-zero if any step comes out differently. In short:
+The first run compiles the workspace: about a minute and a half on a 4-core machine, nearly all of it compiling (plus crate downloads if your cargo cache is empty). After that the script takes about a second ([measured](docs/design/bench/2026-10-24-vm-demo-cold-timing.md)). It starts attenuo and the fake server on free ports, plays nine steps with the `attenuo` CLI, and exits non-zero if any step comes out differently. In short:
 
 - Alice's assistant gets a broad `github:*` token and hands its `coder` sub-agent `github:read_file` only.
 - `coder` reads `alice/public-docs`: allowed.
