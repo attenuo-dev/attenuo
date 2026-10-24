@@ -34,3 +34,4 @@ ring = { workspace = true }
 # Enables the `testing` hooks for this crate's own integration tests.
 attenuo-audit = { path = ".", features = ["testing"] }
 tempfile = { workspace = true }
+proptest = { workspace = true }
