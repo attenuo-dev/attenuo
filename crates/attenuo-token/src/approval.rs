@@ -306,4 +306,56 @@ mod tests {
             Err(TokenError::InvalidSignature)
         ));
     }
+
+    /// The wire format, pinned: this exact token is verified by the Python and TypeScript SDK
+    /// tests (`verify_approval_token`, `verifyApprovalToken`) against the JWKS below, with
+    /// `now` = `iat`. If this changes, those fixtures must change with it.
+    #[test]
+    fn wire_format_is_pinned_for_the_sdks() {
+        const PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
+            MC4CAQAwBQYDK2VwBCIEID5wG4j128wRESlsagZytRF1giPExiQJqUaD10xxL1r+\n\
+            -----END PRIVATE KEY-----\n";
+        let i = Issuer::from_pem(
+            IssuerConfig {
+                issuer: "https://attenuo.test".into(),
+                audience: "attenuo".into(),
+                max_depth: 4,
+                default_ttl: Duration::minutes(5),
+            },
+            PEM,
+        )
+        .unwrap();
+        let token = i
+            .issue_approval(&ApprovalGrant {
+                approval_id: "0f8e6c1a-4b7d-4f61-9a39-2f4f5b0e8d11",
+                approver: "alice",
+                by: "user",
+                chain_id: "lease-root",
+                lease: "lease-hop",
+                call_hash: "ab".repeat(32).as_str(),
+                granted_at: t0(),
+                expires_at: t0() + Duration::seconds(120),
+                jkt: Some(JKT),
+            })
+            .unwrap();
+        let jwk_x = {
+            use base64::Engine;
+            let pem = i.public_key_pem();
+            let b64: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+            let der = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .unwrap();
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&der[12..])
+        };
+        assert_eq!(t0().unix_timestamp(), 1_792_843_200);
+        assert_eq!(jwk_x, "psIk2NjWmiuoUxoim49SIawYPoOBE8gaMWWVX9fpjVU");
+        assert_eq!(i.key_id(), "1OiSA9mGwRnxk7pfP2CCGw");
+        assert_eq!(token, FIXTURE);
+    }
+
+    const FIXTURE: &str = concat!(
+        "eyJ0eXAiOiJhdHRlbnVvLWFwcHJvdmFsK2p3dCIsImFsZyI6IkVkRFNBIiwia2lkIjoiMU9pU0E5bUd3Um54azdwZlAyQ0NHdyJ9.",
+        "eyJpc3MiOiJodHRwczovL2F0dGVudW8udGVzdCIsImF1ZCI6ImF0dGVudW8iLCJzdWIiOiJhbGljZSIsImJ5IjoidXNlciIsImNoYWluX2lkIjoibGVhc2Utcm9vdCIsImxlYXNlIjoibGVhc2UtaG9wIiwiY2giOiJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiIiwiaWF0IjoxNzkyODQzMjAwLCJleHAiOjE3OTI4NDMzMjAsImp0aSI6IjBmOGU2YzFhLTRiN2QtNGY2MS05YTM5LTJmNGY1YjBlOGQxMSIsImNuZiI6eyJqa3QiOiIwWmNPQ09SWk5ZeS1EV3BxcTMwalp5SkdIVE4wZDJIZ2xCVjN1aWd1QTRJIn19.",
+        "YMQGXdHjU1Mzr1i15LY7f74Zl6XliQFvHVBs1FzW0mahmH_ngo3PHkfsZWltnvBvsLrv5GQuSXmCxg-IP45kAw"
+    );
 }
