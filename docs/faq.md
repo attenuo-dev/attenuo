@@ -89,7 +89,7 @@ That has limits, and they matter:
 - Whoever can write the database file can rewrite the whole chain from the point they edit, recomputing every hash after it. The chain alone does not stop that.
 - Truncating the end of the log is not detectable by the chain alone.
 
-The server closes both with signed checkpoints: every 1000 entries and every 300 seconds it signs `(seq, head_hash)` with the issuer key, and `attenuo audit verify` rejects a log that is shorter than a checkpoint or has a different hash at its `seq`. The key is the server's own, so also copy checkpoints (`GET /admin/audit/checkpoint`) or exports to a place the host cannot write. The server does not ship them for you. See [Deploying](guides/deploying.md#sqlite-file-placement-and-backup).
+The server closes both with signed checkpoints: every 1000 entries and every 300 seconds it signs `(seq, head_hash)` with the issuer key, and `attenuo audit verify` rejects a log that is shorter than a checkpoint or has a different hash at its `seq`. The key is the server's own, so checkpoints must also be kept somewhere the host cannot write. Set `[audit.sink]` and the server ships each checkpoint as it is signed (to a webhook, a file on another mount, or S3), or copy `GET /admin/audit/checkpoint` and exports yourself. See [Deploying](guides/deploying.md#sqlite-file-placement-and-backup).
 
 The log stores a digest of each call's arguments, not the arguments.
 
@@ -111,7 +111,9 @@ attenuo accepts an ID-JAG, or a plain OIDC ID token, as the credential at hop 0 
 
 No. It does not detect injected instructions, and does not try to. It assumes the agent can be talked into anything and limits what the agent can do when that happens: the sub-agent that reads untrusted text holds only the tools it needs, a policy checks the arguments, and a lease lets you pull the plug. The [GitHub leak demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/github-leak-demo/README.md) shows this on a replay of a real incident.
 
-It cannot stop an agent from misusing something it is legitimately allowed to do. See the [threat model](spec/threat-model.md).
+Two features reach further, into calls the agent is allowed to make. Output labelling marks every tool result as untrusted, so a policy can ask a person before a destructive call on a run that has read one ([Writing policies](guides/writing-policies.md#asking-for-approval-after-untrusted-output)). Run limits cap how many calls, how much in total or how many destinations a run may use ([run limits](design/run-limits.md)). Both depend on someone choosing well: the approver has to say no, and a limit has to fit the task.
+
+Without those, it cannot stop an agent from misusing something it is legitimately allowed to do. See the [threat model](spec/threat-model.md).
 
 ## Is it ready for production?
 
