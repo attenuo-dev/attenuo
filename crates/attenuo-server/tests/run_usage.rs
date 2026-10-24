@@ -356,7 +356,7 @@ async fn destination_seen_is_per_value_and_kept_as_a_hash() {
 
 /// A catalog `destination` of `url#host` (run-limits phase 2) counts sites, not pages: a second
 /// page of a site the run already fetched from passes, a new site asks, and so does a value
-/// with no host after the first fetch (all such values count as one destination).
+/// with no host after the first fetch (each such value is a destination of its own, SR-63).
 #[tokio::test]
 async fn derived_destination_counts_the_host_of_a_url() {
     let h = Harness::start().await;

@@ -50,7 +50,8 @@ when { context.usage.destination_seen && !context.approval.present };
 // from before asks. More pages of the same site do not. The catalog's `destination =
 // "url#host"` makes `destination_seen` compare hosts, so a query string carrying data to a
 // new host (the injection suite's `slack-08`) is asked whatever the path, while a second
-// article on the same site is not. Values with no host count as one destination.
+// article on the same site is not. A value with no host is a destination of its own, so a
+// new unparseable URL asks too.
 @id("ask_on_a_new_site")
 @obligation("approval")
 forbid (principal, action == Action::"web/get_webpage", resource)

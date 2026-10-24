@@ -981,6 +981,9 @@ pub async fn reload_policies(State(state): State<Arc<AppState>>) -> Result<Json<
                     run_usage = ?engine.usage_tracking_reasons(),
                     "policies reloaded; run usage kept for these reasons (none: not kept)"
                 );
+                if engine.asks_for_approval() && state.approvals_client_id.is_none() {
+                    tracing::warn!("{}", crate::config::UNSET_APPROVAL_CLIENT_ID);
+                }
                 Ok((engine.policy_ids(), engine.validation_warnings().to_vec()))
             }
         }

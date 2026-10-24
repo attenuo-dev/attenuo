@@ -599,8 +599,8 @@ async fn refund_is_admin_only_and_once_per_decision() {
 
 /// `distinct` on a derived value (run-limits phase 2): at most two hosts across the run, any
 /// number of pages per host, charged to every hop; the denial names the derived argument; a
-/// URL without a host cannot be counted; a refund gives a host back; the lease tree shows
-/// each hop's limit and what is left.
+/// URL without a host cannot be counted; a refund gives a host back once no unrefunded
+/// decision used it (SR-62); the lease tree shows each hop's limit and what is left.
 #[tokio::test]
 async fn distinct_hosts_bound_the_sites_a_run_can_reach() {
     let h = Harness::start().await;
@@ -702,13 +702,36 @@ async fn distinct_hosts_bound_the_sites_a_run_can_reach() {
         .collect();
     assert_eq!(kinds, vec![("calls", 5), ("distinct", 2)], "{child_budget}");
 
-    // A refund of the docs.example decision gives the host back.
-    let resp = h
-        .admin_post(
-            "/admin/budgets/refund",
-            json!({"decision_id": docs["id"], "reason": "test"}),
-        )
-        .await;
-    assert_eq!(resp.status(), StatusCode::OK);
+    // A refund of the docs.example decision does not give the host back while the AuthZEN
+    // evaluation, which also reached docs.example, stands (SR-62); refunding that one too does.
+    let authzen_docs = decisions
+        .iter()
+        .rev()
+        .find(|d| d["decision"] == "allow")
+        .unwrap();
+    assert_ne!(authzen_docs["id"], docs["id"]);
+    let refund = |id: Value| {
+        let h = &h;
+        async move {
+            let resp = h
+                .admin_post(
+                    "/admin/budgets/refund",
+                    json!({"decision_id": id, "reason": "test"}),
+                )
+                .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            resp.json::<Value>().await.unwrap()
+        }
+    };
+    assert_eq!(
+        refund(docs["id"].clone()).await["refunded"],
+        1,
+        "calls only"
+    );
+    assert_eq!(
+        denial(&fetch("https://evil.example/?d=still-not").await).0,
+        "budget_exhausted"
+    );
+    refund(authzen_docs["id"].clone()).await;
     assert!(allowed(&fetch("https://evil.example/?d=fine-now").await));
 }

@@ -1213,6 +1213,13 @@ impl PolicyEngine {
             || self.catalog_names_usage
     }
 
+    /// Whether some loaded policy carries `@obligation("approval")`, so that the server may
+    /// ask for approvals (`approval_required`). Recomputed at every
+    /// [`reload_policies_str`](Self::reload_policies_str).
+    pub fn asks_for_approval(&self) -> bool {
+        !self.obligations.approval_ids.is_empty()
+    }
+
     /// Why [`tracks_usage`](Self::tracks_usage) is what it is, for the server's log: the
     /// reasons that hold (`"policy"`, `"catalog"`, `"config"`), empty when usage is not kept.
     pub fn usage_tracking_reasons(&self) -> Vec<&'static str> {
