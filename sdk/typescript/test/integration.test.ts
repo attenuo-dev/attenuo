@@ -40,6 +40,8 @@ import {
   TokenRefresher,
   UnauthorizedError,
   VerificationError,
+  ExportError,
+  verifyExport,
 } from "../src/index.js";
 
 // [[agents]] secrets in the demo config: an exchange authenticates as its actor.
@@ -569,5 +571,164 @@ describe.skipIf(!enabled)("DPoP server nonces against the real server", () => {
     expect(r.status).toBe(200);
     expect(((await r.json()) as { result?: unknown }).result).toBeTruthy();
     await admin.revokeLease(root.lease);
+  });
+});
+
+describe.skipIf(!enabled)("filtered export and revocation by selector", () => {
+  let procs: ChildProcess[] = [];
+  let work = "";
+  let url = "";
+
+  beforeAll(async () => {
+    ({ url, work, procs } = await startStack());
+  });
+
+  afterAll(async () => {
+    await stopStack(procs, work);
+  });
+
+  // First in this stack: the fake upstream hands every caller the same session id and the proxy
+  // binds it to the first caller, so this test must open the stack's first MCP session.
+  it("revokes by session: an unknown id matches nothing, a real one its chain", async () => {
+    const admin = new AdminClient(url, ADMIN_TOKEN);
+    const ob = new AttenuoClient(url);
+
+    const unknown = await admin.revokeBySelector({ session: "no-such-session" }, { preview: true });
+    expect(unknown).toMatchObject({ preview: true, matched: [], revoked: [], revokedCount: 0 });
+    expect(unknown.selector.chain_ids).toEqual([]);
+    expect(String(unknown.selector.session_tag)).toHaveLength(12);
+    expect(JSON.stringify(unknown.selector)).not.toContain("no-such-session");
+
+    const root = await admin.mintRootDev("alice", "https://idp.example", "assistant", {
+      capabilities: ["github:*"],
+    });
+    const coder = await ob.exchange(root, "coder", ["github:read_file"], {
+      clientSecret: CODER_SECRET,
+    });
+    const sid = await ob.initialize(coder, "github");
+    expect(sid).toBeTruthy();
+    const both = [root.lease, coder.lease].sort();
+
+    const preview = await admin.revokeBySelector({ session: sid! }, { preview: true });
+    expect(preview.selector.chain_ids).toEqual([root.lease]);
+    expect([...preview.matched].sort()).toEqual(both);
+    expect([...preview.revoked].sort()).toEqual(both);
+    expect((await admin.leaseStatus(coder.lease)).active).toBe(true);
+
+    const done = await admin.revokeBySelector({ session: sid! }, { reason: "session hijacked" });
+    expect(done.preview).toBe(false);
+    expect([...done.revoked].sort()).toEqual(both);
+    expect(done.auditId).toBeTruthy();
+    expect(JSON.stringify(done)).not.toContain(sid!);
+    const after = await ob
+      .callTool(coder, "github", "read_file", { repo: "alice/public-docs" }, { sessionId: sid! })
+      .catch((e: unknown) => e);
+    expect(after).toBeInstanceOf(DeniedError);
+    expect((after as DeniedError).reason).toBe("lease_revoked");
+  });
+
+  it("exports only token.exchange denials, and verification refuses the file", async () => {
+    const admin = new AdminClient(url, ADMIN_TOKEN);
+    const ob = new AttenuoClient(url);
+    const root = await admin.mintRootDev("alice", "https://idp.example", "assistant", {
+      capabilities: ["github:*"],
+    });
+    const coder = await ob.exchange(root, "coder", ["github:read_file"], {
+      clientSecret: CODER_SECRET,
+    });
+    // A widening exchange: refused, and recorded as a `deny` of tool `token.exchange`.
+    await expect(
+      ob.exchange(coder, "tester", ["github:create_issue"], { clientSecret: TESTER_SECRET }),
+    ).rejects.toMatchObject({ status: 400, error: "invalid_scope" });
+
+    const lines = [];
+    for await (const l of admin.auditExport(1, undefined, {
+      tool: "token.exchange",
+      decision: "deny",
+    }))
+      lines.push(l);
+    expect(lines[0]).toMatchObject({
+      type: "header",
+      filter: { tool: "token.exchange", decision: "deny" },
+    });
+    const entries = lines.filter((l) => l.type === "entry") as unknown as {
+      record: { tool: string; decision: string; chain_id?: string; reason?: string };
+    }[];
+    expect(entries.length).toBeGreaterThan(0);
+    expect(new Set(entries.map((e) => `${e.record.tool} ${e.record.decision}`))).toEqual(
+      new Set(["token.exchange deny"]),
+    );
+    expect(
+      entries.some(
+        (e) => e.record.chain_id === root.lease && e.record.reason === "exchange_widening",
+      ),
+    ).toBe(true);
+
+    const jwks = (await (await fetch(`${url}/.well-known/jwks.json`)).json()) as {
+      keys: unknown[];
+    };
+    const text = lines.map((l) => JSON.stringify(l)).join("\n") + "\n";
+    await expect(verifyExport(text, { checkpointPublicKeys: jwks })).rejects.toThrow(ExportError);
+    await expect(verifyExport(text, { checkpointPublicKeys: jwks })).rejects.toThrow(/filtered/);
+
+    await expect(
+      (async () => {
+        for await (const _ of admin.auditExport(1, undefined, { decision: "maybe" as "deny" }))
+          void _;
+      })(),
+    ).rejects.toMatchObject({ status: 400 });
+    await admin.revokeLease(root.lease);
+  });
+
+  it("revokes by chain id: preview first, then for real", async () => {
+    const admin = new AdminClient(url, ADMIN_TOKEN);
+    const ob = new AttenuoClient(url);
+    const root = await admin.mintRootDev("alice", "https://idp.example", "assistant", {
+      capabilities: ["github:*"],
+    });
+    const coder = await ob.exchange(root, "coder", ["github:read_file"], {
+      clientSecret: CODER_SECRET,
+    });
+    const both = [root.lease, coder.lease].sort();
+
+    // A preview changes nothing and writes nothing.
+    const head = await admin.auditHead();
+    const preview = await admin.revokeBySelector({ chainId: root.lease }, { preview: true });
+    expect(preview).toMatchObject({
+      preview: true,
+      selector: { chain_id: root.lease },
+      matchedCount: 2,
+      revokedCount: 2,
+      truncated: false,
+      reason: undefined,
+      auditId: undefined,
+    });
+    expect([...preview.matched].sort()).toEqual(both);
+    expect([...preview.revoked].sort()).toEqual(both);
+    expect(await admin.auditHead()).toBe(head);
+    expect((await admin.leaseStatus(root.lease)).active).toBe(true);
+    const byUser = await admin.revokeBySelector({ user: "alice" }, { preview: true });
+    expect(byUser.selector).toEqual({ user: "alice" });
+    expect(byUser.matched).toContain(root.lease);
+
+    // For real: the chain is revoked and the revocation is audited.
+    const done = await admin.revokeBySelector(
+      { chainId: root.lease },
+      { reason: "run went wrong" },
+    );
+    expect(done).toMatchObject({ preview: false, revokedCount: 2, reason: "run went wrong" });
+    expect([...done.revoked].sort()).toEqual(both);
+    const record = (await admin.auditRecord(done.auditId!)).entry.record;
+    expect([record.tool, record.kind]).toEqual(["admin.lease.revoke", "lease_revoke"]);
+    expect((await admin.leaseStatus(coder.lease)).active).toBe(false);
+    await expect(
+      ob.callTool(coder, "github", "read_file", { repo: "alice/public-docs" }),
+    ).rejects.toMatchObject({ reason: "lease_revoked" });
+
+    // Nothing is left to match, and an unknown chain is an empty answer, not an error.
+    const again = await admin.revokeBySelector({ chainId: root.lease }, { preview: true });
+    expect(again).toMatchObject({ matched: [], revoked: [], revokedCount: 0 });
+    const unknown = await admin.revokeBySelector({ chainId: "no-such-chain" }, { preview: true });
+    expect(unknown).toMatchObject({ matched: [], revoked: [] });
   });
 });
