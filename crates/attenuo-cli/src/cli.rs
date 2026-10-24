@@ -737,6 +737,11 @@ pub struct TestArgs {
     /// must keep the default's entity types, attributes and hierarchy. Not with `--via authzen`.
     #[arg(long, value_name = "PATH")]
     pub schema_file: Option<std::path::PathBuf>,
+    /// Run again whenever a test file, or a policy, catalog, config or schema file one of them
+    /// reads, changes (polled every 250 ms, settled for 200 ms). Clears the screen before each
+    /// run; stop with Ctrl-C.
+    #[arg(long)]
+    pub watch: bool,
     /// Where the cases are decided: `local` (default, the in-process engine, offline) or
     /// `authzen` (each case is sent to `POST /access/v1/evaluation` of the server named by the
     /// global `--server`, with `--token` as the bearer).

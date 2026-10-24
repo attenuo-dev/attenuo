@@ -789,6 +789,20 @@ impl TestFile {
         }
     }
 
+    /// The files a run of this test file reads besides itself: its policy file, the catalog file
+    /// or server config `catalog` names, and the base schema file in force. Paths that cannot
+    /// be worked out (an unreadable config) are left out.
+    pub fn input_paths(&self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = self.policies_path().into_iter().collect();
+        if let Some(CatalogSpec::Path(p)) = &self.catalog {
+            out.push(clean_path(&self.resolve(p)));
+        }
+        if let Ok(Some(s)) = self.base_schema_path() {
+            out.push(clean_path(&s));
+        }
+        out
+    }
+
     /// The policy file the test file names, resolved against the test file's directory.
     pub fn policies_path(&self) -> Option<PathBuf> {
         self.policies

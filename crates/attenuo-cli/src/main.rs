@@ -12,6 +12,7 @@ mod jwt;
 mod policy_cmd;
 mod render;
 mod secrets;
+mod watch;
 
 use std::io::Read;
 use std::process::ExitCode;
@@ -429,15 +430,13 @@ async fn run(cli: Cli) -> Result<Outcome> {
         }
         Command::Policy(PolicyCmd::Test(args)) => {
             let opts = policy_cmd::TestOptions::from(&args);
-            match args.via {
+            // `Some` with --via authzen: the server and the bearer.
+            let remote = match args.via {
                 cli::Via::Local => {
                     if args.token.token.is_some() || args.token.token_file.is_some() {
                         anyhow::bail!("--token and --token-file need --via authzen");
                     }
-                    finish(
-                        policy_cmd::test(&args.files, &opts, json),
-                        "policy test failed to run",
-                    )
+                    None
                 }
                 cli::Via::Authzen => {
                     if args.schema_file.is_some() {
@@ -454,16 +453,50 @@ async fn run(cli: Cli) -> Result<Outcome> {
                         &mut stdin,
                     )?;
                     let key = dpop_key::load_opt(args.token.dpop_key.as_deref())?;
-                    let remote = policy_cmd::Remote {
-                        client: &client,
-                        token: &token,
-                        dpop_key: key.as_ref(),
-                    };
-                    finish(
-                        policy_cmd::test_authzen(&args.files, &remote, &opts, json).await,
-                        "policy test failed to run",
-                    )
+                    Some((client, token, key))
                 }
+            };
+            let run_once = || async {
+                match &remote {
+                    None => policy_cmd::test(&args.files, &opts, json),
+                    Some((client, token, key)) => {
+                        let remote = policy_cmd::Remote {
+                            client,
+                            token,
+                            dpop_key: key.as_ref(),
+                        };
+                        policy_cmd::test_authzen(&args.files, &remote, &opts, json).await
+                    }
+                }
+            };
+            if !args.watch {
+                return finish(run_once().await, "policy test failed to run");
+            }
+            loop {
+                let paths = watch::watched_paths(&args.files, opts.schema_file.as_deref());
+                let seen = watch::Snapshot::take(&paths);
+                let run = run_once().await;
+                if !json {
+                    print!("{}", watch::CLEAR);
+                }
+                print!("{}", run.stdout);
+                eprint!("{}", run.stderr);
+                let t = OffsetDateTime::now_utc();
+                eprintln!(
+                    "[{:02}:{:02}:{:02} UTC] watching {} file(s); Ctrl-C to stop",
+                    t.hour(),
+                    t.minute(),
+                    t.second(),
+                    seen.len()
+                );
+                tokio::task::spawn_blocking(move || {
+                    watch::wait_for_change(
+                        &seen,
+                        || watch::Snapshot::take(&paths),
+                        std::thread::sleep,
+                    )
+                })
+                .await?;
             }
         }
         Command::Policy(PolicyCmd::Lint {

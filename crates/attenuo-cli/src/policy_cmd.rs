@@ -676,12 +676,23 @@ mod tests {
             "test",
             "a.yaml",
             "--fail-on-unexercised",
+            "--watch",
+            "--schema-file",
+            "base.cedarschema",
+            "--via",
+            "authzen",
+            "--token-file",
+            "t.jwt",
         ])
         .unwrap();
         let Command::Policy(PolicyCmd::Test(args)) = cli.command else {
             panic!("not policy test")
         };
         assert!(args.fail_on_unexercised);
+        assert!(args.watch);
+        assert_eq!(args.schema_file, Some(PathBuf::from("base.cedarschema")));
+        assert_eq!(args.via, crate::cli::Via::Authzen);
+        assert_eq!(args.token.token_file, Some(PathBuf::from("t.jwt")));
 
         let cli = Cli::try_parse_from([
             "attenuo", "policy", "lint", "p.cedar", "--config", "s.toml", "--schema",

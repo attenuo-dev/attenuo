@@ -333,7 +333,7 @@ The harness builds a real `DelegationChain` and calls the same `PolicyEngine::au
 ### Running
 
 ```sh
-attenuo policy test policy_test.yaml [more.yaml ...] [--fail-on-unexercised] [--json]
+attenuo policy test policy_test.yaml [more.yaml ...] [--fail-on-unexercised] [--schema-file F] [--watch] [--json]
 ```
 
 ```
@@ -370,6 +370,10 @@ Each case's call goes to `POST /access/v1/evaluation` with the token as the bear
 - a `chain`, if the case sets one, naming the token's agents in order, with any explicit `capabilities` equal to that hop's capabilities in the token.
 
 Other cases are listed as skipped, with the reason, and do not fail the run. The file's `catalog`, `unknown_tools` and `now` are ignored, since the server uses its own. Every evaluation is a real decision, so each case leaves an audit record on that server; use a test token and a test run, not a production agent's token. The unexercised list still comes from the test file's local `policies` file, which may differ from what the server has loaded.
+
+#### While editing
+
+`attenuo policy test --watch policy_test.yaml` runs the suite, then runs it again every time you save the test file, its policy file, its catalog or server config, or the base schema file. It polls every 250 ms and waits until the files have been quiet for 200 ms, so an editor that writes in several steps causes one run. Each run clears the screen first. Stop it with Ctrl-C.
 
 The same runner is available as a library, `attenuo_policy::testing`, for tests written in Rust.
 
