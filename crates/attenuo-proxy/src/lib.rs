@@ -17,7 +17,9 @@
 //! 4. forwards the remaining allowlisted methods transparently, preserving `Mcp-Session-Id`.
 //!    These, `tools/list` and `GET`/`DELETE` session requests are authenticated and
 //!    lease-checked ([`Authorizer::check_active`]) first, so a revoked token gets `401` there
-//!    too.
+//!    too. That refusal is recorded through [`Authorizer::record_rejection`] (one record per
+//!    request, tool = the allowlisted method or `http.<METHOD>`) and the `401` names the record;
+//!    a token that does not verify is never recorded.
 //! 5. binds every `Mcp-Session-Id` the upstream assigns to the principal it was assigned to
 //!    (originating user and root lease) and refuses the id from anyone else: `403` with reason
 //!    `session_mismatch`, recorded through [`Authorizer::record_rejection`]. An id the proxy

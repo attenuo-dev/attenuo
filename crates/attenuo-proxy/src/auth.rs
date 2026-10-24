@@ -311,8 +311,9 @@ pub trait Authorizer: Send + Sync {
     }
 
     /// Record a request the proxy refused on its own, before any per-call decision (for
-    /// example `session_mismatch`, SR-11), and return the audit record's id. `call` describes
-    /// the HTTP request (`tool` = `http.POST`, `http.GET` or `http.DELETE`). Implementations
+    /// example `session_mismatch`, SR-11, or a failed [`Authorizer::check_active`] of an
+    /// `initialize`), and return the audit record's id. `call` describes the HTTP request
+    /// (`tool` = `http.POST`, `http.GET`, `http.DELETE`, or the allowlisted method refused). Implementations
     /// that keep an audit log must append a `deny` record; the default records nothing and
     /// returns a fresh id.
     async fn record_rejection(
