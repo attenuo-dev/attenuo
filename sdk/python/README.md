@@ -71,7 +71,7 @@ print(admin.audit_verify())  # VerifyReport(ok=True, entries=..., ...)
 | `initialize(token, server)`                                                                          | MCP `initialize`; returns the `Mcp-Session-Id`, if any.                                                                                                                                                                                                                                                                                                                                                           |
 | `authzen_evaluate(token, server, tool, arguments)`                                                   | AuthZEN decision without calling the tool. A deny is a falsy `AuthzenDecision`, not an exception.                                                                                                                                                                                                                                                                                                                 |
 | `inspect(jwt, verify=False)`                                                                         | Decode a token. With `verify=True` fetch the JWKS and check the Ed25519 signature, `typ`, `exp` and that `sub`/`act` match the chain.                                                                                                                                                                                                                                                                             |
-| `AdminClient(server_url, admin_token)`                                                               | `revoke_lease`, `lease_status`, `audit`, `audit_head` (reads `head` from `GET /admin/audit`, signs nothing), `audit_tail`, `audit_export` (iterator of JSON Lines objects; `kind=` and `chain_id=` filter), `audit_checkpoint` (explicit; signs and stores a checkpoint), `audit_verify`, `policy_reload`, `mint_root_dev`, the approval calls (`approvals`, `approval`, `grant_approval`, `decline_approval`); and the read-only console helpers below (`audit_query`, `audit_iter`, `audit_entry`, `audit_record`, `audit_checkpoints`, `lease_tree`, `policies`, `policy_check`, `policy_evaluate`).                                                                                                                       |
+| `AdminClient(server_url, admin_token)`                                                               | `revoke_lease`, `revoke_by_selector` (every lease of one user, chain or MCP session; see [below](#admin-revoking-by-user-chain-or-session)), `lease_status`, `audit`, `audit_head` (reads `head` from `GET /admin/audit`, signs nothing), `audit_tail`, `audit_export` (iterator of JSON Lines objects; `kind=`, `chain_id=`, `tool=` and `decision=` filter), `audit_checkpoint` (explicit; signs and stores a checkpoint), `audit_verify`, `policy_reload`, `mint_root_dev`, the approval calls (`approvals`, `approval`, `grant_approval`, `decline_approval`); and the read-only console helpers below (`audit_query`, `audit_iter`, `audit_entry`, `audit_record`, `audit_checkpoints`, `lease_tree`, `policies`, `policy_check`, `policy_evaluate`).                                                                                                                       |
 
 `Token` carries `jwt` (also `str(token)`), `lease`, `expires_at`, `chain` (user, hops, capabilities per hop), and `verified`. `repr` does not print the JWT. Everything decoded from a token is untrusted unless `verified` is true.
 
@@ -117,6 +117,33 @@ print(ev.decision, ev.reason, ev.policy_ids)  # no lease check, no audit record
 | `grant_approval(approval_id)`, `decline_approval(approval_id)` | `POST /admin/approvals/{id}` | `Approval` after the decision (`by = \"operator\"`); `ApiError` 409 when it is no longer pending |
 
 `AuditFilter` fields are exact matches combined with AND: `kind` (one or a list), `decision`, `reason`, `subject`, `agent`, `lease`, `server`, `tool`, `chain_id`, and `since` / `until` (RFC 3339 strings or timezone-aware datetimes). Errors map as everywhere else: a 404 for an unknown seq, record or lease is an `ApiError` with `status == 404`, a bad filter is a 400 `invalid_request`. `AsyncAdminClient` has the same methods; `audit_iter` is an async iterator there.
+
+`audit_export(from_seq=1, to_seq=None, *, kind=None, chain_id=None, tool=None, decision=None)` takes the same four filters as `GET /admin/audit/export` (`decision` is `"allow"` or `"deny"`), combined with AND. The header of a filtered export has a `filter` member naming them, and [`verify_export`](#verifying-an-audit-export-offline) refuses it.
+
+```python
+denied = list(admin.audit_export(tool="token.exchange", decision="deny"))
+assert denied[0]["filter"] == {"tool": "token.exchange", "decision": "deny"}
+```
+
+### Admin: revoking by user, chain or session
+
+`revoke_by_selector` wraps `POST /admin/leases/revoke`: it revokes every unrevoked lease of one originating user, one delegation chain or the chain that opened one MCP session, each with its descendants, in one transaction. Give exactly one selector; anything else raises `ValueError` before a request is sent.
+
+```python
+admin.revoke_by_selector(user="alice@example.com", reason="laptop stolen")
+admin.revoke_by_selector(chain_id=root.lease, preview=True)  # dry run: nothing written
+r = admin.revoke_by_selector(session=session_id, reason="session hijacked")
+print(r.selector)  # {"session_tag": "<12 hex>", "chain_ids": [...]}, never the raw id
+print(r.matched_count, r.revoked_count, r.audit_id)
+```
+
+| Argument | Matches |
+| --- | --- |
+| `user` | every lease the server recorded for that originating `sub`, under any issuer |
+| `chain_id` | that chain's first-hop lease and everything delegated from it (a lease with a parent matches nothing) |
+| `session` | the raw `Mcp-Session-Id`; the server hashes it and revokes, as `chain_id`, each chain that opened the session through the proxy |
+
+It returns a `SelectorRevocation`: `selector` (as the server shows it), `preview`, `matched`, `revoked` (matches first, then the cascade; each list cut at 10,000 ids, `truncated` says so), `matched_count`, `revoked_count`, `reason` and `audit_id`. With `preview=True` nothing changes and no audit record is written; `revoked` is what a revocation sent now would change, and `reason` and `audit_id` are `None`. Matching nothing is not an error: the lists come back empty, also for a session the server never recorded. The SDK never logs the session id and no error message it raises contains it. `revoke_lease(lease_id)` still revokes one lease by id. See [Revoke by user or chain](https://github.com/attenuo-dev/attenuo/blob/main/docs/reference/http-api.md#revoke-by-user-or-chain) for the server side.
 
 ### Capabilities
 
@@ -320,7 +347,7 @@ if not report.ok:
     print(report.first_bad_seq, report.bad_checkpoints, report.truncated, report.unsigned_tail)
 ```
 
-`verify_export(path_or_lines, *, checkpoint_public_keys, allow_unsigned_tail=False)` takes a path (`str` or `PathLike`; a `str` is always a path) or an iterable of lines, in JSON Lines or the `--format json` form. `checkpoint_public_keys` is the JWKS or a `{kid: public key}` map (raw 32 bytes or base64url). It re-checks the SHA-256 hash chain over RFC 8785 canonical JSON of `["attenuo-audit-entry-v2", seq, prev_hash, record]`, the range the header declares and the Ed25519 checkpoint signatures, with the same strictness as `attenuo audit verify --file`: a short file, entries outside the range and entries after the last valid checkpoint (unless `allow_unsigned_tail=True`) all fail. The `ExportReport` has `ok`, `first_bad_seq`, `bad_checkpoints`, `last_signed_seq`, `unsigned_tail`, `truncated`, `outside_range` and the rest of the Rust report. A file that is not a verifiable export (no header, wrong format, a filtered export, not JSON) raises `attenuo.audit.ExportError`. It needs the `verify` extra (`cryptography`) for the signatures and depends on the pinned `rfc8785`. It hashes each record as it appears in the file and refuses duplicate object members, so it is a little stricter than the Rust check. A filtered export (`audit_export(kind=..., chain_id=...)`) cannot be verified: its chain has gaps, so verify the unfiltered one, then filter. `AuditEntry` has `kind` and `chain_id`.
+`verify_export(path_or_lines, *, checkpoint_public_keys, allow_unsigned_tail=False)` takes a path (`str` or `PathLike`; a `str` is always a path) or an iterable of lines, in JSON Lines or the `--format json` form. `checkpoint_public_keys` is the JWKS or a `{kid: public key}` map (raw 32 bytes or base64url). It re-checks the SHA-256 hash chain over RFC 8785 canonical JSON of `["attenuo-audit-entry-v2", seq, prev_hash, record]`, the range the header declares and the Ed25519 checkpoint signatures, with the same strictness as `attenuo audit verify --file`: a short file, entries outside the range and entries after the last valid checkpoint (unless `allow_unsigned_tail=True`) all fail. The `ExportReport` has `ok`, `first_bad_seq`, `bad_checkpoints`, `last_signed_seq`, `unsigned_tail`, `truncated`, `outside_range` and the rest of the Rust report. A file that is not a verifiable export (no header, wrong format, a filtered export, not JSON) raises `attenuo.audit.ExportError`. It needs the `verify` extra (`cryptography`) for the signatures and depends on the pinned `rfc8785`. It hashes each record as it appears in the file and refuses duplicate object members, so it is a little stricter than the Rust check. A filtered export (`audit_export(kind=..., chain_id=..., tool=..., decision=...)`, any of them) cannot be verified: its chain has gaps, so verify the unfiltered one, then filter. `AuditEntry` has `kind` and `chain_id`.
 
 ### Cross-checking shipped checkpoints
 
@@ -351,7 +378,7 @@ ATTENUO_INTEGRATION=1 pytest -rf -m integration   # builds and starts the real s
 
 Keep `-rf`: it prints the name of every failed test in the summary, which a long run otherwise scrolls away.
 
-The integration test builds `attenuo-server` and the `fake_mcp` example, starts both on free ports, and replays the [GitHub leak scenario](https://github.com/attenuo-dev/attenuo/blob/main/examples/github-leak-demo/README.md) through the SDK: dev root mint, exchange, an allowed call, a policy denial, a capability denial, revocation, `lease_revoked`, and an audit chain check.
+The integration test builds `attenuo-server` and the `fake_mcp` example, starts both on free ports, and replays the [GitHub leak scenario](https://github.com/attenuo-dev/attenuo/blob/main/examples/github-leak-demo/README.md) through the SDK: dev root mint, exchange, an allowed call, a policy denial, a capability denial, revocation, `lease_revoked`, and an audit chain check. Other tests cover DPoP, refresh, the examples, offline export verification across Rust, Python and TypeScript, an export filtered on `tool` and `decision`, and revocation by chain and by MCP session (the session test starts a stack of its own: the fake upstream gives every caller the same session id and the proxy binds it to the first).
 
 ## Limits
 
