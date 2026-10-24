@@ -9,6 +9,12 @@
  *
  * `constraints` is omitted when empty. `server` and `tool` are an exact name, `*`, or a prefix
  * glob such as `read_*`.
+ *
+ * Run limits (ADR-0010) ride along as `limits`, omitted when empty:
+ *
+ * ```ts
+ * withLimits(capability("banking", "send_money"), { calls: 1, sum: { arg: "amount", max: 10 } })
+ * ```
  */
 
 export type Constraint =
@@ -16,10 +22,27 @@ export type Constraint =
   | { op: "one_of"; value: unknown[] }
   | { op: "prefix"; value: string };
 
+/** A run limit over one argument: a total (`sum`) or a count per distinct value (`calls_per`). */
+export interface ArgLimit {
+  arg: string;
+  max: number;
+}
+
+/**
+ * Run limits (ADR-0010): at most `calls` matched calls, a total of at most `sum.max` over
+ * argument `sum.arg`, at most `calls_per.max` calls per value of argument `calls_per.arg`.
+ */
+export interface Limits {
+  calls?: number;
+  sum?: ArgLimit;
+  calls_per?: ArgLimit;
+}
+
 export interface Capability {
   server: string;
   tool: string;
   constraints?: Record<string, Constraint>;
+  limits?: Limits;
 }
 
 /** Anything that can be turned into a capability: an object, `"server:tool"`, or a raw JSON dict. */
@@ -72,6 +95,52 @@ export function capability(
   return cap;
 }
 
+function isCount(v: unknown): v is number {
+  return typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+}
+
+/**
+ * Check a `limits` object and return a normalized copy. A kind this SDK does not know is refused,
+ * as the server refuses it, rather than dropped.
+ */
+function checkLimits(raw: unknown): Limits {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new TypeError("limits must be an object");
+  }
+  const out: Limits = {};
+  for (const [kind, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (kind === "calls") {
+      if (!isCount(v)) throw new TypeError("limits.calls must be an integer >= 0");
+      out.calls = v;
+    } else if (kind === "sum" || kind === "calls_per") {
+      const o = v as Record<string, unknown> | null;
+      const ok =
+        typeof o === "object" &&
+        o !== null &&
+        Object.keys(o).length === 2 &&
+        typeof o.arg === "string" &&
+        o.arg !== "" &&
+        isCount(o.max);
+      if (!ok) throw new TypeError(`limits.${kind} must be {arg: string, max: integer >= 0}`);
+      out[kind] = { arg: o.arg as string, max: o.max as number };
+    } else {
+      throw new TypeError(
+        `unknown limit kind ${JSON.stringify(kind)} (one of calls, sum, calls_per)`,
+      );
+    }
+  }
+  return out;
+}
+
+/** A copy of `cap` carrying run `limits` (ADR-0010); an empty object removes them. */
+export function withLimits(cap: Capability, limits: Limits): Capability {
+  const out: Capability = { ...cap };
+  const checked = checkLimits(limits);
+  if (Object.keys(checked).length > 0) out.limits = checked;
+  else delete out.limits;
+  return out;
+}
+
 /** `"github:read_file"` becomes `capability("github", "read_file")`. */
 export function parseCapability(text: string): Capability {
   const t = text.trim();
@@ -90,7 +159,8 @@ function fromJson(obj: Capability): Capability {
       throw new TypeError(`capability ${obj.server}:${obj.tool}: unknown constraint for ${k}`);
     }
   }
-  return capability(obj.server, obj.tool, raw);
+  const cap = capability(obj.server, obj.tool, raw);
+  return obj.limits === undefined ? cap : withLimits(cap, obj.limits);
 }
 
 /**
@@ -112,10 +182,19 @@ export function capabilitiesToJson(caps: CapabilityLike | readonly CapabilityLik
   return out;
 }
 
-/** Human-readable form: `github:read_file{repo={"op":"prefix","value":"alice/"}}`. */
+/**
+ * Human-readable form: `github:read_file{repo={"op":"prefix","value":"alice/"}}`, with run
+ * limits after it: `banking:send_money[calls<=1,sum(amount)<=10]`.
+ */
 export function formatCapability(cap: Capability): string {
-  const base = `${cap.server}:${cap.tool}`;
+  let out = `${cap.server}:${cap.tool}`;
   const cs = Object.entries(cap.constraints ?? {});
-  if (cs.length === 0) return base;
-  return `${base}{${cs.map(([k, c]) => `${k}=${JSON.stringify(c)}`).join(",")}}`;
+  if (cs.length > 0) out += `{${cs.map(([k, c]) => `${k}=${JSON.stringify(c)}`).join(",")}}`;
+  const l = cap.limits ?? {};
+  const ls: string[] = [];
+  if (l.calls !== undefined) ls.push(`calls<=${l.calls}`);
+  if (l.sum) ls.push(`sum(${l.sum.arg})<=${l.sum.max}`);
+  if (l.calls_per) ls.push(`calls_per(${l.calls_per.arg})<=${l.calls_per.max}`);
+  if (ls.length > 0) out += `[${ls.join(",")}]`;
+  return out;
 }

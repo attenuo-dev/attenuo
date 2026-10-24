@@ -75,3 +75,31 @@ def test_normalize_mixed_inputs() -> None:
     ]
     assert capabilities_to_json("github:*") == [{"server": "github", "tool": "*"}]
     assert capabilities_to_json(Capability("a", "b")) == [{"server": "a", "tool": "b"}]
+
+
+def test_limits_round_trip_and_unknown_kinds_are_refused() -> None:
+    cap = Capability("banking", "send_money").with_limits(
+        calls=1, sum=("amount", 10), calls_per=("recipient", 1)
+    )
+    wire = {
+        "server": "banking",
+        "tool": "send_money",
+        "limits": {
+            "calls": 1,
+            "sum": {"arg": "amount", "max": 10},
+            "calls_per": {"arg": "recipient", "max": 1},
+        },
+    }
+    assert cap.to_json() == wire
+    assert Capability.from_json(wire) == cap
+    # Raw dicts keep their limits when normalized (they used to be dropped).
+    assert capabilities_to_json([wire]) == [wire]
+    assert "limits" not in Capability("banking", "send_money").to_json()
+    for bad in (
+        {"distinct": {"arg": "to", "max": 1}},
+        {"calls": -1},
+        {"calls": 1.5},
+        {"sum": {"arg": "amount"}},
+    ):
+        with pytest.raises(ValueError):
+            Capability.from_json({"server": "b", "tool": "t", "limits": bad})
