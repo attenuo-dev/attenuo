@@ -178,7 +178,7 @@ Show the most recent audit entries, oldest of them first. Filters keep only matc
 | `--before SEQ` | the head | Show the `-n` matching entries just below `SEQ` instead of the newest. To page back, pass the oldest `seq` shown. Not with `--follow`. |
 | `-f`, `--follow` | off | Keep polling for new matching entries. |
 | `--interval-ms` | 1000 | Polling interval with `--follow`. |
-| `--kind` | all | Record kind: `decision`, `tool_result`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin`. Repeatable, or comma-separated; any of them matches. |
+| `--kind` | all | Record kind: `decision`, `tool_result`, `approval_request`, `approval_grant`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin`. Repeatable, or comma-separated; any of them matches. |
 | `--decision` | all | `allow` or `deny`. |
 | `--reason` | all | The record's `reason` (`policy_deny`, `lease_revoked`, ...). |
 | `--subject` | all | The originating user. |
@@ -190,6 +190,21 @@ Show the most recent audit entries, oldest of them first. Filters keep only matc
 | `--since`, `--until` | | RFC 3339 times: records with `at` in `[since, until)`. |
 
 The filters are the query parameters of `GET /admin/audit` (see [Querying the audit log](http-api.md#querying-the-audit-log)): exact matches, combined with AND. A bad kind, decision or time is refused before any request. The CLI reads newest first (`order=desc&before=N`) and keeps following `prev` until it has `-n` entries, because a filtered page can come back short, even empty, when the server stops scanning. `--follow` then reads forward from the head the same way, following `next`. With `--json` each entry is one JSON line.
+
+Every line starts with the sequence number and the time. Decisions, token issuance, lease and admin records show `ALLOW` or `DENY`, `server/tool`, the agents and user, the `reason` and the record id. Records that are not decisions show their kind where `ALLOW`/`DENY` would be, and the details of that kind in place of the reason. Shown here with ids and times shortened:
+
+```text
+#3    2026-10-24T08:45:18Z  ALLOW github/read_file  assistant for alice  reason=policy_allow  id=9f35...
+#4    2026-10-24T08:45:18Z  tool_result  github/read_file  assistant for alice  decision=9f35...  label=untrusted size=149  id=a70d...
+#5    2026-10-24T08:45:18Z  DENY  github/create_issue  assistant for alice  reason=approval_required  id=b9ad...
+#6    2026-10-24T08:45:18Z  approval_request  github/create_issue  assistant for alice  decision=b9ad...  approval=1388... expires=2026-10-24T08:47:18Z  id=7a41...
+#7    2026-10-24T08:45:18Z  approval_grant  github/create_issue  assistant for alice  decision=b9ad...  approval=1388... outcome=grant by=operator  id=e966...
+```
+
+- `tool_result`: `decision=` is the call it answers, `label=` is `untrusted` or `trusted`, `size=` the bytes of the canonical result; ` error` follows when the upstream answered with a JSON-RPC error. The content is not stored.
+- `approval_request`: `decision=` is the gated decision, `expires=` when the approval stops being usable.
+- `approval_grant`: `outcome=` is `grant` or `decline`, `by=` is `user` or `operator`.
+- `exchange`, `root_token`, `lease_renew`, `lease_revoke` and `admin` records already name themselves in `server/tool` (`attenuo/token.exchange`, `attenuo/admin.lease.revoke`, ...) and print as before. `audit show` prints the same first line.
 
 ### `audit show <SEQ>` / `audit show --id <UUID>`
 
