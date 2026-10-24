@@ -1,6 +1,6 @@
 # Performance: micro-benchmarks and end to end
 
-- Status: third measurement, after the policy-stage and WAL work (`perf/policy-stage-and-wal-checkpoints`); exchange, lease renewal and open-loop cells added 2026-10-23 (`perf/exchange-lease-bench`); output labelling and run limits on the hot path added 2026-10-24 (`perf/labels-limits-cost`)
+- Status: third measurement, after the policy-stage and WAL work (`perf/policy-stage-and-wal-checkpoints`); exchange, lease renewal and open-loop cells added 2026-10-23 (`perf/exchange-lease-bench`); output labelling and run limits on the hot path added 2026-10-24 (`perf/labels-limits-cost`); the SR-55 run lock under concurrent clients added 2026-10-24 (`perf/run-lock-cost`)
 - Crates: `attenuo-policy` (`benches/authorize.rs`, `benches/policy_stage.rs`), `attenuo-core` (`benches/attenuation.rs`), `attenuo-server` (`benches/decide.rs`, the decision path by stage), `attenuo-bench` (end to end)
 - Related: [server pipeline](server.md), [ADR-0006](../decisions/0006-lease-based-in-flight-revocation.md)
 - Sources: every figure links the committed file it comes from in [`bench/`](bench/). A figure with no file says "(unrecorded)". Where a rerun of 2026-10-23 gave a different number, the rerun is in the text and the earlier figure is kept in a "quoted earlier, unrecorded" note.
@@ -705,6 +705,38 @@ Anomaly, measured and not fixed: on the in-memory store a new-value charge costs
 
 Not measured: these kinds under concurrent clients, at `durability = "full"` end to end (in process only), on the memory store end to end, with list-valued arguments (one charge per element), with more than one limit kind per capability, and with values that are refused (`max` reached, or `limit_arg_invalid`).
 
+### The SR-55 run lock under concurrent clients (2026-10-24)
+
+Branch `perf/run-lock-cost`, main `e04b516`. Security pass 5 (SR-55) added `Pipeline::run_guard`: one of 64 striped `std::sync::Mutex`es, chosen by the run's `chain_id`, held from the budget read to the end of the charge for every call that matches a limited hop or keeps run usage. This section measures what it costs when many clients share one run, the case it serialises, and when each has its own. Results, full tables and the rerun commands: [`bench/2026-10-24-vm-run-lock.md`](bench/2026-10-24-vm-run-lock.md) and `.json`.
+
+**Method.** `attenuo-bench hot-path` has a new option, `--tokens N`: N root tokens, each its own run, with client i on run i mod N. Two server builds: main (after) and `84b9578`, the parent of the SR-55 commit (before), built in a second worktree; the same bench binary drives both. 8 and 32 clients, on one run (`--tokens 1`) and on a run each (`--tokens` equal to `--clients`); configurations `baseline` (no lock in either build), `limits_calls` (lock, `calls` charge) and `usage` (lock, usage write); file store at `durability = "normal"`, 2-hop token, the `destructive` cell, 2 s warm-up and 10 s measured. Each invocation is one run of the three configurations on one build, the builds alternating; 5 runs per pass, the second pass reversed. Two series: before against after, then before, after and a narrowed lock (below). Release build with `lto = false` and `codegen-units = 16`, as the sections above. Same shared 4-vCPU container, with another agent's fuzz campaign at full CPU throughout: load average 3.4 to 12.6. The lock is taken inside the `policy` stage's timer, so that stage's mean includes the wait for it.
+
+**Noise.** `baseline` takes no lock in either build, and its req/s still differed between the builds by -17 to +13 percent within a pass. So throughput differences under about 15 percent between two builds are not resolved here; the `policy` stage resolves the lock wait, because it moves by milliseconds.
+
+| clients / runs | config | req/s, after against before (4 passes) | `policy` mean, before / after |
+|---|---|---|---|
+| 8 / 1 | `limits_calls` | -10, -11, -10, -14 % | 0.9 / 2.8 to 3.9 ms |
+| 8 / 1 | `usage` | -4, -7, -3, -5 % | 0.9 / 2.6 to 3.3 ms |
+| 32 / 1 | `limits_calls` | -22, -15, -2, -4 % | 3.6 to 4.3 / 21.9 to 25.6 ms |
+| 32 / 1 | `usage` | -15, -8, -4, +4 % | 3.6 to 4.2 / 20.6 to 22.4 ms |
+| 32 / 1 | `baseline` (no lock) | -3, -7, +4, 0 % | 2.3 to 2.4 / 2.3 to 2.4 ms |
+| 8 / 8 | `limits_calls` | -11, -9, -17, -11 % | 0.93 to 0.98 / 1.10 to 1.18 ms |
+| 8 / 8 | `baseline` (no lock) | +11, 0, -11, -8 % | 0.57 to 0.59 / 0.60 to 0.67 ms |
+| 32 / 32 | `limits_calls` | -3, -3, -5, -5 % | 4.0 to 4.5 / 4.3 to 4.9 ms |
+| 32 / 32 | `usage` | -5, +5, -4, -4 % | 3.9 to 4.5 / 3.9 to 4.7 ms |
+
+Readings:
+
+- **On one run the lock mostly moves the queue.** Before SR-55, 32 clients of one run queued for the file's write gate: 4.9 ms in the charge, 7.2 to 7.4 ms in the decision append and 7.0 to 7.3 ms in the result append (series 2, `limits_calls`). With the lock they wait 18 to 22 ms for it, and the charge (0.4 ms) and both appends (1.2 to 1.9 ms) then find the gate nearly free. The handler's total grew by 5 to 9 percent, throughput fell by a median of 9.5 percent for `limits_calls` and 6 percent for `usage` (22 percent in the worst pass, a 4 percent gain in the best), and the client p90 grew by 24 to 37 percent in series 2 while p50 stayed within 1 ms.
+- **At 8 clients on one run** each call waits 2 to 3 ms for the lock; `limits_calls` lost 10 to 14 percent of throughput in all four passes and `usage` 3 to 7 percent, inside the noise `baseline` shows.
+- **One run's ceiling is one decision per lock hold**, about 0.85 to 1.0 ms here (the budget read, Cedar, and the charge, which waits for the gate behind the audit writer's batch commit). This 4-vCPU host saturates near that rate anyway; on a larger host one run's limited or usage-tracked calls would stay near it while other runs scale.
+- **Runs do not wait on each other.** With a run per client the `policy` stage grows by 0.02 to 0.7 ms, against 18 to 22 ms on one run. The throughput differences there match `baseline`'s noise; at 8 runs `limits_calls` lost its time in the charge and the appends, not in `policy`. The before build also lacks SR-62's index on the charge log; that was not separated.
+- **Stripe collisions** were computed, not measured: with 64 stripes a run shares its stripe with another with probability 1 - (63/64)^(N-1), 10 percent at 8 runs and 39 percent at 32, and a shared stripe costs only when two runs' budgeted decisions overlap. The 32-run cells show no lock wait.
+
+**Decision: no server change.** The cost at 32 clients on one run is about the 10 percent line (median 6 to 9.5 percent, worst pass 22), and nothing measurable on separate runs. Candidate (a), taking the lock only after the label read, argument taint and approval take, was built and measured in the second series: the lock wait fell by 1 to 2 ms, but the time reappeared in the approval take (a write transaction), the charge and the appends, and req/s against main moved -1 to +3 percent at 32 clients on one run (8 clients: +22 and -3 percent for `limits_calls`, +13 and -6 for `usage`). Not a clear win, so not kept. A `parking_lot` mutex (b) changes the lock's own cost, but the time is in the hold; per-chain locks (c) remove collisions, which do not show. What would raise one run's ceiling is a shorter hold, which means a cheaper charge transaction or an approval take that skips its write transaction when no approval is granted; neither is in scope here.
+
+Not measured for the run lock: a build of main with the lock removed (the before build differs by the other pass-5 fixes too, SR-62's charge-log index among them), stripe collisions directly, the lock with a `sum` limit or at `durability = "full"` (where the hold includes an `fsync`), runs with approvals granted, the memory store, and a quiet or larger host.
+
 ### How to run
 
 ```
@@ -729,6 +761,8 @@ cargo test --release -p attenuo-audit --test single_client_outliers -- --ignored
 attenuo-bench hot-path --configs baseline --runs 3 --audit-set checkpoint_every=0          # counts over 3, 5 and 10 ms per stage; [audit] keys per run
 attenuo-bench hot-path --runs 5 --cells destructive --configs baseline,limits_calls,calls_per_new,calls_per_same,distinct_new,distinct_same,host_new,host_same  # per-value limit kinds
 cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3 'derive_host|charges_for/|charge_.*/(calls_per|distinct|host)'  # the same in process, and the URL parse
+attenuo-bench hot-path --runs 1 --cells destructive --configs baseline,limits_calls,usage --clients 32 --tokens 1   # one run under 32 clients (the SR-55 run lock); --bin-dir per build, alternating
+attenuo-bench hot-path --runs 1 --cells destructive --configs baseline,limits_calls,usage --clients 32 --tokens 32  # a run per client
 ```
 
 `attenuo-bench --print-config DIR` writes the server config and policy it expects, for pointing the harness at an already running server (`--attenuo-url`, `--upstream-url`, and `--metrics-url` for the stage table). Every answer is checked: a denial counts only as the proxy's `-32003` with the expected reason code and a decision id listed in `X-Attenuo-Decision-Id`, so an `audit_error` denial, a `too_many_sessions` refusal or a `5xx` stops the run after that cell. A one-second smoke run is part of `cargo test --workspace` (`crates/attenuo-bench/tests/smoke.rs`). There is no CI job for the full matrix: it needs a release build and minutes of load, and numbers from shared runners could not be compared.
@@ -740,4 +774,5 @@ cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-t
 - The time outside the proxy's handler (hyper and axum parsing the client's request, relaying a streamed body). The handler's stages are in `attenuo_proxy_stage_seconds`; what lies between them and the client's latency is measured only as a difference.
 - Confidence intervals over repeated runs, open-loop load for the deny outcomes and for more than one hop, and a quiet reference machine. (Open-loop arrivals exist now, for the allow call at one hop and for exchange.)
 - Streaming (SSE) responses and `tools/list` filtering.
+- The SR-55 run lock with a `sum` limit, at `durability = "full"` and on the memory store; one run's ceiling on a host with more cores (see [the run lock section](#the-sr-55-run-lock-under-concurrent-clients-2026-10-24)).
 - Output labelling under concurrency end to end (run limits under 1, 4 and 8 clients are in [Write-lock contention between the lease and audit connections](#write-lock-contention-between-the-lease-and-audit-connections-2026-10-24)), run limits on the memory store end to end and at `durability = "full"` end to end (`calls_per` and `distinct` from one client are in [Limit kinds](#limit-kinds-callsper-and-distinct-2026-10-24)); the charge and the run-label write have no stage of their own in `attenuo_proxy_stage_seconds` (see [Output labelling and run limits on the hot path](#output-labelling-and-run-limits-on-the-hot-path-2026-10-24)).
