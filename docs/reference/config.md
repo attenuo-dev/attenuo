@@ -204,7 +204,7 @@ With no matching entry, no root token is issued.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `stream_recheck_seconds` | `2` | How often a long-lived response stream (the `GET` listen stream, or a `POST` answered over SSE) is re-checked against lease state and token expiry. At the first failure the stream ends, after a final SSE event with JSON-RPC error `-32001` and `data.reason` (`lease_revoked`, `token_expired`, ...). At least 1. |
+| `stream_recheck_seconds` | `2` | How often a long-lived response stream (the `GET` listen stream, or a `POST` answered over SSE) is re-checked against lease state and token expiry. At the first failure the stream ends, after a final SSE event with JSON-RPC error `-32001`, `data.reason` (`lease_revoked`, `token_expired`, ...) and `data.decision_id`, the id of the `stream.end` audit record of the end. At least 1. |
 | `require_listed_tools` | `true` | Deny (`-32003`, reason `tool_not_listed`, audited) a `tools/call` whose exact name the upstream never returned from `tools/list` and the catalog does not know. Stops an upstream that resolves names case-insensitively from running `delete_repo` for `Delete_Repo` (SR-25). A `tools/call` name outside the name rule is always denied with `invalid_name`. |
 | `max_upstream_body_bytes` | `16777216` (16 MiB) | Largest upstream body the proxy buffers: a JSON response it filters or merges replies into, or one SSE event. Over it: `502`, JSON-RPC `-32005`, reason `upstream_body_too_large` (an SSE stream ends instead). At least 1. |
 | `max_request_body_bytes` | `4194304` (4 MiB) | Largest client request body, read after authentication. Over it: `413`, reason `request_too_large`. At least 1. |

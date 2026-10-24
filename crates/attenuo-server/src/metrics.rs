@@ -417,7 +417,8 @@ impl Metrics {
             &mut out,
             "decisions_total",
             "Decision records by outcome and reason code: pipeline decisions (MCP proxy and \
-             AuthZEN), requests the proxy refused and recorded before a decision, and \
+             AuthZEN), requests the proxy refused and recorded before a decision, \
+             streams the proxy ended on revocation or expiry, and \
              refused token exchanges and lease renewals whose token verified. \
              Unauthenticated requests \
              are not counted.",

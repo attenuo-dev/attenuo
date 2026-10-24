@@ -98,12 +98,14 @@
 //!
 //! Not authorized per call (forwarded after authentication and a lease check):
 //! `initialize`, `ping`, `tools/list`, `resources/list`, `resources/templates/list`,
-//! `prompts/list`, `logging/setLevel`, and every `notifications/*`. A message with no `method`
-//! (a client response to a server request) is forwarded after the lease check.
+//! `prompts/list`, `resources/unsubscribe`, `logging/setLevel`, and every `notifications/*`. A
+//! message with no `method` (a client response to a server request) is forwarded after the
+//! lease check. A failed lease check of any of them is recorded as a `deny` under the method's
+//! name (or `http.POST`). `resources/unsubscribe` only gives something up, so it needs no
+//! decision; `resources/subscribe` does.
 //!
-//! The default is deny: an unknown method (including `resources/unsubscribe` and
-//! `sampling/*`) is allowed only if a capability and the policy permit a tool named after the
-//! method. A request missing the field the mapping needs (`name`, `uri`) is answered with
+//! The default is deny: an unknown method (including `sampling/*`) is allowed only if a
+//! capability and the policy permit a tool named after the method. A request missing the field the mapping needs (`name`, `uri`) is answered with
 //! `-32602` and is not forwarded. `tools/call` and `prompts/get` with the same `name` stay
 //! distinct because the latter's tool is `prompts/get`.
 //!
@@ -116,9 +118,13 @@
 //!   are emitted as leading SSE `message` events on the same stream.
 //! - The proxy does not add credentials for the upstream; the bearer token it receives is
 //!   attenuo's, not the upstream's, and is never forwarded.
-//! - A server-to-client stream (the `GET` SSE channel, including a resumed one) is not
-//!   inspected beyond being relayed event by event and re-checked; the client's replies to
-//!   server requests are forwarded after a lease check, not authorized.
+//! - On a server-to-client stream (the `GET` SSE channel, including one resumed with
+//!   `Last-Event-ID`) the proxy did not see the requests, so a response there whose `result`
+//!   holds a list array is filtered by its shape ([`filter::list_kinds_by_shape`]), answers to
+//!   allowed calls are labelled ([`label`]), and everything else is relayed event by event and
+//!   re-checked. A `GET` answered with anything but SSE is relayed as is (MCP allows only SSE
+//!   or `405`). The client's replies to server requests are forwarded after a lease check, not
+//!   authorized.
 //! - Authentication is performed per HTTP request; there is no caching of resolved chains.
 //!
 //! [`DelegationChain`]: attenuo_core::DelegationChain
