@@ -572,8 +572,8 @@ function checkHeader(h: unknown): Obj {
   if (h.filter !== undefined && h.filter !== null) {
     throw new ExportError(
       "the export is filtered (its header has a `filter`), so its hash chain has gaps and " +
-        "nothing proves it is complete; verify an export taken without kind and chain_id " +
-        "filters, then filter that",
+        "nothing proves it is complete; verify an export taken without kind, chain_id, tool " +
+        "or decision filters, then filter that",
     );
   }
   return h;
