@@ -18,7 +18,9 @@
 //!   of them, `GET /admin/audit/checkpoint`, signs a checkpoint of the head when it has none;
 //!   it is mounted as a read because it changes no recorded fact and the CLI treats it as one.
 //! - With `[admin_ui] allow_write = true` only, the routes that change state
-//!   ([`write_routes`]), which also require `Content-Type: application/json`.
+//!   ([`write_routes`]), which also require `Content-Type: application/json`. Without it,
+//!   `POST /admin/leases/revoke` is still mounted for its dry run (`?preview=true`, JSON
+//!   `Content-Type` required) and answers a revocation with 404.
 //! - Never `POST /admin/root-token`, whatever `[dev] allow_root_mint` says.
 //!
 //! Every response, errors and 404s included, carries [`SECURITY_HEADERS`]; every response that
@@ -26,7 +28,8 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Request, State};
+use axum::body::Bytes;
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -193,12 +196,29 @@ pub fn read_routes() -> Router<Arc<AppState>> {
         .merge(evaluate)
 }
 
+/// `POST /admin/leases/revoke` on a console listener without `allow_write`: only the dry run
+/// (`?preview=true`) is served, so the lease page can show what revoking a chain or a user
+/// would change. A revocation is answered 404, as the write routes are when not mounted.
+async fn selector_preview_only(
+    state: State<Arc<AppState>>,
+    q: Query<admin::SelectorRevokeQuery>,
+    body: Bytes,
+) -> Result<axum::Json<serde_json::Value>, ApiError> {
+    if !q.preview {
+        return Err(ApiError::not_found(
+            "writes are disabled on the console listener; only `?preview=true` is served",
+        ));
+    }
+    admin::revoke_by_selector(state, q, body).await
+}
+
 /// The admin routes that change state, mounted on the console listener only with
 /// `[admin_ui] allow_write = true`. Each requires a JSON `Content-Type` ([`require_json`]).
 /// `POST /admin/root-token` is deliberately absent and must never be added.
 pub fn write_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/admin/leases/{lease_id}/revoke", post(admin::revoke_lease))
+        .route("/admin/leases/revoke", post(admin::revoke_by_selector))
         .route("/admin/budgets/refund", post(admin::refund_budget))
         .route("/admin/policies/reload", post(admin::reload_policies))
         .route("/admin/approvals/{id}", post(approvals::admin_decide))
@@ -211,6 +231,12 @@ pub fn router(state: Arc<AppState>, config: &Config) -> Router {
     let mut api = read_routes();
     if config.admin_ui.allow_write {
         api = api.merge(write_routes());
+    } else {
+        api = api.merge(
+            Router::new()
+                .route("/admin/leases/revoke", post(selector_preview_only))
+                .route_layer(middleware::from_fn(require_json)),
+        );
     }
     // `require_admin` is added last so it runs first: no bearer is 401 before anything else.
     let api = api

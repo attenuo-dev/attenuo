@@ -442,11 +442,14 @@ pub struct TreeQuery {
 /// - `would_revoke`: how many leases `POST /admin/leases/{lease_id}/revoke` would revoke if
 ///   sent now, counted over the whole subtree with the same query the revocation runs.
 ///
-/// Each node carries its registry row, whether it is active now, and `agent`, `issued_at`
-/// and `issued_seq` from the audit record that issued it (null when none is found), and
-/// `budget`, the hop's run limits and what is left of them (see `hop_budget`; null when
-/// the hop has no limits and nothing was charged under its lease). Nothing is written, not
-/// even an audit record: this is a read like `GET /admin/leases/{id}`.
+/// Each node carries its registry row, whether it is active now, `chain_id` (the chain's
+/// first-hop lease, the same as `root`; the selector `POST /admin/leases/revoke` takes),
+/// `subject` (the originating user recorded at issue, [`LeaseStore::subject`], read for all
+/// nodes in one store call; null for a lease registered before subjects were recorded),
+/// `agent`, `issued_at` and `issued_seq` from the audit record that issued it (null when none
+/// is found), and `budget`, the hop's run limits and what is left of them (see `hop_budget`;
+/// null when the hop has no limits and nothing was charged under its lease). Nothing is
+/// written, not even an audit record: this is a read like `GET /admin/leases/{id}`.
 pub async fn lease_tree(
     State(state): State<Arc<AppState>>,
     Path(lease_id): Path<String>,
@@ -478,6 +481,9 @@ pub async fn lease_tree(
                 .into_iter()
                 .filter_map(|e| Some((e.record.leases.last()?.clone(), e)))
                 .collect();
+            // The originating user of every listed lease, in one store call however long
+            // the list is. Leases registered before subjects were recorded have none.
+            let subjects = state.leases.subjects(&wanted)?;
             let now = now();
             let fmt = |t: time::OffsetDateTime| t.format(&Rfc3339).unwrap_or_default();
             let budgets: BTreeMap<&LeaseId, Value> = tree
@@ -491,6 +497,8 @@ pub async fn lease_tree(
                 json!({
                     "budget": budgets.get(&n.id).cloned().unwrap_or(Value::Null),
                     "lease_id": n.id,
+                    "chain_id": root,
+                    "subject": subjects.get(&n.id),
                     "parent": n.row.parent,
                     "expires_at": fmt(n.row.expires_at),
                     "revoked_at": n.row.revoked_at.map(fmt),

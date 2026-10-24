@@ -8,7 +8,9 @@
 //     a second public one (budget_exhausted) and tries create_issue (capability_denied);
 //   - the assistant opens an issue (approval_required), the operator grants it with the CLI and
 //     the identical retry is allowed (the approval is consumed); a second issue is left
-//     pending for the browser to grant.
+//     pending for the browser to grant;
+//   - carol gets a chain of two leases (root and a coder hop) and bob two chains (one with a
+//     coder hop), for the lease page's "Revoke chain…" and "Revoke all for <user>…" actions.
 'use strict';
 
 const { execFileSync } = require('node:child_process');
@@ -93,6 +95,16 @@ function populate(e) {
   const pendingGate = call(e, root.access_token, 'create_issue', { repo: 'alice/public-docs', title: 'second issue' }, [2]).json;
   const pendingId = pendingGate.error.data.approval_id;
 
+  // Chains the selector revocations in the lease page act on, apart from alice's run: carol's
+  // chain (root and a coder hop) is revoked as a chain; bob's two chains are revoked by user.
+  const exchangeCoder = (parent) => cliJson(e, ['token', 'exchange', '--actor', 'coder', '--client-secret-stdin', '--cap', 'github:read_file'],
+    { token: parent.access_token, stdin: `${CODER_SECRET}\n` }).json;
+  const carolRoot = cliJson(e, ['token', 'root', '--subject', 'carol', '--agent', 'assistant', '--cap', 'github:*']).json;
+  const carolChild = exchangeCoder(carolRoot);
+  const bobRoot = cliJson(e, ['token', 'root', '--subject', 'bob', '--agent', 'assistant', '--cap', 'github:*']).json;
+  const bobChild = exchangeCoder(bobRoot);
+  const bobSecond = cliJson(e, ['token', 'root', '--subject', 'bob', '--agent', 'assistant', '--cap', 'github:*']).json;
+
   const reasons = {
     policyDeny: denied.error.data.reason,
     budgetExhausted: exhausted.error.data.reason,
@@ -115,6 +127,9 @@ function populate(e) {
     pendingApproval: pendingId,
     budgetExhaustedDecision: exhausted.error.data.decision_id,
     policyDenyDecision: denied.error.data.decision_id,
+    carolRootLease: carolRoot.lease,
+    carolChildLease: carolChild.lease,
+    bobLeases: [bobRoot.lease, bobChild.lease, bobSecond.lease],
   };
 }
 

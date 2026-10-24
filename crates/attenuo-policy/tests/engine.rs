@@ -632,6 +632,32 @@ fn shipped_default_policy_file_loads_from_disk() {
     );
 }
 
+/// `config/policies/default_test.yaml` covers the shipped default policy set: every case
+/// passes and every policy is exercised. The crate's copy (`DEFAULT_POLICIES`) must be the same
+/// bytes as the file the suite tests, so the suite covers both.
+#[test]
+fn shipped_default_policy_passes_its_tests() {
+    use attenuo_policy::testing::{coverage, TestFile};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let config_copy = std::fs::read_to_string(root.join("config/policies/default.cedar")).unwrap();
+    assert_eq!(
+        config_copy, DEFAULT_POLICIES,
+        "config/policies/default.cedar and crates/attenuo-policy/policies/default.cedar differ"
+    );
+    let file = TestFile::load(&root.join("config/policies/default_test.yaml")).unwrap();
+    let report = file.run().unwrap();
+    for case in &report.cases {
+        assert!(
+            case.passed,
+            "{}: {:?} {:?}",
+            case.name, case.failures, case.error
+        );
+    }
+    let cov = coverage([&report]);
+    assert_eq!(cov.policies, 4);
+    assert!(cov.unexercised.is_empty(), "{:?}", cov.unexercised);
+}
+
 #[test]
 fn duplicate_policy_ids_are_rejected() {
     let err = PolicyEngineBuilder::new()

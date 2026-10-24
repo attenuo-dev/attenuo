@@ -596,6 +596,53 @@ fn subjects_are_write_once_and_only_for_known_leases() {
     }
 }
 
+/// `subjects` answers in one call what `subject` answers per lease: leases with no recorded
+/// subject (here `b`, standing for a lease from before subjects were kept, `legacy`, and an
+/// unknown id) are absent.
+#[test]
+fn subjects_in_one_call_agree_with_subject_per_lease() {
+    for (name, store) in stores() {
+        two_users(store.as_ref());
+        let all = [
+            "root", "a", "a1", "a2", "a2x", "b", "broot", "bchild", "legacy", "ghost",
+        ];
+        let leases: Vec<LeaseId> = all.iter().map(|l| id(l)).collect();
+        let refs: Vec<&LeaseId> = leases.iter().collect();
+        let got = store.subjects(&refs).unwrap();
+        for l in &leases {
+            assert_eq!(
+                got.get(l).cloned(),
+                store.subject(l).unwrap(),
+                "{name}: {}",
+                l.0
+            );
+        }
+        assert_eq!(got.len(), 7, "{name}");
+        assert!(store.subjects(&[]).unwrap().is_empty(), "{name}");
+    }
+}
+
+/// More leases than one `IN (...)` query takes are answered in chunks.
+#[test]
+fn subjects_of_a_long_list_are_read_in_chunks() {
+    for (name, store) in stores() {
+        let exp = t0() + Duration::hours(1);
+        let leases: Vec<LeaseId> = (0..150).map(|i| id(&format!("l{i:03}"))).collect();
+        for (i, l) in leases.iter().enumerate() {
+            store.register(l, None, exp).unwrap();
+            if i % 3 != 0 {
+                store.record_subject(l, &format!("user{}", i % 5)).unwrap();
+            }
+        }
+        let refs: Vec<&LeaseId> = leases.iter().collect();
+        let got = store.subjects(&refs).unwrap();
+        assert_eq!(got.len(), 100, "{name}");
+        assert_eq!(got[&id("l001")], "user1", "{name}");
+        assert!(!got.contains_key(&id("l147")), "{name}");
+        assert_eq!(got[&id("l149")], "user4", "{name}");
+    }
+}
+
 /// A user's leases are revoked with their descendants; another user's chain and a lease with
 /// no recorded subject are not touched. The preview names exactly what the revocation then
 /// changes.
