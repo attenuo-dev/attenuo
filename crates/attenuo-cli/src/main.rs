@@ -237,7 +237,39 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 .await?;
             Ok(print_tools(&resp, json))
         }
-        Command::Lease(LeaseCmd::Revoke { id, reason }) => {
+        Command::Lease(LeaseCmd::Revoke {
+            id: None,
+            user,
+            chain_id,
+            preview,
+            reason,
+        }) => {
+            let mut body = match (user, chain_id) {
+                (Some(u), None) => json!({ "user": u }),
+                (None, Some(c)) => json!({ "chain_id": c }),
+                _ => anyhow::bail!("give exactly one of a lease id, --user or --chain-id"),
+            };
+            if let Some(r) = reason {
+                body["reason"] = json!(r);
+            }
+            let path = if preview {
+                "/admin/leases/revoke?preview=true"
+            } else {
+                "/admin/leases/revoke"
+            };
+            let resp = client?.admin_post(path, &body).await?;
+            if json {
+                print_json(&resp);
+            } else {
+                print!("{}", render::render_selector_revocation(&resp));
+            }
+            Ok(Outcome::Ok)
+        }
+        Command::Lease(LeaseCmd::Revoke {
+            id: Some(id),
+            reason,
+            ..
+        }) => {
             let body = match reason {
                 Some(r) => json!({ "reason": r }),
                 None => json!({}),

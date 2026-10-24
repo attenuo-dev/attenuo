@@ -151,6 +151,24 @@ List the tools the token may see (`tools/list`). Takes `--token` (or `--token-fi
 
 Revoke a lease and every lease delegated from it. Needs the admin token.
 
+### `lease revoke --user SUB | --chain-id ID [--preview] [--reason TEXT]`
+
+Revoke every unrevoked lease of one originating user (`--user`, the `sub` of the chain's originating user) or of one delegation chain (`--chain-id`, the `chain_id` of its audit records, which is its first hop's lease), each with everything delegated from it ([`POST /admin/leases/revoke`](http-api.md#revoke-by-user-or-chain)). Give exactly one of a lease id, `--user` and `--chain-id`. `--preview` lists what would be revoked and changes nothing. Leases registered before the server recorded subjects have none, so `--user` does not find them; `--chain-id` does. Needs the admin token.
+
+```text
+$ attenuo lease revoke --user alice@example.com --reason "laptop stolen"
+selector  user alice@example.com
+matched   2 lease(s)
+revoked 3 lease(s)
+  0b7e...
+  6f1c...
+  a93d...
+reason    laptop stolen
+audit     3f2a...
+```
+
+The matches come first, then the descendants the cascade reached. With `--preview` the output starts with `preview: nothing was changed`, says `would revoke`, and has no reason or audit line. `--json` prints the server's answer.
+
 ### `lease show <ID>`
 
 Show a lease's state. Needs the admin token.

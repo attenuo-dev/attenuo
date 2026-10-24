@@ -20,6 +20,7 @@
 //! | `POST/GET/DELETE /mcp/{server}` | delegation token | MCP proxy |
 //! | `POST /admin/root-token` | admin | dev-only hop-0 mint ([`routes::dev_root`]), mounted only with `[dev] allow_root_mint = true` |
 //! | `POST /admin/leases/{id}/revoke`, `GET /admin/leases/{id}` | admin | leases |
+//! | `POST /admin/leases/revoke?preview` | admin | revoke every lease of one user or one chain, with the cascade, audited ([`routes::admin::revoke_by_selector`]) |
 //! | `GET /admin/leases/{id}/tree?max_nodes` | admin | lease subtree, ancestors and how many leases a revoke would change (read-only, [`routes::admin::lease_tree`]) |
 //! | `POST /admin/budgets/refund` | admin | return what one decision charged to the run limits, once, audited ([`routes::admin::refund_budget`]) |
 //! | `GET /admin/audit`, `/admin/audit/verify`, `/admin/audit/checkpoint` | admin | audit |
@@ -80,6 +81,7 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
     use routes::{admin, approvals, authzen, dev_root, policies, renew, token, wellknown};
 
     let mut admin_routes = Router::new()
+        .route("/admin/leases/revoke", post(admin::revoke_by_selector))
         .route("/admin/leases/{lease_id}", get(admin::lease_status))
         .route("/admin/leases/{lease_id}/revoke", post(admin::revoke_lease))
         .route("/admin/leases/{lease_id}/tree", get(admin::lease_tree))

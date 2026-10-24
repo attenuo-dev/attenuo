@@ -31,8 +31,8 @@ use crate::checkpoint::{
 use crate::error::AuditError;
 use crate::export::RecordFilter;
 use crate::lease::{
-    ancestors_of, breadth_first, classify, LeaseRow, LeaseStatus, LeaseStore, LeaseSubtree,
-    RunLabel,
+    ancestors_of, breadth_first, classify, LeaseRow, LeaseSelector, LeaseStatus, LeaseStore,
+    LeaseSubtree, RunLabel, SelectorRevocation,
 };
 use crate::log::{
     canonical_record_json, entry_hash_from_json, verify_entries, AuditEntry, AuditSink,
@@ -101,6 +101,14 @@ CREATE TABLE IF NOT EXISTS lease_bindings (
     id      TEXT PRIMARY KEY,
     binding TEXT NOT NULL
 );
+-- The originating user's subject of each lease (`LeaseStore::record_subject`), for revoking
+-- every lease of one user. Created at open on stores that predate it; a lease registered
+-- before then has no row and is not matched by a subject.
+CREATE TABLE IF NOT EXISTS lease_subjects (
+    id      TEXT PRIMARY KEY,
+    subject TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS lease_subjects_subject_idx ON lease_subjects(subject);
 CREATE TABLE IF NOT EXISTS run_labels (
     chain_id    TEXT    NOT NULL,
     source      TEXT    NOT NULL,
@@ -2733,6 +2741,76 @@ fn revoke_in(
     if get_in(&tx, lease)?.is_none() {
         return Err(AuditError::UnknownLease(lease.0.clone()));
     }
+    let changed = revoke_subtree(&tx, lease, reason, now)?;
+    tx.commit()?;
+    Ok(changed as u64)
+}
+
+/// The unrevoked leases in the subtree of `lease` (itself included).
+fn unrevoked_subtree(conn: &Connection, lease: &LeaseId) -> Result<Vec<LeaseId>, AuditError> {
+    let ids = conn
+        .prepare_cached(concat!(
+            "SELECT id FROM leases WHERE revoked_at IS NULL AND id IN (",
+            subtree_ids!(""),
+            ")"
+        ))?
+        .query_map([&lease.0], |r| r.get::<_, String>(0))?
+        .map(|r| r.map(LeaseId))
+        .collect::<Result<_, _>>()?;
+    Ok(ids)
+}
+
+/// [`LeaseStore::preview_selected`] and [`LeaseStore::revoke_selected`] in one transaction
+/// (`IMMEDIATE` when writing): `write` carries the reason and time of a real revocation,
+/// `None` for a preview. The selector's value is always a bound parameter.
+fn selected_in(
+    conn: &mut Connection,
+    selector: &LeaseSelector,
+    write: Option<(&str, OffsetDateTime)>,
+) -> Result<SelectorRevocation, AuditError> {
+    let tx = if write.is_some() {
+        conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?
+    } else {
+        conn.transaction()?
+    };
+    let matched: Vec<LeaseId> = match selector {
+        LeaseSelector::Subject(subject) => tx
+            .prepare_cached(
+                "SELECT l.id FROM lease_subjects s JOIN leases l ON l.id = s.id \
+                 WHERE s.subject = ?1 AND l.revoked_at IS NULL ORDER BY l.id",
+            )?
+            .query_map([subject], |r| r.get::<_, String>(0))?
+            .map(|r| r.map(LeaseId))
+            .collect::<Result<_, _>>()?,
+        LeaseSelector::Chain(root) => match get_in(&tx, root)? {
+            Some(row) if row.parent.is_none() => unrevoked_subtree(&tx, root)?,
+            _ => Vec::new(),
+        },
+    };
+    let mut cascade = Vec::new();
+    for m in &matched {
+        cascade.extend(unrevoked_subtree(&tx, m)?);
+    }
+    let out = SelectorRevocation::from_parts(matched, cascade);
+    if let Some((reason, now)) = write {
+        // Revoke the matches one by one, each with the same cascade as `revoke_in`. A match
+        // already revoked by an earlier match's cascade changes nothing the second time.
+        for m in &out.matched {
+            revoke_subtree(&tx, m, reason, now)?;
+        }
+    }
+    tx.commit()?;
+    Ok(out)
+}
+
+/// The writes of a revocation of `lease` inside `tx`: mark its unrevoked subtree revoked and
+/// end the runs' span indexes and usage. Returns how many leases changed.
+fn revoke_subtree(
+    tx: &rusqlite::Transaction<'_>,
+    lease: &LeaseId,
+    reason: &str,
+    now: OffsetDateTime,
+) -> Result<usize, AuditError> {
     let changed = tx.execute(
         concat!(
             "UPDATE leases SET revoked_at = ?2, revoke_reason = ?3 \
@@ -2762,8 +2840,7 @@ fn revoke_in(
             params![lease.0, USAGE_KINDS[0], USAGE_KINDS[1], USAGE_KINDS[2]],
         )?;
     }
-    tx.commit()?;
-    Ok(changed as u64)
+    Ok(changed)
 }
 
 /// [`SqliteLeaseStore::subtree`] inside one read transaction, so the nodes, the count and the
@@ -2812,6 +2889,13 @@ fn subtree_in(
         would_revoke: u64::try_from(would_revoke).unwrap_or(0),
         truncated,
     }))
+}
+
+fn subject_in(conn: &Connection, lease: &LeaseId) -> Result<Option<String>, AuditError> {
+    Ok(conn
+        .prepare_cached("SELECT subject FROM lease_subjects WHERE id = ?1")?
+        .query_row([&lease.0], |row| row.get::<_, String>(0))
+        .optional()?)
 }
 
 fn binding_in(conn: &Connection, lease: &LeaseId) -> Result<Option<String>, AuditError> {
@@ -3151,6 +3235,53 @@ impl LeaseStore for SqliteLeaseStore {
     fn binding(&self, lease: &LeaseId) -> Result<Option<String>, AuditError> {
         let conn = self.conn.lock()?;
         binding_in(&conn, lease)
+    }
+
+    fn record_subject(&self, lease: &LeaseId, subject: &str) -> Result<(), AuditError> {
+        let _gate = self.gate.hold();
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if get_in(&tx, lease)?.is_none() {
+            return Err(AuditError::UnknownLease(lease.0.clone()));
+        }
+        match subject_in(&tx, lease)? {
+            Some(s) if s == subject => {}
+            Some(_) => return Err(AuditError::BindingConflict(lease.0.clone())),
+            None => {
+                tx.prepare_cached("INSERT INTO lease_subjects (id, subject) VALUES (?1, ?2)")?
+                    .execute(params![lease.0, subject])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn subject(&self, lease: &LeaseId) -> Result<Option<String>, AuditError> {
+        let conn = self.conn.lock()?;
+        subject_in(&conn, lease)
+    }
+
+    fn preview_selected(&self, selector: &LeaseSelector) -> Result<SelectorRevocation, AuditError> {
+        let mut conn = self.conn.lock()?;
+        selected_in(&mut conn, selector, None)
+    }
+
+    fn revoke_selected(
+        &self,
+        selector: &LeaseSelector,
+        reason: &str,
+        now: OffsetDateTime,
+    ) -> Result<SelectorRevocation, AuditError> {
+        let _gate = self.gate.hold();
+        let mut conn = self.conn.lock()?;
+        // Synced like a single revocation (SR-51).
+        let relaxed = self
+            .durability
+            .filter(|d| *d != Durability::Full)
+            .map(Durability::level);
+        with_full_sync(&mut conn, relaxed, |conn| {
+            selected_in(conn, selector, Some((reason, now)))
+        })?
     }
 
     fn check_all(

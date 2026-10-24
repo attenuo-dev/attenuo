@@ -169,6 +169,16 @@ Tokens still end at `default_ttl_seconds` whatever the lease says, and an exchan
 
 If the lease interval is longer than the token lifetime, the lease is capped by the token, so the interval has no extra effect.
 
+## Revoking during an incident
+
+Revoke from what you know. All of these need the admin token, take effect on the next request, and write an `admin.lease.revoke` audit record:
+
+- A lease id (from a denial's audit record, or the console): `attenuo lease revoke <id>`, everything delegated from it goes too.
+- A run (the `chain_id` of its audit records): `attenuo lease revoke --chain-id <id>`, the whole delegation chain.
+- A user (the `sub` your IdP issued, as in the audit records' `originating_subject`): `attenuo lease revoke --user <sub>`, every run of that user.
+
+Run the selector forms with `--preview` first: it lists the leases that would be revoked and changes nothing. A user is matched by subject under every trusted issuer. Leases issued before the server recorded subjects are not matched by `--user`; if you upgraded during a user's run, revoke that run by `--chain-id` as well. Revoking by MCP session is not supported yet; look up the session's `chain_id` in the audit log instead. To stop a user getting new tokens as well, disable them at the IdP: a revocation covers the leases that exist, not the next root token.
+
 ## Logging
 
 The server logs through `tracing` to standard output. Control it with `RUST_LOG`.

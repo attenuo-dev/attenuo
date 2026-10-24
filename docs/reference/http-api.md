@@ -135,6 +135,7 @@ All admin routes need `Authorization: Bearer <admin token>`. They answer 401 wit
 | --- | --- |
 | `GET /admin/leases/{lease_id}` | Lease state. |
 | `POST /admin/leases/{lease_id}/revoke` | Revoke the lease and all descendants. |
+| `POST /admin/leases/revoke?preview` | Revoke every lease of one originating user or one delegation chain, each with its descendants, in one transaction; `preview=true` is a dry run. See [Revoke by user or chain](#revoke-by-user-or-chain). |
 | `GET /admin/leases/{lease_id}/tree?max_nodes` | The lease, its descendants and its ancestors, and how many leases a revoke would change now. Read-only; see [Lease tree](#lease-tree). 404 for an unknown lease. |
 | `GET /admin/audit` | Audit entries in ascending `seq` order, paged with `from` and `limit` (default 100, at most 1000). Also returns `next` (when the page was full) and `head`, the newest `seq`. Filters and newest-first paging are below. |
 | `GET /admin/audit/entries/{seq}` | One entry with its context, `{entry, lease_states, covered_by_checkpoint, policy_reloaded_after}` (below). 404 when there is no entry at `seq`. |
@@ -149,6 +150,40 @@ All admin routes need `Authorization: Bearer <admin token>`. They answer 401 wit
 | `POST /admin/policies/evaluate` | Dry run: what the loaded policies decide for one call, given a token or a chain. No lease check, no audit record, no decision metric. |
 | `POST /admin/budgets/refund` | Body `{"decision_id": "<uuid>", "reason": "..."}`: give back to every run-limit counter what that decision charged, once, for an allowed call whose effect did not happen. Answers `{decision_id, refunded, reason, audit_id}` (`refunded` counts the token-limit counters credited; the run usage the decision charged is returned too but not counted, so a call that charged only usage answers 0; a `distinct` value is freed, and counted, only when no other unrefunded decision used it, SR-62) and appends an `admin.budget.refund` record. 404 when the decision charged nothing, 409 `already_refunded`. Also on the console listener with `[admin_ui] allow_write = true`. |
 | `POST /admin/root-token` | Development root mint. Mounted only when `[dev] allow_root_mint = true`. |
+
+### Revoke by user or chain
+
+`POST /admin/leases/revoke` takes a JSON body with exactly one selector and an optional reason:
+
+```json
+{"user": "alice@example.com", "reason": "laptop stolen"}
+{"chain_id": "6f1c2d9e-...", "reason": "run went wrong"}
+```
+
+- `user` matches every lease issued for that originating user: the `sub` of the chain's originating-user block, compared exactly, under any issuer. The server records the subject when it registers a lease. Leases registered by a server older than this route have no recorded subject and are not matched; revoke them by `chain_id` or by id.
+- `chain_id` matches one delegation chain: the lease of its first hop (the `chain_id` of its audit records, and the `root` of the lease tree) and everything delegated from it. A lease that has a parent is not a chain id and matches nothing. Found through the parent links, so older leases are matched too.
+- `session` is refused with 400 `unsupported_selector`. An MCP session is bound to its chain's root lease, so revoke the chain of the session's audit records with `chain_id`.
+
+A selector matches leases that are not revoked, expired ones included (`POST /token/renew` could renew those while the token is valid). Each match is revoked with the same cascade as `POST /admin/leases/{lease_id}/revoke`. Matching nothing is a 200 with empty lists, not an error. The answer:
+
+```json
+{
+  "selector": {"user": "alice@example.com"}, "preview": false,
+  "matched": ["0b7e...", "6f1c..."], "revoked": ["0b7e...", "6f1c...", "a93d..."],
+  "matched_count": 2, "revoked_count": 3, "truncated": false,
+  "reason": "laptop stolen", "audit_id": "3f2a..."
+}
+```
+
+- `matched`: the unrevoked leases the selector named, in id order.
+- `revoked`: every lease that changed from unrevoked to revoked: the matches first, then the descendants the cascade reached, each group in id order. Each list holds at most 10,000 ids; the counts are always complete, and `truncated` says a list was cut.
+- `reason`: defaults to `revoked by admin`. `audit_id`: the record of the revocation, `null` if it could not be written (the revocation stands, as for a single revoke).
+
+With `?preview=true` nothing is written, no lease and no audit record. `revoked` is then what a revocation sent now would change, and `reason` and `audit_id` are `null`.
+
+Each revocation appends one record with tool `admin.lease.revoke` and kind `lease_revoke`, whatever it matched. Its `leases` holds the first 256 revoked ids. Its arguments are `{selector, reason, revoked, listed, truncated}` (the count, how many ids `leases` holds, and whether that list was cut), stored as a digest like every admin record. The `leases_revoked_total` metric counts every revoked lease.
+
+Errors: 400 `invalid_request` for no selector, more than one, an empty value, an unknown field or a body that is not JSON; 400 `unsupported_selector` for `session`; 401 without the admin bearer. The route is not on the console listener.
 
 ### Lease tree
 

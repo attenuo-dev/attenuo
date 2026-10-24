@@ -1,10 +1,11 @@
-//! Lease registry: register, revoke with cascade, expiry, unknown-fails-closed, persistence.
+//! Lease registry: register, revoke with cascade, revoke by user or chain, expiry,
+//! unknown-fails-closed, persistence.
 
 mod common;
 
 use attenuo_audit::{
-    AuditError, AuditSink, LeaseNode, LeaseStatus, LeaseStore, LeaseSubtree, MemoryLeaseStore,
-    SqliteAudit, SqliteLeaseStore,
+    AuditError, AuditSink, LeaseNode, LeaseSelector, LeaseStatus, LeaseStore, LeaseSubtree,
+    MemoryLeaseStore, SqliteAudit, SqliteLeaseStore,
 };
 use attenuo_core::LeaseId;
 use attenuo_core::{Decision, DelegationChain, RecordKind};
@@ -538,4 +539,256 @@ fn issuance_records_pick_the_record_that_issued_each_lease() {
         .issuance_records("nope", &[&id("l1")])
         .unwrap()
         .is_empty());
+}
+
+// -- Revocation by selector (`LeaseStore::revoke_selected`, `POST /admin/leases/revoke`) --
+
+fn ids_of(leases: &[LeaseId]) -> Vec<&str> {
+    leases.iter().map(|l| l.0.as_str()).collect()
+}
+
+fn user(s: &str) -> LeaseSelector {
+    LeaseSelector::Subject(s.into())
+}
+
+fn chain(s: &str) -> LeaseSelector {
+    LeaseSelector::Chain(id(s))
+}
+
+/// [`tree`] for alice, every lease but `b` with its subject recorded (`b` stands for a lease
+/// registered before subjects were kept); bob's chain `broot -> bchild`; and `legacy`, a root
+/// with no subject.
+fn two_users(store: &dyn LeaseStore) {
+    tree(store);
+    for l in ["root", "a", "a1", "a2", "a2x"] {
+        store.record_subject(&id(l), "alice").unwrap();
+    }
+    let exp = t0() + Duration::hours(1);
+    store.register(&id("broot"), None, exp).unwrap();
+    store
+        .register(&id("bchild"), Some(&id("broot")), exp)
+        .unwrap();
+    store.record_subject(&id("broot"), "bob").unwrap();
+    store.record_subject(&id("bchild"), "bob").unwrap();
+    store.register(&id("legacy"), None, exp).unwrap();
+}
+
+#[test]
+fn subjects_are_write_once_and_only_for_known_leases() {
+    for (name, store) in stores() {
+        tree(store.as_ref());
+        assert_eq!(store.subject(&id("a")).unwrap(), None, "{name}");
+        store.record_subject(&id("a"), "alice").unwrap();
+        store.record_subject(&id("a"), "alice").unwrap();
+        assert_eq!(store.subject(&id("a")).unwrap().as_deref(), Some("alice"));
+        assert!(
+            matches!(
+                store.record_subject(&id("a"), "mallory"),
+                Err(AuditError::BindingConflict(_))
+            ),
+            "{name}"
+        );
+        assert_eq!(store.subject(&id("a")).unwrap().as_deref(), Some("alice"));
+        assert!(matches!(
+            store.record_subject(&id("ghost"), "alice"),
+            Err(AuditError::UnknownLease(_))
+        ));
+    }
+}
+
+/// A user's leases are revoked with their descendants; another user's chain and a lease with
+/// no recorded subject are not touched. The preview names exactly what the revocation then
+/// changes.
+#[test]
+fn revoke_by_user_revokes_the_users_leases_with_the_cascade() {
+    for (name, store) in stores() {
+        two_users(store.as_ref());
+        let now = t0() + Duration::minutes(1);
+        let preview = store.preview_selected(&user("alice")).unwrap();
+        assert_eq!(
+            ids_of(&preview.matched),
+            ["a", "a1", "a2", "a2x", "root"],
+            "{name}"
+        );
+        // `b` has no subject, but it descends from `root`: the cascade takes it.
+        assert_eq!(
+            ids_of(&preview.revoked),
+            ["a", "a1", "a2", "a2x", "root", "b"],
+            "{name}"
+        );
+        let all = [
+            "root", "a", "a1", "a2", "a2x", "b", "broot", "bchild", "legacy",
+        ];
+        assert!(
+            all.iter().all(|l| store.is_active(&id(l), now).unwrap()),
+            "{name}: the preview wrote nothing"
+        );
+
+        let out = store
+            .revoke_selected(&user("alice"), "incident-42", now)
+            .unwrap();
+        assert_eq!(out, preview, "{name}");
+        for l in ["root", "a", "a1", "a2", "a2x", "b"] {
+            assert!(!store.is_active(&id(l), now).unwrap(), "{name}: {l}");
+        }
+        for l in ["broot", "bchild", "legacy"] {
+            assert!(store.is_active(&id(l), now).unwrap(), "{name}: {l}");
+        }
+        // Nothing left to match: a second call is an empty answer, not an error.
+        let again = store.revoke_selected(&user("alice"), "x", now).unwrap();
+        assert!(
+            again.matched.is_empty() && again.revoked.is_empty(),
+            "{name}"
+        );
+        // A subject nobody has matches nothing.
+        let none = store.revoke_selected(&user("nobody"), "x", now).unwrap();
+        assert_eq!(none, Default::default(), "{name}");
+        // Subjects are matched exactly, not as a prefix or case-insensitively.
+        assert!(store
+            .preview_selected(&user("bo"))
+            .unwrap()
+            .matched
+            .is_empty());
+        assert!(store
+            .preview_selected(&user("BOB"))
+            .unwrap()
+            .matched
+            .is_empty());
+    }
+}
+
+/// Leases already revoked are neither matched nor counted again, and a lease reached both as
+/// a match and through another match's cascade is listed once.
+#[test]
+fn revoke_by_user_skips_revoked_leases_and_lists_each_lease_once() {
+    for (name, store) in stores() {
+        two_users(store.as_ref());
+        store.record_subject(&id("b"), "alice").unwrap();
+        assert_eq!(store.revoke(&id("a"), "earlier", t0()).unwrap(), 4);
+        let out = store.revoke_selected(&user("alice"), "now", t0()).unwrap();
+        assert_eq!(ids_of(&out.matched), ["b", "root"], "{name}");
+        assert_eq!(ids_of(&out.revoked), ["b", "root"], "{name}");
+        let status = store.check_all(&[&id("a2x")], t0()).unwrap();
+        assert_eq!(status.revoked, [id("a2x")], "{name}");
+    }
+}
+
+/// An expired, unrevoked lease is matched: `POST /token/renew` could bring it back.
+#[test]
+fn expired_unrevoked_leases_are_matched() {
+    for (name, store) in stores() {
+        two_users(store.as_ref());
+        let later = t0() + Duration::hours(2);
+        assert!(!store.is_active(&id("broot"), later).unwrap());
+        let out = store.revoke_selected(&user("bob"), "late", later).unwrap();
+        assert_eq!(ids_of(&out.revoked), ["bchild", "broot"], "{name}");
+        assert!(matches!(
+            store.renew(&id("broot"), later + Duration::hours(1), later),
+            Err(AuditError::LeaseRevoked(_))
+        ));
+    }
+}
+
+/// A chain id names the chain's first-hop lease: the whole tree under it goes, whether or not
+/// subjects were recorded. A lease that has a parent is not a chain id, and an unknown id
+/// matches nothing.
+#[test]
+fn revoke_by_chain_revokes_the_whole_chain_only() {
+    for (name, store) in stores() {
+        two_users(store.as_ref());
+        assert_eq!(
+            store.preview_selected(&chain("a")).unwrap(),
+            Default::default(),
+            "{name}: `a` has a parent"
+        );
+        assert_eq!(
+            store.preview_selected(&chain("ghost")).unwrap(),
+            Default::default(),
+            "{name}"
+        );
+        let out = store
+            .revoke_selected(&chain("root"), "chain", t0())
+            .unwrap();
+        assert_eq!(
+            ids_of(&out.matched),
+            ["a", "a1", "a2", "a2x", "b", "root"],
+            "{name}"
+        );
+        assert_eq!(out.revoked, out.matched, "{name}");
+        for l in ["broot", "bchild", "legacy"] {
+            assert!(store.is_active(&id(l), t0()).unwrap(), "{name}: {l}");
+        }
+        // A lease without a subject is found by its chain.
+        let legacy = store.revoke_selected(&chain("legacy"), "x", t0()).unwrap();
+        assert_eq!(ids_of(&legacy.revoked), ["legacy"], "{name}");
+    }
+}
+
+/// Part of a chain revoked earlier: the chain revocation takes the rest. A chain whose root
+/// is revoked but which still has an unrevoked lease under it gets that lease.
+#[test]
+fn revoke_by_chain_after_a_partial_revocation() {
+    for (name, store) in stores() {
+        tree(store.as_ref());
+        assert_eq!(store.revoke(&id("a2"), "earlier", t0()).unwrap(), 2);
+        let out = store.revoke_selected(&chain("root"), "rest", t0()).unwrap();
+        assert_eq!(ids_of(&out.revoked), ["a", "a1", "b", "root"], "{name}");
+        store
+            .register(&id("late"), Some(&id("b")), t0() + Duration::hours(1))
+            .unwrap();
+        let out = store.revoke_selected(&chain("root"), "late", t0()).unwrap();
+        assert_eq!(ids_of(&out.revoked), ["late"], "{name}");
+    }
+}
+
+/// A file store opened by an older server has no `lease_subjects` table: it is created at
+/// open, and the leases registered before have no subject, so only a chain selector finds
+/// them.
+#[test]
+fn sqlite_store_from_before_subjects_gains_the_table_at_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("leases.db");
+    {
+        let s = SqliteLeaseStore::open(&path).unwrap();
+        tree(&s);
+        s.with_connection(|c| {
+            c.execute_batch("DROP TABLE lease_subjects;")?;
+            Ok(())
+        })
+        .unwrap();
+    }
+    let s = SqliteLeaseStore::open(&path).unwrap();
+    assert_eq!(s.subject(&id("root")).unwrap(), None);
+    assert!(s
+        .preview_selected(&user("alice"))
+        .unwrap()
+        .matched
+        .is_empty());
+    s.register(&id("new"), None, t0() + Duration::hours(1))
+        .unwrap();
+    s.record_subject(&id("new"), "alice").unwrap();
+    let out = s.revoke_selected(&user("alice"), "x", t0()).unwrap();
+    assert_eq!(ids_of(&out.revoked), ["new"]);
+    let out = s.revoke_selected(&chain("root"), "x", t0()).unwrap();
+    assert_eq!(out.revoked.len(), 6);
+}
+
+/// A selector revocation persists, and the subjects survive a reopen.
+#[test]
+fn sqlite_selector_revocation_persists() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("leases.db");
+    {
+        let s = SqliteLeaseStore::open(&path).unwrap();
+        two_users(&s);
+    }
+    let s = SqliteLeaseStore::open(&path).unwrap();
+    assert_eq!(s.subject(&id("broot")).unwrap().as_deref(), Some("bob"));
+    s.revoke_selected(&user("bob"), "persist", t0()).unwrap();
+    drop(s);
+    let s = SqliteLeaseStore::open(&path).unwrap();
+    let row = s.get(&id("bchild")).unwrap().unwrap();
+    assert_eq!(row.revoked_at, Some(t0()));
+    assert_eq!(row.revoke_reason.as_deref(), Some("persist"));
+    assert!(s.is_active(&id("root"), t0()).unwrap());
 }
