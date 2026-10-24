@@ -372,7 +372,8 @@ fn build_engine(config: &Config) -> anyhow::Result<(PolicyEngine, Option<String>
         .with_catalog(catalog)
         .with_unknown_tools(config.policy.unknown_tools)
         .with_legacy_bare_actions(config.policy.legacy_bare_actions)
-        .with_annotation_import(config.policy.import_annotations);
+        .with_annotation_import(config.policy.import_annotations)
+        .with_track_usage(config.policy.track_usage);
     if config.policy.legacy_bare_actions {
         tracing::warn!(
             "[policy] legacy_bare_actions = true is deprecated: policies name actions as \
@@ -415,7 +416,12 @@ fn build_engine(config: &Config) -> anyhow::Result<(PolicyEngine, Option<String>
     for w in engine.validation_warnings() {
         tracing::warn!(warning = %w, "policy validation warning");
     }
-    tracing::info!(policies = ?engine.policy_ids(), sha256 = ?digest, "policies loaded");
+    tracing::info!(
+        policies = ?engine.policy_ids(),
+        sha256 = ?digest,
+        run_usage = ?engine.usage_tracking_reasons(),
+        "policies loaded"
+    );
     Ok((engine, digest))
 }
 

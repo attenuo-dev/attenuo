@@ -13,7 +13,9 @@
 //!    (`LeaseStore::budget_used`), as `context.budget` and as the limit check of step 4.
 //!    Unreadable counters deny a limited call with `budget_error`; an argument a limit
 //!    cannot count denies it with `limit_arg_invalid`. In the same read, for a tool the
-//!    catalog marks destructive, the run's usage of it (design section 3.5,
+//!    catalog marks destructive, and only when the engine tracks usage
+//!    ([`PolicyEngine::tracks_usage`]: something loaded can read it), the run's usage of it
+//!    (design section 3.5,
 //!    [`attenuo_core::limits::usage_charges`]): calls, the catalog's `amount` input summed,
 //!    whether its `destination` was seen, as `context.usage`; with no limit matching,
 //!    unreadable usage is the worst case ([`UNREADABLE_USAGE`]) and the policy decides. Then
@@ -788,7 +790,8 @@ impl Pipeline {
     }
 
     /// The run limits that match `call` and what their counters hold (ADR-0010), and for a
-    /// destructive tool the run's usage of it (design section 3.5), read without charging
+    /// destructive tool the run's usage of it (design section 3.5; only when the engine tracks
+    /// usage, [`PolicyEngine::tracks_usage`]), read without charging
     /// anything. Fails closed: an argument a limit cannot count refuses the call with
     /// `limit_arg_invalid`, counters that cannot be read refuse it with `budget_error` (usage
     /// counters too, when a limit matched; with no limit, unreadable usage is the worst case,
@@ -904,14 +907,18 @@ impl Pipeline {
 
     /// For a tool that keeps run usage (one the catalog marks destructive, design section
     /// 3.5): the inputs its catalog entry names as `amount` and `destination`. `None` for any
-    /// other tool. A tool the engine knows nothing about, and a poisoned engine lock, count as
-    /// destructive with neither input, as [`Self::is_destructive`] does.
+    /// other tool, and for every tool when the engine does not track usage
+    /// ([`PolicyEngine::tracks_usage`]: no loaded policy reads `context.usage`, the catalog
+    /// names no `amount` or `destination`, and `[policy] track_usage` is `"auto"`), so an
+    /// allowed call then pays no usage write and its record carries no `usage`. A tool the
+    /// engine knows nothing about, and a poisoned engine lock, count as destructive with
+    /// neither input, as [`Self::is_destructive`] does.
     fn usage_inputs(&self, call: &ToolCall) -> Option<(Option<String>, Option<String>)> {
-        let attrs = self
-            .policy
-            .read()
-            .ok()
-            .and_then(|e| e.effective_attrs(&call.server, &call.tool));
+        let attrs = match self.policy.read() {
+            Ok(e) if !e.tracks_usage() => return None,
+            Ok(e) => e.effective_attrs(&call.server, &call.tool),
+            Err(_) => None,
+        };
         match attrs {
             None => Some((None, None)),
             Some(a) if a.is_destructive() => Some((a.amount, a.destination)),
@@ -1983,6 +1990,9 @@ when { context.input has amount && context.input.amount > 1000 };
                 ),
             )
             .with_policies_str(POLICY)
+            // These tests are about limits, and one about the worst-case usage of an
+            // unreadable store: keep usage although `POLICY` does not read it.
+            .with_track_usage(attenuo_policy::TrackUsage::Always)
             .build()
             .unwrap();
         Pipeline::new(Arc::new(RwLock::new(engine)), leases, audit)
@@ -2562,5 +2572,194 @@ when { resource.destructive && context.args_contain_untrusted && !context.approv
             )
             .unwrap_err();
         assert_eq!(err, REASON_LABEL_ERROR);
+    }
+}
+
+#[cfg(test)]
+mod usage_tracking_tests {
+    //! Run usage is kept only when it can matter ([`PolicyEngine::tracks_usage`]): a policy
+    //! set that does not read `context.usage`, with no catalog `amount` or `destination`,
+    //! writes no usage counter and records no `usage`.
+
+    use super::*;
+    use attenuo_audit::{MemoryAudit, SqliteLeaseStore};
+    use attenuo_core::{AgentId, Capability, CapabilitySet, OriginatingUser};
+    use attenuo_policy::{ArgType, PolicyEngineBuilder, ToolAttrs, ToolCatalog, TrackUsage};
+    use serde_json::json;
+    use time::Duration;
+
+    const PLAIN: &str = r#"
+permit(principal, action, resource);
+@id("no_big_payments")
+forbid(principal, action == Action::"bank/send", resource)
+when { context.input has amount && context.input.amount > 1000 };
+"#;
+
+    const READS_USAGE: &str = r#"
+permit(principal, action, resource);
+@id("cap_run_calls")
+forbid(principal, action == Action::"bank/send", resource)
+when { context.usage.calls >= 2 };
+"#;
+
+    struct Setup {
+        pipeline: Pipeline,
+        leases: Arc<SqliteLeaseStore>,
+        audit: Arc<MemoryAudit>,
+        chain: DelegationChain,
+        now: OffsetDateTime,
+    }
+
+    fn setup(policies: &str, amount: bool, track: TrackUsage) -> Setup {
+        let now = OffsetDateTime::now_utc();
+        let leases = Arc::new(SqliteLeaseStore::open_in_memory().unwrap());
+        leases
+            .register(&LeaseId::new("l1"), None, now + Duration::hours(1))
+            .unwrap();
+        let mut attrs = ToolAttrs::new().with_input("amount", ArgType::Long);
+        if amount {
+            attrs = attrs.with_amount("amount");
+        }
+        let engine = PolicyEngineBuilder::new()
+            .with_catalog(ToolCatalog::new().with("bank", "send", attrs))
+            .with_policies_str(policies)
+            .with_track_usage(track)
+            .build()
+            .unwrap();
+        let audit = Arc::new(MemoryAudit::new());
+        let pipeline = Pipeline::new(Arc::new(RwLock::new(engine)), leases.clone(), audit.clone());
+        let chain = DelegationChain::root(
+            OriginatingUser {
+                subject: "alice".into(),
+                issuer: "idp".into(),
+                authenticated_at: now,
+                attributes: Default::default(),
+            },
+            AgentId::new("planner"),
+            CapabilitySet::from_iter([Capability::new("bank", "send")]),
+            now,
+            Duration::hours(1),
+            LeaseId::new("l1"),
+        )
+        .unwrap();
+        Setup {
+            pipeline,
+            leases,
+            audit,
+            chain,
+            now,
+        }
+    }
+
+    impl Setup {
+        fn pay(&self) -> PipelineDecision {
+            let call = ToolCall::new("bank", "send", json!({ "amount": 5 }));
+            self.pipeline.decide(&self.chain, &call, self.now)
+        }
+
+        /// The run-usage counters in the store.
+        fn usage_rows(&self) -> i64 {
+            self.leases
+                .with_connection(|c| {
+                    Ok(c.query_row(
+                        "SELECT count(*) FROM budget_counters WHERE kind LIKE 'usage_%'",
+                        [],
+                        |r| r.get(0),
+                    )?)
+                })
+                .unwrap()
+        }
+
+        fn tracks(&self) -> bool {
+            self.pipeline.policy().read().unwrap().tracks_usage()
+        }
+
+        fn last_record_has_usage(&self) -> bool {
+            let entries = self.audit.range(0, 1000).unwrap();
+            entries.last().unwrap().record.usage.is_some()
+        }
+    }
+
+    #[test]
+    fn a_policy_set_that_cannot_read_usage_writes_none() {
+        let s = setup(PLAIN, false, TrackUsage::Auto);
+        assert!(!s.tracks());
+        for _ in 0..3 {
+            let d = s.pay();
+            assert!(d.is_allow(), "{d:?}");
+            assert_eq!(d.usage, None);
+            assert!(d.charged.is_none());
+            assert!(!s.last_record_has_usage());
+        }
+        assert_eq!(s.usage_rows(), 0);
+    }
+
+    #[test]
+    fn a_policy_that_reads_usage_turns_it_on() {
+        let s = setup(READS_USAGE, false, TrackUsage::Auto);
+        assert!(s.tracks());
+        assert_eq!(s.pay().usage, Some(UsageContext::default()));
+        assert!(s.last_record_has_usage());
+        assert!(s.pay().is_allow());
+        // The third sees two calls and is refused by the policy.
+        let d = s.pay();
+        assert!(!d.is_allow(), "{d:?}");
+        assert_eq!(d.usage.map(|u| u.calls), Some(2));
+        assert!(s.usage_rows() > 0);
+    }
+
+    #[test]
+    fn a_catalog_amount_turns_it_on() {
+        let s = setup(PLAIN, true, TrackUsage::Auto);
+        assert!(s.tracks());
+        s.pay();
+        let d = s.pay();
+        assert_eq!(
+            d.usage,
+            Some(UsageContext {
+                calls: 1,
+                amount: 5,
+                destination_seen: false
+            })
+        );
+        assert!(s.usage_rows() > 0);
+    }
+
+    #[test]
+    fn track_usage_true_forces_it() {
+        let s = setup(PLAIN, false, TrackUsage::Always);
+        assert!(s.tracks());
+        s.pay();
+        assert_eq!(s.pay().usage.map(|u| u.calls), Some(1));
+        assert!(s.usage_rows() > 0);
+    }
+
+    #[test]
+    fn reload_flips_it() {
+        let s = setup(PLAIN, false, TrackUsage::Auto);
+        s.pay();
+        assert_eq!(s.usage_rows(), 0);
+        s.pipeline
+            .policy()
+            .write()
+            .unwrap()
+            .reload_policies_str(READS_USAGE)
+            .unwrap();
+        assert!(s.tracks());
+        // Usage counts from the reload on: the call before it was not kept.
+        assert_eq!(s.pay().usage, Some(UsageContext::default()));
+        assert_eq!(s.pay().usage.map(|u| u.calls), Some(1));
+        let rows = s.usage_rows();
+        assert!(rows > 0);
+        s.pipeline
+            .policy()
+            .write()
+            .unwrap()
+            .reload_policies_str(PLAIN)
+            .unwrap();
+        assert!(!s.tracks());
+        assert_eq!(s.pay().usage, None);
+        assert!(!s.last_record_has_usage());
+        assert_eq!(s.usage_rows(), rows, "no usage written after the reload");
     }
 }
