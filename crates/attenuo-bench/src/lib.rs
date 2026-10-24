@@ -635,6 +635,10 @@ fn fill_seq(body: &str) -> String {
 struct Target {
     url: String,
     token: Option<String>,
+    /// When set, every call sends the next token of this list in place of `token`, each
+    /// client starting at its own offset, so tokens are not reused call after call (to make
+    /// every call a verified-token cache miss, as `hot-path --rotate-tokens` does).
+    rotate: Option<std::sync::Arc<[String]>>,
     body: String,
     expect: Expect,
 }
@@ -649,6 +653,8 @@ struct PhaseOut {
 async fn client_loop(
     http: reqwest::Client,
     t: Target,
+    client: usize,
+    clients: usize,
     warm_end: Instant,
     end: Instant,
 ) -> PhaseOut {
@@ -659,6 +665,10 @@ async fn client_loop(
         first_bad: None,
     };
     let vary = t.body.contains(SEQ_MARKER);
+    let mut next = t
+        .rotate
+        .as_ref()
+        .map_or(0, |r| client * r.len() / clients.max(1));
     loop {
         let start = Instant::now();
         if start >= end {
@@ -674,7 +684,10 @@ async fn client_loop(
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
             .body(body);
-        if let Some(tok) = &t.token {
+        if let Some(list) = &t.rotate {
+            req = req.bearer_auth(&list[next % list.len()]);
+            next += 1;
+        } else if let Some(tok) = &t.token {
             req = req.bearer_auth(tok);
         }
         let verdict = match req.send().await {
@@ -746,7 +759,7 @@ async fn drive(
     let tasks: Vec<_> = (0..conc)
         .map(|i| {
             let t = targets[i % targets.len()].clone();
-            tokio::spawn(client_loop(http.clone(), t, warm_end, end))
+            tokio::spawn(client_loop(http.clone(), t, i, conc, warm_end, end))
         })
         .collect();
     let before = match metrics {
@@ -997,6 +1010,7 @@ async fn run_group(
     let direct_target = Target {
         url: ep.upstream_mcp.clone(),
         token: None,
+        rotate: None,
         body: Outcome::Allow.body(),
         expect: Expect::Result {
             decision_header: false,
@@ -1034,6 +1048,7 @@ async fn run_group(
                 let target = Target {
                     url: format!("{}/mcp/{UPSTREAM}", ep.attenuo),
                     token: Some(token.clone()),
+                    rotate: None,
                     body: outcome.body(),
                     expect: outcome.expect(),
                 };
