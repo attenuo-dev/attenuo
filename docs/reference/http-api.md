@@ -61,7 +61,7 @@ grant_type=urn:ietf:params:oauth:grant-type:token-exchange
 | `GET /mcp/{server}` | bearer delegation token | Passthrough for the streamable HTTP event stream, after the lease check. |
 | `DELETE /mcp/{server}` | bearer delegation token | Passthrough session close, after the lease check. |
 
-A denial is a JSON-RPC error with code `-32003`, carrying `reason` and `decision_id`. A missing or bad token is HTTP 401 with `-32001` and `data.reason` set to `missing_token`, `invalid_token`, `token_expired`, `dpop_required`, `invalid_dpop_proof`, `use_dpop_nonce` or, for a lease that is no longer live, `lease_revoked`, `lease_expired` or `lease_unknown`. An upstream the proxy cannot reach is HTTP 502 with `-32005` and `data.reason` `upstream_unreachable`; the upstream URL and transport error are only logged. Allowed responses carry `X-Attenuo-Decision-Id`.
+A denial is a JSON-RPC error with code `-32003`, carrying `reason` and `decision_id`. A call that a policy sends for approval (reason `approval_required`) gets `-32008` instead, with `reason`, `decision_id` and `call_hash` (SHA-256 of the RFC 8785 JSON of `{server, tool, arguments}`), and is not forwarded. If the answer to an allowed call cannot be recorded in the audit log, the agent gets `-32003` with reason `label_error` and the call's `decision_id` instead of the answer. A missing or bad token is HTTP 401 with `-32001` and `data.reason` set to `missing_token`, `invalid_token`, `token_expired`, `dpop_required`, `invalid_dpop_proof`, `use_dpop_nonce` or, for a lease that is no longer live, `lease_revoked`, `lease_expired` or `lease_unknown`. An upstream the proxy cannot reach is HTTP 502 with `-32005` and `data.reason` `upstream_unreachable`; the upstream URL and transport error are only logged. Allowed responses carry `X-Attenuo-Decision-Id`.
 
 ## Admin
 
@@ -121,7 +121,7 @@ All admin routes need `Authorization: Bearer <admin token>`. They answer 401 wit
 
 | Parameter | Keeps entries whose record has |
 | --- | --- |
-| `kind` | one of these kinds, comma-separated: `decision`, `exchange`, `root_token`, `lease_renew`, `lease_revoke`, `admin` |
+| `kind` | one of these kinds, comma-separated: `decision`, `tool_result`, `exchange`, `root_token`, `lease_renew`, `lease_revoke`, `admin` |
 | `decision` | `allow` or `deny` |
 | `reason` | this `reason` (`policy_deny`, `lease_revoked`, ...) |
 | `subject` | this `originating_subject` |
@@ -203,6 +203,7 @@ These three routes change nothing and write no audit record. They answer the que
 
 - With `token`, the token is verified with the server's keys and its chain is used; `subject.id` may be empty and `subject.properties.chain` may be left out (if present it must equal the token's chain, else 400 `chain_mismatch`). A bad signature or any other verification failure is 400 `invalid_token`. An expired token is accepted, verified as of the last second it was valid, and the answer has `token_expired: true`. The call counts as DPoP-bound when the token is bound (`cnf`).
 - Without `token`, `subject.properties.chain` is required (400 `invalid_request` otherwise) and is only checked structurally, as of now (400 `invalid_chain` if that fails). Nothing checks that this server issued it.
+- An optional `session`, `{"tainted_by": ["<server>/<tool>", ...], "tainted": true}`, sets the run's output labels for the dry run (`tainted` defaults to whether `tainted_by` is non-empty). Without it, the labels are read from the store for the chain's run. Anything else in `session` is a 400 `invalid_request`.
 
 ```json
 {
@@ -212,11 +213,12 @@ These three routes change nothing and write no audit record. They answer the que
   "diagnostics": [],
   "lease_check": "skipped",
   "chain_source": "token",
-  "token_expired": false
+  "token_expired": false,
+  "session": {"tainted": false, "tainted_by": [], "source": "store"}
 }
 ```
 
-`chain_source` is `token` or `admin_supplied`. The decision comes from the capability stage and Cedar, the same code `POST /access/v1/evaluation` runs after its lease check, so for a token with live leases the two agree on decision, reason and policy ids. A revoked or expired lease does not change the dry run's answer (`lease_check` is always `skipped`).
+`chain_source` is `token` or `admin_supplied`. `session.source` is `request` or `store`. The decision comes from the capability stage and Cedar, the same code `POST /access/v1/evaluation` runs after its lease check, so for a token with live leases the two agree on decision, reason and policy ids. A revoked or expired lease does not change the dry run's answer (`lease_check` is always `skipped`).
 
 ## Metrics
 

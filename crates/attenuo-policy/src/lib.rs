@@ -52,9 +52,33 @@
 //!     "leases": ["l1", "l2"]
 //!   },
 //!   "session_id": "s-123",
-//!   "now_unix": 1760000100
+//!   "now_unix": 1760000100,
+//!   "session": { "tainted": true, "tainted_by": ["web/fetch"] },
+//!   "args_contain_untrusted": false,
+//!   "untrusted_args": [],
+//!   "approval": { "present": false, "by": "" }
 //! }
 //! ```
+//!
+//! `session`, `args_contain_untrusted`, `untrusted_args` and `approval` come from output
+//! labelling (ADR-0009) and are always present, so policies need no `has` guard.
+//! `session.tainted` is true once the delegation run has read an untrusted upstream result
+//! (or when its taint state could not be read), and `session.tainted_by` names the sources as
+//! `"<server>/<tool>"`. They come from [`CallLabels`], which
+//! [`PolicyEngine::authorize_labelled`] takes; [`PolicyEngine::authorize`] evaluates an
+//! untainted run. `args_contain_untrusted` is always `false`, `untrusted_args` always empty
+//! and `approval.present` always `false` (`approval.by` empty) until argument matching and
+//! approvals are built.
+//!
+//! # Obligations
+//!
+//! A `forbid` annotated `@obligation("approval")` asks rather than refuses. When every
+//! `forbid` that applied to a denied call carries it, and the call would be allowed without
+//! those forbids, the reason is `approval_required` instead of `policy_deny`. Any other
+//! `forbid` that applies wins, so an approval can never unlock what the policy forbids for
+//! another reason, and a call no `permit` allows stays `policy_deny`. The capability stage and
+//! the catalog run first, as for every call. Any other `@obligation` value, or one on a
+//! `permit`, is refused at load.
 //!
 //! Through the MCP proxy, `session_id` is a 12-hex-digit SHA-256 prefix of the `Mcp-Session-Id`,
 //! never the id itself. It is **absent** when the call carries none (Cedar has no `null`); test it with
@@ -71,7 +95,7 @@
 //! | `User::"<subject>"` | `subject`, `issuer`, `authenticated_at_unix`, `attributes` (record) | none |
 //! | `Agent::"<id>"`, one per hop | `id`, `chain_depth` (1-based position of the hop) | the `User`, and the previous hop's `Agent` |
 //! | `Server::"<server>"` | `name` | none |
-//! | `Tool::"<server>/<tool>"` | `server`, `name`, `readonly`, `sensitive` (from the [`ToolCatalog`]) | the `Server` |
+//! | `Tool::"<server>/<tool>"` | `server`, `name`, `readonly`, `sensitive`, `destructive` (from the [`ToolCatalog`]; `destructive` defaults to `!readonly`) | the `Server` |
 //!
 //! So policies can say `principal in User::"alice"`, `principal in Agent::"planner"`,
 //! `resource in Server::"github"`, `resource.readonly`, or `principal.chain_depth > 2`.
@@ -162,18 +186,22 @@ mod request;
 mod schema;
 pub mod testing;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::RwLock;
 
 use attenuo_core::{Decision, DelegationChain, ToolCall};
 use cedar_policy::{
-    Authorizer, Decision as CedarDecision, Policy, PolicyId, PolicySet, Request, Schema, Template,
-    ValidationMode, Validator,
+    Authorizer, Decision as CedarDecision, Effect, Policy, PolicyId, PolicySet, Request, Schema,
+    Template, ValidationMode, Validator,
 };
 use time::OffsetDateTime;
 
-pub use catalog::{parse_user_attributes, ArgType, ToolAttrs, ToolCatalog, UnknownTools};
+pub use catalog::{
+    parse_user_attributes, AnnotationImport, ArgType, Narrowing, OutputLabel, ToolAttrs,
+    ToolCatalog, UnknownTools,
+};
 pub use lint::{lint, LintIssue, LintReport, LintSeverity};
 pub use lint::{lint_with_options, policy_action_names, LintOptions};
 pub use schema::{action_id, default_user_attrs, DEFAULT_SCHEMA, GENERIC_ACTION};
@@ -201,6 +229,59 @@ pub const REASON_INVALID_NAME: &str = "invalid_name";
 /// Reason code when an originating-user attribute does not have its declared type (SR-33).
 pub const REASON_ATTRIBUTE_TYPE_MISMATCH: &str = "attribute_type_mismatch";
 
+/// Reason code when Cedar denies only through forbids annotated `@obligation("approval")`
+/// and would allow without them (ADR-0009). Always a deny.
+pub const REASON_APPROVAL_REQUIRED: &str = "approval_required";
+
+/// The annotation that turns a `forbid` into a request for approval.
+pub const OBLIGATION_ANNOTATION: &str = "obligation";
+
+/// The one `@obligation` value the engine knows.
+pub const OBLIGATION_APPROVAL: &str = "approval";
+
+/// What the engine knows about the delegation run a call belongs to (output labelling,
+/// ADR-0009): `context.session` in Cedar.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionLabels {
+    /// The run has read at least one untrusted result, or its taint state could not be read.
+    pub tainted: bool,
+    /// `"<server>/<tool>"` of every source that labelled the run.
+    pub tainted_by: BTreeSet<String>,
+}
+
+impl SessionLabels {
+    /// A run that has read nothing untrusted.
+    pub fn untainted() -> Self {
+        Self::default()
+    }
+
+    /// The labels of a run whose taint state could not be read: tainted, with no known
+    /// source (fail closed).
+    pub fn unknown() -> Self {
+        Self {
+            tainted: true,
+            tainted_by: BTreeSet::new(),
+        }
+    }
+
+    /// A run labelled by these sources; tainted when there is at least one.
+    pub fn from_sources<S: Into<String>>(sources: impl IntoIterator<Item = S>) -> Self {
+        let tainted_by: BTreeSet<String> = sources.into_iter().map(Into::into).collect();
+        Self {
+            tainted: !tainted_by.is_empty(),
+            tainted_by,
+        }
+    }
+}
+
+/// The per-call inputs to the Cedar context that come from output labelling (ADR-0009).
+/// The default is an untainted run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallLabels {
+    /// `context.session`.
+    pub session: SessionLabels,
+}
+
 /// Errors from loading policies or schema.
 #[derive(Debug, thiserror::Error)]
 pub enum PolicyError {
@@ -216,6 +297,10 @@ pub enum PolicyError {
     /// A catalog entry names a server or tool that breaks [`attenuo_core::names`].
     #[error("tool catalog: {0}")]
     Catalog(String),
+    /// An `@obligation` annotation the engine cannot honour: an unknown value, or one on a
+    /// `permit`.
+    #[error("policy obligation error: {0}")]
+    Obligation(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -225,10 +310,11 @@ pub enum PolicyError {
 pub struct Outcome {
     pub decision: Decision,
     /// One of `invalid_name`, `capability_denied`, `tool_not_in_catalog`, `attribute_type_mismatch`,
-    /// `policy_allow`, `policy_deny`, `policy_error`.
+    /// `policy_allow`, `policy_deny`, `approval_required`, `policy_error`.
     pub reason: String,
     /// Ids of the policies that determined the decision (permits that matched for an allow,
-    /// forbids that matched for a deny). Empty for a capability denial or a default deny.
+    /// forbids that matched for a deny, the approval forbids for `approval_required`). Empty
+    /// for a capability denial or a default deny.
     pub policy_ids: Vec<String>,
     /// Human-readable details: evaluation errors, translation problems, capability mismatches.
     pub diagnostics: Vec<String>,
@@ -260,6 +346,7 @@ pub struct PolicyEngineBuilder {
     user_attrs: BTreeMap<String, ArgType>,
     unknown_tools: UnknownTools,
     legacy_bare_actions: bool,
+    annotation_import: AnnotationImport,
 }
 
 impl Default for PolicyEngineBuilder {
@@ -277,7 +364,16 @@ impl PolicyEngineBuilder {
             user_attrs: default_user_attrs(),
             unknown_tools: UnknownTools::default(),
             legacy_bare_actions: false,
+            annotation_import: AnnotationImport::default(),
         }
+    }
+
+    /// Whether MCP tool annotations reported through [`PolicyEngine::import_annotations`] are
+    /// used, narrowing only (`[policy] import_annotations`). Default
+    /// [`AnnotationImport::Never`].
+    pub fn with_annotation_import(mut self, import: AnnotationImport) -> Self {
+        self.annotation_import = import;
+        self
     }
 
     /// Use the pre-SR-13 action ids, the bare tool name (`Action::"read_file"`), instead of
@@ -353,24 +449,94 @@ impl PolicyEngineBuilder {
             }
             text.push('\n');
         }
-        let (policies, warnings) = load_policies(&text, &schema)?;
+        let loaded = load_policies(&text, &schema)?;
         Ok(PolicyEngine {
             schema,
             schema_text,
-            policies,
+            policies: loaded.policies,
+            obligations: loaded.obligations,
             catalog: self.catalog,
             user_attrs: self.user_attrs,
             unknown_tools: self.unknown_tools,
             legacy_bare_actions: self.legacy_bare_actions,
+            annotation_import: self.annotation_import,
+            narrowed: RwLock::new(HashMap::new()),
             authorizer: Authorizer::new(),
-            validation_warnings: warnings,
+            validation_warnings: loaded.warnings,
             request_cache: request::RequestCache::new(request::REQUEST_CACHE_CAPACITY),
         })
     }
 }
 
+/// A validated policy set and what the engine derives from it.
+struct LoadedPolicies {
+    policies: PolicySet,
+    obligations: Obligations,
+    warnings: Vec<String>,
+}
+
+/// The forbids annotated `@obligation("approval")`, and the policy set without them, used to
+/// tell `approval_required` from `policy_deny`.
+#[derive(Debug, Default)]
+struct Obligations {
+    approval_ids: BTreeSet<String>,
+    /// `None` when no policy carries the annotation.
+    without_approval: Option<PolicySet>,
+}
+
+/// Every `@obligation` annotation must be `"approval"` on a `forbid`. Returns the ids of the
+/// policies (and templates) that carry it.
+pub(crate) fn approval_obligations(
+    policies: &PolicySet,
+) -> Result<BTreeSet<String>, Vec<(String, String)>> {
+    let mut ids = BTreeSet::new();
+    let mut errors = Vec::new();
+    let all = policies
+        .policies()
+        .map(|p| {
+            (
+                p.id().to_string(),
+                p.effect(),
+                p.annotation(OBLIGATION_ANNOTATION),
+            )
+        })
+        .chain(policies.templates().map(|t| {
+            (
+                t.id().to_string(),
+                t.effect(),
+                t.annotation(OBLIGATION_ANNOTATION),
+            )
+        }));
+    for (id, effect, value) in all {
+        let Some(value) = value else { continue };
+        if value != OBLIGATION_APPROVAL {
+            errors.push((
+                id,
+                format!(
+                    "unknown obligation `@obligation(\"{value}\")`: the only obligation is \
+                     \"{OBLIGATION_APPROVAL}\""
+                ),
+            ));
+        } else if effect != Effect::Forbid {
+            errors.push((
+                id,
+                "`@obligation(\"approval\")` on a permit has no effect: put it on the forbid \
+                 that should ask for approval"
+                    .to_string(),
+            ));
+        } else {
+            ids.insert(id);
+        }
+    }
+    if errors.is_empty() {
+        Ok(ids)
+    } else {
+        Err(errors)
+    }
+}
+
 /// Parse, re-id (from `@id` annotations) and validate a policy set.
-fn load_policies(text: &str, schema: &Schema) -> Result<(PolicySet, Vec<String>), PolicyError> {
+fn load_policies(text: &str, schema: &Schema) -> Result<LoadedPolicies, PolicyError> {
     let parsed = PolicySet::from_str(text).map_err(|e| PolicyError::Parse(e.to_string()))?;
     let policies = apply_id_annotations(&parsed)?;
     let result = Validator::new(schema.clone()).validate(&policies, ValidationMode::Strict);
@@ -385,7 +551,34 @@ fn load_policies(text: &str, schema: &Schema) -> Result<(PolicySet, Vec<String>)
         .validation_warnings()
         .map(|w| format!("[{}] {w}", w.policy_id()))
         .collect();
-    Ok((policies, warnings))
+    let approval_ids = approval_obligations(&policies).map_err(|errs| {
+        PolicyError::Obligation(
+            errs.into_iter()
+                .map(|(id, msg)| format!("[{id}] {msg}"))
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    })?;
+    let without_approval = if approval_ids.is_empty() {
+        None
+    } else {
+        let mut set = PolicySet::new();
+        for p in policies.policies() {
+            if !approval_ids.contains(&p.id().to_string()) {
+                set.add(p.clone())
+                    .map_err(|e| PolicyError::Parse(format!("policy set: {e}")))?;
+            }
+        }
+        Some(set)
+    };
+    Ok(LoadedPolicies {
+        policies,
+        obligations: Obligations {
+            approval_ids,
+            without_approval,
+        },
+        warnings,
+    })
 }
 
 /// Cedar names policies `policy0`, `policy1`, ... when parsing a set. Rename each one that
@@ -441,7 +634,7 @@ pub mod bench_support {
         let attrs = engine.catalog.get(&call.server, &call.tool);
         PreparedRequest(
             engine
-                .prepare(chain, call, &attrs, now)
+                .prepare(chain, call, &attrs, &CallLabels::default(), now)
                 .expect("request translates"),
         )
     }
@@ -473,10 +666,15 @@ pub struct PolicyEngine {
     schema: Schema,
     schema_text: String,
     policies: PolicySet,
+    obligations: Obligations,
     catalog: ToolCatalog,
     user_attrs: BTreeMap<String, ArgType>,
     unknown_tools: UnknownTools,
     legacy_bare_actions: bool,
+    annotation_import: AnnotationImport,
+    /// Narrowing imported from MCP tool annotations, per catalog tool (sticky; bounded by the
+    /// catalog). Empty unless `annotation_import` is `Narrowing`.
+    narrowed: RwLock<HashMap<(String, String), Narrowing>>,
     authorizer: Authorizer,
     validation_warnings: Vec<String>,
     request_cache: request::RequestCache,
@@ -486,11 +684,24 @@ impl PolicyEngine {
     /// Decide whether `call` may proceed for the agent at the end of `chain`, at time `now`.
     ///
     /// The chain is assumed to have been verified and `validate_at`-ed already; this method
-    /// does not check signatures or expiry.
+    /// does not check signatures or expiry. The run is evaluated as untainted; the server's
+    /// pipeline uses [`authorize_labelled`](Self::authorize_labelled) with the run's labels.
     pub fn authorize(
         &self,
         chain: &DelegationChain,
         call: &ToolCall,
+        now: OffsetDateTime,
+    ) -> Outcome {
+        self.authorize_labelled(chain, call, &CallLabels::default(), now)
+    }
+
+    /// [`authorize`](Self::authorize) with the output labels of the call's delegation run
+    /// (`context.session`, ADR-0009).
+    pub fn authorize_labelled(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        labels: &CallLabels,
         now: OffsetDateTime,
     ) -> Outcome {
         // Stage 0: names. A name outside the rules could not have come from a well-behaved
@@ -538,6 +749,7 @@ impl PolicyEngine {
                 UnknownTools::Allow => ToolAttrs::default(),
             }
         };
+        let attrs = self.narrow(&call.server, &call.tool, attrs);
 
         // Stage 1c: declared attribute types. Evaluation is schema-free, and Cedar's `!=`
         // across types is `true` without an error, so a value of the wrong type (a list where
@@ -547,7 +759,7 @@ impl PolicyEngine {
         }
 
         // Stage 2: Cedar.
-        match self.prepare(chain, call, &attrs, now) {
+        match self.prepare(chain, call, &attrs, labels, now) {
             Ok(prepared) => self.evaluate_prepared(&prepared),
             Err(e) => Outcome::deny(REASON_POLICY_ERROR, vec![e]),
         }
@@ -560,14 +772,94 @@ impl PolicyEngine {
         chain: &DelegationChain,
         call: &ToolCall,
         attrs: &ToolAttrs,
+        labels: &CallLabels,
         now: OffsetDateTime,
     ) -> Result<Prepared, String> {
         let parts = self
             .request_cache
             .get_or_build(chain, call, attrs, self.legacy_bare_actions)
             .map_err(|e| e.to_string())?;
-        let request = parts.request(call, now).map_err(|e| e.to_string())?;
+        let request = parts
+            .request(call, labels, now)
+            .map_err(|e| e.to_string())?;
         Ok(Prepared { request, parts })
+    }
+
+    /// `attrs` with any narrowing imported from tool annotations applied.
+    fn narrow(&self, server: &str, tool: &str, attrs: ToolAttrs) -> ToolAttrs {
+        if self.annotation_import == AnnotationImport::Never {
+            return attrs;
+        }
+        // A poisoned lock cannot be trusted to hold every narrowing: treat the tool as
+        // neither read-only nor non-destructive (the most restricted reading).
+        let narrowing = match self.narrowed.read() {
+            Ok(map) => map
+                .get(&(server.to_string(), tool.to_string()))
+                .copied()
+                .unwrap_or_default(),
+            Err(_) => Narrowing {
+                not_readonly: true,
+                destructive: true,
+            },
+        };
+        if narrowing.is_empty() {
+            attrs
+        } else {
+            attrs.narrowed(&narrowing)
+        }
+    }
+
+    /// Report the MCP annotations a server gave a tool in `tools/list` (`readOnlyHint`,
+    /// `destructiveHint`). With [`AnnotationImport::Narrowing`] and a tool that is in the
+    /// catalog, explicit hints that make the tool more restricted are kept for the life of
+    /// the engine; nothing else changes anything (ADR-0009). Returns whether this narrowed
+    /// the tool further.
+    pub fn import_annotations(
+        &self,
+        server: &str,
+        tool: &str,
+        read_only_hint: Option<bool>,
+        destructive_hint: Option<bool>,
+    ) -> bool {
+        if self.annotation_import == AnnotationImport::Never || !self.catalog.contains(server, tool)
+        {
+            return false;
+        }
+        let asked = Narrowing::from_hints(read_only_hint, destructive_hint);
+        if asked.is_empty() {
+            return false;
+        }
+        let Ok(mut map) = self.narrowed.write() else {
+            return false;
+        };
+        let entry = map
+            .entry((server.to_string(), tool.to_string()))
+            .or_default();
+        let merged = entry.union(asked);
+        let changed = merged != *entry;
+        *entry = merged;
+        changed
+    }
+
+    /// The attributes a call to `(server, tool)` is evaluated with: the catalog entry with any
+    /// imported narrowing, or what [`UnknownTools`] gives a tool missing from the catalog
+    /// (`None` under [`UnknownTools::Deny`]).
+    pub fn effective_attrs(&self, server: &str, tool: &str) -> Option<ToolAttrs> {
+        let attrs = if self.catalog.contains(server, tool) {
+            self.catalog.get(server, tool)
+        } else {
+            match self.unknown_tools {
+                UnknownTools::Deny => return None,
+                UnknownTools::Sensitive => ToolAttrs::new().sensitive(true),
+                UnknownTools::Allow => ToolAttrs::default(),
+            }
+        };
+        Some(self.narrow(server, tool, attrs))
+    }
+
+    /// How annotations are imported ([`PolicyEngineBuilder::with_annotation_import`]).
+    pub fn annotation_import(&self) -> AnnotationImport {
+        self.annotation_import
     }
 
     /// Stage 2, second half: evaluate a prepared request against the policy set.
@@ -597,12 +889,56 @@ impl PolicyEngine {
                 policy_ids,
                 diagnostics: Vec::new(),
             },
-            CedarDecision::Deny => Outcome {
+            CedarDecision::Deny => self.deny_or_ask(prepared, policy_ids),
+        }
+    }
+
+    /// A Cedar deny: `approval_required` when every forbid that applied carries
+    /// `@obligation("approval")` and the call would be allowed without them, else
+    /// `policy_deny`.
+    fn deny_or_ask(&self, prepared: &Prepared, policy_ids: Vec<String>) -> Outcome {
+        let deny = |policy_ids| Outcome {
+            decision: Decision::Deny,
+            reason: REASON_POLICY_DENY.to_string(),
+            policy_ids,
+            diagnostics: Vec::new(),
+        };
+        let Some(relaxed) = &self.obligations.without_approval else {
+            return deny(policy_ids);
+        };
+        let only_approval = !policy_ids.is_empty()
+            && policy_ids
+                .iter()
+                .all(|id| self.obligations.approval_ids.contains(id));
+        if !only_approval {
+            return deny(policy_ids);
+        }
+        // Would a permit allow the call once the approval forbids are lifted? If not, an
+        // approval could not help, and the answer is a plain deny.
+        let response =
+            self.authorizer
+                .is_authorized(&prepared.request, relaxed, &prepared.parts.entities);
+        let errors: Vec<String> = response
+            .diagnostics()
+            .errors()
+            .map(|e| e.to_string())
+            .collect();
+        if !errors.is_empty() {
+            return Outcome {
                 decision: Decision::Deny,
-                reason: REASON_POLICY_DENY.to_string(),
+                reason: REASON_POLICY_ERROR.to_string(),
+                policy_ids,
+                diagnostics: errors,
+            };
+        }
+        match response.decision() {
+            CedarDecision::Allow => Outcome {
+                decision: Decision::Deny,
+                reason: REASON_APPROVAL_REQUIRED.to_string(),
                 policy_ids,
                 diagnostics: Vec::new(),
             },
+            CedarDecision::Deny => deny(policy_ids),
         }
     }
 
@@ -620,9 +956,10 @@ impl PolicyEngine {
     /// Replace the policy set. The new policies are parsed and validated against the engine's
     /// schema first; on error the previous policies stay in force.
     pub fn reload_policies_str(&mut self, policies: &str) -> Result<(), PolicyError> {
-        let (policies, warnings) = load_policies(policies, &self.schema)?;
-        self.policies = policies;
-        self.validation_warnings = warnings;
+        let loaded = load_policies(policies, &self.schema)?;
+        self.policies = loaded.policies;
+        self.obligations = loaded.obligations;
+        self.validation_warnings = loaded.warnings;
         // The cached request parts do not depend on the policies, but a reload is the
         // operator's "start from scratch", so it starts with an empty cache too.
         self.request_cache.clear();

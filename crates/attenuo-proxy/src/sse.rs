@@ -127,15 +127,46 @@ fn split_lines(text: &str) -> Vec<&str> {
     lines
 }
 
-fn rewrite_event(
-    event: &[u8],
-    f: &mut impl FnMut(&mut Value),
-    out: &mut Vec<u8>,
-) -> Result<(), io::Error> {
-    let text = std::str::from_utf8(event)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SSE event is not UTF-8"))?;
+/// Split `buf`, which holds whole events (as [`frame_stream`] and [`rewrite_stream`] emit
+/// them), into those events, each with its terminating empty line. Trailing bytes that do not
+/// end an event are returned as a last element, unchanged.
+pub(crate) fn split_events(buf: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    let mut rest = buf;
+    while let Some(end) = find_event_end(rest) {
+        let (event, tail) = rest.split_at(end);
+        out.push(event);
+        rest = tail;
+    }
+    if !rest.is_empty() {
+        out.push(rest);
+    }
+    out
+}
+
+/// The JSON of an event's `data`, if it has data that parses as JSON (the same reading as
+/// [`SseRewriter`]).
+pub(crate) fn event_json(event: &[u8]) -> Option<Value> {
+    let text = std::str::from_utf8(event).ok()?;
     let lines = split_lines(text);
-    let data: Vec<&str> = lines
+    let data = data_lines(&lines);
+    (!data.is_empty())
+        .then(|| serde_json::from_str::<Value>(&data.join("\n")).ok())
+        .flatten()
+}
+
+/// One `message` event carrying `message` as its data.
+pub(crate) fn message_event(message: &Value) -> Vec<u8> {
+    format!(
+        "event: message\ndata: {}\n\n",
+        serde_json::to_string(message).unwrap_or_default()
+    )
+    .into_bytes()
+}
+
+/// The values of an event's `data` lines.
+fn data_lines<'a>(lines: &[&'a str]) -> Vec<&'a str> {
+    lines
         .iter()
         .filter_map(|l| l.strip_prefix("data"))
         .filter_map(|rest| {
@@ -147,7 +178,18 @@ fn rewrite_event(
                     .map(|v| v.strip_prefix(' ').unwrap_or(v))
             }
         })
-        .collect();
+        .collect()
+}
+
+fn rewrite_event(
+    event: &[u8],
+    f: &mut impl FnMut(&mut Value),
+    out: &mut Vec<u8>,
+) -> Result<(), io::Error> {
+    let text = std::str::from_utf8(event)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SSE event is not UTF-8"))?;
+    let lines = split_lines(text);
+    let data = data_lines(&lines);
     let parsed = (!data.is_empty())
         .then(|| serde_json::from_str::<Value>(&data.join("\n")).ok())
         .flatten();

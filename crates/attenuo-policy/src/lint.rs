@@ -8,6 +8,9 @@
 //! It also flags bare actions (`Action::"read_file"`, stage `actions`): since SR-13 an action
 //! names its server (`Action::"github/read_file"`). A bare action is an error by default and a
 //! deprecation warning under [`LintOptions::legacy_bare_actions`].
+//!
+//! And it checks `@obligation` annotations (stage `obligations`, ADR-0009): the only value is
+//! `"approval"`, and only on a `forbid`. The engine refuses to load anything else.
 
 use std::str::FromStr;
 
@@ -27,7 +30,7 @@ pub enum LintSeverity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LintIssue {
     pub severity: LintSeverity,
-    /// `schema`, `parse`, `actions` or `validate`.
+    /// `schema`, `parse`, `actions`, `obligations` or `validate`.
     pub stage: &'static str,
     /// The policy the issue is about, when Cedar names one.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -337,6 +340,17 @@ pub fn lint_with_options(policy_text: &str, schema_text: &str, options: LintOpti
     report
         .issues
         .extend(bare_action_issues(policy_text, options));
+    if let Err(errors) = crate::approval_obligations(&policies) {
+        for (id, message) in errors {
+            report.issues.push(issue(
+                LintSeverity::Error,
+                "obligations",
+                Some(id),
+                message,
+                None,
+            ));
+        }
+    }
 
     let result = Validator::new(schema).validate(&policies, ValidationMode::Strict);
     for e in result.validation_errors() {
@@ -462,6 +476,44 @@ mod tests {
         );
         assert!(!r.has_errors(), "{:?}", r.issues);
         assert_eq!(r.warning_count(), 1, "{:?}", r.issues);
+    }
+
+    #[test]
+    fn obligations_must_be_approval_on_a_forbid() {
+        let good = concat!(
+            "@id(\"ask\")\n@obligation(\"approval\")\n",
+            "forbid(principal, action, resource) when { resource.destructive && ",
+            "context.session.tainted && !context.approval.present };\n",
+            "permit(principal, action, resource);\n",
+        );
+        let r = lint(good, &schema());
+        assert!(r.issues.is_empty(), "{:?}", r.issues);
+
+        let bad = concat!(
+            "@id(\"typo\")\n@obligation(\"aproval\")\nforbid(principal, action, resource);\n",
+            "@id(\"on_permit\")\n@obligation(\"approval\")\npermit(principal, action, resource);\n",
+        );
+        let r = lint(bad, &schema());
+        let found: Vec<_> = r
+            .issues
+            .iter()
+            .filter(|i| i.stage == "obligations")
+            .map(|i| i.policy_id.clone().unwrap())
+            .collect();
+        assert_eq!(found, vec!["typo", "on_permit"], "{:?}", r.issues);
+        assert!(r.has_errors());
+    }
+
+    #[test]
+    fn output_labelling_attributes_validate_without_has() {
+        let text = concat!(
+            "@id(\"p\")\npermit(principal, action, resource) when { ",
+            "!resource.destructive || (context.session.tainted_by.contains(\"web/fetch\") && ",
+            "!context.args_contain_untrusted && context.untrusted_args.isEmpty() && ",
+            "context.approval.present && context.approval.by == \"user\") };\n",
+        );
+        let r = lint(text, &schema());
+        assert!(!r.has_errors(), "{:?}", r.issues);
     }
 
     #[test]

@@ -289,7 +289,7 @@ fn denied_reason(resp: &Value) -> String {
 fn tool_calls(entries: &[Value]) -> Vec<&Value> {
     entries
         .iter()
-        .filter(|e| e["record"]["server"] == "github")
+        .filter(|e| e["record"]["server"] == "github" && e["record"]["kind"] == "decision")
         .collect()
 }
 
@@ -1122,11 +1122,11 @@ async fn audit_verify_detects_tampering() {
 
     let report = h.admin_get("/admin/audit/verify").await;
     assert_eq!(report["ok"], true);
-    // token.root, admin.root_token, two calls
-    assert_eq!(report["entries"], 4);
+    // token.root, admin.root_token, two calls, the allowed call's tool_result
+    assert_eq!(report["entries"], 5);
     assert_eq!(report["first_bad_seq"], Value::Null);
     let cp = h.admin_get("/admin/audit/checkpoint").await;
-    assert_eq!(cp["seq"], 4);
+    assert_eq!(cp["seq"], 5);
     assert_eq!(cp["hash"].as_str().unwrap().len(), 64);
 
     // Turn the recorded denial into an allow behind the server's back.
@@ -1827,7 +1827,8 @@ async fn concurrent_decisions_keep_the_audit_chain_valid() {
     }
 
     let entries = h.audit_entries().await;
-    assert_eq!(entries.len(), before + 48);
+    // 48 decisions, plus a tool_result for each of the 24 calls that went upstream.
+    assert_eq!(entries.len(), before + 72);
     let seqs: Vec<u64> = entries.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
     assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>());
     let verify = h.admin_get("/admin/audit/verify").await;
@@ -1945,12 +1946,13 @@ async fn checkpoint_endpoint_returns_a_signed_checkpoint_verifiable_with_the_jwk
 
     // Reading the head through the entries page signs nothing.
     let page = h.admin_get("/admin/audit?from=1&limit=1").await;
-    assert_eq!(page["head"], 3);
+    // token.root, admin.root_token, the call and its tool_result.
+    assert_eq!(page["head"], 4);
     assert_eq!(h.admin_get("/admin/audit/verify").await["checkpoints"], 0);
 
     let v = h.admin_get("/admin/audit/checkpoint").await;
     let cp: attenuo_audit::Checkpoint = serde_json::from_value(v.clone()).unwrap();
-    assert_eq!(cp.seq, 3);
+    assert_eq!(cp.seq, 4);
     assert_eq!(v["hash"], v["head_hash"], "legacy alias");
     jwks_keys(&h).await.verify(&cp).unwrap();
     let head = h.audit_entries().await.pop().unwrap();
@@ -1961,7 +1963,7 @@ async fn checkpoint_endpoint_returns_a_signed_checkpoint_verifiable_with_the_jwk
     let report = h.admin_get("/admin/audit/verify").await;
     assert_eq!(report["ok"], true, "{report}");
     assert_eq!(report["checkpoints"], 1);
-    assert_eq!(report["last_signed_seq"], 3);
+    assert_eq!(report["last_signed_seq"], 4);
     assert_eq!(report["unsigned_tail"], 0);
 
     // A forged checkpoint row (right hash, wrong signature) makes verify fail.
@@ -1978,7 +1980,7 @@ async fn checkpoint_endpoint_returns_a_signed_checkpoint_verifiable_with_the_jwk
 async fn checkpoints_are_written_automatically_every_n_entries() {
     let h = Harness::start_tweaked(true, |cfg| cfg.audit.checkpoint_every = 3).await;
     let alice = h.mint_root("alice", "planner", &["github:*"]).await; // entries 1, 2
-    for i in 0..5 {
+    for i in 0..4 {
         h.call(
             &alice.token,
             "read_file",
@@ -1986,12 +1988,13 @@ async fn checkpoints_are_written_automatically_every_n_entries() {
         )
         .await;
     }
-    // 7 entries so far: checkpoints at 3 and 6, tail of 1.
+    // 10 entries so far (a decision and a tool_result per call): checkpoints at 3, 6 and 9,
+    // tail of 1.
     let report = h.admin_get("/admin/audit/verify").await;
     assert_eq!(report["ok"], true, "{report}");
-    assert_eq!(report["entries"], 7);
-    assert_eq!(report["checkpoints"], 2);
-    assert_eq!(report["last_signed_seq"], 6);
+    assert_eq!(report["entries"], 10);
+    assert_eq!(report["checkpoints"], 3);
+    assert_eq!(report["last_signed_seq"], 9);
     assert_eq!(report["unsigned_tail"], 1);
 }
 
@@ -2009,7 +2012,7 @@ async fn checkpoint_timer_signs_the_tail_of_a_quiet_log() {
     for _ in 0..50 {
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         let report = h.admin_get("/admin/audit/verify").await;
-        if report["last_signed_seq"] == 3 {
+        if report["last_signed_seq"] == 4 {
             signed = report;
             break;
         }
@@ -2084,6 +2087,9 @@ fn append_synthetic(h: &Harness, n: usize) {
             session_id: None,
             policy_ids: Vec::new(),
             dpop_bound: false,
+            decision_id: None,
+            result: None,
+            labels: None,
         };
         h.state.audit.append(record).unwrap();
     }
@@ -2094,9 +2100,9 @@ async fn export_streams_a_range_that_verifies_offline_with_only_the_jwks() {
     let h = Harness::start_tweaked(false, |cfg| cfg.audit.checkpoint_every = 400).await;
     let alice = h.mint_root("alice", "planner", &["github:*"]).await; // entries 1, 2
     h.call(&alice.token, "read_file", json!({"repo": "alice/public-a"}))
-        .await;
-    // Past one export page (500) and two automatic checkpoints (400, 800).
-    append_synthetic(&h, 1100);
+        .await; // entries 3, 4 (the decision and its tool_result)
+                // Past one export page (500) and two automatic checkpoints (400, 800).
+    append_synthetic(&h, 1099);
     let keys = jwks_keys(&h).await;
 
     // The whole log: entries 1..=1103, checkpoints at 400, 800 and 1100.
@@ -2229,12 +2235,13 @@ async fn every_record_has_a_kind_and_chains_share_a_chain_id_and_export_filters_
             ("admin", "admin.root_token"),
             ("exchange", "token.exchange"),
             ("decision", "read_file"),
+            ("tool_result", "read_file"),
             ("lease_renew", "lease.renew"),
             ("lease_revoke", "admin.lease.revoke"),
         ]
     );
-    // The chain id is the root lease, the same for the root token, the exchange, the call and
-    // the renewal; admin records have none.
+    // The chain id is the root lease, the same for the root token, the exchange, the call, its
+    // result and the renewal; admin records have none.
     let chain_ids: Vec<_> = all
         .entries
         .iter()
@@ -2243,7 +2250,17 @@ async fn every_record_has_a_kind_and_chains_share_a_chain_id_and_export_filters_
     let (a, b) = (Some(alice.lease.clone()), Some(bob.lease.clone()));
     assert_eq!(
         chain_ids,
-        [a.clone(), None, b, None, a.clone(), a.clone(), a, None]
+        [
+            a.clone(),
+            None,
+            b,
+            None,
+            a.clone(),
+            a.clone(),
+            a.clone(),
+            a,
+            None
+        ]
     );
 
     // `?kind=` and `?chain_id=` filter, and combine; the header says the file is filtered.
@@ -2256,19 +2273,19 @@ async fn every_record_has_a_kind_and_chains_share_a_chain_id_and_export_filters_
         .all(|e| e.record.kind.as_str() == "admin"));
     let header = export.header.unwrap();
     assert_eq!(header.filter.unwrap().kind.unwrap().as_str(), "admin");
-    assert_eq!((header.from, header.to), (1, 8));
+    assert_eq!((header.from, header.to), (1, 9));
 
     let q = format!("?chain_id={}", alice.lease);
     let export = attenuo_audit::parse_export(&export_text(&h, &q).await).unwrap();
     assert_eq!(
         export.entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
-        [1, 5, 6, 7]
+        [1, 5, 6, 7, 8]
     );
     let q = format!("?chain_id={}&kind=lease_renew", alice.lease);
     let export = attenuo_audit::parse_export(&export_text(&h, &q).await).unwrap();
     assert_eq!(
         export.entries.iter().map(|e| e.seq).collect::<Vec<_>>(),
-        [7]
+        [8]
     );
     let export =
         attenuo_audit::parse_export(&export_text(&h, "?kind=exchange&from=6").await).unwrap();
@@ -2303,7 +2320,7 @@ async fn every_record_has_a_kind_and_chains_share_a_chain_id_and_export_filters_
 
 #[tokio::test]
 async fn audit_append_latency_and_checkpoint_metrics_are_exported() {
-    let h = Harness::start_tweaked(false, |cfg| cfg.audit.checkpoint_every = 2).await;
+    let h = Harness::start_tweaked(false, |cfg| cfg.audit.checkpoint_every = 3).await;
     let alice = h.mint_root("alice", "planner", &["github:*"]).await; // 2 appends
     for i in 0..3 {
         h.call(
@@ -2314,7 +2331,8 @@ async fn audit_append_latency_and_checkpoint_metrics_are_exported() {
         .await;
     }
     let entries = h.audit_entries().await.len() as u64;
-    assert_eq!(entries, 5);
+    // Two appends per call: the decision and its tool_result.
+    assert_eq!(entries, 8);
     let text = h.state.metrics.render();
     let value = |prefix: &str| -> u64 {
         text.lines()
@@ -2325,7 +2343,7 @@ async fn audit_append_latency_and_checkpoint_metrics_are_exported() {
             .unwrap()
     };
     assert!(text.contains("# TYPE attenuo_audit_append_duration_seconds histogram"));
-    // Every successful append was timed: root-token issuance (2), plus one per call.
+    // Every successful append was timed: root-token issuance (2), plus two per call.
     assert_eq!(
         value("attenuo_audit_append_duration_seconds_count "),
         entries
@@ -2334,7 +2352,7 @@ async fn audit_append_latency_and_checkpoint_metrics_are_exported() {
         value("attenuo_audit_append_duration_seconds_bucket{le=\"+Inf\"} "),
         entries
     );
-    // Checkpoints at seq 2 and 4.
+    // Checkpoints at seq 3 and 6.
     assert_eq!(value("attenuo_audit_checkpoints_total "), 2);
     // A manual checkpoint of a new head counts; asking again for the same head does not.
     h.admin_get("/admin/audit/checkpoint").await;

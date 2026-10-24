@@ -1,0 +1,63 @@
+# cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3 'result|append_file/|decide_file/'
+# 2026-10-24, branch feat/output-labels-phase1 (based on de3cf75), rustc 1.99.1, 4-core shared VM, load average 1.5 to 2.1
+
+decide/result_digest/1_hop
+                        time:   [664.39 ns 683.83 ns 706.44 ns]
+Found 12 outliers among 100 measurements (12.00%)
+  4 (4.00%) high mild
+  8 (8.00%) high severe
+decide/record_result_memory/1_hop
+                        time:   [128.50 µs 136.14 µs 143.28 µs]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+decide/result_digest/3_hop
+                        time:   [693.20 ns 715.05 ns 739.95 ns]
+Found 9 outliers among 100 measurements (9.00%)
+  7 (7.00%) high mild
+  2 (2.00%) high severe
+decide/record_result_memory/3_hop
+                        time:   [205.90 µs 213.41 µs 220.96 µs]
+Found 7 outliers among 100 measurements (7.00%)
+  5 (5.00%) low mild
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+decide/append_file/1_hop
+                        time:   [104.17 µs 136.16 µs 173.32 µs]
+Found 10 outliers among 100 measurements (10.00%)
+  1 (1.00%) high mild
+  9 (9.00%) high severe
+decide/record_result_file/1_hop
+                        time:   [114.63 µs 147.32 µs 187.46 µs]
+Found 11 outliers among 100 measurements (11.00%)
+  3 (3.00%) high mild
+  8 (8.00%) high severe
+decide/decide_file/1_hop
+                        time:   [123.03 µs 143.08 µs 168.34 µs]
+Found 10 outliers among 100 measurements (10.00%)
+  10 (10.00%) high severe
+decide/append_file/3_hop
+                        time:   [112.84 µs 153.76 µs 201.32 µs]
+Found 11 outliers among 100 measurements (11.00%)
+  2 (2.00%) high mild
+  9 (9.00%) high severe
+decide/record_result_file/3_hop
+                        time:   [125.94 µs 155.13 µs 189.35 µs]
+Found 12 outliers among 100 measurements (12.00%)
+  1 (1.00%) high mild
+  11 (11.00%) high severe
+decide/decide_file/3_hop
+                        time:   [140.69 µs 160.64 µs 184.07 µs]
+Found 9 outliers among 100 measurements (9.00%)
+  9 (9.00%) high severe
+
+Warning: Unable to complete 100 samples in 3.0s. You may wish to increase target time to 3.0s, enable flat sampling, or reduce sample count to 70.
+decide/record_result_file_full/1_hop
+                        time:   [315.59 µs 329.11 µs 343.78 µs]
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+decide/record_result_file_full/3_hop
+                        time:   [399.16 µs 425.03 µs 451.08 µs]
+Found 5 outliers among 100 measurements (5.00%)
+  4 (4.00%) high mild
+  1 (1.00%) high severe

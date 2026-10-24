@@ -176,7 +176,7 @@ Show the most recent audit entries, oldest of them first. Filters keep only matc
 | `--before SEQ` | the head | Show the `-n` matching entries just below `SEQ` instead of the newest. To page back, pass the oldest `seq` shown. Not with `--follow`. |
 | `-f`, `--follow` | off | Keep polling for new matching entries. |
 | `--interval-ms` | 1000 | Polling interval with `--follow`. |
-| `--kind` | all | Record kind: `decision`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin`. Repeatable, or comma-separated; any of them matches. |
+| `--kind` | all | Record kind: `decision`, `tool_result`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin`. Repeatable, or comma-separated; any of them matches. |
 | `--decision` | all | `allow` or `deny`. |
 | `--reason` | all | The record's `reason` (`policy_deny`, `lease_revoked`, ...). |
 | `--subject` | all | The originating user. |
@@ -222,7 +222,7 @@ Write entries and the checkpoints inside the range. Needs the admin token.
 | `--to` | the head | Last sequence number, inclusive. |
 | `--format` | `jsonl` | `jsonl` streams one object per line (header, entries, checkpoints). `json` writes one object `{header, entries, checkpoints}`. |
 | `--out` | stdout | Write to this file. |
-| `--kind` | all | Keep only records of this kind: `decision`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin`. |
+| `--kind` | all | Keep only records of this kind: `decision`, `tool_result`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin`. |
 | `--chain-id` | all | Keep only records of this delegation chain (the `chain_id` field: the lease id of the chain's first hop). |
 
 `--kind` and `--chain-id` combine, and apply inside `--from`/`--to`. A filtered export has a `filter` member in its header and cannot be verified with `audit verify --file` (its hash chain has gaps by construction): verify an unfiltered export, then filter. The same filters are `?kind=` and `?chain_id=` on `GET /admin/audit/export`; an unknown kind or an empty `chain_id` is a 400.

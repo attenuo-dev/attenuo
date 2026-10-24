@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 
+pub use attenuo_core::OutputLabel;
 use serde::{Deserialize, Serialize};
 
 /// Cedar type of a tool argument, used only for schema generation and policy validation.
@@ -70,8 +71,8 @@ impl ArgType {
     }
 }
 
-/// Attributes of one tool. Available in policies as `resource.readonly` and
-/// `resource.sensitive`.
+/// Attributes of one tool. Available in policies as `resource.readonly`,
+/// `resource.sensitive` and `resource.destructive`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolAttrs {
     /// The tool only reads; it never mutates state outside the agent.
@@ -80,15 +81,64 @@ pub struct ToolAttrs {
     /// The tool touches data or actions that warrant stronger user assurance (e.g. MFA).
     #[serde(default)]
     pub sensitive: bool,
+    /// The tool can change or delete things in a way that matters (ADR-0009). Unset means
+    /// `!readonly`, MCP's default for `destructiveHint`; read it with
+    /// [`ToolAttrs::is_destructive`]. Set it to `false` for an additive tool (create an event,
+    /// append to a file) that should not need an approval after an untrusted read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destructive: Option<bool>,
+    /// How the tool's results are labelled: `untrusted` (the default) taints the delegation
+    /// run that reads them; `trusted` is recorded in the audit log but taints nothing. Mark a
+    /// tool trusted only when its output cannot carry text an attacker chose (a balance from
+    /// the user's own bank, a clock).
+    #[serde(default, skip_serializing_if = "is_untrusted")]
+    pub output: OutputLabel,
     /// Declared argument types. Only used to type `context.input` for policy validation;
     /// arguments that are not declared are still passed to Cedar at evaluation time.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub inputs: BTreeMap<String, ArgType>,
 }
 
+fn is_untrusted(label: &OutputLabel) -> bool {
+    *label == OutputLabel::Untrusted
+}
+
 impl ToolAttrs {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// `destructive` as set, else `!readonly`.
+    pub fn is_destructive(&self) -> bool {
+        self.destructive.unwrap_or(!self.readonly)
+    }
+
+    /// Set `destructive` explicitly (see [`ToolAttrs::destructive`]).
+    pub fn destructive(mut self, destructive: bool) -> Self {
+        self.destructive = Some(destructive);
+        self
+    }
+
+    /// Set how the tool's results are labelled (see [`ToolAttrs::output`]).
+    pub fn output(mut self, output: OutputLabel) -> Self {
+        self.output = output;
+        self
+    }
+
+    /// These attributes made more restrictive by `narrowing`, never less: a tool the upstream
+    /// says is not read-only stops being read-only (so an unset `destructive` becomes `true`
+    /// through the `!readonly` default), and one it says is destructive becomes destructive.
+    /// An explicit `destructive = false` in the catalog stays unless the upstream says
+    /// `destructiveHint: true`.
+    pub fn narrowed(&self, narrowing: &Narrowing) -> ToolAttrs {
+        let mut out = self.clone();
+        if narrowing.not_readonly {
+            out.readonly = false;
+        }
+        if narrowing.destructive {
+            out.destructive = Some(true);
+        }
+        out
     }
 
     pub fn readonly(mut self, readonly: bool) -> Self {
@@ -108,6 +158,53 @@ impl ToolAttrs {
     }
 }
 
+/// Whether MCP tool annotations from `tools/list` (`readOnlyHint`, `destructiveHint`) are
+/// imported into the catalog (`[policy] import_annotations`, ADR-0009). Annotations come from
+/// the upstream, which the threat model does not trust, so they can only narrow.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnnotationImport {
+    /// Ignore annotations; the catalog alone decides. The default.
+    #[default]
+    Never,
+    /// An explicit `readOnlyHint: false` clears `readonly`, and an explicit
+    /// `destructiveHint: true` sets `destructive`. Nothing an annotation says can make a tool
+    /// read-only, non-destructive or trusted. Narrowing is sticky for the life of the engine.
+    Narrowing,
+}
+
+/// What imported annotations have narrowed for one tool (see [`AnnotationImport::Narrowing`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Narrowing {
+    /// The upstream said `readOnlyHint: false`.
+    pub not_readonly: bool,
+    /// The upstream said `destructiveHint: true`.
+    pub destructive: bool,
+}
+
+impl Narrowing {
+    /// The narrowing explicit hints ask for. Absent hints, and hints that would widen
+    /// (`readOnlyHint: true`, `destructiveHint: false`), ask for nothing.
+    pub fn from_hints(read_only_hint: Option<bool>, destructive_hint: Option<bool>) -> Self {
+        Self {
+            not_readonly: read_only_hint == Some(false),
+            destructive: destructive_hint == Some(true),
+        }
+    }
+
+    /// Both narrowings together.
+    pub fn union(self, other: Narrowing) -> Narrowing {
+        Narrowing {
+            not_readonly: self.not_readonly || other.not_readonly,
+            destructive: self.destructive || other.destructive,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        !self.not_readonly && !self.destructive
+    }
+}
+
 /// What the engine does with a `tools/call` for a `(server, tool)` pair that is not in the
 /// catalog. See [`PolicyEngineBuilder::with_unknown_tools`](crate::PolicyEngineBuilder::with_unknown_tools).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,10 +216,10 @@ pub enum UnknownTools {
     /// tool that slips past rules keyed on the real name (SR-25).
     #[default]
     Deny,
-    /// Evaluate with `sensitive = true` (and `readonly = false`).
+    /// Evaluate with `sensitive = true` (and `readonly = false`, so `destructive = true`).
     Sensitive,
-    /// Evaluate with [`ToolAttrs::default`] (not read-only, not sensitive). The behaviour
-    /// before SR-12: `forbid` rules keyed on `sensitive` do not apply.
+    /// Evaluate with [`ToolAttrs::default`] (not read-only, so destructive; not sensitive).
+    /// The behaviour before SR-12: `forbid` rules keyed on `sensitive` do not apply.
     Allow,
 }
 

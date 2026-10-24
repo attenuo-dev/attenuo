@@ -55,6 +55,7 @@ entity Tool in [Server] {
     name: String,
     readonly: Bool,
     sensitive: Bool,
+    destructive: Bool,
 };
 "#;
 
@@ -108,7 +109,8 @@ fn record(attrs: &BTreeMap<String, ArgType>) -> String {
 
 fn context_type(inputs: &BTreeMap<String, ArgType>) -> String {
     format!(
-        "{{ input: {}, originating_user: UserContext, chain: ChainContext, session_id?: String, now_unix: Long }}",
+        "{{ input: {}, originating_user: UserContext, chain: ChainContext, session_id?: String, now_unix: Long, \
+         session: SessionContext, args_contain_untrusted: Bool, untrusted_args: Set<String>, approval: ApprovalContext }}",
         record(inputs)
     )
 }
@@ -143,6 +145,9 @@ pub fn generate(
     s.push_str(
         "type ChainContext = { depth: Long, agents: Set<String>, root_agent: String, leases: Set<String> };\n",
     );
+    // Output labelling (ADR-0009). Always present in the context, so policies need no `has`.
+    s.push_str("type SessionContext = { tainted: Bool, tainted_by: Set<String> };\n");
+    s.push_str("type ApprovalContext = { present: Bool, by: String };\n");
     let actions = catalog.actions(legacy_bare_actions);
     let mut all_inputs: BTreeMap<String, ArgType> = BTreeMap::new();
     for inputs in actions.values() {
@@ -198,6 +203,18 @@ mod tests {
         assert!(text.contains("action \"fs/read-file\" in \"invoke\""));
         assert!(text.contains("action \"x/invoke\" in \"invoke\""));
         assert!(!text.contains("action \"create_issue\""));
+        // Output labelling attributes are declared for every action.
+        for attr in [
+            "destructive: Bool",
+            "session: SessionContext",
+            "args_contain_untrusted: Bool",
+            "untrusted_args: Set<String>",
+            "approval: ApprovalContext",
+            "type SessionContext = { tainted: Bool, tainted_by: Set<String> }",
+            "type ApprovalContext = { present: Bool, by: String }",
+        ] {
+            assert!(text.contains(attr), "{attr}");
+        }
         assert_eq!(text.matches("action \"invoke\"").count(), 1);
 
         let legacy = generate(DEFAULT_SCHEMA, &catalog, &default_user_attrs(), true);

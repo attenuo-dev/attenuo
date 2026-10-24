@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use attenuo_core::{Decision, DelegationChain, ToolCall};
+use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -97,6 +98,13 @@ pub const REASON_DPOP_REQUIRED: &str = "dpop_required";
 pub const REASON_INVALID_DPOP_PROOF: &str = "invalid_dpop_proof";
 /// Reason code of [`AuthError::UseDpopNonce`] (RFC 9449 §9).
 pub const REASON_USE_DPOP_NONCE: &str = "use_dpop_nonce";
+/// Reason code (JSON-RPC `data.reason`) for a call whose result was withheld because it could
+/// not be labelled: the `tool_result` audit record or the run's taint state could not be
+/// written (ADR-0009). The call ran upstream; its result never reaches the agent.
+pub const REASON_LABEL_ERROR: &str = "label_error";
+/// Reason code of a decision that asks for an approval (`@obligation("approval")`, ADR-0009).
+/// The proxy answers it with JSON-RPC `-32008`.
+pub const REASON_APPROVAL_REQUIRED: &str = "approval_required";
 /// DPoP signature algorithms accepted, for `WWW-Authenticate: DPoP algs="..."` (RFC 9449 §7.1).
 pub const DPOP_ALGS: &str = "EdDSA ES256";
 
@@ -226,6 +234,44 @@ pub trait Authorizer: Send + Sync {
     ) -> Uuid {
         let _ = (chain, call, reason, now);
         Uuid::new_v4()
+    }
+
+    /// Record the upstream's answer to an allowed mediated call (`tools/call`,
+    /// `resources/read`, `prompts/get`, `completion/complete`) before the proxy relays it
+    /// (output labelling, ADR-0009). `result` is the JSON-RPC `result` member, or the `error`
+    /// member when `is_error`; `decision_id` is the id the call's decision returned.
+    ///
+    /// Implementations that keep an audit log must append a `tool_result` record and, for an
+    /// untrusted result, add a label to the delegation run's taint state. `Err` carries a
+    /// reason code (normally [`REASON_LABEL_ERROR`]) and the proxy then withholds the result:
+    /// the agent gets a JSON-RPC error instead. The default records nothing and lets every
+    /// result through.
+    async fn record_result(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        decision_id: Uuid,
+        result: &Value,
+        is_error: bool,
+        now: OffsetDateTime,
+    ) -> Result<(), String> {
+        let _ = (chain, call, decision_id, result, is_error, now);
+        Ok(())
+    }
+
+    /// Report the MCP annotations an upstream gave a tool in a `tools/list` result
+    /// (`readOnlyHint`, `destructiveHint`; `None` when absent). Called for every listed tool
+    /// that carries either hint, before the list is filtered. The server uses them under
+    /// `[policy] import_annotations = "narrowing"`, where they can only make a tool more
+    /// restricted. Called on the response path, so it must be cheap. The default ignores them.
+    fn observe_tool_hints(
+        &self,
+        server: &str,
+        tool: &str,
+        read_only_hint: Option<bool>,
+        destructive_hint: Option<bool>,
+    ) {
+        let _ = (server, tool, read_only_hint, destructive_hint);
     }
 
     /// Record how long one stage of a proxied request took ([`Stage::Upstream`],

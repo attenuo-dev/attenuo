@@ -120,6 +120,9 @@ impl Row {
             session_id: None,
             policy_ids: Vec::new(),
             dpop_bound: false,
+            decision_id: None,
+            result: None,
+            labels: None,
         }
     }
 }

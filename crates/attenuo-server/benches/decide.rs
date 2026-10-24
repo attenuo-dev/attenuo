@@ -4,7 +4,10 @@
 //! splits the server's share of it into the stages the proxy runs for every `tools/call`:
 //! token verification (`Verifier::verify`, and `ServerAuthorizer::authenticate` with its cache), the lease check (`Pipeline::check_leases`),
 //! policy (`PolicyEngine::authorize`), building the `DecisionRecord`, the audit append, and
-//! `Pipeline::decide` as a whole (leases, policy, record, append). Chains of 1 and 3 hops, the
+//! `Pipeline::decide` as a whole (leases, policy, record, append), and the output-labelling
+//! cost of an allowed call's answer (`result_digest` of a small result, and
+//! `Pipeline::record_result`: the `tool_result` append plus the run label). Chains of 1 and 3
+//! hops, the
 //! `attenuo-bench` policy and catalog, SQLite stores in memory and in a temporary file
 //! (`durability` normal and full, opened as the server opens them: WAL checkpoints in the
 //! background).
@@ -25,6 +28,7 @@ use attenuo_core::{
 };
 use attenuo_policy::{ArgType, PolicyEngine, PolicyEngineBuilder, ToolAttrs, ToolCatalog};
 use attenuo_proxy::Authorizer;
+use attenuo_server::authz::result_digest;
 use attenuo_server::{Pipeline, ServerAuthorizer};
 use attenuo_token::{Issuer, IssuerConfig};
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
@@ -178,6 +182,12 @@ fn bench_decide(c: &mut Criterion) {
         json!({"repo": "alice/public-docs", "path": "README.md"}),
     );
 
+    // A small tools/call result, as the fake upstream answers.
+    let result = json!({
+        "content": [{"type": "text", "text": "# README\nThe public docs of alice."}],
+        "isError": false,
+    });
+
     let mut group = c.benchmark_group("decide");
     for store in stores() {
         let pipeline = Arc::new(Pipeline::new(
@@ -196,6 +206,9 @@ fn bench_decide(c: &mut Criterion) {
             let s = store.name;
 
             if s == "memory" {
+                group.bench_function(format!("result_digest/{depth}_hop"), |b| {
+                    b.iter(|| result_digest(black_box(&result)).unwrap())
+                });
                 group.bench_function(format!("verify/{depth}_hop"), |b| {
                     b.iter(|| verifier.verify(black_box(&tok), now).unwrap())
                 });
@@ -225,6 +238,18 @@ fn bench_decide(c: &mut Criterion) {
                 b.iter_batched(
                     || record(&chain, &call, now),
                     |r| store.audit.append(r).unwrap(),
+                    BatchSize::SmallInput,
+                )
+            });
+            // An untrusted result: the tool_result append and the run label, both on the store.
+            group.bench_function(format!("record_result_{s}/{depth}_hop"), |b| {
+                b.iter_batched(
+                    || result_digest(&result).unwrap(),
+                    |d| {
+                        pipeline
+                            .record_result(&chain, &call, uuid::Uuid::new_v4(), d, false, now)
+                            .unwrap()
+                    },
                     BatchSize::SmallInput,
                 )
             });

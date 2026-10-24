@@ -25,6 +25,9 @@ pub mod names;
 pub use call::ToolCall;
 pub use capability::{ArgConstraint, Capability, CapabilitySet};
 pub use chain::{AgentId, DelegationChain, Hop, LeaseId, OriginatingUser};
-pub use decision::{chain_id_of, Decision, DecisionRecord, RecordKind};
+pub use decision::{
+    chain_id_of, Decision, DecisionRecord, OutputLabel, RecordKind, RecordLabels, ResultInfo,
+    REASON_TOOL_RESULT,
+};
 pub use error::{AttenuationError, ChainError};
 pub use names::{NameError, NameKind};

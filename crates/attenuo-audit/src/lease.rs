@@ -74,6 +74,32 @@ pub trait LeaseStore: Send + Sync {
         leases: &[&LeaseId],
         now: OffsetDateTime,
     ) -> Result<LeaseStatus, AuditError>;
+
+    /// Add an output label to the taint state of the delegation run `chain_id` (the lease of
+    /// the run's first hop; ADR-0009). The run's lease must be known
+    /// ([`AuditError::UnknownLease`] otherwise); the check and the write are one transaction.
+    /// The store keeps one label per source, the one with the smallest `seq`, so reading the
+    /// taint state costs the same however many results the run reads (every result is in the
+    /// audit log as a `tool_result` record). Labels are never removed: taint only grows.
+    fn add_label(&self, chain_id: &LeaseId, label: &RunLabel) -> Result<(), AuditError>;
+
+    /// The taint state of the run `chain_id`: the first label of each source, ordered by
+    /// `seq`. Empty for a run that has read nothing untrusted. Callers must treat an error as
+    /// tainted (fail closed).
+    fn labels(&self, chain_id: &LeaseId) -> Result<Vec<RunLabel>, AuditError>;
+}
+
+/// One output label on a delegation run: an untrusted result the run read (ADR-0009).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunLabel {
+    /// `<server>/<tool>` of the call whose result carried the label.
+    pub source: String,
+    /// Id of the decision record that allowed that call.
+    pub decision_id: String,
+    /// Audit `seq` of the `tool_result` record of the result: the label's provenance.
+    pub seq: u64,
+    /// When the result was recorded.
+    pub at: OffsetDateTime,
 }
 
 /// What a store holds per lease. Shared by the memory and SQLite implementations.
@@ -211,6 +237,8 @@ pub(crate) fn classify(
 pub struct MemoryLeaseStore {
     rows: Mutex<BTreeMap<LeaseId, LeaseRow>>,
     bindings: Mutex<BTreeMap<LeaseId, String>>,
+    /// Per run, the first label of each source.
+    labels: Mutex<BTreeMap<LeaseId, BTreeMap<String, RunLabel>>>,
 }
 
 impl MemoryLeaseStore {
@@ -372,5 +400,36 @@ impl LeaseStore for MemoryLeaseStore {
     ) -> Result<LeaseStatus, AuditError> {
         let rows = self.rows.lock()?;
         classify(leases, now, |id| Ok(rows.get(id).cloned()))
+    }
+
+    fn add_label(&self, chain_id: &LeaseId, label: &RunLabel) -> Result<(), AuditError> {
+        // The rows lock is held across the insert, so the lease cannot appear or vanish in
+        // between (the memory store's "transaction").
+        let rows = self.rows.lock()?;
+        if !rows.contains_key(chain_id) {
+            return Err(AuditError::UnknownLease(chain_id.0.clone()));
+        }
+        let mut labels = self.labels.lock()?;
+        let first = labels.entry(chain_id.clone()).or_default();
+        match first.get(&label.source) {
+            Some(cur) if cur.seq <= label.seq => {}
+            _ => {
+                first.insert(label.source.clone(), label.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn labels(&self, chain_id: &LeaseId) -> Result<Vec<RunLabel>, AuditError> {
+        Ok(self
+            .labels
+            .lock()?
+            .get(chain_id)
+            .map(|first| {
+                let mut out: Vec<RunLabel> = first.values().cloned().collect();
+                out.sort_by_key(|l| l.seq);
+                out
+            })
+            .unwrap_or_default())
     }
 }

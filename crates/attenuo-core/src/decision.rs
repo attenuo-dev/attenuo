@@ -42,20 +42,25 @@ pub enum RecordKind {
     LeaseRevoke,
     /// Any other action taken with the admin bearer (`admin.*`: policy reload, dev root mint).
     Admin,
+    /// The upstream's answer to an allowed mediated call, recorded before it was relayed
+    /// (output labelling, ADR-0009). Carries [`DecisionRecord::decision_id`] and
+    /// [`DecisionRecord::result`]; the content itself is never stored.
+    ToolResult,
 }
 
 impl RecordKind {
-    pub const ALL: [RecordKind; 6] = [
+    pub const ALL: [RecordKind; 7] = [
         RecordKind::Decision,
         RecordKind::Exchange,
         RecordKind::RootToken,
         RecordKind::LeaseRenew,
         RecordKind::LeaseRevoke,
         RecordKind::Admin,
+        RecordKind::ToolResult,
     ];
 
     /// The wire string (`decision`, `exchange`, `root_token`, `lease_renew`, `lease_revoke`,
-    /// `admin`).
+    /// `admin`, `tool_result`).
     pub fn as_str(&self) -> &'static str {
         match self {
             RecordKind::Decision => "decision",
@@ -64,6 +69,7 @@ impl RecordKind {
             RecordKind::LeaseRenew => "lease_renew",
             RecordKind::LeaseRevoke => "lease_revoke",
             RecordKind::Admin => "admin",
+            RecordKind::ToolResult => "tool_result",
         }
     }
 }
@@ -128,6 +134,72 @@ pub struct DecisionRecord {
     /// records written before this field existed, which keeps their hashes unchanged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dpop_bound: bool,
+    /// For a [`RecordKind::ToolResult`] record: the id of the decision record of the call the
+    /// result answers. Absent on every other kind, which keeps their hashes unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_id: Option<Uuid>,
+    /// For a [`RecordKind::ToolResult`] record: what was recorded about the result. Absent on
+    /// every other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<ResultInfo>,
+    /// For a decision: the output labels the delegation run carried when the call was decided.
+    /// Absent when the run had none, which keeps the hashes of older records unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<RecordLabels>,
+}
+
+/// Label of an upstream result (output labelling, ADR-0009).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputLabel {
+    /// The default for every upstream result: it may carry instructions an attacker placed
+    /// there, so it taints the delegation run that read it.
+    #[default]
+    Untrusted,
+    /// The deployment marked the tool's output trusted in the catalog (`output = "trusted"`).
+    /// Recorded, but it does not taint the run.
+    Trusted,
+}
+
+impl OutputLabel {
+    /// The wire string, `untrusted` or `trusted`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OutputLabel::Untrusted => "untrusted",
+            OutputLabel::Trusted => "trusted",
+        }
+    }
+}
+
+/// What a [`RecordKind::ToolResult`] record says about one upstream result. No content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResultInfo {
+    /// SHA-256 (hex) of the RFC 8785 canonical JSON of the result: the JSON-RPC `result`
+    /// member, or the `error` member for a JSON-RPC error.
+    pub digest: String,
+    /// Length in bytes of that canonical JSON.
+    pub size: u64,
+    /// The result was a JSON-RPC error from the upstream.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub error: bool,
+    pub label: OutputLabel,
+    /// Fingerprints taken for argument matching. Always 0 until that is built (phase 2).
+    pub fingerprints: u64,
+}
+
+/// The labels a decision record carries (see [`DecisionRecord::labels`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RecordLabels {
+    /// Audit `seq` of the `tool_result` records that tainted the run: the first untrusted
+    /// result from each source (`<server>/<tool>`), in ascending order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tainted_by: Vec<u64>,
+}
+
+impl RecordLabels {
+    pub fn is_empty(&self) -> bool {
+        self.tainted_by.is_empty()
+    }
 }
 
 /// The chain id of `chain` (see [`DecisionRecord::chain_id`]).
@@ -168,6 +240,41 @@ impl DecisionRecord {
             session_id: call.session_id.clone(),
             policy_ids,
             dpop_bound: call.dpop_bound,
+            decision_id: None,
+            result: None,
+            labels: None,
         }
     }
+
+    /// Attach the run's labels; empty labels leave the field absent.
+    pub fn with_labels(mut self, labels: RecordLabels) -> Self {
+        self.labels = (!labels.is_empty()).then_some(labels);
+        self
+    }
+
+    /// The [`RecordKind::ToolResult`] record for the upstream's answer to `call`, which was
+    /// allowed by decision `decision_id`.
+    pub fn tool_result(
+        at: OffsetDateTime,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        decision_id: Uuid,
+        result: ResultInfo,
+    ) -> Self {
+        let mut r = Self::new(
+            at,
+            Decision::Allow,
+            REASON_TOOL_RESULT,
+            chain,
+            call,
+            Vec::new(),
+        )
+        .with_kind(RecordKind::ToolResult);
+        r.decision_id = Some(decision_id);
+        r.result = Some(result);
+        r
+    }
 }
+
+/// `reason` of every [`RecordKind::ToolResult`] record.
+pub const REASON_TOOL_RESULT: &str = "tool_result";

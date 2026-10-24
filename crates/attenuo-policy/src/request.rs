@@ -13,6 +13,7 @@ use time::OffsetDateTime;
 
 use crate::catalog::{ArgType, ToolAttrs};
 use crate::schema::GENERIC_ACTION;
+use crate::CallLabels;
 
 /// Largest magnitude a Cedar `decimal` can hold.
 // Cedar decimal range is +/-922337203685477.5807; stay a little inside it.
@@ -185,6 +186,7 @@ struct PartsKey {
     tool: String,
     readonly: bool,
     sensitive: bool,
+    destructive: bool,
 }
 
 impl PartsKey {
@@ -204,6 +206,7 @@ impl PartsKey {
             tool: call.tool.clone(),
             readonly: attrs.readonly,
             sensitive: attrs.sensitive,
+            destructive: attrs.is_destructive(),
         }
     }
 
@@ -216,6 +219,7 @@ impl PartsKey {
             && self.tool == call.tool
             && self.readonly == attrs.readonly
             && self.sensitive == attrs.sensitive
+            && self.destructive == attrs.is_destructive()
             && self.hops.len() == chain.hops.len()
             && self
                 .hops
@@ -247,7 +251,8 @@ impl PartsKey {
 /// The parts of a Cedar request that do not change from one call to the next for the same
 /// chain and tool: the principal, action and resource, the entity store (user, agents,
 /// server, tool, actions) and the `originating_user` and `chain` context records. Only
-/// `context.input`, `context.session_id` and `context.now_unix` are built per call.
+/// `context.input`, `context.session_id`, `context.now_unix` and the output-labelling members
+/// (`session`, `args_contain_untrusted`, `untrusted_args`, `approval`) are built per call.
 #[derive(Debug)]
 pub(crate) struct RequestParts {
     key: PartsKey,
@@ -323,10 +328,11 @@ impl RequestParts {
     pub(crate) fn request(
         &self,
         call: &ToolCall,
+        labels: &CallLabels,
         now: OffsetDateTime,
     ) -> Result<Request, TranslationError> {
         let input = object_from(call.arguments.iter(), "input")?;
-        let mut pairs = Vec::with_capacity(5);
+        let mut pairs = Vec::with_capacity(9);
         pairs.push(("input".to_string(), restricted(&input)?));
         pairs.push((
             "originating_user".to_string(),
@@ -343,6 +349,7 @@ impl RequestParts {
             "now_unix".to_string(),
             RestrictedExpression::new_long(now.unix_timestamp()),
         ));
+        pairs.extend(label_pairs(labels)?);
         let context =
             Context::from_pairs(pairs).map_err(|e| TranslationError(format!("context: {e}")))?;
         Request::new(
@@ -354,6 +361,68 @@ impl RequestParts {
         )
         .map_err(|e| TranslationError(e.to_string()))
     }
+}
+
+/// The output-labelling members of the context (ADR-0009), always present:
+/// `session: {tainted, tainted_by}`, `args_contain_untrusted` and `untrusted_args` (fixed
+/// `false` and empty until argument matching exists), and `approval: {present, by}` (fixed
+/// absent until approvals exist).
+fn label_pairs(
+    labels: &CallLabels,
+) -> Result<Vec<(String, RestrictedExpression)>, TranslationError> {
+    let record = |pairs: Vec<(String, RestrictedExpression)>| {
+        RestrictedExpression::new_record(pairs)
+            .map_err(|e| TranslationError(format!("context: {e}")))
+    };
+    let session = record(vec![
+        (
+            "tainted".to_string(),
+            RestrictedExpression::new_bool(labels.session.tainted),
+        ),
+        (
+            "tainted_by".to_string(),
+            RestrictedExpression::new_set(
+                labels
+                    .session
+                    .tainted_by
+                    .iter()
+                    .map(|s| RestrictedExpression::new_string(s.clone())),
+            ),
+        ),
+    ])?;
+    let approval = record(vec![
+        ("present".to_string(), RestrictedExpression::new_bool(false)),
+        (
+            "by".to_string(),
+            RestrictedExpression::new_string(String::new()),
+        ),
+    ])?;
+    Ok(vec![
+        ("session".to_string(), session),
+        (
+            "args_contain_untrusted".to_string(),
+            RestrictedExpression::new_bool(false),
+        ),
+        (
+            "untrusted_args".to_string(),
+            RestrictedExpression::new_set(std::iter::empty()),
+        ),
+        ("approval".to_string(), approval),
+    ])
+}
+
+/// The output-labelling members as JSON, for the one-pass reference translation.
+#[cfg(test)]
+fn label_json(labels: &CallLabels) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert(
+        "session".into(),
+        json!({ "tainted": labels.session.tainted, "tainted_by": labels.session.tainted_by }),
+    );
+    m.insert("args_contain_untrusted".into(), json!(false));
+    m.insert("untrusted_args".into(), json!([]));
+    m.insert("approval".into(), json!({ "present": false, "by": "" }));
+    m
 }
 
 /// Convert the output of [`to_cedar_json`] into the expression Cedar's schema-less JSON
@@ -443,6 +512,7 @@ fn entities(
             "name": call.tool,
             "readonly": attrs.readonly,
             "sensitive": attrs.sensitive,
+            "destructive": attrs.is_destructive(),
         },
         "parents": [uid_json("Server", &call.server)],
     }));
@@ -547,6 +617,7 @@ pub(crate) fn build(
     chain: &DelegationChain,
     call: &ToolCall,
     attrs: &ToolAttrs,
+    labels: &CallLabels,
     now: OffsetDateTime,
     legacy_bare_actions: bool,
 ) -> Result<CedarRequest, TranslationError> {
@@ -587,6 +658,7 @@ pub(crate) fn build(
         context.insert("session_id".into(), Value::String(sid.clone()));
     }
     context.insert("now_unix".into(), json!(now.unix_timestamp()));
+    context.extend(label_json(labels));
     let context = Context::from_json_value(Value::Object(context), None)
         .map_err(|e| TranslationError(format!("context: {e}")))?;
 
@@ -625,6 +697,7 @@ pub(crate) fn build(
             "name": call.tool,
             "readonly": attrs.readonly,
             "sensitive": attrs.sensitive,
+            "destructive": attrs.is_destructive(),
         },
         "parents": [uid_json("Server", &call.server)],
     }));
@@ -782,12 +855,15 @@ mod tests {
                             let mut call = ToolCall::new(server, tool, arguments.clone());
                             call.session_id = session.clone();
                             let tool_attrs = ToolAttrs::new().readonly(true);
-                            for legacy in [false, true] {
+                            for (legacy, labels) in
+                                [(false, CallLabels::default()), (true, tainted_labels())]
+                            {
                                 let reference =
-                                    build(&chain, &call, &tool_attrs, now, legacy).unwrap();
+                                    build(&chain, &call, &tool_attrs, &labels, now, legacy)
+                                        .unwrap();
                                 let parts = RequestParts::build(&chain, &call, &tool_attrs, legacy)
                                     .unwrap();
-                                let request = parts.request(&call, now).unwrap();
+                                let request = parts.request(&call, &labels, now).unwrap();
                                 let what = format!(
                                     "{depth} {attrs} {arguments} {session:?} {tool} {legacy}"
                                 );
@@ -804,21 +880,35 @@ mod tests {
         }
     }
 
+    fn tainted_labels() -> CallLabels {
+        CallLabels {
+            session: crate::SessionLabels::from_sources(["web/fetch", "mail/read"]),
+        }
+    }
+
     #[test]
     fn translation_errors_are_the_same() {
         let now = OffsetDateTime::now_utc();
         let bad_user = chain_of(1, json!({"__entity": {"type": "User", "id": "admin"}}));
         let call = ToolCall::new("gh", "read_file", json!({}));
         let attrs = ToolAttrs::new();
-        let reference = build(&bad_user, &call, &attrs, now, false).err().unwrap();
+        let labels = CallLabels::default();
+        let reference = build(&bad_user, &call, &attrs, &labels, now, false)
+            .err()
+            .unwrap();
         let cached = RequestParts::build(&bad_user, &call, &attrs, false).unwrap_err();
         assert_eq!(cached, reference);
 
         let chain = chain_of(1, json!({}));
         let bad_call = ToolCall::new("gh", "read_file", json!({"a": {"__extn": {}}}));
-        let reference = build(&chain, &bad_call, &attrs, now, false).err().unwrap();
+        let reference = build(&chain, &bad_call, &attrs, &labels, now, false)
+            .err()
+            .unwrap();
         let parts = RequestParts::build(&chain, &bad_call, &attrs, false).unwrap();
-        assert_eq!(parts.request(&bad_call, now).unwrap_err(), reference);
+        assert_eq!(
+            parts.request(&bad_call, &labels, now).unwrap_err(),
+            reference
+        );
     }
 
     #[test]
@@ -849,6 +939,12 @@ mod tests {
             .get_or_build(&no_mfa, &call, &sensitive, false)
             .unwrap();
         assert!(miss.key.sensitive);
+        let additive = ToolAttrs::new().sensitive(true).destructive(false);
+        let miss2 = cache
+            .get_or_build(&no_mfa, &call, &additive, false)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&miss, &miss2));
+        assert!(!miss2.key.destructive);
 
         // Another depth, another tool: separate entries.
         cache

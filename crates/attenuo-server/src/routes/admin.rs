@@ -637,8 +637,8 @@ pub struct ExportQuery {
     pub from: Option<u64>,
     /// Last sequence number, inclusive (default: the head when the export starts).
     pub to: Option<u64>,
-    /// Only records of this kind (`decision`, `exchange`, `root_token`, `lease_renew`,
-    /// `lease_revoke`, `admin`).
+    /// Only records of this kind (`decision`, `tool_result`, `exchange`, `root_token`,
+    /// `lease_renew`, `lease_revoke`, `admin`).
     pub kind: Option<String>,
     /// Only records of this delegation chain (the `chain_id` field).
     pub chain_id: Option<String>,

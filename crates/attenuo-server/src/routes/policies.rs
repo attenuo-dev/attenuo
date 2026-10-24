@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use attenuo_core::{DelegationChain, ToolCall};
 use attenuo_policy::authzen::{self, EvaluationRequest};
+use attenuo_policy::{CallLabels, SessionLabels};
 use attenuo_token::{TokenError, VerifiedToken, Verifier};
 use axum::body::Bytes;
 use axum::extract::State;
@@ -169,6 +170,10 @@ pub async fn evaluate_policies(
             ))
         }
     };
+    let session = match obj.remove("session") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(session_from_json(&v)?),
+    };
     let mut req: EvaluationRequest = serde_json::from_value(raw)
         .map_err(|e| ApiError::bad_request("invalid_request", e.to_string()))?;
 
@@ -190,7 +195,15 @@ pub async fn evaluate_policies(
         }
     };
 
-    let o = state.pipeline.evaluate_policy(&chain, &call, now);
+    // Output labels (ADR-0009): as given, or else the run's current taint state.
+    let (session, session_source) = match session {
+        Some(s) => (s, "request"),
+        None => (state.pipeline.run_labels(&chain).session, "store"),
+    };
+    let labels = CallLabels {
+        session: session.clone(),
+    };
+    let o = state.pipeline.evaluate_policy(&chain, &call, &labels, now);
     Ok(Json(json!({
         "decision": o.decision,
         "reason": o.reason,
@@ -199,7 +212,43 @@ pub async fn evaluate_policies(
         "lease_check": LEASE_CHECK_SKIPPED,
         "chain_source": source,
         "token_expired": token_expired,
+        "session": {
+            "tainted": session.tainted,
+            "tainted_by": session.tainted_by,
+            "source": session_source,
+        },
     })))
+}
+
+/// The optional `session` member of a dry run: `{"tainted_by": ["<server>/<tool>", ...],
+/// "tainted": bool}`. `tainted` defaults to whether `tainted_by` is non-empty.
+fn session_from_json(v: &Value) -> Result<SessionLabels, ApiError> {
+    let bad = |m: &str| ApiError::bad_request("invalid_request", format!("`session`: {m}"));
+    let obj = v.as_object().ok_or_else(|| bad("expected an object"))?;
+    let mut sources = Vec::new();
+    match obj.get("tainted_by") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(items)) => {
+            for item in items {
+                sources.push(
+                    item.as_str()
+                        .ok_or_else(|| bad("`tainted_by` must be a list of strings"))?
+                        .to_owned(),
+                );
+            }
+        }
+        Some(_) => return Err(bad("`tainted_by` must be a list of strings")),
+    }
+    let mut session = SessionLabels::from_sources(sources);
+    match obj.get("tainted") {
+        None | Some(Value::Null) => {}
+        Some(Value::Bool(t)) => session.tainted = *t || !session.tainted_by.is_empty(),
+        Some(_) => return Err(bad("`tainted` must be a boolean")),
+    }
+    if let Some(k) = obj.keys().find(|k| *k != "tainted" && *k != "tainted_by") {
+        return Err(bad(&format!("unknown member `{k}`")));
+    }
+    Ok(session)
 }
 
 fn chain_and_call(req: &EvaluationRequest) -> Result<(DelegationChain, ToolCall), ApiError> {

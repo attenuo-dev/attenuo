@@ -5,6 +5,7 @@ attenuo writes one record for every decision it makes. The records are chained b
 ## What gets a record
 
 - Every `tools/call` decision, allow or deny. The proxy also treats `resources/read`, `prompts/get` and a few other methods as calls, so they are recorded too.
+- The upstream's answer to every allowed `tools/call`, `resources/read`, `prompts/get` and `completion/complete`, as a `tool_result` record (a digest, not the content).
 - Every AuthZEN evaluation.
 - Every token issued, at hop 0 and at each exchange.
 - Every successful lease renewal.
@@ -15,7 +16,7 @@ Requests that carry no decision, such as `tools/list` and `ping`, are not record
 
 A record names the agent chain and the originating user separately. That is the point: most logs cannot tell an agent action from a user action. A record also has:
 
-- a `kind`, one of `decision`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin` (see [Kind and chain id](#kind-and-chain-id)),
+- a `kind`, one of `decision`, `tool_result`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin` (see [Kind and chain id](#kind-and-chain-id)),
 - a `chain_id`, the id of the delegation chain it belongs to (absent for admin actions),
 - a decision id, which the client sees in the `X-Attenuo-Decision-Id` header or in the error data of a denial,
 - the time, and allow or deny,
@@ -36,6 +37,7 @@ Two top-level fields let you filter and join an export without reading anything 
 | `kind` | Written when | `tool` |
 | --- | --- | --- |
 | `decision` | a tool call or AuthZEN evaluation was decided (allow or deny, including refusals before the policy ran) | the tool called |
+| `tool_result` | the proxy relayed the upstream's answer to an allowed call | the tool called |
 | `exchange` | a token exchange issued a new hop | `token.exchange` |
 | `root_token` | a root token was issued (IdP login, or the dev mint) | `token.root` |
 | `lease_renew` | a lease was renewed | `lease.renew` |
@@ -47,6 +49,22 @@ Checkpoints are not records, so they have no kind: they sit in their own table a
 `chain_id` is the lease id of the chain's first hop. Every hop issued from a root token descends from it, so it is the same for the root token's issuance, each exchange, every call made with any token of the run, and each renewal, and it does not change as hops are added (`chain_digest` does). It is not a new token claim: the lease is already in the token. Admin records have no chain and no `chain_id`.
 
 Both fields are part of the record, so the entry hash covers them, and the SQLite store keeps them in indexed columns that are cross-checked against the stored JSON like the other columns.
+
+## Tool results and labels
+
+A `tool_result` record is written after every allowed mediated call that gets an answer, before the proxy relays it. An SSE response gives one record per answering event, and an upstream JSON-RPC error is recorded too. The record has the call's `chain_id`, server and tool, `arguments_digest` and `decision_id` (the id of the decision record that allowed it), and a `result` member:
+
+| Field | Meaning |
+| --- | --- |
+| `digest` | SHA-256 (hex) of the RFC 8785 canonical JSON of the answer's `result` member, or of its `error` member |
+| `size` | length in bytes of that canonical JSON |
+| `error` | `true` when the upstream answered with a JSON-RPC error; absent otherwise |
+| `label` | `untrusted`, or `trusted` when the catalog marks the tool's output trusted |
+| `fingerprints` | number of span fingerprints kept for argument matching; `0` until that is built |
+
+The content is not stored. If the record cannot be written, the agent gets a `label_error` denial instead of the answer.
+
+An untrusted result taints the run (see [Writing policies](../guides/writing-policies.md#asking-for-approval-after-untrusted-output)). A decision record of a call on a tainted run has `labels: {tainted_by: [seq, ...]}`, the `seq` of the first `tool_result` record of each source, so an auditor can see what the run had read before a call. `decision_id`, `result` and `labels` are omitted when absent, so records without them hash exactly as before.
 
 ## The hash chain
 

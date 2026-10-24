@@ -1,0 +1,79 @@
+# Policy tests for output-labels.cedar. Run with:
+#   attenuo policy test config/policies/output-labels_test.yaml
+policies: ./output-labels.cedar
+catalog:
+  web:
+    fetch: { readonly: true }
+  workspace:
+    read_email: { readonly: true }
+    send_email: {}
+    delete_file: {}
+  calendar:
+    create_event: { destructive: false }
+  banking:
+    get_balance: { readonly: true, output: trusted }
+    send_money: { sensitive: true }
+cases:
+  - name: an untainted run may delete a file
+    chain: [assistant]
+    call: { server: workspace, tool: delete_file, arguments: { path: notes.txt } }
+    expect: allow
+    reason: policy_allow
+
+  - name: after an untrusted read, deleting a file needs an approval
+    chain: [assistant]
+    session: { tainted_by: [web/fetch] }
+    call: { server: workspace, tool: delete_file, arguments: { path: notes.txt } }
+    expect: deny
+    reason: approval_required
+    policy_ids: [confirm_destructive_after_untrusted_read]
+
+  - name: sending mail is destructive by default, so it asks too
+    chain: [assistant]
+    session: { tainted_by: [workspace/read_email] }
+    call: { server: workspace, tool: send_email, arguments: { to: bob@example.com } }
+    expect: deny
+    reason: approval_required
+    policy_ids: [confirm_destructive_after_untrusted_read]
+
+  - name: a sensitive payment after a read asks as well
+    chain: [assistant, payer]
+    session: { tainted_by: [web/fetch, workspace/read_email] }
+    call: { server: banking, tool: send_money, arguments: { amount: 10 } }
+    expect: deny
+    reason: approval_required
+
+  - name: reads are never gated by taint
+    chain: [assistant]
+    session: { tainted_by: [web/fetch] }
+    call: { server: workspace, tool: read_email }
+    expect: allow
+    reason: policy_allow
+
+  - name: a tool the catalog marks non-destructive does not ask
+    chain: [assistant]
+    session: { tainted_by: [web/fetch] }
+    call: { server: calendar, tool: create_event, arguments: { title: standup } }
+    expect: allow
+    reason: policy_allow
+
+  - name: an unreadable taint state counts as tainted
+    chain: [assistant]
+    session: { tainted: true }
+    call: { server: workspace, tool: delete_file, arguments: { path: notes.txt } }
+    expect: deny
+    reason: approval_required
+
+  - name: untrusted spans in mail cannot fire before argument matching exists
+    chain: [assistant]
+    call: { server: workspace, tool: send_email, arguments: { to: bob@example.com } }
+    expect: allow
+    reason: policy_allow
+
+  - name: the capability stage still runs first
+    chain:
+      - { agent: assistant, capabilities: ["workspace:read_email"] }
+    session: { tainted_by: [web/fetch] }
+    call: { server: workspace, tool: delete_file }
+    expect: deny
+    reason: capability_denied
