@@ -181,4 +181,20 @@ pub trait AuditSink: Send + Sync {
             None => (0, GENESIS_HASH.to_string()),
         })
     }
+
+    /// [`append`](Self::append), and make the whole of [`sync_file`](Self::sync_file) durable
+    /// before returning, whatever durability the sink runs at: the commit is synced, and with
+    /// it every earlier commit to that file, from any connection. The pipeline uses it for a
+    /// decision whose `sum` charge left its sync to the append (see
+    /// [`LeaseStore::charge_sync_deferred`](crate::LeaseStore::charge_sync_deferred)). The
+    /// default is a plain `append`, right for a sink with nothing to sync.
+    fn append_synced(&self, record: DecisionRecord) -> Result<AuditEntry, AuditError> {
+        self.append(record)
+    }
+
+    /// The database file that [`append_synced`](Self::append_synced) makes durable, if the
+    /// sink is a file (canonical path). `None` (the default) for a sink without one.
+    fn sync_file(&self) -> Option<&std::path::Path> {
+        None
+    }
 }

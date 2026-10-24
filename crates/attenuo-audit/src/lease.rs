@@ -200,6 +200,29 @@ pub trait LeaseStore: Send + Sync {
         at: OffsetDateTime,
     ) -> Result<ChargeOutcome, AuditError>;
 
+    /// [`charge`](Self::charge), except that a store which would sync the commit of a `sum`
+    /// charge itself (a file store below `durability = "full"`, design 3.4) may commit it
+    /// unsynced and leave the sync to the caller. The `bool` says whether it did: then the
+    /// caller must not act on the charge (forward the call) before an
+    /// [`AuditSink::append_synced`](crate::AuditSink::append_synced) on a sink with the same
+    /// [`sync_file`](Self::sync_file) has returned, since that sync covers this commit too.
+    /// The default charges and syncs as `charge` does and returns `false`.
+    fn charge_sync_deferred(
+        &self,
+        decision_id: &str,
+        charges: &[Charge],
+        at: OffsetDateTime,
+    ) -> Result<(ChargeOutcome, bool), AuditError> {
+        self.charge(decision_id, charges, at).map(|o| (o, false))
+    }
+
+    /// The database file whose sync makes this store's commits durable (canonical path), when
+    /// [`charge_sync_deferred`](Self::charge_sync_deferred) can leave a sync to a sink sharing
+    /// it. `None` (the default) for a store that never defers.
+    fn sync_file(&self) -> Option<&std::path::Path> {
+        None
+    }
+
     /// Return what `decision_id` charged to every counter it charged, at most once, in one
     /// transaction. Returns how many counters were restored. [`AuditError::UnknownCharge`]
     /// when the decision charged nothing, [`AuditError::ChargeRefunded`] when it was already

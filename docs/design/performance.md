@@ -486,12 +486,48 @@ What this means:
 
 Anomalies, measured and not fixed:
 
-- A `sum` charge on a `normal` store costs more than on a `full` store: 623 us [574, 680] against 448 us [426, 471] in process. Switching `synchronous` to `FULL` for one transaction and back (`with_full_sync`) may cost more than the sync itself, or force more than one `fsync`. Not profiled.
+- A `sum` charge on a `normal` store costs more than on a `full` store: 623 us [574, 680] against 448 us [426, 471] in process. Switching `synchronous` to `FULL` for one transaction and back (`with_full_sync`) may cost more than the sync itself, or force more than one `fsync`. Not profiled. Profiled since: it is neither (see [`sum` charge follow-up](#sum-charge-follow-up-2026-10-24)).
 - With limits on, the decision append grows by about 50 to 60 us at p50, with or without `sum`. The charge commits on the lease store's own connection just before the append commits on the audit connection, on the same file and WAL; a hand-off of the WAL write lock or the shared memory index is the likely cause. Not investigated.
 - The in-memory store's charge (78 to 84 us) is slower than the file store's `calls` charge (39 us). The in-memory result append looked the same way in the section above.
 - `lease_check` is 15 to 20 us lower on the B and D servers than on A, C and C', with the same chain and store kind. It does not follow any feature, so it is a per-server or per-file effect; it shows how far two identical servers can differ on this host.
 
 Not measured: the memory store end to end (only in process); more than one client, so contention on the store's connection lock between the charge, the label write and the appends under concurrency; `calls_per` limits (their HMAC of the value); results of realistic size (only the small echo answer); `durability = "full"` end to end; and a quiet reference machine.
+
+### `sum` charge follow-up (2026-10-24)
+
+Branch `perf/sum-charge-fsync`, main `422def8`. The section above left two anomalies: a `sum` charge cost more on a `normal` store than on a `full` one (623 against 448 us), which looked like the `synchronous` switch in `with_full_sync` costing more than the sync, and the decision append grew by 50 to 60 us whenever limits were on. This section profiles the charge, changes where its sync happens, and measures again.
+
+**Method.** Same 4-vCPU shared container; other agents were building on it (load average 0.4 to 4.6). All binaries were built with `lto = false` and `codegen-units = 16` (`CARGO_PROFILE_RELEASE_*` overrides, to keep build time and disk down), so the absolute figures are not comparable with the tables above; before and after were built the same way and run interleaved. Three tools: a throwaway probe against `SqliteLeaseStore` and `SqliteAudit` on one file at `normal`, opened as the server opens them (a fresh store per configuration, configurations interleaved; the single-operation loops time 2,000 iterations after 200 discarded, the charge-plus-append runs time every call, 2,000 on one thread or 1,000 per thread on 4 and 8; three to eight rounds); `strace -f` on the same probe to count `fsync` calls and the WAL pages each connection writes; and `attenuo-bench hot-path --configs baseline,limits,limits_calls` with the before and after binaries alternating, 10 runs of each cell per binary (four invocations of 3, 3, 2 and 2 runs). The `decide` bench has a new cell, `decide_limited_{store}/{calls_sum,calls}` (`Pipeline::decide` of a limited call, so the charge and the append in the pipeline's order), but on this host its intervals overlapped from run to run (1.0 to 1.9 ms for `decide_limited_file/calls_sum` with either binary), so the figures below come from the probe.
+
+**What the profile shows.**
+
+- **The `synchronous` switch costs about 2 us** (`PRAGMA synchronous=2` then `=1` without a commit, p50), and every `sum` charge makes exactly one `fsync` in every configuration (strace: one per iteration). A charge-only loop costs the same with the switch (439 to 480 us p50), on a lease connection kept at `FULL` (441 to 452 us), and on a store at `full` (439 to 527 us). Candidate (a), a second connection kept at `FULL`, therefore saves nothing measurable.
+- **The 623 against 448 us in the `decide` bench is not the switch.** With fresh stores and interleaved configurations it does not reproduce. What does make a `sum` charge dearer on a `normal` store is what comes between charges in the pipeline: with a decision append after each charge, the charge costs 541 to 854 us p50 on a `normal` store and 425 to 624 us on a `full` one. Its `fsync` also writes out the previous append's WAL frames, which on a `normal` store nothing synced; on a `full` store that append paid for its own `fsync`.
+- **One allowed `sum` call writes about 25 to 40 WAL pages before its `fsync`**: 6 to 14 for the charge (four counters and their log rows, with indexes) and 16 to 28 for the decision record (the `audit` table and its indexes). That one `fsync` of 100 to 160 KB is most of the 0.8 to 1.0 ms. The invariant (a `sum` charge is on disk before the call goes on) needs one `fsync` per call from a single client, so no change to how the sync is issued removes it; only fewer pages per call would make it cheaper.
+- **The decision append's growth with limits on** did not reproduce cleanly in process: after a `calls` charge the append took 84 to 101 us p50, about what it takes alone, and after a synced `sum` charge 123 to 180 us. It stays open.
+
+**The fix (candidate b, without merging the transactions).** When the lease store and the audit log are the same file, which is how the server opens them, the charge commits at the store's own level and the decision append commits with `synchronous=FULL`. That one `fsync` covers the WAL, so it makes both the charge and the decision durable before the call is answered or forwarded. Concurrent appends join that commit through the existing group commit, so concurrent `sum` calls share one `fsync`. The charge keeps its own `IMMEDIATE` transaction, its re-check and its refund if the append fails. If the process crashes before the synced append returns, the charge can be lost, but then the call was never forwarded. A `calls`-only charge, the memory store, a store at `full`, and a lease store in another file behave as before. Code: `LeaseStore::charge_sync_deferred` and `sync_file`, `AuditSink::append_synced` and `sync_file`, `Pipeline::charge_sync_on_append`. Moving the charge into the audit writer's transaction was not done: the record carries the charge's `used_after`, so the writer would have to run the charge, and the lease store and the log would need one connection. The measurements below show that it would remove one commit, not the `fsync`.
+
+**Before and after.**
+
+| | before | after |
+|---|---|---|
+| Probe, one thread, charge + append, p50 (median of 7 rounds, range; an eighth, first round on a loaded host discarded) | 717 us (640 to 847) | 637 us (572 to 822) |
+| Probe, one thread, charge + append, mean (median of 7 rounds) | 871 us | 705 us |
+| Probe, 4 threads, calls per second (3 rounds) | 427, 473, 473 | 685, 610, 736 |
+| Probe, 8 threads, calls per second (3 rounds) | 511, 522, 215 | 919, 819, 283 |
+| `hot-path`, `limits` `read` / `destructive`, client p50 (median of 10 runs) | 2,405 / 2,339 us | 2,405 / 2,343 us |
+| `hot-path`, `limits` `read`, decide mean (median of 10 runs) | 1,245 us | 1,205 us |
+| `hot-path`, `limits_calls` `read` / `destructive`, client p50 | 1,489 / 1,504 us | 1,457 / 1,523 us |
+| `hot-path`, `baseline` `read` / `destructive`, client p50 | 1,319 / 1,359 us | 1,319 / 1,328 us |
+
+On the server, the cost moved from the charge to the append, as intended: `limits` `read` "decide (unstaged)" fell from 891 to 114 us mean, and `audit_append` rose from 197 to 1,118 us mean (170 to 853 us at p50).
+
+Readings:
+
+- **From one client the change is within noise end to end.** In process it saves about 80 us at p50 (one commit and one lock hand-off between the two connections, about 10 percent of the charge and the append together). At the client, the 10-run medians are equal. The `after` binary also had four runs whose decide mean was 1.5 to 2.9 ms, against at most 1.45 ms for `before`; two of them fell in a load spike on the host, and they were not investigated further. The 0.8 to 1.0 ms a `sum` limit costs is one `fsync` of the call's WAL pages, and the invariant requires it.
+- **With concurrent calls it helps**: 1.3 to 1.8 times the calls per second at 4 and 8 threads in process, in all six rounds (the third 8-thread round was slow for both binaries), because the charge no longer holds the lease store's lock and the database write lock through an `fsync`, and concurrent appends share theirs.
+- **Multi-client cost is dominated by something else.** Under 4 threads both binaries make about one `clock_nanosleep` per call (strace: 1,256 for 1,200 calls before, 1,101 after). That is SQLite's busy handler: when the lease connection and the audit connection want the write lock at the same time, the loser sleeps 1, 2, 5 ms and so on rather than being woken. It sets the 5 to 35 ms per-call latency seen at 4 to 8 threads, with or without this change, and probably the 4 and 8 ms single-client outliers. Making the two connections queue on a lock in the process instead is the next step for concurrent limited calls (and for any lease-store write that runs alongside appends). It was not attempted here.
 
 ### How to run
 
@@ -508,6 +544,7 @@ DURATION=10 scripts/bench-e2e.sh hot-path --runs 5 --approval-loops 2000        
 cargo bench -p attenuo-policy --bench policy_stage -- --warm-up-time 1 --measurement-time 3
 cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3
 cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3 'budget_read_|charge_'  # run-limit counters
+cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3 'decide_limited_'  # a limited call's whole decision
 ```
 
 `attenuo-bench --print-config DIR` writes the server config and policy it expects, for pointing the harness at an already running server (`--attenuo-url`, `--upstream-url`, and `--metrics-url` for the stage table). Every answer is checked: a denial counts only as the proxy's `-32003` with the expected reason code and a decision id listed in `X-Attenuo-Decision-Id`, so an `audit_error` denial, a `too_many_sessions` refusal or a `5xx` stops the run after that cell. A one-second smoke run is part of `cargo test --workspace` (`crates/attenuo-bench/tests/smoke.rs`). There is no CI job for the full matrix: it needs a release build and minutes of load, and numbers from shared runners could not be compared.
