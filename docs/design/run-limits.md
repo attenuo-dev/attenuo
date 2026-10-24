@@ -242,7 +242,7 @@ On `feat/run-limits-phase1`: `limits` (`calls`, `sum`, `calls_per`) in capabilit
 - **AuthZEN** answers carry `context.budget` only when a limit matched, so answers about unlimited calls are unchanged, and add `context.charged` (the decision's charge list).
 - **Refund** is once per decision (404 when nothing was charged, 409 when already refunded); like a revocation, it stands if its `admin.budget.refund` record cannot be appended. The exchange record keeps the capabilities the client asked for, not the clamped ones.
 - **Older servers** accept and ignore `limits` (a capability has no closed field list), so a token with limits checked by a binary without phase 1 is not limited. The runner probes for this before the limits arms.
-- **Runner.** The frozen rule is `policies/limits-rule.json`, hashed under `added_later`; a glob capability is not a read, so it gets `calls: 1`. The approvals API now exists, so the combined arm grants approved calls through `POST /admin/approvals/{id}` and retries them, which charges them. Not done here: the multi-call dev cases, the arm runs on both splits, and the latency measurement; those are the next step before phase 1 is measured.
+- **Runner.** The frozen rule is `policies/limits-rule.json`, hashed under `added_later`; a glob capability is not a read, so it gets `calls: 1`. The combined arm settles approvals through the runner's labels-arm path (#46: grant through `POST /admin/approvals/{id}`, one retry), so an approved call is charged; a retry over a limit is recorded as `denied` with `retry_reason` `budget_exhausted`. Not done here: the multi-call dev cases, the arm runs on both splits, and the latency measurement; those are the next step before phase 1 is measured.
 
 ## 7. Open questions
 

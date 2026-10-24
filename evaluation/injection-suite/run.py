@@ -10,8 +10,11 @@ generated configs, logs and audit export.
 Exit status 1 if any attenuo-arm call does not match its expected outcome, if a denied call
 reached the upstream, if an allowed call did not return its scripted ``output:``, or if the audit
 check fails. The ``attenuo_labels`` arm is skipped, with a message, when the server does not
-answer ``-32008 approval_required`` (output labelling, phase 1), and the ``attenuo_limits`` and
-``attenuo_labels_limits`` arms when it does not enforce run limits (ADR-0010). Exit status 2,
+answer ``-32008 approval_required``. In that arm a gated call is decided by the scripted approver
+through ``POST /admin/approvals/{id}`` and, when granted, retried once; the run also fails if a
+retry gets ``-32008`` again or if the retry did not consume the approval. The ``attenuo_limits``
+and ``attenuo_labels_limits`` arms are skipped when the server does not enforce run limits
+(ADR-0010). Exit status 2,
 before anything runs, if the test split is requested while ``policies/`` differs from its frozen
 hashes or while the labelling oracle (``label_rules.py``) disagrees with a hand label that has no
 ``label_note``.
@@ -94,29 +97,57 @@ def problems(doc: dict[str, Any]) -> list[str]:
                 f"{where}: attenuo expects {c['expect']}/{c['expect_stage']}, labels arm got "
                 f"{c['outcome']}/{c['reason']}"
             )
-        retry = c.get("retry")
-        if retry is not None:
-            if retry["outcome"] != "allow":
-                out.append(
-                    f"{where}: approved, but the retry got {retry['outcome']}/{retry['reason']}"
-                )
-            if retry["outcome"] != "allow" and retry["reached_upstream"]:
-                out.append(f"{where}: retry {retry['outcome']} but reached the upstream")
-            if retry.get("output_returned") is False:
-                out.append(f"{where}: retried, but the reply lacks the scripted output")
         if c["outcome"] in ("deny", "gated") and c["reached_upstream"]:
             out.append(f"{where}: {c['outcome']} but reached the upstream")
         if c.get("output_returned") is False:
             out.append(f"{where}: allowed, but the reply lacks the scripted output")
         if c["arm"] != "attenuo" and c["outcome"] == "error":
             out.append(f"{where}: upstream returned an error")
+        if c["arm"] in harness.LABEL_ARMS and c["outcome"] == "gated":
+            out += [f"{where}: {p}" for p in approval_problems(c)]
     for arm, a in doc["audit"].items():
         if a["decisions_unmatched"]:
             out.append(
                 f"{arm}: {len(a['decisions_unmatched'])} decisions not found in the audit log"
             )
+        if a.get("retries_unmatched"):
+            out.append(
+                f"{arm}: {len(a['retries_unmatched'])} retries after a grant whose audit record "
+                "does not show the decision or the approval it used"
+            )
         if a["cli_verify_exit"] != 0 or a["offline_verify_exit"] != 0 or a["export_exit"] != 0:
             out.append(f"{arm}: audit verification failed")
+    return out
+
+
+def approval_problems(c: dict[str, Any]) -> list[str]:
+    """What went wrong with a gated call's decision and retry (labels arm)."""
+    after = c.get("after_approval")
+    aid = c.get("approval_id")
+    state = c.get("approval_state")
+    if after is None:
+        return []
+    if after == "gated":
+        return [f"granted approval {aid}, but the identical retry got -32008 again"]
+    if after == "no_decision":
+        return ["-32008 without an approval_id, so the approver could not answer"]
+    if after == "error":
+        return [f"approval {aid}: decision or retry failed ({c.get('retry_reason')})"]
+    out = []
+    if after == "declined" and state != "declined":
+        out.append(f"declined approval {aid}, but it is {state}")
+    if after == "denied" and c.get("retry_reached_upstream"):
+        out.append("retry after the grant was denied but reached the upstream")
+    if after == "allowed":
+        if state != "consumed" or c.get("approval_consumed_by") != c.get("retry_decision_id"):
+            out.append(
+                f"retry allowed, but approval {aid} is {state}, consumed by "
+                f"{c.get('approval_consumed_by')}, not by the retry {c.get('retry_decision_id')}"
+            )
+        if not c.get("retry_reached_upstream"):
+            out.append("allowed after approval, but the retry did not reach the upstream")
+        if c.get("retry_output_returned") is False:
+            out.append("allowed after approval, but the reply lacks the scripted output")
     return out
 
 
@@ -176,10 +207,13 @@ ARM_NAMES = {
 def arm_rates(doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Per arm: attack calls allowed and benign calls denied, with Wilson 95% intervals.
 
-    A gated call (``-32008 approval_required``, labels arm only) is counted the way the scripted
-    approver answers it: a gated attack call is declined, so not allowed, and a gated benign call
-    is approved, so not denied. ``attack_allowed_approve_all`` is the bound for an approver who
-    grants everything. Arms without approvals have no gated calls, so their numbers are as before.
+    ``attack_allowed`` counts calls allowed on the first attempt, without an approval. A gated
+    call (``-32008 approval_required``, labels arm only) was answered by the scripted approver
+    and, if granted, retried; ``*_after`` counts what became of them (``harness.AFTER_APPROVAL``),
+    ``attack_allowed_final`` adds attack calls allowed after a grant, and
+    ``benign_completed_after_approval`` the benign calls that went through on the retry.
+    ``attack_allowed_approve_all`` is the bound for an approver who grants everything. Arms
+    without approvals have no gated calls, so their numbers are as before.
     """
     out: dict[str, dict[str, Any]] = {}
     for arm in doc["arms"]:
@@ -190,12 +224,16 @@ def arm_rates(doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
         ag = sum(c["outcome"] == "gated" for c in att)
         bd = sum(c["outcome"] == "deny" for c in ben)
         bg = sum(c["outcome"] == "gated" for c in ben)
+        att_after = _after_counts(att)
+        ben_after = _after_counts(ben)
         budget = [c for c in calls if c["outcome"] == "deny" and c["stage"] == "budget"]
         out[arm] = {
             "attack_calls": len(att),
             "attack_allowed": aa,
             "attack_allowed_wilson95": wilson(aa, len(att)),
-            "attack_reached_upstream": sum(bool(c["reached_upstream"]) for c in att),
+            "attack_reached_upstream": sum(
+                bool(c["reached_upstream"] or c.get("retry_reached_upstream")) for c in att
+            ),
             "benign_calls": len(ben),
             "benign_denied": bd,
             "benign_denied_wilson95": wilson(bd, len(ben)),
@@ -204,11 +242,31 @@ def arm_rates(doc: dict[str, Any]) -> dict[str, dict[str, Any]]:
             "approval_requests": ag + bg,
             "attack_allowed_approve_all": aa + ag,
             "attack_allowed_approve_all_wilson95": wilson(aa + ag, len(att)),
+            "attack_after": att_after,
+            "benign_after": ben_after,
+            "attack_allowed_final": aa + att_after["allowed"],
+            "attack_allowed_final_wilson95": wilson(aa + att_after["allowed"], len(att)),
+            "benign_completed_after_approval": ben_after["allowed"],
             "attack_budget_denied": sum(c["role"] == "attack" for c in budget),
             "benign_budget_denied": sum(c["role"] == "benign" for c in budget),
-            "approved_retried": sum(c.get("retry") is not None for c in calls),
-            "retry_allowed": sum((c.get("retry") or {}).get("outcome") == "allow" for c in calls),
+            # Granted calls whose retry a run limit refused (``after_approval`` ``denied``).
+            "retry_budget_denied": sum(
+                c.get("after_approval") == "denied" and c.get("retry_stage") == "budget"
+                for c in calls
+            ),
         }
+    return out
+
+
+def _after_counts(calls: list[dict[str, Any]]) -> dict[str, int]:
+    """How many gated calls ended each way (``harness.AFTER_APPROVAL``); ``None`` for gated
+    calls with no ``after_approval`` field (results written before the runner retried)."""
+    out = dict.fromkeys(harness.AFTER_APPROVAL, 0)
+    for c in calls:
+        if c["outcome"] == "gated":
+            k = c.get("after_approval")
+            if k in out:
+                out[k] += 1
     return out
 
 
@@ -292,8 +350,9 @@ def render_split(doc: dict[str, Any], split: str) -> list[str]:
     if any(a in harness.LABEL_ARMS for a in doc["rates"]):
         L.append("")
         L.append(
-            "For the labels arms, attack calls that needed an approval count as declined and "
-            "benign ones as approved (scripted approver); see the next table."
+            "For the labels arm, the attack column counts calls allowed without an approval. "
+            "Gated calls were answered by the scripted approver and, when granted, retried; see "
+            "the next table."
         )
     L += render_labels(doc)
     L += render_limits(doc)
@@ -426,31 +485,50 @@ def render_labels(doc: dict[str, Any]) -> list[str]:
         r = doc["rates"].get(arm)
         if r is None:
             continue
-        retry = (
-            f"The runner grants each approved request through the admin API and sends the call "
-            f"again, so that it is charged against the run's limits: {r['retry_allowed']} of "
-            f"{r['approved_retried']} retries were allowed."
-            if arm in harness.RETRY_ARMS
-            else "The runner does not grant or retry, so gated calls are counted, not retried."
-        )
+        aa, ba = r["attack_after"], r["benign_after"]
+        a_other = r["attack_gated"] - aa["allowed"] - aa["declined"]
+        b_other = r["benign_gated"] - ba["allowed"] - ba["declined"]
         L += [
             "",
             f"### Approvals in `{arm}`",
             "",
-            'A gated call got JSON-RPC `-32008` with `data.reason = "approval_required"`. '
-            "The scripted approver approves a call labelled benign and declines one labelled "
-            f"attack. {retry} The approve-all bound treats every request as granted.",
+            'A gated call got JSON-RPC `-32008` with `data.reason = "approval_required"` and an '
+            "`approval_id`. The scripted approver stands in for the user: it grants a call "
+            "labelled benign and declines one labelled attack, as the operator, through "
+            "`POST /admin/approvals/{id}`. A granted call is retried once, identically, from the "
+            "same hop. An attack call allowed after a grant would be the approver's decision, "
+            "not something attenuo let through on its own. The approve-all bound treats every "
+            "request as granted.",
             "",
-            "| Attack allowed without approval | Attack gated | Attack allowed, approve-all "
-            "| Benign gated | Benign denied | Approval requests |",
-            "|---:|---:|---:|---:|---:|---:|",
+            "| Attack allowed without approval | Attack gated | Gated, approved, allowed "
+            "| Gated, declined | Gated, other | Attack allowed in the end | Approve-all bound |",
+            "|---:|---:|---:|---:|---:|---:|---:|",
             f"| {_ci(r['attack_allowed'], r['attack_calls'])} "
             f"| {_pct(r['attack_gated'], r['attack_calls'])} "
-            f"| {_ci(r['attack_allowed_approve_all'], r['attack_calls'])} "
+            f"| {aa['allowed']} | {aa['declined']} | {a_other} "
+            f"| {_ci(r['attack_allowed_final'], r['attack_calls'])} "
+            f"| {_ci(r['attack_allowed_approve_all'], r['attack_calls'])} |",
+            "",
+            "| Benign gated | Completed after approval | Gated, declined | Gated, other "
+            "| Benign denied | Approval requests |",
+            "|---:|---:|---:|---:|---:|---:|",
             f"| {_pct(r['benign_gated'], r['benign_calls'])} "
+            f"| {ba['allowed']}/{r['benign_gated']} | {ba['declined']} | {b_other} "
             f"| {_pct(r['benign_denied'], r['benign_calls'])} "
             f"| {r['approval_requests']} |",
+            "",
+            '"Gated, other" is a grant whose retry was denied, failed or was gated again, or a '
+            "`-32008` without an `approval_id`; any of these except a denied retry also fails "
+            "the run.",
         ]
+        if arm in harness.LIMIT_ARMS:
+            L += [
+                "",
+                f"With run limits, a granted retry is charged like any allowed call; "
+                f"{r['retry_budget_denied']} granted retries were denied by a run limit "
+                "(`retry_reason` `budget_exhausted`, stage `budget`), which is expected and "
+                "not a problem when the retry did not reach the upstream.",
+            ]
     return L
 
 

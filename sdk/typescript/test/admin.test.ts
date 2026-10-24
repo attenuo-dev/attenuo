@@ -486,3 +486,89 @@ describe("AdminClient console endpoints", () => {
     await expect(admin.policyEvaluate("github", "read_file")).rejects.toThrow(TypeError);
   });
 });
+
+const approvalBody = (state = "pending", extra: Record<string, unknown> = {}) => ({
+  approval_id: "a1",
+  state,
+  expired: false,
+  chain_id: "c1",
+  lease: "l1",
+  call_hash: "h",
+  decision_id: "d1",
+  call: { server: "github", tool: "delete_repo", arguments: { repo: "x" } },
+  labels: [{ seq: 4 }],
+  subject: "alice",
+  issuer: "https://idp",
+  agents: ["planner"],
+  created_at: "2026-10-24T10:00:00Z",
+  expires_at: "2026-10-24T10:02:00Z",
+  ...extra,
+});
+
+describe("AdminClient approvals", () => {
+  it("lists approvals with filters and reads one", async () => {
+    const { fetch, calls } = mockFetch((s) =>
+      s.url.pathname === "/admin/approvals"
+        ? jsonResponse({ approvals: [approvalBody()] })
+        : jsonResponse(approvalBody()),
+    );
+    const admin = new AdminClient(URL_, "adm", { fetch });
+    const list = await admin.approvals({ chainId: "c1", state: "pending", limit: 10 });
+    expect(calls[0]!.method).toBe("GET");
+    expect(calls[0]!.url.pathname).toBe("/admin/approvals");
+    expect(Object.fromEntries(calls[0]!.url.searchParams)).toEqual({
+      chain_id: "c1",
+      state: "pending",
+      limit: "10",
+    });
+    expect(calls[0]!.headers.get("authorization")).toBe("Bearer adm");
+    expect(list.map((a) => a.approvalId)).toEqual(["a1"]);
+    expect(list[0]!.tool).toBe("delete_repo");
+    expect(list[0]!.arguments).toEqual({ repo: "x" });
+    expect(list[0]!.usable).toBe(false);
+    expect(list[0]!.raw.decision_id).toBe("d1");
+    await admin.approvals();
+    expect(calls[1]!.url.search).toBe("");
+
+    const a = await admin.approval("../a1");
+    expect(calls[2]!.url.pathname).toBe("/admin/approvals/..%2Fa1");
+    expect(a.state).toBe("pending");
+    expect(a.chainId).toBe("c1");
+  });
+
+  it("grants and declines as the operator", async () => {
+    const { fetch, calls } = mockFetch((s) => {
+      const decision = (s.body as { decision: string }).decision;
+      return jsonResponse(
+        approvalBody(decision === "grant" ? "granted" : "declined", {
+          approver: { subject: "urn:attenuo:admin", method: "admin_token", by: "operator" },
+        }),
+      );
+    });
+    const admin = new AdminClient(URL_, "adm", { fetch });
+    const granted = await admin.grantApproval("a1");
+    expect(calls[0]!.method).toBe("POST");
+    expect(calls[0]!.url.pathname).toBe("/admin/approvals/a1");
+    expect(calls[0]!.body).toEqual({ decision: "grant" });
+    expect(granted.usable).toBe(true);
+    expect(granted.approver?.by).toBe("operator");
+    const declined = await admin.declineApproval("a1");
+    expect(calls[1]!.body).toEqual({ decision: "decline" });
+    expect(declined.state).toBe("declined");
+    expect(declined.usable).toBe(false);
+  });
+
+  it("surfaces 409 and 404 as ApiError", async () => {
+    const { fetch } = mockFetch((s) =>
+      s.method === "POST"
+        ? jsonResponse({ error: "approval_not_pending", detail: "already granted" }, 409)
+        : jsonResponse({ error: "not_found", detail: "unknown approval" }, 404),
+    );
+    const admin = new AdminClient(URL_, "adm", { fetch });
+    await expect(admin.grantApproval("a1")).rejects.toMatchObject({
+      status: 409,
+      error: "approval_not_pending",
+    });
+    await expect(admin.approval("nope")).rejects.toBeInstanceOf(ApiError);
+  });
+});

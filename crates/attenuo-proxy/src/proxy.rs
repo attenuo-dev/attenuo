@@ -30,7 +30,9 @@ use crate::jsonrpc::{
     CODE_PARSE_ERROR, CODE_TOO_MANY, CODE_UNAUTHORIZED, CODE_UNAVAILABLE, CODE_UNKNOWN_SERVER,
     CODE_UPSTREAM,
 };
-use crate::label::{label_stream, Labeller, PendingResult, LABELLED_METHODS};
+use crate::label::{
+    label_stream, AwaitedResults, Labeller, PendingResult, ResultScope, LABELLED_METHODS,
+};
 use crate::listed::ListedTools;
 use crate::session::{session_tag, BindOutcome, SessionCheck, SessionOwner, SessionRegistry};
 use crate::stage::Stage;
@@ -106,6 +108,8 @@ struct AppState {
     max_upstream_body: usize,
     /// [`ProxyConfig::max_request_body_bytes`].
     max_request_body: usize,
+    /// Allowed calls whose answers may arrive on the `GET` listen stream (ADR-0009).
+    awaited: Arc<AwaitedResults>,
 }
 
 impl AppState {
@@ -138,6 +142,7 @@ pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
         listed: Arc::new(ListedTools::new()),
         max_upstream_body,
         max_request_body,
+        awaited: Arc::new(AwaitedResults::new()),
     });
     Router::new()
         .route(
@@ -622,7 +627,7 @@ fn forward_headers(headers: &HeaderMap, names: &[&'static str]) -> HeaderMap {
 }
 
 // ---------------------------------------------------------------------------------------------
-// GET / DELETE: transparent passthrough (SSE listen stream, session termination)
+// GET / DELETE: passthrough (SSE listen stream, its answers labelled; session termination)
 // ---------------------------------------------------------------------------------------------
 
 async fn handle_passthrough(
@@ -662,8 +667,6 @@ async fn handle_passthrough(
             };
         tracing::debug!(%method, "forwarding transparently");
         let is_delete = method == Method::DELETE;
-        // The listen stream lives as long as the client keeps it open: re-check it (SR-28).
-        let guard = (!is_delete).then(|| state.stream_guard(&chain));
         let limit = state.max_upstream_body;
         let req = state
             .client
@@ -674,7 +677,26 @@ async fn handle_passthrough(
             ))
             .body(body);
         let mut response = match req.send().await {
-            Ok(resp) => stream_response(resp, None, guard, limit),
+            Ok(resp) if is_delete => stream_response(resp, None, None, limit),
+            // The listen stream lives as long as the client keeps it open: re-check it
+            // (SR-28). Responses on it to allowed calls are labelled like `POST` answers.
+            Ok(resp) if is_event_stream(resp.headers()) => {
+                let labeller = Labeller::listen(
+                    state.authorizer.clone(),
+                    state.awaited.clone(),
+                    ResultScope::new(&server, session_id.as_deref(), &chain),
+                );
+                let guard = state.stream_guard(&chain);
+                stream_response_sse(
+                    resp,
+                    None,
+                    guard,
+                    limit,
+                    None::<fn(&mut Value)>,
+                    Some(labeller),
+                )
+            }
+            Ok(resp) => stream_response(resp, None, Some(state.stream_guard(&chain)), limit),
             Err(e) => return upstream_error(e),
         };
         match (is_delete, session_id.as_deref()) {
@@ -915,6 +937,15 @@ async fn handle_post_inner(
             HeaderValue::from_static("application/json"),
         );
     }
+    // The upstream may answer an allowed call on the `GET` listen stream instead (after a
+    // `202`, or on a resumed stream): remember it before the upstream can see it.
+    let scope = (!screened.results.is_empty()).then(|| {
+        let scope = ResultScope::new(server, session_id, chain);
+        state
+            .awaited
+            .remember(&scope, chain, &screened.results, Instant::now());
+        scope
+    });
     let sent = Instant::now();
     let resp = match state
         .client
@@ -932,12 +963,13 @@ async fn handle_post_inner(
     timing.upstream_done = Some(headers_in);
 
     let has_lists = !screened.list_requests.is_empty();
-    let labeller = (!screened.results.is_empty()).then(|| {
+    let labeller = scope.map(|scope| {
         Labeller::new(
             state.authorizer.clone(),
             chain.clone(),
             std::mem::take(&mut screened.results),
         )
+        .striking(state.awaited.clone(), scope)
     });
     let needs_buffer = has_lists || !screened.replies.is_empty() || labeller.is_some();
     let content_type = resp

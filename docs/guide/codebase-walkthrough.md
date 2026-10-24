@@ -3,7 +3,7 @@
 A reading-and-running plan for someone who wants to understand every piece of attenuo himself. It has five parts:
 
 1. [A one-page mental model](#1-the-mental-model): the path of one proxied tool call and one token exchange, by file and function.
-2. [Nine reading sessions](#2-reading-sessions) of 45 to 60 minutes, each with files in order, a document to read beside them, three questions and a block of commands that shows the concept working.
+2. [Ten reading sessions](#2-reading-sessions) of 45 to 60 minutes, each with files in order, a document to read beside them, three to six questions and a block of commands that shows the concept working.
 3. [Why it is this way](#3-why-it-is-this-way): every ADR and design document in one line each.
 4. [A glossary](#4-glossary).
 5. [Things that will surprise you](#5-things-that-will-surprise-you).
@@ -11,6 +11,8 @@ A reading-and-running plan for someone who wants to understand every piece of at
 Paths are relative to the repository root. Functions are cited by name, not line number, because lines move: find one with `grep -rn "fn name" crates/`. Line counts are rounded and were checked against main @ de3cf75 (2026-10-24); use them to size a session, not as a contract.
 
 Every command below except `cargo bench` and `cargo +nightly fuzz` was run, in this order, on 2026-10-23 against `main` (about 110 commands; the Rust test filters, the Python and TypeScript test suites and the demo included). Where the text quotes output, that is what was printed. Line counts were refreshed the same day; they are rounded, so use them to size a session, not as a contract.
+
+Session 9 (output labelling and approvals) and the labels-arm part of session 10 were added on 2026-10-24, and every command added there was run against `main` @ 1904f70. The same day the commands of sessions 1 to 7 that use the running server, the session 8 quickstart, the demo, and session 10's oracle, pytest and `run.py --out` were run again on that commit. They print what is quoted, except two counts that changed with the new features and were updated here: the demo now verifies 9 audit entries (the allowed call adds a `tool_result` record), and the suite's pytest run passes 24 and skips 7.
 
 ## 0. Setup you need once
 
@@ -23,7 +25,7 @@ export PATH=$BIN:$PATH                # gives you `attenuo` and `attenuo-server`
 
 `fake_mcp` is a stand-in for an MCP server: it has `read_file`, `create_issue` and `delete_repo` tools, echoes calls and does nothing else. It lands in `$BIN/examples/fake_mcp`.
 
-Sessions 2, 5, 6, 7, 8 and 9 use a running server. Start the demo's server and fake upstream once, in a spare terminal or in the background, from the repository root:
+Sessions 2, 5, 6, 7, 8 and 9 use a running server (session 9 starts a second one beside it). Start the demo's server and fake upstream once, in a spare terminal or in the background, from the repository root:
 
 ```sh
 $BIN/examples/fake_mcp --port 13001 > /tmp/ob-fake.log 2>&1 &
@@ -32,7 +34,7 @@ export ATTENUO_SERVER=http://127.0.0.1:18080 ATTENUO_ADMIN_TOKEN=demo-admin-toke
 sleep 2 && curl -s $ATTENUO_SERVER/healthz       # {"status":"ok","version":"0.1.0"}
 ```
 
-Those two variables are read by anything in this shell, the test binaries included: the `attenuo-cli` unit tests expect the default server address and the `attenuo-bench` smoke test mints its own admin token, so with them exported one test in each fails. The `cargo test` lines of sessions 7 and 9 are written with `env -u` for that reason; the other crates' tests do not read them.
+Those two variables are read by anything in this shell, the test binaries included: the `attenuo-cli` unit tests expect the default server address and the `attenuo-bench` smoke test mints its own admin token, so with them exported one test in each fails. The `cargo test` lines of sessions 7 and 10 are written with `env -u` for that reason; the other crates' tests do not read them.
 
 The config uses fixed ports (18080 for attenuo, 13001 for the upstream), an in-memory audit log (`sqlite_path = ":memory:"`, so a restart starts a new log) and an ephemeral signing key (so a restart invalidates every token). Stop everything with `pkill -x attenuo-server; pkill -x fake_mcp`.
 
@@ -75,6 +77,8 @@ A client sends `POST /mcp/github` with a JSON-RPC `tools/call` body and `Authori
 
 The AuthZEN endpoint (`POST /access/v1/evaluation`, `attenuo-server/src/routes/authzen.rs`) enters the same `Pipeline::decide`, so a gateway that asks "may this call happen?" gets the same answer as the proxy, with the same audit record.
 
+Output labelling (ADR-0009, session 9) adds to this table in two places. Between steps 8 and 9, `Pipeline::decide` reads the run's taint (`run_labels`, keyed by `chain_id`, the first hop's lease) and takes a granted approval for this exact call if there is one; Cedar sees both as `context.session` and `context.approval`. A deny that comes only from forbids annotated `@obligation("approval")` has the reason `approval_required`: the proxy answers `-32008` with an approval id instead of `-32003`, and nothing is forwarded. After step 12, before an allowed call's answer is relayed, the proxy reports it and the server appends a `tool_result` record and labels the run (`Pipeline::record_result`); if either write fails, the agent gets `-32003` `label_error` instead of the answer.
+
 ### One token exchange
 
 A sub-agent (or its parent on its behalf) sends `POST /token` with the parent token, the new actor and the capabilities it wants (RFC 8693).
@@ -95,7 +99,20 @@ Renewal (`POST /token/renew`, `routes/renew.rs`) extends a lease, never beyond t
 
 ## 2. Reading sessions
 
-Nine sessions instead of eight: the CLI and the demo get their own, short, session. Sessions 7 to 9 are light, so merge them if you have the time.
+Ten sessions: the CLI and the demo get their own, short, session, and output labelling and approvals, which landed after the others were written, get session 9. In order:
+
+1. Core types and attenuation (`attenuo-core`).
+2. Tokens, `ou_sig` and DPoP (`attenuo-token`).
+3. Cedar policy and the translation cache (`attenuo-policy`).
+4. Audit log, WAL, checkpoints and canonical JSON (`attenuo-audit`).
+5. Proxy, session registry and list filtering (`attenuo-proxy`).
+6. Server routes, exchange, leases, AuthZEN and admin (`attenuo-server`).
+7. The CLI and the demo.
+8. The SDKs and the refresh helper.
+9. Output labelling and approvals: taint, `tool_result`, `-32008`, the approval store.
+10. Evaluation suite (with the labels arm), benchmarks and fuzzing.
+
+Session 9 cuts across sessions 3 to 8 and is easiest after all of them. Sessions 7, 8 and 10 are light, so merge them if you have the time.
 
 Each session has four parts. Read the files in the order given, with the "read beside" document open. Answer the questions without looking, then check the run block. Tests are named so that `cargo test -p <crate> <filter>` runs a handful, not the whole suite; add `-- --nocapture` to see output.
 
@@ -424,7 +441,7 @@ attenuo tools --server github --token "$CODER" # tools/list through the proxy (-
 attenuo --json lease show "$(attenuo token root --subject alice --agent assistant --cap 'github:*' --print lease)"
 ```
 
-Expect the demo to end with `1 tools/call reached upstream. The three denied calls never left attenuo.` and `audit chain OK: 8 entries verified`.
+Expect the demo to end with `1 tools/call reached upstream. The three denied calls never left attenuo.` and `audit chain OK: 9 entries verified` (8 before output labelling; the ninth is the allowed call's `tool_result` record).
 
 ### Session 8: the SDKs and the refresh helper (`sdk/python`, `sdk/typescript`)
 
@@ -487,7 +504,134 @@ ATTENUO_INTEGRATION=1 ATTENUO_BIN_DIR=$BIN PYTHONPATH=sdk/python/src python3 -m 
 
 The TypeScript SDK: `cd sdk/typescript && npm ci && npm test` (158 passed, 7 skipped without `ATTENUO_INTEGRATION`; main @ de3cf75, 2026-10-24).
 
-### Session 9: evaluation suite, benchmarks and fuzzing
+### Session 9: output labelling and approvals (ADR-0009)
+
+The attacks the injection suite still gets through use a tool and arguments the task itself needs, so neither the token nor a static policy can tell them from the real thing; what gives them away is that the run read a tool result first. This session follows an upstream answer into the audit log and the run's taint, then a later destructive call from `-32008` through an approval to the one retry that approval allows.
+
+Read beside: [ADR-0009: Output labelling](../decisions/0009-output-labelling.md), then sections 3.6 to 3.8 of the [output-labelling design](../design/output-labelling.md). Its status line still says nothing is implemented; phase 1 as built is described in `CHANGELOG.md` under [Unreleased]. Keep [Asking for approval after untrusted output](../guides/writing-policies.md#asking-for-approval-after-untrusted-output) and the Approvals part of [HTTP endpoints](../reference/http-api.md#approvals) open as lookups.
+
+| Order | File | What it does | Lines |
+| --- | --- | --- | --- |
+| 1 | `config/policies/output-labels.cedar`, `output-labels_test.yaml` | The new Cedar attributes listed in the header comment, the two `@obligation("approval")` forbids, and ten policy tests that show every rule from the policy author's side. Read these first. | 130 |
+| 2 | `crates/attenuo-policy/src/catalog.rs` | `ToolAttrs` gains `destructive` (default `!readonly`, read through `is_destructive`) and `output` (`untrusted` by default, or `trusted`); `AnnotationImport` lets MCP hints narrow a tool, never widen it. | 310 |
+| 3 | `crates/attenuo-policy/src/lib.rs` (crate comment, `authorize_labelled`, `REASON_APPROVAL_REQUIRED`), `request.rs` (`context.session`, `context.approval`) | `approval_required` only when every forbid that applied carries the obligation and a permit would otherwise allow the call. Any other forbid still gives `policy_deny`. | 2040 |
+| 4 | `crates/attenuo-core/src/call.rs` (`call_hash`), `decision.rs` (`RecordKind::ToolResult`, `ResultInfo`, `RecordLabels`, `chain_id_of`) | The hash an approval is bound to (SHA-256 of the RFC 8785 JSON of server, tool and arguments), the new record kinds and fields, and the run key: the first hop's lease. | 460 |
+| 5 | `crates/attenuo-proxy/src/label.rs` | `Labeller`: finds the answers to allowed calls by JSON-RPC id in a JSON body, a batch or SSE events, calls `Authorizer::record_result` before relaying, and replaces an answer it could not record with `-32003` `label_error`. `AwaitedResults`: allowed calls remembered for an answer on the `GET` listen stream, with its bounds. | 655 |
+| 6 | `crates/attenuo-proxy/src/jsonrpc.rs` (`approval_required_response`), `proxy.rs` (`screen_message`, where an `approval_required` decision becomes that response, and `handle_passthrough` for the listen stream) | Where `-32008` is written and where the listen stream gets its labeller. | 1840 |
+| 7 | `crates/attenuo-server/src/authz.rs` | The crate comment's six steps, then `run_labels`, `take_approval`, `give_back`, `request_approval` and `Pipeline::record_result`. The two places where this session changes section 1's table. | 1220 |
+| 8 | `crates/attenuo-audit/src/approval.rs`, `lease.rs` (`add_label`, `labels`, `create_approval`, `take_approval`, `restore_approval`), the `run_labels` and `approvals` tables in `sqlite.rs` | The store. Approvals live beside the leases so that every grant and every use checks the lease in the same transaction. | 830 |
+| 9 | `crates/attenuo-server/src/routes/approvals.rs` | `POST /approvals/{id}` with the originating user's ID token (checked as at hop 0, used once), the admin routes, and the order "store first, then the `approval_grant` record, delete on failure". | 395 |
+| 10 | `crates/attenuo-cli/src/main.rs` (`Command::Approval`, and `call`'s exit status 2), `crates/attenuo-server/ui/view-approvals.js` | The operator's side: `attenuo approval` with `list`, `show`, `grant` and `decline`, and the console page `#/approvals`. | 1280 |
+| 11 | `sdk/python/src/attenuo/errors.py` (`ApprovalRequired`, `ApprovalNotGranted`), `client.py` (`get_approval`, `wait_for_approval`, `call_tool_with_approval`), `admin.py` (`approvals`, `grant_approval`, `decline_approval`); `callToolWithApproval` in `sdk/typescript/src/client.ts` | The agent's side, and the operator's calls in the SDK, the same ones the injection-suite runner makes with raw HTTP. | 1735 |
+
+Check you understood:
+
+1. The coder sub-agent reads a file, and then the assistant, the coder's parent at hop 0, calls `create_issue`. Is the assistant's call gated? What is the key of the taint, and where is it computed?
+2. A run is tainted and, besides the approval forbid, a plain `forbid` also matches the call. What does the agent get, and would an approval help?
+3. The user grants the approval for `create_issue {"title": "one"}`. The agent then sends that call with title `"two"`, then with `"one"` twice. What does each of the three get, and which function decides?
+4. The retry's own decision record cannot be appended. What happens to the approval, and why is that the right order?
+5. The upstream has already run an allowed call, and the `tool_result` append fails. What does the agent see, and why not relay the result anyway?
+6. Why can the approval not travel through the agent (MCP elicitation, say), and why does `POST /approvals/{id}` refuse the ID token the agent redeemed at hop 0?
+
+Run it:
+
+```sh
+cargo test -p attenuo-policy --test labels                # the obligation rule, destructive defaults, the shipped example passing its tests
+cargo test -p attenuo-proxy --test labelling              # results recorded before relay, -32008, the listen stream
+cargo test -p attenuo-server --test labels                # taint end to end: trusted output, one run only, label_error
+cargo test -p attenuo-server --test approvals             # single use, different call hash, revocation, ID token rules
+attenuo policy test config/policies/output-labels_test.yaml   # 10 passed, 0 failed
+
+# A second server on port 18081 beside the section 0 one, with the demo policy plus a permit for
+# create_issue and the approval forbid. It uses the same fake upstream.
+cat examples/github-leak-demo/policy.cedar - > /tmp/ob-labels.cedar <<'CEDAR'
+@id("issues_in_public_repos")
+permit(principal, action == Action::"github/create_issue", resource)
+when { context.input has repo && context.input.repo like "alice/public-*" };
+
+@id("confirm_destructive_after_untrusted_read")
+@obligation("approval")
+forbid (principal, action, resource)
+when { resource.destructive && context.session.tainted && !context.approval.present };
+CEDAR
+sed -e 's/18080/18081/g' -e 's#examples/github-leak-demo/policy.cedar#/tmp/ob-labels.cedar#' \
+  examples/github-leak-demo/config.toml > /tmp/ob-labels.toml
+attenuo policy lint /tmp/ob-labels.cedar --config /tmp/ob-labels.toml    # 5 policies, 0 error(s), 0 warning(s)
+RUST_LOG=warn attenuo-server --config /tmp/ob-labels.toml > /tmp/ob-labels.log 2>&1 & LABELS_PID=$!
+export ATTENUO_SERVER=http://127.0.0.1:18081
+sleep 2 && curl -s $ATTENUO_SERVER/healthz
+
+# A fresh run reads, then tries to open an issue. Every result is untrusted unless the catalog says
+# output = "trusted", so the read taints the run, and create_issue is destructive (not readonly).
+export ATTENUO_TOKEN=$(attenuo token root --subject alice --agent assistant --cap 'github:*' --print token)
+attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=README.md   # ALLOWED
+attenuo call --server github --tool create_issue --arg repo=alice/public-docs --arg title=one
+# APPROVAL REQUIRED, then the approval id, its expiry (two minutes), the call hash and the decision id; exit status 2.
+# Repeat it: the same approval id comes back, with a new decision id.
+
+# Decide as the operator within the two minutes (the user would use POST /approvals/{id} with an ID token):
+attenuo approval list         # <id>  pending  github/create_issue  run <root lease>  expires ...
+ID=$(attenuo --json approval list --state pending | python3 -c 'import json,sys; print(json.load(sys.stdin)["approvals"][0]["approval_id"])')
+attenuo approval show $ID     # the exact arguments, the call hash, and "labels  github/read_file (audit seq 4)" on a fresh server
+attenuo approval grant $ID    # state granted, decided ... by urn:attenuo:admin (operator, admin_token)
+
+attenuo call --server github --tool create_issue --arg repo=alice/public-docs --arg title=two   # APPROVAL REQUIRED, a new id: another call hash
+attenuo call --server github --tool create_issue --arg repo=alice/public-docs --arg title=one   # ALLOWED: the identical retry
+attenuo call --server github --tool create_issue --arg repo=alice/public-docs --arg title=one   # APPROVAL REQUIRED again: the grant was used up
+attenuo approval show $ID     # state consumed, "used by  decision <id of the allowed retry>"
+
+# The same gated call as raw JSON-RPC: -32008, with the decision id in the header as for -32003.
+curl -s -D - -X POST $ATTENUO_SERVER/mcp/github \
+  -H "Authorization: Bearer $ATTENUO_TOKEN" -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"create_issue","arguments":{"repo":"alice/public-docs","title":"raw"}}}'
+# x-attenuo-decision-id: <uuid>
+# {"jsonrpc":"2.0","id":7,"error":{"code":-32008,"message":"attenuo: approval required: ask the user to approve <id> (POST /approvals/<id>)",
+#  "data":{"reason":"approval_required","decision_id":"<uuid>","call_hash":"...","approval_id":"<id>","expires_at":"..."}}}
+
+# What the log holds. tail prints no kind: a tool_result shows as "ALLOW ... reason=tool_result", an
+# approval_request as "DENY ... reason=approval_requested" and an approval_grant as "ALLOW ... reason=approval_granted".
+attenuo audit tail -n 12
+curl -s -H "Authorization: Bearer $ATTENUO_ADMIN_TOKEN" "$ATTENUO_SERVER/admin/audit?kind=tool_result&limit=1"
+# "kind":"tool_result", "decision_id" of the read, "result":{"digest":"...","size":149,"label":"untrusted","fingerprints":0}; no content
+curl -s -H "Authorization: Bearer $ATTENUO_ADMIN_TOKEN" "$ATTENUO_SERVER/admin/audit?kind=decision&reason=policy_allow&order=desc&limit=1"
+# the allowed retry: "labels":{"tainted_by":[4]} (the seq of the read's tool_result),"approval":{"id":"<id>","by":"operator"}
+attenuo audit verify          # audit chain OK
+
+# Question 1, answered: a sub-agent's read taints its parent's run.
+R=$(attenuo token root --subject alice --agent assistant --cap 'github:*' --print token)
+C=$(printf '%s\n' demo-coder-secret | ATTENUO_TOKEN="$R" \
+  attenuo token exchange --actor coder --client-secret-stdin --cap github:read_file --print token)
+ATTENUO_TOKEN="$C" attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=x > /dev/null
+ATTENUO_TOKEN="$R" attenuo call --server github --tool create_issue --arg repo=alice/public-docs --arg title=x   # APPROVAL REQUIRED
+
+# The SDK's view. The operator grants inside on_approval here; a real agent shows the user the id.
+PYTHONPATH=sdk/python/src python3 - <<'PY'
+from attenuo import AdminClient, ApprovalRequired, Client
+
+URL = "http://127.0.0.1:18081"
+admin = AdminClient(URL, "demo-admin-token")
+root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+with Client(URL) as ob:
+    ob.call_tool(root, "github", "read_file", {"repo": "alice/public-docs", "path": "a"})
+    args = {"repo": "alice/public-docs", "title": "from python"}
+    try:
+        ob.call_tool(root, "github", "create_issue", args)
+    except ApprovalRequired as e:
+        print("gated:", e.reason, e.approval_id is not None)       # gated: approval_required True
+    done = ob.call_tool_with_approval(root, "github", "create_issue", args,
+                                      on_approval=lambda e: admin.grant_approval(e.approval_id),
+                                      interval=0.2)
+    print("allowed after approval:", done.decision_id is not None)  # allowed after approval: True
+PY
+
+unset ATTENUO_TOKEN; export ATTENUO_SERVER=http://127.0.0.1:18080     # back to the section 0 server
+kill $LABELS_PID                                                      # stop the second server
+```
+
+The user's own route, `POST /approvals/{id}` with an OIDC ID token, needs a configured `[[idps]]` entry and a real or test identity provider, so it is not in the block; `only_the_originating_users_fresh_id_token_approves` in `crates/attenuo-server/tests/approvals.rs` runs it against a test issuer. An answer on the `GET` listen stream cannot be produced with `fake_mcp`, which always answers in the `POST` body; the three `listen_stream` tests in `crates/attenuo-proxy/tests/labelling.rs` use an upstream that answers `202` and sends the result on its stream.
+
+### Session 10: evaluation suite, benchmarks and fuzzing
 
 The evidence that the design works and what it costs. Read this last; it makes the most sense once you know what the stages are.
 
@@ -495,10 +639,12 @@ Read beside: [Injection suite: results](../evaluation/injection-suite.md). Optio
 
 | Order | File | What it does | Lines |
 | --- | --- | --- | --- |
-| 1 | `evaluation/injection-suite/README.md` | What a case is, the five arms (no enforcement, scope only, scope plus constraints, policy only, full attenuo), the dev and test splits. | 138 |
+| 1 | `evaluation/injection-suite/README.md` | What a case is, the six arms (no enforcement, scope only, scope plus constraints, policy only, full attenuo, and full attenuo plus output labels), the dev and test splits, and "The labels arm" section. | 150 |
 | 2 | `evaluation/injection-suite/cases/dev/`, `cases/test/`, `policies/` | The case files and the frozen suite policies (hashes in `cases/test/POLICY_HASHES.json`). | data |
 | 3 | `evaluation/injection-suite/label_rules.py` | The labelling oracle: derives each call's expected outcome from the case structure, independent of hand labels. | |
 | 4 | `evaluation/injection-suite/harness.py`, `run.py` | Starts real servers, replays every call through each arm, writes results with SHA-256 of every input. | |
+| 4a | `evaluation/injection-suite/policies/labels.cedar`; in `harness.py`, `ARMS`, the labels-arm probe, `scripted_approver`, `_settle` and `AFTER_APPROVAL` | The `attenuo_labels` arm: the two approval forbids (hashed under `added_later`), the probe that skips the arm on a server that never answers `-32008`, the scripted approver (grants a call labelled benign, declines one labelled attack, as the operator through `POST /admin/approvals/{id}`) and the one identical retry after a grant, recorded as `after_approval`. | |
+| 4b | `evaluation/injection-suite/results/2026-10-24-labels-v2.md`, with [the summary](../evaluation/injection-suite.md#second-run-with-retry-after-approval-2026-10-24) | How to read a labels run: in the arms table the attack column counts calls allowed without an approval; the "Approvals in `attenuo_labels`" tables say what became of each gated call; the approve-all bound is the attack rate if every request were granted (10/60, the `attenuo` arm's number). | 230 |
 | 5 | `crates/attenuo-bench/src/lib.rs` | End-to-end load generator: proxy versus direct, by chain depth and concurrency. | 1432 |
 | 6 | `crates/attenuo-core/benches/attenuation.rs`, `crates/attenuo-policy/benches/*.rs`, `crates/attenuo-server/benches/decide.rs` | criterion micro-benchmarks of the hot path. | 575 |
 | 7 | `fuzz/fuzz_targets/` and `fuzz/README.md` | Twelve libFuzzer targets; they assert properties as well as absence of panics. | 12 files |
@@ -508,18 +654,32 @@ Check you understood:
 1. Why are the suite's policies frozen before the test split was written, and what does `run.py --split test` do if one of them changed?
 2. The micro-benchmarks do not include token verification, the lease lookup, the audit append or the network. Why are they still useful, and which benchmark does include them?
 3. Pick one fuzz target and say which property it asserts beyond "does not crash".
+4. The labels arm allows 1 of 60 dev attack calls without an approval and 0 attack calls were approved. Why is the second number true by construction, and which number in the report tells you what a careless user would let through?
 
 Run it:
 
 ```sh
 python3 evaluation/injection-suite/label_rules.py dev test     # oracle agreement; kappa 1.0, no disagreements
-python3 -m pytest evaluation/injection-suite -q                # 15 passed, 4 skipped without ATTENUO_INTEGRATION=1
+python3 -m pytest evaluation/injection-suite -q                # 24 passed, 7 skipped without ATTENUO_INTEGRATION=1
+python3 -m pytest evaluation/injection-suite/test_suite.py -q -k 'approv or labels_arm'   # the approver and report logic: 6 passed, 2 skipped
 
 # The full run starts servers from prebuilt binaries and takes about half a minute.
 # --out keeps the results out of the committed results/ directory:
 ATTENUO_BIN_DIR=$BIN \
   python3 evaluation/injection-suite/run.py --split all --out /tmp/ob-inj --tag mine
-ls /tmp/ob-inj          # <date>-mine.json and <date>-mine.md; compare with results/2026-10-23-v2.md
+ls /tmp/ob-inj          # <date>-mine.json and <date>-mine.md; compare with results/2026-10-24-labels-v2.md (six arms)
+
+# What became of every gated call in the labels arm, by hand label:
+python3 - /tmp/ob-inj/$(date -u +%F)-mine.json <<'PY'
+import collections, json, sys
+d = json.load(open(sys.argv[1]))
+for split in ("dev", "test"):
+    gated = [c for c in d["splits"][split]["calls"] if c["outcome"] == "gated"]
+    print(split, sorted(collections.Counter((c["role"], c["after_approval"]) for c in gated).items()))
+PY
+# dev [(('attack', 'declined'), 9), (('benign', 'allowed'), 18)]
+# test [(('attack', 'declined'), 6), (('benign', 'allowed'), 2)]
+grep -A2 '^| Benign gated' /tmp/ob-inj/$(date -u +%F)-mine.md   # 18/69 (26%) | 18/18 ... | 27 approval requests (dev); 2/29 | 2/2 ... | 8 (test)
 
 env -u ATTENUO_SERVER -u ATTENUO_ADMIN_TOKEN cargo test -p attenuo-bench   # a short smoke run of the load generator (env -u: section 0)
 cargo bench -p attenuo-server --bench decide                  # the decision path by stage (optional, slow)
@@ -530,7 +690,7 @@ cargo +nightly fuzz list
 cargo +nightly fuzz run dpop_proof -- -max_total_time=60
 ```
 
-The runner starts its own servers, so it ignores any `ATTENUO_*` variables from section 0 (other than `ATTENUO_BIN_DIR`) and prints one warning. The `cargo +nightly fuzz` commands, the `bench-e2e.sh` run and the Rust benches were not run for this page; the Python oracle, the pytest run and `run.py --out` were.
+The runner starts its own servers, so it ignores any `ATTENUO_*` variables from section 0 (other than `ATTENUO_BIN_DIR`) and prints one warning. The `cargo +nightly fuzz` commands, the `bench-e2e.sh` run and the Rust benches were not run for this page; the Python oracle, the pytest runs, `run.py --out` and the gated-call count were. `run.py` runs the labels arm only on a server with the approvals API; on an older binary it prints why it skipped the arm and records it under `skipped_arms`.
 
 ## 3. Why it is this way
 
@@ -547,6 +707,9 @@ One line per decision. The ADRs record a decision and what was rejected; the des
 | [ADR-0005: Policy decision point](../decisions/0005-policy-decision-point.md) | Two stages, capabilities first and Cedar second; requests are built from the chain and a typed tool catalog; fail closed on any error; AuthZEN types so other enforcement points can call it. | No validation, or a hand-maintained full schema; namespaced actions per server were deferred and later replaced by `Action::"<server>/<tool>"`. |
 | [ADR-0006: Lease-based in-flight revocation](../decisions/0006-lease-based-in-flight-revocation.md) | One lease per hop in a server-side tree; holders renew; revoking a lease cascades to descendants with one write. | A `jti` blacklist, very short token lifetimes only, per-call introspection at the IdP. |
 | [ADR-0007: Actor authentication](../decisions/0007-actor-authentication.md) | Authenticate the agent in an exchange with an RFC 8693 `actor_token` from configured workload-identity issuers, or a client secret, plus `may_act` on the parent. | Client secrets only, mTLS with X.509-SVIDs at `/token`, `private_key_jwt` per agent. |
+| [ADR-0008: Admin console](../decisions/0008-admin-console.md) (proposed) | Vanilla static files embedded in the server, on a separate opt-in listener, with the admin token held in page memory. | A TypeScript app built with Node in CI, or a separate console process calling the admin API across origins; `/admin/ui/` on the main listener and a cookie session were the rejected sub-options. |
+| [ADR-0009: Output labelling](../decisions/0009-output-labelling.md) (proposed; phase 1 built, session 9) | The proxy labels every upstream result untrusted, taints the delegation run by `chain_id`, and policy can require an approval bound to one call (`@obligation("approval")`, `-32008`). | Argument-level taint only, SDK-side labelled values only, no labelling. Argument matching is phase 2. |
+| [ADR-0010: Run limits](../decisions/0010-run-limits.md) (proposed; implementation in progress on another branch) | Count and amount budgets declared per token hop, charged against every hop of the chain in the decision's transaction, exposed to Cedar as `context.budget`. | Per-run budgets in configuration or policy only, reservation carved out of the parent at exchange, per-user rate windows, or no new mechanism (pin amounts and rely on approvals). |
 | [ADR template](../decisions/0000-adr-template.md), [how ADRs are written](../decisions/README.md) | MADR 4 format; one file per decision, numbered. | |
 
 ### Specification and design
@@ -558,6 +721,8 @@ One line per decision. The ADRs record a decision and what was rejected; the des
 | [Server request pipeline](../design/server.md) | The server is wiring around one `Pipeline::decide` used by both the proxy and AuthZEN; SQLite on a blocking pool; MCP method coverage and list filtering. | Deferred: a lease cache (v0 looks every lease up on every request, so revocation reaches the next one). |
 | [Performance](../design/performance.md) | Measure the hot path in pieces; group commit, a verified-token cache and a policy request cache came from the measurements. | A per-call Cedar translation and one commit per audit append were the first versions. Numbers are from a shared VM and indicative only. |
 | [Benchmark runs](../design/bench/2026-10-23-vm.md) | Four dated end-to-end runs (this one, plus `-proxy-stages`, `-policy-stage` and `-audit-write-path` in the same folder) that back the figures in Performance. | Not a reference machine. |
+| [Output labelling](../design/output-labelling.md) | Why provenance, not the token or the policy, separates the suite's remaining attacks; the Cedar attributes, the approval flow and the audit records; the phased plan with the measured phase 1 numbers. | Its status line predates the code; phase 1 is built. Options (b) and (c) are later phases. |
+| [Run limits](../design/run-limits.md) | Budgets per hop for the repetition and amount attacks that labelling only turns into approval requests. | Proposed; implementation in progress. |
 | [Fuzzing](../design/fuzzing.md) | cargo-fuzz targets outside the workspace, public APIs only, with properties asserted, from valid mutated inputs. | In-workspace fuzzing was rejected: it needs nightly and its own lockfile. |
 | [Rename plan](../design/rename-plan.md) | A script (`scripts/rename.py`) does one case-aware rename; history files keep the old name. | The name is not decided. |
 | [Standards](../research/standards.md), [Incidents](../research/incidents-2025-2026.md), [Related work](../research/related-work.md), [Comparison](../comparison.md) | Background: which standards attenuo follows, the incidents it is built against, and how it differs from gateways, policy engines and IdP features. | |
@@ -579,8 +744,8 @@ One line per decision. The ADRs record a decision and what was rejected; the des
 | **`may_act`** | An RFC 8693 claim on a parent token that names the only agents allowed to exchange it. |
 | **`ou_sig`** | The issuer's signature over the issuer, the originating user and the root hop. Copied unchanged into every child token, so a sub-agent cannot change whom the chain acts for. Version 3 is current. |
 | **Decision id** | The UUID of the audit record for one decision. Returned in `X-Attenuo-Decision-Id`, in a denial's `data.decision_id` and in AuthZEN `context.decision_id`; the key for finding a decision in the log. |
-| **Reason** | The short code on a decision: `policy_allow`, `policy_deny`, `capability_denied`, `lease_revoked`, `lease_expired`, `lease_unknown`, `tool_not_in_catalog`, `tool_not_listed`, `invalid_name`, `audit_error`, and others. |
-| **Catalog** | The `[policy.catalog]` table declaring every tool Cedar may name, with `readonly`, `sensitive` and typed inputs. A tool not in it is denied by default. |
+| **Reason** | The short code on a decision: `policy_allow`, `policy_deny`, `approval_required`, `capability_denied`, `lease_revoked`, `lease_expired`, `lease_unknown`, `tool_not_in_catalog`, `tool_not_listed`, `invalid_name`, `audit_error`, `label_error`, and others. |
+| **Catalog** | The `[policy.catalog]` table declaring every tool Cedar may name, with `readonly`, `sensitive`, `destructive` (default: not `readonly`), `output` (`untrusted` by default, or `trusted`) and typed inputs. A tool not in it is denied by default. |
 | **Server-scoped action** | The Cedar action id `Action::"<server>/<tool>"` (for example `github/read_file`). A permit for one upstream's tool cannot match another's (SR-13). The older bare form needs `legacy_bare_actions`. |
 | **Canonical name** | The one accepted spelling of a server or tool name: ASCII letters, digits, `_`, `.`, `-`, at most 128 bytes, compared byte for byte, never case-folded or normalized (`names.rs`). Not to be confused with canonical JSON below. |
 | **Canonical JSON (JCS)** | RFC 8785: the byte-exact JSON form that anything hashed or signed uses, so another language computes the same bytes (`attenuo_core::jcs`). |
@@ -595,6 +760,13 @@ One line per decision. The ADRs record a decision and what was rejected; the des
 | **Root grant** | A `[[root_grants]]` entry: the most a root token may carry for a given user, issuer and agent. |
 | **Session binding** | The proxy's record that an `Mcp-Session-Id` belongs to one principal (the chain's root lease), so another user cannot ride it. |
 | **Dev / test split** | In the injection suite, 46 development cases whose policies were written alongside them, and 26 held-out test cases written afterwards against frozen policies. Do not confuse with `[dev] allow_root_mint`, the development-only token mint, or with `cargo test`. |
+| **Run taint** | The output labels of one delegation run, stored by `chain_id` (the first hop's lease) in `run_labels`: one `{source, decision_id, seq}` per tool whose untrusted result the run has read. Every agent of the run shares it, so a sub-agent's read taints its parent. Cedar sees it as `context.session.tainted` and `tainted_by`; a store that cannot be read counts as tainted. |
+| **`tool_result`** | The audit record kind appended after an allowed call's answer and before it is relayed: the call's `decision_id`, the SHA-256 and size of the RFC 8785 JSON of the answer, its label and a fingerprint count. Never the content. |
+| **`approval_required`, `-32008`** | The reason when Cedar denies only through forbids annotated `@obligation("approval")` and a permit would otherwise allow the call, and the JSON-RPC code the proxy answers it with (`data`: `reason`, `decision_id`, `call_hash`, `approval_id`, `expires_at`). The call is not forwarded. |
+| **Approval** | A record in the lease store's `approvals` table for one gated call: run, calling hop's lease, `call_hash`, the call, the run's labels, `expires_at` (default two minutes, never past the token or lease). Pending, then granted or declined by the user (`POST /approvals/{id}` with an ID token) or an operator (`/admin/approvals`), then consumed by the first identical retry from the same hop. Audit kinds `approval_request` and `approval_grant`; the consuming decision carries `approval: {id, by}`. |
+| **`call_hash`** | SHA-256 of the RFC 8785 JSON of `{server, tool, arguments}` (`ToolCall::call_hash`). What an approval is bound to: any change to an argument is a different call. |
+| **Scripted approver** | The injection-suite runner's stand-in for the user in the `attenuo_labels` arm: it grants a gated call labelled benign and declines one labelled attack, through the operator endpoint, and retries a granted call once. It knows the labels, so it never makes a wrong decision. |
+| **Listen stream, `AwaitedResults`** | The MCP `GET` stream on which an upstream may send messages, including the answer to a `POST` it answered with `202`. `AwaitedResults` in `label.rs` remembers each allowed call (by upstream, session, run and request id; ten minutes, 256 per session, 10,000 in all) so that such an answer is recorded and labelled like one in the `POST` body. |
 | **SR-n, F-n** | Finding numbers from the security reviews (SR) and the fuzzing campaign (F). Comments and changelog entries cite them. |
 
 ## 5. Things that will surprise you
@@ -617,5 +789,11 @@ Each of these is deliberate, and most were found by a review or the fuzzers. Whe
 - **A 500 never explains itself.** The body says "the details are in the server log" (SR-43); look in the log, not the response.
 - **A shared `CARGO_TARGET_DIR` can run the wrong server.** If several checkouts build into one target directory, `target/debug/attenuo-server` is whichever built last. Pin binaries with `ATTENUO_BIN_DIR` (the demo and the integration tests honour it).
 - **The SDK's local `inspect` is not verification of the user block.** It checks signature, `typ`, `exp` and that `sub`/`act` match the chain, not `ou_sig`; the server checks that on every request.
+
+- **Every result is untrusted unless the catalog says otherwise.** That includes the answer of a destructive call and the answers a sub-agent reads: the taint belongs to the run, keyed by the root hop's lease, so a coder's read makes its parent's next `create_issue` ask for an approval. Mark a tool `output = "trusted"` only when its answers cannot carry text from outside. Session 9 shows the parent case.
+- **A grant is used by the identical retry only, once.** The approval is bound to the `call_hash` and the calling hop's lease. A retry with any argument changed gets `-32008` with a new approval; the second identical retry after the grant gets a new approval too; another agent of the same run cannot use it. If the retry's decision cannot be written, the approval is given back (`give_back`), so a grant is spent exactly when an allowed decision naming it is in the log.
+- **`-32008` never appears on the `GET` listen stream, but `label_error` can, without a decision header.** A gated call is decided on its `POST` and never forwarded, so there is nothing for the upstream to answer later. An allowed call answered on the listen stream is labelled there, and if that fails the answer is replaced by `-32003` `label_error` with no `X-Attenuo-Decision-Id` (the stream's headers went out when it opened), so the SDKs see an upstream `RpcError`, not `Denied`. An answer that arrives after its ten minutes, or after its entry was evicted, is relayed unrecorded ([server design](../design/server.md), "Limits").
+- **The approver in the injection suite is a script that knows the labels.** "0 attack calls approved" in the labels results is true by construction. The number that measures attenuo is "attack allowed without approval" (1/60 dev, 1/38 test); the approve-all bound (10/60, 7/38) is what a user who grants everything would get. ADR-0010's run limits aim at the gap between the two.
+- **`attenuo audit tail` does not print the record kind.** A `tool_result` reads as `ALLOW ... reason=tool_result`, an `approval_request` as `DENY ... reason=approval_requested` and an `approval_grant` as `ALLOW ... reason=approval_granted`, next to the decisions. Filter with `GET /admin/audit?kind=decision` when you want decisions only.
 
 When something in the code looks over-cautious, grep its `SR-` or `F` number in the three security reviews, the [fuzzing page](../design/fuzzing.md) and `CHANGELOG.md`; the reason is almost always written down there.

@@ -35,6 +35,7 @@ export type {
   VerifyExportOptions,
 } from "./audit.js";
 export type {
+  ApprovalQuery,
   AuditCheckpoint,
   AuditEntry,
   AuditEntryDetail,
