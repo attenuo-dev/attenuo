@@ -18,8 +18,12 @@
 //! that its `head_hash` equals the entry hash at its seq, and checks that the entries are
 //! exactly the declared range and are all countersigned (see [`VerifyOptions`]).
 //!
-//! A header may carry `filter` (`{"kind":..,"chain_id":..}`) when the export holds only the
-//! matching entries; [`verify_export_with`] refuses such a file.
+//! A header may carry `filter` (`{"kind":..,"chain_id":..,"tool":..,"decision":..}`, each member
+//! optional) when the export holds only the matching entries; [`verify_export_with`] refuses
+//! such a file. `tool` and `decision` were added after `kind` and `chain_id` without a format
+//! bump: a member that is absent means "not filtered on this", so a header written before
+//! they existed reads exactly as it did, and a verifier that predates them still refuses a
+//! file filtered on them because it refuses any header that has a `filter` at all.
 //!
 //! Format `attenuo-audit-export-v2` goes with entry hash construction
 //! [`ENTRY_HASH_VERSION`](crate::ENTRY_HASH_VERSION) (RFC 8785, SR-20). A `v1` export, hashed
@@ -33,7 +37,7 @@ use crate::checkpoint::{
 };
 use crate::error::AuditError;
 use crate::log::AuditEntry;
-use attenuo_core::RecordKind;
+use attenuo_core::{Decision, RecordKind};
 
 /// Value of the header's `format` field.
 pub const EXPORT_FORMAT: &str = "attenuo-audit-export-v2";
@@ -48,11 +52,19 @@ pub struct RecordFilter {
     /// Only records of this delegation chain (`chain_id`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_id: Option<String>,
+    /// Only records for this tool (`tool`, for example `token.exchange`). Absent in headers
+    /// written before this member existed, which means unfiltered on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// Only records with this decision. Absent in headers written before this member
+    /// existed, which means unfiltered on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<Decision>,
 }
 
 impl RecordFilter {
     pub fn is_empty(&self) -> bool {
-        self.kind.is_none() && self.chain_id.is_none()
+        *self == Self::default()
     }
 
     /// Does `record` pass?
@@ -62,6 +74,8 @@ impl RecordFilter {
                 .chain_id
                 .as_ref()
                 .is_none_or(|c| record.chain_id.as_ref() == Some(c))
+            && self.tool.as_ref().is_none_or(|t| *t == record.tool)
+            && self.decision.as_ref().is_none_or(|d| *d == record.decision)
     }
 }
 
@@ -289,8 +303,8 @@ pub fn verify_export_with(
     if header.filter.is_some() {
         return Err(bad(
             "the export is filtered (its header has a `filter`), so its hash chain has gaps \
-             and nothing proves it is complete; verify an export taken without --kind and \
-             --chain-id, then filter that",
+             and nothing proves it is complete; verify an export taken without --kind, \
+             --chain-id, --tool or --decision, then filter that",
         ));
     }
     let first_seq = export.entries.first().map(|e| e.seq);
