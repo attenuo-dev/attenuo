@@ -238,6 +238,12 @@ async fn authenticate(
 /// A 401 that names only the stable reason code ([`AuthError::reason`]); the verifier's detail
 /// (wrong audience, unknown `kid`, ...) goes to the debug log, never to the client (SR-17).
 fn unauthorized(err: AuthError) -> Response {
+    unauthorized_recorded(err, None)
+}
+
+/// [`unauthorized`] for a refusal that was recorded in the audit log as `decision_id`
+/// ([`record_lease_refusal`]): the id goes in `X-Attenuo-Decision-Id` and `data.decision_id`.
+fn unauthorized_recorded(err: AuthError, decision_id: Option<Uuid>) -> Response {
     let reason = err.reason();
     if let AuthError::Unavailable(_) = &err {
         // A server-side limit, not a bad credential: 503, so the client keeps its token and
@@ -257,8 +263,11 @@ fn unauthorized(err: AuthError) -> Response {
     tracing::warn!(reason = ?reason, "request rejected: unauthenticated");
     // The detail can carry attacker-chosen text (an unknown `kid`): Debug-format it (SR-18).
     tracing::debug!(error = ?err.to_string(), "authentication failure detail");
-    let body = unauthorized_body(Value::Null, &err);
+    let body = unauthorized_body(Value::Null, &err, decision_id);
     let mut resp = json_response(StatusCode::UNAUTHORIZED, &body);
+    if let Some(id) = decision_id {
+        add_decision_header(&mut resp, &[id]);
+    }
     if let Ok(challenge) = HeaderValue::from_str(&err.challenge()) {
         resp.headers_mut()
             .insert(header::WWW_AUTHENTICATE, challenge);
@@ -266,15 +275,69 @@ fn unauthorized(err: AuthError) -> Response {
     resp
 }
 
-/// The JSON-RPC `-32001` error for `err`: `message` and `data.reason` carry the reason code.
-fn unauthorized_body(id: Value, err: &AuthError) -> Value {
+/// The JSON-RPC `-32001` error for `err`: `message` and `data.reason` carry the reason code,
+/// and `data.decision_id` the audit record of a recorded refusal.
+fn unauthorized_body(id: Value, err: &AuthError, decision_id: Option<Uuid>) -> Value {
     let reason = err.reason();
+    let mut data = serde_json::json!({ "reason": reason });
+    if let Some(d) = decision_id {
+        data["decision_id"] = Value::String(d.to_string());
+    }
     error_response(
         id,
         CODE_UNAUTHORIZED,
         format!("attenuo: unauthorized: {reason}"),
-        Some(serde_json::json!({ "reason": reason })),
+        Some(data),
     )
+}
+
+/// Record a request refused because the token's lease chain is no longer live (revoked,
+/// expired, unknown, or not checkable), when no per-call decision recorded it already: an
+/// `initialize`, `tools/list` or other undecided message, or a `GET`/`DELETE`. A client that
+/// opens a session per call (LangChain's MCP adapter) meets revocation here, never at a
+/// `tools/call`, and without this record the audit log would not show that it kept trying.
+///
+/// Only [`AuthError::LeaseInactive`] is recorded: the token verified (signature, audience,
+/// expiry, DPoP), so the record names a principal attenuo issued a token to. A token that
+/// fails verification stays a log line (SR-18): recording it would let anyone write to the
+/// audit log. `tool` is a fixed name (an allowlisted method or `http.<METHOD>`), never text
+/// from the request. Returns the record's id, or `None` when nothing was recorded.
+async fn record_lease_refusal(
+    state: &AppState,
+    who: &Authenticated,
+    server: &str,
+    session_id: Option<&str>,
+    tool: &'static str,
+    err: &AuthError,
+    now: OffsetDateTime,
+) -> Option<Uuid> {
+    let AuthError::LeaseInactive(reason) = err else {
+        return None;
+    };
+    let mut call =
+        ToolCall::new(server, tool, serde_json::json!({})).with_dpop_bound(who.dpop_bound);
+    if let Some(sid) = session_id {
+        call = call.with_session(session_tag(sid));
+    }
+    let id = state
+        .authorizer
+        .record_rejection(&who.chain, &call, reason, now)
+        .await;
+    tracing::warn!(reason = ?reason, tool, decision_id = %id, "request refused and recorded: lease inactive");
+    Some(id)
+}
+
+/// The fixed name a lease refusal of `method` is recorded under: the allowlisted method
+/// itself, or `http.POST` for a notification or a message without a method.
+fn refused_tool_name(method: Option<&str>) -> &'static str {
+    method
+        .and_then(|m| {
+            jsonrpc::PASSTHROUGH_METHODS
+                .iter()
+                .copied()
+                .find(|p| *p == m)
+        })
+        .unwrap_or("http.POST")
 }
 
 fn unknown_server(server: &str) -> Response {
@@ -651,7 +714,14 @@ async fn handle_passthrough(
     };
     let chain = who.chain.clone();
     if let Err(e) = state.authorizer.check_active(&chain, now).await {
-        return unauthorized(e);
+        let tool = if method == Method::DELETE {
+            "http.DELETE"
+        } else {
+            "http.GET"
+        };
+        let sid = session_id_of(&headers).ok().flatten();
+        let id = record_lease_refusal(&state, &who, &server, sid.as_deref(), tool, &e, now).await;
+        return unauthorized_recorded(e, id);
     }
     let session_id = match session_id_of(&headers) {
         Ok(s) => s,
@@ -746,6 +816,9 @@ struct Screened {
     /// Result of the lease check made for messages forwarded without a per-call decision;
     /// made at most once per HTTP request.
     lease_check: Option<Result<(), AuthError>>,
+    /// The audit record of a failed lease check ([`record_lease_refusal`]); at most one per
+    /// HTTP request.
+    lease_refusal: Option<Uuid>,
     /// Allowed mediated calls whose responses must be labelled before they are relayed
     /// (ADR-0009).
     results: Vec<PendingResult>,
@@ -887,7 +960,7 @@ async fn handle_post_inner(
     // authentication failure for the whole request.
     if !is_batch && screened.forward.is_empty() && screened.decision_ids.is_empty() {
         if let Some(Err(e)) = screened.lease_check.take() {
-            return unauthorized(e);
+            return unauthorized_recorded(e, screened.lease_refusal);
         }
     }
 
@@ -1131,14 +1204,14 @@ async fn screen_message(
     let Some(method) = method else {
         // A response to a server-initiated request, or something malformed: the upstream
         // decides. Still requires a live lease.
-        if lease_live(state, chain, &msg, now, out).await {
+        if lease_live(state, who, server, session_id, &msg, now, out).await {
             out.forward.push(msg);
         }
         return;
     };
 
     if is_passthrough_method(&method) {
-        if !lease_live(state, chain, &msg, now, out).await {
+        if !lease_live(state, who, server, session_id, &msg, now, out).await {
             return;
         }
         if let Some(kind) = ListKind::from_method(&method) {
@@ -1349,22 +1422,33 @@ async fn refuse_call(
 }
 
 /// Lease check for a message forwarded without a decision. On failure, a request gets a
-/// `-32001` reply and a notification is dropped; returns whether to forward.
+/// `-32001` reply and a notification is dropped; returns whether to forward. The first failure
+/// of an HTTP request is recorded ([`record_lease_refusal`]) under the method of the message
+/// that met it.
 async fn lease_live(
     state: &AppState,
-    chain: &DelegationChain,
+    who: &Authenticated,
+    server: &str,
+    session_id: Option<&str>,
     msg: &Value,
     now: OffsetDateTime,
     out: &mut Screened,
 ) -> bool {
     if out.lease_check.is_none() {
-        out.lease_check = Some(state.authorizer.check_active(chain, now).await);
+        let check = state.authorizer.check_active(&who.chain, now).await;
+        if let Err(e) = &check {
+            let tool = refused_tool_name(method_of(msg));
+            out.lease_refusal =
+                record_lease_refusal(state, who, server, session_id, tool, e, now).await;
+        }
+        out.lease_check = Some(check);
     }
     match out.lease_check.as_ref() {
         Some(Err(e)) => {
             tracing::warn!(reason = ?e.reason(), "request refused: lease inactive");
             if is_request(msg) {
-                out.replies.push(unauthorized_body(id_of(msg), e));
+                out.replies
+                    .push(unauthorized_body(id_of(msg), e, out.lease_refusal));
             }
             false
         }

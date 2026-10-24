@@ -1375,9 +1375,15 @@ impl Pipeline {
         Ok(entry.seq)
     }
 
-    /// Append a `deny` record for a request refused before any decision (for example the
-    /// proxy's `session_mismatch`). Returns the record id, which is not in the log if the
-    /// append failed.
+    /// Append a `deny` record for a request refused before any decision (the proxy's
+    /// `session_mismatch`, `invalid_name` and `tool_not_listed`, or a lease refusal of a
+    /// request that has no per-call decision, such as `initialize` on a revoked lease) and
+    /// count it in `decisions_total{decision="deny",reason}`, so every decision record in the
+    /// log is counted there. Returns the record id, which is not in the log if the append
+    /// failed.
+    ///
+    /// `reason` comes from a fixed set of codes (the proxy's constants and the lease reasons),
+    /// so the metric's label set stays small.
     pub fn record_rejection(
         &self,
         chain: &DelegationChain,
@@ -1385,6 +1391,7 @@ impl Pipeline {
         reason: &str,
         now: OffsetDateTime,
     ) -> Uuid {
+        self.metrics.decision("deny", reason);
         let record = DecisionRecord::new(now, Decision::Deny, reason, chain, call, Vec::new());
         let id = record.id;
         match self.metrics.time_audit_append(|| self.audit.append(record)) {
@@ -1846,6 +1853,10 @@ mod tests {
         assert_eq!(r.reason, "session_mismatch");
         assert_eq!(r.tool, "http.GET");
         assert_eq!(r.session_id.as_deref(), Some("abc123"));
+        // Every decision record is counted in decisions_total, recorded refusals too.
+        assert!(p.metrics().render().contains(
+            "attenuo_decisions_total{decision=\"deny\",reason=\"session_mismatch\"} 1\n"
+        ));
     }
 
     #[test]
