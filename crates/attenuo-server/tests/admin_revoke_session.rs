@@ -375,3 +375,34 @@ async fn the_session_selector_is_validated() {
         assert_eq!(v["error"], "invalid_request", "{body}");
     }
 }
+
+/// Session retention on the server: once alice's chain is revoked, a run of the pruner
+/// deletes her session's binding, counts it in `lease_sessions_pruned_total`, and leaves
+/// bob's (live) binding alone. Revoking by the pruned session then resolves to no chain,
+/// exactly as an unknown session does.
+#[tokio::test]
+async fn bindings_of_revoked_chains_are_pruned() {
+    let h = Harness::start().await;
+    let root = h.mint_root("alice").await;
+    let bob = h.mint_root("bob").await;
+    let sid = h.open(&root.token).await;
+    let bob_sid = h.open(&bob.token).await;
+    assert_eq!(attenuo_server::prune_session_bindings(&h.state).await, 0);
+
+    h.revoke("", json!({"chain_id": root.lease, "reason": "done"}))
+        .await;
+    assert_eq!(attenuo_server::prune_session_bindings(&h.state).await, 1);
+    let digest = |s: &str| session_digest(s);
+    assert!(h.state.leases.sessions(&digest(&sid)).unwrap().is_empty());
+    assert_eq!(h.state.leases.sessions(&digest(&bob_sid)).unwrap().len(), 1);
+    assert!(h
+        .state
+        .metrics
+        .render()
+        .contains("attenuo_lease_sessions_pruned_total 1\n"));
+
+    let v = h.revoke("?preview=true", json!({"session": sid})).await;
+    assert_eq!(v["matched_count"], 0);
+    assert_eq!(v["selector"]["chain_ids"], json!([]));
+    assert_eq!(h.ping(&bob.token, &bob_sid).await.0, StatusCode::OK);
+}

@@ -185,6 +185,71 @@ pub fn spawn_checkpointer(
     })
 }
 
+/// How often the session pruner runs ([`spawn_session_pruner`]).
+pub const SESSION_PRUNE_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Session bindings one pruning pass looks at (and so deletes at most): one short write
+/// transaction each.
+pub const SESSION_PRUNE_BATCH: usize = 1_000;
+
+/// Most passes in one run of the pruner, so one run looks at no more than
+/// `SESSION_PRUNE_BATCH * SESSION_PRUNE_MAX_PASSES` bindings (100,000) before it waits for the
+/// next period.
+pub const SESSION_PRUNE_MAX_PASSES: usize = 100;
+
+/// One run of session retention (`[leases] session_retention_seconds`): pruning passes of
+/// [`SESSION_PRUNE_BATCH`] bindings, each its own write transaction on the blocking pool,
+/// until a pass reaches the end of the table or [`SESSION_PRUNE_MAX_PASSES`] have run. The
+/// next run continues where this one stopped. Counts every deleted binding in
+/// `lease_sessions_pruned_total` and returns how many it deleted; 0 when retention is off.
+pub async fn prune_session_bindings(state: &Arc<AppState>) -> u64 {
+    let Some(retention) = state.session_retention else {
+        return 0;
+    };
+    let mut total = 0;
+    for _ in 0..SESSION_PRUNE_MAX_PASSES {
+        let now = time::OffsetDateTime::now_utc();
+        let pass = state
+            .blocking(move |s| {
+                use attenuo_audit::LeaseStore;
+                s.leases.prune_sessions(now, retention, SESSION_PRUNE_BATCH)
+            })
+            .await;
+        match pass {
+            Ok(pass) => {
+                state.metrics.lease_sessions_pruned(pass.pruned);
+                total += pass.pruned;
+                if pass.wrapped {
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "pruning session bindings failed");
+                break;
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    if total > 0 {
+        tracing::info!(pruned = total, "pruned session bindings of ended chains");
+    }
+    total
+}
+
+/// Start the session pruner: [`prune_session_bindings`] every [`SESSION_PRUNE_PERIOD`].
+/// Dropping the handle does not stop it; abort it to stop.
+pub fn spawn_session_pruner(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(SESSION_PRUNE_PERIOD);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await; // the first tick is immediate
+        loop {
+            tick.tick().await;
+            prune_session_bindings(&state).await;
+        }
+    })
+}
+
 /// How long `[audit.sink]` keeps delivering queued checkpoints after a shutdown signal.
 pub const SINK_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -198,6 +263,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     tracing::info!(addr = %listener.local_addr()?, upstreams = config.upstreams.len(), "attenuo server listening");
     let checkpoint_task = (!state.checkpoint_interval.is_zero())
         .then(|| spawn_checkpointer(state.clone(), state.checkpoint_interval));
+    let prune_task = state
+        .session_retention
+        .is_some()
+        .then(|| spawn_session_pruner(state.clone()));
     let metrics_task = if config.metrics.enabled {
         let l = tokio::net::TcpListener::bind(config.metrics.listen).await?;
         tracing::info!(addr = %l.local_addr()?, "metrics listening (unauthenticated)");
@@ -226,6 +295,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         t.abort();
     }
     if let Some(t) = checkpoint_task {
+        t.abort();
+    }
+    if let Some(t) = prune_task {
         t.abort();
     }
     // Give checkpoints still queued for `[audit.sink]` a moment to leave the host.
