@@ -15,6 +15,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 ### Evaluation
 
 - First run of the injection suite's `attenuo_labels` arm (output labelling phase 1, server from `ed3a769`): attack calls allowed without approval 1/60 dev and 1/38 test, both reads, against 10/60 and 7/38 for the `attenuo` arm; benign calls gated 18/69 and 2/29. Gated calls were counted, not retried, because the approval endpoints are not built yet. Results in `evaluation/injection-suite/results/2026-10-24-labels-v1.md`.
+- The injection-suite runner now answers gated calls in the `attenuo_labels` arm: the scripted approver grants (benign) or declines (attack) through `POST /admin/approvals/{id}`, a granted call is retried once, and the result records `after_approval`; a retry that gets `-32008` again or does not consume its approval fails the run. Second run (`results/2026-10-24-labels-v2.md`): first-pass outcomes as in the first run in all six arms, 0 attack calls approved, gated benign calls completed after approval 18/18 dev and 2/2 test.
 
 ### Performance
 
