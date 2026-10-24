@@ -31,8 +31,8 @@ use crate::checkpoint::{
 use crate::error::AuditError;
 use crate::export::RecordFilter;
 use crate::lease::{
-    ancestors_of, breadth_first, classify, LeaseRow, LeaseSelector, LeaseStatus, LeaseStore,
-    LeaseSubtree, RunLabel, SelectorRevocation, SessionBinding,
+    ancestors_of, breadth_first, classify, session_prunable, LeaseRow, LeaseSelector, LeaseStatus,
+    LeaseStore, LeaseSubtree, RunLabel, SelectorRevocation, SessionBinding, SessionPrune,
 };
 use crate::log::{
     canonical_record_json, entry_hash_from_json, verify_entries, AuditEntry, AuditSink,
@@ -2421,6 +2421,9 @@ pub struct SqliteLeaseStore {
     value_key: ValueKey,
     /// The key span-index fingerprints are hashed under (`budget_meta`, ADR-0009 phase 2).
     span_key: SpanKey,
+    /// The `rowid` of the last `lease_sessions` row a `prune_sessions` pass looked at; 0 to
+    /// start from the first.
+    session_cursor: Mutex<i64>,
     /// Tests: every charge commit and the `synchronous` level it ran at.
     #[cfg(test)]
     probe: Option<Arc<Mutex<Vec<String>>>>,
@@ -2473,6 +2476,7 @@ impl SqliteLeaseStore {
             gate,
             value_key: ValueKey::new(&key),
             span_key: SpanKey::new(&span_key),
+            session_cursor: Mutex::new(0),
             #[cfg(test)]
             probe: None,
         })
@@ -3359,6 +3363,62 @@ impl LeaseStore for SqliteLeaseStore {
     fn sessions(&self, session: &str) -> Result<Vec<SessionBinding>, AuditError> {
         let conn = self.conn.lock()?;
         sessions_in(&conn, session)
+    }
+
+    fn prune_sessions(
+        &self,
+        now: OffsetDateTime,
+        retention: time::Duration,
+        max_rows: usize,
+    ) -> Result<SessionPrune, AuditError> {
+        let max_rows = max_rows.max(1);
+        let _gate = self.gate.hold();
+        let mut conn = self.conn.lock()?;
+        let mut cursor = self.session_cursor.lock()?;
+        // One write transaction from the read on: a renewal cannot revive a chain between the
+        // classification and the delete.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        type Seen = (i64, Option<String>, Option<String>);
+        let seen: Vec<Seen> = tx
+            .prepare_cached(
+                "SELECT s.rowid, l.expires_at, l.revoked_at FROM lease_sessions s \
+                 LEFT JOIN leases l ON l.id = s.chain_id \
+                 WHERE s.rowid > ?1 ORDER BY s.rowid LIMIT ?2",
+            )?
+            .query_map(
+                params![*cursor, i64::try_from(max_rows).unwrap_or(i64::MAX)],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?
+            .collect::<Result<_, _>>()?;
+        let mut pruned = 0;
+        {
+            let mut delete = tx.prepare_cached("DELETE FROM lease_sessions WHERE rowid = ?1")?;
+            for (rowid, expires_at, revoked_at) in &seen {
+                let root = match expires_at {
+                    None => None,
+                    Some(at) => Some(LeaseRow {
+                        parent: None,
+                        expires_at: parse_time(at)?,
+                        revoked_at: revoked_at.as_deref().map(parse_time).transpose()?,
+                        revoke_reason: None,
+                    }),
+                };
+                if session_prunable(root.as_ref(), now, retention) {
+                    pruned += delete.execute([rowid])? as u64;
+                }
+            }
+        }
+        tx.commit()?;
+        let wrapped = seen.len() < max_rows;
+        *cursor = match seen.last() {
+            Some((rowid, _, _)) if !wrapped => *rowid,
+            _ => 0,
+        };
+        Ok(SessionPrune {
+            examined: seen.len() as u64,
+            pruned,
+            wrapped,
+        })
     }
 
     fn preview_selected(&self, selector: &LeaseSelector) -> Result<SelectorRevocation, AuditError> {

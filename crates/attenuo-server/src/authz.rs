@@ -3356,6 +3356,14 @@ mod run_lock_tests {
         fn sessions(&self, s: &str) -> Result<Vec<attenuo_audit::SessionBinding>, AuditError> {
             self.inner.sessions(s)
         }
+        fn prune_sessions(
+            &self,
+            n: OffsetDateTime,
+            r: time::Duration,
+            m: usize,
+        ) -> Result<attenuo_audit::SessionPrune, AuditError> {
+            self.inner.prune_sessions(n, r, m)
+        }
         fn preview_selected(
             &self,
             s: &attenuo_audit::LeaseSelector,

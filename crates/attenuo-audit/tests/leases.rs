@@ -987,3 +987,133 @@ fn sqlite_store_from_before_sessions_gains_the_table_at_open() {
     let out = s.revoke_selected(&session(S1), "x", t0()).unwrap();
     assert_eq!(ids_of(&out.revoked), ["bchild", "broot"]);
 }
+
+/// The default `[leases] session_retention_seconds`: a day.
+const GRACE: Duration = Duration::hours(24);
+
+/// Run `prune_sessions` passes of `batch` until one wraps; the total pruned.
+fn prune_all(s: &dyn LeaseStore, now: time::OffsetDateTime, batch: usize) -> u64 {
+    let mut pruned = 0;
+    for _ in 0..10_000 {
+        let pass = s.prune_sessions(now, GRACE, batch).unwrap();
+        assert!(pass.examined <= batch as u64 && pass.pruned <= pass.examined);
+        pruned += pass.pruned;
+        if pass.wrapped {
+            return pruned;
+        }
+    }
+    panic!("no pass wrapped");
+}
+
+/// Retention keeps a binding while its chain may be used: a live chain's binding stays; a
+/// revoked chain's goes at the next pass; an expired chain's goes only once it has been
+/// expired for longer than the grace period, measured from the root lease's expiry as
+/// renewals leave it. A pruned session resolves to no chain, exactly like a session that was
+/// never recorded.
+#[test]
+fn session_bindings_are_pruned_only_once_their_chain_is_over() {
+    for (name, s) in stores() {
+        two_users(s.as_ref());
+        // root: live. broot: revoked. legacy: live now, expires at t0 + 1 h.
+        s.record_session(S1, "github", &id("root"), t0()).unwrap();
+        s.record_session(S2, "github", &id("broot"), t0()).unwrap();
+        s.record_session(S2, "fs", &id("legacy"), t0()).unwrap();
+        s.revoke(&id("broot"), "stolen", t0()).unwrap();
+
+        assert_eq!(prune_all(s.as_ref(), t0(), 100), 1, "{name}");
+        assert_eq!(s.sessions(S1).unwrap().len(), 1, "{name}: live chain kept");
+        let left: Vec<String> = s
+            .sessions(S2)
+            .unwrap()
+            .into_iter()
+            .map(|b| b.server)
+            .collect();
+        assert_eq!(left, ["fs"], "{name}: revoked chain pruned, live one kept");
+
+        // Expired, but not for longer than the grace period: kept.
+        let expired = t0() + Duration::hours(1);
+        let at_grace = expired + GRACE;
+        assert_eq!(prune_all(s.as_ref(), at_grace, 100), 0, "{name}");
+        assert_eq!(s.sessions(S2).unwrap().len(), 1, "{name}");
+        // Renewed in time: the grace period runs from the new expiry.
+        let renewed = expired + Duration::hours(2);
+        s.renew(&id("legacy"), renewed, at_grace).unwrap();
+        s.renew(&id("root"), renewed, at_grace).unwrap();
+        let after = at_grace + Duration::minutes(30);
+        assert_eq!(prune_all(s.as_ref(), after, 100), 0, "{name}: renewed");
+        // Expired for longer than the grace period: pruned, unless renewed even then.
+        let past = renewed + GRACE + Duration::seconds(1);
+        s.renew(&id("root"), past + Duration::hours(1), past)
+            .unwrap();
+        assert_eq!(prune_all(s.as_ref(), past, 100), 1, "{name}");
+        assert_eq!(s.sessions(S2).unwrap(), Vec::new(), "{name}");
+        assert_eq!(
+            s.sessions(S1).unwrap().len(),
+            1,
+            "{name}: renewed root kept"
+        );
+
+        // A pruned session matches nothing, as an unknown one does.
+        assert_eq!(
+            s.preview_selected(&session(S2)).unwrap(),
+            Default::default(),
+            "{name}"
+        );
+        assert_eq!(
+            s.revoke_selected(&session(S2), "x", past).unwrap(),
+            Default::default(),
+            "{name}"
+        );
+    }
+}
+
+/// One pass looks at no more than its batch of bindings and continues where the previous one
+/// stopped, so a large table is pruned in bounded steps and every binding is reached.
+#[test]
+fn session_prune_passes_are_bounded_and_resume() {
+    for (name, s) in stores() {
+        two_users(s.as_ref());
+        s.revoke(&id("broot"), "done", t0()).unwrap();
+        // 25 bindings of the revoked chain between 25 of the live one.
+        for n in 0..50 {
+            let chain = if n % 2 == 0 { "root" } else { "broot" };
+            s.record_session(&format!("{n:064}"), "github", &id(chain), t0())
+                .unwrap();
+        }
+        let mut passes = Vec::new();
+        loop {
+            let pass = s.prune_sessions(t0(), GRACE, 7).unwrap();
+            assert!(pass.examined <= 7, "{name}: {pass:?}");
+            passes.push(pass);
+            if pass.wrapped {
+                break;
+            }
+        }
+        let examined: u64 = passes.iter().map(|p| p.examined).sum();
+        let pruned: u64 = passes.iter().map(|p| p.pruned).sum();
+        assert_eq!((examined, pruned), (50, 25), "{name}: {passes:?}");
+        assert_eq!(passes.len(), 8, "{name}: 7 full passes, then 1 binding");
+        for n in 0..50 {
+            let left = s.sessions(&format!("{n:064}")).unwrap().len();
+            assert_eq!(left, usize::from(n % 2 == 0), "{name} {n}");
+        }
+        // The next sweep starts from the first binding again and finds nothing more.
+        assert_eq!(prune_all(s.as_ref(), t0(), 7), 0, "{name}");
+    }
+}
+
+/// A binding whose chain's root lease the store does not know (a store that lost the row) is
+/// pruned: an unknown lease is inactive.
+#[test]
+fn a_session_of_an_unknown_chain_is_pruned() {
+    let s = SqliteLeaseStore::open_in_memory().unwrap();
+    two_users(&s);
+    s.record_session(S1, "github", &id("legacy"), t0()).unwrap();
+    s.with_connection(|c| {
+        c.execute("DELETE FROM leases WHERE id = 'legacy'", [])?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(prune_all(&s, t0(), 10), 1);
+    assert_eq!(s.sessions(S1).unwrap(), Vec::new());
+}

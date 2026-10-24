@@ -123,6 +123,21 @@ pub trait LeaseStore: Send + Sync {
     /// `session`, ordered by server; empty for an unknown session.
     fn sessions(&self, session: &str) -> Result<Vec<SessionBinding>, AuditError>;
 
+    /// One pass of session retention: look at up to `max_rows` session bindings, in the order
+    /// they were recorded and continuing after the last binding the previous pass looked at,
+    /// and delete those [`session_prunable`] at `now` with `retention` as the grace period.
+    /// When a pass reaches the last binding it reports `wrapped`, and the next pass starts
+    /// from the first again. One transaction per pass, so a pass never deletes a binding whose
+    /// chain a concurrent renewal has just revived. A pruned session resolves to no chain,
+    /// like a session that was never recorded: [`LeaseSelector::Session`] matches nothing and
+    /// [`sessions`](Self::sessions) is empty.
+    fn prune_sessions(
+        &self,
+        now: OffsetDateTime,
+        retention: time::Duration,
+        max_rows: usize,
+    ) -> Result<SessionPrune, AuditError>;
+
     /// What [`revoke_selected`](Self::revoke_selected) would do now, without writing:
     /// `matched` is every unrevoked lease the selector names, `revoked` every unrevoked lease
     /// a revocation would change (the matches and their descendants). Read in one
@@ -357,6 +372,35 @@ pub struct SessionBinding {
     pub chain_id: LeaseId,
     /// When the proxy bound it.
     pub bound_at: OffsetDateTime,
+}
+
+/// What one [`LeaseStore::prune_sessions`] pass did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SessionPrune {
+    /// Bindings the pass looked at (at most its `max_rows`).
+    pub examined: u64,
+    /// Bindings it deleted.
+    pub pruned: u64,
+    /// The pass reached the last binding; the next one starts from the first.
+    pub wrapped: bool,
+}
+
+/// Whether a session binding may be deleted, given the row of its chain's root lease: the
+/// root is revoked (a revoked lease is never renewed, so the chain can never be used again),
+/// has been expired for longer than `retention` (an expired lease can be renewed while its
+/// token is valid, so the grace period must cover the longest token lifetime the issuer
+/// grants), or is unknown (a store that lost the row; an unknown lease is inactive). A
+/// binding whose root is live, or expired within the grace period, is kept, so revoking by
+/// session keeps working for every session that is or may again be in use.
+pub fn session_prunable(
+    root: Option<&LeaseRow>,
+    now: OffsetDateTime,
+    retention: time::Duration,
+) -> bool {
+    match root {
+        None => true,
+        Some(row) => row.revoked_at.is_some() || row.expires_at.saturating_add(retention) < now,
+    }
 }
 
 /// The result of [`LeaseStore::revoke_selected`] or [`LeaseStore::preview_selected`].
@@ -598,6 +642,9 @@ pub struct MemoryLeaseStore {
     subjects: Mutex<BTreeMap<LeaseId, String>>,
     /// Session bindings by `(session digest, server)` (`record_session`).
     sessions: Mutex<BTreeMap<(String, String), (LeaseId, OffsetDateTime)>>,
+    /// The last session binding a `prune_sessions` pass looked at; `None` to start from the
+    /// first.
+    session_cursor: Mutex<Option<(String, String)>>,
     /// Per run, the first label of each source.
     labels: Mutex<BTreeMap<LeaseId, BTreeMap<String, RunLabel>>>,
     /// Per run, the span index (ADR-0009 phase 2).
@@ -929,6 +976,47 @@ impl LeaseStore for MemoryLeaseStore {
                 bound_at: *bound_at,
             })
             .collect())
+    }
+
+    fn prune_sessions(
+        &self,
+        now: OffsetDateTime,
+        retention: time::Duration,
+        max_rows: usize,
+    ) -> Result<SessionPrune, AuditError> {
+        use std::ops::Bound;
+        let max_rows = max_rows.max(1);
+        // The lock order of `record_session`: rows, then sessions.
+        let rows = self.rows.lock()?;
+        let mut sessions = self.sessions.lock()?;
+        let mut cursor = self.session_cursor.lock()?;
+        let start = match cursor.take() {
+            Some(key) => Bound::Excluded(key),
+            None => Bound::Unbounded,
+        };
+        let seen: Vec<((String, String), bool)> = sessions
+            .range((start, Bound::Unbounded))
+            .take(max_rows)
+            .map(|(key, (chain, _))| {
+                let prunable = session_prunable(rows.get(chain), now, retention);
+                (key.clone(), prunable)
+            })
+            .collect();
+        let wrapped = seen.len() < max_rows;
+        if !wrapped {
+            *cursor = seen.last().map(|(key, _)| key.clone());
+        }
+        let mut pruned = 0;
+        for (key, prunable) in &seen {
+            if *prunable && sessions.remove(key).is_some() {
+                pruned += 1;
+            }
+        }
+        Ok(SessionPrune {
+            examined: seen.len() as u64,
+            pruned,
+            wrapped,
+        })
     }
 
     fn preview_selected(&self, selector: &LeaseSelector) -> Result<SelectorRevocation, AuditError> {

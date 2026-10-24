@@ -98,6 +98,8 @@ pub struct Metrics {
     tokens_root: AtomicU64,
     tokens_exchange: AtomicU64,
     leases_revoked: AtomicU64,
+    /// Session bindings deleted by retention (`[leases] session_retention_seconds`).
+    lease_sessions_pruned: AtomicU64,
     audit_append_errors: AtomicU64,
     audit_checkpoints: AtomicU64,
     /// `[audit.sink]` (SR-21): checkpoints delivered, delivery attempts that failed,
@@ -148,6 +150,7 @@ impl Default for Metrics {
             tokens_root: AtomicU64::default(),
             tokens_exchange: AtomicU64::default(),
             leases_revoked: AtomicU64::default(),
+            lease_sessions_pruned: AtomicU64::default(),
             audit_append_errors: AtomicU64::default(),
             audit_checkpoints: AtomicU64::default(),
             audit_sink_delivered: AtomicU64::default(),
@@ -278,6 +281,11 @@ impl Metrics {
     /// Count leases that changed to revoked.
     pub fn leases_revoked(&self, n: u64) {
         self.leases_revoked.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Count session bindings deleted by retention.
+    pub fn lease_sessions_pruned(&self, n: u64) {
+        self.lease_sessions_pruned.fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn audit_append_error(&self) {
@@ -455,6 +463,13 @@ impl Metrics {
             "leases_revoked_total",
             "Leases moved to revoked, including cascaded descendants.",
             &self.leases_revoked,
+        );
+        simple_counter(
+            &mut out,
+            "lease_sessions_pruned_total",
+            "Session bindings (revoke by session) deleted because their chain was revoked or \
+             expired longer ago than the retention period.",
+            &self.lease_sessions_pruned,
         );
         simple_counter(
             &mut out,
@@ -953,6 +968,7 @@ mod tests {
         assert!(text.contains("attenuo_tokens_issued_total{kind=\"root\"} 1\n"));
         assert!(text.contains("attenuo_tokens_issued_total{kind=\"exchange\"} 0\n"));
         assert!(text.contains("attenuo_leases_revoked_total 3\n"));
+        assert!(text.contains("attenuo_lease_sessions_pruned_total 0\n"));
         assert!(text.contains("attenuo_audit_append_errors_total 1\n"));
         assert!(text.contains("attenuo_http_requests_total{route=\"/token\",status=\"200\"} 1\n"));
         assert!(text.contains("authorize_duration_seconds_bucket{le=\"0.0005\"} 1\n"));
