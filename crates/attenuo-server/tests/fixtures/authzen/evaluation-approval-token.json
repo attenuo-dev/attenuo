@@ -1,0 +1,129 @@
+{
+  "_note": "AuthZEN 1.0 sections 5.4 and 5.5.1 (context in request and response, here as an extension for approvals, ADR-0009): a call gated by @obligation(\"approval\") answers decision false with reason approval_required, call_hash, approval_id and expires_at; after an operator grant, the same request with the grant's signed token in context.approval_token is allowed once, and replaying the token is approval_invalid.",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/evaluation",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "delete_repo"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/delete_repo",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "repo": "alice/site"
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "decision": false,
+          "context": {
+            "reason": "approval_required",
+            "policy_ids": [
+              "confirm_deletes"
+            ],
+            "diagnostics": [],
+            "decision_id": "<decision_id>",
+            "call_hash": "<call_hash>",
+            "approval_id": "<approval_id>",
+            "expires_at": "<expires_at>"
+          }
+        }
+      }
+    },
+    {
+      "path": "/access/v1/evaluation",
+      "grant_previous_approval": true,
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "delete_repo"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/delete_repo",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "repo": "alice/site"
+          },
+          "approval_token": "$approval_token"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "decision": true,
+          "context": {
+            "reason": "policy_allow",
+            "policy_ids": [
+              "deletes"
+            ],
+            "diagnostics": [],
+            "decision_id": "<decision_id>",
+            "approval": {
+              "id": "<approval_id>",
+              "by": "operator",
+              "presented": "token"
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "/access/v1/evaluation",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "delete_repo"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/delete_repo",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "repo": "alice/site"
+          },
+          "approval_token": "$approval_token"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "decision": false,
+          "context": {
+            "reason": "approval_invalid",
+            "policy_ids": [],
+            "diagnostics": [],
+            "decision_id": "<decision_id>"
+          }
+        }
+      }
+    }
+  ]
+}

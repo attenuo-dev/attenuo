@@ -1,0 +1,17 @@
+{
+  "_note": "AuthZEN 1.0 sections 10.1.1 and 10.1.2: a body that is not JSON is 400 Bad Request. Attenuo's error body is the JSON object {error, detail}, not a bare string (see docs/reference/authzen.md).",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/evaluation",
+      "raw_body": "{\"subject\": ",
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "invalid_request",
+          "detail": "<any>"
+        }
+      }
+    }
+  ]
+}

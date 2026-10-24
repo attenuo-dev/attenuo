@@ -1,0 +1,79 @@
+{
+  "_note": "AuthZEN 1.0 section 7.2.1: an entry that cannot be evaluated defaults to closed (decision false) and carries the error in its context, here as context.error {status, code, message} after the spec's non-normative {status, message} example; the other entries are still decided.",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/evaluations",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "evaluations": [
+          {
+            "context": {
+              "input": {
+                "repo": "alice/public-a"
+              }
+            }
+          },
+          {
+            "subject": {
+              "type": "user",
+              "id": "alice"
+            }
+          },
+          "not an object"
+        ]
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "evaluations": [
+            {
+              "decision": true,
+              "context": {
+                "reason": "policy_allow",
+                "policy_ids": [
+                  "public_reads"
+                ],
+                "diagnostics": [],
+                "decision_id": "<decision_id>"
+              }
+            },
+            {
+              "decision": false,
+              "context": {
+                "error": {
+                  "status": 400,
+                  "code": "invalid_request",
+                  "message": "policy parse error: authzen: subject.type must be `agent`, got `user`"
+                }
+              }
+            },
+            {
+              "decision": false,
+              "context": {
+                "error": {
+                  "status": 400,
+                  "code": "invalid_request",
+                  "message": "each evaluation must be an object"
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

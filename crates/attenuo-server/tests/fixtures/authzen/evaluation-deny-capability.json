@@ -1,0 +1,46 @@
+{
+  "_note": "AuthZEN 1.0 sections 5.5 and 10.1: a deny is 200 with decision false, never an HTTP error. Here the token's capabilities (github:read_file only) do not cover the tool, so the capability stage denies before Cedar runs (reason capability_denied, no policy ids).",
+  "token": {
+    "capabilities": [
+      "github:read_file"
+    ]
+  },
+  "steps": [
+    {
+      "path": "/access/v1/evaluation",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "create_issue"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/create_issue",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "repo": "alice/public-site"
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "decision": false,
+          "context": {
+            "reason": "capability_denied",
+            "policy_ids": [],
+            "diagnostics": [],
+            "decision_id": "<decision_id>"
+          }
+        }
+      }
+    }
+  ]
+}

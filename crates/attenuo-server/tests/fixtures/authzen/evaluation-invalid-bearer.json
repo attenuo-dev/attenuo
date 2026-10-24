@@ -1,0 +1,41 @@
+{
+  "_note": "AuthZEN 1.0 section 10.1.2: a bearer that does not verify is 401 Unauthorized with error_description invalid_token; why it failed is never returned.",
+  "steps": [
+    {
+      "path": "/access/v1/evaluation",
+      "auth": "Bearer not-a-token",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "repo": "alice/public-site"
+          }
+        }
+      },
+      "expect": {
+        "status": 401,
+        "headers": {
+          "www-authenticate": "Bearer realm=\"attenuo\""
+        },
+        "body": {
+          "error": "unauthorized",
+          "detail": "<any>",
+          "error_description": "invalid_token"
+        }
+      }
+    }
+  ]
+}

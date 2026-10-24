@@ -1,0 +1,180 @@
+{
+  "_note": "AuthZEN 1.0 section 10.1.3: when the request carries X-Request-ID the PDP MUST return the same value, on success and on errors alike, for both evaluation endpoints; without one, none is added.",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/evaluation",
+      "headers": {
+        "x-request-id": "conformance-1"
+      },
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "repo": "alice/public-site"
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "decision": true,
+          "context": {
+            "reason": "policy_allow",
+            "policy_ids": [
+              "public_reads"
+            ],
+            "diagnostics": [],
+            "decision_id": "<decision_id>"
+          }
+        },
+        "headers": {
+          "x-request-id": "conformance-1"
+        }
+      }
+    },
+    {
+      "path": "/access/v1/evaluation",
+      "auth": "none",
+      "headers": {
+        "x-request-id": "conformance-2"
+      },
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {}
+        }
+      },
+      "expect": {
+        "status": 401,
+        "headers": {
+          "x-request-id": "conformance-2"
+        },
+        "body": {
+          "error": "unauthorized",
+          "detail": "<any>",
+          "error_description": "missing_token"
+        }
+      }
+    },
+    {
+      "path": "/access/v1/evaluations",
+      "headers": {
+        "x-request-id": "conformance-3"
+      },
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "evaluations": [
+          {
+            "context": {
+              "input": {
+                "repo": "alice/public-a"
+              }
+            }
+          }
+        ]
+      },
+      "expect": {
+        "status": 200,
+        "headers": {
+          "x-request-id": "conformance-3"
+        },
+        "body": {
+          "evaluations": [
+            {
+              "decision": true,
+              "context": {
+                "reason": "policy_allow",
+                "policy_ids": [
+                  "public_reads"
+                ],
+                "diagnostics": [],
+                "decision_id": "<decision_id>"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "path": "/access/v1/evaluation",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "repo": "alice/public-site"
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "decision": true,
+          "context": {
+            "reason": "policy_allow",
+            "policy_ids": [
+              "public_reads"
+            ],
+            "diagnostics": [],
+            "decision_id": "<decision_id>"
+          }
+        },
+        "headers": {
+          "x-request-id": null
+        }
+      }
+    }
+  ]
+}

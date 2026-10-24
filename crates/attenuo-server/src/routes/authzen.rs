@@ -77,8 +77,9 @@ pub async fn evaluation(
 /// `resource` and `context` are defaults; each entry of `evaluations` may replace any of them.
 /// Every entry is decided and audited exactly like a single evaluation, in order.
 ///
-/// At most `[authzen] max_batch` entries (400 `batch_too_large` beyond that, 400
-/// `invalid_request` for none). Only the default `execute_all` semantic is supported. An
+/// At most `[authzen] max_batch` entries (400 `batch_too_large` beyond that). Without
+/// `evaluations` (absent or an empty array) the request is a single evaluation and gets a
+/// single `{decision, context}` answer (AuthZEN 1.0 section 7.1). Only the default `execute_all` semantic is supported. An
 /// authentication failure refuses the whole request; any other per-entry failure answers
 /// `decision: false` with `context.error` for that entry.
 // The `Err` is a full response, built once per refused request; boxing it buys nothing.
@@ -108,7 +109,8 @@ fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
     };
     let items = match obj.remove("evaluations") {
         Some(Value::Array(items)) => items,
-        _ => {
+        None => Vec::new(),
+        Some(_) => {
             return Err(ApiError::bad_request(
                 "invalid_request",
                 "`evaluations` must be an array",
@@ -116,10 +118,12 @@ fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
         }
     };
     if items.is_empty() {
-        return Err(ApiError::bad_request(
-            "invalid_request",
-            "`evaluations` must not be empty",
-        ));
+        // AuthZEN 1.0 section 7.1: without `evaluations` (absent or empty) the request behaves
+        // as a single Access Evaluation request, and so does its answer.
+        obj.remove("options");
+        let bearer = bearer_auth(state, headers, "/access/v1/evaluations")?;
+        let r = evaluate_value(state, headers, bearer.as_ref(), raw)?;
+        return serde_json::to_value(r).map_err(ApiError::internal);
     }
     // Refuse before any evaluation runs, so an oversized batch writes nothing to the audit log.
     if items.len() > state.authzen_max_batch {
@@ -176,6 +180,26 @@ fn item_error(e: &ApiError) -> Value {
         "decision": false,
         "context": { "error": { "status": e.status.as_u16(), "code": e.code, "message": e.detail } },
     })
+}
+
+/// The request identifier header of the AuthZEN HTTPS binding (AuthZEN 1.0 section 10.1.3).
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Middleware for the AuthZEN routes: a request that carries `X-Request-ID` gets the same value
+/// back on its response, whatever the status (AuthZEN 1.0 section 10.1.3: the PDP MUST echo
+/// it). Only the first value is echoed; a header value cannot hold a line break, so it cannot
+/// split the response.
+pub async fn echo_request_id(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let id = req.headers().get(REQUEST_ID_HEADER).cloned();
+    let mut resp = next.run(req).await;
+    if let Some(id) = id {
+        resp.headers_mut()
+            .insert(header::HeaderName::from_static(REQUEST_ID_HEADER), id);
+    }
+    resp
 }
 
 fn with_challenge(mut resp: Response) -> Response {

@@ -1,0 +1,32 @@
+{
+  "_note": "AuthZEN 1.0 section 6.1: action is REQUIRED. A request without it is 400 Bad Request with error invalid_request.",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/evaluation",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {}
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "invalid_request",
+          "detail": "<any>"
+        }
+      }
+    }
+  ]
+}
