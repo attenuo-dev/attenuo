@@ -21,13 +21,14 @@ clippy:
 test:
     cargo test --workspace
 
-# the GitHub MCP leak demo, end to end
+# the GitHub MCP leak demo and the multi-hop delegation demo, end to end
 demo:
     bash examples/github-leak-demo/run.sh
+    bash examples/multi-hop-demo/run.sh
 
-# the demo's Cedar policy tests, offline
+# the demos' Cedar policy tests, offline
 policy:
-    cargo run -q -p attenuo-cli -- policy test examples/github-leak-demo/policy_test.yaml
+    cargo run -q -p attenuo-cli -- policy test examples/github-leak-demo/policy_test.yaml examples/multi-hop-demo/policy_test.yaml
 
 # rustdoc with warnings as errors
 docs:
