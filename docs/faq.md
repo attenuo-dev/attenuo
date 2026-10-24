@@ -28,7 +28,7 @@ attenuo is the part that answers those questions. It can sit behind a gateway as
 
 Those two answer "who or what is this workload, and may it reach this system?". Teleport is an identity-aware access layer for infrastructure and issues short-lived credentials to people and machines. SPIRE issues cryptographic identities (SVIDs) to workloads. Both identify the caller.
 
-attenuo answers a different question: "this caller is acting for Alice, through two other agents, with this much of Alice's authority, and may it make this call with these arguments right now?". The two layers fit together. SPIRE or similar could identify each agent, which would fix a gap in v0: the `actor` of an exchange is a name the caller asserts, not proven (see [known limits](design/server.md#known-limits-v0)). That integration is not built. Whether Teleport enforces at the level of an individual MCP tool call, we do not know.
+attenuo answers a different question: "this caller is acting for Alice, through two other agents, with this much of Alice's authority, and may it make this call with these arguments right now?". The two layers fit together. SPIRE or similar could identify each agent, which would fix a gap in v0: the `actor` of an exchange is a name the caller asserts, not proven (see [known limits](design/server.md#known-limits-v0)). That integration is not built. Teleport's MCP Access does enforce per tool: roles list the tools a user or bot may call, by name, glob or regex. Its docs do not describe checks on a call's arguments or a narrowing chain across agents; its Delegated Identity for agents is in public beta. Details and sources are in the [comparison](comparison.md#product-notes) (checked 2026-10-24).
 
 ## How is it different from OpenFGA, SpiceDB, Cerbos or OPA?
 
@@ -40,7 +40,7 @@ What an engine does not give you is everything around the question. It does not 
 
 Managed agent-governance products, from Microsoft (Entra Agent ID, Agent 365), Okta and Auth0, and others, give you agent identity, registries, policy and reporting inside a vendor's platform and tied to that vendor's identity system. As we understand them, they are hosted services.
 
-attenuo is self-hosted, open source (Apache-2.0) and neutral about the IdP: it takes OIDC ID tokens from Keycloak, Okta, Entra, Google and others. It enforces at the tool call, not only at sign-in. You can run both: let the vendor own agent identity and registration, and let attenuo be the monitor in front of the tools. Which of these products enforce per tool call, or revoke in flight, we could not confirm, and the table in [related work](research/related-work.md#positioning-table) marks those cells "?".
+attenuo is self-hosted, open source (Apache-2.0) and neutral about the IdP: it takes OIDC ID tokens from Keycloak, Okta, Entra, Google and others. It enforces at the tool call, not only at sign-in. You can run both: let the vendor own agent identity and registration, and let attenuo be the monitor in front of the tools. Which of these products enforce per tool call, or revoke in flight, we could not confirm from their documentation (checked 2026-10-24); the [comparison](comparison.md#product-notes) has what each documents, with sources.
 
 ## Does it slow calls down?
 

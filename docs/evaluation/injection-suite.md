@@ -36,6 +36,8 @@ The 3 lease denials happened only because the case scripted a user revocation. W
 
 Scope-only tokens stop 19 attack calls: 16 that use a tool the task's grant does not include (14 in the class S cases, plus one each in `github-01` and `travel-06`), and the 3 scripted revocations. The other 31 refusals, the gap between 41 and 10 allowed, need more than tool names. Argument constraints in the token account for 16, and the suite policy for 15. The policy also accounts for all 3 lost benign calls.
 
+**Re-check (2026-10-24).** The suite was re-run on main `de3cf75` (after the admin console #25–#30, the WAL measurement #33, the SDK helpers #34 and the CLI follow-ups #35) with the frozen policies. Every table is identical to the 2026-10-23 v2 run: dev split 10/60 attack calls allowed with the full stack against 60/60 direct, 3/69 benign denied; test split 7/38 against 38/38, 3/29 benign denied; oracle agreement 129/129 and 67/67 call labels. Output: [`results/2026-10-24-recheck.md`](../../evaluation/injection-suite/results/2026-10-24-recheck.md).
+
 ## What attenuo did not stop
 
 ### Dev split
