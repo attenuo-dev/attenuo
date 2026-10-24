@@ -20,7 +20,10 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::approval::{rules, Approval, ApprovalMethod, ApprovalState, Approver};
-use crate::budget::{plan, ChargeOutcome, CounterKey, ValueKey, USAGE_KINDS};
+use crate::budget::{
+    kind_static, plan, summarize, ChargeOutcome, CounterKey, CounterSummary, HopLimit, ValueKey,
+    DISTINCT_VALUE_KIND, USAGE_KINDS,
+};
 use crate::checkpoint::{
     verify_with_checkpoints, Checkpoint, CheckpointKeys, SignedVerifyReport, Start,
 };
@@ -157,6 +160,12 @@ CREATE TABLE IF NOT EXISTS budget_meta (
     value TEXT NOT NULL
 );
 INSERT OR IGNORE INTO budget_meta (key, value) VALUES ('value_key', lower(hex(randomblob(32))));
+-- The limited capabilities of each hop as issued (JSON list of `HopLimit`), for the admin
+-- console only: enforcement reads limits from the token. Created at open on older stores.
+CREATE TABLE IF NOT EXISTS hop_limits (
+    lease  TEXT PRIMARY KEY,
+    limits TEXT NOT NULL
+);
 -- Output labelling phase 2 (ADR-0009): the span index of each run. `hash` is the HMAC-SHA-256
 -- of a result fingerprint under `span_key` (no content); `seq` is the audit seq of the result's
 -- `tool_result` record. Created at open on stores that predate it.
@@ -2246,13 +2255,13 @@ fn charge_in(
             "decision `{decision_id}` is already charged"
         )));
     }
-    let used_after = match plan(keys, charges, |k| counter_in(&tx, k))? {
-        Ok(after) => after,
+    let planned = match plan(keys, charges, |k| counter_in(&tx, k))? {
+        Ok(planned) => planned,
         Err(exhausted) => return Ok(exhausted),
     };
     let at = fmt_time(at)?;
-    for ((key, charge), after) in keys.iter().zip(charges).zip(&used_after) {
-        let (after, amount) = (to_i64(*after)?, to_i64(charge.amount)?);
+    for w in &planned.writes {
+        let (key, after, amount) = (&w.key, to_i64(w.after)?, to_i64(w.amount)?);
         tx.prepare_cached(
             "INSERT INTO budget_counters (lease, cap, kind, arg, value, used) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
@@ -2277,7 +2286,9 @@ fn charge_in(
         ])?;
     }
     tx.commit()?;
-    Ok(ChargeOutcome::Charged { used_after })
+    Ok(ChargeOutcome::Charged {
+        used_after: planned.used_after,
+    })
 }
 
 /// [`LeaseStore::refund`] in one `IMMEDIATE` transaction.
@@ -2290,11 +2301,17 @@ fn refund_in(
     let (rows, refunded, limits): (i64, i64, i64) = tx
         .prepare_cached(
             "SELECT COUNT(*), COUNT(refunded_at), \
-                    COUNT(*) FILTER (WHERE kind NOT IN (?2, ?3, ?4)) \
+                    COUNT(*) FILTER (WHERE kind NOT IN (?2, ?3, ?4, ?5)) \
              FROM budget_charges WHERE decision_id = ?1",
         )?
         .query_row(
-            params![decision_id, USAGE_KINDS[0], USAGE_KINDS[1], USAGE_KINDS[2]],
+            params![
+                decision_id,
+                USAGE_KINDS[0],
+                USAGE_KINDS[1],
+                USAGE_KINDS[2],
+                DISTINCT_VALUE_KIND
+            ],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
     if rows == 0 {
@@ -3151,6 +3168,66 @@ impl LeaseStore for SqliteLeaseStore {
         let _gate = self.gate.hold();
         let mut conn = self.conn.lock()?;
         refund_in(&mut conn, decision_id, at)
+    }
+
+    fn record_hop_limits(&self, lease: &LeaseId, limits: &[HopLimit]) -> Result<(), AuditError> {
+        let json = serde_json::to_string(limits)
+            .map_err(|e| AuditError::Storage(format!("hop limits do not serialize: {e}")))?;
+        let _gate = self.gate.hold();
+        let conn = self.conn.lock()?;
+        conn.prepare_cached(
+            "INSERT INTO hop_limits (lease, limits) VALUES (?1, ?2) \
+             ON CONFLICT (lease) DO UPDATE SET limits = excluded.limits",
+        )?
+        .execute(params![lease.0, json])?;
+        Ok(())
+    }
+
+    fn hop_limits(&self, lease: &LeaseId) -> Result<Option<Vec<HopLimit>>, AuditError> {
+        let conn = self.conn.lock()?;
+        let json: Option<String> = conn
+            .prepare_cached("SELECT limits FROM hop_limits WHERE lease = ?1")?
+            .query_row([&lease.0], |r| r.get(0))
+            .optional()?;
+        json.map(|j| {
+            serde_json::from_str(&j)
+                .map_err(|e| AuditError::Storage(format!("hop limits of `{}`: {e}", lease.0)))
+        })
+        .transpose()
+    }
+
+    fn budget_summary(&self, lease: &LeaseId) -> Result<Vec<CounterSummary>, AuditError> {
+        let conn = self.conn.lock()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT cap, kind, arg, value, used FROM budget_counters WHERE lease = ?1",
+        )?;
+        let rows = stmt
+            .query_map([&lease.0], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut keyed = Vec::with_capacity(rows.len());
+        for (cap, kind, arg, value, used) in rows {
+            // A kind this version does not know is skipped rather than failing the read.
+            let Some(kind) = kind_static(&kind) else {
+                continue;
+            };
+            let key = CounterKey {
+                lease: lease.0.clone(),
+                cap,
+                kind,
+                arg,
+                value,
+            };
+            keyed.push((key, u64::try_from(used).unwrap_or(0)));
+        }
+        Ok(summarize(keyed.iter().map(|(k, v)| (k, *v))))
     }
 }
 

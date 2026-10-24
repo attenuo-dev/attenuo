@@ -1,6 +1,8 @@
 // Run limits examples (ADR-0010; section 3.5 of the run-limits design note).
 //
-// A capability in a delegation token may carry `limits` (`calls`, `sum`, `calls_per`). The
+// A capability in a delegation token may carry `limits` (`calls`, `sum`, `calls_per`,
+// `distinct`; `calls_per` and `distinct` may count the host of a URL argument with
+// `"derive": "host"`). The
 // server enforces them itself, before Cedar: a call that would take any matching limit, in
 // any hop of the chain, past its `max` is denied with `budget_exhausted`, and no policy or
 // approval can pass it. What policies see is what is left, always present:
@@ -9,8 +11,9 @@
 //   context.budget.calls_remaining   before this call, the smallest `max - used` over every
 //                                    matching `calls` limit (Cedar's largest Long if none)
 //   context.budget.amount_remaining  the same for `sum` limits
-//   context.budget.destination_new   the call's `calls_per` value has not appeared in an
-//                                    earlier allowed call under that limit (true if none)
+//   context.budget.destination_new   the call's `calls_per` or `distinct` value has not
+//                                    appeared in an earlier allowed call under that limit
+//                                    (true if none)
 //
 // Policies read these to explain or to ask earlier, never to raise a limit: the figures in
 // the token are the ceiling.

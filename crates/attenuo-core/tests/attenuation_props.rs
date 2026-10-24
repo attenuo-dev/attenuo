@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use attenuo_core::{
     AgentId, ArgConstraint, ArgLimit, AttenuationError, Capability, CapabilitySet, DelegationChain,
-    LeaseId, Limits, OriginatingUser, ToolCall,
+    Derive, LeaseId, Limits, OriginatingUser, ToolCall,
 };
 use proptest::prelude::*;
 use serde_json::{json, Value};
@@ -58,11 +58,20 @@ fn limits() -> impl Strategy<Value = Limits> {
         prop::option::of(0u64..4),
         prop::option::of(0u64..4),
         prop::option::of((prop::sample::select(ARGS), 0u64..4)),
+        prop::option::of((prop::sample::select(ARGS), 0u64..4, any::<bool>())),
     )
-        .prop_map(|(calls, sum, per)| Limits {
+        .prop_map(|(calls, sum, per, distinct)| Limits {
             calls,
             sum: sum.map(|max| ArgLimit::new("n", max)),
             calls_per: per.map(|(arg, max)| ArgLimit::new(arg, max)),
+            distinct: distinct.map(|(arg, max, host)| {
+                let l = ArgLimit::new(arg, max);
+                if host {
+                    l.derived(Derive::Host)
+                } else {
+                    l
+                }
+            }),
         })
 }
 
@@ -476,6 +485,12 @@ proptest! {
             if let Some(pp) = &p.calls_per {
                 let same = c.calls_per.as_ref().is_some_and(|cp| cp.arg == pp.arg && cp.max <= pp.max);
                 prop_assert!(same || c.calls.is_some_and(|cm| cm <= pp.max));
+            }
+            if let Some(pd) = &p.distinct {
+                let same = c.distinct.as_ref().is_some_and(|cd| {
+                    cd.arg == pd.arg && cd.derive == pd.derive && cd.max <= pd.max
+                });
+                prop_assert!(same || c.calls.is_some_and(|cm| cm <= pd.max));
             }
         }
     }

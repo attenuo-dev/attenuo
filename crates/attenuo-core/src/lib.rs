@@ -6,8 +6,8 @@
 //! - [`DelegationChain`]: the originating user plus every agent hop, with the invariant that
 //!   capabilities only narrow from one hop to the next (monotonic attenuation).
 //! - [`ToolCall`]: a normalized tool invocation to authorize.
-//! - [`limits`]: run limits on a capability (`calls`, `sum`, `calls_per`) and the charges a
-//!   call makes against them (ADR-0010).
+//! - [`limits`]: run limits on a capability (`calls`, `sum`, `calls_per`, `distinct`) and the
+//!   charges a call makes against them (ADR-0010).
 //! - [`names`]: what server and tool names may contain (one rule for every boundary).
 //! - [`fingerprint`]: fingerprints of results and arguments for argument-level taint
 //!   (ADR-0009, phase 2).
@@ -38,5 +38,5 @@ pub use decision::{
     REASON_APPROVAL_REQUESTED, REASON_TOOL_RESULT,
 };
 pub use error::{AttenuationError, ChainError};
-pub use limits::{ArgLimit, Charge, LimitKind, Limits};
+pub use limits::{ArgLimit, Charge, Derive, LimitKind, Limits};
 pub use names::{NameError, NameKind};

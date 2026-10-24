@@ -14,7 +14,48 @@ catalog:
       destination: recipient
   workspace:
     send_email: { inputs: { to: string }, destination: to }
+  web:
+    # The host of the URL is the destination (run-limits phase 2), so pages of one site are
+    # one destination.
+    get_webpage: { inputs: { url: string }, destination: "url#host" }
 cases:
+  - name: the first fetch of a run is allowed
+    chain: [assistant]
+    call: { server: web, tool: get_webpage, arguments: { url: "https://news.example/a" } }
+    expect: allow
+    reason: policy_allow
+
+  - name: another page of a site the run fetched from is allowed
+    chain: [assistant]
+    usage: { calls: 1, destination_seen: true }
+    call: { server: web, tool: get_webpage, arguments: { url: "https://news.example/b?p=2" } }
+    expect: allow
+    reason: policy_allow
+
+  - name: a fetch from a new site asks
+    chain: [assistant]
+    usage: { calls: 1, destination_seen: false }
+    call: { server: web, tool: get_webpage, arguments: { url: "https://evil.example/?d=x" } }
+    expect: deny
+    reason: approval_required
+    policy_ids: [ask_on_a_new_site]
+
+  - name: a token may also cap the sites themselves with a derived distinct limit
+    chain:
+      - agent: assistant
+        capabilities:
+          - server: web
+            tool: get_webpage
+            limits: { distinct: { arg: url, derive: host, max: 2 } }
+      - agent: browser
+        capabilities:
+          - server: web
+            tool: get_webpage
+            limits: { calls: 2 }
+    call: { server: web, tool: get_webpage, arguments: { url: "https://news.example/a" } }
+    expect: allow
+    reason: policy_allow
+
   - name: the first payment of a run is allowed
     chain: [assistant]
     call:

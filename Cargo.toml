@@ -62,6 +62,7 @@ serde_urlencoded = "0.7"
 serde_yaml = "0.9"
 miette = { version = "7", default-features = false }
 unicode-normalization = "0.1"
+url = "2.5"
 
 [profile.release]
 lto = "thin"
