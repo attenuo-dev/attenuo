@@ -365,7 +365,9 @@ pub struct RefundBody {
 /// return to every run-limit counter what that decision charged, at most once, and append an
 /// `admin` record (tool `admin.budget.refund`) naming the decision. For an allowed call whose
 /// effect an operator knows did not happen; neither the agent nor the upstream can refund.
-/// 404 when the decision charged nothing, 409 when it was already refunded. The run usage the
+/// 404 when the decision charged nothing or its charge log was pruned (`[leases]
+/// run_state_retention_seconds`, only once the run's leases are gone), 409 when it was already
+/// refunded. The run usage the
 /// decision charged (run-limits design section 3.5) is returned too; `refunded` counts only
 /// token-limit counters, so it is 0 for a call that charged usage alone.
 ///
@@ -388,7 +390,9 @@ pub async fn refund_budget(
                 .refund(&decision_id, now)
                 .map_err(|e| match e {
                     AuditError::UnknownCharge(_) => ApiError::not_found(format!(
-                        "no budget charge is recorded for decision `{decision_id}`"
+                        "no budget charge is recorded for decision `{decision_id}`: it charged \
+                         nothing, or its run's charge log was pruned \
+                         ([leases] run_state_retention_seconds)"
                     )),
                     AuditError::ChargeRefunded(_) => ApiError::new(
                         StatusCode::CONFLICT,

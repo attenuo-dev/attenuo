@@ -31,9 +31,9 @@ use crate::checkpoint::{
 use crate::error::AuditError;
 use crate::export::RecordFilter;
 use crate::lease::{
-    ancestors_of, breadth_first, classify, session_prunable, tree_prunable, LeasePrune, LeaseRow,
-    LeaseSelector, LeaseStatus, LeaseStore, LeaseSubtree, RunLabel, SelectorRevocation,
-    SessionBinding, SessionPrune,
+    ancestors_of, breadth_first, classify, run_state_prunable, session_prunable, tree_prunable,
+    LeasePrune, LeaseRow, LeaseSelector, LeaseStatus, LeaseStore, LeaseSubtree, RunLabel,
+    RunStatePrune, SelectorRevocation, SessionBinding, SessionPrune,
 };
 use crate::log::{
     canonical_record_json, entry_hash_from_json, verify_entries, AuditEntry, AuditSink,
@@ -2428,6 +2428,10 @@ pub struct SqliteLeaseStore {
     /// The `rowid` of the last `leases` row a `prune_leases` pass looked at; 0 to start from
     /// the first.
     lease_cursor: Mutex<i64>,
+    /// Where the next `prune_run_state` pass starts: the table (0 `budget_charges`, 1
+    /// `budget_counters`, 2 `approvals`) and the `rowid` of the last row a pass looked at in
+    /// it, 0 to start from the first.
+    run_state_cursor: Mutex<(u8, i64)>,
     /// Tests: every charge commit and the `synchronous` level it ran at.
     #[cfg(test)]
     probe: Option<Arc<Mutex<Vec<String>>>>,
@@ -2482,6 +2486,7 @@ impl SqliteLeaseStore {
             span_key: SpanKey::new(&span_key),
             session_cursor: Mutex::new(0),
             lease_cursor: Mutex::new(0),
+            run_state_cursor: Mutex::new((0, 0)),
             #[cfg(test)]
             probe: None,
         })
@@ -3523,6 +3528,130 @@ impl LeaseStore for SqliteLeaseStore {
             pruned,
             wrapped,
         })
+    }
+
+    fn prune_run_state(
+        &self,
+        now: OffsetDateTime,
+        retention: time::Duration,
+        max_rows: usize,
+    ) -> Result<RunStatePrune, AuditError> {
+        let max_rows = max_rows.max(1);
+        let _gate = self.gate.hold();
+        let mut conn = self.conn.lock()?;
+        let mut cursor = self.run_state_cursor.lock()?;
+        // One write transaction from the read on: an exchange or a charge cannot slip in
+        // between the check that a lease is gone and the delete.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut out = RunStatePrune::default();
+        let mut budget = max_rows;
+        let (mut phase, mut from) = *cursor;
+        while budget > 0 {
+            let limit = i64::try_from(budget).unwrap_or(i64::MAX);
+            let seen: Vec<i64> = match phase {
+                0 => {
+                    // The charge log, decided per decision: its rows share one run.
+                    let window: Vec<(i64, String)> = tx
+                        .prepare_cached(
+                            "SELECT rowid, decision_id FROM budget_charges \
+                             WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+                        )?
+                        .query_map(params![from, limit], |r| Ok((r.get(0)?, r.get(1)?)))?
+                        .collect::<Result<_, _>>()?;
+                    let decisions: BTreeSet<&str> =
+                        window.iter().map(|(_, d)| d.as_str()).collect();
+                    for decision in decisions {
+                        type Logged = (String, Option<String>, bool);
+                        let rows: Vec<Logged> = tx
+                            .prepare_cached(
+                                "SELECT c.at, c.refunded_at, \
+                                 EXISTS (SELECT 1 FROM leases l WHERE l.id = c.lease) \
+                                 FROM budget_charges c WHERE c.decision_id = ?1",
+                            )?
+                            .query_map([decision], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                            .collect::<Result<_, _>>()?;
+                        let mut lease_known = false;
+                        let mut last: Option<OffsetDateTime> = None;
+                        for (at, refunded_at, known) in &rows {
+                            lease_known |= *known;
+                            for t in std::iter::once(at).chain(refunded_at) {
+                                let t = parse_time(t)?;
+                                last = Some(last.map_or(t, |l| l.max(t)));
+                            }
+                        }
+                        // Rows deleted earlier in this pass (another window row of it).
+                        let Some(last) = last else { continue };
+                        if run_state_prunable(lease_known, last, now, retention) {
+                            tx.prepare_cached("DELETE FROM budget_charges WHERE decision_id = ?1")?
+                                .execute([decision])?;
+                            out.pruned_charges += 1;
+                        }
+                    }
+                    window.into_iter().map(|(rowid, _)| rowid).collect()
+                }
+                1 => {
+                    // A counter goes once its lease is gone and no charge under it is left.
+                    let window: Vec<(i64, bool)> = tx
+                        .prepare_cached(
+                            "SELECT b.rowid, \
+                             EXISTS (SELECT 1 FROM leases l WHERE l.id = b.lease) \
+                             OR EXISTS (SELECT 1 FROM budget_charges c WHERE c.lease = b.lease) \
+                             FROM budget_counters b WHERE b.rowid > ?1 ORDER BY b.rowid LIMIT ?2",
+                        )?
+                        .query_map(params![from, limit], |r| Ok((r.get(0)?, r.get(1)?)))?
+                        .collect::<Result<_, _>>()?;
+                    let mut delete =
+                        tx.prepare_cached("DELETE FROM budget_counters WHERE rowid = ?1")?;
+                    for (rowid, kept) in &window {
+                        if !kept {
+                            out.pruned_counters += delete.execute([rowid])? as u64;
+                        }
+                    }
+                    window.into_iter().map(|(rowid, _)| rowid).collect()
+                }
+                _ => {
+                    type Seen = (i64, String, Option<String>, String, bool);
+                    let window: Vec<Seen> = tx
+                        .prepare_cached(
+                            "SELECT a.rowid, a.created_at, a.decided_at, a.expires_at, \
+                             EXISTS (SELECT 1 FROM leases l WHERE l.id = a.lease \
+                                     OR l.id = a.chain_id) \
+                             FROM approvals a WHERE a.rowid > ?1 ORDER BY a.rowid LIMIT ?2",
+                        )?
+                        .query_map(params![from, limit], |r| {
+                            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                        })?
+                        .collect::<Result<_, _>>()?;
+                    let mut delete = tx.prepare_cached("DELETE FROM approvals WHERE rowid = ?1")?;
+                    for (rowid, created_at, decided_at, expires_at, known) in &window {
+                        let mut last = parse_time(created_at)?.max(parse_time(expires_at)?);
+                        if let Some(d) = decided_at {
+                            last = last.max(parse_time(d)?);
+                        }
+                        if run_state_prunable(*known, last, now, retention) {
+                            out.pruned_approvals += delete.execute([rowid])? as u64;
+                        }
+                    }
+                    window.into_iter().map(|(rowid, ..)| rowid).collect()
+                }
+            };
+            out.examined += seen.len() as u64;
+            if seen.len() < budget {
+                // The end of this table: on to the next one, or back to the first.
+                if phase >= 2 {
+                    (phase, from) = (0, 0);
+                    out.wrapped = true;
+                    break;
+                }
+                (phase, from) = (phase + 1, 0);
+            } else {
+                from = *seen.last().expect("a full window");
+            }
+            budget -= seen.len();
+        }
+        tx.commit()?;
+        *cursor = (phase, from);
+        Ok(out)
     }
 
     fn preview_selected(&self, selector: &LeaseSelector) -> Result<SelectorRevocation, AuditError> {

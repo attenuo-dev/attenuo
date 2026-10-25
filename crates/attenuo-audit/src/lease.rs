@@ -157,6 +157,28 @@ pub trait LeaseStore: Send + Sync {
         max_rows: usize,
     ) -> Result<LeasePrune, AuditError>;
 
+    /// One pass of run-state retention: look at up to `max_rows` rows of run-limit state and
+    /// approvals, continuing after the last row the previous pass looked at, and delete what
+    /// [`run_state_prunable`] allows at `now` with `retention` as the grace period. The tables
+    /// are walked in a fixed order, each in insertion order: the charge log (decided per
+    /// charged decision: every lease it charged must be gone from the registry, and its charge
+    /// and any refund older than `retention`), then the counters (a counter goes once its
+    /// lease is gone and no charge under that lease is left in the log, so a counter outlives
+    /// its newest charge by at least `retention`), then the approvals (gone once neither their
+    /// lease nor their run's chain id is in the registry and their creation, decision and
+    /// expiry are all older than `retention`). Nothing of a lease the registry still holds is
+    /// ever deleted, whatever its age; the lease registry itself waits
+    /// [`prune_leases`](Self::prune_leases)' retention after a run ended. When a pass reaches
+    /// the end of the approvals it reports `wrapped`, and the next pass starts again with the
+    /// charge log. One write transaction per pass. A refund of a pruned charge is refused as
+    /// [`AuditError::UnknownCharge`], like a decision that charged nothing.
+    fn prune_run_state(
+        &self,
+        now: OffsetDateTime,
+        retention: time::Duration,
+        max_rows: usize,
+    ) -> Result<RunStatePrune, AuditError>;
+
     /// What [`revoke_selected`](Self::revoke_selected) would do now, without writing:
     /// `matched` is every unrevoked lease the selector names, `revoked` every unrevoked lease
     /// a revocation would change (the matches and their descendants). Read in one
@@ -466,6 +488,52 @@ pub fn tree_prunable<'a>(
     any
 }
 
+/// What one [`LeaseStore::prune_run_state`] pass did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RunStatePrune {
+    /// Rows the pass looked at across the charge log, the counters and the approvals (at most
+    /// its `max_rows`). The memory store counts one per charged decision in the log.
+    pub examined: u64,
+    /// Run-limit and run-usage counters deleted.
+    pub pruned_counters: u64,
+    /// Charge-log entries deleted, one per charged decision (however many counters it
+    /// charged).
+    pub pruned_charges: u64,
+    /// Approvals deleted.
+    pub pruned_approvals: u64,
+    /// The pass reached the last approval; the next one starts from the charge log again.
+    pub wrapped: bool,
+}
+
+/// Whether per-run state (a decision's charge log entry, an approval) may be deleted:
+/// `lease_known` is whether any lease it is kept under (the leases a decision charged; an
+/// approval's lease and its run's chain id) is still in the registry, and `last` the newest
+/// time it records (a charge and its refund; an approval's creation, decision and expiry).
+/// State of a lease the registry still holds is always kept: the lease registry keeps a run
+/// until it has been over for `[leases] retention_seconds`, and this retention starts only
+/// after that. A lease the registry does not know (pruned, or a store that lost rows) leaves
+/// its state for `retention` past `last`, so the charge log stays available to an operator
+/// refund and to incident review for that long. Counters have no time of their own: a counter
+/// goes once its lease is unknown and no charge under that lease is left in the log.
+pub fn run_state_prunable(
+    lease_known: bool,
+    last: OffsetDateTime,
+    now: OffsetDateTime,
+    retention: time::Duration,
+) -> bool {
+    !lease_known && last.saturating_add(retention) < now
+}
+
+/// The newest time an approval records: its creation, its decision and its expiry. An
+/// approval is never pruned before it has expired.
+pub fn approval_last_touched(approval: &Approval) -> OffsetDateTime {
+    let mut last = approval.created_at.max(approval.expires_at);
+    if let Some(d) = approval.decided_at {
+        last = last.max(d);
+    }
+    last
+}
+
 /// The result of [`LeaseStore::revoke_selected`] or [`LeaseStore::preview_selected`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SelectorRevocation {
@@ -499,11 +567,14 @@ struct LoggedCharge {
     amount: u64,
 }
 
-/// What a decision charged, and whether it was refunded.
-#[derive(Debug, Clone, Default)]
+/// What a decision charged, when, and whether it was refunded.
+#[derive(Debug, Clone)]
 struct ChargeLog {
     charges: Vec<LoggedCharge>,
-    refunded: bool,
+    /// When the decision was charged.
+    at: OffsetDateTime,
+    /// When it was refunded, if it was.
+    refunded_at: Option<OffsetDateTime>,
 }
 
 /// One output label on a delegation run: an untrusted result the run read (ADR-0009).
@@ -710,6 +781,8 @@ pub struct MemoryLeaseStore {
     session_cursor: Mutex<Option<(String, String)>>,
     /// The last lease a `prune_leases` pass looked at; `None` to start from the first.
     lease_cursor: Mutex<Option<LeaseId>>,
+    /// Where the next `prune_run_state` pass starts.
+    run_state_cursor: Mutex<RunStateCursor>,
     /// Per run, the first label of each source.
     labels: Mutex<BTreeMap<LeaseId, BTreeMap<String, RunLabel>>>,
     /// Per run, the span index (ADR-0009 phase 2).
@@ -720,6 +793,21 @@ pub struct MemoryLeaseStore {
     budgets: Mutex<Budgets>,
     /// The limited capabilities of each hop, as issued (display only).
     hop_limits: Mutex<BTreeMap<LeaseId, Vec<HopLimit>>>,
+}
+
+/// Where a memory store's `prune_run_state` pass resumes: the table, and the last key a pass
+/// looked at in it (`None` to start from its first).
+#[derive(Debug, Clone)]
+enum RunStateCursor {
+    Charges(Option<String>),
+    Counters(Option<CounterKey>),
+    Approvals(Option<String>),
+}
+
+impl Default for RunStateCursor {
+    fn default() -> Self {
+        Self::Charges(None)
+    }
 }
 
 /// The memory store's run-limit state.
@@ -1164,6 +1252,138 @@ impl LeaseStore for MemoryLeaseStore {
         })
     }
 
+    fn prune_run_state(
+        &self,
+        now: OffsetDateTime,
+        retention: time::Duration,
+        max_rows: usize,
+    ) -> Result<RunStatePrune, AuditError> {
+        use std::ops::Bound;
+        fn after<K: Ord + Clone>(k: &Option<K>) -> (Bound<K>, Bound<K>) {
+            match k {
+                Some(k) => (Bound::Excluded(k.clone()), Bound::Unbounded),
+                None => (Bound::Unbounded, Bound::Unbounded),
+            }
+        }
+        let max_rows = max_rows.max(1);
+        // The rows lock is held for the whole pass (the memory store's transaction); budgets
+        // and approvals are taken under it, one at a time, in the order used elsewhere.
+        let rows = self.rows.lock()?;
+        let known = |lease: &str| rows.contains_key(&LeaseId::new(lease));
+        let mut cursor = self.run_state_cursor.lock()?;
+        let mut out = RunStatePrune::default();
+        let mut budget = max_rows;
+        while budget > 0 {
+            match cursor.clone() {
+                RunStateCursor::Charges(from) => {
+                    let mut b = self.budgets.lock()?;
+                    let window: Vec<String> = b
+                        .log
+                        .range(after(&from))
+                        .take(budget)
+                        .map(|(d, _)| d.clone())
+                        .collect();
+                    for d in &window {
+                        let entry = &b.log[d];
+                        let lease_known = entry.charges.iter().any(|c| known(&c.counter.lease));
+                        let last = entry.refunded_at.map_or(entry.at, |r| r.max(entry.at));
+                        if !run_state_prunable(lease_known, last, now, retention) {
+                            continue;
+                        }
+                        let entry = b.log.remove(d).expect("in the window");
+                        if entry.refunded_at.is_none() {
+                            // As if its rows were deleted: it no longer holds its values.
+                            for c in &entry.charges {
+                                if c.counter.kind == DISTINCT_VALUE_KIND {
+                                    if let Some(n) = b.holders.get_mut(&c.counter) {
+                                        *n = n.saturating_sub(1);
+                                        if *n == 0 {
+                                            b.holders.remove(&c.counter);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        out.pruned_charges += 1;
+                    }
+                    out.examined += window.len() as u64;
+                    if window.len() < budget {
+                        *cursor = RunStateCursor::Counters(None);
+                    } else {
+                        *cursor = RunStateCursor::Charges(window.last().cloned());
+                    }
+                    budget -= window.len();
+                }
+                RunStateCursor::Counters(from) => {
+                    let mut b = self.budgets.lock()?;
+                    let logged: BTreeSet<&str> = b
+                        .log
+                        .values()
+                        .flat_map(|e| &e.charges)
+                        .map(|c| c.counter.lease.as_str())
+                        .collect();
+                    let window: Vec<(CounterKey, bool)> = b
+                        .counters
+                        .range(after(&from))
+                        .take(budget)
+                        .map(|(k, _)| {
+                            (
+                                k.clone(),
+                                !known(&k.lease) && !logged.contains(k.lease.as_str()),
+                            )
+                        })
+                        .collect();
+                    drop(logged);
+                    for (k, prunable) in &window {
+                        if *prunable && b.counters.remove(k).is_some() {
+                            b.holders.remove(k);
+                            out.pruned_counters += 1;
+                        }
+                    }
+                    out.examined += window.len() as u64;
+                    if window.len() < budget {
+                        *cursor = RunStateCursor::Approvals(None);
+                    } else {
+                        *cursor = RunStateCursor::Counters(window.last().map(|(k, _)| k.clone()));
+                    }
+                    budget -= window.len();
+                }
+                RunStateCursor::Approvals(from) => {
+                    let mut approvals = self.approvals.lock()?;
+                    let window: Vec<(String, bool)> = approvals
+                        .range(after(&from))
+                        .take(budget)
+                        .map(|(id, a)| {
+                            let lease_known =
+                                rows.contains_key(&a.lease) || rows.contains_key(&a.chain_id);
+                            let prunable = run_state_prunable(
+                                lease_known,
+                                approval_last_touched(a),
+                                now,
+                                retention,
+                            );
+                            (id.clone(), prunable)
+                        })
+                        .collect();
+                    for (id, prunable) in &window {
+                        if *prunable && approvals.remove(id).is_some() {
+                            out.pruned_approvals += 1;
+                        }
+                    }
+                    out.examined += window.len() as u64;
+                    if window.len() < budget {
+                        *cursor = RunStateCursor::default();
+                        out.wrapped = true;
+                        break;
+                    }
+                    *cursor = RunStateCursor::Approvals(window.last().map(|(id, _)| id.clone()));
+                    budget -= window.len();
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn preview_selected(&self, selector: &LeaseSelector) -> Result<SelectorRevocation, AuditError> {
         self.selected(selector, None)
     }
@@ -1413,7 +1633,7 @@ impl LeaseStore for MemoryLeaseStore {
         &self,
         decision_id: &str,
         charges: &[Charge],
-        _at: OffsetDateTime,
+        at: OffsetDateTime,
     ) -> Result<ChargeOutcome, AuditError> {
         if charges.is_empty() {
             return Ok(ChargeOutcome::Charged {
@@ -1434,7 +1654,11 @@ impl LeaseStore for MemoryLeaseStore {
             Ok(planned) => planned,
             Err(exhausted) => return Ok(exhausted),
         };
-        let mut log = ChargeLog::default();
+        let mut log = ChargeLog {
+            charges: Vec::new(),
+            at,
+            refunded_at: None,
+        };
         for w in planned.writes {
             if w.key.kind == DISTINCT_VALUE_KIND {
                 *b.holders.entry(w.key.clone()).or_insert(0) += 1;
@@ -1472,7 +1696,7 @@ impl LeaseStore for MemoryLeaseStore {
         ))
     }
 
-    fn refund(&self, decision_id: &str, _at: OffsetDateTime) -> Result<u64, AuditError> {
+    fn refund(&self, decision_id: &str, at: OffsetDateTime) -> Result<u64, AuditError> {
         let mut b = self.budgets.lock()?;
         let Budgets {
             counters,
@@ -1485,7 +1709,7 @@ impl LeaseStore for MemoryLeaseStore {
             .get_mut(decision_id)
             .filter(|e| !e.charges.is_empty())
             .ok_or_else(|| AuditError::UnknownCharge(decision_id.to_owned()))?;
-        if entry.refunded {
+        if entry.refunded_at.is_some() {
             return Err(AuditError::ChargeRefunded(decision_id.to_owned()));
         }
         let distinct = LimitKind::Distinct.as_str();
@@ -1527,7 +1751,7 @@ impl LeaseStore for MemoryLeaseStore {
             }
             restored += 1;
         }
-        entry.refunded = true;
+        entry.refunded_at = Some(at);
         // A run-usage counter saturates at `MAX_LIMIT`, so what one decision logged is not
         // what it added once the counter was full: recompute it from the decisions left
         // (fuzzing round 2, FZ2-4).
@@ -1540,7 +1764,7 @@ impl LeaseStore for MemoryLeaseStore {
         for key in usage {
             let total = log
                 .values()
-                .filter(|e| !e.refunded)
+                .filter(|e| e.refunded_at.is_none())
                 .flat_map(|e| &e.charges)
                 .filter(|c| c.counter == key)
                 .fold(0u64, |t, c| t.saturating_add(c.amount))
