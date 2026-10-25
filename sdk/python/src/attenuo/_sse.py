@@ -55,54 +55,89 @@ class SseEvent:
 
 
 class SseParser:
-    """Feed bytes as they arrive; get back the events they complete."""
+    """Feed bytes as they arrive; get back the events they complete.
+
+    Linear in the input (SR-82): each chunk is searched for line ends once, from its start, and
+    the unfinished line is kept as a list of chunks joined once when its line end arrives, as the
+    TypeScript parser does. Appending to one buffer and searching it again from the start on every
+    chunk made a long line delivered in many small reads cost time quadratic in its length.
+    """
 
     def __init__(self, max_event_bytes: int = DEFAULT_MAX_EVENT_BYTES) -> None:
         if max_event_bytes <= 0:
             raise ValueError("max_event_bytes must be positive")
         self.max_event_bytes = max_event_bytes
         self.last_event_id: str | None = None
-        self._buf = b""
+        self._head = b""  # the first bytes of the stream while they may still be a BOM
+        self._parts: list[bytes] = []  # the unfinished line, no line end in it
+        self._parts_len = 0
+        self._cr = False  # the unfinished line was ended by a CR at the end of a read
         self._data: list[str] = []
         self._size = 0  # bytes of the lines of the event being read
         self._start = True  # a UTF-8 BOM may open the stream
 
     def feed(self, chunk: bytes) -> Iterator[SseEvent]:
         """The events ``chunk`` completes, each as soon as it is parsed (consume them all)."""
-        self._buf += chunk
         if self._start:
-            if len(self._buf) < len(_BOM) and _BOM.startswith(self._buf):
+            self._head += chunk
+            if len(self._head) < len(_BOM) and _BOM.startswith(self._head):
                 return
-            self._buf = self._buf.removeprefix(_BOM)
+            chunk, self._head = self._head.removeprefix(_BOM), b""
             self._start = False
         pos = 0
+        if self._cr and chunk:
+            # A CR ended the last read: a LF opening this one is the rest of a CRLF.
+            end = 2 if chunk.startswith(b"\n") else 1  # the line end's length
+            line = self._pending()
+            self._take(self._parts_len + end)
+            self._parts, self._parts_len, self._cr = [], 0, False
+            pos = end - 1
+            event = self._line(line)
+            if event is not None:
+                yield event
         while True:
-            m = _LINE_END.search(self._buf, pos)
-            # A CR at the very end may be the first half of a CRLF: wait for the next chunk.
-            if m is None or (m.group() == b"\r" and m.end() == len(self._buf)):
+            m = _LINE_END.search(chunk, pos)
+            if m is None:
                 break
-            line = self._buf[pos : m.start()]
-            self._take(m.end() - pos)
+            if m.group() == b"\r" and m.end() == len(chunk):
+                # A CR at the very end may be the first half of a CRLF: wait for the next chunk.
+                self._cr = True
+                break
+            if self._parts:
+                line = self._pending() + chunk[pos : m.start()]
+                self._take(self._parts_len + m.end() - pos)
+                self._parts, self._parts_len = [], 0
+            else:
+                line = chunk[pos : m.start()]
+                self._take(m.end() - pos)
             event = self._line(line)
             pos = m.end()
             if event is not None:
                 yield event
-        self._buf = self._buf[pos:]
-        if self._size + len(self._buf) > self.max_event_bytes:
+        rest = chunk[pos : len(chunk) - 1] if self._cr else chunk[pos:]
+        if rest:
+            self._parts.append(rest)
+            self._parts_len += len(rest)
+        if self._size + self._parts_len + int(self._cr) > self.max_event_bytes:
             raise self._too_big()
 
     def close(self) -> list[SseEvent]:
         """End of stream. A last line ended by a lone CR still counts; an event without its
         blank line is dropped."""
         out: list[SseEvent] = []
-        if self._buf.endswith(b"\r"):
-            event = self._line(self._buf[:-1])
+        if self._cr:
+            event = self._line(self._pending())
             if event is not None:
                 out.append(event)
-        self._buf = b""
+        self._head = b""
+        self._parts, self._parts_len, self._cr = [], 0, False
         self._data = []
         self._size = 0
         return out
+
+    def _pending(self) -> bytes:
+        parts = self._parts
+        return parts[0] if len(parts) == 1 else b"".join(parts)
 
     def _take(self, n: int) -> None:
         self._size += n

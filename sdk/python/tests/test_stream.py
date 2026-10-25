@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import time
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
@@ -137,6 +138,31 @@ def test_parser_refuses_an_oversized_event() -> None:
 def test_parser_refuses_non_utf8() -> None:
     with pytest.raises(AttenuoError, match="UTF-8"):
         parse_all(b"data: \xff\n\n")
+
+
+def test_parser_reads_a_long_line_in_small_reads_in_linear_time_sr82() -> None:
+    # SR-82: the unfinished line was searched again from the start on every read, so a 2 MiB
+    # line in 1 KiB reads took about 16 s (4 s for 1 MiB); linear, it takes about 20 ms. The
+    # bound is far from both.
+    n = 2 * 1024 * 1024
+    body = b"id: 9\r" + b"data: " + b"x" * n + b"\r\n\r\n"
+    p = SseParser(4 * n)
+    out: list[Any] = []
+    t = time.perf_counter()
+    for i in range(0, len(body), 1024):
+        out += p.feed(body[i : i + 1024])
+    elapsed = time.perf_counter() - t
+    out += p.close()
+    assert [(e.data, e.last_event_id) for e in out] == [("x" * n, "9")]
+    assert elapsed < 3.0, f"{elapsed:.2f} s for a 2 MiB line in 1 KiB reads"
+    # One byte at a time, each CR of a CRLF ends a read.
+    small = b"data: " + b"y" * 4096 + b"\r\n\r\n"
+    assert parse_all(small, 1) == [("y" * 4096, None)]
+    # The bound still applies to an unfinished line made of many reads.
+    p = SseParser(1024)
+    with pytest.raises(AttenuoError, match="over 1024 bytes"):
+        for _ in range(2048):
+            list(p.feed(b"z"))
 
 
 def test_default_bound_is_the_proxys() -> None:
