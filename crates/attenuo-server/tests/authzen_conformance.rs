@@ -424,3 +424,91 @@ fn comparator_is_exact_where_it_should_be() {
                            "url": "<base>/x"}})
     );
 }
+
+/// A batch stopped by `deny_on_first_deny` or `permit_on_first_permit` (AuthZEN 1.0 section
+/// 7.1.2.1) audits exactly the entries it decided: one record per answered entry, with the
+/// answer's `decision_id`, and none for the entries after the stop.
+#[tokio::test]
+async fn stopped_batch_audits_only_what_it_ran() {
+    let h = Harness::start().await;
+    let token = h.mint(&json!({})).await;
+    let entry = |repo: &str, session: &str| json!({"context": {"input": {"repo": repo}, "session_id": session}});
+    let cases = [
+        (
+            "deny_on_first_deny",
+            [
+                entry("alice/public-a", "dofd-1"),
+                entry("alice/private-b", "dofd-2"),
+                entry("alice/public-c", "dofd-3"),
+            ],
+            vec![("dofd-1", "allow"), ("dofd-2", "deny")],
+        ),
+        (
+            "permit_on_first_permit",
+            [
+                entry("alice/private-b", "pofp-1"),
+                entry("alice/public-a", "pofp-2"),
+                entry("alice/private-d", "pofp-3"),
+            ],
+            vec![("pofp-1", "deny"), ("pofp-2", "allow")],
+        ),
+    ];
+    for (semantic, entries, want) in cases {
+        let body = json!({
+            "subject": {"type": "agent", "id": ""},
+            "action": {"name": "read_file"},
+            "resource": {"type": "tool", "id": "github/read_file", "properties": {"server": "github"}},
+            "options": {"evaluations_semantic": semantic},
+            "evaluations": entries,
+        });
+        let resp = h
+            .client
+            .post(h.server.url("/access/v1/evaluations"))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{semantic}");
+        let answer: Value = resp.json().await.unwrap();
+        let answered = answer["evaluations"].as_array().unwrap();
+        assert_eq!(answered.len(), want.len(), "{semantic}: {answer}");
+
+        let listing = h
+            .client
+            .get(h.server.url("/admin/audit?from=1&limit=1000"))
+            .bearer_auth(ADMIN)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let prefix = &want[0].0[..5];
+        let records: Vec<&Value> = listing["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| &e["record"])
+            .filter(|r| {
+                r["session_id"]
+                    .as_str()
+                    .is_some_and(|s| s.starts_with(prefix))
+            })
+            .collect();
+        let got: Vec<(&str, &str)> = records
+            .iter()
+            .map(|r| {
+                (
+                    r["session_id"].as_str().unwrap(),
+                    r["decision"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(got, want, "{semantic}: records {records:?}");
+        for (r, a) in records.iter().zip(answered) {
+            assert_eq!(r["id"], a["context"]["decision_id"], "{semantic}");
+            assert_eq!(r["tool"], "read_file");
+        }
+    }
+}

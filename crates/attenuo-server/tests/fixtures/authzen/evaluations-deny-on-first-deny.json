@@ -1,0 +1,212 @@
+{
+  "_note": "AuthZEN 1.0 section 7.1.2.1, deny_on_first_deny ('deny on first denial (or failure)', short-circuiting like &&): entries are decided in order and the batch stops after the first deny. The entries after it are not decided and are left out of the answer, as in the specification's example (three requests, two answers). Step 0: no deny, every entry answered. Step 1: the second of three entries is denied, so the answer has two entries. Step 2: an entry that cannot be evaluated is a failure (section 7.2.1) and also stops the batch.",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/evaluations",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "options": {
+          "evaluations_semantic": "deny_on_first_deny"
+        },
+        "evaluations": [
+          {
+            "context": {
+              "input": {
+                "repo": "alice/public-a"
+              }
+            }
+          },
+          {
+            "context": {
+              "input": {
+                "repo": "alice/public-c"
+              }
+            }
+          }
+        ]
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "evaluations": [
+            {
+              "decision": true,
+              "context": {
+                "reason": "policy_allow",
+                "policy_ids": [
+                  "public_reads"
+                ],
+                "diagnostics": [],
+                "decision_id": "<decision_id>"
+              }
+            },
+            {
+              "decision": true,
+              "context": {
+                "reason": "policy_allow",
+                "policy_ids": [
+                  "public_reads"
+                ],
+                "diagnostics": [],
+                "decision_id": "<decision_id>"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "path": "/access/v1/evaluations",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "options": {
+          "evaluations_semantic": "deny_on_first_deny"
+        },
+        "evaluations": [
+          {
+            "context": {
+              "input": {
+                "repo": "alice/public-a"
+              }
+            }
+          },
+          {
+            "context": {
+              "input": {
+                "repo": "alice/private-b"
+              }
+            }
+          },
+          {
+            "context": {
+              "input": {
+                "repo": "alice/public-c"
+              }
+            }
+          }
+        ]
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "evaluations": [
+            {
+              "decision": true,
+              "context": {
+                "reason": "policy_allow",
+                "policy_ids": [
+                  "public_reads"
+                ],
+                "diagnostics": [],
+                "decision_id": "<decision_id>"
+              }
+            },
+            {
+              "decision": false,
+              "context": {
+                "reason": "policy_deny",
+                "policy_ids": [],
+                "diagnostics": [],
+                "decision_id": "<decision_id>"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "path": "/access/v1/evaluations",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "options": {
+          "evaluations_semantic": "deny_on_first_deny"
+        },
+        "evaluations": [
+          {
+            "context": {
+              "input": {
+                "repo": "alice/public-a"
+              }
+            }
+          },
+          "not an object",
+          {
+            "context": {
+              "input": {
+                "repo": "alice/public-c"
+              }
+            }
+          }
+        ]
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "evaluations": [
+            {
+              "decision": true,
+              "context": {
+                "reason": "policy_allow",
+                "policy_ids": [
+                  "public_reads"
+                ],
+                "diagnostics": [],
+                "decision_id": "<decision_id>"
+              }
+            },
+            {
+              "decision": false,
+              "context": {
+                "error": {
+                  "status": 400,
+                  "code": "invalid_request",
+                  "message": "each evaluation must be an object"
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

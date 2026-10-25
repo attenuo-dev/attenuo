@@ -23,7 +23,13 @@ pub async fn jwks(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(state.jwks.clone())
 }
 
-/// `GET /.well-known/authzen-configuration` (AuthZEN PDP metadata).
+/// `GET /.well-known/authzen-configuration`: AuthZEN 1.0 PDP metadata (sections 9.1.1 and 9.2).
+///
+/// Public, like the JWKS: no credential is asked for and `Authorization` is ignored, because a
+/// PEP reads it before it knows where to send credentials and the specification does not
+/// protect it (9.2.1, 11.8). It holds only the base URL and the two endpoint paths. The search
+/// endpoint parameters are left out because the Search APIs are not served (9.1.1: absent
+/// means unsupported); `capabilities` and `signed_metadata` are not published.
 pub async fn authzen_configuration(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

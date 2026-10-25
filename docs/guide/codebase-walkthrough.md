@@ -1049,6 +1049,9 @@ curl -s $ATTENUO_SERVER/access/v1/evaluations -H "Authorization: Bearer $R" \
 curl -s $ATTENUO_SERVER/access/v1/evaluations -H "Authorization: Bearer $R" \
   -H 'Content-Type: application/json' -d "${Q%\}},\"evaluations\":[{}],\"options\":{\"evaluations_semantic\":\"deny_on_first_deny\"}}"; echo
 # {"error":"invalid_request","detail":"evaluations_semantic `deny_on_first_deny` is not supported; use `execute_all`"}
+#   (that was the answer when this block was run; since `feat/authzen-semantics-discovery` merged, `deny_on_first_deny`
+#   and `permit_on_first_permit` are honoured: the batch stops at the first deny or permit and answers only the
+#   entries it decided, each with its own audit record; see "Batch semantics" on the AuthZEN reference page)
 
 # 4. The dry run with a stated run state, from the CLI: the same cases offline and through the server.
 cat > /tmp/ob-dry_test.yaml <<EOF
@@ -1224,7 +1227,7 @@ What is still open after this session (from the [task board](../tasks/board.md) 
 - Revocation and leases: revoking by the audit `session_tag`; the optional proxy lease cache; a lost session binding is only a log line.
 - Retention: a refund of a pruned charge cannot be told from one of a decision that charged nothing (both 404 `not_found`, exit 2) without the audit log; the maintenance cadence and batch are constants; a lease pass reads the subtree of every prunable run on top of its 1,000-row window, so a very wide run makes that pass longer; the run-state pass's per-row lookups were not measured.
 - Proxy: Cedar-aware list filtering; a client that keeps reopening a listen stream (or sends any undecided request) on a revoked lease still adds one `http.GET` `deny` per request, unbounded; the `stream.end` window is a constant and the suppressed count is in the metric and log only; a large non-list event on the listen stream costs about 0.7 ms per 85 KB to parse and re-serialize.
-- AuthZEN: the Search APIs, `deny_on_first_deny` and `permit_on_first_permit`, discovery `capabilities` and `signed_metadata`, and the `Content-Type` check are not implemented; error bodies stay JSON objects ([AuthZEN conformance](../reference/authzen.md#not-implemented)).
+- AuthZEN: the Search APIs and discovery `capabilities` and `signed_metadata` are not implemented (`deny_on_first_deny`, `permit_on_first_permit` and the `Content-Type` check landed on `feat/authzen-semantics-discovery`); error bodies stay JSON objects ([AuthZEN conformance](../reference/authzen.md#not-implemented)).
 - Dry run: the console's form has no approval field (the SDKs and `policy test` carry one); the route ignores members of `approval` other than `by`, while `session` and `usage` refuse unknown members; offline `policy test` does not enforce chain limits.
 - Server and identity: real admin authentication; actor tokens against a live SPIRE; hop-0 hardening (a shared replay cache, `private_key_jwt`, ID-JAG drafts).
 - SDKs: publishing to PyPI and npm, streaming responses, hop-0 against a live IdP; one intermittent Python integration failure (`test_dpop_server_nonce`, suspected) is still being watched.
