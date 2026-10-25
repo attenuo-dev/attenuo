@@ -763,6 +763,29 @@ mod tests {
     }
 
     #[test]
+    fn range_members_are_checked_whatever_the_member_order() {
+        // With `value` before `op`, serde buffers the value before choosing the variant; the
+        // range checks still apply to the buffered form.
+        let parse = |s: &str| serde_json::from_str::<ArgConstraint>(s);
+        assert_eq!(
+            parse(r#"{"value":{"max":5},"op":"range"}"#).unwrap(),
+            range(None, Some(5))
+        );
+        for s in [
+            r#"{"value":{"max":5,"max":9},"op":"range"}"#,
+            r#"{"op":"range","value":{"max":5,"max":9}}"#,
+            r#"{"value":{"maximum":5},"op":"range"}"#,
+            r#"{"value":[0,5],"op":"range"}"#,
+            r#"{"value":{"max":5.0},"op":"range"}"#,
+            r#"{"value":{"max":1e3},"op":"range"}"#,
+            r#"{"value":{"max":9223372036854775808},"op":"range"}"#,
+            r#"{"value":{"min":2,"max":1},"op":"range"}"#,
+        ] {
+            assert!(parse(s).is_err(), "{s}");
+        }
+    }
+
+    #[test]
     fn range_serde_round_trip_and_validation() {
         let r = range(Some(0), Some(2000));
         let s = serde_json::to_string(&r).unwrap();
