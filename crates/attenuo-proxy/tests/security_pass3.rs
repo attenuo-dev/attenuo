@@ -2,15 +2,16 @@
 //! (`docs/research/security-review-2026-10-23.md`).
 //!
 //! Both findings here are in `crates/attenuo-proxy/src/proxy.rs`: SR-27 (ambiguous
-//! `Mcp-Session-Id` headers) and SR-28 (long-lived streams outliving revocation, and the
-//! audit record of a stream the proxy ends).
+//! `Mcp-Session-Id` headers) and SR-28 (long-lived streams outliving revocation, the audit
+//! record of a stream the proxy ends, how listen streams ending are counted, and the bound on
+//! `stream.end` records per chain and reason).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use attenuo_core::{AgentId, Capability, CapabilitySet, Decision, DelegationChain, LeaseId};
-use attenuo_proxy::guard::STREAM_END_TOOL;
+use attenuo_proxy::guard::{StreamEndCause, STREAM_END_TOOL};
 use attenuo_proxy::session::session_tag;
 use attenuo_proxy::testing::{spawn_router, test_chain, test_user, Spawned, StaticAuthorizer};
 use attenuo_proxy::{router, ProxyConfig, UpstreamConfig};
@@ -457,6 +458,20 @@ async fn a_revoked_listen_stream_ends_promptly_with_a_reason() {
     assert_eq!(last["error"]["data"]["reason"], "lease_revoked");
     assert_stream_end_record(&authorizer, &last, "lease_revoked", Some(&sid));
     assert_eq!(authorizer.decisions().len(), 1);
+    assert_stream_ends(&authorizer, &[StreamEndCause::LeaseRevoked]).await;
+}
+
+/// Wait until `authorizer` has seen `expected.len()` listen-stream ends, then check they are
+/// exactly `expected`, and still are a few re-check intervals later (each stream is counted
+/// once, never again).
+async fn assert_stream_ends(authorizer: &StaticAuthorizer, expected: &[StreamEndCause]) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while authorizer.stream_ends().len() < expected.len() && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(RECHECK * 3).await;
+    assert_eq!(authorizer.stream_ends(), expected);
 }
 
 /// SR-28: a listen stream the client drops, or the upstream ends, is not a decision: nothing
@@ -476,6 +491,8 @@ async fn a_dropped_or_finished_listen_stream_leaves_no_record() {
     authorizer.revoke("alice");
     tokio::time::sleep(RECHECK * 4).await;
     assert!(authorizer.decisions().is_empty(), "client drop");
+    // Counted, as a client disconnect, once.
+    assert_stream_ends(&authorizer, &[StreamEndCause::ClientDisconnect]).await;
 
     // An upstream that ends its listen stream after one event.
     let finite = spawn_router(Router::new().route(
@@ -514,6 +531,176 @@ async fn a_dropped_or_finished_listen_stream_leaves_no_record() {
     authorizer.revoke("alice");
     tokio::time::sleep(RECHECK * 3).await;
     assert!(authorizer.decisions().is_empty(), "upstream end");
+    assert_stream_ends(&authorizer, &[StreamEndCause::UpstreamEof]).await;
+}
+
+/// A listen stream the upstream breaks (here: the upstream's body fails after one event) is
+/// counted as `upstream_error`, once, and leaves no record.
+#[tokio::test]
+async fn a_listen_stream_the_upstream_breaks_is_counted_as_an_upstream_error() {
+    let broken = spawn_router(Router::new().route(
+        "/mcp",
+        post(|| async {
+            (
+                [(header::CONTENT_TYPE, "application/json")],
+                json!({"jsonrpc": "2.0", "id": 1, "result": {}}).to_string(),
+            )
+        })
+        .get(|| async {
+            let events = futures_util::stream::unfold(0u8, |i| async move {
+                match i {
+                    0 => Some((
+                        Ok::<_, std::io::Error>(
+                            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\n\n"
+                                .to_owned(),
+                        ),
+                        1,
+                    )),
+                    1 => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Some((Err(std::io::Error::other("upstream failed")), 2))
+                    }
+                    _ => None,
+                }
+            });
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(events))
+                .unwrap()
+        }),
+    ))
+    .await
+    .unwrap();
+    let authorizer = Arc::new(StaticAuthorizer::new().with_chain(
+        "alice",
+        test_chain("user:alice", "agent:a", [Capability::new(SERVER, "read_*")]),
+    ));
+    let proxy = proxy_with(&broken, authorizer.clone()).await;
+    let resp = reqwest::Client::new()
+        .get(proxy.url(&format!("/mcp/{SERVER}")))
+        .bearer_auth("alice")
+        .header("accept", "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let (text, _) = drain(resp.bytes_stream(), Duration::from_secs(5)).await;
+    assert!(text.contains("notifications/message"), "{text}");
+    assert!(!text.contains("-32001"), "{text}");
+    assert_stream_ends(&authorizer, &[StreamEndCause::UpstreamError]).await;
+    assert!(authorizer.decisions().is_empty());
+}
+
+/// A listen stream whose lease expires is cut, recorded with `lease_expired` and counted.
+#[tokio::test]
+async fn a_listen_stream_whose_lease_expired_ends_and_is_counted() {
+    let upstream = SessionUpstream::default();
+    let up = spawn_router(upstream.router()).await.unwrap();
+    let authorizer = Arc::new(StaticAuthorizer::new().with_chain(
+        "alice",
+        test_chain("user:alice", "agent:a", [Capability::new(SERVER, "read_*")]),
+    ));
+    let proxy = proxy_with(&up, authorizer.clone()).await;
+    let (sid, stream) = open_listen_stream_in(&proxy, "alice").await;
+    authorizer.expire_lease("alice");
+    let (text, _) = drain(stream, Duration::from_secs(5)).await;
+    let last = last_event(&text);
+    assert_eq!(last["error"]["data"]["reason"], "lease_expired");
+    assert_stream_end_record(&authorizer, &last, "lease_expired", Some(&sid));
+    assert_stream_ends(&authorizer, &[StreamEndCause::LeaseExpired]).await;
+}
+
+/// Several listen streams of one chain cut by one revocation (several sessions of one token):
+/// every stream ends with the same final event, but only the first end is a `stream.end`
+/// record; the others are counted as suppressed and their final event names that record.
+/// Another chain keeps its own record. Reopening the stream is still refused every time, and
+/// those refusals (`http.GET`) are not bounded.
+#[tokio::test]
+async fn listen_streams_of_one_chain_cut_together_leave_one_record() {
+    let upstream = SessionUpstream::default();
+    let up = spawn_router(upstream.router()).await.unwrap();
+    let authorizer = Arc::new(
+        StaticAuthorizer::new()
+            .with_chain(
+                "alice",
+                test_chain("user:alice", "agent:a", [Capability::new(SERVER, "read_*")]),
+            )
+            .with_chain(
+                "bob",
+                test_chain("user:bob", "agent:b", [Capability::new(SERVER, "read_*")]),
+            ),
+    );
+    let proxy = proxy_with(&up, authorizer.clone()).await;
+    let mut alice = Vec::new();
+    for _ in 0..3 {
+        alice.push(open_listen_stream_in(&proxy, "alice").await);
+    }
+    let (bob_sid, bob) = open_listen_stream_in(&proxy, "bob").await;
+
+    authorizer.revoke("alice");
+    authorizer.revoke("bob");
+    let mut ids = Vec::new();
+    for (_, stream) in alice {
+        let (text, _) = drain(stream, Duration::from_secs(5)).await;
+        let last = last_event(&text);
+        assert_eq!(last["error"]["code"], -32001);
+        assert_eq!(last["error"]["data"]["reason"], "lease_revoked");
+        ids.push(last["error"]["data"]["decision_id"].clone());
+    }
+    let (text, _) = drain(bob, Duration::from_secs(5)).await;
+    let bob_last = last_event(&text);
+
+    let ends: Vec<_> = authorizer
+        .decisions()
+        .into_iter()
+        .filter(|r| r.tool == STREAM_END_TOOL)
+        .collect();
+    assert_eq!(ends.len(), 2, "{ends:?}");
+    let alice_record = ends
+        .iter()
+        .find(|r| r.originating_subject == "user:alice")
+        .unwrap();
+    let bob_record = ends
+        .iter()
+        .find(|r| r.originating_subject == "user:bob")
+        .unwrap();
+    assert!(
+        ids.iter().all(|id| *id == alice_record.id.to_string()),
+        "{ids:?}"
+    );
+    assert_eq!(
+        bob_last["error"]["data"]["decision_id"],
+        bob_record.id.to_string()
+    );
+    assert_eq!(
+        bob_record.session_id.as_deref(),
+        Some(session_tag(&bob_sid).as_str())
+    );
+    assert_eq!(
+        authorizer.suppressed_records(),
+        vec![(STREAM_END_TOOL.to_owned(), StreamEndCause::LeaseRevoked); 2]
+    );
+    assert_stream_ends(&authorizer, &[StreamEndCause::LeaseRevoked; 4]).await;
+
+    // Reopening is refused each time, with a record per attempt as before.
+    for _ in 0..2 {
+        let resp = reqwest::Client::new()
+            .get(proxy.url(&format!("/mcp/{SERVER}")))
+            .bearer_auth("alice")
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    let refusals = authorizer
+        .decisions()
+        .into_iter()
+        .filter(|r| r.tool == "http.GET")
+        .count();
+    assert_eq!(refusals, 2);
+    assert_eq!(authorizer.suppressed_records().len(), 2);
 }
 
 /// SR-28: a listen stream does not outlive the token that opened it.
@@ -539,6 +726,68 @@ async fn an_expired_tokens_listen_stream_ends() {
     let last = last_event(&text);
     assert_eq!(last["error"]["data"]["reason"], "token_expired");
     assert_stream_end_record(&authorizer, &last, "token_expired", Some(&sid));
+    assert_stream_ends(&authorizer, &[StreamEndCause::TokenExpired]).await;
+}
+
+/// `token_expired` volume: every listen stream of one token still open at its expiry ends,
+/// but only the first is recorded; the others are counted as suppressed. A client that then
+/// reopens the stream with the expired token is refused (`401`, `token_expired`) without a
+/// record, as before: an expired token is refused before any lease check, and is never
+/// recorded.
+#[tokio::test]
+async fn listen_streams_open_at_token_expiry_leave_one_record() {
+    let upstream = SessionUpstream::default();
+    let up = spawn_router(upstream.router()).await.unwrap();
+    let ttl = Duration::from_millis(1200);
+    let chain = DelegationChain::root(
+        test_user("user:alice"),
+        AgentId::new("agent:a"),
+        CapabilitySet::from_iter([Capability::new(SERVER, "read_*")]),
+        time::OffsetDateTime::now_utc(),
+        time::Duration::try_from(ttl).unwrap(),
+        LeaseId::new("lease-short"),
+    )
+    .unwrap();
+    let authorizer = Arc::new(StaticAuthorizer::new().with_chain("alice", chain));
+    let proxy = proxy_with(&up, authorizer.clone()).await;
+    let first = open_listen_stream(&proxy, "alice").await;
+    let second = open_listen_stream(&proxy, "alice").await;
+
+    let (a, b) = tokio::join!(
+        drain(first, ttl + Duration::from_secs(2)),
+        drain(second, ttl + Duration::from_secs(2))
+    );
+    let (a, b) = (last_event(&a.0), last_event(&b.0));
+    for last in [&a, &b] {
+        assert_eq!(last["error"]["data"]["reason"], "token_expired");
+    }
+    let records: Vec<_> = authorizer
+        .decisions()
+        .into_iter()
+        .filter(|r| r.tool == STREAM_END_TOOL)
+        .collect();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].reason, "token_expired");
+    assert_eq!(
+        authorizer.suppressed_records(),
+        vec![(STREAM_END_TOOL.to_owned(), StreamEndCause::TokenExpired)]
+    );
+    assert_stream_ends(&authorizer, &[StreamEndCause::TokenExpired; 2]).await;
+
+    for _ in 0..3 {
+        let resp = reqwest::Client::new()
+            .get(proxy.url(&format!("/mcp/{SERVER}")))
+            .bearer_auth("alice")
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["data"]["reason"], "token_expired");
+        assert!(body["error"]["data"].get("decision_id").is_none());
+    }
+    assert_eq!(authorizer.decisions().len(), 1);
 }
 
 /// SR-28: re-checking does not disturb a stream whose lease stays live.
@@ -627,4 +876,7 @@ async fn a_revoked_sse_tool_call_response_ends() {
     // The call's own decision, then the end of its answer stream (no session here).
     assert_eq!(authorizer.decisions()[0].tool, "read_slowly");
     assert_stream_end_record(&authorizer, &last, "lease_revoked", None);
+    // Not a listen stream: not counted in `proxy_streams_ended_total`.
+    tokio::time::sleep(RECHECK * 3).await;
+    assert!(authorizer.stream_ends().is_empty());
 }

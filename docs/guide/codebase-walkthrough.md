@@ -903,7 +903,7 @@ Every command in the block was run against `main` @ 471a319 on 2026-10-24 with d
 What is still open (from the [task board](../tasks/board.md) and the day's log):
 
 - Revocation: revoking by the audit `session_tag` (48 bits, so the server would have to list every match); a lost session binding is only a log line.
-- Proxy: Cedar-aware list filtering; listen streams the client dropped are log lines only; every listen stream still open at token expiry adds one `token_expired` record.
+- Proxy: Cedar-aware list filtering. (Listen-stream endings are counted in `proxy_streams_ended_total` and their `stream.end` records bounded per chain and reason since `feat/proxy-stream-endings`; the `http.GET` refusals of a client reopening a stream on a revoked lease are still one record per request.)
 - Policy harness: the admin dry run cannot be given a `budget`, so those cases are skipped.
 - Injection suite: `stage_of` in `evaluation/injection-suite/harness.py` does not know `input_type_mismatch`, so `t-banking-02` and `t-workspace-03` will score their mistyped attack calls as stage `other` (still denied) on the next run.
 - SDKs: done after this session on `feat/sdk-export-revoke-selectors`: `audit_export` / `auditExport` take `tool` and `decision`, and `revoke_by_selector` / `revokeBySelector` wrap `POST /admin/leases/revoke`.

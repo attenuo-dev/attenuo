@@ -13,6 +13,7 @@ use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::guard::StreamEndCause;
 use crate::stage::Stage;
 
 /// The outcome of authorizing one call, plus the id of the audit record that was written.
@@ -388,5 +389,23 @@ pub trait Authorizer: Send + Sync {
     /// so it must be cheap. The default discards it.
     fn observe_stage(&self, stage: Stage, elapsed: Duration) {
         let _ = (stage, elapsed);
+    }
+
+    /// Count one `GET` listen stream that ended, by why it ended (the server's
+    /// `proxy_streams_ended_total{cause}`). Called exactly once per listen stream, however it
+    /// ended (see [`crate::guard`]), from a `Drop`, so it must be cheap and must not block.
+    /// The default discards it.
+    fn observe_stream_end(&self, cause: StreamEndCause) {
+        let _ = cause;
+    }
+
+    /// Count one audit record the proxy did not write because an earlier record of the same
+    /// delegation chain and reason stands for it (the server's
+    /// `audit_records_suppressed_total{tool,reason}`). Today only `tool` =
+    /// [`crate::guard::STREAM_END_TOOL`] on the `GET` listen stream, with `reason` one of
+    /// [`StreamEndCause::RECORDED`] ([`crate::guard::StreamEndRecords`]). The default
+    /// discards it.
+    fn observe_record_suppressed(&self, tool: &'static str, reason: StreamEndCause) {
+        let _ = (tool, reason);
     }
 }

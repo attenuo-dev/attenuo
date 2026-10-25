@@ -1987,6 +1987,14 @@ impl Authorizer for ServerAuthorizer {
     fn observe_stage(&self, stage: Stage, elapsed: Duration) {
         self.pipeline.metrics().observe_stage(stage, elapsed);
     }
+
+    fn observe_stream_end(&self, cause: attenuo_proxy::StreamEndCause) {
+        self.pipeline.metrics().stream_ended(cause);
+    }
+
+    fn observe_record_suppressed(&self, tool: &'static str, reason: attenuo_proxy::StreamEndCause) {
+        self.pipeline.metrics().record_suppressed(tool, reason);
+    }
 }
 
 #[cfg(test)]
