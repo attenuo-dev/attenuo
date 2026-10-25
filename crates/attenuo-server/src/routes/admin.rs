@@ -365,9 +365,11 @@ pub struct RefundBody {
 /// return to every run-limit counter what that decision charged, at most once, and append an
 /// `admin` record (tool `admin.budget.refund`) naming the decision. For an allowed call whose
 /// effect an operator knows did not happen; neither the agent nor the upstream can refund.
-/// 404 when the decision charged nothing or its charge log was pruned (`[leases]
-/// run_state_retention_seconds`, only once the run's leases are gone), 409 when it was already
-/// refunded. The run usage the
+/// When the charge log has nothing for the decision, the audit log (append-only, every
+/// decision kept) tells why (`no_charge_refusal`): 410 `charge_pruned` when its record shows
+/// a run-limit charge (the charge-log entry was pruned, `[leases] run_state_retention_seconds`,
+/// only once the run's leases are gone), 404 `not_found` naming "charged nothing" or "unknown
+/// decision" otherwise. 409 when it was already refunded. The run usage the
 /// decision charged (run-limits design section 3.5) is returned too; `refunded` counts only
 /// token-limit counters, so it is 0 for a call that charged usage alone.
 ///
@@ -389,11 +391,7 @@ pub async fn refund_budget(
                 .leases
                 .refund(&decision_id, now)
                 .map_err(|e| match e {
-                    AuditError::UnknownCharge(_) => ApiError::not_found(format!(
-                        "no budget charge is recorded for decision `{decision_id}`: it charged \
-                         nothing, or its run's charge log was pruned \
-                         ([leases] run_state_retention_seconds)"
-                    )),
+                    AuditError::UnknownCharge(_) => no_charge_refusal(state, &decision_id),
                     AuditError::ChargeRefunded(_) => ApiError::new(
                         StatusCode::CONFLICT,
                         "already_refunded",
@@ -423,6 +421,60 @@ pub async fn refund_budget(
         })
         .await
 }
+
+/// The refusal of a refund whose decision has no entry in the charge log, told apart by the
+/// decision's audit record, which outlives the charge log:
+///
+/// - the record carries `budget` (the allowed call charged run-limit counters): the entry can
+///   only have gone by run-state pruning, so 410 `charge_pruned`;
+/// - an allowed decision with `usage` and no `budget` charged run usage only, which is dropped
+///   when its run's root lease is revoked as well as when it is pruned: 404 `not_found` saying
+///   so (the two cannot be told apart from the record);
+/// - any other record charged nothing: 404 `not_found`, "charged nothing";
+/// - no record with that id (or not a UUID): 404 `not_found`, "unknown decision".
+///
+/// Reads only; nothing is audited for the refusal. A failed audit read is a 500.
+fn no_charge_refusal(state: &AppState, decision_id: &str) -> ApiError {
+    let record = match uuid::Uuid::parse_str(decision_id) {
+        // Records store the hyphenated lower-case form.
+        Ok(id) => match state.audit.entry_by_record_id(&id.to_string()) {
+            Ok(entry) => entry.map(|e| e.record),
+            Err(e) => return ApiError::internal(e),
+        },
+        Err(_) => None,
+    };
+    let Some(record) = record else {
+        return ApiError::not_found(format!(
+            "unknown decision `{decision_id}`: no audit record has this id; nothing to refund"
+        ));
+    };
+    let decided = record.kind == RecordKind::Decision && record.decision.is_allow();
+    if decided && record.budget.is_some() {
+        ApiError::new(
+            StatusCode::GONE,
+            CHARGE_PRUNED,
+            format!(
+                "the charge of decision `{decision_id}` was pruned: its run's leases are gone \
+                 and the charge is older than [leases] run_state_retention_seconds, so it can \
+                 no longer be refunded (its audit record keeps what it charged)"
+            ),
+        )
+    } else if decided && record.usage.is_some() {
+        ApiError::not_found(format!(
+            "decision `{decision_id}` charged no run limit, only run usage, which is no longer \
+             recorded (dropped when its run was revoked, or pruned past [leases] \
+             run_state_retention_seconds); nothing to refund"
+        ))
+    } else {
+        ApiError::not_found(format!(
+            "decision `{decision_id}` charged nothing: its audit record shows no run limit or \
+             run usage charged; nothing to refund"
+        ))
+    }
+}
+
+/// `error` of a refund whose charge was pruned from the charge log (410).
+pub const CHARGE_PRUNED: &str = "charge_pruned";
 
 /// `GET /admin/leases/{lease_id}`: the lease's registry row and whether it is active now.
 pub async fn lease_status(
