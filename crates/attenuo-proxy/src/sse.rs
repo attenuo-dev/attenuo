@@ -235,6 +235,13 @@ fn replace_lone_surrogates(text: &str) -> String {
     out
 }
 
+/// Does `event` carry data (at least one `data` line)? True for an event that is not UTF-8,
+/// whose lines the proxy cannot read. With [`event_json`], tells an event whose data the proxy
+/// could not parse, which a client with another JSON parser may still read (SR-79).
+pub(crate) fn has_data(event: &[u8]) -> bool {
+    std::str::from_utf8(event).map_or(true, |text| !data_lines(&split_lines(text)).is_empty())
+}
+
 /// One `message` event carrying `message` as its data.
 pub(crate) fn message_event(message: &Value) -> Vec<u8> {
     format!(

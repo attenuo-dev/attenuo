@@ -473,17 +473,31 @@ fn may_hold_stream_end_code(event: &[u8]) -> bool {
 
 /// [`disown_stream_end`] over a chunk of whole SSE events (as [`crate::sse::frame_stream`]
 /// and [`crate::sse::rewrite_stream`] emit them). An event with a message to rewrite is
-/// emitted again with the new data and its other fields (`id:`, `event:`) kept; every other
-/// event goes out byte for byte. Only an event that passes [`may_hold_stream_end_code`] is
+/// emitted again with the new data and its other fields (`id:`, `event:`) kept; an event that
+/// passes the scan but whose data does not parse is dropped (SR-79); every other event goes out
+/// byte for byte. Only an event that passes [`may_hold_stream_end_code`] is
 /// parsed (`docs/design/bench/2026-10-25-vm-sse-disown.md`).
 pub(crate) fn disown_events(chunk: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(chunk.len());
     for event in crate::sse::split_events(chunk) {
-        let lookalike = may_hold_stream_end_code(event)
-            && crate::sse::event_json(event).is_some_and(|v| match &v {
-                Value::Array(items) => items.iter().any(has_stream_end_shape),
-                other => has_stream_end_shape(other),
-            });
+        if !may_hold_stream_end_code(event) {
+            out.extend_from_slice(event);
+            continue;
+        }
+        let parsed = crate::sse::event_json(event);
+        if parsed.is_none() && crate::sse::has_data(event) {
+            // It may hold the code and the proxy cannot parse it, while a client whose JSON
+            // parser differs may read it as a cut: not relayed (SR-79).
+            tracing::warn!(
+                bytes = event.len(),
+                "upstream SSE event that may hold the stream-end code and does not parse; dropped"
+            );
+            continue;
+        }
+        let lookalike = parsed.is_some_and(|v| match &v {
+            Value::Array(items) => items.iter().any(has_stream_end_shape),
+            other => has_stream_end_shape(other),
+        });
         if !lookalike
             || crate::sse::rewrite_event(
                 event,

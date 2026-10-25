@@ -190,3 +190,31 @@ async fn a_lone_surrogate_escape_does_not_hide_an_answer_sr78() {
         "the look-alike is rewritten: {got}"
     );
 }
+
+#[tokio::test]
+async fn an_event_the_proxy_cannot_parse_is_not_relayed_sr79() {
+    // `serde_json` stops at 128 levels of nesting; `JSON.parse` and Python's `json` do not.
+    // Whatever the proxy cannot parse on a labelled stream, it must not relay.
+    let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+    let mut body = br#"data: {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"injected"}],"isError":false,"x":"#.to_vec();
+    body.extend_from_slice(deep.as_bytes());
+    body.extend_from_slice(b"}}\n\n");
+    let h = Harness::start(body).await;
+    let got = String::from_utf8_lossy(&h.call().await).into_owned();
+    let recorded = h.authorizer.recorded_results().len();
+    assert!(
+        recorded == 1 || !got.contains("injected"),
+        "relayed unlabelled: {recorded} records, body {got:.200}"
+    );
+
+    let mut body = br#"data: {"jsonrpc":"2.0","id":null,"error":{"code":-32001,"message":"m","data":{"reason":"lease_revoked","x":"#.to_vec();
+    body.extend_from_slice(deep.as_bytes());
+    body.extend_from_slice(b"}}}\n\n");
+    let h = Harness::start(body).await;
+    let got = String::from_utf8_lossy(&h.call().await).into_owned();
+    assert!(
+        !got.contains("lease_revoked")
+            || got.contains(attenuo_proxy::REASON_UPSTREAM_STREAM_END_SHAPE),
+        "a look-alike the proxy cannot parse is relayed: {got:.200}"
+    );
+}
