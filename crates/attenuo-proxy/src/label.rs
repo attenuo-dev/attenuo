@@ -7,7 +7,7 @@
 //! run. When that fails, the response is replaced by a JSON-RPC error with reason
 //! `label_error`: the call ran upstream, but its result never reaches the agent.
 //!
-//! Responses are found the way list results are: a message with no `method` whose `id`
+//! Responses are found the way list results are: a message with no string `method` whose `id`
 //! matches the id of an allowed call of the same HTTP request, in a JSON body (single or
 //! batch) or in the events of an SSE body, event by event. Every matching response is
 //! recorded, so an upstream that answers one id twice gets two records, not one unlabelled
@@ -316,9 +316,10 @@ impl Labeller {
         }
     }
 
-    /// The id of `msg` if it is a response (no `method`).
+    /// The id of `msg` if it is a response: no `method`, or one that is not a string, which no
+    /// client reads as a request (SR-69).
     fn response_id(msg: &Value) -> Option<&Value> {
-        if msg.get("method").is_some() {
+        if jsonrpc::method_of(msg).is_some() {
             return None;
         }
         msg.get("id")
@@ -524,6 +525,22 @@ mod tests {
         assert_eq!(msg["error"]["code"], jsonrpc::CODE_DENIED);
         assert_eq!(msg["error"]["data"]["reason"], REASON_LABEL_ERROR);
         assert_eq!(msg["id"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_null_method_does_not_hide_a_result_from_labelling_sr69() {
+        // An upstream (A3) that adds `"method": null` to its answer must not get it past the
+        // labeller: a client such as the Python MCP SDK still reads it as the response.
+        let auth = Arc::new(StaticAuthorizer::new());
+        let l = labeller(auth.clone());
+        let mut msg = json!({"jsonrpc": "2.0", "id": 1, "method": null, "result": {"content": []}});
+        l.label_value(&mut msg).await;
+        assert_eq!(auth.recorded_results().len(), 1, "recorded and labelled");
+
+        auth.fail_results(true);
+        let mut msg = json!({"jsonrpc": "2.0", "id": 1, "method": 7, "result": {"content": []}});
+        assert_eq!(l.label_value(&mut msg).await, 1, "withheld when the label fails");
+        assert_eq!(msg["error"]["data"]["reason"], REASON_LABEL_ERROR);
     }
 
     #[tokio::test]
