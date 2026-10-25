@@ -811,9 +811,11 @@ async fn inspect(client: Option<Client>, args: cli::InspectArgs, json: bool) -> 
 const EXIT_NOTHING_CHARGED: u8 = 2;
 /// Exit status of `budget refund` when the decision was already refunded (409).
 const EXIT_ALREADY_REFUNDED: u8 = 3;
+/// Exit status of `budget refund` when the decision's charge was pruned (410).
+const EXIT_CHARGE_PRUNED: u8 = 4;
 
-/// `budget refund`: `POST /admin/budgets/refund`. The two refusals a script may want to tell
-/// apart get one line on stderr and exit statuses of their own; anything else is an error.
+/// `budget refund`: `POST /admin/budgets/refund`. The three refusals a script may want to
+/// tell apart get one line on stderr and exit statuses of their own; anything else is an error.
 async fn budget_refund(
     client: &Client,
     decision_id: &str,
@@ -840,23 +842,38 @@ async fn budget_refund(
     }
 }
 
-/// The exit status and message for a refund the server refused as nothing charged (404
-/// `not_found`: the decision charged nothing, or its charge log was pruned by
-/// `[leases] run_state_retention_seconds`) or already refunded (409 `already_refunded`). A 404 without that code (a
-/// server too old to have the route) stays an ordinary error.
+/// The exit status and message for a refund the server refused: nothing to refund (404
+/// `not_found`, printed as the server's detail, which says whether the decision is unknown,
+/// charged nothing or charged run usage only), already refunded (409 `already_refunded`) or
+/// charge pruned (410 `charge_pruned`: its audit record shows a charge, but the charge log
+/// entry went past `[leases] run_state_retention_seconds`). A 404 without that code (a server
+/// too old to have the route) stays an ordinary error.
 fn refund_refusal(e: &anyhow::Error, decision_id: &str) -> Option<(u8, String)> {
     let api = e.downcast_ref::<client::ApiError>()?;
     match (api.status.as_u16(), api.code.as_deref()?) {
         (404, "not_found") => Some((
             EXIT_NOTHING_CHARGED,
-            format!(
-                "no charge is recorded for decision {decision_id} (it charged no run limit or run \
-                 usage, or its charge log was pruned); nothing to refund"
-            ),
+            // The server's detail tells the cases apart; servers before it said only this.
+            api.detail
+                .clone()
+                .filter(|d| !d.trim().is_empty())
+                .unwrap_or_else(|| {
+                    format!(
+                        "no charge is recorded for decision {decision_id} (it charged no run \
+                         limit or run usage, or its charge log was pruned); nothing to refund"
+                    )
+                }),
         )),
         (409, "already_refunded") => Some((
             EXIT_ALREADY_REFUNDED,
             format!("the charge of decision {decision_id} was already refunded"),
+        )),
+        (410, "charge_pruned") => Some((
+            EXIT_CHARGE_PRUNED,
+            format!(
+                "the charge of decision {decision_id} was pruned ([leases] \
+                 run_state_retention_seconds after its run ended); it can no longer be refunded"
+            ),
         )),
         _ => None,
     }
@@ -1343,16 +1360,56 @@ mod tests {
     fn refund_refusals_get_their_own_line_and_exit_status() {
         use reqwest::StatusCode;
         let err = |status, body: &str| client::api_error(status, body);
+        // 404: the server's detail, which says which case it is (exit 2 for each).
         let nothing = err(
             StatusCode::NOT_FOUND,
-            r#"{"error":"not_found","detail":"no budget charge"}"#,
+            r#"{"error":"not_found","detail":"decision `D1` charged nothing: its audit record shows no run limit or run usage charged; nothing to refund"}"#,
         );
-        let (code, line) = refund_refusal(&nothing, "D1").unwrap();
-        assert_eq!(code, 2);
         assert_eq!(
-            line,
-            "no charge is recorded for decision D1 (it charged no run limit or run usage, or \
-             its charge log was pruned); nothing to refund"
+            refund_refusal(&nothing, "D1"),
+            Some((
+                2,
+                "decision `D1` charged nothing: its audit record shows no run limit or run \
+                 usage charged; nothing to refund"
+                    .to_string()
+            ))
+        );
+        let unknown = err(
+            StatusCode::NOT_FOUND,
+            r#"{"error":"not_found","detail":"unknown decision `D1`: no audit record has this id; nothing to refund"}"#,
+        );
+        assert_eq!(
+            refund_refusal(&unknown, "D1").unwrap().1,
+            "unknown decision `D1`: no audit record has this id; nothing to refund"
+        );
+        // A server from before the audit-log lookup, or with no detail: the old line.
+        let bare = err(StatusCode::NOT_FOUND, r#"{"error":"not_found"}"#);
+        assert_eq!(
+            refund_refusal(&bare, "D1"),
+            Some((
+                2,
+                "no charge is recorded for decision D1 (it charged no run limit or run usage, \
+                 or its charge log was pruned); nothing to refund"
+                    .to_string()
+            ))
+        );
+        // 410: pruned, exit 4, a line of its own whatever the detail.
+        let pruned = err(
+            StatusCode::GONE,
+            r#"{"error":"charge_pruned","detail":"the charge of decision `D1` was pruned"}"#,
+        );
+        assert_eq!(
+            refund_refusal(&pruned, "D1"),
+            Some((
+                4,
+                "the charge of decision D1 was pruned ([leases] run_state_retention_seconds \
+                 after its run ended); it can no longer be refunded"
+                    .to_string()
+            ))
+        );
+        assert_eq!(
+            refund_refusal(&err(StatusCode::GONE, r#"{"error":"other"}"#), "D1"),
+            None
         );
         let twice = err(
             StatusCode::CONFLICT,

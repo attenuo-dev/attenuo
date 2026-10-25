@@ -376,6 +376,8 @@ async fn derived_destination_counts_the_host_of_a_url() {
 }
 
 /// Usage follows the decision's refund, and ends with the run when its root lease is revoked.
+/// A refund of a usage-only decision after that is 404 `not_found` saying it charged run usage
+/// only (not "charged nothing", not 410: run usage goes at revocation, not only by pruning).
 #[tokio::test]
 async fn usage_is_refunded_with_the_decision_and_deleted_with_the_run() {
     let h = Harness::start().await;
@@ -400,6 +402,10 @@ async fn usage_is_refunded_with_the_decision_and_deleted_with_the_run() {
 
     assert!(allowed(&h.pay(&root.token, "R1", 10).await));
     assert_eq!(h.dry_run_usage(&root.token).await["calls"], 1);
+    let second = h.decisions().await.last().unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let resp = h
         .admin_post(
             &format!("/admin/leases/{}/revoke", root.lease),
@@ -412,6 +418,18 @@ async fn usage_is_refunded_with_the_decision_and_deleted_with_the_run() {
         u["source"] = "store".into();
         u
     });
+    let resp = h
+        .admin_post("/admin/budgets/refund", json!({"decision_id": second}))
+        .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["error"], "not_found");
+    assert!(
+        v["detail"].as_str().unwrap().starts_with(&format!(
+            "decision `{second}` charged no run limit, only run usage"
+        )),
+        "{v}"
+    );
 }
 
 /// AuthZEN charges usage as a proxied call does and reports it; a PEP cannot send its own.

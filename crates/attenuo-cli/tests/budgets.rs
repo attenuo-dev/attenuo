@@ -209,7 +209,7 @@ async fn refund_and_tree_budgets_against_a_real_server() {
     c.args(["--json", "budget", "refund", &decision, "--reason", "again"]);
     assert_eq!(run(c).await.status.code(), Some(3));
 
-    // -- a decision that charged nothing: 404, exit 2 --
+    // -- an unknown decision: 404, exit 2, the server's detail --
     let unknown = "00000000-0000-4000-8000-000000000000";
     let mut c = admin();
     c.args(["budget", "refund", unknown, "--reason", "typo"]);
@@ -218,8 +218,8 @@ async fn refund_and_tree_budgets_against_a_real_server() {
     assert_eq!(
         text(&out.stderr),
         format!(
-            "error: no charge is recorded for decision {unknown} (it charged no run limit or run \
-             usage, or its charge log was pruned); nothing to refund\n"
+            "error: unknown decision `{unknown}`: no audit record has this id; nothing to \
+             refund\n"
         )
     );
 

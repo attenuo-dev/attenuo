@@ -1416,8 +1416,10 @@ async fn a_revoked_hop_cannot_read_its_runs_approvals_sr60() {
 /// registry nothing of it is pruned, however old; once the lease is pruned, its charge log,
 /// counter and approvals stay for `[leases] run_state_retention_seconds` (30 days by default)
 /// and go past it, counted in `run_state_pruned_total{kind}`. An operator refund of the pruned
-/// charge answers 404 `not_found`; bob's live run, as old, keeps everything and can still be
-/// refunded. The audit log keeps every record.
+/// charge answers 410 `charge_pruned` (its audit record shows the charge), unlike a decision
+/// that charged nothing or an unknown id (404 `not_found`, each with its own detail); bob's
+/// live run, as old, keeps everything and can still be refunded. The audit log keeps every
+/// record.
 #[tokio::test]
 async fn run_state_of_pruned_runs_is_pruned_past_its_retention() {
     let h = Harness::start().await;
@@ -1560,13 +1562,50 @@ async fn run_state_of_pruned_runs_is_pruned_past_its_retention() {
     assert_eq!(pruned("charges"), 1, "alice's read_web decision");
     assert_eq!(pruned("approvals"), 2);
 
+    // The pruned charge: its decision record still shows it, so the refund is 410, not 404.
     let (status, v) = refund(alice_read.clone()).await;
+    assert_eq!(status, StatusCode::GONE, "{v}");
+    assert_eq!(v["error"], "charge_pruned");
+    let detail = v["detail"].as_str().unwrap();
+    assert!(
+        detail.contains(&alice_read) && detail.contains("run_state_retention_seconds"),
+        "the detail names the decision and the retention: {v}"
+    );
+    assert!(v.get("decision_id").is_none(), "no record was written: {v}");
+    // alice's gated call was decided (approval required) but charged nothing: still 404.
+    let gated_call = h
+        .records()
+        .await
+        .iter()
+        .find(|r| {
+            r["kind"] == "decision"
+                && r["tool"] == "delete_repo"
+                && r["decision"] == "deny"
+                && r["originating_subject"] == "alice"
+        })
+        .and_then(|r| r["id"].as_str())
+        .unwrap()
+        .to_string();
+    let (status, v) = refund(gated_call.clone()).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
     assert_eq!(v["error"], "not_found");
-    assert!(
-        v["detail"].as_str().unwrap().contains("pruned"),
-        "the detail names the retention: {v}"
+    assert_eq!(
+        v["detail"],
+        format!(
+            "decision `{gated_call}` charged nothing: its audit record shows no run limit or \
+             run usage charged; nothing to refund"
+        )
     );
+    // No such decision at all, as a UUID or not.
+    for unknown in ["00000000-0000-4000-8000-000000000000", "not-a-uuid"] {
+        let (status, v) = refund(unknown.to_string()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+        assert_eq!(v["error"], "not_found");
+        assert_eq!(
+            v["detail"],
+            format!("unknown decision `{unknown}`: no audit record has this id; nothing to refund")
+        );
+    }
     for id in [&consumed.approval_id, &declined.approval_id] {
         let resp = h
             .client
