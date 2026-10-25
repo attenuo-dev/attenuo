@@ -25,20 +25,20 @@
 //!   [`Authorizer::observe_stream_end`] (the server's `proxy_streams_ended_total{cause}`),
 //!   however it ends: cut by the re-check, finished or broken by the upstream, or dropped by
 //!   the client (the `Drop` of the stream state);
-//! - its `stream.end` records are bounded by a [`StreamEndRecords`] window: at most one per
-//!   delegation chain and reason every [`STREAM_END_RECORD_WINDOW`]. The first end in a window
-//!   is recorded; later ones in the same window still end their stream with the same final
-//!   event (naming the first record's id), are logged, and are counted through
-//!   [`Authorizer::observe_record_suppressed`] instead of recorded. Tool-call decisions and
-//!   every other refusal are never bounded this way.
+//! - its `stream.end` records are bounded by a [`RecordWindow`]: at most one per delegation
+//!   chain and reason every [`STREAM_END_RECORD_WINDOW`]. The first end in a window is
+//!   recorded; later ones in the same window still end their stream with the same final event
+//!   (naming the first record's id), are logged, and are counted through
+//!   [`Authorizer::observe_record_suppressed`] instead of recorded. The lease refusals of
+//!   undecided requests are bounded the same way by their own window ([`crate::records`]);
+//!   tool-call decisions and decided refusals (exchanges, renewals) never are.
 //!
 //! Dropping the wrapped stream drops the upstream response, which closes the upstream
 //! connection.
 
-use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use attenuo_core::{chain_id_of, DelegationChain, ToolCall};
@@ -50,6 +50,7 @@ use uuid::Uuid;
 
 use crate::auth::{AuthError, Authorizer};
 use crate::jsonrpc::{error_response, CODE_UNAUTHORIZED};
+use crate::records::{Admission, RecordWindow};
 use crate::session::session_tag;
 
 /// Reason given when a stream is ended because a hop of the token's chain expired.
@@ -61,17 +62,12 @@ pub const STREAM_END_TOOL: &str = "stream.end";
 
 /// How long, after a `stream.end` record of a `GET` listen stream, further ends of listen
 /// streams of the same delegation chain for the same reason are counted instead of recorded
-/// ([`StreamEndRecords`]). A minute keeps the record of when the condition began, and one more
+/// ([`RecordWindow`]). A minute keeps the record of when the condition began, and one more
 /// a minute later while it lasts, without one record per stream: a client holding several
 /// listen streams (or several sessions) of one token sees them all end at the same expiry or
 /// revocation. A constant, not configuration: the suppressed ends are in the metric
 /// `audit_records_suppressed_total` and the proxy log.
 pub const STREAM_END_RECORD_WINDOW: Duration = Duration::from_secs(60);
-
-/// How many (chain, reason) windows [`StreamEndRecords`] keeps at once. When it is full of
-/// windows that are all still open, a further end is recorded rather than suppressed: the
-/// bound may fail open (more records), never closed (fewer).
-pub const STREAM_END_RECORD_KEYS: usize = 10_000;
 
 /// Why a guarded `GET` listen stream ended: the `cause` label of the server's
 /// `proxy_streams_ended_total`. A fixed set, so the metric's cardinality stays bounded; the
@@ -155,118 +151,16 @@ impl StreamEndCause {
         self as usize
     }
 
-    /// The cause of a lease refusal with `reason` ([`AuthError::LeaseInactive`]).
-    fn of_lease_reason(reason: &str) -> Self {
+    /// The cause of a lease refusal with `reason` ([`AuthError::LeaseInactive`]). Also the
+    /// `reason` label of a suppressed lease-refusal record ([`crate::records`]), so a custom
+    /// authorizer's reason cannot widen the metric's label set.
+    pub fn of_lease_reason(reason: &str) -> Self {
         match reason {
             "lease_revoked" => StreamEndCause::LeaseRevoked,
             "lease_expired" => StreamEndCause::LeaseExpired,
             "lease_unknown" => StreamEndCause::LeaseUnknown,
             "lease_error" => StreamEndCause::LeaseError,
             _ => StreamEndCause::LeaseOther,
-        }
-    }
-}
-
-/// The bound on `stream.end` records of `GET` listen streams: at most one per delegation chain
-/// (its digest, so a parent and a sub-agent of one run each keep their own) and reason every
-/// `window` ([`STREAM_END_RECORD_WINDOW`] in the proxy). The first end of a window is recorded,
-/// never a later one, so the log shows when the condition began; the window opens at that
-/// record and a new record is written for the first end after it closes. Shared by every
-/// listen stream of one proxy router.
-#[derive(Debug)]
-pub struct StreamEndRecords {
-    window: Duration,
-    max_keys: usize,
-    slots: Mutex<HashMap<(String, String), Slot>>,
-}
-
-#[derive(Debug)]
-struct Slot {
-    opened: Instant,
-    /// The record that opened the window, once written.
-    first: Option<Uuid>,
-    suppressed: u64,
-}
-
-/// What [`StreamEndRecords::admit`] says about one stream end.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Admission {
-    /// Write the record. `suppressed_before` ends of the same chain and reason were not
-    /// recorded in the window that just closed.
-    Record { suppressed_before: u64 },
-    /// Do not write it: the window's first record (`None` while it is still being written)
-    /// stands for this end too.
-    Suppress { first: Option<Uuid> },
-}
-
-impl Default for StreamEndRecords {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl StreamEndRecords {
-    /// The proxy's bound: [`STREAM_END_RECORD_WINDOW`], [`STREAM_END_RECORD_KEYS`].
-    pub fn new() -> Self {
-        Self::with_window(STREAM_END_RECORD_WINDOW, STREAM_END_RECORD_KEYS)
-    }
-
-    /// A bound with another window and capacity (tests).
-    pub fn with_window(window: Duration, max_keys: usize) -> Self {
-        Self {
-            window,
-            max_keys: max_keys.max(1),
-            slots: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Should an end of a stream of `chain_key` for `reason` at `now` be recorded? A
-    /// [`Admission::Record`] opens a window, so of several concurrent ends exactly one is
-    /// told to record; tell [`StreamEndRecords::recorded`] the record's id once written.
-    pub fn admit(&self, chain_key: &str, reason: &str, now: Instant) -> Admission {
-        let fresh = || Slot {
-            opened: now,
-            first: None,
-            suppressed: 0,
-        };
-        // A poisoned lock fails open: record.
-        let Ok(mut slots) = self.slots.lock() else {
-            return Admission::Record {
-                suppressed_before: 0,
-            };
-        };
-        let key = (chain_key.to_owned(), reason.to_owned());
-        if let Some(slot) = slots.get_mut(&key) {
-            if now.saturating_duration_since(slot.opened) < self.window {
-                slot.suppressed += 1;
-                return Admission::Suppress { first: slot.first };
-            }
-            let suppressed_before = slot.suppressed;
-            *slot = fresh();
-            return Admission::Record { suppressed_before };
-        }
-        if slots.len() >= self.max_keys {
-            let window = self.window;
-            slots.retain(|_, s| now.saturating_duration_since(s.opened) < window);
-            if slots.len() >= self.max_keys {
-                return Admission::Record {
-                    suppressed_before: 0,
-                };
-            }
-        }
-        slots.insert(key, fresh());
-        Admission::Record {
-            suppressed_before: 0,
-        }
-    }
-
-    /// The record admitted for `chain_key` and `reason` was written as `id`: later suppressed
-    /// ends of its window name it.
-    pub fn recorded(&self, chain_key: &str, reason: &str, id: Uuid) {
-        if let Ok(mut slots) = self.slots.lock() {
-            if let Some(slot) = slots.get_mut(&(chain_key.to_owned(), reason.to_owned())) {
-                slot.first.get_or_insert(id);
-            }
         }
     }
 }
@@ -281,7 +175,7 @@ pub struct StreamGuard {
     pub record: Option<StreamRecord>,
     /// Set for a `GET` listen stream ([`StreamGuard::listen`]): its end is counted, and its
     /// `stream.end` record bounded by this window.
-    pub listen: Option<Arc<StreamEndRecords>>,
+    pub listen: Option<Arc<RecordWindow>>,
 }
 
 /// Where a guarded stream goes, for the audit record written when the proxy ends it.
@@ -311,7 +205,7 @@ enum EndRecord {
     None,
     /// Recorded as this id.
     Written(Uuid),
-    /// Not recorded: the first record of the window stands for it ([`StreamEndRecords`]).
+    /// Not recorded: the first record of the window stands for it ([`RecordWindow`]).
     Suppressed(Option<Uuid>),
 }
 
@@ -343,7 +237,7 @@ impl StreamGuard {
 
     /// Mark the stream as a `GET` listen stream: count its end through
     /// [`Authorizer::observe_stream_end`], and bound its `stream.end` records by `records`.
-    pub fn listen(mut self, records: Arc<StreamEndRecords>) -> Self {
+    pub fn listen(mut self, records: Arc<RecordWindow>) -> Self {
         self.listen = Some(records);
         self
     }
@@ -408,7 +302,7 @@ impl StreamGuard {
 
     /// Record the end of the stream for `reason` ([`STREAM_END_TOOL`]), unless the guard
     /// records nothing, or the stream is a listen stream whose chain already has a record for
-    /// `reason` in the current window ([`StreamEndRecords`]).
+    /// `reason` in the current window ([`RecordWindow`]).
     async fn record_end(
         &self,
         reason: &str,
@@ -423,7 +317,7 @@ impl StreamGuard {
             .as_ref()
             .map(|records| (records, self.chain.digest()));
         if let Some((records, key)) = &window {
-            match records.admit(key, reason, Instant::now()) {
+            match records.admit(key, STREAM_END_TOOL, reason, Instant::now()) {
                 Admission::Suppress { first } => {
                     self.authorizer
                         .observe_record_suppressed(STREAM_END_TOOL, cause);
@@ -451,7 +345,7 @@ impl StreamGuard {
             .record_rejection(&self.chain, &call, reason, now)
             .await;
         if let Some((records, key)) = &window {
-            records.recorded(key, reason, id);
+            records.recorded(key, STREAM_END_TOOL, reason, id);
         }
         EndRecord::Written(id)
     }
@@ -685,74 +579,6 @@ mod tests {
         );
     }
 
-    const SEC: Duration = Duration::from_secs(1);
-
-    #[test]
-    fn the_first_end_of_a_window_is_recorded_and_repeats_are_counted() {
-        let r = StreamEndRecords::with_window(60 * SEC, 16);
-        let t0 = Instant::now();
-        let record = |n| Admission::Record {
-            suppressed_before: n,
-        };
-        assert_eq!(r.admit("c1", "token_expired", t0), record(0));
-        // Still being written: nothing to name yet.
-        assert_eq!(
-            r.admit("c1", "token_expired", t0 + SEC),
-            Admission::Suppress { first: None }
-        );
-        let id = Uuid::new_v4();
-        r.recorded("c1", "token_expired", id);
-        assert_eq!(
-            r.admit("c1", "token_expired", t0 + 59 * SEC),
-            Admission::Suppress { first: Some(id) }
-        );
-        // The window runs from the first record, not from the last repeat: a client that keeps
-        // trying gets a new record every window, and the old one is never replaced.
-        assert_eq!(r.admit("c1", "token_expired", t0 + 60 * SEC), record(2));
-        r.recorded("c1", "token_expired", Uuid::new_v4());
-        assert!(matches!(
-            r.admit("c1", "token_expired", t0 + 61 * SEC),
-            Admission::Suppress { first: Some(other) } if other != id
-        ));
-        assert_eq!(r.admit("c1", "token_expired", t0 + 200 * SEC), record(1));
-    }
-
-    #[test]
-    fn chains_and_reasons_have_their_own_windows() {
-        let r = StreamEndRecords::with_window(60 * SEC, 16);
-        let t0 = Instant::now();
-        let first = Admission::Record {
-            suppressed_before: 0,
-        };
-        assert_eq!(r.admit("c1", "token_expired", t0), first);
-        assert_eq!(r.admit("c2", "token_expired", t0), first);
-        assert_eq!(r.admit("c1", "lease_revoked", t0), first);
-        assert!(matches!(
-            r.admit("c2", "token_expired", t0),
-            Admission::Suppress { .. }
-        ));
-    }
-
-    #[test]
-    fn a_full_table_records_rather_than_suppresses() {
-        let r = StreamEndRecords::with_window(60 * SEC, 2);
-        let t0 = Instant::now();
-        let first = Admission::Record {
-            suppressed_before: 0,
-        };
-        assert_eq!(r.admit("c1", "token_expired", t0), first);
-        assert_eq!(r.admit("c2", "token_expired", t0), first);
-        // Both windows open: c3 is recorded every time, never suppressed.
-        assert_eq!(r.admit("c3", "token_expired", t0), first);
-        assert_eq!(r.admit("c3", "token_expired", t0 + SEC), first);
-        // Once the old windows close they make room, and c3 is bounded again.
-        assert_eq!(r.admit("c3", "token_expired", t0 + 61 * SEC), first);
-        assert!(matches!(
-            r.admit("c3", "token_expired", t0 + 62 * SEC),
-            Admission::Suppress { .. }
-        ));
-    }
-
     /// The JSON-RPC payload of the final event of a stream the guard ended.
     async fn final_event(guard: StreamGuard) -> Value {
         let mut s = Box::pin(guard_stream(ticking(), guard, true));
@@ -779,7 +605,7 @@ mod tests {
         auth.revoke("a");
         auth.revoke("b");
         let window = Duration::from_secs(1);
-        let records = Arc::new(StreamEndRecords::with_window(window, 16));
+        let records = Arc::new(RecordWindow::with_max_keys(window, 16));
         let guard = |chain: &DelegationChain| {
             StreamGuard::new(auth.clone(), chain.clone(), Duration::from_millis(10))
                 .recording("s", Some("sess"), false)
@@ -856,7 +682,7 @@ mod tests {
     fn listen_guard(auth: &Arc<StaticAuthorizer>, chain: &DelegationChain) -> StreamGuard {
         StreamGuard::new(auth.clone(), chain.clone(), Duration::from_millis(10))
             .recording("s", None, false)
-            .listen(Arc::new(StreamEndRecords::new()))
+            .listen(Arc::new(RecordWindow::new(STREAM_END_RECORD_WINDOW)))
     }
 
     #[tokio::test]

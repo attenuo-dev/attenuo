@@ -1810,6 +1810,95 @@ async fn initialize_on_a_revoked_lease_is_audited() {
     assert!(h.upstream.recorded_methods().is_empty());
 }
 
+/// A client that keeps retrying `initialize` on a revoked lease (LangChain's adapter, retried)
+/// is refused with 401 every time, but leaves one `deny` record per chain, tool and reason per
+/// minute: the others are counted in `audit_records_suppressed_total{tool,reason}`, not in
+/// `decisions_total`, and their 401 names the first record. Refused renewals and exchanges are
+/// decided requests and stay one record each.
+#[tokio::test]
+async fn retried_initialize_on_a_revoked_lease_leaves_one_record() {
+    let h = Harness::start().await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let child = h
+        .exchange(&root.token, "coder", &["github:read_file"])
+        .await;
+    h.admin_post(
+        &format!("/admin/leases/{}/revoke", root.lease),
+        json!({"reason": "agent session compromised"}),
+    )
+    .await;
+    let before = h.audit_entries().await.len();
+
+    let initialize = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                   "clientInfo": {"name": "langchain-mcp-adapters", "version": "0"}}});
+    const N: usize = 4;
+    let mut named = Vec::new();
+    for _ in 0..N {
+        let resp = h
+            .client
+            .post(h.url("/mcp/github"))
+            .header("accept", "application/json, text/event-stream")
+            .bearer_auth(&child.token)
+            .json(&initialize)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let header = resp.headers()["x-attenuo-decision-id"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["data"]["reason"], "lease_revoked");
+        assert_eq!(body["error"]["data"]["decision_id"], header);
+        named.push(header);
+    }
+    let after = h.audit_entries().await;
+    assert_eq!(after.len(), before + 1, "exactly one record");
+    let r = &after.last().unwrap()["record"];
+    assert_eq!(r["tool"], "initialize");
+    assert_eq!(r["reason"], "lease_revoked");
+    assert_eq!(r["agents"], json!(["planner", "coder"]));
+    assert!(named.iter().all(|id| r["id"] == *id), "{named:?}");
+    let metrics = h.state.metrics.render();
+    assert!(
+        metrics.contains("attenuo_decisions_total{decision=\"deny\",reason=\"lease_revoked\"} 1\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains(&format!(
+            "attenuo_audit_records_suppressed_total{{tool=\"initialize\",reason=\"lease_revoked\"}} {}\n",
+            N - 1
+        )),
+        "{metrics}"
+    );
+
+    // Renewals and exchanges refused on the same revoked chain are decisions: one record each.
+    for _ in 0..3 {
+        refused_renewal_record(&h, &child.token, "lease_revoked").await;
+    }
+    // The same actor three times: a refused exchange does not use up the (parent, actor) slot.
+    for actor in ["reviewer"; 3] {
+        let before = h.audit_entries().await.len();
+        let resp = h
+            .exchange_raw(&child.token, actor, &["github:read_file"])
+            .await;
+        let r = refused_exchange_record(&h, resp, ("invalid_grant", "")).await;
+        assert_eq!(r["reason"], "lease_revoked");
+        assert_eq!(h.audit_entries().await.len(), before + 1);
+    }
+    assert_eq!(h.audit_entries().await.len(), before + 7);
+    let metrics = h.state.metrics.render();
+    assert!(
+        metrics.contains("attenuo_decisions_total{decision=\"deny\",reason=\"lease_revoked\"} 7\n"),
+        "{metrics}"
+    );
+    assert!(!metrics.contains("tool=\"lease.renew\""), "{metrics}");
+    assert!(!metrics.contains("tool=\"token.exchange\""), "{metrics}");
+    assert_eq!(h.admin_get("/admin/audit/verify").await["ok"], true);
+}
+
 /// SR-28: a listen stream the proxy cuts because its lease was revoked leaves one `deny`
 /// record of `stream.end` against the token's chain and the session's hash tag, so the log
 /// tells a revoked stream from a dropped one. The final event names the record.

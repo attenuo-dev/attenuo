@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use attenuo_core::{CapabilitySet, DelegationChain, ToolCall};
+use attenuo_core::{chain_id_of, CapabilitySet, DelegationChain, ToolCall};
 use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, Path, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
@@ -26,7 +26,7 @@ use crate::auth::{
 };
 use crate::config::ProxyConfig;
 use crate::filter::{list_kinds_by_shape, ListFilter, ListKind};
-use crate::guard::{guard_stream, StreamEndRecords, StreamGuard};
+use crate::guard::{guard_stream, StreamEndCause, StreamGuard, STREAM_END_RECORD_WINDOW};
 use crate::jsonrpc::{
     self, approval_required_response, denied_response, denied_response_with, error_response, id_of,
     is_passthrough_method, is_request, method_of, CODE_INVALID_PARAMS, CODE_INVALID_REQUEST,
@@ -37,6 +37,7 @@ use crate::label::{
     label_stream, AwaitedResults, Labeller, PendingResult, ResultScope, LABELLED_METHODS,
 };
 use crate::listed::ListedTools;
+use crate::records::{Admission, RecordWindow};
 use crate::session::{
     session_digest, session_tag, BindOutcome, SessionCheck, SessionOwner, SessionRegistry,
 };
@@ -122,7 +123,9 @@ struct AppState {
     /// Allowed calls whose answers may arrive on the `GET` listen stream (ADR-0009).
     awaited: Arc<AwaitedResults>,
     /// The bound on `stream.end` records of `GET` listen streams, shared by all of them.
-    stream_end_records: Arc<StreamEndRecords>,
+    stream_end_records: Arc<RecordWindow>,
+    /// The bound on lease-refusal records of undecided requests ([`record_lease_refusal`]).
+    lease_refusal_records: RecordWindow,
 }
 
 impl AppState {
@@ -151,6 +154,7 @@ pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
     let require_listed_tools = config.require_listed_tools;
     let max_upstream_body = config.max_upstream_body_bytes.max(1);
     let max_request_body = config.max_request_body_bytes.max(1);
+    let lease_refusal_records = RecordWindow::new(config.lease_refusal_record_window);
     let sessions = SessionRegistry::new(config.session_ttl, config.max_sessions)
         .with_max_per_principal(config.max_sessions_per_principal);
     let upstreams = config
@@ -169,7 +173,8 @@ pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
         max_upstream_body,
         max_request_body,
         awaited: Arc::new(AwaitedResults::new()),
-        stream_end_records: Arc::new(StreamEndRecords::new()),
+        stream_end_records: Arc::new(RecordWindow::new(STREAM_END_RECORD_WINDOW)),
+        lease_refusal_records,
     });
     Router::new()
         .route(
@@ -265,8 +270,9 @@ fn unauthorized(err: AuthError) -> Response {
     unauthorized_recorded(err, None)
 }
 
-/// [`unauthorized`] for a refusal that was recorded in the audit log as `decision_id`
-/// ([`record_lease_refusal`]): the id goes in `X-Attenuo-Decision-Id` and `data.decision_id`.
+/// [`unauthorized`] for a refusal recorded in the audit log as `decision_id`, or standing
+/// under that earlier record of its window ([`record_lease_refusal`]): the id goes in
+/// `X-Attenuo-Decision-Id` and `data.decision_id`.
 fn unauthorized_recorded(err: AuthError, decision_id: Option<Uuid>) -> Response {
     let reason = err.reason();
     if let AuthError::Unavailable(_) = &err {
@@ -325,7 +331,15 @@ fn unauthorized_body(id: Value, err: &AuthError, decision_id: Option<Uuid>) -> V
 /// expiry, DPoP), so the record names a principal attenuo issued a token to. A token that
 /// fails verification stays a log line (SR-18): recording it would let anyone write to the
 /// audit log. `tool` is a fixed name (an allowlisted method or `http.<METHOD>`), never text
-/// from the request. Returns the record's id, or `None` when nothing was recorded.
+/// from the request.
+///
+/// Bounded by [`AppState::lease_refusal_records`]: the first refusal per delegation chain
+/// (digest), `tool` and reason in a [`crate::records::LEASE_REFUSAL_RECORD_WINDOW`] is
+/// recorded; a later one in the window is still refused, but logged and counted through
+/// [`Authorizer::observe_record_suppressed`] instead of recorded, and its 401 names the
+/// window's first record. Returns the id the 401 names: the new record, the window's first
+/// record, or `None` when nothing was recorded (not a lease refusal) or the window's record is
+/// still being written by a concurrent request.
 async fn record_lease_refusal(
     state: &AppState,
     who: &Authenticated,
@@ -338,6 +352,34 @@ async fn record_lease_refusal(
     let AuthError::LeaseInactive(reason) = err else {
         return None;
     };
+    let key = who.chain.digest();
+    let records = &state.lease_refusal_records;
+    match records.admit(&key, tool, reason, std::time::Instant::now()) {
+        Admission::Suppress { first } => {
+            state
+                .authorizer
+                .observe_record_suppressed(tool, StreamEndCause::of_lease_reason(reason));
+            tracing::warn!(
+                reason = ?reason,
+                tool,
+                decision_id = ?first.map(|id| id.to_string()),
+                record_suppressed = true,
+                "request refused, not recorded: lease inactive, recorded earlier in the window"
+            );
+            return first;
+        }
+        Admission::Record { suppressed_before } if suppressed_before > 0 => {
+            tracing::info!(
+                reason = ?reason,
+                tool,
+                suppressed = suppressed_before,
+                chain_id = ?chain_id_of(&who.chain),
+                subject = ?who.chain.originating_user.subject,
+                "lease refusal records suppressed in the previous window"
+            );
+        }
+        Admission::Record { .. } => {}
+    }
     let mut call =
         ToolCall::new(server, tool, serde_json::json!({})).with_dpop_bound(who.dpop_bound);
     if let Some(sid) = session_id {
@@ -347,6 +389,7 @@ async fn record_lease_refusal(
         .authorizer
         .record_rejection(&who.chain, &call, reason, now)
         .await;
+    records.recorded(&key, tool, reason, id);
     tracing::warn!(reason = ?reason, tool, decision_id = %id, "request refused and recorded: lease inactive");
     Some(id)
 }
@@ -917,8 +960,8 @@ struct Screened {
     /// Result of the lease check made for messages forwarded without a per-call decision;
     /// made at most once per HTTP request.
     lease_check: Option<Result<(), AuthError>>,
-    /// The audit record of a failed lease check ([`record_lease_refusal`]); at most one per
-    /// HTTP request.
+    /// The audit record of a failed lease check ([`record_lease_refusal`]): written for this
+    /// HTTP request (at most one), or the earlier record of its window that stands for it.
     lease_refusal: Option<Uuid>,
     /// Allowed mediated calls whose responses must be labelled before they are relayed
     /// (ADR-0009).

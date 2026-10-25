@@ -72,6 +72,16 @@ pub struct ProxyConfig {
     /// [`crate::session::DEFAULT_MAX_SESSIONS_PER_PRINCIPAL`].
     #[serde(default = "default_max_sessions_per_principal")]
     pub max_sessions_per_principal: usize,
+    /// The window bounding lease-refusal records of undecided requests (see
+    /// [`crate::records`]). Always [`crate::records::LEASE_REFUSAL_RECORD_WINDOW`] outside
+    /// tests: not read from or written to configuration files, and not a server setting.
+    #[doc(hidden)]
+    #[serde(skip, default = "default_lease_refusal_record_window")]
+    pub lease_refusal_record_window: Duration,
+}
+
+fn default_lease_refusal_record_window() -> Duration {
+    crate::records::LEASE_REFUSAL_RECORD_WINDOW
 }
 
 fn default_max_upstream_body_bytes() -> usize {
@@ -114,6 +124,7 @@ impl ProxyConfig {
             session_ttl: crate::session::DEFAULT_SESSION_TTL,
             max_sessions: crate::session::DEFAULT_MAX_SESSIONS,
             max_sessions_per_principal: crate::session::DEFAULT_MAX_SESSIONS_PER_PRINCIPAL,
+            lease_refusal_record_window: crate::records::LEASE_REFUSAL_RECORD_WINDOW,
         }
     }
 

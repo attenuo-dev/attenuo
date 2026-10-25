@@ -400,11 +400,14 @@ pub trait Authorizer: Send + Sync {
     }
 
     /// Count one audit record the proxy did not write because an earlier record of the same
-    /// delegation chain and reason stands for it (the server's
-    /// `audit_records_suppressed_total{tool,reason}`). Today only `tool` =
-    /// [`crate::guard::STREAM_END_TOOL`] on the `GET` listen stream, with `reason` one of
-    /// [`StreamEndCause::RECORDED`] ([`crate::guard::StreamEndRecords`]). The default
-    /// discards it.
+    /// delegation chain, tool and reason stands for it (the server's
+    /// `audit_records_suppressed_total{tool,reason}`; see [`crate::records`]). `tool` is
+    /// [`crate::guard::STREAM_END_TOOL`] for an end of a `GET` listen stream, or the fixed
+    /// name of a lease refusal of an undecided request
+    /// ([`crate::records::is_lease_refusal_tool`]); `reason` is one of
+    /// [`StreamEndCause::RECORDED`] (a lease refusal's reason mapped by
+    /// [`StreamEndCause::of_lease_reason`]). Called on the request path, so it must be cheap.
+    /// The default discards it.
     fn observe_record_suppressed(&self, tool: &'static str, reason: StreamEndCause) {
         let _ = (tool, reason);
     }
