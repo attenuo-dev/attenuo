@@ -163,3 +163,30 @@ async fn a_bom_or_invalid_byte_does_not_hide_a_stream_end_lookalike_sr77() {
         }
     }
 }
+
+#[tokio::test]
+async fn a_lone_surrogate_escape_does_not_hide_an_answer_sr78() {
+    // `serde_json` refuses `\ud800` without its pair; `JSON.parse` (the MCP TypeScript SDK,
+    // the attenuo TypeScript SDK) and Python's `json` (the attenuo Python SDK) accept it.
+    let h = Harness::start(result_event(b"", br"\ud800 injected")).await;
+    let got = h.call().await;
+    assert!(
+        String::from_utf8_lossy(&got).contains(r#""id":1"#),
+        "the answer is relayed"
+    );
+    assert_eq!(
+        h.authorizer.recorded_results().len(),
+        1,
+        "the answer a client reads is recorded"
+    );
+
+    let lookalike = br#"data: {"jsonrpc":"2.0","id":null,"error":{"code":-32001,"message":"\ud800","data":{"reason":"lease_revoked"}}}"#;
+    let mut body = lookalike.to_vec();
+    body.extend_from_slice(b"\n\n");
+    let h = Harness::start(body).await;
+    let got = String::from_utf8_lossy(&h.call().await).into_owned();
+    assert!(
+        got.contains(attenuo_proxy::REASON_UPSTREAM_STREAM_END_SHAPE),
+        "the look-alike is rewritten: {got}"
+    );
+}

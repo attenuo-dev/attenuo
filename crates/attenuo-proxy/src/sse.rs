@@ -179,8 +179,60 @@ pub(crate) fn event_json(event: &[u8]) -> Option<Value> {
     let lines = split_lines(text);
     let data = data_lines(&lines);
     (!data.is_empty())
-        .then(|| serde_json::from_str::<Value>(&data.join("\n")).ok())
+        .then(|| parse_data(&data.join("\n")))
         .flatten()
+}
+
+/// Parse an event's joined `data` as JSON the way clients do. `serde_json` refuses a `\u`
+/// escape of a UTF-16 surrogate without its pair (`"\ud800"`), which `JSON.parse` and
+/// Python's `json` accept, so a message the proxy could not parse would still be read by
+/// those clients, unlabelled and unrewritten (SR-78). Such an escape is read as U+FFFD, as
+/// `JSON.parse` would print it; everything else is parsed as is.
+pub(crate) fn parse_data(text: &str) -> Option<Value> {
+    match serde_json::from_str::<Value>(text) {
+        Ok(v) => Some(v),
+        Err(_) if text.contains("\\u") => {
+            serde_json::from_str::<Value>(&replace_lone_surrogates(text)).ok()
+        }
+        Err(_) => None,
+    }
+}
+
+/// `text` with every `\uXXXX` escape of an unpaired UTF-16 surrogate replaced by `\ufffd`.
+/// A backslash is only valid JSON inside a string, so escapes are found without tracking
+/// strings: each `\` takes the character after it.
+fn replace_lone_surrogates(text: &str) -> String {
+    fn unit(b: &[u8], at: usize) -> Option<u16> {
+        let hex = b.get(at..at + 6)?;
+        if hex[0] != b'\\' || hex[1] != b'u' {
+            return None;
+        }
+        u16::from_str_radix(std::str::from_utf8(&hex[2..]).ok()?, 16).ok()
+    }
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        match unit(b, i) {
+            // A pair: kept.
+            Some(0xD800..=0xDBFF) if matches!(unit(b, i + 6), Some(0xDC00..=0xDFFF)) => i += 12,
+            Some(0xD800..=0xDFFF) => {
+                out.push_str(&text[copied..i]);
+                out.push_str("\\ufffd");
+                i += 6;
+                copied = i;
+            }
+            Some(_) => i += 6,
+            None => i += 2,
+        }
+    }
+    out.push_str(&text[copied.min(text.len())..]);
+    out
 }
 
 /// One `message` event carrying `message` as its data.
@@ -221,7 +273,7 @@ pub(crate) fn rewrite_event(
     let lines = split_lines(text);
     let data = data_lines(&lines);
     let parsed = (!data.is_empty())
-        .then(|| serde_json::from_str::<Value>(&data.join("\n")).ok())
+        .then(|| parse_data(&data.join("\n")))
         .flatten();
     let Some(mut message) = parsed else {
         out.extend_from_slice(event);
@@ -498,6 +550,26 @@ mod tests {
             f.push(b"\xa9\"\n\n").unwrap(),
             "data: \"\u{e9}\"\n\n".as_bytes()
         );
+    }
+
+    #[test]
+    fn a_lone_surrogate_escape_is_read_as_a_replacement_character_sr78() {
+        assert_eq!(parse_data(r#""\ud800""#), Some(json!("\u{fffd}")));
+        assert_eq!(
+            parse_data(r#""\udc00x\ud800""#),
+            Some(json!("\u{fffd}x\u{fffd}"))
+        );
+        // A pair is kept, and so is an escaped backslash before a `u`.
+        assert_eq!(parse_data(r#""\ud83d\ude00""#), Some(json!("\u{1f600}")));
+        assert_eq!(
+            parse_data(r#""\ud800\ud83d\ude00""#),
+            Some(json!("\u{fffd}\u{1f600}"))
+        );
+        assert_eq!(parse_data(r#""\\ud800""#), Some(json!("\\ud800")));
+        // Still not JSON.
+        assert_eq!(parse_data(r#""\ud800"#), None);
+        assert_eq!(parse_data("\\u"), None);
+        assert_eq!(parse_data(r#""\u12""#), None);
     }
 
     #[test]
