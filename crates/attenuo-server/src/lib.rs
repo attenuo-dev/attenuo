@@ -192,8 +192,9 @@ pub fn spawn_checkpointer(
 /// How often the lease maintenance ticker runs ([`spawn_lease_maintenance`]).
 pub const LEASE_MAINTENANCE_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Rows one pruning pass looks at (session bindings, or leases): one short write transaction
-/// each. A lease pass also reads and deletes the whole tree of every top lease among them.
+/// Rows one pruning pass looks at (session bindings, leases, or run state): one short write
+/// transaction each. A lease pass also reads and deletes the whole tree of every top lease
+/// among them; a run-state pass, every charge-log row of each charged decision among them.
 pub const LEASE_PRUNE_BATCH: usize = 1_000;
 
 /// Most passes of each kind in one run of the ticker, so one run looks at no more than
@@ -203,26 +204,27 @@ pub const LEASE_PRUNE_MAX_PASSES: usize = 100;
 
 /// Run pruning passes on the blocking pool until one reaches the end of its table or
 /// [`LEASE_PRUNE_MAX_PASSES`] have run. `pass` returns what it deleted and whether it
-/// wrapped; `count` adds the deleted rows to their metric. Returns the total deleted.
-async fn prune_in_passes<F>(
+/// wrapped; `count` adds what one pass deleted to its metrics (and returns the total, for
+/// the return value and the log line). Returns the total deleted.
+async fn prune_in_passes<F, P>(
     state: &Arc<AppState>,
     what: &'static str,
     pass: F,
-    count: fn(&metrics::Metrics, u64),
+    count: fn(&metrics::Metrics, P) -> u64,
 ) -> u64
 where
-    F: Fn(&AppState, time::OffsetDateTime) -> Result<(u64, bool), attenuo_audit::AuditError>
+    F: Fn(&AppState, time::OffsetDateTime) -> Result<(P, bool), attenuo_audit::AuditError>
         + Copy
         + Send
         + 'static,
+    P: Send + 'static,
 {
     let mut total = 0;
     for _ in 0..LEASE_PRUNE_MAX_PASSES {
         let now = time::OffsetDateTime::now_utc();
         match state.blocking(move |s| pass(s, now)).await {
             Ok((pruned, wrapped)) => {
-                count(&state.metrics, pruned);
-                total += pruned;
+                total += count(&state.metrics, pruned);
                 if wrapped {
                     break;
                 }
@@ -257,7 +259,10 @@ pub async fn prune_session_bindings(state: &Arc<AppState>) -> u64 {
             let p = s.leases.prune_sessions(now, retention, LEASE_PRUNE_BATCH)?;
             Ok((p.pruned, p.wrapped))
         },
-        metrics::Metrics::lease_sessions_pruned,
+        |m, n| {
+            m.lease_sessions_pruned(n);
+            n
+        },
     )
     .await
 }
@@ -280,15 +285,48 @@ pub async fn prune_lease_registry(state: &Arc<AppState>) -> u64 {
             let p = s.leases.prune_leases(now, retention, LEASE_PRUNE_BATCH)?;
             Ok((p.pruned, p.wrapped))
         },
-        metrics::Metrics::leases_pruned,
+        |m, n| {
+            m.leases_pruned(n);
+            n
+        },
+    )
+    .await
+}
+
+/// One run of run-state retention (`[leases] run_state_retention_seconds`): passes of
+/// [`LeaseStore::prune_run_state`](attenuo_audit::LeaseStore::prune_run_state) over
+/// [`LEASE_PRUNE_BATCH`] rows each, bounded like [`prune_session_bindings`]. Run-limit
+/// counters, the charge log and approvals go once the leases they belong to are gone from the
+/// registry and they are older than the retention; nothing of a lease still in the registry
+/// is touched. Counts each kind in `run_state_pruned_total{kind}` and returns how many rows
+/// (counters, charge-log entries and approvals together) it deleted; 0 when retention is off.
+pub async fn prune_run_state(state: &Arc<AppState>) -> u64 {
+    let Some(retention) = state.run_state_retention else {
+        return 0;
+    };
+    prune_in_passes(
+        state,
+        "run-limit counters, charges and approvals",
+        move |s, now| {
+            use attenuo_audit::LeaseStore;
+            let p = s
+                .leases
+                .prune_run_state(now, retention, LEASE_PRUNE_BATCH)?;
+            Ok((p, p.wrapped))
+        },
+        |m, p| {
+            m.run_state_pruned(p.pruned_counters, p.pruned_charges, p.pruned_approvals);
+            p.pruned_counters + p.pruned_charges + p.pruned_approvals
+        },
     )
     .await
 }
 
 /// Start the lease maintenance ticker: every [`LEASE_MAINTENANCE_PERIOD`],
-/// [`prune_session_bindings`] then [`prune_lease_registry`] (each does nothing when its
-/// retention is 0). Sessions go first, so a binding whose chain is about to be pruned is
-/// counted as a session. Dropping the handle does not stop it; abort it to stop.
+/// [`prune_session_bindings`], then [`prune_lease_registry`], then [`prune_run_state`] (each
+/// does nothing when its retention is 0). Sessions go first, so a binding whose chain is about
+/// to be pruned is counted as a session; run state goes last, since it is only pruned once
+/// its leases are gone. Dropping the handle does not stop it; abort it to stop.
 pub fn spawn_lease_maintenance(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(LEASE_MAINTENANCE_PERIOD);
@@ -298,6 +336,7 @@ pub fn spawn_lease_maintenance(state: Arc<AppState>) -> tokio::task::JoinHandle<
             tick.tick().await;
             prune_session_bindings(&state).await;
             prune_lease_registry(&state).await;
+            prune_run_state(&state).await;
         }
     })
 }
@@ -315,8 +354,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     tracing::info!(addr = %listener.local_addr()?, upstreams = config.upstreams.len(), "attenuo server listening");
     let checkpoint_task = (!state.checkpoint_interval.is_zero())
         .then(|| spawn_checkpointer(state.clone(), state.checkpoint_interval));
-    let prune_task = (state.session_retention.is_some() || state.lease_retention.is_some())
-        .then(|| spawn_lease_maintenance(state.clone()));
+    let prune_task = (state.session_retention.is_some()
+        || state.lease_retention.is_some()
+        || state.run_state_retention.is_some())
+    .then(|| spawn_lease_maintenance(state.clone()));
     let metrics_task = if config.metrics.enabled {
         let l = tokio::net::TcpListener::bind(config.metrics.listen).await?;
         tracing::info!(addr = %l.local_addr()?, "metrics listening (unauthenticated)");

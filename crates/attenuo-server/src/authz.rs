@@ -3372,6 +3372,14 @@ mod run_lock_tests {
         ) -> Result<attenuo_audit::LeasePrune, AuditError> {
             self.inner.prune_leases(n, r, m)
         }
+        fn prune_run_state(
+            &self,
+            n: OffsetDateTime,
+            r: time::Duration,
+            m: usize,
+        ) -> Result<attenuo_audit::RunStatePrune, AuditError> {
+            self.inner.prune_run_state(n, r, m)
+        }
         fn preview_selected(
             &self,
             s: &attenuo_audit::LeaseSelector,
