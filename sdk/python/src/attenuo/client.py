@@ -10,13 +10,14 @@ from __future__ import annotations
 import asyncio
 import itertools
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator
 from types import TracebackType
 from typing import Any
 
 import httpx
 
 from . import _wire as w
+from ._sse import DEFAULT_MAX_EVENT_BYTES, CallStream, StreamEvent
 from .capability import CapabilityLike
 from .dpop import DpopKey, NonceCache, exchange_proofs, presented
 from .errors import ApprovalNotGranted, ApprovalRequired, AttenuoError
@@ -224,6 +225,85 @@ class Client:
             token, server, "tools/call", w.call_params(tool, arguments, approval_token), session_id
         )
         return w.tool_result(result, decision_id)
+
+    def call_tool_stream(
+        self,
+        token: Token | str | None,
+        server: str,
+        tool: str,
+        arguments: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        *,
+        approval_token: str | None = None,
+        max_event_bytes: int = DEFAULT_MAX_EVENT_BYTES,
+    ) -> Iterator[StreamEvent]:
+        """``tools/call`` with the answer read as it streams: an iterator of
+        :class:`~attenuo.StreamEvent`, one per JSON-RPC message (progress and other
+        notifications as they arrive, then the response, whose event has ``result`` set).
+
+        The request is the one :meth:`call_tool` sends. A denial raises :class:`~attenuo.Denied`
+        before anything is yielded; a stream the proxy cuts because the lease was revoked or
+        expired, or the token expired, raises :class:`~attenuo.Denied` with that ``reason`` and
+        the ``decision_id`` of the proxy's ``stream.end`` record; any other JSON-RPC error
+        raises what :meth:`call_tool` raises. A plain JSON answer is yielded as the one final
+        event. An SSE event (or a plain body) over ``max_event_bytes`` (default 16 MiB, the
+        proxy's ``max_upstream_body_bytes`` default) raises :class:`~attenuo.AttenuoError`.
+        The client's ``timeout`` applies per read, so a stream quiet for longer fails; leaving
+        the loop early closes the connection once the iterator is closed or collected."""
+        path = f"/mcp/{w.path_segment(server, 'server')}"
+        jwt = w.bearer(token, self.token)
+        if max_event_bytes <= 0:
+            raise ValueError("max_event_bytes must be positive")
+        request_id = next(self._ids)
+        params = w.call_params(tool, arguments, approval_token)
+        body = w.rpc_request("tools/call", params, request_id)
+        auth = self._auth(jwt, path)
+        return self._stream(
+            path,
+            lambda nonce: {**w.mcp_headers(jwt, session_id), **auth(nonce)},
+            body,
+            request_id,
+            max_event_bytes,
+        )
+
+    def _stream(
+        self,
+        path: str,
+        headers: Callable[[str | None], dict[str, str]],
+        body: dict[str, Any],
+        request_id: int,
+        max_event_bytes: int,
+    ) -> Iterator[StreamEvent]:
+        def send() -> httpx.Response:
+            h = headers(self._nonce.value)
+            req = self._http.build_request("POST", path, headers=h, json=body)
+            resp = self._http.send(req, stream=True)
+            if resp.status_code in (400, 401):
+                resp.read()  # small; NonceCache looks in it for use_dpop_nonce
+            return resp
+
+        resp = send()
+        try:
+            if self.dpop_key is not None and self._nonce.update(resp):
+                resp.close()
+                resp = send()
+                self._nonce.update(resp)
+            stream = CallStream(resp, request_id, max_event_bytes)
+            if not (stream.sse and resp.is_success):
+                data = bytearray()
+                for chunk in resp.iter_bytes():
+                    data += chunk
+                    if len(data) > max_event_bytes:
+                        break
+                yield from stream.plain(bytes(data))
+                return
+            for chunk in resp.iter_bytes():
+                yield from stream.feed(chunk)
+                if stream.done:
+                    return
+            yield from stream.finish()
+        finally:
+            resp.close()
 
     def list_tools(
         self, token: Token | str | None, server: str, session_id: str | None = None
@@ -490,6 +570,76 @@ class AsyncClient:
             token, server, "tools/call", w.call_params(tool, arguments, approval_token), session_id
         )
         return w.tool_result(result, decision_id)
+
+    def call_tool_stream(
+        self,
+        token: Token | str | None,
+        server: str,
+        tool: str,
+        arguments: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        *,
+        approval_token: str | None = None,
+        max_event_bytes: int = DEFAULT_MAX_EVENT_BYTES,
+    ) -> AsyncIterator[StreamEvent]:
+        """:meth:`Client.call_tool_stream` as an async iterator (``async for``, no ``await``)."""
+        path = f"/mcp/{w.path_segment(server, 'server')}"
+        jwt = w.bearer(token, self.token)
+        if max_event_bytes <= 0:
+            raise ValueError("max_event_bytes must be positive")
+        request_id = next(self._ids)
+        params = w.call_params(tool, arguments, approval_token)
+        body = w.rpc_request("tools/call", params, request_id)
+        auth = self._auth(jwt, path)
+        return self._stream(
+            path,
+            lambda nonce: {**w.mcp_headers(jwt, session_id), **auth(nonce)},
+            body,
+            request_id,
+            max_event_bytes,
+        )
+
+    async def _stream(
+        self,
+        path: str,
+        headers: Callable[[str | None], dict[str, str]],
+        body: dict[str, Any],
+        request_id: int,
+        max_event_bytes: int,
+    ) -> AsyncIterator[StreamEvent]:
+        async def send() -> httpx.Response:
+            h = headers(self._nonce.value)
+            req = self._http.build_request("POST", path, headers=h, json=body)
+            resp = await self._http.send(req, stream=True)
+            if resp.status_code in (400, 401):
+                await resp.aread()  # small; NonceCache looks in it for use_dpop_nonce
+            return resp
+
+        resp = await send()
+        try:
+            if self.dpop_key is not None and self._nonce.update(resp):
+                await resp.aclose()
+                resp = await send()
+                self._nonce.update(resp)
+            stream = CallStream(resp, request_id, max_event_bytes)
+            if not (stream.sse and resp.is_success):
+                data = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    data += chunk
+                    if len(data) > max_event_bytes:
+                        break
+                for ev in stream.plain(bytes(data)):
+                    yield ev
+                return
+            async for chunk in resp.aiter_bytes():
+                for ev in stream.feed(chunk):
+                    yield ev
+                if stream.done:
+                    return
+            for ev in stream.finish():
+                yield ev
+        finally:
+            await resp.aclose()
 
     async def list_tools(
         self, token: Token | str | None, server: str, session_id: str | None = None

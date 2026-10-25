@@ -172,8 +172,22 @@ def sink_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
         yield s
 
 
+@pytest.fixture(scope="module")
+def sse_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
+    """The same stack with a fake upstream that streams its answers (``fake_mcp --sse``) and the
+    proxy's stream re-check every second (``[proxy] stream_recheck_seconds = 1``)."""
+    yield from run_stack(
+        tmp_path_factory.mktemp("attenuo-it-sse"),
+        "[proxy]\nstream_recheck_seconds = 1\n\n",
+        fake_args=["--sse"],
+    )
+
+
 def run_stack(
-    work: Path, token_section: str = "", issuer_key: Path | None = None
+    work: Path,
+    token_section: str = "",
+    issuer_key: Path | None = None,
+    fake_args: list[str] | None = None,
 ) -> Iterator[Stack]:
     built_server, built_fake = binaries()
     # Copy them: a shared CARGO_TARGET_DIR can be rebuilt under us mid-test.
@@ -204,7 +218,9 @@ def run_stack(
     try:
         procs.append(
             subprocess.Popen(
-                [str(fake_bin), "--port", str(mcp_port)], stdout=fake_out, stderr=fake_log
+                [str(fake_bin), "--port", str(mcp_port), *(fake_args or [])],
+                stdout=fake_out,
+                stderr=fake_log,
             )
         )
         procs.append(
@@ -242,6 +258,47 @@ def run_stack(
                 p.kill()
         for f in (fake_out, fake_log, server_log):
             f.close()
+
+
+def test_call_tool_stream_relays_events_and_raises_on_revocation(sse_stack: Stack) -> None:
+    """A streamed tools/call through the real proxy: the upstream's notification arrives before
+    the result; then a call held open by the upstream is cut by the proxy within its re-check
+    interval once the lease is revoked, and the SDK raises Denied with the stream.end record."""
+    admin = AdminClient(sse_stack.url, ADMIN_TOKEN)
+    ob = Client(sse_stack.url)
+    root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+    coder = ob.exchange(
+        root, "coder", [Capability("github", "read_file")], client_secret=CODER_SECRET
+    )
+    args = {"repo": "alice/public-docs", "path": "README.md"}
+
+    events = list(ob.call_tool_stream(coder, "github", "read_file", args))
+    assert [e.method for e in events] == ["notifications/message", None]
+    assert events[0].message["params"]["data"] == "working"
+    final = events[-1]
+    assert final.is_final and final.last_event_id == "0"
+    assert final.result is not None and not final.result.is_error
+    assert final.result.decision_id
+    assert admin.audit_record(final.result.decision_id).entry.decision == "allow"
+
+    # A denial is raised before anything streams.
+    with pytest.raises(Denied) as denied:
+        next(ob.call_tool_stream(coder, "github", "read_file", {"repo": "alice/private-x"}))
+    assert denied.value.reason == "policy_deny"
+
+    # The upstream holds the response back for 20 s; revoke the lease after the first event.
+    held = ob.call_tool_stream(coder, "github", "read_file", {**args, "hold_ms": 20000})
+    first = next(held)
+    assert first.method == "notifications/message" and not first.is_final
+    started = time.monotonic()
+    assert admin.revoke_lease(coder.lease, "stream test").revoked == 1
+    with pytest.raises(Denied) as cut:
+        next(held)
+    assert time.monotonic() - started < 10  # one re-check interval (1 s), with slack
+    assert cut.value.reason == "lease_revoked"
+    assert cut.value.decision_id
+    end = admin.audit_record(cut.value.decision_id).entry
+    assert (end.tool, end.decision, end.reason) == ("stream.end", "deny", "lease_revoked")
 
 
 def test_github_leak_scenario(stack: Stack) -> None:

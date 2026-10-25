@@ -344,13 +344,38 @@ print(claims.approval_id, claims.by, claims.expires_at)
 
 It raises `VerificationError` on a bad signature, `typ`, expiry or binding. It proves the grant was made; only the server knows whether it has been used (needs the `verify` extra).
 
+### Streaming a call
+
+A long tool can stream its answer: the upstream sends progress notifications on an SSE stream before the result. `call_tool` waits for the whole body. `call_tool_stream` (same arguments, plus `max_event_bytes`) yields each JSON-RPC message as it arrives:
+
+```python
+from attenuo import Denied
+
+try:
+    for event in ob.call_tool_stream(coder, "github", "read_file", {"repo": "alice/docs"}):
+        if event.result is not None:  # the last event
+            print(event.result.text, event.result.decision_id)
+        elif event.method == "notifications/progress":
+            print("progress:", event.message["params"].get("progress"))
+except Denied as d:
+    print("denied or cut:", d.reason, d.decision_id)
+```
+
+`AsyncClient.call_tool_stream` is the same as an async iterator (`async for`, no `await`). It is a separate method, not a `stream=True` flag on `call_tool`, because it returns something else: an iterator of `StreamEvent`, not a `ToolResult`. That keeps both return types exact for type checkers, and `call_tool` behaves as before.
+
+- **Events.** Each `StreamEvent` has `message` (the JSON-RPC message as sent), `method` (for a notification or a server request, else `None`), `last_event_id` (the SSE id at that point, what a client would send as `Last-Event-ID` to resume) and `decision_id` (the proxy's `X-Attenuo-Decision-Id`). The final event carries `result`, the same `ToolResult` that `call_tool` returns, and `is_final` is true. Nothing is yielded after it.
+- **Errors.** A denial raises `Denied` (or `ApprovalRequired`) before anything is yielded, as `call_tool` does. When the proxy cuts a stream because the lease was revoked or expired, or the token expired (it re-checks every `[proxy] stream_recheck_seconds`, default 2), its last event is a JSON-RPC `-32001` error with `id: null`. That raises `Denied` with `reason` (`lease_revoked`, `lease_expired`, `lease_unknown`, `token_expired`, ...) and `decision_id`, the id of the proxy's `stream.end` audit record. So code that catches `Denied` around `call_tool` also handles a revocation in the middle of a stream. The `X-Attenuo-Decision-Id` header is sent before the cut, so it cannot vouch for this id as it does for a `-32003`. Any other JSON-RPC error raises what `call_tool` raises. A stream that ends without the response raises `AttenuoError`.
+- **Plain answers.** When the proxy answers with a JSON body instead of SSE (most upstreams do), you get one final event.
+- **Limits.** An SSE event, or a plain body, over `max_event_bytes` raises `AttenuoError`. The default is 16 MiB (`DEFAULT_MAX_EVENT_BYTES`), the same as the proxy's `[proxy] max_upstream_body_bytes` default. The client's `timeout` applies to each read, so a stream that is quiet for longer fails. Leaving the loop early closes the connection once the iterator is closed or garbage collected.
+- **Wire.** It sends the same `POST` as `call_tool`: `Accept: application/json, text/event-stream`, the session id, the approval token in `_meta`, and a DPoP proof (with one retry on `use_dpop_nonce`) when the client has a key. Only the response handling differs. SSE parsing follows the WHATWG rules: `data:` lines are joined, a blank line ends an event, and comments, `event:` and `retry:` are ignored. A final event with no blank line after it is dropped, as the proxy also drops it.
+
 ### Errors
 
 All SDK errors derive from `AttenuoError`.
 
 | Exception                                   | When                                                                                                                                                                                                                                                                                                                                                                         |
 | ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Denied` (`.reason`, `.decision_id`)        | The proxy said no (JSON-RPC `-32003` with the `X-Attenuo-Decision-Id` header naming `data.decision_id`; an upstream's own `-32003` without that proof is an `RpcError`). Branch on `reason`: `capability_denied`, `policy_deny`, `lease_revoked`, `lease_expired`, ... See the [integration guide](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/integrating-mcp-clients.md#handling-denied-responses). |
+| `Denied` (`.reason`, `.decision_id`)        | The proxy said no (JSON-RPC `-32003` with the `X-Attenuo-Decision-Id` header naming `data.decision_id`; an upstream's own `-32003` without that proof is an `RpcError`). Also raised by `call_tool_stream` when the proxy cuts a stream for a lease or token reason ([Streaming a call](#streaming-a-call)). Branch on `reason`: `capability_denied`, `policy_deny`, `lease_revoked`, `lease_expired`, ... See the [integration guide](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/integrating-mcp-clients.md#handling-denied-responses). |
 | `ApprovalRequired` (`.approval_id`, `.expires_at`, `.call_hash`) | A `Denied` for JSON-RPC `-32008`: a policy holds the call until it is approved. See [Approvals](#approvals). |
 | `ApprovalNotGranted` (`.approval_id`, `.state`) | Waiting for an approval ended without a grant: `declined`, `expired`, `consumed` or `timeout`. |
 | `Unauthorized`                              | HTTP 401: missing, bad or expired bearer.                                                                                                                                                                                                                                                                                                                                    |
@@ -425,10 +450,10 @@ ATTENUO_INTEGRATION=1 pytest -rf -m integration   # builds and starts the real s
 
 Keep `-rf`: it prints the name of every failed test in the summary, which a long run otherwise scrolls away.
 
-The integration test builds `attenuo-server` and the `fake_mcp` example, starts both on free ports, and replays the [GitHub leak scenario](https://github.com/attenuo-dev/attenuo/blob/main/examples/github-leak-demo/README.md) through the SDK: dev root mint, exchange, an allowed call, a policy denial, a capability denial, revocation, `lease_revoked`, and an audit chain check. Other tests cover DPoP, refresh, the examples, offline export verification across Rust, Python and TypeScript, an export filtered on `tool` and `decision`, and revocation by chain and by MCP session (the session test starts a stack of its own: the fake upstream gives every caller the same session id and the proxy binds it to the first).
+The integration test builds `attenuo-server` and the `fake_mcp` example, starts both on free ports, and replays the [GitHub leak scenario](https://github.com/attenuo-dev/attenuo/blob/main/examples/github-leak-demo/README.md) through the SDK: dev root mint, exchange, an allowed call, a policy denial, a capability denial, revocation, `lease_revoked`, and an audit chain check. Other tests cover DPoP, refresh, the examples, offline export verification across Rust, Python and TypeScript, an export filtered on `tool` and `decision`, and revocation by chain and by MCP session (the session test starts a stack of its own: the fake upstream gives every caller the same session id and the proxy binds it to the first). `test_call_tool_stream_relays_events_and_raises_on_revocation` starts one with `fake_mcp --sse` and `[proxy] stream_recheck_seconds = 1`: a streamed answer arrives as a notification then the result, and a call the upstream holds open (`hold_ms`) is cut by the proxy when the lease is revoked, raising `Denied` with the `stream.end` record's id.
 
 ## Limits
 
 - The server's JSON-RPC and header behaviour is what is implemented in this repository today. Nothing here is tested against a server of another version.
-- Streaming responses (long-lived SSE, server-initiated requests) are not supported by `call_tool`: it reads one response and returns the first JSON-RPC result or error in it. Use a full MCP client with `attenuo.mcp` for that.
+- `call_tool` reads the whole response and returns the first JSON-RPC result or error in it; `call_tool_stream` yields a streamed answer as it arrives. Neither answers server-initiated requests (sampling, elicitation) or resumes a broken stream with `Last-Event-ID`: `call_tool_stream` yields such requests and keeps the id, but replying and resuming need a full MCP client with `attenuo.mcp`.
 - Hop-0 exchange (`client_id`/`client_secret`) is covered by unit tests against a mock transport only, not against a live IdP.

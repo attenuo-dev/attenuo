@@ -11,6 +11,7 @@ import { ApprovalNotGrantedError, ApprovalRequiredError, AttenuoError } from "./
 import { Http, type HttpOptions } from "./http.js";
 import { bearer, decodeToken, verifyToken, type Jwks, type Token } from "./token.js";
 import { mcpHeaders } from "./mcp.js";
+import { DEFAULT_MAX_EVENT_BYTES, callStream, type StreamEvent } from "./sse.js";
 import * as w from "./wire.js";
 
 export interface ClientOptions extends HttpOptions {
@@ -49,6 +50,17 @@ export interface CallToolOptions extends McpOptions {
    * `params._meta["dev.attenuo/approval"]`; the proxy removes it before the upstream.
    */
   approvalToken?: string;
+}
+
+/** Options of `callToolStream`. */
+export interface CallToolStreamOptions extends CallToolOptions {
+  /**
+   * Refuse an SSE event (or a plain JSON answer) larger than this many bytes (default 16 MiB,
+   * the proxy's `max_upstream_body_bytes` default).
+   */
+  maxEventBytes?: number;
+  /** Abort the call and the stream. */
+  signal?: AbortSignal;
 }
 
 export interface ApprovalWaitOptions {
@@ -107,9 +119,14 @@ export class AttenuoClient {
     headers: (nonce?: string) => Promise<Record<string, string>>,
     json?: unknown,
     method = "POST",
+    signal?: AbortSignal,
   ): Promise<Response> {
     const send = async () =>
-      this.http.request(method, path, { headers: await headers(this.nonce.value), json });
+      this.http.request(method, path, {
+        headers: await headers(this.nonce.value),
+        json,
+        ...(signal ? { signal } : {}),
+      });
     let res = await send();
     if ((await this.dpopKey()) !== undefined && (await this.nonce.update(res))) {
       await res.body?.cancel();
@@ -229,6 +246,81 @@ export class AttenuoClient {
       opts.sessionId,
     );
     return w.toolResult(result, decisionId);
+  }
+
+  /**
+   * `tools/call` with the answer read as it streams: an `AsyncIterable` of `StreamEvent`, one per
+   * JSON-RPC message (progress and other notifications as they arrive, then the response, whose
+   * event has `result` set).
+   *
+   * The request is the one `callTool` sends, and it goes out when iteration starts. A denial
+   * throws `DeniedError` before anything is yielded; a stream the proxy cuts because the lease
+   * was revoked or expired, or the token expired, throws `DeniedError` with that `reason` and the
+   * `decisionId` of the proxy's `stream.end` record; any other JSON-RPC error throws what
+   * `callTool` throws. A plain JSON answer is yielded as the one final event. An event over
+   * `maxEventBytes` throws `AttenuoError`. The client's `timeoutMs` applies between reads, so a
+   * stream quiet for longer is aborted; leaving the loop early closes the connection.
+   */
+  callToolStream(
+    token: Token | string | undefined,
+    server: string,
+    tool: string,
+    args: Record<string, unknown> = {},
+    opts: CallToolStreamOptions = {},
+  ): AsyncIterable<StreamEvent> {
+    const path = `/mcp/${encodeURIComponent(server)}`;
+    const jwt = bearer(token, this.token);
+    const maxEventBytes = opts.maxEventBytes ?? DEFAULT_MAX_EVENT_BYTES;
+    if (!(maxEventBytes > 0)) throw new TypeError("maxEventBytes must be positive");
+    const params: Record<string, unknown> = { name: tool, arguments: args };
+    if (opts.approvalToken) params._meta = { [META_APPROVAL_KEY]: opts.approvalToken };
+    const id = this.nextId++;
+    return this.stream(path, jwt, w.rpcRequest("tools/call", params, id), id, maxEventBytes, opts);
+  }
+
+  private async *stream(
+    path: string,
+    jwt: string,
+    body: Record<string, unknown>,
+    id: number,
+    maxEventBytes: number,
+    opts: CallToolStreamOptions,
+  ): AsyncGenerator<StreamEvent> {
+    const headers = mcpHeaders(jwt, opts.sessionId, { contentHeaders: true });
+    delete headers.Authorization; // replaced by `auth` (lowercase), with a proof when keyed
+    const auth = this.auth(jwt, path);
+    // One controller for the request and the body: the caller's signal, and an idle timer
+    // restarted on every read (the whole-request timeout of the other calls would cut a long
+    // stream).
+    const ctl = new AbortController();
+    const onAbort = () => ctl.abort(opts.signal?.reason);
+    if (opts.signal?.aborted) onAbort();
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+    const ms = this.http.timeoutMs;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const restart = () => {
+      if (ms <= 0) return;
+      clearTimeout(timer);
+      timer = setTimeout(
+        () => ctl.abort(new DOMException("no data within the timeout", "TimeoutError")),
+        ms,
+      );
+    };
+    try {
+      restart();
+      const res = await this.post(
+        path,
+        async (nonce) => ({ ...headers, ...(await auth(nonce)) }),
+        body,
+        "POST",
+        ctl.signal,
+      );
+      restart();
+      yield* callStream(res, id, maxEventBytes, restart);
+    } finally {
+      clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", onAbort);
+    }
   }
 
   /** `tools/list`; the proxy shows only the tools this token may call. */

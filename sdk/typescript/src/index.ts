@@ -117,6 +117,7 @@ export { AttenuoClient } from "./client.js";
 export type {
   ApprovalWaitOptions,
   CallToolOptions,
+  CallToolStreamOptions,
   CallWithApprovalOptions,
   ClientOptions,
   InspectOptions,
@@ -135,6 +136,8 @@ export {
 } from "./errors.js";
 export type { FetchLike, HttpOptions } from "./http.js";
 export { TokenRefresher } from "./refresh.js";
+export { DEFAULT_MAX_EVENT_BYTES, SseParser } from "./sse.js";
+export type { SseEvent, StreamEvent } from "./sse.js";
 export type { RefresherOptions } from "./refresh.js";
 export { mcpFetch, mcpHeaders, mcpUrl } from "./mcp.js";
 export { decodeToken, Token, TOKEN_TYPE, verifyToken } from "./token.js";

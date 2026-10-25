@@ -81,10 +81,11 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * Start the fake upstream and the server with the demo config, plus `tokenSection` (a `[token]`
- * table) when given; resolves once both answer.
+ * table) when given and `fakeArgs` for the upstream; resolves once both answer.
  */
 async function startStack(
   tokenSection = "",
+  fakeArgs: string[] = [],
 ): Promise<{ url: string; work: string; procs: ChildProcess[] }> {
   const work = mkdtempSync(join(tmpdir(), "attenuo-it-"));
   const procs: ChildProcess[] = [];
@@ -116,7 +117,9 @@ async function startStack(
     [fakeOutS, fakeLogS, serverLogS].map((s) => new Promise((r) => s.once("open", r))),
   );
   procs.push(
-    spawn(fakeBin, ["--port", String(mcpPort)], { stdio: ["ignore", fakeOutS, fakeLogS] }),
+    spawn(fakeBin, ["--port", String(mcpPort), ...fakeArgs], {
+      stdio: ["ignore", fakeOutS, fakeLogS],
+    }),
     spawn(serverBin, ["--config", join(work, "config.toml")], {
       stdio: ["ignore", serverLogS, serverLogS],
       env: { ...process.env, RUST_LOG: "warn" },
@@ -508,6 +511,74 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
       expect(proc.stdout).toContain("denied:");
     },
   );
+});
+
+describe.skipIf(!enabled)("streamed tools/call against the real server", () => {
+  let procs: ChildProcess[] = [];
+  let work = "";
+  let url = "";
+
+  beforeAll(async () => {
+    // A fake upstream that streams its answers, and the proxy's re-check every second.
+    ({ url, work, procs } = await startStack("[proxy]\nstream_recheck_seconds = 1\n\n", ["--sse"]));
+  });
+
+  afterAll(async () => {
+    await stopStack(procs, work);
+  });
+
+  it("relays events in order and throws DeniedError when revocation cuts the stream", async () => {
+    const admin = new AdminClient(url, ADMIN_TOKEN);
+    const ob = new AttenuoClient(url);
+    const root = await admin.mintRootDev("alice", "https://idp.example", "assistant", {
+      capabilities: ["github:*"],
+    });
+    const coder = await ob.exchange(root, "coder", [capability("github", "read_file")], {
+      clientSecret: CODER_SECRET,
+    });
+    const args = { repo: "alice/public-docs", path: "README.md" };
+
+    const events = [];
+    for await (const ev of ob.callToolStream(coder, "github", "read_file", args)) events.push(ev);
+    expect(events.map((e) => e.method)).toEqual(["notifications/message", undefined]);
+    expect((events[0]!.message.params as { data: string }).data).toBe("working");
+    const final = events[1]!;
+    expect(final.isFinal).toBe(true);
+    expect(final.lastEventId).toBe("0");
+    expect(final.result?.isError).toBe(false);
+    expect(final.result?.decisionId).toBeTruthy();
+    expect((await admin.auditRecord(final.result!.decisionId!)).entry.record.decision).toBe(
+      "allow",
+    );
+
+    // A denial is thrown before anything streams.
+    const denied = ob.callToolStream(coder, "github", "read_file", { repo: "alice/private-x" });
+    await expect(denied[Symbol.asyncIterator]().next()).rejects.toMatchObject({
+      reason: "policy_deny",
+    });
+
+    // The upstream holds the response back for 20 s; revoke the lease after the first event.
+    const stream = ob.callToolStream(coder, "github", "read_file", { ...args, hold_ms: 20000 });
+    const held = stream[Symbol.asyncIterator]();
+    const first = await held.next();
+    expect(first.done).toBe(false);
+    expect(first.value?.method).toBe("notifications/message");
+    const started = Date.now();
+    expect((await admin.revokeLease(coder.lease!, "stream test")).revoked).toBe(1);
+    const cut = await held.next().then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(Date.now() - started).toBeLessThan(10_000); // one re-check interval (1 s), with slack
+    expect(cut).toBeInstanceOf(DeniedError);
+    expect((cut as DeniedError).reason).toBe("lease_revoked");
+    const end = (await admin.auditRecord((cut as DeniedError).decisionId!)).entry;
+    expect([end.record.tool, end.record.decision, end.record.reason]).toEqual([
+      "stream.end",
+      "deny",
+      "lease_revoked",
+    ]);
+  });
 });
 
 describe.skipIf(!enabled)("DPoP server nonces against the real server", () => {

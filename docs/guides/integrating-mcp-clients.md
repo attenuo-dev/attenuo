@@ -198,6 +198,8 @@ A request with no valid token is different: HTTP 401, JSON-RPC `-32001`, and `"i
 
 Other proxy errors: `-32004` (HTTP 404) for an unknown upstream name, `-32005` (HTTP 502) when the upstream cannot be reached, `-32602` for a request missing a field the proxy needs.
 
+**Streamed answers.** When the upstream streams a `tools/call` answer over SSE, the proxy relays it event by event and re-checks the token and lease every `[proxy] stream_recheck_seconds` (default 2). If the lease is revoked or expires, or the token expires, while the stream is open, the last event is a JSON-RPC `-32001` error with `"id": null` and `data.reason` (`lease_revoked`, `lease_expired`, `lease_unknown`, `token_expired`), plus `data.decision_id` naming the `stream.end` audit record. Treat it like the denial with the same reason in the table above. The SDKs do: `call_tool_stream` (Python) and `callToolStream` (TypeScript) yield each message as it arrives and raise the usual denial error (`Denied`, `DeniedError`) with that reason and decision id.
+
 **Sessions.** The proxy binds each `Mcp-Session-Id` the upstream assigns to the user and the root lease of the token that opened it. Every agent of the same run (same root token lineage) can use the session; any other token gets HTTP 403 with JSON-RPC `-32003` and reason `session_mismatch`, on `POST`, `GET` and `DELETE` alike. A session id the proxy does not know, for example after a proxy restart or an hour without use, gets HTTP 404: start a new session with `initialize`, as MCP clients already do on 404.
 
 Good client behaviour:
