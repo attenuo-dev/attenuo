@@ -30,6 +30,8 @@ pub struct AppState {
     pub leases: Arc<SqliteLeaseStore>,
     /// `[leases] session_retention_seconds`; `None` when session bindings are never pruned.
     pub session_retention: Option<Duration>,
+    /// `[leases] retention_seconds`; `None` when lease trees are never pruned.
+    pub lease_retention: Option<Duration>,
     /// Policy file to re-read on reload; `None` when no policy file is configured.
     pub policies_path: Option<PathBuf>,
     /// Digest and load time of the policy set in force, for `GET /admin/policies`. The engine
@@ -212,6 +214,16 @@ impl AppState {
                 "[[idps]] are configured but [[agents]] is empty; IdP intake rejects every request"
             );
         }
+        if config.leases.retention_seconds > 0
+            && config.leases.retention_seconds < config.issuer.default_ttl_seconds
+        {
+            tracing::warn!(
+                retention_seconds = config.leases.retention_seconds,
+                default_ttl_seconds = config.issuer.default_ttl_seconds,
+                "[leases] retention_seconds is below [issuer] default_ttl_seconds: a chain can be \
+                 pruned while its token is still valid, and its renewal then fails as lease_unknown"
+            );
+        }
 
         Ok(Self {
             issuer,
@@ -224,6 +236,7 @@ impl AppState {
             ),
             leases,
             session_retention: config.leases.session_retention(),
+            lease_retention: config.leases.retention(),
             policies_path: config.policy.policies_path.clone(),
             loaded_policies,
             admin_token: config.admin.token.clone(),

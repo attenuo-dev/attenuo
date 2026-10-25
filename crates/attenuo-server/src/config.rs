@@ -984,10 +984,20 @@ impl ApprovalsSection {
     }
 }
 
-/// `[leases]`: retention of the lease registry's side tables.
+/// `[leases]`: retention of the lease registry and its side tables.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LeasesSection {
+    /// How long a lease tree (a chain's root lease and everything delegated from it, with
+    /// their recorded subjects, chain bindings and session bindings) is kept after its last
+    /// lease ended, in seconds: after every lease in it is revoked or expired. Default 604800
+    /// (a week). An expired lease can still be renewed while its token is valid, so keep this
+    /// above the longest token lifetime the server issues; a tree pruned too early only makes
+    /// a renewal fail as `lease_unknown`. A pruned chain is no longer found by revoke-by-user
+    /// or shown in the console's lease tree; the audit log keeps every decision. 0 keeps every
+    /// lease (no pruning).
+    #[serde(default = "default_retention_seconds")]
+    pub retention_seconds: u64,
     /// How long a session binding (revoke by session) is kept after its chain's root lease
     /// expired, in seconds. Default 86400 (a day). A binding of a revoked chain goes at the
     /// next pruning pass whatever this says. An expired lease can still be renewed while its
@@ -1000,6 +1010,18 @@ pub struct LeasesSection {
 /// Default of `[leases] session_retention_seconds`.
 pub const DEFAULT_SESSION_RETENTION_SECONDS: u64 = 86_400;
 
+/// Default of `[leases] retention_seconds`: a week. Far above any token lifetime the server
+/// grants by default (`[issuer] default_ttl_seconds` is 900, and a root token never outlives
+/// its IdP credential, normally an hour or a day), so no renewable lease is pruned, and long
+/// enough that an operator looking into an incident the following week still finds the
+/// chain in the console and by user. A lease row with its subject and binding is a few
+/// hundred bytes, so a week of them is small next to the audit log.
+pub const DEFAULT_LEASE_RETENTION_SECONDS: u64 = 604_800;
+
+fn default_retention_seconds() -> u64 {
+    DEFAULT_LEASE_RETENTION_SECONDS
+}
+
 fn default_session_retention_seconds() -> u64 {
     DEFAULT_SESSION_RETENTION_SECONDS
 }
@@ -1007,6 +1029,7 @@ fn default_session_retention_seconds() -> u64 {
 impl Default for LeasesSection {
     fn default() -> Self {
         Self {
+            retention_seconds: DEFAULT_LEASE_RETENTION_SECONDS,
             session_retention_seconds: DEFAULT_SESSION_RETENTION_SECONDS,
         }
     }
@@ -1015,12 +1038,18 @@ impl Default for LeasesSection {
 impl LeasesSection {
     /// `session_retention_seconds` as a duration; `None` when pruning is off (0).
     pub fn session_retention(&self) -> Option<time::Duration> {
-        (self.session_retention_seconds > 0).then(|| {
-            time::Duration::seconds(
-                i64::try_from(self.session_retention_seconds).unwrap_or(i64::MAX),
-            )
-        })
+        seconds_or_off(self.session_retention_seconds)
     }
+
+    /// `retention_seconds` as a duration; `None` when lease pruning is off (0).
+    pub fn retention(&self) -> Option<time::Duration> {
+        seconds_or_off(self.retention_seconds)
+    }
+}
+
+/// A retention in seconds as a duration, `None` for 0 (off).
+fn seconds_or_off(seconds: u64) -> Option<time::Duration> {
+    (seconds > 0).then(|| time::Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX)))
 }
 
 /// `[admin]`
@@ -1681,6 +1710,27 @@ mod tests {
         let cfg = super::Config::from_toml("[leases]\nsession_retention_seconds = 0\n").unwrap();
         assert_eq!(cfg.leases.session_retention(), None);
         assert!(super::Config::from_toml("[leases]\nsession_retention = 1\n").is_err());
+    }
+
+    #[test]
+    fn lease_retention_defaults_to_a_week_and_zero_turns_it_off() {
+        let cfg = super::Config::from_toml("").unwrap();
+        assert_eq!(cfg.leases.retention(), Some(time::Duration::weeks(1)));
+        assert_eq!(cfg.leases.retention_seconds, 604_800);
+        // Independent of the session retention.
+        let cfg = super::Config::from_toml(
+            "[leases]\nretention_seconds = 172800\nsession_retention_seconds = 0\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.leases.retention(), Some(time::Duration::days(2)));
+        assert_eq!(cfg.leases.session_retention(), None);
+        let cfg = super::Config::from_toml("[leases]\nretention_seconds = 0\n").unwrap();
+        assert_eq!(cfg.leases.retention(), None);
+        assert_eq!(
+            cfg.leases.session_retention(),
+            Some(time::Duration::hours(24))
+        );
+        assert!(super::Config::from_toml("[leases]\nretention = 1\n").is_err());
     }
 
     use super::*;

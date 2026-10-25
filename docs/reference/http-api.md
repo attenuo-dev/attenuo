@@ -424,6 +424,7 @@ Every series is prefixed `attenuo_`. Label values come from fixed sets, so the n
 | `tokens_issued_total` | counter | `kind` (`root`, `exchange`) | Delegation tokens issued. |
 | `leases_revoked_total` | counter | none | Leases moved to revoked, including cascaded descendants. |
 | `lease_sessions_pruned_total` | counter | none | Session bindings (revoke by session) deleted because their chain's root lease was revoked or expired longer ago than `[leases] session_retention_seconds`. |
+| `leases_pruned_total` | counter | none | Leases deleted from the registry (with their recorded users and bindings) because every lease of their run was revoked or expired longer ago than `[leases] retention_seconds`. |
 | `audit_append_errors_total` | counter | none | Audit log appends that failed. |
 | `audit_checkpoints_total` | counter | none | Signed audit checkpoints written. |
 | `audit_checkpoint_last_timestamp_seconds` | gauge | none | Unix time this process wrote the newest signed audit checkpoint; 0 when none. |

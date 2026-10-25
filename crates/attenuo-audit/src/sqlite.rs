@@ -31,8 +31,9 @@ use crate::checkpoint::{
 use crate::error::AuditError;
 use crate::export::RecordFilter;
 use crate::lease::{
-    ancestors_of, breadth_first, classify, session_prunable, LeaseRow, LeaseSelector, LeaseStatus,
-    LeaseStore, LeaseSubtree, RunLabel, SelectorRevocation, SessionBinding, SessionPrune,
+    ancestors_of, breadth_first, classify, session_prunable, tree_prunable, LeasePrune, LeaseRow,
+    LeaseSelector, LeaseStatus, LeaseStore, LeaseSubtree, RunLabel, SelectorRevocation,
+    SessionBinding, SessionPrune,
 };
 use crate::log::{
     canonical_record_json, entry_hash_from_json, verify_entries, AuditEntry, AuditSink,
@@ -2424,6 +2425,9 @@ pub struct SqliteLeaseStore {
     /// The `rowid` of the last `lease_sessions` row a `prune_sessions` pass looked at; 0 to
     /// start from the first.
     session_cursor: Mutex<i64>,
+    /// The `rowid` of the last `leases` row a `prune_leases` pass looked at; 0 to start from
+    /// the first.
+    lease_cursor: Mutex<i64>,
     /// Tests: every charge commit and the `synchronous` level it ran at.
     #[cfg(test)]
     probe: Option<Arc<Mutex<Vec<String>>>>,
@@ -2477,6 +2481,7 @@ impl SqliteLeaseStore {
             value_key: ValueKey::new(&key),
             span_key: SpanKey::new(&span_key),
             session_cursor: Mutex::new(0),
+            lease_cursor: Mutex::new(0),
             #[cfg(test)]
             probe: None,
         })
@@ -3415,6 +3420,105 @@ impl LeaseStore for SqliteLeaseStore {
             _ => 0,
         };
         Ok(SessionPrune {
+            examined: seen.len() as u64,
+            pruned,
+            wrapped,
+        })
+    }
+
+    fn prune_leases(
+        &self,
+        now: OffsetDateTime,
+        retention: time::Duration,
+        max_rows: usize,
+    ) -> Result<LeasePrune, AuditError> {
+        let max_rows = max_rows.max(1);
+        let _gate = self.gate.hold();
+        let mut conn = self.conn.lock()?;
+        let mut cursor = self.lease_cursor.lock()?;
+        // One write transaction from the read on: a renewal cannot revive a tree between the
+        // check and the delete, and an exchange cannot register a child under a top being
+        // deleted (it would need the top live, and then the top is kept).
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // A top is a lease with no parent, or whose parent row is gone (a store that lost
+        // rows): its tree is decided here, its descendants are skipped.
+        type Seen = (i64, String, bool, String, Option<String>);
+        let seen: Vec<Seen> = tx
+            .prepare_cached(
+                "SELECT l.rowid, l.id, (l.parent IS NULL OR NOT EXISTS \
+                 (SELECT 1 FROM leases p WHERE p.id = l.parent)), l.expires_at, l.revoked_at \
+                 FROM leases l WHERE l.rowid > ?1 ORDER BY l.rowid LIMIT ?2",
+            )?
+            .query_map(
+                params![*cursor, i64::try_from(max_rows).unwrap_or(i64::MAX)],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?
+            .collect::<Result<_, _>>()?;
+        let mut pruned = 0u64;
+        for (_, top, is_top, expires_at, revoked_at) in &seen {
+            if !is_top {
+                continue;
+            }
+            // The top's own row first: a live top, the common case, costs no tree walk.
+            let row = LeaseRow {
+                parent: None,
+                expires_at: parse_time(expires_at)?,
+                revoked_at: revoked_at.as_deref().map(parse_time).transpose()?,
+                revoke_reason: None,
+            };
+            if !tree_prunable([&row], now, retention) {
+                continue;
+            }
+            type TreeRow = (String, String, Option<String>);
+            let tree: Vec<TreeRow> = tx
+                .prepare_cached(concat!(
+                    "SELECT id, expires_at, revoked_at FROM leases WHERE id IN (",
+                    subtree_ids!(""),
+                    ")"
+                ))?
+                .query_map([top], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<Result<_, _>>()?;
+            let rows = tree
+                .iter()
+                .map(|(_, expires_at, revoked_at)| {
+                    Ok(LeaseRow {
+                        parent: None,
+                        expires_at: parse_time(expires_at)?,
+                        revoked_at: revoked_at.as_deref().map(parse_time).transpose()?,
+                        revoke_reason: None,
+                    })
+                })
+                .collect::<Result<Vec<_>, AuditError>>()?;
+            if !tree_prunable(&rows, now, retention) {
+                continue;
+            }
+            // Everything keyed by these leases first, the lease rows last.
+            for (table, column) in [
+                ("lease_subjects", "id"),
+                ("lease_bindings", "id"),
+                ("lease_sessions", "chain_id"),
+                ("hop_limits", "lease"),
+                ("run_labels", "chain_id"),
+                ("run_spans", "chain_id"),
+                ("leases", "id"),
+            ] {
+                let mut delete =
+                    tx.prepare_cached(&format!("DELETE FROM {table} WHERE {column} = ?1"))?;
+                for (id, _, _) in &tree {
+                    let n = delete.execute([id])? as u64;
+                    if table == "leases" {
+                        pruned += n;
+                    }
+                }
+            }
+        }
+        tx.commit()?;
+        let wrapped = seen.len() < max_rows;
+        *cursor = match seen.last() {
+            Some((rowid, ..)) if !wrapped => *rowid,
+            _ => 0,
+        };
+        Ok(LeasePrune {
             examined: seen.len() as u64,
             pruned,
             wrapped,
