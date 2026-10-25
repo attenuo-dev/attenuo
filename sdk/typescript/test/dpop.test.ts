@@ -284,6 +284,29 @@ describe("DPoP server nonces", () => {
     expect(server.state.seen.slice(7)).toEqual(["n-2"]);
   });
 
+  it("signs callToolStream and retries it once on use_dpop_nonce", async () => {
+    const key = await DpopKey.generate();
+    const child = await bound(key.thumbprint, ["planner", "coder"]);
+    const body =
+      'data: {"jsonrpc":"2.0","method":"notifications/progress","params":{}}\n\n' +
+      'data: {"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"bound"}]}}\n\n';
+    const server = nonceServer(
+      () => new Response(body, { headers: { "content-type": "text/event-stream" } }),
+    );
+    const { fetch, calls } = mockFetch(server.handler);
+    const ob = new AttenuoClient(BASE, { fetch, dpopKey: key });
+    const events = [];
+    for await (const ev of ob.callToolStream(child, "github", "read_file")) events.push(ev);
+    expect(events.at(-1)?.result?.text).toBe("bound");
+    expect(server.state.seen).toEqual([undefined, "n-1"]);
+    const [first, retry] = calls as [Seen, Seen];
+    expect(retry.body).toEqual(first.body);
+    expect(retry.headers.get("authorization")).toBe(`DPoP ${child}`);
+    const { claims } = await verify(retry.headers.get("dpop"));
+    expect(claims.htm).toBe("POST");
+    expect(claims.htu).toBe(`${BASE}/mcp/github`);
+  });
+
   it("retries only once", async () => {
     const key = await DpopKey.generate();
     const child = await bound(key.thumbprint);

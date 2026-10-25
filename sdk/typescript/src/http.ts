@@ -18,7 +18,8 @@ export class Http {
   readonly base: string;
   private readonly doFetch: FetchLike;
   private readonly headers: Record<string, string>;
-  private readonly timeoutMs: number;
+  /** Per-request timeout in milliseconds; `0` disables it. */
+  readonly timeoutMs: number;
 
   constructor(serverUrl: string, opts: HttpOptions = {}, headers: Record<string, string> = {}) {
     this.base = normalizeBase(serverUrl);
@@ -34,6 +35,8 @@ export class Http {
       headers?: Record<string, string>;
       json?: unknown;
       query?: Record<string, string | number>;
+      /** Replaces the per-request timeout (a streamed answer keeps its own idle timer). */
+      signal?: AbortSignal;
     } = {},
   ): Promise<Response> {
     let url = `${this.base}${path}`;
@@ -47,7 +50,8 @@ export class Http {
       headers["content-type"] ??= "application/json";
       init.body = JSON.stringify(opts.json);
     }
-    if (this.timeoutMs > 0) init.signal = AbortSignal.timeout(this.timeoutMs);
+    if (opts.signal) init.signal = opts.signal;
+    else if (this.timeoutMs > 0) init.signal = AbortSignal.timeout(this.timeoutMs);
     return this.doFetch(url, init);
   }
 

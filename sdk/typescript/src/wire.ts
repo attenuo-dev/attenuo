@@ -397,10 +397,21 @@ function proxyDecisionId(headerValue: string | undefined, data: Json): string | 
  * error throws `RpcError`.
  */
 export async function rpcResult(res: Response): Promise<{ result: Json; decisionId?: string }> {
-  const headerId = res.headers.get(DECISION_ID_HEADER) ?? undefined;
   const sse = (res.headers.get("content-type") ?? "").includes("event-stream");
   const text = await res.text();
-  const msg = parseRpcBody(text, sse);
+  return rpcMessageResult(res, parseRpcBody(text, sse), text);
+}
+
+/**
+ * `rpcResult` for a response message already parsed (`msg`, undefined when the body held none)
+ * from `text`; only the status and headers of `res` are used, never its body.
+ */
+export function rpcMessageResult(
+  res: Response,
+  msg: Json | undefined,
+  text: string,
+): { result: Json; decisionId?: string } {
+  const headerId = res.headers.get(DECISION_ID_HEADER) ?? undefined;
   if (!msg) {
     if (res.ok) throw new AttenuoError(`no JSON-RPC response in body: ${text.slice(0, 200)}`);
     throw errorFromResponse(res.status, text);

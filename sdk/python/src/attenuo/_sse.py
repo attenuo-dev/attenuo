@@ -1,0 +1,237 @@
+"""An incremental ``text/event-stream`` parser and the streamed ``tools/call`` answer.
+
+The parser follows the SSE rules of the WHATWG HTML standard: LF, CRLF and CR line ends,
+``data:`` lines joined with ``\\n``, a blank line ends an event, comment lines (``:``) and the
+``event:`` and ``retry:`` fields are ignored, ``id:`` sets the last event id (kept across events,
+as the standard says, for ``Last-Event-ID``), and an event with no terminating blank line when
+the stream ends is dropped. It refuses an event (or a single line) over ``max_event_bytes``.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
+from typing import Any
+
+import httpx
+
+from . import _wire as w
+from .errors import AttenuoError, Denied
+
+#: The default bound on one SSE event (or a plain JSON answer) of a streamed call: 16 MiB, the
+#: proxy's ``[proxy] max_upstream_body_bytes`` default.
+DEFAULT_MAX_EVENT_BYTES = 16 * 1024 * 1024
+
+_LINE_END = re.compile(rb"\r\n|\r|\n")
+_BOM = b"\xef\xbb\xbf"
+
+
+@dataclass(frozen=True)
+class SseEvent:
+    """One dispatched SSE event: its joined ``data`` and the last event id at that point."""
+
+    data: str
+    last_event_id: str | None
+
+
+class SseParser:
+    """Feed bytes as they arrive; get back the events they complete."""
+
+    def __init__(self, max_event_bytes: int = DEFAULT_MAX_EVENT_BYTES) -> None:
+        if max_event_bytes <= 0:
+            raise ValueError("max_event_bytes must be positive")
+        self.max_event_bytes = max_event_bytes
+        self.last_event_id: str | None = None
+        self._buf = b""
+        self._data: list[str] = []
+        self._size = 0  # bytes of the lines of the event being read
+        self._start = True  # a UTF-8 BOM may open the stream
+
+    def feed(self, chunk: bytes) -> Iterator[SseEvent]:
+        """The events ``chunk`` completes, each as soon as it is parsed (consume them all)."""
+        self._buf += chunk
+        if self._start:
+            if len(self._buf) < len(_BOM) and _BOM.startswith(self._buf):
+                return
+            self._buf = self._buf.removeprefix(_BOM)
+            self._start = False
+        pos = 0
+        while True:
+            m = _LINE_END.search(self._buf, pos)
+            # A CR at the very end may be the first half of a CRLF: wait for the next chunk.
+            if m is None or (m.group() == b"\r" and m.end() == len(self._buf)):
+                break
+            line = self._buf[pos : m.start()]
+            self._take(m.end() - pos)
+            event = self._line(line)
+            pos = m.end()
+            if event is not None:
+                yield event
+        self._buf = self._buf[pos:]
+        if self._size + len(self._buf) > self.max_event_bytes:
+            raise self._too_big()
+
+    def close(self) -> list[SseEvent]:
+        """End of stream. A last line ended by a lone CR still counts; an event without its
+        blank line is dropped."""
+        out: list[SseEvent] = []
+        if self._buf.endswith(b"\r"):
+            event = self._line(self._buf[:-1])
+            if event is not None:
+                out.append(event)
+        self._buf = b""
+        self._data = []
+        self._size = 0
+        return out
+
+    def _take(self, n: int) -> None:
+        self._size += n
+        if self._size > self.max_event_bytes:
+            raise self._too_big()
+
+    def _too_big(self) -> AttenuoError:
+        return AttenuoError(f"SSE event over {self.max_event_bytes} bytes refused")
+
+    def _line(self, raw: bytes) -> SseEvent | None:
+        if not raw:
+            data, self._data, self._size = self._data, [], 0
+            if not data:
+                return None
+            return SseEvent("\n".join(data), self.last_event_id)
+        try:
+            line = raw.decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise AttenuoError("SSE stream is not UTF-8") from e
+        if line.startswith(":"):
+            return None
+        name, sep, value = line.partition(":")
+        if sep:
+            value = value.removeprefix(" ")
+        if name == "data":
+            self._data.append(value)
+        elif name == "id" and "\0" not in value:
+            self.last_event_id = value
+        # `event`, `retry` and unknown fields are ignored.
+        return None
+
+
+@dataclass(frozen=True)
+class StreamEvent:
+    """One JSON-RPC message of a streamed ``tools/call`` answer.
+
+    ``message`` is the message as sent: a notification (``notifications/progress``,
+    ``notifications/message``, ...), a request from the server, or the response to the call.
+    ``last_event_id`` is the SSE last event id when the message arrived (what a client sends as
+    ``Last-Event-ID`` to resume), ``None`` for a plain JSON answer or a stream without ids.
+    ``decision_id`` is the proxy's ``X-Attenuo-Decision-Id`` for the call. ``result`` is set on
+    the final event only: the call's :class:`~attenuo.ToolResult`.
+    """
+
+    message: dict[str, Any]
+    last_event_id: str | None = None
+    decision_id: str | None = None
+    result: w.ToolResult | None = field(default=None, repr=False)
+
+    @property
+    def method(self) -> str | None:
+        """The notification's or request's ``method``; ``None`` for a response."""
+        m = self.message.get("method")
+        return m if isinstance(m, str) else None
+
+    @property
+    def is_final(self) -> bool:
+        """True for the event that carries the call's result (always the last one)."""
+        return self.result is not None
+
+
+def stream_end_error(msg: dict[str, Any]) -> Denied | None:
+    """The proxy's last event on a stream it cut (``id: null``, ``-32001``, ``data.reason``) as
+    a :class:`Denied` with that reason and ``data.decision_id``, else ``None``.
+
+    The proxy's ``X-Attenuo-Decision-Id`` header went out before the cut, so it cannot vouch for
+    this decision id the way it does for a ``-32003``."""
+    err = msg.get("error")
+    if "method" in msg or msg.get("id") is not None or not isinstance(err, dict):
+        return None
+    data = err.get("data")
+    if err.get("code") != w.CODE_UNAUTHORIZED or not isinstance(data, dict):
+        return None
+    reason = data.get("reason")
+    if not isinstance(reason, str) or not reason:
+        return None
+    decision_id = data.get("decision_id")
+    return Denied(
+        reason,
+        decision_id if isinstance(decision_id, str) and decision_id else None,
+        str(err.get("message", "")),
+    )
+
+
+class CallStream:
+    """Turns the body of one ``tools/call`` response into :class:`StreamEvent` values.
+
+    Feed SSE chunks to :meth:`feed` and call :meth:`finish` at the end, or hand a plain JSON body
+    to :meth:`plain`. After the response to the call (result or error) ``done`` is set and later
+    events are ignored. A JSON-RPC error raises what :meth:`Client.call_tool` raises; the proxy's
+    stream-end event raises :class:`Denied` (see :func:`stream_end_error`).
+    """
+
+    def __init__(self, resp: httpx.Response, request_id: int, max_event_bytes: int) -> None:
+        self.resp = resp
+        self.request_id = request_id
+        self.decision_id: str | None = resp.headers.get(w.DECISION_ID_HEADER)
+        self.parser = SseParser(max_event_bytes)
+        self.done = False
+
+    @property
+    def sse(self) -> bool:
+        return "event-stream" in self.resp.headers.get("content-type", "")
+
+    def feed(self, chunk: bytes) -> Iterator[StreamEvent]:
+        return self._events(self.parser.feed(chunk))
+
+    def finish(self) -> Iterator[StreamEvent]:
+        yield from self._events(self.parser.close())
+        if not self.done:
+            raise AttenuoError("stream ended before the tools/call response")
+
+    def plain(self, body: bytes) -> list[StreamEvent]:
+        """A whole body read at once (a JSON answer, or an error status): one final event, or
+        the exception ``call_tool`` raises."""
+        if len(body) > self.parser.max_event_bytes:
+            raise AttenuoError(f"response over {self.parser.max_event_bytes} bytes refused")
+        whole = httpx.Response(self.resp.status_code, headers=self.resp.headers, content=body)
+        result, decision_id = w.rpc_result(whole)
+        self.done = True
+        msg = w.parse_rpc_body(whole.text, self.sse) or {}
+        return [StreamEvent(msg, None, decision_id, w.tool_result(result, decision_id))]
+
+    def _events(self, sse: Iterable[SseEvent]) -> Iterator[StreamEvent]:
+        for ev in sse:
+            if self.done:
+                break
+            if not ev.data.strip():
+                continue
+            try:
+                msg = json.loads(ev.data)
+            except ValueError as e:
+                raise AttenuoError(f"SSE event is not JSON: {ev.data[:200]}") from e
+            if not isinstance(msg, dict):
+                raise AttenuoError(f"SSE event is not one JSON-RPC message: {ev.data[:200]}")
+            yield self._message(msg, ev.last_event_id)
+
+    def _message(self, msg: dict[str, Any], last_event_id: str | None) -> StreamEvent:
+        is_response = "method" not in msg and ("result" in msg or "error" in msg)
+        if not is_response:
+            return StreamEvent(msg, last_event_id, self.decision_id)
+        cut = stream_end_error(msg)
+        if cut is not None:
+            self.done = True
+            raise cut
+        if msg.get("id") != self.request_id:
+            return StreamEvent(msg, last_event_id, self.decision_id)
+        self.done = True
+        result, decision_id = w.rpc_result(self.resp, msg)
+        return StreamEvent(msg, last_event_id, decision_id, w.tool_result(result, decision_id))

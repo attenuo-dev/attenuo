@@ -409,19 +409,27 @@ def approval_ready(approval: Approval) -> bool:
     raise ApprovalNotGranted(approval.approval_id, approval.state or "unknown")
 
 
-def rpc_result(resp: httpx.Response) -> tuple[dict[str, Any], str | None]:
+_UNPARSED: Any = object()
+
+
+def rpc_result(
+    resp: httpx.Response, msg: dict[str, Any] | None = _UNPARSED
+) -> tuple[dict[str, Any], str | None]:
     """The ``result`` of a JSON-RPC response, or the right exception.
 
-    Returns ``(result, decision_id)``. Denials (``-32003`` that the proxy
-    vouches for with ``X-Attenuo-Decision-Id``, see :func:`_proxy_decision_id`) raise
+    Returns ``(result, decision_id)``. ``msg`` is the response message when the caller already
+    parsed it (an event of a stream); otherwise it is read from ``resp``'s body. Denials
+    (``-32003`` that the proxy vouches for with ``X-Attenuo-Decision-Id``, see
+    :func:`_proxy_decision_id`) raise
     :class:`Denied`; a ``-32003`` without that proof is an upstream's own error and raises
     :class:`RpcError`. A ``-32008`` with the same proof raises :class:`ApprovalRequired`.
     ``-32001`` or HTTP 401 raises :class:`Unauthorized`; any other JSON-RPC error raises
     :class:`RpcError`.
     """
     decision_id = resp.headers.get(DECISION_ID_HEADER)
-    sse = "event-stream" in resp.headers.get("content-type", "")
-    msg = parse_rpc_body(resp.text, sse)
+    if msg is _UNPARSED:
+        sse = "event-stream" in resp.headers.get("content-type", "")
+        msg = parse_rpc_body(resp.text, sse)
     if msg is None:
         if resp.is_success:
             raise AttenuoError(f"no JSON-RPC response in body: {resp.text[:200]}")

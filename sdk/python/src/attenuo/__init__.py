@@ -15,6 +15,7 @@ with Client("http://127.0.0.1:8080") as ob:
 
 from importlib.metadata import PackageNotFoundError, version
 
+from ._sse import DEFAULT_MAX_EVENT_BYTES, StreamEvent
 from ._wire import Approval, AuthzenDecision, Lease, Tool, ToolResult
 from .admin import (
     AdminClient,
@@ -75,6 +76,7 @@ except PackageNotFoundError:  # pragma: no cover - running from a source tree
 
 __all__ = [
     "APPROVAL_TOKEN_TYPE",
+    "DEFAULT_MAX_EVENT_BYTES",
     "META_APPROVAL_KEY",
     "AdminClient",
     "ApiError",
@@ -125,6 +127,7 @@ __all__ = [
     "StatedBudget",
     "StatedSession",
     "StatedUsage",
+    "StreamEvent",
     "Token",
     "TokenRefresher",
     "Tool",

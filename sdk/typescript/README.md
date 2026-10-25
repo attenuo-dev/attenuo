@@ -351,19 +351,47 @@ console.log(claims.approvalId, claims.by, claims.expiresAt);
 
 It throws `VerificationError` on a bad signature, `typ`, expiry or binding. It proves the grant was made; only the server knows whether it has been used.
 
+### Streaming a call
+
+A long tool can stream its answer: the upstream sends progress notifications on an SSE stream before the result. `callTool` waits for the whole body. `callToolStream` (same arguments; options add `maxEventBytes` and `signal`) returns an `AsyncIterable` that yields each JSON-RPC message as it arrives:
+
+```ts
+import { DeniedError } from "@attenuo/sdk";
+
+try {
+  for await (const event of ob.callToolStream(coder, "github", "read_file", {
+    repo: "alice/docs",
+  })) {
+    if (event.result)
+      console.log(event.result.text, event.result.decisionId); // the last event
+    else if (event.method === "notifications/progress")
+      console.log("progress:", event.message.params);
+  }
+} catch (e) {
+  if (e instanceof DeniedError) console.log("denied or cut:", e.reason, e.decisionId);
+  else throw e;
+}
+```
+
+- **Events.** Each `StreamEvent` has `message` (the JSON-RPC message as sent), `method` (for a notification or a server request, else `undefined`), `lastEventId` (the SSE id at that point, what a client would send as `Last-Event-ID` to resume) and `decisionId` (the proxy's `X-Attenuo-Decision-Id`). The final event carries `result`, the same `ToolResult` that `callTool` returns, and `isFinal` is true. Nothing is yielded after it.
+- **Errors.** A denial throws `DeniedError` (or `ApprovalRequiredError`) before anything is yielded, as `callTool` does. When the proxy cuts a stream because the lease was revoked or expired, or the token expired (it re-checks every `[proxy] stream_recheck_seconds`, default 2), its last event is a JSON-RPC `-32001` error with `id: null`. That throws `DeniedError` with `reason` (`lease_revoked`, `lease_expired`, `lease_unknown`, `token_expired`, ...) and `decisionId`, the id of the proxy's `stream.end` audit record. So code that catches `DeniedError` around `callTool` also handles a revocation in the middle of a stream. The `X-Attenuo-Decision-Id` header is sent before the cut, so it cannot vouch for this id as it does for a `-32003`. Any other JSON-RPC error throws what `callTool` throws. A stream that ends without the response throws `AttenuoError`.
+- **Plain answers.** When the proxy answers with a JSON body instead of SSE (most upstreams do), you get one final event.
+- **Limits.** An SSE event, or a plain body, over `maxEventBytes` throws `AttenuoError`. The default is 16 MiB (`DEFAULT_MAX_EVENT_BYTES`), the same as the proxy's `[proxy] max_upstream_body_bytes` default. The client's `timeoutMs` restarts on every read, so it bounds silence, not the length of the stream; `signal` aborts the call. Leaving the loop early (`break`, a throw) cancels the body and closes the connection. The request goes out when iteration starts.
+- **Wire.** It sends the same `POST` as `callTool`: `Accept: application/json, text/event-stream`, the session id, the approval token in `_meta`, and a DPoP proof (with one retry on `use_dpop_nonce`) when the client has a key. Only the response handling differs. SSE parsing follows the WHATWG rules: `data:` lines are joined, a blank line ends an event, and comments, `event:` and `retry:` are ignored. A final event with no blank line after it is dropped, as the proxy also drops it. Tested on Node 20 and 22.
+
 ### Errors
 
-| Error                     | When                                                                                                                                                                                                                                                                            |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `DeniedError`             | The proxy denied a call (JSON-RPC `-32003` with the `X-Attenuo-Decision-Id` header naming `data.decision_id`; an upstream's own `-32003` without that proof is an `RpcError`). Branch on `reason` (`capability_denied`, `policy_deny`, `lease_revoked`, ...), log `decisionId`. |
-| `ApprovalRequiredError`   | A `DeniedError` for JSON-RPC `-32008`: a policy holds the call until it is approved. `approvalId`, `expiresAt`, `callHash`. See [Approvals](#approvals).                                                                                                                        |
-| `ApprovalNotGrantedError` | Waiting for an approval ended without a grant. `state`: `declined`, `expired`, `consumed` or `timeout`.                                                                                                                                                                         |
-| `UnauthorizedError`       | HTTP 401 or JSON-RPC `-32001`: the bearer is missing, malformed, expired or not ours. A subclass of `ApiError`.                                                                                                                                                                 |
-| `ApiError`                | A non-success HTTP status. `status`, `error` (for example `invalid_scope`), `detail`.                                                                                                                                                                                           |
-| `RpcError`                | Any other JSON-RPC error (`code`, `rpcMessage`, `data`).                                                                                                                                                                                                                        |
-| `RefreshError`            | A `TokenRefresher` gave up. `reason`: `lease_revoked`, `lease_lost`, `token_expired`, `refused`, `key_mismatch`.                                                                                                                                                                |
-| `VerificationError`       | `inspect(..., { verify: true })` failed.                                                                                                                                                                                                                                        |
-| `AttenuoError`            | Base class; also thrown for responses that are not what the server sends.                                                                                                                                                                                                       |
+| Error                     | When                                                                                                                                                                                                                                                                                                                                                                      |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DeniedError`             | The proxy denied a call (JSON-RPC `-32003` with the `X-Attenuo-Decision-Id` header naming `data.decision_id`; an upstream's own `-32003` without that proof is an `RpcError`). Also thrown by `callToolStream` when the proxy cuts a stream for a lease or token reason. Branch on `reason` (`capability_denied`, `policy_deny`, `lease_revoked`, ...), log `decisionId`. |
+| `ApprovalRequiredError`   | A `DeniedError` for JSON-RPC `-32008`: a policy holds the call until it is approved. `approvalId`, `expiresAt`, `callHash`. See [Approvals](#approvals).                                                                                                                                                                                                                  |
+| `ApprovalNotGrantedError` | Waiting for an approval ended without a grant. `state`: `declined`, `expired`, `consumed` or `timeout`.                                                                                                                                                                                                                                                                   |
+| `UnauthorizedError`       | HTTP 401 or JSON-RPC `-32001`: the bearer is missing, malformed, expired or not ours. A subclass of `ApiError`.                                                                                                                                                                                                                                                           |
+| `ApiError`                | A non-success HTTP status. `status`, `error` (for example `invalid_scope`), `detail`.                                                                                                                                                                                                                                                                                     |
+| `RpcError`                | Any other JSON-RPC error (`code`, `rpcMessage`, `data`).                                                                                                                                                                                                                                                                                                                  |
+| `RefreshError`            | A `TokenRefresher` gave up. `reason`: `lease_revoked`, `lease_lost`, `token_expired`, `refused`, `key_mismatch`.                                                                                                                                                                                                                                                          |
+| `VerificationError`       | `inspect(..., { verify: true })` failed.                                                                                                                                                                                                                                                                                                                                  |
+| `AttenuoError`            | Base class; also thrown for responses that are not what the server sends.                                                                                                                                                                                                                                                                                                 |
 
 An AuthZEN deny and a tool's own `isError` are results, not exceptions.
 
@@ -432,7 +460,7 @@ npm test             # vitest: unit tests on a mocked fetch
 npm run lint         # tsc --noEmit, eslint, prettier --check
 ```
 
-The integration test replays the GitHub leak scenario from [`examples/github-leak-demo`](https://github.com/attenuo-dev/attenuo/tree/main/examples/github-leak-demo) against a real `attenuo-server` and the `fake_mcp` upstream, then runs both examples. Other tests cover DPoP, server nonces, refresh, an export filtered on `tool` and `decision`, and revocation by chain and by MCP session (on a stack of their own, since the fake upstream gives every caller the same session id and the proxy binds it to the first). It needs prebuilt binaries:
+The integration test replays the GitHub leak scenario from [`examples/github-leak-demo`](https://github.com/attenuo-dev/attenuo/tree/main/examples/github-leak-demo) against a real `attenuo-server` and the `fake_mcp` upstream, then runs both examples. Other tests cover DPoP, server nonces, refresh, an export filtered on `tool` and `decision`, and revocation by chain and by MCP session (on a stack of their own, since the fake upstream gives every caller the same session id and the proxy binds it to the first). The streaming test runs on a stack with `fake_mcp --sse` and `[proxy] stream_recheck_seconds = 1`: a streamed answer arrives as a notification then the result, and a call the upstream holds open (`hold_ms`) is cut by the proxy when the lease is revoked, throwing `DeniedError` with the `stream.end` record's id. It needs prebuilt binaries:
 
 ```sh
 cargo build -p attenuo-server -p attenuo-cli && cargo build -p attenuo-proxy --example fake_mcp
@@ -447,7 +475,7 @@ cd sdk/typescript && npm run build && ATTENUO_INTEGRATION=1 npm test
 ## Not done
 
 - Not on npm until the maintainer publishes 0.1.0.
-- No streaming: `callTool` reads the whole response, so a long-lived SSE stream or server-initiated requests are not supported through the SDK's own methods (use the MCP client for those).
+- `callToolStream` yields server-initiated requests (sampling, elicitation) but cannot answer them, and does not resume a broken stream with `Last-Event-ID` (it keeps the id on each event). Use the MCP client for those.
 - The detached `ou_sig` over the user block is not checked locally; the server checks it on every request.
 - Hop-0 exchange against a live IdP is untested.
 - Browsers: nothing here is Node-only, but only Node 20 and 22 are tested.
