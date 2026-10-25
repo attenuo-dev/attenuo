@@ -104,8 +104,11 @@
 //! `prompts/list`, `resources/unsubscribe`, `logging/setLevel`, and every `notifications/*`. A
 //! message with no `method` (a client response to a server request) is forwarded after the
 //! lease check. A failed lease check of any of them is recorded as a `deny` under the method's
-//! name (or `http.POST`). `resources/unsubscribe` only gives something up, so it needs no
-//! decision; `resources/subscribe` does.
+//! name (or `http.POST`, `http.GET`, `http.DELETE`), at most once per delegation chain, name
+//! and reason per [`records::LEASE_REFUSAL_RECORD_WINDOW`]; later refusals in the window are
+//! still refused, name the window's record, and are counted
+//! ([`Authorizer::observe_record_suppressed`]). `resources/unsubscribe` only gives something
+//! up, so it needs no decision; `resources/subscribe` does.
 //!
 //! The default is deny: an unknown method (including `sampling/*`) is allowed only if a
 //! capability and the policy permit a tool named after the method. A request missing the field the mapping needs (`name`, `uri`) is answered with
@@ -140,6 +143,7 @@ pub mod jsonrpc;
 pub mod label;
 pub mod listed;
 pub mod proxy;
+pub mod records;
 pub mod session;
 pub mod sse;
 pub mod stage;

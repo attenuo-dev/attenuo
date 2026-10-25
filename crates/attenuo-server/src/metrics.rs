@@ -14,6 +14,7 @@ use std::time::Duration;
 use attenuo_audit::WalStats;
 use attenuo_core::{LimitKind, OutputLabel};
 use attenuo_proxy::guard::{STREAM_END_RECORD_WINDOW, STREAM_END_TOOL};
+use attenuo_proxy::records::{is_lease_refusal_tool, LEASE_REFUSAL_RECORD_WINDOW};
 use attenuo_proxy::{Stage, StreamEndCause};
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{header, HeaderValue};
@@ -151,6 +152,10 @@ pub struct Metrics {
     /// `stream.end` records not written, by [`StreamEndCause::index`] of the reason (only the
     /// [`StreamEndCause::RECORDED`] ones, which lead the list).
     stream_end_suppressed: [AtomicU64; StreamEndCause::RECORDED.len()],
+    /// Lease-refusal records of undecided requests not written, by (tool, index of the
+    /// reason). Tools come from a fixed set ([`is_lease_refusal_tool`]), so the map stays
+    /// small; a series appears once counted.
+    lease_refusal_suppressed: Mutex<BTreeMap<(String, usize), u64>>,
 }
 
 impl Default for Metrics {
@@ -188,6 +193,7 @@ impl Default for Metrics {
             wal: OnceLock::new(),
             streams_ended: Default::default(),
             stream_end_suppressed: Default::default(),
+            lease_refusal_suppressed: Mutex::default(),
         }
     }
 }
@@ -1009,15 +1015,20 @@ impl Metrics {
         self.streams_ended[cause.index()].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Count one audit record not written because an earlier one of the same chain and
-    /// reason stands for it. Only `stream.end` records with a recorded reason are bounded;
-    /// anything else is ignored, so the label set stays fixed.
+    /// Count one audit record not written because an earlier one of the same chain, tool and
+    /// reason stands for it: a `stream.end` of a listen stream, or a lease refusal of an
+    /// undecided request (a tool of [`is_lease_refusal_tool`]), with a recorded reason.
+    /// Anything else is ignored, so the label set stays fixed.
     pub fn record_suppressed(&self, tool: &str, reason: StreamEndCause) {
-        if tool != STREAM_END_TOOL {
+        if !StreamEndCause::RECORDED.contains(&reason) {
             return;
         }
-        if let Some(n) = self.stream_end_suppressed.get(reason.index()) {
-            n.fetch_add(1, Ordering::Relaxed);
+        if tool == STREAM_END_TOOL {
+            self.stream_end_suppressed[reason.index()].fetch_add(1, Ordering::Relaxed);
+        } else if is_lease_refusal_tool(tool) {
+            if let Ok(mut map) = self.lease_refusal_suppressed.lock() {
+                *map.entry((tool.to_owned(), reason.index())).or_default() += 1;
+            }
         }
     }
 
@@ -1044,9 +1055,13 @@ impl Metrics {
             "audit_records_suppressed_total",
             &format!(
                 "Audit records not written because an earlier record of the same delegation \
-                 chain and reason, at most {} s older, stands for them. Only stream.end records \
-                 of GET listen streams are bounded this way; tool-call decisions never are.",
-                STREAM_END_RECORD_WINDOW.as_secs()
+                 chain, tool and reason stands for them: stream.end records of GET listen \
+                 streams (at most {} s older), and lease refusals of undecided requests \
+                 (initialize, the list methods, notifications, GET, DELETE; at most {} s \
+                 older; these series appear once counted). Tool-call decisions, token \
+                 exchanges and renewals are never bounded.",
+                STREAM_END_RECORD_WINDOW.as_secs(),
+                LEASE_REFUSAL_RECORD_WINDOW.as_secs()
             ),
             "counter",
         );
@@ -1057,6 +1072,15 @@ impl Metrics {
                 "{PREFIX}_audit_records_suppressed_total{{tool=\"{STREAM_END_TOOL}\",reason=\"{}\"}} {n}",
                 reason.as_str()
             );
+        }
+        if let Ok(map) = self.lease_refusal_suppressed.lock() {
+            for ((tool, reason), n) in map.iter() {
+                let reason = StreamEndCause::RECORDED[*reason].as_str();
+                let _ = writeln!(
+                    out,
+                    "{PREFIX}_audit_records_suppressed_total{{tool=\"{tool}\",reason=\"{reason}\"}} {n}"
+                );
+            }
         }
     }
 }
@@ -1287,7 +1311,9 @@ mod tests {
         m.record_suppressed(STREAM_END_TOOL, StreamEndCause::TokenExpired);
         // Not a bounded record: ignored, no new label.
         m.record_suppressed("tools/call", StreamEndCause::TokenExpired);
+        m.record_suppressed("lease.renew", StreamEndCause::LeaseRevoked);
         m.record_suppressed(STREAM_END_TOOL, StreamEndCause::UpstreamEof);
+        m.record_suppressed("initialize", StreamEndCause::ClientDisconnect);
         let text = m.render();
         assert!(text.contains("# TYPE attenuo_proxy_streams_ended_total counter\n"));
         assert!(text.contains("attenuo_proxy_streams_ended_total{cause=\"token_expired\"} 1\n"));
@@ -1308,6 +1334,42 @@ mod tests {
             StreamEndCause::RECORDED.len()
         );
         assert!(!text.contains("tools/call"));
+        assert!(!text.contains("lease.renew"));
         assert!(!text.contains("reason=\"upstream_eof\""));
+        assert!(!text.contains("reason=\"client_disconnect\""));
+    }
+
+    #[test]
+    fn suppressed_lease_refusals_appear_once_counted() {
+        let m = Metrics::new();
+        let text = m.render();
+        assert!(!text.contains("tool=\"initialize\""));
+        m.record_suppressed("initialize", StreamEndCause::LeaseRevoked);
+        m.record_suppressed("initialize", StreamEndCause::LeaseRevoked);
+        m.record_suppressed("http.GET", StreamEndCause::LeaseExpired);
+        m.record_suppressed("http.GET", StreamEndCause::LeaseOther);
+        // Request text never becomes a label.
+        m.record_suppressed("vendor/x", StreamEndCause::LeaseRevoked);
+        let text = m.render();
+        assert!(text.contains(
+            "attenuo_audit_records_suppressed_total{tool=\"initialize\",reason=\"lease_revoked\"} 2\n"
+        ));
+        assert!(text.contains(
+            "attenuo_audit_records_suppressed_total{tool=\"http.GET\",reason=\"lease_expired\"} 1\n"
+        ));
+        assert!(text.contains(
+            "attenuo_audit_records_suppressed_total{tool=\"http.GET\",reason=\"lease_other\"} 1\n"
+        ));
+        assert!(!text.contains("vendor/x"));
+        assert_eq!(
+            text.matches("attenuo_audit_records_suppressed_total{")
+                .count(),
+            StreamEndCause::RECORDED.len() + 3
+        );
+        assert_eq!(
+            text.matches("# TYPE attenuo_audit_records_suppressed_total counter\n")
+                .count(),
+            1
+        );
     }
 }
