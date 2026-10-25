@@ -53,10 +53,11 @@ def result(text: str, request_id: int = 1) -> dict[str, Any]:
     }
 
 
+CUT_ID = "0b7c2f5e-9a41-4d3e-8f6a-2c1d5e7f9a30"
 CUT_ERROR: dict[str, Any] = {
     "code": -32001,
     "message": "attenuo: unauthorized: stream ended: lease_revoked",
-    "data": {"reason": "lease_revoked", "decision_id": "dec-end"},
+    "data": {"reason": "lease_revoked", "decision_id": CUT_ID},
 }
 CUT = {"jsonrpc": "2.0", "id": None, "error": CUT_ERROR}
 
@@ -189,7 +190,7 @@ async def test_stream_cut_by_the_proxy_raises_denied(make: Any) -> None:  # noqa
     assert [e.method for e in seen] == ["notifications/progress"]
     assert isinstance(err, Denied)
     assert err.reason == "lease_revoked"
-    assert err.decision_id == "dec-end"
+    assert err.decision_id == CUT_ID
     assert "stream ended" in str(err)
 
 
@@ -199,6 +200,54 @@ async def test_stream_cut_without_a_record_has_no_decision_id(make: Any) -> None
     client, _ = make(lambda r: httpx.Response(200, text=event(cut), headers=SSE))
     _, err = await collect_until_error(client.call_tool_stream("TOK", "github", "read_file"))
     assert isinstance(err, Denied) and err.reason == "token_expired" and err.decision_id is None
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "token_expired",
+        "lease_revoked",
+        "lease_expired",
+        "lease_unknown",
+        "lease_error",
+        "unauthorized",
+    ],
+)
+async def test_stream_cut_with_each_reason_the_proxy_sends_is_denied(
+    make: Any,  # noqa: F811
+    reason: str,
+) -> None:
+    error = {**CUT_ERROR, "data": {"reason": reason, "decision_id": CUT_ID}}
+    client, _ = make(
+        lambda r: httpx.Response(200, text=event({**CUT, "error": error}), headers=SSE)
+    )
+    _, err = await collect_until_error(client.call_tool_stream("TOK", "github", "read_file"))
+    assert isinstance(err, Denied) and err.reason == reason and err.decision_id == CUT_ID
+
+
+# Messages of the stream-end shape (null id, -32001) that the proxy never sends. The proxy
+# rewrites any such upstream message (`upstream_stream_end_shape`); the SDK's own check is
+# belt-and-braces, and reads them as an RpcError, not a decision.
+NOT_A_CUT: dict[str, dict[str, Any]] = {
+    "unknown reason": {**CUT_ERROR, "data": {"reason": "policy_deny", "decision_id": CUT_ID}},
+    "non-UUID decision id": {**CUT_ERROR, "data": {"reason": "lease_revoked", "decision_id": "x"}},
+    "null decision id": {**CUT_ERROR, "data": {"reason": "lease_revoked", "decision_id": None}},
+    "missing data": {"code": -32001, "message": CUT_ERROR["message"]},
+}
+
+
+@pytest.mark.parametrize("name", list(NOT_A_CUT))
+async def test_stream_end_shape_the_proxy_never_sends_is_not_denied(
+    make: Any,  # noqa: F811
+    name: str,
+) -> None:
+    error = NOT_A_CUT[name]
+    body = event(progress(1)) + event({**CUT, "error": error})
+    client, _ = make(lambda r: httpx.Response(200, text=body, headers=SSE))
+    seen, err = await collect_until_error(client.call_tool_stream("TOK", "github", "read_file"))
+    assert [e.method for e in seen] == ["notifications/progress"]
+    assert isinstance(err, RpcError) and not isinstance(err, Denied)
+    assert err.code == -32001 and err.data == error.get("data")
 
 
 # What the proxy relays when an upstream sends CUT itself (`upstream_stream_end_shape`).
