@@ -1350,6 +1350,38 @@ pub struct ProxySection {
     /// deleted (SR-49). Default 64.
     #[serde(default = "default_max_sessions_per_principal")]
     pub max_sessions_per_principal: usize,
+    /// How long, in seconds, after an audit record of a repeated condition further
+    /// occurrences of the same delegation chain, tool name and reason are counted (metric
+    /// `audit_records_suppressed_total`, proxy log) instead of recorded. One knob for both
+    /// bounded kinds, the `stream.end` records of `GET` listen streams and the lease refusals
+    /// of undecided requests (`initialize`, the list methods, notifications, `GET`,
+    /// `DELETE`): nobody has asked for them to differ, and two knobs would ask the operator a
+    /// question with no good answer. Tool-call decisions are never bounded. Default 60,
+    /// between 1 and 3600.
+    #[serde(default = "default_record_window_seconds")]
+    pub record_window_seconds: u64,
+    /// Most (chain, tool, reason) windows each bounded kind keeps open at once. A table full
+    /// of open windows records rather than suppresses, so a smaller figure only means more
+    /// records under a flood of distinct chains. Default 10000, between 100 and 1000000.
+    #[serde(default = "default_record_window_max_keys")]
+    pub record_window_max_keys: u64,
+}
+
+/// Largest `[proxy] record_window_seconds`: an hour.
+pub const MAX_RECORD_WINDOW_SECONDS: u64 = 3_600;
+
+/// Smallest `[proxy] record_window_max_keys`.
+pub const MIN_RECORD_WINDOW_MAX_KEYS: u64 = 100;
+
+/// Largest `[proxy] record_window_max_keys`.
+pub const MAX_RECORD_WINDOW_MAX_KEYS: u64 = 1_000_000;
+
+fn default_record_window_seconds() -> u64 {
+    attenuo_proxy::records::DEFAULT_RECORD_WINDOW.as_secs()
+}
+
+fn default_record_window_max_keys() -> u64 {
+    attenuo_proxy::records::DEFAULT_RECORD_WINDOW_MAX_KEYS as u64
 }
 
 impl Default for ProxySection {
@@ -1362,6 +1394,8 @@ impl Default for ProxySection {
             session_ttl_seconds: default_session_ttl_seconds(),
             max_sessions: default_max_sessions(),
             max_sessions_per_principal: default_max_sessions_per_principal(),
+            record_window_seconds: default_record_window_seconds(),
+            record_window_max_keys: default_record_window_max_keys(),
         }
     }
 }
@@ -1421,8 +1455,39 @@ impl ProxySection {
         Ok(())
     }
 
+    /// The record window and its capacity (`record_window_seconds`, `record_window_max_keys`),
+    /// or an error naming the first one out of range. Checked at startup.
+    pub fn record_window(&self) -> anyhow::Result<(std::time::Duration, usize)> {
+        for (name, value, min, max) in [
+            (
+                "record_window_seconds",
+                self.record_window_seconds,
+                1,
+                MAX_RECORD_WINDOW_SECONDS,
+            ),
+            (
+                "record_window_max_keys",
+                self.record_window_max_keys,
+                MIN_RECORD_WINDOW_MAX_KEYS,
+                MAX_RECORD_WINDOW_MAX_KEYS,
+            ),
+        ] {
+            if !(min..=max).contains(&value) {
+                anyhow::bail!("[proxy] {name} must be between {min} and {max}, not {value}");
+            }
+        }
+        Ok((
+            std::time::Duration::from_secs(self.record_window_seconds),
+            usize::try_from(self.record_window_max_keys)?,
+        ))
+    }
+
     /// Apply this section to a proxy configuration.
     pub fn apply(&self, config: attenuo_proxy::ProxyConfig) -> attenuo_proxy::ProxyConfig {
+        let (window, max_keys) = self.record_window().unwrap_or((
+            attenuo_proxy::records::DEFAULT_RECORD_WINDOW,
+            attenuo_proxy::records::DEFAULT_RECORD_WINDOW_MAX_KEYS,
+        ));
         config
             .with_stream_recheck(
                 self.stream_recheck()
@@ -1436,6 +1501,7 @@ impl ProxySection {
                 self.max_sessions,
             )
             .with_max_sessions_per_principal(self.max_sessions_per_principal)
+            .with_record_window(window, max_keys)
     }
 }
 
@@ -1807,6 +1873,97 @@ mod tests {
         );
         let cfg = super::Config::from_toml("[proxy]\nstream_recheck_seconds = 0\n").unwrap();
         assert!(cfg.proxy.stream_recheck().is_err());
+    }
+
+    #[test]
+    fn proxy_record_window_defaults_and_bounds() {
+        let cfg = Config::from_toml("").unwrap();
+        assert_eq!(cfg.proxy.record_window_seconds, 60);
+        assert_eq!(cfg.proxy.record_window_max_keys, 10_000);
+        let (window, max_keys) = cfg.proxy.record_window().unwrap();
+        assert_eq!(window, attenuo_proxy::records::DEFAULT_RECORD_WINDOW);
+        assert_eq!(
+            max_keys,
+            attenuo_proxy::records::DEFAULT_RECORD_WINDOW_MAX_KEYS
+        );
+        let applied = cfg.proxy.apply(attenuo_proxy::ProxyConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![],
+        ));
+        assert_eq!(applied.record_window, std::time::Duration::from_secs(60));
+        assert_eq!(applied.record_window_max_keys, 10_000);
+
+        for (toml, secs, keys) in [
+            (
+                "record_window_seconds = 5\nrecord_window_max_keys = 500\n",
+                5,
+                500,
+            ),
+            (
+                "record_window_seconds = 1\nrecord_window_max_keys = 100\n",
+                1,
+                100,
+            ),
+            (
+                "record_window_seconds = 3600\nrecord_window_max_keys = 1000000\n",
+                3600,
+                1_000_000,
+            ),
+        ] {
+            let cfg = Config::from_toml(&format!("[proxy]\n{toml}")).unwrap();
+            assert_eq!(
+                cfg.proxy.record_window().unwrap(),
+                (std::time::Duration::from_secs(secs), keys)
+            );
+            let applied = cfg.proxy.apply(attenuo_proxy::ProxyConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                vec![],
+            ));
+            assert_eq!(
+                (applied.record_window, applied.record_window_max_keys),
+                (std::time::Duration::from_secs(secs), keys)
+            );
+        }
+
+        for (line, expect) in [
+            (
+                "record_window_seconds = 0",
+                "[proxy] record_window_seconds must be between 1 and 3600, not 0",
+            ),
+            (
+                "record_window_seconds = 3601",
+                "[proxy] record_window_seconds must be between 1 and 3600, not 3601",
+            ),
+            (
+                "record_window_max_keys = 0",
+                "[proxy] record_window_max_keys must be between 100 and 1000000, not 0",
+            ),
+            (
+                "record_window_max_keys = 99",
+                "[proxy] record_window_max_keys must be between 100 and 1000000, not 99",
+            ),
+            (
+                "record_window_max_keys = 1000001",
+                "[proxy] record_window_max_keys must be between 100 and 1000000, not 1000001",
+            ),
+        ] {
+            let cfg = Config::from_toml(&format!("[proxy]\n{line}\n")).unwrap();
+            let err = cfg.proxy.record_window().unwrap_err().to_string();
+            assert_eq!(err, expect);
+        }
+        // Not a whole non-negative number: the parse error names the key.
+        for line in [
+            "record_window_seconds = \"60\"",
+            "record_window_seconds = 1.5",
+            "record_window_seconds = -1",
+            "record_window_max_keys = \"many\"",
+        ] {
+            let err = Config::from_toml(&format!("[proxy]\n{line}\n"))
+                .unwrap_err()
+                .to_string();
+            let key = line.split(' ').next().unwrap();
+            assert!(err.contains(key), "{line}: {err}");
+        }
     }
 
     #[test]

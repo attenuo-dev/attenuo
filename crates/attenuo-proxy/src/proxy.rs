@@ -26,10 +26,7 @@ use crate::auth::{
 };
 use crate::config::ProxyConfig;
 use crate::filter::{list_kinds_by_shape, ListFilter, ListKind};
-use crate::guard::{
-    disown_stream, disown_stream_end, guard_stream, StreamEndCause, StreamGuard,
-    STREAM_END_RECORD_WINDOW,
-};
+use crate::guard::{disown_stream, disown_stream_end, guard_stream, StreamEndCause, StreamGuard};
 use crate::jsonrpc::{
     self, approval_required_response, denied_response, denied_response_with, error_response, id_of,
     is_passthrough_method, is_request, method_of, CODE_INVALID_PARAMS, CODE_INVALID_REQUEST,
@@ -125,9 +122,12 @@ struct AppState {
     max_request_body: usize,
     /// Allowed calls whose answers may arrive on the `GET` listen stream (ADR-0009).
     awaited: Arc<AwaitedResults>,
-    /// The bound on `stream.end` records of `GET` listen streams, shared by all of them.
+    /// The bound on `stream.end` records of `GET` listen streams, shared by all of them
+    /// ([`ProxyConfig::record_window`], [`ProxyConfig::record_window_max_keys`]).
     stream_end_records: Arc<RecordWindow>,
     /// The bound on lease-refusal records of undecided requests ([`record_lease_refusal`]).
+    /// The same window and capacity as `stream_end_records`, in its own table so a flood of
+    /// one kind cannot fill the other's.
     lease_refusal_records: RecordWindow,
 }
 
@@ -157,7 +157,8 @@ pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
     let require_listed_tools = config.require_listed_tools;
     let max_upstream_body = config.max_upstream_body_bytes.max(1);
     let max_request_body = config.max_request_body_bytes.max(1);
-    let lease_refusal_records = RecordWindow::new(config.lease_refusal_record_window);
+    let record_window = config.record_window;
+    let record_window_max_keys = config.record_window_max_keys;
     let sessions = SessionRegistry::new(config.session_ttl, config.max_sessions)
         .with_max_per_principal(config.max_sessions_per_principal);
     let upstreams = config
@@ -176,8 +177,11 @@ pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
         max_upstream_body,
         max_request_body,
         awaited: Arc::new(AwaitedResults::new()),
-        stream_end_records: Arc::new(RecordWindow::new(STREAM_END_RECORD_WINDOW)),
-        lease_refusal_records,
+        stream_end_records: Arc::new(RecordWindow::with_max_keys(
+            record_window,
+            record_window_max_keys,
+        )),
+        lease_refusal_records: RecordWindow::with_max_keys(record_window, record_window_max_keys),
     });
     Router::new()
         .route(
@@ -337,7 +341,7 @@ fn unauthorized_body(id: Value, err: &AuthError, decision_id: Option<Uuid>) -> V
 /// from the request.
 ///
 /// Bounded by [`AppState::lease_refusal_records`]: the first refusal per delegation chain
-/// (digest), `tool` and reason in a [`crate::records::LEASE_REFUSAL_RECORD_WINDOW`] is
+/// (digest), `tool` and reason in a [`ProxyConfig::record_window`] is
 /// recorded; a later one in the window is still refused, but logged and counted through
 /// [`Authorizer::observe_record_suppressed`] instead of recorded, and its 401 names the
 /// window's first record. Returns the id the 401 names: the new record, the window's first

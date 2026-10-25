@@ -1054,7 +1054,7 @@ async fn a_new_window_records_the_next_lease_refusal() -> anyhow::Result<()> {
         false,
         vec![("tok", reader_chain())],
         |mut c| {
-            c.lease_refusal_record_window = window;
+            c.record_window = window;
             c
         },
     )

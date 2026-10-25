@@ -21,18 +21,23 @@ use uuid::Uuid;
 
 use crate::jsonrpc::PASSTHROUGH_METHODS;
 
-/// How many (chain, tool, reason) windows a [`RecordWindow`] keeps at once. When it is full of
+/// Default of [`crate::ProxyConfig::record_window_max_keys`] (`[proxy] record_window_max_keys`):
+/// how many (chain, tool, reason) windows a [`RecordWindow`] keeps at once. When it is full of
 /// windows that are all still open, a further record is admitted rather than suppressed: the
 /// bound may fail open (more records), never closed (fewer).
-pub const RECORD_WINDOW_MAX_KEYS: usize = 10_000;
+pub const DEFAULT_RECORD_WINDOW_MAX_KEYS: usize = 10_000;
 
-/// How long, after the lease-refusal record of an undecided request, further refusals of the
-/// same delegation chain, tool name and reason are counted instead of recorded. The same
-/// minute as [`crate::guard::STREAM_END_RECORD_WINDOW`], for the same reasons: the log keeps
-/// when the client first met the refusal, and one more record a minute while it keeps trying.
-/// A constant, not configuration (the suppressed refusals are in the metric
-/// `audit_records_suppressed_total` and the proxy log).
-pub const LEASE_REFUSAL_RECORD_WINDOW: Duration = Duration::from_secs(60);
+/// Default of [`crate::ProxyConfig::record_window`] (`[proxy] record_window_seconds`): how
+/// long, after a record of one bounded kind, further occurrences of the same delegation chain,
+/// tool name and reason are counted instead of recorded. It bounds both kinds, the
+/// `stream.end` records of `GET` listen streams ([`crate::guard`]) and the lease refusals of
+/// undecided requests. A minute keeps the record of when the condition began (the client
+/// first met the refusal, or its streams first ended), and one more a minute while it lasts,
+/// without one record per retry or per stream: a client holding several listen streams (or
+/// several sessions) of one token sees them all end at the same expiry or revocation. The
+/// suppressed occurrences are in the metric `audit_records_suppressed_total` and the proxy
+/// log.
+pub const DEFAULT_RECORD_WINDOW: Duration = Duration::from_secs(60);
 
 /// The tool names a lease refusal of a request with no allowlisted method is recorded under:
 /// a `POST` whose first refused message is a notification or a client reply, a `GET` and a
@@ -78,12 +83,12 @@ pub enum Admission {
 }
 
 impl RecordWindow {
-    /// A bound of `window` holding at most [`RECORD_WINDOW_MAX_KEYS`] windows.
+    /// A bound of `window` holding at most [`DEFAULT_RECORD_WINDOW_MAX_KEYS`] windows.
     pub fn new(window: Duration) -> Self {
-        Self::with_max_keys(window, RECORD_WINDOW_MAX_KEYS)
+        Self::with_max_keys(window, DEFAULT_RECORD_WINDOW_MAX_KEYS)
     }
 
-    /// A bound with another capacity (tests).
+    /// A bound of `window` holding at most `max_keys` windows (at least one).
     pub fn with_max_keys(window: Duration, max_keys: usize) -> Self {
         Self {
             window,
@@ -95,6 +100,11 @@ impl RecordWindow {
     /// The window's length.
     pub fn window(&self) -> Duration {
         self.window
+    }
+
+    /// The most windows held at once.
+    pub fn max_keys(&self) -> usize {
+        self.max_keys
     }
 
     /// Should a record of `tool` for `chain_key` and `reason` at `now` be written? An
@@ -235,6 +245,73 @@ mod tests {
         assert_eq!(r.admit("c3", T, "token_expired", t0 + 61 * SEC), first);
         assert!(matches!(
             r.admit("c3", T, "token_expired", t0 + 62 * SEC),
+            Admission::Suppress { .. }
+        ));
+    }
+
+    #[test]
+    fn a_short_window_closes_sooner() {
+        // `[proxy] record_window_seconds = 1`: a repeat 1.1 s after the first record opens a
+        // new window, where the default minute would still suppress it.
+        let r = RecordWindow::with_max_keys(SEC, DEFAULT_RECORD_WINDOW_MAX_KEYS);
+        assert_eq!(r.window(), SEC);
+        let t0 = Instant::now();
+        let first = Admission::Record {
+            suppressed_before: 0,
+        };
+        assert_eq!(r.admit("c1", "initialize", "lease_revoked", t0), first);
+        assert!(matches!(
+            r.admit("c1", "initialize", "lease_revoked", t0 + SEC / 2),
+            Admission::Suppress { .. }
+        ));
+        assert_eq!(
+            r.admit(
+                "c1",
+                "initialize",
+                "lease_revoked",
+                t0 + Duration::from_millis(1_100)
+            ),
+            Admission::Record {
+                suppressed_before: 1
+            }
+        );
+        let default = RecordWindow::new(DEFAULT_RECORD_WINDOW);
+        assert_eq!(default.window(), 60 * SEC);
+        assert_eq!(default.max_keys(), DEFAULT_RECORD_WINDOW_MAX_KEYS);
+        assert_eq!(
+            default.admit("c1", "initialize", "lease_revoked", t0),
+            first
+        );
+        assert!(matches!(
+            default.admit(
+                "c1",
+                "initialize",
+                "lease_revoked",
+                t0 + Duration::from_millis(1_100)
+            ),
+            Admission::Suppress { .. }
+        ));
+    }
+
+    #[test]
+    fn a_full_table_at_the_smallest_configurable_size_records() {
+        // `[proxy] record_window_max_keys = 100`, the smallest accepted.
+        let r = RecordWindow::with_max_keys(60 * SEC, 100);
+        assert_eq!(r.max_keys(), 100);
+        let t0 = Instant::now();
+        let first = Admission::Record {
+            suppressed_before: 0,
+        };
+        for i in 0..100 {
+            assert_eq!(r.admit(&format!("c{i}"), T, "lease_revoked", t0), first);
+        }
+        // The table is full of open windows: the 101st chain is recorded every time.
+        for s in 0..3 {
+            assert_eq!(r.admit("c100", T, "lease_revoked", t0 + s * SEC), first);
+        }
+        // A chain already in the table is still bounded.
+        assert!(matches!(
+            r.admit("c0", T, "lease_revoked", t0 + SEC),
             Admission::Suppress { .. }
         ));
     }

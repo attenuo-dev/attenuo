@@ -26,7 +26,9 @@
 //!   however it ends: cut by the re-check, finished or broken by the upstream, or dropped by
 //!   the client (the `Drop` of the stream state);
 //! - its `stream.end` records are bounded by a [`RecordWindow`]: at most one per delegation
-//!   chain and reason every [`STREAM_END_RECORD_WINDOW`]. The first end in a window is
+//!   chain and reason every [`crate::ProxyConfig::record_window`] (`[proxy]
+//!   record_window_seconds`, default [`crate::records::DEFAULT_RECORD_WINDOW`], a minute).
+//!   The first end in a window is
 //!   recorded; later ones in the same window still end their stream with the same final event
 //!   (naming the first record's id), are logged, and are counted through
 //!   [`Authorizer::observe_record_suppressed`] instead of recorded. The lease refusals of
@@ -59,15 +61,6 @@ pub use crate::auth::REASON_TOKEN_EXPIRED;
 /// The tool name of the audit record written when the proxy ends a stream because the lease
 /// is no longer live or the token expired. A fixed name, like `http.GET`, never request text.
 pub const STREAM_END_TOOL: &str = "stream.end";
-
-/// How long, after a `stream.end` record of a `GET` listen stream, further ends of listen
-/// streams of the same delegation chain for the same reason are counted instead of recorded
-/// ([`RecordWindow`]). A minute keeps the record of when the condition began, and one more
-/// a minute later while it lasts, without one record per stream: a client holding several
-/// listen streams (or several sessions) of one token sees them all end at the same expiry or
-/// revocation. A constant, not configuration: the suppressed ends are in the metric
-/// `audit_records_suppressed_total` and the proxy log.
-pub const STREAM_END_RECORD_WINDOW: Duration = Duration::from_secs(60);
 
 /// Why a guarded `GET` listen stream ended: the `cause` label of the server's
 /// `proxy_streams_ended_total`. A fixed set, so the metric's cardinality stays bounded; the
@@ -1045,7 +1038,9 @@ mod tests {
     fn listen_guard(auth: &Arc<StaticAuthorizer>, chain: &DelegationChain) -> StreamGuard {
         StreamGuard::new(auth.clone(), chain.clone(), Duration::from_millis(10))
             .recording("s", None, false)
-            .listen(Arc::new(RecordWindow::new(STREAM_END_RECORD_WINDOW)))
+            .listen(Arc::new(RecordWindow::new(
+                crate::records::DEFAULT_RECORD_WINDOW,
+            )))
     }
 
     #[tokio::test]

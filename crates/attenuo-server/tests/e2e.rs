@@ -1899,6 +1899,69 @@ async fn retried_initialize_on_a_revoked_lease_leaves_one_record() {
     assert_eq!(h.admin_get("/admin/audit/verify").await["ok"], true);
 }
 
+/// `[proxy] record_window_seconds` sets the window: at 1 s, a refused `initialize` 1.1 s after
+/// the first gets its own record, where the default minute would count it instead (above).
+/// A window of 0 refuses to start, naming the key.
+#[tokio::test]
+async fn record_window_seconds_sets_the_lease_refusal_window() {
+    let h = Harness::start_tweaked(false, |cfg| cfg.proxy.record_window_seconds = 1).await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    h.admin_post(
+        &format!("/admin/leases/{}/revoke", root.lease),
+        json!({"reason": "agent session compromised"}),
+    )
+    .await;
+    let before = h.audit_entries().await.len();
+    let initialize = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                   "clientInfo": {"name": "t", "version": "0"}}});
+    let refuse = || async {
+        let resp = h
+            .client
+            .post(h.url("/mcp/github"))
+            .header("accept", "application/json, text/event-stream")
+            .bearer_auth(&root.token)
+            .json(&initialize)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        resp.headers()["x-attenuo-decision-id"]
+            .to_str()
+            .unwrap()
+            .to_string()
+    };
+    let first = refuse().await;
+    // Within the second: still one record.
+    assert_eq!(refuse().await, first);
+    assert_eq!(h.audit_entries().await.len(), before + 1);
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let second = refuse().await;
+    assert_ne!(second, first);
+    let after = h.audit_entries().await;
+    assert_eq!(after.len(), before + 2, "a record per window");
+    assert_eq!(after.last().unwrap()["record"]["id"], second);
+    assert_eq!(after.last().unwrap()["record"]["tool"], "initialize");
+    let metrics = h.state.metrics.render();
+    assert!(
+        metrics.contains(
+            "attenuo_audit_records_suppressed_total{tool=\"initialize\",reason=\"lease_revoked\"} 1\n"
+        ),
+        "{metrics}"
+    );
+
+    let mut cfg = Config::default();
+    cfg.proxy.record_window_seconds = 0;
+    let err = attenuo_server::build(&cfg)
+        .err()
+        .expect("refused")
+        .to_string();
+    assert_eq!(
+        err,
+        "[proxy] record_window_seconds must be between 1 and 3600, not 0"
+    );
+}
+
 /// SR-28: a listen stream the proxy cuts because its lease was revoked leaves one `deny`
 /// record of `stream.end` against the token's chain and the session's hash tag, so the log
 /// tells a revoked stream from a dropped one. The final event names the record.

@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use attenuo_audit::WalStats;
 use attenuo_core::{LimitKind, OutputLabel};
-use attenuo_proxy::guard::{STREAM_END_RECORD_WINDOW, STREAM_END_TOOL};
-use attenuo_proxy::records::{is_lease_refusal_tool, LEASE_REFUSAL_RECORD_WINDOW};
+use attenuo_proxy::guard::STREAM_END_TOOL;
+use attenuo_proxy::records::is_lease_refusal_tool;
 use attenuo_proxy::{Stage, StreamEndCause};
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{header, HeaderValue};
@@ -1053,16 +1053,12 @@ impl Metrics {
         header_lines(
             out,
             "audit_records_suppressed_total",
-            &format!(
-                "Audit records not written because an earlier record of the same delegation \
-                 chain, tool and reason stands for them: stream.end records of GET listen \
-                 streams (at most {} s older), and lease refusals of undecided requests \
-                 (initialize, the list methods, notifications, GET, DELETE; at most {} s \
-                 older; these series appear once counted). Tool-call decisions, token \
-                 exchanges and renewals are never bounded.",
-                STREAM_END_RECORD_WINDOW.as_secs(),
-                LEASE_REFUSAL_RECORD_WINDOW.as_secs()
-            ),
+            "Audit records not written because an earlier record of the same delegation \
+             chain, tool and reason, less than [proxy] record_window_seconds older (default \
+             60), stands for them: stream.end records of GET listen streams, and lease \
+             refusals of undecided requests (initialize, the list methods, notifications, GET, \
+             DELETE; these series appear once counted). Tool-call decisions, token exchanges \
+             and renewals are never bounded.",
             "counter",
         );
         for reason in StreamEndCause::RECORDED {
