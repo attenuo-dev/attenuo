@@ -475,8 +475,9 @@ pub enum LeaseCmd {
 pub enum BudgetCmd {
     /// Give back to every run-limit counter what one allowed decision charged, once, for a
     /// call whose effect did not happen (`POST /admin/budgets/refund`). The refund is audited
-    /// as an `admin.budget.refund` record. Exits 2 when the decision charged nothing and 3 when
-    /// it was already refunded.
+    /// as an `admin.budget.refund` record. Exits 2 when there is nothing to refund (an unknown
+    /// decision, or one that charged nothing), 3 when it was already refunded and 4 when its
+    /// charge was pruned (`[leases] run_state_retention_seconds`).
     Refund {
         /// The allowed call's decision id (the record id `audit tail` prints as `id=`, or the
         /// AuthZEN `context.decision_id`).

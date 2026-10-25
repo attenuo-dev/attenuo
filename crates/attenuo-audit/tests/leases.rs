@@ -4,8 +4,8 @@
 mod common;
 
 use attenuo_audit::{
-    AuditError, AuditSink, LeaseNode, LeaseSelector, LeaseStatus, LeaseStore, LeaseSubtree,
-    MemoryLeaseStore, SessionBinding, SqliteAudit, SqliteLeaseStore,
+    AuditError, AuditSink, LeaseNode, LeasePrune, LeaseSelector, LeaseStatus, LeaseStore,
+    LeaseSubtree, MemoryLeaseStore, SessionBinding, SqliteAudit, SqliteLeaseStore,
 };
 use attenuo_core::LeaseId;
 use attenuo_core::{Decision, DelegationChain, RecordKind};
@@ -1322,4 +1322,232 @@ fn a_lease_whose_parent_is_gone_is_pruned_as_its_own_tree() {
         ),
         2
     );
+}
+
+/// A wide run: `w` with ten children `w-c0`..`w-c9`, each with ten children
+/// `w-cN-g0`..`w-cN-g9` (111 leases), all expiring an hour after t0; the root's subject and
+/// a session binding, a child's binding, a grandchild's hop limits. Next to it a live run
+/// `live` > `live-c`. Returns every lease of the wide run, the root first.
+fn wide_run(s: &dyn LeaseStore) -> Vec<String> {
+    let exp = t0() + Duration::hours(1);
+    let mut all = vec!["w".to_string()];
+    s.register(&id("w"), None, exp).unwrap();
+    for c in 0..10 {
+        let child = format!("w-c{c}");
+        s.register(&id(&child), Some(&id("w")), exp).unwrap();
+        all.push(child.clone());
+        for g in 0..10 {
+            let grandchild = format!("{child}-g{g}");
+            s.register(&id(&grandchild), Some(&id(&child)), exp)
+                .unwrap();
+            all.push(grandchild);
+        }
+    }
+    s.record_subject(&id("w"), "wendy").unwrap();
+    s.record_session(S1, "github", &id("w"), t0()).unwrap();
+    s.bind(&id("w-c3"), "digest").unwrap();
+    s.record_hop_limits(&id("w-c3-g3"), &[]).unwrap();
+    let far = exp + Duration::weeks(10);
+    s.register(&id("live"), None, far).unwrap();
+    s.register(&id("live-c"), Some(&id("live")), far).unwrap();
+    all
+}
+
+fn strs(all: &[String]) -> Vec<&str> {
+    all.iter().map(String::as_str).collect()
+}
+
+/// What a lease check of the wide run sees between passes. No lease of it is active and no
+/// chain of it is; every lease still there has its parent row (children go first); the root
+/// is there as long as any lease of the run is. Returns how many leases of the run are left.
+fn wide_run_is_consistent(
+    name: &str,
+    s: &dyn LeaseStore,
+    all: &[String],
+    now: time::OffsetDateTime,
+) -> usize {
+    let left = known(s, &strs(all));
+    for lease in &left {
+        if let Some((parent, _)) = lease.rsplit_once('-') {
+            assert!(
+                left.iter().any(|l| l == parent),
+                "{name}: {lease} left without {parent}"
+            );
+        }
+        assert!(!s.is_active(&id(lease), now).unwrap(), "{name}: {lease}");
+    }
+    if !left.is_empty() {
+        assert!(left.iter().any(|l| l == "w"), "{name}: root went first");
+    }
+    for c in 0..10 {
+        for g in 0..10 {
+            let chain = [id("w"), id(&format!("w-c{c}")), id(&format!("w-c{c}-g{g}"))];
+            let status = s.check_all(&chain.iter().collect::<Vec<_>>(), now).unwrap();
+            assert!(!status.active, "{name}: {chain:?}");
+        }
+    }
+    left.len()
+}
+
+/// A run wider than a pass is walked whole before anything of it goes, then deleted over
+/// several passes, children before parents and the root last. A pass never touches more
+/// than its batch of lease rows (window, walk and deletes together), no lease of the run is
+/// ever live, none is ever left without its parent row, and the run goes with everything
+/// keyed by it, while the live run next to it stays.
+#[test]
+fn a_wide_run_is_pruned_over_several_passes_never_partly_live() {
+    for (name, s) in stores() {
+        let s = s.as_ref();
+        let all = wide_run(s);
+        s.revoke(&id("w"), "done", t0()).unwrap();
+        let now = t0() + RETAIN + Duration::seconds(1);
+        let mut passes: Vec<LeasePrune> = Vec::new();
+        let mut walked_before_delete = 0;
+        loop {
+            let pass = s.prune_leases(now, RETAIN, 7).unwrap();
+            assert!(
+                pass.examined + pass.walked + pass.pruned <= 7,
+                "{name}: {pass:?}"
+            );
+            if passes.iter().all(|p| p.pruned == 0) {
+                walked_before_delete += pass.walked;
+            }
+            passes.push(pass);
+            let left = wide_run_is_consistent(name, s, &all, now);
+            let pruned: u64 = passes.iter().map(|p| p.pruned).sum();
+            assert_eq!(left as u64 + pruned, 111, "{name}");
+            if pass.wrapped {
+                break;
+            }
+        }
+        let deleting = passes.iter().filter(|p| p.pruned > 0).count();
+        assert!(deleting >= 16, "{name}: {deleting} deleting passes");
+        assert_eq!(walked_before_delete, 110, "{name}: walked whole first");
+        assert_eq!(passes.iter().map(|p| p.pruned).sum::<u64>(), 111, "{name}");
+        assert_eq!(known(s, &["live", "live-c"]).len(), 2, "{name}");
+        assert_eq!(s.subject(&id("w")).unwrap(), None, "{name}");
+        assert_eq!(s.sessions(S1).unwrap(), Vec::new(), "{name}");
+        assert_eq!(s.binding(&id("w-c3")).unwrap(), None, "{name}");
+        assert_eq!(s.hop_limits(&id("w-c3-g3")).unwrap(), None, "{name}");
+        assert_eq!(prune_leases_all(s, now, 7), 0, "{name}");
+    }
+}
+
+/// Passes of 7 until one deletes something (`true`) or the sweep wraps without (`false`).
+fn prune_until_deleting(s: &dyn LeaseStore, now: time::OffsetDateTime) -> bool {
+    for _ in 0..1000 {
+        let pass = s.prune_leases(now, RETAIN, 7).unwrap();
+        if pass.pruned > 0 {
+            return true;
+        }
+        if pass.wrapped {
+            return false;
+        }
+    }
+    panic!("no pass deleted or wrapped");
+}
+
+/// The first pass that walks part of the wide run (and deletes nothing).
+fn start_walk(name: &str, s: &dyn LeaseStore, now: time::OffsetDateTime) {
+    for _ in 0..10 {
+        let pass = s.prune_leases(now, RETAIN, 7).unwrap();
+        assert_eq!(pass.pruned, 0, "{name}");
+        if pass.walked > 0 {
+            return;
+        }
+    }
+    panic!("{name}: no walk");
+}
+
+/// Writes between the passes of a wide run's walk abandon it, so the run is decided again as
+/// one transaction would decide it: a late revocation of a lease already walked restarts the
+/// grace period, a renewal keeps the run, and a child registered under a walked lease goes
+/// with the run rather than being left behind. Nothing of the run is deleted meanwhile.
+#[test]
+fn writes_during_a_wide_runs_walk_keep_it_whole() {
+    let exp = t0() + Duration::hours(1);
+    let now = exp + RETAIN + Duration::seconds(1);
+    for (name, s) in stores() {
+        let s = s.as_ref();
+        let all = wide_run(s);
+        // Expired, never revoked.
+        start_walk(name, s, now);
+        s.revoke(&id("w-c0"), "late", now).unwrap();
+        assert!(!prune_until_deleting(s, now), "{name}: late revocation");
+        assert_eq!(wide_run_is_consistent(name, s, &all, now), 111, "{name}");
+        // Past the restarted grace period the run goes whole.
+        let later = now + RETAIN + Duration::seconds(1);
+        assert_eq!(prune_leases_all(s, later, 7), 111, "{name}");
+    }
+    for (name, s) in stores() {
+        let s = s.as_ref();
+        let all = wide_run(s);
+        start_walk(name, s, now);
+        s.renew(&id("w"), now + Duration::minutes(5), now).unwrap();
+        assert!(!prune_until_deleting(s, now), "{name}: renewal");
+        let after = now + Duration::minutes(10);
+        assert_eq!(wide_run_is_consistent(name, s, &all, after), 111, "{name}");
+        assert!(s.is_active(&id("w"), now).unwrap(), "{name}");
+    }
+    for (name, s) in stores() {
+        let s = s.as_ref();
+        let mut all = wide_run(s);
+        start_walk(name, s, now);
+        // A child of the root, registered already ended, after the root was walked.
+        s.register(&id("w-late"), Some(&id("w")), exp).unwrap();
+        all.push("w-late".into());
+        let mut pruned = 0;
+        for _ in 0..1000 {
+            let pass = s.prune_leases(now, RETAIN, 7).unwrap();
+            pruned += pass.pruned;
+            if pass.wrapped && pruned > 0 {
+                break;
+            }
+        }
+        assert_eq!(pruned, 112, "{name}: the late child went with the run");
+        assert!(known(s, &strs(&all)).is_empty(), "{name}");
+    }
+}
+
+/// Once a wide run is being deleted, a renewal or a new registration of one of its leases is
+/// refused as unknown, so no part of it is live again; a revocation changes nothing usable,
+/// and the deletion carries on to the end.
+#[test]
+fn a_wide_run_being_deleted_cannot_be_revived() {
+    let exp = t0() + Duration::hours(1);
+    let now = exp + RETAIN + Duration::seconds(1);
+    for (name, s) in stores() {
+        let s = s.as_ref();
+        let all = wide_run(s);
+        assert!(prune_until_deleting(s, now), "{name}");
+        assert_eq!(
+            known(s, &["w", "w-c0"]).len(),
+            2,
+            "{name}: root and a child left"
+        );
+        assert!(
+            matches!(
+                s.renew(&id("w"), now + Duration::hours(1), now),
+                Err(AuditError::UnknownLease(_))
+            ),
+            "{name}"
+        );
+        assert!(
+            matches!(
+                s.register(&id("w-c0"), Some(&id("w")), now + Duration::hours(1)),
+                Err(AuditError::UnknownLease(_))
+            ),
+            "{name}"
+        );
+        s.revoke(&id("w-c0"), "late", now).unwrap();
+        assert!(wide_run_is_consistent(name, s, &all, now) > 0, "{name}");
+        prune_leases_all(s, now, 7);
+        assert!(known(s, &strs(&all)).is_empty(), "{name}");
+        // Gone, the run is unknown to a renewal like any pruned run; the live run is there.
+        assert!(matches!(
+            s.renew(&id("w"), now + Duration::hours(1), now),
+            Err(AuditError::UnknownLease(_))
+        ));
+        assert_eq!(known(s, &["live", "live-c"]).len(), 2, "{name}");
+    }
 }

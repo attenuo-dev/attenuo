@@ -309,6 +309,8 @@ pub struct ApiError {
     pub status: StatusCode,
     /// The JSON body's `error` code, when the body is `{"error": code, ...}`.
     pub code: Option<String>,
+    /// The JSON body's `detail`, when it has a string one.
+    pub detail: Option<String>,
     message: String,
 }
 
@@ -322,8 +324,10 @@ impl std::error::Error for ApiError {}
 
 /// A server error as `{"error": code, "detail": text}`, or the raw body when it is not that.
 pub(crate) fn api_error(status: StatusCode, body: &str) -> anyhow::Error {
+    let mut detail = None;
     let (code, message) = match serde_json::from_str::<Value>(body) {
         Ok(v) if v["error"].is_string() => {
+            detail = v["detail"].as_str().map(str::to_string);
             let code = v["error"].as_str().unwrap_or_default().to_string();
             // A refusal the server audited (a refused token exchange) names its record.
             let message = format!(
@@ -345,6 +349,7 @@ pub(crate) fn api_error(status: StatusCode, body: &str) -> anyhow::Error {
     anyhow::Error::new(ApiError {
         status,
         code,
+        detail,
         message,
     })
 }
@@ -420,6 +425,7 @@ mod tests {
         let api = e.downcast_ref::<ApiError>().unwrap();
         assert_eq!(api.status, StatusCode::CONFLICT);
         assert_eq!(api.code.as_deref(), Some("already_refunded"));
+        assert_eq!(api.detail.as_deref(), Some("once"));
         let e = api_error(StatusCode::NOT_FOUND, "");
         let api = e.downcast_ref::<ApiError>().unwrap();
         assert_eq!(

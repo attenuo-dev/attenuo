@@ -243,11 +243,12 @@ When the server refuses, one line goes to stderr and nothing to stdout, with `--
 
 | Server answer | Message | Exit status |
 | --- | --- | --- |
-| 404 `not_found` | `error: no charge is recorded for decision <id> (it charged no run limit or run usage, or its charge log was pruned); nothing to refund` | 2 |
+| 404 `not_found` | `error: ` and the server's detail, which says which case it is: ``unknown decision `<id>`: no audit record has this id; nothing to refund``, ``decision `<id>` charged nothing: ...`` or ``decision `<id>` charged no run limit, only run usage, ...`` (see [Budget refund](http-api.md#budget-refund)); from a server without that detail, `error: no charge is recorded for decision <id> (it charged no run limit or run usage, or its charge log was pruned); nothing to refund` | 2 |
 | 409 `already_refunded` | `error: the charge of decision <id> was already refunded` | 3 |
+| 410 `charge_pruned` | `error: the charge of decision <id> was pruned ([leases] run_state_retention_seconds after its run ended); it can no longer be refunded` | 4 |
 | anything else | `error: server answered ...` | 1 |
 
-Exit 3 lets a script that retries a refund tell "already done" from "nothing to do". If the refund stood but its audit record could not be written, `audit` reads `- (the refund stands, but its audit record was not written; see the server log)` and the exit status is 0.
+Exit 3 lets a script that retries a refund tell "already done" from "nothing to do", and exit 4 tells "too late: the charge log no longer has it" from both. If the refund stood but its audit record could not be written, `audit` reads `- (the refund stands, but its audit record was not written; see the server log)` and the exit status is 0.
 
 ### `audit tail`
 

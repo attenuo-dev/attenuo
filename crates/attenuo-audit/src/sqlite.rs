@@ -31,9 +31,9 @@ use crate::checkpoint::{
 use crate::error::AuditError;
 use crate::export::RecordFilter;
 use crate::lease::{
-    ancestors_of, breadth_first, classify, run_state_prunable, session_prunable, tree_prunable,
-    LeasePrune, LeaseRow, LeaseSelector, LeaseStatus, LeaseStore, LeaseSubtree, RunLabel,
-    RunStatePrune, SelectorRevocation, SessionBinding, SessionPrune,
+    ancestors_of, breadth_first, classify, prune_pass, run_state_prunable, session_prunable,
+    LeasePrune, LeasePruneState, LeaseRow, LeaseSelector, LeaseStatus, LeaseStore, LeaseSubtree,
+    PruneOps, RunLabel, RunStatePrune, SelectorRevocation, SessionBinding, SessionPrune,
 };
 use crate::log::{
     canonical_record_json, entry_hash_from_json, verify_entries, AuditEntry, AuditSink,
@@ -2425,9 +2425,9 @@ pub struct SqliteLeaseStore {
     /// The `rowid` of the last `lease_sessions` row a `prune_sessions` pass looked at; 0 to
     /// start from the first.
     session_cursor: Mutex<i64>,
-    /// The `rowid` of the last `leases` row a `prune_leases` pass looked at; 0 to start from
-    /// the first.
-    lease_cursor: Mutex<i64>,
+    /// Where the next `prune_leases` pass starts (the `rowid` of the last `leases` row a pass
+    /// looked at), and the run it is pruning, if any. Taken under `conn`.
+    lease_prune: Mutex<LeasePruneState<i64>>,
     /// Where the next `prune_run_state` pass starts: the table (0 `budget_charges`, 1
     /// `budget_counters`, 2 `approvals`) and the `rowid` of the last row a pass looked at in
     /// it, 0 to start from the first.
@@ -2485,7 +2485,7 @@ impl SqliteLeaseStore {
             value_key: ValueKey::new(&key),
             span_key: SpanKey::new(&span_key),
             session_cursor: Mutex::new(0),
-            lease_cursor: Mutex::new(0),
+            lease_prune: Mutex::default(),
             run_state_cursor: Mutex::new((0, 0)),
             #[cfg(test)]
             probe: None,
@@ -2754,6 +2754,129 @@ fn refund_in(
 
 fn to_i64(v: u64) -> Result<i64, AuditError> {
     i64::try_from(v).map_err(|_| AuditError::Storage(format!("budget figure {v} out of range")))
+}
+
+/// The SQLite store's side of [`prune_pass`], inside the pass's transaction.
+struct SqlitePrune<'a> {
+    tx: &'a rusqlite::Transaction<'a>,
+}
+
+/// A lease row as `prune_pass` reads it.
+fn prune_row(
+    parent: Option<String>,
+    expires_at: &str,
+    revoked_at: Option<&str>,
+) -> Result<LeaseRow, AuditError> {
+    Ok(LeaseRow {
+        parent: parent.map(LeaseId),
+        expires_at: parse_time(expires_at)?,
+        revoked_at: revoked_at.map(parse_time).transpose()?,
+        revoke_reason: None,
+    })
+}
+
+impl PruneOps for SqlitePrune<'_> {
+    type Pos = i64;
+
+    fn window(
+        &mut self,
+        after: Option<&i64>,
+        limit: usize,
+    ) -> Result<Vec<(i64, LeaseId, bool, LeaseRow)>, AuditError> {
+        // A top is a lease with no parent, or whose parent row is gone (a store that lost
+        // rows): its run is decided there, its descendants are skipped.
+        type Seen = (i64, String, bool, Option<String>, String, Option<String>);
+        let seen: Vec<Seen> = self
+            .tx
+            .prepare_cached(
+                "SELECT l.rowid, l.id, (l.parent IS NULL OR NOT EXISTS \
+                 (SELECT 1 FROM leases p WHERE p.id = l.parent)), l.parent, l.expires_at, \
+                 l.revoked_at FROM leases l WHERE l.rowid > ?1 ORDER BY l.rowid LIMIT ?2",
+            )?
+            .query_map(
+                params![
+                    after.copied().unwrap_or(0),
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )?
+            .collect::<Result<_, _>>()?;
+        seen.into_iter()
+            .map(|(rowid, id, top, parent, expires_at, revoked_at)| {
+                let row = prune_row(parent, &expires_at, revoked_at.as_deref())?;
+                Ok((rowid, LeaseId(id), top, row))
+            })
+            .collect()
+    }
+
+    fn children(
+        &mut self,
+        parent: &LeaseId,
+        after: Option<&LeaseId>,
+        limit: usize,
+    ) -> Result<Vec<(LeaseId, LeaseRow, bool)>, AuditError> {
+        // `leases_parent_idx` holds `(parent, rowid)`, so this is one index range, and the
+        // `EXISTS` one probe of it per child.
+        type Kid = (String, String, Option<String>, bool);
+        let kids: Vec<Kid> = self
+            .tx
+            .prepare_cached(
+                "SELECT l.id, l.expires_at, l.revoked_at, \
+                 EXISTS (SELECT 1 FROM leases c WHERE c.parent = l.id) \
+                 FROM leases l INDEXED BY leases_parent_idx WHERE l.parent = ?1 \
+                 AND l.rowid > coalesce((SELECT rowid FROM leases WHERE id = ?2), 0) \
+                 ORDER BY l.rowid LIMIT ?3",
+            )?
+            .query_map(
+                params![
+                    parent.0,
+                    after.map(|a| a.0.as_str()),
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?
+            .collect::<Result<_, _>>()?;
+        kids.into_iter()
+            .map(|(id, expires_at, revoked_at, has_kids)| {
+                let row = prune_row(Some(parent.0.clone()), &expires_at, revoked_at.as_deref())?;
+                Ok((LeaseId(id), row, has_kids))
+            })
+            .collect()
+    }
+
+    fn row(&mut self, lease: &LeaseId) -> Result<Option<LeaseRow>, AuditError> {
+        get_in(self.tx, lease)
+    }
+
+    fn delete(&mut self, lease: &LeaseId) -> Result<bool, AuditError> {
+        // Everything keyed by the lease first, the lease row last.
+        for (table, column) in [
+            ("lease_subjects", "id"),
+            ("lease_bindings", "id"),
+            ("lease_sessions", "chain_id"),
+            ("hop_limits", "lease"),
+            ("run_labels", "chain_id"),
+            ("run_spans", "chain_id"),
+        ] {
+            self.tx
+                .prepare_cached(&format!("DELETE FROM {table} WHERE {column} = ?1"))?
+                .execute([&lease.0])?;
+        }
+        let n = self
+            .tx
+            .prepare_cached("DELETE FROM leases WHERE id = ?1")?
+            .execute([&lease.0])?;
+        Ok(n > 0)
+    }
 }
 
 fn revoke_in(
@@ -3230,6 +3353,13 @@ impl LeaseStore for SqliteLeaseStore {
     ) -> Result<(), AuditError> {
         let _gate = self.gate.hold();
         let conn = self.conn.lock()?;
+        {
+            let mut prune = self.lease_prune.lock()?;
+            prune.before_revival(lease)?;
+            if let Some(p) = parent {
+                prune.after_write(p);
+            }
+        }
         conn.prepare_cached(
             "INSERT INTO leases (id, parent, expires_at) VALUES (?1, ?2, ?3) \
              ON CONFLICT(id) DO UPDATE SET parent = excluded.parent, \
@@ -3258,6 +3388,7 @@ impl LeaseStore for SqliteLeaseStore {
             .durability
             .filter(|d| *d != Durability::Full)
             .map(Durability::level);
+        self.lease_prune.lock()?.after_write(lease);
         with_full_sync(&mut conn, relaxed, |conn| {
             revoke_in(conn, lease, reason, now)
         })?
@@ -3271,6 +3402,7 @@ impl LeaseStore for SqliteLeaseStore {
     ) -> Result<(), AuditError> {
         let _gate = self.gate.hold();
         let mut conn = self.conn.lock()?;
+        self.lease_prune.lock()?.before_revival(lease)?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         match get_in(&tx, lease)? {
             None => return Err(AuditError::UnknownLease(lease.0.clone())),
@@ -3437,97 +3569,29 @@ impl LeaseStore for SqliteLeaseStore {
         retention: time::Duration,
         max_rows: usize,
     ) -> Result<LeasePrune, AuditError> {
-        let max_rows = max_rows.max(1);
         let _gate = self.gate.hold();
         let mut conn = self.conn.lock()?;
-        let mut cursor = self.lease_cursor.lock()?;
-        // One write transaction from the read on: a renewal cannot revive a tree between the
+        let mut state = self.lease_prune.lock()?;
+        // One write transaction from the read on: a renewal cannot revive a run between the
         // check and the delete, and an exchange cannot register a child under a top being
-        // deleted (it would need the top live, and then the top is kept).
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        // A top is a lease with no parent, or whose parent row is gone (a store that lost
-        // rows): its tree is decided here, its descendants are skipped.
-        type Seen = (i64, String, bool, String, Option<String>);
-        let seen: Vec<Seen> = tx
-            .prepare_cached(
-                "SELECT l.rowid, l.id, (l.parent IS NULL OR NOT EXISTS \
-                 (SELECT 1 FROM leases p WHERE p.id = l.parent)), l.expires_at, l.revoked_at \
-                 FROM leases l WHERE l.rowid > ?1 ORDER BY l.rowid LIMIT ?2",
-            )?
-            .query_map(
-                params![*cursor, i64::try_from(max_rows).unwrap_or(i64::MAX)],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )?
-            .collect::<Result<_, _>>()?;
-        let mut pruned = 0u64;
-        for (_, top, is_top, expires_at, revoked_at) in &seen {
-            if !is_top {
-                continue;
-            }
-            // The top's own row first: a live top, the common case, costs no tree walk.
-            let row = LeaseRow {
-                parent: None,
-                expires_at: parse_time(expires_at)?,
-                revoked_at: revoked_at.as_deref().map(parse_time).transpose()?,
-                revoke_reason: None,
-            };
-            if !tree_prunable([&row], now, retention) {
-                continue;
-            }
-            type TreeRow = (String, String, Option<String>);
-            let tree: Vec<TreeRow> = tx
-                .prepare_cached(concat!(
-                    "SELECT id, expires_at, revoked_at FROM leases WHERE id IN (",
-                    subtree_ids!(""),
-                    ")"
-                ))?
-                .query_map([top], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                .collect::<Result<_, _>>()?;
-            let rows = tree
-                .iter()
-                .map(|(_, expires_at, revoked_at)| {
-                    Ok(LeaseRow {
-                        parent: None,
-                        expires_at: parse_time(expires_at)?,
-                        revoked_at: revoked_at.as_deref().map(parse_time).transpose()?,
-                        revoke_reason: None,
-                    })
-                })
-                .collect::<Result<Vec<_>, AuditError>>()?;
-            if !tree_prunable(&rows, now, retention) {
-                continue;
-            }
-            // Everything keyed by these leases first, the lease rows last.
-            for (table, column) in [
-                ("lease_subjects", "id"),
-                ("lease_bindings", "id"),
-                ("lease_sessions", "chain_id"),
-                ("hop_limits", "lease"),
-                ("run_labels", "chain_id"),
-                ("run_spans", "chain_id"),
-                ("leases", "id"),
-            ] {
-                let mut delete =
-                    tx.prepare_cached(&format!("DELETE FROM {table} WHERE {column} = ?1"))?;
-                for (id, _, _) in &tree {
-                    let n = delete.execute([id])? as u64;
-                    if table == "leases" {
-                        pruned += n;
-                    }
-                }
-            }
+        // deleted (it would need the top live, and then the top is kept). A run carried over
+        // to the next pass is guarded by `state` (`before_revival`, `after_write`).
+        let pass = (|| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let pass = prune_pass(
+                &mut SqlitePrune { tx: &tx },
+                &mut state,
+                now,
+                retention,
+                max_rows,
+            )?;
+            tx.commit()?;
+            Ok(pass)
+        })();
+        if pass.is_err() {
+            state.abandon_sweep();
         }
-        tx.commit()?;
-        let wrapped = seen.len() < max_rows;
-        *cursor = match seen.last() {
-            Some((rowid, ..)) if !wrapped => *rowid,
-            _ => 0,
-        };
-        Ok(LeasePrune {
-            examined: seen.len() as u64,
-            pruned,
-            wrapped,
-        })
+        pass
     }
 
     fn prune_run_state(
@@ -3672,9 +3736,14 @@ impl LeaseStore for SqliteLeaseStore {
             .durability
             .filter(|d| *d != Durability::Full)
             .map(Durability::level);
-        with_full_sync(&mut conn, relaxed, |conn| {
+        let out = with_full_sync(&mut conn, relaxed, |conn| {
             selected_in(conn, selector, Some((reason, now)))
-        })?
+        })??;
+        let mut prune = self.lease_prune.lock()?;
+        for id in &out.revoked {
+            prune.after_write(id);
+        }
+        Ok(out)
     }
 
     fn check_all(

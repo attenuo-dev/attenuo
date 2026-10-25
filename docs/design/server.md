@@ -18,7 +18,7 @@ The server is wiring. It holds no authorization logic of its own: tokens come fr
 | Pipeline | `authz::Pipeline` | `Arc`, used by the proxy's `ServerAuthorizer` and by the AuthZEN handler |
 | Proxy | `attenuo_proxy::router` | mounted at `/mcp/{server}` |
 | IdP registry | `idp::IdpRegistry` | one `JwksCache` per `[[idps]]` entry, behind a `tokio::sync::Mutex` |
-| Lease maintenance | `spawn_lease_maintenance` | one tokio task, every `[leases] maintenance_interval_seconds` (default 60) when `[leases] session_retention_seconds`, `retention_seconds` or `run_state_retention_seconds` is on: `prune_session_bindings`, then `prune_lease_registry`, then `prune_run_state` (run-limit counters, charge log and approvals of runs whose leases are gone), each in passes of `maintenance_batch_rows` rows (default 1,000) on the blocking pool, at most `maintenance_max_passes` passes each (default 100) |
+| Lease maintenance | `spawn_lease_maintenance` | one tokio task, every `[leases] maintenance_interval_seconds` (default 60) when `[leases] session_retention_seconds`, `retention_seconds` or `run_state_retention_seconds` is on: `prune_session_bindings`, then `prune_lease_registry`, then `prune_run_state` (run-limit counters, charge log and approvals of runs whose leases are gone), each in passes of `maintenance_batch_rows` rows (default 1,000) on the blocking pool, at most `maintenance_max_passes` passes each (default 100); a lease pass counts the leases it looks at, reads to decide a run and deletes, and carries a run wider than that over to the next passes (read to the end first, then deleted children before parents, the root last) |
 
 ## The decision pipeline
 
@@ -89,7 +89,7 @@ Phase 1 of [run limits](run-limits.md) (ADR-0010) lets a capability carry `limit
 
 **What callers see.** A `budget_exhausted` denial carries `data.limit: {hop, kind, arg, max, used}` in the `-32003` error, and AuthZEN answers carry it as `context.limit`; AuthZEN answers about a limited call also carry `context.budget` and, when charged, `context.charged`. The decision record carries `budget: {charged: [{hop, cap, kind, arg, used_after, max}]}`, omitted when nothing was charged, so records of unlimited calls hash as before.
 
-**Refund.** An upstream failure is not refunded: the call was allowed and may have had an effect. `POST /admin/budgets/refund {decision_id, reason}` returns what one decision charged, at most once (404 when it charged nothing, 409 `already_refunded`), and appends an `admin` record with tool `admin.budget.refund`. As with a revocation, the refund stands if that record cannot be appended.
+**Refund.** An upstream failure is not refunded: the call was allowed and may have had an effect. `POST /admin/budgets/refund {decision_id, reason}` returns what one decision charged, at most once (404 when it charged nothing or is unknown, 409 `already_refunded`, 410 `charge_pruned` when its audit record shows a charge the charge log no longer has), and appends an `admin` record with tool `admin.budget.refund`. As with a revocation, the refund stands if that record cannot be appended.
 
 **Two stores again.** The charge and the decision's audit append are in different SQLite connections, like approvals. The charge commits first and is refunded if the append fails; a crash between the two leaves a charge with no allowed decision naming it, which over-counts and so fails closed (design open question 8).
 
