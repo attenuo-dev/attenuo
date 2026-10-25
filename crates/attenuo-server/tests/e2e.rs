@@ -1899,6 +1899,18 @@ async fn a_listen_stream_cut_by_revocation_is_audited() {
         .metrics
         .render()
         .contains("attenuo_decisions_total{decision=\"deny\",reason=\"lease_revoked\"} 1\n"));
+    // The stream is counted once by cause; nothing was suppressed (one stream, one record).
+    let ended = "attenuo_proxy_streams_ended_total{cause=\"lease_revoked\"} 1\n";
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !h.state.metrics.render().contains(ended) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let text = h.state.metrics.render();
+    assert!(text.contains(ended), "{text}");
+    assert!(text.contains("attenuo_proxy_streams_ended_total{cause=\"client_disconnect\"} 0\n"));
+    assert!(text.contains(
+        "attenuo_audit_records_suppressed_total{tool=\"stream.end\",reason=\"lease_revoked\"} 0\n"
+    ));
 }
 
 #[tokio::test]

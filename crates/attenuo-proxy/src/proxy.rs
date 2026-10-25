@@ -26,7 +26,7 @@ use crate::auth::{
 };
 use crate::config::ProxyConfig;
 use crate::filter::{list_kinds_by_shape, ListFilter, ListKind};
-use crate::guard::{guard_stream, StreamGuard};
+use crate::guard::{guard_stream, StreamEndRecords, StreamGuard};
 use crate::jsonrpc::{
     self, approval_required_response, denied_response, denied_response_with, error_response, id_of,
     is_passthrough_method, is_request, method_of, CODE_INVALID_PARAMS, CODE_INVALID_REQUEST,
@@ -121,6 +121,8 @@ struct AppState {
     max_request_body: usize,
     /// Allowed calls whose answers may arrive on the `GET` listen stream (ADR-0009).
     awaited: Arc<AwaitedResults>,
+    /// The bound on `stream.end` records of `GET` listen streams, shared by all of them.
+    stream_end_records: Arc<StreamEndRecords>,
 }
 
 impl AppState {
@@ -167,6 +169,7 @@ pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
         max_upstream_body,
         max_request_body,
         awaited: Arc::new(AwaitedResults::new()),
+        stream_end_records: Arc::new(StreamEndRecords::new()),
     });
     Router::new()
         .route(
@@ -786,7 +789,8 @@ async fn handle_passthrough(
         let mut response = match req.send().await {
             Ok(resp) if is_delete => stream_response(resp, None, None, limit),
             // The listen stream lives as long as the client keeps it open: re-check it
-            // (SR-28). List answers on it (replayed on a resumed stream) are filtered, and
+            // (SR-28), count its end, and bound its `stream.end` records per chain and
+            // reason. List answers on it (replayed on a resumed stream) are filtered, and
             // responses to allowed calls labelled, like `POST` answers.
             Ok(resp) if is_event_stream(resp.headers()) => {
                 let labeller = Labeller::listen(
@@ -794,7 +798,9 @@ async fn handle_passthrough(
                     state.awaited.clone(),
                     ResultScope::new(&server, session_id.as_deref(), &chain),
                 );
-                let guard = state.stream_guard(&who, &server, session_id.as_deref());
+                let guard = state
+                    .stream_guard(&who, &server, session_id.as_deref())
+                    .listen(state.stream_end_records.clone());
                 let filter = listen_list_filter(&state, &chain, &server);
                 stream_response_sse(resp, None, guard, limit, Some(filter), Some(labeller))
             }
