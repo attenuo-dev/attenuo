@@ -10,7 +10,10 @@
 //! The framing rules are those of the WHATWG SSE specification: lines end in `\n`, `\r\n` or
 //! `\r`; an empty line ends an event; several `data:` lines of one event are joined with `\n`;
 //! one space after the colon is dropped; a final event that is not terminated by an empty line
-//! is discarded (a client would discard it too).
+//! is discarded (a client would discard it too). A UTF-8 byte order mark that opens the stream
+//! is dropped, as clients drop it, and an event that is not UTF-8 ends the stream with an
+//! error: a client that decodes leniently would read it, so the proxy must not relay what it
+//! could not read (SR-77).
 
 use std::io;
 
@@ -22,10 +25,31 @@ use serde_json::Value;
 /// `[proxy] max_upstream_body_bytes`).
 pub const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
 
+/// The UTF-8 byte order mark, which a client drops when it opens an event stream.
+const BOM: &[u8] = b"\xef\xbb\xbf";
+
+/// Drop a byte order mark that opens the stream from `buf`. Returns `false` while `buf` is
+/// still too short to tell (a strict prefix of the mark): wait for more bytes. `start` is
+/// cleared once decided.
+fn strip_leading_bom(buf: &mut Vec<u8>, start: &mut bool) -> bool {
+    if !*start {
+        return true;
+    }
+    if buf.len() < BOM.len() && BOM.starts_with(buf) {
+        return false;
+    }
+    if buf.starts_with(BOM) {
+        buf.drain(..BOM.len());
+    }
+    *start = false;
+    true
+}
+
 /// Incremental SSE event splitter and rewriter.
 pub struct SseRewriter {
     buf: Vec<u8>,
     limit: usize,
+    start: bool,
 }
 
 impl Default for SseRewriter {
@@ -44,6 +68,7 @@ impl SseRewriter {
         Self {
             buf: Vec::new(),
             limit,
+            start: true,
         }
     }
 
@@ -58,6 +83,9 @@ impl SseRewriter {
     ) -> Result<Vec<u8>, io::Error> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
+        if !strip_leading_bom(&mut self.buf, &mut self.start) {
+            return Ok(out);
+        }
         while let Some(end) = find_event_end(&self.buf) {
             let event: Vec<u8> = self.buf.drain(..end).collect();
             rewrite_event(&event, f, &mut out)?;
@@ -227,6 +255,7 @@ pub(crate) fn rewrite_event(
 pub struct SseFramer {
     buf: Vec<u8>,
     limit: usize,
+    start: bool,
 }
 
 impl Default for SseFramer {
@@ -245,18 +274,31 @@ impl SseFramer {
         Self {
             buf: Vec::new(),
             limit,
+            start: true,
         }
     }
 
-    /// Feed a chunk; returns the bytes of every event it completes, unchanged.
+    /// Feed a chunk; returns the bytes of every event it completes, unchanged, but for a byte
+    /// order mark that opens the stream, which is dropped. An event that is not UTF-8 is an
+    /// error (SR-77): what the proxy relays, it must have been able to read.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<u8>, io::Error> {
         self.buf.extend_from_slice(chunk);
+        if !strip_leading_bom(&mut self.buf, &mut self.start) {
+            return Ok(Vec::new());
+        }
         let mut end = 0;
         while let Some(n) = find_event_end(&self.buf[end..]) {
             end += n;
         }
         if self.buf.len() - end > self.limit {
             return Err(io::Error::other("SSE event larger than the proxy's limit"));
+        }
+        // Whole events end in a line break, so no character is split at `end`.
+        if std::str::from_utf8(&self.buf[..end]).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SSE event is not UTF-8",
+            ));
         }
         Ok(self.buf.drain(..end).collect())
     }
@@ -311,9 +353,10 @@ where
     process_stream(upstream, move |chunk| rewriter.push(chunk, &mut f))
 }
 
-/// Wrap an upstream byte stream so that it yields whole events only, unchanged. A trailing
-/// event without its empty line is dropped (a client would discard it too); a transport error
-/// or an event over `limit` bytes ends the stream with an error.
+/// Wrap an upstream byte stream so that it yields whole events only, unchanged but for a
+/// leading byte order mark, which is dropped. A trailing event without its empty line is
+/// dropped (a client would discard it too); a transport error, an event over `limit` bytes or
+/// a non-UTF-8 event ends the stream with an error.
 pub fn frame_stream<S, E>(
     upstream: S,
     limit: usize,
@@ -419,6 +462,42 @@ mod tests {
     fn non_utf8_event_is_an_error() {
         let mut r = SseRewriter::new();
         assert!(r.push(b"data: \xff\xfe\n\n", &mut |_| {}).is_err());
+    }
+
+    #[test]
+    fn a_leading_bom_is_dropped_and_a_non_utf8_event_is_refused_sr77() {
+        let whole = b"\xef\xbb\xbfdata: {\"a\":1}\n\n";
+        for cut in 0..whole.len() {
+            let (a, b) = whole.split_at(cut);
+            let mut f = SseFramer::new();
+            let mut out = f.push(a).unwrap();
+            out.extend(f.push(b).unwrap());
+            assert_eq!(out, b"data: {\"a\":1}\n\n", "framer, cut at {cut}");
+            let mut r = SseRewriter::new();
+            let mut seen = 0;
+            let mut out = r.push(a, &mut |_: &mut Value| seen += 1).unwrap();
+            out.extend(r.push(b, &mut |_: &mut Value| seen += 1).unwrap());
+            assert_eq!(seen, 1, "rewriter, cut at {cut}");
+            assert_eq!(out, b"data: {\"a\":1}\n\n", "rewriter, cut at {cut}");
+        }
+        // Only the stream's first bytes: a later mark is an ordinary (unknown) field name.
+        let mut f = SseFramer::new();
+        assert_eq!(f.push(b"data: 1\n\n").unwrap(), b"data: 1\n\n");
+        let later = b"\xef\xbb\xbfdata: 2\n\n";
+        assert_eq!(f.push(later).unwrap(), later);
+        // Not UTF-8, in a comment or in the data: the stream ends with an error.
+        for event in [&b": \xff\ndata: {}\n\n"[..], &b"data: \"\xc3\"\n\n"[..]] {
+            let mut f = SseFramer::new();
+            assert!(f.push(b"data: ok\n\n").is_ok());
+            assert!(f.push(event).is_err(), "{event:?}");
+        }
+        // A character split across chunks is fine once its event is whole.
+        let mut f = SseFramer::new();
+        assert!(f.push(b"data: \"\xc3").unwrap().is_empty());
+        assert_eq!(
+            f.push(b"\xa9\"\n\n").unwrap(),
+            "data: \"\u{e9}\"\n\n".as_bytes()
+        );
     }
 
     #[test]
