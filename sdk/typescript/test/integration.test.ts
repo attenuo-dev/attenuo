@@ -42,6 +42,7 @@ import {
   VerificationError,
   ExportError,
   verifyExport,
+  withLimits,
 } from "../src/index.js";
 
 // [[agents]] secrets in the demo config: an exchange authenticates as its actor.
@@ -730,5 +731,84 @@ describe.skipIf(!enabled)("filtered export and revocation by selector", () => {
     expect(again).toMatchObject({ matched: [], revoked: [], revokedCount: 0 });
     const unknown = await admin.revokeBySelector({ chainId: "no-such-chain" }, { preview: true });
     expect(unknown).toMatchObject({ matched: [], revoked: [] });
+  });
+  it("dry-runs with a stated budget, session, approval and usage", async () => {
+    const admin = new AdminClient(url, ADMIN_TOKEN);
+    const ob = new AttenuoClient(url);
+    const root = await admin.mintRootDev("alice", "https://idp.example", "assistant", {
+      capabilities: ["github:*"],
+    });
+    const coder = await ob.exchange(
+      root,
+      "coder",
+      [withLimits(capability("github", "read_file"), { calls: 2 })],
+      { clientSecret: CODER_SECRET },
+    );
+    const read = { repo: "alice/public-docs", path: "README.md" };
+    const head = await admin.auditHead();
+
+    // From the store: a fresh run, nothing used, no labels.
+    const live = await admin.policyEvaluate("github", "read_file", read, { token: coder });
+    expect([live.decision, live.reason]).toEqual(["allow", "policy_allow"]);
+    expect(live.budget).toMatchObject({ source: "store", limited: true });
+    expect(live.labels).toMatchObject({ source: "store", tainted: false });
+
+    // Stated: one call left on the `calls: 2` limit, and a tainted run.
+    const session = { taintedBy: ["web/fetch"], untrustedArgs: ["path"] };
+    const ok = await admin.policyEvaluate("github", "read_file", read, {
+      token: coder,
+      budget: { callsRemaining: 1 },
+      session,
+      usage: { calls: 3, amount: 7, destinationSeen: true },
+    });
+    expect([ok.decision, ok.reason, ok.limit]).toEqual(["allow", "policy_allow", undefined]);
+    expect(ok.budget).toMatchObject({ source: "request", limited: true, callsRemaining: 1 });
+    expect(ok.labels).toEqual({
+      tainted: true,
+      taintedBy: ["web/fetch"],
+      argsContainUntrusted: true,
+      untrustedArgs: ["path"],
+      source: "request",
+    });
+    expect(ok.usage).toEqual({ calls: 3, amount: 7, destinationSeen: true, source: "request" });
+
+    // The stated figures run out: refused as the live call would be, with the limit it hit.
+    const spent = await admin.policyEvaluate("github", "read_file", read, {
+      token: coder,
+      budget: { callsRemaining: 0 },
+      session,
+    });
+    expect([spent.decision, spent.reason]).toEqual(["deny", "budget_exhausted"]);
+    expect(spent.budget!.source).toBe("request");
+    expect(spent.labels!.source).toBe("request");
+    expect(spent.limit).toEqual({ hop: 1, kind: "calls", used: 2, max: 2 });
+    expect(spent.usage).toEqual({ calls: 0, amount: 0, destinationSeen: false, source: "request" });
+
+    // A stated approval: create_issue asks without one and passes with one.
+    const issue = { repo: "alice/public-docs", title: "typo" };
+    const asked = await admin.policyEvaluate("github", "create_issue", issue, { token: root });
+    expect([asked.reason, asked.approvalBy]).toEqual(["approval_required", undefined]);
+    const granted = await admin.policyEvaluate("github", "create_issue", issue, {
+      token: root,
+      approval: { by: "operator" },
+    });
+    expect([granted.decision, granted.approvalBy]).toEqual(["allow", "operator"]);
+
+    // The server checks the blocks: its 400 comes back as ApiError.
+    const bad = await admin
+      .policyEvaluate("github", "read_file", read, { token: coder, usage: { calls: -1 } })
+      .catch((e: unknown) => e);
+    expect(bad).toBeInstanceOf(ApiError);
+    expect(bad).toMatchObject({ status: 400, error: "invalid_request" });
+
+    // Nothing was audited or charged: the live run still has both calls.
+    expect(await admin.auditHead()).toBe(head);
+    for (let i = 0; i < 2; i++) {
+      expect((await ob.callTool(coder, "github", "read_file", read)).decisionId).toBeTruthy();
+    }
+    await expect(ob.callTool(coder, "github", "read_file", read)).rejects.toMatchObject({
+      reason: "budget_exhausted",
+    });
+    await admin.revokeLease(root.lease);
   });
 });

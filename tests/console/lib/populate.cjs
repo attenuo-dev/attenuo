@@ -135,6 +135,8 @@ function populate(e) {
     carolRootLease: carolRoot.lease,
     carolChildLease: carolChild.lease,
     bobLeases: [bobRoot.lease, bobChild.lease, bobSecond.lease],
+    // A root whose run never called a tool, so the store holds no taint for it.
+    bobSecondToken: bobSecond.access_token,
     // The id the fake upstream assigns (crates/attenuo-proxy/src/testing.rs).
     session: FAKE_SESSION,
   };

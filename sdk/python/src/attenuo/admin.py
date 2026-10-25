@@ -330,6 +330,76 @@ class StatedBudget:
 
 
 @dataclass(frozen=True)
+class StatedSession:
+    """The run's output labels a dry run decides the call with, instead of the store's (the
+    ``session`` block of ``POST /admin/policies/evaluate``, ADR-0009). Members left ``None``
+    or empty are not sent.
+
+    ``tainted_by``: the ``<server>/<tool>`` sources the run has read untrusted output from.
+    ``tainted``: ``context.session.tainted`` (server default: whether ``tainted_by`` is
+    non-empty; ``True`` alone taints the run with no named source). ``untrusted_args``: the
+    call's arguments that carry a span of untrusted output. ``args_contain_untrusted``:
+    ``context.args_contain_untrusted`` (server default: whether ``untrusted_args`` is
+    non-empty). The answer's ``labels.source`` is then ``request``. The server answers 400
+    ``invalid_request`` for a malformed block."""
+
+    tainted_by: Sequence[str] = ()
+    tainted: bool | None = None
+    untrusted_args: Sequence[str] = ()
+    args_contain_untrusted: bool | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        if self.tainted_by:
+            out["tainted_by"] = list(self.tainted_by)
+        if self.tainted is not None:
+            out["tainted"] = self.tainted
+        if self.untrusted_args:
+            out["untrusted_args"] = list(self.untrusted_args)
+        if self.args_contain_untrusted is not None:
+            out["args_contain_untrusted"] = self.args_contain_untrusted
+        return out
+
+
+ApprovalBy = Literal["user", "operator", "policy"]
+
+
+@dataclass(frozen=True)
+class StatedApproval:
+    """Evaluate the call as a retry that carries a granted approval (the ``approval`` block of
+    ``POST /admin/policies/evaluate``): ``context.approval.present`` is true and
+    ``context.approval.by`` is ``by``. The dry run never looks up or consumes a stored
+    approval, so no approval id or token is taken. The answer's ``approval_by`` is then
+    ``by``."""
+
+    by: ApprovalBy
+
+    def to_json(self) -> dict[str, Any]:
+        return {"by": self.by}
+
+
+@dataclass(frozen=True)
+class StatedUsage:
+    """The run usage a dry run decides the call with (``context.usage``, the ``usage`` block
+    of ``POST /admin/policies/evaluate``), instead of the store's. Members left ``None`` are
+    not sent; the server takes them as 0 or ``False``. The answer's ``usage.source`` is then
+    ``request``. The server answers 400 ``invalid_request`` for a negative or non-integer
+    figure."""
+
+    calls: int | None = None
+    amount: int | None = None
+    destination_seen: bool | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for name in ("calls", "amount", "destination_seen"):
+            value = getattr(self, name)
+            if value is not None:
+                out[name] = value
+        return out
+
+
+@dataclass(frozen=True)
 class EvaluationBudget:
     """``context.budget`` of a dry run: what the run limits matching the call have left.
 
@@ -646,6 +716,9 @@ def _evaluate_body(
     token: Token | str | None,
     chain: dict[str, Any] | None,
     budget: StatedBudget | dict[str, Any] | None = None,
+    session: StatedSession | dict[str, Any] | None = None,
+    approval: StatedApproval | dict[str, Any] | None = None,
+    usage: StatedUsage | dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if token is None and chain is None:
         raise ValueError("policy_evaluate needs a token or a chain")
@@ -656,6 +729,14 @@ def _evaluate_body(
         body["subject"]["properties"] = {"chain": chain}
     if budget is not None:
         body["budget"] = budget.to_json() if isinstance(budget, StatedBudget) else dict(budget)
+    if session is not None:
+        body["session"] = session.to_json() if isinstance(session, StatedSession) else dict(session)
+    if approval is not None:
+        body["approval"] = (
+            approval.to_json() if isinstance(approval, StatedApproval) else dict(approval)
+        )
+    if usage is not None:
+        body["usage"] = usage.to_json() if isinstance(usage, StatedUsage) else dict(usage)
     return body
 
 
@@ -994,6 +1075,9 @@ class AdminClient:
         token: Token | str | None = None,
         chain: dict[str, Any] | None = None,
         budget: StatedBudget | dict[str, Any] | None = None,
+        session: StatedSession | dict[str, Any] | None = None,
+        approval: StatedApproval | dict[str, Any] | None = None,
+        usage: StatedUsage | dict[str, Any] | None = None,
     ) -> PolicyEvaluation:
         """Dry run: what the loaded policies decide for this call. No lease check, no charge,
         no audit record. Pass a delegation ``token`` (verified by the server; an expired one is
@@ -1003,8 +1087,17 @@ class AdminClient:
         ``budget`` states the run-limit counters to decide in (a :class:`StatedBudget`, or the
         raw block as a dict) instead of the store's; the answer's ``budget.source`` is then
         ``request``. A spent hard limit answers ``budget_exhausted`` with ``limit`` set, as the
-        live call would."""
-        body = _evaluate_body(server, tool, arguments, token, chain, budget)
+        live call would.
+
+        ``session`` states the run's output labels (a :class:`StatedSession`; answer
+        ``labels.source == "request"``), ``approval`` evaluates the call as if it carried a
+        granted approval (a :class:`StatedApproval`; answer ``approval_by``), and ``usage``
+        states ``context.usage`` (a :class:`StatedUsage`; answer ``usage.source ==
+        "request"``). Each also takes the raw block as a dict. Nothing is checked here: a
+        malformed block is the server's 400, raised as :class:`ApiError`."""
+        body = _evaluate_body(
+            server, tool, arguments, token, chain, budget, session, approval, usage
+        )
         return _policy_evaluation(
             w.json_body(self._http.post("/admin/policies/evaluate", json=body))
         )
@@ -1266,8 +1359,13 @@ class AsyncAdminClient:
         token: Token | str | None = None,
         chain: dict[str, Any] | None = None,
         budget: StatedBudget | dict[str, Any] | None = None,
+        session: StatedSession | dict[str, Any] | None = None,
+        approval: StatedApproval | dict[str, Any] | None = None,
+        usage: StatedUsage | dict[str, Any] | None = None,
     ) -> PolicyEvaluation:
-        body = _evaluate_body(server, tool, arguments, token, chain, budget)
+        body = _evaluate_body(
+            server, tool, arguments, token, chain, budget, session, approval, usage
+        )
         return _policy_evaluation(
             w.json_body(await self._http.post("/admin/policies/evaluate", json=body))
         )

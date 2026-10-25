@@ -74,12 +74,31 @@ UI_PORT="${PORTS[2]}"
 RO_MAIN_PORT="${PORTS[3]}"
 RO_UI_PORT="${PORTS[4]}"
 
-# The demo config with its ports and policy path rewritten (as run.sh does), plus the console
-# and root grants for two more users.
+# The demo policy plus a destructive tool the policy allows outright and asks about once the
+# run is tainted, which the policy page's dry run with stated run labels uses.
+cp "$DEMO/policy.cedar" "$WORK/policy.cedar"
+cat >> "$WORK/policy.cedar" <<'EOF'
+
+// Console smoke test only (scripts/console-smoke.sh).
+@id("smoke_permit_add_label")
+permit(principal, action == Action::"github/add_label", resource);
+
+@id("smoke_ask_add_label_on_tainted_run")
+@obligation("approval")
+forbid(principal, action == Action::"github/add_label", resource)
+when { context.session.tainted && !context.approval.present };
+EOF
+
+# The demo config with its ports rewritten (as run.sh does) and that policy, plus the console,
+# the catalog entry of the extra tool and root grants for two more users.
 sed -e "s/18080/$MAIN_PORT/g" -e "s/13001/$MCP_PORT/g" \
-    -e "s#examples/github-leak-demo/policy.cedar#$DEMO/policy.cedar#" \
+    -e "s#examples/github-leak-demo/policy.cedar#$WORK/policy.cedar#" \
     "$DEMO/config.toml" > "$WORK/config.toml"
 cat >> "$WORK/config.toml" <<EOF
+
+# Destructive (not readonly): asked about on a tainted run by the smoke policy above.
+[policy.catalog.github.add_label]
+inputs = { repo = "string", label = "string" }
 
 [admin_ui]
 enabled = true
