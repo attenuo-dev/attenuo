@@ -138,6 +138,25 @@ pub trait LeaseStore: Send + Sync {
         max_rows: usize,
     ) -> Result<SessionPrune, AuditError>;
 
+    /// One pass of lease retention: look at up to `max_rows` leases, in the order they were
+    /// registered and continuing after the last lease the previous pass looked at, and delete
+    /// every lease tree whose top is among them and that is [`tree_prunable`] at `now` with
+    /// `retention` as the grace period. A tree is the top lease (one with no parent, or whose
+    /// parent the store does not know) and everything delegated from it; it is deleted whole,
+    /// with the subjects, chain bindings, session bindings, hop limits, run labels and span
+    /// indexes of its leases, so no lease is ever left whose parent row is gone. Leases that
+    /// are not tops are skipped (their tree is decided at its top), but count as examined.
+    /// When a pass reaches the last lease it reports `wrapped`, and the next pass starts from
+    /// the first again. One write transaction per pass, so a renewal cannot revive a tree
+    /// between the check and the delete. A pruned lease reads as unknown, which every check
+    /// treats as inactive (`lease_unknown`); selectors no longer match it.
+    fn prune_leases(
+        &self,
+        now: OffsetDateTime,
+        retention: time::Duration,
+        max_rows: usize,
+    ) -> Result<LeasePrune, AuditError>;
+
     /// What [`revoke_selected`](Self::revoke_selected) would do now, without writing:
     /// `matched` is every unrevoked lease the selector names, `revoked` every unrevoked lease
     /// a revocation would change (the matches and their descendants). Read in one
@@ -403,6 +422,50 @@ pub fn session_prunable(
     }
 }
 
+/// What one [`LeaseStore::prune_leases`] pass did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LeasePrune {
+    /// Leases the pass looked at (at most its `max_rows`), tops or not.
+    pub examined: u64,
+    /// Leases it deleted: every lease of each pruned tree, including descendants registered
+    /// after the pass's window.
+    pub pruned: u64,
+    /// The pass reached the last lease; the next one starts from the first.
+    pub wrapped: bool,
+}
+
+/// When a lease stopped being usable: when it was revoked, or when it expired if it never was.
+/// An expired lease that is revoked later was renewable until the revocation, so the
+/// revocation is its end.
+pub fn lease_end(row: &LeaseRow) -> OffsetDateTime {
+    row.revoked_at.unwrap_or(row.expires_at)
+}
+
+/// Whether a whole lease tree (a chain's root and everything delegated from it) may be
+/// deleted, given the rows of all its leases: every lease ended (see [`lease_end`]) longer
+/// than `retention` ago. So every lease is revoked or expired, and none can come back: a
+/// revoked lease is never renewed, and an expired one can be renewed only while its token is
+/// valid, which the grace period must outlast (retention above the longest token lifetime the
+/// issuer grants). One lease still live, or ended within the grace period, keeps the whole
+/// tree, so a child is never left without its parent row. Revoked leases wait out the grace
+/// period too: deleting them would change nothing a caller can do, but it keeps them in the
+/// console tree and in `lease_revoked` refusals (not `lease_unknown`) for that long. An empty
+/// tree is not prunable.
+pub fn tree_prunable<'a>(
+    rows: impl IntoIterator<Item = &'a LeaseRow>,
+    now: OffsetDateTime,
+    retention: time::Duration,
+) -> bool {
+    let mut any = false;
+    for row in rows {
+        any = true;
+        if lease_end(row).saturating_add(retention) >= now {
+            return false;
+        }
+    }
+    any
+}
+
 /// The result of [`LeaseStore::revoke_selected`] or [`LeaseStore::preview_selected`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SelectorRevocation {
@@ -645,6 +708,8 @@ pub struct MemoryLeaseStore {
     /// The last session binding a `prune_sessions` pass looked at; `None` to start from the
     /// first.
     session_cursor: Mutex<Option<(String, String)>>,
+    /// The last lease a `prune_leases` pass looked at; `None` to start from the first.
+    lease_cursor: Mutex<Option<LeaseId>>,
     /// Per run, the first label of each source.
     labels: Mutex<BTreeMap<LeaseId, BTreeMap<String, RunLabel>>>,
     /// Per run, the span index (ADR-0009 phase 2).
@@ -1015,6 +1080,86 @@ impl LeaseStore for MemoryLeaseStore {
         Ok(SessionPrune {
             examined: seen.len() as u64,
             pruned,
+            wrapped,
+        })
+    }
+
+    fn prune_leases(
+        &self,
+        now: OffsetDateTime,
+        retention: time::Duration,
+        max_rows: usize,
+    ) -> Result<LeasePrune, AuditError> {
+        use std::ops::Bound;
+        let max_rows = max_rows.max(1);
+        // The rows lock is held for the whole pass (the memory store's transaction); every
+        // other lock is taken under it, one at a time, as everywhere else in this store.
+        let mut rows = self.rows.lock()?;
+        let mut cursor = self.lease_cursor.lock()?;
+        let start = match cursor.take() {
+            Some(id) => Bound::Excluded(id),
+            None => Bound::Unbounded,
+        };
+        let window: Vec<LeaseId> = rows
+            .range((start, Bound::Unbounded))
+            .take(max_rows)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let wrapped = window.len() < max_rows;
+        if !wrapped {
+            *cursor = window.last().cloned();
+        }
+        // Tops whose own row ended past the grace period; a live top keeps its tree.
+        let is_top = |r: &LeaseRow| r.parent.as_ref().is_none_or(|p| !rows.contains_key(p));
+        let tops: Vec<LeaseId> = window
+            .iter()
+            .filter(|id| {
+                rows.get(*id)
+                    .is_some_and(|r| is_top(r) && tree_prunable([r], now, retention))
+            })
+            .cloned()
+            .collect();
+        let mut children: BTreeMap<&LeaseId, Vec<&LeaseId>> = BTreeMap::new();
+        for (id, row) in rows.iter() {
+            if let Some(p) = &row.parent {
+                children.entry(p).or_default().push(id);
+            }
+        }
+        let mut gone: BTreeSet<LeaseId> = BTreeSet::new();
+        for top in &tops {
+            let mut tree = Vec::new();
+            let mut seen = BTreeSet::new();
+            let mut queue = VecDeque::from([top]);
+            while let Some(id) = queue.pop_front() {
+                if !seen.insert(id) {
+                    continue;
+                }
+                tree.push(id);
+                if let Some(kids) = children.get(id) {
+                    queue.extend(kids.iter().copied());
+                }
+            }
+            if tree_prunable(tree.iter().filter_map(|id| rows.get(*id)), now, retention) {
+                gone.extend(tree.into_iter().cloned());
+            }
+        }
+        drop(children);
+        for id in &gone {
+            rows.remove(id);
+        }
+        if !gone.is_empty() {
+            self.bindings.lock()?.retain(|id, _| !gone.contains(id));
+            self.subjects.lock()?.retain(|id, _| !gone.contains(id));
+            self.sessions
+                .lock()?
+                .retain(|_, (chain, _)| !gone.contains(chain));
+            self.labels.lock()?.retain(|id, _| !gone.contains(id));
+            self.spans.lock()?.runs.retain(|id, _| !gone.contains(id));
+            self.hop_limits.lock()?.retain(|id, _| !gone.contains(id));
+        }
+        Ok(LeasePrune {
+            examined: window.len() as u64,
+            pruned: gone.len() as u64,
             wrapped,
         })
     }

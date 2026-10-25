@@ -185,6 +185,12 @@ ttl_seconds = 120
 # allow_unset_client_id = false
 
 [leases]
+# Seconds a chain's leases (with their recorded users and bindings) are kept once every lease
+# in the chain is revoked or expired. Keep it above the longest token lifetime you issue: an
+# expired lease can be renewed while its token is valid. A pruned chain is no longer found by
+# revoke-by-user or shown in the console; the audit log keeps every decision. 0 keeps every
+# lease.
+retention_seconds = 604800
 # Seconds a session binding (revoke by session) is kept after its chain's root lease expired;
 # a revoked chain's bindings go at the next pass (every minute). Keep it above the longest
 # token lifetime you issue: an expired lease can be renewed while its token is valid. 0 keeps

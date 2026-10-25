@@ -189,67 +189,115 @@ pub fn spawn_checkpointer(
     })
 }
 
-/// How often the session pruner runs ([`spawn_session_pruner`]).
-pub const SESSION_PRUNE_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often the lease maintenance ticker runs ([`spawn_lease_maintenance`]).
+pub const LEASE_MAINTENANCE_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Session bindings one pruning pass looks at (and so deletes at most): one short write
-/// transaction each.
-pub const SESSION_PRUNE_BATCH: usize = 1_000;
+/// Rows one pruning pass looks at (session bindings, or leases): one short write transaction
+/// each. A lease pass also reads and deletes the whole tree of every top lease among them.
+pub const LEASE_PRUNE_BATCH: usize = 1_000;
 
-/// Most passes in one run of the pruner, so one run looks at no more than
-/// `SESSION_PRUNE_BATCH * SESSION_PRUNE_MAX_PASSES` bindings (100,000) before it waits for the
-/// next period.
-pub const SESSION_PRUNE_MAX_PASSES: usize = 100;
+/// Most passes of each kind in one run of the ticker, so one run looks at no more than
+/// `LEASE_PRUNE_BATCH * LEASE_PRUNE_MAX_PASSES` rows (100,000) of each table before it waits
+/// for the next period.
+pub const LEASE_PRUNE_MAX_PASSES: usize = 100;
 
-/// One run of session retention (`[leases] session_retention_seconds`): pruning passes of
-/// [`SESSION_PRUNE_BATCH`] bindings, each its own write transaction on the blocking pool,
-/// until a pass reaches the end of the table or [`SESSION_PRUNE_MAX_PASSES`] have run. The
-/// next run continues where this one stopped. Counts every deleted binding in
-/// `lease_sessions_pruned_total` and returns how many it deleted; 0 when retention is off.
-pub async fn prune_session_bindings(state: &Arc<AppState>) -> u64 {
-    let Some(retention) = state.session_retention else {
-        return 0;
-    };
+/// Run pruning passes on the blocking pool until one reaches the end of its table or
+/// [`LEASE_PRUNE_MAX_PASSES`] have run. `pass` returns what it deleted and whether it
+/// wrapped; `count` adds the deleted rows to their metric. Returns the total deleted.
+async fn prune_in_passes<F>(
+    state: &Arc<AppState>,
+    what: &'static str,
+    pass: F,
+    count: fn(&metrics::Metrics, u64),
+) -> u64
+where
+    F: Fn(&AppState, time::OffsetDateTime) -> Result<(u64, bool), attenuo_audit::AuditError>
+        + Copy
+        + Send
+        + 'static,
+{
     let mut total = 0;
-    for _ in 0..SESSION_PRUNE_MAX_PASSES {
+    for _ in 0..LEASE_PRUNE_MAX_PASSES {
         let now = time::OffsetDateTime::now_utc();
-        let pass = state
-            .blocking(move |s| {
-                use attenuo_audit::LeaseStore;
-                s.leases.prune_sessions(now, retention, SESSION_PRUNE_BATCH)
-            })
-            .await;
-        match pass {
-            Ok(pass) => {
-                state.metrics.lease_sessions_pruned(pass.pruned);
-                total += pass.pruned;
-                if pass.wrapped {
+        match state.blocking(move |s| pass(s, now)).await {
+            Ok((pruned, wrapped)) => {
+                count(&state.metrics, pruned);
+                total += pruned;
+                if wrapped {
                     break;
                 }
             }
             Err(e) => {
-                tracing::error!(error = %e, "pruning session bindings failed");
+                tracing::error!(error = %e, "pruning {what} failed");
                 break;
             }
         }
         tokio::task::yield_now().await;
     }
     if total > 0 {
-        tracing::info!(pruned = total, "pruned session bindings of ended chains");
+        tracing::info!(pruned = total, "pruned {what} of ended chains");
     }
     total
 }
 
-/// Start the session pruner: [`prune_session_bindings`] every [`SESSION_PRUNE_PERIOD`].
-/// Dropping the handle does not stop it; abort it to stop.
-pub fn spawn_session_pruner(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
+/// One run of session retention (`[leases] session_retention_seconds`): pruning passes of
+/// [`LEASE_PRUNE_BATCH`] bindings, each its own write transaction on the blocking pool,
+/// until a pass reaches the end of the table or [`LEASE_PRUNE_MAX_PASSES`] have run. The
+/// next run continues where this one stopped. Counts every deleted binding in
+/// `lease_sessions_pruned_total` and returns how many it deleted; 0 when retention is off.
+pub async fn prune_session_bindings(state: &Arc<AppState>) -> u64 {
+    let Some(retention) = state.session_retention else {
+        return 0;
+    };
+    prune_in_passes(
+        state,
+        "session bindings",
+        move |s, now| {
+            use attenuo_audit::LeaseStore;
+            let p = s.leases.prune_sessions(now, retention, LEASE_PRUNE_BATCH)?;
+            Ok((p.pruned, p.wrapped))
+        },
+        metrics::Metrics::lease_sessions_pruned,
+    )
+    .await
+}
+
+/// One run of lease retention (`[leases] retention_seconds`): passes of
+/// [`LeaseStore::prune_leases`](attenuo_audit::LeaseStore::prune_leases) over
+/// [`LEASE_PRUNE_BATCH`] leases each, bounded like [`prune_session_bindings`]. A lease tree
+/// goes whole once every lease in it ended (revoked or expired) longer ago than the
+/// retention, with its subjects and bindings. Counts every deleted lease in
+/// `leases_pruned_total` and returns how many it deleted; 0 when retention is off.
+pub async fn prune_lease_registry(state: &Arc<AppState>) -> u64 {
+    let Some(retention) = state.lease_retention else {
+        return 0;
+    };
+    prune_in_passes(
+        state,
+        "leases",
+        move |s, now| {
+            use attenuo_audit::LeaseStore;
+            let p = s.leases.prune_leases(now, retention, LEASE_PRUNE_BATCH)?;
+            Ok((p.pruned, p.wrapped))
+        },
+        metrics::Metrics::leases_pruned,
+    )
+    .await
+}
+
+/// Start the lease maintenance ticker: every [`LEASE_MAINTENANCE_PERIOD`],
+/// [`prune_session_bindings`] then [`prune_lease_registry`] (each does nothing when its
+/// retention is 0). Sessions go first, so a binding whose chain is about to be pruned is
+/// counted as a session. Dropping the handle does not stop it; abort it to stop.
+pub fn spawn_lease_maintenance(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(SESSION_PRUNE_PERIOD);
+        let mut tick = tokio::time::interval(LEASE_MAINTENANCE_PERIOD);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await; // the first tick is immediate
         loop {
             tick.tick().await;
             prune_session_bindings(&state).await;
+            prune_lease_registry(&state).await;
         }
     })
 }
@@ -267,10 +315,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     tracing::info!(addr = %listener.local_addr()?, upstreams = config.upstreams.len(), "attenuo server listening");
     let checkpoint_task = (!state.checkpoint_interval.is_zero())
         .then(|| spawn_checkpointer(state.clone(), state.checkpoint_interval));
-    let prune_task = state
-        .session_retention
-        .is_some()
-        .then(|| spawn_session_pruner(state.clone()));
+    let prune_task = (state.session_retention.is_some() || state.lease_retention.is_some())
+        .then(|| spawn_lease_maintenance(state.clone()));
     let metrics_task = if config.metrics.enabled {
         let l = tokio::net::TcpListener::bind(config.metrics.listen).await?;
         tracing::info!(addr = %l.local_addr()?, "metrics listening (unauthenticated)");

@@ -406,3 +406,136 @@ async fn bindings_of_revoked_chains_are_pruned() {
     assert_eq!(v["selector"]["chain_ids"], json!([]));
     assert_eq!(h.ping(&bob.token, &bob_sid).await.0, StatusCode::OK);
 }
+
+/// Lease retention on the server: once every lease of alice's chain (root > coder) has been
+/// revoked for longer than `[leases] retention_seconds` (default a week, simulated by moving
+/// the revocation back), a run of the lease pruner deletes both leases with their subjects
+/// and session binding, counts them in `leases_pruned_total`, and leaves bob's live chain
+/// alone. The coder's token is then refused as `lease_unknown`, on the session and on a tool
+/// call, and the tool call is audited as a `deny` like any unknown lease; revoke-by-user no
+/// longer finds alice's chain and the console tree has no such lease.
+#[tokio::test]
+async fn lease_trees_of_ended_chains_are_pruned() {
+    let h = Harness::start().await;
+    assert_eq!(
+        h.state.lease_retention,
+        Some(time::Duration::weeks(1)),
+        "the default"
+    );
+    let root = h.mint_root("alice").await;
+    let coder = h.exchange(&root, "coder").await;
+    let bob = h.mint_root("bob").await;
+    let sid = h.open(&coder.token).await;
+    let bob_sid = h.open(&bob.token).await;
+    assert_eq!(attenuo_server::prune_lease_registry(&h.state).await, 0);
+
+    h.revoke("", json!({"chain_id": root.lease, "reason": "done"}))
+        .await;
+    // Revoked, but within the retention: kept, and refused as revoked.
+    assert_eq!(attenuo_server::prune_lease_registry(&h.state).await, 0);
+    assert_eq!(
+        h.read_file(&coder.token, &sid).await["error"]["data"]["reason"],
+        "lease_revoked"
+    );
+
+    // Eight days later, as far as the store can tell.
+    let past = time::OffsetDateTime::now_utc() - time::Duration::days(8);
+    let past = past
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    h.state
+        .leases
+        .with_connection(|c| {
+            c.execute(
+                "UPDATE leases SET revoked_at = ?1 WHERE revoked_at IS NOT NULL",
+                [&past],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(attenuo_server::prune_lease_registry(&h.state).await, 2);
+    let metrics = h.state.metrics.render();
+    assert!(
+        metrics.contains("attenuo_leases_pruned_total 2\n"),
+        "{metrics}"
+    );
+    for lease in [&root.lease, &coder.lease] {
+        let l = LeaseId::new(lease);
+        assert_eq!(h.state.leases.get(&l).unwrap(), None);
+        assert_eq!(h.state.leases.subject(&l).unwrap(), None);
+        assert_eq!(h.state.leases.binding(&l).unwrap(), None);
+    }
+    assert!(h
+        .state
+        .leases
+        .sessions(&session_digest(&sid))
+        .unwrap()
+        .is_empty());
+    assert!(h.active(&bob.lease));
+    assert_eq!(h.ping(&bob.token, &bob_sid).await.0, StatusCode::OK);
+
+    // The coder's token (still valid as a JWT) now names leases the store does not know.
+    let (status, body) = h.ping(&coder.token, &sid).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"]["data"]["reason"], "lease_unknown");
+    let denied = h.read_file(&coder.token, &sid).await;
+    assert_eq!(denied["error"]["code"], json!(CODE_DENIED), "{denied}");
+    assert_eq!(denied["error"]["data"]["reason"], "lease_unknown");
+    let entry = h
+        .state
+        .audit
+        .entry_by_record_id(denied["error"]["data"]["decision_id"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.record.decision, attenuo_core::Decision::Deny);
+    assert_eq!(entry.record.reason, "lease_unknown");
+    assert_eq!(entry.record.tool, "read_file");
+    assert_eq!(entry.record.originating_subject, "alice");
+    // A renewal is refused and audited the same way.
+    let resp = h
+        .client
+        .post(h.server.url("/token/renew"))
+        .bearer_auth(&coder.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let v: Value = resp.json().await.unwrap();
+    let entry = h
+        .state
+        .audit
+        .entry_by_record_id(v["decision_id"].as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.record.reason, "lease_unknown", "{v}");
+    assert_eq!(entry.record.tool, "lease.renew");
+
+    // Revoke-by-user and by chain no longer find it; bob's is still there.
+    let v = h
+        .revoke("?preview=true", json!({"user": "alice", "reason": "x"}))
+        .await;
+    assert_eq!(v["matched_count"], 0, "{v}");
+    let v = h
+        .revoke(
+            "?preview=true",
+            json!({"chain_id": root.lease, "reason": "x"}),
+        )
+        .await;
+    assert_eq!(v["matched_count"], 0, "{v}");
+    let v = h
+        .revoke("?preview=true", json!({"user": "bob", "reason": "x"}))
+        .await;
+    assert_eq!(v["matched_count"], 1, "{v}");
+    let tree = h
+        .client
+        .get(h.server.url(&format!("/admin/leases/{}/tree", root.lease)))
+        .bearer_auth(ADMIN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tree.status(), StatusCode::NOT_FOUND);
+
+    // Nothing more to prune; a session pass finds nothing either (the binding went with it).
+    assert_eq!(attenuo_server::prune_lease_registry(&h.state).await, 0);
+    assert_eq!(attenuo_server::prune_session_bindings(&h.state).await, 0);
+}
