@@ -423,7 +423,8 @@ impl Labeller {
 
     /// Label the events of an SSE chunk that holds whole events. An event whose data answers
     /// a pending call is recorded; if any of its messages had to be replaced it is emitted
-    /// again as one `message` event with the new data, otherwise byte for byte.
+    /// again as one `message` event with the new data, otherwise byte for byte. An event with
+    /// data the proxy cannot parse is dropped (SR-79).
     pub async fn label_events(&self, chunk: &[u8]) -> Vec<u8> {
         if !self.may_answer() {
             return chunk.to_vec();
@@ -437,6 +438,15 @@ impl Labeller {
                     } else {
                         out.extend_from_slice(event);
                     }
+                }
+                // Data the proxy cannot parse may still be JSON to a client whose parser
+                // differs (nesting deeper than `serde_json` allows, for one): it may be an
+                // answer, so it is not relayed unlabelled (SR-79).
+                None if crate::sse::has_data(event) => {
+                    tracing::warn!(
+                        bytes = event.len(),
+                        "upstream SSE event the proxy cannot parse withheld while an answer is awaited"
+                    );
                 }
                 _ => out.extend_from_slice(event),
             }

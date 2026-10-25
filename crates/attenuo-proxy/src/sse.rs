@@ -5,12 +5,16 @@
 //! events, possibly after notifications and server requests, possibly inside a JSON-RPC batch.
 //! [`rewrite_stream`] parses the stream incrementally, runs a callback over the JSON-RPC
 //! message(s) of each event, and emits the event again. Events with no `data`, and comments, are
-//! passed through; the stream is never buffered beyond one event.
+//! passed through; an event whose `data` does not parse is dropped (SR-80); the stream is never
+//! buffered beyond one event.
 //!
 //! The framing rules are those of the WHATWG SSE specification: lines end in `\n`, `\r\n` or
 //! `\r`; an empty line ends an event; several `data:` lines of one event are joined with `\n`;
 //! one space after the colon is dropped; a final event that is not terminated by an empty line
-//! is discarded (a client would discard it too).
+//! is discarded (a client would discard it too). A UTF-8 byte order mark that opens the stream
+//! is dropped, as clients drop it, and an event that is not UTF-8 ends the stream with an
+//! error: a client that decodes leniently would read it, so the proxy must not relay what it
+//! could not read (SR-77).
 
 use std::io;
 
@@ -22,10 +26,31 @@ use serde_json::Value;
 /// `[proxy] max_upstream_body_bytes`).
 pub const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
 
+/// The UTF-8 byte order mark, which a client drops when it opens an event stream.
+const BOM: &[u8] = b"\xef\xbb\xbf";
+
+/// Drop a byte order mark that opens the stream from `buf`. Returns `false` while `buf` is
+/// still too short to tell (a strict prefix of the mark): wait for more bytes. `start` is
+/// cleared once decided.
+fn strip_leading_bom(buf: &mut Vec<u8>, start: &mut bool) -> bool {
+    if !*start {
+        return true;
+    }
+    if buf.len() < BOM.len() && BOM.starts_with(buf) {
+        return false;
+    }
+    if buf.starts_with(BOM) {
+        buf.drain(..BOM.len());
+    }
+    *start = false;
+    true
+}
+
 /// Incremental SSE event splitter and rewriter.
 pub struct SseRewriter {
     buf: Vec<u8>,
     limit: usize,
+    start: bool,
 }
 
 impl Default for SseRewriter {
@@ -44,13 +69,14 @@ impl SseRewriter {
         Self {
             buf: Vec::new(),
             limit,
+            start: true,
         }
     }
 
     /// Feed a chunk of the stream; returns the bytes of every event completed by it, rewritten.
     /// `f` is called with the parsed JSON of each event that carries valid JSON `data`, and may
     /// modify it. Such an event is re-serialized (so duplicate object keys cannot survive);
-    /// any other event is emitted byte for byte.
+    /// an event with no data is emitted byte for byte, one whose data does not parse is dropped.
     pub fn push(
         &mut self,
         chunk: &[u8],
@@ -58,6 +84,9 @@ impl SseRewriter {
     ) -> Result<Vec<u8>, io::Error> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
+        if !strip_leading_bom(&mut self.buf, &mut self.start) {
+            return Ok(out);
+        }
         while let Some(end) = find_event_end(&self.buf) {
             let event: Vec<u8> = self.buf.drain(..end).collect();
             rewrite_event(&event, f, &mut out)?;
@@ -151,8 +180,67 @@ pub(crate) fn event_json(event: &[u8]) -> Option<Value> {
     let lines = split_lines(text);
     let data = data_lines(&lines);
     (!data.is_empty())
-        .then(|| serde_json::from_str::<Value>(&data.join("\n")).ok())
+        .then(|| parse_data(&data.join("\n")))
         .flatten()
+}
+
+/// Parse an event's joined `data` as JSON the way clients do. `serde_json` refuses a `\u`
+/// escape of a UTF-16 surrogate without its pair (`"\ud800"`), which `JSON.parse` and
+/// Python's `json` accept, so a message the proxy could not parse would still be read by
+/// those clients, unlabelled and unrewritten (SR-78). Such an escape is read as U+FFFD, as
+/// `JSON.parse` would print it; everything else is parsed as is.
+pub(crate) fn parse_data(text: &str) -> Option<Value> {
+    match serde_json::from_str::<Value>(text) {
+        Ok(v) => Some(v),
+        Err(_) if text.contains("\\u") => {
+            serde_json::from_str::<Value>(&replace_lone_surrogates(text)).ok()
+        }
+        Err(_) => None,
+    }
+}
+
+/// `text` with every `\uXXXX` escape of an unpaired UTF-16 surrogate replaced by `\ufffd`.
+/// A backslash is only valid JSON inside a string, so escapes are found without tracking
+/// strings: each `\` takes the character after it.
+fn replace_lone_surrogates(text: &str) -> String {
+    fn unit(b: &[u8], at: usize) -> Option<u16> {
+        let hex = b.get(at..at + 6)?;
+        if hex[0] != b'\\' || hex[1] != b'u' {
+            return None;
+        }
+        u16::from_str_radix(std::str::from_utf8(&hex[2..]).ok()?, 16).ok()
+    }
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'\\' {
+            i += 1;
+            continue;
+        }
+        match unit(b, i) {
+            // A pair: kept.
+            Some(0xD800..=0xDBFF) if matches!(unit(b, i + 6), Some(0xDC00..=0xDFFF)) => i += 12,
+            Some(0xD800..=0xDFFF) => {
+                out.push_str(&text[copied..i]);
+                out.push_str("\\ufffd");
+                i += 6;
+                copied = i;
+            }
+            Some(_) => i += 6,
+            None => i += 2,
+        }
+    }
+    out.push_str(&text[copied.min(text.len())..]);
+    out
+}
+
+/// Does `event` carry data (at least one `data` line)? True for an event that is not UTF-8,
+/// whose lines the proxy cannot read. With [`event_json`], tells an event whose data the proxy
+/// could not parse, which a client with another JSON parser may still read (SR-79).
+pub(crate) fn has_data(event: &[u8]) -> bool {
+    std::str::from_utf8(event).map_or(true, |text| !data_lines(&split_lines(text)).is_empty())
 }
 
 /// One `message` event carrying `message` as its data.
@@ -182,7 +270,8 @@ fn data_lines<'a>(lines: &[&'a str]) -> Vec<&'a str> {
 }
 
 /// Run `f` over the JSON `data` of one whole `event` and write the event to `out`: re-encoded
-/// (other fields kept) when the data is JSON, byte for byte otherwise.
+/// (other fields kept) when the data is JSON, byte for byte when it has no data, and not at
+/// all when its data does not parse (SR-80).
 pub(crate) fn rewrite_event(
     event: &[u8],
     f: &mut impl FnMut(&mut Value),
@@ -193,10 +282,19 @@ pub(crate) fn rewrite_event(
     let lines = split_lines(text);
     let data = data_lines(&lines);
     let parsed = (!data.is_empty())
-        .then(|| serde_json::from_str::<Value>(&data.join("\n")).ok())
+        .then(|| parse_data(&data.join("\n")))
         .flatten();
     let Some(mut message) = parsed else {
-        out.extend_from_slice(event);
+        if data.is_empty() {
+            out.extend_from_slice(event);
+        } else {
+            // Data the proxy cannot parse, which a client with another JSON parser may still
+            // read: `f` never saw it, so it is not relayed (SR-80).
+            tracing::warn!(
+                bytes = event.len(),
+                "upstream SSE event whose data does not parse; dropped"
+            );
+        }
         return Ok(());
     };
     f(&mut message);
@@ -227,6 +325,7 @@ pub(crate) fn rewrite_event(
 pub struct SseFramer {
     buf: Vec<u8>,
     limit: usize,
+    start: bool,
 }
 
 impl Default for SseFramer {
@@ -245,18 +344,31 @@ impl SseFramer {
         Self {
             buf: Vec::new(),
             limit,
+            start: true,
         }
     }
 
-    /// Feed a chunk; returns the bytes of every event it completes, unchanged.
+    /// Feed a chunk; returns the bytes of every event it completes, unchanged, but for a byte
+    /// order mark that opens the stream, which is dropped. An event that is not UTF-8 is an
+    /// error (SR-77): what the proxy relays, it must have been able to read.
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<u8>, io::Error> {
         self.buf.extend_from_slice(chunk);
+        if !strip_leading_bom(&mut self.buf, &mut self.start) {
+            return Ok(Vec::new());
+        }
         let mut end = 0;
         while let Some(n) = find_event_end(&self.buf[end..]) {
             end += n;
         }
         if self.buf.len() - end > self.limit {
             return Err(io::Error::other("SSE event larger than the proxy's limit"));
+        }
+        // Whole events end in a line break, so no character is split at `end`.
+        if std::str::from_utf8(&self.buf[..end]).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SSE event is not UTF-8",
+            ));
         }
         Ok(self.buf.drain(..end).collect())
     }
@@ -311,9 +423,10 @@ where
     process_stream(upstream, move |chunk| rewriter.push(chunk, &mut f))
 }
 
-/// Wrap an upstream byte stream so that it yields whole events only, unchanged. A trailing
-/// event without its empty line is dropped (a client would discard it too); a transport error
-/// or an event over `limit` bytes ends the stream with an error.
+/// Wrap an upstream byte stream so that it yields whole events only, unchanged but for a
+/// leading byte order mark, which is dropped. A trailing event without its empty line is
+/// dropped (a client would discard it too); a transport error, an event over `limit` bytes or
+/// a non-UTF-8 event ends the stream with an error.
 pub fn frame_stream<S, E>(
     upstream: S,
     limit: usize,
@@ -380,9 +493,13 @@ mod tests {
     }
 
     #[test]
-    fn non_json_and_data_less_events_pass_through_byte_for_byte() {
-        let input = "data: not json\n\n: comment\n\nretry: 5\n\n";
+    fn data_less_events_pass_through_and_unparsed_data_is_dropped_sr80() {
+        let input = ": comment\n\nretry: 5\n\n";
         assert_eq!(run(&[input.as_bytes()]), input);
+        // Not JSON, or nested deeper than `serde_json` allows: dropped, the rest kept.
+        let deep = format!("data: {}{}\n\n", "[".repeat(200), "]".repeat(200));
+        let mixed = format!("data: not json\n\n{deep}: comment\n\ndata: {{\"a\":1}}\n\n");
+        assert_eq!(run(&[mixed.as_bytes()]), ": comment\n\ndata: {\"a\":1}\n\n");
     }
 
     #[test]
@@ -419,6 +536,62 @@ mod tests {
     fn non_utf8_event_is_an_error() {
         let mut r = SseRewriter::new();
         assert!(r.push(b"data: \xff\xfe\n\n", &mut |_| {}).is_err());
+    }
+
+    #[test]
+    fn a_leading_bom_is_dropped_and_a_non_utf8_event_is_refused_sr77() {
+        let whole = b"\xef\xbb\xbfdata: {\"a\":1}\n\n";
+        for cut in 0..whole.len() {
+            let (a, b) = whole.split_at(cut);
+            let mut f = SseFramer::new();
+            let mut out = f.push(a).unwrap();
+            out.extend(f.push(b).unwrap());
+            assert_eq!(out, b"data: {\"a\":1}\n\n", "framer, cut at {cut}");
+            let mut r = SseRewriter::new();
+            let mut seen = 0;
+            let mut out = r.push(a, &mut |_: &mut Value| seen += 1).unwrap();
+            out.extend(r.push(b, &mut |_: &mut Value| seen += 1).unwrap());
+            assert_eq!(seen, 1, "rewriter, cut at {cut}");
+            assert_eq!(out, b"data: {\"a\":1}\n\n", "rewriter, cut at {cut}");
+        }
+        // Only the stream's first bytes: a later mark is an ordinary (unknown) field name.
+        let mut f = SseFramer::new();
+        assert_eq!(f.push(b"data: 1\n\n").unwrap(), b"data: 1\n\n");
+        let later = b"\xef\xbb\xbfdata: 2\n\n";
+        assert_eq!(f.push(later).unwrap(), later);
+        // Not UTF-8, in a comment or in the data: the stream ends with an error.
+        for event in [&b": \xff\ndata: {}\n\n"[..], &b"data: \"\xc3\"\n\n"[..]] {
+            let mut f = SseFramer::new();
+            assert!(f.push(b"data: ok\n\n").is_ok());
+            assert!(f.push(event).is_err(), "{event:?}");
+        }
+        // A character split across chunks is fine once its event is whole.
+        let mut f = SseFramer::new();
+        assert!(f.push(b"data: \"\xc3").unwrap().is_empty());
+        assert_eq!(
+            f.push(b"\xa9\"\n\n").unwrap(),
+            "data: \"\u{e9}\"\n\n".as_bytes()
+        );
+    }
+
+    #[test]
+    fn a_lone_surrogate_escape_is_read_as_a_replacement_character_sr78() {
+        assert_eq!(parse_data(r#""\ud800""#), Some(json!("\u{fffd}")));
+        assert_eq!(
+            parse_data(r#""\udc00x\ud800""#),
+            Some(json!("\u{fffd}x\u{fffd}"))
+        );
+        // A pair is kept, and so is an escaped backslash before a `u`.
+        assert_eq!(parse_data(r#""\ud83d\ude00""#), Some(json!("\u{1f600}")));
+        assert_eq!(
+            parse_data(r#""\ud800\ud83d\ude00""#),
+            Some(json!("\u{fffd}\u{1f600}"))
+        );
+        assert_eq!(parse_data(r#""\\ud800""#), Some(json!("\\ud800")));
+        // Still not JSON.
+        assert_eq!(parse_data(r#""\ud800"#), None);
+        assert_eq!(parse_data("\\u"), None);
+        assert_eq!(parse_data(r#""\u12""#), None);
     }
 
     #[test]

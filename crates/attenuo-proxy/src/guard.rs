@@ -473,17 +473,31 @@ fn may_hold_stream_end_code(event: &[u8]) -> bool {
 
 /// [`disown_stream_end`] over a chunk of whole SSE events (as [`crate::sse::frame_stream`]
 /// and [`crate::sse::rewrite_stream`] emit them). An event with a message to rewrite is
-/// emitted again with the new data and its other fields (`id:`, `event:`) kept; every other
-/// event goes out byte for byte. Only an event that passes [`may_hold_stream_end_code`] is
+/// emitted again with the new data and its other fields (`id:`, `event:`) kept; an event that
+/// passes the scan but whose data does not parse is dropped (SR-79); every other event goes out
+/// byte for byte. Only an event that passes [`may_hold_stream_end_code`] is
 /// parsed (`docs/design/bench/2026-10-25-vm-sse-disown.md`).
 pub(crate) fn disown_events(chunk: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(chunk.len());
     for event in crate::sse::split_events(chunk) {
-        let lookalike = may_hold_stream_end_code(event)
-            && crate::sse::event_json(event).is_some_and(|v| match &v {
-                Value::Array(items) => items.iter().any(has_stream_end_shape),
-                other => has_stream_end_shape(other),
-            });
+        if !may_hold_stream_end_code(event) {
+            out.extend_from_slice(event);
+            continue;
+        }
+        let parsed = crate::sse::event_json(event);
+        if parsed.is_none() && crate::sse::has_data(event) {
+            // It may hold the code and the proxy cannot parse it, while a client whose JSON
+            // parser differs may read it as a cut: not relayed (SR-79).
+            tracing::warn!(
+                bytes = event.len(),
+                "upstream SSE event that may hold the stream-end code and does not parse; dropped"
+            );
+            continue;
+        }
+        let lookalike = parsed.is_some_and(|v| match &v {
+            Value::Array(items) => items.iter().any(has_stream_end_shape),
+            other => has_stream_end_shape(other),
+        });
         if !lookalike
             || crate::sse::rewrite_event(
                 event,
@@ -1111,5 +1125,72 @@ mod tests {
             StreamEndCause::of_lease_reason("anything else"),
             StreamEndCause::LeaseOther
         );
+    }
+
+    /// Security review pass 7: every spelling of a number whose `f64` value is -32001 that this
+    /// generator can make (point anywhere, leading and trailing zeros, exponents, both cases,
+    /// `serde_json`'s and Rust's own formatting, decimals that round to it) passes the byte
+    /// scan whenever the parsed message has the stream-end shape.
+    #[test]
+    fn the_byte_scan_admits_every_spelling_of_the_code_pass7() {
+        fn check(num: &str) {
+            let text = format!(r#"data: {{"jsonrpc":"2.0","id":null,"error":{{"code":{num}}}}}"#);
+            let Ok(v) = serde_json::from_str::<Value>(&text["data: ".len()..]) else {
+                return;
+            };
+            if has_stream_end_shape(&v) {
+                assert!(may_hold_stream_end_code(text.as_bytes()), "missed {num}");
+            }
+        }
+        let mut seen = 0;
+        for digits in ["32001", "320010", "3200100", "032001", "0032001"] {
+            for point in 0..=digits.len() {
+                let (a, b) = digits.split_at(point);
+                let mantissa = match (a.is_empty(), b.is_empty()) {
+                    (true, _) => format!("0.{b}"),
+                    (_, true) => a.to_owned(),
+                    _ => format!("{a}.{b}"),
+                };
+                for exp in -12i32..=12 {
+                    for e in ["e", "E"] {
+                        for sign in ["", "+"] {
+                            let n = if exp < 0 {
+                                format!("-{mantissa}{e}{exp}")
+                            } else {
+                                format!("-{mantissa}{e}{sign}{exp}")
+                            };
+                            check(&n);
+                            seen += 1;
+                        }
+                    }
+                }
+                check(&format!("-{mantissa}"));
+            }
+        }
+        // Rust's and serde_json's own spellings of the value and its neighbours.
+        let x = -32001.0f64;
+        for v in [
+            x,
+            f64::from_bits(x.to_bits() + 1),
+            f64::from_bits(x.to_bits() - 1),
+        ] {
+            check(&format!("{v}"));
+            check(&format!("{v:e}"));
+            check(&format!("{v:E}"));
+            check(&format!("{v:.20}"));
+            check(&serde_json::to_string(&v).unwrap());
+        }
+        // Decimals close to 32001 on either side (a small LCG, fixed seed).
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..20_000 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let off = (state >> 11) as f64 / (1u64 << 53) as f64 * 8e-12 - 4e-12;
+            for prec in [10usize, 12, 14, 16, 20] {
+                check(&format!("{:.prec$}", -32001.0 + off));
+            }
+        }
+        assert!(seen > 1000);
     }
 }
