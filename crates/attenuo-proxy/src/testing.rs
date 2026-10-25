@@ -419,6 +419,13 @@ pub fn stream_end_lookalike() -> Value {
     )
 }
 
+/// The proxy's stream-end check over a chunk of whole SSE events, as the unfiltered SSE path
+/// runs it ([`crate::guard::disown_events`]); for the cost measurement in
+/// `tests/listen_stream_cost.rs`.
+pub fn disown_events(chunk: &[u8]) -> Vec<u8> {
+    crate::guard::disown_events(chunk)
+}
+
 async fn fake_handle(
     axum::extract::State(server): axum::extract::State<FakeMcpServer>,
     headers: HeaderMap,
