@@ -26,7 +26,10 @@ use crate::auth::{
 };
 use crate::config::ProxyConfig;
 use crate::filter::{list_kinds_by_shape, ListFilter, ListKind};
-use crate::guard::{guard_stream, StreamEndCause, StreamGuard, STREAM_END_RECORD_WINDOW};
+use crate::guard::{
+    disown_stream, disown_stream_end, guard_stream, StreamEndCause, StreamGuard,
+    STREAM_END_RECORD_WINDOW,
+};
 use crate::jsonrpc::{
     self, approval_required_response, denied_response, denied_response_with, error_response, id_of,
     is_passthrough_method, is_request, method_of, CODE_INVALID_PARAMS, CODE_INVALID_REQUEST,
@@ -1674,6 +1677,8 @@ async fn buffer_and_rewrite(
     if removed > 0 {
         tracing::debug!(removed, "filtered list result");
     }
+    // An upstream error must not read as the proxy's stream end (`id: null`, `-32001`).
+    disown_stream_end(&mut value);
     if let Some(labeller) = labeller {
         let withheld = labeller.label_value(&mut value).await;
         if withheld > 0 {
@@ -1757,7 +1762,8 @@ fn is_event_stream(headers: &HeaderMap) -> bool {
 /// Stream an upstream response back without buffering (SSE passthrough). With a `guard`, the
 /// stream is re-checked and ended when the check fails (SR-28); an SSE body is then relayed
 /// event by event ([`crate::sse::frame_stream`]), so the proxy's final event never lands
-/// inside a partial upstream event.
+/// inside a partial upstream event, and an upstream event in the shape of that final event is
+/// rewritten ([`crate::guard::disown_stream_end`]).
 /// `limit` bounds one buffered SSE event (`max_upstream_body_bytes`).
 fn stream_response(
     resp: reqwest::Response,
@@ -1776,7 +1782,7 @@ fn stream_response(
             Body::from_stream(prelude.chain(raw))
         }
         Some(guard) if is_event_stream(&headers) => {
-            let framed = crate::sse::frame_stream(resp.bytes_stream(), limit);
+            let framed = disown_stream(crate::sse::frame_stream(resp.bytes_stream(), limit));
             Body::from_stream(guard_stream(prelude.chain(framed), guard, true))
         }
         Some(guard) => {
@@ -1792,6 +1798,8 @@ fn stream_response(
 /// Like [`stream_response`] for an SSE body, always re-checked: with a `filter`, it runs over
 /// every JSON-RPC message in the events (see [`crate::sse`]); with a `labeller`, every
 /// response to an allowed call is recorded before its event is relayed ([`crate::label`]).
+/// Either way an upstream event in the shape of the proxy's stream-end event is rewritten
+/// first ([`crate::guard::disown_stream_end`]).
 fn stream_response_sse<F>(
     resp: reqwest::Response,
     prelude: Option<Bytes>,
@@ -1807,9 +1815,21 @@ where
         std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
     let status = resp.status();
     let headers = resp.headers().clone();
+    // No upstream event may read as the proxy's own stream end (the guard appends that). With
+    // a filter, in the same pass that parses each event; without, on the framed events.
     let events: Events = match filter {
-        Some(f) => Box::pin(crate::sse::rewrite_stream(resp.bytes_stream(), limit, f)),
-        None => Box::pin(crate::sse::frame_stream(resp.bytes_stream(), limit)),
+        Some(mut f) => Box::pin(crate::sse::rewrite_stream(
+            resp.bytes_stream(),
+            limit,
+            move |msg: &mut Value| {
+                f(msg);
+                disown_stream_end(msg);
+            },
+        )),
+        None => Box::pin(disown_stream(crate::sse::frame_stream(
+            resp.bytes_stream(),
+            limit,
+        ))),
     };
     let events: Events = match labeller {
         Some(l) => Box::pin(label_stream(events, l)),

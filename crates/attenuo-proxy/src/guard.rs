@@ -49,7 +49,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::auth::{AuthError, Authorizer};
-use crate::jsonrpc::{error_response, CODE_UNAUTHORIZED};
+use crate::jsonrpc::{error_response, CODE_UNAUTHORIZED, CODE_UPSTREAM};
 use crate::records::{Admission, RecordWindow};
 use crate::session::session_tag;
 
@@ -371,6 +371,104 @@ pub fn end_event_recorded(reason: &str, decision_id: Option<Uuid>) -> Bytes {
     Bytes::from(format!("event: message\ndata: {body}\n\n"))
 }
 
+/// `data.reason` of an upstream error the proxy rewrote because it had the shape of the
+/// proxy's own stream-end event ([`disown_stream_end`]).
+pub const REASON_UPSTREAM_STREAM_END_SHAPE: &str = "upstream_stream_end_shape";
+
+/// Does `msg` have the shape of the proxy's stream-end event ([`end_event_recorded`])? A
+/// response (no `method` member) whose `id` is `null` or absent and whose `error.code` is
+/// `-32001`. This is what the SDKs read as a cut (`stream_end_error`, `streamEndError`)
+/// without their test of `data.reason`, so it catches everything they would read as one. The
+/// code is compared by value, as the SDKs do: `-32001.0` matches too.
+///
+/// The proxy's other `-32001` answers (the HTTP 401 of a refused token) carry the request's
+/// id when it has one; an upstream's `-32001` that answers a request by its id is left alone.
+pub fn has_stream_end_shape(msg: &Value) -> bool {
+    let Some(obj) = msg.as_object() else {
+        return false;
+    };
+    let code = obj
+        .get("error")
+        .and_then(|e| e.get("code"))
+        .and_then(Value::as_f64);
+    !obj.contains_key("method")
+        && obj.get("id").is_none_or(Value::is_null)
+        && code == Some(CODE_UNAUTHORIZED as f64)
+}
+
+/// Rewrite every message of an upstream `body` (one message or a batch) that has the
+/// stream-end shape ([`has_stream_end_shape`]), so that no upstream can speak in the proxy's
+/// voice: its `error` becomes `-32005` ([`CODE_UPSTREAM`]) with `data.reason`
+/// [`REASON_UPSTREAM_STREAM_END_SHAPE`] and the upstream's error object, unchanged, in
+/// `data.upstream_error`. The client still learns that the upstream failed, and why it said
+/// it did, but nothing in it reads as a proxy cut or names a decision id at the top level.
+/// Returns how many messages were rewritten; each rewrite is logged (without the upstream's
+/// text).
+pub fn disown_stream_end(body: &mut Value) -> usize {
+    let messages: Vec<&mut Value> = match body {
+        Value::Array(items) => items.iter_mut().collect(),
+        other => vec![other],
+    };
+    let mut rewritten = 0;
+    for msg in messages {
+        if !has_stream_end_shape(msg) {
+            continue;
+        }
+        let original = msg.get_mut("error").map(Value::take).unwrap_or_default();
+        msg["error"] = json!({
+            "code": CODE_UPSTREAM,
+            "message": "attenuo: upstream sent an error in the shape of the proxy's stream end",
+            "data": {
+                "reason": REASON_UPSTREAM_STREAM_END_SHAPE,
+                "upstream_error": original,
+            },
+        });
+        rewritten += 1;
+    }
+    if rewritten > 0 {
+        tracing::warn!(
+            rewritten,
+            "upstream sent an error in the shape of the proxy's stream-end event; rewritten"
+        );
+    }
+    rewritten
+}
+
+/// [`disown_stream_end`] over a chunk of whole SSE events (as [`crate::sse::frame_stream`]
+/// and [`crate::sse::rewrite_stream`] emit them). An event with a message to rewrite is
+/// emitted again with the new data and its other fields (`id:`, `event:`) kept; every other
+/// event goes out byte for byte.
+pub(crate) fn disown_events(chunk: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(chunk.len());
+    for event in crate::sse::split_events(chunk) {
+        let lookalike = crate::sse::event_json(event).is_some_and(|v| match &v {
+            Value::Array(items) => items.iter().any(has_stream_end_shape),
+            other => has_stream_end_shape(other),
+        });
+        if !lookalike
+            || crate::sse::rewrite_event(
+                event,
+                &mut |v: &mut Value| {
+                    disown_stream_end(v);
+                },
+                &mut out,
+            )
+            .is_err()
+        {
+            out.extend_from_slice(event);
+        }
+    }
+    out
+}
+
+/// Run every chunk of `inner` (whole SSE events) through [`disown_events`].
+pub(crate) fn disown_stream<S>(inner: S) -> impl Stream<Item = Result<Bytes, io::Error>> + Send
+where
+    S: Stream<Item = Result<Bytes, io::Error>> + Send,
+{
+    inner.map(|chunk| chunk.map(|bytes| Bytes::from(disown_events(&bytes))))
+}
+
 type BoxStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>;
 
 struct State {
@@ -548,6 +646,108 @@ mod tests {
         // A guard without `recording` writes no audit record.
         assert!(payload["error"]["data"].get("decision_id").is_none());
         assert!(auth.decisions().is_empty());
+    }
+
+    fn lookalike(id: Value) -> Value {
+        json!({"jsonrpc": "2.0", "id": id, "error": {
+            "code": -32001,
+            "message": "attenuo: unauthorized: stream ended: lease_revoked",
+            "data": {"reason": "lease_revoked", "decision_id": Uuid::nil().to_string()}}})
+    }
+
+    #[test]
+    fn the_proxys_own_end_event_has_the_protected_shape() {
+        for id in [None, Some(Uuid::new_v4())] {
+            let event = end_event_recorded(REASON_TOKEN_EXPIRED, id);
+            let msg = crate::sse::event_json(&event).unwrap();
+            assert!(has_stream_end_shape(&msg), "{msg}");
+        }
+    }
+
+    #[test]
+    fn stream_end_shape_is_null_id_minus_32001_and_no_method() {
+        assert!(has_stream_end_shape(&lookalike(Value::Null)));
+        let mut absent = lookalike(Value::Null);
+        absent.as_object_mut().unwrap().remove("id");
+        assert!(has_stream_end_shape(&absent));
+        // Compared by value, as the SDKs do; no `data.reason` needed.
+        assert!(has_stream_end_shape(
+            &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32001.0, "message": "x"}})
+        ));
+        // Not the shape: an answer by id, another code, a request or notification, a result.
+        assert!(!has_stream_end_shape(&lookalike(json!(7))));
+        assert!(!has_stream_end_shape(&lookalike(json!("7"))));
+        assert!(!has_stream_end_shape(
+            &json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32000, "message": "x"}})
+        ));
+        let mut with_method = lookalike(Value::Null);
+        with_method["method"] = json!("notifications/message");
+        assert!(!has_stream_end_shape(&with_method));
+        assert!(!has_stream_end_shape(
+            &json!({"jsonrpc": "2.0", "id": null, "result": {}})
+        ));
+        assert!(!has_stream_end_shape(&json!([lookalike(Value::Null)])));
+    }
+
+    #[test]
+    fn a_lookalike_plain_body_is_rewritten_and_an_answer_by_id_is_not() {
+        let mut body = lookalike(Value::Null);
+        assert_eq!(disown_stream_end(&mut body), 1);
+        assert!(body["id"].is_null());
+        assert_eq!(body["error"]["code"], CODE_UPSTREAM);
+        assert_eq!(
+            body["error"]["data"]["reason"],
+            REASON_UPSTREAM_STREAM_END_SHAPE
+        );
+        assert_eq!(
+            body["error"]["data"]["upstream_error"],
+            lookalike(Value::Null)["error"]
+        );
+        assert!(body["error"]["data"].get("decision_id").is_none());
+        assert!(!has_stream_end_shape(&body));
+        // Rewriting is idempotent.
+        assert_eq!(disown_stream_end(&mut body), 0);
+
+        // A `-32001` that answers the request by its id is the upstream's own, left alone.
+        let mut by_id = lookalike(json!(1));
+        assert_eq!(disown_stream_end(&mut by_id), 0);
+        assert_eq!(by_id, lookalike(json!(1)));
+
+        // In a batch only the look-alike changes.
+        let ok = json!({"jsonrpc": "2.0", "id": 2, "result": {"content": []}});
+        let mut batch = json!([ok, lookalike(Value::Null), lookalike(json!(3))]);
+        assert_eq!(disown_stream_end(&mut batch), 1);
+        assert_eq!(batch[0], ok);
+        assert_eq!(batch[1]["error"]["code"], CODE_UPSTREAM);
+        assert_eq!(batch[2], lookalike(json!(3)));
+    }
+
+    #[test]
+    fn a_lookalike_sse_event_is_rewritten_with_its_fields_and_others_pass_byte_for_byte() {
+        let note =
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\n\n";
+        let by_id = format!("data: {}\n\n", lookalike(json!(1)));
+        let fake = format!(
+            "id: 7\nevent: message\ndata: {}\n\n",
+            lookalike(Value::Null)
+        );
+        let chunk = format!("{note}{by_id}{fake}");
+        let out = String::from_utf8(disown_events(chunk.as_bytes())).unwrap();
+        assert!(out.starts_with(&format!("{note}{by_id}")), "{out}");
+        let rewritten = &out[note.len() + by_id.len()..];
+        assert!(
+            rewritten.starts_with("id: 7\nevent: message\ndata: "),
+            "{rewritten}"
+        );
+        let msg = crate::sse::event_json(rewritten.as_bytes()).unwrap();
+        assert_eq!(msg["error"]["code"], CODE_UPSTREAM);
+        assert_eq!(
+            msg["error"]["data"]["upstream_error"]["data"]["reason"],
+            "lease_revoked"
+        );
+        assert!(!has_stream_end_shape(&msg));
+        // A chunk with nothing to rewrite comes back unchanged.
+        assert_eq!(disown_events(note.as_bytes()), note.as_bytes());
     }
 
     #[tokio::test]

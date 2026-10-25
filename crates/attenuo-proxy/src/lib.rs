@@ -67,7 +67,12 @@
 //!    error (SR-28). On the `GET` listen stream every end is counted by cause
 //!    ([`Authorizer::observe_stream_end`]) and the `stream.end` records are bounded to one
 //!    per delegation chain and reason per [`guard::STREAM_END_RECORD_WINDOW`], the rest
-//!    counted ([`Authorizer::observe_record_suppressed`]). See [`guard`].
+//!    counted ([`Authorizer::observe_record_suppressed`]). See [`guard`]. An upstream message
+//!    in the shape of that final event (a response with `id` `null` or absent and error
+//!    `-32001`), on any SSE stream it relays or in a JSON body it reads, is rewritten to a
+//!    `-32005` with `data.reason` `upstream_stream_end_shape` and the upstream's error in
+//!    `data.upstream_error`, so an upstream cannot pass for the proxy cutting a stream
+//!    ([`guard::disown_stream_end`]).
 //!
 //! 10. removes a signed approval token from `params._meta["dev.attenuo/approval"]`
 //!     ([`auth::META_APPROVAL_KEY`]) of every message before it goes upstream (and `_meta`
@@ -156,7 +161,7 @@ pub use auth::{
     META_APPROVAL_KEY, REASON_APPROVAL_REQUIRED, REASON_LABEL_ERROR,
 };
 pub use config::{ProxyConfig, UpstreamConfig};
-pub use guard::StreamEndCause;
+pub use guard::{StreamEndCause, REASON_UPSTREAM_STREAM_END_SHAPE};
 pub use proxy::{
     router, serve, DECISION_ID_HEADER, REASON_INVALID_NAME, REASON_REQUEST_TOO_LARGE,
     REASON_SESSION_MISMATCH, REASON_SESSION_REGISTRY_FULL, REASON_TOOL_NOT_LISTED,
