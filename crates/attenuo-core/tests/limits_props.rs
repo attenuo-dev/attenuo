@@ -22,15 +22,10 @@ use serde_json::{json, Value};
 use time::macros::datetime;
 use time::Duration;
 
-const ARGS: &[&str] = &["to", "url"];
+mod proptest_seed;
+use proptest_seed::proptest_config;
 
-fn config() -> ProptestConfig {
-    ProptestConfig {
-        cases: 1024,
-        failure_persistence: None,
-        ..ProptestConfig::default()
-    }
-}
+const ARGS: &[&str] = &["to", "url"];
 
 // ---------------------------------------------------------------- strategies
 
@@ -187,7 +182,7 @@ fn same_targets(child: &Limits, parent: &Limits) -> bool {
 // ---------------------------------------------------------------- properties
 
 proptest! {
-    #![proptest_config(config())]
+    #![proptest_config(proptest_config(1024))]
 
     #[test]
     fn clamping_is_idempotent_and_narrows(child in limits(), parent in limits()) {

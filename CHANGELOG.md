@@ -177,6 +177,7 @@ The injection-suite figures in the docs come from synthetic, model-free cases wr
 - BREAKING: an `Mcp-Session-Id` the proxy did not see the upstream assign gets 404; one bound to another principal gets 403 (SR-11). `attenuo_proxy::Authorizer` gained `record_rejection` (with a default), and `LeaseStore` gained `bind` and `binding`.
 - Policy test files take `unknown_tools`, and pick up `[policy] unknown_tools` from a server config named as `catalog`.
 - Python SDK: `exchange(..., client_secret=...)` from a delegation token authenticates the actor (`client_id` defaults to `actor`) and stays a hop n+1 exchange; client credentials only make it hop 0 when the subject token is not an attenuo token. The examples and the integration test pass the demo agents' secrets; the demo config registers a `tester` agent.
+- Property tests replay a fixed seed in CI and use a random one locally: `PROPTEST_RNG_SEED` pins the seed (CI sets it to 20261024, with `PROPTEST_CASES=1024`), and without it the random seed is printed with a failing test so the run can be replayed. A bad value of either variable fails with a message naming it; `proptest-regressions/` is gitignored, as failure persistence stays off.
 
 ### Deprecated
 
