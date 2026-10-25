@@ -13,16 +13,34 @@ import json
 import re
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeGuard
 
 import httpx
 
 from . import _wire as w
-from .errors import AttenuoError, Denied
+from .errors import AttenuoError, Denied, RpcError
 
 #: The default bound on one SSE event (or a plain JSON answer) of a streamed call: 16 MiB, the
 #: proxy's ``[proxy] max_upstream_body_bytes`` default.
 DEFAULT_MAX_EVENT_BYTES = 16 * 1024 * 1024
+
+# The `data.reason` values the proxy's stream-end event carries (`end_event_recorded` in
+# crates/attenuo-proxy/src/guard.rs): the token and lease reasons of the server's authorizer,
+# and `unauthorized` for a re-check that failed for another reason. These are the reasons on
+# the wire, not the `StreamEndCause` metric labels: `lease_other`, `recheck_unavailable` and
+# `recheck_failed` never appear in an event.
+_STREAM_END_REASONS = frozenset(
+    {
+        "token_expired",
+        "lease_revoked",
+        "lease_expired",
+        "lease_unknown",
+        "lease_error",
+        "unauthorized",
+    }
+)
+# `data.decision_id` of a stream-end event, when present: a UUID in its hyphenated form.
+_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 _LINE_END = re.compile(rb"\r\n|\r|\n")
 _BOM = b"\xef\xbb\xbf"
@@ -146,27 +164,44 @@ class StreamEvent:
         return self.result is not None
 
 
-def stream_end_error(msg: dict[str, Any]) -> Denied | None:
-    """The proxy's last event on a stream it cut (``id: null``, ``-32001``, ``data.reason``) as
-    a :class:`Denied` with that reason and ``data.decision_id``, else ``None``.
+def _is_stream_end(data: object) -> TypeGuard[dict[str, Any]]:
+    """Is ``data`` what the proxy's stream-end event carries: a known ``reason``, and a
+    ``decision_id`` that is absent or a UUID string?"""
+    if not isinstance(data, dict):
+        return False
+    reason = data.get("reason")
+    if not isinstance(reason, str) or reason not in _STREAM_END_REASONS:
+        return False
+    if "decision_id" not in data:
+        return True
+    decision_id = data["decision_id"]
+    return isinstance(decision_id, str) and _UUID.fullmatch(decision_id) is not None
 
-    The proxy's ``X-Attenuo-Decision-Id`` header went out before the cut, so it cannot vouch for
-    this decision id the way it does for a ``-32003``."""
+
+def stream_end_error(msg: dict[str, Any]) -> Denied | RpcError | None:
+    """The proxy's last event on a stream it cut, as a :class:`Denied`; ``None`` for a message
+    without the stream-end shape.
+
+    The shape is a response (no ``method``) whose ``id`` is null or absent and whose error code
+    is ``-32001``. A message of that shape is a cut only when ``data.reason`` is one the proxy
+    sends and ``data.decision_id`` is absent or a UUID string: then it is a :class:`Denied` with
+    that reason and id. Anything else of that shape is an :class:`RpcError` with code
+    ``-32001``, which still ends the call, but not as a decision.
+
+    This is belt-and-braces: the real guard is the proxy, which rewrites any upstream message of
+    the stream-end shape to ``-32005`` ``upstream_stream_end_shape`` before it reaches the
+    client. The proxy's ``X-Attenuo-Decision-Id`` header went out before the cut, so it cannot
+    vouch for this decision id the way it does for a ``-32003``."""
     err = msg.get("error")
     if "method" in msg or msg.get("id") is not None or not isinstance(err, dict):
         return None
+    if err.get("code") != w.CODE_UNAUTHORIZED:
+        return None
+    message = str(err.get("message", ""))
     data = err.get("data")
-    if err.get("code") != w.CODE_UNAUTHORIZED or not isinstance(data, dict):
-        return None
-    reason = data.get("reason")
-    if not isinstance(reason, str) or not reason:
-        return None
-    decision_id = data.get("decision_id")
-    return Denied(
-        reason,
-        decision_id if isinstance(decision_id, str) and decision_id else None,
-        str(err.get("message", "")),
-    )
+    if _is_stream_end(data):
+        return Denied(data["reason"], data.get("decision_id"), message)
+    return RpcError(w.CODE_UNAUTHORIZED, message, data)
 
 
 class CallStream:
@@ -175,7 +210,8 @@ class CallStream:
     Feed SSE chunks to :meth:`feed` and call :meth:`finish` at the end, or hand a plain JSON body
     to :meth:`plain`. After the response to the call (result or error) ``done`` is set and later
     events are ignored. A JSON-RPC error raises what :meth:`Client.call_tool` raises; the proxy's
-    stream-end event raises :class:`Denied` (see :func:`stream_end_error`).
+    stream-end event raises :class:`Denied`, and a message of its shape that is not one raises
+    :class:`RpcError` (see :func:`stream_end_error`).
     """
 
     def __init__(self, resp: httpx.Response, request_id: int, max_event_bytes: int) -> None:
