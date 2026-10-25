@@ -684,7 +684,7 @@ fn refund_of_two_large_rows_on_one_counter_fz2_3() {
 /// share some values; a refund frees exactly the values no other unrefunded decision used, in
 /// both hops, and the counts follow.
 #[test]
-fn a_refund_after_a_batched_list_charge_frees_only_unshared_values_sr62() {
+fn a_refund_after_a_wide_list_charge_frees_only_unshared_values_sr62() {
     use attenuo_core::limits::MAX_COUNTED_VALUES;
     let max = 10_000;
     // Both hops of a 2-hop chain, as `charges_for` orders a list: every value in hop 0, then
