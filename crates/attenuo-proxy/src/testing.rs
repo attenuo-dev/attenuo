@@ -551,11 +551,16 @@ pub type ObservedHints = (String, String, Option<bool>, Option<bool>);
 /// ([`recorded_results`](Self::recorded_results)) and can be made to fail
 /// ([`fail_results`](Self::fail_results)); tool annotations are kept too
 /// ([`observed_hints`](Self::observed_hints)), and so are new sessions
-/// ([`recorded_sessions`](Self::recorded_sessions)).
+/// ([`recorded_sessions`](Self::recorded_sessions)), the ends of listen streams
+/// ([`stream_ends`](Self::stream_ends)) and suppressed records
+/// ([`suppressed_records`](Self::suppressed_records)).
 #[derive(Default)]
 pub struct StaticAuthorizer {
     chains: HashMap<String, DelegationChain>,
-    revoked: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Bearer -> the lease reason `check_active` gives for it.
+    revoked: Arc<Mutex<HashMap<String, &'static str>>>,
+    stream_ends: Arc<Mutex<Vec<crate::guard::StreamEndCause>>>,
+    suppressed: Arc<Mutex<Vec<(String, crate::guard::StreamEndCause)>>>,
     decisions: Arc<Mutex<Vec<DecisionRecord>>>,
     catalog: Option<std::collections::HashSet<(String, String)>>,
     results: Arc<Mutex<Vec<RecordedResult>>>,
@@ -610,17 +615,40 @@ impl StaticAuthorizer {
     /// Mark a bearer's lease revoked: `check_active` fails for it from now on, and so does
     /// `authorize` (reason `lease_revoked`), like the real pipeline.
     pub fn revoke(&self, bearer: &str) {
+        self.lapse(bearer, "lease_revoked");
+    }
+
+    /// Mark a bearer's lease expired: like [`revoke`](Self::revoke), with reason
+    /// `lease_expired`.
+    pub fn expire_lease(&self, bearer: &str) {
+        self.lapse(bearer, "lease_expired");
+    }
+
+    fn lapse(&self, bearer: &str, reason: &'static str) {
         self.revoked
             .lock()
             .expect("revoked mutex")
-            .insert(bearer.to_owned());
+            .insert(bearer.to_owned(), reason);
     }
 
-    fn is_revoked(&self, chain: &DelegationChain) -> bool {
+    /// The lease reason of `chain`, when a bearer of it was revoked or expired.
+    fn lapsed(&self, chain: &DelegationChain) -> Option<&'static str> {
         let revoked = self.revoked.lock().expect("revoked mutex");
         self.chains
             .iter()
-            .any(|(bearer, c)| c == chain && revoked.contains(bearer))
+            .filter(|(_, c)| *c == chain)
+            .find_map(|(bearer, _)| revoked.get(bearer).copied())
+    }
+
+    /// Every listen-stream end reported through [`Authorizer::observe_stream_end`], in order.
+    pub fn stream_ends(&self) -> Vec<crate::guard::StreamEndCause> {
+        self.stream_ends.lock().expect("stream ends mutex").clone()
+    }
+
+    /// Every suppressed record reported through [`Authorizer::observe_record_suppressed`],
+    /// as `(tool, reason)`, in order.
+    pub fn suppressed_records(&self) -> Vec<(String, crate::guard::StreamEndCause)> {
+        self.suppressed.lock().expect("suppressed mutex").clone()
     }
 
     /// Every decision recorded so far, in order.
@@ -691,8 +719,8 @@ impl Authorizer for StaticAuthorizer {
         chain: &DelegationChain,
         _now: OffsetDateTime,
     ) -> Result<(), AuthError> {
-        if self.is_revoked(chain) {
-            Err(AuthError::LeaseInactive("lease_revoked".into()))
+        if let Some(reason) = self.lapsed(chain) {
+            Err(AuthError::LeaseInactive(reason.into()))
         } else {
             Ok(())
         }
@@ -704,7 +732,8 @@ impl Authorizer for StaticAuthorizer {
         call: &ToolCall,
         now: OffsetDateTime,
     ) -> AuthDecision {
-        let revoked = self.is_revoked(chain);
+        let lapsed = self.lapsed(chain);
+        let revoked = lapsed.is_some();
         let allowed = !revoked
             && chain
                 .effective_capabilities()
@@ -717,8 +746,8 @@ impl Authorizer for StaticAuthorizer {
             )
         } else if allowed {
             (attenuo_core::Decision::Allow, Self::REASON_ALLOW)
-        } else if revoked {
-            (attenuo_core::Decision::Deny, "lease_revoked")
+        } else if let Some(reason) = lapsed {
+            (attenuo_core::Decision::Deny, reason)
         } else {
             (attenuo_core::Decision::Deny, Self::REASON_DENY)
         };
@@ -840,6 +869,20 @@ impl Authorizer for StaticAuthorizer {
             read_only_hint,
             destructive_hint,
         ));
+    }
+
+    fn observe_stream_end(&self, cause: crate::guard::StreamEndCause) {
+        self.stream_ends
+            .lock()
+            .expect("stream ends mutex")
+            .push(cause);
+    }
+
+    fn observe_record_suppressed(&self, tool: &'static str, reason: crate::guard::StreamEndCause) {
+        self.suppressed
+            .lock()
+            .expect("suppressed mutex")
+            .push((tool.to_owned(), reason));
     }
 }
 

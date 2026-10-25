@@ -13,7 +13,8 @@ use std::time::Duration;
 
 use attenuo_audit::WalStats;
 use attenuo_core::{LimitKind, OutputLabel};
-use attenuo_proxy::Stage;
+use attenuo_proxy::guard::{STREAM_END_RECORD_WINDOW, STREAM_END_TOOL};
+use attenuo_proxy::{Stage, StreamEndCause};
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{header, HeaderValue};
 use axum::middleware::Next;
@@ -140,6 +141,11 @@ pub struct Metrics {
     run_lock_wait: Histogram,
     /// The background WAL checkpointer of the audit store, when there is one.
     wal: OnceLock<WalSource>,
+    /// `GET` listen streams ended, by [`StreamEndCause::index`].
+    streams_ended: [AtomicU64; StreamEndCause::ALL.len()],
+    /// `stream.end` records not written, by [`StreamEndCause::index`] of the reason (only the
+    /// [`StreamEndCause::RECORDED`] ones, which lead the list).
+    stream_end_suppressed: [AtomicU64; StreamEndCause::RECORDED.len()],
 }
 
 impl Default for Metrics {
@@ -173,6 +179,8 @@ impl Default for Metrics {
             taint_matches: Default::default(),
             run_lock_wait: Histogram::new(&STAGE_BUCKETS),
             wal: OnceLock::new(),
+            streams_ended: Default::default(),
+            stream_end_suppressed: Default::default(),
         }
     }
 }
@@ -571,6 +579,7 @@ impl Metrics {
             "Time a decision waited for its delegation run's lock (SR-55); only decisions whose \
              policy input includes run limits or run usage take it.",
         );
+        self.render_stream_ends(&mut out);
         out
     }
 
@@ -944,6 +953,65 @@ pub async fn track_http(State(metrics): State<Arc<Metrics>>, req: Request, next:
     res
 }
 
+/// The proxy's listen-stream endings and the `stream.end` records it did not write.
+impl Metrics {
+    /// Count one `GET` listen stream that ended, by cause.
+    pub fn stream_ended(&self, cause: StreamEndCause) {
+        self.streams_ended[cause.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one audit record not written because an earlier one of the same chain and
+    /// reason stands for it. Only `stream.end` records with a recorded reason are bounded;
+    /// anything else is ignored, so the label set stays fixed.
+    pub fn record_suppressed(&self, tool: &str, reason: StreamEndCause) {
+        if tool != STREAM_END_TOOL {
+            return;
+        }
+        if let Some(n) = self.stream_end_suppressed.get(reason.index()) {
+            n.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn render_stream_ends(&self, out: &mut String) {
+        header_lines(
+            out,
+            "proxy_streams_ended_total",
+            "GET listen streams the proxy relayed that ended, by cause: the re-check cut them \
+             (token_expired, lease_*, recheck_*), the client went away (client_disconnect), \
+             or the upstream finished or broke them (upstream_eof, upstream_error). Each \
+             stream is counted once.",
+            "counter",
+        );
+        for cause in StreamEndCause::ALL {
+            let n = self.streams_ended[cause.index()].load(Ordering::Relaxed);
+            let _ = writeln!(
+                out,
+                "{PREFIX}_proxy_streams_ended_total{{cause=\"{}\"}} {n}",
+                cause.as_str()
+            );
+        }
+        header_lines(
+            out,
+            "audit_records_suppressed_total",
+            &format!(
+                "Audit records not written because an earlier record of the same delegation \
+                 chain and reason, at most {} s older, stands for them. Only stream.end records \
+                 of GET listen streams are bounded this way; tool-call decisions never are.",
+                STREAM_END_RECORD_WINDOW.as_secs()
+            ),
+            "counter",
+        );
+        for reason in StreamEndCause::RECORDED {
+            let n = self.stream_end_suppressed[reason.index()].load(Ordering::Relaxed);
+            let _ = writeln!(
+                out,
+                "{PREFIX}_audit_records_suppressed_total{{tool=\"{STREAM_END_TOOL}\",reason=\"{}\"}} {n}",
+                reason.as_str()
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1148,5 +1216,38 @@ mod tests {
         // The older histograms keep their label-free form.
         assert!(text.contains("attenuo_authorize_duration_seconds_bucket{le=\"+Inf\"} 0\n"));
         assert!(text.contains("attenuo_authorize_duration_seconds_sum 0\n"));
+    }
+
+    #[test]
+    fn stream_ends_and_suppressed_records_have_fixed_labels() {
+        let m = Metrics::new();
+        m.stream_ended(StreamEndCause::TokenExpired);
+        m.stream_ended(StreamEndCause::ClientDisconnect);
+        m.stream_ended(StreamEndCause::ClientDisconnect);
+        m.record_suppressed(STREAM_END_TOOL, StreamEndCause::TokenExpired);
+        // Not a bounded record: ignored, no new label.
+        m.record_suppressed("tools/call", StreamEndCause::TokenExpired);
+        m.record_suppressed(STREAM_END_TOOL, StreamEndCause::UpstreamEof);
+        let text = m.render();
+        assert!(text.contains("# TYPE attenuo_proxy_streams_ended_total counter\n"));
+        assert!(text.contains("attenuo_proxy_streams_ended_total{cause=\"token_expired\"} 1\n"));
+        assert!(text.contains("attenuo_proxy_streams_ended_total{cause=\"client_disconnect\"} 2\n"));
+        for c in StreamEndCause::ALL {
+            let line = format!(
+                "attenuo_proxy_streams_ended_total{{cause=\"{}\"}} ",
+                c.as_str()
+            );
+            assert_eq!(text.matches(&line).count(), 1, "{line}");
+        }
+        assert!(text.contains(
+            "attenuo_audit_records_suppressed_total{tool=\"stream.end\",reason=\"token_expired\"} 1\n"
+        ));
+        assert_eq!(
+            text.matches("attenuo_audit_records_suppressed_total{")
+                .count(),
+            StreamEndCause::RECORDED.len()
+        );
+        assert!(!text.contains("tools/call"));
+        assert!(!text.contains("reason=\"upstream_eof\""));
     }
 }
