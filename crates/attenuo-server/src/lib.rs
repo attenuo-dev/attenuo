@@ -271,9 +271,11 @@ pub async fn prune_session_bindings(state: &Arc<AppState>) -> u64 {
 
 /// One run of lease retention (`[leases] retention_seconds`): passes of
 /// [`LeaseStore::prune_leases`](attenuo_audit::LeaseStore::prune_leases) over
-/// `maintenance_batch_rows` leases each, bounded like [`prune_session_bindings`]. A lease tree
-/// goes whole once every lease in it ended (revoked or expired) longer ago than the
-/// retention, with its subjects and bindings. Counts every deleted lease in
+/// `maintenance_batch_rows` lease rows each (looked at, read to decide a run, or deleted),
+/// bounded like [`prune_session_bindings`]. A lease tree goes whole once every lease in it
+/// ended (revoked or expired) longer ago than the retention, with its subjects and bindings;
+/// a tree wider than a pass is read to the end and then deleted over several passes, children
+/// first, and may carry over to the next run. Counts every deleted lease in
 /// `leases_pruned_total` and returns how many it deleted; 0 when retention is off.
 pub async fn prune_lease_registry(state: &Arc<AppState>) -> u64 {
     let Some(retention) = state.lease_retention else {
