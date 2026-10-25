@@ -23,7 +23,10 @@ from attenuo import (
     EvaluationUsage,
     Prefix,
     RevokeResult,
+    StatedApproval,
     StatedBudget,
+    StatedSession,
+    StatedUsage,
     Unauthorized,
 )
 
@@ -683,6 +686,96 @@ async def test_policy_evaluate_passes_a_budget_refusal_on(make: Any) -> None:
             budget=StatedBudget(calls_remaining=-1),
         )
     assert (e.value.status, e.value.error) == (400, "invalid_request")
+
+
+async def test_policy_evaluate_with_stated_session_approval_and_usage(make: Any) -> None:
+    answer = dict(
+        _EXHAUSTED,
+        decision="allow",
+        reason="policy_allow",
+        session={
+            "tainted": True, "tainted_by": ["web/fetch"], "args_contain_untrusted": True,
+            "untrusted_args": ["title"], "source": "request",
+        },
+        approval={"present": True, "by": "user"},
+        usage={"calls": 2, "amount": 15, "destination_seen": True, "source": "request"},
+    )  # fmt: skip
+    answer.pop("limit")
+    client, seen = make(lambda r: httpx.Response(200, json=answer))
+    ev = await call(
+        client,
+        "policy_evaluate",
+        "github",
+        "create_issue",
+        {"title": "x"},
+        token="t",
+        session=StatedSession(tainted_by=["web/fetch"], untrusted_args=["title"]),
+        approval=StatedApproval(by="user"),
+        usage=StatedUsage(calls=2, amount=15, destination_seen=True),
+    )
+    sent = json.loads(seen[-1].content)
+    # Members left unset are not sent; no budget block appears.
+    assert sent["session"] == {"tainted_by": ["web/fetch"], "untrusted_args": ["title"]}
+    assert sent["approval"] == {"by": "user"}
+    assert sent["usage"] == {"calls": 2, "amount": 15, "destination_seen": True}
+    assert "budget" not in sent
+    assert ev.allowed and ev.limit is None
+    assert ev.labels == EvaluationLabels(True, ["web/fetch"], True, ["title"], "request")
+    assert ev.usage == EvaluationUsage(2, 15, True, "request")
+    assert ev.approval_by == "user"
+
+    # Flags alone, an empty usage block, and raw dicts as given.
+    await call(
+        client,
+        "policy_evaluate",
+        "github",
+        "create_issue",
+        token="t",
+        session=StatedSession(tainted=True, args_contain_untrusted=False),
+        usage=StatedUsage(),
+    )
+    sent = json.loads(seen[-1].content)
+    assert sent["session"] == {"tainted": True, "args_contain_untrusted": False}
+    assert sent["usage"] == {} and "approval" not in sent
+    await call(
+        client,
+        "policy_evaluate",
+        "github",
+        "create_issue",
+        token="t",
+        session={"tainted_by": ["a/b"]},
+        approval={"by": "operator"},
+        usage={"calls": 1},
+    )
+    sent = json.loads(seen[-1].content)
+    assert (sent["session"], sent["approval"], sent["usage"]) == (
+        {"tainted_by": ["a/b"]},
+        {"by": "operator"},
+        {"calls": 1},
+    )
+
+
+async def test_policy_evaluate_passes_an_override_refusal_on(make: Any) -> None:
+    # Nothing is checked client side: a negative figure or an unknown approver reaches the
+    # server, whose 400 is raised as ApiError.
+    client, seen = make(
+        lambda r: httpx.Response(
+            400, json={"error": "invalid_request", "detail": "`usage`: bad figure"}
+        )
+    )
+    with pytest.raises(ApiError) as e:
+        await call(
+            client,
+            "policy_evaluate",
+            "github",
+            "read_file",
+            token="t",
+            usage=StatedUsage(calls=-1),
+            approval=StatedApproval(by="nobody"),  # type: ignore[arg-type]
+        )
+    assert (e.value.status, e.value.error) == (400, "invalid_request")
+    sent = json.loads(seen[-1].content)
+    assert sent["usage"] == {"calls": -1} and sent["approval"] == {"by": "nobody"}
 
 
 def _approval_body(state: str = "pending", **extra: Any) -> dict[str, Any]:

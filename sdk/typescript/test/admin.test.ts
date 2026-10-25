@@ -10,7 +10,10 @@ import {
   type Decision,
   type EvaluationBudget,
   type PolicyEvaluation,
+  type StatedApproval,
   type StatedBudget,
+  type StatedSession,
+  type StatedUsage,
 } from "../src/index.js";
 import { jsonResponse, mockFetch, Signer, tokenResponse } from "./helpers.js";
 
@@ -765,6 +768,82 @@ describe("AdminClient console endpoints", () => {
     expect(ev.approvalBy).toBe("operator");
     expect(ev.limit).toEqual({ hop: 0, kind: "calls", used: 2, max: 2 });
     expect(ev.budget!.callsRemaining).toBe(0);
+  });
+
+  it("states session labels, an approval and usage, and reads them back", async () => {
+    const answer = JSON.parse(exhausted) as Record<string, unknown>;
+    Object.assign(answer, {
+      decision: "allow",
+      reason: "policy_allow",
+      session: {
+        tainted: true,
+        tainted_by: ["web/fetch"],
+        args_contain_untrusted: true,
+        untrusted_args: ["title"],
+        source: "request",
+      },
+      approval: { present: true, by: "user" },
+      usage: { calls: 2, amount: 15, destination_seen: true, source: "request" },
+    });
+    delete answer.limit;
+    const { fetch, calls } = mockFetch(() => jsonResponse(answer));
+    const admin = new AdminClient(URL_, "adm", { fetch });
+    const session: StatedSession = { taintedBy: ["web/fetch"], untrustedArgs: ["title"] };
+    const approval: StatedApproval = { by: "user" };
+    const usage: StatedUsage = { calls: 2, amount: 15, destinationSeen: true };
+    const ev = await admin.policyEvaluate(
+      "github",
+      "create_issue",
+      { title: "x" },
+      { token: "t", session, approval, usage },
+    );
+    const sent = calls[0]!.body as Record<string, unknown>;
+    // Members left out are not sent; names are the server's; no budget block appears.
+    expect(sent.session).toEqual({ tainted_by: ["web/fetch"], untrusted_args: ["title"] });
+    expect(sent.approval).toEqual({ by: "user" });
+    expect(sent.usage).toEqual({ calls: 2, amount: 15, destination_seen: true });
+    expect(sent).not.toHaveProperty("budget");
+    expect(ev.allowed).toBe(true);
+    expect(ev.limit).toBeUndefined();
+    expect(ev.labels).toEqual({
+      tainted: true,
+      taintedBy: ["web/fetch"],
+      argsContainUntrusted: true,
+      untrustedArgs: ["title"],
+      source: "request",
+    });
+    expect(ev.usage).toEqual({ calls: 2, amount: 15, destinationSeen: true, source: "request" });
+    expect(ev.approvalBy).toBe("user");
+
+    // Flags alone and an empty usage block; empty lists are left out.
+    await admin.policyEvaluate("github", "create_issue", undefined, {
+      token: "t",
+      session: { tainted: true, taintedBy: [], argsContainUntrusted: false },
+      usage: {},
+    });
+    const second = calls[1]!.body as Record<string, unknown>;
+    expect(second.session).toEqual({ tainted: true, args_contain_untrusted: false });
+    expect(second.usage).toEqual({});
+    expect(second).not.toHaveProperty("approval");
+
+    expectTypeOf<StatedApproval["by"]>().toEqualTypeOf<"user" | "operator" | "policy">();
+    // @ts-expect-error: not an approver
+    const badApproval: StatedApproval = { by: "admin" };
+    void badApproval;
+  });
+
+  it("passes the server's refusal of a malformed override on as ApiError", async () => {
+    const { fetch, calls } = mockFetch(() =>
+      jsonResponse({ error: "invalid_request", detail: "`usage`: bad" }, 400),
+    );
+    const admin = new AdminClient(URL_, "adm", { fetch });
+    await expect(
+      admin.policyEvaluate("github", "read_file", undefined, {
+        token: "t",
+        usage: { calls: -1 },
+      }),
+    ).rejects.toMatchObject({ status: 400, error: "invalid_request" });
+    expect((calls[0]!.body as Record<string, unknown>).usage).toEqual({ calls: -1 });
   });
 
   it("passes the server's refusal of a malformed budget on as ApiError", async () => {

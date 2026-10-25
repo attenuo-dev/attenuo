@@ -38,12 +38,19 @@ from attenuo import (
     AdminClient,
     ApiError,
     AsyncClient,
+    BudgetLimit,
     Capability,
     Client,
     Denied,
     DpopKey,
+    EvaluationLabels,
+    EvaluationUsage,
     Prefix,
     RefreshError,
+    StatedApproval,
+    StatedBudget,
+    StatedSession,
+    StatedUsage,
     Token,
     TokenRefresher,
     Unauthorized,
@@ -739,6 +746,91 @@ def test_revoke_by_session(fresh_stack: Stack, caplog: pytest.LogCaptureFixture)
 # ---- cross-language export verification ------------------------------------------------------
 
 TS_DIST = ROOT / "sdk" / "typescript" / "dist" / "index.js"
+
+
+def test_dry_run_with_a_stated_budget_session_approval_and_usage(stack: Stack) -> None:
+    """The dry run's request overrides reach a real server: each answer says it decided on
+    the stated figures (``source == "request"``), a stated budget that runs out refuses with
+    the limit it hit, and nothing is charged or audited."""
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    ob = Client(stack.url)
+    root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+    coder = ob.exchange(
+        root,
+        "coder",
+        [Capability("github", "read_file").with_limits(calls=2)],
+        client_secret=CODER_SECRET,
+    )
+    read = {"repo": "alice/public-docs", "path": "README.md"}
+    head = admin.audit_head()
+
+    # From the store: a fresh run, nothing used, no labels.
+    live = admin.policy_evaluate("github", "read_file", read, token=coder)
+    assert (live.decision, live.reason) == ("allow", "policy_allow")
+    assert live.budget is not None and live.budget.source == "store" and live.budget.limited
+    assert live.labels is not None and live.labels.source == "store"
+    assert not live.labels.tainted
+
+    # Stated: one call left on the `calls: 2` limit, and a tainted run.
+    session = StatedSession(tainted_by=["web/fetch"], untrusted_args=["path"])
+    ok = admin.policy_evaluate(
+        "github",
+        "read_file",
+        read,
+        token=coder,
+        budget=StatedBudget(calls_remaining=1),
+        session=session,
+        usage=StatedUsage(calls=3, amount=7, destination_seen=True),
+    )
+    assert (ok.decision, ok.reason) == ("allow", "policy_allow") and ok.limit is None
+    assert ok.budget is not None and ok.budget.source == "request" and ok.budget.limited
+    assert ok.budget.calls_remaining == 1
+    assert ok.labels == EvaluationLabels(True, ["web/fetch"], True, ["path"], "request")
+    assert ok.usage == EvaluationUsage(3, 7, True, "request")
+
+    # The stated figures run out: refused as the live call would be, with the limit it hit.
+    spent = admin.policy_evaluate(
+        "github",
+        "read_file",
+        read,
+        token=coder,
+        budget=StatedBudget(calls_remaining=0),
+        session=session,
+    )
+    assert (spent.decision, spent.reason) == ("deny", "budget_exhausted")
+    assert spent.budget is not None and spent.budget.source == "request"
+    assert spent.labels is not None and spent.labels.source == "request"
+    assert spent.limit == BudgetLimit(hop=1, kind="calls", used=2, arg=None, max=2)
+    # A stated budget without usage decides on zero usage, said to come from the request.
+    assert spent.usage == EvaluationUsage(0, 0, False, "request")
+
+    # A stated approval: create_issue asks without one and passes with one.
+    issue = {"repo": "alice/public-docs", "title": "typo"}
+    asked = admin.policy_evaluate("github", "create_issue", issue, token=root)
+    assert asked.reason == "approval_required" and asked.approval_by is None
+    granted = admin.policy_evaluate(
+        "github", "create_issue", issue, token=root, approval=StatedApproval(by="operator")
+    )
+    assert (granted.decision, granted.approval_by) == ("allow", "operator")
+
+    # The server checks the blocks: its 400 comes back as ApiError.
+    with pytest.raises(ApiError) as bad:
+        admin.policy_evaluate("github", "read_file", read, token=coder, session={"x": True})
+    assert (bad.value.status, bad.value.error) == (400, "invalid_request")
+    with pytest.raises(ApiError) as bad_usage:
+        admin.policy_evaluate("github", "read_file", read, token=coder, usage=StatedUsage(calls=-1))
+    assert bad_usage.value.status == 400
+
+    # Nothing was audited or charged: the live run still has both calls.
+    assert admin.audit_head() == head
+    for _ in range(2):
+        assert ob.call_tool(coder, "github", "read_file", read).decision_id
+    with pytest.raises(Denied) as over:
+        ob.call_tool(coder, "github", "read_file", read)
+    assert over.value.reason == "budget_exhausted"
+    admin.revoke_lease(root.lease)
+    admin.close()
+    ob.close()
 
 
 def cli_binary() -> Path:

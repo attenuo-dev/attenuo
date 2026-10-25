@@ -341,6 +341,47 @@ export interface StatedBudget {
 }
 
 /**
+ * The run's output labels a dry run decides the call with, instead of the store's (the
+ * `session` block of `POST /admin/policies/evaluate`, ADR-0009). Members left out (or empty
+ * lists) are not sent. The answer's `labels.source` is then `request`; a malformed block is the
+ * server's 400 `invalid_request`.
+ */
+export interface StatedSession {
+  /** The `<server>/<tool>` sources the run has read untrusted output from. */
+  taintedBy?: readonly string[];
+  /** `context.session.tainted` (server default: whether `taintedBy` is non-empty). */
+  tainted?: boolean;
+  /** The call's arguments that carry a span of untrusted output. */
+  untrustedArgs?: readonly string[];
+  /** `context.args_contain_untrusted` (server default: whether `untrustedArgs` is non-empty). */
+  argsContainUntrusted?: boolean;
+}
+
+/** Who granted the approval a dry run is evaluated with. */
+export type ApprovalBy = "user" | "operator" | "policy";
+
+/**
+ * Evaluate the call as a retry that carries a granted approval (the `approval` block of
+ * `POST /admin/policies/evaluate`): `context.approval.present` is true and `by` as given. The
+ * dry run never looks up or consumes a stored approval, so it takes no id or token. The
+ * answer's `approvalBy` is then `by`.
+ */
+export interface StatedApproval {
+  by: ApprovalBy;
+}
+
+/**
+ * The run usage a dry run decides the call with (`context.usage`, the `usage` block of
+ * `POST /admin/policies/evaluate`), instead of the store's. Members left out are not sent; the
+ * server takes them as 0 or `false`. The answer's `usage.source` is then `request`.
+ */
+export interface StatedUsage {
+  calls?: number;
+  amount?: number;
+  destinationSeen?: boolean;
+}
+
+/**
  * `context.budget` of a dry run: what the run limits matching the call have left.
  * `callsRemaining` and `amountRemaining` are `Infinity` when no limit of that kind matches (the
  * server sends `2^63 - 1`, which a JavaScript number cannot hold).
@@ -403,6 +444,12 @@ export interface PolicyEvaluateOptions {
   chain?: Json;
   /** The run-limit counters to decide in, instead of the store's (`budget.source: "request"`). */
   budget?: StatedBudget;
+  /** The run's output labels to decide with, instead of the store's (`labels.source: "request"`). */
+  session?: StatedSession;
+  /** Evaluate as if the call carried a granted approval (`approvalBy` in the answer). */
+  approval?: StatedApproval;
+  /** `context.usage` to decide with, instead of the store's (`usage.source: "request"`). */
+  usage?: StatedUsage;
 }
 
 /** Filters for `approvals`. */
@@ -575,6 +622,25 @@ function statedBudgetJson(b: StatedBudget): Json {
       return e;
     });
   }
+  return out;
+}
+
+function statedSessionJson(st: StatedSession): Json {
+  const out: Json = {};
+  if (st.taintedBy !== undefined && st.taintedBy.length > 0) out.tainted_by = [...st.taintedBy];
+  if (st.tainted !== undefined) out.tainted = st.tainted;
+  if (st.untrustedArgs !== undefined && st.untrustedArgs.length > 0) {
+    out.untrusted_args = [...st.untrustedArgs];
+  }
+  if (st.argsContainUntrusted !== undefined) out.args_contain_untrusted = st.argsContainUntrusted;
+  return out;
+}
+
+function statedUsageJson(u: StatedUsage): Json {
+  const out: Json = {};
+  if (u.calls !== undefined) out.calls = u.calls;
+  if (u.amount !== undefined) out.amount = u.amount;
+  if (u.destinationSeen !== undefined) out.destination_seen = u.destinationSeen;
   return out;
 }
 
@@ -991,7 +1057,9 @@ export class AdminClient {
    * record. Pass `opts.token` (verified by the server) or `opts.chain` (checked only
    * structurally). `opts.budget` states the run-limit counters to decide in instead of the
    * store's; a spent hard limit then answers `budget_exhausted` with `limit` set, as the live
-   * call would.
+   * call would. `opts.session`, `opts.approval` and `opts.usage` state the run's output labels,
+   * a granted approval and `context.usage` the same way. Nothing is checked client side: a
+   * malformed block is the server's 400, thrown as `ApiError`.
    */
   async policyEvaluate(
     server: string,
@@ -1008,6 +1076,9 @@ export class AdminClient {
       body.subject = { ...(body.subject as Json), properties: { chain: opts.chain } };
     }
     if (opts.budget !== undefined) body.budget = statedBudgetJson(opts.budget);
+    if (opts.session !== undefined) body.session = statedSessionJson(opts.session);
+    if (opts.approval !== undefined) body.approval = { by: opts.approval.by };
+    if (opts.usage !== undefined) body.usage = statedUsageJson(opts.usage);
     const res = await this.http.post("/admin/policies/evaluate", { json: body });
     return evaluationOf(w.asObject(await w.jsonBody(res), "policy evaluation"));
   }

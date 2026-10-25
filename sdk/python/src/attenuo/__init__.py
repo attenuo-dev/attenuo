@@ -38,7 +38,10 @@ from .admin import (
     PolicySet,
     RevokeResult,
     SelectorRevocation,
+    StatedApproval,
     StatedBudget,
+    StatedSession,
+    StatedUsage,
     VerifyReport,
 )
 from .approval import (
@@ -118,7 +121,10 @@ __all__ = [
     "RevokeResult",
     "RpcError",
     "SelectorRevocation",
+    "StatedApproval",
     "StatedBudget",
+    "StatedSession",
+    "StatedUsage",
     "Token",
     "TokenRefresher",
     "Tool",

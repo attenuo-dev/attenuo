@@ -42,6 +42,7 @@ export type {
   VerifyExportOptions,
 } from "./audit.js";
 export type {
+  ApprovalBy,
   ApprovalQuery,
   AuditCheckpoint,
   AuditEntry,
@@ -73,7 +74,10 @@ export type {
   RevokeBySelectorOptions,
   RevokeResult,
   SelectorRevocation,
+  StatedApproval,
   StatedBudget,
+  StatedSession,
+  StatedUsage,
   StoredCheckpoint,
   VerifyReport,
 } from "./admin.js";
