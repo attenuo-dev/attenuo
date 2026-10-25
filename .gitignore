@@ -20,3 +20,7 @@ __pycache__/
 *.egg-info/
 .venv/
 /book/
+
+# Packed SDK tarballs (npm pack) and the Python build output of docs/release/0.1.0.md.
+*.tgz
+dist-py/
