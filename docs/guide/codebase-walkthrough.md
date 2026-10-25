@@ -3,7 +3,7 @@
 A reading-and-running plan for someone who wants to understand every piece of attenuo himself. It has five parts:
 
 1. [A one-page mental model](#1-the-mental-model): the path of one proxied tool call and one token exchange, by file and function.
-2. [Twelve reading sessions](#2-reading-sessions) of 45 to 60 minutes, each with files in order, a document to read beside them, three to six questions and a block of commands that shows the concept working.
+2. [Thirteen reading sessions](#2-reading-sessions) of 45 to 60 minutes, each with files in order, a document to read beside them, three to six questions and a block of commands that shows the concept working.
 3. [Why it is this way](#3-why-it-is-this-way): every ADR and design document in one line each.
 4. [A glossary](#4-glossary).
 5. [Things that will surprise you](#5-things-that-will-surprise-you).
@@ -18,6 +18,8 @@ Session 11 (run limits) was added for the 0.1.0 documentation refresh, and every
 
 Session 12 (audited refusals, revocation by user, chain and session, typed inputs, the policy harness, listen-stream list filtering and the new metrics) was added on the evening of 2026-10-24 for the merges #77 to #91. Every command in its block was run against `main` @ 471a319 the same day, and its file pointers were checked against that commit. Sessions 1 to 11 were not re-run for it.
 
+Session 13 (numeric `range` constraints, retention of session records, leases and run state, listen-stream endings and the `stream.end` bound, AuthZEN conformance, and the admin dry run with a stated run state) was added on 2026-10-25 for the merges #95 to #103. Every command in its block was run, in order, against `main` @ 35b2c62 the same night, and its file pointers and line counts were checked against that commit. Sessions 1 to 12 were not re-run for it.
+
 ## 0. Setup you need once
 
 ```sh
@@ -29,7 +31,7 @@ export PATH=$BIN:$PATH                # gives you `attenuo` and `attenuo-server`
 
 `fake_mcp` is a stand-in for an MCP server: it has `read_file`, `create_issue` and `delete_repo` tools, echoes calls and does nothing else. It lands in `$BIN/examples/fake_mcp`.
 
-Sessions 2, 5, 6, 7, 8, 9, 11 and 12 use a running server (session 9 starts a second one beside it, and session 12 restarts it for a clean log). Start the demo's server and fake upstream once, in a spare terminal or in the background, from the repository root:
+Sessions 2, 5, 6, 7, 8, 9, 11, 12 and 13 use a running server (session 9 starts a second one beside it, session 12 restarts it for a clean log, and session 13 ends by restarting it on a copy of the config with tiny retentions). Start the demo's server and fake upstream once, in a spare terminal or in the background, from the repository root:
 
 ```sh
 $BIN/examples/fake_mcp --port 13001 > /tmp/ob-fake.log 2>&1 &
@@ -109,7 +111,7 @@ A refusal that happens before any pipeline decision (a session opened, an exchan
 
 ## 2. Reading sessions
 
-Twelve sessions: the CLI and the demo get their own, short, session, and output labelling with approvals and run limits, which landed after the others were written, get sessions 9 and 11. Session 12 covers what the evening merges of 2026-10-24 added across the crates. In order:
+Thirteen sessions: the CLI and the demo get their own, short, session, and output labelling with approvals and run limits, which landed after the others were written, get sessions 9 and 11. Session 12 covers what the evening merges of 2026-10-24 added across the crates, and session 13 what the merges of that night (#95 to #103) added. In order:
 
 1. Core types and attenuation (`attenuo-core`).
 2. Tokens, `ou_sig` and DPoP (`attenuo-token`).
@@ -123,8 +125,9 @@ Twelve sessions: the CLI and the demo get their own, short, session, and output 
 10. Evaluation suite (with the labels and limits arms), benchmarks and fuzzing.
 11. Run limits and budgets: `limits` in the token, the charge transaction, refunds, run usage and soft limits.
 12. Refusals you can see, and revocation you can aim: audited refusals of session opens, exchanges, renewals and streams; revoke by user, chain or MCP session; typed inputs before Cedar; the policy harness; list filtering on the resumed listen stream; the new metrics.
+13. Number bounds, retention, stream endings, AuthZEN and the stated dry run: the `range` constraint; retention of session records, leases and run state on one ticker; listen-stream endings counted and `stream.end` records bounded; the AuthZEN conformance fixtures; the admin dry run told the run's budget, labels, approval and usage.
 
-Sessions 9, 11 and 12 cut across sessions 3 to 8 and are easiest after all of them; read 11 after 9, since soft limits use its approvals. Session 12 needs only sessions 5 and 6. Sessions 7, 8 and 10 are light, so merge them if you have the time.
+Sessions 9, 11 and 12 cut across sessions 3 to 8 and are easiest after all of them; read 11 after 9, since soft limits use its approvals. Session 12 needs only sessions 5 and 6. Session 13 needs sessions 1, 6 and 11, and session 12 for the refusal records. Sessions 7, 8 and 10 are light, so merge them if you have the time.
 
 Each session has four parts. Read the files in the order given, with the "read beside" document open. Answer the questions without looking, then check the run block. Tests are named so that `cargo test -p <crate> <filter>` runs a handful, not the whole suite; add `-- --nocapture` to see output.
 
@@ -909,6 +912,325 @@ What is still open (from the [task board](../tasks/board.md) and the day's log):
 - SDKs: done after this session on `feat/sdk-export-revoke-selectors`: `audit_export` / `auditExport` take `tool` and `decision`, and `revoke_by_selector` / `revokeBySelector` wrap `POST /admin/leases/revoke`.
 - Metrics: soft-limit asks are not told apart from other `approval_required` decisions (that would need policy ids as labels).
 
+Session 13 closes the listen-stream, policy-harness and SDK items above; [its open list](#session-13-number-bounds-retention-stream-endings-authzen-and-the-stated-dry-run) supersedes this one.
+
+### Session 13: number bounds, retention, stream endings, AuthZEN and the stated dry run
+
+The merges of the night of 2026-10-24 to 25 (#95 to #103) close a run of open items from sessions 11 and 12. A capability can now bound a number. The lease store finally forgets: session records, then whole runs, then their counters and approvals. The listen stream's endings are counted and their records bounded. AuthZEN has fixtures that pin the specification's shapes. The admin dry run can be told the whole run state, from the CLI, both SDKs and the console. This session reads them in that order.
+
+Read beside: the `range` paragraphs of [Capabilities and attenuation](../concepts/capabilities-and-attenuation.md) (constraint kinds and the attenuation rules), [Bounding a number](../guides/writing-policies.md#bounding-a-number-range-cedar-or-sum) in the policy guide, the retention items under [Cost and limits](../concepts/leases-and-revocation.md#cost-and-limits) in the leases concept with [`[leases]`](../reference/config.md#leases) in the configuration reference, [What gets a record](../concepts/audit-log.md#what-gets-a-record) in the audit-log concept for the `stream.end` bound, [AuthZEN conformance](../reference/authzen.md), and [Policies: read, check, dry run](../reference/http-api.md#policies-read-check-dry-run) in the HTTP API reference. The section "Admin: a dry run with a stated budget" in `sdk/python/README.md` and in `sdk/typescript/README.md` is the lookup for the SDK side. The reasoning behind each change is in [the 2026-10-24 log](../log/2026-10-24.md): the entries from 22:44 to 23:58 UTC, then the three after midnight, which sit at the top of the file.
+
+| Order | File | What it does | Lines |
+| --- | --- | --- | --- |
+| 1 | `crates/attenuo-core/src/capability.rs` (`ArgConstraint::Range`, `RawRange` and its visitor, `RangeError`, `ArgConstraint::range`, `as_long` with `WHOLE_FLOAT_MAX`, `satisfied_by`, `violation`, `implies`, `Capability::explain_denial`) | #96. The fourth constraint kind. The wire form `{"op": "range", "value": {"min": 0, "max": 2000}}` is inclusive, either bound may be left out but not both, `min <= max`, bounds are JSON integers in `i64`. The visitor is hand-written so that a misspelt `maximum`, a repeated member, a float bound and a list (`[0, 5]`, which a derived struct takes as a tuple) are refused instead of read as "no bound". `as_long` reads a value as Cedar would: an `i64`, or a whole float up to 922337203685477, so `5.0` is `5` and `"5"`, `5.5` and `null` satisfy no range. `implies` is interval containment, a missing bound being the end of `i64`; `equals` or `one_of` sits in a range when every member is an integer inside it, a range sits in them only when it holds one integer, and `prefix` and `range` never relate. | 970 |
+| 2 | `crates/attenuo-policy/src/lib.rs` (the capability check at the top of `authorize_labelled`, near line 930) | Where a range is enforced: the capability stage, before the catalog's type check (`input_type_mismatch`, session 12) and Cedar. So a fraction under a range is `capability_denied` even where the catalog declares the argument `long`. The diagnostic lists the effective capabilities and now appends, per capability whose patterns match, the first constraint the call fails: ``argument `amount` is above the maximum 2000``, `is below the minimum`, `is not an integer`, `is absent`, and for the other kinds `does not start with "acme/"` or `is not one of the permitted values`. It never prints the call's value. The proxy's `-32003` carries only the reason and decision id; the diagnostic is in the dry run and in AuthZEN answers when `[authzen] diagnostics` allows the caller. | 1310 |
+| 3 | `crates/attenuo-core/src/limits.rs` (the `Range` arm in the `sum` check), `crates/attenuo-core/tests/attenuation_props.rs`, `crates/attenuo-server/tests/range_constraint.rs`, `crates/attenuo-policy/tests/range_cases.rs` | A `sum` limit over an argument needs a constraint that admits a non-negative integer; a range does when its `max` is at least 0. The proptests now generate ranges and whole and fractional floats, and check `implies` against integer containment. The server test refuses a higher max, a lower min, a dropped bound and a dropped constraint at exchange, each audited as `exchange_widening`. | 2440 |
+| 4 | `crates/attenuo-cli/src/render.rs` (`fmt_constraint`), `sdk/python/src/attenuo/capability.py` (`Range`), `sdk/typescript/src/capability.ts` (`range`, `RangeBounds`) | The surfaces. `token inspect` prints `1 <= max_lines <= 100`, `amount <= 2000` or `amount >= 0`. There is no `--constraint` flag: a range goes in as `--cap` JSON, as every constraint always has. The SDK builders refuse what the server refuses. A range does not pin an argument against output-labelling fingerprints (only `equals` and `one_of` do), and time ranges are deferred, with the reasons in [RFC-0001 §3.1](../spec/rfc-0001-attenuo.md#31-not-yet-implemented--proposed). | 2010 |
+| 5 | `crates/attenuo-server/src/config.rs` (`LeasesConfig` near line 987, `retention`, `session_retention`, `run_state_retention`), `crates/attenuo-server/src/state.rs` (the startup warning) | #97, #100, #102. Three keys under `[leases]`, each in seconds with 0 meaning off: `session_retention_seconds` 86400, `retention_seconds` 604800, `run_state_retention_seconds` 2592000. The server warns at startup when `retention_seconds` is below `[issuer] default_ttl_seconds`, because a run can then be pruned while its token could still renew it. It warns rather than refuses: too short a value fails closed, as `lease_unknown`. | 3030 |
+| 6 | `crates/attenuo-audit/src/lease.rs` (the trait methods `prune_sessions`, `prune_leases`, `prune_run_state` near line 134; `SessionPrune`, `LeasePrune`, `lease_end`, `tree_prunable`, `RunStatePrune`, `run_state_prunable`, `approval_last_touched` near line 420; the memory store's versions near line 1134) | The three rules, written once as pure functions and used by both stores. `lease_end` is when a lease was revoked, or when it expired if it never was; `tree_prunable` asks it of every lease of a run. Each prune takes `(now, retention, max_rows)`, looks at a bounded window in insertion order, resumes after the last row it saw and reports `wrapped` at the end of the table. | 1780 |
+| 7 | `crates/attenuo-audit/src/sqlite.rs` (`prune_sessions`, `prune_leases`, `prune_run_state` near line 3378) | One `IMMEDIATE` transaction per pass under the write gate, with a `rowid` cursor. The lease pass classifies each row of its window as a top lease or not by a `NOT EXISTS` on its parent, skips a top whose own row is still live without walking its tree, and deletes the rest of each prunable run with the revocation's recursive query. The run-state pass walks the charge log, then the counters, then the approvals, with one cursor, and parses timestamps in Rust, since RFC 3339 strings with and without fractional seconds do not sort as text. | 5170 |
+| 8 | `crates/attenuo-server/src/lib.rs` (`LEASE_MAINTENANCE_PERIOD`, `LEASE_PRUNE_BATCH`, `LEASE_PRUNE_MAX_PASSES`, `prune_in_passes`, `prune_session_bindings`, `prune_lease_registry`, `prune_run_state`, `spawn_lease_maintenance`, and where `serve` starts it) | The single ticker. Every 60 s it runs the session pass, then the lease pass, then the run-state pass, each as passes of 1,000 rows on the blocking pool until one wraps or 100 have run. Sessions go first, so a binding whose run is about to go is counted as a session; run state goes last, since it waits for the leases. The task starts only when at least one retention is on. Its first tick is skipped, so the first run is one period after startup. The three counters are `lease_sessions_pruned_total`, `leases_pruned_total` and `run_state_pruned_total{kind}`, in `metrics.rs`. | 540 |
+| 9 | `crates/attenuo-server/src/routes/admin.rs` (`refund_budget`), `crates/attenuo-cli/src/main.rs` (`budget_refund`) | What a pruned charge looks like to an operator: a refund answers 404 `not_found`, exactly as for a decision that charged nothing, and the detail and the CLI line now say the charge log may have been pruned (exit 2, as before). | 2800 |
+| 10 | `crates/attenuo-proxy/src/guard.rs` (crate comment, `STREAM_END_RECORD_WINDOW`, `STREAM_END_RECORD_KEYS`, `StreamEndCause`, `of_lease_reason`, `StreamEndRecords::admit`, `StreamGuard::listen`, `impl Drop for State` near line 501), `auth.rs` (`observe_stream_end`, `observe_record_suppressed`) | #101. Every `GET` listen stream is counted once when it ends, in `proxy_streams_ended_total{cause}`. The count happens in the `Drop` of the stream's state, which runs exactly once whatever ended it, a body never polled included. A missing cause means the client went away. `StreamEndRecords` bounds the `stream.end` records of listen streams: one per (chain digest, reason) per 60 s, the first; later ends in the window keep their final event, which names the window's record, and are counted in `audit_records_suppressed_total{tool="stream.end",reason}`. | 1340 |
+| 11 | `crates/attenuo-proxy/src/proxy.rs` (`REASON_UPSTREAM_NOT_EVENT_STREAM`, `upstream_not_event_stream` near line 865) | #97. A `GET` the upstream answers with a `2xx` that is not `text/event-stream` is refused: 502, `-32005`, reason `upstream_not_event_stream`, the body dropped unread and no session adopted. It was the one path on which a list answer reached the client unfiltered and an allowed call's answer unlabelled. `405` and errors are relayed as before. | 1920 |
+| 12 | `crates/attenuo-server/tests/authzen_conformance.rs` (crate comment, `run_fixture`, `normalise`, `matches`, `comparator_is_exact_where_it_should_be`), `crates/attenuo-server/tests/fixtures/authzen/` | #99. 27 JSON fixtures, each a `_note` naming the specification section, an optional `token` (capabilities, `revoke`) and steps of request and exact expected answer. Every fixture gets a fresh root token through the dev mint, so budgets and approvals never leak between them. Only random or clock-bound values are normalised (`decision_id`, `approval_id`, `call_hash`, `expires_at`, `approval.id`, the base URL); `"<any>"` is for free-text error details; a member the fixture does not list fails. | 2160 |
+| 13 | `crates/attenuo-server/src/routes/authzen.rs` (`evaluations` near line 87, `echo_request_id` near line 192) | The two gaps the fixtures found. `X-Request-ID` is copied onto every answer of both evaluation routes, errors included, by a `route_layer` (section 10.1.3 makes it a MUST). A batch with no `evaluations`, or an empty one, is decided and answered as a single evaluation (section 7.1), where it used to be a 400. | 490 |
+| 14 | `crates/attenuo-server/src/authz.rs` (`CounterSource` and `StatedBudget` near line 232, `StatedBudget::counters`, `Pipeline::budget_view_from` near line 1071), `routes/policies.rs` (`evaluate_policies`, `budget_from_json`, `usage_from_json`, `session_from_json`) | #95. The dry run's run state. `budget_view_from(chain, call, CounterSource::Store)` is the live path (`budget_view` calls it); `CounterSource::Stated` answers each charge from the request and never touches the lease store. The answer's `budget`, `session` and `usage` each carry `source`: `store` or `request`, and `untracked` for usage when nothing reads it. With a stated `budget` and no `usage`, usage is zero and reported as `request`. | 4290 |
+| 15 | `crates/attenuo-cli/src/policy_cmd.rs` (`admin_evaluate_body` near line 267), `sdk/python/src/attenuo/admin.py` (`StatedBudget`, `BudgetLimit`, `StatedSession`, `StatedApproval`, `StatedUsage`, `policy_evaluate`), `sdk/typescript/src/admin.ts` (the same types, `policyEvaluate`), `crates/attenuo-server/ui/view-policy.js` | #95, #98, #103. `policy test --via admin-evaluate` sends each case's `session` and `usage` always (so nothing is read from the store), `approval` when the case has one and `budget` with only the members the case sets. `policy evaluate` has no flags for these blocks and reads the store. The SDKs send only what is set, under the server's names, and validate nothing beyond types; an unlimited figure is `2**63 - 1` in Python and `Infinity` in TypeScript. The console has "Budget", "Run labels" and "Run usage" sections and no approval field. | 4090 |
+
+The three retention rules side by side:
+
+| | Session records (#97) | Lease registry (#100) | Run state (#102) |
+| --- | --- | --- | --- |
+| Key, default | `session_retention_seconds`, 86400 (a day) | `retention_seconds`, 604800 (a week) | `run_state_retention_seconds`, 2592000 (30 days) |
+| What is deleted | `lease_sessions` rows (revoke by session) | a whole run, root lease and subtree: `leases`, `lease_subjects`, `lease_bindings`, `lease_sessions`, `hop_limits`, `run_labels`, `run_spans` | `budget_charges` entries (per decision), `budget_counters`, `approvals` |
+| When | the run's root lease is revoked (at once, whatever the setting), has been expired longer than the retention, or is unknown | every lease of the run has ended (revoked, or expired if never revoked) and the last ended longer ago than the retention; a revoked run waits too, counted from the revocation | only once the leases they belong to are gone from the registry; a charge entry when its charge and any refund are older than the retention, a counter when no charge under its lease is left, an approval when its creation, decision and expiry are all older |
+| What an operator loses | `lease revoke --session` finds the run no more; `--chain-id` and `--user` still reach it while its leases are kept | the run's token reads `lease_unknown` (audited as a `deny`, renewals included); `--user`, `--chain-id` and `--session` match nothing; the console's lease tree answers 404 | a refund of one of its decisions answers 404 `not_found` (as for a decision that charged nothing, so a late refund cannot be honoured and a second cannot be told from a first); its approvals leave `GET /admin/approvals` and the console |
+| What the audit log keeps | everything | every decision, issuance, renewal and revocation of the run | every decision record with its `budget` member, every `admin.budget.refund`, every `approval_request` and `approval_grant` |
+| Metric | `lease_sessions_pruned_total` | `leases_pruned_total` (deleted leases) | `run_state_pruned_total{kind}`, `kind` one of `counters`, `charges`, `approvals` |
+
+Why each piece is shaped this way:
+
+- **One constraint per argument, so `range` does not combine.** A capability maps an argument name to one `ArgConstraint`, as before. "1 to 100 but not 13" is a Cedar rule. Combining kinds would have changed the shape of every token and the `covers` rule for every pair, for a case nobody has.
+- **A range is checked before Cedar, as the delegated bound.** The policy guide's table says when to use which: `range` when the bound is part of what was delegated (chosen per token, narrowed per hop, passed by no policy or approval), a Cedar rule over `context.input` for a deployment-wide ceiling that nobody has to put in a token, and `sum` or `context.usage.amount` for a total per run. A `range` and a `sum` together stop one large payment and many small ones.
+- **`as_long` repeats the policy crate's rule.** `attenuo-core` cannot depend on `attenuo-policy`, so the 922337203685477 bound for whole floats is a repeated constant with a comment. If the two disagreed, a value could pass the capability stage and be refused or misread by Cedar, or the reverse.
+- **A range covers a `one_of` only when the range holds one integer.** `[1, 3]` does not cover `one_of [1, 2, 3]`. That is sound and keeps the rule to one line; it is open until a real exchange needs more.
+- **The diagnostic names the bound, never the value.** The value of a refused argument is what an injected agent tried to send; echoing it into logs and answers would copy attacker text into places that are read by people and tools. A test checks that a denied `31337` appears nowhere.
+- **Retention exists because nothing in the store was ever deleted.** Before #97 every issued token left a lease row, a subject and a binding forever, and every charged or gated call left counters and approval rows. The rules all keep anything a renewal could still bring back. An expired but unrevoked lease is renewable while its token is valid, so every grace period must outlast the longest token lifetime. That is why the defaults are a day and a week against a 900 s default token.
+- **Whole runs, never part of one.** Deleting a run whole keeps `ancestors_of`, `classify` and the revoke cascade honest: no surviving lease has a parent row that is gone, so the hot path never sees a known child under an unknown parent because of pruning.
+- **Revoked runs wait out the retention, counted from the revocation.** Pruning them at once was allowed and would change nothing a caller can do. Waiting keeps the run in the console tree, in revoke-by-user previews and in `lease_revoked` (rather than `lease_unknown`) refusals for a week, which is what an operator in an incident wants. Counting from the revocation matters for a lease that a user-wide revocation reached after it expired: it was renewable until then (`a_late_revocation_restarts_the_grace_period`). The session record of a revoked run goes at once all the same, since it only serves revoke-by-session and a revoked chain needs no more revoking.
+- **Run state goes per lease, and only after the leases.** Counters and charges are keyed by lease id and never joined with `leases` (ADR-0010). Once the lease rows are gone there is no way back to the run, and since runs go whole, "this lease is unknown" means "its run is gone". Deleting a counter cannot reopen a budget: every hop it counted is unknown, so their calls are refused as `lease_unknown` before any limit is read. The 30 days sit on top of the week because refunds follow billing and incident processes.
+- **One ticker, constants for cadence and batch.** No other part of the store ran periodically, so the server got one task rather than three. A pass is bounded in what it reads as well as what it deletes; measured on a file store of 100,000 leases, a deleting pass of 1,000 took 5.6 ms median and a pass over live rows 0.77 ms. A hot-path lease check that arrives during a deleting pass waits for it. The constants are open as configuration.
+- **One `stream.end` record may stand for many streams.** The volume that prompted #101 turned out to be concurrent listen streams of one token cut at the same moment (several sessions, or more than one stream), not reconnects: reopening with an expired token is refused at authentication and was never recorded (SR-18). So the bound is per chain digest and reason, the digest rather than `chain_id` so that a sub-agent's ends are not hidden behind its parent's. The first end of a window is recorded, so the log shows when the condition began. Decision records have no free-text field, so the count of suppressed ends lives only in `audit_records_suppressed_total` and in the log line of the next record. The window is a constant: no `[proxy]` or `[audit]` key fits a knob on record suppression. A table full of open windows records rather than suppresses. Tool-call decisions, other refusals and the `stream.end` of a streamed `POST` answer are never bounded.
+- **The non-SSE `GET` is refused, not filtered.** MCP allows only an event stream or `405` on `GET`. A JSON body there skipped both the list filter and output labelling, and the safe answer is 502.
+- **Fixtures compare whole answers.** A suite that checked only `decision` would notice neither a new member leaking into answers nor a header the specification requires going missing. The fixtures list the expected headers and the whole body, with a short list of normalised fields, so every change to the answer shape is a test change. A mutation check (the route layer removed) made `evaluation-request-id.json` fail.
+- **The stated dry run goes through the live limit check.** A stated `budget` is turned into counters and checked by the same loop a live call uses, so a spent hard limit answers `budget_exhausted` with the live `limit` member and diagnostic, and a refusal's `limit` can be pasted back as a `limits` entry. The one divergence left is offline: `attenuo policy test` without `--via` keeps no limit check, so a case whose chain carries a limit and whose `budget` says it is spent only sets `context.budget` there. The run block shows it.
+
+Check you understood:
+
+1. A parent holds `amount` in `0..2000`. Which of these children does the exchange accept: `10..500`; `equals 300`; `one_of [100, 2500]`; `{"min": 0}`; `prefix "1"`? Which function decides, and what reason does the audit record carry for a refusal?
+2. An agent holding `amount` in `1..100` sends `amount: 5.0`, then `amount: 5.5`, then `amount: "5"`, to a tool whose catalog declares `amount = "long"`. What does each get, at which stage, and why is the second not `input_type_mismatch`?
+3. Alice's run was revoked six days ago. With the defaults, what does a call with her coder's token get today, and what would it get two days from now if the token were still valid then? Which table rows are gone by then, and which follow thirty days later?
+4. An operator refunds a decision of a run pruned forty days ago, and then one that charged nothing. What does each answer, and where does the operator tell them apart?
+5. Three listen streams of one chain and one of another chain are open when the first chain is revoked. How many `stream.end` records are written, what do the other streams' final events say, and where is the count of the ones not recorded?
+6. A fixture expects `{"decision": true, "context": {"reason": "policy_allow", "policy_ids": [...], "diagnostics": [], "decision_id": "<decision_id>"}}` and the server starts adding `"budget"` to every answer. What happens to the suite, and what would have happened with a comparator that checked only `decision`?
+7. A case's chain carries `calls: 2` on `read_file` and its `budget` says `calls_remaining: 0`. What do `attenuo policy test` and `attenuo policy test --via admin-evaluate` say, and why do they differ?
+
+Run it. Start from the section 0 setup with a freshly started demo server. The last block restarts the server on a copy of the demo config with tiny retentions and a metrics listener, so run it last.
+
+```sh
+cargo test -p attenuo-core --lib range                   # serde, satisfaction, the violation text, implication, attenuation: 5 passed
+cargo test -p attenuo-core --test attenuation_props range # the two range proptests: 2 passed
+cargo test -p attenuo-policy --test range_cases           # range cases in policy test files: 3 passed
+cargo test -p attenuo-server --test range_constraint      # widening refused and audited, narrower child enforced: 2 passed
+
+# 1. A range in a token, a narrower child, a widening refused, a call above the max denied.
+#    fake_mcp echoes any argument, so read_file takes an extra one, max_lines, that the demo catalog does not declare.
+CAP='{"server":"github","tool":"read_file","constraints":{"max_lines":{"op":"range","value":{"min":1,"max":500}}}}'
+ROOTR=$(attenuo token root --subject alice --agent assistant --cap "$CAP" --print token)
+attenuo token inspect "$ROOTR"          # assistant  can github:read_file {1 <= max_lines <= 500}
+NARROW='{"server":"github","tool":"read_file","constraints":{"max_lines":{"op":"range","value":{"min":1,"max":100}}}}'
+C=$(printf '%s\n' demo-coder-secret | ATTENUO_TOKEN="$ROOTR" \
+  attenuo token exchange --actor coder --client-secret-stdin --cap "$NARROW" --print token)
+attenuo token inspect "$C"              # coder  can github:read_file {1 <= max_lines <= 100}
+WIDE='{"server":"github","tool":"read_file","constraints":{"max_lines":{"op":"range","value":{"min":1,"max":1000}}}}'
+printf '%s\n' demo-tester-secret | ATTENUO_TOKEN="$ROOTR" \
+  attenuo token exchange --actor tester --client-secret-stdin --cap "$WIDE"
+# error: server answered 400 Bad Request: invalid_scope: delegation chain is invalid: hop 1 widens capabilities
+#   relative to hop 0: requested capability `github:read_file{max_lines={"op":"range","value":{"min":1,"max":1000}}}` ...
+# decision <uuid>
+NOMAX='{"server":"github","tool":"read_file","constraints":{"max_lines":{"op":"range","value":{"min":1}}}}'
+printf '%s\n' demo-tester-secret | ATTENUO_TOKEN="$C" \
+  attenuo token exchange --actor tester --client-secret-stdin --cap "$NOMAX"
+# error: ... hop 2 widens capabilities relative to hop 1 ...    dropping the upper bound is widening too
+attenuo token root --subject alice --agent assistant \
+  --cap '{"server":"github","tool":"read_file","constraints":{"max_lines":{"op":"range","value":{"min":10,"maximum":5}}}}'
+# error: invalid capability JSON ...: unknown field `maximum`, expected `min` or `max` ...   refused before anything is sent
+
+export ATTENUO_TOKEN="$C"
+attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=a --arg max_lines:=50     # ALLOWED
+attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=a --arg max_lines:=50.0   # ALLOWED: a whole float is 50
+attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=a --arg max_lines:=150
+# DENIED  capability_denied, then the decision id; exit status 2. The -32003 carries only the reason and the id.
+attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=a --arg max_lines:='"50"'  # DENIED  capability_denied
+attenuo policy evaluate --server github --tool read_file --arg repo=alice/public-docs --arg path=a --arg max_lines:=150
+# DENY  capability_denied ...
+# diagnostic: call github:read_file is not permitted by the effective capabilities
+#   [github:read_file{max_lines={"op":"range","value":{"min":1,"max":100}}}]; github:read_file: argument `max_lines` is above the maximum 100
+attenuo policy evaluate --server github --tool read_file --arg repo=alice/public-docs --arg path=a --arg max_lines:=7.5
+# ... argument `max_lines` is not an integer          (also: is below the minimum 1, for 0; is absent, without it)
+unset ATTENUO_TOKEN
+attenuo audit tail --decision deny
+# ... DENY  attenuo/token.exchange  assistant for alice           reason=exchange_widening ...
+# ... DENY  attenuo/token.exchange  assistant > coder for alice   reason=exchange_widening ...
+# ... DENY  github/read_file        assistant > coder for alice   reason=capability_denied ...   (twice)
+
+# 2. Listen-stream endings and the stream.end bound need an upstream with a listen stream (fake_mcp answers GET with 405).
+cargo test -p attenuo-proxy --lib guard::                       # the window, the cause labels, each way a stream ends: 10 passed
+cargo test -p attenuo-proxy --test security_pass3 leave_one_record   # one record for several streams of a chain: 2 passed
+cargo test -p attenuo-proxy --test list_filtering a_get_answered     # the non-SSE GET refused (502), 405 and errors relayed: 2 passed
+
+# 3. AuthZEN conformance: the fixtures, then the two fixed gaps by hand.
+cargo test -p attenuo-server --test authzen_conformance         # every fixture, and the comparator's own test: 2 passed
+ls crates/attenuo-server/tests/fixtures/authzen/ | wc -l        # 27
+R=$(attenuo token root --subject alice --agent assistant --cap 'github:*' --print token)
+Q='{"subject":{"type":"agent","id":""},"action":{"name":"read_file"},"resource":{"type":"tool","id":"github/read_file"},"context":{"input":{"repo":"alice/public-docs","path":"a"}}}'
+curl -s -i $ATTENUO_SERVER/access/v1/evaluation -H "Authorization: Bearer $R" -H 'X-Request-ID: drill-42' \
+  -H 'Content-Type: application/json' -d "$Q" | grep -i -E '^HTTP|^x-request-id'
+# HTTP/1.1 200 OK
+# x-request-id: drill-42
+curl -s -i $ATTENUO_SERVER/access/v1/evaluation -H "Authorization: Bearer garbage" -H 'X-Request-ID: drill-43' \
+  -H 'Content-Type: application/json' -d "$Q" | grep -i -E '^HTTP|^x-request-id'
+# HTTP/1.1 401 Unauthorized
+# x-request-id: drill-43                                         echoed on errors too
+curl -s $ATTENUO_SERVER/access/v1/evaluations -H "Authorization: Bearer $R" \
+  -H 'Content-Type: application/json' -d "${Q%\}},\"evaluations\":[]}"; echo
+# {"decision":true,"context":{"reason":"policy_allow",...}}      an empty batch is one evaluation, answered as one
+curl -s $ATTENUO_SERVER/access/v1/evaluations -H "Authorization: Bearer $R" \
+  -H 'Content-Type: application/json' -d "${Q%\}},\"evaluations\":[{}],\"options\":{\"evaluations_semantic\":\"deny_on_first_deny\"}}"; echo
+# {"error":"invalid_request","detail":"evaluations_semantic `deny_on_first_deny` is not supported; use `execute_all`"}
+
+# 4. The dry run with a stated run state, from the CLI: the same cases offline and through the server.
+cat > /tmp/ob-dry_test.yaml <<EOF
+policies: $PWD/examples/github-leak-demo/policy.cedar
+catalog: $PWD/examples/github-leak-demo/config.toml
+cases:
+  - name: one call left of two, so the read goes through
+    chain:
+      - agent: assistant
+        capabilities: [{server: github, tool: read_file, limits: {calls: 2}}]
+    budget: { calls_remaining: 1 }
+    call: { server: github, tool: read_file, arguments: { repo: alice/public-docs, path: a } }
+    expect: allow
+    reason: policy_allow
+  - name: none left, so the server's own limit check refuses it before Cedar
+    chain:
+      - agent: assistant
+        capabilities: [{server: github, tool: read_file, limits: {calls: 2}}]
+    budget: { calls_remaining: 0 }
+    call: { server: github, tool: read_file, arguments: { repo: alice/public-docs, path: a } }
+    expect: deny
+    reason: budget_exhausted
+  - name: a tainted run that already used the tool, and an approval by the user
+    chain: [{ agent: assistant, capabilities: ["github:*"] }]
+    session: { tainted_by: [github/read_file] }
+    usage: { calls: 3 }
+    approval: { by: user }
+    call: { server: github, tool: create_issue, arguments: { repo: alice/public-docs, title: hi } }
+    expect: allow
+    reason: policy_allow
+EOF
+attenuo policy test /tmp/ob-dry_test.yaml
+# ✗ none left, so the server's own limit check refuses it before Cedar  (allow: policy_allow ...)
+# 2 passed, 1 failed ...; exit status 2: offline, budget only sets context.budget (the documented divergence)
+attenuo policy test --via admin-evaluate /tmp/ob-dry_test.yaml
+# ✓ none left, ...  (deny: budget_exhausted)
+# 3 passed, 0 failed (3 cases in 1 file); nothing audited, nothing charged
+# The CLI prints the decision, not the answer's sources. The route itself, with a stated budget and session:
+R=$(attenuo token root --subject alice --agent assistant \
+  --cap '{"server":"github","tool":"read_file","limits":{"calls":2}}' --print token)
+curl -s $ATTENUO_SERVER/admin/policies/evaluate -H "Authorization: Bearer $ATTENUO_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' -d @- <<EOF | python3 -m json.tool
+{"token": "$R",
+ "subject": {"type": "agent", "id": ""},
+ "action": {"name": "read_file"},
+ "resource": {"type": "tool", "id": "github/read_file", "properties": {"server": "github"}},
+ "context": {"input": {"repo": "alice/public-docs", "path": "a"}},
+ "budget": {"calls_remaining": 0},
+ "session": {"tainted_by": ["github/read_file"]}}
+EOF
+# "reason": "budget_exhausted", "diagnostics": ["limit `calls` of hop 0 would be exceeded: max 2, used 2"],
+# "session": {"tainted": true, ..., "source": "request"}, "budget": {..., "calls_remaining": 0, ..., "source": "request"},
+# "usage": {"calls": 0, ..., "source": "request"}, "limit": {"hop": 0, "kind": "calls", "max": 2, "used": 2}
+
+# 5. The same from Python (the section 8 venv, or PYTHONPATH as below).
+PYTHONPATH=sdk/python/src python3 - <<'PY'
+from attenuo import (AdminClient, Capability, StatedApproval, StatedBudget,
+                     StatedSession, StatedUsage)
+
+admin = AdminClient("http://127.0.0.1:18080", "demo-admin-token")
+root = admin.mint_root_dev("alice", "https://idp.example", "assistant",
+                           [Capability("github", "read_file").with_limits(calls=2), "github:create_issue"])
+read = {"repo": "alice/public-docs", "path": "a"}
+ev = admin.policy_evaluate("github", "read_file", read, token=root)
+print(ev.reason, ev.budget.calls_remaining, ev.budget.source, ev.labels.source, ev.usage.source)
+# policy_allow 2 store store untracked
+ev = admin.policy_evaluate("github", "read_file", read, token=root, budget=StatedBudget(calls_remaining=0))
+print(ev.reason, ev.limit, ev.budget.source, ev.usage.source)
+# budget_exhausted BudgetLimit(hop=0, kind='calls', used=2, arg=None, max=2) request request
+issue = {"repo": "alice/public-docs", "title": "hi"}
+print(admin.policy_evaluate("github", "create_issue", issue, token=root).reason)
+# approval_required
+ev = admin.policy_evaluate("github", "create_issue", issue, token=root,
+                           session=StatedSession(tainted_by=["github/read_file"]),
+                           usage=StatedUsage(calls=3), approval=StatedApproval(by="user"))
+print(ev.reason, ev.approval_by, ev.labels.tainted_by, ev.labels.source, ev.usage.calls, ev.usage.source)
+# policy_allow user ['github/read_file'] request 3 request
+PY
+
+# 6. And from TypeScript, against the built package (npm ci && npm run build in sdk/typescript, as in section 8).
+node --input-type=module - <<'JS'
+import { AdminClient, capability, withLimits } from "./sdk/typescript/dist/index.js";
+const admin = new AdminClient("http://127.0.0.1:18080", "demo-admin-token");
+const root = await admin.mintRootDev("alice", "https://idp.example", "assistant", {
+  capabilities: [withLimits(capability("github", "read_file"), { calls: 2 }), "github:create_issue"],
+});
+const read = { repo: "alice/public-docs", path: "a" };
+let ev = await admin.policyEvaluate("github", "read_file", read, { token: root });
+console.log(ev.reason, ev.budget?.callsRemaining, ev.budget?.source, ev.labels?.source, ev.usage?.source);
+// policy_allow 2 store store untracked
+ev = await admin.policyEvaluate("github", "read_file", read, { token: root, budget: { callsRemaining: 0 } });
+console.log(ev.reason, ev.limit, ev.budget?.source, ev.usage?.source);
+// budget_exhausted { hop: 0, kind: 'calls', used: 2, max: 2 } request request
+ev = await admin.policyEvaluate("github", "create_issue", { repo: "alice/public-docs", title: "hi" }, {
+  token: root, session: { taintedBy: ["github/read_file"] }, usage: { calls: 3 }, approval: { by: "user" },
+});
+console.log(ev.reason, ev.approvalBy, ev.labels?.taintedBy, ev.labels?.source, ev.usage?.calls, ev.usage?.source);
+// policy_allow user [ 'github/read_file' ] request 3 request
+JS
+attenuo audit verify            # audit chain OK: 21 entries verified, on a server that ran only this block so far; the dry-run route never appends
+
+# 7. Retention: tiny retentions, one revoked run, one maintenance period. There is no route or flag that runs a
+#    pass on demand, so the block waits for the ticker (60 s after startup, then every 60 s) and watches /metrics.
+cargo test -p attenuo-audit --test run_state                    # run state kept while the leases are there, pruned after: 5 passed
+cargo test -p attenuo-audit --test leases prune                 # session and lease passes, bounded and resuming: 6 passed
+pkill -x attenuo-server; sleep 1
+cp examples/github-leak-demo/config.toml /tmp/ob-retention.toml
+cat >> /tmp/ob-retention.toml <<'EOF'
+
+[leases]
+retention_seconds = 1
+session_retention_seconds = 1
+run_state_retention_seconds = 1
+
+[metrics]
+enabled = true
+listen = "127.0.0.1:19100"
+EOF
+RUST_LOG=warn attenuo-server --config /tmp/ob-retention.toml > /tmp/ob-server.log 2>&1 &
+sleep 2
+grep -o '\[leases\] retention_seconds is below.*lease_unknown' /tmp/ob-server.log
+# [leases] retention_seconds is below [issuer] default_ttl_seconds: a chain can be pruned while its token is still
+#   valid, and its renewal then fails as lease_unknown
+ROOTJ=$(attenuo --json token root --subject alice --agent assistant \
+  --cap '{"server":"github","tool":"read_file","limits":{"calls":5}}')
+R=$(printf '%s' "$ROOTJ" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+L=$(printf '%s' "$ROOTJ" | python3 -c 'import json,sys; print(json.load(sys.stdin)["lease"])')
+C=$(printf '%s\n' demo-coder-secret | ATTENUO_TOKEN="$R" \
+  attenuo token exchange --actor coder --client-secret-stdin --cap github:read_file --print token)
+ATTENUO_TOKEN="$C" attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=a   # ALLOWED, charged
+D=$(attenuo --json audit tail -n 5 | python3 -c 'import json,sys
+r = [json.loads(l)["record"] for l in sys.stdin if l.strip()]
+print([x for x in r if x["kind"] == "decision" and x["decision"] == "allow"][-1]["id"])')
+attenuo lease revoke --session fake-session-1 --preview          # chains <root lease>, matched 2 lease(s): the binding exists
+attenuo lease revoke --chain-id "$L" --reason "retention drill"  # revoked 2 lease(s)
+ATTENUO_TOKEN="$C" attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=b   # DENIED  lease_revoked
+curl -s http://127.0.0.1:19100/metrics | grep -E '^attenuo_(lease_sessions_pruned|leases_pruned|run_state_pruned)_total'
+# attenuo_lease_sessions_pruned_total 0
+# attenuo_leases_pruned_total 0
+# attenuo_run_state_pruned_total{kind="counters"} 0     (and charges 0, approvals 0)
+until curl -s http://127.0.0.1:19100/metrics | grep -q '^attenuo_leases_pruned_total [1-9]'; do sleep 5; done   # about a minute
+curl -s http://127.0.0.1:19100/metrics | grep -E '^attenuo_(lease_sessions_pruned|leases_pruned|run_state_pruned)_total'
+# attenuo_lease_sessions_pruned_total 1
+# attenuo_leases_pruned_total 2
+# attenuo_run_state_pruned_total{kind="counters"} 2     the root's and the coder's counters
+# attenuo_run_state_pruned_total{kind="charges"} 1      the one charged decision
+# attenuo_run_state_pruned_total{kind="approvals"} 0
+ATTENUO_TOKEN="$C" attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=c   # DENIED  lease_unknown
+curl -s -X POST $ATTENUO_SERVER/token/renew -H "Authorization: Bearer $C"; echo
+# {"error":"invalid_grant","detail":"an ancestor lease is not live: lease_unknown","decision_id":"<uuid>"}
+attenuo lease tree "$L"                     # error: server answered 404 Not Found: not_found: unknown lease `<root lease>`
+attenuo lease revoke --chain-id "$L" --preview       # matched 0 lease(s)
+attenuo lease revoke --session fake-session-1 --preview   # chains none recorded for this session
+attenuo budget refund "$D" --reason late
+# error: no charge is recorded for decision <uuid> (it charged no run limit or run usage, or its charge log was pruned);
+#   nothing to refund                       exit status 2
+attenuo audit tail -n 4
+# #6  ... ALLOW attenuo/admin.lease.revoke  by urn:attenuo:admin  reason=admin_action ...
+# #7  ... DENY  github/read_file      assistant > coder for alice  reason=lease_revoked ...
+# #8  ... DENY  github/read_file      assistant > coder for alice  reason=lease_unknown ...
+# #9  ... DENY  attenuo/lease.renew   assistant > coder for alice  reason=lease_unknown ...
+attenuo audit verify                        # audit chain OK: 9 entries verified: the log kept everything
+pkill -x attenuo-server; sleep 1            # back to the demo config for the other sessions:
+RUST_LOG=warn attenuo-server --config examples/github-leak-demo/config.toml > /tmp/ob-server.log 2>&1 &
+```
+
+Every command in the block was run in this order against `main` @ 35b2c62 on 2026-10-25, with debug binaries, on a freshly started demo server and `fake_mcp`, and prints what is quoted, the test counts included; ids, leases and times differ on every run. The Python block ran the repository's sources through `PYTHONPATH` in a virtual environment with the SDK's dependencies, and the TypeScript block the package built by `npm run build`. Three things are not shown live. One is a `stream.end` record and its bound, since `fake_mcp` answers `GET` with `405`: the `guard::` and `leave_one_record` tests above cut real listen streams, and `a_listen_stream_cut_by_revocation_is_audited` in `crates/attenuo-server/tests/e2e.rs` checks `proxy_streams_ended_total{cause="lease_revoked"} 1` end to end. Another is the console's "Budget", "Run labels" and "Run usage" sections, which `scripts/console-smoke.sh` exercises in a browser (not run for this page). The last is the startup timing of retention: the ticker skips its first tick, so the wait in block 7 is about a minute after the server started, whatever the retentions say; the server-side proofs with a clock moved days back are `lease_trees_of_ended_chains_are_pruned` and `bindings_of_revoked_chains_are_pruned` in `crates/attenuo-server/tests/admin_revoke_session.rs` and `run_state_of_pruned_runs_is_pruned_past_its_retention` in `crates/attenuo-server/tests/approvals.rs` (all three pass on that commit).
+
+What is still open after this session (from the [task board](../tasks/board.md) and the logs of these merges; this list supersedes session 12's):
+
+- Release: 0.1.0 waits on the maintainer (Actions billing, the tag, making the repository public, the package names, the manual publishes).
+- Constraints: time ranges, deferred until a tool argument needs one; no `--constraint` shorthand on the CLI (it would be the first non-JSON constraint syntax, so it should cover every kind); a range covering a small `one_of` is refused; the fuzz targets that now generate ranges were type-checked, not run. In the token claims, `evidence` on the originating user and a stable `chain_id` are still to be reconciled or dropped.
+- Revocation and leases: revoking by the audit `session_tag`; the optional proxy lease cache; a lost session binding is only a log line.
+- Retention: a refund of a pruned charge cannot be told from one of a decision that charged nothing (both 404 `not_found`, exit 2) without the audit log; the maintenance cadence and batch are constants; a lease pass reads the subtree of every prunable run on top of its 1,000-row window, so a very wide run makes that pass longer; the run-state pass's per-row lookups were not measured.
+- Proxy: Cedar-aware list filtering; a client that keeps reopening a listen stream (or sends any undecided request) on a revoked lease still adds one `http.GET` `deny` per request, unbounded; the `stream.end` window is a constant and the suppressed count is in the metric and log only; a large non-list event on the listen stream costs about 0.7 ms per 85 KB to parse and re-serialize.
+- AuthZEN: the Search APIs, `deny_on_first_deny` and `permit_on_first_permit`, discovery `capabilities` and `signed_metadata`, and the `Content-Type` check are not implemented; error bodies stay JSON objects ([AuthZEN conformance](../reference/authzen.md#not-implemented)).
+- Dry run: the console's form has no approval field (the SDKs and `policy test` carry one); the route ignores members of `approval` other than `by`, while `session` and `usage` refuse unknown members; offline `policy test` does not enforce chain limits.
+- Server and identity: real admin authentication; actor tokens against a live SPIRE; hop-0 hardening (a shared replay cache, `private_key_jwt`, ID-JAG drafts).
+- SDKs: publishing to PyPI and npm, streaming responses, hop-0 against a live IdP; one intermittent Python integration failure (`test_dpop_server_nonce`, suspected) is still being watched.
+- Evaluation and performance: the remaining test-split cases and a model in the loop; the injection suite's `stage_of` in `evaluation/injection-suite/harness.py` still does not know `input_type_mismatch`, so two held-out cases will score their mistyped attack calls as stage `other` (still denied); run limits phase 3; the open benchmark and performance items on the board (a quiet reference machine above all).
+- Metrics: soft-limit asks are not told apart from other `approval_required` decisions (that would need policy ids as labels).
+
 ## 3. Why it is this way
 
 One line per decision. The ADRs record a decision and what was rejected; the design pages record how something works and why it was built that way.
@@ -954,7 +1276,7 @@ One line per decision. The ADRs record a decision and what was rejected; the des
 | **Hop** | One link in a delegation chain: an agent, the capabilities it was given, its lease id and its times. Hop 0 is the root; hop n+1 is made by exchanging a hop-n token. |
 | **Chain** | The originating user plus the hops from the root agent down to the token's holder (`DelegationChain`). Each hop's capabilities are a subset of the one above. |
 | **Originating user** | The human the whole chain acts for: subject, issuer, attributes. Fixed at the root and covered by `ou_sig`. |
-| **Capability** | A `server:tool` pattern with optional argument constraints (`Eq`, `OneOf`, `Prefix`) and optional run limits. What a hop may ever do. |
+| **Capability** | A `server:tool` pattern with optional argument constraints (`Eq`, `OneOf`, `Prefix`, and since #96 `Range`) and optional run limits. What a hop may ever do. |
 | **Attenuation** | Handing a sub-agent a subset of your own capabilities, never more. Enforced by `Capability::covers` and `CapabilitySet::attenuate` when a hop is added and again on every validation. |
 | **Lease** | A server-side record per hop with an expiry. A call is allowed only if every lease in the chain is unrevoked and unexpired. Holders renew; revoking one lease kills its descendants. |
 | **Actor token** | An RFC 8693 credential (for example a SPIFFE JWT-SVID) that proves which agent is asking for a delegation. Single use. Alternative to a client secret. Not the same as the delegation token the exchange returns. |
@@ -993,6 +1315,9 @@ One line per decision. The ADRs record a decision and what was rejected; the des
 | **Refund** | `LeaseStore::refund`: give back exactly what one decision charged, once. The pipeline does it when a charged decision's audit append fails; an operator does it with `attenuo budget refund` (`POST /admin/budgets/refund`, audited as `admin.budget.refund`) for a call whose effect did not happen. |
 | **`distinct`** | The limit kind that counts different values of an argument. One `distinct_value` row per value seen (a keyed hash) and one count row; a value already seen adds nothing, and a refund removes the value rows its decision added. |
 | **Run usage, soft limit** | Run usage: per run (`chain_id`) and destructive tool, the calls allowed, the catalog's `amount` input summed and whether its `destination` was seen, kept with no figure in any token and shown to Cedar as `context.usage`. A soft limit is a policy over it marked `@obligation("approval")` (such as `ask_on_repeat_payment`): it asks instead of refusing, and the approved call is counted, so the next one asks again. Token limits are always hard. |
+| **`range`** | The constraint kind that bounds an integer argument, both ends inclusive: `{"op": "range", "value": {"min": 0, "max": 2000}}`, one bound optional. Read as Cedar reads a number (`as_long`), checked at the capability stage, narrowed by interval containment at exchange. Session 13. |
+| **Retention, lease maintenance** | The three `[leases]` rules that delete what can no longer be used (session records, whole ended runs, then their counters, charge log and approvals), run by one background task every minute (`spawn_lease_maintenance`) in bounded passes. The audit log is never pruned. Session 13. |
+| **`stream.end` bound** | At most one `stream.end` record per delegation chain (digest) and reason per 60 s for `GET` listen streams (`StreamEndRecords`); later ends in the window name that record in their final event and are counted in `audit_records_suppressed_total`. Every listen stream's end is counted in `proxy_streams_ended_total{cause}`. |
 | **SR-n, F-n** | Finding numbers from the security reviews (SR) and the fuzzing campaign (F). Comments and changelog entries cite them. |
 
 ## 5. Things that will surprise you
@@ -1031,5 +1356,11 @@ Each of these is deliberate, and most were found by a review or the fuzzers. Whe
 - **A session revocation follows whoever opened the session first.** The binding in `lease_sessions` is write-once per session and upstream, so with `fake_mcp`, which gives every response `fake-session-1`, revoking that session revokes the first run that called after the server started. A real upstream assigns a new id per session.
 - **`resources/unsubscribe` needs no capability.** It is on the passthrough allowlist (#90), so a capability or policy that names it has no effect any more; `resources/subscribe` is still decided.
 - **A number in a declared string is no longer `policy_error`.** It is `input_type_mismatch`, decided before Cedar, even when no policy reads the argument. An undeclared argument, or any argument of a tool missing from the catalog, is still passed to Cedar as it is.
+
+- **A fraction under a `range` is `capability_denied`, not `input_type_mismatch`.** The capability stage runs before the catalog's type check, so `5.5`, `"5"` or a missing argument under a range never reaches it, even where the catalog declares the argument `long`. A whole float such as `5.0` passes as `5`. The `-32003` names only the reason; the bound that was missed is in the dry run's diagnostic.
+- **A pruned run reads as if it never existed.** After the lease retention, its token is `lease_unknown` (not `lease_revoked`), its lease tree is a 404, and after the run-state retention an operator refund of its decisions is a 404 indistinguishable from "this decision charged nothing". Only the audit log still knows. Set the retentions above the longest token lifetime and refund window you have.
+- **Nothing is pruned in the first minute, and nothing prunes on demand.** The maintenance ticker skips its first tick and has no route or flag; a retention of one second still waits for the next tick.
+- **One `stream.end` record can stand for many streams.** Concurrent listen streams of one chain cut for the same reason within 60 s leave one record, naming the first stream's server and session; the count is only in a metric and the log. Reopening on a revoked lease, by contrast, is one `http.GET` record per request.
+- **An empty AuthZEN batch is not an empty list.** `POST /access/v1/evaluations` with no `evaluations`, or `[]`, is decided as a single evaluation and answered as `{decision, context}`, as the specification says (section 7.1), not as `{"evaluations": []}`.
 
 When something in the code looks over-cautious, grep its `SR-` or `F` number in the three security reviews, the [fuzzing page](../design/fuzzing.md) and `CHANGELOG.md`; the reason is almost always written down there.
