@@ -594,6 +594,101 @@ async fn dry_run_says_untracked_when_the_engine_keeps_no_usage() {
     assert_eq!(v["usage"]["source"], "request");
 }
 
+/// The override blocks (`approval`, `session`, `usage`, `budget`) take only their own members:
+/// an unknown or misspelt one is 400 `invalid_request` naming it, never ignored, so a typo
+/// such as `approved_by` cannot quietly mean "no approval". An `approval` block without `by`
+/// (an empty one included) is refused rather than read as granted or as absent; `null` is
+/// absent, as for the other blocks.
+#[tokio::test]
+async fn dry_run_override_blocks_refuse_unknown_members() {
+    let h = Harness::start().await;
+    let root = h.mint_root(&["github:*"]).await;
+    let body = with_token(
+        call_body("create_issue", json!({"repo": "alice/public-site"})),
+        &root.token,
+    );
+    let with = |key: &str, block: Value| {
+        let mut b = body.clone();
+        b[key] = block;
+        b
+    };
+
+    let (status, v) = h
+        .evaluate(with("approval", json!({"by": "operator"})))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["approval"], json!({"present": true, "by": "operator"}));
+    let (status, v) = h.evaluate(with("approval", Value::Null)).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["approval"]["present"], false, "{v}");
+
+    let refused = [
+        (
+            "approval",
+            json!({"by": "user", "approved_by": "operator"}),
+            "`approval`: unknown member `approved_by`",
+        ),
+        (
+            "approval",
+            json!({"approved_by": "operator"}),
+            "`approval`: unknown member `approved_by`",
+        ),
+        (
+            "approval",
+            json!({"by": "user", "id": "a1"}),
+            "unknown member `id`",
+        ),
+        ("approval", json!({}), "`approval`: `by` is required"),
+        (
+            "approval",
+            json!({"by": null}),
+            "`approval`: `by` is required",
+        ),
+        (
+            "approval",
+            json!({"by": "admin"}),
+            "`approval`: `by` must be",
+        ),
+        ("approval", json!({"by": 1}), "`approval`: `by` must be"),
+        (
+            "approval",
+            json!("operator"),
+            "`approval`: expected an object",
+        ),
+        (
+            "session",
+            json!({"tainted_by": ["github/read_file"], "taint": true}),
+            "`session`: unknown member `taint`",
+        ),
+        // The unknown member is named even when a known one is malformed too.
+        (
+            "session",
+            json!({"tainted": "yes", "taint": true}),
+            "`session`: unknown member `taint`",
+        ),
+        (
+            "usage",
+            json!({"calls": 1, "destination": true}),
+            "`usage`: unknown member `destination`",
+        ),
+        (
+            "budget",
+            json!({"calls_remaining": 1, "remaining": 1}),
+            "`budget`: unknown member `remaining`",
+        ),
+    ];
+    for (key, block, msg) in refused {
+        let (status, v) = h.evaluate(with(key, block.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{key}: {block}: {v}");
+        assert_eq!(v["error"], "invalid_request", "{key}: {block}: {v}");
+        let detail = v.to_string();
+        assert!(
+            detail.contains(msg),
+            "{key}: {block}: wanted {msg:?} in {v}"
+        );
+    }
+}
+
 /// Without a policy file there is nothing to check; reading reports an empty set.
 #[tokio::test]
 async fn no_policy_file_reads_empty_and_check_is_409() {
