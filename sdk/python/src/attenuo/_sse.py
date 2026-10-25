@@ -10,7 +10,9 @@ the stream ends is dropped. It refuses an event (or a single line) over ``max_ev
 from __future__ import annotations
 
 import json
+import math
 import re
+import time
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, TypeGuard
@@ -44,6 +46,29 @@ _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}
 
 _LINE_END = re.compile(rb"\r\n|\r|\n")
 _BOM = b"\xef\xbb\xbf"
+
+
+def check_deadline(deadline: float | None) -> None:
+    """Refuse a stream ``deadline`` that is not a positive, finite number of seconds."""
+    if deadline is not None and not (deadline > 0 and math.isfinite(deadline)):
+        raise ValueError("deadline must be a positive number of seconds")
+
+
+class Deadline:
+    """The optional total deadline of a streamed call (SR-82), counted from its creation.
+
+    The idle timeout restarts on every read, so an upstream that sends a keep-alive comment
+    every few seconds would hold the call open forever without it. :meth:`check` runs between
+    reads and raises once the deadline has passed.
+    """
+
+    def __init__(self, seconds: float | None) -> None:
+        self.seconds = seconds
+        self.end = None if seconds is None else time.monotonic() + seconds
+
+    def check(self) -> None:
+        if self.end is not None and time.monotonic() >= self.end:
+            raise AttenuoError(f"stream deadline of {self.seconds:g}s elapsed")
 
 
 @dataclass(frozen=True)

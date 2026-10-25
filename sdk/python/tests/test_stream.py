@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import time
@@ -470,3 +471,89 @@ async def test_stream_with_dpop_retries_once_on_use_dpop_nonce(make: Any) -> Non
     assert claims["htm"] == "POST" and claims["htu"] == f"{BASE}/mcp/github"
     assert retry.content == first.content
     assert isinstance(rec, Recorder)
+
+
+# --- the total deadline (SR-82 part 2) -------------------------------------------------------
+
+
+class KeepAlives(httpx.SyncByteStream, httpx.AsyncByteStream):
+    """A body that sends `tail` and then a keep-alive comment every 20 ms, forever; `closed`
+    records that the client closed the response."""
+
+    def __init__(self, closed: list[bool], tail: bytes) -> None:
+        self.closed, self.tail = closed, tail
+
+    def __iter__(self) -> Iterator[bytes]:
+        if self.tail:
+            yield self.tail
+        while True:
+            yield b":\n\n"
+            time.sleep(0.02)
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        if self.tail:
+            yield self.tail
+        while True:
+            yield b":\n\n"
+            await asyncio.sleep(0.02)
+
+    def close(self) -> None:
+        self.closed.append(True)
+
+    async def aclose(self) -> None:
+        self.closed.append(True)
+
+
+def keep_alive_handler(closed: list[bool], tail: bytes = b"") -> Any:
+    def handler(r: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=KeepAlives(closed, tail), headers=SSE)
+
+    return handler
+
+
+async def run_stream(kind: str, handler: Any, **kw: Any) -> tuple[list[StreamEvent], Any]:
+    if kind == "sync":
+        with Client(BASE, transport=httpx.MockTransport(handler)) as ob:
+            return await collect_until_error(ob.call_tool_stream("TOK", "srv", "t", **kw))
+    async with AsyncClient(BASE, transport=httpx.MockTransport(handler)) as aob:
+        return await collect_until_error(aob.call_tool_stream("TOK", "srv", "t", **kw))
+
+
+@pytest.mark.parametrize("kind", ["sync", "async"])
+async def test_stream_of_keep_alives_ends_at_the_deadline_sr82(kind: str) -> None:
+    closed: list[bool] = []
+    handler = keep_alive_handler(closed, event(progress(1)).encode())
+    start = time.monotonic()
+    seen, err = await run_stream(kind, handler, deadline=0.2)
+    elapsed = time.monotonic() - start
+    assert isinstance(err, AttenuoError)
+    assert "stream deadline of 0.2s elapsed" in str(err)
+    assert [ev.method for ev in seen] == ["notifications/progress"]
+    assert 0.2 <= elapsed < 0.8
+    assert closed == [True]  # the response was closed
+
+
+@pytest.mark.parametrize("kind", ["sync", "async"])
+async def test_stream_done_before_the_deadline_is_unaffected_sr82(kind: str) -> None:
+    body = event(progress(1)) + event(result("ok"))
+
+    def handler(r: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=body, headers=SSE)
+
+    if kind == "sync":
+        with Client(BASE, transport=httpx.MockTransport(handler)) as ob:
+            events = list(ob.call_tool_stream("TOK", "srv", "t", deadline=5))
+    else:
+        async with AsyncClient(BASE, transport=httpx.MockTransport(handler)) as aob:
+            events = [ev async for ev in aob.call_tool_stream("TOK", "srv", "t", deadline=5)]
+    assert len(events) == 2
+    assert events[-1].result is not None and events[-1].result.text == "ok"
+
+
+@pytest.mark.parametrize("deadline", [0, -1, 0.0, float("nan"), float("inf")])
+async def test_stream_refuses_an_invalid_deadline_at_the_call_sr82(deadline: float) -> None:
+    with Client(BASE) as ob, pytest.raises(ValueError, match="deadline"):
+        ob.call_tool_stream("TOK", "srv", "t", deadline=deadline)
+    async with AsyncClient(BASE) as aob:
+        with pytest.raises(ValueError, match="deadline"):
+            aob.call_tool_stream("TOK", "srv", "t", deadline=deadline)

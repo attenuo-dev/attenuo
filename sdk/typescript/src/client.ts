@@ -61,7 +61,18 @@ export interface CallToolStreamOptions extends CallToolOptions {
   maxEventBytes?: number;
   /** Abort the call and the stream. */
   signal?: AbortSignal;
+  /**
+   * A total deadline for the whole call in milliseconds, counted from the request's start
+   * (default none). The idle `timeoutMs` restarts on every read, so an upstream that sends only
+   * keep-alive comments would hold the stream open forever without it (SR-82). On expiry the
+   * request is aborted and the stream throws `AttenuoError`. At most 2147483647 (`setTimeout`'s
+   * limit).
+   */
+  deadlineMs?: number;
 }
+
+/** The longest delay `setTimeout` honours; a longer one fires at once. */
+const MAX_TIMER_MS = 2_147_483_647;
 
 export interface ApprovalWaitOptions {
   /** Give up after this many milliseconds (default: wait until the approval expires). */
@@ -260,6 +271,7 @@ export class AttenuoClient {
    * `callTool` throws. A plain JSON answer is yielded as the one final event. An event over
    * `maxEventBytes` throws `AttenuoError`. The client's `timeoutMs` applies between reads, so a
    * stream quiet for longer is aborted; leaving the loop early closes the connection.
+   * `deadlineMs` bounds the whole call, keep-alives included: on expiry it throws `AttenuoError`.
    */
   callToolStream(
     token: Token | string | undefined,
@@ -272,6 +284,12 @@ export class AttenuoClient {
     const jwt = bearer(token, this.token);
     const maxEventBytes = opts.maxEventBytes ?? DEFAULT_MAX_EVENT_BYTES;
     if (!(maxEventBytes > 0)) throw new TypeError("maxEventBytes must be positive");
+    const deadlineMs = opts.deadlineMs;
+    if (deadlineMs !== undefined && !(deadlineMs > 0 && deadlineMs <= MAX_TIMER_MS)) {
+      throw new RangeError(
+        `deadlineMs must be a positive number of milliseconds up to ${MAX_TIMER_MS}`,
+      );
+    }
     const params: Record<string, unknown> = { name: tool, arguments: args };
     if (opts.approvalToken) params._meta = { [META_APPROVAL_KEY]: opts.approvalToken };
     const id = this.nextId++;
@@ -306,6 +324,22 @@ export class AttenuoClient {
         ms,
       );
     };
+    // The optional total deadline (SR-82): not restarted by reads, so keep-alives cannot hold
+    // the stream open past it. A read that still completes after it throws too.
+    const deadlineMs = opts.deadlineMs;
+    let expired = false;
+    const deadlineError = () => new AttenuoError(`stream deadline of ${deadlineMs}ms elapsed`);
+    const deadline =
+      deadlineMs === undefined
+        ? undefined
+        : setTimeout(() => {
+            expired = true;
+            ctl.abort(deadlineError());
+          }, deadlineMs);
+    const onChunk = () => {
+      if (expired) throw deadlineError();
+      restart();
+    };
     try {
       restart();
       const res = await this.post(
@@ -315,10 +349,14 @@ export class AttenuoClient {
         "POST",
         ctl.signal,
       );
-      restart();
-      yield* callStream(res, id, maxEventBytes, restart);
+      onChunk();
+      yield* callStream(res, id, maxEventBytes, onChunk);
+    } catch (e) {
+      if (expired) throw deadlineError();
+      throw e;
     } finally {
       clearTimeout(timer);
+      clearTimeout(deadline);
       opts.signal?.removeEventListener("abort", onAbort);
     }
   }

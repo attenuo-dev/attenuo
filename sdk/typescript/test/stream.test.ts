@@ -491,4 +491,71 @@ describe("callToolStream", () => {
     expect(seen).toHaveLength(1);
     expect((err as Error).name).toBe("TimeoutError");
   });
+
+  /** A body that sends `head` and then a keep-alive comment every 20 ms until it is aborted. */
+  function keepAlives(head: string, closed: { value: boolean }): typeof fetch {
+    return async (_input, init) => {
+      const signal = init?.signal;
+      let tick: ReturnType<typeof setInterval> | undefined;
+      const body = new ReadableStream<Uint8Array>({
+        start(ctl) {
+          ctl.enqueue(enc.encode(head));
+          tick = setInterval(() => ctl.enqueue(enc.encode(":\n\n")), 20);
+          signal?.addEventListener(
+            "abort",
+            () => {
+              clearInterval(tick);
+              closed.value = true;
+              ctl.error(signal.reason);
+            },
+            { once: true },
+          );
+        },
+        cancel() {
+          clearInterval(tick);
+          closed.value = true;
+        },
+      });
+      return new Response(body, { headers: SSE });
+    };
+  }
+
+  it("ends a keep-alive-only stream at the deadline sr82", async () => {
+    const closed = { value: false };
+    // The idle timeout (50 ms) never fires: a keep-alive comes every 20 ms.
+    const ob = new AttenuoClient(URL_, {
+      fetch: keepAlives(event(progress(1)), closed),
+      timeoutMs: 50,
+    });
+    const start = Date.now();
+    const { seen, err } = await collectUntilError(
+      ob.callToolStream("TOK", "github", "read_file", {}, { deadlineMs: 200 }),
+    );
+    const elapsed = Date.now() - start;
+    expect(seen).toHaveLength(1);
+    expect(err).toBeInstanceOf(AttenuoError);
+    expect((err as Error).message).toContain("stream deadline of 200ms elapsed");
+    expect(elapsed).toBeGreaterThanOrEqual(190);
+    expect(elapsed).toBeLessThan(800);
+    expect(closed.value).toBe(true);
+  });
+
+  it("leaves a stream that ends before the deadline alone sr82", async () => {
+    const { fetch } = mockFetch(() => sse(event(progress(1)) + event(result("ok"))));
+    const ob = new AttenuoClient(URL_, { fetch });
+    const events = await collect(
+      ob.callToolStream("TOK", "github", "read_file", {}, { deadlineMs: 5000 }),
+    );
+    expect(events).toHaveLength(2);
+    expect(events[1]!.result?.text).toBe("ok");
+  });
+
+  it("refuses an invalid deadline at the call sr82", () => {
+    const ob = new AttenuoClient(URL_, { fetch: mockFetch(() => sse("")).fetch });
+    for (const deadlineMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31]) {
+      expect(() => ob.callToolStream("TOK", "github", "read_file", {}, { deadlineMs })).toThrow(
+        RangeError,
+      );
+    }
+  });
 });
