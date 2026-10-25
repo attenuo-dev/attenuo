@@ -1,0 +1,146 @@
+# cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3 'charges_for/(distinct|calls_per|host)|budget_read_(file|memory)/(calls|distinct_list)|charge_(file|memory)/(calls|calls_per_new|calls_per_same|distinct_new|distinct_same|distinct_list)'
+# 2026-10-25, main 3568ba6 plus the distinct_list cells of perf/per-value-limits-latency, rustc 1.99.1, release with lto = false and codegen-units = 16, 4-core shared VM; load average printed before and after each run
+# charges_for/distinct_list_N: the 2N charges of a call whose list argument has N values (one RFC 8785 encoding per value); budget_read_*/distinct_list_N: the policy stage's counter read of those charges; charge_*/distinct_list_N_new: the charge transaction, every value new
+
+## Run 1
+load 3.94 2.63 2.68
+decide/budget_read_memory/calls_sum
+                        time:   [3.2547 µs 3.3498 µs 3.4846 µs]
+decide/charge_memory/calls_sum
+                        time:   [98.646 µs 105.27 µs 110.91 µs]
+decide/budget_read_memory/calls
+                        time:   [2.0272 µs 2.0721 µs 2.1308 µs]
+decide/charge_memory/calls
+                        time:   [77.310 µs 79.472 µs 81.695 µs]
+decide/charges_for/calls_per
+                        time:   [573.27 ns 580.52 ns 594.52 ns]
+decide/charge_memory/calls_per_new
+                        time:   [380.13 µs 396.76 µs 411.15 µs]
+decide/charge_memory/calls_per_same
+                        time:   [125.12 µs 129.13 µs 133.48 µs]
+decide/charges_for/distinct
+                        time:   [618.51 ns 639.24 ns 663.13 ns]
+decide/charge_memory/distinct_new
+                        time:   [557.14 µs 568.31 µs 578.73 µs]
+decide/charge_memory/distinct_same
+                        time:   [140.00 µs 143.61 µs 147.14 µs]
+decide/charges_for/host time:   [1.3421 µs 1.3480 µs 1.3547 µs]
+decide/charges_for/distinct_list_1
+                        time:   [591.83 ns 609.54 ns 631.46 ns]
+decide/budget_read_memory/distinct_list_1
+                        time:   [3.7958 µs 3.8432 µs 3.8924 µs]
+decide/charge_memory/distinct_list_1_new
+                        time:   [635.10 µs 651.64 µs 669.25 µs]
+decide/charges_for/distinct_list_16
+                        time:   [7.9795 µs 8.1356 µs 8.3550 µs]
+decide/budget_read_memory/distinct_list_16
+                        time:   [53.176 µs 55.585 µs 58.122 µs]
+decide/charge_memory/distinct_list_16_new
+                        time:   [2.4697 ms 2.5086 ms 2.5527 ms]
+decide/charges_for/distinct_list_256
+                        time:   [165.97 µs 168.69 µs 172.10 µs]
+decide/budget_read_memory/distinct_list_256
+                        time:   [815.80 µs 830.20 µs 847.26 µs]
+decide/charge_memory/distinct_list_256_new
+                        time:   [21.815 ms 22.421 ms 23.087 ms]
+decide/budget_read_file/calls_sum
+                        time:   [4.7546 µs 4.8481 µs 4.9493 µs]
+decide/charge_file/calls_sum
+                        time:   [563.86 µs 582.28 µs 600.47 µs]
+decide/budget_read_file/calls
+                        time:   [3.5222 µs 3.7056 µs 3.9232 µs]
+decide/charge_file/calls
+                        time:   [52.953 µs 53.665 µs 54.448 µs]
+decide/charge_file/calls_per_new
+                        time:   [103.57 µs 107.68 µs 112.70 µs]
+decide/charge_file/calls_per_same
+                        time:   [83.008 µs 93.801 µs 107.45 µs]
+decide/charge_file/distinct_new
+                        time:   [207.17 µs 215.35 µs 223.90 µs]
+decide/charge_file/distinct_same
+                        time:   [69.064 µs 70.492 µs 72.216 µs]
+decide/budget_read_file/distinct_list_1
+                        time:   [5.5397 µs 5.6392 µs 5.7500 µs]
+decide/charge_file/distinct_list_1_new
+                        time:   [108.34 µs 117.58 µs 128.67 µs]
+decide/budget_read_file/distinct_list_16
+                        time:   [53.419 µs 54.555 µs 56.078 µs]
+decide/charge_file/distinct_list_16_new
+                        time:   [1.3936 ms 1.4224 ms 1.4579 ms]
+decide/budget_read_file/distinct_list_256
+                        time:   [782.11 µs 785.83 µs 790.25 µs]
+decide/charge_file/distinct_list_256_new
+                        time:   [24.946 ms 25.831 ms 27.185 ms]
+load 1.58 2.05 2.44
+
+## Run 2
+load 1.58 2.05 2.44
+decide/budget_read_memory/calls_sum
+                        time:   [3.1332 µs 3.1997 µs 3.2921 µs]
+decide/charge_memory/calls_sum
+                        time:   [97.967 µs 104.51 µs 110.19 µs]
+decide/budget_read_memory/calls
+                        time:   [1.9961 µs 2.0278 µs 2.0672 µs]
+decide/charge_memory/calls
+                        time:   [82.010 µs 84.638 µs 87.193 µs]
+decide/charges_for/calls_per
+                        time:   [589.05 ns 597.88 ns 607.85 ns]
+decide/charge_memory/calls_per_new
+                        time:   [343.61 µs 361.13 µs 377.77 µs]
+decide/charge_memory/calls_per_same
+                        time:   [128.81 µs 133.29 µs 137.84 µs]
+decide/charges_for/distinct
+                        time:   [584.67 ns 599.65 ns 619.26 ns]
+decide/charge_memory/distinct_new
+                        time:   [551.65 µs 563.83 µs 576.05 µs]
+decide/charge_memory/distinct_same
+                        time:   [141.86 µs 146.66 µs 151.58 µs]
+decide/charges_for/host time:   [1.3748 µs 1.3897 µs 1.4058 µs]
+decide/charges_for/distinct_list_1
+                        time:   [598.26 ns 614.57 ns 635.35 ns]
+decide/budget_read_memory/distinct_list_1
+                        time:   [3.8865 µs 3.9280 µs 3.9738 µs]
+decide/charge_memory/distinct_list_1_new
+                        time:   [629.83 µs 643.10 µs 656.11 µs]
+decide/charges_for/distinct_list_16
+                        time:   [7.8639 µs 8.0260 µs 8.2342 µs]
+decide/budget_read_memory/distinct_list_16
+                        time:   [49.724 µs 50.313 µs 51.088 µs]
+decide/charge_memory/distinct_list_16_new
+                        time:   [2.2953 ms 2.3532 ms 2.4143 ms]
+decide/charges_for/distinct_list_256
+                        time:   [168.39 µs 172.37 µs 177.19 µs]
+decide/budget_read_memory/distinct_list_256
+                        time:   [806.25 µs 812.83 µs 820.98 µs]
+decide/charge_memory/distinct_list_256_new
+                        time:   [20.222 ms 20.546 ms 20.923 ms]
+decide/budget_read_file/calls_sum
+                        time:   [4.9520 µs 5.1296 µs 5.3354 µs]
+decide/charge_file/calls_sum
+                        time:   [542.74 µs 559.17 µs 576.05 µs]
+decide/budget_read_file/calls
+                        time:   [3.5831 µs 3.6976 µs 3.8520 µs]
+decide/charge_file/calls
+                        time:   [53.549 µs 55.204 µs 57.215 µs]
+decide/charge_file/calls_per_new
+                        time:   [101.70 µs 105.56 µs 110.42 µs]
+decide/charge_file/calls_per_same
+                        time:   [58.667 µs 62.589 µs 66.766 µs]
+decide/charge_file/distinct_new
+                        time:   [138.16 µs 143.06 µs 148.91 µs]
+decide/charge_file/distinct_same
+                        time:   [62.682 µs 63.600 µs 64.711 µs]
+decide/budget_read_file/distinct_list_1
+                        time:   [5.4537 µs 5.5752 µs 5.7297 µs]
+decide/charge_file/distinct_list_1_new
+                        time:   [153.35 µs 158.75 µs 164.26 µs]
+decide/budget_read_file/distinct_list_16
+                        time:   [54.990 µs 56.427 µs 58.204 µs]
+decide/charge_file/distinct_list_16_new
+                        time:   [1.4973 ms 1.5485 ms 1.6040 ms]
+decide/budget_read_file/distinct_list_256
+                        time:   [831.54 µs 854.76 µs 881.90 µs]
+decide/charge_file/distinct_list_256_new
+                        time:   [24.876 ms 25.338 ms 25.843 ms]
+load 3.45 2.47 2.51
+
