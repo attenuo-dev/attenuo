@@ -1,6 +1,6 @@
 # Fuzzing
 
-- Status: first campaign 2026-10-23 (`test/fuzz-targets`); second campaign, 10 minutes per target, 2026-10-23 evening (below); round 2 over run limits, budgets, approval tokens, the usage walker and the server routes, 2026-10-24 ([write-up](../research/fuzzing-2026-10-24-round2.md))
+- Status: first campaign 2026-10-23 (`test/fuzz-targets`); second campaign, 10 minutes per target, 2026-10-23 evening (below); round 2 over run limits, budgets, approval tokens, the usage walker and the server routes, 2026-10-24 ([write-up](../research/fuzzing-2026-10-24-round2.md)); round 3 over the pass 7 SSE parsing (`SseFramer`, `SseRewriter`, `parse_data`, the stream-end scan and rewrite), 2026-10-25 ([write-up](../research/fuzz-round-3-2026-10-25.md))
 - Crate: `fuzz/` (cargo-fuzz, libFuzzer), outside the workspace
 - Related: [threat model](../spec/threat-model.md), [security review pass 3](../research/security-review-2026-10-23.md)
 
@@ -11,7 +11,7 @@ How to run them, and a table of targets, is in [`fuzz/README.md`](https://github
 ## Design
 
 - **cargo-fuzz on nightly, outside the workspace.** libFuzzer needs `-Zsanitizer` and coverage flags only nightly has, so `fuzz/` is excluded from the root workspace (`exclude = ["fuzz"]`) and has its own `Cargo.lock`. `cargo clippy --workspace`, `cargo test --workspace` and `cargo deny check` do not see it. CI builds it on nightly (job `fuzz-build`).
-- **Public APIs only.** No crate exposes anything new for fuzzing. The proxy target drives `attenuo_proxy::router` through `tower::ServiceExt::oneshot` with a small `Authorizer` and an in-process upstream; the DPoP target calls both `attenuo_token::dpop::verify_proof` and the server's `Dpop::verify`.
+- **Public APIs only, with one exception.** Until round 3 no crate exposed anything new for fuzzing. Round 3 reaches the crate-private SSE helpers through `attenuo_proxy::fuzzing`, a `#[doc(hidden)]` module of thin wrappers behind the `fuzzing` cargo feature that only `fuzz/Cargo.toml` turns on; it is not an API. The proxy target drives `attenuo_proxy::router` through `tower::ServiceExt::oneshot` with a small `Authorizer` and an in-process upstream; the DPoP target calls both `attenuo_token::dpop::verify_proof` and the server's `Dpop::verify`.
 - **Properties, not only crashes.** "No panic" finds overflow and `expect` bugs. Most targets also assert a property the code is supposed to guarantee: an accepted chain narrows at every hop; `child ⊆ parent` means every call the child permits is permitted by the parent; nothing reaches the upstream that the chain does not permit; a verified audit export has not changed a countersigned entry.
 - **Structured inputs.** Random bytes rarely get past a signature check. The token, DPoP and audit targets start from a valid object (a token minted by an issuer with a fixed key, a signed export) and mutate it, re-signing where the attacker model allows: a holder of a second issuer key can re-sign the JWT but not `ou_sig`, a holder of the DPoP key can sign any proof, an attacker without the checkpoint key can re-hash the audit chain but not re-sign checkpoints.
 - **Overflow checks on.** cargo-fuzz builds with debug assertions, so integer overflow panics instead of wrapping silently.
