@@ -15,6 +15,8 @@ categories = ["network-programming", "web-programming::http-server", "authentica
 default = []
 # Test doubles (FakeMcpServer, StaticAuthorizer) for downstream crates' tests.
 testing = []
+# Re-exports of crate-private SSE helpers for the cargo-fuzz targets in `fuzz/`. Not an API.
+fuzzing = []
 
 [dependencies]
 attenuo-core = { workspace = true }

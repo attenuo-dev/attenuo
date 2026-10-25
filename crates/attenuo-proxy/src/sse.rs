@@ -32,7 +32,7 @@ const BOM: &[u8] = b"\xef\xbb\xbf";
 /// Drop a byte order mark that opens the stream from `buf`. Returns `false` while `buf` is
 /// still too short to tell (a strict prefix of the mark): wait for more bytes. `start` is
 /// cleared once decided.
-fn strip_leading_bom(buf: &mut Vec<u8>, start: &mut bool) -> bool {
+pub(crate) fn strip_leading_bom(buf: &mut Vec<u8>, start: &mut bool) -> bool {
     if !*start {
         return true;
     }
@@ -202,7 +202,7 @@ pub(crate) fn parse_data(text: &str) -> Option<Value> {
 /// `text` with every `\uXXXX` escape of an unpaired UTF-16 surrogate replaced by `\ufffd`.
 /// A backslash is only valid JSON inside a string, so escapes are found without tracking
 /// strings: each `\` takes the character after it.
-fn replace_lone_surrogates(text: &str) -> String {
+pub(crate) fn replace_lone_surrogates(text: &str) -> String {
     fn unit(b: &[u8], at: usize) -> Option<u16> {
         let hex = b.get(at..at + 6)?;
         if hex[0] != b'\\' || hex[1] != b'u' {

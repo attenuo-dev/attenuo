@@ -450,7 +450,7 @@ pub fn disown_stream_end(body: &mut Value) -> usize {
 /// `32000.999...`). So the scan accepts an event when some `-` is followed by such a run whose
 /// significant digits start with `32001` or `320009`. The exponent is not read: a wrong
 /// magnitude (`-3.2001`, `-320010`) is a false positive that the parse then rejects.
-fn may_hold_stream_end_code(event: &[u8]) -> bool {
+pub(crate) fn may_hold_stream_end_code(event: &[u8]) -> bool {
     let mut rest = event;
     while let Some(i) = rest.iter().position(|&b| b == b'-') {
         rest = &rest[i + 1..];

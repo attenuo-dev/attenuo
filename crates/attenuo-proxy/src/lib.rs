@@ -156,6 +156,45 @@ pub mod stage;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
+/// Crate-private SSE helpers re-exported for the cargo-fuzz targets (`fuzz/`). Not an API.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    use serde_json::Value;
+
+    pub fn strip_leading_bom(buf: &mut Vec<u8>, start: &mut bool) -> bool {
+        crate::sse::strip_leading_bom(buf, start)
+    }
+    pub fn parse_data(text: &str) -> Option<Value> {
+        crate::sse::parse_data(text)
+    }
+    pub fn replace_lone_surrogates(text: &str) -> String {
+        crate::sse::replace_lone_surrogates(text)
+    }
+    pub fn has_data(event: &[u8]) -> bool {
+        crate::sse::has_data(event)
+    }
+    pub fn event_json(event: &[u8]) -> Option<Value> {
+        crate::sse::event_json(event)
+    }
+    pub fn split_events(buf: &[u8]) -> Vec<&[u8]> {
+        crate::sse::split_events(buf)
+    }
+    pub fn rewrite_event(
+        event: &[u8],
+        f: &mut impl FnMut(&mut Value),
+        out: &mut Vec<u8>,
+    ) -> Result<(), std::io::Error> {
+        crate::sse::rewrite_event(event, f, out)
+    }
+    pub fn disown_events(chunk: &[u8]) -> Vec<u8> {
+        crate::guard::disown_events(chunk)
+    }
+    pub fn may_hold_stream_end_code(event: &[u8]) -> bool {
+        crate::guard::may_hold_stream_end_code(event)
+    }
+}
+
 pub use auth::{
     ApprovalTicket, AuthDecision, AuthError, Authenticated, Authorizer, CallContext, RequestAuth,
     META_APPROVAL_KEY, REASON_APPROVAL_REQUIRED, REASON_LABEL_ERROR,
