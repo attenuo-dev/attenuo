@@ -227,7 +227,7 @@ pub(crate) fn same_id(request: &Value, response: &Value) -> bool {
 /// answer is filtered by the same code as one on the `POST`. A non-list response that happens
 /// to carry such a member loses the entries the chain could not use; nothing is ever added.
 pub fn list_kinds_by_shape(msg: &Value) -> Vec<(Value, ListKind)> {
-    if msg.get("method").is_some() {
+    if crate::jsonrpc::method_of(msg).is_some() {
         return Vec::new();
     }
     let (Some(id), Some(result)) = (msg.get("id"), msg.get("result")) else {
@@ -243,9 +243,11 @@ pub fn list_kinds_by_shape(msg: &Value) -> Vec<(Value, ListKind)> {
 /// The list requests of one HTTP request whose responses must be filtered, and what to filter
 /// them with.
 ///
-/// A message is only ever treated as a *response* when it has no `method`: a request or
+/// A message is only ever treated as a *response* when it has no string `method`: a request or
 /// notification that carries a `result` (a client trying to smuggle one, or an upstream
-/// server-initiated request that reuses an id) is not a result, and is left alone.
+/// server-initiated request that reuses an id) is not a result, and is left alone. A `method`
+/// that is `null` or not a string does not make a request: clients read such a message as a
+/// response, so it is filtered as one (SR-69).
 pub struct ListFilter<'a> {
     pending: &'a [(Value, ListKind)],
     caps: &'a CapabilitySet,
@@ -264,7 +266,7 @@ impl<'a> ListFilter<'a> {
     /// Filter one JSON-RPC message in place if it answers a pending list request; returns the
     /// number of entries removed.
     pub fn apply_message(&self, msg: &mut Value) -> usize {
-        if msg.get("method").is_some() {
+        if crate::jsonrpc::method_of(msg).is_some() {
             return 0;
         }
         let Some(id) = msg.get("id") else {
@@ -320,7 +322,7 @@ impl<'a> ListFilter<'a> {
         };
         let mut found = Vec::new();
         for msg in messages {
-            if msg.get("method").is_some() {
+            if crate::jsonrpc::method_of(msg).is_some() {
                 continue;
             }
             let Some(id) = msg.get("id") else {
@@ -501,6 +503,29 @@ mod tests {
         assert_eq!(ListKind::from_method("prompts/get"), None);
         for k in ListKind::ALL {
             assert!(!k.array_key().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_null_or_non_string_method_does_not_hide_a_list_answer_sr69() {
+        // A JSON-RPC client reads `{"id":1,"method":null,"result":..}` as a response (the
+        // Python MCP SDK does), so the proxy must too: only a string `method` makes a request.
+        let c = caps();
+        let tools = json!([{"name": "read_file"}, {"name": "delete_repo"}]);
+        for method in [Value::Null, json!(5), json!({}), json!(["tools/list"])] {
+            let msg =
+                json!({"jsonrpc":"2.0","id":1,"method":method.clone(),"result":{"tools": tools}});
+            assert_eq!(
+                list_kinds_by_shape(&msg),
+                vec![(json!(1), ListKind::Tools)],
+                "listen stream, method {method}"
+            );
+            let pending = vec![(json!(1), ListKind::Tools)];
+            let f = ListFilter::new(&pending, &c, "github");
+            assert_eq!(f.listed_tool_names(&msg), vec!["read_file", "delete_repo"]);
+            let mut m = msg.clone();
+            assert_eq!(f.apply_message(&mut m), 1, "POST body, method {method}");
+            assert_eq!(m["result"]["tools"], json!([{"name": "read_file"}]));
         }
     }
 

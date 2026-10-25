@@ -30,7 +30,23 @@ fn fmt_span(secs: u64) -> String {
     }
 }
 
+/// `s` with its control characters escaped (`\u{1b}`) and everything else as it is, for text
+/// that a child or a caller chose and a terminal would otherwise act on (SR-59, SR-72).
+fn escape_controls(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().collect()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
 fn fmt_constraint(arg: &str, c: &ArgConstraint) -> String {
+    // A child names the arguments of the constraints it adds (SR-72).
+    let arg = escape_controls(arg);
     match c {
         ArgConstraint::Equals(v) => format!("{arg} == {v}"),
         ArgConstraint::OneOf(vs) => {
@@ -754,7 +770,7 @@ pub fn render_evaluation(v: &Value) -> String {
     ));
     for d in v["diagnostics"].as_array().into_iter().flatten() {
         match d.as_str() {
-            Some(text) => out.push_str(&format!("diagnostic: {text}\n")),
+            Some(text) => out.push_str(&format!("diagnostic: {}\n", escape_controls(text))),
             None => out.push_str(&format!("diagnostic: {d}\n")),
         }
     }
@@ -1093,6 +1109,34 @@ truncated: only 4 leases listed (raise --max-nodes); `would revoke` counts the w
         let lines = fmt_budget(&b);
         assert!(!lines[0].chars().any(char::is_control), "{lines:?}");
         assert!(lines[0].contains(r"to\u{1b}[2J"), "{lines:?}");
+    }
+
+    /// SR-72: a child chooses the argument names of the constraints it adds, and they reach
+    /// `token inspect`, `lease tree` and the dry run's `capability_denied` diagnostic.
+    #[test]
+    fn constraint_names_and_diagnostics_escape_control_characters_sr72() {
+        let evil = "amount\u{1b}[2J\u{1b}]0;x\u{7}";
+        let c = Capability::new("bank", "send_money")
+            .with_constraint(evil, ArgConstraint::range(None, Some(5)).unwrap());
+        let text = fmt_capability(&c);
+        assert!(!text.chars().any(char::is_control), "{text:?}");
+        assert!(text.contains(r"amount\u{1b}[2J"), "{text}");
+        let text = render_evaluation(&json!({
+            "decision": "deny", "reason": "capability_denied", "policy_ids": [],
+            "diagnostics": [format!("bank:send_money: argument `{evil}` is absent; \"acme/\"")],
+            "lease_check": "skipped", "chain_source": "token"}));
+        assert!(
+            !text
+                .trim_end()
+                .lines()
+                .any(|l| l.chars().any(char::is_control)),
+            "{text:?}"
+        );
+        assert!(text.contains(r"argument `amount\u{1b}[2J"), "{text}");
+        assert!(
+            text.contains("; \"acme/\""),
+            "quotes stay as they are: {text}"
+        );
     }
 
     #[test]
