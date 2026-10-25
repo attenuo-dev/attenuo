@@ -189,19 +189,11 @@ pub async fn evaluate_policies(
         None | Some(Value::Null) => None,
         Some(v) => Some(session_from_json(&v)?),
     };
-    // `approval: {"by": "user" | "operator"}`: evaluate as if the call carried a granted
-    // approval. The dry run never looks one up or consumes one.
+    // `approval: {"by": "user" | "operator" | "policy"}`: evaluate as if the call carried a
+    // granted approval. The dry run never looks one up or consumes one.
     let approval = match obj.remove("approval") {
         None | Some(Value::Null) => attenuo_policy::ApprovalContext::default(),
-        Some(v) => match v.get("by").and_then(Value::as_str) {
-            Some(by @ ("user" | "operator" | "policy")) => attenuo_policy::ApprovalContext::by(by),
-            _ => {
-                return Err(ApiError::bad_request(
-                    "invalid_request",
-                    "`approval` must be {\"by\": \"user\" | \"operator\" | \"policy\"}",
-                ))
-            }
-        },
+        Some(v) => approval_from_json(&v)?,
     };
     // `usage: {calls, amount, destination_seen}`: evaluate with this run usage instead of the
     // store's. Members left out are 0 or false.
@@ -482,6 +474,28 @@ fn usage_from_json(v: &Value) -> Result<attenuo_policy::UsageContext, ApiError> 
     })
 }
 
+/// The optional `approval` member of a dry run: `{"by": "user" | "operator" | "policy"}`,
+/// evaluated as if the call carried an approval granted by that party. `by` is required (an
+/// empty block is not an approval) and no other member is taken: no approval id or token,
+/// since the dry run never looks a stored approval up. Anything else is 400 `invalid_request`
+/// naming the member, so a misspelt member is not silently read as "no approval".
+fn approval_from_json(v: &Value) -> Result<attenuo_policy::ApprovalContext, ApiError> {
+    let bad = |m: &str| ApiError::bad_request("invalid_request", format!("`approval`: {m}"));
+    let obj = v.as_object().ok_or_else(|| bad("expected an object"))?;
+    if let Some(k) = obj.keys().find(|k| k.as_str() != "by") {
+        return Err(bad(&format!("unknown member `{k}`")));
+    }
+    match obj.get("by") {
+        Some(Value::String(by)) if matches!(by.as_str(), "user" | "operator" | "policy") => {
+            Ok(attenuo_policy::ApprovalContext::by(by))
+        }
+        None | Some(Value::Null) => Err(bad(
+            "`by` is required (\"user\", \"operator\" or \"policy\")",
+        )),
+        Some(_) => Err(bad("`by` must be \"user\", \"operator\" or \"policy\"")),
+    }
+}
+
 /// The optional `session` member of a dry run: `{"tainted_by": ["<server>/<tool>", ...],
 /// "tainted": bool, "untrusted_args": ["<argument>", ...], "args_contain_untrusted": bool}`.
 /// `tainted` defaults to whether `tainted_by` is non-empty, `args_contain_untrusted` to
@@ -489,6 +503,15 @@ fn usage_from_json(v: &Value) -> Result<attenuo_policy::UsageContext, ApiError> 
 fn session_from_json(v: &Value) -> Result<(SessionLabels, ArgLabels), ApiError> {
     let bad = |m: &str| ApiError::bad_request("invalid_request", format!("`session`: {m}"));
     let obj = v.as_object().ok_or_else(|| bad("expected an object"))?;
+    const KNOWN: [&str; 4] = [
+        "tainted",
+        "tainted_by",
+        "untrusted_args",
+        "args_contain_untrusted",
+    ];
+    if let Some(k) = obj.keys().find(|k| !KNOWN.contains(&k.as_str())) {
+        return Err(bad(&format!("unknown member `{k}`")));
+    }
     let strings = |key: &str| -> Result<Vec<String>, ApiError> {
         let msg = format!("`{key}` must be a list of strings");
         match obj.get(key) {
@@ -514,15 +537,6 @@ fn session_from_json(v: &Value) -> Result<(SessionLabels, ArgLabels), ApiError> 
     let mut args = ArgLabels::from_args(strings("untrusted_args")?);
     if let Some(c) = flag("args_contain_untrusted")? {
         args.contain_untrusted = c || !args.untrusted.is_empty();
-    }
-    const KNOWN: [&str; 4] = [
-        "tainted",
-        "tainted_by",
-        "untrusted_args",
-        "args_contain_untrusted",
-    ];
-    if let Some(k) = obj.keys().find(|k| !KNOWN.contains(&k.as_str())) {
-        return Err(bad(&format!("unknown member `{k}`")));
     }
     Ok((session, args))
 }

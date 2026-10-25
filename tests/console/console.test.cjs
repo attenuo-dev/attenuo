@@ -477,6 +477,65 @@ test('policy page: loaded set, file check and a dry-run evaluation', async () =>
   await bothThemes('policy');
 });
 
+test('policy page: a dry run with a stated approval', async () => {
+  // A fresh form: leave the page and come back, so nothing stated by the test above is left.
+  // Wait for the other page's data, so no request is cut off.
+  await c.go('#/approvals');
+  await c.page.locator('#main table tbody tr').first().waitFor();
+  await c.go('#/policy');
+  await c.page.locator('.policy-item h3').first().waitFor();
+  const evalPanel = c.page.locator('section.panel', { has: c.page.locator('h2', { hasText: 'Evaluate this call' }) });
+  await evalPanel.waitFor();
+  assert.equal(await c.page.locator('#ev-session-tainted-by').inputValue(), '');
+  const approvalBox = evalPanel.locator('.approval-result');
+  const sent = [];
+  const record = (req) => {
+    if (req.url().endsWith('/admin/policies/evaluate')) sent.push(req.postDataJSON());
+  };
+  c.page.on('request', record);
+  const addLabel = async () => {
+    await c.page.locator('#ev-token').fill(data.bobSecondToken);
+    await c.page.locator('#ev-server').fill('github');
+    await c.page.locator('#ev-tool').fill('add_label');
+    await c.page.locator('#ev-args').fill(JSON.stringify({ repo: 'bob/public-site', label: 'bug' }));
+    const previous = await evalPanel.locator('.verdict').elementHandle({ timeout: 1 }).catch(() => null);
+    await c.page.getByRole('button', { name: 'Evaluate' }).click();
+    if (previous) await previous.waitForElementState('hidden');
+    await evalPanel.locator('.verdict .reason').waitFor();
+    return [await evalPanel.locator('.verdict .pill').textContent(), await evalPanel.locator('.verdict .reason').innerText()];
+  };
+  try {
+    // On a stated tainted run the smoke policy asks before add_label unless the call carries
+    // an approval (`!context.approval.present`, scripts/console-smoke.sh).
+    await evalPanel.locator('details.session-form summary').click();
+    await c.page.locator('#ev-session-tainted-by').fill('github/read_file');
+    assert.deepEqual(await addLabel(), ['deny', 'approval_required']);
+    assert.equal(await approvalBox.locator('h3 .pill').textContent(), 'none stated');
+    assert.equal(await kvValue(approvalBox, 'Granted'), 'no (the call is decided as a first attempt)');
+    assert.equal(sent.at(-1).approval, undefined, 'no approval block without a stated approval');
+
+    await evalPanel.locator('details.approval-form summary').click();
+    await c.page.locator('#ev-approval-by').selectOption('operator');
+    assert.deepEqual(await addLabel(), ['allow', 'policy_allow']);
+    assert.deepEqual(sent.at(-1).approval, { by: 'operator' });
+    assert.equal(await approvalBox.locator('h3 .pill').textContent(), 'stated in the request');
+    assert.equal(await kvValue(approvalBox, 'Granted'), 'yes');
+    assert.equal(await kvValue(approvalBox, 'By'), 'operator');
+    assert.deepEqual(
+      (await c.page.locator('#ev-approval-by option').allInnerTexts()),
+      ['not stated (no approval)', 'user', 'operator', 'policy'],
+    );
+    await bothThemes('policy-approval');
+
+    // Back to not stated: nothing is sent and the call asks again.
+    await c.page.locator('#ev-approval-by').selectOption('');
+    assert.deepEqual(await addLabel(), ['deny', 'approval_required']);
+    assert.equal(sent.at(-1).approval, undefined);
+  } finally {
+    c.page.off('request', record);
+  }
+});
+
 test('verify panel: chain ok, then sign a checkpoint of the head', async () => {
   await c.go('#/verify');
   const head = (await admin('/admin/audit?order=desc&limit=1')).head;

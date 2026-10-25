@@ -85,7 +85,7 @@ What it cannot show: the tool arguments and the capabilities each hop held. The 
 - The loaded policies: file path, its SHA-256, when it was loaded, warnings, and the text of each policy.
 - **Check file on disk** lints the file as it is on disk now against the running schema: errors and warnings with line and column, and whether the file differs from what is loaded. It loads nothing.
 - **Reload** becomes available after a check with no errors (see writes below).
-- **Evaluate this call** is a dry run: give a delegation token (an expired one works) or a chain as JSON, a server, a tool and the arguments, and the console shows what the loaded policies decide, the reason, the policy ids and any diagnostics. It skips the lease check and writes no audit record. The token is sent to this server only.
+- **Evaluate this call** is a dry run: give a delegation token (an expired one works) or a chain as JSON, a server, a tool and the arguments, and the console shows what the loaded policies decide, the reason, the policy ids and any diagnostics. It skips the lease check and writes no audit record. The token is sent to this server only. Four sections, closed until opened, state what the dry run would otherwise read from the store or leave out: **Budget** (the run-limit counters), **Run labels** (the run's taint and untrusted arguments), **Run usage** (`context.usage`) and **Approval** (decide the call as a retry that carries an approval granted by `user`, `operator` or `policy`). A section left empty sends nothing. The answer shows the budget, labels, usage and approval the call was decided with, each marked as stated in the request or read from the store (an approval is never read: without one stated, there is none).
 
 ### Verify
 

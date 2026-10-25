@@ -1,6 +1,6 @@
 // Policy page (#/policy): the policy set in force, a lint of the file on disk, reload after a
 // clean check, and a dry-run "evaluate this call" form with an optional stated budget, run
-// labels (taint) and run usage.
+// labels (taint), run usage and approval.
 'use strict';
 
 import {
@@ -132,6 +132,7 @@ function evaluatePanel() {
   const budget = budgetFields(field);
   const session = sessionFields(field);
   const usage = usageFields(field);
+  const approval = approvalFields(field);
   const out = h('div', { class: 'stack' });
 
   const form = h('form', {
@@ -148,6 +149,8 @@ function evaluatePanel() {
           if (labels) body.session = labels;
           const used = usage.read();
           if (used) body.usage = used;
+          const approved = approval.read();
+          if (approved) body.approval = approved;
         } catch (e) {
           replace(out, h('p', { class: 'callout bad' }, e.message));
           return;
@@ -171,6 +174,7 @@ function evaluatePanel() {
   budget.node,
   session.node,
   usage.node,
+  approval.node,
   h('div', { class: 'wide row' },
     h('button', { type: 'submit', class: 'primary' }, 'Evaluate'),
     h('span', { class: 'small muted' }, 'A dry run: no lease check, no audit record, no metrics. The token is sent to this server only.')));
@@ -349,6 +353,28 @@ function usageFields(field) {
   return { node, read };
 }
 
+// The optional `approval` block: decide the call as a retry that carries an approval granted
+// by this party. The dry run never looks a stored approval up, so the route takes only `by`.
+const APPROVAL_BY = ['user', 'operator', 'policy'];
+
+function approvalFields(field) {
+  const byIn = h('select', { id: 'ev-approval-by' },
+    h('option', { value: '' }, 'not stated (no approval)'),
+    APPROVAL_BY.map((by) => h('option', { value: by }, by)));
+  const node = h('details', { class: 'wide override-form approval-form' },
+    h('summary', null, 'Approval (optional): decide the call as if it carried a granted approval'),
+    h('div', { class: 'eval-form' },
+      field('ev-approval-by', 'Approved by', byIn),
+      h('p', { class: 'wide small muted' }, 'Sets context.approval as a retry after the approval was granted would. Nothing is looked up or used: no approval id or token is needed.')));
+
+  /** The block to send, or null when nothing is stated. */
+  function read() {
+    return APPROVAL_BY.includes(byIn.value) ? { by: byIn.value } : null;
+  }
+
+  return { node, read };
+}
+
 const I64_MAX = 9223372036854775807;
 
 /** A remaining figure; the server's 2^63 - 1 means no limit of that kind matches. */
@@ -414,6 +440,17 @@ function usageResult(u) {
     ]));
 }
 
+/** The answer's `approval` (context.approval). Only a request states one; the dry run reads none. */
+function approvalResult(a) {
+  if (!a) return null;
+  return h('section', { class: 'stack approval-result' },
+    h('h3', null, 'Approval ', a.present ? sourcePill('request') : pill('none stated', '')),
+    kv([
+      ['Granted', a.present ? 'yes' : 'no (the call is decided as a first attempt)'],
+      ['By', a.present ? mono(a.by) : h('span', { class: 'muted' }, 'none')],
+    ]));
+}
+
 function evalResult(r) {
   return h('div', { class: 'stack' },
     h('div', { class: 'verdict' },
@@ -426,11 +463,11 @@ function evalResult(r) {
       ['Lease check', mono(r.lease_check)],
       ['Chain source', h('span', null, mono(r.chain_source), r.chain_source === 'admin_supplied' ? ' (not checked to be issued by this server)' : '')],
       ['Token expired', r.token_expired ? 'yes' : 'no'],
-      ['Approval', r.approval && r.approval.present ? h('span', null, 'granted by ', mono(r.approval.by)) : 'none'],
     ]),
     budgetResult(r.budget, r.limit),
     labelsResult(r.session),
     usageResult(r.usage),
+    approvalResult(r.approval),
     r.diagnostics && r.diagnostics.length
       ? h('div', null, h('h3', null, 'Diagnostics'), jsonTree(r.diagnostics, true))
       : h('p', { class: 'small muted' }, 'No diagnostics.'));

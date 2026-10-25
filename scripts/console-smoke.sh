@@ -75,7 +75,8 @@ RO_MAIN_PORT="${PORTS[3]}"
 RO_UI_PORT="${PORTS[4]}"
 
 # The demo policy plus a destructive tool the policy allows outright and asks about once the
-# run is tainted, which the policy page's dry run with stated run labels uses.
+# run is tainted unless the call carries an approval, which the policy page's dry runs with
+# stated run labels and a stated approval use.
 cp "$DEMO/policy.cedar" "$WORK/policy.cedar"
 cat >> "$WORK/policy.cedar" <<'EOF'
 
