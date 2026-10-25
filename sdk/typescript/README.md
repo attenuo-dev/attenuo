@@ -105,19 +105,19 @@ const ev = await admin.policyEvaluate("github", "read_file", { repo: "alice/x" }
 console.log(ev.decision, ev.reason, ev.policyIds); // no lease check, no audit record
 ```
 
-| Call                                                               | Route                                                         | Returns                                                                                                 |
-| ------------------------------------------------------------------ | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `auditQuery(query?)`                                               | `GET /admin/audit`                                            | `{ entries, next, prev, head }`                                                                         |
-| `auditIter(query?)` (`limit` defaults to 1000)                     | `GET /admin/audit`, repeated                                  | async iterator of `AuditEntry`, following `next` (asc) or `prev` (desc) until null                      |
-| `auditEntry(seq)`, `auditRecord(id)`                               | `GET /admin/audit/entries/{seq}`, `/admin/audit/records/{id}` | `{ entry, leaseStates, coveredByCheckpoint, policyReloadedAfter }`                                      |
-| `auditCheckpoints({ before?, limit? })`                            | `GET /admin/audit/checkpoints`                                | `{ checkpoints, prev }`                                                                                 |
-| `leaseTree(leaseId, maxNodes?)`                                    | `GET /admin/leases/{id}/tree`                                 | `{ root, ancestors, nodes, wouldRevoke, truncated }`                                                    |
-| `policies()`                                                       | `GET /admin/policies`                                         | `{ path, sha256, loadedAt, policyIds, warnings, policies }`                                             |
-| `policyCheck()`                                                    | `GET /admin/policies/check`                                   | `{ ok, issues, differsFromLoaded, ... }`                                                                |
-| `policyEvaluate(server, tool, args?, { token?, chain?, budget? })` | `POST /admin/policies/evaluate`                               | `{ decision, allowed, reason, policyIds, ..., tokenExpired, budget, limit, labels, usage, approvalBy }` |
-| `approvals({ chainId?, state?, limit? })`                          | `GET /admin/approvals`                                        | `Approval[]`, newest first                                                                              |
-| `approval(approvalId)`                                             | `GET /admin/approvals/{id}`                                   | `Approval`                                                                                              |
-| `grantApproval(approvalId)`, `declineApproval(approvalId)`         | `POST /admin/approvals/{id}`                                  | `Approval` after the decision (`by = \"operator\"`); `ApiError` 409 when it is no longer pending        |
+| Call                                                                                            | Route                                                         | Returns                                                                                                 |
+| ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `auditQuery(query?)`                                                                            | `GET /admin/audit`                                            | `{ entries, next, prev, head }`                                                                         |
+| `auditIter(query?)` (`limit` defaults to 1000)                                                  | `GET /admin/audit`, repeated                                  | async iterator of `AuditEntry`, following `next` (asc) or `prev` (desc) until null                      |
+| `auditEntry(seq)`, `auditRecord(id)`                                                            | `GET /admin/audit/entries/{seq}`, `/admin/audit/records/{id}` | `{ entry, leaseStates, coveredByCheckpoint, policyReloadedAfter }`                                      |
+| `auditCheckpoints({ before?, limit? })`                                                         | `GET /admin/audit/checkpoints`                                | `{ checkpoints, prev }`                                                                                 |
+| `leaseTree(leaseId, maxNodes?)`                                                                 | `GET /admin/leases/{id}/tree`                                 | `{ root, ancestors, nodes, wouldRevoke, truncated }`                                                    |
+| `policies()`                                                                                    | `GET /admin/policies`                                         | `{ path, sha256, loadedAt, policyIds, warnings, policies }`                                             |
+| `policyCheck()`                                                                                 | `GET /admin/policies/check`                                   | `{ ok, issues, differsFromLoaded, ... }`                                                                |
+| `policyEvaluate(server, tool, args?, { token?, chain?, budget?, session?, approval?, usage? })` | `POST /admin/policies/evaluate`                               | `{ decision, allowed, reason, policyIds, ..., tokenExpired, budget, limit, labels, usage, approvalBy }` |
+| `approvals({ chainId?, state?, limit? })`                                                       | `GET /admin/approvals`                                        | `Approval[]`, newest first                                                                              |
+| `approval(approvalId)`                                                                          | `GET /admin/approvals/{id}`                                   | `Approval`                                                                                              |
+| `grantApproval(approvalId)`, `declineApproval(approvalId)`                                      | `POST /admin/approvals/{id}`                                  | `Approval` after the decision (`by = \"operator\"`); `ApiError` 409 when it is no longer pending        |
 
 `AuditQuery` takes `order` (`"asc"` with `from`, or `"desc"` with `before`), `limit`, and exact-match filters combined with AND: `kind` (one or an array), `decision` (a `Decision`, `"allow" | "deny"`), `reason`, `subject`, `agent`, `lease`, `server`, `tool`, `chainId`, and `since` / `until` (RFC 3339 strings or `Date`s). Errors map as everywhere else: a 404 for an unknown seq, record or lease is an `ApiError` with `status: 404`, a bad filter is a 400 `invalid_request`.
 
@@ -149,6 +149,27 @@ console.log(ev.budget?.source); // "request"; "store" when no budget was stated
 ```
 
 The answer's `budget` is an `EvaluationBudget` (`{ limited, callsRemaining, amountRemaining, destinationNew, source }`), where a remaining figure is `Infinity` when no limit of that kind matches (the server's `2^63 - 1` does not fit a JavaScript number). `limit` is set only on `budget_exhausted` and has the `BudgetLimit` shape, so it can be stated back as it came. `labels` (the run's output labels), `usage` (`context.usage`) and `approvalBy` complete the picture the policy saw.
+
+The other inputs the policy sees can be stated the same way, each instead of what the store holds for the run:
+
+- `opts.session: StatedSession` (`{ taintedBy?, tainted?, untrustedArgs?, argsContainUntrusted? }`): the run's output labels. `tainted` defaults on the server to whether `taintedBy` names a source, `argsContainUntrusted` to whether `untrustedArgs` names an argument. The answer's `labels.source` is then `"request"`.
+- `opts.approval: StatedApproval` (`{ by: "user" | "operator" | "policy" }`, the `ApprovalBy` type): evaluate the call as a retry that carries a granted approval. The dry run never looks up or consumes a stored approval, so there is no id or token to pass. The answer's `approvalBy` is then `by`.
+- `opts.usage: StatedUsage` (`{ calls?, amount?, destinationSeen? }`): `context.usage` (the server takes a member left out as 0 or `false`). The answer's `usage.source` is then `"request"`. With a stated `budget` and no `usage`, the usage is zero and also reported as `"request"`.
+
+Members left out (and empty lists) are not sent. Nothing is checked in the SDK beyond the types: a negative figure is the server's 400 `invalid_request`, thrown as `ApiError`.
+
+```ts
+// Would a create_issue ask for approval once the run has read a web page, and pass with one?
+const session = { taintedBy: ["web/fetch"] };
+const asked = await admin.policyEvaluate("github", "create_issue", issue, { token: root, session });
+console.log(asked.reason, asked.labels?.source); // approval_required request (with a taint rule loaded)
+const ok = await admin.policyEvaluate("github", "create_issue", issue, {
+  token: root,
+  session,
+  approval: { by: "user" },
+});
+console.log(ok.decision, ok.approvalBy); // allow user
+```
 
 ### Admin: revoking by user, chain or session
 

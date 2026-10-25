@@ -111,7 +111,7 @@ print(ev.decision, ev.reason, ev.policy_ids)  # no lease check, no audit record
 | `lease_tree(lease_id, max_nodes=None)` | `GET /admin/leases/{id}/tree` | `LeaseTree(root, ancestors, nodes, would_revoke, truncated)` |
 | `policies()` | `GET /admin/policies` | `PolicySet(path, sha256, loaded_at, policy_ids, warnings, policies)` |
 | `policy_check()` | `GET /admin/policies/check` | `PolicyCheck(ok, issues, differs_from_loaded, ...)` |
-| `policy_evaluate(server, tool, arguments=None, *, token=None, chain=None, budget=None)` | `POST /admin/policies/evaluate` | `PolicyEvaluation(decision, reason, policy_ids, ..., token_expired, budget, limit, labels, usage, approval_by)`; `.allowed` |
+| `policy_evaluate(server, tool, arguments=None, *, token=None, chain=None, budget=None, session=None, approval=None, usage=None)` | `POST /admin/policies/evaluate` | `PolicyEvaluation(decision, reason, policy_ids, ..., token_expired, budget, limit, labels, usage, approval_by)`; `.allowed` |
 | `approvals(chain_id=None, *, state=None, limit=None)` | `GET /admin/approvals` | `list[Approval]`, newest first |
 | `approval(approval_id)` | `GET /admin/approvals/{id}` | `Approval` |
 | `grant_approval(approval_id)`, `decline_approval(approval_id)` | `POST /admin/approvals/{id}` | `Approval` after the decision (`by = \"operator\"`); `ApiError` 409 when it is no longer pending |
@@ -146,6 +146,27 @@ print(ev.budget.source)  # "request"; "store" when no budget was stated
 ```
 
 The answer's `budget` is an `EvaluationBudget(limited, calls_remaining, amount_remaining, destination_new, source)`, where a remaining figure is `2**63 - 1` when no limit of that kind matches. `limit` is set only on `budget_exhausted` and has the `BudgetLimit` shape, so it can be stated back as it came. `labels` (the run's output labels), `usage` (`context.usage`) and `approval_by` complete the picture the policy saw.
+
+The other inputs the policy sees can be stated the same way, each instead of what the store holds for the run:
+
+- `session=StatedSession(tainted_by=(), tainted=None, untrusted_args=(), args_contain_untrusted=None)`: the run's output labels. `tainted` defaults on the server to whether `tainted_by` names a source, `args_contain_untrusted` to whether `untrusted_args` names an argument. The answer's `labels.source` is then `"request"`.
+- `approval=StatedApproval(by="user" | "operator" | "policy")`: evaluate the call as a retry that carries a granted approval. The dry run never looks up or consumes a stored approval, so there is no id or token to pass. The answer's `approval_by` is then `by`.
+- `usage=StatedUsage(calls=None, amount=None, destination_seen=None)`: `context.usage` (the server takes a member left out as 0 or `False`). The answer's `usage.source` is then `"request"`. With a stated `budget` and no `usage`, the usage is zero and also reported as `"request"`.
+
+Each also takes the raw block as a dict, and members left `None` or empty are not sent. Nothing is checked in the SDK: an unknown member, a negative figure or an unknown approver is the server's 400 `invalid_request`, raised as `ApiError`.
+
+```python
+from attenuo import StatedApproval, StatedSession
+
+# Would a create_issue ask for approval once the run has read a web page, and pass with one?
+taint = StatedSession(tainted_by=["web/fetch"])
+asked = admin.policy_evaluate("github", "create_issue", issue, token=root, session=taint)
+print(asked.reason, asked.labels.source)  # approval_required request (with a taint rule loaded)
+ok = admin.policy_evaluate(
+    "github", "create_issue", issue, token=root, session=taint, approval=StatedApproval(by="user")
+)
+print(ok.decision, ok.approval_by)  # allow user
+```
 
 ### Admin: revoking by user, chain or session
 
