@@ -115,7 +115,7 @@ A refusal that happens before any pipeline decision (a session opened, an exchan
 
 ## 2. Reading sessions
 
-Fifteen sessions: the CLI and the demo get their own, short, session, and output labelling with approvals and run limits, which landed after the others were written, get sessions 9 and 11. Session 12 covers what the evening merges of 2026-10-24 added across the crates, session 13 what the merges of that night (#95 to #103) added, session 14 the follow-ups after it (#104, #106 to #113), and session 15 the merges after that (#115 to #119). In order:
+Sixteen sessions: the CLI and the demo get their own, short, session, and output labelling with approvals and run limits, which landed after the others were written, get sessions 9 and 11. Session 12 covers what the evening merges of 2026-10-24 added across the crates, session 13 what the merges of that night (#95 to #103) added, session 14 the follow-ups after it (#104, #106 to #113), session 15 the merges after that (#115 to #119), and session 16 the ones after those (#121 to #126). In order:
 
 1. Core types and attenuation (`attenuo-core`).
 2. Tokens, `ou_sig` and DPoP (`attenuo-token`).
@@ -132,8 +132,9 @@ Fifteen sessions: the CLI and the demo get their own, short, session, and output
 13. Number bounds, retention, stream endings, AuthZEN and the stated dry run: the `range` constraint; retention of session records, leases and run state on one ticker; listen-stream endings counted and `stream.end` records bounded; the AuthZEN conformance fixtures; the admin dry run told the run's budget, labels, approval and usage.
 14. Security pass 6, bounded refusals, short-circuit batches, wide prunes and the pruned refund: SR-69 to SR-72; lease refusals of undecided requests bounded per chain, tool and reason (`RecordWindow`); the proptest oracle and the maintenance settings; AuthZEN `deny_on_first_deny`, `permit_on_first_permit` and public discovery; the strict `approval` block and the console's Approval section; prune passes bounded for wide runs; 410 `charge_pruned`; the per-value limits figures; ADR-0011 (proposed).
 15. Streamed answers, the proxy's voice, reproducible properties and the road to PyPI and npm: `call_tool_stream` and `callToolStream`, `fake_mcp --sse`; upstream messages in the proxy's stream-end shape rewritten to `-32005` `upstream_stream_end_shape`, and the byte scan in front of that check; `PROPTEST_RNG_SEED`, pinned in CI and random locally; `release-packages.yml`, a dry run on a tag and a publish on a dispatch.
+16. Record windows you can set, a cost that would not move, cuts the SDKs can trust and security pass 7: `[proxy] record_window_seconds` and `record_window_max_keys`; the `distinct` list charge measured and left as it was; a stream cut read only with one of the proxy's six reasons and a UUID id, else `RpcError -32001`; SR-77 to SR-80 (events the proxy could not parse); the linear Python SSE parser and the optional total deadline on a streamed call (SR-82).
 
-Sessions 9, 11 and 12 cut across sessions 3 to 8 and are easiest after all of them; read 11 after 9, since soft limits use its approvals. Session 12 needs only sessions 5 and 6. Session 13 needs sessions 1, 6 and 11, and session 12 for the refusal records. Session 14 needs session 13 (retention, `stream.end` windows, the dry run) and session 12 (refusal records). Session 15 needs session 8 (the SDKs), session 5 (the proxy's streaming path) and the `stream.end` records of sessions 12 and 13; its seed part follows session 14's proptest row. Sessions 7, 8 and 10 are light, so merge them if you have the time.
+Sessions 9, 11 and 12 cut across sessions 3 to 8 and are easiest after all of them; read 11 after 9, since soft limits use its approvals. Session 12 needs only sessions 5 and 6. Session 13 needs sessions 1, 6 and 11, and session 12 for the refusal records. Session 14 needs session 13 (retention, `stream.end` windows, the dry run) and session 12 (refusal records). Session 15 needs session 8 (the SDKs), session 5 (the proxy's streaming path) and the `stream.end` records of sessions 12 and 13; its seed part follows session 14's proptest row. Session 16 needs session 14 (the refusal record window) and session 15 (streamed calls, the stream-end shape and the byte scan); its #122 row follows session 11's charge transaction. Sessions 7, 8 and 10 are light, so merge them if you have the time.
 
 Each session has four parts. Read the files in the order given, with the "read beside" document open. Answer the questions without looking, then check the run block. Tests are named so that `cargo test -p <crate> <filter>` runs a handful, not the whole suite; add `-- --nocapture` to see output.
 
@@ -1742,6 +1743,155 @@ What is still open after this session (from the [task board](../tasks/board.md) 
 - Server and identity: real admin authentication; actor tokens against a live SPIRE; hop-0 hardening (a shared replay cache, `private_key_jwt`, ID-JAG drafts).
 - Evaluation and performance: the remaining test-split cases and a model in the loop; the injection suite's `stage_of` in `evaluation/injection-suite/harness.py` still does not know `input_type_mismatch`; run limits phase 3; the open benchmark and performance items on the board (a quiet reference machine above all).
 - Metrics: soft-limit asks are not told apart from other `approval_required` decisions (that would need policy ids as labels).
+
+### Session 16: record windows you can set, a cost that would not move, cuts the SDKs can trust and security pass 7
+
+The six merges after Session 15, on the morning of 2026-10-25 (#121 to #126), close loose ends that Sessions 14 and 15 left open. The two record windows (lease refusals and listen-stream ends) become settings (#121). A try at making a wide `distinct` charge cheaper measured no reliable gain and changed no store code; it leaves one test and a bench note behind (#122). The SDKs stop reading every message of the stream-end shape as a cut: they want one of the six reasons the proxy sends and a UUID decision id (#123). Security pass 7 found the proxy relaying SSE events it could not parse, unlabelled and unrewritten, and fixed that in four ways (#124, SR-77 to SR-80). Its SR-82 was fixed in two parts: the Python SSE parser became linear (#125), and both SDKs gained an optional total deadline on a streamed call (#126). This session reads them in that order.
+
+Read beside: the `[proxy]` rows `record_window_seconds` and `record_window_max_keys` in [the config reference](../reference/config.md#proxy) and the matching comment in `config/example.toml` (near line 285). Then [the distinct list-charge bench note](../design/bench/2026-10-25-vm-distinct-list-charge.md) ("Where the time goes" and "Reading") and the [performance section](../design/performance.md#cheaper-distinct-list-charges-measured-2026-10-25) that summarises it. Then [security review pass 7](../research/security-review-2026-10-25-pass7.md) whole (it is short: the summary table, SR-77 to SR-84, and "Checked and found sound"). Last, "Streaming a call" in `sdk/python/README.md` and in `sdk/typescript/README.md`, which now name the six reasons and the deadline. The reasoning behind each change is in [the 2026-10-24 log](../log/2026-10-24.md), in the entries from 04:32 to 05:26 UTC.
+
+| Order | File | What it does | Lines |
+| --- | --- | --- | --- |
+| 1 | `crates/attenuo-proxy/src/records.rs` (`DEFAULT_RECORD_WINDOW_MAX_KEYS` near line 28, `DEFAULT_RECORD_WINDOW` near line 40, `RecordWindow::with_max_keys` near line 92; tests `a_short_window_closes_sooner` near line 253 and `a_full_table_at_the_smallest_configurable_size_records` near line 297), `config.rs` (`ProxyConfig::record_window` near line 82, `record_window_max_keys` near line 87, `with_record_window` near line 144), `proxy.rs` (`router` reading both near line 160, the lease-refusal table near line 184) | #121, the proxy half. The two constants keep their values (60 s, 10,000 windows) and become the defaults of two `ProxyConfig` fields. `router` builds both `RecordWindow`s from them, the lease-refusal table and the guard's `stream.end` table, each its own table of the same size. The hidden test hook that set only the refusal window is gone. A full table still records rather than suppresses, so a smaller `max_keys` can only mean more records, never fewer. | 360 |
+| 2 | `crates/attenuo-server/src/config.rs` (`ProxySection` near line 1322, its fields near lines 1361 and 1366, `MAX_RECORD_WINDOW_SECONDS` and the two key bounds near lines 1371 to 1377, `ProxySection::record_window` near line 1460, `apply` near line 1486; test `proxy_record_window_defaults_and_bounds` near line 1879), `state.rs` (the startup check near line 101), `tests/e2e.rs` (`record_window_seconds_sets_the_lease_refusal_window` near line 1906) | #121, the server half. `[proxy] record_window_seconds` (default 60, 1 to 3600) and `record_window_max_keys` (default 10000, 100 to 1000000) are read as `u64`. `record_window()` validates both and returns `(Duration, usize)`; startup calls it and refuses a value out of range with `[proxy] record_window_seconds must be between 1 and 3600, not 0`. `apply` passes the pair to `with_record_window`. One window for both kinds, because two would ask the operator a question nobody has asked; the doc comment on the field says so. Read at startup only. | 2540 |
+| 3 | `docs/design/bench/2026-10-25-vm-distinct-list-charge.md` ("Where the time goes" near line 20, the per-row figure near line 34, "Reading" near line 100), `crates/attenuo-audit/tests/budgets.rs` (`a_refund_after_a_wide_list_charge_frees_only_unshared_values_sr62` near line 687) | #122, a negative result. A 256-value `distinct` list charge holds the write gate for about 28 ms (#113). Batching the same rows (a map for pending counters, deduplicated upserts, multi-row `INSERT`s of 64, 8 and 1, one `IN` read per limit) moved the medians inside the old build's spread, so the store code is unchanged. The cost is per row in the B-trees, about 4 to 12 us each, since the value hashes are random and every new value lands on its own leaf pages. Only writing fewer rows would help, and each way of doing that changes what SR-62's exact refunds rely on. What stays is a 64-value bench cell and this test: two 256-value decisions in two hops share values, and refunds free only the unshared ones, on both stores. Whether to lower `MAX_COUNTED_VALUES` (256) is the maintainer's decision, on the board. | 120 |
+| 4 | `crates/attenuo-proxy/src/guard.rs` (`StreamEndCause::of_lease_reason` near line 150, `check_detail` near line 254 and its `check_active` call near line 272, `"unauthorized"` near line 289, `end_event_recorded` near line 353) | Where the six reasons come from (#123 read them here, it changed nothing in the crate). The event carries the reason the re-check failed with, not the metric label. `check_active` returning `LeaseInactive(reason)` passes the server authorizer's reason through: `lease_revoked`, `lease_expired`, `lease_unknown` or `lease_error`. An expired token is `token_expired`, and a token refused for any other reason is `unauthorized` (not recorded, so no id). `end_event_recorded` writes the decision id with `Uuid::to_string()` or leaves the member out. `lease_other`, `recheck_unavailable` and `recheck_failed` are metric labels and never appear in the event. | 1200 |
+| 5 | `sdk/python/src/attenuo/_sse.py` (`_STREAM_END_REASONS` near line 34, `_UUID` near line 45, `_is_stream_end` near line 227, `stream_end_error` near line 241), `sdk/python/tests/test_stream.py` (`test_stream_cut_with_each_reason_the_proxy_sends_is_denied` near line 243, `test_stream_end_shape_the_proxy_never_sends_is_not_denied` near line 267) | #123 in Python. The shape test is unchanged: no `method`, `id` null or absent, `error.code` `-32001`. A message of that shape is now `Denied` only when `_is_stream_end(data)` holds: `data.reason` is one of the six and `data.decision_id` is absent or matches `_UUID` in full. Anything else of that shape is `RpcError(-32001, message, data)`, which still ends the call but is not a decision. An explicit `null` id or an empty string is not a cut. The set and the pattern are private; the package exports no reason constants. The docstring says why this is defence in depth: since #117 the proxy rewrites any upstream message of that shape, and its header went out before the cut, so it cannot vouch for the id. | 330 |
+| 6 | `sdk/typescript/src/sse.ts` (`STREAM_END_REASONS` near line 27, `UUID` near line 37, `streamEndError` near line 202, the reason-and-id test near line 215), `sdk/typescript/test/stream.test.ts` (the two `it.each` tables near lines 207 and 228) | The same rule in TypeScript: `streamEndError` returns `DeniedError`, `RpcError` or `undefined`. The tests are the Python ones as `it.each` tables: the six reasons, then an unknown reason, a non-UUID id, a null id and no `data`. #123 also added the TypeScript twin of the rewritten look-alike test that Session 15 noted was missing. | 320 |
+| 7 | `crates/attenuo-proxy/src/sse.rs` (`strip_leading_bom` near line 35, `event_json` near line 178, `parse_data` near line 192, `replace_lone_surrogates` near line 205, `has_data` near line 242, `SseFramer` near line 325 and `SseFramer::push` near line 354 with its non-UTF-8 error near line 370; tests near lines 496, 542 and 578) | #124, SR-77, SR-78 and SR-80. Labelling and the look-alike rewrite act only on events the proxy parses, and the MCP SDKs parse more leniently than `serde_json`. Now the proxy reads the way they do. A UTF-8 BOM that opens the stream is dropped, as clients drop it (SR-77). An event that is not UTF-8 ends the stream with an `InvalidData` error rather than being passed on (SR-77). `parse_data` retries a failed parse with every unpaired `\uD800`-range escape replaced by `�`, since `JSON.parse` and Python's `json` accept such an escape and `serde_json` does not (SR-78). The list filter's rewriter drops an event whose data does not parse instead of passing it on (SR-80). `has_data` tells an event with data the proxy could not read from a data-less one (a comment, a bare `id:`), which still passes. | 630 |
+| 8 | `crates/attenuo-proxy/src/label.rs` (`label_events` near line 428, the withheld branch near line 448), `guard.rs` (`disown_events` near line 480, the drop near line 495; `the_byte_scan_admits_every_spelling_of_the_code_pass7` near line 1135) | #124, SR-79. Nesting deeper than `serde_json`'s 128 levels is the case no rewrite fixes, so an unparseable event with data is dropped where it matters. `label_events` withholds it while an answer is awaited, since it may be the answer, and a client may read it unlabelled. `disown_events` drops one that passes the byte scan (it may hold `-32001`) and does not parse, with a `warn` line that gives only its size. The pass also checked #119's byte scan against generated spellings of `-32001` and found it sound; that test stays. | 690 |
+| 9 | `crates/attenuo-proxy/tests/security_pass7.rs` (`raw_sse_upstream` near line 17, `lenient_client_reads` near line 88, the five tests from line 117 to line 223), `docs/research/security-review-2026-10-25-pass7.md` (the summary table near line 24, SR-81 near line 82) | The regression tests, each failing on the pre-fix commit first. A raw upstream sends exact bytes, and `lenient_client_reads` parses the client's side as a lenient SDK would (lossy UTF-8, a leading BOM dropped, the `data:` lines joined and parsed), so each test asserts what a real client would act on. The report's open items: SR-81 (a record window opens even when its first audit append failed, so up to `record_window_seconds` of retries name an id no record has; the fix needs a new `Authorizer` method), SR-83 (the release workflow resolves `build`, `twine` and `hatchling` without hashes) and SR-84 (accepted: an AuthZEN batch refused by a 401 or 403 entry after earlier entries were decided). SR-82 was open when the report was written and is fixed by rows 10 and 11. | 250 |
+| 10 | `sdk/python/src/attenuo/_sse.py` (`SseParser` near line 82, its state near lines 96 to 99: `_head`, `_parts`, `_parts_len`, `_cr`; `SseParser.feed` near line 104, `_pending` near line 163), `sdk/python/tests/test_stream.py` (`test_parser_reads_a_long_line_in_small_reads_in_linear_time_sr82` near line 144) | #125, SR-82 part 1. `feed` used to append each read to one buffer and search it from the start, so a long line in small reads cost time quadratic in its length. Now each read is searched once from its own start. The unfinished line is a list of chunks with a byte count, joined once when its line end arrives, as the TypeScript parser already did. A CR at the end of a read is held in `_cr` and settled by the next read's first byte (LF makes it CRLF). `_head` holds the first bytes while they may still be a BOM split across reads. The bound now counts `_parts_len`. A 1 MiB line in 1 KiB reads took about 4 s and now takes about 10 to 20 ms. A throwaway differential check (300,000 random bodies, old parser against new) found no difference and was not committed. | 330 |
+| 11 | `_sse.py` (`check_deadline` near line 51, `Deadline` near line 57), `client.py` (`Client.call_tool_stream` near line 229 with `deadline` near line 239, `Deadline(deadline)` in `_stream` near line 294, `expires.check()` near lines 305 and 312; async twins near lines 586, 634, 645 and 653), `sdk/typescript/src/client.ts` (`CallToolStreamOptions.deadlineMs` near line 71, `MAX_TIMER_MS` near line 75, the check in `callToolStream` near line 287, the `AbortController` in `stream` near line 313 and the deadline timer near line 329), the `*_sr82` tests in `sdk/python/tests/test_stream.py` (near lines 523, 537 and 554) and `sdk/typescript/test/stream.test.ts` (near lines 523, 543 and 553) | #126, SR-82 part 2. Both SDKs restart their idle timer on every read, so an upstream sending `:\n\n` every few seconds kept a call open with no event, until the proxy's re-check ended it at token expiry or revocation. Now there is an optional total deadline, counted from the request's start and never restarted. Python checks a monotonic deadline between reads, so a silent upstream is still ended by the per-read `timeout`. On expiry it raises `AttenuoError("stream deadline of 3s elapsed")`, and the `finally` closes the response. TypeScript arms a second timer on the same `AbortController` as the idle timer: it aborts the fetch, and `onChunk` throws if a read still completes after it. `check_deadline` refuses zero, negative, NaN and infinity with `ValueError`; TypeScript throws `RangeError` for those and for anything above 2,147,483,647 ms, since a longer `setTimeout` fires at once. | 780 |
+
+Why each piece is shaped this way:
+
+- **One window for both bounded kinds.** The listen-stream ends and the lease refusals are the same problem, one condition seen many times. Two knobs would ask the operator to choose between values nobody has a reason to set apart, so there is one, and each kind keeps its own table. The bounds are wide (1 s to an hour, 100 to a million windows), and a value outside them stops startup instead of being clamped, so a typo is not quietly turned into some other value.
+- **A full table records.** If the table is full of open windows, the next condition is recorded, not counted. The bound can therefore fail towards more records, never towards fewer, and `record_window_max_keys` is a memory knob, not an audit knob.
+- **A measurement that changed nothing is still merged.** #122 kept its bench note, a bench cell and the SR-62 test at full list size. The next person who wants to batch these inserts can read why the same rows in fewer statements do not help, and the test guards the refunds any later change to what is written per value would have to keep.
+- **The SDKs check the reason and the id, although the proxy already rewrites.** After #117 nothing of the stream-end shape should reach a client from an upstream. The SDK check is the second wall. Behind a proxy too old to rewrite, or behind some other relay, a made-up `lease_revoked` with an id no record has now surfaces as `RpcError -32001`, which ends the call but does not claim a decision. The cost is that a custom `Authorizer` reason outside the six also surfaces as `RpcError`.
+- **Read the way the client reads.** The pass-7 bugs share one cause: the proxy's parser was stricter than the clients'. An event the proxy could not read went past labelling and the rewrite, and the client then read it. The fixes move the proxy towards what clients do (drop the BOM, accept lone surrogates), and where that cannot work (nesting past 128 levels, bytes that are not UTF-8) they stop relaying instead of passing the event on.
+- **A deadline, not a smaller idle timeout.** A keep-alive is a read, and the idle timer exists to restart on reads. Only a timer that never restarts can end a stream that keeps sending nothing useful. It is opt-in because a tool may honestly run for an hour, and a default would cut it.
+
+Check you understood:
+
+1. An operator sets `record_window_seconds = 0` in `[proxy]`. What happens at startup, and which function says so? With `= 2`, a client retries `initialize` on a revoked lease at 0 s, 0.1 s and 2.3 s: how many `deny` records are written, and what `X-Attenuo-Decision-Id` does each 401 carry? Which table does `record_window_max_keys` size, and what happens when it is full?
+2. Why does `[proxy]` have one window for both bounded kinds and not two? What does SR-81 say goes wrong with that window when the first audit append fails, and why was it not fixed in pass 7?
+3. #122 batched the inserts of a 256-value `distinct` charge and the medians barely moved. Where does the time go, per the bench note, and what would make the charge cheaper? Why is that a design decision and not a performance fix?
+4. A streamed Python call receives `{"id":null,"error":{"code":-32001,"message":"x","data":{"reason":"quota_exceeded","decision_id":"<a UUID>"}}}`. What does `call_tool_stream` raise, and what did it raise before #123? Where in `guard.rs` would you look to check the list of six?
+5. An upstream answers a labelled `tools/call` over SSE with an event whose data is the answer nested 200 arrays deep. What did the client get before #124, and what does it get now? What if the same event opens with a UTF-8 BOM, or holds a lone `\ud800` escape?
+6. A tool sends one progress event and then a keep-alive comment every 0.5 s. What ends the Python call with `timeout=1` and no deadline, and what ends it with `deadline=3`? What does TypeScript do with `deadlineMs: 3_000_000_000`?
+
+Run it. Start from the section 0 setup. No server is needed: every part runs tests or the SDK sources against a fake transport. You also need the section 8 venv active and the TypeScript dependencies installed (`npm ci` in `sdk/typescript`).
+
+```sh
+# 1. Record windows: the proxy's tests, then the server's settings.
+cargo test -p attenuo-proxy --locked record_window 2>&1 | grep -c '^test result: ok. 0 passed'
+# 13: the count of `test result: ok. 0 passed` lines (every test binary plus the doc-tests), none with a test of that name; the window's tests live in records::
+cargo test -p attenuo-proxy --lib --locked records:: 2>&1 | grep 'test result'
+# test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 64 filtered out
+# (a_short_window_closes_sooner and a_full_table_at_the_smallest_configurable_size_records among them)
+cargo test -p attenuo-server --locked record_window 2>&1 | grep '^test '
+# test config::tests::proxy_record_window_defaults_and_bounds ... ok
+# test record_window_seconds_sets_the_lease_refusal_window ... ok
+grep -n '^record_window' config/example.toml
+# 290:record_window_seconds = 60
+# 291:record_window_max_keys = 10000
+
+# 2. The distinct list charge: the one test #122 kept.
+cargo test -p attenuo-audit --test budgets --locked sr62 2>&1 | grep -E '^test |test result'
+# test a_distinct_refund_keeps_a_value_a_later_call_used_sr62 ... ok
+# test a_refund_after_a_wide_list_charge_frees_only_unshared_values_sr62 ... ok
+# test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out
+
+# 3. What the SDK reads as a cut, since #123.
+PYTHONPATH=sdk/python/src python3 - <<'PY'
+from attenuo._sse import stream_end_error
+def cut(data): return {"jsonrpc": "2.0", "id": None, "error": {"code": -32001, "message": "stream ended", "data": data}}
+for d in [{"reason": "lease_revoked", "decision_id": "f49e431b-1c2d-4e5f-8a9b-0c1d2e3f4a5b"},
+          {"reason": "lease_revoked"},
+          {"reason": "quota_exceeded", "decision_id": "f49e431b-1c2d-4e5f-8a9b-0c1d2e3f4a5b"},
+          {"reason": "lease_revoked", "decision_id": "not-a-uuid"},
+          None]:
+    e = stream_end_error(cut(d))
+    print(type(e).__name__, getattr(e, "reason", None) or getattr(e, "code", None), getattr(e, "decision_id", ""))
+print(stream_end_error({"jsonrpc": "2.0", "id": 7, "error": {"code": -32001, "message": "x"}}))
+PY
+# Denied lease_revoked f49e431b-1c2d-4e5f-8a9b-0c1d2e3f4a5b    a known reason and a UUID: the proxy's cut
+# Denied lease_revoked None                                   no id (an end that was not recorded) is still a cut
+# RpcError -32001                                             a reason the proxy never sends
+# RpcError -32001                                             an id that is not a UUID
+# RpcError -32001                                             no data at all
+# None                                                        an answer by the call's id is not the stream-end shape
+
+# 4. Pass 7: the proxy's regression tests.
+cargo test -p attenuo-proxy --test security_pass7 --locked 2>&1 | grep -E '^test |test result'
+# test a_list_answer_the_proxy_cannot_parse_is_not_relayed_unfiltered_sr80 ... ok
+# test a_bom_or_invalid_byte_does_not_hide_a_stream_end_lookalike_sr77 ... ok
+# test a_lone_surrogate_escape_does_not_hide_an_answer_sr78 ... ok
+# test an_event_the_proxy_cannot_parse_is_not_relayed_sr79 ... ok
+# test an_sse_answer_a_client_reads_is_labelled_sr77 ... ok
+# test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+cargo test -p attenuo-proxy --lib --locked -- sr77 sr78 sr80 pass7 2>&1 | grep 'test result'
+# test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 67 filtered out
+# (the BOM and non-UTF-8 test, the lone-surrogate test, the SR-80 rewriter test and the byte-scan check)
+
+# 5. SR-82 part 1: a 1 MiB line in 1 KiB reads.
+PYTHONPATH=sdk/python/src python3 - <<'PY'
+import time
+from attenuo._sse import SseParser
+line = b"data: " + b"x" * (1 << 20) + b"\n\n"
+p = SseParser(); t = time.monotonic(); n = 0
+for i in range(0, len(line), 1024):
+    n += len(list(p.feed(line[i:i + 1024])))
+print(f"{n} event, {len(line)} bytes in 1 KiB reads: {(time.monotonic() - t) * 1000:.0f} ms")
+PY
+# 1 event, 1048584 bytes in 1 KiB reads: 17 ms             (about 4 s before #125)
+
+# 6. SR-82 part 2: keep-alives every 0.5 s, a 1 s idle timeout, a 3 s deadline.
+PYTHONPATH=sdk/python/src python3 - <<'PY'
+import time, httpx
+from attenuo import Client, AttenuoError
+
+def body():
+    yield b'data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1}}\n\n'
+    while True:
+        yield b":\n\n"
+        time.sleep(0.5)
+
+class Body(httpx.SyncByteStream):
+    def __iter__(self): return body()
+
+handler = lambda r: httpx.Response(200, stream=Body(), headers={"content-type": "text/event-stream"})
+t0 = time.monotonic()
+with Client("http://127.0.0.1:1", timeout=1, transport=httpx.MockTransport(handler)) as ob:
+    try:
+        for ev in ob.call_tool_stream("TOK", "srv", "t", deadline=3):
+            print(f"{time.monotonic() - t0:.1f}s", ev.method)
+    except AttenuoError as e:
+        print(f"{time.monotonic() - t0:.1f}s", type(e).__name__, e)
+PY
+# 0.0s notifications/progress
+# 3.0s AttenuoError stream deadline of 3s elapsed          the 1 s idle timeout never fired: every 0.5 s brought a read
+PYTHONPATH=sdk/python/src python3 -m pytest sdk/python/tests/test_stream.py -q -k sr82 2>&1 | tail -1
+# 10 passed, 55 deselected in 1.26s
+(cd sdk/typescript && npx vitest run test/stream.test.ts -t sr82 2>&1 | grep 'Tests ')
+#       Tests  3 passed | 33 skipped (36)
+```
+
+Every command in the block was run in this order against `main` @ fabb60a on 2026-10-25, from a clean worktree with `ATTENUO_TOKEN`, `ATTENUO_SERVER` and `ATTENUO_ADMIN_TOKEN` unset, and prints what is quoted, the test counts included. The cargo commands ran as debug builds without debug info (`CARGO_PROFILE_DEV_DEBUG=0`, a separate `CARGO_TARGET_DIR`). The three Python snippets were run from files with exactly the contents shown, in a virtual environment with the SDK's dependencies. The TypeScript part ran against the installed `node_modules`; it needs no build, since vitest reads the sources. The parser timing differs on every run (the log of #125 has 9.5 to 12.8 ms on the machine that measured it). Not shown live, and where to look instead:
+
+- The startup refusal of an out-of-range window. `proxy_record_window_defaults_and_bounds` checks the exact text of five refusals, and the 04:32 log entry records the server exiting with `Error: [proxy] record_window_seconds must be between 1 and 3600, not 0`. Not rerun for this page.
+- The criterion runs behind #122. The commands are at the end of the bench note; like the other benchmarks they were not rerun.
+- A deadline against a real server. `fake_mcp --sse` sends no keep-alive comments, so a live run would show nothing the fake transport does not. The TypeScript deadline is shown by its three tests only.
+- SR-79 at the byte level. `an_event_the_proxy_cannot_parse_is_not_relayed_sr79` builds the 200-deep nesting; read it beside `disown_events`.
+
+What is still open after this session (from the [task board](../tasks/board.md), [pass 7](../research/security-review-2026-10-25-pass7.md) and the logs of these merges; items of session 15's list not named here stand as written there):
+
+- Proxy: SR-81 is open. A record window opens even when the record that opened it failed to write, so for up to `record_window_seconds` later occurrences name an id that is in no record. The fix needs a checked variant of `Authorizer::record_rejection` and a way to forget a slot. A fix branch, `fix/sr81-record-window-failed-append`, is in flight and may land after this session; it is not covered here. The window settings are read at startup only, not on reload, and a suppressed occurrence's count is still only in the metric and the log. The three look-alike residuals of session 15 stand (relayed unread answers to `initialize`, `ping` and notification-only `POST`s; an upstream `-32001` by the request's id; the scan not measured end to end).
+- SDKs: SR-82 is closed. The deadline is opt-in, so a caller who passes none can still be held by keep-alives until the proxy's re-check ends the stream. Neither SDK can tell that a stream-end id is the proxy's, since the header went out before the cut. A custom `Authorizer` reason outside the six surfaces as `RpcError -32001`. The other SDK items of session 15 (server requests on a stream, `Last-Event-ID` resumption, the sdist test suite, npm trusted publishing) are unchanged.
+- Release and CI: SR-83 is open (`build`, `twine` and `hatchling` resolved without hashes in the publish job, `npm ci` running install scripts in a job that holds `id-token: write`). It needs a hashed requirements file and a CI run, and Actions are blocked on billing. SR-84 is accepted.
+- Run limits: whether to lower `MAX_COUNTED_VALUES`, or write fewer rows per value, is the maintainer's decision. #122 showed that batching the same rows does not help. A 64 MiB SQLite page cache cut the 256-value charge by about 22 % in one timed run, at a memory cost for the whole store; that is a separate, unmeasured decision on the board.
 
 ## 3. Why it is this way
 
