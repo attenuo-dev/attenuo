@@ -35,6 +35,9 @@ pub struct AppState {
     /// `[leases] run_state_retention_seconds`; `None` when run-limit counters, the charge log
     /// and approvals are never pruned.
     pub run_state_retention: Option<Duration>,
+    /// `[leases] maintenance_*`: how often the maintenance task runs, the rows of one
+    /// pruning pass and the most passes of each kind per run.
+    pub lease_maintenance: crate::config::LeaseMaintenance,
     /// Policy file to re-read on reload; `None` when no policy file is configured.
     pub policies_path: Option<PathBuf>,
     /// Digest and load time of the policy set in force, for `GET /admin/policies`. The engine
@@ -97,6 +100,7 @@ impl AppState {
         config.proxy.check_limits()?;
         config.token.check_dpop()?;
         config.approvals.check()?;
+        let lease_maintenance = config.leases.maintenance()?;
         let issuer = load_issuer(config)?;
         // Server DPoP nonces are keyed by the issuer's private key (see `crate::dpop`).
         let dpop = Arc::new(
@@ -241,6 +245,7 @@ impl AppState {
             session_retention: config.leases.session_retention(),
             lease_retention: config.leases.retention(),
             run_state_retention: config.leases.run_state_retention(),
+            lease_maintenance,
             policies_path: config.policy.policies_path.clone(),
             loaded_policies,
             admin_token: config.admin.token.clone(),

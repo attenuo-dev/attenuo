@@ -22,9 +22,16 @@ fn t0() -> OffsetDateTime {
     datetime!(2026-10-22 21:00 UTC)
 }
 
+/// 512 cases, or `PROPTEST_CASES` when set (for longer soak runs). `range()` rejects about
+/// one draw in three, so the local reject allowance grows with the case count.
 fn config() -> ProptestConfig {
+    let cases: u32 = std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(512);
     ProptestConfig {
-        cases: 512,
+        cases,
+        max_local_rejects: cases.saturating_mul(4).max(65_536),
         failure_persistence: None,
         ..ProptestConfig::default()
     }
@@ -262,6 +269,32 @@ fn value_pool() -> impl Strategy<Value = Vec<Value>> {
         pool.push(json!(true));
         pool
     })
+}
+
+/// Is `got` what `attenuate` may return for a covered `requested`? It is `requested`, except
+/// that a `calls_per` or `distinct` may have its `max` lowered on the same argument and
+/// derivation (to the parent's figure, by `Limits::clamp_to`). `covers` accepts such a request
+/// because its own `calls` is no larger than the parent's `max`, and that `calls` must also be
+/// no larger than the lowered `max`: the per-value bound in force, `min(calls, max)`, is the
+/// same before and after. Every other field must be equal.
+fn effect_free_clamp(requested: &Capability, got: &Capability) -> bool {
+    let (r, g) = (&requested.limits, &got.limits);
+    let per_value = |r: &Option<ArgLimit>, g: &Option<ArgLimit>| match (r, g) {
+        (Some(r), Some(g)) if r != g => {
+            r.arg == g.arg
+                && r.derive == g.derive
+                && g.max < r.max
+                && requested.limits.calls.is_some_and(|n| n <= g.max)
+        }
+        _ => r == g,
+    };
+    requested.server == got.server
+        && requested.tool == got.tool
+        && requested.constraints == got.constraints
+        && r.calls == g.calls
+        && r.sum == g.sum
+        && per_value(&r.calls_per, &g.calls_per)
+        && per_value(&r.distinct, &g.distinct)
 }
 
 fn last_expiry(c: &DelegationChain) -> OffsetDateTime {
@@ -528,7 +561,17 @@ proptest! {
             Ok(got) => {
                 prop_assert!(parent.covers(&got));
                 if covered {
-                    prop_assert_eq!(got, requested);
+                    // A covered request comes back as it was, up to the one clamp that
+                    // changes no figure in effect (see `effect_free_clamp`).
+                    prop_assert!(got.len() <= requested.len());
+                    for c in requested.iter() {
+                        prop_assert!(got.iter().any(|g| effect_free_clamp(c, g)),
+                            "{c:?} has no counterpart in {got:?}");
+                    }
+                    for g in got.iter() {
+                        prop_assert!(requested.iter().any(|c| effect_free_clamp(c, g)),
+                            "{g:?} was not requested");
+                    }
                 } else {
                     // Only limits changed: the calls the request names are all still there.
                     for c in requested.iter() {
@@ -614,5 +657,55 @@ proptest! {
         let back: DelegationChain = serde_json::from_str(&s).unwrap();
         prop_assert_eq!(back.digest(), chain.digest());
         prop_assert_eq!(back, chain);
+    }
+}
+
+// ---------------------------------------------------------------- regressions
+
+/// The case `attenuate_iff_covered_and_nonempty` once failed on: a request whose `calls: 0`
+/// meets the parent's `calls_per`/`distinct` of 0 (RFC 0001 section 3, rule 3) while its own
+/// figure on the same argument is 1. It is covered, so `attenuate` accepts it, and lowers the
+/// child's figure to the parent's. That changes nothing in effect (no call is allowed either
+/// way), so the oracle must accept the lowered result and still refuse any other difference.
+#[test]
+fn covered_request_with_calls_below_parent_per_value_limit_is_clamped_without_effect() {
+    for (parent_limits, requested_limits, expected_limits) in [
+        (
+            Limits::default().with_calls_per("y", 0),
+            Limits::default().with_calls(0).with_calls_per("y", 1),
+            Limits::default().with_calls(0).with_calls_per("y", 0),
+        ),
+        (
+            Limits::default().with_distinct("y", 0),
+            Limits::default().with_calls(0).with_distinct("y", 1),
+            Limits::default().with_calls(0).with_distinct("y", 0),
+        ),
+    ] {
+        let parent = CapabilitySet::from_iter([Capability {
+            limits: parent_limits,
+            ..Capability::new("*", "*")
+        }]);
+        let requested_cap = Capability {
+            limits: requested_limits,
+            ..Capability::new("a", "a")
+        };
+        let requested = CapabilitySet::from_iter([requested_cap.clone()]);
+        assert!(parent.covers(&requested));
+        let got = parent.attenuate(&requested).expect("covered, so accepted");
+        let got_cap = got.iter().next().unwrap().clone();
+        assert_eq!(got_cap.limits, expected_limits);
+        assert!(effect_free_clamp(&requested_cap, &got_cap));
+
+        // The oracle stays strict: a lowered figure the request's `calls` does not bound
+        // (`calls: 1` with the figure going from 1 to 0 refuses a call that was allowed), a
+        // changed `calls`, or a raised figure are all differences it refuses.
+        let (mut loose, mut loose_got) = (requested_cap.clone(), got_cap.clone());
+        loose.limits.calls = Some(1);
+        loose_got.limits.calls = Some(1);
+        assert!(!effect_free_clamp(&loose, &loose_got));
+        let mut raised = got_cap.clone();
+        raised.limits.calls = None;
+        assert!(!effect_free_clamp(&requested_cap, &raised));
+        assert!(!effect_free_clamp(&got_cap, &requested_cap));
     }
 }

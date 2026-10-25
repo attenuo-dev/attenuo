@@ -1015,6 +1015,59 @@ pub struct LeasesSection {
     /// audit log keeps every decision, charge and approval record. 0 keeps everything.
     #[serde(default = "default_run_state_retention_seconds")]
     pub run_state_retention_seconds: u64,
+    /// Seconds between runs of the lease maintenance task (the session, lease and run-state
+    /// passes above). Default 60, at least 1.
+    #[serde(default = "default_maintenance_interval_seconds")]
+    pub maintenance_interval_seconds: u64,
+    /// Rows one pruning pass looks at, each pass one write transaction. Default 1000, between
+    /// 1 and 100000. Smaller passes hold the write lock for less time and take more of them.
+    #[serde(default = "default_maintenance_batch_rows")]
+    pub maintenance_batch_rows: u64,
+    /// Most passes of each kind in one run of the maintenance task; what is left waits for
+    /// the next run. Default 100, between 1 and 10000.
+    #[serde(default = "default_maintenance_max_passes")]
+    pub maintenance_max_passes: u64,
+}
+
+/// How the lease maintenance task runs: `[leases] maintenance_interval_seconds`,
+/// `maintenance_batch_rows` and `maintenance_max_passes`, checked
+/// ([`LeasesSection::maintenance`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseMaintenance {
+    /// Time between runs.
+    pub interval: std::time::Duration,
+    /// Rows one pass looks at.
+    pub batch_rows: usize,
+    /// Most passes of each kind per run.
+    pub max_passes: usize,
+}
+
+impl Default for LeaseMaintenance {
+    fn default() -> Self {
+        Self {
+            interval: crate::LEASE_MAINTENANCE_PERIOD,
+            batch_rows: crate::LEASE_PRUNE_BATCH,
+            max_passes: crate::LEASE_PRUNE_MAX_PASSES,
+        }
+    }
+}
+
+/// Largest `[leases] maintenance_batch_rows`.
+pub const MAX_MAINTENANCE_BATCH_ROWS: u64 = 100_000;
+
+/// Largest `[leases] maintenance_max_passes`.
+pub const MAX_MAINTENANCE_MAX_PASSES: u64 = 10_000;
+
+fn default_maintenance_interval_seconds() -> u64 {
+    crate::LEASE_MAINTENANCE_PERIOD.as_secs()
+}
+
+fn default_maintenance_batch_rows() -> u64 {
+    crate::LEASE_PRUNE_BATCH as u64
+}
+
+fn default_maintenance_max_passes() -> u64 {
+    crate::LEASE_PRUNE_MAX_PASSES as u64
 }
 
 /// Default of `[leases] run_state_retention_seconds`: 30 days, counted from the newest charge,
@@ -1055,6 +1108,9 @@ impl Default for LeasesSection {
             retention_seconds: DEFAULT_LEASE_RETENTION_SECONDS,
             session_retention_seconds: DEFAULT_SESSION_RETENTION_SECONDS,
             run_state_retention_seconds: DEFAULT_RUN_STATE_RETENTION_SECONDS,
+            maintenance_interval_seconds: default_maintenance_interval_seconds(),
+            maintenance_batch_rows: default_maintenance_batch_rows(),
+            maintenance_max_passes: default_maintenance_max_passes(),
         }
     }
 }
@@ -1073,6 +1129,35 @@ impl LeasesSection {
     /// `run_state_retention_seconds` as a duration; `None` when run-state pruning is off (0).
     pub fn run_state_retention(&self) -> Option<time::Duration> {
         seconds_or_off(self.run_state_retention_seconds)
+    }
+
+    /// The maintenance settings, or an error naming the first one out of range. Checked at
+    /// startup whether or not any retention is on.
+    pub fn maintenance(&self) -> anyhow::Result<LeaseMaintenance> {
+        if self.maintenance_interval_seconds == 0 {
+            anyhow::bail!("[leases] maintenance_interval_seconds must be at least 1");
+        }
+        for (name, value, max) in [
+            (
+                "maintenance_batch_rows",
+                self.maintenance_batch_rows,
+                MAX_MAINTENANCE_BATCH_ROWS,
+            ),
+            (
+                "maintenance_max_passes",
+                self.maintenance_max_passes,
+                MAX_MAINTENANCE_MAX_PASSES,
+            ),
+        ] {
+            if !(1..=max).contains(&value) {
+                anyhow::bail!("[leases] {name} must be between 1 and {max}, not {value}");
+            }
+        }
+        Ok(LeaseMaintenance {
+            interval: std::time::Duration::from_secs(self.maintenance_interval_seconds),
+            batch_rows: usize::try_from(self.maintenance_batch_rows)?,
+            max_passes: usize::try_from(self.maintenance_max_passes)?,
+        })
     }
 }
 
@@ -1788,6 +1873,67 @@ mod tests {
         assert_eq!(cfg.leases.run_state_retention(), None);
         assert_eq!(cfg.leases.retention(), Some(time::Duration::weeks(1)));
         assert!(super::Config::from_toml("[leases]\nrun_state_retention = 1\n").is_err());
+    }
+
+    #[test]
+    fn lease_maintenance_defaults_and_bounds() {
+        let cfg = super::Config::from_toml("").unwrap();
+        assert_eq!(cfg.leases.maintenance_interval_seconds, 60);
+        assert_eq!(cfg.leases.maintenance_batch_rows, 1_000);
+        assert_eq!(cfg.leases.maintenance_max_passes, 100);
+        let m = cfg.leases.maintenance().unwrap();
+        assert_eq!(m, super::LeaseMaintenance::default());
+        assert_eq!(m.interval, std::time::Duration::from_secs(60));
+        assert_eq!((m.batch_rows, m.max_passes), (1_000, 100));
+
+        let cfg = super::Config::from_toml(
+            "[leases]\nmaintenance_interval_seconds = 1\nmaintenance_batch_rows = 100000\n\
+             maintenance_max_passes = 10000\n",
+        )
+        .unwrap();
+        let m = cfg.leases.maintenance().unwrap();
+        assert_eq!(m.interval, std::time::Duration::from_secs(1));
+        assert_eq!((m.batch_rows, m.max_passes), (100_000, 10_000));
+        let cfg = super::Config::from_toml(
+            "[leases]\nmaintenance_batch_rows = 1\nmaintenance_max_passes = 1\n",
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                cfg.leases.maintenance().unwrap().batch_rows,
+                cfg.leases.maintenance().unwrap().max_passes
+            ),
+            (1, 1)
+        );
+
+        for (line, expect) in [
+            (
+                "maintenance_interval_seconds = 0",
+                "[leases] maintenance_interval_seconds must be at least 1",
+            ),
+            (
+                "maintenance_batch_rows = 0",
+                "[leases] maintenance_batch_rows must be between 1 and 100000, not 0",
+            ),
+            (
+                "maintenance_batch_rows = 100001",
+                "[leases] maintenance_batch_rows must be between 1 and 100000, not 100001",
+            ),
+            (
+                "maintenance_max_passes = 0",
+                "[leases] maintenance_max_passes must be between 1 and 10000, not 0",
+            ),
+            (
+                "maintenance_max_passes = 10001",
+                "[leases] maintenance_max_passes must be between 1 and 10000, not 10001",
+            ),
+        ] {
+            let cfg = super::Config::from_toml(&format!("[leases]\n{line}\n")).unwrap();
+            let err = cfg.leases.maintenance().unwrap_err().to_string();
+            assert_eq!(err, expect);
+        }
+        // Negative figures do not parse.
+        assert!(super::Config::from_toml("[leases]\nmaintenance_batch_rows = -1\n").is_err());
     }
 
     use super::*;
