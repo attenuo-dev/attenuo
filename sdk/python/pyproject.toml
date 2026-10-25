@@ -10,11 +10,21 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
+authors = [{ name = "The attenuo authors" }]
 keywords = ["attenuo", "mcp", "agents", "authorization", "delegation", "rfc8693"]
 dependencies = ["httpx>=0.25", "rfc8785==0.1.4"]
+# No "License ::" classifier: with a PEP 639 `license` expression hatchling rejects one.
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security",
   "Typing :: Typed",
 ]
 
@@ -26,6 +36,7 @@ dpop = ["cryptography>=41"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "cryptography>=41", "ruff", "mypy"]
 
 [project.urls]
+Homepage = "https://github.com/attenuo-dev/attenuo"
 Repository = "https://github.com/attenuo-dev/attenuo"
 Documentation = "https://github.com/attenuo-dev/attenuo/tree/main/sdk/python"
 Issues = "https://github.com/attenuo-dev/attenuo/issues"
