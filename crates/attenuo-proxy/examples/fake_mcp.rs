@@ -8,15 +8,22 @@
 //! It prints `listening on http://<addr>/mcp` once bound, and one line to stderr for every
 //! `tools/call` it receives, so a demo can show which calls actually reached the upstream.
 //! `--port 0` (the default) picks a free port; `--host ADDR` (default 127.0.0.1) is the bind
-//! address; `--tools a,b,c` changes the tool names.
+//! address; `--tools a,b,c` changes the tool names; `--sse` streams the answers (below).
 //!
 //! Scripted outputs: `POST /script` with `{"outputs": {"<tool>": ["text", ...]}}` replaces the
 //! script. Each later `tools/call` of `<tool>` takes the next text from its list and gets it as
 //! a second `text` content item after the echo; a tool with no text left gets the echo only.
 //! `{"outputs": {}}` clears the script. The injection suite uses this for its `output:` field.
+//!
+//! Streaming: `--sse` answers every request as `text/event-stream`, a `notifications/message`
+//! event first and then the response (with an `id:` field), like a server that streams a long
+//! `tools/call`. A `tools/call` whose arguments hold `"hold_ms": N` then gets the first event at
+//! once and the response N milliseconds later, so a test can keep the stream open (the SDKs'
+//! streaming tests revoke the lease meanwhile and see the proxy cut the stream).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use attenuo_proxy::testing::FakeMcpServer;
 use axum::body::{to_bytes, Body, Bytes};
@@ -26,6 +33,7 @@ use axum::middleware::{from_fn_with_state, Next};
 use axum::response::Response;
 use axum::routing::post;
 use axum::Router;
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 /// Texts still to be returned, per tool name, in order.
@@ -82,10 +90,27 @@ fn add_output(reply: &mut Value, outputs: &[(Value, String)]) {
     }
 }
 
+/// With `hold_ms`: send the first SSE event of `body` at once and the rest `hold_ms` later.
+fn held_sse(body: Bytes, hold_ms: u64) -> Body {
+    let cut = body
+        .windows(2)
+        .position(|w| w == b"\n\n")
+        .map_or(body.len(), |i| i + 2);
+    let first = body.slice(..cut);
+    let rest = body.slice(cut..);
+    let head = futures_util::stream::once(async move { Ok::<_, std::io::Error>(first) });
+    let tail = futures_util::stream::once(async move {
+        tokio::time::sleep(Duration::from_millis(hold_ms)).await;
+        Ok::<_, std::io::Error>(rest)
+    });
+    Body::from_stream(head.chain(tail))
+}
+
 async fn log_calls(State(script): State<Script>, req: Request, next: Next) -> Response {
     let (parts, body) = req.into_parts();
     let bytes = to_bytes(body, 1 << 20).await.unwrap_or_default();
     let mut outputs: Vec<(Value, String)> = Vec::new();
+    let mut hold_ms = 0;
     if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
         if v["method"] == "tools/call" {
             eprintln!(
@@ -93,6 +118,7 @@ async fn log_calls(State(script): State<Script>, req: Request, next: Next) -> Re
                 v["params"]["name"].as_str().unwrap_or("?"),
                 v["params"]["arguments"]
             );
+            hold_ms = v["params"]["arguments"]["hold_ms"].as_u64().unwrap_or(0);
         }
         let msgs = match &v {
             Value::Array(items) => items.iter().collect::<Vec<_>>(),
@@ -109,6 +135,15 @@ async fn log_calls(State(script): State<Script>, req: Request, next: Next) -> Re
     let response = next
         .run(Request::from_parts(parts, Body::from(bytes)))
         .await;
+    let sse = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"));
+    if sse && hold_ms > 0 {
+        let (parts, body) = response.into_parts();
+        let bytes = to_bytes(body, 1 << 24).await.unwrap_or_default();
+        return Response::from_parts(parts, held_sse(bytes, hold_ms));
+    }
     if outputs.is_empty() {
         return response;
     }
@@ -131,6 +166,7 @@ async fn main() -> anyhow::Result<()> {
         "create_issue".to_string(),
         "delete_repo".to_string(),
     ];
+    let mut sse = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -153,8 +189,11 @@ async fn main() -> anyhow::Result<()> {
                     .map(str::to_owned)
                     .collect()
             }
+            "--sse" => sse = true,
             other => {
-                anyhow::bail!("unknown argument `{other}` (try --port N, --host ADDR, --tools a,b)")
+                anyhow::bail!(
+                    "unknown argument `{other}` (try --port N, --host ADDR, --tools a,b, --sse)"
+                )
             }
         }
     }
@@ -163,7 +202,12 @@ async fn main() -> anyhow::Result<()> {
     let router = Router::new()
         .route("/script", post(set_script))
         .with_state(script.clone())
-        .merge(FakeMcpServer::new(&names).router())
+        .merge(
+            FakeMcpServer::new(&names)
+                .with_sse(sse)
+                .with_sse_event_per_response(sse)
+                .router(),
+        )
         .layer(from_fn_with_state(script, log_calls));
     let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
     println!("listening on http://{}/mcp", listener.local_addr()?);
