@@ -189,21 +189,22 @@ pub fn spawn_checkpointer(
     })
 }
 
-/// How often the lease maintenance ticker runs ([`spawn_lease_maintenance`]).
+/// Default of `[leases] maintenance_interval_seconds`: how often the lease maintenance ticker
+/// runs ([`spawn_lease_maintenance`]).
 pub const LEASE_MAINTENANCE_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Rows one pruning pass looks at (session bindings, leases, or run state): one short write
-/// transaction each. A lease pass also reads and deletes the whole tree of every top lease
+/// Default of `[leases] maintenance_batch_rows`: rows one pruning pass looks at (session
+/// bindings, leases, or run state), one short write transaction each. A lease pass also reads and deletes the whole tree of every top lease
 /// among them; a run-state pass, every charge-log row of each charged decision among them.
 pub const LEASE_PRUNE_BATCH: usize = 1_000;
 
-/// Most passes of each kind in one run of the ticker, so one run looks at no more than
-/// `LEASE_PRUNE_BATCH * LEASE_PRUNE_MAX_PASSES` rows (100,000) of each table before it waits
-/// for the next period.
+/// Default of `[leases] maintenance_max_passes`: most passes of each kind in one run of the
+/// ticker, so one run looks at no more than `maintenance_batch_rows * maintenance_max_passes`
+/// rows (100,000 by default) of each table before it waits for the next period.
 pub const LEASE_PRUNE_MAX_PASSES: usize = 100;
 
 /// Run pruning passes on the blocking pool until one reaches the end of its table or
-/// [`LEASE_PRUNE_MAX_PASSES`] have run. `pass` returns what it deleted and whether it
+/// `[leases] maintenance_max_passes` have run. `pass` returns what it deleted and whether it
 /// wrapped; `count` adds what one pass deleted to its metrics (and returns the total, for
 /// the return value and the log line). Returns the total deleted.
 async fn prune_in_passes<F, P>(
@@ -220,7 +221,7 @@ where
     P: Send + 'static,
 {
     let mut total = 0;
-    for _ in 0..LEASE_PRUNE_MAX_PASSES {
+    for _ in 0..state.lease_maintenance.max_passes {
         let now = time::OffsetDateTime::now_utc();
         match state.blocking(move |s| pass(s, now)).await {
             Ok((pruned, wrapped)) => {
@@ -243,8 +244,8 @@ where
 }
 
 /// One run of session retention (`[leases] session_retention_seconds`): pruning passes of
-/// [`LEASE_PRUNE_BATCH`] bindings, each its own write transaction on the blocking pool,
-/// until a pass reaches the end of the table or [`LEASE_PRUNE_MAX_PASSES`] have run. The
+/// `[leases] maintenance_batch_rows` bindings, each its own write transaction on the blocking
+/// pool, until a pass reaches the end of the table or `maintenance_max_passes` have run. The
 /// next run continues where this one stopped. Counts every deleted binding in
 /// `lease_sessions_pruned_total` and returns how many it deleted; 0 when retention is off.
 pub async fn prune_session_bindings(state: &Arc<AppState>) -> u64 {
@@ -256,7 +257,8 @@ pub async fn prune_session_bindings(state: &Arc<AppState>) -> u64 {
         "session bindings",
         move |s, now| {
             use attenuo_audit::LeaseStore;
-            let p = s.leases.prune_sessions(now, retention, LEASE_PRUNE_BATCH)?;
+            let batch = s.lease_maintenance.batch_rows;
+            let p = s.leases.prune_sessions(now, retention, batch)?;
             Ok((p.pruned, p.wrapped))
         },
         |m, n| {
@@ -269,7 +271,7 @@ pub async fn prune_session_bindings(state: &Arc<AppState>) -> u64 {
 
 /// One run of lease retention (`[leases] retention_seconds`): passes of
 /// [`LeaseStore::prune_leases`](attenuo_audit::LeaseStore::prune_leases) over
-/// [`LEASE_PRUNE_BATCH`] leases each, bounded like [`prune_session_bindings`]. A lease tree
+/// `maintenance_batch_rows` leases each, bounded like [`prune_session_bindings`]. A lease tree
 /// goes whole once every lease in it ended (revoked or expired) longer ago than the
 /// retention, with its subjects and bindings. Counts every deleted lease in
 /// `leases_pruned_total` and returns how many it deleted; 0 when retention is off.
@@ -282,7 +284,8 @@ pub async fn prune_lease_registry(state: &Arc<AppState>) -> u64 {
         "leases",
         move |s, now| {
             use attenuo_audit::LeaseStore;
-            let p = s.leases.prune_leases(now, retention, LEASE_PRUNE_BATCH)?;
+            let batch = s.lease_maintenance.batch_rows;
+            let p = s.leases.prune_leases(now, retention, batch)?;
             Ok((p.pruned, p.wrapped))
         },
         |m, n| {
@@ -295,7 +298,7 @@ pub async fn prune_lease_registry(state: &Arc<AppState>) -> u64 {
 
 /// One run of run-state retention (`[leases] run_state_retention_seconds`): passes of
 /// [`LeaseStore::prune_run_state`](attenuo_audit::LeaseStore::prune_run_state) over
-/// [`LEASE_PRUNE_BATCH`] rows each, bounded like [`prune_session_bindings`]. Run-limit
+/// `maintenance_batch_rows` rows each, bounded like [`prune_session_bindings`]. Run-limit
 /// counters, the charge log and approvals go once the leases they belong to are gone from the
 /// registry and they are older than the retention; nothing of a lease still in the registry
 /// is touched. Counts each kind in `run_state_pruned_total{kind}` and returns how many rows
@@ -309,9 +312,8 @@ pub async fn prune_run_state(state: &Arc<AppState>) -> u64 {
         "run-limit counters, charges and approvals",
         move |s, now| {
             use attenuo_audit::LeaseStore;
-            let p = s
-                .leases
-                .prune_run_state(now, retention, LEASE_PRUNE_BATCH)?;
+            let batch = s.lease_maintenance.batch_rows;
+            let p = s.leases.prune_run_state(now, retention, batch)?;
             Ok((p, p.wrapped))
         },
         |m, p| {
@@ -322,14 +324,14 @@ pub async fn prune_run_state(state: &Arc<AppState>) -> u64 {
     .await
 }
 
-/// Start the lease maintenance ticker: every [`LEASE_MAINTENANCE_PERIOD`],
+/// Start the lease maintenance ticker: every `[leases] maintenance_interval_seconds`,
 /// [`prune_session_bindings`], then [`prune_lease_registry`], then [`prune_run_state`] (each
 /// does nothing when its retention is 0). Sessions go first, so a binding whose chain is about
 /// to be pruned is counted as a session; run state goes last, since it is only pruned once
 /// its leases are gone. Dropping the handle does not stop it; abort it to stop.
 pub fn spawn_lease_maintenance(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(LEASE_MAINTENANCE_PERIOD);
+        let mut tick = tokio::time::interval(state.lease_maintenance.interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await; // the first tick is immediate
         loop {
@@ -532,5 +534,89 @@ mod shutdown_tests {
         task.await.unwrap().unwrap();
         assert!(t.elapsed() < Duration::from_secs(5));
         req.abort();
+    }
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+    use attenuo_audit::LeaseStore;
+    use attenuo_core::LeaseId;
+
+    /// A server on an in-memory store with a lease retention of 1 s, the given
+    /// `[leases] maintenance_batch_rows` and `maintenance_max_passes`, and 30 single-lease
+    /// runs that expired an hour ago (so all of them are prunable).
+    fn state_with_ended_runs(batch_rows: u64, max_passes: u64) -> Arc<AppState> {
+        let mut cfg = Config::default();
+        cfg.audit.sqlite_path = ":memory:".into();
+        cfg.leases.retention_seconds = 1;
+        cfg.leases.maintenance_batch_rows = batch_rows;
+        cfg.leases.maintenance_max_passes = max_passes;
+        let state = AppState::from_config(&cfg).unwrap();
+        assert_eq!(state.lease_maintenance.batch_rows, batch_rows as usize);
+        assert_eq!(state.lease_maintenance.max_passes, max_passes as usize);
+        let expired = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+        for n in 0..30 {
+            let id = LeaseId::new(format!("run{n:02}"));
+            state.leases.register(&id, None, expired).unwrap();
+        }
+        Arc::new(state)
+    }
+
+    /// Runs of `prune_lease_registry` until one deletes nothing; returns what each deleted.
+    async fn runs_until_clean(state: &Arc<AppState>) -> Vec<u64> {
+        let mut runs = Vec::new();
+        loop {
+            let n = prune_lease_registry(state).await;
+            if n == 0 {
+                return runs;
+            }
+            runs.push(n);
+            assert!(runs.len() < 100, "pruning does not finish: {runs:?}");
+        }
+    }
+
+    /// `maintenance_batch_rows` sets the size of a pass and `maintenance_max_passes` how many
+    /// one run makes: with one pass per run, a batch of 7 needs at least five runs (passes)
+    /// for the 30 ended runs and never deletes more than 7 in one, where a batch of 1,000
+    /// deletes them all in one; with 100 passes per run, the batch of 7 is done in one run
+    /// again. What gets pruned is the same either way.
+    #[tokio::test]
+    async fn a_smaller_maintenance_batch_takes_more_passes() {
+        let small = runs_until_clean(&state_with_ended_runs(7, 1)).await;
+        assert!(small.len() >= 5, "{small:?}");
+        assert!(small.iter().all(|&n| n <= 7), "{small:?}");
+        assert_eq!(small.iter().sum::<u64>(), 30);
+
+        assert_eq!(
+            runs_until_clean(&state_with_ended_runs(1_000, 1)).await,
+            [30]
+        );
+        assert_eq!(runs_until_clean(&state_with_ended_runs(7, 100)).await, [30]);
+
+        let two = runs_until_clean(&state_with_ended_runs(7, 2)).await;
+        assert!(two.iter().all(|&n| n <= 14), "{two:?}");
+        assert!(
+            two.len() >= 3 && two.len() < small.len(),
+            "{two:?} vs {small:?}"
+        );
+        assert_eq!(two.iter().sum::<u64>(), 30);
+    }
+
+    /// `[leases]` maintenance settings out of range stop the server from starting.
+    #[test]
+    fn out_of_range_maintenance_settings_refuse_to_start() {
+        for (key, value) in [
+            ("maintenance_interval_seconds", 0),
+            ("maintenance_batch_rows", 0),
+            ("maintenance_batch_rows", 100_001),
+            ("maintenance_max_passes", 0),
+            ("maintenance_max_passes", 10_001),
+        ] {
+            let mut cfg = Config::from_toml(&format!("[leases]\n{key} = {value}\n")).unwrap();
+            cfg.audit.sqlite_path = ":memory:".into();
+            let err = AppState::from_config(&cfg).err().expect(key).to_string();
+            assert!(err.starts_with(&format!("[leases] {key} must be")), "{err}");
+        }
     }
 }
