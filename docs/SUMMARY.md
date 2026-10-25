@@ -97,3 +97,4 @@
 - [Engineering log: 2026-10-22](log/2026-10-22.md)
 - [Engineering log: 2026-10-23](log/2026-10-23.md)
 - [Engineering log: 2026-10-24](log/2026-10-24.md)
+- [Engineering log: 2026-10-25](log/2026-10-25.md)
