@@ -522,7 +522,7 @@ fn bench_decide(c: &mut Criterion) {
         }
         // `distinct` on a list of `len` values, all new on every call, in both hops: 2 * len
         // charges, each a value row and a charge-log row (plus the two count rows).
-        for len in [1usize, 16, 256] {
+        for len in [1usize, 16, 64, 256] {
             let tok = token_with(&issuer, store.leases.as_ref(), 2, now, list_create_issue);
             let chain = verifier.verify(&tok, now).expect("verifies").chain;
             let probe = charges_for(&chain, &list_call(len, 0)).expect("charges");

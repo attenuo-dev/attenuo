@@ -679,3 +679,78 @@ fn refund_of_two_large_rows_on_one_counter_fz2_3() {
         assert_eq!(store.budget_used(&call[..1]).unwrap(), vec![0], "{name}");
     }
 }
+
+/// SR-62 at full list size: two decisions with `MAX_COUNTED_VALUES`-value lists in two hops
+/// share some values; a refund frees exactly the values no other unrefunded decision used, in
+/// both hops, and the counts follow.
+#[test]
+fn a_refund_after_a_batched_list_charge_frees_only_unshared_values_sr62() {
+    use attenuo_core::limits::MAX_COUNTED_VALUES;
+    let max = 10_000;
+    // Both hops of a 2-hop chain, as `charges_for` orders a list: every value in hop 0, then
+    // every value in hop 1.
+    let list = |values: &[String]| -> Vec<Charge> {
+        ["root", "helper"]
+            .into_iter()
+            .enumerate()
+            .flat_map(|(hop, lease)| {
+                values.iter().map(move |v| Charge {
+                    hop,
+                    ..distinct(lease, v, max)
+                })
+            })
+            .collect()
+    };
+    let v = |range: std::ops::Range<usize>| -> Vec<String> {
+        range.map(|i| format!("v{i}.example")).collect()
+    };
+    let counts = |s: &dyn LeaseStore| {
+        s.budget_used(&[distinct_count("root", max), distinct_count("helper", max)])
+            .unwrap()
+    };
+    for (name, store) in stores() {
+        let n = MAX_COUNTED_VALUES;
+        let up_to_n: Vec<u64> = (1..=n as u64).collect();
+        // d1: v0..v255, all new. d2: v200..v255 (seen) and w0..w199 (new).
+        assert_eq!(
+            charged(store.charge("d1", &list(&v(0..n)), t0()).unwrap()),
+            [up_to_n.clone(), up_to_n].concat(),
+            "{name}"
+        );
+        let mut d2 = v(200..n);
+        d2.extend((0..200).map(|i| format!("w{i}.example")));
+        let after_d2 = charged(store.charge("d2", &list(&d2), t0()).unwrap());
+        assert_eq!(after_d2.len(), 2 * n, "{name}");
+        assert_eq!(
+            after_d2[55], n as u64,
+            "{name}: v255 was seen, the count stays"
+        );
+        assert_eq!(after_d2[n - 1], (n + 200) as u64, "{name}");
+        assert_eq!(counts(store.as_ref()), vec![456, 456], "{name}");
+        // Refunding d1 frees v0..v199 in both hops; v200..v255 stay, d2 used them.
+        assert_eq!(store.refund("d1", t0()).unwrap(), 400, "{name}");
+        assert_eq!(counts(store.as_ref()), vec![256, 256], "{name}");
+        assert_eq!(
+            store.budget_used(&list(&v(199..201))).unwrap(),
+            vec![0, 1, 0, 1],
+            "{name}: v199 freed, v200 kept, in both hops"
+        );
+        // d3 uses v0 again (new) and v200 (seen), so v200 outlives d2's refund.
+        let d3 = vec!["v0.example".to_string(), "v200.example".to_string()];
+        assert_eq!(
+            charged(store.charge("d3", &list(&d3), t0()).unwrap()),
+            vec![257, 257, 257, 257],
+            "{name}"
+        );
+        // Refunding d2 frees v201..v255 and w0..w199 (255 values per hop), not v200.
+        assert_eq!(store.refund("d2", t0()).unwrap(), 2 * 255, "{name}");
+        assert_eq!(counts(store.as_ref()), vec![2, 2], "{name}");
+        assert_eq!(
+            store.budget_used(&list(&v(200..202))).unwrap(),
+            vec![1, 0, 1, 0],
+            "{name}"
+        );
+        assert_eq!(store.refund("d3", t0()).unwrap(), 4, "{name}");
+        assert_eq!(counts(store.as_ref()), vec![0, 0], "{name}");
+    }
+}
