@@ -29,8 +29,8 @@ Every finding fixed here has a regression test that failed on `ea4d35a` and pass
 | High | 0 | 0 | 0 | 0 |
 | Medium | 3 | 3 | 0 | 0 |
 | Low | 1 | 1 | 0 | 0 |
-| Info | 4 | 0 | 3 | 1 |
-| **Total** | **8** | **4** | **3** | **1** |
+| Info | 4 | 2 (SR-81, SR-82, after the pass) | 1 | 1 |
+| **Total** | **8** | **6** | **1** | **1** |
 
 | ID | Area | Severity | Status |
 |---|---|---|---|
@@ -39,7 +39,7 @@ Every finding fixed here has a regression test that failed on `ea4d35a` and pass
 | SR-79 | proxy: SSE data nested deeper than `serde_json` parses (labelling, look-alike rewrite) | Medium | Fixed |
 | SR-80 | proxy: the same depth differential on the list filter | Low | Fixed |
 | SR-81 | proxy: a record window opens on a failed audit append | Info | Fixed |
-| SR-82 | SDKs: SSE reader cost and streams that never go idle | Info | Open |
+| SR-82 | SDKs: SSE reader cost and streams that never go idle | Info | Fixed (#125, #126) |
 | SR-83 | CI: release workflow build toolchain and install scripts | Info | Open |
 | SR-84 | server: AuthZEN batch refused after earlier entries were decided | Info | Accepted |
 
@@ -89,7 +89,7 @@ Fixed in `fix/sr81-record-window-failed-append`.
 - **Fix sketch.** Have the server's `record_rejection` say whether it wrote (a new default method `record_rejection_checked -> Option<Uuid>` on `Authorizer`, defaulting to `Some(record_rejection(..))`), and on `None` remove the slot (`RecordWindow::forget(key)`) so the next occurrence records. Not done here because it adds to the public `Authorizer` trait.
 - **Fixed.** As sketched. `Authorizer::record_rejection_checked` is a default method (`Some(record_rejection(..))`), so existing implementors compile and behave as before; `ServerAuthorizer` overrides it with `Pipeline::record_rejection_checked`, which returns `None` when the append failed (`record_rejection` still returns the id either way). `record_lease_refusal` and the listen-stream `stream.end` record call it, and on `None` call `RecordWindow::forget`, which closes the window unless its record was already written: the next occurrence is recorded and carries the count suppressed meanwhile, and the refusal (or the stream's final event) names no decision id. Regression test `a_failed_append_opens_no_record_window_sr81` (`tests/security_pass7_sr81.rs`, with the new `StaticAuthorizer::fail_rejections` and `rejection_attempts`); unit test `records::tests::a_forgotten_record_does_not_open_a_window_sr81`. With the proxy's call site put back to open the window on any id, the regression test fails with one attempt of two.
 
-### SR-82: SDK SSE readers: quadratic rescans in Python, and no idle bound on keep-alive-only streams (Info, open)
+### SR-82: SDK SSE readers: quadratic rescans in Python, and no idle bound on keep-alive-only streams (Info, fixed after the pass in #125 and #126)
 
 - **Component.** `sdk/python/src/attenuo/_sse.py` `SseParser.feed`; both SDKs' streamed calls.
 - **Observation.** (1) The Python parser keeps the unfinished line as `self._buf += chunk` and searches it again from the start on every chunk, so a long line delivered in many small reads costs time quadratic in its length, up to `max_event_bytes` (16 MiB). The proxy forwards whole events in one write, so a read is usually large, which bounds this in practice. The TypeScript parser keeps the parts in a list and is linear. (2) Both SDKs reset their idle timer on every read, so an upstream that sends `:\n\n` every few seconds keeps a call open with no event until the proxy's stream re-check ends it at token expiry or revocation. A caller can pass its own signal or deadline. Both are denial of service against one client by its upstream, which the threat model leaves out. Hostile `id:` (NUL is ignored as the standard says), CR/LF mixes, CR at a chunk end, UTF-8 split across chunks and oversized `data:` lines were checked in both parsers and behave as specified.
