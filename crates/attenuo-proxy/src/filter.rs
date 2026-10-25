@@ -513,7 +513,8 @@ mod tests {
         let c = caps();
         let tools = json!([{"name": "read_file"}, {"name": "delete_repo"}]);
         for method in [Value::Null, json!(5), json!({}), json!(["tools/list"])] {
-            let msg = json!({"jsonrpc":"2.0","id":1,"method":method.clone(),"result":{"tools": tools}});
+            let msg =
+                json!({"jsonrpc":"2.0","id":1,"method":method.clone(),"result":{"tools": tools}});
             assert_eq!(
                 list_kinds_by_shape(&msg),
                 vec![(json!(1), ListKind::Tools)],

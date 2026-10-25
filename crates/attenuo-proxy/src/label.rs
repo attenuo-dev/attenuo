@@ -539,7 +539,11 @@ mod tests {
 
         auth.fail_results(true);
         let mut msg = json!({"jsonrpc": "2.0", "id": 1, "method": 7, "result": {"content": []}});
-        assert_eq!(l.label_value(&mut msg).await, 1, "withheld when the label fails");
+        assert_eq!(
+            l.label_value(&mut msg).await,
+            1,
+            "withheld when the label fails"
+        );
         assert_eq!(msg["error"]["data"]["reason"], REASON_LABEL_ERROR);
     }
 

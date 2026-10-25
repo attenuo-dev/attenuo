@@ -158,6 +158,19 @@ pub fn as_long(value: &Value) -> Option<i64> {
     (f.is_finite() && f.fract() == 0.0 && f.abs() <= WHOLE_FLOAT_MAX).then_some(f as i64)
 }
 
+/// Does `range` admit every value canonically equal to `v` ([`value_eq`])? `satisfied_by(v)`
+/// alone is not enough: an integer above [`WHOLE_FLOAT_MAX`] in magnitude can also equal a
+/// float (`10^16` and `1e16` have the same canonical form), and no range admits a float that
+/// large, so `equals 10^16` would let through a value the range refuses (SR-71). Such an
+/// integer has an equal float exactly when the float nearest to it is written with its digits.
+fn range_admits_all_equal(range: &ArgConstraint, v: &Value) -> bool {
+    range.satisfied_by(v)
+        && as_long(v).is_some_and(|n| {
+            n.unsigned_abs() <= WHOLE_FLOAT_MAX as u64
+                || crate::jcs::format_f64(n as f64).as_deref() != Some(n.to_string().as_str())
+        })
+}
+
 impl ArgConstraint {
     /// A checked `range`: at least one bound, and `min <= max` when both are given.
     pub fn range(min: Option<i64>, max: Option<i64>) -> Result<Self, RangeError> {
@@ -267,10 +280,13 @@ impl ArgConstraint {
             // A prefix admits infinitely many values; it cannot imply an exact or finite set.
             (ArgConstraint::Prefix(_), ArgConstraint::Equals(_))
             | (ArgConstraint::Prefix(_), ArgConstraint::OneOf(_)) => false,
-            // A value implies a range when it is an integer in it; a set, when every member is.
-            (ArgConstraint::Equals(a), ArgConstraint::Range { .. }) => other.satisfied_by(a),
+            // A value implies a range when it is an integer in it and every value equal to it is
+            // one too; a set, when every member does.
+            (ArgConstraint::Equals(a), ArgConstraint::Range { .. }) => {
+                range_admits_all_equal(other, a)
+            }
             (ArgConstraint::OneOf(as_), ArgConstraint::Range { .. }) => {
-                as_.iter().all(|a| other.satisfied_by(a))
+                as_.iter().all(|a| range_admits_all_equal(other, a))
             }
             // Containment of intervals over i64 (a missing bound is the end of the type).
             (ArgConstraint::Range { .. }, ArgConstraint::Range { .. }) => {
@@ -867,6 +883,53 @@ mod tests {
             cap.explain_denial(&call("bank", "other", json!({"amount": 1}))),
             None
         );
+    }
+
+    #[test]
+    fn equals_a_large_integer_implies_a_range_only_when_every_equal_value_is_a_long_sr71() {
+        // `equals 10^16` admits the float `1e16` too (the same canonical number), and a range
+        // refuses a float of that size, so `equals` would let through a value the parent's
+        // range does not: not an implication.
+        let big: i64 = 10_000_000_000_000_000;
+        let r = range(Some(0), Some(2 * big));
+        let eq = ArgConstraint::Equals(json!(big));
+        assert!(eq.satisfied_by(&json!(1e16)));
+        assert!(!r.satisfied_by(&json!(1e16)));
+        assert!(!eq.implies(&r));
+        assert!(!ArgConstraint::OneOf(vec![json!(1), json!(big)]).implies(&r));
+        // No float equals an integer that has no exact double, and every float that equals a
+        // small integer is a long: those still imply the range.
+        let odd = (1i64 << 53) + 1;
+        assert!(ArgConstraint::Equals(json!(odd)).implies(&range(Some(0), None)));
+        assert!(ArgConstraint::Equals(json!(i64::MAX)).implies(&range(Some(0), None)));
+        assert!(ArgConstraint::Equals(json!(922_337_203_685_477i64)).implies(&r));
+        assert!(
+            ArgConstraint::Equals(json!(-922_337_203_685_477i64)).implies(&range(None, Some(0)))
+        );
+        assert!(
+            !ArgConstraint::Equals(json!(-922_337_203_685_478i64)).implies(&range(None, Some(0)))
+        );
+        // Exhaustively near the edge: whenever `equals n` implies the range, every value that
+        // satisfies `equals n` satisfies the range.
+        for n in [
+            922_337_203_685_476i64,
+            922_337_203_685_477,
+            922_337_203_685_478,
+            1 << 53,
+            (1 << 53) + 1,
+            (1 << 53) + 2,
+            i64::MAX - 1,
+            i64::MAX,
+            i64::MIN,
+        ] {
+            let eq = ArgConstraint::Equals(json!(n));
+            let all = range(Some(i64::MIN), Some(i64::MAX));
+            if eq.implies(&all) {
+                for v in [json!(n), json!(n as f64)] {
+                    assert!(!eq.satisfied_by(&v) || all.satisfied_by(&v), "{n}: {v}");
+                }
+            }
+        }
     }
 
     #[test]
