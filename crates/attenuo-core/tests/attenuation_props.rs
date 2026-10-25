@@ -14,6 +14,9 @@ use serde_json::{json, Value};
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
+mod proptest_seed;
+use proptest_seed::proptest_config;
+
 const MAX_DEPTH: usize = 8;
 const NAMES: &[&str] = &["a", "ab", "abc", "b", "*", "a*", "ab*", "b*"];
 const ARGS: &[&str] = &["x", "y"];
@@ -23,17 +26,14 @@ fn t0() -> OffsetDateTime {
 }
 
 /// 512 cases, or `PROPTEST_CASES` when set (for longer soak runs). `range()` rejects about
-/// one draw in three, so the local reject allowance grows with the case count.
+/// one draw in three and some properties `prop_assume!` their way to a case, so both reject
+/// allowances grow with the case count.
 fn config() -> ProptestConfig {
-    let cases: u32 = std::env::var("PROPTEST_CASES")
-        .ok()
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(512);
+    let config = proptest_config(512);
     ProptestConfig {
-        cases,
-        max_local_rejects: cases.saturating_mul(4).max(65_536),
-        failure_persistence: None,
-        ..ProptestConfig::default()
+        max_local_rejects: config.cases.saturating_mul(4).max(65_536),
+        max_global_rejects: config.cases.saturating_mul(4).max(1024),
+        ..config
     }
 }
 

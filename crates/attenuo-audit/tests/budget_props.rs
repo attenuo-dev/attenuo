@@ -19,6 +19,9 @@ use proptest::prelude::*;
 use time::macros::datetime;
 use time::OffsetDateTime;
 
+mod proptest_seed;
+use proptest_seed::proptest_config;
+
 const LEASES: [&str; 2] = ["root", "child"];
 const VALUES: u8 = 3;
 
@@ -363,11 +366,7 @@ fn run(maxima: &Maxima, ops: &[Op], stores: &[&dyn LeaseStore]) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: 256,
-        failure_persistence: None,
-        ..ProptestConfig::default()
-    })]
+    #![proptest_config(proptest_config(256))]
 
     #[test]
     fn stores_agree_with_the_model(maxima in maxima(), ops in ops()) {
@@ -377,12 +376,18 @@ proptest! {
     }
 }
 
+/// A file store is much slower per case (a new database file each time), so it runs an
+/// eighth of the in-memory count: 32 by default, `PROPTEST_CASES / 8` when that is set.
+fn file_store_config() -> ProptestConfig {
+    let config = proptest_config(256);
+    ProptestConfig {
+        cases: (config.cases / 8).max(1),
+        ..config
+    }
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig {
-        cases: 32,
-        failure_persistence: None,
-        ..ProptestConfig::default()
-    })]
+    #![proptest_config(file_store_config())]
 
     /// The same against the SQLite store in a file, as the server runs it.
     #[test]
