@@ -181,7 +181,9 @@ fn data_lines<'a>(lines: &[&'a str]) -> Vec<&'a str> {
         .collect()
 }
 
-fn rewrite_event(
+/// Run `f` over the JSON `data` of one whole `event` and write the event to `out`: re-encoded
+/// (other fields kept) when the data is JSON, byte for byte otherwise.
+pub(crate) fn rewrite_event(
     event: &[u8],
     f: &mut impl FnMut(&mut Value),
     out: &mut Vec<u8>,

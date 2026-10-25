@@ -201,6 +201,36 @@ async def test_stream_cut_without_a_record_has_no_decision_id(make: Any) -> None
     assert isinstance(err, Denied) and err.reason == "token_expired" and err.decision_id is None
 
 
+# What the proxy relays when an upstream sends CUT itself (`upstream_stream_end_shape`).
+REWRITTEN: dict[str, Any] = {
+    "jsonrpc": "2.0",
+    "id": None,
+    "error": {
+        "code": -32005,
+        "message": "attenuo: upstream sent an error in the shape of the proxy's stream end",
+        "data": {"reason": "upstream_stream_end_shape", "upstream_error": CUT_ERROR},
+    },
+}
+
+
+async def test_stream_upstream_lookalike_rewritten_by_the_proxy_is_not_a_cut(
+    make: Any,  # noqa: F811
+) -> None:
+    # In a stream: an ordinary message, then the stream ends without the call's response.
+    body = event(progress(1)) + event(REWRITTEN)
+    client, _ = make(lambda r: httpx.Response(200, text=body, headers=SSE))
+    seen, err = await collect_until_error(client.call_tool_stream("TOK", "github", "read_file"))
+    assert [e.message for e in seen] == [progress(1), REWRITTEN]
+    assert not isinstance(err, Denied)
+    assert isinstance(err, AttenuoError) and "ended before" in str(err)
+
+    # As a plain JSON answer: an RpcError carrying the upstream's error, not a Denied.
+    client, _ = make(lambda r: httpx.Response(200, json=REWRITTEN))
+    _, err = await collect_until_error(client.call_tool_stream("TOK", "github", "read_file"))
+    assert isinstance(err, RpcError) and not isinstance(err, Denied)
+    assert err.code == -32005 and err.data["upstream_error"] == CUT_ERROR
+
+
 async def test_stream_plain_json_answer_is_the_one_final_event(make: Any) -> None:  # noqa: F811
     client, _ = make(
         lambda r: httpx.Response(200, json=result("plain"), headers={"X-Attenuo-Decision-Id": "d"})
