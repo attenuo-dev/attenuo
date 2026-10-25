@@ -280,6 +280,7 @@ The injection-suite figures in the docs come from synthetic, model-free cases wr
 - SR-78 (medium, security review pass 7): SSE data with a lone surrogate escape (`"\ud800"`), which `serde_json` refuses and `JSON.parse` and Python's `json` accept, was relayed without labelling or the look-alike rewrite. The proxy now reads such an escape as U+FFFD.
 - SR-79 (medium, security review pass 7): SSE data nested deeper than `serde_json` parses was relayed unread on labelled streams and past the look-alike rewrite. Such an event is now dropped on a labelled stream and when it may hold the stream-end code.
 - SR-80 (low, security review pass 7): a streamed list answer nested deeper than `serde_json` parses passed the list filter unchanged. The list filter now drops an event whose data does not parse.
+- SR-81 (info, security review pass 7): a lease-refusal or listen-stream `stream.end` record window opened even when the first record's audit append failed, so repeats in that window were suppressed behind a record that is not in the log. The window now opens only on a written record (new default method `Authorizer::record_rejection_checked`, overridden by the server's authorizer), and a refusal whose record was not written names no decision id.
 
 ### Performance
 

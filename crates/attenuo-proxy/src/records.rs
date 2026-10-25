@@ -69,6 +69,15 @@ struct Slot {
     /// The record that opened the window, once written.
     first: Option<Uuid>,
     suppressed: u64,
+    /// The admitted record was not written ([`RecordWindow::forget`]): the window is closed,
+    /// and the next occurrence is recorded.
+    closed: bool,
+}
+
+impl Slot {
+    fn open_at(&self, now: Instant, window: Duration) -> bool {
+        !self.closed && now.saturating_duration_since(self.opened) < window
+    }
 }
 
 /// What [`RecordWindow::admit`] says about one occurrence.
@@ -110,7 +119,9 @@ impl RecordWindow {
     /// Should a record of `tool` for `chain_key` and `reason` at `now` be written? An
     /// [`Admission::Record`] opens a window, so of several concurrent occurrences exactly one
     /// is told to record; tell [`RecordWindow::recorded`] the record's id once written. A
-    /// poisoned lock, or a table full of open windows, admits the record (fails open).
+    /// poisoned lock, or a table full of open windows, admits the record (fails open). If the
+    /// record could not be written, tell [`RecordWindow::forget`] instead, so the window does
+    /// not stand on a record that is not in the log (SR-81).
     pub fn admit(
         &self,
         chain_key: &str,
@@ -122,6 +133,7 @@ impl RecordWindow {
             opened: now,
             first: None,
             suppressed: 0,
+            closed: false,
         };
         let Ok(mut slots) = self.slots.lock() else {
             return Admission::Record {
@@ -130,7 +142,7 @@ impl RecordWindow {
         };
         let key = (chain_key.to_owned(), tool, reason.to_owned());
         if let Some(slot) = slots.get_mut(&key) {
-            if now.saturating_duration_since(slot.opened) < self.window {
+            if slot.open_at(now, self.window) {
                 slot.suppressed += 1;
                 return Admission::Suppress { first: slot.first };
             }
@@ -140,7 +152,7 @@ impl RecordWindow {
         }
         if slots.len() >= self.max_keys {
             let window = self.window;
-            slots.retain(|_, s| now.saturating_duration_since(s.opened) < window);
+            slots.retain(|_, s| s.open_at(now, window));
             if slots.len() >= self.max_keys {
                 return Admission::Record {
                     suppressed_before: 0,
@@ -159,6 +171,21 @@ impl RecordWindow {
         if let Ok(mut slots) = self.slots.lock() {
             if let Some(slot) = slots.get_mut(&(chain_key.to_owned(), tool, reason.to_owned())) {
                 slot.first.get_or_insert(id);
+            }
+        }
+    }
+
+    /// The record admitted for `chain_key`, `tool` and `reason` was not written (the audit
+    /// append failed): close its window, so the next occurrence is admitted and recorded
+    /// rather than suppressed behind a record that is not in the log (SR-81). Occurrences
+    /// suppressed meanwhile are carried into that record's `suppressed_before`. A window whose
+    /// record was already written is left alone, and so is a poisoned table.
+    pub fn forget(&self, chain_key: &str, tool: &'static str, reason: &str) {
+        if let Ok(mut slots) = self.slots.lock() {
+            if let Some(slot) = slots.get_mut(&(chain_key.to_owned(), tool, reason.to_owned())) {
+                if slot.first.is_none() {
+                    slot.closed = true;
+                }
             }
         }
     }
@@ -339,6 +366,54 @@ mod tests {
         );
         // `recorded` on a poisoned table is a no-op, not a panic.
         r.recorded("c1", T, "lease_revoked", Uuid::new_v4());
+    }
+
+    #[test]
+    fn a_forgotten_record_does_not_open_a_window_sr81() {
+        let r = RecordWindow::with_max_keys(60 * SEC, 16);
+        let t0 = Instant::now();
+        let first = Admission::Record {
+            suppressed_before: 0,
+        };
+        assert_eq!(r.admit("c1", T, "lease_revoked", t0), first);
+        // A concurrent occurrence while the append runs is suppressed, as before.
+        assert_eq!(
+            r.admit("c1", T, "lease_revoked", t0 + SEC),
+            Admission::Suppress { first: None }
+        );
+        // The append failed: the next occurrence records, and counts the one suppressed.
+        r.forget("c1", T, "lease_revoked");
+        assert_eq!(
+            r.admit("c1", T, "lease_revoked", t0 + 2 * SEC),
+            Admission::Record {
+                suppressed_before: 1
+            }
+        );
+        // Failed again, and again: nothing is suppressed behind a record that is not there.
+        r.forget("c1", T, "lease_revoked");
+        assert_eq!(r.admit("c1", T, "lease_revoked", t0 + 3 * SEC), first);
+        // This one is written: the window is open from here as usual.
+        let id = Uuid::new_v4();
+        r.recorded("c1", T, "lease_revoked", id);
+        assert_eq!(
+            r.admit("c1", T, "lease_revoked", t0 + 4 * SEC),
+            Admission::Suppress { first: Some(id) }
+        );
+        // `forget` after a written record changes nothing.
+        r.forget("c1", T, "lease_revoked");
+        assert_eq!(
+            r.admit("c1", T, "lease_revoked", t0 + 5 * SEC),
+            Admission::Suppress { first: Some(id) }
+        );
+        // A closed window makes room in a full table.
+        let full = RecordWindow::with_max_keys(60 * SEC, 1);
+        assert_eq!(full.admit("c1", T, "lease_revoked", t0), first);
+        full.forget("c1", T, "lease_revoked");
+        assert_eq!(full.admit("c2", T, "lease_revoked", t0 + SEC), first);
+        assert!(matches!(
+            full.admit("c2", T, "lease_revoked", t0 + 2 * SEC),
+            Admission::Suppress { .. }
+        ));
     }
 
     #[test]

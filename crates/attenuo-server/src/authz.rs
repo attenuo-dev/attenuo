@@ -1532,7 +1532,8 @@ impl Pipeline {
     /// refused token exchange whose subject token verified, tool `token.exchange`, or a
     /// refused lease renewal whose token verified, tool `lease.renew`) and count it in
     /// `decisions_total{decision="deny",reason}`, so every decision record in the log is
-    /// counted there. Returns the record id, which is not in the log if the append failed.
+    /// counted there. Returns the record id, which is not in the log if the append failed;
+    /// [`Pipeline::record_rejection_checked`] says which.
     ///
     /// `reason` comes from a fixed set of codes (the proxy's constants, the lease reasons,
     /// `token_expired`,
@@ -1546,25 +1547,54 @@ impl Pipeline {
         reason: &str,
         now: OffsetDateTime,
     ) -> Uuid {
+        self.append_rejection(chain, call, reason, now).0
+    }
+
+    /// [`Pipeline::record_rejection`], returning the record id only if the append succeeded
+    /// (`None` when it failed and the record is not in the log). The proxy opens a record
+    /// window only on a written record (SR-81).
+    pub fn record_rejection_checked(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        reason: &str,
+        now: OffsetDateTime,
+    ) -> Option<Uuid> {
+        let (id, written) = self.append_rejection(chain, call, reason, now);
+        written.then_some(id)
+    }
+
+    /// Append the rejection record; its id and whether the append succeeded.
+    fn append_rejection(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        reason: &str,
+        now: OffsetDateTime,
+    ) -> (Uuid, bool) {
         self.metrics.decision("deny", reason);
         let record = DecisionRecord::new(now, Decision::Deny, reason, chain, call, Vec::new());
         let id = record.id;
-        match self.metrics.time_audit_append(|| self.audit.append(record)) {
+        let written = match self.metrics.time_audit_append(|| self.audit.append(record)) {
             // Caller-controlled strings are Debug-formatted so they cannot forge log lines
             // (SR-18).
-            Ok(entry) => tracing::info!(
-                reason = ?reason,
-                subject = ?chain.originating_user.subject,
-                server = ?call.server,
-                tool = ?call.tool,
-                seq = entry.seq,
-                "request rejected"
-            ),
-            Err(e) => {
-                tracing::error!(error = %e, reason = ?reason, "audit append failed for a rejection")
+            Ok(entry) => {
+                tracing::info!(
+                    reason = ?reason,
+                    subject = ?chain.originating_user.subject,
+                    server = ?call.server,
+                    tool = ?call.tool,
+                    seq = entry.seq,
+                    "request rejected"
+                );
+                true
             }
-        }
-        id
+            Err(e) => {
+                tracing::error!(error = %e, reason = ?reason, "audit append failed for a rejection");
+                false
+            }
+        };
+        (id, written)
     }
 
     /// Record that upstream `server` opened the MCP session whose digest is `session` for a
@@ -1962,6 +1992,20 @@ impl Authorizer for ServerAuthorizer {
         let (chain, call, reason) = (chain.clone(), call.clone(), reason.to_string());
         on_blocking_pool(&self.pipeline, move |p| {
             p.record_rejection(&chain, &call, &reason, now)
+        })
+        .await
+    }
+
+    async fn record_rejection_checked(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        reason: &str,
+        now: OffsetDateTime,
+    ) -> Option<Uuid> {
+        let (chain, call, reason) = (chain.clone(), call.clone(), reason.to_string());
+        on_blocking_pool(&self.pipeline, move |p| {
+            p.record_rejection_checked(&chain, &call, &reason, now)
         })
         .await
     }
@@ -2366,6 +2410,32 @@ when { context.input has amount && context.input.amount > 1000 };
 
     fn send(amount: Value) -> ToolCall {
         ToolCall::new("bank", "send", json!({ "to": "emma", "amount": amount }))
+    }
+
+    /// `record_rejection_checked` says whether the rejection reached the log; the proxy opens
+    /// a record window only when it did (SR-81). `record_rejection` returns an id either way.
+    #[test]
+    fn a_failed_rejection_append_is_reported_sr81() {
+        let now = OffsetDateTime::now_utc();
+        let audit = Arc::new(FlakyAudit::default());
+        let p = pipeline(Arc::new(MemoryLeaseStore::new()), audit.clone());
+        let chain = chain(Limits::default(), now);
+        let call = ToolCall::new("github", "initialize", json!({}));
+        audit.fail.store(true, Ordering::SeqCst);
+        assert_eq!(
+            p.record_rejection_checked(&chain, &call, "lease_revoked", now),
+            None
+        );
+        let unwritten = p.record_rejection(&chain, &call, "lease_revoked", now);
+        assert_eq!(audit.inner.len().unwrap(), 0);
+        audit.fail.store(false, Ordering::SeqCst);
+        let id = p
+            .record_rejection_checked(&chain, &call, "lease_revoked", now)
+            .expect("written");
+        assert_ne!(id, unwritten);
+        let entries = audit.inner.snapshot().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].record.id, id);
     }
 
     #[test]

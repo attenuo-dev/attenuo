@@ -333,14 +333,17 @@ impl StreamGuard {
         if let Some(tag) = &record.session {
             call = call.with_session(tag.clone());
         }
-        let id = self
+        let written = self
             .authorizer
-            .record_rejection(&self.chain, &call, reason, now)
+            .record_rejection_checked(&self.chain, &call, reason, now)
             .await;
-        if let Some((records, key)) = &window {
-            records.recorded(key, STREAM_END_TOOL, reason, id);
+        match (written, &window) {
+            (Some(id), Some((records, key))) => records.recorded(key, STREAM_END_TOOL, reason, id),
+            // Not in the log: open no window on it, so the next end is recorded (SR-81).
+            (None, Some((records, key))) => records.forget(key, STREAM_END_TOOL, reason),
+            (_, None) => {}
         }
-        EndRecord::Written(id)
+        written.map_or(EndRecord::None, EndRecord::Written)
     }
 }
 

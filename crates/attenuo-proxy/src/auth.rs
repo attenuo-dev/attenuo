@@ -328,6 +328,23 @@ pub trait Authorizer: Send + Sync {
         Uuid::new_v4()
     }
 
+    /// [`Authorizer::record_rejection`], saying whether the record was written: `Some(id)` if
+    /// it is in the audit log, `None` if the append failed. The proxy calls this for the
+    /// refusals it bounds with a [`crate::records::RecordWindow`] (lease refusals of undecided
+    /// requests, `stream.end` of listen streams), and opens a window only on a written record,
+    /// so a failed append does not hide the repeats that follow it (SR-81). The default calls
+    /// [`Authorizer::record_rejection`] and reports it written; an implementation whose append
+    /// can fail should override it. The server's authorizer does.
+    async fn record_rejection_checked(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        reason: &str,
+        now: OffsetDateTime,
+    ) -> Option<Uuid> {
+        Some(self.record_rejection(chain, call, reason, now).await)
+    }
+
     /// Record that upstream `server` assigned a new MCP session to a caller of `chain`, so
     /// the session can later be revoked by its id (`POST /admin/leases/revoke` with
     /// `session`). `session_digest` is [`crate::session::session_digest`] of the
