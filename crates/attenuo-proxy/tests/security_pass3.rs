@@ -614,8 +614,9 @@ async fn a_listen_stream_whose_lease_expired_ends_and_is_counted() {
 /// Several listen streams of one chain cut by one revocation (several sessions of one token):
 /// every stream ends with the same final event, but only the first end is a `stream.end`
 /// record; the others are counted as suppressed and their final event names that record.
-/// Another chain keeps its own record. Reopening the stream is still refused every time, and
-/// those refusals (`http.GET`) are not bounded.
+/// Another chain keeps its own record. Reopening the stream is still refused every time; those
+/// refusals (`http.GET`) are bounded by their own window, so the first is recorded and the
+/// second counted.
 #[tokio::test]
 async fn listen_streams_of_one_chain_cut_together_leave_one_record() {
     let upstream = SessionUpstream::default();
@@ -683,7 +684,9 @@ async fn listen_streams_of_one_chain_cut_together_leave_one_record() {
     );
     assert_stream_ends(&authorizer, &[StreamEndCause::LeaseRevoked; 4]).await;
 
-    // Reopening is refused each time, with a record per attempt as before.
+    // Reopening is refused each time; the first refusal is recorded, the second counted, and
+    // both 401s name the record.
+    let mut named = Vec::new();
     for _ in 0..2 {
         let resp = reqwest::Client::new()
             .get(proxy.url(&format!("/mcp/{SERVER}")))
@@ -693,14 +696,19 @@ async fn listen_streams_of_one_chain_cut_together_leave_one_record() {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        named.push(resp.headers()["x-attenuo-decision-id"].clone());
     }
-    let refusals = authorizer
+    let refusals: Vec<_> = authorizer
         .decisions()
         .into_iter()
         .filter(|r| r.tool == "http.GET")
-        .count();
-    assert_eq!(refusals, 2);
-    assert_eq!(authorizer.suppressed_records().len(), 2);
+        .collect();
+    assert_eq!(refusals.len(), 1);
+    assert!(named.iter().all(|h| h == &refusals[0].id.to_string()));
+    assert_eq!(
+        authorizer.suppressed_records()[2..],
+        [("http.GET".to_owned(), StreamEndCause::LeaseRevoked)]
+    );
 }
 
 /// SR-28: a listen stream does not outlive the token that opened it.

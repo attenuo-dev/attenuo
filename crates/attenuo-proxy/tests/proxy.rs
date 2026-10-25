@@ -28,6 +28,15 @@ impl Harness {
         sse: bool,
         chains: Vec<(&str, DelegationChain)>,
     ) -> anyhow::Result<Self> {
+        Self::start_with(tools, sse, chains, |c| c).await
+    }
+
+    async fn start_with(
+        tools: &[&str],
+        sse: bool,
+        chains: Vec<(&str, DelegationChain)>,
+        configure: impl FnOnce(ProxyConfig) -> ProxyConfig,
+    ) -> anyhow::Result<Self> {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_test_writer()
@@ -39,10 +48,10 @@ impl Harness {
             authorizer.insert(bearer, chain);
         }
         let authorizer = Arc::new(authorizer);
-        let config = ProxyConfig::new(
+        let config = configure(ProxyConfig::new(
             "127.0.0.1:0".parse()?,
             vec![UpstreamConfig::new(SERVER, upstream_task.url("/mcp"))],
-        );
+        ));
         let proxy = spawn_router(router(config, authorizer.clone())).await?;
         Ok(Self {
             upstream,
@@ -904,5 +913,164 @@ async fn refused_session_opens_on_a_revoked_lease_are_recorded() -> anyhow::Resu
     }
     assert_eq!(h.authorizer.decisions().len(), 4);
     assert!(h.upstream.recorded_methods().is_empty());
+    Ok(())
+}
+
+fn initialize_msg(id: u64) -> Value {
+    rpc_msg(
+        id,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {},
+               "clientInfo": {"name": "t", "version": "0"}}),
+    )
+}
+
+/// The decision id a refused request's 401 names, from the header and the body, which agree.
+async fn refusal_names(resp: reqwest::Response) -> anyhow::Result<String> {
+    assert_eq!(resp.status(), 401);
+    let header = resp.headers()[DECISION_ID_HEADER].to_str()?.to_owned();
+    let body: Value = resp.json().await?;
+    assert_eq!(body["error"]["code"], CODE_UNAUTHORIZED);
+    assert_eq!(body["error"]["data"]["decision_id"], header, "{body}");
+    Ok(header)
+}
+
+/// A client that keeps retrying `initialize` on a revoked lease is refused every time, but
+/// only the first refusal per chain, tool and reason in the window is a record; the others are
+/// counted as suppressed and their 401 names the first record. Another tool, another reason
+/// and another chain each get their own record. Decided requests (`tools/call`) are never
+/// bounded.
+#[tokio::test]
+async fn retried_session_opens_on_a_revoked_lease_leave_one_record_per_window() -> anyhow::Result<()>
+{
+    use attenuo_proxy::StreamEndCause;
+    let bob = test_chain(
+        "user:bob",
+        "agent:reader",
+        [Capability::new(SERVER, "read_*")],
+    );
+    let h = Harness::start(
+        &["read_file"],
+        false,
+        vec![("tok", reader_chain()), ("bob", bob)],
+    )
+    .await?;
+    h.authorizer.revoke("tok");
+    const N: usize = 5;
+    let mut named = Vec::new();
+    for i in 0..N {
+        named.push(refusal_names(h.rpc(Some("tok"), &initialize_msg(i as u64)).await?).await?);
+    }
+    let records = h.authorizer.decisions();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].tool, "initialize");
+    assert_eq!(records[0].reason, "lease_revoked");
+    assert!(
+        named.iter().all(|id| *id == records[0].id.to_string()),
+        "{named:?}"
+    );
+    assert_eq!(
+        h.authorizer.suppressed_records(),
+        vec![("initialize".to_owned(), StreamEndCause::LeaseRevoked); N - 1]
+    );
+
+    // Another tool of the same chain and reason: its own record, then bounded too.
+    let list = rpc_msg(10, "tools/list", json!({}));
+    let first_list = refusal_names(h.rpc(Some("tok"), &list).await?).await?;
+    assert_eq!(
+        refusal_names(h.rpc(Some("tok"), &list).await?).await?,
+        first_list
+    );
+    let get = h
+        .client
+        .get(h.proxy.url(&format!("/mcp/{SERVER}")))
+        .bearer_auth("tok")
+        .send()
+        .await?;
+    let first_get = refusal_names(get).await?;
+    let records = h.authorizer.decisions();
+    assert_eq!(records.len(), 3, "{records:?}");
+    assert_eq!(records[1].tool, "tools/list");
+    assert_eq!(records[1].id.to_string(), first_list);
+    assert_eq!(records[2].tool, "http.GET");
+    assert_eq!(records[2].id.to_string(), first_get);
+
+    // Another chain: its own record.
+    h.authorizer.revoke("bob");
+    let bob_id = refusal_names(h.rpc(Some("bob"), &initialize_msg(20)).await?).await?;
+    assert_ne!(bob_id, named[0]);
+    assert_eq!(
+        refusal_names(h.rpc(Some("bob"), &initialize_msg(21)).await?).await?,
+        bob_id
+    );
+
+    // Another reason for the same chain and tool: its own record.
+    h.authorizer.expire_lease("tok");
+    let expired = h.rpc(Some("tok"), &initialize_msg(30)).await?;
+    let expired_id = refusal_names(expired).await?;
+    let records = h.authorizer.decisions();
+    assert_eq!(records.len(), 5, "{records:?}");
+    assert_eq!(records[3].originating_subject, "user:bob");
+    assert_eq!(records[3].id.to_string(), bob_id);
+    assert_eq!(records[4].reason, "lease_expired");
+    assert_eq!(records[4].tool, "initialize");
+    assert_eq!(records[4].id.to_string(), expired_id);
+
+    // A refused `tools/call` is a decision: recorded every time.
+    for i in 0..3 {
+        let resp = h
+            .rpc(Some("tok"), &tools_call(40 + i, "read_file", json!({})))
+            .await?;
+        assert!(resp.headers().contains_key(DECISION_ID_HEADER));
+    }
+    let calls = h
+        .authorizer
+        .decisions()
+        .into_iter()
+        .filter(|r| r.tool == "read_file")
+        .count();
+    assert_eq!(calls, 3);
+
+    let suppressed = h.authorizer.suppressed_records();
+    assert_eq!(suppressed.len(), N - 1 + 2, "{suppressed:?}");
+    assert_eq!(
+        suppressed[N - 1..],
+        [
+            ("tools/list".to_owned(), StreamEndCause::LeaseRevoked),
+            ("initialize".to_owned(), StreamEndCause::LeaseRevoked),
+        ]
+    );
+    assert!(h.upstream.recorded_methods().is_empty());
+    Ok(())
+}
+
+/// Once the window has passed, the next refusal is recorded again (the window runs from the
+/// first record, so a client that keeps trying leaves one record per window).
+#[tokio::test]
+async fn a_new_window_records_the_next_lease_refusal() -> anyhow::Result<()> {
+    let window = std::time::Duration::from_millis(400);
+    let h = Harness::start_with(
+        &["read_file"],
+        false,
+        vec![("tok", reader_chain())],
+        |mut c| {
+            c.lease_refusal_record_window = window;
+            c
+        },
+    )
+    .await?;
+    h.authorizer.revoke("tok");
+    let first = refusal_names(h.rpc(Some("tok"), &initialize_msg(1)).await?).await?;
+    assert_eq!(
+        refusal_names(h.rpc(Some("tok"), &initialize_msg(2)).await?).await?,
+        first
+    );
+    tokio::time::sleep(window + std::time::Duration::from_millis(100)).await;
+    let second = refusal_names(h.rpc(Some("tok"), &initialize_msg(3)).await?).await?;
+    assert_ne!(second, first);
+    let records = h.authorizer.decisions();
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[1].id.to_string(), second);
+    assert_eq!(h.authorizer.suppressed_records().len(), 1);
     Ok(())
 }
