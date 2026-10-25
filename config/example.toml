@@ -196,6 +196,11 @@ retention_seconds = 604800
 # token lifetime you issue: an expired lease can be renewed while its token is valid. 0 keeps
 # every binding.
 session_retention_seconds = 86400
+# Seconds a run's run-limit counters, charge log and approvals are kept once the run's leases
+# are gone from the registry (after retention_seconds); nothing of a run still in the registry
+# is deleted. After it, an operator refund of the run's decisions answers 404; the audit log
+# keeps every record. 0 keeps everything.
+run_state_retention_seconds = 2592000
 
 # Workload identities accepted as `actor_token` on an exchange or at hop 0. Each actor token
 # works for one request, and the token it obtains never outlives it. A SPIFFE trust domain, keys from the SPIRE

@@ -217,7 +217,10 @@ async fn refund_and_tree_budgets_against_a_real_server() {
     assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
     assert_eq!(
         text(&out.stderr),
-        format!("error: decision {unknown} charged no run limit or run usage; nothing to refund\n")
+        format!(
+            "error: no charge is recorded for decision {unknown} (it charged no run limit or run \
+             usage, or its charge log was pruned); nothing to refund\n"
+        )
     );
 
     // -- an empty reason is refused before any request --

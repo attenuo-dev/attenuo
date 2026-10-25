@@ -1005,6 +1005,29 @@ pub struct LeasesSection {
     /// keeps every binding (no pruning).
     #[serde(default = "default_session_retention_seconds")]
     pub session_retention_seconds: u64,
+    /// How long the run-limit counters, the charge log and the approvals of a run are kept
+    /// once the run's leases are gone from the registry (pruned by `retention_seconds`, or
+    /// unknown), in seconds. Default 2592000 (30 days). Nothing is deleted while any lease it
+    /// belongs to is still in the registry, whatever its age. A charge goes once its charge
+    /// and any refund are older than this, a counter once no charge under its lease is left,
+    /// an approval once its creation, decision and expiry are older than this. After that an
+    /// operator refund of the decision answers 404, as for one that charged nothing; the
+    /// audit log keeps every decision, charge and approval record. 0 keeps everything.
+    #[serde(default = "default_run_state_retention_seconds")]
+    pub run_state_retention_seconds: u64,
+}
+
+/// Default of `[leases] run_state_retention_seconds`: 30 days, counted from the newest charge,
+/// refund or approval event and only once the run's leases are gone (themselves kept a week
+/// after the run ended by default). The charge log is what an operator refund
+/// (`POST /admin/budgets/refund`) works from and what an incident review reads next to the
+/// audit log, and refunds follow billing or incident processes that take weeks rather than
+/// days; a month covers a monthly cycle. The rows are small (a charge row is about 200 bytes),
+/// so the cost of keeping them a month is far below the audit log's.
+pub const DEFAULT_RUN_STATE_RETENTION_SECONDS: u64 = 2_592_000;
+
+fn default_run_state_retention_seconds() -> u64 {
+    DEFAULT_RUN_STATE_RETENTION_SECONDS
 }
 
 /// Default of `[leases] session_retention_seconds`.
@@ -1031,6 +1054,7 @@ impl Default for LeasesSection {
         Self {
             retention_seconds: DEFAULT_LEASE_RETENTION_SECONDS,
             session_retention_seconds: DEFAULT_SESSION_RETENTION_SECONDS,
+            run_state_retention_seconds: DEFAULT_RUN_STATE_RETENTION_SECONDS,
         }
     }
 }
@@ -1044,6 +1068,11 @@ impl LeasesSection {
     /// `retention_seconds` as a duration; `None` when lease pruning is off (0).
     pub fn retention(&self) -> Option<time::Duration> {
         seconds_or_off(self.retention_seconds)
+    }
+
+    /// `run_state_retention_seconds` as a duration; `None` when run-state pruning is off (0).
+    pub fn run_state_retention(&self) -> Option<time::Duration> {
+        seconds_or_off(self.run_state_retention_seconds)
     }
 }
 
@@ -1731,6 +1760,34 @@ mod tests {
             Some(time::Duration::hours(24))
         );
         assert!(super::Config::from_toml("[leases]\nretention = 1\n").is_err());
+    }
+
+    #[test]
+    fn run_state_retention_defaults_to_thirty_days_and_zero_turns_it_off() {
+        let cfg = super::Config::from_toml("").unwrap();
+        assert_eq!(
+            cfg.leases.run_state_retention(),
+            Some(time::Duration::days(30))
+        );
+        assert_eq!(cfg.leases.run_state_retention_seconds, 2_592_000);
+        // Independent of the lease and session retentions.
+        let cfg = super::Config::from_toml(
+            "[leases]\nrun_state_retention_seconds = 86400\nretention_seconds = 0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.leases.run_state_retention(),
+            Some(time::Duration::days(1))
+        );
+        assert_eq!(cfg.leases.retention(), None);
+        assert_eq!(
+            cfg.leases.session_retention(),
+            Some(time::Duration::hours(24))
+        );
+        let cfg = super::Config::from_toml("[leases]\nrun_state_retention_seconds = 0\n").unwrap();
+        assert_eq!(cfg.leases.run_state_retention(), None);
+        assert_eq!(cfg.leases.retention(), Some(time::Duration::weeks(1)));
+        assert!(super::Config::from_toml("[leases]\nrun_state_retention = 1\n").is_err());
     }
 
     use super::*;

@@ -18,7 +18,7 @@ The server is wiring. It holds no authorization logic of its own: tokens come fr
 | Pipeline | `authz::Pipeline` | `Arc`, used by the proxy's `ServerAuthorizer` and by the AuthZEN handler |
 | Proxy | `attenuo_proxy::router` | mounted at `/mcp/{server}` |
 | IdP registry | `idp::IdpRegistry` | one `JwksCache` per `[[idps]]` entry, behind a `tokio::sync::Mutex` |
-| Lease maintenance | `spawn_lease_maintenance` | one tokio task, every 60 s when `[leases] session_retention_seconds` or `retention_seconds` is on: `prune_session_bindings`, then `prune_lease_registry`, each in passes of 1,000 rows on the blocking pool, at most 100 passes each |
+| Lease maintenance | `spawn_lease_maintenance` | one tokio task, every 60 s when `[leases] session_retention_seconds`, `retention_seconds` or `run_state_retention_seconds` is on: `prune_session_bindings`, then `prune_lease_registry`, then `prune_run_state` (run-limit counters, charge log and approvals of runs whose leases are gone), each in passes of 1,000 rows on the blocking pool, at most 100 passes each |
 
 ## The decision pipeline
 

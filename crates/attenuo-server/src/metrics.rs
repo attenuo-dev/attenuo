@@ -103,6 +103,9 @@ pub struct Metrics {
     lease_sessions_pruned: AtomicU64,
     /// Leases deleted by retention (`[leases] retention_seconds`).
     leases_pruned: AtomicU64,
+    /// Run state deleted by retention (`[leases] run_state_retention_seconds`), by
+    /// [`RUN_STATE_KINDS`].
+    run_state_pruned: [AtomicU64; 3],
     audit_append_errors: AtomicU64,
     audit_checkpoints: AtomicU64,
     /// `[audit.sink]` (SR-21): checkpoints delivered, delivery attempts that failed,
@@ -160,6 +163,7 @@ impl Default for Metrics {
             leases_revoked: AtomicU64::default(),
             lease_sessions_pruned: AtomicU64::default(),
             leases_pruned: AtomicU64::default(),
+            run_state_pruned: Default::default(),
             audit_append_errors: AtomicU64::default(),
             audit_checkpoints: AtomicU64::default(),
             audit_sink_delivered: AtomicU64::default(),
@@ -302,6 +306,17 @@ impl Metrics {
     /// Count leases deleted by retention.
     pub fn leases_pruned(&self, n: u64) {
         self.leases_pruned.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Count run state deleted by retention: counters, charge-log entries, approvals.
+    pub fn run_state_pruned(&self, counters: u64, charges: u64, approvals: u64) {
+        for (c, n) in self
+            .run_state_pruned
+            .iter()
+            .zip([counters, charges, approvals])
+        {
+            c.fetch_add(n, Ordering::Relaxed);
+        }
     }
 
     pub fn audit_append_error(&self) {
@@ -494,6 +509,21 @@ impl Metrics {
              expired longer ago than the retention period.",
             &self.leases_pruned,
         );
+        header_lines(
+            &mut out,
+            "run_state_pruned_total",
+            "Run-limit counters, charge-log entries and approvals deleted because their run's \
+             leases were gone from the registry and the state was older than the retention \
+             period.",
+            "counter",
+        );
+        for (kind, c) in RUN_STATE_KINDS.iter().zip(&self.run_state_pruned) {
+            let _ = writeln!(
+                out,
+                "{PREFIX}_run_state_pruned_total{{kind=\"{kind}\"}} {}",
+                c.load(Ordering::Relaxed)
+            );
+        }
         simple_counter(
             &mut out,
             "audit_append_errors_total",
@@ -790,6 +820,10 @@ fn header_lines(out: &mut String, name: &str, help: &str, kind: &str) {
     let _ = writeln!(out, "# TYPE {PREFIX}_{name} {kind}");
 }
 
+/// The `kind` label values of `run_state_pruned_total`, in [`Metrics::run_state_pruned`]'s
+/// argument order.
+pub const RUN_STATE_KINDS: [&str; 3] = ["counters", "charges", "approvals"];
+
 fn simple_counter(out: &mut String, name: &str, help: &str, c: &AtomicU64) {
     header_lines(out, name, help, "counter");
     let _ = writeln!(out, "{PREFIX}_{name} {}", c.load(Ordering::Relaxed));
@@ -1053,6 +1087,16 @@ mod tests {
         assert!(text.contains("attenuo_leases_revoked_total 3\n"));
         assert!(text.contains("attenuo_lease_sessions_pruned_total 0\n"));
         assert!(text.contains("attenuo_leases_pruned_total 0\n"));
+        for kind in RUN_STATE_KINDS {
+            assert!(text.contains(&format!(
+                "attenuo_run_state_pruned_total{{kind=\"{kind}\"}} 0\n"
+            )));
+        }
+        m.run_state_pruned(1, 2, 3);
+        let text = m.render();
+        assert!(text.contains("attenuo_run_state_pruned_total{kind=\"counters\"} 1\n"));
+        assert!(text.contains("attenuo_run_state_pruned_total{kind=\"charges\"} 2\n"));
+        assert!(text.contains("attenuo_run_state_pruned_total{kind=\"approvals\"} 3\n"));
         assert!(text.contains("attenuo_audit_append_errors_total 1\n"));
         assert!(text.contains("attenuo_http_requests_total{route=\"/token\",status=\"200\"} 1\n"));
         assert!(text.contains("authorize_duration_seconds_bucket{le=\"0.0005\"} 1\n"));

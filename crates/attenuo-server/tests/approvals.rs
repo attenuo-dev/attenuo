@@ -1410,3 +1410,189 @@ async fn a_revoked_hop_cannot_read_its_runs_approvals_sr60() {
     assert_eq!(get(coder).await.status(), StatusCode::OK);
     assert_eq!(get(root).await.status(), StatusCode::OK);
 }
+
+/// Run-state retention through the server's maintenance passes: alice's run (a charged
+/// `read_web`, a consumed approval and a declined one) is revoked; while its lease is in the
+/// registry nothing of it is pruned, however old; once the lease is pruned, its charge log,
+/// counter and approvals stay for `[leases] run_state_retention_seconds` (30 days by default)
+/// and go past it, counted in `run_state_pruned_total{kind}`. An operator refund of the pruned
+/// charge answers 404 `not_found`; bob's live run, as old, keeps everything and can still be
+/// refunded. The audit log keeps every record.
+#[tokio::test]
+async fn run_state_of_pruned_runs_is_pruned_past_its_retention() {
+    let h = Harness::start().await;
+    assert_eq!(
+        h.state.run_state_retention,
+        Some(time::Duration::days(30)),
+        "the default"
+    );
+    let mint = |subject: &'static str| {
+        let h = &h;
+        async move {
+            let resp = h
+                .client
+                .post(h.server.url("/admin/root-token"))
+                .bearer_auth(ADMIN)
+                .json(&json!({
+                    "subject": subject,
+                    "issuer": h.idp.issuer,
+                    "agent": "planner",
+                    "capabilities": [
+                        {"server": "github", "tool": "read_web", "limits": {"calls": 10}},
+                        {"server": "github", "tool": "delete_repo"}
+                    ],
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let v: Value = resp.json().await.unwrap();
+            (
+                v["access_token"].as_str().unwrap().to_string(),
+                v["lease"].as_str().unwrap().to_string(),
+            )
+        }
+    };
+    let charged_read = |records: Vec<Value>, subject: &str| {
+        records
+            .iter()
+            .rev()
+            .find(|r| {
+                r["kind"] == "decision"
+                    && r["tool"] == "read_web"
+                    && r["originating_subject"] == subject
+            })
+            .and_then(|r| r["id"].as_str())
+            .unwrap()
+            .to_string()
+    };
+    let refund = |decision: String| {
+        let h = &h;
+        async move {
+            let resp = h
+                .client
+                .post(h.server.url("/admin/budgets/refund"))
+                .bearer_auth(ADMIN)
+                .json(&json!({"decision_id": decision}))
+                .send()
+                .await
+                .unwrap();
+            let status = resp.status();
+            (status, resp.json::<Value>().await.unwrap())
+        }
+    };
+    let pruned = |kind: &str| {
+        metric(
+            &h,
+            &format!("attenuo_run_state_pruned_total{{kind=\"{kind}\"}}"),
+        )
+    };
+
+    let (alice, alice_lease) = mint("alice").await;
+    h.taint(&alice).await;
+    let alice_read = charged_read(h.records().await, "alice");
+    let consumed = h.gated(&alice, "alice/site").await;
+    assert_eq!(
+        h.admin_decide(&consumed.approval_id, "grant").await.0,
+        StatusCode::OK
+    );
+    assert!(allowed(&h.delete(&alice, "alice/site").await));
+    let declined = h.gated(&alice, "alice/other").await;
+    assert_eq!(
+        h.admin_decide(&declined.approval_id, "decline").await.0,
+        StatusCode::OK
+    );
+    let (bob, _) = mint("bob").await;
+    h.taint(&bob).await;
+    let bob_read = charged_read(h.records().await, "bob");
+    let bob_gated = h.gated(&bob, "bob/site").await;
+
+    let resp = h
+        .client
+        .post(h.server.url(&format!("/admin/leases/{alice_lease}/revoke")))
+        .bearer_auth(ADMIN)
+        .json(&json!({"reason": "done"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Every charge and approval a month in the past, as far as the store can tell.
+    let back = |days: i64| {
+        (OffsetDateTime::now_utc() - time::Duration::days(days))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+    };
+    let (month, week) = (back(31), back(8));
+    h.state
+        .leases
+        .with_connection(|c| {
+            c.execute("UPDATE budget_charges SET at = ?1", [&month])?;
+            c.execute(
+                "UPDATE approvals SET created_at = ?1, expires_at = ?1, \
+                 decided_at = CASE WHEN decided_at IS NULL THEN NULL ELSE ?1 END",
+                [&month],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    // alice's lease is revoked but still in the registry: nothing of her run goes.
+    assert_eq!(attenuo_server::prune_run_state(&h.state).await, 0);
+
+    // Her lease is pruned (revoked eight days ago, past the week of lease retention); the
+    // same maintenance run then prunes her run state, which is past its 30 days.
+    h.state
+        .leases
+        .with_connection(|c| {
+            c.execute(
+                "UPDATE leases SET revoked_at = ?1 WHERE revoked_at IS NOT NULL",
+                [&week],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    // The three passes of one maintenance run, in the ticker's order (the revoked run's
+    // session binding, if the proxy recorded one, goes in the first).
+    attenuo_server::prune_session_bindings(&h.state).await;
+    assert_eq!(attenuo_server::prune_lease_registry(&h.state).await, 1);
+    assert_eq!(attenuo_server::prune_run_state(&h.state).await, 4);
+    assert_eq!(pruned("counters"), 1, "alice's read_web calls counter");
+    assert_eq!(pruned("charges"), 1, "alice's read_web decision");
+    assert_eq!(pruned("approvals"), 2);
+
+    let (status, v) = refund(alice_read.clone()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+    assert_eq!(v["error"], "not_found");
+    assert!(
+        v["detail"].as_str().unwrap().contains("pruned"),
+        "the detail names the retention: {v}"
+    );
+    for id in [&consumed.approval_id, &declined.approval_id] {
+        let resp = h
+            .client
+            .get(h.server.url(&format!("/admin/approvals/{id}")))
+            .bearer_auth(ADMIN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // bob's live run keeps its approval and its charge, which can still be refunded.
+    let shown = h
+        .admin_get(&format!("/admin/approvals/{}", bob_gated.approval_id))
+        .await;
+    assert_eq!(shown["state"], "pending");
+    let (status, v) = refund(bob_read).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+
+    // The audit log still has alice's charged decision and is intact; nothing more to prune.
+    assert!(h
+        .records()
+        .await
+        .iter()
+        .any(|r| r["id"].as_str() == Some(alice_read.as_str())));
+    h.verify_ok().await;
+    assert_eq!(attenuo_server::prune_run_state(&h.state).await, 0);
+    assert_eq!(pruned("approvals"), 2);
+}

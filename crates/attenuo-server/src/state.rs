@@ -32,6 +32,9 @@ pub struct AppState {
     pub session_retention: Option<Duration>,
     /// `[leases] retention_seconds`; `None` when lease trees are never pruned.
     pub lease_retention: Option<Duration>,
+    /// `[leases] run_state_retention_seconds`; `None` when run-limit counters, the charge log
+    /// and approvals are never pruned.
+    pub run_state_retention: Option<Duration>,
     /// Policy file to re-read on reload; `None` when no policy file is configured.
     pub policies_path: Option<PathBuf>,
     /// Digest and load time of the policy set in force, for `GET /admin/policies`. The engine
@@ -237,6 +240,7 @@ impl AppState {
             leases,
             session_retention: config.leases.session_retention(),
             lease_retention: config.leases.retention(),
+            run_state_retention: config.leases.run_state_retention(),
             policies_path: config.policy.policies_path.clone(),
             loaded_policies,
             admin_token: config.admin.token.clone(),

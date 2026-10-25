@@ -841,14 +841,18 @@ async fn budget_refund(
 }
 
 /// The exit status and message for a refund the server refused as nothing charged (404
-/// `not_found`) or already refunded (409 `already_refunded`). A 404 without that code (a
+/// `not_found`: the decision charged nothing, or its charge log was pruned by
+/// `[leases] run_state_retention_seconds`) or already refunded (409 `already_refunded`). A 404 without that code (a
 /// server too old to have the route) stays an ordinary error.
 fn refund_refusal(e: &anyhow::Error, decision_id: &str) -> Option<(u8, String)> {
     let api = e.downcast_ref::<client::ApiError>()?;
     match (api.status.as_u16(), api.code.as_deref()?) {
         (404, "not_found") => Some((
             EXIT_NOTHING_CHARGED,
-            format!("decision {decision_id} charged no run limit or run usage; nothing to refund"),
+            format!(
+                "no charge is recorded for decision {decision_id} (it charged no run limit or run \
+                 usage, or its charge log was pruned); nothing to refund"
+            ),
         )),
         (409, "already_refunded") => Some((
             EXIT_ALREADY_REFUNDED,
@@ -1347,7 +1351,8 @@ mod tests {
         assert_eq!(code, 2);
         assert_eq!(
             line,
-            "decision D1 charged no run limit or run usage; nothing to refund"
+            "no charge is recorded for decision D1 (it charged no run limit or run usage, or \
+             its charge log was pruned); nothing to refund"
         );
         let twice = err(
             StatusCode::CONFLICT,
