@@ -38,7 +38,7 @@ Every finding fixed here has a regression test that failed on `ea4d35a` and pass
 | SR-78 | proxy: lone surrogate escapes in SSE data (labelling, look-alike rewrite) | Medium | Fixed |
 | SR-79 | proxy: SSE data nested deeper than `serde_json` parses (labelling, look-alike rewrite) | Medium | Fixed |
 | SR-80 | proxy: the same depth differential on the list filter | Low | Fixed |
-| SR-81 | proxy: a record window opens on a failed audit append | Info | Open |
+| SR-81 | proxy: a record window opens on a failed audit append | Info | Fixed |
 | SR-82 | SDKs: SSE reader cost and streams that never go idle | Info | Open |
 | SR-83 | CI: release workflow build toolchain and install scripts | Info | Open |
 | SR-84 | server: AuthZEN batch refused after earlier entries were decided | Info | Accepted |
@@ -79,11 +79,15 @@ The three Medium findings have one root: the proxy's reading of an upstream SSE 
 - **Evidence.** `a_list_answer_the_proxy_cannot_parse_is_not_relayed_unfiltered_sr80` (failed on `ea4d35a`: `delete_repo` relayed to a `read_*` token). The unit test that pinned the old passthrough of non-JSON data is now `data_less_events_pass_through_and_unparsed_data_is_dropped_sr80`.
 - **Fix.** `rewrite_event` drops an event whose data does not parse, instead of emitting it byte for byte. Events without data still pass byte for byte.
 
-### SR-81: a record window opens on a failed audit append (Info, open)
+### SR-81: a record window opens on a failed audit append (Info, fixed)
+
+Fixed in `fix/sr81-record-window-failed-append`.
+
 
 - **Component.** `attenuo-proxy` `records.rs` `RecordWindow`, `proxy.rs` `record_lease_refusal`, `guard.rs` `StreamEndRecords`.
 - **Observation.** `Authorizer::record_rejection` returns a `Uuid` whatever happens: the server's implementation logs a failed append and returns the id of the record it could not write. `record_lease_refusal` then calls `RecordWindow::recorded` with that id, and for the rest of the window (up to `[proxy] record_window_seconds`, at most 3600) every refusal of that chain, tool and reason is counted, not recorded, and its 401 names a decision id that is in no record. A transient append failure (disk full, a lock timeout) therefore hides up to an hour of retries from the audit log, though not from the proxy log and `audit_records_suppressed_total`. No PoC: `StaticAuthorizer` cannot fail a rejection, and making it able to is a test-API change.
 - **Fix sketch.** Have the server's `record_rejection` say whether it wrote (a new default method `record_rejection_checked -> Option<Uuid>` on `Authorizer`, defaulting to `Some(record_rejection(..))`), and on `None` remove the slot (`RecordWindow::forget(key)`) so the next occurrence records. Not done here because it adds to the public `Authorizer` trait.
+- **Fixed.** As sketched. `Authorizer::record_rejection_checked` is a default method (`Some(record_rejection(..))`), so existing implementors compile and behave as before; `ServerAuthorizer` overrides it with `Pipeline::record_rejection_checked`, which returns `None` when the append failed (`record_rejection` still returns the id either way). `record_lease_refusal` and the listen-stream `stream.end` record call it, and on `None` call `RecordWindow::forget`, which closes the window unless its record was already written: the next occurrence is recorded and carries the count suppressed meanwhile, and the refusal (or the stream's final event) names no decision id. Regression test `a_failed_append_opens_no_record_window_sr81` (`tests/security_pass7_sr81.rs`, with the new `StaticAuthorizer::fail_rejections` and `rejection_attempts`); unit test `records::tests::a_forgotten_record_does_not_open_a_window_sr81`. With the proxy's call site put back to open the window on any id, the regression test fails with one attempt of two.
 
 ### SR-82: SDK SSE readers: quadratic rescans in Python, and no idle bound on keep-alive-only streams (Info, open)
 

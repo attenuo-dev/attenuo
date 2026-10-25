@@ -345,8 +345,9 @@ fn unauthorized_body(id: Value, err: &AuthError, decision_id: Option<Uuid>) -> V
 /// recorded; a later one in the window is still refused, but logged and counted through
 /// [`Authorizer::observe_record_suppressed`] instead of recorded, and its 401 names the
 /// window's first record. Returns the id the 401 names: the new record, the window's first
-/// record, or `None` when nothing was recorded (not a lease refusal) or the window's record is
-/// still being written by a concurrent request.
+/// record, or `None` when nothing was recorded (not a lease refusal), the window's record is
+/// still being written by a concurrent request, or the record could not be written (then no
+/// window opens on it and the next refusal is recorded, SR-81).
 async fn record_lease_refusal(
     state: &AppState,
     who: &Authenticated,
@@ -392,10 +393,17 @@ async fn record_lease_refusal(
     if let Some(sid) = session_id {
         call = call.with_session(session_tag(sid));
     }
-    let id = state
+    let Some(id) = state
         .authorizer
-        .record_rejection(&who.chain, &call, reason, now)
-        .await;
+        .record_rejection_checked(&who.chain, &call, reason, now)
+        .await
+    else {
+        // Not in the log: open no window on it, so the next refusal is recorded (SR-81), and
+        // name no decision id.
+        records.forget(&key, tool, reason);
+        tracing::warn!(reason = ?reason, tool, "request refused, record not written: lease inactive");
+        return None;
+    };
     records.recorded(&key, tool, reason, id);
     tracing::warn!(reason = ?reason, tool, decision_id = %id, "request refused and recorded: lease inactive");
     Some(id)

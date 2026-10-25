@@ -587,7 +587,8 @@ pub type ObservedHints = (String, String, Option<bool>, Option<bool>);
 /// ([`observed_hints`](Self::observed_hints)), and so are new sessions
 /// ([`recorded_sessions`](Self::recorded_sessions)), the ends of listen streams
 /// ([`stream_ends`](Self::stream_ends)) and suppressed records
-/// ([`suppressed_records`](Self::suppressed_records)).
+/// ([`suppressed_records`](Self::suppressed_records)). Rejection records can be made to fail
+/// ([`fail_rejections`](Self::fail_rejections)).
 #[derive(Default)]
 pub struct StaticAuthorizer {
     chains: HashMap<String, DelegationChain>,
@@ -603,6 +604,8 @@ pub struct StaticAuthorizer {
     ask_for: std::collections::HashSet<String>,
     contexts: Arc<Mutex<Vec<crate::auth::CallContext>>>,
     sessions: Arc<Mutex<Vec<RecordedSession>>>,
+    fail_rejections: Arc<std::sync::atomic::AtomicBool>,
+    rejection_attempts: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// A session reported through [`Authorizer::record_session`] to a [`StaticAuthorizer`]:
@@ -714,6 +717,20 @@ impl StaticAuthorizer {
     pub fn fail_results(&self, fail: bool) {
         self.fail_results
             .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Make [`Authorizer::record_rejection_checked`] fail (`true`) as a failed audit append
+    /// would: nothing is recorded and it returns `None`; or succeed again (`false`).
+    /// [`Authorizer::record_rejection`] is unaffected.
+    pub fn fail_rejections(&self, fail: bool) {
+        self.fail_rejections
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many times [`Authorizer::record_rejection_checked`] was called, failed or not.
+    pub fn rejection_attempts(&self) -> usize {
+        self.rejection_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Every session reported through [`Authorizer::record_session`], in order.
@@ -845,6 +862,24 @@ impl Authorizer for StaticAuthorizer {
         let id = record.id;
         self.decisions.lock().expect("decisions mutex").push(record);
         id
+    }
+
+    async fn record_rejection_checked(
+        &self,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        reason: &str,
+        now: OffsetDateTime,
+    ) -> Option<uuid::Uuid> {
+        self.rejection_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .fail_rejections
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return None;
+        }
+        Some(self.record_rejection(chain, call, reason, now).await)
     }
 
     async fn record_session(
