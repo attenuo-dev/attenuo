@@ -402,11 +402,11 @@ test('policy page: loaded set, file check and a dry-run evaluation', async () =>
   // Dry runs read the run-limit counters without charging them. The coder's one repo is
   // used up, so a second repo is over the limit, while the repo it already read still passes.
   const evalPanel = c.page.locator('section.panel', { has: c.page.locator('h2', { hasText: 'Evaluate this call' }) });
-  const evaluate = async (token, repo) => {
+  const evaluate = async (token, repo, tool = 'read_file', args = { repo, path: 'README.md' }) => {
     await c.page.locator('#ev-token').fill(token);
     await c.page.locator('#ev-server').fill('github');
-    await c.page.locator('#ev-tool').fill('read_file');
-    await c.page.locator('#ev-args').fill(JSON.stringify({ repo, path: 'README.md' }));
+    await c.page.locator('#ev-tool').fill(tool);
+    await c.page.locator('#ev-args').fill(JSON.stringify(args));
     const previous = await evalPanel.locator('.verdict').elementHandle({ timeout: 1 }).catch(() => null);
     await c.page.getByRole('button', { name: 'Evaluate' }).click();
     // Wait for this answer, not the previous one still on screen.
@@ -443,8 +443,37 @@ test('policy page: loaded set, file check and a dry-run evaluation', async () =>
   await c.page.getByRole('button', { name: 'Evaluate' }).click();
   await evalPanel.locator('.callout.bad', { hasText: 'Calls remaining must be a whole number' }).waitFor();
   await c.page.locator('#ev-budget-calls').fill('');
-  // Shown in both themes with the budget form open and a stated answer on screen.
   assert.deepEqual(await evaluate(data.coderToken, 'alice/public-site'), ['allow', 'policy_allow']);
+
+  // Stated run labels instead of the store. Bob's second root never called a tool, so the
+  // store holds no taint for its run, and the smoke policy (scripts/console-smoke.sh) allows
+  // the destructive add_label outright; a stated taint makes the same call ask for approval.
+  await c.page.locator('#ev-budget-limits').fill('');
+  await c.page.locator('#ev-budget-dest').selectOption('');
+  const labelsBox = evalPanel.locator('.labels-result');
+  const usageBox = evalPanel.locator('.usage-result');
+  const addLabel = (token) => evaluate(token, null, 'add_label', { repo: 'bob/public-site', label: 'bug' });
+  assert.deepEqual(await addLabel(data.bobSecondToken), ['allow', 'policy_allow']);
+  assert.equal(await labelsBox.locator('h3 .pill').textContent(), 'read from the store');
+  assert.equal(await kvValue(labelsBox, 'Tainted'), 'no');
+  await evalPanel.locator('details.session-form summary').click();
+  await c.page.locator('#ev-session-tainted-by').fill('github/read_file');
+  assert.deepEqual(await addLabel(data.bobSecondToken), ['deny', 'approval_required']);
+  assert.equal(await labelsBox.locator('h3 .pill').textContent(), 'stated in the request');
+  assert.equal(await kvValue(labelsBox, 'Tainted'), 'yes');
+  assert.equal(await kvValue(labelsBox, 'Tainted by'), 'github/read_file');
+  // Stated usage is shown as stated; it does not change this decision.
+  await evalPanel.locator('details.usage-form summary').click();
+  await c.page.locator('#ev-usage-calls').fill('2');
+  assert.deepEqual(await addLabel(data.bobSecondToken), ['deny', 'approval_required']);
+  assert.equal(await usageBox.locator('h3 .pill').textContent(), 'stated in the request');
+  assert.equal(await kvValue(usageBox, 'Calls'), '2');
+  await c.page.locator('#ev-usage-calls').fill('x');
+  await c.page.getByRole('button', { name: 'Evaluate' }).click();
+  await evalPanel.locator('.callout.bad', { hasText: 'Calls so far must be a whole number' }).waitFor();
+  await c.page.locator('#ev-usage-calls').fill('2');
+  // Shown in both themes with the forms open and a stated answer on screen.
+  assert.deepEqual(await addLabel(data.bobSecondToken), ['deny', 'approval_required']);
   await bothThemes('policy');
 });
 
