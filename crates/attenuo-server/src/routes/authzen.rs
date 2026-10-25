@@ -75,11 +75,14 @@ pub async fn evaluation(
 
 /// `POST /access/v1/evaluations`: the AuthZEN "boxcar" form. Top-level `subject`, `action`,
 /// `resource` and `context` are defaults; each entry of `evaluations` may replace any of them.
-/// Every entry is decided and audited exactly like a single evaluation, in order.
+/// Every entry that is decided is decided and audited exactly like a single evaluation, in order.
 ///
 /// At most `[authzen] max_batch` entries (400 `batch_too_large` beyond that). Without
 /// `evaluations` (absent or an empty array) the request is a single evaluation and gets a
-/// single `{decision, context}` answer (AuthZEN 1.0 section 7.1). Only the default `execute_all` semantic is supported. An
+/// single `{decision, context}` answer (AuthZEN 1.0 section 7.1). `options.evaluations_semantic`
+/// (section 7.1.2.1) is `execute_all` (default), `deny_on_first_deny` or
+/// `permit_on_first_permit`; the last two decide in order and stop after the first deny (a
+/// failed entry counts) or permit, answering only the entries decided so far. An
 /// authentication failure refuses the whole request; any other per-entry failure answers
 /// `decision: false` with `context.error` for that entry.
 // The `Err` is a full response, built once per refused request; boxing it buys nothing.
@@ -136,18 +139,7 @@ fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
             ),
         ));
     }
-    if let Some(sem) = obj
-        .get("options")
-        .and_then(|o| o.get("evaluations_semantic"))
-        .and_then(Value::as_str)
-    {
-        if sem != "execute_all" {
-            return Err(ApiError::bad_request(
-                "invalid_request",
-                format!("evaluations_semantic `{sem}` is not supported; use `execute_all`"),
-            ));
-        }
-    }
+    let semantic = Semantic::from_options(obj.get("options"))?;
     obj.remove("options");
     let bearer = bearer_auth(state, headers, "/access/v1/evaluations")?;
 
@@ -158,21 +150,84 @@ fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
                 "invalid_request",
                 "each evaluation must be an object",
             )));
+            // A failed entry is a deny (section 7.2.1), so `deny_on_first_deny` stops here.
+            if semantic.stops_at(false) {
+                break;
+            }
             continue;
         };
         let mut merged = obj.clone();
         for (k, v) in item {
             merged.insert(k, v);
         }
-        match evaluate_value(state, headers, bearer.as_ref(), Value::Object(merged)) {
-            Ok(r) => results.push(serde_json::to_value(r).map_err(ApiError::internal)?),
+        let decision = match evaluate_value(state, headers, bearer.as_ref(), Value::Object(merged))
+        {
+            Ok(r) => {
+                let decision = r.decision;
+                results.push(serde_json::to_value(r).map_err(ApiError::internal)?);
+                decision
+            }
             Err(e) if matches!(e.status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) => {
                 return Err(e)
             }
-            Err(e) => results.push(item_error(&e)),
+            Err(e) => {
+                results.push(item_error(&e));
+                false
+            }
+        };
+        if semantic.stops_at(decision) {
+            break;
         }
     }
     Ok(json!({ "evaluations": results }))
+}
+
+/// `options.evaluations_semantic` of a batch (AuthZEN 1.0 section 7.1.2.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Semantic {
+    /// Decide every entry and answer every one (the default).
+    ExecuteAll,
+    /// Decide in order and stop after the first deny; a failed entry counts as a deny.
+    DenyOnFirstDeny,
+    /// Decide in order and stop after the first permit.
+    PermitOnFirstPermit,
+}
+
+impl Semantic {
+    /// The semantic the request names, `execute_all` when it names none. An unknown name, or
+    /// a value that is not a string, is 400 `invalid_request` before anything is decided.
+    fn from_options(options: Option<&Value>) -> Result<Self, ApiError> {
+        match options.and_then(|o| o.get("evaluations_semantic")) {
+            None | Some(Value::Null) => Ok(Self::ExecuteAll),
+            Some(Value::String(s)) => match s.as_str() {
+                "execute_all" => Ok(Self::ExecuteAll),
+                "deny_on_first_deny" => Ok(Self::DenyOnFirstDeny),
+                "permit_on_first_permit" => Ok(Self::PermitOnFirstPermit),
+                other => Err(ApiError::bad_request(
+                    "invalid_request",
+                    format!(
+                        "evaluations_semantic `{other}` is not supported; use `execute_all`, \
+                         `deny_on_first_deny` or `permit_on_first_permit`"
+                    ),
+                )),
+            },
+            Some(_) => Err(ApiError::bad_request(
+                "invalid_request",
+                "evaluations_semantic must be a string",
+            )),
+        }
+    }
+
+    /// Whether the batch stops after an entry with this decision. The entries after it are not
+    /// decided, not audited and not answered: the answer is shorter than the request, as in the
+    /// section 7.1.2.1 examples.
+    fn stops_at(self, decision: bool) -> bool {
+        match self {
+            Self::ExecuteAll => false,
+            Self::DenyOnFirstDeny => !decision,
+            Self::PermitOnFirstPermit => decision,
+        }
+    }
 }
 
 fn item_error(e: &ApiError) -> Value {

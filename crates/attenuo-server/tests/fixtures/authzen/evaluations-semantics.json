@@ -1,5 +1,5 @@
 {
-  "_note": "AuthZEN 1.0 section 7.1.2.1: execute_all is the default semantic and is accepted when named; deny_on_first_deny and permit_on_first_permit are not implemented by Attenuo and are refused with 400 invalid_request before anything is decided.",
+  "_note": "AuthZEN 1.0 section 7.1.2.1: execute_all is the default semantic and is accepted when named, deciding and answering every entry. A semantic the specification does not define, or a value that is not a string, is refused with 400 invalid_request before anything is decided. deny_on_first_deny and permit_on_first_permit have fixtures of their own.",
   "token": {},
   "steps": [
     {
@@ -29,6 +29,20 @@
                 "repo": "alice/public-a"
               }
             }
+          },
+          {
+            "context": {
+              "input": {
+                "repo": "alice/private-b"
+              }
+            }
+          },
+          {
+            "context": {
+              "input": {
+                "repo": "alice/public-c"
+              }
+            }
           }
         ]
       },
@@ -36,6 +50,26 @@
         "status": 200,
         "body": {
           "evaluations": [
+            {
+              "decision": true,
+              "context": {
+                "reason": "policy_allow",
+                "policy_ids": [
+                  "public_reads"
+                ],
+                "diagnostics": [],
+                "decision_id": "<decision_id>"
+              }
+            },
+            {
+              "decision": false,
+              "context": {
+                "reason": "policy_deny",
+                "policy_ids": [],
+                "diagnostics": [],
+                "decision_id": "<decision_id>"
+              }
+            },
             {
               "decision": true,
               "context": {
@@ -69,7 +103,7 @@
           }
         },
         "options": {
-          "evaluations_semantic": "deny_on_first_deny"
+          "evaluations_semantic": "first_applicable"
         },
         "evaluations": [
           {
@@ -85,7 +119,7 @@
         "status": 400,
         "body": {
           "error": "invalid_request",
-          "detail": "evaluations_semantic `deny_on_first_deny` is not supported; use `execute_all`"
+          "detail": "evaluations_semantic `first_applicable` is not supported; use `execute_all`, `deny_on_first_deny` or `permit_on_first_permit`"
         }
       }
     },
@@ -106,9 +140,6 @@
             "server": "github"
           }
         },
-        "options": {
-          "evaluations_semantic": "permit_on_first_permit"
-        },
         "evaluations": [
           {
             "context": {
@@ -117,13 +148,16 @@
               }
             }
           }
-        ]
+        ],
+        "options": {
+          "evaluations_semantic": 1
+        }
       },
       "expect": {
         "status": 400,
         "body": {
           "error": "invalid_request",
-          "detail": "evaluations_semantic `permit_on_first_permit` is not supported; use `execute_all`"
+          "detail": "evaluations_semantic must be a string"
         }
       }
     }
