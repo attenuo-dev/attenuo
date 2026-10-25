@@ -1,0 +1,35 @@
+{
+  "_note": "AuthZEN 1.0 sections 7.1 and 10.1.2: evaluations, when present, is an array; anything else is 400 Bad Request.",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/evaluations",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "evaluations": {
+          "context": {}
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "invalid_request",
+          "detail": "`evaluations` must be an array"
+        }
+      }
+    }
+  ]
+}

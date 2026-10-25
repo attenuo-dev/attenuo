@@ -1,0 +1,131 @@
+{
+  "_note": "AuthZEN 1.0 section 7.1.2.1: execute_all is the default semantic and is accepted when named; deny_on_first_deny and permit_on_first_permit are not implemented by Attenuo and are refused with 400 invalid_request before anything is decided.",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/evaluations",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "options": {
+          "evaluations_semantic": "execute_all"
+        },
+        "evaluations": [
+          {
+            "context": {
+              "input": {
+                "repo": "alice/public-a"
+              }
+            }
+          }
+        ]
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "evaluations": [
+            {
+              "decision": true,
+              "context": {
+                "reason": "policy_allow",
+                "policy_ids": [
+                  "public_reads"
+                ],
+                "diagnostics": [],
+                "decision_id": "<decision_id>"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "path": "/access/v1/evaluations",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "options": {
+          "evaluations_semantic": "deny_on_first_deny"
+        },
+        "evaluations": [
+          {
+            "context": {
+              "input": {
+                "repo": "alice/public-a"
+              }
+            }
+          }
+        ]
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "invalid_request",
+          "detail": "evaluations_semantic `deny_on_first_deny` is not supported; use `execute_all`"
+        }
+      }
+    },
+    {
+      "path": "/access/v1/evaluations",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "options": {
+          "evaluations_semantic": "permit_on_first_permit"
+        },
+        "evaluations": [
+          {
+            "context": {
+              "input": {
+                "repo": "alice/public-a"
+              }
+            }
+          }
+        ]
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "invalid_request",
+          "detail": "evaluations_semantic `permit_on_first_permit` is not supported; use `execute_all`"
+        }
+      }
+    }
+  ]
+}

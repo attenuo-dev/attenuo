@@ -1,0 +1,43 @@
+{
+  "_note": "AuthZEN 1.0 section 5.5: a context.approval_token that does not verify denies the call (200, decision false, reason approval_invalid) before the policy runs.",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/evaluation",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "delete_repo"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/delete_repo",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "repo": "alice/site"
+          },
+          "approval_token": "not-a-jwt"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "decision": false,
+          "context": {
+            "reason": "approval_invalid",
+            "policy_ids": [],
+            "diagnostics": [],
+            "decision_id": "<decision_id>"
+          }
+        }
+      }
+    }
+  ]
+}

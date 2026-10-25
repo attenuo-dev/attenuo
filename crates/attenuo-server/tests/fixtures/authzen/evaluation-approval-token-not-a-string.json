@@ -1,0 +1,38 @@
+{
+  "_note": "AuthZEN 1.0 section 10.1.2 (400 Bad Request): context.approval_token must be a string; anything else is refused before a decision is made.",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/evaluation",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "delete_repo"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/delete_repo",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "repo": "alice/site"
+          },
+          "approval_token": 42
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "invalid_request",
+          "detail": "context.approval_token must be a string"
+        }
+      }
+    }
+  ]
+}

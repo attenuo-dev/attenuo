@@ -1,0 +1,37 @@
+{
+  "_note": "AuthZEN 1.0 section 5.1: subject.type is REQUIRED; Attenuo only decides for subjects of type `agent` and refuses others with 400 invalid_request.",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/evaluation",
+      "body": {
+        "subject": {
+          "type": "user",
+          "id": "alice"
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "repo": "alice/public-site"
+          }
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "invalid_request",
+          "detail": "policy parse error: authzen: subject.type must be `agent`, got `user`"
+        }
+      }
+    }
+  ]
+}

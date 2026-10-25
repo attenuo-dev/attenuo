@@ -1,0 +1,45 @@
+{
+  "_note": "AuthZEN 1.0 section 10.1.2: an unauthenticated batch is refused as a whole with 401, not per entry.",
+  "steps": [
+    {
+      "path": "/access/v1/evaluations",
+      "auth": "none",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "evaluations": [
+          {
+            "context": {
+              "input": {
+                "repo": "alice/public-a"
+              }
+            }
+          }
+        ]
+      },
+      "expect": {
+        "status": 401,
+        "headers": {
+          "www-authenticate": "Bearer realm=\"attenuo\""
+        },
+        "body": {
+          "error": "unauthorized",
+          "detail": "<any>",
+          "error_description": "missing_token"
+        }
+      }
+    }
+  ]
+}

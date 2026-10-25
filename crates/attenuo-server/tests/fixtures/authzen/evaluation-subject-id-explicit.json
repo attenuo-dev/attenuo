@@ -1,0 +1,44 @@
+{
+  "_note": "AuthZEN 1.0 section 5.1: subject.id is REQUIRED. A PEP that sends the agent id explicitly gets the same answer as one that leaves it empty for Attenuo to fill from the bearer's chain (an Attenuo extension).",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/evaluation",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": "planner"
+        },
+        "action": {
+          "name": "read_file"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "repo": "alice/public-site"
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "decision": true,
+          "context": {
+            "reason": "policy_allow",
+            "policy_ids": [
+              "public_reads"
+            ],
+            "diagnostics": [],
+            "decision_id": "<decision_id>"
+          }
+        }
+      }
+    }
+  ]
+}

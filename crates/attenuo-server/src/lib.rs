@@ -116,6 +116,11 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
         // Added last, so it wraps `require_admin` and its 401/403 answers get the headers too.
         .route_layer(axum::middleware::from_fn(admin::admin_response_headers));
 
+    let authzen_routes = Router::new()
+        .route("/access/v1/evaluation", post(authzen::evaluation))
+        .route("/access/v1/evaluations", post(authzen::evaluations))
+        .route_layer(axum::middleware::from_fn(authzen::echo_request_id));
+
     let api = Router::new()
         .route("/healthz", get(wellknown::healthz))
         .route("/readyz", get(routes::ops::readyz))
@@ -130,8 +135,7 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
             "/approvals/{id}",
             get(approvals::user_get).post(approvals::user_decide),
         )
-        .route("/access/v1/evaluation", post(authzen::evaluation))
-        .route("/access/v1/evaluations", post(authzen::evaluations))
+        .merge(authzen_routes)
         .merge(admin_routes)
         .with_state(state.clone())
         .layer(TraceLayer::new_for_http());
