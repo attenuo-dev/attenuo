@@ -406,7 +406,7 @@ The counters are then checked by the same code a live call goes through, before 
 }
 ```
 
-The SDKs send the block from Python `policy_evaluate(..., budget=StatedBudget(...))` and TypeScript `policyEvaluate(..., { budget })`, and `session`, `approval` and `usage` the same way (`StatedSession`, `StatedApproval`, `StatedUsage`), and type the answer below; the console's dry-run form has "Budget", "Run labels" and "Run usage" sections (no approval field).
+The SDKs send the block from Python `policy_evaluate(..., budget=StatedBudget(...))` and TypeScript `policyEvaluate(..., { budget })`, and `session`, `approval` and `usage` the same way (`StatedSession`, `StatedApproval`, `StatedUsage`), and type the answer below; the console's dry-run form has "Budget", "Run labels", "Run usage" and "Approval" sections.
 
 `budget` is `context.budget`: as the run's counters stand now (`source: "store"`; the dry run reads them and never charges), or as the request's `budget` block states them (`source: "request"`). When the call would exceed a limit, the answer is `budget_exhausted` and adds `limit: {hop, kind, arg, max, used}`.
 
