@@ -22,7 +22,9 @@
 //! 2-hop chain: `charges_for` (the argument read, and for `derive: host` the URL parse),
 //! `Derive::apply` alone on a few URL shapes, and `LeaseStore::charge` of a `calls_per`, a
 //! `distinct` and a host `distinct` limit with a new value on every call and with the same
-//! value on every call.
+//! value on every call. And `distinct` on a list argument of 1, 16 and 256 values (256 is the
+//! most a call may count), all new on every call: `charges_for` (one canonical JSON per
+//! value), the counter read of the policy stage (`budget_used`) and the charge.
 //!
 //! ```text
 //! cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3
@@ -151,6 +153,26 @@ fn per_value_create_issue(kind: &str) -> CapabilitySet {
         },
     };
     CapabilitySet::from_iter([Capability::new("fake", "create_issue").with_limits(limits)])
+}
+
+/// `create_issue` with `distinct` on the list argument `tos`, far above anything a bench
+/// reaches.
+fn list_create_issue() -> CapabilitySet {
+    let limits = Limits {
+        distinct: Some(ArgLimit::new("tos", 1 << 50)),
+        ..Limits::default()
+    };
+    CapabilitySet::from_iter([Capability::new("fake", "create_issue").with_limits(limits)])
+}
+
+/// A `create_issue` call whose `tos` lists `len` values no other `n` gives.
+fn list_call(len: usize, n: u128) -> ToolCall {
+    let tos: Vec<String> = (0..len).map(|i| format!("r{n}-{i}@example.com")).collect();
+    ToolCall::new(
+        "fake",
+        "create_issue",
+        json!({"repo": "alice/public-docs", "title": "t", "tos": tos}),
+    )
 }
 
 /// A `create_issue` call whose `to` and `url` carry `n` where the limit `kind` counts it.
@@ -494,6 +516,41 @@ fn bench_decide(c: &mut Criterion) {
                 b.iter_batched(
                     || uuid::Uuid::new_v4().to_string(),
                     |id| store.leases.charge(&id, &same, now).unwrap(),
+                    BatchSize::SmallInput,
+                )
+            });
+        }
+        // `distinct` on a list of `len` values, all new on every call, in both hops: 2 * len
+        // charges, each a value row and a charge-log row (plus the two count rows).
+        for len in [1usize, 16, 256] {
+            let tok = token_with(&issuer, store.leases.as_ref(), 2, now, list_create_issue);
+            let chain = verifier.verify(&tok, now).expect("verifies").chain;
+            let probe = charges_for(&chain, &list_call(len, 0)).expect("charges");
+            assert_eq!(probe.len(), 2 * len);
+            if s == "memory" {
+                let call = list_call(len, 0);
+                group.bench_function(format!("charges_for/distinct_list_{len}"), |b| {
+                    b.iter(|| charges_for(black_box(&chain), &call).unwrap())
+                });
+            }
+            group.bench_function(format!("budget_read_{s}/distinct_list_{len}"), |b| {
+                b.iter_batched(
+                    || {
+                        charges_for(&chain, &list_call(len, uuid::Uuid::new_v4().as_u128()))
+                            .unwrap()
+                    },
+                    |charges| store.leases.budget_used(&charges).unwrap(),
+                    BatchSize::SmallInput,
+                )
+            });
+            group.bench_function(format!("charge_{s}/distinct_list_{len}_new"), |b| {
+                b.iter_batched(
+                    || {
+                        let n = uuid::Uuid::new_v4();
+                        let charges = charges_for(&chain, &list_call(len, n.as_u128())).unwrap();
+                        (n.to_string(), charges)
+                    },
+                    |(id, charges)| store.leases.charge(&id, &charges, now).unwrap(),
                     BatchSize::SmallInput,
                 )
             });

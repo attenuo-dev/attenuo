@@ -23,10 +23,16 @@
 //! | `calls_per_new`, `calls_per_same` | `trusted` | none | `calls_per` on `to` on `create_issue`, in both hops; a new / the same `to` on every call |
 //! | `distinct_new`, `distinct_same` | `trusted` | none | `distinct` on `to` on `create_issue`, in both hops; a new / the same `to` on every call |
 //! | `host_new`, `host_same` | `trusted` | none | `distinct` on `url` with `derive: host`, in both hops; a new host / a new path on the same host on every call |
+//! | `calls_per_host` | `trusted` | none | `calls_per` on `url` with `derive: host`, in both hops; a new path on the same host on every call |
+//! | `calls_per_distinct_new`, `calls_per_distinct_same` | `trusted` | none | `calls_per` and `distinct` on `to`, in both hops; a new / the same `to` on every call |
+//! | `distinct_list` | `trusted` | none | `distinct` on `tos` (a set of strings), in both hops; needs `--list-values N` |
 //!
-//! The six limit-kind configurations put their limit on `create_issue` only (`read_file` has
+//! The limit-kind configurations put their limit on `create_issue` only (`read_file` has
 //! no `to` or `url`), with a `max` no run reaches, so their `read` cell is `baseline`'s; run
-//! them with `--cells destructive`. A repeated `distinct` value is planned as no write, but
+//! them with `--cells destructive`. `--list-values N` (1 to 256, the most values a call may
+//! count) adds a `tos` argument of N values, all new on every call, to `create_issue` in
+//! every configuration, so `baseline` with the same `--list-values` is `distinct_list`'s
+//! control (same body, same Cedar input, no limit). A repeated `distinct` value is planned as no write, but
 //! its charge transaction still runs.
 //!
 //! Run usage (`context.usage`) is kept only when it can matter: no policy here reads it and
@@ -133,6 +139,19 @@ pub enum HotConfig {
     /// `distinct` on the host of `url` in both hops; a new URL on the same host on every call.
     #[value(name = "host_same")]
     HostSame,
+    /// `calls_per` on the host of `url` (`derive: host`) in both hops; a new URL on the same
+    /// host on every call.
+    #[value(name = "calls_per_host")]
+    CallsPerHost,
+    /// `calls_per` and `distinct` on `to` in both hops; a new `to` on every call.
+    #[value(name = "calls_per_distinct_new")]
+    CallsPerDistinctNew,
+    /// `calls_per` and `distinct` on `to` in both hops; the same `to` on every call.
+    #[value(name = "calls_per_distinct_same")]
+    CallsPerDistinctSame,
+    /// `distinct` on `tos` (a list, `--list-values` long, all new on every call) in both hops.
+    #[value(name = "distinct_list")]
+    DistinctList,
 }
 
 impl HotConfig {
@@ -150,6 +169,10 @@ impl HotConfig {
             HotConfig::DistinctSame => "distinct_same",
             HotConfig::HostNew => "host_new",
             HotConfig::HostSame => "host_same",
+            HotConfig::CallsPerHost => "calls_per_host",
+            HotConfig::CallsPerDistinctNew => "calls_per_distinct_new",
+            HotConfig::CallsPerDistinctSame => "calls_per_distinct_same",
+            HotConfig::DistinctList => "distinct_list",
         }
     }
     fn labels(self) -> bool {
@@ -175,17 +198,27 @@ impl HotConfig {
                 [None, Some(json!({"distinct": to}))]
             }
             HotConfig::HostNew | HotConfig::HostSame => [None, Some(json!({"distinct": host}))],
+            HotConfig::CallsPerHost => [None, Some(json!({"calls_per": host}))],
+            HotConfig::CallsPerDistinctNew | HotConfig::CallsPerDistinctSame => {
+                [None, Some(json!({"calls_per": to, "distinct": to}))]
+            }
+            HotConfig::DistinctList => [
+                None,
+                Some(json!({"distinct": {"arg": "tos", "max": calls}})),
+            ],
         }
     }
     /// `create_issue`'s `to` and `url` in this configuration. A `@SEQ@` in either is replaced
     /// by a new number on every call (`fill_seq`).
     fn destination(self) -> (&'static str, &'static str) {
         match self {
-            HotConfig::CallsPerNew | HotConfig::DistinctNew => {
+            HotConfig::CallsPerNew | HotConfig::DistinctNew | HotConfig::CallsPerDistinctNew => {
                 ("r@SEQ@@example.com", "https://h0.example/a")
             }
             HotConfig::HostNew => ("r0@example.com", "https://h@SEQ@.example/a"),
-            HotConfig::HostSame => ("r0@example.com", "https://h0.example/a@SEQ@"),
+            HotConfig::HostSame | HotConfig::CallsPerHost => {
+                ("r0@example.com", "https://h0.example/a@SEQ@")
+            }
             _ => ("r0@example.com", "https://h0.example/a"),
         }
     }
@@ -239,6 +272,12 @@ pub struct HotPathArgs {
     /// Approval rounds run first and discarded.
     #[arg(long, default_value_t = 100)]
     pub approval_warmup: usize,
+    /// Add a `tos` argument (declared as a set of strings) of this many values to `create_issue`
+    /// in every configuration, every value new on every call; 0 leaves it out. At most 256
+    /// (the most values a `calls_per` or `distinct` limit counts in one call). `distinct_list`
+    /// needs it.
+    #[arg(long, default_value_t = 0)]
+    pub list_values: usize,
     /// Extra `[audit]` settings for every server, as `key=value` with the value in TOML (for
     /// example `checkpoint_every=0` or `wal_checkpoint_seconds=3600`); repeatable.
     #[arg(long = "audit-set", value_name = "KEY=VALUE")]
@@ -270,8 +309,9 @@ impl Cell {
         }
     }
     /// The request body in configuration `config`: `create_issue`'s `to` and `url` depend on
-    /// it, and a body that varies per call is filled by `fill_seq`.
-    fn body(self, config: HotConfig) -> String {
+    /// it, and a body that varies per call is filled by `fill_seq`. `list_values` above 0 adds
+    /// `create_issue`'s `tos`, that many values, new on every call.
+    fn body(self, config: HotConfig, list_values: usize) -> String {
         let (name, args) = match self {
             Cell::Read => (
                 "read_file",
@@ -279,11 +319,14 @@ impl Cell {
             ),
             Cell::Destructive => {
                 let (to, url) = config.destination();
-                (
-                    "create_issue",
-                    json!({"repo": "alice/public-docs", "title": "bench", "n": 1,
-                           "to": to, "url": url}),
-                )
+                let mut args = json!({"repo": "alice/public-docs", "title": "bench", "n": 1,
+                                      "to": to, "url": url});
+                if list_values > 0 {
+                    args["tos"] = (0..list_values)
+                        .map(|i| format!("r@SEQ@-{i}@example.com"))
+                        .collect();
+                }
+                ("create_issue", args)
             }
         };
         json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -291,6 +334,10 @@ impl Cell {
         .to_string()
     }
 }
+
+/// The most values a `calls_per` or `distinct` limit counts in one call
+/// (`attenuo_core::limits::MAX_COUNTED_VALUES`); a call listing more is refused.
+const MAX_LIST_VALUES: usize = 256;
 
 const PERMIT_CREATE_ISSUE: &str = r#"
 @id("permit_create_issue_public")
@@ -316,9 +363,14 @@ when { resource.destructive && context.session.tainted && !context.approval.pres
 "#;
 
 /// The bench's server config with the catalog this module needs: an `n` argument on both
-/// tools, `output = "trusted"` on both unless `untrusted`, and `track_usage = true` when
-/// `track_usage`.
-fn config_text(base: String, untrusted: bool, track_usage: bool) -> Result<String> {
+/// tools, `output = "trusted"` on both unless `untrusted`, `track_usage = true` when
+/// `track_usage`, and `create_issue`'s `tos` (a set of strings) when `list`.
+fn config_text(base: String, untrusted: bool, track_usage: bool, list: bool) -> Result<String> {
+    let tos = if list {
+        ", tos = { set = \"string\" }"
+    } else {
+        ""
+    };
     let output = if untrusted {
         ""
     } else {
@@ -344,7 +396,7 @@ fn config_text(base: String, untrusted: bool, track_usage: bool) -> Result<Strin
             format!(
                 "[policy.catalog.{UPSTREAM}.create_issue]\n{output}\
                  inputs = {{ repo = \"string\", title = \"string\", n = \"long\", \
-                 to = \"string\", url = \"string\" }}\n"
+                 to = \"string\", url = \"string\"{tos} }}\n"
             ),
         ),
     ] {
@@ -489,6 +541,7 @@ async fn start(
         ),
         untrusted,
         track_usage,
+        args.list_values > 0,
     )?;
     let cfg = with_audit_settings(cfg, &args.audit_set)?;
     let cfg_path = dir.join("config.toml");
@@ -567,6 +620,8 @@ struct Sums {
     authorize_count: f64,
     append_sum: f64,
     append_count: f64,
+    run_lock_sum: f64,
+    run_lock_count: f64,
 }
 
 impl Sums {
@@ -577,6 +632,8 @@ impl Sums {
             authorize_count: d("attenuo_authorize_duration_seconds_count"),
             append_sum: d("attenuo_audit_append_duration_seconds_sum"),
             append_count: d("attenuo_audit_append_duration_seconds_count"),
+            run_lock_sum: d("attenuo_run_lock_wait_seconds_sum"),
+            run_lock_count: d("attenuo_run_lock_wait_seconds_count"),
         }
     }
     fn add(&mut self, o: &Sums) {
@@ -584,6 +641,8 @@ impl Sums {
         self.authorize_count += o.authorize_count;
         self.append_sum += o.append_sum;
         self.append_count += o.append_count;
+        self.run_lock_sum += o.run_lock_sum;
+        self.run_lock_count += o.run_lock_count;
     }
 }
 
@@ -650,6 +709,9 @@ struct Derived {
     /// Mean of the appends that are not decision records (the `tool_result` appends).
     result_append_mean_us: f64,
     result_appends: u64,
+    /// `attenuo_run_lock_wait_seconds` mean over the decisions that took the lock (SR-55;
+    /// inside the `policy` stage).
+    run_lock_wait_mean_us: f64,
 }
 
 fn derived(stages: &[(String, StageHist)], s: &Sums) -> Derived {
@@ -673,6 +735,11 @@ fn derived(stages: &[(String, StageHist)], s: &Sums) -> Derived {
             0.0
         },
         result_appends: other_n as u64,
+        run_lock_wait_mean_us: if s.run_lock_count > 0.0 {
+            round1(s.run_lock_sum / s.run_lock_count * 1e6)
+        } else {
+            0.0
+        },
     }
 }
 
@@ -804,9 +871,15 @@ async fn run_approvals(
 ) -> Result<ApprovalReport> {
     let url = format!("{}/mcp/{UPSTREAM}", srv.ep.attenuo);
     // Taint the run first: one untrusted read.
-    let read = rpc(http, &url, srv.token(), &Cell::Read.body(HotConfig::Labels)).await?;
+    let read = rpc(
+        http,
+        &url,
+        srv.token(),
+        &Cell::Read.body(HotConfig::Labels, 0),
+    )
+    .await?;
     ensure!(read.get("result").is_some(), "taint read failed: {read}");
-    let body = Cell::Destructive.body(HotConfig::Labels);
+    let body = Cell::Destructive.body(HotConfig::Labels, args.list_values);
     for _ in 0..args.approval_warmup {
         approval_round(http, srv, &url, &body).await?;
     }
@@ -861,13 +934,14 @@ async fn probe(
     srv: &mut Server,
     config: HotConfig,
     cell: Cell,
+    list_values: usize,
 ) -> Result<Value> {
     let resp = http
         .post(format!("{}/mcp/{UPSTREAM}", srv.ep.attenuo))
         .bearer_auth(srv.token())
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
-        .body(super::fill_seq(&cell.body(config)))
+        .body(super::fill_seq(&cell.body(config, list_values)))
         .send()
         .await?;
     srv.sent += 1;
@@ -1020,7 +1094,8 @@ fn render(r: &HotReport) -> String {
         s.push_str(&format!(
             "| {} | {} | decide (whole, mean) | | {} | | |\n\
              | {} | {} | decide (unstaged, mean) | | {} | | |\n\
-             | {} | {} | result append (mean) | {} | {} | | |\n",
+             | {} | {} | result append (mean) | {} | {} | | |\n\
+             | {} | {} | run lock wait (mean) | | {} | | |\n",
             x.config,
             x.cell,
             d.decide_mean_us,
@@ -1030,7 +1105,10 @@ fn render(r: &HotReport) -> String {
             x.config,
             x.cell,
             d.result_appends,
-            d.result_append_mean_us
+            d.result_append_mean_us,
+            x.config,
+            x.cell,
+            d.run_lock_wait_mean_us
         ));
     }
     if let Some(a) = &r.approval {
@@ -1072,6 +1150,14 @@ pub async fn run(args: &HotPathArgs) -> Result<()> {
     ensure!(
         (2..=8).contains(&args.depth),
         "--depth must be 2 to 8 (limits charge every hop)"
+    );
+    ensure!(
+        args.list_values <= MAX_LIST_VALUES,
+        "--list-values must be at most {MAX_LIST_VALUES} (a call listing more is refused)"
+    );
+    ensure!(
+        args.list_values > 0 || !args.configs.contains(&HotConfig::DistinctList),
+        "distinct_list needs --list-values 1 to {MAX_LIST_VALUES}"
     );
     let mut configs = Vec::new();
     for &c in &args.configs {
@@ -1143,7 +1229,7 @@ pub async fn run(args: &HotPathArgs) -> Result<()> {
                         url: format!("{}/mcp/{UPSTREAM}", srv.ep.attenuo),
                         token: Some(token.clone()),
                         rotate: rotate.clone(),
-                        body: cell.body(*c),
+                        body: cell.body(*c, args.list_values),
                         expect: Expect::Result {
                             decision_header: true,
                         },
@@ -1186,7 +1272,7 @@ pub async fn run(args: &HotPathArgs) -> Result<()> {
     let mut checks = Vec::new();
     for (c, srv) in servers.iter_mut() {
         for &cell in &cells {
-            let mut p = probe(&http, srv, *c, cell).await?;
+            let mut p = probe(&http, srv, *c, cell, args.list_values).await?;
             p["config"] = json!(c.label());
             eprintln!("[{}] probe {p}", c.label());
             checks.push(p);
@@ -1270,6 +1356,7 @@ pub async fn run(args: &HotPathArgs) -> Result<()> {
             "rotate_tokens": args.rotate_tokens,
             "depth": args.depth,
             "audit": args.audit,
+            "list_values": args.list_values,
         }),
         runs,
         summary,
@@ -1294,13 +1381,16 @@ mod tests {
     #[test]
     fn config_patch_applies_to_the_bench_template() {
         let base = render_config(1, 2, std::path::Path::new("/p"), ":memory:", "normal", 3);
-        let trusted = config_text(base.clone(), false, false).unwrap();
+        let trusted = config_text(base.clone(), false, false, false).unwrap();
+        assert!(!trusted.contains("tos"));
+        let list = config_text(base.clone(), false, false, true).unwrap();
+        assert_eq!(list.matches("tos = { set = \"string\" }").count(), 1);
         assert!(!trusted.contains("track_usage"));
-        let tracked = config_text(base.clone(), false, true).unwrap();
+        let tracked = config_text(base.clone(), false, true, false).unwrap();
         assert_eq!(tracked.matches("track_usage = true").count(), 1);
         assert_eq!(trusted.matches("output = \"trusted\"").count(), 2);
         assert_eq!(trusted.matches("n = \"long\"").count(), 2);
-        let untrusted = config_text(base, true, false).unwrap();
+        let untrusted = config_text(base, true, false, false).unwrap();
         assert!(!untrusted.contains("output ="));
         assert_eq!(untrusted.matches("n = \"long\"").count(), 2);
     }
@@ -1308,9 +1398,9 @@ mod tests {
     #[test]
     fn limit_kind_configs_limit_create_issue_and_vary_only_their_argument() {
         let base = render_config(1, 2, std::path::Path::new("/p"), ":memory:", "normal", 3);
-        let cfg = config_text(base, false, false).unwrap();
+        let cfg = config_text(base, false, false, false).unwrap();
         assert_eq!(cfg.matches("to = \"string\", url = \"string\"").count(), 1);
-        let fixed = Cell::Destructive.body(HotConfig::Baseline);
+        let fixed = Cell::Destructive.body(HotConfig::Baseline, 0);
         assert!(!fixed.contains("@SEQ@"));
         for (c, kind, varies) in [
             (HotConfig::CallsPerNew, "calls_per", "\"to\":\"r@SEQ@"),
@@ -1319,21 +1409,62 @@ mod tests {
             (HotConfig::DistinctSame, "distinct", ""),
             (HotConfig::HostNew, "distinct", "https://h@SEQ@.example"),
             (HotConfig::HostSame, "distinct", "https://h0.example/a@SEQ@"),
+            (
+                HotConfig::CallsPerHost,
+                "calls_per",
+                "https://h0.example/a@SEQ@",
+            ),
+            (
+                HotConfig::CallsPerDistinctNew,
+                "distinct",
+                "\"to\":\"r@SEQ@",
+            ),
+            (HotConfig::CallsPerDistinctSame, "calls_per", ""),
         ] {
             let [read, issue] = c.limits();
             assert!(read.is_none(), "{c:?}");
             let issue = issue.unwrap();
             assert!(issue.get(kind).is_some(), "{c:?}: {issue}");
-            let body = Cell::Destructive.body(c);
+            let body = Cell::Destructive.body(c, 0);
             if varies.is_empty() {
                 assert_eq!(body, fixed, "{c:?}");
             } else {
                 assert!(body.contains(varies), "{c:?}: {body}");
             }
-            assert_eq!(Cell::Read.body(c), Cell::Read.body(HotConfig::Baseline));
+            assert_eq!(
+                Cell::Read.body(c, 0),
+                Cell::Read.body(HotConfig::Baseline, 0)
+            );
         }
         let [_, host] = HotConfig::HostNew.limits();
         assert_eq!(host.unwrap()["distinct"]["derive"], "host");
+        let [_, host] = HotConfig::CallsPerHost.limits();
+        assert_eq!(host.unwrap()["calls_per"]["derive"], "host");
+        let [_, both] = HotConfig::CallsPerDistinctSame.limits();
+        let both = both.unwrap();
+        assert!(both.get("calls_per").is_some() && both.get("distinct").is_some());
+        // A list of N values, new on every call, in every configuration's create_issue.
+        let [_, list] = HotConfig::DistinctList.limits();
+        assert_eq!(list.unwrap()["distinct"]["arg"], "tos");
+        for n in [1, 16, 256] {
+            let body: Value =
+                serde_json::from_str(&Cell::Destructive.body(HotConfig::Baseline, n)).unwrap();
+            let tos = body["params"]["arguments"]["tos"].as_array().unwrap();
+            assert_eq!(tos.len(), n);
+            assert!(tos.iter().all(|v| v.as_str().unwrap().contains("@SEQ@")));
+            let filled: Value = serde_json::from_str(&crate::fill_seq(
+                &Cell::Destructive.body(HotConfig::DistinctList, n),
+            ))
+            .unwrap();
+            let values: std::collections::BTreeSet<&str> = filled["params"]["arguments"]["tos"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert_eq!(values.len(), n, "values of one call are distinct");
+        }
+        assert!(!Cell::Read.body(HotConfig::Baseline, 16).contains("tos"));
     }
 
     #[test]
