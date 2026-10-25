@@ -10,6 +10,12 @@
 //! the list filter) against [`SseRewriter`] with the same filter closure the proxy installs,
 //! one event per chunk. `end_to_end` sends a `GET` through the real proxy to an upstream that
 //! writes `N` events and closes, and times the client reading all of them.
+//!
+//! `disown` times the stream-end shape check of the unfiltered SSE path (`disown_stream` over
+//! `frame_stream` in `proxy.rs`, `docs/design/bench/2026-10-25-vm-sse-disown.md`): the framer
+//! alone against the framer followed by `disown_chunk`, for a progress notification, an 8 KB
+//! and an 85 KB tool result. For the numbers before the byte scan, run it on the commit that
+//! added it (`git log -- crates/attenuo-proxy/tests/listen_stream_cost.rs`).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,7 +23,7 @@ use std::time::{Duration, Instant};
 use attenuo_core::{Capability, CapabilitySet};
 use attenuo_proxy::filter::{list_kinds_by_shape, ListFilter};
 use attenuo_proxy::sse::{SseFramer, SseRewriter};
-use attenuo_proxy::testing::{spawn_router, test_chain, StaticAuthorizer};
+use attenuo_proxy::testing::{disown_chunk, spawn_router, test_chain, StaticAuthorizer};
 use attenuo_proxy::{router, ProxyConfig, UpstreamConfig};
 use axum::body::Bytes;
 use axum::response::IntoResponse;
@@ -65,6 +71,21 @@ fn large_result_event(n: usize) -> String {
     let list: Value = serde_json::from_str(data).unwrap();
     let msg = json!({"jsonrpc": "2.0", "id": n,
         "result": {"content": [], "structuredContent": {"items": list["result"]["tools"]}}});
+    format!("id: {n}\nevent: message\ndata: {msg}\n\n")
+}
+
+/// A `tools/call` answer of about 8 KB in the shape of [`large_result_event`] (19 of its 200
+/// objects under `structuredContent`).
+fn mid_result_event(n: usize) -> String {
+    let tools = large_event(n);
+    let data = tools
+        .strip_prefix(&format!("id: {n}\nevent: message\ndata: "))
+        .unwrap()
+        .trim_end();
+    let list: Value = serde_json::from_str(data).unwrap();
+    let items: Vec<Value> = list["result"]["tools"].as_array().unwrap()[..19].to_vec();
+    let msg = json!({"jsonrpc": "2.0", "id": n,
+        "result": {"content": [], "structuredContent": {"items": items}}});
     format!("id: {n}\nevent: message\ndata: {msg}\n\n")
 }
 
@@ -140,6 +161,50 @@ fn stage() {
             relay / 1e3,
             rewrite / 1e3,
             (rewrite - relay) / 1e3
+        );
+    }
+}
+
+#[test]
+#[ignore = "measurement; run on a release build with --ignored --nocapture"]
+fn disown() {
+    for (name, events, runs) in [
+        (
+            "small",
+            (0..20_000).map(small_event).collect::<Vec<_>>(),
+            15,
+        ),
+        (
+            "mid_result",
+            (0..2_000).map(mid_result_event).collect::<Vec<_>>(),
+            15,
+        ),
+        (
+            "large_result",
+            (0..200).map(large_result_event).collect::<Vec<_>>(),
+            15,
+        ),
+    ] {
+        let bytes = events[0].len();
+        let mut framer = SseFramer::with_limit(16 << 20);
+        let relay = time_per_event(&events, runs, |c| framer.push(c).unwrap().len());
+        let mut framer = SseFramer::with_limit(16 << 20);
+        let checked = time_per_event(&events, runs, |c| {
+            let framed = framer.push(c).unwrap();
+            let len = framed.len();
+            let out = disown_chunk(Bytes::from(framed));
+            assert_eq!(out.len(), len, "{name}: no event rewritten");
+            out.len()
+        });
+        let added = checked - relay;
+        println!(
+            "disown {name}: event {bytes} B, relay {:.2} us, checked {:.2} us, added {:.2} us/event, \
+             {:.3} us/KB, {:.0}% of relay",
+            relay / 1e3,
+            checked / 1e3,
+            added / 1e3,
+            added / 1e3 / (bytes as f64 / 1024.0),
+            100.0 * added / relay
         );
     }
 }
