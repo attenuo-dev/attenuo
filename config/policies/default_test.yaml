@@ -112,6 +112,59 @@ cases:
     reason: policy_deny
     policy_ids: []
 
+  # SR-70: a URL parser that follows WHATWG (Node's fetch and URL, the `url` crate) reads a
+  # backslash as `/` and `%2e%2e` as `..`, and drops tabs and newlines, so a tool that puts
+  # `repo` into a URL path would leave the organisation with any of these.
+  - name: a backslash path that climbs out of the acme organisation is denied (SR-70)
+    chain: [assistant]
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: 'acme/..\evil\api', title: hi }
+    expect: deny
+    reason: policy_deny
+    policy_ids: []
+
+  - name: a percent-encoded dot segment is denied (SR-70)
+    chain: [assistant]
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: acme/%2e%2e, title: hi }
+    expect: deny
+    reason: policy_deny
+    policy_ids: []
+
+  - name: a percent-encoded slash is denied (SR-70)
+    chain: [assistant]
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: acme/..%2Fevil%2Fapi, title: hi }
+    expect: deny
+    reason: policy_deny
+    policy_ids: []
+
+  - name: a tab inside the name is denied (SR-70)
+    chain: [assistant]
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: "acme/.\t.", title: hi }
+    expect: deny
+    reason: policy_deny
+    policy_ids: []
+
+  - name: a query or fragment in the name is denied (SR-70)
+    chain: [assistant]
+    call:
+      server: github
+      tool: create_issue
+      arguments: { repo: "acme/api?owner=evil#", title: hi }
+    expect: deny
+    reason: policy_deny
+    policy_ids: []
+
   - name: a repository name that starts with a dot is still allowed
     chain: [assistant]
     call:
@@ -227,6 +280,14 @@ cases:
     expect: allow
     reason: policy_allow
     policy_ids: [permit_delete_acme_sandbox_repo]
+
+  - name: with MFA a backslash path out of the sandbox is still denied (SR-70)
+    user: { attributes: { mfa: true } }
+    chain: [assistant]
+    call: { server: github, tool: delete_repo, arguments: { repo: 'acme/sandbox-x\..\..\evil\api' } }
+    expect: deny
+    reason: policy_deny
+    policy_ids: []
 
   # With MFA the forbid no longer applies, but the sandbox permit does not cover acme/api,
   # so the call is denied by default.

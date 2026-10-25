@@ -22,7 +22,11 @@
 // `"acme/*"` alone also matches "acme/", "acme/a/b" and "acme/../x". The repository rules
 // below therefore pin the shape "acme/<name>": one `/`, and a name that is not empty, "."
 // or "..". Cedar has no character classes; which characters a name may hold is left to the
-// upstream (or to a `one_of` constraint in the token's capability).
+// upstream (or to a `one_of` constraint in the token's capability), except for the ones URL
+// parsers act on (SR-70): a backslash, which WHATWG parsers (Node's fetch, the `url` crate)
+// read as `/` ("acme/..\evil\x" becomes /evil/x), `%` (`%2e%2e` is `..`, and an upstream
+// may decode `%2F`), `?` and `#`, and the tab, line feed and carriage return those parsers
+// drop. GitHub names hold none of them.
 
 // Read-only tools are fine for any agent on behalf of any user.
 // Cedar cannot glob action names (`Action::"read_*"` is not a thing), so tag tools as
@@ -41,6 +45,13 @@ when {
     context.input has repo &&
     context.input.repo like "acme/*" &&
     !(context.input.repo like "acme/*/*") &&
+    !(context.input.repo like "*\\*") &&
+    !(context.input.repo like "*%*") &&
+    !(context.input.repo like "*?*") &&
+    !(context.input.repo like "*#*") &&
+    !(context.input.repo like "*\t*") &&
+    !(context.input.repo like "*\n*") &&
+    !(context.input.repo like "*\r*") &&
     context.input.repo != "acme/" &&
     context.input.repo != "acme/." &&
     context.input.repo != "acme/.."
@@ -56,6 +67,13 @@ when {
     context.input has repo &&
     context.input.repo like "acme/sandbox-*" &&
     !(context.input.repo like "acme/*/*") &&
+    !(context.input.repo like "*\\*") &&
+    !(context.input.repo like "*%*") &&
+    !(context.input.repo like "*?*") &&
+    !(context.input.repo like "*#*") &&
+    !(context.input.repo like "*\t*") &&
+    !(context.input.repo like "*\n*") &&
+    !(context.input.repo like "*\r*") &&
     context.input.repo != "acme/sandbox-"
 };
 

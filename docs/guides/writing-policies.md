@@ -155,7 +155,7 @@ A value outside the range, a fraction, or a numeric string is denied with `capab
 - `acme/a/b`, because `*` crosses `/`;
 - `acme/../x` and `acme/..`, which an upstream that builds a URL or path from the value may resolve outside `acme`.
 
-To pin a shape, add the cases the wildcard should not cover. The starter policy's issue rule allows exactly one `/` and a name that is not empty, `.` or `..`:
+To pin a shape, add the cases the wildcard should not cover. The starter policy's issue rule allows exactly one `/`, none of the characters URL parsers act on, and a name that is not empty, `.` or `..`:
 
 ```cedar
 @id("permit_create_issue_in_acme")
@@ -164,13 +164,20 @@ when {
     context.input has repo &&
     context.input.repo like "acme/*" &&
     !(context.input.repo like "acme/*/*") &&
+    !(context.input.repo like "*\\*") &&
+    !(context.input.repo like "*%*") &&
+    !(context.input.repo like "*?*") &&
+    !(context.input.repo like "*#*") &&
+    !(context.input.repo like "*\t*") &&
+    !(context.input.repo like "*\n*") &&
+    !(context.input.repo like "*\r*") &&
     context.input.repo != "acme/" &&
     context.input.repo != "acme/." &&
     context.input.repo != "acme/.."
 };
 ```
 
-`!(... like "acme/*/*")` is what rules out a second `/`, and with it every `..` path that leaves the owner. A longer fixed prefix needs the same treatment: `like "acme/sandbox-*"` matches `acme/sandbox-x/../api`, so the starter's sandbox permit also carries `!(... like "acme/*/*")` and `!= "acme/sandbox-"`. Patterns are case-sensitive (`ACME/api` does not match), which is what you want when the upstream is too, and a trap when it is not. Which characters a name may contain cannot be said with `like`. Leave that to the upstream, or list the allowed values (`["acme/api", "acme/web"].contains(context.input.repo)`, or a `one_of` constraint in the token).
+`!(... like "acme/*/*")` is what rules out a second `/`. It is not enough on its own when the tool puts the value into a URL: WHATWG URL parsers (Node's `fetch` and `URL`, Rust's `url` crate) read a backslash as `/`, so `acme/..\evil\api` in `https://api.github.com/repos/{repo}/issues` becomes `/repos/evil/api/issues`; they read `%2e%2e` as `..` and drop tabs and line breaks, and some upstreams decode `%2F`. The other guards refuse those characters, and `?` and `#`, which would end the path (SR-70). With them, no `..` path leaves the owner. A longer fixed prefix needs the same treatment: `like "acme/sandbox-*"` matches `acme/sandbox-x/../api`, so the starter's sandbox permit also carries `!(... like "acme/*/*")` and `!= "acme/sandbox-"`. Patterns are case-sensitive (`ACME/api` does not match), which is what you want when the upstream is too, and a trap when it is not. Which characters a name may contain cannot be said with `like`. Leave that to the upstream, or list the allowed values (`["acme/api", "acme/web"].contains(context.input.repo)`, or a `one_of` constraint in the token).
 
 A pattern in policy and a `prefix` constraint in the token's capability do different jobs:
 
