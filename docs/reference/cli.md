@@ -243,7 +243,7 @@ When the server refuses, one line goes to stderr and nothing to stdout, with `--
 
 | Server answer | Message | Exit status |
 | --- | --- | --- |
-| 404 `not_found` | `error: decision <id> charged no run limit or run usage; nothing to refund` | 2 |
+| 404 `not_found` | `error: no charge is recorded for decision <id> (it charged no run limit or run usage, or its charge log was pruned); nothing to refund` | 2 |
 | 409 `already_refunded` | `error: the charge of decision <id> was already refunded` | 3 |
 | anything else | `error: server answered ...` | 1 |
 
