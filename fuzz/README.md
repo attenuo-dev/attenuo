@@ -59,6 +59,8 @@ artifact itself is not kept.
 | `approval_token` | `Verifier::verify_approval` on mutated and re-signed tokens, `check_binding`, `take_approval` and `take_approval_by_id` with mutated arguments | byte-mutated tokens never verify with other claims; accepted tokens are well formed; an approval is taken exactly when the canonical arguments match, once |
 | `policy_usage` | `policies_read_usage` on generated and raw Cedar | never "nobody reads usage" for a policy naming `context.usage`, or one whose answer changes with `context.usage` |
 | `server_http` | the server router: `POST /access/v1/evaluation(s)`, `POST /approvals/{id}`, `POST /admin/approvals/{id}` | no 5xx; an allow has `policy_allow`; one result per batch entry; no decision on a missing approval |
+| `sse_framer_rewriter` | the pass 7 SSE code: BOM strip, `SseFramer`, `SseRewriter`, `rewrite_event`, `has_data`, `may_hold_stream_end_code`, `disown_events` (crate-private, via the `fuzzing` feature) | BOM strip and framing independent of chunking; framed output is whole UTF-8 events; rewriter output bounded; the scan never misses a number equal to -32001; no stream-end shape survives `disown_events` |
+| `sse_parse_data` | `parse_data`, `replace_lone_surrogates` (via the `fuzzing` feature) | same value as `serde_json` whenever it parses; text without `\u` unchanged; length kept; idempotent |
 
 `src/lib.rs` holds the shared pieces: JSON and string generators biased to edge cases, a token
 issuer with a fixed key (so targets can re-sign mutated tokens) and a signed audit export.

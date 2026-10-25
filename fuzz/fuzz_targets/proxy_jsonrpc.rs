@@ -336,6 +336,8 @@ fn world() -> &'static World {
                     session_ttl: std::time::Duration::from_secs(60),
                     max_sessions: 64,
                     max_sessions_per_principal: 64,
+                    record_window: attenuo_proxy::records::DEFAULT_RECORD_WINDOW,
+                    record_window_max_keys: attenuo_proxy::records::DEFAULT_RECORD_WINDOW_MAX_KEYS,
                 };
                 attenuo_proxy::router(config, auth.clone())
             })
