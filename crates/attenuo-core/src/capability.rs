@@ -538,7 +538,10 @@ impl CapabilitySet {
     /// exchange time (ADR-0010):
     ///
     /// - A requested capability that a parent capability covers as it is keeps its limits,
-    ///   lowered by `remaining` below.
+    ///   lowered by `remaining` below. The one other change: a `calls_per` or `distinct` above
+    ///   the parent's on the same argument is lowered to the parent's figure. Such a request is
+    ///   covered only because its `calls` is no larger than that figure
+    ///   ([`Limits::narrows`]), so the bound in force is the same before and after.
     /// - Otherwise the first parent capability that covers its calls
     ///   ([`Capability::covers_calls`]) is its parent: limits the parent has and the request
     ///   lacks are copied, and larger figures are lowered to the parent's
