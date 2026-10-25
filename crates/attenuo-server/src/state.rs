@@ -98,6 +98,7 @@ impl AppState {
         }
         config.proxy.stream_recheck()?;
         config.proxy.check_limits()?;
+        config.proxy.record_window()?;
         config.token.check_dpop()?;
         config.approvals.check()?;
         let lease_maintenance = config.leases.maintenance()?;

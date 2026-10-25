@@ -26,7 +26,9 @@
 //!   however it ends: cut by the re-check, finished or broken by the upstream, or dropped by
 //!   the client (the `Drop` of the stream state);
 //! - its `stream.end` records are bounded by a [`RecordWindow`]: at most one per delegation
-//!   chain and reason every [`STREAM_END_RECORD_WINDOW`]. The first end in a window is
+//!   chain and reason every [`crate::ProxyConfig::record_window`] (`[proxy]
+//!   record_window_seconds`, default [`crate::records::DEFAULT_RECORD_WINDOW`], a minute).
+//!   The first end in a window is
 //!   recorded; later ones in the same window still end their stream with the same final event
 //!   (naming the first record's id), are logged, and are counted through
 //!   [`Authorizer::observe_record_suppressed`] instead of recorded. The lease refusals of
@@ -59,15 +61,6 @@ pub use crate::auth::REASON_TOKEN_EXPIRED;
 /// The tool name of the audit record written when the proxy ends a stream because the lease
 /// is no longer live or the token expired. A fixed name, like `http.GET`, never request text.
 pub const STREAM_END_TOOL: &str = "stream.end";
-
-/// How long, after a `stream.end` record of a `GET` listen stream, further ends of listen
-/// streams of the same delegation chain for the same reason are counted instead of recorded
-/// ([`RecordWindow`]). A minute keeps the record of when the condition began, and one more
-/// a minute later while it lasts, without one record per stream: a client holding several
-/// listen streams (or several sessions) of one token sees them all end at the same expiry or
-/// revocation. A constant, not configuration: the suppressed ends are in the metric
-/// `audit_records_suppressed_total` and the proxy log.
-pub const STREAM_END_RECORD_WINDOW: Duration = Duration::from_secs(60);
 
 /// Why a guarded `GET` listen stream ended: the `cause` label of the server's
 /// `proxy_streams_ended_total`. A fixed set, so the metric's cardinality stays bounded; the
@@ -434,17 +427,63 @@ pub fn disown_stream_end(body: &mut Value) -> usize {
     rewritten
 }
 
+/// Could the raw bytes of an SSE event hold a message with the stream-end shape
+/// ([`has_stream_end_shape`])? A byte scan run before the event is parsed, so that the
+/// unfiltered SSE path parses only the rare event that may be a look-alike; every message
+/// `has_stream_end_shape` matches passes it, and a false positive only costs the parse.
+///
+/// `has_stream_end_shape` compares `error.code` by value, so the event must hold a JSON number
+/// whose `f64` value is `-32001`. Its text cannot be escaped (JSON numbers have no escapes),
+/// it starts with a literal `-`, and it is one unbroken run of the bytes `0-9 . e E + -`
+/// (data lines are joined with `\n`, which cannot fall inside a number). The text is not
+/// always `-32001`: `-32001.0`, `-32001e0`, `-3.2001e4`, `-3.2001E+4`, `-0.32001e5` and
+/// `-320010e-1` all have that value, and so does any decimal close enough to round to it,
+/// such as `-32000.99999999999999999` or `-32001.0000000000000001`. A search for `-32001`
+/// would miss most of these (`-3.2001e4` does not contain it), and a search for `32001`
+/// would miss the rounded ones. What every one of them shares is its significant digits:
+/// take the digits and points after the `-`, drop the points and the leading zeros, and what
+/// is left starts with `32001` or, for a value just under 32001 in magnitude, `320009` (a
+/// double next to 32001 is within 4e-12 of it, so its decimal is `32001.000...` or
+/// `32000.999...`). So the scan accepts an event when some `-` is followed by such a run whose
+/// significant digits start with `32001` or `320009`. The exponent is not read: a wrong
+/// magnitude (`-3.2001`, `-320010`) is a false positive that the parse then rejects.
+fn may_hold_stream_end_code(event: &[u8]) -> bool {
+    let mut rest = event;
+    while let Some(i) = rest.iter().position(|&b| b == b'-') {
+        rest = &rest[i + 1..];
+        let mut head = [0u8; 6];
+        let mut len = 0;
+        for &b in rest
+            .iter()
+            .take_while(|b| b.is_ascii_digit() || **b == b'.')
+            .filter(|b| **b != b'.')
+            .skip_while(|b| **b == b'0')
+            .take(head.len())
+        {
+            head[len] = b;
+            len += 1;
+        }
+        let head = &head[..len];
+        if head.starts_with(b"32001") || head.starts_with(b"320009") {
+            return true;
+        }
+    }
+    false
+}
+
 /// [`disown_stream_end`] over a chunk of whole SSE events (as [`crate::sse::frame_stream`]
 /// and [`crate::sse::rewrite_stream`] emit them). An event with a message to rewrite is
 /// emitted again with the new data and its other fields (`id:`, `event:`) kept; every other
-/// event goes out byte for byte.
+/// event goes out byte for byte. Only an event that passes [`may_hold_stream_end_code`] is
+/// parsed (`docs/design/bench/2026-10-25-vm-sse-disown.md`).
 pub(crate) fn disown_events(chunk: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(chunk.len());
     for event in crate::sse::split_events(chunk) {
-        let lookalike = crate::sse::event_json(event).is_some_and(|v| match &v {
-            Value::Array(items) => items.iter().any(has_stream_end_shape),
-            other => has_stream_end_shape(other),
-        });
+        let lookalike = may_hold_stream_end_code(event)
+            && crate::sse::event_json(event).is_some_and(|v| match &v {
+                Value::Array(items) => items.iter().any(has_stream_end_shape),
+                other => has_stream_end_shape(other),
+            });
         if !lookalike
             || crate::sse::rewrite_event(
                 event,
@@ -461,12 +500,23 @@ pub(crate) fn disown_events(chunk: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Run every chunk of `inner` (whole SSE events) through [`disown_events`].
+/// [`disown_events`] over one chunk of whole SSE events, returning the chunk itself, without
+/// a copy, when no event in it passes [`may_hold_stream_end_code`] (the scan over the chunk
+/// sees every event's bytes; a number never runs across the empty line that ends an event).
+pub(crate) fn disown_chunk(chunk: Bytes) -> Bytes {
+    if may_hold_stream_end_code(&chunk) {
+        Bytes::from(disown_events(&chunk))
+    } else {
+        chunk
+    }
+}
+
+/// Run every chunk of `inner` (whole SSE events) through [`disown_chunk`].
 pub(crate) fn disown_stream<S>(inner: S) -> impl Stream<Item = Result<Bytes, io::Error>> + Send
 where
     S: Stream<Item = Result<Bytes, io::Error>> + Send,
 {
-    inner.map(|chunk| chunk.map(|bytes| Bytes::from(disown_events(&bytes))))
+    inner.map(|chunk| chunk.map(disown_chunk))
 }
 
 type BoxStream = Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>>;
@@ -750,6 +800,112 @@ mod tests {
         assert_eq!(disown_events(note.as_bytes()), note.as_bytes());
     }
 
+    /// An SSE event whose one message is a look-alike with `code` written as `code`.
+    fn lookalike_event(code: &str) -> String {
+        format!(
+            "id: 3\nevent: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":null,\
+             \"error\":{{\"code\":{code},\"message\":\"x\"}}}}\n\n"
+        )
+    }
+
+    /// Every spelling of a look-alike's code passes the byte scan, and the event is rewritten.
+    fn assert_scanned_and_rewritten(code: &str) {
+        let event = lookalike_event(code);
+        let msg = crate::sse::event_json(event.as_bytes()).expect(code);
+        assert!(has_stream_end_shape(&msg), "not a look-alike: {code}");
+        assert!(may_hold_stream_end_code(event.as_bytes()), "missed: {code}");
+        let out = disown_events(event.as_bytes());
+        let msg = crate::sse::event_json(&out).unwrap();
+        assert_eq!(msg["error"]["code"], CODE_UPSTREAM, "{code}");
+    }
+
+    #[test]
+    fn every_encoding_serde_json_writes_for_the_code_passes_the_byte_scan() {
+        for code in [
+            json!(-32001i64),
+            json!(-32001.0f64),
+            json!(CODE_UNAUTHORIZED),
+            json!(CODE_UNAUTHORIZED as f64),
+        ] {
+            let text = code.to_string();
+            assert!(["-32001", "-32001.0"].contains(&text.as_str()), "{text}");
+            assert_scanned_and_rewritten(&text);
+        }
+        assert_scanned_and_rewritten(&lookalike(Value::Null)["error"]["code"].to_string());
+    }
+
+    #[test]
+    fn hand_written_spellings_of_the_code_pass_the_byte_scan() {
+        for code in [
+            "-32001",
+            "-32001.0",
+            "-32001.000",
+            "-3.2001e4",
+            "-3.2001E4",
+            "-3.2001e+4",
+            "-3.2001E+4",
+            "-32001e0",
+            "-32001E-0",
+            "-0.32001e5",
+            "-0.0032001e7",
+            "-320010e-1",
+            "-3200100e-2",
+            "-320.01e2",
+            "-3200.1e1",
+            "-32001.0000000000000001",
+            "-32000.99999999999999999",
+            "-3.2000999999999999999e4",
+            " -32001 ",
+            "\t -3.2001E+4\t",
+        ] {
+            assert_scanned_and_rewritten(code);
+        }
+        // Every place for the point and every exponent that puts it back.
+        let digits = "32001";
+        for point in 1..=digits.len() {
+            for zeros in 0..3 {
+                let (int, frac) = digits.split_at(point);
+                let frac = format!("{frac}{}", "0".repeat(zeros));
+                let frac = if frac.is_empty() {
+                    String::new()
+                } else {
+                    format!(".{frac}")
+                };
+                let exp = digits.len() - point;
+                for e in ["e", "E", "e+", "E+"] {
+                    assert_scanned_and_rewritten(&format!("-{int}{frac}{e}{exp}"));
+                }
+                assert_scanned_and_rewritten(&format!(
+                    "-0.{}{digits}e{}",
+                    "0".repeat(zeros),
+                    5 + zeros
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn events_without_the_codes_digits_are_not_parsed() {
+        for event in [
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\
+             \"params\":{\"progressToken\":\"call-17\",\"progress\":-3,\"total\":100}}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32000,\"message\":\"x\"}}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":32001,\"message\":\"x\"}}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-3.2002e4,\"message\":\"x\"}}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32002,\"message\":\"-3200 or -32000.8\"}}\n\n",
+        ] {
+            assert!(!may_hold_stream_end_code(event.as_bytes()), "{event}");
+            assert_eq!(disown_events(event.as_bytes()), event.as_bytes());
+        }
+        // A chunk that fails the scan is passed on as it is.
+        let note = Bytes::from_static(b"data: {\"jsonrpc\":\"2.0\",\"method\":\"n\"}\n\n");
+        assert_eq!(disown_chunk(note.clone()).as_ptr(), note.as_ptr());
+        // A false positive is parsed and left alone.
+        let near = "data: {\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-3.2001,\"message\":\"x\"}}\n\n";
+        assert!(may_hold_stream_end_code(near.as_bytes()));
+        assert_eq!(disown_events(near.as_bytes()), near.as_bytes());
+    }
+
     #[tokio::test]
     async fn a_non_sse_body_ends_with_an_error() {
         let chain = test_chain("user:a", "agent:a", [Capability::new("s", "*")]);
@@ -882,7 +1038,9 @@ mod tests {
     fn listen_guard(auth: &Arc<StaticAuthorizer>, chain: &DelegationChain) -> StreamGuard {
         StreamGuard::new(auth.clone(), chain.clone(), Duration::from_millis(10))
             .recording("s", None, false)
-            .listen(Arc::new(RecordWindow::new(STREAM_END_RECORD_WINDOW)))
+            .listen(Arc::new(RecordWindow::new(
+                crate::records::DEFAULT_RECORD_WINDOW,
+            )))
     }
 
     #[tokio::test]

@@ -282,6 +282,13 @@ max_sessions = 100000
 # gets 429 too_many_sessions, and other users are unaffected. A session the proxy refuses is
 # deleted at the upstream.
 max_sessions_per_principal = 64
+# Repeated audit records of one condition (a client retrying initialize on a revoked lease, or
+# several GET listen streams of one token cut at once): the first per delegation chain, tool and
+# reason in each window is recorded, the rest are still refused but only counted in
+# audit_records_suppressed_total. One window (seconds, 1 to 3600) for both kinds, and how many
+# windows each kind keeps open (100 to 1000000; a full table records rather than suppresses).
+record_window_seconds = 60
+record_window_max_keys = 10000
 
 [metrics]
 # Prometheus text endpoint on its OWN listener (GET /metrics), never on the proxy port.
