@@ -5,7 +5,8 @@
 //! events, possibly after notifications and server requests, possibly inside a JSON-RPC batch.
 //! [`rewrite_stream`] parses the stream incrementally, runs a callback over the JSON-RPC
 //! message(s) of each event, and emits the event again. Events with no `data`, and comments, are
-//! passed through; the stream is never buffered beyond one event.
+//! passed through; an event whose `data` does not parse is dropped (SR-80); the stream is never
+//! buffered beyond one event.
 //!
 //! The framing rules are those of the WHATWG SSE specification: lines end in `\n`, `\r\n` or
 //! `\r`; an empty line ends an event; several `data:` lines of one event are joined with `\n`;
@@ -75,7 +76,7 @@ impl SseRewriter {
     /// Feed a chunk of the stream; returns the bytes of every event completed by it, rewritten.
     /// `f` is called with the parsed JSON of each event that carries valid JSON `data`, and may
     /// modify it. Such an event is re-serialized (so duplicate object keys cannot survive);
-    /// any other event is emitted byte for byte.
+    /// an event with no data is emitted byte for byte, one whose data does not parse is dropped.
     pub fn push(
         &mut self,
         chunk: &[u8],
@@ -269,7 +270,8 @@ fn data_lines<'a>(lines: &[&'a str]) -> Vec<&'a str> {
 }
 
 /// Run `f` over the JSON `data` of one whole `event` and write the event to `out`: re-encoded
-/// (other fields kept) when the data is JSON, byte for byte otherwise.
+/// (other fields kept) when the data is JSON, byte for byte when it has no data, and not at
+/// all when its data does not parse (SR-80).
 pub(crate) fn rewrite_event(
     event: &[u8],
     f: &mut impl FnMut(&mut Value),
@@ -283,7 +285,16 @@ pub(crate) fn rewrite_event(
         .then(|| parse_data(&data.join("\n")))
         .flatten();
     let Some(mut message) = parsed else {
-        out.extend_from_slice(event);
+        if data.is_empty() {
+            out.extend_from_slice(event);
+        } else {
+            // Data the proxy cannot parse, which a client with another JSON parser may still
+            // read: `f` never saw it, so it is not relayed (SR-80).
+            tracing::warn!(
+                bytes = event.len(),
+                "upstream SSE event whose data does not parse; dropped"
+            );
+        }
         return Ok(());
     };
     f(&mut message);
@@ -482,9 +493,13 @@ mod tests {
     }
 
     #[test]
-    fn non_json_and_data_less_events_pass_through_byte_for_byte() {
-        let input = "data: not json\n\n: comment\n\nretry: 5\n\n";
+    fn data_less_events_pass_through_and_unparsed_data_is_dropped_sr80() {
+        let input = ": comment\n\nretry: 5\n\n";
         assert_eq!(run(&[input.as_bytes()]), input);
+        // Not JSON, or nested deeper than `serde_json` allows: dropped, the rest kept.
+        let deep = format!("data: {}{}\n\n", "[".repeat(200), "]".repeat(200));
+        let mixed = format!("data: not json\n\n{deep}: comment\n\ndata: {{\"a\":1}}\n\n");
+        assert_eq!(run(&[mixed.as_bytes()]), ": comment\n\ndata: {\"a\":1}\n\n");
     }
 
     #[test]

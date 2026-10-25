@@ -218,3 +218,36 @@ async fn an_event_the_proxy_cannot_parse_is_not_relayed_sr79() {
         "a look-alike the proxy cannot parse is relayed: {got:.200}"
     );
 }
+
+#[tokio::test]
+async fn a_list_answer_the_proxy_cannot_parse_is_not_relayed_unfiltered_sr80() {
+    // The same differential on the list filter: a `tools/list` answer, streamed, with a member
+    // nested deeper than `serde_json` allows, reached a client unfiltered.
+    let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+    let mut body = br#"data: {"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"read_file","inputSchema":{}},{"name":"delete_repo","inputSchema":{}}],"x":"#.to_vec();
+    body.extend_from_slice(deep.as_bytes());
+    body.extend_from_slice(b"}}\n\n");
+    let upstream = spawn_router(raw_sse_upstream(body)).await.unwrap();
+    let chain = test_chain("user:a", "agent:a", [Capability::new("s", "read_*")]);
+    let authorizer = Arc::new(StaticAuthorizer::new().with_chain(BEARER, chain));
+    let config = ProxyConfig::new(
+        "127.0.0.1:0".parse().unwrap(),
+        vec![UpstreamConfig::new("s", upstream.url("/mcp"))],
+    );
+    let proxy = spawn_router(router(config, authorizer)).await.unwrap();
+    let resp = reqwest::Client::new()
+        .post(proxy.url("/mcp/s"))
+        .bearer_auth(BEARER)
+        .header("accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .send()
+        .await;
+    let got = match resp {
+        Ok(r) => String::from_utf8_lossy(&r.bytes().await.unwrap_or_default()).into_owned(),
+        Err(_) => String::new(),
+    };
+    assert!(
+        !got.contains("delete_repo"),
+        "a tool outside the token reached the client: {got:.200}"
+    );
+}
