@@ -1787,7 +1787,7 @@ Run it. Start from the section 0 setup. No server is needed: every part runs tes
 ```sh
 # 1. Record windows: the proxy's tests, then the server's settings.
 cargo test -p attenuo-proxy --locked record_window 2>&1 | grep -c '^test result: ok. 0 passed'
-# 13: every binary of the crate runs and none has a test of that name; the window's tests live in records::
+# 13: the count of `test result: ok. 0 passed` lines (every test binary plus the doc-tests), none with a test of that name; the window's tests live in records::
 cargo test -p attenuo-proxy --lib --locked records:: 2>&1 | grep 'test result'
 # test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 64 filtered out
 # (a_short_window_closes_sooner and a_full_table_at_the_smallest_configurable_size_records among them)
