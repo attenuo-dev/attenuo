@@ -16,7 +16,7 @@ The endpoints and their configuration are also listed in the [HTTP API reference
 | 7.1: a batch request with no `evaluations`, or an empty one, behaves like a single evaluation | Implemented: it is decided as one evaluation and answered as one, `{decision, context}`. |
 | 7.1.2.1: `options.evaluations_semantic`, default `execute_all` | `execute_all` (sent or left out), `deny_on_first_deny` and `permit_on_first_permit`. See [batch semantics](#batch-semantics). Any other value, or one that is not a string, is 400 `invalid_request` before anything is decided. |
 | 7.2.1: an entry that cannot be evaluated is closed (`decision: false`) and says why in its `context` | `{"decision": false, "context": {"error": {"status", "code", "message"}}}`, following the spec's non-normative `{status, message}` example with Attenuo's error code added. The other entries are still decided. A failed authentication refuses the whole request instead (401 or 403). |
-| 9: discovery at `GET /.well-known/authzen-configuration` | `policy_decision_point` and `access_evaluation_endpoint` (both required) and `access_evaluations_endpoint`. The base is `[server] public_url`; without it, which is allowed only on a loopback listener, the base is `http://<Host>` and `Host` must be a loopback name. |
+| 9, 9.1.1, 9.2: discovery at `GET /.well-known/authzen-configuration` | `policy_decision_point` and `access_evaluation_endpoint` (both required) and `access_evaluations_endpoint`, without authentication. See [discovery](#discovery). |
 | 10.1: HTTPS `POST` with JSON bodies at the default paths `/access/v1/evaluation` and `/access/v1/evaluations` | Implemented. The server listens on plain HTTP and is expected behind TLS termination in production ([deploying](../guides/deploying.md)). |
 | 10.1.2: 400, 401, 403 and 500 for failed requests | 400 for a malformed request, 401 for a missing or bad credential, 403 `chain_not_issued` for an unsigned body chain that this server did not issue, 500 for internal errors. 503 can also occur (a JWKS that cannot be fetched, a full DPoP replay cache). |
 | 10.1.3: when the request carries `X-Request-ID`, the answer MUST carry the same value | Implemented on both evaluation endpoints, for successful and refused requests alike. A request without one gets none. |
@@ -36,6 +36,24 @@ Entries that were not decided have no side effects: no audit record, no charge t
 The answer to the deciding entry keeps Attenuo's own `context` (`reason` such as `policy_deny`, `policy_ids`, `decision_id`, ...). The specification's non-normative example puts `"reason": "deny_on_first_deny"` there instead; Attenuo does not overwrite the policy reason, which is what the audit record says.
 
 Fixtures: `evaluations-deny-on-first-deny.json`, `evaluations-permit-on-first-permit.json` and `evaluations-semantics.json`. `stopped_batch_audits_only_what_it_ran` in `authzen_conformance.rs` checks that a stopped batch leaves one audit record per answered entry, with the answer's `decision_id`, and none for the rest.
+
+## Discovery
+
+`GET /.well-known/authzen-configuration` serves the PDP metadata document of section 9, at the well-known path of 9.2, answering a `GET` (9.2.1) with 200 and `Content-Type: application/json` (9.2.2):
+
+```json
+{
+  "policy_decision_point": "https://attenuo.example",
+  "access_evaluation_endpoint": "https://attenuo.example/access/v1/evaluation",
+  "access_evaluations_endpoint": "https://attenuo.example/access/v1/evaluations"
+}
+```
+
+- **Members (9.1.1).** `policy_decision_point` and `access_evaluation_endpoint` are required; `access_evaluations_endpoint` is optional and present because the batch endpoint is served. `search_subject_endpoint`, `search_action_endpoint` and `search_resource_endpoint` are left out because the Search APIs are not served: an absent parameter tells the PEP the PDP does not support that API. `capabilities` (9.1.2) and `signed_metadata` (9.1.3) are not published. Nothing else is in the document.
+- **Base URL.** `[server] public_url`, so `policy_decision_point` is the identifier a PEP configured and 9.2.3's identity check passes. Without it, which is allowed only on a loopback listener, the base is `http://<Host>` and `Host` must be `localhost`, `127.0.0.1` or `[::1]` (400 `invalid_host` otherwise), so a forged `Host` cannot end up in a document a shared cache serves to others (SR-19).
+- **No authentication, by decision.** The specification does not protect the metadata endpoint: its 9.2.1 example request carries no credential, and 11.8 relies on TLS at the hosting site for the integrity of unsigned metadata. A PEP also needs the document before it can know where to send credentials. So discovery is public like `/.well-known/jwks.json`: it takes no credential and ignores an `Authorization` header (an invalid bearer gets the same document, not a 401). That is safe because the document holds only the server's public base URL and the two fixed endpoint paths, all of which any caller of the API already knows: no policy, tenant, lease, key, configuration or version information, and it does not vary with the caller.
+
+Fixture: `metadata.json` (no credential, and an invalid bearer; the comparison is exact, so an extra member fails it). The `Host` checks are tested in `security_low.rs`.
 
 ## Extensions
 

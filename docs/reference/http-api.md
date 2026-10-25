@@ -21,7 +21,7 @@ Optional, RFC 9449. See [Binding tokens to keys](../guides/binding-tokens-to-key
 | `GET /healthz` | none | Liveness. Never touches storage. |
 | `GET /readyz` | none | Readiness. Checks the audit store and the lease store. 200 `{"ready":true,"checks":{"audit":"ok","leases":"ok"}}` or 503 with `"error"` for the failing check and no error text. With `[audit.sink]` the body also has `"degraded"` and `checks.checkpoint_sink` (`"ok"` or `"degraded"`); a degraded sink is a 503 only with `fail_readiness = true`. |
 | `GET /.well-known/jwks.json` | none | Public keys for token verification, including retired keys. |
-| `GET /.well-known/authzen-configuration` | none | AuthZEN discovery: decision point, evaluation and evaluations endpoint URLs, built from `[server] public_url`. Without it (loopback only) from `Host`, which must be `localhost`, `127.0.0.1` or `[::1]`; anything else is 400 `invalid_host`. |
+| `GET /.well-known/authzen-configuration` | none | AuthZEN discovery (AuthZEN 1.0 section 9): `policy_decision_point`, `access_evaluation_endpoint` and `access_evaluations_endpoint`, and nothing else; no search endpoints, which are not served. Public metadata: no credential is needed and an `Authorization` header is ignored ([why](authzen.md#discovery)). The URLs are built from `[server] public_url`. Without it (loopback only) from `Host`, which must be `localhost`, `127.0.0.1` or `[::1]`; anything else is 400 `invalid_host`. |
 
 ## Token
 
