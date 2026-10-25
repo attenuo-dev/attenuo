@@ -1,5 +1,8 @@
 /target
 **/*.rs.bk
+# proptest failure persistence is off; a failure is replayed by its seed and kept as a
+# regression test (CONTRIBUTING.md, "Property tests").
+proptest-regressions/
 *.db
 *.sqlite
 .env

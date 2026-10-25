@@ -31,6 +31,17 @@ cargo audit               # cargo install cargo-audit (optional locally; CI runs
 
 `scripts/dev.sh` runs fmt, clippy, the tests and the two scripted demos (the GitHub leak demo and the multi-hop delegation demo) in one go (`scripts/dev.sh policy docs links deny` runs the other CI steps). The `justfile` has the same targets if you use [just](https://github.com/casey/just): `just dev`, `just ci`, `just demo`, `just policy`. `scripts/gen-admin-token.sh` prints a random admin token for a local server config. The MSRV (`rust-version` in `Cargo.toml`) is checked in CI only.
 
+### Property tests
+
+The property tests (`crates/attenuo-core/tests/*_props.rs`, `crates/attenuo-audit/tests/budget_props.rs`) take their settings from two environment variables, read by the `proptest_config` helper in each crate's `tests/proptest_seed/mod.rs`:
+
+- Locally the seed is random, so every run explores new cases. The seed is printed in the test's captured output, which `cargo test` shows when the test fails: `proptest: random seed, replay with PROPTEST_RNG_SEED=<n>`.
+- `PROPTEST_RNG_SEED=<n>` (a decimal u64, proptest's own variable) replays that exact sequence: `PROPTEST_RNG_SEED=<n> cargo test -p attenuo-core --test attenuation_props <name>`.
+- `PROPTEST_CASES=<n>` runs more (or fewer) cases per property than the per-test default (512 for attenuation, 1024 for limits, 256 for budgets; the file-store budget test runs an eighth of that).
+- CI pins both in the `test` job of `.github/workflows/ci.yml`: `PROPTEST_RNG_SEED=20261024` and `PROPTEST_CASES=1024`, so a red run is reproducible and a green one is not luck. Changing the seed there is how CI explores a new sequence.
+
+A bad value of either variable fails the test with a message naming it. Failure persistence is off and `proptest-regressions/` is gitignored: keep a failure you have understood as a deterministic regression test next to the properties, not as a regressions file.
+
 Fuzz targets for the parsers and checks an attacker can reach live in `fuzz/` (cargo-fuzz, nightly, outside the workspace). CI only builds them and runs their seeds; run one for a few minutes when you change a parser, a token or proof check, capability coverage, the proxy's JSON-RPC or SSE handling, or audit verification: `cargo +nightly fuzz run <target> -- -max_total_time=120`. See [fuzz/README.md](fuzz/README.md) and [docs/design/fuzzing.md](docs/design/fuzzing.md).
 
 If you change the admin console (`crates/attenuo-server/ui/`), run `scripts/console-smoke.sh`. It builds and starts the server with the leak demo's config and an `[admin_ui]` listener, fills the log through the CLI, and opens every console page in headless Chromium in the dark and the light theme with Playwright. It fails on any console error, page error, failed request or CSP violation, on text below 4.5:1 contrast, and when the lease page's revoke preview differs from `attenuo lease tree`. It needs Node 20 or later: run `npm ci` and `npx playwright install --with-deps chromium` in `tests/console/` once (Playwright is pinned to 1.56.1 there). Set `CONSOLE_SMOKE_SHOTS=DIR` to keep the screenshots, one per page and theme. It takes about 10 seconds after the build.
