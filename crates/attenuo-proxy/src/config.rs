@@ -72,16 +72,27 @@ pub struct ProxyConfig {
     /// [`crate::session::DEFAULT_MAX_SESSIONS_PER_PRINCIPAL`].
     #[serde(default = "default_max_sessions_per_principal")]
     pub max_sessions_per_principal: usize,
-    /// The window bounding lease-refusal records of undecided requests (see
-    /// [`crate::records`]). Always [`crate::records::LEASE_REFUSAL_RECORD_WINDOW`] outside
-    /// tests: not read from or written to configuration files, and not a server setting.
-    #[doc(hidden)]
-    #[serde(skip, default = "default_lease_refusal_record_window")]
-    pub lease_refusal_record_window: Duration,
+    /// The window bounding repeated audit records ([`crate::records`]): after a record, further
+    /// occurrences of the same delegation chain, tool name and reason within it are counted
+    /// instead of recorded. One window for both bounded kinds, the `stream.end` records of
+    /// `GET` listen streams and the lease refusals of undecided requests (each kind keeps its
+    /// own table). Default [`crate::records::DEFAULT_RECORD_WINDOW`]; the server's
+    /// `[proxy] record_window_seconds` sets it in whole seconds.
+    #[serde(default = "default_record_window")]
+    pub record_window: Duration,
+    /// Most (chain, tool, reason) windows each bounded kind keeps open at once; a table full
+    /// of open windows records rather than suppresses ([`crate::records::RecordWindow`]).
+    /// Default [`crate::records::DEFAULT_RECORD_WINDOW_MAX_KEYS`].
+    #[serde(default = "default_record_window_max_keys")]
+    pub record_window_max_keys: usize,
 }
 
-fn default_lease_refusal_record_window() -> Duration {
-    crate::records::LEASE_REFUSAL_RECORD_WINDOW
+fn default_record_window() -> Duration {
+    crate::records::DEFAULT_RECORD_WINDOW
+}
+
+fn default_record_window_max_keys() -> usize {
+    crate::records::DEFAULT_RECORD_WINDOW_MAX_KEYS
 }
 
 fn default_max_upstream_body_bytes() -> usize {
@@ -124,8 +135,16 @@ impl ProxyConfig {
             session_ttl: crate::session::DEFAULT_SESSION_TTL,
             max_sessions: crate::session::DEFAULT_MAX_SESSIONS,
             max_sessions_per_principal: crate::session::DEFAULT_MAX_SESSIONS_PER_PRINCIPAL,
-            lease_refusal_record_window: crate::records::LEASE_REFUSAL_RECORD_WINDOW,
+            record_window: crate::records::DEFAULT_RECORD_WINDOW,
+            record_window_max_keys: crate::records::DEFAULT_RECORD_WINDOW_MAX_KEYS,
         }
+    }
+
+    /// Set [`ProxyConfig::record_window`] and [`ProxyConfig::record_window_max_keys`].
+    pub fn with_record_window(mut self, window: Duration, max_keys: usize) -> Self {
+        self.record_window = window;
+        self.record_window_max_keys = max_keys;
+        self
     }
 
     /// Set [`ProxyConfig::max_upstream_body_bytes`].

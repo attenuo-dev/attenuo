@@ -66,7 +66,7 @@
 //!    `data.reason` (`token_expired`, `lease_revoked`, ...), any other body with a transport
 //!    error (SR-28). On the `GET` listen stream every end is counted by cause
 //!    ([`Authorizer::observe_stream_end`]) and the `stream.end` records are bounded to one
-//!    per delegation chain and reason per [`guard::STREAM_END_RECORD_WINDOW`], the rest
+//!    per delegation chain and reason per [`ProxyConfig::record_window`] (default a minute), the rest
 //!    counted ([`Authorizer::observe_record_suppressed`]). See [`guard`]. An upstream message
 //!    in the shape of that final event (a response with `id` `null` or absent and error
 //!    `-32001`), on any SSE stream it relays or in a JSON body it reads, is rewritten to a
@@ -110,7 +110,7 @@
 //! message with no `method` (a client response to a server request) is forwarded after the
 //! lease check. A failed lease check of any of them is recorded as a `deny` under the method's
 //! name (or `http.POST`, `http.GET`, `http.DELETE`), at most once per delegation chain, name
-//! and reason per [`records::LEASE_REFUSAL_RECORD_WINDOW`]; later refusals in the window are
+//! and reason per [`ProxyConfig::record_window`]; later refusals in the window are
 //! still refused, name the window's record, and are counted
 //! ([`Authorizer::observe_record_suppressed`]). `resources/unsubscribe` only gives something
 //! up, so it needs no decision; `resources/subscribe` does.
