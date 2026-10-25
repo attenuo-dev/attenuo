@@ -1126,4 +1126,71 @@ mod tests {
             StreamEndCause::LeaseOther
         );
     }
+
+    /// Security review pass 7: every spelling of a number whose `f64` value is -32001 that this
+    /// generator can make (point anywhere, leading and trailing zeros, exponents, both cases,
+    /// `serde_json`'s and Rust's own formatting, decimals that round to it) passes the byte
+    /// scan whenever the parsed message has the stream-end shape.
+    #[test]
+    fn the_byte_scan_admits_every_spelling_of_the_code_pass7() {
+        fn check(num: &str) {
+            let text = format!(r#"data: {{"jsonrpc":"2.0","id":null,"error":{{"code":{num}}}}}"#);
+            let Ok(v) = serde_json::from_str::<Value>(&text["data: ".len()..]) else {
+                return;
+            };
+            if has_stream_end_shape(&v) {
+                assert!(may_hold_stream_end_code(text.as_bytes()), "missed {num}");
+            }
+        }
+        let mut seen = 0;
+        for digits in ["32001", "320010", "3200100", "032001", "0032001"] {
+            for point in 0..=digits.len() {
+                let (a, b) = digits.split_at(point);
+                let mantissa = match (a.is_empty(), b.is_empty()) {
+                    (true, _) => format!("0.{b}"),
+                    (_, true) => a.to_owned(),
+                    _ => format!("{a}.{b}"),
+                };
+                for exp in -12i32..=12 {
+                    for e in ["e", "E"] {
+                        for sign in ["", "+"] {
+                            let n = if exp < 0 {
+                                format!("-{mantissa}{e}{exp}")
+                            } else {
+                                format!("-{mantissa}{e}{sign}{exp}")
+                            };
+                            check(&n);
+                            seen += 1;
+                        }
+                    }
+                }
+                check(&format!("-{mantissa}"));
+            }
+        }
+        // Rust's and serde_json's own spellings of the value and its neighbours.
+        let x = -32001.0f64;
+        for v in [
+            x,
+            f64::from_bits(x.to_bits() + 1),
+            f64::from_bits(x.to_bits() - 1),
+        ] {
+            check(&format!("{v}"));
+            check(&format!("{v:e}"));
+            check(&format!("{v:E}"));
+            check(&format!("{v:.20}"));
+            check(&serde_json::to_string(&v).unwrap());
+        }
+        // Decimals close to 32001 on either side (a small LCG, fixed seed).
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..20_000 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let off = (state >> 11) as f64 / (1u64 << 53) as f64 * 8e-12 - 4e-12;
+            for prec in [10usize, 12, 14, 16, 20] {
+                check(&format!("{:.prec$}", -32001.0 + off));
+            }
+        }
+        assert!(seen > 1000);
+    }
 }
