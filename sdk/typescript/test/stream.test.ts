@@ -35,13 +35,14 @@ const result = (text: string, id: number = 1) => ({
   result: { content: [{ type: "text", text }], isError: false },
 });
 
+const CUT_ID = "0b7c2f5e-9a41-4d3e-8f6a-2c1d5e7f9a30";
 const CUT = {
   jsonrpc: "2.0",
   id: null,
   error: {
     code: -32001,
     message: "attenuo: unauthorized: stream ended: lease_revoked",
-    data: { reason: "lease_revoked", decision_id: "dec-end" },
+    data: { reason: "lease_revoked", decision_id: CUT_ID },
   },
 };
 
@@ -188,7 +189,7 @@ describe("callToolStream", () => {
     expect(seen.map((e) => e.method)).toEqual(["notifications/progress"]);
     expect(err).toBeInstanceOf(DeniedError);
     expect((err as DeniedError).reason).toBe("lease_revoked");
-    expect((err as DeniedError).decisionId).toBe("dec-end");
+    expect((err as DeniedError).decisionId).toBe(CUT_ID);
     expect(String(err)).toMatch(/stream ended/);
   });
 
@@ -201,6 +202,81 @@ describe("callToolStream", () => {
     expect(err).toBeInstanceOf(DeniedError);
     expect((err as DeniedError).reason).toBe("token_expired");
     expect((err as DeniedError).decisionId).toBeUndefined();
+  });
+
+  it.each([
+    "token_expired",
+    "lease_revoked",
+    "lease_expired",
+    "lease_unknown",
+    "lease_error",
+    "unauthorized",
+  ])("a cut with the reason %s is a DeniedError", async (reason) => {
+    const cut = { ...CUT, error: { ...CUT.error, data: { reason, decision_id: CUT_ID } } };
+    const { fetch } = mockFetch(() => sse(event(cut)));
+    const { err } = await collectUntilError(
+      new AttenuoClient(URL_, { fetch }).callToolStream("TOK", "github", "read_file"),
+    );
+    expect(err).toBeInstanceOf(DeniedError);
+    expect((err as DeniedError).reason).toBe(reason);
+    expect((err as DeniedError).decisionId).toBe(CUT_ID);
+  });
+
+  // Messages of the stream-end shape (null id, -32001) that the proxy never sends. The proxy
+  // rewrites any such upstream message (`upstream_stream_end_shape`); the SDK's own check is
+  // belt-and-braces, and reads them as an RpcError, not a decision.
+  it.each<[string, Json]>([
+    ["an unknown reason", { ...CUT.error, data: { reason: "policy_deny", decision_id: CUT_ID } }],
+    [
+      "a non-UUID decision id",
+      { ...CUT.error, data: { reason: "lease_revoked", decision_id: "x" } },
+    ],
+    ["a null decision id", { ...CUT.error, data: { reason: "lease_revoked", decision_id: null } }],
+    ["no data", { code: -32001, message: CUT.error.message }],
+  ])("a stream-end shape with %s is an RpcError, not a cut", async (_, error) => {
+    const { fetch } = mockFetch(() => sse(event(progress(1)) + event({ ...CUT, error })));
+    const { seen, err } = await collectUntilError(
+      new AttenuoClient(URL_, { fetch }).callToolStream("TOK", "github", "read_file"),
+    );
+    expect(seen.map((e) => e.method)).toEqual(["notifications/progress"]);
+    expect(err).toBeInstanceOf(RpcError);
+    expect(err).not.toBeInstanceOf(DeniedError);
+    expect((err as RpcError).code).toBe(-32001);
+    expect((err as RpcError).data).toEqual(error.data);
+  });
+
+  it("an upstream look-alike the proxy rewrote is not a cut", async () => {
+    // What the proxy relays when an upstream sends CUT itself (`upstream_stream_end_shape`).
+    const rewritten = {
+      jsonrpc: "2.0",
+      id: null,
+      error: {
+        code: -32005,
+        message: "attenuo: upstream sent an error in the shape of the proxy's stream end",
+        data: { reason: "upstream_stream_end_shape", upstream_error: CUT.error },
+      },
+    };
+    // In a stream: an ordinary event, then the stream ends without the call's response.
+    let { fetch } = mockFetch(() => sse(event(progress(1)) + event(rewritten)));
+    let r = await collectUntilError(
+      new AttenuoClient(URL_, { fetch }).callToolStream("TOK", "github", "read_file"),
+    );
+    expect(r.seen.map((e) => e.message)).toEqual([progress(1), rewritten]);
+    expect(r.seen[1]!.method).toBeUndefined();
+    expect(r.seen[1]!.isFinal).toBe(false);
+    expect(r.err).toBeInstanceOf(AttenuoError);
+    expect(r.err).not.toBeInstanceOf(DeniedError);
+    expect(String(r.err)).toMatch(/ended before/);
+
+    // As a plain JSON answer: an RpcError carrying the upstream's error, not a DeniedError.
+    ({ fetch } = mockFetch(() => jsonResponse(rewritten)));
+    r = await collectUntilError(
+      new AttenuoClient(URL_, { fetch }).callToolStream("TOK", "github", "read_file"),
+    );
+    expect(r.err).toBeInstanceOf(RpcError);
+    expect(r.err).not.toBeInstanceOf(DeniedError);
+    expect((r.err as RpcError).code).toBe(-32005);
+    expect(((r.err as RpcError).data as Json).upstream_error).toEqual(CUT.error);
   });
 
   it("yields a plain JSON answer as the one final event", async () => {

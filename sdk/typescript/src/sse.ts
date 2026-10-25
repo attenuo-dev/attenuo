@@ -8,7 +8,7 @@
  * stream ends is dropped. It refuses an event (or a single line) over `maxEventBytes`.
  */
 
-import { AttenuoError, DeniedError } from "./errors.js";
+import { AttenuoError, DeniedError, RpcError } from "./errors.js";
 import * as w from "./wire.js";
 
 /**
@@ -16,6 +16,25 @@ import * as w from "./wire.js";
  * proxy's `[proxy] max_upstream_body_bytes` default.
  */
 export const DEFAULT_MAX_EVENT_BYTES = 16 * 1024 * 1024;
+
+/**
+ * The `data.reason` values the proxy's stream-end event carries (`end_event_recorded` in
+ * crates/attenuo-proxy/src/guard.rs): the token and lease reasons of the server's authorizer,
+ * and `unauthorized` for a re-check that failed for another reason. These are the reasons on
+ * the wire, not the `StreamEndCause` metric labels: `lease_other`, `recheck_unavailable` and
+ * `recheck_failed` never appear in an event.
+ */
+const STREAM_END_REASONS: ReadonlySet<string> = new Set([
+  "token_expired",
+  "lease_revoked",
+  "lease_expired",
+  "lease_unknown",
+  "lease_error",
+  "unauthorized",
+]);
+
+/** `data.decision_id` of a stream-end event, when present: a UUID in its hyphenated form. */
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const CR = 0x0d;
 const LF = 0x0a;
@@ -166,23 +185,38 @@ export interface StreamEvent {
 }
 
 /**
- * The proxy's last event on a stream it cut (`id: null`, `-32001`, `data.reason`) as a
- * `DeniedError` with that reason and `data.decision_id`, else undefined. The proxy's
- * `X-Attenuo-Decision-Id` header went out before the cut, so it cannot vouch for this decision id
- * the way it does for a `-32003`.
+ * The proxy's last event on a stream it cut, as a `DeniedError`; undefined for a message without
+ * the stream-end shape.
+ *
+ * The shape is a response (no `method`) whose `id` is null or absent and whose error code is
+ * `-32001`. A message of that shape is a cut only when `data.reason` is one the proxy sends and
+ * `data.decision_id` is absent or a UUID string: then it is a `DeniedError` with that reason and
+ * id. Anything else of that shape is an `RpcError` with code `-32001`, which still ends the
+ * call, but not as a decision.
+ *
+ * This is belt-and-braces: the real guard is the proxy, which rewrites any upstream message of
+ * the stream-end shape to `-32005` `upstream_stream_end_shape` before it reaches the client.
+ * The proxy's `X-Attenuo-Decision-Id` header went out before the cut, so it cannot vouch for
+ * this decision id the way it does for a `-32003`.
  */
-export function streamEndError(msg: Json): DeniedError | undefined {
+export function streamEndError(msg: Json): DeniedError | RpcError | undefined {
   const err = msg.error;
   if ("method" in msg || (msg.id !== null && msg.id !== undefined)) return undefined;
   if (typeof err !== "object" || err === null) return undefined;
   const e = err as Json;
+  if (e.code !== w.CODE_UNAUTHORIZED) return undefined;
+  const message = String(e.message ?? "");
   const data = e.data;
-  if (e.code !== w.CODE_UNAUTHORIZED || typeof data !== "object" || data === null) return undefined;
-  const d = data as Json;
-  if (typeof d.reason !== "string" || d.reason === "") return undefined;
-  const decisionId =
-    typeof d.decision_id === "string" && d.decision_id !== "" ? d.decision_id : undefined;
-  return new DeniedError(d.reason, decisionId, String(e.message ?? ""));
+  if (typeof data === "object" && data !== null && !Array.isArray(data)) {
+    const d = data as Json;
+    const reason = d.reason;
+    const id = d.decision_id;
+    const idOk = !("decision_id" in d) || (typeof id === "string" && UUID.test(id));
+    if (typeof reason === "string" && STREAM_END_REASONS.has(reason) && idOk) {
+      return new DeniedError(reason, id as string | undefined, message);
+    }
+  }
+  return new RpcError(w.CODE_UNAUTHORIZED, message, data);
 }
 
 function streamEvent(
@@ -204,7 +238,8 @@ function streamEvent(
 /**
  * Turns the body of one `tools/call` response into `StreamEvent` values. `onChunk` is called
  * after each read (the client resets its idle timer there). A JSON-RPC error throws what
- * `callTool` throws; the proxy's stream-end event throws `DeniedError` (see `streamEndError`).
+ * `callTool` throws; the proxy's stream-end event throws `DeniedError`, and a message of its shape that is
+ * not one throws `RpcError` (see `streamEndError`).
  */
 export async function* callStream(
   res: Response,
