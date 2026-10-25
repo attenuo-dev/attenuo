@@ -13,8 +13,9 @@
 //!
 //! `disown` times the stream-end shape check of the unfiltered SSE path (`disown_stream` over
 //! `frame_stream` in `proxy.rs`, `docs/design/bench/2026-10-25-vm-sse-disown.md`): the framer
-//! alone against the framer followed by `disown_events`, for a progress notification, an 8 KB
-//! and an 85 KB tool result.
+//! alone against the framer followed by `disown_chunk`, for a progress notification, an 8 KB
+//! and an 85 KB tool result. For the numbers before the byte scan, run it on the commit that
+//! added it (`git log -- crates/attenuo-proxy/tests/listen_stream_cost.rs`).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,7 +23,7 @@ use std::time::{Duration, Instant};
 use attenuo_core::{Capability, CapabilitySet};
 use attenuo_proxy::filter::{list_kinds_by_shape, ListFilter};
 use attenuo_proxy::sse::{SseFramer, SseRewriter};
-use attenuo_proxy::testing::{disown_events, spawn_router, test_chain, StaticAuthorizer};
+use attenuo_proxy::testing::{disown_chunk, spawn_router, test_chain, StaticAuthorizer};
 use attenuo_proxy::{router, ProxyConfig, UpstreamConfig};
 use axum::body::Bytes;
 use axum::response::IntoResponse;
@@ -190,8 +191,9 @@ fn disown() {
         let mut framer = SseFramer::with_limit(16 << 20);
         let checked = time_per_event(&events, runs, |c| {
             let framed = framer.push(c).unwrap();
-            let out = disown_events(&framed);
-            assert_eq!(out.len(), framed.len(), "{name}: no event rewritten");
+            let len = framed.len();
+            let out = disown_chunk(Bytes::from(framed));
+            assert_eq!(out.len(), len, "{name}: no event rewritten");
             out.len()
         });
         let added = checked - relay;
