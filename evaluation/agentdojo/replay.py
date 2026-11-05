@@ -512,9 +512,16 @@ class Attenuo:
     """attenuo-server for one arm."""
 
     def __init__(
-        self, arm: str, suite, env, upstream: str, work: Path, binary: Path, list_filter=None
+        self,
+        arm: str,
+        suite,
+        env,
+        upstream: str,
+        work: Path,
+        binary: Path,
+        list_filter=None,
+        named=(),
     ):
-    def __init__(self, arm: str, suite, env, upstream: str, work: Path, binary: Path, named=()):
         self.port = free_port()
         self.url = f"http://127.0.0.1:{self.port}"
         text = PERMIT_ALL if arm == "grants_only" else suite_policy(env)
@@ -703,7 +710,7 @@ def replay_suite(name: str, work: Path, binary: Path, arms=ARMS, inject_all=Fals
                     if attenuo:
                         attenuo.stop()
                     named = mentioned(user.PROMPT)
-                    attenuo = Attenuo(arm, suite, base_env, shim.url, work, binary, named)
+                    attenuo = Attenuo(arm, suite, base_env, shim.url, work, binary, named=named)
                 env = suite.load_and_inject_default_environment({})
                 pre = env.model_copy(deep=True)
                 truth = user.ground_truth(pre)
