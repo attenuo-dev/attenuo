@@ -50,8 +50,12 @@ def main(out: Path) -> None:
             by_injection=defaultdict(lambda: [0, 0]),
         )
     )
+    partial = 0
     for path in (out / "logs").rglob("*.json"):
         log = json.loads(path.read_text(encoding="utf-8"))
+        if "utility" not in log:  # a run cut off before it was scored
+            partial += 1
+            continue
         # logs/<pipeline>/<suite>/<user task>/<attack or none>/<injection or none>.json
         suite_name, user_task, attack, injection = (*path.parts[-4:-1], path.stem)
         suite = suites[suite_name]
@@ -90,6 +94,7 @@ def main(out: Path) -> None:
             ],
             **{k: (dict(v) if isinstance(v, Counter) else v) for k, v in spend.items()},
         }
+    report["runs_cut_off"] = partial
     report["total_dollars"] = sum(v["dollars"] for v in usage.values())
     print(json.dumps(report, indent=1))
 

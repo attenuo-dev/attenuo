@@ -13,6 +13,8 @@ Arms:
   labels   the same plus labels.cedar (A3). A gated call is approved only if it matches a call in
            the task's ground truth on every argument that is not free text, and declined
            otherwise. A stand-in for a careful person, and an optimistic one.
+  args     grants plus replay.args_policy(False): the call asks for an approval when an argument
+           copies a value or span of an untrusted result, with the same approver.
 
 --filtered-list runs the server with `[proxy] list_filter = "policy"` and offers the model only
 the tools the proxy's `tools/list` returns for that run's token. Off by default, where the model
@@ -101,8 +103,11 @@ class AttenuoToolsExecutor(BasePipelineElement):
         reply = self.http.post(f"{self.attenuo.url}/mcp/{replay.SUITE}", json=body)
         return reply.json()
 
-    def record(self, tool: str, outcome: str, reason: str | None = None) -> None:
+    def record(
+        self, tool: str, outcome: str, reason: str | None = None, args=None, matches=None
+    ) -> None:
         row = {"run": self.label, "tool": tool, "outcome": outcome, "reason": reason}
+        row |= {"args": args, "matches": matches}
         with self.decisions.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")
 
@@ -122,18 +127,21 @@ class AttenuoToolsExecutor(BasePipelineElement):
             grant = in_ground_truth(tool, args, self.truth)
             self.settle(data["approval_id"], grant)
             if not grant:
-                self.record(tool, "approval_declined", data.get("reason"))
+                matches = data.get("untrusted_args")
+                self.record(tool, "approval_declined", data.get("reason"), args, matches)
                 return "", "attenuo: this call needs an approval, and it was declined."
-            self.record(tool, "approval_granted", data.get("reason"))
+            self.record(
+                tool, "approval_granted", data.get("reason"), args, data.get("untrusted_args")
+            )
             answer = self.rpc("tools/call", params)
             error = answer.get("error")
         if error:
             data = error.get("data") or {}
             reason = data.get("reason") or error.get("reason") or str(error.get("code"))
             refused = error.get("code") in (-32003, -32008)
-            self.record(tool, "denied" if refused else "proxy_error", reason)
+            self.record(tool, "denied" if refused else "proxy_error", reason, args)
             return "", f"attenuo denied this call: {reason}."
-        self.record(tool, "allowed")
+        self.record(tool, "allowed", args=args)
         result = answer["result"]
         text = " ".join(part.get("text", "") for part in result.get("content", []))
         return ("", text) if result.get("isError") else (text, None)
@@ -267,7 +275,7 @@ def summarize(out: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--arm", choices=("grants", "labels"), default="grants")
+    parser.add_argument("--arm", choices=("grants", "labels", "args"), default="grants")
     parser.add_argument("--shard", default="0/1")
     parser.add_argument("--model", default="claude-haiku-5-5")
     parser.add_argument("--tasks", type=int, default=0, help="the first N user tasks (0: all)")
