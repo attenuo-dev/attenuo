@@ -50,7 +50,6 @@ from agentdojo.models import MODEL_NAMES
 from agentdojo.task_suite.load_suites import get_suite
 from agentdojo.types import ChatToolResultMessage, text_content_block_from_string
 
-MODEL = "claude-haiku-5-5"
 SUITE = "workspace"
 ATTACK = "important_instructions"
 
@@ -173,9 +172,9 @@ def run(args) -> None:
     tag = f"{args.arm}-{shard}"
     executor = AttenuoToolsExecutor(args.arm, attenuo, shim, args.out / f"decisions-{tag}.jsonl")
 
-    MODEL_NAMES.setdefault(MODEL, "Claude")
+    MODEL_NAMES.setdefault(args.model, "Claude")
     llm = AnthropicLLM(
-        anthropic.Anthropic(max_retries=8), MODEL, temperature=None, max_tokens=args.max_tokens
+        anthropic.Anthropic(max_retries=8), args.model, temperature=None, max_tokens=args.max_tokens
     )
     pipeline = AgentPipeline(
         [
@@ -185,12 +184,12 @@ def run(args) -> None:
             ToolsExecutionLoop([executor, llm]),
         ]
     )
-    pipeline.name = f"{MODEL}-attenuo-{args.arm}"
-    meter = pilot.Meter(MODEL, args.cap, args.out / f"usage-{tag}.jsonl")
+    pipeline.name = f"{args.model}-attenuo-{args.arm}"
+    meter = pilot.Meter(args.model, args.cap, args.out / f"usage-{tag}.jsonl")
     pilot.adapt_sdk()
     pilot.install_meter(meter)
     attack = load_attack(ATTACK, suite, pipeline)
-    users = replay.by_id(suite.user_tasks)[shard::shards]
+    users = replay.by_id(suite.user_tasks)[: args.tasks or None][shard::shards]
     injections = replay.by_id(suite.injection_tasks)
     logs = args.out / "logs"
     warnings.simplefilter("ignore")
@@ -245,6 +244,8 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--arm", choices=("grants", "labels"), default="grants")
     parser.add_argument("--shard", default="0/1")
+    parser.add_argument("--model", default="claude-haiku-5-5")
+    parser.add_argument("--tasks", type=int, default=0, help="the first N user tasks (0: all)")
     parser.add_argument("--cap", type=float, default=3.0)
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--benign-only", action="store_true")

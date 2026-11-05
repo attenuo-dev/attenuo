@@ -47,7 +47,12 @@ VERSION = "v1.2.2"
 ATTACK = "important_instructions"
 # Dollars per million tokens, input and output. Haiku 5.5 costs more on a request whose prompt
 # passes 100K tokens.
-PRICES = {"claude-haiku-5-5": (0.10, 0.50), "claude-sonnet-5-5": (2.0, 10.0)}
+PRICES = {
+    "claude-haiku-5-5": (0.10, 0.50),
+    "claude-sonnet-5-5": (2.0, 10.0),
+    "claude-opus-5-5": (4.0, 20.0),
+    "claude-fable-5-1": (10.0, 50.0),
+}
 RATE_LIMIT_RETRIES = 20
 RATE_LIMIT_WAIT_SECONDS = 30
 LONG_PROMPT = {"claude-haiku-5-5": (100_000, 0.50, 2.50)}
