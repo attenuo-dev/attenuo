@@ -228,6 +228,7 @@ mod catalog;
 mod lint;
 mod request;
 mod schema;
+mod screen;
 pub mod testing;
 mod usage;
 
@@ -251,6 +252,9 @@ pub use lint::{lint, LintIssue, LintReport, LintSeverity};
 pub use lint::{lint_with_options, policy_action_names, LintOptions};
 pub use schema::{
     action_id, default_user_attrs, DEFAULT_SCHEMA, GENERIC_ACTION, REQUIRED_ENTITY_TYPES,
+};
+pub use screen::{
+    ListScreen, HIDE_INVALID_NAME, HIDE_NOT_IN_CATALOG, HIDE_POLICY, SCREEN_MEMO_CAPACITY,
 };
 pub use usage::{policies_read_usage, TrackUsage};
 
@@ -662,6 +666,7 @@ impl PolicyEngineBuilder {
             .any(|(_, a)| a.amount.is_some() || a.destination.is_some());
         Ok(PolicyEngine {
             policies_read_usage: loaded.reads_usage,
+            policies_read_session_id: loaded.reads_session_id,
             catalog_names_usage,
             track_usage: self.track_usage,
             schema,
@@ -677,6 +682,8 @@ impl PolicyEngineBuilder {
             authorizer: Authorizer::new(),
             validation_warnings: loaded.warnings,
             request_cache: request::RequestCache::new(request::REQUEST_CACHE_CAPACITY),
+            generation: 0,
+            screen_memo: screen::ScreenMemo::default(),
         })
     }
 }
@@ -688,6 +695,9 @@ struct LoadedPolicies {
     warnings: Vec<String>,
     /// Some policy may read `context.usage` ([`policies_read_usage`]).
     reads_usage: bool,
+    /// Some policy may read `context.session_id`, the one optional context member (the list
+    /// screen evaluates both its presence and its absence then).
+    reads_session_id: bool,
 }
 
 /// The forbids annotated `@obligation("approval")`, and the policy set without them, used to
@@ -788,6 +798,7 @@ fn load_policies(text: &str, schema: &Schema) -> Result<LoadedPolicies, PolicyEr
     };
     Ok(LoadedPolicies {
         reads_usage: policies_read_usage(&policies),
+        reads_session_id: usage::policies_read_context_attr(&policies, "session_id"),
         policies,
         obligations: Obligations {
             approval_ids,
@@ -864,6 +875,51 @@ pub mod bench_support {
     pub fn clear_request_cache(engine: &PolicyEngine) {
         engine.request_cache.clear();
     }
+
+    /// The list screen's partial requests for `tools` (unknown `session_id` shape), built as
+    /// [`PolicyEngine::screen_tool`] builds them (opaque).
+    pub struct PreparedScreen(Vec<(cedar_policy::Request, cedar_policy::Entities)>);
+
+    /// Build the list screen's partial requests for every catalog tool in `tools`.
+    pub fn screen_prepare(
+        engine: &PolicyEngine,
+        chain: &DelegationChain,
+        server: &str,
+        tools: &[String],
+    ) -> PreparedScreen {
+        let base = request::ScreenBase::build(chain, server).expect("chain translates");
+        PreparedScreen(
+            tools
+                .iter()
+                .map(|t| {
+                    let attrs = engine.effective_attrs(server, t).expect("catalog tool");
+                    base.partial_request(t, &attrs, engine.legacy_bare_actions, true)
+                        .expect("request translates")
+                })
+                .collect(),
+        )
+    }
+
+    /// Partially evaluate prepared screen requests against the policy set without approval
+    /// forbids; returns how many are a definite deny.
+    pub fn screen_evaluate(engine: &PolicyEngine, prepared: &PreparedScreen) -> usize {
+        let policies = engine
+            .obligations
+            .without_approval
+            .as_ref()
+            .unwrap_or(&engine.policies);
+        prepared
+            .0
+            .iter()
+            .filter(|(r, e)| {
+                engine
+                    .authorizer
+                    .is_authorized_partial(r, policies, e)
+                    .decision()
+                    == Some(CedarDecision::Deny)
+            })
+            .count()
+    }
 }
 
 /// The policy decision point. Build once per policy version and share behind an
@@ -894,8 +950,14 @@ pub struct PolicyEngine {
     authorizer: Authorizer,
     validation_warnings: Vec<String>,
     request_cache: request::RequestCache,
+    /// Bumped by every successful policy reload ([`PolicyEngine::policy_generation`]).
+    generation: u64,
+    /// The list screen's verdicts ([`PolicyEngine::screen_tools`]).
+    screen_memo: screen::ScreenMemo,
     /// Some loaded policy may read `context.usage`; recomputed on reload.
     policies_read_usage: bool,
+    /// Some loaded policy may read `context.session_id`; recomputed on reload.
+    policies_read_session_id: bool,
     /// The catalog declares `amount` or `destination` for some tool.
     catalog_names_usage: bool,
     track_usage: TrackUsage,
@@ -1208,9 +1270,13 @@ impl PolicyEngine {
         self.obligations = loaded.obligations;
         self.validation_warnings = loaded.warnings;
         self.policies_read_usage = loaded.reads_usage;
+        self.policies_read_session_id = loaded.reads_session_id;
         // The cached request parts do not depend on the policies, but a reload is the
         // operator's "start from scratch", so it starts with an empty cache too.
         self.request_cache.clear();
+        // A new policy set may hide or show other tools.
+        self.generation += 1;
+        self.screen_memo.clear();
         Ok(())
     }
 

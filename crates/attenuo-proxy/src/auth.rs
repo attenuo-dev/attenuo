@@ -311,6 +311,23 @@ pub trait Authorizer: Send + Sync {
         false
     }
 
+    /// The policy screen of a `tools/list` answer (`[proxy] list_filter = "policy"`,
+    /// ADR-0011): for each of `tools` (names on `server` that passed the capability filter),
+    /// whether it stays listed. Must return one verdict per name, in order; any other length
+    /// keeps every tool. Called on the response path; an implementation that does real work
+    /// should run it off the async workers. It must not record, approve, charge or read run
+    /// state: a hidden tool that is called anyway is decided like any other call. The default
+    /// keeps everything.
+    async fn screen_tools(
+        &self,
+        chain: &DelegationChain,
+        server: &str,
+        tools: &[String],
+    ) -> Vec<bool> {
+        let _ = (chain, server);
+        vec![true; tools.len()]
+    }
+
     /// Record a request the proxy refused on its own, before any per-call decision (for
     /// example `session_mismatch`, SR-11, or a failed [`Authorizer::check_active`] of an
     /// `initialize`), and return the audit record's id. `call` describes the HTTP request

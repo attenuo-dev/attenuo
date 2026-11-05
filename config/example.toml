@@ -270,6 +270,13 @@ stream_recheck_seconds = 2
 # catalog does not know (reason tool_not_listed), so an upstream that resolves names
 # case-insensitively cannot run delete_repo for "Delete_Repo".
 require_listed_tools = true
+# How tools/list answers are filtered (ADR-0011, proposed). "capabilities" (the default) keeps
+# every tool some capability of the token could permit. "policy" also hides a tool the Cedar
+# policy denies for every possible call of this token (no permit can apply, a forbid on token
+# facts such as chain depth or MFA, approval obligations lifted so approval-gated tools stay),
+# and a tool missing from the catalog under unknown_tools = "deny". Advisory only: a hidden
+# tool that is called is still decided and audited.
+# list_filter = "policy"
 # Memory bounds. An upstream body the proxy must buffer (a JSON list result it filters, one SSE
 # event) over max_upstream_body_bytes gets 502; a request body over max_request_body_bytes
 # gets 413.

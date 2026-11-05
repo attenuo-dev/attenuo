@@ -38,6 +38,7 @@ use crate::label::{
 };
 use crate::listed::ListedTools;
 use crate::records::{Admission, RecordWindow};
+use crate::screen::{screen_body, screen_stream, ListFilterMode, StreamScreen, ToolsAnswers};
 use crate::session::{
     session_digest, session_tag, BindOutcome, SessionCheck, SessionOwner, SessionRegistry,
 };
@@ -114,6 +115,8 @@ struct AppState {
     stream_recheck: Duration,
     /// [`ProxyConfig::require_listed_tools`].
     require_listed_tools: bool,
+    /// [`ProxyConfig::list_filter`] is [`ListFilterMode::Policy`].
+    screen_lists: bool,
     /// Tool names each upstream has listed (SR-25).
     listed: Arc<ListedTools>,
     /// [`ProxyConfig::max_upstream_body_bytes`].
@@ -155,6 +158,7 @@ impl AppState {
 pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
     let stream_recheck = config.stream_recheck;
     let require_listed_tools = config.require_listed_tools;
+    let screen_lists = config.list_filter == ListFilterMode::Policy;
     let max_upstream_body = config.max_upstream_body_bytes.max(1);
     let max_request_body = config.max_request_body_bytes.max(1);
     let record_window = config.record_window;
@@ -173,6 +177,7 @@ pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
         sessions,
         stream_recheck,
         require_listed_tools,
+        screen_lists,
         listed: Arc::new(ListedTools::new()),
         max_upstream_body,
         max_request_body,
@@ -860,7 +865,21 @@ async fn handle_passthrough(
                     .stream_guard(&who, &server, session_id.as_deref())
                     .listen(state.stream_end_records.clone());
                 let filter = listen_list_filter(&state, &chain, &server);
-                stream_response_sse(resp, None, guard, limit, Some(filter), Some(labeller))
+                let screen = state.screen_lists.then(|| StreamScreen {
+                    authorizer: state.authorizer.clone(),
+                    chain: chain.clone(),
+                    server: server.clone(),
+                    answers: ToolsAnswers::ByShape,
+                });
+                stream_response_sse(
+                    resp,
+                    None,
+                    guard,
+                    limit,
+                    Some(filter),
+                    screen,
+                    Some(labeller),
+                )
             }
             // Any other success answer to a `GET` is a protocol violation, and the one body
             // that would pass the list filter by: refused. `405` and errors are relayed.
@@ -1268,12 +1287,19 @@ async fn handle_post_inner(
                 }
             }
         });
+        let screen = (has_lists && state.screen_lists).then(|| StreamScreen {
+            authorizer: state.authorizer.clone(),
+            chain: chain.clone(),
+            server: server.to_owned(),
+            answers: ToolsAnswers::Pending(Arc::new(screened.list_requests.clone())),
+        });
         stream_response_sse(
             resp,
             prelude,
             guard,
             state.max_upstream_body,
             filter,
+            screen,
             labeller,
         )
     } else if let Some(labeller) = labeller
@@ -1713,6 +1739,20 @@ async fn buffer_and_rewrite(
     if removed > 0 {
         tracing::debug!(removed, "filtered list result");
     }
+    if state.screen_lists && !screened.list_requests.is_empty() {
+        let answers = ToolsAnswers::Pending(Arc::new(screened.list_requests.clone()));
+        let hidden = screen_body(
+            state.authorizer.as_ref(),
+            chain,
+            server,
+            &answers,
+            &mut value,
+        )
+        .await;
+        if hidden > 0 {
+            tracing::debug!(hidden, "list screen hid tools");
+        }
+    }
     // An upstream error must not read as the proxy's stream end (`id: null`, `-32001`).
     disown_stream_end(&mut value);
     if let Some(labeller) = labeller {
@@ -1853,6 +1893,7 @@ fn stream_response_sse<F>(
     guard: StreamGuard,
     limit: usize,
     filter: Option<F>,
+    screen: Option<StreamScreen>,
     labeller: Option<Labeller>,
 ) -> Response
 where
@@ -1877,6 +1918,10 @@ where
             resp.bytes_stream(),
             limit,
         ))),
+    };
+    let events: Events = match screen {
+        Some(s) => Box::pin(screen_stream(events, s)),
+        None => events,
     };
     let events: Events = match labeller {
         Some(l) => Box::pin(label_stream(events, l)),

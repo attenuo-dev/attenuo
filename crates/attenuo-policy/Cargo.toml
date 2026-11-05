@@ -13,7 +13,7 @@ categories = ["authentication"]
 
 [dependencies]
 attenuo-core = { workspace = true }
-cedar-policy = { workspace = true }
+cedar-policy = { workspace = true, features = ["partial-eval"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -26,6 +26,7 @@ toml = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }
+proptest = { workspace = true }
 
 [[bench]]
 name = "authorize"
@@ -33,4 +34,8 @@ harness = false
 
 [[bench]]
 name = "policy_stage"
+harness = false
+
+[[bench]]
+name = "list_screen"
 harness = false

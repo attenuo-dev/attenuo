@@ -1,6 +1,6 @@
 # Cedar-aware list filtering: design
 
-- Status: proposed, nothing built. The decision is [ADR-0011](../decisions/0011-cedar-aware-list-filtering.md) (proposed); the maintainer decides.
+- Status: proposed; the first slice (section 4) is built on branch `feat/cedar-list-filter` (2026-11-05), measured in [bench/2026-11-05-vm-list-screen.md](bench/2026-11-05-vm-list-screen.md) and described in [server pipeline, list filtering](server.md#list-filtering). The decision is [ADR-0011](../decisions/0011-cedar-aware-list-filtering.md) (proposed); the maintainer decides.
 - Date: 2026-10-25. Base: `main` at 76cff3a.
 - Related: [server pipeline, list filtering](server.md#list-filtering), [decision pipeline](server.md#the-decision-pipeline), [capabilities](../concepts/capabilities-and-attenuation.md), [ADR-0005](../decisions/0005-policy-decision-point.md), [ADR-0009](../decisions/0009-output-labelling.md), [ADR-0010](../decisions/0010-run-limits.md), [listen-stream filter bench](bench/2026-10-24-vm-listen-stream-filter.md).
 
@@ -104,4 +104,4 @@ These need a screen entry point in the harness; nothing under `evaluation/` chan
 2. Should a spent hard token limit hide a tool? It is exact at list time and wrong a moment later only if an operator refunds a charge; it costs a counter read per limited capability.
 3. Should the proxy send `notifications/tools/list_changed` on open listen streams after a policy reload?
 4. Is `"annotate"` worth adding once a client reads `_meta` hints, and if so, from token and policy facts only, never run state?
-5. Partial evaluation cost is not measured. A criterion bench next to `policy_stage` (200 tools, starter policy, with and without approval obligations) should come before the slice is accepted.
+5. Partial evaluation cost: measured on 2026-11-05 ([bench](bench/2026-11-05-vm-list-screen.md)), 4.9 to 5.9 ms per uncached 200-tool list and 80 to 91 us memoised, with and without approval obligations alike. Two differences from section 4 in what was built: `session_id` is a ninth unknown, evaluated absent as well when a policy reads it (it is optional in a call's context, so an unknown alone would make `context has session_id` true); and an evaluation error keeps the entry, as section 4 says, while a chain that cannot be translated keeps every entry. The trait method is `Authorizer::screen_tools`, not `screen_list`; there is no timeout on the screen (it runs on the blocking pool like a decision); and an originating-user attribute of the wrong type, which denies every call with `attribute_type_mismatch`, hides every tool.

@@ -1365,6 +1365,13 @@ pub struct ProxySection {
     /// records under a flood of distinct chains. Default 10000, between 100 and 1000000.
     #[serde(default = "default_record_window_max_keys")]
     pub record_window_max_keys: u64,
+    /// How `tools/list` answers are filtered (ADR-0011): `"capabilities"` (the default) keeps
+    /// every tool some capability of the chain could permit; `"policy"` also hides a tool when
+    /// the Cedar policy (approval obligations lifted) denies every possible call to it for the
+    /// chain, or when the catalog lacks it under `unknown_tools = "deny"`. Advisory only: a
+    /// hidden tool that is called is decided and audited as usual.
+    #[serde(default)]
+    pub list_filter: attenuo_proxy::ListFilterMode,
 }
 
 /// Largest `[proxy] record_window_seconds`: an hour.
@@ -1396,6 +1403,7 @@ impl Default for ProxySection {
             max_sessions_per_principal: default_max_sessions_per_principal(),
             record_window_seconds: default_record_window_seconds(),
             record_window_max_keys: default_record_window_max_keys(),
+            list_filter: attenuo_proxy::ListFilterMode::Capabilities,
         }
     }
 }
@@ -1502,6 +1510,7 @@ impl ProxySection {
             )
             .with_max_sessions_per_principal(self.max_sessions_per_principal)
             .with_record_window(window, max_keys)
+            .with_list_filter(self.list_filter)
     }
 }
 
@@ -1898,6 +1907,39 @@ mod tests {
             let cfg = Config::from_toml(&format!("[proxy]\n{key} = 0\n")).unwrap();
             let err = cfg.proxy.check_limits().unwrap_err().to_string();
             assert!(err.contains(key), "{err}");
+        }
+    }
+
+    #[test]
+    fn list_filter_defaults_to_capabilities_and_refuses_unknown_values() {
+        use attenuo_proxy::ListFilterMode;
+        let cfg = Config::from_toml("").unwrap();
+        assert_eq!(cfg.proxy.list_filter, ListFilterMode::Capabilities);
+        let proxy = cfg.proxy.apply(attenuo_proxy::ProxyConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![],
+        ));
+        assert_eq!(proxy.list_filter, ListFilterMode::Capabilities);
+        for (text, mode) in [
+            ("capabilities", ListFilterMode::Capabilities),
+            ("policy", ListFilterMode::Policy),
+        ] {
+            let cfg = Config::from_toml(&format!("[proxy]\nlist_filter = \"{text}\"\n")).unwrap();
+            assert_eq!(cfg.proxy.list_filter, mode);
+            let proxy = cfg.proxy.apply(attenuo_proxy::ProxyConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                vec![],
+            ));
+            assert_eq!(proxy.list_filter, mode);
+        }
+        for bad in ["\"Policy\"", "\"cedar\"", "\"\"", "true"] {
+            let err = Config::from_toml(&format!("[proxy]\nlist_filter = {bad}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("list_filter") || err.contains("variant"),
+                "{bad}: {err}"
+            );
         }
     }
 

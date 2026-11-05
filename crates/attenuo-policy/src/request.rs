@@ -321,6 +321,48 @@ pub(crate) struct RequestParts {
     pub(crate) entities: Entities,
 }
 
+/// The `originating_user` and `chain` context records, which depend on the chain only.
+fn fixed_records(
+    chain: &DelegationChain,
+) -> Result<(RestrictedExpression, RestrictedExpression), TranslationError> {
+    let user = &chain.originating_user;
+    let user_attributes = object_from(user.attributes.iter(), "originating_user.attributes")?;
+    let agents: Vec<String> = chain.hops.iter().map(|h| h.agent.to_string()).collect();
+    let leases: Vec<String> = chain.hops.iter().map(|h| h.lease.0.clone()).collect();
+    let root_agent = agents.first().cloned().unwrap_or_default();
+
+    // ---- context: the records that depend on the chain only ----
+    let fixed = json!({
+        "originating_user": {
+            "subject": user.subject,
+            "issuer": user.issuer,
+            "attributes": user_attributes,
+            "authenticated_at_unix": user.authenticated_at.unix_timestamp(),
+        },
+        "chain": {
+            "depth": chain.depth(),
+            "agents": agents,
+            "root_agent": root_agent,
+            "leases": leases,
+        },
+    });
+    let mut originating_user = None;
+    let mut chain_record = None;
+    for (k, v) in Context::from_json_value(fixed, None)
+        .map_err(|e| TranslationError(format!("context: {e}")))?
+    {
+        match k.as_str() {
+            "originating_user" => originating_user = Some(v),
+            "chain" => chain_record = Some(v),
+            _ => {}
+        }
+    }
+    match (originating_user, chain_record) {
+        (Some(u), Some(c)) => Ok((u, c)),
+        _ => Err(TranslationError("context: missing record".into())),
+    }
+}
+
 impl RequestParts {
     /// Translate the chain and tool. This is the JSON translation the engine has always
     /// used; its output is reused by [`RequestParts::request`] for every call it matches.
@@ -334,41 +376,7 @@ impl RequestParts {
         let agent = chain
             .current_agent()
             .ok_or_else(|| TranslationError("delegation chain has no hops".into()))?;
-        let user = &chain.originating_user;
-        let user_attributes = object_from(user.attributes.iter(), "originating_user.attributes")?;
-        let agents: Vec<String> = chain.hops.iter().map(|h| h.agent.to_string()).collect();
-        let leases: Vec<String> = chain.hops.iter().map(|h| h.lease.0.clone()).collect();
-        let root_agent = agents.first().cloned().unwrap_or_default();
-
-        // ---- context: the records that depend on the chain only ----
-        let fixed = json!({
-            "originating_user": {
-                "subject": user.subject,
-                "issuer": user.issuer,
-                "attributes": user_attributes,
-                "authenticated_at_unix": user.authenticated_at.unix_timestamp(),
-            },
-            "chain": {
-                "depth": chain.depth(),
-                "agents": agents,
-                "root_agent": root_agent,
-                "leases": leases,
-            },
-        });
-        let mut originating_user = None;
-        let mut chain_record = None;
-        for (k, v) in Context::from_json_value(fixed, None)
-            .map_err(|e| TranslationError(format!("context: {e}")))?
-        {
-            match k.as_str() {
-                "originating_user" => originating_user = Some(v),
-                "chain" => chain_record = Some(v),
-                _ => {}
-            }
-        }
-        let (Some(originating_user), Some(chain_record)) = (originating_user, chain_record) else {
-            return Err(TranslationError("context: missing record".into()));
-        };
+        let (originating_user, chain_record) = fixed_records(chain)?;
 
         Ok(Self {
             key: PartsKey::new(chain, call, attrs),
@@ -722,6 +730,171 @@ impl RequestCache {
 
     pub(crate) fn len(&self) -> usize {
         self.parts.lock().map(|p| p.len()).unwrap_or(0)
+    }
+}
+
+/// The context members a `tools/call` decision fills in from the call or the run, which a
+/// list screen does not know (ADR-0011): each is a Cedar unknown of the same name. Every one
+/// of them is always present in a call's context, so making its value unknown keeps
+/// `context has <member>` true, as it is for every call. `session_id`, the one optional member,
+/// is handled apart ([`ScreenBase::partial_request`]).
+pub(crate) const SCREEN_UNKNOWNS: [&str; 8] = [
+    "input",
+    "now_unix",
+    "session",
+    "args_contain_untrusted",
+    "untrusted_args",
+    "approval",
+    "budget",
+    "usage",
+];
+
+/// The parts of a list screen's Cedar requests that depend on the chain and the server only,
+/// built once per screened list: the principal, the `originating_user` and `chain` records,
+/// and the entity store without the tool and its action (the user, every hop's agent, the
+/// server and `Action::"invoke"`). The entities and records are the ones
+/// [`RequestParts::build`] gives a call; [`ScreenBase::partial_request`] adds the tool.
+#[derive(Debug)]
+pub(crate) struct ScreenBase {
+    server: String,
+    principal: EntityUid,
+    originating_user: RestrictedExpression,
+    chain: RestrictedExpression,
+    entities: Entities,
+}
+
+impl ScreenBase {
+    pub(crate) fn build(chain: &DelegationChain, server: &str) -> Result<Self, TranslationError> {
+        let agent = chain
+            .current_agent()
+            .ok_or_else(|| TranslationError("delegation chain has no hops".into()))?;
+        let (originating_user, chain_record) = fixed_records(chain)?;
+        let user = &chain.originating_user;
+        let mut entities = Vec::with_capacity(chain.hops.len() + 3);
+        entities.push(json!({
+            "uid": uid_json("User", &user.subject),
+            "attrs": {
+                "subject": user.subject,
+                "issuer": user.issuer,
+                "authenticated_at_unix": user.authenticated_at.unix_timestamp(),
+                "attributes": user_attributes_value(&user.attributes)?,
+            },
+            "parents": [],
+        }));
+        for (i, hop) in chain.hops.iter().enumerate() {
+            let mut parents = vec![uid_json("User", &user.subject)];
+            if i > 0 {
+                parents.push(uid_json("Agent", &chain.hops[i - 1].agent.0));
+            }
+            entities.push(json!({
+                "uid": uid_json("Agent", &hop.agent.0),
+                "attrs": { "id": hop.agent.0, "chain_depth": i + 1 },
+                "parents": parents,
+            }));
+        }
+        entities.push(json!({
+            "uid": uid_json("Server", server),
+            "attrs": { "name": server },
+            "parents": [],
+        }));
+        entities.push(json!({
+            "uid": uid_json("Action", GENERIC_ACTION),
+            "attrs": {},
+            "parents": [],
+        }));
+        let entities = Entities::from_json_value(Value::Array(entities), None)
+            .map_err(|e| TranslationError(format!("entities: {e}")))?;
+        Ok(Self {
+            server: server.to_owned(),
+            principal: uid("Agent", &agent.0),
+            originating_user,
+            chain: chain_record,
+            entities,
+        })
+    }
+
+    /// The request and entity store for a call of `tool` with every member of
+    /// [`SCREEN_UNKNOWNS`] unknown, and `session_id` an unknown when `with_session_id`,
+    /// absent otherwise. The tool's entity and its action's are those
+    /// [`RequestParts::build`] makes.
+    pub(crate) fn partial_request(
+        &self,
+        tool: &str,
+        attrs: &ToolAttrs,
+        legacy_bare_actions: bool,
+        with_session_id: bool,
+    ) -> Result<(Request, Entities), TranslationError> {
+        use cedar_policy::Entity;
+        use std::collections::HashSet;
+
+        let action = crate::schema::action_id(&self.server, tool, legacy_bare_actions);
+        let resource_id = format!("{}/{tool}", self.server);
+        let tool_entity = Entity::new(
+            uid("Tool", &resource_id),
+            HashMap::from([
+                (
+                    "server".to_string(),
+                    RestrictedExpression::new_string(self.server.clone()),
+                ),
+                (
+                    "name".to_string(),
+                    RestrictedExpression::new_string(tool.to_owned()),
+                ),
+                (
+                    "readonly".to_string(),
+                    RestrictedExpression::new_bool(attrs.readonly),
+                ),
+                (
+                    "sensitive".to_string(),
+                    RestrictedExpression::new_bool(attrs.sensitive),
+                ),
+                (
+                    "destructive".to_string(),
+                    RestrictedExpression::new_bool(attrs.is_destructive()),
+                ),
+            ]),
+            HashSet::from([uid("Server", &self.server)]),
+        )
+        .map_err(|e| TranslationError(format!("entities: {e}")))?;
+        let mut added = vec![tool_entity];
+        if action != GENERIC_ACTION {
+            added.push(Entity::new_no_attrs(
+                uid("Action", &action),
+                HashSet::from([uid("Action", GENERIC_ACTION)]),
+            ));
+        }
+        let entities = self
+            .entities
+            .clone()
+            .add_entities(added, None)
+            .map_err(|e| TranslationError(format!("entities: {e}")))?;
+
+        let mut pairs = Vec::with_capacity(SCREEN_UNKNOWNS.len() + 3);
+        pairs.push((
+            "originating_user".to_string(),
+            self.originating_user.clone(),
+        ));
+        pairs.push(("chain".to_string(), self.chain.clone()));
+        if with_session_id {
+            pairs.push((
+                "session_id".to_string(),
+                RestrictedExpression::new_unknown("session_id"),
+            ));
+        }
+        for name in SCREEN_UNKNOWNS {
+            pairs.push((name.to_string(), RestrictedExpression::new_unknown(name)));
+        }
+        let context =
+            Context::from_pairs(pairs).map_err(|e| TranslationError(format!("context: {e}")))?;
+        let request = Request::new(
+            self.principal.clone(),
+            uid("Action", &action),
+            uid("Tool", &resource_id),
+            context,
+            None,
+        )
+        .map_err(|e| TranslationError(e.to_string()))?;
+        Ok((request, entities))
     }
 }
 
