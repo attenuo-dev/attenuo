@@ -21,6 +21,7 @@ never written anywhere by this script.
 
 import argparse
 import asyncio
+import contextlib
 import json
 import sys
 import warnings
@@ -75,10 +76,8 @@ class Meter:
         total = 0.0
         for path in self.path.parent.glob("usage-*.jsonl"):
             for line in path.read_text(encoding="utf-8").splitlines():
-                try:
+                with contextlib.suppress(ValueError, KeyError):  # another process is mid-write
                     total += json.loads(line)["dollars"]
-                except (ValueError, KeyError):
-                    pass  # another process is mid-write
         return total
 
     def cost(self, usage) -> float:

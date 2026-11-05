@@ -14,6 +14,10 @@ Arms:
            the task's ground truth on every argument that is not free text, and declined
            otherwise. A stand-in for a careful person, and an optimistic one.
 
+--filtered-list runs the server with `[proxy] list_filter = "policy"` and offers the model only
+the tools the proxy's `tools/list` returns for that run's token. Off by default, where the model
+is offered every tool in the suite.
+
     ANTHROPIC_API_KEY=... PYTHONPATH=sdk/python/src python evaluation/agentdojo/enforced.py \\
         --out DIR --arm grants --shard 0/4 --cap 3
     python evaluation/agentdojo/enforced.py --out DIR --summarize
@@ -45,6 +49,7 @@ from agentdojo.agent_pipeline.llms.google_llm import EMPTY_FUNCTION_NAME
 from agentdojo.agent_pipeline.tool_execution import is_string_list
 from agentdojo.attacks.attack_registry import load_attack
 from agentdojo.benchmark import run_task_with_injection_tasks, run_task_without_injection_tasks
+from agentdojo.functions_runtime import FunctionsRuntime
 from agentdojo.logging import OutputLogger
 from agentdojo.models import MODEL_NAMES
 from agentdojo.task_suite.load_suites import get_suite
@@ -85,7 +90,10 @@ class AttenuoToolsExecutor(BasePipelineElement):
                 "accept": "application/json, text/event-stream",
             },
         )
-        self.rpc("tools/list", {})
+        listed = self.rpc("tools/list", {}).get("result", {}).get("tools", [])
+        self.listed = {tool["name"] for tool in listed}
+        with self.decisions.with_name(f"lists-{self.decisions.stem}.jsonl").open("a") as fh:
+            fh.write(json.dumps({"run": label, "tools": sorted(self.listed)}) + "\n")
 
     def rpc(self, method: str, params: dict) -> dict:
         self.rid += 1
@@ -161,13 +169,28 @@ class AttenuoToolsExecutor(BasePipelineElement):
         return query, runtime, env, [*messages, *results], extra_args
 
 
+class ProxyToolList(BasePipelineElement):
+    """Offer the model only what the proxy listed for this run. Sits before the first model turn,
+    so the LLM element builds its request from the narrowed runtime."""
+
+    name = "proxy_tool_list"
+
+    def __init__(self, executor: AttenuoToolsExecutor):
+        self.executor = executor
+
+    def query(self, query, runtime, env, messages=(), extra_args={}):  # noqa: B006
+        keep = [f for f in runtime.functions.values() if f.name in self.executor.listed]
+        return query, FunctionsRuntime(keep), env, messages, extra_args
+
+
 def run(args) -> None:
     replay.SUITE = SUITE
     suite = get_suite(replay.VERSION, SUITE)
     base_env = suite.load_and_inject_default_environment({})
     work = Path(tempfile.mkdtemp(dir=args.out, prefix="work-"))
     shim = replay.Shim(suite)
-    attenuo = replay.Attenuo(args.arm, suite, base_env, shim.url, work, args.binary)
+    list_filter = "policy" if args.filtered_list else None
+    attenuo = replay.Attenuo(args.arm, suite, base_env, shim.url, work, args.binary, list_filter)
     shard, shards = (int(x) for x in args.shard.split("/"))
     tag = f"{args.arm}-{shard}"
     executor = AttenuoToolsExecutor(args.arm, attenuo, shim, args.out / f"decisions-{tag}.jsonl")
@@ -176,10 +199,12 @@ def run(args) -> None:
     llm = AnthropicLLM(
         anthropic.Anthropic(max_retries=8), args.model, temperature=None, max_tokens=args.max_tokens
     )
+    narrow = [ProxyToolList(executor)] if args.filtered_list else []
     pipeline = AgentPipeline(
         [
             SystemMessage(load_system_message(None)),
             InitQuery(),
+            *narrow,
             llm,
             ToolsExecutionLoop([executor, llm]),
         ]
@@ -249,6 +274,7 @@ def main() -> None:
     parser.add_argument("--cap", type=float, default=3.0)
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--benign-only", action="store_true")
+    parser.add_argument("--filtered-list", action="store_true")
     parser.add_argument("--binary", type=Path, default=replay.ROOT / "target/debug/attenuo-server")
     parser.add_argument("--summarize", action="store_true")
     args = parser.parse_args()

@@ -174,7 +174,8 @@ permit(principal, action == Action::"{SUITE}/update_user_info", resource);
 
 @id("banking_password_needs_mfa")
 permit(principal, action == Action::"{SUITE}/update_password", resource)
-when {{ context.originating_user.attributes has mfa && context.originating_user.attributes.mfa == true }};
+when {{ context.originating_user.attributes has mfa &&
+  context.originating_user.attributes.mfa == true }};
 """
 
 
@@ -203,7 +204,8 @@ permit(principal, action == Action::"{SUITE}/add_user_to_channel", resource);
 
 @id("slack_remove_needs_mfa")
 permit(principal, action == Action::"{SUITE}/remove_user_from_slack", resource)
-when {{ context.originating_user.attributes has mfa && context.originating_user.attributes.mfa == true }};
+when {{ context.originating_user.attributes has mfa &&
+  context.originating_user.attributes.mfa == true }};
 """
 
 
@@ -379,7 +381,9 @@ def free_port() -> int:
 class Attenuo:
     """attenuo-server for one arm."""
 
-    def __init__(self, arm: str, suite, env, upstream: str, work: Path, binary: Path):
+    def __init__(
+        self, arm: str, suite, env, upstream: str, work: Path, binary: Path, list_filter=None
+    ):
         self.port = free_port()
         self.url = f"http://127.0.0.1:{self.port}"
         text = PERMIT_ALL if arm == "grants_only" else suite_policy(env)
@@ -403,6 +407,7 @@ policies_path = "{policy}"
 {catalog_toml(suite, arm in ("args_reads", "args_fields"))}
 [audit]
 sqlite_path = ":memory:"
+{f'[proxy]{chr(10)}list_filter = "{list_filter}"' if list_filter else ""}
 [admin]
 token = "{ADMIN_TOKEN}"
 [[upstreams]]
