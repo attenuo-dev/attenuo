@@ -86,6 +86,10 @@
 - [Open-source project practices](research/oss-project-practices.md)
 - [Secret scan of the full history, 2026-11-05](research/secret-scan-2026-11-05.md)
 
+# Report
+
+- [Technical report, 2026-11](report/attenuo-2026-11.md)
+
 # Project
 
 - [FAQ](faq.md)
