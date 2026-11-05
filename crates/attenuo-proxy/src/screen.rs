@@ -2,7 +2,7 @@
 //!
 //! The capability filter ([`crate::filter`]) runs first and is unchanged. With
 //! [`ListFilterMode::Policy`] the tools it keeps are then put to
-//! [`Authorizer::screen_tools`](crate::Authorizer::screen_tools), which hides a tool only when
+//! [`Authorizer::screen_tools`], which hides a tool only when
 //! no call to it could be allowed for the chain (the server's authorizer partially evaluates
 //! the Cedar policy set; see `attenuo_policy::PolicyEngine::screen_tools`). The screen is
 //! advisory: a hidden tool that is called anyway is decided and recorded like any other call.
@@ -31,7 +31,7 @@ pub enum ListFilterMode {
     #[default]
     Capabilities,
     /// By capability shape, then `tools/list` entries through
-    /// [`Authorizer::screen_tools`](crate::Authorizer::screen_tools).
+    /// [`Authorizer::screen_tools`].
     Policy,
 }
 

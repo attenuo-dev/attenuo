@@ -70,7 +70,7 @@ pub(crate) enum Prepared {
 }
 
 impl PolicyEngine {
-    /// The list screen for one tool, uncached (see the [module docs](self)): `(server, tool)`
+    /// The list screen for one tool, uncached (see [`PolicyEngine::screen_tools`]): `(server, tool)`
     /// for the agent at the end of `chain`.
     pub fn screen_tool(&self, chain: &DelegationChain, server: &str, tool: &str) -> ListScreen {
         let base = self.screen_prepare(chain, server);
@@ -165,7 +165,7 @@ impl PolicyEngine {
     }
 }
 
-/// Most screen verdicts [`ScreenMemo`] holds; when full it is emptied and refilled.
+/// Most screen verdicts the memo of [`PolicyEngine::screen_tools`] holds; when full it is emptied and refilled.
 pub const SCREEN_MEMO_CAPACITY: usize = 16_384;
 
 /// The attributes a memoised verdict was computed with (narrowing from tool annotations can
@@ -211,7 +211,7 @@ impl ScreenMemo {
 impl PolicyEngine {
     /// The list screen for every tool in `tools` (one verdict each, in order), memoised per
     /// (chain digest, [`policy_generation`](Self::policy_generation), server, tool) and the
-    /// tool's effective attributes. See the [module docs](self). Never writes anything but
+    /// tool's effective attributes. The module-level comment of `screen.rs` explains the screen. Never writes anything but
     /// the memo.
     pub fn screen_tools(
         &self,
