@@ -32,7 +32,7 @@
 //! List requests (`tools/list` and the other three list methods) are remembered in the same
 //! map, under the same scope, bounds and expiry, with their [`ListKind`] instead of a decision
 //! (SR-87): an upstream that answers one with `202` and puts the answer in the body of a later
-//! `POST` gets it filtered there, through [`ListAnswers`], like an answer in its own body.
+//! `POST` gets it filtered there, through `ListAnswers`, like an answer in its own body.
 //! Calls and list requests are kept apart, so neither replaces nor claims the other. An answer
 //! on the listen stream or in the request's own body strikes the entry. A list answer that
 //! claims nothing in a `POST` body (another run's, an expired one, or a second answer to an id
