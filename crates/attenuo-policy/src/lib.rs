@@ -217,6 +217,11 @@
 //! ```
 
 #![forbid(unsafe_code)]
+#![warn(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 
 pub mod authzen;
 mod catalog;

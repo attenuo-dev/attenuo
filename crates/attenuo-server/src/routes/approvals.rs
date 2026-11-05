@@ -170,29 +170,6 @@ fn approval_body(state: &AppState, a: &Approval, now: OffsetDateTime) -> Value {
     v
 }
 
-/// What the store's refusals mean to a caller.
-fn decide_error(e: AuditError) -> ApiError {
-    match e {
-        AuditError::UnknownApproval(id) => ApiError::not_found(format!("unknown approval `{id}`")),
-        AuditError::ApprovalNotPending { state, .. } => ApiError::new(
-            StatusCode::CONFLICT,
-            "approval_not_pending",
-            format!("the approval is already {state}"),
-        ),
-        AuditError::ApprovalExpired(_) => ApiError::new(
-            StatusCode::CONFLICT,
-            "approval_expired",
-            "the approval, or the lease it is bound to, has expired",
-        ),
-        AuditError::LeaseRevoked(_) => ApiError::new(
-            StatusCode::CONFLICT,
-            "lease_revoked",
-            "the lease the approval is bound to has been revoked",
-        ),
-        other => other.into(),
-    }
-}
-
 fn load(state: &AppState, id: &str) -> Result<Approval, ApiError> {
     state
         .leases
@@ -215,7 +192,7 @@ fn decide(
             if matches!(e, AuditError::ApprovalExpired(_)) {
                 state.metrics.approval_expired();
             }
-            decide_error(e)
+            ApiError::from(e)
         })?;
     let call = ToolCall::new(a.server.clone(), a.tool.clone(), a.arguments.clone());
     let (decision, reason) = if grant {

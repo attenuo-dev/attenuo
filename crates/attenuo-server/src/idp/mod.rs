@@ -39,7 +39,9 @@
 //!
 //! Every rejection has a stable `error_description` sub-code ([`IntakeError::description`]),
 //! with the OAuth `error` code `invalid_grant` (400) except `jwks_unavailable`, which is
-//! `temporarily_unavailable` (503).
+//! `temporarily_unavailable` (503). An `invalid_grant` carries the sub-code as `detail` too; the
+//! verifier's message (issuer, audience, `kid`, client ids) is logged at debug level and never
+//! returned (SR-17).
 
 pub mod claims;
 pub mod intake;
@@ -157,7 +159,13 @@ impl From<IntakeError> for ApiError {
                     "the identity provider's keys cannot be fetched; try again later",
                 )
             }
-            _ => ApiError::bad_request("invalid_grant", e.to_string()),
+            // The verifier's text names the issuer, the expected audience, the client ids and
+            // the signature library's complaint: log it at debug level and return only the
+            // stable sub-code, as `detail` and `error_description` (SR-17).
+            _ => {
+                tracing::debug!(reason = d, detail = ?e.to_string(), "IdP credential refused");
+                ApiError::bad_request("invalid_grant", d)
+            }
         }
         .with_description(d)
     }
@@ -498,9 +506,29 @@ fn peek(token: &str) -> Result<(JsonObject, JsonObject), IntakeError> {
 }
 
 /// A NumericDate claim as whole seconds.
+///
+/// RFC 7519 §2 allows a NumericDate to be a non-integer: a float is rounded down to the whole
+/// second (`exp` of `5.5` expires at `5`, never later). A float that is not finite or is outside
+/// the `i64` range of seconds (`1e300`) is not a NumericDate this server can compare, so the
+/// claim reads as absent and a required claim is refused with `missing_claim`; it never
+/// saturates into a far-future `exp`.
 pub(crate) fn numeric_date(claims: &Map<String, Value>, name: &str) -> Option<i64> {
     let v = claims.get(name)?;
-    v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))
+    v.as_i64().or_else(|| v.as_f64().and_then(float_seconds))
+}
+
+/// `f` rounded down to a whole number of seconds, if that fits in an `i64`.
+fn float_seconds(f: f64) -> Option<i64> {
+    // -2^63 is exact as an f64; i64::MAX is not (it rounds up to 2^63), so the upper bound is
+    // exclusive.
+    const LIMIT: f64 = 9_223_372_036_854_775_808.0;
+    let s = f.floor();
+    if !s.is_finite() || s < -LIMIT || s >= LIMIT {
+        return None;
+    }
+    // In range and whole, so the cast is exact.
+    #[allow(clippy::cast_possible_truncation)]
+    Some(s as i64)
 }
 
 /// Check `iss`, `aud`, `exp`, `iat`, `nbf` and `sub`; return `sub`.
@@ -555,6 +583,46 @@ mod tests {
 
     fn claims(v: Value) -> Map<String, Value> {
         v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn float_numeric_dates_round_down_and_refuse_out_of_range() {
+        assert_eq!(float_seconds(f64::NAN), None);
+        assert_eq!(float_seconds(f64::INFINITY), None);
+        assert_eq!(float_seconds(f64::NEG_INFINITY), None);
+        assert_eq!(float_seconds(1e300), None);
+        assert_eq!(float_seconds(-1e300), None);
+        assert_eq!(float_seconds(9_223_372_036_854_775_808.0), None);
+        assert_eq!(float_seconds(-9_223_372_036_854_775_808.0), Some(i64::MIN));
+        assert_eq!(float_seconds(-1.0), Some(-1));
+        assert_eq!(float_seconds(-0.5), Some(-1));
+        assert_eq!(float_seconds(5.0), Some(5));
+        assert_eq!(float_seconds(5.5), Some(5));
+
+        // Through the claim reader: an integer is read as is, a fraction rounds down, and a
+        // float too large for an i64 is absent rather than a saturated far-future date.
+        let c = claims(json!({"a": 7, "b": 1_000_100.9, "c": 1e300, "d": -1.0, "e": "5"}));
+        assert_eq!(numeric_date(&c, "a"), Some(7));
+        assert_eq!(numeric_date(&c, "b"), Some(1_000_100));
+        assert_eq!(numeric_date(&c, "c"), None);
+        assert_eq!(numeric_date(&c, "d"), Some(-1));
+        assert_eq!(numeric_date(&c, "e"), None);
+        assert_eq!(numeric_date(&c, "missing"), None);
+
+        // An `exp` of 1e300 used to saturate to i64::MAX and never expire; now it is refused.
+        let now = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let c = claims(json!({"iss": "i", "aud": "a", "sub": "u", "exp": 1e300, "iat": 999_990}));
+        assert_eq!(
+            check_claims(&c, "i", "a", now, 60),
+            Err(IntakeError::MissingClaim("exp"))
+        );
+        // A fractional `exp` in the past is expired, not read as 0 or as a later second.
+        let c =
+            claims(json!({"iss": "i", "aud": "a", "sub": "u", "exp": 999_900.5, "iat": 999_800.5}));
+        assert_eq!(
+            check_claims(&c, "i", "a", now, 60),
+            Err(IntakeError::Expired)
+        );
     }
 
     #[test]

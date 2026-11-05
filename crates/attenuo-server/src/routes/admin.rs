@@ -391,13 +391,10 @@ pub async fn refund_budget(
                 .leases
                 .refund(&decision_id, now)
                 .map_err(|e| match e {
+                    // Why there is no charge is in the audit log; the rest is the
+                    // central mapping (409 `already_refunded` included).
                     AuditError::UnknownCharge(_) => no_charge_refusal(state, &decision_id),
-                    AuditError::ChargeRefunded(_) => ApiError::new(
-                        StatusCode::CONFLICT,
-                        "already_refunded",
-                        format!("the charge of decision `{decision_id}` was already refunded"),
-                    ),
-                    other => ApiError::internal(other),
+                    other => other.into(),
                 })?;
             state.metrics.budget_refunded(RefundSource::Operator);
             tracing::warn!(decision = ?decision_id, reason = ?reason, refunded, "budget refunded");

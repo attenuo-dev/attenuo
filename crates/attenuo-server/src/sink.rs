@@ -76,8 +76,11 @@ impl Jitter {
     fn new() -> Self {
         let seed = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64);
-        Self(seed ^ (std::process::id() as u64).rotate_left(32))
+            // The low 64 bits of the clock are the seed.
+            .map_or(0, |d| {
+                u64::try_from(d.as_nanos() & u128::from(u64::MAX)).unwrap_or_default()
+            });
+        Self(seed ^ u64::from(std::process::id()).rotate_left(32))
     }
 
     fn unit(&mut self) -> f64 {
@@ -674,7 +677,9 @@ pub fn amz_date(t: SystemTime) -> String {
     let secs = t
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let dt = time::OffsetDateTime::from_unix_timestamp(secs as i64)
+    let dt = i64::try_from(secs)
+        .ok()
+        .and_then(|s| time::OffsetDateTime::from_unix_timestamp(s).ok())
         .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
     format!(
         "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
