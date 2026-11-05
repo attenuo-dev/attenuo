@@ -88,6 +88,7 @@
 - [Open-source project practices](research/oss-project-practices.md)
 - [Secret scan of the full history, 2026-11-05](research/secret-scan-2026-11-05.md)
 - [CI minutes, 2026-11-05](research/ci-minutes-2026-11-05.md)
+- [Code-quality pass, 2026-11-05](research/code-quality-2026-11-05.md)
 
 # Report
 

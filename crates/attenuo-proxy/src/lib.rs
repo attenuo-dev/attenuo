@@ -140,6 +140,8 @@
 //!
 //! [`DelegationChain`]: attenuo_core::DelegationChain
 
+#![deny(unsafe_code)]
+
 pub mod auth;
 pub mod config;
 pub mod filter;

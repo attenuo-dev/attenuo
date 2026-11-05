@@ -11,13 +11,24 @@ use crate::chain::{AgentId, DelegationChain, LeaseId};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
+    /// The call may go ahead.
     Allow,
+    /// The call is refused.
     Deny,
 }
 
 impl Decision {
+    /// Is this [`Decision::Allow`]?
     pub fn is_allow(&self) -> bool {
         matches!(self, Decision::Allow)
+    }
+
+    /// The wire form, `"allow"` or `"deny"` (the same string serde writes).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Decision::Allow => "allow",
+            Decision::Deny => "deny",
+        }
     }
 }
 
@@ -57,6 +68,7 @@ pub enum RecordKind {
 }
 
 impl RecordKind {
+    /// Every kind, in declaration order.
     pub const ALL: [RecordKind; 9] = [
         RecordKind::Decision,
         RecordKind::Exchange,
@@ -113,7 +125,9 @@ impl std::str::FromStr for RecordKind {
 /// involved without the log storing the full chain each time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionRecord {
+    /// Unique id of this record.
     pub id: Uuid,
+    /// When the event happened.
     #[serde(with = "time::serde::rfc3339")]
     pub at: OffsetDateTime,
     /// What sort of event this is ([`RecordKind`]).
@@ -123,19 +137,28 @@ pub struct DecisionRecord {
     /// change as hops are added. Absent for records with no chain (admin actions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_id: Option<String>,
+    /// The outcome.
     pub decision: Decision,
     /// Short machine-readable reason (e.g. `policy_deny`, `lease_revoked`, `chain_invalid`).
     pub reason: String,
+    /// Subject of the originating user.
     pub originating_subject: String,
     /// Every agent in the chain, root first. Lets a reader distinguish "the user did this"
     /// from "agent X did this for the user" at a glance.
     pub agents: Vec<AgentId>,
+    /// Number of hops in the chain.
     pub chain_depth: usize,
+    /// [`DelegationChain::digest`] of the chain in force.
     pub chain_digest: String,
+    /// The lease of every hop, root first.
     pub leases: Vec<LeaseId>,
+    /// Server the call was for.
     pub server: String,
+    /// Tool (or call name) the call was for.
     pub tool: String,
+    /// [`ToolCall::arguments_digest`] of the call's arguments.
     pub arguments_digest: String,
+    /// MCP session the call arrived on, when there was one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     /// Identifiers of the policies that determined the decision, if the engine reports them.
@@ -206,6 +229,7 @@ pub struct BudgetCharge {
     pub hop: usize,
     /// Index of the capability in the hop's capability set.
     pub cap: usize,
+    /// Which limit of the capability was charged.
     pub kind: crate::limits::LimitKind,
     /// The argument a `sum` or `calls_per` limit counts; absent for `calls`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -303,6 +327,7 @@ pub struct ResultInfo {
     /// The result was a JSON-RPC error from the upstream.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub error: bool,
+    /// The label the result was given.
     pub label: OutputLabel,
     /// How many fingerprints of the result went into the run's span index for argument
     /// matching (ADR-0009 phase 2, [`crate::fingerprint`]). 0 for a trusted result, and in
@@ -325,6 +350,7 @@ pub struct RecordLabels {
 }
 
 impl RecordLabels {
+    /// No taint sources and no untrusted arguments.
     pub fn is_empty(&self) -> bool {
         self.tainted_by.is_empty() && self.untrusted_args.is_empty()
     }
@@ -339,6 +365,7 @@ pub struct UntrustedArg {
     /// Absent for [`UntrustedKind::Unreadable`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
+    /// How the argument came to count as untrusted.
     pub kind: UntrustedKind,
 }
 
@@ -392,6 +419,8 @@ impl DecisionRecord {
         self
     }
 
+    /// A [`RecordKind::Decision`] record of `decision` on `call` under `chain`, with a fresh id;
+    /// the optional members start empty.
     pub fn new(
         at: OffsetDateTime,
         decision: Decision,

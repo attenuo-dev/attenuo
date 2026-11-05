@@ -532,6 +532,13 @@ fn open_memory_connection() -> Result<Connection, AuditError> {
     Ok(conn)
 }
 
+/// A commit of one record handed back no entry. `commit` returns one entry per record, so this
+/// does not happen; if it ever did, the caller gets a storage error instead of a panic on the
+/// request path.
+fn no_entry_for_record() -> AuditError {
+    AuditError::Storage("an append of one record returned no entry".into())
+}
+
 fn fmt_time(t: OffsetDateTime) -> Result<String, AuditError> {
     Ok(t.format(&Rfc3339)?)
 }
@@ -591,7 +598,7 @@ fn entry_from_row(row: &Row<'_>) -> Result<AuditEntry, AuditError> {
             )))
         }
     };
-    expect("decision", &decision, decision_str(&record.decision))?;
+    expect("decision", &decision, record.decision.as_str())?;
     expect("kind", &kind, record.kind.as_str())?;
     if chain_id != record.chain_id {
         return Err(corrupt(format!(
@@ -635,13 +642,6 @@ fn entry_from_row(row: &Row<'_>) -> Result<AuditEntry, AuditError> {
         record,
         entry_hash,
     })
-}
-
-fn decision_str(d: &attenuo_core::Decision) -> &'static str {
-    match d {
-        attenuo_core::Decision::Allow => "allow",
-        attenuo_core::Decision::Deny => "deny",
-    }
 }
 
 fn head_in(tx: &Transaction<'_>) -> Result<Option<AuditEntry>, AuditError> {
@@ -1491,7 +1491,7 @@ impl Inner {
             Err((_, records)) => records
                 .into_iter()
                 .map(|r| match self.commit(conn, vec![r], sync) {
-                    Ok(mut one) => Ok(one.pop().expect("one record, one entry")),
+                    Ok(mut one) => one.pop().ok_or_else(no_entry_for_record),
                     Err((e, _)) => Err(e),
                 })
                 .collect(),
@@ -1717,7 +1717,7 @@ fn insert_entry(
         entry.prev_hash,
         entry.entry_hash,
         fmt_time(r.at)?,
-        decision_str(&r.decision),
+        r.decision.as_str(),
         r.reason,
         r.originating_subject,
         serde_json::to_string(&r.agents)?,
@@ -2101,7 +2101,7 @@ impl SqliteAudit {
             let names: Vec<&str> = filter.kinds.iter().map(|k| k.as_str()).collect();
             Some(serde_json::to_string(&names)?)
         };
-        let decision = filter.decision.as_ref().map(decision_str);
+        let decision = filter.decision.as_ref().map(attenuo_core::Decision::as_str);
         // The columns hold JSON arrays of strings: look for the element as a quoted string.
         let agent = match &filter.agent {
             Some(a) => Some(like_contains(&serde_json::to_string(&a.0)?)),
@@ -2245,7 +2245,7 @@ impl SqliteAudit {
         Ok(query_entries(
             &conn,
             &sql,
-            &[&kind.as_str(), &tool, &decision_str(decision), &after],
+            &[&kind.as_str(), &tool, &decision.as_str(), &after],
         )?
         .pop())
     }
@@ -2333,7 +2333,7 @@ impl SqliteAudit {
             match self.inner.conn.try_lock() {
                 Ok(mut conn) => {
                     let mut out = self.inner.append_locked(&mut conn, vec![record], sync);
-                    return out.pop().expect("one record, one result");
+                    return out.pop().unwrap_or_else(|| Err(no_entry_for_record()));
                 }
                 Err(TryLockError::Poisoned(_)) => return Err(AuditError::Poisoned),
                 Err(TryLockError::WouldBlock) => {}

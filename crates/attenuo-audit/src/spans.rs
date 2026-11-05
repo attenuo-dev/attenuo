@@ -50,12 +50,12 @@ impl std::fmt::Debug for SpanKey {
 }
 
 impl SpanKey {
-    pub fn new(secret: &[u8]) -> Self {
+    pub(crate) fn new(secret: &[u8]) -> Self {
         Self(hmac::Key::new(hmac::HMAC_SHA256, secret))
     }
 
     /// A fresh random key (the memory store's, which lives as long as its index).
-    pub fn random() -> Result<Self, AuditError> {
+    pub(crate) fn random() -> Result<Self, AuditError> {
         let rng = ring::rand::SystemRandom::new();
         let key = hmac::Key::generate(hmac::HMAC_SHA256, &rng)
             .map_err(|_| AuditError::Storage("could not generate a span key".into()))?;
@@ -63,7 +63,7 @@ impl SpanKey {
     }
 
     /// The stored form of `f`: HMAC-SHA-256 of its digest (which already covers its kind).
-    pub fn hash(&self, f: &Fingerprint) -> [u8; 32] {
+    pub(crate) fn hash(&self, f: &Fingerprint) -> [u8; 32] {
         let tag = hmac::sign(&self.0, &f.digest);
         let mut out = [0u8; 32];
         out.copy_from_slice(tag.as_ref());

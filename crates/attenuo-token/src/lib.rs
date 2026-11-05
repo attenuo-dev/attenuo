@@ -65,6 +65,9 @@
 //! assert_eq!(verified.claims.act.act.unwrap().sub, "agent:planner");
 //! ```
 
+#![deny(unsafe_code)]
+#![warn(missing_docs)]
+
 pub mod approval;
 pub mod claims;
 pub mod detached;

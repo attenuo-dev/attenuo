@@ -13,6 +13,8 @@
 //!
 //! Nothing here evaluates policy; the sibling crates call into this one after deciding.
 
+#![deny(unsafe_code)]
+
 pub mod approval;
 pub mod budget;
 pub mod checkpoint;

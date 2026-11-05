@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 use attenuo_bench::{run, Opts};
 use clap::Parser;
 

@@ -639,8 +639,7 @@ impl Pipeline {
         let started = Instant::now();
         let out = self.decide_inner(chain, call, ctx, now);
         self.metrics.observe_authorize(started.elapsed());
-        self.metrics
-            .decision(if out.is_allow() { "allow" } else { "deny" }, &out.reason);
+        self.metrics.decision(out.decision.as_str(), &out.reason);
         out
     }
 

@@ -1206,7 +1206,7 @@ impl TestCase {
             report.failures.push(format!(
                 "expected {}, got {} ({})",
                 case.expect,
-                decision_str(&actual.decision),
+                actual.decision.as_str(),
                 actual.reason
             ));
         }
@@ -1233,14 +1233,6 @@ impl TestCase {
         report.passed = report.failures.is_empty();
         report.actual = Some(actual);
         report
-    }
-}
-
-fn decision_str(d: &Decision) -> &'static str {
-    if d.is_allow() {
-        "allow"
-    } else {
-        "deny"
     }
 }
 

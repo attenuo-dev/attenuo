@@ -17,15 +17,7 @@ use crate::jsonrpc::{
 };
 
 /// Name pattern matching as `attenuo-core` defines it: exact, `*`, or `prefix*`.
-pub fn pattern_matches(pattern: &str, name: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    match pattern.strip_suffix('*') {
-        Some(prefix) => name.starts_with(prefix),
-        None => pattern == name,
-    }
-}
+pub use attenuo_core::capability::pattern_matches;
 
 /// Could some capability in `caps` permit a call to `tool` on `server`, for *some* arguments?
 pub fn could_permit_tool(caps: &CapabilitySet, server: &str, tool: &str) -> bool {

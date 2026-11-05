@@ -20,6 +20,8 @@
 //!
 //! See `docs/design/performance.md` for the method and its limits.
 
+#![deny(unsafe_code)]
+
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};

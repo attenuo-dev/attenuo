@@ -19,6 +19,7 @@ pub const DEFAULT_MAX_DEPTH: usize = 8;
 pub struct AgentId(pub String);
 
 impl AgentId {
+    /// Wrap an agent identifier.
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
     }
@@ -37,6 +38,7 @@ impl std::fmt::Display for AgentId {
 pub struct LeaseId(pub String);
 
 impl LeaseId {
+    /// Wrap a lease identifier.
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
     }
@@ -64,19 +66,26 @@ pub struct OriginatingUser {
 /// One delegation step: an agent holding a capability set for a bounded time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hop {
+    /// The agent acting at this hop.
     pub agent: AgentId,
+    /// What the agent may call; covered by the parent hop's set.
     pub capabilities: CapabilitySet,
+    /// When the hop was issued.
     #[serde(with = "time::serde::rfc3339")]
     pub issued_at: OffsetDateTime,
+    /// When the hop expires; no later than the parent hop's expiry.
     #[serde(with = "time::serde::rfc3339")]
     pub expires_at: OffsetDateTime,
+    /// The revocation lease of this hop.
     pub lease: LeaseId,
 }
 
 /// The full chain: who it is for, and who has acted on their behalf so far (root first).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegationChain {
+    /// The user the whole chain acts for.
     pub originating_user: OriginatingUser,
+    /// Every hop, root first.
     pub hops: Vec<Hop>,
 }
 
@@ -299,6 +308,7 @@ impl DelegationChain {
         Ok(())
     }
 
+    /// Number of hops.
     pub fn depth(&self) -> usize {
         self.hops.len()
     }
