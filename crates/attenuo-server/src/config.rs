@@ -931,9 +931,10 @@ pub const NOTIFY_SECRET_MIN_LEN: usize = 32;
 /// again when it is decided or expires, is queued (bounded, never blocking a decision) and
 /// `POST`ed to `url` by a background thread with jittered retries, on the `[audit.sink]`
 /// queue ([`crate::sink::Queue`]). The body is signed with HMAC-SHA-256 under the secret in
-/// the environment variable `secret_env` (header `X-Attenuo-Signature`). Best effort: a
-/// notification that fails `max_attempts` times is dropped and counted. See
-/// `docs/design/approval-notifier.md`.
+/// the environment variable `secret_env` (header `X-Attenuo-Signature`). Each notice is
+/// stored in the lease store's `notice_outbox` table first, so a restart delivers what was
+/// left undelivered ([`crate::notify`]). Best effort: a notification that fails `max_attempts`
+/// times is dropped and counted. See `docs/design/server.md` ("Approvals").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotifySection {
@@ -971,8 +972,16 @@ pub struct NotifySection {
     /// full. Default 300.
     #[serde(default = "default_sink_max_lag_seconds")]
     pub max_lag_seconds: u64,
+    /// How long a notice stays in the outbox table after it was delivered or given up, so
+    /// that it is not sent again after a restart. Approvals that expired longer ago than this
+    /// get no `approval.expired` notice on start. Default 604800 (7 days).
+    #[serde(default = "default_notify_outbox_retention_seconds")]
+    pub outbox_retention_seconds: u64,
 }
 
+fn default_notify_outbox_retention_seconds() -> u64 {
+    7 * 24 * 3600
+}
 fn default_notify_secret_env() -> String {
     NOTIFY_SECRET_ENV.into()
 }
@@ -1010,6 +1019,7 @@ impl NotifySection {
             initial_backoff_ms: default_sink_initial_backoff_ms(),
             max_backoff_seconds: default_notify_max_backoff_seconds(),
             max_lag_seconds: default_sink_max_lag_seconds(),
+            outbox_retention_seconds: default_notify_outbox_retention_seconds(),
         }
     }
 
@@ -1060,10 +1070,11 @@ impl NotifySection {
             || self.initial_backoff_ms == 0
             || self.max_backoff_seconds == 0
             || self.max_lag_seconds == 0
+            || self.outbox_retention_seconds == 0
         {
             anyhow::bail!(
-                "[approvals.notify] timeout_seconds, initial_backoff_ms, max_backoff_seconds \
-                 and max_lag_seconds must be positive"
+                "[approvals.notify] timeout_seconds, initial_backoff_ms, max_backoff_seconds, \
+                 max_lag_seconds and outbox_retention_seconds must be positive"
             );
         }
         Ok(())

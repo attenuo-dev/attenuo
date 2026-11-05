@@ -53,6 +53,33 @@ pub trait Deliver<T: Sync = ShippedCheckpoint>: Send + Sync {
 pub trait QueueItem: Send + Sync + 'static {
     /// Names the item in log lines. Never secret.
     fn log_id(&self) -> String;
+
+    /// Failed attempts made before the item was queued: an approval notice reloaded from the
+    /// outbox after a restart. They count towards [`QueueRole::give_up`]. Default 0.
+    fn attempts(&self) -> u32 {
+        0
+    }
+}
+
+/// What became of a queued item, told to the queue's [`Settle`] hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settled {
+    /// Delivered.
+    Delivered,
+    /// Attempt number `attempts` failed; the next one follows in `wait`.
+    Retry { attempts: u32, wait: Duration },
+    /// Every attempt failed ([`QueueRole::give_up`]): dropped.
+    GaveUp { attempts: u32 },
+    /// Dropped from a full queue before delivery.
+    Dropped,
+}
+
+/// Told what became of each item, for a queue whose items are also kept elsewhere (the
+/// approval notice outbox, [`crate::notify`]). Runs on the delivery thread, before the
+/// delivered and failure counters move; [`Settled::Dropped`] runs on the thread that pushed.
+/// Never called for an item left queued at shutdown: it stays wherever the hook keeps it.
+pub trait Settle<T>: Send + Sync + std::fmt::Debug {
+    fn settled(&self, item: &T, how: Settled);
 }
 
 impl QueueItem for ShippedCheckpoint {
@@ -231,11 +258,19 @@ struct Shared<T> {
     limits: SinkLimits,
     role: QueueRole,
     metrics: Arc<Metrics>,
+    /// Told what became of each item, when set.
+    settle: Option<Box<dyn Settle<T>>>,
     /// Test hook: delivered items, by count.
     delivered: AtomicU64,
 }
 
 impl<T> Shared<T> {
+    fn settled(&self, item: &T, how: Settled) {
+        if let Some(s) = &self.settle {
+            s.settled(item, how);
+        }
+    }
+
     fn oldest(st: &State<T>) -> Option<(Instant, SystemTime)> {
         st.in_flight
             .or_else(|| st.queue.front().map(|q| (q.since, q.since_wall)))
@@ -286,6 +321,7 @@ impl<T: QueueItem> QueueHandle<T> {
         let Ok(mut st) = self.shared.state.lock() else {
             return;
         };
+        let mut dropped = None;
         if st.queue.len() >= self.shared.limits.capacity {
             if let Some(old) = st.queue.pop_front() {
                 self.shared.role.dropped(&self.shared.metrics);
@@ -295,6 +331,7 @@ impl<T: QueueItem> QueueHandle<T> {
                     "{} queue full: dropped the oldest undelivered item",
                     self.shared.role.section()
                 );
+                dropped = Some(old.item);
             }
         }
         st.queue.push_back(Queued {
@@ -305,6 +342,9 @@ impl<T: QueueItem> QueueHandle<T> {
         self.shared.gauges(&st);
         drop(st);
         self.shared.wake.notify_all();
+        if let Some(old) = dropped {
+            self.shared.settled(&old, Settled::Dropped);
+        }
     }
 
     pub fn status(&self) -> SinkStatus {
@@ -352,12 +392,24 @@ impl<T: QueueItem> Queue<T> {
         role: QueueRole,
         metrics: Arc<Metrics>,
     ) -> anyhow::Result<Self> {
+        Self::start_with(deliver, limits, role, metrics, None)
+    }
+
+    /// [`start`](Self::start), telling `settle` what became of each item.
+    pub fn start_with(
+        deliver: Box<dyn Deliver<T>>,
+        limits: SinkLimits,
+        role: QueueRole,
+        metrics: Arc<Metrics>,
+        settle: Option<Box<dyn Settle<T>>>,
+    ) -> anyhow::Result<Self> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
             limits,
             role,
             metrics,
+            settle,
             delivered: AtomicU64::new(0),
         });
         let worker = shared.clone();
@@ -546,9 +598,27 @@ fn run<T: QueueItem>(shared: Arc<Shared<T>>, deliver: Box<dyn Deliver<T>>) {
                 st = shared.wake.wait(st).unwrap_or_else(|e| e.into_inner());
             }
         };
-        let mut attempt = 0u32;
+        let mut attempt = item.item.attempts();
         loop {
             let result = rt.block_on(deliver.deliver(&item.item));
+            // Tell the hook first, outside the lock: it may write to disk.
+            let wait = match &result {
+                Ok(()) => {
+                    shared.settled(&item.item, Settled::Delivered);
+                    Duration::ZERO
+                }
+                Err(_) => {
+                    let attempts = attempt.saturating_add(1);
+                    if shared.role.give_up().is_some_and(|n| attempts >= n) {
+                        shared.settled(&item.item, Settled::GaveUp { attempts });
+                        Duration::ZERO
+                    } else {
+                        let wait = shared.limits.backoff.delay(attempts - 1, jitter.unit());
+                        shared.settled(&item.item, Settled::Retry { attempts, wait });
+                        wait
+                    }
+                }
+            };
             let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
             match result {
                 Ok(()) => {
@@ -586,7 +656,6 @@ fn run<T: QueueItem>(shared: Arc<Shared<T>>, deliver: Box<dyn Deliver<T>>) {
                         "{section} delivery failed; retrying"
                     );
                     st.last_error = Some(e);
-                    let wait = shared.limits.backoff.delay(attempt - 1, jitter.unit());
                     let until = Instant::now() + wait;
                     // Sleep, but wake for a shutdown whose deadline has passed.
                     loop {

@@ -468,6 +468,7 @@ Every series is prefixed `attenuo_`. Label values come from fixed sets, so the n
 | `approval_notify_failures_total` | counter | none | Approval notification deliveries that failed; each is retried until `max_attempts`. |
 | `approval_notify_dropped_total` | counter | none | Approval notifications not delivered: dropped from a full queue, failed on every attempt, or not watched for expiry because 10,000 pending approvals already were. |
 | `approval_notify_queue_depth` | gauge | none | Approval notifications waiting in the `[approvals.notify]` queue. |
+| `approval_notify_outbox_rows` | gauge | none | Approval notifications stored in the outbox and not yet delivered or given up. Restored from the database at start. |
 | `audit_wal_checkpoints_total` | counter | `result` (`complete`, `incomplete`, `error`) | Background WAL checkpoint rounds: `complete` left nothing in the WAL, `incomplete` left frames behind (a reader or the writer was in the way; the next commit starts another round). |
 | `audit_wal_locked_passes_total` | counter | none | WAL catch-up passes run holding the store's lock, each pausing appends briefly (only when the WAL passes 64 MB under load). |
 | `audit_wal_backstops_total` | counter | none | WAL checkpoints the audit writer ran itself because the WAL outgrew the backstop (128 MB): the background thread fell behind. |

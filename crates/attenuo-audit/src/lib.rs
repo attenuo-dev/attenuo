@@ -62,8 +62,9 @@ pub use shipped::{
 };
 pub use spans::{SpanHit, MAX_SPANS_PER_RUN};
 pub use sqlite::{
-    Durability, SqliteAudit, SqliteLeaseStore, WalCheckpoint, WalStats, CHECKPOINT_PRESYNC_LEAD,
-    DEFAULT_WAL_CHECKPOINT_INTERVAL, WAL_CHECKPOINT_COMMITS, WAL_WRITER_BACKSTOP_FRAMES,
+    Durability, NewNotice, OutboxNotice, SqliteAudit, SqliteLeaseStore, WalCheckpoint, WalStats,
+    CHECKPOINT_PRESYNC_LEAD, DEFAULT_WAL_CHECKPOINT_INTERVAL, WAL_CHECKPOINT_COMMITS,
+    WAL_WRITER_BACKSTOP_FRAMES,
 };
 #[cfg(feature = "testing")]
 #[doc(hidden)]

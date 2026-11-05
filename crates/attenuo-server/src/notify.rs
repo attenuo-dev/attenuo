@@ -4,18 +4,30 @@
 //!
 //! Where: [`NotifierHandle::pending`] is called by the pipeline after a new pending approval
 //! and its `approval_request` record were written, and [`NotifierHandle::decided`] by the
-//! approval routes after the decision and its `approval_grant` record were. Both only build a
-//! small JSON document and queue it; neither waits on the network. Delivery runs on the
-//! `[audit.sink]` queue ([`crate::sink::Queue`], role [`QueueRole::ApprovalNotices`]): bounded,
-//! oldest dropped when full, one background thread, jittered exponential backoff, and given
-//! up after `max_attempts`. Expiry has no request to hang on, so a watcher thread keeps the
-//! pending approvals by expiry time and, once one is due, reads it from the lease store and
-//! queues `approval.expired` if it is still pending.
+//! approval routes after the decision and its `approval_grant` record were. Both build a
+//! small JSON document, store it as one row of the lease store's `notice_outbox` table (one
+//! local insert, never the network) and queue it. Delivery runs on the `[audit.sink]` queue
+//! ([`crate::sink::Queue`], role [`QueueRole::ApprovalNotices`]): bounded, oldest dropped when
+//! full, one background thread, jittered exponential backoff, and given up after
+//! `max_attempts`. The queue's [`Settle`] hook ([`OutboxSettle`]) marks each row delivered or
+//! given up, and records the attempts and the next try of a failed one. Expiry has no request
+//! to hang on, so a watcher thread keeps the pending approvals by expiry time and, once one is
+//! due, reads it from the lease store and queues `approval.expired` if it is still pending.
+//!
+//! Restarts: on start the rows still open (queued, or in flight, when the last process
+//! stopped) are queued again first, oldest first, with their attempts so far; and every
+//! approval still pending in the store is watched again, so one that expired while the server
+//! was down gets its `approval.expired` at once. The notice id (`event_id`) is derived from the
+//! approval id and the type ([`event_id_for`]) and is unique in the table, so finding such an
+//! expiry a second time queues nothing. Rows delivered or given up are deleted
+//! `outbox_retention_seconds` later by the watcher; an approval that expired longer ago than
+//! that is not looked at on start, since its notice may already be gone from the table.
 //!
 //! Best effort: a notification can be late, dropped (counted in
-//! `attenuo_approval_notify_dropped_total`) or, after a retry whose answer was lost, delivered
-//! twice (the receiver deduplicates by `event_id`). Nothing here can change a decision, and a
-//! receiver that is down or slow never holds up a request.
+//! `attenuo_approval_notify_dropped_total`) or delivered twice: after a retry whose answer was
+//! lost, or when the process stopped between a delivery and the write marking it delivered.
+//! The receiver deduplicates by `event_id`. Nothing here can change a decision, and a receiver
+//! that is down or slow never holds up a request.
 //!
 //! The document carries no token and no arguments: only the call hash
 //! (`ToolCall::call_hash`, SHA-256 over server, tool and arguments) stands for the call. Each
@@ -28,7 +40,9 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
-use attenuo_audit::{Approval, ApprovalState, LeaseStore};
+use attenuo_audit::{
+    Approval, ApprovalState, LeaseStore, NewNotice, OutboxNotice, SqliteLeaseStore,
+};
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -36,7 +50,8 @@ use time::OffsetDateTime;
 use crate::config::{NotifySection, NOTIFY_SECRET_MIN_LEN};
 use crate::metrics::Metrics;
 use crate::sink::{
-    Backoff, Deliver, Queue, QueueHandle, QueueItem, QueueRole, SinkLimits, SinkStatus,
+    Backoff, Deliver, Queue, QueueHandle, QueueItem, QueueRole, Settle, Settled, SinkLimits,
+    SinkStatus,
 };
 
 /// The signature header: `t=<unix seconds>,v1=<hex HMAC-SHA-256 of "<t>.<body>">`.
@@ -52,6 +67,10 @@ pub const MAX_WATCHED: usize = 10_000;
 
 /// How long after `expires_at` the watcher looks, so the store agrees it has expired.
 const EXPIRY_GRACE: Duration = Duration::from_millis(250);
+
+/// How often the watcher deletes outbox rows settled more than `outbox_retention_seconds` ago.
+/// It also does so once at start.
+pub const OUTBOX_PRUNE_PERIOD: Duration = Duration::from_secs(3600);
 
 /// What happened to the approval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,35 +88,153 @@ impl NoticeKind {
             Self::Expired => "approval.expired",
         }
     }
+
+    /// The kind [`as_str`](Self::as_str) names.
+    pub fn parse(s: &str) -> Option<Self> {
+        [Self::Pending, Self::Decided, Self::Expired]
+            .into_iter()
+            .find(|k| k.as_str() == s)
+    }
 }
 
-/// One notification, its body fixed when it was queued.
+/// The `event_id` of the `kind` notice of approval `approval_id`: a UUID (version 8, RFC 9562)
+/// made of the first 16 bytes of SHA-256 over a label, the type and the approval id. An
+/// approval gets at most one notice of each type, so this names the notice, and it is the
+/// same on every attempt and after a restart.
+pub fn event_id_for(kind: NoticeKind, approval_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"attenuo approval notice\0");
+    h.update(kind.as_str().as_bytes());
+    h.update(b"\0");
+    h.update(approval_id.as_bytes());
+    let mut b = [0u8; 16];
+    b.copy_from_slice(&h.finalize()[..16]);
+    b[6] = (b[6] & 0x0f) | 0x80;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(b).to_string()
+}
+
+/// One notification, its body fixed when it was first queued.
 #[derive(Debug, Clone)]
 pub struct Notice {
     pub kind: NoticeKind,
     pub approval_id: String,
-    /// A UUID, the same on every attempt.
+    /// The same on every attempt and after a restart ([`event_id_for`]).
     pub event_id: String,
     /// The JSON document, exactly as sent and signed.
     pub body: Vec<u8>,
+    /// Its `notice_outbox` row; `None` when storing it failed (then it lives in memory only).
+    pub row: Option<i64>,
+    /// Failed attempts before it was queued (a row reloaded after a restart).
+    pub attempts: u32,
 }
 
 impl Notice {
     pub fn new(kind: NoticeKind, a: &Approval) -> Self {
-        let event_id = uuid::Uuid::new_v4().to_string();
+        let event_id = event_id_for(kind, &a.id);
         let body = serde_json::to_vec(&notice_json(kind, &event_id, a)).unwrap_or_default();
         Self {
             kind,
             approval_id: a.id.clone(),
             event_id,
             body,
+            row: None,
+            attempts: 0,
         }
+    }
+
+    /// A row of the outbox, as stored. `None` for a type this version does not know.
+    pub fn from_outbox(r: OutboxNotice) -> Option<Self> {
+        Some(Self {
+            kind: NoticeKind::parse(&r.kind)?,
+            approval_id: r.approval_id,
+            event_id: r.event_id,
+            body: r.body,
+            row: Some(r.id),
+            attempts: r.attempts,
+        })
     }
 }
 
 impl QueueItem for Notice {
     fn log_id(&self) -> String {
         format!("{} {}", self.kind.as_str(), self.approval_id)
+    }
+
+    fn attempts(&self) -> u32 {
+        self.attempts
+    }
+}
+
+/// The queue's [`Settle`] hook: keeps each notice's outbox row in step with its delivery. A
+/// write that fails is logged and leaves the row open, so it is delivered again after the
+/// next restart (the receiver deduplicates by `event_id`).
+#[derive(Debug)]
+pub struct OutboxSettle {
+    store: Arc<SqliteLeaseStore>,
+    metrics: Arc<Metrics>,
+}
+
+impl Settle<Notice> for OutboxSettle {
+    fn settled(&self, n: &Notice, how: Settled) {
+        let Some(row) = n.row else {
+            return;
+        };
+        let now = OffsetDateTime::now_utc();
+        let closed = match how {
+            Settled::Delivered => self.store.outbox_delivered(row, now),
+            Settled::GaveUp { attempts } => self.store.outbox_given_up(row, attempts, now),
+            Settled::Dropped => self.store.outbox_given_up(row, n.attempts, now),
+            Settled::Retry { attempts, wait } => self
+                .store
+                .outbox_retry(row, attempts, now + wait)
+                .map(|()| false),
+        };
+        match closed {
+            Ok(true) => self.metrics.approval_notify_outbox_closed(),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                notice = %n.log_id(),
+                error = %e,
+                "[approvals.notify] could not update the outbox row: it may be delivered again \
+                 after a restart"
+            ),
+        }
+    }
+}
+
+/// Stores a notice in the outbox, then queues it. Shared by the handle and the watcher.
+#[derive(Debug, Clone)]
+struct Emitter {
+    queue: QueueHandle<Notice>,
+    store: Arc<SqliteLeaseStore>,
+    metrics: Arc<Metrics>,
+}
+
+impl Emitter {
+    fn emit(&self, mut n: Notice) {
+        let new = NewNotice {
+            event_id: &n.event_id,
+            kind: n.kind.as_str(),
+            approval_id: &n.approval_id,
+            body: &n.body,
+        };
+        match self.store.outbox_insert(new, OffsetDateTime::now_utc()) {
+            Ok(Some(row)) => {
+                n.row = Some(row);
+                self.metrics.approval_notify_outbox_opened();
+            }
+            // Stored before (an expiry found again after a restart): queued then, or done.
+            Ok(None) => return,
+            Err(e) => tracing::warn!(
+                notice = %n.log_id(),
+                error = %e,
+                "[approvals.notify] could not store the notice in the outbox: queued in memory \
+                 only, so a restart before it is delivered loses it"
+            ),
+        }
+        self.queue.push(n);
     }
 }
 
@@ -314,31 +451,41 @@ impl Watch {
         self.wake.notify_all();
     }
 
-    /// Wait for the next due id; `None` once stopped.
-    fn next_due(&self) -> Option<String> {
+    /// Wait for the next due id, or until `until`.
+    fn next_due(&self, until: Instant) -> Next {
         let mut st = self.st.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if st.stop {
-                return None;
+                return Next::Stop;
             }
             let now = Instant::now();
-            match st.due.first().cloned() {
+            let wake_at = match st.due.first().cloned() {
                 Some((when, id)) if when <= now => {
                     st.due.remove(&(when, id.clone()));
                     st.at.remove(&id);
-                    return Some(id);
+                    return Next::Due(id);
                 }
-                Some((when, _)) => {
-                    st = self
-                        .wake
-                        .wait_timeout(st, when - now)
-                        .unwrap_or_else(|e| e.into_inner())
-                        .0;
-                }
-                None => st = self.wake.wait(st).unwrap_or_else(|e| e.into_inner()),
+                Some((when, _)) => when.min(until),
+                None => until,
+            };
+            if wake_at <= now {
+                return Next::Timeout;
             }
+            st = self
+                .wake
+                .wait_timeout(st, wake_at - now)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
     }
+}
+
+/// What [`Watch::next_due`] waited for.
+#[derive(Debug, PartialEq, Eq)]
+enum Next {
+    Due(String),
+    Timeout,
+    Stop,
 }
 
 /// When to look at an approval that expires at `expires_at`.
@@ -351,17 +498,17 @@ fn due_at(expires_at: OffsetDateTime) -> Instant {
 /// The producer end: what the pipeline and the approval routes call. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct NotifierHandle {
-    queue: QueueHandle<Notice>,
+    emit: Emitter,
     watch: Arc<Watch>,
-    metrics: Arc<Metrics>,
 }
 
 impl NotifierHandle {
-    /// `a` was just stored as pending: queue `approval.pending` and watch for its expiry.
+    /// `a` was just stored as pending: store and queue `approval.pending`, and watch for its
+    /// expiry. Writes one outbox row; never waits on the receiver.
     pub fn pending(&self, a: &Approval) {
-        self.queue.push(Notice::new(NoticeKind::Pending, a));
+        self.emit.emit(Notice::new(NoticeKind::Pending, a));
         if !self.watch.add(&a.id, due_at(a.expires_at)) {
-            self.metrics.approval_notify_dropped();
+            self.emit.metrics.approval_notify_dropped();
             tracing::warn!(
                 approval = %a.id,
                 max = MAX_WATCHED,
@@ -371,10 +518,10 @@ impl NotifierHandle {
         }
     }
 
-    /// `a` was just granted or declined: queue `approval.decided`.
+    /// `a` was just granted or declined: store and queue `approval.decided`.
     pub fn decided(&self, a: &Approval) {
         self.watch.remove(&a.id);
-        self.queue.push(Notice::new(NoticeKind::Decided, a));
+        self.emit.emit(Notice::new(NoticeKind::Decided, a));
     }
 }
 
@@ -382,9 +529,9 @@ impl NotifierHandle {
 #[derive(Debug)]
 pub struct ApprovalNotifier {
     queue: Queue<Notice>,
+    emit: Emitter,
     watch: Arc<Watch>,
     watcher: Mutex<Option<std::thread::JoinHandle<()>>>,
-    metrics: Arc<Metrics>,
 }
 
 impl ApprovalNotifier {
@@ -393,7 +540,7 @@ impl ApprovalNotifier {
     pub fn start(
         cfg: &NotifySection,
         metrics: Arc<Metrics>,
-        leases: Arc<dyn LeaseStore>,
+        leases: Arc<SqliteLeaseStore>,
     ) -> anyhow::Result<Self> {
         cfg.validate()?;
         let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
@@ -445,43 +592,63 @@ impl ApprovalNotifier {
                 max: Duration::from_secs(cfg.max_backoff_seconds),
             },
         };
-        let n = Self::with_deliver(Box::new(deliver), limits, cfg.max_attempts, metrics, leases)?;
+        let retention = Duration::from_secs(cfg.outbox_retention_seconds);
+        let n = Self::with_deliver(
+            Box::new(deliver),
+            limits,
+            cfg.max_attempts,
+            retention,
+            metrics,
+            leases,
+        )?;
         tracing::info!(host = %host, capacity = cfg.queue_capacity, "[approvals.notify] notifying a webhook of approvals");
         Ok(n)
     }
 
-    /// Start with any deliverer (tests).
+    /// Start with any deliverer (tests). Queues the outbox rows still open and watches the
+    /// approvals still pending (see the module docs), then returns.
     pub fn with_deliver(
         deliver: Box<dyn Deliver<Notice>>,
         limits: SinkLimits,
         max_attempts: u32,
+        outbox_retention: Duration,
         metrics: Arc<Metrics>,
-        leases: Arc<dyn LeaseStore>,
+        store: Arc<SqliteLeaseStore>,
     ) -> anyhow::Result<Self> {
-        let queue = Queue::start(
+        let settle = OutboxSettle {
+            store: store.clone(),
+            metrics: metrics.clone(),
+        };
+        let queue = Queue::start_with(
             deliver,
             limits,
             QueueRole::ApprovalNotices { max_attempts },
             metrics.clone(),
+            Some(Box::new(settle)),
         )?;
+        let emit = Emitter {
+            queue: queue.handle(),
+            store,
+            metrics,
+        };
         let watch = Arc::new(Watch::default());
-        let (w, q, m) = (watch.clone(), queue.handle(), metrics.clone());
+        recover(&emit, &watch, outbox_retention);
+        let (w, e) = (watch.clone(), emit.clone());
         let watcher = std::thread::Builder::new()
             .name("attenuo-approval-expiry".into())
-            .spawn(move || watch_expiry(&w, leases.as_ref(), &q, &m))?;
+            .spawn(move || watch_expiry(&w, &e, outbox_retention))?;
         Ok(Self {
             queue,
+            emit,
             watch,
             watcher: Mutex::new(Some(watcher)),
-            metrics,
         })
     }
 
     pub fn handle(&self) -> NotifierHandle {
         NotifierHandle {
-            queue: self.queue.handle(),
+            emit: self.emit.clone(),
             watch: self.watch.clone(),
-            metrics: self.metrics.clone(),
         }
     }
 
@@ -505,19 +672,83 @@ impl Drop for ApprovalNotifier {
     }
 }
 
+/// What a restart left: queue the outbox rows still open, oldest first, and watch every
+/// approval still pending whose expiry is within `retention` (the watcher queues
+/// `approval.expired` at once for one that expired while the server was down). Errors are
+/// logged: the notifier starts anyway.
+fn recover(emit: &Emitter, watch: &Watch, retention: Duration) {
+    let store = &emit.store;
+    match store.outbox_open(MAX_WATCHED) {
+        Ok(rows) => {
+            let n = rows.len();
+            for row in rows {
+                match Notice::from_outbox(row) {
+                    Some(notice) => emit.queue.push(notice),
+                    None => {
+                        tracing::warn!("[approvals.notify] outbox row of an unknown type: skipped")
+                    }
+                }
+            }
+            if n > 0 {
+                tracing::info!(
+                    notices = n,
+                    "[approvals.notify] delivering notices stored before the restart"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "[approvals.notify] could not read the outbox: notices stored before the restart are not delivered now")
+        }
+    }
+    match store.outbox_open_count() {
+        Ok(n) => emit.metrics.approval_notify_outbox_rows(n),
+        Err(e) => tracing::warn!(error = %e, "[approvals.notify] could not count the outbox"),
+    }
+    let oldest = OffsetDateTime::now_utc() - retention;
+    match store.pending_approvals(MAX_WATCHED) {
+        Ok(pending) => {
+            for a in pending.iter().filter(|a| a.expires_at > oldest) {
+                watch.add(&a.id, due_at(a.expires_at));
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "[approvals.notify] could not read the pending approvals: those waiting before the restart get no approval.expired notice")
+        }
+    }
+}
+
+/// Delete outbox rows settled longer than `retention` ago.
+fn prune_outbox(emit: &Emitter, retention: Duration) {
+    match emit
+        .store
+        .outbox_prune(OffsetDateTime::now_utc() - retention)
+    {
+        Ok(0) => {}
+        Ok(n) => tracing::debug!(rows = n, "[approvals.notify] pruned the outbox"),
+        Err(e) => tracing::warn!(error = %e, "[approvals.notify] pruning the outbox failed"),
+    }
+}
+
 /// The expiry watcher: queue `approval.expired` for each watched approval still pending once
-/// its expiry has passed.
-fn watch_expiry(
-    watch: &Watch,
-    leases: &dyn LeaseStore,
-    queue: &QueueHandle<Notice>,
-    metrics: &Metrics,
-) {
-    while let Some(id) = watch.next_due() {
+/// its expiry has passed, and prune the outbox every [`OUTBOX_PRUNE_PERIOD`].
+fn watch_expiry(watch: &Watch, emit: &Emitter, retention: Duration) {
+    let leases: &dyn LeaseStore = emit.store.as_ref();
+    let metrics = &emit.metrics;
+    let mut prune_at = Instant::now();
+    loop {
+        if Instant::now() >= prune_at {
+            prune_outbox(emit, retention);
+            prune_at = Instant::now() + OUTBOX_PRUNE_PERIOD;
+        }
+        let id = match watch.next_due(prune_at) {
+            Next::Due(id) => id,
+            Next::Timeout => continue,
+            Next::Stop => return,
+        };
         match leases.approval(&id) {
             Ok(Some(a)) if a.state == ApprovalState::Pending => {
                 if a.is_expired(OffsetDateTime::now_utc()) {
-                    queue.push(Notice::new(NoticeKind::Expired, &a));
+                    emit.emit(Notice::new(NoticeKind::Expired, &a));
                 } else {
                     // The clocks disagree by a little: look again.
                     watch.add(
@@ -695,6 +926,28 @@ mod tests {
     }
 
     #[test]
+    fn event_id_is_a_stable_uuid_per_approval_and_type() {
+        let a = event_id_for(NoticeKind::Pending, "a1");
+        assert_eq!(a, event_id_for(NoticeKind::Pending, "a1"));
+        assert_ne!(a, event_id_for(NoticeKind::Expired, "a1"));
+        assert_ne!(a, event_id_for(NoticeKind::Pending, "a2"));
+        let u = uuid::Uuid::parse_str(&a).unwrap();
+        assert_eq!(u.get_version_num(), 8);
+        assert_eq!(u.get_variant(), uuid::Variant::RFC4122);
+        let n = Notice::new(NoticeKind::Pending, &approval(ApprovalState::Pending));
+        let body: Value = serde_json::from_slice(&n.body).unwrap();
+        assert_eq!(body["event_id"], n.event_id);
+        for k in [
+            NoticeKind::Pending,
+            NoticeKind::Decided,
+            NoticeKind::Expired,
+        ] {
+            assert_eq!(NoticeKind::parse(k.as_str()), Some(k));
+        }
+        assert_eq!(NoticeKind::parse("approval.other"), None);
+    }
+
+    #[test]
     fn webhook_debug_shows_the_host_only() {
         let w = WebhookNotify::new(
             "https://hooks.example/p/very-secret-path?key=k",
@@ -743,9 +996,11 @@ mod tests {
         assert!(w.add("a", now));
         assert!(w.add("c", now + Duration::from_millis(10)));
         w.remove("c");
-        assert_eq!(w.next_due().as_deref(), Some("a"));
-        assert_eq!(w.next_due().as_deref(), Some("b"));
+        let later = Instant::now() + Duration::from_secs(5);
+        assert_eq!(w.next_due(later), Next::Due("a".into()));
+        assert_eq!(w.next_due(later), Next::Due("b".into()));
+        assert_eq!(w.next_due(Instant::now()), Next::Timeout);
         w.stop();
-        assert_eq!(w.next_due(), None);
+        assert_eq!(w.next_due(later), Next::Stop);
     }
 }
