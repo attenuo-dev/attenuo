@@ -34,7 +34,8 @@ use crate::jsonrpc::{
     CODE_UPSTREAM,
 };
 use crate::label::{
-    label_stream, AwaitedResults, Labeller, PendingResult, ResultScope, LABELLED_METHODS,
+    label_stream, AwaitedResults, Labeller, ListAnswers, PendingResult, ResultScope,
+    LABELLED_METHODS,
 };
 use crate::listed::ListedTools;
 use crate::records::{Admission, RecordWindow};
@@ -864,7 +865,12 @@ async fn handle_passthrough(
                 let guard = state
                     .stream_guard(&who, &server, session_id.as_deref())
                     .listen(state.stream_end_records.clone());
-                let filter = listen_list_filter(&state, &chain, &server);
+                let filter = listen_list_filter(
+                    &state,
+                    &chain,
+                    &server,
+                    ResultScope::new(&server, session_id.as_deref(), &chain),
+                );
                 let screen = state.screen_lists.then(|| StreamScreen {
                     authorizer: state.authorizer.clone(),
                     chain: chain.clone(),
@@ -908,22 +914,31 @@ async fn handle_passthrough(
 /// resumes with `Last-Event-ID`, and may answer after a `202`. So every response on the stream
 /// whose `result` holds a list array ([`list_kinds_by_shape`]) is filtered for `chain`, the
 /// holder of the stream, through the same [`ListFilter`] as a `POST` answer, and its tools are
-/// recorded for SR-25 the same way ([`observe_listed`]).
+/// recorded for SR-25 the same way ([`observe_listed`]). A response that answers a list
+/// request remembered in `scope` strikes it (SR-87), so later `POST` bodies of the session
+/// stop being read for it.
 fn listen_list_filter(
     state: &AppState,
     chain: &DelegationChain,
     server: &str,
+    scope: ResultScope,
 ) -> impl FnMut(&mut Value) + Send + 'static {
     let caps = chain.effective_capabilities().cloned().unwrap_or_default();
     let server = server.to_owned();
     let listed = state.listed.clone();
     let authorizer = state.authorizer.clone();
+    let awaited = state.awaited.clone();
     move |body: &mut Value| {
         let messages: Vec<&mut Value> = match body {
             Value::Array(items) => items.iter_mut().collect(),
             other => vec![other],
         };
         for msg in messages {
+            if crate::jsonrpc::method_of(msg).is_none() {
+                if let Some(id) = msg.get("id") {
+                    awaited.take_list(&scope, id, Instant::now());
+                }
+            }
             let pending = list_kinds_by_shape(msg);
             if pending.is_empty() {
                 continue;
@@ -1199,12 +1214,18 @@ async fn handle_post_inner(
     }
     // The upstream may answer an allowed call on the `GET` listen stream instead (after a
     // `202`, or on a resumed stream), or in the body of a later `POST` of the session:
-    // remember it before the upstream can see it.
+    // remember it before the upstream can see it. List requests likewise (SR-87), so their
+    // answer is filtered in a later `POST`'s body too.
     let scope = ResultScope::new(server, session_id, chain);
     if !screened.results.is_empty() {
         state
             .awaited
             .remember(&scope, chain, &screened.results, Instant::now());
+    }
+    if !screened.list_requests.is_empty() {
+        state
+            .awaited
+            .remember_lists(&scope, &screened.list_requests, Instant::now());
     }
     let sent = Instant::now();
     let resp = match state
@@ -1222,7 +1243,16 @@ async fn handle_post_inner(
     timing.upstream = Some(headers_in - sent);
     timing.upstream_done = Some(headers_in);
 
-    let has_lists = !screened.list_requests.is_empty();
+    // The list answers this body may hold: those of its own list requests, and (SR-87) those
+    // of earlier list requests of its scope, which clients route by id like call answers.
+    // As for calls, only a `POST` that forwarded a request is read for them.
+    let forwards_request = screened.forward.iter().any(is_request);
+    let mut lists = ListAnswers::new(screened.list_requests.clone());
+    if forwards_request {
+        lists = lists.claiming(state.awaited.clone(), scope.clone());
+    }
+    let lists = Arc::new(lists);
+    let has_lists = lists.may_answer();
     // Clients route a response by its id, whatever body it comes in: an answer to an earlier
     // call of this session and run in this body is labelled too (SR-85), so a `POST` with no
     // allowed call of its own is still read while such calls are awaited. Clients do not read
@@ -1236,7 +1266,7 @@ async fn handle_post_inner(
             )
             .striking(state.awaited.clone(), scope),
         )
-    } else if screened.forward.iter().any(is_request) && state.awaited.any_in(&scope) {
+    } else if forwards_request && state.awaited.any_call_in(&scope) {
         Some(Labeller::listen(
             state.authorizer.clone(),
             state.awaited.clone(),
@@ -1262,6 +1292,7 @@ async fn handle_post_inner(
             chain,
             server,
             &screened,
+            &lists,
             labeller.as_ref(),
             is_batch,
         )
@@ -1273,12 +1304,17 @@ async fn handle_post_inner(
         let prelude = sse_prelude(&screened.replies);
         let guard = state.stream_guard(who, server, session_id);
         let filter = has_lists.then(|| {
-            let pending = screened.list_requests.clone();
+            let lists = lists.clone();
             let caps = chain.effective_capabilities().cloned().unwrap_or_default();
             let server = server.to_owned();
             let listed = state.listed.clone();
             let authorizer = state.authorizer.clone();
             move |msg: &mut Value| {
+                lists.claim(msg);
+                let pending = lists.pending();
+                if pending.is_empty() {
+                    return;
+                }
                 let filter = ListFilter::new(&pending, &caps, &server);
                 observe_listed(&filter, msg, &server, &listed, authorizer.as_ref());
                 let removed = filter.apply(msg);
@@ -1291,7 +1327,7 @@ async fn handle_post_inner(
             authorizer: state.authorizer.clone(),
             chain: chain.clone(),
             server: server.to_owned(),
-            answers: ToolsAnswers::Pending(Arc::new(screened.list_requests.clone())),
+            answers: ToolsAnswers::Pending(lists.clone()),
         });
         stream_response_sse(
             resp,
@@ -1366,11 +1402,17 @@ fn report_post_timing(state: &AppState, timing: &PostTiming, started: Instant) {
     }
     a.observe_stage(Stage::Total, total);
     tracing::debug!(
-        upstream_us = timing.upstream.map(|d| d.as_micros() as u64),
-        response_us = response.map(|d| d.as_micros() as u64),
-        total_us = total.as_micros() as u64,
+        upstream_us = timing.upstream.map(micros),
+        response_us = response.map(micros),
+        total_us = micros(total),
         "proxy stages"
     );
+}
+
+/// A duration in whole microseconds for a log field, saturating at `u64::MAX` (about 584,000
+/// years, so never reached in practice).
+fn micros(d: Duration) -> u64 {
+    u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
 }
 
 /// Classify one JSON-RPC message and route it. See the method table in the crate docs.
@@ -1663,12 +1705,14 @@ async fn lease_live(
 
 /// Read a JSON upstream response fully, filter list results and merge in the replies
 /// the proxy generated for a batch, then re-encode.
+#[allow(clippy::too_many_arguments)]
 async fn buffer_and_rewrite(
     state: &AppState,
     resp: reqwest::Response,
     chain: &DelegationChain,
     server: &str,
     screened: &Screened,
+    lists: &Arc<ListAnswers>,
     labeller: Option<&Labeller>,
     is_batch: bool,
 ) -> Response {
@@ -1694,8 +1738,9 @@ async fn buffer_and_rewrite(
             return build_response(status, &headers, Body::from(bytes));
         }
         Err(e) => {
-            if !screened.list_requests.is_empty() {
-                // A list result the proxy cannot parse is one it cannot filter.
+            if lists.may_answer() {
+                // A list result the proxy cannot parse is one it cannot filter (an answer to
+                // an earlier list request of the scope may be in it, SR-87).
                 tracing::error!(
                     error = ?e.to_string(),
                     "upstream answered a list request with invalid JSON"
@@ -1727,7 +1772,9 @@ async fn buffer_and_rewrite(
     // A chain with no hops has no capabilities: list nothing.
     let no_caps = CapabilitySet::new();
     let caps = chain.effective_capabilities().unwrap_or(&no_caps);
-    let filter = ListFilter::new(&screened.list_requests, caps, server);
+    lists.claim(&value);
+    let pending = lists.pending();
+    let filter = ListFilter::new(&pending, caps, server);
     observe_listed(
         &filter,
         &value,
@@ -1739,8 +1786,8 @@ async fn buffer_and_rewrite(
     if removed > 0 {
         tracing::debug!(removed, "filtered list result");
     }
-    if state.screen_lists && !screened.list_requests.is_empty() {
-        let answers = ToolsAnswers::Pending(Arc::new(screened.list_requests.clone()));
+    if state.screen_lists && !pending.is_empty() {
+        let answers = ToolsAnswers::Pending(lists.clone());
         let hidden = screen_body(
             state.authorizer.as_ref(),
             chain,

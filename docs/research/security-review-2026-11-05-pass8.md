@@ -27,15 +27,15 @@ Every finding fixed here has a regression test that fails on `bd4f8dd` and passe
 | Critical | 0 | 0 | 0 | 0 |
 | High | 0 | 0 | 0 | 0 |
 | Medium | 1 | 1 | 0 | 0 |
-| Low | 3 | 1 | 1 | 1 |
+| Low | 3 | 2 (SR-87 after the pass) | 0 | 1 |
 | Info | 1 | 1 | 0 | 0 |
-| **Total** | **5** | **3** | **1** | **1** |
+| **Total** | **5** | **4** | **0** | **1** |
 
 | ID | Severity | Component | Title | Status |
 |---|---|---|---|---|
 | SR-85 | Medium | proxy (`proxy.rs`, `label.rs`) | An answer to an earlier call in the body of a later `POST` reached the client unlabelled | Fixed |
 | SR-86 | Low | proxy (`label.rs` `AwaitedInner::evict_oldest`) | One run could push every other run's awaited calls out of the map | Fixed |
-| SR-87 | Low | proxy (`proxy.rs`, `filter.rs`) | A list answer to an earlier request, in the body of a later `POST`, is not filtered | Open |
+| SR-87 | Low | proxy (`proxy.rs`, `label.rs`, `screen.rs`) | A list answer to an earlier request, in the body of a later `POST`, was not filtered | Fixed (`fix/proxy-followups`) |
 | SR-88 | Info | server (`routes/token.rs` `form_to_json`) | A repeated form `scope` was taken last-wins instead of refused | Fixed |
 | SR-89 | Low | proxy (`label.rs` `AWAITED_RESULT_TTL`) | An answer later than ten minutes is relayed unlabelled, and the Python MCP SDK waits that long | Accepted |
 
@@ -63,11 +63,13 @@ SR-85 is the third route, after SR-69 (message shape) and SR-77 to SR-79 (SSE tr
 - **Evidence.** Unit test `label::tests::a_run_that_fills_the_map_evicts_its_own_calls_sr86`: a victim run remembers one call, another run fills the map over 41 sessions; with the old eviction the victim's call is gone (`the flooding run pushed out another run's call`).
 - **Fix.** When the map is full, the oldest call of the run holding the most calls is dropped, so a run that fills the map evicts its own calls first. The existing `awaited_calls_are_bounded` test (one run) is unchanged. What is left: an attacker with many runs (many root tokens) can still spread its entries so the victim's run is not the largest; each root token is an IdP sign-in or a root grant, which the operator controls.
 
-### SR-87: a list answer to an earlier request, in the body of a later `POST`, is not filtered (Low, open)
+### SR-87: a list answer to an earlier request, in the body of a later `POST`, was not filtered (Low, fixed)
 
-- **Component.** `attenuo-proxy` `proxy.rs` `buffer_and_rewrite` and the SSE filter of `handle_post_inner`; `filter.rs` `ListFilter`.
-- **Observation.** By reading, not run. The list filter of a `POST` answer only looks at the ids of that `POST`'s own list requests. A `tools/list` answered with `202`, and then answered in the body of a later `POST` (as in SR-85), reaches the client unfiltered and lists tools the token does not cover. The listen stream filters every list answer by shape (`list_kinds_by_shape`), so this is only the later-`POST` route. As with SR-80, the list filter is not an authorization boundary (every call is decided), so this shows the agent tools it cannot call.
-- **Fix sketch.** Remember list requests in `AwaitedResults` next to calls (kind instead of decision) and let a `POST` filter claim them like SR-85's labeller, or filter every response with an id that is not one of the `POST`'s own requests by shape, as the listen stream does. Either touches `label.rs`, `filter.rs` and `proxy.rs`, and the second parses every answer of a session; left for a separate change.
+- **Component.** `attenuo-proxy` `proxy.rs` `buffer_and_rewrite` and the SSE filter of `handle_post_inner`; `filter.rs` `ListFilter`; `screen.rs` `ToolsAnswers::Pending`.
+- **Observation.** Found by reading during the pass, reproduced after it. The list filter of a `POST` answer only looked at the ids of that `POST`'s own list requests. A `tools/list` answered with `202`, and then answered in the body of a later `POST` (as in SR-85), reached the client unfiltered and listed tools the token does not cover. The listen stream filters every list answer by shape (`list_kinds_by_shape`), so this was only the later-`POST` route. As with SR-80, the list filter is not an authorization boundary (every call is decided), so this showed the agent tools it cannot call.
+- **Evidence.** `crates/attenuo-proxy/tests/security_pass8_sr87.rs`: `a_list_answer_in_a_later_post_body_is_filtered_sr87` (a `tools/list` answered `202`, its answer in the JSON batch, the JSON message or the SSE answer to a later `ping`, with `list_filter` `capabilities` and `policy`; a tool outside the capabilities and one the screen hides) and `a_post_with_its_own_list_request_also_claims_an_earlier_one_sr87`. On `1c0ebdf` the client is listed `delete_repo` in all six cases of the first (and `read_secret` under `policy`), and the second fails the same way. `a_list_answer_is_claimed_only_in_its_own_run_and_upstream_sr87` checks that a later `POST` of another run, or to another upstream, does not take the entry.
+- **Fix.** The first sketch: before forwarding, each list request (id and `ListKind`) is remembered in `label::AwaitedResults` next to the awaited calls, under the same scope (upstream, `Mcp-Session-Id`, run), bounds, eviction and ten-minute expiry. A later `POST` that forwards a request claims the list requests its body answers (`label::ListAnswers`, ids matched with `same_id`), and its capability filter and list screen apply to them like to its own. An answer in the request's own body or on the listen stream strikes the entry. Calls and list requests are kept apart, so neither replaces nor claims the other, and a remembered list request does not make the listen stream parse its events for labelling. While a list request of its scope is awaited, a `POST` that forwards a request has its JSON answer buffered or its SSE events framed and filtered, and a body the proxy cannot read is answered `502`, as for its own list requests.
+- **What is left.** A claimed entry is gone, so a second answer to the same list request in yet another `POST` body is not filtered there (the same as a second answer to a call, which is not recorded). A list answer for another run's request in a `POST` body, or one after the ten minutes, claims nothing and is relayed as it is.
 
 ### SR-88: a repeated form `scope` was taken last-wins instead of refused (Info, fixed)
 
