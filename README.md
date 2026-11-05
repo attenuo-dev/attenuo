@@ -33,7 +33,9 @@ The first run compiles the workspace: about a minute and a half on a 4-core mach
 - Alice revokes the assistant's lease. `coder`'s next call, even the legitimate one, is `DENIED lease_revoked`.
 - The audit chain verifies (9 entries, one of them the `tool_result` record of the allowed read), and the fake GitHub server received exactly one call.
 
-A recorded run is in [transcript.md](examples/github-leak-demo/transcript.md), and the step table is in the [demo README](examples/github-leak-demo/README.md). The demo mints Alice's root token through a development-only endpoint. A real deployment mints it from an OIDC ID token, as shown in [getting started](docs/guides/getting-started.md) and [identity providers](docs/guides/identity-providers.md).
+![The GitHub leak demo in a terminal: the coder reads the public repository, is refused the private one and create_issue, and is cut off by the revocation](docs/demo/github-leak-demo.gif)
+
+A recorded run is in [transcript.md](examples/github-leak-demo/transcript.md) (the recording above is [docs/demo](docs/demo/README.md), paced for reading), and the step table is in the [demo README](examples/github-leak-demo/README.md). The demo mints Alice's root token through a development-only endpoint. A real deployment mints it from an OIDC ID token, as shown in [getting started](docs/guides/getting-started.md) and [identity providers](docs/guides/identity-providers.md).
 
 ## How it works
 

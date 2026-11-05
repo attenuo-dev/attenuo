@@ -9,6 +9,7 @@
   - [Integrating MCP clients](guides/integrating-mcp-clients.md)
   - [Binding tokens to keys](guides/binding-tokens-to-keys.md)
   - [Admin console](guides/admin-console.md)
+- [Demo recordings](demo/README.md)
 - [Codebase walkthrough](guide/codebase-walkthrough.md)
 
 # Concepts
