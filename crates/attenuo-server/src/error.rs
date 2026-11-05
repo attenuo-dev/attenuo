@@ -165,13 +165,67 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// The one mapping of a store refusal to an HTTP answer, so a route that uses `?` on a domain
+/// variant answers with its status rather than a 500.
+///
+/// | Variant | Status | `error` |
+/// |---|---|---|
+/// | `UnknownLease`, `UnknownApproval`, `UnknownCharge` | 404 | `not_found` |
+/// | `ApprovalNotPending` | 409 | `approval_not_pending` |
+/// | `ApprovalExpired` | 409 | `approval_expired` |
+/// | `LeaseRevoked` | 409 | `lease_revoked` |
+/// | `ChargeRefunded` | 409 | `already_refunded` |
+/// | storage, lock, encoding, `BindingConflict`, `NoCheckpointSigner`, `Export`, `Jwks` | 500 | `server_error`, no detail (SR-43) |
+///
+/// A route whose answer depends on more than the variant keeps its own arm before falling back
+/// to this: `POST /token/renew` refuses a revoked or unknown own lease as `invalid_grant` with
+/// an audited deny record, and `POST /admin/budgets/refund` reads the audit log to tell an
+/// unknown decision from a pruned charge (410 `charge_pruned`). `BindingConflict` is a 500
+/// because a lease is bound only once, at issuance, to a lease id the server just made: a
+/// conflict there is a server fault. `Export` and `Jwks` come from offline verification, which
+/// no route runs.
 impl From<attenuo_audit::AuditError> for ApiError {
     fn from(e: attenuo_audit::AuditError) -> Self {
+        use attenuo_audit::AuditError as E;
         match e {
-            attenuo_audit::AuditError::UnknownLease(id) => {
-                ApiError::not_found(format!("unknown lease `{id}`"))
+            E::UnknownLease(id) => ApiError::not_found(format!("unknown lease `{id}`")),
+            E::UnknownApproval(id) => ApiError::not_found(format!("unknown approval `{id}`")),
+            E::UnknownCharge(id) => {
+                ApiError::not_found(format!("no budget charge is recorded for decision `{id}`"))
             }
-            other => ApiError::internal(other),
+            E::ApprovalNotPending { state, .. } => ApiError::new(
+                StatusCode::CONFLICT,
+                "approval_not_pending",
+                format!("the approval is already {state}"),
+            ),
+            E::ApprovalExpired(_) => ApiError::new(
+                StatusCode::CONFLICT,
+                "approval_expired",
+                "the approval, or the lease it is bound to, has expired",
+            ),
+            // Only the approval routes reach this: renewal answers a revoked lease itself.
+            E::LeaseRevoked(_) => ApiError::new(
+                StatusCode::CONFLICT,
+                "lease_revoked",
+                "the lease the approval is bound to has been revoked",
+            ),
+            E::ChargeRefunded(id) => ApiError::new(
+                StatusCode::CONFLICT,
+                "already_refunded",
+                format!("the charge of decision `{id}` was already refunded"),
+            ),
+            // Listed one by one so that a new variant needs a decision here.
+            e @ (E::Sqlite(_)
+            | E::Serde(_)
+            | E::TimeFormat(_)
+            | E::TimeParse(_)
+            | E::Storage(_)
+            | E::Poisoned
+            | E::Corrupt { .. }
+            | E::Export(_)
+            | E::NoCheckpointSigner
+            | E::Jwks(_)
+            | E::BindingConflict(_)) => ApiError::internal(e),
         }
     }
 }
@@ -231,5 +285,141 @@ mod tests {
             !text.contains("/var/lib") && !text.contains("disk I/O"),
             "{text}"
         );
+    }
+
+    /// Every `AuditError` variant has one status, one `error` code and, for a 500, no detail
+    /// of its own (SR-43). The route tests pin the same answers end to end.
+    #[test]
+    fn every_audit_error_has_one_answer() {
+        use attenuo_audit::AuditError as E;
+        use StatusCode as S;
+        let parse = time::OffsetDateTime::parse(
+            "not a time",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap_err();
+        let serde = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let cases: Vec<(E, S, &str, Option<&str>)> = vec![
+            (
+                E::UnknownLease("l1".into()),
+                S::NOT_FOUND,
+                "not_found",
+                Some("unknown lease `l1`"),
+            ),
+            (
+                E::UnknownApproval("a1".into()),
+                S::NOT_FOUND,
+                "not_found",
+                Some("unknown approval `a1`"),
+            ),
+            (
+                E::UnknownCharge("d1".into()),
+                S::NOT_FOUND,
+                "not_found",
+                Some("no budget charge is recorded for decision `d1`"),
+            ),
+            (
+                E::ApprovalNotPending {
+                    id: "a1".into(),
+                    state: "granted",
+                },
+                S::CONFLICT,
+                "approval_not_pending",
+                Some("the approval is already granted"),
+            ),
+            (
+                E::ApprovalExpired("a1".into()),
+                S::CONFLICT,
+                "approval_expired",
+                Some("the approval, or the lease it is bound to, has expired"),
+            ),
+            (
+                E::LeaseRevoked("l1".into()),
+                S::CONFLICT,
+                "lease_revoked",
+                Some("the lease the approval is bound to has been revoked"),
+            ),
+            (
+                E::ChargeRefunded("d1".into()),
+                S::CONFLICT,
+                "already_refunded",
+                Some("the charge of decision `d1` was already refunded"),
+            ),
+            (
+                E::Sqlite(rusqlite::Error::QueryReturnedNoRows),
+                S::INTERNAL_SERVER_ERROR,
+                "server_error",
+                None,
+            ),
+            (
+                E::Serde(serde),
+                S::INTERNAL_SERVER_ERROR,
+                "server_error",
+                None,
+            ),
+            (
+                E::TimeFormat(time::error::Format::InvalidComponent("offset")),
+                S::INTERNAL_SERVER_ERROR,
+                "server_error",
+                None,
+            ),
+            (
+                E::TimeParse(parse),
+                S::INTERNAL_SERVER_ERROR,
+                "server_error",
+                None,
+            ),
+            (
+                E::Storage("/var/lib/attenuo/audit.db: disk I/O error".into()),
+                S::INTERNAL_SERVER_ERROR,
+                "server_error",
+                None,
+            ),
+            (E::Poisoned, S::INTERNAL_SERVER_ERROR, "server_error", None),
+            (
+                E::Corrupt {
+                    seq: 7,
+                    detail: "bad json".into(),
+                },
+                S::INTERNAL_SERVER_ERROR,
+                "server_error",
+                None,
+            ),
+            (
+                E::Export("line 3".into()),
+                S::INTERNAL_SERVER_ERROR,
+                "server_error",
+                None,
+            ),
+            (
+                E::NoCheckpointSigner,
+                S::INTERNAL_SERVER_ERROR,
+                "server_error",
+                None,
+            ),
+            (
+                E::Jwks("no keys".into()),
+                S::INTERNAL_SERVER_ERROR,
+                "server_error",
+                None,
+            ),
+            (
+                E::BindingConflict("l1".into()),
+                S::INTERNAL_SERVER_ERROR,
+                "server_error",
+                None,
+            ),
+        ];
+        // One case per variant (the `From` match lists them all, so a new one fails to compile
+        // there first).
+        assert_eq!(cases.len(), 18);
+        for (e, status, code, detail) in cases {
+            let name = format!("{e:?}");
+            let got = ApiError::from(e);
+            assert_eq!(got.status, status, "{name}");
+            assert_eq!(got.code, code, "{name}");
+            assert_eq!(got.detail, detail.unwrap_or(INTERNAL_DETAIL), "{name}");
+            assert_eq!(got.description, None, "{name}");
+        }
     }
 }
