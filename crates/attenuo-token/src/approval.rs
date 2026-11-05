@@ -38,17 +38,23 @@ pub const APPROVAL_TOKEN_TYPE: &str = "attenuo-approval+jwt";
 /// The claims of an approval token (see the module docs).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalClaims {
+    /// The issuer that signed the approval.
     pub iss: String,
+    /// The audience the approval is for.
     pub aud: String,
     /// The approver's subject.
     pub sub: String,
     /// `user` or `operator`.
     pub by: String,
+    /// The delegation run the approval is for (its chain id).
     pub chain_id: String,
+    /// The lease of the hop whose call was approved.
     pub lease: String,
     /// The call hash the approval is bound to.
     pub ch: String,
+    /// When the approval was granted, Unix seconds.
     pub iat: i64,
+    /// Expires at, Unix seconds.
     pub exp: i64,
     /// The approval id.
     pub jti: String,
@@ -61,13 +67,21 @@ pub struct ApprovalClaims {
 /// issuer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalGrant<'a> {
+    /// The approval id (`jti`).
     pub approval_id: &'a str,
+    /// The approver's subject (`sub`).
     pub approver: &'a str,
+    /// `user` or `operator` (`by`).
     pub by: &'a str,
+    /// The delegation run (`chain_id`).
     pub chain_id: &'a str,
+    /// The calling hop's lease (`lease`).
     pub lease: &'a str,
+    /// The call hash (`ch`).
     pub call_hash: &'a str,
+    /// When the approval was granted (`iat`).
     pub granted_at: OffsetDateTime,
+    /// When the approval expires (`exp`).
     pub expires_at: OffsetDateTime,
     /// `cnf.jkt` of the calling hop's token, if it is bound.
     pub jkt: Option<&'a str>,
@@ -76,12 +90,16 @@ pub struct ApprovalGrant<'a> {
 /// Which binding claim of an approval token did not match the call it was presented with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ApprovalMismatch {
+    /// `chain_id` names another delegation run.
     #[error("the approval token is for another delegation run (`chain_id`)")]
     ChainId,
+    /// `lease` names another hop.
     #[error("the approval token is for another hop (`lease`)")]
     Lease,
+    /// `ch` is the hash of another call.
     #[error("the approval token is for another call (`ch`)")]
     CallHash,
+    /// `cnf.jkt` does not match the calling hop's key binding.
     #[error(
         "the approval token is bound to another key, or the call's binding differs (`cnf.jkt`)"
     )]
