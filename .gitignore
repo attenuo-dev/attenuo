@@ -24,3 +24,6 @@ __pycache__/
 # Packed SDK tarballs (npm pack) and the Python build output of docs/release/0.1.0.md.
 *.tgz
 dist-py/
+
+# Owner-facing reading guides exported from the project workspace; never part of the repository.
+docs/guide/flight-guide-*
