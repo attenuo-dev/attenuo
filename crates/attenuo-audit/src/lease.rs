@@ -1128,10 +1128,10 @@ struct Budgets {
 
 impl Budgets {
     fn keys(&mut self, charges: &[Charge]) -> Result<Vec<CounterKey>, AuditError> {
-        if self.key.is_none() {
-            self.key = Some(ValueKey::random()?);
-        }
-        let key = self.key.as_ref().expect("set above");
+        let key = match &mut self.key {
+            Some(key) => key,
+            slot => slot.insert(ValueKey::random()?),
+        };
         charges.iter().map(|c| key.counter(c)).collect()
     }
 }
@@ -1146,10 +1146,10 @@ struct Spans {
 
 impl Spans {
     fn key(&mut self) -> Result<SpanKey, AuditError> {
-        if self.key.is_none() {
-            self.key = Some(SpanKey::random()?);
+        match &self.key {
+            Some(key) => Ok(key.clone()),
+            None => Ok(self.key.insert(SpanKey::random()?).clone()),
         }
-        Ok(self.key.clone().expect("set above"))
     }
 }
 
