@@ -131,17 +131,26 @@ struct Harness {
     state: Arc<AppState>,
     _upstream_task: Spawned,
     client: reqwest::Client,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
 }
 
 impl Harness {
     /// A server notifying `url`, with the secret in the environment variable `secret_env`
     /// (one per test, so tests running in parallel do not share one).
     async fn start(url: &str, secret_env: &str, tweak: impl FnOnce(&mut Config)) -> Self {
+        Self::start_in(tempfile::tempdir().unwrap(), url, secret_env, tweak).await
+    }
+
+    /// [`start`](Self::start) on the database in `dir`, as a restarted server would.
+    async fn start_in(
+        dir: tempfile::TempDir,
+        url: &str,
+        secret_env: &str,
+        tweak: impl FnOnce(&mut Config),
+    ) -> Self {
         std::env::set_var(secret_env, SECRET);
         let upstream = FakeMcpServer::new(&["read_web", "delete_repo"]);
         let upstream_task = upstream.spawn().await.unwrap();
-        let dir = tempfile::tempdir().unwrap();
         let policy_path = dir.path().join("policies.cedar");
         std::fs::write(&policy_path, POLICY).unwrap();
         let mut cfg = Config::default();
@@ -173,8 +182,32 @@ impl Harness {
             state,
             _upstream_task: upstream_task,
             client: reqwest::Client::new(),
-            _dir: dir,
+            dir,
         }
+    }
+
+    /// Stop the way `serve` does after a signal, with no grace for the notifier: what was
+    /// not delivered stays in the outbox. Returns the directory holding the database.
+    async fn stop(self) -> tempfile::TempDir {
+        let Self {
+            server,
+            state,
+            _upstream_task,
+            dir,
+            ..
+        } = self;
+        drop(server);
+        let s = state.clone();
+        tokio::task::spawn_blocking(move || {
+            s.approval_notifier
+                .as_ref()
+                .unwrap()
+                .shutdown(Duration::ZERO)
+        })
+        .await
+        .unwrap();
+        drop(state);
+        dir
     }
 
     async fn root(&self) -> String {
@@ -477,4 +510,109 @@ fn startup_fails_without_the_signing_secret_and_names_only_the_variable() {
         .expect("refused")
         .to_string();
     assert!(err.contains("ATTENUO_TEST_NOTIFY_AUTH_UNSET"), "{err}");
+}
+
+/// Settings for a server whose receiver never answers: short timeouts, many attempts.
+fn hanging(c: &mut Config) {
+    let n = c.approvals.notify.as_mut().unwrap();
+    n.timeout_seconds = 1;
+    n.max_attempts = 100;
+}
+
+/// Wait until the outbox has no open row.
+async fn outbox_drains(h: &Harness) {
+    let end = Instant::now() + Duration::from_secs(10);
+    while !h.state.leases.outbox_open(10).unwrap().is_empty() {
+        assert!(Instant::now() < end, "outbox rows still open");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A notice queued for a receiver that never answered is in the outbox when the server stops,
+/// and a server started on the same database delivers it, once, signed, with the same id.
+#[tokio::test]
+async fn a_notice_queued_at_shutdown_is_delivered_after_a_restart() {
+    const ENV: &str = "ATTENUO_TEST_NOTIFY_SECRET_5";
+    let (url, _dead) = dead_receiver().await;
+    let h = Harness::start(&url, ENV, hanging).await;
+    let token = h.root().await;
+    let id = h.gated(&token, "alice/site").await;
+    let open = h.state.leases.outbox_open(10).unwrap();
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].approval_id, id);
+    assert_eq!(open[0].kind, "approval.pending");
+    let dir = h.stop().await;
+
+    let (r, hook) = receiver(0).await;
+    let h = Harness::start_in(dir, &hook.url("/hook"), ENV, |_| {}).await;
+    let pending = r.wait_for("approval.pending").await;
+    assert_eq!(pending["approval_id"], id);
+    let event_id =
+        attenuo_server::notify::event_id_for(attenuo_server::notify::NoticeKind::Pending, &id);
+    assert_eq!(pending["event_id"], event_id);
+    outbox_drains(&h).await;
+    assert_eq!(
+        h.metric_reaches("attenuo_approval_notify_delivered_total", 1)
+            .await,
+        1
+    );
+    // Nothing else arrives: the delivered row is not sent again.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let got = r.got.lock().unwrap().clone();
+    assert_eq!(got.len(), 1, "delivered once");
+    let (headers, body) = &got[0];
+    assert_signed(headers, body);
+    assert_eq!(headers["x-attenuo-event-id"].to_str().unwrap(), event_id);
+    assert_eq!(h.metric("attenuo_approval_notify_outbox_rows"), 0);
+}
+
+/// An approval pending when the server stopped and expired while it was down gets its
+/// `approval.expired` notice on start, after the pending one still in the outbox; a second
+/// restart sends neither again.
+#[tokio::test]
+async fn an_approval_that_expired_while_down_gets_its_notice_on_start_once() {
+    const ENV: &str = "ATTENUO_TEST_NOTIFY_SECRET_6";
+    let (url, _dead) = dead_receiver().await;
+    let h = Harness::start(&url, ENV, |c| {
+        c.approvals.ttl_seconds = 1;
+        hanging(c);
+    })
+    .await;
+    let token = h.root().await;
+    let id = h.gated(&token, "alice/site").await;
+    let expires_at = h.state.leases.approval(&id).unwrap().unwrap().expires_at;
+    let dir = h.stop().await;
+    // Down until after the expiry.
+    let left = expires_at - time::OffsetDateTime::now_utc();
+    if let Ok(left) = Duration::try_from(left) {
+        tokio::time::sleep(left + Duration::from_millis(100)).await;
+    }
+
+    let (r, hook) = receiver(0).await;
+    let h = Harness::start_in(dir, &hook.url("/hook"), ENV, |_| {}).await;
+    let expired = r.wait_for("approval.expired").await;
+    assert_eq!(expired["approval_id"], id);
+    outbox_drains(&h).await;
+    let types: Vec<String> = r
+        .delivered()
+        .iter()
+        .map(|v| {
+            assert_eq!(v["approval_id"], id.as_str());
+            v["type"].as_str().unwrap().to_string()
+        })
+        .collect();
+    assert_eq!(types, ["approval.pending", "approval.expired"]);
+    for (headers, body) in r.got.lock().unwrap().iter() {
+        assert_signed(headers, body);
+    }
+    let dir = h.stop().await;
+
+    let (r2, hook2) = receiver(0).await;
+    let h = Harness::start_in(dir, &hook2.url("/hook"), ENV, |_| {}).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(
+        r2.got.lock().unwrap().is_empty(),
+        "nothing is sent again after a second restart"
+    );
+    assert_eq!(h.metric("attenuo_approval_notify_outbox_rows"), 0);
 }
