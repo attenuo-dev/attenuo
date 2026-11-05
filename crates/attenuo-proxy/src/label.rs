@@ -28,6 +28,16 @@
 //! response on the listen stream that claims no entry (an unknown id, one already answered on
 //! the `POST`, or one that expired or was evicted) and every notification or server request
 //! passes through unchanged.
+//!
+//! List requests (`tools/list` and the other three list methods) are remembered in the same
+//! map, under the same scope, bounds and expiry, with their [`ListKind`] instead of a decision
+//! (SR-87): an upstream that answers one with `202` and puts the answer in the body of a later
+//! `POST` gets it filtered there, through [`ListAnswers`], like an answer in its own body.
+//! Calls and list requests are kept apart, so neither replaces nor claims the other. An answer
+//! on the listen stream or in the request's own body strikes the entry. A list answer that
+//! claims nothing in a `POST` body (another run's, an expired one, or a second answer to an id
+//! already claimed) is not filtered there; the listen stream filters every list answer by
+//! shape.
 
 use std::collections::HashMap;
 use std::io;
@@ -42,7 +52,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::auth::{Authorizer, REASON_LABEL_ERROR};
-use crate::filter::same_id;
+use crate::filter::{same_id, ListKind};
 use crate::jsonrpc::{self, denied_response, id_of};
 
 /// The methods whose responses are labelled.
@@ -96,9 +106,32 @@ impl ResultScope {
     }
 }
 
+/// What an [`Awaited`] entry waits for an answer to.
+enum Waiting {
+    /// An allowed call, labelled with its own chain and decision when answered.
+    Call {
+        pending: PendingResult,
+        chain: Arc<DelegationChain>,
+    },
+    /// A list request (SR-87): its answer is filtered for whoever's body it arrives in.
+    List { id: Value, kind: ListKind },
+}
+
+impl Waiting {
+    fn id(&self) -> &Value {
+        match self {
+            Waiting::Call { pending, .. } => &pending.id,
+            Waiting::List { id, .. } => id,
+        }
+    }
+
+    fn is_call(&self) -> bool {
+        matches!(self, Waiting::Call { .. })
+    }
+}
+
 struct Awaited {
-    pending: PendingResult,
-    chain: Arc<DelegationChain>,
+    what: Waiting,
     expires: Instant,
     /// Insertion order, for evicting the oldest when the map is full.
     seq: u64,
@@ -156,16 +189,67 @@ impl AwaitedInner {
         Some(removed)
     }
 
-    fn position(&self, scope: &ResultScope, id: &Value, now: Instant) -> Option<usize> {
+    /// The unexpired call (`call`) or list request (not `call`) in `scope` that `id`
+    /// answers. Calls and list requests are kept apart, so a list request never replaces or
+    /// claims a call with the same id, nor the other way round.
+    fn position(&self, scope: &ResultScope, id: &Value, call: bool, now: Instant) -> Option<usize> {
         self.scopes
             .get(scope)?
             .iter()
-            .position(|a| a.expires > now && same_id(&a.pending.id, id))
+            .position(|a| a.expires > now && a.what.is_call() == call && same_id(a.what.id(), id))
+    }
+
+    /// Remember `what` in `scope`, replacing an entry of the same kind and id, within the
+    /// bounds of the module docs.
+    fn insert(&mut self, scope: &ResultScope, what: Waiting, now: Instant) {
+        if let Some(i) = self.position(scope, what.id(), what.is_call(), now) {
+            self.remove_at(scope, i);
+        }
+        if let Some(v) = self.scopes.get_mut(scope) {
+            let before = v.len();
+            v.retain(|a| a.expires > now);
+            let dropped = before - v.len();
+            let emptied = v.is_empty();
+            self.len -= dropped;
+            if emptied {
+                self.scopes.remove(scope);
+            }
+        }
+        if self
+            .scopes
+            .get(scope)
+            .is_some_and(|v| v.len() >= MAX_AWAITED_RESULTS_PER_SESSION)
+        {
+            self.remove_at(scope, 0);
+        }
+        if self.len >= MAX_AWAITED_RESULTS {
+            self.drop_expired(now);
+            if self.len >= MAX_AWAITED_RESULTS {
+                tracing::warn!("awaited results full; forgetting the oldest entry");
+                self.evict_oldest();
+            }
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.scopes.entry(scope.clone()).or_default().push(Awaited {
+            what,
+            expires: now + AWAITED_RESULT_TTL,
+            seq,
+        });
+        self.len += 1;
+    }
+
+    /// Is an unexpired entry of this kind remembered in `scope`?
+    fn any(&self, scope: &ResultScope, call: bool, now: Instant) -> bool {
+        self.scopes.get(scope).is_some_and(|v| {
+            v.iter()
+                .any(|a| a.expires > now && a.what.is_call() == call)
+        })
     }
 }
 
-/// Allowed calls whose answers may still arrive on the `GET` listen stream. Bounded and
-/// expiring; see the module docs.
+/// Allowed calls and list requests whose answers may still arrive on the `GET` listen stream
+/// or in a later `POST` body. Bounded and expiring; see the module docs.
 #[derive(Default)]
 pub(crate) struct AwaitedResults {
     inner: Mutex<AwaitedInner>,
@@ -193,43 +277,51 @@ impl AwaitedResults {
         let chain = Arc::new(chain.clone());
         let mut inner = self.lock();
         for call in calls {
-            if let Some(i) = inner.position(scope, &call.id, now) {
-                inner.remove_at(scope, i);
-            }
-            if let Some(v) = inner.scopes.get_mut(scope) {
-                let before = v.len();
-                v.retain(|a| a.expires > now);
-                let dropped = before - v.len();
-                inner.len -= dropped;
-            }
-            if inner
-                .scopes
-                .get(scope)
-                .is_some_and(|v| v.len() >= MAX_AWAITED_RESULTS_PER_SESSION)
-            {
-                inner.remove_at(scope, 0);
-            }
-            if inner.len >= MAX_AWAITED_RESULTS {
-                inner.drop_expired(now);
-                if inner.len >= MAX_AWAITED_RESULTS {
-                    tracing::warn!("awaited results full; forgetting the oldest call");
-                    inner.evict_oldest();
-                }
-            }
-            let seq = inner.next_seq;
-            inner.next_seq += 1;
-            inner
-                .scopes
-                .entry(scope.clone())
-                .or_default()
-                .push(Awaited {
-                    pending: call.clone(),
-                    chain: chain.clone(),
-                    expires: now + AWAITED_RESULT_TTL,
-                    seq,
-                });
-            inner.len += 1;
+            let what = Waiting::Call {
+                pending: call.clone(),
+                chain: chain.clone(),
+            };
+            inner.insert(scope, what, now);
         }
+    }
+
+    /// Remember the list requests `lists` (id and kind) in `scope`, until answered or
+    /// [`AWAITED_RESULT_TTL`], under the same bounds as calls (SR-87). A list request with the
+    /// id of one already remembered in the scope replaces it.
+    pub(crate) fn remember_lists(
+        &self,
+        scope: &ResultScope,
+        lists: &[(Value, ListKind)],
+        now: Instant,
+    ) {
+        let mut inner = self.lock();
+        for (id, kind) in lists {
+            let what = Waiting::List {
+                id: id.clone(),
+                kind: *kind,
+            };
+            inner.insert(scope, what, now);
+        }
+    }
+
+    /// Remove and return the unexpired list request in `scope` that `id` answers.
+    pub(crate) fn take_list(
+        &self,
+        scope: &ResultScope,
+        id: &Value,
+        now: Instant,
+    ) -> Option<(Value, ListKind)> {
+        let mut inner = self.lock();
+        let i = inner.position(scope, id, false, now)?;
+        match inner.remove_at(scope, i)?.what {
+            Waiting::List { id, kind } => Some((id, kind)),
+            Waiting::Call { .. } => None,
+        }
+    }
+
+    /// Is an unexpired list request remembered in `scope`?
+    pub(crate) fn any_list_in(&self, scope: &ResultScope) -> bool {
+        self.lock().any(scope, false, Instant::now())
     }
 
     /// Remove and return the unexpired call in `scope` that `id` answers.
@@ -240,24 +332,111 @@ impl AwaitedResults {
         now: Instant,
     ) -> Option<(PendingResult, Arc<DelegationChain>)> {
         let mut inner = self.lock();
-        let i = inner.position(scope, id, now)?;
-        inner.remove_at(scope, i).map(|a| (a.pending, a.chain))
+        let i = inner.position(scope, id, true, now)?;
+        match inner.remove_at(scope, i)?.what {
+            Waiting::Call { pending, chain } => Some((pending, chain)),
+            Waiting::List { .. } => None,
+        }
     }
 
     /// Is an unexpired call with this `id` remembered in `scope`?
     pub(crate) fn awaits(&self, scope: &ResultScope, id: &Value, now: Instant) -> bool {
-        self.lock().position(scope, id, now).is_some()
+        self.lock().position(scope, id, true, now).is_some()
     }
 
-    /// Is anything remembered in `scope`? Lets the listen stream skip parsing events.
-    pub(crate) fn any_in(&self, scope: &ResultScope) -> bool {
-        self.lock().scopes.contains_key(scope)
+    /// Is an unexpired call remembered in `scope`? Lets the listen stream skip parsing events.
+    pub(crate) fn any_call_in(&self, scope: &ResultScope) -> bool {
+        self.lock().any(scope, true, Instant::now())
     }
 
     /// How many calls are remembered, expired ones included until they are dropped.
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.lock().len
+    }
+}
+
+/// The list requests whose answers the list filter and list screen of one `POST` body apply
+/// to: the `POST`'s own, and those of earlier requests of its scope that the body answers
+/// (SR-87). An upstream may answer a `tools/list` with `202` and put the answer in the body of
+/// a later `POST`; clients route it by id, so it is filtered there as the answer to that list
+/// request. Ids match as in the list filter ([`same_id`]).
+pub(crate) struct ListAnswers {
+    own: Vec<(Value, ListKind)>,
+    awaited: Option<(Arc<AwaitedResults>, ResultScope)>,
+    /// Earlier list requests this body answered, taken from `awaited`.
+    claimed: Mutex<Vec<(Value, ListKind)>>,
+}
+
+impl ListAnswers {
+    /// The list requests of one `POST`.
+    pub(crate) fn new(own: Vec<(Value, ListKind)>) -> Self {
+        Self {
+            own,
+            awaited: None,
+            claimed: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Also claim the list requests remembered in `scope`, and strike the `POST`'s own when
+    /// its body answers them.
+    pub(crate) fn claiming(mut self, awaited: Arc<AwaitedResults>, scope: ResultScope) -> Self {
+        self.awaited = Some((awaited, scope));
+        self
+    }
+
+    /// Could a body hold a list answer: the `POST` has list requests of its own, or earlier
+    /// ones of its scope are awaited?
+    pub(crate) fn may_answer(&self) -> bool {
+        !self.own.is_empty()
+            || self
+                .awaited
+                .as_ref()
+                .is_some_and(|(a, scope)| a.any_list_in(scope))
+    }
+
+    /// Take the remembered list requests that the responses in `body` (a message or a batch)
+    /// answer. An answer to one of the `POST`'s own strikes it; an answer to an earlier one
+    /// claims it, so it is filtered here and is not awaited any more. Call it on each body or
+    /// event before [`pending`](Self::pending).
+    pub(crate) fn claim(&self, body: &Value) {
+        let Some((awaited, scope)) = &self.awaited else {
+            return;
+        };
+        let messages: Vec<&Value> = match body {
+            Value::Array(items) => items.iter().collect(),
+            other => vec![other],
+        };
+        let now = Instant::now();
+        for msg in messages {
+            if jsonrpc::method_of(msg).is_some() {
+                continue;
+            }
+            let Some(id) = msg.get("id") else { continue };
+            let Some(taken) = awaited.take_list(scope, id, now) else {
+                continue;
+            };
+            if !self.own.iter().any(|(own, _)| same_id(own, id)) {
+                self.lock_claimed().push(taken);
+            }
+        }
+    }
+
+    /// The list requests to filter for: the `POST`'s own and those claimed so far.
+    pub(crate) fn pending(&self) -> Vec<(Value, ListKind)> {
+        let mut all = self.own.clone();
+        all.extend(self.lock_claimed().iter().cloned());
+        all
+    }
+
+    /// Does a response with `id` answer a `tools/list` of [`pending`](Self::pending)?
+    pub(crate) fn answers_tools(&self, id: &Value) -> bool {
+        let is = |(pid, k): &(Value, ListKind)| *k == ListKind::Tools && same_id(pid, id);
+        self.own.iter().any(is) || self.lock_claimed().iter().any(is)
+    }
+
+    fn lock_claimed(&self) -> std::sync::MutexGuard<'_, Vec<(Value, ListKind)>> {
+        self.claimed.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -393,7 +572,7 @@ impl Labeller {
     fn may_answer(&self) -> bool {
         match &self.calls {
             Calls::Request { .. } => true,
-            Calls::Listen { awaited, scope } => awaited.any_in(scope),
+            Calls::Listen { awaited, scope } => awaited.any_call_in(scope),
         }
     }
 
@@ -645,7 +824,7 @@ id: 4\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
         assert_eq!(awaited.len(), 1);
         let (got, _) = awaited.take(&scope, &json!("b"), now).unwrap();
         assert_eq!(got.decision_id, newer.decision_id);
-        assert!(!awaited.any_in(&scope));
+        assert!(!awaited.any_call_in(&scope));
         // Past the TTL it is gone.
         awaited.remember(&scope, &c, &[pending(json!(2))], now);
         let later = now + AWAITED_RESULT_TTL + Duration::from_secs(1);
@@ -679,7 +858,7 @@ id: 4\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
         }
         assert_eq!(awaited.len(), MAX_AWAITED_RESULTS);
         assert!(
-            !awaited.any_in(&scope),
+            !awaited.any_call_in(&scope),
             "the first session's calls were the oldest"
         );
     }
@@ -711,6 +890,64 @@ id: 4\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
         );
     }
 
+    #[test]
+    fn awaited_lists_are_kept_apart_from_calls_and_claimed_once_sr87() {
+        let awaited = Arc::new(AwaitedResults::new());
+        let c = chain();
+        let scope = ResultScope::new("s", Some("sess"), &c);
+        let other_run = ResultScope::new(
+            "s",
+            Some("sess"),
+            &test_chain("user:b", "agent:b", [Capability::new("s", "*")]),
+        );
+        let other_server = ResultScope::new("t", Some("sess"), &c);
+        let now = Instant::now();
+        // A call and a list request with the same id do not replace or claim each other.
+        awaited.remember(&scope, &c, &[pending(json!(1))], now);
+        awaited.remember_lists(&scope, &[(json!(1), ListKind::Tools)], now);
+        assert_eq!(awaited.len(), 2);
+        assert!(awaited.any_call_in(&scope) && awaited.any_list_in(&scope));
+        assert!(awaited.take_list(&other_run, &json!(1), now).is_none());
+        assert!(awaited.take_list(&other_server, &json!(1), now).is_none());
+        assert_eq!(
+            awaited.take_list(&scope, &json!(1.0), now),
+            Some((json!(1), ListKind::Tools))
+        );
+        assert!(awaited.take_list(&scope, &json!(1), now).is_none());
+        assert!(
+            awaited.take(&scope, &json!(1), now).is_some(),
+            "the call stayed"
+        );
+        // A list request alone does not make the listen stream parse for calls.
+        awaited.remember_lists(&scope, &[(json!(2), ListKind::Prompts)], now);
+        assert!(!awaited.any_call_in(&scope));
+        let later = now + AWAITED_RESULT_TTL + Duration::from_secs(1);
+        assert!(
+            awaited.take_list(&scope, &json!(2), later).is_none(),
+            "expired"
+        );
+        assert!(awaited.take_list(&scope, &json!(2), now).is_some());
+
+        // A POST's list answers: its own request is struck, an earlier one is claimed.
+        awaited.remember_lists(
+            &scope,
+            &[(json!(3), ListKind::Tools), (json!(4), ListKind::Tools)],
+            now,
+        );
+        let lists = ListAnswers::new(vec![(json!(4), ListKind::Tools)])
+            .claiming(awaited.clone(), scope.clone());
+        assert!(lists.may_answer());
+        assert!(!lists.answers_tools(&json!(3)));
+        lists.claim(&json!([
+            {"jsonrpc": "2.0", "id": 3, "result": {"tools": []}},
+            {"jsonrpc": "2.0", "id": 4, "result": {"tools": []}},
+            {"jsonrpc": "2.0", "id": 9, "method": "x", "result": {"tools": []}},
+        ]));
+        assert!(lists.answers_tools(&json!(3)) && lists.answers_tools(&json!(4)));
+        assert_eq!(lists.pending().len(), 2);
+        assert!(!awaited.any_list_in(&scope));
+    }
+
     #[tokio::test]
     async fn listen_stream_labels_claimed_answers_only() {
         let auth = Arc::new(StaticAuthorizer::new());
@@ -739,6 +976,6 @@ id: 4\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
             .striking(awaited.clone(), scope.clone());
         let mut msg = json!({"jsonrpc": "2.0", "id": 1, "result": {}});
         assert_eq!(post.label_value(&mut msg).await, 0);
-        assert!(!awaited.any_in(&scope));
+        assert!(!awaited.any_call_in(&scope));
     }
 }

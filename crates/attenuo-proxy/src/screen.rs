@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::auth::Authorizer;
-use crate::filter::{list_kinds_by_shape, same_id, ListKind};
+use crate::filter::{list_kinds_by_shape, ListKind};
+use crate::label::ListAnswers;
 
 /// `[proxy] list_filter`: how list answers are filtered.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,11 +36,12 @@ pub enum ListFilterMode {
     Policy,
 }
 
-/// Which messages of a body answer a `tools/list`: those answering a pending request of this
-/// HTTP request, or on the listen stream any response shaped like a tools list.
+/// Which messages of a body answer a `tools/list`: those answering a list request of this
+/// HTTP request or one of its scope that the body's list filter claimed (SR-87), or on the
+/// listen stream any response shaped like a tools list.
 #[derive(Clone)]
 pub(crate) enum ToolsAnswers {
-    Pending(Arc<Vec<(Value, ListKind)>>),
+    Pending(Arc<ListAnswers>),
     ByShape,
 }
 
@@ -49,11 +51,7 @@ impl ToolsAnswers {
             return false;
         }
         match self {
-            ToolsAnswers::Pending(pending) => msg.get("id").is_some_and(|id| {
-                pending
-                    .iter()
-                    .any(|(pid, k)| *k == ListKind::Tools && same_id(pid, id))
-            }),
+            ToolsAnswers::Pending(lists) => msg.get("id").is_some_and(|id| lists.answers_tools(id)),
             ToolsAnswers::ByShape => list_kinds_by_shape(msg)
                 .iter()
                 .any(|(_, k)| *k == ListKind::Tools),
@@ -226,10 +224,10 @@ mod tests {
 
     #[test]
     fn only_tools_answers_are_screened() {
-        let pending = ToolsAnswers::Pending(Arc::new(vec![
+        let pending = ToolsAnswers::Pending(Arc::new(ListAnswers::new(vec![
             (json!(1), ListKind::Tools),
             (json!(2), ListKind::Prompts),
-        ]));
+        ])));
         assert!(pending.answers_tools(&json!({"id": 1.0, "result": {"tools": []}})));
         assert!(!pending.answers_tools(&json!({"id": 2, "result": {"tools": []}})));
         assert!(!pending.answers_tools(&json!({"id": 1, "method": "x", "result": {"tools": []}})));
