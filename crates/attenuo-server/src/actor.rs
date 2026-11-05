@@ -124,7 +124,13 @@ impl From<ActorTokenError> for ApiError {
                     "the actor token issuer's keys cannot be fetched; try again later",
                 )
             }
-            _ => ApiError::bad_request("invalid_request", e.to_string()),
+            // The verifier's text names the expected audience, the issuer, the SPIFFE id and
+            // the signature library's complaint: log it at debug level and return only the
+            // stable sub-code, as `detail` and `error_description` (SR-17).
+            _ => {
+                tracing::debug!(reason = d, detail = ?e.to_string(), "actor token refused");
+                ApiError::bad_request("invalid_request", d)
+            }
         }
         .with_description(d)
     }

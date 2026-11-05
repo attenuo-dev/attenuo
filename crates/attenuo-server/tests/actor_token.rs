@@ -328,6 +328,59 @@ async fn spiffe_jwt_svid_authenticates_the_actor() {
     assert_eq!(status, StatusCode::OK, "{v}");
 }
 
+/// A refused actor token's body carries only the stable sub-code: the verifier's text, which
+/// names the expected audience, the issuer and the `kid`, stays in the server log (SR-17).
+#[tokio::test]
+async fn actor_token_refusals_do_not_echo_the_verifier() {
+    let h = Harness::start(|_| {}).await;
+    let root = h.root_token().await;
+    let assert_opaque = |v: &Value, want: &str, secrets: &[&str]| {
+        assert_eq!(code(v), ("invalid_request", want), "{v}");
+        assert_eq!(v["detail"], want, "{v}");
+        let text = v.to_string();
+        for s in secrets {
+            assert!(!text.contains(s), "body leaks {s:?}: {text}");
+        }
+    };
+
+    // A JWT-SVID for another audience.
+    let mut c = h.keys.svid_claims(CODER_ID);
+    c["aud"] = json!("https://elsewhere.example");
+    let (status, v) = h
+        .with_actor_token(&root, "coder", &h.keys.svid.sign(&c))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_opaque(
+        &v,
+        "actor_token_audience_mismatch",
+        &["elsewhere.example", ACTOR_AUD, TRUST_DOMAIN],
+    );
+
+    // A key the bundle does not hold.
+    let stranger =
+        Key::es256("never-published-kid", "jwt-svid").sign(&h.keys.svid_claims(CODER_ID));
+    let (status, v) = h.with_actor_token(&root, "coder", &stranger).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_opaque(
+        &v,
+        "actor_token_unknown_kid",
+        &["never-published-kid", ACTOR_AUD, TRUST_DOMAIN, "kid "],
+    );
+
+    // A workload token from an issuer that is not trusted.
+    let foreign = h.keys.workload.sign(&json!({
+        "iss": "https://evil.example", "sub": "wl:reviewer", "aud": ACTOR_AUD,
+        "exp": now() + 300, "iat": now(), "jti": uuid::Uuid::new_v4().to_string(),
+    }));
+    let (status, v) = h.with_actor_token(&root, "wl:reviewer", &foreign).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_opaque(
+        &v,
+        "actor_token_untrusted_issuer",
+        &["evil.example", ACTOR_AUD],
+    );
+}
+
 #[tokio::test]
 async fn bad_actor_tokens_are_refused_with_stable_codes() {
     let h = Harness::start(|_| {}).await;
