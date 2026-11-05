@@ -8,7 +8,7 @@ The plan has three steps:
 2. A free replay of each benchmark attack's own tool calls through attenuo, which needs no model.
 3. The full arms, once the pilot's cost per run is known.
 
-Steps 1 and 2 have run, and so have full Haiku baselines with two attacks and a first run of Haiku with attenuo in front of it: see [Attenuo with a real model](#attenuo-with-a-real-model-2026-11-05), [Stronger attack](#stronger-attack-2026-11-05), [Haiku baseline](#haiku-baseline-2026-11-05), [Pilot](#pilot-2026-11-05) and [Replay](#replay-2026-11-05). Facts about the benchmark come from `agentdojo` 0.1.35 as installed from PyPI, read locally, unless a line says otherwise. Costs in the estimate table are estimates.
+Steps 1 and 2 have run, and so have full Haiku baselines with two attacks, a four-model sample, runs of Haiku and Sonnet with attenuo in front of them, and a replay of argument-level taint: see [Four models on one sample](#four-models-on-one-sample-2026-11-05), [Attenuo with a real model](#attenuo-with-a-real-model-2026-11-05), [Stronger attack](#stronger-attack-2026-11-05), [Argument-level taint in the replay](#argument-level-taint-in-the-replay-2026-11-05), [Haiku baseline](#haiku-baseline-2026-11-05), [Pilot](#pilot-2026-11-05) and [Replay](#replay-2026-11-05). Facts about the benchmark come from `agentdojo` 0.1.35 as installed from PyPI, read locally, unless a line says otherwise. Costs in the estimate table are estimates.
 
 ## What the benchmark measures
 

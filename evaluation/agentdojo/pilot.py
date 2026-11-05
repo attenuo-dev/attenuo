@@ -107,7 +107,9 @@ class Meter:
             "cache_read_input_tokens": usage.cache_read_input_tokens,
             "cache_creation_input_tokens": usage.cache_creation_input_tokens,
             "stop_reason": completion.stop_reason,
-            "refusal_category": getattr(getattr(completion, "stop_details", None), "category", None),
+            "refusal_category": getattr(
+                getattr(completion, "stop_details", None), "category", None
+            ),
             "dollars": dollars,
         }
         with self.path.open("a", encoding="utf-8") as fh:
@@ -186,7 +188,9 @@ def is_injectable(attack, user_task) -> bool:
         return False
 
 
-def select_tasks(suite, pipeline, count: int, attack_name: str = ATTACK) -> tuple[list[str], list[str]]:
+def select_tasks(
+    suite, pipeline, count: int, attack_name: str = ATTACK
+) -> tuple[list[str], list[str]]:
     """The first `count` injectable user tasks in id order (0: all), and the ones not injectable."""
     attack = load_attack(attack_name, suite, pipeline)
     chosen, skipped = [], []
