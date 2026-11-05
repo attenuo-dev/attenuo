@@ -1421,7 +1421,7 @@ fn default_max_sessions_per_principal() -> usize {
 }
 
 fn default_stream_recheck_seconds() -> u64 {
-    2
+    attenuo_proxy::config::DEFAULT_STREAM_RECHECK.as_secs()
 }
 
 impl ProxySection {
