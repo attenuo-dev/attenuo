@@ -58,6 +58,7 @@ jobs:
     name: Python package (build and check)
     if: github.event_name == 'push' || inputs.package != 'typescript'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: sdk/python
@@ -106,6 +107,7 @@ jobs:
     needs: python
     if: github.event_name == 'workflow_dispatch' && inputs.dry_run == false && inputs.package != 'typescript'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment:
       name: pypi
       url: https://pypi.org/project/attenuo/
@@ -122,6 +124,7 @@ jobs:
     name: npm package (build, test and check)
     if: github.event_name == 'push' || inputs.package != 'python'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: sdk/typescript
@@ -157,6 +160,7 @@ jobs:
     needs: typescript
     if: github.event_name == 'workflow_dispatch' && inputs.dry_run == false && inputs.package != 'python'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment:
       name: npm
       url: https://www.npmjs.com/package/@attenuo/sdk
