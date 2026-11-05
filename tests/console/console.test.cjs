@@ -63,6 +63,47 @@ test('login screen, then log in with the admin token', async () => {
   assert.equal(await c.page.evaluate(() => location.hash), '#/audit');
 });
 
+test('the favicon link resolves to the embedded SVG and loads under the CSP', async () => {
+  const icon = await c.page.evaluate(async () => {
+    const link = document.querySelector('link[rel="icon"]');
+    if (!link) return null;
+    const resp = await fetch(link.href);
+    const text = await resp.text();
+    // As an image, so img-src 'self' is exercised the way a browser tab icon would be.
+    const img = new Image();
+    const loaded = await new Promise((resolve) => {
+      img.onload = () => resolve(true);
+      img.onerror = () => resolve(false);
+      img.src = link.href;
+    });
+    return {
+      attr: link.getAttribute('href'),
+      type: link.type,
+      path: new URL(link.href).pathname,
+      status: resp.status,
+      contentType: resp.headers.get('content-type'),
+      isSvg: text.startsWith('<svg'),
+      loaded,
+      width: img.naturalWidth,
+    };
+  });
+  assert.ok(icon, 'no <link rel="icon"> in the console page');
+  assert.deepEqual(icon, {
+    attr: 'favicon.svg',
+    type: 'image/svg+xml',
+    path: '/admin/ui/favicon.svg',
+    status: 200,
+    contentType: 'image/svg+xml',
+    isSvg: true,
+    loaded: true,
+    width: 64,
+  });
+  const root = await fetch(`${E.ui}/favicon.svg`);
+  assert.equal(root.status, 200);
+  assert.equal(root.headers.get('content-type'), 'image/svg+xml');
+  assert.deepEqual(await c.cspViolations(), [], 'the favicon caused a CSP violation');
+});
+
 test('audit explorer lists every entry', async () => {
   await c.go('#/audit');
   const head = (await admin('/admin/audit?order=desc&limit=1')).head;

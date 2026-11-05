@@ -11,6 +11,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 ### Added
 
 - Brand assets under `assets/brand/` (mark, favicon, README header, social preview) and a favicon for the docs site. The mark is the delegation chain: three squares narrowing left to right.
+- The admin console serves the brand favicon at `/favicon.svg` (and `/admin/ui/favicon.svg`) and links it from its page, with the same headers as its other files and no CSP change.
 
 ### Changed
 
