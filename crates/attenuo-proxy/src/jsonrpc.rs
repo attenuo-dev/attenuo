@@ -4,33 +4,12 @@
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-/// Standard JSON-RPC parse error.
-pub const CODE_PARSE_ERROR: i64 = -32700;
-/// Standard JSON-RPC invalid request.
-pub const CODE_INVALID_REQUEST: i64 = -32600;
-/// Standard JSON-RPC invalid params.
-pub const CODE_INVALID_PARAMS: i64 = -32602;
-/// attenuo: missing or invalid bearer token (sent with HTTP 401).
-pub const CODE_UNAUTHORIZED: i64 = -32001;
-/// attenuo: the call was denied by policy.
-pub const CODE_DENIED: i64 = -32003;
-/// attenuo: no upstream is configured under this name (sent with HTTP 404).
-pub const CODE_UNKNOWN_SERVER: i64 = -32004;
-/// attenuo: the upstream could not be reached, or answered with something the proxy will not
-/// relay (sent with HTTP 502).
-pub const CODE_UPSTREAM: i64 = -32005;
-/// attenuo: the proxy is out of a bounded resource, such as session slots (sent with HTTP
-/// 503).
-pub const CODE_UNAVAILABLE: i64 = -32006;
-/// attenuo: this principal holds too many of a bounded resource, such as session slots (sent
-/// with HTTP 429 and `Retry-After`; SR-49).
-pub const CODE_TOO_MANY: i64 = -32007;
-/// attenuo: the policy asks for an approval of this exact call before it may run
-/// (`@obligation("approval")`, ADR-0009). Sent inside a `200` JSON-RPC response, like a
-/// denial; `data` carries `reason: "approval_required"`, `decision_id`, `call_hash` and,
-/// when the approval was stored, `approval_id` and `expires_at` (RFC 3339). The code is not
-/// reserved anywhere (design open question 10).
-pub const CODE_APPROVAL_REQUIRED: i64 = -32008;
+// The error codes live in `attenuo-core` so the CLI reads the same values (debt item 6).
+pub use attenuo_core::jsonrpc::{
+    CODE_APPROVAL_REQUIRED, CODE_DENIED, CODE_INVALID_PARAMS, CODE_INVALID_REQUEST,
+    CODE_PARSE_ERROR, CODE_TOO_MANY, CODE_UNAUTHORIZED, CODE_UNAVAILABLE, CODE_UNKNOWN_SERVER,
+    CODE_UPSTREAM,
+};
 
 /// MCP method names the proxy understands.
 pub const METHOD_TOOLS_CALL: &str = "tools/call";
