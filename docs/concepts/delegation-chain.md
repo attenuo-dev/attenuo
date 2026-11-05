@@ -15,7 +15,7 @@ The chain is stored whole in the `chain` claim of the token. The standard `sub` 
 
 ## Where a chain starts
 
-Hop 0 starts at `POST /token`. An agent presents a credential for a user from an identity provider you trust: an OIDC ID token or an ID-JAG. attenuo verifies the signature and claims, then builds the originating user block from them. The agent must authenticate with its own client secret. The requested capabilities must fit inside the root grant you configured for that issuer and agent.
+Hop 0 starts at `POST /token`. An agent presents a credential for a user from an identity provider you trust: an OIDC ID token or an ID-JAG. attenuo verifies the signature and claims, then builds the originating user block from them. The agent must authenticate, with its own client secret or with an `actor_token` from a workload-identity issuer you trust (`[token] actor_auth`). The requested capabilities must fit inside the root grant you configured for that issuer and agent.
 
 For local trials only, a development endpoint can mint a root token for a user nobody verified. It is off by default.
 

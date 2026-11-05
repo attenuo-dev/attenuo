@@ -42,7 +42,7 @@ When a hop delegates to a child, the child's capabilities must be covered by the
 
 1. The parent's server and tool patterns must cover the child's. `*` covers anything. `read_*` covers `read_file` and `read_*`. An exact name covers only itself, never a glob.
 2. Every argument the parent constrains must also be constrained by the child. The child's test must be at least as strict. A child may add constraints the parent does not have.
-3. Every limit the parent has must also be on the child, with a maximum no larger. A child may add limits. At exchange the server fills in limits the child left out and lowers the child's figures to what the parent has left.
+3. Every limit the parent has must also be on the child, over the same argument (and `derive`), with a maximum no larger; a child `calls` limit no larger than a parent's `calls_per` or `distinct` maximum also satisfies it. A child may add limits. At exchange the server fills in limits the child left out and lowers the child's figures to what the parent has left.
 
 So `repo prefix acme/` can become `repo equals acme/api`, or `repo prefix acme/api`. It cannot become a prefix that is shorter, and it cannot drop the constraint.
 
