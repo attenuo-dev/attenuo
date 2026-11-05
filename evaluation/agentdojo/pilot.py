@@ -53,7 +53,12 @@ PRICES = {
     "claude-sonnet-5-5": (2.0, 10.0),
     "claude-opus-5-5": (4.0, 20.0),
     "claude-fable-5-1": (10.0, 50.0),
+    # What a refusal fallback can route to.
+    "claude-sonnet-5": (2.0, 10.0),
+    "claude-opus-5": (5.0, 25.0),
+    "claude-opus-4-8": (5.0, 25.0),
 }
+FALLBACK_BETA = "server-side-fallback-2026-07-01"
 RATE_LIMIT_RETRIES = 20
 RATE_LIMIT_WAIT_SECONDS = 30
 LONG_PROMPT = {"claude-haiku-5-5": (100_000, 0.50, 2.50)}
@@ -80,21 +85,32 @@ class Meter:
                     total += json.loads(line)["dollars"]
         return total
 
-    def cost(self, usage) -> float:
-        rate_in, rate_out = PRICES[self.model]
-        limit, long_in, long_out = LONG_PROMPT.get(self.model, (float("inf"), 0, 0))
-        if usage.input_tokens > limit:
-            rate_in, rate_out = long_in, long_out
-        cached = (usage.cache_read_input_tokens or 0) + (usage.cache_creation_input_tokens or 0)
-        if cached:
-            # The pilot sets no cache breakpoints, so this should never fire; a price we do not
-            # hold must not turn into a silently wrong total.
-            raise RuntimeError(f"unexpected cache tokens: {cached}")
-        return (usage.input_tokens * rate_in + usage.output_tokens * rate_out) / 1e6
+    def rates(self, model: str, input_tokens: int) -> tuple[float, float]:
+        if model not in PRICES:
+            raise RuntimeError(f"no price held for {model}")
+        limit, long_in, long_out = LONG_PROMPT.get(model, (float("inf"), 0, 0))
+        return (long_in, long_out) if input_tokens > limit else PRICES[model]
+
+    def cost(self, usage, model: str) -> float:
+        """With a fallback, `usage.iterations` lists each attempt and top-level usage covers only
+        the last. Declined attempts are counted, so a fallback run's cost is an upper bound. Any
+        cached tokens count at the input rate, also an upper bound; these runs set no breakpoints.
+        """
+        attempts = getattr(usage, "iterations", None) or [usage]
+        total = 0.0
+        for attempt in attempts:
+            cached = (attempt.cache_read_input_tokens or 0) + (
+                attempt.cache_creation_input_tokens or 0
+            )
+            tokens = attempt.input_tokens + cached
+            rate_in, rate_out = self.rates(getattr(attempt, "model", None) or model, tokens)
+            total += (tokens * rate_in + attempt.output_tokens * rate_out) / 1e6
+        return total
 
     def record(self, completion) -> None:
         usage = completion.usage
-        dollars = self.cost(usage)
+        dollars = self.cost(usage, completion.model)
+        attempts = getattr(usage, "iterations", None) or []
         self.turns += 1
         details = getattr(usage, "output_tokens_details", None)
         line = {
@@ -106,6 +122,8 @@ class Meter:
             "cache_read_input_tokens": usage.cache_read_input_tokens,
             "cache_creation_input_tokens": usage.cache_creation_input_tokens,
             "stop_reason": completion.stop_reason,
+            "fallback": any(a.type == "fallback_message" for a in attempts),
+            "attempts": [[a.type, a.model, a.input_tokens, a.output_tokens] for a in attempts],
             "refusal_category": getattr(
                 getattr(completion, "stop_details", None), "category", None
             ),
@@ -123,7 +141,20 @@ def adapt_sdk() -> None:
     anthropic_llm.MessageParam = dict
 
 
-def install_meter(meter: Meter) -> None:
+def drop_fallback_blocks(completion) -> None:
+    """AgentDojo replays what the model returned and has no case for a `fallback` block. The API
+    treats that block as an audit marker, and before the last one only text may be echoed."""
+    kinds = [block.type for block in completion.content]
+    if "fallback" in kinds:
+        last = len(kinds) - 1 - kinds[::-1].index("fallback")
+        completion.content = [
+            block
+            for i, block in enumerate(completion.content)
+            if i > last or (i < last and block.type == "text")
+        ]
+
+
+def install_meter(meter: Meter, fallback: bool = False) -> None:
     """Replace agentdojo's request function: it passes sentinels the current SDK rejects, and
     its retry wrapper hides the error. Only the fields that are set go out, and every response
     passes the meter. The SDK's own retries still cover 429s and server errors."""
@@ -148,7 +179,13 @@ def install_meter(meter: Meter) -> None:
         # A long wait, past the SDK's own retries: an unattended run outlasts a burst of 429s.
         for attempt in range(RATE_LIMIT_RETRIES + 1):
             try:
-                async with client.messages.stream(**fields) as stream:
+                if fallback:
+                    opener = client.beta.messages.stream(
+                        **fields, betas=[FALLBACK_BETA], fallbacks="default"
+                    )
+                else:
+                    opener = client.messages.stream(**fields)
+                async with opener as stream:
                     completion = await stream.get_final_message()
                 break
             except anthropic.RateLimitError:
@@ -156,6 +193,7 @@ def install_meter(meter: Meter) -> None:
                     raise
                 await asyncio.sleep(RATE_LIMIT_WAIT_SECONDS)
         meter.record(completion)
+        drop_fallback_blocks(completion)
         return completion
 
     anthropic_llm.chat_completion_request = request
@@ -211,6 +249,7 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--cap", type=float, default=2.0, help="stop past this many dollars")
     parser.add_argument("--attack", default=ATTACK)
+    parser.add_argument("--fallback", action="store_true", help='fallbacks: "default"')
     parser.add_argument("--shard", default="0/1", help="I/N: run every Nth user task from I")
     parser.add_argument("--resume", action="store_true", help="skip runs that have a log")
     parser.add_argument("--plan", action="store_true", help="print the selection and stop")
@@ -247,7 +286,7 @@ def main() -> None:
     tag = f"{args.suite}-{shard}"
     meter = Meter(args.model, args.cap, args.out / f"usage-{tag}.jsonl")
     adapt_sdk()
-    install_meter(meter)
+    install_meter(meter, args.fallback)
     attack = load_attack(args.attack, suite, pipeline)
     results = {"benign": {}, "attack": {}}
     warnings.simplefilter("ignore")

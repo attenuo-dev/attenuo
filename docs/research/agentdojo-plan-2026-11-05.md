@@ -498,11 +498,40 @@ How far this goes:
 - There is no fallback model, as instructed. The API has a fallback option for refusals on some of these models, and it might recover many of these runs. We haven't measured that, and a real deployment would want to know.
 - One run per pair, with no pinned sampling. Differences of a few runs mean little, and the large gaps above are the ones to read.
 
+### Refusals: fallback and a second attack
+
+The refusal result above needed two checks before anyone can claim it: does the API's refusal fallback recover those runs, and does it hold under another attack? Both ran on the workspace half of the sample, user tasks 0 to 9 against all 14 injection tasks plus 10 benign runs, no attenuo. One run each. Refused runs count as not done, and attack success is 0 in every row.
+
+| Run set | Benign utility | Task done under attack | Runs refused | Runs with a fallback | Cost |
+| --- | --- | --- | --- | --- | --- |
+| Opus, no fallback (above) | 10/10 | 49/140 | 91 | | $7.91 |
+| Opus, fallback | 10/10 | 132/132 | 0 | 83 | up to $12.25 |
+| Opus, `tool_knowledge`, no fallback | 10/10 | 50/140 | 90 | | $7.95 |
+| Sonnet, no fallback (above) | 10/10 | 112/140 | 28 | | $4.63 |
+| Sonnet, fallback | 10/10 | 132/137 | 5 | 28 | up to $5.03 |
+
+Fallback means `fallbacks: "default"` with the beta header `server-side-fallback-2026-07-01`, which both models accepted. Both fallback sets stopped at their spending caps, before finishing: Opus at 132 of 140 pairs and Sonnet at 137 of 140. No benign run used a fallback.
+
+What the numbers show:
+
+- The fallback recovers the task. On Opus every finished run completed, against 49 of 140 without it, and all of the fallback runs that finished did the user's task. On Sonnet, 132 of 137 completed against 112 of 140. So the denial of service in the section above belongs to the default configuration: it stops when the caller opts in.
+- The fallback didn't let the attack through. Attack success stayed 0 and no tool call carried the attacker's address, on runs served partly by another model. On these runs that model read the injection and did not act on it.
+- A fallback changes which model does the work. A `cyber` refusal on Opus 5.5 went to Opus 4.8 and on Sonnet 5.5 to Sonnet 5, and later turns stayed there. Opus 4.8 served 123 of Opus's 360 turns here. A caller gets the task done, on a different model, at that model's price.
+- The fallback can refuse too. Sonnet 5 still refused 5 runs, all category `cyber`. Opus 4.8 refused none here.
+- The second attack refuses about as often: 90 against 91 on Opus, all 90 category `cyber`, on the same injection tasks 4 to 13. The tool hints made no difference to the refusals, and no attacker call appeared there either.
+
+How far this goes:
+
+- `tool_knowledge` isn't an independent second attack. It is the `important_instructions` template plus tool hints, and 8 of the 14 workspace injection tasks get no hints at all. This shows the refusals survive hints, not that they survive another kind of attack. What triggers them, the template or the goal, is untested.
+- Costs for the fallback sets are upper bounds. They count each declined attempt, about 482,000 input tokens on Opus or about $1.93, and we didn't confirm whether those are billed. The Sonnet set also had three fallback turns that weren't metered, because the meter lacked a price for Sonnet 5 and stopped there. Those runs were redone, and the difference is a few cents.
+- Runs that hit the cap are missing from the fallback rows, so their totals are slightly different samples from the rows above. The 8 Opus pairs aren't a random sample, because they are whichever came last.
+- One run per pair, workspace only, and refusals vary from run to run: the same pair can refuse on one run and pass on the next.
+
 ## Decisions needed
 
-Spend so far is $63.38 of $168.50.
+Spend so far is about $88.71 of $168.50.
 
 1. Whether any more baseline spending helps. No attack succeeded on four models with this attack, and on Haiku with a stronger one too. Attacks that adapt to the model are a separate research effort, and more runs of stock attacks are unlikely to change this.
-2. Whether to report the refusal result. An injection that stops the user's task on Opus in most workspace runs is a finding about these models and this benchmark's scoring. It needs a fallback run, and more than one attack, before it is claimed in the report.
+2. Whether to report the refusal result. It holds, with limits, and can now be stated narrowly. With default settings, an injection stopped the user's task on Opus in about 65% of workspace runs under two related attacks, without the attack succeeding, and the attack success rate doesn't show this. With the [refusal fallback](#refusals-fallback-and-a-second-attack), nearly all of those runs finished, on an older model, and no attack succeeded. An unrelated attack is the remaining check before claiming it goes beyond this template.
 3. Which attenuo cost to fix first. Passing the proxy's tool list to the model is [measured](#filtered-tool-list): it cuts cost to about a third and removes refusals of tools outside the grant, and it doesn't recover utility. So we recommend replacing the contact rule next, since it accounts for the tasks lost on every row, and then looking at the pin rule, which `user_task_7` suggests costs a task on its own. Filtering is worth keeping for its cost, whichever way those go.
 4. Planner grants. Whether to pay for a realistic planner on top of the oracle in A2. Every utility number here still rests on oracle grants.
