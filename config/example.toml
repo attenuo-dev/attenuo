@@ -185,6 +185,20 @@ ttl_seconds = 120
 # ID tokens for the user by itself.
 # allow_unset_client_id = false
 
+# POST a signed JSON notice to a webhook you own when an approval becomes pending, and again
+# when it is decided or expires. Best effort: it never holds up a call or a decision, and a
+# notice that fails max_attempts times is dropped and counted. The body is signed with
+# HMAC-SHA-256 under the secret in the variable secret_env (at least 32 bytes, required):
+# X-Attenuo-Signature: t=<unix seconds>,v1=<hex HMAC of "<t>.<body>">. Header values come
+# from environment variables, never from this file.
+# [approvals.notify]
+# url = "https://hooks.example.com/attenuo/approvals"
+# secret_env = "ATTENUO_APPROVAL_NOTIFY_SECRET"
+# headers = { authorization = "ATTENUO_APPROVAL_NOTIFY_AUTH" }
+# timeout_seconds = 5
+# queue_capacity = 256
+# max_attempts = 5
+
 [leases]
 # Seconds a chain's leases (with their recorded users and bindings) are kept once every lease
 # in the chain is revoked or expired. Keep it above the longest token lifetime you issue: an

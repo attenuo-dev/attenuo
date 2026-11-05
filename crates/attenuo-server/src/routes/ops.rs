@@ -23,6 +23,11 @@ use crate::state::AppState;
 /// `checks.checkpoint_sink` (`"ok"` or `"degraded"`): degraded when the sink queue is full or
 /// the oldest undelivered checkpoint is older than `max_lag_seconds` (SR-21). A degraded sink
 /// fails readiness only with `fail_readiness = true`.
+///
+/// With `[approvals.notify]` configured, `checks.approval_notifier` is `"ok"` or
+/// `"degraded"` on the same rule (queue full, or the oldest undelivered notification or the
+/// current run of failures older than its `max_lag_seconds`), and `"degraded"` is true when
+/// either is. A degraded notifier never fails readiness: notifications are best effort.
 pub async fn readyz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
     let (audit, leases) = state
         .blocking(|s| {
@@ -65,6 +70,22 @@ pub async fn readyz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Val
         body["ready"] = json!(ready);
         body["degraded"] = json!(status.degraded);
         body["checks"]["checkpoint_sink"] = json!(if status.degraded { "degraded" } else { "ok" });
+    }
+    if let Some(n) = &state.approval_notifier {
+        let status = n.status();
+        if status.degraded {
+            tracing::warn!(
+                queued = status.queued,
+                capacity = status.capacity,
+                lag_seconds = status.lag.as_secs(),
+                last_error = status.last_error.as_deref().unwrap_or(""),
+                "readiness: [approvals.notify] is degraded"
+            );
+        }
+        let degraded = status.degraded || body["degraded"].as_bool().unwrap_or(false);
+        body["degraded"] = json!(degraded);
+        body["checks"]["approval_notifier"] =
+            json!(if status.degraded { "degraded" } else { "ok" });
     }
     let code = if ready {
         StatusCode::OK

@@ -130,6 +130,29 @@ Approvals of calls a policy gates with `@obligation("approval")` (see [Writing p
 | `client_id` | none | The `aud` an ID token must carry to decide at `POST /approvals/{id}`. Unset, it is the client id hop-0 intake expects for the run's root agent. Set it to a client the agent does not control, such as the approval page's own OAuth client, so that an ID token the agent can get for itself cannot approve its calls. When a loaded policy carries `@obligation("approval")` and this is unset, the server logs a warning at startup and after every policy reload, and refuses to start when `[server] listen` is not a loopback address (SR-64), unless `allow_unset_client_id` is set. |
 | `allow_unset_client_id` | false | Start with `client_id` unset off loopback although a loaded policy asks for approvals. The default refuses, because an agent that can get ID tokens for its user (silent re-authentication, a refresh token with `openid`) could then approve its own gated calls, and the audit record would show `by: user`. Set it only where the agent cannot obtain ID tokens for the user by itself; the warning is still logged. |
 
+
+### `[approvals.notify]`
+
+`POST`s a small signed JSON document to a webhook when an approval becomes pending, and again when it is decided or expires, so an operator does not have to watch the console. Unset by default. Delivery is best effort and never holds up a call or a decision; see [the server design](../design/server.md#approvals).
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `url` | required | URL to `POST` to: `https://` or `http://`, with a host and no user info or fragment. Any 2xx is success; redirects are not followed. Log lines name only its host. |
+| `headers` | none | Extra request headers, as header name to the name of the environment variable holding the value, e.g. `{ authorization = "ATTENUO_NOTIFY_AUTH" }`. Read at startup; an unset or empty variable fails startup. `content-type`, `content-length`, `host`, `transfer-encoding` and `x-attenuo-*` are refused. |
+| `secret_env` | `"ATTENUO_APPROVAL_NOTIFY_SECRET"` | Environment variable holding the HMAC signing secret, at least 32 bytes. Required: startup fails without it. |
+| `timeout_seconds` | 5 | Per-request timeout. |
+| `queue_capacity` | 256 | Notifications waiting for delivery, at most. When full, the oldest queued one is dropped and `attenuo_approval_notify_dropped_total` counts it. |
+| `max_attempts` | 5 | Attempts per notification. After the last one fails it is dropped and counted in `attenuo_approval_notify_dropped_total`. |
+| `initial_backoff_ms` | 500 | First retry delay; doubles per attempt up to `max_backoff_seconds`, each wait drawn between half and all of it. |
+| `max_backoff_seconds` | 30 | Longest retry delay. |
+| `max_lag_seconds` | 300 | `/readyz` shows `checks.approval_notifier: "degraded"` once the oldest undelivered notification, or the current run of failed deliveries, is older than this, or the queue is full. A degraded notifier never makes `/readyz` fail. |
+
+Every limit must be at least 1.
+
+**The document.** `type` (`approval.pending`, `approval.decided` or `approval.expired`), `event_id` (a UUID, the same on every retry of one notification), `approval_id`, `decision_id` (the gated decision), `chain_id`, `server`, `tool`, `call_hash` (SHA-256 over the server, tool and arguments, as in `-32008`), `subject` and `issuer` of the originating user, `agent` (the last hop's agent), `chain_depth` (hops), `requested_at`, `expires_at` (RFC 3339) and `reason`, a one-line summary naming the sources of the run's untrusted results. An `approval.decided` document adds `decision` (`grant` or `decline`), `decided_by: {subject, by}` and `decided_at`. No token and no argument values are sent. The call hash of an argument with few possible values can be confirmed by guessing, so treat the receiver as able to learn what a guessable call was.
+
+**Headers and signature.** `Content-Type: application/json`, `X-Attenuo-Event` (the `type`), `X-Attenuo-Event-Id` and `X-Attenuo-Signature: t=<unix seconds>,v1=<hex>`, where `<hex>` is HMAC-SHA-256 under the secret of the bytes `<t>.` followed by the body exactly as received. The timestamp is the time of the attempt, so a receiver can refuse old requests (five minutes is a reasonable window) and should compare signatures in constant time. A receiver may see one notification twice if an answer was lost; deduplicate by `event_id`. An approval still pending when the server restarts gets no `approval.expired` notice.
+
 ## `[leases]`
 
 Retention of the lease registry and what it records beside the leases (see [Leases and revocation](../concepts/leases-and-revocation.md)). One background task runs every `maintenance_interval_seconds` (a minute by default) when any of the three retentions is on: a session pass, then a lease pass, then a run-state pass, each in passes of `maintenance_batch_rows` rows (1,000 by default, one short write transaction each) and at most `maintenance_max_passes` passes of each kind per run (100 by default). The figures below for the retentions are those defaults.

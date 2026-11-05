@@ -117,6 +117,13 @@ pub struct Metrics {
     audit_sink_dropped: AtomicU64,
     audit_sink_queue_depth: AtomicU64,
     audit_sink_oldest_unix: AtomicU64,
+    /// `[approvals.notify]`: notifications delivered, delivery attempts that failed,
+    /// notifications dropped (queue full, every attempt failed, or too many approvals waiting
+    /// for their expiry), and the queue depth.
+    approval_notify_delivered: AtomicU64,
+    approval_notify_failures: AtomicU64,
+    approval_notify_dropped: AtomicU64,
+    approval_notify_queue_depth: AtomicU64,
     /// Time to decide one tool call.
     authorize: Histogram,
     /// Time for one audit append, lock wait and commit included.
@@ -185,6 +192,10 @@ impl Default for Metrics {
             audit_sink_dropped: AtomicU64::default(),
             audit_sink_queue_depth: AtomicU64::default(),
             audit_sink_oldest_unix: AtomicU64::default(),
+            approval_notify_delivered: AtomicU64::default(),
+            approval_notify_failures: AtomicU64::default(),
+            approval_notify_dropped: AtomicU64::default(),
+            approval_notify_queue_depth: AtomicU64::default(),
             authorize: Histogram::new(&BUCKETS),
             audit_append: Histogram::new(&BUCKETS),
             stages: std::array::from_fn(|_| Histogram::new(&STAGE_BUCKETS)),
@@ -465,6 +476,29 @@ impl Metrics {
             .store(oldest.map_or(0, unix_secs), Ordering::Relaxed);
     }
 
+    /// Count one approval notification delivered by `[approvals.notify]`.
+    pub fn approval_notify_delivered(&self) {
+        self.approval_notify_delivered
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one failed notification delivery attempt.
+    pub fn approval_notify_failure(&self) {
+        self.approval_notify_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one approval notification that will not be delivered.
+    pub fn approval_notify_dropped(&self) {
+        self.approval_notify_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Set the notification queue depth gauge.
+    pub fn approval_notify_queue(&self, depth: u64) {
+        self.approval_notify_queue_depth
+            .store(depth, Ordering::Relaxed);
+    }
+
     /// Prometheus text exposition format (version 0.0.4).
     pub fn render(&self) -> String {
         let mut out = String::new();
@@ -591,6 +625,31 @@ impl Metrics {
             "audit_sink_oldest_undelivered_timestamp_seconds",
             "Unix time the oldest undelivered checkpoint was queued; 0 when none.",
             &self.audit_sink_oldest_unix,
+        );
+        simple_counter(
+            &mut out,
+            "approval_notify_delivered_total",
+            "Approval notifications delivered by [approvals.notify].",
+            &self.approval_notify_delivered,
+        );
+        simple_counter(
+            &mut out,
+            "approval_notify_failures_total",
+            "Approval notification deliveries that failed (retried until max_attempts).",
+            &self.approval_notify_failures,
+        );
+        simple_counter(
+            &mut out,
+            "approval_notify_dropped_total",
+            "Approval notifications not delivered: queue full, every attempt failed, or too \
+             many approvals waiting for their expiry.",
+            &self.approval_notify_dropped,
+        );
+        simple_gauge(
+            &mut out,
+            "approval_notify_queue_depth",
+            "Approval notifications waiting in the [approvals.notify] queue.",
+            &self.approval_notify_queue_depth,
         );
         header_lines(
             &mut out,

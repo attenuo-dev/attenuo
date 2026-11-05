@@ -19,7 +19,7 @@ Optional, RFC 9449. See [Binding tokens to keys](../guides/binding-tokens-to-key
 | Method and path | Auth | Purpose |
 | --- | --- | --- |
 | `GET /healthz` | none | Liveness. Never touches storage. |
-| `GET /readyz` | none | Readiness. Checks the audit store and the lease store. 200 `{"ready":true,"checks":{"audit":"ok","leases":"ok"}}` or 503 with `"error"` for the failing check and no error text. With `[audit.sink]` the body also has `"degraded"` and `checks.checkpoint_sink` (`"ok"` or `"degraded"`); a degraded sink is a 503 only with `fail_readiness = true`. |
+| `GET /readyz` | none | Readiness. Checks the audit store and the lease store. 200 `{"ready":true,"checks":{"audit":"ok","leases":"ok"}}` or 503 with `"error"` for the failing check and no error text. With `[audit.sink]` the body also has `"degraded"` and `checks.checkpoint_sink` (`"ok"` or `"degraded"`); a degraded sink is a 503 only with `fail_readiness = true`. With `[approvals.notify]` it also has `checks.approval_notifier` (`"ok"` or `"degraded"`), which sets `"degraded"` but never makes the answer a 503. |
 | `GET /.well-known/jwks.json` | none | Public keys for token verification, including retired keys. |
 | `GET /.well-known/authzen-configuration` | none | AuthZEN discovery (AuthZEN 1.0 section 9): `policy_decision_point`, `access_evaluation_endpoint` and `access_evaluations_endpoint`, and nothing else; no search endpoints, which are not served. Public metadata: no credential is needed and an `Authorization` header is ignored ([why](authzen.md#discovery)). The URLs are built from `[server] public_url`. Without it (loopback only) from `Host`, which must be `localhost`, `127.0.0.1` or `[::1]`; anything else is 400 `invalid_host`. |
 
@@ -464,6 +464,10 @@ Every series is prefixed `attenuo_`. Label values come from fixed sets, so the n
 | `audit_sink_dropped_total` | counter | none | Checkpoints dropped from a full `[audit.sink]` queue before delivery. |
 | `audit_sink_queue_depth` | gauge | none | Checkpoints waiting in the `[audit.sink]` queue. |
 | `audit_sink_oldest_undelivered_timestamp_seconds` | gauge | none | Unix time the oldest undelivered checkpoint was queued; 0 when none. |
+| `approval_notify_delivered_total` | counter | none | Approval notifications delivered by `[approvals.notify]`. |
+| `approval_notify_failures_total` | counter | none | Approval notification deliveries that failed; each is retried until `max_attempts`. |
+| `approval_notify_dropped_total` | counter | none | Approval notifications not delivered: dropped from a full queue, failed on every attempt, or not watched for expiry because 10,000 pending approvals already were. |
+| `approval_notify_queue_depth` | gauge | none | Approval notifications waiting in the `[approvals.notify]` queue. |
 | `audit_wal_checkpoints_total` | counter | `result` (`complete`, `incomplete`, `error`) | Background WAL checkpoint rounds: `complete` left nothing in the WAL, `incomplete` left frames behind (a reader or the writer was in the way; the next commit starts another round). |
 | `audit_wal_locked_passes_total` | counter | none | WAL catch-up passes run holding the store's lock, each pausing appends briefly (only when the WAL passes 64 MB under load). |
 | `audit_wal_backstops_total` | counter | none | WAL checkpoints the audit writer ran itself because the WAL outgrew the backstop (128 MB): the background thread fell behind. |

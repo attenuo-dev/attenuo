@@ -83,6 +83,8 @@ pub struct AppState {
     pub sink_fails_readiness: bool,
     /// `[approvals] client_id`: the `aud` of approval ID tokens, when set.
     pub approvals_client_id: Option<String>,
+    /// `[approvals.notify]`: the approval notifier; `None` when unset.
+    pub approval_notifier: Option<crate::notify::ApprovalNotifier>,
 }
 
 impl AppState {
@@ -151,12 +153,22 @@ impl AppState {
             metrics.clone(),
             checkpoint_sink.as_ref().map(|s| s.handle()),
         )?;
-        let pipeline = Arc::new(
-            Pipeline::new(policy, leases.clone(), audit.clone())
-                .with_metrics(metrics.clone())
-                .with_approval_ttl(config.approvals.ttl())
-                .with_approval_verifier(verifier.clone()),
-        );
+        let approval_notifier = match &config.approvals.notify {
+            Some(cfg) => Some(crate::notify::ApprovalNotifier::start(
+                cfg,
+                metrics.clone(),
+                leases.clone(),
+            )?),
+            None => None,
+        };
+        let mut pipeline = Pipeline::new(policy, leases.clone(), audit.clone())
+            .with_metrics(metrics.clone())
+            .with_approval_ttl(config.approvals.ttl())
+            .with_approval_verifier(verifier.clone());
+        if let Some(n) = &approval_notifier {
+            pipeline = pipeline.with_approval_notifier(n.handle());
+        }
+        let pipeline = Arc::new(pipeline);
         let idps = IdpRegistry::from_config(&config.idps, &config.issuer.issuer)?;
         let agents = crate::idp::intake::validate_agents(&config.agents)?;
         let peps = crate::clientauth::validate_clients("[[peps]]", &config.peps)?;
@@ -270,6 +282,7 @@ impl AppState {
             checkpoint_sink,
             sink_fails_readiness: config.audit.sink.as_ref().is_some_and(|s| s.fail_readiness),
             approvals_client_id: config.approvals.client_id.clone(),
+            approval_notifier,
         })
     }
 

@@ -224,6 +224,10 @@ fn decide(
         )));
     }
     state.metrics.approval_decided(grant, approver.method.by());
+    if let Some(n) = &state.approval_notifier {
+        // Only queues: the answer does not wait for the webhook.
+        n.handle().decided(&a);
+    }
     // Subject and tool come from the request and the agent: Debug-format them (SR-18).
     tracing::info!(
         approval = %a.id,

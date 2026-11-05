@@ -915,6 +915,159 @@ pub struct ApprovalsSection {
     /// user by itself.
     #[serde(default)]
     pub allow_unset_client_id: bool,
+    /// `[approvals.notify]`: `POST` a signed notice to a webhook when an approval becomes
+    /// pending, is decided, or expires. Unset by default.
+    #[serde(default)]
+    pub notify: Option<NotifySection>,
+}
+
+/// Environment variable `[approvals.notify] secret_env` names by default.
+pub const NOTIFY_SECRET_ENV: &str = "ATTENUO_APPROVAL_NOTIFY_SECRET";
+
+/// Fewest bytes the `[approvals.notify]` signing secret may have.
+pub const NOTIFY_SECRET_MIN_LEN: usize = 32;
+
+/// `[approvals.notify]`: the approval notifier. Every approval that becomes pending, and
+/// again when it is decided or expires, is queued (bounded, never blocking a decision) and
+/// `POST`ed to `url` by a background thread with jittered retries, on the `[audit.sink]`
+/// queue ([`crate::sink::Queue`]). The body is signed with HMAC-SHA-256 under the secret in
+/// the environment variable `secret_env` (header `X-Attenuo-Signature`). Best effort: a
+/// notification that fails `max_attempts` times is dropped and counted. See
+/// `docs/design/approval-notifier.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotifySection {
+    /// The URL to `POST` to (`https://` or `http://`, with a host and no user info or
+    /// fragment). Any 2xx is success; redirects are not followed.
+    pub url: String,
+    /// Extra request headers, as header name to the name of the environment variable that
+    /// holds its value (for example `authorization = "ATTENUO_NOTIFY_AUTH"`). Read at
+    /// startup; an unset or empty variable fails startup. `content-type`, `content-length`,
+    /// `host`, `transfer-encoding` and `x-attenuo-*` are refused.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// The environment variable holding the HMAC signing secret, at least
+    /// [`NOTIFY_SECRET_MIN_LEN`] bytes. Required at startup. Default [`NOTIFY_SECRET_ENV`].
+    #[serde(default = "default_notify_secret_env")]
+    pub secret_env: String,
+    /// Per-request timeout in seconds. Default 5.
+    #[serde(default = "default_notify_timeout_seconds")]
+    pub timeout_seconds: u64,
+    /// Notifications waiting to be delivered, at most; when full, the oldest queued one is
+    /// dropped and `attenuo_approval_notify_dropped_total` counts it. Default 256.
+    #[serde(default = "default_notify_queue_capacity")]
+    pub queue_capacity: usize,
+    /// Attempts per notification before it is dropped (and counted). Default 5.
+    #[serde(default = "default_notify_max_attempts")]
+    pub max_attempts: u32,
+    /// First retry delay in milliseconds; doubles per attempt, with jitter. Default 500.
+    #[serde(default = "default_sink_initial_backoff_ms")]
+    pub initial_backoff_ms: u64,
+    /// Longest retry delay in seconds. Default 30.
+    #[serde(default = "default_notify_max_backoff_seconds")]
+    pub max_backoff_seconds: u64,
+    /// `/readyz` reports the notifier degraded (never not ready) once the oldest undelivered
+    /// notification, or the current run of failures, is older than this, or the queue is
+    /// full. Default 300.
+    #[serde(default = "default_sink_max_lag_seconds")]
+    pub max_lag_seconds: u64,
+}
+
+fn default_notify_secret_env() -> String {
+    NOTIFY_SECRET_ENV.into()
+}
+fn default_notify_timeout_seconds() -> u64 {
+    5
+}
+fn default_notify_queue_capacity() -> usize {
+    256
+}
+fn default_notify_max_attempts() -> u32 {
+    5
+}
+fn default_notify_max_backoff_seconds() -> u64 {
+    30
+}
+
+/// Request headers `[approvals.notify] headers` may not set.
+const NOTIFY_RESERVED_HEADERS: [&str; 4] = [
+    "content-type",
+    "content-length",
+    "host",
+    "transfer-encoding",
+];
+
+impl NotifySection {
+    /// A section for `url` with every other field at its default.
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            headers: BTreeMap::new(),
+            secret_env: default_notify_secret_env(),
+            timeout_seconds: default_notify_timeout_seconds(),
+            queue_capacity: default_notify_queue_capacity(),
+            max_attempts: default_notify_max_attempts(),
+            initial_backoff_ms: default_sink_initial_backoff_ms(),
+            max_backoff_seconds: default_notify_max_backoff_seconds(),
+            max_lag_seconds: default_sink_max_lag_seconds(),
+        }
+    }
+
+    /// Startup check of the file's values (the environment is read when the notifier
+    /// starts). The URL must be `http(s)://` with a host and no user info or fragment, so no
+    /// credential sits in a URL that error messages could carry; redirects are never
+    /// followed, so the receiver cannot send the request on to another host.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let url = reqwest::Url::parse(&self.url)
+            .map_err(|e| anyhow::anyhow!("[approvals.notify] url is not a URL: {e}"))?;
+        if !matches!(url.scheme(), "https" | "http") {
+            anyhow::bail!("[approvals.notify] url must start with https:// or http://");
+        }
+        if url.host_str().is_none_or(str::is_empty) {
+            anyhow::bail!("[approvals.notify] url needs a host");
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            anyhow::bail!(
+                "[approvals.notify] url must not carry user info; send credentials in `headers` \
+                 from an environment variable"
+            );
+        }
+        if url.fragment().is_some() {
+            anyhow::bail!("[approvals.notify] url must not have a fragment");
+        }
+        for (name, env) in &self.headers {
+            let lower = name.to_ascii_lowercase();
+            if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                anyhow::bail!("[approvals.notify] headers: {name:?} is not a header name");
+            }
+            if NOTIFY_RESERVED_HEADERS.contains(&lower.as_str()) || lower.starts_with("x-attenuo-")
+            {
+                anyhow::bail!("[approvals.notify] headers: {name:?} is set by the server");
+            }
+            if env.is_empty() {
+                anyhow::bail!(
+                    "[approvals.notify] headers: {name:?} needs the name of an environment variable"
+                );
+            }
+        }
+        if self.secret_env.is_empty() {
+            anyhow::bail!("[approvals.notify] secret_env must name an environment variable");
+        }
+        if self.queue_capacity == 0 || self.max_attempts == 0 {
+            anyhow::bail!("[approvals.notify] queue_capacity and max_attempts must be at least 1");
+        }
+        if self.timeout_seconds == 0
+            || self.initial_backoff_ms == 0
+            || self.max_backoff_seconds == 0
+            || self.max_lag_seconds == 0
+        {
+            anyhow::bail!(
+                "[approvals.notify] timeout_seconds, initial_backoff_ms, max_backoff_seconds \
+                 and max_lag_seconds must be positive"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// What the server logs when a loaded policy asks for approvals and `[approvals] client_id`
@@ -939,12 +1092,14 @@ impl Default for ApprovalsSection {
             ttl_seconds: DEFAULT_APPROVAL_TTL_SECONDS,
             client_id: None,
             allow_unset_client_id: false,
+            notify: None,
         }
     }
 }
 
 impl ApprovalsSection {
-    /// Startup check: `ttl_seconds` in 1..=86400, `client_id` not empty when set.
+    /// Startup check: `ttl_seconds` in 1..=86400, `client_id` not empty when set, and
+    /// `[approvals.notify]` when set.
     pub fn check(&self) -> anyhow::Result<()> {
         if !(1..=86_400).contains(&self.ttl_seconds) {
             anyhow::bail!(
@@ -954,6 +1109,9 @@ impl ApprovalsSection {
         }
         if self.client_id.as_deref().is_some_and(str::is_empty) {
             anyhow::bail!("[approvals] client_id must not be empty when set");
+        }
+        if let Some(n) = &self.notify {
+            n.validate()?;
         }
         Ok(())
     }
