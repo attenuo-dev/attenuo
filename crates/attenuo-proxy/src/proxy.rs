@@ -1366,11 +1366,17 @@ fn report_post_timing(state: &AppState, timing: &PostTiming, started: Instant) {
     }
     a.observe_stage(Stage::Total, total);
     tracing::debug!(
-        upstream_us = timing.upstream.map(|d| d.as_micros() as u64),
-        response_us = response.map(|d| d.as_micros() as u64),
-        total_us = total.as_micros() as u64,
+        upstream_us = timing.upstream.map(micros),
+        response_us = response.map(micros),
+        total_us = micros(total),
         "proxy stages"
     );
+}
+
+/// A duration in whole microseconds for a log field, saturating at `u64::MAX` (about 584,000
+/// years, so never reached in practice).
+fn micros(d: Duration) -> u64 {
+    u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
 }
 
 /// Classify one JSON-RPC message and route it. See the method table in the crate docs.

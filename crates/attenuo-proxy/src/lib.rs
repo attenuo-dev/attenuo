@@ -144,6 +144,11 @@
 //! [`DelegationChain`]: attenuo_core::DelegationChain
 
 #![deny(unsafe_code)]
+#![warn(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 
 pub mod auth;
 pub mod config;
