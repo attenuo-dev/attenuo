@@ -39,7 +39,9 @@
 //!
 //! Every rejection has a stable `error_description` sub-code ([`IntakeError::description`]),
 //! with the OAuth `error` code `invalid_grant` (400) except `jwks_unavailable`, which is
-//! `temporarily_unavailable` (503).
+//! `temporarily_unavailable` (503). An `invalid_grant` carries the sub-code as `detail` too; the
+//! verifier's message (issuer, audience, `kid`, client ids) is logged at debug level and never
+//! returned (SR-17).
 
 pub mod claims;
 pub mod intake;
@@ -157,7 +159,13 @@ impl From<IntakeError> for ApiError {
                     "the identity provider's keys cannot be fetched; try again later",
                 )
             }
-            _ => ApiError::bad_request("invalid_grant", e.to_string()),
+            // The verifier's text names the issuer, the expected audience, the client ids and
+            // the signature library's complaint: log it at debug level and return only the
+            // stable sub-code, as `detail` and `error_description` (SR-17).
+            _ => {
+                tracing::debug!(reason = d, detail = ?e.to_string(), "IdP credential refused");
+                ApiError::bad_request("invalid_grant", d)
+            }
         }
         .with_description(d)
     }

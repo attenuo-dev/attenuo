@@ -494,6 +494,73 @@ async fn bad_id_tokens_are_rejected_with_stable_codes() {
     assert_eq!(idp.hits(), before + 1);
 }
 
+/// A refused credential's body carries only the stable sub-code: the verifier's text, which
+/// names the issuer, the expected audience and the `kid`, stays in the server log (SR-17).
+#[tokio::test]
+async fn intake_refusals_do_not_echo_the_verifier() {
+    let h = Harness::start().await;
+    let idp = &h.idp;
+    let assert_opaque = |got: &(StatusCode, Value), code: &str, secrets: &[&str]| {
+        assert_error(got, StatusCode::BAD_REQUEST, "invalid_grant", code);
+        assert_eq!(got.1["detail"], code, "{}", got.1);
+        let text = got.1.to_string();
+        for s in secrets {
+            assert!(!text.contains(s), "body leaks {s:?}: {text}");
+        }
+    };
+
+    // An ID token issued to another client.
+    let mut c = idp.id_token_claims("alice");
+    c["aud"] = json!("someone-else");
+    let got = h
+        .intake(&idp.sign(&idp.key, Some("JWT"), &c), "github:read_file")
+        .await;
+    assert_opaque(
+        &got,
+        "credential_audience_mismatch",
+        &["someone-else", CLIENT_AUD, "planner", &idp.issuer],
+    );
+
+    // An ID-JAG whose audience is not attenuo.
+    let mut c = idp.id_jag_claims("alice", "planner");
+    c["aud"] = json!("https://elsewhere.example");
+    let jag = idp.sign(&idp.key, Some("oauth-id-jag+jwt"), &c);
+    let got = h
+        .post_form(
+            &[
+                ("grant_type", EXCHANGE),
+                ("subject_token", &jag),
+                ("subject_token_type", ID_JAG),
+                ("scope", "github:read_file"),
+            ],
+            Some(("planner", PLANNER_SECRET)),
+        )
+        .await;
+    assert_opaque(
+        &got,
+        "audience_mismatch",
+        &["elsewhere.example", ISSUER, &idp.issuer],
+    );
+
+    // A key the IdP never published.
+    let stranger = IdpKey::generate("never-published-kid");
+    let token = idp.sign(&stranger, Some("JWT"), &idp.id_token_claims("alice"));
+    let got = h.intake(&token, "github:read_file").await;
+    assert_opaque(
+        &got,
+        "unknown_kid",
+        &["never-published-kid", &idp.issuer, "kid "],
+    );
+
+    // An issuer that is not configured.
+    let mut c = idp.id_token_claims("alice");
+    c["iss"] = json!("https://evil.example");
+    let got = h
+        .intake(&idp.sign(&idp.key, Some("JWT"), &c), "github:read_file")
+        .await;
+    assert_opaque(&got, "untrusted_issuer", &["evil.example"]);
+}
+
 #[tokio::test]
 async fn client_authentication_is_required() {
     let h = Harness::start().await;
