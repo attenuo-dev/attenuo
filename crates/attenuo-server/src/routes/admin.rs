@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use super::{audit_admin, bearer_of, now, REASON_ADMIN_ACTION};
+use super::{audit_admin, bearer_of, REASON_ADMIN_ACTION};
 use crate::error::ApiError;
 use crate::metrics::RefundSource;
 use crate::state::AppState;
@@ -101,7 +101,7 @@ pub async fn revoke_lease(
         .reason
         .unwrap_or_else(|| "revoked by admin".to_string());
     let lease = LeaseId::new(lease_id);
-    let now = now();
+    let now = state.now();
     state
         .blocking(move |state| {
             let revoked = state.leases.revoke(&lease, &reason, now)?;
@@ -302,7 +302,7 @@ pub async fn revoke_by_selector(
     let reason = body
         .reason
         .unwrap_or_else(|| "revoked by admin".to_string());
-    let now = now();
+    let now = state.now();
     state
         .blocking(move |state| {
             resolve_shown(state, &selector, &mut shown)?;
@@ -384,7 +384,7 @@ pub async fn refund_budget(
         .reason
         .unwrap_or_else(|| "refunded by admin".to_string());
     let decision_id = body.decision_id;
-    let now = now();
+    let now = state.now();
     state
         .blocking(move |state| {
             let refunded = state
@@ -487,7 +487,7 @@ pub async fn lease_status(
                 .ok_or_else(|| ApiError::not_found(format!("unknown lease `{}`", lease.0)))?;
             let fmt = |t: time::OffsetDateTime| t.format(&Rfc3339).unwrap_or_default();
             // Ask the store rather than the row so this agrees with what the pipeline sees.
-            let active = state.leases.is_active(&lease, now())?;
+            let active = state.leases.is_active(&lease, state.now())?;
             Ok(Json(json!({
                 "lease_id": lease,
                 "active": active,
@@ -565,7 +565,7 @@ pub async fn lease_tree(
             // The originating user of every listed lease, in one store call however long
             // the list is. Leases registered before subjects were recorded have none.
             let subjects = state.leases.subjects(&wanted)?;
-            let now = now();
+            let now = state.now();
             let fmt = |t: time::OffsetDateTime| t.format(&Rfc3339).unwrap_or_default();
             let budgets: BTreeMap<&LeaseId, Value> = tree
                 .ancestors
@@ -925,7 +925,9 @@ pub async fn audit_verify(
 /// can be kept off-host and checked later with only the JWKS. `hash` repeats `head_hash` for
 /// clients written against the unsigned v0 response.
 pub async fn audit_checkpoint(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
-    let cp = state.blocking(|s| s.audit.checkpoint_signed(now())).await?;
+    let cp = state
+        .blocking(|s| s.audit.checkpoint_signed(s.now()))
+        .await?;
     let mut v = serde_json::to_value(&cp).map_err(ApiError::internal)?;
     v["hash"] = Value::String(cp.head_hash.clone());
     Ok(Json(v))
@@ -937,7 +939,7 @@ const POLICY_RELOAD_TOOL: &str = "admin.policies.reload";
 /// The body of the single-entry routes; the shape is described on [`audit_entry`].
 fn entry_view(state: &AppState, entry: AuditEntry) -> Result<Value, ApiError> {
     let fmt = |t: time::OffsetDateTime| t.format(&Rfc3339).unwrap_or_default();
-    let now = now();
+    let now = state.now();
     let mut lease_states = Vec::with_capacity(entry.record.leases.len());
     for lease in &entry.record.leases {
         let state_of = match state.leases.get(lease)? {
@@ -1163,7 +1165,7 @@ pub async fn audit_export(
         tool: parsed.tool,
         decision: parsed.decision,
     };
-    let exported_at = now().format(&Rfc3339).map_err(ApiError::internal)?;
+    let exported_at = state.now().format(&Rfc3339).map_err(ApiError::internal)?;
     let header = attenuo_audit::header_line(
         &attenuo_audit::ExportHeader::new(from, to, exported_at).with_filter(filter.clone()),
     );
@@ -1250,7 +1252,7 @@ pub async fn reload_policies(State(state): State<Arc<AppState>>) -> Result<Json<
         .await
         .map_err(|e| ApiError::internal(format!("reading {}: {e}", path.display())))?;
     let digest = hex::encode(sha2::Sha256::digest(text.as_bytes()));
-    let now = now();
+    let now = state.now();
     // The write guard is not `Send`, so it lives only inside this block.
     let reloaded = {
         let mut engine = state

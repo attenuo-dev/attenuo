@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 use time::Duration;
 
 use super::{
-    audit_admin, audit_issuance, no_store, now, parse_json, register_issued, REASON_ADMIN_ACTION,
+    audit_admin, audit_issuance, no_store, parse_json, register_issued, REASON_ADMIN_ACTION,
 };
 use crate::config::{capability_set, CapSpec, RootGrant};
 use crate::error::ApiError;
@@ -85,7 +85,7 @@ fn mint_root_sync(
     let (capabilities, grant_attributes, may_act) = resolve_grant(&state.root_grants, &req)?;
     let attributes = merge_attributes(grant_attributes, &req.attributes)?;
 
-    let now = now();
+    let now = state.now();
     // DPoP (SR-24): a `DPoP` header binds the root token to its key, per `[token] dpop`.
     let cnf = state.dpop.bind_new(
         crate::dpop::header_proof(headers)?,

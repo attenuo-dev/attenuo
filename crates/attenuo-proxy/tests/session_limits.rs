@@ -4,11 +4,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use attenuo_core::Capability;
+use attenuo_core::{Capability, ManualClock};
 use attenuo_proxy::jsonrpc::{CODE_TOO_MANY, CODE_UNAVAILABLE};
 use attenuo_proxy::testing::{spawn_router, test_chain, FakeMcpServer, Spawned, StaticAuthorizer};
 use attenuo_proxy::{
-    router, ProxyConfig, UpstreamConfig, REASON_SESSION_REGISTRY_FULL, REASON_TOO_MANY_SESSIONS,
+    router_with_clock, ProxyConfig, UpstreamConfig, REASON_SESSION_REGISTRY_FULL,
+    REASON_TOO_MANY_SESSIONS,
 };
 use serde_json::{json, Value};
 
@@ -20,6 +21,8 @@ struct Harness {
     upstream: FakeMcpServer,
     proxy: Spawned,
     _up: Spawned,
+    /// The proxy's clock: [`ManualClock::advance`] steps past the session TTL.
+    clock: Arc<ManualClock>,
 }
 
 /// Status, `Retry-After`, `Mcp-Session-Id` and body of a proxied response.
@@ -52,11 +55,13 @@ impl Harness {
             "127.0.0.1:0".parse()?,
             vec![UpstreamConfig::new(SERVER, up.url("/mcp"))],
         ));
-        let proxy = spawn_router(router(cfg, authorizer)).await?;
+        let clock = ManualClock::new();
+        let proxy = spawn_router(router_with_clock(cfg, authorizer, clock.clone())).await?;
         Ok(Self {
             upstream,
             proxy,
             _up: up,
+            clock,
         })
     }
 
@@ -193,7 +198,7 @@ async fn a_deleted_or_expired_binding_frees_the_slot_sr49() -> anyhow::Result<()
     assert_eq!(h.initialize("alice").await?.0, 429);
 
     // So does idling past the TTL.
-    tokio::time::sleep(ttl + Duration::from_millis(200)).await;
+    h.clock.advance(ttl + Duration::from_millis(200));
     let (status, third, body) = h.initialize("alice").await?;
     assert_eq!(status, 200, "{body}");
     assert_ne!(second, third);

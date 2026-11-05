@@ -42,7 +42,7 @@ use time::OffsetDateTime;
 
 use crate::authz::{REASON_LEASE_EXPIRED, REASON_LEASE_REVOKED, REASON_LEASE_UNKNOWN};
 
-use super::{audit_event, bearer_of, no_store, now};
+use super::{audit_event, bearer_of, no_store};
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -61,7 +61,7 @@ fn renew_sync(state: &AppState, headers: &HeaderMap) -> Result<Response, ApiErro
             "a delegation token bearer is required",
         )
     })?;
-    let now = now();
+    let now = state.now();
     let verified = state
         .verifier
         .verify(bearer, now)

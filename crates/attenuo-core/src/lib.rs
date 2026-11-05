@@ -8,6 +8,7 @@
 //! - [`ToolCall`]: a normalized tool invocation to authorize.
 //! - [`limits`]: run limits on a capability (`calls`, `sum`, `calls_per`, `distinct`) and the
 //!   charges a call makes against them (ADR-0010).
+//! - [`clock`]: the time source of TTL and window checks, injectable for tests.
 //! - [`names`]: what server and tool names may contain (one rule for every boundary).
 //! - [`fingerprint`]: fingerprints of results and arguments for argument-level taint
 //!   (ADR-0009, phase 2).
@@ -32,6 +33,7 @@ pub mod authorization;
 pub mod call;
 pub mod capability;
 pub mod chain;
+pub mod clock;
 pub mod decision;
 pub mod digest;
 pub mod error;
@@ -44,6 +46,7 @@ pub mod names;
 pub use call::ToolCall;
 pub use capability::{as_long, ArgConstraint, Capability, CapabilitySet, RangeError};
 pub use chain::{AgentId, DelegationChain, Hop, LeaseId, OriginatingUser};
+pub use clock::{Clock, ManualClock, SystemClock};
 pub use decision::{
     chain_id_of, ApprovalInfo, BudgetCharge, Decision, DecisionRecord, OutputLabel, RecordBudget,
     RecordKind, RecordLabels, RecordUsage, ResultInfo, UntrustedArg, UntrustedKind,

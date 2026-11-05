@@ -880,6 +880,10 @@ enum WalMsg {
     SyncWal,
     /// The store is closing: run the final checkpoint and exit.
     Stop,
+    /// Tests: answer once every message sent before this one has been handled
+    /// (`SqliteAudit::settle_wal_checkpointer`).
+    #[cfg(any(test, feature = "testing"))]
+    Settle(mpsc::SyncSender<()>),
 }
 
 /// The background WAL checkpointer of a file-backed [`SqliteAudit`]: a thread with its own
@@ -1021,6 +1025,11 @@ fn wal_loop(shared: &WalShared, msgs: &mpsc::Receiver<WalMsg>) {
                         t.wal_presyncs += 1;
                     }
                 }
+                continue;
+            }
+            #[cfg(any(test, feature = "testing"))]
+            Ok(WalMsg::Settle(done)) => {
+                let _ = done.send(());
                 continue;
             }
             Ok(WalMsg::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -4243,6 +4252,22 @@ impl SqliteAudit {
     #[doc(hidden)]
     pub fn park_wal_checkpointer(&self) -> Option<std::sync::MutexGuard<'_, Connection>> {
         self.wal.as_ref().map(|w| w.conn.lock().unwrap())
+    }
+
+    /// Tests: wait until the background WAL checkpointer has handled every message sent to it
+    /// before this call (the syncs ahead of checkpoints that the appends so far asked for, and
+    /// any round they queued). The channel is first in, first out, so what the checkpointer
+    /// has done by then is final for those appends: a test can assert that something did
+    /// *not* happen without sleeping. Returns at once without
+    /// [`with_wal_checkpoints`](Self::with_wal_checkpoints).
+    #[doc(hidden)]
+    pub fn settle_wal_checkpointer(&self) {
+        let Some(w) = self.wal.as_ref() else { return };
+        let (done, settled) = mpsc::sync_channel(1);
+        w.msgs
+            .send(WalMsg::Settle(done))
+            .expect("the WAL checkpointer is running");
+        settled.recv().expect("the WAL checkpointer answers");
     }
 
     /// Tests and measurements: the pauses the WAL checkpointers have imposed so far.
