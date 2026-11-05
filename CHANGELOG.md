@@ -11,6 +11,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 ### Added
 
 - Python SDK: the package root exports the audit verification helpers (`verify_export`, `cross_check`, `parse_shipped`, `ExportError`, the report types, `SHIPPED_FORMAT`), the MCP helpers (`mcp_url`, `mcp_headers`, `TokenAuth`), the DPoP helpers (`NonceCache`, `access_token_hash`, `jwk_thumbprint`, `is_use_dpop_nonce`, `NONCE_HEADER`, `USE_DPOP_NONCE`) and `TOKEN_TYPE`, as the TypeScript root does. The submodule imports still work.
+- AgentDojo: an evaluation plan with cost estimates and adapter design (`docs/research/agentdojo-plan-2026-11-05.md`), a baseline runner for Claude 5.5 models with a spend cap (`evaluation/agentdojo/pilot.py`), and a model-free replay of the benchmark's ground-truth attack calls through the proxy (`evaluation/agentdojo/replay.py`). Results from 2026-11-05 are in the plan.
 - Brand assets under `assets/brand/` (mark, favicon, README header, social preview) and a favicon for the docs site. The mark is the delegation chain: three squares narrowing left to right.
 - The admin console serves the brand favicon at `/favicon.svg` (and `/admin/ui/favicon.svg`) and links it from its page, with the same headers as its other files and no CSP change.
 
