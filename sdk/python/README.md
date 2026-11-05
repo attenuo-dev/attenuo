@@ -397,6 +397,8 @@ url = mcp_url("http://127.0.0.1:8080", "github")  # http://127.0.0.1:8080/mcp/gi
 headers = mcp_headers(coder)  # {"Authorization": "Bearer ..."}
 ```
 
+The MCP helpers (`mcp_url`, `mcp_headers`, `TokenAuth`) are also importable from the package root, like the TypeScript SDK's `mcpUrl`, `mcpHeaders` and `mcpFetch`.
+
 `TokenAuth(provider)` is an `httpx.Auth` that reads the current token on each request, for tokens that get replaced (a [`TokenRefresher`](#keeping-a-token-alive) is a provider). `TokenAuth(provider, dpop_key=key)` also adds a DPoP proof per request, which a bound token needs; static headers cannot carry one.
 
 ## Verifying
@@ -418,6 +420,8 @@ report = verify_export("audit.jsonl", checkpoint_public_keys=jwks)  # from `atte
 if not report.ok:
     print(report.first_bad_seq, report.bad_checkpoints, report.truncated, report.unsigned_tail)
 ```
+
+The audit helpers (`verify_export`, `cross_check`, `parse_shipped`, `ExportError`, the report types and `SHIPPED_FORMAT`) and the DPoP helpers (`NonceCache`, `access_token_hash`, `jwk_thumbprint`, `is_use_dpop_nonce`, `NONCE_HEADER`, `USE_DPOP_NONCE`) are importable from `attenuo` itself, as in the TypeScript SDK; `from attenuo import verify_export` is the same function.
 
 `verify_export(path_or_lines, *, checkpoint_public_keys, allow_unsigned_tail=False)` takes a path (`str` or `PathLike`; a `str` is always a path) or an iterable of lines, in JSON Lines or the `--format json` form. `checkpoint_public_keys` is the JWKS or a `{kid: public key}` map (raw 32 bytes or base64url). It re-checks the SHA-256 hash chain over RFC 8785 canonical JSON of `["attenuo-audit-entry-v2", seq, prev_hash, record]`, the range the header declares and the Ed25519 checkpoint signatures, with the same strictness as `attenuo audit verify --file`: a short file, entries outside the range and entries after the last valid checkpoint (unless `allow_unsigned_tail=True`) all fail. The `ExportReport` has `ok`, `first_bad_seq`, `bad_checkpoints`, `last_signed_seq`, `unsigned_tail`, `truncated`, `outside_range` and the rest of the Rust report. A file that is not a verifiable export (no header, wrong format, a filtered export, not JSON) raises `attenuo.audit.ExportError`. It needs the `verify` extra (`cryptography`) for the signatures and depends on the pinned `rfc8785`. It hashes each record as it appears in the file and refuses duplicate object members, so it is a little stricter than the Rust check. A filtered export (`audit_export(kind=..., chain_id=..., tool=..., decision=...)`, any of them) cannot be verified: its chain has gaps, so verify the unfiltered one, then filter. `AuditEntry` has `kind` and `chain_id`.
 

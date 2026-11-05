@@ -52,9 +52,29 @@ from .approval import (
     call_hash,
     verify_approval_token,
 )
+from .audit import (
+    SHIPPED_FORMAT,
+    BadCheckpoint,
+    CrossCheckReport,
+    ExportError,
+    ExportReport,
+    ShippedLine,
+    ShippedMismatch,
+    cross_check,
+    parse_shipped,
+    verify_export,
+)
 from .capability import ArgLimit, Capability, Equals, Limits, OneOf, Prefix, Range
 from .client import AsyncClient, Client
-from .dpop import DpopKey
+from .dpop import (
+    NONCE_HEADER,
+    USE_DPOP_NONCE,
+    DpopKey,
+    NonceCache,
+    access_token_hash,
+    is_use_dpop_nonce,
+    jwk_thumbprint,
+)
 from .errors import (
     ApiError,
     ApprovalNotGranted,
@@ -66,8 +86,9 @@ from .errors import (
     Unauthorized,
     VerificationError,
 )
+from .mcp import TokenAuth, mcp_headers, mcp_url
 from .refresh import AsyncTokenRefresher, TokenRefresher
-from .token import Chain, Hop, Token, User, decode_token, verify_token
+from .token import TOKEN_TYPE, Chain, Hop, Token, User, decode_token, verify_token
 
 try:
     __version__ = version("attenuo")
@@ -78,6 +99,10 @@ __all__ = [
     "APPROVAL_TOKEN_TYPE",
     "DEFAULT_MAX_EVENT_BYTES",
     "META_APPROVAL_KEY",
+    "NONCE_HEADER",
+    "SHIPPED_FORMAT",
+    "TOKEN_TYPE",
+    "USE_DPOP_NONCE",
     "AdminClient",
     "ApiError",
     "Approval",
@@ -94,17 +119,21 @@ __all__ = [
     "AuditFilter",
     "AuditPage",
     "AuthzenDecision",
+    "BadCheckpoint",
     "BudgetLimit",
     "Capability",
     "Chain",
     "CheckpointPage",
     "Client",
+    "CrossCheckReport",
     "Denied",
     "DpopKey",
     "Equals",
     "EvaluationBudget",
     "EvaluationLabels",
     "EvaluationUsage",
+    "ExportError",
+    "ExportReport",
     "Hop",
     "Lease",
     "LeaseNode",
@@ -112,6 +141,7 @@ __all__ = [
     "LeaseStatus",
     "LeaseTree",
     "Limits",
+    "NonceCache",
     "OneOf",
     "PolicyCheck",
     "PolicyEvaluation",
@@ -123,12 +153,15 @@ __all__ = [
     "RevokeResult",
     "RpcError",
     "SelectorRevocation",
+    "ShippedLine",
+    "ShippedMismatch",
     "StatedApproval",
     "StatedBudget",
     "StatedSession",
     "StatedUsage",
     "StreamEvent",
     "Token",
+    "TokenAuth",
     "TokenRefresher",
     "Tool",
     "ToolResult",
@@ -136,8 +169,16 @@ __all__ = [
     "User",
     "VerificationError",
     "VerifyReport",
+    "access_token_hash",
     "call_hash",
+    "cross_check",
     "decode_token",
+    "is_use_dpop_nonce",
+    "jwk_thumbprint",
+    "mcp_headers",
+    "mcp_url",
+    "parse_shipped",
     "verify_approval_token",
+    "verify_export",
     "verify_token",
 ]
