@@ -195,7 +195,7 @@ pub struct ExchangeResponse {
 impl ExchangeResponse {
     /// Build the response for a token minted at `now`.
     pub fn from_issued(issued: &IssuedToken, now: OffsetDateTime) -> Self {
-        let expires_in = (issued.expires_at - now).whole_seconds().max(0) as u64;
+        let expires_in = u64::try_from((issued.expires_at - now).whole_seconds()).unwrap_or(0);
         Self {
             access_token: issued.token.clone(),
             issued_token_type: JWT_TOKEN_TYPE_URN.to_owned(),

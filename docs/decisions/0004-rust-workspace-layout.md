@@ -43,3 +43,34 @@ Conventions:
 - **Two crates (lib + bin)**: does not separate the trusted base from transport code, and forces gateways to take the proxy with the PDP.
 - **Separate crate per standard** (`rfc8693`, `authzen`, `idjag`): premature; the standards are drafts and are revised together.
 - **A Go implementation to match most gateways**: rejected; Cedar and the VMM layer are Rust, and in-process Cedar from Go would need CGo.
+
+## More Information
+
+### Update 2026-11-05
+
+The decision stands: a Cargo workspace, dependencies pointing only downward, status accepted. The layout above has drifted from the code in the ways below, checked against the `Cargo.toml` files and the sources at this date. The table in Decision is kept as written; read it with these corrections.
+
+- **Eight crates, not seven.** `attenuo-bench` (load and hot-path measurement) was added. It has no workspace dependencies: it spawns the built binaries.
+- **IdP intake and JWKS fetching are in `attenuo-server`, not `attenuo-token`.** ID-JAG and OIDC intake and the IdP key cache live in `attenuo-server/src/idp/` (`intake.rs`, `jwks.rs`, `claims.rs`). `attenuo-token` has no HTTP client code for them.
+- **`attenuo-audit` depends on `attenuo-token`**, for `DetachedSigner` and `verify_detached` (checkpoint signing). The verifier became the `attenuo audit verify` command in the CLI rather than a separate binary.
+- **`attenuo-cli` depends on `attenuo-audit` and `attenuo-policy`** as well as core and token. `audit verify --file` and `policy test` / `policy lint` run locally, the latter against the real `PolicyEngine`. "Decides nothing" holds only for the online commands.
+- **`attenuo-proxy` depends only on `attenuo-core`**, narrower than the table. It reaches the decision side through its `Authorizer` trait.
+- **The `RelationResolver` trait was never built** in `attenuo-policy`. Hot reload is driven by the server (`POST /admin/policies/reload`).
+- **`attenuo-server` holds real logic**, not only wiring: `authz.rs` (the authorization pipeline), `dpop.rs`, `actor.rs`, `replay.rs`, `sink.rs` and `idp/`. The [server design](../design/server.md) describes `authz::Pipeline` as the server's piece of composition.
+- **Names in core:** the code has `LeaseId` and `DecisionRecord` where the table says `Lease` and `AuditRecord`.
+- **Unsafe code:** `attenuo-core` and `attenuo-policy` use `#![forbid(unsafe_code)]`; the other crates use `#![deny(unsafe_code)]`.
+
+Workspace dependencies between crates, from the manifests (`[dependencies]` only; "x" means the row depends on the column):
+
+| Crate | core | token | policy | audit | proxy | server |
+|---|---|---|---|---|---|---|
+| `attenuo-core` | | | | | | |
+| `attenuo-token` | x | | | | | |
+| `attenuo-policy` | x | | | | | |
+| `attenuo-audit` | x | x | | | | |
+| `attenuo-proxy` | x | | | | | |
+| `attenuo-server` | x | x | x | x | x | |
+| `attenuo-cli` | x | x | x | x | | |
+| `attenuo-bench` | | | | | | |
+
+`attenuo-cli` has `attenuo-server` and `attenuo-proxy` as dev-dependencies only (integration tests). Source: [code-quality pass, 2026-11-05](../research/code-quality-2026-11-05.md).

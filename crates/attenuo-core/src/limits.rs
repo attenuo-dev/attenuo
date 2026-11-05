@@ -496,8 +496,16 @@ pub fn amount_of(v: &Value) -> Option<u64> {
     }
     let f = n.as_f64()?;
     // 2^53: beyond it a double no longer stands for one integer.
-    (f.is_finite() && f >= 0.0 && f.fract() == 0.0 && f <= 9_007_199_254_740_992.0)
-        .then_some(f as u64)
+    if !(f.is_finite() && f >= 0.0 && f.fract() == 0.0 && f <= 9_007_199_254_740_992.0) {
+        return None;
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "0 <= f <= 2^53 and f has no fraction, so the cast is exact"
+    )]
+    let whole = f as u64;
+    Some(whole)
 }
 
 /// One counter a call would be charged against: a limit of a capability of a hop.

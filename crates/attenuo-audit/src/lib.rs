@@ -14,6 +14,11 @@
 //! Nothing here evaluates policy; the sibling crates call into this one after deciding.
 
 #![deny(unsafe_code)]
+#![warn(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 
 pub mod approval;
 pub mod budget;

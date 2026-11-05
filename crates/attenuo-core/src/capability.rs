@@ -161,8 +161,15 @@ pub fn as_long(value: &Value) -> Option<i64> {
         return Some(i);
     }
     let f = n.as_f64()?;
-    // |f| <= WHOLE_FLOAT_MAX < 2^63, so the cast is exact.
-    (f.is_finite() && f.fract() == 0.0 && f.abs() <= WHOLE_FLOAT_MAX).then_some(f as i64)
+    if !(f.is_finite() && f.fract() == 0.0 && f.abs() <= WHOLE_FLOAT_MAX) {
+        return None;
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "|f| <= WHOLE_FLOAT_MAX < 2^63 and f has no fraction, so the cast is exact"
+    )]
+    let whole = f as i64;
+    Some(whole)
 }
 
 /// Does `range` admit every value canonically equal to `v` ([`value_eq`])? `satisfied_by(v)`
@@ -171,9 +178,15 @@ pub fn as_long(value: &Value) -> Option<i64> {
 /// large, so `equals 10^16` would let through a value the range refuses (SR-71). Such an
 /// integer has an equal float exactly when the float nearest to it is written with its digits.
 fn range_admits_all_equal(range: &ArgConstraint, v: &Value) -> bool {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "WHOLE_FLOAT_MAX is a positive whole number far below 2^64"
+    )]
+    const WHOLE_FLOAT_MAX_U64: u64 = WHOLE_FLOAT_MAX as u64;
     range.satisfied_by(v)
         && as_long(v).is_some_and(|n| {
-            n.unsigned_abs() <= WHOLE_FLOAT_MAX as u64
+            n.unsigned_abs() <= WHOLE_FLOAT_MAX_U64
                 || crate::jcs::format_f64(n as f64).as_deref() != Some(n.to_string().as_str())
         })
 }
