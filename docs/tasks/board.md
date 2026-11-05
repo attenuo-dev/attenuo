@@ -34,10 +34,10 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 - [x] Policy test harness: `attenuo policy test` (YAML cases through the real `PolicyEngine`) and `attenuo policy lint`; guide in [guides/writing-policies.md](../guides/writing-policies.md).
 
 ## Next
-- [ ] Centralise the `AuditError` to `ApiError` mapping so `?` on a domain refusal cannot answer 500 (M, debt item 1 of the [code-quality report](../research/code-quality-2026-11-05.md#i-prioritised-debt-list)).
+- [x] Centralise the `AuditError` to `ApiError` mapping so `?` on a domain refusal cannot answer 500 (M, debt item 1 of the [code-quality report](../research/code-quality-2026-11-05.md#i-prioritised-debt-list)). Done on `fix/hardening-small`: one mapping per variant in `error.rs`, pinned by a table test; renewal and the refund's unknown-charge lookup keep their own arms.
 - [ ] One `Authorization` scheme parser for the proxy and the server (M, item 3 of the [code-quality report](../research/code-quality-2026-11-05.md#i-prioritised-debt-list)).
 - [ ] `#![warn(missing_docs)]` for `attenuo-proxy` (41 items) and `attenuo-audit` (62), then `attenuo-policy` (93) (M, item 4 of the [code-quality report](../research/code-quality-2026-11-05.md#i-prioritised-debt-list)).
-- [ ] Adopt `clippy::cast_possible_truncation`, starting with the float-to-int casts on IdP claims and Cedar arguments (M, item 5 of the [code-quality report](../research/code-quality-2026-11-05.md#i-prioritised-debt-list)).
+- [ ] Adopt `clippy::cast_possible_truncation`, starting with the float-to-int casts on IdP claims and Cedar arguments (M, item 5 of the [code-quality report](../research/code-quality-2026-11-05.md#i-prioritised-debt-list)). Done for `attenuo-server` and `attenuo-policy` on `fix/hardening-small` (the two input casts checked, 17 other hits fixed, the three cast lints on in both); left: core, token, audit, proxy and the server's integration tests.
 - [ ] Split `attenuo-audit/src/sqlite.rs` (5,237 lines) and then `attenuo-server/src/authz.rs` (3,717) into submodules (L, item 7 of the [code-quality report](../research/code-quality-2026-11-05.md#i-prioritised-debt-list)).
 - [ ] Replace wall-clock sleeps in TTL and window tests with an injectable clock (M, item 8 of the [code-quality report](../research/code-quality-2026-11-05.md#i-prioritised-debt-list)).
 - [ ] Narrow the server's `pub mod` surface and rename the issuer-keys `jwks` module (M, item 11 of the [code-quality report](../research/code-quality-2026-11-05.md#i-prioritised-debt-list)).
