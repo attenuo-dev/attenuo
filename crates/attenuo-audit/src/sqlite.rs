@@ -42,6 +42,9 @@ use crate::log::{
 use crate::query::{like_contains, EntryFilter, Order};
 use crate::spans::{distinct_hashes, evictions, SpanHit, SpanKey, MAX_SPANS_PER_RUN};
 
+mod outbox;
+pub use outbox::{NewNotice, OutboxNotice};
+
 const AUDIT_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS audit (
     seq                 INTEGER PRIMARY KEY,
@@ -2479,6 +2482,7 @@ impl SqliteLeaseStore {
     pub fn from_connection(conn: Connection) -> Result<Self, AuditError> {
         conn.execute_batch(LEASE_SCHEMA)?;
         add_approval_columns(&conn)?;
+        conn.execute_batch(outbox::OUTBOX_SCHEMA)?;
         let key: String = conn.query_row(
             "SELECT value FROM budget_meta WHERE key = 'value_key'",
             [],
