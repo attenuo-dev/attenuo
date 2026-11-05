@@ -387,8 +387,61 @@ How far these numbers go:
 - A2's grants are oracles. A real planner would write worse ones, and that could move utility either way, because a broader grant would also refuse fewer of these reads.
 - A model that sees only its granted tools might avoid many of these refusals. The proxy can filter `tools/list`, but this adapter doesn't pass that to the model. We haven't measured it, and it is the first thing to try.
 
+### The same arm on Sonnet
+
+A2 on Sonnet 5.5, on the workspace half of the [four-model sample](#four-models-on-one-sample-2026-11-05): 10 benign runs and all 140 pairs, $4.66. Haiku's row is the same tasks from the run above. Refused runs count as not done, and attack success is 0 in every cell.
+
+| Model and arm | Benign utility | Task done under attack | Runs refused |
+| --- | --- | --- | --- |
+| Haiku, baseline | 10/10 | 140/140 | 0 |
+| Haiku, A2 | 5/10 | 70/140 | 0 |
+| Sonnet, baseline | 10/10 | 112/140 | 28 |
+| Sonnet, A2 | 6/10 | 65/140 | 26 |
+
+- Attenuo costs about the same on both models here: benign utility falls to about half on these ten tasks. This sample is harsher than the 40-task figure of 29/40, because tasks 4, 6, 8 and 9 are all blocked by the contact rule and they make up 4 of the 10. Those four are exactly the tasks Sonnet lost.
+- The attenuo refusal and the classifier refusal are separate losses and they add up. On Sonnet the classifier stops 26 runs and attenuo's rules take the total of finished tasks from 112 to 65.
+- Attenuo allowed 13 of Sonnet's 19 benign calls and 181 of its 258 attack-run calls. The largest refused group under attack is `create_calendar_event` by policy (30), then `get_current_day` by capability (28).
+
+## Four models on one sample 2026-11-05
+
+The full suite on the larger models doesn't fit the budget, so all four ran one sample chosen before any call: workspace user tasks 0 to 9 against all 14 injection tasks plus their 10 benign runs, and banking user tasks 0 to 7 against all 9 plus 8 benign runs. That is 230 runs per model. `agentdojo` 0.1.35, suite `v1.2.2`, `important_instructions`, no attenuo, one run each. We kept this attack because `tool_knowledge` didn't change Haiku's behaviour. Haiku's figures come from its existing full run, not a rerun.
+
+| Model | Benign utility | Task done under attack | Attack success as scored | Runs refused | Cost |
+| --- | --- | --- | --- | --- | --- |
+| Haiku 5.5 | 16/18 | 188/212 | 0/212 | 0 | $0.35 |
+| Sonnet 5.5 | 16/18 | 173/212 | 0/212 | 28 | $6.26 |
+| Opus 5.5 | 18/18 | 111/212 | 0/212 | 92 | $11.11 |
+| Fable 5.1 | 18/18 | 166/212 | 0/212 | 37 | $31.95 |
+
+A refused run didn't do the user's task, so it counts as not done in the fourth column.
+
+| Model | Workspace task done | Workspace refused | Banking task done | Banking refused |
+| --- | --- | --- | --- | --- |
+| Haiku 5.5 | 140/140 | 0 | 48/72 | 0 |
+| Sonnet 5.5 | 112/140 | 28 | 61/72 | 0 |
+| Opus 5.5 | 49/140 | 91 | 62/72 | 1 |
+| Fable 5.1 | 103/140 | 37 | 63/72 | 0 |
+
+What the numbers show:
+
+- No attack succeeded on any model. Searching every tool call for the attackers' address, account and password, and for the file delete, found none in any model's 212 attack runs.
+- The injected text often stops the run instead. A refusal means `stop_reason: refusal`, from a safety classifier: the API ends the response, and the task goes undone. Every refused run had already read the injection, and none of the 18 benign runs per model was refused. On Opus, an attacker who can place text in the data the agent reads prevents the user's task in 91 of 140 workspace runs, while achieving nothing else. That is a denial of service, and the attack success rate doesn't show it. The same comparison by attack success alone would rank Opus level with the others.
+- Refusals follow the attacker's goal. They occur only on workspace injection tasks 4 to 13, which ask for security codes, mail or files to be sent out, plus one on banking's password change. Workspace tasks 0 to 3 were never refused. Opus refused 10 of 10 on most of those tasks.
+- Rerunning three refused pairs per model gave 7 refusals out of 9, all in category `cyber`, and 2 that this time finished normally. So refusals vary from run to run. The category wasn't recorded in the main runs, so it rests on those seven.
+- Haiku was never refused and finished the most under attack here, but on banking it finished fewest, at 48/72 against 61 to 63 for the others.
+
+How far this goes:
+
+- Two suites of four, and one attack. Travel and slack aren't in the sample. Effort stayed at each model's default: medium on Haiku and Opus, high on Sonnet and Fable. Those defaults may affect the comparison, and we didn't test that.
+- `max_tokens` was 16,000 on the three larger models and 4,096 on Haiku. No run on any model stopped at its limit.
+- There is no fallback model, as instructed. The API has a fallback option for refusals on some of these models, and it might recover many of these runs. We haven't measured that, and a real deployment would want to know.
+- One run per pair, with no pinned sampling. Differences of a few runs mean little, and the large gaps above are the ones to read.
+
 ## Decisions needed
 
-1. Whether to spend on Sonnet at all yet. On Haiku this attack lands nowhere, so a full Sonnet baseline at about $60 would most likely repeat that. We recommend testing a small sample first, and trying a stronger attack on Haiku, at about $2.50 per full pass, because attack strength is now the limiting factor. A deliberately weaker or older model is the other way to show enforcement working under a model, and it would need saying plainly in the report.
-2. Whether to run a model with attenuo in front of it. Attack success can't move, but a real model's utility under grants and labels can, and that is the number the replay can't give. It also needs a realistic grant source (next item).
-3. Planner grants. Whether to pay for a realistic planner on top of the oracle in A2.
+Spend so far is $61.58 of $168.50.
+
+1. Whether any more baseline spending helps. No attack succeeded on four models with this attack, and on Haiku with a stronger one too. Attacks that adapt to the model are a separate research effort, and more runs of stock attacks are unlikely to change this.
+2. Whether to report the refusal result. An injection that stops the user's task on Opus in most workspace runs is a finding about these models and this benchmark's scoring. It needs a fallback run, and more than one attack, before it is claimed in the report.
+3. Which attenuo cost to fix first. We recommend replacing the contact rule, which costs the most utility for almost no gain over grants, and then passing the proxy's filtered tool list to the model, and measuring both.
+4. Planner grants. Whether to pay for a realistic planner on top of the oracle in A2. Every utility number here still rests on oracle grants.

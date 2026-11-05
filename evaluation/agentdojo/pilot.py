@@ -107,6 +107,7 @@ class Meter:
             "cache_read_input_tokens": usage.cache_read_input_tokens,
             "cache_creation_input_tokens": usage.cache_creation_input_tokens,
             "stop_reason": completion.stop_reason,
+            "refusal_category": getattr(getattr(completion, "stop_details", None), "category", None),
             "dollars": dollars,
         }
         with self.path.open("a", encoding="utf-8") as fh:

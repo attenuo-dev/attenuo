@@ -83,6 +83,12 @@ def main(out: Path) -> None:
             },
             "errors": suite["errors"],
             "refusals": suite["refusals"],
+            # Refused runs did not do the user's task, so this is the figure to compare across models.
+            "done_counting_refusals_as_not_done": [
+                suite["attacked"][0],
+                suite["attacked"][1]
+                + sum(1 for r in suite["refusals"] if not r.endswith("/none")),
+            ],
             **{k: (dict(v) if isinstance(v, Counter) else v) for k, v in spend.items()},
         }
     report["total_dollars"] = sum(v["dollars"] for v in usage.values())
