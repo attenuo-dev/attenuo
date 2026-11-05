@@ -788,7 +788,7 @@ impl ScreenBase {
             }
             entities.push(json!({
                 "uid": uid_json("Agent", &hop.agent.0),
-                "attrs": { "id": hop.agent.0, "chain_depth": (i + 1) as i64 },
+                "attrs": { "id": hop.agent.0, "chain_depth": i + 1 },
                 "parents": parents,
             }));
         }
