@@ -62,8 +62,8 @@ Items that should be `pub(crate)`: the 19 `unreachable_pub` hits were methods on
 | Capability name pattern match (`*`, `prefix*`, exact) | `core/src/capability.rs:350` and `proxy/src/filter.rs:20`, line for line | Fixed: core's is public, the proxy re-exports it |
 | `Decision` to `"allow"`/`"deny"` | `audit/src/sqlite.rs:640`, `policy/src/testing.rs:1239`, `cli/src/policy_cmd.rs:449`, `server/src/authz.rs:643` | Fixed: `Decision::as_str` in core |
 | `[proxy] stream_recheck_seconds` default | `server/src/config.rs:1423` (literal `2`) and `proxy/src/config.rs:29` (`DEFAULT_STREAM_RECHECK`) | Fixed: the server reads the proxy constant like the other `[proxy]` defaults |
-| Bearer and DPoP `Authorization` parsing | `proxy/src/proxy.rs:224`, `server/src/routes/mod.rs:38` | Open (debt item 3) |
-| JSON-RPC denial and approval codes | `cli/src/main.rs:36-38`, `proxy/src/jsonrpc.rs:16,33` | Open (debt item 6) |
+| Bearer and DPoP `Authorization` parsing | `proxy/src/proxy.rs:224`, `server/src/routes/mod.rs:38` | Done (debt item 3, `chore/authz-parser-favicon`: `attenuo_core::authorization::token_of`) |
+| JSON-RPC denial and approval codes | `cli/src/main.rs:36-38`, `proxy/src/jsonrpc.rs:16,33` | Done (debt item 6, `chore/authz-parser-favicon`: `attenuo_core::jsonrpc`) |
 | `sha256_hex` test helper | 12 test files: `cli/tests/{admin_reads,budgets,dpop_nonce}.rs`, `server/tests/{actor_token,actor_token_hop0,admin_policies,dpop,e2e,oidc,range_constraint,run_limits,run_usage}.rs` | Open. Not folded into `attenuo_core::digest::sha256_bytes`: `admin_policies.rs` checks the server's policy hash against it, and an independent computation is the point there |
 | `fn attenuo()` (path of the CLI binary) | 11 CLI test files | Open (debt item 10) |
 | `wait_for` polling helper | `audit/tests/wal.rs:42`, `audit/tests/presync.rs:20`, `server/tests/checkpoint_sink.rs:122` | Open (debt item 10) |
