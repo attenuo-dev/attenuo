@@ -19,7 +19,8 @@
 //! `Mcp-Session-Id`, run (`chain_id`) and request id. An answer in the `POST`'s own
 //! body strikes the entry; a response on a `GET` stream of the same upstream, session and run
 //! claims it and is recorded (and withheld on failure) exactly like a `POST` answer, with the
-//! chain and `decision_id` of the call. So does a response in the body of a *later* `POST` of
+//! chain and `decision_id` of the call. When the map is full, the run holding the most calls
+//! gives up its oldest (SR-86), so one run cannot push out the calls of the others. So does a response in the body of a *later* `POST` of
 //! the same upstream, session and run (SR-85): clients route a response by its id whatever
 //! stream or body it arrives in, so an upstream could otherwise answer call 1 inside its
 //! answer to a `ping`, or to call 2, and get it to the agent unrecorded. The map is bounded ([`MAX_AWAITED_RESULTS`],
@@ -66,7 +67,8 @@ pub(crate) struct PendingResult {
 pub const AWAITED_RESULT_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// Most allowed calls remembered for the listen stream, over all sessions. When full, expired
-/// entries are dropped, then the oldest entry.
+/// entries are dropped, then the oldest entry of the run (`chain_id`) that holds the most
+/// (SR-86).
 pub const MAX_AWAITED_RESULTS: usize = 10_000;
 
 /// Most allowed calls remembered for one upstream session and run. One more drops that
@@ -120,13 +122,26 @@ impl AwaitedInner {
         self.len = len;
     }
 
+    /// Drop the oldest call of the run that holds the most calls (SR-86). Evicting the oldest
+    /// call overall let one run, with many sessions and calls whose answers never come, push
+    /// out every other run's calls, so a late answer to them passed the listen stream
+    /// unlabelled. A run that fills the map now evicts its own calls first.
     fn evict_oldest(&mut self) {
-        let oldest = self
-            .scopes
-            .iter()
-            .filter_map(|(k, v)| v.first().map(|a| (a.seq, k.clone())))
-            .min_by_key(|(seq, _)| *seq);
-        if let Some((_, key)) = oldest {
+        // Per run: how many calls it holds, and its oldest call's (seq, scope).
+        let mut runs: HashMap<&Option<String>, (usize, u64, &ResultScope)> = HashMap::new();
+        for (k, v) in &self.scopes {
+            let Some(first) = v.first() else { continue };
+            let e = runs.entry(&k.run).or_insert((0, first.seq, k));
+            e.0 += v.len();
+            if first.seq < e.1 {
+                (e.1, e.2) = (first.seq, k);
+            }
+        }
+        let victim = runs
+            .into_values()
+            .max_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)))
+            .map(|(_, _, k)| k.clone());
+        if let Some(key) = victim {
             self.remove_at(&key, 0);
         }
     }
@@ -666,6 +681,33 @@ id: 4\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
         assert!(
             !awaited.any_in(&scope),
             "the first session's calls were the oldest"
+        );
+    }
+
+    #[test]
+    fn a_run_that_fills_the_map_evicts_its_own_calls_sr86() {
+        let awaited = AwaitedResults::new();
+        let now = Instant::now();
+        // The victim's run remembers one call first, so it is the oldest in the map.
+        let victim = test_chain("user:v", "agent:v", [Capability::new("s", "*")]);
+        let victim_scope = ResultScope::new("s", Some("victim"), &victim);
+        awaited.remember(&victim_scope, &victim, &[pending(json!(1))], now);
+        // Another run fills the map over many sessions, with calls that are never answered.
+        let flood = chain();
+        let per = MAX_AWAITED_RESULTS_PER_SESSION;
+        for n in 0..(MAX_AWAITED_RESULTS / per + 2) {
+            let s = ResultScope::new("s", Some(&format!("f{n}")), &flood);
+            let calls: Vec<_> = (0..per).map(|i| pending(json!(i))).collect();
+            awaited.remember(&s, &flood, &calls, now);
+        }
+        assert_eq!(awaited.len(), MAX_AWAITED_RESULTS);
+        assert!(
+            awaited.awaits(&victim_scope, &json!(1), now),
+            "the flooding run pushed out another run's call"
+        );
+        assert!(
+            !awaited.awaits(&ResultScope::new("s", Some("f0"), &flood), &json!(0), now),
+            "the flooding run's oldest call went first"
         );
     }
 
