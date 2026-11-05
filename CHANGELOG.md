@@ -10,11 +10,15 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ### Added
 
+- Python SDK: the package root exports the audit verification helpers (`verify_export`, `cross_check`, `parse_shipped`, `ExportError`, the report types, `SHIPPED_FORMAT`), the MCP helpers (`mcp_url`, `mcp_headers`, `TokenAuth`), the DPoP helpers (`NonceCache`, `access_token_hash`, `jwk_thumbprint`, `is_use_dpop_nonce`, `NONCE_HEADER`, `USE_DPOP_NONCE`) and `TOKEN_TYPE`, as the TypeScript root does. The submodule imports still work.
 - Brand assets under `assets/brand/` (mark, favicon, README header, social preview) and a favicon for the docs site. The mark is the delegation chain: three squares narrowing left to right.
 - The admin console serves the brand favicon at `/favicon.svg` (and `/admin/ui/favicon.svg`) and links it from its page, with the same headers as its other files and no CSP change.
 
 ### Changed
 
+- ADR-0004 has an "Update 2026-11-05" section: eight crates, IdP intake and JWKS in the server, the audit, CLI and proxy dependencies as built, no `RelationResolver`, and a dependency table from the manifests.
+- `JcsError` derives `thiserror::Error`; the messages are unchanged.
+- `attenuo-core`, `attenuo-token` and `attenuo-audit` warn on `clippy::cast_possible_truncation`, `cast_sign_loss` and `cast_possible_wrap`. The casts are checked or saturating conversions with the same results, except that `SqliteAudit::range` with a `from_seq` above `i64::MAX` now returns nothing instead of wrapping to a negative bound and returning every entry (no such seq exists).
 - Injection suite: the harness has a stage `input` for the proxy's argument type check (reason `input_type_mismatch`, which refuses a mistyped argument before Cedar since 799350c), between `capability` and `policy`. It is counted per stage (`blocked_input`, an `Input` column in the per-stage tables), the labelling oracle gives it to a declared argument of another JSON type, and the two test-split calls it refuses (`t-banking-02` call 1, `t-workspace-03` call 2) expect it instead of `policy`. The 18 problems of `results/2026-11-05-final-main.md` are gone and every per-arm count is unchanged; the new baseline of `scripts/reproduce.sh` is `evaluation/injection-suite/results/2026-11-05-type-check-stage.md`.
 - CI: the macOS tests run weekly and on dispatch instead of on every push to main, the fuzz build runs on main, weekly and on pull requests touching `fuzz/`, documentation-only pull requests skip the Rust jobs, `cargo audit` uses a prebuilt binary, four jobs share one cargo cache, every job has a timeout, and a `ci-ok` job is the check to require once branch protection is on. About 19 billed minutes per pull request run instead of about 27; see [the write-up](docs/research/ci-minutes-2026-11-05.md).
 ### Security
