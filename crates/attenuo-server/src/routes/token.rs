@@ -637,7 +637,8 @@ fn form_to_json(body: &Bytes) -> Result<Value, ApiError> {
     let mut obj = Map::new();
     let mut scope: Option<String> = None;
     for (k, v) in pairs {
-        if obj.contains_key(&k) {
+        // `scope` is kept aside until the end, so it is checked here too (SR-88).
+        if obj.contains_key(&k) || (k == "scope" && scope.is_some()) {
             // RFC 6749 §3.1: parameters must not be included more than once.
             return Err(ApiError::bad_request(
                 "invalid_request",
@@ -808,6 +809,9 @@ mod tests {
     #[test]
     fn form_rejects_repeats_and_bad_json() {
         assert!(form_to_json(&Bytes::from("actor=a&actor=b")).is_err());
+        // `scope` too, which used to keep the last one (SR-88).
+        let repeated = form_to_json(&Bytes::from("scope=github%3Aread_file&scope=github%3A*"));
+        assert!(repeated.is_err(), "{repeated:?}");
         assert!(form_to_json(&Bytes::from("authorization_details=%5Bnope")).is_err());
         assert!(form_to_json(&Bytes::from("scope=nocolon")).is_err());
     }

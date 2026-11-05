@@ -16,6 +16,11 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 - Injection suite: the harness has a stage `input` for the proxy's argument type check (reason `input_type_mismatch`, which refuses a mistyped argument before Cedar since 799350c), between `capability` and `policy`. It is counted per stage (`blocked_input`, an `Input` column in the per-stage tables), the labelling oracle gives it to a declared argument of another JSON type, and the two test-split calls it refuses (`t-banking-02` call 1, `t-workspace-03` call 2) expect it instead of `policy`. The 18 problems of `results/2026-11-05-final-main.md` are gone and every per-arm count is unchanged; the new baseline of `scripts/reproduce.sh` is `evaluation/injection-suite/results/2026-11-05-type-check-stage.md`.
 - CI: the macOS tests run weekly and on dispatch instead of on every push to main, the fuzz build runs on main, weekly and on pull requests touching `fuzz/`, documentation-only pull requests skip the Rust jobs, `cargo audit` uses a prebuilt binary, four jobs share one cargo cache, every job has a timeout, and a `ci-ok` job is the check to require once branch protection is on. About 19 billed minutes per pull request run instead of about 27; see [the write-up](docs/research/ci-minutes-2026-11-05.md).
+### Security
+
+- Proxy: an answer to an earlier allowed call that an upstream puts in the body of a later `POST` of the same session and run (a `ping`, a list request or another call) is now recorded and labelled before it is relayed, like an answer on the listen stream; clients route a response by its id whatever body it arrives in. A `POST` that forwards a request while calls of its scope are awaited has its answer read for this, and one the proxy cannot read is answered `502` (SR-85).
+- Proxy: when the map of calls awaited for the listen stream is full, the run holding the most entries gives up its oldest, so one run can no longer push out every other run's awaited calls (SR-86).
+- Server: a repeated form `scope` on `POST /token` is refused like any other repeated parameter, instead of keeping the last one (SR-88).
 
 ## [0.1.0] - 2026-10-24
 
