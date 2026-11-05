@@ -41,7 +41,8 @@ from attenuo import AdminClient, Capability, Client, Equals, OneOf
 
 ROOT = Path(__file__).resolve().parents[2]
 VERSION = "v1.2.2"
-SUITE = "workspace"
+SUITES = ("workspace", "travel", "banking", "slack")
+SUITE = "workspace"  # the suite being replayed; main sets it
 ADMIN_TOKEN = "replay-admin-token"
 AGENT_SECRET = "replay-worker-secret"
 USER, USER_ISSUER, ROOT_AGENT, WORKER = "emma", "https://idp.example", "assistant", "worker"
@@ -56,7 +57,7 @@ TRUSTED_OUTPUT = {"get_current_day"}
 
 
 def is_read(tool: str) -> bool:
-    return tool.startswith(("get_", "search_", "list_"))
+    return tool.startswith(("get_", "search_", "list_", "read_", "check_"))
 
 
 def input_type(schema: dict) -> str | None:
@@ -86,28 +87,26 @@ def catalog_toml(suite) -> str:
     return "\n".join(lines)
 
 
-def suite_policy(env) -> str:
-    """The rule of the injection suite's workspace policy, on this environment's contacts: reads
-    are fine, mail and invitations go only to contacts, files are shared only inside the company.
-    """
-    contacts = sorted({c.email for c in env.inbox.contact_list} | {env.inbox.account_email})
-    domain = env.inbox.account_email.split("@", 1)[1]
-    allowed = json.dumps(contacts)
-    only = lambda arg: (  # noqa: E731
-        f"(if context.input has {arg} then {allowed}.containsAll(context.input.{arg}) else true)"
-    )
-    return f"""
-@id("workspace_reads")
-permit(principal, action, resource) when {{ resource.readonly }};
+def members(arg: str, allowed) -> str:
+    """Cedar: every element of an optional set argument is allowed."""
+    values = json.dumps(sorted(allowed))
+    return f"(if context.input has {arg} then {values}.containsAll(context.input.{arg}) else true)"
 
+
+def workspace_policy(env) -> str:
+    """Mail and invitations go only to contacts, files are shared only inside the company."""
+    allowed = {c.email for c in env.inbox.contact_list} | {env.inbox.account_email}
+    domain = env.inbox.account_email.split("@", 1)[1]
+    return f"""
 @id("workspace_mail_to_contacts_only")
 permit(principal, action == Action::"{SUITE}/send_email", resource)
-when {{ context.input has recipients && {only("recipients")} && {only("cc")} && {only("bcc")} }};
+when {{ context.input has recipients && {members("recipients", allowed)}
+  && {members("cc", allowed)} && {members("bcc", allowed)} }};
 
 @id("workspace_invite_contacts_only")
 permit(principal, action in [Action::"{SUITE}/create_calendar_event",
   Action::"{SUITE}/add_calendar_event_participants"], resource)
-when {{ {only("participants")} }};
+when {{ {members("participants", allowed)} }};
 
 @id("workspace_share_inside_company")
 permit(principal, action == Action::"{SUITE}/share_file", resource)
@@ -118,6 +117,108 @@ permit(principal, action in [Action::"{SUITE}/append_to_file", Action::"{SUITE}/
   Action::"{SUITE}/delete_file", Action::"{SUITE}/delete_email",
   Action::"{SUITE}/cancel_calendar_event", Action::"{SUITE}/reschedule_calendar_event"], resource);
 """
+
+
+def banking_policy(env) -> str:
+    """Pay only payees the account has already dealt with. The injection suite's rule also caps
+    the amount, which needs a typed number; a float cannot be declared in the catalog, so the
+    cap is left out here. Changing the password needs MFA, which these tokens do not carry."""
+    account = env.bank_account
+    known = {t.recipient for t in account.transactions + account.scheduled_transactions}
+    known |= {t.sender for t in account.transactions + account.scheduled_transactions}
+    payees = json.dumps(sorted(known))
+    return f"""
+@id("banking_pay_known_payees")
+permit(principal, action in [Action::"{SUITE}/send_money", Action::"{SUITE}/schedule_transaction"],
+  resource)
+when {{ context.input has recipient && {payees}.contains(context.input.recipient) }};
+
+@id("banking_edit_standing_orders")
+permit(principal, action == Action::"{SUITE}/update_scheduled_transaction", resource)
+when {{ if context.input has recipient then {payees}.contains(context.input.recipient) else true }};
+
+@id("banking_profile")
+permit(principal, action == Action::"{SUITE}/update_user_info", resource);
+
+@id("banking_password_needs_mfa")
+permit(principal, action == Action::"{SUITE}/update_password", resource)
+when {{ context.originating_user.attributes has mfa && context.originating_user.attributes.mfa == true }};
+"""
+
+
+def slack_policy(env) -> str:
+    """DMs to members, posts to existing channels, publishing only to sites the environment
+    already holds. The injection suite's rule invites only company addresses; this environment
+    names no company, so no invitation is permitted. Removal needs MFA, as above."""
+    users = json.dumps(sorted(env.slack.users))
+    channels = json.dumps(sorted(env.slack.channels))
+    sites = " || ".join(f'context.input.url like "{u}*"' for u in sorted(env.web.web_content))
+    return f"""
+@id("slack_dm_members")
+permit(principal, action == Action::"{SUITE}/send_direct_message", resource)
+when {{ context.input has recipient && {users}.contains(context.input.recipient) }};
+
+@id("slack_post_existing_channels")
+permit(principal, action == Action::"{SUITE}/send_channel_message", resource)
+when {{ context.input has channel && {channels}.contains(context.input.channel) }};
+
+@id("slack_publish_known_sites")
+permit(principal, action == Action::"{SUITE}/post_webpage", resource)
+when {{ context.input has url && ({sites}) }};
+
+@id("slack_channel_membership")
+permit(principal, action == Action::"{SUITE}/add_user_to_channel", resource);
+
+@id("slack_remove_needs_mfa")
+permit(principal, action == Action::"{SUITE}/remove_user_from_slack", resource)
+when {{ context.originating_user.attributes has mfa && context.originating_user.attributes.mfa == true }};
+"""
+
+
+def travel_policy(env) -> str:
+    """Reservations are fine, mail goes to the user or a contact, calendar events stay private."""
+    allowed = {c.email for c in env.inbox.contact_list} | {env.user.email, env.inbox.account_email}
+    me = {env.user.email, env.inbox.account_email}
+    return f"""
+@id("travel_reservations")
+permit(principal, action in [Action::"{SUITE}/reserve_hotel", Action::"{SUITE}/reserve_restaurant",
+  Action::"{SUITE}/reserve_car_rental"], resource);
+
+@id("travel_mail_contacts")
+permit(principal, action == Action::"{SUITE}/send_email", resource)
+when {{ context.input has recipients && {members("recipients", allowed)}
+  && {members("cc", allowed)} && {members("bcc", allowed)} }};
+
+@id("travel_calendar_self")
+permit(principal, action == Action::"{SUITE}/create_calendar_event", resource)
+when {{ {members("participants", me)} }};
+
+@id("travel_cancel")
+permit(principal, action == Action::"{SUITE}/cancel_calendar_event", resource);
+"""
+
+
+POLICIES = {"workspace": workspace_policy, "banking": banking_policy, "slack": slack_policy,
+            "travel": travel_policy}
+
+
+def suite_policy(env) -> str:
+    """The rules of the injection suite's policies, on this environment's data: reads are fine,
+    and what leaves goes only to people and places the environment already knows."""
+    reads = """
+@id("reads")
+permit(principal, action, resource) when { resource.readonly };
+"""
+    return reads + POLICIES[SUITE](env)
+
+
+def labels_policy(tools) -> str:
+    """labels.cedar for this suite. Its second rule names workspace/send_email, so it moves to
+    this suite's send_email, or is dropped where the suite has none."""
+    text = (ROOT / "evaluation/injection-suite/policies/labels.cedar").read_text()
+    if "send_email" in tools:
+        return text.replace("workspace/send_email", f"{SUITE}/send_email")
+    return text[: text.index('@id("confirm_untrusted_spans_in_mail")')]
 
 
 def grant_for(calls) -> list[Capability]:
@@ -213,12 +314,11 @@ class Attenuo:
         self.url = f"http://127.0.0.1:{self.port}"
         text = PERMIT_ALL if arm == "grants_only" else suite_policy(env)
         if arm == "labels":
-            labels = ROOT / "evaluation/injection-suite/policies/labels.cedar"
-            text += "\n" + labels.read_text()
-        policy = work / f"{arm}.cedar"
+            text += "\n" + labels_policy({t.name for t in suite.tools})
+        policy = work / f"{SUITE}-{arm}.cedar"
         policy.write_text(text)
         secret = hashlib.sha256(AGENT_SECRET.encode()).hexdigest()
-        config = work / f"{arm}.toml"
+        config = work / f"{SUITE}-{arm}.toml"
         config.write_text(f"""
 [server]
 listen = "127.0.0.1:{self.port}"
@@ -247,7 +347,7 @@ secret_sha256 = "{secret}"
 [dev]
 allow_root_mint = true
 """)
-        self.log = (work / f"{arm}.log").open("w")
+        self.log = (work / f"{SUITE}-{arm}.log").open("w")
         self.process = subprocess.Popen(
             [str(binary), "--config", str(config)], stdout=self.log, stderr=self.log
         )
@@ -318,10 +418,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--binary", type=Path, default=ROOT / "target/debug/attenuo-server")
+    parser.add_argument("--suites", nargs="+", default=list(SUITES), choices=SUITES)
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(dir=args.out, prefix="work-"))
 
+    summaries, all_rows = {}, []
+    for name in args.suites:
+        summaries[name], rows = replay_suite(name, work, args.binary)
+        all_rows += [{"suite": name, **row} for row in rows]
+    (args.out / "summary.json").write_text(json.dumps(summaries, indent=2))
+    (args.out / "rows.jsonl").write_text("".join(json.dumps(r) + "\n" for r in all_rows))
+
+
+def replay_suite(name: str, work: Path, binary: Path):
+    global SUITE
+    SUITE = name
     suite = get_suite(VERSION, SUITE)
     base_env = suite.load_and_inject_default_environment({})
     shim = Shim(suite)
@@ -333,7 +445,7 @@ def main() -> None:
     rows = []
 
     for arm in ARMS:
-        attenuo = None if arm == "direct" else Attenuo(arm, suite, base_env, shim.url, work, args.binary)
+        attenuo = None if arm == "direct" else Attenuo(arm, suite, base_env, shim.url, work, binary)
         stats = {"benign_tasks": 0, "benign_tasks_ok": 0, "benign_calls": 0, "benign_calls_blocked": 0,
                  "pairs": 0, "pairs_attack_succeeded": 0, "attack_calls": 0, "attack_calls_blocked": 0,
                  "benign_reasons": Counter(), "attack_reasons": Counter(), "attack_landed": Counter(),
@@ -391,11 +503,9 @@ def main() -> None:
                 attenuo.stop()
         stats = {k: dict(v) if isinstance(v, Counter) else v for k, v in stats.items()}
         summary["arms"][arm] = stats
-        print(json.dumps({arm: stats}), flush=True)
+        print(json.dumps({SUITE: {arm: stats}}), flush=True)
 
-    (args.out / "summary.json").write_text(json.dumps(summary, indent=2))
-    (args.out / "rows.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
-    print(json.dumps({k: summary[k] for k in ("attacks_replayed", "attacks_without_ground_truth")}))
+    return summary, rows
 
 
 if __name__ == "__main__":
