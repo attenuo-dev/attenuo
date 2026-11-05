@@ -347,7 +347,9 @@ fn pattern_covers(parent: &str, child: &str) -> bool {
     }
 }
 
-fn pattern_matches(pattern: &str, name: &str) -> bool {
+/// Does `name` match a server or tool `pattern` of a capability: `*` matches anything,
+/// `prefix*` matches names starting with `prefix`, anything else matches only itself.
+pub fn pattern_matches(pattern: &str, name: &str) -> bool {
     if pattern == "*" {
         return true;
     }
