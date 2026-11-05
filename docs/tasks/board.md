@@ -34,6 +34,14 @@ First 30 days. Technical tasks only. Milestones in [milestones.md](milestones.md
 - [x] Policy test harness: `attenuo policy test` (YAML cases through the real `PolicyEngine`) and `attenuo policy lint`; guide in [guides/writing-policies.md](../guides/writing-policies.md).
 
 ## Next
+- [ ] Centralise the `AuditError` to `ApiError` mapping so `?` on a domain refusal cannot answer 500 (M, debt item 1 of the [code-quality report](../research/code-quality-2026-11-05.md#i-prioritised-debt-list)).
+- [ ] One `Authorization` scheme parser for the proxy and the server (M, item 3 of the [code-quality report](../research/code-quality-2026-11-05.md#i-prioritised-debt-list)).
+- [ ] `#![warn(missing_docs)]` for `attenuo-proxy` (41 items) and `attenuo-audit` (62), then `attenuo-policy` (93) (M, item 4 of the [code-quality report](../research/code-quality-2026-11-05.md#i-prioritised-debt-list)).
+- [ ] Adopt `clippy::cast_possible_truncation`, starting with the float-to-int casts on IdP claims and Cedar arguments (M, item 5 of the [code-quality report](../research/code-quality-2026-11-05.md#i-prioritised-debt-list)).
+- [ ] Split `attenuo-audit/src/sqlite.rs` (5,237 lines) and then `attenuo-server/src/authz.rs` (3,717) into submodules (L, item 7 of the [code-quality report](../research/code-quality-2026-11-05.md#i-prioritised-debt-list)).
+- [ ] Replace wall-clock sleeps in TTL and window tests with an injectable clock (M, item 8 of the [code-quality report](../research/code-quality-2026-11-05.md#i-prioritised-debt-list)).
+- [ ] Narrow the server's `pub mod` surface and rename the issuer-keys `jwks` module (M, item 11 of the [code-quality report](../research/code-quality-2026-11-05.md#i-prioritised-debt-list)).
+- [ ] Adopt `clippy::missing_errors_doc` for core, token and policy (M, item 12 of the [code-quality report](../research/code-quality-2026-11-05.md#i-prioritised-debt-list)).
 - [ ] Admin console: serve `assets/brand/favicon.svg` as `/favicon.svg` with a `<link rel="icon">` in the console page (embedded like the other UI files, no CSP change). The docs site already has it via `book-theme/`; the social preview is uploaded by hand under the repository settings.
 
 - [x] Metrics for 0.1.0 (`feat/metrics-limits-approvals`): `/metrics` series for run limits (charges, exhaustion by kind and where, refunds), approvals (created, decided, consumed, expired, by approver kind), output labelling (results by label, taint matches), the SR-55 run lock wait histogram and the WAL checkpointer; full table in the [HTTP API reference](../reference/http-api.md#metrics), example alert rules in the [deploy guide](../guides/deploying.md#what-to-monitor).
