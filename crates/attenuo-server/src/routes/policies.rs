@@ -353,8 +353,8 @@ fn budget_from_json(
         None | Some(Value::Null) => Ok(None),
         Some(n) => n
             .as_i64()
-            .filter(|n| *n >= 0)
-            .map(|n| Some(n as u64))
+            .and_then(|n| u64::try_from(n).ok())
+            .map(Some)
             .ok_or_else(|| bad(&format!("`{at}{key}` must be a non-negative integer"))),
     };
     let flag = |key: &str| match obj.get(key) {

@@ -19,6 +19,19 @@ use crate::CallLabels;
 // Cedar decimal range is +/-922337203685477.5807; stay a little inside it.
 const DECIMAL_MAX: f64 = 922_337_203_685_477.0;
 
+/// A float read as a Cedar `Long`: a finite whole number of magnitude at most [`DECIMAL_MAX`]
+/// (RFC-0001 section 5), so `5.0` is `5` and `-1.0` is `-1`. NaN, the infinities, fractions
+/// (`5.5`) and larger magnitudes (`1e300`) are not a `Long`. [`to_cedar_json`] and the
+/// declared-type check both read numbers through this, so they cannot disagree.
+fn whole_long(f: f64) -> Option<i64> {
+    if !(f.is_finite() && f.fract() == 0.0 && f.abs() <= DECIMAL_MAX) {
+        return None;
+    }
+    // Whole and |f| <= DECIMAL_MAX < 2^53, so the cast is exact.
+    #[allow(clippy::cast_possible_truncation)]
+    Some(f as i64)
+}
+
 /// Something in the call or chain that cannot be expressed to Cedar safely.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TranslationError(pub String);
@@ -49,12 +62,12 @@ pub(crate) fn to_cedar_json(value: &Value, path: &str) -> Result<Value, Translat
             if let Some(i) = n.as_i64() {
                 json!(i)
             } else if let Some(f) = n.as_f64() {
-                if f.is_finite() && f.fract() == 0.0 && f.abs() <= DECIMAL_MAX {
+                if let Some(i) = whole_long(f) {
                     // JSON has one number type: `0.0` is the value `0` to most consumers
                     // (JavaScript, Python's `==`), so it must be the Cedar `Long` 0 too.
                     // Otherwise `forbid ... when { context.input.n == 0 }` is bypassed by
-                    // sending `0.0`. |f| <= DECIMAL_MAX < 2^63, so the cast is exact.
-                    json!(f as i64)
+                    // sending `0.0`.
+                    json!(i)
                 } else if f.is_finite() && f.abs() <= DECIMAL_MAX {
                     json!({ "__extn": { "fn": "decimal", "arg": format!("{f:.4}") } })
                 } else {
@@ -164,9 +177,7 @@ fn input_matches(value: &Value, ty: &ArgType) -> bool {
     match (ty, value) {
         (ArgType::String, Value::String(_)) | (ArgType::Bool, Value::Bool(_)) => true,
         (ArgType::Long, Value::Number(n)) => {
-            n.is_i64()
-                || n.as_f64()
-                    .is_some_and(|f| f.is_finite() && f.fract() == 0.0 && f.abs() <= DECIMAL_MAX)
+            n.is_i64() || n.as_f64().and_then(whole_long).is_some()
         }
         (ArgType::Set(inner), Value::Array(items)) => {
             items.iter().all(|i| i.is_null() || input_matches(i, inner))
@@ -338,7 +349,7 @@ impl RequestParts {
                 "authenticated_at_unix": user.authenticated_at.unix_timestamp(),
             },
             "chain": {
-                "depth": chain.depth() as i64,
+                "depth": chain.depth(),
                 "agents": agents,
                 "root_agent": root_agent,
                 "leases": leases,
@@ -609,7 +620,7 @@ fn entities(
         }
         entities.push(json!({
             "uid": uid_json("Agent", &hop.agent.0),
-            "attrs": { "id": hop.agent.0, "chain_depth": (i + 1) as i64 },
+            "attrs": { "id": hop.agent.0, "chain_depth": i + 1 },
             "parents": parents,
         }));
     }
@@ -761,7 +772,7 @@ pub(crate) fn build(
     context.insert(
         "chain".into(),
         json!({
-            "depth": chain.depth() as i64,
+            "depth": chain.depth(),
             "agents": agents,
             "root_agent": root_agent,
             "leases": leases,
@@ -794,7 +805,7 @@ pub(crate) fn build(
         }
         entities.push(json!({
             "uid": uid_json("Agent", &hop.agent.0),
-            "attrs": { "id": hop.agent.0, "chain_depth": (i + 1) as i64 },
+            "attrs": { "id": hop.agent.0, "chain_depth": i + 1 },
             "parents": parents,
         }));
     }
@@ -849,6 +860,41 @@ fn user_attributes_value(attrs: &BTreeMap<String, Value>) -> Result<Value, Trans
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn floats_are_a_long_only_when_whole_and_in_range() {
+        assert_eq!(whole_long(f64::NAN), None);
+        assert_eq!(whole_long(f64::INFINITY), None);
+        assert_eq!(whole_long(f64::NEG_INFINITY), None);
+        assert_eq!(whole_long(1e300), None);
+        assert_eq!(whole_long(-1e300), None);
+        assert_eq!(whole_long(DECIMAL_MAX + 1.0), None);
+        assert_eq!(whole_long(-1.0), Some(-1));
+        assert_eq!(whole_long(-0.0), Some(0));
+        assert_eq!(whole_long(5.0), Some(5));
+        assert_eq!(whole_long(5.5), None);
+        assert_eq!(whole_long(DECIMAL_MAX), Some(922_337_203_685_477));
+
+        // The translation and the declared-type check agree on every case JSON can carry
+        // (JSON has no NaN or infinity).
+        for (f, cedar) in [
+            (1e300, json!("1e+300")),
+            (-1.0, json!(-1)),
+            (5.0, json!(5)),
+            (
+                5.5,
+                json!({ "__extn": { "fn": "decimal", "arg": "5.5000" } }),
+            ),
+        ] {
+            let v = json!(f);
+            assert_eq!(to_cedar_json(&v, "input").unwrap(), cedar, "{f:e}");
+            assert_eq!(
+                input_matches(&v, &ArgType::Long),
+                whole_long(f).is_some(),
+                "{f:e}"
+            );
+        }
+    }
 
     #[test]
     fn nulls_are_dropped_and_numbers_mapped() {

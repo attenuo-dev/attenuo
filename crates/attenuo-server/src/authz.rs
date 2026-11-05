@@ -443,10 +443,16 @@ pub fn usage_json(u: &UsageContext) -> Value {
     })
 }
 
+/// A duration in whole microseconds for a log field, saturating (a `u64` of microseconds is
+/// over 500,000 years).
+fn micros(d: std::time::Duration) -> u64 {
+    u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
+}
+
 fn record_usage(u: &UsageContext) -> RecordUsage {
     RecordUsage {
-        calls: u.calls.max(0) as u64,
-        amount: u.amount.max(0) as u64,
+        calls: u64::try_from(u.calls).unwrap_or(0),
+        amount: u64::try_from(u.amount).unwrap_or(0),
         destination_seen: u.destination_seen,
     }
 }
@@ -546,7 +552,7 @@ impl Pipeline {
             audit,
             metrics: Metrics::new(),
             approval_ttl: time::Duration::seconds(
-                crate::config::DEFAULT_APPROVAL_TTL_SECONDS as i64,
+                i64::try_from(crate::config::DEFAULT_APPROVAL_TTL_SECONDS).unwrap_or(i64::MAX),
             ),
             approval_verifier: None,
             run_locks: (0..RUN_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
@@ -868,9 +874,9 @@ impl Pipeline {
         }
         self.metrics.observe_stage(Stage::AuditAppend, append_time);
         tracing::debug!(
-            lease_check_us = lease_time.as_micros() as u64,
-            policy_us = policy_time.map(|d| d.as_micros() as u64),
-            audit_append_us = append_time.as_micros() as u64,
+            lease_check_us = micros(lease_time),
+            policy_us = policy_time.map(micros),
+            audit_append_us = micros(append_time),
             "decision stages"
         );
         match appended {
@@ -1718,7 +1724,7 @@ impl ServerAuthorizer {
         self.pipeline.metrics().observe_stage(stage, elapsed);
         tracing::debug!(
             cache_hit = hit,
-            token_verify_us = elapsed.as_micros() as u64,
+            token_verify_us = micros(elapsed),
             "token verified"
         );
         out.map(|(v, _)| v)
@@ -1907,10 +1913,7 @@ impl Authorizer for ServerAuthorizer {
         self.pipeline
             .metrics()
             .observe_stage(Stage::BlockingPool, hop);
-        tracing::debug!(
-            blocking_pool_us = hop.as_micros() as u64,
-            "decision returned"
-        );
+        tracing::debug!(blocking_pool_us = micros(hop), "decision returned");
         AuthDecision {
             decision: d.decision,
             reason: d.reason,

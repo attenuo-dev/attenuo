@@ -42,6 +42,11 @@
 //! [`admin_ui::SECURITY_HEADERS`], and no CORS headers. See [`admin_ui`].
 
 #![deny(unsafe_code)]
+#![warn(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 
 pub mod actor;
 pub mod admin_ui;
@@ -555,8 +560,14 @@ mod maintenance_tests {
         cfg.leases.maintenance_batch_rows = batch_rows;
         cfg.leases.maintenance_max_passes = max_passes;
         let state = AppState::from_config(&cfg).unwrap();
-        assert_eq!(state.lease_maintenance.batch_rows, batch_rows as usize);
-        assert_eq!(state.lease_maintenance.max_passes, max_passes as usize);
+        assert_eq!(
+            state.lease_maintenance.batch_rows,
+            usize::try_from(batch_rows).unwrap()
+        );
+        assert_eq!(
+            state.lease_maintenance.max_passes,
+            usize::try_from(max_passes).unwrap()
+        );
         let expired = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
         for n in 0..30 {
             let id = LeaseId::new(format!("run{n:02}"));
