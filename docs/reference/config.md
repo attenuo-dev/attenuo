@@ -2,7 +2,7 @@
 
 The server reads one TOML file: `attenuo-server --config <file>` or `ATTENUO_CONFIG=<file>`. Unknown keys are rejected at start-up. Relative paths resolve against the working directory.
 
-The annotated source of truth is [config/example.toml](https://github.com/attenuo-dev/attenuo/blob/main/config/example.toml). Never use its example admin token or agent secret for anything real. [Deploying](../guides/deploying.md) covers what to change before you expose a server.
+The annotated source of truth is [config/example.toml](https://github.com/attenuo-dev/attenuo/blob/main/config/example.toml). Never use its example agent secrets for anything real; it ships no admin token. [Deploying](../guides/deploying.md) covers what to change before you expose a server.
 
 ## `[server]`
 
@@ -19,8 +19,8 @@ The names reserved for the server's own audit records are refused at start: `att
 | --- | --- | --- |
 | `issuer` | `http://127.0.0.1:8080` | The `iss` of tokens. Also the `aud` an ID-JAG must carry. |
 | `audience` | `attenuo` | The `aud` of issued tokens. |
-| `max_depth` | library default | Longest allowed delegation chain. The example sets 8. |
-| `default_ttl_seconds` | `900` | Token lifetime when the exchange does not ask for one. |
+| `max_depth` | `8` | Longest allowed delegation chain. |
+| `default_ttl_seconds` | `900` | Token lifetime when the exchange does not ask for one. Must be positive. |
 | `lease_interval_seconds` | `300` | How long a lease lives after issuance or renewal. Must be positive. |
 | `private_key_pem_path` | ephemeral key | Ed25519 PKCS#8 key. Created with mode 0600 on first start if missing. |
 | `previous_key_paths` | none | Retired keys (PEM) that stay trusted for verification and in the JWKS. They never sign. |
@@ -29,7 +29,7 @@ The names reserved for the server's own audit records are refused at start: `att
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `policies_path` | none | Cedar policy file. `POST /admin/policies/reload` re-reads it. |
+| `policies_path` | none | Cedar policy file. `POST /admin/policies/reload` re-reads it. Unset, the policy set is empty, so every call is denied, and reload is unavailable. |
 | `catalog_path` | none | JSON tool catalog. Can be combined with `[policy.catalog]`. |
 | `schema_path` | none | Cedar schema file (Cedar schema syntax) replacing the built-in base schema, the entity types policies are validated against. Actions, context types and `UserAttributes` are still generated. It must declare `User`, `Agent in [User, Agent]`, `Server` and `Tool in [Server]` with every attribute of the default, required and of the same type, or the server refuses to start and says what is missing; it may add entity types and optional attributes. Read once at start (a policy reload keeps it). A relative path is resolved against the working directory; `attenuo policy test` and `policy lint --config` resolve it against the config file, as they do `catalog_path`. |
 | `user_attributes` | none | Extra `originating_user.attributes` for the Cedar schema, as `{ name = "type" }`. Types: `string`, `long`, `bool`, `set<string>`. A value of another type is denied with `attribute_type_mismatch`. |
@@ -60,7 +60,7 @@ Server and tool names follow one rule everywhere (catalog, `[[upstreams]]`, capa
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `sqlite_path` | none | Audit log and lease registry. `:memory:` keeps both in memory and loses them on exit. |
+| `sqlite_path` | `":memory:"` | Audit log and lease registry. `:memory:` keeps both in memory and loses them on exit. |
 | `checkpoint_every` | 1000 | Sign a checkpoint every this many entries. 0 turns the count trigger off. |
 | `checkpoint_interval_seconds` | 300 | Also sign one this often, if entries arrived since the last. 0 turns the timer off. Whichever trigger fires first writes the checkpoint. |
 | `durability` | `"normal"` | `"normal"` or `"full"`: SQLite `synchronous` for a file-backed store, which always runs in WAL mode. `normal` does not sync on commit; `full` syncs every commit. Lease revocations always sync. Ignored for `:memory:`. See below. |
@@ -92,6 +92,8 @@ Ships every signed checkpoint off the host as it is created (SR-21); see [Shippi
 | `initial_backoff_ms` | 500 | First retry delay; doubles per attempt up to `max_backoff_seconds`, each wait drawn between half and all of it. Failed deliveries are retried until they succeed. |
 | `max_backoff_seconds` | 60 | Longest retry delay. |
 
+`queue_capacity`, `max_lag_seconds`, `timeout_seconds`, `initial_backoff_ms` and `max_backoff_seconds` must each be at least 1. A webhook `url` and an s3 `endpoint` must start with `http://` or `https://`.
+
 ## `[authzen]`
 
 | Key | Default | Meaning |
@@ -102,12 +104,12 @@ Ships every signed checkpoint off the host as it is created (SR-21); see [Shippi
 
 ## `[token]`
 
-How the caller of an exchange (hop n to n+1) proves it is the `actor` it names.
+How the caller of an exchange (hop n to n+1) proves it is the `actor` it names, and how the agent authenticates at hop 0 (IdP intake).
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `require_actor_auth` | `true` | The actor must authenticate with a method `actor_auth` accepts. When `false`, `actor` is asserted (the server warns at start-up), but credentials that are sent are still checked. |
-| `actor_auth` | `"either"` | `"secret"`: `[[agents]]` client credentials only; an `actor_token` is refused with `actor_token_not_accepted`. `"actor_token"`: an `actor_token` from an `[[actor_trust]]` issuer only; client credentials are refused with `client_auth_not_accepted`, and the server will not start without an `[[actor_trust]]` entry. `"either"`: both are accepted, and when both are sent both are checked. |
+| `require_actor_auth` | `true` | The actor of an exchange must authenticate with a method `actor_auth` accepts. When `false`, `actor` is asserted (the server warns at start-up), but credentials that are sent are still checked. Hop 0 always needs an authenticated agent, whatever this says. |
+| `actor_auth` | `"either"` | `"secret"`: `[[agents]]` client credentials only; an `actor_token` is refused with `actor_token_not_accepted`. `"actor_token"`: an `actor_token` from an `[[actor_trust]]` issuer only; client credentials are refused with `client_auth_not_accepted`, and the server will not start without an `[[actor_trust]]` entry. `"either"`: both are accepted, and when both are sent both are checked and must name the same agent. The same rule applies to the agent at hop 0, where `"actor_token"` without a token fails with `actor_token_required`. |
 
 It also sets sender-constrained tokens (DPoP, RFC 9449; see [Binding tokens to keys](../guides/binding-tokens-to-keys.md)):
 
@@ -143,7 +145,7 @@ Retention of the lease registry and what it records beside the leases (see [Leas
 
 ## `[[actor_trust]]`
 
-Issuers of workload identities whose JWTs are accepted as the RFC 8693 `actor_token` of an exchange. Give each entry exactly one key source: `jwks_url` (with `issuer`), or `spiffe_trust_domain` with `spiffe_bundle_url`. Neither is discovered. Hop 0 (IdP intake) still authenticates the agent with `[[agents]]` client credentials.
+Issuers of workload identities whose JWTs are accepted as the RFC 8693 `actor_token` of an exchange. Give each entry exactly one key source: `jwks_url` (with `issuer`), or `spiffe_trust_domain` with `spiffe_bundle_url`. Neither is discovered. The same entries authenticate the agent at hop 0 (IdP intake) when `[token] actor_auth` accepts actor tokens.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -168,11 +170,13 @@ One table per MCP server, using streamable HTTP.
 | `name` | Mount name, served at `/mcp/<name>`. It is the `server` part of capabilities and of action ids. ASCII letters, digits, `_`, `.`, `-`; `attenuo` is reserved. |
 | `url` | Upstream MCP endpoint. |
 
+Unlike the rest of the file, `[[upstreams]]` entries, `[policy.catalog.<server>.<tool>]` tables (and the JSON of `catalog_path`) and full capability tables in `[[root_grants]]` do not reject unknown keys at present: a misspelt key there is ignored (see the [spec audit](../research/spec-audit-2026-11-05.md#unknown-keys-in-nested-tables)).
+
 ## `[admin]`
 
 | Key | Meaning |
 | --- | --- |
-| `token` | Static bearer for `/admin/*`. With no token configured, admin routes answer 403 `admin_disabled`. Do not expose `/admin` publicly. |
+| `token` | Static bearer for `/admin/*`. `ATTENUO_ADMIN_TOKEN`, when set, replaces it. With no token configured, admin routes answer 403 `admin_disabled`. When `[server] listen` (or an enabled `[admin_ui] listen`) is not a loopback address, the server refuses to start if the token is missing, shorter than 32 bytes or a published placeholder (`change-me`, `admin`, ...); on loopback it only warns. Generate one with `openssl rand -hex 32`. Do not expose `/admin` publicly. |
 
 ## `[[idps]]`
 
@@ -191,7 +195,7 @@ Trusted identity providers for hop 0. Only these issuers are accepted at `POST /
 
 ## `[[agents]]`
 
-Agents (OAuth clients) that may present user credentials at `POST /token`. With none configured, all IdP intake is rejected.
+Agents (OAuth clients) that may present user credentials at `POST /token`, and that authenticate as the `actor` of an exchange with client credentials. With none configured, every request that authenticates with client credentials is rejected (`no_agents_configured`); an agent that authenticates with an `actor_token` from `[[actor_trust]]` needs no entry here.
 
 | Key | Meaning |
 | --- | --- |
@@ -207,11 +211,24 @@ The most a root token may carry.
 | `issuer` | Issuer of the users this applies to. |
 | `agent` | The agent that holds the root token. |
 | `subject` | Optional. Pins the entry to one user. A pinned entry wins over an unpinned one. |
-| `capabilities` | List of `server:tool` strings. Requests are attenuated against this. |
+| `capabilities` | List of `server:tool` strings (globs such as `github:*` allowed) or full capability tables `{ server, tool, constraints }`. Requests are attenuated against this. |
 | `attributes` | Used only by the development root mint. IdP intake takes attributes from the verified token. |
+
+For the development root mint, an empty `[[root_grants]]` list lets the admin mint any capabilities.
 | `may_act` | Optional list of agent ids: the RFC 8693 `may_act` of root tokens minted under this grant, so only these agents may exchange them. A request may narrow it with its own `may_act`, never widen it (`may_act_exceeds_grant`). |
 
 With no matching entry, no root token is issued.
+
+## `[[peps]]`
+
+Policy enforcement points that call the AuthZEN endpoints. Same shape as `[[agents]]`; `attenuo` is reserved as an id.
+
+| Key | Meaning |
+| --- | --- |
+| `id` | PEP id, sent as the HTTP Basic user or as `pep_id` in an evaluation body. |
+| `secret_sha256` | SHA-256 of the PEP's secret, in hex. |
+
+A request that authenticates as a PEP gets `context.diagnostics` under `[authzen] diagnostics = "peps"`, and only such a request may send an unsigned chain when `[authzen] allow_unsigned_chain = true` (the server refuses to start with that set and no `[[peps]]`).
 
 ## `[proxy]`
 
@@ -250,4 +267,4 @@ The admin console, on its own opt-in listener so it never shares an origin with 
 | `enabled` | `false` | Start the console listener. Without the section there is no console. |
 | `listen` | `127.0.0.1:9101` | Address of the console listener. Keep it on loopback and reach it over an SSH tunnel. |
 | `allow_public` | `false` | Without it, the server refuses to start when `enabled` and `listen` is not a loopback address. With it, the server starts and logs a warning, and `[admin] token` must then pass the strength check that a public `[server] listen` needs. |
-| `allow_write` | `false` | Also mount `POST /admin/leases/{id}/revoke` and `POST /admin/policies/reload` on the console listener; they require `Content-Type: application/json` there (415 otherwise). Without it those paths are 404 on this listener, so the console is read-only by the server's rule. `POST /admin/leases/revoke` (revoke by user or chain) is mounted in full with it; without it only its `?preview=true` dry run is served, and a revocation is 404. The read routes, always mounted, are `GET /admin/audit`, `/admin/audit/entries/{seq}`, `/admin/audit/records/{id}`, `/admin/audit/checkpoints`, `/admin/audit/verify`, `/admin/audit/checkpoint` (which signs a checkpoint of the head when it has none) and `/admin/audit/export`; `GET /admin/leases/{id}` and `/admin/leases/{id}/tree`; `GET /admin/policies` and `/admin/policies/check`; and the `POST /admin/policies/evaluate` dry run (JSON `Content-Type` required). The main listener keeps every admin route either way. See [the admin console guide](../guides/admin-console.md). |
+| `allow_write` | `false` | Also mount `POST /admin/leases/{id}/revoke`, `POST /admin/policies/reload`, `POST /admin/approvals/{id}` and `POST /admin/budgets/refund` on the console listener; they require `Content-Type: application/json` there (415 otherwise). Without it those paths are 404 on this listener, so the console is read-only by the server's rule. `POST /admin/leases/revoke` (revoke by user or chain) is mounted in full with it; without it only its `?preview=true` dry run is served, and a revocation is 404. The read routes, always mounted, are `GET /admin/audit`, `/admin/audit/entries/{seq}`, `/admin/audit/records/{id}`, `/admin/audit/checkpoints`, `/admin/audit/verify`, `/admin/audit/checkpoint` (which signs a checkpoint of the head when it has none) and `/admin/audit/export`; `GET /admin/leases/{id}` and `/admin/leases/{id}/tree`; `GET /admin/policies` and `/admin/policies/check`; `GET /admin/approvals` and `/admin/approvals/{id}`; and the `POST /admin/policies/evaluate` dry run (JSON `Content-Type` required). The main listener keeps every admin route either way. See [the admin console guide](../guides/admin-console.md). |
