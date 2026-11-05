@@ -84,6 +84,7 @@
   - [Security review, pass 3](research/security-review-2026-10-23.md)
   - [Security review, pass 4](research/security-review-2026-10-23-pass4.md)
   - [Security review, pass 5](research/security-review-2026-10-24-pass5.md)
+  - [Security review, pass 8](research/security-review-2026-11-05-pass8.md)
 - [Open-source project practices](research/oss-project-practices.md)
 - [Secret scan of the full history, 2026-11-05](research/secret-scan-2026-11-05.md)
 - [CI minutes, 2026-11-05](research/ci-minutes-2026-11-05.md)
