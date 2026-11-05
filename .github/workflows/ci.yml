@@ -69,9 +69,10 @@ jobs:
               - "!book.toml"
               - "!book-theme/**"
               - "!.github/ISSUE_TEMPLATE/**"
+            # `predicate-quantifier: every` applies to this filter too, so the two paths
+            # are one brace pattern: a file matches when it is under fuzz/ or is this file.
             fuzz:
-              - "fuzz/**"
-              - ".github/workflows/ci.yml"
+              - "{fuzz/**,.github/workflows/ci.yml}"
 
   fmt:
     name: rustfmt
@@ -132,7 +133,9 @@ jobs:
   # needs no other job and no job needs it, so a queued-out or red macOS run never hides or
   # blocks the Linux result. Warnings are not fatal here, as before; clippy covers them on Linux.
   test-macos:
-    name: test (${{ inputs.macos-runner || 'macos-latest' }}, stable)
+    # A static name: a job name with an expression over `inputs` shows the raw expression in
+    # the checks list when the job is skipped. The chosen runner is in the job's `runs-on`.
+    name: test (macos, stable)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ inputs.macos-runner || 'macos-latest' }}
     # Counts from the moment a runner picks the job up; queue time is not billed.
