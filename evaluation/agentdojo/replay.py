@@ -168,6 +168,11 @@ def mentioned(prompt: str) -> set[str]:
     return set(found) | set(re.findall(r"\b[Ii]nvite (?:user )?([A-Z][a-z]+)\b", prompt))
 
 
+def one_of(values, expr: str) -> str:
+    """Cedar: `expr` is one of `values`. Cedar forbids an empty set literal, so none is false."""
+    return f"{json.dumps(sorted(values))}.contains({expr})" if values else "false"
+
+
 def recipient_rule(rule_id: str, actions, when: str | None, plain: bool) -> str:
     """One permit. With `plain`, the same actions with no condition on the recipients."""
     names = ", ".join(f'Action::"{SUITE}/{a}"' for a in actions)
@@ -186,7 +191,7 @@ def workspace_policy(env, rule="contacts", named=frozenset()) -> str:
         share = f'context.input.email like "*@{domain}"'
         if rule == "mentioned":
             allowed |= named
-            share = f"({share} || {json.dumps(sorted(named))}.contains(context.input.email))"
+            share = f"({share} || {one_of(named, 'context.input.email')})"
         mail = f"""context.input has recipients && {members("recipients", allowed)}
   && {members("cc", allowed)} && {members("bcc", allowed)}"""
         invite = ("create_calendar_event", "add_calendar_event_participants")
@@ -281,7 +286,7 @@ def slack_policy(env, rule="contacts", named=frozenset()) -> str:
     plain = rule == "none"
     dm = f"context.input has recipient && {users}.contains(context.input.recipient)"
     post = f"context.input has channel && {channels}.contains(context.input.channel)"
-    invite = f"context.input has user && {json.dumps(sorted(named))}.contains(context.input.user)"
+    invite = f"context.input has user && {one_of(named, 'context.input.user')}"
     if rule != "contacts":
         rules = (
             recipient_rule("slack_dm", ["send_direct_message"], dm, plain)
