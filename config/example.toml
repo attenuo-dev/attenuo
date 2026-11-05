@@ -137,7 +137,8 @@ attribute_claims = ["email", "groups", "amr"]
 
 # Agents (OAuth clients) that may present user credentials at POST /token, authenticated with
 # client_id/client_secret (form or HTTP Basic). secret_sha256 = `printf %s "$SECRET" | sha256sum`.
-# With no [[agents]], every IdP intake request is rejected.
+# With no [[agents]], every request that authenticates with client credentials is rejected
+# (an agent with an actor_token from [[actor_trust]] needs no entry).
 [[agents]]
 id = "planner"
 secret_sha256 = "a93d472e76b73bffcef69973eb463fb679b1365377e183a459d7f33c2ee97b7a"   # "planner-secret-change-me"
@@ -198,7 +199,7 @@ retention_seconds = 604800
 session_retention_seconds = 86400
 # Seconds a run's run-limit counters, charge log and approvals are kept once the run's leases
 # are gone from the registry (after retention_seconds); nothing of a run still in the registry
-# is deleted. After it, an operator refund of the run's decisions answers 404; the audit log
+# is deleted. After it, an operator refund of the run's decisions answers 410 charge_pruned; the audit log
 # keeps every record. 0 keeps everything.
 run_state_retention_seconds = 2592000
 # The task that prunes the three above runs every maintenance_interval_seconds (at least 1), in
@@ -305,5 +306,6 @@ enabled = false
 # listen = "127.0.0.1:9101"
 # A non-loopback `listen` is refused at startup unless this is true.
 # allow_public = false
-# Mount POST /admin/leases/{id}/revoke and POST /admin/policies/reload on this listener.
+# Mount POST /admin/leases/{id}/revoke, POST /admin/policies/reload, POST /admin/approvals/{id}
+# and POST /admin/budgets/refund on this listener.
 # allow_write = false

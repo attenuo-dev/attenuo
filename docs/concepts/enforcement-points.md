@@ -58,6 +58,6 @@ Both paths write to the same audit log.
 
 - There is no push channel, so a PEP that caches decisions will not learn of a revocation.
 - Admin routes use one static bearer and should not be public.
-- AuthZEN conformance fixtures are on the task board. Treat conformance with the spec as unverified.
+- AuthZEN conformance is checked by fixtures in `crates/attenuo-server/tests/fixtures/authzen/`; what is and is not implemented is in [AuthZEN conformance](../reference/authzen.md). The Search APIs are not served.
 
 More detail: [design/server.md](../design/server.md#the-decision-pipeline), [ADR-0001](../decisions/0001-separate-enforcement-layer.md) and [RFC-0001 section 5](../spec/rfc-0001-attenuo.md#5-per-call-authorization).
