@@ -18,6 +18,7 @@
 //! Everything that signs, stores, or evaluates lives in sibling crates.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
 
 pub mod call;
 pub mod capability;

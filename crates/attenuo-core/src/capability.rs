@@ -52,8 +52,10 @@ pub enum ArgConstraint {
     /// `{"op": "range", "value": {"min": 0, "max": 2000}}`, a missing bound omitted. Build it
     /// with [`ArgConstraint::range`], which checks the bounds.
     Range {
+        /// Smallest allowed value, inclusive; `None` for no lower bound.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         min: Option<i64>,
+        /// Largest allowed value, inclusive; `None` for no upper bound.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max: Option<i64>,
     },
@@ -136,7 +138,12 @@ pub enum RangeError {
     Unbounded,
     /// `min > max`: no value could satisfy it.
     #[error("a range constraint's min {min} is greater than its max {max}")]
-    Inverted { min: i64, max: i64 },
+    Inverted {
+        /// The lower bound given.
+        min: i64,
+        /// The upper bound given, smaller than `min`.
+        max: i64,
+    },
 }
 
 /// Largest magnitude of a float that counts as a whole number, as the Cedar translation in
@@ -365,15 +372,20 @@ pub fn pattern_matches(pattern: &str, name: &str) -> bool {
 /// ([`crate::limits`]); absent (and omitted from the token) when there are none.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Capability {
+    /// Server name pattern: exact, `*` or `prefix*` ([`pattern_matches`]).
     pub server: String,
+    /// Tool name pattern: exact, `*` or `prefix*` ([`pattern_matches`]).
     pub tool: String,
+    /// Constraints on named arguments; an argument not listed here is unconstrained.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub constraints: BTreeMap<String, ArgConstraint>,
+    /// Run limits on calls this capability matches; empty when there are none.
     #[serde(default, skip_serializing_if = "Limits::is_empty")]
     pub limits: Limits,
 }
 
 impl Capability {
+    /// A capability for `tool` on `server` with no constraints and no limits.
     pub fn new(server: impl Into<String>, tool: impl Into<String>) -> Self {
         Self {
             server: server.into(),
@@ -383,11 +395,13 @@ impl Capability {
         }
     }
 
+    /// Add (or replace) the constraint on argument `arg`.
     pub fn with_constraint(mut self, arg: impl Into<String>, c: ArgConstraint) -> Self {
         self.constraints.insert(arg.into(), c);
         self
     }
 
+    /// Set the run limits.
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
         self
@@ -489,22 +503,27 @@ impl FromIterator<Capability> for CapabilitySet {
 }
 
 impl CapabilitySet {
+    /// An empty set.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Add a capability; `false` if an identical one was already there.
     pub fn insert(&mut self, c: Capability) -> bool {
         self.0.insert(c)
     }
 
+    /// Does the set hold no capabilities?
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
+    /// Number of capabilities in the set.
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
+    /// The capabilities, in their canonical (sorted) order.
     pub fn iter(&self) -> impl Iterator<Item = &Capability> {
         self.0.iter()
     }

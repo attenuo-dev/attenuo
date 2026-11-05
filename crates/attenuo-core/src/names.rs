@@ -39,7 +39,9 @@ pub const MAX_NAME_LEN: usize = 128;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NameKind {
+    /// An MCP server (upstream) name.
     Server,
+    /// A tool name, or a call name such as `resources/read`.
     Tool,
 }
 
@@ -55,16 +57,27 @@ impl std::fmt::Display for NameKind {
 /// Why a name was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum NameError {
+    /// The name is the empty string.
     #[error("{kind} name is empty")]
-    Empty { kind: NameKind },
+    Empty {
+        /// What sort of name it is.
+        kind: NameKind,
+    },
+    /// The name is longer than [`MAX_NAME_LEN`] bytes.
     #[error("{kind} name is longer than {MAX_NAME_LEN} bytes")]
-    TooLong { kind: NameKind },
+    TooLong {
+        /// What sort of name it is.
+        kind: NameKind,
+    },
     /// A character outside the allowed set (see the module docs). `name` is the offending
     /// name, escaped for display.
     #[error("{kind} name {name} contains {found}, which is not allowed")]
     InvalidChar {
+        /// What sort of name it is.
         kind: NameKind,
+        /// The refused name, escaped for display.
         name: String,
+        /// The first character outside the allowed set, escaped for display.
         found: String,
     },
 }

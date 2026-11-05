@@ -48,6 +48,7 @@ impl ToolCall {
         self
     }
 
+    /// Set the MCP session id the call arrived on.
     pub fn with_session(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
         self

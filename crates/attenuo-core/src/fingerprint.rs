@@ -125,7 +125,9 @@ impl std::fmt::Display for FingerprintKind {
 /// entity and a k-gram a k-gram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Fingerprint {
+    /// What was fingerprinted.
     pub kind: FingerprintKind,
+    /// The SHA-256 described above.
     pub digest: [u8; 32],
 }
 

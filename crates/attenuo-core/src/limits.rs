@@ -192,6 +192,7 @@ pub struct ArgLimit {
 }
 
 impl ArgLimit {
+    /// A limit of `max` on argument `arg`, counting the argument as it is.
     pub fn new(arg: impl Into<String>, max: u64) -> Self {
         Self {
             arg: arg.into(),
@@ -247,9 +248,13 @@ pub struct Limits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LimitKind {
+    /// At most this many matched calls.
     Calls,
+    /// At most this total of an argument's amounts.
     Sum,
+    /// At most this many matched calls per value of an argument.
     CallsPer,
+    /// At most this many distinct values of an argument.
     Distinct,
 }
 
@@ -286,12 +291,16 @@ impl std::fmt::Display for LimitKind {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("limit `{kind}` of capability `{capability}`: {detail}")]
 pub struct LimitError {
+    /// The capability, as [`crate::Capability::display`] writes it.
     pub capability: String,
+    /// Which of its limits is malformed.
     pub kind: LimitKind,
+    /// What is wrong with it.
     pub detail: String,
 }
 
 impl Limits {
+    /// No limit is set.
     pub fn is_empty(&self) -> bool {
         self.calls.is_none()
             && self.sum.is_none()
@@ -299,21 +308,25 @@ impl Limits {
             && self.distinct.is_none()
     }
 
+    /// Set the `calls` limit.
     pub fn with_calls(mut self, max: u64) -> Self {
         self.calls = Some(max);
         self
     }
 
+    /// Set the `sum` limit on argument `arg`.
     pub fn with_sum(mut self, arg: impl Into<String>, max: u64) -> Self {
         self.sum = Some(ArgLimit::new(arg, max));
         self
     }
 
+    /// Set the `calls_per` limit on argument `arg`.
     pub fn with_calls_per(mut self, arg: impl Into<String>, max: u64) -> Self {
         self.calls_per = Some(ArgLimit::new(arg, max));
         self
     }
 
+    /// Set the `distinct` limit on argument `arg`.
     pub fn with_distinct(mut self, arg: impl Into<String>, max: u64) -> Self {
         self.distinct = Some(ArgLimit::new(arg, max));
         self
@@ -496,6 +509,7 @@ pub struct Charge {
     pub cap: usize,
     /// The hop's lease: the counter lives under it.
     pub lease: LeaseId,
+    /// Which limit the counter belongs to.
     pub kind: LimitKind,
     /// The argument a `sum`, `calls_per` or `distinct` limit counts, `arg#host` for a derived
     /// value ([`ArgLimit::counted`]); `None` for `calls`.
@@ -544,9 +558,13 @@ impl Charge {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("limit `{kind}` of hop {hop} counts argument `{arg}`, which {problem}")]
 pub struct LimitArgError {
+    /// Position of the hop whose limit it is.
     pub hop: usize,
+    /// Which limit.
     pub kind: LimitKind,
+    /// The argument the limit counts.
     pub arg: String,
+    /// What is wrong with the argument (for example `is missing`).
     pub problem: String,
 }
 
