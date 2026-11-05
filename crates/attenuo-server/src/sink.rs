@@ -23,6 +23,11 @@
 //! Three deliverers: [`WebhookDeliver`] (`POST`, any 2xx), [`FileDeliver`] (append one JSON
 //! line, `fsync`), and [`S3Deliver`] (`PUT` with AWS Signature Version 4, implemented here on
 //! `ring` HMAC and `sha2`).
+//!
+//! The queue itself ([`Queue`]) is generic over what it carries, so the approval notifier
+//! (`[approvals.notify]`, [`crate::notify`]) runs on the same code with its own metrics and
+//! one difference: a notification is given up after `max_attempts` ([`QueueRole::give_up`]),
+//! where a checkpoint never is.
 
 use std::collections::VecDeque;
 use std::io::Write as _;
@@ -38,10 +43,84 @@ use sha2::{Digest, Sha256};
 use crate::config::{SinkKind, SinkSection, SINK_TOKEN_ENV};
 use crate::metrics::Metrics;
 
-/// Delivers one shipped checkpoint. `Err` is retried.
+/// Delivers one queued item (a shipped checkpoint unless named). `Err` is retried.
 #[async_trait]
-pub trait Deliver: Send + Sync {
-    async fn deliver(&self, shipped: &ShippedCheckpoint) -> Result<(), String>;
+pub trait Deliver<T: Sync = ShippedCheckpoint>: Send + Sync {
+    async fn deliver(&self, item: &T) -> Result<(), String>;
+}
+
+/// What a [`Queue`] carries.
+pub trait QueueItem: Send + Sync + 'static {
+    /// Names the item in log lines. Never secret.
+    fn log_id(&self) -> String;
+}
+
+impl QueueItem for ShippedCheckpoint {
+    fn log_id(&self) -> String {
+        format!("checkpoint seq {}", self.checkpoint.seq)
+    }
+}
+
+/// Which queue this is: where its log lines and metrics go, and whether it gives up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueRole {
+    /// `[audit.sink]`: retried until delivered.
+    Checkpoints,
+    /// `[approvals.notify]`: given up after this many failed attempts (at least 1).
+    ApprovalNotices { max_attempts: u32 },
+}
+
+impl QueueRole {
+    /// The config section, as log lines name it.
+    pub fn section(self) -> &'static str {
+        match self {
+            Self::Checkpoints => "[audit.sink]",
+            Self::ApprovalNotices { .. } => "[approvals.notify]",
+        }
+    }
+
+    fn thread_name(self) -> &'static str {
+        match self {
+            Self::Checkpoints => "attenuo-ckpt-sink",
+            Self::ApprovalNotices { .. } => "attenuo-approval-notify",
+        }
+    }
+
+    /// After how many failed attempts an item is dropped; `None` retries forever.
+    pub fn give_up(self) -> Option<u32> {
+        match self {
+            Self::Checkpoints => None,
+            Self::ApprovalNotices { max_attempts } => Some(max_attempts.max(1)),
+        }
+    }
+
+    fn delivered(self, m: &Metrics) {
+        match self {
+            Self::Checkpoints => m.audit_sink_delivered(),
+            Self::ApprovalNotices { .. } => m.approval_notify_delivered(),
+        }
+    }
+
+    fn failed(self, m: &Metrics) {
+        match self {
+            Self::Checkpoints => m.audit_sink_failure(),
+            Self::ApprovalNotices { .. } => m.approval_notify_failure(),
+        }
+    }
+
+    fn dropped(self, m: &Metrics) {
+        match self {
+            Self::Checkpoints => m.audit_sink_dropped(),
+            Self::ApprovalNotices { .. } => m.approval_notify_dropped(),
+        }
+    }
+
+    fn gauges(self, m: &Metrics, depth: u64, oldest: Option<SystemTime>) {
+        match self {
+            Self::Checkpoints => m.audit_sink_queue(depth, oldest),
+            Self::ApprovalNotices { .. } => m.approval_notify_queue(depth),
+        }
+    }
 }
 
 /// Exponential backoff with jitter: attempt `n` (from 0) waits a uniformly random time
@@ -115,44 +194,57 @@ impl SinkLimits {
 }
 
 #[derive(Debug)]
-struct Queued {
-    shipped: ShippedCheckpoint,
+struct Queued<T> {
+    item: T,
     since: Instant,
     since_wall: SystemTime,
 }
 
-#[derive(Debug, Default)]
-struct State {
-    queue: VecDeque<Queued>,
-    /// The checkpoint being delivered, by when it was queued.
+#[derive(Debug)]
+struct State<T> {
+    queue: VecDeque<Queued<T>>,
+    /// The item being delivered, by when it was queued.
     in_flight: Option<(Instant, SystemTime)>,
-    /// First failure of the current delivery; cleared on success.
+    /// First failure since the last successful delivery; cleared on success.
     failing_since: Option<Instant>,
     last_error: Option<String>,
     /// Shutting down: deliver what is queued until this deadline, then stop.
     stop_at: Option<Instant>,
 }
 
+impl<T> Default for State<T> {
+    fn default() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            in_flight: None,
+            failing_since: None,
+            last_error: None,
+            stop_at: None,
+        }
+    }
+}
+
 #[derive(Debug)]
-struct Shared {
-    state: Mutex<State>,
+struct Shared<T> {
+    state: Mutex<State<T>>,
     wake: Condvar,
     limits: SinkLimits,
+    role: QueueRole,
     metrics: Arc<Metrics>,
-    public_url: Option<String>,
-    /// Test hook: delivered checkpoints, by count.
+    /// Test hook: delivered items, by count.
     delivered: AtomicU64,
 }
 
-impl Shared {
-    fn oldest(st: &State) -> Option<(Instant, SystemTime)> {
+impl<T> Shared<T> {
+    fn oldest(st: &State<T>) -> Option<(Instant, SystemTime)> {
         st.in_flight
             .or_else(|| st.queue.front().map(|q| (q.since, q.since_wall)))
     }
 
     /// Refresh the depth and oldest-undelivered gauges. Call with the lock held.
-    fn gauges(&self, st: &State) {
-        self.metrics.audit_sink_queue(
+    fn gauges(&self, st: &State<T>) {
+        self.role.gauges(
+            &self.metrics,
             st.queue.len() as u64,
             Self::oldest(st).map(|(_, wall)| wall),
         );
@@ -164,40 +256,49 @@ impl Shared {
 pub struct SinkStatus {
     pub queued: usize,
     pub capacity: usize,
-    /// Age of the oldest checkpoint not yet delivered (zero when none).
+    /// Age of the oldest item not yet delivered (zero when none).
     pub lag: Duration,
-    /// How long the current delivery has been failing.
+    /// How long deliveries have been failing (since the last success).
     pub failing_for: Option<Duration>,
     pub last_error: Option<String>,
     /// The queue is full, or `lag` (or `failing_for`) exceeds `max_lag_seconds`.
     pub degraded: bool,
 }
 
-/// The queue end the log's hook pushes into. Cheap to clone.
-#[derive(Debug, Clone)]
-pub struct SinkHandle {
-    shared: Arc<Shared>,
+/// The end of a [`Queue`] that producers push into. Cheap to clone.
+#[derive(Debug)]
+pub struct QueueHandle<T> {
+    shared: Arc<Shared<T>>,
 }
 
-impl SinkHandle {
-    /// Queue `cp` for delivery. Never blocks on the network or on disk.
-    pub fn push(&self, cp: &Checkpoint) {
-        let shipped = ShippedCheckpoint::new(cp, self.shared.public_url.clone());
+impl<T> Clone for QueueHandle<T> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+impl<T: QueueItem> QueueHandle<T> {
+    /// Queue `item` for delivery. Never blocks on the network or on disk. When the queue is
+    /// full the oldest queued item is dropped and counted.
+    pub fn push(&self, item: T) {
         let Ok(mut st) = self.shared.state.lock() else {
             return;
         };
         if st.queue.len() >= self.shared.limits.capacity {
             if let Some(old) = st.queue.pop_front() {
-                self.shared.metrics.audit_sink_dropped();
+                self.shared.role.dropped(&self.shared.metrics);
                 tracing::error!(
-                    dropped_seq = old.shipped.checkpoint.seq,
+                    dropped = %old.item.log_id(),
                     capacity = self.shared.limits.capacity,
-                    "[audit.sink] queue full: dropped the oldest undelivered checkpoint"
+                    "{} queue full: dropped the oldest undelivered item",
+                    self.shared.role.section()
                 );
             }
         }
         st.queue.push_back(Queued {
-            shipped,
+            item,
             since: Instant::now(),
             since_wall: SystemTime::now(),
         });
@@ -213,8 +314,8 @@ impl SinkHandle {
     fn status_at(&self, now: Instant) -> SinkStatus {
         let st = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         let limits = self.shared.limits;
-        let lag =
-            Shared::oldest(&st).map_or(Duration::ZERO, |(t, _)| now.saturating_duration_since(t));
+        let lag = Shared::<T>::oldest(&st)
+            .map_or(Duration::ZERO, |(t, _)| now.saturating_duration_since(t));
         let failing_for = st.failing_since.map(|t| now.saturating_duration_since(t));
         let full = st.queue.len() >= limits.capacity;
         let degraded =
@@ -229,9 +330,108 @@ impl SinkHandle {
         }
     }
 
-    /// Checkpoints delivered since start.
+    /// Items delivered since start.
     pub fn delivered(&self) -> u64 {
         self.shared.delivered.load(Ordering::Relaxed)
+    }
+}
+
+/// A running queue: its items plus the delivery thread. Dropping it stops the thread without
+/// waiting; [`shutdown`](Self::shutdown) gives queued items a grace period first.
+#[derive(Debug)]
+pub struct Queue<T> {
+    handle: QueueHandle<T>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl<T: QueueItem> Queue<T> {
+    /// Start delivering with `deliver`.
+    pub fn start(
+        deliver: Box<dyn Deliver<T>>,
+        limits: SinkLimits,
+        role: QueueRole,
+        metrics: Arc<Metrics>,
+    ) -> anyhow::Result<Self> {
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State::default()),
+            wake: Condvar::new(),
+            limits,
+            role,
+            metrics,
+            delivered: AtomicU64::new(0),
+        });
+        let worker = shared.clone();
+        let thread = std::thread::Builder::new()
+            .name(role.thread_name().into())
+            .spawn(move || run(worker, deliver))?;
+        Ok(Self {
+            handle: QueueHandle { shared },
+            thread: Mutex::new(Some(thread)),
+        })
+    }
+
+    pub fn handle(&self) -> QueueHandle<T> {
+        self.handle.clone()
+    }
+
+    pub fn status(&self) -> SinkStatus {
+        self.handle.status()
+    }
+
+    /// Stop after delivering what is queued, giving up at `grace`. Blocks (call it from a
+    /// blocking context); a request already in flight can add its timeout.
+    pub fn shutdown(&self, grace: Duration) {
+        self.stop(Instant::now() + grace);
+        let thread = self.thread.lock().ok().and_then(|mut t| t.take());
+        if let Some(t) = thread {
+            let _ = t.join();
+        }
+    }
+
+    fn stop(&self, at: Instant) {
+        if let Ok(mut st) = self.handle.shared.state.lock() {
+            st.stop_at = Some(st.stop_at.map_or(at, |s| s.min(at)));
+        }
+        self.handle.shared.wake.notify_all();
+    }
+}
+
+impl<T> Drop for Queue<T> {
+    fn drop(&mut self) {
+        if let Ok(mut st) = self.handle.shared.state.lock() {
+            let now = Instant::now();
+            st.stop_at = Some(st.stop_at.map_or(now, |s| s.min(now)));
+        }
+        self.handle.shared.wake.notify_all();
+    }
+}
+
+/// The queue end the log's hook pushes into. Cheap to clone.
+#[derive(Debug, Clone)]
+pub struct SinkHandle {
+    queue: QueueHandle<ShippedCheckpoint>,
+    public_url: Option<String>,
+}
+
+impl SinkHandle {
+    /// Queue `cp` for delivery. Never blocks on the network or on disk.
+    pub fn push(&self, cp: &Checkpoint) {
+        self.queue
+            .push(ShippedCheckpoint::new(cp, self.public_url.clone()));
+    }
+
+    pub fn status(&self) -> SinkStatus {
+        self.queue.status()
+    }
+
+    #[cfg(test)]
+    fn status_at(&self, now: Instant) -> SinkStatus {
+        self.queue.status_at(now)
+    }
+
+    /// Checkpoints delivered since start.
+    pub fn delivered(&self) -> u64 {
+        self.queue.delivered()
     }
 }
 
@@ -239,8 +439,8 @@ impl SinkHandle {
 /// waiting; [`shutdown`](Self::shutdown) gives queued checkpoints a grace period first.
 #[derive(Debug)]
 pub struct CheckpointSink {
-    handle: SinkHandle,
-    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    queue: Queue<ShippedCheckpoint>,
+    public_url: Option<String>,
     kind: SinkKind,
 }
 
@@ -278,27 +478,18 @@ impl CheckpointSink {
         public_url: Option<String>,
         metrics: Arc<Metrics>,
     ) -> anyhow::Result<Self> {
-        let shared = Arc::new(Shared {
-            state: Mutex::new(State::default()),
-            wake: Condvar::new(),
-            limits,
-            metrics,
-            public_url,
-            delivered: AtomicU64::new(0),
-        });
-        let worker = shared.clone();
-        let thread = std::thread::Builder::new()
-            .name("attenuo-ckpt-sink".into())
-            .spawn(move || run(worker, deliver))?;
         Ok(Self {
-            handle: SinkHandle { shared },
-            thread: Mutex::new(Some(thread)),
+            queue: Queue::start(deliver, limits, QueueRole::Checkpoints, metrics)?,
+            public_url,
             kind: SinkKind::Webhook,
         })
     }
 
     pub fn handle(&self) -> SinkHandle {
-        self.handle.clone()
+        SinkHandle {
+            queue: self.queue.handle(),
+            public_url: self.public_url.clone(),
+        }
     }
 
     pub fn kind(&self) -> SinkKind {
@@ -306,48 +497,32 @@ impl CheckpointSink {
     }
 
     pub fn status(&self) -> SinkStatus {
-        self.handle.status()
+        self.queue.status()
     }
 
     /// Stop after delivering what is queued, giving up at `grace`. Blocks (call it from a
     /// blocking context); a request already in flight can add its timeout.
     pub fn shutdown(&self, grace: Duration) {
-        self.stop(Instant::now() + grace);
-        let thread = self.thread.lock().ok().and_then(|mut t| t.take());
-        if let Some(t) = thread {
-            let _ = t.join();
-        }
-    }
-
-    fn stop(&self, at: Instant) {
-        if let Ok(mut st) = self.handle.shared.state.lock() {
-            st.stop_at = Some(st.stop_at.map_or(at, |s| s.min(at)));
-        }
-        self.handle.shared.wake.notify_all();
-    }
-}
-
-impl Drop for CheckpointSink {
-    fn drop(&mut self) {
-        self.stop(Instant::now());
+        self.queue.shutdown(grace);
     }
 }
 
 /// The delivery thread.
-fn run(shared: Arc<Shared>, deliver: Box<dyn Deliver>) {
+fn run<T: QueueItem>(shared: Arc<Shared<T>>, deliver: Box<dyn Deliver<T>>) {
+    let section = shared.role.section();
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
         Ok(rt) => rt,
         Err(e) => {
-            tracing::error!(error = %e, "[audit.sink] cannot start its runtime; checkpoints will not be shipped");
+            tracing::error!(error = %e, "{section} cannot start its runtime; nothing will be delivered");
             return;
         }
     };
     let mut jitter = Jitter::new();
     loop {
-        // Next checkpoint, or stop.
+        // Next item, or stop.
         let item = {
             let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
             loop {
@@ -356,7 +531,7 @@ fn run(shared: Arc<Shared>, deliver: Box<dyn Deliver>) {
                     if !st.queue.is_empty() {
                         tracing::error!(
                             undelivered = st.queue.len(),
-                            "[audit.sink] stopping with checkpoints not shipped"
+                            "{section} stopping with items not delivered"
                         );
                     }
                     return;
@@ -373,7 +548,7 @@ fn run(shared: Arc<Shared>, deliver: Box<dyn Deliver>) {
         };
         let mut attempt = 0u32;
         loop {
-            let result = rt.block_on(deliver.deliver(&item.shipped));
+            let result = rt.block_on(deliver.deliver(&item.item));
             let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
             match result {
                 Ok(()) => {
@@ -382,30 +557,45 @@ fn run(shared: Arc<Shared>, deliver: Box<dyn Deliver>) {
                     st.last_error = None;
                     shared.gauges(&st);
                     shared.delivered.fetch_add(1, Ordering::Relaxed);
-                    shared.metrics.audit_sink_delivered();
+                    shared.role.delivered(&shared.metrics);
                     break;
                 }
                 Err(e) => {
-                    shared.metrics.audit_sink_failure();
+                    shared.role.failed(&shared.metrics);
                     st.failing_since.get_or_insert_with(Instant::now);
+                    attempt = attempt.saturating_add(1);
+                    if shared.role.give_up().is_some_and(|n| attempt >= n) {
+                        // Given up: counted as dropped. `failing_since` stays until a later
+                        // delivery succeeds, so a receiver that stays down still degrades.
+                        tracing::error!(
+                            item = %item.item.log_id(),
+                            attempts = attempt,
+                            error = %e,
+                            "{section} delivery failed on every attempt; dropped"
+                        );
+                        st.last_error = Some(e);
+                        st.in_flight = None;
+                        shared.role.dropped(&shared.metrics);
+                        shared.gauges(&st);
+                        break;
+                    }
                     tracing::warn!(
-                        seq = item.shipped.checkpoint.seq,
-                        attempt,
+                        item = %item.item.log_id(),
+                        attempt = attempt - 1,
                         error = %e,
-                        "[audit.sink] delivering a checkpoint failed; retrying"
+                        "{section} delivery failed; retrying"
                     );
                     st.last_error = Some(e);
-                    let wait = shared.limits.backoff.delay(attempt, jitter.unit());
-                    attempt = attempt.saturating_add(1);
+                    let wait = shared.limits.backoff.delay(attempt - 1, jitter.unit());
                     let until = Instant::now() + wait;
                     // Sleep, but wake for a shutdown whose deadline has passed.
                     loop {
                         let now = Instant::now();
                         if st.stop_at.is_some_and(|t| now >= t) {
                             tracing::error!(
-                                seq = item.shipped.checkpoint.seq,
+                                item = %item.item.log_id(),
                                 undelivered = st.queue.len() + 1,
-                                "[audit.sink] stopping with checkpoints not shipped"
+                                "{section} stopping with items not delivered"
                             );
                             return;
                         }
@@ -984,6 +1174,69 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "a 30 s backoff does not hold up shutdown"
         );
+    }
+
+    #[derive(Debug)]
+    struct Item(u64);
+
+    impl QueueItem for Item {
+        fn log_id(&self) -> String {
+            format!("item {}", self.0)
+        }
+    }
+
+    #[async_trait]
+    impl Deliver<Item> for FakeRef {
+        async fn deliver(&self, i: &Item) -> Result<(), String> {
+            self.0.attempts.fetch_add(1, Ordering::SeqCst);
+            if self.0.fail.load(Ordering::SeqCst) {
+                return Err("down".into());
+            }
+            self.0.got.lock().unwrap().push(i.0);
+            Ok(())
+        }
+    }
+
+    /// The approval notifier's role: an item is dropped after `max_attempts`, counted under
+    /// its own metrics, and the next one is delivered; the checkpoint series stay at zero.
+    #[test]
+    fn a_notice_queue_gives_up_after_max_attempts_and_moves_on() {
+        let fake = Arc::new(Fake::default());
+        fake.fail.store(true, Ordering::SeqCst);
+        let metrics = Metrics::new();
+        let q = Queue::start(
+            Box::new(FakeRef(fake.clone())) as Box<dyn Deliver<Item>>,
+            limits(16, Duration::from_secs(3600)),
+            QueueRole::ApprovalNotices { max_attempts: 3 },
+            metrics.clone(),
+        )
+        .unwrap();
+        let h = q.handle();
+        h.push(Item(1));
+        h.push(Item(2));
+        wait_until(|| {
+            metrics
+                .render()
+                .contains("attenuo_approval_notify_dropped_total 2\n")
+        });
+        assert_eq!(fake.attempts.load(Ordering::SeqCst), 6);
+        let st = h.status();
+        assert_eq!(st.queued, 0);
+        assert!(
+            st.failing_for.is_some(),
+            "still failing until a delivery succeeds"
+        );
+        fake.fail.store(false, Ordering::SeqCst);
+        h.push(Item(3));
+        wait_until(|| h.delivered() == 1);
+        assert_eq!(*fake.got.lock().unwrap(), vec![3]);
+        assert_eq!(h.status().failing_for, None);
+        let text = metrics.render();
+        assert!(text.contains("attenuo_approval_notify_failures_total 6\n"));
+        assert!(text.contains("attenuo_approval_notify_delivered_total 1\n"));
+        assert!(text.contains("attenuo_audit_sink_failures_total 0\n"));
+        assert!(text.contains("attenuo_audit_sink_dropped_total 0\n"));
+        q.shutdown(Duration::from_secs(1));
     }
 
     #[test]
