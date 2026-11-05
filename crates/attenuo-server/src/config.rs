@@ -971,8 +971,16 @@ pub struct NotifySection {
     /// full. Default 300.
     #[serde(default = "default_sink_max_lag_seconds")]
     pub max_lag_seconds: u64,
+    /// How long a notice stays in the outbox table after it was delivered or given up, so
+    /// that it is not sent again after a restart. Approvals that expired longer ago than this
+    /// get no `approval.expired` notice on start. Default 604800 (7 days).
+    #[serde(default = "default_notify_outbox_retention_seconds")]
+    pub outbox_retention_seconds: u64,
 }
 
+fn default_notify_outbox_retention_seconds() -> u64 {
+    7 * 24 * 3600
+}
 fn default_notify_secret_env() -> String {
     NOTIFY_SECRET_ENV.into()
 }
@@ -1010,6 +1018,7 @@ impl NotifySection {
             initial_backoff_ms: default_sink_initial_backoff_ms(),
             max_backoff_seconds: default_notify_max_backoff_seconds(),
             max_lag_seconds: default_sink_max_lag_seconds(),
+            outbox_retention_seconds: default_notify_outbox_retention_seconds(),
         }
     }
 
@@ -1060,10 +1069,11 @@ impl NotifySection {
             || self.initial_backoff_ms == 0
             || self.max_backoff_seconds == 0
             || self.max_lag_seconds == 0
+            || self.outbox_retention_seconds == 0
         {
             anyhow::bail!(
-                "[approvals.notify] timeout_seconds, initial_backoff_ms, max_backoff_seconds \
-                 and max_lag_seconds must be positive"
+                "[approvals.notify] timeout_seconds, initial_backoff_ms, max_backoff_seconds, \
+                 max_lag_seconds and outbox_retention_seconds must be positive"
             );
         }
         Ok(())

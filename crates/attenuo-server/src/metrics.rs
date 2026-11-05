@@ -124,6 +124,7 @@ pub struct Metrics {
     approval_notify_failures: AtomicU64,
     approval_notify_dropped: AtomicU64,
     approval_notify_queue_depth: AtomicU64,
+    approval_notify_outbox_rows: AtomicU64,
     /// Time to decide one tool call.
     authorize: Histogram,
     /// Time for one audit append, lock wait and commit included.
@@ -197,6 +198,7 @@ impl Default for Metrics {
             approval_notify_failures: AtomicU64::default(),
             approval_notify_dropped: AtomicU64::default(),
             approval_notify_queue_depth: AtomicU64::default(),
+            approval_notify_outbox_rows: AtomicU64::default(),
             authorize: Histogram::new(&BUCKETS),
             audit_append: Histogram::new(&BUCKETS),
             stages: std::array::from_fn(|_| Histogram::new(&STAGE_BUCKETS)),
@@ -500,6 +502,32 @@ impl Metrics {
             .store(depth, Ordering::Relaxed);
     }
 
+    /// Set the open outbox rows gauge (at start, from the table).
+    pub fn approval_notify_outbox_rows(&self, rows: u64) {
+        self.approval_notify_outbox_rows
+            .store(rows, Ordering::Relaxed);
+    }
+
+    /// One notice stored in the outbox.
+    pub fn approval_notify_outbox_opened(&self) {
+        self.approval_notify_outbox_rows
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One outbox row marked delivered or given up.
+    pub fn approval_notify_outbox_closed(&self) {
+        // A compare-and-swap loop that stops at zero (`fetch_update` is deprecated on newer
+        // toolchains, `try_update` is too new for the MSRV).
+        let rows = &self.approval_notify_outbox_rows;
+        let mut n = rows.load(Ordering::Relaxed);
+        while n > 0 {
+            match rows.compare_exchange_weak(n, n - 1, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(now) => n = now,
+            }
+        }
+    }
+
     /// Prometheus text exposition format (version 0.0.4).
     pub fn render(&self) -> String {
         let mut out = String::new();
@@ -651,6 +679,12 @@ impl Metrics {
             "approval_notify_queue_depth",
             "Approval notifications waiting in the [approvals.notify] queue.",
             &self.approval_notify_queue_depth,
+        );
+        simple_gauge(
+            &mut out,
+            "approval_notify_outbox_rows",
+            "Approval notifications stored in the outbox and not yet delivered or given up.",
+            &self.approval_notify_outbox_rows,
         );
         header_lines(
             &mut out,
