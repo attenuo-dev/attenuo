@@ -198,8 +198,12 @@ permit(principal, action == Action::"{SUITE}/cancel_calendar_event", resource);
 """
 
 
-POLICIES = {"workspace": workspace_policy, "banking": banking_policy, "slack": slack_policy,
-            "travel": travel_policy}
+POLICIES = {
+    "workspace": workspace_policy,
+    "banking": banking_policy,
+    "slack": slack_policy,
+    "travel": travel_policy,
+}
 
 
 def suite_policy(env) -> str:
@@ -280,12 +284,20 @@ class Shim:
         if rid is None:
             return None
         if method == "initialize":
-            result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
-                      "serverInfo": {"name": "agentdojo-shim", "version": "0"}}
+            result = {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "agentdojo-shim", "version": "0"},
+            }
         elif method == "tools/list":
-            tools = [{"name": f.name, "description": f.description,
-                      "inputSchema": f.parameters.model_json_schema()}
-                     for f in self.runtime.functions.values()]
+            tools = [
+                {
+                    "name": f.name,
+                    "description": f.description,
+                    "inputSchema": f.parameters.model_json_schema(),
+                }
+                for f in self.runtime.functions.values()
+            ]
             result = {"tools": tools}
         elif method == "tools/call":
             result = self.call(msg["params"]["name"], msg["params"].get("arguments") or {})
@@ -379,10 +391,13 @@ class Run:
         if arm == "direct":
             return
         self.url = f"{attenuo.url}/mcp/{SUITE}"
-        self.http = httpx.Client(timeout=30, headers={
-            "authorization": f"Bearer {attenuo.token(caps)}",
-            "accept": "application/json, text/event-stream",
-        })
+        self.http = httpx.Client(
+            timeout=30,
+            headers={
+                "authorization": f"Bearer {attenuo.token(caps)}",
+                "accept": "application/json, text/event-stream",
+            },
+        )
         self.rpc("tools/list", {})
 
     def rpc(self, method, params):
@@ -440,17 +455,33 @@ def replay_suite(name: str, work: Path, binary: Path):
     users = by_id(suite.user_tasks)
     attacks = [t for t in by_id(suite.injection_tasks) if t.ground_truth(base_env)]
     no_truth = [t.ID for t in by_id(suite.injection_tasks) if not t.ground_truth(base_env)]
-    summary = {"version": VERSION, "suite": SUITE, "attacks_replayed": [t.ID for t in attacks],
-               "attacks_without_ground_truth": no_truth, "arms": {}}
+    summary = {
+        "version": VERSION,
+        "suite": SUITE,
+        "attacks_replayed": [t.ID for t in attacks],
+        "attacks_without_ground_truth": no_truth,
+        "arms": {},
+    }
     rows = []
 
     for arm in ARMS:
         attenuo = None if arm == "direct" else Attenuo(arm, suite, base_env, shim.url, work, binary)
-        stats = {"benign_tasks": 0, "benign_tasks_ok": 0, "benign_calls": 0, "benign_calls_blocked": 0,
-                 "pairs": 0, "pairs_attack_succeeded": 0, "attack_calls": 0, "attack_calls_blocked": 0,
-                 "benign_reasons": Counter(), "attack_reasons": Counter(), "attack_landed": Counter(),
-                 "benign_blocked_tools": Counter(), "attack_reached_tools": Counter(),
-                 "benign_tasks_lost": []}
+        stats = {
+            "benign_tasks": 0,
+            "benign_tasks_ok": 0,
+            "benign_calls": 0,
+            "benign_calls_blocked": 0,
+            "pairs": 0,
+            "pairs_attack_succeeded": 0,
+            "attack_calls": 0,
+            "attack_calls_blocked": 0,
+            "benign_reasons": Counter(),
+            "attack_reasons": Counter(),
+            "attack_landed": Counter(),
+            "benign_blocked_tools": Counter(),
+            "attack_reached_tools": Counter(),
+            "benign_tasks_lost": [],
+        }
         try:
             for user in users:
                 env = suite.load_and_inject_default_environment({})
@@ -497,7 +528,9 @@ def replay_suite(name: str, work: Path, binary: Path):
                     stats["pairs"] += 1
                     stats["pairs_attack_succeeded"] += landed
                     stats["attack_landed"][attack.ID] += landed
-                    rows.append({"arm": arm, "user": user.ID, "attack": attack.ID, "landed": landed})
+                    rows.append(
+                        {"arm": arm, "user": user.ID, "attack": attack.ID, "landed": landed}
+                    )
         finally:
             if attenuo:
                 attenuo.stop()

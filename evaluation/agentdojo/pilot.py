@@ -34,8 +34,8 @@ from agentdojo.agent_pipeline import (
     ToolsExecutionLoop,
     ToolsExecutor,
 )
-from agentdojo.agent_pipeline.llms import anthropic_llm
 from agentdojo.agent_pipeline.agent_pipeline import load_system_message
+from agentdojo.agent_pipeline.llms import anthropic_llm
 from agentdojo.attacks.attack_registry import load_attack
 from agentdojo.benchmark import run_task_with_injection_tasks, run_task_without_injection_tasks
 from agentdojo.logging import OutputLogger
@@ -119,7 +119,13 @@ def install_meter(meter: Meter) -> None:
     passes the meter. The SDK's own retries still cover 429s and server errors."""
 
     async def request(
-        client, model, messages, tools, max_tokens, system_prompt=None, temperature=None,
+        client,
+        model,
+        messages,
+        tools,
+        max_tokens,
+        system_prompt=None,
+        temperature=None,
         thinking_budget_tokens=None,
     ):
         if temperature is not None or thinking_budget_tokens is not None:
@@ -203,8 +209,16 @@ def main() -> None:
         (user_ids + not_injectable) if not args.tasks else user_ids, key=task_number
     )[shard::shards]
     user_ids = user_ids[shard::shards]
-    print(json.dumps({"benign": benign_ids, "attacked": user_ids, "injections": injection_ids,
-                      "not_injectable": not_injectable}))
+    print(
+        json.dumps(
+            {
+                "benign": benign_ids,
+                "attacked": user_ids,
+                "injections": injection_ids,
+                "not_injectable": not_injectable,
+            }
+        )
+    )
     if args.plan:
         return
 
@@ -246,7 +260,9 @@ def main() -> None:
                         "utility": utility[key],
                         "attack_succeeded": security[key],
                     }
-                    print(json.dumps({"run": meter.task, **results["attack"][meter.task]}), flush=True)
+                    print(
+                        json.dumps({"run": meter.task, **results["attack"][meter.task]}), flush=True
+                    )
     except OverCap as err:
         print(err, file=sys.stderr)
     finally:

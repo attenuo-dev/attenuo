@@ -19,8 +19,11 @@ def number(task_id: str) -> int:
 
 
 def main(out: Path) -> None:
-    usage = defaultdict(lambda: dict(turns=0, input=0, output=0, thinking=0, dollars=0.0,
-                                     stops=Counter(), longest_prompt=0))
+    usage = defaultdict(
+        lambda: dict(
+            turns=0, input=0, output=0, thinking=0, dollars=0.0, stops=Counter(), longest_prompt=0
+        )
+    )
     for path in out.glob("usage-*.jsonl"):
         for line in path.read_text(encoding="utf-8").splitlines():
             row = json.loads(line)
@@ -33,12 +36,19 @@ def main(out: Path) -> None:
             bucket["stops"][row["stop_reason"]] += 1
             bucket["longest_prompt"] = max(bucket["longest_prompt"], row["input_tokens"])
 
-    suites = defaultdict(lambda: dict(benign=[0, 0], attacked=[0, 0], landed=0, errors=[],
-                                      by_injection=defaultdict(lambda: [0, 0])))
+    suites = defaultdict(
+        lambda: dict(
+            benign=[0, 0],
+            attacked=[0, 0],
+            landed=0,
+            errors=[],
+            by_injection=defaultdict(lambda: [0, 0]),
+        )
+    )
     for path in (out / "logs").rglob("*.json"):
         log = json.loads(path.read_text(encoding="utf-8"))
         # logs/<pipeline>/<suite>/<user task>/<attack or none>/<injection or none>.json
-        suite_name, user_task, attack, injection = path.parts[-4:-1] + (path.stem,)
+        suite_name, user_task, attack, injection = (*path.parts[-4:-1], path.stem)
         suite = suites[suite_name]
         if log.get("error"):
             suite["errors"].append(f"{user_task}/{injection}")
@@ -60,8 +70,9 @@ def main(out: Path) -> None:
             "benign_utility": suite["benign"],
             "utility_under_attack": suite["attacked"],
             "attack_success": [suite["landed"], suite["attacked"][1]],
-            "by_injection": {k: suite["by_injection"][k]
-                             for k in sorted(suite["by_injection"], key=number)},
+            "by_injection": {
+                k: suite["by_injection"][k] for k in sorted(suite["by_injection"], key=number)
+            },
             "errors": suite["errors"],
             **{k: (dict(v) if isinstance(v, Counter) else v) for k, v in spend.items()},
         }
