@@ -16,8 +16,8 @@ Attack calls allowed and benign calls denied, with Wilson 95% intervals. The int
 | Arm | Dev: attack allowed | Dev: benign denied | Test: attack allowed | Test: benign denied |
 |---|---:|---:|---:|---:|
 | No attenuo (direct to the upstream) | 60/60 (94-100%) | 0/69 (0-5%) | 38/38 (91-100%) | 0/29 (0-12%) |
-| Scope-only tokens (tool names only, permit-all policy) | 41/60 (56-79%) | 0/69 (0-5%) | 23/38 (45-74%) | 0/29 (0-12%) |
-| Constrained tokens, permit-all policy | 25/60 (30-54%) | 0/69 (0-5%) | 16/38 (28-58%) | 0/29 (0-12%) |
+| Scope-only tokens (tool names only, permit-all policy) | 41/60 (56-79%) | 0/69 (0-5%) | 21/38 (40-70%), was 23/38 before the type check | 0/29 (0-12%) |
+| Constrained tokens, permit-all policy | 25/60 (30-54%) | 0/69 (0-5%) | 14/38 (23-53%), was 16/38 before the type check | 0/29 (0-12%) |
 | Suite policy, root token (no attenuation) | 20/60 (23-46%) | 3/69 (1-12%) | 11/38 (17-45%) | 3/29 (4-26%) |
 | attenuo (constrained tokens, suite Cedar policy, leases) | 10/60 (9-28%) | 3/69 (1-12%) | 7/38 (9-33%) | 3/29 (4-26%) |
 
@@ -39,6 +39,8 @@ The 3 lease denials happened only because the case scripted a user revocation. W
 Scope-only tokens stop 19 attack calls: 16 that use a tool the task's grant does not include (14 in the class S cases, plus one each in `github-01` and `travel-06`), and the 3 scripted revocations. The other 31 refusals, the gap between 41 and 10 allowed, need more than tool names. Argument constraints in the token account for 16, and the suite policy for 15. The policy also accounts for all 3 lost benign calls.
 
 **Re-check (2026-10-24).** The suite was re-run on main `de3cf75` (after the admin console #25–#30, the WAL measurement #33, the SDK helpers #34 and the CLI follow-ups #35) with the frozen policies. Every table is identical to the 2026-10-23 v2 run: dev split 10/60 attack calls allowed with the full stack against 60/60 direct, 3/69 benign denied; test split 7/38 against 38/38, 3/29 benign denied; oracle agreement 129/129 and 67/67 call labels. Output: [`results/2026-10-24-recheck.md`](../../evaluation/injection-suite/results/2026-10-24-recheck.md).
+
+**Re-check (2026-11-05).** Every arm of both splits re-run on main `85cb28f` (the last commit before the 0.1.0 tag) with release binaries and the frozen policies. Every `attenuo` arm and the root-token baseline are identical to the runs they were first reported in, including the numbers this page and [ADR-0010](../decisions/0010-run-limits.md) quote: test split 7/38 attack calls allowed and 3/29 benign denied for `attenuo`, 1/38 with output labels; every dev-split row is identical call for call. Two test-split baseline rows moved: scope-only tokens 23/38 to 21/38 and constrained tokens 16/38 to 14/38 (the table above shows both). The cause is the declared-argument type check that runs before Cedar (799350c, 2026-10-24, after the last October run): `t-banking-02` call 1 sends the amount as the string `"1500"` and `t-workspace-03` call 2 sends `bcc` as a plain string, and both are now refused as `input_type_mismatch` in every proxied arm, which the permit-all baselines used to let through. The `attenuo` arms already denied both at the policy stage, so their counts did not move; the runner reports the two calls as 18 stage problems (two calls, nine arms) because the cases still say `stage: policy`, and the harness has no stage name for the type check yet. Output: [`results/2026-11-05-final-main.md`](../../evaluation/injection-suite/results/2026-11-05-final-main.md). To check these rows on your own machine with one command, which rebuilds the binaries, runs both demos and the suite and diffs the result against this file, see [Reproducing the numbers](reproduce.md).
 
 ## What attenuo did not stop
 

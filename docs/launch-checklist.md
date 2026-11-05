@@ -7,7 +7,7 @@ The first release is 0.1.0. Its notes draft, what is already prepared and the ex
 ## Repository settings
 
 - [ ] Branch protection on `main`: pull request required, CI checks required, no direct pushes, as [CONTRIBUTING](https://github.com/attenuo-dev/attenuo/blob/main/CONTRIBUTING.md) and [GOVERNANCE](https://github.com/attenuo-dev/attenuo/blob/main/GOVERNANCE.md) already promise. The required checks are the jobs in `.github/workflows/ci.yml`: `fmt`, `clippy`, `test`, `msrv`, `deny`, `audit`, `demo`, `policy-tests`, `fuzz-build`, `docs`. `.github/CODEOWNERS` says code-owner approval satisfies the rule.
-- [ ] Discussions switched on. `.github/ISSUE_TEMPLATE/config.yml` already links to `/discussions` for questions and early design ideas, so the link is dead until this is enabled.
+- [ ] Discussions switched on, then point `SUPPORT.md` and the "Ask a question" link in `.github/ISSUE_TEMPLATE/config.yml` at `/discussions` (both point at SUPPORT.md until then).
 - [ ] Private vulnerability reporting switched on. [SECURITY.md](https://github.com/attenuo-dev/attenuo/blob/main/SECURITY.md) points reporters at `github.com/attenuo-dev/attenuo/security/advisories/new`.
 - [ ] Issue templates render: open the "New issue" page and confirm the bug report, feature request and security links appear, and that blank issues are off (`.github/ISSUE_TEMPLATE/`).
 - [ ] Pull request template appears on a test PR (`.github/pull_request_template.md`).
@@ -15,7 +15,7 @@ The first release is 0.1.0. Its notes draft, what is already prepared and the ex
 
 ## SECURITY.md contact
 
-- [ ] Replace the `security@<domain>` placeholder in SECURITY.md with a real mailbox, or remove the email line and keep GitHub private reporting as the only channel. Check that the mailbox receives mail.
+- [x] The `security@<domain>` placeholder is gone from SECURITY.md (2026-11-05); GitHub private vulnerability reporting is the only channel. Switch it on in the repository's security settings once the repo is public (the feature exists only for public repositories), and add a mailbox later if a project domain exists.
 - [ ] Check the response times SECURITY.md promises are ones a single maintainer can keep.
 
 ## Documentation site

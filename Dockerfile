@@ -25,7 +25,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # Pinned by digest (multi-arch index, SR-30). Refresh: Dependabot (docker ecosystem), or
 # `docker buildx imagetools inspect debian:bookworm-slim` and paste the top-level Digest.
-FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS runtime
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS runtime
 # curl is only for the HEALTHCHECK.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \
