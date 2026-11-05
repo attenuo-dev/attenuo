@@ -253,7 +253,9 @@ pub use lint::{lint_with_options, policy_action_names, LintOptions};
 pub use schema::{
     action_id, default_user_attrs, DEFAULT_SCHEMA, GENERIC_ACTION, REQUIRED_ENTITY_TYPES,
 };
-pub use screen::{ListScreen, HIDE_INVALID_NAME, HIDE_NOT_IN_CATALOG, HIDE_POLICY};
+pub use screen::{
+    ListScreen, HIDE_INVALID_NAME, HIDE_NOT_IN_CATALOG, HIDE_POLICY, SCREEN_MEMO_CAPACITY,
+};
 pub use usage::{policies_read_usage, TrackUsage};
 
 /// The starter policy set shipped with the crate (`policies/default.cedar`).
@@ -680,6 +682,8 @@ impl PolicyEngineBuilder {
             authorizer: Authorizer::new(),
             validation_warnings: loaded.warnings,
             request_cache: request::RequestCache::new(request::REQUEST_CACHE_CAPACITY),
+            generation: 0,
+            screen_memo: screen::ScreenMemo::default(),
         })
     }
 }
@@ -946,6 +950,10 @@ pub struct PolicyEngine {
     authorizer: Authorizer,
     validation_warnings: Vec<String>,
     request_cache: request::RequestCache,
+    /// Bumped by every successful policy reload ([`PolicyEngine::policy_generation`]).
+    generation: u64,
+    /// The list screen's verdicts ([`PolicyEngine::screen_tools`]).
+    screen_memo: screen::ScreenMemo,
     /// Some loaded policy may read `context.usage`; recomputed on reload.
     policies_read_usage: bool,
     /// Some loaded policy may read `context.session_id`; recomputed on reload.
@@ -1266,6 +1274,9 @@ impl PolicyEngine {
         // The cached request parts do not depend on the policies, but a reload is the
         // operator's "start from scratch", so it starts with an empty cache too.
         self.request_cache.clear();
+        // A new policy set may hide or show other tools.
+        self.generation += 1;
+        self.screen_memo.clear();
         Ok(())
     }
 

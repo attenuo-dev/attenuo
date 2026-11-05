@@ -13,7 +13,10 @@
 //!    results down to the entries the caller's effective capabilities could ever permit, using
 //!    the same names the request mapping below uses (see [`filter::could_permit_tool`],
 //!    [`filter::could_permit_resource`], [`filter::could_permit_prompt`]); `nextCursor` is
-//!    passed through untouched;
+//!    passed through untouched. With [`ProxyConfig::list_filter`] set to
+//!    [`ListFilterMode::Policy`], the `tools/list` entries that remain are then screened by
+//!    [`Authorizer::screen_tools`], which hides a tool no call could be allowed for (see
+//!    [`screen`]); the default, [`ListFilterMode::Capabilities`], is the capability filter alone;
 //! 4. forwards the remaining allowlisted methods transparently, preserving `Mcp-Session-Id`.
 //!    These, `tools/list` and `GET`/`DELETE` session requests are authenticated and
 //!    lease-checked ([`Authorizer::check_active`]) first, so a revoked token gets `401` there
@@ -151,6 +154,7 @@ pub mod label;
 pub mod listed;
 pub mod proxy;
 pub mod records;
+pub mod screen;
 pub mod session;
 pub mod sse;
 pub mod stage;
@@ -208,5 +212,6 @@ pub use proxy::{
     REASON_SESSION_MISMATCH, REASON_SESSION_REGISTRY_FULL, REASON_TOOL_NOT_LISTED,
     REASON_TOO_MANY_SESSIONS, REASON_UPSTREAM_BODY_TOO_LARGE, REASON_UPSTREAM_NOT_EVENT_STREAM,
 };
+pub use screen::ListFilterMode;
 pub use session::{SessionOwner, SessionRegistry};
 pub use stage::Stage;

@@ -23,6 +23,7 @@ Rows, each one whole 200-tool list:
 | row | what |
 |---|---|
 | `screen` | `PolicyEngine::screen_tools_uncached`: the per-list parts (principal, `originating_user` and `chain` records, the user, agent and server entities), then per tool the tool and action entities, the partial request and the partial evaluation. What a chain's first list costs; the server memoises the verdicts (commit 2). |
+| `screen_memo` | `PolicyEngine::screen_tools` for a chain already screened: every verdict from the memo (chain digest, policy generation, server, tool, attributes). What a repeated list costs. Added with the memo (second commit of the branch); its run is below. |
 | `screen_approval` | the same with the approval obligation |
 | `prepare` | the first half alone (requests and entity stores for 200 tools) |
 | `partial_eval` | the second half alone (200 `is_authorized_partial` calls on prepared requests) |
@@ -45,7 +46,7 @@ cargo bench -p attenuo-policy --bench list_screen -- --warm-up-time 1 --measurem
 
 Per tool: about 25 us for the whole screen (20 us to build the request and entity store, 9 us to evaluate), against 6 us for a concrete evaluation. Partial evaluation costs about 1.3 to 1.5 times concrete evaluation of the same policies. `prepare` and `partial_eval` add up to more than `screen`; the halves are timed with their outputs kept alive (200 entity stores), which `screen` does not do, so read the split as a proportion. The approval obligation costs nothing measurable at 1 hop; at 3 hops the 0.6 ms difference is within this host's run-to-run spread.
 
-Against the ADR's estimate: a chain's first list is 5 to 6 ms, not 25 ms, because the screen builds the user, agent and server entities once per list and adds two entities per tool (`Entities::add_entities`) instead of parsing a whole entity store from JSON per tool (the request cache's 110 to 150 us). A warm list is memo lookups: see the follow-up below once the memo exists.
+Against the ADR's estimate: a chain's first list is 5 to 6 ms, not 25 ms, because the screen builds the user, agent and server entities once per list and adds two entities per tool (`Entities::add_entities`) instead of parsing a whole entity store from JSON per tool (the request cache's 110 to 150 us). A warm list is memo lookups: 80 to 91 us per 200 tools (below), about 0.4 us per tool, most of it the chain digest (RFC 8785 and SHA-256 of the chain, once per list) and the catalog lookups.
 
 Raw criterion output:
 
@@ -61,6 +62,40 @@ list_screen_partial/prepare/3_hop               time:   [4.3812 ms 4.4554 ms 4.5
 list_screen_partial/partial_eval/3_hop          time:   [1.7038 ms 1.7471 ms 1.7959 ms]
 list_screen_partial/concrete_eval/3_hop         time:   [1.3525 ms 1.4008 ms 1.4543 ms]
 ```
+
+## With the memo (second run, same day)
+
+The branch's second commit adds the memo and the `screen_memo` row; the whole group was run again (load average 2.5 before, 1.3 after):
+
+```
+list_screen_partial/screen/1_hop          [4.8226 ms 4.9283 ms 5.0616 ms]
+list_screen_partial/screen_memo/1_hop     [77.262 us 79.548 us 82.191 us]
+list_screen_partial/screen_approval/1_hop [4.9611 ms 5.0418 ms 5.1296 ms]
+list_screen_partial/prepare/1_hop         [3.7672 ms 3.8555 ms 3.9528 ms]
+list_screen_partial/partial_eval/1_hop    [1.5532 ms 1.5731 ms 1.5970 ms]
+list_screen_partial/concrete_eval/1_hop   [1.2459 ms 1.2659 ms 1.2879 ms]
+list_screen_partial/screen/3_hop          [5.7748 ms 5.8949 ms 6.0297 ms]
+list_screen_partial/screen_memo/3_hop     [86.958 us 90.912 us 95.729 us]
+list_screen_partial/screen_approval/3_hop [5.6320 ms 5.7218 ms 5.8261 ms]
+list_screen_partial/prepare/3_hop         [4.3978 ms 4.4801 ms 4.5730 ms]
+list_screen_partial/partial_eval/3_hop    [1.7615 ms 1.8037 ms 1.8492 ms]
+list_screen_partial/concrete_eval/3_hop   [1.2052 ms 1.2191 ms 1.2370 ms]
+```
+
+## End to end, through the server
+
+An `#[ignore]` test, `list_cost_by_mode` in `crates/attenuo-server/tests/list_screen.rs`, starts the whole server (in-memory audit) in front of the fake MCP server listing 200 tools, mints a 1-hop token for a user without MFA, and times `tools/list` over HTTP on one connection: the first list, then 9 rounds of 50 lists (median of the rounds, min and max in brackets). The catalog has 199 of the 200 tools, 195 of them read-only, so under `"policy"` the screen keeps 197 and hides `update_issue`, `delete_repo` and the uncatalogued one; the bodies differ by those three entries. The modes alternate, two servers each, two runs (load average 2.8 to 3.3):
+
+```
+cargo test --release -p attenuo-server --test list_screen list_cost -- --ignored --nocapture
+```
+
+| mode | first list (us) | repeated list, median (us) |
+|---|---|---|
+| `capabilities` | 2587, 2705, 2788, 2709 | 1986 [1710, 2425], 1806 [1701, 1896], 1797 [1528, 2059], 1886 [1642, 2407] |
+| `policy` | 8184, 7560, 8357, 10661 | 2421 [1974, 3068], 2468 [2160, 2618], 2226 [2029, 2793], 2700 [2225, 3433] |
+
+So on this host the screen adds about 5 to 8 ms to a chain's first list and 0.4 to 0.8 ms to a repeated one, against 1.8 to 2.0 ms for the list itself. The repeated figure is more than the 0.08 to 0.09 ms of `screen_memo`: the rest is the hop to the blocking pool and back, copying the chain and the 200 names there, and collecting and removing the names in the response. The default mode's path differs from the base commit by one boolean test per list answer and an absent stream stage; it was not timed against the base end to end.
 
 ## The decision path with the feature on
 

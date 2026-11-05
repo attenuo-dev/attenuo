@@ -8,6 +8,8 @@
 //!
 //! - `screen/<n>_hop`: `PolicyEngine::screen_tools_uncached`, what a chain's first list costs
 //!   (per-list parts, then per tool: tool entities, partial request, partial evaluation).
+//! - `screen_memo/<n>_hop`: `PolicyEngine::screen_tools` on a chain already screened, every
+//!   verdict a memo hit: what a repeated list costs.
 //! - `screen_approval/<n>_hop`: the same with an `@obligation("approval")` forbid added, so the
 //!   screen evaluates the relaxed set.
 //! - `prepare/<n>_hop` and `partial_eval/<n>_hop`: the two halves of `screen`, timed apart.
@@ -128,6 +130,14 @@ fn bench_screen(c: &mut Criterion) {
 
         group.bench_function(format!("screen/{depth}_hop"), |b| {
             b.iter(|| plain.screen_tools_uncached(black_box(&chain), "github", black_box(&names)))
+        });
+        // A repeated list of the same chain: every verdict from the memo.
+        assert_eq!(
+            plain.screen_tools(&chain, "github", &names),
+            plain.screen_tools_uncached(&chain, "github", &names)
+        );
+        group.bench_function(format!("screen_memo/{depth}_hop"), |b| {
+            b.iter(|| plain.screen_tools(black_box(&chain), "github", black_box(&names)))
         });
         group.bench_function(format!("screen_approval/{depth}_hop"), |b| {
             b.iter(|| {

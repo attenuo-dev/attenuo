@@ -674,6 +674,33 @@ impl Pipeline {
         }
     }
 
+    /// The list screen (ADR-0011, `[proxy] list_filter = "policy"`): for each of `tools` on
+    /// `server`, whether it stays listed for `chain` (`PolicyEngine::screen_tools`). No lease
+    /// check, no audit record, no approval, no charge, no run state: a hidden tool that is
+    /// called anyway is decided by [`decide`](Self::decide) as before. Hidden entries are
+    /// counted by reason. A poisoned engine lock keeps everything.
+    pub fn screen_tools(
+        &self,
+        chain: &DelegationChain,
+        server: &str,
+        tools: &[String],
+    ) -> Vec<bool> {
+        let Ok(engine) = self.policy.read() else {
+            return vec![true; tools.len()];
+        };
+        engine
+            .screen_tools(chain, server, tools)
+            .into_iter()
+            .map(|verdict| match verdict {
+                attenuo_policy::ListScreen::Keep => true,
+                attenuo_policy::ListScreen::Hide(reason) => {
+                    self.metrics.list_entry_hidden(reason);
+                    false
+                }
+            })
+            .collect()
+    }
+
     fn decide_inner(
         &self,
         chain: &DelegationChain,
@@ -1973,6 +2000,20 @@ impl Authorizer for ServerAuthorizer {
                 "tool annotations narrowed a catalog entry"
             );
         }
+    }
+
+    async fn screen_tools(
+        &self,
+        chain: &DelegationChain,
+        server: &str,
+        tools: &[String],
+    ) -> Vec<bool> {
+        let (chain, server, tools) = (chain.clone(), server.to_owned(), tools.to_vec());
+        // Cedar runs on the blocking pool, as for a decision.
+        on_blocking_pool(&self.pipeline, move |p| {
+            p.screen_tools(&chain, &server, &tools)
+        })
+        .await
     }
 
     fn knows_tool(&self, server: &str, tool: &str) -> bool {

@@ -164,3 +164,139 @@ impl PolicyEngine {
             && response.decision() == Some(CedarDecision::Deny)
     }
 }
+
+/// Most screen verdicts [`ScreenMemo`] holds; when full it is emptied and refilled.
+pub const SCREEN_MEMO_CAPACITY: usize = 16_384;
+
+/// The attributes a memoised verdict was computed with (narrowing from tool annotations can
+/// change them during the engine's life).
+type AttrKey = (bool, bool, bool);
+
+fn attr_key(attrs: &ToolAttrs) -> AttrKey {
+    (attrs.readonly, attrs.sensitive, attrs.is_destructive())
+}
+
+/// Screen verdicts by (chain digest, policy generation, server), then tool. A list of the same
+/// chain costs one lookup per tool. Emptied on a policy reload, and keyed on the generation
+/// as well, so a verdict of an earlier policy set is never served.
+#[derive(Debug, Default)]
+pub(crate) struct ScreenMemo {
+    inner: std::sync::Mutex<MemoInner>,
+}
+
+type ListKey = (String, u64, String);
+
+#[derive(Debug, Default)]
+struct MemoInner {
+    lists: std::collections::HashMap<
+        ListKey,
+        std::collections::HashMap<String, (AttrKey, ListScreen)>,
+    >,
+    entries: usize,
+}
+
+impl ScreenMemo {
+    pub(crate) fn clear(&self) {
+        if let Ok(mut m) = self.inner.lock() {
+            m.lists.clear();
+            m.entries = 0;
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.inner.lock().map(|m| m.entries).unwrap_or(0)
+    }
+}
+
+impl PolicyEngine {
+    /// The list screen for every tool in `tools` (one verdict each, in order), memoised per
+    /// (chain digest, [`policy_generation`](Self::policy_generation), server, tool) and the
+    /// tool's effective attributes. See the [module docs](self). Never writes anything but
+    /// the memo.
+    pub fn screen_tools(
+        &self,
+        chain: &DelegationChain,
+        server: &str,
+        tools: &[String],
+    ) -> Vec<ListScreen> {
+        let mut out = vec![ListScreen::Keep; tools.len()];
+        // (index, attributes) of the tools Cedar has to answer.
+        let mut todo: Vec<(usize, ToolAttrs)> = Vec::new();
+        for (i, tool) in tools.iter().enumerate() {
+            if attenuo_core::names::check_server_name(server).is_err()
+                || attenuo_core::names::check_call_name(tool).is_err()
+            {
+                out[i] = ListScreen::Hide(HIDE_INVALID_NAME);
+                continue;
+            }
+            match self.effective_attrs(server, tool) {
+                None => out[i] = ListScreen::Hide(HIDE_NOT_IN_CATALOG),
+                Some(attrs) => todo.push((i, attrs)),
+            }
+        }
+        if todo.is_empty() {
+            return out;
+        }
+        let key: ListKey = (chain.digest(), self.generation, server.to_owned());
+        if let Ok(memo) = self.screen_memo.inner.lock() {
+            if let Some(list) = memo.lists.get(&key) {
+                todo.retain(|(i, attrs)| match list.get(tools[*i].as_str()) {
+                    Some((k, verdict)) if *k == attr_key(attrs) => {
+                        out[*i] = *verdict;
+                        false
+                    }
+                    _ => true,
+                });
+            }
+        }
+        if todo.is_empty() {
+            return out;
+        }
+        let base = self.screen_prepare(chain, server);
+        let computed: Vec<(usize, AttrKey, ListScreen)> = todo
+            .iter()
+            .map(|(i, attrs)| {
+                let verdict = match &base {
+                    Prepared::AllDenied => ListScreen::Hide(HIDE_POLICY),
+                    Prepared::Failed => ListScreen::Keep,
+                    Prepared::Base(b) => self.screen_cedar(b, &tools[*i], attrs),
+                };
+                (*i, attr_key(attrs), verdict)
+            })
+            .collect();
+        for (i, _, verdict) in &computed {
+            out[*i] = *verdict;
+        }
+        // A failed translation is not remembered: it says nothing about the policy.
+        if matches!(base, Prepared::Failed) {
+            return out;
+        }
+        if let Ok(mut memo) = self.screen_memo.inner.lock() {
+            if memo.entries + computed.len() > SCREEN_MEMO_CAPACITY {
+                memo.lists.clear();
+                memo.entries = 0;
+            }
+            let list = memo.lists.entry(key).or_default();
+            let mut added = 0;
+            for (i, k, verdict) in computed {
+                if list.insert(tools[i].clone(), (k, verdict)).is_none() {
+                    added += 1;
+                }
+            }
+            memo.entries += added;
+        }
+        out
+    }
+
+    /// Bumped by every successful [`reload_policies_str`](Self::reload_policies_str); part
+    /// of the list screen's memo key.
+    pub fn policy_generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// How many tool verdicts the list screen's memo holds (at most
+    /// [`SCREEN_MEMO_CAPACITY`]).
+    pub fn screened_tools(&self) -> usize {
+        self.screen_memo.len()
+    }
+}

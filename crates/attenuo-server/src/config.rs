@@ -1365,6 +1365,13 @@ pub struct ProxySection {
     /// records under a flood of distinct chains. Default 10000, between 100 and 1000000.
     #[serde(default = "default_record_window_max_keys")]
     pub record_window_max_keys: u64,
+    /// How `tools/list` answers are filtered (ADR-0011): `"capabilities"` (the default) keeps
+    /// every tool some capability of the chain could permit; `"policy"` also hides a tool when
+    /// the Cedar policy (approval obligations lifted) denies every possible call to it for the
+    /// chain, or when the catalog lacks it under `unknown_tools = "deny"`. Advisory only: a
+    /// hidden tool that is called is decided and audited as usual.
+    #[serde(default)]
+    pub list_filter: attenuo_proxy::ListFilterMode,
 }
 
 /// Largest `[proxy] record_window_seconds`: an hour.
@@ -1396,6 +1403,7 @@ impl Default for ProxySection {
             max_sessions_per_principal: default_max_sessions_per_principal(),
             record_window_seconds: default_record_window_seconds(),
             record_window_max_keys: default_record_window_max_keys(),
+            list_filter: attenuo_proxy::ListFilterMode::Capabilities,
         }
     }
 }
@@ -1502,6 +1510,7 @@ impl ProxySection {
             )
             .with_max_sessions_per_principal(self.max_sessions_per_principal)
             .with_record_window(window, max_keys)
+            .with_list_filter(self.list_filter)
     }
 }
 

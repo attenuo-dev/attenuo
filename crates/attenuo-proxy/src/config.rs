@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::screen::ListFilterMode;
+
 /// One upstream MCP server, mounted at `/mcp/{name}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,6 +88,11 @@ pub struct ProxyConfig {
     /// Default [`crate::records::DEFAULT_RECORD_WINDOW_MAX_KEYS`].
     #[serde(default = "default_record_window_max_keys")]
     pub record_window_max_keys: usize,
+    /// How list answers are filtered: by capability shape alone (the default), or with
+    /// [`ListFilterMode::Policy`] also by [`crate::Authorizer::screen_tools`] for
+    /// `tools/list` (ADR-0011, see [`crate::screen`]).
+    #[serde(default)]
+    pub list_filter: ListFilterMode,
 }
 
 fn default_record_window() -> Duration {
@@ -138,7 +145,14 @@ impl ProxyConfig {
             max_sessions_per_principal: crate::session::DEFAULT_MAX_SESSIONS_PER_PRINCIPAL,
             record_window: crate::records::DEFAULT_RECORD_WINDOW,
             record_window_max_keys: crate::records::DEFAULT_RECORD_WINDOW_MAX_KEYS,
+            list_filter: ListFilterMode::Capabilities,
         }
+    }
+
+    /// Set [`ProxyConfig::list_filter`].
+    pub fn with_list_filter(mut self, mode: ListFilterMode) -> Self {
+        self.list_filter = mode;
+        self
     }
 
     /// Set [`ProxyConfig::record_window`] and [`ProxyConfig::record_window_max_keys`].

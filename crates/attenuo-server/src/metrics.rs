@@ -156,7 +156,16 @@ pub struct Metrics {
     /// reason). Tools come from a fixed set ([`is_lease_refusal_tool`]), so the map stays
     /// small; a series appears once counted.
     lease_refusal_suppressed: Mutex<BTreeMap<(String, usize), u64>>,
+    /// `tools/list` entries the list screen hid (ADR-0011), by [`LIST_HIDE_REASONS`] index.
+    list_entries_hidden: [AtomicU64; LIST_HIDE_REASONS.len()],
 }
+
+/// The reasons of `proxy_list_entries_hidden_total`, the list screen's hide reasons.
+pub const LIST_HIDE_REASONS: [&str; 3] = [
+    attenuo_policy::HIDE_POLICY,
+    attenuo_policy::HIDE_NOT_IN_CATALOG,
+    attenuo_policy::HIDE_INVALID_NAME,
+];
 
 impl Default for Metrics {
     fn default() -> Self {
@@ -194,6 +203,7 @@ impl Default for Metrics {
             streams_ended: Default::default(),
             stream_end_suppressed: Default::default(),
             lease_refusal_suppressed: Mutex::default(),
+            list_entries_hidden: Default::default(),
         }
     }
 }
@@ -631,6 +641,7 @@ impl Metrics {
              policy input includes run limits or run usage take it.",
         );
         self.render_stream_ends(&mut out);
+        self.render_list_screen(&mut out);
         out
     }
 
@@ -1029,6 +1040,32 @@ impl Metrics {
             if let Ok(mut map) = self.lease_refusal_suppressed.lock() {
                 *map.entry((tool.to_owned(), reason.index())).or_default() += 1;
             }
+        }
+    }
+
+    /// Count one `tools/list` entry the list screen hid, by its reason (one of
+    /// [`LIST_HIDE_REASONS`]; anything else is ignored, so the label set stays fixed).
+    pub fn list_entry_hidden(&self, reason: &str) {
+        if let Some(i) = LIST_HIDE_REASONS.iter().position(|r| *r == reason) {
+            self.list_entries_hidden[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn render_list_screen(&self, out: &mut String) {
+        header_lines(
+            out,
+            "proxy_list_entries_hidden_total",
+            "tools/list entries the list screen hid ([proxy] list_filter = \"policy\", \
+             ADR-0011), by reason: policy (no call could be allowed), not_in_catalog \
+             (unknown_tools = \"deny\"), invalid_name. Not audited: nothing was decided.",
+            "counter",
+        );
+        for (i, reason) in LIST_HIDE_REASONS.iter().enumerate() {
+            let n = self.list_entries_hidden[i].load(Ordering::Relaxed);
+            let _ = writeln!(
+                out,
+                "{PREFIX}_proxy_list_entries_hidden_total{{reason=\"{reason}\"}} {n}"
+            );
         }
     }
 
