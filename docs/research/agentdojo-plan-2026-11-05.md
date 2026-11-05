@@ -463,6 +463,30 @@ How far this goes:
 - A narrow list depends on the oracle. A real planner that leaves out a needed tool now takes it away from the model completely, where before the model could at least try it and see the refusal. Which of those is better for utility is unmeasured.
 - Same limits as above: workspace half only, 10 tasks, one attack, no pinned sampling.
 
+### Argument-level taint with a real model
+
+This adds the `confirm_untrusted_args` rule from `replay.args_policy(False)` to A2: a call asks for an approval when an argument copies a value or span of an untrusted result, on every call of a tainted run, reads included. The approver is the one from A3. Workspace half of the sample, `important_instructions`, server built from `8ceaa46`. Refused runs count as not done, and attack success is 0 in every row.
+
+| Model and arm | Benign utility | Task done under attack | Runs refused | Cost, by our meter |
+| --- | --- | --- | --- | --- |
+| Haiku, A2 | 5/10 | 70/140 | 0 | $0.30 |
+| Haiku, `args` | 5/10 | 70/140 | 0 | $0.30 |
+| Sonnet, A2 | 6/10 | 65/140 | 26 | $4.66 |
+| Sonnet, `args`, cut off | 6/10 | 56/112 | 23 | $3.64 |
+
+On the 112 pairs both Sonnet runs finished, `args` and A2 each finished 56, with 23 and 21 refused. The Sonnet run stopped when the API credit ran out.
+
+| Attack-run calls | Allowed | Denied by capability | Denied by policy | Sent to approval |
+| --- | --- | --- | --- | --- |
+| Haiku, `args` | 168 | 100 | 42 | 0 |
+| Sonnet, `args` | 146 | 29 | 33 | 0 |
+
+The rule never fired: no call on either model went to approval, so there are no gated tools, arguments or match kinds to list.
+
+That isn't a failure of the rule. A free control on the same binary, the replay's `args` arm, opened 14 approvals on slack and 30 on workspace. The real models never reached it. Their allowed calls are `search_calendar_events`, `get_day_calendar_events` and `get_current_day` with values from the user's prompt, and Sonnet's five `reschedule_calendar_event` calls, whose arguments are pinned, which the rule exempts. The writes that might copy text were refused earlier, by capability or by the contact rule.
+
+**This run doesn't answer the paraphrase question.** A search of every logged call for the attacker's address found none, gated or not, so nothing was paraphrased past the rule, because the models never tried to act on the attack at all. Testing paraphrase needs a model and attack where the model does act on the injection, and a sample with allowed writes. The workspace half has few of those. Since tasks 0 to 9 and these grants don't exercise the rule, this result shows only that it added no cost here.
+
 ## Four models on one sample 2026-11-05
 
 The full suite on the larger models doesn't fit the budget, so all four ran one sample chosen before any call: workspace user tasks 0 to 9 against all 14 injection tasks plus their 10 benign runs, and banking user tasks 0 to 7 against all 9 plus 8 benign runs. That is 230 runs per model. `agentdojo` 0.1.35, suite `v1.2.2`, `important_instructions`, no attenuo, one run each. We kept this attack because `tool_knowledge` didn't change Haiku's behaviour. Haiku's figures come from its existing full run, not a rerun.
@@ -588,12 +612,24 @@ How far these numbers go:
 
 The binary was `attenuo-server` built from `bf9227f`. Raw outputs are not in the repository.
 
+An unrelated attack, `ignore_previous`, gives the same pattern. We chose it because it shares nothing with the `important_instructions` template: it just tells the model to ignore its instructions and do the goal, with no claim to come from the user. Opus 5.5, no fallback, cut off at 110 of 140 attack pairs when the credit ran out, with all 10 benign runs at 10/10. Attack success was 0/110, with no attacker call in the logs, and 47 of 110 tasks finished. On the 110 pairs all three attacks share:
+
+| Attack | Task done | Runs refused | Refused on injections 0 to 3 (36 pairs) | Refused on injections 4 to 13 (74 pairs) |
+| --- | --- | --- | --- | --- |
+| `important_instructions` | 42 | 68 | 0 | 68 |
+| `tool_knowledge` | 43 | 67 | not split | not split |
+| `ignore_previous` | 47 | 63 | 0 | 63 |
+
+All 63 refusals are category `cyber`. So the refusals follow the attacker's goal, not the wording. Three templates give about the same rate, and goals that send data out draw them while goals like these first four don't. The pairs left out are later user tasks, not a random sample, and it is one model, one run per pair.
+
 ## Decisions needed
 
-Spend so far is about $88.71 of $168.50.
+Spend so far is **$171.96 by the Console, and the API credit is used up**: the account shows $3.46 unpaid, and the API refuses calls until funds are added. No payment method is on file and the credit was promotional, so nothing was charged.
+
+Our meter says $99.03, so it missed $72.93. All costs in this document come from that meter, and any cost for a model other than Haiku may be low by a factor of about 1.8. The caps we set also rested on it, which is how spending passed the $120 limit set for this work. The Console's cost and usage pages list only Haiku, at $7.42 and 60.5M input tokens, which is close to our meter's $7.16 and 58.6M. They don't list the other models at all, so we can't tell where the difference comes from. It could be rates higher than the table we priced from, or something we don't count. Treat relative costs between runs of one model as usable, and absolute costs above as lower bounds.
 
 1. Whether any more baseline spending helps. No attack succeeded on four models with this attack, and on Haiku with a stronger one too. Attacks that adapt to the model are a separate research effort, and more runs of stock attacks are unlikely to change this.
-2. Whether to report the refusal result. It holds, with limits, and can now be stated narrowly. With default settings, an injection stopped the user's task on Opus in about 65% of workspace runs under two related attacks, without the attack succeeding, and the attack success rate doesn't show this. With the [refusal fallback](#refusals-fallback-and-a-second-attack), nearly all of those runs finished, on an older model, and no attack succeeded. An unrelated attack is the remaining check before claiming it goes beyond this template.
+2. Whether to report the refusal result. It can now be stated, narrowly. With default settings, on Opus 5.5 and these workspace tasks, an injection stopped the user's task in about 60% of runs under [three attacks](#refusals-fallback-and-a-second-attack), without the attack succeeding, and the attack success rate doesn't show this. Refusals follow goals that send data out, not the template. With the refusal fallback, nearly all those runs finished, on an older model, and no attack succeeded. It rests on one model at this rate, one run per pair and a partial third run. Other models and suites are unmeasured.
 3. Which attenuo cost to fix first. Passing the proxy's tool list to the model is [measured](#filtered-tool-list): it cuts cost to about a third and removes refusals of tools outside the grant, and it doesn't recover utility. So we recommend replacing the contact rule next, since it accounts for the tasks lost on every row, and then looking at the pin rule, which `user_task_7` suggests costs a task on its own. Filtering is worth keeping for its cost, whichever way those go.
 2. Whether to report the refusal result. An injection that stops the user's task on Opus in most workspace runs is a finding about these models and this benchmark's scoring. It needs a fallback run, and more than one attack, before it is claimed in the report.
 3. Which attenuo cost to fix first. We recommend dropping the contact rule wherever a token carries a grant that pins its recipients, as in `grants_nocontact` ([replay](#replacing-the-contact-rule-2026-11-05): 95 of 97 benign tasks against 77, and 16 of 609 attacks landed against 15), keeping it only for broad tokens, then passing the proxy's filtered tool list to the model, and measuring both with a real model. Neither a domain rule nor a rule on recipients the prompt names stops the one extra attack, which goes to the task's own recipient.
