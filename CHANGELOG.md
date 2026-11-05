@@ -8,7 +8,9 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- Brand assets under `assets/brand/` (mark, favicon, README header, social preview) and a favicon for the docs site. The mark is the delegation chain: three squares narrowing left to right.
 
 ## [0.1.0] - 2026-10-24
 
