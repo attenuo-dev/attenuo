@@ -200,6 +200,64 @@ async fn assets_have_their_content_type_and_unknown_ones_404() {
 }
 
 #[tokio::test]
+async fn favicon_is_the_brand_svg_with_the_asset_headers() {
+    let h = Harness::start(false).await;
+    let brand: &[u8] = include_bytes!("../../../assets/brand/favicon.svg");
+    // A static asset to compare headers with.
+    let css = h.get("/admin/ui/app.css").await;
+    assert_eq!(css.status(), StatusCode::OK);
+    let css = css.headers().clone();
+    let mut etag = None;
+    for path in ["/favicon.svg", "/admin/ui/favicon.svg"] {
+        let r = h.get(path).await;
+        assert_eq!(r.status(), StatusCode::OK, "{path}");
+        let headers = r.headers().clone();
+        assert_eq!(headers["content-type"], "image/svg+xml", "{path}");
+        assert_security_headers(&headers);
+        for name in [
+            "cache-control",
+            "content-security-policy",
+            "x-content-type-options",
+            "x-frame-options",
+            "referrer-policy",
+            "cross-origin-opener-policy",
+            "cross-origin-resource-policy",
+        ] {
+            assert_eq!(headers[name], css[name], "{path}: {name}");
+        }
+        assert!(!headers.contains_key("pragma"), "{path}");
+        assert_eq!(
+            headers["etag"].to_str().unwrap(),
+            format!("\"{}\"", hex::encode(sha2::Sha256::digest(brand))),
+            "{path}"
+        );
+        etag = Some(headers["etag"].clone());
+        assert_eq!(r.bytes().await.unwrap().as_ref(), brand, "{path}");
+    }
+    let r = Harness::client()
+        .get(h.console.url("/favicon.svg"))
+        .header("if-none-match", etag.unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NOT_MODIFIED);
+    assert_security_headers(r.headers());
+    // The page links it relative to itself, as it does its stylesheet and scripts.
+    let page = h.get("/admin/ui/").await.text().await.unwrap();
+    assert!(
+        page.contains(r#"<link rel="icon" type="image/svg+xml" href="favicon.svg">"#),
+        "{page}"
+    );
+    // Not on the main listener, which never serves the console.
+    let r = Harness::client()
+        .get(h.main.url("/favicon.svg"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn etag_and_if_none_match_give_304() {
     let h = Harness::start(false).await;
     let r = h.get("/admin/ui/app.js").await;

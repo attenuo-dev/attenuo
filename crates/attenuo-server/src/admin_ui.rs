@@ -12,6 +12,9 @@
 //!   compiled in with `include_bytes!` ([`ASSETS`]). `/` and `/admin/ui` redirect to
 //!   `/admin/ui/`. Assets carry `Cache-Control: no-cache` and a SHA-256 `ETag`, and answer
 //!   `If-None-Match` with 304, so a server upgrade never leaves a stale script running.
+//! - `GET /favicon.svg`: the brand favicon (`ui/favicon.svg`, a copy of
+//!   `assets/brand/favicon.svg` kept in the crate so it packages), the same asset as
+//!   `/admin/ui/favicon.svg` with the same headers.
 //! - The read-only admin routes ([`read_routes`]) behind [`require_admin`]: audit queries,
 //!   entries and checkpoints, lease status and tree, the loaded policies, a lint of the policy
 //!   file, and the `POST /admin/policies/evaluate` dry run (JSON `Content-Type` required). One
@@ -78,6 +81,7 @@ pub struct Asset {
 const HTML: &str = "text/html; charset=utf-8";
 const JS: &str = "text/javascript; charset=utf-8";
 const CSS: &str = "text/css; charset=utf-8";
+const SVG: &str = "image/svg+xml";
 
 /// The console files. A fixed table rather than a directory walk, so what ships is exactly
 /// what is listed here and reviewed; a new file is one entry. Paths are flat (the asset route
@@ -92,6 +96,11 @@ pub const ASSETS: &[Asset] = &[
         path: "app.css",
         content_type: CSS,
         bytes: include_bytes!("../ui/app.css"),
+    },
+    Asset {
+        path: "favicon.svg",
+        content_type: SVG,
+        bytes: include_bytes!("../ui/favicon.svg"),
     },
     Asset {
         path: "app.js",
@@ -246,6 +255,7 @@ pub fn router(state: Arc<AppState>, config: &Config) -> Router {
     let assets = Router::new()
         .route("/", get(redirect_to_ui))
         .route("/admin/ui", get(redirect_to_ui))
+        .route("/favicon.svg", get(favicon))
         .route(UI_PREFIX, get(index))
         .route("/admin/ui/{file}", get(asset))
         .with_state(asset_table());
@@ -266,6 +276,10 @@ async fn not_found() -> ApiError {
 
 async fn index(State(table): State<AssetTable>, headers: HeaderMap) -> Response {
     serve_asset(&table, "index.html", &headers)
+}
+
+async fn favicon(State(table): State<AssetTable>, headers: HeaderMap) -> Response {
+    serve_asset(&table, "favicon.svg", &headers)
 }
 
 async fn asset(
@@ -410,7 +424,7 @@ mod tests {
         if text.contains("style=") {
             found.push(format!("{path}: `style=`"));
         }
-        if !path.ends_with(".html") {
+        if !path.ends_with(".html") && !path.ends_with(".svg") {
             return found;
         }
         let lower = text.to_ascii_lowercase();
@@ -502,6 +516,23 @@ mod tests {
         }
     }
 
+    /// The embedded favicon is the brand file, byte for byte (the crate keeps its own copy so
+    /// that it packages), and the SVG markup scan above covers it: no script, no handler.
+    #[test]
+    fn favicon_is_the_brand_file() {
+        let fav = ASSETS.iter().find(|a| a.path == "favicon.svg").unwrap();
+        assert_eq!(
+            fav.bytes,
+            include_bytes!("../../../assets/brand/favicon.svg"),
+            "crates/attenuo-server/ui/favicon.svg differs from assets/brand/favicon.svg"
+        );
+        assert_eq!(fav.content_type, "image/svg+xml");
+        let text = std::str::from_utf8(fav.bytes).unwrap().to_ascii_lowercase();
+        assert!(!text.contains("<script") && !text.contains("<foreignobject"));
+        assert!(unsafe_markup("favicon.svg", &text).is_empty());
+        assert!(!unsafe_markup("x.svg", "<svg onload=\"go()\"/>").is_empty());
+    }
+
     #[test]
     fn every_asset_has_a_known_type_and_unique_path() {
         let mut paths: Vec<_> = ASSETS.iter().map(|a| a.path).collect();
@@ -513,6 +544,7 @@ mod tests {
                 Some("html") => HTML,
                 Some("js") => JS,
                 Some("css") => CSS,
+                Some("svg") => SVG,
                 other => panic!("no content type for {other:?}"),
             };
             assert_eq!(a.content_type, want, "{}", a.path);
