@@ -528,6 +528,8 @@ pub struct Pipeline {
     /// budget figures, from reading those figures to charging them (SR-55). See
     /// `Pipeline::run_guard`.
     run_locks: Box<[Mutex<()>]>,
+    /// `[approvals.notify]`: told about each new pending approval; it only queues.
+    approval_notifier: Option<crate::notify::NotifierHandle>,
 }
 
 /// How many locks `Pipeline::run_guard` spreads runs over. Two runs that share one only
@@ -556,6 +558,7 @@ impl Pipeline {
             ),
             approval_verifier: None,
             run_locks: (0..RUN_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
+            approval_notifier: None,
         }
     }
 
@@ -602,6 +605,13 @@ impl Pipeline {
     /// How long a pending approval stays usable (`[approvals] ttl_seconds`, default 120 s).
     pub fn with_approval_ttl(mut self, ttl: time::Duration) -> Self {
         self.approval_ttl = ttl;
+        self
+    }
+
+    /// Queue an `approval.pending` notice for every new pending approval
+    /// (`[approvals.notify]`). Queuing never waits on the receiver.
+    pub fn with_approval_notifier(mut self, notifier: crate::notify::NotifierHandle) -> Self {
+        self.approval_notifier = Some(notifier);
         self
     }
 
@@ -1341,6 +1351,9 @@ impl Pipeline {
                 return None;
             }
             self.metrics.approval_created();
+            if let Some(n) = &self.approval_notifier {
+                n.pending(&stored);
+            }
         }
         Some(ApprovalTicket {
             approval_id,

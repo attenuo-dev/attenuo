@@ -58,6 +58,7 @@ pub mod error;
 pub mod idp;
 pub mod jwks;
 pub mod metrics;
+pub mod notify;
 pub mod replay;
 pub mod routes;
 pub mod sink;
@@ -406,6 +407,16 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         let _ = tokio::task::spawn_blocking(move || {
             if let Some(sink) = &s.checkpoint_sink {
                 sink.shutdown(SINK_SHUTDOWN_GRACE);
+            }
+        })
+        .await;
+    }
+    // Give approval notifications still queued a moment to go out.
+    if state.approval_notifier.is_some() {
+        let s = state.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(n) = &s.approval_notifier {
+                n.shutdown(SINK_SHUTDOWN_GRACE);
             }
         })
         .await;
