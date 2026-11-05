@@ -20,6 +20,7 @@ never written anywhere by this script.
 """
 
 import argparse
+import asyncio
 import json
 import sys
 import warnings
@@ -46,7 +47,14 @@ VERSION = "v1.2.2"
 ATTACK = "important_instructions"
 # Dollars per million tokens, input and output. Haiku 5.5 costs more on a request whose prompt
 # passes 100K tokens.
-PRICES = {"claude-haiku-5-5": (0.10, 0.50), "claude-sonnet-5-5": (2.0, 10.0)}
+PRICES = {
+    "claude-haiku-5-5": (0.10, 0.50),
+    "claude-sonnet-5-5": (2.0, 10.0),
+    "claude-opus-5-5": (4.0, 20.0),
+    "claude-fable-5-1": (10.0, 50.0),
+}
+RATE_LIMIT_RETRIES = 20
+RATE_LIMIT_WAIT_SECONDS = 30
 LONG_PROMPT = {"claude-haiku-5-5": (100_000, 0.50, 2.50)}
 
 
@@ -99,6 +107,9 @@ class Meter:
             "cache_read_input_tokens": usage.cache_read_input_tokens,
             "cache_creation_input_tokens": usage.cache_creation_input_tokens,
             "stop_reason": completion.stop_reason,
+            "refusal_category": getattr(
+                getattr(completion, "stop_details", None), "category", None
+            ),
             "dollars": dollars,
         }
         with self.path.open("a", encoding="utf-8") as fh:
@@ -135,8 +146,16 @@ def install_meter(meter: Meter) -> None:
             fields["tools"] = tools
         if system_prompt:
             fields["system"] = system_prompt
-        async with client.messages.stream(**fields) as stream:
-            completion = await stream.get_final_message()
+        # A long wait, past the SDK's own retries: an unattended run outlasts a burst of 429s.
+        for attempt in range(RATE_LIMIT_RETRIES + 1):
+            try:
+                async with client.messages.stream(**fields) as stream:
+                    completion = await stream.get_final_message()
+                break
+            except anthropic.RateLimitError:
+                if attempt == RATE_LIMIT_RETRIES:
+                    raise
+                await asyncio.sleep(RATE_LIMIT_WAIT_SECONDS)
         meter.record(completion)
         return completion
 
@@ -169,9 +188,11 @@ def is_injectable(attack, user_task) -> bool:
         return False
 
 
-def select_tasks(suite, pipeline, count: int) -> tuple[list[str], list[str]]:
+def select_tasks(
+    suite, pipeline, count: int, attack_name: str = ATTACK
+) -> tuple[list[str], list[str]]:
     """The first `count` injectable user tasks in id order (0: all), and the ones not injectable."""
-    attack = load_attack(ATTACK, suite, pipeline)
+    attack = load_attack(attack_name, suite, pipeline)
     chosen, skipped = [], []
     for task_id in sorted(suite.user_tasks, key=task_number):
         if not is_injectable(attack, suite.user_tasks[task_id]):
@@ -190,6 +211,7 @@ def main() -> None:
     parser.add_argument("--injections", type=int, default=2)
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--cap", type=float, default=2.0, help="stop past this many dollars")
+    parser.add_argument("--attack", default=ATTACK)
     parser.add_argument("--shard", default="0/1", help="I/N: run every Nth user task from I")
     parser.add_argument("--resume", action="store_true", help="skip runs that have a log")
     parser.add_argument("--plan", action="store_true", help="print the selection and stop")
@@ -200,7 +222,7 @@ def main() -> None:
         raise SystemExit(f"no price held for {args.model}")
     suite = get_suite(VERSION, args.suite)
     pipeline = build_pipeline(args.model, args.max_tokens)
-    user_ids, not_injectable = select_tasks(suite, pipeline, args.tasks)
+    user_ids, not_injectable = select_tasks(suite, pipeline, args.tasks, args.attack)
     injection_ids = sorted(suite.injection_tasks, key=task_number)
     injection_ids = injection_ids[: args.injections or None]
     shard, shards = (int(x) for x in args.shard.split("/"))
@@ -227,7 +249,7 @@ def main() -> None:
     meter = Meter(args.model, args.cap, args.out / f"usage-{tag}.jsonl")
     adapt_sdk()
     install_meter(meter)
-    attack = load_attack(ATTACK, suite, pipeline)
+    attack = load_attack(args.attack, suite, pipeline)
     results = {"benign": {}, "attack": {}}
     warnings.simplefilter("ignore")
     logs = args.out / "logs"

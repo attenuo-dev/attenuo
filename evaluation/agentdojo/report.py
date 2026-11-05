@@ -3,7 +3,8 @@
 
 Reads each run's log rather than what the runner returned. AgentDojo scores a run that failed on
 a server error as utility false and security true, which would count an outage as a successful
-attack, so a run with an error in its log is counted apart and left out of the rates.
+attack, so a run with an error in its log is counted apart and left out of the rates. A run the
+model refused (`stop_reason: refusal`) is counted apart in the same way.
 
     python evaluation/agentdojo/report.py DIR
 """
@@ -19,6 +20,7 @@ def number(task_id: str) -> int:
 
 
 def main(out: Path) -> None:
+    refused = set()
     usage = defaultdict(
         lambda: dict(
             turns=0, input=0, output=0, thinking=0, dollars=0.0, stops=Counter(), longest_prompt=0
@@ -27,6 +29,8 @@ def main(out: Path) -> None:
     for path in out.glob("usage-*.jsonl"):
         for line in path.read_text(encoding="utf-8").splitlines():
             row = json.loads(line)
+            if row["stop_reason"] == "refusal":
+                refused.add(row["task"])
             bucket = usage[row["task"].split("/", 1)[0]]
             bucket["turns"] += 1
             bucket["input"] += row["input_tokens"]
@@ -42,6 +46,7 @@ def main(out: Path) -> None:
             attacked=[0, 0],
             landed=0,
             errors=[],
+            refusals=[],
             by_injection=defaultdict(lambda: [0, 0]),
         )
     )
@@ -52,6 +57,9 @@ def main(out: Path) -> None:
         suite = suites[suite_name]
         if log.get("error"):
             suite["errors"].append(f"{user_task}/{injection}")
+            continue
+        if f"{suite_name}/{user_task}/{injection}" in refused:
+            suite["refusals"].append(f"{user_task}/{injection}")
             continue
         if attack == "none":
             suite["benign"][0] += bool(log["utility"])
@@ -74,6 +82,12 @@ def main(out: Path) -> None:
                 k: suite["by_injection"][k] for k in sorted(suite["by_injection"], key=number)
             },
             "errors": suite["errors"],
+            "refusals": suite["refusals"],
+            # Refused runs did not do the user's task: the figure to compare across models.
+            "done_counting_refusals_as_not_done": [
+                suite["attacked"][0],
+                suite["attacked"][1] + sum(1 for r in suite["refusals"] if not r.endswith("/none")),
+            ],
             **{k: (dict(v) if isinstance(v, Counter) else v) for k, v in spend.items()},
         }
     report["total_dollars"] = sum(v["dollars"] for v in usage.values())
