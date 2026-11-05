@@ -20,7 +20,9 @@
 //!    whether its `destination` was seen, as `context.usage`; with no limit matching,
 //!    unreadable usage is the worst case ([`UNREADABLE_USAGE`]) and the policy decides. Then
 //!    argument matching (ADR-0009
-//!    phase 2, [`Pipeline::arg_taint`]): for a call to a destructive tool on a tainted run,
+//!    phase 2, [`Pipeline::arg_taint`]): on a tainted run, for every call when a loaded
+//!    policy reads `context.args_contain_untrusted` or `context.untrusted_args`
+//!    ([`PolicyEngine::reads_arg_taint`]) and otherwise for a call to a destructive tool,
 //!    every argument not pinned by an `equals` or `one_of` constraint is fingerprinted and
 //!    looked up in the run's span index (`LeaseStore::find_spans`); the hits are
 //!    `context.untrusted_args` and the record's `labels.untrusted_args`. An unreadable index
@@ -1241,7 +1243,7 @@ impl Pipeline {
     /// names no `amount` or `destination`, and `[policy] track_usage` is `"auto"`), so an
     /// allowed call then pays no usage write and its record carries no `usage`. A tool the
     /// engine knows nothing about, and a poisoned engine lock, count as destructive with
-    /// neither input, as [`Self::is_destructive`] does.
+    /// neither input, as [`Self::matches_arguments`] does.
     fn usage_inputs(&self, call: &ToolCall) -> Option<(Option<String>, Option<String>)> {
         let attrs = match self.policy.read() {
             Ok(e) if !e.tracks_usage() => return None,
@@ -1415,19 +1417,27 @@ impl Pipeline {
             .unwrap_or_default()
     }
 
-    /// Does the catalog mark `call`'s tool destructive? A tool the engine knows nothing about
-    /// (its call is denied anyway) and a poisoned engine lock both count as destructive.
-    fn is_destructive(&self, call: &ToolCall) -> bool {
-        self.policy
-            .read()
-            .ok()
-            .and_then(|e| e.effective_attrs(&call.server, &call.tool))
-            .is_none_or(|a| a.is_destructive())
+    /// Whether [`Self::arg_taint`] matches `call`'s arguments on a tainted run: when some
+    /// loaded policy reads argument taint ([`PolicyEngine::reads_arg_taint`]), or the catalog
+    /// marks the tool destructive (so the decision record says which arguments were copied
+    /// even when no policy asks). A tool the engine knows nothing about (its call is denied
+    /// anyway) and a poisoned engine lock count as destructive.
+    fn matches_arguments(&self, call: &ToolCall) -> bool {
+        let Ok(engine) = self.policy.read() else {
+            return true;
+        };
+        engine.reads_arg_taint()
+            || engine
+                .effective_attrs(&call.server, &call.tool)
+                .is_none_or(|a| a.is_destructive())
     }
 
     /// Which arguments of `call` carry a verbatim span of an untrusted result of the run
-    /// (ADR-0009 phase 2, design section 3.4). Only for a call to a destructive tool on a
-    /// tainted run (`session.tainted`); otherwise nothing matches. Arguments pinned by an
+    /// (ADR-0009 phase 2, design section 3.4). Only on a tainted run (`session.tainted`), and
+    /// only for a call to a destructive tool unless some loaded policy reads
+    /// `context.args_contain_untrusted` or `context.untrusted_args`
+    /// ([`PolicyEngine::reads_arg_taint`]), in which case every call is matched (a fetch of a
+    /// URL copied from a result, for example); otherwise nothing matches. Arguments pinned by an
     /// `equals` or `one_of` constraint of a hop that permits the call are skipped (the pin
     /// exemption). Every other argument is fingerprinted as results are
     /// ([`attenuo_core::fingerprint::fingerprints`]) and looked up in the run's span index.
@@ -1440,7 +1450,7 @@ impl Pipeline {
         call: &ToolCall,
         session: &SessionLabels,
     ) -> ArgTaint {
-        if !session.tainted || !self.is_destructive(call) {
+        if !session.tainted || !self.matches_arguments(call) {
             return ArgTaint::default();
         }
         let Some(chain_id) = chain_id_of(chain) else {
@@ -2956,6 +2966,14 @@ when { resource.destructive && context.args_contain_untrusted && !context.approv
 "#;
 
     fn pipeline(leases: Arc<dyn LeaseStore>, audit: Arc<dyn AuditSink>) -> Pipeline {
+        pipeline_with(leases, audit, POLICY)
+    }
+
+    fn pipeline_with(
+        leases: Arc<dyn LeaseStore>,
+        audit: Arc<dyn AuditSink>,
+        policy: &str,
+    ) -> Pipeline {
         let catalog = ToolCatalog::new()
             .with("mail", "read", ToolAttrs::new().readonly(true))
             .with(
@@ -2967,7 +2985,7 @@ when { resource.destructive && context.args_contain_untrusted && !context.approv
             .with("mail", "draft", ToolAttrs::new().destructive(false));
         let engine = PolicyEngineBuilder::new()
             .with_catalog(catalog)
-            .with_policies_str(POLICY)
+            .with_policies_str(policy)
             .build()
             .unwrap();
         Pipeline::new(Arc::new(RwLock::new(engine)), leases, audit)
@@ -3093,7 +3111,7 @@ when { resource.destructive && context.args_contain_untrusted && !context.approv
     }
 
     #[test]
-    fn unmatched_pinned_and_non_destructive_calls_do_not_ask() {
+    fn unmatched_pinned_and_non_destructive_calls_are_not_asked_about() {
         let now = OffsetDateTime::now_utc();
         let leases = Arc::new(MemoryLeaseStore::new());
         let audit = Arc::new(MemoryAudit::new());
@@ -3127,10 +3145,12 @@ when { resource.destructive && context.args_contain_untrusted && !context.approv
             now,
         );
         assert!(pinned.is_allow(), "{pinned:?}");
-        // Not destructive: never matched.
+        // Not destructive: matched, because the policy reads argument taint, but this policy
+        // asks only for destructive calls.
         let draft = ToolCall::new("mail", "draft", json!({"to": "mallory@evil.example"}));
         let d = p.decide(&c, &draft, now);
-        assert!(d.is_allow() && d.untrusted_args.is_empty(), "{d:?}");
+        assert!(d.is_allow(), "{d:?}");
+        assert_eq!(d.untrusted_args.len(), 1, "{d:?}");
         let records = audit.snapshot().unwrap();
         let own_record = records
             .iter()
@@ -3141,6 +3161,66 @@ when { resource.destructive && context.args_contain_untrusted && !context.approv
         assert!(!serde_json::to_string(&own_record.record)
             .unwrap()
             .contains("untrusted_args"));
+    }
+
+    #[test]
+    fn reads_are_matched_only_when_a_policy_reads_argument_taint() {
+        let now = OffsetDateTime::now_utc();
+        // A read whose argument copies the attacker's address from an earlier result.
+        let fetch = ToolCall::new("mail", "read", json!({"query": "mallory@evil.example"}));
+        let gated = r#"
+permit(principal, action, resource);
+@id("ask_on_any_copied_argument")
+@obligation("approval")
+forbid(principal, action, resource)
+when { context.args_contain_untrusted && !context.approval.present };
+"#;
+        let leases = Arc::new(MemoryLeaseStore::new());
+        let p = pipeline_with(leases.clone(), Arc::new(MemoryAudit::new()), gated);
+        let c = chain(leases.as_ref(), now);
+        assert!(p.policy.read().unwrap().reads_arg_taint());
+        let seq = read(&p, &c, "read", INBOX, now);
+        let d = p.decide(&c, &fetch, now);
+        assert_eq!(d.reason, attenuo_policy::REASON_APPROVAL_REQUIRED, "{d:?}");
+        assert_eq!(
+            d.untrusted_args,
+            vec![UntrustedArg {
+                arg: "query".into(),
+                seq: Some(seq),
+                kind: UntrustedKind::Entity,
+            }]
+        );
+
+        // No policy reads argument taint: the read is not matched at all, and the destructive
+        // call still is, for its record.
+        let plain = r#"
+permit(principal, action, resource);
+@id("ask_after_taint")
+@obligation("approval")
+forbid(principal, action, resource)
+when { resource.destructive && context.session.tainted && !context.approval.present };
+"#;
+        let leases = Arc::new(MemoryLeaseStore::new());
+        let p = pipeline_with(leases.clone(), Arc::new(MemoryAudit::new()), plain);
+        let c = chain(leases.as_ref(), now);
+        assert!(!p.policy.read().unwrap().reads_arg_taint());
+        let seq = read(&p, &c, "read", INBOX, now);
+        let d = p.decide(&c, &fetch, now);
+        assert!(d.is_allow() && d.untrusted_args.is_empty(), "{d:?}");
+        let d = p.decide(
+            &c,
+            &send(json!({"to": "mallory@evil.example", "cc": "bob@acme.example"})),
+            now,
+        );
+        assert_eq!(d.reason, attenuo_policy::REASON_APPROVAL_REQUIRED, "{d:?}");
+        assert_eq!(
+            d.untrusted_args,
+            vec![UntrustedArg {
+                arg: "to".into(),
+                seq: Some(seq),
+                kind: UntrustedKind::Entity,
+            }]
+        );
     }
 
     #[test]

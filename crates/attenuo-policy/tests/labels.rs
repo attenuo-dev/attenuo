@@ -262,6 +262,31 @@ fn option_b_asks_only_on_matched_arguments() {
 }
 
 #[test]
+fn the_engine_knows_whether_a_policy_reads_argument_taint() {
+    let reads = |p: &str| engine(p, AnnotationImport::Never).reads_arg_taint();
+    assert!(!reads("permit (principal, action, resource);"));
+    assert!(!reads(ASK_AFTER_TAINT));
+    assert!(reads(
+        "forbid (principal, action, resource) when { context.args_contain_untrusted };"
+    ));
+    assert!(reads(
+        r#"forbid (principal, action, resource) when { context.untrusted_args.contains("url") };"#
+    ));
+    assert!(reads(
+        r#"forbid (principal, action, resource) when { context["untrusted_args"].isEmpty() };"#
+    ));
+    // Recomputed on reload, both ways.
+    let mut e = engine(ASK_AFTER_TAINT, AnnotationImport::Never);
+    e.reload_policies_str(
+        "forbid (principal, action, resource) when { context.args_contain_untrusted };",
+    )
+    .unwrap();
+    assert!(e.reads_arg_taint());
+    e.reload_policies_str(ASK_AFTER_TAINT).unwrap();
+    assert!(!e.reads_arg_taint());
+}
+
+#[test]
 fn obligations_other_than_approval_on_a_forbid_are_refused_at_load() {
     for text in [
         "@obligation(\"aproval\") forbid (principal, action, resource);",

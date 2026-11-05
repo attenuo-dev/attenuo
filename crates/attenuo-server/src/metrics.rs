@@ -145,7 +145,8 @@ pub struct Metrics {
     approvals_consumed: [AtomicU64; 2],
     approvals_expired: AtomicU64,
     /// Output labelling (ADR-0009): results recorded, by label (trusted, untrusted), and
-    /// decisions on destructive calls whose arguments matched the run's span index, by
+    /// decisions on calls whose arguments matched the run's span index (calls the server
+    /// matches: destructive ones, or every call when a policy reads argument taint), by
     /// decision (allow, deny).
     results_recorded: [AtomicU64; 2],
     taint_matches: [AtomicU64; 2],
@@ -442,8 +443,8 @@ impl Metrics {
         self.results_recorded[i].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Count one decision on a destructive call with an argument that matched the run's span
-    /// index (or could not be checked against it).
+    /// Count one decision on a call with an argument that matched the run's span index (or
+    /// could not be checked against it); see `Pipeline::arg_taint` for which calls are matched.
     pub fn taint_match(&self, allowed: bool) {
         self.taint_matches[usize::from(!allowed)].fetch_add(1, Ordering::Relaxed);
     }
@@ -805,8 +806,8 @@ impl Metrics {
         header_lines(
             out,
             "taint_matches_total",
-            "Decisions on destructive calls with an argument found in the run's untrusted \
-             results (or not checkable), by decision.",
+            "Decisions on calls with an argument found in the run's untrusted results (or not \
+             checkable), by decision.",
             "counter",
         );
         for (i, decision) in ["allow", "deny"].iter().enumerate() {

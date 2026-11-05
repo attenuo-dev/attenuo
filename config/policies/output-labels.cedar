@@ -8,8 +8,10 @@
 //   context.session.tainted_by      "<server>/<tool>" of every source
 //   resource.destructive            catalog `destructive`, default `!readonly`
 //   context.args_contain_untrusted  some argument carries a verbatim span of an untrusted
-//                                   result of the run (phase 2; matched only for destructive
-//                                   tools on a tainted run, `equals`/`one_of` pins exempt)
+//                                   result of the run (phase 2; matched on a tainted run, for
+//                                   every call because these policies read it, `equals` and
+//                                   `one_of` pins exempt; a policy set that never reads it
+//                                   gets it for destructive calls only)
 //   context.untrusted_args          the names of those arguments
 //   context.approval.present        the call carries a granted approval for its exact
 //                                   call hash (single use, see `POST /approvals/{id}`)

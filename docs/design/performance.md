@@ -783,6 +783,18 @@ Branch `perf/sse-disown-cost`, main `2b495e2`. Since #117 the SSE path without a
 
 Branch `feat/cedar-list-filter`, base `a2d7a84`. [ADR-0011](../decisions/0011-cedar-aware-list-filtering.md) asked for a bench of Cedar partial evaluation for 200 tools before acceptance. cedar-policy 4.14.0's `partial-eval` feature can express it: `is_authorized_partial` with `originating_user` and `chain` concrete and `input`, `now_unix`, `session`, `args_contain_untrusted`, `untrusted_args`, `approval`, `budget`, `usage` and `session_id` as unknowns. A new criterion bench, `list_screen` in `attenuo-policy`, screens the shipped starter policy for a 200-tool catalog (133 hidden, 67 kept, asserted): **4.9 ms at 1 hop and 5.5 ms at 3 hops per uncached 200-tool list**, about 25 us per tool, of which 9 us is the partial evaluation (1.3 to 1.5 times a concrete one, 6 us) and the rest the per-tool request and entity store. An approval obligation (the relaxed set) costs nothing measurable. That is a fifth of the ADR's 25 ms first-list estimate, because the screen builds the chain's entities once per list and adds two per tool instead of parsing a store per tool. The server memoises verdicts per (chain digest, policy generation, server, tool), so a repeated list of the same chain costs **80 to 91 us** in the engine (`screen_memo`). End to end through the server (`list_cost_by_mode`, `#[ignore]`), `list_filter = "policy"` adds 5 to 8 ms to a chain's first 200-tool list and 0.4 to 0.8 ms to a repeated one, against 1.8 to 2.0 ms for the list with `"capabilities"`. With the feature on, `policy_stage`'s `authorize` and `evaluate` rows are unchanged within this host's 0.7 us spread (A/B in one worktree). Results and method: [`bench/2026-11-05-vm-list-screen.md`](bench/2026-11-05-vm-list-screen.md).
 
+### Argument matching of reads (2026-11-05)
+
+Branch `feat/arg-taint-hosts-and-reads`, base `bf9227f`. When a loaded policy reads `context.args_contain_untrusted` or `context.untrusted_args`, the server now matches the arguments of every call on a tainted run, reads included ([output labelling 3.4](output-labelling.md#34-option-b-argument-level-taint)). New cells in `cargo bench -p attenuo-server --bench decide`, `arg_taint_{store}/{read_clean,read_url}_{policy_reads,no_policy}`: `Pipeline::arg_taint` alone, for a `read_file` call on a run that has read one untrusted result of about 1 KB (an injection naming `www.true-informations.com`), 2-hop chain. `read_clean` has two short arguments that match nothing; `read_url` has a `path` of `https://www.true-informations.com/`, which matches the result's host. Release profile, the same shared 4-vCPU container, with an AgentDojo replay running on it (load average about 5.9), so read the figures as upper bounds. Criterion point estimates, interval in brackets:
+
+| Cell | memory | file, `normal` | file, `full` |
+|---|---|---|---|
+| `read_clean`, a policy reads argument taint | 4.5 us [4.4, 4.6] | 5.4 us [5.3, 5.6] | 5.4 us [5.4, 5.5] |
+| `read_url`, a policy reads argument taint (one hit) | 7.7 us [7.7, 7.8] | 9.4 us [9.1, 9.7] | 8.4 us [8.2, 8.7] |
+| either read, no policy reads it (not matched) | 0.16 to 0.17 us | 0.15 to 0.16 us | 0.15 to 0.16 us |
+
+So a policy set that reads argument taint adds about 5 us to each read on a tainted run with nothing to match, and about 8 to 9 us when an argument matches (more fingerprints of the URL, and the hit's lookup). That is under 1% of the roughly 1 ms of a proxied call in the hot-path tables above. With no such policy the read pays a lock and a catalog lookup, about 0.15 us, as before. Not measured: end to end, many or long arguments (each string argument is fingerprinted, so the cost grows with argument text, up to the k-gram cap), and a full run index (20,000 hashes).
+
 ### How to run
 
 ```
@@ -817,6 +829,7 @@ attenuo-bench hot-path --runs 5 --configs baseline --cells read --tokens 5000 --
 cargo test --release -p attenuo-proxy --test listen_stream_cost -- --ignored --nocapture --test-threads 1  # the listen-stream filter per event, stage and end to end
 cargo test --release -p attenuo-proxy --test listen_stream_cost -- --ignored --nocapture --test-threads 1 disown  # the stream-end shape check on the unfiltered SSE path
 cargo bench -p attenuo-policy --bench list_screen -- --warm-up-time 1 --measurement-time 3  # the list screen (ADR-0011): partial evaluation for 200 tools
+cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3 'arg_taint'  # argument matching of a read on a tainted run
 cargo test --release -p attenuo-server --test list_screen list_cost -- --ignored --nocapture  # a 200-tool tools/list end to end, per [proxy] list_filter
 ```
 
