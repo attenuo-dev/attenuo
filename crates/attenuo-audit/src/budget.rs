@@ -169,12 +169,12 @@ impl std::fmt::Debug for ValueKey {
 }
 
 impl ValueKey {
-    pub fn new(secret: &[u8]) -> Self {
+    pub(crate) fn new(secret: &[u8]) -> Self {
         Self(hmac::Key::new(hmac::HMAC_SHA256, secret))
     }
 
     /// A fresh random key (the memory store's, which lives as long as its counters).
-    pub fn random() -> Result<Self, AuditError> {
+    pub(crate) fn random() -> Result<Self, AuditError> {
         let rng = ring::rand::SystemRandom::new();
         let key = hmac::Key::generate(hmac::HMAC_SHA256, &rng)
             .map_err(|_| AuditError::Storage("could not generate a budget value key".into()))?;
@@ -182,7 +182,7 @@ impl ValueKey {
     }
 
     /// The counter key of `charge`.
-    pub fn counter(&self, charge: &Charge) -> Result<CounterKey, AuditError> {
+    pub(crate) fn counter(&self, charge: &Charge) -> Result<CounterKey, AuditError> {
         let cap = i64::try_from(charge.cap).map_err(|_| {
             AuditError::Storage(format!("capability index {} too large", charge.cap))
         })?;

@@ -247,7 +247,7 @@ pub fn action_id(server: &str, tool: &str, legacy_bare_actions: bool) -> String 
 
 /// Build the complete schema text from a base schema, the catalog and the user attributes.
 /// With `legacy_bare_actions`, actions are declared per tool name (the form before SR-13).
-pub fn generate(
+pub(crate) fn generate(
     base: &str,
     catalog: &ToolCatalog,
     user_attrs: &BTreeMap<String, ArgType>,

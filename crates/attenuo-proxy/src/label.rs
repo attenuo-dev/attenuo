@@ -87,7 +87,7 @@ pub(crate) struct ResultScope {
 }
 
 impl ResultScope {
-    pub fn new(server: &str, session: Option<&str>, chain: &DelegationChain) -> Self {
+    pub(crate) fn new(server: &str, session: Option<&str>, chain: &DelegationChain) -> Self {
         Self {
             server: server.to_owned(),
             session: session.map(str::to_owned),
@@ -172,7 +172,7 @@ pub(crate) struct AwaitedResults {
 }
 
 impl AwaitedResults {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -183,7 +183,7 @@ impl AwaitedResults {
 
     /// Remember `calls` of `chain` in `scope`, until answered or [`AWAITED_RESULT_TTL`]. A call
     /// with the id of one already remembered in the scope replaces it.
-    pub fn remember(
+    pub(crate) fn remember(
         &self,
         scope: &ResultScope,
         chain: &DelegationChain,
@@ -233,7 +233,7 @@ impl AwaitedResults {
     }
 
     /// Remove and return the unexpired call in `scope` that `id` answers.
-    pub fn take(
+    pub(crate) fn take(
         &self,
         scope: &ResultScope,
         id: &Value,
@@ -245,12 +245,12 @@ impl AwaitedResults {
     }
 
     /// Is an unexpired call with this `id` remembered in `scope`?
-    pub fn awaits(&self, scope: &ResultScope, id: &Value, now: Instant) -> bool {
+    pub(crate) fn awaits(&self, scope: &ResultScope, id: &Value, now: Instant) -> bool {
         self.lock().position(scope, id, now).is_some()
     }
 
     /// Is anything remembered in `scope`? Lets the listen stream skip parsing events.
-    pub fn any_in(&self, scope: &ResultScope) -> bool {
+    pub(crate) fn any_in(&self, scope: &ResultScope) -> bool {
         self.lock().scopes.contains_key(scope)
     }
 
@@ -299,7 +299,7 @@ pub(crate) struct Labeller {
 
 impl Labeller {
     /// A labeller for the answers to the allowed calls of one `POST`.
-    pub fn new(
+    pub(crate) fn new(
         authorizer: Arc<dyn Authorizer>,
         chain: DelegationChain,
         pending: Vec<PendingResult>,
@@ -316,7 +316,7 @@ impl Labeller {
 
     /// Strike each call answered in the `POST`'s own body from `awaited` (where the proxy
     /// remembered it under `scope` before forwarding).
-    pub fn striking(mut self, awaited: Arc<AwaitedResults>, scope: ResultScope) -> Self {
+    pub(crate) fn striking(mut self, awaited: Arc<AwaitedResults>, scope: ResultScope) -> Self {
         if let Calls::Request { awaited: slot, .. } = &mut self.calls {
             *slot = Some((awaited, scope));
         }
@@ -325,7 +325,7 @@ impl Labeller {
 
     /// A labeller for a `GET` listen stream in `scope`, or for the body of a `POST` in
     /// `scope` that has no allowed call of its own while earlier calls are awaited (SR-85).
-    pub fn listen(
+    pub(crate) fn listen(
         authorizer: Arc<dyn Authorizer>,
         awaited: Arc<AwaitedResults>,
         scope: ResultScope,
@@ -440,7 +440,7 @@ impl Labeller {
     }
 
     /// Label every response in `body` (a message or a batch). Returns how many were replaced.
-    pub async fn label_value(&self, body: &mut Value) -> usize {
+    pub(crate) async fn label_value(&self, body: &mut Value) -> usize {
         match body {
             Value::Array(items) => {
                 let mut replaced = 0;
@@ -457,7 +457,7 @@ impl Labeller {
     /// a pending call is recorded; if any of its messages had to be replaced it is emitted
     /// again as one `message` event with the new data, otherwise byte for byte. An event with
     /// data the proxy cannot parse is dropped (SR-79).
-    pub async fn label_events(&self, chunk: &[u8]) -> Vec<u8> {
+    pub(crate) async fn label_events(&self, chunk: &[u8]) -> Vec<u8> {
         if !self.may_answer() {
             return chunk.to_vec();
         }
@@ -488,7 +488,7 @@ impl Labeller {
 
     /// One `label_error` denial per pending call, for an upstream body the proxy cannot read
     /// (JSON that does not parse, or a content type that is neither JSON nor SSE).
-    pub fn failure_replies(&self) -> Vec<Value> {
+    pub(crate) fn failure_replies(&self) -> Vec<Value> {
         match &self.calls {
             Calls::Request { pending, .. } => pending
                 .iter()
