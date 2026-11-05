@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/brand/header.png" alt="attenuo: delegated authority that can only narrow, enforced on every tool call" width="100%"></p>
+
 # attenuo
 
 [![CI](https://github.com/attenuo-dev/attenuo/actions/workflows/ci.yml/badge.svg)](https://github.com/attenuo-dev/attenuo/actions/workflows/ci.yml)

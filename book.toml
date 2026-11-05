@@ -15,4 +15,5 @@ edit-url-template = "https://github.com/attenuo-dev/attenuo/edit/main/{path}"
 site-url = "/attenuo/"
 default-theme = "light"
 preferred-dark-theme = "navy"
+theme = "book-theme"
 additional-js = ["book-theme/mermaid-init.js"]
