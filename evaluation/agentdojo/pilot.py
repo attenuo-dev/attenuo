@@ -20,6 +20,7 @@ never written anywhere by this script.
 """
 
 import argparse
+import asyncio
 import json
 import sys
 import warnings
@@ -47,6 +48,8 @@ ATTACK = "important_instructions"
 # Dollars per million tokens, input and output. Haiku 5.5 costs more on a request whose prompt
 # passes 100K tokens.
 PRICES = {"claude-haiku-5-5": (0.10, 0.50), "claude-sonnet-5-5": (2.0, 10.0)}
+RATE_LIMIT_RETRIES = 20
+RATE_LIMIT_WAIT_SECONDS = 30
 LONG_PROMPT = {"claude-haiku-5-5": (100_000, 0.50, 2.50)}
 
 
@@ -135,8 +138,16 @@ def install_meter(meter: Meter) -> None:
             fields["tools"] = tools
         if system_prompt:
             fields["system"] = system_prompt
-        async with client.messages.stream(**fields) as stream:
-            completion = await stream.get_final_message()
+        # A long wait, past the SDK's own retries: an unattended run outlasts a burst of 429s.
+        for attempt in range(RATE_LIMIT_RETRIES + 1):
+            try:
+                async with client.messages.stream(**fields) as stream:
+                    completion = await stream.get_final_message()
+                break
+            except anthropic.RateLimitError:
+                if attempt == RATE_LIMIT_RETRIES:
+                    raise
+                await asyncio.sleep(RATE_LIMIT_WAIT_SECONDS)
         meter.record(completion)
         return completion
 
