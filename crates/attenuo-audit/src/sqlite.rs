@@ -532,6 +532,13 @@ fn open_memory_connection() -> Result<Connection, AuditError> {
     Ok(conn)
 }
 
+/// A commit of one record handed back no entry. `commit` returns one entry per record, so this
+/// does not happen; if it ever did, the caller gets a storage error instead of a panic on the
+/// request path.
+fn no_entry_for_record() -> AuditError {
+    AuditError::Storage("an append of one record returned no entry".into())
+}
+
 fn fmt_time(t: OffsetDateTime) -> Result<String, AuditError> {
     Ok(t.format(&Rfc3339)?)
 }
@@ -1484,7 +1491,7 @@ impl Inner {
             Err((_, records)) => records
                 .into_iter()
                 .map(|r| match self.commit(conn, vec![r], sync) {
-                    Ok(mut one) => Ok(one.pop().expect("one record, one entry")),
+                    Ok(mut one) => one.pop().ok_or_else(no_entry_for_record),
                     Err((e, _)) => Err(e),
                 })
                 .collect(),
@@ -2326,7 +2333,7 @@ impl SqliteAudit {
             match self.inner.conn.try_lock() {
                 Ok(mut conn) => {
                     let mut out = self.inner.append_locked(&mut conn, vec![record], sync);
-                    return out.pop().expect("one record, one result");
+                    return out.pop().unwrap_or_else(|| Err(no_entry_for_record()));
                 }
                 Err(TryLockError::Poisoned(_)) => return Err(AuditError::Poisoned),
                 Err(TryLockError::WouldBlock) => {}
