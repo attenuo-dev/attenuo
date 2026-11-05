@@ -3,8 +3,8 @@
 //!
 //! For every untrusted result a run reads, the server stores the result's fingerprints
 //! ([`attenuo_core::fingerprint`]) under the run's `chain_id`, tagged with the audit `seq` of
-//! the result's `tool_result` record. A later destructive call looks its arguments' fingerprints
-//! up here ([`LeaseStore::find_spans`](crate::LeaseStore::find_spans)); a hit names the result.
+//! the result's `tool_result` record. A later call (a destructive one, or any call when a
+//! policy reads argument taint) looks its arguments' fingerprints up here ([`LeaseStore::find_spans`](crate::LeaseStore::find_spans)); a hit names the result.
 //!
 //! - **Keyed.** The store hashes every fingerprint again with HMAC-SHA-256 under a key it
 //!   generates once and keeps (the SQLite store in its key table, the memory store in memory),

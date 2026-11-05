@@ -228,8 +228,9 @@ pub async fn evaluate_policies(
         }
     };
 
-    // Output labels (ADR-0009): as given, or else the run's current taint state and, for a
-    // destructive call on a tainted run, the arguments that match its span index now.
+    // Output labels (ADR-0009): as given, or else the run's current taint state and, on a
+    // tainted run, the arguments that match its span index now (for every call when a policy
+    // reads argument taint, else for a destructive call; `Pipeline::arg_taint`).
     let (session, args, session_source) = match session {
         Some((s, args)) => (s, args, "request"),
         None => {

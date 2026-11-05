@@ -79,8 +79,10 @@
 //! `"<server>/<tool>"`. They come from [`CallLabels`], which
 //! [`PolicyEngine::authorize_labelled`] takes; [`PolicyEngine::authorize`] evaluates an
 //! untainted run. `untrusted_args` names the arguments of the call that carry a verbatim span
-//! of an untrusted result of the run (phase 2: the server's span index, matched only for a
-//! destructive tool on a tainted run, with arguments pinned by `equals` or `one_of` exempt),
+//! of an untrusted result of the run (phase 2: the server's span index, matched on a tainted
+//! run for every call when a loaded policy reads either attribute
+//! ([`PolicyEngine::reads_arg_taint`]) and otherwise only for a destructive tool, with
+//! arguments pinned by `equals` or `one_of` exempt),
 //! and `args_contain_untrusted` is `true` when there is at least one ([`ArgLabels`]); both
 //! come from [`CallLabels::args`]. `approval.present` is `true` only when the call
 //! carries a granted approval for its exact call hash ([`ApprovalContext`]), with
@@ -667,6 +669,7 @@ impl PolicyEngineBuilder {
         Ok(PolicyEngine {
             policies_read_usage: loaded.reads_usage,
             policies_read_session_id: loaded.reads_session_id,
+            policies_read_arg_taint: loaded.reads_arg_taint,
             catalog_names_usage,
             track_usage: self.track_usage,
             schema,
@@ -698,6 +701,9 @@ struct LoadedPolicies {
     /// Some policy may read `context.session_id`, the one optional context member (the list
     /// screen evaluates both its presence and its absence then).
     reads_session_id: bool,
+    /// Some policy may read `context.args_contain_untrusted` or `context.untrusted_args`
+    /// ([`PolicyEngine::reads_arg_taint`]).
+    reads_arg_taint: bool,
 }
 
 /// The forbids annotated `@obligation("approval")`, and the policy set without them, used to
@@ -799,6 +805,8 @@ fn load_policies(text: &str, schema: &Schema) -> Result<LoadedPolicies, PolicyEr
     Ok(LoadedPolicies {
         reads_usage: policies_read_usage(&policies),
         reads_session_id: usage::policies_read_context_attr(&policies, "session_id"),
+        reads_arg_taint: usage::policies_read_context_attr(&policies, "args_contain_untrusted")
+            || usage::policies_read_context_attr(&policies, "untrusted_args"),
         policies,
         obligations: Obligations {
             approval_ids,
@@ -958,6 +966,9 @@ pub struct PolicyEngine {
     policies_read_usage: bool,
     /// Some loaded policy may read `context.session_id`; recomputed on reload.
     policies_read_session_id: bool,
+    /// Some loaded policy may read `context.args_contain_untrusted` or
+    /// `context.untrusted_args`; recomputed on reload.
+    policies_read_arg_taint: bool,
     /// The catalog declares `amount` or `destination` for some tool.
     catalog_names_usage: bool,
     track_usage: TrackUsage,
@@ -1271,6 +1282,7 @@ impl PolicyEngine {
         self.validation_warnings = loaded.warnings;
         self.policies_read_usage = loaded.reads_usage;
         self.policies_read_session_id = loaded.reads_session_id;
+        self.policies_read_arg_taint = loaded.reads_arg_taint;
         // The cached request parts do not depend on the policies, but a reload is the
         // operator's "start from scratch", so it starts with an empty cache too.
         self.request_cache.clear();
@@ -1348,6 +1360,18 @@ impl PolicyEngine {
         self.track_usage == TrackUsage::Always
             || self.policies_read_usage
             || self.catalog_names_usage
+    }
+
+    /// Whether some loaded policy (or template) may read `context.args_contain_untrusted` or
+    /// `context.untrusted_args` (output labelling phase 2), by the conservative walk of
+    /// [`policies_read_usage`]: a whole-`context` use counts, and so does a set that cannot be
+    /// rendered as JSON. Decided at build and at every
+    /// [`reload_policies_str`](Self::reload_policies_str). The server matches the arguments of
+    /// every call on a tainted run when this holds, and only those of destructive calls
+    /// otherwise (for the decision record), so a policy set that never looks at argument taint
+    /// pays nothing for the calls of reads.
+    pub fn reads_arg_taint(&self) -> bool {
+        self.policies_read_arg_taint
     }
 
     /// Whether some loaded policy carries `@obligation("approval")`, so that the server may
