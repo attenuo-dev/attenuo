@@ -4,5 +4,5 @@ contact_links:
     url: https://github.com/attenuo-dev/attenuo/blob/main/SECURITY.md
     about: Security reports are private, never public issues. SECURITY.md explains how (GitHub private vulnerability reporting, or email) and what to expect.
   - name: Ask a question or propose a design
-    url: https://github.com/attenuo-dev/attenuo/discussions
-    about: For questions and early-stage design ideas before they become an RFC. See also SUPPORT.md.
+    url: https://github.com/attenuo-dev/attenuo/blob/main/SUPPORT.md
+    about: SUPPORT.md says where questions and early-stage design ideas go before they become an RFC.

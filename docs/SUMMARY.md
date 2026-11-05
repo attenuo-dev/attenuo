@@ -83,6 +83,7 @@
   - [Security review, pass 4](research/security-review-2026-10-23-pass4.md)
   - [Security review, pass 5](research/security-review-2026-10-24-pass5.md)
 - [Open-source project practices](research/oss-project-practices.md)
+- [Secret scan of the full history, 2026-11-05](research/secret-scan-2026-11-05.md)
 
 # Project
 
@@ -98,3 +99,4 @@
 - [Engineering log: 2026-10-23](log/2026-10-23.md)
 - [Engineering log: 2026-10-24](log/2026-10-24.md)
 - [Engineering log: 2026-10-25](log/2026-10-25.md)
+- [Engineering log: 2026-11-05](log/2026-11-05.md)
