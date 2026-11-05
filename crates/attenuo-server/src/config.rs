@@ -931,9 +931,10 @@ pub const NOTIFY_SECRET_MIN_LEN: usize = 32;
 /// again when it is decided or expires, is queued (bounded, never blocking a decision) and
 /// `POST`ed to `url` by a background thread with jittered retries, on the `[audit.sink]`
 /// queue ([`crate::sink::Queue`]). The body is signed with HMAC-SHA-256 under the secret in
-/// the environment variable `secret_env` (header `X-Attenuo-Signature`). Best effort: a
-/// notification that fails `max_attempts` times is dropped and counted. See
-/// `docs/design/approval-notifier.md`.
+/// the environment variable `secret_env` (header `X-Attenuo-Signature`). Each notice is
+/// stored in the lease store's `notice_outbox` table first, so a restart delivers what was
+/// left undelivered ([`crate::notify`]). Best effort: a notification that fails `max_attempts`
+/// times is dropped and counted. See `docs/design/server.md` ("Approvals").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotifySection {

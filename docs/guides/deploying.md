@@ -280,6 +280,7 @@ listen = "127.0.0.1:9100"
 | `run_lock_wait_seconds` | Contention on the per-run lock (SR-55) between calls of one delegation run that has limits or keeps run usage. |
 | `audit_checkpoint_last_timestamp_seconds`, `audit_wal_last_complete_timestamp_seconds`, `audit_wal_checkpoints_total{result}`, `audit_wal_backstops_total` | Signed checkpoints and the SQLite WAL checkpointer keeping up. |
 | `audit_sink_dropped_total`, `audit_sink_oldest_undelivered_timestamp_seconds` | Checkpoints not leaving the host. |
+| `approval_notify_dropped_total`, `approval_notify_outbox_rows` | `[approvals.notify]` notices given up, and notices stored but not yet delivered. The outbox count staying up means the receiver is down; the notices survive a restart. |
 
 Alert on any increase of `audit_append_errors_total`, on a rising share of `reason="lease_expired"`, on `audit_sink_dropped_total` and on `readyz` returning 503. Example Prometheus rules for the newer series; tune the thresholds to your traffic:
 

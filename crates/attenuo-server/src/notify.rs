@@ -926,6 +926,24 @@ mod tests {
     }
 
     #[test]
+    fn event_id_is_a_stable_uuid_per_approval_and_type() {
+        let a = event_id_for(NoticeKind::Pending, "a1");
+        assert_eq!(a, event_id_for(NoticeKind::Pending, "a1"));
+        assert_ne!(a, event_id_for(NoticeKind::Expired, "a1"));
+        assert_ne!(a, event_id_for(NoticeKind::Pending, "a2"));
+        let u = uuid::Uuid::parse_str(&a).unwrap();
+        assert_eq!(u.get_version_num(), 8);
+        assert_eq!(u.get_variant(), uuid::Variant::RFC4122);
+        let n = Notice::new(NoticeKind::Pending, &approval(ApprovalState::Pending));
+        let body: Value = serde_json::from_slice(&n.body).unwrap();
+        assert_eq!(body["event_id"], n.event_id);
+        for k in [NoticeKind::Pending, NoticeKind::Decided, NoticeKind::Expired] {
+            assert_eq!(NoticeKind::parse(k.as_str()), Some(k));
+        }
+        assert_eq!(NoticeKind::parse("approval.other"), None);
+    }
+
+    #[test]
     fn webhook_debug_shows_the_host_only() {
         let w = WebhookNotify::new(
             "https://hooks.example/p/very-secret-path?key=k",
