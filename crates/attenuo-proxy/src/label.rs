@@ -19,7 +19,10 @@
 //! `Mcp-Session-Id`, run (`chain_id`) and request id. An answer in the `POST`'s own
 //! body strikes the entry; a response on a `GET` stream of the same upstream, session and run
 //! claims it and is recorded (and withheld on failure) exactly like a `POST` answer, with the
-//! chain and `decision_id` of the call. The map is bounded ([`MAX_AWAITED_RESULTS`],
+//! chain and `decision_id` of the call. So does a response in the body of a *later* `POST` of
+//! the same upstream, session and run (SR-85): clients route a response by its id whatever
+//! stream or body it arrives in, so an upstream could otherwise answer call 1 inside its
+//! answer to a `ping`, or to call 2, and get it to the agent unrecorded. The map is bounded ([`MAX_AWAITED_RESULTS`],
 //! [`MAX_AWAITED_RESULTS_PER_SESSION`]) and entries expire after [`AWAITED_RESULT_TTL`]. A
 //! response on the listen stream that claims no entry (an unknown id, one already answered on
 //! the `POST`, or one that expired or was evicted) and every notification or server request
@@ -257,7 +260,8 @@ fn result_part(msg: &Value) -> (&Value, bool) {
 #[derive(Clone)]
 enum Calls {
     /// The allowed calls of one `POST`. An answer found is also struck from `awaited`, so it
-    /// is not expected on the listen stream any more.
+    /// is not expected on the listen stream any more; an answer to an earlier call remembered
+    /// in `awaited` claims it, as on the listen stream (SR-85).
     Request {
         chain: Arc<DelegationChain>,
         pending: Arc<Vec<PendingResult>>,
@@ -304,7 +308,8 @@ impl Labeller {
         self
     }
 
-    /// A labeller for a `GET` listen stream in `scope`.
+    /// A labeller for a `GET` listen stream in `scope`, or for the body of a `POST` in
+    /// `scope` that has no allowed call of its own while earlier calls are awaited (SR-85).
     pub fn listen(
         authorizer: Arc<dyn Authorizer>,
         awaited: Arc<AwaitedResults>,
@@ -331,7 +336,14 @@ impl Labeller {
             return false;
         };
         match &self.calls {
-            Calls::Request { pending, .. } => pending.iter().any(|p| same_id(&p.id, id)),
+            Calls::Request {
+                pending, awaited, ..
+            } => {
+                pending.iter().any(|p| same_id(&p.id, id))
+                    || awaited
+                        .as_ref()
+                        .is_some_and(|(a, scope)| a.awaits(scope, id, Instant::now()))
+            }
             Calls::Listen { awaited, scope } => awaited.awaits(scope, id, Instant::now()),
         }
     }
@@ -346,11 +358,16 @@ impl Labeller {
                 pending,
                 awaited,
             } => {
-                let found = pending.iter().find(|p| same_id(&p.id, id))?;
-                if let Some((awaited, scope)) = awaited {
-                    awaited.take(scope, id, Instant::now());
+                let taken = awaited
+                    .as_ref()
+                    .and_then(|(awaited, scope)| awaited.take(scope, id, Instant::now()));
+                match pending.iter().find(|p| same_id(&p.id, id)) {
+                    Some(found) => Some((found.clone(), chain.clone())),
+                    // An answer to an earlier call of the same session and run, in the body
+                    // of this one (SR-85): the client routes it by id, so it is that call's
+                    // answer and is labelled as such.
+                    None => taken,
                 }
-                Some((found.clone(), chain.clone()))
             }
             Calls::Listen { awaited, scope } => awaited.take(scope, id, Instant::now()),
         }

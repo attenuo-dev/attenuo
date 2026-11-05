@@ -1179,14 +1179,14 @@ async fn handle_post_inner(
         );
     }
     // The upstream may answer an allowed call on the `GET` listen stream instead (after a
-    // `202`, or on a resumed stream): remember it before the upstream can see it.
-    let scope = (!screened.results.is_empty()).then(|| {
-        let scope = ResultScope::new(server, session_id, chain);
+    // `202`, or on a resumed stream), or in the body of a later `POST` of the session:
+    // remember it before the upstream can see it.
+    let scope = ResultScope::new(server, session_id, chain);
+    if !screened.results.is_empty() {
         state
             .awaited
             .remember(&scope, chain, &screened.results, Instant::now());
-        scope
-    });
+    }
     let sent = Instant::now();
     let resp = match state
         .client
@@ -1204,14 +1204,28 @@ async fn handle_post_inner(
     timing.upstream_done = Some(headers_in);
 
     let has_lists = !screened.list_requests.is_empty();
-    let labeller = scope.map(|scope| {
-        Labeller::new(
-            state.authorizer.clone(),
-            chain.clone(),
-            std::mem::take(&mut screened.results),
+    // Clients route a response by its id, whatever body it comes in: an answer to an earlier
+    // call of this session and run in this body is labelled too (SR-85), so a `POST` with no
+    // allowed call of its own is still read while such calls are awaited. Clients do not read
+    // the body of a `POST` that carried no request, so that one is left alone.
+    let labeller = if !screened.results.is_empty() {
+        Some(
+            Labeller::new(
+                state.authorizer.clone(),
+                chain.clone(),
+                std::mem::take(&mut screened.results),
+            )
+            .striking(state.awaited.clone(), scope),
         )
-        .striking(state.awaited.clone(), scope)
-    });
+    } else if screened.forward.iter().any(is_request) && state.awaited.any_in(&scope) {
+        Some(Labeller::listen(
+            state.authorizer.clone(),
+            state.awaited.clone(),
+            scope,
+        ))
+    } else {
+        None
+    };
     let needs_buffer = has_lists || !screened.replies.is_empty() || labeller.is_some();
     let content_type = resp
         .headers()
@@ -1643,6 +1657,16 @@ async fn buffer_and_rewrite(
     };
     let mut value: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
+        // An empty body answers nothing, so it hides nothing either: relayed as it is when no
+        // call or list of this request awaits an answer in it (SR-85 reads the bodies of
+        // requests that only might hold an earlier call's answer).
+        Err(_)
+            if bytes.is_empty()
+                && screened.list_requests.is_empty()
+                && labeller.is_none_or(|l| l.failure_replies().is_empty()) =>
+        {
+            return build_response(status, &headers, Body::from(bytes));
+        }
         Err(e) => {
             if !screened.list_requests.is_empty() {
                 // A list result the proxy cannot parse is one it cannot filter.
@@ -1737,6 +1761,17 @@ fn observe_listed(
 fn label_failure(screened: &Screened, labeller: &Labeller, is_batch: bool) -> Response {
     let mut items = screened.replies.clone();
     items.extend(labeller.failure_replies());
+    if items.is_empty() {
+        // No call of this request was allowed, but the body may answer an earlier one
+        // (SR-85): nothing in it can be relayed.
+        let body = error_response(
+            Value::Null,
+            CODE_UPSTREAM,
+            "attenuo: upstream answered with a body the proxy cannot label",
+            None,
+        );
+        return json_response(StatusCode::BAD_GATEWAY, &body);
+    }
     let body = if is_batch || items.len() > 1 {
         Value::Array(items)
     } else {
