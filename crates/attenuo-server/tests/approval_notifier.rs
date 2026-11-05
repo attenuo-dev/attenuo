@@ -249,6 +249,19 @@ impl Harness {
             .parse()
             .unwrap()
     }
+
+    /// The receiver records a request before the queue thread counts it delivered, so a
+    /// counter read right after `wait_for` can be one short: wait for it, briefly.
+    async fn metric_reaches(&self, series: &str, want: u64) -> u64 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let got = self.metric(series);
+            if got >= want || Instant::now() > deadline {
+                return got;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 }
 
 #[tokio::test]
@@ -310,7 +323,11 @@ async fn pending_and_decided_notices_are_signed_and_carry_no_arguments() {
         assert!(!text.contains(&token), "no token: {text}");
         assert!(!text.contains(SECRET));
     }
-    assert_eq!(h.metric("attenuo_approval_notify_delivered_total"), 2);
+    assert_eq!(
+        h.metric_reaches("attenuo_approval_notify_delivered_total", 2)
+            .await,
+        2
+    );
 }
 
 #[tokio::test]
@@ -364,8 +381,12 @@ async fn a_receiver_answering_500_is_retried_with_the_same_event() {
     for (headers, body) in &got {
         assert_signed(headers, body);
     }
+    assert_eq!(
+        h.metric_reaches("attenuo_approval_notify_delivered_total", 1)
+            .await,
+        1
+    );
     assert_eq!(h.metric("attenuo_approval_notify_failures_total"), 2);
-    assert_eq!(h.metric("attenuo_approval_notify_delivered_total"), 1);
     assert_eq!(h.metric("attenuo_approval_notify_dropped_total"), 0);
 }
 
