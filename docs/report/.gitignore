@@ -1,0 +1,3 @@
+# Build outputs of build.sh; only the Markdown and the script are committed.
+*.html
+*.pdf
