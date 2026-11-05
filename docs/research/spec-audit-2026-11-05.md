@@ -68,6 +68,7 @@ Nothing was built or run. Behaviour that only a running server shows (timings, t
 - Doc: ADR-0005 (`docs/decisions/0005-policy-decision-point.md:3`), ADR-0006 (`0006-lease-based-in-flight-revocation.md:2`), ADR-0007 (`0007-actor-authentication.md:2`), ADR-0008 (`0008-admin-console.md:2`) and ADR-0009 (`0009-output-labelling.md:2`) say `proposed`, as does the index in `docs/decisions/README.md`.
 - Code: all five are implemented and documented as shipped (the capability stage and generated schema in `attenuo-policy`; leases in `attenuo-audit/src/lease.rs`; actor tokens in `attenuo-server/src/actor.rs`; the console in `admin_ui.rs`; output labels and approvals in `authz.rs` and `routes/approvals.rs`). ADR-0011 is `proposed` and correctly so: there is no opt-in setting for Cedar-aware list filtering in `[proxy]` (`config.rs:1321-1368`).
 - Recommendation: decide. The ADR process (`docs/decisions/README.md`) makes acceptance a maintainer decision, so the audit did not change the lines. If accepted, set `status: accepted` and the date in each file and in the index; ADR-0009's title ("labels every upstream result untrusted") predates the catalog's `output = "trusted"` and may want a note under More Information.
+- Status: accepted on `fix/spec-audit-findings`. ADR-0005 to ADR-0009 are `accepted` with date 2026-11-05 in each file and in the index, and ADR-0009's More Information notes that its title predates `output = "trusted"`.
 
 ### Approval ID-token errors return the verifier's message
 

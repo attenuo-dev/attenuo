@@ -1,6 +1,6 @@
 ---
-status: proposed
-date: 2026-10-24
+status: accepted
+date: 2026-11-05
 decision-makers: [7Mudit]
 consulted: []
 informed: []
@@ -84,4 +84,5 @@ When implemented: a new injection-suite arm `attenuo+labels` with per-call upstr
 - Design and false-positive analysis: [design/output-labelling.md](../design/output-labelling.md).
 - Related: [ADR-0005](0005-policy-decision-point.md) (capabilities before Cedar), [ADR-0006](0006-lease-based-in-flight-revocation.md) (leases, which bound approvals), [ADR-0008](0008-admin-console.md) (operator approval surface), RFC-0001 sections 4.1, 7 and 9.
 - Prior work: [CaMeL](https://arxiv.org/abs/2503.18813), [FIDES](https://arxiv.org/abs/2505.23643), [f-secure LLM system](https://arxiv.org/abs/2409.19091), [Flume](https://www.read.seas.harvard.edu/~kohler/pubs/krohn07information.pdf), [MCP tool annotations](https://blog.modelcontextprotocol.io/posts/2026-03-16-tool-annotations/).
+- The title predates the catalog's `output = "trusted"` setting, which exempts a tool's results from the untrusted label.
 - Revisit after phase 1 is measured: if the benign approval rate on a model-in-the-loop run is far above the corpus estimate, phase 2 moves ahead of any rollout; if MCP standardises trust or sensitivity annotations, map them narrowing-only.

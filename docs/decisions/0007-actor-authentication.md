@@ -1,6 +1,6 @@
 ---
-status: proposed
-date: 2026-10-23
+status: accepted
+date: 2026-11-05
 decision-makers: [7Mudit]
 consulted: []
 informed: []

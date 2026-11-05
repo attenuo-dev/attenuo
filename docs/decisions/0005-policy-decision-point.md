@@ -1,7 +1,7 @@
 # ADR-0005: Policy decision point: capabilities first, then Cedar with a generated schema
 
-- Status: proposed
-- Date: 2026-10-22
+- Status: accepted
+- Date: 2026-11-05
 
 ## Context
 

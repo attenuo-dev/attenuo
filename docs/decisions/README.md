@@ -44,11 +44,11 @@ Only the `status` and `date` fields and the More Information section of an accep
 | [0002](0002-cedar-for-policy.md) | Cedar as the policy language, with ReBAC composed from outside | accepted |
 | [0003](0003-apache-2-license.md) | Apache License 2.0 | accepted |
 | [0004](0004-rust-workspace-layout.md) | Rust workspace layout | accepted |
-| [0005](0005-policy-decision-point.md) | Policy decision point: capabilities first, then Cedar with a generated schema | proposed |
-| [0006](0006-lease-based-in-flight-revocation.md) | Lease-based in-flight revocation | proposed |
-| [0007](0007-actor-authentication.md) | Actor authentication: RFC 8693 `actor_token` from a workload-identity issuer, with `may_act` | proposed |
-| [0008](0008-admin-console.md) | Admin console: vanilla static files embedded in `attenuo-server`, on a separate opt-in listener, admin token held in page memory | proposed |
-| [0009](0009-output-labelling.md) | Output labelling: the proxy labels every upstream result untrusted, taints the delegation run, and policy can require a call-bound approval for destructive tools | proposed |
+| [0005](0005-policy-decision-point.md) | Policy decision point: capabilities first, then Cedar with a generated schema | accepted |
+| [0006](0006-lease-based-in-flight-revocation.md) | Lease-based in-flight revocation | accepted |
+| [0007](0007-actor-authentication.md) | Actor authentication: RFC 8693 `actor_token` from a workload-identity issuer, with `may_act` | accepted |
+| [0008](0008-admin-console.md) | Admin console: vanilla static files embedded in `attenuo-server`, on a separate opt-in listener, admin token held in page memory | accepted |
+| [0009](0009-output-labelling.md) | Output labelling: the proxy labels every upstream result untrusted, taints the delegation run, and policy can require a call-bound approval for destructive tools | accepted |
 | [0010](0010-run-limits.md) | Run limits: count and amount budgets declared per token hop, charged against every hop of the chain in the decision's transaction, and exposed to Cedar as context | accepted |
 | [0011](0011-cedar-aware-list-filtering.md) | Cedar-aware list filtering: opt in, hide a tool only when the policy denies it for every possible call, with approval-gated tools always kept | proposed |
 
