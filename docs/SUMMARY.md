@@ -89,6 +89,7 @@
 # Report
 
 - [Technical report, 2026-11](report/attenuo-2026-11.md)
+  - [One-page researcher brief](brief/attenuo-one-page.md)
 
 # Project
 
