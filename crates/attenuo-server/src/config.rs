@@ -1911,6 +1911,39 @@ mod tests {
     }
 
     #[test]
+    fn list_filter_defaults_to_capabilities_and_refuses_unknown_values() {
+        use attenuo_proxy::ListFilterMode;
+        let cfg = Config::from_toml("").unwrap();
+        assert_eq!(cfg.proxy.list_filter, ListFilterMode::Capabilities);
+        let proxy = cfg.proxy.apply(attenuo_proxy::ProxyConfig::new(
+            "127.0.0.1:0".parse().unwrap(),
+            vec![],
+        ));
+        assert_eq!(proxy.list_filter, ListFilterMode::Capabilities);
+        for (text, mode) in [
+            ("capabilities", ListFilterMode::Capabilities),
+            ("policy", ListFilterMode::Policy),
+        ] {
+            let cfg = Config::from_toml(&format!("[proxy]\nlist_filter = \"{text}\"\n")).unwrap();
+            assert_eq!(cfg.proxy.list_filter, mode);
+            let proxy = cfg.proxy.apply(attenuo_proxy::ProxyConfig::new(
+                "127.0.0.1:0".parse().unwrap(),
+                vec![],
+            ));
+            assert_eq!(proxy.list_filter, mode);
+        }
+        for bad in ["\"Policy\"", "\"cedar\"", "\"\"", "true"] {
+            let err = Config::from_toml(&format!("[proxy]\nlist_filter = {bad}\n"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("list_filter") || err.contains("variant"),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn require_listed_tools_defaults_to_on_sr25() {
         assert!(Config::from_toml("").unwrap().proxy.require_listed_tools);
         assert!(

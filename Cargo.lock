@@ -213,6 +213,7 @@ dependencies = [
  "cedar-policy",
  "criterion",
  "miette",
+ "proptest",
  "serde",
  "serde_json",
  "serde_yaml",

@@ -606,6 +606,8 @@ pub struct StaticAuthorizer {
     sessions: Arc<Mutex<Vec<RecordedSession>>>,
     fail_rejections: Arc<std::sync::atomic::AtomicBool>,
     rejection_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    hidden: std::collections::HashSet<String>,
+    screens: Arc<Mutex<Vec<Vec<String>>>>,
 }
 
 /// A session reported through [`Authorizer::record_session`] to a [`StaticAuthorizer`]:
@@ -738,6 +740,18 @@ impl StaticAuthorizer {
         self.sessions.lock().expect("sessions mutex").clone()
     }
 
+    /// Hide these tool names (any server) from [`Authorizer::screen_tools`], as a list screen
+    /// that found no call could use them would.
+    pub fn with_hidden_tools(mut self, tools: &[&str]) -> Self {
+        self.hidden = tools.iter().map(|t| t.to_string()).collect();
+        self
+    }
+
+    /// The names of every [`Authorizer::screen_tools`] call, in order.
+    pub fn screens(&self) -> Vec<Vec<String>> {
+        self.screens.lock().expect("screens mutex").clone()
+    }
+
     /// Every tool annotation reported through [`Authorizer::observe_tool_hints`], as
     /// `(server, tool, readOnlyHint, destructiveHint)`.
     pub fn observed_hints(&self) -> Vec<ObservedHints> {
@@ -836,6 +850,19 @@ impl Authorizer for StaticAuthorizer {
             .expect("contexts mutex")
             .push(ctx.clone());
         self.authorize(chain, call, now).await
+    }
+
+    async fn screen_tools(
+        &self,
+        _chain: &DelegationChain,
+        _server: &str,
+        tools: &[String],
+    ) -> Vec<bool> {
+        self.screens
+            .lock()
+            .expect("screens mutex")
+            .push(tools.to_vec());
+        tools.iter().map(|t| !self.hidden.contains(t)).collect()
     }
 
     fn knows_tool(&self, server: &str, tool: &str) -> bool {
