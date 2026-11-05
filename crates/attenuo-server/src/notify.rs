@@ -937,7 +937,11 @@ mod tests {
         let n = Notice::new(NoticeKind::Pending, &approval(ApprovalState::Pending));
         let body: Value = serde_json::from_slice(&n.body).unwrap();
         assert_eq!(body["event_id"], n.event_id);
-        for k in [NoticeKind::Pending, NoticeKind::Decided, NoticeKind::Expired] {
+        for k in [
+            NoticeKind::Pending,
+            NoticeKind::Decided,
+            NoticeKind::Expired,
+        ] {
             assert_eq!(NoticeKind::parse(k.as_str()), Some(k));
         }
         assert_eq!(NoticeKind::parse("approval.other"), None);
