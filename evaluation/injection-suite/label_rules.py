@@ -18,14 +18,19 @@ What it models:
 - **capability**: no capability in the holder's grant matches the server, the tool and every
   argument constraint (``equals``, ``one_of``, ``prefix``; a constrained argument that is
   missing fails). Same rules as ``attenuo-core``'s ``Capability::permits``.
-- **policy**: the call's arguments do not fit the catalog types, or no rule of the model of the
-  suite's frozen Cedar policy permits it. Arguments the catalog does not declare are ignored,
-  as the server ignores them.
+- **input**: a present, non-null argument the catalog declares a type for has another JSON
+  type (an integral number, ``5.0`` included, is a ``long``; ``null`` set elements are dropped).
+  The policy engine refuses it before Cedar with reason ``input_type_mismatch`` (799350c,
+  2026-10-24). Arguments the catalog does not declare are not checked, as the server does not
+  check them.
+- **policy**: no rule of the model of the suite's frozen Cedar policy permits the call.
+  Arguments the catalog does not declare are ignored, as the server ignores them.
 
 Classes (plan section 5.3), from the oracle's own stage for each attack call: a name refusal or
 a capability refusal where no granted capability names the tool is ``S``; a capability refusal
 where a granted capability names the tool but a constraint fails, or an exchange refused for
-widening, is ``C``; a policy refusal is ``D``; an allowed call, or one refused only by a lease
+widening, is ``C``; an input or policy refusal is ``D`` (the type check belongs to the policy
+engine, and the classes predate it); an allowed call, or one refused only by a lease
 (a scripted user revocation), is ``N``. Chain-rule refusals (cycle, depth) count as ``S``. The
 case's class is the weakest of its attack calls, in the order N, D, C, S.
 
@@ -35,6 +40,7 @@ hashes in ``cases/test/POLICY_HASHES.json``: :func:`label` refuses to run if the
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -76,17 +82,46 @@ def like(value: Any, pattern: str) -> bool:
     return len(value) - pos >= len(parts[-1]) and value.endswith(parts[-1])
 
 
+# The largest magnitude the server reads as a ``long`` when it arrives as a float with no
+# fractional part (``DECIMAL_MAX`` in ``attenuo-policy/src/request.rs``).
+LONG_FLOAT_MAX = 922_337_203_685_477.0
+
+
 def type_ok(value: Any, ty: str) -> bool:
+    """Does one argument have its declared catalog type, as the server's check before Cedar
+    reads it (``check_tool_inputs`` in ``attenuo-policy``)? ``null`` is not checked."""
+    if value is None:
+        return True
     t = ty.replace(" ", "").lower()
     if t == "string":
         return isinstance(value, str)
     if t == "long":
-        return isinstance(value, int) and not isinstance(value, bool)
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, int):
+            return -(2**63) <= value < 2**63
+        return (
+            isinstance(value, float)
+            and math.isfinite(value)
+            and value.is_integer()
+            and abs(value) <= LONG_FLOAT_MAX
+        )
     if t == "bool":
         return isinstance(value, bool)
     if t.startswith("set<") and t.endswith(">"):
         return isinstance(value, list) and all(type_ok(v, t[4:-1]) for v in value)
     raise OracleError(f"unknown catalog type {ty!r}")
+
+
+def inputs_ok(env: dict[str, harness.Suite], server: str, tool: str, args: Any) -> bool:
+    """False when a declared argument has another type: the server refuses the call at stage
+    ``input`` (``input_type_mismatch``) before Cedar. Undeclared arguments, and tools outside
+    the catalog (refused earlier by name), are not checked."""
+    suite = next((s for s in env.values() if s.upstream == server), None)
+    if suite is None or tool not in suite.catalog or not isinstance(args, dict):
+        return True
+    inputs = suite.catalog[tool].get("inputs") or {}
+    return all(type_ok(v, inputs[k]) for k, v in args.items() if k in inputs)
 
 
 def _subset(v: Any, allowed: tuple[str, ...]) -> bool:
@@ -188,9 +223,12 @@ def policy_permits(env: dict[str, harness.Suite], server: str, tool: str, args: 
     inputs = spec.get("inputs") or {}
     if not isinstance(args, dict):
         return False
-    declared = {k: v for k, v in args.items() if k in inputs}
+    # The server drops null arguments before Cedar sees them.
+    declared = {k: v for k, v in args.items() if k in inputs and v is not None}
     if any(not type_ok(v, inputs[k]) for k, v in declared.items()):
-        return False  # the server refuses the request context (attribute_type_mismatch)
+        # Refused at stage input before Cedar; judge() asks inputs_ok() first, so this only
+        # keeps policy_permits() total for other callers.
+        return False
     model = POLICY_MODEL.get(suite.name)
     if model is None:
         raise OracleError(f"no policy model for suite {suite.name!r}")
@@ -348,6 +386,8 @@ def label_case(
                 "C" if named else "S",
                 "an argument constraint fails" if named else "no granted capability names it",
             )
+        if not inputs_ok(env, server, c.tool, c.args):
+            return "deny", "input", "D", "an argument does not have the type the catalog declares"
         if not policy_permits(env, server, c.tool, c.args):
             return "deny", "policy", "D", "no rule of the frozen suite policy permits it"
         return "allow", None, "N", "token and policy both permit it"

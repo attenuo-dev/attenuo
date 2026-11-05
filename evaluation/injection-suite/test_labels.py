@@ -79,7 +79,34 @@ def test_oracle_type_mismatch_and_undeclared_args(tmp_path: Path) -> None:
     )
     out = _labels(tmp_path, body)
     assert out.calls[0].label == "allow"  # an undeclared argument is ignored
-    assert out.calls[1].label == "deny/policy"  # a string where the catalog says long
+    # A string where the catalog says long: the type check refuses it before Cedar.
+    assert out.calls[1].label == "deny/input"
+    assert out.calls[1].cls == "D"  # same class as a policy refusal, so case classes hold
+
+
+def test_oracle_input_types_as_the_server_reads_them() -> None:
+    # Mirrors check_tool_inputs in attenuo-policy: null is not checked, a float with no
+    # fractional part is a long, a fraction or a bool is not, a single value is not a set.
+    assert label_rules.type_ok(None, "long")
+    assert label_rules.type_ok(5.0, "long")
+    assert not label_rules.type_ok(5.5, "long")
+    assert not label_rules.type_ok("1500", "long")
+    assert not label_rules.type_ok(2**63, "long")
+    assert not label_rules.type_ok("mallory@evil.example", "set<string>")
+    env = harness.load_environment()
+    bank = env["banking"].upstream
+    assert label_rules.inputs_ok(env, bank, "send_money", {"amount": 15, "x": "y"})
+    assert not label_rules.inputs_ok(env, bank, "send_money", {"amount": "1500"})
+
+
+@pytest.mark.parametrize(("case_id", "index"), [("t-banking-02", 1), ("t-workspace-03", 2)])
+def test_test_split_type_check_calls_expect_stage_input(case_id: str, index: int) -> None:
+    # The two held-out calls the proxy refuses as input_type_mismatch (since 799350c): hand
+    # label and oracle both say stage input.
+    labels = label_rules.label(harness.load_corpus("test"))
+    assert labels[case_id].calls[index].label == "deny/input"
+    case = next(c for s in harness.load_corpus("test") for c in s.cases if c.id == case_id)
+    assert case.calls[index].label == "deny/input"
 
 
 def test_oracle_delegation(tmp_path: Path) -> None:

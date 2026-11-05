@@ -11,6 +11,13 @@ report format changed).
 The "Problems" lists (what run.py reports and exits 1 for) are compared the same way: a
 problem the baseline also has is a known one and is only counted, a new or a missing one
 is a difference.
+
+No other table is compared, so a column added to another table (the ``Input`` column of the
+per-stage tables, added on 2026-11-05) does not affect the result. The baseline is
+``results/2026-11-05-type-check-stage.md`` (``scripts/reproduce.sh``). Against the older
+``results/2026-11-05-final-main.md`` every arm row matches, but its 18 problems (two
+``input_type_mismatch`` calls, before the harness had a stage for them) are reported as
+only in the baseline: the stage changed, not an outcome.
 """
 
 from __future__ import annotations

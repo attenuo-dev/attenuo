@@ -28,7 +28,7 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROOT=$PWD
 PYTHON=${PYTHON:-python3}
 SUITE=evaluation/injection-suite
-BASELINE=$SUITE/results/2026-11-05-final-main.md
+BASELINE=$SUITE/results/2026-11-05-type-check-stage.md
 SKIP_BUILD=0
 SKIP_DEMOS=0
 
@@ -113,10 +113,11 @@ SUITE_RC=0
 ATTENUO_BIN_DIR=$BIN "$PYTHON" "$SUITE/run.py" --split all --tag reproduce --date "$DATE" \
   > /dev/null || SUITE_RC=$?
 [ -f "$NEW" ] || { echo "!! the suite wrote no $NEW (exit $SUITE_RC)" >&2; exit 1; }
-# run.py exits 1 when it reports a problem. The committed baseline lists its own (two
-# test-split calls denied by the argument type check before Cedar, input_type_mismatch,
-# where the case expects the policy stage), so the compare step decides: the same problems
-# pass, a new or a missing one is a difference. Any other exit status is a failure.
+# run.py exits 1 when it reports a problem. The committed baseline has none (the argument
+# type check before Cedar, input_type_mismatch, has its own stage, input, since
+# 2026-11-05), but an older baseline given with --baseline may list some, so the compare
+# step decides: the same problems pass, a new or a missing one is a difference. Any other
+# exit status is a failure.
 case "$SUITE_RC" in
   0) ;;
   1) echo "run.py exited 1 (PROBLEM lines above); the compare step checks them against the baseline" ;;

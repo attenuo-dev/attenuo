@@ -239,7 +239,9 @@ BUDGET_ARMS = LIMIT_ARMS + DISTINCT_ARMS + TASK_LIMIT_ARMS
 # Refusals by a run limit, in the capability stage after the capability check (ADR-0010).
 BUDGET_REASONS = ("budget_exhausted", "budget_error", "limit_arg_invalid")
 PERMIT_ALL_ARMS = ("scope_only", "scope_constraints")
-STAGES = ("name", "lease", "capability", "policy", "exchange")
+# ``input`` is the proxy's check of declared argument types against the catalog, which refuses
+# a mistyped argument before Cedar (reason ``input_type_mismatch``, since 799350c, 2026-10-24).
+STAGES = ("name", "lease", "capability", "input", "policy", "exchange")
 ROLES = ("benign", "attack")
 CLASSES = ("S", "C", "D", "N")
 SPLITS = ("dev", "test")
@@ -254,6 +256,9 @@ EXTRA_READS = frozenset({"get_webpage"})
 # Reasons the proxy gives before the policy engine runs: the request names a server or tool
 # that does not exist, or a name outside the naming rule.
 NAME_REASONS = ("invalid_name", "tool_not_listed", "tool_not_in_catalog", "unknown_server")
+# Reasons for an argument whose JSON type is not the one the catalog declares, refused by the
+# policy engine before Cedar evaluates anything (stage ``input``).
+INPUT_REASONS = ("input_type_mismatch",)
 
 
 # --- corpus -----------------------------------------------------------------------------------
@@ -1080,6 +1085,8 @@ def stage_of(reason: str | None) -> str | None:
         return "budget"
     if reason.startswith("capability_"):
         return "capability"
+    if reason in INPUT_REASONS:
+        return "input"
     if reason.startswith("policy_") or reason == "attribute_type_mismatch":
         return "policy"
     if reason.startswith("lease_"):
