@@ -52,6 +52,8 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    # A cold release build (thin LTO, one codegen unit, no cache) on the slowest target.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -100,6 +102,7 @@ jobs:
   image:
     name: Container image (GHCR, cosign, SBOM)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
@@ -157,6 +160,7 @@ jobs:
     name: Draft GitHub release
     needs: [build, image]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
     steps:

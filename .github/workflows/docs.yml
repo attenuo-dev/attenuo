@@ -38,6 +38,7 @@ jobs:
   build:
     name: build book
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -81,6 +82,7 @@ jobs:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.DEPLOY_PAGES == 'true'
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       pages: write
       id-token: write
