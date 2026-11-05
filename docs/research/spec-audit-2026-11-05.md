@@ -88,6 +88,7 @@ Nothing was built or run. Behaviour that only a running server shows (timings, t
 
 - `crates/attenuo-server/src/config.rs:1012-1015` (doc comment of `run_state_retention_seconds`) says a refund after run-state pruning "answers 404, as for one that charged nothing"; the route answers 410 `charge_pruned` (`routes/admin.rs:369, 429`), as the docs say.
 - Recommendation: fix the comment. It is code, so the audit left it.
+- Status: fixed on `fix/spec-audit-findings`; the comment says 410 `charge_pruned`.
 
 ## Not verified
 

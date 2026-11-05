@@ -1011,8 +1011,8 @@ pub struct LeasesSection {
     /// belongs to is still in the registry, whatever its age. A charge goes once its charge
     /// and any refund are older than this, a counter once no charge under its lease is left,
     /// an approval once its creation, decision and expiry are older than this. After that an
-    /// operator refund of the decision answers 404, as for one that charged nothing; the
-    /// audit log keeps every decision, charge and approval record. 0 keeps everything.
+    /// operator refund of the decision answers 410 `charge_pruned`; the audit log keeps every
+    /// decision, charge and approval record. 0 keeps everything.
     #[serde(default = "default_run_state_retention_seconds")]
     pub run_state_retention_seconds: u64,
     /// Seconds between runs of the lease maintenance task (the session, lease and run-state
