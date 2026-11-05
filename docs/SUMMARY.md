@@ -78,11 +78,17 @@
 - [Related work](research/related-work.md)
 - [Evaluation plan](research/evaluation-plan.md)
   - [Injection suite, first results](evaluation/injection-suite.md)
+  - [Reproducing the numbers](evaluation/reproduce.md)
 - [Security review, pass 1](research/security-review-2026-10-22.md)
   - [Security review, pass 3](research/security-review-2026-10-23.md)
   - [Security review, pass 4](research/security-review-2026-10-23-pass4.md)
   - [Security review, pass 5](research/security-review-2026-10-24-pass5.md)
 - [Open-source project practices](research/oss-project-practices.md)
+- [Secret scan of the full history, 2026-11-05](research/secret-scan-2026-11-05.md)
+
+# Report
+
+- [Technical report, 2026-11](report/attenuo-2026-11.md)
 
 # Project
 
@@ -92,9 +98,11 @@
   - [Release 0.1.0](release/0.1.0.md)
 - [Changelog](project/changelog.md)
 - [Security policy](project/security.md)
+- [Research-readiness plan, 2026-11-05](project/research-readiness-plan.md)
 - [Task board](tasks/board.md)
 - [Milestones](tasks/milestones.md)
 - [Engineering log: 2026-10-22](log/2026-10-22.md)
 - [Engineering log: 2026-10-23](log/2026-10-23.md)
 - [Engineering log: 2026-10-24](log/2026-10-24.md)
 - [Engineering log: 2026-10-25](log/2026-10-25.md)
+- [Engineering log: 2026-11-05](log/2026-11-05.md)
