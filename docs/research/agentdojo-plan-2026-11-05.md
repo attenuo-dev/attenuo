@@ -402,6 +402,41 @@ A2 on Sonnet 5.5, on the workspace half of the [four-model sample](#four-models-
 - The attenuo refusal and the classifier refusal are separate losses and they add up. On Sonnet the classifier stops 26 runs and attenuo's rules take the total of finished tasks from 112 to 65.
 - Attenuo allowed 13 of Sonnet's 19 benign calls and 181 of its 258 attack-run calls. The largest refused group under attack is `create_calendar_event` by policy (30), then `get_current_day` by capability (28).
 
+### Filtered tool list
+
+The rows above offer the model every tool in the suite, and attenuo refuses what the grant leaves out. With `--filtered-list` in [`enforced.py`](../../evaluation/agentdojo/enforced.py), the server runs with `[proxy] list_filter = "policy"` and the model is offered only what the proxy's `tools/list` returns for that run's token. Same arm (A2), same workspace half of the sample, same oracle grants and policies, one run per pair. Refused runs count as not done, and attack success is 0 in every row.
+
+| Model and tool list | Benign utility | Task done under attack | Runs refused | Cost |
+| --- | --- | --- | --- | --- |
+| Sonnet, every tool | 6/10 | 65/140 | 26 | $4.66 |
+| Sonnet, filtered | 5/10 | 68/140 | 12 | $1.70 |
+| Haiku, every tool | 5/10 | 70/140 | 0 | $0.30 |
+| Haiku, filtered | 5/10 | 70/140 | 0 | $0.10 |
+
+Calls in the attack runs:
+
+| Model and tool list | Allowed | Denied by capability | Denied by policy |
+| --- | --- | --- | --- |
+| Sonnet, every tool | 181 | 35 | 42 |
+| Sonnet, filtered | 175 | 18 | 42 |
+| Haiku, every tool | 168 | 101 | 42 |
+| Haiku, filtered | 169 | 38 | 42 |
+
+What the numbers show:
+
+- Filtering doesn't recover utility. The figures move by at most 3 runs of 140 and one task of 10, which is inside the noise of single runs.
+- That fits where the loss comes from. Tasks 4, 6, 8 and 9 fail on all four rows, and they are the ones the contact rule refuses. Policy denials in the attack runs stay at 42 whatever the model is offered.
+- It removes the refusals it can remove. Calls to tools outside the grant disappear, because the model can't name them. What remains under capability is writes that miss a pinned argument, on both models. On Sonnet, `user_task_9` with `create_calendar_event` (12) and `user_task_7` with `reschedule_calendar_event` (6) make up all 18. `user_task_7` fails on three of the four rows, which suggests the pin rule costs a task on its own.
+- It costs about a third as much. Input per turn falls from about 5,500 tokens to about 1,400, because the schemas of tools the run can't use are no longer sent. That holds even with the task's outcome unchanged.
+- Classifier refusals on Sonnet fell from 26 to 12, on the same pairs. All 12 are category `cyber`. We can't say why from one run per pair, and it wasn't what this run was built to test. The tasks freed by this mostly did not finish anyway: of the runs not refused, 68 of 128 finished against 65 of 114.
+
+How far this goes:
+
+- This tests filtering to the grant, not the policy filter. `list_filter = "policy"` hid nothing beyond capabilities: in all 150 Sonnet runs the list was exactly the grant's tools. With oracle grants of 1 or 2 tools, there is little left for it to hide, and its conditional rules, such as the contact rule, stay listed by design. A broader token is where that filter would show.
+- Hiding isn't enforcement, as the [design note](../design/cedar-aware-list-filtering.md) says. No attacker call appears in any of these 280 attack runs, so this says nothing about whether a hidden tool would have stopped one.
+- A narrow list depends on the oracle. A real planner that leaves out a needed tool now takes it away from the model completely, where before the model could at least try it and see the refusal. Which of those is better for utility is unmeasured.
+- Same limits as above: workspace half only, 10 tasks, one attack, no pinned sampling.
+
 ## Four models on one sample 2026-11-05
 
 The full suite on the larger models doesn't fit the budget, so all four ran one sample chosen before any call: workspace user tasks 0 to 9 against all 14 injection tasks plus their 10 benign runs, and banking user tasks 0 to 7 against all 9 plus 8 benign runs. That is 230 runs per model. `agentdojo` 0.1.35, suite `v1.2.2`, `important_instructions`, no attenuo, one run each. We kept this attack because `tool_knowledge` didn't change Haiku's behaviour. Haiku's figures come from its existing full run, not a rerun.
@@ -439,9 +474,9 @@ How far this goes:
 
 ## Decisions needed
 
-Spend so far is $61.58 of $168.50.
+Spend so far is $63.38 of $168.50.
 
 1. Whether any more baseline spending helps. No attack succeeded on four models with this attack, and on Haiku with a stronger one too. Attacks that adapt to the model are a separate research effort, and more runs of stock attacks are unlikely to change this.
 2. Whether to report the refusal result. An injection that stops the user's task on Opus in most workspace runs is a finding about these models and this benchmark's scoring. It needs a fallback run, and more than one attack, before it is claimed in the report.
-3. Which attenuo cost to fix first. We recommend replacing the contact rule, which costs the most utility for almost no gain over grants, and then passing the proxy's filtered tool list to the model, and measuring both.
+3. Which attenuo cost to fix first. Passing the proxy's tool list to the model is [measured](#filtered-tool-list): it cuts cost to about a third and removes refusals of tools outside the grant, and it doesn't recover utility. So we recommend replacing the contact rule next, since it accounts for the tasks lost on every row, and then looking at the pin rule, which `user_task_7` suggests costs a task on its own. Filtering is worth keeping for its cost, whichever way those go.
 4. Planner grants. Whether to pay for a realistic planner on top of the oracle in A2. Every utility number here still rests on oracle grants.
