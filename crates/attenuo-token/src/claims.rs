@@ -301,7 +301,7 @@ mod tests {
         assert_eq!(&base[..7], b"\0\0\0\x03iss");
         let msg = ou_sig_message("iss", &user, &hop);
         let ctx = b"attenuo-ou-v3";
-        let mut expect = (ctx.len() as u32).to_be_bytes().to_vec();
+        let mut expect = u32::try_from(ctx.len()).unwrap().to_be_bytes().to_vec();
         expect.extend_from_slice(ctx);
         assert!(msg.starts_with(&expect));
         assert!(msg.ends_with(&base));

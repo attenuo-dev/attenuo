@@ -688,7 +688,7 @@ fn query_entries(
 fn checkpoint_from_row(row: &Row<'_>) -> rusqlite::Result<Checkpoint> {
     let seq: i64 = row.get(0)?;
     Ok(Checkpoint {
-        seq: seq.max(0) as u64,
+        seq: u64::try_from(seq.max(0)).unwrap_or(0),
         head_hash: row.get(1)?,
         at: row.get(2)?,
         kid: row.get(3)?,
@@ -700,17 +700,27 @@ fn insert_checkpoint(conn: &Connection, cp: &Checkpoint) -> Result<(), AuditErro
     conn.execute(
         "INSERT INTO checkpoints (seq, head_hash, at, kid, signature) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![cp.seq as i64, cp.head_hash, cp.at, cp.kid, cp.signature],
+        params![
+            seq_to_i64(cp.seq)?,
+            cp.head_hash,
+            cp.at,
+            cp.kid,
+            cp.signature
+        ],
     )?;
     Ok(())
 }
 
 fn checkpoint_at(conn: &Connection, seq: u64) -> Result<Option<Checkpoint>, AuditError> {
+    // A seq above `i64::MAX` is never stored, so there is no such checkpoint.
+    let Ok(seq) = i64::try_from(seq) else {
+        return Ok(None);
+    };
     Ok(conn
         .prepare_cached(
             "SELECT seq, head_hash, at, kid, signature FROM checkpoints WHERE seq = ?1",
         )?
-        .query_row([seq as i64], checkpoint_from_row)
+        .query_row([seq], checkpoint_from_row)
         .optional()?)
 }
 
@@ -1713,7 +1723,7 @@ fn insert_entry(
          ?18, ?19)",
     )?
     .execute(params![
-        entry.seq as i64,
+        seq_to_i64(entry.seq)?,
         entry.prev_hash,
         entry.entry_hash,
         fmt_time(r.at)?,
@@ -1721,7 +1731,7 @@ fn insert_entry(
         r.reason,
         r.originating_subject,
         serde_json::to_string(&r.agents)?,
-        r.chain_depth as i64,
+        usize_to_i64(r.chain_depth),
         r.chain_digest,
         serde_json::to_string(&r.leases)?,
         r.server,
@@ -1981,8 +1991,8 @@ impl SqliteAudit {
         )?;
         let rows = stmt.query_map(
             [
-                from.min(i64::MAX as u64) as i64,
-                to.min(i64::MAX as u64) as i64,
+                i64::try_from(from).unwrap_or(i64::MAX),
+                i64::try_from(to).unwrap_or(i64::MAX),
             ],
             checkpoint_from_row,
         )?;
@@ -2027,7 +2037,7 @@ impl SqliteAudit {
              ORDER BY seq DESC LIMIT ?2"
         );
         let conn = self.inner.conn.lock()?;
-        query_entries(&conn, &sql, &[&subject, &(limit as i64)])
+        query_entries(&conn, &sql, &[&subject, &usize_to_i64(limit)])
     }
 
     /// Up to `limit` entries with `from_seq <= seq <= to_seq` that match `filter`, in order.
@@ -2143,7 +2153,7 @@ impl SqliteAudit {
             let read_all = rows.len() < limit;
             for entry in rows {
                 // A seq read from an INTEGER column fits in i64.
-                let seq = entry.seq as i64;
+                let seq = seq_to_i64(entry.seq)?;
                 match order {
                     Order::Ascending => lo = seq + 1,
                     Order::Descending => hi = seq - 1,
@@ -2314,7 +2324,7 @@ impl SqliteAudit {
     pub fn len(&self) -> Result<u64, AuditError> {
         let conn = self.inner.conn.lock()?;
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM audit", [], |r| r.get(0))?;
-        Ok(n as u64)
+        Ok(u64::try_from(n).unwrap_or(0))
     }
 
     pub fn is_empty(&self) -> Result<bool, AuditError> {
@@ -2375,7 +2385,14 @@ impl AuditSink for SqliteAudit {
         let sql =
             format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE seq >= ?1 ORDER BY seq LIMIT ?2");
         let conn = self.inner.conn.lock()?;
-        query_entries(&conn, &sql, &[&(from_seq as i64), &(limit as i64)])
+        query_entries(
+            &conn,
+            &sql,
+            &[
+                &i64::try_from(from_seq).unwrap_or(i64::MAX),
+                &usize_to_i64(limit),
+            ],
+        )
     }
 
     fn verify_chain(&self) -> Result<VerifyReport, AuditError> {
@@ -2749,7 +2766,17 @@ fn refund_in(
     }
     tx.commit()?;
     // Token-limit counters only (see `LeaseStore::refund`).
-    Ok(limits as u64 + freed)
+    Ok(u64::try_from(limits).unwrap_or(0) + freed)
+}
+
+/// A sequence number as SQLite's `INTEGER`; one above `i64::MAX` cannot be stored.
+fn seq_to_i64(v: u64) -> Result<i64, AuditError> {
+    i64::try_from(v).map_err(|_| AuditError::Storage(format!("sequence number {v} out of range")))
+}
+
+/// A row count or limit as SQLite's `INTEGER`, saturating (a limit that large is no limit).
+fn usize_to_i64(v: usize) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
 }
 
 fn to_i64(v: u64) -> Result<i64, AuditError> {
@@ -4703,7 +4730,7 @@ mod tests {
         let page_size: i64 = audit
             .with_connection(|c| Ok(c.query_row("PRAGMA page_size", [], |r| r.get(0))?))
             .unwrap();
-        let backstop = (WAL_WRITER_BACKSTOP_FRAMES * page_size) as u64;
+        let backstop = u64::try_from(WAL_WRITER_BACKSTOP_FRAMES * page_size).unwrap();
 
         // Park the background thread: it locks its own connection first thing in a round.
         let checkpointer = audit.wal.as_ref().unwrap();
@@ -4741,7 +4768,7 @@ mod tests {
         drop(parked);
         let report = audit.verify_chain().unwrap();
         assert!(report.ok);
-        assert_eq!(report.entries, i as u64);
+        assert_eq!(report.entries, u64::try_from(i).unwrap());
     }
 
     // -----------------------------------------------------------------------------------------
@@ -4793,8 +4820,15 @@ mod tests {
             (K::Decision, D::Allow, "l1", "ab1", "50%"),
         ];
         for (i, (kind, decision, agent, lease, tool)) in rows.into_iter().enumerate() {
-            log.append(shaped(i as i64 + 1, kind, decision, agent, lease, tool))
-                .unwrap();
+            log.append(shaped(
+                i64::try_from(i).unwrap() + 1,
+                kind,
+                decision,
+                agent,
+                lease,
+                tool,
+            ))
+            .unwrap();
         }
         log
     }

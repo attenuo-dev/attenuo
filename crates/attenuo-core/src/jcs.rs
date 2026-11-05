@@ -111,6 +111,13 @@ pub fn write_str(out: &mut Vec<u8>, s: &str) {
 
 /// The ECMAScript `Number.prototype.toString` form of a finite double (RFC 8785 section
 /// 3.2.2.3). `None` for NaN and the infinities.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "lengths are at most 17 digits and the exponent is within +-324, so they fit i32; \
+              each `as usize` follows a range check that makes it non-negative"
+)]
 pub fn format_f64(v: f64) -> Option<String> {
     if !v.is_finite() {
         return None;

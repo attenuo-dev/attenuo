@@ -22,7 +22,9 @@ const RESERVED_PREFIX: &str = "attenuo-ou-";
 
 pub(crate) fn frame(context: &str, payload: &[u8]) -> Vec<u8> {
     let mut msg = Vec::with_capacity(4 + context.len() + payload.len());
-    msg.extend_from_slice(&(context.len() as u32).to_be_bytes());
+    // Contexts are short constants; a longer one is clamped, never wrapped.
+    let len = u32::try_from(context.len()).unwrap_or(u32::MAX);
+    msg.extend_from_slice(&len.to_be_bytes());
     msg.extend_from_slice(context.as_bytes());
     msg.extend_from_slice(payload);
     msg
