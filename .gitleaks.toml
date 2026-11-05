@@ -1,0 +1,38 @@
+# gitleaks configuration (https://github.com/gitleaks/gitleaks).
+#
+# The repository holds no credentials. Everything the default rules flag is demo or test
+# material whose plaintext is documented beside it, so it is allowlisted here by path and
+# shape; a real secret would still be reported. Run: gitleaks git . (full history) or
+# gitleaks dir . (working tree). Last full-history run: docs/research/secret-scan-2026-11-05.md.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Demo, example and test fixtures"
+paths = [
+  # Demo transcripts and READMEs: decision ids and lease ids (UUIDs) of recorded runs.
+  '''examples/[^/]+/(transcript|README)\.md''',
+  # Demo and example configs: SHA-256 of the demo client secrets, whose plaintext is in the
+  # comment above each one (for example `demo-coder-secret`, `planner-secret-change-me`).
+  '''examples/[^/]+/config[^/]*\.toml''',
+  '''config/example\.toml''',
+  # Recorded timings and the identity-provider guide quote the same example config.
+  '''docs/design/bench/.*\.md''',
+  '''docs/guides/identity-providers\.md''',
+  # Test fixtures: a pinned Ed25519 test key for the SDK wire-format test and an `alg: none`
+  # JWT that the proxy test must reject.
+  '''crates/attenuo-token/src/approval\.rs''',
+  '''crates/attenuo-proxy/tests/.*\.rs''',
+  '''sdk/python/tests/.*\.py''',
+  # Local, git-ignored fuzz corpus: generated tokens and inputs (`gitleaks dir`).
+  '''fuzz/corpus/.*''',
+]
+regexes = [
+  # The project's own JWT `typ` value and a class name, not keys.
+  '''attenuo\+jwt''',
+  '''onbehalf\+jwt''',
+  '''Ed25519PrivateKey''',
+  # README curl examples that use the documented `*-secret-change-me` placeholders.
+  '''[a-z]+-secret-change-me''',
+]
