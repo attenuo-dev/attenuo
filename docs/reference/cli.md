@@ -1,6 +1,6 @@
 # CLI commands
 
-The `attenuo` binary comes from the `attenuo-cli` crate. It talks to a running attenuo server over HTTP, except for `policy test` (unless `--via authzen`) and `policy lint`, which run offline.
+The `attenuo` binary comes from the `attenuo-cli` crate. It talks to a running attenuo server over HTTP, except for `key gen`, `policy lint`, `policy test` with `--via local` (the default), `token inspect` without `--verify`, `audit verify --file` with `--jwks`, and `approval verify` with a `--jwks` file, which run offline.
 
 ```
 attenuo [--server URL] [--json] <command>
@@ -17,6 +17,15 @@ attenuo [--server URL] [--json] <command>
 | `--json` | | off | Print machine-readable JSON instead of text. Works after any subcommand. |
 
 The `--server` flag of `call`, `tools` and `authzen eval` is different. It names the MCP upstream, for example `github`.
+
+## Exit status
+
+| Status | Meaning |
+| --- | --- |
+| 0 | Success; for a command that asks a question (`call`, `tools`, `token inspect --verify`, `policy evaluate`, `authzen eval`, `policy test`, `policy lint`, `policy check`, `audit verify`, `approval verify`), the answer was yes. |
+| 1 | An error: the server could not be reached or answered with an error, a file could not be read, a test file could not be run. The message goes to stderr as `error: ...`. |
+| 2 | The answer was no: a denial or `APPROVAL REQUIRED`, a JSON-RPC error from `tools`, a token that fails `--verify`, a failed test case, policy errors, a broken audit chain or invalid checkpoint, an invalid approval token; for `budget refund`, nothing to refund. A command line the CLI cannot parse (unknown flag, missing argument) also exits 2, with clap's usage message on stderr. |
+| 3, 4 | `budget refund` only: already refunded, charge pruned (see [`budget refund`](#budget-refund-id---reason-text)). |
 
 ## Secrets
 
@@ -330,7 +339,7 @@ Write entries and the checkpoints inside the range. Needs the admin token.
 | `--to` | the head | Last sequence number, inclusive. |
 | `--format` | `jsonl` | `jsonl` streams one object per line (header, entries, checkpoints). `json` writes one object `{header, entries, checkpoints}`. |
 | `--out` | stdout | Write to this file. |
-| `--kind` | all | Keep only records of this kind: `decision`, `tool_result`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin`. |
+| `--kind` | all | Keep only records of this kind: `decision`, `tool_result`, `approval_request`, `approval_grant`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin`. |
 | `--chain-id` | all | Keep only records of this delegation chain (the `chain_id` field: the lease id of the chain's first hop). |
 | `--tool` | all | Keep only records for this tool, as on `audit tail`: an MCP tool name, or one of attenuo's own (`token.root`, `token.exchange`, `lease.renew`, `admin.*`). Exact match. |
 | `--decision` | all | Keep only records with this decision: `allow` or `deny`. |
