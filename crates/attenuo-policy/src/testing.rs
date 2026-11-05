@@ -1699,6 +1699,25 @@ catalog:
         assert_eq!(v["cases"][0]["actual"]["decision"], "deny");
         assert_eq!(v["cases"][0]["passed"], true);
     }
+
+    /// A misspelt catalog key is refused by every loader (server config, JSON catalog), not
+    /// read as an attribute left at its default.
+    #[test]
+    fn catalog_loaders_refuse_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = dir.path().join("catalog.json");
+        std::fs::write(&json, r#"{"github": {"delete_repo": {"sensitve": true}}}"#).unwrap();
+        let err = load_catalog(&json).unwrap_err().to_string();
+        assert!(err.contains("unknown field `sensitve`"), "{err}");
+        let toml = dir.path().join("attenuo.toml");
+        std::fs::write(
+            &toml,
+            "[policy.catalog.github.delete_repo]\nsensitve = true\n",
+        )
+        .unwrap();
+        let err = load_catalog(&toml).unwrap_err().to_string();
+        assert!(err.contains("unknown field `sensitve`"), "{err}");
+    }
 }
 
 #[cfg(test)]

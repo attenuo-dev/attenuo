@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 /// One upstream MCP server, mounted at `/mcp/{name}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpstreamConfig {
     /// Logical server name. This is the `server` field of every [`attenuo_core::ToolCall`]
     /// derived from requests to this upstream, so it must match the server names used in
