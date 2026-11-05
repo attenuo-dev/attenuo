@@ -93,6 +93,7 @@
   - [Release 0.1.0](release/0.1.0.md)
 - [Changelog](project/changelog.md)
 - [Security policy](project/security.md)
+- [Research-readiness plan, 2026-11-05](project/research-readiness-plan.md)
 - [Task board](tasks/board.md)
 - [Milestones](tasks/milestones.md)
 - [Engineering log: 2026-10-22](log/2026-10-22.md)
