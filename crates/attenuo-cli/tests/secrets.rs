@@ -336,7 +336,8 @@ fn bad_secret_sources_fail_before_any_request() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("already read"));
 
-    // Flag plus stdin on the command line is a usage error (clap exits 2).
+    // Flag plus stdin on the command line is a usage error, which exits 1 (not 2, the status
+    // of a denial).
     let out = attenuo()
         .args([
             "--admin-token",
@@ -348,7 +349,7 @@ fn bad_secret_sources_fail_before_any_request() {
         ])
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(1));
 }
 
 const RPC_OK: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[]}}"#;

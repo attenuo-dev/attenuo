@@ -1,7 +1,8 @@
 //! `attenuo`: a command line for a running attenuo server.
 //!
-//! Exit status: 0 on success, 1 on an error, 2 when the server answered but said no (a denied
-//! call, a negative AuthZEN decision, a broken audit chain), so scripts can tell the two apart.
+//! Exit status: 0 on success, 1 on an error (including a usage error: an unknown flag, a
+//! missing argument), 2 when the server answered but said no (a denied call, a negative AuthZEN
+//! decision, a broken audit chain), so scripts can tell the two apart.
 //! `budget refund` also exits 3 when the decision was already refunded, so a retried refund can
 //! be told from one that found nothing to refund (2).
 
@@ -49,7 +50,21 @@ enum Outcome {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // Not `Cli::parse()`: clap exits 2 on a usage error, the status that means "the answer
+    // was no", so a script would read a typo as a denial.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            // Help and version go to stdout, errors to stderr, formatted as clap would.
+            let _ = e.print();
+            return match e.kind() {
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
+                    ExitCode::SUCCESS
+                }
+                _ => ExitCode::FAILURE,
+            };
+        }
+    };
     for line in secrets::argv_warnings(std::env::args_os()) {
         eprintln!("{line}");
     }

@@ -82,6 +82,7 @@ Nothing was built or run. Behaviour that only a running server shows (timings, t
 - Doc: `cli.md` gives exit 2 for "the answer was no" on `call`, `policy evaluate`, `policy test` and others, and for "nothing to refund" on `budget refund`; the new exit status table now also says that usage errors exit 2.
 - Code: `Cli::parse()` (`crates/attenuo-cli/src/main.rs:50`) exits through clap, which uses status 2 for an unknown flag or a missing argument, the same status `Outcome::No` maps to (`main.rs:56`).
 - Recommendation: decide. A script that treats 2 as "denied" will read a typo as a denial. Either parse with `Cli::try_parse()` and exit 1 (or 64) on a usage error, or keep it and leave the documentation as it is now.
+- Status: fixed on `fix/spec-audit-findings`. The CLI parses with `Cli::try_parse()`: help and version exit 0, any other parse error prints clap's message to stderr and exits 1, so 2 means only "the answer was no". The exit status table in `cli.md` moves usage errors to row 1.
 
 ### Stale code comments
 

@@ -23,8 +23,8 @@ The `--server` flag of `call`, `tools` and `authzen eval` is different. It names
 | Status | Meaning |
 | --- | --- |
 | 0 | Success; for a command that asks a question (`call`, `tools`, `token inspect --verify`, `policy evaluate`, `authzen eval`, `policy test`, `policy lint`, `policy check`, `audit verify`, `approval verify`), the answer was yes. |
-| 1 | An error: the server could not be reached or answered with an error, a file could not be read, a test file could not be run. The message goes to stderr as `error: ...`. |
-| 2 | The answer was no: a denial or `APPROVAL REQUIRED`, a JSON-RPC error from `tools`, a token that fails `--verify`, a failed test case, policy errors, a broken audit chain or invalid checkpoint, an invalid approval token; for `budget refund`, nothing to refund. A command line the CLI cannot parse (unknown flag, missing argument) also exits 2, with clap's usage message on stderr. |
+| 1 | An error: the server could not be reached or answered with an error, a file could not be read, a test file could not be run, or the command line could not be parsed (unknown flag, missing argument). The message goes to stderr as `error: ...`; for a command line, it is clap's usage message. `--help` and `--version` exit 0. |
+| 2 | The answer was no: a denial or `APPROVAL REQUIRED`, a JSON-RPC error from `tools`, a token that fails `--verify`, a failed test case, policy errors, a broken audit chain or invalid checkpoint, an invalid approval token; for `budget refund`, nothing to refund. |
 | 3, 4 | `budget refund` only: already refunded, charge pruned (see [`budget refund`](#budget-refund-id---reason-text)). |
 
 ## Secrets

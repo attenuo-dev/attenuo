@@ -198,7 +198,7 @@ async fn lease_revoke_by_user_by_chain_and_by_session() {
         c.args(args);
         assert_eq!(
             run(c).await.status.code(),
-            Some(2),
+            Some(1),
             "clap usage error: {args:?}"
         );
     }
