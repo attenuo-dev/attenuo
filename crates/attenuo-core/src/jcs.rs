@@ -35,34 +35,25 @@ use serde::ser::{self, Serialize};
 use serde_json::Value;
 
 /// Why a value has no canonical form.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum JcsError {
     /// NaN or an infinity.
+    #[error("JSON has no NaN or infinite numbers")]
     NonFinite,
     /// Two members of one object have this name.
+    #[error("duplicate object member `{0}`")]
     DuplicateKey(String),
     /// A map key that is neither a string nor an integer.
+    #[error("object keys must be strings")]
     KeyNotString,
     /// Something JSON cannot hold, or that this module does not canonicalize (raw JSON, a
     /// 128-bit integer out of the 64-bit range).
+    #[error("cannot canonicalize {0}")]
     Unsupported(String),
     /// An error raised by a `Serialize` implementation.
+    #[error("{0}")]
     Custom(String),
 }
-
-impl fmt::Display for JcsError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            JcsError::NonFinite => f.write_str("JSON has no NaN or infinite numbers"),
-            JcsError::DuplicateKey(k) => write!(f, "duplicate object member `{k}`"),
-            JcsError::KeyNotString => f.write_str("object keys must be strings"),
-            JcsError::Unsupported(what) => write!(f, "cannot canonicalize {what}"),
-            JcsError::Custom(msg) => f.write_str(msg),
-        }
-    }
-}
-
-impl std::error::Error for JcsError {}
 
 impl ser::Error for JcsError {
     fn custom<T: fmt::Display>(msg: T) -> Self {
