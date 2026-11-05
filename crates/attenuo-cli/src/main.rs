@@ -22,6 +22,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use attenuo_core::jsonrpc::{CODE_APPROVAL_REQUIRED, CODE_DENIED};
 use clap::Parser;
 use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
@@ -32,11 +33,6 @@ use cli::{
 };
 use client::{query_escape, Client};
 use render::fmt_audit_entry;
-
-/// JSON-RPC error code the proxy uses for a denied call.
-const CODE_DENIED: i64 = -32003;
-/// JSON-RPC error code the proxy uses for a call that needs an approval (ADR-0009).
-const CODE_APPROVAL_REQUIRED: i64 = -32008;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {

@@ -11,6 +11,9 @@
 //! - [`names`]: what server and tool names may contain (one rule for every boundary).
 //! - [`fingerprint`]: fingerprints of results and arguments for argument-level taint
 //!   (ADR-0009, phase 2).
+//! - [`authorization`]: the `Bearer` / `DPoP` `Authorization` header, read one way by the
+//!   proxy and the server.
+//! - [`jsonrpc`]: the JSON-RPC error codes the proxy sends and the CLI reads.
 //! - [`jcs`]: RFC 8785 canonical JSON, the encoding of everything that is hashed or signed.
 //! - [`Decision`] and [`DecisionRecord`]: the outcome of authorization and the record that the
 //!   audit log stores.
@@ -25,6 +28,7 @@
     clippy::cast_possible_wrap
 )]
 
+pub mod authorization;
 pub mod call;
 pub mod capability;
 pub mod chain;
@@ -33,6 +37,7 @@ pub mod digest;
 pub mod error;
 pub mod fingerprint;
 pub mod jcs;
+pub mod jsonrpc;
 pub mod limits;
 pub mod names;
 

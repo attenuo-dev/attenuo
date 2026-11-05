@@ -226,21 +226,16 @@ pub async fn serve(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> anyh
 // ---------------------------------------------------------------------------------------------
 
 /// The token of `Authorization: Bearer <token>` or `Authorization: DPoP <token>` (RFC 9449
-/// §7.1). Whether a proof is needed depends on the token, not on the scheme.
+/// §7.1). Whether a proof is needed depends on the token, not on the scheme. The parsing is
+/// [`attenuo_core::authorization::token_of`], shared with the server.
 fn bearer_of(headers: &HeaderMap) -> Result<&str, AuthError> {
     let raw = headers
         .get(header::AUTHORIZATION)
         .ok_or(AuthError::MissingToken)?
         .to_str()
         .map_err(|_| AuthError::InvalidToken("authorization header is not ASCII".into()))?;
-    let (scheme, token) = raw
-        .split_once(' ')
-        .ok_or_else(|| AuthError::InvalidToken("expected `Bearer <token>`".into()))?;
-    let known = scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("dpop");
-    if !known || token.trim().is_empty() {
-        return Err(AuthError::InvalidToken("expected `Bearer <token>`".into()));
-    }
-    Ok(token.trim())
+    attenuo_core::authorization::token_of(raw)
+        .ok_or_else(|| AuthError::InvalidToken("expected `Bearer <token>`".into()))
 }
 
 /// The request's `DPoP` header: none, or exactly one ASCII value (RFC 9449 §4.3).
