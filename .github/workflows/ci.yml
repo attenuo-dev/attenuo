@@ -342,8 +342,9 @@ jobs:
 
   # The one check to mark as required once branch protection is on. A job skipped on purpose
   # (docs-only pull request, fuzz on a pull request) counts as passed; a failed or cancelled one
-  # fails this. A required check that is itself skipped would never report, so this job always
-  # runs. The macOS job is left out on purpose (weekly, and its pool can queue it out).
+  # fails this. Branch protection itself counts any skipped job as passed, including one skipped
+  # because `changes` failed, so the individual jobs must not be the required checks. This job
+  # always runs. The macOS job is left out on purpose (weekly, and its pool can queue it out).
   ci-ok:
     name: ci-ok
     if: always()
