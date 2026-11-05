@@ -77,6 +77,8 @@ This writes `results/<UTC date>.json` (every call in every arm) and `results/<UT
 
 The results JSON holds, per split, every call in every arm, the per-arm rates with Wilson 95% intervals, the per-taxonomy table and the oracle agreement report, plus SHA-256 hashes of every case file, policy file and binary under `meta.sha256`.
 
+To rebuild the release binaries, run both demos and every arm of both splits, and diff the per-arm rows against the committed [`results/2026-11-05-final-main.md`](results/2026-11-05-final-main.md) in one step, run `scripts/reproduce.sh` (it exits 0 with a `REPRODUCED` line, or 1 with the diff; see [docs/evaluation/reproduce.md](../../docs/evaluation/reproduce.md)). The comparison on its own is `python3 evaluation/injection-suite/compare_results.py BASELINE.md NEW.md`.
+
 The labelling oracle runs on its own, without binaries: `python3 evaluation/injection-suite/label_rules.py dev test`.
 
 As a test (ten dev cases against the server, a few seconds, plus the oracle and refusal tests in `test_labels.py`, which need no server):
