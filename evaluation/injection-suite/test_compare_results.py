@@ -68,3 +68,22 @@ def test_rows_are_tagged_by_split(tmp_path: Path) -> None:
     assert compare_results.compare(a, b)[0] == 1
     # A file with no arm rows at all is an error of its own.
     assert compare_results.compare(a, _write(tmp_path, "c.md", "nothing\n"))[0] == 2
+
+
+def test_other_tables_and_new_columns_are_ignored(tmp_path: Path) -> None:
+    # The per-stage tables gained an Input column on 2026-11-05; only arm rows and problems
+    # are compared, so a baseline without the column still reproduces.
+    old = BASE + "\n| Suite | Cases | Name | Policy |\n| banking | 13 | 2 | 3 |\n"
+    new = BASE + "\n| Suite | Cases | Name | Input | Policy |\n| banking | 13 | 2 | 1 | 3 |\n"
+    a, b = _write(tmp_path, "a.md", old), _write(tmp_path, "b.md", new)
+    assert compare_results.compare(a, b)[0] == 0
+
+
+def test_committed_baseline_is_reproduce_default() -> None:
+    # scripts/reproduce.sh compares against the newest committed results file.
+    root = Path(__file__).resolve().parents[2]
+    script = (root / "scripts" / "reproduce.sh").read_text()
+    assert "BASELINE=$SUITE/results/2026-11-05-type-check-stage.md" in script
+    base = Path(__file__).parent / "results" / "2026-11-05-type-check-stage.md"
+    assert compare_results.arm_rows(base.read_text())
+    assert not compare_results.problem_lines(base.read_text())

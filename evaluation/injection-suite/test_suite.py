@@ -414,6 +414,29 @@ def test_limits_probe_and_budget_stage() -> None:
     assert "probe got error -32003 policy_deny" in (harness.limits_probe_verdict(other) or "")
 
 
+def test_input_type_mismatch_is_stage_input() -> None:
+    # The proxy's argument type check (799350c) refuses before Cedar: its own stage, between
+    # capability and policy, counted per stage like the others.
+    assert harness.stage_of("input_type_mismatch") == "input"
+    assert harness.stage_of("attribute_type_mismatch") == "policy"  # user attributes, not args
+    st = harness.STAGES
+    assert st.index("capability") < st.index("input") < st.index("policy")
+    doc = {
+        "calls": [
+            {**_call("attack", "deny", "deny", "input"), "arm": "attenuo", "suite": "banking",
+             "args_intact": False, "as_expected": True},
+            {**_call("attack", "deny", "deny", "policy"), "arm": "attenuo", "suite": "banking",
+             "args_intact": False, "as_expected": True},
+        ]
+    }  # fmt: skip
+    (row,) = harness.summarise(doc)["rows"]
+    assert (row["blocked_input"], row["blocked_policy"], row["blocked_other"]) == (1, 1, 0)
+    # A case may expect it, and a labels arm that denies at stage input is consistent.
+    assert run.labels_consistent(_call("attack", "deny", "deny", "input"))
+    wrong = {**_call("attack", "deny", "deny", "policy"), "stage": "input"}
+    assert not run.labels_consistent(wrong)
+
+
 def _limits_call(arm: str, role: str, outcome: str, expect: str = "allow",
                  expect_stage: str | None = None,
                  stage: str | None = None) -> dict[str, Any]:  # fmt: skip
@@ -426,6 +449,8 @@ def test_limits_arm_consistency() -> None:
         _limits_call(lim, "attack", "allow"),
         _limits_call(lim, "attack", "deny", "allow", None, "budget"),
         _limits_call(lim, "attack", "deny", "deny", "policy", "budget"),
+        _limits_call(lim, "attack", "deny", "deny", "input", "budget"),  # limit before types
+        _limits_call(lim, "attack", "deny", "deny", "input", "input"),
         _limits_call(lim, "attack", "deny", "deny", "capability", "capability"),
         _limits_call(both, "benign", "gated"),
     ]

@@ -12,6 +12,10 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 - Brand assets under `assets/brand/` (mark, favicon, README header, social preview) and a favicon for the docs site. The mark is the delegation chain: three squares narrowing left to right.
 
+### Changed
+
+- Injection suite: the harness has a stage `input` for the proxy's argument type check (reason `input_type_mismatch`, which refuses a mistyped argument before Cedar since 799350c), between `capability` and `policy`. It is counted per stage (`blocked_input`, an `Input` column in the per-stage tables), the labelling oracle gives it to a declared argument of another JSON type, and the two test-split calls it refuses (`t-banking-02` call 1, `t-workspace-03` call 2) expect it instead of `policy`. The 18 problems of `results/2026-11-05-final-main.md` are gone and every per-arm count is unchanged; the new baseline of `scripts/reproduce.sh` is `evaluation/injection-suite/results/2026-11-05-type-check-stage.md`.
+
 ## [0.1.0] - 2026-10-24
 
 ### Highlights

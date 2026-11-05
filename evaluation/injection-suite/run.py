@@ -46,6 +46,7 @@ import label_rules
 
 STAGE_NOTE = {
     "capability": "the delegation token does not cover the call",
+    "input": "an argument does not have the type the catalog declares",
     "policy": "the suite's Cedar policy refuses it",
     "lease": "the session was revoked",
 }
@@ -171,10 +172,10 @@ def labels_consistent(c: dict[str, Any]) -> bool:
 
 def limits_consistent(c: dict[str, Any]) -> bool:
     """A call in a limits arm keeps its attenuo label, except that a run limit may refuse it
-    (stage ``budget``): an allowed call, or one the policy would deny, since the limit check
-    comes before the policy. In the combined arm an allowed call may also be gated."""
+    (stage ``budget``): an allowed call, or one the type check or the policy would deny, since
+    the limit check comes before both. In the combined arm an allowed call may also be gated."""
     if c["outcome"] == "deny" and c["stage"] == "budget":
-        return c["expect"] == "allow" or c["expect_stage"] == "policy"
+        return c["expect"] == "allow" or c["expect_stage"] in ("input", "policy")
     if c["expect"] == "deny":
         return bool(c["outcome"] == "deny" and c["stage"] == c["expect_stage"])
     return c["outcome"] in (("allow", "gated") if c["arm"] in harness.LABEL_ARMS else ("allow",))
@@ -396,14 +397,15 @@ def render_split(doc: dict[str, Any], split: str) -> list[str]:
         "",
         "### attenuo by suite and stage",
         "",
-        "| Suite | Cases | Attack calls | Name | Capability | Policy | Exchange | Lease "
+        "| Suite | Cases | Attack calls | Name | Capability | Input | Policy | Exchange | Lease "
         "| Allowed | Benign calls | Benign denied |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for r in [*ob, total("attenuo")] if ob else []:
         L.append(
             f"| {r['suite']} | {r['cases']} | {r['attack_calls']} | {r['blocked_name']} "
-            f"| {r['blocked_capability']} | {r['blocked_policy']} | {r['blocked_exchange']} "
+            f"| {r['blocked_capability']} | {r['blocked_input']} | {r['blocked_policy']} "
+            f"| {r['blocked_exchange']} "
             f"| {r['blocked_lease']} | {r['attack_allowed']} | {r['benign_calls']} "
             f"| {r['benign_denied']} |"
         )
@@ -424,14 +426,15 @@ def render_split(doc: dict[str, Any], split: str) -> list[str]:
         "Rows are the `taxonomy:` classes of [TAXONOMY.md](../cases/test/TAXONOMY.md) where cases "
         "have one, else the plan's S/C/D/N class.",
         "",
-        "| Class | Cases | Attack calls | Name | Capability | Policy | Exchange | Lease | Allowed "
-        "| Benign denied |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Class | Cases | Attack calls | Name | Capability | Input | Policy | Exchange | Lease "
+        "| Allowed | Benign denied |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for r in tax:
         L.append(
             f"| {r['taxonomy']} | {len(r['cases'])} | {r['attack_calls']} | {r['blocked_name']} "
-            f"| {r['blocked_capability']} | {r['blocked_policy']} | {r['blocked_exchange']} "
+            f"| {r['blocked_capability']} | {r['blocked_input']} | {r['blocked_policy']} "
+            f"| {r['blocked_exchange']} "
             f"| {r['blocked_lease']} | {r['attack_allowed']} "
             f"| {r['benign_denied']}/{r['benign_calls']} |"
         )

@@ -9,7 +9,7 @@ scripts/reproduce.sh
 
 It ends with one of two outcomes:
 
-- `REPRODUCED: 24 arm rows identical to results/2026-11-05-final-main.md` and exit status 0, or
+- `REPRODUCED: 24 arm rows identical to results/2026-11-05-type-check-stage.md` and exit status 0, or
 - a unified diff of the rows that differ, a `DIFFERS` line, and exit status 1.
 
 ## What it needs
@@ -27,7 +27,7 @@ Five steps, each printed with a heading and its time:
 2. **build**: `cargo build --release` of `attenuo-server`, `attenuo` and the `fake_mcp` test upstream.
 3. **demos**: [`examples/github-leak-demo/run.sh`](../../examples/github-leak-demo/README.md) and [`examples/multi-hop-demo/run.sh`](../../examples/multi-hop-demo/README.md) on those binaries. Each demo checks every step's exit status and output, and the number of calls that reached the fake upstream, and fails otherwise.
 4. **suite**: `run.py --split all --tag reproduce`, every arm of both splits ([the suite's README](../../evaluation/injection-suite/README.md) has the method).
-5. **compare**: [`compare_results.py`](../../evaluation/injection-suite/compare_results.py) takes the per-arm rows (the rows of the "Arms compared" tables that start with `| attenuo` or `| Suite policy`, 12 per split) from the new results file and from the committed [`results/2026-11-05-final-main.md`](../../evaluation/injection-suite/results/2026-11-05-final-main.md), and compares them byte for byte, together with the two files' lists of problems (below).
+5. **compare**: [`compare_results.py`](../../evaluation/injection-suite/compare_results.py) takes the per-arm rows (the rows of the "Arms compared" tables that start with `| attenuo` or `| Suite policy`, 12 per split) from the new results file and from the committed [`results/2026-11-05-type-check-stage.md`](../../evaluation/injection-suite/results/2026-11-05-type-check-stage.md), and compares them byte for byte, together with the two files' lists of problems (below).
 
 The results files the suite writes (`results/<date>-reproduce.md` and `.json`) are deleted at the end, since the committed baseline is the reference. `KEEP_RESULTS=1` keeps them, for instance to look at the per-call JSON after a difference.
 
@@ -50,7 +50,7 @@ A second run reuses the build, so it takes a little over a minute; `--skip-build
 
 The 24 rows hold, for every arm and both splits, the attack calls allowed, the attack calls that reached the upstream, and the benign calls denied, each as a count with its Wilson interval. These are the figures the [results page](injection-suite.md), [ADR-0010](../decisions/0010-run-limits.md) and [section 7 of the run-limits note](../design/run-limits.md#7-measured) quote, for instance 7/38 attack calls allowed and 3/29 benign calls denied on the test split for `attenuo`. The suite has no model and no randomness that changes outcomes (`--seed` only changes the order cases run in), so on the same corpus and the same code every row should be identical, not merely close.
 
-The comparison also covers the "Problems" lists, which hold what `run.py` exits 1 for: an attenuo call that did not get its expected outcome, a denied call that reached the upstream, a failed audit check. The baseline has 18 of them, all in the test split and all of one kind: two attack calls (`t-banking-02` call 1, `t-workspace-03` call 2) are denied by the argument type check that runs before Cedar (`input_type_mismatch`, added on 2026-10-24 after those cases were written), where the case files expect the policy stage to deny them; one line for `attenuo` and one for each of the eight arms built on it. The outcome is a deny either way, so no count changes. A problem the baseline also has is printed as known; a new one, or one that went away, is a difference like a changed row.
+The comparison also covers the "Problems" lists, which hold what `run.py` exits 1 for: an attenuo call that did not get its expected outcome, a denied call that reached the upstream, a failed audit check. The baseline has none. The previous baseline, `results/2026-11-05-final-main.md`, had 18, all of one kind: two test-split attack calls (`t-banking-02` call 1, `t-workspace-03` call 2) are denied by the argument type check that runs before Cedar (`input_type_mismatch`, added on 2026-10-24 after those cases were written), and the harness had no stage for it. It now has one, `input`, and the two cases expect it; every per-arm row is identical between the two files. Compared against the old file with `--baseline`, a run reports its 24 rows as identical and the 18 problems as only in the baseline. A problem the baseline also has is printed as known; a new one, or one that went away, is a difference like a changed row. The comparison reads only the per-arm rows and the problems, so the `Input` column the per-stage tables gained does not affect it.
 
 What it does not check: the other tables of the results file (per-taxonomy, approvals, run limits), which follow from the same calls, and the timing figures in the [end-to-end benchmark](../design/bench/2026-10-23-vm.md), which depend on the machine.
 
