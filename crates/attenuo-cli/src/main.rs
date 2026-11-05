@@ -5,6 +5,8 @@
 //! `budget refund` also exits 3 when the decision was already refunded, so a retried refund can
 //! be told from one that found nothing to refund (2).
 
+#![deny(unsafe_code)]
+
 mod cli;
 mod client;
 mod dpop_key;
