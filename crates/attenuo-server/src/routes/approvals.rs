@@ -294,10 +294,11 @@ async fn verify_user(
         )
         .await
         .map_err(|e| {
+            // Only the stable sub-code is returned; the verifier's text (an audience, a `kid`)
+            // is logged at debug level (SR-17).
             let d = e.description();
-            tracing::debug!(error = %e, "approval ID token refused");
-            ApiError::new(StatusCode::UNAUTHORIZED, "invalid_token", e.to_string())
-                .with_description(d)
+            tracing::debug!(reason = d, detail = ?e.to_string(), "approval ID token refused");
+            ApiError::new(StatusCode::UNAUTHORIZED, "invalid_token", d).with_description(d)
         })?;
     let user = &a.chain.originating_user;
     if verified.subject != user.subject || verified.issuer != user.issuer {

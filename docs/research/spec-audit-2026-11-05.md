@@ -75,6 +75,7 @@ Nothing was built or run. Behaviour that only a running server shows (timings, t
 - Doc: `http-api.md` says why a bearer token did not verify "is logged at debug level and never returned" (scoped to `/token/renew`, AuthZEN and `/admin/*`), following SR-17.
 - Code: `POST /approvals/{id}` and `GET /approvals/{id}` answer a failed ID token with 401 `invalid_token` whose `detail` is the verifier's `Display` text (`crates/attenuo-server/src/routes/approvals.rs:296-300`), while `error_description` carries the stable sub-code. The other bearer routes use `ApiError::unauthorized`, which returns only the code (`error.rs:76-82`).
 - Recommendation: decide, probably fix code. The text names things such as an audience mismatch or an unknown `kid`; that is little, but it is the one place the SR-17 rule is not followed. Returning `e.description()` as the detail would match the rest.
+- Status: fixed on `fix/spec-audit-findings`. The `detail` of that 401 is now the sub-code (`e.description()`), the same as `error_description`; the verifier's text is logged at debug level. `http-api.md`'s approvals error table says so.
 
 ### CLI usage errors exit 2, like a denial
 

@@ -170,7 +170,7 @@ Every answer for one grant carries the same token. To use it, retry the call wit
 | 400 | `invalid_request` | `decision` is not `grant` or `decline` |
 | 400 | `invalid_grant` (`error_description` `replayed`) | the ID token was already used to decide an approval |
 | 401 | `unauthorized` (`error_description` `missing_token`) | no bearer |
-| 401 | `invalid_token` (`error_description` says why: `expired`, `audience_mismatch`, ...) | the ID token failed verification |
+| 401 | `invalid_token` (`detail` and `error_description` both carry the sub-code: `expired`, `audience_mismatch`, ...; the verifier's message is logged at debug level, never returned) | the ID token failed verification |
 | 403 | `agent_token_refused` | a delegation token on `POST /approvals/{id}` |
 | 403 | `wrong_user` | the ID token belongs to someone other than the run's originating user |
 | 404 | `not_found` | unknown approval, or a delegation token of another run |
