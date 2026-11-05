@@ -73,8 +73,15 @@ impl<'de> Deserialize<'de> for TrackUsage {
 /// Whether any policy or template in `policies` may read `context.usage` (see the module
 /// docs for what counts). `true` when the set cannot be rendered as JSON.
 pub fn policies_read_usage(policies: &PolicySet) -> bool {
+    policies_read_context_attr(policies, "usage")
+}
+
+/// Whether any policy or template in `policies` may read the context member `attr`, by the
+/// same conservative walk as [`policies_read_usage`]. `true` when the set cannot be rendered
+/// as JSON.
+pub(crate) fn policies_read_context_attr(policies: &PolicySet, attr: &str) -> bool {
     match policies.clone().to_json() {
-        Ok(v) => reads_usage(&v),
+        Ok(v) => reads_attr(&v, attr),
         Err(_) => true,
     }
 }
@@ -83,9 +90,9 @@ fn is_context(v: &Value) -> bool {
     v.get("Var").and_then(Value::as_str) == Some("context")
 }
 
-/// Walk Cedar's JSON (EST) form: an attribute access or `has` test on `context` reads usage
-/// when it names `usage`; any other appearance of the `context` variable counts too.
-fn reads_usage(v: &Value) -> bool {
+/// Walk Cedar's JSON (EST) form: an attribute access or `has` test on `context` reads `name`
+/// when it names it; any other appearance of the `context` variable counts too.
+fn reads_attr(v: &Value, name: &str) -> bool {
     match v {
         Value::Object(map) => {
             for op in [".", "has"] {
@@ -97,13 +104,13 @@ fn reads_usage(v: &Value) -> bool {
                             _ => None,
                         };
                         // An unexpected shape is a read, to be safe.
-                        return attr.is_none_or(|a| a == "usage");
+                        return attr.is_none_or(|a| a == name);
                     }
                 }
             }
-            is_context(v) || map.values().any(reads_usage)
+            is_context(v) || map.values().any(|x| reads_attr(x, name))
         }
-        Value::Array(items) => items.iter().any(reads_usage),
+        Value::Array(items) => items.iter().any(|x| reads_attr(x, name)),
         _ => false,
     }
 }
