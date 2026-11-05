@@ -11,13 +11,24 @@ use crate::chain::{AgentId, DelegationChain, LeaseId};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Decision {
+    /// The call may go ahead.
     Allow,
+    /// The call is refused.
     Deny,
 }
 
 impl Decision {
+    /// Is this [`Decision::Allow`]?
     pub fn is_allow(&self) -> bool {
         matches!(self, Decision::Allow)
+    }
+
+    /// The wire form, `"allow"` or `"deny"` (the same string serde writes).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Decision::Allow => "allow",
+            Decision::Deny => "deny",
+        }
     }
 }
 

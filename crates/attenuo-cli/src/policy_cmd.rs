@@ -444,15 +444,7 @@ fn render_case(out: &mut String, case: &CaseReport) {
     let mark = if case.passed { "\u{2713}" } else { "\u{2717}" };
     let detail = match &case.actual {
         Some(a) => {
-            let mut d = format!(
-                "{}: {}",
-                if a.decision.is_allow() {
-                    "allow"
-                } else {
-                    "deny"
-                },
-                a.reason
-            );
+            let mut d = format!("{}: {}", a.decision.as_str(), a.reason);
             if !a.policy_ids.is_empty() {
                 let _ = write!(d, " [{}]", a.policy_ids.join(", "));
             }

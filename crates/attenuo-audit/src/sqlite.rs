@@ -591,7 +591,7 @@ fn entry_from_row(row: &Row<'_>) -> Result<AuditEntry, AuditError> {
             )))
         }
     };
-    expect("decision", &decision, decision_str(&record.decision))?;
+    expect("decision", &decision, record.decision.as_str())?;
     expect("kind", &kind, record.kind.as_str())?;
     if chain_id != record.chain_id {
         return Err(corrupt(format!(
@@ -635,13 +635,6 @@ fn entry_from_row(row: &Row<'_>) -> Result<AuditEntry, AuditError> {
         record,
         entry_hash,
     })
-}
-
-fn decision_str(d: &attenuo_core::Decision) -> &'static str {
-    match d {
-        attenuo_core::Decision::Allow => "allow",
-        attenuo_core::Decision::Deny => "deny",
-    }
 }
 
 fn head_in(tx: &Transaction<'_>) -> Result<Option<AuditEntry>, AuditError> {
@@ -1717,7 +1710,7 @@ fn insert_entry(
         entry.prev_hash,
         entry.entry_hash,
         fmt_time(r.at)?,
-        decision_str(&r.decision),
+        r.decision.as_str(),
         r.reason,
         r.originating_subject,
         serde_json::to_string(&r.agents)?,
@@ -2101,7 +2094,7 @@ impl SqliteAudit {
             let names: Vec<&str> = filter.kinds.iter().map(|k| k.as_str()).collect();
             Some(serde_json::to_string(&names)?)
         };
-        let decision = filter.decision.as_ref().map(decision_str);
+        let decision = filter.decision.as_ref().map(attenuo_core::Decision::as_str);
         // The columns hold JSON arrays of strings: look for the element as a quoted string.
         let agent = match &filter.agent {
             Some(a) => Some(like_contains(&serde_json::to_string(&a.0)?)),
@@ -2245,7 +2238,7 @@ impl SqliteAudit {
         Ok(query_entries(
             &conn,
             &sql,
-            &[&kind.as_str(), &tool, &decision_str(decision), &after],
+            &[&kind.as_str(), &tool, &decision.as_str(), &after],
         )?
         .pop())
     }
