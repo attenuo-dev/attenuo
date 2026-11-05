@@ -34,7 +34,8 @@ pub(crate) fn now() -> OffsetDateTime {
 }
 
 /// The token from `Authorization: Bearer <token>` (or `DPoP <token>`, RFC 9449 §7.1),
-/// `Ok(None)` when the header is absent, or an error when it is present but neither.
+/// `Ok(None)` when the header is absent, or an error when it is present but neither. The
+/// parsing is [`attenuo_core::authorization::token_of`], shared with the proxy.
 pub(crate) fn bearer_of(headers: &HeaderMap) -> Result<Option<&str>, ApiError> {
     let Some(raw) = headers.get(header::AUTHORIZATION) else {
         return Ok(None);
@@ -42,18 +43,14 @@ pub(crate) fn bearer_of(headers: &HeaderMap) -> Result<Option<&str>, ApiError> {
     let raw = raw.to_str().map_err(|_| {
         ApiError::unauthorized(REASON_INVALID_TOKEN, "authorization header is not ASCII")
     })?;
-    match raw.split_once(' ') {
-        Some((scheme, token))
-            if (scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("dpop"))
-                && !token.trim().is_empty() =>
-        {
-            Ok(Some(token.trim()))
-        }
-        _ => Err(ApiError::unauthorized(
-            REASON_INVALID_TOKEN,
-            "expected `Authorization: Bearer <token>`",
-        )),
-    }
+    attenuo_core::authorization::token_of(raw)
+        .map(Some)
+        .ok_or_else(|| {
+            ApiError::unauthorized(
+                REASON_INVALID_TOKEN,
+                "expected `Authorization: Bearer <token>`",
+            )
+        })
 }
 
 /// Parse a JSON body with a JSON error on failure (axum's own rejection is plain text).
