@@ -6,10 +6,7 @@ attenuo is authorization infrastructure. A bug here is not a crash; it is an age
 
 **Do not open a public issue or pull request for a security problem.**
 
-Report privately through either channel:
-
-- Email `security@<domain>` (placeholder until the project domain is set; until then use GitHub private reporting).
-- GitHub private vulnerability reporting: [github.com/attenuo-dev/attenuo/security/advisories/new](https://github.com/attenuo-dev/attenuo/security/advisories/new).
+Report privately through GitHub private vulnerability reporting: [github.com/attenuo-dev/attenuo/security/advisories/new](https://github.com/attenuo-dev/attenuo/security/advisories/new). If that page is unavailable to you, open an issue that says only "security report, please contact me" with no details, and a maintainer will reach you privately.
 
 Please include as much of the following as you can:
 
