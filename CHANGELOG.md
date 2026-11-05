@@ -23,6 +23,16 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 - Proxy: when the map of calls awaited for the listen stream is full, the run holding the most entries gives up its oldest, so one run can no longer push out every other run's awaited calls (SR-86).
 - Server: a repeated form `scope` on `POST /token` is refused like any other repeated parameter, instead of keeping the last one (SR-88).
 
+### Changed
+
+- ADR-0005 (policy decision point), ADR-0006 (lease-based in-flight revocation), ADR-0007 (actor authentication), ADR-0008 (admin console) and ADR-0009 (output labelling) are accepted (2026-11-05); all five were already implemented. ADR-0009's More Information notes that its title predates the catalog's `output = "trusted"`.
+
+### Fixed
+
+- Unknown keys in nested config tables are refused at start-up, as the config reference says: `[[upstreams]]` entries, `[policy.catalog.<server>.<tool>]` tables and the JSON of `catalog_path` (also in `attenuo policy test` and `lint`), and the table form of `[[root_grants]] capabilities`. A misspelt key used to be ignored, and two cases failed open: `sensitve = true` left the tool not sensitive, `constraint = {...}` left the grant unconstrained. A config with such a key no longer loads; the error names the key. A capability object in the body of the dev root mint (`POST /admin/root-token`) is read the same strict way, as the rest of that body already was. The token format is unchanged: a delegation token's capabilities still ignore unknown members.
+- `POST /approvals/{id}` and `GET /approvals/{id}` no longer return the ID-token verifier's message in the `detail` of a 401 `invalid_token`; `detail` is now the stable sub-code, the same as `error_description`, and the message is logged at debug level (SR-17).
+- `attenuo` exits 1, not 2, on a command line it cannot parse (an unknown flag, a missing argument, a bad value), so 2 means only "the answer was no". `--help` and `--version` still exit 0.
+
 ## [0.1.0] - 2026-10-24
 
 ### Highlights

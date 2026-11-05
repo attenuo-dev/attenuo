@@ -1011,8 +1011,8 @@ pub struct LeasesSection {
     /// belongs to is still in the registry, whatever its age. A charge goes once its charge
     /// and any refund are older than this, a counter once no charge under its lease is left,
     /// an approval once its creation, decision and expiry are older than this. After that an
-    /// operator refund of the decision answers 404, as for one that charged nothing; the
-    /// audit log keeps every decision, charge and approval record. 0 keeps everything.
+    /// operator refund of the decision answers 410 `charge_pruned`; the audit log keeps every
+    /// decision, charge and approval record. 0 keeps everything.
     #[serde(default = "default_run_state_retention_seconds")]
     pub run_state_retention_seconds: u64,
     /// Seconds between runs of the lease maintenance task (the session, lease and run-state
@@ -1649,12 +1649,65 @@ pub fn resolve_may_act(
 }
 
 /// A capability written either as shorthand `"server:tool"` (globs allowed, e.g. `"github:*"`)
-/// or as a full object `{ server, tool, constraints }`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// or as a full object `{ server, tool, constraints, limits }`.
+///
+/// The full form is read through [`CapabilityConfig`], which refuses unknown members: a
+/// misspelt `constraint = {...}` would otherwise leave the grant unconstrained. The token
+/// wire format ([`Capability`]) keeps ignoring unknown members, so that an older server can
+/// read a newer token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum CapSpec {
     Short(String),
     Full(Capability),
+}
+
+/// The full-table form of a capability in configuration: [`Capability`]'s members, with
+/// unknown ones refused.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityConfig {
+    pub server: String,
+    pub tool: String,
+    #[serde(default)]
+    pub constraints: BTreeMap<String, attenuo_core::ArgConstraint>,
+    #[serde(default)]
+    pub limits: attenuo_core::Limits,
+}
+
+impl From<CapabilityConfig> for Capability {
+    fn from(c: CapabilityConfig) -> Self {
+        let mut cap = Capability::new(c.server, c.tool).with_limits(c.limits);
+        cap.constraints = c.constraints;
+        cap
+    }
+}
+
+impl<'de> Deserialize<'de> for CapSpec {
+    // By hand rather than `untagged`, so that an error in the table form (an unknown member)
+    // is reported as such instead of as "did not match any variant".
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = CapSpec;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a capability: \"server:tool\" or a table { server, tool, ... }")
+            }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<CapSpec, E> {
+                Ok(CapSpec::Short(s.to_string()))
+            }
+            fn visit_string<E: serde::de::Error>(self, s: String) -> Result<CapSpec, E> {
+                Ok(CapSpec::Short(s))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<CapSpec, A::Error> {
+                let full = CapabilityConfig::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(CapSpec::Full(full.into()))
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 impl CapSpec {
@@ -2519,6 +2572,72 @@ mod tests {
         assert!(Config::from_toml("[server]\nlisten = \"127.0.0.1:1\"\nlsten = 1\n").is_err());
     }
 
+    /// Nested tables refuse unknown keys too, and the error names the key. Each of these
+    /// would otherwise fail open: the tool would not be sensitive, the grant unconstrained.
+    #[test]
+    fn unknown_keys_in_nested_tables_are_rejected() {
+        let refused = |text: &str, key: &str| {
+            let err = Config::from_toml(text).unwrap_err().to_string();
+            assert!(err.contains(&format!("unknown field `{key}`")), "{err}");
+        };
+        refused(
+            "[policy.catalog.github.delete_repo]\nsensitve = true\n",
+            "sensitve",
+        );
+        refused(
+            "[[upstreams]]\nname = \"github\"\nurl = \"http://127.0.0.1:1/mcp\"\ntimeout = 5\n",
+            "timeout",
+        );
+        refused(
+            "[[root_grants]]\nissuer = \"i\"\nagent = \"a\"\n\
+             capabilities = [{ server = \"github\", tool = \"create_issue\", \
+             constraint = { repo = { op = \"prefix\", value = \"acme/\" } } }]\n",
+            "constraint",
+        );
+        // The correctly spelt forms still load, string and table alike.
+        let cfg = Config::from_toml(
+            "[policy.catalog.github.delete_repo]\nsensitive = true\n\
+             [[upstreams]]\nname = \"github\"\nurl = \"http://127.0.0.1:1/mcp\"\n\
+             [[root_grants]]\nissuer = \"i\"\nagent = \"a\"\n\
+             capabilities = [\"github:*\", { server = \"github\", tool = \"create_issue\", \
+             constraints = { repo = { op = \"prefix\", value = \"acme/\" } }, \
+             limits = { calls = 3 } }]\n",
+        )
+        .unwrap();
+        let caps = capability_set(&cfg.root_grants[0].capabilities).unwrap();
+        assert_eq!(caps.len(), 2);
+        let full = cfg.root_grants[0].capabilities[1].to_capability().unwrap();
+        assert_eq!(full.constraints.len(), 1);
+        assert_eq!(full.limits.calls, Some(3));
+        assert!(
+            cfg.policy
+                .load_catalog()
+                .unwrap()
+                .get("github", "delete_repo")
+                .sensitive
+        );
+    }
+
+    /// The JSON catalog at `catalog_path` is read through the same strict `ToolAttrs`.
+    #[test]
+    fn unknown_keys_in_catalog_path_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.json");
+        std::fs::write(&path, r#"{"github": {"delete_repo": {"sensitve": true}}}"#).unwrap();
+        let mut policy = Config::default().policy;
+        policy.catalog_path = Some(path.clone());
+        let err = policy.load_catalog().unwrap_err().to_string();
+        assert!(err.contains("unknown field `sensitve`"), "{err}");
+        std::fs::write(&path, r#"{"github": {"delete_repo": {"sensitive": true}}}"#).unwrap();
+        assert!(
+            policy
+                .load_catalog()
+                .unwrap()
+                .get("github", "delete_repo")
+                .sensitive
+        );
+    }
+
     #[test]
     fn cap_spec_forms() {
         let short: CapSpec = serde_json::from_value(serde_json::json!("github:read_*")).unwrap();
@@ -2532,6 +2651,14 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(full.to_capability().unwrap().constraints.len(), 1);
+        // The table form is strict in JSON as in TOML.
+        let err = serde_json::from_value::<CapSpec>(serde_json::json!({
+            "server": "github", "tool": "create_issue",
+            "constraint": {"repo": {"op": "prefix", "value": "acme/"}}
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown field `constraint`"), "{err}");
         assert!(CapSpec::Short("nocolon".into()).to_capability().is_err());
         assert!(CapSpec::Short(":x".into()).to_capability().is_err());
     }

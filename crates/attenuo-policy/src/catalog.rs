@@ -74,7 +74,11 @@ impl ArgType {
 
 /// Attributes of one tool. Available in policies as `resource.readonly`,
 /// `resource.sensitive` and `resource.destructive`.
+///
+/// Unknown members are refused: a misspelt `sensitve = true` that was silently ignored would
+/// leave the tool not sensitive, and a `forbid ... when { resource.sensitive }` would not apply.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolAttrs {
     /// The tool only reads; it never mutates state outside the agent.
     #[serde(default)]

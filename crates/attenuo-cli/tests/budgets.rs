@@ -227,6 +227,6 @@ async fn refund_and_tree_budgets_against_a_real_server() {
     let mut c = admin();
     c.args(["budget", "refund", &decision, "--reason", " "]);
     let out = run(c).await;
-    assert_eq!(out.status.code(), Some(2), "clap's usage error");
+    assert_eq!(out.status.code(), Some(1), "a usage error, not a no");
     assert!(text(&out.stderr).contains("the reason must not be empty"));
 }

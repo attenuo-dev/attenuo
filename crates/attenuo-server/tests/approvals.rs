@@ -587,8 +587,9 @@ async fn only_the_originating_users_fresh_id_token_approves() {
     let (status, v) = h.user_decide(&g.approval_id, &token, "grant").await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
     assert_eq!(v["error"], "agent_token_refused");
-    // An ID token issued to another client.
-    let (status, _) = h
+    // An ID token issued to another client. The body carries the stable sub-code only, not
+    // the verifier's text, which names the client (SR-17).
+    let (status, v) = h
         .user_decide(
             &g.approval_id,
             &h.idp.id_token_for("alice", "some-other-client"),
@@ -596,6 +597,15 @@ async fn only_the_originating_users_fresh_id_token_approves() {
         )
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(v["error"], "invalid_token", "{v}");
+    assert_eq!(
+        v["error_description"], "credential_audience_mismatch",
+        "{v}"
+    );
+    assert_eq!(v["detail"], "credential_audience_mismatch", "{v}");
+    let body = v.to_string();
+    assert!(!body.contains("some-other-client"), "{body}");
+    assert!(!body.contains("was not issued"), "{body}");
     // The admin bearer is not a user credential.
     let (status, _) = h.user_decide(&g.approval_id, ADMIN, "grant").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);

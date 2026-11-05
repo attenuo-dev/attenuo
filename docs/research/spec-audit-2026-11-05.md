@@ -61,29 +61,34 @@ Nothing was built or run. Behaviour that only a running server shows (timings, t
 - Code: the top-level sections are `#[serde(deny_unknown_fields)]`, but three nested types are not: `UpstreamConfig` (`crates/attenuo-proxy/src/config.rs:9-10`), `ToolAttrs` for `[policy.catalog.<server>.<tool>]` and `catalog_path` (`crates/attenuo-policy/src/catalog.rs:77-78`) and `Capability`, used by the full-table form of `[[root_grants]] capabilities` (`crates/attenuo-core/src/capability.rs:364-365`). A misspelt key there is silently ignored. Two cases fail open: `sensitve = true` in the catalog leaves the tool not sensitive, so a `forbid ... when { resource.sensitive }` does not apply; `constraint = {...}` in a root grant leaves the grant unconstrained.
 - Interim doc change: `config.md` now says which tables do not reject unknown keys.
 - Recommendation: fix code. Add `deny_unknown_fields` to `UpstreamConfig` and `ToolAttrs`. For `Capability` decide separately, since it is also the token wire format and an old server reading a newer token relies on unknown members being ignored (`capabilities-and-attenuation.md` says servers before 0.1.0 ignore `limits`); a config-only wrapper type with `deny_unknown_fields` would cover `[[root_grants]]` without touching tokens. Then restore the one-sentence claim.
+- Status: fixed on `fix/spec-audit-findings`. `UpstreamConfig` and `ToolAttrs` refuse unknown fields; `ToolAttrs` covers the inline catalog, the JSON of `catalog_path` and the catalogs the `attenuo policy` harness reads. The table form of `[[root_grants]] capabilities` is read through a config-only `CapabilityConfig` with `deny_unknown_fields`, so `Capability` and the token format are unchanged. The interim paragraph in `config.md` is removed and the one-sentence claim stands.
 
 ### ADR status lines
 
 - Doc: ADR-0005 (`docs/decisions/0005-policy-decision-point.md:3`), ADR-0006 (`0006-lease-based-in-flight-revocation.md:2`), ADR-0007 (`0007-actor-authentication.md:2`), ADR-0008 (`0008-admin-console.md:2`) and ADR-0009 (`0009-output-labelling.md:2`) say `proposed`, as does the index in `docs/decisions/README.md`.
 - Code: all five are implemented and documented as shipped (the capability stage and generated schema in `attenuo-policy`; leases in `attenuo-audit/src/lease.rs`; actor tokens in `attenuo-server/src/actor.rs`; the console in `admin_ui.rs`; output labels and approvals in `authz.rs` and `routes/approvals.rs`). ADR-0011 is `proposed` and correctly so: there is no opt-in setting for Cedar-aware list filtering in `[proxy]` (`config.rs:1321-1368`).
 - Recommendation: decide. The ADR process (`docs/decisions/README.md`) makes acceptance a maintainer decision, so the audit did not change the lines. If accepted, set `status: accepted` and the date in each file and in the index; ADR-0009's title ("labels every upstream result untrusted") predates the catalog's `output = "trusted"` and may want a note under More Information.
+- Status: accepted on `fix/spec-audit-findings`. ADR-0005 to ADR-0009 are `accepted` with date 2026-11-05 in each file and in the index, and ADR-0009's More Information notes that its title predates `output = "trusted"`.
 
 ### Approval ID-token errors return the verifier's message
 
 - Doc: `http-api.md` says why a bearer token did not verify "is logged at debug level and never returned" (scoped to `/token/renew`, AuthZEN and `/admin/*`), following SR-17.
 - Code: `POST /approvals/{id}` and `GET /approvals/{id}` answer a failed ID token with 401 `invalid_token` whose `detail` is the verifier's `Display` text (`crates/attenuo-server/src/routes/approvals.rs:296-300`), while `error_description` carries the stable sub-code. The other bearer routes use `ApiError::unauthorized`, which returns only the code (`error.rs:76-82`).
 - Recommendation: decide, probably fix code. The text names things such as an audience mismatch or an unknown `kid`; that is little, but it is the one place the SR-17 rule is not followed. Returning `e.description()` as the detail would match the rest.
+- Status: fixed on `fix/spec-audit-findings`. The `detail` of that 401 is now the sub-code (`e.description()`), the same as `error_description`; the verifier's text is logged at debug level. `http-api.md`'s approvals error table says so.
 
 ### CLI usage errors exit 2, like a denial
 
 - Doc: `cli.md` gives exit 2 for "the answer was no" on `call`, `policy evaluate`, `policy test` and others, and for "nothing to refund" on `budget refund`; the new exit status table now also says that usage errors exit 2.
 - Code: `Cli::parse()` (`crates/attenuo-cli/src/main.rs:50`) exits through clap, which uses status 2 for an unknown flag or a missing argument, the same status `Outcome::No` maps to (`main.rs:56`).
 - Recommendation: decide. A script that treats 2 as "denied" will read a typo as a denial. Either parse with `Cli::try_parse()` and exit 1 (or 64) on a usage error, or keep it and leave the documentation as it is now.
+- Status: fixed on `fix/spec-audit-findings`. The CLI parses with `Cli::try_parse()`: help and version exit 0, any other parse error prints clap's message to stderr and exits 1, so 2 means only "the answer was no". The exit status table in `cli.md` moves usage errors to row 1.
 
 ### Stale code comments
 
 - `crates/attenuo-server/src/config.rs:1012-1015` (doc comment of `run_state_retention_seconds`) says a refund after run-state pruning "answers 404, as for one that charged nothing"; the route answers 410 `charge_pruned` (`routes/admin.rs:369, 429`), as the docs say.
 - Recommendation: fix the comment. It is code, so the audit left it.
+- Status: fixed on `fix/spec-audit-findings`; the comment says 410 `charge_pruned`.
 
 ## Not verified
 

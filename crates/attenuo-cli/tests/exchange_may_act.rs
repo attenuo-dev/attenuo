@@ -219,11 +219,11 @@ async fn no_delegation_makes_a_token_nobody_may_exchange() {
     v.arg(&path);
     ok(&run(v).await);
 
-    // A bad value fails before any request, as on `audit tail`.
+    // A bad value fails before any request, as on `audit tail`: a usage error, exit 1.
     let out = run(audit(&["audit", "export", "--decision", "maybe"])).await;
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(1));
     let out = run(audit(&["audit", "export", "--tool", ""])).await;
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(1));
 
     // Without either flag the new token carries no `may_act`: anyone authenticated may
     // exchange it (it does not inherit the parent's list).
@@ -282,7 +282,7 @@ async fn no_delegation_makes_a_token_nobody_may_exchange() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("--no-delegation"));
     let out = run(root_cmd("dave", &["--no-delegation", "--may-act", "coder"])).await;
-    assert_eq!(out.status.code(), Some(2), "clap usage error");
+    assert_eq!(out.status.code(), Some(1), "clap usage error");
 
     // An empty --may-act is refused before anything is sent, and the two flags conflict.
     let out = run(exchange(&root, "reviewer", &["--may-act", ""])).await;
@@ -294,7 +294,7 @@ async fn no_delegation_makes_a_token_nobody_may_exchange() {
         &["--no-delegation", "--may-act", "x"],
     ))
     .await;
-    assert_eq!(out.status.code(), Some(2), "clap usage error");
+    assert_eq!(out.status.code(), Some(1), "clap usage error");
 
     // `token inspect` says who may exchange each token, and `--verify` covers it: the same
     // token with its `may_act` rewritten decodes to the new list but fails verification.

@@ -170,8 +170,6 @@ One table per MCP server, using streamable HTTP.
 | `name` | Mount name, served at `/mcp/<name>`. It is the `server` part of capabilities and of action ids. ASCII letters, digits, `_`, `.`, `-`; `attenuo` is reserved. |
 | `url` | Upstream MCP endpoint. |
 
-Unlike the rest of the file, `[[upstreams]]` entries, `[policy.catalog.<server>.<tool>]` tables (and the JSON of `catalog_path`) and full capability tables in `[[root_grants]]` do not reject unknown keys at present: a misspelt key there is ignored (see the [spec audit](../research/spec-audit-2026-11-05.md#unknown-keys-in-nested-tables)).
-
 ## `[admin]`
 
 | Key | Meaning |
