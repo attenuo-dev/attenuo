@@ -1,4 +1,6 @@
-//! The issuer's public key as a JWK Set (RFC 7517, OKP keys per RFC 8037).
+//! The issuer's own public keys as a JWK Set (RFC 7517, OKP keys per RFC 8037), served at
+//! `GET /.well-known/jwks.json`. The cache of identity-provider keys is a different module,
+//! `idp::jwks`.
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;

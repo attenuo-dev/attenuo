@@ -7,8 +7,8 @@
 //!
 //! | Route | Auth | Purpose |
 //! |---|---|---|
-//! | `POST /token` | client credentials + IdP credential | hop 0 from an OIDC ID token or ID-JAG ([`idp`]) |
-//! | `POST /token` | subject token in body; actor by client credentials or `actor_token` ([`actor`]) | RFC 8693 exchange, hop n to n+1 |
+//! | `POST /token` | client credentials + IdP credential | hop 0 from an OIDC ID token or ID-JAG (`idp`) |
+//! | `POST /token` | subject token in body; actor by client credentials or `actor_token` (`actor`) | RFC 8693 exchange, hop n to n+1 |
 //! | `POST /token/renew` | delegation token (bearer; with a `DPoP` proof when bound, [`dpop`]) | extend the last hop's lease |
 //! | `POST /access/v1/evaluation` | delegation token (bearer); or `[[peps]]` credentials with `[authzen] allow_unsigned_chain` | AuthZEN evaluation |
 //! | `POST /access/v1/evaluations` | same as above | AuthZEN batch evaluation, at most `[authzen] max_batch` entries |
@@ -48,21 +48,29 @@
     clippy::cast_possible_wrap
 )]
 
-pub mod actor;
+pub(crate) mod actor;
+// Used by the integration tests.
 pub mod admin_ui;
+// Used by the benches (`result_digest`).
 pub mod authz;
-pub mod clientauth;
+pub(crate) mod clientauth;
 pub mod config;
+// Used by the fuzz targets.
 pub mod dpop;
+// Used by the integration tests.
 pub mod error;
-pub mod idp;
-pub mod jwks;
+pub(crate) mod idp;
+pub(crate) mod issuer_keys;
+// Used by the integration tests.
 pub mod metrics;
+// Used by the integration tests.
 pub mod notify;
-pub mod replay;
+pub(crate) mod replay;
+// Used by the integration tests.
 pub mod routes;
+// Used by the integration tests.
 pub mod sink;
-pub mod state;
+pub(crate) mod state;
 
 use std::sync::Arc;
 

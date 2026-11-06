@@ -1,7 +1,7 @@
 //! `POST /admin/root-token`: mint a hop-0 token directly. **Development only.**
 //!
 //! Real hop-0 intake verifies a user credential from a trusted IdP (an OIDC ID token or an
-//! ID-JAG) at `POST /token`; see [`crate::idp`]. This endpoint skips that: an operator holding
+//! ID-JAG) at `POST /token`; see `crate::idp`. This endpoint skips that: an operator holding
 //! the admin token asserts who the user is and which agent acts for them. Nothing about the
 //! user is verified, so the route is mounted only when `[dev] allow_root_mint = true` (the
 //! server logs a warning at startup when it is), sits behind the admin bearer and, when
