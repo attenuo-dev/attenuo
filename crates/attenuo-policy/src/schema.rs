@@ -384,6 +384,53 @@ mod tests {
     }
 
     #[test]
+    fn a_decimal_input_is_the_cedar_decimal_extension_type() {
+        let catalog = ToolCatalog::new().with(
+            "banking",
+            "send_money",
+            ToolAttrs::new()
+                .with_input("amount", ArgType::Decimal)
+                .with_input("fees", ArgType::Set(Box::new(ArgType::Decimal))),
+        );
+        let text = generate(DEFAULT_SCHEMA, &catalog, &default_user_attrs(), false);
+        assert!(
+            text.contains(
+                r#"input: { "amount"?: __cedar::decimal, "fees"?: Set<__cedar::decimal> }"#
+            ),
+            "{text}"
+        );
+        let (_, warnings) =
+            cedar_policy::Schema::from_cedarschema_str(&text).expect("schema parses");
+        assert_eq!(warnings.count(), 0);
+        // Policies that compare it validate; comparing it with a Long does not.
+        let build = |policy: &str| {
+            crate::PolicyEngineBuilder::new()
+                .with_catalog(catalog.clone())
+                .with_policies_str(policy)
+                .build()
+        };
+        build(
+            r#"permit(principal, action == Action::"banking/send_money", resource) when {
+                 context.input has amount && context.input.amount.lessThan(decimal("100.0")) &&
+                 context.input has fees && context.input.fees.contains(decimal("0.5")) };"#,
+        )
+        .unwrap();
+        let err = build(
+            r#"permit(principal, action, resource) when {
+                 context.input has amount && context.input.amount < 100 };"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::PolicyError::Validation(_)), "{err}");
+        // Cedar 4 has no `<` on decimals: the methods are the only comparison.
+        let err = build(
+            r#"permit(principal, action, resource) when {
+                 context.input has amount && context.input.amount < decimal("100.0") };"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("but saw decimal"), "{err}");
+    }
+
+    #[test]
     fn generated_schema_parses() {
         let catalog = ToolCatalog::new()
             .with(

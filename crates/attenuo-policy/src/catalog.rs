@@ -24,6 +24,13 @@ pub enum ArgType {
     Long,
     /// A JSON `true` or `false`; Cedar `Bool`.
     Bool,
+    /// A JSON number with at most 4 fractional digits and a magnitude of at most
+    /// 922337203685477; Cedar's `decimal` extension type. `12.5`, `12.50` and `12` are
+    /// `decimal("12.5")`, `decimal("12.5")` and `decimal("12.0")`: the number's shortest
+    /// decimal form, never rounded, so `12.34567` is refused. Compare it with the decimal
+    /// methods, `context.input.amount.lessThan(decimal("100.0"))`. A catalog input type only:
+    /// user attributes cannot be declared `decimal`.
+    Decimal,
     /// A JSON array whose every element has the inner type; Cedar `Set<T>`.
     Set(Box<ArgType>),
 }
@@ -31,18 +38,20 @@ pub enum ArgType {
 impl std::str::FromStr for ArgType {
     type Err = String;
 
-    /// Parse `string`, `long`, `bool` or `set<T>` (case-insensitive, spaces ignored), the
-    /// notation used by `[policy] user_attributes` in the server config.
+    /// Parse `string`, `long`, `bool`, `decimal` or `set<T>` (case-insensitive, spaces
+    /// ignored), the notation used by `[policy] user_attributes` in the server config, which
+    /// then refuses `decimal` ([`parse_user_attributes`]).
     fn from_str(s: &str) -> Result<Self, String> {
         let t = s.trim().to_ascii_lowercase();
         match t.as_str() {
             "string" => Ok(ArgType::String),
             "long" => Ok(ArgType::Long),
             "bool" => Ok(ArgType::Bool),
+            "decimal" => Ok(ArgType::Decimal),
             _ => match t.strip_prefix("set<").and_then(|r| r.strip_suffix('>')) {
                 Some(inner) => Ok(ArgType::Set(Box::new(inner.parse()?))),
                 None => Err(format!(
-                    "unknown type `{}`: expected string, long, bool or set<...>",
+                    "unknown type `{}`: expected string, long, bool, decimal or set<...>",
                     s.trim()
                 )),
             },
@@ -55,16 +64,24 @@ impl std::str::FromStr for ArgType {
 /// # Errors
 ///
 /// A message `user_attributes.<name>: ...` for the first declaration (in name order) whose type
-/// is not `string`, `long`, `bool` or `set<T>` of one of those.
+/// is not `string`, `long`, `bool` or `set<T>` of one of those. `decimal` parses but is
+/// refused here: it is a catalog input type only ([`ArgType::Decimal`]).
 pub fn parse_user_attributes(
     decls: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, ArgType>, String> {
     decls
         .iter()
         .map(|(name, ty)| {
-            ty.parse()
-                .map(|t| (name.clone(), t))
-                .map_err(|e| format!("user_attributes.{name}: {e}"))
+            let t: ArgType = ty
+                .parse()
+                .map_err(|e| format!("user_attributes.{name}: {e}"))?;
+            if t.contains_decimal() {
+                return Err(format!(
+                    "user_attributes.{name}: decimal is a catalog input type only; user \
+                     attributes are string, long, bool or set<...>"
+                ));
+            }
+            Ok((name.clone(), t))
         })
         .collect()
 }
@@ -76,7 +93,27 @@ impl ArgType {
             ArgType::String => "String".to_string(),
             ArgType::Long => "Long".to_string(),
             ArgType::Bool => "Bool".to_string(),
+            ArgType::Decimal => "__cedar::decimal".to_string(),
             ArgType::Set(inner) => format!("Set<{}>", inner.cedar()),
+        }
+    }
+
+    /// As [`cedar`](Self::cedar), with `decimal` for the extension type: the name diagnostics
+    /// use.
+    pub(crate) fn shown(&self) -> String {
+        match self {
+            ArgType::Decimal => "decimal".to_string(),
+            ArgType::Set(inner) => format!("Set<{}>", inner.shown()),
+            other => other.cedar(),
+        }
+    }
+
+    /// Is this `decimal`, or a set of it at any depth?
+    pub(crate) fn contains_decimal(&self) -> bool {
+        match self {
+            ArgType::Decimal => true,
+            ArgType::Set(inner) => inner.contains_decimal(),
+            _ => false,
         }
     }
 }
@@ -369,7 +406,7 @@ impl ToolCatalog {
                         return Err(format!(
                             "catalog entry {server:?} / {tool:?}: `amount` names input \
                              {input:?}, declared {}, not long",
-                            ty.cedar()
+                            ty.shown()
                         ))
                     }
                 }
@@ -502,5 +539,67 @@ mod tests {
             vec!["input.amount: expected Long, got number".to_string()]
         );
         assert_eq!(send(&e, json!(12.0)).decision, Decision::Allow);
+    }
+
+    #[test]
+    fn decimal_parses_and_is_a_catalog_input_type_only() {
+        assert_eq!(" Decimal ".parse::<ArgType>().unwrap(), ArgType::Decimal);
+        assert_eq!(
+            "set<decimal>".parse::<ArgType>().unwrap(),
+            ArgType::Set(Box::new(ArgType::Decimal))
+        );
+        let decls = BTreeMap::from([("limit".to_string(), "set<decimal>".to_string())]);
+        let err = parse_user_attributes(&decls).unwrap_err();
+        assert!(
+            err.starts_with("user_attributes.limit: decimal is a catalog input type only"),
+            "{err}"
+        );
+        let err = PolicyEngineBuilder::new()
+            .with_user_attr("limit", ArgType::Decimal)
+            .build()
+            .err()
+            .unwrap();
+        assert!(matches!(err, crate::PolicyError::Schema(_)), "{err}");
+        // The TOML and JSON catalog spelling.
+        let attrs: ToolAttrs =
+            serde_json::from_value(json!({"inputs": {"amount": "decimal"}})).unwrap();
+        assert_eq!(attrs.inputs["amount"], ArgType::Decimal);
+        // A run-usage `amount` still has to be a long.
+        let err = ToolCatalog::new()
+            .with("banking", "send_money", attrs.with_amount("amount"))
+            .validate()
+            .unwrap_err();
+        assert!(err.ends_with("declared decimal, not long"), "{err}");
+    }
+
+    /// With `amount` declared `decimal`, a policy compares it with the decimal methods, for
+    /// whole and fractional values alike, and a value that is not a decimal is refused before
+    /// Cedar.
+    #[test]
+    fn a_decimal_amount_is_compared_in_a_policy() {
+        let e = engine(
+            ToolAttrs::new().with_input("amount", ArgType::Decimal),
+            r#"@id("small") permit(principal, action == Action::"banking/send_money", resource)
+               when { context.input has amount &&
+                      context.input.amount.lessThan(decimal("100.0")) };"#,
+        )
+        .unwrap();
+        for amount in [json!(12.5), json!(99.9999), json!(12), json!(0)] {
+            let out = send(&e, amount.clone());
+            assert_eq!(out.decision, Decision::Allow, "{amount} {out:?}");
+            assert_eq!(out.policy_ids, vec!["small".to_string()]);
+        }
+        for amount in [json!(100), json!(100.0), json!(250.75)] {
+            let out = send(&e, amount.clone());
+            assert_eq!(out.reason, crate::REASON_POLICY_DENY, "{amount} {out:?}");
+        }
+        for amount in [json!(12.34567), json!("12.5"), json!(1e300)] {
+            let out = send(&e, amount.clone());
+            assert_eq!(
+                out.reason,
+                crate::REASON_INPUT_TYPE_MISMATCH,
+                "{amount} {out:?}"
+            );
+        }
     }
 }

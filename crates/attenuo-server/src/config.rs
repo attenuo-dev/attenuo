@@ -531,7 +531,7 @@ pub struct PolicySection {
     #[serde(default)]
     pub policies_path: Option<PathBuf>,
     /// Inline tool catalog: `[policy.catalog.<server>.<tool>]` tables with `readonly`,
-    /// `sensitive` and `inputs = { arg = "string" | "long" | "bool" }`.
+    /// `sensitive` and `inputs = { arg = "string" | "long" | "bool" | "decimal" }`.
     #[serde(default)]
     pub catalog: BTreeMap<String, BTreeMap<String, ToolAttrs>>,
     /// JSON file with the same shape as `catalog`: `{ "<server>": { "<tool>": { ... } } }`.
