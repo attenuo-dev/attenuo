@@ -11,16 +11,27 @@ pub use attenuo_core::jsonrpc::{
     CODE_UPSTREAM,
 };
 
-/// MCP method names the proxy understands.
+// MCP method names the proxy understands.
+
+/// `tools/call`: run a tool (decided per call).
 pub const METHOD_TOOLS_CALL: &str = "tools/call";
+/// `tools/list`: list the tools (filtered).
 pub const METHOD_TOOLS_LIST: &str = "tools/list";
+/// `resources/list`: list the resources (filtered).
 pub const METHOD_RESOURCES_LIST: &str = "resources/list";
+/// `resources/templates/list`: list the resource templates (filtered).
 pub const METHOD_RESOURCES_TEMPLATES_LIST: &str = "resources/templates/list";
+/// `prompts/list`: list the prompts (filtered).
 pub const METHOD_PROMPTS_LIST: &str = "prompts/list";
+/// `resources/read`: read a resource (decided per call).
 pub const METHOD_RESOURCES_READ: &str = "resources/read";
+/// `resources/subscribe`: subscribe to a resource's updates (decided per call).
 pub const METHOD_RESOURCES_SUBSCRIBE: &str = "resources/subscribe";
+/// `resources/unsubscribe`: drop a subscription (forwarded after a lease check).
 pub const METHOD_RESOURCES_UNSUBSCRIBE: &str = "resources/unsubscribe";
+/// `prompts/get`: fetch a prompt (decided per call).
 pub const METHOD_PROMPTS_GET: &str = "prompts/get";
+/// `completion/complete`: argument completion (decided per call).
 pub const METHOD_COMPLETION_COMPLETE: &str = "completion/complete";
 
 /// Methods forwarded without a per-call authorization decision. They are still authenticated

@@ -6,7 +6,7 @@
 //!   `...:token-type:id-jag` (or `grant_type` is `...:grant-type:jwt-bearer`): the subject token
 //!   is a user credential from a trusted IdP, and the agent authenticates with its client
 //!   credentials or an `actor_token`, under the same `[token] actor_auth` modes as an
-//!   exchange. Handled by [`crate::idp::intake`].
+//!   exchange. Handled by `crate::idp::intake`.
 //! - **Hop n to n+1.** `subject_token_type` is `...:token-type:jwt` and the subject token is an
 //!   attenuo token. Described below.
 //!
@@ -19,7 +19,7 @@
 //! | `subject_token_type` | `urn:ietf:params:oauth:token-type:jwt` |
 //! | `actor` | the sub-agent's id; the request must authenticate as this agent (below) |
 //! | `client_id`, `client_secret` | the actor's `[[agents]]` credentials; HTTP Basic also accepted |
-//! | `actor_token`, `actor_token_type` | RFC 8693 §2.1: a workload-identity JWT for the actor, type `urn:ietf:params:oauth:token-type:jwt` ([`crate::actor`]) |
+//! | `actor_token`, `actor_token_type` | RFC 8693 §2.1: a workload-identity JWT for the actor, type `urn:ietf:params:oauth:token-type:jwt` (`crate::actor`) |
 //! | `authorization_details` | RFC 9396 list with one `{"type":"attenuo_capabilities","capabilities":[...]}`; a JSON string in form encoding |
 //! | `scope` | form only, alternative to `authorization_details`: space-separated `server:tool` |
 //! | `requested_ttl_seconds` | optional |
@@ -32,7 +32,7 @@
 //! - client credentials from `[[agents]]` (HTTP Basic, or `client_id` / `client_secret`); the
 //!   client id must equal `actor`. Failures are 401 `invalid_client` (sub-codes as for intake).
 //! - an `actor_token` from an `[[actor_trust]]` issuer (a SPIFFE JWT-SVID, or any JWT with a
-//!   JWKS), verified by [`crate::actor::ActorTrustRegistry::verify`]; the agent its `sub` maps
+//!   JWKS), verified by `crate::actor::ActorTrustRegistry::verify`; the agent its `sub` maps
 //!   to must equal `actor`. Failures are 400 `invalid_request` with `actor_token_*` sub-codes.
 //!
 //! When both are sent, both are checked. A method `actor_auth` does not accept is refused
@@ -49,7 +49,7 @@
 //! Besides what `ExchangeRequest::execute` checks (signature, chain validity, attenuation,
 //! depth), the parent's leases must all be live: a revoked parent cannot delegate. A parent
 //! token delegates to a given actor once; a second exchange of the same parent for the same
-//! actor is 400 `invalid_grant` / `replayed` until the parent expires ([`crate::replay`]). The new lease
+//! actor is 400 `invalid_grant` / `replayed` until the parent expires (`crate::replay`). The new lease
 //! is registered as a child of the parent token's last lease, so revoking the parent cascades.
 //!
 //! **Sender constraint (SR-24).** A `DPoP` header binds the child to the proof's key; a bound

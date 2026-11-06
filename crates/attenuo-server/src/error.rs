@@ -1,6 +1,6 @@
 //! JSON error responses: `{"error": "<code>", "detail": "<human-readable text>"}`, plus a
 //! stable machine-readable sub-code in `error_description` where one is defined (IdP intake at
-//! `POST /token`, see [`crate::idp::IntakeError`]).
+//! `POST /token`, see `crate::idp::IntakeError`).
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};

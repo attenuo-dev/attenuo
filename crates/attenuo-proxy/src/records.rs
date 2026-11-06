@@ -85,10 +85,16 @@ impl Slot {
 pub enum Admission {
     /// Write the record. `suppressed_before` occurrences of the same chain, tool and reason
     /// were not recorded in the window that just closed.
-    Record { suppressed_before: u64 },
+    Record {
+        /// Occurrences left unrecorded in the window that just closed.
+        suppressed_before: u64,
+    },
     /// Do not write it: the window's first record (`None` while it is still being written)
     /// stands for this occurrence too.
-    Suppress { first: Option<Uuid> },
+    Suppress {
+        /// The id of the window's first record, once it is written.
+        first: Option<Uuid>,
+    },
 }
 
 impl RecordWindow {

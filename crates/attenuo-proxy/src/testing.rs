@@ -30,11 +30,13 @@ use crate::jsonrpc::{error_response, id_of, is_request, method_of, CODE_INVALID_
 
 /// A router served on an ephemeral port. The server task is aborted on drop.
 pub struct Spawned {
+    /// The address the router listens on.
     pub addr: SocketAddr,
     handle: tokio::task::JoinHandle<()>,
 }
 
 impl Spawned {
+    /// `http://{addr}{path}`.
     pub fn url(&self, path: &str) -> String {
         format!("http://{}{}", self.addr, path)
     }
@@ -63,8 +65,11 @@ pub async fn spawn_router(router: Router) -> anyhow::Result<Spawned> {
 /// A `tools/call` the fake upstream received.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedCall {
+    /// The tool name.
     pub name: String,
+    /// The call's `arguments` member.
     pub arguments: Value,
+    /// The `Mcp-Session-Id` header the call came with, if any.
     pub session_id: Option<String>,
     /// The whole `params` member as received (with `_meta`, if any).
     pub params: Value,
@@ -270,11 +275,14 @@ impl FakeMcpServer {
         self
     }
 
+    /// Assign this `Mcp-Session-Id` (default `fake-session-1`; with fresh sessions, the prefix
+    /// of each new id).
     pub fn with_session_id(mut self, id: impl Into<String>) -> Self {
         self.session_id = id.into();
         self
     }
 
+    /// The `Mcp-Session-Id` this server assigns.
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -290,6 +298,7 @@ impl FakeMcpServer {
         self.methods.lock().expect("methods mutex").clone()
     }
 
+    /// The fake server's router, with its endpoint at `/mcp`.
     pub fn router(&self) -> Router {
         let routes = post(fake_handle).delete(fake_delete);
         let routes = if self.listen {
@@ -300,6 +309,7 @@ impl FakeMcpServer {
         Router::new().route("/mcp", routes).with_state(self.clone())
     }
 
+    /// Serve [`router`](Self::router) on an ephemeral port.
     pub async fn spawn(&self) -> anyhow::Result<Spawned> {
         spawn_router(self.router()).await
     }
@@ -420,7 +430,7 @@ pub fn stream_end_lookalike() -> Value {
 }
 
 /// The proxy's stream-end check over a chunk of whole SSE events, as the unfiltered SSE path
-/// runs it ([`crate::guard::disown_chunk`]); for the cost measurement in
+/// runs it (`crate::guard::disown_chunk`); for the cost measurement in
 /// `tests/listen_stream_cost.rs`.
 pub fn disown_chunk(chunk: Bytes) -> Bytes {
     crate::guard::disown_chunk(chunk)
@@ -617,20 +627,28 @@ pub type RecordedSession = (attenuo_core::LeaseId, String, String);
 /// A result reported through [`Authorizer::record_result`] to a [`StaticAuthorizer`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordedResult {
+    /// The call the result answers.
     pub call: ToolCall,
+    /// The id of the call's decision record.
     pub decision_id: uuid::Uuid,
+    /// The upstream's `result` member.
     pub result: Value,
+    /// Whether the result had `isError: true`.
     pub is_error: bool,
 }
 
 impl StaticAuthorizer {
+    /// The reason of an allowed call.
     pub const REASON_ALLOW: &'static str = "capability_allow";
+    /// The reason of a call the chain's capabilities do not permit.
     pub const REASON_DENY: &'static str = "capability_denied";
 
+    /// An authorizer that knows no bearer.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Resolve `bearer` to `chain`.
     pub fn with_chain(mut self, bearer: impl Into<String>, chain: DelegationChain) -> Self {
         self.chains.insert(bearer.into(), chain);
         self
@@ -647,6 +665,7 @@ impl StaticAuthorizer {
         self
     }
 
+    /// Resolve `bearer` to `chain`, in place.
     pub fn insert(&mut self, bearer: impl Into<String>, chain: DelegationChain) {
         self.chains.insert(bearer.into(), chain);
     }
@@ -986,6 +1005,7 @@ impl Authorizer for StaticAuthorizer {
 // Chain builders
 // ---------------------------------------------------------------------------------------------
 
+/// A user `subject` at `https://idp.test`, authenticated now, with no attributes.
 pub fn test_user(subject: &str) -> OriginatingUser {
     OriginatingUser {
         subject: subject.into(),

@@ -27,6 +27,7 @@ pub struct ListedTools {
 }
 
 impl ListedTools {
+    /// An empty record: no upstream has listed anything yet.
     pub fn new() -> Self {
         Self::default()
     }

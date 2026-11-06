@@ -62,7 +62,7 @@
 //! Entries sit in time buckets, so expired ones are dropped a bucket at a time. When the cache
 //! holds `[token] dpop_replay_capacity` live entries, new proofs are refused with 503
 //! `temporarily_unavailable` (`dpop_replay_cache_full`): fail closed, as the credential replay
-//! cache does ([`crate::replay`]).
+//! cache does (`crate::replay`).
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;

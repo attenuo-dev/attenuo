@@ -120,7 +120,7 @@ impl AppState {
             .with_nonce(config.token.dpop_nonce, issuer.private_key_pem().as_bytes()),
         );
         let verifier = issuer.verifier();
-        let jwks = crate::jwks::jwks_from_keys(&issuer.trusted_public_keys())?;
+        let jwks = crate::issuer_keys::jwks_from_keys(&issuer.trusted_public_keys())?;
 
         let (engine, policies_sha256) = build_engine(config)?;
         if config
