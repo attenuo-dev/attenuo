@@ -122,7 +122,7 @@ attenuo is pre-alpha and has not been used in production. Release 0.1.0 is prepa
 | `attenuo-audit` | Append-only, hash-chained audit log |
 | `attenuo-proxy` | Enforcement in front of upstream services |
 | `attenuo-server` | The standalone server binary |
-| `attenuo-cli` | The `attenuo` command line for a running server |
+| `attenuo-cli` | The `attenuo` command line: a client for a running server, plus offline `audit verify --file` and `policy test` / `policy lint` |
 | `attenuo-bench` | End-to-end latency and throughput benchmark (`scripts/bench-e2e.sh`, results in `docs/design/bench/`) |
 
 ## Building
