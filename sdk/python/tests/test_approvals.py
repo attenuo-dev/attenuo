@@ -238,6 +238,19 @@ async def test_call_tool_with_approval_gives_up_after_one_retry(make: Any) -> No
     assert len(seen) == 1
 
 
+async def test_too_many_pending_approvals_is_an_api_error(make: Any) -> None:
+    """The server's 429 for a run that already holds as many pending approvals as it keeps."""
+    body = {
+        "error": "too_many_pending_approvals",
+        "detail": "the run already has 32 pending approvals",
+    }
+    client, _ = make(lambda r: httpx.Response(429, json=body))
+    with pytest.raises(ApiError) as e:
+        await call(client, "get_approval", APPROVAL_ID, "TOK")
+    assert (e.value.status, e.value.error) == (429, "too_many_pending_approvals")
+    assert "32 pending approvals" in e.value.detail
+
+
 # --- signed approval tokens --------------------------------------------------------------------
 
 JKT = "0ZcOCORZNYy-DWpqq30jZyJGHTN0d2HglBV3uiguA4I"
