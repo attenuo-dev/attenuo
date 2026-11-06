@@ -127,10 +127,16 @@ fn object_from<'a>(
 /// A JSON number as the argument of Cedar's `decimal()`, for an argument declared
 /// [`ArgType::Decimal`]: its shortest decimal form, with `.0` added to a whole number, so `12.5`
 /// is `"12.5"` and `100` is `"100.0"`. `None` when it has more than 4 fractional digits or a
-/// magnitude above [`DECIMAL_MAX`] (Cedar's range); nothing is rounded. A JSON number is a
-/// double here (serde_json's `float_roundtrip` is on), and Rust's `Display` for `f64` is the
+/// magnitude above [`DECIMAL_MAX`] (Cedar's range); nothing is rounded here. A JSON number is
+/// a double here (serde_json's `float_roundtrip` is on), and Rust's `Display` for `f64` is the
 /// shortest form that reads back as the same double, never in exponent notation, so the digits
-/// are the ones the caller wrote, trailing zeros aside.
+/// are the ones the caller wrote, trailing zeros aside, as long as a double can hold them
+/// (15 significant digits always fit). A number written with more digits than that was
+/// already rounded to the nearest double when the JSON was parsed, and that double's shortest
+/// form can have fewer fractional digits than were sent: `0.10000000000000001` is the double
+/// `0.1`, `1000000000000.00001` the double `1000000000000.0`, and both are accepted. Cedar and
+/// the upstream still see the same number, because the proxy forwards the arguments
+/// re-encoded from the same parsed value (SR-95).
 pub(crate) fn decimal_text(n: &serde_json::Number) -> Option<String> {
     let text = if let Some(i) = n.as_i64() {
         // Integers above 2^53 have no exact double; read them as integers.
@@ -1184,6 +1190,33 @@ mod tests {
                 json!({ "__extn": { "fn": "decimal", "arg": arg } }),
                 "{f}"
             );
+        }
+    }
+
+    /// SR-95: a number written with more digits than a double holds is rounded by the JSON
+    /// parse, before `decimal_text` sees it, so a sixth fractional digit can vanish rather than
+    /// be refused. What Cedar compares is then the value the upstream is sent: the shortest
+    /// form of the parsed double, which is also how the arguments are re-encoded.
+    #[test]
+    fn digits_beyond_a_double_are_rounded_by_the_parse_alike_for_cedar_and_upstream_sr95() {
+        for (text, cedar) in [
+            ("0.10000000000000001", "0.1"),
+            ("1000000000000.00001", "1000000000000.0"),
+            ("12345678901.234500001", "12345678901.2345"),
+        ] {
+            let v: Value = serde_json::from_str(text).unwrap();
+            let Value::Number(n) = &v else { unreachable!() };
+            assert_eq!(decimal_text(n).as_deref(), Some(cedar), "{text}");
+            let forwarded = serde_json::to_string(&v).unwrap();
+            assert_eq!(
+                forwarded, cedar,
+                "{text}: the upstream is sent what Cedar compares"
+            );
+        }
+        // Within what a double holds, a fifth fractional digit is still refused.
+        for text in ["99999999999.99999", "12345678901.23456", "0.00001"] {
+            let n: serde_json::Number = serde_json::from_str(text).unwrap();
+            assert_eq!(decimal_text(&n), None, "{text}");
         }
     }
 

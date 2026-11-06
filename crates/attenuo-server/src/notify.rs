@@ -377,6 +377,22 @@ impl WebhookNotify {
     }
 }
 
+/// Whether notices to `url` would travel unencrypted to another host: an `http` URL (in any
+/// letter case, as the URL parser reads the scheme) whose host is not `localhost` or a
+/// loopback address (SR-96).
+fn plain_http_off_loopback(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let host = url.host_str().unwrap_or_default();
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || bare
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|a| a.is_loopback());
+    url.scheme() == "http" && !loopback
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -575,9 +591,7 @@ impl ApprovalNotifier {
             Duration::from_secs(cfg.timeout_seconds),
         )?;
         let host = deliver.host.clone();
-        if cfg.url.starts_with("http://")
-            && !matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]")
-        {
+        if plain_http_off_loopback(&cfg.url) {
             tracing::warn!(
                 host = %host,
                 "[approvals.notify] url is plain http to a host other than loopback: \
@@ -986,6 +1000,31 @@ mod tests {
         c.headers.clear();
         c.max_attempts = 0;
         assert!(c.validate().is_err());
+    }
+
+    /// SR-96: the plain-http warning reads the scheme as the URL parser does, so an upper-case
+    /// `HTTP://` to another host is warned about too, and every loopback address is exempt.
+    #[test]
+    fn plain_http_to_another_host_is_detected_in_any_case_sr96() {
+        for url in [
+            "http://hooks.example/a",
+            "HTTP://hooks.example/a",
+            "Http://10.0.0.5:8080/",
+            "http://[2001:db8::1]/",
+        ] {
+            assert!(plain_http_off_loopback(url), "{url}");
+        }
+        for url in [
+            "https://hooks.example/a",
+            "HTTPS://hooks.example/a",
+            "http://localhost:9000/",
+            "http://LOCALHOST/",
+            "http://127.0.0.1/",
+            "http://127.0.0.2:9/",
+            "http://[::1]:9/",
+        ] {
+            assert!(!plain_http_off_loopback(url), "{url}");
+        }
     }
 
     #[test]
