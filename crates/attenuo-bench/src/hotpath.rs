@@ -224,6 +224,7 @@ impl HotConfig {
     }
 }
 
+/// Options of `hot-path`.
 #[derive(Debug, Clone, Args)]
 pub struct HotPathArgs {
     /// Directory holding `attenuo-server` and `fake_mcp` (default: this executable's directory).
