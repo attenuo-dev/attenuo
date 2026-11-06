@@ -134,7 +134,8 @@ struct AppState {
     /// one kind cannot fill the other's.
     lease_refusal_records: RecordWindow,
     /// The time of the request checks: token and lease expiry, session TTL, record windows
-    /// ([`router_with_clock`]). Stream re-checks and awaited results read the system clock.
+    /// ([`router_with_clock`]), and of each stream re-check ([`StreamGuard::with_clock`]).
+    /// Awaited results read the system clock.
     clock: Arc<dyn Clock>,
 }
 
@@ -154,6 +155,7 @@ impl AppState {
             who.chain.clone(),
             self.stream_recheck,
         )
+        .with_clock(self.clock.clone())
         .recording(server, session_id, who.dpop_bound)
     }
 }
@@ -164,7 +166,7 @@ pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
 }
 
 /// [`router`], reading the time of its request checks (token and lease expiry, the session
-/// TTL, the record windows) from `clock`. Tests pass a [`attenuo_core::ManualClock`] to step
+/// TTL, the record windows, the stream re-checks) from `clock`. Tests pass a [`attenuo_core::ManualClock`] to step
 /// past a TTL instead of sleeping; [`router`] passes the system clock.
 pub fn router_with_clock(
     config: ProxyConfig,

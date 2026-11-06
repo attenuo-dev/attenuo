@@ -12,11 +12,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use attenuo_core::{AgentId, Capability, CapabilitySet, Decision, DelegationChain, LeaseId};
+use attenuo_core::{
+    AgentId, Capability, CapabilitySet, Decision, DelegationChain, LeaseId, ManualClock,
+};
 use attenuo_proxy::guard::{StreamEndCause, STREAM_END_TOOL};
 use attenuo_proxy::session::session_tag;
 use attenuo_proxy::testing::{spawn_router, test_chain, test_user, Spawned, StaticAuthorizer};
-use attenuo_proxy::{router, ProxyConfig, UpstreamConfig};
+use attenuo_proxy::{router_with_clock, ProxyConfig, UpstreamConfig};
 use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -30,6 +32,46 @@ const SERVER: &str = "github";
 /// The stream re-check interval used in these tests (SR-28); production defaults to 2 s.
 const RECHECK: Duration = Duration::from_millis(100);
 
+/// Polls `done` every 10 ms until it is true; panics, naming `what`, after 5 s.
+async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !done() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// How many of an upstream's response streams are still open. The proxy's guarded body owns
+/// the upstream response, so an upstream stream is dropped only after the guard wrapping it
+/// is: once none is open, no guard of those streams is left to re-check, record or count
+/// anything, and a check of "nothing more happened" is exact instead of a wait.
+#[derive(Clone, Default)]
+struct Live(Arc<AtomicUsize>);
+
+/// Held by one open upstream stream; dropping it closes the stream in [`Live`].
+struct Open(Arc<AtomicUsize>);
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Live {
+    fn open(&self) -> Open {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Open(self.0.clone())
+    }
+
+    /// Wait until every stream this upstream opened is closed.
+    async fn all_closed(&self) {
+        eventually("upstream streams still open", || {
+            self.0.load(Ordering::SeqCst) == 0
+        })
+        .await;
+    }
+}
+
 /// An upstream that hands out a fresh session id to every POST without one, records every
 /// `Mcp-Session-Id` value it receives (all of them, per request), and answers `GET` with an
 /// SSE stream that emits one event every 50 ms for as long as the connection stays open.
@@ -37,6 +79,7 @@ const RECHECK: Duration = Duration::from_millis(100);
 struct SessionUpstream {
     next: Arc<AtomicUsize>,
     seen: Arc<Mutex<Vec<Vec<Vec<u8>>>>>,
+    streams: Live,
 }
 
 impl SessionUpstream {
@@ -97,15 +140,17 @@ impl SessionUpstream {
                 let me = b.clone();
                 async move {
                     me.record(&headers);
-                    let events = futures_util::stream::unfold(0u64, |i| async move {
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        let event = format!(
-                            "event: message\ndata: {}\n\n",
-                            json!({"jsonrpc": "2.0", "method": "notifications/message",
-                                   "params": {"level": "info", "data": i}})
-                        );
-                        Some((Ok::<_, std::io::Error>(event), i + 1))
-                    });
+                    let open = me.streams.open();
+                    let events =
+                        futures_util::stream::unfold((0u64, open), |(i, open)| async move {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            let event = format!(
+                                "event: message\ndata: {}\n\n",
+                                json!({"jsonrpc": "2.0", "method": "notifications/message",
+                                       "params": {"level": "info", "data": i}})
+                            );
+                            Some((Ok::<_, std::io::Error>(event), (i + 1, open)))
+                        });
                     Response::builder()
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -118,12 +163,24 @@ impl SessionUpstream {
 }
 
 async fn proxy_with(upstream: &Spawned, authorizer: Arc<StaticAuthorizer>) -> Spawned {
+    proxy_with_clock(upstream, authorizer, ManualClock::new()).await
+}
+
+/// [`proxy_with`], on `clock`: [`ManualClock::advance`] steps the proxy, and the re-checks of
+/// its streams, past a token's expiry.
+async fn proxy_with_clock(
+    upstream: &Spawned,
+    authorizer: Arc<StaticAuthorizer>,
+    clock: Arc<ManualClock>,
+) -> Spawned {
     let config = ProxyConfig::new(
         "127.0.0.1:0".parse().unwrap(),
         vec![UpstreamConfig::new(SERVER, upstream.url("/mcp"))],
     )
     .with_stream_recheck(RECHECK);
-    spawn_router(router(config, authorizer)).await.unwrap()
+    spawn_router(router_with_clock(config, authorizer, clock))
+        .await
+        .unwrap()
 }
 
 fn ping() -> String {
@@ -460,19 +517,20 @@ async fn a_revoked_listen_stream_ends_promptly_with_a_reason() {
     assert_eq!(last["error"]["data"]["reason"], "lease_revoked");
     assert_stream_end_record(&authorizer, &last, "lease_revoked", Some(&sid));
     assert_eq!(authorizer.decisions().len(), 1);
+    upstream.streams.all_closed().await;
     assert_stream_ends(&authorizer, &[StreamEndCause::LeaseRevoked]).await;
 }
 
 /// Wait until `authorizer` has seen `expected.len()` listen-stream ends, then check they are
-/// exactly `expected`, and still are a few re-check intervals later (each stream is counted
-/// once, never again).
+/// exactly `expected` (each stream is counted once, never again). The caller first makes sure
+/// no guard of its streams is left to count anything: [`Live::all_closed`] for an upstream
+/// that tracks its streams; for a single stream whose upstream ended it, the count itself
+/// (taken when the guard is dropped).
 async fn assert_stream_ends(authorizer: &StaticAuthorizer, expected: &[StreamEndCause]) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while authorizer.stream_ends().len() < expected.len() && tokio::time::Instant::now() < deadline
-    {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    tokio::time::sleep(RECHECK * 3).await;
+    eventually("listen-stream ends", || {
+        authorizer.stream_ends().len() >= expected.len()
+    })
+    .await;
     assert_eq!(authorizer.stream_ends(), expected);
 }
 
@@ -489,9 +547,9 @@ async fn a_dropped_or_finished_listen_stream_leaves_no_record() {
     let proxy = proxy_with(&up, authorizer.clone()).await;
     let stream = open_listen_stream(&proxy, "alice").await;
     drop(stream);
-    tokio::time::sleep(RECHECK * 4).await;
+    // The proxy has dropped the stream's guard: nothing is left to see the revocation.
+    upstream.streams.all_closed().await;
     authorizer.revoke("alice");
-    tokio::time::sleep(RECHECK * 4).await;
     assert!(authorizer.decisions().is_empty(), "client drop");
     // Counted, as a client disconnect, once.
     assert_stream_ends(&authorizer, &[StreamEndCause::ClientDisconnect]).await;
@@ -530,10 +588,12 @@ async fn a_dropped_or_finished_listen_stream_leaves_no_record() {
     let (text, _) = drain(resp.bytes_stream(), Duration::from_secs(5)).await;
     assert!(text.contains("notifications/message"), "{text}");
     assert!(!text.contains("-32001"), "{text}");
-    authorizer.revoke("alice");
-    tokio::time::sleep(RECHECK * 3).await;
-    assert!(authorizer.decisions().is_empty(), "upstream end");
+    // Counted when the proxy drops the stream's guard: once it is, nothing is left to see
+    // the revocation.
     assert_stream_ends(&authorizer, &[StreamEndCause::UpstreamEof]).await;
+    authorizer.revoke("alice");
+    assert!(authorizer.decisions().is_empty(), "upstream end");
+    assert_eq!(authorizer.stream_ends(), [StreamEndCause::UpstreamEof]);
 }
 
 /// A listen stream the upstream breaks (here: the upstream's body fails after one event) is
@@ -610,6 +670,7 @@ async fn a_listen_stream_whose_lease_expired_ends_and_is_counted() {
     let last = last_event(&text);
     assert_eq!(last["error"]["data"]["reason"], "lease_expired");
     assert_stream_end_record(&authorizer, &last, "lease_expired", Some(&sid));
+    upstream.streams.all_closed().await;
     assert_stream_ends(&authorizer, &[StreamEndCause::LeaseExpired]).await;
 }
 
@@ -684,6 +745,7 @@ async fn listen_streams_of_one_chain_cut_together_leave_one_record() {
         authorizer.suppressed_records(),
         vec![(STREAM_END_TOOL.to_owned(), StreamEndCause::LeaseRevoked); 2]
     );
+    upstream.streams.all_closed().await;
     assert_stream_ends(&authorizer, &[StreamEndCause::LeaseRevoked; 4]).await;
 
     // Reopening is refused each time; the first refusal is recorded, the second counted, and
@@ -713,29 +775,41 @@ async fn listen_streams_of_one_chain_cut_together_leave_one_record() {
     );
 }
 
+/// The lifetime of the token [`short_lived_chain`] issues.
+const SHORT_TTL: Duration = Duration::from_secs(60);
+
+/// A [`ManualClock`], and an authorizer knowing `alice` by a chain whose token expires
+/// [`SHORT_TTL`] from now on that clock.
+fn short_lived_chain() -> (Arc<ManualClock>, Arc<StaticAuthorizer>) {
+    let clock = ManualClock::new();
+    let chain = DelegationChain::root(
+        test_user("user:alice"),
+        AgentId::new("agent:a"),
+        CapabilitySet::from_iter([Capability::new(SERVER, "read_*")]),
+        attenuo_core::Clock::now_utc(&*clock),
+        time::Duration::try_from(SHORT_TTL).unwrap(),
+        LeaseId::new("lease-short"),
+    )
+    .unwrap();
+    let authorizer = Arc::new(StaticAuthorizer::new().with_chain("alice", chain));
+    (clock, authorizer)
+}
+
 /// SR-28: a listen stream does not outlive the token that opened it.
 #[tokio::test]
 async fn an_expired_tokens_listen_stream_ends() {
     let upstream = SessionUpstream::default();
     let up = spawn_router(upstream.router()).await.unwrap();
-    let ttl = Duration::from_millis(800);
-    let chain = DelegationChain::root(
-        test_user("user:alice"),
-        AgentId::new("agent:a"),
-        CapabilitySet::from_iter([Capability::new(SERVER, "read_*")]),
-        time::OffsetDateTime::now_utc(),
-        time::Duration::try_from(ttl).unwrap(),
-        LeaseId::new("lease-short"),
-    )
-    .unwrap();
-    let authorizer = Arc::new(StaticAuthorizer::new().with_chain("alice", chain));
-    let proxy = proxy_with(&up, authorizer.clone()).await;
+    let (clock, authorizer) = short_lived_chain();
+    let proxy = proxy_with_clock(&up, authorizer.clone(), clock.clone()).await;
     let (sid, stream) = open_listen_stream_in(&proxy, "alice").await;
 
-    let (text, _) = drain(stream, ttl + Duration::from_secs(2)).await;
+    clock.advance(SHORT_TTL);
+    let (text, _) = drain(stream, Duration::from_secs(2)).await;
     let last = last_event(&text);
     assert_eq!(last["error"]["data"]["reason"], "token_expired");
     assert_stream_end_record(&authorizer, &last, "token_expired", Some(&sid));
+    upstream.streams.all_closed().await;
     assert_stream_ends(&authorizer, &[StreamEndCause::TokenExpired]).await;
 }
 
@@ -748,24 +822,15 @@ async fn an_expired_tokens_listen_stream_ends() {
 async fn listen_streams_open_at_token_expiry_leave_one_record() {
     let upstream = SessionUpstream::default();
     let up = spawn_router(upstream.router()).await.unwrap();
-    let ttl = Duration::from_millis(1200);
-    let chain = DelegationChain::root(
-        test_user("user:alice"),
-        AgentId::new("agent:a"),
-        CapabilitySet::from_iter([Capability::new(SERVER, "read_*")]),
-        time::OffsetDateTime::now_utc(),
-        time::Duration::try_from(ttl).unwrap(),
-        LeaseId::new("lease-short"),
-    )
-    .unwrap();
-    let authorizer = Arc::new(StaticAuthorizer::new().with_chain("alice", chain));
-    let proxy = proxy_with(&up, authorizer.clone()).await;
+    let (clock, authorizer) = short_lived_chain();
+    let proxy = proxy_with_clock(&up, authorizer.clone(), clock.clone()).await;
     let first = open_listen_stream(&proxy, "alice").await;
     let second = open_listen_stream(&proxy, "alice").await;
 
+    clock.advance(SHORT_TTL);
     let (a, b) = tokio::join!(
-        drain(first, ttl + Duration::from_secs(2)),
-        drain(second, ttl + Duration::from_secs(2))
+        drain(first, Duration::from_secs(2)),
+        drain(second, Duration::from_secs(2))
     );
     let (a, b) = (last_event(&a.0), last_event(&b.0));
     for last in [&a, &b] {
@@ -782,6 +847,7 @@ async fn listen_streams_open_at_token_expiry_leave_one_record() {
         authorizer.suppressed_records(),
         vec![(STREAM_END_TOOL.to_owned(), StreamEndCause::TokenExpired)]
     );
+    upstream.streams.all_closed().await;
     assert_stream_ends(&authorizer, &[StreamEndCause::TokenExpired; 2]).await;
 
     for _ in 0..3 {
@@ -830,17 +896,20 @@ async fn an_untouched_listen_stream_keeps_flowing() {
 /// SR-28: a `tools/call` answered over a long-lived SSE stream is re-checked too.
 #[tokio::test]
 async fn a_revoked_sse_tool_call_response_ends() {
+    let streams = Live::default();
+    let live = streams.clone();
     let up = spawn_router(Router::new().route(
         "/mcp",
-        post(|| async {
-            let events = futures_util::stream::unfold(0u64, |i| async move {
+        post(move || async move {
+            let open = live.open();
+            let events = futures_util::stream::unfold((0u64, open), |(i, open)| async move {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 let event = format!(
                     "event: message\ndata: {}\n\n",
                     json!({"jsonrpc": "2.0", "method": "notifications/progress",
                            "params": {"progressToken": "t", "progress": i}})
                 );
-                Some((Ok::<_, std::io::Error>(event), i + 1))
+                Some((Ok::<_, std::io::Error>(event), (i + 1, open)))
             });
             Response::builder()
                 .status(StatusCode::OK)
@@ -886,7 +955,8 @@ async fn a_revoked_sse_tool_call_response_ends() {
     // The call's own decision, then the end of its answer stream (no session here).
     assert_eq!(authorizer.decisions()[0].tool, "read_slowly");
     assert_stream_end_record(&authorizer, &last, "lease_revoked", None);
-    // Not a listen stream: not counted in `proxy_streams_ended_total`.
-    tokio::time::sleep(RECHECK * 3).await;
+    // Not a listen stream: not counted in `proxy_streams_ended_total`, also once its guard
+    // is gone.
+    streams.all_closed().await;
     assert!(authorizer.stream_ends().is_empty());
 }

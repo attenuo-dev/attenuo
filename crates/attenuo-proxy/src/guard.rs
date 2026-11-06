@@ -41,8 +41,9 @@
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use attenuo_core::clock::{system_clock, Clock};
 use attenuo_core::{chain_id_of, DelegationChain, ToolCall};
 use axum::body::Bytes;
 use futures_util::{Stream, StreamExt};
@@ -172,6 +173,10 @@ pub struct StreamGuard {
     /// Set for a `GET` listen stream ([`StreamGuard::listen`]): its end is counted, and its
     /// `stream.end` record bounded by this window.
     pub listen: Option<Arc<RecordWindow>>,
+    /// The time each re-check judges token expiry at, and the record window reads: the
+    /// system clock unless [`StreamGuard::with_clock`] set another. The ticks between
+    /// re-checks are tokio's, whatever the clock.
+    pub clock: Arc<dyn Clock>,
 }
 
 /// Where a guarded stream goes, for the audit record written when the proxy ends it.
@@ -229,7 +234,15 @@ impl StreamGuard {
             interval: interval.max(Duration::from_millis(1)),
             record: None,
             listen: None,
+            clock: system_clock(),
         }
+    }
+
+    /// Read the time of each re-check from `clock` (the proxy passes its own, so a test's
+    /// [`attenuo_core::ManualClock`] steps a stream past its token's expiry).
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Mark the stream as a `GET` listen stream: count its end through
@@ -314,7 +327,7 @@ impl StreamGuard {
             .as_ref()
             .map(|records| (records, self.chain.digest()));
         if let Some((records, key)) = &window {
-            match records.admit(key, STREAM_END_TOOL, reason, Instant::now()) {
+            match records.admit(key, STREAM_END_TOOL, reason, self.clock.now()) {
                 Admission::Suppress { first } => {
                     self.authorizer
                         .observe_record_suppressed(STREAM_END_TOOL, cause);
@@ -615,7 +628,7 @@ where
                 // A ready tick wins over a ready chunk, so a busy stream is checked on time too.
                 biased;
                 _ = st.ticker.tick() => {
-                    let now = OffsetDateTime::now_utc();
+                    let now = st.guard.clock.now_utc();
                     let Err(failed) = st.guard.check_detail(now).await else {
                         continue;
                     };
@@ -988,7 +1001,7 @@ mod tests {
                 .recording("s", Some("sess"), false)
                 .listen(records.clone())
         };
-        let started = Instant::now();
+        let started = std::time::Instant::now();
 
         // First end: recorded, and the final event names the record.
         let first = final_event(guard(&chain_a)).await;
