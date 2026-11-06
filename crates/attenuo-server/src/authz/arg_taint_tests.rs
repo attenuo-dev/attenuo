@@ -5,7 +5,7 @@
 use super::*;
 use attenuo_audit::{AuditSink, LeaseStore};
 use attenuo_audit::{MemoryAudit, MemoryLeaseStore, SqliteLeaseStore};
-use attenuo_core::fingerprint::fingerprints;
+use attenuo_core::fingerprint::{fingerprints, pinned_arguments};
 use attenuo_core::{AgentId, ArgConstraint, Capability, CapabilitySet, OriginatingUser};
 use attenuo_core::{
     DelegationChain, LeaseId, OutputLabel, RecordKind, ToolCall, UntrustedArg, UntrustedKind,
@@ -360,4 +360,123 @@ fn an_unreadable_index_makes_unpinned_arguments_untrusted() {
         )
         .unwrap_err();
     assert_eq!(err, REASON_LABEL_ERROR);
+}
+
+/// SR-91: a call whose arguments carry more than `MAX_ARG_PROBES` fingerprints in all is not
+/// looked up at all. It fails closed, every argument `unreadable`, and stays cheap however
+/// many results of the run hold the value its arguments share.
+#[test]
+fn too_many_argument_fingerprints_fail_closed_without_a_lookup_sr91() {
+    let now = OffsetDateTime::now_utc();
+    let leases = Arc::new(SqliteLeaseStore::open_in_memory().unwrap());
+    let p = pipeline(leases.clone(), Arc::new(MemoryAudit::new()));
+    let c = chain(leases.as_ref(), now);
+    for _ in 0..50 {
+        read(&p, &c, "read", "xxxxxxxx", now);
+    }
+    let n = 100_000;
+    let args: serde_json::Map<String, Value> = (0..n)
+        .map(|i| (format!("k{i:06}"), json!("xxxxxxxx")))
+        .collect();
+    assert!(n > MAX_ARG_PROBES);
+    // A tool the token does not cover and the catalog does not know: matched anyway.
+    let call = ToolCall::new("mail", "no_such_tool", Value::Object(args));
+
+    let started = std::time::Instant::now();
+    let d = p.decide(&c, &call, now);
+    let took = started.elapsed();
+    assert!(!d.is_allow(), "{:?}", d.reason);
+    // About 1.4 s in a debug build, nearly all of it fingerprinting the 100,000 values (which
+    // the body size bounds); without the bounds the lookup alone added seconds and gigabytes.
+    // Loose enough not to flake under a parallel test run.
+    assert!(
+        took < std::time::Duration::from_secs(5),
+        "one call took {took:?}"
+    );
+    assert_eq!(d.untrusted_args.len(), MAX_UNTRUSTED_ARG_ENTRIES);
+    assert!(d
+        .untrusted_args
+        .iter()
+        .all(|u| u.kind == UntrustedKind::Unreadable && u.seq.is_none()));
+    assert!(
+        d.diagnostics.iter().any(|m| m
+            == "arguments carry more than 8000 fingerprints; unpinned arguments treated as \
+                untrusted"),
+        "{:?}",
+        d.diagnostics
+    );
+
+    // Every argument is named, for Cedar.
+    let run = p.run_labels(&c);
+    let taint = p.arg_taint(&c, &call, &run.session);
+    assert_eq!(taint.context.untrusted.len(), n);
+    assert!(taint.context.contain_untrusted);
+}
+
+/// SR-91: just under the bound the call is looked up as before, and a value that several
+/// arguments share is one probe, reported for each argument that carries it.
+#[test]
+fn a_value_shared_by_arguments_is_one_probe_for_each_owner_sr91() {
+    let now = OffsetDateTime::now_utc();
+    let leases = Arc::new(MemoryLeaseStore::new());
+    let audit = Arc::new(MemoryAudit::new());
+    let p = pipeline(leases.clone(), audit);
+    let c = chain(leases.as_ref(), now);
+    let seq = read(&p, &c, "read", INBOX, now);
+
+    let call = send(json!({
+        "to": "mallory@evil.example",
+        "bcc": "mallory@evil.example",
+        "cc": "bob@acme.example",
+        "subject": "hello there",
+    }));
+    let probes = super::pipeline::arg_probes(&call, &pinned_arguments(&c, &call));
+    let per_value = fingerprints(&json!("mallory@evil.example")).len();
+    let subject = fingerprints(&json!("hello there")).len();
+    assert_eq!(probes.fingerprinted, vec!["bcc", "subject", "to"]);
+    assert_eq!(probes.pairs, 2 * per_value + subject);
+    assert_eq!(probes.probes.len(), per_value + subject, "{probes:?}");
+    for owners in &probes.owners[..per_value] {
+        assert_eq!(owners, &vec!["bcc", "to"]);
+    }
+
+    let d = p.decide(&c, &call, now);
+    assert_eq!(d.reason, attenuo_policy::REASON_APPROVAL_REQUIRED, "{d:?}");
+    assert_eq!(
+        d.untrusted_args,
+        vec![
+            UntrustedArg {
+                arg: "bcc".into(),
+                seq: Some(seq),
+                kind: UntrustedKind::Entity,
+            },
+            UntrustedArg {
+                arg: "to".into(),
+                seq: Some(seq),
+                kind: UntrustedKind::Entity,
+            },
+        ]
+    );
+}
+
+/// SR-91: the bound counts `(argument, fingerprint)` pairs: arguments that carry exactly
+/// `MAX_ARG_PROBES` are looked up, one more is not.
+#[test]
+fn the_argument_bound_is_exact_sr91() {
+    let at_bound = |n: usize| {
+        let args: serde_json::Map<String, Value> = (0..n)
+            .map(|i| (format!("k{i:05}"), json!("xxxxxxxx")))
+            .collect();
+        ToolCall::new("mail", "send", Value::Object(args))
+    };
+    let call = at_bound(MAX_ARG_PROBES);
+    let probes = super::pipeline::arg_probes(&call, &Default::default());
+    assert_eq!(probes.pairs, MAX_ARG_PROBES);
+    assert_eq!(probes.probes.len(), 1);
+    assert_eq!(probes.owners[0].len(), MAX_ARG_PROBES);
+    let call = at_bound(MAX_ARG_PROBES + 1);
+    let probes = super::pipeline::arg_probes(&call, &Default::default());
+    assert_eq!(probes.pairs, MAX_ARG_PROBES + 1);
+    assert!(probes.probes.is_empty() && probes.owners.is_empty());
+    assert_eq!(probes.fingerprinted.len(), MAX_ARG_PROBES + 1);
 }

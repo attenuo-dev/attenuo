@@ -15,7 +15,10 @@
 //!   [`attenuo_core::fingerprint::MAX_FINGERPRINTS_PER_VALUE`] per result. A result whose
 //!   fingerprints would take the run past the cap evicts the oldest results' sets (smallest
 //!   `seq`) first, whole. An evicted result's label stays in the run's taint state, so eviction
-//!   can drop an argument match but never makes a run look untainted.
+//!   can drop an argument match but never makes a run look untainted. A lookup returns at most
+//!   [`MAX_SEQS_PER_PROBE`] results per fingerprint, lowest `seq` first, so one fingerprint
+//!   that many results share cannot make one call's lookup large; the server also bounds the
+//!   fingerprints it looks up per call (`MAX_ARG_PROBES` in `attenuo-server`, SR-91).
 //! - **Ends with the run.** Revoking the run's root lease (the lease whose id is the
 //!   `chain_id`) deletes its index in the same transaction. A run whose lease merely expires
 //!   keeps its index, like its labels and budget counters: an expired lease that was not
@@ -29,6 +32,13 @@ use crate::error::AuditError;
 /// Most fingerprints the span index keeps for one run. At 32 bytes of hash and a `seq` per
 /// entry, about 1 MB of index rows per run in SQLite; ten results at the per-result cap.
 pub const MAX_SPANS_PER_RUN: usize = 20_000;
+
+/// Most results [`LeaseStore::find_spans`](crate::LeaseStore::find_spans) returns for one
+/// probe: the lowest `seq`s. A decision record keeps 64 `untrusted_args` entries and Cedar
+/// only sees which arguments matched, so more results per fingerprint add nothing a decision
+/// uses; without a bound, a short string that hundreds of results hold made one lookup return
+/// millions of hits (SR-91).
+pub const MAX_SEQS_PER_PROBE: usize = 8;
 
 /// One argument fingerprint found in a run's span index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

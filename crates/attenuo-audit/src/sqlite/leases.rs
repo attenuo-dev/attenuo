@@ -33,7 +33,9 @@ use crate::lease::{
     LeasePrune, LeasePruneState, LeaseRow, LeaseSelector, LeaseStatus, LeaseStore, LeaseSubtree,
     PruneOps, RunLabel, RunStatePrune, SelectorRevocation, SessionBinding, SessionPrune,
 };
-use crate::spans::{distinct_hashes, evictions, SpanHit, SpanKey, MAX_SPANS_PER_RUN};
+use crate::spans::{
+    distinct_hashes, evictions, SpanHit, SpanKey, MAX_SEQS_PER_PROBE, MAX_SPANS_PER_RUN,
+};
 
 /// Lease registry in SQLite.
 ///
@@ -1167,11 +1169,13 @@ impl LeaseStore for SqliteLeaseStore {
         let mut hits = Vec::new();
         {
             let mut stmt = tx.prepare_cached(
-                "SELECT seq FROM run_spans WHERE chain_id = ?1 AND hash = ?2 ORDER BY seq",
+                "SELECT seq FROM run_spans WHERE chain_id = ?1 AND hash = ?2 ORDER BY seq LIMIT ?3",
             )?;
+            let limit = i64::try_from(MAX_SEQS_PER_PROBE).unwrap_or(i64::MAX);
             for (probe, f) in probes.iter().enumerate() {
                 let h = self.span_key.hash(f);
-                let seqs = stmt.query_map(params![chain_id.0, &h[..]], |r| r.get::<_, i64>(0))?;
+                let seqs =
+                    stmt.query_map(params![chain_id.0, &h[..], limit], |r| r.get::<_, i64>(0))?;
                 for seq in seqs {
                     let seq = seq?;
                     let seq = u64::try_from(seq)

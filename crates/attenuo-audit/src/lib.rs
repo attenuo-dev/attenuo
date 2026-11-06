@@ -62,7 +62,7 @@ pub use shipped::{
     checkpoint_sha256, cross_check, parse_shipped, CrossCheckReport, ShippedCheckpoint,
     ShippedLine, ShippedMismatch, SHIPPED_FORMAT,
 };
-pub use spans::{SpanHit, MAX_SPANS_PER_RUN};
+pub use spans::{SpanHit, MAX_SEQS_PER_PROBE, MAX_SPANS_PER_RUN};
 pub use sqlite::{
     Durability, NewNotice, OutboxNotice, SqliteAudit, SqliteLeaseStore, WalCheckpoint, WalStats,
     CHECKPOINT_PRESYNC_LEAD, DEFAULT_WAL_CHECKPOINT_INTERVAL, WAL_CHECKPOINT_COMMITS,

@@ -18,7 +18,9 @@ use crate::budget::{
     DISTINCT_VALUE_KIND, USAGE_KINDS,
 };
 use crate::error::AuditError;
-use crate::spans::{distinct_hashes, evictions, SpanHit, SpanKey, MAX_SPANS_PER_RUN};
+use crate::spans::{
+    distinct_hashes, evictions, SpanHit, SpanKey, MAX_SEQS_PER_PROBE, MAX_SPANS_PER_RUN,
+};
 
 /// Outcome of checking a set of leases together (typically every lease in a chain).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -245,8 +247,10 @@ pub trait LeaseStore: Send + Sync {
     ) -> Result<(), AuditError>;
 
     /// Look `probes` up in the span index of the run `chain_id`: one [`SpanHit`] per probe and
-    /// stored result that holds it, ordered by probe, then `seq`. Empty for a run with no
-    /// index. Callers must treat an error as a match (fail closed).
+    /// stored result that holds it, at most [`MAX_SEQS_PER_PROBE`] per probe (the lowest
+    /// `seq`s), ordered by probe, then `seq`. Empty for a run with no index. One lookup per
+    /// probe, so callers bound and deduplicate `probes`. Callers must treat an error as a
+    /// match (fail closed).
     fn find_spans(
         &self,
         chain_id: &LeaseId,
@@ -1817,7 +1821,11 @@ impl LeaseStore for MemoryLeaseStore {
         let mut hits = Vec::new();
         for (probe, f) in probes.iter().enumerate() {
             if let Some(seqs) = run.index.get(&key.hash(f)) {
-                hits.extend(seqs.iter().map(|&seq| SpanHit { probe, seq }));
+                hits.extend(
+                    seqs.iter()
+                        .take(MAX_SEQS_PER_PROBE)
+                        .map(|&seq| SpanHit { probe, seq }),
+                );
             }
         }
         Ok(hits)

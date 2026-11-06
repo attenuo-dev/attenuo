@@ -35,7 +35,7 @@ Every fix here has a regression test that fails on `5b85f43` and passes on this 
 
 | ID | Severity | Component | Title | Status |
 |---|---|---|---|---|
-| SR-91 | Medium | server (`authz/pipeline.rs` `arg_taint`, both stores' `find_spans`) | One call's arguments are looked up with no bound on probes or hits: seconds under the store lock and gigabytes of memory per call | Proposed |
+| SR-91 | Medium | server (`authz/pipeline.rs` `arg_taint`, both stores' `find_spans`) | One call's arguments are looked up with no bound on probes or hits: seconds under the store lock and gigabytes of memory per call | Fixed (`fix/sr91-arg-taint-bounds`) |
 | SR-92 | Low | server (`notify.rs`, `sink.rs` `QueueHandle::push`) | One run can push every other run's approval notices out of the queue and the expiry watcher | Proposed |
 | SR-93 | Info | server (`notify.rs` `recover`) | On restart, open outbox rows beyond `queue_capacity` are given up without one attempt | Proposed |
 | SR-94 | Info | server (`sink.rs` `WebhookDeliver`, `S3Deliver`) | A failed checkpoint delivery logged the sink URL, query string included | Fixed, test `a_failed_webhook_delivery_does_not_log_the_url_sr94` |
@@ -44,7 +44,7 @@ Every fix here has a regression test that fails on `5b85f43` and passes on this 
 
 ## Findings
 
-### SR-91: one call's arguments are looked up with no bound on probes or hits (Medium, proposed)
+### SR-91: one call's arguments are looked up with no bound on probes or hits (Medium, fixed on `fix/sr91-arg-taint-bounds`)
 
 - **Component.** `attenuo-server` `authz/pipeline.rs` `Pipeline::arg_taint` (lines 1026 to 1087) and `matches_arguments` (1004); `attenuo-audit` `sqlite/leases.rs` `find_spans` (1160) and `lease.rs` `MemoryLeaseStore::find_spans` (1807).
 - **Observation.** `fingerprints` caps one value at `MAX_FINGERPRINTS_PER_VALUE` (2,000) fingerprints from its first 1 MiB, and the module docs present that as the bound. `arg_taint` calls it once per argument (`pipeline.rs:1041`), so a call's probe count is the number of arguments times up to 2,000, with no total. Probes are not deduplicated across arguments. `find_spans` then runs one indexed query per probe inside one transaction on the lease store's only connection, holding its mutex, and returns every `(probe, seq)` pair, with no limit on how many results (`seq`) one hash has: a run holds up to `MAX_SPANS_PER_RUN` (20,000) hashes, so one hash can sit under up to 20,000 results. `arg_taint` collects the hits into a `BTreeSet<UntrustedArg>`, one entry per argument name and `seq`, each with its own `String`, before the record keeps 64.
