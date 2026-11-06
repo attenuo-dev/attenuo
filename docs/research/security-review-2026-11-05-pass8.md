@@ -38,6 +38,7 @@ Every finding fixed here has a regression test that fails on `bd4f8dd` and passe
 | SR-87 | Low | proxy (`proxy.rs`, `label.rs`, `screen.rs`) | A list answer to an earlier request, in the body of a later `POST`, was not filtered | Fixed (`fix/proxy-followups`) |
 | SR-88 | Info | server (`routes/token.rs` `form_to_json`) | A repeated form `scope` was taken last-wins instead of refused | Fixed |
 | SR-89 | Low | proxy (`label.rs` `AWAITED_RESULT_TTL`) | An answer later than ten minutes is relayed unlabelled, and the Python MCP SDK waits that long | Accepted |
+| SR-90 | Low | server and proxy (`lib.rs`, `admin_ui.rs`, `proxy.rs` `TraceLayer`) | TraceLayer default span records the full URI with query string; subjects and filters could reach debug logs | Fixed (`fix/trace-span-route-template`), test `request_spans_carry_the_route_template_not_the_uri` |
 
 SR-85 is the third route, after SR-69 (message shape) and SR-77 to SR-79 (SSE transport), to the same effect: an upstream gets a `tools/call` result to the agent with no `tool_result` record and no `untrusted` label, so `context.session.tainted` stays off and approval rules for destructive calls stay ungated. This time the route is the request flow: the proxy looked for an answer only in the body of the request that carried the call (or on the listen stream), while clients accept it in the body of any request of the session.
 
@@ -82,6 +83,14 @@ SR-85 is the third route, after SR-69 (message shape) and SR-77 to SR-79 (SSE tr
 - **Component.** `attenuo-proxy` `label.rs` `AWAITED_RESULT_TTL`.
 - **Observation.** An allowed call is remembered for ten minutes. An answer to it after that, on the listen stream or (since SR-85) in a later `POST` body, matches nothing and is relayed unlabelled; the module docs and the threat model say so, and pass 6 left it out as "most clients time out well before then". The Python MCP SDK does not: `read_timeout_seconds` is unset by default, so a client session waits for a response indefinitely. An upstream (A3) that answers a call with `202` and sends the answer eleven minutes later on the listen stream gets it to a default Python MCP client unlabelled. The TypeScript MCP SDK times a request out after 60 seconds by default.
 - **Reason accepted.** Closing this needs a design decision, not a one-file fix: either keep every forwarded request id for the life of its session (unbounded unless sessions are), or withhold every response on the listen stream and in `POST` bodies that answers nothing the proxy remembers, which also drops legitimate late answers to `ping` or the list methods. The ten-minute bound is documented in the threat model, and an operator can tell agents to set a request timeout below it. Recommended follow-up: name the Python SDK default in the threat model's residual risks, and consider failing closed for unclaimed responses whose result has the shape of a tool result (`content` array).
+
+### SR-90: the `TraceLayer` default span recorded the full URI with its query string (Low, fixed)
+
+Found after the pass, by the [OpenTelemetry design note](../design/otel-export.md) (section 3.1).
+
+- **Component.** `attenuo-server` `lib.rs` (API router) and `admin_ui.rs` (console listener), `attenuo-proxy` `proxy.rs` (proxy router): each used `TraceLayer::new_for_http()`.
+- **Observation.** tower-http's default `make_span_with` records `method`, `uri` and `version`, and `uri` includes the query string. With `RUST_LOG=tower_http=debug` (or `debug`), `GET /admin/audit?subject=alice@example.com` wrote the subject to the log on every event of the request, and any other query-string filter likewise. The metrics already label by route template, never the URI.
+- **Fix.** All three layers use `attenuo_proxy::http_trace::request_span`, which records `method`, `route` (the `MatchedPath` template, or the fixed `unmatched`) and `version`, with tower-http's span name, level and target so existing filters still select it. The URI is never recorded. Test `request_spans_carry_the_route_template_not_the_uri` (`crates/attenuo-server/tests/hardening.rs`) sends `?subject=secret-marker` to `/admin/audit` on the API and console listeners, to `/mcp/{server}`, and to an unmatched path, and checks the captured debug log has the templates and not the marker; it fails with the default span.
 
 ## Checked and found sound
 
