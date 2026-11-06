@@ -960,6 +960,57 @@ mod tests {
         assert!(charges_for(&chain, &missing).is_err());
     }
 
+    /// A fractional amount (AgentDojo's `send_money` sends `amount` as a Python float): a
+    /// `sum` refuses it, `calls_per` and `distinct` count it as its canonical JSON number, and
+    /// run usage adds 0 for it. None of the three rounds it to a whole number.
+    #[test]
+    fn fractional_values_under_limits() {
+        let send = |amount: Value| {
+            ToolCall::new(
+                "banking",
+                "send_money",
+                json!({"recipient": "A", "amount": amount}),
+            )
+        };
+        let summed = root(vec![
+            send_money().with_limits(Limits::default().with_sum("amount", 100))
+        ]);
+        let err = charges_for(&summed, &send(json!(12.5))).unwrap_err();
+        assert_eq!((err.kind, err.arg.as_str()), (LimitKind::Sum, "amount"));
+        assert!(err.problem.contains("a fraction"), "{}", err.problem);
+        // A float with no fraction is the integer.
+        assert_eq!(
+            charges_for(&summed, &send(json!(12.0))).unwrap()[0].amount,
+            12
+        );
+
+        for limits in [
+            Limits::default().with_calls_per("amount", 1),
+            Limits::default().with_distinct("amount", 1),
+        ] {
+            let chain = root(vec![send_money().with_limits(limits)]);
+            let value = |amount: Value| {
+                let c = charges_for(&chain, &send(amount)).unwrap();
+                assert_eq!(c.len(), 1);
+                c[0].value.clone().unwrap()
+            };
+            assert_eq!(value(json!(12.5)), b"12.5".to_vec());
+            // `12.50` and `12.5` are one JSON number; `12.0` is the integer 12.
+            let v: Value = serde_json::from_str("12.50").unwrap();
+            assert_eq!(value(v), b"12.5".to_vec());
+            assert_eq!(value(json!(12.0)), value(json!(12)));
+            assert_ne!(value(json!(12.5)), value(json!(12.500001)));
+        }
+
+        let usage = usage_charges(
+            &LeaseId::new("run"),
+            &send(json!(12.5)),
+            Some("amount"),
+            None,
+        );
+        assert_eq!((usage[1].kind, usage[1].amount), (LimitKind::Sum, 0));
+    }
+
     #[test]
     fn list_valued_destinations_count_each_distinct_element() {
         let chain =

@@ -1078,6 +1078,24 @@ mod tests {
         }
     }
 
+    /// An undeclared fractional argument reaches Cedar as a `decimal` rounded to four
+    /// fractional digits: `12.34567` is `12.3457`, and `0.00001` is `0.0000`, which equals 0.
+    #[test]
+    fn undeclared_fractions_reach_cedar_rounded_to_four_digits() {
+        for (f, arg) in [
+            (12.5, "12.5000"),
+            (12.34567, "12.3457"),
+            (0.00001, "0.0000"),
+            (-0.5, "-0.5000"),
+        ] {
+            assert_eq!(
+                to_cedar_json(&json!(f), "input").unwrap(),
+                json!({ "__extn": { "fn": "decimal", "arg": arg } }),
+                "{f}"
+            );
+        }
+    }
+
     #[test]
     fn nulls_are_dropped_and_numbers_mapped() {
         let v = json!({ "a": null, "b": [1, null, "x"], "c": 1.5, "d": 18446744073709551615u64 });

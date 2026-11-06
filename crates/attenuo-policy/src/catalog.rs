@@ -396,3 +396,111 @@ impl ToolCatalog {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CallLabels, Decision, PolicyEngine, PolicyEngineBuilder};
+    use attenuo_core::{
+        AgentId, Capability, CapabilitySet, DelegationChain, LeaseId, OriginatingUser, ToolCall,
+    };
+    use serde_json::{json, Value};
+    use time::{Duration, OffsetDateTime};
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_762_400_000).unwrap()
+    }
+
+    fn chain() -> DelegationChain {
+        DelegationChain::root(
+            OriginatingUser {
+                subject: "alice".into(),
+                issuer: "https://idp.example".into(),
+                authenticated_at: now(),
+                attributes: Default::default(),
+            },
+            AgentId::new("planner"),
+            CapabilitySet::from_iter([Capability::new("banking", "*")]),
+            now(),
+            Duration::hours(1),
+            LeaseId::new("l1"),
+        )
+        .unwrap()
+    }
+
+    fn engine(attrs: ToolAttrs, policies: &str) -> Result<PolicyEngine, crate::PolicyError> {
+        PolicyEngineBuilder::new()
+            .with_catalog(ToolCatalog::new().with("banking", "send_money", attrs))
+            .with_policies_str(policies)
+            .build()
+    }
+
+    fn send(engine: &PolicyEngine, amount: Value) -> crate::Outcome {
+        engine.authorize_labelled(
+            &chain(),
+            &ToolCall::new(
+                "banking",
+                "send_money",
+                json!({"recipient": "A", "amount": amount}),
+            ),
+            &CallLabels::default(),
+            now(),
+        )
+    }
+
+    /// Today, with `amount` not declared: `context.input` is a closed record, so a policy that
+    /// reads `context.input.amount` fails to load, and one that guards it with `has` loads
+    /// with a "policy is impossible" warning. Evaluation is schema-free, though: the guarded
+    /// rule still runs, a fraction reaches it as a Cedar `decimal`, and comparing that with
+    /// `>` is a type error, so the call is denied as `policy_error`. A whole amount is a `Long`
+    /// and the rule applies to it.
+    #[test]
+    fn an_undeclared_fractional_amount_cannot_be_read_by_a_policy() {
+        let err = engine(
+            ToolAttrs::new(),
+            r#"forbid(principal, action, resource) when { context.input.amount > 100 };"#,
+        )
+        .unwrap_err();
+        assert!(matches!(err, crate::PolicyError::Validation(_)), "{err}");
+
+        let guarded = engine(
+            ToolAttrs::new(),
+            r#"permit(principal, action, resource);
+               forbid(principal, action, resource) when {
+                 context.input has amount && context.input.amount > 100 };"#,
+        )
+        .unwrap();
+        assert!(
+            guarded
+                .validation_warnings()
+                .iter()
+                .any(|w| w.contains("policy is impossible")),
+            "{:?}",
+            guarded.validation_warnings()
+        );
+        let out = send(&guarded, json!(12.5));
+        assert_eq!(out.reason, crate::REASON_POLICY_ERROR, "{out:?}");
+        assert_eq!(send(&guarded, json!(500)).reason, crate::REASON_POLICY_DENY);
+        assert_eq!(send(&guarded, json!(12)).decision, Decision::Allow);
+
+        let open = engine(ToolAttrs::new(), r#"permit(principal, action, resource);"#).unwrap();
+        assert_eq!(send(&open, json!(12.5)).decision, Decision::Allow);
+    }
+
+    /// Today, with `amount` declared `long`: a fraction is refused before Cedar.
+    #[test]
+    fn a_fractional_amount_declared_long_is_an_input_type_mismatch() {
+        let e = engine(
+            ToolAttrs::new().with_input("amount", ArgType::Long),
+            r#"permit(principal, action, resource);"#,
+        )
+        .unwrap();
+        let out = send(&e, json!(12.5));
+        assert_eq!(out.reason, crate::REASON_INPUT_TYPE_MISMATCH);
+        assert_eq!(
+            out.diagnostics,
+            vec!["input.amount: expected Long, got number".to_string()]
+        );
+        assert_eq!(send(&e, json!(12.0)).decision, Decision::Allow);
+    }
+}
