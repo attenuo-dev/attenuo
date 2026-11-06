@@ -119,6 +119,7 @@ impl ApprovalMethod {
 pub struct Approver {
     /// The user's `sub`, or `urn:attenuo:admin` for an operator.
     pub subject: String,
+    /// How the approver authenticated: an ID token, or the admin token.
     pub method: ApprovalMethod,
 }
 
@@ -143,9 +144,11 @@ pub struct Approval {
     pub lease: LeaseId,
     /// `ToolCall::call_hash` of the gated call.
     pub call_hash: String,
-    /// The gated call, exactly as decided.
+    /// The gated call's MCP server, exactly as decided.
     pub server: String,
+    /// The gated call's tool name.
     pub tool: String,
+    /// The gated call's arguments, exactly as decided.
     pub arguments: Value,
     /// The run's output labels when the call was gated.
     pub labels: Vec<ApprovalLabel>,
@@ -158,10 +161,12 @@ pub struct Approval {
     /// The delegation chain that made the call: whose run it is (`originating_user`) and what
     /// the audit records of the approval name.
     pub chain: DelegationChain,
+    /// When the call was gated and the approval stored.
     pub created_at: OffsetDateTime,
     /// `min(created_at + [approvals] ttl, lease expiry)`. After this the approval can no
     /// longer be granted or used.
     pub expires_at: OffsetDateTime,
+    /// Where the approval is in its life: pending, granted, declined or consumed.
     pub state: ApprovalState,
     /// Set once granted or declined.
     pub approver: Option<Approver>,

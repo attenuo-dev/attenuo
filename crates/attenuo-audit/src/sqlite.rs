@@ -263,8 +263,10 @@ const STATEMENT_CACHE: usize = 32;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Durability {
+    /// `synchronous=NORMAL`: synced at WAL checkpoints; the default.
     #[default]
     Normal,
+    /// `synchronous=FULL`: every commit synced before it returns.
     Full,
 }
 
@@ -1770,6 +1772,7 @@ impl SqliteAudit {
         Self::from_connection(open_connection(path.as_ref(), durability)?)
     }
 
+    /// A log in a private in-memory database, gone when the value is dropped.
     pub fn open_in_memory() -> Result<Self, AuditError> {
         Self::from_connection(open_memory_connection()?)
     }
@@ -2339,6 +2342,7 @@ impl SqliteAudit {
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
+    /// Whether the log has no entries.
     pub fn is_empty(&self) -> Result<bool, AuditError> {
         Ok(self.len()? == 0)
     }
@@ -2484,10 +2488,13 @@ impl SqliteLeaseStore {
         Ok(store)
     }
 
+    /// A registry in a private in-memory database, gone when the value is dropped.
     pub fn open_in_memory() -> Result<Self, AuditError> {
         Self::from_connection(open_memory_connection()?)
     }
 
+    /// Wrap an existing connection, creating or upgrading the lease, approval and outbox
+    /// tables as needed.
     pub fn from_connection(conn: Connection) -> Result<Self, AuditError> {
         conn.execute_batch(LEASE_SCHEMA)?;
         add_approval_columns(&conn)?;

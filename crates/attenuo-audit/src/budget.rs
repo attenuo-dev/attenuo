@@ -41,10 +41,18 @@ use crate::error::AuditError;
 pub enum ChargeOutcome {
     /// Every charge was applied. `used_after[i]` is what the counter of `charges[i]` holds now
     /// (for a `distinct` charge, how many values its limit has seen).
-    Charged { used_after: Vec<u64> },
+    Charged {
+        /// The counter value after each charge, in the order of `charges`.
+        used_after: Vec<u64>,
+    },
     /// Nothing was applied: `charges[index]` would have taken its counter, which holds `used`,
     /// past its `max`.
-    Exhausted { index: usize, used: u64 },
+    Exhausted {
+        /// Position in `charges` of the first charge that did not fit.
+        index: usize,
+        /// What that charge's counter holds, unchanged by the refused charge.
+        used: u64,
+    },
 }
 
 /// The row key of a counter. `value` is the hex HMAC of a `calls_per` value, or empty.
@@ -66,8 +74,11 @@ pub struct HopLimit {
     /// Index of the capability in the hop's capability set (its canonical order), as charges
     /// and records name it.
     pub cap: usize,
+    /// The capability's server name pattern.
     pub server: String,
+    /// The capability's tool name pattern.
     pub tool: String,
+    /// The limits the token carries for that capability.
     pub limits: Limits,
 }
 

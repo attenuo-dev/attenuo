@@ -25,8 +25,11 @@ use crate::spans::{distinct_hashes, evictions, SpanHit, SpanKey, MAX_SPANS_PER_R
 pub struct LeaseStatus {
     /// `true` only when every lease is known, unrevoked and unexpired.
     pub active: bool,
+    /// The leases that have been revoked.
     pub revoked: Vec<LeaseId>,
+    /// The leases past their expiry.
     pub expired: Vec<LeaseId>,
+    /// The leases the store has no row for, which count as inactive.
     pub unknown: Vec<LeaseId>,
 }
 
@@ -896,13 +899,18 @@ pub struct RunLabel {
 /// What a store holds per lease. Shared by the memory and SQLite implementations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaseRow {
+    /// The lease this one was delegated from; `None` for a run's root.
     pub parent: Option<LeaseId>,
+    /// When the lease stops being active.
     pub expires_at: OffsetDateTime,
+    /// When it was revoked, directly or as a descendant of a revoked lease.
     pub revoked_at: Option<OffsetDateTime>,
+    /// The reason given with the revocation.
     pub revoke_reason: Option<String>,
 }
 
 impl LeaseRow {
+    /// Unrevoked and not yet expired at `now`.
     pub fn is_active(&self, now: OffsetDateTime) -> bool {
         self.revoked_at.is_none() && self.expires_at > now
     }
@@ -1176,6 +1184,7 @@ impl RunSpans {
 }
 
 impl MemoryLeaseStore {
+    /// An empty store.
     pub fn new() -> Self {
         Self::default()
     }

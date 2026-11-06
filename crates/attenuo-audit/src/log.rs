@@ -17,8 +17,11 @@ pub const ENTRY_HASH_VERSION: &str = "attenuo-audit-entry-v2";
 /// One link in the audit chain. Sequence numbers start at 1 and are contiguous.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEntry {
+    /// Position in the log, from 1.
     pub seq: u64,
+    /// `entry_hash` of the entry before, or [`GENESIS_HASH`] for the first.
     pub prev_hash: String,
+    /// The decision the entry records.
     pub record: DecisionRecord,
     /// [`compute_entry_hash`] of the three fields above.
     pub entry_hash: String,
@@ -86,6 +89,7 @@ pub fn entry_hash_from_json(seq: u64, prev_hash: &str, record_json: &str) -> Str
 pub struct VerifyReport {
     /// Entries examined (including the first bad one, if any).
     pub entries: u64,
+    /// Every entry examined links to the one before and re-hashes to its `entry_hash`.
     pub ok: bool,
     /// Sequence number of the first entry that fails verification. For a deleted entry this is
     /// the seq of the entry that follows the gap, since the deleted one is no longer present.

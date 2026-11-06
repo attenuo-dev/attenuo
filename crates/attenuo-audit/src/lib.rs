@@ -14,6 +14,7 @@
 //! Nothing here evaluates policy; the sibling crates call into this one after deciding.
 
 #![deny(unsafe_code)]
+#![warn(missing_docs)]
 #![warn(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
