@@ -51,5 +51,6 @@ Only the `status` and `date` fields and the More Information section of an accep
 | [0009](0009-output-labelling.md) | Output labelling: the proxy labels every upstream result untrusted, taints the delegation run, and policy can require a call-bound approval for destructive tools | accepted |
 | [0010](0010-run-limits.md) | Run limits: count and amount budgets declared per token hop, charged against every hop of the chain in the decision's transaction, and exposed to Cedar as context | accepted |
 | [0011](0011-cedar-aware-list-filtering.md) | Cedar-aware list filtering: opt in, hide a tool only when the policy denies it for every possible call, with approval-gated tools always kept | proposed |
+| [0012](0012-opentelemetry-export.md) | OpenTelemetry export: allow-listed decision spans over OTLP/HTTP, off by default, linked not adopted, joined to the signed record by decision id | proposed |
 
 Add a row for each new ADR.

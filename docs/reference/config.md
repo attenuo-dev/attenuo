@@ -285,6 +285,42 @@ A request that authenticates as a PEP gets `context.diagnostics` under `[authzen
 | `listen` | `127.0.0.1:9100` | Address of the metrics listener. No authentication, so keep it on loopback or a private network. |
 | `allow_public` | `false` | Without it, the server refuses to start when `enabled` and `listen` is not a loopback address. With it, the server starts and logs a warning. |
 
+## `[telemetry]`
+
+OpenTelemetry trace export over OTLP/HTTP ([observability guide](../guides/observability.md), [ADR-0012](../decisions/0012-opentelemetry-export.md), proposed). Off by default: with the section absent or `enabled = false` no exporter is built and nothing is inserted on upstream requests. Exported spans carry only allow-listed fields: no token, subject, argument, result, URL or error text. Export fails open: a full queue or a dead collector drops spans (counted in `telemetry_spans_dropped_total` and `telemetry_export_failures_total`) and never delays or changes a decision. An unreachable collector does not stop the server; a malformed section does.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Export traces. |
+| `otlp_endpoint` | `"http://127.0.0.1:4318"` | The collector's OTLP/HTTP base URL; `/v1/traces` is appended. `http` or `https`, with a host, and no user name, password, query or fragment (credentials go in `OTEL_EXPORTER_OTLP_HEADERS`). A non-loopback `http://` URL refuses to start unless `allow_insecure = true`. |
+| `protocol` | `"http/protobuf"` | The only protocol built. `"grpc"` refuses to start. |
+| `timeout_seconds` | `10` | Timeout of one export request, 1 to 300. |
+| `allow_insecure` | `false` | Accept a plain `http://` endpoint that is not loopback. |
+| `service_name` | `"attenuo-server"` | The `service.name` resource attribute. Not empty. |
+| `resource_attributes` | `{}` | More resource attributes, for example `{ "deployment.environment" = "production" }`. |
+
+### `[telemetry.traces]`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `sample_ratio` | `0.1` | Head sampling of new traces, 0 to 1. In `parent` mode the parent's sampled flag decides instead. Keeping every deny is a job for the collector's tail sampling. |
+| `inbound_mcp` | `"link"` | What a W3C `traceparent` on `/mcp/{server}`, `POST /token` and `POST /token/renew` does: `"link"` starts a new trace with a span link to the caller's (the caller cannot pick attenuo's trace id or force sampling), `"parent"` adopts it, `"ignore"` drops it. A missing, repeated or malformed header starts a new trace and is never a refusal. |
+| `inbound_authzen` | `"parent"` | The same for the AuthZEN routes, when the caller authenticates as a `[[peps]]` entry with HTTP Basic. Any other AuthZEN caller (a bearer, or PEP credentials in the body) gets `inbound_mcp`. |
+| `propagate_upstream` | `true` | Insert attenuo's own `traceparent` (its `attenuo.upstream` span) on the request to the upstream MCP server. The client's header is never forwarded. |
+| `max_queue_spans` | `2048` | Most finished spans waiting for export, 1 to 1000000. One more is dropped and counted. |
+| `max_export_batch` | `512` | Most spans in one export request, 1 to `max_queue_spans`. |
+
+### `[telemetry.metrics]`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `export` | `false` | OTLP push of the `/metrics` series is not built; `true` refuses to start. Scrape `[metrics] listen` with the collector's Prometheus receiver. |
+| `interval_seconds` | `60` | Unused until `export` is built. |
+
+**Environment.** The standard variables override the file: `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (the full URL) or `OTEL_EXPORTER_OTLP_ENDPOINT` (a base, `/v1/traces` appended), `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` or `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` or `OTEL_EXPORTER_OTLP_TIMEOUT` (milliseconds), `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES` (`k=v,k=v`, merged over the file's), `OTEL_TRACES_SAMPLER_ARG`, and `OTEL_EXPORTER_OTLP_HEADERS` / `OTEL_EXPORTER_OTLP_TRACES_HEADERS` for collector credentials. `OTEL_SDK_DISABLED=true` turns export off without editing the file. None of them turns export on: that takes `enabled = true`. The startup checks above apply to the values from the environment too.
+
+**Build.** The exporter is in the `otel` cargo feature of `attenuo-server`, on by default, so release binaries and the image carry it. A server built with `--no-default-features` refuses `enabled = true`.
+
 ## `[admin_ui]`
 
 The admin console, on its own opt-in listener so it never shares an origin with `/mcp/{server}`. It serves the embedded console under `/admin/ui/` (`/` redirects there) and the admin API under `/admin/*`, behind the same `[admin] token`. Every response carries a strict `Content-Security-Policy`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` and same-origin `Cross-Origin-Opener-Policy` / `Cross-Origin-Resource-Policy`; API answers also carry `Cache-Control: no-store`. No CORS headers are ever sent. `POST /admin/root-token` is never mounted here, whatever `[dev]` says.

@@ -330,6 +330,27 @@ enabled = false
 # A non-loopback `listen` is refused at startup unless this is true (SR-38).
 # allow_public = false
 
+[telemetry]
+# OpenTelemetry trace export over OTLP/HTTP (protobuf). Off by default. Exported spans carry
+# decision ids, reason codes, tool names and route templates; never a token, the subject,
+# arguments or results. Export fails open: a dead collector never delays a decision.
+# See docs/guides/observability.md.
+enabled = false
+# otlp_endpoint = "http://127.0.0.1:4318"   # /v1/traces is appended; non-loopback must be https
+# timeout_seconds = 10
+# allow_insecure = false
+# service_name = "attenuo-server"
+# resource_attributes = { "deployment.environment" = "production" }
+# Collector credentials: OTEL_EXPORTER_OTLP_HEADERS, never this file.
+
+# [telemetry.traces]
+# sample_ratio = 0.1
+# inbound_mcp = "link"         # "link" | "parent" | "ignore"
+# inbound_authzen = "parent"   # for [[peps]] callers with HTTP Basic
+# propagate_upstream = true
+# max_queue_spans = 2048
+# max_export_batch = 512
+
 [admin_ui]
 # The admin console on its OWN listener (/admin/ui/ plus the admin API, same admin token).
 # Read-only unless allow_write; never serves /admin/root-token; no CORS.

@@ -1,6 +1,6 @@
 # OpenTelemetry export: design
 
-- Status: proposed, not accepted. Nothing in this note changes what the server exports today: Prometheus text on the side listener ([HTTP API: metrics](../reference/http-api.md#metrics)), log lines on standard output ([deploy guide: logging](../guides/deploying.md#logging)), and the decision id on every answer.
+- Status: proposed, not accepted; built on `feat/otel-export` (steps 1 to 4 of section 7, see [section 10](#10-built)) for the maintainer to judge. With `[telemetry]` absent or off, the server exports what it did before: Prometheus text on the side listener ([HTTP API: metrics](../reference/http-api.md#metrics)), log lines on standard output ([deploy guide: logging](../guides/deploying.md#logging)), and the decision id on every answer. Decision record: [ADR-0012](../decisions/0012-opentelemetry-export.md).
 - Date: 2026-11-06. Base: `main` at 6951476.
 - Related: [server pipeline](server.md), [deploy guide: what to monitor](../guides/deploying.md#what-to-monitor), [HTTP API: metrics](../reference/http-api.md#metrics), [performance](performance.md) (the per-stage timing that `proxy_stage_seconds` reports), [multi-replica readiness](multi-replica.md) (per-process metrics), [related work: AgentGateway](../research/related-work.md#agentgateway-linux-foundation), [RFC-0001](../spec/rfc-0001-attenuo.md) section 8 ("Not a general MCP gateway"), [audit log](../concepts/audit-log.md).
 
@@ -211,3 +211,57 @@ The HTTP variant's cost is almost all the second `reqwest`. `opentelemetry-http`
 6. **Names.** OpenTelemetry semantic conventions for the HTTP attributes, and an `attenuo.` namespace for the rest. Should pushed metrics keep the Prometheus names (`attenuo_decisions_total`) so dashboards carry over, or follow OTel naming (`attenuo.decisions`, unit suffixes handled by the exporter)?
 7. **Logs.** The proposal exports no logs, because the existing events carry subjects and error strings. Is that acceptable, or should a small allowlisted set of events (decisions, refusals) go out as span events?
 8. **Scope against RFC-0001 section 8.** Does the maintainer accept that exporting attenuo's own decision spans is not "OTel belongs to gateways"? If so, section 8 would gain one sentence: attenuo exports spans and metrics for its own decisions, and does not route, rate-limit, federate or export payloads.
+
+## 10. Built
+
+Built on `feat/otel-export` from `main` at 77cc0a4: steps 1 to 4 of section 7. Steps 5 to 7 are not built. Operator documentation is in the [observability guide](../guides/observability.md) and the [configuration reference](../reference/config.md#telemetry).
+
+### What was built
+
+- **Step 1.** The deploy guide and the observability guide document the collector's Prometheus receiver scraping `[metrics] listen`.
+- **Step 2.** `Carry` (`crates/attenuo-server/src/telemetry.rs`) carries the subscriber, the current span and the OpenTelemetry context into `on_blocking_pool` and `AppState::blocking`, so the decision's spans are children of the request and the `decision` log line is inside `mcp_request`. The spans of section 3.2 are in target `attenuo::otel`: `mcp.request`, `attenuo.authenticate` and `attenuo.session_gate` in `proxy.rs`, `attenuo.upstream` and `attenuo.response` around the upstream round trip, `attenuo.record_result` in `label.rs`, `attenuo.stream_end` in `guard.rs`, and `attenuo.decide` with `attenuo.lease_check`, `attenuo.run_state`, `attenuo.policy`, `attenuo.charge` and `attenuo.audit_append` in `authz/pipeline.rs`. The log layer filters the target out, so log output is as before.
+- **Step 3.** `[telemetry]` and `[telemetry.traces]` as in section 6, the `OTEL_*` overrides, startup checks (`TelemetrySection::resolve`), a subscriber of a log layer and an OpenTelemetry layer filtered to `attenuo::otel` (`telemetry::init`, installed by `main.rs` once the config is read), the keyed subject digest, `BoundedProcessor` (a bounded queue and one export thread, in place of the SDK's batch processor, so drops can be counted) and the two counters `telemetry_spans_dropped_total` and `telemetry_export_failures_total`, and a bounded flush on shutdown. The layer adds no file, line, module, thread, target or timing attributes.
+- **Step 4.** `crates/attenuo-proxy/src/traceparent.rs` parses `traceparent` (version `00` only, lowercase hex, non-zero ids, exactly one header) with no OpenTelemetry dependency and defines `TraceHook`, which the server implements (`ServerTrace`) and hands to the proxy through `Authorizer::trace`. The `parent`, `link` and `ignore` modes, attenuo's own `traceparent` on the upstream request, `PendingResult` and `StreamGuard` keep the request's context for later links. The token and AuthZEN routes get one span each from the `trace_route` middleware, mounted only when tracing is on.
+
+### Choices for the open questions
+
+Each is the note's recommendation where it has one; the maintainer can reverse any of them.
+
+1. **Feature flag or always compiled.** A cargo feature `otel` of `attenuo-server`, **on by default**, so the release binaries and the image carry the exporter and export is a config switch; `--no-default-features` builds without the OpenTelemetry crates and refuses `enabled = true`. Section 7 step 3 asked for a feature; default-on answers "is the published image built with it" with yes.
+2. **gRPC or HTTP.** OTLP over HTTP with protobuf only, sent through the workspace's `reqwest` 0.12 by a small `opentelemetry_http::HttpClient` (section 8's smallest variant). The request runs as a task on the server's runtime, so the export thread needs no runtime of its own. `protocol = "grpc"` refuses to start. No sub-features.
+3. **One trace or links.** Inside the process: one trace. MCP port, token routes and AuthZEN callers that are not PEPs: `link` (default `inbound_mcp`). AuthZEN callers that authenticate as `[[peps]]` with HTTP Basic: `parent` (default `inbound_authzen`); PEP credentials in the body are not looked at, because the span is built before the handler reads the body. Results recorded after the response, and stream ends: a new span with a link to the request, not a held-open `mcp.request`.
+4. **`trace_id` in the record.** Not added. The join is `attenuo.decision_id` and `attenuo.audit.seq` on the spans; the record schema and the hash chain are unchanged (step 6 not built).
+5. **The subject.** A keyed digest, `attenuo.subject_digest` on `attenuo.decide`: HMAC-SHA256, 16 hex digits, key derived from the issuer's private key with the label `attenuo/telemetry-subject/v1`, as the DPoP nonce key is. It changes at key rotation. Agent ids are not exported at all (the "safe with care" class), since `require_actor_auth = false` can make them caller-chosen.
+6. **Names.** OpenTelemetry semantic conventions for `http.request.method`, `http.route` and `http.response.status_code`; `attenuo.` for the rest. Metric names do not arise, as no metrics are pushed.
+7. **Logs.** No logs signal and no span events. The OpenTelemetry layer sees no event at all.
+8. **Scope.** Not decided here; RFC-0001 section 8 is unchanged. The build stays inside the sentence proposed there: decision spans only, no routing, rate limits, federation or payloads.
+
+Other choices:
+
+- **Metrics (step 5).** Not built. `[telemetry.metrics] export = true` refuses to start with a pointer to the Prometheus receiver, so the section of section 6 parses with a clear answer.
+- **`tracestate` and `baggage`.** Neither read nor sent, in any mode (section 4 allowed `tracestate` in `parent` mode).
+- **Environment.** The `OTEL_*` variables override the file but never turn export on; `OTEL_SDK_DISABLED=true` turns it off. The checks apply to values from the environment too.
+- **Attributes as built.** `http.request.method`, `http.route`, `http.response.status_code`, `attenuo.server`, `attenuo.session_tag`, `attenuo.chain_id`, `attenuo.chain_depth`, `attenuo.dpop_bound`, `attenuo.token.cache`, `attenuo.reason`, `attenuo.tool`, `attenuo.decision`, `attenuo.decision_id`, `attenuo.audit.seq`, `attenuo.policy_ids` (comma-joined), `attenuo.tainted`, `attenuo.subject_digest`, `attenuo.limit.kind`, `attenuo.budget.exhausted_at`, `attenuo.result.label`. `attenuo.list.hidden` (on `attenuo.response`) is not built.
+- **Session gate.** A `404` for an unknown session records `attenuo.reason = "session_unknown"`, a fixed string next to `session_mismatch`.
+- **Refused exchanges.** The token span records the status code, not the refusal's reason or `decision_id` (section 3.2 asked for both).
+- **Failed exports.** Counted once per request; their spans are not retried and not added to the drop counter.
+
+### Measured
+
+Development profile (`CARGO_PROFILE_DEV_DEBUG=0`, no release build was made), on a 4-core VM with a load average of 9 to 13 from parallel builds:
+
+- **Lock file.** 17 packages added: `opentelemetry`, `opentelemetry_sdk`, `opentelemetry-otlp`, `opentelemetry-http`, `opentelemetry-proto` (0.33.1), `tracing-opentelemetry` (0.34.0), `prost` and `prost-derive` (0.14), `futures-executor`, `rand` 0.9 with `rand_chacha`, `rand_core` and `ppv-lite86`, a third `getrandom` (with `r-efi`, `wasip2`, `wit-bindgen`). No `tonic`, `h2`, `hyper` 1 client, second `reqwest` or `aws-lc`. Section 8 counted 25 for gRPC and 42 for the crate's HTTP client.
+- **Binary.** `attenuo-server` 76,191,432 bytes without the feature, 78,682,016 with it: 2.49 MB (3.3 %) more in the development profile. Section 8 estimated 1 to 2 MB on the release binary for this variant; the release figure is not measured.
+- **Build time.** Building the binary with the feature after a build without it took 78 s, of which 20 s is the rebuild of `attenuo-server` itself; so about 60 s for the new crates under that load, `prost-derive` included. Section 8 estimated 10 to 20 s on a clean release build; not comparable, and not measured on a quiet machine.
+- **Span overhead.** Not measured with `attenuo-bench` (section 6, "Cost"). With `[telemetry]` off, the exported spans are disabled at their call sites by the log layer's filter and `Carry` adds a dispatcher and context clone per blocking-pool hop.
+
+### Tests
+
+`crates/attenuo-server/tests/otel.rs`: `tools_call_exports_the_listed_spans_and_nothing_forbidden` (an in-process exporter; every span's attributes are on the list above, and no value holds the token, the subject, the argument value, the result text or the upstream URL; one trace; the link to the caller's context; `attenuo.decide` a child of `mcp.request` across the blocking pool; decision id and seq lead to the record, which has no trace field; `/admin/audit/verify` is ok), `upstream_gets_attenuos_traceparent_and_a_malformed_one_is_ignored`, `parent_mode_adopts_the_inbound_trace`, `tracing_off_inserts_nothing_upstream`, `a_dead_collector_never_slows_or_fails_a_decision` (a collector that accepts and never answers, a queue of 4: every call under 0.9 s, drops and the timed-out export counted, shutdown bounded), `spans_reach_an_otlp_http_receiver_without_secrets` (the real exporter and client against a receiver on 127.0.0.1; the protobuf bodies hold the span names and none of the secrets), `a_bad_endpoint_refuses_to_start`, `authzen_and_token_routes_get_one_span_each`. Unit tests in `telemetry.rs` (configuration off, on, overrides and refusals; the subject digest) and `traceparent.rs` (parsing).
+
+### Not built or not verified
+
+- Steps 5 (metrics push), 6 (`trace_id` in the record) and 7 (exemplars).
+- A result recorded on a stream after the response, and `attenuo.stream_end`, are linked by code that no test drives yet.
+- The release binary size and build time, and the span overhead benchmark.
+- The collector configuration in the observability guide was not run against a real collector.

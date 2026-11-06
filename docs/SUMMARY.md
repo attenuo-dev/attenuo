@@ -9,6 +9,7 @@
   - [Integrating MCP clients](guides/integrating-mcp-clients.md)
   - [Binding tokens to keys](guides/binding-tokens-to-keys.md)
   - [Admin console](guides/admin-console.md)
+  - [Observability](guides/observability.md)
 - [Demo recordings](demo/README.md)
 - [Codebase walkthrough](guide/codebase-walkthrough.md)
 
@@ -39,7 +40,7 @@
 - [Run limits](design/run-limits.md)
 - [Cedar-aware list filtering (proposed)](design/cedar-aware-list-filtering.md)
 - [Multi-replica readiness (proposed)](design/multi-replica.md)
-- [OpenTelemetry export (proposed)](design/otel-export.md)
+- [OpenTelemetry export (built, proposed)](design/otel-export.md)
 - [Run limits phase 3 (proposed)](design/run-limits-phase3.md)
 - [Read-side exfiltration (proposed)](design/read-side-exfiltration.md)
 
@@ -75,6 +76,7 @@
   - [ADR-0009: Output labelling](decisions/0009-output-labelling.md)
   - [ADR-0010: Run limits](decisions/0010-run-limits.md)
   - [ADR-0011: Cedar-aware list filtering](decisions/0011-cedar-aware-list-filtering.md)
+  - [ADR-0012: OpenTelemetry export](decisions/0012-opentelemetry-export.md)
 
 # Research
 
