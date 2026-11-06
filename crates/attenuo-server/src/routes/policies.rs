@@ -23,7 +23,7 @@ use sha2::Digest;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use super::{now, parse_json};
+use super::parse_json;
 use crate::authz::{CounterSource, StatedBudget, StatedLimit, MAX_STATED_LIMITS};
 use crate::error::ApiError;
 use crate::state::AppState;
@@ -167,7 +167,7 @@ pub async fn evaluate_policies(
     State(state): State<Arc<AppState>>,
     body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
-    let now = now();
+    let now = state.now();
     let mut raw: Value = parse_json(&body)?;
     let Some(obj) = raw.as_object_mut() else {
         return Err(ApiError::bad_request(

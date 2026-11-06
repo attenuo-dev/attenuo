@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use attenuo_core::ManualClock;
 use attenuo_policy::authzen;
 use attenuo_policy::{ArgType, ToolAttrs};
 use attenuo_proxy::jsonrpc::CODE_DENIED;
@@ -45,6 +46,8 @@ struct Harness {
     _upstream_task: Spawned,
     server: Spawned,
     state: Arc<AppState>,
+    /// The server's clock: [`ManualClock::advance`] steps past a window.
+    clock: Arc<ManualClock>,
     client: reqwest::Client,
     policy_path: PathBuf,
     db_path: Option<PathBuf>,
@@ -118,7 +121,8 @@ impl Harness {
             .collect();
         tweak(&mut cfg);
 
-        let (router, state) = attenuo_server::build(&cfg).unwrap();
+        let clock = ManualClock::new();
+        let (router, state) = attenuo_server::build_with_clock(&cfg, clock.clone()).unwrap();
         assert!(dir.path().join("keys/issuer.pem").exists());
         let server = spawn_router(router).await.unwrap();
         Self {
@@ -126,6 +130,7 @@ impl Harness {
             _upstream_task: upstream_task,
             server,
             state,
+            clock,
             client: reqwest::Client::new(),
             policy_path,
             db_path,
@@ -1935,7 +1940,8 @@ async fn record_window_seconds_sets_the_lease_refusal_window() {
     // Within the second: still one record.
     assert_eq!(refuse().await, first);
     assert_eq!(h.audit_entries().await.len(), before + 1);
-    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    // Past the one-second window, on the server's clock.
+    h.clock.advance(std::time::Duration::from_millis(1_100));
     let second = refuse().await;
     assert_ne!(second, first);
     let after = h.audit_entries().await;

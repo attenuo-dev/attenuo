@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use attenuo_core::{chain_id_of, CapabilitySet, DelegationChain, ToolCall};
+use attenuo_core::{chain_id_of, CapabilitySet, Clock, DelegationChain, ToolCall};
 use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, Path, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
@@ -133,6 +133,9 @@ struct AppState {
     /// The same window and capacity as `stream_end_records`, in its own table so a flood of
     /// one kind cannot fill the other's.
     lease_refusal_records: RecordWindow,
+    /// The time of the request checks: token and lease expiry, session TTL, record windows
+    /// ([`router_with_clock`]). Stream re-checks and awaited results read the system clock.
+    clock: Arc<dyn Clock>,
 }
 
 impl AppState {
@@ -157,6 +160,17 @@ impl AppState {
 
 /// Build the proxy router. Upstreams are mounted at `/mcp/{name}`.
 pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
+    router_with_clock(config, authorizer, attenuo_core::clock::system_clock())
+}
+
+/// [`router`], reading the time of its request checks (token and lease expiry, the session
+/// TTL, the record windows) from `clock`. Tests pass a [`attenuo_core::ManualClock`] to step
+/// past a TTL instead of sleeping; [`router`] passes the system clock.
+pub fn router_with_clock(
+    config: ProxyConfig,
+    authorizer: Arc<dyn Authorizer>,
+    clock: Arc<dyn Clock>,
+) -> Router {
     let stream_recheck = config.stream_recheck;
     let require_listed_tools = config.require_listed_tools;
     let screen_lists = config.list_filter == ListFilterMode::Policy;
@@ -188,6 +202,7 @@ pub fn router(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> Router {
             record_window_max_keys,
         )),
         lease_refusal_records: RecordWindow::with_max_keys(record_window, record_window_max_keys),
+        clock,
     });
     Router::new()
         .route(
@@ -363,7 +378,7 @@ async fn record_lease_refusal(
     };
     let key = who.chain.digest();
     let records = &state.lease_refusal_records;
-    match records.admit(&key, tool, reason, std::time::Instant::now()) {
+    match records.admit(&key, tool, reason, state.clock.now()) {
         Admission::Suppress { first } => {
             state
                 .authorizer
@@ -485,7 +500,7 @@ async fn session_gate(
         return Ok(owner);
     };
     let check = match &owner {
-        Some(o) => state.sessions.check(sid, o, Instant::now()),
+        Some(o) => state.sessions.check(sid, o, state.clock.now()),
         None => SessionCheck::Mismatch,
     };
     match check {
@@ -542,7 +557,7 @@ async fn adopt_session(
         return;
     };
     let outcome = match owner {
-        Some(o) => state.sessions.bind(&sid, o, Instant::now()),
+        Some(o) => state.sessions.bind(&sid, o, state.clock.now()),
         None => BindOutcome::Taken,
     };
     match outcome {
@@ -803,7 +818,7 @@ async fn handle_passthrough(
     let Some(upstream) = state.upstreams.get(&server).cloned() else {
         return unknown_server(&server);
     };
-    let now = OffsetDateTime::now_utc();
+    let now = state.clock.now_utc();
     let who = match authenticate(&state, &method, &uri, &headers, now).await {
         Ok(a) => a,
         Err(e) => return unauthorized(e),
@@ -1035,7 +1050,7 @@ async fn handle_post(
     let Some(upstream) = state.upstreams.get(&server) else {
         return unknown_server(&server);
     };
-    let now = OffsetDateTime::now_utc();
+    let now = state.clock.now_utc();
     let who = match authenticate(&state, &Method::POST, &uri, &headers, now).await {
         Ok(a) => a,
         Err(e) => return unauthorized(e),

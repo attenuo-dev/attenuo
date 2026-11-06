@@ -49,7 +49,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
 
-use super::{now, parse_json};
+use super::parse_json;
 use crate::clientauth::{self, ClientKind};
 use crate::error::{ApiError, REASON_INVALID_TOKEN, REASON_MISSING_TOKEN};
 use crate::state::AppState;
@@ -326,7 +326,7 @@ fn bearer_auth(
         }
         None => return Ok(None),
     };
-    let now = now();
+    let now = state.now();
     let v = state
         .verifier
         .verify(token, now)
@@ -359,7 +359,7 @@ fn evaluate_value(
     let (pep_id, pep_secret) = (pep_field("pep_id"), pep_field("pep_secret"));
     let mut req: EvaluationRequest = serde_json::from_value(raw)
         .map_err(|e| ApiError::bad_request("invalid_request", e.to_string()))?;
-    let now = now();
+    let now = state.now();
 
     // `body_chain_pep`: the PEP whose unsigned body chain is used. `pep_authenticated`: the
     // caller proved it is a `[[peps]]` entry, which decides whether it sees diagnostics.

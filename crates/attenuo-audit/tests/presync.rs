@@ -130,10 +130,9 @@ fn the_wal_is_synced_ahead_of_each_signed_checkpoint() {
     for i in 0..n {
         audit.append(record(i as usize)).unwrap();
     }
-    wait_for("two WAL syncs", Duration::from_secs(10), || {
-        audit.wal_timings().wal_presyncs >= 2
-    });
-    std::thread::sleep(Duration::from_millis(100));
+    // Every sync these appends asked for has run once the checkpointer has settled: two,
+    // and no more.
+    audit.settle_wal_checkpointer();
     assert_eq!(audit.wal_timings().wal_presyncs, 2);
     let cps = audit.checkpoints_between(0, n).unwrap();
     assert_eq!(
@@ -156,7 +155,9 @@ fn a_full_store_does_not_sync_ahead_of_signed_checkpoints() {
     for i in 0..every + 1 {
         audit.append(record(i as usize)).unwrap();
     }
-    std::thread::sleep(Duration::from_millis(200));
+    // Nothing asked for a sync: once the checkpointer has handled everything sent to it,
+    // it has synced nothing.
+    audit.settle_wal_checkpointer();
     assert_eq!(audit.wal_timings().wal_presyncs, 0);
     assert_eq!(audit.checkpoints_between(0, every + 1).unwrap().len(), 1);
 }

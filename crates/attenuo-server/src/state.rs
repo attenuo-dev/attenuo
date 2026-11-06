@@ -85,6 +85,10 @@ pub struct AppState {
     pub approvals_client_id: Option<String>,
     /// `[approvals.notify]`: the approval notifier; `None` when unset.
     pub approval_notifier: Option<crate::notify::ApprovalNotifier>,
+    /// The time of every request check (token, lease and approval expiry, the embedded
+    /// proxy's session TTL and record windows): the system clock, except in tests that step
+    /// past a TTL with a [`attenuo_core::ManualClock`] ([`crate::build_with_clock`]).
+    pub clock: Arc<dyn attenuo_core::Clock>,
 }
 
 impl AppState {
@@ -283,7 +287,13 @@ impl AppState {
             sink_fails_readiness: config.audit.sink.as_ref().is_some_and(|s| s.fail_readiness),
             approvals_client_id: config.approvals.client_id.clone(),
             approval_notifier,
+            clock: attenuo_core::clock::system_clock(),
         })
+    }
+
+    /// The current time by [`AppState::clock`].
+    pub fn now(&self) -> OffsetDateTime {
+        self.clock.now_utc()
     }
 
     /// Run `f` on tokio's blocking pool.

@@ -29,10 +29,6 @@ pub const REASON_TOKEN_ISSUED: &str = "token_issued";
 /// Audit `reason` for a successful lease renewal.
 pub const REASON_LEASE_RENEWED: &str = "lease_renewed";
 
-pub(crate) fn now() -> OffsetDateTime {
-    OffsetDateTime::now_utc()
-}
-
 /// The token from `Authorization: Bearer <token>` (or `DPoP <token>`, RFC 9449 §7.1),
 /// `Ok(None)` when the header is absent, or an error when it is present but neither. The
 /// parsing is [`attenuo_core::authorization::token_of`], shared with the proxy.

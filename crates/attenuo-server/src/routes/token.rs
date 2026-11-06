@@ -87,7 +87,7 @@ use axum::Json;
 use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
 
-use super::{audit_issuance, no_store, now, parse_json, register_issued};
+use super::{audit_issuance, no_store, parse_json, register_issued};
 use crate::actor::{VerifiedActor, ACTOR_TOKEN_TYPE};
 use crate::clientauth::{self, ClientKind};
 use crate::config::{capability_set, ActorAuth, CapSpec};
@@ -100,7 +100,7 @@ pub async fn exchange(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     let value = parse_body(&headers, &body)?;
-    let now = now();
+    let now = state.now();
     if crate::idp::intake::is_intake(&value) {
         return crate::idp::intake::handle(&state, &headers, value, now).await;
     }

@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use attenuo_core::ToolCall;
+use attenuo_core::{ManualClock, ToolCall};
 use attenuo_policy::ToolAttrs;
 use attenuo_proxy::testing::{spawn_router, FakeMcpServer, Spawned};
 use attenuo_proxy::UpstreamConfig;
@@ -126,6 +126,8 @@ struct Harness {
     idp: FakeIdp,
     server: Spawned,
     state: Arc<AppState>,
+    /// The server's clock: [`ManualClock::advance`] steps past an approval's TTL.
+    clock: Arc<ManualClock>,
     cfg: Config,
     upstream: FakeMcpServer,
     _upstream_task: Spawned,
@@ -197,11 +199,13 @@ impl Harness {
             client_ids: [("planner".to_string(), CLIENT_AUD.to_string())].into(),
         }];
         tweak(&mut cfg);
-        let (router, state) = attenuo_server::build(&cfg).unwrap();
+        let clock = ManualClock::new();
+        let (router, state) = attenuo_server::build_with_clock(&cfg, clock.clone()).unwrap();
         Self {
             idp,
             server: spawn_router(router).await.unwrap(),
             state,
+            clock,
             cfg,
             upstream,
             _upstream_task: upstream_task,
@@ -546,7 +550,8 @@ async fn expired_approval_is_gated() {
     let g = h.gated(&token, "alice/site").await;
     h.grant_as_alice(&g.approval_id).await;
     let g2 = h.gated(&token, "alice/other").await;
-    tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+    // Past the one-second TTL of both, on the server's clock.
+    h.clock.advance(std::time::Duration::from_secs(2));
     // Granted but expired: not used.
     let v = h.delete(&token, "alice/site").await;
     assert_eq!(v["error"]["code"], -32008, "{v}");

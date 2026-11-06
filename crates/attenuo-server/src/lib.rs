@@ -77,7 +77,19 @@ pub use state::AppState;
 
 /// Build the state and the full router from a config.
 pub fn build(config: &Config) -> anyhow::Result<(Router, Arc<AppState>)> {
-    let state = Arc::new(AppState::from_config(config)?);
+    build_with_clock(config, attenuo_core::clock::system_clock())
+}
+
+/// [`build`], with every request check (token, lease and approval expiry, the proxy's
+/// session TTL and record windows) reading the time from `clock`. Tests pass a
+/// [`attenuo_core::ManualClock`] to step past a TTL instead of sleeping through it.
+pub fn build_with_clock(
+    config: &Config,
+    clock: Arc<dyn attenuo_core::Clock>,
+) -> anyhow::Result<(Router, Arc<AppState>)> {
+    let mut state = AppState::from_config(config)?;
+    state.clock = clock;
+    let state = Arc::new(state);
     let router = router(state.clone(), config.upstreams.clone(), config);
     Ok((router, state))
 }
@@ -150,12 +162,13 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
         ServerAuthorizer::new(state.verifier.clone(), state.pipeline.clone())
             .with_dpop(state.dpop.clone()),
     );
-    let proxy = attenuo_proxy::router(
+    let proxy = attenuo_proxy::router_with_clock(
         // Validated in `AppState::from_config`.
         config
             .proxy
             .apply(ProxyConfig::new(config.server.listen, upstreams)),
         authorizer,
+        state.clock.clone(),
     );
     api.merge(proxy)
         .layer(axum::middleware::from_fn_with_state(
@@ -228,7 +241,7 @@ where
 {
     let mut total = 0;
     for _ in 0..state.lease_maintenance.max_passes {
-        let now = time::OffsetDateTime::now_utc();
+        let now = state.now();
         match state.blocking(move |s| pass(s, now)).await {
             Ok((pruned, wrapped)) => {
                 total += count(&state.metrics, pruned);

@@ -3,10 +3,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use attenuo_core::{ArgConstraint, Capability, DelegationChain};
+use attenuo_core::{ArgConstraint, Capability, DelegationChain, ManualClock};
 use attenuo_proxy::jsonrpc::{CODE_DENIED, CODE_UNAUTHORIZED, CODE_UNKNOWN_SERVER};
 use attenuo_proxy::testing::{spawn_router, test_chain, FakeMcpServer, Spawned, StaticAuthorizer};
-use attenuo_proxy::{router, ProxyConfig, UpstreamConfig, DECISION_ID_HEADER};
+use attenuo_proxy::{router_with_clock, ProxyConfig, UpstreamConfig, DECISION_ID_HEADER};
 use serde_json::{json, Value};
 
 const SERVER: &str = "github";
@@ -16,6 +16,8 @@ struct Harness {
     _upstream_task: Spawned,
     proxy: Spawned,
     authorizer: Arc<StaticAuthorizer>,
+    /// The proxy's clock: [`ManualClock::advance`] steps past a TTL or a window.
+    clock: Arc<ManualClock>,
     client: reqwest::Client,
     /// The `Mcp-Session-Id` each bearer was given, sent back on its later requests like an MCP
     /// client would.
@@ -52,12 +54,15 @@ impl Harness {
             "127.0.0.1:0".parse()?,
             vec![UpstreamConfig::new(SERVER, upstream_task.url("/mcp"))],
         ));
-        let proxy = spawn_router(router(config, authorizer.clone())).await?;
+        let clock = ManualClock::new();
+        let proxy =
+            spawn_router(router_with_clock(config, authorizer.clone(), clock.clone())).await?;
         Ok(Self {
             upstream,
             _upstream_task: upstream_task,
             proxy,
             authorizer,
+            clock,
             client: reqwest::Client::new(),
             sessions: Mutex::default(),
         })
@@ -1065,7 +1070,8 @@ async fn a_new_window_records_the_next_lease_refusal() -> anyhow::Result<()> {
         refusal_names(h.rpc(Some("tok"), &initialize_msg(2)).await?).await?,
         first
     );
-    tokio::time::sleep(window + std::time::Duration::from_millis(100)).await;
+    h.clock
+        .advance(window + std::time::Duration::from_millis(100));
     let second = refusal_names(h.rpc(Some("tok"), &initialize_msg(3)).await?).await?;
     assert_ne!(second, first);
     let records = h.authorizer.decisions();

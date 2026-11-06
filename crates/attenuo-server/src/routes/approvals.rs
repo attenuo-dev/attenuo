@@ -50,7 +50,7 @@ use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use super::{bearer_of, now, parse_json, ADMIN_SUBJECT};
+use super::{bearer_of, parse_json, ADMIN_SUBJECT};
 use crate::error::{ApiError, REASON_MISSING_TOKEN};
 use crate::state::AppState;
 
@@ -310,7 +310,7 @@ pub async fn user_decide(
             "approvals are not accepted with a delegation token; present the user's ID token",
         ));
     }
-    let now = now();
+    let now = state.now();
     let id2 = id.clone();
     let a = state.blocking(move |s| load(s, &id2)).await?;
     let verified = verify_user(&state, &a, &token, now).await?;
@@ -341,7 +341,7 @@ pub async fn user_get(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     let token = required_bearer(&headers)?.to_owned();
-    let now = now();
+    let now = state.now();
     let id2 = id.clone();
     let a = state.blocking(move |s| load(s, &id2)).await?;
     if is_delegation_token(&state, &token) {
@@ -388,7 +388,7 @@ pub async fn admin_decide(
 ) -> Result<Json<Value>, ApiError> {
     let body: DecideBody = parse_json(&body)?;
     let grant = body.grant()?;
-    let now = now();
+    let now = state.now();
     state
         .blocking(move |s| {
             let approver = Approver {
@@ -406,7 +406,7 @@ pub async fn admin_get(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let now = now();
+    let now = state.now();
     state
         .blocking(move |s| Ok(Json(approval_body(s, &load(s, &id)?, now))))
         .await
@@ -426,7 +426,7 @@ pub async fn admin_list(
         ),
     };
     let limit = q.limit.unwrap_or(MAX_LIST).clamp(1, MAX_LIST);
-    let now = now();
+    let now = state.now();
     state
         .blocking(move |s| {
             let chain = q.chain_id.filter(|c| !c.is_empty()).map(LeaseId::new);
