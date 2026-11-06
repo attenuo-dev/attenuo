@@ -42,17 +42,22 @@ pub const PLACEHOLDER_ADMIN_TOKENS: &[&str] = &[
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// `[server]`: listen address and public URL.
     #[serde(default)]
     pub server: ServerSection,
+    /// `[issuer]`: token issuer identity, signing key, chain depth and lifetimes.
     #[serde(default)]
     pub issuer: IssuerSection,
+    /// `[policy]`: the Cedar policy file and the tool catalog.
     #[serde(default)]
     pub policy: PolicySection,
+    /// `[audit]`: the audit log database, checkpoints, durability and the optional external sink.
     #[serde(default)]
     pub audit: AuditSection,
     /// MCP servers mounted at `/mcp/{name}`.
     #[serde(default)]
     pub upstreams: Vec<UpstreamConfig>,
+    /// `[admin]`: the bearer token for `/admin/*`.
     #[serde(default)]
     pub admin: AdminSection,
     /// Trusted identity providers for hop-0 intake (OIDC ID tokens and ID-JAG). See [`IdpConfig`].
@@ -66,17 +71,22 @@ pub struct Config {
     /// IdP intake and by the dev root mint. See [`RootGrant`].
     #[serde(default)]
     pub root_grants: Vec<RootGrant>,
+    /// `[dev]`: development-only switches, all off by default.
     #[serde(default)]
     pub dev: DevSection,
+    /// `[metrics]`: the Prometheus listener.
     #[serde(default)]
     pub metrics: MetricsSection,
     /// The opt-in admin console listener. See [`AdminUiSection`].
     #[serde(default)]
     pub admin_ui: AdminUiSection,
+    /// `[proxy]`: the MCP proxy at `/mcp/{server}`.
     #[serde(default)]
     pub proxy: ProxySection,
+    /// `[authzen]`: the AuthZEN evaluation endpoints.
     #[serde(default)]
     pub authzen: AuthzenSection,
+    /// `[token]`: the `POST /token` exchange endpoint.
     #[serde(default)]
     pub token: TokenSection,
     /// Approvals of calls gated by `@obligation("approval")` (ADR-0009). See
@@ -472,8 +482,12 @@ pub struct IssuerSection {
     /// `aud` of every token this server mints (and requires on verification).
     #[serde(default = "default_audience")]
     pub audience: String,
+    /// Most hops a chain may have, checked at exchange and at every call. Default
+    /// [`attenuo_core::chain::DEFAULT_MAX_DEPTH`].
     #[serde(default = "default_max_depth")]
     pub max_depth: usize,
+    /// Lifetime of a minted token, in seconds (default 900); an exchanged hop never outlives its
+    /// parent. Must be positive.
     #[serde(default = "default_ttl")]
     pub default_ttl_seconds: u64,
     /// How long a hop's lease lives after issuance or renewal (default 300). Revocation takes
@@ -1746,7 +1760,9 @@ fn default_clock_skew() -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
+    /// The OAuth `client_id`; for an agent, also the root hop's agent id.
     pub id: String,
+    /// Lowercase hex SHA-256 of the client secret.
     pub secret_sha256: String,
 }
 
@@ -1766,9 +1782,14 @@ pub struct RootGrant {
     /// Pin the grant to one user. When absent, the grant applies to every user of `issuer`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
+    /// The IdP issuer (`iss`) whose users the grant covers.
     pub issuer: String,
+    /// The agent the root token is issued to: the authenticated `[[agents]]` id for IdP intake,
+    /// the request's `agent` for the dev root mint.
     pub agent: String,
+    /// The most a root token under this grant may carry; a request is attenuated against it.
     pub capabilities: Vec<CapSpec>,
+    /// User attributes the dev root mint copies into the user block. Ignored by IdP intake.
     #[serde(default)]
     pub attributes: BTreeMap<String, Value>,
     /// RFC 8693 §4.4 `may_act` of root tokens minted under this grant: the agents allowed to
@@ -1836,7 +1857,9 @@ pub fn resolve_may_act(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum CapSpec {
+    /// Shorthand `"server:tool"`, with no constraints or limits.
     Short(String),
+    /// The full table form.
     Full(Capability),
 }
 
@@ -1845,10 +1868,14 @@ pub enum CapSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CapabilityConfig {
+    /// Server name pattern: exact, `*` or `prefix*`.
     pub server: String,
+    /// Tool name pattern: exact, `*` or `prefix*`.
     pub tool: String,
+    /// Constraints on named arguments; an argument not listed is unconstrained.
     #[serde(default)]
     pub constraints: BTreeMap<String, attenuo_core::ArgConstraint>,
+    /// Run limits on calls the capability matches.
     #[serde(default)]
     pub limits: attenuo_core::Limits,
 }
@@ -1889,6 +1916,11 @@ impl<'de> Deserialize<'de> for CapSpec {
 }
 
 impl CapSpec {
+    /// The capability this entry stands for.
+    ///
+    /// # Errors
+    ///
+    /// A shorthand that is not `server:tool` with both parts non-empty.
     pub fn to_capability(&self) -> Result<Capability, String> {
         match self {
             CapSpec::Full(c) => Ok(c.clone()),

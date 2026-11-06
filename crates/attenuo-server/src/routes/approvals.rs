@@ -61,6 +61,7 @@ pub const MAX_LIST: usize = 500;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DecideBody {
+    /// `grant` or `decline`; anything else is a 400 `invalid_request`.
     pub decision: String,
 }
 

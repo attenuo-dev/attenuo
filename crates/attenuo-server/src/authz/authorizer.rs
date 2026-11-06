@@ -31,6 +31,8 @@ pub struct ServerAuthorizer {
 }
 
 impl ServerAuthorizer {
+    /// An authorizer that verifies tokens with `verifier` and decides with `pipeline`. DPoP is
+    /// not checked until [`Self::with_dpop`], so a bound token is refused until then.
     pub fn new(verifier: Verifier, pipeline: Arc<Pipeline>) -> Self {
         Self {
             verifier,

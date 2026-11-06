@@ -19,14 +19,19 @@ use crate::metrics::Metrics;
 
 /// Everything the handlers share.
 pub struct AppState {
+    /// Mints and exchanges tokens with the server's signing key.
     pub issuer: Issuer,
+    /// Verifies delegation tokens against the current and retired issuer keys.
     pub verifier: Verifier,
+    /// The decision pipeline the proxy and the AuthZEN endpoints share.
     pub pipeline: Arc<Pipeline>,
+    /// The hash-chained audit log.
     pub audit: Arc<SqliteAudit>,
     /// Public keys that may have signed audit checkpoints (the JWKS: current plus retired).
     pub checkpoint_keys: CheckpointKeys,
     /// `[audit] checkpoint_interval_seconds`; zero means no timer.
     pub checkpoint_interval: std::time::Duration,
+    /// The lease registry. It shares the audit log's SQLite file unless that is `:memory:`.
     pub leases: Arc<SqliteLeaseStore>,
     /// `[leases] session_retention_seconds`; `None` when session bindings are never pruned.
     pub session_retention: Option<Duration>,
@@ -45,7 +50,9 @@ pub struct AppState {
     /// (while the engine's write lock is held, so the two never disagree), and left alone by
     /// a failed one.
     pub loaded_policies: RwLock<LoadedPolicies>,
+    /// `[admin] token`, the bearer for `/admin/*`; `None` answers every admin call 403.
     pub admin_token: Option<String>,
+    /// `[[root_grants]]`, the ceilings of root tokens.
     pub root_grants: Vec<RootGrant>,
     /// Trusted IdPs for hop-0 intake.
     pub idps: IdpRegistry,
@@ -67,11 +74,13 @@ pub struct AppState {
     pub authzen_diagnostics: crate::config::AuthzenDiagnostics,
     /// PEPs allowed to send unsigned chains (`[[peps]]`, validated).
     pub peps: Vec<AgentConfig>,
+    /// `[server] public_url`.
     pub public_url: Option<String>,
     /// `[issuer] lease_interval_seconds`: lifetime of a lease after issuance or renewal.
     pub lease_interval: Duration,
     /// Precomputed `/.well-known/jwks.json` body.
     pub jwks: Value,
+    /// The server's metrics, served on the `[metrics]` listener.
     pub metrics: Arc<Metrics>,
     /// One-time use of IdP credentials and of (parent token, actor) exchanges.
     pub replay: crate::replay::ReplayCache,

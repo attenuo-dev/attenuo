@@ -162,6 +162,10 @@ pub struct Dpop {
 }
 
 impl Dpop {
+    /// DPoP checks in `mode`, accepting proofs whose `iat` is within `max_age_seconds` of the
+    /// clock (at least 1) and remembering up to `replay_capacity` of them for replay detection.
+    /// `public_url` (a trailing `/` dropped) is the base of the expected `htu`. No server nonces
+    /// until [`Self::with_nonce`].
     pub fn new(
         mode: DpopMode,
         max_age_seconds: u64,

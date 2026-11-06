@@ -46,6 +46,8 @@ use crate::metrics::Metrics;
 /// Delivers one queued item (a shipped checkpoint unless named). `Err` is retried.
 #[async_trait]
 pub trait Deliver<T: Sync = ShippedCheckpoint>: Send + Sync {
+    /// Deliver `item` once. `Err` carries the failure for the log and `last_error`; the queue
+    /// retries after a backoff, or gives up as its [`QueueRole`] says.
     async fn deliver(&self, item: &T) -> Result<(), String>;
 }
 
@@ -67,9 +69,17 @@ pub enum Settled {
     /// Delivered.
     Delivered,
     /// Attempt number `attempts` failed; the next one follows in `wait`.
-    Retry { attempts: u32, wait: Duration },
+    Retry {
+        /// Failed attempts so far, this one and any made before the item was queued included.
+        attempts: u32,
+        /// Delay before the next attempt.
+        wait: Duration,
+    },
     /// Every attempt failed ([`QueueRole::give_up`]): dropped.
-    GaveUp { attempts: u32 },
+    GaveUp {
+        /// Failed attempts in all, any made before the item was queued included.
+        attempts: u32,
+    },
     /// Dropped from a full queue before delivery.
     Dropped,
 }
@@ -79,6 +89,7 @@ pub enum Settled {
 /// delivered and failure counters move; [`Settled::Dropped`] runs on the thread that pushed.
 /// Never called for an item left queued at shutdown: it stays wherever the hook keeps it.
 pub trait Settle<T>: Send + Sync + std::fmt::Debug {
+    /// How one attempt to deliver `item` ended, or that it was dropped from a full queue.
     fn settled(&self, item: &T, how: Settled);
 
     /// Items kept elsewhere that wait for room in the queue, oldest first, at most `room`
@@ -103,7 +114,10 @@ pub enum QueueRole {
     /// `[audit.sink]`: retried until delivered.
     Checkpoints,
     /// `[approvals.notify]`: given up after this many failed attempts (at least 1).
-    ApprovalNotices { max_attempts: u32 },
+    ApprovalNotices {
+        /// The `[approvals.notify]` attempt limit; 0 counts as 1.
+        max_attempts: u32,
+    },
 }
 
 impl QueueRole {
@@ -163,7 +177,9 @@ impl QueueRole {
 /// between half and all of `min(initial * 2^n, max)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Backoff {
+    /// The ceiling of the first retry.
     pub initial: Duration,
+    /// The most any retry waits.
     pub max: Duration,
 }
 
@@ -211,12 +227,17 @@ impl Jitter {
 /// Queue limits and timing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SinkLimits {
+    /// Most items queued; pushing onto a full queue drops the oldest.
     pub capacity: usize,
+    /// Lag (or failing time) past which [`SinkStatus::degraded`] is set.
     pub max_lag: Duration,
+    /// Retry delays.
     pub backoff: Backoff,
 }
 
 impl SinkLimits {
+    /// The limits `[audit.sink]` sets: `queue_capacity`, `max_lag_seconds`,
+    /// `initial_backoff_ms`, `max_backoff_seconds`.
     pub fn from_config(cfg: &SinkSection) -> Self {
         Self {
             capacity: cfg.queue_capacity,
@@ -304,12 +325,15 @@ impl<T> Shared<T> {
 /// Whether the sink keeps up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SinkStatus {
+    /// Items waiting for delivery, not counting the one in flight.
     pub queued: usize,
+    /// The queue's capacity ([`SinkLimits::capacity`]).
     pub capacity: usize,
     /// Age of the oldest item not yet delivered (zero when none).
     pub lag: Duration,
     /// How long deliveries have been failing (since the last success).
     pub failing_for: Option<Duration>,
+    /// The error of the last failed attempt, cleared by a success.
     pub last_error: Option<String>,
     /// The queue is full, or `lag` (or `failing_for`) exceeds `max_lag_seconds`.
     pub degraded: bool,
@@ -362,6 +386,7 @@ impl<T: QueueItem> QueueHandle<T> {
         }
     }
 
+    /// How the queue is keeping up now.
     pub fn status(&self) -> SinkStatus {
         self.status_at(Instant::now())
     }
@@ -437,10 +462,12 @@ impl<T: QueueItem> Queue<T> {
         })
     }
 
+    /// A producer end of this queue.
     pub fn handle(&self) -> QueueHandle<T> {
         self.handle.clone()
     }
 
+    /// How the queue is keeping up now.
     pub fn status(&self) -> SinkStatus {
         self.handle.status()
     }
@@ -487,6 +514,7 @@ impl SinkHandle {
             .push(ShippedCheckpoint::new(cp, self.public_url.clone()));
     }
 
+    /// How the sink is keeping up now.
     pub fn status(&self) -> SinkStatus {
         self.queue.status()
     }
@@ -552,6 +580,7 @@ impl CheckpointSink {
         })
     }
 
+    /// A producer end for the audit log's checkpoint hook.
     pub fn handle(&self) -> SinkHandle {
         SinkHandle {
             queue: self.queue.handle(),
@@ -559,10 +588,12 @@ impl CheckpointSink {
         }
     }
 
+    /// The configured kind (`webhook`, `file` or `s3`).
     pub fn kind(&self) -> SinkKind {
         self.kind
     }
 
+    /// How the sink is keeping up now, which `/readyz` reports.
     pub fn status(&self) -> SinkStatus {
         self.queue.status()
     }
@@ -734,6 +765,12 @@ pub struct WebhookDeliver {
 }
 
 impl WebhookDeliver {
+    /// A webhook deliverer for `url`, with `bearer` as `Authorization: Bearer` when set. Each
+    /// request times out after `timeout`; redirects are not followed.
+    ///
+    /// # Errors
+    ///
+    /// The HTTP client cannot be built.
     pub fn new(url: String, bearer: Option<String>, timeout: Duration) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(timeout)
@@ -812,8 +849,11 @@ impl Deliver for FileDeliver {
 /// Credentials for [`S3Deliver`].
 #[derive(Clone)]
 pub struct S3Credentials {
+    /// AWS access key id.
     pub access_key_id: String,
+    /// AWS secret access key. Left out of `Debug`.
     pub secret_access_key: String,
+    /// STS session token, sent as `x-amz-security-token` when set. Left out of `Debug`.
     pub session_token: Option<String>,
 }
 
@@ -877,6 +917,12 @@ impl S3Deliver {
         )
     }
 
+    /// An S3 deliverer for `bucket` at `endpoint` (a trailing `/` is dropped), naming objects
+    /// under `prefix`. Each request times out after `timeout`; redirects are not followed.
+    ///
+    /// # Errors
+    ///
+    /// The HTTP client cannot be built.
     pub fn new(
         endpoint: String,
         bucket: String,
@@ -1008,16 +1054,24 @@ pub fn uri_encode(s: &str, encode_slash: bool) -> String {
 
 /// What SigV4 signs.
 pub struct SigV4Request<'a> {
+    /// HTTP method, for example `PUT`.
     pub method: &'a str,
     /// Already encoded with [`uri_encode`].
     pub canonical_uri: &'a str,
+    /// Canonical query string, already encoded and sorted; empty when there is none.
     pub canonical_query: &'a str,
     /// Lowercase names; every header listed here is signed.
     pub headers: &'a [(String, String)],
+    /// Hex SHA-256 of the request body.
     pub payload_sha256: &'a str,
+    /// AWS region, for example `us-east-1`.
     pub region: &'a str,
+    /// AWS service name, for example `s3`.
     pub service: &'a str,
+    /// Request time as `YYYYMMDD'T'HHMMSS'Z'` (the `x-amz-date` header); its first eight
+    /// characters are the scope date.
     pub amz_date: &'a str,
+    /// The signing credentials.
     pub creds: &'a S3Credentials,
 }
 

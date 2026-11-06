@@ -78,9 +78,12 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// Body of `POST /admin/leases/{lease_id}/revoke`; an empty body is allowed.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RevokeBody {
+    /// Why the lease is revoked, stored with it and in the audit record. Default
+    /// `revoked by admin`.
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -151,6 +154,8 @@ pub struct SelectorRevokeBody {
     /// hashes it and resolves it to the chains that opened it through the proxy.
     #[serde(default)]
     pub session: Option<String>,
+    /// Why the leases are revoked, for the audit record. Default `revoked by admin`; ignored
+    /// with `?preview=true`.
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -357,6 +362,7 @@ pub struct RefundBody {
     /// The decision whose run-limit charge to return: the id of the allowed call's decision
     /// record (the AuthZEN `context.decision_id`).
     pub decision_id: String,
+    /// Why the charge is returned, for the audit record. Default `refunded by admin`.
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -1089,6 +1095,7 @@ pub async fn admin_response_headers(req: Request, next: Next) -> Response {
 /// Entries read per blocking-pool hop while streaming an export.
 const EXPORT_PAGE: usize = 500;
 
+/// Query of `GET /admin/audit/export`: the range and the optional filters.
 #[derive(Debug, Deserialize)]
 pub struct ExportQuery {
     /// First sequence number (default 1).

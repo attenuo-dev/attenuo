@@ -45,6 +45,7 @@ use super::{
 // ---------------------------------------------------------------------------------------
 // Command line
 
+/// The `attenuo-bench` subcommands, each starting its own servers.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Token-exchange throughput: clients exchange their token to a fresh actor per request.
@@ -56,6 +57,7 @@ pub enum Command {
     HotPath(crate::hotpath::HotPathArgs),
 }
 
+/// Options every subcommand but `hot-path` shares.
 #[derive(Debug, Clone, Args)]
 pub struct Common {
     /// Directory holding the `attenuo-server` binary (default: this executable's directory).
@@ -78,8 +80,10 @@ pub struct Common {
     pub markdown: Option<PathBuf>,
 }
 
+/// Options of `exchange`.
 #[derive(Debug, Clone, Args)]
 pub struct ExchangeArgs {
+    /// Binaries, timing, audit modes and outputs.
     #[command(flatten)]
     pub common: Common,
     /// Closed-loop clients (ignored with `--open-loop`).
@@ -93,8 +97,10 @@ pub struct ExchangeArgs {
     pub open_loop: Vec<f64>,
 }
 
+/// Options of `lease-renew`.
 #[derive(Debug, Clone, Args)]
 pub struct LeaseArgs {
+    /// Binaries, timing, audit modes and outputs.
     #[command(flatten)]
     pub common: Common,
     /// Cells as `LEASES:INTERVAL_SECONDS`, comma separated. Leases are rounded up to a
@@ -123,6 +129,7 @@ impl ActorIds {
         }
     }
 
+    /// Ids with a prefix drawn from the process id and the clock, so two runs differ.
     pub fn for_this_run() -> Self {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -152,6 +159,11 @@ pub struct Arrivals {
 }
 
 impl Arrivals {
+    /// Arrivals at `rate` per second from a fixed `seed`, so a schedule can be repeated.
+    ///
+    /// # Panics
+    ///
+    /// When `rate` is not a positive finite number.
     pub fn poisson(rate: f64, seed: u64) -> Self {
         assert!(rate > 0.0 && rate.is_finite(), "rate must be positive");
         Self {
@@ -188,18 +200,24 @@ fn record(h: &mut Histogram<u64>, d: Duration) {
     let _ = h.record((d.as_nanos() as u64).max(1));
 }
 
+/// Settings of one open-loop run ([`run_open`]).
 #[derive(Debug, Clone)]
 pub struct OpenCfg {
+    /// Mean arrival rate, in requests per second.
     pub rate: f64,
     /// Time zero of the schedule.
     pub start: Instant,
+    /// Arrivals before `start + warmup` are sent but not measured.
     pub warmup: Duration,
+    /// Length of the measured window after the warm-up.
     pub duration: Duration,
     /// Requests in flight at once; an arrival that finds all slots taken is shed and counted.
     pub max_inflight: usize,
+    /// Seed of the arrival schedule.
     pub seed: u64,
 }
 
+/// What an open-loop run measured; histograms are in nanoseconds.
 #[derive(Debug)]
 pub struct OpenOut {
     /// Arrivals scheduled inside the measured window.
@@ -210,7 +228,9 @@ pub struct OpenOut {
     pub done_in_window: u64,
     /// Of those, answered correctly at any time (after the drain).
     pub ok: u64,
+    /// Of those, answered wrongly or failed.
     pub errors: u64,
+    /// The first wrong answer, for the failure message.
     pub first_bad: Option<String>,
     /// From the scheduled arrival to the end of the response.
     pub latency: Histogram<u64>,
@@ -306,11 +326,16 @@ where
     out
 }
 
+/// What a closed-loop run ([`run_closed`]) measured over its window.
 #[derive(Debug)]
 pub struct ClosedOut {
+    /// Requests answered correctly.
     pub ok: u64,
+    /// Requests answered wrongly or failed.
     pub errors: u64,
+    /// The first wrong answer, for the failure message.
     pub first_bad: Option<String>,
+    /// Latency of the correct answers, in nanoseconds from send.
     pub latency: Histogram<u64>,
 }
 
@@ -442,6 +467,7 @@ fn clk_tck() -> f64 {
 /// Server CPU over a measured window.
 #[derive(Debug, Clone, Serialize)]
 pub struct Cpu {
+    /// Server CPU time (user plus system) in the window, in seconds.
     pub seconds: f64,
     /// Share of one core, in percent, over the window.
     pub pct_of_core: f64,
@@ -804,11 +830,14 @@ enum Load {
     Open(f64),
 }
 
+/// One measured cell: load, latency, server CPU and memory.
 #[derive(Debug, Clone, Serialize)]
 pub struct Measured {
     /// `closed` or `open`.
     pub load: &'static str,
+    /// Closed loop: the number of clients.
     pub clients: Option<usize>,
+    /// Open loop: the arrival rate, in requests per second.
     pub offered_rps: Option<f64>,
     /// Arrivals dropped because too many requests were already in flight (open loop).
     pub shed: u64,
@@ -816,17 +845,21 @@ pub struct Measured {
     /// rate of correct answers.
     #[serde(flatten)]
     pub stats: Stats,
+    /// Server CPU over the window, when `/proc` could be read.
     pub cpu: Option<Cpu>,
+    /// Server resident set size after the window, in MiB.
     pub server_rss_mb: Option<f64>,
     /// Open loop only: p50 and p99 of the time from sending a request to its answer, without
     /// the time the arrival waited for the scheduler (see `dispatch_lag_*`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_p50_us: Option<f64>,
+    /// Open loop only: p99 of the same time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_p99_us: Option<f64>,
     /// Open loop only: how late the scheduler dispatched arrivals (timer resolution is 1 ms).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dispatch_lag_p50_us: Option<f64>,
+    /// Open loop only: p99 of the same lag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dispatch_lag_p99_us: Option<f64>,
 }
@@ -916,11 +949,14 @@ fn ensure_clean(cell: &str, m: &Measured) -> Result<()> {
 // ---------------------------------------------------------------------------------------
 // exchange
 
+/// One `exchange` cell.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExchangeRow {
+    /// Audit mode label (`memory`, `file`, `file_full`).
     pub audit: String,
     /// Hops in the token that is exchanged (the child has one more).
     pub parent_hops: usize,
+    /// The measurements.
     #[serde(flatten)]
     pub m: Measured,
 }
@@ -1007,6 +1043,7 @@ fn cpu_cells(c: &Option<Cpu>) -> String {
     })
 }
 
+/// The markdown tables of an `exchange` run, with the audit checks `checks` below them.
 pub fn render_exchange(rows: &[ExchangeRow], checks: &[Value]) -> String {
     let mut s = String::from("### Token exchange (`POST /token`), fresh actor per request\n\n");
     s.push_str(
@@ -1065,41 +1102,63 @@ fn render_checks(checks: &[Value]) -> String {
 const GROUP: usize = 100;
 const RENEW_INFLIGHT: usize = 256;
 
+/// One `lease-renew` cell: `leases` live leases, each renewed once per `interval_s`.
 #[derive(Debug, Clone, Serialize)]
 pub struct LeaseRow {
+    /// Audit mode label (`memory`, `file`, `file_full`).
     pub audit: String,
+    /// Live leases (the requested count rounded up to a multiple of 100).
     pub leases: usize,
+    /// Root tokens, one per group of 100 leases.
     pub roots: usize,
+    /// Seconds between two renewals of one lease.
     pub interval_s: f64,
+    /// `leases / interval_s`, rounded to 0.1.
     pub offered_rps: f64,
+    /// Renewals finished inside the window, per second.
     pub achieved_rps: f64,
+    /// Successful renewals after the warm-up.
     pub renewals: u64,
+    /// Failed renewals; any fails the run.
     pub errors: u64,
     /// Renewals that finished later than one interval after they were due.
     pub later_than_interval: u64,
     /// From the due time to the end of the response.
     pub p50_us: f64,
+    /// p99 of the same time, in microseconds.
     pub p99_us: f64,
+    /// Slowest renewal by the same measure, in microseconds.
     pub max_us: f64,
     /// From the start of the request to the end of the response.
     pub service_p50_us: f64,
+    /// p99 of the same time, in microseconds.
     pub service_p99_us: f64,
+    /// Server CPU over the window.
     pub cpu: Option<Cpu>,
     /// Server CPU with the same leases live and no renewals, percent of one core.
     pub idle_cpu_pct: Option<f64>,
+    /// Server resident set size once the leases exist, in MiB.
     pub rss_mb_before: Option<f64>,
+    /// Server resident set size after the window, in MiB.
     pub rss_mb_after: Option<f64>,
+    /// Seconds it took to create the leases.
     pub setup_s: f64,
 }
 
+/// One revoke-cascade run: revoke the root of a tree and time it.
 #[derive(Debug, Clone, Serialize)]
 pub struct CascadeRow {
+    /// Audit mode label (`memory`, `file`, `file_full`).
     pub audit: String,
+    /// Index of the run within its audit mode.
     pub run: usize,
     /// Hops of the deepest token in the tree.
     pub depth: usize,
+    /// Leases below the root (100).
     pub descendants: usize,
+    /// Leases the revoke changed, as the server reported (the root and its descendants).
     pub revoked: u64,
+    /// Wall time of the revoke request, in milliseconds.
     pub revoke_ms: f64,
     /// A descendant's renewal after the revoke was refused.
     pub descendant_refused: bool,
@@ -1365,6 +1424,7 @@ fn opt(x: Option<f64>) -> String {
     x.map_or("n/a".into(), |v| format!("{v}"))
 }
 
+/// The markdown tables of a `lease-renew` run, with the audit checks `checks` below them.
 pub fn render_lease(rows: &[LeaseRow], cascades: &[CascadeRow], checks: &[Value]) -> String {
     let mut s = String::from("### Lease renewal (`POST /token/renew`)\n\n");
     s.push_str(
@@ -1421,12 +1481,16 @@ pub fn render_lease(rows: &[LeaseRow], cascades: &[CascadeRow], checks: &[Value]
 // ---------------------------------------------------------------------------------------
 // Open-loop proxied call (the top-level `--open-loop` flag)
 
+/// One open-loop `tools/call` cell (`--open-loop`).
 #[derive(Debug, Clone, Serialize)]
 pub struct CallOpenRow {
+    /// Audit mode label (`memory`, `file`, `file_full`).
     pub audit: String,
     /// `direct` (straight at the upstream) or the outcome through the proxy.
     pub path: String,
+    /// Hops in the token; 0 on the `direct` path.
     pub hops: usize,
+    /// The measurements.
     #[serde(flatten)]
     pub m: Measured,
 }
@@ -1533,6 +1597,7 @@ pub async fn run_call_open(opts: &Opts) -> Result<()> {
     )
 }
 
+/// The markdown tables of an `--open-loop` run, with the audit checks `checks` below them.
 pub fn render_call_open(rows: &[CallOpenRow], checks: &[Value]) -> String {
     let mut s = String::from("### Proxied `tools/call`, open loop (Poisson arrivals)\n\n");
     s.push_str(
@@ -1658,6 +1723,7 @@ fn append(p: &Path, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Run one subcommand to the end.
 pub async fn run_command(cmd: &Command) -> Result<()> {
     match cmd {
         Command::Exchange(a) => run_exchange(a).await,

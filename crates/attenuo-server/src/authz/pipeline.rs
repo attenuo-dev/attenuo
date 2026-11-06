@@ -56,13 +56,20 @@ pub const DIAG_TOO_MANY_PENDING_APPROVALS: &str = "too many pending approvals fo
 /// The result of running the pipeline once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineDecision {
+    /// Allow or deny.
     pub decision: Decision,
+    /// The reason code the record and any denial carry, such as `policy_allow`, `policy_deny`,
+    /// `budget_exhausted` or `audit_error`.
     pub reason: String,
     /// Id of the audit record. When the append failed this id is not in the log.
     pub decision_id: Uuid,
     /// Audit sequence number of the record, if it was written.
     pub audit_seq: Option<u64>,
+    /// Ids of the Cedar policies that determined the decision. Empty for a capability denial, a
+    /// default deny, or a call refused before the policy ran (a lease or approval-token problem).
     pub policy_ids: Vec<String>,
+    /// Human-readable details for the record: policy evaluation errors and lease, label, usage
+    /// and approval problems.
     pub diagnostics: Vec<String>,
     /// For `approval_required`: the pending approval stored for the call. `None` otherwise,
     /// or when it could not be stored or recorded (the diagnostics say why).
@@ -88,6 +95,7 @@ pub struct PipelineDecision {
 }
 
 impl PipelineDecision {
+    /// Whether the call is allowed.
     pub fn is_allow(&self) -> bool {
         self.decision.is_allow()
     }
@@ -173,6 +181,10 @@ pub(super) fn arg_probes<'a>(call: &'a ToolCall, pinned: &BTreeSet<String>) -> A
 const RUN_LOCK_STRIPES: usize = 64;
 
 impl Pipeline {
+    /// A pipeline over this policy, lease store and audit log, with the default approval TTL and
+    /// no approval-token verifier or approval notifier (see the `with_*` methods). When the lease
+    /// store and the audit log are the same database file, a `sum` charge leaves its sync to the
+    /// decision's append.
     pub fn new(
         policy: Arc<RwLock<PolicyEngine>>,
         leases: Arc<dyn LeaseStore>,

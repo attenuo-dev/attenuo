@@ -21,6 +21,7 @@
 //! See `docs/design/performance.md` for the method and its limits.
 
 #![deny(unsafe_code)]
+#![warn(missing_docs)]
 #![warn(unreachable_pub)]
 
 use std::path::{Path, PathBuf};
@@ -147,6 +148,8 @@ impl Outcome {
     }
 }
 
+/// Command line of `attenuo-bench`: the closed-loop proxy benchmark, or one of the
+/// [`exchange::Command`] subcommands.
 #[derive(Debug, Parser)]
 #[command(
     name = "attenuo-bench",
@@ -195,8 +198,10 @@ pub struct Opts {
     /// exit. Needs `--attenuo-port` and `--upstream-port`; honours the first `--audit` mode.
     #[arg(long)]
     pub print_config: Option<PathBuf>,
+    /// Listen port of the server in the config `--print-config` writes.
     #[arg(long, default_value_t = 18080)]
     pub attenuo_port: u16,
+    /// Port of `fake_mcp` in the config `--print-config` writes.
     #[arg(long, default_value_t = 13001)]
     pub upstream_port: u16,
     /// Port of the `/metrics` listener in the config `--print-config` writes.
@@ -212,6 +217,7 @@ pub struct Opts {
     /// `--warmup` apply; the cells use their own servers.
     #[arg(long, value_delimiter = ',')]
     pub open_loop: Vec<f64>,
+    /// A subcommand; when set, every other option is ignored.
     #[command(subcommand)]
     pub command: Option<exchange::Command>,
 }
@@ -219,46 +225,77 @@ pub struct Opts {
 // ---------------------------------------------------------------------------------------
 // Result types
 
+/// Latency and throughput of one cell over its measured window (warm-up excluded).
+/// Latencies are in microseconds, rounded to 0.1.
 #[derive(Debug, Clone, Serialize)]
 pub struct Stats {
+    /// Requests in the measured window that got the expected answer; the latencies are over
+    /// these.
     pub requests: u64,
+    /// Requests in the window whose answer was not the expected one.
     pub unexpected: u64,
+    /// Length of the measured window, in seconds.
     pub seconds: f64,
+    /// Throughput in requests per second, rounded to 0.1.
     pub rps: f64,
+    /// Mean latency.
     pub mean_us: f64,
+    /// Median latency.
     pub p50_us: f64,
+    /// 90th percentile latency.
     pub p90_us: f64,
+    /// 95th percentile latency.
     pub p95_us: f64,
+    /// 99th percentile latency.
     pub p99_us: f64,
+    /// Slowest request.
     pub max_us: f64,
     /// Requests that took longer than 3, 5 and 10 ms (the single-client outliers).
     pub over_3ms: u64,
+    /// Requests over 5 ms.
     pub over_5ms: u64,
+    /// Requests over 10 ms.
     pub over_10ms: u64,
 }
 
+/// One baseline cell: the allow call straight at `fake_mcp`.
 #[derive(Debug, Clone, Serialize)]
 pub struct DirectRow {
+    /// The audit mode of the server group the baseline was measured with (the baseline itself
+    /// never reaches the server).
     pub audit_group: String,
+    /// Closed-loop clients.
     pub concurrency: usize,
+    /// The measurements.
     #[serde(flatten)]
     pub stats: Stats,
 }
 
+/// Proxy latency minus direct latency at the same concurrency, in microseconds.
 #[derive(Debug, Clone, Serialize)]
 pub struct Added {
+    /// Difference of the medians.
     pub p50_us: f64,
+    /// Difference of the 90th percentiles.
     pub p90_us: f64,
+    /// Difference of the 99th percentiles.
     pub p99_us: f64,
+    /// Difference of the means.
     pub mean_us: f64,
 }
 
+/// One proxied cell: an outcome at one chain depth and concurrency, through the proxy.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProxyRow {
+    /// Audit mode label (`memory`, `file`, `file_full`, or the label of an external server).
     pub audit: String,
+    /// Hops in the token.
     pub depth: usize,
+    /// Outcome label (`allow`, `deny_policy`, `deny_capability`).
     pub outcome: &'static str,
+    /// Closed-loop clients.
     pub concurrency: usize,
+    /// The measurements.
     #[serde(flatten)]
     pub stats: Stats,
     /// Proxy minus direct (allow call) at the same concurrency. For denied calls the upstream
@@ -272,33 +309,56 @@ pub struct ProxyRow {
 /// so they are estimates; the mean is exact.
 #[derive(Debug, Clone, Serialize)]
 pub struct StageRow {
+    /// Audit mode label, as in [`ProxyRow::audit`].
     pub audit: String,
+    /// Hops in the token.
     pub depth: usize,
+    /// Outcome label, as in [`ProxyRow::outcome`].
     pub outcome: &'static str,
+    /// Closed-loop clients.
     pub concurrency: usize,
+    /// The `stage` label of the histogram.
     pub stage: String,
+    /// Samples of the stage in the window.
     pub count: u64,
+    /// Mean time in the stage, in microseconds.
     pub mean_us: f64,
+    /// Estimated median, in microseconds.
     pub p50_us: f64,
+    /// Estimated 90th percentile, in microseconds.
     pub p90_us: f64,
 }
 
+/// The audit check after one server group: `GET /admin/audit/verify` against the proxied
+/// calls sent.
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditCheck {
+    /// Audit mode label, as in [`ProxyRow::audit`].
     pub audit: String,
+    /// The chain verified with no bad entry.
     pub ok: bool,
+    /// Entries in the log; the run fails when below `proxied_calls_sent`.
     pub entries: u64,
+    /// Proxied calls sent to the server, warm-up included.
     pub proxied_calls_sent: u64,
+    /// Signed checkpoints in the log.
     pub checkpoints: u64,
+    /// Entries after the last checkpoint, not yet covered by a signature.
     pub unsigned_tail: u64,
 }
 
+/// The full result of a closed-loop run, as `--json` writes it.
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
+    /// Host, toolchain and run settings.
     pub meta: Value,
+    /// Baseline cells.
     pub direct: Vec<DirectRow>,
+    /// Proxied cells.
     pub results: Vec<ProxyRow>,
+    /// Per-stage times of the proxied cells, when the server's metrics were reachable.
     pub stages: Vec<StageRow>,
+    /// Audit checks, one per server group.
     pub audit_checks: Vec<AuditCheck>,
 }
 
@@ -535,7 +595,10 @@ pub const DECISION_ID_HEADER: &str = "x-attenuo-decision-id";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expect {
     /// A JSON-RPC `result`; through the proxy it must also carry a decision id header.
-    Result { decision_header: bool },
+    Result {
+        /// The answer must carry `X-Attenuo-Decision-Id` (through the proxy, not direct).
+        decision_header: bool,
+    },
     /// The proxy's own denial (`-32003`) with this reason code.
     Denied(&'static str),
 }
@@ -849,8 +912,11 @@ pub fn over_ns(h: &Histogram<u64>, ns: u64) -> u64 {
 /// `+Inf`), sum in seconds, and count.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StageHist {
+    /// Cumulative counts by bucket upper bound, in seconds, ascending; the last bound is `+Inf`.
     pub buckets: Vec<(f64, u64)>,
+    /// Sum of the samples, in seconds.
     pub sum: f64,
+    /// Number of samples.
     pub count: u64,
 }
 
@@ -1167,6 +1233,7 @@ fn meta(opts: &Opts) -> Value {
     })
 }
 
+/// The markdown tables of a closed-loop run, as `--markdown` writes them and the run prints.
 pub fn render_markdown(r: &Report) -> String {
     let mut s = String::new();
     s.push_str("### Direct to the upstream (baseline, allow call)\n\n");
