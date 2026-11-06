@@ -583,7 +583,7 @@ pub trait LeaseStore: Send + Sync {
 
     /// One pass of per-user window retention: delete up to `max_rows` window counters, and
     /// the charges logged against them, whose window ended more than `retention` before
-    /// `now` ([`window_prunable`](crate::window_prunable)). Open windows are never touched.
+    /// `now` ([`window_prunable`]). Open windows are never touched.
     /// One write transaction per pass. The default keeps nothing and reports `wrapped`.
     fn prune_user_windows(
         &self,
