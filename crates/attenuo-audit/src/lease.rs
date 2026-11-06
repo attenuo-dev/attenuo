@@ -547,6 +547,11 @@ pub trait LeaseStore: Send + Sync {
     /// each charge holds now, in order. A window never charged holds 0. The charges' `amount`
     /// is ignored. Callers decide on the worst case when this fails. The default keeps no
     /// windows and fails, so a store without them is read as the worst case.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Storage`] when the store keeps no windows (the default) or a counter does
+    /// not fit, or a store fault (see [`LeaseStore`]).
     fn window_used(&self, windows: &[WindowCharge]) -> Result<Vec<u64>, AuditError> {
         let _ = windows;
         Err(AuditError::Storage(
@@ -561,6 +566,11 @@ pub trait LeaseStore: Send + Sync {
     /// [`WindowCharge::MAX`]) and never adds a sync of its own. A refund returns the window
     /// charges with the rest. The default refuses any window charge, and otherwise is
     /// `charge` or `charge_sync_deferred`.
+    ///
+    /// # Errors
+    ///
+    /// As [`charge`](Self::charge), plus [`AuditError::Storage`] when `windows` is not empty
+    /// and the store keeps no windows (the default).
     fn charge_windowed(
         &self,
         decision_id: &str,
@@ -585,6 +595,10 @@ pub trait LeaseStore: Send + Sync {
     /// the charges logged against them, whose window ended more than `retention` before
     /// `now` ([`window_prunable`]). Open windows are never touched.
     /// One write transaction per pass. The default keeps nothing and reports `wrapped`.
+    ///
+    /// # Errors
+    ///
+    /// A store fault (see [`LeaseStore`]); the default never fails.
     fn prune_user_windows(
         &self,
         now: OffsetDateTime,
