@@ -104,6 +104,8 @@ The decision stays in Cedar. The generated schema gains these attributes, always
 | `context.session.tainted_by` | set of string | `"<server>/<tool>"` of every source that labelled the run. |
 | `context.args_contain_untrusted` | bool | Phase 2: some argument matched an untrusted span. Always `false` before phase 2. |
 | `context.untrusted_args` | set of string | Phase 2: names of the arguments that matched. |
+| `context.untrusted_outbound` | bool | Added 2026-11-06: one of those arguments is one the catalog marks `outbound` ([read-side exfiltration](read-side-exfiltration.md#d-a-catalog-flag-that-marks-an-argument-outbound)), an `unreadable` one included. Reading it turns on matching for every call, as for the two above. |
+| `resource.outbound` | bool | Added 2026-11-06: the catalog names an `outbound` input for the tool. |
 | `context.approval.present` | bool | The call carries a valid approval for its exact hash (section 3.7). |
 | `context.approval.by` | string | `"user"`, `"operator"` or `"policy"`; empty when absent. |
 

@@ -70,6 +70,16 @@ inputs = { repo = "string", title = "string" }
 sensitive = true
 inputs = { repo = "string" }
 
+# A fetch is read-only, but its `url` goes to whatever host the URL names, which can be the
+# attacker's: an outbound argument. `outbound = "url#host"` makes the fetch keep run usage per
+# host (context.usage.destination_seen, as `destination` does for a destructive tool) and sets
+# context.untrusted_outbound when the URL carries text from an untrusted result of the run.
+# Cedar sees resource.outbound = true. A list names several: outbound = ["url", "callback"].
+[policy.catalog.web.fetch]
+readonly = true
+inputs = { url = "string" }
+outbound = "url#host"
+
 [audit]
 # Audit log and lease registry. ":memory:" keeps both in memory (lost on exit).
 sqlite_path = "data/attenuo.sqlite"

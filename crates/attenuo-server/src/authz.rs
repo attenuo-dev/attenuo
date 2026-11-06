@@ -108,6 +108,8 @@ mod arg_taint_tests;
 #[cfg(test)]
 mod budget_tests;
 #[cfg(test)]
+mod outbound_tests;
+#[cfg(test)]
 mod run_lock_tests;
 #[cfg(test)]
 mod tests;

