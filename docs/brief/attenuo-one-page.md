@@ -26,7 +26,7 @@ attenuo is a self-hosted server and MCP proxy, written in Rust, that sits betwee
 | Test split, attenuo plus output labels and a one-call limit on non-reads (scripted approver) | 1/38 attack calls allowed, 3/29 benign denied <!-- docs/report/attenuo-2026-11.md, Table 2, row "+ labels and calls: 1"; evaluation/injection-suite/results/2026-11-05-final-main.md --> |
 | Added latency per proxied call, median | 0.4 to 0.8 ms (425 to 771 µs), 1 to 3 hops, shared 4-core container <!-- docs/design/performance.md; README.md --> |
 | Tests passing | 1,161 Rust, 322 Python SDK, 242 TypeScript SDK <!-- README.md, "Tests and fuzzing"; docs/report/attenuo-2026-11.md, Implementation --> |
-| Internal security review, 7 passes | 84 findings, 5 High; all fixed except 11 accepted Low/Info and 1 open Info <!-- docs/report/attenuo-2026-11.md, Table 3 and "Security review" --> |
+| Internal security review, 7 passes | 84 findings, 5 High; all fixed except 11 accepted Low/Info and 1 open Info <!-- docs/report/attenuo-2026-11.md, Table 4 and "Security review" --> |
 | Size | 64,529 lines of Rust in `src/`, 39,278 in tests <!-- docs/report/attenuo-2026-11.md, Table 1 --> |
 
 The test split has 26 synthetic cases replayed with no model in the loop. <!-- docs/report/attenuo-2026-11.md, Evaluation --> The cases, policies and approver were written by the same people who built the system, so these figures check the implementation against its own corpus and do not measure how often a real injected agent would be stopped.
