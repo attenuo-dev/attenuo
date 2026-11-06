@@ -6,7 +6,8 @@
 mod common;
 
 use attenuo_audit::{
-    AuditError, LeaseStore, MemoryLeaseStore, SpanHit, SqliteLeaseStore, MAX_SPANS_PER_RUN,
+    AuditError, LeaseStore, MemoryLeaseStore, SpanHit, SqliteLeaseStore, MAX_SEQS_PER_PROBE,
+    MAX_SPANS_PER_RUN,
 };
 use attenuo_core::fingerprint::{fingerprints, Fingerprint, FingerprintKind};
 use attenuo_core::LeaseId;
@@ -82,6 +83,28 @@ fn spans_are_found_by_run_and_name_their_result() {
             store.find_spans(&r1, &[entity]).unwrap().is_empty(),
             "{name}"
         );
+    }
+}
+
+/// SR-91: a fingerprint that many results share returns only the lowest `seq`s, so one probe
+/// cannot make a lookup return a hit per result.
+#[test]
+fn a_probe_returns_at_most_the_lowest_seqs_sr91() {
+    for (name, store) in stores() {
+        let r = run(store.as_ref(), "run-many");
+        // 1,000 results that all hold the same string, stored out of `seq` order.
+        for i in 0..1_000u64 {
+            let seq = (i * 7_919) % 1_000 + 1;
+            store
+                .add_spans(&r, seq, &[fp("xxxxxxxx"), fp(&format!("own-{seq}"))])
+                .unwrap();
+        }
+        let hits = store
+            .find_spans(&r, &[fp("own-500"), fp("xxxxxxxx"), fp("nothing")])
+            .unwrap();
+        let mut expected = vec![SpanHit { probe: 0, seq: 500 }];
+        expected.extend((1..=MAX_SEQS_PER_PROBE as u64).map(|seq| SpanHit { probe: 1, seq }));
+        assert_eq!(hits, expected, "{name}");
     }
 }
 
