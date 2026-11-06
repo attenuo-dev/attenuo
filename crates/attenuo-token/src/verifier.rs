@@ -82,6 +82,11 @@ impl Verifier {
     }
 
     /// Build a verifier from the issuer's `PUBLIC KEY` PEM (see `Issuer::public_key_pem`).
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::Key`] when `public_pem` has no `PUBLIC KEY` block, its body is not base64,
+    /// or it is not an Ed25519 SubjectPublicKeyInfo.
     pub fn from_public_pem(
         issuer: &str,
         audience: &str,
@@ -98,6 +103,11 @@ impl Verifier {
 
     /// Trust one more key, given as a `PUBLIC KEY` PEM (for example a retired issuer key
     /// during a rotation). Adding a key that is already trusted is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::Key`] when `public_pem` has no `PUBLIC KEY` block, its body is not base64,
+    /// or it is not an Ed25519 SubjectPublicKeyInfo.
     pub fn with_public_pem(mut self, public_pem: &str) -> Result<Self, TokenError> {
         self.add_key(PublicKey::from_pem(public_pem)?);
         Ok(self)
@@ -173,6 +183,17 @@ impl Verifier {
     /// `ou_sig` over `iss`, the originating-user block and the root hop, under the `ou_kid` key;
     /// and finally `chain.validate_at(now, max_depth)`. Time is taken from `now`, never from the
     /// system clock, so callers control leeway and tests are deterministic.
+    ///
+    /// # Errors
+    ///
+    /// The first failed check, in the order above: [`TokenError::UnknownKeyId`] or
+    /// [`TokenError::InvalidSignature`] for the signature; [`TokenError::Malformed`] for a token
+    /// that is not a JWT of these claims, or whose `sub`, `act` or `exp` disagree with the chain,
+    /// or whose `cnf.jkt` is ill-formed; [`TokenError::WrongType`]; [`TokenError::WrongIssuer`];
+    /// [`TokenError::WrongAudience`]; [`TokenError::Expired`];
+    /// [`TokenError::UnsupportedOuSig`] for an `ou_sig_v` other than 3;
+    /// [`TokenError::InvalidSignature`] when `ou_kid` names no trusted key or `ou_sig` does not
+    /// verify; and [`TokenError::Chain`] from the chain's own validation.
     pub fn verify(&self, token: &str, now: OffsetDateTime) -> Result<VerifiedToken, TokenError> {
         let (header, claims) = self.decode_signed::<Claims>(token)?;
 

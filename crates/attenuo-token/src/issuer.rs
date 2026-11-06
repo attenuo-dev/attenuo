@@ -116,6 +116,11 @@ impl Issuer {
     }
 
     /// Create an issuer from a PKCS#8 `PRIVATE KEY` PEM holding an Ed25519 key.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::Key`] when `private_pem` has no `PRIVATE KEY` block, its body is not
+    /// base64, or the DER is not an Ed25519 PKCS#8 key.
     pub fn from_pem(config: IssuerConfig, private_pem: &str) -> Result<Self, TokenError> {
         Ok(Self::with_key(config, SigningKey::from_pem(private_pem)?))
     }
@@ -134,6 +139,11 @@ impl Issuer {
     /// (only the public half is used). The key never signs. Use this during a rotation, so
     /// tokens minted before the switch keep verifying (and can still be exchanged) until they
     /// expire. Adding the current key again is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::Key`] when `pem` is neither a parseable Ed25519 `PRIVATE KEY` nor a
+    /// `PUBLIC KEY` block holding an Ed25519 SubjectPublicKeyInfo.
     pub fn trust_previous_key(&mut self, pem: &str) -> Result<(), TokenError> {
         let key = if pem.contains("-----BEGIN PRIVATE KEY-----") {
             SigningKey::from_pem(pem)?.public_key()
@@ -207,6 +217,10 @@ impl Issuer {
     /// This is the only place the originating-user block is signed (`ou_sig`, bound to `iss`
     /// and this root hop, see [`crate::claims::ou_sig_payload`]); exchanges copy that
     /// signature, its version and its `kid` unchanged.
+    ///
+    /// # Errors
+    ///
+    /// As [`Issuer::issue_root_with`] with default options.
     pub fn issue_root(
         &self,
         user: OriginatingUser,
@@ -226,6 +240,14 @@ impl Issuer {
     }
 
     /// [`Issuer::issue_root`] with [`IssueOptions`] (`may_act`, an expiry cap).
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::NoLifetimeLeft`] when `options.not_after` is less than a second after
+    /// `now`; [`TokenError::Chain`] when [`DelegationChain::root`] refuses the hop (empty
+    /// subject, agent or capabilities, an invalid capability, an unrepresentable expiry);
+    /// [`TokenError::Malformed`] when a time in the chain has no RFC 3339 form or `options.cnf`
+    /// is not a SHA-256 thumbprint.
     pub fn issue_root_with(
         &self,
         user: OriginatingUser,
@@ -269,6 +291,11 @@ impl Issuer {
     /// chain would exceed `max_depth`, with [`TokenError::ActorNotPermitted`] when the parent
     /// carries `may_act` and `actor` is not listed, and with the verification error if the
     /// parent token is not valid at `now`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Issuer::exchange_with`] with default options: as no key is given, a key-bound
+    /// parent fails with [`TokenError::BindingRequired`].
     pub fn exchange(
         &self,
         parent_token: &str,
@@ -292,6 +319,14 @@ impl Issuer {
     /// (`cnf.jkt`) needs a bound child: without `options.cnf` this fails with
     /// [`TokenError::BindingRequired`]. The child may be bound to another key than the
     /// parent's; checking that the requester holds the parent's key is the caller's job.
+    ///
+    /// # Errors
+    ///
+    /// Any error of [`Verifier::verify`] for `parent_token` at `now`;
+    /// [`TokenError::ActorNotPermitted`]; [`TokenError::BindingRequired`];
+    /// [`TokenError::NoLifetimeLeft`] when `options.not_after` leaves under a second;
+    /// [`TokenError::Chain`] from [`DelegationChain::extend`] (not covered, too deep, a duplicate
+    /// agent, an empty actor); and [`TokenError::Malformed`] for an ill-formed `options.cnf`.
     pub fn exchange_with(
         &self,
         parent_token: &str,

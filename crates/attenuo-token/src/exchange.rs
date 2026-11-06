@@ -60,6 +60,10 @@ pub struct ExchangeRequest {
 
 impl ExchangeRequest {
     /// Perform the exchange with `issuer` as of `now`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Issuer::exchange`].
     pub fn execute(
         &self,
         issuer: &Issuer,
@@ -70,6 +74,12 @@ impl ExchangeRequest {
 
     /// As [`ExchangeRequest::execute`], with the child's expiry also capped at `not_after`
     /// (for example the `exp` of the actor token that authenticated the request).
+    ///
+    /// # Errors
+    ///
+    /// As [`Issuer::exchange`] (so a key-bound subject token fails with
+    /// [`TokenError::BindingRequired`]), plus [`TokenError::NoLifetimeLeft`] when `not_after`
+    /// is less than a second after `now`.
     pub fn execute_until(
         &self,
         issuer: &Issuer,
@@ -82,6 +92,13 @@ impl ExchangeRequest {
     /// As [`ExchangeRequest::execute_until`], with the child bound to a key (`cnf`) when given.
     /// The caller has verified a DPoP proof for that key and, when the subject token is bound,
     /// possession of the subject token's key; see [`IssueOptions::cnf`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Issuer::exchange_with`]: the subject token's verification error,
+    /// [`TokenError::ActorNotPermitted`], [`TokenError::BindingRequired`],
+    /// [`TokenError::NoLifetimeLeft`], [`TokenError::Chain`] when the hop cannot be added, and
+    /// [`TokenError::Malformed`] for a `cnf` that is not a SHA-256 thumbprint.
     pub fn execute_with(
         &self,
         issuer: &Issuer,

@@ -111,6 +111,12 @@ impl ApprovalClaims {
     /// call hash, and the calling hop's key thumbprint (`None` for a bearer hop). The key must
     /// match exactly: a token minted for a bound hop is refused without that hop's key, and a
     /// token with no `cnf` is refused for a bound hop.
+    ///
+    /// # Errors
+    ///
+    /// The first claim that differs, checked in this order: [`ApprovalMismatch::ChainId`],
+    /// [`ApprovalMismatch::Lease`], [`ApprovalMismatch::CallHash`], [`ApprovalMismatch::Key`]
+    /// (also when only one of the token and the hop has a key).
     pub fn check_binding(
         &self,
         chain_id: &str,
@@ -142,6 +148,11 @@ impl ApprovalClaims {
 impl Issuer {
     /// Sign an approval token for a granted approval (see the module docs), with the current
     /// key and its `kid`.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::Key`] or [`TokenError::Malformed`] if `jsonwebtoken` cannot encode or sign
+    /// the claims, which does not happen with the issuer's Ed25519 key.
     pub fn issue_approval(&self, grant: &ApprovalGrant<'_>) -> Result<String, TokenError> {
         let claims = ApprovalClaims {
             iss: self.config().issuer.clone(),
@@ -169,6 +180,15 @@ impl Verifier {
     /// The binding claims are checked separately ([`ApprovalClaims::check_binding`]). A
     /// delegation token is refused here ([`TokenError::WrongType`]), as an approval token is
     /// refused by [`Verifier::verify`].
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::UnknownKeyId`] for a `kid` no trusted key has,
+    /// [`TokenError::InvalidSignature`] for a signature no candidate key verifies,
+    /// [`TokenError::Malformed`] for a token that is not a JWT of approval claims or has a
+    /// malformed `cnf.jkt`, [`TokenError::WrongType`], [`TokenError::WrongIssuer`],
+    /// [`TokenError::WrongAudience`], and [`TokenError::Expired`] when `exp` is at or before
+    /// `now`.
     pub fn verify_approval(
         &self,
         token: &str,
