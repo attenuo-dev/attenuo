@@ -144,13 +144,25 @@ export function approvalReady(a: Approval): boolean {
   throw new ApprovalNotGrantedError(a.approvalId, a.state || "unknown");
 }
 
-/** Answer to an AuthZEN evaluation. A `false` decision is returned, never thrown. */
+/**
+ * Answer to an AuthZEN evaluation. A `false` decision is returned, never thrown.
+ *
+ * On `reason === "approval_required"` the fields the proxy's `-32008` carries are set too:
+ * `callHash` (what an approval is bound to), and `approvalId` and `expiresAt` of the pending
+ * approval. `approvalId` is absent when the server opened none: the run already has as many
+ * pending approvals as it keeps (32), and a PEP that gets diagnostics sees
+ * `"too many pending approvals for this run"` in `diagnostics`. The call is then simply denied
+ * until an approval of the run is decided or lapses.
+ */
 export interface AuthzenDecision {
   decision: boolean;
   reason: string;
   decisionId: string | undefined;
   policyIds: string[];
   diagnostics: unknown[];
+  approvalId?: string;
+  callHash?: string;
+  expiresAt?: Date;
 }
 
 // --- plain HTTP -------------------------------------------------------------------------------
@@ -337,13 +349,18 @@ export function authzenBody(server: string, tool: string, args?: Json): Json {
 export function authzenFromResponse(body: unknown): AuthzenDecision {
   const b = asObject(body, "AuthZEN");
   const ctx = (typeof b.context === "object" && b.context !== null ? b.context : {}) as Json;
-  return {
+  const d: AuthzenDecision = {
     decision: b.decision === true,
     reason: String(ctx.reason ?? ""),
     decisionId: typeof ctx.decision_id === "string" ? ctx.decision_id : undefined,
     policyIds: Array.isArray(ctx.policy_ids) ? (ctx.policy_ids as string[]) : [],
     diagnostics: Array.isArray(ctx.diagnostics) ? ctx.diagnostics : [],
   };
+  if (typeof ctx.approval_id === "string" && ctx.approval_id !== "") d.approvalId = ctx.approval_id;
+  if (typeof ctx.call_hash === "string" && ctx.call_hash !== "") d.callHash = ctx.call_hash;
+  const expiresAt = optTime(ctx.expires_at);
+  if (expiresAt !== undefined) d.expiresAt = expiresAt;
+  return d;
 }
 
 // --- MCP / JSON-RPC ---------------------------------------------------------------------------

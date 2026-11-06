@@ -28,6 +28,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   AdminClient,
   ApiError,
+  ApprovalRequiredError,
+  callHash,
   capability,
   DeniedError,
   DpopKey,
@@ -81,11 +83,13 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
  * Start the fake upstream and the server with the demo config, plus `tokenSection` (a `[token]`
- * table) when given and `fakeArgs` for the upstream; resolves once both answer.
+ * table) when given and `fakeArgs` for the upstream; resolves once both answer. `policyExtra` is
+ * appended to the demo policy, and each `edits` key of the config is replaced by its value.
  */
 async function startStack(
   tokenSection = "",
   fakeArgs: string[] = [],
+  opts: { policyExtra?: string; edits?: Record<string, string> } = {},
 ): Promise<{ url: string; work: string; procs: ChildProcess[] }> {
   const work = mkdtempSync(join(tmpdir(), "attenuo-it-"));
   const procs: ChildProcess[] = [];
@@ -99,11 +103,20 @@ async function startStack(
   const obPort = await freePort();
   let mcpPort = await freePort();
   while (mcpPort === obPort) mcpPort = await freePort();
-  const config = readFileSync(join(DEMO, "config.toml"), "utf8")
+  let policy = join(DEMO, "policy.cedar");
+  if (opts.policyExtra !== undefined) {
+    policy = join(work, "policy.cedar");
+    writeFileSync(policy, readFileSync(join(DEMO, "policy.cedar"), "utf8") + opts.policyExtra);
+  }
+  let config = readFileSync(join(DEMO, "config.toml"), "utf8")
     .replaceAll("18080", String(obPort))
     .replaceAll("13001", String(mcpPort))
-    .replaceAll("examples/github-leak-demo/policy.cedar", join(DEMO, "policy.cedar"))
+    .replaceAll("examples/github-leak-demo/policy.cedar", policy)
     .replace("[audit]\n", `${tokenSection}[audit]\n`);
+  for (const [from, to] of Object.entries(opts.edits ?? {})) {
+    if (!config.includes(from)) throw new Error(`not in the demo config: ${from}`);
+    config = config.replace(from, to);
+  }
   writeFileSync(join(work, "config.toml"), config);
 
   const fakeOut = join(work, "fake-mcp.out");
@@ -880,6 +893,136 @@ describe.skipIf(!enabled)("filtered export and revocation by selector", () => {
     await expect(ob.callTool(coder, "github", "read_file", read)).rejects.toMatchObject({
       reason: "budget_exhausted",
     });
+    await admin.revokeLease(root.lease);
+  });
+});
+
+describe.skipIf(!enabled)("pending approvals cap against the real server", () => {
+  let procs: ChildProcess[] = [];
+  let work = "";
+  let url = "";
+
+  beforeAll(async () => {
+    ({ url, work, procs } = await startStack());
+  });
+
+  afterAll(async () => {
+    await stopStack(procs, work);
+  });
+
+  it("answers approval_required without an approval id past 32 pending (SR-92)", async () => {
+    const admin = new AdminClient(url, ADMIN_TOKEN);
+    const ob = new AttenuoClient(url);
+    const root = await admin.mintRootDev("alice", "https://idp.example", "assistant", {
+      capabilities: ["github:*"],
+    });
+    const issue = (title: string) => ({ repo: "alice/public-docs", title });
+    const held = async (title: string): Promise<ApprovalRequiredError> => {
+      const e = await ob.callTool(root, "github", "create_issue", issue(title)).catch((x) => x);
+      expect(e).toBeInstanceOf(ApprovalRequiredError);
+      return e as ApprovalRequiredError;
+    };
+
+    const ids: string[] = [];
+    for (let n = 0; n < 32; n++) {
+      const e = await held(`t${n}`);
+      expect(e.approvalId).toBeTruthy();
+      ids.push(e.approvalId!);
+    }
+
+    const full = await held("one too many");
+    expect(full.reason).toBe("approval_required");
+    expect(full.decisionId).toBeTruthy();
+    expect([full.approvalId, full.expiresAt]).toEqual([undefined, undefined]);
+    expect(full.callHash).toBe(await callHash("github", "create_issue", issue("one too many")));
+
+    const told: ApprovalRequiredError[] = [];
+    const again = await ob
+      .callToolWithApproval(root, "github", "create_issue", issue("one too many"), {
+        onApproval: (e) => void told.push(e),
+      })
+      .catch((x: unknown) => x);
+    expect(again).toBeInstanceOf(ApprovalRequiredError);
+    expect(told).toEqual([]);
+
+    const verdict = await ob.authzenEvaluate(root, "github", "create_issue", issue("also"));
+    expect([verdict.decision, verdict.reason, verdict.approvalId]).toEqual([
+      false,
+      "approval_required",
+      undefined,
+    ]);
+    expect(verdict.callHash).toBe(await callHash("github", "create_issue", issue("also")));
+
+    // A repeat of a waiting call keeps its approval, in the -32008 and in AuthZEN.
+    expect((await held("t7")).approvalId).toBe(ids[7]);
+    const t7 = await ob.authzenEvaluate(root, "github", "create_issue", issue("t7"));
+    expect(t7.approvalId).toBe(ids[7]);
+    expect(t7.expiresAt).toBeInstanceOf(Date);
+
+    // Deciding one makes room for the next.
+    await admin.declineApproval(ids[0]!);
+    const room = await held("one too many");
+    expect(room.approvalId).toBeTruthy();
+    expect(ids).not.toContain(room.approvalId);
+    await admin.revokeLease(root.lease);
+  });
+});
+
+describe.skipIf(!enabled)("decimal catalog input against the real server", () => {
+  let procs: ChildProcess[] = [];
+  let work = "";
+  let url = "";
+
+  beforeAll(async () => {
+    ({ url, work, procs } = await startStack("", [], {
+      policyExtra:
+        '\n@id("read_file_amount_below_100")\n' +
+        'forbid(principal, action == Action::"github/read_file", resource)\n' +
+        'when { context.input has amount && !context.input.amount.lessThan(decimal("100.0")) };\n',
+      edits: {
+        'inputs = { repo = "string", path = "string" }':
+          'inputs = { repo = "string", path = "string", amount = "decimal" }',
+      },
+    }));
+  });
+
+  afterAll(async () => {
+    await stopStack(procs, work);
+  });
+
+  it("compares a JSON number as a Cedar decimal and refuses more than 4 digits", async () => {
+    const admin = new AdminClient(url, ADMIN_TOKEN);
+    const ob = new AttenuoClient(url);
+    const root = await admin.mintRootDev("alice", "https://idp.example", "assistant", {
+      capabilities: ["github:*"],
+    });
+    const read = (amount: unknown) => ({ repo: "alice/public-docs", path: "README.md", amount });
+    for (const fine of [12.5, 99.9999, 0, 99]) {
+      expect((await ob.callTool(root, "github", "read_file", read(fine))).decisionId).toBeTruthy();
+      expect((await ob.authzenEvaluate(root, "github", "read_file", read(fine))).decision).toBe(
+        true,
+      );
+    }
+    for (const over of [100, 150.25]) {
+      await expect(ob.callTool(root, "github", "read_file", read(over))).rejects.toMatchObject({
+        reason: "policy_deny",
+      });
+      const v = await ob.authzenEvaluate(root, "github", "read_file", read(over));
+      expect(v.reason).toBe("policy_deny");
+    }
+    for (const bad of [1.23456, "12.5"]) {
+      const e = await ob.callTool(root, "github", "read_file", read(bad)).catch((x) => x);
+      expect(e).toBeInstanceOf(DeniedError);
+      expect((e as DeniedError).reason).toBe("input_type_mismatch");
+      const v = await ob.authzenEvaluate(root, "github", "read_file", read(bad));
+      expect([v.decision, v.reason]).toEqual([false, "input_type_mismatch"]);
+    }
+    const dry = await admin.policyEvaluate("github", "read_file", read(12.5), { token: root });
+    expect(dry.decision).toBe("allow");
+    const dryBad = await admin.policyEvaluate("github", "read_file", read(1.23456), {
+      token: root,
+    });
+    expect([dryBad.decision, dryBad.reason]).toEqual(["deny", "input_type_mismatch"]);
     await admin.revokeLease(root.lease);
   });
 });

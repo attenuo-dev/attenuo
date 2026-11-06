@@ -107,13 +107,24 @@ class Tool:
 
 @dataclass(frozen=True)
 class AuthzenDecision:
-    """Answer to an AuthZEN evaluation. A ``False`` decision is returned, never raised."""
+    """Answer to an AuthZEN evaluation. A ``False`` decision is returned, never raised.
+
+    On ``reason == "approval_required"`` the fields the proxy's ``-32008`` carries are set too:
+    ``call_hash`` (what an approval is bound to), and ``approval_id`` and ``expires_at`` of the
+    pending approval. ``approval_id`` is ``None`` when the server opened none: the run already
+    has as many pending approvals as it keeps (32), and a PEP that gets diagnostics sees
+    ``"too many pending approvals for this run"`` in ``diagnostics``. The call is then simply
+    denied until an approval of the run is decided or lapses.
+    """
 
     decision: bool
     reason: str
     decision_id: str | None
     policy_ids: list[str]
     diagnostics: list[Any]
+    approval_id: str | None = None
+    call_hash: str | None = None
+    expires_at: datetime | None = None
 
     def __bool__(self) -> bool:
         return self.decision
@@ -289,7 +300,14 @@ def authzen_from_response(body: Any) -> AuthzenDecision:
         decision_id=ctx.get("decision_id"),
         policy_ids=list(ctx.get("policy_ids") or []),
         diagnostics=list(ctx.get("diagnostics") or []),
+        approval_id=_opt_str(ctx.get("approval_id")),
+        call_hash=_opt_str(ctx.get("call_hash")),
+        expires_at=_opt_time(ctx.get("expires_at")),
     )
+
+
+def _opt_str(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 # --- MCP / JSON-RPC --------------------------------------------------------------------------

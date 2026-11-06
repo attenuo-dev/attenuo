@@ -37,6 +37,7 @@ from cryptography.hazmat.primitives.serialization import (
 from attenuo import (
     AdminClient,
     ApiError,
+    ApprovalRequired,
     AsyncClient,
     BudgetLimit,
     Capability,
@@ -54,6 +55,7 @@ from attenuo import (
     Token,
     TokenRefresher,
     Unauthorized,
+    call_hash,
 )
 from attenuo.audit import entry_hash
 from attenuo.mcp import TokenAuth
@@ -183,11 +185,36 @@ def sse_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
     )
 
 
+@pytest.fixture(scope="module")
+def decimal_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
+    """The same stack with ``amount`` declared ``decimal`` for ``github/read_file`` and a policy
+    that refuses an amount of 100 or more."""
+    work = tmp_path_factory.mktemp("attenuo-it-decimal")
+    policy = work / "policy.cedar"
+    policy.write_text(
+        (DEMO / "policy.cedar").read_text()
+        + '\n@id("read_file_amount_below_100")\n'
+        + 'forbid(principal, action == Action::"github/read_file", resource)\n'
+        + 'when { context.input has amount && !context.input.amount.lessThan(decimal("100.0")) };\n'
+    )
+    yield from run_stack(
+        work,
+        policy=policy,
+        edits={
+            'inputs = { repo = "string", path = "string" }': (
+                'inputs = { repo = "string", path = "string", amount = "decimal" }'
+            )
+        },
+    )
+
+
 def run_stack(
     work: Path,
     token_section: str = "",
     issuer_key: Path | None = None,
     fake_args: list[str] | None = None,
+    policy: Path | None = None,
+    edits: Mapping[str, str] | None = None,
 ) -> Iterator[Stack]:
     built_server, built_fake = binaries()
     # Copy them: a shared CARGO_TARGET_DIR can be rebuilt under us mid-test.
@@ -202,9 +229,12 @@ def run_stack(
         .read_text()
         .replace("18080", str(ob_port))
         .replace("13001", str(mcp_port))
-        .replace("examples/github-leak-demo/policy.cedar", str(DEMO / "policy.cedar"))
+        .replace("examples/github-leak-demo/policy.cedar", str(policy or DEMO / "policy.cedar"))
         .replace("[audit]\n", f"{token_section.replace('{work}', str(work))}[audit]\n", 1)
     )
+    for old, new in (edits or {}).items():
+        assert old in config, f"not in the demo config: {old}"
+        config = config.replace(old, new, 1)
     if issuer_key is not None:
         config = config.replace(
             "[issuer]\n", f'[issuer]\nprivate_key_pem_path = "{issuer_key}"\n', 1
@@ -559,6 +589,109 @@ def test_dpop_server_nonce(nonce_stack: Stack) -> None:
         assert r.status_code == 200, r.text
         assert "result" in r.json()
     admin.revoke_lease(root.lease)
+    admin.close()
+
+
+async def test_dpop_server_nonce_async(nonce_stack: Stack) -> None:
+    """The async client against the same server: its own nonce cache starts empty, so its first
+    call is refused, and the retry goes out on a new connection (see ``drop_connection``)."""
+    url = nonce_stack.url
+    key = DpopKey.generate()
+    with AdminClient(url, ADMIN_TOKEN) as admin:
+        root = admin.mint_root_dev(
+            "alice", "https://idp.example", "assistant", ["github:*"], dpop_key=key
+        )
+        async with AsyncClient(url, dpop_key=key) as ob:
+            res = await ob.call_tool(root, "github", "read_file", {"repo": "alice/public-docs"})
+            assert res.decision_id
+            assert (await ob.renew(root)).expires_in > 0
+        admin.revoke_lease(root.lease)
+
+
+def test_too_many_pending_approvals(stack: Stack) -> None:
+    """A run holds at most 32 pending approvals (SR-92). The next gated call is still
+    ``approval_required``, with no approval to wait for: ``approval_id`` is ``None`` in the
+    ``-32008`` and in the AuthZEN answer, and ``call_tool_with_approval`` raises at once."""
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    ob = Client(stack.url)
+    root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+
+    def issue(title: str) -> dict[str, Any]:
+        return {"repo": "alice/public-docs", "title": title}
+
+    ids = []
+    for n in range(32):
+        with pytest.raises(ApprovalRequired) as held:
+            ob.call_tool(root, "github", "create_issue", issue(f"t{n}"))
+        assert held.value.approval_id
+        ids.append(held.value.approval_id)
+
+    with pytest.raises(ApprovalRequired) as full:
+        ob.call_tool(root, "github", "create_issue", issue("one too many"))
+    assert full.value.reason == "approval_required" and full.value.decision_id
+    assert full.value.approval_id is None and full.value.expires_at is None
+    assert full.value.call_hash == call_hash("github", "create_issue", issue("one too many"))
+
+    told: list[ApprovalRequired] = []
+    with pytest.raises(ApprovalRequired) as again:
+        ob.call_tool_with_approval(
+            root, "github", "create_issue", issue("one too many"), on_approval=told.append
+        )
+    assert again.value.approval_id is None and told == []
+
+    verdict = ob.authzen_evaluate(root, "github", "create_issue", issue("also too many"))
+    assert not verdict and verdict.reason == "approval_required"
+    assert verdict.approval_id is None and verdict.expires_at is None
+    assert verdict.call_hash == call_hash("github", "create_issue", issue("also too many"))
+
+    # A repeat of a waiting call keeps its approval, in the -32008 and in AuthZEN.
+    with pytest.raises(ApprovalRequired) as repeat:
+        ob.call_tool(root, "github", "create_issue", issue("t7"))
+    assert repeat.value.approval_id == ids[7]
+    assert ob.authzen_evaluate(root, "github", "create_issue", issue("t7")).approval_id == ids[7]
+
+    # Deciding one makes room for the next.
+    admin.decline_approval(ids[0])
+    with pytest.raises(ApprovalRequired) as room:
+        ob.call_tool(root, "github", "create_issue", issue("one too many"))
+    assert room.value.approval_id and room.value.approval_id not in ids
+    admin.revoke_lease(root.lease)
+    ob.close()
+    admin.close()
+
+
+def test_decimal_catalog_input(decimal_stack: Stack) -> None:
+    """A ``decimal`` catalog input: the SDK sends the JSON number as given, the policy compares
+    it as a Cedar decimal, and a number with more than 4 fractional digits is refused with
+    ``input_type_mismatch`` by the proxy, AuthZEN and the dry run alike."""
+    url = decimal_stack.url
+    admin = AdminClient(url, ADMIN_TOKEN)
+    ob = Client(url)
+    root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+
+    def read(amount: Any) -> dict[str, Any]:
+        return {"repo": "alice/public-docs", "path": "README.md", "amount": amount}
+
+    for fine in (12.5, 99.9999, 0, 99):
+        assert ob.call_tool(root, "github", "read_file", read(fine)).decision_id
+        assert ob.authzen_evaluate(root, "github", "read_file", read(fine))
+    for over in (100, 100.0, 150.25):
+        with pytest.raises(Denied) as d:
+            ob.call_tool(root, "github", "read_file", read(over))
+        assert d.value.reason == "policy_deny"
+        assert ob.authzen_evaluate(root, "github", "read_file", read(over)).reason == "policy_deny"
+    for bad in (1.23456, "12.5"):
+        with pytest.raises(Denied) as d:
+            ob.call_tool(root, "github", "read_file", read(bad))
+        assert d.value.reason == "input_type_mismatch"
+        verdict = ob.authzen_evaluate(root, "github", "read_file", read(bad))
+        assert not verdict and verdict.reason == "input_type_mismatch"
+
+    assert admin.policy_evaluate("github", "read_file", read(12.5), token=root).decision == "allow"
+    dry = admin.policy_evaluate("github", "read_file", read(1.23456), token=root)
+    assert (dry.decision, dry.reason) == ("deny", "input_type_mismatch")
+    admin.revoke_lease(root.lease)
+    ob.close()
     admin.close()
 
 

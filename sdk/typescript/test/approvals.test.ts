@@ -146,6 +146,68 @@ describe("getApproval", () => {
   });
 });
 
+describe("too many pending approvals", () => {
+  it("passes the server's 429 through as an ApiError", async () => {
+    const { fetch } = mockFetch(() =>
+      jsonResponse(
+        {
+          error: "too_many_pending_approvals",
+          detail: "the run already has 32 pending approvals",
+        },
+        429,
+      ),
+    );
+    const err = await new AttenuoClient(URL_, { fetch })
+      .getApproval(APPROVAL_ID, "TOK")
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect([(err as ApiError).status, (err as ApiError).error]).toEqual([
+      429,
+      "too_many_pending_approvals",
+    ]);
+  });
+
+  it("reads an AuthZEN approval_required with and without an approval", async () => {
+    const ctx = {
+      reason: "approval_required",
+      policy_ids: ["ask"],
+      diagnostics: [],
+      decision_id: "d3",
+      call_hash: HASH,
+      approval_id: APPROVAL_ID,
+      expires_at: "2026-11-06T10:02:00.5Z",
+    };
+    const one = mockFetch(() => jsonResponse({ decision: false, context: ctx }));
+    const d = await new AttenuoClient(URL_, { fetch: one.fetch }).authzenEvaluate("TOK", "g", "t");
+    expect([d.decision, d.reason, d.approvalId, d.callHash]).toEqual([
+      false,
+      "approval_required",
+      APPROVAL_ID,
+      HASH,
+    ]);
+    expect(d.expiresAt?.toISOString()).toBe("2026-11-06T10:02:00.500Z");
+
+    // The run already holds as many pending approvals as the server keeps: none is opened,
+    // and a PEP with diagnostics is told why (SR-92).
+    const full = mockFetch(() =>
+      jsonResponse({
+        decision: false,
+        context: {
+          reason: "approval_required",
+          policy_ids: ["ask"],
+          diagnostics: ["too many pending approvals for this run"],
+          decision_id: "d4",
+          call_hash: HASH,
+        },
+      }),
+    );
+    const f = await new AttenuoClient(URL_, { fetch: full.fetch }).authzenEvaluate("TOK", "g", "t");
+    expect(f.reason).toBe("approval_required");
+    expect([f.approvalId, f.expiresAt, f.callHash]).toEqual([undefined, undefined, HASH]);
+    expect(f.diagnostics).toEqual(["too many pending approvals for this run"]);
+  });
+});
+
 describe("waitForApproval", () => {
   it("polls until granted", async () => {
     const { fetch, calls } = sequence(
