@@ -292,6 +292,12 @@ fn thumbprint_of(canonical: &str) -> String {
 
 /// RFC 7638 JWK SHA-256 thumbprint of a public (or private: private members are ignored)
 /// Ed25519 or P-256 JWK.
+///
+/// # Errors
+///
+/// [`DpopError::BadKey`] when `jwk` is not a JSON object, carries a private member other than
+/// `d` (`p`, `q`, `dp`, `dq`, `qi`, `k`), is not `OKP`/`Ed25519` or `EC`/`P-256`, or
+/// has an `x` (or `y`) that is missing, not base64url, or not 32 bytes.
 pub fn jwk_thumbprint(jwk: &Value) -> Result<String, DpopError> {
     let mut public = jwk.clone();
     if let Some(obj) = public.as_object_mut() {
@@ -312,6 +318,17 @@ fn decode_part(part: &str, what: &str) -> Result<Map<String, Value>, DpopError> 
 
 /// Verify a DPoP proof against the request it came with. See the module docs for what is
 /// checked; `jti` replay is left to the caller ([`VerifiedProof::replay_key`]).
+///
+/// # Errors
+///
+/// The first failed check: [`DpopError::Malformed`] (too large, not a compact JWS, a part that
+/// is not base64url JSON, `crit` present, `alg`, `jti`, `htm`, `htu` or `iat` missing or
+/// mistyped, or a `jti` longer than the limit), [`DpopError::WrongType`],
+/// [`DpopError::BadKey`] for the header `jwk`, [`DpopError::UnsupportedAlg`] for an `alg`
+/// that is not `EdDSA` or `ES256` or does not match the key, [`DpopError::BadSignature`],
+/// [`DpopError::MethodMismatch`], [`DpopError::UrlMismatch`], [`DpopError::Stale`] when
+/// `iat` is more than `max_age` from `now`, and [`DpopError::AthMismatch`] when
+/// `check.access_token` is set and `ath` is missing or wrong.
 pub fn verify_proof(proof: &str, check: &ProofCheck<'_>) -> Result<VerifiedProof, DpopError> {
     if proof.len() > MAX_PROOF_BYTES {
         return Err(DpopError::Malformed("proof is too large".into()));
@@ -435,6 +452,10 @@ impl std::fmt::Debug for DpopKey {
 
 impl DpopKey {
     /// A fresh random Ed25519 key.
+    ///
+    /// # Errors
+    ///
+    /// [`DpopError::BadKey`] if the system random number generator is unavailable.
     pub fn generate() -> Result<Self, DpopError> {
         let mut seed = [0u8; 32];
         SystemRandom::new()
@@ -457,6 +478,12 @@ impl DpopKey {
     }
 
     /// Load a private JWK: `OKP`/`Ed25519` or `EC`/`P-256`, with `d`.
+    ///
+    /// # Errors
+    ///
+    /// [`DpopError::BadKey`] when `jwk` is not an object, is of another key type or curve, has a
+    /// `d`, `x` or `y` that is missing, not base64url or not 32 bytes, has an Ed25519 `x` that
+    /// does not match `d`, or holds a P-256 pair that `ring` rejects.
     pub fn from_jwk(jwk: &Value) -> Result<Self, DpopError> {
         let obj = jwk
             .as_object()

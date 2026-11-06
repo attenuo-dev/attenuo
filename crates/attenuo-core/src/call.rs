@@ -56,6 +56,13 @@ impl ToolCall {
 
     /// Check `server` and `tool` against [`crate::names`]: a server name, and a call name (a
     /// tool name or an MCP method name such as `resources/read`).
+    ///
+    /// # Errors
+    ///
+    /// [`NameError`](crate::names::NameError) if `server` is not a valid server name (checked
+    /// first) or `tool` is not a valid call name: empty, longer than
+    /// [`MAX_NAME_LEN`](crate::names::MAX_NAME_LEN) bytes, or holding a character outside
+    /// `[A-Za-z0-9_.-]` (or, in `tool`, an empty `/`-separated segment).
     pub fn check_names(&self) -> Result<(), crate::names::NameError> {
         crate::names::check_server_name(&self.server)?;
         crate::names::check_call_name(&self.tool)

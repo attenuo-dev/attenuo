@@ -18,9 +18,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArgType {
+    /// A JSON string; Cedar `String`.
     String,
+    /// A JSON number with no fractional part (`5.0` counts); Cedar `Long`.
     Long,
+    /// A JSON `true` or `false`; Cedar `Bool`.
     Bool,
+    /// A JSON array whose every element has the inner type; Cedar `Set<T>`.
     Set(Box<ArgType>),
 }
 
@@ -47,6 +51,11 @@ impl std::str::FromStr for ArgType {
 }
 
 /// Parse a `{ name = "type" }` table of user attribute declarations.
+///
+/// # Errors
+///
+/// A message `user_attributes.<name>: ...` for the first declaration (in name order) whose type
+/// is not `string`, `long`, `bool` or `set<T>` of one of those.
 pub fn parse_user_attributes(
     decls: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, ArgType>, String> {
@@ -124,6 +133,8 @@ fn is_untrusted(label: &OutputLabel) -> bool {
 }
 
 impl ToolAttrs {
+    /// No attributes: not read-only, not sensitive, `destructive` unset (so destructive), output
+    /// untrusted, no declared inputs.
     pub fn new() -> Self {
         Self::default()
     }
@@ -161,11 +172,13 @@ impl ToolAttrs {
         out
     }
 
+    /// Set `readonly` (see [`ToolAttrs::readonly`]).
     pub fn readonly(mut self, readonly: bool) -> Self {
         self.readonly = readonly;
         self
     }
 
+    /// Set `sensitive` (see [`ToolAttrs::sensitive`]).
     pub fn sensitive(mut self, sensitive: bool) -> Self {
         self.sensitive = sensitive;
         self
@@ -232,6 +245,7 @@ impl Narrowing {
         }
     }
 
+    /// No hint asked to narrow anything.
     pub fn is_empty(&self) -> bool {
         !self.not_readonly && !self.destructive
     }
@@ -266,6 +280,7 @@ pub struct ToolCatalog {
 }
 
 impl ToolCatalog {
+    /// An empty catalog: under the default [`UnknownTools::Deny`], every `tools/call` is denied.
     pub fn new() -> Self {
         Self::default()
     }
@@ -294,15 +309,18 @@ impl ToolCatalog {
             .unwrap_or_default()
     }
 
+    /// Is `(server, tool)` registered? Names are compared exactly.
     pub fn contains(&self, server: &str, tool: &str) -> bool {
         self.tools
             .contains_key(&(server.to_string(), tool.to_string()))
     }
 
+    /// Number of registered `(server, tool)` pairs.
     pub fn len(&self) -> usize {
         self.tools.len()
     }
 
+    /// No tool is registered.
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }
@@ -317,6 +335,13 @@ impl ToolCatalog {
     /// `amount` and `destination` must name an input, and `amount` one not declared other than
     /// `long`; a `destination` with `#` must end in a known derivation (`#host`). Called by
     /// [`PolicyEngineBuilder::build`](crate::PolicyEngineBuilder::build).
+    ///
+    /// # Errors
+    ///
+    /// A message naming the first offending `(server, tool)` entry, in order: an invalid server
+    /// or call name, an empty `amount` or `destination`, a `destination` that
+    /// [`parse_arg_ref`](attenuo_core::limits::parse_arg_ref) refuses, or an `amount` whose input
+    /// is declared with a type other than `long`.
     pub fn validate(&self) -> Result<(), String> {
         for ((server, tool), attrs) in &self.tools {
             attenuo_core::names::check_server_name(server)

@@ -193,6 +193,11 @@ fn range_admits_all_equal(range: &ArgConstraint, v: &Value) -> bool {
 
 impl ArgConstraint {
     /// A checked `range`: at least one bound, and `min <= max` when both are given.
+    ///
+    /// # Errors
+    ///
+    /// [`RangeError::Unbounded`] when both bounds are `None`, and [`RangeError::Inverted`] when
+    /// `min > max`.
     pub fn range(min: Option<i64>, max: Option<i64>) -> Result<Self, RangeError> {
         match (min, max) {
             (None, None) => Err(RangeError::Unbounded),
@@ -421,12 +426,22 @@ impl Capability {
     }
 
     /// Check the capability's limits ([`Limits::validate`]).
+    ///
+    /// # Errors
+    ///
+    /// The first [`LimitError`] that [`Limits::validate`] finds in this capability's limits.
     pub fn validate_limits(&self) -> Result<(), LimitError> {
         self.limits.validate(self)
     }
 
     /// Check the server and tool patterns against [`crate::names`]: `*`, `<prefix>*` or a
     /// name. A capability that fails this could only ever match names no call can have.
+    ///
+    /// # Errors
+    ///
+    /// [`NameError`] if the server pattern or the tool pattern is neither `*` nor a valid name or
+    /// `<prefix>*`: a `*` anywhere but the end, an empty or over-long pattern, or a character
+    /// outside the name set.
     pub fn validate(&self) -> Result<(), NameError> {
         crate::names::check_server_pattern(&self.server)?;
         crate::names::check_call_pattern(&self.tool)
@@ -542,11 +557,21 @@ impl CapabilitySet {
     }
 
     /// [`Capability::validate`] every member.
+    ///
+    /// # Errors
+    ///
+    /// The [`NameError`] of the first member, in canonical order, whose patterns
+    /// [`Capability::validate`] refuses.
     pub fn validate(&self) -> Result<(), NameError> {
         self.0.iter().try_for_each(Capability::validate)
     }
 
     /// [`Capability::validate_limits`] every member.
+    ///
+    /// # Errors
+    ///
+    /// The [`LimitError`] of the first member, in canonical order, whose limits
+    /// [`Limits::validate`] refuses.
     pub fn validate_limits(&self) -> Result<(), LimitError> {
         self.0.iter().try_for_each(Capability::validate_limits)
     }
@@ -564,6 +589,12 @@ impl CapabilitySet {
     ///
     /// This is the attenuation step performed at every delegation hop. Limits are clamped, not
     /// refused ([`attenuate_with`](Self::attenuate_with) with nothing spent yet).
+    ///
+    /// # Errors
+    ///
+    /// As [`attenuate_with`](Self::attenuate_with): [`AttenuationError::Empty`] for an empty
+    /// `requested`, [`AttenuationError::NotCovered`] for the first requested capability no member
+    /// of `self` covers.
     pub fn attenuate(&self, requested: &CapabilitySet) -> Result<CapabilitySet, AttenuationError> {
         self.attenuate_with(requested, |_, _, _| None)
     }
@@ -586,6 +617,13 @@ impl CapabilitySet {
     ///
     /// The result must then be covered by `self`, or the request fails as not covered. A
     /// child requesting no limit under a limited parent so gets the parent's figure.
+    ///
+    /// # Errors
+    ///
+    /// [`AttenuationError::Empty`] when `requested` is empty. [`AttenuationError::NotCovered`],
+    /// naming the capability, when no member of `self` covers a requested capability's calls, or
+    /// when the clamped capability is still not covered by its parent (a constraint or limit
+    /// clamping cannot fix).
     pub fn attenuate_with(
         &self,
         requested: &CapabilitySet,

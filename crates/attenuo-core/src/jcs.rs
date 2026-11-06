@@ -62,6 +62,13 @@ impl ser::Error for JcsError {
 }
 
 /// The canonical (RFC 8785) encoding of `value`.
+///
+/// # Errors
+///
+/// [`JcsError::NonFinite`] for a NaN or infinite float, [`JcsError::DuplicateKey`] when a map
+/// serializes two members of one name, [`JcsError::KeyNotString`] for a map key that is
+/// neither a string nor an integer, [`JcsError::Unsupported`] for a value JSON cannot hold,
+/// and [`JcsError::Custom`] for an error raised by `value`'s `Serialize` implementation.
 pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, JcsError> {
     let node = value.serialize(NodeSerializer)?;
     let mut out = Vec::with_capacity(128);
@@ -70,6 +77,10 @@ pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, JcsError> {
 }
 
 /// [`to_vec`] as a `String` (the encoding is UTF-8).
+///
+/// # Errors
+///
+/// As [`to_vec`].
 pub fn to_string<T: Serialize + ?Sized>(value: &T) -> Result<String, JcsError> {
     let bytes = to_vec(value)?;
     // Built from `&str`s and ASCII only.

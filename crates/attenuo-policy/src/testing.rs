@@ -130,13 +130,26 @@ const MAX_CASE_DEPTH: usize = 64;
 /// Errors that stop a whole test file from running (as opposed to a case that fails).
 #[derive(Debug, thiserror::Error)]
 pub enum HarnessError {
+    /// A file the test file needs (itself, its policies, catalog, config or schema) could not
+    /// be read.
     #[error("reading {path}: {source}")]
     Io {
+        /// The file that could not be read.
         path: PathBuf,
+        /// Why.
         source: std::io::Error,
     },
+    /// A file was read but its contents are not what the harness expects.
     #[error("{what} is not valid: {message}")]
-    Invalid { what: String, message: String },
+    Invalid {
+        /// What was being read: `test file`, a file path, or a part of a config such as
+        /// `catalog in config.toml`.
+        what: String,
+        /// The parser's or the check's message.
+        message: String,
+    },
+    /// The engine could not be built from the policies, catalog and schema, or the policy
+    /// text does not parse.
     #[error(transparent)]
     Policy(#[from] PolicyError),
 }
@@ -172,6 +185,12 @@ fn read(path: &Path) -> Result<String, HarnessError> {
 /// Read the tool catalog from a server config: the inline `[policy.catalog.<server>.<tool>]`
 /// tables, with `[policy] catalog_path` (a JSON file, relative to the config) merged on top,
 /// exactly as `attenuo-server` does. A config with no catalog yields an empty one.
+///
+/// # Errors
+///
+/// [`HarnessError::Io`] when the config, or the JSON file `catalog_path` names, cannot be read;
+/// [`HarnessError::Invalid`] when the config is not TOML, `[policy.catalog]` is not a table
+/// of tool attributes (an unknown member included), or the JSON catalog does not parse.
 pub fn load_catalog_from_config(path: &Path) -> Result<ToolCatalog, HarnessError> {
     let what = format!("catalog in {}", path.display());
     let doc: toml::Table = read(path)?
@@ -202,6 +221,12 @@ pub fn load_catalog_from_config(path: &Path) -> Result<ToolCatalog, HarnessError
 /// Read `[policy] user_attributes` (`name = "string" | "long" | "bool" | "set<...>"`) from a
 /// server config, the extra `originating_user.attributes` the schema should declare. A JSON
 /// file or a config without the table yields an empty map.
+///
+/// # Errors
+///
+/// [`HarnessError::Io`] when the config cannot be read; [`HarnessError::Invalid`] when it is
+/// not TOML, `user_attributes` is not a table of strings, or a type is not one
+/// [`ArgType`]'s parser accepts.
 pub fn load_user_attrs(path: &Path) -> Result<BTreeMap<String, ArgType>, HarnessError> {
     if path.extension().and_then(|e| e.to_str()) == Some("json") {
         return Ok(BTreeMap::new());
@@ -225,6 +250,12 @@ pub fn load_user_attrs(path: &Path) -> Result<BTreeMap<String, ArgType>, Harness
 }
 
 /// Read `[policy] unknown_tools` from a server config; `None` when it is not set.
+///
+/// # Errors
+///
+/// [`HarnessError::Io`] when the file cannot be read; [`HarnessError::Invalid`] when it is not
+/// TOML (a JSON catalog is not special-cased here) or the value is not `deny`, `sensitive` or
+/// `allow`.
 pub fn load_unknown_tools_from_config(path: &Path) -> Result<Option<UnknownTools>, HarnessError> {
     let what = format!("unknown_tools in {}", path.display());
     let doc: toml::Table = read(path)?
@@ -245,6 +276,11 @@ pub fn load_unknown_tools_from_config(path: &Path) -> Result<Option<UnknownTools
 }
 
 /// Read `[policy] legacy_bare_actions` from a server config; `None` when it is not set.
+///
+/// # Errors
+///
+/// [`HarnessError::Io`] when the config cannot be read; [`HarnessError::Invalid`] when it is
+/// not TOML or the value is not a boolean. A `.json` path is `Ok(None)` without being read.
 pub fn load_legacy_bare_actions_from_config(path: &Path) -> Result<Option<bool>, HarnessError> {
     if path.extension().and_then(|e| e.to_str()) == Some("json") {
         return Ok(None);
@@ -269,6 +305,11 @@ pub fn load_legacy_bare_actions_from_config(path: &Path) -> Result<Option<bool>,
 
 /// Read `[policy] schema_path` from a server config, resolved against the config's directory
 /// as `catalog_path` is; `None` when it is not set or the path is a JSON catalog.
+///
+/// # Errors
+///
+/// [`HarnessError::Io`] when the config cannot be read; [`HarnessError::Invalid`] when it is
+/// not TOML or the value is not a string. A `.json` path is `Ok(None)` without being read.
 pub fn load_schema_path_from_config(path: &Path) -> Result<Option<PathBuf>, HarnessError> {
     if path.extension().and_then(|e| e.to_str()) == Some("json") {
         return Ok(None);
@@ -294,6 +335,11 @@ pub fn load_schema_path_from_config(path: &Path) -> Result<Option<PathBuf>, Harn
 }
 
 /// Read a JSON catalog file: `{ "<server>": { "<tool>": { "readonly": true, ... } } }`.
+///
+/// # Errors
+///
+/// [`HarnessError::Io`] when the file cannot be read; [`HarnessError::Invalid`] when it is not
+/// JSON of that shape (an unknown tool attribute included).
 pub fn load_catalog_json(path: &Path) -> Result<ToolCatalog, HarnessError> {
     let tables: CatalogTables = serde_json::from_str(&read(path)?)
         .map_err(|e| HarnessError::invalid(format!("catalog {}", path.display()), e))?;
@@ -302,6 +348,10 @@ pub fn load_catalog_json(path: &Path) -> Result<ToolCatalog, HarnessError> {
 
 /// Load a catalog from a path by extension: `.json` is a bare catalog, anything else is a
 /// server config in TOML.
+///
+/// # Errors
+///
+/// As [`load_catalog_json`] or [`load_catalog_from_config`], whichever the extension picks.
 pub fn load_catalog(path: &Path) -> Result<ToolCatalog, HarnessError> {
     if path.extension().and_then(|e| e.to_str()) == Some("json") {
         load_catalog_json(path)
@@ -322,10 +372,13 @@ enum CatalogSpec {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserSpec {
+    /// `originating_user.subject`; default `alice`.
     #[serde(default = "default_subject")]
     pub subject: String,
+    /// `originating_user.issuer`; default `https://idp.example`.
     #[serde(default = "default_issuer")]
     pub issuer: String,
+    /// `originating_user.attributes`, passed as written; default none.
     #[serde(default)]
     pub attributes: BTreeMap<String, Value>,
     /// Unix seconds; default is one minute before `now`.
@@ -356,7 +409,9 @@ impl Default for UserSpec {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(untagged)]
 pub enum CapSpec {
+    /// `server:tool`, each side a name or a glob, with no constraints or limits.
     Short(String),
+    /// A capability object as a token carries it, constraints and limits included.
     Full(Capability),
 }
 
@@ -377,14 +432,20 @@ impl CapSpec {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(untagged)]
 pub enum HopSpec {
+    /// Just the agent id; the hop gets the previous hop's capabilities.
     Agent(String),
+    /// `{ agent, capabilities }`.
     Detailed(HopDetail),
 }
 
+/// A hop written as a map: `{ agent: coder, capabilities: [github:read_file] }`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HopDetail {
+    /// The hop's agent id.
     pub agent: String,
+    /// The hop's capabilities; absent means the previous hop's (or, for the first hop, the
+    /// call's `server:tool`).
     #[serde(default)]
     pub capabilities: Option<Vec<CapSpec>>,
 }
@@ -409,10 +470,14 @@ impl HopSpec {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CallSpec {
+    /// The upstream server's name.
     pub server: String,
+    /// The tool (or MCP method) name.
     pub tool: String,
+    /// The call's arguments, `context.input`; default `{}`.
     #[serde(default = "empty_object")]
     pub arguments: Value,
+    /// The MCP session id, `context.session_id`; default none.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -473,12 +538,16 @@ pub struct ApprovalSpec {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetSpec {
+    /// `context.budget.limited`; default `true`.
     #[serde(default)]
     pub limited: Option<bool>,
+    /// `context.budget.calls_remaining`; default `i64::MAX`.
     #[serde(default)]
     pub calls_remaining: Option<i64>,
+    /// `context.budget.amount_remaining`; default `i64::MAX`.
     #[serde(default)]
     pub amount_remaining: Option<i64>,
+    /// `context.budget.destination_new`; default `true`.
     #[serde(default)]
     pub destination_new: Option<bool>,
 }
@@ -501,10 +570,14 @@ impl BudgetSpec {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsageSpec {
+    /// `context.usage.calls`: allowed calls of the tool earlier in the run.
     #[serde(default)]
     pub calls: i64,
+    /// `context.usage.amount`: the sum of the tool's `amount` input over those calls.
     #[serde(default)]
     pub amount: i64,
+    /// `context.usage.destination_seen`: the call's destination appeared in an earlier allowed
+    /// call of the tool.
     #[serde(default)]
     pub destination_seen: bool,
 }
@@ -523,7 +596,9 @@ impl UsageSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Expect {
+    /// The engine must allow the call.
     Allow,
+    /// The engine must deny the call, for any reason (`approval_required` included).
     Deny,
 }
 
@@ -549,13 +624,17 @@ impl std::fmt::Display for Expect {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TestCase {
+    /// The case's name, unique in the file; reports name the case by it.
     pub name: String,
+    /// The originating user; see [`UserSpec`] for the defaults.
     #[serde(default)]
     pub user: UserSpec,
     /// Agent ids, root first. Defaults to a single agent called `agent`.
     #[serde(default)]
     pub chain: Vec<HopSpec>,
+    /// The call to authorize.
     pub call: CallSpec,
+    /// The decision the policies must produce.
     pub expect: Expect,
     /// Expected reason code, e.g. `policy_deny` or `capability_denied`.
     #[serde(default)]
@@ -591,6 +670,7 @@ pub struct TestFile {
     legacy_bare_actions: Option<bool>,
     #[serde(default)]
     now: Option<i64>,
+    /// The cases, run in order; never empty.
     pub cases: Vec<TestCase>,
     /// Directory relative paths resolve against. Set by [`TestFile::load`].
     #[serde(skip)]
@@ -606,6 +686,11 @@ pub struct TestFile {
 impl TestFile {
     /// Parse a test file from YAML. Relative `policies` and `catalog` paths resolve against the
     /// current directory; use [`TestFile::load`] to resolve them against the file.
+    ///
+    /// # Errors
+    ///
+    /// [`HarnessError::Invalid`] (`test file`) when the YAML does not parse into a test file (an
+    /// unknown key included), `cases` is empty, or two cases share a name.
     pub fn from_yaml_str(yaml: &str) -> Result<Self, HarnessError> {
         let file: TestFile =
             serde_yaml::from_str(yaml).map_err(|e| HarnessError::invalid("test file", e))?;
@@ -613,6 +698,12 @@ impl TestFile {
     }
 
     /// Read and parse a test file. Relative paths inside it resolve against its directory.
+    ///
+    /// # Errors
+    ///
+    /// [`HarnessError::Io`] when the file cannot be read; otherwise as
+    /// [`from_yaml_str`](Self::from_yaml_str), with the path as the `what` of
+    /// [`HarnessError::Invalid`].
     pub fn load(path: &Path) -> Result<Self, HarnessError> {
         let text = read(path)?;
         let mut file: TestFile = serde_yaml::from_str(&text)
@@ -657,6 +748,11 @@ impl TestFile {
 
     /// How calls to uncatalogued tools are handled: the file's `unknown_tools`, else the one of
     /// the server config `catalog` names, else deny (the server's default).
+    ///
+    /// # Errors
+    ///
+    /// When the file sets no `unknown_tools` and `catalog` names a server config, the errors of
+    /// [`load_unknown_tools_from_config`]. Otherwise it cannot fail.
     pub fn load_unknown_tools(&self) -> Result<UnknownTools, HarnessError> {
         if let Some(u) = self.unknown_tools {
             return Ok(u);
@@ -671,6 +767,11 @@ impl TestFile {
 
     /// Whether the engine uses the deprecated bare action ids: the file's
     /// `legacy_bare_actions`, else the one of the server config `catalog` names, else `false`.
+    ///
+    /// # Errors
+    ///
+    /// When the file sets no `legacy_bare_actions` and `catalog` names a server config, the errors
+    /// of [`load_legacy_bare_actions_from_config`]. Otherwise it cannot fail.
     pub fn load_legacy_bare_actions(&self) -> Result<bool, HarnessError> {
         if let Some(b) = self.legacy_bare_actions {
             return Ok(b);
@@ -684,6 +785,11 @@ impl TestFile {
     }
 
     /// The tool catalog the file selects (empty when it names none).
+    ///
+    /// # Errors
+    ///
+    /// When `catalog` is a path, the errors of the free function [`load_catalog`]. An inline or
+    /// absent catalog cannot fail.
     pub fn load_catalog(&self) -> Result<ToolCatalog, HarnessError> {
         match &self.catalog {
             None => Ok(ToolCatalog::new()),
@@ -694,6 +800,15 @@ impl TestFile {
 
     /// Build the engine the file describes. With no `policies`, the policy set is empty and
     /// Cedar denies everything.
+    ///
+    /// # Errors
+    ///
+    /// Any error of [`load_catalog`](Self::load_catalog),
+    /// [`load_unknown_tools`](Self::load_unknown_tools),
+    /// [`load_legacy_bare_actions`](Self::load_legacy_bare_actions), [`load_user_attrs`] or
+    /// [`load_base_schema`](Self::load_base_schema), and [`HarnessError::Policy`] for whatever
+    /// [`PolicyEngineBuilder::build`] refuses (an unreadable policy file is
+    /// [`PolicyError::Io`] there).
     pub fn build_engine(&self) -> Result<PolicyEngine, HarnessError> {
         let mut builder = PolicyEngineBuilder::new()
             .with_catalog(self.load_catalog()?)
@@ -723,6 +838,11 @@ impl TestFile {
     /// The base schema file in force: [`with_schema_file`](Self::with_schema_file), else the
     /// `[policy] schema_path` of the server config `catalog` names (relative to that config),
     /// else none (the built-in [`DEFAULT_SCHEMA`](crate::DEFAULT_SCHEMA)).
+    ///
+    /// # Errors
+    ///
+    /// When no schema file was set and `catalog` names a config, the errors of
+    /// [`load_schema_path_from_config`].
     pub fn base_schema_path(&self) -> Result<Option<PathBuf>, HarnessError> {
         if let Some(p) = &self.schema_file {
             return Ok(Some(p.clone()));
@@ -734,11 +854,22 @@ impl TestFile {
     }
 
     /// The text of [`base_schema_path`](Self::base_schema_path), if any.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`base_schema_path`](Self::base_schema_path), and [`HarnessError::Io`] when
+    /// the schema file cannot be read.
     pub fn load_base_schema(&self) -> Result<Option<String>, HarnessError> {
         self.base_schema_path()?.map(|p| read(&p)).transpose()
     }
 
     /// Build the engine and run every case.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`build_engine`](Self::build_engine) and
+    /// [`policy_refs`](Self::policy_refs). A case that fails or cannot be built is reported in
+    /// the [`TestReport`], not returned as an error.
     pub fn run(&self) -> Result<TestReport, HarnessError> {
         let engine = self.build_engine()?;
         let mut report = self.run_with(&engine);
@@ -758,6 +889,10 @@ impl TestFile {
 
     /// A report for case results produced some other way (for instance by a remote server),
     /// with the file's source and its policies (see [`TestFile::policy_refs`]).
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`policy_refs`](Self::policy_refs).
     pub fn report_for(&self, cases: Vec<CaseReport>) -> Result<TestReport, HarnessError> {
         Ok(TestReport {
             source: self.source.clone(),
@@ -812,6 +947,11 @@ impl TestFile {
 
     /// Every policy of the file's `policies`, with the line it starts on (empty when it names
     /// none).
+    ///
+    /// # Errors
+    ///
+    /// [`HarnessError::Io`] when the policy file cannot be read, and [`HarnessError::Policy`]
+    /// ([`PolicyError::Parse`]) when it does not parse.
     pub fn policy_refs(&self) -> Result<Vec<PolicyRef>, HarnessError> {
         match self.policies_path() {
             None => Ok(Vec::new()),
@@ -837,7 +977,9 @@ fn clean_path(path: &Path) -> PathBuf {
 /// Cedar's `policy<N>`), and where it starts when known.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct PolicyRef {
+    /// The policy's id as the engine reports it.
     pub id: String,
+    /// The policy file it is in, when the policies came from a file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<PathBuf>,
     /// 1-based line of the policy's first token (its first annotation, or `permit`/`forbid`).
@@ -858,6 +1000,11 @@ impl std::fmt::Display for PolicyRef {
 
 /// The policies (and templates) in Cedar policy text, as the engine names them, each with the
 /// line it starts on, in file order. `file` is only recorded in the result.
+///
+/// # Errors
+///
+/// [`HarnessError::Policy`] ([`PolicyError::Parse`]) when `text` is not a Cedar policy set.
+/// Ids are not checked: a duplicate `@id` is reported twice, not refused.
 pub fn policy_refs(text: &str, file: Option<&Path>) -> Result<Vec<PolicyRef>, HarnessError> {
     use std::str::FromStr as _;
     let parsed = cedar_policy::PolicySet::from_str(text)
@@ -898,6 +1045,7 @@ pub struct Coverage {
 }
 
 impl Coverage {
+    /// How many of the policies some case exercised.
     pub fn exercised(&self) -> usize {
         self.policies - self.unexercised.len()
     }
@@ -947,9 +1095,13 @@ pub fn coverage<'a>(reports: impl IntoIterator<Item = &'a TestReport>) -> Covera
 /// What the engine decided.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Actual {
+    /// Allow or deny.
     pub decision: Decision,
+    /// The reason code, as in [`Outcome::reason`].
     pub reason: String,
+    /// The determining policies, as in [`Outcome::policy_ids`].
     pub policy_ids: Vec<String>,
+    /// The engine's details, as in [`Outcome::diagnostics`].
     pub diagnostics: Vec<String>,
 }
 
@@ -967,8 +1119,11 @@ impl From<Outcome> for Actual {
 /// The result of one case.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CaseReport {
+    /// The case's name.
     pub name: String,
+    /// Evaluated, and every expectation held.
     pub passed: bool,
+    /// The decision the case expected.
     pub expected: Expect,
     /// Absent when the case could not be evaluated (see `error`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -988,8 +1143,10 @@ pub struct CaseReport {
 /// The result of one test file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TestReport {
+    /// The test file, when it was loaded from one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<PathBuf>,
+    /// One report per case, in file order.
     pub cases: Vec<CaseReport>,
     /// Every policy of the set under test, exercised or not.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1015,6 +1172,7 @@ impl TestReport {
             .collect()
     }
 
+    /// Cases that passed.
     pub fn passed(&self) -> usize {
         self.cases.iter().filter(|c| c.passed).count()
     }
@@ -1029,6 +1187,7 @@ impl TestReport {
         self.cases.iter().filter(|c| c.skipped.is_some()).count()
     }
 
+    /// No case failed. Skipped cases do not count against it.
     pub fn all_passed(&self) -> bool {
         self.failed() == 0
     }
@@ -1046,9 +1205,13 @@ fn run_case(engine: &PolicyEngine, case: &TestCase, now_unix: i64) -> CaseReport
 /// What a case evaluates: the chain and call it describes, the run's labels and the time.
 #[derive(Debug, Clone)]
 pub struct CaseInput {
+    /// The chain the case describes, already validated at `now`.
     pub chain: DelegationChain,
+    /// The call under test.
     pub call: ToolCall,
+    /// The run's labels, approval, budget and usage the case sets.
     pub labels: CallLabels,
+    /// The evaluation time.
     pub now: OffsetDateTime,
 }
 
@@ -1056,6 +1219,13 @@ impl TestCase {
     /// Build what the case evaluates at `now_unix` (the file's [`TestFile::now_unix`]), exactly
     /// as the in-process run does. `Err` describes a malformed case, for instance a chain that
     /// violates attenuation.
+    ///
+    /// # Errors
+    ///
+    /// A message when `now_unix` or `user.authenticated_at_unix` is not a representable time, a
+    /// short capability is not `server:tool`, or the built chain fails
+    /// [`DelegationChain::validate_at`] (an empty subject or agent id, a hop that widens its
+    /// parent's capabilities, a repeated agent, more than 64 hops).
     pub fn input(&self, now_unix: i64) -> Result<CaseInput, String> {
         let (chain, call, now) = build_case(self, now_unix)?;
         let mut labels = self
@@ -1186,6 +1356,11 @@ impl TestCase {
     /// `file_now_unix`: the chain is stamped at `at_unix`, and an explicit
     /// `user.authenticated_at_unix` moves by the same amount, so the user's authentication keeps
     /// the age the case gives it. For a server that validates the chain at its own clock.
+    ///
+    /// # Errors
+    ///
+    /// As [`input`](Self::input), and a message when shifting `user.authenticated_at_unix` by
+    /// `at_unix - file_now_unix` overflows.
     pub fn input_at(&self, file_now_unix: i64, at_unix: i64) -> Result<CaseInput, String> {
         let Some(t) = self.user.authenticated_at_unix else {
             return self.input(at_unix);

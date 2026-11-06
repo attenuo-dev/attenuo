@@ -113,18 +113,34 @@ fn check_segment_chars(kind: NameKind, name: &str, segment: &str) -> Result<(), 
 }
 
 /// Check a server name: one segment of allowed characters, 1 to [`MAX_NAME_LEN`] bytes.
+///
+/// # Errors
+///
+/// [`NameError::Empty`], [`NameError::TooLong`], or [`NameError::InvalidChar`] for the first
+/// character outside `[A-Za-z0-9_.-]` (a `/` included).
 pub fn check_server_name(name: &str) -> Result<(), NameError> {
     check_len(NameKind::Server, name)?;
     check_segment_chars(NameKind::Server, name, name)
 }
 
 /// Check a tool name as MCP carries it (`tools/list`, `tools/call`): one segment, no `/`.
+///
+/// # Errors
+///
+/// [`NameError::Empty`], [`NameError::TooLong`], or [`NameError::InvalidChar`] for the first
+/// character outside `[A-Za-z0-9_.-]` (a `/` included).
 pub fn check_tool_name(name: &str) -> Result<(), NameError> {
     check_len(NameKind::Tool, name)?;
     check_segment_chars(NameKind::Tool, name, name)
 }
 
 /// Check a call name: a tool name, or method-style segments joined by single `/`.
+///
+/// # Errors
+///
+/// [`NameError::Empty`] or [`NameError::TooLong`]; [`NameError::InvalidChar`] reporting `/`
+/// for an empty segment (a leading, trailing or doubled `/`), or the first other character
+/// outside the set.
 pub fn check_call_name(name: &str) -> Result<(), NameError> {
     check_len(NameKind::Tool, name)?;
     for segment in name.split('/') {
@@ -137,6 +153,11 @@ pub fn check_call_name(name: &str) -> Result<(), NameError> {
 }
 
 /// Check a capability's server pattern: `*`, `<prefix>*`, or a server name.
+///
+/// # Errors
+///
+/// [`NameError::Empty`] or [`NameError::TooLong`]; [`NameError::InvalidChar`] for a `*`
+/// before the end or any character outside the server name set. `*` alone never fails.
 pub fn check_server_pattern(pattern: &str) -> Result<(), NameError> {
     check_pattern(NameKind::Server, pattern, |p| {
         check_segment_chars(NameKind::Server, pattern, p)
@@ -145,6 +166,12 @@ pub fn check_server_pattern(pattern: &str) -> Result<(), NameError> {
 
 /// Check a capability's tool pattern: `*`, `<prefix>*`, or a call name. A prefix may end in
 /// `/` (`resources/*`).
+///
+/// # Errors
+///
+/// [`NameError::Empty`] or [`NameError::TooLong`]; [`NameError::InvalidChar`] for a `*`
+/// before the end, an empty segment other than the tail after a trailing `/`, or a character
+/// outside the name set. `*` alone never fails.
 pub fn check_call_pattern(pattern: &str) -> Result<(), NameError> {
     check_pattern(NameKind::Tool, pattern, |prefix| {
         for (i, segment) in prefix.split('/').enumerate() {
