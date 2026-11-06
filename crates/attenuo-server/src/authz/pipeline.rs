@@ -140,9 +140,14 @@ pub(super) struct ArgProbes<'a> {
 }
 
 /// The probes of `call`'s arguments not in `pinned`. Once the pairs pass [`MAX_ARG_PROBES`]
-/// nothing more is kept for lookup (the caller then looks nothing up); the remaining
-/// arguments are only checked for having a fingerprint, so the fail-closed answer still
-/// names each of them.
+/// nothing more is kept for lookup (the caller then looks nothing up). The remaining
+/// arguments are still fingerprinted, in full, to learn which of them have a fingerprint, so
+/// the fail-closed answer names each of them: the bound limits the lookups and what they
+/// return, not the fingerprinting, whose cost is that of the request body (each value at
+/// most [`MAX_FINGERPRINTS_PER_VALUE`] fingerprints from its first [`MAX_TEXT_BYTES`]; SR-99).
+///
+/// [`MAX_FINGERPRINTS_PER_VALUE`]: attenuo_core::fingerprint::MAX_FINGERPRINTS_PER_VALUE
+/// [`MAX_TEXT_BYTES`]: attenuo_core::fingerprint::MAX_TEXT_BYTES
 pub(super) fn arg_probes<'a>(call: &'a ToolCall, pinned: &BTreeSet<String>) -> ArgProbes<'a> {
     let mut out = ArgProbes::default();
     let mut slot: HashMap<Fingerprint, usize> = HashMap::new();
