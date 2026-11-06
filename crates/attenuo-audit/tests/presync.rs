@@ -6,23 +6,15 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use attenuo_audit::{AuditSink, Durability, SqliteAudit, CHECKPOINT_PRESYNC_LEAD};
-use common::record;
+use common::{record, wait_for};
 
 fn wal_path(db: &Path) -> PathBuf {
     let mut p = db.as_os_str().to_owned();
     p.push("-wal");
     PathBuf::from(p)
-}
-
-fn wait_for(what: &str, timeout: Duration, mut done: impl FnMut() -> bool) {
-    let start = Instant::now();
-    while !done() {
-        assert!(start.elapsed() < timeout, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(20));
-    }
 }
 
 fn issuer() -> attenuo_token::Issuer {

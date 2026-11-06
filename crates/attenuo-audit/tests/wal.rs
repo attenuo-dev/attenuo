@@ -13,7 +13,7 @@ use attenuo_audit::{
     AuditSink, Durability, SqliteAudit, SqliteLeaseStore, DEFAULT_WAL_CHECKPOINT_INTERVAL,
     WAL_CHECKPOINT_COMMITS, WAL_WRITER_BACKSTOP_FRAMES,
 };
-use common::record;
+use common::{record, wait_for};
 use rusqlite::{Connection, OpenFlags};
 
 fn wal_path(db: &Path) -> PathBuf {
@@ -37,14 +37,6 @@ fn autocheckpoint(audit: &SqliteAudit) -> i64 {
     audit
         .with_connection(|c| Ok(c.query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))?))
         .unwrap()
-}
-
-fn wait_for(what: &str, timeout: Duration, mut done: impl FnMut() -> bool) {
-    let start = Instant::now();
-    while !done() {
-        assert!(start.elapsed() < timeout, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(20));
-    }
 }
 
 #[test]

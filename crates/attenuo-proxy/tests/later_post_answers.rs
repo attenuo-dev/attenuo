@@ -1,6 +1,7 @@
-//! Security review pass 8: an upstream (A3) that answers an allowed call in the body of a
-//! later `POST` of the same session must not get that answer to the client unlabelled
-//! (SR-85).
+//! Answers in the body of a later `POST`: an upstream (A3) that answers an allowed call in the
+//! body of a later `POST` of the same session must not get that answer to the client
+//! unlabelled (SR-85, security review pass 8, `docs/research/security-review-2026-11-05-pass8.md`).
+//! Formerly `security_pass8.rs`; the list-answer case (SR-87) is in `later_post_list_answers.rs`.
 
 use std::sync::{Arc, Mutex};
 

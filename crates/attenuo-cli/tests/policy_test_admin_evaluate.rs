@@ -5,6 +5,8 @@
 // Configs are built field by field from `Config::default()`, as in the server tests.
 #![allow(clippy::field_reassign_with_default)]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -14,6 +16,8 @@ use attenuo_policy::{ArgType, ToolAttrs};
 use attenuo_proxy::testing::{spawn_router, Spawned};
 use attenuo_server::Config;
 use serde_json::Value;
+
+use common::attenuo;
 
 const ADMIN: &str = "policy-test-admin-evaluate-admin";
 const POLICY: &str = r#"@id("public_reads")
@@ -41,20 +45,6 @@ const CATALOG: &str = r#"catalog:
     read_file: { readonly: true, inputs: { repo: string } }
     create_issue: { inputs: { repo: string } }
 "#;
-
-fn attenuo() -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_attenuo"));
-    for var in [
-        "ATTENUO_ADMIN_TOKEN",
-        "ATTENUO_CLIENT_SECRET",
-        "ATTENUO_TOKEN",
-        "ATTENUO_SERVER",
-        "ATTENUO_DPOP_KEY",
-    ] {
-        c.env_remove(var);
-    }
-    c
-}
 
 /// Run the CLI off the async runtime (the server runs on it).
 async fn run(cmd: Command) -> Output {

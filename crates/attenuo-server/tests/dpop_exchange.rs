@@ -1,10 +1,15 @@
-//! Regression tests for findings of the 2026-10-23 security review, pass 4
-//! (`docs/research/security-review-2026-10-23-pass4.md`). SR-44 and the `[[actor_trust]]` case
-//! of SR-45 are in `actor_token.rs`, next to the actor-token harness they need; SR-46 is a unit
-//! test in `src/authz.rs`.
+//! DPoP proofs and token exchange: regression tests for the findings of the 2026-10-23
+//! security review, pass 4 (`docs/research/security-review-2026-10-23-pass4.md`): SR-40 (the
+//! parent's sign-off names the new key and agent), SR-41 (wrong-key proofs), SR-42 (`htu` and
+//! the host), SR-43 (internal errors reveal no paths), SR-45 (the reserved agent id) and SR-47
+//! (a full DPoP replay cache). Formerly `security_pass4.rs`. SR-44 and the `[[actor_trust]]`
+//! case of SR-45 are in `actor_token.rs`, next to the actor-token harness they need; SR-46 is a
+//! unit test in `src/authz.rs`.
 
 // Configs are built field by field from `Config::default()`, as in the other server tests.
 #![allow(clippy::field_reassign_with_default)]
+
+mod common;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -12,13 +17,13 @@ use std::path::Path;
 use attenuo_policy::{ArgType, ToolAttrs};
 use attenuo_proxy::testing::{spawn_router, FakeMcpServer, Spawned};
 use attenuo_proxy::UpstreamConfig;
-use attenuo_server::config::AgentConfig;
 use attenuo_server::Config;
 use attenuo_token::DpopKey;
 use reqwest::{RequestBuilder, StatusCode};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
+
+use common::agent_configs;
 
 const ADMIN: &str = "pass4-admin-token";
 const AGENTS: &[&str] = &["planner", "coder", "reviewer"];
@@ -69,13 +74,7 @@ async fn start(dir: &Path, tweak: impl FnOnce(&mut Config)) -> Server {
     cfg.upstreams = vec![UpstreamConfig::new("github", upstream_task.url("/mcp"))];
     cfg.admin.token = Some(ADMIN.into());
     cfg.dev.allow_root_mint = true;
-    cfg.agents = AGENTS
-        .iter()
-        .map(|id| AgentConfig {
-            id: (*id).into(),
-            secret_sha256: hex::encode(Sha256::digest(secret(id).as_bytes())),
-        })
-        .collect();
+    cfg.agents = agent_configs(AGENTS, secret);
     tweak(&mut cfg);
     let (router, _state) = attenuo_server::build(&cfg).unwrap();
     Server {

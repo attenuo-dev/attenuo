@@ -1,6 +1,10 @@
-//! Security review pass 7: what the proxy reads of an upstream SSE body must be what a client
-//! reads of it, so that output labelling and the stream-end rewrite see every message a client
-//! acts on.
+//! What the proxy reads of an upstream SSE body must be what a client reads of it, so that
+//! output labelling and the stream-end rewrite see every message a client acts on. Regression
+//! tests for SR-77 (an answer a lenient client reads is labelled; a BOM or invalid byte does
+//! not hide a stream-end lookalike), SR-78 (lone surrogate escapes), SR-79 (an event the proxy
+//! cannot parse is not relayed) and SR-80 (nor is a list answer it cannot parse), from security
+//! review pass 7 (`docs/research/security-review-2026-10-25-pass7.md`). Formerly
+//! `security_pass7.rs`.
 
 use std::sync::Arc;
 

@@ -5,6 +5,8 @@
 // Configs are built field by field from `Config::default()`, as in the other server tests.
 #![allow(clippy::field_reassign_with_default)]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -22,8 +24,9 @@ use reqwest::StatusCode;
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, Ed25519KeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
+
+use common::sha256_hex;
 
 const ADMIN: &str = "test-admin-token";
 const TRUST_DOMAIN: &str = "example.org";
@@ -147,10 +150,6 @@ impl KeyServer {
             "jti": uuid::Uuid::new_v4().to_string(),
         }))
     }
-}
-
-fn sha256_hex(s: &str) -> String {
-    hex::encode(Sha256::digest(s.as_bytes()))
 }
 
 struct Harness {

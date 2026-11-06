@@ -5,18 +5,22 @@
 // Configs are built field by field from `Config::default()`, as in the other server tests.
 #![allow(clippy::field_reassign_with_default)]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use attenuo_policy::{ArgType, ToolAttrs};
 use attenuo_proxy::testing::{spawn_router, FakeMcpServer, Spawned};
 use attenuo_proxy::UpstreamConfig;
-use attenuo_server::config::{AgentConfig, DpopMode, DpopNonceMode};
+use attenuo_server::config::{DpopMode, DpopNonceMode};
 use attenuo_server::Config;
 use attenuo_token::DpopKey;
 use reqwest::{RequestBuilder, StatusCode};
 use serde_json::{json, Value};
 use time::OffsetDateTime;
+
+use common::agent_configs;
 
 const ADMIN: &str = "dpop-test-admin";
 const AGENTS: &[&str] = &["planner", "coder", "reviewer"];
@@ -25,11 +29,6 @@ const JWT: &str = "urn:ietf:params:oauth:token-type:jwt";
 
 fn secret(id: &str) -> String {
     format!("{id}-secret")
-}
-
-fn sha256_hex(s: &str) -> String {
-    use sha2::Digest;
-    hex::encode(sha2::Sha256::digest(s.as_bytes()))
 }
 
 struct Server {
@@ -75,13 +74,7 @@ async fn start_with(dir: &Path, mode: DpopMode, nonce: DpopNonceMode) -> Server 
     cfg.dev.allow_root_mint = true;
     cfg.token.dpop = mode;
     cfg.token.dpop_nonce = nonce;
-    cfg.agents = AGENTS
-        .iter()
-        .map(|id| AgentConfig {
-            id: (*id).into(),
-            secret_sha256: sha256_hex(&secret(id)),
-        })
-        .collect();
+    cfg.agents = agent_configs(AGENTS, secret);
     let (router, _state) = attenuo_server::build(&cfg).unwrap();
     Server {
         upstream,

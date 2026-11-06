@@ -80,3 +80,12 @@ pub fn record(i: usize) -> DecisionRecord {
         },
     )
 }
+
+/// Polls `done` every 20 ms until it is true; panics, naming `what`, after `timeout`.
+pub fn wait_for(what: &str, timeout: std::time::Duration, mut done: impl FnMut() -> bool) {
+    let start = std::time::Instant::now();
+    while !done() {
+        assert!(start.elapsed() < timeout, "timed out waiting for {what}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}

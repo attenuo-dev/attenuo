@@ -3,6 +3,8 @@
 // Configs are built field by field from `Config::default()`, as in the server tests.
 #![allow(clippy::field_reassign_with_default)]
 
+mod common;
+
 use std::process::{Command, Output};
 
 use attenuo_audit::LeaseStore;
@@ -13,21 +15,9 @@ use attenuo_server::config::AgentConfig;
 use attenuo_server::Config;
 use serde_json::Value;
 
-const ADMIN: &str = "lease-revoke-test-admin";
+use common::attenuo;
 
-fn attenuo() -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_attenuo"));
-    for var in [
-        "ATTENUO_ADMIN_TOKEN",
-        "ATTENUO_CLIENT_SECRET",
-        "ATTENUO_TOKEN",
-        "ATTENUO_SERVER",
-        "ATTENUO_DPOP_KEY",
-    ] {
-        c.env_remove(var);
-    }
-    c
-}
+const ADMIN: &str = "lease-revoke-test-admin";
 
 /// Run the CLI off the async runtime (the server runs on it).
 async fn run(mut cmd: Command) -> Output {

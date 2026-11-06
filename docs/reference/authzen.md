@@ -53,7 +53,7 @@ Fixtures: `evaluations-deny-on-first-deny.json`, `evaluations-permit-on-first-pe
 - **Base URL.** `[server] public_url`, so `policy_decision_point` is the identifier a PEP configured and 9.2.3's identity check passes. Without it, which is allowed only on a loopback listener, the base is `http://<Host>` and `Host` must be `localhost`, `127.0.0.1` or `[::1]` (400 `invalid_host` otherwise), so a forged `Host` cannot end up in a document a shared cache serves to others (SR-19).
 - **No authentication, by decision.** The specification does not protect the metadata endpoint: its 9.2.1 example request carries no credential, and 11.8 relies on TLS at the hosting site for the integrity of unsigned metadata. A PEP also needs the document before it can know where to send credentials. So discovery is public like `/.well-known/jwks.json`: it takes no credential and ignores an `Authorization` header (an invalid bearer gets the same document, not a 401). That is safe because the document holds only the server's public base URL and the two fixed endpoint paths, all of which any caller of the API already knows: no policy, tenant, lease, key, configuration or version information, and it does not vary with the caller.
 
-Fixture: `metadata.json` (no credential, and an invalid bearer; the comparison is exact, so an extra member fails it). The `Host` checks are tested in `security_low.rs`.
+Fixture: `metadata.json` (no credential, and an invalid bearer; the comparison is exact, so an extra member fails it). The `Host` checks are tested in `crates/attenuo-server/tests/hardening.rs`.
 
 ## Extensions
 

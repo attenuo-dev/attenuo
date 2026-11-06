@@ -54,6 +54,8 @@ struct Minted {
     lease: String,
 }
 
+// Not the shared `common::sha256_hex`, on purpose: the tests check the policy hash the server
+// reports against this independent computation.
 fn sha256_hex(s: &str) -> String {
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(s.as_bytes()))

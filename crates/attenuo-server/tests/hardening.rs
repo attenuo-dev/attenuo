@@ -1,7 +1,10 @@
-//! Regression tests for the Low findings closed together: SR-17 (error responses reveal
-//! internals), SR-18 (log injection), SR-19 (Host-header poisoning of discovery) from
-//! `docs/research/security-review-2026-10-22.md`, and SR-34 (reserved names and the admin
-//! audit subject) from `docs/research/security-review-2026-10-23.md`.
+//! Hardening of the server's error bodies, logs, discovery and reserved names: regression tests
+//! for the Low findings closed together, SR-17 (error responses reveal internals), SR-18 (log
+//! injection) and SR-19 (Host-header poisoning of discovery) from
+//! `docs/research/security-review-2026-10-22.md`, and SR-30 (release workflow actions pinned
+//! to commits) and SR-34 (reserved names and the admin audit subject) from
+//! `docs/research/security-review-2026-10-23.md`. Formerly `security_low.rs`; the SR-30 test
+//! and the SR-34 server-name test came from `security_pass3.rs`.
 
 // Configs are built field by field from `Config::default()`, as in the other server tests.
 #![allow(clippy::field_reassign_with_default)]
@@ -399,6 +402,18 @@ async fn discovery_without_public_url_accepts_only_loopback_hosts() {
 // SR-34: reserved names and the admin subject.
 // ---------------------------------------------------------------------------------------------
 
+/// SR-34: an upstream named `attenuo` wrote tool-call audit records under the server name the
+/// server uses for its own events (`token.exchange`, `lease.renew`, `admin.*`).
+#[test]
+fn the_server_name_attenuo_is_reserved() {
+    let mut cfg = Config::default();
+    cfg.upstreams = vec![UpstreamConfig::new("attenuo", "http://127.0.0.1:9/mcp")];
+    let err = cfg.check_server_names().unwrap_err().to_string();
+    assert!(err.contains("reserved"), "{err}");
+    cfg.upstreams = vec![UpstreamConfig::new("github", "http://127.0.0.1:9/mcp")];
+    cfg.check_server_names().unwrap();
+}
+
 /// SR-34: the server name `attenuo` was already reserved for upstreams; agents, PEPs and
 /// root grants may not use it as an agent id either.
 #[test]
@@ -535,4 +550,45 @@ async fn admin_records_use_a_subject_no_user_can_have() {
         .await
         .unwrap();
     assert_eq!(online["ok"], true, "{online}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// SR-30: the release workflow.
+// ---------------------------------------------------------------------------------------------
+
+/// SR-30: the release workflow holds `packages: write`, `id-token: write` (keyless signing)
+/// and `contents: write`. Every action it runs must be pinned to a full commit SHA, so a moved
+/// tag in a third-party action cannot publish or sign an image in this repository's name, and
+/// the release build must not restore a cache other workflows can write.
+#[test]
+fn release_workflow_actions_are_pinned_to_commits() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../.github/workflows/release.yml"
+    );
+    let text = std::fs::read_to_string(path).unwrap();
+    let mut seen = 0;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        let Some(spec) = line
+            .strip_prefix("- uses:")
+            .or_else(|| line.strip_prefix("uses:"))
+        else {
+            continue;
+        };
+        let spec = spec.trim();
+        let (_, reference) = spec
+            .rsplit_once('@')
+            .unwrap_or_else(|| panic!("`{spec}` has no ref"));
+        assert!(
+            reference.len() == 40 && reference.bytes().all(|b| b.is_ascii_hexdigit()),
+            "`{spec}` is not pinned to a commit SHA"
+        );
+        seen += 1;
+    }
+    assert!(seen >= 10, "found only {seen} `uses:` lines");
+    assert!(
+        !text.contains("Swatinem/rust-cache"),
+        "the release build must not restore a shared cargo cache"
+    );
 }

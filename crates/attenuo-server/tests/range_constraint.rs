@@ -3,6 +3,8 @@
 //! malformed range refused as `invalid_request`, and calls outside the range denied as
 //! `capability_denied` before Cedar (whose policy here permits everything).
 
+mod common;
+
 use std::collections::BTreeMap;
 
 use attenuo_policy::{ArgType, ToolAttrs};
@@ -12,6 +14,8 @@ use attenuo_proxy::UpstreamConfig;
 use attenuo_server::Config;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
+
+use common::agent_configs;
 
 const ADMIN: &str = "range-test-admin";
 const AGENTS: &[&str] = &["helper", "sneaky"];
@@ -23,11 +27,6 @@ permit(principal, action, resource);
 
 fn secret(id: &str) -> String {
     format!("{id}-secret")
-}
-
-fn sha256_hex(s: &str) -> String {
-    use sha2::Digest;
-    hex::encode(sha2::Sha256::digest(s.as_bytes()))
 }
 
 struct Harness {
@@ -63,13 +62,7 @@ impl Harness {
         cfg.upstreams = vec![UpstreamConfig::new("bank", upstream_task.url("/mcp"))];
         cfg.admin.token = Some(ADMIN.into());
         cfg.dev.allow_root_mint = true;
-        cfg.agents = AGENTS
-            .iter()
-            .map(|id| attenuo_server::config::AgentConfig {
-                id: (*id).into(),
-                secret_sha256: sha256_hex(&secret(id)),
-            })
-            .collect();
+        cfg.agents = agent_configs(AGENTS, secret);
         let (router, _state) = attenuo_server::build(&cfg).unwrap();
         let server = spawn_router(router).await.unwrap();
         Self {

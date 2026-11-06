@@ -1,24 +1,13 @@
 //! SR-24: `attenuo key gen --dpop` and `--dpop-key` put DPoP proofs on the wire. A one-shot
 //! HTTP listener stands in for the server and records the request.
 
+mod common;
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::process::Command;
 use std::thread::{self, JoinHandle};
 
-fn attenuo() -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_attenuo"));
-    for var in [
-        "ATTENUO_ADMIN_TOKEN",
-        "ATTENUO_CLIENT_SECRET",
-        "ATTENUO_TOKEN",
-        "ATTENUO_SERVER",
-        "ATTENUO_DPOP_KEY",
-    ] {
-        c.env_remove(var);
-    }
-    c
-}
+use common::attenuo;
 
 /// Answers one request with `200 <body>` and returns the raw request text.
 fn fake_server(body: &'static str) -> (String, JoinHandle<String>) {

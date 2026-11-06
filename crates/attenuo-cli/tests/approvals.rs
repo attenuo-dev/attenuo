@@ -4,6 +4,8 @@
 // Configs are built field by field from `Config::default()`, as in the server tests.
 #![allow(clippy::field_reassign_with_default)]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::process::{Command, Output};
 
@@ -12,6 +14,8 @@ use attenuo_proxy::testing::{spawn_router, FakeMcpServer};
 use attenuo_proxy::UpstreamConfig;
 use attenuo_server::Config;
 use serde_json::Value;
+
+use common::attenuo;
 
 const ADMIN: &str = "approvals-cli-test-admin";
 const POLICY: &str = r#"
@@ -23,20 +27,6 @@ permit(principal, action, resource);
 forbid(principal, action, resource)
 when { resource.destructive && context.session.tainted && !context.approval.present };
 "#;
-
-fn attenuo() -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_attenuo"));
-    for var in [
-        "ATTENUO_ADMIN_TOKEN",
-        "ATTENUO_CLIENT_SECRET",
-        "ATTENUO_TOKEN",
-        "ATTENUO_SERVER",
-        "ATTENUO_DPOP_KEY",
-    ] {
-        c.env_remove(var);
-    }
-    c
-}
 
 async fn run(cmd: Command) -> Output {
     let mut cmd = cmd;

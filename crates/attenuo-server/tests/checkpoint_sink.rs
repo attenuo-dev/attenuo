@@ -1,9 +1,10 @@
 //! `[audit.sink]` end to end (SR-21): signed checkpoints leave the host through a webhook, a
 //! JSON Lines file or an S3-compatible PUT, and the shipped copies cross-check an export.
 
+mod common;
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use attenuo_audit::{cross_check, parse_export, parse_shipped, ShippedCheckpoint};
 use attenuo_proxy::testing::{spawn_router, Spawned};
@@ -15,6 +16,8 @@ use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::routing::{post, put};
 use axum::Router;
 use serde_json::{json, Value};
+
+use common::wait_for;
 
 const ADMIN: &str = "admin";
 const PUBLIC_URL: &str = "http://127.0.0.1:1";
@@ -116,14 +119,6 @@ impl Harness {
     async fn readyz(&self) -> (StatusCode, Value) {
         let r = reqwest::get(self.server.url("/readyz")).await.unwrap();
         (r.status(), r.json().await.unwrap())
-    }
-}
-
-async fn wait_for(mut f: impl FnMut() -> bool) {
-    let end = Instant::now() + Duration::from_secs(20);
-    while !f() {
-        assert!(Instant::now() < end, "timed out");
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 

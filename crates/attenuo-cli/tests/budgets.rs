@@ -5,6 +5,8 @@
 // Configs are built field by field from `Config::default()`, as in the server tests.
 #![allow(clippy::field_reassign_with_default)]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::process::{Command, Output};
 
@@ -15,28 +17,11 @@ use attenuo_server::config::AgentConfig;
 use attenuo_server::Config;
 use serde_json::Value;
 
+use common::{attenuo, sha256_hex};
+
 const ADMIN: &str = "budgets-test-admin";
 const POLICY: &str =
     "@id(\"reads\")\npermit(principal, action == Action::\"github/read_file\", resource);\n";
-
-fn attenuo() -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_attenuo"));
-    for var in [
-        "ATTENUO_ADMIN_TOKEN",
-        "ATTENUO_CLIENT_SECRET",
-        "ATTENUO_TOKEN",
-        "ATTENUO_SERVER",
-        "ATTENUO_DPOP_KEY",
-    ] {
-        c.env_remove(var);
-    }
-    c
-}
-
-fn sha256_hex(s: &str) -> String {
-    use sha2::Digest;
-    hex::encode(sha2::Sha256::digest(s.as_bytes()))
-}
 
 /// Run the CLI off the async runtime (the server runs on it).
 async fn run(mut cmd: Command) -> Output {

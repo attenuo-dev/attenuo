@@ -2,6 +2,8 @@
 //! chain, with the descendant cascade, an audit record and a dry run. Chains are built through
 //! real root mints and token exchanges, so the subjects come from the issued tokens.
 
+mod common;
+
 use std::sync::Arc;
 
 use attenuo_audit::LeaseStore;
@@ -10,7 +12,8 @@ use attenuo_proxy::testing::{spawn_router, Spawned};
 use attenuo_server::{AppState, Config};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
-use sha2::Digest;
+
+use common::agent_configs;
 
 const ADMIN: &str = "test-admin-token";
 /// Agents that may act in an exchange; each one's secret is `<id>-secret`.
@@ -40,13 +43,7 @@ impl Harness {
             .into_owned();
         cfg.admin.token = Some(ADMIN.into());
         cfg.dev.allow_root_mint = true;
-        cfg.agents = AGENTS
-            .iter()
-            .map(|id| attenuo_server::config::AgentConfig {
-                id: (*id).into(),
-                secret_sha256: hex::encode(sha2::Sha256::digest(format!("{id}-secret"))),
-            })
-            .collect();
+        cfg.agents = agent_configs(AGENTS, |id| format!("{id}-secret"));
         let (router, state) = attenuo_server::build(&cfg).unwrap();
         let server = spawn_router(router).await.unwrap();
         Self {
