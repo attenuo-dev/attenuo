@@ -9,8 +9,7 @@ use attenuo_audit::{
 };
 use attenuo_core::fingerprint::{fingerprints, pinned_arguments, Fingerprint};
 use attenuo_core::limits::{
-    charges_for, usage_charges, MAX_LIMIT, REASON_BUDGET_ERROR, REASON_BUDGET_EXHAUSTED,
-    REASON_LIMIT_ARG_INVALID,
+    charges_for, MAX_LIMIT, REASON_BUDGET_ERROR, REASON_BUDGET_EXHAUSTED, REASON_LIMIT_ARG_INVALID,
 };
 use attenuo_core::{
     chain_id_of, ApprovalInfo, BudgetCharge, Charge, Decision, DecisionRecord, DelegationChain,
@@ -29,7 +28,7 @@ use uuid::Uuid;
 use crate::metrics::{ExhaustedAt, Metrics, RefundSource};
 
 use super::budgets::{distinct_step, read_counters};
-use super::usage::{micros, record_usage};
+use super::usage::{micros, record_usage, run_usage_charges, UsageInputs};
 use super::windows::{read_windows, user_stripe, USER_LOCK_STRIPES};
 use super::{
     ArgTaint, BudgetView, CounterSource, LimitHit, RunLabels, MAX_ARG_PROBES,
@@ -852,13 +851,8 @@ impl Pipeline {
         };
         let limited = !charges.is_empty();
         let keeps_usage = match (self.usage_inputs(call), chain_id_of(chain)) {
-            (Some((amount, destination)), Some(chain_id)) => {
-                charges.extend(usage_charges(
-                    &LeaseId::new(chain_id),
-                    call,
-                    amount.as_deref(),
-                    destination.as_deref(),
-                ));
+            (Some(inputs), Some(chain_id)) => {
+                charges.extend(run_usage_charges(&LeaseId::new(chain_id), call, &inputs));
                 true
             }
             _ => false,
@@ -954,22 +948,27 @@ impl Pipeline {
     }
 
     /// For a tool that keeps run usage (one the catalog marks destructive, design section
-    /// 3.5): the inputs its catalog entry names as `amount` and `destination`. `None` for any
+    /// 3.5, or gives an `outbound` input, read-side exfiltration design option d): the inputs
+    /// its catalog entry names as `amount`, `destination` and `outbound`. `None` for any
     /// other tool, and for every tool when the engine does not track usage
     /// ([`PolicyEngine::tracks_usage`]: no loaded policy reads `context.usage`, the catalog
     /// names no `amount` or `destination`, and `[policy] track_usage` is `"auto"`), so an
     /// allowed call then pays no usage write and its record carries no `usage`. A tool the
     /// engine knows nothing about, and a poisoned engine lock, count as destructive with
     /// neither input, as [`Self::matches_arguments`] does.
-    fn usage_inputs(&self, call: &ToolCall) -> Option<(Option<String>, Option<String>)> {
+    fn usage_inputs(&self, call: &ToolCall) -> Option<UsageInputs> {
         let attrs = match self.policy.read() {
             Ok(e) if !e.tracks_usage() => return None,
             Ok(e) => e.effective_attrs(&call.server, &call.tool),
             Err(_) => None,
         };
         match attrs {
-            None => Some((None, None)),
-            Some(a) if a.is_destructive() => Some((a.amount, a.destination)),
+            None => Some(UsageInputs::default()),
+            Some(a) if a.is_destructive() || a.has_outbound() => Some(UsageInputs {
+                amount: a.amount,
+                destination: a.destination,
+                outbound: a.outbound,
+            }),
             Some(_) => None,
         }
     }

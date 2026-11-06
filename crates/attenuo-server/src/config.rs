@@ -2570,6 +2570,9 @@ mod tests {
         );
         let catalog = cfg.policy.load_catalog().unwrap();
         assert!(catalog.get("github", "read_file").readonly);
+        let fetch = catalog.get("web", "fetch");
+        assert!(fetch.readonly && fetch.has_outbound());
+        assert_eq!(fetch.outbound, vec!["url#host".to_string()]);
         assert!(!cfg.root_grants.is_empty());
         capability_set(&cfg.root_grants[0].capabilities).unwrap();
         assert_eq!(cfg.idps.len(), 1);

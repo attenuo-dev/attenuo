@@ -1,6 +1,8 @@
-//! Run usage of destructive tools (run-limits design section 3.5) and the result digest.
+//! Run usage of destructive tools and of tools with an outbound argument (run-limits design
+//! section 3.5, read-side exfiltration design option d) and the result digest.
 
-use attenuo_core::RecordUsage;
+use attenuo_core::limits::usage_charges;
+use attenuo_core::{Charge, LeaseId, RecordUsage, ToolCall};
 use attenuo_policy::{UsageContext, UserWindowContext};
 use serde_json::Value;
 
@@ -35,6 +37,46 @@ pub fn usage_json(u: &UsageContext) -> Value {
             serde_json::json!({ "hour": w(&u.user_window.hour), "day": w(&u.user_window.day) });
     }
     v
+}
+
+/// The catalog inputs run usage counts for one tool: `amount`, `destination` and every
+/// `outbound` entry (each `"<input>"` or `"<input>#host"`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct UsageInputs {
+    pub(super) amount: Option<String>,
+    pub(super) destination: Option<String>,
+    pub(super) outbound: Vec<String>,
+}
+
+/// The run-usage charges of `call` under `chain_id`: [`usage_charges`] for `amount` and
+/// `destination`, then the destinations of each outbound input, derived as `destination` is,
+/// added to the same per-tool destination counter. A value already counted (the same canonical
+/// value, or host, from `destination` or an earlier outbound input) is counted once.
+/// `context.usage.destination_seen` is then true when any of the call's destination values was
+/// seen in an earlier allowed call of the tool, as for a list-valued `destination`.
+pub(super) fn run_usage_charges(
+    chain_id: &LeaseId,
+    call: &ToolCall,
+    inputs: &UsageInputs,
+) -> Vec<Charge> {
+    let mut out = usage_charges(
+        chain_id,
+        call,
+        inputs.amount.as_deref(),
+        inputs.destination.as_deref(),
+    );
+    for entry in &inputs.outbound {
+        // The first charge is the call count, already in `out`.
+        for c in usage_charges(chain_id, call, None, Some(entry))
+            .into_iter()
+            .skip(1)
+        {
+            if !out.iter().any(|o| o.kind == c.kind && o.value == c.value) {
+                out.push(c);
+            }
+        }
+    }
+    out
 }
 
 /// A duration in whole microseconds for a log field, saturating (a `u64` of microseconds is
