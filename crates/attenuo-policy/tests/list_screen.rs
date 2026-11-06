@@ -561,6 +561,7 @@ fn arguments(suite: &Suite, tool: &str, c: &Ctx) -> Map<String, Value> {
         let v = match ty {
             Some(ArgType::String) => s(),
             Some(ArgType::Long) => l(),
+            Some(ArgType::Decimal) => json!(1.25),
             Some(ArgType::Bool) => json!(pick % 2 == 0),
             Some(ArgType::Set(_)) => Value::Array(vec![s()]),
             None => match kind % 3 {

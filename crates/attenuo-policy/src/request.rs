@@ -124,6 +124,91 @@ fn object_from<'a>(
     Ok(Value::Object(out))
 }
 
+/// A JSON number as the argument of Cedar's `decimal()`, for an argument declared
+/// [`ArgType::Decimal`]: its shortest decimal form, with `.0` added to a whole number, so `12.5`
+/// is `"12.5"` and `100` is `"100.0"`. `None` when it has more than 4 fractional digits or a
+/// magnitude above [`DECIMAL_MAX`] (Cedar's range); nothing is rounded. A JSON number is a
+/// double here (serde_json's `float_roundtrip` is on), and Rust's `Display` for `f64` is the
+/// shortest form that reads back as the same double, never in exponent notation, so the digits
+/// are the ones the caller wrote, trailing zeros aside.
+pub(crate) fn decimal_text(n: &serde_json::Number) -> Option<String> {
+    let text = if let Some(i) = n.as_i64() {
+        // Integers above 2^53 have no exact double; read them as integers.
+        if i.unsigned_abs() > 922_337_203_685_477 {
+            return None;
+        }
+        i.to_string()
+    } else {
+        let f = n.as_f64()?;
+        if !(f.is_finite() && f.abs() <= DECIMAL_MAX) {
+            return None;
+        }
+        // `-0.0` displays as `-0`.
+        if f == 0.0 {
+            "0".to_string()
+        } else {
+            f.to_string()
+        }
+    };
+    match text.split_once('.') {
+        None => Some(format!("{text}.0")),
+        Some((_, frac)) if (1..=4).contains(&frac.len()) => Some(text),
+        Some(_) => None,
+    }
+}
+
+/// `value` as Cedar JSON when the catalog declares its type: a [`ArgType::Decimal`] number (or
+/// each element of a set of them) becomes `decimal(...)` through [`decimal_text`] rather than a
+/// `Long` or a rounded decimal; everything else is [`to_cedar_json`]. Run after
+/// [`check_tool_inputs`], so a number that is not a decimal is an error only if that check
+/// was skipped.
+fn typed_cedar_json(value: &Value, ty: &ArgType, path: &str) -> Result<Value, TranslationError> {
+    match (ty, value) {
+        (ArgType::Decimal, Value::Number(n)) => {
+            let arg = decimal_text(n).ok_or_else(|| {
+                TranslationError(format!("{path}: number {n} is not a Cedar decimal"))
+            })?;
+            Ok(json!({ "__extn": { "fn": "decimal", "arg": arg } }))
+        }
+        (ArgType::Set(inner), Value::Array(items)) if inner.contains_decimal() => {
+            let mut out = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                let v = typed_cedar_json(item, inner, &format!("{path}[{i}]"))?;
+                if !v.is_null() {
+                    out.push(v);
+                }
+            }
+            Ok(Value::Array(out))
+        }
+        _ => to_cedar_json(value, path),
+    }
+}
+
+/// `context.input`: the call's arguments, each through [`typed_cedar_json`] when `declared`
+/// gives its type and [`to_cedar_json`] otherwise, `null`s dropped, `__` keys refused.
+fn input_object(
+    arguments: &BTreeMap<String, Value>,
+    declared: &BTreeMap<String, ArgType>,
+) -> Result<Value, TranslationError> {
+    let mut out = Map::new();
+    for (k, v) in arguments {
+        if k.starts_with("__") {
+            return Err(TranslationError(format!(
+                "input.{k}: keys beginning with `__` are reserved by Cedar"
+            )));
+        }
+        let path = format!("input.{k}");
+        let v = match declared.get(k) {
+            Some(ty) => typed_cedar_json(v, ty, &path)?,
+            None => to_cedar_json(v, &path)?,
+        };
+        if !v.is_null() {
+            out.insert(k.clone(), v);
+        }
+    }
+    Ok(Value::Object(out))
+}
+
 fn matches_type(value: &Value, ty: &ArgType) -> bool {
     match (ty, value) {
         (ArgType::String, Value::String(_)) | (ArgType::Bool, Value::Bool(_)) => true,
@@ -179,6 +264,7 @@ fn input_matches(value: &Value, ty: &ArgType) -> bool {
         (ArgType::Long, Value::Number(n)) => {
             n.is_i64() || n.as_f64().and_then(whole_long).is_some()
         }
+        (ArgType::Decimal, Value::Number(n)) => decimal_text(n).is_some(),
         (ArgType::Set(inner), Value::Array(items)) => {
             items.iter().all(|i| i.is_null() || input_matches(i, inner))
         }
@@ -202,11 +288,13 @@ pub(crate) fn check_tool_inputs(
         if value.is_null() || input_matches(value, ty) {
             continue;
         }
-        return Err(format!(
-            "input.{name}: expected {}, got {}",
-            ty.cedar(),
-            type_name(value)
-        ));
+        let got = match (ty, value) {
+            (ArgType::Decimal, Value::Number(_)) => {
+                "a number with more than 4 fractional digits or out of range"
+            }
+            _ => type_name(value),
+        };
+        return Err(format!("input.{name}: expected {}, got {got}", ty.shown()));
     }
     Ok(())
 }
@@ -399,13 +487,16 @@ impl RequestParts {
     }
 
     /// The Cedar request for `call` at `now`, with the per-call context members.
+    /// `inputs` are the tool's declared argument types, which pick how a number is converted
+    /// ([`ArgType::Decimal`]).
     pub(crate) fn request(
         &self,
         call: &ToolCall,
+        inputs: &BTreeMap<String, ArgType>,
         labels: &CallLabels,
         now: OffsetDateTime,
     ) -> Result<Request, TranslationError> {
-        let input = object_from(call.arguments.iter(), "input")?;
+        let input = input_object(&call.arguments, inputs)?;
         let mut pairs = Vec::with_capacity(10);
         pairs.push(("input".to_string(), restricted(&input)?));
         pairs.push((
@@ -1078,6 +1169,109 @@ mod tests {
         }
     }
 
+    /// An undeclared fractional argument reaches Cedar as a `decimal` rounded to four
+    /// fractional digits: `12.34567` is `12.3457`, and `0.00001` is `0.0000`, which equals 0.
+    #[test]
+    fn undeclared_fractions_reach_cedar_rounded_to_four_digits() {
+        for (f, arg) in [
+            (12.5, "12.5000"),
+            (12.34567, "12.3457"),
+            (0.00001, "0.0000"),
+            (-0.5, "-0.5000"),
+        ] {
+            assert_eq!(
+                to_cedar_json(&json!(f), "input").unwrap(),
+                json!({ "__extn": { "fn": "decimal", "arg": arg } }),
+                "{f}"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_inputs_convert_without_rounding() {
+        let n = |text: &str| -> serde_json::Number { serde_json::from_str(text).unwrap() };
+        for (text, want) in [
+            // Whole numbers, integer or float, get a `.0`.
+            ("12", "12.0"),
+            ("12.0", "12.0"),
+            ("-3", "-3.0"),
+            ("0", "0.0"),
+            ("-0.0", "0.0"),
+            ("1e3", "1000.0"),
+            ("922337203685477", "922337203685477.0"),
+            // Fractions keep the digits written, trailing zeros aside.
+            ("12.5", "12.5"),
+            ("12.50", "12.5"),
+            ("0.1", "0.1"),
+            ("19.99", "19.99"),
+            ("0.0001", "0.0001"),
+            ("-1234.5678", "-1234.5678"),
+        ] {
+            assert_eq!(decimal_text(&n(text)).as_deref(), Some(want), "{text}");
+        }
+        // More than 4 fractional digits, or beyond Cedar's range: refused, not rounded.
+        for text in [
+            "12.34567",
+            "0.00001",
+            "1e-7",
+            "922337203685478",
+            "1e300",
+            "9223372036854775807",
+            "18446744073709551615",
+        ] {
+            assert_eq!(decimal_text(&n(text)), None, "{text}");
+        }
+
+        let decl: BTreeMap<String, ArgType> = [
+            ("amount".to_string(), ArgType::Decimal),
+            ("fees".to_string(), ArgType::Set(Box::new(ArgType::Decimal))),
+        ]
+        .into_iter()
+        .collect();
+        let args = |v: Value| -> BTreeMap<String, Value> { serde_json::from_value(v).unwrap() };
+        let ok = args(json!({"amount": 100, "fees": [0.5, null, 2], "note": 1.5}));
+        check_tool_inputs(&ok, &decl).unwrap();
+        assert_eq!(
+            input_object(&ok, &decl).unwrap(),
+            json!({
+                "amount": { "__extn": { "fn": "decimal", "arg": "100.0" } },
+                "fees": [
+                    { "__extn": { "fn": "decimal", "arg": "0.5" } },
+                    { "__extn": { "fn": "decimal", "arg": "2.0" } },
+                ],
+                // Undeclared: as before.
+                "note": { "__extn": { "fn": "decimal", "arg": "1.5000" } },
+            })
+        );
+        for (bad, why) in [
+            (
+                json!({"amount": 12.34567}),
+                "input.amount: expected decimal, got a number with more than 4 fractional \
+                 digits or out of range",
+            ),
+            (
+                json!({"amount": "12.5"}),
+                "input.amount: expected decimal, got string",
+            ),
+            (
+                json!({"amount": true}),
+                "input.amount: expected decimal, got bool",
+            ),
+            (
+                json!({"fees": ["0.5"]}),
+                "input.fees: expected Set<decimal>, got array",
+            ),
+        ] {
+            assert_eq!(
+                check_tool_inputs(&args(bad.clone()), &decl).unwrap_err(),
+                why,
+                "{bad}"
+            );
+        }
+        // Were the check skipped, the translation would still refuse rather than round.
+        assert!(input_object(&args(json!({"amount": 12.34567})), &decl).is_err());
+    }
+
     #[test]
     fn nulls_are_dropped_and_numbers_mapped() {
         let v = json!({ "a": null, "b": [1, null, "x"], "c": 1.5, "d": 18446744073709551615u64 });
@@ -1273,7 +1467,9 @@ mod tests {
                                         .unwrap();
                                 let parts = RequestParts::build(&chain, &call, &tool_attrs, legacy)
                                     .unwrap();
-                                let request = parts.request(&call, &labels, now).unwrap();
+                                let request = parts
+                                    .request(&call, &BTreeMap::new(), &labels, now)
+                                    .unwrap();
                                 let what = format!(
                                     "{depth} {attrs} {arguments} {session:?} {tool} {legacy}"
                                 );
@@ -1318,7 +1514,9 @@ mod tests {
             .unwrap();
         let parts = RequestParts::build(&chain, &bad_call, &attrs, false).unwrap();
         assert_eq!(
-            parts.request(&bad_call, &labels, now).unwrap_err(),
+            parts
+                .request(&bad_call, &BTreeMap::new(), &labels, now)
+                .unwrap_err(),
             reference
         );
     }

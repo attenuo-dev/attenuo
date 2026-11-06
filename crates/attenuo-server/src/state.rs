@@ -661,6 +661,74 @@ mod tests {
             .unwrap());
     }
 
+    /// A catalog input declared `decimal` in the config: a fractional amount reaches the policy
+    /// as a Cedar decimal, and a string where it is declared is refused before Cedar with
+    /// `input_type_mismatch`, the reason the proxy relays in its `-32003` error. User
+    /// attributes cannot be declared `decimal`.
+    #[test]
+    fn a_decimal_catalog_input_from_the_config() {
+        use attenuo_core::{
+            AgentId, Capability, CapabilitySet, DelegationChain, LeaseId, OriginatingUser, ToolCall,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let policies = dir.path().join("bank.cedar");
+        std::fs::write(
+            &policies,
+            "permit (principal, action == Action::\"banking/send_money\", resource) when {\n\
+             context.input has amount && context.input.amount.lessThan(decimal(\"100.0\")) };\n",
+        )
+        .unwrap();
+        let mut cfg = Config::from_toml(
+            r#"
+            [policy.catalog.banking.send_money]
+            inputs = { recipient = "string", amount = "decimal" }
+            "#,
+        )
+        .unwrap();
+        cfg.policy.policies_path = Some(policies);
+        let (engine, _) = build_engine(&cfg).unwrap();
+        let now = OffsetDateTime::now_utc();
+        let chain = DelegationChain::root(
+            OriginatingUser {
+                subject: "alice".into(),
+                issuer: "https://idp.example".into(),
+                authenticated_at: now,
+                attributes: Default::default(),
+            },
+            AgentId::new("planner"),
+            CapabilitySet::from_iter([Capability::new("banking", "send_money")]),
+            now,
+            Duration::hours(1),
+            LeaseId::new("l1"),
+        )
+        .unwrap();
+        let send = |amount: Value| {
+            let call = ToolCall::new(
+                "banking",
+                "send_money",
+                serde_json::json!({"recipient": "A", "amount": amount}),
+            );
+            engine.authorize(&chain, &call, now)
+        };
+        assert_eq!(send(serde_json::json!(12.5)).reason, "policy_allow");
+        assert_eq!(send(serde_json::json!(150)).reason, "policy_deny");
+        let out = send(serde_json::json!("12.5"));
+        assert_eq!(out.reason, attenuo_policy::REASON_INPUT_TYPE_MISMATCH);
+        assert_eq!(
+            out.diagnostics,
+            vec!["input.amount: expected decimal, got string".to_string()]
+        );
+
+        cfg.policy
+            .user_attributes
+            .insert("limit".into(), "decimal".into());
+        let err = build_engine(&cfg).err().unwrap().to_string();
+        assert!(
+            err.contains("decimal is a catalog input type only"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn lease_interval_defaults_to_300_and_must_be_positive() {
         let mut cfg = Config::default();

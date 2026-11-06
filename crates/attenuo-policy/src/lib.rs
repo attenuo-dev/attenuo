@@ -126,8 +126,11 @@
 //! `context has session_id`. The same goes for every `null` inside `input` and
 //! `originating_user.attributes`: null-valued members are dropped, so write
 //! `context.input has repo && context.input.repo like "acme/*"`. Integers (and floats with no
-//! fractional part, so `5.0` is `5`) are Cedar `Long`, other floats are Cedar `decimal`, and
-//! argument keys beginning with `__` are rejected (Cedar reserves them for escapes).
+//! fractional part, so `5.0` is `5`) are Cedar `Long`, other floats are Cedar `decimal` rounded
+//! to four fractional digits, and argument keys beginning with `__` are rejected (Cedar
+//! reserves them for escapes). An argument the catalog declares [`ArgType::Decimal`] is a Cedar
+//! `decimal` whole or not (`100` is `decimal("100.0")`), never rounded: a number with more than
+//! four fractional digits is denied with `input_type_mismatch`.
 //!
 //! ## Entities
 //!
@@ -638,6 +641,13 @@ impl PolicyEngineBuilder {
     }
 
     fn parse_schema(&self) -> Result<Schema, PolicyError> {
+        // User attributes reach Cedar without the catalog's typed conversion, so a declared
+        // decimal would be a `Long` for a whole value and fail every `.lessThan()`.
+        if let Some((name, _)) = self.user_attrs.iter().find(|(_, t)| t.contains_decimal()) {
+            return Err(PolicyError::Schema(format!(
+                "user attribute `{name}`: decimal is a catalog input type only"
+            )));
+        }
         let custom = self.base_schema != DEFAULT_SCHEMA;
         let what = |e: String| {
             if custom {
@@ -1125,7 +1135,7 @@ impl PolicyEngine {
             .get_or_build(chain, call, attrs, self.legacy_bare_actions)
             .map_err(|e| e.to_string())?;
         let request = parts
-            .request(call, labels, now)
+            .request(call, &attrs.inputs, labels, now)
             .map_err(|e| e.to_string())?;
         Ok(Prepared { request, parts })
     }
