@@ -5,7 +5,7 @@
 //! The notifier (in `attenuo-server`) writes a row right after the approval change it
 //! describes was stored and recorded, delivers from its in-memory queue, and marks the row
 //! delivered or given up. On start it delivers the rows still open, in insertion order, reading
-//! them in batches no larger than its queue ([`SqliteLeaseStore::outbox_open_between`]).
+//! them in batches no larger than half its queue ([`SqliteLeaseStore::outbox_open_between`]).
 //! `event_id` is unique: it is derived from the approval id and the notice type, so a second
 //! notice of one type for one approval (an `approval.expired` found again
 //! after a restart) is refused here instead of being sent twice.

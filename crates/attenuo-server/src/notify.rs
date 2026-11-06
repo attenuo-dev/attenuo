@@ -16,8 +16,8 @@
 //!
 //! Restarts: on start the rows still open (queued, or in flight, when the last process
 //! stopped) are delivered again, oldest first, with their attempts so far. The delivery thread
-//! reads them from the outbox a batch of at most `queue_capacity` at a time, whenever the
-//! queue runs empty, so a backlog longer than the queue is delivered whole instead of being
+//! reads them from the outbox a batch of at most half of `queue_capacity` at a time, whenever
+//! the queue runs empty (the other half is room for notices that arrive meanwhile, SR-98), so a backlog longer than the queue is delivered whole instead of being
 //! dropped for lack of room (SR-93); a notice stored meanwhile is queued as usual and may go
 //! out between two batches. And every approval still pending in the store is watched again,
 //! so one that expired while the server was down gets its `approval.expired` at once. The notice id (`event_id`) is derived from the
@@ -1256,7 +1256,7 @@ mod tests {
         let (release_tx, release) = std::sync::mpsc::channel();
         *recorder.hold.lock().unwrap() = Some((started, release));
         let (n, metrics) = start(&store, &recorder, 4);
-        // The first backlog row is in flight, three more are queued.
+        // The first backlog row is in flight, the other one of its batch is queued.
         started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         let mut fresh = approval(ApprovalState::Pending);
         fresh.id = "33333333-3333-4333-8333-333333333333".into();
@@ -1281,14 +1281,56 @@ mod tests {
         // Shutting down delivers anything still queued, so a second copy would show here.
         n.shutdown(Duration::from_secs(5));
         let got = recorder.got.lock().unwrap().clone();
-        // The first batch, the fresh notice queued behind it, then the rest of the backlog.
-        let mut want = events[..4].to_vec();
+        // The first batch (half the queue, SR-98), the fresh notice queued behind it, then the
+        // rest of the backlog.
+        let mut want = events[..2].to_vec();
         want.push(fresh_event);
-        want.extend_from_slice(&events[4..]);
+        want.extend_from_slice(&events[2..]);
         assert_eq!(got, want);
         // Only the row whose push is still to come is open: the backlog did not take it.
         assert!(store.outbox_open_id(&mid_emit).unwrap().is_some());
         assert_eq!(store.outbox_open_count().unwrap(), 1);
+        assert!(metrics
+            .render()
+            .contains("attenuo_approval_notify_dropped_total 0\n"));
+    }
+
+    /// SR-98: a backlog batch leaves room in the queue. Notices that arrive while a batch is
+    /// delivered are queued behind it, and none of the batch is pushed out by them: with the
+    /// batch as large as the queue, the second new notice dropped a backlog row (given up
+    /// without one attempt), and the queue read as full on `/readyz` for the whole backlog.
+    #[test]
+    fn notices_queued_while_a_backlog_batch_drains_drop_none_of_it_sr98() {
+        let (store, events) = store_with_open_rows(10);
+        let recorder = Arc::new(Recorder::default());
+        let (started, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release) = std::sync::mpsc::channel();
+        *recorder.hold.lock().unwrap() = Some((started, release));
+        let (n, metrics) = start(&store, &recorder, 4);
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        // The first backlog row is in flight and the rest of its batch is queued.
+        let st = n.status();
+        assert!(st.queued < st.capacity, "{st:?}");
+        assert!(!st.degraded, "{st:?}");
+        let mut fresh_events = Vec::new();
+        for i in 0..2 {
+            let mut fresh = approval(ApprovalState::Pending);
+            fresh.id = format!("44444444-4444-4444-8444-{i:012}");
+            fresh.expires_at = OffsetDateTime::now_utc() + time::Duration::hours(1);
+            n.handle().pending(&fresh);
+            fresh_events.push(event_id_for(NoticeKind::Pending, &fresh.id));
+        }
+        release_tx.send(()).unwrap();
+        // Every row is closed once it is delivered, or given up when a full queue drops it.
+        wait_until(|| store.outbox_open_count().unwrap() == 0);
+        n.shutdown(Duration::from_secs(5));
+        let got = recorder.got.lock().unwrap().clone();
+        // The first batch (half the queue), the new notices queued behind it, then the rest.
+        let mut want = events[..2].to_vec();
+        want.extend(fresh_events);
+        want.extend_from_slice(&events[2..]);
+        assert_eq!(got, want);
+        assert_eq!(store.outbox_open_count().unwrap(), 0);
         assert!(metrics
             .render()
             .contains("attenuo_approval_notify_dropped_total 0\n"));
