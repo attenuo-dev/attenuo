@@ -15,14 +15,14 @@ const SPKI_ED25519_PREFIX: [u8; 12] = [
 
 /// Header and claims of a token, decoded without checking the signature.
 #[derive(Debug)]
-pub struct Decoded {
+pub(crate) struct Decoded {
     pub header: Value,
     pub claims: Claims,
     pub claims_json: Value,
 }
 
 /// Decode a compact JWS. **Nothing is verified**: the output is whatever the sender wrote.
-pub fn decode_unverified(token: &str) -> Result<Decoded> {
+pub(crate) fn decode_unverified(token: &str) -> Result<Decoded> {
     let mut parts = token.trim().split('.');
     let (Some(h), Some(p), Some(_sig), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -50,7 +50,7 @@ pub fn decode_unverified(token: &str) -> Result<Decoded> {
 
 /// SubjectPublicKeyInfo PEM for the JWKS key to verify with: the one whose `kid` matches the
 /// token header if there is a `kid`, else the first Ed25519 key.
-pub fn pem_from_jwks(jwks: &Value, kid: Option<&str>) -> Result<String> {
+pub(crate) fn pem_from_jwks(jwks: &Value, kid: Option<&str>) -> Result<String> {
     let keys = jwks["keys"]
         .as_array()
         .ok_or_else(|| anyhow!("JWKS has no `keys` array"))?;
@@ -85,7 +85,7 @@ pub fn pem_from_jwks(jwks: &Value, kid: Option<&str>) -> Result<String> {
 /// Verify `token` with the JWKS key. `issuer` and `audience` default to the token's own claims,
 /// so by default this proves "signed by this server's key, unexpired, chain valid", not "issued
 /// for a particular audience"; pass them to pin those.
-pub fn verify_with_jwks(
+pub(crate) fn verify_with_jwks(
     token: &str,
     decoded: &Decoded,
     jwks: &Value,
@@ -139,7 +139,7 @@ fn jwks_verifier(
 
 /// The binding an approval token is checked against; `None` members are not checked.
 #[derive(Debug, Default)]
-pub struct ApprovalBinding<'a> {
+pub(crate) struct ApprovalBinding<'a> {
     pub chain_id: Option<&'a str>,
     pub lease: Option<&'a str>,
     pub call_hash: Option<&'a str>,
@@ -148,7 +148,7 @@ pub struct ApprovalBinding<'a> {
 }
 
 /// Header and claims of an approval token, decoded without checking anything.
-pub fn decode_approval_unverified(token: &str) -> Result<(Value, Value)> {
+pub(crate) fn decode_approval_unverified(token: &str) -> Result<(Value, Value)> {
     let mut parts = token.trim().split('.');
     let (Some(h), Some(p), Some(_sig), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -168,7 +168,7 @@ pub fn decode_approval_unverified(token: &str) -> Result<(Value, Value)> {
 
 /// Verify an approval token with the JWKS keys: signature, `typ`, `iss`, `aud` (both default to
 /// the token's own), `exp`, then each binding member that is given.
-pub fn verify_approval_with_jwks(
+pub(crate) fn verify_approval_with_jwks(
     token: &str,
     jwks: &Value,
     issuer: Option<&str>,

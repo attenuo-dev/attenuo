@@ -7,6 +7,8 @@
 //! be told from one that found nothing to refund (2).
 
 #![deny(unsafe_code)]
+#![warn(missing_docs)]
+#![warn(unreachable_pub)]
 
 mod cli;
 mod client;

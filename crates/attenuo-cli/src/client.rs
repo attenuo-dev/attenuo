@@ -41,7 +41,7 @@ struct Reply {
     text: String,
 }
 
-pub struct Client {
+pub(crate) struct Client {
     http: reqwest::Client,
     base: String,
     admin_token: Option<String>,
@@ -51,7 +51,7 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(base: &str, admin_token: Option<String>) -> Result<Self> {
+    pub(crate) fn new(base: &str, admin_token: Option<String>) -> Result<Self> {
         let base = base.trim_end_matches('/').to_string();
         if !(base.starts_with("http://") || base.starts_with("https://")) {
             bail!(
@@ -70,7 +70,7 @@ impl Client {
     }
 
     /// Whether an admin token was given (flag, file, stdin or `ATTENUO_ADMIN_TOKEN`).
-    pub fn has_admin_token(&self) -> bool {
+    pub(crate) fn has_admin_token(&self) -> bool {
         self.admin_token.is_some()
     }
 
@@ -141,11 +141,11 @@ impl Client {
         json_reply(reply)
     }
 
-    pub async fn get(&self, path: &str) -> Result<Value> {
+    pub(crate) async fn get(&self, path: &str) -> Result<Value> {
         self.send_json(self.http.get(self.url(path))).await
     }
 
-    pub async fn admin_get(&self, path: &str) -> Result<Value> {
+    pub(crate) async fn admin_get(&self, path: &str) -> Result<Value> {
         self.send_json(self.admin(self.http.get(self.url(path)))?)
             .await
     }
@@ -153,7 +153,7 @@ impl Client {
     /// `GET` an admin path and hand back the response for the caller to read incrementally
     /// (the audit export). Non-success statuses become errors; the long timeout is for a big
     /// export, not for a hung server.
-    pub async fn admin_get_stream(&self, path: &str) -> Result<reqwest::Response> {
+    pub(crate) async fn admin_get_stream(&self, path: &str) -> Result<reqwest::Response> {
         let resp = self
             .admin(self.http.get(self.url(path)))?
             .timeout(std::time::Duration::from_secs(3600))
@@ -167,13 +167,13 @@ impl Client {
         Err(api_error(status, &resp.text().await?))
     }
 
-    pub async fn admin_post(&self, path: &str, body: &Value) -> Result<Value> {
+    pub(crate) async fn admin_post(&self, path: &str, body: &Value) -> Result<Value> {
         self.send_json(self.admin(self.http.post(self.url(path)).json(body))?)
             .await
     }
 
     /// `POST /admin/root-token`, bound to `key` when given (a DPoP proof in the header).
-    pub async fn root(&self, body: &Value, key: Option<&DpopKey>) -> Result<Value> {
+    pub(crate) async fn root(&self, body: &Value, key: Option<&DpopKey>) -> Result<Value> {
         let url = self.url("/admin/root-token");
         let reply = self
             .send_dpop(key.is_some(), |nonce| {
@@ -197,14 +197,14 @@ impl Client {
     }
 
     /// The URL of `POST /token`, which DPoP proofs for an exchange name.
-    pub fn token_url(&self) -> String {
+    pub(crate) fn token_url(&self) -> String {
         self.url("/token")
     }
 
     /// `POST /token` with an RFC 8693 JSON body. `proof` makes the `DPoP` header for the
     /// nonce it is given (none without a DPoP key); it runs again if the server asks for its
     /// nonce.
-    pub async fn exchange(
+    pub(crate) async fn exchange(
         &self,
         body: &Value,
         proof: impl Fn(Option<&str>) -> Result<Option<String>>,
@@ -223,7 +223,12 @@ impl Client {
     }
 
     /// `POST /access/v1/evaluation` with the delegation token as bearer.
-    pub async fn authzen(&self, token: &str, body: &Value, key: Option<&DpopKey>) -> Result<Value> {
+    pub(crate) async fn authzen(
+        &self,
+        token: &str,
+        body: &Value,
+        key: Option<&DpopKey>,
+    ) -> Result<Value> {
         let url = self.url("/access/v1/evaluation");
         let reply = self
             .send_dpop(key.is_some(), |nonce| {
@@ -235,7 +240,7 @@ impl Client {
 
     /// One JSON-RPC request to `/mcp/{server}`. Returns the JSON-RPC response whatever the
     /// HTTP status, since the proxy reports denials as JSON-RPC errors.
-    pub async fn mcp(
+    pub(crate) async fn mcp(
         &self,
         token: &str,
         key: Option<&DpopKey>,
@@ -305,7 +310,7 @@ fn is_use_dpop_nonce(status: StatusCode, headers: &HeaderMap, body: &str) -> boo
 /// audit record of the refusal; a command that gives some statuses a meaning of its own (as
 /// `budget refund` does for 404 and 409) finds it with `anyhow::Error::downcast_ref`.
 #[derive(Debug)]
-pub struct ApiError {
+pub(crate) struct ApiError {
     pub status: StatusCode,
     /// The JSON body's `error` code, when the body is `{"error": code, ...}`.
     pub code: Option<String>,
@@ -355,7 +360,7 @@ pub(crate) fn api_error(status: StatusCode, body: &str) -> anyhow::Error {
 }
 
 /// The JSON-RPC response in a plain JSON or `text/event-stream` body.
-pub fn parse_rpc_body(text: &str, sse: bool) -> Option<Value> {
+pub(crate) fn parse_rpc_body(text: &str, sse: bool) -> Option<Value> {
     if !sse {
         return serde_json::from_str(text).ok();
     }
@@ -366,7 +371,7 @@ pub fn parse_rpc_body(text: &str, sse: bool) -> Option<Value> {
 }
 
 /// Percent-encode a query value or a path segment (everything but unreserved characters).
-pub fn query_escape(s: &str) -> String {
+pub(crate) fn query_escape(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {

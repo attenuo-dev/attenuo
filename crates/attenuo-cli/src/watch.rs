@@ -9,22 +9,22 @@ use std::time::{Duration, SystemTime};
 use attenuo_policy::testing::TestFile;
 
 /// How often the files are looked at.
-pub const POLL: Duration = Duration::from_millis(250);
+pub(crate) const POLL: Duration = Duration::from_millis(250);
 /// How long the files must stay unchanged after a change before the rerun, so that an editor
 /// writing several files (or one file in several steps) causes one run, not several.
-pub const DEBOUNCE: Duration = Duration::from_millis(200);
+pub(crate) const DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// Clears the terminal and moves the cursor home (ANSI), printed before each run.
-pub const CLEAR: &str = "\x1b[2J\x1b[H";
+pub(crate) const CLEAR: &str = "\x1b[2J\x1b[H";
 
 /// What was seen of each watched file: its modification time and size, or `None` when it
 /// could not be read (missing, for instance). A file that appears, disappears or changes
 /// either value counts as changed.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Snapshot(BTreeMap<PathBuf, Option<(SystemTime, u64)>>);
+pub(crate) struct Snapshot(BTreeMap<PathBuf, Option<(SystemTime, u64)>>);
 
 impl Snapshot {
-    pub fn take(paths: &[PathBuf]) -> Self {
+    pub(crate) fn take(paths: &[PathBuf]) -> Self {
         Self(
             paths
                 .iter()
@@ -38,7 +38,7 @@ impl Snapshot {
         )
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.0.len()
     }
 }
@@ -47,7 +47,7 @@ impl Snapshot {
 /// policy file, catalog or server config, and base schema file (`schema_file` overrides the
 /// config's). Worked out again before every run, since an edit can point a test file at
 /// another policy file.
-pub fn watched_paths(files: &[PathBuf], schema_file: Option<&Path>) -> Vec<PathBuf> {
+pub(crate) fn watched_paths(files: &[PathBuf], schema_file: Option<&Path>) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = files.to_vec();
     for f in files {
         if let Ok(tf) = TestFile::load(f) {
@@ -69,7 +69,7 @@ pub fn watched_paths(files: &[PathBuf], schema_file: Option<&Path>) -> Vec<PathB
 /// Wait until a snapshot differs from `seen`, then until two snapshots [`DEBOUNCE`] apart are
 /// equal, and return the settled one. `take` looks at the files and `sleep` waits; both are
 /// parameters so the logic can be tested without a clock.
-pub fn wait_for_change(
+pub(crate) fn wait_for_change(
     seen: &Snapshot,
     mut take: impl FnMut() -> Snapshot,
     mut sleep: impl FnMut(Duration),

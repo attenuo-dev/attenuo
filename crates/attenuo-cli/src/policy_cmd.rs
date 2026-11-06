@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 
 /// How a run ended, which maps to the process exit status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Status {
+pub(crate) enum Status {
     /// Everything passed (exit 0).
     Ok,
     /// The checks ran and some failed (exit 2).
@@ -22,7 +22,7 @@ pub enum Status {
 
 /// What to print and how it ended.
 #[derive(Debug)]
-pub struct Run {
+pub(crate) struct Run {
     pub stdout: String,
     pub stderr: String,
     pub status: Status,
@@ -52,7 +52,7 @@ fn pretty(v: &Value) -> String {
 
 /// How `policy test` runs and when it fails, beyond the files.
 #[derive(Debug, Clone, Default)]
-pub struct TestOptions {
+pub(crate) struct TestOptions {
     /// Fail (exit 2) when some policy was not exercised by any case.
     pub fail_on_unexercised: bool,
     /// Base schema replacing the built-in one (and any config's `[policy] schema_path`).
@@ -69,7 +69,7 @@ impl From<&crate::cli::TestArgs> for TestOptions {
 }
 
 /// `attenuo policy test <file>...`
-pub fn test(files: &[PathBuf], opts: &TestOptions, json_out: bool) -> Run {
+pub(crate) fn test(files: &[PathBuf], opts: &TestOptions, json_out: bool) -> Run {
     let mut reports: Vec<(&Path, TestReport)> = Vec::new();
     let mut errors: Vec<(&Path, String)> = Vec::new();
     for path in files {
@@ -86,7 +86,7 @@ pub fn test(files: &[PathBuf], opts: &TestOptions, json_out: bool) -> Run {
 }
 
 /// The server and credentials of `policy test --via authzen`.
-pub struct Remote<'a> {
+pub(crate) struct Remote<'a> {
     pub client: &'a crate::client::Client,
     pub token: &'a str,
     pub dpop_key: Option<&'a attenuo_token::DpopKey>,
@@ -96,7 +96,7 @@ pub struct Remote<'a> {
 /// `POST /access/v1/evaluation`, with the token's chain. Cases the endpoint cannot express
 /// (see [`testing::TestCase::authzen_skip_reason`]) are skipped and listed as such. Every
 /// evaluation is a real decision on the server, so each one writes an audit record there.
-pub async fn test_authzen(
+pub(crate) async fn test_authzen(
     files: &[PathBuf],
     remote: &Remote<'_>,
     opts: &TestOptions,
@@ -194,7 +194,7 @@ fn authzen_body(call: &attenuo_core::ToolCall) -> Value {
 /// `max_depth`, an approval `by` it does not know, a negative `budget` figure) is reported as
 /// that case's error; any other refusal (a bad admin token, a server without the route) or a
 /// transport error stops the file.
-pub async fn test_admin_evaluate(
+pub(crate) async fn test_admin_evaluate(
     files: &[PathBuf],
     client: &crate::client::Client,
     opts: &TestOptions,
@@ -486,14 +486,14 @@ fn catalog_from_policy(text: &str) -> (attenuo_policy::ToolCatalog, Vec<String>)
 
 /// `attenuo policy lint <policy.cedar> [--config server.toml] [--schema]`
 #[cfg(test)]
-pub fn lint(policy: &Path, config: Option<&Path>, show_schema: bool, json_out: bool) -> Run {
+pub(crate) fn lint(policy: &Path, config: Option<&Path>, show_schema: bool, json_out: bool) -> Run {
     lint_with_schema(policy, config, None, show_schema, json_out)
 }
 
 /// `attenuo policy lint <policy.cedar> [--config server.toml] [--schema-file F] [--schema]`.
 /// The base schema is `schema_file`, else the config's `[policy] schema_path`, else the
 /// built-in one.
-pub fn lint_with_schema(
+pub(crate) fn lint_with_schema(
     policy: &Path,
     config: Option<&Path>,
     schema_file: Option<&Path>,
