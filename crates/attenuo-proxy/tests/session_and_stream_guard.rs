@@ -1,10 +1,12 @@
-//! Regression tests for findings of the 2026-10-23 security review, pass 3
-//! (`docs/research/security-review-2026-10-23.md`).
+//! Session headers and the stream guard: regression tests for the proxy findings of the
+//! 2026-10-23 security review, pass 3 (`docs/research/security-review-2026-10-23.md`).
+//! Formerly `security_pass3.rs`.
 //!
 //! Both findings here are in `crates/attenuo-proxy/src/proxy.rs`: SR-27 (ambiguous
 //! `Mcp-Session-Id` headers) and SR-28 (long-lived streams outliving revocation, the audit
 //! record of a stream the proxy ends, how listen streams ending are counted, and the bound on
-//! `stream.end` records per chain and reason).
+//! `stream.end` records per chain and reason). The SR-27 tests share the session upstream the
+//! SR-28 listen-stream tests use.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

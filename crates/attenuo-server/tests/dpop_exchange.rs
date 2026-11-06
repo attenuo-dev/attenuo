@@ -1,7 +1,10 @@
-//! Regression tests for findings of the 2026-10-23 security review, pass 4
-//! (`docs/research/security-review-2026-10-23-pass4.md`). SR-44 and the `[[actor_trust]]` case
-//! of SR-45 are in `actor_token.rs`, next to the actor-token harness they need; SR-46 is a unit
-//! test in `src/authz.rs`.
+//! DPoP proofs and token exchange: regression tests for the findings of the 2026-10-23
+//! security review, pass 4 (`docs/research/security-review-2026-10-23-pass4.md`): SR-40 (the
+//! parent's sign-off names the new key and agent), SR-41 (wrong-key proofs), SR-42 (`htu` and
+//! the host), SR-43 (internal errors reveal no paths), SR-45 (the reserved agent id) and SR-47
+//! (a full DPoP replay cache). Formerly `security_pass4.rs`. SR-44 and the `[[actor_trust]]`
+//! case of SR-45 are in `actor_token.rs`, next to the actor-token harness they need; SR-46 is a
+//! unit test in `src/authz.rs`.
 
 // Configs are built field by field from `Config::default()`, as in the other server tests.
 #![allow(clippy::field_reassign_with_default)]

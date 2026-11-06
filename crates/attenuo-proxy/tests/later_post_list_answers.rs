@@ -1,7 +1,9 @@
-//! Security review pass 8, SR-87: a list request the upstream answers with `202` and then
-//! answers in the body of a later `POST` of the same session must reach the client filtered
-//! (and, with `[proxy] list_filter = "policy"`, screened), like an answer in its own body.
-//! An answer to a list request of another run or another upstream is not claimed.
+//! SR-87 (security review pass 8, `docs/research/security-review-2026-11-05-pass8.md`): a list
+//! request the upstream answers with `202` and then answers in the body of a later `POST` of
+//! the same session must reach the client filtered (and, with `[proxy] list_filter = "policy"`,
+//! screened), like an answer in its own body. An answer to a list request of another run or
+//! another upstream is not claimed. Formerly `security_pass8_sr87.rs`; the labelling case
+//! (SR-85) is in `later_post_answers.rs`.
 
 use std::sync::{Arc, Mutex};
 

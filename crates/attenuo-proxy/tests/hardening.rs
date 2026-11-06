@@ -1,5 +1,9 @@
-//! Regression tests for findings of the 2026-10-22 security review
-//! (`docs/research/security-review-2026-10-22.md`).
+//! Hardening of the proxy's request path: regression tests for the proxy findings of the
+//! 2026-10-22 security review (`docs/research/security-review-2026-10-22.md`). SR-01 (duplicate
+//! member names smuggling another call), SR-02 (upstream redirects), SR-03 (non-object
+//! `arguments`), SR-11 (session ids bound to the principal), SR-17 (an unreachable upstream
+//! names no internal URL) and SR-18 (newlines in caller strings and log lines). Formerly
+//! `security.rs`.
 
 use std::sync::{Arc, Mutex};
 

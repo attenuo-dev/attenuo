@@ -1,5 +1,6 @@
-//! Security review pass 7, SR-81: a record window opens only on a record that was written. A
-//! failed audit append for a bounded refusal must not suppress the repeats that follow it.
+//! SR-81 (security review pass 7, `docs/research/security-review-2026-10-25-pass7.md`): a
+//! record window opens only on a record that was written. A failed audit append for a bounded
+//! refusal must not suppress the repeats that follow it. Formerly `security_pass7_sr81.rs`.
 
 use std::sync::Arc;
 
