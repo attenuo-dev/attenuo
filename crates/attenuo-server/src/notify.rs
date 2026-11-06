@@ -46,6 +46,7 @@ use async_trait::async_trait;
 use attenuo_audit::{
     Approval, ApprovalState, LeaseStore, NewNotice, OutboxNotice, SqliteLeaseStore,
 };
+use attenuo_core::Clock;
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -181,6 +182,7 @@ pub struct OutboxSettle {
     store: Arc<SqliteLeaseStore>,
     metrics: Arc<Metrics>,
     backlog: Mutex<Backlog>,
+    clock: Arc<dyn Clock>,
 }
 
 /// The outbox rows open at start not yet handed to the queue: those with a row id in
@@ -236,7 +238,7 @@ impl Settle<Notice> for OutboxSettle {
         let Some(row) = n.row else {
             return;
         };
-        let now = OffsetDateTime::now_utc();
+        let now = self.clock.now_utc();
         let closed = match how {
             Settled::Delivered => self.store.outbox_delivered(row, now),
             Settled::GaveUp { attempts } => self.store.outbox_given_up(row, attempts, now),
@@ -269,6 +271,7 @@ struct Emitter {
     queue: QueueHandle<Notice>,
     store: Arc<SqliteLeaseStore>,
     metrics: Arc<Metrics>,
+    clock: Arc<dyn Clock>,
 }
 
 impl Emitter {
@@ -279,7 +282,7 @@ impl Emitter {
             approval_id: &n.approval_id,
             body: &n.body,
         };
-        match self.store.outbox_insert(new, OffsetDateTime::now_utc()) {
+        match self.store.outbox_insert(new, self.clock.now_utc()) {
             Ok(Some(row)) => {
                 n.row = Some(row);
                 self.metrics.approval_notify_outbox_opened();
@@ -492,13 +495,37 @@ struct WatchState {
     stop: bool,
 }
 
-#[derive(Debug, Default)]
+/// The watched approvals, on `clock`: due times are its [`Clock::now`] instants.
+#[derive(Debug)]
 struct Watch {
     st: Mutex<WatchState>,
     wake: Condvar,
+    clock: Arc<dyn Clock>,
 }
 
 impl Watch {
+    fn new(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            st: Mutex::default(),
+            wake: Condvar::new(),
+            clock,
+        }
+    }
+
+    /// When to look at an approval that expires at `expires_at`.
+    fn due_at(&self, expires_at: OffsetDateTime) -> Instant {
+        let left = expires_at - self.clock.now_utc();
+        let left = Duration::try_from(left).unwrap_or(Duration::ZERO);
+        self.clock.now() + left + EXPIRY_GRACE
+    }
+
+    /// Wake [`next_due`](Self::next_due) to read the clock again. Taking the lock first
+    /// means a watcher that read the clock before it moved is already waiting, so it is woken.
+    fn poke(&self) {
+        drop(self.st.lock().unwrap_or_else(|e| e.into_inner()));
+        self.wake.notify_all();
+    }
+
     /// Look at `id` again at `when`. `false` when the watcher is full.
     fn add(&self, id: &str, when: Instant) -> bool {
         let mut st = self.st.lock().unwrap_or_else(|e| e.into_inner());
@@ -533,7 +560,7 @@ impl Watch {
             if st.stop {
                 return Next::Stop;
             }
-            let now = Instant::now();
+            let now = self.clock.now();
             let wake_at = match st.due.first().cloned() {
                 Some((when, id)) if when <= now => {
                     st.due.remove(&(when, id.clone()));
@@ -563,13 +590,6 @@ enum Next {
     Stop,
 }
 
-/// When to look at an approval that expires at `expires_at`.
-fn due_at(expires_at: OffsetDateTime) -> Instant {
-    let left = expires_at - OffsetDateTime::now_utc();
-    let left = Duration::try_from(left).unwrap_or(Duration::ZERO);
-    Instant::now() + left + EXPIRY_GRACE
-}
-
 /// The producer end: what the pipeline and the approval routes call. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct NotifierHandle {
@@ -582,7 +602,7 @@ impl NotifierHandle {
     /// expiry. Writes one outbox row; never waits on the receiver.
     pub fn pending(&self, a: &Approval) {
         self.emit.emit(Notice::new(NoticeKind::Pending, a));
-        if !self.watch.add(&a.id, due_at(a.expires_at)) {
+        if !self.watch.add(&a.id, self.watch.due_at(a.expires_at)) {
             self.emit.metrics.approval_notify_dropped();
             tracing::warn!(
                 approval = %a.id,
@@ -616,6 +636,7 @@ impl ApprovalNotifier {
         cfg: &NotifySection,
         metrics: Arc<Metrics>,
         leases: Arc<SqliteLeaseStore>,
+        clock: Arc<dyn Clock>,
     ) -> anyhow::Result<Self> {
         cfg.validate()?;
         let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
@@ -673,6 +694,7 @@ impl ApprovalNotifier {
             retention,
             metrics,
             leases,
+            clock,
         )?;
         tracing::info!(host = %host, capacity = cfg.queue_capacity, "[approvals.notify] notifying a webhook of approvals");
         Ok(n)
@@ -687,11 +709,13 @@ impl ApprovalNotifier {
         outbox_retention: Duration,
         metrics: Arc<Metrics>,
         store: Arc<SqliteLeaseStore>,
+        clock: Arc<dyn Clock>,
     ) -> anyhow::Result<Self> {
         let settle = OutboxSettle {
             store: store.clone(),
             metrics: metrics.clone(),
             backlog: Mutex::new(backlog_at_start(&store)),
+            clock: clock.clone(),
         };
         let queue = Queue::start_with(
             deliver,
@@ -704,8 +728,9 @@ impl ApprovalNotifier {
             queue: queue.handle(),
             store,
             metrics,
+            clock: clock.clone(),
         };
-        let watch = Arc::new(Watch::default());
+        let watch = Arc::new(Watch::new(clock));
         recover(&emit, &watch, outbox_retention);
         let (w, e) = (watch.clone(), emit.clone());
         let watcher = std::thread::Builder::new()
@@ -737,6 +762,13 @@ impl ApprovalNotifier {
             let _ = t.join();
         }
         self.queue.shutdown(grace);
+    }
+
+    /// Have the expiry watcher read its clock again now. For tests that move a
+    /// [`attenuo_core::ManualClock`] forward: the watcher otherwise sleeps until the next
+    /// expiry as the real time goes, so a jump of the clock is seen only then.
+    pub fn clock_advanced(&self) {
+        self.watch.poke();
     }
 }
 
@@ -780,11 +812,11 @@ fn recover(emit: &Emitter, watch: &Watch, retention: Duration) {
         }
         Err(e) => tracing::warn!(error = %e, "[approvals.notify] could not count the outbox"),
     }
-    let oldest = OffsetDateTime::now_utc() - retention;
+    let oldest = emit.clock.now_utc() - retention;
     match store.pending_approvals(MAX_WATCHED) {
         Ok(pending) => {
             for a in pending.iter().filter(|a| a.expires_at > oldest) {
-                watch.add(&a.id, due_at(a.expires_at));
+                watch.add(&a.id, watch.due_at(a.expires_at));
             }
         }
         Err(e) => {
@@ -795,10 +827,7 @@ fn recover(emit: &Emitter, watch: &Watch, retention: Duration) {
 
 /// Delete outbox rows settled longer than `retention` ago.
 fn prune_outbox(emit: &Emitter, retention: Duration) {
-    match emit
-        .store
-        .outbox_prune(OffsetDateTime::now_utc() - retention)
-    {
+    match emit.store.outbox_prune(emit.clock.now_utc() - retention) {
         Ok(0) => {}
         Ok(n) => tracing::debug!(rows = n, "[approvals.notify] pruned the outbox"),
         Err(e) => tracing::warn!(error = %e, "[approvals.notify] pruning the outbox failed"),
@@ -810,11 +839,12 @@ fn prune_outbox(emit: &Emitter, retention: Duration) {
 fn watch_expiry(watch: &Watch, emit: &Emitter, retention: Duration) {
     let leases: &dyn LeaseStore = emit.store.as_ref();
     let metrics = &emit.metrics;
-    let mut prune_at = Instant::now();
+    let clock = &emit.clock;
+    let mut prune_at = clock.now();
     loop {
-        if Instant::now() >= prune_at {
+        if clock.now() >= prune_at {
             prune_outbox(emit, retention);
-            prune_at = Instant::now() + OUTBOX_PRUNE_PERIOD;
+            prune_at = clock.now() + OUTBOX_PRUNE_PERIOD;
         }
         let id = match watch.next_due(prune_at) {
             Next::Due(id) => id,
@@ -823,13 +853,13 @@ fn watch_expiry(watch: &Watch, emit: &Emitter, retention: Duration) {
         };
         match leases.approval(&id) {
             Ok(Some(a)) if a.state == ApprovalState::Pending => {
-                if a.is_expired(OffsetDateTime::now_utc()) {
+                if a.is_expired(clock.now_utc()) {
                     emit.emit(Notice::new(NoticeKind::Expired, &a));
                 } else {
                     // The clocks disagree by a little: look again.
                     watch.add(
                         &a.id,
-                        due_at(a.expires_at).max(Instant::now() + EXPIRY_GRACE),
+                        watch.due_at(a.expires_at).max(clock.now() + EXPIRY_GRACE),
                     );
                 }
             }
@@ -1177,6 +1207,7 @@ mod tests {
             Duration::from_secs(3600),
             metrics.clone(),
             store.clone(),
+            attenuo_core::clock::system_clock(),
         )
         .unwrap();
         (n, metrics)
@@ -1256,16 +1287,20 @@ mod tests {
 
     #[test]
     fn watch_returns_ids_in_expiry_order_and_forgets_removed_ones() {
-        let w = Watch::default();
-        let now = Instant::now();
-        assert!(w.add("b", now + Duration::from_millis(20)));
+        let clock = attenuo_core::ManualClock::new();
+        let w = Watch::new(clock.clone());
+        let now = clock.now();
+        assert!(w.add("b", now + Duration::from_secs(20)));
         assert!(w.add("a", now));
-        assert!(w.add("c", now + Duration::from_millis(10)));
+        assert!(w.add("c", now + Duration::from_secs(10)));
         w.remove("c");
-        let later = Instant::now() + Duration::from_secs(5);
+        let later = now + Duration::from_secs(3600);
         assert_eq!(w.next_due(later), Next::Due("a".into()));
+        // "b" is not due yet; step the clock to it instead of waiting.
+        assert_eq!(w.next_due(clock.now()), Next::Timeout);
+        clock.advance(Duration::from_secs(20));
         assert_eq!(w.next_due(later), Next::Due("b".into()));
-        assert_eq!(w.next_due(Instant::now()), Next::Timeout);
+        assert_eq!(w.next_due(clock.now()), Next::Timeout);
         w.stop();
         assert_eq!(w.next_due(later), Next::Stop);
     }

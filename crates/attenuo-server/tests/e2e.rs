@@ -2016,6 +2016,10 @@ async fn a_listen_stream_cut_by_revocation_is_audited() {
     )
     .await;
     let before = h.audit_entries().await.len();
+    // The re-check is a tokio interval of `stream_recheck_seconds` (whole seconds): on paused
+    // tokio time the runtime jumps to its next tick once every task waits, instead of this
+    // test sleeping up to a second for it.
+    tokio::time::pause();
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while let Some(Ok(chunk)) = stream.next().await {
             text.push_str(std::str::from_utf8(&chunk).unwrap());
@@ -2023,6 +2027,7 @@ async fn a_listen_stream_cut_by_revocation_is_audited() {
     })
     .await
     .expect("the stream ends after the revocation");
+    tokio::time::resume();
     let last: Value = serde_json::from_str(
         text.split("\n\n")
             .filter_map(|e| e.lines().find_map(|l| l.strip_prefix("data: ")))

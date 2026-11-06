@@ -2,6 +2,11 @@
 //! an operator's decision an `approval.decided` one, and an approval nobody decides an
 //! `approval.expired` one. A receiver that fails is retried; one that never answers delays
 //! neither the gated call nor the decision.
+//!
+//! No test waits for time to pass: the server runs on a [`ManualClock`], and a test steps it
+//! past an approval's TTL ([`Harness::advance`]). "Nothing else arrives" is checked against a
+//! later notice that the same thread delivers after any stray one, or after stopping the
+//! delivery thread, never by sleeping for a while.
 
 // Configs are built field by field from `Config::default()`, as in the other server tests.
 #![allow(clippy::field_reassign_with_default)]
@@ -12,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use attenuo_audit::LeaseStore;
-use attenuo_core::ToolCall;
+use attenuo_core::{Clock, ManualClock, ToolCall};
 use attenuo_policy::ToolAttrs;
 use attenuo_proxy::testing::{spawn_router, FakeMcpServer, Spawned};
 use attenuo_proxy::UpstreamConfig;
@@ -83,18 +88,29 @@ impl Receiver {
 
     /// Wait until a delivered notice of `kind` arrives, and return it.
     async fn wait_for(&self, kind: &str) -> Value {
+        self.wait_until(kind, |v| v["type"] == kind).await
+    }
+
+    /// Wait until a delivered notice of `kind` for approval `id` arrives, and return it.
+    async fn wait_for_approval(&self, kind: &str, id: &str) -> Value {
+        self.wait_until(kind, |v| v["type"] == kind && v["approval_id"] == id)
+            .await
+    }
+
+    /// Poll the delivered notices until one matches `found`.
+    async fn wait_until(&self, what: &str, found: impl Fn(&Value) -> bool) -> Value {
         let end = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Some(v) = self.delivered().into_iter().find(|v| v["type"] == kind) {
+            if let Some(v) = self.delivered().into_iter().find(&found) {
                 return v;
             }
-            assert!(Instant::now() < end, "no {kind} notice in time");
+            assert!(Instant::now() < end, "no {what} notice in time");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 }
 
-/// A TCP listener that accepts connections and never answers.
+/// A TCP listener that accepts connections and never answers, until [`hang_up`].
 async fn dead_receiver() -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/hook", listener.local_addr().unwrap());
@@ -105,6 +121,13 @@ async fn dead_receiver() -> (String, tokio::task::JoinHandle<()>) {
         }
     });
     (url, task)
+}
+
+/// Close the [`dead_receiver`] and every connection it holds, so a request still waiting on
+/// it fails at once instead of at its timeout: stopping the server then does not wait for it.
+async fn hang_up(dead: tokio::task::JoinHandle<()>) {
+    dead.abort();
+    let _ = dead.await;
 }
 
 /// Check `X-Attenuo-Signature` against the body, computing the HMAC here.
@@ -129,6 +152,8 @@ fn assert_signed(headers: &HeaderMap, body: &[u8]) {
 struct Harness {
     server: Spawned,
     state: Arc<AppState>,
+    /// The server's clock, notifier included: [`Harness::advance`] steps it.
+    clock: Arc<ManualClock>,
     _upstream_task: Spawned,
     client: reqwest::Client,
     dir: tempfile::TempDir,
@@ -138,12 +163,15 @@ impl Harness {
     /// A server notifying `url`, with the secret in the environment variable `secret_env`
     /// (one per test, so tests running in parallel do not share one).
     async fn start(url: &str, secret_env: &str, tweak: impl FnOnce(&mut Config)) -> Self {
-        Self::start_in(tempfile::tempdir().unwrap(), url, secret_env, tweak).await
+        let dir = tempfile::tempdir().unwrap();
+        Self::start_in(dir, ManualClock::new(), url, secret_env, tweak).await
     }
 
-    /// [`start`](Self::start) on the database in `dir`, as a restarted server would.
+    /// [`start`](Self::start) on the database in `dir` and on `clock`, as a restarted server
+    /// would.
     async fn start_in(
         dir: tempfile::TempDir,
+        clock: Arc<ManualClock>,
         url: &str,
         secret_env: &str,
         tweak: impl FnOnce(&mut Config),
@@ -176,14 +204,47 @@ impl Harness {
         notify.max_backoff_seconds = 1;
         cfg.approvals.notify = Some(notify);
         tweak(&mut cfg);
-        let (router, state) = attenuo_server::build(&cfg).unwrap();
+        let (router, state) = attenuo_server::build_with_clock(&cfg, clock.clone()).unwrap();
         Self {
             server: spawn_router(router).await.unwrap(),
             state,
+            clock,
             _upstream_task: upstream_task,
             client: reqwest::Client::new(),
             dir,
         }
+    }
+
+    /// Move the server's clock forward by `by`, and have the notifier's expiry watcher look
+    /// at it at once.
+    fn advance(&self, by: Duration) {
+        self.clock.advance(by);
+        self.notifier().clock_advanced();
+    }
+
+    fn notifier(&self) -> &attenuo_server::notify::ApprovalNotifier {
+        self.state.approval_notifier.as_ref().unwrap()
+    }
+
+    /// Step the clock past the expiry of approval `id`.
+    fn advance_past_expiry(&self, id: &str) {
+        let expires_at = self.state.leases.approval(id).unwrap().unwrap().expires_at;
+        let left = Duration::try_from(expires_at - self.clock.now_utc()).unwrap_or_default();
+        self.advance(left + Duration::from_secs(1));
+    }
+
+    /// Stop the notifier's threads, delivering first whatever is queued: once this returns
+    /// nothing more is sent, so a count read afterwards is final.
+    async fn quiesce(&self) {
+        let s = self.state.clone();
+        tokio::task::spawn_blocking(move || {
+            s.approval_notifier
+                .as_ref()
+                .unwrap()
+                .shutdown(Duration::from_secs(10))
+        })
+        .await
+        .unwrap();
     }
 
     /// Stop the way `serve` does after a signal, with no grace for the notifier: what was
@@ -373,16 +434,22 @@ async fn an_approval_nobody_decides_gets_an_expired_notice() {
     let token = h.root().await;
     let id = h.gated(&token, "alice/site").await;
     r.wait_for("approval.pending").await;
+    h.advance_past_expiry(&id);
     let expired = r.wait_for("approval.expired").await;
     assert_eq!(expired["approval_id"], id);
     assert!(expired.get("decision").is_none());
     let (headers, body) = r.got.lock().unwrap().last().cloned().unwrap();
     assert_signed(&headers, &body);
-    // A decided approval gets no expired notice.
+    // A decided approval gets no expired notice. `id3`, left pending, expires after `id2`:
+    // the watcher looks at approvals in expiry order and the queue delivers in order, so an
+    // expired notice for `id2` would arrive before the one for `id3`.
     let id2 = h.gated(&token, "alice/other").await;
     h.admin_decide(&id2, "grant").await;
     r.wait_for("approval.decided").await;
-    tokio::time::sleep(Duration::from_millis(1800)).await;
+    let id3 = h.gated(&token, "alice/third").await;
+    h.advance_past_expiry(&id3);
+    let expired3 = r.wait_for_approval("approval.expired", &id3).await;
+    assert_eq!(expired3["approval_id"], id3);
     let notices = r.delivered();
     let for_id2: Vec<&str> = notices
         .iter()
@@ -390,6 +457,12 @@ async fn an_approval_nobody_decides_gets_an_expired_notice() {
         .map(|v| v["type"].as_str().unwrap())
         .collect();
     assert_eq!(for_id2, ["approval.pending", "approval.decided"]);
+    let expired_ids: Vec<&str> = notices
+        .iter()
+        .filter(|v| v["type"] == "approval.expired")
+        .map(|v| v["approval_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(expired_ids, [id.as_str(), id3.as_str()]);
 }
 
 #[tokio::test]
@@ -533,7 +606,7 @@ async fn outbox_drains(h: &Harness) {
 #[tokio::test]
 async fn a_notice_queued_at_shutdown_is_delivered_after_a_restart() {
     const ENV: &str = "ATTENUO_TEST_NOTIFY_SECRET_5";
-    let (url, _dead) = dead_receiver().await;
+    let (url, dead) = dead_receiver().await;
     let h = Harness::start(&url, ENV, hanging).await;
     let token = h.root().await;
     let id = h.gated(&token, "alice/site").await;
@@ -541,10 +614,12 @@ async fn a_notice_queued_at_shutdown_is_delivered_after_a_restart() {
     assert_eq!(open.len(), 1, "{open:?}");
     assert_eq!(open[0].approval_id, id);
     assert_eq!(open[0].kind, "approval.pending");
+    hang_up(dead).await;
+    let clock = h.clock.clone();
     let dir = h.stop().await;
 
     let (r, hook) = receiver(0).await;
-    let h = Harness::start_in(dir, &hook.url("/hook"), ENV, |_| {}).await;
+    let h = Harness::start_in(dir, clock, &hook.url("/hook"), ENV, |_| {}).await;
     let pending = r.wait_for("approval.pending").await;
     assert_eq!(pending["approval_id"], id);
     let event_id =
@@ -556,8 +631,9 @@ async fn a_notice_queued_at_shutdown_is_delivered_after_a_restart() {
             .await,
         1
     );
-    // Nothing else arrives: the delivered row is not sent again.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Nothing else arrives: the delivered row is not sent again. Stopping the delivery
+    // thread delivers anything still queued first, so a second copy would show here.
+    h.quiesce().await;
     let got = r.got.lock().unwrap().clone();
     assert_eq!(got.len(), 1, "delivered once");
     let (headers, body) = &got[0];
@@ -572,7 +648,7 @@ async fn a_notice_queued_at_shutdown_is_delivered_after_a_restart() {
 #[tokio::test]
 async fn an_approval_that_expired_while_down_gets_its_notice_on_start_once() {
     const ENV: &str = "ATTENUO_TEST_NOTIFY_SECRET_6";
-    let (url, _dead) = dead_receiver().await;
+    let (url, dead) = dead_receiver().await;
     let h = Harness::start(&url, ENV, |c| {
         c.approvals.ttl_seconds = 1;
         hanging(c);
@@ -581,15 +657,17 @@ async fn an_approval_that_expired_while_down_gets_its_notice_on_start_once() {
     let token = h.root().await;
     let id = h.gated(&token, "alice/site").await;
     let expires_at = h.state.leases.approval(&id).unwrap().unwrap().expires_at;
+    hang_up(dead).await;
+    let clock = h.clock.clone();
     let dir = h.stop().await;
     // Down until after the expiry.
-    let left = expires_at - time::OffsetDateTime::now_utc();
-    if let Ok(left) = Duration::try_from(left) {
-        tokio::time::sleep(left + Duration::from_millis(100)).await;
-    }
+    let left = Duration::try_from(expires_at - clock.now_utc()).unwrap_or_default();
+    clock.advance(left + Duration::from_secs(1));
 
     let (r, hook) = receiver(0).await;
-    let h = Harness::start_in(dir, &hook.url("/hook"), ENV, |_| {}).await;
+    let h = Harness::start_in(dir, clock, &hook.url("/hook"), ENV, |_| {}).await;
+    // Past the watcher's grace after an expiry too, so it looks now.
+    h.advance(Duration::from_secs(1));
     let expired = r.wait_for("approval.expired").await;
     assert_eq!(expired["approval_id"], id);
     outbox_drains(&h).await;
@@ -605,14 +683,31 @@ async fn an_approval_that_expired_while_down_gets_its_notice_on_start_once() {
     for (headers, body) in r.got.lock().unwrap().iter() {
         assert_signed(headers, body);
     }
+    let clock = h.clock.clone();
     let dir = h.stop().await;
 
     let (r2, hook2) = receiver(0).await;
-    let h = Harness::start_in(dir, &hook2.url("/hook"), ENV, |_| {}).await;
-    tokio::time::sleep(Duration::from_millis(800)).await;
-    assert!(
-        r2.got.lock().unwrap().is_empty(),
-        "nothing is sent again after a second restart"
-    );
+    let h = Harness::start_in(dir, clock, &hook2.url("/hook"), ENV, |_| {}).await;
+    // A fresh approval, left to expire: the watcher looks at the old one first (it expired
+    // earlier), and the queue delivers in order, so a second notice for the old one would
+    // arrive before this one's `approval.expired`. Stopping then flushes anything queued.
+    let token = h.root().await;
+    let fresh = h.gated(&token, "alice/fresh").await;
+    h.advance_past_expiry(&fresh);
+    r2.wait_for_approval("approval.expired", &fresh).await;
+    h.quiesce().await;
+    let types: Vec<String> = r2
+        .delivered()
+        .iter()
+        .map(|v| {
+            assert_eq!(
+                v["approval_id"],
+                fresh.as_str(),
+                "nothing is sent again after a second restart"
+            );
+            v["type"].as_str().unwrap().to_string()
+        })
+        .collect();
+    assert_eq!(types, ["approval.pending", "approval.expired"]);
     assert_eq!(h.metric("attenuo_approval_notify_outbox_rows"), 0);
 }

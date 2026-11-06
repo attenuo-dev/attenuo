@@ -53,6 +53,7 @@ fn counting_busy_handler(count: i32) -> bool {
         }
     }
     let t = Instant::now();
+    // SQLite's own busy-handler backoff, reproduced: the behaviour under test, not a wait.
     std::thread::sleep(Duration::from_millis(delay));
     BUSY_SLEPT_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
     true

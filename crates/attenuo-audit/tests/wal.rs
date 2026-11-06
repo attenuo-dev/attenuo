@@ -71,7 +71,7 @@ fn concurrent_appends_with_verify_running_and_background_checkpoints() {
                 last = report.entries;
                 runs += 1;
                 // The scan holds the store lock; leave room for the writers (std mutexes are
-                // not fair, so a tight loop could starve them).
+                // not fair, so a tight loop could starve them). Workload pacing, not a wait.
                 std::thread::sleep(Duration::from_millis(5));
             }
             runs
@@ -170,6 +170,7 @@ fn the_wal_stays_bounded_under_continuous_load() {
             let mut largest = 0;
             while !done.load(Ordering::Acquire) {
                 largest = largest.max(std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0));
+                // The sampling period of the WAL size, part of the workload: not a wait.
                 std::thread::sleep(Duration::from_millis(5));
             }
             largest
@@ -386,6 +387,7 @@ fn wal_backstop_pause() {
     while audit.wal_timings().locked_passes.len() < FIRES
         && phase2.elapsed() < Duration::from_secs(600)
     {
+        // A poll on the condition above (the probe's phase length), not a fixed wait.
         std::thread::sleep(Duration::from_millis(50));
     }
     stop.store(true, Ordering::Release);

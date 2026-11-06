@@ -26,6 +26,7 @@ static BUSY: AtomicU64 = AtomicU64::new(0);
 
 fn counting(_: i32) -> bool {
     BUSY.fetch_add(1, Ordering::Relaxed);
+    // A busy handler's backoff (it must not spin), part of the workload: not a wait.
     std::thread::sleep(Duration::from_millis(1));
     true
 }
