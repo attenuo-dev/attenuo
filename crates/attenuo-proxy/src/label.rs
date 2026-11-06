@@ -351,7 +351,7 @@ impl AwaitedResults {
 
     /// How many calls are remembered, expired ones included until they are dropped.
     #[cfg(test)]
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.lock().len
     }
 }

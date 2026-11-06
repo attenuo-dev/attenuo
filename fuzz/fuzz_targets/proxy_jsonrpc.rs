@@ -338,6 +338,7 @@ fn world() -> &'static World {
                     max_sessions_per_principal: 64,
                     record_window: attenuo_proxy::records::DEFAULT_RECORD_WINDOW,
                     record_window_max_keys: attenuo_proxy::records::DEFAULT_RECORD_WINDOW_MAX_KEYS,
+                    list_filter: attenuo_proxy::ListFilterMode::Capabilities,
                 };
                 attenuo_proxy::router(config, auth.clone())
             })
