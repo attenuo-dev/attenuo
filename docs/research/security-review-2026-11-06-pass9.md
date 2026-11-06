@@ -28,16 +28,18 @@ Every fix here has a regression test that fails on `5b85f43` and passes on this 
 |---|---|---|---|---|
 | Critical | 0 | 0 | 0 | 0 |
 | High | 0 | 0 | 0 | 0 |
-| Medium | 1 | 0 | 1 | 0 |
-| Low | 1 | 0 | 1 | 0 |
-| Info | 4 | 3 | 1 | 0 |
-| **Total** | **6** | **3** | **3** | **0** |
+| Medium | 1 | 1 | 0 | 0 |
+| Low | 1 | 1 | 0 | 0 |
+| Info | 4 | 4 | 0 | 0 |
+| **Total** | **6** | **6** | **0** | **0** |
+
+SR-91, SR-92 and SR-93 were proposed by this pass and fixed afterwards (`fix/sr91-arg-taint-bounds`, `fix/sr92-sr93-notifier-queue`); the counts above include them.
 
 | ID | Severity | Component | Title | Status |
 |---|---|---|---|---|
 | SR-91 | Medium | server (`authz/pipeline.rs` `arg_taint`, both stores' `find_spans`) | One call's arguments are looked up with no bound on probes or hits: seconds under the store lock and gigabytes of memory per call | Fixed (`fix/sr91-arg-taint-bounds`) |
-| SR-92 | Low | server (`notify.rs`, `sink.rs` `QueueHandle::push`) | One run can push every other run's approval notices out of the queue and the expiry watcher | Proposed |
-| SR-93 | Info | server (`notify.rs` `recover`) | On restart, open outbox rows beyond `queue_capacity` are given up without one attempt | Proposed |
+| SR-92 | Low | server (`notify.rs`, `sink.rs` `QueueHandle::push`) | One run can push every other run's approval notices out of the queue and the expiry watcher | Fixed (fix/sr92-sr93-notifier-queue), tests `a_run_has_at_most_max_pending_approvals_sr92`, `a_run_with_too_many_pending_approvals_gets_no_new_one_sr92` |
+| SR-93 | Info | server (`notify.rs` `recover`) | On restart, open outbox rows beyond `queue_capacity` are given up without one attempt | Fixed (fix/sr92-sr93-notifier-queue), tests `a_backlog_longer_than_the_queue_is_delivered_whole_and_in_order_sr93`, `a_notice_stored_while_the_backlog_drains_is_delivered_once_sr93` |
 | SR-94 | Info | server (`sink.rs` `WebhookDeliver`, `S3Deliver`) | A failed checkpoint delivery logged the sink URL, query string included | Fixed, test `a_failed_webhook_delivery_does_not_log_the_url_sr94` |
 | SR-95 | Info | policy (`request.rs` `decimal_text`), docs | "Never rounded" for `decimal` inputs does not hold for numbers with more digits than a double | Fixed (docs), test `digits_beyond_a_double_are_rounded_by_the_parse_alike_for_cedar_and_upstream_sr95` |
 | SR-96 | Info | server (`notify.rs` `ApprovalNotifier::start`) | The plain-http warning missed `HTTP://` and loopback addresses other than `127.0.0.1` | Fixed, test `plain_http_to_another_host_is_detected_in_any_case_sr96` |
@@ -61,18 +63,20 @@ Every fix here has a regression test that fails on `5b85f43` and passes on this 
 
   A regression test: a call with 100,000 arguments sharing one leaf, after 50 results holding it, decided within a fixed time and with every argument named `unreadable`; and a `find_spans` call with one probe whose hash sits under 1,000 results returning at most the bound.
 
-### SR-92: one run can push every other run's approval notices out of the queue (Low, proposed)
+### SR-92: one run can push every other run's approval notices out of the queue (Low, fixed (fix/sr92-sr93-notifier-queue))
 
 - **Component.** `attenuo-server` `notify.rs` `NotifierHandle::pending` (508) and `Watch::add` (428); `sink.rs` `QueueHandle::push` (320).
 - **Observation.** Every new pending approval queues an `approval.pending` notice and adds the approval to the expiry watcher. The queue (default 256) drops its oldest item when full, whoever it belongs to, and marks its outbox row given up; the watcher refuses new approvals past `MAX_WATCHED` (10,000), counting a drop. Nothing bounds the pending approvals of one run: `create_approval` reuses a pending approval only for the same call hash, so a run that varies one argument of a gated call creates a new approval, and a new notice, per call. One delivery thread posts the queue in order, so a receiver that takes 50 ms per notice drains 20 a second.
 - **Exploit path.** A token holder whose policy gates its calls on approval (for example `confirm_destructive_with_untrusted_args`) sends a few hundred gated calls a second with distinct arguments. The queue fills with its notices and the notices of other runs, queued before them, are dropped: the operator is not told that another user's call is waiting, and that call expires. With 10,000 approvals pending the watcher is full and later approvals of any run get no `approval.expired`. Low: notifications are documented as best effort, every approval stays in the store, the audit log and the console, and nothing is allowed that would not be; the attacker can only make the operator miss someone else's request, as SR-86 could with awaited calls.
 - **Proposed patch.** Cap the pending approvals of one run in `create_approval` (both stores), for example 32: past the cap the call is denied with diagnostics `too many pending approvals for this run`, as a failed store would deny it. That bounds the approvals table and the notices together. Alternatively, as SR-86 did, drop the oldest queued notice of the run with the most queued notices when the queue is full (`QueueItem::group`, the chain id for a notice, `None` for a checkpoint), and give the watcher a per-run share.
+- **Fix (fix/sr92-sr93-notifier-queue).** The first patch. `create_approval` in both stores refuses a run's 33rd pending, unexpired approval (`MAX_PENDING_APPROVALS_PER_RUN = 32` in `attenuo-audit`) with `AuditError::TooManyPendingApprovals`, after the reuse check, so a repeated call keeps its approval and is not counted twice. The gated call is then answered as for a failed store: `-32008` (AuthZEN: `decision: false`, `reason: approval_required`) with no `approval_id`, diagnostics `too many pending approvals for this run`, and its decision record (`deny`, `approval_required`) but no `approval_request` record and no notice. With at most 32 approvals waiting per run, one run fills an eighth of the default notice queue and cannot fill the expiry watcher alone.
 
-### SR-93: on restart, open outbox rows beyond `queue_capacity` are given up without one attempt (Info, proposed)
+### SR-93: on restart, open outbox rows beyond `queue_capacity` are given up without one attempt (Info, fixed (fix/sr92-sr93-notifier-queue))
 
 - **Component.** `attenuo-server` `notify.rs` `recover` (679).
 - **Observation.** `recover` reads up to `MAX_WATCHED` (10,000) open rows and pushes them all into a queue of `queue_capacity` (default 256), oldest first. Each push past the capacity drops the oldest queued notice, and `OutboxSettle` marks its row given up (`Settled::Dropped`), so after a restart with 1,000 open rows (a receiver that was down while SR-92's flood or ordinary traffic ran) 744 notices are closed without one delivery attempt, logged as `queue full`. Rows beyond 10,000 are left open and are only read at the next restart. The design note says a dropped notice is marked given up, but `recover` reads as if it delivered "the rows still open". No security effect beyond SR-92's: notices are best effort.
 - **Proposed patch.** Read at most `queue_capacity` rows in `recover`, and have the delivery thread read the next batch of open rows from the outbox (`outbox_open` after the last row id) when the queue runs empty, so open rows are delivered in order without being dropped for lack of room. Smaller alternative: read only `queue_capacity` rows and leave the rest open until the next restart, which keeps them but delays them indefinitely; not recommended.
+- **Fix (fix/sr92-sr93-notifier-queue).** As proposed, with the read moved onto the delivery thread from the start: before the queue starts, the notifier notes the newest open row; whenever the delivery thread finds the queue empty it asks the queue's `Settle` hook for more (`Settle::refill`), and the outbox hook answers with the next open rows up to that row, at most `queue_capacity` (`outbox_open_between`). Every open row gets its attempts in order, and none is given up for lack of room. A notice stored after start has a higher row id and is queued when stored, so the backlog never reads it and it is not sent twice.
 
 ### SR-94: a failed checkpoint delivery logged the sink URL, query string included (Info, fixed)
 

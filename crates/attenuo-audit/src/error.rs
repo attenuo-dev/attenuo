@@ -69,6 +69,15 @@ pub enum AuditError {
     /// What this decision charged was already refunded.
     #[error("the budget charge of decision `{0}` was already refunded")]
     ChargeRefunded(String),
+    /// The run already has [`crate::MAX_PENDING_APPROVALS_PER_RUN`] pending approvals, so no
+    /// new one is stored (SR-92).
+    #[error("run `{chain_id}` already has {max} pending approvals")]
+    TooManyPendingApprovals {
+        /// The run (the lease of its first hop).
+        chain_id: String,
+        /// The cap, [`crate::MAX_PENDING_APPROVALS_PER_RUN`].
+        max: usize,
+    },
 }
 
 impl<T> From<std::sync::PoisonError<T>> for AuditError {

@@ -48,6 +48,10 @@ pub const REASON_AUDIT_ERROR: &str = "audit_error";
 /// Reason code: a result's `tool_result` record or the run's label could not be written, so
 /// the result is withheld (ADR-0009).
 pub const REASON_LABEL_ERROR: &str = attenuo_proxy::REASON_LABEL_ERROR;
+/// The diagnostic of a gated call whose run already has
+/// [`attenuo_audit::MAX_PENDING_APPROVALS_PER_RUN`] approvals pending (SR-92): the call is
+/// denied `approval_required` with no approval to grant, as when the store fails.
+pub const DIAG_TOO_MANY_PENDING_APPROVALS: &str = "too many pending approvals for this run";
 
 /// The result of running the pipeline once.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -950,6 +954,12 @@ impl Pipeline {
         };
         let (stored, created) = match self.leases.create_approval(&wanted) {
             Ok(v) => v,
+            // SR-92: the run has as many approvals waiting as an operator is asked to follow.
+            Err(e @ attenuo_audit::AuditError::TooManyPendingApprovals { .. }) => {
+                tracing::warn!(error = %e, "pending approval refused: too many for this run");
+                diagnostics.push(DIAG_TOO_MANY_PENDING_APPROVALS.to_string());
+                return None;
+            }
             Err(e) => {
                 tracing::error!(error = %e, "pending approval could not be stored");
                 diagnostics.push(format!("pending approval could not be stored: {e}"));

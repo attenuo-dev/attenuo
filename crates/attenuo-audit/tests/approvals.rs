@@ -6,7 +6,7 @@ mod common;
 
 use attenuo_audit::{
     Approval, ApprovalLabel, ApprovalMethod, ApprovalState, Approver, AuditError, LeaseStore,
-    MemoryLeaseStore, SqliteLeaseStore,
+    MemoryLeaseStore, SqliteLeaseStore, MAX_PENDING_APPROVALS_PER_RUN,
 };
 use attenuo_core::{LeaseId, UntrustedArg, UntrustedKind};
 use common::{chain, t0};
@@ -352,6 +352,82 @@ fn approval_taken_by_id_checks_run_hop_call_and_state() {
         assert!(
             by_id(&a.id, "l1", "l2", "h1", "d3", now).is_none(),
             "{name}: revoked"
+        );
+    }
+}
+
+/// SR-92: a run has at most `MAX_PENDING_APPROVALS_PER_RUN` pending, unexpired approvals. The
+/// next distinct gated call is refused; a repeat of a waiting call still gets its approval and
+/// does not count again; another run is not affected; a decided or expired approval frees
+/// its place.
+#[test]
+fn a_run_has_at_most_max_pending_approvals_sr92() {
+    assert_eq!(MAX_PENDING_APPROVALS_PER_RUN, 32);
+    for (name, store) in stores() {
+        let store = store.as_ref();
+        leases(store);
+        let ttl = Duration::seconds(120);
+        let hash = |n: u32| format!("h{n}");
+        let mut first = Vec::new();
+        for n in 0..MAX_PENDING_APPROVALS_PER_RUN as u32 {
+            let (a, created) = store.create_approval(&pending(n, &hash(n), ttl)).unwrap();
+            assert!(created, "{name}: approval {n}");
+            first.push(a);
+        }
+        let over = pending(100, &hash(100), ttl);
+        match store.create_approval(&over) {
+            Err(AuditError::TooManyPendingApprovals { chain_id, max }) => {
+                assert_eq!((chain_id.as_str(), max), ("l1", 32), "{name}");
+            }
+            other => panic!("{name}: the 33rd distinct approval was not refused: {other:?}"),
+        }
+        assert!(
+            store.approval(&over.id).unwrap().is_none(),
+            "{name}: not stored"
+        );
+        assert_eq!(
+            store.approvals(Some(&id("l1")), 100).unwrap().len(),
+            32,
+            "{name}"
+        );
+
+        // The same call again reuses its approval, at the cap and as often as it is repeated.
+        for _ in 0..3 {
+            let (again, created) = store.create_approval(&pending(101, &hash(5), ttl)).unwrap();
+            assert!(!created, "{name}");
+            assert_eq!(again, first[5], "{name}");
+        }
+
+        // Another run (root `l3`, calling hop `l4`) still gets one.
+        let exp = t0() + Duration::hours(1);
+        store.register(&id("l3"), None, exp).unwrap();
+        store.register(&id("l4"), Some(&id("l3")), exp).unwrap();
+        let mut other = pending(200, &hash(100), ttl);
+        other.chain_id = id("l3");
+        other.lease = id("l4");
+        other.chain = chain("bob", ("l3", "l4"));
+        assert!(
+            store.create_approval(&other).unwrap().1,
+            "{name}: other run"
+        );
+
+        // A declined approval no longer counts: one more fits, then the cap holds again.
+        store
+            .decide_approval(&first[0].id, false, &user(), t0())
+            .unwrap();
+        assert!(store.create_approval(&over).unwrap().1, "{name}");
+        assert!(matches!(
+            store.create_approval(&pending(102, &hash(102), ttl)),
+            Err(AuditError::TooManyPendingApprovals { .. })
+        ));
+
+        // Once they have expired, pending approvals no longer count either.
+        let mut later = pending(103, &hash(103), ttl);
+        later.created_at = t0() + Duration::seconds(121);
+        later.expires_at = later.created_at + ttl;
+        assert!(
+            store.create_approval(&later).unwrap().1,
+            "{name}: after expiry"
         );
     }
 }

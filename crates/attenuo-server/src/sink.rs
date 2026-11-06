@@ -80,6 +80,15 @@ pub enum Settled {
 /// Never called for an item left queued at shutdown: it stays wherever the hook keeps it.
 pub trait Settle<T>: Send + Sync + std::fmt::Debug {
     fn settled(&self, item: &T, how: Settled);
+
+    /// Items kept elsewhere that wait for room in the queue, oldest first, at most `room`
+    /// (the approval notices a restart left open, SR-93). The delivery thread asks each time
+    /// it finds the queue empty, outside the lock, and puts what it gets at the front, so
+    /// they go before anything queued meanwhile. Default: none.
+    fn refill(&self, room: usize) -> Vec<T> {
+        let _ = room;
+        Vec::new()
+    }
 }
 
 impl QueueItem for ShippedCheckpoint {
@@ -269,6 +278,12 @@ impl<T> Shared<T> {
         if let Some(s) = &self.settle {
             s.settled(item, how);
         }
+    }
+
+    fn refill(&self) -> Vec<T> {
+        self.settle
+            .as_ref()
+            .map_or_else(Vec::new, |s| s.refill(self.limits.capacity))
     }
 
     fn oldest(st: &State<T>) -> Option<(Instant, SystemTime)> {
@@ -577,6 +592,8 @@ fn run<T: QueueItem>(shared: Arc<Shared<T>>, deliver: Box<dyn Deliver<T>>) {
         // Next item, or stop.
         let item = {
             let mut st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            // Asked the hook for waiting items since the last wake-up.
+            let mut refilled = false;
             loop {
                 let stopping = st.stop_at.is_some_and(|t| Instant::now() >= t);
                 if stopping {
@@ -595,7 +612,28 @@ fn run<T: QueueItem>(shared: Arc<Shared<T>>, deliver: Box<dyn Deliver<T>>) {
                 if st.stop_at.is_some() {
                     return; // stopping and nothing left
                 }
+                if !refilled {
+                    // Empty: take the next items waiting elsewhere, if any (SR-93). Outside
+                    // the lock, since the hook may read from disk.
+                    refilled = true;
+                    drop(st);
+                    let more = shared.refill();
+                    st = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if !more.is_empty() {
+                        let (since, since_wall) = (Instant::now(), SystemTime::now());
+                        for item in more.into_iter().rev() {
+                            st.queue.push_front(Queued {
+                                item,
+                                since,
+                                since_wall,
+                            });
+                        }
+                        shared.gauges(&st);
+                    }
+                    continue;
+                }
                 st = shared.wake.wait(st).unwrap_or_else(|e| e.into_inner());
+                refilled = false;
             }
         };
         let mut attempt = item.item.attempts();

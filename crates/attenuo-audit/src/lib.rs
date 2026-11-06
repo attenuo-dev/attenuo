@@ -35,7 +35,9 @@ pub mod shipped;
 pub mod spans;
 pub mod sqlite;
 
-pub use approval::{Approval, ApprovalLabel, ApprovalMethod, ApprovalState, Approver};
+pub use approval::{
+    Approval, ApprovalLabel, ApprovalMethod, ApprovalState, Approver, MAX_PENDING_APPROVALS_PER_RUN,
+};
 pub use budget::{ChargeOutcome, CounterSummary, HopLimit};
 pub use checkpoint::{
     verify_with_checkpoints, BadCheckpoint, Checkpoint, CheckpointKeys, SignedVerifyReport, Start,

@@ -4,9 +4,10 @@
 //!
 //! The notifier (in `attenuo-server`) writes a row right after the approval change it
 //! describes was stored and recorded, delivers from its in-memory queue, and marks the row
-//! delivered or given up. On start it loads the rows still open and delivers them first, in
-//! insertion order. `event_id` is unique: it is derived from the approval id and the notice
-//! type, so a second notice of one type for one approval (an `approval.expired` found again
+//! delivered or given up. On start it delivers the rows still open, in insertion order, reading
+//! them in batches no larger than its queue ([`SqliteLeaseStore::outbox_open_between`]).
+//! `event_id` is unique: it is derived from the approval id and the notice type, so a second
+//! notice of one type for one approval (an `approval.expired` found again
 //! after a restart) is refused here instead of being sent twice.
 //!
 //! Times are Unix milliseconds (`INTEGER`), so that the pruning cutoff is a plain comparison.
@@ -70,6 +71,18 @@ fn ms(t: OffsetDateTime) -> i64 {
     i64::try_from(t.unix_timestamp_nanos() / 1_000_000).unwrap_or(i64::MAX)
 }
 
+/// One row of `SELECT id, event_id, kind, approval_id, body, attempts`.
+fn outbox_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxNotice> {
+    Ok(OutboxNotice {
+        id: r.get(0)?,
+        event_id: r.get(1)?,
+        kind: r.get(2)?,
+        approval_id: r.get(3)?,
+        body: r.get(4)?,
+        attempts: u32::try_from(r.get::<_, i64>(5)?).unwrap_or(u32::MAX),
+    })
+}
+
 const OPEN: &str = "delivered_at IS NULL AND given_up_at IS NULL";
 
 impl SqliteLeaseStore {
@@ -98,17 +111,41 @@ impl SqliteLeaseStore {
             "SELECT id, event_id, kind, approval_id, body, attempts FROM notice_outbox \
              WHERE {OPEN} ORDER BY id LIMIT ?1"
         ))?;
-        let rows = stmt.query_map([limit], |r| {
-            Ok(OutboxNotice {
-                id: r.get(0)?,
-                event_id: r.get(1)?,
-                kind: r.get(2)?,
-                approval_id: r.get(3)?,
-                body: r.get(4)?,
-                attempts: u32::try_from(r.get::<_, i64>(5)?).unwrap_or(u32::MAX),
-            })
-        })?;
+        let rows = stmt.query_map([limit], outbox_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The open notices with a row id in `(after, through]`, oldest first, at most `limit`.
+    /// The notifier reads the rows left open by the last process in batches of this, so that
+    /// none is dropped for lack of room in its queue, and never past the last row that was
+    /// open at start (`through`, [`Self::outbox_last_open_id`]), so that a notice stored
+    /// since, and queued directly, is not read a second time.
+    pub fn outbox_open_between(
+        &self,
+        after: i64,
+        through: i64,
+        limit: usize,
+    ) -> Result<Vec<OutboxNotice>, AuditError> {
+        let conn = self.conn.lock()?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT id, event_id, kind, approval_id, body, attempts FROM notice_outbox \
+             WHERE {OPEN} AND id > ?1 AND id <= ?2 ORDER BY id LIMIT ?3"
+        ))?;
+        let rows = stmt.query_map(params![after, through, limit], outbox_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The row id of the newest open notice, or `None` when none is open. An open row is
+    /// never pruned, and SQLite gives a new row an id above every id in the table, so a
+    /// notice stored after this was read has a higher id.
+    pub fn outbox_last_open_id(&self) -> Result<Option<i64>, AuditError> {
+        let conn = self.conn.lock()?;
+        Ok(conn.query_row(
+            &format!("SELECT max(id) FROM notice_outbox WHERE {OPEN}"),
+            [],
+            |r| r.get(0),
+        )?)
     }
 
     /// How many notices are open.
@@ -228,6 +265,44 @@ mod tests {
             approval_id: "a1",
             body,
         }
+    }
+
+    /// SR-93: the rows open at start are read in batches up to the newest one open then;
+    /// a row stored later is outside the range.
+    #[test]
+    fn open_rows_are_read_in_batches_up_to_the_last_open_at_start() {
+        let s = SqliteLeaseStore::open_in_memory().unwrap();
+        let t = OffsetDateTime::from_unix_timestamp(1_780_000_000).unwrap();
+        assert_eq!(s.outbox_last_open_id().unwrap(), None);
+        let ids: Vec<i64> = (0..5)
+            .map(|n| {
+                let e = format!("e{n}");
+                s.outbox_insert(notice(&e, b"{}"), t).unwrap().unwrap()
+            })
+            .collect();
+        assert!(s.outbox_delivered(ids[1], t).unwrap());
+        let through = s.outbox_last_open_id().unwrap().unwrap();
+        assert_eq!(through, ids[4]);
+        let later = s.outbox_insert(notice("late", b"{}"), t).unwrap().unwrap();
+        assert!(later > through);
+        let batch = |after| {
+            s.outbox_open_between(after, through, 2)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            batch(0),
+            vec![ids[0], ids[2]],
+            "the delivered row is skipped"
+        );
+        assert_eq!(batch(ids[2]), vec![ids[3], ids[4]]);
+        assert_eq!(
+            batch(ids[4]),
+            Vec::<i64>::new(),
+            "the later row is not read"
+        );
     }
 
     #[test]

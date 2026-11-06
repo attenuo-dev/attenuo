@@ -13,7 +13,8 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use time::OffsetDateTime;
 
 use super::approvals::{
-    add_approval_columns, approval_from_row, approval_in, approvals_for_call, APPROVAL_COLUMNS,
+    add_approval_columns, approval_from_row, approval_in, approvals_for_call, pending_of_run,
+    APPROVAL_COLUMNS,
 };
 use super::budgets::{counter_in, refund_in};
 use super::connection::{
@@ -1206,6 +1207,8 @@ impl LeaseStore for SqliteLeaseStore {
         {
             return Ok((existing, false));
         }
+        let pending = pending_of_run(&tx, &approval.chain_id, now)?;
+        rules::below_pending_cap(&approval.chain_id, pending)?;
         let mut stored = approval.clone();
         stored.state = ApprovalState::Pending;
         stored.approver = None;
