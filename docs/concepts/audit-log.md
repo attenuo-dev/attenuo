@@ -148,7 +148,7 @@ For every shipped checkpoint inside the export's range, the export must hold the
 ### Verifying in code
 
 ```python
-from attenuo.audit import verify_export
+from attenuo import verify_export
 
 report = verify_export("audit.jsonl", checkpoint_public_keys=jwks)  # jwks: GET /.well-known/jwks.json
 if not report.ok:

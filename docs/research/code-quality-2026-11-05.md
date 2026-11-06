@@ -184,13 +184,13 @@ Differences a user will notice:
 | Area | Python | TypeScript |
 |---|---|---|
 | Sync and async | `Client`, `AdminClient`, `TokenRefresher` plus `AsyncClient`, `AsyncAdminClient`, `AsyncTokenRefresher` | async only (idiomatic) |
-| Top-level exports | audit verification (`verify_export`, `parse_shipped`, `cross_check`), the MCP helpers (`mcp_url`, `mcp_headers`) and the DPoP helpers (`jwk_thumbprint`, `access_token_hash`, `NonceCache`) are reachable only from their submodules | all exported from the package root (`index.ts:33` and others) |
+| Top-level exports | audit verification (`verify_export`, `parse_shipped`, `cross_check`), the MCP helpers (`mcp_url`, `mcp_headers`) and the DPoP helpers (`jwk_thumbprint`, `access_token_hash`, `NonceCache`) are reachable only from their submodules (now exported from the root too, debt item 13) | all exported from the package root (`index.ts:33` and others) |
 | Error class names | `Denied`, `Unauthorized`, `ApprovalRequired`, `ApprovalNotGranted` | `DeniedError`, `UnauthorizedError`, `ApprovalRequiredError`, `ApprovalNotGrantedError` |
 | Capability builders | classes: `Capability(...)`, `Prefix`, `Equals`, `OneOf`, `Range` | functions: `capability()`, `prefix()`, `equals()`, `oneOf()`, `range()`, plus `parseCapability` / `formatCapability` |
 | Canonical JSON | the `rfc8785` package | its own `jcs.ts` with its own test vectors |
 | MCP transport | `mcp.py` supplies an `httpx.Auth` flow (`auth_flow`) | `mcpFetch`, a `fetch` wrapper |
 
-None of these is a missing feature. The export gap is the one to close: a Python user reading the TypeScript README will look for `attenuo.verify_export` and not find it.
+None of these is a missing feature. The export gap is the one to close: a Python user reading the TypeScript README will look for `attenuo.verify_export` and not find it. (Closed: debt item 13.)
 
 ## (i) Prioritised debt list
 
@@ -210,7 +210,7 @@ Effort: S under a day, M one to three days, L more. Risk is the chance of a beha
 | 10 | A `tests/common/mod.rs` for the server and the CLI (`fn attenuo()` ×11, `sha256_hex` ×12, `wait_for` ×3, the agent-config builders). Done (`chore/test-file-hygiene`: `attenuo` ×11 and `sha256_hex` ×3 in the CLI's, `sha256_hex` ×8, `agent_configs` ×9 and `wait_for` in the server's, `wait_for` ×2 in the audit crate's; `admin_policies.rs` keeps its own `sha256_hex`) | S | Low |
 | 11 | Narrow the server's `pub mod` surface (`server/src/lib.rs:46-59`) to what `main.rs` and the integration tests use, and give `src/jwks.rs` a name that says "issuer keys". Done (`chore/proxy-docs-server-surface`: `actor`, `clientauth`, `idp`, `replay` and `state` are `pub(crate)`; `src/jwks.rs` is `src/issuer_keys.rs`) | M | Low |
 | 12 | Adopt `missing_errors_doc` for core, token and policy (an `# Errors` section on each public fallible function) | M | Low. Done (`chore/policy-docs-errors-doc`: `#![warn(clippy::missing_errors_doc)]` on in all three; 68 sections at 439fc28, core 21, token 19, policy 28; the 253 of (g) count every crate) |
-| 13 | Python SDK: export audit verification, the MCP helpers and the DPoP helpers from the package root, as TypeScript does | S | Low (additive) |
+| 13 | Python SDK: export audit verification, the MCP helpers and the DPoP helpers from the package root, as TypeScript does | S | Low (additive). Done (`chore/python-sdk-exports`: all of `attenuo.audit.__all__`, the DPoP and MCP helpers, `capabilities_to_json` and `TOKEN_TYPE` are in the root and its `__all__`; `tests/test_root_exports.py` checks each is its submodule's object) |
 | 14 | `audit/src/lease.rs:1134,1152`: `get_or_insert_with` instead of `expect("set above")`; `policy/src/request.rs:204`: parse the fixed Cedar entity type names once | S | Low. Done (`chore/audit-docs-small-debt`: `Option::insert` in the memory store, four `LazyLock` type names in `request.rs`) |
 | 15 | Turn on `unreachable_pub` for the library crates so the `pub(crate)` cleanup on this branch stays done | S | Low |
 | 16 | `JcsError` to `thiserror` like every other error type in the workspace | S | Low. Done (`chore/debt-small`; messages unchanged) |
