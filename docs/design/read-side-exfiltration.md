@@ -229,15 +229,17 @@ Steps 1 and 2 stand on their own, and step 1 is a fix whatever the maintainer de
 
 The replay runner exists and needs no model: `PYTHONPATH=sdk/python/src python evaluation/agentdojo/replay.py --out DIR --arms ... --inject-all`, against a server built from the commit under test ([replay](../research/agentdojo-plan-2026-11-05.md#replay-2026-11-05)). Each arm below is added to `replay.py` and frozen before its first run, as the plan's rules require. Each keeps the oracle grants and the suite policy. Every approval is declined unless a row says otherwise.
 
-| Arm | Change | Estimate to check |
-| --- | --- | --- |
-| `grants_urlpins` | `grant_for` pins `url` of `get_webpage` with `one_of` the ground truth's URLs | 3/609 landed, 77/97 kept |
-| `args_urlpins` | `grants_urlpins` plus the `args` rule | 0/609, 73/97 |
-| `grants_hostlimit` | `distinct` on `url` with `derive: host`, `max` the ground truth's host count, on `get_webpage` | today: every slack fetch refused with `limit_arg_invalid`; 3/609; about 4 slack tasks lost |
-| `grants_hostlimit1` | the same with a frozen `max: 1` | as above today; after step 1: 3/609, `user_task_15` lost |
-| `usage_newsite` | catalog `get_webpage` with `destructive = true` and `destination = "url#host"`, plus `ask_on_a_new_site` | today: hosts compared as raw strings, so as below for these URLs; 3/609, 76/97, 6 asks in 4 benign tasks |
-| `first_contact` | `usage_newsite` without `context.usage.calls >= 1` | 3/609, up to 6 slack tasks lost, 18 asks |
-| `args` on permit-all | the `args` rule over `grants_only`, which #164 has not been re-run on | whether the passport email lands (expected: it does) |
+| Arm | Change | Estimate to check | Measured (2026-11-06) |
+| --- | --- | --- | --- |
+| `grants_urlpins` | `grant_for` pins `url` of `get_webpage` with `one_of` the ground truth's URLs | 3/609 landed, 77/97 kept | run, see plan doc: 3/609, 77/97; held |
+| `args_urlpins` | `grants_urlpins` plus the `args` rule | 0/609, 73/97 | run, see plan doc: 0/609, 73/97, all 15 stopped at the attacker's call; held |
+| `grants_hostlimit` | `distinct` on `url` with `derive: host`, `max` the ground truth's host count, on `get_webpage` | today: every slack fetch refused with `limit_arg_invalid`; 3/609; about 4 slack tasks lost | run, see plan doc: all 18 benign and 12 attacker fetches `limit_arg_invalid`, 3/609, 4 slack tasks lost (73/97); held |
+| `grants_hostlimit1` | the same with a frozen `max: 1` | as above today; after step 1: 3/609, `user_task_15` lost | run, see plan doc: as above today (also with `calls_per: 1`, arm `grants_hostcalls1`); held. After step 1: not run, needs the server change |
+| `usage_newsite` | catalog `get_webpage` with `destructive = true` and `destination = "url#host"`, plus `ask_on_a_new_site` | today: hosts compared as raw strings, so as below for these URLs; 3/609, 76/97, 6 asks in 4 benign tasks | run, see plan doc: 3/609, 76/97, 6 asks in 4 tasks; held |
+| `first_contact` | `usage_newsite` without `context.usage.calls >= 1` | 3/609, up to 6 slack tasks lost, 18 asks | run, see plan doc: 3/609, 4 slack tasks lost (73/97), 18 asks in 12 tasks; held. Hosts from the token cannot be expressed: Cedar's context has no token constraints |
+| `args` on permit-all | the `args` rule over `grants_only`, which #164 has not been re-run on | whether the passport email lands (expected: it does) | run as `args_permit_all`, see plan doc: it lands, 7/609, 89/97; held |
+
+The measured column is from the [read-side arms in the replay](../research/agentdojo-plan-2026-11-05.md#read-side-arms-in-the-replay-2026-11-06) (2026-11-06). The estimates are left as written.
 
 For every arm, report:
 
