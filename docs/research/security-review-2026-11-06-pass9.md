@@ -113,7 +113,7 @@ SR-91, SR-92 and SR-93 were proposed by this pass and fixed afterwards (`fix/sr9
 
 - `cargo deny check`: see the gate in the log entry for this pass.
 - `cargo audit` is not installed here (as in passes 1 to 8); CI runs `rustsec/audit-check`.
-- Fuzzing: `policy_context` (which covers `to_cedar_json` and the declared-type check, not yet `decimal`) ran for 120 s on nightly with no crash; the other targets were not run. Adding `ArgType::Decimal` and `Set<decimal>` to that target's catalog is a cheap follow-up.
+- Fuzzing: `policy_context` (which covers `to_cedar_json` and the declared-type check, not yet `decimal`) ran for 120 s on nightly with no crash; the other targets were not run. Adding `ArgType::Decimal` and `Set<decimal>` to that target's catalog is a cheap follow-up (done on `fuzz/policy-context-decimal`).
 
 ## Not covered
 
