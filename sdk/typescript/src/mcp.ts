@@ -7,7 +7,7 @@
  * A token bound to a key (DPoP) also needs a fresh proof per request: use `mcpFetch`.
  */
 
-import { DpopKey, NonceCache, presented, type DpopKeyLike } from "./dpop.js";
+import { DpopKey, NonceCache, presented, resendOnce, type DpopKeyLike } from "./dpop.js";
 import type { FetchLike } from "./http.js";
 import { bearer, type Token } from "./token.js";
 import { MCP_ACCEPT, normalizeBase } from "./wire.js";
@@ -54,17 +54,18 @@ export function mcpFetch(
     key ??= DpopKey.of(opts.dpopKey);
     const dpopKey = await key;
     const jwt = bearer(await token());
-    const send = async () => {
+    const headersNow = async () => {
       const headers = new Headers(init.headers);
       const auth = await presented(jwt, dpopKey, init.method ?? "GET", String(input), nonce.value);
       for (const [k, v] of Object.entries(auth)) headers.set(k, v);
-      return base(input, { ...init, headers });
+      return headers;
     };
-    let res = await send();
+    let res = await base(input, { ...init, headers: await headersNow() });
     const replayable = !(init.body instanceof ReadableStream);
     if (dpopKey !== undefined && (await nonce.update(res)) && replayable) {
       await res.body?.cancel();
-      res = await send();
+      const headers = await headersNow();
+      res = await resendOnce(() => base(input, { ...init, headers }));
       await nonce.update(res);
     }
     return res;

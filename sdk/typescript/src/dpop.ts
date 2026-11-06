@@ -230,6 +230,27 @@ export async function presented(
   return { authorization: `DPoP ${token}`, dpop: await key.proof(method, url, token, opts) };
 }
 
+/**
+ * Send the retry that follows a `use_dpop_nonce` refusal, and once more, unchanged, when `fetch`
+ * fails at the network level (a `TypeError`, such as undici's "other side closed").
+ *
+ * The refusal usually goes out before the server has read the request body, and the server then
+ * closes that keep-alive connection right after the 401 without saying so (no
+ * `Connection: close`). `fetch` puts the retry on the pooled connection unless the close has
+ * already reached it, so now and then the retry meets the close and fails. `send` must make the
+ * same request with the same headers each time, so the same DPoP proof: if the server did get
+ * the first copy, its `jti` is used and the second is refused as a replay, never acted on twice.
+ * An abort (a `DOMException`) is not resent.
+ */
+export async function resendOnce(send: () => Promise<Response>): Promise<Response> {
+  try {
+    return await send();
+  } catch (e) {
+    if (!(e instanceof TypeError)) throw e;
+    return send();
+  }
+}
+
 /** The latest `DPoP-Nonce` a server sent (RFC 9449 §8), for the next proof. */
 export class NonceCache {
   /** The nonce to put in the next proof, or undefined before the server sent one. */
