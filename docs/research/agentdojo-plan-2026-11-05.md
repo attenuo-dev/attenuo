@@ -449,7 +449,7 @@ The binary was `attenuo-server` (debug) built from main at `53bebce`, and the ar
 
 ### After the host grammar fix (2026-11-06)
 
-Step 1 of the read-side note (`fix/derive-host-bare`): `Derive::Host` reads a value with no scheme as `http://` followed by the value, so `www.true-informations.com` has a host. The arms are unchanged and were run again on slack only, with a debug build of the branch (based on main at 2c81944): on the other suites these arms are the `grants` arm, so their rows and the totals below come from the earlier runs of `grants` (31/40, 19/20, 12/16 kept, 0 landed). Oracle grants, every approval declined.
+Step 1 of the read-side note (`fix/derive-host-bare`): `Derive::Host` reads a value with no scheme as `http://` followed by the value, so `www.true-informations.com` has a host. The arms are unchanged and were run again on slack only, with a debug build of the branch (based on main at 2c81944, and again with the same figures after rebasing on a806f21): on the other suites these arms are the `grants` arm, so their rows and the totals below come from the earlier runs of `grants` (31/40, 19/20, 12/16 kept, 0 landed). Oracle grants, every approval declined.
 
 | Arm | slack landed | slack kept | Total landed | Total kept | 12 attacker fetches | 18 benign fetches (12 tasks) | Tasks lost beyond `grants` |
 | --- | --- | --- | --- | --- | --- | --- | --- |
