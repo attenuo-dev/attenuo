@@ -19,6 +19,7 @@ use crate::stage::Stage;
 /// The outcome of authorizing one call, plus the id of the audit record that was written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthDecision {
+    /// Whether the call may go upstream.
     pub decision: Decision,
     /// Short machine-readable reason (e.g. `capability_allow`, `policy_deny`, `lease_revoked`).
     pub reason: String,
@@ -67,6 +68,7 @@ pub struct ApprovalTicket {
 }
 
 impl AuthDecision {
+    /// An allow decision with this reason, recorded as `decision_id`.
     pub fn allow(reason: impl Into<String>, decision_id: Uuid) -> Self {
         Self {
             decision: Decision::Allow,
@@ -79,6 +81,7 @@ impl AuthDecision {
         }
     }
 
+    /// A deny decision with this reason, recorded as `decision_id`.
     pub fn deny(reason: impl Into<String>, decision_id: Uuid) -> Self {
         Self {
             decision: Decision::Deny,
@@ -115,6 +118,7 @@ impl AuthDecision {
         self
     }
 
+    /// Whether the decision lets the call through.
     pub fn is_allow(&self) -> bool {
         self.decision.is_allow()
     }
@@ -127,11 +131,14 @@ impl AuthDecision {
 /// logged at debug level and never returned (SR-17).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AuthError {
+    /// The request has no `Authorization: Bearer` header.
     #[error("missing bearer token")]
     MissingToken,
     /// The token verified but has expired.
     #[error("token has expired")]
     TokenExpired,
+    /// The token did not verify (signature, audience, issuer, `kid` or shape); the string is
+    /// the verifier's complaint, logged only.
     #[error("invalid token: {0}")]
     InvalidToken(String),
     /// The token is valid but a lease in its chain is revoked, expired or unknown. The string

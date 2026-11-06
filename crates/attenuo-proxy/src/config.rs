@@ -20,6 +20,7 @@ pub struct UpstreamConfig {
 }
 
 impl UpstreamConfig {
+    /// An upstream mounted at `/mcp/{name}` and forwarded to `url`.
     pub fn new(name: impl Into<String>, url: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -35,9 +36,12 @@ pub const DEFAULT_MAX_UPSTREAM_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Default for [`ProxyConfig::max_request_body_bytes`]: 4 MiB.
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 
+/// Everything the proxy needs to serve: its upstreams, its listen address, and its limits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProxyConfig {
+    /// The MCP servers the proxy fronts, each at `/mcp/{name}`.
     pub upstreams: Vec<UpstreamConfig>,
+    /// The address [`crate::serve`] binds.
     pub listen: SocketAddr,
     /// How often a long-lived response stream (the `GET` listen stream, or a `POST` answered
     /// with a streamed body such as SSE) is re-checked against lease state and token expiry.
@@ -132,6 +136,7 @@ fn default_true() -> bool {
 }
 
 impl ProxyConfig {
+    /// A config for these upstreams on `listen`, with every other setting at its default.
     pub fn new(listen: SocketAddr, upstreams: Vec<UpstreamConfig>) -> Self {
         Self {
             upstreams,

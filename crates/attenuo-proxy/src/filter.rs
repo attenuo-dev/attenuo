@@ -53,13 +53,18 @@ pub fn filter_tools_response(response: &mut Value, caps: &CapabilitySet, server:
 /// The four MCP list methods whose results the proxy filters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListKind {
+    /// `tools/list`.
     Tools,
+    /// `resources/list`.
     Resources,
+    /// `resources/templates/list`.
     ResourceTemplates,
+    /// `prompts/list`.
     Prompts,
 }
 
 impl ListKind {
+    /// Every list kind, in a fixed order.
     pub const ALL: [ListKind; 4] = [
         ListKind::Tools,
         ListKind::Resources,
@@ -247,6 +252,7 @@ pub struct ListFilter<'a> {
 }
 
 impl<'a> ListFilter<'a> {
+    /// A filter for the list requests in `pending`, checked against `caps` on `server`.
     pub fn new(pending: &'a [(Value, ListKind)], caps: &'a CapabilitySet, server: &'a str) -> Self {
         Self {
             pending,

@@ -161,8 +161,11 @@ impl StreamEndCause {
 /// What a stream is re-checked against, and how often.
 #[derive(Clone)]
 pub struct StreamGuard {
+    /// Asked [`Authorizer::check_active`] on every re-check.
     pub authorizer: Arc<dyn Authorizer>,
+    /// The chain the stream was opened under.
     pub chain: DelegationChain,
+    /// Time between re-checks; at least one millisecond.
     pub interval: Duration,
     /// Where the stream goes, for the audit record of its end; `None` records nothing.
     pub record: Option<StreamRecord>,
@@ -214,6 +217,7 @@ impl EndRecord {
 }
 
 impl StreamGuard {
+    /// Re-check `chain` through `authorizer` every `interval`, recording nothing.
     pub fn new(
         authorizer: Arc<dyn Authorizer>,
         chain: DelegationChain,

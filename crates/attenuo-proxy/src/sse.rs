@@ -60,6 +60,7 @@ impl Default for SseRewriter {
 }
 
 impl SseRewriter {
+    /// A rewriter that buffers at most [`MAX_EVENT_BYTES`] of an incomplete event.
     pub fn new() -> Self {
         Self::with_limit(MAX_EVENT_BYTES)
     }
@@ -335,6 +336,7 @@ impl Default for SseFramer {
 }
 
 impl SseFramer {
+    /// A framer that buffers at most [`MAX_EVENT_BYTES`] of an incomplete event.
     pub fn new() -> Self {
         Self::with_limit(MAX_EVENT_BYTES)
     }

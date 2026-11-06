@@ -41,8 +41,11 @@ pub const DEFAULT_MAX_SESSIONS_PER_PRINCIPAL: usize = 64;
 /// Who a session belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionOwner {
+    /// The originating user's subject.
     pub subject: String,
+    /// The originating user's issuer.
     pub issuer: String,
+    /// The root lease of the chain that opened the session.
     pub root_lease: LeaseId,
 }
 
@@ -186,6 +189,7 @@ impl Default for SessionRegistry {
 }
 
 impl SessionRegistry {
+    /// A registry whose bindings last `ttl` since last use, holding at most `max` (at least one).
     pub fn new(ttl: Duration, max: usize) -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
@@ -259,10 +263,12 @@ impl SessionRegistry {
         self.lock().remove(session_id);
     }
 
+    /// How many bindings the registry holds, expired ones not yet swept included.
     pub fn len(&self) -> usize {
         self.lock().entries.len()
     }
 
+    /// Whether the registry holds no bindings.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
