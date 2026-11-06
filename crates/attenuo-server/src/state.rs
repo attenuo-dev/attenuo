@@ -94,6 +94,15 @@ pub struct AppState {
 impl AppState {
     /// Load keys, policies and storage as the config says.
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
+        Self::from_config_with_clock(config, attenuo_core::clock::system_clock())
+    }
+
+    /// [`AppState::from_config`], reading the time from `clock`: the request checks and the
+    /// approval notifier's expiry watcher ([`crate::build_with_clock`]).
+    pub(crate) fn from_config_with_clock(
+        config: &Config,
+        clock: Arc<dyn attenuo_core::Clock>,
+    ) -> anyhow::Result<Self> {
         config.check_server_names()?;
         config.server.check_public_url()?;
         config.check_admin_token()?;
@@ -162,6 +171,7 @@ impl AppState {
                 cfg,
                 metrics.clone(),
                 leases.clone(),
+                clock.clone(),
             )?),
             None => None,
         };
@@ -287,7 +297,7 @@ impl AppState {
             sink_fails_readiness: config.audit.sink.as_ref().is_some_and(|s| s.fail_readiness),
             approvals_client_id: config.approvals.client_id.clone(),
             approval_notifier,
-            clock: attenuo_core::clock::system_clock(),
+            clock,
         })
     }
 

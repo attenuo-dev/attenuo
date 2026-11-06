@@ -96,9 +96,7 @@ pub fn build_with_clock(
     config: &Config,
     clock: Arc<dyn attenuo_core::Clock>,
 ) -> anyhow::Result<(Router, Arc<AppState>)> {
-    let mut state = AppState::from_config(config)?;
-    state.clock = clock;
-    let state = Arc::new(state);
+    let state = Arc::new(AppState::from_config_with_clock(config, clock)?);
     let router = router(state.clone(), config.upstreams.clone(), config);
     Ok((router, state))
 }
