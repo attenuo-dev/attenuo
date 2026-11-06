@@ -162,6 +162,11 @@ impl std::fmt::Display for Derive {
 /// Split an argument reference as records and catalogs write it: `url#host` is the host of
 /// argument `url` ([`Derive`]), anything without `#` is the argument itself. A `#` followed by
 /// anything but a known derivation, or with nothing before it, is an error.
+///
+/// # Errors
+///
+/// A message naming `s` when the text after the last `#` is not a known derivation (only
+/// `host` is), or when nothing comes before the `#`.
 pub fn parse_arg_ref(s: &str) -> Result<(String, Option<Derive>), String> {
     match s.rsplit_once('#') {
         None => Ok((s.to_string(), None)),
@@ -412,6 +417,11 @@ impl Limits {
     /// constraint, if any, lets be a
     /// non-negative integer (otherwise no call could ever be charged and the limit is a
     /// mistake). Negative or fractional maxima cannot be written: they do not deserialize.
+    ///
+    /// # Errors
+    ///
+    /// The first [`LimitError`] found, in the order above, with `cap`'s display form, the
+    /// offending limit's kind and what is wrong with it.
     pub fn validate(&self, cap: &Capability) -> Result<(), LimitError> {
         let err = |kind, detail: String| LimitError {
             capability: cap.display(),
@@ -581,6 +591,13 @@ pub struct LimitArgError {
 /// `calls_per` and `distinct` on a list-valued argument, one per distinct element; a list of
 /// more than [`MAX_COUNTED_VALUES`] elements is refused). Ordered
 /// by hop, then capability index, then kind. Empty when no limit in the chain matches.
+///
+/// # Errors
+///
+/// [`LimitArgError`] when the call is permitted by a limited capability but the argument one
+/// of its limits counts is missing or null, is not an amount ([`amount_of`]) for a `sum`,
+/// is a list of more than [`MAX_COUNTED_VALUES`] elements for `calls_per` or `distinct`,
+/// or, for a `#host` limit, has a value that is not an absolute URL with a host.
 pub fn charges_for(chain: &DelegationChain, call: &ToolCall) -> Result<Vec<Charge>, LimitArgError> {
     let mut out = Vec::new();
     for (hop_index, hop) in chain.hops.iter().enumerate() {

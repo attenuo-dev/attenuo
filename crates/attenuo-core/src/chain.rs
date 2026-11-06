@@ -91,6 +91,15 @@ pub struct DelegationChain {
 
 impl DelegationChain {
     /// Start a chain: the first agent receives `capabilities` directly from the user's grant.
+    ///
+    /// # Errors
+    ///
+    /// [`ChainError::EmptySubject`], [`ChainError::EmptyAgentId`] or [`ChainError::EmptyLeaseId`]
+    /// for an empty subject, agent or lease id; [`ChainError::AttenuationViolated`] (with
+    /// [`AttenuationError::Empty`](crate::AttenuationError::Empty)) for an empty capability set;
+    /// [`ChainError::InvalidName`] or [`ChainError::InvalidLimit`] for a capability that fails
+    /// [`CapabilitySet::validate`] or [`CapabilitySet::validate_limits`]; and
+    /// [`ChainError::TtlOutOfRange`] when `now + ttl` is not a representable time.
     pub fn root(
         originating_user: OriginatingUser,
         agent: AgentId,
@@ -140,6 +149,15 @@ impl DelegationChain {
     /// ([`ChainError::DuplicateAgent`]), if `agent` or `lease` is empty or `lease` is already
     /// used, or if the chain is currently invalid. The new hop's expiry is clamped to its
     /// parent's so a child can never outlive its parent.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`validate_at`](Self::validate_at) reports for the chain as it is; then, for the
+    /// new hop: [`ChainError::TooDeep`], [`ChainError::EmptyAgentId`],
+    /// [`ChainError::EmptyLeaseId`], [`ChainError::DuplicateAgent`],
+    /// [`ChainError::DuplicateLease`], [`ChainError::InvalidName`], [`ChainError::InvalidLimit`],
+    /// and [`ChainError::AttenuationViolated`] when the last hop does not cover `requested`. A
+    /// `ttl` too large to add is not an error: the expiry is the parent's.
     pub fn extend(
         &self,
         agent: AgentId,
@@ -224,6 +242,11 @@ impl DelegationChain {
     ///
     /// `issued_at` is not compared with `now`: chains are validated at arbitrary times (tests,
     /// replays of the audit log), and a chain from a token was stamped by the issuer's clock.
+    ///
+    /// # Errors
+    ///
+    /// The first broken invariant from the list above, as its [`ChainError`] variant, carrying
+    /// the hop's position.
     pub fn validate_at(&self, now: OffsetDateTime, max_depth: usize) -> Result<(), ChainError> {
         if self.originating_user.subject.is_empty() {
             return Err(ChainError::EmptySubject);
