@@ -9,7 +9,7 @@
 
 Measured on `main` at 5b85f43 (#190), against the figures above from bd4f8dd. The commands are the ones in [How the numbers were produced](#what-was-fixed-on-this-branch) at the end of the report; source lines are `wc -l` over `crates/<crate>/src/**/*.rs`. The findings below this section keep their 2026-11-05 wording; lines that had become wrong are corrected in place and marked "(updated 2026-11-06)".
 
-The night closed fifteen of the sixteen debt items and most of the sixteenth. The two large files are split (`sqlite.rs` into nine submodules, the largest 1,497 lines; `authz.rs` into ten, the largest 1,314), every library crate now warns on `missing_docs` and `unreachable_pub`, the server and the bench library included (`missing_docs` there since `docs/server-missing-docs`, which documented 121 server and 122 bench items), the three cast lints are on in the six library crates and leave no hit in any library source, and `missing_errors_doc` is on in core, token and policy with no hit left there. The duplicated `Authorization` parser and JSON-RPC codes moved to core, the `AuditError` mapping is one function, the review-pass test files have feature names and the server and CLI share test helpers. What remains: debt item 8's last sleeps (the notifier tests, the 1 s stream re-check in `e2e.rs`, the eight-tick listen-stream test and the audit workload sleeps); `missing_errors_doc` outside the three gateway crates (184, all in audit, server, proxy and bench sources); and the cast lints in test targets and the bench library, which no crate attribute covers (34 hits). The server grew by 2,571 source lines since bd4f8dd, mostly the approval notifier (`notify.rs`, 1,006 lines, and the sink queue made generic for it) and its config; with `authz.rs` split, `config.rs` (2,876) is now the largest file in the workspace.
+The night closed fifteen of the sixteen debt items and most of the sixteenth. The two large files are split (`sqlite.rs` into nine submodules, the largest 1,497 lines; `authz.rs` into ten, the largest 1,314), every library crate now warns on `missing_docs` and `unreachable_pub`, the server and the bench library included (`missing_docs` there since `docs/server-missing-docs`, which documented 121 server and 122 bench items), the three cast lints are on in the six library crates and leave no hit in any library source, and `missing_errors_doc` is on in every library crate with no hit left (core, token and policy first; audit, proxy, server and bench since `docs/missing-errors-doc`, which wrote 183 `# Errors` sections, updated 2026-11-06). The duplicated `Authorization` parser and JSON-RPC codes moved to core, the `AuditError` mapping is one function, the review-pass test files have feature names and the server and CLI share test helpers. What remains: debt item 8's last sleeps (the notifier tests, the 1 s stream re-check in `e2e.rs`, the eight-tick listen-stream test and the audit workload sleeps); and the cast lints in test targets and the bench library, which no crate attribute covers (34 hits). The server grew by 2,571 source lines since bd4f8dd, mostly the approval notifier (`notify.rs`, 1,006 lines, and the sink queue made generic for it) and its config; with `authz.rs` split, `config.rs` (2,876) is now the largest file in the workspace.
 
 ### Crate sizes (source lines under `src/`)
 
@@ -49,10 +49,10 @@ From `grep -n 'warn(' crates/*/src/lib.rs` and `cargo clippy --workspace --lib -
 | `attenuo-core` | 98 / 0 | on | on | on | on | 0 |
 | `attenuo-token` | 18 / 0 | on | on | on | on | 0 |
 | `attenuo-policy` | 93 / 0 | on | on | on | on | 0 |
-| `attenuo-audit` | 62 / 0 | on | on | off | on | 0 |
-| `attenuo-proxy` | 41 / 0 | on | on | off | on | 0 |
-| `attenuo-server` | 141 / 120 (121 at 2c81944, then 0) | on | on | off | on | 0 |
-| `attenuo-bench` (lib) | 122 / 122 (then 0) | on | on | off | off | 0 |
+| `attenuo-audit` | 62 / 0 | on | on | on | on | 0 |
+| `attenuo-proxy` | 41 / 0 | on | on | on | on | 0 |
+| `attenuo-server` | 141 / 120 (121 at 2c81944, then 0) | on | on | on | on | 0 |
+| `attenuo-bench` (lib) | 122 / 122 (then 0) | on | on | on | off | 0 |
 | `attenuo-cli` (bin, `main.rs`) | 0 / 0 | on | on | off | off | 0 (105, 106 with the test target, at a806f21) |
 
 `attenuo-cli` is a binary only; its attributes sit in `main.rs`. `missing_docs` finds nothing there (a binary exports no item). `unreachable_pub` found 105 `pub` items in its modules at a806f21, plus one more in the test target (the `#[cfg(test)]` `policy_cmd::lint`); since `chore/cli-unreachable-pub` all 106 are `pub(crate)` and `main.rs` warns on both lints (updated 2026-11-06). Since `docs/server-missing-docs` the server and the bench library warn on `missing_docs` as well, and so does the server's `main.rs` (with `unreachable_pub`; no hit). That branch documented the 121 server items found at 2c81944 (the fields and variants of the `pub` modules the tests reach, the route handlers and request bodies, the sink and notifier methods) and the 122 bench items (the report rows and the subcommand options), and made none `pub(crate)`. ADR-0004 still promises neither crate as an API.
@@ -85,7 +85,7 @@ Server surface at 5b85f43 (`crates/attenuo-server/src/lib.rs`): `pub mod` `admin
 | `cast_sign_loss` | 20 | 5 |
 | `unchecked_time_subtraction` | 3 | 3 |
 
-Where the three adopted lints still fire: `missing_errors_doc` 184, all in library sources of crates that do not enable it (audit 100, server 73, proxy 6, bench 5), none in core, token or policy. The 34 cast hits are in integration tests and benches (audit 19, server 7, core 1, CLI 1) and in the bench library (6), none in the source of a crate that enables the lints: a `#![warn]` in `lib.rs` does not reach a crate's `tests/` and `benches/` targets. `unchecked_time_subtraction` is still 3, at `server/src/sink.rs:173`, `proxy/src/session.rs:356` and `bench/src/exchange.rs:1718`; it was recommended in (g) but not adopted.
+Where the three adopted lints still fire: `missing_errors_doc` 184 at 5b85f43, all in library sources of crates that did not enable it (audit 100, server 73, proxy 6, bench 5), none in core, token or policy. Update (`docs/missing-errors-doc`, 2026-11-06): the lint is on in audit, proxy, server and bench too, and the 183 hits it found at 77cc0a4 (audit 102, server 70, proxy 6, bench 5) each have an `# Errors` section, so none is left in any library source; the CLI and the server and bench binaries export nothing, so it finds nothing there and is not enabled. The 34 cast hits are in integration tests and benches (audit 19, server 7, core 1, CLI 1) and in the bench library (6), none in the source of a crate that enables the lints: a `#![warn]` in `lib.rs` does not reach a crate's `tests/` and `benches/` targets. `unchecked_time_subtraction` is still 3, at `server/src/sink.rs:173`, `proxy/src/session.rs:356` and `bench/src/exchange.rs:1718`; it was recommended in (g) but not adopted.
 
 ### Debt table, state on 2026-11-06
 
@@ -102,7 +102,7 @@ Where the three adopted lints still fire: `missing_errors_doc` 184, all in libra
 | 9 | Feature-named test files | Done | #174 |
 | 10 | Shared test helpers | Done | #174 |
 | 11 | Narrow the server's `pub mod` surface | Done | #172; `unreachable_pub` on the server in #183 |
-| 12 | `missing_errors_doc` on core, token, policy | Done | #173 |
+| 12 | `missing_errors_doc` on core, token, policy | Done | #173; audit, proxy, server and bench on `docs/missing-errors-doc` |
 | 13 | Python SDK root exports | Done | `chore/debt-small`, #176 |
 | 14 | `expect("set above")` and the Cedar type names | Done | #171 |
 | 15 | `unreachable_pub` on the library crates | Done | #177, #183 |
