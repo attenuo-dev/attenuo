@@ -60,8 +60,11 @@ export class DeniedError extends AttenuoError {
  * `approvalId` names the pending approval: show it to the user, who grants it with their own
  * sign-in (`POST /approvals/{id}`), or an operator grants it. Then retry the identical call once
  * (`waitForApproval` and `callToolWithApproval` do this). `approvalId` is undefined when the
- * server could not open an approval; the call is then simply denied. `callHash` is the RFC 8785
- * hash of the call the approval is bound to.
+ * server could not open an approval, among others when the run already has as many pending
+ * approvals as the server keeps for one run (32; its diagnostic is
+ * `"too many pending approvals for this run"`). The call is then simply denied, and
+ * `callToolWithApproval` throws this error at once, without calling `onApproval`. `callHash` is
+ * the RFC 8785 hash of the call the approval is bound to.
  */
 export class ApprovalRequiredError extends DeniedError {
   constructor(
