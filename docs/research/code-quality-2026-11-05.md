@@ -5,6 +5,120 @@
 - Standard: [ADR-0004](../decisions/0004-rust-workspace-layout.md) and [the server design](../design/server.md). The goal is consistency and less debt with no change in behaviour.
 - File:line references are to bd4f8dd unless a section says otherwise. The fixes made on this branch are listed in [What was fixed](#what-was-fixed-on-this-branch).
 
+## Addendum 2026-11-06: state after the overnight batch
+
+Measured on `main` at 5b85f43 (#190), against the figures above from bd4f8dd. The commands are the ones in [How the numbers were produced](#what-was-fixed-on-this-branch) at the end of the report; source lines are `wc -l` over `crates/<crate>/src/**/*.rs`. The findings below this section keep their 2026-11-05 wording; lines that had become wrong are corrected in place and marked "(updated 2026-11-06)".
+
+The night closed fifteen of the sixteen debt items and most of the sixteenth. The two large files are split (`sqlite.rs` into nine submodules, the largest 1,497 lines; `authz.rs` into ten, the largest 1,314), every library crate now warns on `missing_docs` and `unreachable_pub`, the server and the bench library warn on `unreachable_pub`, the three cast lints are on in the six library crates and leave no hit in any library source, and `missing_errors_doc` is on in core, token and policy with no hit left there. The duplicated `Authorization` parser and JSON-RPC codes moved to core, the `AuditError` mapping is one function, the review-pass test files have feature names and the server and CLI share test helpers. What remains: debt item 8's last sleeps (the notifier tests, the 1 s stream re-check in `e2e.rs`, the eight-tick listen-stream test and the audit workload sleeps); `missing_docs` on the server (120) and the bench (122), which ADR-0004 does not ask for; `missing_errors_doc` outside the three gateway crates (184, all in audit, server, proxy and bench sources); and the cast lints in test targets and the bench library, which no crate attribute covers (34 hits). The server grew by 2,571 source lines since bd4f8dd, mostly the approval notifier (`notify.rs`, 1,006 lines, and the sink queue made generic for it) and its config; with `authz.rs` split, `config.rs` (2,876) is now the largest file in the workspace.
+
+### Crate sizes (source lines under `src/`)
+
+| Crate | bd4f8dd | 5b85f43 | `.rs` files then / now |
+|---|---|---|---|
+| `attenuo-server` | 19,616 | 22,187 | 28 / 39 |
+| `attenuo-audit` | 9,507 | 10,074 | 13 / 22 |
+| `attenuo-proxy` | 8,211 | 9,048 | 14 / 16 |
+| `attenuo-policy` | 6,141 | 7,522 | 8 / 9 |
+| `attenuo-cli` | 7,219 | 7,224 | 9 / 9 |
+| `attenuo-core` | 5,739 | 6,482 | 11 / 14 |
+| `attenuo-bench` | 4,928 | 4,933 | 4 / 4 |
+| `attenuo-token` | 2,952 | 3,102 | 10 / 10 |
+| Total | 64,313 | 70,572 | 97 / 123 |
+
+### Largest files
+
+| bd4f8dd | Lines | 5b85f43 | Lines |
+|---|---|---|---|
+| `audit/src/sqlite.rs` | 5,237 | `server/src/config.rs` | 2,876 |
+| `server/src/authz.rs` | 3,717 | `proxy/src/proxy.rs` | 2,133 |
+| `server/src/config.rs` | 2,538 | `audit/src/lease.rs` | 2,111 |
+| `audit/src/lease.rs` | 2,102 | `policy/src/testing.rs` | 2,099 |
+| `proxy/src/proxy.rs` | 1,993 | `bench/src/exchange.rs` | 1,891 |
+| `policy/src/testing.rs` | 1,913 | `cli/src/cli.rs` | 1,748 |
+| `bench/src/exchange.rs` | 1,891 | `policy/src/request.rs` | 1,587 |
+| `cli/src/cli.rs` | 1,748 | `core/src/limits.rs` | 1,579 |
+
+The split files at 5b85f43: `audit/src/sqlite.rs` 70, and under `sqlite/` `leases.rs` 1,497, `log.rs` 1,418, `tests.rs` 1,003, `wal.rs` 579, `connection.rs` 320, `budgets.rs` 278, `outbox.rs` 270 (the notifier outbox, added after the split), `schema.rs` 187, `approvals.rs` 100. `server/src/authz.rs` 108, and under `authz/` `pipeline.rs` 1,314, `budget_tests.rs` 553, `authorizer.rs` 401, `arg_taint_tests.rs` 363, `run_lock_tests.rs` 355, `budgets.rs` 288, `tests.rs` 285, `usage_tracking_tests.rs` 190, `usage.rs` 51, `labels.rs` 47.
+
+### Crate-level lints and the public surface
+
+From `grep -n 'warn(' crates/*/src/lib.rs` and `cargo clippy --workspace --lib -- -A clippy::all -W missing_docs -W unreachable_pub`:
+
+| Crate | `missing_docs` hits bd4f8dd / 5b85f43 | `#![warn(missing_docs)]` | `#![warn(unreachable_pub)]` | `missing_errors_doc` | cast lints | `unreachable_pub` hits now |
+|---|---|---|---|---|---|---|
+| `attenuo-core` | 98 / 0 | on | on | on | on | 0 |
+| `attenuo-token` | 18 / 0 | on | on | on | on | 0 |
+| `attenuo-policy` | 93 / 0 | on | on | on | on | 0 |
+| `attenuo-audit` | 62 / 0 | on | on | off | on | 0 |
+| `attenuo-proxy` | 41 / 0 | on | on | off | on | 0 |
+| `attenuo-server` | 141 / 120 | off | on | off | on | 0 |
+| `attenuo-bench` (lib) | 122 / 122 | off | on | off | off | 0 |
+
+`attenuo-cli` is a binary only and has none of these attributes. The server and the bench do not warn on `missing_docs`: ADR-0004 does not promise either as an API, and the 120 server hits are the fields and variants of the `pub` modules the tests reach.
+
+Server surface at 5b85f43 (`crates/attenuo-server/src/lib.rs`): `pub mod` `admin_ui`, `authz`, `config`, `dpop`, `error`, `metrics`, `notify`, `routes` and `sink`, each but `config` with a comment naming its outside user (integration tests, the benches' `result_digest`, the fuzz targets); `pub(crate) mod` `actor`, `clientauth`, `idp`, `issuer_keys`, `replay` and `state`. The root re-exports `Pipeline`, `PipelineDecision` and `ServerAuthorizer` from `authz`, `Config` and `AppState` (so `AppState` is public while its module is not), and has the public functions `build`, `build_with_clock`, `router`, `serve`, `serve_until`, `shutdown_signal`, `spawn_checkpointer`, `spawn_lease_maintenance` and the three `prune_*` passes, with five constants for the maintenance and shutdown periods. `notify` (the approval notifier, #168) is the one `pub` module added since the report. Since #183 the server warns on `unreachable_pub`, so an item inside the six crate-private modules cannot be marked `pub` again without a warning.
+
+### Clippy pedantic
+
+`cargo clippy --workspace --all-targets --message-format=json -- -W clippy::pedantic`, deduplicated by lint, file and line as before: 1,679 at bd4f8dd, 1,636 at 5b85f43. By crate, then / now: server 494 / 503, audit 264 / 259, proxy 232 / 239, core 170 / 143, policy 160 / 151, CLI 135 / 136, bench 122 / 122, token 102 / 83. The total fell less than the fixed lints suggest because the code grew by about 6,000 lines.
+
+| Lint | bd4f8dd | 5b85f43 |
+|---|---|---|
+| `must_use_candidate` | 339 | 349 |
+| `missing_errors_doc` | 253 | 184 |
+| `doc_markdown` | 231 | 245 |
+| `assert_is_empty` | 99 | 104 |
+| `format_push_string` | 92 | 94 |
+| `return_self_not_must_use` | 73 | 77 |
+| `semicolon_if_nothing_returned` | 57 | 69 |
+| `cast_precision_loss` | 58 | 58 |
+| `too_many_lines` | 45 | 47 |
+| `redundant_closure_for_method_calls` | 36 | 47 |
+| `default_trait_access` | 41 | 45 |
+| `needless_pass_by_value` | 38 | 40 |
+| `unreadable_literal` | 33 | 34 |
+| `map_unwrap_or` | 24 | 25 |
+| `missing_panics_doc` | 23 | 24 |
+| `cast_possible_truncation` | 42 | 21 |
+| `cast_possible_wrap` | 27 | 8 |
+| `cast_sign_loss` | 20 | 5 |
+| `unchecked_time_subtraction` | 3 | 3 |
+
+Where the three adopted lints still fire: `missing_errors_doc` 184, all in library sources of crates that do not enable it (audit 100, server 73, proxy 6, bench 5), none in core, token or policy. The 34 cast hits are in integration tests and benches (audit 19, server 7, core 1, CLI 1) and in the bench library (6), none in the source of a crate that enables the lints: a `#![warn]` in `lib.rs` does not reach a crate's `tests/` and `benches/` targets. `unchecked_time_subtraction` is still 3, at `server/src/sink.rs:173`, `proxy/src/session.rs:356` and `bench/src/exchange.rs:1718`; it was recommended in (g) but not adopted.
+
+### Debt table, state on 2026-11-06
+
+| # | Item | State | Where |
+|---|---|---|---|
+| 1 | `AuditError` to `ApiError` in one place | Done | `fix/hardening-small`, `chore/audit-error-mapping` (#187) |
+| 2 | ADR-0004 up to date | Done | `chore/debt-small`, `docs/adr-0004-refresh` (#186) |
+| 3 | One `Authorization` parser | Done | `chore/authz-parser-favicon` (#169) |
+| 4 | `missing_docs` on proxy, audit, policy | Done | #171, #172, #173 |
+| 5 | Cast lints | Done in the six library crates | `fix/hardening-small` (server, policy), `chore/debt-small` (core, token, audit), `fix/proxy-followups` (proxy). State on 2026-11-06: not on in the bench library (6 hits) or the CLI, and 28 hits remain in test targets |
+| 6 | JSON-RPC codes shared | Done | `chore/authz-parser-favicon` (#169) |
+| 7 | Split `sqlite.rs` and `authz.rs` | Done | #175, #180 |
+| 8 | Injectable clock for TTL and window tests | Mostly done | #170, #188. State on 2026-11-06: left are the notifier tests in `server/tests/approval_notifier.rs` (sleeps of 300 ms to 1.8 s), the 1 s stream re-check in `e2e.rs`, `an_untouched_listen_stream_keeps_flowing`, and the audit sleeps that are the workload under test; 12 integration test files still call `sleep(` |
+| 9 | Feature-named test files | Done | #174 |
+| 10 | Shared test helpers | Done | #174 |
+| 11 | Narrow the server's `pub mod` surface | Done | #172; `unreachable_pub` on the server in #183 |
+| 12 | `missing_errors_doc` on core, token, policy | Done | #173 |
+| 13 | Python SDK root exports | Done | `chore/debt-small`, #176 |
+| 14 | `expect("set above")` and the Cedar type names | Done | #171 |
+| 15 | `unreachable_pub` on the library crates | Done | #177, #183 |
+| 16 | `JcsError` to `thiserror` | Done | `chore/debt-small` |
+
+Nothing in the table is open as written; item 8 is the one with work left, and item 5's remainder (bench, CLI, test targets) is outside what the row asked.
+
+### Tests
+
+`cargo test --workspace` at 5b85f43, after touching every `lib.rs` and `main.rs`: 1,247 passed, 0 failed, 7 ignored, over 98 result lines (test binaries and doc-test runs), against 1,161 passed and 6 ignored at the report's branch. The seventh ignored test is `list_cost_by_mode` in `server/tests/list_screen.rs`, a measurement added with the list screen; it is the one `#[ignore]` without a reason string (the pedantic run's single `ignore_without_reason`). The other six are the probes section (f) names (three of them in `proxy/tests/listen_stream_cost.rs`).
+
+`#[test]` and `#[tokio::test]` attributes, unit (`src`) / integration (`tests/`), then and now: core 79/32 to 88/32, token 24/31 to 24/31, policy 44/62 to 53/76, audit 28/160 to 29/160, proxy 72/109 to 76/119, server 145/230 to 163/249, CLI 89/29 to 89/32, bench 20/5 to 20/5.
+
+### Duplicated logic (section d)
+
+Both open rows of section (d) closed in #169: the `Authorization` parser is `attenuo_core::authorization::token_of`, called by the proxy's and the server's `bearer_of`, and the JSON-RPC codes are `attenuo_core::jsonrpc`, re-exported by `attenuo_proxy::jsonrpc` and imported by the CLI. The test helpers closed in #174. The two `proptest_seed/mod.rs` copies are still byte-identical by design, and the `[proxy]` `default_*` functions in the server and the proxy still read the same constants.
+
 ## (a) Module layout against ADR-0004
 
 The workspace has eight members, not the seven ADR-0004 lists: `attenuo-bench` (load and hot-path measurement) is the extra one. Dependencies all point downward in the ADR's order. Two edges go beyond what the ADR's table names, and two crates have fewer edges than it names.
@@ -20,7 +134,7 @@ The workspace has eight members, not the seven ADR-0004 lists: `attenuo-bench` (
 | `attenuo-cli` | bin only: `cli`, `client`, `dpop_key`, `jwt`, `policy_cmd`, `render`, `secrets`, `watch` | core, token, audit, policy | Partly. The ADR says core and token. `audit` is used for offline `audit verify --file`; `policy` for `policy test` and `policy lint`, which run the real `PolicyEngine` locally. So "decides nothing" holds only for the online commands. |
 | `attenuo-bench` | `lib`, `exchange`, `hotpath`, `main` | none (spawns the binaries) | Not in the ADR. |
 
-Size outliers that a new contributor will notice first: `attenuo-audit/src/sqlite.rs` (5,237 lines), `attenuo-server/src/authz.rs` (3,717), `attenuo-server/src/config.rs` (2,538), `attenuo-audit/src/lease.rs` (2,102), `attenuo-proxy/src/proxy.rs` (1,993), `attenuo-policy/src/testing.rs` (1,913). The two `jwks` modules in the server (`src/jwks.rs` serves the issuer's own keys, `src/idp/jwks.rs` caches IdP keys) differ only by directory. (Renamed: `src/jwks.rs` is now `src/issuer_keys.rs`, debt item 11.)
+Size outliers that a new contributor will notice first: `attenuo-audit/src/sqlite.rs` (5,237 lines), `attenuo-server/src/authz.rs` (3,717), `attenuo-server/src/config.rs` (2,538), `attenuo-audit/src/lease.rs` (2,102), `attenuo-proxy/src/proxy.rs` (1,993), `attenuo-policy/src/testing.rs` (1,913). The two `jwks` modules in the server (`src/jwks.rs` serves the issuer's own keys, `src/idp/jwks.rs` caches IdP keys) differ only by directory. (Renamed: `src/jwks.rs` is now `src/issuer_keys.rs`, debt item 11.) (updated 2026-11-06: `sqlite.rs` and `authz.rs` are split into submodules, debt item 7; the sizes at 5b85f43 are in the addendum.)
 
 ## (b) Error handling
 
@@ -53,7 +167,7 @@ Counted with `cargo clippy --workspace --lib -- -W missing_docs -W unreachable_p
 
 `#![warn(missing_docs)]` readiness: core and token are now on, audit since `chore/audit-docs-small-debt`, proxy since `chore/proxy-docs-server-surface` and policy since `chore/policy-docs-errors-doc` (the 95 were mostly the AuthZEN wire types and the `testing` harness). Server and bench are not promised stable (ADR-0004), so the lint matters less there than narrowing their surface.
 
-Items that should be `pub(crate)`: the 19 `unreachable_pub` hits were methods on crate-private types (`audit/src/budget.rs:172-185`, `audit/src/spans.rs:53-66`, `proxy/src/label.rs` (12), `policy/src/schema.rs:250`); all are now `pub(crate)`. Update (`chore/unreachable-pub`, debt item 15): `#![warn(unreachable_pub)]` is on in core, token, policy, audit and proxy, so new hits fail `clippy -D warnings`; at 39b77ac it found one more, the test-only `AwaitedResults::len` in `proxy/src/label.rs`, now `pub(crate)`. Beyond the lint: every server module is `pub mod` (`server/src/lib.rs:46-59`) so the integration tests can reach `config`, `state` and `authz`. Much of `replay`, `clientauth` and `sink` is used only inside the crate. Narrowing them needs a look at what each test file imports, so it is listed as debt rather than done. Update (`chore/proxy-docs-server-surface`, debt item 11): `actor`, `clientauth`, `idp`, `replay`, `state` and the renamed `issuer_keys` are `pub(crate)`; the modules still `pub` are used by the integration tests, the benches, the fuzz targets, `main.rs` or the CLI, and say which in a comment. `sink` stays `pub` for the SigV4 test in `tests/checkpoint_sink.rs`.
+Items that should be `pub(crate)`: the 19 `unreachable_pub` hits were methods on crate-private types (`audit/src/budget.rs:172-185`, `audit/src/spans.rs:53-66`, `proxy/src/label.rs` (12), `policy/src/schema.rs:250`); all are now `pub(crate)`. Update (`chore/unreachable-pub`, debt item 15): `#![warn(unreachable_pub)]` is on in core, token, policy, audit and proxy, so new hits fail `clippy -D warnings`; at 39b77ac it found one more, the test-only `AwaitedResults::len` in `proxy/src/label.rs`, now `pub(crate)`. Beyond the lint: every server module is `pub mod` (`server/src/lib.rs:46-59`) so the integration tests can reach `config`, `state` and `authz`. Much of `replay`, `clientauth` and `sink` is used only inside the crate. Narrowing them needs a look at what each test file imports, so it is listed as debt rather than done. Update (`chore/proxy-docs-server-surface`, debt item 11): `actor`, `clientauth`, `idp`, `replay`, `state` and the renamed `issuer_keys` are `pub(crate)`; the modules still `pub` are used by the integration tests, the benches, the fuzz targets, `main.rs` or the CLI, and say which in a comment. `sink` stays `pub` for the SigV4 test in `tests/checkpoint_sink.rs`. (updated 2026-11-06: `config` carries no such comment, `notify` has joined the `pub` modules, and since #183 the server also warns on `unreachable_pub`; the module list at 5b85f43 is in the addendum.)
 
 ## (d) Duplicated logic
 
@@ -116,7 +230,7 @@ A scan that skips `#[cfg(test)]` items found 69 `unwrap`, `expect`, `unreachable
 
 (Counts are `#[test]` and `#[tokio::test]` attributes, so parameterised and proptest cases count once. The full run on this branch is 1,161 tests in 91 binaries, 6 ignored.)
 
-Conventions: unit tests are `#[cfg(test)] mod tests` at the end of the file, except `server/src/lib.rs`, which has `shutdown_tests` and `maintenance_tests`. Integration test files are mostly named after the feature (`leases.rs`, `approvals.rs`, `run_limits.rs`). Seven are named after the security review pass that added them instead: `proxy/tests/security.rs`, `security_pass3.rs`, `security_pass7.rs`, `security_pass7_sr81.rs`, `server/tests/security_pass3.rs`, `security_pass4.rs`, `security_low.rs`. A contributor looking for the tests of a feature has to know which pass found its bug. Only `attenuo-audit` has a shared `tests/common/mod.rs`; the server and CLI test files each build their own harness. Update (`chore/test-file-hygiene`, debt items 9 and 10): the seven, and the two pass 8 files added since (`proxy/tests/security_pass8.rs`, `security_pass8_sr87.rs`), are named after the feature, each with a module doc that lists its SR ids and its old name: proxy `hardening.rs`, `session_and_stream_guard.rs`, `sse_client_view.rs`, `refusal_record_window.rs`, `later_post_answers.rs`, `later_post_list_answers.rs`; server `hardening.rs`, `id_token_intake.rs`, `dpop_exchange.rs`. The two `hardening.rs` files are grab-bags of small findings (SR-01, 02, 03, 11, 17, 18 at the proxy; SR-17, 18, 19, 30, 34 at the server) that would otherwise scatter one test per file. The server and the CLI now have a `tests/common/mod.rs` too. The 6 ignored tests are measurement probes (`proxy/tests/listen_stream_cost.rs`, `audit/tests/{wal,single_client_outliers,write_contention}.rs`), each with a reason string.
+Conventions: unit tests are `#[cfg(test)] mod tests` at the end of the file, except `server/src/lib.rs`, which has `shutdown_tests` and `maintenance_tests`. Integration test files are mostly named after the feature (`leases.rs`, `approvals.rs`, `run_limits.rs`). Seven are named after the security review pass that added them instead: `proxy/tests/security.rs`, `security_pass3.rs`, `security_pass7.rs`, `security_pass7_sr81.rs`, `server/tests/security_pass3.rs`, `security_pass4.rs`, `security_low.rs`. A contributor looking for the tests of a feature has to know which pass found its bug. Only `attenuo-audit` has a shared `tests/common/mod.rs`; the server and CLI test files each build their own harness. Update (`chore/test-file-hygiene`, debt items 9 and 10): the seven, and the two pass 8 files added since (`proxy/tests/security_pass8.rs`, `security_pass8_sr87.rs`), are named after the feature, each with a module doc that lists its SR ids and its old name: proxy `hardening.rs`, `session_and_stream_guard.rs`, `sse_client_view.rs`, `refusal_record_window.rs`, `later_post_answers.rs`, `later_post_list_answers.rs`; server `hardening.rs`, `id_token_intake.rs`, `dpop_exchange.rs`. The two `hardening.rs` files are grab-bags of small findings (SR-01, 02, 03, 11, 17, 18 at the proxy; SR-17, 18, 19, 30, 34 at the server) that would otherwise scatter one test per file. The server and the CLI now have a `tests/common/mod.rs` too. The 6 ignored tests are measurement probes (`proxy/tests/listen_stream_cost.rs`, `audit/tests/{wal,single_client_outliers,write_contention}.rs`), each with a reason string. (updated 2026-11-06: a seventh, `list_cost_by_mode` in `server/tests/list_screen.rs`, has no reason string.)
 
 Tests that sleep or depend on wall-clock timing (the polling `wait_for` loops are left out):
 
@@ -169,7 +283,7 @@ One run: `cargo clippy --workspace --all-targets -- -W clippy::pedantic` at bd4f
 
 The three worth adopting (as `warn` in `[workspace.lints]` or per crate, with the existing hits fixed or allowed where they are deliberate):
 
-1. **`cast_possible_truncation`** (42), with `cast_possible_wrap` (27) and `cast_sign_loss` (20). For a reference monitor these are the casts that can turn a large value into a small one. Most hits are timing fields (`as_micros() as u64`) and are harmless. Two are on untrusted input and deserve a look: `server/src/idp/mod.rs:503` (`f as i64` on an IdP claim: saturates, and NaN becomes 0) and `policy/src/request.rs:57` (`f as i64` when translating an argument for Cedar, after a whole-number check).
+1. **`cast_possible_truncation`** (42), with `cast_possible_wrap` (27) and `cast_sign_loss` (20). For a reference monitor these are the casts that can turn a large value into a small one. Most hits are timing fields (`as_micros() as u64`) and are harmless. Two are on untrusted input and deserve a look: `server/src/idp/mod.rs:503` (`f as i64` on an IdP claim: saturates, and NaN becomes 0) and `policy/src/request.rs:57` (`f as i64` when translating an argument for Cedar, after a whole-number check). (updated 2026-11-06: adopted as debt item 5; both casts are now checked conversions.)
 2. **`unchecked_time_subtraction`** (3: `server/src/sink.rs:67`, `proxy/src/session.rs:350` in a test, `bench/src/exchange.rs:1718`). `Instant` and `Duration` subtraction panics on underflow. The count is small, so it costs nothing to keep at zero.
 3. **`missing_errors_doc`** (253), scoped to core, token and policy, the crates ADR-0004 calls the gateway integration surface. It asks for an `# Errors` section on every public function that returns `Result`, which is what a gateway author needs. It pairs with the `missing_docs` lint now on in core and token. Adopted in all three on `chore/policy-docs-errors-doc` (68 hits there at 439fc28).
 
@@ -200,10 +314,10 @@ Effort: S under a day, M one to three days, L more. Risk is the chance of a beha
 |---|---|---|---|
 | 1 | Centralise `AuditError` to `ApiError`: move the per-route domain mappings (`routes/approvals.rs:176-187`, `renew.rs:204`, `admin.rs:394`) into one function that routes call, so `?` on a domain variant cannot become a 500 | M | Medium: status codes are part of the API; the existing tests pin them. Done (`fix/hardening-small`: one `From<AuditError> for ApiError` in `server/src/error.rs` gives each variant its status, pinned by `every_audit_error_has_one_answer`; `chore/audit-error-mapping`: the approvals routes' unknown-approval 404s and the admin lease reads' unknown-lease 404s are built from it too, renewal keeps only its two lease-refusal arms over it, and `only_store_faults_answer_500` fails when a new variant is not classed as a store fault or a refusal) |
 | 2 | Bring ADR-0004 up to date: eight crates (bench), IdP intake and JWKS in the server, audit's dependency on token, the CLI's offline commands depending on audit and policy, no `RelationResolver`, the pipeline living in the server | S | Low (docs only). Done (`docs/adr-0004-refresh`: "Amendment 2026-11-06" in ADR-0004 with the crate graph from `cargo metadata` and the ten points of the original table that no longer hold; index row, server design and README crate row aligned) |
-| 3 | One `Authorization` scheme parser for the proxy and the server (`proxy/src/proxy.rs:224`, `server/src/routes/mod.rs:38`), each keeping its own error type | M | Medium: authentication parsing; needs the SR-17 tests to stay green |
+| 3 | One `Authorization` scheme parser for the proxy and the server (`proxy/src/proxy.rs:224`, `server/src/routes/mod.rs:38`), each keeping its own error type | M | Medium: authentication parsing; needs the SR-17 tests to stay green. Done (updated 2026-11-06; `chore/authz-parser-favicon`, #169: `attenuo_core::authorization::token_of`, called by both `bearer_of`, each keeping its error type) |
 | 4 | `#![warn(missing_docs)]` for `attenuo-proxy` (41) and `attenuo-audit` (62), then `attenuo-policy` (93) | M | Low. Done: audit (`chore/audit-docs-small-debt`: 70 items, lint on), proxy (`chore/proxy-docs-server-surface`: 60 items with the `testing` feature, 41 without, lint on), policy (`chore/policy-docs-errors-doc`: 95 items, lint on) |
-| 5 | Adopt `cast_possible_truncation` (and wrap and sign-loss), starting with the float-to-int casts on untrusted input (`server/src/idp/mod.rs:503`, `policy/src/request.rs:57`) | M | Medium for the two input casts, low elsewhere |
-| 6 | Move the JSON-RPC error codes the CLI needs (`-32003`, `-32008`) to a module both CLI and proxy can use (core, or a small shared constants module), so `cli/src/main.rs:36-38` stops duplicating `proxy/src/jsonrpc.rs` | S | Low |
+| 5 | Adopt `cast_possible_truncation` (and wrap and sign-loss), starting with the float-to-int casts on untrusted input (`server/src/idp/mod.rs:503`, `policy/src/request.rs:57`) | M | Medium for the two input casts, low elsewhere. Done (updated 2026-11-06): the two input casts are checked conversions and the three lints are on in server and policy (`fix/hardening-small`), core, token and audit (`chore/debt-small`) and proxy (`fix/proxy-followups`); not in the bench library or the CLI |
+| 6 | Move the JSON-RPC error codes the CLI needs (`-32003`, `-32008`) to a module both CLI and proxy can use (core, or a small shared constants module), so `cli/src/main.rs:36-38` stops duplicating `proxy/src/jsonrpc.rs` | S | Low. Done (updated 2026-11-06; `chore/authz-parser-favicon`, #169: `attenuo_core::jsonrpc`, re-exported by the proxy, imported by the CLI) |
 | 7 | Split `audit/src/sqlite.rs` (5,237 lines) into log, leases, budgets, approvals and maintenance submodules; then `server/src/authz.rs` (3,717) by pipeline stage | L | Medium: merge conflicts with any open branch; no behaviour change. Audit done (`chore/split-audit-sqlite`: `sqlite.rs` is 70 lines of module doc, re-exports and shared helpers; `sqlite/schema.rs`, `connection.rs`, `wal.rs`, `log.rs`, `leases.rs`, `budgets.rs`, `approvals.rs`, `tests.rs`, the largest 1,497 lines; public paths unchanged); server done (`chore/split-server-authz`: `authz.rs` is 108 lines of module doc, module declarations and re-exports; `authz/pipeline.rs`, `authorizer.rs`, `budgets.rs`, `labels.rs`, `usage.rs`, and the five unit test modules in files of the same names, the largest 1,314 lines; public paths and test paths unchanged) |
 | 8 | Replace wall-clock sleeps in TTL and window tests (`server/tests/approvals.rs:549`, `e2e.rs:1938`, `proxy/tests/session_limits.rs:196`, `proxy/tests/proxy.rs:1068`, `security_pass3.rs` (now `session_and_stream_guard.rs`) re-check waits) with an injectable clock, and turn the negative sleep in `audit/tests/presync.rs:136,159` into a deterministic check | M | Low; speeds up CI. Mostly done (`chore/injectable-clock`: `ManualClock` in the approval, window and session-TTL tests, a checkpointer barrier in `presync.rs`; `chore/deterministic-time-tests`: the stream guard reads the proxy's clock (`StreamGuard::with_clock`), so the two token-expiry stream tests advance a `ManualClock`, and the six re-check waits in `session_and_stream_guard.rs` are gone, each negative check made exact by waiting until the upstream has seen every guarded stream dropped; that binary 2.84 s to 0.96 s). Left: the notifier tests in `server/tests/approval_notifier.rs` (a 1 s approval TTL waited out, three "nothing else arrives" waits), since the notifier reads the system clock on its own thread; the 1 s stream re-check in `e2e.rs` (`stream_recheck_seconds` takes whole seconds); `an_untouched_listen_stream_keeps_flowing`, which must span eight real re-check ticks; and the audit sleeps that are the workload or the busy-handler backoff under test |
 | 9 | Rename or fold the seven review-pass test files (`security_pass3.rs` and the rest) into feature-named files, keeping the SR ids in test names or comments. Done (`chore/test-file-hygiene`: nine files renamed, the two pass 8 files included; module docs list the SR ids; the server's SR-30 and SR-34 server-name tests moved to `hardening.rs`; see section (f)) | S | Low |
