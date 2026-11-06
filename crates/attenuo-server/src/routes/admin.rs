@@ -975,8 +975,9 @@ pub async fn audit_verify(
 ///
 /// # Errors
 ///
-/// 500 `server_error` when the audit log cannot be read or written, when a stored checkpoint
-/// disagrees with the log at the head, or when no checkpoint signer is configured.
+/// 500 `server_error` when the audit log cannot be read or written, or when a stored checkpoint
+/// disagrees with the log at the head. (The audit crate's `NoCheckpointSigner` maps here too,
+/// but the server always builds its sink with a signer, so it cannot arise in practice.)
 pub async fn audit_checkpoint(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
     let cp = state
         .blocking(|s| s.audit.checkpoint_signed(s.now()))
