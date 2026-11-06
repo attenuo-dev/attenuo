@@ -80,7 +80,7 @@ One trace per proxied MCP request:
 | `attenuo.upstream` | client | `attenuo.server`, `http.response.status_code`, `attenuo.reason` (`upstream_unreachable`) |
 | `attenuo.response` | internal | none |
 | `attenuo.record_result` | internal | `attenuo.decision_id` of the call, `attenuo.result.label`, `attenuo.audit.seq` |
-| `attenuo.stream_end` | internal | `attenuo.reason`, `attenuo.decision_id` of the `stream.end` record |
+| `attenuo.stream_end` | internal | `attenuo.reason`, `attenuo.decision_id` and `attenuo.audit.seq` of the `stream.end` record |
 
 `POST /token` (`attenuo.token.exchange`, or `attenuo.token.root` for an IdP credential), `POST /token/renew` (`attenuo.token.renew`) and the AuthZEN routes (`attenuo.authzen.evaluate`, with an `attenuo.decide` child per evaluation) get one span each, with the method, the route template and the status code. Admin routes export nothing. The resource carries `service.name` and your `resource_attributes`.
 
@@ -102,7 +102,7 @@ This is enforced by construction. The exporter sees only spans in the `attenuo::
 
 ## From a span to the signed record, and back
 
-`attenuo.decide`, `attenuo.record_result` and `attenuo.stream_end` carry `attenuo.decision_id`, the id of the audit record, and the first two carry `attenuo.audit.seq`, its sequence number. From a span, open the record:
+`attenuo.decide`, `attenuo.record_result` and `attenuo.stream_end` carry `attenuo.decision_id`, the id of the audit record, and `attenuo.audit.seq`, its sequence number. From a span, open the record:
 
 ```sh
 curl -s -H "Authorization: Bearer $ATTENUO_ADMIN_TOKEN" \
@@ -116,4 +116,4 @@ From a record, search the tracing backend for the attribute `attenuo.decision_id
 
 Export is the one part of attenuo that fails open, and it never changes an answer. Finished spans go to a bounded queue drained by one thread; a full queue drops the span and counts it, so a slow or dead collector cannot slow a call. Export errors are logged once per outage and counted, never returned to a client or written to the audit log. `/readyz` ignores telemetry. An unreachable collector at start does not stop the server; a malformed `[telemetry]` section does. On shutdown the queue gets 5 seconds to drain after the requests have.
 
-Span overhead with sampling at 0, 0.1 and 1 has not been measured with `attenuo-bench` yet.
+Span overhead, measured on one decision in process ([design note, section 10](../design/otel-export.md#measured)): with `[telemetry]` off, within noise; on at the default ratio 0.1, 2 to 16 %; on at ratio 1, 30 to 95 µs per decision. The whole call through HTTP has not been measured with `attenuo-bench` yet.
