@@ -254,7 +254,7 @@ URL pins, host limits and the banking cap have been replayed only, and the `outb
 
 - The grants are oracles, derived from each task's ground truth, not written by a planner that sees only the prompt. A planner would write different grants, which could move utility either way and would lean more on the policy. Every figure under grants rests on this.
 - The replay has no model in the loop. It sends the attack's ground-truth arguments verbatim, after the task's calls, in one fixed order. A model may phrase the calls differently, order them differently, or never make them.
-- The samples are small. The runs with attenuo cover 10 workspace tasks, one run per pair, and the temperature cannot be set, so a difference of one or two tasks means little. Two of the three attacks share one template, none adapts, and an attacker who knows attenuo is in place is out of scope.
+- The samples are small. The runs with attenuo cover 10 workspace tasks on Sonnet and 40 on Haiku, one run per pair, and the temperature cannot be set, so a difference of one or two tasks means little. Two of the three attacks share one template, none adapts, and an attacker who knows attenuo is in place is out of scope.
 - The policies, catalog and grant rule were written by the people who built attenuo. Each arm was committed before its first run and not tuned after it, but several arms were added after earlier results had been read.
 - Raw outputs are not in the repository. Costs come from our own meter, which missed part of the spend outside Haiku ([plan, "Decisions needed"](../research/agentdojo-plan-2026-11-05.md#decisions-needed)).
 
