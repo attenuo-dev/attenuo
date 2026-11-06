@@ -15,6 +15,7 @@
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(unreachable_pub)]
 #![warn(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
