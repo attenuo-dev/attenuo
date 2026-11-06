@@ -562,6 +562,22 @@ def test_dpop_server_nonce(nonce_stack: Stack) -> None:
     admin.close()
 
 
+async def test_dpop_server_nonce_async(nonce_stack: Stack) -> None:
+    """The async client against the same server: its own nonce cache starts empty, so its first
+    call is refused, and the retry goes out on a new connection (see ``drop_connection``)."""
+    url = nonce_stack.url
+    key = DpopKey.generate()
+    with AdminClient(url, ADMIN_TOKEN) as admin:
+        root = admin.mint_root_dev(
+            "alice", "https://idp.example", "assistant", ["github:*"], dpop_key=key
+        )
+        async with AsyncClient(url, dpop_key=key) as ob:
+            res = await ob.call_tool(root, "github", "read_file", {"repo": "alice/public-docs"})
+            assert res.decision_id
+            assert (await ob.renew(root)).expires_in > 0
+        admin.revoke_lease(root.lease)
+
+
 def wait_for(cond: Callable[[], bool], seconds: float, what: str) -> None:
     deadline = time.monotonic() + seconds  # not time.time(): a clock step must not cut the wait
     while time.monotonic() < deadline:
