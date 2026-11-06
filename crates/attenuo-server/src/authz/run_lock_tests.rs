@@ -11,7 +11,7 @@ use attenuo_audit::{
 use attenuo_core::fingerprint::Fingerprint;
 use attenuo_core::limits::REASON_BUDGET_EXHAUSTED;
 use attenuo_core::{AgentId, Capability, CapabilitySet, Limits, OriginatingUser};
-use attenuo_core::{Charge, DelegationChain, LeaseId, LimitKind, ToolCall};
+use attenuo_core::{Charge, DelegationChain, LeaseId, LimitKind, ToolCall, WindowCharge};
 use attenuo_policy::{ArgType, PolicyEngineBuilder, ToolAttrs, ToolCatalog};
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -25,10 +25,13 @@ use time::OffsetDateTime;
 struct Rendezvous {
     inner: MemoryLeaseStore,
     readers: Mutex<usize>,
+    window_readers: Mutex<usize>,
     arrived: Condvar,
     /// Budget reads see empty counters, as if another process had not charged yet; only
     /// the store's charge transaction sees what was spent.
     stale: std::sync::atomic::AtomicBool,
+    /// Per-user windows cannot be read or charged (a store that lost them).
+    no_windows: std::sync::atomic::AtomicBool,
 }
 
 impl LeaseStore for Rendezvous {
@@ -196,6 +199,35 @@ impl LeaseStore for Rendezvous {
     fn refund(&self, d: &str, at: OffsetDateTime) -> Result<u64, AuditError> {
         self.inner.refund(d, at)
     }
+    fn window_used(&self, w: &[WindowCharge]) -> Result<Vec<u64>, AuditError> {
+        if self.no_windows.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(AuditError::Storage("windows lost".into()));
+        }
+        // Wait for a second reader, as `budget_used` does: two runs of one user both read
+        // their windows before either charges unless the user lock serialises them.
+        let mut readers = self.window_readers.lock().unwrap();
+        *readers += 1;
+        self.arrived.notify_all();
+        let (readers, _) = self
+            .arrived
+            .wait_timeout_while(readers, std::time::Duration::from_millis(300), |r| *r < 2)
+            .unwrap();
+        drop(readers);
+        self.inner.window_used(w)
+    }
+    fn charge_windowed(
+        &self,
+        d: &str,
+        c: &[Charge],
+        w: &[WindowCharge],
+        at: OffsetDateTime,
+        defer: bool,
+    ) -> Result<(ChargeOutcome, bool), AuditError> {
+        if self.no_windows.load(std::sync::atomic::Ordering::SeqCst) && !w.is_empty() {
+            return Err(AuditError::Storage("windows lost".into()));
+        }
+        self.inner.charge_windowed(d, c, w, at, defer)
+    }
     fn record_hop_limits(&self, l: &LeaseId, h: &[HopLimit]) -> Result<(), AuditError> {
         self.inner.record_hop_limits(l, h)
     }
@@ -216,16 +248,37 @@ fn run_with(
     limits: Limits,
     stale: bool,
 ) -> (Arc<Pipeline>, DelegationChain, OffsetDateTime) {
+    let (p, chain, now, _) = runs_with(policies, limits, stale, false);
+    (p, chain, now)
+}
+
+/// As [`run_with`], plus a second run (`l2`) of the same user; with `no_windows`, per-user
+/// windows cannot be read.
+fn runs_with(
+    policies: &str,
+    limits: Limits,
+    stale: bool,
+    no_windows: bool,
+) -> (
+    Arc<Pipeline>,
+    DelegationChain,
+    OffsetDateTime,
+    DelegationChain,
+) {
     let now = OffsetDateTime::now_utc();
     let leases = Arc::new(Rendezvous {
         inner: MemoryLeaseStore::new(),
         readers: Mutex::new(0),
+        window_readers: Mutex::new(0),
         arrived: Condvar::new(),
         stale: stale.into(),
+        no_windows: no_windows.into(),
     });
-    leases
-        .register(&LeaseId::new("l1"), None, now + Duration::hours(1))
-        .unwrap();
+    for l in ["l1", "l2"] {
+        leases
+            .register(&LeaseId::new(l), None, now + Duration::hours(1))
+            .unwrap();
+    }
     let attrs = ToolAttrs::new()
         .with_input("amount", ArgType::Long)
         .with_amount("amount");
@@ -239,21 +292,23 @@ fn run_with(
         leases,
         Arc::new(MemoryAudit::new()),
     );
-    let chain = DelegationChain::root(
-        OriginatingUser {
-            subject: "alice".into(),
-            issuer: "idp".into(),
-            authenticated_at: now,
-            attributes: Default::default(),
-        },
-        AgentId::new("planner"),
-        CapabilitySet::from_iter([Capability::new("bank", "send").with_limits(limits)]),
-        now,
-        Duration::hours(1),
-        LeaseId::new("l1"),
-    )
-    .unwrap();
-    (Arc::new(pipeline), chain, now)
+    let root = |lease: &str| {
+        DelegationChain::root(
+            OriginatingUser {
+                subject: "alice".into(),
+                issuer: "idp".into(),
+                authenticated_at: now,
+                attributes: Default::default(),
+            },
+            AgentId::new("planner"),
+            CapabilitySet::from_iter([Capability::new("bank", "send").with_limits(limits.clone())]),
+            now,
+            Duration::hours(1),
+            LeaseId::new(lease),
+        )
+        .unwrap()
+    };
+    (Arc::new(pipeline), root("l1"), now, root("l2"))
 }
 
 /// Two payments of one run, sent at the same moment.
@@ -262,9 +317,19 @@ fn pay_twice_at_once(
     chain: &DelegationChain,
     now: OffsetDateTime,
 ) -> Vec<PipelineDecision> {
+    pay_at_once(p, [chain, chain], now)
+}
+
+/// One payment from each of two chains, sent at the same moment.
+fn pay_at_once(
+    p: &Arc<Pipeline>,
+    chains: [&DelegationChain; 2],
+    now: OffsetDateTime,
+) -> Vec<PipelineDecision> {
     let start = Arc::new(Barrier::new(2));
-    let threads: Vec<_> = (0..2)
-        .map(|_| {
+    let threads: Vec<_> = chains
+        .into_iter()
+        .map(|chain| {
             let (p, chain, start) = (p.clone(), chain.clone(), start.clone());
             std::thread::spawn(move || {
                 start.wait();
@@ -352,4 +417,92 @@ fn metrics_time_the_run_lock_and_tell_a_charge_time_exhaustion() {
         .metrics()
         .render()
         .contains("attenuo_run_lock_wait_seconds_count 2\n"));
+}
+
+/// A user's daily cap over every run (run limits phase 3).
+const USER_DAILY_CAP: &str = r#"
+permit(principal, action, resource);
+@id("user_daily_spend_cap_2000")
+forbid (principal, action == Action::"bank/send", resource)
+when { context.input has amount && context.usage.user_window.day.amount + context.input.amount > 2000 };
+"#;
+
+/// Two runs of one user hold different run stripes, so only the user stripe, taken after the
+/// run's, keeps them from both reading the same window figure and both passing the cap.
+#[test]
+fn concurrent_runs_of_one_user_cannot_both_pass_a_window_cap() {
+    let (p, a, now, b) = runs_with(USER_DAILY_CAP, Limits::default(), false, false);
+    let stripe = |c: &DelegationChain| {
+        let d =
+            attenuo_core::digest::sha256_bytes(attenuo_core::chain_id_of(c).unwrap().as_bytes());
+        usize::from_str_radix(&d[..8], 16).unwrap() % super::pipeline::RUN_LOCK_STRIPES_FOR_TESTS
+    };
+    assert_ne!(
+        stripe(&a),
+        stripe(&b),
+        "the two runs must not share a run stripe"
+    );
+    let out = pay_at_once(&p, [&a, &b], now);
+    assert_eq!(out.iter().filter(|d| d.is_allow()).count(), 1, "{out:#?}");
+    let denied = out.iter().find(|d| !d.is_allow()).unwrap();
+    assert_eq!(denied.reason, attenuo_policy::REASON_POLICY_DENY);
+    assert_eq!(denied.usage.map(|u| u.user_window.day.amount), Some(1500));
+    // The run's own usage is the other run's business: zero here.
+    assert_eq!(denied.usage.map(|u| u.amount), Some(0));
+    // Only the day kind is kept: the hour reads zero.
+    assert_eq!(denied.usage.map(|u| u.user_window.hour.amount), Some(0));
+    // Both decisions waited on the lock once.
+    assert!(p
+        .metrics()
+        .render()
+        .contains("attenuo_run_lock_wait_seconds_count 2\n"));
+}
+
+/// A window the store cannot read is the worst case: the amount rule overflows and denies,
+/// with a diagnostic, and the call is not charged.
+#[test]
+fn an_unreadable_window_is_the_worst_case() {
+    let (p, a, now, _) = runs_with(USER_DAILY_CAP, Limits::default(), false, true);
+    let call = ToolCall::new("bank", "send", json!({"amount": 1}));
+    let d = p.decide(&a, &call, now);
+    assert!(!d.is_allow(), "{d:#?}");
+    assert_eq!(
+        d.usage.map(|u| u.user_window.day),
+        Some(crate::authz::UNREADABLE_WINDOW)
+    );
+    assert!(
+        d.diagnostics
+            .iter()
+            .any(|m| m.contains("per-user windows unreadable, worst case assumed")),
+        "{:?}",
+        d.diagnostics
+    );
+    // A count rule refuses too.
+    let (p, a, now, _) = runs_with(
+        "permit(principal, action, resource);\n\
+         forbid (principal, action == Action::\"bank/send\", resource) \
+         when { context.usage.user_window.hour.calls >= 5 };",
+        Limits::default(),
+        false,
+        true,
+    );
+    assert_eq!(
+        p.decide(&a, &call, now).reason,
+        attenuo_policy::REASON_POLICY_DENY
+    );
+}
+
+/// Sequentially, the second run sees what the first charged, and the record says so.
+#[test]
+fn a_new_run_does_not_reset_the_users_window() {
+    let (p, a, now, b) = runs_with(USER_DAILY_CAP, Limits::default(), false, false);
+    let call = ToolCall::new("bank", "send", json!({"amount": 1500}));
+    assert!(p.decide(&a, &call, now).is_allow());
+    let d = p.decide(&b, &call, now);
+    assert_eq!(d.reason, attenuo_policy::REASON_POLICY_DENY, "{d:#?}");
+    let small = ToolCall::new("bank", "send", json!({"amount": 500}));
+    let d = p.decide(&b, &small, now);
+    assert!(d.is_allow(), "{d:#?}");
+    let w = d.usage.unwrap().user_window.day;
+    assert_eq!((w.calls, w.amount), (1, 1500));
 }

@@ -106,7 +106,7 @@ pub struct Metrics {
     leases_pruned: AtomicU64,
     /// Run state deleted by retention (`[leases] run_state_retention_seconds`), by
     /// [`RUN_STATE_KINDS`].
-    run_state_pruned: [AtomicU64; 3],
+    run_state_pruned: [AtomicU64; 4],
     audit_append_errors: AtomicU64,
     audit_checkpoints: AtomicU64,
     /// `[audit.sink]` (SR-21): checkpoints delivered, delivery attempts that failed,
@@ -352,6 +352,12 @@ impl Metrics {
         {
             c.fetch_add(n, Ordering::Relaxed);
         }
+    }
+
+    /// Count per-user window rows (windows and their charges) deleted by
+    /// `[leases] user_window_retention_seconds`, as `run_state_pruned_total{kind="user_window"}`.
+    pub fn user_windows_pruned(&self, n: u64) {
+        self.run_state_pruned[3].fetch_add(n, Ordering::Relaxed);
     }
 
     /// Count one failed audit append (`audit_append_errors_total`).
@@ -600,7 +606,8 @@ impl Metrics {
             "run_state_pruned_total",
             "Run-limit counters, charge-log entries and approvals deleted because their run's \
              leases were gone from the registry and the state was older than the retention \
-             period.",
+             period, and per-user window rows deleted once their window had ended longer ago \
+             than its retention.",
             "counter",
         );
         for (kind, c) in RUN_STATE_KINDS.iter().zip(&self.run_state_pruned) {
@@ -939,8 +946,8 @@ fn header_lines(out: &mut String, name: &str, help: &str, kind: &str) {
 }
 
 /// The `kind` label values of `run_state_pruned_total`, in [`Metrics::run_state_pruned`]'s
-/// argument order.
-pub const RUN_STATE_KINDS: [&str; 3] = ["counters", "charges", "approvals"];
+/// argument order, then `user_window` ([`Metrics::user_windows_pruned`]).
+pub const RUN_STATE_KINDS: [&str; 4] = ["counters", "charges", "approvals", "user_window"];
 
 fn simple_counter(out: &mut String, name: &str, help: &str, c: &AtomicU64) {
     header_lines(out, name, help, "counter");

@@ -1,7 +1,7 @@
 //! Run usage of destructive tools (run-limits design section 3.5) and the result digest.
 
 use attenuo_core::RecordUsage;
-use attenuo_policy::UsageContext;
+use attenuo_policy::{UsageContext, UserWindowContext};
 use serde_json::Value;
 
 /// What Cedar sees as `context.usage` when the run's usage cannot be read: the worst case, as an
@@ -12,17 +12,29 @@ pub const UNREADABLE_USAGE: UsageContext = UsageContext {
     calls: i64::MAX,
     amount: i64::MAX,
     destination_seen: true,
+    user_window: UserWindowContext {
+        hour: super::windows::UNREADABLE_WINDOW,
+        day: super::windows::UNREADABLE_WINDOW,
+    },
 };
 
-/// `context.usage` as JSON: `{calls, amount, destination_seen}`. What the decision record's
-/// `usage` member, the `-32008` / `-32003` error data, AuthZEN answers and the admin dry run
-/// carry for a destructive tool.
+/// `context.usage` as JSON: `{calls, amount, destination_seen}`, plus `user_window: {hour:
+/// {calls, amount}, day: {calls, amount}}` (run limits phase 3) when any of its figures is not
+/// zero; left out, it is all zero, which is also what Cedar sees for a kind that is not kept.
+/// What the `-32008` / `-32003` error data, AuthZEN answers and the admin dry run carry for a
+/// destructive tool.
 pub fn usage_json(u: &UsageContext) -> Value {
-    serde_json::json!({
+    let mut v = serde_json::json!({
         "calls": u.calls,
         "amount": u.amount,
         "destination_seen": u.destination_seen,
-    })
+    });
+    if u.user_window != UserWindowContext::default() {
+        let w = |f: &attenuo_policy::WindowFigures| serde_json::json!({"calls": f.calls, "amount": f.amount});
+        v["user_window"] =
+            serde_json::json!({ "hour": w(&u.user_window.hour), "day": w(&u.user_window.day) });
+    }
+    v
 }
 
 /// A duration in whole microseconds for a log field, saturating (a `u64` of microseconds is
@@ -31,11 +43,15 @@ pub(super) fn micros(d: std::time::Duration) -> u64 {
     u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
 }
 
-pub(super) fn record_usage(u: &UsageContext) -> RecordUsage {
+pub(super) fn record_usage(
+    u: &UsageContext,
+    windows: &[attenuo_core::WindowCharge],
+) -> RecordUsage {
     RecordUsage {
         calls: u64::try_from(u.calls).unwrap_or(0),
         amount: u64::try_from(u.amount).unwrap_or(0),
         destination_seen: u.destination_seen,
+        user_window: super::windows::record_windows(u, windows),
     }
 }
 

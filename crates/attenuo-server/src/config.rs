@@ -1234,6 +1234,16 @@ pub struct LeasesSection {
     /// decision, charge and approval record. 0 keeps everything.
     #[serde(default = "default_run_state_retention_seconds")]
     pub run_state_retention_seconds: u64,
+    /// How long a per-user window (run limits phase 3, `context.usage.user_window`) and the
+    /// charges logged against it are kept after the window ended, in seconds. Default 3024000
+    /// (35 days: a month of refunds after the longest window). Counted from the window's end,
+    /// never from the leases, so revoking or pruning a run does not reset a window. Values
+    /// from 1 to 86399 are refused at start: a retention below a day, the longest window,
+    /// would not reset open windows (they are never pruned) but would drop a day's charges
+    /// before they could be refunded. After a window is pruned, an operator refund of its
+    /// charge answers 410 `charge_pruned` for that part. 0 keeps every window.
+    #[serde(default = "default_user_window_retention_seconds")]
+    pub user_window_retention_seconds: u64,
     /// Seconds between runs of the lease maintenance task (the session, lease and run-state
     /// passes above). Default 60, at least 1.
     #[serde(default = "default_maintenance_interval_seconds")]
@@ -1302,6 +1312,18 @@ fn default_run_state_retention_seconds() -> u64 {
     DEFAULT_RUN_STATE_RETENTION_SECONDS
 }
 
+/// Default of `[leases] user_window_retention_seconds`: 35 days after a window ends, enough
+/// for a month of refunds after the longest window (a day). A user active every hour on one
+/// tool with both kinds kept writes about 50 small rows a day.
+pub const DEFAULT_USER_WINDOW_RETENTION_SECONDS: u64 = 3_024_000;
+
+/// The smallest `[leases] user_window_retention_seconds` other than 0: the longest window.
+pub const MIN_USER_WINDOW_RETENTION_SECONDS: u64 = 86_400;
+
+fn default_user_window_retention_seconds() -> u64 {
+    DEFAULT_USER_WINDOW_RETENTION_SECONDS
+}
+
 /// Default of `[leases] session_retention_seconds`.
 pub const DEFAULT_SESSION_RETENTION_SECONDS: u64 = 86_400;
 
@@ -1327,6 +1349,7 @@ impl Default for LeasesSection {
             retention_seconds: DEFAULT_LEASE_RETENTION_SECONDS,
             session_retention_seconds: DEFAULT_SESSION_RETENTION_SECONDS,
             run_state_retention_seconds: DEFAULT_RUN_STATE_RETENTION_SECONDS,
+            user_window_retention_seconds: DEFAULT_USER_WINDOW_RETENTION_SECONDS,
             maintenance_interval_seconds: default_maintenance_interval_seconds(),
             maintenance_batch_rows: default_maintenance_batch_rows(),
             maintenance_max_passes: default_maintenance_max_passes(),
@@ -1348,6 +1371,24 @@ impl LeasesSection {
     /// `run_state_retention_seconds` as a duration; `None` when run-state pruning is off (0).
     pub fn run_state_retention(&self) -> Option<time::Duration> {
         seconds_or_off(self.run_state_retention_seconds)
+    }
+
+    /// `user_window_retention_seconds` as a duration; `None` when per-user windows are never
+    /// pruned (0).
+    ///
+    /// # Errors
+    ///
+    /// When it is below [`MIN_USER_WINDOW_RETENTION_SECONDS`] and not 0. Checked at startup.
+    pub fn user_window_retention(&self) -> anyhow::Result<Option<time::Duration>> {
+        let s = self.user_window_retention_seconds;
+        if s != 0 && s < MIN_USER_WINDOW_RETENTION_SECONDS {
+            anyhow::bail!(
+                "[leases] user_window_retention_seconds = {s} is below a day \
+                 ({MIN_USER_WINDOW_RETENTION_SECONDS}), the longest per-user window: use at \
+                 least {MIN_USER_WINDOW_RETENTION_SECONDS}, or 0 to keep every window"
+            );
+        }
+        Ok(seconds_or_off(s))
     }
 
     /// The maintenance settings. Checked at startup whether or not any retention is on.
@@ -2402,6 +2443,28 @@ mod tests {
             Some(time::Duration::hours(24))
         );
         assert!(super::Config::from_toml("[leases]\nretention = 1\n").is_err());
+    }
+
+    #[test]
+    fn user_window_retention_defaults_to_35_days_and_refuses_less_than_a_day() {
+        let cfg = super::Config::from_toml("").unwrap();
+        assert_eq!(
+            cfg.leases.user_window_retention().unwrap(),
+            Some(time::Duration::days(35))
+        );
+        let cfg =
+            super::Config::from_toml("[leases]\nuser_window_retention_seconds = 0\n").unwrap();
+        assert_eq!(cfg.leases.user_window_retention().unwrap(), None);
+        let cfg =
+            super::Config::from_toml("[leases]\nuser_window_retention_seconds = 86400\n").unwrap();
+        assert_eq!(
+            cfg.leases.user_window_retention().unwrap(),
+            Some(time::Duration::days(1))
+        );
+        let cfg =
+            super::Config::from_toml("[leases]\nuser_window_retention_seconds = 86399\n").unwrap();
+        let err = cfg.leases.user_window_retention().unwrap_err().to_string();
+        assert!(err.contains("below a day"), "{err}");
     }
 
     #[test]

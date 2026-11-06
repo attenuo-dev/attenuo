@@ -83,6 +83,7 @@ mod budgets;
 mod labels;
 mod pipeline;
 mod usage;
+mod windows;
 
 pub use authorizer::{ServerAuthorizer, VERIFIED_TOKENS_CAPACITY, VERIFIED_TOKEN_MAX_BYTES};
 pub use budgets::{
@@ -97,6 +98,7 @@ pub use pipeline::{
     REASON_LEASE_UNKNOWN,
 };
 pub use usage::{result_digest, usage_json, UNREADABLE_USAGE};
+pub use windows::UNREADABLE_WINDOW;
 
 #[cfg(test)]
 mod arg_taint_tests;
