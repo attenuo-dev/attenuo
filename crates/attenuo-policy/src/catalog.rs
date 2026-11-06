@@ -8,10 +8,10 @@
 //! declared action (`Action::"<server>/<tool>"`) and every declared input argument becomes a typed, optional attribute of
 //! `context.input`, so the validator can catch typos and type errors in policies at load time.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub use attenuo_core::OutputLabel;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Cedar type of a tool argument or user attribute: used for schema generation and policy
 /// validation, and checked against the call's value before Cedar runs.
@@ -119,7 +119,7 @@ impl ArgType {
 }
 
 /// Attributes of one tool. Available in policies as `resource.readonly`,
-/// `resource.sensitive` and `resource.destructive`.
+/// `resource.sensitive`, `resource.destructive` and `resource.outbound`.
 ///
 /// Unknown members are refused: a misspelt `sensitve = true` that was silently ignored would
 /// leave the tool not sensitive, and a `forbid ... when { resource.sensitive }` would not apply.
@@ -150,7 +150,8 @@ pub struct ToolAttrs {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub inputs: BTreeMap<String, ArgType>,
     /// The input whose value run usage sums for this tool, `context.usage.amount`
-    /// (run-limits design section 3.5). Only a destructive tool keeps usage. A value that is
+    /// (run-limits design section 3.5). Only a destructive tool, or one with an
+    /// [`outbound`](Self::outbound) argument, keeps usage. A value that is
     /// not a JSON integer of at least 0 adds nothing. When `inputs` declares it, it must be
     /// `long`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -163,6 +164,39 @@ pub struct ToolAttrs {
     /// `{"raw": value}` so it collides with no host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<String>,
+    /// The inputs whose values are delivered to a party the value names (a URL, a recipient):
+    /// *outbound* arguments (read-side exfiltration design, option d). In the catalog either
+    /// one name or a list, `outbound = "url#host"` or `outbound = ["url", "callback"]`; each
+    /// entry is an input name with an optional `#host`, as for
+    /// [`destination`](Self::destination). An outbound argument:
+    ///
+    /// - is a destination for run usage whatever `destructive` says, so a read-only fetch keeps
+    ///   `context.usage` and a rule over `context.usage.destination_seen` applies to it. Its
+    ///   values (hosts, with `#host`) are counted under the tool next to those of
+    ///   `destination`, which stays the input for a tool whose payee is not outbound;
+    /// - sets `context.untrusted_outbound` when argument taint matches it
+    ///   ([`ToolAttrs::untrusted_outbound`]);
+    /// - makes `resource.outbound` true ([`ToolAttrs::has_outbound`]).
+    #[serde(
+        default,
+        deserialize_with = "one_or_many",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub outbound: Vec<String>,
+}
+
+/// A string or a list of strings, as a list.
+fn one_or_many<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged, expecting = "an input name or a list of input names")]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
 }
 
 fn is_untrusted(label: &OutputLabel) -> bool {
@@ -231,6 +265,31 @@ impl ToolAttrs {
     pub fn with_destination(mut self, input: impl Into<String>) -> Self {
         self.destination = Some(input.into());
         self
+    }
+
+    /// Mark an input outbound, `"<input>"` or `"<input>#host"` (see [`ToolAttrs::outbound`]).
+    pub fn with_outbound(mut self, input: impl Into<String>) -> Self {
+        self.outbound.push(input.into());
+        self
+    }
+
+    /// The tool has at least one outbound argument: `resource.outbound`.
+    pub fn has_outbound(&self) -> bool {
+        !self.outbound.is_empty()
+    }
+
+    /// The names of the outbound inputs, without any `#host`.
+    pub fn outbound_inputs(&self) -> impl Iterator<Item = &str> {
+        self.outbound
+            .iter()
+            .map(|r| r.rsplit_once('#').map_or(r.as_str(), |(arg, _)| arg))
+    }
+
+    /// `context.untrusted_outbound`: some argument in `untrusted` (the arguments that matched
+    /// an untrusted result of the run, `context.untrusted_args`, including the fail-closed
+    /// `unreadable` ones) is outbound.
+    pub fn untrusted_outbound(&self, untrusted: &BTreeSet<String>) -> bool {
+        self.outbound_inputs().any(|a| untrusted.contains(a))
     }
 
     /// Declare the type of an argument so policies that read `context.input.<name>` validate.
@@ -370,15 +429,19 @@ impl ToolCatalog {
     /// Check every server and tool name against [`attenuo_core::names`]: a server name has
     /// no `/`, and a tool is a tool name or an MCP method name (`resources/read`). A tool's
     /// `amount` and `destination` must name an input, and `amount` one not declared other than
-    /// `long`; a `destination` with `#` must end in a known derivation (`#host`). Called by
+    /// `long`; a `destination` with `#` must end in a known derivation (`#host`). Each
+    /// `outbound` entry is checked as `destination` is, names its input once, and with `#host`
+    /// names an input not declared other than `string` or `set<string>`. Called by
     /// [`PolicyEngineBuilder::build`](crate::PolicyEngineBuilder::build).
     ///
     /// # Errors
     ///
     /// A message naming the first offending `(server, tool)` entry, in order: an invalid server
     /// or call name, an empty `amount` or `destination`, a `destination` that
-    /// [`parse_arg_ref`](attenuo_core::limits::parse_arg_ref) refuses, or an `amount` whose input
-    /// is declared with a type other than `long`.
+    /// [`parse_arg_ref`](attenuo_core::limits::parse_arg_ref) refuses, an `amount` whose input
+    /// is declared with a type other than `long`, or an `outbound` entry that is empty, that
+    /// `parse_arg_ref` refuses, that repeats an input, or whose `#host` names an input declared
+    /// with a type other than `string` or `set<string>`.
     pub fn validate(&self) -> Result<(), String> {
         for ((server, tool), attrs) in &self.tools {
             attenuo_core::names::check_server_name(server)
@@ -411,8 +474,57 @@ impl ToolCatalog {
                     }
                 }
             }
+            let mut seen = BTreeSet::new();
+            for entry in &attrs.outbound {
+                let at = || format!("catalog entry {server:?} / {tool:?}: `outbound`");
+                if entry.is_empty() {
+                    return Err(format!("{}: an entry names no input", at()));
+                }
+                let (input, derive) = attenuo_core::limits::parse_arg_ref(entry)
+                    .map_err(|e| format!("{} {e}", at()))?;
+                if !seen.insert(input.clone()) {
+                    return Err(format!("{} names input {input:?} twice", at()));
+                }
+                if derive.is_some() {
+                    match attrs.inputs.get(&input) {
+                        None | Some(ArgType::String) => {}
+                        Some(ArgType::Set(inner)) if **inner == ArgType::String => {}
+                        Some(ty) => {
+                            return Err(format!(
+                                "{} `{entry}`: input {input:?} is declared {}; `#host` needs \
+                                 a string (or a set of strings)",
+                                at(),
+                                ty.shown()
+                            ))
+                        }
+                    }
+                }
+            }
         }
         Ok(())
+    }
+
+    /// What is likely a mistake in the catalog but does not stop it loading, one message per
+    /// problem, in `(server, tool)` order: an `outbound` entry naming an input that the tool's
+    /// `inputs` do not declare, when it declares some (a misspelt name would leave the real
+    /// argument unwatched). A tool that declares no inputs is not checked. The engine adds
+    /// these to [`PolicyEngine::validation_warnings`](crate::PolicyEngine::validation_warnings).
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for ((server, tool), attrs) in &self.tools {
+            if attrs.inputs.is_empty() {
+                continue;
+            }
+            for input in attrs.outbound_inputs() {
+                if !attrs.inputs.contains_key(input) {
+                    out.push(format!(
+                        "catalog entry {server:?} / {tool:?}: `outbound` names input {input:?}, \
+                         which `inputs` does not declare"
+                    ));
+                }
+            }
+        }
+        out
     }
 
     /// Cedar action ids (see [`crate::action_id`]) with the union of their declared inputs.
@@ -457,7 +569,10 @@ mod tests {
                 attributes: Default::default(),
             },
             AgentId::new("planner"),
-            CapabilitySet::from_iter([Capability::new("banking", "*")]),
+            CapabilitySet::from_iter([
+                Capability::new("banking", "*"),
+                Capability::new("web", "*"),
+            ]),
             now(),
             Duration::hours(1),
             LeaseId::new("l1"),
@@ -601,5 +716,242 @@ mod tests {
                 "{amount} {out:?}"
             );
         }
+    }
+
+    fn fetch_catalog(attrs: ToolAttrs) -> ToolCatalog {
+        ToolCatalog::new().with("web", "fetch", attrs)
+    }
+
+    /// `outbound` is one name or a list, in TOML and JSON alike, and always a list in Rust.
+    #[test]
+    fn outbound_is_one_input_or_a_list() {
+        let t: BTreeMap<String, ToolAttrs> = toml::from_str(
+            r#"
+            [fetch]
+            readonly = true
+            inputs = { url = "string" }
+            outbound = "url#host"
+
+            [post]
+            outbound = ["url", "callback#host"]
+
+            [read]
+            readonly = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(t["fetch"].outbound, vec!["url#host".to_string()]);
+        assert!(t["fetch"].has_outbound() && t["fetch"].readonly);
+        assert_eq!(t["post"].outbound, vec!["url", "callback#host"]);
+        assert_eq!(
+            t["post"].outbound_inputs().collect::<Vec<_>>(),
+            vec!["url", "callback"]
+        );
+        assert!(!t["read"].has_outbound());
+        let j: ToolAttrs = serde_json::from_value(json!({"outbound": ["url"]})).unwrap();
+        assert_eq!(j, ToolAttrs::new().with_outbound("url"));
+        let err = serde_json::from_value::<ToolAttrs>(json!({"outbound": 3})).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("an input name or a list of input names"),
+            "{err}"
+        );
+        // Serialised as a list, and left out when empty.
+        assert_eq!(
+            serde_json::to_value(ToolAttrs::new().with_outbound("url#host")).unwrap()["outbound"],
+            json!(["url#host"])
+        );
+        assert!(serde_json::to_value(ToolAttrs::new())
+            .unwrap()
+            .get("outbound")
+            .is_none());
+        // Which matched arguments are outbound.
+        let untrusted: BTreeSet<String> = ["body".to_string(), "callback".to_string()].into();
+        assert!(t["post"].untrusted_outbound(&untrusted));
+        assert!(!t["fetch"].untrusted_outbound(&untrusted));
+        assert!(!t["read"].untrusted_outbound(&untrusted));
+    }
+
+    #[test]
+    fn outbound_entries_are_checked_at_load() {
+        let ok = fetch_catalog(
+            ToolAttrs::new()
+                .with_input("url", ArgType::String)
+                .with_input("urls", ArgType::Set(Box::new(ArgType::String)))
+                .with_outbound("url#host")
+                .with_outbound("urls#host")
+                .with_outbound("undeclared#host"),
+        );
+        assert_eq!(ok.validate(), Ok(()));
+        let refused = |attrs: ToolAttrs| fetch_catalog(attrs).validate().unwrap_err();
+        let err = refused(
+            ToolAttrs::new()
+                .with_input("port", ArgType::Long)
+                .with_outbound("port#host"),
+        );
+        assert!(
+            err.contains("`outbound` `port#host`: input \"port\" is declared Long"),
+            "{err}"
+        );
+        // A non-string input may still be outbound without `#host`: it counts as itself.
+        assert_eq!(
+            fetch_catalog(
+                ToolAttrs::new()
+                    .with_input("port", ArgType::Long)
+                    .with_outbound("port")
+            )
+            .validate(),
+            Ok(())
+        );
+        let err = refused(ToolAttrs::new().with_outbound(""));
+        assert!(
+            err.ends_with("`outbound`: an entry names no input"),
+            "{err}"
+        );
+        let err = refused(ToolAttrs::new().with_outbound("url#path"));
+        assert!(err.contains("unknown derivation `path`"), "{err}");
+        let err = refused(ToolAttrs::new().with_outbound("#host"));
+        assert!(err.contains("names no argument before `#`"), "{err}");
+        let err = refused(
+            ToolAttrs::new()
+                .with_outbound("url")
+                .with_outbound("url#host"),
+        );
+        assert!(err.ends_with("names input \"url\" twice"), "{err}");
+    }
+
+    /// A name the tool's `inputs` do not declare is a warning, not an error, and only when the
+    /// tool declares inputs at all. The engine reports it with the policy warnings.
+    #[test]
+    fn an_undeclared_outbound_input_is_a_warning() {
+        let c = fetch_catalog(
+            ToolAttrs::new()
+                .with_input("url", ArgType::String)
+                .with_outbound("uri#host"),
+        )
+        .with("web", "ping", ToolAttrs::new().with_outbound("host"));
+        assert_eq!(c.validate(), Ok(()));
+        assert_eq!(
+            c.warnings(),
+            vec![
+                "catalog entry \"web\" / \"fetch\": `outbound` names input \"uri\", which \
+                 `inputs` does not declare"
+                    .to_string()
+            ]
+        );
+        let engine = PolicyEngineBuilder::new()
+            .with_catalog(c)
+            .with_policies_str("permit(principal, action, resource);")
+            .build()
+            .unwrap();
+        assert_eq!(engine.validation_warnings(), [c_warning()]);
+        let mut engine = engine;
+        engine
+            .reload_policies_str("permit(principal, action, resource);")
+            .unwrap();
+        assert_eq!(engine.validation_warnings(), [c_warning()]);
+    }
+
+    fn c_warning() -> String {
+        "catalog entry \"web\" / \"fetch\": `outbound` names input \"uri\", which `inputs` does \
+         not declare"
+            .to_string()
+    }
+
+    fn fetch(engine: &PolicyEngine, labels: &CallLabels) -> crate::Outcome {
+        engine.authorize_labelled(
+            &chain(),
+            &ToolCall::new(
+                "web",
+                "fetch",
+                json!({"url": "https://a.example/", "note": "x"}),
+            ),
+            labels,
+            now(),
+        )
+    }
+
+    /// `resource.outbound` and `context.untrusted_outbound` validate against the generated
+    /// schema, and say what the catalog and the matched arguments say.
+    #[test]
+    fn policies_read_resource_outbound_and_context_untrusted_outbound() {
+        let policies = r#"
+            @id("open") permit(principal, action, resource);
+            @id("ask_on_untrusted_outbound") @obligation("approval")
+            forbid(principal, action, resource)
+            when { context.untrusted_outbound == true && !context.approval.present };
+            @id("outbound_tools") forbid(principal, action, resource)
+            when { resource.outbound && context.input has note && context.input.note == "deny" };
+        "#;
+        let build = |attrs: ToolAttrs| {
+            PolicyEngineBuilder::new()
+                .with_catalog(fetch_catalog(
+                    attrs
+                        .readonly(true)
+                        .with_input("url", ArgType::String)
+                        .with_input("note", ArgType::String),
+                ))
+                .with_policies_str(policies)
+                .build()
+                .unwrap()
+        };
+        let flagged = build(ToolAttrs::new().with_outbound("url#host"));
+        assert!(flagged.validation_warnings().is_empty());
+        assert!(
+            flagged.reads_arg_taint(),
+            "reading untrusted_outbound reads arg taint"
+        );
+        let plain = build(ToolAttrs::new());
+        let labels = |args: &[&str]| CallLabels {
+            session: crate::SessionLabels::from_sources(["web/fetch"]),
+            args: crate::ArgLabels::from_args(args.iter().copied()),
+            ..CallLabels::default()
+        };
+        // The outbound argument matched: ask.
+        let out = fetch(&flagged, &labels(&["url"]));
+        assert_eq!(out.reason, crate::REASON_APPROVAL_REQUIRED, "{out:?}");
+        assert_eq!(
+            out.policy_ids,
+            vec!["ask_on_untrusted_outbound".to_string()]
+        );
+        // Only another argument matched: no ask.
+        assert_eq!(
+            fetch(&flagged, &labels(&["note"])).decision,
+            Decision::Allow
+        );
+        assert_eq!(fetch(&flagged, &labels(&[])).decision, Decision::Allow);
+        // No outbound input in the catalog: a matched `url` is not outbound.
+        assert_eq!(fetch(&plain, &labels(&["url"])).decision, Decision::Allow);
+
+        // `resource.outbound`: true with the flag, false without.
+        let deny_note = |e: &PolicyEngine| {
+            e.authorize_labelled(
+                &chain(),
+                &ToolCall::new("web", "fetch", json!({"url": "u", "note": "deny"})),
+                &CallLabels::default(),
+                now(),
+            )
+        };
+        assert_eq!(deny_note(&flagged).reason, crate::REASON_POLICY_DENY);
+        assert_eq!(deny_note(&plain).decision, Decision::Allow);
+    }
+
+    /// A custom base schema written before `outbound` existed still loads; only a policy that
+    /// reads `resource.outbound` needs it declared.
+    #[test]
+    fn a_custom_base_without_outbound_still_loads() {
+        let base = crate::DEFAULT_SCHEMA.replace("    outbound: Bool,\n", "");
+        assert!(!base.contains("outbound"));
+        let build = |p: &str| {
+            PolicyEngineBuilder::new()
+                .with_catalog(fetch_catalog(ToolAttrs::new().with_outbound("url")))
+                .with_schema_str(&base)
+                .with_policies_str(p)
+                .build()
+        };
+        build("permit(principal, action, resource) when { context.untrusted_outbound };").unwrap();
+        let err =
+            build("permit(principal, action, resource) when { resource.outbound };").unwrap_err();
+        assert!(matches!(err, crate::PolicyError::Validation(_)), "{err}");
     }
 }

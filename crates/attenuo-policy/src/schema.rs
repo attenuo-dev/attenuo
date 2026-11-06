@@ -31,6 +31,9 @@ pub const GENERIC_ACTION: &str = "invoke";
 ///   `principal in User::"alice"` and `principal in Agent::"planner"` work.
 /// - `Server` is a logical tool server (an MCP server, for instance).
 /// - `Tool` is one tool on one server, with id `"<server>/<tool>"`, `in` its `Server`.
+///   `outbound` (the catalog names an outbound input) is not required of a custom base schema,
+///   so one written before it still loads; a policy that reads `resource.outbound` validates
+///   only against a base that declares it.
 pub const DEFAULT_SCHEMA: &str = r#"// attenuo default Cedar schema (entity types).
 // Actions, context types and UserAttributes are generated from the tool catalog.
 
@@ -56,6 +59,7 @@ entity Tool in [Server] {
     readonly: Bool,
     sensitive: Bool,
     destructive: Bool,
+    outbound: Bool,
 };
 "#;
 
@@ -226,7 +230,8 @@ fn record(attrs: &BTreeMap<String, ArgType>) -> String {
 fn context_type(inputs: &BTreeMap<String, ArgType>) -> String {
     format!(
         "{{ input: {}, originating_user: UserContext, chain: ChainContext, session_id?: String, now_unix: Long, \
-         session: SessionContext, args_contain_untrusted: Bool, untrusted_args: Set<String>, approval: ApprovalContext, \
+         session: SessionContext, args_contain_untrusted: Bool, untrusted_args: Set<String>, untrusted_outbound: Bool, \
+         approval: ApprovalContext, \
          budget: BudgetContext, usage: UsageContext }}",
         record(inputs)
     )
@@ -459,6 +464,8 @@ mod tests {
             "session: SessionContext",
             "args_contain_untrusted: Bool",
             "untrusted_args: Set<String>",
+            "untrusted_outbound: Bool",
+            "    outbound: Bool,",
             "approval: ApprovalContext",
             "type SessionContext = { tainted: Bool, tainted_by: Set<String> }",
             "type ApprovalContext = { present: Bool, by: String }",
