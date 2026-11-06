@@ -71,7 +71,10 @@ class ApprovalRequired(Denied):
     who grants it with their own sign-in (``POST /approvals/{id}``), or an operator grants it.
     Then retry the identical call once (``Client.wait_for_approval`` and
     ``Client.call_tool_with_approval`` do this). ``approval_id`` is ``None`` when the server
-    could not open an approval; the call is then simply denied. ``expires_at`` is when the
+    could not open an approval, among others when the run already has as many pending
+    approvals as the server keeps for one run (32; its diagnostic is ``"too many pending
+    approvals for this run"``). The call is then simply denied, and ``call_tool_with_approval``
+    raises this error at once, without calling ``on_approval``. ``expires_at`` is when the
     approval lapses; ``call_hash`` is the RFC 8785 hash of the call it is bound to.
     """
 
