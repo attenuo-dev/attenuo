@@ -67,6 +67,11 @@ impl ApprovalState {
     }
 
     /// Parse the wire string.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Storage`] when `s` is not one of the four wire strings (a stored row the store
+    /// cannot read back).
     pub fn parse(s: &str) -> Result<Self, AuditError> {
         Ok(match s {
             "pending" => ApprovalState::Pending,
@@ -116,6 +121,11 @@ impl ApprovalMethod {
     }
 
     /// Parse the wire string.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Storage`] when `s` is neither `id_token` nor `admin_token` (a stored row the
+    /// store cannot read back).
     pub fn parse(s: &str) -> Result<Self, AuditError> {
         match s {
             "id_token" => Ok(ApprovalMethod::IdToken),

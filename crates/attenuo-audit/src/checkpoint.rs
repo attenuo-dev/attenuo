@@ -60,6 +60,11 @@ impl Checkpoint {
     }
 
     /// Sign `(seq, head_hash)` at `now` with `signer`.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::TimeFormat`] when `now` cannot be written as RFC 3339 (a year outside
+    /// 0000..=9999).
     pub fn sign(
         signer: &attenuo_token::DetachedSigner,
         seq: u64,
@@ -93,6 +98,11 @@ pub struct CheckpointKeys {
 impl CheckpointKeys {
     /// From a JWKS document (`{"keys": [{"kty":"OKP","crv":"Ed25519","kid":..,"x":..}]}`).
     /// Entries that are not Ed25519 OKP keys are skipped.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Jwks`] when the document has no `keys` array, or when an Ed25519 OKP entry's
+    /// `x` is not base64url or does not decode to 32 bytes.
     pub fn from_jwks(jwks: &Value) -> Result<Self, AuditError> {
         let list = jwks
             .get("keys")
@@ -127,6 +137,11 @@ impl CheckpointKeys {
     }
 
     /// `Ok` when `cp` carries a valid signature by a known key.
+    ///
+    /// # Errors
+    ///
+    /// The reason as text, for [`BadCheckpoint::reason`]: `cp.kid` names no key in the set, or the
+    /// signature does not verify against that key.
     pub fn verify(&self, cp: &Checkpoint) -> Result<(), String> {
         let key = self
             .keys
@@ -202,6 +217,12 @@ pub enum Start {
 /// Only checkpoints inside the walked range are meaningful; callers exporting a window pass
 /// just those. A checkpoint beyond the last entry is reported as `bad` (truncation) when the
 /// chain itself is intact.
+///
+/// # Errors
+///
+/// Whatever error an item of `entries` carries other than [`AuditError::Corrupt`] (a store fault
+/// while reading the log), which is propagated. A corrupt entry, a broken chain and a bad
+/// checkpoint are not errors: they are reported in the [`SignedVerifyReport`].
 pub fn verify_with_checkpoints<I>(
     entries: I,
     checkpoints: &[Checkpoint],

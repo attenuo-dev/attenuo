@@ -82,12 +82,22 @@ pub struct SqliteLeaseStore {
 impl SqliteLeaseStore {
     /// Open (or create) the registry at `path` with [`Durability::Normal`]. May be the same file
     /// as a [`SqliteAudit`](super::SqliteAudit).
+    ///
+    /// # Errors
+    ///
+    /// As [`open_with`](Self::open_with).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AuditError> {
         Self::open_with(path, Durability::default())
     }
 
     /// Open (or create) the registry at `path` in WAL mode with the given durability.
     /// Revocations commit with `synchronous=FULL` whatever `durability` says.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Sqlite`] when the file cannot be opened or the schema cannot be created or
+    /// upgraded, and [`AuditError::Storage`] when the file cannot be switched to WAL mode or a
+    /// stored budget or span key is not hex.
     pub fn open_with(path: impl AsRef<Path>, durability: Durability) -> Result<Self, AuditError> {
         let conn = open_connection(path.as_ref(), durability)?;
         let file = file_of(&conn);
@@ -98,12 +108,23 @@ impl SqliteLeaseStore {
     }
 
     /// A registry in a private in-memory database, gone when the value is dropped.
+    ///
+    /// # Errors
+    ///
+    /// As [`from_connection`](Self::from_connection); an in-memory database should not fail to
+    /// open.
     pub fn open_in_memory() -> Result<Self, AuditError> {
         Self::from_connection(open_memory_connection()?)
     }
 
     /// Wrap an existing connection, creating or upgrading the lease, approval and outbox
     /// tables as needed.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Sqlite`] when the schema cannot be created or upgraded on `conn` (a read-only
+    /// or foreign database, for example), and [`AuditError::Storage`] when a stored budget or span
+    /// key is not hex.
     pub fn from_connection(conn: Connection) -> Result<Self, AuditError> {
         conn.execute_batch(LEASE_SCHEMA)?;
         add_approval_columns(&conn)?;
@@ -140,6 +161,11 @@ impl SqliteLeaseStore {
 
     /// Run `f` against the underlying connection while holding the store's lock. For tests
     /// and operational tooling.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or whatever `f`
+    /// returns.
     pub fn with_connection<R>(
         &self,
         f: impl FnOnce(&Connection) -> Result<R, AuditError>,
@@ -150,10 +176,16 @@ impl SqliteLeaseStore {
 
     /// Stop this connection from checkpointing the WAL when it commits
     /// (`wal_autocheckpoint=0`). Only for a store that shares its file with a
-    /// [`SqliteAudit`](super::SqliteAudit) whose [`with_wal_checkpoints`](super::SqliteAudit::with_wal_checkpoints) is on:
-    /// that checkpointer covers the whole file, and without this a token exchange that
+    /// [`SqliteAudit`](super::SqliteAudit) whose
+    /// [`with_wal_checkpoints`](super::SqliteAudit::with_wal_checkpoints) is on: that
+    /// checkpointer covers the whole file, and without this a token exchange that
     /// registers a lease would still run a checkpoint inline now and then. Nothing to do for
     /// an in-memory store.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or
+    /// [`AuditError::Sqlite`] when the pragma is refused.
     pub fn without_wal_autocheckpoint(self) -> Result<Self, AuditError> {
         self.conn
             .lock()?
@@ -162,6 +194,12 @@ impl SqliteLeaseStore {
     }
 
     /// One lease's row, if known.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or a query or
+    /// timestamp fault ([`AuditError::Sqlite`], [`AuditError::TimeParse`]) reading the row. An
+    /// unknown lease is `Ok(None)`.
     pub fn get(&self, lease: &LeaseId) -> Result<Option<LeaseRow>, AuditError> {
         let conn = self.conn.lock()?;
         get_in(&conn, lease)
@@ -172,6 +210,12 @@ impl SqliteLeaseStore {
     /// same recursive query over `leases_parent_idx`, so `would_revoke` is the count a
     /// revocation run now would return. `nodes` holds at most `max_nodes` leases (at least 1),
     /// found breadth-first; `would_revoke` counts the whole subtree regardless of the cap.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or a query or
+    /// timestamp fault ([`AuditError::Sqlite`], [`AuditError::TimeParse`]) reading the subtree. An
+    /// unknown lease is `Ok(None)`.
     pub fn subtree(
         &self,
         lease: &LeaseId,
