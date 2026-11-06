@@ -457,6 +457,8 @@ Every series is prefixed `attenuo_`. Label values come from fixed sets, so the n
 | `tokens_issued_total` | counter | `kind` (`root`, `exchange`) | Delegation tokens issued. |
 | `leases_revoked_total` | counter | none | Leases moved to revoked, including cascaded descendants. |
 | `lease_sessions_pruned_total` | counter | none | Session bindings (revoke by session) deleted because their chain's root lease was revoked or expired longer ago than `[leases] session_retention_seconds`. |
+| `telemetry_spans_dropped_total` | counter | none | Finished spans dropped before export (`[telemetry]`): the span queue was full or export had shut down. Always 0 with telemetry off. |
+| `telemetry_export_failures_total` | counter | none | OTLP export requests that failed or timed out; their spans are not retried. |
 | `leases_pruned_total` | counter | none | Leases deleted from the registry (with their recorded users and bindings) because every lease of their run was revoked or expired longer ago than `[leases] retention_seconds`. |
 | `run_state_pruned_total` | counter | `kind` (`counters`, `charges`, `approvals`, `user_window`) | Run state deleted by `[leases] run_state_retention_seconds` once the leases it belongs to were gone from the registry: run-limit and run-usage counters, charge-log entries (one per charged decision) and approvals; and, as `user_window`, per-user window rows (windows and their logged charges) deleted by `[leases] user_window_retention_seconds` once their window had ended. |
 | `audit_append_errors_total` | counter | none | Audit log appends that failed. |

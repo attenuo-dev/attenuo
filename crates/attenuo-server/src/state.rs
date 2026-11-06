@@ -101,6 +101,9 @@ pub struct AppState {
     /// proxy's session TTL and record windows): the system clock, except in tests that step
     /// past a TTL with a [`attenuo_core::ManualClock`] ([`crate::build_with_clock`]).
     pub clock: Arc<dyn attenuo_core::Clock>,
+    /// `[telemetry]`: the trace hook of the exported spans; `None` when export is off
+    /// ([`crate::telemetry`]).
+    pub trace: Option<Arc<crate::telemetry::ServerTrace>>,
 }
 
 impl AppState {
@@ -199,6 +202,16 @@ impl AppState {
             .with_metrics(metrics.clone())
             .with_approval_ttl(config.approvals.ttl())
             .with_approval_verifier(verifier.clone());
+        let trace_settings = config.telemetry.resolve()?;
+        let trace = trace_settings
+            .as_ref()
+            .map(|s| Arc::new(crate::telemetry::ServerTrace::new(s)));
+        if trace.is_some() {
+            // Keyed like the DPoP nonces, by the issuer's private key (open question 5).
+            pipeline = pipeline.with_subject_digest(crate::telemetry::SubjectDigest::derive(
+                issuer.private_key_pem().as_bytes(),
+            ));
+        }
         if let Some(n) = &approval_notifier {
             pipeline = pipeline.with_approval_notifier(n.handle());
         }
@@ -319,6 +332,7 @@ impl AppState {
             approvals_client_id: config.approvals.client_id.clone(),
             approval_notifier,
             clock,
+            trace,
         })
     }
 
@@ -338,7 +352,9 @@ impl AppState {
         R: Send + 'static,
     {
         let state = Arc::clone(self);
-        match tokio::task::spawn_blocking(move || f(&state)).await {
+        // Carry the caller's span and trace context onto the blocking thread.
+        let carry = crate::telemetry::Carry::capture();
+        match tokio::task::spawn_blocking(move || carry.run(|| f(&state))).await {
             Ok(r) => r,
             Err(e) => std::panic::resume_unwind(e.into_panic()),
         }

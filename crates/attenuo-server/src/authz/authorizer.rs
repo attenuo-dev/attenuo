@@ -28,6 +28,7 @@ pub struct ServerAuthorizer {
     pipeline: Arc<Pipeline>,
     pub(super) verified: VerifiedTokens,
     dpop: Option<Arc<crate::dpop::Dpop>>,
+    trace: Option<Arc<crate::telemetry::ServerTrace>>,
 }
 
 impl ServerAuthorizer {
@@ -39,7 +40,15 @@ impl ServerAuthorizer {
             pipeline,
             verified: VerifiedTokens::new(VERIFIED_TOKENS_CAPACITY),
             dpop: None,
+            trace: None,
         }
+    }
+
+    /// Join the proxy's exported spans to outside traces through `trace` (`[telemetry]`);
+    /// `None` leaves tracing off.
+    pub fn with_trace(mut self, trace: Option<Arc<crate::telemetry::ServerTrace>>) -> Self {
+        self.trace = trace;
+        self
     }
 
     /// Check DPoP proofs with these settings and replay cache (the server's own). Without
@@ -62,6 +71,8 @@ impl ServerAuthorizer {
             _ => (Stage::TokenVerifyMiss, false),
         };
         self.pipeline.metrics().observe_stage(stage, elapsed);
+        // On the proxy's `attenuo.authenticate` span.
+        tracing::Span::current().record("attenuo.token.cache", if hit { "hit" } else { "miss" });
         tracing::debug!(
             cache_hit = hit,
             token_verify_us = micros(elapsed),
@@ -387,6 +398,12 @@ impl Authorizer for ServerAuthorizer {
             p.record_session(&chain, &server, &session, now)
         })
         .await
+    }
+
+    fn trace(&self) -> Option<&dyn attenuo_proxy::TraceHook> {
+        self.trace
+            .as_deref()
+            .map(|t| t as &dyn attenuo_proxy::TraceHook)
     }
 
     fn observe_stage(&self, stage: Stage, elapsed: Duration) {

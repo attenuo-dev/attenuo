@@ -594,6 +594,21 @@ impl Metrics {
              expired longer ago than the retention period.",
             &self.lease_sessions_pruned,
         );
+        let telemetry = crate::telemetry::counters();
+        simple_counter(
+            &mut out,
+            "telemetry_spans_dropped_total",
+            "Finished spans dropped before export ([telemetry]): the span queue was full or \
+             export had shut down. Export fails open: a dropped span never changes an answer.",
+            &telemetry.spans_dropped,
+        );
+        simple_counter(
+            &mut out,
+            "telemetry_export_failures_total",
+            "OTLP export requests that failed or timed out ([telemetry]); their spans are not \
+             retried.",
+            &telemetry.export_failures,
+        );
         simple_counter(
             &mut out,
             "leases_pruned_total",

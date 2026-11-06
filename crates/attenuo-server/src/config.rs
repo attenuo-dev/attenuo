@@ -104,6 +104,10 @@ pub struct Config {
     /// exchange (hop n to n+1). See [`ActorTrustConfig`].
     #[serde(default)]
     pub actor_trust: Vec<ActorTrustConfig>,
+    /// `[telemetry]`: OpenTelemetry trace export, off by default
+    /// ([`crate::telemetry::TelemetrySection`]).
+    #[serde(default)]
+    pub telemetry: crate::telemetry::TelemetrySection,
 }
 
 /// `[authzen]`
