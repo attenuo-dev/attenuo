@@ -57,7 +57,7 @@ Routes are registered in `router()` in `crates/attenuo-server/src/lib.rs`. The a
 | `/admin/audit/verify` | GET | admin | `admin::audit_verify` | `SignedVerifyReport`: `entries`, `ok`, `first_bad_seq`, `checkpoints`, `last_signed_seq`, `unsigned_tail`, `bad_checkpoints`. Walks the whole chain. | Usable as is, on demand only (cost grows with the log). |
 | `/admin/audit/checkpoint` | GET | admin | `admin::audit_checkpoint` (`SqliteAudit::checkpoint_signed`) | `{seq, head_hash, at, kid, signature, hash}`. **Signs and stores a new checkpoint** when the head has none. | Not a read: use only behind an explicit "Sign head now" button, never on page load or polling. **Gap:** no read-only list of stored checkpoints. |
 | `/admin/audit/export?from&to&kind&chain_id` | GET | admin | `admin::audit_export` | `application/x-ndjson` stream, `Cache-Control: no-store`; filtered exports carry a `filter` header member and do not verify. | Usable as is. The UI fetches with the `Authorization` header and saves a Blob (a plain link cannot carry the header). |
-| `/admin/leases/{lease_id}` | GET | admin | `admin::lease_status` | `{lease_id, active, parent, expires_at, revoked_at, revoke_reason}`; 404 for an unknown id. | Usable for one node. **Gap:** no children, no agent, no issue time; the `leases` table (`LEASE_SCHEMA` in `crates/attenuo-audit/src/sqlite.rs`) stores only `id, parent, expires_at, revoked_at, revoke_reason`. |
+| `/admin/leases/{lease_id}` | GET | admin | `admin::lease_status` | `{lease_id, active, parent, expires_at, revoked_at, revoke_reason}`; 404 for an unknown id. | Usable for one node. **Gap:** no children, no agent, no issue time; the `leases` table (`LEASE_SCHEMA` in `crates/attenuo-audit/src/sqlite/schema.rs`) stores only `id, parent, expires_at, revoked_at, revoke_reason`. |
 | `/admin/leases/{lease_id}/revoke` | POST | admin | `admin::revoke_lease` | Body `{reason?}` (`RevokeBody`, `deny_unknown_fields`, empty body allowed). `{lease_id, revoked, reason, audit_id}`; audited as `admin.lease.revoke` / kind `lease_revoke`. | Usable as is for the action. **Gap:** no dry run, so no cascade preview. |
 | `/admin/policies/reload` | POST | admin | `admin::reload_policies` | `{policy_ids, warnings, sha256, audit_id}`; 409 `reload_unavailable` without `policy.policies_path`; 422 `policy_invalid` (previous set stays; audited as deny). | Usable as is for the action. **Gap:** no read of the loaded set, no check without swapping. |
 | `/admin/root-token` | POST | admin, only with `[dev] allow_root_mint` | `dev_root::mint_root` | A root token. | Never used (granting is a non-goal). Not mounted on the console listener. |
@@ -195,7 +195,7 @@ Acceptance:
 - `GET /admin/audit/checkpoints` leaves the `checkpoints` row count unchanged.
 - Unknown `kind` is 400; missing bearer 401; no admin token configured 403.
 
-Tests: new `crates/attenuo-server/tests/admin_api.rs` (filters, paging both ways, lookup by seq and by id, 404s, auth); unit tests in `crates/attenuo-audit/src/sqlite.rs` for the widened `range_filtered` and the index migration on an existing database.
+Tests: new `crates/attenuo-server/tests/admin_api.rs` (filters, paging both ways, lookup by seq and by id, 404s, auth); unit tests in `crates/attenuo-audit/src/sqlite.rs` (now `sqlite/tests.rs`) for the widened `range_filtered` and the index migration on an existing database.
 
 ### PR 2: Lease tree and cascade preview (G4)
 
