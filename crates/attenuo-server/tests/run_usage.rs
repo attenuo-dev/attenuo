@@ -5,6 +5,8 @@
 //! run; and a soft limit over it with `@obligation("approval")`, settled by the existing
 //! approval flow.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -15,6 +17,8 @@ use attenuo_proxy::UpstreamConfig;
 use attenuo_server::{AppState, Config};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
+
+use common::agent_configs;
 
 const ADMIN: &str = "run-usage-test-admin";
 const AGENTS: &[&str] = &["helper", "helper2"];
@@ -47,11 +51,6 @@ when { context.usage.calls >= 1 && !context.usage.destination_seen && !context.a
 
 fn secret(id: &str) -> String {
     format!("{id}-secret")
-}
-
-fn sha256_hex(s: &str) -> String {
-    use sha2::Digest;
-    hex::encode(sha2::Sha256::digest(s.as_bytes()))
 }
 
 struct Harness {
@@ -111,13 +110,7 @@ impl Harness {
         cfg.upstreams = vec![UpstreamConfig::new("bank", upstream_task.url("/mcp"))];
         cfg.admin.token = Some(ADMIN.into());
         cfg.dev.allow_root_mint = true;
-        cfg.agents = AGENTS
-            .iter()
-            .map(|id| attenuo_server::config::AgentConfig {
-                id: (*id).into(),
-                secret_sha256: sha256_hex(&secret(id)),
-            })
-            .collect();
+        cfg.agents = agent_configs(AGENTS, secret);
         let (router, state) = attenuo_server::build(&cfg).unwrap();
         let server = spawn_router(router).await.unwrap();
         Self {

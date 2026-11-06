@@ -6,6 +6,8 @@
 // Configs are built field by field from `Config::default()`, as in the server tests.
 #![allow(clippy::field_reassign_with_default)]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -19,23 +21,11 @@ use attenuo_server::config::{AgentConfig, DpopMode, DpopNonceMode};
 use attenuo_server::Config;
 use attenuo_token::dpop::{verify_proof, ProofCheck, VerifiedProof};
 
+use common::{attenuo, sha256_hex};
+
 const NONCE: &str = "bm9uY2Utb25lLXNlY3JldA";
 const REFUSAL: &str = r#"{"error":"use_dpop_nonce","detail":"retry with the DPoP-Nonce"}"#;
 const OK_RPC: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[]}}"#;
-
-fn attenuo() -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_attenuo"));
-    for var in [
-        "ATTENUO_ADMIN_TOKEN",
-        "ATTENUO_CLIENT_SECRET",
-        "ATTENUO_TOKEN",
-        "ATTENUO_SERVER",
-        "ATTENUO_DPOP_KEY",
-    ] {
-        c.env_remove(var);
-    }
-    c
-}
 
 /// One scripted reply: status line, extra headers, body.
 type Reply = (&'static str, Vec<(&'static str, String)>, &'static str);
@@ -312,11 +302,6 @@ fn a_second_refusal_is_reported_not_retried_and_a_bearer_is_never_retried() {
 // -- the real server --
 
 const ADMIN: &str = "nonce-test-admin";
-
-fn sha256_hex(s: &str) -> String {
-    use sha2::Digest;
-    hex::encode(sha2::Sha256::digest(s.as_bytes()))
-}
 
 /// The CLI against a server with `[token] dpop_nonce = "required"`: a bound root token, a
 /// call through the proxy, an exchange and an AuthZEN evaluation, each in its own process

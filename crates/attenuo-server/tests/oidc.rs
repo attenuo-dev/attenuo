@@ -1,6 +1,8 @@
 //! Hop-0 intake against a fake identity provider: an axum app on an ephemeral port serving OIDC
 //! discovery and a JWKS with Ed25519 keys generated in the test, minting ID tokens and ID-JAGs.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -19,8 +21,9 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use reqwest::StatusCode;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
+
+use common::sha256_hex;
 
 const ISSUER: &str = "https://attenuo.test";
 const AUDIENCE: &str = "attenuo-test";
@@ -183,10 +186,6 @@ struct Harness {
     server: Spawned,
     state: Arc<AppState>,
     client: reqwest::Client,
-}
-
-fn sha256_hex(s: &str) -> String {
-    hex::encode(Sha256::digest(s.as_bytes()))
 }
 
 impl Harness {

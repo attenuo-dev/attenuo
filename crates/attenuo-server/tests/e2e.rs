@@ -1,6 +1,8 @@
 //! End-to-end: the whole server (issuer, policy, audit, leases, proxy) on an ephemeral port in
 //! front of a fake MCP server, driven over HTTP the way a client would.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,6 +16,8 @@ use attenuo_proxy::UpstreamConfig;
 use attenuo_server::{AppState, Config};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
+
+use common::{agent_configs, sha256_hex};
 
 const ADMIN: &str = "test-admin-token";
 /// Agents registered in `[[agents]]`; each one's secret is [`agent_secret`].
@@ -112,13 +116,7 @@ impl Harness {
         cfg.upstreams = vec![UpstreamConfig::new("github", upstream_task.url("/mcp"))];
         cfg.admin.token = Some(ADMIN.into());
         cfg.dev.allow_root_mint = true;
-        cfg.agents = AGENTS
-            .iter()
-            .map(|id| attenuo_server::config::AgentConfig {
-                id: (*id).into(),
-                secret_sha256: sha256_hex(&agent_secret(id)),
-            })
-            .collect();
+        cfg.agents = agent_configs(AGENTS, agent_secret);
         tweak(&mut cfg);
 
         let clock = ManualClock::new();
@@ -967,11 +965,6 @@ async fn authzen_matches_proxy_decisions() {
 }
 
 const PEP_SECRET: &str = "pep-secret-for-tests";
-
-fn sha256_hex(s: &str) -> String {
-    use sha2::Digest;
-    hex::encode(sha2::Sha256::digest(s.as_bytes()))
-}
 
 /// SR-08: with `allow_unsigned_chain`, a body chain needs PEP credentials and must match, hop by
 /// hop, a chain this server issued. Lease ids alone (they are printed in every token) are not

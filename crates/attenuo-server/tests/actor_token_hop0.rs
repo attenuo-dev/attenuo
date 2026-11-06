@@ -6,6 +6,8 @@
 // Configs are built field by field from `Config::default()`, as in the other server tests.
 #![allow(clippy::field_reassign_with_default)]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -23,8 +25,9 @@ use reqwest::StatusCode;
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, Ed25519KeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
+
+use common::sha256_hex;
 
 const ADMIN: &str = "test-admin-token";
 const ISSUER: &str = "https://attenuo.test";
@@ -39,10 +42,6 @@ const EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 
 fn now() -> i64 {
     OffsetDateTime::now_utc().unix_timestamp()
-}
-
-fn sha256_hex(s: &str) -> String {
-    hex::encode(Sha256::digest(s.as_bytes()))
 }
 
 /// A signing key and its public JWK.

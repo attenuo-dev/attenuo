@@ -9,19 +9,21 @@
 // Configs are built field by field from `Config::default()`, as in the other server tests.
 #![allow(clippy::field_reassign_with_default)]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use attenuo_policy::{ArgType, ToolAttrs};
 use attenuo_proxy::testing::{spawn_router, FakeMcpServer, Spawned};
 use attenuo_proxy::UpstreamConfig;
-use attenuo_server::config::AgentConfig;
 use attenuo_server::Config;
 use attenuo_token::DpopKey;
 use reqwest::{RequestBuilder, StatusCode};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
+
+use common::agent_configs;
 
 const ADMIN: &str = "pass4-admin-token";
 const AGENTS: &[&str] = &["planner", "coder", "reviewer"];
@@ -72,13 +74,7 @@ async fn start(dir: &Path, tweak: impl FnOnce(&mut Config)) -> Server {
     cfg.upstreams = vec![UpstreamConfig::new("github", upstream_task.url("/mcp"))];
     cfg.admin.token = Some(ADMIN.into());
     cfg.dev.allow_root_mint = true;
-    cfg.agents = AGENTS
-        .iter()
-        .map(|id| AgentConfig {
-            id: (*id).into(),
-            secret_sha256: hex::encode(Sha256::digest(secret(id).as_bytes())),
-        })
-        .collect();
+    cfg.agents = agent_configs(AGENTS, secret);
     tweak(&mut cfg);
     let (router, _state) = attenuo_server::build(&cfg).unwrap();
     Server {

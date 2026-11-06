@@ -2,6 +2,8 @@
 //! token is bound to its chain in the lease store (as a digest, never the raw id), and the
 //! admin revokes that chain by the session id, with a dry run and an audit record.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -15,7 +17,8 @@ use attenuo_proxy::UpstreamConfig;
 use attenuo_server::{AppState, Config};
 use reqwest::StatusCode;
 use serde_json::{json, Value};
-use sha2::Digest;
+
+use common::agent_configs;
 
 const ADMIN: &str = "test-admin-token";
 const AGENTS: &[&str] = &["coder"];
@@ -63,13 +66,7 @@ impl Harness {
         cfg.upstreams = vec![UpstreamConfig::new("github", upstream.url("/mcp"))];
         cfg.admin.token = Some(ADMIN.into());
         cfg.dev.allow_root_mint = true;
-        cfg.agents = AGENTS
-            .iter()
-            .map(|id| attenuo_server::config::AgentConfig {
-                id: (*id).into(),
-                secret_sha256: hex::encode(sha2::Sha256::digest(format!("{id}-secret"))),
-            })
-            .collect();
+        cfg.agents = agent_configs(AGENTS, |id| format!("{id}-secret"));
         let (router, state) = attenuo_server::build(&cfg).unwrap();
         let server = spawn_router(router).await.unwrap();
         Self {

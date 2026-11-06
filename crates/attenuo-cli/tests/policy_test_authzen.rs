@@ -4,6 +4,8 @@
 // Configs are built field by field from `Config::default()`, as in the server tests.
 #![allow(clippy::field_reassign_with_default)]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -13,6 +15,8 @@ use attenuo_proxy::testing::{spawn_router, Spawned};
 use attenuo_server::Config;
 use serde_json::Value;
 
+use common::attenuo;
+
 const ADMIN: &str = "policy-test-authzen-admin";
 const POLICY: &str = r#"@id("public_reads")
 permit(principal, action == Action::"github/read_file", resource)
@@ -21,20 +25,6 @@ when { context.input has repo && context.input.repo like "alice/public-*" };
 @id("never")
 forbid(principal, action, resource) when { context.chain.depth > 5 };
 "#;
-
-fn attenuo() -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_attenuo"));
-    for var in [
-        "ATTENUO_ADMIN_TOKEN",
-        "ATTENUO_CLIENT_SECRET",
-        "ATTENUO_TOKEN",
-        "ATTENUO_SERVER",
-        "ATTENUO_DPOP_KEY",
-    ] {
-        c.env_remove(var);
-    }
-    c
-}
 
 /// Run the CLI off the async runtime (the server runs on it).
 async fn run(cmd: Command) -> Output {

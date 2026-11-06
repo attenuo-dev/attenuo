@@ -1,10 +1,10 @@
 //! SR-21: `attenuo audit verify --file <export> --checkpoints <shipped>` reports a
 //! checkpoint signed again after it was shipped off the host.
 
+// The audit crate's record builders, under another name than this crate's `common`.
 #[path = "../../attenuo-audit/tests/common/mod.rs"]
+mod audit_common;
 mod common;
-
-use std::process::Command;
 
 use attenuo_audit::{
     checkpoint_line, entry_line, header_line, AuditSink, ExportHeader, ShippedCheckpoint,
@@ -15,20 +15,14 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use serde_json::{json, Value};
 
-fn attenuo() -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_attenuo"));
-    for var in ["ATTENUO_ADMIN_TOKEN", "ATTENUO_SERVER", "ATTENUO_TOKEN"] {
-        c.env_remove(var);
-    }
-    c
-}
+use common::attenuo;
 
 fn log(issuer: &Issuer, offset: usize) -> SqliteAudit {
     let log = SqliteAudit::open_in_memory()
         .unwrap()
         .with_checkpointing(issuer.detached_signer(), 2);
     for i in offset..offset + 6 {
-        log.append(common::record(i)).unwrap();
+        log.append(audit_common::record(i)).unwrap();
     }
     log
 }
