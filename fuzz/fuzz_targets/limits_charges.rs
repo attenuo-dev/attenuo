@@ -16,8 +16,9 @@
 //! - `usage_charges` starts with one `calls` charge, has distinct destination values, at most
 //!   `MAX_COUNTED_VALUES` of them, and never fails;
 //! - a derived host is non-empty, lowercase, without characters URL parsers disagree on, comes
-//!   from a URL of a special scheme (`https`, `http`, ...) only, and counting it again gives
-//!   the same host;
+//!   from a URL of a special scheme (`https`, `http`, ...) or from a bare host (no scheme, or a
+//!   "scheme" followed by a port, read as `http://` plus the string) only, and counting it
+//!   again gives the same host;
 //! - canonical JSON is a fixpoint (parse and canonicalise again gives the same bytes) and
 //!   `jcs::value_eq` agrees with byte equality of the canonical forms.
 #![no_main]
@@ -64,6 +65,16 @@ const URLS: &[&str] = &[
     "mailto:a@b.example",
     "data:text/plain,x",
     "a.example/x",
+    "www.true-informations.com",
+    "localhost:8080",
+    "a.example:443/x",
+    "a.example:99999",
+    "good.example@evil.example",
+    "a.example:x@b.example",
+    "a.example:80@b.example",
+    "javascript:alert(1)",
+    "tel:911",
+    "http:8080",
     "//a.example/x",
     "https:a.example",
     "https:/a.example",
@@ -405,18 +416,31 @@ fn check_host_shape(host: &str) {
 const SPECIAL: &[&str] = &["http", "https", "ws", "wss", "ftp", "file"];
 
 /// `host` was derived from `source`. Only a special scheme has a host: any other scheme has
-/// an opaque host, which WHATWG neither percent-decodes nor maps through IDNA (FZ2-2). Counting
-/// the host again gives the same host: one destination, one spelling.
+/// an opaque host, which WHATWG neither percent-decodes nor maps through IDNA (FZ2-2). A
+/// string with no scheme is a bare host, the host of `http://` plus the string; so is one whose
+/// "scheme" is followed by a port (`localhost:8080`). Counting the host again gives the same
+/// host: one destination, one spelling.
 fn check_host(host: &str, source: &str) {
     check_host_shape(host);
-    let scheme = source
-        .split_once(':')
-        .map(|(s, _)| s.to_ascii_lowercase())
-        .unwrap_or_default();
-    assert!(
-        SPECIAL.contains(&scheme.as_str()),
-        "{source:?} has a host ({host:?}) under a non-special scheme"
-    );
+    let (scheme, rest) = source.split_once(':').unwrap_or_default();
+    let is_scheme = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c));
+    let special = is_scheme && SPECIAL.contains(&scheme.to_ascii_lowercase().as_str());
+    if !special {
+        let port = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        assert!(
+            !is_scheme || (!port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())),
+            "{source:?} has a host ({host:?}) under a non-special scheme"
+        );
+        let bare = Derive::Host.apply(&Value::String(format!("http://{source}")));
+        assert_eq!(
+            bare.as_deref(),
+            Some(host),
+            "bare host {source:?} is not the host of http://{source}"
+        );
+    }
     let again = Derive::Host.apply(&Value::String(format!("https://{host}/")));
     assert_eq!(
         again.as_deref(),
