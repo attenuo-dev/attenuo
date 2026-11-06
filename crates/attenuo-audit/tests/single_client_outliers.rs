@@ -147,6 +147,7 @@ fn segment(stores: &Stores, config: &str, calls: usize, gap: Duration, out: &mut
         out.reads.push(t.elapsed());
         let took = timed_append(stores, record_for(&chain, i, Decision::Allow), out);
         out.decision.push(took);
+        // The gaps between a client's writes are the workload this probe measures.
         std::thread::sleep(gap);
         let took = timed_append(stores, record_for(&chain, i, Decision::Allow), out);
         out.result.push(took);

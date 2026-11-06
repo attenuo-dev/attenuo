@@ -393,6 +393,7 @@ fn group_commit_keeps_the_chain_and_checkpoints_under_concurrency() {
                 while !stop.load(Ordering::Relaxed) {
                     assert!(log.verify_chain().unwrap().ok);
                     log.checkpoint_if_new(t0()).unwrap();
+                    // Pacing of the concurrent checker, part of the workload: not a wait.
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
             })
