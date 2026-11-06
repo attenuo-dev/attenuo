@@ -45,13 +45,13 @@ Counted with `cargo clippy --workspace --lib -- -W missing_docs -W unreachable_p
 |---|---|---|---|
 | `attenuo-core` | 98 | 0, `#![warn(missing_docs)]` on | 0 |
 | `attenuo-token` | 18 (all in `approval.rs`) | 0, `#![warn(missing_docs)]` on | 0 |
-| `attenuo-policy` | 93 | 93 | 1 (fixed) |
-| `attenuo-audit` | 62 | 62 | 6 (fixed) |
-| `attenuo-proxy` | 41 | 41 | 12 (fixed) |
+| `attenuo-policy` | 93 | 93 (95 at dead1ac) | 1 (fixed) |
+| `attenuo-audit` | 62 | 0, `#![warn(missing_docs)]` on (`chore/audit-docs-small-debt`; 70 at dead1ac) | 6 (fixed) |
+| `attenuo-proxy` | 41 | 41 (41 at dead1ac) | 12 (fixed) |
 | `attenuo-server` | 141 | 141 | 0 |
 | `attenuo-bench` | 122 | 122 | 0 |
 
-`#![warn(missing_docs)]` readiness: core and token are now on. Proxy (41) and audit (62) are an afternoon each. Policy (93) is mostly the AuthZEN wire types and the `testing` harness. Server and bench are not promised stable (ADR-0004), so the lint matters less there than narrowing their surface.
+`#![warn(missing_docs)]` readiness: core and token are now on, and audit since `chore/audit-docs-small-debt`. Proxy (41) is an afternoon. Policy (93) is mostly the AuthZEN wire types and the `testing` harness. Server and bench are not promised stable (ADR-0004), so the lint matters less there than narrowing their surface.
 
 Items that should be `pub(crate)`: the 19 `unreachable_pub` hits were methods on crate-private types (`audit/src/budget.rs:172-185`, `audit/src/spans.rs:53-66`, `proxy/src/label.rs` (12), `policy/src/schema.rs:250`); all are now `pub(crate)`. Beyond the lint: every server module is `pub mod` (`server/src/lib.rs:46-59`) so the integration tests can reach `config`, `state` and `authz`. Much of `replay`, `clientauth` and `sink` is used only inside the crate. Narrowing them needs a look at what each test file imports, so it is listed as debt rather than done.
 
@@ -201,7 +201,7 @@ Effort: S under a day, M one to three days, L more. Risk is the chance of a beha
 | 1 | Centralise `AuditError` to `ApiError`: move the per-route domain mappings (`routes/approvals.rs:176-187`, `renew.rs:204`, `admin.rs:394`) into one function that routes call, so `?` on a domain variant cannot become a 500 | M | Medium: status codes are part of the API; the existing tests pin them |
 | 2 | Bring ADR-0004 up to date: eight crates (bench), IdP intake and JWKS in the server, audit's dependency on token, the CLI's offline commands depending on audit and policy, no `RelationResolver`, the pipeline living in the server | S | Low (docs only) |
 | 3 | One `Authorization` scheme parser for the proxy and the server (`proxy/src/proxy.rs:224`, `server/src/routes/mod.rs:38`), each keeping its own error type | M | Medium: authentication parsing; needs the SR-17 tests to stay green |
-| 4 | `#![warn(missing_docs)]` for `attenuo-proxy` (41) and `attenuo-audit` (62), then `attenuo-policy` (93) | M | Low |
+| 4 | `#![warn(missing_docs)]` for `attenuo-proxy` (41) and `attenuo-audit` (62), then `attenuo-policy` (93) | M | Low. Audit half done (`chore/audit-docs-small-debt`: 70 items documented, lint on); proxy (41) and policy (95) open |
 | 5 | Adopt `cast_possible_truncation` (and wrap and sign-loss), starting with the float-to-int casts on untrusted input (`server/src/idp/mod.rs:503`, `policy/src/request.rs:57`) | M | Medium for the two input casts, low elsewhere |
 | 6 | Move the JSON-RPC error codes the CLI needs (`-32003`, `-32008`) to a module both CLI and proxy can use (core, or a small shared constants module), so `cli/src/main.rs:36-38` stops duplicating `proxy/src/jsonrpc.rs` | S | Low |
 | 7 | Split `audit/src/sqlite.rs` (5,237 lines) into log, leases, budgets, approvals and maintenance submodules; then `server/src/authz.rs` (3,717) by pipeline stage | L | Medium: merge conflicts with any open branch; no behaviour change |
@@ -211,9 +211,9 @@ Effort: S under a day, M one to three days, L more. Risk is the chance of a beha
 | 11 | Narrow the server's `pub mod` surface (`server/src/lib.rs:46-59`) to what `main.rs` and the integration tests use, and give `src/jwks.rs` a name that says "issuer keys" | M | Low |
 | 12 | Adopt `missing_errors_doc` for core, token and policy (an `# Errors` section on each public fallible function) | M | Low |
 | 13 | Python SDK: export audit verification, the MCP helpers and the DPoP helpers from the package root, as TypeScript does | S | Low (additive) |
-| 14 | `audit/src/lease.rs:1134,1152`: `get_or_insert_with` instead of `expect("set above")`; `policy/src/request.rs:204`: parse the fixed Cedar entity type names once | S | Low |
+| 14 | `audit/src/lease.rs:1134,1152`: `get_or_insert_with` instead of `expect("set above")`; `policy/src/request.rs:204`: parse the fixed Cedar entity type names once | S | Low. Done (`chore/audit-docs-small-debt`: `Option::insert` in the memory store, four `LazyLock` type names in `request.rs`) |
 | 15 | Turn on `unreachable_pub` for the library crates so the `pub(crate)` cleanup on this branch stays done | S | Low |
-| 16 | `JcsError` to `thiserror` like every other error type in the workspace | S | Low |
+| 16 | `JcsError` to `thiserror` like every other error type in the workspace | S | Low. Done (`chore/debt-small`; messages unchanged) |
 
 ## What was fixed on this branch
 
