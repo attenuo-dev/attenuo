@@ -53,6 +53,9 @@ from .approval import (
     verify_approval_token,
 )
 from .audit import (
+    ENTRY_HASH_VERSION,
+    EXPORT_FORMAT,
+    GENESIS_HASH,
     SHIPPED_FORMAT,
     BadCheckpoint,
     CrossCheckReport,
@@ -61,13 +64,24 @@ from .audit import (
     ShippedLine,
     ShippedMismatch,
     cross_check,
+    entry_hash,
     parse_shipped,
     verify_export,
 )
-from .capability import ArgLimit, Capability, Equals, Limits, OneOf, Prefix, Range
+from .capability import (
+    ArgLimit,
+    Capability,
+    Equals,
+    Limits,
+    OneOf,
+    Prefix,
+    Range,
+    capabilities_to_json,
+)
 from .client import AsyncClient, Client
 from .dpop import (
     NONCE_HEADER,
+    PROOF_TYPE,
     USE_DPOP_NONCE,
     DpopKey,
     NonceCache,
@@ -98,8 +112,12 @@ except PackageNotFoundError:  # pragma: no cover - running from a source tree
 __all__ = [
     "APPROVAL_TOKEN_TYPE",
     "DEFAULT_MAX_EVENT_BYTES",
+    "ENTRY_HASH_VERSION",
+    "EXPORT_FORMAT",
+    "GENESIS_HASH",
     "META_APPROVAL_KEY",
     "NONCE_HEADER",
+    "PROOF_TYPE",
     "SHIPPED_FORMAT",
     "TOKEN_TYPE",
     "USE_DPOP_NONCE",
@@ -171,8 +189,10 @@ __all__ = [
     "VerifyReport",
     "access_token_hash",
     "call_hash",
+    "capabilities_to_json",
     "cross_check",
     "decode_token",
+    "entry_hash",
     "is_use_dpop_nonce",
     "jwk_thumbprint",
     "mcp_headers",
