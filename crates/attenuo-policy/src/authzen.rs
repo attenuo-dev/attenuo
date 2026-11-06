@@ -28,27 +28,39 @@ pub const SUBJECT_TYPE: &str = "agent";
 /// `resource.type` used for tools.
 pub const RESOURCE_TYPE: &str = "tool";
 
+/// AuthZEN `subject`: who is asking. For attenuo, the current agent of the chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Subject {
+    /// `type` on the wire; [`SUBJECT_TYPE`] (`agent`) for attenuo.
     #[serde(rename = "type")]
     pub r#type: String,
+    /// The current agent's id: the last hop of the chain.
     pub id: String,
+    /// Extra data. attenuo puts the serialized chain under `chain` (required to rebuild the
+    /// call) and the originating user under `originating_user`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub properties: Option<Value>,
 }
 
+/// AuthZEN `action`: what is being done. For attenuo, the tool (or MCP method) being called.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Action {
+    /// The tool name, as in [`ToolCall::tool`].
     pub name: String,
+    /// Extra data. attenuo puts the upstream server's name under `server`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub properties: Option<Value>,
 }
 
+/// AuthZEN `resource`: what the action is done to. For attenuo, the tool on its server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resource {
+    /// `type` on the wire; [`RESOURCE_TYPE`] (`tool`) for attenuo.
     #[serde(rename = "type")]
     pub r#type: String,
+    /// `"<server>/<tool>"`, the same id the Cedar `Tool` entity has.
     pub id: String,
+    /// Extra data. attenuo puts `server` and `tool` here separately.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub properties: Option<Value>,
 }
@@ -56,9 +68,13 @@ pub struct Resource {
 /// AuthZEN evaluation request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvaluationRequest {
+    /// The agent asking.
     pub subject: Subject,
+    /// The tool being called.
     pub action: Action,
+    /// The tool, on its server.
     pub resource: Resource,
+    /// The call's context: its arguments under `input`, and `session_id` when the call has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<Value>,
 }
@@ -67,7 +83,9 @@ pub struct EvaluationRequest {
 /// and any diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvaluationResponse {
+    /// `true` for allow, `false` for deny.
     pub decision: bool,
+    /// `reason`, `policy_ids` and `diagnostics` of the [`Outcome`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<Value>,
 }
@@ -109,6 +127,14 @@ pub fn to_request(chain: &DelegationChain, call: &ToolCall) -> EvaluationRequest
 /// PEP that follows the same conventions: `subject.properties.chain` holds the chain, the
 /// server comes from `action.properties.server` or `resource.properties.server`, and
 /// `context.input` holds the arguments).
+///
+/// # Errors
+///
+/// [`PolicyError::Parse`] when `subject.type` is not [`SUBJECT_TYPE`],
+/// `subject.properties.chain` is missing or does not deserialize as a chain, `subject.id` is
+/// not the chain's current agent, or no server is given and `resource.id` does not end in
+/// `/<action.name>`. The chain is not validated here; [`crate::PolicyEngine::authorize`]
+/// does not validate it either, so a caller verifies it first.
 pub fn to_chain_and_call(
     req: &EvaluationRequest,
 ) -> Result<(DelegationChain, ToolCall), PolicyError> {

@@ -22,19 +22,23 @@ use serde::Serialize;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LintSeverity {
+    /// The file would not load: the engine refuses it.
     Error,
+    /// The file loads, but something in it is likely a mistake or deprecated.
     Warning,
 }
 
 /// One problem found in a policy file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LintIssue {
+    /// Whether the issue fails the lint.
     pub severity: LintSeverity,
     /// `schema`, `parse`, `actions`, `obligations` or `validate`.
     pub stage: &'static str,
     /// The policy the issue is about, when Cedar names one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_id: Option<String>,
+    /// What is wrong, as Cedar or the stage words it.
     pub message: String,
     /// 1-based line in the policy text, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -47,20 +51,24 @@ pub struct LintIssue {
 /// Everything [`lint`] found.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct LintReport {
+    /// Every issue, in the order the stages found them.
     pub issues: Vec<LintIssue>,
     /// Ids of the policies that parsed (empty when parsing failed).
     pub policy_ids: Vec<String>,
 }
 
 impl LintReport {
+    /// Number of [`LintSeverity::Error`] issues.
     pub fn error_count(&self) -> usize {
         self.count(LintSeverity::Error)
     }
 
+    /// Number of [`LintSeverity::Warning`] issues.
     pub fn warning_count(&self) -> usize {
         self.count(LintSeverity::Warning)
     }
 
+    /// At least one issue is an error, so the file fails the lint.
     pub fn has_errors(&self) -> bool {
         self.error_count() > 0
     }

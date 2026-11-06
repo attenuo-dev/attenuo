@@ -219,6 +219,8 @@
 //! ```
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
+#![warn(clippy::missing_errors_doc)]
 #![warn(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -468,6 +470,7 @@ pub enum PolicyError {
     /// `permit`.
     #[error("policy obligation error: {0}")]
     Obligation(String),
+    /// A policy file added with [`PolicyEngineBuilder::with_policies_file`] could not be read.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -475,6 +478,7 @@ pub enum PolicyError {
 /// The result of one authorization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
+    /// Allow or Deny. An approval requirement is a Deny with reason `approval_required`.
     pub decision: Decision,
     /// One of `invalid_name`, `capability_denied`, `tool_not_in_catalog`, `attribute_type_mismatch`,
     /// `input_type_mismatch`, `policy_allow`, `policy_deny`, `approval_required`, `policy_error`.
@@ -524,6 +528,9 @@ impl Default for PolicyEngineBuilder {
 }
 
 impl PolicyEngineBuilder {
+    /// The defaults: no policies, [`DEFAULT_SCHEMA`], an empty catalog, the built-in user
+    /// attributes (`mfa`, `roles`, `tenant`, `email`), unknown tools denied, server-qualified
+    /// actions, no annotation import and [`TrackUsage::Auto`].
     pub fn new() -> Self {
         Self {
             policy_sources: Vec::new(),
@@ -619,6 +626,12 @@ impl PolicyEngineBuilder {
     /// and `Tool in [Server]`. Actions are always generated, so a base that declares
     /// `Action::"invoke"` or a catalog action fails to parse. [`build`](Self::build) runs this
     /// too.
+    ///
+    /// # Errors
+    ///
+    /// [`PolicyError::Schema`] when the generated schema text does not parse, or, for a replaced
+    /// base schema, when it lacks one of the four entity types or one of their required
+    /// attributes or parent relations; the message starts `custom base schema:` in that case.
     pub fn check_schema(&self) -> Result<(), PolicyError> {
         self.parse_schema().map(|_| ())
     }
@@ -649,6 +662,17 @@ impl PolicyEngineBuilder {
         Ok(schema)
     }
 
+    /// Validate the catalog and the schema, read and concatenate the policy sources in the order
+    /// they were added, then parse and validate the policies against the schema.
+    ///
+    /// # Errors
+    ///
+    /// [`PolicyError::Catalog`] when [`ToolCatalog::validate`] refuses the catalog; the errors
+    /// of [`check_schema`](Self::check_schema); [`PolicyError::Io`] when a policy file cannot
+    /// be read; [`PolicyError::Parse`] when the policy text does not parse or two policies share
+    /// an `@id`; [`PolicyError::Validation`] when a policy does not type-check against the
+    /// schema (strict mode; all errors, joined); [`PolicyError::Obligation`] for an
+    /// `@obligation` the engine cannot honour.
     pub fn build(self) -> Result<PolicyEngine, PolicyError> {
         self.catalog.validate().map_err(PolicyError::Catalog)?;
         let schema_text = self.schema_text();
@@ -1264,6 +1288,12 @@ impl PolicyEngine {
 
     /// Serve an AuthZEN evaluation request. The chain is taken from
     /// `subject.properties.chain`; see [`authzen`].
+    ///
+    /// # Errors
+    ///
+    /// [`PolicyError::Parse`] when the request cannot be turned back into a chain and a call (see
+    /// [`authzen::to_chain_and_call`]). A request that translates always gets a response, with
+    /// `decision: false` for a deny.
     pub fn evaluate(
         &self,
         req: &authzen::EvaluationRequest,
@@ -1275,6 +1305,11 @@ impl PolicyEngine {
 
     /// Replace the policy set. The new policies are parsed and validated against the engine's
     /// schema first; on error the previous policies stay in force.
+    ///
+    /// # Errors
+    ///
+    /// As for the policies in [`PolicyEngineBuilder::build`]: [`PolicyError::Parse`],
+    /// [`PolicyError::Validation`] or [`PolicyError::Obligation`]. The engine is unchanged.
     pub fn reload_policies_str(&mut self, policies: &str) -> Result<(), PolicyError> {
         let loaded = load_policies(policies, &self.schema)?;
         self.policies = loaded.policies;
@@ -1334,6 +1369,8 @@ impl PolicyEngine {
         &self.schema_text
     }
 
+    /// The tool catalog the engine was built with, without any narrowing from imported
+    /// annotations.
     pub fn catalog(&self) -> &ToolCatalog {
         &self.catalog
     }
