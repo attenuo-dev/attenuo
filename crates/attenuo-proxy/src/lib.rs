@@ -156,6 +156,7 @@ pub mod auth;
 pub mod config;
 pub mod filter;
 pub mod guard;
+pub mod http_trace;
 pub mod jsonrpc;
 pub mod label;
 pub mod listed;

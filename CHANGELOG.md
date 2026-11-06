@@ -46,6 +46,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 - Proxy: when the map of calls awaited for the listen stream is full, the run holding the most entries gives up its oldest, so one run can no longer push out every other run's awaited calls (SR-86).
 - Server: a repeated form `scope` on `POST /token` is refused like any other repeated parameter, instead of keeping the last one (SR-88).
 - Proxy: a list request (`tools/list`, `resources/list`, `resources/templates/list`, `prompts/list`) that the upstream answers with `202` and then answers in the body of a later `POST` of the same session and run is now filtered there (and screened under `[proxy] list_filter = "policy"`), like an answer in its own body. The proxy remembers list requests next to awaited calls, with the same bounds and ten-minute expiry; a `POST` that forwards a request while one of its scope is awaited has its answer read for this, and one the proxy cannot read is answered `502` (SR-87).
+- Server and proxy: the `request` span of every `TraceLayer` (API router, proxy router, console listener) records the route template (`MatchedPath`, or `unmatched`) instead of the full URI, so a query string such as `/admin/audit?subject=...` no longer reaches the log at `tower_http=debug` (SR-90).
 
 ### Changed
 
