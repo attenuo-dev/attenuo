@@ -30,6 +30,12 @@ pub async fn jwks(State(state): State<Arc<AppState>>) -> Json<Value> {
 /// protect it (9.2.1, 11.8). It holds only the base URL and the two endpoint paths. The search
 /// endpoint parameters are left out because the Search APIs are not served (9.1.1: absent
 /// means unsupported); `capabilities` and `signed_metadata` are not published.
+///
+/// # Errors
+///
+/// 400 `invalid_host` when `[server] public_url` is unset and the `Host` header is not a loopback
+/// name (`localhost`, `127.0.0.1` or `[::1]`), so a forged `Host` never reaches a cached discovery
+/// document (SR-19).
 pub async fn authzen_configuration(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

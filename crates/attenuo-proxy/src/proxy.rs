@@ -232,6 +232,11 @@ fn upstream_client() -> reqwest::Client {
 }
 
 /// Bind `config.listen` and serve the proxy until the task is cancelled.
+///
+/// # Errors
+///
+/// When `config.listen` cannot be bound (in use, or not permitted), when the bound address cannot
+/// be read back, or when the server itself fails with an I/O error.
 pub async fn serve(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     tracing::info!(addr = %listener.local_addr()?, "attenuo proxy listening");

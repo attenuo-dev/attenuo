@@ -40,8 +40,12 @@ pub(super) fn record_usage(u: &UsageContext) -> RecordUsage {
 }
 
 /// SHA-256 (hex) and length of the RFC 8785 canonical JSON of an upstream result: what a
-/// `tool_result` record stores instead of the result. `Err` for a value with no canonical
-/// form (nothing parsed from JSON has one).
+/// `tool_result` record stores instead of the result.
+///
+/// # Errors
+///
+/// The canonicalization error, as text, for a value with no RFC 8785 form (a number JSON cannot
+/// carry); nothing parsed from JSON has one, so in practice this does not fail.
 pub fn result_digest(result: &Value) -> Result<(String, u64), String> {
     let bytes = attenuo_core::jcs::to_vec(result).map_err(|e| e.to_string())?;
     Ok((

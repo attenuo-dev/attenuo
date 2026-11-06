@@ -36,9 +36,26 @@ pub struct LeaseStatus {
 }
 
 /// Registry of leases and their revocation state.
+///
+/// # Errors
+///
+/// Every method can fail on a store fault, which each method's own `# Errors` section calls
+/// that: [`AuditError::Poisoned`] when a writer panicked holding one of the store's locks,
+/// and, for the file store, [`AuditError::Sqlite`] when a query or commit fails,
+/// [`AuditError::Serde`], [`AuditError::TimeFormat`] or [`AuditError::TimeParse`] when a
+/// stored value cannot be written or read back, [`AuditError::Storage`] when a stored figure
+/// is out of range or the store is not as it must be, and [`AuditError::Corrupt`] when a
+/// row cannot be read back. The refusals a method makes on purpose (an unknown lease, a
+/// conflicting binding, an approval that is not pending) are listed on that method.
 pub trait LeaseStore: Send + Sync {
     /// Record a lease. Registering an id that already exists overwrites its parent and expiry
     /// but never clears a revocation.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::UnknownLease`] when `lease` belongs to a tree that
+    /// [`prune_leases`](Self::prune_leases) has started deleting, or a store fault (see
+    /// [`LeaseStore`]).
     fn register(
         &self,
         lease: &LeaseId,
@@ -47,16 +64,25 @@ pub trait LeaseStore: Send + Sync {
     ) -> Result<(), AuditError>;
 
     /// Revoke `lease` and every lease descended from it. Returns how many leases changed from
-    /// unrevoked to revoked (already-revoked ones are not counted again). Revoking an unknown
-    /// lease is an error, so a typo cannot pass for a successful revocation.
+    /// unrevoked to revoked (already-revoked ones are not counted again).
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::UnknownLease`] when the store has no row for `lease`, so a typo cannot pass
+    /// for a successful revocation, or a store fault (see [`LeaseStore`]).
     fn revoke(&self, lease: &LeaseId, reason: &str, now: OffsetDateTime)
         -> Result<u64, AuditError>;
 
     /// Set the expiry of `lease` to `new_expires_at` (a heartbeat). The caller computes the
     /// new value and is responsible for capping it (token expiry, parent lease); the store
-    /// only refuses leases it must not revive: an unknown id is [`AuditError::UnknownLease`]
-    /// and a revoked one is [`AuditError::LeaseRevoked`]. An expired but unrevoked lease may
-    /// be renewed. Revocation state and the parent link are untouched.
+    /// only refuses leases it must not revive. An expired but unrevoked lease may be renewed.
+    /// Revocation state and the parent link are untouched.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::UnknownLease`] when the store has no row for `lease` or its tree is being
+    /// deleted by [`prune_leases`](Self::prune_leases), [`AuditError::LeaseRevoked`] when it is
+    /// revoked, or a store fault (see [`LeaseStore`]).
     fn renew(
         &self,
         lease: &LeaseId,
@@ -65,32 +91,55 @@ pub trait LeaseStore: Send + Sync {
     ) -> Result<(), AuditError>;
 
     /// Known, not revoked, and `expires_at > now`.
+    ///
+    /// # Errors
+    ///
+    /// Only a store fault (see [`LeaseStore`]): an unknown lease is `Ok(false)`, not an error.
     fn is_active(&self, lease: &LeaseId, now: OffsetDateTime) -> Result<bool, AuditError>;
 
     /// Record which chain `lease` was issued for: the digest of the chain up to and including
     /// the hop that holds the lease (`DelegationChain::prefix_digest`). Write-once: binding a
-    /// lease again to the same value is a no-op, to a different value is
-    /// [`AuditError::BindingConflict`], and an unknown lease is [`AuditError::UnknownLease`].
+    /// lease again to the same value is a no-op, to a different value an error.
     ///
     /// The issuer binds every lease it registers. A chain presented without its signed token
     /// (an AuthZEN body chain) is accepted only if every hop's prefix digest equals its lease's
     /// binding, so lease ids alone, which are not secret, cannot be stitched into a forged
     /// chain.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::UnknownLease`] when the store has no row for `lease`,
+    /// [`AuditError::BindingConflict`] when it is already bound to a different value, or a store
+    /// fault (see [`LeaseStore`]).
     fn bind(&self, lease: &LeaseId, binding: &str) -> Result<(), AuditError>;
 
     /// The binding recorded by [`bind`](Self::bind), or `None` (unknown or never bound).
+    ///
+    /// # Errors
+    ///
+    /// Only a store fault (see [`LeaseStore`]): an unknown or unbound lease is `Ok(None)`.
     fn binding(&self, lease: &LeaseId) -> Result<Option<String>, AuditError>;
 
     /// Record the originating user's subject (`sub` of the chain's originating-user block) of
     /// the token `lease` was issued for, so [`LeaseSelector::Subject`] can find it. The issuer
     /// records it for every lease it registers. Write-once, like [`bind`](Self::bind):
-    /// recording the same subject again is a no-op, a different one is
-    /// [`AuditError::BindingConflict`], and an unknown lease is [`AuditError::UnknownLease`].
+    /// recording the same subject again is a no-op, a different one an error.
     /// Leases registered before the store kept subjects have none and are never matched by a
     /// subject selector.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::UnknownLease`] when the store has no row for `lease`,
+    /// [`AuditError::BindingConflict`] when a different subject is already recorded, or a store
+    /// fault (see [`LeaseStore`]).
     fn record_subject(&self, lease: &LeaseId, subject: &str) -> Result<(), AuditError>;
 
     /// The subject recorded by [`record_subject`](Self::record_subject), or `None`.
+    ///
+    /// # Errors
+    ///
+    /// Only a store fault (see [`LeaseStore`]): an unknown lease or one without a subject is
+    /// `Ok(None)`.
     fn subject(&self, lease: &LeaseId) -> Result<Option<String>, AuditError>;
 
     /// [`subject`](Self::subject) for many leases at once: the recorded subject of each lease
@@ -98,6 +147,11 @@ pub trait LeaseStore: Send + Sync {
     /// subjects were kept) are absent from the map. The stores answer with one lock (the file
     /// store with `IN (...)` queries), so a lease tree of thousands of nodes costs no query per
     /// node; the default asks [`subject`](Self::subject) once per lease.
+    ///
+    /// # Errors
+    ///
+    /// Only a store fault (see [`LeaseStore`]), the first one met; unknown leases are left out of
+    /// the map.
     fn subjects(&self, leases: &[&LeaseId]) -> Result<BTreeMap<LeaseId, String>, AuditError> {
         let mut out = BTreeMap::new();
         for lease in leases {
@@ -114,8 +168,12 @@ pub trait LeaseStore: Send + Sync {
     /// SHA-256 of the `Mcp-Session-Id` in lowercase hex (`attenuo_proxy::session::session_digest`;
     /// the audit tag of the session is its first 12 characters): raw session ids are never
     /// stored. Write-once per `(session, server)`: returns `true` when the binding is new and
-    /// `false` when one was already recorded, whatever its chain, which is then kept. An
-    /// unknown `chain_id` is [`AuditError::UnknownLease`].
+    /// `false` when one was already recorded, whatever its chain, which is then kept.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::UnknownLease`] when the store has no row for `chain_id`, or a store fault (see
+    /// [`LeaseStore`]). A binding already recorded for `(session, server)` is `Ok(false)`.
     fn record_session(
         &self,
         session: &str,
@@ -126,6 +184,10 @@ pub trait LeaseStore: Send + Sync {
 
     /// The bindings [`record_session`](Self::record_session) recorded for the session digest
     /// `session`, ordered by server; empty for an unknown session.
+    ///
+    /// # Errors
+    ///
+    /// Only a store fault (see [`LeaseStore`]): an unknown session is an empty list.
     fn sessions(&self, session: &str) -> Result<Vec<SessionBinding>, AuditError>;
 
     /// One pass of session retention: look at up to `max_rows` session bindings, in the order
@@ -136,6 +198,11 @@ pub trait LeaseStore: Send + Sync {
     /// chain a concurrent renewal has just revived. A pruned session resolves to no chain,
     /// like a session that was never recorded: [`LeaseSelector::Session`] matches nothing and
     /// [`sessions`](Self::sessions) is empty.
+    ///
+    /// # Errors
+    ///
+    /// Only a store fault (see [`LeaseStore`]); the pass's transaction is then rolled back and
+    /// nothing is deleted.
     fn prune_sessions(
         &self,
         now: OffsetDateTime,
@@ -167,6 +234,11 @@ pub trait LeaseStore: Send + Sync {
     /// Every lease of such a tree is inactive throughout: a check reads it as revoked or
     /// expired until its row goes, then as unknown. A pruned lease reads as unknown, which
     /// every check treats as inactive (`lease_unknown`); selectors no longer match it.
+    ///
+    /// # Errors
+    ///
+    /// Only a store fault (see [`LeaseStore`]); the pass's transaction is then rolled back and
+    /// nothing is deleted.
     fn prune_leases(
         &self,
         now: OffsetDateTime,
@@ -189,6 +261,11 @@ pub trait LeaseStore: Send + Sync {
     /// the end of the approvals it reports `wrapped`, and the next pass starts again with the
     /// charge log. One write transaction per pass. A refund of a pruned charge is refused as
     /// [`AuditError::UnknownCharge`], like a decision that charged nothing.
+    ///
+    /// # Errors
+    ///
+    /// Only a store fault (see [`LeaseStore`]); the pass's transaction is then rolled back and
+    /// nothing is deleted.
     fn prune_run_state(
         &self,
         now: OffsetDateTime,
@@ -200,12 +277,21 @@ pub trait LeaseStore: Send + Sync {
     /// `matched` is every unrevoked lease the selector names, `revoked` every unrevoked lease
     /// a revocation would change (the matches and their descendants). Read in one
     /// transaction.
+    ///
+    /// # Errors
+    ///
+    /// Only a store fault (see [`LeaseStore`]): a selector that matches nothing is an empty result.
     fn preview_selected(&self, selector: &LeaseSelector) -> Result<SelectorRevocation, AuditError>;
 
     /// Revoke every unrevoked lease `selector` names, each with the cascade of
     /// [`revoke`](Self::revoke), in one transaction. Returns the matches and every lease that
     /// changed from unrevoked to revoked. Matching nothing is not an error (an empty result):
     /// a selector names a set, and an empty set is a valid answer during an incident.
+    ///
+    /// # Errors
+    ///
+    /// Only a store fault (see [`LeaseStore`]), in which case nothing is revoked: a selector that
+    /// matches nothing is an empty result.
     fn revoke_selected(
         &self,
         selector: &LeaseSelector,
@@ -214,6 +300,11 @@ pub trait LeaseStore: Send + Sync {
     ) -> Result<SelectorRevocation, AuditError>;
 
     /// Classify every lease. A lease that is both revoked and expired is reported as revoked.
+    ///
+    /// # Errors
+    ///
+    /// Only a store fault (see [`LeaseStore`]): unknown leases are reported in
+    /// [`LeaseStatus::unknown`], not as an error.
     fn check_all(
         &self,
         leases: &[&LeaseId],
@@ -221,24 +312,38 @@ pub trait LeaseStore: Send + Sync {
     ) -> Result<LeaseStatus, AuditError>;
 
     /// Add an output label to the taint state of the delegation run `chain_id` (the lease of
-    /// the run's first hop; ADR-0009). The run's lease must be known
-    /// ([`AuditError::UnknownLease`] otherwise); the check and the write are one transaction.
+    /// the run's first hop; ADR-0009). The run's lease must be known; the check and the write
+    /// are one transaction.
     /// The store keeps one label per source, the one with the smallest `seq`, so reading the
     /// taint state costs the same however many results the run reads (every result is in the
     /// audit log as a `tool_result` record). Labels are never removed: taint only grows.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::UnknownLease`] when the store has no row for `chain_id`, or a store fault (see
+    /// [`LeaseStore`]), including a `label.seq` the file store cannot hold
+    /// ([`AuditError::Storage`]).
     fn add_label(&self, chain_id: &LeaseId, label: &RunLabel) -> Result<(), AuditError>;
 
     /// The taint state of the run `chain_id`: the first label of each source, ordered by
     /// `seq`. Empty for a run that has read nothing untrusted. Callers must treat an error as
     /// tainted (fail closed).
+    ///
+    /// # Errors
+    ///
+    /// Only a store fault (see [`LeaseStore`]), which the caller must read as tainted.
     fn labels(&self, chain_id: &LeaseId) -> Result<Vec<RunLabel>, AuditError>;
 
     /// Add the fingerprints of one untrusted result to the span index of the run `chain_id`
     /// (ADR-0009 phase 2, [`crate::spans`]), tagged with `seq`, the audit `seq` of the result's
-    /// `tool_result` record. The run's lease must be known ([`AuditError::UnknownLease`]
-    /// otherwise). Keeps at most [`MAX_SPANS_PER_RUN`] per run, evicting the oldest results'
-    /// sets first; the check, the eviction and the write are one transaction. Nothing is
-    /// written for an empty `spans`.
+    /// `tool_result` record. The run's lease must be known. Keeps at most [`MAX_SPANS_PER_RUN`] per
+    /// run, evicting the oldest results' sets first; the check, the eviction and the write are one
+    /// transaction. Nothing is written for an empty `spans`.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::UnknownLease`] when the store has no row for `chain_id`, or a store fault (see
+    /// [`LeaseStore`]), including a `seq` the file store cannot hold ([`AuditError::Storage`]).
     fn add_spans(
         &self,
         chain_id: &LeaseId,
@@ -251,6 +356,10 @@ pub trait LeaseStore: Send + Sync {
     /// `seq`s), ordered by probe, then `seq`. Empty for a run with no index. One lookup per
     /// probe, so callers bound and deduplicate `probes`. Callers must treat an error as a
     /// match (fail closed).
+    ///
+    /// # Errors
+    ///
+    /// Only a store fault (see [`LeaseStore`]), which the caller must read as a match.
     fn find_spans(
         &self,
         chain_id: &LeaseId,
@@ -259,30 +368,49 @@ pub trait LeaseStore: Send + Sync {
 
     /// Store a pending approval (ADR-0009). `approval.state` is ignored (stored as pending);
     /// `approval.expires_at` is lowered to the expiry of `approval.lease`, which must be known
-    /// and live ([`AuditError::UnknownLease`], [`AuditError::LeaseRevoked`] or
-    /// [`AuditError::ApprovalExpired`] otherwise); the check and the write are one
-    /// transaction. When a pending, unexpired approval for the same run, lease and call hash
-    /// already exists, nothing is written and that one is returned with `false`, so an agent
-    /// that repeats a gated call gets the same approval id. Otherwise, when the run already has
-    /// [`crate::MAX_PENDING_APPROVALS_PER_RUN`] pending, unexpired approvals, nothing is
-    /// written and [`AuditError::TooManyPendingApprovals`] is returned (SR-92). Returns the
+    /// and live; the check and the write are one transaction. When a pending, unexpired approval
+    /// for the same run, lease and call hash already exists, nothing is written and that one is
+    /// returned with `false`, so an agent that repeats a gated call gets the same approval id.
+    /// Otherwise, when the run already has [`crate::MAX_PENDING_APPROVALS_PER_RUN`] pending,
+    /// unexpired approvals, nothing is written and the approval is refused (SR-92). Returns the
     /// stored approval and whether it is new.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::UnknownLease`] when `approval.lease` is unknown, [`AuditError::LeaseRevoked`]
+    /// when it is revoked, [`AuditError::ApprovalExpired`] when it has expired,
+    /// [`AuditError::TooManyPendingApprovals`] when the run is at the cap, or a store fault (see
+    /// [`LeaseStore`]).
     fn create_approval(&self, approval: &Approval) -> Result<(Approval, bool), AuditError>;
 
     /// One approval by id, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// Only a store fault (see [`LeaseStore`]): an unknown id is `Ok(None)`.
     fn approval(&self, id: &str) -> Result<Option<Approval>, AuditError>;
 
     /// Approvals newest first, at most `limit`; only those of the run `chain_id` when given.
+    ///
+    /// # Errors
+    ///
+    /// Only a store fault (see [`LeaseStore`]): an unknown run is an empty list.
     fn approvals(
         &self,
         chain_id: Option<&LeaseId>,
         limit: usize,
     ) -> Result<Vec<Approval>, AuditError>;
 
-    /// Grant (`grant = true`) or decline a pending approval. Refused with
-    /// [`AuditError::UnknownApproval`], [`AuditError::ApprovalNotPending`],
-    /// [`AuditError::ApprovalExpired`] (the approval or its lease), or
-    /// [`AuditError::LeaseRevoked`]; the checks and the write are one transaction.
+    /// Grant (`grant = true`) or decline a pending approval; the checks and the write are one
+    /// transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::UnknownApproval`] when no approval has this id,
+    /// [`AuditError::ApprovalNotPending`] when it was already decided or consumed,
+    /// [`AuditError::ApprovalExpired`] when it or its lease has expired,
+    /// [`AuditError::LeaseRevoked`] when its lease is revoked, [`AuditError::UnknownLease`] when
+    /// its lease is gone, or a store fault (see [`LeaseStore`]).
     fn decide_approval(
         &self,
         id: &str,
@@ -295,6 +423,10 @@ pub trait LeaseStore: Send + Sync {
     /// the run `chain_id`, and mark it consumed by `decision_id`, in one transaction, so two
     /// concurrent retries cannot both use it. The lease must be live. `None` when there is
     /// none.
+    ///
+    /// # Errors
+    ///
+    /// Only a store fault (see [`LeaseStore`]): a dead lease or no usable approval is `Ok(None)`.
     fn take_approval(
         &self,
         chain_id: &LeaseId,
@@ -309,6 +441,10 @@ pub trait LeaseStore: Send + Sync {
     /// unexpired, of the run `chain_id`, of the hop holding `lease` (which must be live) and
     /// for `call_hash`, in one transaction. `None` otherwise (unknown, pending, declined,
     /// already consumed, expired, another call or hop, or a dead lease).
+    ///
+    /// # Errors
+    ///
+    /// Only a store fault (see [`LeaseStore`]): every refusal listed above is `Ok(None)`.
     fn take_approval_by_id(
         &self,
         id: &str,
@@ -323,21 +459,41 @@ pub trait LeaseStore: Send + Sync {
     /// [`take_approval_by_id`](Self::take_approval_by_id)) for a decision that did not go through
     /// (denied anyway, or its audit append failed): an approval consumed by `decision_id` is
     /// granted again. Anything else is left alone.
+    ///
+    /// # Errors
+    ///
+    /// Only a store fault (see [`LeaseStore`]): an unknown id or an approval not consumed by
+    /// `decision_id` is left alone and is `Ok(())`.
     fn restore_approval(&self, id: &str, decision_id: &str) -> Result<(), AuditError>;
 
     /// Delete an approval whose request could not be recorded.
+    ///
+    /// # Errors
+    ///
+    /// Only a store fault (see [`LeaseStore`]): removing an unknown id is `Ok(())`.
     fn remove_approval(&self, id: &str) -> Result<(), AuditError>;
 
     /// Run limits (ADR-0010): what the counter of each charge holds now, in order. A counter
     /// never charged holds 0. The charges' `amount` and `max` are ignored. Reading does not
     /// look at the leases, so the counters of a revoked or expired lease can still be read.
     /// Callers must deny a limited call when this fails (`budget_error`).
+    ///
+    /// # Errors
+    ///
+    /// A charge whose capability index does not fit the counter key ([`AuditError::Storage`]), or a
+    /// store fault (see [`LeaseStore`]).
     fn budget_used(&self, charges: &[Charge]) -> Result<Vec<u64>, AuditError>;
 
     /// Charge one allowed call (ADR-0010): check every charge against its counter and either
     /// apply all of them, logged under `decision_id`, or none (`Exhausted`, naming the first
     /// that would go over its `max`), in one transaction. An empty `charges` writes nothing.
     /// A decision id that already has charges is refused, so a decision is charged once.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Storage`] when `decision_id` already has charges or a charge's figures do not
+    /// fit the store, or a store fault (see [`LeaseStore`]); nothing is charged then. A charge that
+    /// would go over its `max` is not an error but `Ok(ChargeOutcome::Exhausted { .. })`.
     fn charge(
         &self,
         decision_id: &str,
@@ -352,6 +508,10 @@ pub trait LeaseStore: Send + Sync {
     /// [`AuditSink::append_synced`](crate::AuditSink::append_synced) on a sink with the same
     /// [`sync_file`](Self::sync_file) has returned, since that sync covers this commit too.
     /// The default charges and syncs as `charge` does and returns `false`.
+    ///
+    /// # Errors
+    ///
+    /// As [`charge`](Self::charge).
     fn charge_sync_deferred(
         &self,
         decision_id: &str,
@@ -372,15 +532,24 @@ pub trait LeaseStore: Send + Sync {
     /// transaction, run-usage counters included. Returns how many token-limit counters were
     /// restored (run usage is not counted, so a decision that charged only usage returns 0).
     /// A `distinct` value is freed, and counted, only when no other unrefunded decision used
-    /// it (SR-62; see [`crate::budget`]). [`AuditError::UnknownCharge`]
-    /// when the decision charged nothing, [`AuditError::ChargeRefunded`] when it was already
-    /// refunded. Used by the pipeline when a charged decision's audit append fails, and by
-    /// the operator refund (`POST /admin/budgets/refund`).
+    /// it (SR-62; see [`crate::budget`]). Used by the pipeline when a charged decision's audit
+    /// append fails, and by the operator refund (`POST /admin/budgets/refund`).
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::UnknownCharge`] when `decision_id` charged nothing (or its charge was pruned),
+    /// [`AuditError::ChargeRefunded`] when it was already refunded, or a store fault (see
+    /// [`LeaseStore`]).
     fn refund(&self, decision_id: &str, at: OffsetDateTime) -> Result<u64, AuditError>;
 
     /// Keep the limited capabilities of the hop whose lease is `lease`, as issued (ADR-0010),
     /// for the admin console. Display only: enforcement reads the limits from the token. The
     /// default keeps nothing.
+    ///
+    /// # Errors
+    ///
+    /// A store that keeps the limits fails on a store fault (see [`LeaseStore`]) or when `limits`
+    /// cannot be serialized ([`AuditError::Storage`]). The default cannot fail.
     fn record_hop_limits(&self, lease: &LeaseId, limits: &[HopLimit]) -> Result<(), AuditError> {
         let _ = (lease, limits);
         Ok(())
@@ -389,6 +558,11 @@ pub trait LeaseStore: Send + Sync {
     /// What [`record_hop_limits`](Self::record_hop_limits) kept for `lease`. `None` when
     /// nothing was kept (a hop without limits, a lease issued before this was recorded, or a
     /// store that keeps none, the default).
+    ///
+    /// # Errors
+    ///
+    /// A store that keeps the limits fails on a store fault (see [`LeaseStore`]) or when the kept
+    /// value no longer deserializes ([`AuditError::Storage`]). The default cannot fail.
     fn hop_limits(&self, lease: &LeaseId) -> Result<Option<Vec<HopLimit>>, AuditError> {
         let _ = lease;
         Ok(None)
@@ -396,6 +570,10 @@ pub trait LeaseStore: Send + Sync {
 
     /// Every counter under `lease`, grouped ([`CounterSummary`]): its limits' counters and,
     /// for a run's root lease, the run's usage. Empty when nothing was charged, and by default.
+    ///
+    /// # Errors
+    ///
+    /// Only a store fault (see [`LeaseStore`]). The default cannot fail.
     fn budget_summary(&self, lease: &LeaseId) -> Result<Vec<CounterSummary>, AuditError> {
         let _ = lease;
         Ok(Vec::new())
@@ -1265,6 +1443,10 @@ impl MemoryLeaseStore {
     }
 
     /// Copy of one lease's row, if known.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked while holding the lease table's lock.
     pub fn get(&self, lease: &LeaseId) -> Result<Option<LeaseRow>, AuditError> {
         Ok(self.rows.lock()?.get(lease).cloned())
     }
@@ -1272,6 +1454,11 @@ impl MemoryLeaseStore {
     /// What revoking `lease` would touch, without changing anything; `None` for an unknown
     /// lease. `nodes` holds at most `max_nodes` leases (at least 1); `would_revoke` counts
     /// the whole subtree. See [`LeaseSubtree`]; the SQLite store answers the same way.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked while holding the lease table's lock. An
+    /// unknown lease is `Ok(None)`.
     pub fn subtree(
         &self,
         lease: &LeaseId,

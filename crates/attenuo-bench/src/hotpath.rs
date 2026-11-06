@@ -1139,6 +1139,13 @@ fn render(r: &HotReport) -> String {
 }
 
 /// Run `attenuo-bench hot-path`.
+///
+/// # Errors
+///
+/// When an argument is out of range (`--duration`, `--runs`, `--clients`, `--tokens`, `--depth`
+/// outside 2 to 8, `--list-values` above the cap or 0 with `distinct_list`), when the binaries
+/// cannot be found or copied or the server does not start, when a cell's answers are not what it
+/// expects, or when the report cannot be written.
 pub async fn run(args: &HotPathArgs) -> Result<()> {
     ensure!(args.duration > 0.0, "--duration must be positive");
     ensure!(args.runs > 0, "--runs must be at least 1");

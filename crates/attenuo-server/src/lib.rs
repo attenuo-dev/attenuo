@@ -44,6 +44,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(unreachable_pub)]
+#![warn(clippy::missing_errors_doc)]
 #![warn(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -86,6 +87,10 @@ pub use config::Config;
 pub use state::AppState;
 
 /// Build the state and the full router from a config.
+///
+/// # Errors
+///
+/// As [`AppState::from_config`].
 pub fn build(config: &Config) -> anyhow::Result<(Router, Arc<AppState>)> {
     build_with_clock(config, attenuo_core::clock::system_clock())
 }
@@ -93,6 +98,10 @@ pub fn build(config: &Config) -> anyhow::Result<(Router, Arc<AppState>)> {
 /// [`build`], with every request check (token, lease and approval expiry, the proxy's
 /// session TTL and record windows) reading the time from `clock`. Tests pass a
 /// [`attenuo_core::ManualClock`] to step past a TTL instead of sleeping through it.
+///
+/// # Errors
+///
+/// As [`AppState::from_config`].
 pub fn build_with_clock(
     config: &Config,
     clock: Arc<dyn attenuo_core::Clock>,
@@ -380,6 +389,12 @@ pub const SINK_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_s
 pub const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Bind `[server] listen` and serve until SIGINT or SIGTERM, then drain for [`DRAIN_TIMEOUT`].
+///
+/// # Errors
+///
+/// When [`build`] fails, when `[server] listen` (or the metrics or admin UI listener) cannot be
+/// bound, or when serving fails with an I/O error. A failed final WAL checkpoint is logged, not
+/// returned.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let (app, state) = build(&config)?;
     let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
@@ -456,6 +471,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 
 /// Serve `app` on `listener` until `shutdown` resolves, then stop accepting connections and
 /// wait up to `drain` for in-flight requests before giving up on them.
+///
+/// # Errors
+///
+/// When the server task fails with an I/O error or panics, before or during the drain. A drain that
+/// times out is not an error: the remaining connections are closed.
 pub async fn serve_until(
     listener: tokio::net::TcpListener,
     app: Router,

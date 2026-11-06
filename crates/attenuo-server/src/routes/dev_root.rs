@@ -62,6 +62,15 @@ pub struct RootTokenRequest {
 }
 
 /// `POST /admin/root-token`: mint a hop-0 token for an unverified user. Development only.
+///
+/// # Errors
+///
+/// 400 `invalid_request` for a body that is not a [`RootTokenRequest`], a reserved subject or
+/// agent, missing capabilities or a `may_act` beyond the grant; 400 `invalid_scope` for
+/// capabilities that do not parse or exceed the grant; 403 `no_root_grant` when `[[root_grants]]`
+/// has no entry for the request and 403 `attribute_fixed_by_grant` when it changes a granted
+/// attribute; 401 for a bad DPoP proof; 500 `server_error` when the token cannot be signed,
+/// registered or audited.
 pub async fn mint_root(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,

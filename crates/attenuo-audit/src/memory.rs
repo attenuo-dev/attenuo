@@ -20,16 +20,28 @@ impl MemoryAudit {
     }
 
     /// Number of entries.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when an appender panicked while holding the log's lock.
     pub fn len(&self) -> Result<usize, AuditError> {
         Ok(self.entries.lock()?.len())
     }
 
     /// Whether the log has no entries.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when an appender panicked while holding the log's lock.
     pub fn is_empty(&self) -> Result<bool, AuditError> {
         Ok(self.len()? == 0)
     }
 
     /// Snapshot of every entry, in order.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when an appender panicked while holding the log's lock.
     pub fn snapshot(&self) -> Result<Vec<AuditEntry>, AuditError> {
         Ok(self.entries.lock()?.clone())
     }
