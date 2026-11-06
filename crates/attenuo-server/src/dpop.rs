@@ -228,6 +228,13 @@ impl Dpop {
 
     /// Verify `proof` for a request (`method`, `url`), with `ath` checked when `access_token`
     /// is given, and use its `jti` once.
+    ///
+    /// # Errors
+    ///
+    /// [`DpopFailure::Invalid`] when the proof does not verify (signature, `htm`, `htu`, `iat`
+    /// window, `ath`) or its `jti` was already used, [`DpopFailure::UseNonce`] when it lacks a
+    /// current server nonce that `[token] dpop_nonce` asks for, and [`DpopFailure::Unavailable`]
+    /// when the replay cache is full of live entries.
     pub fn verify(
         &self,
         proof: &str,
@@ -312,6 +319,13 @@ impl Dpop {
     /// (`cnf`), require a proof by its key for this request with `ath` of `token`. With
     /// `[token] dpop = "required"`, an unbound token is refused. Returns whether the request
     /// was bound. A proof sent with an unbound token is not checked.
+    ///
+    /// # Errors
+    ///
+    /// [`DpopFailure::Required`] for a bound token without a proof, or an unbound one under `dpop =
+    /// "required"`; [`DpopFailure::Invalid`] for a proof that fails [`verify`](Self::verify)'s
+    /// checks or is by another key than the token's; and the nonce and replay-cache failures of
+    /// [`verify`](Self::verify).
     pub fn check_presented(
         &self,
         cnf: Option<&Confirmation>,
@@ -346,6 +360,11 @@ impl Dpop {
     /// The key a newly issued token is bound to, from the request's `DPoP` header (a proof with
     /// no `ath` requirement): `None` without a proof (refused with `dpop = "required"`) and
     /// whenever `dpop = "off"`. For hop 0 and the dev root mint.
+    ///
+    /// # Errors
+    ///
+    /// [`DpopFailure::Required`] when no proof is sent under `dpop = "required"`, and otherwise the
+    /// failures of [`verify`](Self::verify) for the proof that is sent.
     pub fn bind_new(
         &self,
         proof: Option<&str>,
@@ -369,6 +388,15 @@ impl Dpop {
     /// The binding of a child token in an exchange for `actor`, and whether the requester
     /// proved possession of a bound parent's key. `header` is the request's `DPoP` header and
     /// `subject_proof` the body's `subject_token_dpop`; see the module docs for the rule.
+    ///
+    /// # Errors
+    ///
+    /// [`DpopFailure::Required`] for a bound parent without a `DPoP` header, or a child bound to
+    /// another key without `subject_token_dpop`; [`DpopFailure::Invalid`] when the header proof
+    /// does not cover the subject token (one key), when the sign-off proof is not by the parent's
+    /// key or names another key or actor than the child's (two keys), or when a proof fails
+    /// [`verify`](Self::verify)'s checks; and the nonce and replay-cache failures. An unbound
+    /// parent fails as [`bind_new`](Self::bind_new).
     #[allow(clippy::too_many_arguments)]
     pub fn bind_exchange(
         &self,
@@ -490,8 +518,12 @@ pub async fn nonce_header(State(dpop): State<Arc<Dpop>>, req: Request, next: Nex
     resp
 }
 
-/// The request's single `DPoP` header (RFC 9449 §4.3): two or more, or a non-ASCII one, is an
-/// invalid proof.
+/// The request's single `DPoP` header (RFC 9449 §4.3), or `None` when there is none.
+///
+/// # Errors
+///
+/// [`DpopFailure::Invalid`] when the request carries more than one `DPoP` header or a value that is
+/// not ASCII.
 pub fn header_proof(headers: &HeaderMap) -> Result<Option<&str>, DpopFailure> {
     let mut values = headers.get_all("dpop").iter();
     let Some(first) = values.next() else {

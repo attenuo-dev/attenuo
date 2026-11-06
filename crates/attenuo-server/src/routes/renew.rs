@@ -48,6 +48,13 @@ use crate::state::AppState;
 
 /// `POST /token/renew`: extend the lease of the bearer token's last hop (see the module
 /// docs).
+///
+/// # Errors
+///
+/// As the module docs say: 401 for a missing, invalid or expired token or a failed DPoP proof; 400
+/// `invalid_grant` (audited, with its `decision_id`) when the lease or an ancestor lease is revoked
+/// or unknown, or an ancestor lease has expired; 500 `server_error` when the lease store fails or
+/// the renewal cannot be audited.
 pub async fn renew(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

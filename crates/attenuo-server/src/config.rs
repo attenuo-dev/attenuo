@@ -237,6 +237,10 @@ impl Default for TokenSection {
 
 impl TokenSection {
     /// Startup check of the DPoP settings.
+    ///
+    /// # Errors
+    ///
+    /// When `dpop_max_age_seconds` is outside 1..=3600 or `dpop_replay_capacity` is 0.
     pub fn check_dpop(&self) -> anyhow::Result<()> {
         if !(1..=3600).contains(&self.dpop_max_age_seconds) {
             anyhow::bail!("[token] dpop_max_age_seconds must be between 1 and 3600");
@@ -407,6 +411,12 @@ impl ServerSection {
     /// Startup check (SR-19): `public_url`, when set, is an absolute `http(s)://` URL with a
     /// host; when unset, `listen` must be a loopback address, because discovery would
     /// otherwise build its URLs from a `Host` header any client can choose.
+    ///
+    /// # Errors
+    ///
+    /// When `public_url` does not start with `https://` or `http://`, has no host, or contains
+    /// whitespace, a control character, `?` or `#`; or when it is unset and `listen` is not a
+    /// loopback address.
     pub fn check_public_url(&self) -> anyhow::Result<()> {
         match self.public_url.as_deref() {
             Some(url) => {
@@ -593,6 +603,10 @@ pub struct PolicySection {
 
 impl PolicySection {
     /// The effective catalog: the inline table, then `catalog_path` on top.
+    ///
+    /// # Errors
+    ///
+    /// When `catalog_path` is set and the file cannot be read or does not parse as a catalog.
     pub fn load_catalog(&self) -> anyhow::Result<ToolCatalog> {
         let mut catalog = ToolCatalog::new();
         let mut add = |tables: &BTreeMap<String, BTreeMap<String, ToolAttrs>>| {
@@ -791,6 +805,12 @@ impl SinkSection {
 
     /// Startup check: the fields `kind` needs are set, no other kind's fields are, and the
     /// limits are positive.
+    ///
+    /// # Errors
+    ///
+    /// When a field `kind` needs is missing or another kind's field is set; when `url` or
+    /// `endpoint` is not `http(s)://`, `endpoint` has a path, query or fragment, or `bucket` is not
+    /// a bucket name; or when `queue_capacity` is 0 or a lag, timeout or backoff is 0.
     pub fn validate(&self) -> anyhow::Result<()> {
         let set = |name: &'static str, present: bool| present.then_some(name);
         let webhook = [
@@ -1041,6 +1061,13 @@ impl NotifySection {
     /// starts). The URL must be `http(s)://` with a host and no user info or fragment, so no
     /// credential sits in a URL that error messages could carry; redirects are never
     /// followed, so the receiver cannot send the request on to another host.
+    ///
+    /// # Errors
+    ///
+    /// When `url` is not an `http(s)://` URL with a host, or carries user info or a fragment; when
+    /// a header name is invalid, is one the server sets, or names no environment variable; when
+    /// `secret_env` is empty; or when `queue_capacity`, `max_attempts`, a timeout, backoff, lag or
+    /// retention is 0.
     pub fn validate(&self) -> anyhow::Result<()> {
         let url = reqwest::Url::parse(&self.url)
             .map_err(|e| anyhow::anyhow!("[approvals.notify] url is not a URL: {e}"))?;
@@ -1125,6 +1152,11 @@ impl Default for ApprovalsSection {
 impl ApprovalsSection {
     /// Startup check: `ttl_seconds` in 1..=86400, `client_id` not empty when set, and
     /// `[approvals.notify]` when set.
+    ///
+    /// # Errors
+    ///
+    /// When `ttl_seconds` is outside 1..=86400, `client_id` is set but empty, or
+    /// `[approvals.notify]` is set and does not validate.
     pub fn check(&self) -> anyhow::Result<()> {
         if !(1..=86_400).contains(&self.ttl_seconds) {
             anyhow::bail!(
@@ -1143,9 +1175,13 @@ impl ApprovalsSection {
 
     /// The approval audience check at startup (SR-64). With a loaded policy that asks for
     /// approvals (`asks`) and `client_id` unset, an ID token for the root agent's own OAuth
-    /// client approves its calls. Returns whether to log [`UNSET_APPROVAL_CLIENT_ID`]; an error
-    /// instead when the public listener `listen` is not loopback, unless
-    /// `allow_unset_client_id` is set. A policy reload only warns.
+    /// client approves its calls. Returns whether to log [`UNSET_APPROVAL_CLIENT_ID`]. A policy
+    /// reload only warns.
+    ///
+    /// # Errors
+    ///
+    /// When `asks` is true, `client_id` is unset, `listen` is not a loopback address and
+    /// `allow_unset_client_id` is not set.
     pub fn audience_check(&self, asks: bool, listen: std::net::SocketAddr) -> anyhow::Result<bool> {
         if !asks || self.client_id.is_some() {
             return Ok(false);
@@ -1314,8 +1350,13 @@ impl LeasesSection {
         seconds_or_off(self.run_state_retention_seconds)
     }
 
-    /// The maintenance settings, or an error naming the first one out of range. Checked at
-    /// startup whether or not any retention is on.
+    /// The maintenance settings. Checked at startup whether or not any retention is on.
+    ///
+    /// # Errors
+    ///
+    /// When `maintenance_interval_seconds` is 0, or `maintenance_batch_rows` or
+    /// `maintenance_max_passes` is outside 1 to its cap (or does not fit a `usize`); the message
+    /// names the setting.
     pub fn maintenance(&self) -> anyhow::Result<LeaseMaintenance> {
         if self.maintenance_interval_seconds == 0 {
             anyhow::bail!("[leases] maintenance_interval_seconds must be at least 1");
@@ -1395,6 +1436,10 @@ pub struct MetricsSection {
 
 impl MetricsSection {
     /// Startup check (SR-38): a metrics listener off loopback needs `allow_public = true`.
+    ///
+    /// # Errors
+    ///
+    /// When the listener is enabled, not on loopback, and `allow_public` is not set.
     pub fn check_listen(&self) -> anyhow::Result<()> {
         if !self.enabled || self.listen.ip().is_loopback() {
             return Ok(());
@@ -1464,6 +1509,10 @@ pub struct AdminUiSection {
 impl AdminUiSection {
     /// Startup check, as for `[metrics]` (SR-38): a console listener off loopback needs
     /// `allow_public = true`, and gets a warning when it has it.
+    ///
+    /// # Errors
+    ///
+    /// When the console is enabled, not on loopback, and `allow_public` is not set.
     pub fn check_listen(&self) -> anyhow::Result<()> {
         if !self.enabled || self.listen.ip().is_loopback() {
             return Ok(());
@@ -1616,7 +1665,11 @@ fn default_stream_recheck_seconds() -> u64 {
 }
 
 impl ProxySection {
-    /// The re-check interval, or an error when it is zero.
+    /// The re-check interval.
+    ///
+    /// # Errors
+    ///
+    /// When `stream_recheck_seconds` is 0.
     pub fn stream_recheck(&self) -> anyhow::Result<std::time::Duration> {
         if self.stream_recheck_seconds == 0 {
             anyhow::bail!("[proxy] stream_recheck_seconds must be at least 1");
@@ -1625,6 +1678,11 @@ impl ProxySection {
     }
 
     /// Reject limits of zero, which would refuse every request, body or session.
+    ///
+    /// # Errors
+    ///
+    /// When `max_upstream_body_bytes`, `max_request_body_bytes`, `session_ttl_seconds`,
+    /// `max_sessions` or `max_sessions_per_principal` is 0; the message names the first.
     pub fn check_limits(&self) -> anyhow::Result<()> {
         for (name, value) in [
             (
@@ -1646,8 +1704,14 @@ impl ProxySection {
         Ok(())
     }
 
-    /// The record window and its capacity (`record_window_seconds`, `record_window_max_keys`),
-    /// or an error naming the first one out of range. Checked at startup.
+    /// The record window and its capacity (`record_window_seconds`, `record_window_max_keys`).
+    /// Checked at startup.
+    ///
+    /// # Errors
+    ///
+    /// When `record_window_seconds` is outside 1 to `MAX_RECORD_WINDOW_SECONDS` or
+    /// `record_window_max_keys` is outside `MIN_RECORD_WINDOW_MAX_KEYS` to
+    /// `MAX_RECORD_WINDOW_MAX_KEYS` (or does not fit a `usize`); the message names the first.
     pub fn record_window(&self) -> anyhow::Result<(std::time::Duration, usize)> {
         for (name, value, min, max) in [
             (
@@ -1825,12 +1889,20 @@ impl RootGrant {
 
     /// The `may_act` of a root token minted under this grant, given the request's: the
     /// request's when it is within the grant's, the grant's when the request has none.
+    ///
+    /// # Errors
+    ///
+    /// As [`resolve_may_act`]: the request's `may_act` names an agent the grant's does not.
     pub fn may_act_for(&self, requested: Option<MayAct>) -> Result<Option<MayAct>, String> {
         resolve_may_act(self.may_act.as_deref(), requested)
     }
 }
 
 /// `may_act` for a root token: `requested` must be within `ceiling` when both are set.
+///
+/// # Errors
+///
+/// When both are set and `requested` names an agent that `ceiling` does not.
 pub fn resolve_may_act(
     ceiling: Option<&[String]>,
     requested: Option<MayAct>,
@@ -1938,6 +2010,10 @@ impl CapSpec {
 }
 
 /// Parse a list of [`CapSpec`]s into a set.
+///
+/// # Errors
+///
+/// The first entry that [`CapSpec::to_capability`] refuses (a shorthand that is not `server:tool`).
 pub fn capability_set(specs: &[CapSpec]) -> Result<CapabilitySet, String> {
     specs.iter().map(CapSpec::to_capability).collect()
 }
@@ -1946,6 +2022,11 @@ pub fn capability_set(specs: &[CapSpec]) -> Result<CapabilitySet, String> {
 /// [`attenuo_core::names`] (no `/`: the Cedar resource and action ids are
 /// `"<server>/<tool>"`, which would be ambiguous, SR-13). `attenuo` is reserved for the
 /// server's own audit records (SR-34).
+///
+/// # Errors
+///
+/// When `name` breaks [`attenuo_core::names`] (empty, or with a `/` or another character names may
+/// not hold) or is the reserved `attenuo`.
 pub fn check_server_name(name: &str) -> Result<(), String> {
     attenuo_core::names::check_server_name(name).map_err(|e| e.to_string())?;
     if name == crate::routes::AUDIT_SERVER {
@@ -1964,6 +2045,13 @@ impl Config {
     /// `[[upstreams]]`, the tool catalog (inline and `catalog_path`) and `[[root_grants]]`
     /// capabilities, and the agent id `attenuo` in `[[agents]]`, `[[peps]]` and
     /// `[[root_grants]]` (SR-34).
+    ///
+    /// # Errors
+    ///
+    /// When a server name in `[[upstreams]]`, the catalog or a `[[root_grants]]` capability is
+    /// refused by [`check_server_name`], when the catalog cannot be loaded or does not validate,
+    /// when a `[[root_grants]]` capability does not parse, or when an agent id in `[[agents]]`,
+    /// `[[peps]]` or `[[root_grants]]` is `attenuo`; the message names the section.
     pub fn check_server_names(&self) -> anyhow::Result<()> {
         for u in &self.upstreams {
             check_server_name(&u.name).map_err(|e| anyhow::anyhow!("[[upstreams]]: {e}"))?;
@@ -2031,6 +2119,12 @@ impl Config {
     /// Refuse a weak or missing admin token unless the server listens on loopback only, where
     /// it is a warning (SR-15). An enabled `[admin_ui]` listener counts as a listener here,
     /// since it serves the admin API too.
+    ///
+    /// # Errors
+    ///
+    /// When [`admin_token_problem`](Self::admin_token_problem) finds a problem (unset, a published
+    /// placeholder, shorter than `MIN_ADMIN_TOKEN_LEN` bytes) and `[server] listen` or an enabled
+    /// `[admin_ui] listen` is not a loopback address. On loopback only the problem is a warning.
     pub fn check_admin_token(&self) -> anyhow::Result<()> {
         let Some(problem) = self.admin_token_problem() else {
             return Ok(());
@@ -2069,11 +2163,21 @@ impl Config {
     }
 
     /// Parse TOML text.
+    ///
+    /// # Errors
+    ///
+    /// When `text` is not TOML or does not match the config's shape (an unknown key, a wrong type,
+    /// a missing required field).
     pub fn from_toml(text: &str) -> anyhow::Result<Self> {
         Ok(toml::from_str(text)?)
     }
 
     /// Read and parse a file.
+    ///
+    /// # Errors
+    ///
+    /// When the file cannot be read, or as [`from_toml`](Self::from_toml); the message names the
+    /// path.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("reading config {}: {e}", path.display()))?;

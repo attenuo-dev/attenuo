@@ -45,6 +45,10 @@ fn lock_poisoned() -> ApiError {
 /// `loaded_at` describe the file text the engine loaded (at startup or by the last successful
 /// reload), so after an edit that was not reloaded they still describe the old text. `path`
 /// and `sha256` are `null` when no `policy.policies_path` is configured.
+///
+/// # Errors
+///
+/// 500 `server_error` when a policy lock is poisoned (a reload panicked).
 pub async fn get_policies(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
     // Engine first, then the loaded-policy info: the order reload takes them in, so the pair
     // always describes the same policy set.
@@ -82,6 +86,11 @@ pub async fn get_policies(State(state): State<Arc<AppState>>) -> Result<Json<Val
 /// `column`). `ok` is true when there are no errors, which is when a reload would succeed.
 /// The loaded set stays in force whatever the file holds, and nothing is audited. 409 when no
 /// policy file is configured.
+///
+/// # Errors
+///
+/// 409 when no `policy.policies_path` is configured, and 500 `server_error` when the file cannot be
+/// read or a policy lock is poisoned. A file that does not lint is not an error but `ok: false`.
 pub async fn check_policies(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
     let path = state.policies_path.as_ref().ok_or_else(|| {
         ApiError::new(
@@ -163,6 +172,14 @@ pub async fn check_policies(State(state): State<Arc<AppState>>) -> Result<Json<V
 /// when the engine keeps no run usage at all
 /// ([`attenuo_policy::PolicyEngine::tracks_usage`]), so the zeros are not a reading of the
 /// run.
+///
+/// # Errors
+///
+/// 400 `invalid_request` for a body that is not a JSON object or an AuthZEN request, a non-string
+/// `token`, a malformed `session`, `approval`, `usage` or `budget` block, or a `budget` that does
+/// not match the call's limits; 400 `invalid_token` for a token that does not verify (other than by
+/// expiring); 400 `invalid_chain` for a body chain that fails `validate_at`; 500 `server_error`
+/// when a policy lock is poisoned.
 pub async fn evaluate_policies(
     State(state): State<Arc<AppState>>,
     body: Bytes,
@@ -553,6 +570,12 @@ fn chain_and_call(req: &EvaluationRequest) -> Result<(DelegationChain, ToolCall)
 /// The second attempt repeats every check (signature, issuer, audience, chain) at that
 /// earlier time, so an expired token is accepted only if it was once a good token. The `exp`
 /// read from the unverified payload only picks the time; the signature check then covers it.
+///
+/// # Errors
+///
+/// The [`TokenError`] of the first verification when it fails for any reason other than expiry,
+/// [`TokenError::Expired`] when the payload's `exp` cannot be read, and the error of the second
+/// verification when the token was not a good token at that earlier time either.
 pub fn verify_allowing_expiry(
     verifier: &Verifier,
     token: &str,
