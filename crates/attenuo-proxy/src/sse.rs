@@ -78,6 +78,12 @@ impl SseRewriter {
     /// `f` is called with the parsed JSON of each event that carries valid JSON `data`, and may
     /// modify it. Such an event is re-serialized (so duplicate object keys cannot survive);
     /// an event with no data is emitted byte for byte, one whose data does not parse is dropped.
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::InvalidData`] when a completed event is not UTF-8 or a rewritten value
+    /// cannot be re-encoded, and an [`io::ErrorKind::Other`] error when the incomplete event left
+    /// in the buffer exceeds the limit. The stream should end at the first error.
     pub fn push(
         &mut self,
         chunk: &[u8],
@@ -351,8 +357,13 @@ impl SseFramer {
     }
 
     /// Feed a chunk; returns the bytes of every event it completes, unchanged, but for a byte
-    /// order mark that opens the stream, which is dropped. An event that is not UTF-8 is an
-    /// error (SR-77): what the proxy relays, it must have been able to read.
+    /// order mark that opens the stream, which is dropped.
+    ///
+    /// # Errors
+    ///
+    /// An [`io::ErrorKind::Other`] error when the incomplete event left in the buffer exceeds the
+    /// limit, and [`io::ErrorKind::InvalidData`] when the completed events are not UTF-8 (SR-77:
+    /// what the proxy relays, it must have been able to read).
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<u8>, io::Error> {
         self.buf.extend_from_slice(chunk);
         if !strip_leading_bom(&mut self.buf, &mut self.start) {
