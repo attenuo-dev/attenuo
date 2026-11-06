@@ -52,7 +52,7 @@ Metrics stay on Prometheus `/metrics`, scraped by the collector; OTLP metrics pu
 - Bad, because every default build now carries 17 more packages, `prost-derive` among them, and the binary grows (2.5 MB in the development profile; release not measured).
 - Bad, because the `OTEL_*` environment variables are the first overrides besides `ATTENUO_ADMIN_TOKEN`.
 - Bad, because the subject digest changes at issuer key rotation, which breaks per-user series across a rotation.
-- Bad, because span overhead on the hot path is not yet measured with `attenuo-bench`.
+- Bad, because sampling every trace costs 30 to 95 µs per decision in the in-process bench (within noise with export off, 2 to 16 % at the default ratio 0.1; [design note, section 10](../design/otel-export.md#measured)); the whole call has not been measured with `attenuo-bench`.
 - Neutral, because "keep every deny" needs tail sampling in the collector; attenuo samples at the head.
 - Neutral, because linking by default means a backend shows the agent's trace and attenuo's as two traces joined by a link; an operator who trusts the client can set `inbound_mcp = "parent"`.
 

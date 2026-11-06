@@ -71,14 +71,42 @@ impl SpanExporter for Collect {
     }
 }
 
+/// How the fake upstream answers a `tools/call`.
+#[derive(Clone, Copy, Debug, Default)]
+enum Answer {
+    /// A JSON body, read whole by the proxy inside the request.
+    #[default]
+    Json,
+    /// An SSE body whose one event, the result, comes after a pause, so the proxy records it
+    /// after the request has returned its headers.
+    SseLate,
+    /// An SSE body with one progress notification, then open for good, until the proxy ends it.
+    SseOpen,
+}
+
 /// A fake upstream that answers `tools/call` and remembers each request's headers.
 #[derive(Clone, Default)]
 struct Upstream {
     headers: Arc<Mutex<Vec<HeaderMap>>>,
+    answer: Arc<Mutex<Answer>>,
+}
+
+/// One SSE event of `msg`.
+fn sse_event(msg: &Value) -> axum::body::Bytes {
+    format!("event: message\ndata: {msg}\n\n").into()
 }
 
 impl Upstream {
+    fn answering(answer: Answer) -> Self {
+        Self {
+            answer: Arc::new(Mutex::new(answer)),
+            ..Self::default()
+        }
+    }
+
     async fn spawn(&self) -> Spawned {
+        use axum::response::IntoResponse;
+        use futures_util::StreamExt;
         let me = self.clone();
         let app = axum::Router::new().route(
             "/mcp",
@@ -86,11 +114,33 @@ impl Upstream {
                 let me = me.clone();
                 async move {
                     me.headers.lock().unwrap().push(headers);
-                    axum::Json(json!({
+                    let result = json!({
                         "jsonrpc": "2.0",
                         "id": body.0["id"].clone(),
                         "result": {"content": [{"type": "text", "text": RESULT_TEXT}]},
-                    }))
+                    });
+                    let answer = *me.answer.lock().unwrap();
+                    let events = match answer {
+                        Answer::Json => return axum::Json(result).into_response(),
+                        Answer::SseLate => futures_util::stream::once(async move {
+                            tokio::time::sleep(Duration::from_millis(150)).await;
+                            Ok::<_, std::io::Error>(sse_event(&result))
+                        })
+                        .boxed(),
+                        Answer::SseOpen => {
+                            let progress = json!({"jsonrpc": "2.0",
+                                "method": "notifications/progress",
+                                "params": {"progressToken": 1, "progress": 1}});
+                            futures_util::stream::iter([Ok(sse_event(&progress))])
+                                .chain(futures_util::stream::pending())
+                                .boxed()
+                        }
+                    };
+                    (
+                        [("content-type", "text/event-stream")],
+                        axum::body::Body::from_stream(events),
+                    )
+                        .into_response()
                 }
             }),
         );
@@ -149,8 +199,12 @@ fn config(dir: &std::path::Path, upstream_url: String, tweak: impl FnOnce(&mut C
 
 impl Harness {
     async fn start(tweak: impl FnOnce(&mut Config)) -> Self {
+        Self::start_answering(Answer::Json, tweak).await
+    }
+
+    async fn start_answering(answer: Answer, tweak: impl FnOnce(&mut Config)) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let upstream = Upstream::default();
+        let upstream = Upstream::answering(answer);
         let task = upstream.spawn().await;
         let cfg = config(dir.path(), task.url("/mcp"), tweak);
         let (router, state) = attenuo_server::build(&cfg).unwrap();
@@ -170,20 +224,58 @@ impl Harness {
     }
 
     async fn mint(&self) -> String {
+        self.mint_with_lease(None).await.0
+    }
+
+    /// A root token for [`SUBJECT`] living `ttl_seconds` (the default when `None`), and its
+    /// lease id.
+    async fn mint_with_lease(&self, ttl_seconds: Option<u64>) -> (String, String) {
         let resp = self
             .client
             .post(self.server.url("/admin/root-token"))
             .bearer_auth(ADMIN)
             .json(&json!({"subject": SUBJECT, "issuer": "https://idp.example",
-                          "agent": "planner", "capabilities": ["github:*"]}))
+                          "agent": "planner", "capabilities": ["github:*"],
+                          "ttl_seconds": ttl_seconds}))
             .send()
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        resp.json::<Value>().await.unwrap()["access_token"]
-            .as_str()
+        let v = resp.json::<Value>().await.unwrap();
+        (
+            v["access_token"].as_str().unwrap().to_owned(),
+            v["lease"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    /// Send one `tools/call` of `read_file` with `traceparent`, and return the response with
+    /// its body unread (an SSE stream).
+    async fn call_streamed(&self, token: &str, traceparent: &str) -> reqwest::Response {
+        let resp = self
+            .client
+            .post(self.server.url("/mcp/github"))
+            .bearer_auth(token)
+            .header("accept", "application/json, text/event-stream")
+            .header("traceparent", traceparent)
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": {"name": "read_file", "arguments": {"repo": ARG_VALUE}}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers()["content-type"]
+            .to_str()
             .unwrap()
-            .to_owned()
+            .starts_with("text/event-stream"));
+        resp
+    }
+
+    /// Every audit entry, oldest first.
+    async fn audit_entries(&self) -> Vec<Value> {
+        self.admin_get("/admin/audit?from=1&limit=1000").await["entries"]
+            .as_array()
+            .unwrap()
+            .clone()
     }
 
     /// One `tools/call` of `read_file`, with `traceparent` when given. Returns the decision id.
@@ -540,6 +632,256 @@ async fn tracing_off_inserts_nothing_upstream() {
     let token = h.mint().await;
     h.call(&token, Some(INBOUND)).await;
     assert_eq!(h.upstream.last_traceparent(), None);
+}
+
+/// The spans of the trace `trace_id`.
+fn in_trace(spans: &[SpanData], trace_id: opentelemetry::trace::TraceId) -> Vec<&SpanData> {
+    spans
+        .iter()
+        .filter(|s| s.span_context.trace_id() == trace_id)
+        .collect()
+}
+
+/// `late` is a span recorded after `request` returned: the root of a trace of its own (no
+/// parent, and not in the request's trace), with exactly one span link, without attributes,
+/// to a span of the request's trace (the one current when the proxy kept the context).
+/// Returns the name of the span linked to.
+fn assert_linked_not_parented(spans: &[SpanData], late: &SpanData, request: &SpanData) -> String {
+    let request_trace = request.span_context.trace_id();
+    assert_eq!(
+        late.parent_span_id,
+        opentelemetry::trace::SpanId::INVALID,
+        "{}: a new root span, not a child",
+        late.name
+    );
+    assert_ne!(
+        late.span_context.trace_id(),
+        request_trace,
+        "{}: a trace of its own",
+        late.name
+    );
+    let links: Vec<_> = late.links.iter().collect();
+    assert_eq!(links.len(), 1, "{}: one link", late.name);
+    let link = &links[0].span_context;
+    assert_eq!(
+        link.trace_id(),
+        request_trace,
+        "{}: linked to the request",
+        late.name
+    );
+    assert!(links[0].attributes.is_empty());
+    let target = in_trace(spans, request_trace)
+        .into_iter()
+        .find(|s| s.span_context.span_id() == link.span_id())
+        .unwrap_or_else(|| panic!("{}: the link names no span of the request", late.name));
+    // Nothing else of the late span's trace but its own children.
+    for s in in_trace(spans, late.span_context.trace_id()) {
+        assert!(
+            s.span_context.span_id() == late.span_context.span_id()
+                || s.parent_span_id == late.span_context.span_id(),
+            "{} in the trace of {}",
+            s.name,
+            late.name
+        );
+    }
+    target.name.to_string()
+}
+
+/// Read an SSE body to its end, at most `within`.
+async fn read_to_end(resp: reqwest::Response, within: Duration) -> String {
+    use futures_util::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut text = String::new();
+    tokio::time::timeout(within, async {
+        while let Some(chunk) = stream.next().await {
+            text.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+        }
+    })
+    .await
+    .expect("the stream ended");
+    text
+}
+
+/// The JSON-RPC messages of the `data:` lines of an SSE body.
+fn sse_messages(text: &str) -> Vec<Value> {
+    text.lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .map(|d| serde_json::from_str(d).unwrap())
+        .collect()
+}
+
+/// A result streamed back after the response's headers is recorded by the labeller outside
+/// `mcp.request`, which has ended: `attenuo.record_result` is a new span linked to the
+/// request, with the call's decision id and the seq of its `tool_result` record.
+#[tokio::test(flavor = "current_thread")]
+async fn a_result_recorded_after_the_response_is_a_linked_span() {
+    let sink = Collect::default();
+    let (provider, _guard) = install(&settings(2048, 512), sink.clone(), Arc::default());
+    let h = Harness::start_answering(Answer::SseLate, |_| {}).await;
+    let token = h.mint().await;
+    let resp = h.call_streamed(&token, INBOUND).await;
+    let header_id = resp
+        .headers()
+        .get(attenuo_proxy::DECISION_ID_HEADER)
+        .map(|v| v.to_str().unwrap().to_owned());
+    let text = read_to_end(resp, Duration::from_secs(5)).await;
+    let messages = sse_messages(&text);
+    assert_eq!(messages.len(), 1, "{text}");
+    assert_eq!(
+        messages[0]["result"]["content"][0]["text"], RESULT_TEXT,
+        "{text}"
+    );
+    let spans = spans_until(&provider, &sink, "attenuo.record_result").await;
+    let spans = if spans.iter().any(|s| s.name == "mcp.request") {
+        spans
+    } else {
+        spans_until(&provider, &sink, "mcp.request").await
+    };
+
+    let request = one(&spans, "mcp.request");
+    let decide = one(&spans, "attenuo.decide");
+    assert_eq!(
+        decide.span_context.trace_id(),
+        request.span_context.trace_id()
+    );
+    // The response span ended with the headers: the result is not inside it.
+    let response = one(&spans, "attenuo.response");
+    let result = one(&spans, "attenuo.record_result");
+    assert_ne!(result.parent_span_id, response.span_context.span_id());
+    let linked = assert_linked_not_parented(&spans, result, request);
+    assert_eq!(linked, "mcp.request");
+
+    // The join to the record: the call's decision id, and the seq of its `tool_result`.
+    let decision_id = attr(decide, "attenuo.decision_id").unwrap();
+    assert_eq!(
+        attr(result, "attenuo.decision_id").as_deref(),
+        Some(decision_id.as_str())
+    );
+    if let Some(id) = header_id {
+        assert_eq!(id, decision_id);
+    }
+    assert_eq!(
+        attr(result, "attenuo.result.label").as_deref(),
+        Some("untrusted")
+    );
+    let seq: u64 = attr(result, "attenuo.audit.seq").unwrap().parse().unwrap();
+    let entries = h.audit_entries().await;
+    let entry = entries
+        .iter()
+        .find(|e| e["seq"] == json!(seq))
+        .expect("the span's seq is in the log");
+    assert_eq!(entry["record"]["kind"], "tool_result");
+    assert_eq!(entry["record"]["decision_id"], json!(decision_id));
+    let decision_seq: u64 = attr(decide, "attenuo.audit.seq").unwrap().parse().unwrap();
+    let decision = entries
+        .iter()
+        .find(|e| e["seq"] == json!(decision_seq))
+        .unwrap();
+    assert_eq!(decision["record"]["id"], json!(decision_id));
+
+    let upstream = h._upstream_task.url("/mcp");
+    assert_nothing_forbidden(
+        &spans,
+        &[
+            &token,
+            SUBJECT,
+            "alice.secret",
+            ARG_VALUE,
+            "ARGVALUE",
+            RESULT_TEXT,
+            "RESULTBODY",
+            &upstream,
+        ],
+    );
+    assert_eq!(h.admin_get("/admin/audit/verify").await["ok"], true);
+}
+
+/// A streamed answer that the proxy ends because the chain's lease was revoked (`revoke`)
+/// or the token expired: `attenuo.stream_end` is a new span linked to the request that
+/// opened the stream, with the reason and the decision id and seq of the `stream.end`
+/// record, which the final event names.
+async fn a_cut_stream_is_a_linked_stream_end_span(revoke: bool) {
+    let sink = Collect::default();
+    let (provider, _guard) = install(&settings(2048, 512), sink.clone(), Arc::default());
+    let h = Harness::start_answering(Answer::SseOpen, |c| c.proxy.stream_recheck_seconds = 1).await;
+    let (token, lease) = h.mint_with_lease((!revoke).then_some(2)).await;
+    let resp = h.call_streamed(&token, INBOUND).await;
+    if revoke {
+        let r = h
+            .client
+            .post(h.server.url(&format!("/admin/leases/{lease}/revoke")))
+            .bearer_auth(ADMIN)
+            .json(&json!({"reason": "incident"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+    let text = read_to_end(resp, Duration::from_secs(10)).await;
+    let messages = sse_messages(&text);
+    assert_eq!(messages[0]["method"], "notifications/progress", "{text}");
+    let last = messages.last().unwrap();
+    let reason = if revoke {
+        "lease_revoked"
+    } else {
+        "token_expired"
+    };
+    assert_eq!(last["error"]["code"], -32001, "{text}");
+    assert_eq!(last["error"]["data"]["reason"], reason);
+    let end_id = last["error"]["data"]["decision_id"].as_str().unwrap();
+
+    let spans = spans_until(&provider, &sink, "attenuo.stream_end").await;
+    let request = one(&spans, "mcp.request");
+    let end = one(&spans, "attenuo.stream_end");
+    // The guard is built around the streamed response, inside `attenuo.response`, a child
+    // of `mcp.request`: the link names that span.
+    let linked = assert_linked_not_parented(&spans, end, request);
+    assert_eq!(linked, "attenuo.response");
+    assert_eq!(
+        one(&spans, "attenuo.response").parent_span_id,
+        request.span_context.span_id()
+    );
+    assert!(
+        !names(&spans).contains("attenuo.record_result"),
+        "no result came"
+    );
+    assert_eq!(attr(end, "attenuo.reason").as_deref(), Some(reason));
+    assert_eq!(attr(end, "attenuo.decision_id").as_deref(), Some(end_id));
+    let seq: u64 = attr(end, "attenuo.audit.seq").unwrap().parse().unwrap();
+    let entry = h.admin_get(&format!("/admin/audit/records/{end_id}")).await;
+    assert_eq!(entry["entry"]["seq"], json!(seq));
+    let record = &entry["entry"]["record"];
+    assert_eq!(record["tool"], "stream.end");
+    assert_eq!(record["decision"], "deny");
+    assert_eq!(record["reason"], reason);
+    // The call's own decision is a different record, joined from `attenuo.decide`.
+    let decide = one(&spans, "attenuo.decide");
+    assert_ne!(attr(decide, "attenuo.decision_id").as_deref(), Some(end_id));
+
+    let upstream = h._upstream_task.url("/mcp");
+    assert_nothing_forbidden(
+        &spans,
+        &[
+            &token,
+            SUBJECT,
+            "alice.secret",
+            ARG_VALUE,
+            "ARGVALUE",
+            RESULT_TEXT,
+            &upstream,
+        ],
+    );
+    assert_eq!(h.admin_get("/admin/audit/verify").await["ok"], true);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_stream_cut_by_revocation_is_a_linked_stream_end_span() {
+    a_cut_stream_is_a_linked_stream_end_span(true).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_stream_cut_at_token_expiry_is_a_linked_stream_end_span() {
+    a_cut_stream_is_a_linked_stream_end_span(false).await;
 }
 
 fn hex(b: &[u8]) -> String {

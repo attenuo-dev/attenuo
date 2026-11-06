@@ -365,13 +365,15 @@ impl StreamGuard {
         if let Some(tag) = &record.session {
             call = call.with_session(tag.clone());
         }
-        // The exported `attenuo.stream_end` span: the reason and the record's id, linked to the
-        // request that opened the stream (design section 3.2, "Long streams").
+        // The exported `attenuo.stream_end` span: the reason and the record's id and seq (the
+        // authorizer fills in the seq), linked to the request that opened the stream (design
+        // section 3.2, "Long streams").
         let span = tracing::info_span!(
             target: OTEL_TARGET,
             "attenuo.stream_end",
             attenuo.reason = %reason,
             attenuo.decision_id = tracing::field::Empty,
+            attenuo.audit.seq = tracing::field::Empty,
         );
         if let (Some(hook), Some(origin)) = (self.authorizer.trace(), self.origin) {
             hook.link_detached(&span, origin);
