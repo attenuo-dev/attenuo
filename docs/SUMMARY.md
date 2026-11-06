@@ -40,6 +40,7 @@
 - [Cedar-aware list filtering (proposed)](design/cedar-aware-list-filtering.md)
 - [Multi-replica readiness (proposed)](design/multi-replica.md)
 - [OpenTelemetry export (proposed)](design/otel-export.md)
+- [Run limits phase 3 (proposed)](design/run-limits-phase3.md)
 
 # Policy
 
