@@ -174,7 +174,7 @@ impl QueueItem for Notice {
 /// write that fails is logged and leaves the row open, so it is delivered again after the
 /// next restart (the receiver deduplicates by `event_id`).
 ///
-/// It also hands the delivery thread the rows a restart left open ([`Backlog`]), a batch at a
+/// It also hands the delivery thread the rows a restart left open (`Backlog`), a batch at a
 /// time whenever the queue runs empty, so that none is dropped for lack of room (SR-93).
 #[derive(Debug)]
 pub struct OutboxSettle {
@@ -1237,7 +1237,7 @@ mod tests {
             .unwrap()
             .unwrap();
         release_tx.send(()).unwrap();
-        wait_until(|| recorder.got.lock().unwrap().len() >= events.len() + 1);
+        wait_until(|| recorder.got.lock().unwrap().len() > events.len());
         // Shutting down delivers anything still queued, so a second copy would show here.
         n.shutdown(Duration::from_secs(5));
         let got = recorder.got.lock().unwrap().clone();
