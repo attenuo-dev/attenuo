@@ -102,6 +102,13 @@ pub struct AppState {
 
 impl AppState {
     /// Load keys, policies and storage as the config says.
+    ///
+    /// # Errors
+    ///
+    /// When a check of the config fails (server names, public URL, admin token, listeners,
+    /// `[authzen]`, `[proxy]`, `[token] dpop`, `[approvals]`, `[leases]`), when the issuer's keys
+    /// cannot be loaded, when the policies do not parse or validate, when the audit log or lease
+    /// store cannot be opened, or when the IdP, agent, PEP or actor-trust entries are invalid.
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
         Self::from_config_with_clock(config, attenuo_core::clock::system_clock())
     }

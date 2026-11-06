@@ -426,6 +426,10 @@ pub struct Queue<T> {
 
 impl<T: QueueItem> Queue<T> {
     /// Start delivering with `deliver`.
+    ///
+    /// # Errors
+    ///
+    /// As [`start_with`](Self::start_with).
     pub fn start(
         deliver: Box<dyn Deliver<T>>,
         limits: SinkLimits,
@@ -436,6 +440,10 @@ impl<T: QueueItem> Queue<T> {
     }
 
     /// [`start`](Self::start), telling `settle` what became of each item.
+    ///
+    /// # Errors
+    ///
+    /// When the delivery thread cannot be spawned.
     pub fn start_with(
         deliver: Box<dyn Deliver<T>>,
         limits: SinkLimits,
@@ -541,6 +549,13 @@ pub struct CheckpointSink {
 
 impl CheckpointSink {
     /// Validate `cfg` and start delivering.
+    ///
+    /// # Errors
+    ///
+    /// When `cfg` does not validate, when the webhook or S3 client cannot be built, when an S3 sink
+    /// has no access key id or secret access key (in the config or `AWS_ACCESS_KEY_ID` and
+    /// `AWS_SECRET_ACCESS_KEY`), when a file sink's path cannot be opened for appending, or as
+    /// [`with_deliver`](Self::with_deliver).
     pub fn start(
         cfg: &SinkSection,
         public_url: Option<String>,
@@ -567,6 +582,10 @@ impl CheckpointSink {
     }
 
     /// Start with any deliverer (tests).
+    ///
+    /// # Errors
+    ///
+    /// When the delivery thread cannot be spawned.
     pub fn with_deliver(
         deliver: Box<dyn Deliver>,
         limits: SinkLimits,
@@ -818,7 +837,12 @@ pub struct FileDeliver {
 }
 
 impl FileDeliver {
-    /// Checks at startup that `path` can be opened for appending.
+    /// A sink appending to `path`, checked at startup.
+    ///
+    /// # Errors
+    ///
+    /// When `path` cannot be opened for appending (missing directory, no permission); the message
+    /// names the path.
     pub fn new(path: PathBuf) -> anyhow::Result<Self> {
         open_append(&path)
             .map_err(|e| anyhow::anyhow!("[audit.sink] path {}: {e}", path.display()))?;

@@ -90,6 +90,12 @@ pub struct RevokeBody {
 
 /// `POST /admin/leases/{lease_id}/revoke` with `{ "reason": "..." }`: revoke the lease and
 /// every lease delegated from it. Returns how many leases changed state.
+///
+/// # Errors
+///
+/// 400 `invalid_request` when a non-empty body is not the expected JSON, 404 `not_found` when the
+/// registry has no such lease, and 500 `server_error` when the lease store fails. A failure to
+/// write the audit record is not an error (`audit_id` is null).
 pub async fn revoke_lease(
     State(state): State<Arc<AppState>>,
     Path(lease_id): Path<String>,
@@ -293,6 +299,13 @@ fn selector_response(
 /// digest, like every admin record) are the selector, the reason, the count and whether the
 /// list was cut. As with a single revocation, the revocation stands if the record cannot be
 /// written; `audit_id` is then null.
+///
+/// # Errors
+///
+/// 400 `invalid_request` when the body is not the expected JSON, names none or more than one of
+/// `user`, `chain_id` and `session`, or gives an empty one, and 500 `server_error` when the lease
+/// store fails (nothing is revoked then). Matching nothing and a failed audit append are not
+/// errors.
 pub async fn revoke_by_selector(
     State(state): State<Arc<AppState>>,
     Query(q): Query<SelectorRevokeQuery>,
@@ -381,6 +394,13 @@ pub struct RefundBody {
 ///
 /// As with a revocation, the refund stands if its record cannot be written; the response
 /// then carries `audit_id: null` and the failure is logged.
+///
+/// # Errors
+///
+/// 400 `invalid_request` when the body is not the expected JSON; 404 `not_found` or 410
+/// `charge_pruned` when the charge log has nothing for the decision, as above; 409
+/// `already_refunded` when it was refunded before; 500 `server_error` when the lease store or the
+/// audit lookup fails.
 pub async fn refund_budget(
     State(state): State<Arc<AppState>>,
     body: Bytes,
@@ -480,6 +500,11 @@ fn no_charge_refusal(state: &AppState, decision_id: &str) -> ApiError {
 pub const CHARGE_PRUNED: &str = "charge_pruned";
 
 /// `GET /admin/leases/{lease_id}`: the lease's registry row and whether it is active now.
+///
+/// # Errors
+///
+/// 404 `not_found` when the registry has no such lease, and 500 `server_error` when the lease store
+/// fails.
 pub async fn lease_status(
     State(state): State<Arc<AppState>>,
     Path(lease_id): Path<String>,
@@ -537,6 +562,11 @@ pub struct TreeQuery {
 /// is found), and `budget`, the hop's run limits and what is left of them (see `hop_budget`;
 /// null when the hop has no limits and nothing was charged under its lease). Nothing is
 /// written, not even an audit record: this is a read like `GET /admin/leases/{id}`.
+///
+/// # Errors
+///
+/// 404 `not_found` when the registry has no such lease, and 500 `server_error` when the lease store
+/// or the audit log fails.
 pub async fn lease_tree(
     State(state): State<Arc<AppState>>,
     Path(lease_id): Path<String>,
@@ -817,6 +847,13 @@ fn entry_filter(q: &AuditQuery) -> Result<EntryFilter, ApiError> {
 /// `head` is the newest seq (0 for an empty log); reading it signs nothing, unlike
 /// `/admin/audit/checkpoint`. An ascending answer is `{entries, next, head}`, exactly as
 /// before filters existed; a descending one adds `prev`.
+///
+/// # Errors
+///
+/// 400 `invalid_request` for an `order` other than `asc` or `desc`, `before` without `order=desc`,
+/// `from` with it, `before=0`, or a filter that is empty or does not parse (an unknown `kind`, a
+/// `decision` other than `allow` or `deny`, a `since` or `until` that is not RFC 3339); 500
+/// `server_error` when the audit log fails.
 pub async fn audit_range(
     State(state): State<Arc<AppState>>,
     Query(q): Query<AuditQuery>,
@@ -916,6 +953,11 @@ pub async fn audit_range(
 /// `GET /admin/audit/verify`: walk the whole chain and verify every stored checkpoint
 /// signature against the JWKS keys. Besides `entries`, `ok` and `first_bad_seq` the report has
 /// `checkpoints`, `last_signed_seq`, `unsigned_tail` and `bad_checkpoints`.
+///
+/// # Errors
+///
+/// 500 `server_error` when the audit log cannot be read (a store fault, not a broken chain: a break
+/// or a bad checkpoint is reported in the answer).
 pub async fn audit_verify(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<SignedVerifyReport>, ApiError> {
@@ -930,6 +972,11 @@ pub async fn audit_verify(
 /// `{seq, head_hash, at, kid, signature}`. Created now if the head has none yet, so the answer
 /// can be kept off-host and checked later with only the JWKS. `hash` repeats `head_hash` for
 /// clients written against the unsigned v0 response.
+///
+/// # Errors
+///
+/// 500 `server_error` when the audit log cannot be read or written, when a stored checkpoint
+/// disagrees with the log at the head, or when no checkpoint signer is configured.
 pub async fn audit_checkpoint(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
     let cp = state
         .blocking(|s| s.audit.checkpoint_signed(s.now()))
@@ -989,8 +1036,7 @@ fn entry_view(state: &AppState, entry: AuditEntry) -> Result<Value, ApiError> {
 }
 
 /// `GET /admin/audit/entries/{seq}`: one entry and its context, as
-/// `{entry, lease_states, covered_by_checkpoint, policy_reloaded_after}`. 404 when there is
-/// no entry at `seq`.
+/// `{entry, lease_states, covered_by_checkpoint, policy_reloaded_after}`.
 ///
 /// - `lease_states`: one object per lease in the record's chain, root first, as the lease
 ///   registry sees it now: `{lease_id, known, active, parent, expires_at, revoked_at,
@@ -1002,6 +1048,11 @@ fn entry_view(state: &AppState, entry: AuditEntry) -> Result<Value, ApiError> {
 /// - `policy_reloaded_after`: the seq of the first successful policy reload recorded after
 ///   the entry, or null. When set, the policy in force now may not be the one that made the
 ///   decision.
+///
+/// # Errors
+///
+/// 404 `not_found` when there is no entry at `seq`, and 500 `server_error` when the audit log or
+/// the lease store fails.
 pub async fn audit_entry(
     State(state): State<Arc<AppState>>,
     Path(seq): Path<u64>,
@@ -1019,7 +1070,12 @@ pub async fn audit_entry(
 
 /// `GET /admin/audit/records/{id}`: the entry whose record id is `id`, the UUID that proxy
 /// denials and AuthZEN answers return as `decision_id` (shape as for
-/// `/admin/audit/entries/{seq}`). 400 when `id` is not a UUID, 404 when no record has it.
+/// `/admin/audit/entries/{seq}`).
+///
+/// # Errors
+///
+/// 400 `invalid_request` when `id` is not a UUID, 404 `not_found` when no record has it, and 500
+/// `server_error` when the audit log or the lease store fails.
 pub async fn audit_record(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1050,6 +1106,10 @@ pub struct CheckpointsQuery {
 /// `GET /admin/audit/checkpoints?before=&limit=`: stored checkpoints, newest first, as
 /// `{checkpoints, prev}`; `prev` is the `before` of the next (older) page, or null after the
 /// oldest. Read-only: unlike `GET /admin/audit/checkpoint` it never signs a new checkpoint.
+///
+/// # Errors
+///
+/// 400 `invalid_request` when `before` is 0, and 500 `server_error` when the audit log fails.
 pub async fn audit_checkpoints(
     State(state): State<Arc<AppState>>,
     Query(q): Query<CheckpointsQuery>,
@@ -1128,6 +1188,13 @@ enum ExportPhase {
 /// `kind`, `chain_id`, `tool` and `decision` keep only the matching entries. The header then
 /// carries a `filter` member and the file cannot be verified (its chain has gaps); verify an
 /// unfiltered export.
+///
+/// # Errors
+///
+/// 400 `invalid_request` when `from` is 0, `to` is smaller than `from`, a filter does not parse (as
+/// for `GET /admin/audit`) or `kind` names more than one kind, and 500 `server_error` when the head
+/// cannot be read. A read failure once the stream has started ends the stream with an error
+/// instead.
 pub async fn audit_export(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ExportQuery>,
@@ -1246,7 +1313,13 @@ pub async fn audit_export(
 }
 
 /// `POST /admin/policies/reload`: re-read `policy.policies_path` and swap the policy set if it
-/// parses and validates. On failure the previous set stays in force and the answer is 422.
+/// parses and validates.
+///
+/// # Errors
+///
+/// 409 `reload_unavailable` when `policy.policies_path` is not configured, 500 `server_error` when
+/// the file cannot be read or a policy lock is poisoned, and 422 when the file does not parse or
+/// validate (the previous set stays in force).
 pub async fn reload_policies(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
     let path = state.policies_path.as_ref().ok_or_else(|| {
         ApiError::new(

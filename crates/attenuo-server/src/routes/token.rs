@@ -96,6 +96,16 @@ use crate::state::AppState;
 
 /// `POST /token`: RFC 8693 exchange from hop n to n+1, or hop-0 IdP intake (see the module
 /// docs).
+///
+/// # Errors
+///
+/// As the module docs say: 400 `invalid_request` for a malformed body or a failed actor token
+/// check, 401 `invalid_client` for failed client authentication, 400 `invalid_grant` for a subject
+/// token that does not verify, a parent lease that cannot delegate or a replay, 400 `invalid_scope`
+/// for a widening or too deep a chain (audited when the subject token verified), 401 for a failed
+/// DPoP proof, 503 when the actor token issuer's keys or the replay cache are unavailable, and 500
+/// `server_error` for a store or signing fault. Hop-0 intake fails as `crate::idp::intake`
+/// describes.
 pub async fn exchange(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
