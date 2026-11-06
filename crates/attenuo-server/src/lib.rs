@@ -60,6 +60,7 @@ pub(crate) mod clientauth;
 pub mod config;
 // Used by the fuzz targets.
 pub mod dpop;
+pub(crate) mod early_close;
 // Used by the integration tests.
 pub mod error;
 pub(crate) mod idp;
@@ -197,6 +198,8 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
             state.metrics.clone(),
             metrics::track_http,
         ))
+        // Outermost, so it sees every answer, the early refusals of the layers above included.
+        .layer(axum::middleware::from_fn(early_close::mark_early_refusal))
 }
 
 /// Start the `[audit] checkpoint_interval_seconds` timer: every `period`, sign the head if
