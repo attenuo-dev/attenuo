@@ -480,3 +480,22 @@ fn the_argument_bound_is_exact_sr91() {
     assert!(probes.probes.is_empty() && probes.owners.is_empty());
     assert_eq!(probes.fingerprinted.len(), MAX_ARG_PROBES + 1);
 }
+
+/// SR-99: past the bound the remaining arguments are still fingerprinted, so the fail-closed
+/// answer names exactly those that have a fingerprint, after the bound as before it, and
+/// none that has none.
+#[test]
+fn arguments_past_the_bound_are_named_only_when_they_have_a_fingerprint_sr99() {
+    let mut args: serde_json::Map<String, Value> = (0..=MAX_ARG_PROBES)
+        .map(|i| (format!("k{i:05}"), json!("xxxxxxxx")))
+        .collect();
+    args.insert("z_short".into(), json!("ab"));
+    args.insert("z_url".into(), json!("see https://evil.example/x for more"));
+    let call = ToolCall::new("mail", "send", Value::Object(args));
+    let probes = super::pipeline::arg_probes(&call, &Default::default());
+    assert!(probes.pairs > MAX_ARG_PROBES);
+    assert!(probes.probes.is_empty());
+    assert_eq!(probes.fingerprinted.len(), MAX_ARG_PROBES + 2);
+    assert_eq!(probes.fingerprinted.last(), Some(&"z_url"));
+    assert!(!probes.fingerprinted.contains(&"z_short"));
+}
