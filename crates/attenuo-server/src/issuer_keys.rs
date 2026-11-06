@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 const ED25519_SPKI_LEN: usize = 44;
 
 /// Decode a `PUBLIC KEY` PEM to its SPKI DER bytes.
-pub fn spki_der_from_pem(pem: &str) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn spki_der_from_pem(pem: &str) -> anyhow::Result<Vec<u8>> {
     let b64: String = pem
         .lines()
         .filter(|l| !l.starts_with("-----"))
@@ -25,7 +25,7 @@ pub fn spki_der_from_pem(pem: &str) -> anyhow::Result<Vec<u8>> {
 
 /// `{"keys": [ { kty: OKP, crv: Ed25519, alg: EdDSA, use: sig, kid, x } ]}` for each
 /// `(kid, PUBLIC KEY PEM)`: the signing key first, then any retired keys still trusted.
-pub fn jwks_from_keys(keys: &[(String, String)]) -> anyhow::Result<Value> {
+pub(crate) fn jwks_from_keys(keys: &[(String, String)]) -> anyhow::Result<Value> {
     let mut out = Vec::with_capacity(keys.len());
     for (kid, pem) in keys {
         let der = spki_der_from_pem(pem)?;

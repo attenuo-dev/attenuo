@@ -43,9 +43,9 @@
 //! verifier's message (issuer, audience, `kid`, client ids) is logged at debug level and never
 //! returned (SR-17).
 
-pub mod claims;
-pub mod intake;
-pub mod jwks;
+pub(crate) mod claims;
+pub(crate) mod intake;
+pub(crate) mod jwks;
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -62,13 +62,13 @@ use crate::error::ApiError;
 use jwks::{JwksCache, JwksError};
 
 /// RFC 8693 §3 token type of an OIDC ID token.
-pub const ID_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:id_token";
+pub(crate) const ID_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:id_token";
 /// Token type of an ID-JAG (draft-ietf-oauth-identity-assertion-authz-grant).
-pub const ID_JAG_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:id-jag";
+pub(crate) const ID_JAG_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:id-jag";
 /// Header `typ` of an ID-JAG.
-pub const ID_JAG_TYP: &str = "oauth-id-jag+jwt";
+pub(crate) const ID_JAG_TYP: &str = "oauth-id-jag+jwt";
 /// RFC 7523 grant type, the draft's way of presenting an ID-JAG.
-pub const JWT_BEARER_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
+pub(crate) const JWT_BEARER_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
 
 /// Timeout for discovery and JWKS requests.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);

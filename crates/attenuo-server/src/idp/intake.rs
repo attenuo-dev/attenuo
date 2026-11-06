@@ -60,7 +60,7 @@ use crate::routes::{audit_issuance, no_store, register_issued};
 use crate::state::AppState;
 
 /// Does this `/token` request carry an IdP credential (rather than an attenuo token)?
-pub fn is_intake(body: &Value) -> bool {
+pub(crate) fn is_intake(body: &Value) -> bool {
     let s = |k: &str| body.get(k).and_then(Value::as_str);
     matches!(
         s("subject_token_type"),
@@ -104,7 +104,7 @@ fn invalid_scope(description: &'static str, detail: impl Into<String>) -> ApiErr
 }
 
 /// Handle an intake request whose body has already been parsed to JSON.
-pub async fn handle(
+pub(crate) async fn handle(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     body: Value,
@@ -414,7 +414,7 @@ fn authenticate_agent(
 }
 
 /// Validate `[[agents]]` at startup; returns them with the hash lowercased.
-pub fn validate_agents(agents: &[AgentConfig]) -> anyhow::Result<Vec<AgentConfig>> {
+pub(crate) fn validate_agents(agents: &[AgentConfig]) -> anyhow::Result<Vec<AgentConfig>> {
     clientauth::validate_clients("[[agents]]", agents)
 }
 

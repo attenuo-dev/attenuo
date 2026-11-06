@@ -47,7 +47,7 @@ use crate::idp::jwks::{JwksCache, JwksError};
 use crate::idp::numeric_date;
 
 /// RFC 8693 §3 token type the `actor_token_type` must name.
-pub const ACTOR_TOKEN_TYPE: &str = attenuo_token::JWT_TOKEN_TYPE_URN;
+pub(crate) const ACTOR_TOKEN_TYPE: &str = attenuo_token::JWT_TOKEN_TYPE_URN;
 
 /// Timeout for JWKS requests.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -510,7 +510,7 @@ fn valid_trust_domain(td: &str) -> bool {
 /// `spiffe`, lowercase trust domain of `[a-z0-9.-_]`, a non-empty path of `/`-separated
 /// segments of `[a-zA-Z0-9.-_]` that are neither empty, `.` nor `..`; no query, fragment,
 /// port or user info.
-pub fn parse_spiffe_id(id: &str) -> Option<(String, String)> {
+pub(crate) fn parse_spiffe_id(id: &str) -> Option<(String, String)> {
     let rest = id.strip_prefix("spiffe://")?;
     let (td, path) = rest.split_once('/')?;
     if !valid_trust_domain(td) {

@@ -16,12 +16,12 @@ use super::{numeric_date, IntakeError, VerifiedAssertion};
 
 /// Name of the derived attribute that says whether the user authenticated with more than one
 /// factor.
-pub const MFA_ATTRIBUTE: &str = "mfa";
+pub(crate) const MFA_ATTRIBUTE: &str = "mfa";
 
 /// `amr` values (RFC 8176) that count as multi-factor: `mfa` itself, a one-time password, and a
 /// proof of possession of a hardware or software key. Anything else (`pwd`, `face`, `sms`, ...)
 /// on its own does not set `mfa`.
-pub const MFA_AMR_VALUES: &[&str] = &["mfa", "otp", "hwk", "swk"];
+pub(crate) const MFA_AMR_VALUES: &[&str] = &["mfa", "otp", "hwk", "swk"];
 
 /// Build the originating user from a verified credential.
 ///
@@ -30,7 +30,7 @@ pub const MFA_AMR_VALUES: &[&str] = &["mfa", "otp", "hwk", "swk"];
 /// - `attributes` = every claim named in the IdP's `attribute_claims` that is present and not
 ///   null, copied verbatim, plus `mfa: bool` from `amr` ([`MFA_AMR_VALUES`]). The derived `mfa`
 ///   overrides a claim of the same name.
-pub fn originating_user(v: &VerifiedAssertion) -> Result<OriginatingUser, IntakeError> {
+pub(crate) fn originating_user(v: &VerifiedAssertion) -> Result<OriginatingUser, IntakeError> {
     let at = numeric_date(&v.claims, "auth_time")
         .or_else(|| numeric_date(&v.claims, "iat"))
         .ok_or(IntakeError::MissingClaim("iat"))?;
@@ -56,7 +56,7 @@ pub fn originating_user(v: &VerifiedAssertion) -> Result<OriginatingUser, Intake
 }
 
 /// `true` when `amr` contains one of [`MFA_AMR_VALUES`].
-pub fn mfa_from_amr(claims: &Map<String, Value>) -> bool {
+pub(crate) fn mfa_from_amr(claims: &Map<String, Value>) -> bool {
     claims
         .get("amr")
         .and_then(Value::as_array)
@@ -69,7 +69,7 @@ pub fn mfa_from_amr(claims: &Map<String, Value>) -> bool {
 
 /// The ID-JAG claims attenuo uses beyond the common ones.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IdJagClaims {
+pub(crate) struct IdJagClaims {
     /// `client_id`: the client the IdP issued the assertion to. It must be the agent that
     /// presents it, and becomes the root hop's agent.
     pub client_id: String,
@@ -80,7 +80,7 @@ pub struct IdJagClaims {
 /// The draft's `resource` and `scope` claims are not used: the capabilities of the root token
 /// come from `[[root_grants]]` and the request, not from the IdP. If a later draft renames or
 /// adds required claims, this is the function to change.
-pub fn map_id_jag(claims: &Map<String, Value>) -> Result<IdJagClaims, IntakeError> {
+pub(crate) fn map_id_jag(claims: &Map<String, Value>) -> Result<IdJagClaims, IntakeError> {
     match claims.get("client_id").and_then(Value::as_str) {
         Some(c) if !c.is_empty() => Ok(IdJagClaims {
             client_id: c.to_owned(),

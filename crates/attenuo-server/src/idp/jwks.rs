@@ -20,11 +20,11 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 /// Largest JWKS or discovery document accepted.
-pub const MAX_JWKS_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_JWKS_BYTES: usize = 256 * 1024;
 /// Most keys kept from one JWKS.
-pub const MAX_JWKS_KEYS: usize = 32;
+pub(crate) const MAX_JWKS_KEYS: usize = 32;
 /// Minimum time between two refetches triggered by an unknown `kid`.
-pub const UNKNOWN_KID_REFETCH_COOLDOWN: Duration = Duration::from_secs(30);
+pub(crate) const UNKNOWN_KID_REFETCH_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Why no key could be found.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -55,7 +55,7 @@ struct CacheState {
 }
 
 /// The key cache for one IdP.
-pub struct JwksCache {
+pub(crate) struct JwksCache {
     client: reqwest::Client,
     issuer: String,
     configured_url: Option<String>,
@@ -64,7 +64,7 @@ pub struct JwksCache {
 }
 
 impl JwksCache {
-    pub fn new(
+    pub(crate) fn new(
         client: reqwest::Client,
         issuer: String,
         jwks_url: Option<String>,
@@ -82,7 +82,7 @@ impl JwksCache {
     /// The verification key for a token signed with `alg` and header `kid`.
     ///
     /// The lock is held across a fetch so concurrent requests share one fetch.
-    pub async fn key_for(
+    pub(crate) async fn key_for(
         &self,
         kid: Option<&str>,
         alg: Algorithm,

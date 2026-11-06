@@ -21,6 +21,7 @@
 //! See `docs/design/performance.md` for the method and its limits.
 
 #![deny(unsafe_code)]
+#![warn(unreachable_pub)]
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
