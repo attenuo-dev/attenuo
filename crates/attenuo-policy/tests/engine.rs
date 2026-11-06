@@ -492,6 +492,26 @@ fn forbid_wins_over_permit_and_both_ids_are_reported_appropriately() {
     assert_eq!(out.policy_ids, vec!["p"]);
 }
 
+/// Cedar returns the determining policies as a set, so the ids reached the outcome in hash
+/// order and two identical calls could disagree on it (found by the `policy_context` fuzz
+/// target's determinism check, 2026-11-06). They are sorted now.
+#[test]
+fn policy_ids_are_sorted_so_identical_calls_give_identical_outcomes() {
+    let engine = engine_with(
+        r#"
+        @id("p") permit(principal, action, resource);
+        @id("f_zulu") forbid(principal, action == Action::"github/delete_repo", resource);
+        @id("f_alpha") forbid(principal, action == Action::"github/delete_repo", resource);
+        @id("f_mike") forbid(principal, action == Action::"github/delete_repo", resource);
+        "#,
+    );
+    for _ in 0..20 {
+        let out = engine.authorize(&chain(), &call("delete_repo", json!({})), now());
+        assert_eq!(out.decision, Decision::Deny);
+        assert_eq!(out.policy_ids, vec!["f_alpha", "f_mike", "f_zulu"]);
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // Entities and context details
 // ---------------------------------------------------------------------------------------

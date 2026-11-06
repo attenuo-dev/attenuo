@@ -1,6 +1,6 @@
 # Fuzzing
 
-- Status: first campaign 2026-10-23 (`test/fuzz-targets`); second campaign, 10 minutes per target, 2026-10-23 evening (below); round 2 over run limits, budgets, approval tokens, the usage walker and the server routes, 2026-10-24 ([write-up](../research/fuzzing-2026-10-24-round2.md)); round 3 over the pass 7 SSE parsing (`SseFramer`, `SseRewriter`, `parse_data`, the stream-end scan and rewrite), 2026-10-25 ([write-up](../research/fuzz-round-3-2026-10-25.md))
+- Status: first campaign 2026-10-23 (`test/fuzz-targets`); second campaign, 10 minutes per target, 2026-10-23 evening (below); round 2 over run limits, budgets, approval tokens, the usage walker and the server routes, 2026-10-24 ([write-up](../research/fuzzing-2026-10-24-round2.md)); round 3 over the pass 7 SSE parsing (`SseFramer`, `SseRewriter`, `parse_data`, the stream-end scan and rewrite), 2026-10-25 ([write-up](../research/fuzz-round-3-2026-10-25.md)); `decimal` and `set<decimal>` inputs in `policy_context`, checked against an exact-digit oracle, 2026-11-06 (`fuzz/policy-context-decimal`, 300 s, 424 k runs, no crash; the order of `Outcome::policy_ids` varies between identical calls)
 - Crate: `fuzz/` (cargo-fuzz, libFuzzer), outside the workspace
 - Related: [threat model](../spec/threat-model.md), [security review pass 3](../research/security-review-2026-10-23.md)
 
