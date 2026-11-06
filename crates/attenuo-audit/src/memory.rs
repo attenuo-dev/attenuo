@@ -14,6 +14,7 @@ pub struct MemoryAudit {
 }
 
 impl MemoryAudit {
+    /// An empty log.
     pub fn new() -> Self {
         Self::default()
     }
@@ -23,6 +24,7 @@ impl MemoryAudit {
         Ok(self.entries.lock()?.len())
     }
 
+    /// Whether the log has no entries.
     pub fn is_empty(&self) -> Result<bool, AuditError> {
         Ok(self.len()? == 0)
     }

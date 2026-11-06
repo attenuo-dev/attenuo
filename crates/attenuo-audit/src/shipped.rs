@@ -38,7 +38,9 @@ pub const SHIPPED_FORMAT: &str = "attenuo-shipped-checkpoint-v1";
 /// object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShippedCheckpoint {
+    /// The envelope version, [`SHIPPED_FORMAT`].
     pub format: String,
+    /// The signed checkpoint itself.
     pub checkpoint: Checkpoint,
     /// The checkpoint's `kid`, repeated.
     pub kid: String,
@@ -58,6 +60,7 @@ pub fn checkpoint_sha256(cp: &Checkpoint) -> String {
 }
 
 impl ShippedCheckpoint {
+    /// The envelope for `cp`; `public_url` is the signing server's `[server] public_url`, if set.
     pub fn new(cp: &Checkpoint, public_url: Option<String>) -> Self {
         Self {
             format: SHIPPED_FORMAT.to_string(),
@@ -102,6 +105,7 @@ impl ShippedCheckpoint {
 pub struct ShippedLine {
     /// 1-based line number in the file.
     pub line: usize,
+    /// The checkpoint the line carries.
     pub checkpoint: Checkpoint,
     /// Set when the line was an envelope that does not match its own checkpoint.
     pub inconsistency: Option<String>,
@@ -147,9 +151,11 @@ pub fn parse_shipped(text: &str) -> Result<Vec<ShippedLine>, AuditError> {
 /// A shipped checkpoint the export disagrees with, or one that is unusable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShippedMismatch {
+    /// The shipped checkpoint's `seq`.
     pub seq: u64,
     /// Line of the shipped file.
     pub line: usize,
+    /// What disagrees, or why the checkpoint cannot be used.
     pub reason: String,
 }
 
@@ -167,6 +173,7 @@ pub struct CrossCheckReport {
     pub beyond_range: u64,
     /// Highest seq in the shipped file.
     pub last_shipped_seq: Option<u64>,
+    /// Each shipped checkpoint the export disagrees with, or that is unusable.
     pub mismatches: Vec<ShippedMismatch>,
     /// No mismatches.
     pub ok: bool,

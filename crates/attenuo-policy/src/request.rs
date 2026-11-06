@@ -2,7 +2,7 @@
 //! and the context record. The shape is documented at the crate root.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use attenuo_core::{DelegationChain, ToolCall};
 use cedar_policy::{
@@ -211,9 +211,18 @@ pub(crate) fn check_tool_inputs(
     Ok(())
 }
 
-pub(crate) fn uid(ty: &str, id: &str) -> EntityUid {
-    let ty: EntityTypeName = ty.parse().expect("entity type names used here are valid");
-    EntityUid::from_type_name_and_id(ty, EntityId::new(id))
+/// The fixed entity type names a request refers to, parsed once rather than per request.
+static AGENT: LazyLock<EntityTypeName> = LazyLock::new(|| entity_type("Agent"));
+static ACTION: LazyLock<EntityTypeName> = LazyLock::new(|| entity_type("Action"));
+static TOOL: LazyLock<EntityTypeName> = LazyLock::new(|| entity_type("Tool"));
+static SERVER: LazyLock<EntityTypeName> = LazyLock::new(|| entity_type("Server"));
+
+fn entity_type(ty: &str) -> EntityTypeName {
+    ty.parse().expect("entity type names used here are valid")
+}
+
+pub(crate) fn uid(ty: &EntityTypeName, id: &str) -> EntityUid {
+    EntityUid::from_type_name_and_id(ty.clone(), EntityId::new(id))
 }
 
 /// Resource id for a call: `<server>/<tool>`.
@@ -380,9 +389,9 @@ impl RequestParts {
 
         Ok(Self {
             key: PartsKey::new(chain, call, attrs),
-            principal: uid("Agent", &agent.0),
-            action: uid("Action", &action),
-            resource: uid("Tool", &tool_id(call)),
+            principal: uid(&AGENT, &agent.0),
+            action: uid(&ACTION, &action),
+            resource: uid(&TOOL, &tool_id(call)),
             originating_user,
             chain: chain_record,
             entities: entities(chain, call, attrs, &action)?,
@@ -806,7 +815,7 @@ impl ScreenBase {
             .map_err(|e| TranslationError(format!("entities: {e}")))?;
         Ok(Self {
             server: server.to_owned(),
-            principal: uid("Agent", &agent.0),
+            principal: uid(&AGENT, &agent.0),
             originating_user,
             chain: chain_record,
             entities,
@@ -830,7 +839,7 @@ impl ScreenBase {
         let action = crate::schema::action_id(&self.server, tool, legacy_bare_actions);
         let resource_id = format!("{}/{tool}", self.server);
         let tool_entity = Entity::new(
-            uid("Tool", &resource_id),
+            uid(&TOOL, &resource_id),
             HashMap::from([
                 (
                     "server".to_string(),
@@ -853,14 +862,14 @@ impl ScreenBase {
                     RestrictedExpression::new_bool(attrs.is_destructive()),
                 ),
             ]),
-            HashSet::from([uid("Server", &self.server)]),
+            HashSet::from([uid(&SERVER, &self.server)]),
         )
         .map_err(|e| TranslationError(format!("entities: {e}")))?;
         let mut added = vec![tool_entity];
         if action != GENERIC_ACTION {
             added.push(Entity::new_no_attrs(
-                uid("Action", &action),
-                HashSet::from([uid("Action", GENERIC_ACTION)]),
+                uid(&ACTION, &action),
+                HashSet::from([uid(&ACTION, GENERIC_ACTION)]),
             ));
         }
         let entities = self
@@ -888,8 +897,8 @@ impl ScreenBase {
             Context::from_pairs(pairs).map_err(|e| TranslationError(format!("context: {e}")))?;
         let request = Request::new(
             self.principal.clone(),
-            uid("Action", &action),
-            uid("Tool", &resource_id),
+            uid(&ACTION, &action),
+            uid(&TOOL, &resource_id),
             context,
             None,
         )
@@ -1018,9 +1027,9 @@ pub(crate) fn build(
         .map_err(|e| TranslationError(format!("entities: {e}")))?;
 
     Ok(CedarRequest {
-        principal: uid("Agent", &agent.0),
-        action: uid("Action", &action),
-        resource: uid("Tool", &tool_id(call)),
+        principal: uid(&AGENT, &agent.0),
+        action: uid(&ACTION, &action),
+        resource: uid(&TOOL, &tool_id(call)),
         context,
         entities,
     })

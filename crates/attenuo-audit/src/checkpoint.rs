@@ -33,7 +33,9 @@ pub const CHECKPOINT_CONTEXT: &str = "attenuo-checkpoint-v1";
 /// A signed `(seq, head_hash)` pair. An empty log checkpoints as `(0, GENESIS_HASH)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Checkpoint {
+    /// Sequence number of the last entry the checkpoint covers.
     pub seq: u64,
+    /// `entry_hash` of the entry at `seq` (the genesis hash for an empty log).
     pub head_hash: String,
     /// RFC 3339 UTC, whole seconds.
     pub at: String,
@@ -119,6 +121,7 @@ impl CheckpointKeys {
         Ok(Self { keys })
     }
 
+    /// Whether the JWKS held no usable Ed25519 key.
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
@@ -145,7 +148,10 @@ impl CheckpointKeys {
 /// A checkpoint that failed verification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BadCheckpoint {
+    /// The `seq` the checkpoint claims to cover.
     pub seq: u64,
+    /// Why it failed: an unknown key, a bad signature, a head hash that differs from the log,
+    /// or a log that ends before it.
     pub reason: String,
 }
 
@@ -157,6 +163,7 @@ pub struct SignedVerifyReport {
     pub entries: u64,
     /// The chain is intact and every checkpoint verified.
     pub ok: bool,
+    /// Sequence number of the first entry that breaks the hash chain, as in [`VerifyReport`].
     pub first_bad_seq: Option<u64>,
     /// Checkpoints examined.
     pub checkpoints: u64,
@@ -165,6 +172,7 @@ pub struct SignedVerifyReport {
     /// Entries after `last_signed_seq` (all of them when there is none): covered by the hash
     /// chain only, not yet countersigned.
     pub unsigned_tail: u64,
+    /// Every checkpoint that failed verification, with the reason.
     pub bad_checkpoints: Vec<BadCheckpoint>,
 }
 

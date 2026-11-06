@@ -63,6 +63,7 @@ pub struct RecordFilter {
 }
 
 impl RecordFilter {
+    /// Whether no member is set, so the filter matches every record.
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
@@ -82,9 +83,13 @@ impl RecordFilter {
 /// First line of an export.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportHeader {
+    /// The export format version, [`EXPORT_FORMAT`] for a file this crate writes.
     pub format: String,
+    /// First seq of the declared range `from..=to`.
     pub from: u64,
+    /// Last seq of the declared range.
     pub to: u64,
+    /// When the export was taken, RFC 3339 UTC.
     pub exported_at: String,
     /// Present when the export holds only the entries that match. Such a file has gaps in its
     /// hash chain by construction, so [`verify_export_with`] refuses it: verify an unfiltered
@@ -94,6 +99,7 @@ pub struct ExportHeader {
 }
 
 impl ExportHeader {
+    /// An unfiltered header for the range `from..=to`, in the current [`EXPORT_FORMAT`].
     pub fn new(from: u64, to: u64, exported_at: String) -> Self {
         Self {
             format: EXPORT_FORMAT.to_string(),
@@ -117,7 +123,9 @@ pub struct Export {
     /// Always present in a parsed export; [`verify_export`] refuses an `Export` built without
     /// one, since nothing would say which range the file claims to hold.
     pub header: Option<ExportHeader>,
+    /// The entries, in file order.
     pub entries: Vec<AuditEntry>,
+    /// The checkpoints, in file order.
     pub checkpoints: Vec<Checkpoint>,
 }
 
@@ -247,10 +255,12 @@ pub fn to_json_form(export: &Export) -> Value {
 /// Result of verifying an export.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExportReport {
+    /// Chain and checkpoint verification of the file's entries, flattened into the report.
     #[serde(flatten)]
     pub report: SignedVerifyReport,
     /// Seq of the first and last entry in the file, if any.
     pub first_seq: Option<u64>,
+    /// Seq of the last entry in the file, if any.
     pub last_seq: Option<u64>,
     /// The file starts at seq 1 and its first `prev_hash` is the genesis value. When `false`
     /// the entries before `first_seq` are not covered by this file.

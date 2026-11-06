@@ -45,6 +45,7 @@ pub struct OutboxNotice {
     pub event_id: String,
     /// `approval.pending`, `approval.decided` or `approval.expired`.
     pub kind: String,
+    /// The approval the notice is about.
     pub approval_id: String,
     /// The JSON document exactly as sent and signed.
     pub body: Vec<u8>,
@@ -55,9 +56,13 @@ pub struct OutboxNotice {
 /// What [`SqliteLeaseStore::outbox_insert`] stores.
 #[derive(Debug, Clone, Copy)]
 pub struct NewNotice<'a> {
+    /// The notice's stable id, as [`OutboxNotice::event_id`].
     pub event_id: &'a str,
+    /// The event kind, as [`OutboxNotice::kind`].
     pub kind: &'a str,
+    /// The approval the notice is about.
     pub approval_id: &'a str,
+    /// The signed JSON document to send.
     pub body: &'a [u8],
 }
 
