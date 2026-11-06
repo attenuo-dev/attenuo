@@ -163,6 +163,35 @@ CREATE TABLE IF NOT EXISTS run_spans (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS run_spans_seq_idx ON run_spans(chain_id, seq);
 INSERT OR IGNORE INTO budget_meta (key, value) VALUES ('span_key', lower(hex(randomblob(32))));
+-- Per-user windows (run limits phase 3). `user` is the hex HMAC-SHA-256, under `user_key`
+-- in budget_meta, of the RFC 8785 JSON of [issuer, subject]; never the subject itself.
+-- Pruned by the window's end (`[leases] user_window_retention_seconds`), never by leases.
+-- Created at open on stores that predate it.
+CREATE TABLE IF NOT EXISTS user_windows (
+    user         TEXT    NOT NULL,
+    window_kind  TEXT    NOT NULL,
+    window_start INTEGER NOT NULL,
+    tool         TEXT    NOT NULL,
+    measure      TEXT    NOT NULL,
+    used         INTEGER NOT NULL,
+    PRIMARY KEY (user, window_kind, window_start, tool, measure)
+) WITHOUT ROWID;
+-- What each decision charged to a window, for refunds.
+CREATE TABLE IF NOT EXISTS user_window_charges (
+    decision_id  TEXT    NOT NULL,
+    user         TEXT    NOT NULL,
+    window_kind  TEXT    NOT NULL,
+    window_start INTEGER NOT NULL,
+    tool         TEXT    NOT NULL,
+    measure      TEXT    NOT NULL,
+    amount       INTEGER NOT NULL,
+    at           TEXT    NOT NULL,
+    refunded_at  TEXT    NULL
+);
+CREATE INDEX IF NOT EXISTS user_window_charges_decision_idx ON user_window_charges(decision_id);
+CREATE INDEX IF NOT EXISTS user_window_charges_window_idx
+    ON user_window_charges(user, window_kind, window_start, tool, measure);
+INSERT OR IGNORE INTO budget_meta (key, value) VALUES ('user_key', lower(hex(randomblob(32))));
 "#;
 
 /// The record id (`DecisionRecord::id`) of a row, as SQL. `record_json` is the hashed text

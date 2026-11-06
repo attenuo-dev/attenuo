@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 use attenuo_core::fingerprint::Fingerprint;
 use attenuo_core::limits::MAX_LIMIT;
-use attenuo_core::{Charge, LeaseId, LimitKind};
+use attenuo_core::{Charge, LeaseId, LimitKind, WindowCharge};
 use time::OffsetDateTime;
 
 use crate::approval::{rules, Approval, ApprovalState, Approver};
@@ -21,6 +21,7 @@ use crate::error::AuditError;
 use crate::spans::{
     distinct_hashes, evictions, SpanHit, SpanKey, MAX_SEQS_PER_PROBE, MAX_SPANS_PER_RUN,
 };
+use crate::window::{plan_windows, window_prunable, UserKey, WindowKey, WindowPrune};
 
 /// Outcome of checking a set of leases together (typically every lease in a chain).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -541,6 +542,61 @@ pub trait LeaseStore: Send + Sync {
     /// [`AuditError::ChargeRefunded`] when it was already refunded, or a store fault (see
     /// [`LeaseStore`]).
     fn refund(&self, decision_id: &str, at: OffsetDateTime) -> Result<u64, AuditError>;
+
+    /// Per-user windows (run limits phase 3, [`crate::window`]): what the window counter of
+    /// each charge holds now, in order. A window never charged holds 0. The charges' `amount`
+    /// is ignored. Callers decide on the worst case when this fails. The default keeps no
+    /// windows and fails, so a store without them is read as the worst case.
+    fn window_used(&self, windows: &[WindowCharge]) -> Result<Vec<u64>, AuditError> {
+        let _ = windows;
+        Err(AuditError::Storage(
+            "this lease store keeps no per-user windows".into(),
+        ))
+    }
+
+    /// [`charge`](Self::charge) (or, with `defer`,
+    /// [`charge_sync_deferred`](Self::charge_sync_deferred)) together with the per-user
+    /// window charges of the same decision, in one transaction: either everything is applied,
+    /// logged under `decision_id`, or nothing. A window charge never refuses (it saturates at
+    /// [`WindowCharge::MAX`]) and never adds a sync of its own. A refund returns the window
+    /// charges with the rest. The default refuses any window charge, and otherwise is
+    /// `charge` or `charge_sync_deferred`.
+    fn charge_windowed(
+        &self,
+        decision_id: &str,
+        charges: &[Charge],
+        windows: &[WindowCharge],
+        at: OffsetDateTime,
+        defer: bool,
+    ) -> Result<(ChargeOutcome, bool), AuditError> {
+        if !windows.is_empty() {
+            return Err(AuditError::Storage(
+                "this lease store keeps no per-user windows".into(),
+            ));
+        }
+        if defer {
+            self.charge_sync_deferred(decision_id, charges, at)
+        } else {
+            self.charge(decision_id, charges, at).map(|o| (o, false))
+        }
+    }
+
+    /// One pass of per-user window retention: delete up to `max_rows` window counters, and
+    /// the charges logged against them, whose window ended more than `retention` before
+    /// `now` ([`window_prunable`](crate::window_prunable)). Open windows are never touched.
+    /// One write transaction per pass. The default keeps nothing and reports `wrapped`.
+    fn prune_user_windows(
+        &self,
+        now: OffsetDateTime,
+        retention: time::Duration,
+        max_rows: usize,
+    ) -> Result<WindowPrune, AuditError> {
+        let _ = (now, retention, max_rows);
+        Ok(WindowPrune {
+            wrapped: true,
+            ..WindowPrune::default()
+        })
+    }
 
     /// Keep the limited capabilities of the hop whose lease is `lease`, as issued (ADR-0010),
     /// for the admin console. Display only: enforcement reads the limits from the token. The
@@ -1316,7 +1372,16 @@ struct Budgets {
     /// For each `distinct` value row, how many unrefunded decisions logged it: a refund frees
     /// the value only when it was the last (SR-62).
     holders: BTreeMap<CounterKey, usize>,
+    /// Per-user windows ([`crate::window`]): created on first use, like `key`.
+    user_key: Option<UserKey>,
+    /// What each window counter holds.
+    windows: BTreeMap<WindowKey, u64>,
+    /// What each decision charged to windows (counter, amount), and whether it was refunded.
+    window_log: BTreeMap<String, WindowLog>,
 }
+
+/// What one decision charged to windows (counter, amount), and when it was refunded.
+type WindowLog = (Vec<(WindowKey, u64)>, Option<OffsetDateTime>);
 
 impl Budgets {
     fn keys(&mut self, charges: &[Charge]) -> Result<Vec<CounterKey>, AuditError> {
@@ -1325,6 +1390,14 @@ impl Budgets {
             slot => slot.insert(ValueKey::random()?),
         };
         charges.iter().map(|c| key.counter(c)).collect()
+    }
+
+    fn window_keys(&mut self, windows: &[WindowCharge]) -> Result<Vec<WindowKey>, AuditError> {
+        let key = match &mut self.user_key {
+            Some(key) => key,
+            slot => slot.insert(UserKey::random()?),
+        };
+        windows.iter().map(|w| key.key(w)).collect()
     }
 }
 
@@ -2172,25 +2245,65 @@ impl LeaseStore for MemoryLeaseStore {
         charges: &[Charge],
         at: OffsetDateTime,
     ) -> Result<ChargeOutcome, AuditError> {
-        if charges.is_empty() {
-            return Ok(ChargeOutcome::Charged {
+        self.charge_windowed(decision_id, charges, &[], at, false)
+            .map(|(outcome, _)| outcome)
+    }
+
+    fn window_used(&self, windows: &[WindowCharge]) -> Result<Vec<u64>, AuditError> {
+        let mut b = self.budgets.lock()?;
+        let keys = b.window_keys(windows)?;
+        Ok(keys
+            .iter()
+            .map(|k| b.windows.get(k).copied().unwrap_or(0))
+            .collect())
+    }
+
+    fn charge_windowed(
+        &self,
+        decision_id: &str,
+        charges: &[Charge],
+        windows: &[WindowCharge],
+        at: OffsetDateTime,
+        _defer: bool,
+    ) -> Result<(ChargeOutcome, bool), AuditError> {
+        if charges.is_empty() && windows.is_empty() {
+            let none = ChargeOutcome::Charged {
                 used_after: Vec::new(),
-            });
+            };
+            return Ok((none, false));
         }
         // The lock is held from the check to the write: the memory store's transaction.
         let mut b = self.budgets.lock()?;
-        if b.log.contains_key(decision_id) {
+        if b.log.contains_key(decision_id) || b.window_log.contains_key(decision_id) {
             return Err(AuditError::Storage(format!(
                 "decision `{decision_id}` is already charged"
             )));
         }
+        let window_keys = b.window_keys(windows)?;
         let keys = b.keys(charges)?;
         let planned = match plan(&keys, charges, |k| {
             Ok(b.counters.get(k).copied().unwrap_or(0))
         })? {
             Ok(planned) => planned,
-            Err(exhausted) => return Ok(exhausted),
+            Err(exhausted) => return Ok((exhausted, false)),
         };
+        let window_writes = plan_windows(&window_keys, windows, |k| {
+            Ok(b.windows.get(k).copied().unwrap_or(0))
+        })?;
+        if !window_writes.is_empty() {
+            let mut logged = Vec::with_capacity(window_writes.len());
+            for (key, after, amount) in window_writes {
+                b.windows.insert(key.clone(), after);
+                logged.push((key, amount));
+            }
+            b.window_log.insert(decision_id.to_owned(), (logged, None));
+        }
+        if charges.is_empty() {
+            let none = ChargeOutcome::Charged {
+                used_after: Vec::new(),
+            };
+            return Ok((none, false));
+        }
         let mut log = ChargeLog {
             charges: Vec::new(),
             at,
@@ -2207,8 +2320,41 @@ impl LeaseStore for MemoryLeaseStore {
             });
         }
         b.log.insert(decision_id.to_owned(), log);
-        Ok(ChargeOutcome::Charged {
+        let outcome = ChargeOutcome::Charged {
             used_after: planned.used_after,
+        };
+        Ok((outcome, false))
+    }
+
+    fn prune_user_windows(
+        &self,
+        now: OffsetDateTime,
+        retention: time::Duration,
+        max_rows: usize,
+    ) -> Result<WindowPrune, AuditError> {
+        let max_rows = max_rows.max(1);
+        let mut b = self.budgets.lock()?;
+        let gone: Vec<WindowKey> = b
+            .windows
+            .keys()
+            .filter(|k| window_prunable(k.end(), now, retention))
+            .take(max_rows)
+            .cloned()
+            .collect();
+        for k in &gone {
+            b.windows.remove(k);
+        }
+        let mut pruned_charges = 0u64;
+        b.window_log.retain(|_, (charges, _)| {
+            let before = charges.len();
+            charges.retain(|(k, _)| !window_prunable(k.end(), now, retention));
+            pruned_charges += (before - charges.len()) as u64;
+            !charges.is_empty()
+        });
+        Ok(WindowPrune {
+            pruned_windows: gone.len() as u64,
+            pruned_charges,
+            wrapped: gone.len() < max_rows,
         })
     }
 
@@ -2239,16 +2385,49 @@ impl LeaseStore for MemoryLeaseStore {
             counters,
             log,
             holders,
+            windows,
+            window_log,
             ..
         } = &mut *b;
+        // Per-user windows the decision charged: returned with the rest, each recomputed from
+        // the unrefunded charges left, since a window saturates like run usage.
+        let windowed = match window_log.get(decision_id) {
+            Some((_, Some(_))) => {
+                return Err(AuditError::ChargeRefunded(decision_id.to_owned()));
+            }
+            Some((charged, None)) => Some(charged.clone()),
+            None => None,
+        };
+        let refund_windows =
+            |windows: &mut BTreeMap<WindowKey, u64>,
+             window_log: &mut BTreeMap<String, WindowLog>| {
+                let Some(charged) = &windowed else { return };
+                if let Some(entry) = window_log.get_mut(decision_id) {
+                    entry.1 = Some(at);
+                }
+                for (key, _) in charged {
+                    let total = window_log
+                        .values()
+                        .filter(|(_, refunded)| refunded.is_none())
+                        .flat_map(|(c, _)| c)
+                        .filter(|(k, _)| k == key)
+                        .fold(0u64, |t, (_, a)| t.saturating_add(*a))
+                        .min(WindowCharge::MAX);
+                    windows.insert(key.clone(), total);
+                }
+            };
         // An entry left empty by a revocation that ended its run's usage charged nothing now.
-        let entry = log
-            .get_mut(decision_id)
-            .filter(|e| !e.charges.is_empty())
-            .ok_or_else(|| AuditError::UnknownCharge(decision_id.to_owned()))?;
+        let Some(entry) = log.get_mut(decision_id).filter(|e| !e.charges.is_empty()) else {
+            if windowed.is_none() {
+                return Err(AuditError::UnknownCharge(decision_id.to_owned()));
+            }
+            refund_windows(windows, window_log);
+            return Ok(0);
+        };
         if entry.refunded_at.is_some() {
             return Err(AuditError::ChargeRefunded(decision_id.to_owned()));
         }
+        refund_windows(windows, window_log);
         let distinct = LimitKind::Distinct.as_str();
         let mut restored = 0u64;
         for c in &entry.charges {

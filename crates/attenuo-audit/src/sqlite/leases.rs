@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 use attenuo_core::fingerprint::Fingerprint;
-use attenuo_core::{Charge, LeaseId};
+use attenuo_core::{Charge, LeaseId, WindowCharge};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use time::OffsetDateTime;
 
@@ -16,7 +16,7 @@ use super::approvals::{
     add_approval_columns, approval_from_row, approval_in, approvals_for_call, pending_of_run,
     APPROVAL_COLUMNS,
 };
-use super::budgets::{counter_in, refund_in};
+use super::budgets::{counter_in, prune_windows_in, refund_in, window_in};
 use super::connection::{
     file_of, open_connection, open_memory_connection, with_full_sync, Durability, WriteGate,
 };
@@ -37,6 +37,7 @@ use crate::lease::{
 use crate::spans::{
     distinct_hashes, evictions, SpanHit, SpanKey, MAX_SEQS_PER_PROBE, MAX_SPANS_PER_RUN,
 };
+use crate::window::{UserKey, WindowPrune};
 
 /// Lease registry in SQLite.
 ///
@@ -64,6 +65,8 @@ pub struct SqliteLeaseStore {
     pub(super) value_key: ValueKey,
     /// The key span-index fingerprints are hashed under (`budget_meta`, ADR-0009 phase 2).
     span_key: SpanKey,
+    /// The key per-user window users are digested under (`budget_meta`, run limits phase 3).
+    pub(super) user_key: UserKey,
     /// The `rowid` of the last `lease_sessions` row a `prune_sessions` pass looked at; 0 to
     /// start from the first.
     session_cursor: Mutex<i64>,
@@ -143,6 +146,13 @@ impl SqliteLeaseStore {
         )?;
         let span_key = hex::decode(&span_key)
             .map_err(|e| AuditError::Storage(format!("span key is not hex: {e}")))?;
+        let user_key: String = conn.query_row(
+            "SELECT value FROM budget_meta WHERE key = 'user_key'",
+            [],
+            |r| r.get(0),
+        )?;
+        let user_key = hex::decode(&user_key)
+            .map_err(|e| AuditError::Storage(format!("user window key is not hex: {e}")))?;
         let gate = WriteGate::for_file(file_of(&conn).as_deref());
         Ok(Self {
             conn: Mutex::new(conn),
@@ -151,6 +161,7 @@ impl SqliteLeaseStore {
             gate,
             value_key: ValueKey::new(&key),
             span_key: SpanKey::new(&span_key),
+            user_key: UserKey::new(&user_key),
             session_cursor: Mutex::new(0),
             lease_prune: Mutex::default(),
             run_state_cursor: Mutex::new((0, 0)),
@@ -1452,8 +1463,40 @@ impl LeaseStore for SqliteLeaseStore {
         charges: &[Charge],
         at: OffsetDateTime,
     ) -> Result<ChargeOutcome, AuditError> {
-        self.charge_with(decision_id, charges, at, false)
+        self.charge_with(decision_id, charges, &[], at, false)
             .map(|(outcome, _)| outcome)
+    }
+
+    fn window_used(&self, windows: &[WindowCharge]) -> Result<Vec<u64>, AuditError> {
+        let keys = windows
+            .iter()
+            .map(|w| self.user_key.key(w))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction()?;
+        keys.iter().map(|k| window_in(&tx, k)).collect()
+    }
+
+    fn charge_windowed(
+        &self,
+        decision_id: &str,
+        charges: &[Charge],
+        windows: &[WindowCharge],
+        at: OffsetDateTime,
+        defer: bool,
+    ) -> Result<(ChargeOutcome, bool), AuditError> {
+        self.charge_with(decision_id, charges, windows, at, defer)
+    }
+
+    fn prune_user_windows(
+        &self,
+        now: OffsetDateTime,
+        retention: time::Duration,
+        max_rows: usize,
+    ) -> Result<WindowPrune, AuditError> {
+        let _gate = self.gate.hold();
+        let mut conn = self.conn.lock()?;
+        prune_windows_in(&mut conn, now, retention, max_rows)
     }
 
     /// Defers the sync of a `sum` charge on a file store below `durability = "full"`; any
@@ -1464,7 +1507,7 @@ impl LeaseStore for SqliteLeaseStore {
         charges: &[Charge],
         at: OffsetDateTime,
     ) -> Result<(ChargeOutcome, bool), AuditError> {
-        self.charge_with(decision_id, charges, at, true)
+        self.charge_with(decision_id, charges, &[], at, true)
     }
 
     fn sync_file(&self) -> Option<&Path> {

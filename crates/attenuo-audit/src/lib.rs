@@ -35,6 +35,7 @@ pub mod query;
 pub mod shipped;
 pub mod spans;
 pub mod sqlite;
+pub mod window;
 
 pub use approval::{
     Approval, ApprovalLabel, ApprovalMethod, ApprovalState, Approver, MAX_PENDING_APPROVALS_PER_RUN,
@@ -74,3 +75,4 @@ pub use sqlite::{
 #[cfg(feature = "testing")]
 #[doc(hidden)]
 pub use sqlite::{WalRound, WalTimings};
+pub use window::{window_prunable, WindowPrune};
