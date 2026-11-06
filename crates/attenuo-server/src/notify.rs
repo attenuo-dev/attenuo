@@ -79,12 +79,16 @@ pub const OUTBOX_PRUNE_PERIOD: Duration = Duration::from_secs(3600);
 /// What happened to the approval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeKind {
+    /// The call was gated and its approval is waiting (`approval.pending`).
     Pending,
+    /// The approval was granted or declined (`approval.decided`).
     Decided,
+    /// The approval expired undecided (`approval.expired`).
     Expired,
 }
 
 impl NoticeKind {
+    /// The event type, as sent in [`EVENT_HEADER`] and the body's `type`.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "approval.pending",
@@ -122,7 +126,9 @@ pub fn event_id_for(kind: NoticeKind, approval_id: &str) -> String {
 /// One notification, its body fixed when it was first queued.
 #[derive(Debug, Clone)]
 pub struct Notice {
+    /// What happened to the approval.
     pub kind: NoticeKind,
+    /// Id of the approval the notice is about.
     pub approval_id: String,
     /// The same on every attempt and after a restart ([`event_id_for`]).
     pub event_id: String,
@@ -135,6 +141,7 @@ pub struct Notice {
 }
 
 impl Notice {
+    /// The notice of `kind` for approval `a`, its body built and fixed now; not yet stored.
     pub fn new(kind: NoticeKind, a: &Approval) -> Self {
         let event_id = event_id_for(kind, &a.id);
         let body = serde_json::to_vec(&notice_json(kind, &event_id, a)).unwrap_or_default();
@@ -744,6 +751,7 @@ impl ApprovalNotifier {
         })
     }
 
+    /// A producer end for the pipeline and the approval routes.
     pub fn handle(&self) -> NotifierHandle {
         NotifierHandle {
             emit: self.emit.clone(),
@@ -751,6 +759,7 @@ impl ApprovalNotifier {
         }
     }
 
+    /// Queue depth, lag and failures of delivery, which `/readyz` reports.
     pub fn status(&self) -> SinkStatus {
         self.queue.status()
     }

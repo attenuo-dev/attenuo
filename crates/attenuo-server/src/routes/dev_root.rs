@@ -35,22 +35,33 @@ use crate::error::ApiError;
 use crate::state::AppState;
 use attenuo_core::Decision;
 
+/// Body of `POST /admin/root-token` (see the module docs).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RootTokenRequest {
+    /// The user's subject, as asserted by the operator and never verified.
     pub subject: String,
+    /// The user's IdP issuer, as asserted by the operator.
     pub issuer: String,
+    /// The agent acting for the user: the root hop's agent id. `attenuo` is reserved.
     pub agent: String,
+    /// `"server:tool"` strings or capability objects. Required when `[[root_grants]]` is
+    /// empty; otherwise attenuated against the matching grant, which it defaults to.
     #[serde(default)]
     pub capabilities: Option<Vec<CapSpec>>,
+    /// Token lifetime in seconds; `[issuer] default_ttl_seconds` when absent.
     #[serde(default)]
     pub ttl_seconds: Option<u64>,
+    /// User attributes, merged over the grant's; a request may add an attribute but not change
+    /// one the grant sets (403 `attribute_fixed_by_grant`).
     #[serde(default)]
     pub attributes: BTreeMap<String, Value>,
+    /// RFC 8693 §4.4 `may_act` of the root token; within the grant's when it has one.
     #[serde(default)]
     pub may_act: Option<MayAct>,
 }
 
+/// `POST /admin/root-token`: mint a hop-0 token for an unverified user. Development only.
 pub async fn mint_root(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,

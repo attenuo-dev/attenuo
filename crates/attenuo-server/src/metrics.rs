@@ -297,11 +297,15 @@ impl Histogram {
 /// Which kind of token was issued.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
+    /// A hop-0 token: IdP intake or the dev root mint (`kind="root"`).
     Root,
+    /// A token exchanged from a parent (`kind="exchange"`).
     Exchange,
 }
 
 impl Metrics {
+    /// A fresh set of metrics with every counter at zero, shared by the pipeline, the routes
+    /// and the background tasks of one server.
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
@@ -315,6 +319,7 @@ impl Metrics {
         }
     }
 
+    /// Count one issued token in `tokens_issued_total`.
     pub fn token_issued(&self, kind: TokenKind) {
         let c = match kind {
             TokenKind::Root => &self.tokens_root,
@@ -349,10 +354,12 @@ impl Metrics {
         }
     }
 
+    /// Count one failed audit append (`audit_append_errors_total`).
     pub fn audit_append_error(&self) {
         self.audit_append_errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count one HTTP response by route template (`unmatched` for none) and status code.
     pub fn http_request(&self, route: &str, status: u16) {
         if let Ok(mut m) = self.http.lock() {
             *m.entry((route.to_string(), status)).or_default() += 1;

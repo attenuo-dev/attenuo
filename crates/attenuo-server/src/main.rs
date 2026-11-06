@@ -2,6 +2,9 @@
 //!
 //! Logging is controlled by `RUST_LOG` (default `info`).
 
+#![warn(missing_docs)]
+#![warn(unreachable_pub)]
+
 use std::path::PathBuf;
 
 use attenuo_server::config::{Config, CONFIG_ENV};

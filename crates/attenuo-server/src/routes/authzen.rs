@@ -58,6 +58,8 @@ use crate::state::AppState;
 pub const CHAIN_NOT_ISSUED: &str = "chain_not_issued";
 
 // The `Err` is a full response, built once per refused request; boxing it buys nothing.
+/// `POST /access/v1/evaluation`: decide one AuthZEN request through the pipeline (see the
+/// module docs for where the chain comes from). A refusal is returned as a full response.
 #[allow(clippy::result_large_err)]
 pub async fn evaluation(
     State(state): State<Arc<AppState>>,

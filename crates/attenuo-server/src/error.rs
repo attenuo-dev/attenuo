@@ -29,8 +29,12 @@ pub const INTERNAL_DETAIL: &str = "internal error; the details are in the server
 /// An error a handler returns. `code` is short and machine-readable; `detail` is for humans.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiError {
+    /// HTTP status of the response.
     pub status: StatusCode,
+    /// Machine-readable code, sent as `error` in the body.
     pub code: String,
+    /// Human-readable explanation, sent as `detail`. [`Self::internal`] sends
+    /// [`INTERNAL_DETAIL`] here and keeps the cause in the log.
     pub detail: String,
     /// Stable sub-code, sent as `error_description` (RFC 6749 §5.2) when set.
     pub description: Option<&'static str>,
@@ -42,6 +46,7 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    /// An error with no `error_description` and no decision id.
     pub fn new(status: StatusCode, code: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
             status,
@@ -64,10 +69,12 @@ impl ApiError {
         self
     }
 
+    /// A 400 with this `code`.
     pub fn bad_request(code: impl Into<String>, detail: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, code, detail)
     }
 
+    /// A 404 with code `not_found`.
     pub fn not_found(detail: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, "not_found", detail)
     }

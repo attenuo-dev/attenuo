@@ -46,6 +46,8 @@ use super::{audit_event, bearer_of, no_store};
 use crate::error::ApiError;
 use crate::state::AppState;
 
+/// `POST /token/renew`: extend the lease of the bearer token's last hop (see the module
+/// docs).
 pub async fn renew(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

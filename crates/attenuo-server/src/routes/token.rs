@@ -94,6 +94,8 @@ use crate::config::{capability_set, ActorAuth, CapSpec};
 use crate::error::ApiError;
 use crate::state::AppState;
 
+/// `POST /token`: RFC 8693 exchange from hop n to n+1, or hop-0 IdP intake (see the module
+/// docs).
 pub async fn exchange(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

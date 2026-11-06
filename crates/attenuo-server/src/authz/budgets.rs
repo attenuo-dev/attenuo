@@ -35,9 +35,13 @@ pub struct BudgetView {
 /// position, not its lease id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LimitHit {
+    /// Position of the hop whose limit it is (0 is the root).
     pub hop: usize,
+    /// Which kind of limit was hit.
     pub kind: LimitKind,
+    /// The argument the limit counts, as [`Charge::arg`] names it; `None` for `calls`.
     pub arg: Option<String>,
+    /// The limit's `max`.
     pub max: u64,
     /// What the counter held before the call.
     pub used: u64,
@@ -133,7 +137,9 @@ pub struct StatedBudget {
 /// `hop`, the shape of the `limit` member of a `budget_exhausted` answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatedLimit {
+    /// Position of the hop whose limit it is (0 is the root).
     pub hop: usize,
+    /// Which kind of limit the counter belongs to.
     pub kind: LimitKind,
     /// The counted argument, as [`Charge::arg`] names it; `None` for `calls`.
     pub arg: Option<String>,
