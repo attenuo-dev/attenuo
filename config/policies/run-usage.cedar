@@ -18,10 +18,15 @@
 //   [policy.catalog.web.get_webpage]
 //   destination = "url#host"      # the host of the URL, not the whole URL (phase 2)
 //
+//   [policy.catalog.web.fetch]
+//   readonly = true
+//   outbound = "url#host"         # an outbound argument: usage is kept for this read too
+//
 // Usage refuses nothing by itself. These policies turn it into limits that need no number in
 // any token: a hard one (`forbid`) and soft ones (`@obligation("approval")`) that ask once a
 // count is reached. An approval passes one call: that call is counted like any other, so the
-// next one asks again. All three figures are zero or false for a tool that is not destructive.
+// next one asks again. All three figures are zero or false for a tool that is not destructive
+// and has no `outbound` input.
 
 // Soft: the second and every later payment of a run asks the user. A benign second payment
 // costs one approval; an injected repeat is declined.
@@ -56,6 +61,19 @@ when { context.usage.destination_seen && !context.approval.present };
 @obligation("approval")
 forbid (principal, action == Action::"web/get_webpage", resource)
 when {
+  context.usage.calls >= 1 &&
+  !context.usage.destination_seen &&
+  !context.approval.present
+};
+
+// The same rule for every tool with an outbound argument, read-only or not: no tool name, and
+// the catalog's `outbound = "url#host"` says which argument names the site. A tool listed in
+// both rules is asked once, by both.
+@id("ask_on_a_new_outbound_site")
+@obligation("approval")
+forbid (principal, action, resource)
+when {
+  resource.outbound &&
   context.usage.calls >= 1 &&
   !context.usage.destination_seen &&
   !context.approval.present
