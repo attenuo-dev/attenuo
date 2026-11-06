@@ -445,7 +445,7 @@ What this does not show:
 - The host limits were measured only with today's `Derive::Host`. Their figures after the grammar fix are estimates still.
 - With every approval declined a prompt is a lost task. The request counts above say what a real approver would see; how a model behaves after a declined fetch is not measured. Utility under attack is not counted, as in the earlier sections.
 
-The binary was `attenuo-server` (debug) built from main at `53bebce`, and the arms were run again on a build of main at `d9ec99a` (after the decimal catalog input type, #190): every arm's per-suite statistics and every banking and slack row came out identical. That second run's server stopped partway through banking, so banking and slack were run a second time on their own. Raw outputs are not in the repository.
+The binary was `attenuo-server` (debug) built from main at `53bebce`, and the arms were run again on a build of main at `d9ec99a` (after the decimal catalog input type, #190): every arm's per-suite statistics and every banking and slack row came out identical. That second run's server stopped partway through banking, so banking and slack were run a second time on their own. After the argument-taint bounds of SR-91 (#193) the two controls were run once more on a release build of main at 7472dcd: `grants` 15/609 and 77/97, `args` 6/609 and 71/97, with the same per-suite rows, as expected, since no AgentDojo call comes near the 8,000-pair bound and the 8-per-probe limit changes which `seq` is reported, not which arguments match. Raw outputs are not in the repository.
 
 ## Stronger attack 2026-11-05
 
