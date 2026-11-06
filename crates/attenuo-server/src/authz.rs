@@ -24,9 +24,11 @@
 //!    policy reads `context.args_contain_untrusted` or `context.untrusted_args`
 //!    ([`PolicyEngine::reads_arg_taint`]) and otherwise for a call to a destructive tool,
 //!    every argument not pinned by an `equals` or `one_of` constraint is fingerprinted and
-//!    looked up in the run's span index (`LeaseStore::find_spans`); the hits are
-//!    `context.untrusted_args` and the record's `labels.untrusted_args`. An unreadable index
-//!    makes every unpinned argument untrusted.
+//!    looked up in the run's span index (`LeaseStore::find_spans`), once per distinct
+//!    fingerprint and with at most [`attenuo_audit::MAX_SEQS_PER_PROBE`] results each; the
+//!    hits are `context.untrusted_args` and the record's `labels.untrusted_args`. An
+//!    unreadable index, or arguments that carry more than [`MAX_ARG_PROBES`] fingerprints in
+//!    all (then nothing is looked up), makes every unpinned argument untrusted (SR-91).
 //! 3. **Approval.** A granted, unexpired approval for this call (same run, same calling hop's
 //!    lease, same call hash) is taken from the lease store and marked consumed
 //!    (`LeaseStore::take_approval`); Cedar then sees `context.approval.present` and `by`.
@@ -86,7 +88,9 @@ pub use authorizer::{ServerAuthorizer, VERIFIED_TOKENS_CAPACITY, VERIFIED_TOKEN_
 pub use budgets::{
     budget_json, BudgetView, CounterSource, LimitHit, StatedBudget, StatedLimit, MAX_STATED_LIMITS,
 };
-pub use labels::{untrusted_args_json, ArgTaint, RunLabels, MAX_UNTRUSTED_ARG_ENTRIES};
+pub use labels::{
+    untrusted_args_json, ArgTaint, RunLabels, MAX_ARG_PROBES, MAX_UNTRUSTED_ARG_ENTRIES,
+};
 pub use pipeline::{
     Pipeline, PipelineDecision, REASON_AUDIT_ERROR, REASON_LABEL_ERROR, REASON_LEASE_ERROR,
     REASON_LEASE_EXPIRED, REASON_LEASE_REVOKED, REASON_LEASE_UNKNOWN,

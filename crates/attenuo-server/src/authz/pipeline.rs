@@ -1,6 +1,6 @@
 //! [`Pipeline`]: the decision pipeline, steps 1 to 7 of the [module docs](super).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -31,8 +31,8 @@ use crate::metrics::{ExhaustedAt, Metrics, RefundSource};
 use super::budgets::{distinct_step, read_counters};
 use super::usage::{micros, record_usage};
 use super::{
-    ArgTaint, BudgetView, CounterSource, LimitHit, RunLabels, MAX_UNTRUSTED_ARG_ENTRIES,
-    UNREADABLE_USAGE,
+    ArgTaint, BudgetView, CounterSource, LimitHit, RunLabels, MAX_ARG_PROBES,
+    MAX_UNTRUSTED_ARG_ENTRIES, UNREADABLE_USAGE,
 };
 
 /// Reason code: a lease in the chain (or an ancestor of one) was revoked.
@@ -111,6 +111,56 @@ pub struct Pipeline {
     run_locks: Box<[Mutex<()>]>,
     /// `[approvals.notify]`: told about each new pending approval; it only queues.
     approval_notifier: Option<crate::notify::NotifierHandle>,
+}
+
+/// The lookups [`Pipeline::arg_taint`] makes for a call: one probe per distinct fingerprint of
+/// the unpinned arguments, with the arguments that carry it (SR-91).
+#[derive(Debug, Default)]
+pub(super) struct ArgProbes<'a> {
+    /// The distinct fingerprints, in first-seen order. Empty past [`MAX_ARG_PROBES`].
+    pub(super) probes: Vec<Fingerprint>,
+    /// For each probe, the arguments that carry it, in argument order.
+    pub(super) owners: Vec<Vec<&'a str>>,
+    /// Every unpinned argument with at least one fingerprint, in argument order.
+    pub(super) fingerprinted: Vec<&'a str>,
+    /// `(argument, fingerprint)` pairs over all unpinned arguments, duplicates included.
+    pub(super) pairs: usize,
+}
+
+/// The probes of `call`'s arguments not in `pinned`. Once the pairs pass [`MAX_ARG_PROBES`]
+/// nothing more is kept for lookup (the caller then looks nothing up); the remaining
+/// arguments are only checked for having a fingerprint, so the fail-closed answer still
+/// names each of them.
+pub(super) fn arg_probes<'a>(call: &'a ToolCall, pinned: &BTreeSet<String>) -> ArgProbes<'a> {
+    let mut out = ArgProbes::default();
+    let mut slot: HashMap<Fingerprint, usize> = HashMap::new();
+    for (name, value) in &call.arguments {
+        if pinned.contains(name) {
+            continue;
+        }
+        let fps = fingerprints(value);
+        if fps.is_empty() {
+            continue;
+        }
+        out.fingerprinted.push(name);
+        out.pairs = out.pairs.saturating_add(fps.len());
+        if out.pairs > MAX_ARG_PROBES {
+            continue;
+        }
+        for f in fps {
+            let i = *slot.entry(f).or_insert_with(|| {
+                out.probes.push(f);
+                out.owners.push(Vec::new());
+                out.probes.len() - 1
+            });
+            out.owners[i].push(name);
+        }
+    }
+    if out.pairs > MAX_ARG_PROBES {
+        out.probes.clear();
+        out.owners.clear();
+    }
+    out
 }
 
 /// How many locks `Pipeline::run_guard` spreads runs over. Two runs that share one only
@@ -1021,8 +1071,16 @@ impl Pipeline {
     /// exemption). Every other argument is fingerprinted as results are
     /// ([`attenuo_core::fingerprint::fingerprints`]) and looked up in the run's span index.
     ///
-    /// Fails closed: when the index cannot be read, every unpinned argument that has a
-    /// fingerprint counts as untrusted, with kind `unreadable` and no `seq`.
+    /// A fingerprint that several arguments carry is looked up once and reported for each of
+    /// them. The store returns at most [`MAX_SEQS_PER_PROBE`] results per fingerprint, lowest
+    /// `seq` first.
+    ///
+    /// Fails closed: when the index cannot be read, or the arguments carry more than
+    /// [`MAX_ARG_PROBES`] fingerprints in all (no lookup is then made), every unpinned
+    /// argument that has a fingerprint counts as untrusted, with kind `unreadable` and no
+    /// `seq`, and the diagnostics say why.
+    ///
+    /// [`MAX_SEQS_PER_PROBE`]: attenuo_audit::MAX_SEQS_PER_PROBE
     pub fn arg_taint(
         &self,
         chain: &DelegationChain,
@@ -1036,46 +1094,62 @@ impl Pipeline {
             return ArgTaint::default();
         };
         let pinned = pinned_arguments(chain, call);
-        let mut probes: Vec<Fingerprint> = Vec::new();
-        let mut owners: Vec<&str> = Vec::new();
-        for (name, value) in &call.arguments {
-            if pinned.contains(name) {
-                continue;
-            }
-            for f in fingerprints(value) {
-                probes.push(f);
-                owners.push(name);
-            }
-        }
-        if probes.is_empty() {
+        let ArgProbes {
+            probes,
+            owners,
+            fingerprinted,
+            pairs,
+        } = arg_probes(call, &pinned);
+        if fingerprinted.is_empty() {
             return ArgTaint::default();
         }
-        let (found, error) = match self.leases.find_spans(&LeaseId::new(chain_id), &probes) {
-            Ok(hits) => (
-                hits.iter()
-                    .map(|h| UntrustedArg {
-                        arg: owners[h.probe].to_string(),
-                        seq: Some(h.seq),
-                        kind: probes[h.probe].kind.into(),
-                    })
-                    .collect::<BTreeSet<_>>(),
-                None,
-            ),
-            Err(e) => {
-                tracing::error!(error = %e, "span index unreadable; treating the arguments as untrusted");
-                (
-                    owners
-                        .iter()
-                        .map(|arg| UntrustedArg {
-                            arg: arg.to_string(),
-                            seq: None,
-                            kind: UntrustedKind::Unreadable,
+        let unreadable = |args: &[&str]| -> BTreeSet<UntrustedArg> {
+            args.iter()
+                .map(|arg| UntrustedArg {
+                    arg: arg.to_string(),
+                    seq: None,
+                    kind: UntrustedKind::Unreadable,
+                })
+                .collect()
+        };
+        let (found, error) = if pairs > MAX_ARG_PROBES {
+            // Fail closed without a lookup, as for an unreadable index.
+            tracing::warn!(
+                fingerprints = pairs,
+                bound = MAX_ARG_PROBES,
+                "too many argument fingerprints; treating the arguments as untrusted"
+            );
+            (
+                unreadable(&fingerprinted),
+                Some(format!(
+                    "arguments carry more than {MAX_ARG_PROBES} fingerprints; unpinned \
+                     arguments treated as untrusted"
+                )),
+            )
+        } else {
+            match self.leases.find_spans(&LeaseId::new(chain_id), &probes) {
+                Ok(hits) => (
+                    hits.iter()
+                        .flat_map(|h| {
+                            let kind = probes[h.probe].kind.into();
+                            owners[h.probe].iter().map(move |arg| UntrustedArg {
+                                arg: arg.to_string(),
+                                seq: Some(h.seq),
+                                kind,
+                            })
                         })
-                        .collect(),
-                    Some(format!(
-                        "span index unreadable, unpinned arguments treated as untrusted: {e}"
-                    )),
-                )
+                        .collect::<BTreeSet<_>>(),
+                    None,
+                ),
+                Err(e) => {
+                    tracing::error!(error = %e, "span index unreadable; treating the arguments as untrusted");
+                    (
+                        unreadable(&fingerprinted),
+                        Some(format!(
+                            "span index unreadable, unpinned arguments treated as untrusted: {e}"
+                        )),
+                    )
+                }
             }
         };
         ArgTaint {

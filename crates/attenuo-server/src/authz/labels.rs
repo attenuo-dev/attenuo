@@ -26,6 +26,19 @@ pub struct RunLabels {
 /// Cedar context still names every matching argument.
 pub const MAX_UNTRUSTED_ARG_ENTRIES: usize = 64;
 
+/// Most `(argument, fingerprint)` pairs [`Pipeline::arg_taint`] looks up for one call: four
+/// arguments at the per-value cap ([`MAX_FINGERPRINTS_PER_VALUE`]). Counted before
+/// duplicates are merged, so it bounds both the lookups (one per distinct fingerprint) and
+/// the entries the hits expand to (at most [`MAX_SEQS_PER_PROBE`] results per fingerprint,
+/// times the arguments that carry it). An ordinary call is far below it: a long message body
+/// is one argument. A call past it is not looked up at all and fails closed: every unpinned
+/// argument with a fingerprint counts as untrusted, kind `unreadable` (SR-91).
+///
+/// [`Pipeline::arg_taint`]: super::Pipeline::arg_taint
+/// [`MAX_FINGERPRINTS_PER_VALUE`]: attenuo_core::fingerprint::MAX_FINGERPRINTS_PER_VALUE
+/// [`MAX_SEQS_PER_PROBE`]: attenuo_audit::MAX_SEQS_PER_PROBE
+pub const MAX_ARG_PROBES: usize = 4 * attenuo_core::fingerprint::MAX_FINGERPRINTS_PER_VALUE;
+
 /// What [`Pipeline::arg_taint`] found for a call (ADR-0009 phase 2).
 ///
 /// [`Pipeline::arg_taint`]: super::Pipeline::arg_taint
@@ -36,7 +49,8 @@ pub struct ArgTaint {
     /// What the decision record carries as `labels.untrusted_args`, at most
     /// [`MAX_UNTRUSTED_ARG_ENTRIES`].
     pub record: Vec<UntrustedArg>,
-    /// Set when the span index could not be read (every unpinned argument then counts).
+    /// Set when the span index could not be read, or the call carries more than
+    /// [`MAX_ARG_PROBES`] fingerprints (every unpinned argument then counts).
     pub error: Option<String>,
 }
 
