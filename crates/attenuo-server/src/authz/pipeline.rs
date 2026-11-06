@@ -1439,6 +1439,9 @@ impl Pipeline {
                     seq = entry.seq,
                     "request rejected"
                 );
+                // The proxy's `attenuo.stream_end` span, carried onto this thread; a no-op
+                // in any span that does not declare the field.
+                tracing::Span::current().record("attenuo.audit.seq", entry.seq);
                 true
             }
             Err(e) => {
