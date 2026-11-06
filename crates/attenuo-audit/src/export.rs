@@ -157,6 +157,14 @@ fn bad(detail: impl Into<String>) -> AuditError {
 }
 
 /// Parse an export in either shape (JSONL, or the single-object JSON form).
+///
+/// # Errors
+///
+/// [`AuditError::Export`] when a line (or the single JSON object) is not valid JSON or not a
+/// header, entry or checkpoint, when a JSONL file has a second header or a line of unknown `type`,
+/// when the JSON form's `entries` or `checkpoints` is not an array, when there is no header, or
+/// when the header's `format` is not [`EXPORT_FORMAT`] (including the earlier
+/// `attenuo-audit-export-v1`).
 pub fn parse_export(text: &str) -> Result<Export, AuditError> {
     let trimmed = text.trim_start();
     if trimmed.starts_with('{') {
@@ -288,6 +296,10 @@ pub struct VerifyOptions {
 
 /// Verify an export against the JWKS keys, offline, strictly: [`verify_export_with`] with the
 /// default [`VerifyOptions`], so every entry must be countersigned.
+///
+/// # Errors
+///
+/// As [`verify_export_with`].
 pub fn verify_export(export: &Export, keys: &CheckpointKeys) -> Result<ExportReport, AuditError> {
     verify_export_with(export, keys, VerifyOptions::default())
 }
@@ -304,6 +316,12 @@ pub fn verify_export(export: &Export, keys: &CheckpointKeys) -> Result<ExportRep
 ///
 /// A checkpoint outside the file's entry range is ignored by the chain check but still has
 /// its signature verified.
+///
+/// # Errors
+///
+/// [`AuditError::Export`] when the export has no header, or when its header carries a `filter` (a
+/// filtered export has gaps, so its chain cannot be verified). Everything else that is wrong with
+/// the export is reported in the [`ExportReport`], not as an error.
 pub fn verify_export_with(
     export: &Export,
     keys: &CheckpointKeys,
