@@ -878,7 +878,11 @@ async fn an_untouched_listen_stream_keeps_flowing() {
     let proxy = proxy_with(&up, authorizer.clone()).await;
     let mut stream = open_listen_stream(&proxy, "alice").await;
 
-    // Several re-check intervals' worth of events, all upstream notifications.
+    // Several re-check intervals' worth of events, all upstream notifications. On paused
+    // tokio time: the re-check ticks and the upstream's gaps between events are tokio timers,
+    // so once every task waits the runtime jumps to the next one, and the eight intervals pass
+    // in their real order without being slept through.
+    tokio::time::pause();
     let mut events = 0;
     let deadline = tokio::time::Instant::now() + RECHECK * 8;
     while let Ok(next) = tokio::time::timeout_at(deadline, stream.next()).await {

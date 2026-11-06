@@ -52,6 +52,8 @@ criterion = { workspace = true }
 attenuo-proxy = { workspace = true, features = ["testing"] }
 rusqlite = { workspace = true }
 tempfile = { workspace = true }
+# Paused time (`tokio::time::pause`) for the stream re-check test in `tests/e2e.rs`.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "decide"

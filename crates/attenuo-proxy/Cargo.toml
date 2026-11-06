@@ -40,6 +40,8 @@ uuid = { workspace = true }
 [dev-dependencies]
 # Enables the `testing` module for this crate's own integration tests.
 attenuo-proxy = { path = ".", features = ["testing"] }
+# Paused time (`start_paused`) for the re-check ticks in `tests/session_and_stream_guard.rs`.
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 
 [[example]]
