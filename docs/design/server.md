@@ -15,7 +15,7 @@ The server is wiring. It holds no authorization logic of its own: tokens come fr
 | Policy engine | `attenuo_policy::PolicyEngine` | `Arc<RwLock<_>>`, swapped in place by `POST /admin/policies/reload` |
 | Lease registry | `attenuo_audit::SqliteLeaseStore` | `Arc`, same SQLite file as the log |
 | Audit log | `attenuo_audit::SqliteAudit` | `Arc`; signs checkpoints with the issuer key (`Issuer::detached_signer`) |
-| Pipeline | `authz::Pipeline` | `Arc`, used by the proxy's `ServerAuthorizer` and by the AuthZEN handler |
+| Pipeline | `authz::Pipeline` (`authz/pipeline.rs`) | `Arc`, used by the proxy's `ServerAuthorizer` and by the AuthZEN handler |
 | Proxy | `attenuo_proxy::router` | mounted at `/mcp/{server}` |
 | IdP registry | `idp::IdpRegistry` | one `JwksCache` per `[[idps]]` entry, behind a `tokio::sync::Mutex` |
 | Lease maintenance | `spawn_lease_maintenance` | one tokio task, every `[leases] maintenance_interval_seconds` (default 60) when `[leases] session_retention_seconds`, `retention_seconds` or `run_state_retention_seconds` is on: `prune_session_bindings`, then `prune_lease_registry`, then `prune_run_state` (run-limit counters, charge log and approvals of runs whose leases are gone), each in passes of `maintenance_batch_rows` rows (default 1,000) on the blocking pool, at most `maintenance_max_passes` passes each (default 100); a lease pass counts the leases it looks at, reads to decide a run and deletes, and carries a run wider than that over to the next passes (read to the end first, then deleted children before parents, the root last) |
