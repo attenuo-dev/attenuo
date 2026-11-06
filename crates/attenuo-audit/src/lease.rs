@@ -263,8 +263,10 @@ pub trait LeaseStore: Send + Sync {
     /// [`AuditError::ApprovalExpired`] otherwise); the check and the write are one
     /// transaction. When a pending, unexpired approval for the same run, lease and call hash
     /// already exists, nothing is written and that one is returned with `false`, so an agent
-    /// that repeats a gated call gets the same approval id. Returns the stored approval and
-    /// whether it is new.
+    /// that repeats a gated call gets the same approval id. Otherwise, when the run already has
+    /// [`crate::MAX_PENDING_APPROVALS_PER_RUN`] pending, unexpired approvals, nothing is
+    /// written and [`AuditError::TooManyPendingApprovals`] is returned (SR-92). Returns the
+    /// stored approval and whether it is new.
     fn create_approval(&self, approval: &Approval) -> Result<(Approval, bool), AuditError>;
 
     /// One approval by id, or `None`.
@@ -1843,6 +1845,11 @@ impl LeaseStore for MemoryLeaseStore {
         {
             return Ok((existing.clone(), false));
         }
+        let pending = approvals
+            .values()
+            .filter(|a| rules::counts_as_pending(a, &approval.chain_id, now))
+            .count();
+        rules::below_pending_cap(&approval.chain_id, pending)?;
         let mut stored = approval.clone();
         stored.state = ApprovalState::Pending;
         stored.approver = None;

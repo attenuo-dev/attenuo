@@ -2,6 +2,7 @@
 
 use attenuo_core::LeaseId;
 use rusqlite::{params, Connection, Row};
+use time::OffsetDateTime;
 
 use super::parse_time;
 use crate::approval::{Approval, ApprovalMethod, ApprovalState, Approver};
@@ -97,4 +98,25 @@ pub(super) fn approvals_for_call(
         out.push(approval_from_row(r)?);
     }
     Ok(out)
+}
+
+/// How many approvals of the run `chain_id` are pending and unexpired at `now`
+/// ([`crate::MAX_PENDING_APPROVALS_PER_RUN`]). Expiry is compared in Rust, as in
+/// [`approvals_for_call`].
+pub(super) fn pending_of_run(
+    conn: &Connection,
+    chain_id: &LeaseId,
+    now: OffsetDateTime,
+) -> Result<usize, AuditError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT expires_at FROM approvals WHERE chain_id = ?1 AND state = 'pending'",
+    )?;
+    let mut rows = stmt.query(params![chain_id.0])?;
+    let mut n = 0;
+    while let Some(r) = rows.next()? {
+        if parse_time(&r.get::<_, String>(0)?)? > now {
+            n += 1;
+        }
+    }
+    Ok(n)
 }

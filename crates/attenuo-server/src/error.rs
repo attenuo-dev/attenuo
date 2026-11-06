@@ -175,6 +175,7 @@ impl IntoResponse for ApiError {
 /// | `ApprovalExpired` | 409 | `approval_expired` |
 /// | `LeaseRevoked` | 409 | `lease_revoked` |
 /// | `ChargeRefunded` | 409 | `already_refunded` |
+/// | `TooManyPendingApprovals` | 429 | `too_many_pending_approvals` |
 /// | storage, lock, encoding, `BindingConflict`, `NoCheckpointSigner`, `Export`, `Jwks` | 500 | `server_error`, no detail (SR-43) |
 ///
 /// A route whose answer depends on more than the variant keeps its own arm before falling back
@@ -213,6 +214,13 @@ impl From<attenuo_audit::AuditError> for ApiError {
                 StatusCode::CONFLICT,
                 "already_refunded",
                 format!("the charge of decision `{id}` was already refunded"),
+            ),
+            // Only the pipeline creates approvals, and it answers this itself (a gated call
+            // with no approval to grant, SR-92); a route that ever reaches it says the same.
+            E::TooManyPendingApprovals { max, .. } => ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too_many_pending_approvals",
+                format!("the run already has {max} pending approvals"),
             ),
             // Listed one by one so that a new variant needs a decision here.
             e @ (E::Sqlite(_)
@@ -320,6 +328,10 @@ mod tests {
             E::ApprovalExpired("a1".into()),
             E::UnknownCharge("d1".into()),
             E::ChargeRefunded("d1".into()),
+            E::TooManyPendingApprovals {
+                chain_id: "l1".into(),
+                max: 32,
+            },
         ]
     }
 
@@ -353,6 +365,7 @@ mod tests {
                 E::ApprovalExpired(_) => (15, false),
                 E::UnknownCharge(_) => (16, false),
                 E::ChargeRefunded(_) => (17, false),
+                E::TooManyPendingApprovals { .. } => (18, false),
             }
         }
         let all = one_of_each_audit_error();
@@ -436,6 +449,15 @@ mod tests {
                 Some("the charge of decision `d1` was already refunded"),
             ),
             (
+                E::TooManyPendingApprovals {
+                    chain_id: "l1".into(),
+                    max: 32,
+                },
+                S::TOO_MANY_REQUESTS,
+                "too_many_pending_approvals",
+                Some("the run already has 32 pending approvals"),
+            ),
+            (
                 E::Sqlite(rusqlite::Error::QueryReturnedNoRows),
                 S::INTERNAL_SERVER_ERROR,
                 "server_error",
@@ -502,7 +524,7 @@ mod tests {
         ];
         // One case per variant (the `From` match lists them all, so a new one fails to compile
         // there first).
-        assert_eq!(cases.len(), 18);
+        assert_eq!(cases.len(), 19);
         for (e, status, code, detail) in cases {
             let name = format!("{e:?}");
             let got = ApiError::from(e);

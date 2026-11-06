@@ -28,6 +28,19 @@ use time::OffsetDateTime;
 use crate::error::AuditError;
 use crate::lease::LeaseRow;
 
+/// Most approvals one delegation run may have pending (unexpired) at once (SR-92). Past it,
+/// [`crate::LeaseStore::create_approval`] refuses a new one with
+/// [`AuditError::TooManyPendingApprovals`], and the gated call is denied with no approval to
+/// grant, as when the store fails. A repeat of a call that already has a pending approval
+/// reuses it and is not refused.
+///
+/// Why 32: pending approvals are an operator-facing queue, not a work queue. Each one waits
+/// for a person to read it, is used once, and expires after `[approvals] ttl_seconds`, so a
+/// run that needs more than a few dozen answers at once is not one a person can follow call
+/// by call. The cap bounds what one run adds to the approvals table, the notice queue and
+/// the expiry watcher, so it cannot push other runs' approvals out of the operator's view.
+pub const MAX_PENDING_APPROVALS_PER_RUN: usize = 32;
+
 /// Where an approval is in its life (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -233,6 +246,24 @@ pub(crate) mod rules {
             && &a.lease == lease
             && a.call_hash == call_hash
             && !a.is_expired(now)
+    }
+
+    /// Refuse a new approval for the run `chain_id` that already has `pending` pending,
+    /// unexpired approvals ([`MAX_PENDING_APPROVALS_PER_RUN`]).
+    pub(crate) fn below_pending_cap(chain_id: &LeaseId, pending: usize) -> Result<(), AuditError> {
+        if pending >= MAX_PENDING_APPROVALS_PER_RUN {
+            return Err(AuditError::TooManyPendingApprovals {
+                chain_id: chain_id.0.clone(),
+                max: MAX_PENDING_APPROVALS_PER_RUN,
+            });
+        }
+        Ok(())
+    }
+
+    /// Is `a` a pending, unexpired approval of the run `chain_id` (one that counts towards
+    /// [`MAX_PENDING_APPROVALS_PER_RUN`])?
+    pub(crate) fn counts_as_pending(a: &Approval, chain_id: &LeaseId, now: OffsetDateTime) -> bool {
+        a.state == ApprovalState::Pending && &a.chain_id == chain_id && !a.is_expired(now)
     }
 
     /// Is `a` a pending, unexpired approval for this call of this hop (one a repeated gated

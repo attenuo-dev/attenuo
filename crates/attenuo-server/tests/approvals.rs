@@ -1650,3 +1650,95 @@ async fn run_state_of_pruned_runs_is_pruned_past_its_retention() {
     assert_eq!(attenuo_server::prune_run_state(&h.state).await, 0);
     assert_eq!(pruned("approvals"), 2);
 }
+
+/// SR-92: one run has at most `MAX_PENDING_APPROVALS_PER_RUN` approvals waiting. Past it a
+/// distinct gated call is still denied `approval_required` and recorded, but with no approval
+/// to grant (as when the store fails) and the diagnostic saying why; a repeat of a waiting call
+/// keeps its approval, another run is not affected, and an expired approval frees its place.
+#[tokio::test]
+async fn a_run_with_too_many_pending_approvals_gets_no_new_one_sr92() {
+    use attenuo_audit::MAX_PENDING_APPROVALS_PER_RUN as MAX;
+    let h = Harness::start_with(|c| {
+        c.approvals.ttl_seconds = 60;
+        c.authzen.diagnostics = attenuo_server::config::AuthzenDiagnostics::Always;
+    })
+    .await;
+    let token = h.root().await;
+    h.taint(&token).await;
+    let mut ids = Vec::new();
+    for n in 0..MAX {
+        ids.push(h.gated(&token, &format!("alice/r{n}")).await.approval_id);
+    }
+
+    // The next distinct call: `-32008` with no approval id.
+    let v = h.delete(&token, "alice/one-too-many").await;
+    let err = &v["error"];
+    assert_eq!(err["code"], -32008, "{v}");
+    assert_eq!(err["message"], "attenuo: approval required", "{v}");
+    assert_eq!(err["data"]["reason"], "approval_required");
+    assert!(err["data"].get("approval_id").is_none(), "{v}");
+    let refused_decision = err["data"]["decision_id"].as_str().unwrap().to_string();
+
+    // AuthZEN says the same, with the diagnostic.
+    let resp = h
+        .client
+        .post(h.server.url("/access/v1/evaluation"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "subject": {"type": "agent", "id": ""},
+            "action": {"name": "delete_repo"},
+            "resource": {"type": "tool", "id": "github/delete_repo",
+                         "properties": {"server": "github"}},
+            "context": {"input": {"repo": "alice/also-too-many"}},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["decision"], false, "{v}");
+    assert_eq!(v["context"]["reason"], "approval_required", "{v}");
+    assert!(v["context"].get("approval_id").is_none(), "{v}");
+    assert_eq!(
+        v["context"]["diagnostics"],
+        json!([attenuo_server::authz::DIAG_TOO_MANY_PENDING_APPROVALS]),
+        "{v}"
+    );
+    assert_eq!(
+        attenuo_server::authz::DIAG_TOO_MANY_PENDING_APPROVALS,
+        "too many pending approvals for this run"
+    );
+
+    // A repeat of a waiting call keeps its approval.
+    assert_eq!(h.gated(&token, "alice/r7").await.approval_id, ids[7]);
+    // Another run is not affected.
+    let bob = h.root_for("bob", None).await;
+    h.taint(&bob).await;
+    h.gated(&bob, "bob/site").await;
+
+    // The refused call is recorded as a denied decision, with no approval request.
+    let records = h.records().await;
+    let refused = records
+        .iter()
+        .find(|r| r["id"] == refused_decision.as_str())
+        .expect("the refused call's decision record");
+    assert_eq!(refused["reason"], "approval_required", "{refused}");
+    assert_eq!(refused["decision"], "deny", "{refused}");
+    let requests = records
+        .iter()
+        .filter(|r| r["kind"] == "approval_request")
+        .collect::<Vec<_>>();
+    assert_eq!(requests.len(), MAX + 1);
+    assert!(requests
+        .iter()
+        .all(|r| r["decision_id"] != refused_decision.as_str()));
+    assert_eq!(
+        metric(&h, "attenuo_approvals_created_total"),
+        MAX as u64 + 1
+    );
+
+    // Once the waiting approvals have expired, the run gets new ones again.
+    h.clock.advance(std::time::Duration::from_secs(61));
+    h.gated(&token, "alice/one-too-many").await;
+    h.verify_ok().await;
+}
