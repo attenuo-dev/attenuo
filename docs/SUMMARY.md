@@ -38,6 +38,7 @@
 - [Output labelling (proposed)](design/output-labelling.md)
 - [Run limits](design/run-limits.md)
 - [Cedar-aware list filtering (proposed)](design/cedar-aware-list-filtering.md)
+- [Multi-replica readiness (proposed)](design/multi-replica.md)
 
 # Policy
 
