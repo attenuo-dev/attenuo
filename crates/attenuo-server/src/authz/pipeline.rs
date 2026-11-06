@@ -290,9 +290,10 @@ impl Pipeline {
         call: &ToolCall,
         now: OffsetDateTime,
     ) {
-        let Some((amount, _)) = self.usage_inputs(call) else {
+        let Some(inputs) = self.usage_inputs(call) else {
             return;
         };
+        let amount = inputs.amount;
         let kinds = match self.policy.read() {
             Ok(e) => e.user_window_kinds().to_vec(),
             Err(_) => attenuo_core::WindowKind::ALL.to_vec(),

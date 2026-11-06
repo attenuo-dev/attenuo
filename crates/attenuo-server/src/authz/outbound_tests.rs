@@ -123,6 +123,7 @@ fn a_read_only_fetch_with_an_outbound_host_asks_on_the_second_site_only() {
             calls: 1,
             amount: 0,
             destination_seen: true,
+            ..Default::default()
         })
     );
 
@@ -144,6 +145,7 @@ fn a_read_only_fetch_with_an_outbound_host_asks_on_the_second_site_only() {
             calls: 2,
             amount: 0,
             destination_seen: false,
+            ..Default::default()
         })
     );
 }
