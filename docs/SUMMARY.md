@@ -41,6 +41,7 @@
 - [Multi-replica readiness (proposed)](design/multi-replica.md)
 - [OpenTelemetry export (proposed)](design/otel-export.md)
 - [Run limits phase 3 (proposed)](design/run-limits-phase3.md)
+- [Read-side exfiltration (proposed)](design/read-side-exfiltration.md)
 
 # Policy
 
