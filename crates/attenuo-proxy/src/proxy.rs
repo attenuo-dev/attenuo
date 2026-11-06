@@ -211,7 +211,8 @@ pub fn router_with_clock(
                 .get(handle_passthrough)
                 .delete(handle_passthrough),
         )
-        .layer(TraceLayer::new_for_http())
+        // The span records the route template, never the URI (SR-90).
+        .layer(TraceLayer::new_for_http().make_span_with(crate::http_trace::request_span))
         .with_state(state)
 }
 

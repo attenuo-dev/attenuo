@@ -165,7 +165,8 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
         .merge(authzen_routes)
         .merge(admin_routes)
         .with_state(state.clone())
-        .layer(TraceLayer::new_for_http());
+        // The span records the route template, never the URI (SR-90).
+        .layer(TraceLayer::new_for_http().make_span_with(attenuo_proxy::http_trace::request_span));
 
     let authorizer = Arc::new(
         ServerAuthorizer::new(state.verifier.clone(), state.pipeline.clone())

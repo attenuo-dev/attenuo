@@ -3,8 +3,10 @@
 //! injection) and SR-19 (Host-header poisoning of discovery) from
 //! `docs/research/security-review-2026-10-22.md`, and SR-30 (release workflow actions pinned
 //! to commits) and SR-34 (reserved names and the admin audit subject) from
-//! `docs/research/security-review-2026-10-23.md`. Formerly `security_low.rs`; the SR-30 test
-//! and the SR-34 server-name test came from `security_pass3.rs`.
+//! `docs/research/security-review-2026-10-23.md`, and SR-90 (request spans record the route
+//! template, not the URI) from `docs/research/security-review-2026-11-05-pass8.md`. Formerly
+//! `security_low.rs`; the SR-30 test and the SR-34 server-name test came from
+//! `security_pass3.rs`.
 
 // Configs are built field by field from `Config::default()`, as in the other server tests.
 #![allow(clippy::field_reassign_with_default)]
@@ -282,8 +284,10 @@ impl std::io::Write for ThreadCapture {
 fn install_capture() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
+        // `tower_http=debug` for the SR-90 request span; everything else at the default `info`.
         let subscriber = tracing_subscriber::fmt()
             .with_writer(|| ThreadCapture)
+            .with_env_filter(tracing_subscriber::EnvFilter::new("info,tower_http=debug"))
             .with_ansi(false)
             .finish();
         tracing::subscriber::set_global_default(subscriber)
@@ -314,6 +318,65 @@ fn a_newline_in_a_tool_name_stays_on_one_log_line() {
     assert_eq!(text.lines().count(), 1, "{text}");
     assert!(text.contains(r#"tool="read_file\nFORGED"#), "{text}");
     assert!(text.contains(r#"subject="alice\nFORGED"#), "{text}");
+}
+
+/// SR-90: tower-http's default request span recorded the full URI, query string included, so
+/// `RUST_LOG=tower_http=debug` wrote `GET /admin/audit?subject=...` to the log. The span on the
+/// API router, the proxy router and the console listener now records the route template only.
+#[tokio::test]
+async fn request_spans_carry_the_route_template_not_the_uri() {
+    install_capture();
+    let mut cfg = base_config();
+    cfg.admin_ui.enabled = true;
+    let (router, state) = attenuo_server::build(&cfg).unwrap();
+    let main = spawn_router(router).await.unwrap();
+    let console = spawn_router(attenuo_server::admin_ui::router(state, &cfg))
+        .await
+        .unwrap();
+    let client = reqwest::Client::new();
+    // The `current_thread` test runtime serves these on this thread, so the capture sees them.
+    CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    let audit = client
+        .get(main.url("/admin/audit?subject=secret-marker"))
+        .bearer_auth(ADMIN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(audit.status(), StatusCode::OK);
+    let mcp = client
+        .post(main.url("/mcp/github?subject=secret-marker"))
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mcp.status(), StatusCode::UNAUTHORIZED);
+    let ui = client
+        .get(console.url("/admin/audit?subject=secret-marker"))
+        .bearer_auth(ADMIN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ui.status(), StatusCode::OK);
+    let unmatched = client
+        .get(console.url("/secret-marker?subject=secret-marker"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unmatched.status(), StatusCode::NOT_FOUND);
+    let text = String::from_utf8(CAPTURE.with(|c| c.borrow_mut().take()).unwrap()).unwrap();
+    let spans = |route: &str| {
+        text.lines()
+            .filter(|l| l.contains(&format!("request{{method=GET route={route} ")))
+            .count()
+    };
+    assert!(spans("/admin/audit") >= 2, "{text}");
+    assert!(spans("unmatched") >= 1, "{text}");
+    assert!(
+        text.lines()
+            .any(|l| l.contains("request{method=POST route=/mcp/{server} ")),
+        "{text}"
+    );
+    assert!(!text.contains("secret-marker"), "{text}");
 }
 
 // ---------------------------------------------------------------------------------------------
