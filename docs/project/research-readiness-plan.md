@@ -33,6 +33,8 @@ Done or in flight on `chore/research-ready-hygiene`:
 
 9. Run attenuo under an existing public benchmark, AgentDojo or InjecAgent, with a real model in the loop: a no-enforcement baseline and an attenuo-enforced run, reporting attack success and task utility. This is the one result a researcher cannot get from the repository's own suite, and the strongest evidence for the report. It needs an LLM API budget (roughly a few tens of dollars per full run) and two to three days; the decision is the owner's.
 
+   **Done, for AgentDojo** ([AgentDojo plan](../research/agentdojo-plan-2026-11-05.md); report section 5.2). A Haiku baseline over all 949 pairs, a four-model sample without attenuo, attenuo-enforced runs on Haiku and Sonnet over a 10-task workspace sample with oracle grants, and a model-free replay of the attacks' own calls on all four suites. No attack succeeded on any model with or without attenuo, so the enforced runs measure the cost of enforcement and not its benefit. Planner grants and InjecAgent were not run.
+
 ## Not in this week
 
 - No new enforcement features (run limits phase 3, ADR-0011 list filtering, real admin authentication) unless a reviewer asks for one.
