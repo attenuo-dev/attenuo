@@ -43,7 +43,7 @@ Only the `status` and `date` fields and the More Information section of an accep
 | [0001](0001-separate-enforcement-layer.md) | Enforce delegation and per-call authorization in a separate layer | accepted |
 | [0002](0002-cedar-for-policy.md) | Cedar as the policy language, with ReBAC composed from outside | accepted |
 | [0003](0003-apache-2-license.md) | Apache License 2.0 | accepted |
-| [0004](0004-rust-workspace-layout.md) | Rust workspace layout | accepted |
+| [0004](0004-rust-workspace-layout.md) | Rust workspace layout | accepted (amended 2026-11-06) |
 | [0005](0005-policy-decision-point.md) | Policy decision point: capabilities first, then Cedar with a generated schema | accepted |
 | [0006](0006-lease-based-in-flight-revocation.md) | Lease-based in-flight revocation | accepted |
 | [0007](0007-actor-authentication.md) | Actor authentication: RFC 8693 `actor_token` from a workload-identity issuer, with `may_act` | accepted |

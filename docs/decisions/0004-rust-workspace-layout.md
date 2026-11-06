@@ -1,6 +1,6 @@
 # ADR-0004: Rust workspace layout
 
-- Status: accepted
+- Status: accepted (amended 2026-11-05 and 2026-11-06, see [More Information](#more-information))
 - Date: 2026-10-22
 
 ## Context
@@ -74,3 +74,55 @@ Workspace dependencies between crates, from the manifests (`[dependencies]` only
 | `attenuo-bench` | | | | | | |
 
 `attenuo-cli` has `attenuo-server` and `attenuo-proxy` as dev-dependencies only (integration tests). Source: [code-quality pass, 2026-11-05](../research/code-quality-2026-11-05.md).
+
+### Amendment 2026-11-06
+
+The decision still stands and Decision is still kept as written. This amendment records the workspace as it is on `main` at `82905d0`, corrects two lines of the update above that were overtaken the same night, and lists in one place every statement of the original table that no longer holds. Facts come from `cargo metadata --no-deps` and the sources at that commit.
+
+Crate graph (normal dependencies only; `──►` lists the crates a crate depends on):
+
+```text
+top      attenuo-cli     ──► core, token, policy, audit
+         attenuo-server  ──► core, token, policy, audit, proxy
+middle   attenuo-proxy   ──► core
+         attenuo-audit   ──► token, core
+         attenuo-policy  ──► core
+         attenuo-token   ──► core
+base     attenuo-core        (no workspace dependencies)
+outside  attenuo-bench       (no workspace dependencies; spawns the built binaries)
+```
+
+The same edges as a table, with the workspace dev-dependencies:
+
+| Crate | Depends on (workspace, `[dependencies]`) | Dev-dependencies (workspace) |
+|---|---|---|
+| `attenuo-core` | none | none |
+| `attenuo-token` | core | none |
+| `attenuo-policy` | core | none |
+| `attenuo-audit` | core, token | itself, with `testing` |
+| `attenuo-proxy` | core | itself, with `testing` |
+| `attenuo-server` | core, token, policy, audit, proxy | proxy |
+| `attenuo-cli` | core, token, policy, audit | core, proxy, server |
+| `attenuo-bench` | none | none |
+
+Every edge still points downward in the order core, token, policy, audit, proxy, server, cli; bench sits outside the order. The rule of the Decision holds.
+
+Corrections to the update of 2026-11-05:
+
+- **The pipeline is `authz/`, not `authz.rs` alone.** `e40e3ee` (2026-11-06, #180) split it by stage: `authz.rs` keeps the module documentation and re-exports, and the stages live in `authz/pipeline.rs`, `authorizer.rs`, `labels.rs`, `budgets.rs` and `usage.rs`. The [server design](../design/server.md) already names `authz/pipeline.rs`.
+- **Two files named for keys.** `9023ce5` (2026-11-06) renamed the server's `src/jwks.rs`, which builds the issuer's own JWK Set for `GET /.well-known/jwks.json`, to `src/issuer_keys.rs`, so that it no longer shares a name with the IdP key cache in `src/idp/jwks.rs`. The same commit made `actor`, `clientauth`, `idp`, `replay` and `state` `pub(crate)`.
+
+What the original table says that is no longer true, with the reason where the log, a commit or an ADR gives one:
+
+1. **Seven crates.** There are eight; `attenuo-bench` (end-to-end latency and throughput, `scripts/bench-e2e.sh`) was added on 2026-10-23 (`75b8625`, the end-to-end latency harness) and drives the release binaries over HTTP, so it needs no workspace dependency.
+2. **`attenuo-token` does ID-JAG and OIDC intake and JWKS fetching.** Both are in `attenuo-server/src/idp/` (`intake.rs`, `jwks.rs`, `claims.rs`), next to the `[[idps]]` configuration and the HTTP client they use; `attenuo-token` keeps minting, verification and detached signatures and has no HTTP client. No log entry records it as a decision: intake was written in the server from its first commit (`4692f75`, 2026-10-22, "feat(server): hop-0 intake from OIDC ID tokens and ID-JAG").
+3. **`attenuo-policy` has a `RelationResolver` trait.** It was never built (`git grep RelationResolver` finds only docs). ReBAC composition stays planned under [ADR-0002](0002-cedar-for-policy.md) and is an open item on the board; policy reload is driven by the server (`POST /admin/policies/reload`).
+4. **`attenuo-audit` is the log and depends only on core.** It depends on `attenuo-token` for `DetachedSigner` and `verify_detached`, which sign and check audit checkpoints with the issuer key (audit hardening, 2026-10-23). It also holds the lease store (`lease`, `approval`, `budget`, `spans`: leases, approvals, run counters and the span index), so the SQLite state of a deployment sits in one crate.
+5. **The verifier is a separate binary entry point.** It is `attenuo audit verify` in the CLI; `--file` checks an export offline with only the JWKS (2026-10-23).
+6. **`attenuo-cli` depends on core and token only and decides nothing.** It also depends on audit (offline `audit verify --file`) and policy (`policy test` and `policy lint`, which run the real `PolicyEngineBuilder` locally). It holds no keys of the server and its online commands decide nothing; the offline commands evaluate policy and verify logs on the operator's machine.
+7. **`attenuo-proxy` depends on core, token, policy and audit.** It depends on core only and reaches decisions through its `Authorizer` trait, which the server implements (`ServerAuthorizer` in `authz/authorizer.rs`).
+8. **`attenuo-server` is wiring with no logic.** It holds the decision pipeline (`authz/`), IdP intake (`idp/`), the issuer JWKS (`issuer_keys.rs`), DPoP (`dpop.rs`), actor-token authentication (`actor.rs`), client authentication (`clientauth.rs`), replay protection (`replay.rs`), the checkpoint sink (`sink.rs`), the approval notifier (`notify.rs`, ADR-0009 approvals), the admin console listener (`admin_ui.rs`, [ADR-0008](0008-admin-console.md)) and metrics. Putting the pipeline here lets the proxy and the AuthZEN endpoint share one `Pipeline::decide`, so they cannot disagree ([server design](../design/server.md)).
+9. **Core type names.** The code has `LeaseId` and `DecisionRecord` where the table says `Lease` and `AuditRecord`.
+10. **Unsafe code.** `attenuo-policy` uses `#![forbid(unsafe_code)]` like core, stricter than the convention; the rest use `#![deny(unsafe_code)]`.
+
+The Consequences hold with "seven crates" read as eight. Source: debt item 2 of the [code-quality pass](../research/code-quality-2026-11-05.md).

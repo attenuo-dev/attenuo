@@ -4,7 +4,7 @@
 - Crate: `crates/attenuo-server`
 - Related: [RFC-0001](../spec/rfc-0001-attenuo.md) §4–§7, [ADR-0004](../decisions/0004-rust-workspace-layout.md)
 
-The server is wiring. It holds no authorization logic of its own: tokens come from `attenuo-token`, decisions from `attenuo-policy`, leases and the audit log from `attenuo-audit`, MCP framing from `attenuo-proxy`. The one piece of composition that matters for security is `authz::Pipeline`, and both enforcement paths go through it.
+The server wires the crates together and holds what belongs to none of them: IdP intake (`idp/`), DPoP, replay, client and actor authentication, and the decision pipeline ([ADR-0004 amendment](../decisions/0004-rust-workspace-layout.md#amendment-2026-11-06)). Tokens come from `attenuo-token`, Cedar decisions from `attenuo-policy`, leases and the audit log from `attenuo-audit`, MCP framing from `attenuo-proxy`. The one piece of composition that matters for security is `authz::Pipeline`, and both enforcement paths go through it.
 
 ## Components in the process
 
