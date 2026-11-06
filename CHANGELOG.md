@@ -61,6 +61,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 ### Documentation
 
 - Proposed design note on running more than one server replica ([docs/design/multi-replica.md](docs/design/multi-replica.md)): an inventory of per-process state read from the code (replay caches, the run lock, the proxy's session table, the notifier, the audit chain, policy reload), which of it allows a replay or an over-spend with a second replica or after a restart, four deployment shapes, a ranked path (a `ReplayCache` trait with a SQLite table, a start-up fence, policy consistency, a `Counters` trait, a Postgres backend) and eight open questions. Nothing changes for a single replica.
+- The deploy guide's "No high availability" bullet now gives the shared-file reasons for not running two replicas (per-process replay caches, run lock and policy set) separately from the copy-of-a-volume reason, and links to the multi-replica note.
 
 ## [0.1.0] - 2026-10-24
 
