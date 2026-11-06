@@ -58,6 +58,10 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 - `POST /token` no longer returns the verifier's message in the `detail` of a refused IdP credential (400 `invalid_grant`) or a refused `actor_token` (400 `invalid_request`), which named the expected audience, the issuer, the client ids or the SPIFFE id; `detail` is now the stable sub-code, the same as `error_description` (`audience_mismatch`, `unknown_kid`, `actor_token_audience_mismatch`, ...), and the message is logged at debug level (SR-17).
 - A float `exp`, `iat`, `nbf` or `auth_time` in an ID token, ID-JAG or actor token is rounded down to the whole second, and one outside the `i64` range of seconds (`1e300`) is treated as absent, so a required claim is refused with `missing_claim`; before, it saturated, and an `exp` of `1e300` never expired. The Cedar translation and the declared-type check read floats through one checked conversion (a whole number of magnitude at most 922337203685477 is a `Long`; unchanged). `attenuo-server` and `attenuo-policy` warn on `cast_possible_truncation`, `cast_sign_loss` and `cast_possible_wrap`.
 
+### Documentation
+
+- Proposed design note on running more than one server replica ([docs/design/multi-replica.md](docs/design/multi-replica.md)): an inventory of per-process state read from the code (replay caches, the run lock, the proxy's session table, the notifier, the audit chain, policy reload), which of it allows a replay or an over-spend with a second replica or after a restart, four deployment shapes, a ranked path (a `ReplayCache` trait with a SQLite table, a start-up fence, policy consistency, a `Counters` trait, a Postgres backend) and eight open questions. Nothing changes for a single replica.
+
 ## [0.1.0] - 2026-10-24
 
 ### Highlights
