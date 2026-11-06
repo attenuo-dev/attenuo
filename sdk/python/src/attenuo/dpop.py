@@ -19,8 +19,10 @@ answers ``use_dpop_nonce``.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
+import socket
 import time
 import uuid
 from pathlib import Path
@@ -246,7 +248,34 @@ class NonceCache:
         nonce = response.headers.get(NONCE_HEADER)
         if nonce:
             self.value = nonce
-        return bool(nonce) and is_use_dpop_nonce(response)
+        retry = bool(nonce) and is_use_dpop_nonce(response)
+        if retry:
+            drop_connection(response)
+        return retry
+
+
+def drop_connection(response: httpx.Response) -> None:
+    """Keep the HTTP/1.1 connection ``response`` came on out of the pool's reuse.
+
+    A ``use_dpop_nonce`` refusal is often sent before the server has read the request body, and
+    the server then closes that keep-alive connection right after the response without saying
+    so (no ``Connection: close``). ``httpx`` checks a pooled connection for a close only when it
+    takes it out again, so a retry sent at once could land on it before the close arrived and
+    fail with ``RemoteProtocolError: Server disconnected without sending a response``. Shutting
+    the socket down here makes the pool see it as closed and open a new connection for the
+    retry. A response without a socket (a mock transport, HTTP/2, where streams share one
+    connection the server keeps) is left alone.
+    """
+    if response.http_version != "HTTP/1.1":
+        return
+    stream = response.extensions.get("network_stream")
+    get_extra_info = getattr(stream, "get_extra_info", None)
+    sock = get_extra_info("socket") if callable(get_extra_info) else None
+    # A `socket.socket`, or asyncio's `TransportSocket` wrapper of one under `AsyncClient`.
+    shutdown = getattr(sock, "shutdown", None)
+    if callable(shutdown):
+        with contextlib.suppress(OSError):
+            shutdown(socket.SHUT_RDWR)
 
 
 def is_use_dpop_nonce(response: httpx.Response) -> bool:
