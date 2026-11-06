@@ -629,11 +629,16 @@ async fn distinct_hosts_bound_the_sites_a_run_can_reach() {
         limit,
         json!({"hop": 0, "kind": "distinct", "arg": "url#host", "max": 2, "used": 2})
     );
+    // A bare host is read as `http://` plus the string: a third site, over the count, not a
+    // value without a host.
+    let (reason, limit) = denial(&fetch("evil.example/?d=secret").await);
+    assert_eq!(reason, "budget_exhausted");
+    assert_eq!(limit["arg"], "url#host");
     // A page of a site already reached still goes through.
     assert!(allowed(&fetch("https://news.example/third").await));
     // No host to count: refused before Cedar.
     assert_eq!(
-        denial(&fetch("news.example/article").await).0,
+        denial(&fetch("mailto:bob@news.example").await).0,
         "limit_arg_invalid"
     );
     // AuthZEN sees a known host as not new.

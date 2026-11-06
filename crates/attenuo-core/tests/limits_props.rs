@@ -7,11 +7,15 @@
 //! - a limit counts every distinct value of a call once, at most `MAX_COUNTED_VALUES`, and a
 //!   `sum` charge is exactly the argument's amount;
 //! - a derived host is a fixpoint: counting it again gives the same host (FZ2-1);
+//! - a derived host and the injection suite's host entity of the same token are the same
+//!   host whenever both exist, outside the input classes on which the two grammars are known
+//!   to differ (`Derive::Host` lists them);
 //! - canonical JSON is a fixpoint, and `jcs::value_eq` agrees with byte equality of the
 //!   canonical forms.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use attenuo_core::fingerprint::{entities, normalise};
 use attenuo_core::limits::{amount_of, charges_for, usage_charges, MAX_COUNTED_VALUES, MAX_LIMIT};
 use attenuo_core::{
     jcs, AgentId, ArgLimit, Capability, CapabilitySet, DelegationChain, Derive, LeaseId, LimitKind,
@@ -74,7 +78,7 @@ fn url() -> impl Strategy<Value = String> {
         "[a-z]{1,3}(\\.[a-z]{1,3}){0,2}",
     ];
     (
-        prop::sample::select(&["https://", "http://", "HTTPS://", "wss://", "ftp://"][..]),
+        prop::sample::select(&["https://", "http://", "HTTPS://", "wss://", "ftp://", ""][..]),
         prop::option::of(Just("user:pw@")),
         host,
         prop::sample::select(&["", ".", "..", "..."][..]),
@@ -84,6 +88,90 @@ fn url() -> impl Strategy<Value = String> {
         .prop_map(|(scheme, user, host, dots, port, path)| {
             format!("{scheme}{}{host}{dots}{port}{path}", user.unwrap_or(""))
         })
+}
+
+/// One token in the shapes on which a URL grammar and a host-entity grammar may disagree:
+/// with or without a scheme, user info, IP and IDNA hosts, percent escapes, trailing dots,
+/// ports, and a second URL in the path or query. Also short strings of URL punctuation.
+fn host_token() -> impl Strategy<Value = String> {
+    let label = "[a-zA-Z0-9][a-zA-Z0-9-]{0,4}";
+    let host = prop_oneof![
+        6 => (prop::collection::vec(label, 1..4), "[a-zA-Z]{2,4}|[0-9]{1,3}|x[a-z]")
+            .prop_map(|(ls, tld)| format!("{}.{tld}", ls.join("."))),
+        1 => prop::sample::select(&[
+            "localhost", "127.0.0.1", "0x7f.1", "127.1", "[::1]", "[::ffff:1.2.3.4]",
+            "a.ex%61mple", "%61.example", "βόλος.example", "ａ.example", "xn--nxasmq6b.example",
+            "www.true-informations.com", "a-.example", "a.example.com.pdf", "1.2.3",
+        ][..]).prop_map(str::to_string),
+    ];
+    let structured = (
+        prop::sample::select(
+            &[
+                "", "", "", "http://", "https://", "HTTP://", "ws://", "ftp://",
+            ][..],
+        ),
+        prop::sample::select(&["", "", "", "u@", "u:p@", "good.example@", "a.example:80@"][..]),
+        host,
+        prop::sample::select(&["", "", ".", ".."][..]),
+        prop::sample::select(&["", "", ":", ":80", ":8080", ":99999", ":x"][..]),
+        prop::sample::select(
+            &[
+                "",
+                "",
+                "/",
+                "/x/y",
+                "?q=1",
+                "#f",
+                "/?r=https://b.example/",
+                "/x/http://c.example",
+                "?@evil.example",
+                "#@evil.example",
+            ][..],
+        ),
+    )
+        .prop_map(|(scheme, user, host, dots, port, tail)| {
+            format!("{scheme}{user}{host}{dots}{port}{tail}")
+        });
+    prop_oneof![
+        8 => structured,
+        1 => "[a-z0-9.:/?#@%-]{0,16}",
+    ]
+}
+
+/// The host entity of one token, as the injection suite's matcher takes it: the host of the
+/// token's `http(s)://` URL, or else its bare host (`fingerprint::entities`). The token must
+/// not contain characters the entity tokeniser splits on.
+fn fingerprint_host(token: &str) -> Option<String> {
+    let found = entities(&normalise(token));
+    if found.first().is_some_and(|e| e.contains("://")) {
+        return found.get(1).filter(|h| !h.contains("://")).cloned();
+    }
+    // A bare host is the one entity with a dot and no `/`, `\` or `@` (paths, emails and
+    // digit runs have one of those or no dot).
+    found
+        .into_iter()
+        .find(|e| e.contains('.') && !e.contains(['/', '\\', '@']))
+}
+
+/// The input classes on which the two host grammars are known to differ, listed in the
+/// `Derive::Host` documentation and in `docs/design/read-side-exfiltration.md` section 3. The
+/// property does not force them to agree.
+fn grammars_differ_on(token: &str, derived: &str, entity: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    // Percent escapes and non-ASCII: WHATWG decodes them and maps the host through IDNA; the
+    // entity keeps the spelling (or, NFKC-normalised, may differ from IDNA's mapping).
+    lower.contains('%') || !token.is_ascii()
+        // IPv6 literals: the entity tokeniser splits on `[` and `]`.
+        || token.contains(['[', ']'])
+        // IPv4 in hex, octal or short form: WHATWG rewrites it to dotted decimal.
+        || derived.parse::<std::net::Ipv4Addr>().is_ok()
+        // Trailing dots in a full URL: the entity keeps them.
+        || entity.ends_with('.')
+        // A second URL after the token's start: the entity takes the embedded URL's host.
+        || lower
+            .match_indices("http://")
+            .chain(lower.match_indices("https://"))
+            .any(|(at, _)| at > 0)
 }
 
 fn leaf() -> impl Strategy<Value = Value> {
@@ -237,6 +325,20 @@ proptest! {
             prop_assert_eq!(host.clone(), host.to_ascii_lowercase());
             let again = Derive::Host.apply(&json!(format!("https://{host}/")));
             prop_assert_eq!(again, Some(host));
+        }
+    }
+
+    /// The two host grammars (`Derive::Host` for limits and destinations, the host entities of
+    /// `fingerprint` for argument taint) name the same host for a token whenever both name one,
+    /// outside the classes `grammars_differ_on` excludes.
+    #[test]
+    fn derived_host_agrees_with_the_fingerprint_host(token in host_token()) {
+        let derived = Derive::Host.apply(&json!(token));
+        let entity = fingerprint_host(&token);
+        if let (Some(d), Some(e)) = (derived, entity) {
+            if !grammars_differ_on(&token, &d, &e) {
+                prop_assert_eq!(d, e, "token {:?}", token);
+            }
         }
     }
 
