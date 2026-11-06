@@ -301,6 +301,17 @@ async fn verify_user(
 
 /// `POST /approvals/{id}` with `Authorization: Bearer <ID token>` and
 /// `{"decision": "grant" | "decline"}`: the originating user decides.
+///
+/// # Errors
+///
+/// 400 `invalid_request` when the body is not JSON or its `decision` is neither `grant` nor
+/// `decline`; 401 `unauthorized` when no bearer token is sent, and 401 `invalid_token` when the ID
+/// token does not verify; 403 `agent_token_refused` for a delegation token and 403 `wrong_user` for
+/// another user's ID token; 400 `invalid_grant` (`replayed`) for an ID token already used, and 503
+/// when the replay cache is full; 404 `not_found` for an unknown approval; 409
+/// `approval_not_pending`, `approval_expired` or `lease_revoked` when it cannot be decided; 500
+/// `server_error` when the store fails or the decision cannot be audited (the decision is then
+/// dropped).
 pub async fn user_decide(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -341,7 +352,15 @@ pub async fn user_decide(
 
 /// `GET /approvals/{id}`: the approval, for its originating user (ID token, not used up) or
 /// for an agent of the same delegation run (its delegation token, with a DPoP proof when the
-/// token is bound). Anyone else gets 404.
+/// token is bound). Anyone else gets 404, as for an unknown approval.
+///
+/// # Errors
+///
+/// 401 `unauthorized` when no bearer token is sent or a delegation token does not verify
+/// (`invalid_token` or `token_expired`), or when an ID token does not verify; 401 with a DPoP code
+/// when a bound delegation token comes without a valid proof; 403 `wrong_user` for another user's
+/// ID token; 404 `not_found` for an unknown approval and for a delegation token of another run or
+/// with a dead lease; 500 `server_error` when the store fails.
 pub async fn user_get(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -388,6 +407,13 @@ pub async fn user_get(
 
 /// `POST /admin/approvals/{id}` with `{"decision": "grant" | "decline"}`: an operator decides
 /// (`by = "operator"`, approver `urn:attenuo:admin`).
+///
+/// # Errors
+///
+/// 400 `invalid_request` when the body is not JSON or its `decision` is neither `grant` nor
+/// `decline`; 404 `not_found` for an unknown approval; 409 `approval_not_pending`,
+/// `approval_expired` or `lease_revoked` when it cannot be decided; 500 `server_error` when the
+/// store fails or the decision cannot be audited (the decision is then dropped).
 pub async fn admin_decide(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -409,6 +435,10 @@ pub async fn admin_decide(
 }
 
 /// `GET /admin/approvals/{id}`.
+///
+/// # Errors
+///
+/// 404 `not_found` for an unknown approval, and 500 `server_error` when the store fails.
 pub async fn admin_get(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -421,6 +451,10 @@ pub async fn admin_get(
 
 /// `GET /admin/approvals?chain_id=&state=&limit=`: the newest approvals, of one run when
 /// `chain_id` is given.
+///
+/// # Errors
+///
+/// 400 `invalid_request` for an unknown `state`, and 500 `server_error` when the store fails.
 pub async fn admin_list(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ListQuery>,

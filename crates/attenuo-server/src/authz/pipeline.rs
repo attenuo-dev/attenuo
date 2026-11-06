@@ -1191,11 +1191,16 @@ impl Pipeline {
     /// content) and, unless the catalog marks the tool's output trusted ([`output_label`]),
     /// add a label `{source, decision_id, seq, at}` to the run's taint state and `spans` (the
     /// result's fingerprints) to the run's span index under the record's `seq`. A trusted
-    /// result's `spans` are dropped and its record says 0. Returns the record's `seq`. `Err`
-    /// (reason `label_error`) when any write fails; the caller must then withhold the result.
+    /// result's `spans` are dropped and its record says 0. Returns the record's `seq`.
     ///
     /// [`output_label`]: Self::output_label
     /// [`result_digest`]: super::result_digest
+    ///
+    /// # Errors
+    ///
+    /// [`REASON_LABEL_ERROR`] when the `tool_result` append fails, when the chain has no first hop
+    /// to name the run, or, for an untrusted result, when the run label or the span index cannot be
+    /// written; the caller must then withhold the result.
     #[allow(clippy::too_many_arguments)]
     pub fn record_result(
         &self,
@@ -1365,7 +1370,13 @@ impl Pipeline {
         }
     }
 
-    /// `Ok` when every lease in the chain is live; otherwise the reason code and details.
+    /// `Ok` when every lease in the chain is live.
+    ///
+    /// # Errors
+    ///
+    /// [`REASON_LEASE_ERROR`] with the store's message when the lease store cannot be read, and
+    /// otherwise, in this order of precedence, [`REASON_LEASE_REVOKED`], [`REASON_LEASE_EXPIRED`]
+    /// or [`REASON_LEASE_UNKNOWN`] with the ids of the leases concerned.
     pub fn check_leases(
         &self,
         chain: &DelegationChain,

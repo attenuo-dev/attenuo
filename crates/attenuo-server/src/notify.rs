@@ -413,6 +413,11 @@ impl std::fmt::Debug for WebhookNotify {
 
 impl WebhookNotify {
     /// `headers` are name and value pairs, already read from the environment.
+    ///
+    /// # Errors
+    ///
+    /// When `url` does not parse, when a header name or value is not valid in HTTP, or when the
+    /// HTTP client cannot be built (its TLS backend fails to start).
     pub fn new(
         url: &str,
         headers: &[(String, String)],
@@ -637,8 +642,14 @@ pub struct ApprovalNotifier {
 }
 
 impl ApprovalNotifier {
-    /// Validate `cfg`, read its secret and headers from the environment, and start. The
-    /// error names a missing variable, never a value.
+    /// Validate `cfg`, read its secret and headers from the environment, and start.
+    ///
+    /// # Errors
+    ///
+    /// When `cfg` does not validate, when the signing secret's variable is unset or holds fewer
+    /// than `NOTIFY_SECRET_MIN_LEN` bytes, when a header's variable is unset, when the webhook
+    /// client cannot be built ([`WebhookNotify::new`]), or as [`with_deliver`](Self::with_deliver).
+    /// The message names the variable, never its value.
     pub fn start(
         cfg: &NotifySection,
         metrics: Arc<Metrics>,
@@ -709,6 +720,10 @@ impl ApprovalNotifier {
 
     /// Start with any deliverer (tests). Hands the delivery thread the outbox rows still open
     /// and watches the approvals still pending (see the module docs), then returns.
+    ///
+    /// # Errors
+    ///
+    /// When the delivery thread or the expiry watcher thread cannot be spawned.
     pub fn with_deliver(
         deliver: Box<dyn Deliver<Notice>>,
         limits: SinkLimits,
