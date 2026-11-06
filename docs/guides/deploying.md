@@ -267,7 +267,7 @@ enabled = true
 listen = "127.0.0.1:9100"
 ```
 
-`GET http://127.0.0.1:9100/metrics` has no authentication. Keep it on loopback or a private network and scrape it from there. The server refuses to start when `listen` is not a loopback address, unless you also set `allow_public = true` (it then logs a warning); do that only for a private interface that network policy protects, since decision counts by reason are served to anyone who can connect. The API port does not serve `/metrics`. Every series is prefixed `attenuo_`; the full list, with types, labels and help text, is in the [HTTP API reference](../reference/http-api.md#metrics). The ones to watch first:
+`GET http://127.0.0.1:9100/metrics` has no authentication. Keep it on loopback or a private network and scrape it from there. The server refuses to start when `listen` is not a loopback address, unless you also set `allow_public = true` (it then logs a warning); do that only for a private interface that network policy protects, since decision counts by reason are served to anyone who can connect. The API port does not serve `/metrics`. Every series is prefixed `attenuo_`; the full list, with types, labels and help text, is in the [HTTP API reference](../reference/http-api.md#metrics). There is no OTLP export yet: to get these series into an OpenTelemetry collector, scrape this listener with the collector's Prometheus receiver; a proposal for OTLP traces and metrics push is in [OpenTelemetry export](../design/otel-export.md). The ones to watch first:
 
 | Series | What it tells you |
 |---|---|
