@@ -270,7 +270,12 @@ pub(crate) fn generate(
         "type BudgetContext = { limited: Bool, calls_remaining: Long, amount_remaining: Long, destination_new: Bool };\n",
     );
     // Run usage (run-limits design section 3.5). Always present.
-    s.push_str("type UsageContext = { calls: Long, amount: Long, destination_seen: Bool };\n");
+    // Per-user windows (run limits phase 3), inside it. Always present too.
+    s.push_str("type WindowFigures = { calls: Long, amount: Long };\n");
+    s.push_str("type UserWindowContext = { hour: WindowFigures, day: WindowFigures };\n");
+    s.push_str(
+        "type UsageContext = { calls: Long, amount: Long, destination_seen: Bool, user_window: UserWindowContext };\n",
+    );
     let actions = catalog.actions(legacy_bare_actions);
     let mut all_inputs: BTreeMap<String, ArgType> = BTreeMap::new();
     for inputs in actions.values() {
@@ -460,7 +465,9 @@ mod tests {
             "budget: BudgetContext",
             "type BudgetContext = { limited: Bool, calls_remaining: Long, amount_remaining: Long, destination_new: Bool }",
             "usage: UsageContext",
-            "type UsageContext = { calls: Long, amount: Long, destination_seen: Bool }",
+            "type UsageContext = { calls: Long, amount: Long, destination_seen: Bool, user_window: UserWindowContext }",
+            "type UserWindowContext = { hour: WindowFigures, day: WindowFigures }",
+            "type WindowFigures = { calls: Long, amount: Long }",
         ] {
             assert!(text.contains(attr), "{attr}");
         }
