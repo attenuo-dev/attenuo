@@ -20,7 +20,7 @@ use crate::routes::admin::constant_time_eq;
 
 /// Which list is being authenticated against; only changes error texts and sub-codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClientKind {
+pub(crate) enum ClientKind {
     /// `[[agents]]`, body fields `client_id` / `client_secret`.
     Agent,
     /// `[[peps]]`, body fields `pep_id` / `pep_secret`.
@@ -60,7 +60,7 @@ pub(crate) fn invalid_client(description: &'static str, detail: impl Into<String
 
 /// Client credentials from HTTP Basic (RFC 6749 §2.3.1, form-encoded id and secret).
 /// `Ok(None)` when there is no `Authorization` header or it is not Basic.
-pub fn basic_credentials(headers: &HeaderMap) -> Result<Option<(String, String)>, ApiError> {
+pub(crate) fn basic_credentials(headers: &HeaderMap) -> Result<Option<(String, String)>, ApiError> {
     let Some(raw) = headers.get(header::AUTHORIZATION) else {
         return Ok(None);
     };
@@ -88,7 +88,7 @@ pub fn basic_credentials(headers: &HeaderMap) -> Result<Option<(String, String)>
 /// `body_id` / `body_secret` are the body fields ([`ClientKind`] names them). Sub-codes:
 /// `client_auth_missing`, `multiple_client_auth`, `malformed_client_auth`,
 /// `client_authentication_failed`, `no_agents_configured` / `no_peps_configured`.
-pub fn authenticate(
+pub(crate) fn authenticate(
     kind: ClientKind,
     clients: &[AgentConfig],
     headers: &HeaderMap,
@@ -154,7 +154,7 @@ pub fn authenticate(
 }
 
 /// Validate a `{ id, secret_sha256 }` list at startup; returns it with the hashes lowercased.
-pub fn validate_clients(
+pub(crate) fn validate_clients(
     section: &str,
     clients: &[AgentConfig],
 ) -> anyhow::Result<Vec<AgentConfig>> {

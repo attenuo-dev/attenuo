@@ -42,6 +42,7 @@
 //! [`admin_ui::SECURITY_HEADERS`], and no CORS headers. See [`admin_ui`].
 
 #![deny(unsafe_code)]
+#![warn(unreachable_pub)]
 #![warn(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,

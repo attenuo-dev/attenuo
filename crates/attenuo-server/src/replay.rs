@@ -30,7 +30,7 @@ use time::OffsetDateTime;
 use crate::error::ApiError;
 
 /// Default number of live entries held.
-pub const DEFAULT_REPLAY_CAPACITY: usize = 100_000;
+pub(crate) const DEFAULT_REPLAY_CAPACITY: usize = 100_000;
 
 /// The replay cache.
 pub struct ReplayCache {
