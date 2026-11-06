@@ -722,10 +722,11 @@ impl Deliver for WebhookDeliver {
         if let Some(t) = &self.bearer {
             req = req.bearer_auth(t);
         }
+        // The URL is left out of the error: its query may hold a credential (SR-94).
         let resp = req
             .send()
             .await
-            .map_err(|e| format!("request failed: {e}"))?;
+            .map_err(|e| format!("request failed: {}", e.without_url()))?;
         let status = resp.status();
         if status.is_success() {
             Ok(())
@@ -921,7 +922,7 @@ impl Deliver for S3Deliver {
         let resp = req
             .send()
             .await
-            .map_err(|e| format!("request failed: {e}"))?;
+            .map_err(|e| format!("request failed: {}", e.without_url()))?;
         let status = resp.status();
         if status.is_success() {
             Ok(())
@@ -1306,6 +1307,30 @@ mod tests {
         assert!(text.contains("attenuo_audit_sink_failures_total 0\n"));
         assert!(text.contains("attenuo_audit_sink_dropped_total 0\n"));
         q.shutdown(Duration::from_secs(1));
+    }
+
+    /// SR-94: a failed delivery's error, which `/readyz` and the retry log line print, names
+    /// neither the sink URL's query (it may carry a credential) nor its path.
+    #[test]
+    fn a_failed_webhook_delivery_does_not_log_the_url_sr94() {
+        let d = WebhookDeliver::new(
+            "http://127.0.0.1:1/ingest/path-marker?token=secret-marker".into(),
+            None,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(d.deliver(&ShippedCheckpoint::new(&cp(1), None)))
+            .unwrap_err();
+        assert!(err.starts_with("request failed"), "{err}");
+        assert!(
+            !err.contains("secret-marker") && !err.contains("path-marker"),
+            "{err}"
+        );
     }
 
     #[test]
