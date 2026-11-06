@@ -281,6 +281,10 @@ fn admin_evaluate_body(input: &testing::CaseInput, budget: Option<&testing::Budg
         "calls": l.usage.calls,
         "amount": l.usage.amount,
         "destination_seen": l.usage.destination_seen,
+        "user_window": {
+            "hour": { "calls": l.usage.user_window.hour.calls, "amount": l.usage.user_window.hour.amount },
+            "day": { "calls": l.usage.user_window.day.calls, "amount": l.usage.user_window.day.amount },
+        },
     });
     if l.approval.present {
         body["approval"] = json!({ "by": l.approval.by });

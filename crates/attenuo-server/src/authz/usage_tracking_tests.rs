@@ -145,7 +145,8 @@ fn a_catalog_amount_turns_it_on() {
         Some(UsageContext {
             calls: 1,
             amount: 5,
-            destination_seen: false
+            destination_seen: false,
+            ..Default::default()
         })
     );
     assert!(s.usage_rows() > 0);

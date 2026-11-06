@@ -178,6 +178,7 @@ when { context.usage.calls != 0 || context.usage.amount != 0 || context.usage.de
             calls: 2,
             amount: 40,
             destination_seen: true,
+            ..Default::default()
         },
         ..Default::default()
     };
@@ -229,6 +230,21 @@ fn shipped_run_usage_policies_pass_their_tests() {
         );
     }
     assert!(report.cases.len() >= 10);
+}
+
+#[test]
+fn shipped_user_window_policies_pass_their_tests() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/policies/user-windows_test.yaml");
+    let report = TestFile::load(&path).unwrap().run().unwrap();
+    for case in &report.cases {
+        assert!(
+            case.passed,
+            "{}: {:?} {:?}",
+            case.name, case.failures, case.error
+        );
+    }
+    assert!(report.cases.len() >= 7);
 }
 
 /// A catalog's `amount` must name an input, and one not declared as anything but `long`.

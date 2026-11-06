@@ -363,8 +363,37 @@ pub async fn prune_run_state(state: &Arc<AppState>) -> u64 {
     .await
 }
 
+/// One run of per-user window retention (`[leases] user_window_retention_seconds`, run limits
+/// phase 3): passes of
+/// [`LeaseStore::prune_user_windows`](attenuo_audit::LeaseStore::prune_user_windows), bounded
+/// like [`prune_run_state`]. A window and its charges go once the window ended longer ago than
+/// the retention; an open window is never touched. Counts what it deleted in
+/// `run_state_pruned_total{kind="user_window"}` and returns it; 0 when retention is off.
+pub async fn prune_user_windows(state: &Arc<AppState>) -> u64 {
+    let Some(retention) = state.user_window_retention else {
+        return 0;
+    };
+    prune_in_passes(
+        state,
+        "per-user windows",
+        move |s, now| {
+            use attenuo_audit::LeaseStore;
+            let batch = s.lease_maintenance.batch_rows;
+            let p = s.leases.prune_user_windows(now, retention, batch)?;
+            Ok((p, p.wrapped))
+        },
+        |m, p| {
+            let n = p.pruned_windows + p.pruned_charges;
+            m.user_windows_pruned(n);
+            n
+        },
+    )
+    .await
+}
+
 /// Start the lease maintenance ticker: every `[leases] maintenance_interval_seconds`,
-/// [`prune_session_bindings`], then [`prune_lease_registry`], then [`prune_run_state`] (each
+/// [`prune_session_bindings`], then [`prune_lease_registry`], then [`prune_run_state`], then
+/// [`prune_user_windows`] (each
 /// does nothing when its retention is 0). Sessions go first, so a binding whose chain is about
 /// to be pruned is counted as a session; run state goes last, since it is only pruned once
 /// its leases are gone. Dropping the handle does not stop it; abort it to stop.
@@ -378,6 +407,7 @@ pub fn spawn_lease_maintenance(state: Arc<AppState>) -> tokio::task::JoinHandle<
             prune_session_bindings(&state).await;
             prune_lease_registry(&state).await;
             prune_run_state(&state).await;
+            prune_user_windows(&state).await;
         }
     })
 }
@@ -403,7 +433,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .then(|| spawn_checkpointer(state.clone(), state.checkpoint_interval));
     let prune_task = (state.session_retention.is_some()
         || state.lease_retention.is_some()
-        || state.run_state_retention.is_some())
+        || state.run_state_retention.is_some()
+        || state.user_window_retention.is_some())
     .then(|| spawn_lease_maintenance(state.clone()));
     let metrics_task = if config.metrics.enabled {
         let l = tokio::net::TcpListener::bind(config.metrics.listen).await?;

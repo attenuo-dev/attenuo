@@ -450,6 +450,8 @@ pub async fn refund_budget(
 ///
 /// - the record carries `budget` (the allowed call charged run-limit counters): the entry can
 ///   only have gone by run-state pruning, so 410 `charge_pruned`;
+/// - an allowed decision whose `usage` carries `user_window` charged per-user windows, which
+///   go only by their own retention: 410 `charge_pruned`;
 /// - an allowed decision with `usage` and no `budget` charged run usage only, which is dropped
 ///   when its run's root lease is revoked as well as when it is pruned: 404 `not_found` saying
 ///   so (the two cannot be told apart from the record);
@@ -480,6 +482,18 @@ fn no_charge_refusal(state: &AppState, decision_id: &str) -> ApiError {
                 "the charge of decision `{decision_id}` was pruned: its run's leases are gone \
                  and the charge is older than [leases] run_state_retention_seconds, so it can \
                  no longer be refunded (its audit record keeps what it charged)"
+            ),
+        )
+    } else if decided && record.usage.is_some_and(|u| u.user_window.is_some()) {
+        // Per-user windows are kept apart from the run and pruned only after their window
+        // ended (`[leases] user_window_retention_seconds`), never at revocation.
+        ApiError::new(
+            StatusCode::GONE,
+            CHARGE_PRUNED,
+            format!(
+                "the per-user window charge of decision `{decision_id}` was pruned: its window \
+                 ended longer ago than [leases] user_window_retention_seconds, so it can no \
+                 longer be refunded (its audit record keeps what the windows held)"
             ),
         )
     } else if decided && record.usage.is_some() {

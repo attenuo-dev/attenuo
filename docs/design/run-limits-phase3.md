@@ -1,6 +1,6 @@
 # Run limits phase 3: design
 
-- Status: proposed, not accepted. Nothing in this note changes what is built: run limits phases 1 and 2 ([run limits](run-limits.md), [ADR-0010](../decisions/0010-run-limits.md)) stay as documented, and phase 3 stays unbuilt until the open questions below are answered.
+- Status: proposed, not accepted. Step 1 of section 7 (per-user windows) is built on `feat/run-limits-phase3`, with the choices of [section 8](#choices-made-in-step-1-2026-11-06) taken in place of answers; see [run limits: as built](run-limits.md#as-built-per-user-windows-phase-3-step-1). Steps 0 and 2 to 6 stay unbuilt until the open questions below are answered.
 - Date: 2026-11-06. Base: `main` at 4ffe725.
 - Related: [run limits](run-limits.md) sections 2, 3.3, 3.4, 3.6, 5, 6 and 7, and open questions 4, 5, 6, 7, 8 and 9; [ADR-0010](../decisions/0010-run-limits.md); [multi-replica readiness](multi-replica.md) (the `Counters` trait and the run lock); [RFC-0001](../spec/rfc-0001-attenuo.md) sections 3.1 and 8; [related work: AgentGateway](../research/related-work.md#agentgateway-linux-foundation); [config reference: `[leases]`](../reference/config.md#leases); [injection suite](../evaluation/injection-suite.md); [AgentDojo plan](../research/agentdojo-plan-2026-11-05.md); [ADR-0006](../decisions/0006-lease-based-in-flight-revocation.md) (leases); [ADR-0009](../decisions/0009-output-labelling.md) (results recorded after the response).
 
@@ -302,3 +302,20 @@ Step 1 stands on its own for a single replica and should not wait for the multi-
 5. **Which reservation, if any.** Escrow at exchange (section 5.2), which the run-limits note promised, or hold at decision (section 5.3), which this note's brief described and which reduces to trusted settlement? And if escrow, is a share stranded for the child token's lifetime acceptable?
 6. **Deny or ask by default.** Should the documented window rule ask (keeping other runs going under an injected agent that spends the window) or deny (a regulated cap the approver cannot pass)?
 7. **Measure first.** Should step 0 run before any phase 3 code, given that no part of phase 3 has a measured benefit on the suites as they are?
+
+### Choices made in step 1 (2026-11-06)
+
+Step 1 was built before the questions above were answered. Where this note recommends an option, step 1 takes it; where it recommends none, the choice below was made for step 1 and is open to reversal.
+
+1. Belongs in attenuo: built in attenuo, for policy over destructive tools' calls and amounts; request rates stay at the gateway. RFC-0001 section 8 is not changed: that sentence is the maintainer's.
+2. Window kinds and time zone: fixed calendar windows in UTC, kinds `hour` and `day` only; no month, no configured offset. One user under two IdPs is two windows (the key is issuer and subject).
+3. Wait for `Counters`: no; built for one replica, with the user stripes in process, and the deploy guide says windows are a single-replica guarantee. Serialising a user's budgeted decisions is accepted, including for service accounts; the user lock's wait is reported in the existing `run_lock_wait_seconds`, not a new series.
+4. IdP cooperation (RAR): not part of step 1; nothing decided.
+5. Which reservation: not part of step 1; nothing decided.
+6. Deny or ask by default: ask is the documented default form (`config/policies/user-windows.cedar`, the policy guide), deny for a regulated cap, as section 6 recommends.
+7. Measure first: step 1 was built without step 0, which is still open; nothing in step 1 changes what the suites can measure (section 6).
+8. Tracking (section 3.3): windows are kept per kind only when a loaded policy reads `context.usage.user_window.<kind>`; there is no config flag.
+9. Unreadable store (section 3.4): the worst case, both figures the largest `Long`, for every kept kind, with a diagnostic; the call is not refused for the read error itself.
+10. Retention (section 3.7): `[leases] user_window_retention_seconds`, default 35 days after a window ends; values from 1 to 86399 (below a day) refused at start; 0 keeps every window, like the other retention keys. An open window is never pruned at any setting.
+11. Reporting (section 3.4): the decision record names only kept kinds, with each window's `start`; error data, AuthZEN answers and the dry run carry `user_window` only when it is not all zero, so their shape is unchanged for deployments without windows.
+12. Refund of a pruned window (section 3.7): when the charge log has nothing left and the record carries `usage.user_window`, 410 `charge_pruned`; a refund whose other charges remain returns them and skips the pruned window silently.

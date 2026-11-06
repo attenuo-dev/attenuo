@@ -539,7 +539,7 @@ impl RequestParts {
 /// arguments that matched the run's span index, phase 2), and `approval: {present, by}` (a
 /// granted approval the call consumed, if any); and the run-limit member (ADR-0010),
 /// `budget: {limited, calls_remaining, amount_remaining, destination_new}`, and run usage,
-/// `usage: {calls, amount, destination_seen}`.
+/// `usage: {calls, amount, destination_seen, user_window: {hour, day}}`.
 fn label_pairs(
     labels: &CallLabels,
 ) -> Result<Vec<(String, RestrictedExpression)>, TranslationError> {
@@ -593,6 +593,19 @@ fn label_pairs(
         ),
     ])?;
     let u = &labels.usage;
+    let window = |w: &crate::WindowFigures| {
+        record(vec![
+            ("calls".to_string(), RestrictedExpression::new_long(w.calls)),
+            (
+                "amount".to_string(),
+                RestrictedExpression::new_long(w.amount),
+            ),
+        ])
+    };
+    let user_window = record(vec![
+        ("hour".to_string(), window(&u.user_window.hour)?),
+        ("day".to_string(), window(&u.user_window.day)?),
+    ])?;
     let usage = record(vec![
         ("calls".to_string(), RestrictedExpression::new_long(u.calls)),
         (
@@ -603,6 +616,7 @@ fn label_pairs(
             "destination_seen".to_string(),
             RestrictedExpression::new_bool(u.destination_seen),
         ),
+        ("user_window".to_string(), user_window),
     ])?;
     Ok(vec![
         ("session".to_string(), session),
@@ -658,6 +672,16 @@ fn label_json(labels: &CallLabels) -> Map<String, Value> {
             "calls": labels.usage.calls,
             "amount": labels.usage.amount,
             "destination_seen": labels.usage.destination_seen,
+            "user_window": {
+                "hour": {
+                    "calls": labels.usage.user_window.hour.calls,
+                    "amount": labels.usage.user_window.hour.amount,
+                },
+                "day": {
+                    "calls": labels.usage.user_window.day.calls,
+                    "amount": labels.usage.user_window.day.amount,
+                },
+            },
         }),
     );
     m

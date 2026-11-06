@@ -68,7 +68,10 @@
 //!     "amount_remaining": 9223372036854775807,
 //!     "destination_new": true
 //!   },
-//!   "usage": { "calls": 0, "amount": 0, "destination_seen": false }
+//!   "usage": {
+//!     "calls": 0, "amount": 0, "destination_seen": false,
+//!     "user_window": { "hour": { "calls": 0, "amount": 0 }, "day": { "calls": 0, "amount": 0 } }
+//!   }
 //! }
 //! ```
 //!
@@ -110,6 +113,12 @@
 //! Nothing refuses a call because of usage unless a policy says so, which is how a deployment
 //! writes limits without a number in every token, hard (`forbid`) or soft
 //! (`@obligation("approval")`).
+//!
+//! `usage.user_window` (run limits phase 3, [`UserWindowContext`]) is the originating user's
+//! usage of the same tool across all their runs, in the current fixed UTC hour (`hour`) and
+//! UTC day (`day`): `calls` and the summed `amount`, before this call. Users are told apart by
+//! issuer and subject. The server keeps a kind only when some loaded policy reads it
+//! ([`PolicyEngine::user_window_kinds`]); a kind not kept is zero.
 //!
 //! # Obligations
 //!
@@ -264,7 +273,7 @@ pub use schema::{
 pub use screen::{
     ListScreen, HIDE_INVALID_NAME, HIDE_NOT_IN_CATALOG, HIDE_POLICY, SCREEN_MEMO_CAPACITY,
 };
-pub use usage::{policies_read_usage, TrackUsage};
+pub use usage::{policies_read_usage, policies_read_user_window, TrackUsage};
 
 /// The starter policy set shipped with the crate (`policies/default.cedar`).
 ///
@@ -391,6 +400,47 @@ pub struct UsageContext {
     /// `context.usage.destination_seen`: the catalog's `destination` input value appeared in an
     /// earlier allowed call of this tool in the run.
     pub destination_seen: bool,
+    /// `context.usage.user_window`: the originating user's usage of this tool across all their
+    /// runs, per fixed UTC window (run limits phase 3).
+    pub user_window: UserWindowContext,
+}
+
+/// `context.usage.user_window` (run limits phase 3): the originating user's per-user windows
+/// of the called tool, before this call. Always present; a kind the server does not keep (no
+/// loaded policy reads it, [`PolicyEngine::user_window_kinds`]) is zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UserWindowContext {
+    /// `context.usage.user_window.hour`: the current UTC hour.
+    pub hour: WindowFigures,
+    /// `context.usage.user_window.day`: the current UTC day.
+    pub day: WindowFigures,
+}
+
+impl UserWindowContext {
+    /// The figures of `kind`.
+    pub fn get(&self, kind: attenuo_core::WindowKind) -> &WindowFigures {
+        match kind {
+            attenuo_core::WindowKind::Hour => &self.hour,
+            attenuo_core::WindowKind::Day => &self.day,
+        }
+    }
+
+    /// The figures of `kind`, to set.
+    pub fn get_mut(&mut self, kind: attenuo_core::WindowKind) -> &mut WindowFigures {
+        match kind {
+            attenuo_core::WindowKind::Hour => &mut self.hour,
+            attenuo_core::WindowKind::Day => &mut self.day,
+        }
+    }
+}
+
+/// One per-user window as Cedar sees it: `{calls, amount}`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WindowFigures {
+    /// Allowed calls of the tool by any run of the user in the window.
+    pub calls: i64,
+    /// The sum of the catalog's `amount` input over those calls.
+    pub amount: i64,
 }
 
 /// `context.budget` (ADR-0010): what the run limits that match a call have left, computed by
@@ -703,6 +753,7 @@ impl PolicyEngineBuilder {
             .any(|(_, a)| a.amount.is_some() || a.destination.is_some());
         Ok(PolicyEngine {
             policies_read_usage: loaded.reads_usage,
+            policies_read_user_window: loaded.reads_user_window,
             policies_read_session_id: loaded.reads_session_id,
             policies_read_arg_taint: loaded.reads_arg_taint,
             catalog_names_usage,
@@ -733,6 +784,8 @@ struct LoadedPolicies {
     warnings: Vec<String>,
     /// Some policy may read `context.usage` ([`policies_read_usage`]).
     reads_usage: bool,
+    /// The window kinds some policy may read ([`policies_read_user_window`]).
+    reads_user_window: Vec<attenuo_core::WindowKind>,
     /// Some policy may read `context.session_id`, the one optional context member (the list
     /// screen evaluates both its presence and its absence then).
     reads_session_id: bool,
@@ -839,6 +892,7 @@ fn load_policies(text: &str, schema: &Schema) -> Result<LoadedPolicies, PolicyEr
     };
     Ok(LoadedPolicies {
         reads_usage: policies_read_usage(&policies),
+        reads_user_window: policies_read_user_window(&policies),
         reads_session_id: usage::policies_read_context_attr(&policies, "session_id"),
         reads_arg_taint: usage::policies_read_context_attr(&policies, "args_contain_untrusted")
             || usage::policies_read_context_attr(&policies, "untrusted_args"),
@@ -999,6 +1053,8 @@ pub struct PolicyEngine {
     screen_memo: screen::ScreenMemo,
     /// Some loaded policy may read `context.usage`; recomputed on reload.
     policies_read_usage: bool,
+    /// The per-user window kinds loaded policies may read; recomputed on reload.
+    policies_read_user_window: Vec<attenuo_core::WindowKind>,
     /// Some loaded policy may read `context.session_id`; recomputed on reload.
     policies_read_session_id: bool,
     /// Some loaded policy may read `context.args_contain_untrusted` or
@@ -1331,6 +1387,7 @@ impl PolicyEngine {
         self.obligations = loaded.obligations;
         self.validation_warnings = loaded.warnings;
         self.policies_read_usage = loaded.reads_usage;
+        self.policies_read_user_window = loaded.reads_user_window;
         self.policies_read_session_id = loaded.reads_session_id;
         self.policies_read_arg_taint = loaded.reads_arg_taint;
         // The cached request parts do not depend on the policies, but a reload is the
@@ -1412,6 +1469,16 @@ impl PolicyEngine {
         self.track_usage == TrackUsage::Always
             || self.policies_read_usage
             || self.catalog_names_usage
+    }
+
+    /// The per-user window kinds (run limits phase 3) the server keeps under this engine: those
+    /// some loaded policy may read as `context.usage.user_window.<kind>`
+    /// ([`policies_read_user_window`]), shortest first. Empty when none is read, and then
+    /// nothing about windows is charged or read. Only kept for calls that keep run usage
+    /// ([`tracks_usage`](Self::tracks_usage), which a read of `context.usage` implies).
+    /// Decided at build and at every [`reload_policies_str`](Self::reload_policies_str).
+    pub fn user_window_kinds(&self) -> &[attenuo_core::WindowKind] {
+        &self.policies_read_user_window
     }
 
     /// Whether some loaded policy (or template) may read `context.args_contain_untrusted` or

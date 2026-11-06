@@ -166,9 +166,10 @@ pub async fn check_policies(State(state): State<Arc<AppState>>) -> Result<Json<V
 /// a spent hard limit answers `budget_exhausted` with the live diagnostic; the dry run never
 /// charges a counter, and a stated `budget` is never read from or written to the store.
 /// `usage` is `context.usage` (run-limits design section 3.5): as given in the request's
-/// optional `usage: {calls, amount, destination_seen}`, or else the run's usage of a
-/// destructive tool read from the store (all zero for any other tool, and all zero when the
-/// body states a `budget`), with `source` saying which: `request`, `store`, or `untracked`
+/// optional `usage: {calls, amount, destination_seen, user_window}`, or else the run's usage
+/// of a destructive tool, with its user's per-user windows (run limits phase 3, the kinds a
+/// loaded policy reads), read from the store (all zero for any other tool, and all zero when
+/// the body states a `budget`), with `source` saying which: `request`, `store`, or `untracked`
 /// when the engine keeps no run usage at all
 /// ([`attenuo_policy::PolicyEngine::tracks_usage`]), so the zeros are not a reading of the
 /// run.
@@ -259,7 +260,14 @@ pub async fn evaluate_policies(
     // Run limits (ADR-0010): the counters as they are now, or as the request states them.
     // Read, never charged.
     let (budget, budget_source) = match &stated {
-        None => (state.pipeline.budget_view(&chain, &call), "store"),
+        None => {
+            let mut view = state.pipeline.budget_view(&chain, &call);
+            // Per-user windows (run limits phase 3) are read with the run's usage.
+            state
+                .pipeline
+                .add_user_windows(&mut view, &chain, &call, now);
+            (view, "store")
+        }
         Some(s) => {
             let mut view = state
                 .pipeline
@@ -323,13 +331,9 @@ pub async fn evaluate_policies(
         },
         "approval": { "present": approval.present, "by": approval.by },
         "budget": crate::authz::budget_json(&budget.context),
-        "usage": {
-            "calls": usage.calls,
-            "amount": usage.amount,
-            "destination_seen": usage.destination_seen,
-            "source": usage_source,
-        },
+        "usage": crate::authz::usage_json(&usage),
     });
+    out["usage"]["source"] = usage_source.into();
     out["budget"]["source"] = budget_source.into();
     if let Some(hit) = &budget.hit {
         out["limit"] = hit.to_json();
@@ -461,17 +465,20 @@ fn budget_from_json(
 }
 
 /// The optional `usage` member of a dry run: `{"calls": n, "amount": n, "destination_seen":
-/// bool}`, each optional (0 or false), the figures non-negative integers.
+/// bool, "user_window": {"hour": {"calls": n, "amount": n}, "day": {...}}}`, each optional (0
+/// or false), the figures non-negative integers.
 fn usage_from_json(v: &Value) -> Result<attenuo_policy::UsageContext, ApiError> {
     let bad = |m: &str| ApiError::bad_request("invalid_request", format!("`usage`: {m}"));
     let obj = v.as_object().ok_or_else(|| bad("expected an object"))?;
-    if let Some(k) = obj
-        .keys()
-        .find(|k| !matches!(k.as_str(), "calls" | "amount" | "destination_seen"))
-    {
+    if let Some(k) = obj.keys().find(|k| {
+        !matches!(
+            k.as_str(),
+            "calls" | "amount" | "destination_seen" | "user_window"
+        )
+    }) {
         return Err(bad(&format!("unknown member `{k}`")));
     }
-    let figure = |key: &str| -> Result<i64, ApiError> {
+    let figure_in = |obj: &serde_json::Map<String, Value>, key: &str| -> Result<i64, ApiError> {
         match obj.get(key) {
             None | Some(Value::Null) => Ok(0),
             Some(n) => n
@@ -480,6 +487,27 @@ fn usage_from_json(v: &Value) -> Result<attenuo_policy::UsageContext, ApiError> 
                 .ok_or_else(|| bad(&format!("`{key}` must be a non-negative integer"))),
         }
     };
+    let figure = |key: &str| figure_in(obj, key);
+    let mut user_window = attenuo_policy::UserWindowContext::default();
+    if let Some(w) = obj.get("user_window").filter(|w| !w.is_null()) {
+        let w = w
+            .as_object()
+            .ok_or_else(|| bad("`user_window` must be an object"))?;
+        for (kind, f) in w {
+            let kind = attenuo_core::WindowKind::parse(kind)
+                .ok_or_else(|| bad(&format!("`user_window`: unknown kind `{kind}`")))?;
+            let f = f
+                .as_object()
+                .ok_or_else(|| bad(&format!("`user_window.{kind}` must be an object")))?;
+            if let Some(k) = f.keys().find(|k| !matches!(k.as_str(), "calls" | "amount")) {
+                return Err(bad(&format!("`user_window.{kind}`: unknown member `{k}`")));
+            }
+            *user_window.get_mut(kind) = attenuo_policy::WindowFigures {
+                calls: figure_in(f, "calls")?,
+                amount: figure_in(f, "amount")?,
+            };
+        }
+    }
     let destination_seen = match obj.get("destination_seen") {
         None | Some(Value::Null) => false,
         Some(Value::Bool(b)) => *b,
@@ -489,6 +517,7 @@ fn usage_from_json(v: &Value) -> Result<attenuo_policy::UsageContext, ApiError> 
         calls: figure("calls")?,
         amount: figure("amount")?,
         destination_seen,
+        user_window,
     })
 }
 

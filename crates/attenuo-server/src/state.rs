@@ -40,6 +40,9 @@ pub struct AppState {
     /// `[leases] run_state_retention_seconds`; `None` when run-limit counters, the charge log
     /// and approvals are never pruned.
     pub run_state_retention: Option<Duration>,
+    /// `[leases] user_window_retention_seconds`; `None` when per-user windows are never
+    /// pruned.
+    pub user_window_retention: Option<Duration>,
     /// `[leases] maintenance_*`: how often the maintenance task runs, the rows of one
     /// pruning pass and the most passes of each kind per run.
     pub lease_maintenance: crate::config::LeaseMaintenance,
@@ -133,6 +136,7 @@ impl AppState {
         config.token.check_dpop()?;
         config.approvals.check()?;
         let lease_maintenance = config.leases.maintenance()?;
+        let user_window_retention = config.leases.user_window_retention()?;
         let issuer = load_issuer(config)?;
         // Server DPoP nonces are keyed by the issuer's private key (see `crate::dpop`).
         let dpop = Arc::new(
@@ -288,6 +292,7 @@ impl AppState {
             session_retention: config.leases.session_retention(),
             lease_retention: config.leases.retention(),
             run_state_retention: config.leases.run_state_retention(),
+            user_window_retention,
             lease_maintenance,
             policies_path: config.policy.policies_path.clone(),
             loaded_policies,

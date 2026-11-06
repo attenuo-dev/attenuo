@@ -30,6 +30,7 @@ use crate::metrics::{ExhaustedAt, Metrics, RefundSource};
 
 use super::budgets::{distinct_step, read_counters};
 use super::usage::{micros, record_usage};
+use super::windows::{read_windows, user_stripe, USER_LOCK_STRIPES};
 use super::{
     ArgTaint, BudgetView, CounterSource, LimitHit, RunLabels, MAX_ARG_PROBES,
     MAX_UNTRUSTED_ARG_ENTRIES, UNREADABLE_USAGE,
@@ -121,6 +122,9 @@ pub struct Pipeline {
     /// budget figures, from reading those figures to charging them (SR-55). See
     /// `Pipeline::run_guard`.
     run_locks: Box<[Mutex<()>]>,
+    /// The same for every run of one originating user, for calls that keep a per-user window
+    /// (run limits phase 3), taken after the run's lock. See `Pipeline::run_guard`.
+    user_locks: Box<[Mutex<()>]>,
     /// `[approvals.notify]`: told about each new pending approval; it only queues.
     approval_notifier: Option<crate::notify::NotifierHandle>,
 }
@@ -185,6 +189,9 @@ pub(super) fn arg_probes<'a>(call: &'a ToolCall, pinned: &BTreeSet<String>) -> A
 /// to the same lock.
 const RUN_LOCK_STRIPES: usize = 64;
 
+#[cfg(test)]
+pub(super) const RUN_LOCK_STRIPES_FOR_TESTS: usize = RUN_LOCK_STRIPES;
+
 impl Pipeline {
     /// A pipeline over this policy, lease store and audit log, with the default approval TTL and
     /// no approval-token verifier or approval notifier (see the `with_*` methods). When the lease
@@ -210,6 +217,7 @@ impl Pipeline {
             ),
             approval_verifier: None,
             run_locks: (0..RUN_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
+            user_locks: (0..USER_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
             approval_notifier: None,
         }
     }
@@ -221,13 +229,20 @@ impl Pipeline {
     /// `usage.amount + input.amount > 2000`, or a soft rule that asks on the second call) or
     /// over `context.budget`: without the lock, concurrent calls of one run all read the same
     /// figures and are all allowed. `None` (no lock) for a call that neither matches a token
-    /// limit's hop nor keeps run usage, so other calls never wait. In process only: two
-    /// servers on one store would not share it (not a supported deployment).
+    /// limit's hop nor keeps run usage, so other calls never wait. A call that keeps a
+    /// per-user window (run limits phase 3) also holds its user's lock, taken after the run's
+    /// from a separate set of stripes, so a rule over `context.usage.user_window` sees what
+    /// every earlier call of the user's other runs charged. The wait for both is one
+    /// `run_lock_wait_seconds` observation. In process only: two servers on one store would
+    /// not share them (not a supported deployment).
     fn run_guard(
         &self,
         chain: &DelegationChain,
         call: &ToolCall,
-    ) -> Option<std::sync::MutexGuard<'_, ()>> {
+    ) -> Option<(
+        std::sync::MutexGuard<'_, ()>,
+        Option<std::sync::MutexGuard<'_, ()>>,
+    )> {
         let limited = chain
             .hops
             .iter()
@@ -243,8 +258,55 @@ impl Pipeline {
         let guard = self.run_locks[stripe]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Run first, then user, from separate arrays: no deadlock and no self-block.
+        let user = self.keeps_user_window(call).then(|| {
+            self.user_locks[user_stripe(&chain.originating_user, self.user_locks.len())]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
         self.metrics.observe_run_lock_wait(waiting.elapsed());
-        Some(guard)
+        Some((guard, user))
+    }
+
+    /// Whether `call` keeps a per-user window: it keeps run usage and some loaded policy reads
+    /// a window kind.
+    fn keeps_user_window(&self, call: &ToolCall) -> bool {
+        self.usage_inputs(call).is_some()
+            && self
+                .policy
+                .read()
+                .is_ok_and(|e| !e.user_window_kinds().is_empty())
+    }
+
+    /// Add the originating user's per-user windows (run limits phase 3) to `view`, read from
+    /// the lease store at `now`: the window charges go into `view.windows` and the figures into
+    /// `view.usage.user_window`, for the kinds a loaded policy reads
+    /// ([`PolicyEngine::user_window_kinds`]). Does nothing for a call that keeps no run usage.
+    /// An unreadable store gives the worst case for every kept kind, and the policy decides.
+    /// The admin dry run uses this when it reads usage from the store.
+    pub fn add_user_windows(
+        &self,
+        view: &mut BudgetView,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        now: OffsetDateTime,
+    ) {
+        let Some((amount, _)) = self.usage_inputs(call) else {
+            return;
+        };
+        let kinds = match self.policy.read() {
+            Ok(e) => e.user_window_kinds().to_vec(),
+            Err(_) => attenuo_core::WindowKind::ALL.to_vec(),
+        };
+        read_windows(
+            self.leases.as_ref(),
+            view,
+            &chain.originating_user,
+            call,
+            amount.as_deref(),
+            &kinds,
+            now,
+        );
     }
 
     /// Accept signed approval tokens that verify under `verifier` (the issuer's own verifier:
@@ -391,6 +453,7 @@ impl Pipeline {
             Ok(()) => {
                 let run = self.run_labels(chain);
                 budget = self.budget_view(chain, call);
+                self.add_user_windows(&mut budget, chain, call, now);
                 let args = self.arg_taint(chain, call, &run.session);
                 let mut diagnostics = Vec::new();
                 record_labels = run.record;
@@ -454,18 +517,17 @@ impl Pipeline {
         let mut any_charged = false;
         // The charge left its sync to the decision's append (see `charge_sync_on_append`).
         let mut sync_on_append = false;
-        if decision.is_allow() && !budget.charges.is_empty() {
+        if decision.is_allow() && !(budget.charges.is_empty() && budget.windows.is_empty()) {
             let id = decision_id.to_string();
-            let outcome = if self.charge_sync_on_append {
-                self.leases
-                    .charge_sync_deferred(&id, &budget.charges, now)
-                    .map(|(outcome, owed)| {
-                        sync_on_append = owed;
-                        outcome
-                    })
-            } else {
-                self.leases.charge(&id, &budget.charges, now)
-            };
+            // Per-user windows go in the same transaction (run limits phase 3).
+            let defer = self.charge_sync_on_append;
+            let outcome = self
+                .leases
+                .charge_windowed(&id, &budget.charges, &budget.windows, now, defer)
+                .map(|(outcome, owed)| {
+                    sync_on_append = owed;
+                    outcome
+                });
             match outcome {
                 Ok(ChargeOutcome::Charged { used_after }) => {
                     any_charged = true;
@@ -544,7 +606,10 @@ impl Pipeline {
             record.approval = Some(info);
         }
         record.budget = charged.clone();
-        record.usage = budget.usage.as_ref().map(record_usage);
+        record.usage = budget
+            .usage
+            .as_ref()
+            .map(|u| record_usage(u, &budget.windows));
         // The record moves into the log; the entry hands it back, so it is never cloned. A
         // deferred `sum` charge is durable once this synced append returns, before the call is
         // answered or forwarded; if the append fails, the charge is refunded below.
@@ -829,6 +894,7 @@ impl Pipeline {
                     usage: None,
                     usage_error: None,
                     hit: None,
+                    windows: Vec::new(),
                 };
             }
         };
@@ -883,6 +949,7 @@ impl Pipeline {
             usage_error: None,
             context,
             hit,
+            windows: Vec::new(),
         }
     }
 

@@ -24,7 +24,7 @@ Every call becomes one Cedar request.
 | `context.args_contain_untrusted`, `context.untrusted_args` | on a tainted run, for every call if some loaded policy reads either attribute and otherwise for a destructive call: whether an argument copies a value or span of an untrusted result of the run, and the names of those arguments (an argument pinned by an `equals` or `one_of` constraint never counts); `false` and an empty set otherwise. See [Asking only when an argument copies untrusted output](#asking-only-when-an-argument-copies-untrusted-output) |
 | `context.approval` | `present` (bool) and `by` (`"user"`, `"operator"`, or `""` without an approval): whether this call carries a granted approval for its exact hash; see [Asking for approval after untrusted output](#asking-for-approval-after-untrusted-output) |
 | `context.budget` | what the token's run limits matching this call have left: `limited` (bool), `calls_remaining`, `amount_remaining` (Long; the largest Long when no such limit applies) and `destination_new` (bool); see [Run limits](#run-limits) |
-| `context.usage` | the delegation run's usage of this tool so far, for a destructive tool: `calls` (allowed calls by any hop), `amount` (the catalog's `amount` input summed over them) and `destination_seen` (bool); zero and false for other tools. See [Limits over run usage](#limits-over-run-usage) |
+| `context.usage` | the delegation run's usage of this tool so far, for a destructive tool: `calls` (allowed calls by any hop), `amount` (the catalog's `amount` input summed over them) and `destination_seen` (bool); zero and false for other tools. `user_window.hour` and `user_window.day` (each `{calls, amount}`) are the same tool's usage by every run of the originating user in the current UTC hour and day. See [Limits over run usage](#limits-over-run-usage) and [Limits per user across runs](#limits-per-user-across-runs) |
 
 The action names the server as well as the tool. `action == Action::"github/read_file"` matches `read_file` on the upstream mounted as `github` and nothing else: a second upstream that also has a `read_file` tool (a malicious one, say) is not covered by that permit. To write a rule for every tool of one server, use the resource: `resource in Server::"github"`. To write one for every tool everywhere, leave `action` unconstrained or use `action in Action::"invoke"`.
 
@@ -295,6 +295,24 @@ when {
 
 The gated call gets `-32008` with `usage` in its data; once the user or an operator grants it, the identical retry is allowed and counted, so the next payment asks again. Only allowed calls are counted, and an approval never raises a token's own limits. The figures are what the run had before this call, so `calls >= 1` means "not the first". An `amount` value that is not a non-negative integer adds nothing; a list-valued `destination` counts each element. A rule over `destination_seen` asks only for a repeat to the same payee or recipient, however many others the run has paid. With `destination = "url#host"` in the catalog, `destination_seen` compares the hosts of a URL input, so a rule can ask when a run fetches from a site it has not used before. Usage ends with the run: revoking its root lease deletes it. [`config/policies/run-usage.cedar`](../../config/policies/run-usage.cedar) has these rules, a per-recipient mail rule and a per-site fetch rule, with tests in `run-usage_test.yaml`.
 
+### Limits per user across runs
+
+Run usage starts again with every run, so it cannot say "at most 5000 a day from this user's agents". A per-user window can. For the same destructive tools, the server can also keep usage per originating user (issuer and subject) across all their runs, in fixed UTC windows: `context.usage.user_window.hour` (the current clock hour) and `context.usage.user_window.day` (00:00 to 24:00 UTC), each with `calls` and `amount`, before this call:
+
+```cedar
+// Soft, the recommended form: past 5000 in a UTC day, the user's agents ask.
+@id("ask_over_user_daily_spend_5000")
+@obligation("approval")
+forbid (principal, action == Action::"banking/send_money", resource)
+when {
+  context.input has amount &&
+  context.usage.user_window.day.amount + context.input.amount > 5000 &&
+  !context.approval.present
+};
+```
+
+The server keeps a window only for the kinds a loaded policy reads (the rule above keeps `day`, not `hour`); a kind it does not keep reads as zero. Starting a new run, or revoking one, does not reset a window. An injected agent that spends the window blocks the user's other runs until the window ends, so prefer the asking form, and use a plain `forbid` for a regulated cap that no approver may pass. If the window cannot be read, the policy sees the largest `Long` for both figures, so a count rule refuses or asks and an amount rule overflows and denies. Windows are exact only on one server process: see [deploying](deploying.md). [`config/policies/user-windows.cedar`](../../config/policies/user-windows.cedar) has an asking daily cap and a hard hourly count, with tests in `user-windows_test.yaml`.
+
 ### Chain depth
 
 ```cedar
@@ -394,7 +412,7 @@ The harness builds a real `DelegationChain` and calls the same `PolicyEngine::au
 - **Defaults.** User `alice` at `https://idp.example`, authenticated a minute before `now`; time fixed at 1760000000; each hop lives an hour; lease ids are random. `policy_ids: []` asserts that no policy matched (a default deny).
 - **Output labels.** A case's `session: { tainted_by: [web/fetch] }` evaluates the call as part of a run that has read that source; `tainted: true` with no sources is a run whose taint state could not be read. Without `session` the run is untainted. `reason` also accepts `approval_required`. `approval: { by: user }` evaluates the call as a retry that carries a granted approval (`by` is `user` or `operator`); without it there is none. `session: { untrusted_args: [body] }` sets `context.untrusted_args`, and `args_contain_untrusted` defaults to whether that list is non-empty (it can also be set `true` alone); without them the call has no matched arguments.
 - **Run limits.** The harness keeps no counters. `budget: { calls_remaining: 1 }` sets `context.budget` for the case (`limited` defaults to `true` there; the other members default to an unlimited call's values). Capabilities in `chain` may carry `limits`, which are checked for narrowing like any other part of a capability. Offline, those limits are not enforced: a case whose chain carries a limit and whose `budget` says it is spent sees the figures in Cedar but is not refused. Through `--via admin-evaluate` the server does enforce them (`budget_exhausted` before Cedar, as for a live call), so write such a case for the server arm, or leave `limits` out of the chain to test the policy alone.
-- **Run usage.** `usage: { calls: 1, amount: 10, destination_seen: true }` sets `context.usage` for the case, as if the run had made those calls of the tool before (each member optional, 0 or false). Without it the call is the run's first. The inline catalog takes `amount` and `destination` like the server's.
+- **Run usage.** `usage: { calls: 1, amount: 10, destination_seen: true }` sets `context.usage` for the case, as if the run had made those calls of the tool before (each member optional, 0 or false). Without it the call is the run's first. `usage: { user_window: { day: { calls: 3, amount: 4900 } } }` sets the user's windows the same way (`hour` and `day`, each optional, members default 0). The inline catalog takes `amount` and `destination` like the server's.
 - **Mistakes in the file** (unknown keys, a missing `expect`, duplicate case names, an empty `cases`) are errors, not silent passes.
 
 ### Running

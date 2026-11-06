@@ -19,6 +19,7 @@
 //! rendered as JSON counts as reading usage. Untracked usage is not a weaker policy: no loaded
 //! policy can tell the zeros it then sees from real figures.
 
+use attenuo_core::WindowKind;
 use cedar_policy::PolicySet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -83,6 +84,78 @@ pub(crate) fn policies_read_context_attr(policies: &PolicySet, attr: &str) -> bo
     match policies.clone().to_json() {
         Ok(v) => reads_attr(&v, attr),
         Err(_) => true,
+    }
+}
+
+/// The per-user window kinds (run limits phase 3) some policy or template in `policies` may
+/// read as `context.usage.user_window.<kind>`, shortest first. The walk errs towards keeping
+/// a kind, as [`policies_read_usage`] does: a use of `context`, `context.usage` or
+/// `context.usage.user_window` as a whole (or a `has` test on one) counts for every kind, and
+/// so does a set that cannot be rendered as JSON. A kind no loaded policy reads is not kept:
+/// the server charges and reads nothing for it, and Cedar sees it as zero.
+pub fn policies_read_user_window(policies: &PolicySet) -> Vec<WindowKind> {
+    let mut kinds = [false; 2];
+    match policies.clone().to_json() {
+        Ok(v) => window_reads(&v, &mut kinds),
+        Err(_) => kinds = [true; 2],
+    }
+    WindowKind::ALL
+        .into_iter()
+        .zip(kinds)
+        .filter_map(|(k, read)| read.then_some(k))
+        .collect()
+}
+
+/// The attribute path of an access chain on `context` (`context.a.b` is `["a", "b"]`), or
+/// `None` when `v` is not one. An access whose attribute has an unexpected shape ends the
+/// path with `None` in it, which reads as "anything".
+fn context_path(v: &Value) -> Option<Vec<Option<String>>> {
+    if is_context(v) {
+        return Some(Vec::new());
+    }
+    let map = v.as_object().filter(|m| m.len() == 1)?;
+    let inner = [".", "has"].into_iter().find_map(|op| map.get(op))?;
+    let mut path = context_path(inner.get("left")?)?;
+    match inner.get("attr") {
+        Some(Value::String(a)) => path.push(Some(a.clone())),
+        Some(Value::Array(items)) => {
+            path.extend(items.iter().map(|a| a.as_str().map(str::to_string)))
+        }
+        _ => path.push(None),
+    }
+    Some(path)
+}
+
+fn window_reads(v: &Value, kinds: &mut [bool; 2]) {
+    if let Some(path) = context_path(v) {
+        let at = |i: usize| path.get(i).map(Option::as_deref);
+        let all = match (at(0), at(1), at(2)) {
+            // `context` whole, or an unreadable step: could observe anything.
+            (None, ..) | (Some(None), ..) => true,
+            (Some(Some(a)), ..) if a != "usage" => false,
+            (Some(Some(_)), None, _) | (Some(Some(_)), Some(None), _) => true,
+            (Some(Some(_)), Some(Some(b)), _) if b != "user_window" => false,
+            (_, _, None) | (_, _, Some(None)) => true,
+            (_, _, Some(Some(kind))) => {
+                match WindowKind::parse(kind) {
+                    Some(k) => {
+                        kinds[WindowKind::ALL.iter().position(|x| *x == k).unwrap_or(0)] = true
+                    }
+                    // A kind the schema does not declare cannot validate; keep both to be safe.
+                    None => *kinds = [true; 2],
+                }
+                false
+            }
+        };
+        if all {
+            *kinds = [true; 2];
+        }
+        return;
+    }
+    match v {
+        Value::Object(map) => map.values().for_each(|x| window_reads(x, kinds)),
+        Value::Array(items) => items.iter().for_each(|x| window_reads(x, kinds)),
+        _ => {}
     }
 }
 
@@ -155,6 +228,68 @@ mod tests {
         assert!(!reads(
             r#"forbid(principal, action, resource) when { context.input has usage && context.input.usage == "usage" };"#
         ));
+    }
+
+    fn windows(text: &str) -> Vec<&'static str> {
+        policies_read_user_window(&PolicySet::from_str(text).unwrap())
+            .into_iter()
+            .map(|k| k.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn finds_the_window_kinds_policies_read() {
+        let none: Vec<&str> = Vec::new();
+        assert_eq!(windows("permit(principal, action, resource);"), none);
+        // Run usage alone keeps no window.
+        assert_eq!(
+            windows("forbid(principal, action, resource) when { context.usage.amount > 5 };"),
+            none
+        );
+        assert_eq!(
+            windows(
+                "forbid(principal, action, resource) when { \
+                 context.usage.user_window.day.amount + 1 > 5000 };"
+            ),
+            vec!["day"]
+        );
+        assert_eq!(
+            windows(
+                r#"forbid(principal, action, resource) when { context["usage"]["user_window"]["hour"].calls > 3 };"#
+            ),
+            vec!["hour"]
+        );
+        assert_eq!(
+            windows(
+                "forbid(principal, action, resource) when { context.usage.user_window.hour.calls > 3 \
+                 || context.usage.user_window.day.calls > 30 };"
+            ),
+            vec!["hour", "day"]
+        );
+        // Whole records count for every kind.
+        for whole in [
+            "forbid(principal, action, resource) when { context.usage.user_window == {} };",
+            "forbid(principal, action, resource) when { context.usage == {} };",
+            "forbid(principal, action, resource) when { context == {} };",
+            "forbid(principal, action, resource) when { context.usage has user_window };",
+        ] {
+            assert_eq!(windows(whole), vec!["hour", "day"], "{whole}");
+        }
+        // Templates count too.
+        assert_eq!(
+            windows(
+                "permit(principal == ?principal, action, resource) when { \
+                 context.usage.user_window.day.calls < 3 };"
+            ),
+            vec!["day"]
+        );
+        // `user_window` elsewhere is not a read.
+        assert_eq!(
+            windows(
+                r#"forbid(principal, action, resource) when { context.input has user_window && context.input.user_window == "day" };"#
+            ),
+            none
+        );
     }
 
     #[test]

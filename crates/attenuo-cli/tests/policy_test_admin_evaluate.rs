@@ -420,7 +420,7 @@ async fn repository_suites_replay_through_the_admin_dry_run_with_nothing_skipped
         .filter(|p| p.to_string_lossy().ends_with("_test.yaml"))
         .collect();
     files.sort();
-    assert_eq!(files.len(), 4, "{files:?}");
+    assert_eq!(files.len(), 5, "{files:?}");
     files.push(root.join("examples/github-leak-demo/policy_test.yaml"));
     files.push(root.join("examples/multi-hop-demo/policy_test.yaml"));
 

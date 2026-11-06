@@ -2,7 +2,7 @@
 //! transactions.
 
 use attenuo_core::limits::MAX_LIMIT;
-use attenuo_core::{Charge, LimitKind};
+use attenuo_core::{Charge, LimitKind, WindowCharge};
 use rusqlite::{params, Connection, OptionalExtension};
 use time::OffsetDateTime;
 
@@ -11,6 +11,7 @@ use super::leases::SqliteLeaseStore;
 use super::{fmt_time, to_i64};
 use crate::budget::{plan, ChargeOutcome, CounterKey, DISTINCT_VALUE_KIND, USAGE_KINDS};
 use crate::error::AuditError;
+use crate::window::{plan_windows, WindowKey, WindowPrune};
 
 /// What counter `key` holds (0 when it has never been charged).
 pub(super) fn counter_in(conn: &Connection, key: &CounterKey) -> Result<u64, AuditError> {
@@ -29,18 +30,41 @@ pub(super) fn counter_in(conn: &Connection, key: &CounterKey) -> Result<u64, Aud
         .map_err(|_| AuditError::Storage(format!("budget counter {used} is negative")))
 }
 
-/// [`LeaseStore::charge`](crate::lease::LeaseStore::charge) in one `IMMEDIATE` transaction: the re-check and the writes see the
-/// same counters, and a concurrent charge waits for this one to commit.
+/// What window counter `key` holds (0 when it has never been charged).
+pub(super) fn window_in(conn: &Connection, key: &WindowKey) -> Result<u64, AuditError> {
+    let used: Option<i64> = conn
+        .prepare_cached(
+            "SELECT used FROM user_windows WHERE user = ?1 AND window_kind = ?2 \
+             AND window_start = ?3 AND tool = ?4 AND measure = ?5",
+        )?
+        .query_row(
+            params![key.user, key.kind, key.start, key.tool, key.measure],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let used = used.unwrap_or(0);
+    u64::try_from(used)
+        .map_err(|_| AuditError::Storage(format!("window counter {used} is negative")))
+}
+
+/// [`LeaseStore::charge_windowed`](crate::lease::LeaseStore::charge_windowed) in one
+/// `IMMEDIATE` transaction: the re-check and the writes see the same counters, and a
+/// concurrent charge waits for this one to commit. Window charges are written only once every
+/// limit fits, in the same transaction.
 fn charge_in(
     conn: &mut Connection,
     keys: &[CounterKey],
     decision_id: &str,
     charges: &[Charge],
+    windows: (&[WindowKey], &[WindowCharge]),
     at: OffsetDateTime,
 ) -> Result<ChargeOutcome, AuditError> {
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let already: bool = tx
-        .prepare_cached("SELECT EXISTS (SELECT 1 FROM budget_charges WHERE decision_id = ?1)")?
+        .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM budget_charges WHERE decision_id = ?1) \
+                 OR EXISTS (SELECT 1 FROM user_window_charges WHERE decision_id = ?1)",
+        )?
         .query_row([decision_id], |r| r.get(0))?;
     if already {
         return Err(AuditError::Storage(format!(
@@ -77,6 +101,37 @@ fn charge_in(
             at
         ])?;
     }
+    for (key, after, amount) in plan_windows(windows.0, windows.1, |k| window_in(&tx, k))? {
+        tx.prepare_cached(
+            "INSERT INTO user_windows (user, window_kind, window_start, tool, measure, used) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT (user, window_kind, window_start, tool, measure) \
+             DO UPDATE SET used = excluded.used",
+        )?
+        .execute(params![
+            key.user,
+            key.kind,
+            key.start,
+            key.tool,
+            key.measure,
+            to_i64(after)?
+        ])?;
+        tx.prepare_cached(
+            "INSERT INTO user_window_charges \
+             (decision_id, user, window_kind, window_start, tool, measure, amount, at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?
+        .execute(params![
+            decision_id,
+            key.user,
+            key.kind,
+            key.start,
+            key.tool,
+            key.measure,
+            to_i64(amount)?,
+            at
+        ])?;
+    }
     tx.commit()?;
     Ok(ChargeOutcome::Charged {
         used_after: planned.used_after,
@@ -110,12 +165,18 @@ pub(super) fn refund_in(
             ],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-    if rows == 0 {
+    let (window_rows, window_refunded): (i64, i64) = tx
+        .prepare_cached(
+            "SELECT COUNT(*), COUNT(refunded_at) FROM user_window_charges WHERE decision_id = ?1",
+        )?
+        .query_row([decision_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    if rows == 0 && window_rows == 0 {
         return Err(AuditError::UnknownCharge(decision_id.to_owned()));
     }
-    if refunded > 0 {
+    if refunded > 0 || window_refunded > 0 {
         return Err(AuditError::ChargeRefunded(decision_id.to_owned()));
     }
+    refund_windows_in(&tx, decision_id, at)?;
     // The values this decision used, and whether another unrefunded decision used each too.
     let values: Vec<(String, i64, String, String, bool)> = tx
         .prepare_cached(
@@ -210,16 +271,102 @@ pub(super) fn refund_in(
     Ok(u64::try_from(limits).unwrap_or(0) + freed)
 }
 
+/// The window part of a refund, inside the refund's transaction: mark what `decision_id`
+/// charged to windows refunded and recompute each of those windows from the unrefunded charges
+/// left (a window saturates at `MAX_LIMIT`, so what one decision logged is not what it added
+/// once the window was full).
+fn refund_windows_in(
+    tx: &Connection,
+    decision_id: &str,
+    at: OffsetDateTime,
+) -> Result<(), AuditError> {
+    let keys: Vec<(String, String, i64, String, String)> = tx
+        .prepare_cached(
+            "SELECT DISTINCT user, window_kind, window_start, tool, measure \
+             FROM user_window_charges WHERE decision_id = ?1",
+        )?
+        .query_map([decision_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    if keys.is_empty() {
+        return Ok(());
+    }
+    tx.prepare_cached("UPDATE user_window_charges SET refunded_at = ?2 WHERE decision_id = ?1")?
+        .execute(params![decision_id, fmt_time(at)?])?;
+    for (user, kind, start, tool, measure) in keys {
+        let amounts: Vec<i64> = tx
+            .prepare_cached(
+                "SELECT amount FROM user_window_charges WHERE user = ?1 AND window_kind = ?2 \
+                 AND window_start = ?3 AND tool = ?4 AND measure = ?5 AND refunded_at IS NULL",
+            )?
+            .query_map(params![user, kind, start, tool, measure], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        let total = amounts
+            .into_iter()
+            .fold(0u64, |t, a| t.saturating_add(u64::try_from(a).unwrap_or(0)))
+            .min(MAX_LIMIT);
+        tx.prepare_cached(
+            "UPDATE user_windows SET used = ?6 WHERE user = ?1 AND window_kind = ?2 \
+             AND window_start = ?3 AND tool = ?4 AND measure = ?5",
+        )?
+        .execute(params![user, kind, start, tool, measure, to_i64(total)?])?;
+    }
+    Ok(())
+}
+
+/// [`LeaseStore::prune_user_windows`](crate::lease::LeaseStore::prune_user_windows) in one
+/// `IMMEDIATE` transaction: up to `max_rows` window counters whose window ended more than
+/// `retention` ago, then the charges logged against windows that old (at most `max_rows`).
+pub(super) fn prune_windows_in(
+    conn: &mut Connection,
+    now: OffsetDateTime,
+    retention: time::Duration,
+    max_rows: usize,
+) -> Result<WindowPrune, AuditError> {
+    let max = max_rows.max(1) as u64;
+    let max_rows = i64::try_from(max).unwrap_or(i64::MAX);
+    // The window's end, as `WindowKey::end` computes it (an unknown kind counts as a day), is
+    // compared with `now - retention`: the same rule as `window_prunable`.
+    let latest_end = now
+        .unix_timestamp()
+        .saturating_sub(retention.whole_seconds());
+    let ended = "window_start + CASE window_kind WHEN 'hour' THEN 3600 ELSE 86400 END < ?1";
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let windows = tx
+        .prepare_cached(&format!(
+            "DELETE FROM user_windows WHERE (user, window_kind, window_start, tool, measure) IN \
+             (SELECT user, window_kind, window_start, tool, measure FROM user_windows \
+              WHERE {ended} LIMIT ?2)"
+        ))?
+        .execute(params![latest_end, max_rows])?;
+    let charges = tx
+        .prepare_cached(&format!(
+            "DELETE FROM user_window_charges WHERE rowid IN \
+             (SELECT rowid FROM user_window_charges WHERE {ended} LIMIT ?2)"
+        ))?
+        .execute(params![latest_end, max_rows])?;
+    tx.commit()?;
+    let windows = windows as u64;
+    let charges = charges as u64;
+    Ok(WindowPrune {
+        pruned_windows: windows,
+        pruned_charges: charges,
+        wrapped: windows < max && charges < max,
+    })
+}
+
 impl SqliteLeaseStore {
     /// [`LeaseStore::charge`](crate::lease::LeaseStore::charge), or with `defer` [`LeaseStore::charge_sync_deferred`](crate::lease::LeaseStore::charge_sync_deferred).
     pub(super) fn charge_with(
         &self,
         decision_id: &str,
         charges: &[Charge],
+        windows: &[WindowCharge],
         at: OffsetDateTime,
         defer: bool,
     ) -> Result<(ChargeOutcome, bool), AuditError> {
-        if charges.is_empty() {
+        if charges.is_empty() && windows.is_empty() {
             let none = ChargeOutcome::Charged {
                 used_after: Vec::new(),
             };
@@ -229,6 +376,11 @@ impl SqliteLeaseStore {
             .iter()
             .map(|c| self.value_key.counter(c))
             .collect::<Result<Vec<_>, _>>()?;
+        let window_keys = windows
+            .iter()
+            .map(|w| self.user_key.key(w))
+            .collect::<Result<Vec<_>, _>>()?;
+        let windows = (window_keys.as_slice(), windows);
         let _gate = self.gate.hold();
         let mut conn = self.conn.lock()?;
         // A lost `sum` charge could be spent again after a power failure, so a transaction
@@ -244,13 +396,13 @@ impl SqliteLeaseStore {
         if defer && relaxed.is_some() && self.file.is_some() {
             // Committed at the store's own level. The caller's synced append on the same
             // file syncs the WAL, which holds this commit, before the call goes anywhere.
-            let outcome = charge_in(&mut conn, &keys, decision_id, charges, at)?;
+            let outcome = charge_in(&mut conn, &keys, decision_id, charges, windows, at)?;
             self.probe_charge(&conn, &outcome);
             let owed = matches!(outcome, ChargeOutcome::Charged { .. });
             return Ok((outcome, owed));
         }
         let outcome = with_full_sync(&mut conn, relaxed, |conn| {
-            let outcome = charge_in(conn, &keys, decision_id, charges, at);
+            let outcome = charge_in(conn, &keys, decision_id, charges, windows, at);
             if let Ok(o) = &outcome {
                 self.probe_charge(conn, o);
             }
