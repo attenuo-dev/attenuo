@@ -287,6 +287,96 @@ mod tests {
         );
     }
 
+    /// One value of every `AuditError` variant.
+    fn one_of_each_audit_error() -> Vec<attenuo_audit::AuditError> {
+        use attenuo_audit::AuditError as E;
+        let parse = time::OffsetDateTime::parse(
+            "not a time",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap_err();
+        vec![
+            E::Sqlite(rusqlite::Error::QueryReturnedNoRows),
+            E::Serde(serde_json::from_str::<serde_json::Value>("{").unwrap_err()),
+            E::TimeFormat(time::error::Format::InvalidComponent("offset")),
+            E::TimeParse(parse),
+            E::Storage("disk I/O error".into()),
+            E::Poisoned,
+            E::Corrupt {
+                seq: 7,
+                detail: "bad json".into(),
+            },
+            E::Export("line 3".into()),
+            E::NoCheckpointSigner,
+            E::Jwks("no keys".into()),
+            E::UnknownLease("l1".into()),
+            E::LeaseRevoked("l1".into()),
+            E::BindingConflict("l1".into()),
+            E::UnknownApproval("a1".into()),
+            E::ApprovalNotPending {
+                id: "a1".into(),
+                state: "granted",
+            },
+            E::ApprovalExpired("a1".into()),
+            E::UnknownCharge("d1".into()),
+            E::ChargeRefunded("d1".into()),
+        ]
+    }
+
+    /// Only a store fault answers 500: every domain refusal of the lease store has a 4xx, so a
+    /// route's `?` on one cannot turn it into "internal error". The match below has no
+    /// wildcard: a new variant does not compile here until it is classed as a fault or a
+    /// refusal, and added to [`one_of_each_audit_error`] (the test checks that every
+    /// variant appears there exactly once).
+    #[test]
+    fn only_store_faults_answer_500() {
+        use attenuo_audit::AuditError as E;
+        // (position in declaration order, is a store fault)
+        fn class(e: &E) -> (usize, bool) {
+            match e {
+                E::Sqlite(_) => (0, true),
+                E::Serde(_) => (1, true),
+                E::TimeFormat(_) => (2, true),
+                E::TimeParse(_) => (3, true),
+                E::Storage(_) => (4, true),
+                E::Poisoned => (5, true),
+                E::Corrupt { .. } => (6, true),
+                E::Export(_) => (7, true),
+                E::NoCheckpointSigner => (8, true),
+                E::Jwks(_) => (9, true),
+                E::UnknownLease(_) => (10, false),
+                E::LeaseRevoked(_) => (11, false),
+                // Bound once, at issuance, to a lease id the server just made.
+                E::BindingConflict(_) => (12, true),
+                E::UnknownApproval(_) => (13, false),
+                E::ApprovalNotPending { .. } => (14, false),
+                E::ApprovalExpired(_) => (15, false),
+                E::UnknownCharge(_) => (16, false),
+                E::ChargeRefunded(_) => (17, false),
+            }
+        }
+        let all = one_of_each_audit_error();
+        let positions: Vec<usize> = all.iter().map(|e| class(e).0).collect();
+        assert_eq!(
+            positions,
+            (0..all.len()).collect::<Vec<_>>(),
+            "one_of_each_audit_error must list every variant once, in declaration order"
+        );
+        for e in all {
+            let (_, fault) = class(&e);
+            let name = format!("{e:?}");
+            let got = ApiError::from(e);
+            if fault {
+                assert_eq!(got.status, StatusCode::INTERNAL_SERVER_ERROR, "{name}");
+                assert_eq!(got.code, "server_error", "{name}");
+                assert_eq!(got.detail, INTERNAL_DETAIL, "{name}");
+            } else {
+                assert!(got.status.is_client_error(), "{name}: {}", got.status);
+                assert_ne!(got.detail, INTERNAL_DETAIL, "{name}");
+            }
+        }
+    }
+
     /// Every `AuditError` variant has one status, one `error` code and, for a 500, no detail
     /// of its own (SR-43). The route tests pin the same answers end to end.
     #[test]

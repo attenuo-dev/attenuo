@@ -484,7 +484,7 @@ pub async fn lease_status(
             let row = state
                 .leases
                 .get(&lease)?
-                .ok_or_else(|| ApiError::not_found(format!("unknown lease `{}`", lease.0)))?;
+                .ok_or_else(|| AuditError::UnknownLease(lease.0.clone()))?;
             let fmt = |t: time::OffsetDateTime| t.format(&Rfc3339).unwrap_or_default();
             // Ask the store rather than the row so this agrees with what the pipeline sees.
             let active = state.leases.is_active(&lease, state.now())?;
@@ -546,7 +546,7 @@ pub async fn lease_tree(
             let tree = state
                 .leases
                 .subtree(&lease, max_nodes)?
-                .ok_or_else(|| ApiError::not_found(format!("unknown lease `{}`", lease.0)))?;
+                .ok_or_else(|| AuditError::UnknownLease(lease.0.clone()))?;
             let root = tree.root().clone();
             // Every lease here descends from `root`, so one indexed lookup by `chain_id`
             // finds all their issuance records.

@@ -170,11 +170,17 @@ fn approval_body(state: &AppState, a: &Approval, now: OffsetDateTime) -> Value {
     v
 }
 
+/// The 404 for an approval that is not stored, or that this caller may not learn exists: the
+/// same answer as the store's [`AuditError::UnknownApproval`], from the central mapping.
+fn unknown_approval(id: &str) -> ApiError {
+    AuditError::UnknownApproval(id.to_owned()).into()
+}
+
 fn load(state: &AppState, id: &str) -> Result<Approval, ApiError> {
     state
         .leases
         .approval(id)?
-        .ok_or_else(|| ApiError::not_found(format!("unknown approval `{id}`")))
+        .ok_or_else(|| unknown_approval(id))
 }
 
 /// Grant or decline `id` as `approver`, then record it. See the module docs for the order.
@@ -361,7 +367,7 @@ pub async fn user_get(
         )?;
         if attenuo_core::chain_id_of(&verified.chain).as_deref() != Some(a.chain_id.0.as_str()) {
             // Not this run's: do not confirm the approval exists.
-            return Err(ApiError::not_found(format!("unknown approval `{id}`")));
+            return Err(unknown_approval(&id));
         }
         // A token whose lease (or an ancestor's) was revoked or has expired speaks for no
         // agent any more, though its signature still verifies (SR-60): answer it as one of
@@ -371,7 +377,7 @@ pub async fn user_get(
             .blocking(move |s| s.leases.check_all(&chain.leases(), now).map(|st| st.active))
             .await?;
         if !live {
-            return Err(ApiError::not_found(format!("unknown approval `{id}`")));
+            return Err(unknown_approval(&id));
         }
     } else {
         verify_user(&state, &a, &token, now).await?;
