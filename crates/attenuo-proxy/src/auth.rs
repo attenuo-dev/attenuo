@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::guard::StreamEndCause;
 use crate::stage::Stage;
+use crate::traceparent::TraceHook;
 
 /// The outcome of authorizing one call, plus the id of the audit record that was written.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -423,6 +424,14 @@ pub trait Authorizer: Send + Sync {
         destructive_hint: Option<bool>,
     ) {
         let _ = (server, tool, read_only_hint, destructive_hint);
+    }
+
+    /// The hook that joins the proxy's exported spans to traces outside the process
+    /// ([`crate::traceparent`]): the inbound `traceparent`, the one inserted upstream, and the
+    /// links of results and stream ends recorded after a response. `None` (the default) when
+    /// tracing is off: the proxy then reads no `traceparent` and inserts none.
+    fn trace(&self) -> Option<&dyn TraceHook> {
+        None
     }
 
     /// Record how long one stage of a proxied request took ([`Stage::Upstream`],

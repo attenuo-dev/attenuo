@@ -49,12 +49,14 @@ use axum::body::Bytes;
 use futures_util::{Stream, StreamExt};
 use serde_json::{json, Value};
 use time::OffsetDateTime;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::auth::{AuthError, Authorizer};
 use crate::jsonrpc::{error_response, CODE_UNAUTHORIZED, CODE_UPSTREAM};
 use crate::records::{Admission, RecordWindow};
 use crate::session::session_tag;
+use crate::traceparent::{TraceParent, OTEL_TARGET};
 
 /// Reason given when a stream is ended because a hop of the token's chain expired.
 pub use crate::auth::REASON_TOKEN_EXPIRED;
@@ -177,6 +179,9 @@ pub struct StreamGuard {
     /// system clock unless [`StreamGuard::with_clock`] set another. The ticks between
     /// re-checks are tokio's, whatever the clock.
     pub clock: Arc<dyn Clock>,
+    /// The trace context the guard was made in (the request that opened the stream), when
+    /// tracing is on: the exported `attenuo.stream_end` span links to it.
+    pub origin: Option<TraceParent>,
 }
 
 /// Where a guarded stream goes, for the audit record written when the proxy ends it.
@@ -228,6 +233,7 @@ impl StreamGuard {
         chain: DelegationChain,
         interval: Duration,
     ) -> Self {
+        let origin = authorizer.trace().and_then(|h| h.current());
         Self {
             authorizer,
             chain,
@@ -235,6 +241,7 @@ impl StreamGuard {
             record: None,
             listen: None,
             clock: system_clock(),
+            origin,
         }
     }
 
@@ -358,10 +365,25 @@ impl StreamGuard {
         if let Some(tag) = &record.session {
             call = call.with_session(tag.clone());
         }
+        // The exported `attenuo.stream_end` span: the reason and the record's id, linked to the
+        // request that opened the stream (design section 3.2, "Long streams").
+        let span = tracing::info_span!(
+            target: OTEL_TARGET,
+            "attenuo.stream_end",
+            attenuo.reason = %reason,
+            attenuo.decision_id = tracing::field::Empty,
+        );
+        if let (Some(hook), Some(origin)) = (self.authorizer.trace(), self.origin) {
+            hook.link_detached(&span, origin);
+        }
         let written = self
             .authorizer
             .record_rejection_checked(&self.chain, &call, reason, now)
+            .instrument(span.clone())
             .await;
+        if let Some(id) = written {
+            span.record("attenuo.decision_id", tracing::field::display(id));
+        }
         match (written, &window) {
             (Some(id), Some((records, key))) => records.recorded(key, STREAM_END_TOOL, reason, id),
             // Not in the log: open no window on it, so the next end is recorded (SR-81).

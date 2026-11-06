@@ -49,6 +49,7 @@ use axum::body::Bytes;
 use futures_util::{Stream, StreamExt};
 use serde_json::Value;
 use time::OffsetDateTime;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::auth::{Authorizer, REASON_LABEL_ERROR};
@@ -70,6 +71,9 @@ pub(crate) struct PendingResult {
     pub id: Value,
     pub call: ToolCall,
     pub decision_id: Uuid,
+    /// The trace context of the request that made the call, when tracing is on: a result
+    /// recorded after that request returned (on a stream) links its span to it.
+    pub origin: Option<crate::traceparent::TraceParent>,
 }
 
 /// How long an allowed call is remembered for an answer on the `GET` listen stream. An answer
@@ -591,6 +595,20 @@ impl Labeller {
             return false;
         };
         let (part, is_error) = result_part(msg);
+        // The exported `attenuo.record_result` span: a child of the response span when the
+        // body is buffered, or (on a stream, after the request returned) a new span linked to
+        // the request that made the call. The authorizer fills in the label and the audit seq.
+        let span = tracing::info_span!(
+            target: crate::traceparent::OTEL_TARGET,
+            "attenuo.record_result",
+            attenuo.decision_id = %pending.decision_id,
+            attenuo.result.label = tracing::field::Empty,
+            attenuo.audit.seq = tracing::field::Empty,
+            attenuo.reason = tracing::field::Empty,
+        );
+        if let (Some(hook), Some(origin)) = (self.authorizer.trace(), pending.origin) {
+            hook.link_detached(&span, origin);
+        }
         let recorded = self
             .authorizer
             .record_result(
@@ -601,10 +619,12 @@ impl Labeller {
                 is_error,
                 OffsetDateTime::now_utc(),
             )
+            .instrument(span.clone())
             .await;
         match recorded {
             Ok(()) => false,
             Err(reason) => {
+                span.record("attenuo.reason", reason.as_str());
                 // The tool name is the caller's: Debug-format it (SR-18).
                 tracing::error!(
                     tool = ?pending.call.tool,
@@ -713,6 +733,7 @@ mod tests {
                 id: json!(1),
                 call: ToolCall::new("s", "read", json!({})),
                 decision_id: Uuid::nil(),
+                origin: None,
             }],
         )
     }
@@ -790,6 +811,7 @@ id: 4\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
             id,
             call: ToolCall::new("s", "read", json!({})),
             decision_id: Uuid::new_v4(),
+            origin: None,
         }
     }
 
