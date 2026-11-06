@@ -254,6 +254,10 @@ pub struct TraceSettings {
 
 impl TelemetrySection {
     /// [`resolve_with`](Self::resolve_with) over the process environment.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`resolve_with`](Self::resolve_with).
     pub fn resolve(&self) -> anyhow::Result<Option<TraceSettings>> {
         self.resolve_with(&|k| std::env::var(k).ok())
     }
@@ -267,7 +271,9 @@ impl TelemetrySection {
     /// `OTEL_RESOURCE_ATTRIBUTES` (`k=v,k=v`, over the file's) and `OTEL_TRACES_SAMPLER_ARG`.
     /// `OTEL_EXPORTER_OTLP_HEADERS` (collector credentials) is read by the exporter itself.
     ///
-    /// Errors, which stop the server: a protocol other than `http/protobuf`; an endpoint that
+    /// # Errors
+    ///
+    /// These stop the server: a protocol other than `http/protobuf`; an endpoint that
     /// is not an `http` or `https` URL with a host, or that carries a user name, password,
     /// query or fragment; a non-loopback `http://` endpoint without `allow_insecure`; a
     /// timeout outside 1 to 300 seconds; a sample ratio outside 0 to 1; a queue or batch size
@@ -789,8 +795,13 @@ impl TelemetryGuard {
 
 /// Install the process's subscriber: the log layer, and when `[telemetry]` resolves to
 /// [`TraceSettings`], the OpenTelemetry layer with the OTLP/HTTP exporter. Call once, from
-/// inside the tokio runtime (the exporter sends its requests on it). An invalid `[telemetry]`
-/// section is an error; an unreachable collector is not.
+/// inside the tokio runtime (the exporter sends its requests on it).
+///
+/// # Errors
+///
+/// An invalid `[telemetry]` section (see [`TelemetrySection::resolve_with`]), a failure to
+/// build the exporter, or a global subscriber already installed. An unreachable collector is
+/// not an error.
 pub fn init(section: &TelemetrySection) -> anyhow::Result<TelemetryGuard> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
@@ -958,6 +969,10 @@ mod otel {
 
     /// The OTLP/HTTP (protobuf) span exporter for `settings`, sending through the workspace's
     /// `reqwest` on `rt`. `OTEL_EXPORTER_OTLP_HEADERS` is read here, by the exporter.
+    ///
+    /// # Errors
+    ///
+    /// When the `reqwest` client or the OTLP exporter cannot be built from `settings`.
     pub fn otlp_exporter(
         settings: &TraceSettings,
         rt: tokio::runtime::Handle,
