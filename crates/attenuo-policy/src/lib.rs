@@ -220,6 +220,7 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(unreachable_pub)]
 #![warn(clippy::missing_errors_doc)]
 #![warn(
     clippy::cast_possible_truncation,
