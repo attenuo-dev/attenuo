@@ -39,6 +39,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 - Internal: `attenuo-core`, `attenuo-token`, `attenuo-policy`, `attenuo-audit` and `attenuo-proxy` warn on `unreachable_pub`, so a `pub` item that nothing outside its crate can reach fails the lint gate. The one hit, a test-only method in the proxy, is now `pub(crate)`. No public item changed.
 - Internal: `attenuo-server` and the `attenuo-bench` library warn on `unreachable_pub` too. The 31 server hits were items in the crate-private `actor`, `clientauth`, `idp`, `issuer_keys` and `replay` modules, now `pub(crate)`; the bench library had none. No public item changed.
 - Internal: `attenuo-server`'s `authz.rs` (3,853 lines) is split into submodules by pipeline stage: `authz/pipeline.rs` (`Pipeline`, `PipelineDecision`, the reason codes), `authorizer.rs` (`ServerAuthorizer` and the verified-token cache), `budgets.rs` (run limits), `labels.rs` (run and argument taint) and `usage.rs` (run usage and `result_digest`), with the unit tests in five files. Every public path (`attenuo_server::authz::Pipeline` and the rest) is unchanged. No behaviour change.
+- Internal: the approvals routes' unknown-approval 404s and the admin lease reads' unknown-lease 404s are built from the one `AuditError` to `ApiError` mapping instead of repeating its text, and a unit test (`only_store_faults_answer_500`) checks that only the store-fault variants answer 500, so a new variant must be classed as a fault or a refusal. Responses are byte-identical.
 
 ### Security
 
