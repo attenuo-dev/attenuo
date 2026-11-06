@@ -126,6 +126,9 @@ pub struct Pipeline {
     user_locks: Box<[Mutex<()>]>,
     /// `[approvals.notify]`: told about each new pending approval; it only queues.
     approval_notifier: Option<crate::notify::NotifierHandle>,
+    /// `[telemetry]`: the key of the subject digest on the exported `attenuo.decide` span
+    /// ([`crate::telemetry::SubjectDigest`]); `None` when telemetry is off.
+    subject_digest: Option<crate::telemetry::SubjectDigest>,
 }
 
 /// The lookups [`Pipeline::arg_taint`] makes for a call: one probe per distinct fingerprint of
@@ -218,6 +221,7 @@ impl Pipeline {
             run_locks: (0..RUN_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
             user_locks: (0..USER_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
             approval_notifier: None,
+            subject_digest: None,
         }
     }
 
@@ -329,6 +333,13 @@ impl Pipeline {
         self
     }
 
+    /// Put a keyed digest of the originating subject on the exported `attenuo.decide` span
+    /// (`[telemetry]`, design section 3.3): never the subject itself.
+    pub fn with_subject_digest(mut self, digest: crate::telemetry::SubjectDigest) -> Self {
+        self.subject_digest = Some(digest);
+        self
+    }
+
     /// Report decisions and audit failures to a shared [`Metrics`] instead of a private one.
     pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
         self.metrics = metrics;
@@ -366,10 +377,14 @@ impl Pipeline {
         ctx: &CallContext,
         now: OffsetDateTime,
     ) -> PipelineDecision {
+        let span = crate::telemetry::decide_span(call);
+        let entered = span.enter();
         let started = Instant::now();
         let out = self.decide_inner(chain, call, ctx, now);
         self.metrics.observe_authorize(started.elapsed());
         self.metrics.decision(out.decision.as_str(), &out.reason);
+        drop(entered);
+        crate::telemetry::record_decision(&span, &out, chain, self.subject_digest.as_ref());
         out
     }
 
@@ -434,7 +449,13 @@ impl Pipeline {
     ) -> PipelineDecision {
         // Stage timings: one `Instant::now()` per boundary (see `Stage`).
         let t0 = Instant::now();
-        let leases = self.check_leases(chain, now);
+        let leases = crate::telemetry::stage_span!("attenuo.lease_check").in_scope(|| {
+            let leases = self.check_leases(chain, now);
+            if let Err((reason, _)) = &leases {
+                tracing::Span::current().record("attenuo.reason", *reason);
+            }
+            leases
+        });
         let t1 = Instant::now();
         let mut policy_time = None;
         let mut record_labels = RecordLabels::default();
@@ -451,10 +472,15 @@ impl Pipeline {
         let (mut decision, mut reason, mut policy_ids, mut diagnostics) = match leases {
             Err((reason, detail)) => (Decision::Deny, reason.to_string(), Vec::new(), detail),
             Ok(()) => {
-                let run = self.run_labels(chain);
-                budget = self.budget_view(chain, call);
-                self.add_user_windows(&mut budget, chain, call, now);
-                let args = self.arg_taint(chain, call, &run.session);
+                let (run, args) =
+                    crate::telemetry::stage_span!("attenuo.run_state").in_scope(|| {
+                        let run = self.run_labels(chain);
+                        budget = self.budget_view(chain, call);
+                        self.add_user_windows(&mut budget, chain, call, now);
+                        let args = self.arg_taint(chain, call, &run.session);
+                        (run, args)
+                    });
+                tracing::Span::current().record("attenuo.tainted", run.session.tainted);
                 let mut diagnostics = Vec::new();
                 record_labels = run.record;
                 record_labels.untrusted_args = args.record;
@@ -494,7 +520,8 @@ impl Pipeline {
                             budget: budget.context.clone(),
                             usage: budget.usage.unwrap_or_default(),
                         };
-                        let o = self.evaluate_policy(chain, call, &labels, now);
+                        let o = crate::telemetry::stage_span!("attenuo.policy")
+                            .in_scope(|| self.evaluate_policy(chain, call, &labels, now));
                         policy_time = Some(t1.elapsed());
                         diagnostics.extend(o.diagnostics);
                         diagnostics.extend(run.error);
@@ -519,6 +546,8 @@ impl Pipeline {
         let mut sync_on_append = false;
         if decision.is_allow() && !(budget.charges.is_empty() && budget.windows.is_empty()) {
             let id = decision_id.to_string();
+            let charge_span = crate::telemetry::stage_span!("attenuo.charge");
+            let charging = charge_span.enter();
             // Per-user windows go in the same transaction (run limits phase 3).
             let defer = self.charge_sync_on_append;
             let outcome = self
@@ -528,6 +557,10 @@ impl Pipeline {
                     sync_on_append = owed;
                     outcome
                 });
+            if matches!(outcome, Ok(ChargeOutcome::Exhausted { .. })) {
+                charge_span.record("attenuo.budget.exhausted_at", "charge");
+            }
+            drop(charging);
             match outcome {
                 Ok(ChargeOutcome::Charged { used_after }) => {
                     any_charged = true;
@@ -614,11 +647,17 @@ impl Pipeline {
         // deferred `sum` charge is durable once this synced append returns, before the call is
         // answered or forwarded; if the append fails, the charge is refunded below.
         let t2 = Instant::now();
-        let appended = if sync_on_append {
-            self.audit.append_synced(record)
-        } else {
-            self.audit.append(record)
-        };
+        let appended = crate::telemetry::stage_span!("attenuo.audit_append").in_scope(|| {
+            let appended = if sync_on_append {
+                self.audit.append_synced(record)
+            } else {
+                self.audit.append(record)
+            };
+            if let Ok(entry) = &appended {
+                tracing::Span::current().record("attenuo.audit.seq", entry.seq);
+            }
+            appended
+        });
         let append_time = t2.elapsed();
         self.metrics.observe_audit_append(append_time);
         let lease_time = t1 - t0;
@@ -641,6 +680,7 @@ impl Pipeline {
                     .filter(|_| record.reason == REASON_BUDGET_EXHAUSTED)
                 {
                     self.metrics.budget_exhausted(hit.kind, exhausted_at);
+                    crate::telemetry::record_exhausted(hit.kind, exhausted_at);
                 }
                 if let Some((_, by)) = &consumed_approval {
                     self.metrics.approval_consumed(by);
@@ -1323,6 +1363,10 @@ impl Pipeline {
                 })?;
         }
         self.metrics.result_recorded(label);
+        // The proxy's `attenuo.record_result` span, carried onto this thread.
+        let span = tracing::Span::current();
+        span.record("attenuo.result.label", label.as_str());
+        span.record("attenuo.audit.seq", entry.seq);
         tracing::debug!(
             server = ?call.server,
             tool = ?call.tool,
@@ -1486,7 +1530,10 @@ pub(super) async fn on_blocking_pool<R: Send + 'static>(
     f: impl FnOnce(&Pipeline) -> R + Send + 'static,
 ) -> R {
     let pipeline = Arc::clone(pipeline);
-    match tokio::task::spawn_blocking(move || f(&pipeline)).await {
+    // Carry the caller's span and trace context, so the decision's spans and log lines are
+    // inside the request that asked for it (otel-export design, section 3.2).
+    let carry = crate::telemetry::Carry::capture();
+    match tokio::task::spawn_blocking(move || carry.run(|| f(&pipeline))).await {
         Ok(r) => r,
         Err(e) => std::panic::resume_unwind(e.into_panic()),
     }

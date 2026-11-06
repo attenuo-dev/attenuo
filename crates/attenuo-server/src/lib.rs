@@ -75,6 +75,7 @@ pub mod routes;
 // Used by the integration tests.
 pub mod sink;
 pub(crate) mod state;
+pub mod telemetry;
 
 use std::sync::Arc;
 
@@ -156,6 +157,17 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
         .route("/access/v1/evaluation", post(authzen::evaluation))
         .route("/access/v1/evaluations", post(authzen::evaluations))
         .route_layer(axum::middleware::from_fn(authzen::echo_request_id));
+    let mut token_routes = Router::new()
+        .route("/token", post(token::exchange))
+        .route("/token/renew", post(renew::renew));
+    // One exported span per token and AuthZEN request, only when tracing is on.
+    let (authzen_routes, token_routes) = if state.trace.is_some() {
+        let layer = axum::middleware::from_fn_with_state(state.clone(), telemetry::trace_route);
+        token_routes = token_routes.route_layer(layer.clone());
+        (authzen_routes.route_layer(layer), token_routes)
+    } else {
+        (authzen_routes, token_routes)
+    };
 
     let api = Router::new()
         .route("/healthz", get(wellknown::healthz))
@@ -165,8 +177,7 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
             "/.well-known/authzen-configuration",
             get(wellknown::authzen_configuration),
         )
-        .route("/token", post(token::exchange))
-        .route("/token/renew", post(renew::renew))
+        .merge(token_routes)
         .route(
             "/approvals/{id}",
             get(approvals::user_get).post(approvals::user_decide),
@@ -179,7 +190,8 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
 
     let authorizer = Arc::new(
         ServerAuthorizer::new(state.verifier.clone(), state.pipeline.clone())
-            .with_dpop(state.dpop.clone()),
+            .with_dpop(state.dpop.clone())
+            .with_trace(state.trace.clone()),
     );
     let proxy = attenuo_proxy::router_with_clock(
         // Validated in `AppState::from_config`.
