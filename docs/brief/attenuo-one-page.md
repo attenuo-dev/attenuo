@@ -24,17 +24,17 @@ attenuo is a self-hosted server and MCP proxy, written in Rust, that sits betwee
 | Injection suite, test split: attack calls allowed, direct (no attenuo) vs attenuo | 38/38 vs 7/38 <!-- evaluation/injection-suite/results/2026-11-05-final-main.md --> |
 | Test split: benign calls denied by attenuo | 3/29 <!-- evaluation/injection-suite/results/2026-11-05-final-main.md --> |
 | Test split, attenuo plus output labels and a one-call limit on non-reads (scripted approver) | 1/38 attack calls allowed, 3/29 benign denied <!-- docs/report/attenuo-2026-11.md, Table 2, row "+ labels and calls: 1"; evaluation/injection-suite/results/2026-11-05-final-main.md --> |
-| Added latency per proxied call, median | 0.4 to 0.8 ms (425 to 771 µs), 1 to 3 hops, shared 4-core container <!-- docs/design/performance.md; README.md --> |
+| Added latency per proxied call, median | 0.4 to 0.8 ms, 1 to 3 hops, shared 4-core container <!-- docs/design/performance.md; README.md --> |
 | Tests passing | 1,161 Rust, 322 Python SDK, 242 TypeScript SDK <!-- README.md, "Tests and fuzzing"; docs/report/attenuo-2026-11.md, Implementation --> |
 | Internal security review, 7 passes | 84 findings, 5 High; all fixed except 11 accepted Low/Info and 1 open Info <!-- docs/report/attenuo-2026-11.md, Table 4 and "Security review" --> |
 | Size | 64,529 lines of Rust in `src/`, 39,278 in tests <!-- docs/report/attenuo-2026-11.md, Table 1 --> |
 
-The test split has 26 synthetic cases replayed with no model in the loop. <!-- docs/report/attenuo-2026-11.md, Evaluation --> The cases, policies and approver were written by the same people who built the system, so these figures check the implementation against its own corpus and do not measure how often a real injected agent would be stopped.
+The test split's 26 synthetic cases are replayed with no model, <!-- docs/report/attenuo-2026-11.md, Evaluation --> and the cases, policies and approver were written by attenuo's authors, so these figures check the implementation, not how often a real injected agent would be stopped. On the public AgentDojo benchmark, a replay of each attack's calls with no model landed 592/609 attacks without attenuo and 15/609 under grants derived from each task's known solution; with real models no attack succeeded either way. <!-- docs/research/agentdojo-plan-2026-11-05.md, "Replay on all suites" and "Four models on one sample"; docs/report/attenuo-2026-11.md, "External benchmark: AgentDojo" -->
 
 ## Open research questions
 
-- **An independent attack corpus with a model in the loop.** What would a credible evaluation of a per-call enforcement layer look like: AgentDojo's injection tasks with policies frozen before the run, or a held-out corpus written by people who have not read the policies?
-- **The approver in the loop.** Output labelling turns most remaining misses into approval requests (71 on the dev split). <!-- docs/report/attenuo-2026-11.md, Open questions --> How often do people grant them unread, and which signals make a request decidable? This needs a user study.
+- **An independent evaluation with a model in the loop.** Our AgentDojo runs use oracle grants and our own policies. What would a credible evaluation need: grants from a planner that sees only the prompt, an adaptive attacker, a corpus by people who have not read the policies?
+- **The approver in the loop.** Output labelling turns most remaining misses into approval requests (71 on dev). <!-- docs/report/attenuo-2026-11.md, Open questions --> How often do people grant them unread, and which signals make a request decidable? This needs a user study.
 - **Policy-aware listing and the reach of the narrowing relation.** Is hiding a tool by Cedar partial evaluation sound for the policies agents use, and where should the line sit between what tokens can delegate and what only policy can deny?
 
 ## What I am looking for
