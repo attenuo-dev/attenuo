@@ -431,3 +431,65 @@ fn a_run_has_at_most_max_pending_approvals_sr92() {
         );
     }
 }
+
+/// SR-97: approvals of a revoked hop do not hold the run's places. Hops `l1` (root), `l2`
+/// and `l3` (child of `l2`): while `l3` is live its 32 approvals fill the run and `l2` is
+/// refused; once `l3` is revoked `l2` gets one at once, and the cap then counts only the
+/// live hops' approvals.
+#[test]
+fn a_revoked_child_frees_the_runs_pending_places_sr97() {
+    for (name, store) in stores() {
+        let store = store.as_ref();
+        leases(store);
+        let exp = t0() + Duration::hours(1);
+        store.register(&id("l3"), Some(&id("l2")), exp).unwrap();
+        let ttl = Duration::seconds(120);
+        let of_child = |n: u32| {
+            let mut a = pending(n, &format!("c{n}"), ttl);
+            a.lease = id("l3");
+            a.chain = chain("alice", ("l1", "l3"));
+            a
+        };
+        for n in 0..MAX_PENDING_APPROVALS_PER_RUN as u32 {
+            assert!(
+                store.create_approval(&of_child(n)).unwrap().1,
+                "{name}: {n}"
+            );
+        }
+
+        // The child is live: the cap holds for its parent.
+        let mut parent = pending(100, "p100", ttl);
+        parent.created_at = t0() + Duration::seconds(1);
+        match store.create_approval(&parent) {
+            Err(AuditError::TooManyPendingApprovals { chain_id, max }) => {
+                assert_eq!((chain_id.as_str(), max), ("l1", 32), "{name}");
+            }
+            other => panic!("{name}: the parent's approval was not refused: {other:?}"),
+        }
+
+        // Revoking the child frees its places at once.
+        store
+            .revoke(&id("l3"), "misbehaving", t0() + Duration::seconds(1))
+            .unwrap();
+        assert!(
+            store.create_approval(&parent).unwrap().1,
+            "{name}: parent after revocation"
+        );
+
+        // The cap still holds over the live hops: 31 more fit, the next is refused.
+        for n in 101..132u32 {
+            let mut a = pending(n, &format!("p{n}"), ttl);
+            a.created_at = parent.created_at;
+            assert!(store.create_approval(&a).unwrap().1, "{name}: {n}");
+        }
+        let mut over = pending(200, "p200", ttl);
+        over.created_at = parent.created_at;
+        assert!(
+            matches!(
+                store.create_approval(&over),
+                Err(AuditError::TooManyPendingApprovals { .. })
+            ),
+            "{name}: cap over live hops"
+        );
+    }
+}

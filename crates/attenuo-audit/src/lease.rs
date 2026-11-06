@@ -2121,7 +2121,7 @@ impl LeaseStore for MemoryLeaseStore {
         }
         let pending = approvals
             .values()
-            .filter(|a| rules::counts_as_pending(a, &approval.chain_id, now))
+            .filter(|a| rules::counts_as_pending(a, rows.get(&a.lease), &approval.chain_id, now))
             .count();
         rules::below_pending_cap(&approval.chain_id, pending)?;
         let mut stored = approval.clone();
