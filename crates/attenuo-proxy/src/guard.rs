@@ -263,7 +263,15 @@ impl StreamGuard {
         self
     }
 
-    /// Is the stream still allowed at `now`? `Err` carries a short reason code.
+    /// Is the stream still allowed at `now`?
+    ///
+    /// # Errors
+    ///
+    /// The reason code when the stream must end: [`REASON_TOKEN_EXPIRED`] when a hop of the chain
+    /// has expired at `now` or the authorizer reports the token expired, the authorizer's lease
+    /// reason (such as `lease_revoked`) when a lease of the chain is no longer active, the
+    /// authorizer's reason when the re-check could not be made at all (`Unavailable`, a store or
+    /// network fault), and `unauthorized` for any other refusal.
     pub async fn check(&self, now: OffsetDateTime) -> Result<(), String> {
         self.check_detail(now).await.map_err(|f| f.reason)
     }
