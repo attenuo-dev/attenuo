@@ -16,7 +16,7 @@ use time::OffsetDateTime;
 
 /// Generate an Ed25519 key and write it to `path` as a private JWK, mode 0600 on Unix. An
 /// existing file is never overwritten.
-pub fn generate(path: &Path) -> Result<DpopKey> {
+pub(crate) fn generate(path: &Path) -> Result<DpopKey> {
     let key = DpopKey::generate().context("generating a DPoP key")?;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
@@ -39,7 +39,7 @@ pub fn generate(path: &Path) -> Result<DpopKey> {
 }
 
 /// Read a private JWK from `path`.
-pub fn load(path: &Path) -> Result<DpopKey> {
+pub(crate) fn load(path: &Path) -> Result<DpopKey> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading DPoP key {}", path.display()))?;
     let jwk: Value = serde_json::from_str(&text)
@@ -47,12 +47,12 @@ pub fn load(path: &Path) -> Result<DpopKey> {
     DpopKey::from_jwk(&jwk).with_context(|| format!("DPoP key {}", path.display()))
 }
 
-pub fn load_opt(path: Option<&Path>) -> Result<Option<DpopKey>> {
+pub(crate) fn load_opt(path: Option<&Path>) -> Result<Option<DpopKey>> {
     path.map(load).transpose()
 }
 
 /// `cnf.jkt` of a token, read from its payload without verification.
-pub fn token_jkt(token: &str) -> Option<String> {
+pub(crate) fn token_jkt(token: &str) -> Option<String> {
     let payload = token.split('.').nth(1)?;
     let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
     claims["cnf"]["jkt"].as_str().map(str::to_owned)
@@ -69,7 +69,7 @@ pub fn token_jkt(token: &str) -> Option<String> {
 ///   is bound to.
 /// - A bound subject token with another `key` needs a sign-off by its key, naming `key` and
 ///   `actor` (SR-40): made here from `subject_key`, or given.
-pub fn exchange_proofs(
+pub(crate) fn exchange_proofs(
     url: &str,
     subject: &str,
     actor: &str,
@@ -116,7 +116,7 @@ pub fn exchange_proofs(
 /// `attenuo token sign-off`: the parent holder's consent (`subject_token_dpop`) to an
 /// exchange of `subject` at `url` that binds the new token to the key `child_jkt` and gives it
 /// to `actor`, made with the parent's key at `key` (SR-40).
-pub fn sign_off(
+pub(crate) fn sign_off(
     url: &str,
     subject: &str,
     key: &Path,

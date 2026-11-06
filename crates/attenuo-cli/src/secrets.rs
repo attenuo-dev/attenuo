@@ -16,11 +16,11 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 
 /// Environment variable for the admin token.
-pub const ADMIN_TOKEN_ENV: &str = "ATTENUO_ADMIN_TOKEN";
+pub(crate) const ADMIN_TOKEN_ENV: &str = "ATTENUO_ADMIN_TOKEN";
 /// Environment variable for the agent's client secret.
-pub const CLIENT_SECRET_ENV: &str = "ATTENUO_CLIENT_SECRET";
+pub(crate) const CLIENT_SECRET_ENV: &str = "ATTENUO_CLIENT_SECRET";
 /// Environment variable for the delegation token (`--token`, `--subject-token`).
-pub const TOKEN_ENV: &str = "ATTENUO_TOKEN";
+pub(crate) const TOKEN_ENV: &str = "ATTENUO_TOKEN";
 
 /// Secrets that have a flag, and what to use instead.
 const ARGV_SECRETS: &[(&str, &str)] = &[
@@ -46,7 +46,7 @@ const ARGV_SECRETS: &[(&str, &str)] = &[
 /// name) with a literal value, in the order the flags first appear. Only exact `--flag value`
 /// and `--flag=value` forms count, so `--token-file` does not, and the value `-` (read stdin)
 /// is not a secret on the command line.
-pub fn argv_warnings<I>(args: I) -> Vec<String>
+pub(crate) fn argv_warnings<I>(args: I) -> Vec<String>
 where
     I: IntoIterator<Item = OsString>,
 {
@@ -82,14 +82,14 @@ where
 /// Reads stdin at most once per process: two values read from stdin would otherwise race
 /// for it.
 #[derive(Debug, Default)]
-pub struct Stdin {
+pub(crate) struct Stdin {
     used: bool,
 }
 
 impl Stdin {
     /// The first line of `reader`, without the line ending. Errors when stdin was already
     /// taken or the value is empty.
-    pub fn secret(&mut self, what: &str, reader: impl Read) -> Result<String> {
+    pub(crate) fn secret(&mut self, what: &str, reader: impl Read) -> Result<String> {
         self.claim(what)?;
         let mut buf = String::new();
         reader
@@ -100,7 +100,7 @@ impl Stdin {
     }
 
     /// Reserve stdin for `what`, which reads it itself. Errors when it was already taken.
-    pub fn claim(&mut self, what: &str) -> Result<()> {
+    pub(crate) fn claim(&mut self, what: &str) -> Result<()> {
         if self.used {
             bail!("{what}: standard input was already read for another value");
         }
@@ -110,7 +110,7 @@ impl Stdin {
 }
 
 /// The first line of `path`, without the line ending.
-pub fn from_file(what: &str, path: &Path) -> Result<String> {
+pub(crate) fn from_file(what: &str, path: &Path) -> Result<String> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading {what} from {}", path.display()))?;
     clean(what, &text)
@@ -131,7 +131,7 @@ fn from_env(env: &str) -> Option<String> {
 
 /// Pick the secret: stdin, then the file, then the flag, then the environment variable `env`
 /// (clap makes stdin, file and flag mutually exclusive on the command line).
-pub fn resolve(
+pub(crate) fn resolve(
     what: &str,
     literal: Option<String>,
     stdin: bool,
@@ -150,7 +150,7 @@ pub fn resolve(
 
 /// A delegation token from `--token` (or `--subject-token`; `-` reads the first line of
 /// stdin), its `--…-file` form or [`TOKEN_ENV`]. Errors when none of them gives one.
-pub fn resolve_token(
+pub(crate) fn resolve_token(
     flag: &str,
     literal: Option<String>,
     file: Option<&Path>,

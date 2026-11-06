@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::Value;
 
 /// Default server address (matches `config/example.toml`).
-pub const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
+pub(crate) const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 
 /// attenuo: mint, exchange and inspect delegation tokens, call tools through the proxy and
 /// administer a running attenuo server.
@@ -14,7 +14,7 @@ pub const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 /// `--server` of `call` and `tools` names the MCP upstream (for example `github`).
 #[derive(Debug, Parser)]
 #[command(name = "attenuo", version, about, long_about)]
-pub struct Cli {
+pub(crate) struct Cli {
     /// Base URL of the attenuo server.
     #[arg(long, visible_alias = "url", env = "ATTENUO_SERVER", default_value = DEFAULT_SERVER)]
     pub server: String,
@@ -49,7 +49,7 @@ pub struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum Command {
+pub(crate) enum Command {
     /// Mint, exchange and inspect delegation tokens.
     #[command(subcommand)]
     Token(TokenCmd),
@@ -81,7 +81,7 @@ pub enum Command {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum KeyCmd {
+pub(crate) enum KeyCmd {
     /// Generate a key. `--dpop <PATH>` writes a new Ed25519 DPoP key (RFC 9449) as a private
     /// JWK, readable only by you, and prints its thumbprint (the `cnf.jkt` of tokens bound to
     /// it). Use it with `--dpop-key`; the Python and TypeScript SDKs take the same file.
@@ -93,7 +93,7 @@ pub enum KeyCmd {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum TokenCmd {
+pub(crate) enum TokenCmd {
     /// Mint a root (hop 0) token. Development endpoint; needs the admin token.
     Root(RootArgs),
     /// RFC 8693 exchange: delegate a subset of a token's capabilities to a sub-agent.
@@ -109,7 +109,7 @@ pub enum TokenCmd {
 
 /// Which single value of a token response to print (for shell scripting).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum Field {
+pub(crate) enum Field {
     /// The JWT.
     Token,
     /// The lease id.
@@ -117,7 +117,7 @@ pub enum Field {
 }
 
 #[derive(Debug, Args)]
-pub struct RootArgs {
+pub(crate) struct RootArgs {
     /// The user the agent acts for.
     #[arg(long)]
     pub subject: String,
@@ -163,7 +163,7 @@ pub struct RootArgs {
 
 impl RootArgs {
     /// The JSON body for `POST /admin/root-token`.
-    pub fn request_body(&self) -> anyhow::Result<Value> {
+    pub(crate) fn request_body(&self) -> anyhow::Result<Value> {
         let mut body = serde_json::Map::new();
         body.insert("subject".into(), self.subject.clone().into());
         body.insert("issuer".into(), self.issuer.clone().into());
@@ -194,7 +194,7 @@ impl RootArgs {
     /// applies), `Some([])` with `--no-delegation`. `--may-act` values that are all empty are
     /// refused rather than dropped, since sending nothing would fall back to the grant's list,
     /// or to none at all.
-    pub fn may_act_claim(&self) -> anyhow::Result<Option<Vec<String>>> {
+    pub(crate) fn may_act_claim(&self) -> anyhow::Result<Option<Vec<String>>> {
         may_act_claim(&self.may_act, self.no_delegation)
     }
 }
@@ -230,7 +230,7 @@ fn split_agents(values: &[String]) -> Vec<String> {
 }
 
 #[derive(Debug, Args)]
-pub struct ExchangeArgs {
+pub(crate) struct ExchangeArgs {
     /// The parent token, or `-` to read it from the first line of stdin. Without this flag or
     /// `--subject-token-file`, the `ATTENUO_TOKEN` environment variable is used. Prefer those:
     /// an argument is visible to other local users in `ps`.
@@ -313,7 +313,7 @@ pub struct ExchangeArgs {
 impl ExchangeArgs {
     /// The actor token from `--actor-token` (`-` reads `stdin`) or `--actor-token-file`,
     /// trimmed; `None` when neither is given.
-    pub fn actor_token(&self, stdin: impl std::io::Read) -> anyhow::Result<Option<String>> {
+    pub(crate) fn actor_token(&self, stdin: impl std::io::Read) -> anyhow::Result<Option<String>> {
         use anyhow::Context;
         let raw = match (&self.actor_token, &self.actor_token_file) {
             (None, None) => return Ok(None),
@@ -339,13 +339,13 @@ impl ExchangeArgs {
     /// The `may_act` to send: `None` without `--may-act` and `--no-delegation`, `Some([])` with
     /// `--no-delegation`. `--may-act` values that are all empty are refused rather than
     /// dropped, since sending nothing would let any agent exchange the token.
-    pub fn may_act_claim(&self) -> anyhow::Result<Option<Vec<String>>> {
+    pub(crate) fn may_act_claim(&self) -> anyhow::Result<Option<Vec<String>>> {
         may_act_claim(&self.may_act, self.no_delegation)
     }
 }
 
 #[derive(Debug, Args)]
-pub struct SignOffArgs {
+pub(crate) struct SignOffArgs {
     /// The bound token to be exchanged (the parent), or `-` to read it from the first line of
     /// stdin. Without this flag or `--subject-token-file`, `ATTENUO_TOKEN` is used.
     #[arg(long, conflicts_with = "subject_token_file")]
@@ -366,7 +366,7 @@ pub struct SignOffArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct InspectArgs {
+pub(crate) struct InspectArgs {
     /// The JWT, or `-` to read it from stdin.
     pub jwt: String,
     /// Fetch the server's JWKS and verify signature, issuer, audience and chain.
@@ -383,7 +383,7 @@ pub struct InspectArgs {
 /// `--token` / `--token-file`: where the delegation token of `call`, `tools` and
 /// `authzen eval` comes from.
 #[derive(Debug, Args)]
-pub struct TokenSource {
+pub(crate) struct TokenSource {
     /// Delegation token, or `-` to read it from the first line of stdin. Without this flag or
     /// `--token-file`, the `ATTENUO_TOKEN` environment variable is used. Prefer those: an
     /// argument is visible to other local users in `ps`.
@@ -399,7 +399,7 @@ pub struct TokenSource {
 }
 
 #[derive(Debug, Args)]
-pub struct CallArgs {
+pub(crate) struct CallArgs {
     #[command(flatten)]
     pub token: TokenSource,
     /// MCP upstream name, as mounted at `/mcp/<name>`.
@@ -414,7 +414,7 @@ pub struct CallArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct ToolsArgs {
+pub(crate) struct ToolsArgs {
     #[command(flatten)]
     pub token: TokenSource,
     /// MCP upstream name.
@@ -423,7 +423,7 @@ pub struct ToolsArgs {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum LeaseCmd {
+pub(crate) enum LeaseCmd {
     /// Revoke a lease and every lease delegated from it. With `--user`, `--chain-id` or
     /// `--session` instead of an id, revoke every unrevoked lease of that originating user,
     /// delegation chain or MCP session's chain, each with its descendants
@@ -472,7 +472,7 @@ pub enum LeaseCmd {
 /// Run-limit budgets: what a token's `limits` let a run spend (ADR-0010). The figures
 /// themselves are shown by `lease tree`.
 #[derive(Debug, Subcommand)]
-pub enum BudgetCmd {
+pub(crate) enum BudgetCmd {
     /// Give back to every run-limit counter what one allowed decision charged, once, for a
     /// call whose effect did not happen (`POST /admin/budgets/refund`). The refund is audited
     /// as an `admin.budget.refund` record. Exits 2 when there is nothing to refund (an unknown
@@ -501,7 +501,7 @@ fn parse_reason(s: &str) -> Result<String, String> {
 /// use the admin API, so a grant here is recorded with `by = "operator"`; the originating user
 /// grants with an ID token at `POST /approvals/{id}` instead.
 #[derive(Debug, Subcommand)]
-pub enum ApprovalCmd {
+pub(crate) enum ApprovalCmd {
     /// The newest approvals, newest first.
     List {
         /// Only the approvals of this delegation run (its first hop's lease).
@@ -528,7 +528,7 @@ pub enum ApprovalCmd {
 }
 
 #[derive(Debug, Args)]
-pub struct ApprovalVerifyArgs {
+pub(crate) struct ApprovalVerifyArgs {
     /// The approval token, or `-` to read it from stdin.
     pub token: String,
     /// The issuer's JWKS: an `http(s)://` URL or a file. Default:
@@ -556,7 +556,7 @@ pub struct ApprovalVerifyArgs {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum AuditCmd {
+pub(crate) enum AuditCmd {
     /// Show the most recent audit entries, oldest of them first. Filters keep only matching
     /// entries, so `-n 5 --decision deny` is the last five denials.
     Tail {
@@ -684,7 +684,7 @@ impl From<DecisionArg> for attenuo_core::Decision {
 /// Filters of `GET /admin/audit`, all exact matches combined with AND. Checked here as far as
 /// the server would check them, so a typo fails before any request.
 #[derive(Debug, Default, Args)]
-pub struct AuditFilter {
+pub(crate) struct AuditFilter {
     /// Record kind: decision, tool_result, exchange, root_token, lease_renew, lease_revoke or
     /// admin. Repeatable, or comma-separated; any of them matches.
     #[arg(long, value_parser = parse_record_kind, value_delimiter = ',')]
@@ -726,7 +726,7 @@ pub struct AuditFilter {
 
 impl AuditFilter {
     /// The filter as query parameters, each with a leading `&` (empty when there is none).
-    pub fn query(&self) -> String {
+    pub(crate) fn query(&self) -> String {
         use crate::client::query_escape;
         let mut q = String::new();
         if !self.kind.is_empty() {
@@ -770,13 +770,13 @@ fn parse_rfc3339(s: &str) -> Result<String, String> {
 
 /// Output format of `audit export`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum ExportFormat {
+pub(crate) enum ExportFormat {
     Jsonl,
     Json,
 }
 
 #[derive(Debug, Subcommand)]
-pub enum PolicyCmd {
+pub(crate) enum PolicyCmd {
     /// Re-read the policy file on the server.
     Reload,
     /// Show the policy set the server has in force: file, digest, load time and each policy's
@@ -815,7 +815,7 @@ pub enum PolicyCmd {
 
 /// `policy test`: the files and how to run them.
 #[derive(Debug, Args)]
-pub struct TestArgs {
+pub(crate) struct TestArgs {
     /// Test files (format documented in docs/guides/writing-policies.md).
     #[arg(required = true)]
     pub files: Vec<std::path::PathBuf>,
@@ -847,7 +847,7 @@ pub struct TestArgs {
 
 /// Where `policy test` decides the cases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum Via {
+pub(crate) enum Via {
     /// The in-process engine built from the test file (offline).
     Local,
     /// A running server's AuthZEN endpoint.
@@ -858,7 +858,7 @@ pub enum Via {
 
 /// `policy evaluate`: the call, and the chain it is made for (from a token or a file).
 #[derive(Debug, Args)]
-pub struct EvaluateArgs {
+pub(crate) struct EvaluateArgs {
     /// Delegation token whose chain makes the call, or `-` to read it from stdin. An expired
     /// token is accepted (the answer says so). Without this flag, `--token-file` or
     /// `--chain-file`, `ATTENUO_TOKEN` is used.
@@ -883,7 +883,7 @@ pub struct EvaluateArgs {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum AuthzenCmd {
+pub(crate) enum AuthzenCmd {
     /// Ask the PDP whether the token's chain may make this call, without making it.
     Eval {
         /// The delegation token, sent as the bearer.
@@ -904,7 +904,7 @@ pub enum AuthzenCmd {
 /// Turn `--cap` values into capability objects. A value starting with `{` is a full
 /// capability (JSON, may carry constraints and limits); anything else is
 /// `server:tool[,server:tool...]`.
-pub fn parse_caps(raw: &[String]) -> anyhow::Result<Vec<Value>> {
+pub(crate) fn parse_caps(raw: &[String]) -> anyhow::Result<Vec<Value>> {
     let mut out = Vec::new();
     for item in raw {
         let item = item.trim();
@@ -930,7 +930,7 @@ pub fn parse_caps(raw: &[String]) -> anyhow::Result<Vec<Value>> {
 }
 
 /// Parse `key=value` (a string) or `key:=json` (any JSON value).
-pub fn parse_kv(s: &str) -> Result<(String, Value), String> {
+pub(crate) fn parse_kv(s: &str) -> Result<(String, Value), String> {
     let (left, right) = s
         .split_once('=')
         .ok_or_else(|| format!("expected key=value or key:=json, got `{s}`"))?;

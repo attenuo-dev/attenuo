@@ -5,13 +5,13 @@ use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-pub fn fmt_time(t: OffsetDateTime) -> String {
+pub(crate) fn fmt_time(t: OffsetDateTime) -> String {
     let t = t.replace_nanosecond(0).unwrap_or(t);
     t.format(&Rfc3339).unwrap_or_else(|_| t.to_string())
 }
 
 /// "in 14m 30s" or "expired 2m 5s ago".
-pub fn fmt_relative(t: OffsetDateTime, now: OffsetDateTime) -> String {
+pub(crate) fn fmt_relative(t: OffsetDateTime, now: OffsetDateTime) -> String {
     let secs = (t - now).whole_seconds();
     let span = fmt_span(secs.unsigned_abs());
     if secs >= 0 {
@@ -65,7 +65,7 @@ fn fmt_constraint(arg: &str, c: &ArgConstraint) -> String {
 
 /// `github:read_file`, or `github:create_issue {repo starts with "acme/"}`, with run limits
 /// (ADR-0010) after them: `banking:send_money [calls <= 1, sum(amount) <= 10]`.
-pub fn fmt_capability(c: &Capability) -> String {
+pub(crate) fn fmt_capability(c: &Capability) -> String {
     let mut out = format!("{}:{}", c.server, c.tool);
     if !c.constraints.is_empty() {
         let cs: Vec<String> = c
@@ -95,7 +95,7 @@ pub fn fmt_capability(c: &Capability) -> String {
     out
 }
 
-pub fn fmt_capabilities(set: &CapabilitySet) -> String {
+pub(crate) fn fmt_capabilities(set: &CapabilitySet) -> String {
     if set.is_empty() {
         return "(none)".to_string();
     }
@@ -108,7 +108,7 @@ pub fn fmt_capabilities(set: &CapabilitySet) -> String {
 
 /// Draw the chain as a tree: the user at the root, then one level per agent, each with its
 /// capabilities, expiry and lease. The last hop is the agent that holds the token.
-pub fn render_chain_tree(chain: &DelegationChain, now: OffsetDateTime) -> String {
+pub(crate) fn render_chain_tree(chain: &DelegationChain, now: OffsetDateTime) -> String {
     let user = &chain.originating_user;
     let mut out = format!("user {}  (issuer {})\n", user.subject, user.issuer);
     out.push_str(&format!(
@@ -149,7 +149,7 @@ pub fn render_chain_tree(chain: &DelegationChain, now: OffsetDateTime) -> String
 /// The `may_act` line of `token inspect`: who may exchange the token next (RFC 8693 §4.4).
 /// Absent means any authenticated agent may; an empty list, none. Agent ids are printed with
 /// control characters escaped, since they come from the token.
-pub fn fmt_may_act(may_act: Option<&attenuo_token::MayAct>) -> String {
+pub(crate) fn fmt_may_act(may_act: Option<&attenuo_token::MayAct>) -> String {
     match may_act {
         None => "may_act (absent): any authenticated agent may exchange this token".into(),
         Some(m) if m.sub.is_empty() => "may_act []: no agent may exchange this token".into(),
@@ -172,7 +172,7 @@ pub fn fmt_may_act(may_act: Option<&attenuo_token::MayAct>) -> String {
 /// (the key that made the originating-user signature `ou_sig` at the root, which differs after
 /// a key rotation), each only when present and with control characters escaped. `None` when
 /// neither is there.
-pub fn fmt_kids(kid: Option<&str>, ou_kid: Option<&str>) -> Option<String> {
+pub(crate) fn fmt_kids(kid: Option<&str>, ou_kid: Option<&str>) -> Option<String> {
     let parts: Vec<String> = [("kid", kid), ("ou_kid", ou_kid)]
         .into_iter()
         .filter_map(|(name, v)| {
@@ -209,7 +209,7 @@ fn strs(v: &Value) -> Vec<&str> {
 /// `attenuo/token.exchange`). The records that are not decisions but would read like one,
 /// `tool_result`, `approval_request` and `approval_grant`, print their kind in place of
 /// `ALLOW`/`DENY` and the details that matter for that kind.
-pub fn fmt_audit_entry(e: &Value) -> String {
+pub(crate) fn fmt_audit_entry(e: &Value) -> String {
     let r = &e["record"];
     let agents = strs(&r["agents"]);
     // Admin actions have no delegation chain, so no agents.
@@ -307,7 +307,7 @@ fn fmt_lease_state(l: &Value) -> String {
 
 /// `audit show`: the entry line, then the record's details and its context
 /// (`{entry, lease_states, covered_by_checkpoint, policy_reloaded_after}`).
-pub fn render_entry_view(v: &Value) -> String {
+pub(crate) fn render_entry_view(v: &Value) -> String {
     let e = &v["entry"];
     let r = &e["record"];
     let mut out = format!("{}\n", fmt_audit_entry(e));
@@ -356,7 +356,7 @@ pub fn render_entry_view(v: &Value) -> String {
 }
 
 /// `audit checkpoints`: one line per stored checkpoint, newest first, and how to page on.
-pub fn render_checkpoints(v: &Value) -> String {
+pub(crate) fn render_checkpoints(v: &Value) -> String {
     let cps = v["checkpoints"].as_array().cloned().unwrap_or_default();
     if cps.is_empty() {
         return "no checkpoints stored\n".to_string();
@@ -405,7 +405,7 @@ fn num(v: &Value) -> String {
 /// (`<server>/<tool> <kind> [<arg>] <used>/<max> (<remaining> left)`, with the number of
 /// values seen for `calls_per`), then one `usage` line per destructive tool on a run's root
 /// lease. Nothing for a `null` budget.
-pub fn fmt_budget(b: &Value) -> Vec<String> {
+pub(crate) fn fmt_budget(b: &Value) -> Vec<String> {
     let mut out = Vec::new();
     if b.is_null() {
         return out;
@@ -472,7 +472,7 @@ fn tree_budget(out: &mut String, n: &Value, deeper: &str, children: &Children) {
 /// `lease tree`: the ancestors nearest first, then the lease and its descendants drawn as a
 /// tree, then what a revoke would change. Each lease with a `budget` has its limit and usage
 /// lines under it, indented to stay inside its branch.
-pub fn render_lease_tree(v: &Value) -> String {
+pub(crate) fn render_lease_tree(v: &Value) -> String {
     let nodes = v["nodes"].as_array().cloned().unwrap_or_default();
     let mut out = String::new();
     let ancestors = v["ancestors"].as_array().cloned().unwrap_or_default();
@@ -529,7 +529,7 @@ pub fn render_lease_tree(v: &Value) -> String {
 }
 
 /// `budget refund`: what was given back and the audit record that says so.
-pub fn render_refund(v: &Value) -> String {
+pub(crate) fn render_refund(v: &Value) -> String {
     let audit = match v["audit_id"].as_str() {
         Some(id) => id.to_string(),
         None => "- (the refund stands, but its audit record was not written; see the server log)"
@@ -546,7 +546,7 @@ pub fn render_refund(v: &Value) -> String {
 /// `lease revoke --user/--chain-id/--session [--preview]`: the selector (for a session, its
 /// audit tag and the chains it resolved to), the counts, then one line per revoked lease (the
 /// matches first, then the cascade), and the audit record.
-pub fn render_selector_revocation(v: &Value) -> String {
+pub(crate) fn render_selector_revocation(v: &Value) -> String {
     let preview = v["preview"].as_bool().unwrap_or(false);
     let sel = &v["selector"];
     let session = sel["session_tag"].as_str();
@@ -599,7 +599,7 @@ pub fn render_selector_revocation(v: &Value) -> String {
 }
 
 /// `approval list`: one line per approval, newest first.
-pub fn render_approvals(v: &Value) -> String {
+pub(crate) fn render_approvals(v: &Value) -> String {
     let list = v["approvals"].as_array().cloned().unwrap_or_default();
     if list.is_empty() {
         return "no approvals\n".to_string();
@@ -626,7 +626,7 @@ pub fn render_approvals(v: &Value) -> String {
 
 /// `approval show` (and the answer to `grant` / `decline`): the exact call the approval is
 /// for, the run's labels, and its state.
-pub fn render_approval(a: &Value) -> String {
+pub(crate) fn render_approval(a: &Value) -> String {
     let mut out = format!(
         "approval   {}\nstate      {}{}\ncall       {}/{}\narguments  {}\ncall hash  {}\n",
         s(a, "approval_id"),
@@ -683,7 +683,7 @@ pub fn render_approval(a: &Value) -> String {
 }
 
 /// `policy show`: what the server has loaded, then each policy's text.
-pub fn render_policies(v: &Value) -> String {
+pub(crate) fn render_policies(v: &Value) -> String {
     let ids = strs(&v["policy_ids"]);
     let mut out = format!(
         "path       {}\nsha256     {}\nloaded at  {}\npolicies   {}: {}\n",
@@ -708,7 +708,7 @@ pub fn render_policies(v: &Value) -> String {
 
 /// `policy check`: the lint issues as `path:line:col: severity[stage] (id): message`, as
 /// `policy lint` prints them, then whether a reload would succeed.
-pub fn render_policy_check(v: &Value) -> String {
+pub(crate) fn render_policy_check(v: &Value) -> String {
     let path = s(v, "path");
     let mut out = String::new();
     for i in v["issues"].as_array().into_iter().flatten() {
@@ -749,7 +749,7 @@ pub fn render_policy_check(v: &Value) -> String {
 }
 
 /// `policy evaluate`: the decision, its reason and policies, and what the dry run left out.
-pub fn render_evaluation(v: &Value) -> String {
+pub(crate) fn render_evaluation(v: &Value) -> String {
     let mut out = format!("{}  {}\n", s(v, "decision").to_uppercase(), s(v, "reason"));
     let pols = strs(&v["policy_ids"]);
     if !pols.is_empty() {
