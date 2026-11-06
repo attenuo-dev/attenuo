@@ -488,8 +488,8 @@ pub struct Outcome {
     /// `input_type_mismatch`, `policy_allow`, `policy_deny`, `approval_required`, `policy_error`.
     pub reason: String,
     /// Ids of the policies that determined the decision (permits that matched for an allow,
-    /// forbids that matched for a deny, the approval forbids for `approval_required`). Empty
-    /// for a capability denial or a default deny.
+    /// forbids that matched for a deny, the approval forbids for `approval_required`), in
+    /// sorted order. Empty for a capability denial or a default deny.
     pub policy_ids: Vec<String>,
     /// Human-readable details: evaluation errors, translation problems, capability mismatches.
     pub diagnostics: Vec<String>,
@@ -1225,8 +1225,12 @@ impl PolicyEngine {
             &prepared.parts.entities,
         );
         let diagnostics = response.diagnostics();
-        let errors: Vec<String> = diagnostics.errors().map(|e| e.to_string()).collect();
-        let policy_ids: Vec<String> = diagnostics.reason().map(|id| id.to_string()).collect();
+        // Cedar hands both back from hash sets, so two identical calls could list the same
+        // policies in a different order; sorted, the outcome is the same text every time.
+        let mut errors: Vec<String> = diagnostics.errors().map(|e| e.to_string()).collect();
+        let mut policy_ids: Vec<String> = diagnostics.reason().map(|id| id.to_string()).collect();
+        errors.sort_unstable();
+        policy_ids.sort_unstable();
         if !errors.is_empty() {
             // Fail closed: a policy that errored was skipped by Cedar, and a skipped forbid
             // is a silent grant. Do not trust the decision.
