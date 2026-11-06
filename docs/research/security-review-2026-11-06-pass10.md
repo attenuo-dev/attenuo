@@ -20,18 +20,18 @@ Every fix here has a regression test. SR-98's fails on `77cc0a4`; SR-99 corrects
 
 ## Summary
 
-| Severity | Found | Fixed here | Proposed (lead decides) | Accepted |
+| Severity | Found | Fixed (here or later) | Proposed (lead decides) | Accepted |
 |---|---|---|---|---|
 | Critical | 0 | 0 | 0 | 0 |
 | High | 0 | 0 | 0 | 0 |
 | Medium | 0 | 0 | 0 | 0 |
-| Low | 1 | 0 | 1 | 0 |
+| Low | 1 | 1 | 0 | 0 |
 | Info | 4 | 2 | 2 | 0 |
-| **Total** | **5** | **2** | **3** | **0** |
+| **Total** | **5** | **3** | **2** | **0** |
 
 | ID | Severity | Component | Title | Status |
 |---|---|---|---|---|
-| SR-97 | Low | audit (`create_approval`, `rules::counts_as_pending`) | A child hop can fill its run's 32 pending approvals and keep its parent and siblings from getting any; revoking the child does not free them | Proposed |
+| SR-97 | Low | audit (`create_approval`, `rules::counts_as_pending`) | A child hop can fill its run's 32 pending approvals and keep its parent and siblings from getting any; revoking the child does not free them | Fixed later on `fix/sr97-live-pending-approvals` (patch 1 only), test `a_revoked_child_frees_the_runs_pending_places_sr97` |
 | SR-98 | Info | server (`sink.rs` delivery loop, `Settle::refill`) | A backlog batch filled the whole notice queue, so new notices pushed backlog rows out without one attempt, and `/readyz` read full while it drained | Fixed, test `notices_queued_while_a_backlog_batch_drains_drop_none_of_it_sr98` |
 | SR-99 | Info | server (`authz/pipeline.rs` `arg_probes`), docs | The doc said arguments past `MAX_ARG_PROBES` are "only checked for having a fingerprint"; they are fingerprinted in full | Fixed (docs), test `arguments_past_the_bound_are_named_only_when_they_have_a_fingerprint_sr99` |
 | SR-100 | Info | core (`limits.rs` `Derive::Host`) | IDNA deviation characters (`ß`, `ς`): the counted host is the non-transitional one, Python's stdlib connects to the transitional one | Proposed |
@@ -39,13 +39,14 @@ Every fix here has a regression test. SR-98's fails on `77cc0a4`; SR-99 corrects
 
 ## Findings
 
-### SR-97: a child hop can fill its run's pending approvals (Low, proposed)
+### SR-97: a child hop can fill its run's pending approvals (Low, fixed later)
 
 - **Component.** `attenuo-audit` `approval.rs` `rules::counts_as_pending` and `below_pending_cap`; `sqlite/approvals.rs` `pending_of_run`; `lease.rs` `MemoryLeaseStore::create_approval`.
 - **Observation.** SR-92's cap counts every pending, unexpired approval whose `chain_id` is the run, whichever hop asked and whether that hop's lease is still live. Revoking a lease does not touch its approvals (no store method changes approvals on revocation), and an approval of a revoked hop can never be consumed, so it is dead weight until `expires_at`: `[approvals] ttl_seconds` (default 120, no upper bound) or the hop's lease expiry, whichever is first.
 - **Measured.** Scratch test against both stores: hops `l1` (root), `l2`, `l3` (child of `l2`); `l3` creates 32 approvals with distinct call hashes, `l3` is revoked, then `l2` asks for an approval one second later. Both stores answer `TooManyPendingApprovals { chain_id: "l1", max: 32 }`; `l2` gets one only once `l3`'s approvals have expired.
 - **Exploit path.** Attacker (a), a narrow child token whose capabilities include one tool its policy gates (for example `confirm_destructive_with_untrusted_args` on a tainted run), sends 32 gated calls with distinct arguments, and repeats every `ttl_seconds`. Every other hop of the run, the parent that delegated to it included, has every gated call answered `-32008` with no `approval_id` (`too many pending approvals for this run`), so no person can approve the parent's real work. The operator's answer to a misbehaving child, revoking it, does not end this for up to `ttl_seconds`; declining the 32 approvals one by one does. Low: availability of approvals within one run, to a hop that is part of that run; nothing is allowed that would not be, and the denials are recorded.
-- **Proposed patch** (behaviour changes, so not applied):
+- **Fixed later** on `fix/sr97-live-pending-approvals`: patch 1 below, as proposed, in both stores; patch 2 was not taken. Test `a_revoked_child_frees_the_runs_pending_places_sr97` (attenuo-audit, both stores): the child's 32 approvals refuse the parent while the child is live, the parent gets one at once after the revocation, and the cap then holds over the live hops. It fails before the fix.
+- **Proposed patch** (behaviour changes, so not applied in this pass):
   1. Count only approvals whose lease is live. SQLite: `SELECT a.expires_at FROM approvals a JOIN leases l ON l.id = a.lease WHERE a.chain_id = ?1 AND a.state = 'pending' AND l.revoked_at IS NULL` (the lease rows of a revoked subtree are all marked, so the join covers descendants); memory store: the same filter with the `rows` map, taken in the same lock order `create_approval` already uses. A revoked child then frees its places at once. Test: the scratch test above, with the parent's approval created after the revocation.
   2. Optionally, give the calling hop's path a share: count against the cap only the approvals of the calling lease, its ancestors and its descendants, and keep a run-wide ceiling of, say, `4 * 32` so that minting siblings cannot bring back SR-92. A child then cannot fill the places its parent counts, and the notice queue stays bounded per run. A design choice for the lead.
 
