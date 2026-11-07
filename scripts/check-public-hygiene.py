@@ -41,7 +41,7 @@ PLACEHOLDER_PENDING = {"CODE_OF_CONDUCT.md"}
 PLACEHOLDER_MENTION_OK = re.compile(r"^(docs/log/|docs/research/|docs/launch-checklist\.md$)")
 
 NEVER_TRACKED = re.compile(r"^docs/guide/flight-guide-")
-PRIVATE_PAGES = ("project/research-readiness-plan.md",)
+PRIVATE_PAGES = ("project/research-readiness-plan.md", "brief/attenuo-one-page.md")
 ADR_STATUSES = {"proposed", "accepted", "rejected", "deprecated", "superseded"}
 
 TEXT_SUFFIXES = {

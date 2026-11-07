@@ -148,7 +148,7 @@ Maintainers only. Versions follow [SemVer 2.0](https://semver.org/). Pre-1.0, a 
 
 ## AI-assisted contributions
 
-AI coding tools are welcome; most of this repository was written with them (see [How this project is built](README.md#how-this-project-is-built)). The rules are the same as for any change: you are responsible for every line you submit, you must understand it well enough to answer review questions about it, and it must pass the same tests and review. Say in the pull request description which parts a tool wrote. Do not paste output you have not read, and do not submit code a tool generated from sources whose licence you cannot check. A `Co-Authored-By:` trailer for the tool is welcome.
+AI coding tools are welcome; most of this repository was written with them (see [How this project is built](README.md#how-this-project-is-built)). The rules are the same as for any change: you are responsible for every line you submit, you must understand it well enough to answer review questions about it, and it must pass the same tests and review. Say in the pull request description which parts a tool wrote. Do not paste output you have not read, and do not submit code a tool generated from sources whose licence you cannot check. A `Co-Authored-By:` trailer for the tool is welcome; links to private tool sessions (such as `Claude-Session:` URLs) do not belong in commit messages.
 
 ## Licence
 
