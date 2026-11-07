@@ -39,12 +39,16 @@ docs:
 links:
     python3 scripts/check-links.py
 
+# nothing private, stale or machine-specific in the tracked tree
+hygiene:
+    python3 scripts/check-public-hygiene.py
+
 # cargo-deny (cargo install cargo-deny)
 deny:
     cargo deny check
 
 # everything CI runs that can run locally
-ci: fmt clippy test demo policy docs links deny
+ci: fmt clippy test demo policy docs links hygiene deny
 
 # print a random admin token
 admin-token:

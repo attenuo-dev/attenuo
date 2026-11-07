@@ -1,7 +1,7 @@
 # For run.py and test_suite.py. The attenuo SDK itself is imported from sdk/python/src,
 # so its runtime dependencies are listed here too (rfc8785 for call hashes).
 # Pinned to exact versions for reproducibility: the versions scripts/reproduce.sh was
-# checked with against results/2026-11-05-final-main.md. Change a pin only together with a
+# checked with against results/2026-11-05-type-check-stage.md. Change a pin only together with a
 # reproduce run that still prints REPRODUCED.
 httpx==0.28.1
 pyyaml==6.0.3

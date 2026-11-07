@@ -23,13 +23,13 @@ You now have three binaries in `target/debug/`: `attenuo-server`, `attenuo` (the
 
 ## 2. Make a working directory, a key and an admin token
 
-Set `OB` to your checkout, then make a scratch directory.
+Set `REPO` to your checkout, then make a scratch directory.
 
 ```sh
-export OB=$PWD
+export REPO=$PWD
 mkdir -p ~/attenuo-try/data
 cd ~/attenuo-try
-cp $OB/config/policies/default.cedar policy.cedar
+cp $REPO/config/policies/default.cedar policy.cedar
 
 openssl genpkey -algorithm ed25519 -out data/issuer.pem
 chmod 600 data/issuer.pem
@@ -110,13 +110,13 @@ The config has more keys than this. `config/example.toml` in the repository is t
 In one terminal:
 
 ```sh
-$OB/target/debug/examples/fake_mcp --port 3001
+$REPO/target/debug/examples/fake_mcp --port 3001
 ```
 
-In a second terminal, from `~/attenuo-try` (set `OB` again there):
+In a second terminal, from `~/attenuo-try` (set `REPO` again there):
 
 ```sh
-$OB/target/debug/attenuo-server --config attenuo.toml
+$REPO/target/debug/attenuo-server --config attenuo.toml
 ```
 
 `ATTENUO_CONFIG=attenuo.toml` works in place of `--config`. The server logs the issuer public key and the policy ids it loaded, then listens on `127.0.0.1:8080`. It also warns that the development root mint is on. That is expected here. Set `RUST_LOG=debug` for more output.
@@ -142,7 +142,7 @@ The rest of this guide uses the `attenuo` CLI as the client. It is a thin HTTP c
 
 ```sh
 export ATTENUO_SERVER=http://127.0.0.1:8080
-alias attenuo=$OB/target/debug/attenuo
+alias attenuo=$REPO/target/debug/attenuo
 ```
 
 The CLI reads `ATTENUO_ADMIN_TOKEN` from step 2.

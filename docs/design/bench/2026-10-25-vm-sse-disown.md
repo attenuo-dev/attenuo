@@ -21,7 +21,7 @@ Events (no event contains a `-`):
 | `large_result` | 85,099 | 200 | the same with 200 objects (the `large_result` event of the listen-stream note) |
 
 ```
-export CARGO_TARGET_DIR=/home/claude/agent-target-ssecost CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}" CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0
 cargo test --release -p attenuo-proxy --locked --test listen_stream_cost -- --ignored --nocapture --test-threads 1 disown
 ```
 
