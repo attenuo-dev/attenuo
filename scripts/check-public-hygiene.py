@@ -31,8 +31,8 @@ OLD_NAME_OK = re.compile(
 )
 OLD_NAME = re.compile(r"onbehalf", re.IGNORECASE)
 
-ABSOLUTE_PATH = re.compile(r"/home/claude\b|/Users/[a-z][a-z0-9_-]*/|/mnt/project-files\b")
-PERSONAL = re.compile(r"muditk441|onbehalf-private|Mudit's|\bMudit (asked|said|chose|wants)", re.IGNORECASE)
+ABSOLUTE_PATH = re.compile(r"/home/claude\b|/tmp/claude|/root/\.|/Users/[A-Za-z][A-Za-z0-9_.-]*/|/mnt/project-files\b")
+PERSONAL = re.compile(r"muditk441|onbehalf-private|Mudit[’']s|\bMudit (asked|said|chose|wants)", re.IGNORECASE)
 
 PLACEHOLDER = re.compile(r"[a-z]+@<domain>")
 # Placeholders the maintainer still has to fill in; each needs a real address first.
@@ -46,7 +46,7 @@ ADR_STATUSES = {"proposed", "accepted", "rejected", "deprecated", "superseded"}
 
 TEXT_SUFFIXES = {
     ".md", ".toml", ".yml", ".yaml", ".py", ".sh", ".rs", ".ts", ".js", ".json",
-    ".html", ".css", ".txt", ".cedar", "",
+    ".html", ".css", ".txt", ".cedar", ".cjs", ".mjs", ".svg", ".cast", ".ini", ".cfg", "",
 }
 
 
