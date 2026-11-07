@@ -1,6 +1,6 @@
 # Codebase walkthrough
 
-A reading-and-running plan for someone who wants to understand every piece of attenuo himself. It has five parts:
+A reading-and-running plan for anyone who wants to understand every piece of attenuo themselves. It has five parts:
 
 1. [A one-page mental model](#1-the-mental-model): the path of one proxied tool call and one token exchange, by file and function.
 2. [Fifteen reading sessions](#2-reading-sessions) of 45 to 60 minutes, each with files in order, a document to read beside them, three to six questions and a block of commands that shows the concept working.

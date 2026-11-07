@@ -30,7 +30,7 @@ Rows, each one whole 200-tool list:
 | `concrete_eval` | for comparison: 200 concrete evaluations of prepared calls, `policy_stage`'s `evaluate` row 200 times |
 
 ```
-export CARGO_TARGET_DIR=/home/claude/agent-target-list CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}" CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0
 cargo bench -p attenuo-policy --bench list_screen -- --warm-up-time 1 --measurement-time 3
 ```
 

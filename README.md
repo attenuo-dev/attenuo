@@ -2,7 +2,6 @@
 
 # attenuo
 
-[![CI](https://github.com/attenuo-dev/attenuo/actions/workflows/ci.yml/badge.svg)](https://github.com/attenuo-dev/attenuo/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![MSRV: 1.89](https://img.shields.io/badge/MSRV-1.89-blue.svg)](Cargo.toml)
 [![Status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-orange.svg)](docs/spec/rfc-0001-attenuo.md)
@@ -85,14 +84,15 @@ All of these come from a shared 4-core development container, not a reference ma
 - **Injection suite.** The development split has 63 synthetic cases with 77 attack calls and 130 benign calls. With attenuo's tokens, suite policies and leases, 15 of the 77 attack calls got through, and 3 benign calls were refused by static suite policies. With output labelling added (a destructive call after an untrusted read needs an approval), 1 attack call got through without an approval, a read, at the price of 71 approval requests. Adding a uniform `calls: 1` limit to labelling also leaves 1, and the limit refuses 10 more benign calls in tasks that legitimately repeat a tool. With the run limit each task states written into its grant and no labelling, 7 attack calls got through and 4 benign calls were refused (1 of them by a limit), with no approval asked; those figures were written after reading the cases. On the 26 held-out test cases written after the policies were frozen (38 attack and 29 benign calls), the base configuration let 7 attack calls through and refused 3 benign calls, and labelling left 1 attack call, a read. Caveats: the call sequences are hand-written and no model is in the loop. The cases, the policies and the limits were written by the same author, and the approver is a script that knows which calls are attacks. So this checks the corpus against the code and does not measure effectiveness. See [injection-suite.md](docs/evaluation/injection-suite.md) and [run limits, section 7](docs/design/run-limits.md#7-measured).
 - **Latency added.** Through the real proxy with one client, attenuo added about 0.4 to 0.8 ms at the median (425 to 771 microseconds, one to three hops, in-memory or file-backed audit). Load was closed-loop and each cell is good to roughly plus or minus 20 percent. See [performance.md](docs/design/performance.md#after-the-policy-stage-and-wal-work). A `sum` limit adds about 0.8 to 1.0 ms at the median, because its charge is synced to disk ([run limits on the hot path](docs/design/performance.md#output-labelling-and-run-limits-on-the-hot-path-2026-10-24)). Measured on 2026-10-25, after security pass 5, a `calls` limit adds about 210 to 270 microseconds at the median ([bench note](docs/design/bench/2026-10-25-vm-per-value-limits.md)), a `calls_per` limit about 0.2 to 0.3 ms, `distinct` about 0.4 ms for a new value, and `distinct` on a list argument about 50 microseconds per new value per hop, about 35 ms at the 256-value cap ([per-value limits](docs/design/performance.md#per-value-limits-on-current-main-2026-10-25)).
 - **Policy stage.** A Cedar decision takes about 12 to 13 microseconds when the per-chain request cache hits and 122 to 163 microseconds when it does not (one and three hops, [criterion output](docs/design/bench/2026-10-23-vm-criterion-policy_stage.txt)). The cache keys on chain and tool, so the first call of a chain pays the uncached cost. See [performance.md](docs/design/performance.md#after-the-policy-stage-and-wal-work).
+- **AgentDojo.** Replaying each attack's tool calls with no model, 592 of 609 attacks landed without attenuo and 15 with grants derived from each task's known solution (an upper bound on what grants can do, not a realistic setting). With real models, no attack succeeded: four models (Haiku, Sonnet, Opus, Fable) on one sample without attenuo, and Haiku and Sonnet with attenuo on the workspace half. Those runs with attenuo therefore measure only its cost to task completion. See [the report](docs/report/attenuo-2026-11.md), section 5.2.
 - **Throughput.** With a file-backed audit log at `durability = "normal"` and one hop, the benchmark measured 1,252, 4,049 and 6,254 allowed calls per second at 1, 8 and 32 clients. That setting can lose the newest audit records on a power failure (up to five seconds or 256 commits). See [the run](docs/design/bench/2026-10-23-vm-policy-stage.md). Open-loop load was measured only for the allow call at one hop and for token exchange; repeated runs with confidence intervals and a quiet machine are listed in [performance.md](docs/design/performance.md#not-measured) as not measured.
 
 ## Status
 
 attenuo is pre-alpha and has not been used in production. Release 0.1.0 is prepared but not tagged; its draft notes, upgrade notes and known limitations are in [docs/release/0.1.0.md](docs/release/0.1.0.md).
 
-- **Security review.** Five review passes have been done in this repository, written up in [pass 1](docs/research/security-review-2026-10-22.md), [pass 3](docs/research/security-review-2026-10-23.md), [pass 4](docs/research/security-review-2026-10-23-pass4.md) and [pass 5](docs/research/security-review-2026-10-24-pass5.md). Pass 2 was the fix round for pass 1. Passes 1, 3, 4 and 5 recorded 26, 13, 15 and 14 findings, 68 in all. None was Critical, and only pass 1 found any High (5). Pass 4 found 1 Medium, fixed; pass 5 found none above Low. As of 2026-10-24 every finding is fixed or accepted with its reasoning in the report (two Info findings in pass 4, SR-52 and SR-54, and four in pass 5). Pass 5 covered run limits, approvals and output labelling; its main fixes were a per-run lock so concurrent calls cannot bypass a usage cap (SR-55) and refusing ambiguous URL hosts (SR-56). The project did all five passes itself; there has been no outside audit.
-- **Tests and fuzzing.** On `main` at 23e027b (2026-11-06, after 194 merged pull requests), 1313 Rust tests passed with 7 ignored (`cargo test --workspace --locked`), 404 Python SDK tests (none skipped, integration tests included) and 259 TypeScript SDK tests (2 skipped: the examples need `npm install`). The last full `scripts/release-check.sh` run, on the 0.1.0 preparation branch (merged as d7f3889), also passed the injection suite's 47 checks (12 skipped without built binaries); see the [2026-10-24 log](docs/log/2026-10-24.md). There are [19 fuzz targets](docs/design/fuzzing.md) (tokens, DPoP, chains, capability attenuation, the proxy, SSE, audit export, since round 2 run-limit charges, budget plans, approval tokens, the usage walker and the server's HTTP routes, and since round 3 the proxy's SSE framing and data parsing). The [second campaign](docs/design/fuzzing.md#second-campaign-10-minutes-per-target-2026-10-23-evening) ran the first twelve for 10 minutes each, about 282 million inputs in all, with no crash. Those campaigns found five bugs (three in token and proxy handling, two in audit verification), and [round 2](docs/research/fuzzing-2026-10-24-round2.md#findings) found four more (FZ2-1 to FZ2-4, low or info), all fixed. [Round 3](docs/research/fuzz-round-3-2026-10-25.md) (300 s per target over the pass 7 SSE parsing) found none.
+- **Security review.** Ten review passes have been done in this repository, between 2026-10-22 and 2026-11-06: [pass 1](docs/research/security-review-2026-10-22.md), [3](docs/research/security-review-2026-10-23.md), [4](docs/research/security-review-2026-10-23-pass4.md), [5](docs/research/security-review-2026-10-24-pass5.md), [6](docs/research/security-review-2026-10-25-pass6.md), [7](docs/research/security-review-2026-10-25-pass7.md), [8](docs/research/security-review-2026-11-05-pass8.md), [9](docs/research/security-review-2026-11-06-pass9.md) and [10](docs/research/security-review-2026-11-06-pass10.md). Pass 2 was the fix round for pass 1. Together they recorded 101 findings, SR-01 to SR-101: none Critical, 5 High (all in pass 1), 19 Medium, 46 Low and 31 Info. Every finding is fixed or accepted with its reasoning in its report, except three Info findings still open: SR-83 (release toolchain pinning), SR-100 and SR-101. The project did all ten passes itself; there has been no outside audit.
+- **Tests and fuzzing.** On `main` at 9d715e8 (2026-11-06, #217), 1313 Rust tests passed with 7 ignored (`cargo test --workspace --locked`), 404 Python SDK tests (none skipped, integration tests included) and 259 TypeScript SDK tests (2 skipped: the examples need `npm install`). The last full `scripts/release-check.sh` run, on the 0.1.0 preparation branch (merged as d7f3889), also passed the injection suite's 47 checks (12 skipped without built binaries); see the [2026-10-24 log](docs/log/2026-10-24.md). There are [19 fuzz targets](docs/design/fuzzing.md) (tokens, DPoP, chains, capability attenuation, the proxy, SSE, audit export, since round 2 run-limit charges, budget plans, approval tokens, the usage walker and the server's HTTP routes, and since round 3 the proxy's SSE framing and data parsing). The [second campaign](docs/design/fuzzing.md#second-campaign-10-minutes-per-target-2026-10-23-evening) ran the first twelve for 10 minutes each, about 282 million inputs in all, with no crash. Those campaigns found five bugs (three in token and proxy handling, two in audit verification), and [round 2](docs/research/fuzzing-2026-10-24-round2.md#findings) found four more (FZ2-1 to FZ2-4, low or info), all fixed. [Round 3](docs/research/fuzz-round-3-2026-10-25.md) (300 s per target over the pass 7 SSE parsing) found none.
 - **Not tested.** Every identity-provider recipe (Keycloak, Auth0, Okta, Entra ID, Google, ID-JAG) is untested against a real provider; the server's tests use assertions it signs itself. The Docker setup is untested. There has been no production use and no load test on reference hardware.
 
 ## Where to look
@@ -170,12 +170,12 @@ capabilities = ["github:*"]
 An ID token is accepted only from the agent whose `client_ids` entry its `aud` names (an agent without an entry must have a client id equal to its agent id). The agent exchanges the user's ID token for a root delegation token (RFC 8693), authenticating with its own client credentials. The token's originating user comes from the verified ID token: `sub`, `iss`, `auth_time`, the configured `attribute_claims`, and an `mfa` flag derived from `amr`.
 
 ```sh
-OB=http://127.0.0.1:8080
+SRV=http://127.0.0.1:8080
 ADMIN=$ATTENUO_ADMIN_TOKEN   # see below
 ID_TOKEN=...   # from your IdP's login flow
 
 # 1. Exchange the user's ID token for a root token held by "planner".
-ROOT=$(curl -s -X POST $OB/token -u planner:planner-secret-change-me \
+ROOT=$(curl -s -X POST $SRV/token -u planner:planner-secret-change-me \
   --data-urlencode grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
   --data-urlencode subject_token=$ID_TOKEN \
   --data-urlencode subject_token_type=urn:ietf:params:oauth:token-type:id_token \
@@ -190,7 +190,7 @@ For an ID-JAG, send `subject_token_type=urn:ietf:params:oauth:token-type:id-jag`
 ```sh
 # 2. RFC 8693 exchange: planner delegates read_file only to a "coder" sub-agent. The coder
 #    authenticates as itself ([[agents]]); only it can receive a token in its name.
-CHILD_TOKEN=$(curl -s -X POST $OB/token -u coder:coder-secret-change-me \
+CHILD_TOKEN=$(curl -s -X POST $SRV/token -u coder:coder-secret-change-me \
   --data-urlencode grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
   --data-urlencode subject_token=$ROOT_TOKEN \
   --data-urlencode subject_token_type=urn:ietf:params:oauth:token-type:jwt \
@@ -198,7 +198,7 @@ CHILD_TOKEN=$(curl -s -X POST $OB/token -u coder:coder-secret-change-me \
   --data-urlencode scope=github:read_file | jq -r .access_token)
 
 # 3. Call through the proxy: read_file is allowed (forwarded upstream).
-mcp() { curl -s -X POST $OB/mcp/github -H "Authorization: Bearer $CHILD_TOKEN" \
+mcp() { curl -s -X POST $SRV/mcp/github -H "Authorization: Bearer $CHILD_TOKEN" \
   -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d "$1"; }
 mcp '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"repo":"acme/api"}}}'
 
@@ -207,7 +207,7 @@ mcp '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_issu
 # {"jsonrpc":"2.0","id":2,"error":{"code":-32003,"message":"attenuo: denied: capability_denied",...}}
 
 # 5. Revoke the ROOT lease; the revocation cascades to the coder's lease.
-curl -s -X POST $OB/admin/leases/$ROOT_LEASE/revoke -H "Authorization: Bearer $ADMIN" \
+curl -s -X POST $SRV/admin/leases/$ROOT_LEASE/revoke -H "Authorization: Bearer $ADMIN" \
   -H 'content-type: application/json' -d '{"reason":"demo"}'
 # {"lease_id":"...","revoked":2,"reason":"demo","audit_id":"..."}
 
@@ -216,8 +216,8 @@ mcp '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file",
 # ... "message":"attenuo: denied: lease_revoked" ...
 
 # Every decision and issuance is in the hash-chained audit log.
-curl -s $OB/admin/audit/verify -H "Authorization: Bearer $ADMIN"   # {"entries":5,"ok":true,"first_bad_seq":null,"checkpoints":...,...}
-curl -s "$OB/admin/audit?from=1&limit=20" -H "Authorization: Bearer $ADMIN" | jq '.entries[].record | {decision,reason,tool,agents}'
+curl -s $SRV/admin/audit/verify -H "Authorization: Bearer $ADMIN"   # {"entries":5,"ok":true,"first_bad_seq":null,"checkpoints":...,...}
+curl -s "$SRV/admin/audit?from=1&limit=20" -H "Authorization: Bearer $ADMIN" | jq '.entries[].record | {decision,reason,tool,agents}'
 ```
 
 ### Development only: a root token without an IdP
@@ -225,7 +225,7 @@ curl -s "$OB/admin/audit?from=1&limit=20" -H "Authorization: Bearer $ADMIN" | jq
 To try the flow without an identity provider, set `[dev] allow_root_mint = true`. This mounts `POST /admin/root-token`, which mints a root token for whichever user the admin names. Nothing about that user is verified, so the server logs a warning at startup. With the setting off (the default) the route does not exist and answers 404. Use it in place of step 1:
 
 ```sh
-ROOT=$(curl -s -X POST $OB/admin/root-token -H "Authorization: Bearer $ADMIN" \
+ROOT=$(curl -s -X POST $SRV/admin/root-token -H "Authorization: Bearer $ADMIN" \
   -H 'content-type: application/json' \
   -d '{"subject":"alice","issuer":"https://idp.example","agent":"planner","capabilities":["github:*"]}')
 ROOT_TOKEN=$(echo "$ROOT" | jq -r .access_token); ROOT_LEASE=$(echo "$ROOT" | jq -r .lease)
@@ -303,6 +303,10 @@ try {
 ```
 
 It is pre-alpha like the rest and is not published to npm.
+
+## How this project is built
+
+attenuo is written by one maintainer working with AI coding agents (Claude Code), and the git history shows it: most commits carry a `Co-Authored-By` trailer for the model that wrote them. Every change went through a branch, local tests and review before it was merged, and the maintainer decides what the project does. Some parts of the evaluation were also written by AI agents, including the injection-suite cases, their policies and the scripted approver; the [technical report](docs/report/attenuo-2026-11.md) treats that as a threat to validity. The security review passes in `docs/research/` were done the same way, which is one more reason they are not a substitute for an outside audit. Rules for AI-assisted contributions are in [CONTRIBUTING](CONTRIBUTING.md#ai-assisted-contributions).
 
 ## License
 

@@ -29,7 +29,7 @@ Other places to look:
 ## Conventions in these guides
 
 - Commands are meant to be run as written. Where one has not been run, the guide says **untested**.
-- `$OB` is your checkout of the repository. `$ATTENUO_ADMIN_TOKEN` is the admin bearer.
+- `$REPO` is your checkout of the repository. `$ATTENUO_ADMIN_TOKEN` is the admin bearer.
 - A guide never uses the example admin token or agent secret from `config/example.toml` for anything real.
 
 If a command in a guide does not work as written, that is a bug in the guide. Please open an issue.
