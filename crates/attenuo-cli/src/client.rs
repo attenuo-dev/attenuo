@@ -141,6 +141,24 @@ impl Client {
         json_reply(reply)
     }
 
+    /// `GET` an unauthenticated path within `timeout` and hand back the status and body as
+    /// they came, whatever the status (`attenuo health`).
+    pub(crate) async fn probe(
+        &self,
+        path: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(StatusCode, String)> {
+        let resp = self
+            .http
+            .get(self.url(path))
+            .timeout(timeout)
+            .send()
+            .await
+            .with_context(|| format!("could not reach the server at {}", self.base))?;
+        let status = resp.status();
+        Ok((status, resp.text().await?))
+    }
+
     pub(crate) async fn get(&self, path: &str) -> Result<Value> {
         self.send_json(self.http.get(self.url(path))).await
     }

@@ -164,6 +164,22 @@ pub(crate) enum Command {
     /// Generate keys.
     #[command(subcommand)]
     Key(KeyCmd),
+    /// Check that the server is up (`GET /healthz`), or ready with `--ready` (`GET /readyz`).
+    /// Exits 0 when it is and 1 when it is not or cannot be reached, never 2, so it can be a
+    /// container `HEALTHCHECK` (Docker reserves exit status 2 there). Needs no token.
+    Health(HealthArgs),
+}
+
+/// `attenuo health`.
+#[derive(Debug, Args)]
+pub(crate) struct HealthArgs {
+    /// Ask `/readyz` (audit log and lease store answer, last audit append succeeded) instead of
+    /// `/healthz` (the process answers HTTP).
+    #[arg(long)]
+    pub ready: bool,
+    /// Give up after this many seconds, connect and answer together.
+    #[arg(long, value_name = "SECS", default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=300))]
+    pub timeout: u64,
 }
 
 #[derive(Debug, Subcommand)]
