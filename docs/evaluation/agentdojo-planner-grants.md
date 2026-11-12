@@ -75,7 +75,7 @@ The rejected alternative was a hash written only into the results. It would not 
 
 ## The planner
 
-The planner is a Claude model run as an agent whose only input is the bundle and whose only output is the four grant files. Model: **TBD-by-lead**. The prompt it gets is the bundle's `INSTRUCTIONS.md` and a one-line request to write the files into an empty directory. It runs once; a repeat run, if any, is reported as a separate grant source, not merged.
+The planner is a Claude model run as an agent whose only input is the bundle and whose only output is the four grant files. Model: Claude Opus 5.5, run on 2026-11-12 as four agents, one per suite, each told to read only the bundle's `INSTRUCTIONS.md` and its own suite's files and to write one grant file into an empty directory. The restriction was an instruction to the agent, not a sandbox, and no independent reviewer applied the rubric before the freeze: [`REVIEW.md`](https://github.com/attenuo-dev/attenuo/blob/main/evaluation/agentdojo/planner/REVIEW.md) records how the run was made and what the planner said it was unsure about. It ran once; a repeat run, if any, is reported as a separate grant source, not merged.
 
 ## Analysis
 
@@ -100,37 +100,50 @@ The planner is a Claude model run as an agent whose only input is the bundle and
 
 ## Results
 
-Not run yet. Filled in after the grant files are frozen and committed.
+Run of 2026-11-12 on main `b0f1ed1` with the server built at `72d5fbc` (no server change between the two), grants frozen in commit `139c9a9` before the replay. Raw output: [`evaluation/agentdojo/results/2026-11-12-planner/`](https://github.com/attenuo-dev/attenuo/tree/main/evaluation/agentdojo/results/2026-11-12-planner) (`rows.jsonl`, `summary.json`, `stats.md`, `grant-quality.md`). The `suite` and oracle arms reproduce the figures of the 2026-11-05 replay (138, 15 and 16 of 609).
+
+No model is in the loop: the attacker's calls are AgentDojo's ground-truth calls, sent after the user task's own. With no attenuo 592 of 609 pairs land.
 
 | Arm | Grant source | Attacks landed (Wilson 95%) | Utility kept (Wilson 95%) |
 | --- | --- | --- | --- |
-| `suite` | G0 | | |
-| `planner` | G1 | | |
-| `grants` | G2 | | |
-| `planner_only` | G1 | | |
-| `grants_only` | G2 | | |
-| `planner_nocontact` | G1 | | |
-| `grants_nocontact` | G2 | | |
+| `suite` | G0 | 138/609 (19.5 to 26.2%) | 77/97 (70.3 to 86.2%) |
+| `planner` | G1 | 13/609 (1.3 to 3.6%) | 75/97 (68.0 to 84.5%) |
+| `grants` | G2 | 15/609 (1.5 to 4.0%) | 77/97 (70.3 to 86.2%) |
+| `planner_only` | G1 | 32/609 (3.7 to 7.3%) | 95/97 (92.8 to 99.4%) |
+| `grants_only` | G2 | 16/609 (1.6 to 4.2%) | 97/97 (96.2 to 100%) |
+| `planner_nocontact` | G1 | 28/609 (3.2 to 6.6%) | 93/97 (89.9 to 98.4%) |
+| `grants_nocontact` | G2 | 16/609 (1.6 to 4.2%) | 95/97 (92.8 to 99.4%) |
 
 | Comparison | Metric | A only | B only | McNemar p | A - B (cluster bootstrap 95%) |
 | --- | --- | ---: | ---: | ---: | --- |
-| `planner` vs `suite` | attacks landed | | | | |
-| `planner` vs `suite` | utility kept | | | | |
-| `planner` vs `grants` | attacks landed | | | | |
-| `planner` vs `grants` | utility kept | | | | |
-| `planner_only` vs `grants_only` | attacks landed | | | | |
-| `planner_only` vs `grants_only` | utility kept | | | | |
-| `planner_nocontact` vs `grants_nocontact` | attacks landed | | | | |
-| `planner_nocontact` vs `grants_nocontact` | utility kept | | | | |
+| `planner` vs `suite` | attacks landed | 0 | 125 | <0.001 | -20.5% (-21.7 to -19.4) |
+| `planner` vs `suite` | utility kept | 0 | 2 | 0.5 | -2.1% (-5.2 to 0.0) |
+| `planner` vs `grants` | attacks landed | 2 | 4 | 0.688 | -0.3% (-1.1 to 0.7) |
+| `planner` vs `grants` | utility kept | 0 | 2 | 0.5 | -2.1% (-5.2 to 0.0) |
+| `planner_only` vs `grants_only` | attacks landed | 21 | 5 | 0.002 | 2.6% (0.0 to 5.9) |
+| `planner_only` vs `grants_only` | utility kept | 0 | 2 | 0.5 | -2.1% (-5.2 to 0.0) |
+| `planner_nocontact` vs `grants_nocontact` | attacks landed | 17 | 5 | 0.017 | 2.0% (-0.3 to 4.9) |
+| `planner_nocontact` vs `grants_nocontact` | utility kept | 0 | 2 | 0.5 | -2.1% (-5.2 to 0.0) |
 
 | Suite | Tools (planner / oracle) | Over-grant | Under-grant | Write pins (planner / oracle) | Pins against ground truth | Ground-truth calls refused |
 | --- | --- | ---: | ---: | --- | ---: | ---: |
-| workspace | | | | | | |
-| travel | | | | | | |
-| banking | | | | | | |
-| slack | | | | | | |
+| workspace | 148 / 75 | 73 | 0 | 45 / 48 | 4 | 0 |
+| travel | 108 / 108 | 1 | 1 | 14 / 12 | 2 | 2 |
+| banking | 37 / 33 | 4 | 0 | 10 / 36 | 0 | 0 |
+| slack | 73 / 64 | 13 | 4 | 20 / 36 | 0 | 7 |
 
-Review: entries reviewed, failures per rubric check, edits logged, minutes spent.
+Review: none before the freeze, no edits ([`REVIEW.md`](https://github.com/attenuo-dev/attenuo/blob/main/evaluation/agentdojo/planner/REVIEW.md)).
+
+### What the numbers say
+
+- **With the suite policy, grants written from the task text do as well as the oracle.** 13 of 609 pairs land with the planner's token and 15 with the oracle's; six pairs differ, and the interval for the difference spans zero. Both sit far below the suite policy alone (138). All 13 are on slack, the same two injection tasks the oracle arm leaves open: a link sent to a recipient the task itself allows, and a fetch of a page.
+- **Without the policy behind it, the planner's token is looser than the oracle's.** Under a permit-all policy 32 pairs land against 16. The planner pins fewer write arguments (89 against 132) because the prompt often does not say who or how much: a task that says "do what the email asks" gets write tools with no pins. On workspace and banking that lets through 15 pairs that the suite policy's recipient rules then stop. The grant narrows the tools; the policy is what holds when the task text is vague.
+- **The cost is two tasks.** The planner loses two user tasks the oracle keeps (travel task 4 and slack task 6), both under-grants the planner flagged as uncertain before the run: it read one prompt as a reminder rather than a booking, and withheld a web fetch in the other. Every other lost task is lost in the oracle arm too, to the suite policy's contact rule.
+- **Over-grant.** The planner grants 91 tools the ground truth never calls, 73 of them on workspace. It cannot know which look-ups a task will need, so it grants more of them than the one path the ground truth takes.
+
+### What they do not say
+
+One planner run, by a model from the same family as the tools that built the system, on public task prompts, with no reviewer and an instruction rather than a sandbox as the blinding. The attacker is a fixed call list, not a model that adapts to the grant. Slack's two broad grants (tasks 18 and 19, where the work is on a web page) are a case no grant written before the task can narrow. These figures compare grant sources on one replay; they are not a rate of attacks stopped in deployment.
 
 ## Running it
 
