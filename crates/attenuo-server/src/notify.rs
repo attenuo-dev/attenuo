@@ -17,10 +17,15 @@
 //! Restarts: on start the rows still open (queued, or in flight, when the last process
 //! stopped) are delivered again, oldest first, with their attempts so far. The delivery thread
 //! reads them from the outbox a batch of at most half of `queue_capacity` at a time, whenever
-//! the queue runs empty (the other half is room for notices that arrive meanwhile, SR-98), so a backlog longer than the queue is delivered whole instead of being
-//! dropped for lack of room (SR-93); a notice stored meanwhile is queued as usual and may go
-//! out between two batches. And every approval still pending in the store is watched again,
-//! so one that expired while the server was down gets its `approval.expired` at once. The notice id (`event_id`) is derived from the
+//! the queue runs empty (the other half is room, SR-98), so a backlog longer than the queue is
+//! delivered whole instead of being dropped for lack of room (SR-93). Until it has caught up,
+//! a notice stored meanwhile is not queued: it waits in the outbox and is read there behind
+//! every row stored before it, so the notices of one approval go out in the order they were
+//! stored (`approval.pending` before its `approval.expired` or `approval.decided`) across a
+//! restart too. Once a read of the outbox finds nothing left, notices are queued as they are
+//! stored again. And every approval still pending in the store is watched again,
+//! so one that expired while the server was down gets its `approval.expired` at once, behind
+//! its `approval.pending` if that was still in the outbox. The notice id (`event_id`) is derived from the
 //! approval id and the type ([`event_id_for`]) and is unique in the table, so finding such an
 //! expiry a second time queues nothing. Rows delivered or given up are deleted
 //! `outbox_retention_seconds` later by the watcher; an approval that expired longer ago than
@@ -39,6 +44,7 @@
 //! ([`signature`]).
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -182,46 +188,65 @@ impl QueueItem for Notice {
 /// write that fails is logged and leaves the row open, so it is delivered again after the
 /// next restart (the receiver deduplicates by `event_id`).
 ///
-/// It also hands the delivery thread the rows a restart left open (`Backlog`), a batch at a
-/// time whenever the queue runs empty, so that none is dropped for lack of room (SR-93).
+/// It also hands the delivery thread the rows a restart left open, and those stored while it
+/// works through them (`Backlog`), a batch at a time whenever the queue runs empty, so that
+/// none is dropped for lack of room (SR-93) and they go out in the order they were stored.
 #[derive(Debug)]
 pub struct OutboxSettle {
     store: Arc<SqliteLeaseStore>,
     metrics: Arc<Metrics>,
-    backlog: Mutex<Backlog>,
+    backlog: Arc<Backlog>,
     clock: Arc<dyn Clock>,
 }
 
-/// The outbox rows open at start not yet handed to the queue: those with a row id in
-/// `(after, through]`. `through` is the newest row open at start; a notice stored since has a
-/// higher id and was queued when it was stored, so reading stops there and nothing is
-/// delivered twice. Empty once `after >= through`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// The outbox rows not yet handed to the queue after a restart: the open ones with a row id
+/// above `after`, the last row handed. While `draining`, [`Emitter::emit`] stores a new notice
+/// without queuing it, so the delivery thread reads it from the outbox behind every row stored
+/// before it; the first read that finds no row (or fails) clears `draining`, and from then on
+/// notices are queued when stored and the outbox is not read again. `draining` changes only
+/// with `after` locked, and `emit` decides with it locked too, so a notice is either read from
+/// the outbox or queued, never both and never neither.
+///
+/// A notice stored during the drain gets a row id above `after`: SQLite gives a new row an id
+/// above every id in the table, and the row `after` names is the last of the batch being
+/// delivered, which stays open (so unpruned) until that batch is through; the next read
+/// follows as soon as the queue runs empty.
+#[derive(Debug, Default)]
 struct Backlog {
-    after: i64,
-    through: i64,
+    after: Mutex<i64>,
+    draining: AtomicBool,
+}
+
+impl Backlog {
+    fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, i64> {
+        self.after.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 impl OutboxSettle {
     /// The next open rows of the backlog, oldest first, at most `room`. A row of a type this
-    /// version does not know is skipped. A read that fails ends the backlog, logged: the rows
-    /// left stay open for the next restart.
+    /// version does not know is skipped. A read that finds nothing ends the backlog; one that
+    /// fails ends it too, logged, and the rows left stay open for the next restart.
     fn next_backlog(&self, room: usize) -> Vec<Notice> {
-        let mut b = self.backlog.lock().unwrap_or_else(|e| e.into_inner());
-        while b.after < b.through && room > 0 {
-            let rows = match self.store.outbox_open_between(b.after, b.through, room) {
+        let mut after = self.backlog.lock();
+        while self.backlog.is_draining() && room > 0 {
+            let rows = match self.store.outbox_open_between(*after, i64::MAX, room) {
                 Ok(rows) => rows,
                 Err(e) => {
                     tracing::error!(error = %e, "[approvals.notify] could not read the outbox: notices stored before the restart and not yet queued are left until the next one");
-                    b.after = b.through;
+                    self.backlog.draining.store(false, Ordering::Release);
                     break;
                 }
             };
             let Some(last) = rows.last() else {
-                b.after = b.through;
+                self.backlog.draining.store(false, Ordering::Release);
                 break;
             };
-            b.after = last.id;
+            *after = last.id;
             let notices: Vec<Notice> = rows
                 .into_iter()
                 .filter_map(|row| {
@@ -272,17 +297,45 @@ impl Settle<Notice> for OutboxSettle {
     }
 }
 
-/// Stores a notice in the outbox, then queues it. Shared by the handle and the watcher.
+/// Stores a notice in the outbox, then queues it (or, while a restart's backlog drains, leaves
+/// it to be read from the outbox in its turn, [`Backlog`]). Shared by the handle and the
+/// watcher.
 #[derive(Debug, Clone)]
 struct Emitter {
     queue: QueueHandle<Notice>,
     store: Arc<SqliteLeaseStore>,
     metrics: Arc<Metrics>,
     clock: Arc<dyn Clock>,
+    backlog: Arc<Backlog>,
 }
 
 impl Emitter {
     fn emit(&self, mut n: Notice) {
+        if self.backlog.is_draining() {
+            let after = self.backlog.lock();
+            // Looked at again with the backlog locked: the drain may have ended meanwhile.
+            if self.backlog.is_draining() {
+                if !self.store(&mut n) {
+                    return;
+                }
+                if n.row.is_some() {
+                    // Stored: the delivery thread reads it behind the rows before it.
+                    return;
+                }
+                // Not stored, so the backlog cannot read it: queued now, in memory only.
+                drop(after);
+                self.queue.push(n);
+                return;
+            }
+        }
+        if self.store(&mut n) {
+            self.queue.push(n);
+        }
+    }
+
+    /// Store `n` in the outbox and set its row. `false` when it was stored before (an expiry
+    /// found again after a restart: queued then, or done), so there is nothing to queue.
+    fn store(&self, n: &mut Notice) -> bool {
         let new = NewNotice {
             event_id: &n.event_id,
             kind: n.kind.as_str(),
@@ -295,7 +348,7 @@ impl Emitter {
                 self.metrics.approval_notify_outbox_opened();
             }
             // Stored before (an expiry found again after a restart): queued then, or done.
-            Ok(None) => return,
+            Ok(None) => return false,
             Err(e) => tracing::warn!(
                 notice = %n.log_id(),
                 error = %e,
@@ -303,7 +356,7 @@ impl Emitter {
                  only, so a restart before it is delivered loses it"
             ),
         }
-        self.queue.push(n);
+        true
     }
 }
 
@@ -733,10 +786,11 @@ impl ApprovalNotifier {
         store: Arc<SqliteLeaseStore>,
         clock: Arc<dyn Clock>,
     ) -> anyhow::Result<Self> {
+        let backlog = Arc::new(backlog_at_start(&store));
         let settle = OutboxSettle {
             store: store.clone(),
             metrics: metrics.clone(),
-            backlog: Mutex::new(backlog_at_start(&store)),
+            backlog: backlog.clone(),
             clock: clock.clone(),
         };
         let queue = Queue::start_with(
@@ -751,6 +805,7 @@ impl ApprovalNotifier {
             store,
             metrics,
             clock: clock.clone(),
+            backlog,
         };
         let watch = Arc::new(Watch::new(clock));
         recover(&emit, &watch, outbox_retention);
@@ -794,6 +849,12 @@ impl ApprovalNotifier {
     pub fn clock_advanced(&self) {
         self.watch.poke();
     }
+
+    /// Whether the delivery thread is still reading a restart's backlog from the outbox.
+    #[cfg(test)]
+    fn draining(&self) -> bool {
+        self.emit.backlog.is_draining()
+    }
 }
 
 impl Drop for ApprovalNotifier {
@@ -802,19 +863,21 @@ impl Drop for ApprovalNotifier {
     }
 }
 
-/// The outbox rows open at start, for [`OutboxSettle`] to hand to the queue a batch at a
-/// time (SR-93). Read before the queue starts, so before any new notice is stored. A read that
-/// fails is logged and leaves the backlog empty: those rows wait for the next restart.
+/// Whether a restart left outbox rows open, for [`OutboxSettle`] to hand to the queue a batch
+/// at a time (SR-93), with new notices waiting behind them ([`Backlog`]). Read before the
+/// queue starts, so before any new notice is stored. A read that fails is logged and leaves
+/// the backlog empty: those rows wait for the next restart.
 fn backlog_at_start(store: &SqliteLeaseStore) -> Backlog {
-    match store.outbox_last_open_id() {
-        Ok(last) => Backlog {
-            after: 0,
-            through: last.unwrap_or(0),
-        },
+    let draining = match store.outbox_last_open_id() {
+        Ok(last) => last.is_some(),
         Err(e) => {
             tracing::error!(error = %e, "[approvals.notify] could not read the outbox: notices stored before the restart are not delivered now");
-            Backlog::default()
+            false
         }
+    };
+    Backlog {
+        after: Mutex::new(0),
+        draining: AtomicBool::new(draining),
     }
 }
 
@@ -1259,10 +1322,12 @@ mod tests {
         );
     }
 
-    /// SR-93: a notice stored while the backlog drains is queued directly and delivered once:
-    /// the backlog stops at the last row open at start, so the delivery thread never reads a
-    /// later row from the outbox, not even one whose notice is stored but not queued yet (an
-    /// `emit` between its insert and its push, stood in for here by a bare insert).
+    /// SR-93: a notice stored while the backlog drains is delivered once, read from the outbox
+    /// behind the rows stored before it, and so is a row stored there by any other path then
+    /// (a bare insert here). Once the delivery thread has caught up, a notice is queued when it
+    /// is stored and the outbox is not read again: a row that is stored but never queued (an
+    /// `emit` cut off between its insert and its push, stood in for by a bare insert) stays
+    /// open for the next restart instead of being delivered twice.
     #[test]
     fn a_notice_stored_while_the_backlog_drains_is_delivered_once_sr93() {
         let (store, events) = store_with_open_rows(10);
@@ -1273,47 +1338,101 @@ mod tests {
         let (n, metrics) = start(&store, &recorder, 4);
         // The first backlog row is in flight, the other one of its batch is queued.
         started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(n.draining());
         let mut fresh = approval(ApprovalState::Pending);
         fresh.id = "33333333-3333-4333-8333-333333333333".into();
         fresh.expires_at = OffsetDateTime::now_utc() + time::Duration::hours(1);
         n.handle().pending(&fresh);
+        // Stored, not queued: only the rest of the first batch is in the queue.
+        assert_eq!(n.status().queued, 1);
         let fresh_event = event_id_for(NoticeKind::Pending, &fresh.id);
-        let mid_emit = event_id_for(NoticeKind::Expired, &fresh.id);
-        store
-            .outbox_insert(
-                NewNotice {
-                    event_id: &mid_emit,
-                    kind: "approval.expired",
-                    approval_id: &fresh.id,
-                    body: b"{}",
-                },
-                OffsetDateTime::now_utc(),
-            )
-            .unwrap()
-            .unwrap();
+        let insert = |event: &str, kind: &str| {
+            store
+                .outbox_insert(
+                    NewNotice {
+                        event_id: event,
+                        kind,
+                        approval_id: &fresh.id,
+                        body: b"{}",
+                    },
+                    OffsetDateTime::now_utc(),
+                )
+                .unwrap()
+                .unwrap()
+        };
+        let mid_drain = event_id_for(NoticeKind::Expired, &fresh.id);
+        insert(&mid_drain, "approval.expired");
         release_tx.send(()).unwrap();
-        wait_until(|| recorder.got.lock().unwrap().len() > events.len());
+        wait_until(|| !n.draining());
+        // Caught up: queued as stored, and a bare insert is not read any more.
+        let mut later = approval(ApprovalState::Pending);
+        later.id = "55555555-5555-4555-8555-555555555555".into();
+        later.expires_at = OffsetDateTime::now_utc() + time::Duration::hours(1);
+        n.handle().pending(&later);
+        let later_event = event_id_for(NoticeKind::Pending, &later.id);
+        let never_pushed = event_id_for(NoticeKind::Decided, &fresh.id);
+        insert(&never_pushed, "approval.decided");
+        wait_until(|| recorder.got.lock().unwrap().len() > events.len() + 2);
         // Shutting down delivers anything still queued, so a second copy would show here.
         n.shutdown(Duration::from_secs(5));
         let got = recorder.got.lock().unwrap().clone();
-        // The first batch (half the queue, SR-98), the fresh notice queued behind it, then the
-        // rest of the backlog.
-        let mut want = events[..2].to_vec();
-        want.push(fresh_event);
-        want.extend_from_slice(&events[2..]);
+        // The backlog in the order it was stored, the two notices stored during the drain
+        // behind it, then the one queued once the drain was over.
+        let mut want = events.clone();
+        want.extend([fresh_event, mid_drain, later_event]);
         assert_eq!(got, want);
-        // Only the row whose push is still to come is open: the backlog did not take it.
-        assert!(store.outbox_open_id(&mid_emit).unwrap().is_some());
+        // Only the row whose push never came is open: the outbox was not read again.
+        assert!(store.outbox_open_id(&never_pushed).unwrap().is_some());
         assert_eq!(store.outbox_open_count().unwrap(), 1);
         assert!(metrics
             .render()
             .contains("attenuo_approval_notify_dropped_total 0\n"));
     }
 
-    /// SR-98: a backlog batch leaves room in the queue. Notices that arrive while a batch is
-    /// delivered are queued behind it, and none of the batch is pushed out by them: with the
-    /// batch as large as the queue, the second new notice dropped a backlog row (given up
-    /// without one attempt), and the queue read as full on `/readyz` for the whole backlog.
+    /// The notices of one approval go out in the order they were stored across a restart: an
+    /// `approval.expired` (or `approval.decided`) stored while that approval's
+    /// `approval.pending` is still unread in the outbox goes out after it, not before. Before
+    /// the fix the new notice was queued at once and could overtake the backlog, which a
+    /// receiver saw as an expiry of an approval it had never heard of.
+    #[test]
+    fn a_notice_stored_during_the_drain_never_overtakes_its_approvals_pending_one() {
+        let (store, events) = store_with_open_rows(10);
+        let recorder = Arc::new(Recorder::default());
+        let (started, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release) = std::sync::mpsc::channel();
+        *recorder.hold.lock().unwrap() = Some((started, release));
+        let (n, metrics) = start(&store, &recorder, 4);
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        // Rows 1 and 2 are in the first batch; row 6's approval is still unread. It expires,
+        // and another is decided.
+        let mut expired = approval(ApprovalState::Pending);
+        expired.id = "00000000-0000-4000-8000-000000000006".into();
+        let mut decided = approval(ApprovalState::Granted);
+        decided.id = "00000000-0000-4000-8000-000000000008".into();
+        n.emit.emit(Notice::new(NoticeKind::Expired, &expired));
+        n.handle().decided(&decided);
+        release_tx.send(()).unwrap();
+        wait_until(|| recorder.got.lock().unwrap().len() >= events.len() + 2);
+        n.shutdown(Duration::from_secs(5));
+        let got = recorder.got.lock().unwrap().clone();
+        let mut want = events.clone();
+        want.push(event_id_for(NoticeKind::Expired, &expired.id));
+        want.push(event_id_for(NoticeKind::Decided, &decided.id));
+        assert_eq!(got, want);
+        let pos = |e: &str| got.iter().position(|g| g == e).unwrap();
+        assert!(pos(&events[6]) < pos(&want[events.len()]));
+        assert!(pos(&events[8]) < pos(&want[events.len() + 1]));
+        assert_eq!(store.outbox_open_count().unwrap(), 0);
+        assert!(metrics
+            .render()
+            .contains("attenuo_approval_notify_dropped_total 0\n"));
+    }
+
+    /// SR-98: a backlog batch leaves room in the queue, and nothing that arrives while it is
+    /// delivered pushes any of it out: with the batch as large as the queue, the second new
+    /// notice dropped a backlog row (given up without one attempt), and the queue read as full
+    /// on `/readyz` for the whole backlog. New notices now wait in the outbox behind the
+    /// backlog, so they take no room in the queue while it drains.
     #[test]
     fn notices_queued_while_a_backlog_batch_drains_drop_none_of_it_sr98() {
         let (store, events) = store_with_open_rows(10);
@@ -1335,15 +1454,16 @@ mod tests {
             n.handle().pending(&fresh);
             fresh_events.push(event_id_for(NoticeKind::Pending, &fresh.id));
         }
+        let st = n.status();
+        assert!(st.queued < st.capacity, "{st:?}");
         release_tx.send(()).unwrap();
         // Every row is closed once it is delivered, or given up when a full queue drops it.
         wait_until(|| store.outbox_open_count().unwrap() == 0);
         n.shutdown(Duration::from_secs(5));
         let got = recorder.got.lock().unwrap().clone();
-        // The first batch (half the queue), the new notices queued behind it, then the rest.
-        let mut want = events[..2].to_vec();
+        // The backlog, then the new notices, in the order they were stored.
+        let mut want = events.clone();
         want.extend(fresh_events);
-        want.extend_from_slice(&events[2..]);
         assert_eq!(got, want);
         assert_eq!(store.outbox_open_count().unwrap(), 0);
         assert!(metrics
