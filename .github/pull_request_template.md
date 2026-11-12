@@ -1,3 +1,5 @@
+<!-- This description and the CHANGELOG entry are the lasting record of the change: say what changed and why. -->
+
 ## What
 
 ## Why

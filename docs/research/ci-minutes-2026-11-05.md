@@ -85,7 +85,7 @@ That is a quarter to a third off, not 20 times. At about 20 billed Linux minutes
 
 The repository has no branch protection yet (writing settings is refused in this environment). When it is switched on, mark only `ci-ok` as a required status check, not the individual jobs.
 
-The rule behind that: a job skipped by its `if:` reports the status "skipped", and branch protection counts a skipped required check as passed. So if the individual jobs were required and the `changes` job failed, every Rust job would be skipped and the pull request would look green. A whole workflow skipped by `paths` or `paths-ignore` is worse the other way: it reports nothing, and a required check from it stays pending forever. `ci-ok` runs on every pull request (`if: always()`), needs every per-change job, and fails if any of them failed or was cancelled, while treating a skip on purpose as a pass. The macOS job is not in its `needs`, so it is never a required check. The [launch checklist](../launch-checklist.md) says the same.
+The rule behind that: a job skipped by its `if:` reports the status "skipped", and branch protection counts a skipped required check as passed. So if the individual jobs were required and the `changes` job failed, every Rust job would be skipped and the pull request would look green. A whole workflow skipped by `paths` or `paths-ignore` is worse the other way: it reports nothing, and a required check from it stays pending forever. `ci-ok` runs on every pull request (`if: always()`), needs every per-change job, and fails if any of them failed or was cancelled, while treating a skip on purpose as a pass. The macOS job is not in its `needs`, so it is never a required check.
 
 ## Not validated
 
