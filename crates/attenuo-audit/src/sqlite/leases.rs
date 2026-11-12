@@ -80,6 +80,21 @@ pub struct SqliteLeaseStore {
     /// Tests: every charge commit and the `synchronous` level it ran at.
     #[cfg(test)]
     pub(super) probe: Option<Arc<Mutex<Vec<String>>>>,
+    /// Tests: run once by `take_approval` after its read, with no lock held.
+    #[cfg(any(test, feature = "testing"))]
+    after_approval_read: AfterRead,
+}
+
+/// A test hook run between `take_approval`'s read and its write transaction.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Default)]
+struct AfterRead(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+#[cfg(any(test, feature = "testing"))]
+impl std::fmt::Debug for AfterRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AfterRead")
+    }
 }
 
 impl SqliteLeaseStore {
@@ -170,6 +185,8 @@ impl SqliteLeaseStore {
             schema,
             #[cfg(test)]
             probe: None,
+            #[cfg(any(test, feature = "testing"))]
+            after_approval_read: AfterRead::default(),
         })
     }
 
@@ -1375,6 +1392,28 @@ impl LeaseStore for SqliteLeaseStore {
         decision_id: &str,
         now: OffsetDateTime,
     ) -> Result<Option<Approval>, AuditError> {
+        // Read first, without the write gate or a write transaction (A-4): almost every call
+        // has no granted approval, and then there is nothing to consume. The read can only
+        // answer "nothing to consume": a row it finds is taken, or not, by the write
+        // transaction below, which reads the lease and the row again under the write lock. A
+        // grant committed after this read is left for the next call, as if it had landed
+        // after this one.
+        {
+            let conn = self.conn.lock()?;
+            let any = approvals_for_call(&conn, chain_id, call_hash, ApprovalState::Granted)?
+                .iter()
+                .any(|a| rules::usable(a, chain_id, lease, call_hash, now));
+            if !any {
+                #[cfg(any(test, feature = "testing"))]
+                {
+                    drop(conn);
+                    self.run_after_approval_read()?;
+                }
+                return Ok(None);
+            }
+        }
+        #[cfg(any(test, feature = "testing"))]
+        self.run_after_approval_read()?;
         let _gate = self.gate.hold();
         let mut conn = self.conn.lock()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1600,6 +1639,25 @@ impl SqliteLeaseStore {
         self.gate.turns()
     }
 
+    /// Run `f` once, in the next [`take_approval`](LeaseStore::take_approval), between its
+    /// read and its write transaction (whether or not the read found a usable approval),
+    /// with no lock of this store held. For tests.
+    #[doc(hidden)]
+    pub fn after_next_approval_read(&self, f: impl FnOnce() + Send + 'static) {
+        *self
+            .after_approval_read
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(f));
+    }
+
+    fn run_after_approval_read(&self) -> Result<(), AuditError> {
+        let hook = self.after_approval_read.0.lock()?.take();
+        if let Some(f) = hook {
+            f();
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

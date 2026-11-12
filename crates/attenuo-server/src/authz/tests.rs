@@ -287,3 +287,31 @@ fn verified_token_cache_stays_bounded() {
     assert_eq!(chains.len(), 1);
     assert!(chains.contains_key(&VerifiedTokens::key("c")));
 }
+
+/// An allowed call with no approval token and no granted approval writes once, its audit
+/// append: the approval lookup reads without the write lock (audit finding A-4).
+#[test]
+fn an_allowed_call_without_an_approval_writes_only_its_record() {
+    use attenuo_audit::{Durability, SqliteAudit, SqliteLeaseStore};
+    let (_, _, _, chain) = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.db");
+    let leases = Arc::new(SqliteLeaseStore::open_with(&path, Durability::Normal).unwrap());
+    let audit = Arc::new(SqliteAudit::open_with(&path, Durability::Normal).unwrap());
+    let now = OffsetDateTime::now_utc();
+    leases
+        .register(&LeaseId::new("l1"), None, now + Duration::hours(1))
+        .unwrap();
+    let engine = PolicyEngineBuilder::new()
+        .with_policies_str("permit(principal, action, resource);")
+        .with_unknown_tools(attenuo_policy::UnknownTools::Allow)
+        .build()
+        .unwrap();
+    let p = Pipeline::new(Arc::new(SharedPolicy::new(engine)), leases.clone(), audit);
+    let call = ToolCall::new("github", "read_file", json!({}));
+    for _ in 0..5 {
+        let before = leases.write_turns();
+        assert!(p.decide(&chain, &call, now).is_allow());
+        assert_eq!(leases.write_turns() - before, 1, "the audit append alone");
+    }
+}
