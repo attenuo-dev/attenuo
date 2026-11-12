@@ -2,7 +2,8 @@
 
 Both classes expose the same methods; the async one has ``await`` in front. They mirror what the
 ``attenuo`` CLI does over HTTP: ``POST /token``, ``POST /token/renew``, ``POST /mcp/{server}``,
-``POST /access/v1/evaluation`` and ``GET /approvals/{id}``.
+``POST /access/v1/evaluation`` (and ``/evaluations``), ``GET`` and ``POST /approvals/{id}`` and
+``DELETE /mcp/{server}``.
 """
 
 from __future__ import annotations
@@ -325,6 +326,14 @@ class Client:
         result, _, _ = self._rpc(token, server, "tools/list", {}, session_id)
         return w.tools_from_result(result)
 
+    def close_session(self, token: Token | str | None, server: str, session_id: str) -> bool:
+        """End an MCP session (``DELETE /mcp/{server}`` with its ``Mcp-Session-Id``). ``True``
+        when the upstream closed it, ``False`` when the upstream does not let clients close
+        sessions (405). The proxy's refusals raise what a call would (an unknown session is an
+        :class:`~attenuo.RpcError` with code ``-32600``)."""
+        path, headers = _session_request(self._auth, token, self.token, server, session_id)
+        return w.session_closed(self._request("DELETE", path, headers))
+
     # -- approvals --
     def get_approval(self, approval_id: str, token: Token | str | None = None) -> w.Approval:
         """``GET /approvals/{id}`` with a delegation token of the same run (or the user's ID
@@ -390,6 +399,28 @@ class Client:
             token, server, tool, arguments, session_id, approval_token=granted.approval_token
         )
 
+    def grant_approval(self, approval_id: str, id_token: str) -> w.Approval:
+        """Grant a pending approval as the run's originating user (``POST /approvals/{id}``,
+        ``by = "user"``); returns it. ``id_token`` is that user's OIDC ID token, sent as a
+        plain bearer: a delegation token is refused (403 ``agent_token_refused``), another
+        user's is 403 ``wrong_user``, and an ID token decides once (400 ``invalid_grant``
+        after). 409 (``approval_not_pending``, ``approval_expired``, ``lease_revoked``) when
+        it cannot be decided any more, 404 when it is unknown; all :class:`~attenuo.ApiError`
+        (:class:`~attenuo.Unauthorized` for a 401)."""
+        return self._decide(approval_id, id_token, "grant")
+
+    def decline_approval(self, approval_id: str, id_token: str) -> w.Approval:
+        """Decline a pending approval as the run's originating user; errors as
+        :meth:`grant_approval`."""
+        return self._decide(approval_id, id_token, "decline")
+
+    def _decide(self, approval_id: str, id_token: str, decision: str) -> w.Approval:
+        path = f"/approvals/{w.path_segment(approval_id, 'approval_id')}"
+        resp = self._http.post(
+            path, headers=w.id_token_headers(id_token), json=w.approval_decision_body(decision)
+        )
+        return w.approval_from_json(w.json_body(resp))
+
     # -- AuthZEN --
     def authzen_evaluate(
         self,
@@ -405,6 +436,33 @@ class Client:
             json=w.authzen_body(server, tool, arguments),
         )
         return w.authzen_from_response(w.json_body(resp))
+
+    def authzen_evaluate_batch(
+        self,
+        token: Token | str | None,
+        evaluations: Iterable[w.AuthzenEvaluationLike],
+        *,
+        semantic: str | None = None,
+    ) -> list[w.AuthzenDecision]:
+        """Decide several calls in one request (``POST /access/v1/evaluations``), each decided,
+        charged and audited like :meth:`authzen_evaluate`. Returns one decision per call, in
+        order; denies are returned, not raised.
+
+        ``semantic`` is AuthZEN's ``evaluations_semantic``: ``execute_all`` (the server's
+        default), ``deny_on_first_deny`` or ``permit_on_first_permit``. A batch stopped by it
+        answers only the calls it decided, so the list can be shorter than ``evaluations``. A
+        call the server could not decide is a deny whose ``error`` says why. More calls than
+        ``[authzen] max_batch`` is an :class:`~attenuo.ApiError` (400 ``batch_too_large``)."""
+        body = w.authzen_batch_body(evaluations, semantic)
+        path = "/access/v1/evaluations"
+        resp = self._post(path, self._auth(w.bearer(token, self.token), path), json=body)
+        return w.authzen_batch_from_response(w.json_body(resp))
+
+    def authzen_configuration(self) -> w.AuthzenConfiguration:
+        """``GET /.well-known/authzen-configuration``: the AuthZEN discovery document. No
+        credential is sent."""
+        resp = self._http.get("/.well-known/authzen-configuration")
+        return w.authzen_configuration_from_json(w.json_body(resp))
 
     # -- inspection --
     def jwks(self) -> dict[str, Any]:
@@ -667,6 +725,10 @@ class AsyncClient:
         result, _, _ = await self._rpc(token, server, "tools/list", {}, session_id)
         return w.tools_from_result(result)
 
+    async def close_session(self, token: Token | str | None, server: str, session_id: str) -> bool:
+        path, headers = _session_request(self._auth, token, self.token, server, session_id)
+        return w.session_closed(await self._request("DELETE", path, headers))
+
     async def get_approval(self, approval_id: str, token: Token | str | None = None) -> w.Approval:
         path = f"/approvals/{w.path_segment(approval_id, 'approval_id')}"
         resp = await self._request(
@@ -721,6 +783,19 @@ class AsyncClient:
             token, server, tool, arguments, session_id, approval_token=granted.approval_token
         )
 
+    async def grant_approval(self, approval_id: str, id_token: str) -> w.Approval:
+        return await self._decide(approval_id, id_token, "grant")
+
+    async def decline_approval(self, approval_id: str, id_token: str) -> w.Approval:
+        return await self._decide(approval_id, id_token, "decline")
+
+    async def _decide(self, approval_id: str, id_token: str, decision: str) -> w.Approval:
+        path = f"/approvals/{w.path_segment(approval_id, 'approval_id')}"
+        resp = await self._http.post(
+            path, headers=w.id_token_headers(id_token), json=w.approval_decision_body(decision)
+        )
+        return w.approval_from_json(w.json_body(resp))
+
     async def authzen_evaluate(
         self,
         token: Token | str | None,
@@ -734,6 +809,22 @@ class AsyncClient:
             json=w.authzen_body(server, tool, arguments),
         )
         return w.authzen_from_response(w.json_body(resp))
+
+    async def authzen_evaluate_batch(
+        self,
+        token: Token | str | None,
+        evaluations: Iterable[w.AuthzenEvaluationLike],
+        *,
+        semantic: str | None = None,
+    ) -> list[w.AuthzenDecision]:
+        body = w.authzen_batch_body(evaluations, semantic)
+        path = "/access/v1/evaluations"
+        resp = await self._post(path, self._auth(w.bearer(token, self.token), path), json=body)
+        return w.authzen_batch_from_response(w.json_body(resp))
+
+    async def authzen_configuration(self) -> w.AuthzenConfiguration:
+        resp = await self._http.get("/.well-known/authzen-configuration")
+        return w.authzen_configuration_from_json(w.json_body(resp))
 
     async def jwks(self) -> dict[str, Any]:
         body = w.json_body(await self._http.get("/.well-known/jwks.json"))
@@ -751,6 +842,25 @@ class AsyncClient:
         if not verify:
             return decode_token(raw)
         return verify_token(raw, await self.jwks(), issuer=issuer, audience=audience)
+
+
+def _session_request(
+    auth: Callable[[str, str, str], Callable[[str | None], dict[str, str]]],
+    token: Token | str | None,
+    default: Token | str | None,
+    server: str,
+    session_id: str,
+) -> tuple[str, Callable[[str | None], dict[str, str]]]:
+    """The path and headers of ``DELETE /mcp/{server}`` for ``session_id``."""
+    if not session_id:
+        raise ValueError("session_id must be the Mcp-Session-Id to close")
+    path = f"/mcp/{w.path_segment(server, 'server')}"
+    presented_auth = auth(w.bearer(token, default), path, "DELETE")
+    return path, lambda nonce: {
+        "accept": w.MCP_ACCEPT,
+        w.SESSION_HEADER: session_id,
+        **presented_auth(nonce),
+    }
 
 
 def _exchange_dpop(

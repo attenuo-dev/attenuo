@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import inspect
 import json
 from collections.abc import Callable
@@ -15,9 +16,13 @@ from attenuo import (
     ArgLimit,
     AsyncClient,
     AttenuoError,
+    AuthzenConfiguration,
+    AuthzenEntryError,
+    AuthzenEvaluation,
     Capability,
     Client,
     Denied,
+    DpopKey,
     Prefix,
     RpcError,
     Token,
@@ -525,3 +530,179 @@ def test_context_managers() -> None:
 async def test_async_context_manager() -> None:
     async with AsyncClient(BASE, transport=httpx.MockTransport(lambda r: httpx.Response(200))) as c:
         assert c.server_url == BASE
+
+
+# --- K-5: AuthZEN batch and discovery, MCP session close -------------------------------------
+
+
+async def test_authzen_evaluate_batch_wire_format_and_answers(make: Any) -> None:
+    answer = {
+        "evaluations": [
+            {"decision": True, "context": {"reason": "policy_allow", "decision_id": "d1"}},
+            {"decision": False, "context": {"reason": "capability_denied", "decision_id": "d2"}},
+            {
+                "decision": False,
+                "context": {
+                    "error": {"status": 400, "code": "invalid_request", "message": "bad entry"}
+                },
+            },
+        ]
+    }
+    client, rec = make(lambda r: httpx.Response(200, json=answer))
+    out = await call(
+        client,
+        "authzen_evaluate_batch",
+        "TOK",
+        [
+            AuthzenEvaluation("github", "read_file", {"repo": "a/b"}),
+            ("github", "create_issue"),
+            ("github", "delete_repo", {"repo": "a/b"}),
+        ],
+        semantic="deny_on_first_deny",
+    )
+    assert (rec.last.method, rec.last.url.path) == ("POST", "/access/v1/evaluations")
+    assert rec.last.headers["authorization"] == "Bearer TOK"
+    assert rec.body() == {
+        "subject": {"type": "agent", "id": ""},
+        "evaluations": [
+            {
+                "action": {"name": "read_file", "properties": {"server": "github"}},
+                "resource": {"type": "tool", "id": "github/read_file"},
+                "context": {"input": {"repo": "a/b"}},
+            },
+            {
+                "action": {"name": "create_issue", "properties": {"server": "github"}},
+                "resource": {"type": "tool", "id": "github/create_issue"},
+                "context": {"input": {}},
+            },
+            {
+                "action": {"name": "delete_repo", "properties": {"server": "github"}},
+                "resource": {"type": "tool", "id": "github/delete_repo"},
+                "context": {"input": {"repo": "a/b"}},
+            },
+        ],
+        "options": {"evaluations_semantic": "deny_on_first_deny"},
+    }
+    assert [(d.decision, d.reason, d.decision_id) for d in out] == [
+        (True, "policy_allow", "d1"),
+        (False, "capability_denied", "d2"),
+        (False, "", None),
+    ]
+    assert out[0].error is None
+    assert out[2].error == AuthzenEntryError(400, "invalid_request", "bad entry")
+
+    # No semantic: no `options`; a stopped batch answers fewer entries.
+    client, rec = make(
+        lambda r: httpx.Response(200, json={"evaluations": answer["evaluations"][:1]})
+    )
+    out = await call(client, "authzen_evaluate_batch", "TOK", [("github", "a"), ("github", "b")])
+    assert "options" not in rec.body() and len(out) == 1
+
+
+async def test_authzen_evaluate_batch_refusals(make: Any) -> None:
+    client, rec = make(lambda r: httpx.Response(500))
+    with pytest.raises(ValueError, match="at least one"):
+        await call(client, "authzen_evaluate_batch", "TOK", [])
+    with pytest.raises(ValueError, match="semantic"):
+        await call(client, "authzen_evaluate_batch", "TOK", [("s", "t")], semantic="first")
+    with pytest.raises(TypeError):
+        await call(client, "authzen_evaluate_batch", "TOK", ["s/t"])
+    assert rec.requests == []
+
+    too_many = {"error": "batch_too_large", "detail": "65 evaluations exceed [authzen] max_batch"}
+    client, _ = make(lambda r: httpx.Response(400, json=too_many))
+    with pytest.raises(ApiError) as e:
+        await call(client, "authzen_evaluate_batch", "TOK", [("s", "t")])
+    assert (e.value.status, e.value.error) == (400, "batch_too_large")
+
+    expired = {
+        "error": "invalid_token",
+        "detail": "expired",
+        "error_description": "expired",
+    }
+    client, _ = make(lambda r: httpx.Response(401, json=expired))
+    with pytest.raises(Unauthorized) as u:
+        await call(client, "authzen_evaluate_batch", "TOK", [("s", "t")])
+    assert u.value.description == "expired"
+
+    client, _ = make(lambda r: httpx.Response(200, json={"decision": True}))
+    with pytest.raises(AttenuoError, match="batch response"):
+        await call(client, "authzen_evaluate_batch", "TOK", [("s", "t")])
+
+
+async def test_authzen_evaluate_batch_signs_with_dpop(make: Any) -> None:
+    key = DpopKey.generate()
+    client, rec = make(lambda r: httpx.Response(200, json={"evaluations": []}), dpop_key=key)
+    assert await call(client, "authzen_evaluate_batch", "TOK", [("s", "t")]) == []
+    assert rec.last.headers["authorization"] == "DPoP TOK"
+    claims = json.loads(base64.urlsafe_b64decode(rec.last.headers["dpop"].split(".")[1] + "=="))
+    assert (claims["htm"], claims["htu"]) == ("POST", f"{BASE}/access/v1/evaluations")
+
+
+async def test_authzen_configuration(make: Any) -> None:
+    doc = {
+        "policy_decision_point": "https://pdp.example",
+        "access_evaluation_endpoint": "https://pdp.example/access/v1/evaluation",
+        "access_evaluations_endpoint": "https://pdp.example/access/v1/evaluations",
+    }
+    client, rec = make(lambda r: httpx.Response(200, json=doc))
+    cfg = await call(client, "authzen_configuration")
+    assert (rec.last.method, rec.last.url.path) == ("GET", "/.well-known/authzen-configuration")
+    assert "authorization" not in rec.last.headers
+    assert isinstance(cfg, AuthzenConfiguration)
+    assert cfg.policy_decision_point == "https://pdp.example"
+    assert cfg.access_evaluation_endpoint.endswith("/access/v1/evaluation")
+    assert cfg.access_evaluations_endpoint.endswith("/access/v1/evaluations")
+    assert cfg.raw == doc
+
+    bad_host = {"error": "invalid_host", "detail": "Host must be localhost"}
+    client, _ = make(lambda r: httpx.Response(400, json=bad_host))
+    with pytest.raises(ApiError) as e:
+        await call(client, "authzen_configuration")
+    assert e.value.error == "invalid_host"
+
+
+async def test_close_session(make: Any) -> None:
+    client, rec = make(lambda r: httpx.Response(204))
+    assert await call(client, "close_session", "TOK", "github", "s-1") is True
+    assert (rec.last.method, rec.last.url.path) == ("DELETE", "/mcp/github")
+    assert rec.last.headers["mcp-session-id"] == "s-1"
+    assert rec.last.headers["authorization"] == "Bearer TOK"
+
+    client, _ = make(lambda r: httpx.Response(405))
+    assert await call(client, "close_session", "TOK", "github", "s-1") is False
+
+    client, _ = make(lambda r: rpc_err(-32600, "unknown session", status=404))
+    with pytest.raises(RpcError) as e:
+        await call(client, "close_session", "TOK", "github", "s-1")
+    assert e.value.code == -32600
+
+    data = {"reason": "session_mismatch", "decision_id": "dec-9"}
+    client, _ = make(
+        lambda r: rpc_err(-32003, "denied", data, 403, {"x-attenuo-decision-id": "dec-9"})
+    )
+    with pytest.raises(Denied) as d:
+        await call(client, "close_session", "TOK", "github", "s-1")
+    assert (d.value.reason, d.value.decision_id) == ("session_mismatch", "dec-9")
+
+    client, _ = make(lambda r: rpc_err(-32001, "revoked", {"reason": "lease_revoked"}, 401))
+    with pytest.raises(Unauthorized) as u:
+        await call(client, "close_session", "TOK", "github", "s-1")
+    assert u.value.reason == "lease_revoked"
+
+    client, _ = make(lambda r: httpx.Response(502, text="bad gateway"))
+    with pytest.raises(ApiError) as a:
+        await call(client, "close_session", "TOK", "github", "s-1")
+    assert a.value.status == 502
+
+    with pytest.raises(ValueError):
+        await call(client, "close_session", "TOK", "github", "")
+    with pytest.raises(ValueError):
+        await call(client, "close_session", "TOK", "..", "s-1")
+
+
+async def test_close_session_signs_a_delete_with_dpop(make: Any) -> None:
+    client, rec = make(lambda r: httpx.Response(200), dpop_key=DpopKey.generate())
+    assert await call(client, "close_session", "TOK", "github", "s-1") is True
+    claims = json.loads(base64.urlsafe_b64decode(rec.last.headers["dpop"].split(".")[1] + "=="))
+    assert (claims["htm"], claims["htu"]) == ("DELETE", f"{BASE}/mcp/github")

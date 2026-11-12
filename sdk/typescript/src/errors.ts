@@ -19,9 +19,10 @@ export class AttenuoError extends Error {
 
 /**
  * The request got no answer: `fetch` failed (connection refused or dropped, DNS, TLS: a
- * `TypeError`), or the client's own `timeoutMs` ran out (a `TimeoutError`), before or while the
- * body was read. `cause` is the original error. An abort through a signal you passed, or a
- * streamed call's idle timer, is not wrapped: it is thrown as it came.
+ * `TypeError`), or one of the client's own timers ran out (`TransportTimeoutError`), before or
+ * while the body was read. `cause` is the original error. An abort through a signal you passed
+ * is not wrapped: it is thrown as it came (an `AbortError`, or the reason you gave), so a
+ * cancellation stays a cancellation.
  */
 export class TransportError extends AttenuoError {
   constructor(message: string, cause: unknown) {
@@ -29,6 +30,15 @@ export class TransportError extends AttenuoError {
     this.cause = cause;
   }
 }
+
+/**
+ * A `TransportError` because one of the client's own timers ran out: its `timeoutMs` (a whole
+ * request, or the silence between two reads of a streamed call) or a streamed call's
+ * `deadlineMs`. `cause` is the `TimeoutError` `DOMException` the request was aborted with, or
+ * undefined for a deadline that passed between reads. A timeout signal you passed yourself
+ * (`AbortSignal.timeout`) is yours, and is thrown as it came.
+ */
+export class TransportTimeoutError extends TransportError {}
 
 /** One run-limit figure pair of a per-user window: allowed calls and the summed amount. */
 export interface WindowUsage {

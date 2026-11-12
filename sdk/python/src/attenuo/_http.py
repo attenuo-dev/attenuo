@@ -1,4 +1,5 @@
-"""``httpx`` clients whose transport failures are :class:`~attenuo.TransportError`.
+"""``httpx`` clients whose transport failures are :class:`~attenuo.TransportError` (a timeout
+:class:`~attenuo.TransportTimeout`).
 
 Every request the SDK's clients send goes through ``send``, so wrapping there covers them all:
 a failure to send or to read a whole answer, and, for a streamed answer, a failure while its
@@ -12,12 +13,14 @@ from typing import Any
 
 import httpx
 
-from .errors import TransportError
+from .errors import TransportError, TransportTimeout
 
 
 def _wrap(e: httpx.TransportError, request: httpx.Request | None) -> TransportError:
+    """``e`` as a :class:`TransportError`; a timeout as its :class:`TransportTimeout`."""
     target = f"{request.method} {request.url}" if request is not None else "request"
-    return TransportError(f"{target} failed: {type(e).__name__}: {e}", request=request)
+    cls = TransportTimeout if isinstance(e, httpx.TimeoutException) else TransportError
+    return cls(f"{target} failed: {type(e).__name__}: {e}", request=request)
 
 
 def _request_of(e: httpx.TransportError) -> httpx.Request | None:

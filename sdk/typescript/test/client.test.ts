@@ -4,6 +4,7 @@ import {
   argLimit,
   capability,
   DeniedError,
+  DpopKey,
   AttenuoClient,
   AttenuoError,
   prefix,
@@ -547,5 +548,206 @@ describe("transport options", () => {
         init?.signal?.addEventListener("abort", () => rej(init.signal!.reason));
       })) as typeof globalThis.fetch;
     await expect(new AttenuoClient(URL_, { fetch: slow, timeoutMs: 20 }).jwks()).rejects.toThrow();
+  });
+});
+
+describe("authzenEvaluateBatch (K-5)", () => {
+  const answer = {
+    evaluations: [
+      { decision: true, context: { reason: "policy_allow", decision_id: "d1" } },
+      { decision: false, context: { reason: "capability_denied", decision_id: "d2" } },
+      {
+        decision: false,
+        context: { error: { status: 400, code: "invalid_request", message: "bad entry" } },
+      },
+    ],
+  };
+
+  it("posts one entry per call under the subject default, and reads every answer", async () => {
+    const { fetch, calls } = mockFetch(() => jsonResponse(answer));
+    const out = await new AttenuoClient(URL_, { fetch }).authzenEvaluateBatch(
+      "TOK",
+      [
+        { server: "github", tool: "read_file", args: { repo: "a/b" } },
+        ["github", "create_issue"],
+        ["github", "delete_repo", { repo: "a/b" }],
+      ],
+      { semantic: "deny_on_first_deny" },
+    );
+    expect(calls[0]!.method).toBe("POST");
+    expect(calls[0]!.url.pathname).toBe("/access/v1/evaluations");
+    expect(calls[0]!.headers.get("authorization")).toBe("Bearer TOK");
+    expect(calls[0]!.body).toEqual({
+      subject: { type: "agent", id: "" },
+      evaluations: [
+        {
+          action: { name: "read_file", properties: { server: "github" } },
+          resource: { type: "tool", id: "github/read_file" },
+          context: { input: { repo: "a/b" } },
+        },
+        {
+          action: { name: "create_issue", properties: { server: "github" } },
+          resource: { type: "tool", id: "github/create_issue" },
+          context: { input: {} },
+        },
+        {
+          action: { name: "delete_repo", properties: { server: "github" } },
+          resource: { type: "tool", id: "github/delete_repo" },
+          context: { input: { repo: "a/b" } },
+        },
+      ],
+      options: { evaluations_semantic: "deny_on_first_deny" },
+    });
+    expect(out.map((d) => [d.decision, d.reason, d.decisionId])).toEqual([
+      [true, "policy_allow", "d1"],
+      [false, "capability_denied", "d2"],
+      [false, "", undefined],
+    ]);
+    expect(out[0]!.error).toBeUndefined();
+    expect(out[2]!.error).toEqual({ status: 400, code: "invalid_request", message: "bad entry" });
+  });
+
+  it("sends no options without a semantic, and returns a stopped batch as it came", async () => {
+    const { fetch, calls } = mockFetch(() =>
+      jsonResponse({ evaluations: answer.evaluations.slice(0, 1) }),
+    );
+    const out = await new AttenuoClient(URL_, { fetch }).authzenEvaluateBatch("TOK", [
+      ["g", "a"],
+      ["g", "b"],
+    ]);
+    expect(calls[0]!.body).not.toHaveProperty("options");
+    expect(out).toHaveLength(1);
+  });
+
+  it("refuses an empty batch, a bad entry and an unknown semantic before sending", async () => {
+    const { fetch, calls } = mockFetch(() => jsonResponse({}, 500));
+    const ob = new AttenuoClient(URL_, { fetch });
+    await expect(ob.authzenEvaluateBatch("TOK", [])).rejects.toThrow(/at least one/);
+    await expect(
+      ob.authzenEvaluateBatch("TOK", [["s", "t"]], { semantic: "first" as never }),
+    ).rejects.toThrow(/semantic/);
+    await expect(ob.authzenEvaluateBatch("TOK", ["s/t" as never])).rejects.toBeInstanceOf(
+      TypeError,
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  it("maps the server's refusals through the error contract", async () => {
+    const tooMany = { error: "batch_too_large", detail: "65 evaluations exceed max_batch" };
+    const { fetch } = mockFetch(() => jsonResponse(tooMany, 400));
+    const err = await new AttenuoClient(URL_, { fetch })
+      .authzenEvaluateBatch("TOK", [["s", "t"]])
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err).toMatchObject({ status: 400, error: "batch_too_large" });
+
+    const expired = { error: "invalid_token", detail: "expired", error_description: "expired" };
+    const { fetch: f401 } = mockFetch(() => jsonResponse(expired, 401));
+    const e401 = await new AttenuoClient(URL_, { fetch: f401 })
+      .authzenEvaluateBatch("TOK", [["s", "t"]])
+      .catch((e: unknown) => e);
+    expect(e401).toBeInstanceOf(UnauthorizedError);
+    expect(e401).toMatchObject({ description: "expired" });
+
+    const { fetch: fSingle } = mockFetch(() => jsonResponse({ decision: true }));
+    await expect(
+      new AttenuoClient(URL_, { fetch: fSingle }).authzenEvaluateBatch("TOK", [["s", "t"]]),
+    ).rejects.toThrow(/batch response/);
+  });
+
+  it("signs the batch with DPoP when the client has a key", async () => {
+    const { fetch, calls } = mockFetch(() => jsonResponse({ evaluations: [] }));
+    const ob = new AttenuoClient(URL_, { fetch, dpopKey: await DpopKey.generate() });
+    expect(await ob.authzenEvaluateBatch("TOK", [["s", "t"]])).toEqual([]);
+    expect(calls[0]!.headers.get("authorization")).toBe("DPoP TOK");
+    const claims = JSON.parse(
+      Buffer.from(calls[0]!.headers.get("dpop")!.split(".")[1]!, "base64url").toString(),
+    );
+    expect([claims.htm, claims.htu]).toEqual(["POST", `${URL_}/access/v1/evaluations`]);
+  });
+});
+
+describe("authzenConfiguration (K-5)", () => {
+  it("reads the discovery document without a credential", async () => {
+    const doc = {
+      policy_decision_point: "https://pdp.example",
+      access_evaluation_endpoint: "https://pdp.example/access/v1/evaluation",
+      access_evaluations_endpoint: "https://pdp.example/access/v1/evaluations",
+    };
+    const { fetch, calls } = mockFetch(() => jsonResponse(doc));
+    const cfg = await new AttenuoClient(URL_, { fetch, token: "TOK" }).authzenConfiguration();
+    expect(calls[0]!.method).toBe("GET");
+    expect(calls[0]!.url.pathname).toBe("/.well-known/authzen-configuration");
+    expect(calls[0]!.headers.has("authorization")).toBe(false);
+    expect(cfg).toEqual({
+      policyDecisionPoint: "https://pdp.example",
+      accessEvaluationEndpoint: "https://pdp.example/access/v1/evaluation",
+      accessEvaluationsEndpoint: "https://pdp.example/access/v1/evaluations",
+      raw: doc,
+    });
+  });
+
+  it("throws the server's refusal as an ApiError", async () => {
+    const { fetch } = mockFetch(() =>
+      jsonResponse({ error: "invalid_host", detail: "Host must be localhost" }, 400),
+    );
+    await expect(new AttenuoClient(URL_, { fetch }).authzenConfiguration()).rejects.toMatchObject({
+      status: 400,
+      error: "invalid_host",
+    });
+  });
+});
+
+describe("closeSession (K-5)", () => {
+  it("sends DELETE with the session id, and reads 2xx and 405", async () => {
+    const { fetch, calls } = mockFetch(() => new Response(null, { status: 204 }));
+    expect(await new AttenuoClient(URL_, { fetch }).closeSession("TOK", "github", "s-1")).toBe(
+      true,
+    );
+    expect(calls[0]!.method).toBe("DELETE");
+    expect(calls[0]!.url.pathname).toBe("/mcp/github");
+    expect(calls[0]!.headers.get("mcp-session-id")).toBe("s-1");
+    expect(calls[0]!.headers.get("authorization")).toBe("Bearer TOK");
+
+    const { fetch: f405 } = mockFetch(() => new Response("", { status: 405 }));
+    expect(
+      await new AttenuoClient(URL_, { fetch: f405 }).closeSession("TOK", "github", "s-1"),
+    ).toBe(false);
+  });
+
+  it("throws the proxy's refusals as a call would", async () => {
+    const run = (res: () => Response) =>
+      new AttenuoClient(URL_, { fetch: mockFetch(res).fetch })
+        .closeSession("TOK", "github", "s-1")
+        .catch((e: unknown) => e);
+    const unknown = await run(() => rpcErr(-32600, "unknown session", undefined, 404));
+    expect(unknown).toBeInstanceOf(RpcError);
+    expect(unknown).toMatchObject({ code: -32600 });
+    const mismatch = await run(() =>
+      rpcErr(-32003, "denied", { reason: "session_mismatch", decision_id: "dec-9" }, 403, {
+        "x-attenuo-decision-id": "dec-9",
+      }),
+    );
+    expect(mismatch).toBeInstanceOf(DeniedError);
+    expect(mismatch).toMatchObject({ reason: "session_mismatch", decisionId: "dec-9" });
+    const revoked = await run(() => rpcErr(-32001, "revoked", { reason: "lease_revoked" }, 401));
+    expect(revoked).toBeInstanceOf(UnauthorizedError);
+    expect(revoked).toMatchObject({ reason: "lease_revoked" });
+    const gateway = await run(() => new Response("bad gateway", { status: 502 }));
+    expect(gateway).toBeInstanceOf(ApiError);
+    expect(gateway).toMatchObject({ status: 502 });
+  });
+
+  it("refuses an empty session id or a dot server, and signs a DELETE with DPoP", async () => {
+    const { fetch, calls } = mockFetch(() => new Response(null, { status: 200 }));
+    const ob = new AttenuoClient(URL_, { fetch, dpopKey: await DpopKey.generate() });
+    await expect(ob.closeSession("TOK", "github", "")).rejects.toBeInstanceOf(TypeError);
+    await expect(ob.closeSession("TOK", "..", "s-1")).rejects.toBeInstanceOf(TypeError);
+    expect(calls).toHaveLength(0);
+    expect(await ob.closeSession("TOK", "github", "s-1")).toBe(true);
+    const claims = JSON.parse(
+      Buffer.from(calls[0]!.headers.get("dpop")!.split(".")[1]!, "base64url").toString(),
+    );
+    expect([claims.htm, claims.htu]).toEqual(["DELETE", `${URL_}/mcp/github`]);
   });
 });

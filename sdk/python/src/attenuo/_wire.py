@@ -6,7 +6,7 @@ import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, TypeAlias
 from urllib.parse import quote
 
 import httpx
@@ -125,9 +125,52 @@ class AuthzenDecision:
     approval_id: str | None = None
     call_hash: str | None = None
     expires_at: datetime | None = None
+    error: AuthzenEntryError | None = None
 
     def __bool__(self) -> bool:
         return self.decision
+
+
+@dataclass(frozen=True)
+class AuthzenEntryError:
+    """Why one entry of an AuthZEN batch failed (``context.error``): the HTTP ``status`` and
+    error ``code`` a single evaluation of it would have answered (``invalid_request``,
+    ``unknown_tool``, ...) and the server's ``message``. The entry counts as a deny; the rest
+    of the batch is decided as usual."""
+
+    status: int
+    code: str
+    message: str
+
+
+@dataclass(frozen=True)
+class AuthzenEvaluation:
+    """One call to decide in :meth:`~attenuo.Client.authzen_evaluate_batch`: the tool
+    ``server/tool`` with ``arguments``. A ``(server, tool)`` or ``(server, tool, arguments)``
+    tuple is taken too."""
+
+    server: str
+    tool: str
+    arguments: dict[str, Any] | None = None
+
+
+AuthzenEvaluationLike: TypeAlias = (
+    AuthzenEvaluation | tuple[str, str] | tuple[str, str, dict[str, Any] | None]
+)
+
+EVALUATIONS_SEMANTICS = ("execute_all", "deny_on_first_deny", "permit_on_first_permit")
+
+
+@dataclass(frozen=True)
+class AuthzenConfiguration:
+    """The AuthZEN discovery document (``GET /.well-known/authzen-configuration``, AuthZEN 1.0
+    section 9): the decision point's base URL and its two evaluation endpoints, as the server
+    publishes them (from ``[server] public_url``)."""
+
+    policy_decision_point: str
+    access_evaluation_endpoint: str
+    access_evaluations_endpoint: str
+    raw: dict[str, Any] = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -310,6 +353,65 @@ def authzen_body(server: str, tool: str, arguments: dict[str, Any] | None) -> di
     }
 
 
+def authzen_batch_body(
+    evaluations: Iterable[AuthzenEvaluationLike], semantic: str | None
+) -> dict[str, Any]:
+    """The ``POST /access/v1/evaluations`` body: the subject as the top-level default (the
+    server fills it from the verified chain) and one ``action``/``resource``/``context`` entry
+    per call. ``ValueError`` for no call, since the server answers an empty batch as a single
+    evaluation, or for an unknown ``semantic``."""
+    entries = []
+    for ev in evaluations:
+        if isinstance(ev, tuple):
+            ev = AuthzenEvaluation(*ev)
+        if not isinstance(ev, AuthzenEvaluation):
+            raise TypeError(f"an evaluation is an AuthzenEvaluation or a tuple, got {ev!r}")
+        one = authzen_body(ev.server, ev.tool, ev.arguments)
+        del one["subject"]
+        entries.append(one)
+    if not entries:
+        raise ValueError("an AuthZEN batch needs at least one evaluation")
+    body: dict[str, Any] = {"subject": {"type": "agent", "id": ""}, "evaluations": entries}
+    if semantic is not None:
+        if semantic not in EVALUATIONS_SEMANTICS:
+            raise ValueError(
+                f"semantic must be one of {', '.join(EVALUATIONS_SEMANTICS)}, got {semantic!r}"
+            )
+        body["options"] = {"evaluations_semantic": semantic}
+    return body
+
+
+def authzen_batch_from_response(body: Any) -> list[AuthzenDecision]:
+    """The decisions of a batch answer, in request order. A batch stopped by its semantic
+    answers fewer entries than it asked."""
+    items = body.get("evaluations") if isinstance(body, dict) else None
+    if not isinstance(items, list):
+        raise AttenuoError(f"unexpected AuthZEN batch response: {str(body)[:200]}")
+    return [authzen_from_response(item if isinstance(item, dict) else {}) for item in items]
+
+
+def authzen_configuration_from_json(body: Any) -> AuthzenConfiguration:
+    if not isinstance(body, dict):
+        raise AttenuoError(f"unexpected AuthZEN configuration: {str(body)[:200]}")
+    return AuthzenConfiguration(
+        policy_decision_point=str(body.get("policy_decision_point", "")),
+        access_evaluation_endpoint=str(body.get("access_evaluation_endpoint", "")),
+        access_evaluations_endpoint=str(body.get("access_evaluations_endpoint", "")),
+        raw=body,
+    )
+
+
+def _entry_error(value: Any) -> AuthzenEntryError | None:
+    if not isinstance(value, dict):
+        return None
+    status = value.get("status")
+    return AuthzenEntryError(
+        status=status if isinstance(status, int) and not isinstance(status, bool) else 0,
+        code=str(value.get("code", "")),
+        message=str(value.get("message", "")),
+    )
+
+
 def authzen_from_response(body: Any) -> AuthzenDecision:
     ctx = body.get("context") or {}
     return AuthzenDecision(
@@ -321,6 +423,7 @@ def authzen_from_response(body: Any) -> AuthzenDecision:
         approval_id=_opt_str(ctx.get("approval_id")),
         call_hash=_opt_str(ctx.get("call_hash")),
         expires_at=_opt_time(ctx.get("expires_at")),
+        error=_entry_error(ctx.get("error")),
     )
 
 
@@ -438,6 +541,37 @@ def approval_from_json(body: Any) -> Approval:
         if isinstance(approval_token, str) and approval_token
         else None,
     )
+
+
+APPROVAL_DECISIONS = ("grant", "decline")
+
+
+def approval_decision_body(decision: str) -> dict[str, str]:
+    if decision not in APPROVAL_DECISIONS:
+        raise ValueError(f"decision must be 'grant' or 'decline', got {decision!r}")
+    return {"decision": decision}
+
+
+def id_token_headers(id_token: str) -> dict[str, str]:
+    """``Authorization: Bearer`` for the user's OIDC ID token. Never DPoP: the server verifies
+    the ID token as at hop 0, and a delegation token is refused there
+    (``agent_token_refused``)."""
+    token = id_token.strip() if isinstance(id_token, str) else ""
+    if not token:
+        raise ValueError("id_token must be the user's OIDC ID token")
+    return {"authorization": f"Bearer {token}"}
+
+
+def session_closed(resp: httpx.Response) -> bool:
+    """The answer to ``DELETE /mcp/{server}``: ``True`` when the upstream closed the session,
+    ``False`` when it does not let clients close sessions (405, as MCP allows). The proxy's own
+    refusals raise what a call would (:func:`rpc_result`)."""
+    if resp.is_success:
+        return True
+    if resp.status_code == 405:
+        return False
+    rpc_result(resp)
+    raise error_from_response(resp)
 
 
 def approval_ready(approval: Approval) -> bool:

@@ -20,6 +20,7 @@ import {
   writeFileSync,
   createWriteStream,
 } from "node:fs";
+import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -38,6 +39,7 @@ import {
   AttenuoClient,
   prefix,
   RefreshError,
+  RpcError,
   type Token,
   TokenRefresher,
   UnauthorizedError,
@@ -1063,3 +1065,195 @@ describe.skipIf(!enabled)("decimal catalog input against the real server", () =>
     await admin.revokeLease(root.lease);
   });
 });
+
+describe.skipIf(!enabled)(
+  "refund, AuthZEN batch and discovery, user decision, session close (K-5)",
+  () => {
+    const ISSUER = "https://idp.example";
+    let procs: ChildProcess[] = [];
+    let work = "";
+    let url = "";
+    let jwksServer: HttpServer | undefined;
+    let idpKey: CryptoKey;
+
+    const b64u = (d: Uint8Array | string) => Buffer.from(d).toString("base64url");
+    async function idToken(sub: string, jti: string): Promise<string> {
+      const now = Math.floor(Date.now() / 1000);
+      const head = { alg: "EdDSA", typ: "JWT", kid: "idp-1" };
+      const claims = { iss: ISSUER, sub, aud: "demo-approval-page", iat: now, exp: now + 300, jti };
+      const signing = `${b64u(JSON.stringify(head))}.${b64u(JSON.stringify(claims))}`;
+      const sig = await crypto.subtle.sign("Ed25519", idpKey, new TextEncoder().encode(signing));
+      return `${signing}.${b64u(new Uint8Array(sig))}`;
+    }
+
+    beforeAll(async () => {
+      // A stand-in OIDC issuer: an Ed25519 key, its JWKS on a local port, trusted by `[[idps]]`.
+      const pair = (await crypto.subtle.generateKey("Ed25519", true, [
+        "sign",
+        "verify",
+      ])) as CryptoKeyPair;
+      idpKey = pair.privateKey;
+      const raw = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+      const jwks = JSON.stringify({
+        keys: [{ kty: "OKP", crv: "Ed25519", kid: "idp-1", x: b64u(raw) }],
+      });
+      const srv = createHttpServer((_req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(jwks);
+      });
+      jwksServer = srv;
+      const port = await new Promise<number>((ok) =>
+        srv.listen(0, "127.0.0.1", () => ok((srv.address() as { port: number }).port)),
+      );
+      const idps = `[[idps]]\nissuer = "${ISSUER}"\njwks_url = "http://127.0.0.1:${port}/jwks"\n\n`;
+      ({ url, work, procs } = await startStack(idps));
+    });
+
+    afterAll(async () => {
+      await stopStack(procs, work);
+      jwksServer?.close();
+    });
+
+    it("closes an MCP session, and refuses another run's or an unknown one", async () => {
+      const admin = new AdminClient(url, ADMIN_TOKEN);
+      const ob = new AttenuoClient(url);
+      const root = await admin.mintRootDev("alice", ISSUER, "assistant", {
+        capabilities: ["github:*"],
+      });
+      const coder = await ob.exchange(root, "coder", ["github:read_file"], {
+        clientSecret: CODER_SECRET,
+      });
+      const sid = await ob.initialize(coder, "github");
+      expect(sid, "the fake upstream assigns a session id").toBeTruthy();
+      const other = await admin.mintRootDev("alice", ISSUER, "assistant", {
+        capabilities: ["github:*"],
+      });
+      const mismatch = await ob.closeSession(other, "github", sid!).catch((e: unknown) => e);
+      expect(mismatch).toBeInstanceOf(DeniedError);
+      expect((mismatch as DeniedError).reason).toBe("session_mismatch");
+      expect(await ob.closeSession(coder, "github", sid!)).toBe(true);
+      const unknown = await ob.closeSession(coder, "github", "no-such-session").catch((e) => e);
+      expect(unknown).toBeInstanceOf(RpcError);
+      expect((unknown as RpcError).code).toBe(-32600);
+      await admin.revokeLease(root.lease);
+      await admin.revokeLease(other.lease);
+    });
+
+    it("refunds a charged decision once", async () => {
+      const admin = new AdminClient(url, ADMIN_TOKEN);
+      const ob = new AttenuoClient(url);
+      const root = await admin.mintRootDev("alice", ISSUER, "assistant", {
+        capabilities: ["github:*"],
+      });
+      const coder = await ob.exchange(
+        root,
+        "coder",
+        [withLimits(capability("github", "read_file"), { calls: 1 })],
+        { clientSecret: CODER_SECRET },
+      );
+      const read = { repo: "alice/public-docs", path: "README.md" };
+      const first = await ob.callTool(coder, "github", "read_file", read);
+      expect(first.decisionId).toBeTruthy();
+      await expect(ob.callTool(coder, "github", "read_file", read)).rejects.toMatchObject({
+        reason: "budget_exhausted",
+      });
+      const refund = await admin.refundBudget(first.decisionId!, "upstream failed");
+      expect(refund.decisionId).toBe(first.decisionId);
+      expect(refund.refunded).toBeGreaterThanOrEqual(1);
+      expect(refund.reason).toBe("upstream failed");
+      expect(refund.auditId).toBeTruthy();
+      expect((await ob.callTool(coder, "github", "read_file", read)).decisionId).toBeTruthy();
+      await expect(admin.refundBudget(first.decisionId!)).rejects.toMatchObject({
+        status: 409,
+        error: "already_refunded",
+        decisionId: undefined,
+      });
+      await expect(
+        admin.refundBudget("00000000-0000-4000-8000-000000000000"),
+      ).rejects.toMatchObject({ status: 404, error: "not_found" });
+      await admin.revokeLease(root.lease);
+    });
+
+    it("decides a batch in order, stops on the first deny, and serves discovery", async () => {
+      const admin = new AdminClient(url, ADMIN_TOKEN);
+      const ob = new AttenuoClient(url);
+      const root = await admin.mintRootDev("alice", ISSUER, "assistant", {
+        capabilities: ["github:*"],
+      });
+      const coder = await ob.exchange(root, "coder", ["github:read_file"], {
+        clientSecret: CODER_SECRET,
+      });
+      const read = { repo: "alice/public-docs", path: "README.md" };
+      const issue = { repo: "alice/public-docs", title: "t" };
+      const [allow, deny] = await ob.authzenEvaluateBatch(coder, [
+        { server: "github", tool: "read_file", args: read },
+        ["github", "create_issue", issue],
+      ]);
+      expect(allow!.decision).toBe(true);
+      expect(allow!.decisionId).toBeTruthy();
+      expect([deny!.decision, deny!.reason]).toEqual([false, "capability_denied"]);
+      const stopped = await ob.authzenEvaluateBatch(
+        coder,
+        [
+          ["github", "create_issue", issue],
+          ["github", "read_file", read],
+        ],
+        { semantic: "deny_on_first_deny" },
+      );
+      expect(stopped.map((d) => d.decision)).toEqual([false]);
+      await expect(
+        ob.authzenEvaluateBatch("not-a-token", [["github", "read_file", read]]),
+      ).rejects.toBeInstanceOf(UnauthorizedError);
+
+      expect(await ob.authzenConfiguration()).toMatchObject({
+        policyDecisionPoint: url,
+        accessEvaluationEndpoint: `${url}/access/v1/evaluation`,
+        accessEvaluationsEndpoint: `${url}/access/v1/evaluations`,
+      });
+      await admin.revokeLease(root.lease);
+    });
+
+    it("lets the user decide with their ID token, and nobody else", async () => {
+      const admin = new AdminClient(url, ADMIN_TOKEN);
+      const ob = new AttenuoClient(url);
+      const root = await admin.mintRootDev("alice", ISSUER, "assistant", {
+        capabilities: ["github:*"],
+      });
+      const issue = { repo: "alice/public-docs", title: "from the user" };
+      const held = (await ob
+        .callTool(root, "github", "create_issue", issue)
+        .catch((e) => e)) as ApprovalRequiredError;
+      expect(held).toBeInstanceOf(ApprovalRequiredError);
+      const id = held.approvalId!;
+
+      await expect(ob.grantApproval(id, root.jwt)).rejects.toMatchObject({
+        status: 403,
+        error: "agent_token_refused",
+      });
+      await expect(ob.grantApproval(id, await idToken("mallory", "j-0"))).rejects.toMatchObject({
+        status: 403,
+        error: "wrong_user",
+      });
+      const token = await idToken("alice", "j-1");
+      const granted = await ob.grantApproval(id, token);
+      expect(granted).toMatchObject({ state: "granted", usable: true });
+      expect(granted.approver?.by).toBe("user");
+      const done = await ob.callTool(root, "github", "create_issue", issue, {
+        approvalToken: granted.approvalToken!,
+      });
+      expect(done.decisionId).toBeTruthy();
+
+      const second = (await ob
+        .callTool(root, "github", "create_issue", { ...issue, title: "again" })
+        .catch((e) => e)) as ApprovalRequiredError;
+      expect(second.approvalId).toBeTruthy();
+      await expect(ob.declineApproval(second.approvalId!, token)).rejects.toMatchObject({
+        status: 400,
+        error: "invalid_grant",
+      });
+      const declined = await ob.declineApproval(second.approvalId!, await idToken("alice", "j-2"));
+      expect(declined.state).toBe("declined");
+      await admin.revokeLease(root.lease);
+    });
+  },
+);

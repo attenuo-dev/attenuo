@@ -33,12 +33,14 @@ from cryptography.hazmat.primitives.serialization import (
     NoEncryption,
     PrivateFormat,
 )
+from cryptography.hazmat.primitives.serialization import PublicFormat as _PublicFormat
 
 from attenuo import (
     AdminClient,
     ApiError,
     ApprovalRequired,
     AsyncClient,
+    AuthzenEvaluation,
     BudgetLimit,
     Capability,
     Client,
@@ -48,6 +50,7 @@ from attenuo import (
     EvaluationUsage,
     Prefix,
     RefreshError,
+    RpcError,
     StatedApproval,
     StatedBudget,
     StatedSession,
@@ -1374,3 +1377,215 @@ def test_shipped_checkpoint_tampering_is_reported_at_the_same_seq_by_rust_python
     assert "shipped checkpoint does not verify" in got[0][2]
     admin.close()
     ob.close()
+
+
+# ---- K-5: budget refund, AuthZEN batch and discovery, user decision, session close ---------
+
+
+def test_refund_budget(stack: Stack) -> None:
+    """An allowed call charged to a ``calls`` limit is refunded once by its decision id: the
+    run gets the call back, a second refund is 409, an unknown id 404."""
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    ob = Client(stack.url)
+    root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+    coder = ob.exchange(
+        root,
+        "coder",
+        [Capability("github", "read_file").with_limits(calls=1)],
+        client_secret=CODER_SECRET,
+    )
+    read = {"repo": "alice/public-docs", "path": "README.md"}
+    first = ob.call_tool(coder, "github", "read_file", read)
+    assert first.decision_id
+    with pytest.raises(Denied) as spent:
+        ob.call_tool(coder, "github", "read_file", read)
+    assert spent.value.reason == "budget_exhausted"
+
+    refund = admin.refund_budget(first.decision_id, "upstream failed")
+    assert refund.decision_id == first.decision_id
+    assert refund.refunded >= 1 and refund.reason == "upstream failed"
+    assert refund.audit_id is not None
+    assert ob.call_tool(coder, "github", "read_file", read).decision_id  # the call is back
+
+    with pytest.raises(ApiError) as again:
+        admin.refund_budget(first.decision_id)
+    assert (again.value.status, again.value.error) == (409, "already_refunded")
+    assert again.value.decision_id is None
+    with pytest.raises(ApiError) as unknown:
+        admin.refund_budget("00000000-0000-4000-8000-000000000000")
+    assert (unknown.value.status, unknown.value.error) == (404, "not_found")
+    admin.revoke_lease(root.lease)
+    ob.close()
+    admin.close()
+
+
+async def test_authzen_batch_and_discovery(stack: Stack) -> None:
+    """A batch is one decision per call, in order; ``deny_on_first_deny`` stops at the first
+    deny; discovery names this server's endpoints. The async client agrees."""
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    ob = Client(stack.url)
+    root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+    coder = ob.exchange(root, "coder", ["github:read_file"], client_secret=CODER_SECRET)
+    read = {"repo": "alice/public-docs", "path": "README.md"}
+    issue = {"repo": "alice/public-docs", "title": "t"}
+
+    allow, deny = ob.authzen_evaluate_batch(
+        coder,
+        [AuthzenEvaluation("github", "read_file", read), ("github", "create_issue", issue)],
+    )
+    assert allow and allow.decision_id and allow.error is None
+    assert not deny and deny.reason == "capability_denied" and deny.decision_id
+
+    stopped = ob.authzen_evaluate_batch(
+        coder,
+        [("github", "create_issue", issue), ("github", "read_file", read)],
+        semantic="deny_on_first_deny",
+    )
+    assert [d.decision for d in stopped] == [False]
+
+    with pytest.raises(Unauthorized):
+        ob.authzen_evaluate_batch("not-a-token", [("github", "read_file", read)])
+
+    cfg = ob.authzen_configuration()
+    assert cfg.policy_decision_point == stack.url
+    assert cfg.access_evaluation_endpoint == f"{stack.url}/access/v1/evaluation"
+    assert cfg.access_evaluations_endpoint == f"{stack.url}/access/v1/evaluations"
+
+    async with AsyncClient(stack.url) as aob:
+        assert (await aob.authzen_configuration()) == cfg
+        (one,) = await aob.authzen_evaluate_batch(coder, [("github", "read_file", read)])
+        assert one.decision
+    admin.revoke_lease(root.lease)
+    ob.close()
+    admin.close()
+
+
+def test_close_session(fresh_stack: Stack) -> None:
+    """``DELETE /mcp/{server}`` reaches the upstream; another run's attempt on the session is
+    the proxy's audited ``session_mismatch``; an unknown session is its ``-32600``."""
+    stack = fresh_stack
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    ob = Client(stack.url)
+    root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+    coder = ob.exchange(root, "coder", ["github:read_file"], client_secret=CODER_SECRET)
+    sid = ob.initialize(coder, "github")
+    assert sid, "the fake upstream assigns a session id"
+    other = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+    with pytest.raises(Denied) as mismatch:
+        ob.close_session(other, "github", sid)
+    assert mismatch.value.reason == "session_mismatch" and mismatch.value.decision_id
+    assert ob.close_session(coder, "github", sid) is True
+    with pytest.raises(RpcError) as unknown:
+        ob.close_session(coder, "github", "no-such-session")
+    assert unknown.value.code == -32600
+    admin.revoke_lease(other.lease)
+    admin.revoke_lease(root.lease)
+    ob.close()
+    admin.close()
+
+
+class Idp:
+    """A stand-in OIDC issuer: an Ed25519 key, its JWKS served on a local port."""
+
+    ISSUER = "https://idp.example"
+
+    def __init__(self) -> None:
+        import http.server
+        import threading
+
+        self.key = Ed25519PrivateKey.generate()
+        raw = self.key.public_key().public_bytes(Encoding.Raw, _PublicFormat.Raw)
+        jwks = json.dumps(
+            {"keys": [{"kty": "OKP", "crv": "Ed25519", "kid": "idp-1", "x": _b64(raw)}]}
+        ).encode()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(jwks)))
+                self.end_headers()
+                self.wfile.write(jwks)
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/jwks"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def id_token(self, subject: str, audience: str, jti: str) -> str:
+        now = int(time.time())
+        head = {"alg": "EdDSA", "typ": "JWT", "kid": "idp-1"}
+        claims = {
+            "iss": self.ISSUER,
+            "sub": subject,
+            "aud": audience,
+            "iat": now,
+            "exp": now + 300,
+            "jti": jti,
+        }
+        signing = f"{_b64(json.dumps(head).encode())}.{_b64(json.dumps(claims).encode())}"
+        return f"{signing}.{_b64(self.key.sign(signing.encode()))}"
+
+
+def _b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+@pytest.fixture(scope="module")
+def idp_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Stack, Idp]]:
+    """The demo stack with ``[[idps]]`` trusting a local issuer, so a test can sign the
+    originating user's ID token."""
+    idp = Idp()
+    section = f'[[idps]]\nissuer = "{Idp.ISSUER}"\njwks_url = "{idp.url}"\n\n'
+    try:
+        for s in run_stack(tmp_path_factory.mktemp("attenuo-it-idp"), section):
+            yield s, idp
+    finally:
+        idp.server.shutdown()
+
+
+def test_user_decides_an_approval_with_their_id_token(idp_stack: tuple[Stack, Idp]) -> None:
+    """``POST /approvals/{id}`` with the originating user's ID token: a delegation token is
+    refused, the user's token grants, the granted call goes through, and the same ID token
+    cannot decide a second time."""
+    stack, idp = idp_stack
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    ob = Client(stack.url)
+    root = admin.mint_root_dev("alice", Idp.ISSUER, "assistant", ["github:*"])
+    issue = {"repo": "alice/public-docs", "title": "from the user"}
+    with pytest.raises(ApprovalRequired) as held:
+        ob.call_tool(root, "github", "create_issue", issue)
+    approval_id = held.value.approval_id
+    assert approval_id
+
+    with pytest.raises(ApiError) as agent:
+        ob.grant_approval(approval_id, root.jwt)
+    assert (agent.value.status, agent.value.error) == (403, "agent_token_refused")
+    with pytest.raises(ApiError) as other:
+        ob.grant_approval(approval_id, idp.id_token("mallory", "demo-approval-page", "j-0"))
+    assert (other.value.status, other.value.error) == (403, "wrong_user")
+
+    id_token = idp.id_token("alice", "demo-approval-page", "j-1")
+    granted = ob.grant_approval(approval_id, id_token)
+    assert granted.state == "granted" and granted.usable
+    assert granted.approver is not None and granted.approver["by"] == "user"
+    result = ob.call_tool(
+        root, "github", "create_issue", issue, approval_token=granted.approval_token
+    )
+    assert result.decision_id
+
+    with pytest.raises(ApprovalRequired) as second:
+        ob.call_tool(root, "github", "create_issue", {**issue, "title": "again"})
+    assert second.value.approval_id
+    with pytest.raises(ApiError) as replay:
+        ob.decline_approval(second.value.approval_id, id_token)
+    assert (replay.value.status, replay.value.error) == (400, "invalid_grant")
+    declined = ob.decline_approval(
+        second.value.approval_id, idp.id_token("alice", "demo-approval-page", "j-2")
+    )
+    assert declined.state == "declined"
+    admin.revoke_lease(root.lease)
+    ob.close()
+    admin.close()

@@ -17,6 +17,7 @@ from attenuo import (
     AuditEntry,
     AuditFilter,
     BudgetLimit,
+    BudgetRefund,
     Capability,
     EvaluationBudget,
     EvaluationLabels,
@@ -847,3 +848,40 @@ async def test_approval_errors(make: Any) -> None:
     with pytest.raises(ApiError) as e:
         await call(client, "approval", "nope")
     assert e.value.status == 404
+
+
+# --- K-5: budget refund ----------------------------------------------------------------------
+
+
+async def test_refund_budget(make: Any) -> None:
+    answer = {"decision_id": "d-1", "refunded": 2, "reason": "upstream failed", "audit_id": "r-9"}
+    client, seen = make(lambda r: httpx.Response(200, json=answer))
+    res = await call(client, "refund_budget", "d-1", "upstream failed")
+    assert (seen[-1].method, seen[-1].url.path) == ("POST", "/admin/budgets/refund")
+    assert seen[-1].headers["authorization"] == "Bearer adm"
+    assert json.loads(seen[-1].content) == {"decision_id": "d-1", "reason": "upstream failed"}
+    assert res == BudgetRefund("d-1", 2, "upstream failed", "r-9")
+
+    answer = {"decision_id": "d-1", "refunded": 0, "reason": "refunded by admin", "audit_id": None}
+    client, seen = make(lambda r: httpx.Response(200, json=answer))
+    res = await call(client, "refund_budget", "d-1")
+    assert json.loads(seen[-1].content) == {"decision_id": "d-1"}
+    assert (res.refunded, res.reason, res.audit_id) == (0, "refunded by admin", None)
+
+    with pytest.raises(ValueError, match="decision_id"):
+        await call(client, "refund_budget", " ")
+    assert len(seen) == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "error"),
+    [(409, "already_refunded"), (410, "charge_pruned"), (404, "not_found"), (401, "unauthorized")],
+)
+async def test_refund_budget_refusals(make: Any, status: int, error: str) -> None:
+    body = {"error": error, "detail": "the charge of decision `d-1` was already refunded"}
+    client, _ = make(lambda r: httpx.Response(status, json=body))
+    with pytest.raises(ApiError) as e:
+        await call(client, "refund_budget", "d-1")
+    assert (e.value.status, e.value.error) == (status, error)
+    assert e.value.decision_id is None  # a refused refund writes no record
+    assert isinstance(e.value, Unauthorized) == (status == 401)

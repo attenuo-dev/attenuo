@@ -1,4 +1,4 @@
-import { TransportError } from "./errors.js";
+import { TransportError, TransportTimeoutError } from "./errors.js";
 import { normalizeBase } from "./wire.js";
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
@@ -25,11 +25,15 @@ function isTransportFailure(e: unknown, ownTimeout: boolean): boolean {
   return ownTimeout && (e as { name?: unknown } | null)?.name === "TimeoutError";
 }
 
+/** `e` as a `TransportError`; the client's own timeout as its `TransportTimeoutError`. */
 function transportError(method: string, url: string, e: unknown): TransportError {
-  const err = e as { message?: unknown; cause?: unknown } | null;
+  const err = e as { message?: unknown; cause?: unknown; name?: unknown } | null;
   const inner = (err?.cause as { message?: unknown } | null | undefined)?.message;
   const why = typeof inner === "string" && inner !== "" ? ` (${inner})` : "";
-  return new TransportError(`${method} ${url} failed: ${String(err?.message ?? e)}${why}`, e);
+  const message = `${method} ${url} failed: ${String(err?.message ?? e)}${why}`;
+  return err?.name === "TimeoutError"
+    ? new TransportTimeoutError(message, e)
+    : new TransportError(message, e);
 }
 
 /**

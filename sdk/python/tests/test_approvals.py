@@ -23,6 +23,7 @@ from attenuo import (
     Denied,
     DpopKey,
     RpcError,
+    Unauthorized,
     VerificationError,
     call_hash,
     verify_approval_token,
@@ -422,3 +423,67 @@ def test_verify_approval_token_signed_by_the_server() -> None:
     assert int(claims.expires_at.timestamp()) == RUST_IAT + 120
     with pytest.raises(VerificationError, match="expired"):
         verify_approval_token(RUST_TOKEN, RUST_JWKS, now=RUST_IAT + 120)
+
+
+# --- K-5: the user's own decision (POST /approvals/{id}) -------------------------------------
+
+
+async def test_user_grant_and_decline_send_the_id_token(make: Any) -> None:
+    def handler(r: httpx.Request) -> httpx.Response:
+        decision = json.loads(r.content)["decision"]
+        approver = {"subject": "alice", "method": "id_token", "by": "user"}
+        if decision == "grant":
+            return approval("granted", approver=approver, approval_token="a.b.c")
+        return approval("declined", approver=approver)
+
+    key = DpopKey.generate()
+    client, seen = make(handler, token="DELEGATION", dpop_key=key)
+    a = await call(client, "grant_approval", APPROVAL_ID, " ID-TOKEN ")
+    assert (seen[-1].method, seen[-1].url.path) == ("POST", f"/approvals/{APPROVAL_ID}")
+    # The ID token as a plain bearer, never the client's token, never DPoP.
+    assert seen[-1].headers["authorization"] == "Bearer ID-TOKEN"
+    assert "dpop" not in seen[-1].headers
+    assert json.loads(seen[-1].content) == {"decision": "grant"}
+    assert isinstance(a, Approval) and a.usable and a.approval_token == "a.b.c"
+    assert a.approver is not None and a.approver["by"] == "user"
+
+    a = await call(client, "decline_approval", APPROVAL_ID, "ID-TOKEN")
+    assert json.loads(seen[-1].content) == {"decision": "decline"}
+    assert a.state == "declined" and not a.usable
+
+
+@pytest.mark.parametrize(
+    ("status", "error", "description"),
+    [
+        (403, "agent_token_refused", None),
+        (403, "wrong_user", None),
+        (409, "approval_not_pending", None),
+        (400, "invalid_grant", "replayed"),
+        (404, "not_found", None),
+    ],
+)
+async def test_user_decision_refusals_are_api_errors(
+    make: Any, status: int, error: str, description: str | None
+) -> None:
+    body: dict[str, Any] = {"error": error, "detail": "refused"}
+    if description is not None:
+        body["error_description"] = description
+    client, _ = make(lambda r: httpx.Response(status, json=body))
+    with pytest.raises(ApiError) as e:
+        await call(client, "grant_approval", APPROVAL_ID, "ID-TOKEN")
+    assert (e.value.status, e.value.error, e.value.description) == (status, error, description)
+
+
+async def test_user_decision_401_and_bad_input(make: Any) -> None:
+    body = {"error": "invalid_token", "detail": "expired", "error_description": "expired"}
+    client, seen = make(lambda r: httpx.Response(401, json=body))
+    with pytest.raises(Unauthorized) as e:
+        await call(client, "decline_approval", APPROVAL_ID, "ID-TOKEN")
+    assert (e.value.error, e.value.description) == ("invalid_token", "expired")
+    n = len(seen)
+    for bad in ("", "  "):
+        with pytest.raises(ValueError, match="id_token"):
+            await call(client, "grant_approval", APPROVAL_ID, bad)
+    with pytest.raises(ValueError):
+        await call(client, "grant_approval", "..", "ID-TOKEN")
+    assert len(seen) == n

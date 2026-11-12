@@ -61,6 +61,7 @@ export type {
   AuditPage,
   AuditQuery,
   BudgetLimit,
+  BudgetRefund,
   CheckpointPage,
   Decision,
   EvaluationBudget,
@@ -145,6 +146,7 @@ export {
   RefreshError,
   RpcError,
   TransportError,
+  TransportTimeoutError,
   UnauthorizedError,
   VerificationError,
 } from "./errors.js";
@@ -159,7 +161,12 @@ export { decodeToken, Token, TOKEN_TYPE, verifyToken } from "./token.js";
 export type { Chain, Hop, Jwks, User, VerifyOptions } from "./token.js";
 export type {
   Approval,
+  AuthzenConfiguration,
   AuthzenDecision,
+  AuthzenEntryError,
+  AuthzenEvaluation,
+  AuthzenEvaluationLike,
+  EvaluationsSemantic,
   ExchangeOptions,
   Lease,
   Tool,

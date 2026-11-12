@@ -975,3 +975,54 @@ describe("AdminClient approvals", () => {
     await expect(admin.approval("nope")).rejects.toBeInstanceOf(ApiError);
   });
 });
+
+describe("refundBudget (K-5)", () => {
+  it("posts the decision id and reason, and reads the answer", async () => {
+    const { fetch, calls } = mockFetch(() =>
+      jsonResponse({ decision_id: "d-1", refunded: 2, reason: "upstream failed", audit_id: "r-9" }),
+    );
+    const admin = new AdminClient(URL_, "adm", { fetch });
+    const res = await admin.refundBudget("d-1", "upstream failed");
+    expect(calls[0]!.method).toBe("POST");
+    expect(calls[0]!.url.pathname).toBe("/admin/budgets/refund");
+    expect(calls[0]!.headers.get("authorization")).toBe("Bearer adm");
+    expect(calls[0]!.body).toEqual({ decision_id: "d-1", reason: "upstream failed" });
+    expect(res).toEqual({
+      decisionId: "d-1",
+      refunded: 2,
+      reason: "upstream failed",
+      auditId: "r-9",
+    });
+  });
+
+  it("leaves the reason to the server, and reads a missing audit id", async () => {
+    const { fetch, calls } = mockFetch(() =>
+      jsonResponse({
+        decision_id: "d-1",
+        refunded: 0,
+        reason: "refunded by admin",
+        audit_id: null,
+      }),
+    );
+    const res = await new AdminClient(URL_, "adm", { fetch }).refundBudget("d-1");
+    expect(calls[0]!.body).toEqual({ decision_id: "d-1" });
+    expect(res).toMatchObject({ refunded: 0, reason: "refunded by admin", auditId: undefined });
+    await expect(new AdminClient(URL_, "adm", { fetch }).refundBudget(" ")).rejects.toThrow(
+      /decisionId/,
+    );
+    expect(calls).toHaveLength(1);
+  });
+
+  it.each([
+    [409, "already_refunded"],
+    [410, "charge_pruned"],
+    [404, "not_found"],
+  ])("throws %i %s as an ApiError without a decision id", async (status, error) => {
+    const { fetch } = mockFetch(() => jsonResponse({ error, detail: "refused" }, status));
+    const err = await new AdminClient(URL_, "adm", { fetch })
+      .refundBudget("d-1")
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err).toMatchObject({ status, error, decisionId: undefined });
+  });
+});
