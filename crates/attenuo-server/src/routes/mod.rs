@@ -4,6 +4,7 @@ pub mod admin;
 pub mod approvals;
 pub mod authzen;
 pub mod dev_root;
+pub mod extract;
 pub mod ops;
 pub mod policies;
 pub mod renew;

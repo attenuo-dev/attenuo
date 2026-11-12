@@ -19,7 +19,6 @@ use std::sync::Arc;
 use attenuo_audit::LeaseStore;
 use attenuo_core::{AgentId, CapabilitySet, OriginatingUser};
 use attenuo_token::{ExchangeResponse, IssueOptions, MayAct};
-use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -27,6 +26,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use time::Duration;
 
+use super::extract::Body;
 use super::{
     audit_admin, audit_issuance, no_store, parse_json, register_issued, REASON_ADMIN_ACTION,
 };
@@ -74,7 +74,7 @@ pub struct RootTokenRequest {
 pub async fn mint_root(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
-    body: Bytes,
+    Body(body): Body,
 ) -> Result<Response, ApiError> {
     let req: RootTokenRequest = parse_json(&body)?;
     state

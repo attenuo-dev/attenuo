@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use attenuo_core::{chain_id_of, CapabilitySet, Clock, DelegationChain, ToolCall};
 use axum::body::{Body, Bytes};
-use axum::extract::{OriginalUri, Path, State};
+use axum::extract::{FromRequestParts, OriginalUri, Path, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -478,6 +478,34 @@ fn unknown_server(server: &str) -> Response {
         None,
     );
     json_response(StatusCode::NOT_FOUND, &body)
+}
+
+/// The `{server}` of `/mcp/{server}`. A name that is not UTF-8 once percent-decoded is refused
+/// as HTTP 400 with JSON-RPC `-32600` and `id: null`, not axum's `text/plain` rejection (K-10);
+/// the message does not repeat the name.
+struct ServerName(String);
+
+impl<S: Send + Sync> FromRequestParts<S> for ServerName {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Response> {
+        match Path::<String>::from_request_parts(parts, state).await {
+            Ok(Path(server)) => Ok(ServerName(server)),
+            Err(e) => {
+                tracing::debug!(error = ?e.body_text(), "request rejected: bad server name");
+                let body = error_response(
+                    Value::Null,
+                    CODE_INVALID_REQUEST,
+                    "attenuo: the server name in the path is not valid UTF-8".to_string(),
+                    None,
+                );
+                Err(json_response(StatusCode::BAD_REQUEST, &body))
+            }
+        }
+    }
 }
 
 fn json_response(status: StatusCode, body: &Value) -> Response {
@@ -1012,7 +1040,7 @@ fn forward_headers(headers: &HeaderMap, names: &[&'static str]) -> HeaderMap {
 
 async fn handle_passthrough(
     State(state): State<Arc<AppState>>,
-    Path(server): Path<String>,
+    ServerName(server): ServerName,
     OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
@@ -1284,7 +1312,7 @@ struct PostTiming {
 
 async fn handle_post(
     State(state): State<Arc<AppState>>,
-    Path(server): Path<String>,
+    ServerName(server): ServerName,
     OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     body: Body,

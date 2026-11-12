@@ -12,7 +12,7 @@ use attenuo_audit::{
 };
 use attenuo_core::{AgentId, LeaseId, RecordKind};
 use axum::body::Bytes;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use super::extract::{Body, Path, Query};
 use super::{audit_admin, bearer_of, REASON_ADMIN_ACTION};
 use crate::error::ApiError;
 use crate::metrics::RefundSource;
@@ -99,7 +100,7 @@ pub struct RevokeBody {
 pub async fn revoke_lease(
     State(state): State<Arc<AppState>>,
     Path(lease_id): Path<String>,
-    body: Bytes,
+    Body(body): Body,
 ) -> Result<Json<Value>, ApiError> {
     let body: RevokeBody = if body.is_empty() {
         RevokeBody::default()
@@ -309,7 +310,7 @@ fn selector_response(
 pub async fn revoke_by_selector(
     State(state): State<Arc<AppState>>,
     Query(q): Query<SelectorRevokeQuery>,
-    body: Bytes,
+    Body(body): Body,
 ) -> Result<Json<Value>, ApiError> {
     let body: SelectorRevokeBody = if body.is_empty() {
         SelectorRevokeBody::default()
@@ -403,7 +404,7 @@ pub struct RefundBody {
 /// audit lookup fails.
 pub async fn refund_budget(
     State(state): State<Arc<AppState>>,
-    body: Bytes,
+    Body(body): Body,
 ) -> Result<Json<Value>, ApiError> {
     let body: RefundBody = super::parse_json(&body)?;
     let reason = body

@@ -41,8 +41,7 @@ use attenuo_core::{
     ApprovalInfo, Decision, DecisionRecord, LeaseId, RecordKind, ToolCall,
     REASON_APPROVAL_DECLINED, REASON_APPROVAL_GRANTED,
 };
-use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use serde::Deserialize;
@@ -50,6 +49,7 @@ use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use super::extract::{Body, Path, Query};
 use super::{bearer_of, parse_json, ADMIN_SUBJECT};
 use crate::error::{ApiError, REASON_MISSING_TOKEN};
 use crate::state::AppState;
@@ -316,7 +316,7 @@ pub async fn user_decide(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    Body(body): Body,
 ) -> Result<Json<Value>, ApiError> {
     let body: DecideBody = parse_json(&body)?;
     let grant = body.grant()?;
@@ -417,7 +417,7 @@ pub async fn user_get(
 pub async fn admin_decide(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    body: Bytes,
+    Body(body): Body,
 ) -> Result<Json<Value>, ApiError> {
     let body: DecideBody = parse_json(&body)?;
     let grant = body.grant()?;

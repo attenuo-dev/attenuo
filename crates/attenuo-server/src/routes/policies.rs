@@ -12,7 +12,6 @@ use attenuo_core::{DelegationChain, ToolCall};
 use attenuo_policy::authzen::{self, EvaluationRequest};
 use attenuo_policy::{ArgLabels, CallLabels, SessionLabels};
 use attenuo_token::{TokenError, VerifiedToken, Verifier};
-use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
@@ -23,6 +22,7 @@ use sha2::Digest;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use super::extract::Body;
 use super::parse_json;
 use crate::authz::{CounterSource, StatedBudget, StatedLimit, MAX_STATED_LIMITS};
 use crate::error::ApiError;
@@ -173,7 +173,7 @@ pub async fn check_policies(State(state): State<Arc<AppState>>) -> Result<Json<V
 /// expiring); 400 `invalid_chain` for a body chain that fails `validate_at`.
 pub async fn evaluate_policies(
     State(state): State<Arc<AppState>>,
-    body: Bytes,
+    Body(body): Body,
 ) -> Result<Json<Value>, ApiError> {
     let now = state.now();
     let mut raw: Value = parse_json(&body)?;
