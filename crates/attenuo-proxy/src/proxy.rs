@@ -329,6 +329,21 @@ fn unauthorized(err: AuthError) -> Response {
 /// `X-Attenuo-Decision-Id` and `data.decision_id`.
 fn unauthorized_recorded(err: AuthError, decision_id: Option<Uuid>) -> Response {
     let reason = err.reason();
+    if let AuthError::RateLimited(secs) = &err {
+        // Over a per-run rate limit: the token is good, so not a 401. Logged by the
+        // authorizer once per run and window, not here per request.
+        tracing::debug!(reason, "request refused: rate limited");
+        let body = error_response(
+            Value::Null,
+            CODE_TOO_MANY,
+            "attenuo: too many requests for this run; retry later",
+            Some(serde_json::json!({ "reason": reason })),
+        );
+        let mut resp = json_response(StatusCode::TOO_MANY_REQUESTS, &body);
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from((*secs).max(1)));
+        return resp;
+    }
     if let AuthError::Unavailable(_) = &err {
         // A server-side limit, not a bad credential: 503, so the client keeps its token and
         // key and retries (SR-47).

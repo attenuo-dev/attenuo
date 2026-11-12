@@ -72,6 +72,55 @@ pub enum ExhaustedAt {
     Charge = 1,
 }
 
+/// Which `[limits]` rate limit refused a request (the `limit` label of
+/// `requests_rate_limited_total`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitedBy {
+    /// `token_requests_per_minute`, per authenticated agent.
+    Token = 0,
+    /// `token_unauthenticated_requests_per_minute`, per peer address.
+    TokenUnauthenticated = 1,
+    /// `mcp_requests_per_minute`, per run.
+    Mcp = 2,
+}
+
+impl RateLimitedBy {
+    /// Every limit, in index order.
+    pub const ALL: [RateLimitedBy; 3] = [
+        RateLimitedBy::Token,
+        RateLimitedBy::TokenUnauthenticated,
+        RateLimitedBy::Mcp,
+    ];
+
+    /// The label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            RateLimitedBy::Token => "token",
+            RateLimitedBy::TokenUnauthenticated => "token_unauthenticated",
+            RateLimitedBy::Mcp => "mcp",
+        }
+    }
+}
+
+/// Why a rate limit refused a request (the `cause` label of `requests_rate_limited_total`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitCause {
+    /// The caller used up its requests of the minute.
+    Limit = 0,
+    /// A new caller, and every tracked caller is inside its minute
+    /// (`[limits] rate_limit_max_keys`).
+    TableFull = 1,
+}
+
+/// Which `[limits]` deadline a request missed (the `kind` label of `request_timeouts_total`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutKind {
+    /// `request_body_timeout_seconds`.
+    Body = 0,
+    /// `request_timeout_seconds`.
+    Handler = 1,
+}
+
 /// Who returned a run-limit charge (the `source` label of `budget_refunds_total`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefundSource {
@@ -184,6 +233,11 @@ pub struct Metrics {
     lease_refusal_suppressed: Mutex<BTreeMap<(String, usize), u64>>,
     /// `tools/list` entries the list screen hid (ADR-0011), by [`LIST_HIDE_REASONS`] index.
     list_entries_hidden: [AtomicU64; LIST_HIDE_REASONS.len()],
+    /// `[limits]`: requests refused by the in-flight cap, by a rate limit (by
+    /// [`RateLimitedBy`] and [`RateLimitCause`]), and past a deadline (by [`TimeoutKind`]).
+    requests_shed: AtomicU64,
+    rate_limited: [[AtomicU64; 2]; 3],
+    request_timeouts: [AtomicU64; 2],
 }
 
 /// The reasons of `proxy_list_entries_hidden_total`, the list screen's hide reasons.
@@ -238,6 +292,9 @@ impl Default for Metrics {
             stream_end_suppressed: Default::default(),
             lease_refusal_suppressed: Mutex::default(),
             list_entries_hidden: Default::default(),
+            requests_shed: AtomicU64::default(),
+            rate_limited: Default::default(),
+            request_timeouts: Default::default(),
         }
     }
 }
@@ -390,6 +447,21 @@ impl Metrics {
         if let Ok(mut m) = self.http.lock() {
             *m.entry((route.to_string(), status)).or_default() += 1;
         }
+    }
+
+    /// Count one request refused by `[limits] max_in_flight`.
+    pub fn request_shed(&self) {
+        self.requests_shed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one request refused by a `[limits]` rate limit.
+    pub fn rate_limited(&self, by: RateLimitedBy, cause: RateLimitCause) {
+        self.rate_limited[by as usize][cause as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one request past a `[limits]` deadline.
+    pub fn request_timed_out(&self, kind: TimeoutKind) {
+        self.request_timeouts[kind as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record how long one authorization decision took.
@@ -807,6 +879,49 @@ impl Metrics {
                     escape(route)
                 );
             }
+        }
+        simple_counter(
+            &mut out,
+            "requests_shed_total",
+            "Requests answered 503 overloaded at once because [limits] max_in_flight requests \
+             were already being handled. /healthz and /readyz are never shed.",
+            &self.requests_shed,
+        );
+        header_lines(
+            &mut out,
+            "requests_rate_limited_total",
+            "Requests answered 429 by a [limits] rate limit, by limit (token: per agent, \
+             token_unauthenticated: per peer address, mcp: per run) and cause (limit: the \
+             caller used up its minute; table_full: a new caller while rate_limit_max_keys \
+             callers were inside their minute).",
+            "counter",
+        );
+        for by in RateLimitedBy::ALL {
+            for (cause, c) in ["limit", "table_full"]
+                .iter()
+                .zip(&self.rate_limited[by as usize])
+            {
+                let _ = writeln!(
+                    out,
+                    "{PREFIX}_requests_rate_limited_total{{limit=\"{}\",cause=\"{cause}\"}} {}",
+                    by.label(),
+                    c.load(Ordering::Relaxed)
+                );
+            }
+        }
+        header_lines(
+            &mut out,
+            "request_timeouts_total",
+            "Requests past a [limits] deadline, by kind (body: the body did not arrive within \
+             request_body_timeout_seconds; handler: no answer within request_timeout_seconds).",
+            "counter",
+        );
+        for (kind, c) in ["body", "handler"].iter().zip(&self.request_timeouts) {
+            let _ = writeln!(
+                out,
+                "{PREFIX}_request_timeouts_total{{kind=\"{kind}\"}} {}",
+                c.load(Ordering::Relaxed)
+            );
         }
         self.authorize.render(
             &mut out,

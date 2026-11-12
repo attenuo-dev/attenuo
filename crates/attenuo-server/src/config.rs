@@ -111,6 +111,10 @@ pub struct Config {
     /// `[logging]`: the log format and subject redaction ([`crate::logging::LoggingSection`]).
     #[serde(default)]
     pub logging: crate::logging::LoggingSection,
+    /// `[limits]`: the in-flight cap, request timeouts and per-caller rate limits of the main
+    /// listener. See [`LimitsSection`].
+    #[serde(default)]
+    pub limits: LimitsSection,
 }
 
 /// `[authzen]`
@@ -2137,6 +2141,184 @@ impl ProxySection {
     }
 }
 
+/// `[limits]`: basic protection of one server process against too much work at once
+/// (audit finding S-4). Every figure is per process: with one replica, per server.
+///
+/// - `max_in_flight` caps the requests of the main listener being handled at once; one more
+///   is answered `503` with `Retry-After` at once instead of queueing. `/healthz` and `/readyz`
+///   are never refused by it, and the `[metrics]`, `[admin] listen` and `[admin_ui]` listeners
+///   are not counted. A request counts until its answer starts: a streamed MCP answer (SSE,
+///   the `GET` listen stream) stops counting once its headers are sent.
+/// - `header_read_timeout_seconds` bounds the wait for a request's headers on every listener,
+///   the idle time of a kept-alive connection included; past it the connection is closed.
+/// - `request_body_timeout_seconds` bounds the read of a request body, from the moment its
+///   headers are in; past it the answer is `408` (`400` with the JSON-RPC shape on `/mcp`).
+/// - `request_timeout_seconds` bounds the time to an answer of every route of the main
+///   listener except `/mcp/{server}` (bounded by the `[proxy]` upstream deadlines, and whose
+///   streams must stay open) and `/admin/*` (an audit verify or export of a large log may take
+///   longer); past it the answer is `503` with `Retry-After`.
+/// - `token_requests_per_minute`, `token_unauthenticated_requests_per_minute` and
+///   `mcp_requests_per_minute` are per-caller fixed-window rate limits, off (0) by default:
+///   `POST /token` per authenticated agent, `POST /token` requests that authenticated no
+///   agent per peer address, and `/mcp/{server}` per run (the chain's root lease). Over the
+///   limit the answer is `429` with `Retry-After`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsSection {
+    /// Most requests the main listener handles at once; one more gets `503` `overloaded`.
+    /// 0 turns the cap off. Default 1024, at most 1000000.
+    #[serde(default = "default_max_in_flight")]
+    pub max_in_flight: u64,
+    /// How long, in seconds, a connection may take to send a request's headers, or stay idle
+    /// between requests. Default 30, between 1 and 300.
+    #[serde(default = "default_header_read_timeout_seconds")]
+    pub header_read_timeout_seconds: u64,
+    /// How long, in seconds, a request body may take to arrive once the headers are in.
+    /// Default 30, between 1 and 3600.
+    #[serde(default = "default_request_body_timeout_seconds")]
+    pub request_body_timeout_seconds: u64,
+    /// How long, in seconds, a route other than `/mcp/{server}` and `/admin/*` may take to
+    /// answer. Default 60, between 1 and 3600.
+    #[serde(default = "default_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+    /// `POST /token` requests per minute per authenticated agent (client credentials or actor
+    /// token). 0 (the default) turns it off; at most 1000000.
+    #[serde(default)]
+    pub token_requests_per_minute: u64,
+    /// `POST /token` requests per minute per peer address (IPv6 by /64) that authenticated no
+    /// agent: refused before authentication, failed it, or (with `[token] require_actor_auth =
+    /// false`) sent no credentials. Once a peer has used them up, every `POST /token` from it
+    /// is refused until the minute ends. 0 (the default) turns it off; at most 1000000.
+    #[serde(default)]
+    pub token_unauthenticated_requests_per_minute: u64,
+    /// Requests per minute to `/mcp/{server}` per run (the delegation chain's root lease),
+    /// counted once the token and its DPoP proof have verified. 0 (the default) turns it off;
+    /// at most 1000000.
+    #[serde(default)]
+    pub mcp_requests_per_minute: u64,
+    /// Most callers each rate limit tracks at once. Callers whose minute has ended are dropped
+    /// first; when every tracked caller is inside its minute, a new caller is refused (`429`)
+    /// until one ends. Default 10000, between 100 and 1000000.
+    #[serde(default = "default_rate_limit_max_keys")]
+    pub rate_limit_max_keys: u64,
+}
+
+/// Default `[limits] max_in_flight`.
+pub const DEFAULT_MAX_IN_FLIGHT: u64 = 1_024;
+/// Default `[limits] header_read_timeout_seconds` (hyper's own default).
+pub const DEFAULT_HEADER_READ_TIMEOUT_SECONDS: u64 = 30;
+/// Default `[limits] request_body_timeout_seconds`.
+pub const DEFAULT_REQUEST_BODY_TIMEOUT_SECONDS: u64 = 30;
+/// Default `[limits] request_timeout_seconds`.
+pub const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 60;
+/// Default `[limits] rate_limit_max_keys`.
+pub const DEFAULT_RATE_LIMIT_MAX_KEYS: u64 = 10_000;
+/// Largest `[limits] max_in_flight` and largest per-minute rate.
+pub const MAX_LIMITS_COUNT: u64 = 1_000_000;
+
+fn default_max_in_flight() -> u64 {
+    DEFAULT_MAX_IN_FLIGHT
+}
+
+fn default_header_read_timeout_seconds() -> u64 {
+    DEFAULT_HEADER_READ_TIMEOUT_SECONDS
+}
+
+fn default_request_body_timeout_seconds() -> u64 {
+    DEFAULT_REQUEST_BODY_TIMEOUT_SECONDS
+}
+
+fn default_request_timeout_seconds() -> u64 {
+    DEFAULT_REQUEST_TIMEOUT_SECONDS
+}
+
+fn default_rate_limit_max_keys() -> u64 {
+    DEFAULT_RATE_LIMIT_MAX_KEYS
+}
+
+impl Default for LimitsSection {
+    fn default() -> Self {
+        Self {
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            header_read_timeout_seconds: DEFAULT_HEADER_READ_TIMEOUT_SECONDS,
+            request_body_timeout_seconds: DEFAULT_REQUEST_BODY_TIMEOUT_SECONDS,
+            request_timeout_seconds: DEFAULT_REQUEST_TIMEOUT_SECONDS,
+            token_requests_per_minute: 0,
+            token_unauthenticated_requests_per_minute: 0,
+            mcp_requests_per_minute: 0,
+            rate_limit_max_keys: DEFAULT_RATE_LIMIT_MAX_KEYS,
+        }
+    }
+}
+
+impl LimitsSection {
+    /// Check every key's range. Called at startup.
+    ///
+    /// # Errors
+    ///
+    /// When a timeout is outside its range (`header_read_timeout_seconds` 1 to 300, the other
+    /// two 1 to 3600), `max_in_flight` or a rate is over 1000000, or `rate_limit_max_keys` is
+    /// outside 100 to 1000000; the message names the first.
+    pub fn check(&self) -> anyhow::Result<()> {
+        for (name, value, min, max) in [
+            ("max_in_flight", self.max_in_flight, 0, MAX_LIMITS_COUNT),
+            (
+                "header_read_timeout_seconds",
+                self.header_read_timeout_seconds,
+                1,
+                300,
+            ),
+            (
+                "request_body_timeout_seconds",
+                self.request_body_timeout_seconds,
+                1,
+                3_600,
+            ),
+            (
+                "request_timeout_seconds",
+                self.request_timeout_seconds,
+                1,
+                3_600,
+            ),
+            (
+                "token_requests_per_minute",
+                self.token_requests_per_minute,
+                0,
+                MAX_LIMITS_COUNT,
+            ),
+            (
+                "token_unauthenticated_requests_per_minute",
+                self.token_unauthenticated_requests_per_minute,
+                0,
+                MAX_LIMITS_COUNT,
+            ),
+            (
+                "mcp_requests_per_minute",
+                self.mcp_requests_per_minute,
+                0,
+                MAX_LIMITS_COUNT,
+            ),
+            (
+                "rate_limit_max_keys",
+                self.rate_limit_max_keys,
+                100,
+                MAX_LIMITS_COUNT,
+            ),
+        ] {
+            if !(min..=max).contains(&value) {
+                anyhow::bail!("[limits] {name} must be between {min} and {max}, not {value}");
+            }
+        }
+        Ok(())
+    }
+
+    /// `header_read_timeout_seconds` as a duration (clamped into its range, so an unchecked
+    /// section still gives a usable value).
+    pub fn header_read_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.header_read_timeout_seconds.clamp(1, 300))
+    }
+}
+
 /// Default `[[idps]] allowed_algs`.
 pub const DEFAULT_IDP_ALGS: &[&str] = &["RS256", "ES256", "EdDSA"];
 /// Default `[[idps]] attribute_claims`.
@@ -2952,11 +3134,47 @@ mod tests {
 
     use super::*;
 
+    /// The `[limits]` defaults: a cap, the three deadlines, and every rate limit off.
+    #[test]
+    fn limits_defaults() {
+        let l = Config::from_toml("").unwrap().limits;
+        assert_eq!(
+            (
+                l.max_in_flight,
+                l.header_read_timeout_seconds,
+                l.request_body_timeout_seconds,
+                l.request_timeout_seconds,
+            ),
+            (1_024, 30, 30, 60)
+        );
+        assert_eq!(
+            (
+                l.token_requests_per_minute,
+                l.token_unauthenticated_requests_per_minute,
+                l.mcp_requests_per_minute,
+                l.rate_limit_max_keys,
+            ),
+            (0, 0, 0, 10_000)
+        );
+        l.check().unwrap();
+        // The edges of each range are accepted.
+        let edges = Config::from_toml(
+            "[limits]\nmax_in_flight = 0\nheader_read_timeout_seconds = 300\n\
+             request_body_timeout_seconds = 1\nrequest_timeout_seconds = 3600\n\
+             mcp_requests_per_minute = 1000000\nrate_limit_max_keys = 100\n",
+        )
+        .unwrap();
+        edges.limits.check().unwrap();
+    }
+
     #[test]
     fn example_config_parses() {
         let text = include_str!("../../../config/example.toml");
         let cfg = Config::from_toml(text).unwrap();
         assert_eq!(cfg.server.listen, "127.0.0.1:8080".parse().unwrap());
+        // The example spells out the `[limits]` defaults.
+        assert_eq!(cfg.limits, LimitsSection::default());
+        cfg.limits.check().unwrap();
         assert_eq!(cfg.upstreams.len(), 1);
         assert!(
             cfg.admin.token.is_none(),

@@ -316,7 +316,8 @@ impl StreamGuard {
                 | AuthError::InvalidToken(_)
                 | AuthError::DpopRequired
                 | AuthError::InvalidDpopProof(_)
-                | AuthError::UseDpopNonce(_),
+                | AuthError::UseDpopNonce(_)
+                | AuthError::RateLimited(_),
             ) => fail(
                 "unauthorized".to_owned(),
                 false,

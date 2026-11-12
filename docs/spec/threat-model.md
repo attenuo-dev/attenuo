@@ -40,6 +40,8 @@ An attacker may do any of the following; attenuo's guarantees must hold anyway.
 
 Out of scope: compromise of attenuo's host or signing keys, compromise of the IdP, side channels, denial of service against attenuo itself.
 
+Denial of service stays out of scope as a security property: attenuo fails closed, so a swamped server refuses calls rather than letting them through, and nothing here claims it stays available under attack. The server does have basic protections against one caller or a burst taking the process down ([`[limits]`](../reference/config.md#limits), single replica, all in-process): a cap on requests in flight that answers `503` at once instead of queueing (never on `/healthz` or `/readyz`), header, body and handler deadlines, optional per-run (`/mcp`), per-agent and per-peer-address (`POST /token`) rate limits answering `429`, and bounded queues and deadlines behind them (the audit writer's queue and append timeout, upstream connect and response deadlines, key-fetch timeouts, the session registry). A flood beyond these, or from many addresses, is for the network in front of attenuo.
+
 ## Incident mapping
 
 Sources: [AuthZed timeline](https://authzed.com/blog/timeline-mcp-breaches), [Practical DevSecOps roundup](https://www.practical-devsecops.com/mcp-security-statistics-2026-report/). Properties are as defined in [RFC-0001 §2](rfc-0001-attenuo.md#2-security-properties).

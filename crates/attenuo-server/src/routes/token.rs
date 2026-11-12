@@ -93,6 +93,7 @@ use crate::actor::{VerifiedActor, ACTOR_TOKEN_TYPE};
 use crate::clientauth::{self, ClientKind};
 use crate::config::{capability_set, ActorAuth, CapSpec};
 use crate::error::ApiError;
+use crate::limits::CallerMark;
 use crate::state::AppState;
 
 /// `POST /token`: RFC 8693 exchange from hop n to n+1, or hop-0 IdP intake (see the module
@@ -110,15 +111,18 @@ use crate::state::AppState;
 pub async fn exchange(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    extensions: axum::http::Extensions,
     Body(body): Body,
 ) -> Result<Response, ApiError> {
+    // Set by `crate::limits::token_peer_limit`, which `crate::router` mounts on this route.
+    let mark = extensions.get::<CallerMark>().cloned();
     let value = parse_body(&headers, &body)?;
     let now = state.now();
     if crate::idp::intake::is_intake(&value) {
         // Hop 0 from an IdP credential: the exported span (`crate::telemetry::trace_route`)
         // is `attenuo.token.root`, not `attenuo.token.exchange`.
         tracing::Span::current().record("otel.name", "attenuo.token.root");
-        return crate::idp::intake::handle(&state, &headers, value, now).await;
+        return crate::idp::intake::handle(&state, &headers, value, mark.as_ref(), now).await;
     }
     let mut value = value;
     // The actor token is verified here, on the async side: it may need a JWKS fetch.
@@ -128,7 +132,7 @@ pub async fn exchange(
     };
     // Lease lookups, registration and the audit append are SQLite calls: off the async workers.
     state
-        .blocking(move |s| exchange_sync(s, &headers, value, actor, now))
+        .blocking(move |s| exchange_sync(s, &headers, value, actor, mark.as_ref(), now))
         .await
 }
 
@@ -268,6 +272,7 @@ fn exchange_sync(
     headers: &HeaderMap,
     value: Value,
     actor: Option<(VerifiedActor, String)>,
+    mark: Option<&CallerMark>,
     now: OffsetDateTime,
 ) -> Result<Response, ApiError> {
     let field = |k: &str| value.get(k).and_then(Value::as_str).map(str::to_owned);
@@ -291,6 +296,8 @@ fn exchange_sync(
     // subject token has verified, so that the refusal is audited against its chain.
     let mut mismatch = None;
     let mut actor_auth = "none";
+    // The agent this request authenticated as, for `[limits] token_requests_per_minute`.
+    let mut caller = actor.as_ref().map(|(verified, _)| verified.agent.clone());
     if let Some((verified, _)) = &actor {
         if verified.agent != req.actor.0 {
             mismatch = Some(clientauth::invalid_request(
@@ -331,6 +338,11 @@ fn exchange_sync(
         } else {
             "client_secret"
         };
+        caller = Some(agent);
+    }
+    // Before the subject token, the lease lookups, signing and the audit append.
+    if let Some(agent) = &caller {
+        state.limits.admit_agent(mark, agent)?;
     }
     if req.requested.is_empty() {
         return Err(ApiError::bad_request(

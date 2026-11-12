@@ -165,6 +165,12 @@ pub enum AuthError {
     /// good token or key (SR-47).
     #[error("temporarily unavailable: {0}")]
     Unavailable(String),
+    /// The caller is over a rate limit of the authorizer (the server's `[limits]
+    /// mcp_requests_per_minute`, per run). The number is how many seconds until it may retry.
+    /// The proxy answers `429` with `Retry-After` and JSON-RPC `-32007`, not `401`: the token
+    /// is good.
+    #[error("rate limited; retry in {0} s")]
+    RateLimited(u64),
 }
 
 /// Reason code of [`AuthError::MissingToken`].
@@ -177,6 +183,8 @@ pub const REASON_TOKEN_EXPIRED: &str = "token_expired";
 pub const REASON_DPOP_REQUIRED: &str = "dpop_required";
 /// Reason code of [`AuthError::InvalidDpopProof`].
 pub const REASON_INVALID_DPOP_PROOF: &str = "invalid_dpop_proof";
+/// Reason code of [`AuthError::RateLimited`].
+pub const REASON_RATE_LIMITED: &str = "rate_limited";
 /// Reason code of [`AuthError::UseDpopNonce`] (RFC 9449 §9).
 pub const REASON_USE_DPOP_NONCE: &str = "use_dpop_nonce";
 /// Reason code (JSON-RPC `data.reason`) for a call whose result was withheld because it could
@@ -201,6 +209,7 @@ impl AuthError {
             AuthError::InvalidDpopProof(_) => REASON_INVALID_DPOP_PROOF,
             AuthError::UseDpopNonce(_) => REASON_USE_DPOP_NONCE,
             AuthError::Unavailable(reason) => reason,
+            AuthError::RateLimited(_) => REASON_RATE_LIMITED,
         }
     }
 

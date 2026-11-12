@@ -108,6 +108,8 @@ pub struct AppState {
     /// `[telemetry]`: the trace hook of the exported spans; `None` when export is off
     /// ([`crate::telemetry`]).
     pub trace: Option<Arc<crate::telemetry::ServerTrace>>,
+    /// `[limits]`: the in-flight cap, the deadlines and the rate limits ([`crate::limits`]).
+    pub(crate) limits: Arc<crate::limits::Limits>,
     /// The single-writer fence on `<sqlite_path>.lock`, held for as long as the state lives
     /// (the OS releases it when the process exits); `None` for `:memory:`. Declared last, so
     /// it is released after the stores above.
@@ -123,7 +125,7 @@ impl AppState {
     /// # Errors
     ///
     /// When a check of the config fails (server names, public URL, admin token, listeners,
-    /// `[authzen]`, `[proxy]`, `[token] dpop`, `[approvals]`, `[leases]`), when the issuer's keys
+    /// `[authzen]`, `[proxy]`, `[limits]`, `[token] dpop`, `[approvals]`, `[leases]`), when the issuer's keys
     /// cannot be loaded, when the policies do not parse or validate, when the audit log or lease
     /// store cannot be opened, or when the IdP, agent, PEP or actor-trust entries are invalid.
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
@@ -155,6 +157,7 @@ impl AppState {
         config.proxy.check_limits()?;
         config.proxy.record_window()?;
         config.proxy.upstream_timeouts()?;
+        config.limits.check()?;
         config.audit.append_limits()?;
         config.token.check_dpop()?;
         config.approvals.check()?;
@@ -189,6 +192,7 @@ impl AppState {
 
         let checkpoint_keys = CheckpointKeys::from_jwks(&jwks)?;
         let metrics = Metrics::new();
+        let metrics_for_limits = metrics.clone();
         let checkpoint_sink = match &config.audit.sink {
             Some(cfg) => {
                 let sink = crate::sink::CheckpointSink::start(
@@ -356,6 +360,10 @@ impl AppState {
             approval_notifier,
             clock,
             trace,
+            limits: Arc::new(crate::limits::Limits::new(
+                &config.limits,
+                metrics_for_limits,
+            )),
             store_fence,
             released: tokio::sync::watch::Sender::new(()),
         })

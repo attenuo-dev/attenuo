@@ -108,6 +108,7 @@ pub(crate) async fn handle(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     body: Value,
+    mark: Option<&crate::limits::CallerMark>,
     now: OffsetDateTime,
 ) -> Result<Response, ApiError> {
     let mut body = body;
@@ -129,6 +130,9 @@ pub(crate) async fn handle(
         &req,
         actor.as_ref().map(|(v, _)| v),
     )?;
+    // `[limits] token_requests_per_minute`: before the DPoP proof, the IdP credential, the
+    // lease registration, signing and the audit append.
+    state.limits.admit_agent(mark, &agent)?;
     // DPoP (SR-24): bind the root token to the proof's key, per `[token] dpop`.
     let cnf = state.dpop.bind_new(
         crate::dpop::header_proof(headers)?,
