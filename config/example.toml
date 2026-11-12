@@ -98,6 +98,12 @@ durability = "normal"
 # (and after every 256 commits), so appends do not wait while it copies; at "normal" that is
 # also when the newest decisions reach the disk. 0 leaves it to SQLite on the writer.
 wal_checkpoint_seconds = 5
+# Appends waiting for the audit writer: at most append_queue_max at once (16 to 1000000), each
+# for at most append_timeout_seconds (1 to 300). Past either the decision is denied with
+# audit_error and counted in audit_append_shed_total, so a hung disk denies calls instead of
+# piling up blocked threads.
+append_queue_max = 1024
+append_timeout_seconds = 10
 
 # Ship every signed checkpoint off the host as it is created (SR-21). The signing key lives
 # here, so only a copy that already left the host shows a log rewritten and re-signed later
@@ -321,6 +327,12 @@ max_sessions_per_principal = 64
 # windows each kind keeps open (100 to 1000000; a full table records rather than suppresses).
 record_window_seconds = 60
 record_window_max_keys = 10000
+# Upstream deadlines. Connecting (1 to 300 s): a failure is 502 upstream_unreachable, nothing
+# was sent. Response headers, and a JSON body the proxy buffers, counted from sending (1 to
+# 3600 s): past it, 504 upstream_timeout, and the upstream may have acted. An SSE stream that
+# has started is never cut by it. Raise it for tools that answer in JSON after a long run.
+upstream_connect_timeout_seconds = 5
+upstream_response_timeout_seconds = 30
 
 [metrics]
 # Prometheus text endpoint on its OWN listener (GET /metrics), never on the proxy port.

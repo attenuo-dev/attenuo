@@ -104,6 +104,10 @@ pub struct AppState {
     /// `[telemetry]`: the trace hook of the exported spans; `None` when export is off
     /// ([`crate::telemetry`]).
     pub trace: Option<Arc<crate::telemetry::ServerTrace>>,
+    /// The single-writer fence on `<sqlite_path>.lock`, held for as long as the state lives
+    /// (the OS releases it when the process exits); `None` for `:memory:`. Declared last, so
+    /// it is released after the stores above.
+    store_fence: Option<attenuo_audit::WriterFence>,
 }
 
 impl AppState {
@@ -136,6 +140,8 @@ impl AppState {
         config.proxy.stream_recheck()?;
         config.proxy.check_limits()?;
         config.proxy.record_window()?;
+        config.proxy.upstream_timeouts()?;
+        config.audit.append_limits()?;
         config.token.check_dpop()?;
         config.approvals.check()?;
         let lease_maintenance = config.leases.maintenance()?;
@@ -183,7 +189,7 @@ impl AppState {
             }
             None => None,
         };
-        let (audit, leases) = open_storage(
+        let (audit, leases, store_fence) = open_storage(
             &config.audit,
             issuer.detached_signer(),
             metrics.clone(),
@@ -333,7 +339,16 @@ impl AppState {
             approval_notifier,
             clock,
             trace,
+            store_fence,
         })
+    }
+
+    /// The lock file of the single-writer fence this state holds (`<sqlite_path>.lock`);
+    /// `None` for an in-memory store, which takes no fence.
+    pub fn store_fence(&self) -> Option<&Path> {
+        self.store_fence
+            .as_ref()
+            .map(attenuo_audit::WriterFence::path)
     }
 
     /// The current time by [`AppState::clock`].
@@ -570,7 +585,12 @@ fn open_storage(
     signer: attenuo_token::DetachedSigner,
     metrics: Arc<Metrics>,
     sink: Option<crate::sink::SinkHandle>,
-) -> anyhow::Result<(Arc<SqliteAudit>, Arc<SqliteLeaseStore>)> {
+) -> anyhow::Result<(
+    Arc<SqliteAudit>,
+    Arc<SqliteLeaseStore>,
+    Option<attenuo_audit::WriterFence>,
+)> {
+    let (append_queue, append_timeout) = cfg.append_limits()?;
     let wal_metrics = Arc::clone(&metrics);
     // Runs after the commit that wrote the checkpoint was synced (SR-50); the sink only queues.
     let count = move |cp: &attenuo_audit::Checkpoint| {
@@ -582,23 +602,30 @@ fn open_storage(
     let path = cfg.sqlite_path.as_str();
     if path == ":memory:" {
         tracing::warn!("audit.sqlite_path is :memory:; the audit log is lost on exit");
-        return Ok((
-            Arc::new(
-                SqliteAudit::open_in_memory()?
-                    .with_checkpointing(signer, cfg.checkpoint_every)
-                    .with_checkpoint_hook(count),
-            ),
-            Arc::new(SqliteLeaseStore::open_in_memory()?),
-        ));
+        // Private to this process: nothing to fence.
+        let audit = Arc::new(
+            SqliteAudit::open_in_memory()?
+                .with_append_limits(append_queue, append_timeout)
+                .with_checkpointing(signer, cfg.checkpoint_every)
+                .with_checkpoint_hook(count),
+        );
+        watch_append_shedding(&wal_metrics, &audit);
+        return Ok((audit, Arc::new(SqliteLeaseStore::open_in_memory()?), None));
     }
     let p = Path::new(path);
     if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
+    // Before the file is opened: a second server on the same file stops here, before it has
+    // touched the database, recovered the outbox or started a writer (audit A-2).
+    let fence = attenuo_audit::WriterFence::acquire(p)
+        .with_context(|| format!("taking the single-writer fence of {path}"))?;
+    tracing::info!(lock = %fence.path().display(), "single-writer fence held");
     let wal_interval = std::time::Duration::from_secs(cfg.wal_checkpoint_seconds);
     let audit = Arc::new(
         SqliteAudit::open_with(p, cfg.durability)
             .with_context(|| format!("opening audit log {path}"))?
+            .with_append_limits(append_queue, append_timeout)
             .with_checkpointing(signer, cfg.checkpoint_every)
             .with_checkpoint_hook(count)
             .with_wal_checkpoints(wal_interval)
@@ -608,6 +635,7 @@ fn open_storage(
     // keep the store (and its final WAL checkpoint on drop) alive forever.
     let weak = Arc::downgrade(&audit);
     wal_metrics.set_wal_source(move || weak.upgrade().and_then(|a| a.wal_stats()));
+    watch_append_shedding(&wal_metrics, &audit);
     let mut leases = SqliteLeaseStore::open_with(p, cfg.durability)
         .with_context(|| format!("opening lease store {path}"))?;
     if !wal_interval.is_zero() {
@@ -620,7 +648,14 @@ fn open_storage(
         wal_checkpoint_seconds = cfg.wal_checkpoint_seconds,
         "audit store opened (WAL)"
     );
-    Ok((audit, Arc::new(leases)))
+    Ok((audit, Arc::new(leases), Some(fence)))
+}
+
+/// Serve the audit store's shed appends as `audit_append_shed_total`. Weak, as for the WAL
+/// source: the metrics must not keep the store alive.
+fn watch_append_shedding(metrics: &Metrics, audit: &Arc<SqliteAudit>) {
+    let weak = Arc::downgrade(audit);
+    metrics.set_append_source(move || weak.upgrade().map(|a| a.append_stats()));
 }
 
 #[cfg(test)]
@@ -917,6 +952,101 @@ mod tests {
         cfg.policy.schema_path = Some(dir.path().join("missing.cedarschema"));
         let err = format!("{:#}", AppState::from_config(&cfg).err().unwrap());
         assert!(err.contains("[policy] schema_path"), "{err}");
+    }
+
+    /// The single-writer fence (audit A-2): a second server on the same SQLite file refuses
+    /// to start, naming the lock file and the holder, and starts once the first is gone.
+    #[test]
+    fn a_second_server_on_one_file_is_refused_until_the_first_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.audit.sqlite_path = dir
+            .path()
+            .join("data/audit.sqlite")
+            .to_string_lossy()
+            .into_owned();
+        let (router, first) = crate::build(&cfg).unwrap();
+        let lock = first.store_fence().unwrap().to_path_buf();
+        assert!(
+            lock.ends_with("data/audit.sqlite.lock"),
+            "{}",
+            lock.display()
+        );
+
+        let err = crate::build(&cfg)
+            .err()
+            .expect("a second server must not start");
+        let text = format!("{err:#}");
+        assert!(text.contains("single-writer fence"), "{text}");
+        assert!(text.contains("audit.sqlite.lock"), "{text}");
+        assert!(
+            text.contains(&format!("pid {}", std::process::id())),
+            "{text}"
+        );
+        assert!(text.contains("strategy: Recreate"), "{text}");
+        assert!(matches!(
+            err.downcast_ref::<attenuo_audit::AuditError>(),
+            Some(attenuo_audit::AuditError::Fenced { .. })
+        ));
+
+        drop(router);
+        drop(first);
+        let (_router, second) = crate::build(&cfg).unwrap();
+        assert_eq!(second.store_fence(), Some(lock.as_path()));
+    }
+
+    /// An in-memory store is private to its process: no fence, and any number of them.
+    #[test]
+    fn in_memory_stores_take_no_fence() {
+        let cfg = Config::default();
+        assert_eq!(cfg.audit.sqlite_path, ":memory:");
+        let a = AppState::from_config(&cfg).unwrap();
+        let b = AppState::from_config(&cfg).unwrap();
+        assert!(a.store_fence().is_none() && b.store_fence().is_none());
+    }
+
+    #[test]
+    fn audit_append_limits_are_range_checked() {
+        for (queue, timeout, bad) in [
+            (15, 10, Some("append_queue_max")),
+            (1_000_001, 10, Some("append_queue_max")),
+            (1024, 0, Some("append_timeout_seconds")),
+            (1024, 301, Some("append_timeout_seconds")),
+            (16, 1, None),
+            (1_000_000, 300, None),
+        ] {
+            let mut cfg = Config::default();
+            cfg.audit.append_queue_max = queue;
+            cfg.audit.append_timeout_seconds = timeout;
+            match (AppState::from_config(&cfg), bad) {
+                (Ok(_), None) => {}
+                (Err(e), Some(key)) => assert!(e.to_string().contains(key), "{e}"),
+                (Ok(_), Some(key)) => panic!("{key}: {queue}/{timeout} accepted"),
+                (Err(e), None) => panic!("{queue}/{timeout} refused: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn upstream_timeouts_are_range_checked() {
+        for (connect, response, bad) in [
+            (0, 30, Some("upstream_connect_timeout_seconds")),
+            (301, 30, Some("upstream_connect_timeout_seconds")),
+            (5, 0, Some("upstream_response_timeout_seconds")),
+            (5, 3601, Some("upstream_response_timeout_seconds")),
+            (1, 1, None),
+            (300, 3600, None),
+        ] {
+            let mut cfg = Config::default();
+            cfg.proxy.upstream_connect_timeout_seconds = connect;
+            cfg.proxy.upstream_response_timeout_seconds = response;
+            match (AppState::from_config(&cfg), bad) {
+                (Ok(_), None) => {}
+                (Err(e), Some(key)) => assert!(e.to_string().contains(key), "{e}"),
+                (Ok(_), Some(key)) => panic!("{key}: {connect}/{response} accepted"),
+                (Err(e), None) => panic!("{connect}/{response} refused: {e}"),
+            }
+        }
     }
 
     #[test]

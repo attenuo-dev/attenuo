@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use attenuo_audit::WalStats;
+use attenuo_audit::{AppendStats, WalStats};
 use attenuo_core::{LimitKind, OutputLabel};
 use attenuo_proxy::guard::STREAM_END_TOOL;
 use attenuo_proxy::records::is_lease_refusal_tool;
@@ -90,6 +90,15 @@ impl std::fmt::Debug for WalSource {
     }
 }
 
+/// Reads the audit store's shed appends at render time (see [`Metrics::set_append_source`]).
+struct AppendSource(Box<dyn Fn() -> Option<AppendStats> + Send + Sync>);
+
+impl std::fmt::Debug for AppendSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AppendSource")
+    }
+}
+
 /// All server metrics. Cheap to share: clone the `Arc`.
 #[derive(Debug)]
 pub struct Metrics {
@@ -156,6 +165,8 @@ pub struct Metrics {
     run_lock_wait: Histogram,
     /// The background WAL checkpointer of the audit store, when there is one.
     wal: OnceLock<WalSource>,
+    /// The audit store's shed appends ([`attenuo_audit::SqliteAudit::append_stats`]).
+    append: OnceLock<AppendSource>,
     /// `GET` listen streams ended, by [`StreamEndCause::index`].
     streams_ended: [AtomicU64; StreamEndCause::ALL.len()],
     /// `stream.end` records not written, by [`StreamEndCause::index`] of the reason (only the
@@ -214,6 +225,7 @@ impl Default for Metrics {
             taint_matches: Default::default(),
             run_lock_wait: Histogram::new(&STAGE_BUCKETS),
             wal: OnceLock::new(),
+            append: OnceLock::new(),
             streams_ended: Default::default(),
             stream_end_suppressed: Default::default(),
             lease_refusal_suppressed: Mutex::default(),
@@ -408,6 +420,16 @@ impl Metrics {
     /// series are then left out.
     pub fn set_wal_source(&self, source: impl Fn() -> Option<WalStats> + Send + Sync + 'static) {
         let _ = self.wal.set(WalSource(Box::new(source)));
+    }
+
+    /// Read the audit store's shed appends through `source` at every render
+    /// (`audit_append_shed_total`). Set once; later calls are ignored. Until it is set, or
+    /// when `source` returns `None`, the series read zero.
+    pub fn set_append_source(
+        &self,
+        source: impl Fn() -> Option<AppendStats> + Send + Sync + 'static,
+    ) {
+        let _ = self.append.set(AppendSource(Box::new(source)));
     }
 
     /// Count one run-limit counter charged by an allowed call (ADR-0010).
@@ -638,6 +660,21 @@ impl Metrics {
             "Audit log appends that failed.",
             &self.audit_append_errors,
         );
+        let shed = self.append.get().and_then(|a| (a.0)()).unwrap_or_default();
+        header_lines(
+            &mut out,
+            "audit_append_shed_total",
+            "Audit appends that failed instead of waiting for the writer, by cause: queue_full \
+             ([audit] append_queue_max appends already waiting) or timeout (no answer within \
+             [audit] append_timeout_seconds). Their decisions are denied with audit_error.",
+            "counter",
+        );
+        for (cause, n) in [("queue_full", shed.queue_full), ("timeout", shed.timeouts)] {
+            let _ = writeln!(
+                out,
+                "{PREFIX}_audit_append_shed_total{{cause=\"{cause}\"}} {n}"
+            );
+        }
         simple_counter(
             &mut out,
             "audit_checkpoints_total",
@@ -1404,6 +1441,26 @@ mod tests {
             assert!(text.contains(&format!("{line}\n")), "{line}\n{text}");
         }
         assert!(!text.contains("attenuo_audit_checkpoint_last_timestamp_seconds 0\n"));
+    }
+
+    /// `audit_append_shed_total` reads zero until the store reports, then its counts.
+    #[test]
+    fn renders_audit_append_shedding() {
+        let m = Metrics::new();
+        let text = m.render();
+        check_text_format(&text).unwrap();
+        assert!(text.contains("attenuo_audit_append_shed_total{cause=\"queue_full\"} 0\n"));
+        assert!(text.contains("attenuo_audit_append_shed_total{cause=\"timeout\"} 0\n"));
+        m.set_append_source(|| {
+            Some(AppendStats {
+                queue_full: 3,
+                timeouts: 7,
+            })
+        });
+        let text = m.render();
+        check_text_format(&text).unwrap();
+        assert!(text.contains("attenuo_audit_append_shed_total{cause=\"queue_full\"} 3\n"));
+        assert!(text.contains("attenuo_audit_append_shed_total{cause=\"timeout\"} 7\n"));
     }
 
     #[test]

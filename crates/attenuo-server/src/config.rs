@@ -665,6 +665,17 @@ pub struct AuditSection {
     /// audit checkpoints above. Ignored for `":memory:"`.
     #[serde(default = "default_wal_checkpoint_seconds")]
     pub wal_checkpoint_seconds: u64,
+    /// Most audit appends that may wait for the writer thread at once. One more fails at once,
+    /// and its decision is denied with `audit_error` (metric
+    /// `audit_append_shed_total{cause="queue_full"}`). Default 1024, between 16 and 1000000.
+    #[serde(default = "default_append_queue_max")]
+    pub append_queue_max: u64,
+    /// How long, in seconds, an audit append waits for the writer thread before it fails and
+    /// its decision is denied with `audit_error` (metric
+    /// `audit_append_shed_total{cause="timeout"}`), so a hung disk denies calls instead of
+    /// piling up blocked threads. Default 10, between 1 and 300.
+    #[serde(default = "default_append_timeout_seconds")]
+    pub append_timeout_seconds: u64,
     /// `[audit.sink]`: ship every signed checkpoint off the host as it is created (SR-21).
     /// Unset by default.
     #[serde(default)]
@@ -908,8 +919,60 @@ impl Default for AuditSection {
             checkpoint_interval_seconds: default_checkpoint_interval_seconds(),
             durability: attenuo_audit::Durability::default(),
             wal_checkpoint_seconds: default_wal_checkpoint_seconds(),
+            append_queue_max: default_append_queue_max(),
+            append_timeout_seconds: default_append_timeout_seconds(),
             sink: None,
         }
+    }
+}
+
+/// Smallest `[audit] append_queue_max`.
+pub const MIN_APPEND_QUEUE_MAX: u64 = 16;
+/// Largest `[audit] append_queue_max`.
+pub const MAX_APPEND_QUEUE_MAX: u64 = 1_000_000;
+/// Largest `[audit] append_timeout_seconds`.
+pub const MAX_APPEND_TIMEOUT_SECONDS: u64 = 300;
+
+fn default_append_queue_max() -> u64 {
+    attenuo_audit::DEFAULT_APPEND_QUEUE as u64
+}
+
+fn default_append_timeout_seconds() -> u64 {
+    attenuo_audit::DEFAULT_APPEND_TIMEOUT.as_secs()
+}
+
+impl AuditSection {
+    /// The bounds on audit appends waiting for the writer: (`append_queue_max`,
+    /// `append_timeout_seconds`). Checked at startup.
+    ///
+    /// # Errors
+    ///
+    /// When `append_queue_max` is outside `MIN_APPEND_QUEUE_MAX` to `MAX_APPEND_QUEUE_MAX`
+    /// or `append_timeout_seconds` outside 1 to `MAX_APPEND_TIMEOUT_SECONDS`; the message
+    /// names the first.
+    pub fn append_limits(&self) -> anyhow::Result<(usize, std::time::Duration)> {
+        for (name, value, min, max) in [
+            (
+                "append_queue_max",
+                self.append_queue_max,
+                MIN_APPEND_QUEUE_MAX,
+                MAX_APPEND_QUEUE_MAX,
+            ),
+            (
+                "append_timeout_seconds",
+                self.append_timeout_seconds,
+                1,
+                MAX_APPEND_TIMEOUT_SECONDS,
+            ),
+        ] {
+            if !(min..=max).contains(&value) {
+                anyhow::bail!("[audit] {name} must be between {min} and {max}, not {value}");
+            }
+        }
+        Ok((
+            usize::try_from(self.append_queue_max)?,
+            std::time::Duration::from_secs(self.append_timeout_seconds),
+        ))
     }
 }
 
@@ -1649,6 +1712,34 @@ pub struct ProxySection {
     /// hidden tool that is called is decided and audited as usual.
     #[serde(default)]
     pub list_filter: attenuo_proxy::ListFilterMode,
+    /// How long, in seconds, the proxy waits for a TCP (and TLS) connection to an upstream.
+    /// A connection not made in time answers `502` `upstream_unreachable`: nothing was sent,
+    /// so a retry is safe. Default 5, between 1 and 300.
+    #[serde(default = "default_upstream_connect_timeout_seconds")]
+    pub upstream_connect_timeout_seconds: u64,
+    /// How long, in seconds, the proxy waits for an upstream's response headers, and for the
+    /// rest of a body it buffers (a JSON answer it filters or labels), counted from sending
+    /// the request. Past it the proxy answers `504` `upstream_timeout`: the upstream may have
+    /// acted on the request. A streamed body (SSE, the `GET` listen stream, a body relayed as
+    /// it arrives) is not cut once its headers are in; `stream_recheck_seconds` governs those.
+    /// Default 30, between 1 and 3600. Raise it for tools that answer in JSON after running
+    /// for longer.
+    #[serde(default = "default_upstream_response_timeout_seconds")]
+    pub upstream_response_timeout_seconds: u64,
+}
+
+/// Largest `[proxy] upstream_connect_timeout_seconds`.
+pub const MAX_UPSTREAM_CONNECT_TIMEOUT_SECONDS: u64 = 300;
+
+/// Largest `[proxy] upstream_response_timeout_seconds`: an hour.
+pub const MAX_UPSTREAM_RESPONSE_TIMEOUT_SECONDS: u64 = 3_600;
+
+fn default_upstream_connect_timeout_seconds() -> u64 {
+    attenuo_proxy::config::DEFAULT_UPSTREAM_CONNECT_TIMEOUT.as_secs()
+}
+
+fn default_upstream_response_timeout_seconds() -> u64 {
+    attenuo_proxy::config::DEFAULT_UPSTREAM_RESPONSE_TIMEOUT.as_secs()
 }
 
 /// Largest `[proxy] record_window_seconds`: an hour.
@@ -1681,6 +1772,8 @@ impl Default for ProxySection {
             record_window_seconds: default_record_window_seconds(),
             record_window_max_keys: default_record_window_max_keys(),
             list_filter: attenuo_proxy::ListFilterMode::Capabilities,
+            upstream_connect_timeout_seconds: default_upstream_connect_timeout_seconds(),
+            upstream_response_timeout_seconds: default_upstream_response_timeout_seconds(),
         }
     }
 }
@@ -1782,11 +1875,46 @@ impl ProxySection {
         ))
     }
 
+    /// The upstream deadlines: (`upstream_connect_timeout_seconds`,
+    /// `upstream_response_timeout_seconds`). Checked at startup.
+    ///
+    /// # Errors
+    ///
+    /// When `upstream_connect_timeout_seconds` is outside 1 to
+    /// `MAX_UPSTREAM_CONNECT_TIMEOUT_SECONDS` or `upstream_response_timeout_seconds` outside 1
+    /// to `MAX_UPSTREAM_RESPONSE_TIMEOUT_SECONDS`; the message names the first.
+    pub fn upstream_timeouts(&self) -> anyhow::Result<(std::time::Duration, std::time::Duration)> {
+        for (name, value, max) in [
+            (
+                "upstream_connect_timeout_seconds",
+                self.upstream_connect_timeout_seconds,
+                MAX_UPSTREAM_CONNECT_TIMEOUT_SECONDS,
+            ),
+            (
+                "upstream_response_timeout_seconds",
+                self.upstream_response_timeout_seconds,
+                MAX_UPSTREAM_RESPONSE_TIMEOUT_SECONDS,
+            ),
+        ] {
+            if !(1..=max).contains(&value) {
+                anyhow::bail!("[proxy] {name} must be between 1 and {max}, not {value}");
+            }
+        }
+        Ok((
+            std::time::Duration::from_secs(self.upstream_connect_timeout_seconds),
+            std::time::Duration::from_secs(self.upstream_response_timeout_seconds),
+        ))
+    }
+
     /// Apply this section to a proxy configuration.
     pub fn apply(&self, config: attenuo_proxy::ProxyConfig) -> attenuo_proxy::ProxyConfig {
         let (window, max_keys) = self.record_window().unwrap_or((
             attenuo_proxy::records::DEFAULT_RECORD_WINDOW,
             attenuo_proxy::records::DEFAULT_RECORD_WINDOW_MAX_KEYS,
+        ));
+        let (connect, response) = self.upstream_timeouts().unwrap_or((
+            attenuo_proxy::config::DEFAULT_UPSTREAM_CONNECT_TIMEOUT,
+            attenuo_proxy::config::DEFAULT_UPSTREAM_RESPONSE_TIMEOUT,
         ));
         config
             .with_stream_recheck(
@@ -1803,6 +1931,7 @@ impl ProxySection {
             .with_max_sessions_per_principal(self.max_sessions_per_principal)
             .with_record_window(window, max_keys)
             .with_list_filter(self.list_filter)
+            .with_upstream_timeouts(connect, response)
     }
 }
 
