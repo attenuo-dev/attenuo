@@ -4,6 +4,13 @@
 #   # or: ATTENUO_CONFIG=config/example.toml cargo run -p attenuo-server
 #
 # Relative paths are resolved against the working directory. Unknown keys are rejected.
+#
+# Any scalar key can be overridden from the environment with ATTENUO__<SECTION>__<KEY>, two
+# underscores each (ATTENUO__SERVER__LISTEN=0.0.0.0:8080, ATTENUO__ADMIN__LISTEN=0.0.0.0:9102,
+# ATTENUO__TELEMETRY__TRACES__SAMPLE_RATIO=0.1). The overrides are applied before the startup
+# checks, and a variable that names no key, has a value of the wrong type or names a [dev] key
+# stops the server. Lists and [[...]] entries come from this file only. See
+# docs/reference/config.md, "Environment overrides".
 
 [server]
 listen = "127.0.0.1:8080"
