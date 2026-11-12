@@ -54,6 +54,7 @@ fn fmt_constraint(arg: &str, c: &ArgConstraint) -> String {
             format!("{arg} in [{}]", items.join(", "))
         }
         ArgConstraint::Prefix(p) => format!("{arg} starts with {p:?}"),
+        ArgConstraint::PathPrefix(p) => format!("{arg} is a path under {p:?}"),
         ArgConstraint::Range { min, max } => match (min, max) {
             (Some(lo), Some(hi)) => format!("{lo} <= {arg} <= {hi}"),
             (Some(lo), None) => format!("{arg} >= {lo}"),
@@ -992,6 +993,13 @@ user alice  (issuer https://idp.example)
             .with_constraint("r", ArgConstraint::OneOf(vec![json!("a"), json!("b")]));
         assert_eq!(fmt_capability(&c), "github:x {n == 1, r in [\"a\", \"b\"]}");
         assert_eq!(fmt_capabilities(&CapabilitySet::new()), "(none)");
+        let paths = Capability::new("fs", "read_file")
+            .with_constraint("path", ArgConstraint::path_prefix("/workspace/").unwrap())
+            .with_constraint("root", ArgConstraint::Prefix("/workspace/".into()));
+        assert_eq!(
+            fmt_capability(&paths),
+            "fs:read_file {path is a path under \"/workspace/\", root starts with \"/workspace/\"}"
+        );
         let range = |min, max| ArgConstraint::range(min, max).unwrap();
         let ranged = Capability::new("bank", "send_money")
             .with_constraint("amount", range(Some(0), Some(2000)))

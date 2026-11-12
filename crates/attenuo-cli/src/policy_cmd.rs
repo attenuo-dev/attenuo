@@ -582,10 +582,28 @@ pub(crate) fn lint_with_schema(
         },
     );
 
+    // A `prefix` constraint on a path-like argument of a `[[root_grants]]` capability: a
+    // warning that does not change the exit code (S-7). Only the grants are read, so a
+    // config that the rest of this command accepts is not refused here.
+    let mut grant_warnings: Vec<String> = Vec::new();
+    if let Some(path) = config {
+        match testing::load_root_grant_capabilities(path) {
+            Ok(caps) => {
+                grant_warnings = caps
+                    .iter()
+                    .flat_map(attenuo_core::Capability::path_prefix_warnings)
+                    .map(|w| format!("[[root_grants]] {w}"))
+                    .collect();
+            }
+            Err(e) => notes.push(format!("[[root_grants]] not checked: {e}")),
+        }
+    }
+
     if json_out {
         let mut v = serde_json::to_value(&report).unwrap_or_default();
         v["file"] = json!(policy);
         v["notes"] = json!(notes);
+        v["capability_warnings"] = json!(grant_warnings);
         if show_schema {
             v["schema"] = json!(schema);
         }
@@ -616,6 +634,11 @@ pub(crate) fn lint_with_schema(
                 .map(|p| format!(" ({p})"))
                 .unwrap_or_default();
             let _ = writeln!(run.stdout, "{loc}: {sev}[{}]{id}: {}", i.stage, i.message);
+        }
+        if let Some(path) = config {
+            for w in &grant_warnings {
+                let _ = writeln!(run.stdout, "{}: warning: {w}", path.display());
+            }
         }
         if report.has_errors() && catalog_empty {
             let _ = writeln!(
@@ -761,6 +784,48 @@ mod tests {
         let r = test(&[t], &strict, false);
         assert_eq!(r.status, Status::Ok, "{}", r.stdout);
         assert!(r.stdout.contains("all 1 policy exercised"), "{}", r.stdout);
+    }
+
+    #[test]
+    fn lint_warns_on_a_prefix_over_a_path_in_root_grants() {
+        let d = tempfile::tempdir().unwrap();
+        let p = write(d.path(), "p.cedar", POLICY);
+        let grants = r#"
+[[root_grants]]
+issuer = "https://idp.example"
+agent = "coder"
+capabilities = [
+  { server = "github", tool = "read_file", constraints = { path = { op = "prefix", value = "/workspace/" } } },
+  { server = "github", tool = "read_file", constraints = { file = { op = "path_prefix", value = "/workspace/" } } },
+]
+"#;
+        let c = write(d.path(), "c.toml", &format!("{CONFIG}{grants}"));
+        let r = lint(&p, Some(&c), false, false);
+        // A warning, not a failure.
+        assert_eq!(r.status, Status::Ok, "{}", r.stdout);
+        let line = format!(
+            "{}: warning: [[root_grants]] github:read_file argument \"path\": `prefix` \"/workspace/\"",
+            c.display()
+        );
+        assert!(r.stdout.contains(&line), "{}", r.stdout);
+        assert!(
+            r.stdout.contains("use `path_prefix` for a file path"),
+            "{}",
+            r.stdout
+        );
+        assert_eq!(
+            r.stdout.matches("[[root_grants]]").count(),
+            1,
+            "{}",
+            r.stdout
+        );
+        let j = lint(&p, Some(&c), false, true);
+        let v: Value = serde_json::from_str(&j.stdout).unwrap();
+        assert_eq!(v["capability_warnings"].as_array().unwrap().len(), 1);
+        // No grants, no warnings.
+        let plain = write(d.path(), "plain.toml", CONFIG);
+        let r = lint(&p, Some(&plain), false, false);
+        assert!(!r.stdout.contains("[[root_grants]]"), "{}", r.stdout);
     }
 
     #[test]

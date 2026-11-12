@@ -929,6 +929,16 @@ pub(crate) fn parse_caps(raw: &[String]) -> anyhow::Result<Vec<Value>> {
     Ok(out)
 }
 
+/// Warnings about capabilities as [`parse_caps`] returns them: a `prefix` constraint on an
+/// argument that looks like a file path, where `path_prefix` is meant
+/// ([`attenuo_core::Capability::path_prefix_warnings`]). The request is sent anyway.
+pub(crate) fn cap_warnings(caps: &[Value]) -> Vec<String> {
+    caps.iter()
+        .filter_map(|v| serde_json::from_value::<attenuo_core::Capability>(v.clone()).ok())
+        .flat_map(|c| c.path_prefix_warnings())
+        .collect()
+}
+
 /// Parse `key=value` (a string) or `key:=json` (any JSON value).
 pub(crate) fn parse_kv(s: &str) -> Result<(String, Value), String> {
     let (left, right) = s
@@ -1331,6 +1341,34 @@ mod tests {
         assert_eq!(caps[0], json!({"server": "github", "tool": "read_file"}));
         assert_eq!(caps[1]["constraints"]["repo"]["op"], "prefix");
         assert!(parse_caps(&["nocolon".into()]).is_err());
+        // `acme/` holds a `/` and no `://`, so it reads as a path too (SR-73: `..` and `\`
+        // after it reach other organisations through a URL parser).
+        assert_eq!(cap_warnings(&caps).len(), 1);
+        // `path_prefix` passes through; a malformed one is refused before the request, and a
+        // `prefix` on a path argument gets a warning.
+        let paths = parse_caps(&[
+            r#"{"server":"fs","tool":"read_file","constraints":{"path":{"op":"path_prefix","value":"/workspace/"}}}"#.into(),
+            r#"{"server":"fs","tool":"write_file","constraints":{"path":{"op":"prefix","value":"/workspace/"}}}"#.into(),
+        ])
+        .unwrap();
+        assert_eq!(paths[0]["constraints"]["path"]["op"], "path_prefix");
+        assert_eq!(paths[0]["constraints"]["path"]["value"], "/workspace/");
+        let warnings = cap_warnings(&paths);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("fs:write_file argument \"path\""),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("use `path_prefix`"), "{warnings:?}");
+        let bad = parse_caps(&[
+            r#"{"server":"fs","tool":"read_file","constraints":{"path":{"op":"path_prefix","value":"/workspace/../etc"}}}"#.into(),
+        ])
+        .unwrap_err();
+        assert!(
+            bad.to_string()
+                .contains("a path_prefix constraint's path holds a `.` or `..` segment"),
+            "{bad}"
+        );
         assert!(parse_caps(&["github:".into()]).is_err());
         assert!(parse_caps(&[r#"{"server":1}"#.into()]).is_err());
         // A `range` constraint passes through; a malformed one is refused before the request.
