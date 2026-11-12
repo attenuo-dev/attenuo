@@ -913,10 +913,10 @@ impl SqliteAudit {
         let activity = Arc::clone(&self.inner.activity);
         let _ = activity.wal_kick.set(kick.clone());
         {
-            let writer = self.inner.conn.lock()?;
+            let mut writer = self.inner.conn.lock()?;
             writer.pragma_update(None, "wal_autocheckpoint", 0)?;
             // After the pragma: setting `wal_autocheckpoint` installs SQLite's own hook.
-            writer.wal_hook(Some(note_wal_pages));
+            writer.wal_hook(Some(note_wal_pages))?;
         }
         self.wal = Some(WalCheckpointer::start(
             conn,
@@ -1170,10 +1170,10 @@ impl SqliteAudit {
     /// returns.
     pub fn with_connection<R>(
         &self,
-        f: impl FnOnce(&Connection) -> Result<R, AuditError>,
+        f: impl FnOnce(&mut Connection) -> Result<R, AuditError>,
     ) -> Result<R, AuditError> {
-        let conn = self.inner.conn.lock()?;
-        f(&conn)
+        let mut conn = self.inner.conn.lock()?;
+        f(&mut conn)
     }
 
     /// Entries for one originating subject, newest first, at most `limit`.
