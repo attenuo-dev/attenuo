@@ -23,6 +23,21 @@ cargo run -q -p attenuo-cli -- policy lint examples/github-leak-demo/policy.ceda
 
 See [writing-policies](../../docs/guides/writing-policies.md#testing-policies).
 
+### Run it in Docker
+
+`docker-compose.yml` at the repository root runs the same pair in containers: the server from the release image (`attenuo:dev`, which has no fake server and no `curl`) and the fake GitHub server from the `demo` build target (`attenuo:demo`).
+
+```sh
+export ATTENUO_ADMIN_TOKEN=$(openssl rand -hex 32)
+docker compose up --build --wait     # returns once `attenuo health` passes in the server's container
+# admin commands: in the container, on the admin listener (port 9102, not published)
+docker compose exec attenuo attenuo --server http://127.0.0.1:9102 token root --subject alice --agent assistant --cap 'github:*'
+curl -s http://127.0.0.1:8080/healthz             # the main listener, from the host
+docker compose down
+```
+
+The main port answers `/admin/*` with 404, so `token root`, `lease`, `audit` and `approval` go to port 9102 from inside the container; `token exchange`, `call` and `tools` go to 8080, from the container or from the host (`ATTENUO_SERVER=http://127.0.0.1:8080`). `scripts/compose-smoke.sh` builds both images, checks what the release image holds, and plays steps 1 to 9 this way, failing on any step that does not come out as below. It needs Docker with the compose plugin and a free `127.0.0.1:8080`; the first build compiles the workspace in release mode.
+
 ### How long it takes
 
 Measured 2026-10-24 at commit `de3cf75` on a 4-vCPU container (Intel Xeon @ 2.10GHz, 15 GB RAM, rustc 1.99.1), with an empty target directory and crates already downloaded:
@@ -54,7 +69,7 @@ At the end the script prints what the fake GitHub server received: one `tools/ca
 - `config.toml`: server config with the catalog, the upstream, the admin token, alice's root grant and the `[approvals]` client id. `run.sh` rewrites the ports and the policy path in a copy.
 - `policy.cedar`: two permits, `read_file` and `create_issue` only when `repo like "alice/public-*"`; a forbid with `@obligation("approval")` that holds every `create_issue` until a person approves it (the Python, TypeScript and Claude Agent SDK examples use it); and two guard-rail forbids (sensitive tools without MFA, chains deeper than three).
 - `policy_test.yaml`: eleven cases for that policy, run by `attenuo policy test`.
-- `config.docker.toml`: the same, for `docker-compose.yml` at the repository root (untested). It binds `0.0.0.0` inside the container, so it sets the demo-only `[dev] allow_root_mint_off_loopback`, without which the dev mint refuses to start off loopback. Never copy that line into a deployment.
+- `config.docker.toml`: the same, for `docker-compose.yml` at the repository root (run by `scripts/compose-smoke.sh`). It binds `0.0.0.0` inside the container, so the admin API gets a listener of its own (`[admin] listen = "0.0.0.0:9102"`, not published by compose), and, since that listener is not loopback either, it sets the demo-only `[dev] allow_root_mint_off_loopback`, without which the dev mint refuses to start. Never copy that line into a deployment.
 - `run.sh`, `transcript.md`.
 
 The fake server is `crates/attenuo-proxy/examples/fake_mcp.rs`: the proxy crate's `FakeMcpServer` test double with `read_file`, `create_issue` and `delete_repo`, which echoes calls instead of doing anything.

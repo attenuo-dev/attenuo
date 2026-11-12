@@ -1,44 +1,64 @@
-# The GitHub leak demo as two containers: attenuo-server in front of a fake GitHub MCP server.
+# The GitHub leak demo as two containers: attenuo-server (the release image) in front of a fake
+# GitHub MCP server (the `demo` build target). scripts/compose-smoke.sh runs this file end to end.
 #
-#   docker compose up --build
+#   export ATTENUO_ADMIN_TOKEN=$(openssl rand -hex 32)
+#   docker compose up --build --wait      # returns once the server's health check passes
 #
-# Then, from the host (the server is published on 127.0.0.1:8080 only):
+# Admin commands run in the server's container, against the admin listener (port 9102, not
+# published to the host); the container already has ATTENUO_ADMIN_TOKEN:
 #
-#   export ATTENUO_ADMIN_TOKEN=$(openssl rand -hex 32)   # before `docker compose up`
-#   export ATTENUO_SERVER=http://127.0.0.1:8080
-#   cargo run -p attenuo-cli -- token root --subject alice --agent assistant --cap 'github:*'
+#   docker compose exec attenuo attenuo --server http://127.0.0.1:9102 \
+#     token root --subject alice --agent assistant --cap 'github:*'
 #
-# or run the CLI in the same image: docker compose run --rm --entrypoint attenuo attenuo --help
-# The scripted walk-through is examples/github-leak-demo/run.sh, which does not need Docker.
+# Agent-side commands (token exchange, call, tools) use the main listener, which is published on
+# the host's 127.0.0.1:8080 only: from the host with ATTENUO_SERVER=http://127.0.0.1:8080, or in
+# the container with --server http://127.0.0.1:8080. /admin/* there answers 404.
+# examples/github-leak-demo/README.md walks through it; run.sh plays the same scenario without
+# Docker.
+#
 # The server listens on all interfaces inside the container, so it refuses to start without a
-# strong admin token: compose passes ATTENUO_ADMIN_TOKEN from your shell. For the same reason
-# the dev root mint needs the demo-only [dev] allow_root_mint_off_loopback in its config, and
-# the admin API on the main listener needs [admin] serve_on_main_listener (a deployment gives it
-# a listener of its own with [admin] listen instead, and publishes that port to operators only).
-# Never publish /admin outside localhost.
+# strong admin token (compose passes ATTENUO_ADMIN_TOKEN from your shell), and without the
+# admin API on a listener of its own ([admin] listen in config.docker.toml). The dev root mint
+# needs the demo-only [dev] allow_root_mint_off_loopback in that file for the same reason.
 
 services:
   attenuo:
     image: attenuo:dev
-    build: .
+    build:
+      context: .
+      target: runtime
     command: ["--config", "/etc/attenuo/config.toml"]
     environment:
       ATTENUO_ADMIN_TOKEN: ${ATTENUO_ADMIN_TOKEN:?set ATTENUO_ADMIN_TOKEN, e.g. $(openssl rand -hex 32)}
     ports:
+      # Agent-facing listener only. The admin listener (9102) stays inside the compose network.
       - "127.0.0.1:8080:8080"
     volumes:
       - ./examples/github-leak-demo/config.docker.toml:/etc/attenuo/config.toml:ro
       - ./examples/github-leak-demo/policy.cedar:/etc/attenuo/policy.cedar:ro
+    # The image's HEALTHCHECK, restated so this file shows it (`attenuo health`, no curl).
+    healthcheck:
+      test: ["CMD", "attenuo", "--server", "http://127.0.0.1:8080", "health", "--timeout", "3"]
+      interval: 10s
+      timeout: 5s
+      start_period: 5s
+      start_interval: 1s
+      retries: 3
     depends_on:
-      - fake-mcp
+      fake-mcp:
+        condition: service_started
+    stop_grace_period: 15s # the server drains for up to 10s after SIGTERM
     read_only: true
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
 
   fake-mcp:
-    image: attenuo:dev
-    entrypoint: ["fake-mcp"]
+    image: attenuo:demo
+    build:
+      context: .
+      target: demo
+    # The image's defaults, restated: listen on the compose network, port 3001.
     command: ["--host", "0.0.0.0", "--port", "3001"]
     expose:
       - "3001"

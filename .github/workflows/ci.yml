@@ -1,9 +1,10 @@
 name: CI
 
 # Where each check runs (docs/research/ci-minutes-2026-11-05.md has the numbers):
-# - every pull request: everything below except the macOS tests and the fuzz build; a pull
+# - every pull request: everything below except the macOS tests, the fuzz build and the
+#   docker compose demo (those two run on a pull request that changes their files); a pull
 #   request that only touches documentation (see the `changes` job) runs only the link check.
-# - every push to main: the same, plus the fuzz build.
+# - every push to main: the same, plus the fuzz build and the docker compose demo.
 # - weekly (Monday) and on manual dispatch: everything, including the macOS tests.
 # macOS minutes are billed at 10x on a private repository and the hosted macOS arm64 pool often
 # cannot start the job within 15 minutes, so macOS is weekly, not per push.
@@ -53,6 +54,7 @@ jobs:
     outputs:
       rust: ${{ github.event_name != 'pull_request' || steps.filter.outputs.rust == 'true' }}
       fuzz: ${{ github.event_name != 'pull_request' || steps.filter.outputs.fuzz == 'true' }}
+      docker: ${{ github.event_name != 'pull_request' || steps.filter.outputs.docker == 'true' }}
     steps:
       - id: filter
         if: github.event_name == 'pull_request'
@@ -73,6 +75,9 @@ jobs:
             # are one brace pattern: a file matches when it is under fuzz/ or is this file.
             fuzz:
               - "{fuzz/**,.github/workflows/ci.yml}"
+            # The image and compose files, the compose demo's config and its test.
+            docker:
+              - "{Dockerfile,.dockerignore,docker-compose.yml,examples/github-leak-demo/config.docker.toml,scripts/compose-smoke.sh,.github/workflows/ci.yml}"
 
   fmt:
     name: rustfmt
@@ -238,6 +243,20 @@ jobs:
       - name: Admin console smoke test
         run: bash scripts/admin-ui-smoke.sh
 
+  # Builds the release and demo images and plays the leak demo through docker-compose.yml
+  # (scripts/compose-smoke.sh): release image contents, `attenuo health` as the HEALTHCHECK, the
+  # admin listener unpublished. A release build of the workspace, so on pull requests only when
+  # the Docker files change; always on main, weekly and on dispatch.
+  compose:
+    name: docker compose demo
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: bash scripts/compose-smoke.sh
+
   # The admin console in headless Chromium: every page in both themes, with zero console
   # errors and CSP violations allowed (scripts/console-smoke.sh, tests/console/).
   console-browser:
@@ -359,7 +378,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, fmt, clippy, test, msrv, deny, audit, demo, console-browser, policy-tests, fuzz-build, docs]
+    needs: [changes, fmt, clippy, test, msrv, deny, audit, demo, compose, console-browser, policy-tests, fuzz-build, docs]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
