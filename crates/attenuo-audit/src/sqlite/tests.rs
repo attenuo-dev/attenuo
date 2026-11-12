@@ -1294,3 +1294,45 @@ fn a_taken_append_is_waited_for_past_the_timeout_sr102() {
     assert_eq!(log.append_stats().timeouts, 0);
     assert!(log.verify_chain().unwrap().ok);
 }
+
+/// SR-103: a database file the stores create is the owner's alone, and so are the `-wal`
+/// and `-shm` files SQLite creates next to it (it gives them the database file's mode). The
+/// lease store, on the same file, opens it the same way.
+#[cfg(unix)]
+#[test]
+fn new_database_files_are_owner_only_sr103() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("audit.sqlite");
+    let log = SqliteAudit::open(&db).unwrap();
+    let leases = SqliteLeaseStore::open(&db).unwrap();
+    log.append(record(1)).unwrap();
+    for suffix in ["", "-wal", "-shm"] {
+        let p = PathBuf::from(format!("{}{suffix}", db.display()));
+        assert_eq!(mode(&p), 0o600, "{}", p.display());
+    }
+    drop((log, leases));
+}
+
+/// SR-103: an existing database file keeps the mode an operator gave it (here group-readable,
+/// for a backup user), and SQLite gives its `-wal` and `-shm` files the same.
+#[cfg(unix)]
+#[test]
+fn an_existing_database_keeps_its_mode_sr103() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("audit.sqlite");
+    drop(SqliteAudit::open(&db).unwrap());
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let log = SqliteAudit::open(&db).unwrap();
+    log.append(record(1)).unwrap();
+    for suffix in ["", "-wal", "-shm"] {
+        let p = PathBuf::from(format!("{}{suffix}", db.display()));
+        assert_eq!(mode(&p), 0o640, "{}", p.display());
+    }
+}

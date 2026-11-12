@@ -67,13 +67,17 @@ impl WriterFence {
             AuditError::Storage(format!("{what} {}: {e}", path.display()))
         };
         // No truncation before the lock is held: the file holds the current holder's pid.
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        // Owner only: `flock` works on a descriptor opened read-only, so anyone who can open
+        // the file could hold the fence and keep the server from starting (SR-103).
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+        let mut file = opts
             .open(&path)
             .map_err(|e| io("cannot open the lock file", e))?;
+        #[cfg(unix)]
+        restrict_to_owner(&file).map_err(|e| io("cannot restrict the mode of", e))?;
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
@@ -106,6 +110,22 @@ impl Drop for WriterFence {
         // Closing the file releases the lock as well; unlocking first says so explicitly. The
         // file is left in place: removing it would race a process that just opened it.
         let _ = self.file.unlock();
+    }
+}
+
+/// Narrow an existing lock file's mode to `0600` when anyone but its owner may open it (one
+/// created before SR-103, or by hand). Only the owner (or root) may change a mode: for a file
+/// owned by another user the change is refused and the file is left as it is, since the
+/// directory's permissions, not this file's, decide who can create one there.
+#[cfg(unix)]
+fn restrict_to_owner(file: &File) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if file.metadata()?.permissions().mode() & 0o077 == 0 {
+        return Ok(());
+    }
+    match file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
+        other => other,
     }
 }
 
@@ -182,6 +202,47 @@ mod tests {
         let fence = WriterFence::acquire(&db).unwrap();
         let text = std::fs::read_to_string(fence.path()).unwrap();
         assert_eq!(text.trim(), std::process::id().to_string());
+    }
+
+    /// SR-103: the lock file is the owner's alone, so another local user cannot open it and
+    /// hold the fence. A new one is created `0600`; an older, wider one is narrowed.
+    #[cfg(unix)]
+    #[test]
+    fn the_lock_file_is_owner_only_sr103() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("audit.sqlite");
+        let fence = WriterFence::acquire(&db).unwrap();
+        assert_eq!(mode(fence.path()), 0o600);
+        drop(fence);
+
+        let old = dir.path().join("old.sqlite");
+        let lock = WriterFence::lock_path(&old);
+        std::fs::write(&lock, "4242\n").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let fence = WriterFence::acquire(&old).unwrap();
+        assert_eq!(mode(fence.path()), 0o600);
+    }
+
+    /// SR-103: the pid in the lock file is the last server that took the fence, which is not
+    /// the holder when another program locked the file without writing it. The error says
+    /// so instead of naming that pid as the holder.
+    #[test]
+    fn the_fenced_error_does_not_name_the_recorded_pid_as_the_holder() {
+        let text = AuditError::Fenced {
+            lock: PathBuf::from("/var/lib/attenuo/audit.sqlite.lock"),
+            holder: Some(1234),
+        }
+        .to_string();
+        assert!(!text.contains("another process holds"), "{text}");
+        assert!(text.contains("is locked by another process"), "{text}");
+        assert!(
+            text.contains("records pid 1234, the last attenuo server"),
+            "{text}"
+        );
+        assert!(text.contains("fuser"), "{text}");
+        assert!(text.contains("strategy: Recreate"), "{text}");
     }
 
     #[test]
