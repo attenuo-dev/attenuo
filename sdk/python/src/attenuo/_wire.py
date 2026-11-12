@@ -507,7 +507,10 @@ def rpc_result(
                 "unauthorized",
                 message,
                 decision_id=_proxy_decision_id(resp, data),
-                reason=_opt_str(data.get("reason")) or "unauthorized",
+                # Only the proxy answers with HTTP 401. A `-32001` inside a 200 answer can be an
+                # upstream's own error, so its `data.reason` is not taken as the server's word.
+                reason=(_opt_str(data.get("reason")) if resp.status_code == 401 else None)
+                or "unauthorized",
                 data=data,
             )
         raise RpcError(int(code) if isinstance(code, int) else 0, message, raw_data)

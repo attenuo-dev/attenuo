@@ -484,7 +484,12 @@ export function rpcMessageResult(
       }
     }
     if (e.code === CODE_UNAUTHORIZED || res.status === 401) {
-      const reason = typeof data.reason === "string" && data.reason !== "" ? data.reason : "";
+      // Only the proxy answers with HTTP 401. A `-32001` inside a 200 answer can be an upstream's
+      // own error, so its `data.reason` is not taken as the server's word.
+      const reason =
+        res.status === 401 && typeof data.reason === "string" && data.reason !== ""
+          ? data.reason
+          : "";
       throw new UnauthorizedError(
         401,
         "unauthorized",

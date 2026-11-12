@@ -85,6 +85,14 @@ describe("a proxy 401 (K-1)", () => {
     }
   });
 
+  it("keeps no reason from a -32001 inside a 200 answer", async () => {
+    // Only the proxy answers with HTTP 401; an upstream can put `-32001` in a 200 body.
+    const data = { reason: "lease_revoked", decision_id: DEC };
+    const { ob } = client(() => rpcErr(-32001, "m", data, 200));
+    const e = (await caught(ob.callTool("TOK", "github", "read_file"))) as UnauthorizedError;
+    expect([e.reason, e.decisionId]).toEqual(["unauthorized", undefined]);
+  });
+
   it("is a plain unauthorized without data", async () => {
     const { ob } = client(() => rpcErr(-32001, "who are you", undefined, 401));
     const e = (await caught(ob.callTool("TOK", "github", "read_file"))) as UnauthorizedError;

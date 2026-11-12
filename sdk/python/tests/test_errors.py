@@ -82,6 +82,15 @@ async def test_proxy_401_decision_id_needs_the_header(make: Any) -> None:  # noq
         assert e.value.decision_id is None
 
 
+async def test_a_minus_32001_inside_a_200_answer_keeps_no_reason(make: Any) -> None:  # noqa: F811
+    """Only the proxy answers with HTTP 401; an upstream can put `-32001` in a 200 body."""
+    data = {"reason": "lease_revoked", "decision_id": DEC}
+    client, _ = make(lambda r: rpc_err(-32001, "m", data, status=200))
+    with pytest.raises(Unauthorized) as e:
+        await call(client, "call_tool", "TOK", "github", "read_file")
+    assert (e.value.reason, e.value.decision_id) == ("unauthorized", None)
+
+
 async def test_proxy_401_without_data_is_plain_unauthorized(make: Any) -> None:  # noqa: F811
     client, _ = make(lambda r: rpc_err(-32001, "who are you", status=401))
     with pytest.raises(Unauthorized) as e:
