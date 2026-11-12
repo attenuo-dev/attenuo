@@ -833,6 +833,31 @@ fn reload_replaces_policies_and_keeps_old_ones_on_error() {
     assert_eq!(out.policy_ids, vec!["none"]);
 }
 
+/// A-7: a reload compiles a new engine from a shared reference, leaving the engine in force
+/// untouched until the caller swaps it in.
+#[test]
+fn with_policies_reloaded_builds_a_new_engine_and_leaves_the_old_one_alone() {
+    let engine = engine_with(r#"@id("all") permit(principal, action, resource);"#);
+    let c = call("read_file", json!({}));
+    assert!(matches!(
+        engine
+            .with_policies_reloaded("forbid(principal, action, resource) when { resource.nope };"),
+        Err(PolicyError::Validation(_))
+    ));
+    let next = engine
+        .with_policies_reloaded(r#"@id("none") forbid(principal, action, resource);"#)
+        .unwrap();
+    assert_eq!(engine.policy_ids(), ["all"]);
+    assert_eq!(
+        engine.authorize(&chain(), &c, now()).decision,
+        Decision::Allow
+    );
+    assert_eq!(next.policy_ids(), ["none"]);
+    assert_eq!(next.authorize(&chain(), &c, now()).decision, Decision::Deny);
+    assert_eq!(next.policy_generation(), engine.policy_generation() + 1);
+    assert_eq!(next.schema_text(), engine.schema_text());
+}
+
 // ---------------------------------------------------------------------------------------
 // Scenario: the GitHub MCP over-privileged token
 // ---------------------------------------------------------------------------------------

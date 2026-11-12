@@ -1,7 +1,7 @@
 # Performance: micro-benchmarks and end to end
 
 - Status: third measurement, after the policy-stage and WAL work (`perf/policy-stage-and-wal-checkpoints`); exchange, lease renewal and open-loop cells added 2026-10-23 (`perf/exchange-lease-bench`); output labelling and run limits on the hot path added 2026-10-24 (`perf/labels-limits-cost`); the SR-55 run lock under concurrent clients added 2026-10-24 (`perf/run-lock-cost`); per-value limits on current main, two kinds on one capability and list arguments added 2026-10-25 (`perf/per-value-limits-latency`)
-- Crates: `attenuo-policy` (`benches/authorize.rs`, `benches/policy_stage.rs`), `attenuo-core` (`benches/attenuation.rs`), `attenuo-server` (`benches/decide.rs`, the decision path by stage), `attenuo-bench` (end to end)
+- Crates: `attenuo-policy` (`benches/authorize.rs`, `benches/policy_stage.rs`), `attenuo-core` (`benches/attenuation.rs`), `attenuo-server` (`benches/decide.rs`, the decision path by stage; `benches/audit_reads.rs`, appends during long audit reads), `attenuo-bench` (end to end)
 - Related: [server pipeline](server.md), [ADR-0006](../decisions/0006-lease-based-in-flight-revocation.md)
 - Sources: every figure links the committed file it comes from in [`bench/`](bench/). A figure with no file says "(unrecorded)". Where a rerun of 2026-10-23 gave a different number, the rerun is in the text and the earlier figure is kept in a "quoted earlier, unrecorded" note.
 
@@ -795,6 +795,31 @@ Branch `feat/arg-taint-hosts-and-reads`, base `bf9227f`. When a loaded policy re
 
 So a policy set that reads argument taint adds about 5 us to each read on a tainted run with nothing to match, and about 8 to 9 us when an argument matches (more fingerprints of the URL, and the hit's lookup). That is under 1% of the roughly 1 ms of a proxied call in the hot-path tables above. With no such policy the read pays a lock and a catalog lookup, about 0.15 us, as before. Not measured: end to end, many or long arguments (each string argument is fingerprinted, so the cost grows with argument text, up to the k-gram cap), and a full run index (20,000 hashes).
 
+### Long audit reads and the append path (2026-11-12)
+
+Branch `fix/audit-verify-reader`, main `a4d3cf1`. The 2026-11-07 audit (finding A-1) suspected, without measuring, that `GET /admin/audit/verify` stalls decisions: `verify_chain_signed` walked the whole log while holding the audit store's only connection mutex, the one every append commits on. The export (pages of 500) and the filtered search (one scan of up to 50,000 seqs) took the same mutex.
+
+**Method.** `crates/attenuo-server/benches/audit_reads.rs` (`cargo bench -p attenuo-server --bench audit_reads`, a plain `main`, no criterion). A 50,000-entry log in a temporary file, opened as the server opens it (`durability = "normal"`, a signed checkpoint every 1,000 entries, WAL checkpoints in the background). Then, for each case, one thread makes 2,000 timed appends 200 us apart while another thread runs the read back to back: `verify` (`verify_chain_signed`), `export` (`range_filtered` over the whole log in pages of 500), `search` (a filtered `entries_matching` over the newest 50,000 seqs that matches nothing, descending, page 100), and `idle` (no reader). A case stops after 10 s between appends. Bench profile, the same 4-vCPU shared container as above with other agents building (load not recorded), two runs each; before and after are the same bench source built against the code before and after the change.
+
+| Reader | Before: appends made, p50 / p99 / max | After (two runs): p50 / p99 / max |
+|---|---|---|
+| idle | 2,000; 87 us / 0.2 ms / 8 ms (second run 96 us / 0.2 ms / 19 ms) | 99 to 103 us / 0.2 ms / 20 to 27 ms |
+| verify | **1** append, which waited **27 s** (second run **95 s**) | 66 to 85 us / 0.4 to 1.1 ms / 17 to 18 ms |
+| export | 2,000; 3.3 ms / 9.5 to 11 ms / 20 to 132 ms | 72 to 80 us / 2.6 to 2.9 ms / 16 to 48 ms |
+| search | 154 and 283 appends; 20 to 21 ms / 0.5 to 0.7 s / 1.2 to 1.6 s | 75 to 98 us / 0.3 to 3.9 ms / 12 to 244 ms |
+
+One verify of 50,000 entries took 0.6 s before and 0.6 to 1.0 s after (the after figure is from one or two verifies per run). The paging costs one query per 1,000 rows.
+
+**What the numbers say.**
+
+- **The stall was worse than one verify long.** `std::sync::Mutex` is not fair: the verifying thread released the lock and took it again for the next verify before the waiting append was woken, 46 and 161 times in a row. One verify alone blocks an append for up to its own 0.6 s; an operator or a script polling `/admin/audit/verify` (the console's Verify page calls it) could hold every decision for as long as it kept polling.
+- **The filtered search was the other real cost:** the 50,000-seq scan held the mutex for about 20 ms per page, and appends queued behind it for up to 1.6 s.
+- **After, a long read costs the append path about what any other connection on the file does.** The p99 and max rise a little against `idle` in some runs; the largest after-change outlier (244 ms, one search run) is unexplained: a WAL checkpoint that waited for a reader's snapshot is the likely cause, not investigated.
+
+**The change.** A store on a file in WAL mode opens a second, read-only connection with its own mutex, and every query of `SqliteAudit` (verify, export pages, search, lookups by id or seq, checkpoint lists, `head`, `len`, `range`) runs on it; WAL lets it read while the writer commits. Verify reads the newest seq and every checkpoint in one read transaction, then the entries up to that seq 1,000 at a time, each page in its own read transaction: an append that lands during the walk is not walked, a checkpoint written after the snapshot is not read (so it cannot look like a truncation), and no single read transaction pins a WAL snapshot for the whole walk, which would stop the background checkpointer from restarting the WAL. One reader connection, not a pool: admin reads are rare, and the reader's lock is released between pages, so a search waits at most one verify page. Writes, signed checkpoints, `with_connection` and the WAL checkpointer use the writer's connection as before. An in-memory store has no second connection. Tests: `a_read_in_progress_does_not_hold_up_appends`, `a_paged_verify_stops_at_its_snapshot` and `a_paged_verify_reports_a_corrupt_row_at_its_seq` (`crates/attenuo-audit/src/sqlite/tests.rs`), `verify_during_appends_reports_its_snapshot_and_never_a_false_break` (`crates/attenuo-audit/tests/checkpoints.rs`).
+
+**Not changed.** The lease store still has one connection for reads and writes (the read side of finding A-5 for leases); its reads are short and on the decision path. Not measured: end to end through HTTP, and `durability = "full"`.
+
 ### How to run
 
 ```
@@ -810,6 +835,7 @@ DURATION=10 scripts/bench-e2e.sh hot-path --runs 5 --approval-loops 2000        
 cargo bench -p attenuo-policy --bench policy_stage -- --warm-up-time 1 --measurement-time 3
 cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3
 cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3 'budget_read_|charge_'  # run-limit counters
+cargo bench -p attenuo-server --bench audit_reads  # append latency during verify, export and search
 cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3 'decide_limited_'  # a limited call's whole decision
 cargo test --release -p attenuo-audit --test write_contention -- --ignored --nocapture  # lease writes against appends on one file, busy-handler count
 attenuo-bench hot-path --configs limits_calls,limits --runs 1 --clients 4                # run limits under concurrent clients

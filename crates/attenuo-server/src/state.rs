@@ -50,9 +50,13 @@ pub struct AppState {
     pub policies_path: Option<PathBuf>,
     /// Digest and load time of the policy set in force, for `GET /admin/policies`. The engine
     /// does not keep them, so they live here: set at startup and on every successful reload
-    /// (while the engine's write lock is held, so the two never disagree), and left alone by
-    /// a failed one.
+    /// (the engine is swapped while this lock is held for writing, and `GET /admin/policies`
+    /// takes its snapshot while holding it for reading, so the two never disagree), and left
+    /// alone by a failed one.
     pub loaded_policies: RwLock<LoadedPolicies>,
+    /// Held by `POST /admin/policies/reload` from reading the file to the swap, so two
+    /// reloads cannot cross (the one that read the older text swapping last).
+    pub policy_reload: tokio::sync::Mutex<()>,
     /// `[admin] token`, the bearer for `/admin/*`; `None` answers every admin call 403.
     pub admin_token: Option<String>,
     /// `[[root_grants]]`, the ceilings of root tokens.
@@ -174,7 +178,7 @@ impl AppState {
             sha256: policies_sha256,
             loaded_at: OffsetDateTime::now_utc(),
         });
-        let policy = Arc::new(RwLock::new(engine));
+        let policy = Arc::new(crate::authz::SharedPolicy::new(engine));
 
         let checkpoint_keys = CheckpointKeys::from_jwks(&jwks)?;
         let metrics = Metrics::new();
@@ -318,6 +322,7 @@ impl AppState {
             lease_maintenance,
             policies_path: config.policy.policies_path.clone(),
             loaded_policies,
+            policy_reload: tokio::sync::Mutex::new(()),
             admin_token: config.admin.token.clone(),
             root_grants: config.root_grants.clone(),
             idps,
@@ -676,7 +681,7 @@ mod tests {
         cfg.issuer.private_key_pem_path = None;
         cfg.audit.sqlite_path = ":memory:".into();
         let state = AppState::from_config(&cfg).unwrap();
-        let ids = state.pipeline.policy().read().unwrap().policy_ids();
+        let ids = state.pipeline.policy().snapshot().policy_ids();
         assert!(ids.contains(&"permit_readonly_tools".to_string()));
         assert_eq!(state.admin_token, None);
     }
@@ -708,7 +713,7 @@ mod tests {
             cfg
         };
         let state = AppState::from_config(&config("127.0.0.1:8080", &asks, None, false)).unwrap();
-        assert!(state.pipeline.policy().read().unwrap().asks_for_approval());
+        assert!(state.pipeline.policy().snapshot().asks_for_approval());
         // Loopback: starts, and the check says to warn.
         let cfg = config("127.0.0.1:8080", &asks, None, false);
         assert!(cfg
@@ -739,7 +744,7 @@ mod tests {
             .unwrap());
         let cfg = config("0.0.0.0:8080", &plain, None, false);
         let state = AppState::from_config(&cfg).unwrap();
-        assert!(!state.pipeline.policy().read().unwrap().asks_for_approval());
+        assert!(!state.pipeline.policy().snapshot().asks_for_approval());
         assert!(!cfg
             .approvals
             .audience_check(false, cfg.server.listen)
@@ -878,7 +883,7 @@ mod tests {
 
         let warnings = |cfg: &Config| {
             let state = AppState::from_config(cfg).unwrap();
-            let engine = state.pipeline.policy().read().unwrap();
+            let engine = state.pipeline.policy().snapshot();
             engine.validation_warnings().to_vec()
         };
         assert!(!warnings(&cfg).is_empty(), "undeclared attributes warn");
@@ -890,13 +895,7 @@ mod tests {
         .into();
         assert!(warnings(&cfg).is_empty());
         let state = AppState::from_config(&cfg).unwrap();
-        let schema = state
-            .pipeline
-            .policy()
-            .read()
-            .unwrap()
-            .schema_text()
-            .to_string();
+        let schema = state.pipeline.policy().snapshot().schema_text().to_string();
         assert!(schema.contains("\"groups\"?: Set<String>"), "{schema}");
         assert!(schema.contains("\"department\"?: String"), "{schema}");
 
@@ -929,15 +928,14 @@ mod tests {
         let warned = !state
             .pipeline
             .policy()
-            .read()
-            .unwrap()
+            .snapshot()
             .validation_warnings()
             .is_empty();
         assert!(warned);
 
         cfg.policy.schema_path = Some(schema.clone());
         let state = AppState::from_config(&cfg).unwrap();
-        let engine = state.pipeline.policy().read().unwrap();
+        let engine = state.pipeline.policy().snapshot();
         assert!(engine.validation_warnings().is_empty());
         assert!(engine.schema_text().contains("owner?: String"));
         drop(engine);

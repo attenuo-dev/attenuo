@@ -47,7 +47,7 @@
 //! ```
 
 use std::hint::black_box;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use attenuo_audit::{
     AuditSink, Durability, LeaseStore, SqliteAudit, SqliteLeaseStore,
@@ -63,7 +63,7 @@ use attenuo_policy::{
 };
 use attenuo_proxy::Authorizer;
 use attenuo_server::authz::result_digest;
-use attenuo_server::{Pipeline, ServerAuthorizer};
+use attenuo_server::{Pipeline, ServerAuthorizer, SharedPolicy};
 use attenuo_token::{Issuer, IssuerConfig};
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use serde_json::json;
@@ -402,7 +402,7 @@ fn bench_decide(c: &mut Criterion) {
         default_ttl: Duration::hours(1),
     });
     let verifier = issuer.verifier();
-    let policy = Arc::new(RwLock::new(engine()));
+    let policy = Arc::new(SharedPolicy::new(engine()));
     let call = ToolCall::new(
         "fake",
         "read_file",
@@ -468,12 +468,7 @@ fn bench_decide(c: &mut Criterion) {
                     })
                 });
                 group.bench_function(format!("policy/{depth}_hop"), |b| {
-                    b.iter(|| {
-                        policy
-                            .read()
-                            .unwrap()
-                            .authorize(black_box(&chain), &call, now)
-                    })
+                    b.iter(|| policy.snapshot().authorize(black_box(&chain), &call, now))
                 });
                 group.bench_function(format!("record/{depth}_hop"), |b| {
                     b.iter(|| record(black_box(&chain), &call, now))
@@ -567,7 +562,7 @@ fn bench_decide(c: &mut Criterion) {
             let engine = engine_with(track, PERMIT_CREATE_ISSUE);
             assert_eq!(engine.tracks_usage(), track == TrackUsage::Always);
             let p = Pipeline::new(
-                Arc::new(RwLock::new(engine)),
+                Arc::new(SharedPolicy::new(engine)),
                 store.leases.clone(),
                 store.audit.clone(),
             );
@@ -681,7 +676,7 @@ fn bench_decide(c: &mut Criterion) {
         let tok = token(&issuer, store.leases.as_ref(), 2, now);
         let chain = verifier.verify(&tok, now).expect("verifies").chain;
         let tainting = Pipeline::new(
-            Arc::new(RwLock::new(reads_args(false))),
+            Arc::new(SharedPolicy::new(reads_args(false))),
             store.leases.clone(),
             store.audit.clone(),
         );
@@ -703,21 +698,22 @@ fn bench_decide(c: &mut Criterion) {
         );
         for (mode, reads) in [("policy_reads", true), ("no_policy", false)] {
             let p = Pipeline::new(
-                Arc::new(RwLock::new(reads_args(reads))),
+                Arc::new(SharedPolicy::new(reads_args(reads))),
                 store.leases.clone(),
                 store.audit.clone(),
             );
+            let engine = p.policy_snapshot();
             let session = p.run_labels(&chain).session;
             assert!(session.tainted);
-            let clean = p.arg_taint(&chain, &call, &session);
+            let clean = p.arg_taint(&engine, &chain, &call, &session);
             assert!(clean.record.is_empty() && clean.error.is_none());
-            let hit = p.arg_taint(&chain, &url_read, &session);
+            let hit = p.arg_taint(&engine, &chain, &url_read, &session);
             assert_eq!(hit.record.is_empty(), !reads, "{hit:?}");
             group.bench_function(format!("arg_taint_{s}/read_clean_{mode}"), |b| {
-                b.iter(|| p.arg_taint(black_box(&chain), &call, &session))
+                b.iter(|| p.arg_taint(&engine, black_box(&chain), &call, &session))
             });
             group.bench_function(format!("arg_taint_{s}/read_url_{mode}"), |b| {
-                b.iter(|| p.arg_taint(black_box(&chain), &url_read, &session))
+                b.iter(|| p.arg_taint(&engine, black_box(&chain), &url_read, &session))
             });
         }
         assert!(store.audit.verify_chain().unwrap().ok);

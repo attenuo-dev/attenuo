@@ -1128,3 +1128,119 @@ fn bounded_queue_keeps_group_commit_and_order() {
     assert_eq!(log.append_stats(), super::log::AppendStats::default());
     assert!(log.verify_chain().unwrap().ok);
 }
+
+/// A-1: on a file in WAL mode, queries run on their own read-only connection, so a long read
+/// (here simulated by holding the reader's lock, as a verify walking a page does) never holds
+/// up an append, and an append is visible to the next read.
+#[test]
+fn a_read_in_progress_does_not_hold_up_appends() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = Arc::new(SqliteAudit::open(dir.path().join("audit.db")).unwrap());
+    log.append(record(0)).unwrap();
+    let reading = log
+        .reader
+        .as_ref()
+        .expect("a file in WAL mode has a reader")
+        .lock();
+    let (done, appended) = mpsc::channel();
+    let writer = {
+        let log = Arc::clone(&log);
+        std::thread::spawn(move || {
+            for i in 1..=20 {
+                log.append(record(i)).unwrap();
+            }
+            done.send(()).unwrap();
+        })
+    };
+    appended
+        .recv_timeout(Duration::from_secs(10))
+        .expect("appends commit while a read holds the reader connection");
+    // Queries wait for the reader, not for the writer.
+    let (asked, answered) = mpsc::channel();
+    let counting = {
+        let log = Arc::clone(&log);
+        std::thread::spawn(move || asked.send(log.len().unwrap()).unwrap())
+    };
+    assert!(answered.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(reading);
+    assert_eq!(answered.recv_timeout(Duration::from_secs(10)).unwrap(), 21);
+    writer.join().unwrap();
+    counting.join().unwrap();
+    assert!(log.verify_chain().unwrap().ok);
+    // The reader cannot write.
+    let refused = log
+        .reader
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM audit", []);
+    assert!(refused.is_err(), "the reader connection is read-only");
+    assert_eq!(log.len().unwrap(), 21);
+}
+
+/// An in-memory store has no second connection: its reads share the writer's.
+#[test]
+fn an_in_memory_store_reads_on_the_writer_connection() {
+    let log = SqliteAudit::open_in_memory().unwrap();
+    assert!(log.reader.is_none());
+    log.append(record(0)).unwrap();
+    assert_eq!(log.len().unwrap(), 1);
+    assert!(log.verify_chain().unwrap().ok);
+}
+
+/// A verify walks the log as it was when it began, page by page: entries appended after its
+/// snapshot are not walked, whatever page the walk is on when they land.
+#[test]
+fn a_paged_verify_stops_at_its_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = SqliteAudit::open(dir.path().join("audit.db")).unwrap();
+    // More than two pages.
+    let n = 2500;
+    std::thread::scope(|s| {
+        for t in 0..4 {
+            let log = &log;
+            s.spawn(move || {
+                for i in (t..n).step_by(4) {
+                    log.append(record(i)).unwrap();
+                }
+            });
+        }
+    });
+    let (upper, _) = log.verify_snapshot().unwrap();
+    assert_eq!(upper, n);
+    let mut walk = log.entries_through(upper);
+    let first = walk.next().unwrap().unwrap();
+    assert_eq!(first.seq, 1);
+    // Appends land while the walk is in its first page.
+    for i in 0..50 {
+        log.append(record(n + i)).unwrap();
+    }
+    let seqs: Vec<u64> = std::iter::once(Ok(first))
+        .chain(walk)
+        .map(|e| e.unwrap().seq)
+        .collect();
+    assert_eq!(seqs, (1..=2500).collect::<Vec<u64>>());
+    let report = log.verify_chain().unwrap();
+    assert!(report.ok);
+    assert_eq!(report.entries, 2550);
+}
+
+/// A row that does not decode is reported at its seq by the paged walk too, and the walk
+/// goes on past it.
+#[test]
+fn a_paged_verify_reports_a_corrupt_row_at_its_seq() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = SqliteAudit::open(dir.path().join("audit.db")).unwrap();
+    for i in 0..1500 {
+        log.append(record(i)).unwrap();
+    }
+    log.with_connection(|c| {
+        c.execute("UPDATE audit SET decision = 'deny' WHERE seq = 1200", [])?;
+        Ok(())
+    })
+    .unwrap();
+    let report = log.verify_chain().unwrap();
+    assert!(!report.ok);
+    assert_eq!(report.first_bad_seq, Some(1200));
+}

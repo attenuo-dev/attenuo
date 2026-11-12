@@ -1333,7 +1333,7 @@ pub async fn audit_export(
 /// # Errors
 ///
 /// 409 `reload_unavailable` when `policy.policies_path` is not configured, 500 `server_error` when
-/// the file cannot be read or a policy lock is poisoned, and 422 when the file does not parse or
+/// the file cannot be read or the loaded policy info lock is poisoned, and 422 when the file does not parse or
 /// validate (the previous set stays in force).
 pub async fn reload_policies(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
     let path = state.policies_path.as_ref().ok_or_else(|| {
@@ -1343,40 +1343,44 @@ pub async fn reload_policies(State(state): State<Arc<AppState>>) -> Result<Json<
             "policy.policies_path is not configured; there is nothing to reload",
         )
     })?;
+    // One reload at a time, from reading the file to the swap.
+    let _reloading = state.policy_reload.lock().await;
     let text = tokio::fs::read_to_string(path)
         .await
         .map_err(|e| ApiError::internal(format!("reading {}: {e}", path.display())))?;
     let digest = hex::encode(sha2::Sha256::digest(text.as_bytes()));
     let now = state.now();
-    // The write guard is not `Send`, so it lives only inside this block.
-    let reloaded = {
-        let mut engine = state
-            .pipeline
-            .policy()
-            .write()
-            .map_err(|_| ApiError::internal("policy engine lock poisoned"))?;
-        match engine.reload_policies_str(&text) {
-            Err(e) => Err(e.to_string()),
-            Ok(()) => {
-                // Under the engine's write lock, so `GET /admin/policies` never pairs the new
-                // policies with the old digest. A failed reload leaves both as they were.
+    // Compile the new set on the blocking pool from a snapshot of the engine in force, with no
+    // lock held: decisions go on with the old engine meanwhile (A-7). Then swap it in whole.
+    let compiled = state
+        .blocking(move |s| s.pipeline.policy_snapshot().with_policies_reloaded(&text))
+        .await;
+    let reloaded = match compiled {
+        Err(e) => Err(e.to_string()),
+        Ok(engine) => {
+            let engine = Arc::new(engine);
+            {
+                // The swap happens under the loaded-policy info's write lock, so
+                // `GET /admin/policies` never pairs the new policies with the old digest. A
+                // failed reload leaves both as they were.
                 let mut loaded = state
                     .loaded_policies
                     .write()
                     .map_err(|_| ApiError::internal("loaded policy info lock poisoned"))?;
+                state.pipeline.policy().swap(Arc::clone(&engine));
                 *loaded = crate::state::LoadedPolicies {
                     sha256: Some(digest.clone()),
                     loaded_at: now,
                 };
-                tracing::info!(
-                    run_usage = ?engine.usage_tracking_reasons(),
-                    "policies reloaded; run usage kept for these reasons (none: not kept)"
-                );
-                if engine.asks_for_approval() && state.approvals_client_id.is_none() {
-                    tracing::warn!("{}", crate::config::UNSET_APPROVAL_CLIENT_ID);
-                }
-                Ok((engine.policy_ids(), engine.validation_warnings().to_vec()))
             }
+            tracing::info!(
+                run_usage = ?engine.usage_tracking_reasons(),
+                "policies reloaded; run usage kept for these reasons (none: not kept)"
+            );
+            if engine.asks_for_approval() && state.approvals_client_id.is_none() {
+                tracing::warn!("{}", crate::config::UNSET_APPROVAL_CLIENT_ID);
+            }
+            Ok((engine.policy_ids(), engine.validation_warnings().to_vec()))
         }
     };
     let (ids, warnings) = match reloaded {

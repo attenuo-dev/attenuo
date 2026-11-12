@@ -84,7 +84,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use tower_http::trace::TraceLayer;
 
-pub use authz::{Pipeline, PipelineDecision, ServerAuthorizer};
+pub use authz::{Pipeline, PipelineDecision, ServerAuthorizer, SharedPolicy};
 pub use config::Config;
 pub use state::AppState;
 

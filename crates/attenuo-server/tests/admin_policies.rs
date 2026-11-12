@@ -575,7 +575,7 @@ async fn policy_routes_need_the_admin_token() {
 #[tokio::test]
 async fn dry_run_says_untracked_when_the_engine_keeps_no_usage() {
     let h = Harness::start().await;
-    assert!(!h.state.pipeline.policy().read().unwrap().tracks_usage());
+    assert!(!h.state.pipeline.policy().snapshot().tracks_usage());
     let root = h.mint_root(&["github:*"]).await;
     let body = with_token(
         call_body("create_issue", json!({"repo": "alice/public-site"})),
