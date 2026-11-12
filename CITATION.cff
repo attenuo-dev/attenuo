@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use attenuo in your research, please cite it as below."
+type: software
+title: "attenuo: delegation-aware authorization and enforcement for tool-using AI agents"
+abstract: >-
+  A self-hosted reference monitor between AI agent clients and Model Context
+  Protocol (MCP) tool servers. A user's login is exchanged (RFC 8693) for a
+  delegation token that can only narrow at each hop; every proxied tool call is
+  checked against every hop's lease, the chain's capabilities and run limits,
+  and a Cedar policy that sees the call's arguments, and every decision is
+  appended to a hash-chained audit log. Pre-alpha.
+authors:
+  - family-names: Kapoor
+    given-names: Mudit
+repository-code: "https://github.com/attenuo-dev/attenuo"
+license: Apache-2.0
+keywords:
+  - authorization
+  - AI agents
+  - Model Context Protocol
+  - delegation
+  - capabilities
+  - Cedar
+  - audit log

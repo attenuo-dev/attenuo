@@ -96,7 +96,7 @@ This is why narrow grants matter. A capability of `github:*` also covers `resour
 ## Limits today
 
 - The constraint kinds are `equals`, `one_of`, `prefix`, `path_prefix` and `range`. A `range` bounds the value of each call; a `sum` limit bounds the total over the run. Use both to say "at most 2000 per payment and 5000 in all". Time-range constraints are not built ([RFC-0001 section 3.1](../spec/rfc-0001-attenuo.md#31-not-yet-implemented--proposed) says why).
-- Run limits count per delegation run. Limits per time window are not built.
+- Run limits in a token count per delegation run. A user's use of destructive tools across all their runs in the current UTC hour and day is a policy input (`context.usage.user_window`, single replica only; see [run limits: per-user windows](../design/run-limits.md#as-built-per-user-windows-phase-3-step-1)); a token limit per time window is not built.
 - Property tests (`crates/attenuo-core/tests/attenuation_props.rs`) check that coverage never lets a child permit something its parent does not, limits included. They check soundness, not that every narrower request is accepted.
 
 More detail: [RFC-0001 section 3](../spec/rfc-0001-attenuo.md#3-delegation-chain-data-model) and [ADR-0005](../decisions/0005-policy-decision-point.md).

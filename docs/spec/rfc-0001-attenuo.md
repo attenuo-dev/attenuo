@@ -28,7 +28,9 @@ The 2025-2026 incident record is mostly over-privilege, missing isolation and mi
 
 attenuo is a self-hosted, IdP-neutral reference monitor that sits between agent clients and MCP tool servers. It issues attenuated delegation tokens, authorizes every tool call against a policy that sees the arguments, revokes in-flight runs, and records every decision in a tamper-evident log.
 
-## 2. Guaranteed properties
+## 2. Security properties
+
+These are the properties the design sets out to hold. The implementation is checked against them with unit, property and integration tests and with fuzzing; none of them is formally proven.
 
 Let a *run* be a tree of hops rooted at an originating user `u`. Hop `h_n` is an agent acting with capability set `C_n`.
 

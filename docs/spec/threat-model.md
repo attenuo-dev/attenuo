@@ -42,7 +42,7 @@ Out of scope: compromise of attenuo's host or signing keys, compromise of the Id
 
 ## Incident mapping
 
-Sources: [AuthZed timeline](https://authzed.com/blog/timeline-mcp-breaches), [Practical DevSecOps roundup](https://www.practical-devsecops.com/mcp-security-statistics-2026-report/). Properties are as defined in [RFC-0001 §2](rfc-0001-attenuo.md#2-guaranteed-properties).
+Sources: [AuthZed timeline](https://authzed.com/blog/timeline-mcp-breaches), [Practical DevSecOps roundup](https://www.practical-devsecops.com/mcp-security-statistics-2026-report/). Properties are as defined in [RFC-0001 §2](rfc-0001-attenuo.md#2-security-properties).
 
 | Incident | Root cause | Would have blocked or limited | Would not have prevented |
 |---|---|---|---|

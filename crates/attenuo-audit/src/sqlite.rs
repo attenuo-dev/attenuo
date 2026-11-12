@@ -1,6 +1,8 @@
 //! SQLite-backed audit sink and lease store.
 //!
-//! Both wrap a single `rusqlite::Connection` behind a `Mutex`. Audit appends go through one
+//! Each writes through one `rusqlite::Connection` behind a `Mutex`. The audit log on a file in
+//! WAL mode also reads through a second, read-only connection with its own lock, so a long
+//! read never holds the writer's (see "Reads" on [`SqliteAudit`]). Audit appends go through one
 //! writer thread (group commit, see [`SqliteAudit`]): it takes the lock, reads the current head
 //! and inserts the next rows in one transaction, so two entries can never share a `prev_hash`.
 //! The lock and the single writer, not SQLite's locking, keep the chain linear within a
