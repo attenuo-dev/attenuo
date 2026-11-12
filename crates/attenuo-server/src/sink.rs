@@ -94,8 +94,9 @@ pub trait Settle<T>: Send + Sync + std::fmt::Debug {
 
     /// Items kept elsewhere that wait for room in the queue, oldest first, at most `room`
     /// (the approval notices a restart left open, SR-93). The delivery thread asks each time
-    /// it finds the queue empty, outside the lock, and puts what it gets at the front, so
-    /// they go before anything queued meanwhile. Default: none.
+    /// it finds the queue empty, outside the lock, for at most half the capacity (SR-98), and
+    /// puts what it gets at the front, so they go before anything queued meanwhile. Default:
+    /// none.
     fn refill(&self, room: usize) -> Vec<T> {
         let _ = room;
         Vec::new()
@@ -301,10 +302,13 @@ impl<T> Shared<T> {
         }
     }
 
+    /// Ask the hook for waiting items: at most half the capacity, so that items pushed while
+    /// the batch is delivered find room instead of pushing the batch out of a full queue (and
+    /// the queue does not read as full the whole time a backlog drains, SR-98).
     fn refill(&self) -> Vec<T> {
         self.settle
             .as_ref()
-            .map_or_else(Vec::new, |s| s.refill(self.limits.capacity))
+            .map_or_else(Vec::new, |s| s.refill(refill_room(self.limits.capacity)))
     }
 
     fn oldest(st: &State<T>) -> Option<(Instant, SystemTime)> {
@@ -426,6 +430,10 @@ pub struct Queue<T> {
 
 impl<T: QueueItem> Queue<T> {
     /// Start delivering with `deliver`.
+    ///
+    /// # Errors
+    ///
+    /// As [`start_with`](Self::start_with).
     pub fn start(
         deliver: Box<dyn Deliver<T>>,
         limits: SinkLimits,
@@ -436,6 +444,10 @@ impl<T: QueueItem> Queue<T> {
     }
 
     /// [`start`](Self::start), telling `settle` what became of each item.
+    ///
+    /// # Errors
+    ///
+    /// When the delivery thread cannot be spawned.
     pub fn start_with(
         deliver: Box<dyn Deliver<T>>,
         limits: SinkLimits,
@@ -541,6 +553,13 @@ pub struct CheckpointSink {
 
 impl CheckpointSink {
     /// Validate `cfg` and start delivering.
+    ///
+    /// # Errors
+    ///
+    /// When `cfg` does not validate, when the webhook or S3 client cannot be built, when an S3 sink
+    /// has no access key id or secret access key (in the config or `AWS_ACCESS_KEY_ID` and
+    /// `AWS_SECRET_ACCESS_KEY`), when a file sink's path cannot be opened for appending, or as
+    /// [`with_deliver`](Self::with_deliver).
     pub fn start(
         cfg: &SinkSection,
         public_url: Option<String>,
@@ -567,6 +586,10 @@ impl CheckpointSink {
     }
 
     /// Start with any deliverer (tests).
+    ///
+    /// # Errors
+    ///
+    /// When the delivery thread cannot be spawned.
     pub fn with_deliver(
         deliver: Box<dyn Deliver>,
         limits: SinkLimits,
@@ -603,6 +626,12 @@ impl CheckpointSink {
     pub fn shutdown(&self, grace: Duration) {
         self.queue.shutdown(grace);
     }
+}
+
+/// How many waiting items [`Settle::refill`] is asked for at a time: half the queue, at least
+/// one (SR-98).
+fn refill_room(capacity: usize) -> usize {
+    (capacity / 2).max(1)
 }
 
 /// The delivery thread.
@@ -818,7 +847,12 @@ pub struct FileDeliver {
 }
 
 impl FileDeliver {
-    /// Checks at startup that `path` can be opened for appending.
+    /// A sink appending to `path`, checked at startup.
+    ///
+    /// # Errors
+    ///
+    /// When `path` cannot be opened for appending (missing directory, no permission); the message
+    /// names the path.
     pub fn new(path: PathBuf) -> anyhow::Result<Self> {
         open_append(&path)
             .map_err(|e| anyhow::anyhow!("[audit.sink] path {}: {e}", path.display()))?;

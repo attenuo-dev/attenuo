@@ -170,10 +170,15 @@ pub const SCREEN_MEMO_CAPACITY: usize = 16_384;
 
 /// The attributes a memoised verdict was computed with (narrowing from tool annotations can
 /// change them during the engine's life).
-type AttrKey = (bool, bool, bool);
+type AttrKey = (bool, bool, bool, bool);
 
 fn attr_key(attrs: &ToolAttrs) -> AttrKey {
-    (attrs.readonly, attrs.sensitive, attrs.is_destructive())
+    (
+        attrs.readonly,
+        attrs.sensitive,
+        attrs.is_destructive(),
+        attrs.has_outbound(),
+    )
 }
 
 /// Screen verdicts by (chain digest, policy generation, server), then tool. A list of the same

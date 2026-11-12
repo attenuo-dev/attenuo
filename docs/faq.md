@@ -28,7 +28,7 @@ attenuo is the part that answers those questions. It can sit behind a gateway as
 
 Those two answer "who or what is this workload, and may it reach this system?". Teleport is an identity-aware access layer for infrastructure and issues short-lived credentials to people and machines. SPIRE issues cryptographic identities (SVIDs) to workloads. Both identify the caller.
 
-attenuo answers a different question: "this caller is acting for Alice, through two other agents, with this much of Alice's authority, and may it make this call with these arguments right now?". The two layers fit together. SPIRE or similar could identify each agent, which would fix a gap in v0: the `actor` of an exchange is a name the caller asserts, not proven (see [known limits](design/server.md#known-limits-v0)). That integration is not built. Teleport's MCP Access does enforce per tool: roles list the tools a user or bot may call, by name, glob or regex. Its docs do not describe checks on a call's arguments or a narrowing chain across agents; its Delegated Identity for agents is in public beta. Details and sources are in the [comparison](comparison.md#product-notes) (checked 2026-10-24).
+attenuo answers a different question: "this caller is acting for Alice, through two other agents, with this much of Alice's authority, and may it make this call with these arguments right now?". The two layers fit together. SPIRE or similar can identify each agent: an exchange's `actor` is authenticated by default (`[token] require_actor_auth`), by a client secret or by an `actor_token` such as a JWT-SVID checked against a SPIFFE trust bundle ([ADR-0007](decisions/0007-actor-authentication.md)). Teleport's MCP Access does enforce per tool: roles list the tools a user or bot may call, by name, glob or regex. Its docs do not describe checks on a call's arguments or a narrowing chain across agents; its Delegated Identity for agents is in public beta. Details and sources are in the [comparison](comparison.md#product-notes) (checked 2026-10-24).
 
 ## How is it different from OpenFGA, SpiceDB, Cerbos or OPA?
 
@@ -40,7 +40,13 @@ What an engine does not give you is everything around the question. It does not 
 
 Managed agent-governance products, from Microsoft (Entra Agent ID, Agent 365), Okta and Auth0, and others, give you agent identity, registries, policy and reporting inside a vendor's platform and tied to that vendor's identity system. As we understand them, they are hosted services.
 
-attenuo is self-hosted, open source (Apache-2.0) and neutral about the IdP: it takes OIDC ID tokens from Keycloak, Okta, Entra, Google and others. It enforces at the tool call, not only at sign-in. You can run both: let the vendor own agent identity and registration, and let attenuo be the monitor in front of the tools. Which of these products enforce per tool call, or revoke in flight, we could not confirm from their documentation (checked 2026-10-24); the [comparison](comparison.md#product-notes) has what each documents, with sources.
+attenuo is self-hosted, open source (Apache-2.0) and neutral about the IdP: it takes OIDC ID tokens from Keycloak, Okta, Entra, Google and others. It enforces at the tool call, not only at sign-in. You can run both: let the vendor own agent identity and registration, and let attenuo be the monitor in front of the tools. Which of these products enforce per tool call, or revoke in flight, we could not confirm from their documentation (checked 2026-10-24). Some products announced since do describe a check on each tool call and per-agent revocation, Aembit's MCP Identity Gateway among them. The [comparison](comparison.md#product-notes) has what each documents or announced, with sources.
+
+## Is attenuo the only system that does this?
+
+No. Narrowing delegation with a check on every tool call exists elsewhere. Two research prototypes, AgentCap (or AgentGate, which may be the same work) and DelegateGuard, narrow authority across hops and check calls outside the model, and DelegateGuard also cascades revocation. An IETF individual draft, `draft-niyikiza-oauth-attenuating-agent-tokens`, defines agent tokens that holders narrow offline, with argument constraints and a proof of possession per call. Commercial gateways and vendor platforms cover parts of it too.
+
+What attenuo adds is a combination, built in the open: it is self-hosted and Apache-2.0, it uses standards (RFC 8693 exchange, ID-JAG or OIDC at hop 0, Cedar, AuthZEN), its chains cross identity providers and services, revoking a lease stops running agents on their next call, the decision log can be verified offline by anyone with the public keys, and its evaluation states what it does not show. Its delegation is online, at the server, where the draft's is offline: that costs a round trip per hop and buys revocation and a record of every delegation. See [related work](research/related-work.md#online-versus-offline-attenuation) and [standards](research/standards.md).
 
 ## Does it slow calls down?
 
@@ -105,7 +111,7 @@ The holder renews its lease with `POST /token/renew`. See [ADR-0006](decisions/0
 
 ID-JAG is the Identity Assertion JWT Authorization Grant, an IETF OAuth draft (`draft-ietf-oauth-identity-assertion-authz-grant`). It is a JWT that an IdP issues to say: this client is allowed to act for this user toward this resource. It is the basis of Okta's Cross App Access and was folded into MCP as an enterprise authorization extension.
 
-attenuo accepts an ID-JAG, or a plain OIDC ID token, as the credential at hop 0 and builds the first token of a chain from it. It follows draft -04, and drafts change, so treat that part as the least stable. It has been tested only against assertions the server's own tests sign. See [Identity providers](guides/identity-providers.md#id-jag) and [the standards note](research/standards.md).
+attenuo accepts an ID-JAG, or a plain OIDC ID token, as the credential at hop 0 and builds the first token of a chain from it. It follows draft -04. The draft has since reached -06 (31 October 2026), and attenuo has not been re-tested against it, so treat that part as the least stable. It has been tested only against assertions the server's own tests sign. See [Identity providers](guides/identity-providers.md#id-jag) and [the standards note](research/standards.md).
 
 ## Does it stop prompt injection?
 
@@ -117,4 +123,4 @@ Without those, it cannot stop an agent from misusing something it is legitimatel
 
 ## Is it ready for production?
 
-No. It is pre-alpha. Formats will change before 1.0, there is one node and one SQLite file, admin authentication is a single static token, and the four security review passes were done by the project itself with no outside audit (every finding from them is fixed or accepted; see [Status](../README.md#status)). Use it to evaluate the model, in staging, or in a closed pilot where you accept those limits. [Deploying](guides/deploying.md) lists what to harden.
+No. It is pre-alpha. Formats will change before 1.0 ([what may change](reference/api-compatibility.md)), there is one node and one SQLite file, admin authentication is a single static token, and the ten security review passes were done by the project itself with no outside audit (every finding is fixed or accepted except three open Info findings; see [Status](https://github.com/attenuo-dev/attenuo#status)). Use it to evaluate the model, in staging, or in a closed pilot where you accept those limits. [Deploying](guides/deploying.md) lists what to harden.

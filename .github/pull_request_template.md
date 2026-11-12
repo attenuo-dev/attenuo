@@ -15,7 +15,7 @@
 - [ ] `CHANGELOG.md` updated under Unreleased, if user-visible
 - [ ] ADR added/updated if a design decision was made (docs/decisions/)
 - [ ] RFC status updated if this implements one (docs/spec/)
-- [ ] Task moved in docs/tasks/board.md
+- [ ] Task board (`docs/tasks/board.md`) updated, if the change is on it (maintainers)
 
 ## Process
 - [ ] Commits follow Conventional Commits and are signed off (`git commit -s`, DCO)

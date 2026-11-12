@@ -146,6 +146,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(unreachable_pub)]
+#![warn(clippy::missing_errors_doc)]
 #![warn(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -166,6 +167,7 @@ pub mod screen;
 pub mod session;
 pub mod sse;
 pub mod stage;
+pub mod traceparent;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -224,3 +226,4 @@ pub use proxy::{
 pub use screen::ListFilterMode;
 pub use session::{SessionOwner, SessionRegistry};
 pub use stage::Stage;
+pub use traceparent::{TraceHook, TraceParent, OTEL_TARGET};

@@ -346,6 +346,7 @@ struct PartsKey {
     readonly: bool,
     sensitive: bool,
     destructive: bool,
+    outbound: bool,
 }
 
 impl PartsKey {
@@ -366,6 +367,7 @@ impl PartsKey {
             readonly: attrs.readonly,
             sensitive: attrs.sensitive,
             destructive: attrs.is_destructive(),
+            outbound: attrs.has_outbound(),
         }
     }
 
@@ -379,6 +381,7 @@ impl PartsKey {
             && self.readonly == attrs.readonly
             && self.sensitive == attrs.sensitive
             && self.destructive == attrs.is_destructive()
+            && self.outbound == attrs.has_outbound()
             && self.hops.len() == chain.hops.len()
             && self
                 .hops
@@ -411,7 +414,8 @@ impl PartsKey {
 /// chain and tool: the principal, action and resource, the entity store (user, agents,
 /// server, tool, actions) and the `originating_user` and `chain` context records. Only
 /// `context.input`, `context.session_id`, `context.now_unix` and the output-labelling members
-/// (`session`, `args_contain_untrusted`, `untrusted_args`, `approval`) and the run-limit
+/// (`session`, `args_contain_untrusted`, `untrusted_args`, `untrusted_outbound`, `approval`) and
+/// the run-limit
 /// members (`budget`, `usage`) are built per call.
 #[derive(Debug)]
 pub(crate) struct RequestParts {
@@ -493,16 +497,16 @@ impl RequestParts {
     }
 
     /// The Cedar request for `call` at `now`, with the per-call context members.
-    /// `inputs` are the tool's declared argument types, which pick how a number is converted
-    /// ([`ArgType::Decimal`]).
+    /// `attrs` are the tool's: its declared argument types pick how a number is converted
+    /// ([`ArgType::Decimal`]), and its `outbound` inputs give `context.untrusted_outbound`.
     pub(crate) fn request(
         &self,
         call: &ToolCall,
-        inputs: &BTreeMap<String, ArgType>,
+        attrs: &ToolAttrs,
         labels: &CallLabels,
         now: OffsetDateTime,
     ) -> Result<Request, TranslationError> {
-        let input = input_object(&call.arguments, inputs)?;
+        let input = input_object(&call.arguments, &attrs.inputs)?;
         let mut pairs = Vec::with_capacity(10);
         pairs.push(("input".to_string(), restricted(&input)?));
         pairs.push((
@@ -520,7 +524,10 @@ impl RequestParts {
             "now_unix".to_string(),
             RestrictedExpression::new_long(now.unix_timestamp()),
         ));
-        pairs.extend(label_pairs(labels)?);
+        pairs.extend(label_pairs(
+            labels,
+            attrs.untrusted_outbound(&labels.args.untrusted),
+        )?);
         let context =
             Context::from_pairs(pairs).map_err(|e| TranslationError(format!("context: {e}")))?;
         Request::new(
@@ -536,12 +543,14 @@ impl RequestParts {
 
 /// The output-labelling members of the context (ADR-0009), always present:
 /// `session: {tainted, tainted_by}`, `args_contain_untrusted` and `untrusted_args` (the
-/// arguments that matched the run's span index, phase 2), and `approval: {present, by}` (a
+/// arguments that matched the run's span index, phase 2), `untrusted_outbound` (one of them is
+/// an outbound input of the tool, as the caller computed it), and `approval: {present, by}` (a
 /// granted approval the call consumed, if any); and the run-limit member (ADR-0010),
 /// `budget: {limited, calls_remaining, amount_remaining, destination_new}`, and run usage,
-/// `usage: {calls, amount, destination_seen}`.
+/// `usage: {calls, amount, destination_seen, user_window: {hour, day}}`.
 fn label_pairs(
     labels: &CallLabels,
+    untrusted_outbound: bool,
 ) -> Result<Vec<(String, RestrictedExpression)>, TranslationError> {
     let record = |pairs: Vec<(String, RestrictedExpression)>| {
         RestrictedExpression::new_record(pairs)
@@ -593,6 +602,19 @@ fn label_pairs(
         ),
     ])?;
     let u = &labels.usage;
+    let window = |w: &crate::WindowFigures| {
+        record(vec![
+            ("calls".to_string(), RestrictedExpression::new_long(w.calls)),
+            (
+                "amount".to_string(),
+                RestrictedExpression::new_long(w.amount),
+            ),
+        ])
+    };
+    let user_window = record(vec![
+        ("hour".to_string(), window(&u.user_window.hour)?),
+        ("day".to_string(), window(&u.user_window.day)?),
+    ])?;
     let usage = record(vec![
         ("calls".to_string(), RestrictedExpression::new_long(u.calls)),
         (
@@ -603,6 +625,7 @@ fn label_pairs(
             "destination_seen".to_string(),
             RestrictedExpression::new_bool(u.destination_seen),
         ),
+        ("user_window".to_string(), user_window),
     ])?;
     Ok(vec![
         ("session".to_string(), session),
@@ -620,6 +643,10 @@ fn label_pairs(
                     .map(|a| RestrictedExpression::new_string(a.clone())),
             ),
         ),
+        (
+            "untrusted_outbound".to_string(),
+            RestrictedExpression::new_bool(untrusted_outbound),
+        ),
         ("approval".to_string(), approval),
         ("budget".to_string(), budget),
         ("usage".to_string(), usage),
@@ -628,7 +655,7 @@ fn label_pairs(
 
 /// The output-labelling members as JSON, for the one-pass reference translation.
 #[cfg(test)]
-fn label_json(labels: &CallLabels) -> Map<String, Value> {
+fn label_json(labels: &CallLabels, untrusted_outbound: bool) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert(
         "session".into(),
@@ -639,6 +666,7 @@ fn label_json(labels: &CallLabels) -> Map<String, Value> {
         json!(labels.args.contain_untrusted),
     );
     m.insert("untrusted_args".into(), json!(labels.args.untrusted));
+    m.insert("untrusted_outbound".into(), json!(untrusted_outbound));
     m.insert(
         "approval".into(),
         json!({ "present": labels.approval.present, "by": labels.approval.by }),
@@ -658,6 +686,16 @@ fn label_json(labels: &CallLabels) -> Map<String, Value> {
             "calls": labels.usage.calls,
             "amount": labels.usage.amount,
             "destination_seen": labels.usage.destination_seen,
+            "user_window": {
+                "hour": {
+                    "calls": labels.usage.user_window.hour.calls,
+                    "amount": labels.usage.user_window.hour.amount,
+                },
+                "day": {
+                    "calls": labels.usage.user_window.day.calls,
+                    "amount": labels.usage.user_window.day.amount,
+                },
+            },
         }),
     );
     m
@@ -751,6 +789,7 @@ fn entities(
             "readonly": attrs.readonly,
             "sensitive": attrs.sensitive,
             "destructive": attrs.is_destructive(),
+            "outbound": attrs.has_outbound(),
         },
         "parents": [uid_json("Server", &call.server)],
     }));
@@ -844,12 +883,13 @@ impl RequestCache {
 /// of them is always present in a call's context, so making its value unknown keeps
 /// `context has <member>` true, as it is for every call. `session_id`, the one optional member,
 /// is handled apart ([`ScreenBase::partial_request`]).
-pub(crate) const SCREEN_UNKNOWNS: [&str; 8] = [
+pub(crate) const SCREEN_UNKNOWNS: [&str; 9] = [
     "input",
     "now_unix",
     "session",
     "args_contain_untrusted",
     "untrusted_args",
+    "untrusted_outbound",
     "approval",
     "budget",
     "usage",
@@ -958,6 +998,10 @@ impl ScreenBase {
                     "destructive".to_string(),
                     RestrictedExpression::new_bool(attrs.is_destructive()),
                 ),
+                (
+                    "outbound".to_string(),
+                    RestrictedExpression::new_bool(attrs.has_outbound()),
+                ),
             ]),
             HashSet::from([uid(&SERVER, &self.server)]),
         )
@@ -1061,7 +1105,10 @@ pub(crate) fn build(
         context.insert("session_id".into(), Value::String(sid.clone()));
     }
     context.insert("now_unix".into(), json!(now.unix_timestamp()));
-    context.extend(label_json(labels));
+    context.extend(label_json(
+        labels,
+        attrs.untrusted_outbound(&labels.args.untrusted),
+    ));
     let context = Context::from_json_value(Value::Object(context), None)
         .map_err(|e| TranslationError(format!("context: {e}")))?;
 
@@ -1101,6 +1148,7 @@ pub(crate) fn build(
             "readonly": attrs.readonly,
             "sensitive": attrs.sensitive,
             "destructive": attrs.is_destructive(),
+            "outbound": attrs.has_outbound(),
         },
         "parents": [uid_json("Server", &call.server)],
     }));
@@ -1491,18 +1539,26 @@ mod tests {
                         for (server, tool) in [("gh", "read_file"), ("gh", "resources/read")] {
                             let mut call = ToolCall::new(server, tool, arguments.clone());
                             call.session_id = session.clone();
-                            let tool_attrs = ToolAttrs::new().readonly(true);
-                            for (legacy, labels) in
-                                [(false, CallLabels::default()), (true, tainted_labels())]
-                            {
+                            for (tool_attrs, legacy, labels) in [
+                                (
+                                    ToolAttrs::new().readonly(true),
+                                    false,
+                                    CallLabels::default(),
+                                ),
+                                (ToolAttrs::new().readonly(true), true, tainted_labels()),
+                                (
+                                    ToolAttrs::new().readonly(true).with_outbound("to#host"),
+                                    false,
+                                    tainted_labels(),
+                                ),
+                            ] {
                                 let reference =
                                     build(&chain, &call, &tool_attrs, &labels, now, legacy)
                                         .unwrap();
                                 let parts = RequestParts::build(&chain, &call, &tool_attrs, legacy)
                                     .unwrap();
-                                let request = parts
-                                    .request(&call, &BTreeMap::new(), &labels, now)
-                                    .unwrap();
+                                let request =
+                                    parts.request(&call, &tool_attrs, &labels, now).unwrap();
                                 let what = format!(
                                     "{depth} {attrs} {arguments} {session:?} {tool} {legacy}"
                                 );
@@ -1547,9 +1603,7 @@ mod tests {
             .unwrap();
         let parts = RequestParts::build(&chain, &bad_call, &attrs, false).unwrap();
         assert_eq!(
-            parts
-                .request(&bad_call, &BTreeMap::new(), &labels, now)
-                .unwrap_err(),
+            parts.request(&bad_call, &attrs, &labels, now).unwrap_err(),
             reference
         );
     }

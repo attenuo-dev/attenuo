@@ -17,9 +17,12 @@ from typing import Any, Literal
 import httpx
 
 from . import _wire as w
+from ._http import AsyncHttpClient, HttpClient
 from .capability import CapabilityLike, capabilities_to_json
 from .dpop import DpopKey, NonceCache
-from .errors import AttenuoError
+from .errors import AttenuoError, budget_limit_from_json
+from .errors import BudgetLimit as BudgetLimit
+from .errors import LimitKind as LimitKind
 from .token import Token
 
 _MAX_PAGE = 1000
@@ -268,35 +271,6 @@ class PolicyCheck:
     warning_count: int
     issues: list[dict[str, Any]]
     policy_ids: list[str]
-
-
-LimitKind = Literal["calls", "sum", "calls_per", "distinct"]
-
-
-@dataclass(frozen=True)
-class BudgetLimit:
-    """One run-limit counter: ``hop`` (position in the chain, root 0), ``kind``, ``arg`` (the
-    counted argument as the limit names it, ``arg#host`` for a derived one; ``None`` for
-    ``calls``), ``used`` (calls or summed amount; for ``calls_per`` the calls with this value;
-    for ``distinct`` how many values the limit has seen) and ``max``.
-
-    The ``limit`` of a ``budget_exhausted`` dry run has this shape, and so does an entry of
-    :attr:`StatedBudget.limits`, where ``max`` is optional (when given it must equal the
-    limit's). A refusal's ``limit`` can be stated back as it came."""
-
-    hop: int
-    kind: LimitKind
-    used: int
-    arg: str | None = None
-    max: int | None = None
-
-    def to_json(self) -> dict[str, Any]:
-        out: dict[str, Any] = {"hop": self.hop, "kind": self.kind, "used": self.used}
-        if self.arg is not None:
-            out["arg"] = self.arg
-        if self.max is not None:
-            out["max"] = self.max
-        return out
 
 
 @dataclass(frozen=True)
@@ -744,19 +718,6 @@ def _int(v: Any) -> int:
     return v if isinstance(v, int) and not isinstance(v, bool) else 0
 
 
-def _budget_limit(v: Any) -> BudgetLimit | None:
-    if not isinstance(v, dict):
-        return None
-    arg, mx = v.get("arg"), v.get("max")
-    return BudgetLimit(
-        hop=_int(v.get("hop")),
-        kind=str(v.get("kind", "")),  # type: ignore[arg-type]
-        used=_int(v.get("used")),
-        arg=None if arg is None else str(arg),
-        max=mx if isinstance(mx, int) and not isinstance(mx, bool) else None,
-    )
-
-
 def _evaluation_budget(v: Any) -> EvaluationBudget | None:
     if not isinstance(v, dict):
         return None
@@ -804,7 +765,7 @@ def _policy_evaluation(b: Any) -> PolicyEvaluation:
         chain_source=str(b.get("chain_source", "")),
         token_expired=b.get("token_expired") is True,
         budget=_evaluation_budget(b.get("budget")),
-        limit=_budget_limit(b.get("limit")),
+        limit=budget_limit_from_json(b.get("limit")),
         labels=_evaluation_labels(b.get("session")),
         usage=_evaluation_usage(b.get("usage")),
         approval_by=str(approval.get("by", "")) if present else None,
@@ -853,7 +814,7 @@ class AdminClient:
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.server_url = w.normalize_base(server_url)
-        self._http = httpx.Client(
+        self._http = HttpClient(
             base_url=self.server_url,
             timeout=timeout,
             transport=transport,
@@ -1177,7 +1138,7 @@ class AsyncAdminClient:
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.server_url = w.normalize_base(server_url)
-        self._http = httpx.AsyncClient(
+        self._http = AsyncHttpClient(
             base_url=self.server_url,
             timeout=timeout,
             transport=transport,

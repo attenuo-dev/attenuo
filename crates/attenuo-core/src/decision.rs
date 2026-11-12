@@ -211,6 +211,35 @@ pub struct RecordUsage {
     /// The catalog's `destination` input value appeared in an earlier allowed call of this
     /// tool in the run.
     pub destination_seen: bool,
+    /// The originating user's per-user windows of this tool (run limits phase 3), for the
+    /// kinds a loaded policy reads. Absent when none is kept, so records written without
+    /// windows hash as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_window: Option<RecordUserWindow>,
+}
+
+/// What a decision record says about the originating user's per-user windows of the called
+/// tool (`context.usage.user_window`), before the call. Only the kinds the server keeps are
+/// present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RecordUserWindow {
+    /// The UTC hour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hour: Option<RecordWindow>,
+    /// The UTC day.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub day: Option<RecordWindow>,
+}
+
+/// One per-user window as a decision record states it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RecordWindow {
+    /// The window's start, Unix seconds UTC.
+    pub start: i64,
+    /// Allowed calls of the tool by any run of the user in the window.
+    pub calls: u64,
+    /// The sum of the catalog's `amount` input over those calls.
+    pub amount: u64,
 }
 
 /// What a decision record says about run limits (see [`DecisionRecord::budget`]).

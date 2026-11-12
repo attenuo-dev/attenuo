@@ -11,6 +11,7 @@ Task-oriented guides for people who want to run attenuo or build on it. They des
 | [Codebase walkthrough](../guide/codebase-walkthrough.md) | Read and run the whole codebase yourself: fifteen sessions of reading order, questions and commands, a "why it is this way" index, a glossary and the things that surprise people |
 | [Binding tokens to keys](binding-tokens-to-keys.md) | Make a leaked token useless: bind tokens to agent keys with DPoP, from the CLI, the SDKs or raw HTTP, and what the server refuses |
 | [Identity providers](identity-providers.md) | Connect Keycloak, Auth0, Okta, Entra ID or Google, set up agents and root grants, and use ID-JAG. Provider recipes are untested |
+| [Observability](observability.md) | Send traces of each MCP call to an OpenTelemetry collector, scrape the metrics into it, and follow a span to its signed audit record |
 | [Admin console](admin-console.md) | Look at the audit log, a decision, a lease tree, the loaded policies and the chain's signatures in a browser; revoke or reload from it if you allow writes |
 
 Suggested order: Getting started, then Identity providers and Integrating MCP clients, then Deploying.
@@ -28,7 +29,7 @@ Other places to look:
 ## Conventions in these guides
 
 - Commands are meant to be run as written. Where one has not been run, the guide says **untested**.
-- `$OB` is your checkout of the repository. `$ATTENUO_ADMIN_TOKEN` is the admin bearer.
+- `$REPO` is your checkout of the repository. `$ATTENUO_ADMIN_TOKEN` is the admin bearer.
 - A guide never uses the example admin token or agent secret from `config/example.toml` for anything real.
 
 If a command in a guide does not work as written, that is a bug in the guide. Please open an issue.

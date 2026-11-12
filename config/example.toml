@@ -70,6 +70,16 @@ inputs = { repo = "string", title = "string" }
 sensitive = true
 inputs = { repo = "string" }
 
+# A fetch is read-only, but its `url` goes to whatever host the URL names, which can be the
+# attacker's: an outbound argument. `outbound = "url#host"` makes the fetch keep run usage per
+# host (context.usage.destination_seen, as `destination` does for a destructive tool) and sets
+# context.untrusted_outbound when the URL carries text from an untrusted result of the run.
+# Cedar sees resource.outbound = true. A list names several: outbound = ["url", "callback"].
+[policy.catalog.web.fetch]
+readonly = true
+inputs = { url = "string" }
+outbound = "url#host"
+
 [audit]
 # Audit log and lease registry. ":memory:" keeps both in memory (lost on exit).
 sqlite_path = "data/attenuo.sqlite"
@@ -319,6 +329,27 @@ enabled = false
 # listen = "127.0.0.1:9100"
 # A non-loopback `listen` is refused at startup unless this is true (SR-38).
 # allow_public = false
+
+[telemetry]
+# OpenTelemetry trace export over OTLP/HTTP (protobuf). Off by default. Exported spans carry
+# decision ids, reason codes, tool names and route templates; never a token, the subject,
+# arguments or results. Export fails open: a dead collector never delays a decision.
+# See docs/guides/observability.md.
+enabled = false
+# otlp_endpoint = "http://127.0.0.1:4318"   # /v1/traces is appended; non-loopback must be https
+# timeout_seconds = 10
+# allow_insecure = false
+# service_name = "attenuo-server"
+# resource_attributes = { "deployment.environment" = "production" }
+# Collector credentials: OTEL_EXPORTER_OTLP_HEADERS, never this file.
+
+# [telemetry.traces]
+# sample_ratio = 0.1
+# inbound_mcp = "link"         # "link" | "parent" | "ignore"
+# inbound_authzen = "parent"   # for [[peps]] callers with HTTP Basic
+# propagate_upstream = true
+# max_queue_spans = 2048
+# max_export_batch = 512
 
 [admin_ui]
 # The admin console on its OWN listener (/admin/ui/ plus the admin API, same admin token).

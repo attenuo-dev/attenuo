@@ -23,6 +23,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(unreachable_pub)]
+#![warn(clippy::missing_errors_doc)]
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -612,12 +613,19 @@ fn rpc_message(text: &str) -> Option<Value> {
     })
 }
 
-/// Check one answer against `expect`. `Err` says what was wrong, for the run's failure message.
+/// Check one answer against `expect`.
 ///
 /// A denial counts only when it is the expected reason and the proxy vouches for it: the
 /// `-32003` error's `data.decision_id` is one of the ids in `X-Attenuo-Decision-Id`, as the
 /// SDKs require (an upstream can put any `-32003` in its own body). So an `audit_error` denial,
 /// a `-32007` `too_many_sessions`, a `-32001` or any non-200 status is a failure, not a denial.
+///
+/// # Errors
+///
+/// What was wrong, as text: a status other than 200, a body with no JSON-RPC message, a result
+/// where a denial was expected (or the reverse), a result without the decision-id header when one
+/// is required, a denial with another code or reason than `expect`, or a denial whose
+/// `data.decision_id` is not among the header's ids.
 pub fn check_answer(
     expect: Expect,
     status: u16,
@@ -1325,6 +1333,15 @@ fn default_bin_dir() -> Result<PathBuf> {
 }
 
 /// Run the whole benchmark as configured by `opts`.
+///
+/// # Errors
+///
+/// When `opts` is invalid (a non-positive `--duration`, a `--concurrency` of 0), when the binaries
+/// cannot be found or the work directory, config, policy or report files cannot be written, when
+/// the server or the fake upstream does not start or answer in time, when a cell's requests fail,
+/// and when any response was not what its scenario expects (the figures would not be trustworthy).
+/// A subcommand or `--open-loop` run fails as [`exchange::run_command`] or
+/// [`exchange::run_call_open`] does.
 pub async fn run(opts: Opts) -> Result<()> {
     if let Some(cmd) = &opts.command {
         return exchange::run_command(cmd).await;

@@ -28,7 +28,8 @@ use time::OffsetDateTime;
 use crate::error::AuditError;
 use crate::lease::LeaseRow;
 
-/// Most approvals one delegation run may have pending (unexpired) at once (SR-92). Past it,
+/// Most approvals one delegation run may have pending (unexpired, of a hop whose lease is not
+/// revoked) at once (SR-92, SR-97). Past it,
 /// [`crate::LeaseStore::create_approval`] refuses a new one with
 /// [`AuditError::TooManyPendingApprovals`], and the gated call is denied with no approval to
 /// grant, as when the store fails. A repeat of a call that already has a pending approval
@@ -67,6 +68,11 @@ impl ApprovalState {
     }
 
     /// Parse the wire string.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Storage`] when `s` is not one of the four wire strings (a stored row the store
+    /// cannot read back).
     pub fn parse(s: &str) -> Result<Self, AuditError> {
         Ok(match s {
             "pending" => ApprovalState::Pending,
@@ -116,6 +122,11 @@ impl ApprovalMethod {
     }
 
     /// Parse the wire string.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Storage`] when `s` is neither `id_token` nor `admin_token` (a stored row the
+    /// store cannot read back).
     pub fn parse(s: &str) -> Result<Self, AuditError> {
         match s {
             "id_token" => Ok(ApprovalMethod::IdToken),
@@ -260,10 +271,21 @@ pub(crate) mod rules {
         Ok(())
     }
 
-    /// Is `a` a pending, unexpired approval of the run `chain_id` (one that counts towards
-    /// [`MAX_PENDING_APPROVALS_PER_RUN`])?
-    pub(crate) fn counts_as_pending(a: &Approval, chain_id: &LeaseId, now: OffsetDateTime) -> bool {
-        a.state == ApprovalState::Pending && &a.chain_id == chain_id && !a.is_expired(now)
+    /// Is `a` a pending, unexpired approval of the run `chain_id` whose hop's lease is not
+    /// revoked (one that counts towards [`MAX_PENDING_APPROVALS_PER_RUN`])? `lease` is the
+    /// store's row for `a.lease`. An approval of a revoked hop can never be consumed, so it
+    /// does not hold a place: revoking a child that filled the run's places frees them at once
+    /// (SR-97).
+    pub(crate) fn counts_as_pending(
+        a: &Approval,
+        lease: Option<&LeaseRow>,
+        chain_id: &LeaseId,
+        now: OffsetDateTime,
+    ) -> bool {
+        a.state == ApprovalState::Pending
+            && &a.chain_id == chain_id
+            && !a.is_expired(now)
+            && lease.is_some_and(|r| r.revoked_at.is_none())
     }
 
     /// Is `a` a pending, unexpired approval for this call of this hop (one a repeated gated

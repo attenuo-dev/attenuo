@@ -100,7 +100,8 @@ pub(super) fn approvals_for_call(
     Ok(out)
 }
 
-/// How many approvals of the run `chain_id` are pending and unexpired at `now`
+/// How many approvals of the run `chain_id` are pending and unexpired at `now`, of a hop whose
+/// lease is not revoked (SR-97: the lease rows of a revoked subtree are all marked)
 /// ([`crate::MAX_PENDING_APPROVALS_PER_RUN`]). Expiry is compared in Rust, as in
 /// [`approvals_for_call`].
 pub(super) fn pending_of_run(
@@ -109,7 +110,8 @@ pub(super) fn pending_of_run(
     now: OffsetDateTime,
 ) -> Result<usize, AuditError> {
     let mut stmt = conn.prepare_cached(
-        "SELECT expires_at FROM approvals WHERE chain_id = ?1 AND state = 'pending'",
+        "SELECT a.expires_at FROM approvals a JOIN leases l ON l.id = a.lease \
+         WHERE a.chain_id = ?1 AND a.state = 'pending' AND l.revoked_at IS NULL",
     )?;
     let mut rows = stmt.query(params![chain_id.0])?;
     let mut n = 0;

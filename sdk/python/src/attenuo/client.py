@@ -17,6 +17,7 @@ from typing import Any
 import httpx
 
 from . import _wire as w
+from ._http import AsyncHttpClient, HttpClient
 from ._sse import DEFAULT_MAX_EVENT_BYTES, CallStream, Deadline, StreamEvent, check_deadline
 from .capability import CapabilityLike
 from .dpop import DpopKey, NonceCache, exchange_proofs, presented
@@ -57,7 +58,7 @@ class Client:
         self.token = token
         self.dpop_key = DpopKey.of(dpop_key)
         self._nonce = NonceCache()
-        self._http = httpx.Client(
+        self._http = HttpClient(
             base_url=self.server_url, timeout=timeout, transport=transport, headers=headers
         )
         self._ids = itertools.count(1)
@@ -447,7 +448,7 @@ class AsyncClient:
         self.token = token
         self.dpop_key = DpopKey.of(dpop_key)
         self._nonce = NonceCache()
-        self._http = httpx.AsyncClient(
+        self._http = AsyncHttpClient(
             base_url=self.server_url, timeout=timeout, transport=transport, headers=headers
         )
         self._ids = itertools.count(1)

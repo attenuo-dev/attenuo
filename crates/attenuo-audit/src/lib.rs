@@ -16,6 +16,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(unreachable_pub)]
+#![warn(clippy::missing_errors_doc)]
 #![warn(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -34,6 +35,7 @@ pub mod query;
 pub mod shipped;
 pub mod spans;
 pub mod sqlite;
+pub mod window;
 
 pub use approval::{
     Approval, ApprovalLabel, ApprovalMethod, ApprovalState, Approver, MAX_PENDING_APPROVALS_PER_RUN,
@@ -73,3 +75,4 @@ pub use sqlite::{
 #[cfg(feature = "testing")]
 #[doc(hidden)]
 pub use sqlite::{WalRound, WalTimings};
+pub use window::{window_prunable, WindowPrune};

@@ -98,8 +98,14 @@ pub struct VerifyReport {
 
 /// Verify an ordered stream of entries. An entry is bad when its seq is not the previous seq + 1
 /// (starting at 1), its `prev_hash` does not equal the previous `entry_hash`, its own hash
-/// does not recompute, or its seq is `u64::MAX` (no entry could follow it). An item carrying [`AuditError::Corrupt`] (a row that could not be decoded)
-/// is reported as a break at that seq; any other error is propagated.
+/// does not recompute, or its seq is `u64::MAX` (no entry could follow it). An item carrying
+/// [`AuditError::Corrupt`] (a row that could not be decoded) is reported as a break at that seq.
+///
+/// # Errors
+///
+/// The first error an item of `entries` carries other than [`AuditError::Corrupt`] (a store
+/// fault while reading the log), propagated as it is. A broken chain is not an error but a
+/// report with `ok: false`.
 pub fn verify_entries<I>(entries: I) -> Result<VerifyReport, AuditError>
 where
     I: IntoIterator<Item = Result<AuditEntry, AuditError>>,
@@ -167,18 +173,52 @@ where
 }
 
 /// An append-only, hash-chained decision log.
+///
+/// # Errors
+///
+/// Every method can fail on a sink fault, which each method's own `# Errors` section calls
+/// that: [`AuditError::Poisoned`] when a writer panicked holding the sink's lock, and, for the
+/// file sink, [`AuditError::Sqlite`] when a query, commit or sync fails, [`AuditError::Serde`],
+/// [`AuditError::TimeFormat`] or [`AuditError::TimeParse`] when a record cannot be encoded or
+/// read back, [`AuditError::Corrupt`] when a stored row cannot be decoded, and
+/// [`AuditError::Storage`] when the background writer has stopped or a figure is out of range.
 pub trait AuditSink: Send + Sync {
     /// Append `record` as the next entry and return it.
+    ///
+    /// # Errors
+    ///
+    /// A sink fault (see [`AuditSink`]); nothing is appended then.
     fn append(&self, record: DecisionRecord) -> Result<AuditEntry, AuditError>;
+
     /// The most recent entry, or `None` for an empty log.
+    ///
+    /// # Errors
+    ///
+    /// A sink fault (see [`AuditSink`]); an empty log is `Ok(None)`.
     fn head(&self) -> Result<Option<AuditEntry>, AuditError>;
+
     /// Up to `limit` entries with `seq >= from_seq`, in ascending order.
+    ///
+    /// # Errors
+    ///
+    /// A sink fault (see [`AuditSink`]), including [`AuditError::Corrupt`] for a row in the range
+    /// that cannot be read back.
     fn range(&self, from_seq: u64, limit: usize) -> Result<Vec<AuditEntry>, AuditError>;
+
     /// Walk the whole chain and report the first break, if any.
+    ///
+    /// # Errors
+    ///
+    /// A sink fault (see [`AuditSink`]) other than a corrupt row: a row that cannot be read back is
+    /// reported as the break, not as an error.
     fn verify_chain(&self) -> Result<VerifyReport, AuditError>;
 
     /// `(head_seq, head_hash)` for an external signer to countersign. An empty log checkpoints
     /// as `(0, GENESIS_HASH)`.
+    ///
+    /// # Errors
+    ///
+    /// As [`head`](Self::head).
     fn checkpoint(&self) -> Result<(u64, String), AuditError> {
         Ok(match self.head()? {
             Some(h) => (h.seq, h.entry_hash),
@@ -192,6 +232,10 @@ pub trait AuditSink: Send + Sync {
     /// decision whose `sum` charge left its sync to the append (see
     /// [`LeaseStore::charge_sync_deferred`](crate::LeaseStore::charge_sync_deferred)). The
     /// default is a plain `append`, right for a sink with nothing to sync.
+    ///
+    /// # Errors
+    ///
+    /// As [`append`](Self::append), and a failed sync of the file is a sink fault too.
     fn append_synced(&self, record: DecisionRecord) -> Result<AuditEntry, AuditError> {
         self.append(record)
     }

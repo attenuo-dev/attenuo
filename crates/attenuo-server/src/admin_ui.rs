@@ -265,6 +265,7 @@ pub fn router(state: Arc<AppState>, config: &Config) -> Router {
         .layer(middleware::from_fn(security_headers))
         // The span records the route template, never the URI (SR-90).
         .layer(TraceLayer::new_for_http().make_span_with(attenuo_proxy::http_trace::request_span))
+        .layer(middleware::from_fn(crate::early_close::mark_early_refusal))
 }
 
 async fn redirect_to_ui() -> Redirect {

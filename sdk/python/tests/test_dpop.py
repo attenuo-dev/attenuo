@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import json
+import socket
+import threading
 import time
 from collections.abc import Callable
 from typing import Any
@@ -16,7 +18,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 from attenuo import AdminClient, AsyncAdminClient, AttenuoError, Client, DpopKey, Unauthorized
-from attenuo.dpop import access_token_hash, jwk_thumbprint
+from attenuo.dpop import access_token_hash, drop_connection, jwk_thumbprint
 from attenuo.mcp import TokenAuth
 
 from .helpers import Signer, token_response
@@ -314,6 +316,110 @@ async def test_admin_root_mint_retries_with_the_servers_nonce(kind: str) -> None
             await a.mint_root_dev("alice", "https://idp", "planner", dpop_key=key)
     assert tok.dpop_jkt == key.thumbprint
     assert server.seen == [None, "n-1", "n-1"]
+
+
+class ClosingNonceServer:
+    """A real HTTP/1.1 listener that refuses a proof without its nonce the way attenuo-server
+    can: the 401 goes out before the request body is read, and the connection is closed a moment
+    later without ``Connection: close``. A retry put on that connection gets no answer."""
+
+    def __init__(self) -> None:
+        self.sock = socket.create_server(("127.0.0.1", 0))
+        self.url = f"http://127.0.0.1:{self.sock.getsockname()[1]}"
+        self.connections = 0
+        self.nonces: list[str | None] = []
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self) -> None:
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            self.connections += 1
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn: socket.socket) -> None:
+        with conn:
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    return
+                data += chunk
+            head = data.split(b"\r\n\r\n", 1)[0].decode()
+            proof = next(
+                line.split(":", 1)[1].strip()
+                for line in head.split("\r\n")
+                if line.lower().startswith("dpop:")
+            )
+            payload = proof.split(".")[1]
+            nonce = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+            self.nonces.append(nonce.get("nonce"))
+            if nonce.get("nonce") != "n-1":
+                body = b'{"error":"use_dpop_nonce"}'
+                conn.sendall(
+                    b"HTTP/1.1 401 Unauthorized\r\n"
+                    b'www-authenticate: DPoP error="use_dpop_nonce"\r\n'
+                    b"dpop-nonce: n-1\r\ncontent-type: application/json\r\n"
+                    b"content-length: %d\r\n\r\n%s" % (len(body), body)
+                )
+                time.sleep(0.3)  # the close lands after the client's immediate retry
+                return
+            conn.sendall(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}")
+            time.sleep(0.3)
+
+    def close(self) -> None:
+        self.sock.close()
+
+
+def test_nonce_retry_does_not_reuse_the_refused_connection() -> None:
+    """The retry after ``use_dpop_nonce`` goes out on a new connection: the one that carried the
+    refusal may be closing (the flake of ``test_dpop_server_nonce``)."""
+    server = ClosingNonceServer()
+    try:
+        auth = TokenAuth(lambda: "a.b.c", dpop_key=DpopKey.generate())
+        with httpx.Client(auth=auth, timeout=5) as http:
+            r = http.post(f"{server.url}/mcp/github", json={"id": 1})
+        assert r.status_code == 200
+        assert server.nonces == [None, "n-1"]
+        assert server.connections == 2
+    finally:
+        server.close()
+
+
+async def test_nonce_retry_does_not_reuse_the_refused_connection_async() -> None:
+    server = ClosingNonceServer()
+    try:
+        auth = TokenAuth(lambda: "a.b.c", dpop_key=DpopKey.generate())
+        async with httpx.AsyncClient(auth=auth, timeout=5) as http:
+            r = await http.post(f"{server.url}/mcp/github", json={"id": 1})
+        assert r.status_code == 200
+        assert server.nonces == [None, "n-1"]
+        assert server.connections == 2
+    finally:
+        server.close()
+
+
+def test_drop_connection_leaves_responses_without_a_socket_alone() -> None:
+    drop_connection(httpx.Response(401))  # a mock transport's response: nothing to shut down
+    a, b = socket.socketpair()
+    with a, b:
+
+        class Stream:
+            def get_extra_info(self, info: str) -> object:
+                return a if info == "socket" else None
+
+        h2 = httpx.Response(401, extensions={"http_version": b"HTTP/2", "network_stream": Stream()})
+        drop_connection(h2)  # HTTP/2 multiplexes on one connection the server keeps
+        b.setblocking(False)
+        with pytest.raises(BlockingIOError):
+            b.recv(1)
+        h1 = httpx.Response(
+            401, extensions={"http_version": b"HTTP/1.1", "network_stream": Stream()}
+        )
+        drop_connection(h1)
+        assert b.recv(1) == b""
 
 
 def test_proof_carries_a_nonce_only_when_given() -> None:

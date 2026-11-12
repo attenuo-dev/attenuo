@@ -1497,6 +1497,12 @@ pub struct CallOpenRow {
 
 /// The existing proxied `tools/call` cell with Poisson arrivals at each `--open-loop` rate,
 /// plus the same call straight at the upstream at the same rate.
+///
+/// # Errors
+///
+/// When `--duration` or an `--open-loop` rate is not positive, when the binaries cannot be found or
+/// the server does not start, when minting a chain fails, when a cell's answers are not all what it
+/// expects, or when the audit log of a run does not verify.
 pub async fn run_call_open(opts: &Opts) -> Result<()> {
     ensure!(opts.duration > 0.0, "--duration must be positive");
     ensure!(
@@ -1724,6 +1730,11 @@ fn append(p: &Path, text: &str) -> Result<()> {
 }
 
 /// Run one subcommand to the end.
+///
+/// # Errors
+///
+/// As the subcommand's own run: an invalid argument, a server that does not start, a cell whose
+/// answers are not what it expects, or a report that cannot be written.
 pub async fn run_command(cmd: &Command) -> Result<()> {
     match cmd {
         Command::Exchange(a) => run_exchange(a).await,

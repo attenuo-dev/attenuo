@@ -447,6 +447,44 @@ async def test_authzen(make: Any) -> None:
         await call(client, "authzen_evaluate", "TOK", "github", "read_file")
 
 
+async def test_authzen_approval_required_with_and_without_an_approval(make: Any) -> None:
+    ctx: dict[str, Any] = {
+        "reason": "approval_required",
+        "policy_ids": ["ask"],
+        "diagnostics": [],
+        "decision_id": "d3",
+        "call_hash": "ab" * 32,
+        "approval_id": "0f8e6c1a-4b7d-4f61-9a39-2f4f5b0e8d11",
+        "expires_at": "2026-11-06T10:02:00.5Z",
+    }
+    client, _ = make(lambda r: httpx.Response(200, json={"decision": False, "context": ctx}))
+    d = await call(client, "authzen_evaluate", "TOK", "github", "create_issue")
+    assert not d and d.reason == "approval_required"
+    assert d.approval_id == ctx["approval_id"] and d.call_hash == "ab" * 32
+    assert d.expires_at is not None and d.expires_at.minute == 2
+
+    # The run already has as many pending approvals as the server keeps: no approval is
+    # opened, and a PEP with diagnostics is told why (SR-92).
+    full = {
+        "reason": "approval_required",
+        "policy_ids": ["ask"],
+        "diagnostics": ["too many pending approvals for this run"],
+        "decision_id": "d4",
+        "call_hash": "ab" * 32,
+    }
+    client, _ = make(lambda r: httpx.Response(200, json={"decision": False, "context": full}))
+    d = await call(client, "authzen_evaluate", "TOK", "github", "create_issue")
+    assert not d and d.reason == "approval_required"
+    assert d.approval_id is None and d.expires_at is None and d.call_hash == "ab" * 32
+    assert d.diagnostics == ["too many pending approvals for this run"]
+
+    # Other answers leave the approval fields unset.
+    allow = {"decision": True, "context": {"reason": "policy_allow", "decision_id": "d5"}}
+    client, _ = make(lambda r: httpx.Response(200, json=allow))
+    d = await call(client, "authzen_evaluate", "TOK", "github", "read_file")
+    assert (d.approval_id, d.call_hash, d.expires_at) == (None, None, None)
+
+
 async def test_inspect_without_and_with_verify(make: Any) -> None:
     s = Signer()
     jwt = s.mint(("planner", "coder"))

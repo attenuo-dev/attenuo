@@ -44,6 +44,7 @@ use crate::session::{
     session_digest, session_tag, BindOutcome, SessionCheck, SessionOwner, SessionRegistry,
 };
 use crate::stage::Stage;
+use crate::traceparent::{TraceParent, OTEL_TARGET, TRACEPARENT_HEADER};
 
 /// Response header carrying the decision record id(s) of every `tools/call` in the request,
 /// comma separated in request order.
@@ -89,6 +90,10 @@ pub const REASON_UPSTREAM_NOT_EVENT_STREAM: &str = "upstream_not_event_stream";
 /// Reason code for a `tools/call` whose name the upstream never listed and the catalog does not
 /// know, with [`ProxyConfig::require_listed_tools`] on (SR-25).
 pub const REASON_TOOL_NOT_LISTED: &str = "tool_not_listed";
+
+/// Reason code recorded on the exported `attenuo.session_gate` span for a session id the
+/// proxy does not know (answered `404`, the MCP signal to start a new session).
+pub const REASON_SESSION_UNKNOWN: &str = "session_unknown";
 
 const HEADER_MCP_SESSION_ID: &str = "mcp-session-id";
 
@@ -232,6 +237,11 @@ fn upstream_client() -> reqwest::Client {
 }
 
 /// Bind `config.listen` and serve the proxy until the task is cancelled.
+///
+/// # Errors
+///
+/// When `config.listen` cannot be bound (in use, or not permitted), when the bound address cannot
+/// be read back, or when the server itself fails with an I/O error.
 pub async fn serve(config: ProxyConfig, authorizer: Arc<dyn Authorizer>) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     tracing::info!(addr = %listener.local_addr()?, "attenuo proxy listening");
@@ -480,6 +490,139 @@ fn request_span(server: &str, chain: &DelegationChain, session_id: Option<&str>)
         // Session ids grant access to a session: log a hash prefix only (SR-11).
         session = %session_id.map(session_tag).unwrap_or_default(),
     )
+}
+
+/// The exported `mcp.request` span of one proxied request ([`OTEL_TARGET`], design section
+/// 3.2). It carries only the allow-listed fields (section 3.3): the method, the route
+/// template, the configured upstream name, and, filled in later, the session tag, the run's
+/// chain id and depth, whether the request was DPoP-bound, and the status code. Never the
+/// subject, the token or the URI. The trace hook, when tracing is on, makes the request's
+/// `traceparent` its parent or a link before it is first entered (section 4).
+fn otel_request_span(
+    state: &AppState,
+    method: &Method,
+    server: &str,
+    headers: &HeaderMap,
+) -> tracing::Span {
+    let span = tracing::info_span!(
+        target: OTEL_TARGET,
+        "mcp.request",
+        otel.kind = "server",
+        http.request.method = %method,
+        http.route = "/mcp/{server}",
+        attenuo.server = %server,
+        attenuo.session_tag = tracing::field::Empty,
+        attenuo.chain_id = tracing::field::Empty,
+        attenuo.chain_depth = tracing::field::Empty,
+        attenuo.dpop_bound = tracing::field::Empty,
+        http.response.status_code = tracing::field::Empty,
+    );
+    if let Some(hook) = state.authorizer.trace() {
+        hook.inbound(&span, TraceParent::from_headers(headers));
+    }
+    span
+}
+
+/// [`authenticate`] inside the exported `attenuo.authenticate` span, which records the
+/// reason code of a refusal; on success the run's chain id, depth and DPoP binding go on the
+/// request span `otel`.
+async fn authenticate_traced(
+    state: &AppState,
+    otel: &tracing::Span,
+    method: &Method,
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
+    now: OffsetDateTime,
+) -> Result<Authenticated, AuthError> {
+    let span = tracing::info_span!(
+        target: OTEL_TARGET,
+        "attenuo.authenticate",
+        attenuo.token.cache = tracing::field::Empty,
+        attenuo.dpop_bound = tracing::field::Empty,
+        attenuo.reason = tracing::field::Empty,
+    );
+    let out = authenticate(state, method, uri, headers, now)
+        .instrument(span.clone())
+        .await;
+    match &out {
+        Ok(who) => {
+            span.record("attenuo.dpop_bound", who.dpop_bound);
+            if let Some(chain_id) = chain_id_of(&who.chain) {
+                otel.record("attenuo.chain_id", chain_id.as_str());
+            }
+            otel.record("attenuo.chain_depth", who.chain.depth());
+            otel.record("attenuo.dpop_bound", who.dpop_bound);
+        }
+        Err(e) => {
+            span.record("attenuo.reason", e.reason());
+        }
+    }
+    out
+}
+
+/// [`session_gate`] inside the exported `attenuo.session_gate` span, which records the
+/// reason of a refusal (`session_mismatch`, or `session_unknown` for the `404`).
+// The `Err` is a full response, built once per refused request; boxing it buys nothing.
+#[allow(clippy::result_large_err)]
+async fn session_gate_traced(
+    state: &AppState,
+    server: &str,
+    method: &Method,
+    who: &Authenticated,
+    session_id: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<Option<SessionOwner>, Response> {
+    let span = tracing::info_span!(
+        target: OTEL_TARGET,
+        "attenuo.session_gate",
+        attenuo.reason = tracing::field::Empty,
+    );
+    let out = session_gate(state, server, method, who, session_id, now)
+        .instrument(span.clone())
+        .await;
+    if let Err(resp) = &out {
+        let reason = if resp.status() == StatusCode::FORBIDDEN {
+            REASON_SESSION_MISMATCH
+        } else {
+            REASON_SESSION_UNKNOWN
+        };
+        span.record("attenuo.reason", reason);
+    }
+    out
+}
+
+/// The exported `attenuo.upstream` span (client kind) around sending a screened request to
+/// `server`, and the `traceparent` to insert on it: attenuo's own span, never the client's
+/// header (SR-27), and only when the trace hook says so (`[telemetry.traces]
+/// propagate_upstream`).
+fn upstream_span(state: &AppState, server: &str, headers: &mut HeaderMap) -> tracing::Span {
+    let span = tracing::info_span!(
+        target: OTEL_TARGET,
+        "attenuo.upstream",
+        otel.kind = "client",
+        attenuo.server = %server,
+        http.response.status_code = tracing::field::Empty,
+        attenuo.reason = tracing::field::Empty,
+    );
+    let outbound = state.authorizer.trace().and_then(|h| h.outbound(&span));
+    if let Some(value) = outbound.and_then(|tp| HeaderValue::from_str(&tp.to_header()).ok()) {
+        headers.insert(HeaderName::from_static(TRACEPARENT_HEADER), value);
+    }
+    span
+}
+
+/// Send `req` inside `span` ([`upstream_span`]), recording the status, or
+/// `upstream_unreachable` on a transport failure.
+async fn send_upstream(
+    span: tracing::Span,
+    req: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let out = req.send().instrument(span.clone()).await;
+    match &out {
+        Ok(resp) => span.record("http.response.status_code", resp.status().as_u16()),
+        Err(_) => span.record("attenuo.reason", REASON_UPSTREAM_UNREACHABLE),
+    };
+    out
 }
 
 /// The SR-11 session check, made after authentication. `Ok` carries the caller's
@@ -821,8 +964,29 @@ async fn handle_passthrough(
     let Some(upstream) = state.upstreams.get(&server).cloned() else {
         return unknown_server(&server);
     };
+    let otel = otel_request_span(&state, &method, &server, &headers);
+    let response = passthrough_request(&state, &otel, upstream, server, uri, method, headers, body)
+        .instrument(otel.clone())
+        .await;
+    otel.record("http.response.status_code", response.status().as_u16());
+    response
+}
+
+/// [`handle_passthrough`] for a known upstream, inside its `mcp.request` span `otel`.
+#[allow(clippy::too_many_arguments)]
+async fn passthrough_request(
+    state: &Arc<AppState>,
+    otel: &tracing::Span,
+    upstream: String,
+    server: String,
+    uri: axum::http::Uri,
+    method: Method,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let state = state.clone();
     let now = state.clock.now_utc();
-    let who = match authenticate(&state, &method, &uri, &headers, now).await {
+    let who = match authenticate_traced(&state, otel, &method, &uri, &headers, now).await {
         Ok(a) => a,
         Err(e) => return unauthorized(e),
     };
@@ -841,6 +1005,9 @@ async fn handle_passthrough(
         Ok(s) => s,
         Err(resp) => return resp,
     };
+    if let Some(sid) = session_id.as_deref() {
+        otel.record("attenuo.session_tag", session_tag(sid).as_str());
+    }
     let body = match read_request_body(&headers, body, state.max_request_body).await {
         Ok(b) => b,
         Err(resp) => return resp,
@@ -848,22 +1015,26 @@ async fn handle_passthrough(
     let span = request_span(&server, &chain, session_id.as_deref());
     async move {
         let owner =
-            match session_gate(&state, &server, &method, &who, session_id.as_deref(), now).await {
+            match session_gate_traced(&state, &server, &method, &who, session_id.as_deref(), now)
+                .await
+            {
                 Ok(o) => o,
                 Err(resp) => return resp,
             };
         tracing::debug!(%method, "forwarding transparently");
         let is_delete = method == Method::DELETE;
         let limit = state.max_upstream_body;
+        let mut req_headers = with_session_header(
+            forward_headers(&headers, FORWARD_REQUEST_HEADERS),
+            session_id.as_deref(),
+        );
+        let up = upstream_span(&state, &server, &mut req_headers);
         let req = state
             .client
             .request(method, &upstream)
-            .headers(with_session_header(
-                forward_headers(&headers, FORWARD_REQUEST_HEADERS),
-                session_id.as_deref(),
-            ))
+            .headers(req_headers)
             .body(body);
-        let mut response = match req.send().await {
+        let mut response = match send_upstream(up, req).await {
             Ok(resp) if is_delete => stream_response(resp, None, None, limit),
             // The listen stream lives as long as the client keeps it open: re-check it
             // (SR-28), count its end, and bound its `stream.end` records per chain and
@@ -1053,26 +1224,51 @@ async fn handle_post(
     let Some(upstream) = state.upstreams.get(&server) else {
         return unknown_server(&server);
     };
+    let otel = otel_request_span(&state, &Method::POST, &server, &headers);
+    let response = post_request(
+        &state, &otel, upstream, &server, &uri, &headers, body, started,
+    )
+    .instrument(otel.clone())
+    .await;
+    otel.record("http.response.status_code", response.status().as_u16());
+    response
+}
+
+/// [`handle_post`] for a known upstream, inside its `mcp.request` span `otel`.
+#[allow(clippy::too_many_arguments)]
+async fn post_request(
+    state: &AppState,
+    otel: &tracing::Span,
+    upstream: &str,
+    server: &str,
+    uri: &axum::http::Uri,
+    headers: &HeaderMap,
+    body: Body,
+    started: Instant,
+) -> Response {
     let now = state.clock.now_utc();
-    let who = match authenticate(&state, &Method::POST, &uri, &headers, now).await {
+    let who = match authenticate_traced(state, otel, &Method::POST, uri, headers, now).await {
         Ok(a) => a,
         Err(e) => return unauthorized(e),
     };
     let chain = &who.chain;
-    let session_id = match session_id_of(&headers) {
+    let session_id = match session_id_of(headers) {
         Ok(s) => s,
         Err(resp) => return resp,
     };
+    if let Some(sid) = session_id.as_deref() {
+        otel.record("attenuo.session_tag", session_tag(sid).as_str());
+    }
     // Read only after authentication, so an anonymous caller cannot make the proxy buffer.
-    let body = match read_request_body(&headers, body, state.max_request_body).await {
+    let body = match read_request_body(headers, body, state.max_request_body).await {
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let span = request_span(&server, chain, session_id.as_deref());
+    let span = request_span(server, chain, session_id.as_deref());
     async {
-        let owner = match session_gate(
-            &state,
-            &server,
+        let owner = match session_gate_traced(
+            state,
+            server,
             &Method::POST,
             &who,
             session_id.as_deref(),
@@ -1085,26 +1281,26 @@ async fn handle_post(
         };
         let mut timing = PostTiming::default();
         let mut response = handle_post_inner(
-            &state,
+            state,
             upstream,
-            &server,
+            server,
             &who,
             session_id.as_deref(),
-            &headers,
+            headers,
             body,
             now,
             &mut timing,
         )
         .await;
-        adopt_session(&state, upstream, owner.as_ref(), &mut response).await;
+        adopt_session(state, upstream, owner.as_ref(), &mut response).await;
         if let Some(digest) = new_session_digest(session_id.as_deref(), &response) {
             state
                 .authorizer
-                .record_session(&who.chain, &server, &digest, now)
+                .record_session(&who.chain, server, &digest, now)
                 .await;
         }
         if timing.decided {
-            report_post_timing(&state, &timing, started);
+            report_post_timing(state, &timing, started);
         }
         response
     }
@@ -1240,164 +1436,169 @@ async fn handle_post_inner(
             .awaited
             .remember_lists(&scope, &screened.list_requests, Instant::now());
     }
+    let up = upstream_span(state, server, &mut req_headers);
     let sent = Instant::now();
-    let resp = match state
+    let req = state
         .client
         .post(upstream)
         .headers(req_headers)
-        .body(upstream_body)
-        .send()
-        .await
-    {
+        .body(upstream_body);
+    let resp = match send_upstream(up, req).await {
         Ok(r) => r,
         Err(e) => return upstream_error(e),
     };
     let headers_in = Instant::now();
     timing.upstream = Some(headers_in - sent);
     timing.upstream_done = Some(headers_in);
-
-    // The list answers this body may hold: those of its own list requests, and (SR-87) those
-    // of earlier list requests of its scope, which clients route by id like call answers.
-    // As for calls, only a `POST` that forwarded a request is read for them.
-    let forwards_request = screened.forward.iter().any(is_request);
-    let mut lists = ListAnswers::new(screened.list_requests.clone());
-    if forwards_request {
-        lists = lists.claiming(state.awaited.clone(), scope.clone());
-    }
-    let lists = Arc::new(lists);
-    let has_lists = lists.may_answer();
-    // Clients route a response by its id, whatever body it comes in: an answer to an earlier
-    // call of this session and run in this body is labelled too (SR-85), so a `POST` with no
-    // allowed call of its own is still read while such calls are awaited. Clients do not read
-    // the body of a `POST` that carried no request, so that one is left alone.
-    let labeller = if !screened.results.is_empty() {
-        Some(
-            Labeller::new(
-                state.authorizer.clone(),
-                chain.clone(),
-                std::mem::take(&mut screened.results),
-            )
-            .striking(state.awaited.clone(), scope),
-        )
-    } else if forwards_request && state.awaited.any_call_in(&scope) {
-        Some(Labeller::listen(
-            state.authorizer.clone(),
-            state.awaited.clone(),
-            scope,
-        ))
-    } else {
-        None
-    };
-    let needs_buffer = has_lists || !screened.replies.is_empty() || labeller.is_some();
-    let content_type = resp
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|ct| ct.trim_start().to_ascii_lowercase())
-        .unwrap_or_default();
-    let is_json = content_type.starts_with("application/json");
-    let is_sse = content_type.starts_with("text/event-stream");
-
-    let mut response = if needs_buffer && is_json {
-        buffer_and_rewrite(
-            state,
-            resp,
-            chain,
-            server,
-            &screened,
-            &lists,
-            labeller.as_ref(),
-            is_batch,
-        )
-        .await
-    } else if (has_lists || labeller.is_some()) && is_sse {
-        // The list response is an event of the stream, alone or inside a batch: filter each
-        // event as it passes; label every response to an allowed call the same way. Replies
-        // the proxy generated itself lead the stream.
-        let prelude = sse_prelude(&screened.replies);
-        let guard = state.stream_guard(who, server, session_id);
-        let filter = has_lists.then(|| {
-            let lists = lists.clone();
-            let caps = chain.effective_capabilities().cloned().unwrap_or_default();
-            let server = server.to_owned();
-            let listed = state.listed.clone();
-            let authorizer = state.authorizer.clone();
-            move |msg: &mut Value| {
-                lists.claim(msg);
-                let pending = lists.pending();
-                if pending.is_empty() {
-                    return;
-                }
-                let filter = ListFilter::new(&pending, &caps, &server);
-                observe_listed(&filter, msg, &server, &listed, authorizer.as_ref());
-                let removed = filter.apply(msg);
-                if removed > 0 {
-                    tracing::debug!(removed, "filtered list result in SSE stream");
-                }
-            }
-        });
-        let screen = (has_lists && state.screen_lists).then(|| StreamScreen {
-            authorizer: state.authorizer.clone(),
-            chain: chain.clone(),
-            server: server.to_owned(),
-            answers: ToolsAnswers::Pending(lists.clone()),
-        });
-        stream_response_sse(
-            resp,
-            prelude,
-            guard,
-            state.max_upstream_body,
-            filter,
-            screen,
-            labeller,
-        )
-    } else if let Some(labeller) = labeller
-        .as_ref()
-        .filter(|_| !has_lists && !matches!(resp.status().as_u16(), 202 | 204))
-    {
-        // Neither JSON nor SSE: the proxy cannot find the results in it, so it cannot record
-        // them, and an unrecorded result must not reach the agent (ADR-0009). An empty body
-        // (a redirect, say) carries nothing and keeps its status; anything else fails closed.
-        let status = resp.status();
-        let upstream_headers = resp.headers().clone();
-        match read_upstream_body(resp, state.max_upstream_body).await {
-            Ok(b) if b.is_empty() => build_response(status, &upstream_headers, Body::empty()),
-            Ok(_) | Err(UpstreamBodyError::TooLarge) => {
-                tracing::error!(
-                    content_type = ?content_type,
-                    status = %status,
-                    "upstream answered a mediated call with a body the proxy cannot label"
-                );
-                label_failure(&screened, labeller, is_batch)
-            }
-            Err(UpstreamBodyError::Transport(e)) => upstream_error(e),
+    // From the upstream's response headers to the response handed back: the exported
+    // `attenuo.response` span. Results recorded while the body is buffered are its children.
+    let response_span = tracing::info_span!(target: OTEL_TARGET, "attenuo.response");
+    async {
+        // The list answers this body may hold: those of its own list requests, and (SR-87) those
+        // of earlier list requests of its scope, which clients route by id like call answers.
+        // As for calls, only a `POST` that forwarded a request is read for them.
+        let forwards_request = screened.forward.iter().any(is_request);
+        let mut lists = ListAnswers::new(screened.list_requests.clone());
+        if forwards_request {
+            lists = lists.claiming(state.awaited.clone(), scope.clone());
         }
-    } else if has_lists && !matches!(resp.status().as_u16(), 202 | 204) {
-        // Neither JSON nor SSE: the proxy cannot tell what is in it, and a list result must
-        // not reach the client unfiltered. Fail closed.
-        tracing::error!(
-            content_type = ?content_type,
-            status = %resp.status(),
-            "upstream answered a list request with a body the proxy cannot filter"
-        );
-        let body = error_response(
-            Value::Null,
-            CODE_UPSTREAM,
-            "attenuo: upstream answered a list request with an unsupported content type",
-            None,
-        );
-        json_response(StatusCode::BAD_GATEWAY, &body)
-    } else {
-        let prelude = sse_prelude(&screened.replies);
-        stream_response(
-            resp,
-            prelude,
-            Some(state.stream_guard(who, server, session_id)),
-            state.max_upstream_body,
-        )
-    };
-    add_decision_header(&mut response, &screened.decision_ids);
-    response
+        let lists = Arc::new(lists);
+        let has_lists = lists.may_answer();
+        // Clients route a response by its id, whatever body it comes in: an answer to an earlier
+        // call of this session and run in this body is labelled too (SR-85), so a `POST` with no
+        // allowed call of its own is still read while such calls are awaited. Clients do not read
+        // the body of a `POST` that carried no request, so that one is left alone.
+        let labeller = if !screened.results.is_empty() {
+            Some(
+                Labeller::new(
+                    state.authorizer.clone(),
+                    chain.clone(),
+                    std::mem::take(&mut screened.results),
+                )
+                .striking(state.awaited.clone(), scope),
+            )
+        } else if forwards_request && state.awaited.any_call_in(&scope) {
+            Some(Labeller::listen(
+                state.authorizer.clone(),
+                state.awaited.clone(),
+                scope,
+            ))
+        } else {
+            None
+        };
+        let needs_buffer = has_lists || !screened.replies.is_empty() || labeller.is_some();
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|ct| ct.trim_start().to_ascii_lowercase())
+            .unwrap_or_default();
+        let is_json = content_type.starts_with("application/json");
+        let is_sse = content_type.starts_with("text/event-stream");
+
+        let mut response = if needs_buffer && is_json {
+            buffer_and_rewrite(
+                state,
+                resp,
+                chain,
+                server,
+                &screened,
+                &lists,
+                labeller.as_ref(),
+                is_batch,
+            )
+            .await
+        } else if (has_lists || labeller.is_some()) && is_sse {
+            // The list response is an event of the stream, alone or inside a batch: filter each
+            // event as it passes; label every response to an allowed call the same way. Replies
+            // the proxy generated itself lead the stream.
+            let prelude = sse_prelude(&screened.replies);
+            let guard = state.stream_guard(who, server, session_id);
+            let filter = has_lists.then(|| {
+                let lists = lists.clone();
+                let caps = chain.effective_capabilities().cloned().unwrap_or_default();
+                let server = server.to_owned();
+                let listed = state.listed.clone();
+                let authorizer = state.authorizer.clone();
+                move |msg: &mut Value| {
+                    lists.claim(msg);
+                    let pending = lists.pending();
+                    if pending.is_empty() {
+                        return;
+                    }
+                    let filter = ListFilter::new(&pending, &caps, &server);
+                    observe_listed(&filter, msg, &server, &listed, authorizer.as_ref());
+                    let removed = filter.apply(msg);
+                    if removed > 0 {
+                        tracing::debug!(removed, "filtered list result in SSE stream");
+                    }
+                }
+            });
+            let screen = (has_lists && state.screen_lists).then(|| StreamScreen {
+                authorizer: state.authorizer.clone(),
+                chain: chain.clone(),
+                server: server.to_owned(),
+                answers: ToolsAnswers::Pending(lists.clone()),
+            });
+            stream_response_sse(
+                resp,
+                prelude,
+                guard,
+                state.max_upstream_body,
+                filter,
+                screen,
+                labeller,
+            )
+        } else if let Some(labeller) = labeller
+            .as_ref()
+            .filter(|_| !has_lists && !matches!(resp.status().as_u16(), 202 | 204))
+        {
+            // Neither JSON nor SSE: the proxy cannot find the results in it, so it cannot record
+            // them, and an unrecorded result must not reach the agent (ADR-0009). An empty body
+            // (a redirect, say) carries nothing and keeps its status; anything else fails closed.
+            let status = resp.status();
+            let upstream_headers = resp.headers().clone();
+            match read_upstream_body(resp, state.max_upstream_body).await {
+                Ok(b) if b.is_empty() => build_response(status, &upstream_headers, Body::empty()),
+                Ok(_) | Err(UpstreamBodyError::TooLarge) => {
+                    tracing::error!(
+                        content_type = ?content_type,
+                        status = %status,
+                        "upstream answered a mediated call with a body the proxy cannot label"
+                    );
+                    label_failure(&screened, labeller, is_batch)
+                }
+                Err(UpstreamBodyError::Transport(e)) => upstream_error(e),
+            }
+        } else if has_lists && !matches!(resp.status().as_u16(), 202 | 204) {
+            // Neither JSON nor SSE: the proxy cannot tell what is in it, and a list result must
+            // not reach the client unfiltered. Fail closed.
+            tracing::error!(
+                content_type = ?content_type,
+                status = %resp.status(),
+                "upstream answered a list request with a body the proxy cannot filter"
+            );
+            let body = error_response(
+                Value::Null,
+                CODE_UPSTREAM,
+                "attenuo: upstream answered a list request with an unsupported content type",
+                None,
+            );
+            json_response(StatusCode::BAD_GATEWAY, &body)
+        } else {
+            let prelude = sse_prelude(&screened.replies);
+            stream_response(
+                resp,
+                prelude,
+                Some(state.stream_guard(who, server, session_id)),
+                state.max_upstream_body,
+            )
+        };
+        add_decision_header(&mut response, &screened.decision_ids);
+        response
+    }
+    .instrument(response_span)
+    .await
 }
 
 /// Report the proxy's own stages of a `POST` that carried a decided call: to the authorizer
@@ -1586,6 +1787,7 @@ async fn screen_message(
                 id,
                 call,
                 decision_id: verdict.decision_id,
+                origin: state.authorizer.trace().and_then(|h| h.current()),
             });
         }
         out.forward.push(msg);

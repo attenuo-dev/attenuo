@@ -34,6 +34,8 @@
 //!       calls: 1                    # each member optional, default 0 / false
 //!       amount: 10
 //!       destination_seen: true
+//!       user_window:                # optional: the user's windows of this tool (phase 3)
+//!         day: { calls: 3, amount: 4900 }   # hour and day, each optional, members default 0
 //! ```
 //!
 //! Without `session` the run is untainted, as for a run that has read nothing. Without
@@ -42,7 +44,8 @@
 //! The harness keeps no counters: `budget` sets what Cedar sees, it does not enforce limits
 //! a hop's capabilities carry. Without `usage`, the run has made no call of the tool
 //! (`context.usage` is all zero and false); like `budget`, it sets what Cedar sees and counts
-//! nothing.
+//! nothing. `usage.user_window` sets `context.usage.user_window.hour` and `.day` the same way
+//! (run limits phase 3), whatever kinds the server would keep.
 //!
 //! An inline catalog has the same shape as `[policy.catalog]` in the server config:
 //!
@@ -580,14 +583,50 @@ pub struct UsageSpec {
     /// call of the tool.
     #[serde(default)]
     pub destination_seen: bool,
+    /// `context.usage.user_window`: the originating user's per-user windows of the tool (run
+    /// limits phase 3). Absent kinds are zero.
+    #[serde(default)]
+    pub user_window: UserWindowSpec,
+}
+
+/// `usage.user_window` of a case: `hour` and `day`, each optional.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserWindowSpec {
+    /// `context.usage.user_window.hour`.
+    #[serde(default)]
+    pub hour: WindowSpec,
+    /// `context.usage.user_window.day`.
+    #[serde(default)]
+    pub day: WindowSpec,
+}
+
+/// One window of `usage.user_window`: `calls` and `amount`, each defaulting to 0.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowSpec {
+    /// Allowed calls of the tool by any run of the user in the window.
+    #[serde(default)]
+    pub calls: i64,
+    /// The sum of the tool's `amount` input over those calls.
+    #[serde(default)]
+    pub amount: i64,
 }
 
 impl UsageSpec {
     fn context(&self) -> crate::UsageContext {
+        let window = |w: &WindowSpec| crate::WindowFigures {
+            calls: w.calls,
+            amount: w.amount,
+        };
         crate::UsageContext {
             calls: self.calls,
             amount: self.amount,
             destination_seen: self.destination_seen,
+            user_window: crate::UserWindowContext {
+                hour: window(&self.user_window.hour),
+                day: window(&self.user_window.day),
+            },
         }
     }
 }

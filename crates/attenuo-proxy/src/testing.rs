@@ -49,6 +49,10 @@ impl Drop for Spawned {
 }
 
 /// Serve `router` on `127.0.0.1:0` in a background task.
+///
+/// # Errors
+///
+/// When `127.0.0.1:0` cannot be bound or its local address cannot be read.
 pub async fn spawn_router(router: Router) -> anyhow::Result<Spawned> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -310,6 +314,10 @@ impl FakeMcpServer {
     }
 
     /// Serve [`router`](Self::router) on an ephemeral port.
+    ///
+    /// # Errors
+    ///
+    /// As [`spawn_router`].
     pub async fn spawn(&self) -> anyhow::Result<Spawned> {
         spawn_router(self.router()).await
     }

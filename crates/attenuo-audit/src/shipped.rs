@@ -111,8 +111,12 @@ pub struct ShippedLine {
     pub inconsistency: Option<String>,
 }
 
-/// Parse a JSONL file of shipped checkpoints. Blank lines are skipped; anything that is
-/// neither an envelope nor a checkpoint is an error.
+/// Parse a JSONL file of shipped checkpoints. Blank lines are skipped.
+///
+/// # Errors
+///
+/// [`AuditError::Export`] naming the line when a non-blank line is not JSON, or is neither an
+/// envelope nor a checkpoint.
 pub fn parse_shipped(text: &str) -> Result<Vec<ShippedLine>, AuditError> {
     let mut out = Vec::new();
     for (n, line) in text.lines().enumerate() {

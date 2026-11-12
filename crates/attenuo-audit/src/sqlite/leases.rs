@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
 
 use attenuo_core::fingerprint::Fingerprint;
-use attenuo_core::{Charge, LeaseId};
+use attenuo_core::{Charge, LeaseId, WindowCharge};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use time::OffsetDateTime;
 
@@ -16,7 +16,7 @@ use super::approvals::{
     add_approval_columns, approval_from_row, approval_in, approvals_for_call, pending_of_run,
     APPROVAL_COLUMNS,
 };
-use super::budgets::{counter_in, refund_in};
+use super::budgets::{counter_in, prune_windows_in, refund_in, window_in};
 use super::connection::{
     file_of, open_connection, open_memory_connection, with_full_sync, Durability, WriteGate,
 };
@@ -37,6 +37,7 @@ use crate::lease::{
 use crate::spans::{
     distinct_hashes, evictions, SpanHit, SpanKey, MAX_SEQS_PER_PROBE, MAX_SPANS_PER_RUN,
 };
+use crate::window::{UserKey, WindowPrune};
 
 /// Lease registry in SQLite.
 ///
@@ -64,6 +65,8 @@ pub struct SqliteLeaseStore {
     pub(super) value_key: ValueKey,
     /// The key span-index fingerprints are hashed under (`budget_meta`, ADR-0009 phase 2).
     span_key: SpanKey,
+    /// The key per-user window users are digested under (`budget_meta`, run limits phase 3).
+    pub(super) user_key: UserKey,
     /// The `rowid` of the last `lease_sessions` row a `prune_sessions` pass looked at; 0 to
     /// start from the first.
     session_cursor: Mutex<i64>,
@@ -82,12 +85,22 @@ pub struct SqliteLeaseStore {
 impl SqliteLeaseStore {
     /// Open (or create) the registry at `path` with [`Durability::Normal`]. May be the same file
     /// as a [`SqliteAudit`](super::SqliteAudit).
+    ///
+    /// # Errors
+    ///
+    /// As [`open_with`](Self::open_with).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AuditError> {
         Self::open_with(path, Durability::default())
     }
 
     /// Open (or create) the registry at `path` in WAL mode with the given durability.
     /// Revocations commit with `synchronous=FULL` whatever `durability` says.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Sqlite`] when the file cannot be opened or the schema cannot be created or
+    /// upgraded, and [`AuditError::Storage`] when the file cannot be switched to WAL mode or a
+    /// stored budget or span key is not hex.
     pub fn open_with(path: impl AsRef<Path>, durability: Durability) -> Result<Self, AuditError> {
         let conn = open_connection(path.as_ref(), durability)?;
         let file = file_of(&conn);
@@ -98,12 +111,23 @@ impl SqliteLeaseStore {
     }
 
     /// A registry in a private in-memory database, gone when the value is dropped.
+    ///
+    /// # Errors
+    ///
+    /// As [`from_connection`](Self::from_connection); an in-memory database should not fail to
+    /// open.
     pub fn open_in_memory() -> Result<Self, AuditError> {
         Self::from_connection(open_memory_connection()?)
     }
 
     /// Wrap an existing connection, creating or upgrading the lease, approval and outbox
     /// tables as needed.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Sqlite`] when the schema cannot be created or upgraded on `conn` (a read-only
+    /// or foreign database, for example), and [`AuditError::Storage`] when a stored budget or span
+    /// key is not hex.
     pub fn from_connection(conn: Connection) -> Result<Self, AuditError> {
         conn.execute_batch(LEASE_SCHEMA)?;
         add_approval_columns(&conn)?;
@@ -122,6 +146,13 @@ impl SqliteLeaseStore {
         )?;
         let span_key = hex::decode(&span_key)
             .map_err(|e| AuditError::Storage(format!("span key is not hex: {e}")))?;
+        let user_key: String = conn.query_row(
+            "SELECT value FROM budget_meta WHERE key = 'user_key'",
+            [],
+            |r| r.get(0),
+        )?;
+        let user_key = hex::decode(&user_key)
+            .map_err(|e| AuditError::Storage(format!("user window key is not hex: {e}")))?;
         let gate = WriteGate::for_file(file_of(&conn).as_deref());
         Ok(Self {
             conn: Mutex::new(conn),
@@ -130,6 +161,7 @@ impl SqliteLeaseStore {
             gate,
             value_key: ValueKey::new(&key),
             span_key: SpanKey::new(&span_key),
+            user_key: UserKey::new(&user_key),
             session_cursor: Mutex::new(0),
             lease_prune: Mutex::default(),
             run_state_cursor: Mutex::new((0, 0)),
@@ -140,6 +172,11 @@ impl SqliteLeaseStore {
 
     /// Run `f` against the underlying connection while holding the store's lock. For tests
     /// and operational tooling.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or whatever `f`
+    /// returns.
     pub fn with_connection<R>(
         &self,
         f: impl FnOnce(&Connection) -> Result<R, AuditError>,
@@ -150,10 +187,16 @@ impl SqliteLeaseStore {
 
     /// Stop this connection from checkpointing the WAL when it commits
     /// (`wal_autocheckpoint=0`). Only for a store that shares its file with a
-    /// [`SqliteAudit`](super::SqliteAudit) whose [`with_wal_checkpoints`](super::SqliteAudit::with_wal_checkpoints) is on:
-    /// that checkpointer covers the whole file, and without this a token exchange that
+    /// [`SqliteAudit`](super::SqliteAudit) whose
+    /// [`with_wal_checkpoints`](super::SqliteAudit::with_wal_checkpoints) is on: that
+    /// checkpointer covers the whole file, and without this a token exchange that
     /// registers a lease would still run a checkpoint inline now and then. Nothing to do for
     /// an in-memory store.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or
+    /// [`AuditError::Sqlite`] when the pragma is refused.
     pub fn without_wal_autocheckpoint(self) -> Result<Self, AuditError> {
         self.conn
             .lock()?
@@ -162,6 +205,12 @@ impl SqliteLeaseStore {
     }
 
     /// One lease's row, if known.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or a query or
+    /// timestamp fault ([`AuditError::Sqlite`], [`AuditError::TimeParse`]) reading the row. An
+    /// unknown lease is `Ok(None)`.
     pub fn get(&self, lease: &LeaseId) -> Result<Option<LeaseRow>, AuditError> {
         let conn = self.conn.lock()?;
         get_in(&conn, lease)
@@ -172,6 +221,12 @@ impl SqliteLeaseStore {
     /// same recursive query over `leases_parent_idx`, so `would_revoke` is the count a
     /// revocation run now would return. `nodes` holds at most `max_nodes` leases (at least 1),
     /// found breadth-first; `would_revoke` counts the whole subtree regardless of the cap.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or a query or
+    /// timestamp fault ([`AuditError::Sqlite`], [`AuditError::TimeParse`]) reading the subtree. An
+    /// unknown lease is `Ok(None)`.
     pub fn subtree(
         &self,
         lease: &LeaseId,
@@ -1408,8 +1463,40 @@ impl LeaseStore for SqliteLeaseStore {
         charges: &[Charge],
         at: OffsetDateTime,
     ) -> Result<ChargeOutcome, AuditError> {
-        self.charge_with(decision_id, charges, at, false)
+        self.charge_with(decision_id, charges, &[], at, false)
             .map(|(outcome, _)| outcome)
+    }
+
+    fn window_used(&self, windows: &[WindowCharge]) -> Result<Vec<u64>, AuditError> {
+        let keys = windows
+            .iter()
+            .map(|w| self.user_key.key(w))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction()?;
+        keys.iter().map(|k| window_in(&tx, k)).collect()
+    }
+
+    fn charge_windowed(
+        &self,
+        decision_id: &str,
+        charges: &[Charge],
+        windows: &[WindowCharge],
+        at: OffsetDateTime,
+        defer: bool,
+    ) -> Result<(ChargeOutcome, bool), AuditError> {
+        self.charge_with(decision_id, charges, windows, at, defer)
+    }
+
+    fn prune_user_windows(
+        &self,
+        now: OffsetDateTime,
+        retention: time::Duration,
+        max_rows: usize,
+    ) -> Result<WindowPrune, AuditError> {
+        let _gate = self.gate.hold();
+        let mut conn = self.conn.lock()?;
+        prune_windows_in(&mut conn, now, retention, max_rows)
     }
 
     /// Defers the sync of a `sum` charge on a file store below `durability = "full"`; any
@@ -1420,7 +1507,7 @@ impl LeaseStore for SqliteLeaseStore {
         charges: &[Charge],
         at: OffsetDateTime,
     ) -> Result<(ChargeOutcome, bool), AuditError> {
-        self.charge_with(decision_id, charges, at, true)
+        self.charge_with(decision_id, charges, &[], at, true)
     }
 
     fn sync_file(&self) -> Option<&Path> {

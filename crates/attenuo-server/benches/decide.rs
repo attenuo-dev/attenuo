@@ -33,6 +33,18 @@
 //! ```text
 //! cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3
 //! ```
+//!
+//! The span overhead of `[telemetry]` (design note `otel-export.md`, section 6, "Cost"):
+//! with `ATTENUO_BENCH_TELEMETRY` set, the bench installs the server's global subscriber
+//! before it runs. `off` is the subscriber of a server with `[telemetry]` off (the log layer
+//! alone; run with `RUST_LOG=warn` so the `decision` line is filtered, not printed); `on` and
+//! `on=<ratio>` add the OpenTelemetry layer at sample ratio 1 or `<ratio>`, exporting through
+//! the server's bounded processor to an exporter that discards. Unset, no subscriber, as
+//! before. Each value is one run of the process, as a server has one subscriber:
+//!
+//! ```text
+//! RUST_LOG=warn ATTENUO_BENCH_TELEMETRY=off cargo bench -p attenuo-server --bench decide -- decide/decide_memory/
+//! ```
 
 use std::hint::black_box;
 use std::sync::{Arc, RwLock};
@@ -295,7 +307,93 @@ fn record(
     )
 }
 
+/// An exporter that drops every batch: the span cost without a network.
+#[cfg(feature = "otel")]
+#[derive(Debug)]
+struct Discard;
+
+#[cfg(feature = "otel")]
+impl opentelemetry_sdk::trace::SpanExporter for Discard {
+    async fn export(
+        &self,
+        batch: Vec<opentelemetry_sdk::trace::SpanData>,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        black_box(batch);
+        Ok(())
+    }
+}
+
+/// The exporter `ATTENUO_BENCH_TELEMETRY=on` runs, until the bench ends; then the spans it
+/// exported and dropped are printed, so a run whose queue overflowed shows it.
+#[cfg(feature = "otel")]
+struct Exporting {
+    provider: opentelemetry_sdk::trace::SdkTracerProvider,
+    counters: Arc<attenuo_server::telemetry::TelemetryCounters>,
+    _rt: tokio::runtime::Runtime,
+}
+
+#[cfg(feature = "otel")]
+impl Drop for Exporting {
+    fn drop(&mut self) {
+        let _ = self
+            .provider
+            .shutdown_with_timeout(std::time::Duration::from_secs(5));
+        eprintln!(
+            "telemetry: {} spans exported, {} dropped",
+            self.counters.exported(),
+            self.counters.dropped()
+        );
+    }
+}
+
+/// What `ATTENUO_BENCH_TELEMETRY` installs (see the module docs); the returned value keeps the
+/// exporter running until the bench ends.
+fn telemetry_from_env() -> Option<Box<dyn std::any::Any>> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let mode = std::env::var("ATTENUO_BENCH_TELEMETRY").ok()?;
+    let registry = tracing_subscriber::registry().with(attenuo_server::telemetry::log_layer());
+    if mode == "off" {
+        registry.init();
+        return Some(Box::new(()));
+    }
+    #[cfg(feature = "otel")]
+    if let Some(ratio) = mode.strip_prefix("on") {
+        let ratio = match ratio.strip_prefix('=') {
+            Some(r) => r.parse().expect("ATTENUO_BENCH_TELEMETRY=on=<ratio>"),
+            None => 1.0,
+        };
+        let mut section = attenuo_server::telemetry::TelemetrySection {
+            enabled: true,
+            ..Default::default()
+        };
+        section.traces.sample_ratio = ratio;
+        let settings = section.resolve_with(&|_| None).unwrap().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let counters = Arc::new(attenuo_server::telemetry::TelemetryCounters::default());
+        let provider = attenuo_server::telemetry::tracer_provider(
+            &settings,
+            Discard,
+            counters.clone(),
+            rt.handle().clone(),
+        );
+        registry
+            .with(attenuo_server::telemetry::layer(&provider))
+            .init();
+        return Some(Box::new(Exporting {
+            provider,
+            counters,
+            _rt: rt,
+        }));
+    }
+    panic!("ATTENUO_BENCH_TELEMETRY is off, on or on=<ratio>, not {mode:?}");
+}
+
 fn bench_decide(c: &mut Criterion) {
+    let _telemetry = telemetry_from_env();
     let now = OffsetDateTime::now_utc();
     let issuer = Issuer::generate(IssuerConfig {
         issuer: "http://bench".into(),

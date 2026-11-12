@@ -61,6 +61,7 @@
 //!   "session": { "tainted": true, "tainted_by": ["web/fetch"] },
 //!   "args_contain_untrusted": true,
 //!   "untrusted_args": ["body"],
+//!   "untrusted_outbound": false,
 //!   "approval": { "present": false, "by": "" },
 //!   "budget": {
 //!     "limited": false,
@@ -68,12 +69,16 @@
 //!     "amount_remaining": 9223372036854775807,
 //!     "destination_new": true
 //!   },
-//!   "usage": { "calls": 0, "amount": 0, "destination_seen": false }
+//!   "usage": {
+//!     "calls": 0, "amount": 0, "destination_seen": false,
+//!     "user_window": { "hour": { "calls": 0, "amount": 0 }, "day": { "calls": 0, "amount": 0 } }
+//!   }
 //! }
 //! ```
 //!
-//! `session`, `args_contain_untrusted`, `untrusted_args` and `approval` come from output
-//! labelling (ADR-0009) and are always present, so policies need no `has` guard.
+//! `session`, `args_contain_untrusted`, `untrusted_args`, `untrusted_outbound` and `approval`
+//! come from output labelling (ADR-0009) and are always present, so policies need no `has`
+//! guard.
 //! `session.tainted` is true once the delegation run has read an untrusted upstream result
 //! (or when its taint state could not be read), and `session.tainted_by` names the sources as
 //! `"<server>/<tool>"`. They come from [`CallLabels`], which
@@ -84,7 +89,11 @@
 //! ([`PolicyEngine::reads_arg_taint`]) and otherwise only for a destructive tool, with
 //! arguments pinned by `equals` or `one_of` exempt),
 //! and `args_contain_untrusted` is `true` when there is at least one ([`ArgLabels`]); both
-//! come from [`CallLabels::args`]. `approval.present` is `true` only when the call
+//! come from [`CallLabels::args`]. `untrusted_outbound` is `true` when one of those arguments is
+//! one the catalog marks outbound ([`ToolAttrs::outbound`], [`ToolAttrs::untrusted_outbound`]),
+//! an `unreadable` one (the fail-closed case) included, so a policy can ask on outbound matches
+//! without listing argument names; it is computed by the engine from `untrusted_args` and the
+//! tool's attributes. `approval.present` is `true` only when the call
 //! carries a granted approval for its exact call hash ([`ApprovalContext`]), with
 //! `approval.by` set to `user` or `operator`; otherwise it is `false` and `by` is empty.
 //!
@@ -102,14 +111,21 @@
 //! always present too ([`UsageContext`]): `usage.calls` is how many calls of this server and
 //! tool the run has had allowed so far, by any hop; `usage.amount` the sum of the catalog's
 //! `amount` input over them (`0` when the catalog names none); `usage.destination_seen` whether
-//! the catalog's `destination` input value appeared in one of them. The server keeps usage only
-//! for tools the catalog marks destructive; for any other tool all three are zero or false.
+//! the catalog's `destination` input value, or a value of one of its `outbound` inputs, appeared
+//! in one of them. The server keeps usage only for tools the catalog marks destructive or gives
+//! an `outbound` input; for any other tool all three are zero or false.
 //! It keeps it at all only when it can matter ([`PolicyEngine::tracks_usage`]): some loaded
 //! policy reads `context.usage`, the catalog declares `amount` or `destination`, or
 //! [`TrackUsage::Always`]; otherwise every tool sees zeros, which no loaded policy reads.
 //! Nothing refuses a call because of usage unless a policy says so, which is how a deployment
 //! writes limits without a number in every token, hard (`forbid`) or soft
 //! (`@obligation("approval")`).
+//!
+//! `usage.user_window` (run limits phase 3, [`UserWindowContext`]) is the originating user's
+//! usage of the same tool across all their runs, in the current fixed UTC hour (`hour`) and
+//! UTC day (`day`): `calls` and the summed `amount`, before this call. Users are told apart by
+//! issuer and subject. The server keeps a kind only when some loaded policy reads it
+//! ([`PolicyEngine::user_window_kinds`]); a kind not kept is zero.
 //!
 //! # Obligations
 //!
@@ -139,7 +155,7 @@
 //! | `User::"<subject>"` | `subject`, `issuer`, `authenticated_at_unix`, `attributes` (record) | none |
 //! | `Agent::"<id>"`, one per hop | `id`, `chain_depth` (1-based position of the hop) | the `User`, and the previous hop's `Agent` |
 //! | `Server::"<server>"` | `name` | none |
-//! | `Tool::"<server>/<tool>"` | `server`, `name`, `readonly`, `sensitive`, `destructive` (from the [`ToolCatalog`]; `destructive` defaults to `!readonly`) | the `Server` |
+//! | `Tool::"<server>/<tool>"` | `server`, `name`, `readonly`, `sensitive`, `destructive`, `outbound` (from the [`ToolCatalog`]; `destructive` defaults to `!readonly`, `outbound` is whether the entry names an `outbound` input) | the `Server` |
 //!
 //! So policies can say `principal in User::"alice"`, `principal in Agent::"planner"`,
 //! `resource in Server::"github"`, `resource.readonly`, or `principal.chain_depth > 2`.
@@ -264,7 +280,7 @@ pub use schema::{
 pub use screen::{
     ListScreen, HIDE_INVALID_NAME, HIDE_NOT_IN_CATALOG, HIDE_POLICY, SCREEN_MEMO_CAPACITY,
 };
-pub use usage::{policies_read_usage, TrackUsage};
+pub use usage::{policies_read_usage, policies_read_user_window, TrackUsage};
 
 /// The starter policy set shipped with the crate (`policies/default.cedar`).
 ///
@@ -391,6 +407,47 @@ pub struct UsageContext {
     /// `context.usage.destination_seen`: the catalog's `destination` input value appeared in an
     /// earlier allowed call of this tool in the run.
     pub destination_seen: bool,
+    /// `context.usage.user_window`: the originating user's usage of this tool across all their
+    /// runs, per fixed UTC window (run limits phase 3).
+    pub user_window: UserWindowContext,
+}
+
+/// `context.usage.user_window` (run limits phase 3): the originating user's per-user windows
+/// of the called tool, before this call. Always present; a kind the server does not keep (no
+/// loaded policy reads it, [`PolicyEngine::user_window_kinds`]) is zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UserWindowContext {
+    /// `context.usage.user_window.hour`: the current UTC hour.
+    pub hour: WindowFigures,
+    /// `context.usage.user_window.day`: the current UTC day.
+    pub day: WindowFigures,
+}
+
+impl UserWindowContext {
+    /// The figures of `kind`.
+    pub fn get(&self, kind: attenuo_core::WindowKind) -> &WindowFigures {
+        match kind {
+            attenuo_core::WindowKind::Hour => &self.hour,
+            attenuo_core::WindowKind::Day => &self.day,
+        }
+    }
+
+    /// The figures of `kind`, to set.
+    pub fn get_mut(&mut self, kind: attenuo_core::WindowKind) -> &mut WindowFigures {
+        match kind {
+            attenuo_core::WindowKind::Hour => &mut self.hour,
+            attenuo_core::WindowKind::Day => &mut self.day,
+        }
+    }
+}
+
+/// One per-user window as Cedar sees it: `{calls, amount}`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WindowFigures {
+    /// Allowed calls of the tool by any run of the user in the window.
+    pub calls: i64,
+    /// The sum of the catalog's `amount` input over those calls.
+    pub amount: i64,
 }
 
 /// `context.budget` (ADR-0010): what the run limits that match a call have left, computed by
@@ -488,8 +545,8 @@ pub struct Outcome {
     /// `input_type_mismatch`, `policy_allow`, `policy_deny`, `approval_required`, `policy_error`.
     pub reason: String,
     /// Ids of the policies that determined the decision (permits that matched for an allow,
-    /// forbids that matched for a deny, the approval forbids for `approval_required`). Empty
-    /// for a capability denial or a default deny.
+    /// forbids that matched for a deny, the approval forbids for `approval_required`), in
+    /// sorted order. Empty for a capability denial or a default deny.
     pub policy_ids: Vec<String>,
     /// Human-readable details: evaluation errors, translation problems, capability mismatches.
     pub diagnostics: Vec<String>,
@@ -697,12 +754,15 @@ impl PolicyEngineBuilder {
             text.push('\n');
         }
         let loaded = load_policies(&text, &schema)?;
+        let mut validation_warnings = loaded.warnings;
+        validation_warnings.extend(self.catalog.warnings());
         let catalog_names_usage = self
             .catalog
             .iter()
             .any(|(_, a)| a.amount.is_some() || a.destination.is_some());
         Ok(PolicyEngine {
             policies_read_usage: loaded.reads_usage,
+            policies_read_user_window: loaded.reads_user_window,
             policies_read_session_id: loaded.reads_session_id,
             policies_read_arg_taint: loaded.reads_arg_taint,
             catalog_names_usage,
@@ -718,7 +778,7 @@ impl PolicyEngineBuilder {
             annotation_import: self.annotation_import,
             narrowed: RwLock::new(HashMap::new()),
             authorizer: Authorizer::new(),
-            validation_warnings: loaded.warnings,
+            validation_warnings,
             request_cache: request::RequestCache::new(request::REQUEST_CACHE_CAPACITY),
             generation: 0,
             screen_memo: screen::ScreenMemo::default(),
@@ -733,11 +793,13 @@ struct LoadedPolicies {
     warnings: Vec<String>,
     /// Some policy may read `context.usage` ([`policies_read_usage`]).
     reads_usage: bool,
+    /// The window kinds some policy may read ([`policies_read_user_window`]).
+    reads_user_window: Vec<attenuo_core::WindowKind>,
     /// Some policy may read `context.session_id`, the one optional context member (the list
     /// screen evaluates both its presence and its absence then).
     reads_session_id: bool,
-    /// Some policy may read `context.args_contain_untrusted` or `context.untrusted_args`
-    /// ([`PolicyEngine::reads_arg_taint`]).
+    /// Some policy may read `context.args_contain_untrusted`, `context.untrusted_args` or
+    /// `context.untrusted_outbound` ([`PolicyEngine::reads_arg_taint`]).
     reads_arg_taint: bool,
 }
 
@@ -839,9 +901,11 @@ fn load_policies(text: &str, schema: &Schema) -> Result<LoadedPolicies, PolicyEr
     };
     Ok(LoadedPolicies {
         reads_usage: policies_read_usage(&policies),
+        reads_user_window: policies_read_user_window(&policies),
         reads_session_id: usage::policies_read_context_attr(&policies, "session_id"),
         reads_arg_taint: usage::policies_read_context_attr(&policies, "args_contain_untrusted")
-            || usage::policies_read_context_attr(&policies, "untrusted_args"),
+            || usage::policies_read_context_attr(&policies, "untrusted_args")
+            || usage::policies_read_context_attr(&policies, "untrusted_outbound"),
         policies,
         obligations: Obligations {
             approval_ids,
@@ -999,10 +1063,12 @@ pub struct PolicyEngine {
     screen_memo: screen::ScreenMemo,
     /// Some loaded policy may read `context.usage`; recomputed on reload.
     policies_read_usage: bool,
+    /// The per-user window kinds loaded policies may read; recomputed on reload.
+    policies_read_user_window: Vec<attenuo_core::WindowKind>,
     /// Some loaded policy may read `context.session_id`; recomputed on reload.
     policies_read_session_id: bool,
-    /// Some loaded policy may read `context.args_contain_untrusted` or
-    /// `context.untrusted_args`; recomputed on reload.
+    /// Some loaded policy may read `context.args_contain_untrusted`,
+    /// `context.untrusted_args` or `context.untrusted_outbound`; recomputed on reload.
     policies_read_arg_taint: bool,
     /// The catalog declares `amount` or `destination` for some tool.
     catalog_names_usage: bool,
@@ -1135,7 +1201,7 @@ impl PolicyEngine {
             .get_or_build(chain, call, attrs, self.legacy_bare_actions)
             .map_err(|e| e.to_string())?;
         let request = parts
-            .request(call, &attrs.inputs, labels, now)
+            .request(call, attrs, labels, now)
             .map_err(|e| e.to_string())?;
         Ok(Prepared { request, parts })
     }
@@ -1225,8 +1291,12 @@ impl PolicyEngine {
             &prepared.parts.entities,
         );
         let diagnostics = response.diagnostics();
-        let errors: Vec<String> = diagnostics.errors().map(|e| e.to_string()).collect();
-        let policy_ids: Vec<String> = diagnostics.reason().map(|id| id.to_string()).collect();
+        // Cedar hands both back from hash sets, so two identical calls could list the same
+        // policies in a different order; sorted, the outcome is the same text every time.
+        let mut errors: Vec<String> = diagnostics.errors().map(|e| e.to_string()).collect();
+        let mut policy_ids: Vec<String> = diagnostics.reason().map(|id| id.to_string()).collect();
+        errors.sort_unstable();
+        policy_ids.sort_unstable();
         if !errors.is_empty() {
             // Fail closed: a policy that errored was skipped by Cedar, and a skipped forbid
             // is a silent grant. Do not trust the decision.
@@ -1326,7 +1396,9 @@ impl PolicyEngine {
         self.policies = loaded.policies;
         self.obligations = loaded.obligations;
         self.validation_warnings = loaded.warnings;
+        self.validation_warnings.extend(self.catalog.warnings());
         self.policies_read_usage = loaded.reads_usage;
+        self.policies_read_user_window = loaded.reads_user_window;
         self.policies_read_session_id = loaded.reads_session_id;
         self.policies_read_arg_taint = loaded.reads_arg_taint;
         // The cached request parts do not depend on the policies, but a reload is the
@@ -1370,7 +1442,8 @@ impl PolicyEngine {
         out
     }
 
-    /// Validation warnings from the last successful load (for example "policy is impossible").
+    /// Validation warnings from the last successful load (for example "policy is impossible"),
+    /// then the catalog's ([`ToolCatalog::warnings`]).
     pub fn validation_warnings(&self) -> &[String] {
         &self.validation_warnings
     }
@@ -1410,8 +1483,19 @@ impl PolicyEngine {
             || self.catalog_names_usage
     }
 
-    /// Whether some loaded policy (or template) may read `context.args_contain_untrusted` or
-    /// `context.untrusted_args` (output labelling phase 2), by the conservative walk of
+    /// The per-user window kinds (run limits phase 3) the server keeps under this engine: those
+    /// some loaded policy may read as `context.usage.user_window.<kind>`
+    /// ([`policies_read_user_window`]), shortest first. Empty when none is read, and then
+    /// nothing about windows is charged or read. Only kept for calls that keep run usage
+    /// ([`tracks_usage`](Self::tracks_usage), which a read of `context.usage` implies).
+    /// Decided at build and at every [`reload_policies_str`](Self::reload_policies_str).
+    pub fn user_window_kinds(&self) -> &[attenuo_core::WindowKind] {
+        &self.policies_read_user_window
+    }
+
+    /// Whether some loaded policy (or template) may read `context.args_contain_untrusted`,
+    /// `context.untrusted_args` or `context.untrusted_outbound` (output labelling phase 2, and
+    /// the read-side exfiltration design's option d), by the conservative walk of
     /// [`policies_read_usage`]: a whole-`context` use counts, and so does a set that cannot be
     /// rendered as JSON. Decided at build and at every
     /// [`reload_policies_str`](Self::reload_policies_str). The server matches the arguments of

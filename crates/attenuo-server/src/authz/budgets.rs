@@ -28,6 +28,10 @@ pub struct BudgetView {
     pub context: BudgetContext,
     /// For `budget_exhausted`: the limit the call would take past its `max`.
     pub hit: Option<LimitHit>,
+    /// The per-user window counters the call would be charged against (run limits phase 3),
+    /// with the run usage. Empty when no loaded policy reads a window or the call keeps no
+    /// usage.
+    pub windows: Vec<attenuo_core::WindowCharge>,
 }
 
 /// A run limit a call would exceed: the `limit` member of a `budget_exhausted` denial

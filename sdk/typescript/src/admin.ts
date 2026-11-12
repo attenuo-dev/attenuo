@@ -7,9 +7,9 @@
  */
 
 import { capabilitiesToJson, type CapabilityLike } from "./capability.js";
-import { DpopKey, NonceCache, type DpopKeyLike } from "./dpop.js";
+import { DpopKey, NonceCache, resendOnce, type DpopKeyLike } from "./dpop.js";
 import { Http, type HttpOptions } from "./http.js";
-import { AttenuoError } from "./errors.js";
+import { AttenuoError, budgetLimitOf } from "./errors.js";
 import { bearer, type Token } from "./token.js";
 import * as w from "./wire.js";
 
@@ -654,19 +654,6 @@ function obj(v: unknown): Json | undefined {
   return typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Json) : undefined;
 }
 
-function budgetLimitOf(v: unknown): BudgetLimit | undefined {
-  const l = obj(v);
-  if (!l) return undefined;
-  const out: BudgetLimit = {
-    hop: Number(l.hop),
-    kind: String(l.kind) as LimitKind,
-    used: Number(l.used),
-  };
-  if (typeof l.arg === "string") out.arg = l.arg;
-  if (typeof l.max === "number") out.max = l.max;
-  return out;
-}
-
 function evaluationOf(b: Json): PolicyEvaluation {
   const out: PolicyEvaluation = {
     decision: (b.decision === "allow" ? "allow" : "deny") as Decision,
@@ -855,7 +842,7 @@ export class AdminClient {
   ): AsyncGenerator<AuditExportLine> {
     const query = exportParams(fromSeq, toSeq, filter);
     const res = await this.http.get("/admin/audit/export", { query });
-    if (!res.ok) throw w.errorFromResponse(res.status, await res.text());
+    if (!res.ok) throw w.errorFromResponse(res.status, await res.text(), res.headers);
     const decoder = new TextDecoder();
     let buf = "";
     const emit = function* (line: string): Generator<AuditExportLine> {
@@ -1142,9 +1129,9 @@ export class AdminClient {
       body.attributes = opts.attributes;
     if (opts.mayAct !== undefined) body.may_act = w.mayActJson(opts.mayAct);
     const key = await DpopKey.of(opts.dpopKey);
-    const send = async () => {
+    const headersNow = async (): Promise<Record<string, string>> => {
       const proofOpts = this.nonce.value === undefined ? {} : { nonce: this.nonce.value };
-      const headers: Record<string, string> = key
+      return key
         ? {
             dpop: await key.proof(
               "POST",
@@ -1154,13 +1141,15 @@ export class AdminClient {
             ),
           }
         : {};
-      return this.http.post("/admin/root-token", { json: body, headers });
     };
-    let res = await send();
+    const send = (headers: Record<string, string>) =>
+      this.http.post("/admin/root-token", { json: body, headers });
+    let res = await send(await headersNow());
     if (key !== undefined && (await this.nonce.update(res))) {
-      // `use_dpop_nonce`: retry once with the server's nonce.
+      // `use_dpop_nonce`: retry once with the server's nonce, on a new connection if need be.
       await res.body?.cancel();
-      res = await send();
+      const headers = await headersNow();
+      res = await resendOnce(() => send(headers));
       await this.nonce.update(res);
     }
     return w.tokenFromResponse(await w.jsonBody(res));

@@ -44,6 +44,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(unreachable_pub)]
+#![warn(clippy::missing_errors_doc)]
 #![warn(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -59,6 +60,7 @@ pub(crate) mod clientauth;
 pub mod config;
 // Used by the fuzz targets.
 pub mod dpop;
+pub(crate) mod early_close;
 // Used by the integration tests.
 pub mod error;
 pub(crate) mod idp;
@@ -73,6 +75,7 @@ pub mod routes;
 // Used by the integration tests.
 pub mod sink;
 pub(crate) mod state;
+pub mod telemetry;
 
 use std::sync::Arc;
 
@@ -86,6 +89,10 @@ pub use config::Config;
 pub use state::AppState;
 
 /// Build the state and the full router from a config.
+///
+/// # Errors
+///
+/// As [`AppState::from_config`].
 pub fn build(config: &Config) -> anyhow::Result<(Router, Arc<AppState>)> {
     build_with_clock(config, attenuo_core::clock::system_clock())
 }
@@ -93,6 +100,10 @@ pub fn build(config: &Config) -> anyhow::Result<(Router, Arc<AppState>)> {
 /// [`build`], with every request check (token, lease and approval expiry, the proxy's
 /// session TTL and record windows) reading the time from `clock`. Tests pass a
 /// [`attenuo_core::ManualClock`] to step past a TTL instead of sleeping through it.
+///
+/// # Errors
+///
+/// As [`AppState::from_config`].
 pub fn build_with_clock(
     config: &Config,
     clock: Arc<dyn attenuo_core::Clock>,
@@ -146,6 +157,17 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
         .route("/access/v1/evaluation", post(authzen::evaluation))
         .route("/access/v1/evaluations", post(authzen::evaluations))
         .route_layer(axum::middleware::from_fn(authzen::echo_request_id));
+    let mut token_routes = Router::new()
+        .route("/token", post(token::exchange))
+        .route("/token/renew", post(renew::renew));
+    // One exported span per token and AuthZEN request, only when tracing is on.
+    let (authzen_routes, token_routes) = if state.trace.is_some() {
+        let layer = axum::middleware::from_fn_with_state(state.clone(), telemetry::trace_route);
+        token_routes = token_routes.route_layer(layer.clone());
+        (authzen_routes.route_layer(layer), token_routes)
+    } else {
+        (authzen_routes, token_routes)
+    };
 
     let api = Router::new()
         .route("/healthz", get(wellknown::healthz))
@@ -155,8 +177,7 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
             "/.well-known/authzen-configuration",
             get(wellknown::authzen_configuration),
         )
-        .route("/token", post(token::exchange))
-        .route("/token/renew", post(renew::renew))
+        .merge(token_routes)
         .route(
             "/approvals/{id}",
             get(approvals::user_get).post(approvals::user_decide),
@@ -169,7 +190,8 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
 
     let authorizer = Arc::new(
         ServerAuthorizer::new(state.verifier.clone(), state.pipeline.clone())
-            .with_dpop(state.dpop.clone()),
+            .with_dpop(state.dpop.clone())
+            .with_trace(state.trace.clone()),
     );
     let proxy = attenuo_proxy::router_with_clock(
         // Validated in `AppState::from_config`.
@@ -188,6 +210,8 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
             state.metrics.clone(),
             metrics::track_http,
         ))
+        // Outermost, so it sees every answer, the early refusals of the layers above included.
+        .layer(axum::middleware::from_fn(early_close::mark_early_refusal))
 }
 
 /// Start the `[audit] checkpoint_interval_seconds` timer: every `period`, sign the head if
@@ -354,8 +378,37 @@ pub async fn prune_run_state(state: &Arc<AppState>) -> u64 {
     .await
 }
 
+/// One run of per-user window retention (`[leases] user_window_retention_seconds`, run limits
+/// phase 3): passes of
+/// [`LeaseStore::prune_user_windows`](attenuo_audit::LeaseStore::prune_user_windows), bounded
+/// like [`prune_run_state`]. A window and its charges go once the window ended longer ago than
+/// the retention; an open window is never touched. Counts what it deleted in
+/// `run_state_pruned_total{kind="user_window"}` and returns it; 0 when retention is off.
+pub async fn prune_user_windows(state: &Arc<AppState>) -> u64 {
+    let Some(retention) = state.user_window_retention else {
+        return 0;
+    };
+    prune_in_passes(
+        state,
+        "per-user windows",
+        move |s, now| {
+            use attenuo_audit::LeaseStore;
+            let batch = s.lease_maintenance.batch_rows;
+            let p = s.leases.prune_user_windows(now, retention, batch)?;
+            Ok((p, p.wrapped))
+        },
+        |m, p| {
+            let n = p.pruned_windows + p.pruned_charges;
+            m.user_windows_pruned(n);
+            n
+        },
+    )
+    .await
+}
+
 /// Start the lease maintenance ticker: every `[leases] maintenance_interval_seconds`,
-/// [`prune_session_bindings`], then [`prune_lease_registry`], then [`prune_run_state`] (each
+/// [`prune_session_bindings`], then [`prune_lease_registry`], then [`prune_run_state`], then
+/// [`prune_user_windows`] (each
 /// does nothing when its retention is 0). Sessions go first, so a binding whose chain is about
 /// to be pruned is counted as a session; run state goes last, since it is only pruned once
 /// its leases are gone. Dropping the handle does not stop it; abort it to stop.
@@ -369,6 +422,7 @@ pub fn spawn_lease_maintenance(state: Arc<AppState>) -> tokio::task::JoinHandle<
             prune_session_bindings(&state).await;
             prune_lease_registry(&state).await;
             prune_run_state(&state).await;
+            prune_user_windows(&state).await;
         }
     })
 }
@@ -380,6 +434,12 @@ pub const SINK_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_s
 pub const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Bind `[server] listen` and serve until SIGINT or SIGTERM, then drain for [`DRAIN_TIMEOUT`].
+///
+/// # Errors
+///
+/// When [`build`] fails, when `[server] listen` (or the metrics or admin UI listener) cannot be
+/// bound, or when serving fails with an I/O error. A failed final WAL checkpoint is logged, not
+/// returned.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let (app, state) = build(&config)?;
     let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
@@ -388,7 +448,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         .then(|| spawn_checkpointer(state.clone(), state.checkpoint_interval));
     let prune_task = (state.session_retention.is_some()
         || state.lease_retention.is_some()
-        || state.run_state_retention.is_some())
+        || state.run_state_retention.is_some()
+        || state.user_window_retention.is_some())
     .then(|| spawn_lease_maintenance(state.clone()));
     let metrics_task = if config.metrics.enabled {
         let l = tokio::net::TcpListener::bind(config.metrics.listen).await?;
@@ -456,6 +517,11 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 
 /// Serve `app` on `listener` until `shutdown` resolves, then stop accepting connections and
 /// wait up to `drain` for in-flight requests before giving up on them.
+///
+/// # Errors
+///
+/// When the server task fails with an I/O error or panics, before or during the drain. A drain that
+/// times out is not an error: the remaining connections are closed.
 pub async fn serve_until(
     listener: tokio::net::TcpListener,
     app: Router,

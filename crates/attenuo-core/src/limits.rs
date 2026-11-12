@@ -80,15 +80,48 @@ pub const REASON_LIMIT_ARG_INVALID: &str = "limit_arg_invalid";
 #[serde(rename_all = "snake_case")]
 pub enum Derive {
     /// The host of a URL argument: parsed as a WHATWG URL, lowercased, without port, user
-    /// info or trailing dots. A value that is not a string, or not an absolute URL with a
-    /// host (`example.com/x`, `mailto:a@b`), has none. Nor does a string with a backslash,
-    /// whitespace or a control character in it: WHATWG reads `https://a.example\@b.example/`
-    /// as host `a.example`, while common HTTP clients (Python's `urllib` and `httpx`, among
-    /// others) fetch `b.example`, so the host counted would not be the host reached (SR-56).
-    /// Only a URL of a special scheme (`http`, `https`, `ws`, `wss`, `ftp`, `file`) has a
-    /// host: any other scheme (`ssh://`, `git://`) has an opaque host, which WHATWG neither
-    /// percent-decodes nor maps through IDNA, so `ssh://a.ex%61mple/` and `ssh://a.example/`
-    /// would count as two hosts where a client that decodes the host reaches one (FZ2-2).
+    /// info or trailing dots. A value that is not a string, or not a URL with a host
+    /// (`mailto:a@b`, `/etc/passwd`), has none.
+    ///
+    /// Nor does a string with a backslash, whitespace or a control character in it: WHATWG
+    /// reads `https://a.example\@b.example/` as host `a.example`, while common HTTP clients
+    /// (Python's `urllib` and `httpx`, among others) fetch `b.example`, so the host counted
+    /// would not be the host reached (SR-56). Only a URL of a special scheme (`http`, `https`,
+    /// `ws`, `wss`, `ftp`, `file`) has a host: any other scheme (`ssh://`, `git://`) has an
+    /// opaque host, which WHATWG neither percent-decodes nor maps through IDNA, so
+    /// `ssh://a.ex%61mple/` and `ssh://a.example/` would count as two hosts where a client that
+    /// decodes the host reaches one (FZ2-2).
+    ///
+    /// A string with no scheme is a bare host and is read as `http://` followed by the string,
+    /// so `www.example.com`, `example.com/x?q=1` and `localhost:8080` have the hosts
+    /// `www.example.com`, `example.com` and `localhost`. A string has no scheme when
+    /// `url::Url::parse` refuses it as a relative URL (`RelativeUrlWithoutBase`: the text
+    /// before the first `:` is not a scheme name, or there is no `:`), or when it parses with
+    /// a scheme that is not special and the text after that scheme's `:`, up to the first `/`,
+    /// `?` or `#`, is one or more ASCII digits: then the "scheme" is a host and the digits are
+    /// its port (`localhost:8080`, `a.example:443/x`). The plainer rule, "no `:` before the
+    /// first `/`, `?` or `#`", would read every bare host with a port as a scheme, because a
+    /// host name is also a valid scheme name. A special scheme always wins (`http:8080` is
+    /// still the URL WHATWG reads, host `0.0.31.144`), and any other scheme stays refused
+    /// (`mailto:x@y`, `javascript:alert(1)`, `data:,x`, `a.example:x@b.example`). A string
+    /// that starts with `/` is a path and has none. A bare host with user info means what it
+    /// means to a browser that is given it: `good.example@evil.example` is
+    /// `http://good.example@evil.example`, whose host is `evil.example`, the one a browser
+    /// would connect to. A short opaque URL with a digit body reads as a host as well
+    /// (`tel:911` counts host `tel`), which counts a destination where refusing would also be
+    /// safe.
+    ///
+    /// The injection suite's host entities (`fingerprint::entities`) are a separate,
+    /// deliberately looser grammar. Where both give a host for one token they give the same
+    /// one, except for: a host with non-canonical spelling that WHATWG rewrites (percent
+    /// escapes, IPv4 in hex, octal or short form, IDNA and other non-ASCII, trailing dots in
+    /// a full URL), an IPv6 literal (whose brackets the entity tokeniser splits on), and a
+    /// token that holds a second `http(s)://` URL after its start (the entity grammar takes
+    /// the embedded URL's host, this one the leading host). For a bare host only the last
+    /// class arises, since the entity grammar takes only ASCII names that end in a label of
+    /// letters, and no user info. The property test
+    /// `derived_host_agrees_with_the_fingerprint_host` in `tests/limits_props.rs` checks the
+    /// rest.
     Host,
 }
 
@@ -124,7 +157,7 @@ impl Derive {
                 {
                     return None;
                 }
-                let url = url::Url::parse(raw).ok()?;
+                let url = parse_url_or_bare_host(raw)?;
                 // An opaque host is not normalised, so it could be spelled several ways for
                 // one destination (fuzzing round 2, FZ2-2).
                 if !SPECIAL_SCHEMES.contains(&url.scheme()) {
@@ -150,6 +183,35 @@ impl Derive {
                 Some(trimmed.to_string())
             }
         }
+    }
+}
+
+/// `raw` as a URL, or as `http://` followed by `raw` when `raw` has no scheme (a bare host,
+/// possibly with a port, path, query or fragment). See [`Derive::Host`] for the rule.
+fn parse_url_or_bare_host(raw: &str) -> Option<url::Url> {
+    let bare = || {
+        if raw.starts_with('/') {
+            return None;
+        }
+        url::Url::parse(&format!("http://{raw}")).ok()
+    };
+    match url::Url::parse(raw) {
+        Ok(url) if SPECIAL_SCHEMES.contains(&url.scheme()) => Some(url),
+        Ok(url) => {
+            // The scheme WHATWG read is ASCII and as long as its spelling in `raw` (a string
+            // with whitespace or control characters never gets here), so `raw` continues with
+            // the `:` after it.
+            let rest = raw.get(url.scheme().len() + 1..)?;
+            let port = rest.split(['/', '?', '#']).next().unwrap_or_default();
+            let is_port = !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit());
+            if is_port {
+                bare()
+            } else {
+                None
+            }
+        }
+        Err(url::ParseError::RelativeUrlWithoutBase) => bare(),
+        Err(_) => None,
     }
 }
 
@@ -1208,7 +1270,7 @@ mod tests {
         assert_eq!((charges[0].amount, charges[0].max), (1, 2));
         // No host: refused, naming the derived argument.
         for url in [
-            json!("news.example/a"),
+            json!("/news.example/a"),
             json!("mailto:a@b.example"),
             json!(7),
         ] {
@@ -1245,7 +1307,7 @@ mod tests {
             Some("a.example")
         );
         assert_eq!(h("http://[::1]:8080/").as_deref(), Some("[::1]"));
-        assert_eq!(h("a.example/x"), None);
+        assert_eq!(h("/a.example/x"), None);
         assert_eq!(h("mailto:a@b.example"), None);
         assert_eq!(h("file:///etc/passwd"), None);
         assert_eq!(Derive::Host.apply(&json!(["https://a.example"])), None);
@@ -1262,6 +1324,83 @@ mod tests {
             ..Limits::default()
         });
         assert!(cap.validate_limits().is_err());
+    }
+
+    /// A bare host (no scheme) is read as `http://` followed by the string, so `distinct` and
+    /// `calls_per` host limits and a `url#host` destination count the AgentDojo slack URLs
+    /// (`www.true-informations.com`), which carry no scheme. Every guard of a full URL still
+    /// applies to it.
+    #[test]
+    fn a_bare_host_is_read_as_an_http_url() {
+        let h = |s: &str| Derive::Host.apply(&json!(s));
+        for (raw, host) in [
+            ("www.true-informations.com", "www.true-informations.com"),
+            ("WWW.Dora-Website.com/about?x=1#f", "www.dora-website.com"),
+            ("a.example.", "a.example"),
+            ("a.example../x", "a.example"),
+            ("localhost", "localhost"),
+            // A host name is also a valid scheme name: digits after the `:` are a port.
+            ("localhost:8080", "localhost"),
+            ("a.example:443/x", "a.example"),
+            ("A.Example:8443?q=1", "a.example"),
+            ("127.0.0.1:80/x", "127.0.0.1"),
+            ("0x7f.1", "127.0.0.1"),
+            ("[::1]:8080/x", "[::1]"),
+            ("a.ex%61mple", "a.example"),
+            ("xn--nxasmq6b.example", "xn--nxasmq6b.example"),
+            (
+                "\u{3b2}\u{3cc}\u{3bb}\u{3bf}\u{3c2}.example",
+                "xn--nxasmm1c.example",
+            ),
+            // User info: the host is the one a browser would connect to.
+            ("good.example@evil.example", "evil.example"),
+            ("good.example@evil.example:80/x", "evil.example"),
+            ("a.example?@evil.example", "a.example"),
+            ("a.example#@evil.example", "a.example"),
+        ] {
+            assert_eq!(h(raw).as_deref(), Some(host), "{raw:?}");
+        }
+        for raw in [
+            // A non-special scheme stays refused, unless what follows it is a port.
+            "mailto:x@y.example",
+            "javascript:alert(1)",
+            "data:text/plain,x",
+            "a.example:x@evil.example",
+            "a.example:80@evil.example",
+            "a.example:",
+            "ssh:22x",
+            // A port out of range, a path, nothing, dots only.
+            "a.example:99999",
+            "/a.example",
+            "//a.example/x",
+            "",
+            "..",
+            "?x",
+            // SR-56 applies before the bare reading.
+            "a.example\\@evil.example",
+            "a.example /x",
+            "a.exa\tmple",
+        ] {
+            assert_eq!(h(raw), None, "{raw:?}");
+        }
+        // A special scheme always wins over the bare reading.
+        assert_eq!(h("http:8080").as_deref(), Some("0.0.31.144"));
+        assert_eq!(h("https:a.example").as_deref(), Some("a.example"));
+        // A bare host and its full URL count as one host.
+        let chain = root(vec![Capability::new("web", "get_webpage").with_limits(
+            Limits {
+                calls_per: Some(ArgLimit::new("url", 1).derived(Derive::Host)),
+                ..Limits::default()
+            },
+        )]);
+        let value = |url: &str| {
+            let call = ToolCall::new("web", "get_webpage", json!({ "url": url }));
+            charges_for(&chain, &call).unwrap()[0].value.clone()
+        };
+        assert_eq!(
+            value("www.true-informations.com"),
+            value("https://www.true-informations.com/news")
+        );
     }
 
     /// FZ2-1 (fuzzing round 2): only one trailing dot was stripped, so `https://a.example../`
@@ -1447,22 +1586,24 @@ mod tests {
                 .map(|c| c.value.unwrap())
                 .collect::<Vec<_>>()
         };
-        let a = dest(json!("docs.example/page"));
-        let b = dest(json!("evil.example/?d=secret"));
+        let a = dest(json!("/docs.example/page"));
+        let b = dest(json!("/evil.example/?d=secret"));
         assert_eq!(a.len(), 1);
         assert_ne!(a, b, "two hostless values must be two destinations");
-        assert_eq!(a, dest(json!("docs.example/page")), "the same one is one");
+        assert_eq!(a, dest(json!("/docs.example/page")), "the same one is one");
         assert_eq!(
-            dest(json!(["docs.example/page", "docs.example/page"])).len(),
+            dest(json!(["/docs.example/page", "/docs.example/page"])).len(),
             1
         );
         assert_eq!(
-            dest(json!(["docs.example/page", "evil.example/?d=secret"])).len(),
+            dest(json!(["/docs.example/page", "/evil.example/?d=secret"])).len(),
             2
         );
-        assert_eq!(a[0], canonical(&json!({"raw": "docs.example/page"})));
+        assert_eq!(a[0], canonical(&json!({"raw": "/docs.example/page"})));
         // A hostless value never collides with a host, even one spelled like the raw value.
-        assert_ne!(dest(json!("a.example")), dest(json!("https://a.example/")));
+        assert_ne!(dest(json!("/a.example")), dest(json!("https://a.example/")));
+        // A bare host is a host, not a raw value: it is the destination of its full URL.
+        assert_eq!(dest(json!("a.example")), dest(json!("https://a.example/")));
     }
 
     #[test]

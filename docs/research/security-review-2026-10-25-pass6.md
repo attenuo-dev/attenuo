@@ -16,7 +16,7 @@ What merged after pass 5, PRs #87 to #102. The new surface, read in full:
 - the admin dry run's `budget` block (`budget_from_json`, `CounterSource::Stated`);
 - the audit export's `tool` and `decision` filters.
 
-The attacker was taken as each of the threat model's roles: a prompt-injected agent that controls arguments (A1), a compromised sub-agent that writes its own exchange requests (A2), a malicious or compromised MCP upstream (A3), a holder of copied or revoked tokens (A4, A6), and a reader of the audit log (A7). For A3 the review checked what MCP client SDKs accept against what the proxy classifies: the Python MCP SDK (`mcp` in `/home/claude/sdk-venv`) and the TypeScript SDK (`@modelcontextprotocol/sdk` in `examples/typescript-agent`). For the starter policy it checked how a WHATWG URL parser (Node's `URL`) reads repository names put into a GitHub API path.
+The attacker was taken as each of the threat model's roles: a prompt-injected agent that controls arguments (A1), a compromised sub-agent that writes its own exchange requests (A2), a malicious or compromised MCP upstream (A3), a holder of copied or revoked tokens (A4, A6), and a reader of the audit log (A7). For A3 the review checked what MCP client SDKs accept against what the proxy classifies: the Python MCP SDK (`mcp` in a local virtualenv) and the TypeScript SDK (`@modelcontextprotocol/sdk` in `examples/typescript-agent`). For the starter policy it checked how a WHATWG URL parser (Node's `URL`) reads repository names put into a GitHub API path.
 
 Every finding fixed here has a regression test that failed on the base commit and passes on this branch; each was run against the unfixed code first. Findings are numbered from SR-69.
 

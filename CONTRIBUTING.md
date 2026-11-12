@@ -4,7 +4,7 @@ Thank you for considering a contribution. This document is the whole process; if
 
 ## Ground rules
 
-- `main` is protected: no direct pushes. Every change goes through a branch and a pull request.
+- No direct pushes to `main`. Every change goes through a branch and a pull request. Branch protection enforces this once the repository is public; before that it was kept by practice.
 - A PR is mergeable when fmt, clippy (`-D warnings`), the full test suite and the supply-chain checks pass, and new behaviour has tests.
 - Design decisions are recorded as ADRs in `docs/decisions/` (one file per decision, numbered). See [docs/decisions/README.md](docs/decisions/README.md).
 - Changes to the token format, policy request shape, audit schema or public API need an RFC first. See [docs/spec/README.md](docs/spec/README.md).
@@ -48,7 +48,7 @@ If you change the admin console (`crates/attenuo-server/ui/`), run `scripts/cons
 
 The Python SDK tests (`cd sdk/python && pytest -rf`, and `ATTENUO_INTEGRATION=1 pytest -rf -m integration` for the real-server tests) are run with `-rf` so that the name of a failing test is in the summary; see [sdk/python/README.md](sdk/python/README.md).
 
-`rustfmt.toml` and `clippy.toml` in the repo root carry the project settings, so `cargo fmt` and `cargo clippy` pick them up without flags. The toolchain is pinned by `rust-toolchain.toml`.
+`rustfmt.toml` and `clippy.toml` in the repo root carry the project settings, so `cargo fmt` and `cargo clippy` pick them up without flags. `rust-toolchain.toml` selects the stable channel. It is not pinned to an exact release, so a new stable clippy can flag code that passed before; CI uses the same channel.
 
 ## Previewing the documentation site
 
@@ -59,6 +59,7 @@ cargo install mdbook --locked --version 0.4.52   # the version CI uses
 mdbook serve --open                              # http://localhost:3000, rebuilds on save
 mdbook build                                     # one-off build into book/ (ignored by git)
 python3 scripts/check-links.py                   # relative links and anchors
+python3 scripts/check-public-hygiene.py          # no machine paths, personal notes, old name or placeholders
 ```
 
 Keep the pages readable on GitHub and in Obsidian as well. Link to other pages with relative `.md` paths. Link to files outside `docs/` (for example `config/example.toml`) with a full GitHub URL, because the book only contains `docs/`. To link to a folder's `README.md`, link the folder (`../spec/`), since the book renders it as `index.html`. Mermaid diagrams render on the site through a script that loads mermaid from a CDN, so they need network access when you preview.
@@ -81,7 +82,7 @@ Example: `feat/token-caveats`, `fix/audit-chain-reorder`.
 
 ### Conventional Commits
 
-Commit messages follow [Conventional Commits 1.0](https://www.conventionalcommits.org/en/v1.0.0/). The changelog and version bumps are derived from them, so this is checked in review.
+Pull request titles follow [Conventional Commits 1.0](https://www.conventionalcommits.org/en/v1.0.0/), and pull requests are squash-merged, so each one lands on `main` as a single commit with that title. The changelog and version bumps are derived from them, so this is checked in review. Commits inside a branch should follow the same form, but only the squashed commit has to. History from before the first public release does not follow this consistently and is not rewritten.
 
 ```
 <type>(<scope>): <short summary in imperative mood>
@@ -112,7 +113,7 @@ We use the [DCO](https://developercertificate.org/) instead of a CLA. By signing
 git commit -s
 ```
 
-This appends `Signed-off-by: Your Name <you@example.com>` using your git identity. The name and email must be real and must match the commit author. A PR with unsigned commits will be asked to rebase with `git rebase --signoff`. (When the DCO GitHub App is enabled on the repository, it enforces this automatically.)
+Sign-off is required from the first public release on; earlier history is exempt. This appends `Signed-off-by: Your Name <you@example.com>` using your git identity. The name and email must be real and must match the commit author. A PR with unsigned commits will be asked to rebase with `git rebase --signoff`. (When the DCO GitHub App is enabled on the repository, it enforces this automatically.)
 
 ## Pull requests
 
@@ -137,13 +138,17 @@ A change is done when all of the following hold:
 
 ## Releases
 
-Maintainers only. Versions follow [SemVer 2.0](https://semver.org/). Pre-1.0, a minor bump may break; every breaking change is marked in the changelog.
+Maintainers only. Versions follow [SemVer 2.0](https://semver.org/). Pre-1.0, a minor bump may break; every breaking change is marked in the changelog. What counts as breaking for each surface (routes, error codes, token claims, audit constructions, config keys, metrics, SDKs) and how it is deprecated first is in [API compatibility](docs/reference/api-compatibility.md); a change to the wire format is additive unless it follows those rules.
 
 1. Make sure `main` is green and `CHANGELOG.md`'s `Unreleased` section is complete. `git cliff --unreleased` gives a draft to compare against. `scripts/release-check.sh` runs every local check a release needs, including the crates, PyPI and npm dry runs; the 0.1.0 steps are in [docs/release/0.1.0.md](docs/release/0.1.0.md).
-2. Open a `chore(release): vX.Y.Z` PR that bumps `workspace.package.version` in `Cargo.toml`, moves `Unreleased` to a dated `[X.Y.Z]` heading with a compare link, and adds a fresh empty `Unreleased`.
+2. Open a `chore(release): vX.Y.Z` PR that bumps `workspace.package.version` in `Cargo.toml` and the SDK versions with it (`sdk/python/pyproject.toml`, `sdk/typescript/package.json` and its lockfile; `scripts/release-check.sh` fails when they differ), moves `Unreleased` to a dated `[X.Y.Z]` heading with a compare link, and adds a fresh empty `Unreleased`.
 3. Merge, then tag the merge commit `vX.Y.Z` (annotated, signed if you have a key) and push the tag. `.github/workflows/release.yml` builds `attenuo` and `attenuo-server` for Linux (musl, x86_64 and aarch64) and macOS (arm64, x86_64), pushes a signed multi-arch image to GHCR (cosign keyless, SBOM attached), and opens a **draft** GitHub release with the archives, `SHA256SUMS` and the git-cliff changelog section. Review the draft and publish it by hand. It needs only the automatic `GITHUB_TOKEN`; set the GHCR package to public after the first push.
 4. For the first public release, work through the [launch checklist](docs/launch-checklist.md).
 5. Crate publishing to crates.io is manual until the public API settles; the plan is to adopt release-plz once it does.
+
+## AI-assisted contributions
+
+AI coding tools are welcome; most of this repository was written with them (see [How this project is built](README.md#how-this-project-is-built)). The rules are the same as for any change: you are responsible for every line you submit, you must understand it well enough to answer review questions about it, and it must pass the same tests and review. Say in the pull request description which parts a tool wrote. Do not paste output you have not read, and do not submit code a tool generated from sources whose licence you cannot check. A `Co-Authored-By:` trailer for the tool is welcome; links to private tool sessions (such as `Claude-Session:` URLs) do not belong in commit messages.
 
 ## Licence
 

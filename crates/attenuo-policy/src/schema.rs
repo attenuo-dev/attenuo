@@ -31,6 +31,9 @@ pub const GENERIC_ACTION: &str = "invoke";
 ///   `principal in User::"alice"` and `principal in Agent::"planner"` work.
 /// - `Server` is a logical tool server (an MCP server, for instance).
 /// - `Tool` is one tool on one server, with id `"<server>/<tool>"`, `in` its `Server`.
+///   `outbound` (the catalog names an outbound input) is not required of a custom base schema,
+///   so one written before it still loads; a policy that reads `resource.outbound` validates
+///   only against a base that declares it.
 pub const DEFAULT_SCHEMA: &str = r#"// attenuo default Cedar schema (entity types).
 // Actions, context types and UserAttributes are generated from the tool catalog.
 
@@ -56,6 +59,7 @@ entity Tool in [Server] {
     readonly: Bool,
     sensitive: Bool,
     destructive: Bool,
+    outbound: Bool,
 };
 "#;
 
@@ -226,7 +230,8 @@ fn record(attrs: &BTreeMap<String, ArgType>) -> String {
 fn context_type(inputs: &BTreeMap<String, ArgType>) -> String {
     format!(
         "{{ input: {}, originating_user: UserContext, chain: ChainContext, session_id?: String, now_unix: Long, \
-         session: SessionContext, args_contain_untrusted: Bool, untrusted_args: Set<String>, approval: ApprovalContext, \
+         session: SessionContext, args_contain_untrusted: Bool, untrusted_args: Set<String>, untrusted_outbound: Bool, \
+         approval: ApprovalContext, \
          budget: BudgetContext, usage: UsageContext }}",
         record(inputs)
     )
@@ -270,7 +275,12 @@ pub(crate) fn generate(
         "type BudgetContext = { limited: Bool, calls_remaining: Long, amount_remaining: Long, destination_new: Bool };\n",
     );
     // Run usage (run-limits design section 3.5). Always present.
-    s.push_str("type UsageContext = { calls: Long, amount: Long, destination_seen: Bool };\n");
+    // Per-user windows (run limits phase 3), inside it. Always present too.
+    s.push_str("type WindowFigures = { calls: Long, amount: Long };\n");
+    s.push_str("type UserWindowContext = { hour: WindowFigures, day: WindowFigures };\n");
+    s.push_str(
+        "type UsageContext = { calls: Long, amount: Long, destination_seen: Bool, user_window: UserWindowContext };\n",
+    );
     let actions = catalog.actions(legacy_bare_actions);
     let mut all_inputs: BTreeMap<String, ArgType> = BTreeMap::new();
     for inputs in actions.values() {
@@ -454,13 +464,17 @@ mod tests {
             "session: SessionContext",
             "args_contain_untrusted: Bool",
             "untrusted_args: Set<String>",
+            "untrusted_outbound: Bool",
+            "    outbound: Bool,",
             "approval: ApprovalContext",
             "type SessionContext = { tainted: Bool, tainted_by: Set<String> }",
             "type ApprovalContext = { present: Bool, by: String }",
             "budget: BudgetContext",
             "type BudgetContext = { limited: Bool, calls_remaining: Long, amount_remaining: Long, destination_new: Bool }",
             "usage: UsageContext",
-            "type UsageContext = { calls: Long, amount: Long, destination_seen: Bool }",
+            "type UsageContext = { calls: Long, amount: Long, destination_seen: Bool, user_window: UserWindowContext }",
+            "type UserWindowContext = { hour: WindowFigures, day: WindowFigures }",
+            "type WindowFigures = { calls: Long, amount: Long }",
         ] {
             assert!(text.contains(attr), "{attr}");
         }

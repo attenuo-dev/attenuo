@@ -691,25 +691,44 @@ fn insert_entry(
 impl SqliteAudit {
     /// Open (or create) the log at `path` with [`Durability::Normal`]. Pass `":memory:"` for a
     /// private in-memory log.
+    ///
+    /// # Errors
+    ///
+    /// As [`open_with`](Self::open_with).
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AuditError> {
         Self::open_with(path, Durability::default())
     }
 
     /// Open (or create) the log at `path` in WAL mode with the given durability.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Sqlite`] when the file cannot be opened or the schema cannot be created, and
+    /// [`AuditError::Storage`] when the file cannot be switched to WAL mode or holds a log this
+    /// version refuses (see [`from_connection`](Self::from_connection)).
     pub fn open_with(path: impl AsRef<Path>, durability: Durability) -> Result<Self, AuditError> {
         Self::from_connection(open_connection(path.as_ref(), durability)?)
     }
 
     /// A log in a private in-memory database, gone when the value is dropped.
+    ///
+    /// # Errors
+    ///
+    /// As [`from_connection`](Self::from_connection); a fresh in-memory database should not fail.
     pub fn open_in_memory() -> Result<Self, AuditError> {
         Self::from_connection(open_memory_connection()?)
     }
 
     /// Wrap an existing connection, creating the schema if needed.
     ///
-    /// Fails for a log written with another entry hash construction than
-    /// [`ENTRY_HASH_VERSION`](crate::log::ENTRY_HASH_VERSION), such as one written before RFC 8785
-    /// canonical JSON (SR-20): there is no migration, start a new file.
+    /// # Errors
+    ///
+    /// [`AuditError::Storage`] when the log predates records with `kind` and `chain_id`, or was
+    /// written with another entry hash construction than
+    /// [`ENTRY_HASH_VERSION`](crate::log::ENTRY_HASH_VERSION), such as one written before RFC
+    /// 8785 canonical JSON (SR-20): there is no migration, start a new file.
+    /// [`AuditError::Sqlite`] when the schema, the meta row or the record-id index cannot be
+    /// written (a read-only or foreign database, for example).
     pub fn from_connection(conn: Connection) -> Result<Self, AuditError> {
         check_record_fields(&conn)?;
         conn.execute_batch(AUDIT_SCHEMA)?;
@@ -750,6 +769,13 @@ impl SqliteAudit {
     /// pages), and so does a store that is not a file in WAL mode, such as an in-memory one.
     /// Readers are unaffected: every read goes through the store's own connection, which sees
     /// every committed row whether or not it has been copied into the database file yet.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock,
+    /// [`AuditError::Sqlite`] when the pragmas cannot be read or set or the checkpointer's own
+    /// connection cannot be opened, and [`AuditError::Storage`] when its thread cannot be started.
+    /// A zero interval or a store that is not a WAL file is `Ok`, unchanged.
     pub fn with_wal_checkpoints(mut self, interval: Duration) -> Result<Self, AuditError> {
         if interval.is_zero() || self.wal.is_some() {
             return Ok(self);
@@ -806,6 +832,12 @@ impl SqliteAudit {
     /// up to the busy timeout for the locks that takes. `None` for a store that is not a
     /// file in WAL mode. The server calls it once more after draining at shutdown; dropping
     /// the store does it too.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock, or
+    /// [`AuditError::Sqlite`] when the checkpoint fails, including when its locks are not free
+    /// within the busy timeout. A store that is not a WAL file is `Ok(None)`.
     pub fn checkpoint_wal(&self) -> Result<Option<WalCheckpoint>, AuditError> {
         if let Some(wal) = &self.wal {
             return wal.truncate().map(Some);
@@ -853,6 +885,14 @@ impl SqliteAudit {
 
     /// The signed checkpoint of the current head, creating it if the head has none yet. Asking
     /// twice without an append in between returns the same checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::NoCheckpointSigner`] when [`with_checkpointing`](Self::with_checkpointing) was
+    /// not called, [`AuditError::Corrupt`] when a stored checkpoint at the head's seq disagrees
+    /// with the log (nothing is signed over a conflict), [`AuditError::TimeFormat`] when `now`
+    /// cannot be written as RFC 3339, or [`AuditError::Poisoned`] when a writer panicked holding
+    /// the log's lock, [`AuditError::Sqlite`] when the transaction or its synced commit fails.
     pub fn checkpoint_signed(&self, now: OffsetDateTime) -> Result<Checkpoint, AuditError> {
         let c = self
             .inner
@@ -897,6 +937,11 @@ impl SqliteAudit {
     /// Checkpoint the head only if it has advanced past the newest checkpoint; `None` when
     /// there is nothing new to sign (or the log is empty). The timer behind
     /// `[audit] checkpoint_interval_seconds` calls this.
+    ///
+    /// # Errors
+    ///
+    /// As [`checkpoint_signed`](Self::checkpoint_signed), plus [`AuditError::Sqlite`] when the head
+    /// or newest checkpoint cannot be read. Nothing new to sign is `Ok(None)`.
     pub fn checkpoint_if_new(&self, now: OffsetDateTime) -> Result<Option<Checkpoint>, AuditError> {
         let (head, last) = {
             let conn = self.inner.conn.lock()?;
@@ -915,6 +960,11 @@ impl SqliteAudit {
     }
 
     /// The newest checkpoint, if any.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock, or
+    /// [`AuditError::Sqlite`] when the query fails or a row has the wrong shape.
     pub fn last_checkpoint(&self) -> Result<Option<Checkpoint>, AuditError> {
         let conn = self.inner.conn.lock()?;
         let mut stmt = conn.prepare_cached(
@@ -926,6 +976,11 @@ impl SqliteAudit {
     }
 
     /// Checkpoints with `from <= seq <= to`, ascending.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock, or
+    /// [`AuditError::Sqlite`] when the query fails or a row has the wrong shape.
     pub fn checkpoints_between(&self, from: u64, to: u64) -> Result<Vec<Checkpoint>, AuditError> {
         let conn = self.inner.conn.lock()?;
         let mut stmt = conn.prepare_cached(
@@ -943,6 +998,13 @@ impl SqliteAudit {
     }
 
     /// Walk the chain and verify every stored checkpoint against `keys`.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock,
+    /// [`AuditError::Sqlite`] when a query fails, or a fault decoding an entry other than a corrupt
+    /// one. A corrupt entry, a broken chain and a bad checkpoint are reported in the
+    /// [`SignedVerifyReport`], not as errors.
     pub fn verify_chain_signed(
         &self,
         keys: &CheckpointKeys,
@@ -965,6 +1027,11 @@ impl SqliteAudit {
     ///
     /// Meant for operational tooling and tests (export, vacuum, deliberate tampering in a test).
     /// Anything written through here bypasses the chain, which `verify_chain` will report.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock, or whatever `f`
+    /// returns.
     pub fn with_connection<R>(
         &self,
         f: impl FnOnce(&Connection) -> Result<R, AuditError>,
@@ -974,6 +1041,12 @@ impl SqliteAudit {
     }
 
     /// Entries for one originating subject, newest first, at most `limit`.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock,
+    /// [`AuditError::Sqlite`] when the query fails, or [`AuditError::Corrupt`] when a row cannot be
+    /// decoded.
     pub fn by_subject(&self, subject: &str, limit: usize) -> Result<Vec<AuditEntry>, AuditError> {
         let sql = format!(
             "SELECT {ENTRY_COLUMNS} FROM audit WHERE originating_subject = ?1 \
@@ -985,6 +1058,10 @@ impl SqliteAudit {
 
     /// Up to `limit` entries with `from_seq <= seq <= to_seq` that match `filter`, in order.
     /// An empty filter is the same as [`AuditSink::range`] bounded by `to_seq`.
+    ///
+    /// # Errors
+    ///
+    /// As [`entries_matching`](Self::entries_matching).
     pub fn range_filtered(
         &self,
         from_seq: u64,
@@ -1017,6 +1094,13 @@ impl SqliteAudit {
     /// Rows are read in batches of `limit` and the store's lock is released between batches,
     /// so a long scan does not hold up appends. The cost grows with the window, not the page:
     /// callers bound the window.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock,
+    /// [`AuditError::Sqlite`] when a query fails, [`AuditError::Corrupt`] when a row cannot be
+    /// decoded or disagrees with its `record_json`, and [`AuditError::Serde`] or
+    /// [`AuditError::TimeFormat`] when a filter value cannot be encoded for the query.
     pub fn entries_matching(
         &self,
         lo: u64,
@@ -1116,6 +1200,12 @@ impl SqliteAudit {
     }
 
     /// The entry at `seq`, if there is one.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock,
+    /// [`AuditError::Sqlite`] when the query fails, or [`AuditError::Corrupt`] when the row cannot
+    /// be decoded. A seq with no entry, or one past `i64::MAX`, is `Ok(None)`.
     pub fn entry_at(&self, seq: u64) -> Result<Option<AuditEntry>, AuditError> {
         let Ok(seq) = i64::try_from(seq) else {
             return Ok(None);
@@ -1128,6 +1218,12 @@ impl SqliteAudit {
     /// The entry whose record has id `id` (the hyphenated lower-case UUID that proxy denials
     /// and AuthZEN answers return as `decision_id`), if there is one. Uses the
     /// `audit_record_id_idx` expression index.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock,
+    /// [`AuditError::Sqlite`] when the query fails, or [`AuditError::Corrupt`] when a row cannot be
+    /// decoded. An unknown id is `Ok(None)`.
     pub fn entry_by_record_id(&self, id: &str) -> Result<Option<AuditEntry>, AuditError> {
         let sql =
             format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE {RECORD_ID_EXPR} = ?1 ORDER BY seq");
@@ -1140,6 +1236,11 @@ impl SqliteAudit {
 
     /// Up to `limit` stored checkpoints with `seq < before`, newest first. It only reads:
     /// unlike [`checkpoint_signed`](Self::checkpoint_signed) it never signs one.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock, or
+    /// [`AuditError::Sqlite`] when the query fails or a row has the wrong shape.
     pub fn checkpoints_before(
         &self,
         before: u64,
@@ -1163,6 +1264,12 @@ impl SqliteAudit {
     /// The oldest stored checkpoint at or after `seq`: the first one whose signature covers
     /// the entry at `seq` through the hash chain. It is read as stored, not verified;
     /// [`verify_chain_signed`](Self::verify_chain_signed) checks signatures.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock, or
+    /// [`AuditError::Sqlite`] when the query fails or a row has the wrong shape. A seq past
+    /// `i64::MAX` or past the newest checkpoint is `Ok(None)`.
     pub fn checkpoint_covering(&self, seq: u64) -> Result<Option<Checkpoint>, AuditError> {
         let Ok(seq) = i64::try_from(seq) else {
             return Ok(None);
@@ -1179,6 +1286,12 @@ impl SqliteAudit {
     /// `decision`, if any. For questions such as "was the policy reloaded after this
     /// decision?" (kind `admin`, tool `admin.policies.reload`, `allow`). It reads through the
     /// `kind` index, so it stays cheap on a long log as long as that kind is rare.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock,
+    /// [`AuditError::Sqlite`] when the query fails, or [`AuditError::Corrupt`] when the row cannot
+    /// be decoded.
     pub fn first_entry_after(
         &self,
         after: u64,
@@ -1211,6 +1324,12 @@ impl SqliteAudit {
     ///
     /// Reads through the `chain_id` index and decodes only that chain's issuance records, so
     /// the cost grows with the chain, not the log.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock,
+    /// [`AuditError::Sqlite`] when the query fails, or [`AuditError::Corrupt`] when one of the
+    /// chain's issuance rows cannot be decoded.
     pub fn issuance_records(
         &self,
         chain_id: &str,
@@ -1238,6 +1357,12 @@ impl SqliteAudit {
     }
 
     /// Every entry bound to one delegation chain, in order.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock,
+    /// [`AuditError::Sqlite`] when the query fails, or [`AuditError::Corrupt`] when a row cannot be
+    /// decoded.
     pub fn by_chain(&self, chain_digest: &str) -> Result<Vec<AuditEntry>, AuditError> {
         let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE chain_digest = ?1 ORDER BY seq");
         let conn = self.inner.conn.lock()?;
@@ -1249,6 +1374,12 @@ impl SqliteAudit {
     /// v0 note: `leases` is stored as a JSON array of strings and this is a `LIKE` on that text
     /// (the id is matched as a quoted JSON string so `l1` does not match `l10`). It is a full scan;
     /// a join table is the upgrade path when volume demands an index.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock,
+    /// [`AuditError::Sqlite`] when the query fails, or [`AuditError::Corrupt`] when a candidate row
+    /// cannot be decoded.
     pub fn by_lease(&self, lease: &LeaseId) -> Result<Vec<AuditEntry>, AuditError> {
         let pattern = like_contains(&serde_json::to_string(&lease.0)?);
         let sql = format!(
@@ -1264,6 +1395,11 @@ impl SqliteAudit {
     }
 
     /// Number of entries.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock, or
+    /// [`AuditError::Sqlite`] when the count query fails.
     pub fn len(&self) -> Result<u64, AuditError> {
         let conn = self.inner.conn.lock()?;
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM audit", [], |r| r.get(0))?;
@@ -1271,6 +1407,10 @@ impl SqliteAudit {
     }
 
     /// Whether the log has no entries.
+    ///
+    /// # Errors
+    ///
+    /// As [`len`](Self::len).
     pub fn is_empty(&self) -> Result<bool, AuditError> {
         Ok(self.len()? == 0)
     }

@@ -107,13 +107,24 @@ class Tool:
 
 @dataclass(frozen=True)
 class AuthzenDecision:
-    """Answer to an AuthZEN evaluation. A ``False`` decision is returned, never raised."""
+    """Answer to an AuthZEN evaluation. A ``False`` decision is returned, never raised.
+
+    On ``reason == "approval_required"`` the fields the proxy's ``-32008`` carries are set too:
+    ``call_hash`` (what an approval is bound to), and ``approval_id`` and ``expires_at`` of the
+    pending approval. ``approval_id`` is ``None`` when the server opened none: the run already
+    has as many pending approvals as it keeps (32), and a PEP that gets diagnostics sees
+    ``"too many pending approvals for this run"`` in ``diagnostics``. The call is then simply
+    denied until an approval of the run is decided or lapses.
+    """
 
     decision: bool
     reason: str
     decision_id: str | None
     policy_ids: list[str]
     diagnostics: list[Any]
+    approval_id: str | None = None
+    call_hash: str | None = None
+    expires_at: datetime | None = None
 
     def __bool__(self) -> bool:
         return self.decision
@@ -156,8 +167,17 @@ class Approval:
 
 
 def error_from_response(resp: httpx.Response) -> ApiError:
+    """The :class:`ApiError` (:class:`Unauthorized` for a 401) for a non-success answer.
+
+    ``decision_id`` is the body's ``decision_id`` when ``X-Attenuo-Decision-Id`` vouches for
+    it (see :func:`_proven_decision_id`). A JSON-RPC error body (the proxy's 401) gives its
+    ``data.reason`` and ``data``.
+    """
     text = resp.text
     error, detail, description = "http_error", text.strip(), None
+    claimed: Any = None
+    reason: str | None = None
+    data: dict[str, Any] | None = None
     try:
         body = json.loads(text)
     except ValueError:
@@ -166,12 +186,21 @@ def error_from_response(resp: httpx.Response) -> ApiError:
         error = body["error"]
         detail = str(body.get("detail", ""))
         description = body.get("error_description")
+        claimed = body.get("decision_id")
     elif isinstance(body, dict) and isinstance(body.get("error"), dict):
         # A JSON-RPC error body (the proxy's 401).
         error = str(body["error"].get("code", "rpc_error"))
         detail = str(body["error"].get("message", ""))
-    cls = Unauthorized if resp.status_code == 401 else ApiError
-    return cls(resp.status_code, error, detail, description)
+        raw_data = body["error"].get("data")
+        data = raw_data if isinstance(raw_data, dict) else {}
+        claimed = data.get("decision_id")
+        reason = _opt_str(data.get("reason")) or "unauthorized"
+    decision_id = _proven_decision_id(resp, claimed)
+    if resp.status_code == 401:
+        return Unauthorized(
+            resp.status_code, error, detail, description, decision_id, reason=reason, data=data
+        )
+    return ApiError(resp.status_code, error, detail, description, decision_id)
 
 
 def json_body(resp: httpx.Response) -> Any:
@@ -289,7 +318,14 @@ def authzen_from_response(body: Any) -> AuthzenDecision:
         decision_id=ctx.get("decision_id"),
         policy_ids=list(ctx.get("policy_ids") or []),
         diagnostics=list(ctx.get("diagnostics") or []),
+        approval_id=_opt_str(ctx.get("approval_id")),
+        call_hash=_opt_str(ctx.get("call_hash")),
+        expires_at=_opt_time(ctx.get("expires_at")),
     )
+
+
+def _opt_str(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 # --- MCP / JSON-RPC --------------------------------------------------------------------------
@@ -344,20 +380,27 @@ def parse_rpc_body(text: str, sse: bool) -> dict[str, Any] | None:
     return None
 
 
-def _proxy_decision_id(resp: httpx.Response, data: dict[str, Any]) -> str | None:
-    """The decision id of a denial the proxy produced, else ``None`` (SR-32).
+def _proven_decision_id(resp: httpx.Response, claimed: Any) -> str | None:
+    """``claimed`` when it is one of the ids in ``resp``'s ``X-Attenuo-Decision-Id``, else
+    ``None`` (SR-32).
 
-    The proxy sets ``X-Attenuo-Decision-Id`` (a comma separated list, request order) on every
-    response that carries its decisions and forwards no such header from an upstream. An upstream
-    is untrusted and can put any ``-32003`` error in its own body, so a denial counts only when
-    ``data.decision_id`` is one of the ids in that header.
+    The server and the proxy set that header (a comma separated list, request order) on every
+    response that carries their decisions, and the proxy forwards no such header from an
+    upstream. An upstream is untrusted and can put any error, and any ``decision_id``, in its
+    own body, so an id counts only when the header names it too.
     """
-    claimed = data.get("decision_id")
     header = resp.headers.get(DECISION_ID_HEADER)
     if not isinstance(claimed, str) or not claimed or not header:
         return None
     ids = [part.strip() for part in header.split(",")]
     return claimed if claimed in ids else None
+
+
+def _proxy_decision_id(resp: httpx.Response, data: dict[str, Any]) -> str | None:
+    """The decision id of a denial the proxy produced, else ``None``: a ``-32003`` or
+    ``-32008`` counts as the proxy's only when ``data.decision_id`` is proven by the header
+    (:func:`_proven_decision_id`)."""
+    return _proven_decision_id(resp, data.get("decision_id"))
 
 
 def _opt_time(value: Any) -> datetime | None:
@@ -423,8 +466,9 @@ def rpc_result(
     :func:`_proxy_decision_id`) raise
     :class:`Denied`; a ``-32003`` without that proof is an upstream's own error and raises
     :class:`RpcError`. A ``-32008`` with the same proof raises :class:`ApprovalRequired`.
-    ``-32001`` or HTTP 401 raises :class:`Unauthorized`; any other JSON-RPC error raises
-    :class:`RpcError`.
+    ``-32001`` or HTTP 401 raises :class:`Unauthorized` with the error's ``data.reason`` as
+    ``reason`` and, when the header vouches for it, its ``data.decision_id``; any other
+    JSON-RPC error raises :class:`RpcError`.
     """
     decision_id = resp.headers.get(DECISION_ID_HEADER)
     if msg is _UNPARSED:
@@ -443,7 +487,7 @@ def rpc_result(
         if code == CODE_DENIED:
             proven = _proxy_decision_id(resp, data)
             if proven is not None:
-                raise Denied(str(data.get("reason", "unknown")), proven, message)
+                raise Denied(str(data.get("reason", "unknown")), proven, message, data)
         if code == CODE_APPROVAL_REQUIRED:
             proven = _proxy_decision_id(resp, data)
             if proven is not None:
@@ -455,9 +499,20 @@ def rpc_result(
                     _opt_time(data.get("expires_at")),
                     call_hash if isinstance(call_hash, str) else None,
                     message,
+                    data,
                 )
         if code == CODE_UNAUTHORIZED or resp.status_code == 401:
-            raise Unauthorized(401, "unauthorized", message)
+            raise Unauthorized(
+                401,
+                "unauthorized",
+                message,
+                decision_id=_proxy_decision_id(resp, data),
+                # Only the proxy answers with HTTP 401. A `-32001` inside a 200 answer can be an
+                # upstream's own error, so its `data.reason` is not taken as the server's word.
+                reason=(_opt_str(data.get("reason")) if resp.status_code == 401 else None)
+                or "unauthorized",
+                data=data,
+            )
         raise RpcError(int(code) if isinstance(code, int) else 0, message, raw_data)
     if not resp.is_success:
         raise error_from_response(resp)

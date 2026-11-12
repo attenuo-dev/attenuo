@@ -1,0 +1,88 @@
+# Policy tests for user-windows.cedar. Run with:
+#   attenuo policy test config/policies/user-windows_test.yaml
+#
+# The harness keeps no counters: `usage.user_window` sets what Cedar sees
+# (context.usage.user_window) for the case, as the server would after the user's earlier
+# allowed calls of the same tool in the current UTC hour and day, across all their runs.
+policies: ./user-windows.cedar
+catalog:
+  banking:
+    get_balance: { readonly: true }
+    send_money:
+      sensitive: true
+      inputs: { recipient: string, amount: long }
+      amount: amount
+      destination: recipient
+cases:
+  - name: the user's first payment of the day is allowed
+    chain: [assistant]
+    call:
+      server: banking
+      tool: send_money
+      arguments: { recipient: FR00EMMA00000000000003, amount: 100 }
+    expect: allow
+    reason: policy_allow
+
+  - name: a payment within the daily total is allowed, whatever other runs spent
+    chain: [assistant]
+    usage: { user_window: { day: { calls: 4, amount: 4800 } } }
+    call:
+      server: banking
+      tool: send_money
+      arguments: { recipient: FR00EMMA00000000000003, amount: 200 }
+    expect: allow
+    reason: policy_allow
+
+  - name: a payment past the daily total asks, in a run that has spent nothing
+    chain: [assistant]
+    usage: { calls: 0, user_window: { day: { calls: 5, amount: 4900 } } }
+    call:
+      server: banking
+      tool: send_money
+      arguments: { recipient: FR00EMMA00000000000003, amount: 101 }
+    expect: deny
+    reason: approval_required
+    policy_ids: [ask_over_user_daily_spend_5000]
+
+  - name: the approved retry passes the daily total
+    chain: [assistant]
+    usage: { user_window: { day: { calls: 5, amount: 4900 } } }
+    approval: { by: user }
+    call:
+      server: banking
+      tool: send_money
+      arguments: { recipient: FR00EMMA00000000000003, amount: 101 }
+    expect: allow
+    reason: policy_allow
+
+  - name: the hourly count is a hard cap that no approval passes
+    chain: [assistant]
+    usage: { user_window: { hour: { calls: 20, amount: 200 }, day: { calls: 20, amount: 200 } } }
+    approval: { by: user }
+    call:
+      server: banking
+      tool: send_money
+      arguments: { recipient: FR00EMMA00000000000003, amount: 1 }
+    expect: deny
+    reason: policy_deny
+    policy_ids: [user_hourly_payments_20]
+
+  - name: an unreadable window is the worst case and refuses
+    chain: [assistant]
+    usage:
+      user_window:
+        hour: { calls: 9223372036854775807, amount: 9223372036854775807 }
+        day: { calls: 9223372036854775807, amount: 9223372036854775807 }
+    approval: { by: user }
+    call:
+      server: banking
+      tool: send_money
+      arguments: { recipient: FR00EMMA00000000000003, amount: 1 }
+    expect: deny
+
+  - name: a read is never limited by a window
+    chain: [assistant]
+    usage: { user_window: { hour: { calls: 50 }, day: { calls: 50, amount: 99999 } } }
+    call: { server: banking, tool: get_balance }
+    expect: allow
+    reason: policy_allow

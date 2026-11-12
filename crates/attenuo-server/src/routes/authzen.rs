@@ -60,6 +60,15 @@ pub const CHAIN_NOT_ISSUED: &str = "chain_not_issued";
 // The `Err` is a full response, built once per refused request; boxing it buys nothing.
 /// `POST /access/v1/evaluation`: decide one AuthZEN request through the pipeline (see the
 /// module docs for where the chain comes from). A refusal is returned as a full response.
+///
+/// # Errors
+///
+/// A full error response (with a `WWW-Authenticate` challenge on a 401): 400 `invalid_request` for
+/// a body that is not an AuthZEN request, a body chain that differs from the token's or fails
+/// `validate_at`, or a non-string `context.approval_token`; 401 for a missing, invalid or expired
+/// bearer, a missing or bad DPoP proof, or, with an unsigned body chain, a PEP that does not
+/// authenticate (`invalid_client`); 403 `chain_not_issued` for a body chain this server did not
+/// issue. A policy or lease refusal is not an error but `decision: false`.
 #[allow(clippy::result_large_err)]
 pub async fn evaluation(
     State(state): State<Arc<AppState>>,
@@ -79,14 +88,20 @@ pub async fn evaluation(
 /// `resource` and `context` are defaults; each entry of `evaluations` may replace any of them.
 /// Every entry that is decided is decided and audited exactly like a single evaluation, in order.
 ///
-/// At most `[authzen] max_batch` entries (400 `batch_too_large` beyond that). Without
+/// At most `[authzen] max_batch` entries. Without
 /// `evaluations` (absent or an empty array) the request is a single evaluation and gets a
 /// single `{decision, context}` answer (AuthZEN 1.0 section 7.1). `options.evaluations_semantic`
 /// (section 7.1.2.1) is `execute_all` (default), `deny_on_first_deny` or
 /// `permit_on_first_permit`; the last two decide in order and stop after the first deny (a
-/// failed entry counts) or permit, answering only the entries decided so far. An
-/// authentication failure refuses the whole request; any other per-entry failure answers
-/// `decision: false` with `context.error` for that entry.
+/// failed entry counts) or permit, answering only the entries decided so far.
+///
+/// # Errors
+///
+/// As [`evaluation`], for the request as a whole: 400 `invalid_request` when the body is not a JSON
+/// object, `evaluations` is not an array or `options.evaluations_semantic` is unknown, 400
+/// `batch_too_large` beyond `[authzen] max_batch`, and the 401 and 403 of authentication, which
+/// refuse the whole batch. Any other failure of one entry is that entry's `decision: false` with
+/// `context.error`.
 // The `Err` is a full response, built once per refused request; boxing it buys nothing.
 #[allow(clippy::result_large_err)]
 pub async fn evaluations(

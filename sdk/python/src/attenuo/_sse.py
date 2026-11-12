@@ -260,7 +260,7 @@ def stream_end_error(msg: dict[str, Any]) -> Denied | RpcError | None:
     message = str(err.get("message", ""))
     data = err.get("data")
     if _is_stream_end(data):
-        return Denied(data["reason"], data.get("decision_id"), message)
+        return Denied(data["reason"], data.get("decision_id"), message, data)
     return RpcError(w.CODE_UNAUTHORIZED, message, data)
 
 

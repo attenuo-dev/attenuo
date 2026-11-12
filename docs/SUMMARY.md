@@ -9,6 +9,7 @@
   - [Integrating MCP clients](guides/integrating-mcp-clients.md)
   - [Binding tokens to keys](guides/binding-tokens-to-keys.md)
   - [Admin console](guides/admin-console.md)
+  - [Observability](guides/observability.md)
 - [Demo recordings](demo/README.md)
 - [Codebase walkthrough](guide/codebase-walkthrough.md)
 
@@ -35,11 +36,11 @@
 - [Fuzzing](design/fuzzing.md)
   - [Fuzzing, round 2](research/fuzzing-2026-10-24-round2.md)
 - [Admin console](design/admin-console.md)
-- [Output labelling (proposed)](design/output-labelling.md)
+- [Output labelling](design/output-labelling.md)
 - [Run limits](design/run-limits.md)
-- [Cedar-aware list filtering (proposed)](design/cedar-aware-list-filtering.md)
+- [Cedar-aware list filtering (built, opt-in)](design/cedar-aware-list-filtering.md)
 - [Multi-replica readiness (proposed)](design/multi-replica.md)
-- [OpenTelemetry export (proposed)](design/otel-export.md)
+- [OpenTelemetry export (built, off by default)](design/otel-export.md)
 - [Run limits phase 3 (proposed)](design/run-limits-phase3.md)
 - [Read-side exfiltration (proposed)](design/read-side-exfiltration.md)
 
@@ -59,6 +60,7 @@
   - [Configuration keys](reference/config.md)
   - [HTTP endpoints](reference/http-api.md)
   - [AuthZEN conformance](reference/authzen.md)
+  - [API compatibility](reference/api-compatibility.md)
 
 # Decisions
 
@@ -75,6 +77,7 @@
   - [ADR-0009: Output labelling](decisions/0009-output-labelling.md)
   - [ADR-0010: Run limits](decisions/0010-run-limits.md)
   - [ADR-0011: Cedar-aware list filtering](decisions/0011-cedar-aware-list-filtering.md)
+  - [ADR-0012: OpenTelemetry export](decisions/0012-opentelemetry-export.md)
 
 # Research
 
@@ -90,6 +93,7 @@
   - [Security review, pass 5](research/security-review-2026-10-24-pass5.md)
   - [Security review, pass 8](research/security-review-2026-11-05-pass8.md)
   - [Security review, pass 9](research/security-review-2026-11-06-pass9.md)
+  - [Security review, pass 10](research/security-review-2026-11-06-pass10.md)
 - [Open-source project practices](research/oss-project-practices.md)
 - [Secret scan of the full history, 2026-11-05](research/secret-scan-2026-11-05.md)
 - [CI minutes, 2026-11-05](research/ci-minutes-2026-11-05.md)
@@ -99,7 +103,6 @@
 # Report
 
 - [Technical report, 2026-11](report/attenuo-2026-11.md)
-  - [One-page researcher brief](brief/attenuo-one-page.md)
 
 # Project
 
@@ -109,7 +112,6 @@
   - [Release 0.1.0](release/0.1.0.md)
 - [Changelog](project/changelog.md)
 - [Security policy](project/security.md)
-- [Research-readiness plan, 2026-11-05](project/research-readiness-plan.md)
 - [Task board](tasks/board.md)
 - [Milestones](tasks/milestones.md)
 - [Engineering log: 2026-10-22](log/2026-10-22.md)

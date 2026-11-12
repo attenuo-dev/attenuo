@@ -40,6 +40,9 @@ pub struct AppState {
     /// `[leases] run_state_retention_seconds`; `None` when run-limit counters, the charge log
     /// and approvals are never pruned.
     pub run_state_retention: Option<Duration>,
+    /// `[leases] user_window_retention_seconds`; `None` when per-user windows are never
+    /// pruned.
+    pub user_window_retention: Option<Duration>,
     /// `[leases] maintenance_*`: how often the maintenance task runs, the rows of one
     /// pruning pass and the most passes of each kind per run.
     pub lease_maintenance: crate::config::LeaseMaintenance,
@@ -98,10 +101,20 @@ pub struct AppState {
     /// proxy's session TTL and record windows): the system clock, except in tests that step
     /// past a TTL with a [`attenuo_core::ManualClock`] ([`crate::build_with_clock`]).
     pub clock: Arc<dyn attenuo_core::Clock>,
+    /// `[telemetry]`: the trace hook of the exported spans; `None` when export is off
+    /// ([`crate::telemetry`]).
+    pub trace: Option<Arc<crate::telemetry::ServerTrace>>,
 }
 
 impl AppState {
     /// Load keys, policies and storage as the config says.
+    ///
+    /// # Errors
+    ///
+    /// When a check of the config fails (server names, public URL, admin token, listeners,
+    /// `[authzen]`, `[proxy]`, `[token] dpop`, `[approvals]`, `[leases]`), when the issuer's keys
+    /// cannot be loaded, when the policies do not parse or validate, when the audit log or lease
+    /// store cannot be opened, or when the IdP, agent, PEP or actor-trust entries are invalid.
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
         Self::from_config_with_clock(config, attenuo_core::clock::system_clock())
     }
@@ -126,6 +139,7 @@ impl AppState {
         config.token.check_dpop()?;
         config.approvals.check()?;
         let lease_maintenance = config.leases.maintenance()?;
+        let user_window_retention = config.leases.user_window_retention()?;
         let issuer = load_issuer(config)?;
         // Server DPoP nonces are keyed by the issuer's private key (see `crate::dpop`).
         let dpop = Arc::new(
@@ -188,6 +202,16 @@ impl AppState {
             .with_metrics(metrics.clone())
             .with_approval_ttl(config.approvals.ttl())
             .with_approval_verifier(verifier.clone());
+        let trace_settings = config.telemetry.resolve()?;
+        let trace = trace_settings
+            .as_ref()
+            .map(|s| Arc::new(crate::telemetry::ServerTrace::new(s)));
+        if trace.is_some() {
+            // Keyed like the DPoP nonces, by the issuer's private key (open question 5).
+            pipeline = pipeline.with_subject_digest(crate::telemetry::SubjectDigest::derive(
+                issuer.private_key_pem().as_bytes(),
+            ));
+        }
         if let Some(n) = &approval_notifier {
             pipeline = pipeline.with_approval_notifier(n.handle());
         }
@@ -281,6 +305,7 @@ impl AppState {
             session_retention: config.leases.session_retention(),
             lease_retention: config.leases.retention(),
             run_state_retention: config.leases.run_state_retention(),
+            user_window_retention,
             lease_maintenance,
             policies_path: config.policy.policies_path.clone(),
             loaded_policies,
@@ -307,6 +332,7 @@ impl AppState {
             approvals_client_id: config.approvals.client_id.clone(),
             approval_notifier,
             clock,
+            trace,
         })
     }
 
@@ -326,7 +352,9 @@ impl AppState {
         R: Send + 'static,
     {
         let state = Arc::clone(self);
-        match tokio::task::spawn_blocking(move || f(&state)).await {
+        // Carry the caller's span and trace context onto the blocking thread.
+        let carry = crate::telemetry::Carry::capture();
+        match tokio::task::spawn_blocking(move || carry.run(|| f(&state))).await {
             Ok(r) => r,
             Err(e) => std::panic::resume_unwind(e.into_panic()),
         }

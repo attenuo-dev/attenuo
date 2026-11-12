@@ -10,7 +10,7 @@ Even with one maintainer the project binds itself to its own process:
 
 - Design changes to the token format, policy request shape, audit schema or public API go through an RFC with a seven-day comment window ([docs/spec/README.md](docs/spec/README.md)).
 - Architectural decisions are recorded as ADRs ([docs/decisions/README.md](docs/decisions/README.md)).
-- `main` is protected. Every change, including the maintainer's own, goes through a pull request that passes CI.
+- Every change to `main`, including the maintainer's own, goes through a pull request that passes CI (or, while GitHub Actions cannot run, the same checks run locally and recorded in the pull request). Branch protection enforces this once the repository is public.
 - Security reports are handled under [SECURITY.md](SECURITY.md) regardless of who reported them.
 
 ## Roles

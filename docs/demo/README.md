@@ -28,22 +28,23 @@ asciinema play docs/demo/multi-hop-demo.cast
 
 | File | Size | Length | Timing |
 | --- | --- | --- | --- |
-| `github-leak-demo.cast` | 8.6 KB | 2.0 s | real time |
+| `github-leak-demo.cast` | 8.6 KB | 0.17 s | real time |
 | `github-leak-demo.gif` | 1.3 MB | 57.5 s | retimed |
-| `multi-hop-demo.cast` | 16.4 KB | 2.0 s | real time |
-| `multi-hop-demo.gif` | 2.4 MB | 87.0 s | retimed |
+| `multi-hop-demo.cast` | 16.5 KB | 0.26 s | real time |
+| `multi-hop-demo.gif` | 2.5 MB | 89.0 s | retimed |
 
-The `.cast` files are the recordings as made. Each demo finishes in about two seconds, so use `asciinema play --speed 0.05 FILE` to read one as it plays, or `cat` the demo's own [leak transcript](../../examples/github-leak-demo/transcript.md).
+The `.cast` files are the recordings as made. Each demo finishes in well under a second, so use `asciinema play --speed 0.01 FILE` to read one as it plays, or `cat` the demo's own [leak transcript](../../examples/github-leak-demo/transcript.md).
 
 The GIFs have the same output in the same order, but the pauses are added. [`retime.py`](retime.py) waits 2.5 s before each section heading and 2 s before each command, and shows a command and its output in one frame. Don't read the GIF's length as the demo's run time.
 
 ## How they were made
 
-From commit `bd4f8dd`, on macOS arm64 with Rust 1.89.0, asciinema 3.2.1 and agg 1.9.0. Each demo ran once beforehand so the recording doesn't show a compile. The build was a warm developer checkout, not a fresh clone.
+From a fresh clone at commit `77cc0a4`, on macOS arm64 with Rust 1.89.0, asciinema 3.2.1 and agg 1.9.0, using the release binaries `scripts/reproduce.sh` had just built in that clone. The demos use those binaries, so the recording shows no compile.
 
 ```bash
-asciinema rec --window-size 100x30 --idle-time-limit 2 --output-format asciicast-v2 \
-  -c "bash examples/github-leak-demo/run.sh" docs/demo/github-leak-demo.cast
+ATTENUO_BIN_DIR=$PWD/target/release asciinema rec --window-size 100x30 --idle-time-limit 2 \
+  --output-format asciicast-v2 -c "bash examples/github-leak-demo/run.sh" \
+  docs/demo/github-leak-demo.cast
 python3 docs/demo/retime.py docs/demo/github-leak-demo.cast /tmp/github-leak-demo.paced.cast
 agg --theme github-dark --font-size 14 --last-frame-duration 6 \
   /tmp/github-leak-demo.paced.cast docs/demo/github-leak-demo.gif

@@ -604,6 +604,7 @@ fn labels(c: &Ctx, args: &Map<String, Value>) -> CallLabels {
             calls: c.usage_calls,
             amount: c.usage_amount,
             destination_seen: c.destination_seen,
+            ..Default::default()
         },
     }
 }

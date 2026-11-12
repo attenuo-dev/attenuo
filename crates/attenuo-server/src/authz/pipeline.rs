@@ -9,8 +9,7 @@ use attenuo_audit::{
 };
 use attenuo_core::fingerprint::{fingerprints, pinned_arguments, Fingerprint};
 use attenuo_core::limits::{
-    charges_for, usage_charges, MAX_LIMIT, REASON_BUDGET_ERROR, REASON_BUDGET_EXHAUSTED,
-    REASON_LIMIT_ARG_INVALID,
+    charges_for, MAX_LIMIT, REASON_BUDGET_ERROR, REASON_BUDGET_EXHAUSTED, REASON_LIMIT_ARG_INVALID,
 };
 use attenuo_core::{
     chain_id_of, ApprovalInfo, BudgetCharge, Charge, Decision, DecisionRecord, DelegationChain,
@@ -29,7 +28,8 @@ use uuid::Uuid;
 use crate::metrics::{ExhaustedAt, Metrics, RefundSource};
 
 use super::budgets::{distinct_step, read_counters};
-use super::usage::{micros, record_usage};
+use super::usage::{micros, record_usage, run_usage_charges, UsageInputs};
+use super::windows::{read_windows, user_stripe, USER_LOCK_STRIPES};
 use super::{
     ArgTaint, BudgetView, CounterSource, LimitHit, RunLabels, MAX_ARG_PROBES,
     MAX_UNTRUSTED_ARG_ENTRIES, UNREADABLE_USAGE,
@@ -121,8 +121,14 @@ pub struct Pipeline {
     /// budget figures, from reading those figures to charging them (SR-55). See
     /// `Pipeline::run_guard`.
     run_locks: Box<[Mutex<()>]>,
+    /// The same for every run of one originating user, for calls that keep a per-user window
+    /// (run limits phase 3), taken after the run's lock. See `Pipeline::run_guard`.
+    user_locks: Box<[Mutex<()>]>,
     /// `[approvals.notify]`: told about each new pending approval; it only queues.
     approval_notifier: Option<crate::notify::NotifierHandle>,
+    /// `[telemetry]`: the key of the subject digest on the exported `attenuo.decide` span
+    /// ([`crate::telemetry::SubjectDigest`]); `None` when telemetry is off.
+    subject_digest: Option<crate::telemetry::SubjectDigest>,
 }
 
 /// The lookups [`Pipeline::arg_taint`] makes for a call: one probe per distinct fingerprint of
@@ -140,9 +146,14 @@ pub(super) struct ArgProbes<'a> {
 }
 
 /// The probes of `call`'s arguments not in `pinned`. Once the pairs pass [`MAX_ARG_PROBES`]
-/// nothing more is kept for lookup (the caller then looks nothing up); the remaining
-/// arguments are only checked for having a fingerprint, so the fail-closed answer still
-/// names each of them.
+/// nothing more is kept for lookup (the caller then looks nothing up). The remaining
+/// arguments are still fingerprinted, in full, to learn which of them have a fingerprint, so
+/// the fail-closed answer names each of them: the bound limits the lookups and what they
+/// return, not the fingerprinting, whose cost is that of the request body (each value at
+/// most [`MAX_FINGERPRINTS_PER_VALUE`] fingerprints from its first [`MAX_TEXT_BYTES`]; SR-99).
+///
+/// [`MAX_FINGERPRINTS_PER_VALUE`]: attenuo_core::fingerprint::MAX_FINGERPRINTS_PER_VALUE
+/// [`MAX_TEXT_BYTES`]: attenuo_core::fingerprint::MAX_TEXT_BYTES
 pub(super) fn arg_probes<'a>(call: &'a ToolCall, pinned: &BTreeSet<String>) -> ArgProbes<'a> {
     let mut out = ArgProbes::default();
     let mut slot: HashMap<Fingerprint, usize> = HashMap::new();
@@ -180,6 +191,9 @@ pub(super) fn arg_probes<'a>(call: &'a ToolCall, pinned: &BTreeSet<String>) -> A
 /// to the same lock.
 const RUN_LOCK_STRIPES: usize = 64;
 
+#[cfg(test)]
+pub(super) const RUN_LOCK_STRIPES_FOR_TESTS: usize = RUN_LOCK_STRIPES;
+
 impl Pipeline {
     /// A pipeline over this policy, lease store and audit log, with the default approval TTL and
     /// no approval-token verifier or approval notifier (see the `with_*` methods). When the lease
@@ -205,7 +219,9 @@ impl Pipeline {
             ),
             approval_verifier: None,
             run_locks: (0..RUN_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
+            user_locks: (0..USER_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
             approval_notifier: None,
+            subject_digest: None,
         }
     }
 
@@ -216,13 +232,20 @@ impl Pipeline {
     /// `usage.amount + input.amount > 2000`, or a soft rule that asks on the second call) or
     /// over `context.budget`: without the lock, concurrent calls of one run all read the same
     /// figures and are all allowed. `None` (no lock) for a call that neither matches a token
-    /// limit's hop nor keeps run usage, so other calls never wait. In process only: two
-    /// servers on one store would not share it (not a supported deployment).
+    /// limit's hop nor keeps run usage, so other calls never wait. A call that keeps a
+    /// per-user window (run limits phase 3) also holds its user's lock, taken after the run's
+    /// from a separate set of stripes, so a rule over `context.usage.user_window` sees what
+    /// every earlier call of the user's other runs charged. The wait for both is one
+    /// `run_lock_wait_seconds` observation. In process only: two servers on one store would
+    /// not share them (not a supported deployment).
     fn run_guard(
         &self,
         chain: &DelegationChain,
         call: &ToolCall,
-    ) -> Option<std::sync::MutexGuard<'_, ()>> {
+    ) -> Option<(
+        std::sync::MutexGuard<'_, ()>,
+        Option<std::sync::MutexGuard<'_, ()>>,
+    )> {
         let limited = chain
             .hops
             .iter()
@@ -238,8 +261,56 @@ impl Pipeline {
         let guard = self.run_locks[stripe]
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Run first, then user, from separate arrays: no deadlock and no self-block.
+        let user = self.keeps_user_window(call).then(|| {
+            self.user_locks[user_stripe(&chain.originating_user, self.user_locks.len())]
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
         self.metrics.observe_run_lock_wait(waiting.elapsed());
-        Some(guard)
+        Some((guard, user))
+    }
+
+    /// Whether `call` keeps a per-user window: it keeps run usage and some loaded policy reads
+    /// a window kind.
+    fn keeps_user_window(&self, call: &ToolCall) -> bool {
+        self.usage_inputs(call).is_some()
+            && self
+                .policy
+                .read()
+                .is_ok_and(|e| !e.user_window_kinds().is_empty())
+    }
+
+    /// Add the originating user's per-user windows (run limits phase 3) to `view`, read from
+    /// the lease store at `now`: the window charges go into `view.windows` and the figures into
+    /// `view.usage.user_window`, for the kinds a loaded policy reads
+    /// ([`PolicyEngine::user_window_kinds`]). Does nothing for a call that keeps no run usage.
+    /// An unreadable store gives the worst case for every kept kind, and the policy decides.
+    /// The admin dry run uses this when it reads usage from the store.
+    pub fn add_user_windows(
+        &self,
+        view: &mut BudgetView,
+        chain: &DelegationChain,
+        call: &ToolCall,
+        now: OffsetDateTime,
+    ) {
+        let Some(inputs) = self.usage_inputs(call) else {
+            return;
+        };
+        let amount = inputs.amount;
+        let kinds = match self.policy.read() {
+            Ok(e) => e.user_window_kinds().to_vec(),
+            Err(_) => attenuo_core::WindowKind::ALL.to_vec(),
+        };
+        read_windows(
+            self.leases.as_ref(),
+            view,
+            &chain.originating_user,
+            call,
+            amount.as_deref(),
+            &kinds,
+            now,
+        );
     }
 
     /// Accept signed approval tokens that verify under `verifier` (the issuer's own verifier:
@@ -259,6 +330,13 @@ impl Pipeline {
     /// (`[approvals.notify]`). Queuing never waits on the receiver.
     pub fn with_approval_notifier(mut self, notifier: crate::notify::NotifierHandle) -> Self {
         self.approval_notifier = Some(notifier);
+        self
+    }
+
+    /// Put a keyed digest of the originating subject on the exported `attenuo.decide` span
+    /// (`[telemetry]`, design section 3.3): never the subject itself.
+    pub fn with_subject_digest(mut self, digest: crate::telemetry::SubjectDigest) -> Self {
+        self.subject_digest = Some(digest);
         self
     }
 
@@ -299,10 +377,14 @@ impl Pipeline {
         ctx: &CallContext,
         now: OffsetDateTime,
     ) -> PipelineDecision {
+        let span = crate::telemetry::decide_span(call);
+        let entered = span.enter();
         let started = Instant::now();
         let out = self.decide_inner(chain, call, ctx, now);
         self.metrics.observe_authorize(started.elapsed());
         self.metrics.decision(out.decision.as_str(), &out.reason);
+        drop(entered);
+        crate::telemetry::record_decision(&span, &out, chain, self.subject_digest.as_ref());
         out
     }
 
@@ -367,7 +449,13 @@ impl Pipeline {
     ) -> PipelineDecision {
         // Stage timings: one `Instant::now()` per boundary (see `Stage`).
         let t0 = Instant::now();
-        let leases = self.check_leases(chain, now);
+        let leases = crate::telemetry::stage_span!("attenuo.lease_check").in_scope(|| {
+            let leases = self.check_leases(chain, now);
+            if let Err((reason, _)) = &leases {
+                tracing::Span::current().record("attenuo.reason", *reason);
+            }
+            leases
+        });
         let t1 = Instant::now();
         let mut policy_time = None;
         let mut record_labels = RecordLabels::default();
@@ -384,9 +472,15 @@ impl Pipeline {
         let (mut decision, mut reason, mut policy_ids, mut diagnostics) = match leases {
             Err((reason, detail)) => (Decision::Deny, reason.to_string(), Vec::new(), detail),
             Ok(()) => {
-                let run = self.run_labels(chain);
-                budget = self.budget_view(chain, call);
-                let args = self.arg_taint(chain, call, &run.session);
+                let (run, args) =
+                    crate::telemetry::stage_span!("attenuo.run_state").in_scope(|| {
+                        let run = self.run_labels(chain);
+                        budget = self.budget_view(chain, call);
+                        self.add_user_windows(&mut budget, chain, call, now);
+                        let args = self.arg_taint(chain, call, &run.session);
+                        (run, args)
+                    });
+                tracing::Span::current().record("attenuo.tainted", run.session.tainted);
                 let mut diagnostics = Vec::new();
                 record_labels = run.record;
                 record_labels.untrusted_args = args.record;
@@ -426,7 +520,8 @@ impl Pipeline {
                             budget: budget.context.clone(),
                             usage: budget.usage.unwrap_or_default(),
                         };
-                        let o = self.evaluate_policy(chain, call, &labels, now);
+                        let o = crate::telemetry::stage_span!("attenuo.policy")
+                            .in_scope(|| self.evaluate_policy(chain, call, &labels, now));
                         policy_time = Some(t1.elapsed());
                         diagnostics.extend(o.diagnostics);
                         diagnostics.extend(run.error);
@@ -449,18 +544,23 @@ impl Pipeline {
         let mut any_charged = false;
         // The charge left its sync to the decision's append (see `charge_sync_on_append`).
         let mut sync_on_append = false;
-        if decision.is_allow() && !budget.charges.is_empty() {
+        if decision.is_allow() && !(budget.charges.is_empty() && budget.windows.is_empty()) {
             let id = decision_id.to_string();
-            let outcome = if self.charge_sync_on_append {
-                self.leases
-                    .charge_sync_deferred(&id, &budget.charges, now)
-                    .map(|(outcome, owed)| {
-                        sync_on_append = owed;
-                        outcome
-                    })
-            } else {
-                self.leases.charge(&id, &budget.charges, now)
-            };
+            let charge_span = crate::telemetry::stage_span!("attenuo.charge");
+            let charging = charge_span.enter();
+            // Per-user windows go in the same transaction (run limits phase 3).
+            let defer = self.charge_sync_on_append;
+            let outcome = self
+                .leases
+                .charge_windowed(&id, &budget.charges, &budget.windows, now, defer)
+                .map(|(outcome, owed)| {
+                    sync_on_append = owed;
+                    outcome
+                });
+            if matches!(outcome, Ok(ChargeOutcome::Exhausted { .. })) {
+                charge_span.record("attenuo.budget.exhausted_at", "charge");
+            }
+            drop(charging);
             match outcome {
                 Ok(ChargeOutcome::Charged { used_after }) => {
                     any_charged = true;
@@ -539,16 +639,25 @@ impl Pipeline {
             record.approval = Some(info);
         }
         record.budget = charged.clone();
-        record.usage = budget.usage.as_ref().map(record_usage);
+        record.usage = budget
+            .usage
+            .as_ref()
+            .map(|u| record_usage(u, &budget.windows));
         // The record moves into the log; the entry hands it back, so it is never cloned. A
         // deferred `sum` charge is durable once this synced append returns, before the call is
         // answered or forwarded; if the append fails, the charge is refunded below.
         let t2 = Instant::now();
-        let appended = if sync_on_append {
-            self.audit.append_synced(record)
-        } else {
-            self.audit.append(record)
-        };
+        let appended = crate::telemetry::stage_span!("attenuo.audit_append").in_scope(|| {
+            let appended = if sync_on_append {
+                self.audit.append_synced(record)
+            } else {
+                self.audit.append(record)
+            };
+            if let Ok(entry) = &appended {
+                tracing::Span::current().record("attenuo.audit.seq", entry.seq);
+            }
+            appended
+        });
         let append_time = t2.elapsed();
         self.metrics.observe_audit_append(append_time);
         let lease_time = t1 - t0;
@@ -571,6 +680,7 @@ impl Pipeline {
                     .filter(|_| record.reason == REASON_BUDGET_EXHAUSTED)
                 {
                     self.metrics.budget_exhausted(hit.kind, exhausted_at);
+                    crate::telemetry::record_exhausted(hit.kind, exhausted_at);
                 }
                 if let Some((_, by)) = &consumed_approval {
                     self.metrics.approval_consumed(by);
@@ -782,13 +892,8 @@ impl Pipeline {
         };
         let limited = !charges.is_empty();
         let keeps_usage = match (self.usage_inputs(call), chain_id_of(chain)) {
-            (Some((amount, destination)), Some(chain_id)) => {
-                charges.extend(usage_charges(
-                    &LeaseId::new(chain_id),
-                    call,
-                    amount.as_deref(),
-                    destination.as_deref(),
-                ));
+            (Some(inputs), Some(chain_id)) => {
+                charges.extend(run_usage_charges(&LeaseId::new(chain_id), call, &inputs));
                 true
             }
             _ => false,
@@ -824,6 +929,7 @@ impl Pipeline {
                     usage: None,
                     usage_error: None,
                     hit: None,
+                    windows: Vec::new(),
                 };
             }
         };
@@ -878,26 +984,32 @@ impl Pipeline {
             usage_error: None,
             context,
             hit,
+            windows: Vec::new(),
         }
     }
 
     /// For a tool that keeps run usage (one the catalog marks destructive, design section
-    /// 3.5): the inputs its catalog entry names as `amount` and `destination`. `None` for any
+    /// 3.5, or gives an `outbound` input, read-side exfiltration design option d): the inputs
+    /// its catalog entry names as `amount`, `destination` and `outbound`. `None` for any
     /// other tool, and for every tool when the engine does not track usage
     /// ([`PolicyEngine::tracks_usage`]: no loaded policy reads `context.usage`, the catalog
     /// names no `amount` or `destination`, and `[policy] track_usage` is `"auto"`), so an
     /// allowed call then pays no usage write and its record carries no `usage`. A tool the
     /// engine knows nothing about, and a poisoned engine lock, count as destructive with
     /// neither input, as [`Self::matches_arguments`] does.
-    fn usage_inputs(&self, call: &ToolCall) -> Option<(Option<String>, Option<String>)> {
+    fn usage_inputs(&self, call: &ToolCall) -> Option<UsageInputs> {
         let attrs = match self.policy.read() {
             Ok(e) if !e.tracks_usage() => return None,
             Ok(e) => e.effective_attrs(&call.server, &call.tool),
             Err(_) => None,
         };
         match attrs {
-            None => Some((None, None)),
-            Some(a) if a.is_destructive() => Some((a.amount, a.destination)),
+            None => Some(UsageInputs::default()),
+            Some(a) if a.is_destructive() || a.has_outbound() => Some(UsageInputs {
+                amount: a.amount,
+                destination: a.destination,
+                outbound: a.outbound,
+            }),
             Some(_) => None,
         }
     }
@@ -1186,11 +1298,16 @@ impl Pipeline {
     /// content) and, unless the catalog marks the tool's output trusted ([`output_label`]),
     /// add a label `{source, decision_id, seq, at}` to the run's taint state and `spans` (the
     /// result's fingerprints) to the run's span index under the record's `seq`. A trusted
-    /// result's `spans` are dropped and its record says 0. Returns the record's `seq`. `Err`
-    /// (reason `label_error`) when any write fails; the caller must then withhold the result.
+    /// result's `spans` are dropped and its record says 0. Returns the record's `seq`.
     ///
     /// [`output_label`]: Self::output_label
     /// [`result_digest`]: super::result_digest
+    ///
+    /// # Errors
+    ///
+    /// [`REASON_LABEL_ERROR`] when the `tool_result` append fails, when the chain has no first hop
+    /// to name the run, or, for an untrusted result, when the run label or the span index cannot be
+    /// written; the caller must then withhold the result.
     #[allow(clippy::too_many_arguments)]
     pub fn record_result(
         &self,
@@ -1246,6 +1363,10 @@ impl Pipeline {
                 })?;
         }
         self.metrics.result_recorded(label);
+        // The proxy's `attenuo.record_result` span, carried onto this thread.
+        let span = tracing::Span::current();
+        span.record("attenuo.result.label", label.as_str());
+        span.record("attenuo.audit.seq", entry.seq);
         tracing::debug!(
             server = ?call.server,
             tool = ?call.tool,
@@ -1318,6 +1439,9 @@ impl Pipeline {
                     seq = entry.seq,
                     "request rejected"
                 );
+                // The proxy's `attenuo.stream_end` span, carried onto this thread; a no-op
+                // in any span that does not declare the field.
+                tracing::Span::current().record("attenuo.audit.seq", entry.seq);
                 true
             }
             Err(e) => {
@@ -1360,7 +1484,13 @@ impl Pipeline {
         }
     }
 
-    /// `Ok` when every lease in the chain is live; otherwise the reason code and details.
+    /// `Ok` when every lease in the chain is live.
+    ///
+    /// # Errors
+    ///
+    /// [`REASON_LEASE_ERROR`] with the store's message when the lease store cannot be read, and
+    /// otherwise, in this order of precedence, [`REASON_LEASE_REVOKED`], [`REASON_LEASE_EXPIRED`]
+    /// or [`REASON_LEASE_UNKNOWN`] with the ids of the leases concerned.
     pub fn check_leases(
         &self,
         chain: &DelegationChain,
@@ -1403,7 +1533,10 @@ pub(super) async fn on_blocking_pool<R: Send + 'static>(
     f: impl FnOnce(&Pipeline) -> R + Send + 'static,
 ) -> R {
     let pipeline = Arc::clone(pipeline);
-    match tokio::task::spawn_blocking(move || f(&pipeline)).await {
+    // Carry the caller's span and trace context, so the decision's spans and log lines are
+    // inside the request that asked for it (otel-export design, section 3.2).
+    let carry = crate::telemetry::Carry::capture();
+    match tokio::task::spawn_blocking(move || carry.run(|| f(&pipeline))).await {
         Ok(r) => r,
         Err(e) => std::panic::resume_unwind(e.into_panic()),
     }

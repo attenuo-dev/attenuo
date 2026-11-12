@@ -5,7 +5,7 @@
 //! The notifier (in `attenuo-server`) writes a row right after the approval change it
 //! describes was stored and recorded, delivers from its in-memory queue, and marks the row
 //! delivered or given up. On start it delivers the rows still open, in insertion order, reading
-//! them in batches no larger than its queue ([`SqliteLeaseStore::outbox_open_between`]).
+//! them in batches no larger than half its queue ([`SqliteLeaseStore::outbox_open_between`]).
 //! `event_id` is unique: it is derived from the approval id and the notice type, so a second
 //! notice of one type for one approval (an `approval.expired` found again
 //! after a restart) is refused here instead of being sent twice.
@@ -88,6 +88,12 @@ const OPEN: &str = "delivered_at IS NULL AND given_up_at IS NULL";
 impl SqliteLeaseStore {
     /// Store a notice to deliver. `Ok(None)` when a notice with this `event_id` is already
     /// stored (open, delivered or given up): it is not stored again.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or
+    /// [`AuditError::Sqlite`] when the insert fails. A duplicate `event_id` is `Ok(None)`, not an
+    /// error.
     pub fn outbox_insert(
         &self,
         n: NewNotice<'_>,
@@ -104,6 +110,11 @@ impl SqliteLeaseStore {
     }
 
     /// The open notices, oldest first, at most `limit`.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or
+    /// [`AuditError::Sqlite`] when the query fails or a row has the wrong shape.
     pub fn outbox_open(&self, limit: usize) -> Result<Vec<OutboxNotice>, AuditError> {
         let conn = self.conn.lock()?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
@@ -120,6 +131,11 @@ impl SqliteLeaseStore {
     /// none is dropped for lack of room in its queue, and never past the last row that was
     /// open at start (`through`, [`Self::outbox_last_open_id`]), so that a notice stored
     /// since, and queued directly, is not read a second time.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or
+    /// [`AuditError::Sqlite`] when the query fails or a row has the wrong shape.
     pub fn outbox_open_between(
         &self,
         after: i64,
@@ -139,6 +155,11 @@ impl SqliteLeaseStore {
     /// The row id of the newest open notice, or `None` when none is open. An open row is
     /// never pruned, and SQLite gives a new row an id above every id in the table, so a
     /// notice stored after this was read has a higher id.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or
+    /// [`AuditError::Sqlite`] when the query fails.
     pub fn outbox_last_open_id(&self) -> Result<Option<i64>, AuditError> {
         let conn = self.conn.lock()?;
         Ok(conn.query_row(
@@ -149,6 +170,11 @@ impl SqliteLeaseStore {
     }
 
     /// How many notices are open.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or
+    /// [`AuditError::Sqlite`] when the query fails.
     pub fn outbox_open_count(&self) -> Result<u64, AuditError> {
         let conn = self.conn.lock()?;
         let n: i64 = conn.query_row(
@@ -160,12 +186,22 @@ impl SqliteLeaseStore {
     }
 
     /// Mark notice `id` delivered. `false` when it was not open (already settled, or pruned).
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or
+    /// [`AuditError::Sqlite`] when the update fails. A notice that is not open is `Ok(false)`.
     pub fn outbox_delivered(&self, id: i64, now: OffsetDateTime) -> Result<bool, AuditError> {
         self.outbox_settle(id, "delivered_at", None, now)
     }
 
     /// Mark notice `id` given up after `attempts` failed attempts. `false` when it was not
     /// open.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or
+    /// [`AuditError::Sqlite`] when the update fails. A notice that is not open is `Ok(false)`.
     pub fn outbox_given_up(
         &self,
         id: i64,
@@ -195,6 +231,12 @@ impl SqliteLeaseStore {
     }
 
     /// Record a failed attempt of notice `id`: `attempts` so far, the next try at `next`.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or
+    /// [`AuditError::Sqlite`] when the update fails. A notice that is not open is left alone and is
+    /// `Ok(())`.
     pub fn outbox_retry(
         &self,
         id: i64,
@@ -214,6 +256,11 @@ impl SqliteLeaseStore {
     }
 
     /// Delete the notices delivered or given up before `before`. Returns how many.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or
+    /// [`AuditError::Sqlite`] when the delete fails.
     pub fn outbox_prune(&self, before: OffsetDateTime) -> Result<u64, AuditError> {
         let _gate = self.gate.hold();
         let conn = self.conn.lock()?;
@@ -225,6 +272,12 @@ impl SqliteLeaseStore {
     }
 
     /// The `id` of the open notice with `event_id`, if any (tests and tooling).
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or
+    /// [`AuditError::Sqlite`] when the query fails. No open notice with that `event_id` is
+    /// `Ok(None)`.
     pub fn outbox_open_id(&self, event_id: &str) -> Result<Option<i64>, AuditError> {
         let conn = self.conn.lock()?;
         Ok(conn
@@ -238,6 +291,13 @@ impl SqliteLeaseStore {
 
     /// Approvals still in state `pending` (expired or not), oldest first, at most `limit`.
     /// The notifier reads them at start to watch for their expiry again.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock,
+    /// [`AuditError::Sqlite`] when the query fails, or a row that cannot be read back as an
+    /// approval ([`AuditError::Storage`] for an unknown state or method, [`AuditError::TimeParse`]
+    /// for a bad timestamp).
     pub fn pending_approvals(&self, limit: usize) -> Result<Vec<Approval>, AuditError> {
         let conn = self.conn.lock()?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);

@@ -18,6 +18,19 @@ path = "src/lib.rs"
 name = "attenuo-server"
 path = "src/main.rs"
 
+[features]
+# OpenTelemetry trace export (`[telemetry]`). On by default, so the release binary and the
+# image carry it and export stays a config switch; `--no-default-features` builds a server
+# without the OpenTelemetry crates, which then refuses `[telemetry] enabled = true`.
+default = ["otel"]
+otel = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:opentelemetry-http",
+    "dep:tracing-opentelemetry",
+]
+
 [dependencies]
 attenuo-core = { workspace = true }
 attenuo-token = { workspace = true }
@@ -31,6 +44,7 @@ base64 = { workspace = true }
 clap = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }
+http-body = { workspace = true }
 jsonwebtoken = { workspace = true }
 reqwest = { workspace = true }
 ring = { workspace = true }
@@ -45,6 +59,11 @@ toml = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+opentelemetry-http = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
 uuid = { workspace = true }
 
 [dev-dependencies]

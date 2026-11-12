@@ -37,6 +37,7 @@ from cryptography.hazmat.primitives.serialization import (
 from attenuo import (
     AdminClient,
     ApiError,
+    ApprovalRequired,
     AsyncClient,
     BudgetLimit,
     Capability,
@@ -54,6 +55,7 @@ from attenuo import (
     Token,
     TokenRefresher,
     Unauthorized,
+    call_hash,
 )
 from attenuo.audit import entry_hash
 from attenuo.mcp import TokenAuth
@@ -183,11 +185,36 @@ def sse_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
     )
 
 
+@pytest.fixture(scope="module")
+def decimal_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
+    """The same stack with ``amount`` declared ``decimal`` for ``github/read_file`` and a policy
+    that refuses an amount of 100 or more."""
+    work = tmp_path_factory.mktemp("attenuo-it-decimal")
+    policy = work / "policy.cedar"
+    policy.write_text(
+        (DEMO / "policy.cedar").read_text()
+        + '\n@id("read_file_amount_below_100")\n'
+        + 'forbid(principal, action == Action::"github/read_file", resource)\n'
+        + 'when { context.input has amount && !context.input.amount.lessThan(decimal("100.0")) };\n'
+    )
+    yield from run_stack(
+        work,
+        policy=policy,
+        edits={
+            'inputs = { repo = "string", path = "string" }': (
+                'inputs = { repo = "string", path = "string", amount = "decimal" }'
+            )
+        },
+    )
+
+
 def run_stack(
     work: Path,
     token_section: str = "",
     issuer_key: Path | None = None,
     fake_args: list[str] | None = None,
+    policy: Path | None = None,
+    edits: Mapping[str, str] | None = None,
 ) -> Iterator[Stack]:
     built_server, built_fake = binaries()
     # Copy them: a shared CARGO_TARGET_DIR can be rebuilt under us mid-test.
@@ -202,9 +229,12 @@ def run_stack(
         .read_text()
         .replace("18080", str(ob_port))
         .replace("13001", str(mcp_port))
-        .replace("examples/github-leak-demo/policy.cedar", str(DEMO / "policy.cedar"))
+        .replace("examples/github-leak-demo/policy.cedar", str(policy or DEMO / "policy.cedar"))
         .replace("[audit]\n", f"{token_section.replace('{work}', str(work))}[audit]\n", 1)
     )
+    for old, new in (edits or {}).items():
+        assert old in config, f"not in the demo config: {old}"
+        config = config.replace(old, new, 1)
     if issuer_key is not None:
         config = config.replace(
             "[issuer]\n", f'[issuer]\nprivate_key_pem_path = "{issuer_key}"\n', 1
@@ -392,9 +422,11 @@ def test_github_leak_scenario(stack: Stack) -> None:
         ob.exchange(root, "reviewer", ["github:read_file"])
     assert unauthenticated.value.status == 401
 
-    # 11. A bad bearer is a 401, not a denial.
-    with pytest.raises(Unauthorized):
+    # 11. A bad bearer is a 401, not a denial, and says why.
+    with pytest.raises(Unauthorized) as bad_bearer:
         ob.call_tool("not.a.token", "github", "read_file", {"repo": "alice/public-docs"})
+    assert bad_bearer.value.reason == "invalid_token"
+    assert bad_bearer.value.decision_id is None  # a token that does not verify writes no record
 
     # 12. Revoke the root lease: the cascade takes the coder and the tester with it.
     revoked = admin.revoke_lease(root.lease, "agent session compromised")
@@ -407,8 +439,15 @@ def test_github_leak_scenario(stack: Stack) -> None:
     assert after.value.reason == "lease_revoked"
     with pytest.raises(Denied):
         ob.call_tool(tester, "github", "read_file", {"repo": "alice/public-docs"})
-    with pytest.raises(ApiError):
+    # A request without a per-call decision is a 401 that names the reason and its record.
+    with pytest.raises(Unauthorized) as listing:
+        ob.list_tools(tester, "github")
+    assert listing.value.reason == "lease_revoked"
+    assert listing.value.decision_id
+    with pytest.raises(ApiError) as renewal:
         ob.renew(coder)  # a revoked lease is final
+    assert (renewal.value.status, renewal.value.error) == (400, "invalid_grant")
+    assert renewal.value.decision_id
 
     # 13. The audit log has every decision, and its hash chain verifies.
     report = admin.audit_verify()
@@ -419,6 +458,10 @@ def test_github_leak_scenario(stack: Stack) -> None:
     assert by_id[policy_denied.value.decision_id].reason == "policy_deny"
     assert by_id[cap_denied.value.decision_id].reason == "capability_denied"
     assert by_id[after.value.decision_id].reason == "lease_revoked"
+    listed = by_id[listing.value.decision_id]
+    assert (listed.tool, listed.reason) == ("tools/list", "lease_revoked")
+    renew_record = by_id[renewal.value.decision_id]
+    assert (renew_record.tool, renew_record.reason) == ("lease.renew", "lease_revoked")
 
     # 14. Only the intended reads (one for the coder, one for the tester) reached upstream.
     assert len(stack.upstream_calls()) == 2
@@ -486,20 +529,31 @@ def test_dpop_bound_chain(stack: Stack) -> None:
 
     # The same token without the key: refused everywhere.
     with Client(stack.url) as thief:
+        # Every route says why the same way: `reason`, for the proxy as for REST routes.
         with pytest.raises(Unauthorized) as no_proof:
             thief.call_tool(coder, "github", "read_file", {"repo": "alice/public-docs"})
         assert no_proof.value.status == 401
+        assert no_proof.value.reason == "dpop_required"
+        with pytest.raises(Unauthorized) as no_proof_list:
+            thief.list_tools(coder, "github")
+        assert no_proof_list.value.reason == "dpop_required"
         with pytest.raises(Unauthorized) as renew:
             thief.renew(coder)
         assert renew.value.error == "dpop_required"
+        assert renew.value.reason == "dpop_required"
         with pytest.raises(Unauthorized) as exchange:
             thief.exchange(coder, "tester", ["github:read_file"], client_secret=TESTER_SECRET)
         assert exchange.value.error == "dpop_required"
+        assert exchange.value.reason == "dpop_required"
     # Another key does not help either.
     with Client(stack.url, dpop_key=DpopKey.generate()) as other:
         with pytest.raises(Unauthorized) as wrong_key:
             other.renew(coder)
         assert wrong_key.value.error == "invalid_dpop_proof"
+        assert wrong_key.value.reason == "invalid_dpop_proof"
+        with pytest.raises(Unauthorized) as wrong_key_call:
+            other.call_tool(coder, "github", "read_file", {"repo": "alice/public-docs"})
+        assert wrong_key_call.value.reason == "invalid_dpop_proof"
 
     # The audit log records the bound use.
     entries = admin.audit_tail(50)
@@ -559,6 +613,109 @@ def test_dpop_server_nonce(nonce_stack: Stack) -> None:
         assert r.status_code == 200, r.text
         assert "result" in r.json()
     admin.revoke_lease(root.lease)
+    admin.close()
+
+
+async def test_dpop_server_nonce_async(nonce_stack: Stack) -> None:
+    """The async client against the same server: its own nonce cache starts empty, so its first
+    call is refused, and the retry goes out on a new connection (see ``drop_connection``)."""
+    url = nonce_stack.url
+    key = DpopKey.generate()
+    with AdminClient(url, ADMIN_TOKEN) as admin:
+        root = admin.mint_root_dev(
+            "alice", "https://idp.example", "assistant", ["github:*"], dpop_key=key
+        )
+        async with AsyncClient(url, dpop_key=key) as ob:
+            res = await ob.call_tool(root, "github", "read_file", {"repo": "alice/public-docs"})
+            assert res.decision_id
+            assert (await ob.renew(root)).expires_in > 0
+        admin.revoke_lease(root.lease)
+
+
+def test_too_many_pending_approvals(stack: Stack) -> None:
+    """A run holds at most 32 pending approvals (SR-92). The next gated call is still
+    ``approval_required``, with no approval to wait for: ``approval_id`` is ``None`` in the
+    ``-32008`` and in the AuthZEN answer, and ``call_tool_with_approval`` raises at once."""
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    ob = Client(stack.url)
+    root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+
+    def issue(title: str) -> dict[str, Any]:
+        return {"repo": "alice/public-docs", "title": title}
+
+    ids = []
+    for n in range(32):
+        with pytest.raises(ApprovalRequired) as held:
+            ob.call_tool(root, "github", "create_issue", issue(f"t{n}"))
+        assert held.value.approval_id
+        ids.append(held.value.approval_id)
+
+    with pytest.raises(ApprovalRequired) as full:
+        ob.call_tool(root, "github", "create_issue", issue("one too many"))
+    assert full.value.reason == "approval_required" and full.value.decision_id
+    assert full.value.approval_id is None and full.value.expires_at is None
+    assert full.value.call_hash == call_hash("github", "create_issue", issue("one too many"))
+
+    told: list[ApprovalRequired] = []
+    with pytest.raises(ApprovalRequired) as again:
+        ob.call_tool_with_approval(
+            root, "github", "create_issue", issue("one too many"), on_approval=told.append
+        )
+    assert again.value.approval_id is None and told == []
+
+    verdict = ob.authzen_evaluate(root, "github", "create_issue", issue("also too many"))
+    assert not verdict and verdict.reason == "approval_required"
+    assert verdict.approval_id is None and verdict.expires_at is None
+    assert verdict.call_hash == call_hash("github", "create_issue", issue("also too many"))
+
+    # A repeat of a waiting call keeps its approval, in the -32008 and in AuthZEN.
+    with pytest.raises(ApprovalRequired) as repeat:
+        ob.call_tool(root, "github", "create_issue", issue("t7"))
+    assert repeat.value.approval_id == ids[7]
+    assert ob.authzen_evaluate(root, "github", "create_issue", issue("t7")).approval_id == ids[7]
+
+    # Deciding one makes room for the next.
+    admin.decline_approval(ids[0])
+    with pytest.raises(ApprovalRequired) as room:
+        ob.call_tool(root, "github", "create_issue", issue("one too many"))
+    assert room.value.approval_id and room.value.approval_id not in ids
+    admin.revoke_lease(root.lease)
+    ob.close()
+    admin.close()
+
+
+def test_decimal_catalog_input(decimal_stack: Stack) -> None:
+    """A ``decimal`` catalog input: the SDK sends the JSON number as given, the policy compares
+    it as a Cedar decimal, and a number with more than 4 fractional digits is refused with
+    ``input_type_mismatch`` by the proxy, AuthZEN and the dry run alike."""
+    url = decimal_stack.url
+    admin = AdminClient(url, ADMIN_TOKEN)
+    ob = Client(url)
+    root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+
+    def read(amount: Any) -> dict[str, Any]:
+        return {"repo": "alice/public-docs", "path": "README.md", "amount": amount}
+
+    for fine in (12.5, 99.9999, 0, 99):
+        assert ob.call_tool(root, "github", "read_file", read(fine)).decision_id
+        assert ob.authzen_evaluate(root, "github", "read_file", read(fine))
+    for over in (100, 100.0, 150.25):
+        with pytest.raises(Denied) as d:
+            ob.call_tool(root, "github", "read_file", read(over))
+        assert d.value.reason == "policy_deny"
+        assert ob.authzen_evaluate(root, "github", "read_file", read(over)).reason == "policy_deny"
+    for bad in (1.23456, "12.5"):
+        with pytest.raises(Denied) as d:
+            ob.call_tool(root, "github", "read_file", read(bad))
+        assert d.value.reason == "input_type_mismatch"
+        verdict = ob.authzen_evaluate(root, "github", "read_file", read(bad))
+        assert not verdict and verdict.reason == "input_type_mismatch"
+
+    assert admin.policy_evaluate("github", "read_file", read(12.5), token=root).decision == "allow"
+    dry = admin.policy_evaluate("github", "read_file", read(1.23456), token=root)
+    assert (dry.decision, dry.reason) == ("deny", "input_type_mismatch")
+    admin.revoke_lease(root.lease)
+    ob.close()
     admin.close()
 
 
@@ -885,6 +1042,9 @@ def test_dry_run_with_a_stated_budget_session_approval_and_usage(stack: Stack) -
     with pytest.raises(Denied) as over:
         ob.call_tool(coder, "github", "read_file", read)
     assert over.value.reason == "budget_exhausted"
+    # The refusal names the limit, as the dry run did.
+    assert over.value.limit == BudgetLimit(hop=1, kind="calls", used=2, arg=None, max=2)
+    assert over.value.data["limit"] == over.value.limit.to_json()
     admin.revoke_lease(root.lease)
     admin.close()
     ob.close()

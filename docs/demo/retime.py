@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Write a slowed-down copy of an asciicast v2 file, for rendering a readable GIF.
 
-The demos finish in about two seconds, too fast to read. This keeps every output event in
+The demos finish in well under a second, too fast to read. This keeps every output event in
 order and unchanged and replaces only the timestamps: a pause before each "== " section
 heading and each "$ " command, and none before the output that follows, so a command and
 its output land in one GIF frame (fewer frames, a smaller file). The input file is

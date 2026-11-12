@@ -17,7 +17,7 @@
  * answers `use_dpop_nonce`.
  */
 
-import { AttenuoError } from "./errors.js";
+import { AttenuoError, TransportError } from "./errors.js";
 import { b64urlDecode } from "./token.js";
 
 /** `typ` of a DPoP proof. */
@@ -228,6 +228,32 @@ export async function presented(
   if (key === undefined) return { authorization: `Bearer ${token}` };
   const opts = nonce === undefined ? {} : { nonce };
   return { authorization: `DPoP ${token}`, dpop: await key.proof(method, url, token, opts) };
+}
+
+/**
+ * Send the retry that follows a `use_dpop_nonce` refusal, and once more, unchanged, when `fetch`
+ * fails at the network level (a `TypeError`, such as undici's "other side closed").
+ *
+ * The refusal usually goes out before the server has read the request body, and the server then
+ * closes that keep-alive connection right after the 401 without saying so (no
+ * `Connection: close`). `fetch` puts the retry on the pooled connection unless the close has
+ * already reached it, so now and then the retry meets the close and fails. `send` must make the
+ * same request with the same headers each time, so the same DPoP proof: if the server did get
+ * the first copy, its `jti` is used and the second is refused as a replay, never acted on twice.
+ * The client's own requests throw that `TypeError` wrapped in a `TransportError`, which is resent
+ * the same way. An abort or a timeout (a `DOMException`, or a `TransportError` around one) is not
+ * resent.
+ */
+export async function resendOnce(send: () => Promise<Response>): Promise<Response> {
+  try {
+    return await send();
+  } catch (e) {
+    // The SDK's own requests wrap the `TypeError` in a `TransportError` (its `cause`).
+    const network =
+      e instanceof TypeError || (e instanceof TransportError && e.cause instanceof TypeError);
+    if (!network) throw e;
+    return send();
+  }
 }
 
 /** The latest `DPoP-Nonce` a server sent (RFC 9449 §8), for the next proof. */

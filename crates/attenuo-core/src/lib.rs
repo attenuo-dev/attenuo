@@ -9,6 +9,8 @@
 //! - [`limits`]: run limits on a capability (`calls`, `sum`, `calls_per`, `distinct`) and the
 //!   charges a call makes against them (ADR-0010).
 //! - [`clock`]: the time source of TTL and window checks, injectable for tests.
+//! - [`windows`]: per-user windows across runs (run limits phase 3), read by policies as
+//!   `context.usage.user_window`.
 //! - [`names`]: what server and tool names may contain (one rule for every boundary).
 //! - [`fingerprint`]: fingerprints of results and arguments for argument-level taint
 //!   (ADR-0009, phase 2).
@@ -44,6 +46,7 @@ pub mod jcs;
 pub mod jsonrpc;
 pub mod limits;
 pub mod names;
+pub mod windows;
 
 pub use call::ToolCall;
 pub use capability::{as_long, ArgConstraint, Capability, CapabilitySet, RangeError};
@@ -51,10 +54,11 @@ pub use chain::{AgentId, DelegationChain, Hop, LeaseId, OriginatingUser};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use decision::{
     chain_id_of, ApprovalInfo, BudgetCharge, Decision, DecisionRecord, OutputLabel, RecordBudget,
-    RecordKind, RecordLabels, RecordUsage, ResultInfo, UntrustedArg, UntrustedKind,
-    REASON_APPROVAL_DECLINED, REASON_APPROVAL_GRANTED, REASON_APPROVAL_INVALID,
-    REASON_APPROVAL_REQUESTED, REASON_TOOL_RESULT,
+    RecordKind, RecordLabels, RecordUsage, RecordUserWindow, RecordWindow, ResultInfo,
+    UntrustedArg, UntrustedKind, REASON_APPROVAL_DECLINED, REASON_APPROVAL_GRANTED,
+    REASON_APPROVAL_INVALID, REASON_APPROVAL_REQUESTED, REASON_TOOL_RESULT,
 };
 pub use error::{AttenuationError, ChainError};
 pub use limits::{ArgLimit, Charge, Derive, LimitKind, Limits};
 pub use names::{NameError, NameKind};
+pub use windows::{WindowCharge, WindowKind, WindowMeasure};

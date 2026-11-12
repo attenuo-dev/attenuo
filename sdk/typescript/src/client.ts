@@ -5,7 +5,14 @@
  */
 
 import type { CapabilityLike } from "./capability.js";
-import { DpopKey, NonceCache, exchangeProofs, presented, type DpopKeyLike } from "./dpop.js";
+import {
+  DpopKey,
+  NonceCache,
+  exchangeProofs,
+  presented,
+  resendOnce,
+  type DpopKeyLike,
+} from "./dpop.js";
 import { META_APPROVAL_KEY } from "./approval.js";
 import { ApprovalNotGrantedError, ApprovalRequiredError, AttenuoError } from "./errors.js";
 import { Http, type HttpOptions } from "./http.js";
@@ -132,16 +139,13 @@ export class AttenuoClient {
     method = "POST",
     signal?: AbortSignal,
   ): Promise<Response> {
-    const send = async () =>
-      this.http.request(method, path, {
-        headers: await headers(this.nonce.value),
-        json,
-        ...(signal ? { signal } : {}),
-      });
-    let res = await send();
+    const send = (h: Record<string, string>) =>
+      this.http.request(method, path, { headers: h, json, ...(signal ? { signal } : {}) });
+    let res = await send(await headers(this.nonce.value));
     if ((await this.dpopKey()) !== undefined && (await this.nonce.update(res))) {
       await res.body?.cancel();
-      res = await send();
+      const h = await headers(this.nonce.value);
+      res = await resendOnce(() => send(h));
       await this.nonce.update(res);
     }
     return res;

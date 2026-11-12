@@ -1,5 +1,6 @@
 /** DPoP (RFC 9449, SR-24): keys, proofs, and the clients putting them on the wire. */
 
+import { createServer, type AddressInfo, type Socket } from "node:net";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   accessTokenHash,
@@ -9,6 +10,7 @@ import {
   mcpFetch,
   AttenuoClient,
   AttenuoError,
+  TransportError,
 } from "../src/index.js";
 import { jsonResponse, mockFetch, rpcOk, Signer, tokenResponse, type Seen } from "./helpers.js";
 
@@ -349,6 +351,135 @@ describe("DPoP server nonces", () => {
     await admin.mintRootDev("alice", "https://idp", "planner", { dpopKey: key });
     expect(tok.dpopJkt).toBe(key.thumbprint);
     expect(server.state.seen).toEqual([undefined, "n-1", "n-1"]);
+  });
+
+  it("resends the retry once, with the same proof, when the connection drops", async () => {
+    const key = await DpopKey.generate();
+    const child = await bound(key.thumbprint, ["planner", "coder"]);
+    const server = nonceServer(okForEveryRoute(child));
+    let dropped = 0;
+    const { fetch, calls } = mockFetch((seen) => {
+      // The retry lands on the connection the server is closing after its refusal.
+      if (calls.length === 2 && dropped++ === 0) throw new TypeError("fetch failed");
+      return server.handler(seen);
+    });
+    const ob = new AttenuoClient(BASE, { fetch, dpopKey: key });
+    await ob.callTool(child, "github", "read_file");
+    expect(calls).toHaveLength(3);
+    const [, retry, resent] = calls as [Seen, Seen, Seen];
+    expect(resent.headers.get("dpop")).toBe(retry.headers.get("dpop"));
+    expect((await verify(resent.headers.get("dpop"))).claims.nonce).toBe("n-1");
+    expect(resent.body).toEqual(retry.body);
+
+    // mcpFetch and the root mint do the same.
+    for (const run of [
+      () =>
+        mcpFetch(() => "a.b.c", { dpopKey: key, fetch })(`${BASE}/mcp/github`, {
+          method: "POST",
+          body: JSON.stringify({ id: 1 }),
+        }),
+      () =>
+        new AdminClient(BASE, "adm", { fetch }).mintRootDev("alice", "https://idp", "planner", {
+          dpopKey: key,
+        }),
+    ]) {
+      calls.length = 0;
+      dropped = 0;
+      await run();
+      expect(calls).toHaveLength(3);
+      expect(calls[2]!.headers.get("dpop")).toBe(calls[1]!.headers.get("dpop"));
+    }
+  });
+
+  it("does not resend the first request, a second drop or an abort", async () => {
+    const key = await DpopKey.generate();
+    const child = await bound(key.thumbprint, ["planner", "coder"]);
+    const server = nonceServer(okForEveryRoute(child));
+    let fail: (() => never) | undefined = () => {
+      throw new TypeError("fetch failed");
+    };
+    const { fetch, calls } = mockFetch((seen) => (fail ? fail() : server.handler(seen)));
+    const ob = new AttenuoClient(BASE, { fetch, dpopKey: key });
+    // The client wraps fetch's TypeError in a TransportError (its cause).
+    const first = await ob.callTool(child, "github", "read_file").catch((e: unknown) => e);
+    expect(first).toBeInstanceOf(TransportError);
+    expect((first as TransportError).cause).toBeInstanceOf(TypeError);
+    expect(calls).toHaveLength(1);
+
+    fail = undefined;
+    calls.length = 0;
+    const drops = mockFetch((seen) => {
+      if (drops.calls.length >= 2) throw new TypeError("fetch failed");
+      return server.handler(seen);
+    });
+    const ob2 = new AttenuoClient(BASE, { fetch: drops.fetch, dpopKey: key });
+    const second = await ob2.callTool(child, "github", "read_file").catch((e: unknown) => e);
+    expect(second).toBeInstanceOf(TransportError);
+    expect((second as TransportError).cause).toBeInstanceOf(TypeError);
+    expect(drops.calls).toHaveLength(3);
+
+    const aborts = mockFetch((seen) => {
+      if (aborts.calls.length === 2) throw new DOMException("aborted", "AbortError");
+      return server.handler(seen);
+    });
+    const ob3 = new AttenuoClient(BASE, { fetch: aborts.fetch, dpopKey: key });
+    await expect(ob3.callTool(child, "github", "read_file")).rejects.toThrow("aborted");
+    expect(aborts.calls).toHaveLength(2);
+  });
+
+  it("gets the retry through a server that closes the refused connection", async () => {
+    // Like attenuo-server: the 401 goes out before the body is read, and the connection is
+    // closed a moment later without `Connection: close`.
+    const nonces: (string | undefined)[] = [];
+    let connections = 0;
+    const srv = createServer((sock: Socket) => {
+      connections++;
+      let buf = "";
+      const onData = (d: Buffer) => {
+        buf += d.toString("latin1");
+        const end = buf.indexOf("\r\n\r\n");
+        if (end < 0) return;
+        sock.off("data", onData);
+        const proof = buf
+          .slice(0, end)
+          .split("\r\n")
+          .find((l) => l.toLowerCase().startsWith("dpop:"))!
+          .slice(5)
+          .trim();
+        const claims = JSON.parse(
+          Buffer.from(proof.split(".")[1]!, "base64url").toString(),
+        ) as Json;
+        nonces.push(claims.nonce as string | undefined);
+        if (claims.nonce !== "n-1") {
+          const body = '{"error":"use_dpop_nonce"}';
+          sock.write(
+            "HTTP/1.1 401 Unauthorized\r\n" +
+              'www-authenticate: DPoP error="use_dpop_nonce"\r\ndpop-nonce: n-1\r\n' +
+              `content-type: application/json\r\ncontent-length: ${body.length}\r\n\r\n${body}`,
+          );
+          setTimeout(() => sock.destroy(), 300);
+        } else {
+          sock.end("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}");
+        }
+      };
+      sock.on("data", onData);
+    });
+    await new Promise<void>((ok) => srv.listen(0, "127.0.0.1", ok));
+    try {
+      const { port } = srv.address() as AddressInfo;
+      const f = mcpFetch(() => "a.b.c", { dpopKey: await DpopKey.generate() });
+      const r = await f(`http://127.0.0.1:${port}/mcp/github`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id: 1 }),
+      });
+      expect(r.status).toBe(200);
+      // The retry went out on the closing connection, unread; its resend on a new one.
+      expect(nonces).toEqual([undefined, "n-1"]);
+      expect(connections).toBe(2);
+    } finally {
+      srv.close();
+    }
   });
 
   it("puts a nonce in a proof only when given", async () => {
