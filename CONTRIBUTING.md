@@ -133,7 +133,7 @@ A change is done when all of the following hold:
 3. Public items have doc comments; new configuration or CLI flags are documented.
 4. `CHANGELOG.md` has an entry under `Unreleased` if the change is visible to users (new feature, behaviour change, fix, security fix).
 5. An ADR or RFC exists for any design decision the change embodies, and its status is updated if the change implements it.
-6. The task is moved on `docs/tasks/board.md` and, if you keep one, a line is added to today's file in `docs/log/`.
+6. The task is moved on `docs/tasks/board.md` if it is on the board. The durable record of a change is its `CHANGELOG.md` entry and its pull request description, so say there what changed and why.
 7. Commits are signed off and in conventional form; the PR has at least one maintainer approval.
 
 ## Releases
@@ -150,8 +150,7 @@ Maintainers only. Versions follow [SemVer 2.0](https://semver.org/). Pre-1.0, a 
 
    Also update `Cargo.lock` (`cargo update --workspace`): the step does not compare it, but the later steps build with `--locked` and fail on a stale lockfile.
 3. Merge, then tag the merge commit `vX.Y.Z` (annotated, signed if you have a key) and push the tag. `.github/workflows/release.yml` builds `attenuo` and `attenuo-server` for Linux (musl, x86_64 and aarch64) and macOS (arm64, x86_64), pushes a signed multi-arch image to GHCR (cosign keyless, SBOM attached), and opens a **draft** GitHub release with the archives, `SHA256SUMS` and the git-cliff changelog section. Review the draft and publish it by hand. It needs only the automatic `GITHUB_TOKEN`; set the GHCR package to public after the first push.
-4. For the first public release, work through the [launch checklist](docs/launch-checklist.md).
-5. Crate publishing to crates.io is manual until the public API settles; the plan is to adopt release-plz once it does.
+4. Crate publishing to crates.io is manual until the public API settles; the plan is to adopt release-plz once it does.
 
 ## AI-assisted contributions
 

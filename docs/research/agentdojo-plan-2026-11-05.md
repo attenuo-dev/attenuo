@@ -585,7 +585,7 @@ This adds the `confirm_untrusted_args` rule from `replay.args_policy(False)` to 
 | Sonnet, A2 | 6/10 | 65/140 | 26 | $4.66 |
 | Sonnet, `args`, cut off | 6/10 | 56/112 | 23 | $3.64 |
 
-On the 112 pairs both Sonnet runs finished, `args` and A2 each finished 56, with 23 and 21 refused. The Sonnet run stopped when the API credit ran out.
+On the 112 pairs both Sonnet runs finished, `args` and A2 each finished 56, with 23 and 21 refused. The Sonnet run stopped before it finished.
 
 | Attack-run calls | Allowed | Denied by capability | Denied by policy | Sent to approval |
 | --- | --- | --- | --- | --- |
@@ -735,9 +735,7 @@ All 63 refusals are category `cyber`. So the refusals follow the attacker's goal
 
 ## Decisions needed
 
-Spend so far is **$171.96 by the Console, and the API credit is used up**: the account shows $3.46 unpaid, and the API refuses calls until funds are added. No payment method is on file and the credit was promotional, so nothing was charged.
-
-Our meter says $99.03, so it missed $72.93. All costs in this document come from that meter, and any cost for a model other than Haiku may be low by a factor of about 1.8. The caps we set also rested on it, which is how spending passed the $120 limit set for this work. The Console's cost and usage pages list only Haiku, at $7.42 and 60.5M input tokens, which is close to our meter's $7.16 and 58.6M. They don't list the other models at all, so we can't tell where the difference comes from. It could be rates higher than the table we priced from, or something we don't count. Treat relative costs between runs of one model as usable, and absolute costs above as lower bounds.
+The provider's Console puts the cost of all runs so far at **$171.96**. Our meter says $99.03, so it missed $72.93. All costs in this document come from that meter, and any cost for a model other than Haiku may be low by a factor of about 1.8. The spending caps we set for the runs also rested on it, so actual spending ran past them. The Console's cost and usage pages list only Haiku, at $7.42 and 60.5M input tokens, which is close to our meter's $7.16 and 58.6M. They don't list the other models at all, so we can't tell where the difference comes from. It could be rates higher than the table we priced from, or something we don't count. Treat relative costs between runs of one model as usable, and absolute costs above as lower bounds.
 
 1. Whether any more baseline spending helps. No attack succeeded on four models with this attack, and on Haiku with a stronger one too. Attacks that adapt to the model are a separate research effort, and more runs of stock attacks are unlikely to change this.
 2. Whether to report the refusal result. It can now be stated, narrowly. With default settings, on Opus 5.5 and these workspace tasks, an injection stopped the user's task in about 60% of runs under [three attacks](#refusals-fallback-and-a-second-attack), without the attack succeeding, and the attack success rate doesn't show this. Refusals follow goals that send data out, not the template. With the refusal fallback, nearly all those runs finished, on an older model, and no attack succeeded. It rests on one model at this rate, one run per pair and a partial third run. Other models and suites are unmeasured.

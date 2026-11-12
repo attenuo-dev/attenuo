@@ -7,7 +7,8 @@ Catches the things that crept in before the first public release:
 - personal identifiers and references to the maintainer's private notes;
 - the project's old name outside the files that record the rename;
 - `<domain>`-style contact placeholders, beyond the known pending ones;
-- files that must never be committed (exported reading guides);
+- files that must never be committed (exported reading guides, daily working logs under
+  docs/log/, the pre-release launch checklist);
 - pages under docs/ that are personal planning, listed in docs/SUMMARY.md;
 - an ADR whose front matter or status line has an unknown status;
 - a security review pass under docs/research/ that README.md does not link.
@@ -24,9 +25,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 # Files that may name the old project name: they record the rename itself, or are
-# dated records (logs, review passes, benchmark outputs) written before it.
+# dated records (review passes, benchmark outputs) written before it.
 OLD_NAME_OK = re.compile(
-    r"^(docs/log/|docs/research/|docs/design/bench/|docs/design/rename-plan\.md$"
+    r"^(docs/research/|docs/design/bench/|docs/design/rename-plan\.md$"
     r"|scripts/(test_)?rename\.py$|CHANGELOG\.md$|docs/release/0\.1\.0\.md$|\.gitleaks\.toml$)"
 )
 OLD_NAME = re.compile(r"onbehalf", re.IGNORECASE)
@@ -38,10 +39,17 @@ PLACEHOLDER = re.compile(r"[a-z]+@<domain>")
 # Placeholders the maintainer still has to fill in; each needs a real address first.
 PLACEHOLDER_PENDING: set[str] = set()
 # Pages that talk about the placeholder rather than use it.
-PLACEHOLDER_MENTION_OK = re.compile(r"^(docs/log/|docs/research/|docs/launch-checklist\.md$)")
+PLACEHOLDER_MENTION_OK = re.compile(r"^docs/research/")
 
-NEVER_TRACKED = re.compile(r"^docs/guide/flight-guide-")
-PRIVATE_PAGES = ("project/research-readiness-plan.md", "brief/attenuo-one-page.md")
+# Exported reading guides; the daily working logs and the launch checklist, which left the
+# repository before it went public (the CHANGELOG and pull request descriptions are the record).
+NEVER_TRACKED = re.compile(r"^(docs/guide/flight-guide-|docs/log/|docs/launch-checklist\.md$)")
+PRIVATE_PAGES = (
+    "project/research-readiness-plan.md",
+    "brief/attenuo-one-page.md",
+    "launch-checklist.md",
+    "](log/",
+)
 ADR_STATUSES = {"proposed", "accepted", "rejected", "deprecated", "superseded"}
 
 TEXT_SUFFIXES = {
@@ -62,7 +70,7 @@ def main() -> int:
 
     for rel in files:
         if NEVER_TRACKED.search(rel):
-            problems.append(f"{rel}: must never be committed (see .gitignore)")
+            problems.append(f"{rel}: must never be committed (working notes or an exported guide)")
             continue
         path = ROOT / rel
         if path.suffix not in TEXT_SUFFIXES or not path.is_file():
