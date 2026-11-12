@@ -176,7 +176,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo check --workspace --all-targets --locked
+      # `+<version>`: rust-toolchain.toml pins the release CI otherwise uses, and it takes
+      # precedence over the toolchain the step above made the default.
+      - run: cargo +${{ steps.msrv.outputs.version }} check --workspace --all-targets --locked
 
   deny:
     name: cargo deny

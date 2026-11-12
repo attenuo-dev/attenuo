@@ -70,12 +70,21 @@ jobs:
             os: macos-latest # cross-compiled with the Xcode SDK
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The release rust-toolchain.toml pins, read from the file so the two cannot differ (the
+      # file wins over the action's default anyway, and the target must be added to it).
+      - name: Read the pinned toolchain
+        id: toolchain
+        shell: bash
+        run: |
+          v="$(sed -n -E 's/^channel *= *"([^"]+)".*/\1/p' rust-toolchain.toml | head -n1)"
+          test -n "$v" || { echo "no channel in rust-toolchain.toml" >&2; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
       # Pinned to a commit of the `stable` branch, so the toolchain is named explicitly. No
       # cargo cache: release builds start clean, so nothing another workflow saved can end up
       # in a signed artifact.
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: stable
+          toolchain: ${{ steps.toolchain.outputs.version }}
           targets: ${{ matrix.target }}
       - name: Install musl tools
         if: matrix.musl

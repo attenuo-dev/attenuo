@@ -48,7 +48,7 @@ If you change the admin console (`crates/attenuo-server/ui/`), run `scripts/cons
 
 The Python SDK tests (`cd sdk/python && pytest -rf`, and `ATTENUO_INTEGRATION=1 pytest -rf -m integration` for the real-server tests) are run with `-rf` so that the name of a failing test is in the summary; see [sdk/python/README.md](sdk/python/README.md).
 
-`rustfmt.toml` and `clippy.toml` in the repo root carry the project settings, so `cargo fmt` and `cargo clippy` pick them up without flags. `rust-toolchain.toml` selects the stable channel. It is not pinned to an exact release, so a new stable clippy can flag code that passed before; CI uses the same channel.
+`rustfmt.toml` and `clippy.toml` in the repo root carry the project settings, so `cargo fmt` and `cargo clippy` pick them up without flags. `rust-toolchain.toml` pins the exact stable release CI, the release builds and the Dockerfile use (1.99.1), with `rustfmt` and `clippy`; rustup installs it on first use in the repository. A new stable is adopted in its own pull request that bumps `channel` there, the `RUST_VERSION` of the Dockerfile's base image, and fixes what the new clippy and rustdoc find. Nightly-only work names its toolchain (`cargo +nightly fuzz ...`), which overrides the file; so does the MSRV check (`cargo +1.89 check`).
 
 ## Previewing the documentation site
 
