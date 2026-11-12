@@ -65,6 +65,8 @@ pub(crate) mod early_close;
 pub mod error;
 pub(crate) mod idp;
 pub(crate) mod issuer_keys;
+// Used by `main` and the integration tests.
+pub mod logging;
 // Used by the integration tests.
 pub mod metrics;
 // Used by the integration tests.

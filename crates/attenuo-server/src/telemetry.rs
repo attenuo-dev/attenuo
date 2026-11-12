@@ -1,11 +1,11 @@
 //! OpenTelemetry trace export (`[telemetry]`, `docs/design/otel-export.md`, ADR-0012).
 //!
 //! Off by default. When `[telemetry] enabled = true`, the subscriber [`init`] installs has two
-//! layers: the log (the `fmt` layer under `RUST_LOG`, as before) and an OpenTelemetry layer
-//! that sees only spans in the [`OTEL_TARGET`] target. Those spans are built with the fields
-//! of the design's allow-list (section 3.3) and nothing else, so nothing a log line carries (a
-//! subject, an error string, a verifier detail) can reach the collector: enforcement is by
-//! construction, not by scrubbing. No span event and no log record is exported.
+//! layers: the log (the `fmt` layer under `RUST_LOG` in the `[logging]` format, as before)
+//! and an OpenTelemetry layer that sees only spans in the [`OTEL_TARGET`] target. Those spans
+//! are built with the fields of the design's allow-list (section 3.3) and nothing else, so
+//! nothing a log line carries (a subject, an error string, a verifier detail) can reach the
+//! collector: enforcement is by construction, not by scrubbing. No span event and no log record is exported.
 //!
 //! **What is exported.** One trace per proxied MCP request: `mcp.request` (server kind), with
 //! `attenuo.authenticate`, `attenuo.session_gate`, one `attenuo.decide` per decided message
@@ -748,19 +748,18 @@ pub async fn trace_route(
     response
 }
 
-/// The subscriber's log layer: the `fmt` layer under `RUST_LOG` (default `info`), which never
-/// sees spans in [`OTEL_TARGET`], so log lines read as they did without telemetry.
+/// The subscriber's log layer in the text format, on standard output, with colour when that
+/// is a terminal ([`crate::logging::layer`]). [`init`] picks the format from `[logging]`.
 pub fn log_layer<S>() -> impl tracing_subscriber::Layer<S> + Send + Sync
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
-    use tracing_subscriber::filter::FilterExt;
-    use tracing_subscriber::Layer;
-    let env = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt::layer().with_filter(env.and(tracing_subscriber::filter::filter_fn(
-        |m| m.target() != OTEL_TARGET,
-    )))
+    use crate::logging::{ansi_for_stdout, layer, LogFormat};
+    layer(
+        LogFormat::Text,
+        ansi_for_stdout(LogFormat::Text),
+        std::io::stdout,
+    )
 }
 
 /// What [`init`] leaves running: the tracer provider, flushed by [`TelemetryGuard::shutdown`].
@@ -793,20 +792,29 @@ impl TelemetryGuard {
     }
 }
 
-/// Install the process's subscriber: the log layer, and when `[telemetry]` resolves to
+/// Install the process's subscriber: the log layer in the format `[logging]` and
+/// `ATTENUO_LOG_FORMAT` select ([`crate::logging`]), and when `[telemetry]` resolves to
 /// [`TraceSettings`], the OpenTelemetry layer with the OTLP/HTTP exporter. Call once, from
 /// inside the tokio runtime (the exporter sends its requests on it).
 ///
 /// # Errors
 ///
-/// An invalid `[telemetry]` section (see [`TelemetrySection::resolve_with`]), a failure to
-/// build the exporter, or a global subscriber already installed. An unreachable collector is
-/// not an error.
-pub fn init(section: &TelemetrySection) -> anyhow::Result<TelemetryGuard> {
+/// An unknown `ATTENUO_LOG_FORMAT`, an invalid `[telemetry]` section (see
+/// [`TelemetrySection::resolve_with`]), a failure to build the exporter, or a global
+/// subscriber already installed. An unreachable collector is not an error.
+pub fn init(
+    logging: &crate::logging::LoggingSection,
+    section: &TelemetrySection,
+) -> anyhow::Result<TelemetryGuard> {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
+    let format = logging.resolve_format()?;
     let settings = section.resolve()?;
-    let registry = tracing_subscriber::registry().with(log_layer());
+    let registry = tracing_subscriber::registry().with(crate::logging::layer(
+        format,
+        crate::logging::ansi_for_stdout(format),
+        std::io::stdout,
+    ));
     #[cfg(feature = "otel")]
     if let Some(settings) = settings {
         let exporter = otel::otlp_exporter(&settings, tokio::runtime::Handle::current())?;

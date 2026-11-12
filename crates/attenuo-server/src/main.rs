@@ -1,7 +1,8 @@
 //! `attenuo-server --config <file>` (or `ATTENUO_CONFIG=<file>`).
 //!
-//! Logging is controlled by `RUST_LOG` (default `info`). `[telemetry]` adds OpenTelemetry
-//! trace export over OTLP/HTTP ([`attenuo_server::telemetry`]).
+//! Logging is controlled by `RUST_LOG` (default `info`), its format by `[logging]` and
+//! `ATTENUO_LOG_FORMAT` ([`attenuo_server::logging`]). `[telemetry]` adds OpenTelemetry trace
+//! export over OTLP/HTTP ([`attenuo_server::telemetry`]).
 
 #![warn(missing_docs)]
 #![warn(unreachable_pub)]
@@ -31,9 +32,10 @@ async fn main() -> anyhow::Result<()> {
         })?;
     let mut config = Config::load(&path)?;
     config.apply_env();
-    // The subscriber needs `[telemetry]`, so it is installed once the file is read. A bad
-    // `[telemetry]` section stops the server here; an unreachable collector does not.
-    let telemetry = attenuo_server::telemetry::init(&config.telemetry)?;
+    // The subscriber needs `[logging]` and `[telemetry]`, so it is installed once the file is
+    // read. An unknown log format or a bad `[telemetry]` section stops the server here; an
+    // unreachable collector does not.
+    let telemetry = attenuo_server::telemetry::init(&config.logging, &config.telemetry)?;
     tracing::info!(config = %path.display(), "config loaded");
     let res = attenuo_server::serve(config).await;
     // After the request drain: give queued spans a bounded moment to leave the host.

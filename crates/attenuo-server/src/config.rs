@@ -108,6 +108,9 @@ pub struct Config {
     /// ([`crate::telemetry::TelemetrySection`]).
     #[serde(default)]
     pub telemetry: crate::telemetry::TelemetrySection,
+    /// `[logging]`: the log format and subject redaction ([`crate::logging::LoggingSection`]).
+    #[serde(default)]
+    pub logging: crate::logging::LoggingSection,
 }
 
 /// `[authzen]`

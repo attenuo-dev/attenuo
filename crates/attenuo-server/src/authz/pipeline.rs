@@ -132,6 +132,8 @@ pub struct Pipeline {
     /// Tests: run in a decision between the run-state stage and the policy stage.
     #[cfg(test)]
     pub(super) mid_decision_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// `[logging] redact_subjects`: how the decision and rejection log lines name the user.
+    subject_log: attenuo_proxy::SubjectLog,
 }
 
 /// The lookups [`Pipeline::arg_taint`] makes for a call: one probe per distinct fingerprint of
@@ -225,6 +227,7 @@ impl Pipeline {
             user_locks: (0..USER_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
             approval_notifier: None,
             subject_digest: None,
+            subject_log: attenuo_proxy::SubjectLog::clear(),
             #[cfg(test)]
             mid_decision_hook: Mutex::new(None),
         }
@@ -340,6 +343,19 @@ impl Pipeline {
     pub fn with_subject_digest(mut self, digest: crate::telemetry::SubjectDigest) -> Self {
         self.subject_digest = Some(digest);
         self
+    }
+
+    /// Write user subjects into log lines as `log` says (`[logging] redact_subjects`). The
+    /// audit records keep the subject either way.
+    pub fn with_subject_log(mut self, log: attenuo_proxy::SubjectLog) -> Self {
+        self.subject_log = log;
+        self
+    }
+
+    /// How user subjects appear in log lines, for every log site that names one: the
+    /// pipeline's, the routes' and, through the authorizer, the proxy's.
+    pub fn subject_log(&self) -> &attenuo_proxy::SubjectLog {
+        &self.subject_log
     }
 
     /// Report decisions and audit failures to a shared [`Metrics`] instead of a private one.
@@ -700,7 +716,7 @@ impl Pipeline {
                 tracing::info!(
                     decision = ?record.decision,
                     reason = ?record.reason,
-                    subject = ?record.originating_subject,
+                    subject = ?self.subject_log.show(&record.originating_subject),
                     agent = ?chain.current_agent().map(|a| a.0.as_str()).unwrap_or(""),
                     server = ?call.server,
                     tool = ?call.tool,
@@ -1404,7 +1420,7 @@ impl Pipeline {
             Ok(entry) => {
                 tracing::info!(
                     reason = ?reason,
-                    subject = ?chain.originating_user.subject,
+                    subject = ?self.subject_log.show(&chain.originating_user.subject),
                     server = ?call.server,
                     tool = ?call.tool,
                     seq = entry.seq,

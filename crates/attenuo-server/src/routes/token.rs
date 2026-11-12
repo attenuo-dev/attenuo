@@ -547,7 +547,10 @@ fn exchange_verified(
     }
     tracing::info!(
         // Caller-controlled strings are Debug-formatted (SR-18).
-        subject = ?issued.chain.originating_user.subject,
+        subject = ?state
+            .pipeline
+            .subject_log()
+            .show(&issued.chain.originating_user.subject),
         actor = ?req.actor,
         actor_auth,
         actor_subject = ?actor.map(|(v, _)| v.subject.as_str()),

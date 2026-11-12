@@ -240,7 +240,7 @@ fn decide(
         approval = %a.id,
         outcome = if grant { "grant" } else { "decline" },
         by = approver.method.by(),
-        approver = ?approver.subject,
+        approver = ?state.pipeline.subject_log().show(&approver.subject),
         tool = ?a.tool,
         "approval decided"
     );

@@ -167,7 +167,7 @@ fn mint_root_sync(
         return Err(e);
     }
     tracing::warn!(
-        subject = ?req.subject,
+        subject = ?state.pipeline.subject_log().show(&req.subject),
         agent = ?req.agent,
         lease = %issued.lease.0,
         "dev root token minted (no user credential verified)"

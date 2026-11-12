@@ -220,11 +220,19 @@ impl AppState {
         let trace = trace_settings
             .as_ref()
             .map(|s| Arc::new(crate::telemetry::ServerTrace::new(s)));
-        if trace.is_some() {
-            // Keyed like the DPoP nonces, by the issuer's private key (open question 5).
-            pipeline = pipeline.with_subject_digest(crate::telemetry::SubjectDigest::derive(
-                issuer.private_key_pem().as_bytes(),
-            ));
+        if trace.is_some() || config.logging.redact_subjects {
+            // Keyed like the DPoP nonces, by the issuer's private key (open question 5). The
+            // log lines use the same digest as the exported span, so the two can be matched.
+            let digest =
+                crate::telemetry::SubjectDigest::derive(issuer.private_key_pem().as_bytes());
+            if config.logging.redact_subjects {
+                let d = digest.clone();
+                pipeline = pipeline
+                    .with_subject_log(attenuo_proxy::SubjectLog::digest(move |s| d.digest(s)));
+            }
+            if trace.is_some() {
+                pipeline = pipeline.with_subject_digest(digest);
+            }
         }
         if let Some(n) = &approval_notifier {
             pipeline = pipeline.with_approval_notifier(n.handle());
