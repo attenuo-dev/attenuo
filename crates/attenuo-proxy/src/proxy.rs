@@ -81,6 +81,13 @@ pub const REASON_UPSTREAM_BODY_TOO_LARGE: &str = "upstream_body_too_large";
 /// transport error itself is only logged (SR-17).
 pub const REASON_UPSTREAM_UNREACHABLE: &str = "upstream_unreachable";
 
+/// Reason code (HTTP 504, JSON-RPC `data.reason`) when the upstream accepted the request but
+/// did not send its response headers, or the rest of a body the proxy buffers, within
+/// [`ProxyConfig::upstream_response_timeout`]. Unlike [`REASON_UPSTREAM_UNREACHABLE`] the
+/// request was sent, so the upstream may have acted on it: a client should not retry a
+/// call with side effects blindly.
+pub const REASON_UPSTREAM_TIMEOUT: &str = "upstream_timeout";
+
 /// Reason code (HTTP 502, JSON-RPC `data.reason`) when an upstream answers a `GET` with a
 /// success status but not `text/event-stream`. MCP allows only an SSE listen stream or `405`
 /// there, and such a body would reach the client without the list filter or result labelling
@@ -115,6 +122,8 @@ const FORWARD_RESPONSE_HEADERS: &[&str] = &[
 struct AppState {
     upstreams: HashMap<String, String>,
     client: reqwest::Client,
+    /// [`ProxyConfig::upstream_response_timeout`].
+    response_timeout: Duration,
     authorizer: Arc<dyn Authorizer>,
     sessions: SessionRegistry,
     /// [`ProxyConfig::stream_recheck`].
@@ -185,6 +194,8 @@ pub fn router_with_clock(
     let max_request_body = config.max_request_body_bytes.max(1);
     let record_window = config.record_window;
     let record_window_max_keys = config.record_window_max_keys;
+    let client = upstream_client(config.upstream_connect_timeout);
+    let response_timeout = config.upstream_response_timeout;
     let sessions = SessionRegistry::new(config.session_ttl, config.max_sessions)
         .with_max_per_principal(config.max_sessions_per_principal);
     let upstreams = config
@@ -194,7 +205,8 @@ pub fn router_with_clock(
         .collect();
     let state = Arc::new(AppState {
         upstreams,
-        client: upstream_client(),
+        client,
+        response_timeout,
         authorizer,
         sessions,
         stream_recheck,
@@ -229,9 +241,15 @@ pub fn router_with_clock(
 /// `307`/`308` would replay an already-authorized `tools/call` body to a host of the upstream's
 /// choosing (including internal addresses only the proxy can reach). A redirect response is
 /// returned to the client as-is, without its `Location` header.
-fn upstream_client() -> reqwest::Client {
+///
+/// Connecting is bounded by `connect_timeout`. There is deliberately no client-wide total
+/// timeout: it would also cut streamed bodies (the `GET` listen stream, a `POST` answered over
+/// SSE) that legitimately stay open. The wait for response headers, and for a body the proxy
+/// buffers, is bounded per request instead ([`send_upstream`], [`read_upstream_body`]).
+fn upstream_client(connect_timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(connect_timeout)
         .build()
         .expect("reqwest client with static configuration builds")
 }
@@ -611,16 +629,41 @@ fn upstream_span(state: &AppState, server: &str, headers: &mut HeaderMap) -> tra
     span
 }
 
-/// Send `req` inside `span` ([`upstream_span`]), recording the status, or
-/// `upstream_unreachable` on a transport failure.
+/// Why an upstream request produced no usable response.
+enum UpstreamFailure {
+    /// Could not connect (including the connect timeout), or the connection failed:
+    /// [`REASON_UPSTREAM_UNREACHABLE`].
+    Transport(reqwest::Error),
+    /// The response headers, or a buffered body, did not arrive by the request's deadline:
+    /// [`REASON_UPSTREAM_TIMEOUT`].
+    Timeout,
+}
+
+impl UpstreamFailure {
+    fn reason(&self) -> &'static str {
+        match self {
+            UpstreamFailure::Transport(_) => REASON_UPSTREAM_UNREACHABLE,
+            UpstreamFailure::Timeout => REASON_UPSTREAM_TIMEOUT,
+        }
+    }
+}
+
+/// Send `req` inside `span` ([`upstream_span`]) and wait for the response headers until
+/// `deadline`, recording the status, or the failure's reason. Only the headers are awaited:
+/// the body is read, or relayed, by the caller.
 async fn send_upstream(
     span: tracing::Span,
     req: reqwest::RequestBuilder,
-) -> Result<reqwest::Response, reqwest::Error> {
-    let out = req.send().instrument(span.clone()).await;
+    deadline: tokio::time::Instant,
+) -> Result<reqwest::Response, UpstreamFailure> {
+    let out = match tokio::time::timeout_at(deadline, req.send().instrument(span.clone())).await {
+        Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(e)) => Err(UpstreamFailure::Transport(e)),
+        Err(_) => Err(UpstreamFailure::Timeout),
+    };
     match &out {
         Ok(resp) => span.record("http.response.status_code", resp.status().as_u16()),
-        Err(_) => span.record("attenuo.reason", REASON_UPSTREAM_UNREACHABLE),
+        Err(f) => span.record("attenuo.reason", f.reason()),
     };
     out
 }
@@ -839,22 +882,31 @@ async fn read_request_body(
 /// Why reading an upstream body failed.
 enum UpstreamBodyError {
     TooLarge,
-    Transport(reqwest::Error),
+    Failed(UpstreamFailure),
 }
 
 /// Read an upstream body, at most `limit` bytes (checked against `Content-Length` first, then
-/// while reading).
+/// while reading), all of it by `deadline` (the request's, [`send_upstream`]).
 async fn read_upstream_body(
     resp: reqwest::Response,
     limit: usize,
+    deadline: tokio::time::Instant,
 ) -> Result<Bytes, UpstreamBodyError> {
     if resp.content_length().is_some_and(|n| n > limit as u64) {
         return Err(UpstreamBodyError::TooLarge);
     }
     let mut out = Vec::new();
     let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(UpstreamBodyError::Transport)?;
+    loop {
+        let next = match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(next) => next,
+            Err(_) => {
+                tracing::error!("upstream body not complete by the response deadline");
+                return Err(UpstreamBodyError::Failed(UpstreamFailure::Timeout));
+            }
+        };
+        let Some(chunk) = next else { break };
+        let chunk = chunk.map_err(|e| UpstreamBodyError::Failed(UpstreamFailure::Transport(e)))?;
         if out.len() + chunk.len() > limit {
             return Err(UpstreamBodyError::TooLarge);
         }
@@ -1034,7 +1086,9 @@ async fn passthrough_request(
             .request(method, &upstream)
             .headers(req_headers)
             .body(body);
-        let mut response = match send_upstream(up, req).await {
+        // Headers only: the listen stream and a relayed body stay open as long as they last.
+        let deadline = tokio::time::Instant::now() + state.response_timeout;
+        let mut response = match send_upstream(up, req, deadline).await {
             Ok(resp) if is_delete => stream_response(resp, None, None, limit),
             // The listen stream lives as long as the client keeps it open: re-check it
             // (SR-28), count its end, and bound its `stream.end` records per chain and
@@ -1080,7 +1134,7 @@ async fn passthrough_request(
                 Some(state.stream_guard(&who, &server, session_id.as_deref())),
                 limit,
             ),
-            Err(e) => return upstream_error(e),
+            Err(f) => return upstream_error(f),
         };
         match (is_delete, session_id.as_deref()) {
             (true, Some(sid)) if response.status().is_success() => state.sessions.remove(sid),
@@ -1160,18 +1214,28 @@ fn upstream_not_event_stream(resp: &reqwest::Response) -> Response {
     json_response(StatusCode::BAD_GATEWAY, &body)
 }
 
-/// `502` for a failed upstream request. The `reqwest` error names the internal upstream URL
-/// and the transport failure: it is logged, and the client gets only the reason code
-/// [`REASON_UPSTREAM_UNREACHABLE`] (SR-17).
-fn upstream_error(err: reqwest::Error) -> Response {
-    tracing::error!(error = ?err.to_string(), "upstream request failed");
+/// The answer to a failed upstream request: `502` [`REASON_UPSTREAM_UNREACHABLE`] for a
+/// transport failure, `504` [`REASON_UPSTREAM_TIMEOUT`] for a missed deadline. The `reqwest`
+/// error names the internal upstream URL and the transport failure: it is logged, and the
+/// client gets only the reason code (SR-17).
+fn upstream_error(failure: UpstreamFailure) -> Response {
+    let (status, message) = match &failure {
+        UpstreamFailure::Transport(err) => {
+            tracing::error!(error = ?err.to_string(), "upstream request failed");
+            (StatusCode::BAD_GATEWAY, "attenuo: upstream unreachable")
+        }
+        UpstreamFailure::Timeout => {
+            tracing::error!("upstream did not answer by the response deadline");
+            (StatusCode::GATEWAY_TIMEOUT, "attenuo: upstream timed out")
+        }
+    };
     let body = error_response(
         Value::Null,
         CODE_UPSTREAM,
-        "attenuo: upstream unreachable",
-        Some(serde_json::json!({ "reason": REASON_UPSTREAM_UNREACHABLE })),
+        message,
+        Some(serde_json::json!({ "reason": failure.reason() })),
     );
-    json_response(StatusCode::BAD_GATEWAY, &body)
+    json_response(status, &body)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1438,14 +1502,17 @@ async fn handle_post_inner(
     }
     let up = upstream_span(state, server, &mut req_headers);
     let sent = Instant::now();
+    // The headers, and a body the proxy buffers, must be in by then; a streamed body is not
+    // cut by it.
+    let deadline = tokio::time::Instant::now() + state.response_timeout;
     let req = state
         .client
         .post(upstream)
         .headers(req_headers)
         .body(upstream_body);
-    let resp = match send_upstream(up, req).await {
+    let resp = match send_upstream(up, req, deadline).await {
         Ok(r) => r,
-        Err(e) => return upstream_error(e),
+        Err(f) => return upstream_error(f),
     };
     let headers_in = Instant::now();
     timing.upstream = Some(headers_in - sent);
@@ -1506,6 +1573,7 @@ async fn handle_post_inner(
                 &lists,
                 labeller.as_ref(),
                 is_batch,
+                deadline,
             )
             .await
         } else if (has_lists || labeller.is_some()) && is_sse {
@@ -1558,7 +1626,7 @@ async fn handle_post_inner(
             // (a redirect, say) carries nothing and keeps its status; anything else fails closed.
             let status = resp.status();
             let upstream_headers = resp.headers().clone();
-            match read_upstream_body(resp, state.max_upstream_body).await {
+            match read_upstream_body(resp, state.max_upstream_body, deadline).await {
                 Ok(b) if b.is_empty() => build_response(status, &upstream_headers, Body::empty()),
                 Ok(_) | Err(UpstreamBodyError::TooLarge) => {
                     tracing::error!(
@@ -1568,7 +1636,7 @@ async fn handle_post_inner(
                     );
                     label_failure(&screened, labeller, is_batch)
                 }
-                Err(UpstreamBodyError::Transport(e)) => upstream_error(e),
+                Err(UpstreamBodyError::Failed(f)) => upstream_error(f),
             }
         } else if has_lists && !matches!(resp.status().as_u16(), 202 | 204) {
             // Neither JSON nor SSE: the proxy cannot tell what is in it, and a list result must
@@ -1930,15 +1998,16 @@ async fn buffer_and_rewrite(
     lists: &Arc<ListAnswers>,
     labeller: Option<&Labeller>,
     is_batch: bool,
+    deadline: tokio::time::Instant,
 ) -> Response {
     let status = resp.status();
     let headers = resp.headers().clone();
-    let bytes = match read_upstream_body(resp, state.max_upstream_body).await {
+    let bytes = match read_upstream_body(resp, state.max_upstream_body, deadline).await {
         Ok(b) => b,
         Err(UpstreamBodyError::TooLarge) => {
             return upstream_body_too_large(state.max_upstream_body)
         }
-        Err(UpstreamBodyError::Transport(e)) => return upstream_error(e),
+        Err(UpstreamBodyError::Failed(f)) => return upstream_error(f),
     };
     let mut value: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
