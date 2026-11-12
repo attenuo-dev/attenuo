@@ -36,9 +36,15 @@ For a file path use `path_prefix`. It splits the value and its own path on `/` a
 - an empty segment (`/workspace//a`),
 - a backslash, which Windows and URL parsers read as a separator,
 - a control character (NUL, tab, line breaks),
-- a percent-encoded `.`, `/` or `\` (`%2e`, `%2f`, `%5c`, in either case), which a tool that decodes would read as one.
+- a percent-encoded `.`, `/` or `\` (`%2e`, `%2f`, `%5c`, in either case), which a tool that decodes would read as one,
+- a percent escape that is itself encoded (`%25` and two hex digits, such as `%252e`), which a tool that decodes twice would read as `.`, `/` or `\`,
+- a character that Unicode compatibility normalisation (NFKC) or Windows "best fit" conversion turns into `.`, `/` or `\`: `․` `‥` `…` `︙` `︰` `﹒` `﹨` `．` `／` `＼` (U+2024, U+2025, U+2026, U+FE19, U+FE30, U+FE52, U+FE68, U+FF0E, U+FF0F, U+FF3C) and the slashes `⁄` `∕` `⧸` (U+2044, U+2215, U+29F8).
+
+`path_prefix` reads ASCII separators after at most one percent-decode and does not normalise Unicode, so it refuses these spellings rather than guess what a tool makes of them. Other non-ASCII names (`café.txt`, `日本語/文書.md`) and a plain `%` (`50%.txt`, `100%25.txt`) are admitted. Code-page specific mappings beyond the list (a yen sign read as `\` on a Japanese Windows code page, for one) are not modelled: for such a tool, grant a narrower path.
 
 A trailing `/` on the value is ignored. A trailing `/` on the constraint's path asks for something below it: `path_prefix: "/workspace/"` admits `/workspace/` and `/workspace/a`, but not `/workspace` itself. An absolute path (one starting with `/`) admits only absolute values and a relative one (`docs`) only relative values. The constraint's own path must follow the same rules: `path_prefix: "/workspace/../x"` or an empty path is refused when the token, the exchange request or the config is read.
+
+`path_prefix` compares the text of the path. It does not look at the file system, so it does not see symbolic links: if `/workspace/docs` is a link to `/home/user/.ssh`, `path_prefix: "/workspace/"` admits `/workspace/docs/id_ed25519`, and the tool opens the file the link points to. A link can get there in ordinary ways, such as a cloned repository that contains one, or another granted tool that can create links. Attenuo cannot check this, because the file system is the upstream's. Pair `path_prefix` with an upstream that resolves the real path and checks it against its own allowed directories (the reference MCP filesystem server does this), or do not grant tools that can create links or check out untrusted content under the prefix.
 
 Every value `path_prefix: P` admits also starts with `P` as a string, so swapping a path argument's `prefix` for a `path_prefix` with the same text always narrows. `path_prefix` is for paths, not URIs: `file:///public/` holds `//` and admits nothing; keep `prefix` for a URI.
 

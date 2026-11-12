@@ -226,6 +226,7 @@ pub(super) fn open_connection(
     path: &Path,
     durability: Durability,
 ) -> Result<Connection, AuditError> {
+    create_owner_only(path)?;
     let conn = Connection::open(path)?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
@@ -240,6 +241,41 @@ pub(super) fn open_connection(
     }
     conn.pragma_update(None, "synchronous", durability.pragma())?;
     Ok(conn)
+}
+
+/// Create the database file `0600` on Unix when it does not exist yet, before SQLite opens
+/// it: SQLite would create it `0644` (less the umask), readable by every local user, and the
+/// log holds user subjects, tool arguments and decisions. SQLite gives the `-wal` and `-shm`
+/// files it creates the database file's mode, so they are owner-only too. An existing file is
+/// left as it is: an operator who made it group-readable (for a backup user, say) keeps that
+/// (SR-103). A `:memory:` or `file:` URI name is not a file path and is skipped.
+fn create_owner_only(path: &Path) -> Result<(), AuditError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let name = path.as_os_str();
+        if name == ":memory:" || name.as_encoded_bytes().starts_with(b"file:") {
+            return Ok(());
+        }
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(AuditError::Storage(format!(
+                    "cannot create the database file {}: {e}",
+                    path.display()
+                )))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// `PRAGMA journal_mode=WAL`, answering the mode in force. SQLite does not call the busy

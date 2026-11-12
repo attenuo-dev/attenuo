@@ -154,8 +154,10 @@ Placement:
 At start-up the server takes an exclusive lock on `<sqlite_path>.lock` (for `/var/lib/attenuo/attenuo.sqlite`, `/var/lib/attenuo/attenuo.sqlite.lock`) and holds it until it exits. A second server pointed at the same file stops before it opens the database:
 
 ```text
-Error: taking the single-writer fence of /var/lib/attenuo/attenuo.sqlite: another process holds /var/lib/attenuo/attenuo.sqlite.lock (pid 1234): one server process per database file; stop the other instance first (in Kubernetes, use `strategy: Recreate`)
+Error: taking the single-writer fence of /var/lib/attenuo/attenuo.sqlite: /var/lib/attenuo/attenuo.sqlite.lock is locked by another process: one server process per database file; stop the other instance first (in Kubernetes, use `strategy: Recreate`). The lock file records pid 1234, the last attenuo server that took it; if that process is gone, another program holds the lock (find it with `fuser` or `lsof`).
 ```
+
+The pid is the one the lock file records, not necessarily the holder: any process that can open the file can lock it without writing to it. The server creates the lock file, the database and SQLite's `-wal` and `-shm` files with mode `0600` (owner only), and the data directory with `0700` when it creates it, so on a shared host other local users can neither read the log nor hold the lock. It narrows a lock file it finds with a wider mode to `0600`. It does not change the mode of a database file that already exists, so a file you made group-readable on purpose (for a backup user) stays that way, and SQLite gives the `-wal` and `-shm` files the same mode. A directory that already exists keeps its mode too: make sure only the server's user can write to it.
 
 The lock is released when the process exits, also on a crash, `kill -9` or OOM kill, so a leftover `.lock` file never blocks a restart; do not delete it by hand. Why it exists: two servers on one file share the lease registry and counters but not the state that makes a credential single use, the run lock that serialises a run's budgeted decisions, or the loaded policy set, so an overlap silently weakens single-use credentials and run limits (see [What v0 is and is not](#what-v0-is-and-is-not)). The CLI is not affected: `attenuo audit verify` and `audit export` read through the admin API or from an export file, never the database itself.
 

@@ -128,6 +128,16 @@ export function pathProblem(path: string): string | undefined {
   // eslint-disable-next-line no-control-regex
   if (/[\u0000-\u001f\u007f-\u009f]/.test(path)) return "holds a control character";
   if (/%(2e|2f|5c)/i.test(path)) return "holds a percent-encoded `.`, `/` or `\\`";
+  if (/%25[0-9a-f]{2}/i.test(path)) {
+    return "holds a percent escape that is itself percent-encoded (`%25` and two hex digits)";
+  }
+  // Characters that NFKC or Windows best-fit conversion turn into `.`, `/` or `\` (SR-105);
+  // the server's `attenuo_core::LOOKALIKE_SEPARATORS`.
+  if (
+    /[\u2024\u2025\u2026\ufe19\ufe30\ufe52\ufe68\uff0e\uff0f\uff3c\u2044\u2215\u29f8]/.test(path)
+  ) {
+    return "holds a character that normalises to `.`, `/` or `\\`";
+  }
   if (path.includes("//")) return "holds an empty segment (`//`)";
   let body = path.startsWith("/") ? path.slice(1) : path;
   if (body.endsWith("/")) body = body.slice(0, -1);

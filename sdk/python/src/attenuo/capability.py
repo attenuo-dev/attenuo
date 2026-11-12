@@ -36,6 +36,7 @@ limit the child leaves out), and charges every call to every hop.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -81,6 +82,12 @@ class Prefix:
 
 
 _ENCODED_SEPARATORS = ("%2e", "%2f", "%5c")
+# Characters that NFKC or Windows best-fit conversion turn into `.`, `/` or `\` (SR-105);
+# the server's `attenuo_core::LOOKALIKE_SEPARATORS`.
+_LOOKALIKE_SEPARATORS = frozenset(
+    "\u2024\u2025\u2026\ufe19\ufe30\ufe52\ufe68\uff0e\uff0f\uff3c\u2044\u2215\u29f8"
+)
+_DOUBLE_ENCODED = re.compile(r"%25[0-9A-Fa-f]{2}")
 
 
 def path_problem(path: str) -> str | None:
@@ -88,8 +95,9 @@ def path_problem(path: str) -> str | None:
 
     The server refuses, rather than normalises, a value or a ``path_prefix`` path that is empty
     or holds a backslash, a control character, a percent-encoded ``.``, ``/`` or ``\\``
-    (``%2e``, ``%2f``, ``%5c``, any case), an empty segment (``//``) or a ``.`` or ``..``
-    segment."""
+    (``%2e``, ``%2f``, ``%5c``, any case), a percent escape that is itself encoded (``%25``
+    and two hex digits), a character that normalises to ``.``, ``/`` or ``\\`` (such as
+    U+FF0E or U+FF0F), an empty segment (``//``) or a ``.`` or ``..`` segment."""
     if not path:
         return "is empty"
     if "\\" in path:
@@ -99,6 +107,10 @@ def path_problem(path: str) -> str | None:
     lowered = path.lower()
     if any(e in lowered for e in _ENCODED_SEPARATORS):
         return "holds a percent-encoded `.`, `/` or `\\`"
+    if _DOUBLE_ENCODED.search(path):
+        return "holds a percent escape that is itself percent-encoded (`%25` and two hex digits)"
+    if any(c in _LOOKALIKE_SEPARATORS for c in path):
+        return "holds a character that normalises to `.`, `/` or `\\`"
     if "//" in path:
         return "holds an empty segment (`//`)"
     body = path.removeprefix("/").removesuffix("/")

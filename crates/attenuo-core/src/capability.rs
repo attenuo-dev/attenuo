@@ -62,6 +62,13 @@ pub enum ArgConstraint {
     /// Every value it admits starts with its path as a string, so `path_prefix: P` is always
     /// narrower than `prefix: P`. Build it with [`ArgConstraint::path_prefix`], which checks
     /// the path; an unchecked one whose path breaks the rules admits nothing.
+    ///
+    /// The comparison is on text only. It does not resolve symbolic links, so a link under
+    /// the path (one in a cloned repository, or one a granted tool created) leads the upstream
+    /// outside it: with `/workspace/docs` linked to `/home/user/.ssh`, `/workspace/` admits
+    /// `/workspace/docs/id_ed25519`. Pair it with an upstream that resolves the real path and
+    /// checks it (the reference MCP filesystem server does), or do not grant tools that can
+    /// create links under the path (SR-106).
     PathPrefix(String),
     /// Argument must be an integer (a Cedar `long`, read as [`as_long`] reads it) between the
     /// bounds, both inclusive. A missing bound is unbounded on that side. Serialized as
@@ -182,7 +189,39 @@ pub enum PathError {
     /// `/` or `\`.
     #[error("holds a percent-encoded `.`, `/` or `\\`")]
     EncodedSeparator,
+    /// A character that compatibility normalisation (NFKC) or Windows "best fit" conversion
+    /// turns into `.`, `/` or `\` ([`LOOKALIKE_SEPARATORS`]), such as `．` (U+FF0E) or `／`
+    /// (U+FF0F): a tool that normalises or converts the path could read a `..` segment or a
+    /// separator the path does not spell (SR-105).
+    #[error("holds a character that normalises to `.`, `/` or `\\`")]
+    LookalikeSeparator,
+    /// `%25` followed by two hex digits, which one percent-decode turns into another escape
+    /// (`%252e` to `%2e`): a tool that decodes twice reads what the path does not spell
+    /// (SR-105).
+    #[error("holds a percent escape that is itself percent-encoded (`%25` and two hex digits)")]
+    DoubleEncoded,
 }
+
+/// The code points `path_prefix` refuses because another tool may read them as `.`, `/` or
+/// `\` ([`PathError::LookalikeSeparator`]). `path_prefix` reads a path as ASCII separators
+/// after at most one percent-decode and does not normalise Unicode, so it refuses what it
+/// cannot reason about instead:
+///
+/// - every code point whose NFKC form is made only of `.`, `/` and `\` (Unicode 15.1):
+///   U+2024 `․`, U+2025 `‥`, U+2026 `…`, U+FE19 `︙`, U+FE30 `︰`, U+FE52 `﹒`, U+FE68 `﹨`,
+///   U+FF0E `．`, U+FF0F `／`, U+FF3C `＼`;
+/// - three slashes that Windows best-fit code-page conversion maps to `/` in an ANSI API
+///   call: U+2044 `⁄`, U+2215 `∕`, U+29F8 `⧸`.
+///
+/// Code points whose NFKC form mixes these with letters or digits (`⒈` is `1.`, `℀` is
+/// `a/c`) cannot form a `.` or `..` segment on their own and are admitted. Code-page
+/// specific best-fit mappings beyond these (the yen sign read as `\` on a Japanese code
+/// page, for one) are not modelled: grant such a tool a narrower path or run it on a
+/// Unicode API.
+pub const LOOKALIKE_SEPARATORS: &[char] = &[
+    '\u{2024}', '\u{2025}', '\u{2026}', '\u{fe19}', '\u{fe30}', '\u{fe52}', '\u{fe68}', '\u{ff0e}',
+    '\u{ff0f}', '\u{ff3c}', '\u{2044}', '\u{2215}', '\u{29f8}',
+];
 
 /// A string read as a path by [`parse_path`]: whether it starts with `/`, its segments
 /// between `/`, and whether it ends with `/`.
@@ -214,6 +253,16 @@ fn parse_path(s: &str) -> Result<PathSegments<'_>, PathError> {
     });
     if encoded {
         return Err(PathError::EncodedSeparator);
+    }
+    let double = s
+        .as_bytes()
+        .windows(5)
+        .any(|w| w.starts_with(b"%25") && w[3].is_ascii_hexdigit() && w[4].is_ascii_hexdigit());
+    if double {
+        return Err(PathError::DoubleEncoded);
+    }
+    if s.contains(LOOKALIKE_SEPARATORS) {
+        return Err(PathError::LookalikeSeparator);
     }
     if s.contains("//") {
         return Err(PathError::EmptySegment);
@@ -1400,6 +1449,63 @@ mod tests {
             "/workspace/a%2",
             "/workspace/...",
             "/workspace/.env",
+        ] {
+            assert!(c.satisfied_by(&json!(v)), "{v:?}");
+        }
+    }
+
+    /// SR-106: the comparison is lexical. A path through a link under the prefix is
+    /// admitted, since the engine cannot see the upstream's file system; the docs say so.
+    #[test]
+    fn path_prefix_compares_text_and_does_not_see_links_sr106() {
+        let c = pp("/workspace/");
+        assert!(c.satisfied_by(&json!("/workspace/link/id_ed25519")));
+    }
+
+    /// SR-105: spellings outside the ASCII, single-decode model are refused, not admitted:
+    /// code points that compatibility-normalise (NFKC) or Windows best-fit map to `.`, `/` or
+    /// `\\`, and an escape that one decode leaves behind (`%252e`). Ordinary non-ASCII names
+    /// and a literal `%` still pass.
+    #[test]
+    fn path_prefix_refuses_what_its_model_cannot_reason_about_sr105() {
+        let c = pp("/workspace");
+        for (v, why) in [
+            (
+                "/workspace/\u{ff0e}\u{ff0e}/secrets/key",
+                PathError::LookalikeSeparator,
+            ),
+            ("/workspace/\u{2025}/x", PathError::LookalikeSeparator),
+            (
+                "/workspace/a\u{ff0f}..\u{ff0f}..\u{ff0f}etc",
+                PathError::LookalikeSeparator,
+            ),
+            ("/workspace/a\u{ff3c}b", PathError::LookalikeSeparator),
+            (
+                "/workspace/\u{fe52}\u{2024}/x",
+                PathError::LookalikeSeparator,
+            ),
+            ("/workspace/\u{2026}", PathError::LookalikeSeparator),
+            ("/workspace/\u{fe30}/x", PathError::LookalikeSeparator),
+            ("/workspace/a\u{2215}b", PathError::LookalikeSeparator),
+            ("/workspace/a\u{2044}b", PathError::LookalikeSeparator),
+            ("/workspace/a\u{29f8}b", PathError::LookalikeSeparator),
+            ("/workspace/%252e%252e/etc/passwd", PathError::DoubleEncoded),
+            ("/workspace/%252F", PathError::DoubleEncoded),
+            ("/workspace/a%2541", PathError::DoubleEncoded),
+            ("/workspace/%25252e", PathError::DoubleEncoded),
+        ] {
+            assert_eq!(parse_path(v).err(), Some(why), "{v:?}");
+            assert!(!c.satisfied_by(&json!(v)), "{v:?} must be refused");
+        }
+        for v in [
+            "/workspace/caf\u{e9}.txt",
+            "/workspace/\u{65e5}\u{672c}\u{8a9e}/\u{6587}\u{66f8}.md",
+            "/workspace/\u{43e}\u{442}\u{447}\u{451}\u{442}.pdf",
+            "/workspace/na\u{ef}ve r\u{e9}sum\u{e9}.docx",
+            "/workspace/100%25.txt",
+            "/workspace/50%.txt",
+            "/workspace/a%25",
+            "/workspace/\u{2488}notes",
         ] {
             assert!(c.satisfied_by(&json!(v)), "{v:?}");
         }

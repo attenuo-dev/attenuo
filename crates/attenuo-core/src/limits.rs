@@ -102,6 +102,12 @@ pub enum Derive {
     /// `xn--fa-hia.example` (SR-100). The punycode spelling is not affected:
     /// `https://xn--fa-hia.example/` keeps its host.
     ///
+    /// Nor does a value whose host, as written, holds a `%`. WHATWG percent-decodes a host
+    /// before it maps it, so `https://fa%C3%9F.example/` is `faß.example` to it and would
+    /// slip past the test above, while Python's stdlib looks up the escaped text as it is and
+    /// Go's `net/url` decodes it: the clients do not agree on the host. A host name has no
+    /// reason to be percent-encoded, so `a.ex%61mple` has no host either (SR-104).
+    ///
     /// A string with no scheme is a bare host and is read as `http://` followed by the string,
     /// so `www.example.com`, `example.com/x?q=1` and `localhost:8080` have the hosts
     /// `www.example.com`, `example.com` and `localhost`. A string has no scheme when
@@ -123,8 +129,7 @@ pub enum Derive {
     ///
     /// The injection suite's host entities (`fingerprint::entities`) are a separate,
     /// deliberately looser grammar. Where both give a host for one token they give the same
-    /// one, except for: a host with non-canonical spelling that WHATWG rewrites (percent
-    /// escapes, IPv4 in hex, octal or short form, IDNA and other non-ASCII, trailing dots in
+    /// one, except for: a host with non-canonical spelling that WHATWG rewrites (IPv4 in hex, octal or short form, IDNA and other non-ASCII, trailing dots in
     /// a full URL), an IPv6 literal (whose brackets the entity tokeniser splits on), and a
     /// token that holds a second `http(s)://` URL after its start (the entity grammar takes
     /// the embedded URL's host, this one the leading host). For a bare host only the last
@@ -179,8 +184,11 @@ impl Derive {
                     return None;
                 }
                 let (url, written_host) = parse_url_or_bare_host(raw)?;
-                // Characters on which IDNA mappings disagree about which host is meant (SR-100).
-                if written_host.contains(IDNA_DEVIATIONS) {
+                // Characters on which IDNA mappings disagree about which host is meant (SR-100),
+                // and any percent escape, which WHATWG decodes before it maps the host, so
+                // `fa%C3%9F.example` would hide a `ß` from the first test, and which clients
+                // decode differently or not at all (SR-104).
+                if written_host.contains(IDNA_DEVIATIONS) || written_host.contains('%') {
                     return None;
                 }
                 // An opaque host is not normalised, so it could be spelled several ways for
@@ -1386,7 +1394,6 @@ mod tests {
             ("127.0.0.1:80/x", "127.0.0.1"),
             ("0x7f.1", "127.0.0.1"),
             ("[::1]:8080/x", "[::1]"),
-            ("a.ex%61mple", "a.example"),
             ("xn--nxasmq6b.example", "xn--nxasmq6b.example"),
             (
                 "\u{3b2}\u{3cc}\u{3bb}\u{3bf}\u{3c3}.example",
@@ -1492,7 +1499,9 @@ mod tests {
         ] {
             assert_eq!(h(url), None, "{url:?}");
         }
-        assert_eq!(h("https://a.ex%61mple/").as_deref(), Some("a.example"));
+        // A special scheme decodes the escape, but a `%` in the host is refused (SR-104).
+        assert_eq!(h("https://a.ex%61mple/"), None);
+        assert_eq!(h("https://a.example/").as_deref(), Some("a.example"));
         assert_eq!(h("ws://a.example/").as_deref(), Some("a.example"));
         assert_eq!(h("ftp://a.example/").as_deref(), Some("a.example"));
         assert_eq!(h("file://a.example/x").as_deref(), Some("a.example"));
@@ -1578,6 +1587,12 @@ mod tests {
             "ws://faß.example/",
             "a\u{200d}b.example",
             "https://a\u{200c}b.example/",
+            // Percent-encoded, which WHATWG decodes before it maps the host (SR-104).
+            "https://fa%C3%9F.example/",
+            "fa%C3%9F.example",
+            "https://%CF%83%CF%82.example/",
+            "https://FA%E1%BA%9E.example/",
+            "https://a%E2%80%8Db.example/",
         ] {
             assert_eq!(h(raw), None, "{raw:?}");
         }
@@ -1600,6 +1615,8 @@ mod tests {
             ("https://fass.example/", "fass.example"),
             ("https://βόλοσ.example/", "xn--nxasmq6b.example"),
             ("https://a.example/straße?q=ß#ς", "a.example"),
+            ("https://a.example/%C3%9F?q=%CF%82#%25", "a.example"),
+            ("https://%C3%9F@a.example/", "a.example"),
             ("https://faß@a.example/", "a.example"),
             ("faß@a.example", "a.example"),
         ] {

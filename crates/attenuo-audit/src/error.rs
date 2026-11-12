@@ -80,21 +80,33 @@ pub enum AuditError {
     },
     /// Another holder has the database's single-writer fence
     /// ([`WriterFence`](crate::WriterFence)): another server process runs on this file.
+    ///
+    /// The pid is the one the lock file records: the last attenuo server that took the fence.
+    /// Any process that can open the file can lock it without writing it, so the holder may
+    /// be another program; the message says so rather than name a pid as the holder (SR-103).
     #[error(
-        "another process holds {} ({}): one server process per database file; stop the other \
-         instance first (in Kubernetes, use `strategy: Recreate`)",
+        "{} is locked by another process: one server process per database file; stop the \
+         other instance first (in Kubernetes, use `strategy: Recreate`). {}",
         lock.display(),
-        holder.map_or_else(|| "pid unknown".to_string(), |p| format!("pid {p}"))
+        holder.map_or_else(
+            || "The lock file records no pid; find the holder with `fuser` or `lsof`.".to_string(),
+            |p| format!(
+                "The lock file records pid {p}, the last attenuo server that took it; if that \
+                 process is gone, another program holds the lock (find it with `fuser` or `lsof`)."
+            )
+        )
     )]
     Fenced {
         /// The lock file, `<sqlite_path>.lock`.
         lock: std::path::PathBuf,
-        /// The process id the lock file records, when it is readable.
+        /// The process id the lock file records, when it is readable: the last attenuo
+        /// server that took the fence, not necessarily the current holder.
         holder: Option<u32>,
     },
     /// An append was shed instead of waiting without bound: the writer's queue was full, or
-    /// the writer did not answer within the append timeout (a hung disk, say). The decision it
-    /// belongs to fails closed.
+    /// the writer did not take the record within the append timeout (a hung disk, say). The
+    /// record was not written and never will be, so the caller may undo what the decision
+    /// charged; the decision fails closed.
     #[error("audit append shed: {0}")]
     Overloaded(&'static str),
     /// The database file's schema version (`PRAGMA user_version`) is newer than this build

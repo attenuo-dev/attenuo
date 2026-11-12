@@ -646,7 +646,15 @@ fn open_storage(
     }
     let p = Path::new(path);
     if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        // A directory created here is the server user's alone (SR-103); one that exists keeps
+        // its mode.
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+            .create(dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
     }
     // Before the file is opened: a second server on the same file stops here, before it has
     // touched the database, recovered the outbox or started a writer (audit A-2).
@@ -1120,6 +1128,31 @@ mod tests {
                 (Err(e), None) => panic!("{connect}/{response} refused: {e}"),
             }
         }
+    }
+
+    /// SR-103: the data directory the server creates for `sqlite_path`, the database, its
+    /// lock file and SQLite's `-wal` and `-shm` files are the server user's alone.
+    #[cfg(unix)]
+    #[test]
+    fn storage_files_are_owner_only_sr103() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data/attenuo");
+        let db = data.join("audit.sqlite");
+        let mut cfg = Config::default();
+        cfg.audit.sqlite_path = db.display().to_string();
+        let state = AppState::from_config(&cfg).unwrap();
+        assert_eq!(mode(&data), 0o700);
+        for name in [
+            "audit.sqlite",
+            "audit.sqlite.lock",
+            "audit.sqlite-wal",
+            "audit.sqlite-shm",
+        ] {
+            assert_eq!(mode(&data.join(name)), 0o600, "{name}");
+        }
+        drop(state);
     }
 
     #[test]
