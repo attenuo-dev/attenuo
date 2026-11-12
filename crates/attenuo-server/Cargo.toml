@@ -70,6 +70,8 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+# `SqliteLeaseStore::write_turns`, for the write count of the `allowed_call` bench and tests.
+attenuo-audit = { workspace = true, features = ["testing"] }
 attenuo-proxy = { workspace = true, features = ["testing"] }
 rusqlite = { workspace = true }
 tempfile = { workspace = true }
@@ -78,6 +80,10 @@ tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "decide"
+harness = false
+
+[[bench]]
+name = "allowed_call"
 harness = false
 
 [[bench]]

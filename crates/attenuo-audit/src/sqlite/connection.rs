@@ -139,6 +139,10 @@ pub(super) struct Ticket {
     /// (next ticket to hand out, ticket now served).
     state: Mutex<(u64, u64)>,
     turn: Condvar,
+    /// Tests and measurements: how many turns were taken, that is how many writes ran on the
+    /// file, by every store on it.
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) taken: std::sync::atomic::AtomicU64,
 }
 
 /// Holds a [`Ticket`] until dropped (also when unwinding), which serves the next ticket.
@@ -180,6 +184,8 @@ impl WriteGate {
     /// ignored.
     pub(super) fn hold(&self) -> Option<TicketGuard<'_>> {
         self.0.as_ref().map(|t| {
+            #[cfg(any(test, feature = "testing"))]
+            t.taken.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut s = t.state.lock().unwrap_or_else(PoisonError::into_inner);
             let mine = s.0;
             s.0 += 1;
@@ -188,6 +194,15 @@ impl WriteGate {
             }
             TicketGuard(t)
         })
+    }
+
+    /// Tests and measurements: how many turns this gate has handed out (every write on the
+    /// file, by every store on it); 0 for a store with no gate.
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) fn turns(&self) -> u64 {
+        self.0
+            .as_ref()
+            .map_or(0, |t| t.taken.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 
