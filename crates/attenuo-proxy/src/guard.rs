@@ -353,7 +353,7 @@ impl StreamGuard {
                         reason = ?reason,
                         suppressed = suppressed_before,
                         chain_id = ?chain_id_of(&self.chain),
-                        subject = ?self.chain.originating_user.subject,
+                        subject = ?self.authorizer.subject_log().show(&self.chain.originating_user.subject),
                         "stream.end records suppressed in the previous window"
                     );
                 }
@@ -618,7 +618,11 @@ impl Drop for State {
                 server = ?server,
                 session = %session,
                 chain_id = ?chain_id_of(&self.guard.chain),
-                subject = ?self.guard.chain.originating_user.subject,
+                subject = ?self
+                    .guard
+                    .authorizer
+                    .subject_log()
+                    .show(&self.guard.chain.originating_user.subject),
                 "response stream closed by the client"
             );
         }
@@ -677,7 +681,11 @@ where
                         server = ?server,
                         session = %session,
                         chain_id = ?chain_id_of(&st.guard.chain),
-                        subject = ?st.guard.chain.originating_user.subject,
+                        subject = ?st
+                            .guard
+                            .authorizer
+                            .subject_log()
+                            .show(&st.guard.chain.originating_user.subject),
                         decision_id = ?decision_id,
                         record_suppressed = matches!(end, EndRecord::Suppressed(_)),
                         "ending response stream: re-check failed"
