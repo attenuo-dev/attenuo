@@ -167,6 +167,7 @@ pub mod screen;
 pub mod session;
 pub mod sse;
 pub mod stage;
+pub mod subject_log;
 pub mod traceparent;
 
 #[cfg(any(test, feature = "testing"))]
@@ -226,4 +227,5 @@ pub use proxy::{
 pub use screen::ListFilterMode;
 pub use session::{SessionOwner, SessionRegistry};
 pub use stage::Stage;
+pub use subject_log::{LoggedSubject, SubjectLog};
 pub use traceparent::{TraceHook, TraceParent, OTEL_TARGET};

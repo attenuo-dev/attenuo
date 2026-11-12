@@ -345,6 +345,10 @@ impl Authorizer for ServerAuthorizer {
         .await
     }
 
+    fn subject_log(&self) -> &attenuo_proxy::SubjectLog {
+        self.pipeline.subject_log()
+    }
+
     fn knows_tool(&self, server: &str, tool: &str) -> bool {
         self.pipeline
             .policy_snapshot()

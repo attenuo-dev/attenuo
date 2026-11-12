@@ -39,7 +39,7 @@ axum = "0.8"
 http-body = "1"
 tower-http = { version = "0.7", features = ["trace", "cors"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 sha2 = "0.11"

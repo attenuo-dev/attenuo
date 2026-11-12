@@ -5,8 +5,9 @@
 #   docker build -t attenuo:dev .
 #   docker compose up --build        # server + fake GitHub MCP, see docker-compose.yml
 #
-# The rust-version in Cargo.toml is 1.89; the toolchain is `stable`, so build with a current
-# image rather than pinning the minimum.
+# The rust-version in Cargo.toml is 1.89; builds use the release rust-toolchain.toml pins
+# (1.99.1). Keep the base image on that release: with any other, rustup downloads the pinned
+# toolchain during the build.
 
 # Pinned by digest (multi-arch index, SR-30). Refresh: Dependabot (docker ecosystem), or
 # `docker buildx imagetools inspect rust:1-bookworm` and paste the top-level Digest.

@@ -429,7 +429,7 @@ async fn record_lease_refusal(
                 tool,
                 suppressed = suppressed_before,
                 chain_id = ?chain_id_of(&who.chain),
-                subject = ?who.chain.originating_user.subject,
+                subject = ?state.authorizer.subject_log().show(&who.chain.originating_user.subject),
                 "lease refusal records suppressed in the previous window"
             );
         }
@@ -493,7 +493,12 @@ fn json_response(status: StatusCode, body: &Value) -> Response {
         .into_response()
 }
 
-fn request_span(server: &str, chain: &DelegationChain, session_id: Option<&str>) -> tracing::Span {
+fn request_span(
+    state: &AppState,
+    server: &str,
+    chain: &DelegationChain,
+    session_id: Option<&str>,
+) -> tracing::Span {
     let agent = chain
         .current_agent()
         .map(ToString::to_string)
@@ -503,7 +508,7 @@ fn request_span(server: &str, chain: &DelegationChain, session_id: Option<&str>)
         "mcp_request",
         server = ?server,
         agent = ?agent,
-        subject = ?chain.originating_user.subject,
+        subject = ?state.authorizer.subject_log().show(&chain.originating_user.subject),
         chain_depth = chain.depth(),
         // Session ids grant access to a session: log a hash prefix only (SR-11).
         session = %session_id.map(session_tag).unwrap_or_default(),
@@ -1064,7 +1069,7 @@ async fn passthrough_request(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let span = request_span(&server, &chain, session_id.as_deref());
+    let span = request_span(&state, &server, &chain, session_id.as_deref());
     async move {
         let owner =
             match session_gate_traced(&state, &server, &method, &who, session_id.as_deref(), now)
@@ -1328,7 +1333,7 @@ async fn post_request(
         Ok(b) => b,
         Err(resp) => return resp,
     };
-    let span = request_span(server, chain, session_id.as_deref());
+    let span = request_span(state, server, chain, session_id.as_deref());
     async {
         let owner = match session_gate_traced(
             state,

@@ -287,7 +287,7 @@ pub(crate) async fn handle(
         .await?;
     tracing::info!(
         // Caller-controlled strings are Debug-formatted (SR-18).
-        subject = ?verified.subject,
+        subject = ?state.pipeline.subject_log().show(&verified.subject),
         idp = ?verified.issuer,
         credential = kind.as_str(),
         agent = ?agent,

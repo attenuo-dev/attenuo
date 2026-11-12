@@ -225,9 +225,19 @@ The server logs through `tracing` to standard output. Control it with `RUST_LOG`
 
 Examples: `RUST_LOG=info`, `RUST_LOG=attenuo_server=debug,info`.
 
-Output has ANSI colour codes by default. Set `NO_COLOR=1` to switch them off for log shippers.
+**Format.** Text lines by default. For a log shipper (Loki, Elasticsearch, CloudWatch, a Kubernetes log pipeline), set `ATTENUO_LOG_FORMAT=json` or `[logging] format = "json"`; the variable wins over the file. Each line is then one JSON object:
 
-Log lines name the agent, the user subject, the chain depth, the tool and the decision. They are an operational aid and are not the audit record. The audit log is the record. Do not rely on stdout for forensics.
+```json
+{"timestamp":"2026-11-12T19:14:20.540106Z","level":"INFO","message":"decision","decision":"Allow","reason":"\"policy_allow\"","subject":"\"alice@example.com\"","agent":"\"coder\"","server":"\"github\"","tool":"\"read_file\"","seq":4,"target":"attenuo_server::authz::pipeline","span":{"agent":"\"coder\"","chain_depth":2,"server":"\"github\"","session":"","subject":"\"alice@example.com\"","name":"mcp_request"},"spans":[{"...":"..."}]}
+```
+
+`timestamp`, `level`, `target` and `message` are always there; the event's own fields sit next to them, and `span` and `spans` carry the request context the text format prints before the message. Strings that come from a caller (subject, agent, server, tool, reason) are written in their escaped, quoted form, as in the text format, so a newline or a quote in them cannot forge a line or a field (SR-18); strip the outer quotes in the shipper if you want the bare value. An unknown format refuses to start.
+
+**Colour.** ANSI colour codes are written only in the text format and only when standard output is a terminal, so a container, a systemd unit or a redirect to a file gets plain text. `NO_COLOR=1` switches them off on a terminal too.
+
+**Personal data.** Log lines name the agent, the chain depth, the tool, the decision and, by default, the user subject (the decision and rejection lines, token issuance, approval decisions, and every line inside a proxied request's `mcp_request` span). A subject is usually personal data, such as an email address. If your logs go somewhere with wider access or a longer retention than the audit log, set `[logging] redact_subjects = true`: subjects are then written as `hmac:` and 16 hex digits, the same keyed digest trace export uses for `attenuo.subject_digest` ([observability](observability.md)), so you can still group lines by user and match them to traces, and find the user in the audit log, which always keeps the subject. The digest changes when the issuer key does. Agent ids, the actor token's subject on an exchange (a workload identity) and tool names are not redacted.
+
+Log lines are an operational aid and are not the audit record. The audit log is the record. Do not rely on stdout for forensics.
 
 ## Docker and Compose
 

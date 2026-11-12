@@ -355,6 +355,16 @@ enabled = false
 # A non-loopback `listen` is refused at startup unless this is true (SR-38).
 # allow_public = false
 
+[logging]
+# The log on standard output. "text" (default) or "json" (one object per line: timestamp,
+# level, target, message, the event's fields, and its spans). ATTENUO_LOG_FORMAT overrides it;
+# an unknown value refuses to start. RUST_LOG still picks what is logged. ANSI colour only on a
+# terminal, in text, and without NO_COLOR.
+format = "text"
+# Log user subjects as hmac:<16 hex>, the digest trace export uses, instead of in clear.
+# The audit log keeps the subject either way.
+redact_subjects = false
+
 [telemetry]
 # OpenTelemetry trace export over OTLP/HTTP (protobuf). Off by default. Exported spans carry
 # decision ids, reason codes, tool names and route templates; never a token, the subject,

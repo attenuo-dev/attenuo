@@ -310,6 +310,12 @@ pub trait Authorizer: Send + Sync {
         self.authorize(chain, call, now).await
     }
 
+    /// How user subjects are written into the proxy's log lines (`[logging]
+    /// redact_subjects`). The default writes them as they are.
+    fn subject_log(&self) -> &crate::SubjectLog {
+        &crate::subject_log::CLEAR
+    }
+
     /// Is `(server, tool)` in the tool catalog behind this authorizer? Used by the proxy's
     /// `require_listed_tools` check (SR-25): a `tools/call` whose name the upstream never listed
     /// is still screened if the catalog knows it. Names are compared exactly. The default knows
