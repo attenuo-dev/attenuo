@@ -60,6 +60,7 @@
   - [Configuration keys](reference/config.md)
   - [HTTP endpoints](reference/http-api.md)
   - [AuthZEN conformance](reference/authzen.md)
+  - [API compatibility](reference/api-compatibility.md)
 
 # Decisions
 

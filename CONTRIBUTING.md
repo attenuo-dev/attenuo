@@ -138,7 +138,7 @@ A change is done when all of the following hold:
 
 ## Releases
 
-Maintainers only. Versions follow [SemVer 2.0](https://semver.org/). Pre-1.0, a minor bump may break; every breaking change is marked in the changelog.
+Maintainers only. Versions follow [SemVer 2.0](https://semver.org/). Pre-1.0, a minor bump may break; every breaking change is marked in the changelog. What counts as breaking for each surface (routes, error codes, token claims, audit constructions, config keys, metrics, SDKs) and how it is deprecated first is in [API compatibility](docs/reference/api-compatibility.md); a change to the wire format is additive unless it follows those rules.
 
 1. Make sure `main` is green and `CHANGELOG.md`'s `Unreleased` section is complete. `git cliff --unreleased` gives a draft to compare against. `scripts/release-check.sh` runs every local check a release needs, including the crates, PyPI and npm dry runs; the 0.1.0 steps are in [docs/release/0.1.0.md](docs/release/0.1.0.md).
 2. Open a `chore(release): vX.Y.Z` PR that bumps `workspace.package.version` in `Cargo.toml` and the SDK versions with it (`sdk/python/pyproject.toml`, `sdk/typescript/package.json` and its lockfile; `scripts/release-check.sh` fails when they differ), moves `Unreleased` to a dated `[X.Y.Z]` heading with a compare link, and adds a fresh empty `Unreleased`.
