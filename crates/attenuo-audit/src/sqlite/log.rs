@@ -12,13 +12,11 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use time::OffsetDateTime;
 
 use super::connection::{
-    check_hash_version, check_record_fields, file_of, open_connection, open_memory_connection,
-    relaxed_sync_of, restore_sync, with_full_sync, Durability, WriteGate, BUSY_TIMEOUT, SYNC_FULL,
-    SYNC_NORMAL,
+    file_of, open_connection, open_memory_connection, relaxed_sync_of, restore_sync,
+    with_full_sync, Durability, WriteGate, BUSY_TIMEOUT, SYNC_FULL, SYNC_NORMAL,
 };
-use super::schema::{
-    create_record_id_index, AUDIT_SCHEMA, CHECKPOINT_SCHEMA, META_SCHEMA, RECORD_ID_EXPR,
-};
+use super::migrations::{check_entry_hash, migrate, SchemaState};
+use super::schema::RECORD_ID_EXPR;
 #[cfg(any(test, feature = "testing"))]
 use super::wal::WalTimings;
 use super::wal::{
@@ -362,6 +360,8 @@ pub struct SqliteAudit {
     /// [`read_conn`](Self::read_conn)); `None` for a store that is not a file in WAL mode,
     /// whose reads share the writer's connection.
     pub(super) reader: Option<Mutex<Connection>>,
+    /// The file's schema version and what this open did to it.
+    schema: SchemaState,
 }
 
 /// What the writer thread and the readers share.
@@ -868,26 +868,29 @@ impl SqliteAudit {
         Self::from_connection(open_memory_connection()?)
     }
 
-    /// Wrap an existing connection, creating the schema if needed.
+    /// Wrap an existing connection, bringing its file to
+    /// [`SCHEMA_VERSION`](crate::SCHEMA_VERSION) first (see [`schema`](Self::schema)).
+    ///
+    /// The migration runs on this connection, before the read-only reader connection is
+    /// opened, so the reader never sees a file mid-migration and never migrates. On a file
+    /// that is already current (a [`SqliteLeaseStore`](super::SqliteLeaseStore) on the same
+    /// file migrated it) it only reads `user_version`.
     ///
     /// # Errors
     ///
-    /// [`AuditError::Storage`] when the log predates records with `kind` and `chain_id`, or was
-    /// written with another entry hash construction than
-    /// [`ENTRY_HASH_VERSION`](crate::log::ENTRY_HASH_VERSION), such as one written before RFC
-    /// 8785 canonical JSON (SR-20): there is no migration, start a new file.
-    /// [`AuditError::Sqlite`] when the schema, the meta row or the record-id index cannot be
-    /// written (a read-only or foreign database, for example).
-    pub fn from_connection(conn: Connection) -> Result<Self, AuditError> {
-        check_record_fields(&conn)?;
-        conn.execute_batch(AUDIT_SCHEMA)?;
-        conn.execute_batch(CHECKPOINT_SCHEMA)?;
-        conn.execute_batch(META_SCHEMA)?;
-        check_hash_version(&conn)?;
-        // After the version check, so a log this version refuses is not changed by it.
-        create_record_id_index(&conn)?;
+    /// [`AuditError::SchemaTooNew`] when a newer attenuo wrote the file. [`AuditError::Storage`]
+    /// when the log predates records with `kind` and `chain_id`, or was written with another
+    /// entry hash construction than [`ENTRY_HASH_VERSION`](crate::log::ENTRY_HASH_VERSION),
+    /// such as one written before RFC 8785 canonical JSON (SR-20): there is no migration for
+    /// those, start a new file; or when a migration fails (the file stays at the version
+    /// before it). [`AuditError::Sqlite`] when the schema cannot be read or written (a
+    /// read-only or foreign database, for example).
+    pub fn from_connection(mut conn: Connection) -> Result<Self, AuditError> {
+        let schema = migrate(&mut conn)?;
+        check_entry_hash(&conn, false)?;
         let relaxed_sync = relaxed_sync_of(&conn)?;
         let file = file_of(&conn);
+        // After the migration: the reader only ever sees a current file.
         let reader = open_reader(&conn)?.map(Mutex::new);
         Ok(Self {
             inner: Arc::new(Inner {
@@ -906,7 +909,13 @@ impl SqliteAudit {
             writer: OnceLock::new(),
             wal: None,
             reader,
+            schema,
         })
+    }
+
+    /// The file's schema version and whether this open migrated it (for the start-up log).
+    pub fn schema(&self) -> SchemaState {
+        self.schema
     }
 
     /// The connection queries run on: the read-only reader when there is one, else the

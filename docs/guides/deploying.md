@@ -382,4 +382,31 @@ If you run a second system that needs to react to revocations, such as an AuthZE
 
 Until 1.0, minor versions can change the config, the token format and the database layout. Read the [CHANGELOG](https://github.com/attenuo-dev/attenuo/blob/main/CHANGELOG.md) before every upgrade, and back up the database and the key first. Tokens issued by one version may not verify on the next. Plan to re-mint.
 
+### The database schema
+
+The SQLite file carries a schema version (SQLite's `user_version`). Each build knows the newest version it can read, and upgrades the file to it when it starts. An upgrade of the database goes like this:
+
+1. Stop the old server, and wait until it has exited (it holds the [single-writer lock](#one-process-per-file)).
+2. Back up the file with `sqlite3 attenuo.sqlite ".backup '/backups/attenuo-before-upgrade.sqlite'"`, or copy `attenuo.sqlite`, `-wal` and `-shm` together while nothing runs. This backup is the only way back.
+3. Start the new binary. Before it serves anything, it brings the file to its schema version, each step in one transaction, and logs it (timestamps left out):
+
+   ```text
+   INFO attenuo_server::state: database schema migrated path="/var/lib/attenuo/attenuo.sqlite" from=0 to=1
+   INFO attenuo_server::state: audit store opened (WAL) path="/var/lib/attenuo/attenuo.sqlite" durability=normal wal_checkpoint_seconds=5 schema_version=1
+   ```
+
+   `from=0` is a new file or one written before schema versions existed. Every start logs `schema_version` on the `audit store opened` line, so the version a server runs on is in its start-up log. A step that fails leaves the file at the version before it, and the server does not start; the error names the step.
+
+Rules that follow from this:
+
+- **There is no downgrade.** An older binary refuses a file a newer one has migrated, before it reads or writes anything:
+
+  ```text
+  Error: opening audit log /var/lib/attenuo/attenuo.sqlite: the database has schema version 2, written by a newer attenuo; this build reads schema versions up to 1. Run the newer binary, or restore the backup taken before upgrading: there is no downgrade
+  ```
+
+  To go back, restore the backup from step 2. Whatever happened after the upgrade, decisions and revocations included, is not in it (see "Know what a restore does" under [Backup](#sqlite-file-placement-and-backup)).
+- **A file from before schema versions** (any build before this was added) is adopted as version 1 at the first start: tables and indexes that came later are created, the two `approvals` columns that came later are added, and no row changes, so the audit chain, its head and the signed checkpoints stay as they were. A log written before records had `kind` and `chain_id`, or hashed before RFC 8785 canonical JSON, is refused as before: move it aside and start a new file.
+- Several servers on one file are already ruled out by the lock, so a migration never races a running server.
+
 **Run limits need every server on 0.1.0 or later.** A `limits` block in a capability is an open field that older servers accept and ignore, so a token whose budget says "at most 2 payments" is unlimited when an older binary checks it (any build from `main` before run limits landed on 2026-10-24). Nothing fails and nothing is logged: the decision record of the old server simply has no `budget` member. Until every replica, and every external PEP that reads `limits`, runs 0.1.0 or later, do not rely on a limit for safety; use a Cedar `forbid` for the same call, or an approval, and add the limit on top. Check the mixed-version window with `attenuo audit tail --json`: a `decision` record for a limited capability without `budget` came from an old server. (The injection-suite runner probes for this before its limits arms and refuses to run them against an old server.)

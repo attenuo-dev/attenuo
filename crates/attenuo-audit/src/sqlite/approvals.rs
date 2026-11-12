@@ -61,25 +61,6 @@ pub(super) fn approval_in(conn: &Connection, id: &str) -> Result<Option<Approval
     }
 }
 
-/// Add the `approvals` columns that came after the table: `jkt` (approval tokens) and
-/// `untrusted_args` (output labelling phase 2), each in the same release cycle as the table
-/// and never shipped without it, but cheap to carry. A missing value reads as `NULL`: an
-/// approval with no key binding, or with no matched arguments.
-pub(super) fn add_approval_columns(conn: &Connection) -> Result<(), AuditError> {
-    let cols: Vec<String> = conn
-        .prepare("SELECT name FROM pragma_table_info('approvals')")?
-        .query_map([], |r| r.get(0))?
-        .collect::<Result<_, _>>()?;
-    for column in ["jkt", "untrusted_args"] {
-        if !cols.iter().any(|c| c == column) {
-            conn.execute_batch(&format!(
-                "ALTER TABLE approvals ADD COLUMN {column} TEXT NULL"
-            ))?;
-        }
-    }
-    Ok(())
-}
-
 /// Approvals of one run for one call hash in one state. Expiry is compared in Rust: the
 /// stored times are RFC 3339 text, which does not sort as time across offsets.
 pub(super) fn approvals_for_call(

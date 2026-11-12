@@ -10,7 +10,8 @@
 //! The code is split by store: [`SqliteAudit`] is in `log.rs` (with the WAL checkpointer in
 //! `wal.rs`), [`SqliteLeaseStore`] in `leases.rs` (with run limits in `budgets.rs`, approvals
 //! in `approvals.rs` and the notice outbox in `outbox.rs`). Both open their connections
-//! through `connection.rs` and share the schema in `schema.rs`.
+//! through `connection.rs`, share the schema in `schema.rs` and bring a file to the current
+//! schema version with the one list of migrations in `migrations.rs`.
 
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -23,6 +24,7 @@ mod connection;
 mod fence;
 mod leases;
 mod log;
+mod migrations;
 mod outbox;
 mod schema;
 #[cfg(test)]
@@ -34,6 +36,7 @@ pub use connection::Durability;
 pub use fence::WriterFence;
 pub use leases::SqliteLeaseStore;
 pub use log::{AppendStats, SqliteAudit, DEFAULT_APPEND_QUEUE, DEFAULT_APPEND_TIMEOUT, MAX_BATCH};
+pub use migrations::{SchemaState, SCHEMA_VERSION};
 pub use outbox::{NewNotice, OutboxNotice};
 pub use wal::{
     WalCheckpoint, WalStats, CHECKPOINT_PRESYNC_LEAD, DEFAULT_WAL_CHECKPOINT_INTERVAL,

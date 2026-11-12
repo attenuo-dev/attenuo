@@ -242,7 +242,8 @@ impl From<attenuo_audit::AuditError> for ApiError {
             | E::Jwks(_)
             | E::BindingConflict(_)
             | E::Fenced { .. }
-            | E::Overloaded(_)) => ApiError::internal(e),
+            | E::Overloaded(_)
+            | E::SchemaTooNew { .. }) => ApiError::internal(e),
         }
     }
 }
@@ -346,6 +347,10 @@ mod tests {
                 holder: Some(42),
             },
             E::Overloaded("the audit writer's queue is full"),
+            E::SchemaTooNew {
+                found: 2,
+                supported: 1,
+            },
         ]
     }
 
@@ -382,6 +387,8 @@ mod tests {
                 E::TooManyPendingApprovals { .. } => (18, false),
                 E::Fenced { .. } => (19, true),
                 E::Overloaded(_) => (20, true),
+                // Only at start-up, which it stops.
+                E::SchemaTooNew { .. } => (21, true),
             }
         }
         let all = one_of_each_audit_error();
