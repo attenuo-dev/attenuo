@@ -9,18 +9,19 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use attenuo_policy::{ArgType, ToolAttrs};
-use attenuo_proxy::testing::{spawn_router, FakeMcpServer, Spawned};
+use attenuo_proxy::testing::{FakeMcpServer, Spawned};
 use attenuo_proxy::UpstreamConfig;
 use attenuo_server::config::{DpopMode, DpopNonceMode};
-use attenuo_server::Config;
+use attenuo_server::{AppState, Config};
 use attenuo_token::DpopKey;
 use reqwest::{RequestBuilder, StatusCode};
 use serde_json::{json, Value};
 use time::OffsetDateTime;
 
-use common::agent_configs;
+use common::{agent_configs, Running};
 
 const ADMIN: &str = "dpop-test-admin";
 const AGENTS: &[&str] = &["planner", "coder", "reviewer"];
@@ -34,7 +35,8 @@ fn secret(id: &str) -> String {
 struct Server {
     upstream: FakeMcpServer,
     _upstream_task: Spawned,
-    server: Spawned,
+    server: Running,
+    state: Arc<AppState>,
     client: reqwest::Client,
 }
 
@@ -77,11 +79,12 @@ async fn start_with(dir: &Path, mode: DpopMode, nonce: DpopNonceMode) -> Server 
     cfg.token.dpop = mode;
     cfg.token.dpop_nonce = nonce;
     cfg.agents = agent_configs(AGENTS, secret);
-    let (router, _state) = attenuo_server::build(&cfg).unwrap();
+    let (router, state) = attenuo_server::build(&cfg).unwrap();
     Server {
         upstream,
         _upstream_task: upstream_task,
-        server: spawn_router(router).await.unwrap(),
+        server: Running::start(cfg, state.clone(), router).await,
+        state,
         client: reqwest::Client::new(),
     }
 }
@@ -96,21 +99,11 @@ fn proof(key: &DpopKey, url: &str, token: Option<&str>) -> String {
 }
 
 impl Server {
-    /// Stop this server and wait until it has let go of the SQLite file in `dir`: its router,
-    /// client connections and state are dropped, which releases the single-writer fence.
-    async fn stop(self, dir: &Path) {
-        drop(self);
-        let db = dir.join("audit.sqlite");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            match attenuo_audit::WriterFence::acquire(&db) {
-                Ok(fence) => return drop(fence),
-                Err(_) if std::time::Instant::now() < deadline => {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-                Err(e) => panic!("the stopped server still holds the database: {e}"),
-            }
-        }
+    /// Stop this server as `serve` does after a signal; once this returns it has let go of
+    /// the SQLite file, so the next server on the same `dir` can start ([`Running::stop`]).
+    async fn stop(self) {
+        let Self { server, state, .. } = self;
+        server.stop(state).await;
     }
 
     fn url(&self, path: &str) -> String {
@@ -569,7 +562,7 @@ async fn required_mode_refuses_unbound_exchanges_sr24() {
     let key = DpopKey::generate().unwrap();
     let unbound = optional.root_token(None).await;
     let bound = optional.root_token(Some(&key)).await;
-    optional.stop(dir.path()).await;
+    optional.stop().await;
     let required = start(dir.path(), DpopMode::Required).await;
 
     // `required`: no unbound issuance, no unbound token accepted.
@@ -591,7 +584,7 @@ async fn required_mode_refuses_unbound_exchanges_sr24() {
     )
     .await;
     required.root_token(Some(&key)).await;
-    required.stop(dir.path()).await;
+    required.stop().await;
 
     // `off`: proofs are ignored at issuance, but a bound token still needs one.
     let off = start(dir.path(), DpopMode::Off).await;
@@ -720,13 +713,13 @@ async fn server_nonce_required_through_the_proxy() {
 
     // A server with the same issuer key accepts the nonce (no shared storage needed); one
     // with nonces off neither sends nor checks them. They run on the same file, so in turn.
-    s.stop(dir.path()).await;
+    s.stop().await;
     let twin = start_with(dir.path(), DpopMode::Optional, DpopNonceMode::Required).await;
     let twin_mcp = twin.url("/mcp/github");
     let p = key.proof_with_nonce("POST", &twin_mcp, Some(&token), Some(&nonce), now());
     let resp = twin.call(&token, Some(p)).send().await.unwrap();
     assert!(allowed(&resp.json().await.unwrap()));
-    twin.stop(dir.path()).await;
+    twin.stop().await;
     let off = start(dir.path(), DpopMode::Optional).await;
     let off_mcp = off.url("/mcp/github");
     let resp = off
