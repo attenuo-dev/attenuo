@@ -313,10 +313,12 @@ const READER_STATEMENT_CACHE: usize = 32;
 /// either gets its committed entry back or an error, never a guess.
 ///
 /// **Bounded waits.** The writer's queue holds at most [`DEFAULT_APPEND_QUEUE`] appends and
-/// each waits at most [`DEFAULT_APPEND_TIMEOUT`] for its entry
+/// each waits at most [`DEFAULT_APPEND_TIMEOUT`] for the writer to take it
 /// ([`with_append_limits`](Self::with_append_limits)); past either the append fails with
-/// [`AuditError::Overloaded`], so a hung disk denies decisions instead of blocking threads
-/// without end.
+/// [`AuditError::Overloaded`] and is never written, so a hung disk denies decisions instead
+/// of blocking threads without end. The writer takes a batch only once it holds the
+/// connection, and the callers of a taken batch (at most [`MAX_BATCH`]) wait for its commit
+/// however long it takes, so an append that fails was not committed (SR-102).
 ///
 /// **Inline commit.** When no append is waiting for the writer and the connection is free, an
 /// append commits on the caller's thread instead, the same one-record transaction the writer
@@ -386,6 +388,45 @@ pub(super) struct Inner {
     /// Tests: every commit and the `synchronous` level it ran at, in one log with the hook.
     #[cfg(test)]
     probe: Option<Arc<Mutex<Vec<String>>>>,
+    /// Tests: the writer stops here once it has taken a batch, before committing it.
+    #[cfg(test)]
+    pub(super) take_gate: Option<Arc<TakeGate>>,
+}
+
+/// Tests: holds the writer between taking a batch and committing it, so a test can make an
+/// append's wait run out at exactly that point.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct TakeGate {
+    state: Mutex<(bool, bool)>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl TakeGate {
+    /// The writer: note that a batch is taken and wait until the test lets it commit.
+    fn hold(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.0 = true;
+        self.changed.notify_all();
+        while !s.1 {
+            s = self.changed.wait(s).unwrap();
+        }
+    }
+
+    /// Wait until the writer has taken a batch.
+    pub(super) fn wait_taken(&self) {
+        let mut s = self.state.lock().unwrap();
+        while !s.0 {
+            s = self.changed.wait(s).unwrap();
+        }
+    }
+
+    /// Let the writer commit.
+    pub(super) fn release(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.changed.notify_all();
+    }
 }
 
 /// Why [`Inner::commit_tx`] wrote nothing. Either way the records come back.
@@ -468,14 +509,16 @@ impl Writer {
         }
     }
 
-    /// Queue `record` for the writer and wait for its entry, at most `inner.append_timeout`.
+    /// Queue `record` for the writer and wait for its entry.
     ///
-    /// A full queue fails at once. When the wait times out, the job is withdrawn if the writer
-    /// has not taken it yet, so it is never written; if the writer has (its batch is being
-    /// committed, or is stuck committing), the caller gives up all the same and the entry may
-    /// still be committed later. Either way the caller gets [`AuditError::Overloaded`] and its
-    /// decision fails closed. Which records are committed, and in what order, is decided by
-    /// the writer alone, so the chain stays linear whatever the callers do.
+    /// A full queue fails at once. A job the writer has not taken within
+    /// `inner.append_timeout` is withdrawn, never written, and the caller gets
+    /// [`AuditError::Overloaded`], so its decision fails closed. The writer takes a job only
+    /// once it holds the connection, right before the commit; a caller whose job was taken
+    /// waits for the commit's outcome however long it takes, as an inline commit does. So an
+    /// error always means the record is not in the log and never will be, and the caller may
+    /// undo what it charged (SR-102). Which records are committed, and in what order, is
+    /// decided by the writer alone, so the chain stays linear whatever the callers do.
     fn append(
         &self,
         inner: &Inner,
@@ -499,27 +542,32 @@ impl Writer {
             }
             Err(mpsc::TrySendError::Disconnected(_)) => return Err(stopped()),
         }
+        // Tests: start the wait only once the writer holds the batch, so it runs out there.
+        #[cfg(test)]
+        if let Some(gate) = &inner.take_gate {
+            gate.wait_taken();
+        }
         match answer.recv_timeout(inner.append_timeout) {
             Ok(result) => result,
             // A writer that panicked drops the reply sender: the append fails, it is not
             // assumed.
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(stopped()),
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                let withdrawn = claim
+                if claim
                     .compare_exchange(WAITING, ABANDONED, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok();
-                if !withdrawn {
-                    // Taken: the answer may have arrived since the wait ended.
-                    if let Ok(result) = answer.try_recv() {
-                        return result;
-                    }
+                    .is_ok()
+                {
+                    inner.shed.timeouts.fetch_add(1, Ordering::Relaxed);
+                    return Err(AuditError::Overloaded(
+                        "the audit writer did not take the record within the append timeout",
+                    ));
                 }
-                inner.shed.timeouts.fetch_add(1, Ordering::Relaxed);
-                Err(AuditError::Overloaded(if withdrawn {
-                    "the audit writer did not take the record within the append timeout"
-                } else {
-                    "the audit writer did not commit the record within the append timeout"
-                }))
+                // Taken: the writer holds the connection and is committing the record. Wait
+                // for the outcome, as an inline commit does, so that an error always means
+                // the record was not written and the caller may roll back what it charged
+                // (SR-102). Only the one batch in hand can wait here: the writer takes no
+                // other while it commits.
+                answer.recv().unwrap_or_else(|_| Err(stopped()))
             }
         }
     }
@@ -536,24 +584,44 @@ impl Drop for Writer {
 
 fn writer_loop(inner: &Inner, jobs: &mpsc::Receiver<Job>) {
     while let Ok(first) = jobs.recv() {
-        // Jobs whose callers gave up are dropped here, before anything is written; the rest
-        // keep the order in which they reached the queue.
-        let mut batch: Vec<Job> = first.take().into_iter().collect();
+        let mut batch: Vec<Job> = vec![first];
         while batch.len() < MAX_BATCH {
             match jobs.try_recv() {
-                Ok(job) => batch.extend(job.take()),
+                Ok(job) => batch.push(job),
                 Err(_) => break,
             }
         }
+        // Claim the jobs only once the connection is held, right before the commit: a job
+        // whose caller gave up meanwhile (the connection was busy) is dropped unwritten, and
+        // a claimed job is committed or fails without further waits on anything but the
+        // commit itself, whose outcome its caller waits for (SR-102).
+        let mut conn = match inner.conn.lock() {
+            Ok(c) => c,
+            Err(_) => {
+                for job in batch.into_iter().filter_map(Job::take) {
+                    let _ = job.reply.send(Err(AuditError::Poisoned));
+                }
+                continue;
+            }
+        };
+        // Jobs whose callers gave up are dropped here, before anything is written; the rest
+        // keep the order in which they reached the queue.
+        let batch: Vec<Job> = batch.into_iter().filter_map(Job::take).collect();
         if batch.is_empty() {
             continue;
+        }
+        #[cfg(test)]
+        if let Some(gate) = &inner.take_gate {
+            gate.hold();
         }
         // One record that must be synced makes the whole batch commit at `FULL`: one sync
         // covers them all.
         let sync = batch.iter().any(|j| j.sync);
         let (records, replies): (Vec<_>, Vec<_>) =
             batch.into_iter().map(|j| (j.record, j.reply)).unzip();
-        for (reply, result) in replies.into_iter().zip(inner.append_batch(records, sync)) {
+        let results = inner.append_locked(&mut conn, records, sync);
+        drop(conn);
+        for (reply, result) in replies.into_iter().zip(results) {
             // The caller always waits for its answer; a send can only fail if it panicked.
             let _ = reply.send(result);
         }
@@ -562,7 +630,9 @@ fn writer_loop(inner: &Inner, jobs: &mpsc::Receiver<Job>) {
 
 impl Inner {
     /// Commit `records` in order, as one transaction when possible. One result per record.
-    /// With `sync`, every commit runs at `synchronous=FULL`.
+    /// With `sync`, every commit runs at `synchronous=FULL`. Tests only: the writer locks the
+    /// connection itself and calls [`append_locked`](Self::append_locked).
+    #[cfg(test)]
     pub(super) fn append_batch(
         &self,
         records: Vec<DecisionRecord>,
@@ -905,6 +975,8 @@ impl SqliteAudit {
                 shed: ShedCounters::default(),
                 #[cfg(test)]
                 probe: None,
+                #[cfg(test)]
+                take_gate: None,
             }),
             writer: OnceLock::new(),
             wal: None,
@@ -1096,11 +1168,13 @@ impl SqliteAudit {
     }
 
     /// Bound the appends that wait for the writer thread: at most `queue` (at least 1) wait at
-    /// once, and each waits at most `timeout` for its entry. A full queue, or a wait that
-    /// runs out, fails the append with [`AuditError::Overloaded`] (counted in
-    /// [`append_stats`](Self::append_stats)), so a writer stuck on a hung disk turns into
-    /// failed appends, and denied decisions, instead of an ever-growing number of blocked
-    /// threads. Group commit is unchanged: what reaches the writer is batched and committed in
+    /// once, and each waits at most `timeout` for the writer to take it. A full queue, or a
+    /// wait that runs out, fails the append with [`AuditError::Overloaded`] (counted in
+    /// [`append_stats`](Self::append_stats)) and the record is never written, so a writer
+    /// stuck on a hung disk turns into failed appends, and denied decisions, instead of an
+    /// ever-growing number of blocked threads. The appends of the one batch the writer has
+    /// taken wait for its commit without a deadline, so their outcome is never a guess
+    /// (SR-102). Group commit is unchanged: what reaches the writer is batched and committed in
     /// queue order. An append committed inline, on the caller's thread (when nothing waits
     /// and the connection is free), has no deadline: a thread cannot be taken out of a stuck
     /// write, and it holds the connection, so every later append goes to the queue and is
@@ -1815,5 +1889,16 @@ impl SqliteAudit {
     pub(super) fn with_probe(mut self, log: Arc<Mutex<Vec<String>>>) -> Self {
         self.inner_mut().probe = Some(log);
         self
+    }
+
+    /// Stop the writer at `gate` after it takes each batch (see [`TakeGate`]).
+    pub(super) fn with_take_gate(mut self, gate: Arc<TakeGate>) -> Self {
+        self.inner_mut().take_gate = Some(gate);
+        self
+    }
+
+    /// Send every later append to the writer thread, as if one were already waiting there.
+    pub(super) fn never_inline(&self) {
+        self.inner.activity.pending.fetch_add(1, Ordering::AcqRel);
     }
 }

@@ -1248,3 +1248,49 @@ fn a_paged_verify_reports_a_corrupt_row_at_its_seq() {
     assert!(!report.ok);
     assert_eq!(report.first_bad_seq, Some(1200));
 }
+
+/// SR-102: once the writer has taken a record, its caller waits for the true outcome, even
+/// past the append timeout. Before the fix the caller gave up with `Overloaded` (and the
+/// pipeline refunded the charge and gave the approval back) while the writer still committed
+/// the record afterwards, so the log held an `allow` for a call that was denied.
+#[test]
+fn a_taken_append_is_waited_for_past_the_timeout_sr102() {
+    use super::log::TakeGate;
+    let gate = Arc::new(TakeGate::default());
+    let timeout = Duration::from_millis(20);
+    let log = Arc::new(
+        SqliteAudit::open_in_memory()
+            .unwrap()
+            .with_append_limits(8, timeout)
+            .with_take_gate(Arc::clone(&gate)),
+    );
+    log.never_inline();
+    let (tx, rx) = mpsc::channel();
+    let appender = {
+        let log = Arc::clone(&log);
+        std::thread::spawn(move || tx.send(log.append(record(1))).unwrap())
+    };
+    // The writer holds the record and has not committed it; the caller's deadline runs now.
+    gate.wait_taken();
+    let early = rx.recv_timeout(timeout * 10);
+    // Let the writer go before any assertion, so a failure does not hang the drop.
+    gate.release();
+    match early {
+        Err(mpsc::RecvTimeoutError::Timeout) => {}
+        Ok(answer) => {
+            appender.join().unwrap();
+            let head = log.head().unwrap().map(|h| h.seq);
+            panic!(
+                "the caller gave up on a record the writer had taken ({answer:?}); \
+                 the log head is now {head:?}"
+            )
+        }
+        Err(e) => panic!("{e}"),
+    }
+    let entry = rx.recv().unwrap().expect("the caller learns the commit");
+    appender.join().unwrap();
+    assert_eq!(entry.seq, 1);
+    assert_eq!(log.head().unwrap().map(|h| h.seq), Some(1));
+    assert_eq!(log.append_stats().timeouts, 0);
+    assert!(log.verify_chain().unwrap().ok);
+}

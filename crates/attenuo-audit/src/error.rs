@@ -93,8 +93,9 @@ pub enum AuditError {
         holder: Option<u32>,
     },
     /// An append was shed instead of waiting without bound: the writer's queue was full, or
-    /// the writer did not answer within the append timeout (a hung disk, say). The decision it
-    /// belongs to fails closed.
+    /// the writer did not take the record within the append timeout (a hung disk, say). The
+    /// record was not written and never will be, so the caller may undo what the decision
+    /// charged; the decision fails closed.
     #[error("audit append shed: {0}")]
     Overloaded(&'static str),
     /// The database file's schema version (`PRAGMA user_version`) is newer than this build
