@@ -27,7 +27,8 @@ is offered every tool in the suite.
 --endpoint URL runs a local open-weight model behind an OpenAI-compatible server, as in pilot.py.
 --suite picks the suite (workspace by default). --grant-source planner gives each run the
 planner-written grant for its user task instead of the oracle's, from --planner-grants DIR under
-the same FROZEN check as replay.py; the server's policy does not change.
+the same FROZEN check as replay.py; the server's policy does not change. --resume skips the runs
+a stopped process in the same --out already completed (done.jsonl).
 
     PYTHONPATH=sdk/python/src python evaluation/agentdojo/enforced.py --out DIR --suite slack \
         --endpoint http://127.0.0.1:11434/v1 --model qwen2.5:14b \
@@ -205,9 +206,18 @@ class ProxyToolList(BasePipelineElement):
         return query, FunctionsRuntime(keep), env, messages, extra_args
 
 
+def finished(out: Path) -> set[str]:
+    """Runs a stopped process in this directory completed (`--resume`)."""
+    path = out / "done.jsonl"
+    if not path.exists():
+        return set()
+    return {json.loads(line)["run"] for line in path.read_text(encoding="utf-8").splitlines()}
+
+
 def attempt(args, label: str, task) -> None:
     """One benchmark run. With a local model a run that raises is logged and the next one
-    starts; on the paid API it stops the process, as before."""
+    starts; on the paid API it stops the process, as before. A completed run is noted in
+    done.jsonl, which `--resume` reads."""
     try:
         task()
     except pilot.OverCap:
@@ -219,6 +229,8 @@ def attempt(args, label: str, task) -> None:
             fh.write(json.dumps({"run": label, "error": repr(err)[:300]}) + "\n")
         print(json.dumps({"run": label, "error": repr(err)[:300]}), flush=True)
         return
+    with (args.out / "done.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"run": label}) + "\n")
     print(json.dumps({"run": label}), flush=True)
 
 
@@ -258,12 +270,15 @@ def run(args) -> None:
     users = replay.by_id(suite.user_tasks)[: args.tasks or None][shard::shards]
     injections = replay.by_id(suite.injection_tasks)
     logs = args.out / "logs"
+    skip = finished(args.out) if args.resume else set()
     warnings.simplefilter("ignore")
     try:
         with OutputLogger(str(logs)):
             for user in users:
                 truth = user.ground_truth(base_env.model_copy(deep=True))
                 label = f"{SUITE}/{user.ID}/none"
+                if label in skip:
+                    continue
                 meter.task = label
                 executor.start_run(label, truth)
                 attempt(
@@ -279,6 +294,8 @@ def run(args) -> None:
                 truth = user.ground_truth(base_env.model_copy(deep=True))
                 for injection in injections:
                     label = f"{SUITE}/{user.ID}/{injection.ID}"
+                    if label in skip:
+                        continue
                     meter.task = label
                     executor.start_run(label, truth)
                     attempt(
@@ -334,6 +351,7 @@ def main() -> None:
     parser.add_argument("--binary", type=Path, default=replay.ROOT / "target/debug/attenuo-server")
     parser.add_argument("--summarize", action="store_true")
     parser.add_argument("--suite", choices=replay.SUITES, default="workspace")
+    parser.add_argument("--resume", action="store_true", help="skip runs noted in done.jsonl")
     parser.add_argument("--endpoint", help="OpenAI-compatible base URL of a local model server")
     parser.add_argument("--address-as", help="the attack's name for a local model")
     parser.add_argument("--grant-source", choices=("oracle", "planner"), default="oracle")
