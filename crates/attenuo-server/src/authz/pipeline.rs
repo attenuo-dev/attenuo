@@ -666,6 +666,7 @@ impl Pipeline {
         });
         let append_time = t2.elapsed();
         self.metrics.observe_audit_append(append_time);
+        self.metrics.audit_append_result(appended.is_ok());
         let lease_time = t1 - t0;
         self.metrics.observe_stage(Stage::LeaseCheck, lease_time);
         if let Some(d) = policy_time {

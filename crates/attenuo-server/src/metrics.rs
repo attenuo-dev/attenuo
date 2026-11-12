@@ -117,6 +117,12 @@ pub struct Metrics {
     /// [`RUN_STATE_KINDS`].
     run_state_pruned: [AtomicU64; 4],
     audit_append_errors: AtomicU64,
+    /// When the last audit append failed, as milliseconds since `epoch` plus one; 0 when the
+    /// last append succeeded or none has failed (`/readyz`, see
+    /// [`audit_append_failing`](Metrics::audit_append_failing)).
+    audit_append_failed_at: AtomicU64,
+    /// The instant `audit_append_failed_at` counts from.
+    epoch: std::time::Instant,
     audit_checkpoints: AtomicU64,
     /// `[audit.sink]` (SR-21): checkpoints delivered, delivery attempts that failed,
     /// checkpoints dropped from a full queue, the queue depth, and when the oldest undelivered
@@ -199,6 +205,8 @@ impl Default for Metrics {
             leases_pruned: AtomicU64::default(),
             run_state_pruned: Default::default(),
             audit_append_errors: AtomicU64::default(),
+            audit_append_failed_at: AtomicU64::default(),
+            epoch: std::time::Instant::now(),
             audit_checkpoints: AtomicU64::default(),
             audit_sink_delivered: AtomicU64::default(),
             audit_sink_failures: AtomicU64::default(),
@@ -395,12 +403,45 @@ impl Metrics {
         self.audit_append.observe(d);
     }
 
-    /// Run an audit append and record its duration.
-    pub fn time_audit_append<R>(&self, append: impl FnOnce() -> R) -> R {
+    /// Run an audit append, record its duration and note whether it failed (see
+    /// [`audit_append_result`](Self::audit_append_result)).
+    ///
+    /// # Errors
+    ///
+    /// Whatever `append` returns, unchanged.
+    pub fn time_audit_append<T, E>(&self, append: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
         let started = std::time::Instant::now();
         let out = append();
         self.observe_audit_append(started.elapsed());
+        self.audit_append_result(out.is_ok());
         out
+    }
+
+    /// Note how an audit append ended, for `/readyz`: a failure marks the audit log failing,
+    /// the next success clears it. Every append the server makes reports here.
+    pub fn audit_append_result(&self, ok: bool) {
+        let at = if ok {
+            0
+        } else {
+            u64::try_from(self.epoch.elapsed().as_millis())
+                .unwrap_or(u64::MAX - 1)
+                .saturating_add(1)
+        };
+        self.audit_append_failed_at.store(at, Ordering::Relaxed);
+    }
+
+    /// Whether the most recent audit append failed, less than `hold` ago. `/readyz` reports
+    /// not ready while this holds (A-12). The flag clears on the next successful append; the
+    /// `hold` bounds it too, because a server that readiness has taken out of rotation gets
+    /// no traffic and so no append that could clear it: after `hold` it is offered traffic
+    /// again, and the next failure takes it out once more.
+    pub fn audit_append_failing(&self, hold: Duration) -> bool {
+        let at = self.audit_append_failed_at.load(Ordering::Relaxed);
+        if at == 0 {
+            return false;
+        }
+        let failed = Duration::from_millis(at - 1);
+        self.epoch.elapsed().saturating_sub(failed) < hold
     }
 
     /// Record how long one stage of a proxied call took (see [`Stage`]).
@@ -1336,9 +1377,9 @@ mod tests {
         m.observe_audit_append(Duration::from_millis(7));
         let slow = m.time_audit_append(|| {
             std::thread::sleep(Duration::from_millis(30));
-            "done"
+            Ok::<_, ()>("done")
         });
-        assert_eq!(slow, "done");
+        assert_eq!(slow, Ok("done"));
         m.audit_checkpoint();
         m.audit_checkpoint();
         let text = m.render();
@@ -1584,5 +1625,24 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// A-12: a failed append marks the audit log failing until the next success, or until
+    /// the hold has passed.
+    #[test]
+    fn a_failed_append_marks_the_audit_log_failing_until_the_next_success() {
+        let m = Metrics::new();
+        let hold = Duration::from_secs(30);
+        assert!(!m.audit_append_failing(hold));
+        assert_eq!(
+            m.time_audit_append(|| Err::<(), _>("disk full")),
+            Err("disk full")
+        );
+        assert!(m.audit_append_failing(hold));
+        assert!(!m.audit_append_failing(Duration::ZERO), "past the hold");
+        assert_eq!(m.time_audit_append(|| Ok::<_, ()>(1)), Ok(1));
+        assert!(!m.audit_append_failing(hold));
+        m.audit_append_result(false);
+        assert!(m.audit_append_failing(hold));
     }
 }

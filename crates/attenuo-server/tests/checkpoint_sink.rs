@@ -188,7 +188,7 @@ async fn webhook_sink_ships_each_checkpoint_with_retries_sr21() {
     assert_eq!(
         body,
         json!({"ready": true, "degraded": false,
-               "checks": {"audit": "ok", "leases": "ok", "checkpoint_sink": "ok"}})
+               "checks": {"audit": "ok", "audit_append": "ok", "leases": "ok", "checkpoint_sink": "ok"}})
     );
     let metrics = h.state.metrics.render();
     assert!(
@@ -252,7 +252,7 @@ async fn a_failing_sink_degrades_readyz_and_counts_drops_sr21() {
     assert_eq!(
         body,
         json!({"ready": false, "degraded": true,
-               "checks": {"audit": "ok", "leases": "ok", "checkpoint_sink": "degraded"}})
+               "checks": {"audit": "ok", "audit_append": "ok", "leases": "ok", "checkpoint_sink": "degraded"}})
     );
 }
 
