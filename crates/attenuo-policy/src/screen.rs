@@ -182,7 +182,7 @@ fn attr_key(attrs: &ToolAttrs) -> AttrKey {
 }
 
 /// Screen verdicts by (chain digest, policy generation, server), then tool. A list of the same
-/// chain costs one lookup per tool. Emptied on a policy reload, and keyed on the generation
+/// chain costs one lookup per tool. A reload starts a new, empty one, and keyed on the generation
 /// as well, so a verdict of an earlier policy set is never served.
 #[derive(Debug, Default)]
 pub(crate) struct ScreenMemo {
@@ -201,13 +201,6 @@ struct MemoInner {
 }
 
 impl ScreenMemo {
-    pub(crate) fn clear(&self) {
-        if let Ok(mut m) = self.inner.lock() {
-            m.lists.clear();
-            m.entries = 0;
-        }
-    }
-
     pub(crate) fn len(&self) -> usize {
         self.inner.lock().map(|m| m.entries).unwrap_or(0)
     }
