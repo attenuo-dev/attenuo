@@ -25,10 +25,7 @@ ROOT = Path(__file__).resolve().parent.parent
 GITHUB = "https://github.com/attenuo-dev/attenuo"
 # Book pages that still link out of the book. They are reported as warnings
 # until their owners convert them; remove an entry once its page is clean.
-LEAVES_BOOK_PENDING = {
-    "docs/evaluation/injection-suite.md",
-    "docs/report/attenuo-2026-11.md",
-}
+LEAVES_BOOK_PENDING: set[str] = set()
 SKIP_DIRS = {".git", "target", "node_modules", ".obsidian", ".claude"}
 LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 FENCE = re.compile(r"^\s*(```|~~~)")
