@@ -194,11 +194,12 @@ It resolves to a `SelectorRevocation`: `selector` (as the server shows it, with 
 ### Capabilities
 
 ```ts
-import { capability, equals, oneOf, prefix, range } from "@attenuo/sdk";
+import { capability, equals, oneOf, pathPrefix, prefix, range } from "@attenuo/sdk";
 
 capability("github", "read_file"); // github:read_file
 capability("github", "create_issue", { repo: oneOf("acme/api", "acme/web") });
 capability("github", "read_*", { repo: prefix("alice/public-"), ref: equals("main") });
+capability("fs", "read_file", { path: pathPrefix("/workspace") }); // /workspace and below, no ..
 capability("banking", "send_money", { amount: range({ min: 0, max: 2000 }) }); // 0 <= amount <= 2000
 capability("banking", "refund", { amount: range({ max: 50 }) }); // no lower bound
 capability("github", "list_issues", { state: "open" }); // a bare value means equals
@@ -207,6 +208,8 @@ capability("github", "list_issues", { state: "open" }); // a bare value means eq
 Capabilities serialize as the server expects: `{ server, tool, constraints: { repo: { op: "prefix", value: "..." } } }`, with `constraints` omitted when empty. `exchange` and `mintRootDev` also take `"server:tool"` strings (comma-separated lists too, like the CLI's `--cap`) and raw objects.
 
 `range({ min, max })` bounds an integer argument, both ends inclusive; leave one out for no bound on that side, but not both. It throws a `TypeError` for no bound, `min > max` or a bound that is not a safe integer. The server reads the argument as Cedar does (`5.0` is `5`), and a fraction or a numeric string is outside every range. A child may narrow a range (`range({ min: 10, max: 500 })` under `range({ min: 0, max: 2000 })`, or `oneOf(100, 200)`), never widen it. A range bounds each call; to bound the total over a run as well, add a `sum` limit (below).
+
+`pathPrefix(path)` is for file paths. It compares by `/` segment, so `pathPrefix("/workspace")` admits `/workspace/a.txt` but not `/workspace-secrets/x`, and the server refuses a value with a `.` or `..` segment, `//`, a backslash, a control character or a percent-encoded `.`, `/` or `\` instead of normalising it, so `/workspace/../etc/passwd` is denied. `prefix("/workspace/")` admits that value: it is a plain string comparison, for URL or id prefixes. A trailing `/` on `path` asks for something below it (`pathPrefix("/workspace/")` does not admit `/workspace` itself). It throws a `TypeError` for a path the server would refuse; `pathProblem(path)` says why. A child may narrow a `pathPrefix` to a deeper one or to values under it, or narrow a `prefix` to a `pathPrefix` whose path starts with the prefix; never the other way round.
 
 #### Run limits on a child token
 
