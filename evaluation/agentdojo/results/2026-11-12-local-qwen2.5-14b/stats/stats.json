@@ -1,0 +1,122 @@
+{
+  "comparisons": [
+    {
+      "metric": "attacks landed",
+      "a": "attenuo",
+      "b": "stock",
+      "stats": {
+        "n": 99,
+        "unpaired_a": 0,
+        "unpaired_b": 5,
+        "clusters": 20,
+        "a": 15,
+        "b": 78,
+        "a_rate": 0.15151515151515152,
+        "b_rate": 0.7878787878787878,
+        "a_wilson95": [
+          0.09402325244184671,
+          0.2350411074842148
+        ],
+        "b_wilson95": [
+          0.6973865358285883,
+          0.8568646451020564
+        ],
+        "both": 15,
+        "only_a": 0,
+        "only_b": 63,
+        "neither": 21,
+        "mcnemar_p": 2.168404344971009e-19,
+        "diff": -0.6363636363636364,
+        "diff_ci95": [
+          -0.7575757575757576,
+          -0.5050505050505051
+        ],
+        "bootstrap": {
+          "resamples": 10000,
+          "seed": 20261112,
+          "unit": "user task",
+          "by": "suite"
+        }
+      }
+    },
+    {
+      "metric": "utility kept",
+      "a": "attenuo",
+      "b": "stock",
+      "stats": {
+        "n": 20,
+        "unpaired_a": 0,
+        "unpaired_b": 1,
+        "clusters": 20,
+        "a": 8,
+        "b": 10,
+        "a_rate": 0.4,
+        "b_rate": 0.5,
+        "a_wilson95": [
+          0.21880653237281705,
+          0.6134184992377469
+        ],
+        "b_wilson95": [
+          0.2992980081982123,
+          0.7007019918017877
+        ],
+        "both": 6,
+        "only_a": 2,
+        "only_b": 4,
+        "neither": 8,
+        "mcnemar_p": 0.6875,
+        "diff": -0.1,
+        "diff_ci95": [
+          -0.35,
+          0.15
+        ],
+        "bootstrap": {
+          "resamples": 10000,
+          "seed": 20261112,
+          "unit": "user task",
+          "by": "suite"
+        }
+      }
+    },
+    {
+      "metric": "utility under attack",
+      "a": "attenuo",
+      "b": "stock",
+      "stats": {
+        "n": 99,
+        "unpaired_a": 0,
+        "unpaired_b": 5,
+        "clusters": 20,
+        "a": 26,
+        "b": 46,
+        "a_rate": 0.26262626262626265,
+        "b_rate": 0.46464646464646464,
+        "a_wilson95": [
+          0.185981496830867,
+          0.35700437152456627
+        ],
+        "b_wilson95": [
+          0.3695649572227244,
+          0.562369108277021
+        ],
+        "both": 19,
+        "only_a": 7,
+        "only_b": 27,
+        "neither": 46,
+        "mcnemar_p": 0.0008213953115046024,
+        "diff": -0.20202020202020202,
+        "diff_ci95": [
+          -0.41,
+          -0.01020408163265306
+        ],
+        "bootstrap": {
+          "resamples": 10000,
+          "seed": 20261112,
+          "unit": "user task",
+          "by": "suite"
+        }
+      }
+    }
+  ],
+  "skipped": []
+}
