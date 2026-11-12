@@ -13,15 +13,13 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use time::OffsetDateTime;
 
 use super::approvals::{
-    add_approval_columns, approval_from_row, approval_in, approvals_for_call, pending_of_run,
-    APPROVAL_COLUMNS,
+    approval_from_row, approval_in, approvals_for_call, pending_of_run, APPROVAL_COLUMNS,
 };
 use super::budgets::{counter_in, prune_windows_in, refund_in, window_in};
 use super::connection::{
     file_of, open_connection, open_memory_connection, with_full_sync, Durability, WriteGate,
 };
-use super::outbox;
-use super::schema::LEASE_SCHEMA;
+use super::migrations::{migrate, SchemaState};
 use super::{fmt_time, parse_time};
 use crate::approval::{rules, Approval, ApprovalState, Approver};
 use crate::budget::{
@@ -77,6 +75,8 @@ pub struct SqliteLeaseStore {
     /// `budget_counters`, 2 `approvals`) and the `rowid` of the last row a pass looked at in
     /// it, 0 to start from the first.
     run_state_cursor: Mutex<(u8, i64)>,
+    /// The file's schema version and what this open did to it.
+    schema: SchemaState,
     /// Tests: every charge commit and the `synchronous` level it ran at.
     #[cfg(test)]
     pub(super) probe: Option<Arc<Mutex<Vec<String>>>>,
@@ -120,18 +120,20 @@ impl SqliteLeaseStore {
         Self::from_connection(open_memory_connection()?)
     }
 
-    /// Wrap an existing connection, creating or upgrading the lease, approval and outbox
-    /// tables as needed.
+    /// Wrap an existing connection, bringing its file to
+    /// [`SCHEMA_VERSION`](crate::SCHEMA_VERSION) first (see [`schema`](Self::schema)). On a
+    /// file that is already current (a [`SqliteAudit`](super::SqliteAudit) on the same file
+    /// migrated it) this only reads `user_version`.
     ///
     /// # Errors
     ///
-    /// [`AuditError::Sqlite`] when the schema cannot be created or upgraded on `conn` (a read-only
-    /// or foreign database, for example), and [`AuditError::Storage`] when a stored budget or span
-    /// key is not hex.
-    pub fn from_connection(conn: Connection) -> Result<Self, AuditError> {
-        conn.execute_batch(LEASE_SCHEMA)?;
-        add_approval_columns(&conn)?;
-        conn.execute_batch(outbox::OUTBOX_SCHEMA)?;
+    /// [`AuditError::SchemaTooNew`] when a newer attenuo wrote the file;
+    /// [`AuditError::Storage`] when a migration fails or the file holds an audit log this
+    /// version refuses to adopt, or a stored budget or span key is not hex;
+    /// [`AuditError::Sqlite`] when the schema cannot be read or written on `conn` (a read-only
+    /// or foreign database, for example).
+    pub fn from_connection(mut conn: Connection) -> Result<Self, AuditError> {
+        let schema = migrate(&mut conn)?;
         let key: String = conn.query_row(
             "SELECT value FROM budget_meta WHERE key = 'value_key'",
             [],
@@ -165,9 +167,15 @@ impl SqliteLeaseStore {
             session_cursor: Mutex::new(0),
             lease_prune: Mutex::default(),
             run_state_cursor: Mutex::new((0, 0)),
+            schema,
             #[cfg(test)]
             probe: None,
         })
+    }
+
+    /// The file's schema version and whether this open migrated it.
+    pub fn schema(&self) -> SchemaState {
+        self.schema
     }
 
     /// Run `f` against the underlying connection while holding the store's lock. For tests

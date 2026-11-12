@@ -653,10 +653,16 @@ fn open_storage(
         // Same file: the audit store's checkpointer covers it.
         leases = leases.without_wal_autocheckpoint()?;
     }
+    // The audit log opens first and migrates the file; the lease store finds it current.
+    let schema = audit.schema();
+    if let Some(from) = schema.migrated_from {
+        tracing::info!(path, from, to = schema.version, "database schema migrated");
+    }
     tracing::info!(
         path,
         durability = %cfg.durability,
         wal_checkpoint_seconds = cfg.wal_checkpoint_seconds,
+        schema_version = schema.version,
         "audit store opened (WAL)"
     );
     Ok((audit, Arc::new(leases), Some(fence)))
@@ -997,6 +1003,46 @@ mod tests {
         drop(first);
         let (_router, second) = crate::build(&cfg).unwrap();
         assert_eq!(second.store_fence(), Some(lock.as_path()));
+    }
+
+    /// A database file written by a newer attenuo (a higher schema version) stops start-up
+    /// with an error naming both versions, before anything in it is changed, and the fence is
+    /// released so that the newer binary can start on it.
+    #[test]
+    fn a_database_from_a_newer_build_refuses_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("audit.sqlite");
+        let mut cfg = Config::default();
+        cfg.audit.sqlite_path = db.to_string_lossy().into_owned();
+        let (router, state) = crate::build(&cfg).unwrap();
+        drop((router, state));
+        let newer = attenuo_audit::SCHEMA_VERSION + 1;
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .pragma_update(None, "user_version", newer)
+            .unwrap();
+
+        let err = crate::build(&cfg)
+            .err()
+            .expect("an older binary must not open a newer file");
+        let text = format!("{err:#}");
+        assert!(text.contains("opening audit log"), "{text}");
+        assert!(text.contains(&format!("schema version {newer}")), "{text}");
+        assert!(
+            text.contains(&format!("up to {}", attenuo_audit::SCHEMA_VERSION)),
+            "{text}"
+        );
+        assert!(matches!(
+            err.downcast_ref::<attenuo_audit::AuditError>(),
+            Some(attenuo_audit::AuditError::SchemaTooNew { .. })
+        ));
+        let version: u32 = rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, newer, "the refused file is left as it was");
+        // The failed start released the fence.
+        drop(attenuo_audit::WriterFence::acquire(&db).unwrap());
     }
 
     /// An in-memory store is private to its process: no fence, and any number of them.

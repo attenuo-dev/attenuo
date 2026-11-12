@@ -1,15 +1,14 @@
-//! Opening a connection: durability, the switch to WAL mode, the per-file write gate and
-//! the checks an existing audit table must pass.
+//! Opening a connection: durability, the switch to WAL mode and the per-file write gate. The
+//! schema is brought up to date by `migrations.rs`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
 use crate::error::AuditError;
-use crate::log::ENTRY_HASH_VERSION;
 
 /// How long a connection waits for another connection's write lock before giving up with
 /// `SQLITE_BUSY`. Within one process the stores' [`WriteGate`] serializes writers on one file,
@@ -197,72 +196,6 @@ pub(super) fn relaxed_sync_of(conn: &Connection) -> Result<Option<i64>, AuditErr
     let file_backed = conn.path().is_some_and(|p| !p.is_empty());
     let level: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
     Ok((file_backed && level < SYNC_FULL).then_some(level))
-}
-
-/// Refuse a log created before records had `kind` and `chain_id` (this morning's v2 shape,
-/// never released): its rows lack the columns and its hashes do not cover the fields.
-pub(super) fn check_record_fields(conn: &Connection) -> Result<(), AuditError> {
-    let cols: Vec<String> = conn
-        .prepare("SELECT name FROM pragma_table_info('audit')")?
-        .query_map([], |r| r.get(0))?
-        .collect::<Result<_, _>>()?;
-    if !cols.is_empty() && !cols.iter().any(|c| c == "kind") {
-        return Err(AuditError::Storage(
-            "this audit log was written before records had `kind` and `chain_id` (a pre-release \
-             build) and cannot be read by this version; move the file aside and start a new log"
-                .into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Refuse a log whose entries were hashed with another construction than
-/// [`ENTRY_HASH_VERSION`], and record the construction of a new one.
-pub(super) fn check_hash_version(conn: &Connection) -> Result<(), AuditError> {
-    let stored: Option<String> = conn
-        .query_row(
-            "SELECT value FROM audit_meta WHERE key = 'entry_hash'",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
-    match stored {
-        Some(v) if v == ENTRY_HASH_VERSION => Ok(()),
-        Some(v) => Err(AuditError::Storage(format!(
-            "this audit log was written with entry hash `{v}`; this version reads only \
-             `{ENTRY_HASH_VERSION}`"
-        ))),
-        None => {
-            let has_entries: bool =
-                conn.query_row("SELECT EXISTS (SELECT 1 FROM audit)", [], |r| r.get(0))?;
-            if has_entries {
-                return Err(AuditError::Storage(format!(
-                    "this audit log was written by an earlier attenuo (entry hash v1, before \
-                     RFC 8785 canonical JSON) and cannot be verified or extended by this \
-                     version, which hashes `{ENTRY_HASH_VERSION}`; move the file aside and \
-                     start a new log"
-                )));
-            }
-            conn.execute(
-                "INSERT OR IGNORE INTO audit_meta (key, value) VALUES ('entry_hash', ?1)",
-                [ENTRY_HASH_VERSION],
-            )?;
-            // Another process may have created the log meanwhile; whoever won must agree.
-            let v: String = conn.query_row(
-                "SELECT value FROM audit_meta WHERE key = 'entry_hash'",
-                [],
-                |r| r.get(0),
-            )?;
-            if v == ENTRY_HASH_VERSION {
-                Ok(())
-            } else {
-                Err(AuditError::Storage(format!(
-                    "this audit log uses entry hash `{v}`; this version reads only \
-                     `{ENTRY_HASH_VERSION}`"
-                )))
-            }
-        }
-    }
 }
 
 impl std::fmt::Display for Durability {

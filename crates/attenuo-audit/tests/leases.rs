@@ -799,7 +799,8 @@ fn sqlite_store_from_before_subjects_gains_the_table_at_open() {
         let s = SqliteLeaseStore::open(&path).unwrap();
         tree(&s);
         s.with_connection(|c| {
-            c.execute_batch("DROP TABLE lease_subjects;")?;
+            // An older server's file: no table, and no schema version.
+            c.execute_batch("DROP TABLE lease_subjects; PRAGMA user_version = 0;")?;
             Ok(())
         })
         .unwrap();
@@ -970,7 +971,8 @@ fn sqlite_store_from_before_sessions_gains_the_table_at_open() {
         let s = SqliteLeaseStore::open(&path).unwrap();
         two_users(&s);
         s.with_connection(|c| {
-            c.execute_batch("DROP TABLE lease_sessions;")?;
+            // An older server's file: no table, and no schema version.
+            c.execute_batch("DROP TABLE lease_sessions; PRAGMA user_version = 0;")?;
             Ok(())
         })
         .unwrap();

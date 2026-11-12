@@ -19,7 +19,7 @@ use super::{approval_from_row, SqliteLeaseStore, APPROVAL_COLUMNS};
 use crate::approval::Approval;
 use crate::error::AuditError;
 
-/// Created at open, on new stores and on stores that predate it.
+/// Part of schema version 1 (migration 1, see `migrations.rs`).
 pub(super) const OUTBOX_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS notice_outbox (
     id              INTEGER PRIMARY KEY,

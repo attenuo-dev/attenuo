@@ -97,6 +97,20 @@ pub enum AuditError {
     /// belongs to fails closed.
     #[error("audit append shed: {0}")]
     Overloaded(&'static str),
+    /// The database file's schema version (`PRAGMA user_version`) is newer than this build
+    /// knows: a newer attenuo wrote it. Nothing was read or written. Run the newer binary, or
+    /// restore the backup taken before the upgrade; there is no downgrade.
+    #[error(
+        "the database has schema version {found}, written by a newer attenuo; this build reads \
+         schema versions up to {supported}. Run the newer binary, or restore the backup taken \
+         before upgrading: there is no downgrade"
+    )]
+    SchemaTooNew {
+        /// The file's `user_version`.
+        found: u32,
+        /// [`SCHEMA_VERSION`](crate::SCHEMA_VERSION), the newest this build knows.
+        supported: u32,
+    },
 }
 
 impl<T> From<std::sync::PoisonError<T>> for AuditError {
