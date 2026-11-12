@@ -40,6 +40,12 @@
 //! bearer; revoke, reload and budget refunds only with `[admin_ui] allow_write = true`, and never
 //! `/admin/root-token`. Every response there carries a strict CSP and the other headers in
 //! [`admin_ui::SECURITY_HEADERS`], and no CORS headers. See [`admin_ui`].
+//!
+//! **Admin listener.** With `[admin] listen` set, every `/admin/*` route above is served on
+//! that address only ([`admin_router`]), behind the same admin bearer, and the main listener
+//! answers those paths as it answers any unknown path. Without it they are on the main
+//! listener, which the server accepts off loopback only with `[admin] serve_on_main_listener =
+//! true` (S-1). `/healthz`, `/readyz` and everything else stay on the main listener.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -115,9 +121,84 @@ pub fn build_with_clock(
     Ok((router, state))
 }
 
-/// The full router over an existing state.
+/// The full router of the main listener over an existing state: every route of the table
+/// above, the admin routes included unless `[admin] listen` moves them to a listener of their
+/// own ([`admin_router`]). Then `/admin/*` is not mounted here at all, so the main listener
+/// answers it exactly as it answers any path it does not know.
 pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Config) -> Router {
-    use routes::{admin, approvals, authzen, dev_root, policies, renew, token, wellknown};
+    use routes::{approvals, authzen, renew, token, wellknown};
+
+    let authzen_routes = Router::new()
+        .route("/access/v1/evaluation", post(authzen::evaluation))
+        .route("/access/v1/evaluations", post(authzen::evaluations))
+        .route_layer(axum::middleware::from_fn(authzen::echo_request_id));
+    let mut token_routes = Router::new()
+        .route("/token", post(token::exchange))
+        .route("/token/renew", post(renew::renew));
+    // One exported span per token and AuthZEN request, only when tracing is on.
+    let (authzen_routes, token_routes) = if state.trace.is_some() {
+        let layer = axum::middleware::from_fn_with_state(state.clone(), telemetry::trace_route);
+        token_routes = token_routes.route_layer(layer.clone());
+        (authzen_routes.route_layer(layer), token_routes)
+    } else {
+        (authzen_routes, token_routes)
+    };
+
+    let mut api = Router::new()
+        .route("/healthz", get(wellknown::healthz))
+        .route("/readyz", get(routes::ops::readyz))
+        .route("/.well-known/jwks.json", get(wellknown::jwks))
+        .route(
+            "/.well-known/authzen-configuration",
+            get(wellknown::authzen_configuration),
+        )
+        .merge(token_routes)
+        .route(
+            "/approvals/{id}",
+            get(approvals::user_get).post(approvals::user_decide),
+        )
+        .merge(authzen_routes);
+    if config.admin.on_main_listener() {
+        api = api.merge(admin_routes(&state));
+    }
+    let api = api
+        .with_state(state.clone())
+        // The span records the route template, never the URI (SR-90).
+        .layer(TraceLayer::new_for_http().make_span_with(attenuo_proxy::http_trace::request_span));
+
+    let authorizer = Arc::new(
+        ServerAuthorizer::new(state.verifier.clone(), state.pipeline.clone())
+            .with_dpop(state.dpop.clone())
+            .with_trace(state.trace.clone()),
+    );
+    let proxy = attenuo_proxy::router_with_clock(
+        // Validated in `AppState::from_config`.
+        config
+            .proxy
+            .apply(ProxyConfig::new(config.server.listen, upstreams)),
+        authorizer,
+        state.clock.clone(),
+    );
+    outer_layers(api.merge(proxy), &state)
+}
+
+/// The router of the `[admin] listen` listener (S-1): the admin routes of the table above
+/// behind the same `require_admin` layer, response headers, request span, metrics and
+/// `DPoP-Nonce` header as on the main listener, and nothing else (no `/healthz`, `/readyz` or
+/// discovery; any other path answers as an unknown path does on the main listener). [`run`]
+/// serves it when `[admin] listen` is set.
+pub fn admin_router(state: Arc<AppState>) -> Router {
+    let admin = admin_routes(&state)
+        .with_state(state.clone())
+        // The span records the route template, never the URI (SR-90).
+        .layer(TraceLayer::new_for_http().make_span_with(attenuo_proxy::http_trace::request_span));
+    outer_layers(admin, &state)
+}
+
+/// Every `/admin/*` route of the table above, behind [`routes::admin::require_admin`]. Mounted
+/// on the main listener ([`router`]) or on its own ([`admin_router`]), never on both.
+fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
+    use routes::{admin, approvals, dev_root, policies};
 
     let mut admin_routes = Router::new()
         .route("/admin/leases/revoke", post(admin::revoke_by_selector))
@@ -147,73 +228,27 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
     if state.dev_allow_root_mint {
         admin_routes = admin_routes.route("/admin/root-token", post(dev_root::mint_root));
     }
-    let admin_routes = admin_routes
+    admin_routes
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             admin::require_admin,
         ))
         // Added last, so it wraps `require_admin` and its 401/403 answers get the headers too.
-        .route_layer(axum::middleware::from_fn(admin::admin_response_headers));
+        .route_layer(axum::middleware::from_fn(admin::admin_response_headers))
+}
 
-    let authzen_routes = Router::new()
-        .route("/access/v1/evaluation", post(authzen::evaluation))
-        .route("/access/v1/evaluations", post(authzen::evaluations))
-        .route_layer(axum::middleware::from_fn(authzen::echo_request_id));
-    let mut token_routes = Router::new()
-        .route("/token", post(token::exchange))
-        .route("/token/renew", post(renew::renew));
-    // One exported span per token and AuthZEN request, only when tracing is on.
-    let (authzen_routes, token_routes) = if state.trace.is_some() {
-        let layer = axum::middleware::from_fn_with_state(state.clone(), telemetry::trace_route);
-        token_routes = token_routes.route_layer(layer.clone());
-        (authzen_routes.route_layer(layer), token_routes)
-    } else {
-        (authzen_routes, token_routes)
-    };
-
-    let api = Router::new()
-        .route("/healthz", get(wellknown::healthz))
-        .route("/readyz", get(routes::ops::readyz))
-        .route("/.well-known/jwks.json", get(wellknown::jwks))
-        .route(
-            "/.well-known/authzen-configuration",
-            get(wellknown::authzen_configuration),
-        )
-        .merge(token_routes)
-        .route(
-            "/approvals/{id}",
-            get(approvals::user_get).post(approvals::user_decide),
-        )
-        .merge(authzen_routes)
-        .merge(admin_routes)
-        .with_state(state.clone())
-        // The span records the route template, never the URI (SR-90).
-        .layer(TraceLayer::new_for_http().make_span_with(attenuo_proxy::http_trace::request_span));
-
-    let authorizer = Arc::new(
-        ServerAuthorizer::new(state.verifier.clone(), state.pipeline.clone())
-            .with_dpop(state.dpop.clone())
-            .with_trace(state.trace.clone()),
-    );
-    let proxy = attenuo_proxy::router_with_clock(
-        // Validated in `AppState::from_config`.
-        config
-            .proxy
-            .apply(ProxyConfig::new(config.server.listen, upstreams)),
-        authorizer,
-        state.clock.clone(),
-    );
-    api.merge(proxy)
-        .layer(axum::middleware::from_fn_with_state(
-            state.dpop.clone(),
-            dpop::nonce_header,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            state.metrics.clone(),
-            metrics::track_http,
-        ))
-        // Outermost, so it sees every answer, the early refusals of the layers above included.
-        .layer(axum::middleware::from_fn(early_close::mark_early_refusal))
+/// The layers around everything the main and the admin listener serve, unknown paths included.
+fn outer_layers(app: Router, state: &Arc<AppState>) -> Router {
+    app.layer(axum::middleware::from_fn_with_state(
+        state.dpop.clone(),
+        dpop::nonce_header,
+    ))
+    .layer(axum::middleware::from_fn_with_state(
+        state.metrics.clone(),
+        metrics::track_http,
+    ))
+    // Outermost, so it sees every answer, the early refusals of the layers above included.
+    .layer(axum::middleware::from_fn(early_close::mark_early_refusal))
 }
 
 /// Start the `[audit] checkpoint_interval_seconds` timer: every `period`, sign the head if
@@ -471,8 +506,8 @@ pub const RELEASE_GRACE: std::time::Duration = std::time::Duration::from_secs(2)
 ///
 /// # Errors
 ///
-/// When [`build`] fails, when `[server] listen` (or the metrics or admin UI listener) cannot be
-/// bound, or when serving fails with an I/O error. A failed final WAL checkpoint is logged, not
+/// When [`build`] fails, when `[server] listen` (or the metrics, admin or admin UI listener)
+/// cannot be bound, or when serving fails with an I/O error. A failed final WAL checkpoint is logged, not
 /// returned.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let (app, state) = build(&config)?;
@@ -495,8 +530,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 }
 
 /// Serve `app` (built over `state` by [`build`]) on `listener` with everything [`serve`] runs
-/// next to it (the checkpoint timer, lease maintenance, the `[metrics]` and `[admin_ui]`
-/// listeners) until `shutdown` resolves; then drain every listener for [`DRAIN_TIMEOUT`] and
+/// next to it (the checkpoint timer, lease maintenance, the `[metrics]`, `[admin] listen` and
+/// `[admin_ui]` listeners) until `shutdown` resolves; then drain every listener for [`DRAIN_TIMEOUT`] and
 /// stop. This is [`serve`] without the binding of `[server] listen` and the signal handling,
 /// for an embedder that runs the server in its own process and stops it itself.
 ///
@@ -509,8 +544,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 ///
 /// # Errors
 ///
-/// When the metrics or admin UI listener cannot be bound (nothing has started then), or when
-/// serving fails with an I/O error. A failed final WAL checkpoint is logged, not returned.
+/// When the metrics, admin or admin UI listener cannot be bound (nothing has started then), or
+/// when serving fails with an I/O error. A failed final WAL checkpoint is logged, not returned.
 pub async fn run(
     config: &Config,
     state: Arc<AppState>,
@@ -525,6 +560,17 @@ pub async fn run(
         Some(l)
     } else {
         None
+    };
+    let admin_listener = match config.admin.listen {
+        Some(addr) => {
+            let l = tokio::net::TcpListener::bind(addr).await?;
+            tracing::info!(
+                addr = %l.local_addr()?,
+                "admin API listening (/admin/*, not on the main listener)"
+            );
+            Some(l)
+        }
+        None => None,
     };
     let console_listener = if config.admin_ui.enabled {
         let l = tokio::net::TcpListener::bind(config.admin_ui.listen).await?;
@@ -575,6 +621,11 @@ pub async fn run(
         let app = metrics::router(state.metrics.clone());
         let until = serve_and_release(l, app, stopped(), DRAIN_TIMEOUT);
         tasks.push(("metrics listener", tokio::spawn(until)));
+    }
+    if let Some(l) = admin_listener {
+        let app = admin_router(state.clone());
+        let until = serve_and_release(l, app, stopped(), DRAIN_TIMEOUT);
+        tasks.push(("admin listener", tokio::spawn(until)));
     }
     if let Some(l) = console_listener {
         let app = admin_ui::router(state.clone(), config);
@@ -820,24 +871,39 @@ mod shutdown_tests {
         cfg
     }
 
+    /// A free loopback port, for a listener `run` binds itself (`[admin] listen`).
+    fn free_port() -> std::net::SocketAddr {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    }
+
     /// Stop a server through `run` and start the next one on the same file at once, again and
     /// again: once `run` has returned and the caller has dropped its state, nothing holds the
     /// single-writer fence, so the next start never meets it. Nothing waits in between, not
     /// even a yield to the scheduler. Each server is used first (a request that reads the database, over a
     /// connection the client keeps open across the stop), so a connection task holds a copy
-    /// of the router when the stop begins.
-    async fn stop_and_restart_in_a_loop() {
+    /// of the router when the stop begins. With `own_admin_listener`, `[admin] listen` is set
+    /// too and that request goes to the admin listener, so it is that listener's connection
+    /// that holds a copy (S-1); the main listener is used as well, for `/readyz`.
+    async fn stop_and_restart_in_a_loop(own_admin_listener: bool) {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = everything_on(dir.path());
+        let mut cfg = everything_on(dir.path());
+        if own_admin_listener {
+            cfg.admin.listen = Some(free_port());
+        }
         let client = reqwest::Client::new();
         let (mut app, mut state) = build(&cfg).unwrap();
         assert!(state.store_fence().is_some());
         for round in 0..20 {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let main = listener.local_addr().unwrap();
             let url = format!(
                 "http://{}/admin/audit/verify",
-                listener.local_addr().unwrap()
+                cfg.admin.listen.unwrap_or(main)
             );
+            let ready = format!("http://{main}/readyz");
             let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
             let released = state.released();
             // `run` is polled in this task, not spawned: the restart below follows its return
@@ -847,12 +913,29 @@ mod shutdown_tests {
                 let _ = stopped.await;
             });
             let using = async {
-                let resp = client
-                    .get(&url)
-                    .bearer_auth("restart-test-admin")
-                    .send()
-                    .await
-                    .unwrap();
+                // The admin listener is bound inside `run`: wait until it answers.
+                let mut tries = 0;
+                let resp = loop {
+                    match client
+                        .get(&url)
+                        .bearer_auth("restart-test-admin")
+                        .send()
+                        .await
+                    {
+                        Ok(resp) => break resp,
+                        Err(_) if tries < 200 => {
+                            tries += 1;
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        Err(e) => panic!("round {round}: {e}"),
+                    }
+                };
+                assert!(
+                    resp.status().is_success(),
+                    "round {round}: {}",
+                    resp.status()
+                );
+                let resp = client.get(&ready).send().await.unwrap();
                 assert!(
                     resp.status().is_success(),
                     "round {round}: {}",
@@ -875,14 +958,27 @@ mod shutdown_tests {
 
     #[tokio::test]
     async fn a_server_stopped_by_run_can_be_restarted_on_its_file_at_once() {
-        stop_and_restart_in_a_loop().await;
+        stop_and_restart_in_a_loop(false).await;
     }
 
     /// The same on a multi-threaded runtime, where the connection tasks, the timers and the
     /// other listeners run on other workers than `run` itself.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_server_stopped_by_run_can_be_restarted_at_once_on_many_threads() {
-        stop_and_restart_in_a_loop().await;
+        stop_and_restart_in_a_loop(false).await;
+    }
+
+    /// S-1: with `[admin] listen`, the admin listener goes through the same stop and drain,
+    /// so the fence is released as soon as `run` returns.
+    #[tokio::test]
+    async fn a_server_with_an_admin_listener_can_be_restarted_on_its_file_at_once() {
+        stop_and_restart_in_a_loop(true).await;
+    }
+
+    /// The same on a multi-threaded runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_server_with_an_admin_listener_can_be_restarted_at_once_on_many_threads() {
+        stop_and_restart_in_a_loop(true).await;
     }
 }
 

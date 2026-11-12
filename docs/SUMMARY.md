@@ -78,6 +78,7 @@
   - [ADR-0010: Run limits](decisions/0010-run-limits.md)
   - [ADR-0011: Cedar-aware list filtering](decisions/0011-cedar-aware-list-filtering.md)
   - [ADR-0012: OpenTelemetry export](decisions/0012-opentelemetry-export.md)
+  - [ADR-0013: Admin API listener](decisions/0013-admin-api-listener.md)
 
 # Research
 

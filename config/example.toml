@@ -135,6 +135,15 @@ url = "http://127.0.0.1:3001/mcp"
 # address the server refuses to start when the token is missing, shorter than 32 bytes or a
 # published placeholder.
 # token = "<output of openssl rand -hex 32>"
+# Serve /admin/* on a listener of its own, and not on [server] listen (which then answers
+# those paths as unknown ones, 404). /healthz and /readyz stay on the main listener. Point the
+# CLI's --server (ATTENUO_SERVER) at this address for admin commands. When [server] listen is
+# not a loopback address the server refuses to start unless this is set, or
+# serve_on_main_listener = true below.
+# listen = "127.0.0.1:9102"
+# Keep /admin/* on [server] listen although it is not loopback: only when something in front
+# of the server keeps /admin/ away from agents. Logs a warning. Not with `listen`.
+# serve_on_main_listener = false
 
 # Trusted identity providers for hop 0. POST /token accepts an OIDC ID token
 # (subject_token_type = urn:ietf:params:oauth:token-type:id_token) or an ID-JAG
@@ -296,7 +305,8 @@ diagnostics = "peps"
 [dev]
 # DEVELOPMENT ONLY. Mounts POST /admin/root-token, which mints root tokens for a user nobody
 # verified (admin bearer + [[root_grants]] only). The server logs a warning when this is on,
-# and refuses to start with it when [server] listen is not a loopback address. Set it to true
+# and refuses to start with it when the admin API's listener ([admin] listen, else
+# [server] listen) is not a loopback address. Set it to true
 # to follow the README quick start or `attenuo token root` on this machine.
 allow_root_mint = false
 # Demo containers only (the docker-compose demo): accept allow_root_mint although listen is not

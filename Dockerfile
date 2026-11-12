@@ -44,6 +44,8 @@ EXPOSE 8080
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
   CMD curl -fsS http://127.0.0.1:8080/healthz || exit 1
 
-# Mount a config at /etc/attenuo/config.toml (see config/example.toml).
+# Mount a config at /etc/attenuo/config.toml (see config/example.toml). A config that listens on
+# 0.0.0.0 here needs [admin] listen (publish that port to operators only, e.g. on the host's
+# 127.0.0.1) or [admin] serve_on_main_listener = true, or the server refuses to start (S-1).
 ENTRYPOINT ["attenuo-server"]
 CMD ["--config", "/etc/attenuo/config.toml"]

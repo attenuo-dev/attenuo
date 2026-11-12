@@ -1565,6 +1565,93 @@ pub struct AdminSection {
     /// warns. Generate one with `openssl rand -hex 32`, or set [`ADMIN_TOKEN_ENV`].
     #[serde(default)]
     pub token: Option<String>,
+    /// Serve the admin API (`/admin/*`) on a listener of its own at this address, and not on
+    /// `[server] listen` (S-1). Unset by default: the admin API is then served on the main
+    /// listener, which the server accepts only when `[server] listen` is a loopback address or
+    /// [`serve_on_main_listener`](Self::serve_on_main_listener) is set. With `listen` set, the
+    /// main listener answers `/admin/*` as it answers any unknown path. The listener has the
+    /// same admin bearer, request logging and shutdown as the main one; `/healthz` and
+    /// `/readyz` stay on the main listener. Suggested: `127.0.0.1:9102`.
+    #[serde(default)]
+    pub listen: Option<SocketAddr>,
+    /// Serve the admin API on `[server] listen` although that address is not loopback. Default
+    /// `false`: without `listen` and without this, the server refuses to start off loopback, so
+    /// that revoke, reload, approve, export and the dev root mint are not reachable on the port
+    /// agents use unless an operator said so. Set it only when something in front of the
+    /// server keeps `/admin/*` away from agents and the internet (a reverse proxy that does not
+    /// forward `/admin/`, or a demo container that binds `0.0.0.0` behind a loopback-only
+    /// published port); a warning is logged at startup. Cannot be combined with `listen`.
+    #[serde(default)]
+    pub serve_on_main_listener: bool,
+}
+
+impl AdminSection {
+    /// Where the admin API is served: `listen` when set, else `server_listen`.
+    pub fn api_listen(&self, server_listen: SocketAddr) -> SocketAddr {
+        self.listen.unwrap_or(server_listen)
+    }
+
+    /// Whether `/admin/*` is mounted on the main listener (`listen` unset).
+    pub fn on_main_listener(&self) -> bool {
+        self.listen.is_none()
+    }
+
+    /// Startup check (S-1): the admin API is served off a loopback `[server] listen` only with
+    /// `serve_on_main_listener = true`; `listen` and `serve_on_main_listener` exclude each
+    /// other, and `listen` must differ from `server_listen`. Logs the startup warnings.
+    ///
+    /// # Errors
+    ///
+    /// When `listen` is unset, `server_listen` is not loopback and `serve_on_main_listener` is
+    /// not set; when both `listen` and `serve_on_main_listener` are set; or when `listen` is
+    /// `server_listen` (a fixed port, not 0).
+    pub fn check_listen(&self, server_listen: SocketAddr) -> anyhow::Result<()> {
+        match self.listen {
+            Some(listen) => {
+                if self.serve_on_main_listener {
+                    anyhow::bail!(
+                        "[admin] listen = {listen} and [admin] serve_on_main_listener = true \
+                         contradict each other: listen moves the admin API off the main \
+                         listener. Keep one of the two."
+                    );
+                }
+                if listen == server_listen && listen.port() != 0 {
+                    anyhow::bail!(
+                        "[admin] listen = {listen} is [server] listen too: give the admin API \
+                         a port of its own (for example 127.0.0.1:9102)"
+                    );
+                }
+                if !listen.ip().is_loopback() {
+                    tracing::warn!(
+                        %listen,
+                        "[admin] listener is not on loopback: restrict it with network policy \
+                         to the hosts operators use"
+                    );
+                }
+                Ok(())
+            }
+            None if server_listen.ip().is_loopback() => Ok(()),
+            None if self.serve_on_main_listener => {
+                tracing::warn!(
+                    listen = %server_listen,
+                    "!!! [admin] serve_on_main_listener = true: /admin/* (revoke, reload, \
+                     approve, export) is served on [server] listen, which is not loopback. \
+                     Keep /admin/ away from agents and the internet in front of the server, or \
+                     set [admin] listen. !!!"
+                );
+                Ok(())
+            }
+            None => anyhow::bail!(
+                "[server] listen = {server_listen} is not a loopback address and the admin API \
+                 (/admin/*: revoke, reload, approve, export) would be served on it, next to the \
+                 agent-facing routes. Set [admin] listen to an address of its own (for example \
+                 127.0.0.1:9102) and point the CLI's --server, or the SDKs' AdminClient, at it \
+                 for admin commands. To keep the admin API on the main listener (only when \
+                 something in front of the server keeps /admin/ away from agents), set [admin] \
+                 serve_on_main_listener = true."
+            ),
+        }
+    }
 }
 
 /// `[dev]`: development-only switches. Everything here defaults to off.
@@ -1573,12 +1660,13 @@ pub struct AdminSection {
 pub struct DevSection {
     /// Mount `POST /admin/root-token`, which mints hop-0 tokens for a user nobody verified.
     /// Default `false`; when `true` the server logs a warning at startup, and refuses to start
-    /// when `[server] listen` is not a loopback address (S-3) unless
+    /// when the admin API's listener (`[admin] listen` when set, else `[server] listen`) is not
+    /// a loopback address (S-3) unless
     /// [`allow_root_mint_off_loopback`](Self::allow_root_mint_off_loopback) is also set.
     #[serde(default)]
     pub allow_root_mint: bool,
-    /// Demo containers only: accept `allow_root_mint` although `[server] listen` is not a
-    /// loopback address. Meant for a container that must bind `0.0.0.0` inside its own network
+    /// Demo containers only: accept `allow_root_mint` although the admin API's listener is not
+    /// a loopback address. Meant for a container that must bind `0.0.0.0` inside its own network
     /// namespace while the host publishes the port on loopback only (the docker-compose demo).
     /// Never set it in a deployment. Default `false`.
     #[serde(default)]
@@ -1586,8 +1674,9 @@ pub struct DevSection {
 }
 
 impl DevSection {
-    /// Startup check (S-3): the dev root mint is refused when `listen` (the `[server]`
-    /// listener, where the route is mounted) is not a loopback address, unless
+    /// Startup check (S-3): the dev root mint is refused when `listen` (the listener the admin
+    /// API, and so the route, is mounted on: `[admin] listen` when set, else `[server] listen`,
+    /// see [`AdminSection::api_listen`]) is not a loopback address, unless
     /// `allow_root_mint_off_loopback` is set. Logs the startup warnings.
     ///
     /// # Errors
@@ -1607,11 +1696,12 @@ impl DevSection {
         if !listen.ip().is_loopback() {
             if !self.allow_root_mint_off_loopback {
                 anyhow::bail!(
-                    "[dev] allow_root_mint = true and [server] listen = {listen} is not a \
-                     loopback address. POST /admin/root-token mints root tokens for users nobody \
+                    "[dev] allow_root_mint = true and the admin API's listener ({listen}: \
+                     [admin] listen when set, else [server] listen) is not a loopback address. \
+                     POST /admin/root-token mints root tokens for users nobody \
                      has verified, so it is refused off loopback. Mint root tokens from an OIDC \
-                     ID token or ID-JAG instead ([[idps]]), or bind listen to 127.0.0.1 for \
-                     local development. (A demo container that binds 0.0.0.0 behind a \
+                     ID token or ID-JAG instead ([[idps]]), or bind that listener to 127.0.0.1 \
+                     for local development. (A demo container that binds 0.0.0.0 behind a \
                      loopback-only published port may set [dev] \
                      allow_root_mint_off_loopback = true; never in a deployment.)"
                 );
@@ -1716,8 +1806,9 @@ pub struct AdminUiSection {
     /// Mount the routes that change state (`POST /admin/leases/{id}/revoke`,
     /// `POST /admin/policies/reload`, `POST /admin/approvals/{id}` and
     /// `POST /admin/budgets/refund`) on the console listener. Default `false`, so read-only is
-    /// enforced by the server and not only by the page: those paths answer 404 there. The main
-    /// listener keeps every admin route whatever this says.
+    /// enforced by the server and not only by the page: those paths answer 404 there. The admin
+    /// API's own listener (`[admin] listen`, else the main listener) keeps every admin route
+    /// whatever this says.
     #[serde(default)]
     pub allow_write: bool,
 }
@@ -2417,14 +2508,15 @@ impl Config {
     }
 
     /// Refuse a weak or missing admin token unless the server listens on loopback only, where
-    /// it is a warning (SR-15). An enabled `[admin_ui]` listener counts as a listener here,
-    /// since it serves the admin API too.
+    /// it is a warning (SR-15). An enabled `[admin_ui]` listener and an `[admin] listen`
+    /// listener count as listeners here, since they serve the admin API too.
     ///
     /// # Errors
     ///
     /// When [`admin_token_problem`](Self::admin_token_problem) finds a problem (unset, a published
-    /// placeholder, shorter than `MIN_ADMIN_TOKEN_LEN` bytes) and `[server] listen` or an enabled
-    /// `[admin_ui] listen` is not a loopback address. On loopback only the problem is a warning.
+    /// placeholder, shorter than `MIN_ADMIN_TOKEN_LEN` bytes) and `[server] listen`, `[admin]
+    /// listen` or an enabled `[admin_ui] listen` is not a loopback address. On loopback only the
+    /// problem is a warning.
     pub fn check_admin_token(&self) -> anyhow::Result<()> {
         let Some(problem) = self.admin_token_problem() else {
             return Ok(());
@@ -2434,7 +2526,11 @@ impl Config {
             .admin_ui
             .enabled
             .then_some(("[admin_ui] listen", self.admin_ui.listen));
+        // So does an admin API listener of its own. `[server] listen` keeps counting when the
+        // admin API is not on it: a weak token is refused on any server reachable off loopback.
+        let admin = self.admin.listen.map(|addr| ("[admin] listen", addr));
         let exposed = std::iter::once(("[server] listen", self.server.listen))
+            .chain(admin)
             .chain(console)
             .find(|(_, addr)| !addr.ip().is_loopback());
         let Some((key, addr)) = exposed else {
@@ -3342,6 +3438,97 @@ mod tests {
         ] {
             assert!(!url_host_is_loopback(no), "{no}");
         }
+    }
+
+    /// S-1: off a loopback `[server] listen`, the admin API needs a listener of its own or the
+    /// explicit `serve_on_main_listener`; on loopback nothing changes. The two keys exclude each
+    /// other, and the admin listener cannot be the main one.
+    #[test]
+    fn admin_api_off_loopback_needs_its_own_listener_or_the_opt_in_s1() {
+        let addr = |a: &str| a.parse::<SocketAddr>().unwrap();
+        let admin = |listen: Option<&str>, on_main: bool| AdminSection {
+            token: None,
+            listen: listen.map(addr),
+            serve_on_main_listener: on_main,
+        };
+        // Loopback, nothing configured: on the main listener, as before.
+        for main in ["127.0.0.1:8080", "[::1]:8080"] {
+            let a = admin(None, false);
+            a.check_listen(addr(main)).unwrap();
+            assert!(a.on_main_listener());
+            assert_eq!(a.api_listen(addr(main)), addr(main));
+            admin(None, true).check_listen(addr(main)).unwrap();
+        }
+        for main in ["0.0.0.0:8080", "10.1.2.3:8080", "[::]:8080"] {
+            let err = admin(None, false)
+                .check_listen(addr(main))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not a loopback address"), "{err}");
+            assert!(err.contains("[admin] listen"), "{err}");
+            assert!(err.contains("serve_on_main_listener = true"), "{err}");
+            admin(None, true).check_listen(addr(main)).unwrap();
+            for own in ["127.0.0.1:9102", "10.0.0.7:9102", "0.0.0.0:9102"] {
+                let a = admin(Some(own), false);
+                a.check_listen(addr(main)).unwrap();
+                assert!(!a.on_main_listener());
+                assert_eq!(a.api_listen(addr(main)), addr(own));
+                let err = admin(Some(own), true)
+                    .check_listen(addr(main))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("contradict"), "{err}");
+            }
+        }
+        let err = admin(Some("127.0.0.1:8080"), false)
+            .check_listen(addr("127.0.0.1:8080"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("port of its own"), "{err}");
+        // Port 0 (tests): two different ports once bound.
+        admin(Some("127.0.0.1:0"), false)
+            .check_listen(addr("127.0.0.1:0"))
+            .unwrap();
+        // From TOML: absent by default, both keys read.
+        let cfg = Config::from_toml("").unwrap();
+        assert_eq!(cfg.admin.listen, None);
+        assert!(!cfg.admin.serve_on_main_listener);
+        let cfg = Config::from_toml(
+            "[server]\nlisten = \"0.0.0.0:8080\"\n\n[admin]\nlisten = \"127.0.0.1:9102\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.admin.listen, Some(addr("127.0.0.1:9102")));
+        cfg.admin.check_listen(cfg.server.listen).unwrap();
+        let cfg = Config::from_toml(
+            "[server]\nlisten = \"0.0.0.0:8080\"\n\n[admin]\nserve_on_main_listener = true\n",
+        )
+        .unwrap();
+        cfg.admin.check_listen(cfg.server.listen).unwrap();
+        // Every shipped config still starts: the loopback ones as they are, the docker demo
+        // through the opt-in (its port is published on the host's loopback only).
+        for text in [
+            include_str!("../../../examples/github-leak-demo/config.toml"),
+            include_str!("../../../examples/multi-hop-demo/config.toml"),
+            include_str!("../../../examples/github-leak-demo/config.docker.toml"),
+            include_str!("../../../config/example.toml"),
+        ] {
+            let cfg = Config::from_toml(text).unwrap();
+            cfg.admin.check_listen(cfg.server.listen).unwrap();
+        }
+    }
+
+    /// SR-15 with S-1: an `[admin] listen` off loopback is exposure, as `[server] listen` is.
+    #[test]
+    fn an_admin_listener_off_loopback_needs_a_strong_admin_token() {
+        let mut cfg = Config::default();
+        cfg.admin.token = Some("short".into());
+        cfg.admin.listen = Some("127.0.0.1:9102".parse().unwrap());
+        cfg.check_admin_token().unwrap();
+        cfg.admin.listen = Some("0.0.0.0:9102".parse().unwrap());
+        let err = cfg.check_admin_token().unwrap_err().to_string();
+        assert!(err.contains("[admin] listen = 0.0.0.0:9102"), "{err}");
+        cfg.admin.token = Some("0123456789abcdef0123456789abcdef".into());
+        cfg.check_admin_token().unwrap();
     }
 
     /// S-3: the dev root mint is refused when `[server] listen` is not loopback, unless the

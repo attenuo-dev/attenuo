@@ -389,8 +389,10 @@ async fn request_spans_carry_the_route_template_not_the_uri() {
 fn public_url_is_required_off_loopback() {
     let mut cfg = base_config();
     cfg.server.listen = "0.0.0.0:8080".parse().unwrap();
-    // The dev root mint is refused off loopback (S-3), which is not what this test is about.
+    // The dev root mint is refused off loopback (S-3), and the admin API on the main listener
+    // (S-1), which is not what this test is about.
     cfg.dev.allow_root_mint = false;
+    cfg.admin.listen = Some("127.0.0.1:9102".parse().unwrap());
     let err = attenuo_server::build(&cfg).err().expect("must refuse");
     assert!(err.to_string().contains("public_url"), "{err}");
     cfg.server.public_url = Some("https://attenuo.example.com".into());
@@ -414,6 +416,7 @@ fn plain_http_public_url_off_loopback_is_refused_at_startup_s9() {
     let mut cfg = base_config();
     cfg.server.listen = "0.0.0.0:8080".parse().unwrap();
     cfg.dev.allow_root_mint = false;
+    cfg.admin.listen = Some("127.0.0.1:9102".parse().unwrap());
     cfg.server.public_url = Some("http://attenuo.example.com".into());
     let err = attenuo_server::build(&cfg).err().expect("must refuse");
     assert!(err.to_string().contains("allow_insecure_http"), "{err}");
@@ -428,17 +431,28 @@ fn plain_http_public_url_off_loopback_is_refused_at_startup_s9() {
 }
 
 /// S-3: the dev root mint stops the server off loopback unless the demo-only opt-in is set.
+/// What counts is the listener the admin API is on: the main one here (S-1 opt-in), a
+/// loopback `[admin] listen` at the end.
 #[test]
 fn dev_root_mint_off_loopback_is_refused_at_startup_s3() {
     let mut cfg = base_config();
     cfg.server.listen = "0.0.0.0:8080".parse().unwrap();
     cfg.server.public_url = Some("https://attenuo.example.com".into());
+    cfg.admin.serve_on_main_listener = true;
     assert!(cfg.dev.allow_root_mint, "base_config turns the mint on");
     let err = attenuo_server::build(&cfg).err().expect("must refuse");
     assert!(err.to_string().contains("allow_root_mint"), "{err}");
     cfg.dev.allow_root_mint_off_loopback = true;
     let _ = attenuo_server::build(&cfg).unwrap();
     cfg.dev.allow_root_mint_off_loopback = false;
+    // On an admin listener of its own the mint is judged by that listener's address.
+    cfg.admin.serve_on_main_listener = false;
+    cfg.admin.listen = Some("0.0.0.0:9102".parse().unwrap());
+    let err = attenuo_server::build(&cfg).err().expect("must refuse");
+    assert!(err.to_string().contains("allow_root_mint"), "{err}");
+    cfg.admin.listen = Some("127.0.0.1:9102".parse().unwrap());
+    let _ = attenuo_server::build(&cfg).unwrap();
+    cfg.admin.listen = None;
     cfg.server.listen = "127.0.0.1:8080".parse().unwrap();
     let _ = attenuo_server::build(&cfg).unwrap();
 }

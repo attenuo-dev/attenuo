@@ -20,12 +20,12 @@ The full list of known gaps is at the end of [design/server.md](../design/server
 
 Go through this before pointing anything real at the server.
 
-- [ ] `[dev] allow_root_mint` is `false` or absent. With it on, anyone holding the admin token can mint a root token for any user. Off a loopback `listen` address the server refuses to start with it; `[dev] allow_root_mint_off_loopback` exists only for the docker-compose demo and must not appear in your config.
+- [ ] `[dev] allow_root_mint` is `false` or absent. With it on, anyone holding the admin token can mint a root token for any user. When the admin API's listener (`[admin] listen`, else `[server] listen`) is not loopback the server refuses to start with it; `[dev] allow_root_mint_off_loopback` exists only for the docker-compose demo and must not appear in your config.
 - [ ] Root tokens come from a real identity provider: `[[idps]]`, `[[agents]]`, `[[root_grants]]`. See [Identity providers](identity-providers.md).
 - [ ] The admin token (`[admin] token`, or `ATTENUO_ADMIN_TOKEN`, which overrides it) is a long random value that is not in any example, not in version control and not shared with agents. Generate it with `openssl rand -hex 32`. Off a loopback `listen` address the server refuses to start without one, with one shorter than 32 bytes, or with a known placeholder; it cannot tell whether your token was leaked.
 - [ ] Every agent that receives a token is an `[[agents]]` entry with its own secret: token exchanges authenticate as their `actor` (`[token] require_actor_auth`, on by default).
 - [ ] `[policy] unknown_tools` is `deny` (the default) or `sensitive`, not `allow`.
-- [ ] `/admin/*` is not reachable from the networks agents live on. See [Network exposure](#network-exposure).
+- [ ] `/admin/*` is not reachable from the networks agents live on: `[admin] listen` gives it a port of its own. See [Network exposure](#network-exposure).
 - [ ] TLS terminates in front of attenuo, and agents reach it over HTTPS only. `[server] public_url` is the proxy's `https://` URL. A plain `http://` `public_url` on a host that is not loopback refuses to start unless `[server] allow_insecure_http = true`, which you should not need.
 - [ ] Every `[[idps]]` and `[[actor_trust]]` key URL (`jwks_url`, `spiffe_bundle_url`, or the IdP `issuer` used for discovery) is the final `https://` URL. Plain `http://` is accepted only on loopback, and redirects are not followed, so a key URL that redirects fails every ID or actor token it should verify.
 - [ ] `[issuer] private_key_pem_path` is set, the file is mode 0600, owned by the service user, and backed up somewhere safe. Without the setting the server makes a new key at every start and every token dies on restart.
@@ -50,7 +50,21 @@ The routes fall into three groups:
 | `/admin/*` | Operators only |
 | `GET /healthz` | Your health checker |
 
-Binding to `0.0.0.0` puts `/admin` on the same listener as everything else. The static admin token is then the only thing between the network and "revoke any lease, reload policy, read the audit log". Route `/admin` away from the public listener at the reverse proxy, or give operators a separate path to a loopback-only port by running the CLI on the host or over an SSH tunnel.
+Without `[admin] listen`, `/admin` is on the same listener as everything else. On `127.0.0.1` that is fine for local use. Off loopback the static admin token would be the only thing between the agents' network and "revoke any lease, reload policy, read the audit log", so the server refuses to start that way. Give the admin API a listener of its own:
+
+```toml
+[server]
+listen = "0.0.0.0:8080"
+public_url = "https://attenuo.example.com"
+
+[admin]
+# /admin/* only here; the main listener answers it as an unknown path (404).
+listen = "127.0.0.1:9102"
+```
+
+Operators then reach it on the host or over an SSH tunnel (`ssh -L 9102:127.0.0.1:9102 host`), and point admin commands at it: `ATTENUO_SERVER=http://127.0.0.1:9102 attenuo lease revoke ...`, or the SDKs' `AdminClient("http://127.0.0.1:9102", token)`. Commands that talk to agents' routes (`token exchange`, `call`, `tools`) keep using the main URL. On a private operator network, `listen` can be that interface's address; the admin token must then be a strong one, as for any listener off loopback. The admin console (`[admin_ui]`) has its own listener and is not affected.
+
+If something in front of the server already keeps `/admin/` away from agents (the reverse proxy below, or a container whose port is published on the host's loopback only), `[admin] serve_on_main_listener = true` keeps the admin API on the main listener off loopback; the server logs a warning at startup. Prefer `[admin] listen`: it holds even when the proxy is bypassed.
 
 Two other exposure points to think about:
 
@@ -76,7 +90,7 @@ attenuo.example.com {
 }
 ```
 
-This hides `/admin` from the public name. Operators reach it on `127.0.0.1:8080` directly.
+This hides `/admin` from the public name for a server that serves it on the main listener (loopback, or `serve_on_main_listener`). Operators reach it on `127.0.0.1:8080` directly. With `[admin] listen` the block is not needed, and harmless.
 
 For nginx, the equivalent pieces are `proxy_pass http://127.0.0.1:8080;`, `proxy_buffering off;`, `proxy_http_version 1.1;` and a `location /admin/ { return 404; }` block. Untested.
 
@@ -284,7 +298,7 @@ Matching settings in `attenuo.toml`: `policies_path = "/etc/attenuo/policy.cedar
 
 Notes:
 
-- **Signals.** The server shuts down gracefully on SIGTERM (what `docker stop` and Kubernetes send) and on SIGINT. It stops accepting connections, gives in-flight requests up to 10 seconds to finish (on the admin console and metrics listeners too), stops its timers, closes the database and releases its lock, then exits; it logs `shutdown signal received; draining`, `shutdown complete` and `single-writer fence released`. Set `stop_grace_period` (or `terminationGracePeriodSeconds`) above 10 seconds. No `stop_signal` override is needed. SQLite writes are transactional, so even a kill does not corrupt the log.
+- **Signals.** The server shuts down gracefully on SIGTERM (what `docker stop` and Kubernetes send) and on SIGINT. It stops accepting connections, gives in-flight requests up to 10 seconds to finish (on the admin API, admin console and metrics listeners too), stops its timers, closes the database and releases its lock, then exits; it logs `shutdown signal received; draining`, `shutdown complete` and `single-writer fence released`. Set `stop_grace_period` (or `terminationGracePeriodSeconds`) above 10 seconds. No `stop_signal` override is needed. SQLite writes are transactional, so even a kill does not corrupt the log.
 - **Read-only root.** The server only writes under the data directory and, when the key file is missing, to the key path. Keep the key file in the read-only mount, so a missing key is an error you see, not a new key you did not plan.
 - **Upstreams** must be reachable from the container. `127.0.0.1` in `[[upstreams]]` means the container itself. The proxy gives an upstream `[proxy] upstream_connect_timeout_seconds` (default 5) to accept a connection and `upstream_response_timeout_seconds` (default 120) to send response headers, or a JSON answer it must read; past that the agent gets `502 upstream_unreachable` or `504 upstream_timeout`. Raise the second for tools that answer in JSON after a long run. Streams (SSE) are not cut by it.
 
