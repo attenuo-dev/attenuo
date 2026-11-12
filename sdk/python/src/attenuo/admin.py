@@ -1,5 +1,5 @@
-"""Operator API: revoke leases, read and verify the audit log, reload policy, decide
-approvals, mint dev roots.
+"""Operator API: revoke leases, refund a decision's budget charge, read and verify the audit
+log, reload policy, decide approvals, mint dev roots.
 
 Every route needs the static admin bearer (``[admin] token`` in the server config). Keep that
 token out of agents: it can revoke anything and read every decision.
@@ -36,6 +36,21 @@ class RevokeResult:
 
     lease_id: str
     revoked: int
+    reason: str
+    audit_id: str | None = None
+
+
+@dataclass(frozen=True)
+class BudgetRefund:
+    """The answer of :meth:`AdminClient.refund_budget` (``POST /admin/budgets/refund``).
+
+    ``refunded`` counts the token-limit counters credited. The run usage and per-user windows
+    the decision charged are given back too but not counted, so a decision that charged only
+    usage answers 0. ``audit_id`` is the id of the ``admin.budget.refund`` record, ``None``
+    when the server could not write it (the refund stands)."""
+
+    decision_id: str
+    refunded: int
     reason: str
     audit_id: str | None = None
 
@@ -798,6 +813,28 @@ def _approvals(b: Any) -> list[w.Approval]:
     return [w.approval_from_json(a) for a in items or []]
 
 
+def _refund_body(decision_id: str, reason: str | None) -> dict[str, Any]:
+    if not isinstance(decision_id, str) or not decision_id.strip():
+        raise ValueError("decision_id must be the id of an allowed decision")
+    body: dict[str, Any] = {"decision_id": decision_id.strip()}
+    if reason is not None:
+        body["reason"] = reason
+    return body
+
+
+def _budget_refund(b: Any) -> BudgetRefund:
+    if not isinstance(b, dict):
+        raise AttenuoError(f"unexpected refund response: {str(b)[:200]}")
+    audit_id = b.get("audit_id")
+    refunded = b.get("refunded")
+    return BudgetRefund(
+        decision_id=str(b.get("decision_id", "")),
+        refunded=refunded if isinstance(refunded, int) and not isinstance(refunded, bool) else 0,
+        reason=str(b.get("reason", "")),
+        audit_id=None if audit_id is None else str(audit_id),
+    )
+
+
 def _approval_path(approval_id: str) -> str:
     return f"/admin/approvals/{w.path_segment(approval_id, 'approval_id')}"
 
@@ -867,6 +904,19 @@ class AdminClient:
         body, params = _selector_request(user, chain_id, session, reason, preview)
         resp = self._http.post("/admin/leases/revoke", json=body, params=params)
         return _selector_revocation(w.json_body(resp))
+
+    def refund_budget(self, decision_id: str, reason: str | None = None) -> BudgetRefund:
+        """``POST /admin/budgets/refund``: give back what the allowed decision ``decision_id``
+        charged to its run's limits, once, for a call whose effect did not happen. The server
+        writes an ``admin.budget.refund`` record (``reason`` defaults to ``refunded by
+        admin``).
+
+        A refund that cannot be made is an :class:`~attenuo.ApiError`: 409
+        ``already_refunded``, 410 ``charge_pruned`` (the charge is older than the server
+        keeps), 404 ``not_found`` (an unknown id, or a decision that charged nothing). Its
+        ``detail`` says which, from the decision's audit record."""
+        body = _refund_body(decision_id, reason)
+        return _budget_refund(w.json_body(self._http.post("/admin/budgets/refund", json=body)))
 
     def lease_status(self, lease_id: str) -> LeaseStatus:
         b = w.json_body(self._http.get(f"/admin/leases/{w.path_segment(lease_id, 'lease_id')}"))
@@ -1181,6 +1231,11 @@ class AsyncAdminClient:
         body, params = _selector_request(user, chain_id, session, reason, preview)
         resp = await self._http.post("/admin/leases/revoke", json=body, params=params)
         return _selector_revocation(w.json_body(resp))
+
+    async def refund_budget(self, decision_id: str, reason: str | None = None) -> BudgetRefund:
+        body = _refund_body(decision_id, reason)
+        resp = await self._http.post("/admin/budgets/refund", json=body)
+        return _budget_refund(w.json_body(resp))
 
     async def lease_status(self, lease_id: str) -> LeaseStatus:
         b = w.json_body(

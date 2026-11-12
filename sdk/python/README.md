@@ -67,11 +67,14 @@ print(admin.audit_verify())  # VerifyReport(ok=True, entries=..., ...)
 | `call_tool(token, server, tool, arguments, session_id=None)`                                         | `tools/call` through `/mcp/{server}`. Returns `ToolResult` (`.text`, `.content`, `.is_error`, `.decision_id`).                                                                                                                                                                                                                                                                                                    |
 | `call_tool_with_approval(token, server, tool, arguments, *, on_approval=None, timeout=None, interval=2.0)` | `call_tool`; when the call needs an approval (`-32008`), calls `on_approval(err)`, waits for the grant, and retries the call once, with the grant's `approval_token` when it has one. `call_tool(..., approval_token=...)` sends a token yourself. See [Approvals](#approvals). |
 | `get_approval(approval_id, token)`, `wait_for_approval(approval_id, token, *, timeout=None, interval=2.0)` | `GET /approvals/{id}` as the agent (same run, DPoP signed when the client has a key); `wait_for_approval` polls until granted and raises `ApprovalNotGranted` otherwise. |
+| `grant_approval(approval_id, id_token)`, `decline_approval(approval_id, id_token)` | `POST /approvals/{id}` as the run's originating user, with their OIDC ID token as a plain bearer. Returns the decided `Approval`. See [Approvals](#approvals). |
 | `list_tools(token, server)`                                                                          | `tools/list`, filtered by the proxy to what the token may call.                                                                                                                                                                                                                                                                                                                                                   |
 | `initialize(token, server)`                                                                          | MCP `initialize`; returns the `Mcp-Session-Id`, if any.                                                                                                                                                                                                                                                                                                                                                           |
+| `close_session(token, server, session_id)` | `DELETE /mcp/{server}`: ends the MCP session. `True` when the upstream closed it, `False` when it does not let clients close sessions (405). |
 | `authzen_evaluate(token, server, tool, arguments)`                                                   | AuthZEN decision without calling the tool. A deny is a falsy `AuthzenDecision`, not an exception; on `approval_required` it also has `call_hash`, `approval_id` and `expires_at` (see [Approvals](#approvals)).                                                                                                                                                                                                   |
+| `authzen_evaluate_batch(token, evaluations, *, semantic=None)`, `authzen_configuration()` | `POST /access/v1/evaluations`: several decisions in one request, one `AuthzenDecision` per call; and the AuthZEN discovery document. See [AuthZEN batches and discovery](#authzen-batches-and-discovery). |
 | `inspect(jwt, verify=False)`                                                                         | Decode a token. With `verify=True` fetch the JWKS and check the Ed25519 signature, `typ`, `exp` and that `sub`/`act` match the chain.                                                                                                                                                                                                                                                                             |
-| `AdminClient(server_url, admin_token)`                                                               | `revoke_lease`, `revoke_by_selector` (every lease of one user, chain or MCP session; see [below](#admin-revoking-by-user-chain-or-session)), `lease_status`, `audit`, `audit_head` (reads `head` from `GET /admin/audit`, signs nothing), `audit_tail`, `audit_export` (iterator of JSON Lines objects; `kind=`, `chain_id=`, `tool=` and `decision=` filter), `audit_checkpoint` (explicit; signs and stores a checkpoint), `audit_verify`, `policy_reload`, `mint_root_dev`, the approval calls (`approvals`, `approval`, `grant_approval`, `decline_approval`); and the read-only console helpers below (`audit_query`, `audit_iter`, `audit_entry`, `audit_record`, `audit_checkpoints`, `lease_tree`, `policies`, `policy_check`, `policy_evaluate`).                                                                                                                       |
+| `AdminClient(server_url, admin_token)`                                                               | `revoke_lease`, `revoke_by_selector` (every lease of one user, chain or MCP session; see [below](#admin-revoking-by-user-chain-or-session)), `lease_status`, `refund_budget` (see [below](#admin-refunding-a-budget-charge)), `audit`, `audit_head` (reads `head` from `GET /admin/audit`, signs nothing), `audit_tail`, `audit_export` (iterator of JSON Lines objects; `kind=`, `chain_id=`, `tool=` and `decision=` filter), `audit_checkpoint` (explicit; signs and stores a checkpoint), `audit_verify`, `policy_reload`, `mint_root_dev`, the approval calls (`approvals`, `approval`, `grant_approval`, `decline_approval`); and the read-only console helpers below (`audit_query`, `audit_iter`, `audit_entry`, `audit_record`, `audit_checkpoints`, `lease_tree`, `policies`, `policy_check`, `policy_evaluate`).                                                                                                                       |
 
 `Token` carries `jwt` (also `str(token)`), `lease`, `expires_at`, `chain` (user, hops, capabilities per hop), and `verified`. `repr` does not print the JWT. Everything decoded from a token is untrusted unless `verified` is true.
 
@@ -188,6 +191,23 @@ print(r.matched_count, r.revoked_count, r.audit_id)
 
 It returns a `SelectorRevocation`: `selector` (as the server shows it), `preview`, `matched`, `revoked` (matches first, then the cascade; each list cut at 10,000 ids, `truncated` says so), `matched_count`, `revoked_count`, `reason` and `audit_id`. With `preview=True` nothing changes and no audit record is written; `revoked` is what a revocation sent now would change, and `reason` and `audit_id` are `None`. Matching nothing is not an error: the lists come back empty, also for a session the server never recorded. The SDK never logs the session id and no error message it raises contains it. `revoke_lease(lease_id)` still revokes one lease by id; its `RevokeResult` carries the `audit_id` of the `admin.lease.revoke` record (`None` when the server could not write it). See [Revoke by user or chain](https://github.com/attenuo-dev/attenuo/blob/main/docs/reference/http-api.md#revoke-by-user-or-chain) for the server side.
 
+### Admin: refunding a budget charge
+
+An allowed call is charged to its run's limits before it goes upstream. When its effect did not happen (the upstream failed, or a person undid it), an operator can give the charge back, once, by the decision's id:
+
+```python
+from attenuo import AdminClient, ApiError
+
+admin = AdminClient(URL, "dev-admin-token-change-me")
+try:
+    r = admin.refund_budget(result.decision_id, "upstream returned 502")
+    print(r.refunded, r.audit_id)  # counters credited; the admin.budget.refund record
+except ApiError as e:
+    print(e.status, e.error, e.detail)  # 409 already_refunded, 410 charge_pruned, 404 not_found
+```
+
+`refund_budget(decision_id, reason=None)` sends `POST /admin/budgets/refund` and returns `BudgetRefund(decision_id, refunded, reason, audit_id)`. `refunded` counts the run-limit counters credited; the run usage and per-user windows the decision charged are given back as well but not counted, so it can be 0. A refusal writes no audit record, so its `ApiError` has no `decision_id`; `detail` says why, from the decision's audit record ([HTTP API](https://github.com/attenuo-dev/attenuo/blob/main/docs/reference/http-api.md#budget-refund)).
+
 ### Capabilities
 
 ```python
@@ -270,7 +290,7 @@ with Client(url, dpop_key=coder_key) as ob:
     ob.call_tool(coder, "github", "read_file", {"repo": "alice/docs"})  # proof attached
 ```
 
-With a key, every `call_tool`, `list_tools`, `renew` and `authzen_evaluate` sends `Authorization: DPoP <token>` and a fresh proof, and every `exchange` binds the new token. When the parent is bound to another key, its holder's sign-off names the new key and agent and works for that one exchange; a process that holds both keys can pass `subject_dpop_key=planner_key` instead. When the parent is bound to the client's own key, no sign-off is needed. `Token.dpop_jkt` is the thumbprint a token is bound to (`None` for a bearer token), and `AuditEntry.dpop_bound` says whether a decision was made with a proven bound token. A bound token without a proof is `Unauthorized` with `reason == "dpop_required"`, from `call_tool` as from `renew` or `exchange` (see [Errors](#errors)). See [Binding tokens to keys](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/binding-tokens-to-keys.md).
+With a key, every `call_tool`, `list_tools`, `close_session`, `renew`, `authzen_evaluate` and `authzen_evaluate_batch` sends `Authorization: DPoP <token>` and a fresh proof, and every `exchange` binds the new token. When the parent is bound to another key, its holder's sign-off names the new key and agent and works for that one exchange; a process that holds both keys can pass `subject_dpop_key=planner_key` instead. When the parent is bound to the client's own key, no sign-off is needed. `Token.dpop_jkt` is the thumbprint a token is bound to (`None` for a bearer token), and `AuditEntry.dpop_bound` says whether a decision was made with a proven bound token. A bound token without a proof is `Unauthorized` with `reason == "dpop_required"`, from `call_tool` as from `renew` or `exchange` (see [Errors](#errors)). See [Binding tokens to keys](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/binding-tokens-to-keys.md).
 
 Server nonces (RFC 9449 §8, `[token] dpop_nonce = "required"`) need no code. `Client`, `AsyncClient`, `AdminClient.mint_root_dev` and `TokenAuth` keep the latest `DPoP-Nonce` header the server sent and put it in each proof. When the server refuses a proof with `use_dpop_nonce`, they retry the request once with a new proof carrying the nonce from that response, on a new connection: the server can close the connection that carried the refusal without saying so (it does when it answers before reading the request body), so `NonceCache.update` shuts that socket down and the pool opens another (`attenuo.dpop.drop_connection`; a response without a socket, such as from a mock transport, is left alone). For your own HTTP code, `DpopKey.proof(method, url, access_token, nonce=...)` adds the claim, and `attenuo.dpop.NonceCache` does the bookkeeping: `update(response)` stores the nonce and returns true when the request should be retried.
 
@@ -346,6 +366,40 @@ print(claims.approval_id, claims.by, claims.expires_at)
 
 It raises `VerificationError` on a bad signature, `typ`, expiry or binding. It proves the grant was made; only the server knows whether it has been used (needs the `verify` extra).
 
+The user decides with their own sign-in. A front end that holds the user's OIDC ID token (from the same `[[idps]]` issuer and client id the run started with) calls:
+
+```python
+approval = ob.grant_approval(approval_id, user_id_token)  # or decline_approval
+print(
+    approval.state, approval.approver
+)  # granted, {"subject": "alice", "method": "id_token", "by": "user"}
+```
+
+The ID token goes as `Authorization: Bearer`, never with DPoP and never the client's own token: the server refuses a delegation token there (403 `agent_token_refused`), another user's token (403 `wrong_user`) and an ID token used before (400 `invalid_grant`, `description == "replayed"`); a decided or expired approval is 409. Each is an `ApiError` (`Unauthorized` for a 401, such as an expired ID token).
+
+### AuthZEN batches and discovery
+
+`authzen_evaluate_batch` sends several calls in one `POST /access/v1/evaluations`. Each is decided, charged and audited like `authzen_evaluate`, and the answer has one `AuthzenDecision` per call, in order:
+
+```python
+from attenuo import AuthzenEvaluation
+
+decisions = ob.authzen_evaluate_batch(
+    token,
+    [
+        AuthzenEvaluation("github", "read_file", {"repo": "alice/docs"}),
+        ("github", "create_issue", {"repo": "alice/docs"}),  # a tuple works too
+    ],
+    semantic="deny_on_first_deny",
+)
+for d in decisions:
+    print(bool(d), d.reason, d.decision_id, d.error)
+```
+
+`semantic` is AuthZEN's `evaluations_semantic`: `execute_all` (the default), `deny_on_first_deny` or `permit_on_first_permit`. A batch that stops early answers only the calls it decided, so the list can be shorter than the request. A call the server could not decide is a deny with `error`, an `AuthzenEntryError(status, code, message)`. An empty batch raises `ValueError` before anything is sent (the server would answer it as a single evaluation), and more calls than `[authzen] max_batch` (default 64) is `ApiError` 400 `batch_too_large`.
+
+`authzen_configuration()` reads `GET /.well-known/authzen-configuration` without a credential and returns `AuthzenConfiguration(policy_decision_point, access_evaluation_endpoint, access_evaluations_endpoint, raw)`.
+
 ### Streaming a call
 
 A long tool can stream its answer: the upstream sends progress notifications on an SSE stream before the result. `call_tool` waits for the whole body. `call_tool_stream` (same arguments, plus `max_event_bytes` and `deadline`) yields each JSON-RPC message as it arrives:
@@ -368,7 +422,7 @@ except Denied as d:
 - **Events.** Each `StreamEvent` has `message` (the JSON-RPC message as sent), `method` (for a notification or a server request, else `None`), `last_event_id` (the SSE id at that point, what a client would send as `Last-Event-ID` to resume) and `decision_id` (the proxy's `X-Attenuo-Decision-Id`). The final event carries `result`, the same `ToolResult` that `call_tool` returns, and `is_final` is true. Nothing is yielded after it.
 - **Errors.** A denial raises `Denied` (or `ApprovalRequired`) before anything is yielded, as `call_tool` does. When the proxy cuts a stream because the lease was revoked or expired, or the token expired (it re-checks every `[proxy] stream_recheck_seconds`, default 2), its last event is a JSON-RPC `-32001` error with `id: null`. That raises `Denied` with `reason` (`lease_revoked`, `lease_expired`, `lease_unknown`, `token_expired`, ...) and `decision_id`, the id of the proxy's `stream.end` audit record. So code that catches `Denied` around `call_tool` also handles a revocation in the middle of a stream. The `X-Attenuo-Decision-Id` header is sent before the cut, so it cannot vouch for this id as it does for a `-32003`. A `-32001` with `id: null` counts as a cut only when `data.reason` is one the proxy sends and `data.decision_id` is absent or a UUID; anything else of that shape raises `RpcError` with code `-32001`, a belt-and-braces check, since the proxy itself rewrites any upstream message of that shape to `-32005` (`upstream_stream_end_shape`). Any other JSON-RPC error raises what `call_tool` raises. A stream that ends without the response raises `AttenuoError`.
 - **Plain answers.** When the proxy answers with a JSON body instead of SSE (most upstreams do), you get one final event.
-- **Limits.** An SSE event, or a plain body, over `max_event_bytes` raises `AttenuoError`. The default is 16 MiB (`DEFAULT_MAX_EVENT_BYTES`), the same as the proxy's `[proxy] max_upstream_body_bytes` default. The client's `timeout` applies to each read, so a stream that is quiet for longer fails. Keep-alive comments restart that timer, so pass `deadline=` (seconds, from the request's start, default none) to bound the whole call: once it has passed, the next read raises `AttenuoError` naming the deadline and closes the response. Leaving the loop early closes the connection once the iterator is closed or garbage collected.
+- **Limits.** An SSE event, or a plain body, over `max_event_bytes` raises `AttenuoError`. The default is 16 MiB (`DEFAULT_MAX_EVENT_BYTES`), the same as the proxy's `[proxy] max_upstream_body_bytes` default. The client's `timeout` applies to each read, so a stream that is quiet for longer fails. Keep-alive comments restart that timer, so pass `deadline=` (seconds, from the request's start, default none) to bound the whole call: once it has passed, the next read raises `TransportTimeout` naming the deadline and closes the response. Leaving the loop early closes the connection once the iterator is closed or garbage collected.
 - **Wire.** It sends the same `POST` as `call_tool`: `Accept: application/json, text/event-stream`, the session id, the approval token in `_meta`, and a DPoP proof (with one retry on `use_dpop_nonce`) when the client has a key. Only the response handling differs. SSE parsing follows the WHATWG rules: `data:` lines are joined, a blank line ends an event, and comments, `event:` and `retry:` are ignored. A final event with no blank line after it is dropped, as the proxy also drops it.
 
 ### Errors
@@ -383,6 +437,7 @@ All SDK errors derive from `AttenuoError`, transport failures included.
 | `Unauthorized` (`.reason`, `.decision_id`, `.data`) | HTTP 401 or JSON-RPC `-32001`: missing, bad or expired bearer, a DPoP failure, or (from the proxy) a lease that is no longer live. A subclass of `ApiError`. Branch on `reason` (below). |
 | `ApiError` (`.status`, `.error`, `.detail`, `.decision_id`) | Any other non-success from the server: `invalid_scope`, `invalid_grant`, 404, 422. `decision_id` names the audit record of a refused exchange or renewal. |
 | `TransportError` | No answer: the connection was refused or dropped, a timeout ran out, TLS or a proxy failed. `__cause__` is the `httpx` error. |
+| `TransportTimeout` | A `TransportError` because a timeout ran out: the client's `timeout` (`__cause__` is the `httpx.TimeoutException`) or a streamed call's `deadline`. Also an `httpx.TimeoutException`. |
 | `RpcError` | A JSON-RPC error that is not a denial (unknown upstream, upstream down). |
 | `RefreshError` (`.reason`) | A `TokenRefresher` gave up: `lease_revoked`, `lease_lost`, `token_expired`, `refused`, `key_mismatch`. |
 | `VerificationError` | `inspect(verify=True)` failed. |
@@ -413,7 +468,7 @@ except TransportError as e:
 
 **Decision ids are proven.** A `decision_id` on `Unauthorized` or `ApiError` is taken from the body only when the `X-Attenuo-Decision-Id` header names it, as for `Denied`: the proxy never forwards that header from an upstream, so an upstream's answer cannot pass off an id.
 
-**Transport failures.** `TransportError` is also an `httpx.TransportError`, so `except httpx.TransportError` (or `httpx.RequestError`, `httpx.HTTPError`) keeps catching it; a handler for one `httpx` subclass, such as `httpx.ConnectError`, should test `isinstance(e.__cause__, httpx.ConnectError)` now. A failure while a streamed answer is read is one too. `TokenAuth` runs inside your own `httpx` client, whose errors stay plain `httpx` errors.
+**Transport failures.** `TransportError` is also an `httpx.TransportError`, so `except httpx.TransportError` (or `httpx.RequestError`, `httpx.HTTPError`) keeps catching it; a handler for one `httpx` subclass, such as `httpx.ConnectError`, should test `isinstance(e.__cause__, httpx.ConnectError)` now. A failure while a streamed answer is read is one too. A timeout is the subclass `TransportTimeout` (also an `httpx.TimeoutException`), so a retry policy can tell a slow server from an unreachable one. `TokenAuth` runs inside your own `httpx` client, whose errors stay plain `httpx` errors.
 
 A denied `tools/call` is a decision, not a glitch: do not retry it blindly. A `lease_expired` denial is the one case where `renew()` then one retry makes sense; `lease_revoked` means stop.
 

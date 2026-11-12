@@ -163,6 +163,55 @@ export interface AuthzenDecision {
   approvalId?: string;
   callHash?: string;
   expiresAt?: Date;
+  /** Set on a batch entry the server could not decide (it counts as a deny). */
+  error?: AuthzenEntryError;
+}
+
+/**
+ * Why one entry of an AuthZEN batch failed (`context.error`): the HTTP `status` and error `code` a
+ * single evaluation of it would have answered (`invalid_request`, `unknown_tool`, ...) and the
+ * server's `message`. The rest of the batch is decided as usual.
+ */
+export interface AuthzenEntryError {
+  status: number;
+  code: string;
+  message: string;
+}
+
+/**
+ * One call to decide in `authzenEvaluateBatch`: the tool `server/tool` with `args`. A
+ * `[server, tool]` or `[server, tool, args]` tuple is taken too.
+ */
+export interface AuthzenEvaluation {
+  server: string;
+  tool: string;
+  args?: Json;
+}
+
+export type AuthzenEvaluationLike =
+  | AuthzenEvaluation
+  | readonly [server: string, tool: string]
+  | readonly [server: string, tool: string, args: Json | undefined];
+
+/** AuthZEN's `evaluations_semantic` for a batch (AuthZEN 1.0 section 7.1.2.1). */
+export type EvaluationsSemantic = "execute_all" | "deny_on_first_deny" | "permit_on_first_permit";
+
+const SEMANTICS: readonly string[] = [
+  "execute_all",
+  "deny_on_first_deny",
+  "permit_on_first_permit",
+];
+
+/**
+ * The AuthZEN discovery document (`GET /.well-known/authzen-configuration`, AuthZEN 1.0 section
+ * 9): the decision point's base URL and its two evaluation endpoints, as the server publishes
+ * them (from `[server] public_url`).
+ */
+export interface AuthzenConfiguration {
+  policyDecisionPoint: string;
+  accessEvaluationEndpoint: string;
+  accessEvaluationsEndpoint: string;
+  raw: Json;
 }
 
 // --- plain HTTP -------------------------------------------------------------------------------
@@ -375,7 +424,117 @@ export function authzenFromResponse(body: unknown): AuthzenDecision {
   if (typeof ctx.call_hash === "string" && ctx.call_hash !== "") d.callHash = ctx.call_hash;
   const expiresAt = optTime(ctx.expires_at);
   if (expiresAt !== undefined) d.expiresAt = expiresAt;
+  const error = entryError(ctx.error);
+  if (error !== undefined) d.error = error;
   return d;
+}
+
+/**
+ * The `POST /access/v1/evaluations` body: the subject as the top-level default (the server fills
+ * it from the verified chain) and one `action`/`resource`/`context` entry per call. A
+ * `TypeError` for no call (the server answers an empty batch as a single evaluation) or an
+ * unknown `semantic`.
+ */
+export function authzenBatchBody(
+  evaluations: readonly AuthzenEvaluationLike[],
+  semantic?: EvaluationsSemantic,
+): Json {
+  const entries = evaluations.map((ev) => {
+    const one: AuthzenEvaluation = Array.isArray(ev)
+      ? { server: ev[0] as string, tool: ev[1] as string, args: ev[2] as Json | undefined }
+      : (ev as AuthzenEvaluation);
+    if (typeof one?.server !== "string" || typeof one.tool !== "string") {
+      throw new TypeError(`an evaluation is {server, tool, args?} or a tuple, got ${String(ev)}`);
+    }
+    const body = authzenBody(one.server, one.tool, one.args);
+    delete body.subject;
+    return body;
+  });
+  if (entries.length === 0) throw new TypeError("an AuthZEN batch needs at least one evaluation");
+  const body: Json = { subject: { type: "agent", id: "" }, evaluations: entries };
+  if (semantic !== undefined) {
+    if (!SEMANTICS.includes(semantic)) {
+      throw new TypeError(`semantic must be one of ${SEMANTICS.join(", ")}, got ${semantic}`);
+    }
+    body.options = { evaluations_semantic: semantic };
+  }
+  return body;
+}
+
+/**
+ * The decisions of a batch answer, in request order. A batch stopped by its semantic answers
+ * fewer entries than it asked.
+ */
+export function authzenBatchFromResponse(body: unknown): AuthzenDecision[] {
+  const items = asObject(body, "AuthZEN batch").evaluations;
+  if (!Array.isArray(items)) {
+    throw new AttenuoError(
+      `unexpected AuthZEN batch response: ${JSON.stringify(body)?.slice(0, 200)}`,
+    );
+  }
+  return items.map((item) =>
+    authzenFromResponse(
+      typeof item === "object" && item !== null && !Array.isArray(item) ? item : {},
+    ),
+  );
+}
+
+export function authzenConfigurationFromJson(body: unknown): AuthzenConfiguration {
+  const b = asObject(body, "AuthZEN configuration");
+  return {
+    policyDecisionPoint: String(b.policy_decision_point ?? ""),
+    accessEvaluationEndpoint: String(b.access_evaluation_endpoint ?? ""),
+    accessEvaluationsEndpoint: String(b.access_evaluations_endpoint ?? ""),
+    raw: b,
+  };
+}
+
+function entryError(v: unknown): AuthzenEntryError | undefined {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return undefined;
+  const e = v as Json;
+  return {
+    status: typeof e.status === "number" && Number.isInteger(e.status) ? e.status : 0,
+    code: String(e.code ?? ""),
+    message: String(e.message ?? ""),
+  };
+}
+
+/** The body of `POST /approvals/{id}`; a `TypeError` for anything but `grant` or `decline`. */
+export function approvalDecisionBody(decision: string): Json {
+  if (decision !== "grant" && decision !== "decline") {
+    throw new TypeError(`decision must be "grant" or "decline", got ${JSON.stringify(decision)}`);
+  }
+  return { decision };
+}
+
+/**
+ * `Authorization: Bearer` for the user's OIDC ID token. Never DPoP: the server verifies the ID
+ * token as at hop 0, and refuses a delegation token there (`agent_token_refused`).
+ */
+export function idTokenHeaders(idToken: string): Record<string, string> {
+  const token = typeof idToken === "string" ? idToken.trim() : "";
+  if (token === "") throw new TypeError("idToken must be the user's OIDC ID token");
+  return { authorization: `Bearer ${token}` };
+}
+
+/**
+ * The answer to `DELETE /mcp/{server}`: `true` when the upstream closed the session, `false` when
+ * it does not let clients close sessions (405, as MCP allows). The proxy's own refusals throw
+ * what a call would (`rpcResult`).
+ */
+export async function sessionClosed(res: Response): Promise<boolean> {
+  if (res.ok) {
+    await res.body?.cancel();
+    return true;
+  }
+  if (res.status === 405) {
+    await res.body?.cancel();
+    return false;
+  }
+  const sse = (res.headers.get("content-type") ?? "").includes("event-stream");
+  const text = await res.text();
+  rpcMessageResult(res, parseRpcBody(text, sse), text);
+  throw errorFromResponse(res.status, text, res.headers);
 }
 
 // --- MCP / JSON-RPC ---------------------------------------------------------------------------

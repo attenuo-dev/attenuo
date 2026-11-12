@@ -23,6 +23,7 @@ from attenuo import (
     RpcError,
     RunUsage,
     TransportError,
+    TransportTimeout,
     Unauthorized,
     UntrustedArg,
     UserWindow,
@@ -367,3 +368,50 @@ async def test_connection_refused_by_a_real_socket() -> None:
         with pytest.raises(TransportError) as e2:
             await aob.renew("TOK")
     assert isinstance(e2.value.__cause__, httpx.ConnectError)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx.ConnectTimeout("c"),
+        httpx.ReadTimeout("r"),
+        httpx.WriteTimeout("w"),
+        httpx.PoolTimeout("p"),
+    ],
+)
+async def test_a_timeout_is_a_transport_timeout(make: Any, exc: Exception) -> None:  # noqa: F811
+    client, _ = make(failing(exc))
+    with pytest.raises(TransportTimeout) as e:
+        await call(client, "renew", "TOK")
+    assert isinstance(e.value, TransportError) and isinstance(e.value, AttenuoError)
+    assert isinstance(e.value, httpx.TimeoutException)
+    assert e.value.__cause__ is exc
+    assert e.value.request.url.path == "/token/renew"
+
+
+async def test_a_refused_connection_is_not_a_timeout(make: Any) -> None:  # noqa: F811
+    client, _ = make(failing(httpx.ConnectError("refused")))
+    with pytest.raises(TransportError) as e:
+        await call(client, "renew", "TOK")
+    assert not isinstance(e.value, TransportTimeout)
+    assert not isinstance(e.value, httpx.TimeoutException)
+
+
+async def test_a_read_timeout_while_streaming_is_a_transport_timeout(make: Any) -> None:  # noqa: F811
+    class SlowBody(httpx.SyncByteStream, httpx.AsyncByteStream):
+        def __iter__(self) -> Iterator[bytes]:
+            yield b": keep-alive\n\n"
+            raise httpx.ReadTimeout("no data")
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            yield b": keep-alive\n\n"
+            raise httpx.ReadTimeout("no data")
+
+    client, _ = make(
+        lambda r: httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, stream=SlowBody()
+        )
+    )
+    _, err = await collect_until_error(client.call_tool_stream("TOK", "github", "read_file"))
+    assert isinstance(err, TransportTimeout)
+    assert isinstance(err.__cause__, httpx.ReadTimeout)

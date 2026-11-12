@@ -16,7 +16,16 @@ with Client("http://127.0.0.1:8080") as ob:
 from importlib.metadata import PackageNotFoundError, version
 
 from ._sse import DEFAULT_MAX_EVENT_BYTES, StreamEvent
-from ._wire import Approval, AuthzenDecision, Lease, Tool, ToolResult
+from ._wire import (
+    Approval,
+    AuthzenConfiguration,
+    AuthzenDecision,
+    AuthzenEntryError,
+    AuthzenEvaluation,
+    Lease,
+    Tool,
+    ToolResult,
+)
 from .admin import (
     AdminClient,
     AsyncAdminClient,
@@ -24,6 +33,7 @@ from .admin import (
     AuditEntryDetail,
     AuditFilter,
     AuditPage,
+    BudgetRefund,
     CheckpointPage,
     EvaluationBudget,
     EvaluationLabels,
@@ -101,6 +111,7 @@ from .errors import (
     RpcError,
     RunUsage,
     TransportError,
+    TransportTimeout,
     Unauthorized,
     UntrustedArg,
     UserWindow,
@@ -143,9 +154,13 @@ __all__ = [
     "AuditEntryDetail",
     "AuditFilter",
     "AuditPage",
+    "AuthzenConfiguration",
     "AuthzenDecision",
+    "AuthzenEntryError",
+    "AuthzenEvaluation",
     "BadCheckpoint",
     "BudgetLimit",
+    "BudgetRefund",
     "Capability",
     "Chain",
     "CheckpointPage",
@@ -193,6 +208,7 @@ __all__ = [
     "Tool",
     "ToolResult",
     "TransportError",
+    "TransportTimeout",
     "Unauthorized",
     "UntrustedArg",
     "User",

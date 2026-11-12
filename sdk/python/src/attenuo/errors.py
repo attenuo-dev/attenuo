@@ -32,6 +32,15 @@ class TransportError(AttenuoError, httpx.TransportError):
         super().__init__(message, request=request)
 
 
+class TransportTimeout(TransportError, httpx.TimeoutException):
+    """A :class:`TransportError` because a timeout ran out: the client's ``timeout`` (connect,
+    read, write or pool; ``__cause__`` is the ``httpx.TimeoutException``), or a streamed call's
+    total ``deadline`` (no ``__cause__``). It is also an ``httpx.TimeoutException``.
+
+    Branch on it to retry a slow call without retrying a refused connection, for instance.
+    """
+
+
 LimitKind = Literal["calls", "sum", "calls_per", "distinct"]
 
 

@@ -1,6 +1,6 @@
 /**
- * Operator API: revoke leases, read and verify the audit log, reload policy, decide approvals,
- * mint dev roots.
+ * Operator API: revoke leases, refund a decision's budget charge, read and verify the audit log,
+ * reload policy, decide approvals, mint dev roots.
  *
  * Every route needs the static admin bearer (`[admin] token` in the server config). Keep that
  * token out of agents: it can revoke anything and read every decision.
@@ -24,6 +24,20 @@ type Json = Record<string, unknown>;
 export interface RevokeResult {
   leaseId: string;
   revoked: number;
+  reason: string;
+  auditId: string | undefined;
+}
+
+/**
+ * The answer of `refundBudget` (`POST /admin/budgets/refund`). `refunded` counts the token-limit
+ * counters credited. The run usage and per-user windows the decision charged are given back too
+ * but not counted, so a decision that charged only usage answers 0. `auditId` is the id of the
+ * `admin.budget.refund` record, `undefined` when the server could not write it (the refund
+ * stands).
+ */
+export interface BudgetRefund {
+  decisionId: string;
+  refunded: number;
   reason: string;
   auditId: string | undefined;
 }
@@ -793,6 +807,30 @@ export class AdminClient {
     const { json, query } = selectorRequest(selector, opts);
     const res = await this.http.post("/admin/leases/revoke", { json, query });
     return selectorRevocationOf(w.asObject(await w.jsonBody(res), "revoke"));
+  }
+
+  /**
+   * `POST /admin/budgets/refund`: give back what the allowed decision `decisionId` charged to its
+   * run's limits, once, for a call whose effect did not happen. The server writes an
+   * `admin.budget.refund` record (`reason` defaults to `refunded by admin`).
+   *
+   * A refund that cannot be made is an `ApiError`: 409 `already_refunded`, 410 `charge_pruned`
+   * (the charge is older than the server keeps), 404 `not_found` (an unknown id, or a decision
+   * that charged nothing). Its `detail` says which, from the decision's audit record.
+   */
+  async refundBudget(decisionId: string, reason?: string): Promise<BudgetRefund> {
+    const id = typeof decisionId === "string" ? decisionId.trim() : "";
+    if (id === "") throw new TypeError("decisionId must be the id of an allowed decision");
+    const json: Json = { decision_id: id };
+    if (reason !== undefined) json.reason = reason;
+    const res = await this.http.post("/admin/budgets/refund", { json });
+    const b = w.asObject(await w.jsonBody(res), "refund");
+    return {
+      decisionId: String(b.decision_id ?? ""),
+      refunded: typeof b.refunded === "number" && Number.isInteger(b.refunded) ? b.refunded : 0,
+      reason: String(b.reason ?? ""),
+      auditId: b.audit_id == null ? undefined : String(b.audit_id),
+    };
   }
 
   async leaseStatus(leaseId: string): Promise<LeaseStatus> {

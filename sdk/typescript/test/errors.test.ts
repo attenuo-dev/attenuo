@@ -17,6 +17,7 @@ import {
   RpcError,
   SHIPPED_FORMAT,
   TransportError,
+  TransportTimeoutError,
   UnauthorizedError,
   entryHash,
   type BudgetLimit,
@@ -374,5 +375,73 @@ describe("the audit constants (K-11)", () => {
     expect(await entryHash(1, GENESIS_HASH, { a: 1 })).toBe(
       "8b0a08f4d4e974318b7cc1319d0c4732579bbbe8c1f4197d956419aa44b40452",
     );
+  });
+});
+
+describe("a timeout (K-12)", () => {
+  it("is a TransportTimeoutError when the client's own timer ran out", async () => {
+    const timeout = new DOMException("timed out", "TimeoutError");
+    const { ob } = client(() => {
+      throw timeout;
+    });
+    const e = (await caught(ob.renew("TOK"))) as TransportTimeoutError;
+    expect(e).toBeInstanceOf(TransportTimeoutError);
+    expect(e).toBeInstanceOf(TransportError);
+    expect(e).toBeInstanceOf(AttenuoError);
+    expect(e.name).toBe("TransportTimeoutError");
+    expect(e.cause).toBe(timeout);
+  });
+
+  it("is not what a refused connection gives", async () => {
+    const { ob } = client(() => {
+      throw new TypeError("fetch failed");
+    });
+    const e = await caught(ob.renew("TOK"));
+    expect(e).toBeInstanceOf(TransportError);
+    expect(e).not.toBeInstanceOf(TransportTimeoutError);
+  });
+
+  it("is a real request's timeoutMs running out", async () => {
+    const srv = createServer(() => {}); // accepts, never answers
+    const port = await new Promise<number>((resolve) =>
+      srv.listen(0, "127.0.0.1", () => resolve((srv.address() as AddressInfo).port)),
+    );
+    try {
+      const ob = new AttenuoClient(`http://127.0.0.1:${port}`, { timeoutMs: 100 });
+      const e = (await caught(ob.renew("TOK"))) as TransportTimeoutError;
+      expect(e).toBeInstanceOf(TransportTimeoutError);
+      expect((e.cause as DOMException).name).toBe("TimeoutError");
+    } finally {
+      srv.close();
+    }
+  });
+
+  it("leaves the caller's abort of a streamed call as it came", async () => {
+    const ctl = new AbortController();
+    const reason = new DOMException("stop", "AbortError");
+    const { ob } = client(() => {
+      ctl.abort(reason);
+      throw reason;
+    });
+    const err = await (async () => {
+      try {
+        for await (const _ of ob.callToolStream(
+          "TOK",
+          "github",
+          "read_file",
+          {},
+          {
+            signal: ctl.signal,
+          },
+        )) {
+          void _;
+        }
+      } catch (e) {
+        return e;
+      }
+      return undefined;
+    })();
+    expect(err).toBe(reason);
+    expect(err).not.toBeInstanceOf(AttenuoError);
   });
 });

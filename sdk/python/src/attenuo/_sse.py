@@ -20,7 +20,7 @@ from typing import Any, TypeGuard
 import httpx
 
 from . import _wire as w
-from .errors import AttenuoError, Denied, RpcError
+from .errors import AttenuoError, Denied, RpcError, TransportTimeout
 
 #: The default bound on one SSE event (or a plain JSON answer) of a streamed call: 16 MiB, the
 #: proxy's ``[proxy] max_upstream_body_bytes`` default.
@@ -68,7 +68,7 @@ class Deadline:
 
     def check(self) -> None:
         if self.end is not None and time.monotonic() >= self.end:
-            raise AttenuoError(f"stream deadline of {self.seconds:g}s elapsed")
+            raise TransportTimeout(f"stream deadline of {self.seconds:g}s elapsed")
 
 
 @dataclass(frozen=True)

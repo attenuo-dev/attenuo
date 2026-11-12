@@ -1,7 +1,7 @@
 /**
  * Client for the attenuo server. It mirrors what the `attenuo` CLI does over HTTP:
- * `POST /token`, `POST /token/renew`, `POST /mcp/{server}`, `POST /access/v1/evaluation` and
- * `GET /approvals/{id}`.
+ * `POST /token`, `POST /token/renew`, `POST /mcp/{server}`, `POST /access/v1/evaluation` (and
+ * `/evaluations`), `GET` and `POST /approvals/{id}` and `DELETE /mcp/{server}`.
  */
 
 import type { CapabilityLike } from "./capability.js";
@@ -14,7 +14,12 @@ import {
   type DpopKeyLike,
 } from "./dpop.js";
 import { META_APPROVAL_KEY } from "./approval.js";
-import { ApprovalNotGrantedError, ApprovalRequiredError, AttenuoError } from "./errors.js";
+import {
+  ApprovalNotGrantedError,
+  ApprovalRequiredError,
+  AttenuoError,
+  TransportTimeoutError,
+} from "./errors.js";
 import { Http, type HttpOptions } from "./http.js";
 import { bearer, decodeToken, verifyToken, type Jwks, type Token } from "./token.js";
 import { mcpHeaders } from "./mcp.js";
@@ -72,8 +77,8 @@ export interface CallToolStreamOptions extends CallToolOptions {
    * A total deadline for the whole call in milliseconds, counted from the request's start
    * (default none). The idle `timeoutMs` restarts on every read, so an upstream that sends only
    * keep-alive comments would hold the stream open forever without it (SR-82). On expiry the
-   * request is aborted and the stream throws `AttenuoError`. At most 2147483647 (`setTimeout`'s
-   * limit).
+   * request is aborted and the stream throws `TransportTimeoutError`. At most 2147483647
+   * (`setTimeout`'s limit).
    */
   deadlineMs?: number;
 }
@@ -94,6 +99,17 @@ export interface CallWithApprovalOptions extends McpOptions, ApprovalWaitOptions
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/**
+ * `value` as one percent-encoded URL path segment; `.` and `..` are refused because URL
+ * normalization removes them even when encoded (SR-31).
+ */
+function pathSegment(value: string, what: string): string {
+  if (value === "" || value === "." || value === "..") {
+    throw new TypeError(`${what} must be a non-empty name, got ${JSON.stringify(value)}`);
+  }
+  return encodeURIComponent(value);
+}
 
 export class AttenuoClient {
   readonly serverUrl: string;
@@ -274,8 +290,9 @@ export class AttenuoClient {
    * `decisionId` of the proxy's `stream.end` record; any other JSON-RPC error throws what
    * `callTool` throws. A plain JSON answer is yielded as the one final event. An event over
    * `maxEventBytes` throws `AttenuoError`. The client's `timeoutMs` applies between reads, so a
-   * stream quiet for longer is aborted; leaving the loop early closes the connection.
-   * `deadlineMs` bounds the whole call, keep-alives included: on expiry it throws `AttenuoError`.
+   * stream quiet for longer is aborted with a `TransportTimeoutError`; leaving the loop early
+   * closes the connection. `deadlineMs` bounds the whole call, keep-alives included: on expiry it
+   * throws `TransportTimeoutError`. An abort through `signal` is thrown as it came.
    */
   callToolStream(
     token: Token | string | undefined,
@@ -320,25 +337,30 @@ export class AttenuoClient {
     opts.signal?.addEventListener("abort", onAbort, { once: true });
     const ms = this.http.timeoutMs;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    // The reason the idle timer aborted with, told apart from the caller's own abort by identity:
+    // the client's timeout is a `TransportTimeoutError`, the caller's abort is thrown as it came.
+    let idle: DOMException | undefined;
     const restart = () => {
       if (ms <= 0) return;
       clearTimeout(timer);
-      timer = setTimeout(
-        () => ctl.abort(new DOMException("no data within the timeout", "TimeoutError")),
-        ms,
-      );
+      timer = setTimeout(() => {
+        idle = new DOMException("no data within the timeout", "TimeoutError");
+        ctl.abort(idle);
+      }, ms);
     };
     // The optional total deadline (SR-82): not restarted by reads, so keep-alives cannot hold
     // the stream open past it. A read that still completes after it throws too.
     const deadlineMs = opts.deadlineMs;
     let expired = false;
-    const deadlineError = () => new AttenuoError(`stream deadline of ${deadlineMs}ms elapsed`);
+    const deadlineAbort = new DOMException("stream deadline elapsed", "TimeoutError");
+    const deadlineError = () =>
+      new TransportTimeoutError(`stream deadline of ${deadlineMs}ms elapsed`, deadlineAbort);
     const deadline =
       deadlineMs === undefined
         ? undefined
         : setTimeout(() => {
             expired = true;
-            ctl.abort(deadlineError());
+            ctl.abort(deadlineAbort);
           }, deadlineMs);
     const onChunk = () => {
       if (expired) throw deadlineError();
@@ -357,12 +379,44 @@ export class AttenuoClient {
       yield* callStream(res, id, maxEventBytes, onChunk);
     } catch (e) {
       if (expired) throw deadlineError();
+      if (idle !== undefined && ctl.signal.reason === idle) {
+        throw new TransportTimeoutError(
+          `POST ${this.serverUrl}${path}: no data within ${ms}ms`,
+          idle,
+        );
+      }
       throw e;
     } finally {
       clearTimeout(timer);
       clearTimeout(deadline);
       opts.signal?.removeEventListener("abort", onAbort);
     }
+  }
+
+  /**
+   * End an MCP session (`DELETE /mcp/{server}` with its `Mcp-Session-Id`). Resolves to `true` when
+   * the upstream closed it, `false` when the upstream does not let clients close sessions (405).
+   * The proxy's refusals throw what a call would (an unknown session is an `RpcError` with code
+   * `-32600`).
+   */
+  async closeSession(
+    token: Token | string | undefined,
+    server: string,
+    sessionId: string,
+  ): Promise<boolean> {
+    if (typeof sessionId !== "string" || sessionId === "") {
+      throw new TypeError("sessionId must be the Mcp-Session-Id to close");
+    }
+    const path = `/mcp/${pathSegment(server, "server")}`;
+    const auth = this.auth(bearer(token, this.token), path, "DELETE");
+    const headers = { accept: w.MCP_ACCEPT, [w.SESSION_HEADER]: sessionId };
+    const res = await this.post(
+      path,
+      async (nonce) => ({ ...headers, ...(await auth(nonce)) }),
+      undefined,
+      "DELETE",
+    );
+    return w.sessionClosed(res);
   }
 
   /** `tools/list`; the proxy shows only the tools this token may call. */
@@ -444,6 +498,36 @@ export class AttenuoClient {
     return this.callTool(token, server, tool, args, retry);
   }
 
+  /**
+   * Grant a pending approval as the run's originating user (`POST /approvals/{id}`,
+   * `by = "user"`); resolves to it. `idToken` is that user's OIDC ID token, sent as a plain
+   * bearer: a delegation token is refused (403 `agent_token_refused`), another user's is 403
+   * `wrong_user`, and an ID token decides once (400 `invalid_grant` after). 409
+   * (`approval_not_pending`, `approval_expired`, `lease_revoked`) when it cannot be decided any
+   * more, 404 when it is unknown; all `ApiError` (`UnauthorizedError` for a 401).
+   */
+  async grantApproval(approvalId: string, idToken: string): Promise<w.Approval> {
+    return this.decideApproval(approvalId, idToken, "grant");
+  }
+
+  /** Decline a pending approval as the run's originating user; errors as `grantApproval`. */
+  async declineApproval(approvalId: string, idToken: string): Promise<w.Approval> {
+    return this.decideApproval(approvalId, idToken, "decline");
+  }
+
+  private async decideApproval(
+    approvalId: string,
+    idToken: string,
+    decision: "grant" | "decline",
+  ): Promise<w.Approval> {
+    const path = `/approvals/${pathSegment(approvalId, "approvalId")}`;
+    const res = await this.http.post(path, {
+      headers: w.idTokenHeaders(idToken),
+      json: w.approvalDecisionBody(decision),
+    });
+    return w.approvalFromJson(await w.jsonBody(res));
+  }
+
   /** Ask for a decision without calling the tool. A deny is returned, not thrown. */
   async authzenEvaluate(
     token: Token | string | undefined,
@@ -457,6 +541,34 @@ export class AttenuoClient {
       w.authzenBody(server, tool, args),
     );
     return w.authzenFromResponse(await w.jsonBody(res));
+  }
+
+  /**
+   * Decide several calls in one request (`POST /access/v1/evaluations`), each decided, charged
+   * and audited like `authzenEvaluate`. Resolves to one decision per call, in order; denies are
+   * returned, not thrown.
+   *
+   * `semantic` is AuthZEN's `evaluations_semantic`: `execute_all` (the server's default),
+   * `deny_on_first_deny` or `permit_on_first_permit`. A batch stopped by it answers only the
+   * calls it decided, so the array can be shorter than `evaluations`. A call the server could
+   * not decide is a deny whose `error` says why. More calls than `[authzen] max_batch` is an
+   * `ApiError` (400 `batch_too_large`).
+   */
+  async authzenEvaluateBatch(
+    token: Token | string | undefined,
+    evaluations: readonly w.AuthzenEvaluationLike[],
+    opts: { semantic?: w.EvaluationsSemantic } = {},
+  ): Promise<w.AuthzenDecision[]> {
+    const body = w.authzenBatchBody(evaluations, opts.semantic);
+    const path = "/access/v1/evaluations";
+    const res = await this.post(path, this.auth(bearer(token, this.token), path), body);
+    return w.authzenBatchFromResponse(await w.jsonBody(res));
+  }
+
+  /** `GET /.well-known/authzen-configuration`: the AuthZEN discovery document. No credential is sent. */
+  async authzenConfiguration(): Promise<w.AuthzenConfiguration> {
+    const res = await this.http.get("/.well-known/authzen-configuration");
+    return w.authzenConfigurationFromJson(await w.jsonBody(res));
   }
 
   /** `GET /.well-known/jwks.json`. */
