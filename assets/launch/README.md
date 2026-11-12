@@ -27,10 +27,10 @@ Every claim comes from a merged document; change the source first, then the vide
 
 | On screen | Source |
 |---|---|
-| Injected GitHub issue that published private repositories (May 2025); 16 MCP incidents | `docs/brief/attenuo-one-page.md`, Problem; `docs/report/attenuo-2026-11.md`, Introduction |
+| Injected GitHub issue that published private repositories (May 2025); 16 MCP incidents | `docs/report/attenuo-2026-11.md`, Introduction |
 | The three calls and their decisions (`policy_allow`, `policy_deny`, `capability_denied`), revoke cascade, "revoked 2 lease(s)" | `docs/demo/github-leak-demo.cast` |
-| 38/38 vs 7/38 attack calls; 1/38 with labels and a one-call limit; 3/29 benign denied | `docs/brief/attenuo-one-page.md`, Evidence; `docs/report/attenuo-2026-11.md`, Table 2 |
-| 0.4 to 0.8 ms median added latency | `docs/brief/attenuo-one-page.md`; `docs/design/performance.md` |
+| 38/38 vs 7/38 attack calls; 1/38 with labels and a one-call limit; 3/29 benign denied | `docs/report/attenuo-2026-11.md`, Table 2 |
+| 0.4 to 0.8 ms median added latency | `docs/design/performance.md` |
 | AgentDojo 0/212 on four models without attenuo; up to 92 refused runs | `docs/research/agentdojo-plan-2026-11-05.md`, "Four models on one sample" |
 | Admin console | `public/shots/dark-02-audit.png` (console screenshot) |
 
