@@ -12,6 +12,7 @@
 //! | a path parameter that does not parse or is not UTF-8 | 400 | `invalid_request` |
 //! | a body over the limit (axum's default, 2 MiB) | 413 | `request_too_large` |
 //! | a body that cannot be read | 400 | `invalid_request` |
+//! | a body not read within `[limits] request_body_timeout_seconds` | 408 | `request_timeout` |
 //!
 //! `detail` names the parameter (a name from the route or the query struct, never a value from
 //! the request) and the expected type; it never quotes what was sent. A route-definition error
@@ -169,6 +170,13 @@ impl std::ops::Deref for Body {
 /// The [`ApiError`] for a body that could not be read.
 pub fn body_rejection(rejection: BytesRejection) -> ApiError {
     tracing::debug!(error = ?rejection.body_text(), "request body refused");
+    if crate::limits::is_body_timeout(&rejection) {
+        return ApiError::new(
+            StatusCode::REQUEST_TIMEOUT,
+            crate::limits::REQUEST_TIMEOUT,
+            "the request body did not arrive in time",
+        );
+    }
     if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
         ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,

@@ -71,6 +71,8 @@ pub(crate) mod early_close;
 pub mod error;
 pub(crate) mod idp;
 pub(crate) mod issuer_keys;
+pub(crate) mod limits;
+pub(crate) mod listen;
 // Used by `main` and the integration tests.
 pub mod logging;
 // Used by the integration tests.
@@ -133,7 +135,13 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
         .route("/access/v1/evaluations", post(authzen::evaluations))
         .route_layer(axum::middleware::from_fn(authzen::echo_request_id));
     let mut token_routes = Router::new()
-        .route("/token", post(token::exchange))
+        .route(
+            "/token",
+            post(token::exchange).layer(axum::middleware::from_fn_with_state(
+                state.limits.clone(),
+                limits::token_peer_limit,
+            )),
+        )
         .route("/token/renew", post(renew::renew));
     // One exported span per token and AuthZEN request, only when tracing is on.
     let (authzen_routes, token_routes) = if state.trace.is_some() {
@@ -169,7 +177,8 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
     let authorizer = Arc::new(
         ServerAuthorizer::new(state.verifier.clone(), state.pipeline.clone())
             .with_dpop(state.dpop.clone())
-            .with_trace(state.trace.clone()),
+            .with_trace(state.trace.clone())
+            .with_limits(state.limits.clone()),
     );
     let proxy = attenuo_proxy::router_with_clock(
         // Validated in `AppState::from_config`.
@@ -179,7 +188,19 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
         authorizer,
         state.clock.clone(),
     );
-    outer_layers(api.merge(proxy), &state)
+    // `[limits]`: the deadlines inside the in-flight cap, both inside the metrics layer so
+    // that their refusals are counted by route like any answer. Main listener only.
+    let app = api
+        .merge(proxy)
+        .layer(axum::middleware::from_fn_with_state(
+            state.limits.clone(),
+            limits::deadlines,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.limits.clone(),
+            limits::shed,
+        ));
+    outer_layers(app, &state)
 }
 
 /// The router of the `[admin] listen` listener (S-1): the admin routes of the table above
@@ -592,6 +613,7 @@ pub async fn run(
             let _ = rx.wait_for(|stop| *stop).await;
         }
     };
+    let header_read_timeout = config.limits.header_read_timeout();
     let mut tasks: Vec<(&str, tokio::task::JoinHandle<anyhow::Result<()>>)> = Vec::new();
     if !state.checkpoint_interval.is_zero() {
         let ticks = checkpoint_ticks(state.clone(), state.checkpoint_interval, stopped());
@@ -619,17 +641,17 @@ pub async fn run(
     }
     if let Some(l) = metrics_listener {
         let app = metrics::router(state.metrics.clone());
-        let until = serve_and_release(l, app, stopped(), DRAIN_TIMEOUT);
+        let until = serve_and_release(l, app, stopped(), DRAIN_TIMEOUT, header_read_timeout);
         tasks.push(("metrics listener", tokio::spawn(until)));
     }
     if let Some(l) = admin_listener {
         let app = admin_router(state.clone());
-        let until = serve_and_release(l, app, stopped(), DRAIN_TIMEOUT);
+        let until = serve_and_release(l, app, stopped(), DRAIN_TIMEOUT, header_read_timeout);
         tasks.push(("admin listener", tokio::spawn(until)));
     }
     if let Some(l) = console_listener {
         let app = admin_ui::router(state.clone(), config);
-        let until = serve_and_release(l, app, stopped(), DRAIN_TIMEOUT);
+        let until = serve_and_release(l, app, stopped(), DRAIN_TIMEOUT, header_read_timeout);
         tasks.push(("admin console listener", tokio::spawn(until)));
     }
     let res = serve_and_release(
@@ -640,6 +662,7 @@ pub async fn run(
             let _ = stop_tx.send(true);
         },
         DRAIN_TIMEOUT,
+        header_read_timeout,
     )
     .await;
     // The timers and the other listeners stop with the main one; wait for each, so none of
@@ -683,7 +706,9 @@ pub async fn run(
 }
 
 /// Serve `app` on `listener` until `shutdown` resolves, then stop accepting connections and
-/// wait up to `drain` for in-flight requests before giving up on them.
+/// wait up to `drain` for in-flight requests before giving up on them. Connections get the
+/// default `[limits] header_read_timeout_seconds`
+/// ([`config::DEFAULT_HEADER_READ_TIMEOUT_SECONDS`]).
 ///
 /// # Errors
 ///
@@ -696,25 +721,29 @@ pub async fn serve_until(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     drain: std::time::Duration,
 ) -> anyhow::Result<()> {
-    serve_until_drained(listener, app, shutdown, drain)
+    let header_read_timeout =
+        std::time::Duration::from_secs(config::DEFAULT_HEADER_READ_TIMEOUT_SECONDS);
+    serve_until_drained(listener, app, shutdown, drain, header_read_timeout)
         .await
         .map(drop)
 }
 
 /// [`serve_until`], saying whether every connection was drained (`false`: the drain timed out).
+/// Each connection gets `header_read_timeout` ([`listen`]).
 async fn serve_until_drained(
     listener: tokio::net::TcpListener,
     app: Router,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     drain: std::time::Duration,
+    header_read_timeout: std::time::Duration,
 ) -> anyhow::Result<bool> {
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+    let server = listen::serve(listener, app, header_read_timeout, async move {
         let _ = rx.await;
     });
-    let mut server = tokio::spawn(async move { server.await });
+    let mut server = tokio::spawn(server);
     tokio::select! {
-        res = &mut server => return res?.map(|()| true).map_err(Into::into),
+        res = &mut server => return res.map(|()| true).map_err(Into::into),
         () = shutdown => {}
     }
     tracing::info!(
@@ -724,7 +753,7 @@ async fn serve_until_drained(
     let _ = tx.send(());
     match tokio::time::timeout(drain, &mut server).await {
         Ok(res) => {
-            res??;
+            res?;
             tracing::info!("shutdown complete");
             Ok(true)
         }
@@ -757,10 +786,11 @@ async fn serve_and_release(
     app: Router,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     drain: std::time::Duration,
+    header_read_timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
     let (copy, mut copies) = tokio::sync::mpsc::channel::<()>(1);
     let app = app.layer(axum::Extension(RouterCopy { _held: copy }));
-    if serve_until_drained(listener, app, shutdown, drain).await? {
+    if serve_until_drained(listener, app, shutdown, drain, header_read_timeout).await? {
         // Nothing is sent: `recv` answers `None` once the last sender, so the last copy, is gone.
         if tokio::time::timeout(drain, copies.recv()).await.is_err() {
             tracing::warn!("a copy of the router outlived the drain");

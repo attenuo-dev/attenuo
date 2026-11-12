@@ -29,6 +29,7 @@ pub struct ServerAuthorizer {
     pub(super) verified: VerifiedTokens,
     dpop: Option<Arc<crate::dpop::Dpop>>,
     trace: Option<Arc<crate::telemetry::ServerTrace>>,
+    limits: Option<Arc<crate::limits::Limits>>,
 }
 
 impl ServerAuthorizer {
@@ -41,7 +42,15 @@ impl ServerAuthorizer {
             verified: VerifiedTokens::new(VERIFIED_TOKENS_CAPACITY),
             dpop: None,
             trace: None,
+            limits: None,
         }
+    }
+
+    /// Count each authenticated request against `[limits] mcp_requests_per_minute` of its run
+    /// ([`crate::limits`]). Without this nothing is counted.
+    pub(crate) fn with_limits(mut self, limits: Arc<crate::limits::Limits>) -> Self {
+        self.limits = Some(limits);
+        self
     }
 
     /// Join the proxy's exported spans to outside traces through `trace` (`[telemetry]`);
@@ -218,6 +227,15 @@ impl Authorizer for ServerAuthorizer {
         let jkt = dpop_bound
             .then(|| v.claims.cnf.as_ref().map(|c| c.jkt.clone()))
             .flatten();
+        // The per-run rate limit, keyed by the root lease: known from the verified token (a
+        // cache hit after the first request), before any lease lookup, decision, audit append
+        // or upstream call. Counted only once the token and its DPoP proof verified, so a
+        // caller without the token's key cannot use up a run's requests.
+        if let Some(limits) = &self.limits {
+            if let Some(run) = v.chain.hops.first().map(|h| h.lease.0.as_str()) {
+                limits.admit_mcp(run).map_err(AuthError::RateLimited)?;
+            }
+        }
         Ok(Authenticated {
             chain: v.chain,
             dpop_bound,

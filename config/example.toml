@@ -357,6 +357,29 @@ record_window_max_keys = 10000
 upstream_connect_timeout_seconds = 5
 upstream_response_timeout_seconds = 120
 
+[limits]
+# Basic protection of this one process against too much work at once (not a security
+# property; every figure is per process, and attenuo runs as a single replica).
+# Requests handled at once on the main listener; one more gets 503 overloaded with
+# Retry-After: 1 instead of queueing. /healthz and /readyz are never refused. 0: no cap.
+max_in_flight = 1024
+# Seconds for a request's headers to arrive (also the idle time of a kept-alive connection).
+header_read_timeout_seconds = 30
+# Seconds for a request body to arrive once the headers are in; past it, 408.
+request_body_timeout_seconds = 30
+# Seconds for an answer on every route but /mcp/{server} (its streams stay open) and
+# /admin/*; past it, 503 request_timeout.
+request_timeout_seconds = 60
+# Per-caller rate limits, per minute, off (0) by default: POST /token per authenticated
+# agent, POST /token that authenticated no agent per peer address (behind a reverse proxy
+# every caller shares its address), and /mcp/{server} per run (root lease). Over: 429 with
+# Retry-After. Pick a few times the busiest legitimate rate.
+token_requests_per_minute = 0
+token_unauthenticated_requests_per_minute = 0
+mcp_requests_per_minute = 0
+# Callers each rate limit tracks; when all are inside their minute a new one is refused.
+rate_limit_max_keys = 10000
+
 [metrics]
 # Prometheus text endpoint on its OWN listener (GET /metrics), never on the proxy port.
 # No authentication: keep it on loopback or a private network.

@@ -43,6 +43,9 @@ pub struct ApiError {
     /// verified). Sent as `decision_id` in the body and in
     /// the `X-Attenuo-Decision-Id` header.
     pub decision_id: Option<uuid::Uuid>,
+    /// Seconds the client should wait before it retries, sent as `Retry-After` when set (a
+    /// shed request, a timed-out handler, a rate limit; see [`crate::config::LimitsSection`]).
+    pub retry_after: Option<u64>,
 }
 
 impl ApiError {
@@ -54,7 +57,14 @@ impl ApiError {
             detail: detail.into(),
             description: None,
             decision_id: None,
+            retry_after: None,
         }
+    }
+
+    /// Ask the client to wait `seconds` (at least 1) before it retries (`Retry-After`).
+    pub fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after = Some(seconds.max(1));
+        self
     }
 
     /// Attach a stable `error_description` sub-code.
@@ -142,6 +152,10 @@ impl IntoResponse for ApiError {
             axum::http::header::CACHE_CONTROL,
             axum::http::HeaderValue::from_static("no-store"),
         );
+        if let Some(secs) = self.retry_after {
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, secs.into());
+        }
         if self.status == StatusCode::UNAUTHORIZED && self.code == "invalid_client" {
             // RFC 6749 §5.2: a 401 for client authentication names the scheme.
             resp.headers_mut().insert(
