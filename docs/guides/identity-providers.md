@@ -126,7 +126,7 @@ capabilities = [
 ]
 ```
 
-`op` is `equals`, `one_of` or `prefix`. Start narrow. A root token is the widest anything in the chain can be.
+`op` is `equals`, `one_of`, `prefix`, `path_prefix` or `range`; use `path_prefix`, not `prefix`, for a file path ([why](../concepts/capabilities-and-attenuation.md#prefixes-of-strings-and-of-paths)). Start narrow. A root token is the widest anything in the chain can be.
 
 ID tokens are bearer credentials, bound to the agent that presents them only through `aud`/`azp` (SR-37): a token issued for agent A is refused from agent B with `credential_audience_mismatch`. `nonce` is not checked, because it binds a token to the browser session that requested it and the agent presenting the token here is not that session; the bearer risk remains until sender-constrained tokens exist.
 

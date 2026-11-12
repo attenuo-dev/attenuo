@@ -247,6 +247,8 @@ The most a root token may carry.
 | `attributes` | Used only by the development root mint. IdP intake takes attributes from the verified token. |
 
 For the development root mint, an empty `[[root_grants]]` list lets the admin mint any capabilities.
+
+A constraint's `op` is `equals`, `one_of`, `prefix`, `path_prefix` or `range` ([capabilities](../concepts/capabilities-and-attenuation.md)); a malformed `range` or `path_prefix` (`{ op = "path_prefix", value = "/workspace/../x" }`) refuses the config. A `prefix` on an argument that looks like a file path (named `path`, `file`, `filename`, `dir`, `directory` or `folder`, or ending in `_path`, `_dir` or `_file`, or a prefix starting with `/`, `./` or `~`, or holding a `/` and no `://`) is logged as a warning at startup recommending `path_prefix`, and `attenuo policy lint --config` prints the same warning; neither refuses it.
 | `may_act` | Optional list of agent ids: the RFC 8693 `may_act` of root tokens minted under this grant, so only these agents may exchange them. A request may narrow it with its own `may_act`, never widen it (`may_act_exceeds_grant`). |
 
 With no matching entry, no root token is issued.
