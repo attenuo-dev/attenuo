@@ -50,7 +50,7 @@ enum Outcome {
 async fn main() -> ExitCode {
     // Not `Cli::parse()`: clap exits 2 on a usage error, the status that means "the answer
     // was no", so a script would read a typo as a denial.
-    let cli = match Cli::try_parse() {
+    let mut cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {
             // Help and version go to stdout, errors to stderr, formatted as clap would.
@@ -64,6 +64,9 @@ async fn main() -> ExitCode {
         }
     };
     for line in secrets::argv_warnings(std::env::args_os()) {
+        eprintln!("{line}");
+    }
+    for line in cli.resolve_deprecated() {
         eprintln!("{line}");
     }
     match run(cli).await {
@@ -224,6 +227,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
             Ok(Outcome::Ok)
         }
         Command::Call(a) => {
+            let upstream = a.upstream().to_string();
             let client = client?;
             let token = secrets::resolve_token(
                 "--token",
@@ -237,7 +241,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 .mcp(
                     &token,
                     key.as_ref(),
-                    &a.server,
+                    &upstream,
                     "tools/call",
                     json!({"name": a.tool, "arguments": args}),
                 )
@@ -245,6 +249,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
             Ok(print_call(&resp, json))
         }
         Command::Tools(a) => {
+            let upstream = a.upstream().to_string();
             let client = client?;
             let token = secrets::resolve_token(
                 "--token",
@@ -254,7 +259,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
             )?;
             let key = dpop_key::load_opt(a.token.dpop_key.as_deref())?;
             let resp = client
-                .mcp(&token, key.as_ref(), &a.server, "tools/list", json!({}))
+                .mcp(&token, key.as_ref(), &upstream, "tools/list", json!({}))
                 .await?;
             Ok(print_tools(&resp, json))
         }
@@ -657,9 +662,10 @@ async fn run(cli: Cli) -> Result<Outcome> {
         }
         Command::Authzen(AuthzenCmd::Eval {
             token,
-            server,
+            upstream: server,
             tool,
             args,
+            ..
         }) => {
             let input: Map<String, Value> = args.into_iter().collect();
             // The server fills an empty subject id from the verified chain.
@@ -712,8 +718,8 @@ fn evaluate_body(a: &cli::EvaluateArgs, stdin: &mut secrets::Stdin) -> Result<Va
     let input: Map<String, Value> = a.args.iter().cloned().collect();
     let mut req = json!({
         "subject": {"type": "agent", "id": ""},
-        "action": {"name": a.tool, "properties": {"server": a.server}},
-        "resource": {"type": "tool", "id": format!("{}/{}", a.server, a.tool)},
+        "action": {"name": a.tool, "properties": {"server": a.upstream()}},
+        "resource": {"type": "tool", "id": format!("{}/{}", a.upstream(), a.tool)},
         "context": {"input": input},
     });
     match &a.chain_file {

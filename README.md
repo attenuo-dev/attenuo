@@ -247,7 +247,7 @@ export PATH=$PWD/target/debug:$PATH   # or $CARGO_TARGET_DIR/debug
 attenuo token root --subject alice --issuer https://idp.example --agent planner --cap 'github:*'
 printf '%s\n' coder-secret-change-me | ATTENUO_TOKEN="$ROOT_TOKEN" attenuo token exchange --actor coder --client-secret-stdin --cap github:read_file
 attenuo token inspect "$CHILD_TOKEN" --verify      # the chain as a tree; --verify checks it against the server's JWKS
-printf '%s\n' "$CHILD_TOKEN" | attenuo call --token - --server github --tool read_file --arg repo=acme/api
+printf '%s\n' "$CHILD_TOKEN" | attenuo call --token - --upstream github --tool read_file --arg repo=acme/api
 attenuo lease revoke "$ROOT_LEASE" --reason demo
 attenuo audit tail -n 10 --follow
 attenuo audit verify

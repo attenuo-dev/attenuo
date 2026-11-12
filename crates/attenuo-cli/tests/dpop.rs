@@ -93,7 +93,7 @@ fn key_gen_and_call_with_a_dpop_key_sr24() {
             "--server",
             &url,
             "call",
-            "--server",
+            "--upstream",
             "github",
             "--tool",
             "read_file",

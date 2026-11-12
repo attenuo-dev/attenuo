@@ -92,7 +92,7 @@ expires_in  900s
 token       eyJ0eXAiOiJhdHRlbnVvK2p3...
 
 == 2. The planner looks at the issues it was asked to plan for: allowed
-$ ATTENUO_TOKEN="$PLANNER" attenuo call --server github --tool list_issues --arg repo=acme/api
+$ ATTENUO_TOKEN="$PLANNER" attenuo call --upstream github --tool list_issues --arg repo=acme/api
 ALLOWED
 {"arguments":{"repo":"acme/api"},"name":"list_issues"}
 
@@ -137,25 +137,25 @@ error: server answered 400 Bad Request: invalid_request: agent `reviewer` is not
 decision 6e0429d7-529e-4a36-b88d-6084e5ea80b6
 
 == 7. The coder reads the file it was asked to fix: allowed
-$ ATTENUO_TOKEN="$CODER" attenuo call --server github --tool get_file_contents --arg repo=acme/api --arg path=src/lib.rs
+$ ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool get_file_contents --arg repo=acme/api --arg path=src/lib.rs
 ALLOWED
 {"arguments":{"path":"src/lib.rs","repo":"acme/api"},"name":"get_file_contents"}
 
 == 8. The coder pushes its fix straight to main: denied by policy
 # create_or_update_file on acme/api is in the coder's token; the policy wants an agent/* branch.
-$ ATTENUO_TOKEN="$CODER" attenuo call --server github --tool create_or_update_file --arg repo=acme/api --arg path=src/lib.rs --arg branch=main --arg content="fn fixed() {}"
+$ ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool create_or_update_file --arg repo=acme/api --arg path=src/lib.rs --arg branch=main --arg content="fn fixed() {}"
 DENIED  policy_deny
 decision 2e156546-15e4-4168-91f5-3faeb6871786
 
 == 9. The coder tries to open an issue: denied, the planner never delegated create_issue
-$ ATTENUO_TOKEN="$CODER" attenuo call --server github --tool create_issue --arg repo=acme/api --arg title="fix pushed"
+$ ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool create_issue --arg repo=acme/api --arg title="fix pushed"
 DENIED  capability_denied
 decision 40d705aa-bc4b-4c1d-9b9a-93fd87a9031e
 
 == 10. The coder reads from a second repository under acme/api: denied by the run limit
 # acme/api-client is inside the coder's repo prefix and the policy allows the read, but the
 # distinct limit allows one repository per run and acme/api was the first.
-$ ATTENUO_TOKEN="$CODER" attenuo call --server github --tool get_file_contents --arg repo=acme/api-client --arg path=README.md
+$ ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool get_file_contents --arg repo=acme/api-client --arg path=README.md
 DENIED  budget_exhausted
 decision 98737a37-fc57-435a-8660-4665022c7b43
 
@@ -187,7 +187,7 @@ reason    planner run went wrong
 audit     092534bf-f3ad-44f4-b20b-de269067305a
 
 == 13. The coder's next call, even the one that worked before, is denied
-$ ATTENUO_TOKEN="$CODER" attenuo call --server github --tool get_file_contents --arg repo=acme/api --arg path=src/lib.rs
+$ ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool get_file_contents --arg repo=acme/api --arg path=src/lib.rs
 DENIED  lease_revoked
 decision 88fc8d8d-a59e-4e76-b894-9440eeeb458d
 

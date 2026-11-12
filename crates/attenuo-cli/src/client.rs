@@ -56,7 +56,7 @@ impl Client {
         if !(base.starts_with("http://") || base.starts_with("https://")) {
             bail!(
                 "--server must be the attenuo server's base URL (http://host:port), got `{base}`. \
-                 To name an MCP upstream, put `--server <name>` after `call` or `tools`."
+                 To name an MCP upstream, use `--upstream <name>` after the subcommand."
             );
         }
         Ok(Self {

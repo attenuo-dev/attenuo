@@ -16,7 +16,7 @@ attenuo [--server URL] [--json] <command>
 | `--admin-token TOKEN` | `ATTENUO_ADMIN_TOKEN` | none | Bearer for `/admin/*`. Prefer the environment variable, stdin or a file: an argument is readable by other local users (`ps`, `/proc/<pid>/cmdline`) and lands in shell history, so the CLI prints a warning to stderr when it is used. |
 | `--json` | | off | Print machine-readable JSON instead of text. Works after any subcommand. |
 
-The `--server` flag of `call`, `tools` and `authzen eval` is different. It names the MCP upstream, for example `github`.
+The MCP upstream a subcommand talks to (`call`, `tools`, `authzen eval`, `policy evaluate`, `audit tail`) is its `--upstream`, for example `github`. Those subcommands still accept the old spelling `--server <name>` after the subcommand, which is deprecated: it works as before, is hidden from `--help`, and prints a one-line warning to stderr. Giving both is an error.
 
 ## Exit status
 
@@ -42,7 +42,7 @@ Secrets are never taken from the argument list by default. That covers the admin
 export ATTENUO_ADMIN_TOKEN=$(cat /run/secrets/attenuo-admin)
 printf '%s\n' "$CODER_SECRET" | ATTENUO_TOKEN="$ROOT" attenuo token exchange --actor coder --client-secret-stdin --cap github:read_file
 attenuo --admin-token-file /run/secrets/attenuo-admin lease show "$LEASE"
-printf '%s\n' "$CODER" | attenuo call --token - --server github --tool read_file --arg repo=acme/api
+printf '%s\n' "$CODER" | attenuo call --token - --upstream github --tool read_file --arg repo=acme/api
 ```
 
 `token inspect -` also reads a token from stdin.
@@ -155,7 +155,7 @@ Call a tool through the proxy (`tools/call`).
 | `--token <JWT\|->` (`ATTENUO_TOKEN`) | Delegation token; `-` reads it from stdin. One of the flag, `--token-file` or `ATTENUO_TOKEN` is required. The flag with a literal token prints a warning. |
 | `--token-file PATH` | Read the delegation token from the first line of a file. |
 | `--dpop-key PATH` (`ATTENUO_DPOP_KEY`) | The DPoP key the token is bound to. Every request then carries a proof and `Authorization: DPoP`. Against a server with `[token] dpop_nonce = "required"` the CLI keeps the `DPoP-Nonce` the server sent, puts it in the proof, and sends a request once more when the server answers `use_dpop_nonce` (RFC 9449 §8); nonces are never printed or logged. Also on `tools` and `authzen eval`, and on `token root` and `token exchange`. |
-| `--server`, `--upstream` | MCP upstream name. Required. |
+| `--upstream` | MCP upstream name. Required. (`--server` after `call` is a deprecated spelling.) |
 | `--tool` | Tool name. Required. |
 | `--arg` | Tool argument. Repeatable. |
 
@@ -163,7 +163,7 @@ A call that needs an approval prints `APPROVAL REQUIRED` followed by the approva
 
 ### `tools`
 
-List the tools the token may see (`tools/list`). Takes `--token` (or `--token-file`, or `ATTENUO_TOKEN`) and `--server`.
+List the tools the token may see (`tools/list`). Takes `--token` (or `--token-file`, or `ATTENUO_TOKEN`) and `--upstream` (`--server` after `tools` is a deprecated spelling).
 
 ### `lease revoke <ID> [--reason TEXT]`
 
@@ -275,7 +275,7 @@ Show the most recent audit entries, oldest of them first. Filters keep only matc
 | `--subject` | all | The originating user. |
 | `--agent` | all | An agent anywhere in the record's chain. |
 | `--lease` | all | A lease anywhere in the record's chain. |
-| `--server` | all | The MCP upstream the call went to. This `--server` comes after `audit tail`; the attenuo server URL is the global `--server` before the subcommand. |
+| `--upstream` | all | The MCP upstream the call went to (the record's `server`). `--server` after `audit tail` is a deprecated spelling; the attenuo server URL is the global `--server` before the subcommand. |
 | `--tool` | all | The tool. attenuo's own records use `token.root`, `token.exchange`, `lease.renew` and `admin.*`. |
 | `--chain-id` | all | The delegation chain (the lease id of its first hop). |
 | `--since`, `--until` | | RFC 3339 times: records with `at` in `[since, until)`. |
@@ -366,12 +366,12 @@ Dry run: what the loaded policies decide for one call (`POST /admin/policies/eva
 | --- | --- |
 | `--token <JWT\|->` (`ATTENUO_TOKEN`) / `--token-file PATH` | The delegation token whose chain makes the call. An expired token is accepted and reported as expired. |
 | `--chain-file PATH` | A delegation chain as JSON instead of a token. The server checks only its shape, so the answer says `admin supplied`. Not with `--token` or `--token-file`. |
-| `--server`, `--upstream` | MCP upstream name. Required. |
+| `--upstream` | MCP upstream name. Required. (`--server` after `policy evaluate` is a deprecated spelling.) |
 | `--tool` | Tool name. Required. |
 | `--arg` | Tool argument. Repeatable. |
 
 ```sh
-ATTENUO_TOKEN="$CODER" attenuo policy evaluate --server github --tool create_issue --arg repo=acme/api
+ATTENUO_TOKEN="$CODER" attenuo policy evaluate --upstream github --tool create_issue --arg repo=acme/api
 ```
 
 ### `policy test <FILE>...`
@@ -437,6 +437,6 @@ Ask the decision endpoint whether the token's chain may make a call, without mak
 | --- | --- | --- |
 | `--token <JWT\|->` (`ATTENUO_TOKEN`) | | Delegation token, sent as the bearer; `-` reads it from stdin. Or `--token-file PATH`. |
 | `--dpop-key PATH` (`ATTENUO_DPOP_KEY`) | | The DPoP key a bound token needs. |
-| `--server` | `github` | MCP server name. |
+| `--upstream` | `github` | MCP upstream name. (`--server` after `authzen eval` is a deprecated spelling.) |
 | `--tool` | | Tool name. Required. |
 | `--arg` | | Tool argument. Repeatable. |
