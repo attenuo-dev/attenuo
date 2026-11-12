@@ -1589,6 +1589,19 @@ impl LeaseStore for SqliteLeaseStore {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
+impl SqliteLeaseStore {
+    /// How many writes have run on this store's file, by every store on it (the write gate's
+    /// turns): a lease store and a [`SqliteAudit`](super::SqliteAudit) on one file count
+    /// together. 0 for a store that is not on a file this crate opened. For tests and
+    /// measurements.
+    #[doc(hidden)]
+    pub fn write_turns(&self) -> u64 {
+        self.gate.turns()
+    }
+
+}
+
 #[cfg(test)]
 impl SqliteLeaseStore {
     /// Log every charge that commits (with its `synchronous` level) into `log`.
