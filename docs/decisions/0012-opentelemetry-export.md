@@ -1,6 +1,6 @@
 ---
-status: proposed
-date: 2026-11-06
+status: accepted
+date: 2026-11-12
 decision-makers: [7Mudit]
 consulted: []
 informed: []
@@ -31,7 +31,7 @@ Operators who run an OpenTelemetry collector want a trace of each MCP call throu
 
 ## Decision Outcome
 
-Proposed (built on `feat/otel-export`, see Confirmation): "Allow-listed spans in their own target, over OTLP/HTTP", because it is the only option where what leaves the process is fixed by construction rather than by a scrubber, it adds 17 packages instead of 25 or 42, and it keeps the record unchanged. The choices for the design's eight open questions:
+Chosen (built on `feat/otel-export`, see Confirmation): "Allow-listed spans in their own target, over OTLP/HTTP", because it is the only option where what leaves the process is fixed by construction rather than by a scrubber, it adds 17 packages instead of 25 or 42, and it keeps the record unchanged. The choices for the design's eight open questions:
 
 1. A cargo feature `otel` of `attenuo-server`, on by default: the published binary and image carry it, and export is a config switch (`[telemetry] enabled`).
 2. OTLP over HTTP with protobuf only; gRPC refuses to start.
@@ -58,7 +58,7 @@ Metrics stay on Prometheus `/metrics`, scraped by the collector; OTLP metrics pu
 
 ### Confirmation
 
-Built on branch `feat/otel-export` (2026-11-06) and merged to `main` (#215, #217): the `otel` cargo feature is compiled in by default and export stays off until `[telemetry]` turns it on. The status stays proposed until the maintainer accepts it. Tests in `crates/attenuo-server/tests/otel.rs`: `tools_call_exports_the_listed_spans_and_nothing_forbidden`, `upstream_gets_attenuos_traceparent_and_a_malformed_one_is_ignored`, `parent_mode_adopts_the_inbound_trace`, `tracing_off_inserts_nothing_upstream`, `a_dead_collector_never_slows_or_fails_a_decision`, `spans_reach_an_otlp_http_receiver_without_secrets`, `a_bad_endpoint_refuses_to_start`, `authzen_and_token_routes_get_one_span_each`; configuration and digest unit tests in `crates/attenuo-server/src/telemetry.rs`; `traceparent` parsing tests in `crates/attenuo-proxy/src/traceparent.rs`. The existing audit verification tests pass unchanged. Measurements and what is not verified are in [design section 10](../design/otel-export.md#10-built).
+Built on branch `feat/otel-export` (2026-11-06) and merged to `main` (#215, #217): the `otel` cargo feature is compiled in by default and export stays off until `[telemetry]` turns it on. The maintainer accepted it on 2026-11-12, with the choices listed above for the design's open questions; export stays off unless configured. Tests in `crates/attenuo-server/tests/otel.rs`: `tools_call_exports_the_listed_spans_and_nothing_forbidden`, `upstream_gets_attenuos_traceparent_and_a_malformed_one_is_ignored`, `parent_mode_adopts_the_inbound_trace`, `tracing_off_inserts_nothing_upstream`, `a_dead_collector_never_slows_or_fails_a_decision`, `spans_reach_an_otlp_http_receiver_without_secrets`, `a_bad_endpoint_refuses_to_start`, `authzen_and_token_routes_get_one_span_each`; configuration and digest unit tests in `crates/attenuo-server/src/telemetry.rs`; `traceparent` parsing tests in `crates/attenuo-proxy/src/traceparent.rs`. The existing audit verification tests pass unchanged. Measurements and what is not verified are in [design section 10](../design/otel-export.md#10-built).
 
 ## Pros and Cons of the Options
 

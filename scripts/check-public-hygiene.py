@@ -36,7 +36,7 @@ PERSONAL = re.compile(r"muditk441|onbehalf-private|Mudit[’']s|\bMudit (asked|s
 
 PLACEHOLDER = re.compile(r"[a-z]+@<domain>")
 # Placeholders the maintainer still has to fill in; each needs a real address first.
-PLACEHOLDER_PENDING = {"CODE_OF_CONDUCT.md"}
+PLACEHOLDER_PENDING: set[str] = set()
 # Pages that talk about the placeholder rather than use it.
 PLACEHOLDER_MENTION_OK = re.compile(r"^(docs/log/|docs/research/|docs/launch-checklist\.md$)")
 

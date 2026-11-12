@@ -316,7 +316,7 @@ The Mediums of pass 7 are typical of later passes. The proxy and MCP clients rea
 
 **What the proxy cannot see.** attenuo sees only MCP over streamable HTTP and its AuthZEN endpoint. It does not see local STDIO servers, API keys in the agent's environment, network paths around it, or what a server does after a clean request. (`docs/spec/threat-model.md`).
 
-**List filtering is Cedar-aware only when opted in.** By default `tools/list` answers are filtered by capability shape only, so an agent is shown tools no call can get through. This wastes calls and model context but does not affect security, since every call is still decided. The opt-in `[proxy] list_filter = "policy"` also hides tools that Cedar partial evaluation shows are denied for every input (ADR-0011, still proposed; `docs/decisions/0011-cedar-aware-list-filtering.md`).
+**List filtering is Cedar-aware only when opted in.** By default `tools/list` answers are filtered by capability shape only, so an agent is shown tools no call can get through. This wastes calls and model context but does not affect security, since every call is still decided. The opt-in `[proxy] list_filter = "policy"` also hides tools that Cedar partial evaluation shows are denied for every input (ADR-0011; `docs/decisions/0011-cedar-aware-list-filtering.md`).
 
 **Other gaps.** The IdP recipes (Keycloak, Auth0, Okta, Entra ID, Google, ID-JAG) are untested against real providers, and the Docker setup is untested (`README.md`, "Status"). Cross-organisation chains are not addressed. A root agent that can silently re-authenticate its user can approve its own gated calls unless approvals use a separate client (`docs/spec/threat-model.md`).
 

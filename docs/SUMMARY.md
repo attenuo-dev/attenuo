@@ -38,9 +38,9 @@
 - [Admin console](design/admin-console.md)
 - [Output labelling](design/output-labelling.md)
 - [Run limits](design/run-limits.md)
-- [Cedar-aware list filtering (built, opt-in, proposed)](design/cedar-aware-list-filtering.md)
+- [Cedar-aware list filtering (built, opt-in)](design/cedar-aware-list-filtering.md)
 - [Multi-replica readiness (proposed)](design/multi-replica.md)
-- [OpenTelemetry export (built, proposed)](design/otel-export.md)
+- [OpenTelemetry export (built, off by default)](design/otel-export.md)
 - [Run limits phase 3 (proposed)](design/run-limits-phase3.md)
 - [Read-side exfiltration (proposed)](design/read-side-exfiltration.md)
 

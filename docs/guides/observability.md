@@ -2,7 +2,7 @@
 
 attenuo gives an operator three views of what it does: Prometheus metrics on a side listener, log lines on standard output, and, with `[telemetry]`, OpenTelemetry traces of each MCP call sent to a collector over OTLP. This guide covers the traces and how to get the metrics into the same collector. The audit log stays the record of what was decided; traces and logs are operational aids.
 
-The design is in [OpenTelemetry export](../design/otel-export.md) and the decision in [ADR-0012](../decisions/0012-opentelemetry-export.md), both still proposed.
+The design is in [OpenTelemetry export](../design/otel-export.md) and the decision in [ADR-0012](../decisions/0012-opentelemetry-export.md).
 
 ## Point attenuo at a collector
 
