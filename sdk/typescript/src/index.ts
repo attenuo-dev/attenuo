@@ -30,7 +30,17 @@ export {
   verifyApprovalToken,
 } from "./approval.js";
 export type { ApprovalClaims, ApprovalVerifyOptions } from "./approval.js";
-export { ExportError, SHIPPED_FORMAT, crossCheck, parseShipped, verifyExport } from "./audit.js";
+export {
+  ENTRY_HASH_VERSION,
+  EXPORT_FORMAT,
+  ExportError,
+  GENESIS_HASH,
+  SHIPPED_FORMAT,
+  crossCheck,
+  entryHash,
+  parseShipped,
+  verifyExport,
+} from "./audit.js";
 export type {
   BadCheckpoint,
   CheckpointFields,
@@ -110,6 +120,7 @@ export {
   jwkThumbprint,
   NONCE_HEADER,
   NonceCache,
+  PROOF_TYPE,
   USE_DPOP_NONCE,
 } from "./dpop.js";
 export type { DpopKeyLike, Jwk } from "./dpop.js";
@@ -131,9 +142,11 @@ export {
   AttenuoError,
   RefreshError,
   RpcError,
+  TransportError,
   UnauthorizedError,
   VerificationError,
 } from "./errors.js";
+export type { RunUsage, UntrustedArg, UserWindow, WindowUsage } from "./errors.js";
 export type { FetchLike, HttpOptions } from "./http.js";
 export { TokenRefresher } from "./refresh.js";
 export { DEFAULT_MAX_EVENT_BYTES, SseParser } from "./sse.js";

@@ -167,10 +167,18 @@ export interface AuthzenDecision {
 
 // --- plain HTTP -------------------------------------------------------------------------------
 
-export function errorFromResponse(status: number, text: string): ApiError {
+/**
+ * The `ApiError` (`UnauthorizedError` for a 401) for a non-success answer. `decisionId` is the
+ * body's `decision_id` when `headers` carry an `X-Attenuo-Decision-Id` that vouches for it (see
+ * `provenDecisionId`). A JSON-RPC error body (the proxy's 401) gives its `data.reason` and `data`.
+ */
+export function errorFromResponse(status: number, text: string, headers?: Headers): ApiError {
   let error = "http_error";
   let detail = text.trim();
   let description: string | undefined;
+  let claimed: unknown;
+  let reason: string | undefined;
+  let data: Json | undefined;
   let body: unknown;
   try {
     body = JSON.parse(text);
@@ -183,21 +191,28 @@ export function errorFromResponse(status: number, text: string): ApiError {
       error = b.error;
       detail = String(b.detail ?? "");
       if (typeof b.error_description === "string") description = b.error_description;
+      claimed = b.decision_id;
     } else if (typeof b.error === "object" && b.error !== null) {
       // A JSON-RPC error body (the proxy's 401).
       const e = b.error as Json;
       error = String(e.code ?? "rpc_error");
       detail = String(e.message ?? "");
+      data = (typeof e.data === "object" && e.data !== null ? e.data : {}) as Json;
+      claimed = data.decision_id;
+      reason = typeof data.reason === "string" && data.reason !== "" ? data.reason : "unauthorized";
     }
   }
-  const Cls = status === 401 ? UnauthorizedError : ApiError;
-  return new Cls(status, error, detail, description);
+  const decisionId = provenDecisionId(headers?.get(DECISION_ID_HEADER) ?? undefined, claimed);
+  if (status === 401) {
+    return new UnauthorizedError(status, error, detail, description, decisionId, reason, data);
+  }
+  return new ApiError(status, error, detail, description, decisionId);
 }
 
 /** The JSON body of a success response; throws `ApiError` otherwise. */
 export async function jsonBody(res: Response): Promise<unknown> {
   const text = await res.text();
-  if (!res.ok) throw errorFromResponse(res.status, text);
+  if (!res.ok) throw errorFromResponse(res.status, text, res.headers);
   try {
     return JSON.parse(text);
   } catch {
@@ -395,23 +410,29 @@ export function parseRpcBody(text: string, sse: boolean): Json | undefined {
 }
 
 /**
- * The decision id of a denial the proxy produced, else `undefined` (SR-32). The proxy sets
- * `X-Attenuo-Decision-Id` (comma separated, request order) and forwards no such header from an
- * upstream; an upstream is untrusted and can put any `-32003` error in its own body. A denial
- * counts only when `data.decision_id` is one of the ids in that header.
+ * `claimed` when it is one of the ids in the `X-Attenuo-Decision-Id` header value, else
+ * `undefined` (SR-32). The server and the proxy set that header (comma separated, request order)
+ * on every response that carries their decisions, and the proxy forwards no such header from an
+ * upstream; an upstream is untrusted and can put any error, and any `decision_id`, in its own
+ * body, so an id counts only when the header names it too.
  */
-function proxyDecisionId(headerValue: string | undefined, data: Json): string | undefined {
-  const claimed = data.decision_id;
+function provenDecisionId(headerValue: string | undefined, claimed: unknown): string | undefined {
   if (typeof claimed !== "string" || claimed === "" || !headerValue) return undefined;
   return headerValue.split(",").some((p) => p.trim() === claimed) ? claimed : undefined;
+}
+
+/** The decision id of a `-32003` or `-32008` the proxy produced (`provenDecisionId`). */
+function proxyDecisionId(headerValue: string | undefined, data: Json): string | undefined {
+  return provenDecisionId(headerValue, data.decision_id);
 }
 
 /**
  * The `result` of a JSON-RPC response, or the right error. Denials (`-32003` that the proxy
  * vouches for with `X-Attenuo-Decision-Id`) throw `DeniedError`; a `-32003` without that proof
  * is an upstream's own error and throws `RpcError`. A `-32008` with the same proof throws
- * `ApprovalRequiredError`. `-32001` or HTTP 401 throws `UnauthorizedError`; any other JSON-RPC
- * error throws `RpcError`.
+ * `ApprovalRequiredError`. `-32001` or HTTP 401 throws `UnauthorizedError` with the error's
+ * `data.reason` as `reason` and, when the header vouches for it, its `data.decision_id`; any other
+ * JSON-RPC error throws `RpcError`.
  */
 export async function rpcResult(res: Response): Promise<{ result: Json; decisionId?: string }> {
   const sse = (res.headers.get("content-type") ?? "").includes("event-stream");
@@ -431,7 +452,7 @@ export function rpcMessageResult(
   const headerId = res.headers.get(DECISION_ID_HEADER) ?? undefined;
   if (!msg) {
     if (res.ok) throw new AttenuoError(`no JSON-RPC response in body: ${text.slice(0, 200)}`);
-    throw errorFromResponse(res.status, text);
+    throw errorFromResponse(res.status, text, res.headers);
   }
   const err = msg.error;
   if (typeof err === "object" && err !== null) {
@@ -440,7 +461,9 @@ export function rpcMessageResult(
     const message = String(e.message ?? "");
     if (e.code === CODE_DENIED) {
       const id = proxyDecisionId(headerId, data);
-      if (id !== undefined) throw new DeniedError(String(data.reason ?? "unknown"), id, message);
+      if (id !== undefined) {
+        throw new DeniedError(String(data.reason ?? "unknown"), id, message, data);
+      }
     }
     if (e.code === CODE_APPROVAL_REQUIRED) {
       const id = proxyDecisionId(headerId, data);
@@ -456,15 +479,25 @@ export function rpcMessageResult(
           optTime(data.expires_at),
           callHash,
           message,
+          data,
         );
       }
     }
     if (e.code === CODE_UNAUTHORIZED || res.status === 401) {
-      throw new UnauthorizedError(401, "unauthorized", message);
+      const reason = typeof data.reason === "string" && data.reason !== "" ? data.reason : "";
+      throw new UnauthorizedError(
+        401,
+        "unauthorized",
+        message,
+        undefined,
+        proxyDecisionId(headerId, data),
+        reason || "unauthorized",
+        data,
+      );
     }
     throw new RpcError(typeof e.code === "number" ? e.code : 0, message, e.data);
   }
-  if (!res.ok) throw errorFromResponse(res.status, text);
+  if (!res.ok) throw errorFromResponse(res.status, text, res.headers);
   const result = msg.result;
   const r =
     typeof result === "object" && result !== null && !Array.isArray(result) ? (result as Json) : {};

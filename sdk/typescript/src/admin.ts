@@ -9,7 +9,7 @@
 import { capabilitiesToJson, type CapabilityLike } from "./capability.js";
 import { DpopKey, NonceCache, resendOnce, type DpopKeyLike } from "./dpop.js";
 import { Http, type HttpOptions } from "./http.js";
-import { AttenuoError } from "./errors.js";
+import { AttenuoError, budgetLimitOf } from "./errors.js";
 import { bearer, type Token } from "./token.js";
 import * as w from "./wire.js";
 
@@ -654,19 +654,6 @@ function obj(v: unknown): Json | undefined {
   return typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Json) : undefined;
 }
 
-function budgetLimitOf(v: unknown): BudgetLimit | undefined {
-  const l = obj(v);
-  if (!l) return undefined;
-  const out: BudgetLimit = {
-    hop: Number(l.hop),
-    kind: String(l.kind) as LimitKind,
-    used: Number(l.used),
-  };
-  if (typeof l.arg === "string") out.arg = l.arg;
-  if (typeof l.max === "number") out.max = l.max;
-  return out;
-}
-
 function evaluationOf(b: Json): PolicyEvaluation {
   const out: PolicyEvaluation = {
     decision: (b.decision === "allow" ? "allow" : "deny") as Decision,
@@ -855,7 +842,7 @@ export class AdminClient {
   ): AsyncGenerator<AuditExportLine> {
     const query = exportParams(fromSeq, toSeq, filter);
     const res = await this.http.get("/admin/audit/export", { query });
-    if (!res.ok) throw w.errorFromResponse(res.status, await res.text());
+    if (!res.ok) throw w.errorFromResponse(res.status, await res.text(), res.headers);
     const decoder = new TextDecoder();
     let buf = "";
     const emit = function* (line: string): Generator<AuditExportLine> {
