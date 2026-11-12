@@ -5,6 +5,8 @@
 //! decision, a broken audit chain), so scripts can tell the two apart.
 //! `budget refund` also exits 3 when the decision was already refunded, so a retried refund can
 //! be told from one that found nothing to refund (2).
+//! `health` exits 1, never 2, when the server is not healthy (Docker reserves 2 in a
+//! `HEALTHCHECK`).
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -13,6 +15,7 @@
 mod cli;
 mod client;
 mod dpop_key;
+mod health;
 mod jwt;
 mod policy_cmd;
 mod render;
@@ -30,8 +33,8 @@ use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
 
 use cli::{
-    ApprovalCmd, AuditCmd, AuthzenCmd, BudgetCmd, Cli, Command, ExportFormat, Field, KeyCmd,
-    LeaseCmd, PolicyCmd, TokenCmd,
+    ApprovalCmd, AuditCmd, AuthzenCmd, BudgetCmd, Cli, Command, ExportFormat, Field, HealthArgs,
+    KeyCmd, LeaseCmd, PolicyCmd, TokenCmd,
 };
 use client::{query_escape, Client};
 use render::fmt_audit_entry;
@@ -80,6 +83,20 @@ async fn main() -> ExitCode {
     }
 }
 
+/// `attenuo health`: 0 when the server answered healthy (or ready), an error (exit 1) otherwise.
+async fn health(client: &Client, a: &HealthArgs, json: bool) -> Result<Outcome> {
+    let (status, body) = client
+        .probe(health::path(a.ready), Duration::from_secs(a.timeout))
+        .await?;
+    let (line, body) = health::judge(a.ready, status, &body).map_err(|e| anyhow::anyhow!(e))?;
+    if json {
+        print_json(&body);
+    } else {
+        println!("{line}");
+    }
+    Ok(Outcome::Ok)
+}
+
 /// Print an offline command's output and map its status to the exit code.
 fn finish(run: policy_cmd::Run, error: &str) -> Result<Outcome> {
     print!("{}", run.stdout);
@@ -110,6 +127,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
     let client = Client::new(&cli.server, admin_token);
     match cli.command {
         Command::Token(TokenCmd::Inspect(args)) => inspect(client.ok(), args, json).await,
+        Command::Health(a) => health(&client?, &a, json).await,
         Command::Key(KeyCmd::Gen { dpop }) => {
             let key = dpop_key::generate(&dpop)?;
             if json {

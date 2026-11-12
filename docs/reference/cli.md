@@ -23,7 +23,7 @@ The MCP upstream a subcommand talks to (`call`, `tools`, `authzen eval`, `policy
 | Status | Meaning |
 | --- | --- |
 | 0 | Success; for a command that asks a question (`call`, `tools`, `token inspect --verify`, `policy evaluate`, `authzen eval`, `policy test`, `policy lint`, `policy check`, `audit verify`, `approval verify`), the answer was yes. |
-| 1 | An error: the server could not be reached or answered with an error, a file could not be read, a test file could not be run, or the command line could not be parsed (unknown flag, missing argument). The message goes to stderr as `error: ...`; for a command line, it is clap's usage message. `--help` and `--version` exit 0. |
+| 1 | An error: the server could not be reached or answered with an error, a file could not be read, a test file could not be run, or the command line could not be parsed (unknown flag, missing argument). The message goes to stderr as `error: ...`; for a command line, it is clap's usage message. `--help` and `--version` exit 0. `health` exits 1, not 2, when the server answers but is not healthy or ready. |
 | 2 | The answer was no: a denial or `APPROVAL REQUIRED`, a JSON-RPC error from `tools`, a token that fails `--verify`, a failed test case, policy errors, a broken audit chain or invalid checkpoint, an invalid approval token; for `budget refund`, nothing to refund. |
 | 3, 4 | `budget refund` only: already refunded, charge pruned (see [`budget refund`](#budget-refund-id---reason-text)). |
 
@@ -54,6 +54,20 @@ printf '%s\n' "$CODER" | attenuo call --token - --upstream github --tool read_fi
 - `--attr key=value` follows the same rule for user attributes.
 
 ## Commands
+
+### `health`
+
+Check that the server is up: `GET /healthz`, or with `--ready`, `GET /readyz` ([health and readiness](../guides/deploying.md#health-and-readiness)). Needs no token. Prints `ok (attenuo-server <version>)` or `ready {...checks...}` and exits 0; exits 1 with `error: ...` on stderr when the server cannot be reached within the timeout, answers another status (for `/readyz`, the message names the failing check), or answers 200 with a body that is not attenuo's (another service on the port). It never exits 2, because Docker reserves that status for health checks. The release image's `HEALTHCHECK` is `attenuo --server http://127.0.0.1:8080 health`. Point it at the main listener: the admin listener (`[admin] listen`) has no `/healthz`.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--ready` | off | Ask `/readyz` (audit log and lease store answer, the last audit append succeeded) instead of `/healthz`. |
+| `--timeout SECS` | `5` | Give up after this many seconds (1 to 300), connecting and answering together. |
+
+```sh
+attenuo --server http://127.0.0.1:8080 health            # liveness
+attenuo --server http://127.0.0.1:8080 health --ready    # readiness, for a load balancer or readinessProbe
+```
 
 ### `token root`
 

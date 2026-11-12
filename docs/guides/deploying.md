@@ -257,18 +257,20 @@ Log lines are an operational aid and are not the audit record. The audit log is 
 
 ## Docker and Compose
 
-The repository has a `Dockerfile` and a `docker-compose.yml`. Both are marked untested in the repository, and the compose file is the leak demo, not a production layout.
+The repository has a `Dockerfile` with two targets and a `docker-compose.yml` that runs the leak demo. The compose file is a demo, not a production layout. `scripts/compose-smoke.sh` builds both targets, starts the compose demo, waits for the health check and plays the demo's scenario; CI runs it (the `compose` job). The release workflow's multi-arch build and push have not run yet.
 
-The image:
+The release image (target `runtime`, the default):
 
-- builds `attenuo-server`, the `attenuo` CLI and the fake MCP server from source;
-- runs as uid 10001 (`attenuo`), working directory `/var/lib/attenuo`;
+- holds `attenuo-server` and the `attenuo` CLI, nothing else from this repository, on `debian:bookworm-slim` with no extra packages (no `curl`; TLS uses rustls with its built-in roots, not the system store);
+- runs as uid 10001 (`attenuo`), working directory `/var/lib/attenuo` (mode 0700);
 - expects a config at `/etc/attenuo/config.toml` (the default `CMD` is `--config /etc/attenuo/config.toml`);
-- exposes 8080 and has a `HEALTHCHECK` that calls `/healthz`;
-- includes `curl` for that check.
+- exposes 8080 and has a `HEALTHCHECK` that runs `attenuo --server http://127.0.0.1:8080 health`, which asks `GET /healthz` and exits 0 or 1 ([CLI reference](../reference/cli.md#health)). If your `[server] listen` uses another port, override the health check with that port.
+
+The demo image (target `demo`) adds the fake MCP server the demo uses as its GitHub upstream. Never deploy it.
 
 ```sh
-docker build -t attenuo:dev .
+docker build -t attenuo:dev .                  # release image
+docker build --target demo -t attenuo:demo .   # demo image
 ```
 
 For anything beyond the demo, start from the demo's compose file and change these things:
@@ -280,6 +282,8 @@ services:
     command: ["--config", "/etc/attenuo/config.toml"]
     ports:
       - "127.0.0.1:8080:8080"        # reverse proxy on the host or in another container
+      # [admin] listen (9102 here) is not published; operators reach it from the host's
+      # loopback only if you add "127.0.0.1:9102:9102", or with docker compose exec.
     volumes:
       - ./attenuo.toml:/etc/attenuo/config.toml:ro
       - ./policy.cedar:/etc/attenuo/policy.cedar:ro
@@ -296,7 +300,7 @@ volumes:
   attenuo-data:
 ```
 
-Matching settings in `attenuo.toml`: `policies_path = "/etc/attenuo/policy.cedar"`, `private_key_pem_path = "/etc/attenuo/issuer.pem"`, `sqlite_path = "/var/lib/attenuo/attenuo.sqlite"`, `listen = "0.0.0.0:8080"` (inside the container only; the published port stays on loopback) and `public_url` set to the URL clients use, which a non-loopback `listen` requires. This layout is untested.
+Matching settings in `attenuo.toml`: `policies_path = "/etc/attenuo/policy.cedar"`, `private_key_pem_path = "/etc/attenuo/issuer.pem"`, `sqlite_path = "/var/lib/attenuo/attenuo.sqlite"`, `listen = "0.0.0.0:8080"` (inside the container only; the published port stays on loopback), `public_url` set to the URL clients use, which a non-loopback `listen` requires, and `[admin] listen` on a port of its own (the server refuses to start with the admin API on a non-loopback main listener otherwise). The demo's `examples/github-leak-demo/config.docker.toml` binds `[admin] listen = "0.0.0.0:9102"` and does not publish it. This production layout itself (volume, key file, restart policy) has not been run; the demo's compose file, which shares the image, ports, health check and hardening options, is what `scripts/compose-smoke.sh` tests.
 
 Notes:
 
@@ -308,7 +312,7 @@ Notes:
 
 `GET /healthz` returns `{"status":"ok","version":"..."}` with HTTP 200. It is a liveness check only. It does not open the database, check disk space or contact an identity provider. A server whose SQLite file is read-only or full still answers `ok`, and then denies every call.
 
-`GET /readyz` is the readiness check. It reads the head of the audit log and one row of the lease store, and checks whether the last audit append failed. It answers 200 `{"ready":true,"checks":{"audit":"ok","audit_append":"ok","leases":"ok"}}` when all is well, and 503 with `"error"` on the failing check otherwise, for example `{"ready":false,"checks":{"audit":"ok","audit_append":"error","leases":"ok"}}`. A full disk is the usual cause of `audit_append`: reads still work, but every append fails and every decision is denied with `audit_error`. The check writes nothing; it clears with the next append that succeeds. Because an instance out of rotation gets no traffic, and so no append that could clear it, it also clears 30 seconds after the failure if nothing was appended since: the instance is then offered traffic again, and the next failed append takes it out again. Alert on `audit_append_errors_total` rather than on the flapping. Point a load balancer or Kubernetes `readinessProbe` at it; keep `/healthz` for the liveness probe so a full disk takes the instance out of rotation instead of restarting it. It needs no credentials, so the body names only the check and `ok` or `error`; the storage error (SQLite message, file path) is written to the server log at `warn` level.
+`GET /readyz` is the readiness check. It reads the head of the audit log and one row of the lease store, and checks whether the last audit append failed. It answers 200 `{"ready":true,"checks":{"audit":"ok","audit_append":"ok","leases":"ok"}}` when all is well, and 503 with `"error"` on the failing check otherwise, for example `{"ready":false,"checks":{"audit":"ok","audit_append":"error","leases":"ok"}}`. A full disk is the usual cause of `audit_append`: reads still work, but every append fails and every decision is denied with `audit_error`. The check writes nothing; it clears with the next append that succeeds. Because an instance out of rotation gets no traffic, and so no append that could clear it, it also clears 30 seconds after the failure if nothing was appended since: the instance is then offered traffic again, and the next failed append takes it out again. Alert on `audit_append_errors_total` rather than on the flapping. Point a load balancer or Kubernetes `readinessProbe` at it; keep `/healthz` for the liveness probe so a full disk takes the instance out of rotation instead of restarting it. Where there is no HTTP client to probe with (the release image has no `curl`), `attenuo health` asks `/healthz` and `attenuo health --ready` asks `/readyz`, exiting 0 or 1 ([CLI reference](../reference/cli.md#health)). It needs no credentials, so the body names only the check and `ok` or `error`; the storage error (SQLite message, file path) is written to the server log at `warn` level.
 
 Startup is quick: parse config, load the key, open SQLite, load policy. Config, policy or catalog errors stop the process with a message instead of starting a half-working server.
 
