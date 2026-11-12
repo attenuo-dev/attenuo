@@ -15,7 +15,7 @@ keywords = ["attenuo", "mcp", "agents", "authorization", "delegation", "rfc8693"
 dependencies = ["httpx>=0.25", "rfc8785==0.1.4"]
 # No "License ::" classifier: with a PEP 639 `license` expression hatchling rejects one.
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 2 - Pre-Alpha",
   "Intended Audience :: Developers",
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",

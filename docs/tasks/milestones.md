@@ -1,6 +1,6 @@
 # Milestones
 
-Technical milestones for the first 90 days. Tasks in [board.md](board.md); properties P1-P4 as defined in [RFC-0001 §2](../spec/rfc-0001-attenuo.md#2-guaranteed-properties).
+Technical milestones for the first 90 days. Tasks in [board.md](board.md); properties P1-P4 as defined in [RFC-0001 §2](../spec/rfc-0001-attenuo.md#2-security-properties).
 
 ## Day 30 (2026-11-21): v0.1, one real chain end to end
 

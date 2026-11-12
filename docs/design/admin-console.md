@@ -281,7 +281,7 @@ The lease page has a third selector action, "Revoke by session…", for `{"sessi
 
 Open: the console cannot show the user action for a lease without a recorded subject, even when other leases of its chain have one.
 
-## 6. Open questions for the owner
+## 6. Open questions
 
 1. **Token in the browser: header-only in memory, or a session cookie?** Recommended: header-only for v1, because it adds no auth code and no CSRF surface; switch to a `__Host-`, `HttpOnly`, `SameSite=Strict` session with CSRF token when per-operator admin auth exists.
 2. **Separate console listener, or `/admin/ui/` on the main listener?** Recommended: separate, opt-in, loopback by default, like `[metrics]`. It keeps the console off the proxy's origin and lets the server enforce read-only.
