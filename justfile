@@ -21,10 +21,11 @@ clippy:
 test:
     cargo test --workspace
 
-# the GitHub MCP leak demo and the multi-hop delegation demo, end to end
+# the GitHub MCP leak demo, the multi-hop delegation demo and the IdP exchange demo, end to end
 demo:
     bash examples/github-leak-demo/run.sh
     bash examples/multi-hop-demo/run.sh
+    bash examples/idp-exchange-demo/run.sh
 
 # the Cedar policy tests (both demos' and config/policies/), offline
 policy:

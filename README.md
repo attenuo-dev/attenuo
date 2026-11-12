@@ -106,6 +106,7 @@ attenuo is pre-alpha and has not been used in production. Release 0.1.0 is prepa
 - [TypeScript SDK](sdk/typescript/README.md): `@attenuo/sdk` (Node 20+, no runtime dependencies), the same API with promises, and an [agent example](examples/typescript-agent/agent.ts).
 - [examples/github-leak-demo](examples/github-leak-demo/README.md): the demo from the top of this page.
 - [examples/multi-hop-demo](examples/multi-hop-demo/README.md): alice, a planner and a coder, each exchange narrower than the last, a run limit, and one revocation of the whole chain by `chain_id`.
+- [examples/idp-exchange-demo](examples/idp-exchange-demo/README.md): the chain starts at an identity provider: alice's OIDC ID token, from a local mock IdP, is exchanged at `POST /token` for the root token with the dev mint off, then narrowed for a coder.
 - [examples/claude-agent-sdk](examples/claude-agent-sdk/README.md) and [examples/langchain-agent](examples/langchain-agent/README.md): an orchestrator delegating to a coder sub-agent in the Claude Agent SDK and in LangChain, each hop with its own token, through the proxy. A `run.sh` dry-run needs no API key. All examples are listed in [examples/README.md](examples/README.md).
 - [docs/guides/writing-policies.md](docs/guides/writing-policies.md): writing Cedar policies for agents and testing them offline with `attenuo policy test` and `attenuo policy lint`, including a CI recipe.
 - [CONTRIBUTING.md](CONTRIBUTING.md): how to build, test and submit changes.

@@ -230,6 +230,10 @@ jobs:
       # the binaries built above and fails on any step, audit count or upstream count that differs.
       - name: Multi-hop delegation demo
         run: bash examples/multi-hop-demo/run.sh
+      # Hop 0 from an ID token: a mock OIDC IdP (the server's mock_idp example), POST /token with
+      # the dev mint off, one exchange, one allowed and one denied call. Same checks as above.
+      - name: IdP exchange demo
+        run: bash examples/idp-exchange-demo/run.sh
       # The admin console listener against the real binary: page and CSP, admin token, no dev mint.
       - name: Admin console smoke test
         run: bash scripts/admin-ui-smoke.sh
