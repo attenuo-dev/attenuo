@@ -6,7 +6,7 @@ This guide covers what to change between "it runs on my laptop" and "other peopl
 
 attenuo is pre-alpha. Do not treat this guide as a statement that it is ready for production. It is a list of what you would have to do if you ran it anyway, for example in a staging environment or a closed pilot.
 
-- **One node.** There is no clustering, no replication and no leader election. One server process owns one SQLite file.
+- **One node.** There is no clustering, no replication and no leader election. One server process owns one SQLite file, and the server enforces it: a second server on the same file refuses to start (see [One process per file](#one-process-per-file)).
 - **SQLite only.** The audit log and the lease registry live in the same SQLite file, in WAL mode. Store calls run on the blocking pool, and audit appends go through one writer thread that commits whatever is queued in one transaction (group commit). On a shared 4-core development container a file-backed server handled about 3,000 to 4,500 calls per second at one hop (memory: about 5,000 to 6,600); see [design/performance.md](../design/performance.md) for the method and the caveats.
 - **No high availability.** If the process is down, every call through the proxy fails. That is by design: attenuo fails closed. Do not start a second replica against the same file, or against a copy. Against a copy, each process keeps its own idea of which leases are revoked and how much of a run limit is spent. Against the same file, the lease registry and the counters are shared, but the state that makes a credential single use, the locks that serialise a run's budgeted decisions and a user's decisions under a per-user window, and the loaded policy set live in each process, so a credential can be redeemed once per replica and a reload reaches one replica only. Per-user windows (`context.usage.user_window`) are therefore a single-replica guarantee: against a copy each replica keeps its own windows, so a user gets the cap once per replica, and against the same file two replicas can each pass a call the window should have stopped. A window that guards money should also run at `[audit] durability = "full"`: at `"normal"` a power failure can drop the newest commits, and a lost window charge can be spent again in the same window (a call that also charges a `sum` limit already commits with a full sync). The inventory is in [multi-replica readiness](../design/multi-replica.md) (proposed).
 - **No TLS.** The server speaks plain HTTP. Terminate TLS in front of it.
@@ -134,6 +134,36 @@ Placement:
 - Watch free disk space. An audit append that fails turns the decision into a deny with reason `audit_error`, so a full disk stops all calls and token issuance. That is the fail-closed rule working as designed.
 - The file runs in SQLite's WAL mode, so next to `attenuo.sqlite` you will see `attenuo.sqlite-wal` and `attenuo.sqlite-shm`. They belong to the database: keep them on the same volume, and never copy or delete one of the three on its own. A background thread folds the WAL into the main file every `[audit] wal_checkpoint_seconds` (default 5) and empties it when the server is idle and at a clean shutdown, so after `SIGTERM` the `-wal` file is empty. Under sustained load the `-wal` file grows to roughly 64 to 100 MB before it starts over; leave room for it.
 
+### One process per file
+
+At start-up the server takes an exclusive lock on `<sqlite_path>.lock` (for `/var/lib/attenuo/attenuo.sqlite`, `/var/lib/attenuo/attenuo.sqlite.lock`) and holds it until it exits. A second server pointed at the same file stops before it opens the database:
+
+```text
+Error: taking the single-writer fence of /var/lib/attenuo/attenuo.sqlite: another process holds /var/lib/attenuo/attenuo.sqlite.lock (pid 1234): one server process per database file; stop the other instance first (in Kubernetes, use `strategy: Recreate`)
+```
+
+The lock is released when the process exits, also on a crash, `kill -9` or OOM kill, so a leftover `.lock` file never blocks a restart; do not delete it by hand. Why it exists: two servers on one file share the lease registry and counters but not the state that makes a credential single use, the run lock that serialises a run's budgeted decisions, or the loaded policy set, so an overlap silently weakens single-use credentials and run limits (see [What v0 is and is not](#what-v0-is-and-is-not)). The CLI is not affected: `attenuo audit verify` and `audit export` read through the admin API or from an export file, never the database itself.
+
+This changes how you roll out a new version. Anything that starts the new instance before the old one has exited now gets a start-up failure instead of a silent overlap:
+
+- **Kubernetes:** one replica, `strategy: type: Recreate`, and a `ReadWriteOnce` volume. The default `RollingUpdate` starts the new pod before the old one is gone, and even with `maxSurge: 0` a new pod can start while the old one is still terminating; the new pod would then fail and restart until the old one has exited. `Recreate` waits until the old pods have terminated before it creates the new one. Expect a short gap in service during a rollout (the old pod drains for up to 10 seconds, then the new one starts); attenuo fails closed, so agents see errors, not unchecked calls.
+
+  ```yaml
+  apiVersion: apps/v1
+  kind: Deployment
+  spec:
+    replicas: 1
+    strategy:
+      type: Recreate
+    template:
+      spec:
+        terminationGracePeriodSeconds: 15
+  ```
+
+- **Docker Compose, systemd, a VM pair:** stop the old instance before starting the new one; a failover script must make sure the old host has let go of the volume.
+
+The lock is a `flock` advisory lock. It is reliable on a local disk and on a `ReadWriteOnce` volume mounted by one host. It is not a cluster lock: do not put the file on NFS (SQLite's WAL mode does not work there either).
+
 Durability (`[audit] durability`):
 
 - `"normal"` (the default) does not `fsync` on each commit. A process crash, `kill -9` or OOM kill loses nothing that was answered. A power failure or kernel crash can lose the most recent decisions, those written since SQLite's last sync, which happens at each WAL checkpoint, normally no more than `[audit] wal_checkpoint_seconds` (default 5) or 256 commits apart. Lower the interval to narrow that window. The log that remains is a clean prefix: no torn entry, no corruption, and `audit verify` passes with an earlier head. Lease revocations are always synced, so a revoked lease stays revoked.
@@ -245,7 +275,7 @@ Notes:
 
 - **Signals.** The server shuts down gracefully on SIGTERM (what `docker stop` and Kubernetes send) and on SIGINT. It stops accepting connections, gives in-flight requests up to 10 seconds to finish, then exits; it logs `shutdown signal received; draining` and `shutdown complete`. Set `stop_grace_period` (or `terminationGracePeriodSeconds`) above 10 seconds. No `stop_signal` override is needed. SQLite writes are transactional, so even a kill does not corrupt the log.
 - **Read-only root.** The server only writes under the data directory and, when the key file is missing, to the key path. Keep the key file in the read-only mount, so a missing key is an error you see, not a new key you did not plan.
-- **Upstreams** must be reachable from the container. `127.0.0.1` in `[[upstreams]]` means the container itself.
+- **Upstreams** must be reachable from the container. `127.0.0.1` in `[[upstreams]]` means the container itself. The proxy gives an upstream `[proxy] upstream_connect_timeout_seconds` (default 5) to accept a connection and `upstream_response_timeout_seconds` (default 30) to send response headers, or a JSON answer it must read; past that the agent gets `502 upstream_unreachable` or `504 upstream_timeout`. Raise the second for tools that answer in JSON after a long run. Streams (SSE) are not cut by it.
 
 ## Health and readiness
 
@@ -273,6 +303,7 @@ listen = "127.0.0.1:9100"
 |---|---|
 | `decisions_total{decision, reason}` | Allows and denies by reason code. A jump in one reason is the first sign of a misconfigured client, an expired lease population or a prompt-injected agent. |
 | `audit_append_errors_total` | Every one denied a call (`audit_error`). Should stay at 0. |
+| `audit_append_shed_total{cause}` | Audit appends that failed fast instead of waiting for the writer: `timeout` (no answer within `[audit] append_timeout_seconds`, usually a stalled disk) or `queue_full`. Each denied a call with `audit_error`. Should stay at 0. |
 | `authorize_duration_seconds`, `proxy_stage_seconds{stage}` | Decision time and where it goes. |
 | `budget_exhausted_total{kind, at}`, `budget_charges_total{kind}`, `budget_refunds_total{source}` | Run limits (ADR-0010) being hit, spent and given back. `at="charge"` means two calls of one run raced for the last of a budget. |
 | `approvals_created_total`, `approvals_decided_total{outcome, by}`, `approvals_consumed_total{by}`, `approvals_expired_total` | The approval queue: created minus decided is what people still have to answer; expired attempts mean approvals answered too late. |

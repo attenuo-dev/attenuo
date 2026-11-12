@@ -77,7 +77,7 @@ One trace per proxied MCP request:
 | `attenuo.session_gate` | internal | `attenuo.reason` on a refusal (`session_mismatch`, `session_unknown`) |
 | `attenuo.decide` | internal | `attenuo.server`, `attenuo.tool`, `attenuo.decision`, `attenuo.reason`, `attenuo.decision_id`, `attenuo.audit.seq`, `attenuo.policy_ids`, `attenuo.tainted`, `attenuo.chain_id`, `attenuo.subject_digest`, `attenuo.limit.kind` and `attenuo.budget.exhausted_at` when a run limit was met |
 | `attenuo.lease_check`, `attenuo.run_state`, `attenuo.policy`, `attenuo.charge`, `attenuo.audit_append` | internal | children of `attenuo.decide`; `attenuo.reason` on a lease failure, `attenuo.audit.seq` on the append |
-| `attenuo.upstream` | client | `attenuo.server`, `http.response.status_code`, `attenuo.reason` (`upstream_unreachable`) |
+| `attenuo.upstream` | client | `attenuo.server`, `http.response.status_code`, `attenuo.reason` (`upstream_unreachable`, `upstream_timeout`) |
 | `attenuo.response` | internal | none |
 | `attenuo.record_result` | internal | `attenuo.decision_id` of the call, `attenuo.result.label`, `attenuo.audit.seq` |
 | `attenuo.stream_end` | internal | `attenuo.reason`, `attenuo.decision_id` and `attenuo.audit.seq` of the `stream.end` record |
