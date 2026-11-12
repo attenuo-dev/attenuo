@@ -12,8 +12,10 @@
 # The scripted walk-through is examples/github-leak-demo/run.sh, which does not need Docker.
 # The server listens on all interfaces inside the container, so it refuses to start without a
 # strong admin token: compose passes ATTENUO_ADMIN_TOKEN from your shell. For the same reason
-# the dev root mint needs the demo-only [dev] allow_root_mint_off_loopback in its config. Never
-# publish /admin outside localhost.
+# the dev root mint needs the demo-only [dev] allow_root_mint_off_loopback in its config, and
+# the admin API on the main listener needs [admin] serve_on_main_listener (a deployment gives it
+# a listener of its own with [admin] listen instead, and publishes that port to operators only).
+# Never publish /admin outside localhost.
 
 services:
   attenuo:

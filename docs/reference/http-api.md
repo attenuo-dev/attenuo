@@ -184,6 +184,8 @@ Every answer for one grant carries the same token. To use it, retry the call wit
 
 All admin routes need `Authorization: Bearer <admin token>`. They answer 401 without it and 403 `admin_disabled` when no admin token is configured. Every admin answer, errors included, carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
 
+Where they are served: on the main listener by default; with `[admin] listen` set, on that listener only, and the main listener then answers every `/admin/...` path exactly as it answers an unknown path (404 with an empty body, whatever the method and bearer), so it does not reveal that an admin API exists. The admin listener serves these routes and nothing else (`/healthz` and `/readyz` stay on the main listener). Off a loopback `[server] listen` the server does not start with the admin routes on the main listener unless `[admin] serve_on_main_listener = true` ([config](config.md#admin)). The console listener (`[admin_ui]`) serves its own subset either way.
+
 | Method and path | Purpose |
 | --- | --- |
 | `GET /admin/leases/{lease_id}` | Lease state. |
@@ -202,7 +204,7 @@ All admin routes need `Authorization: Bearer <admin token>`. They answer 401 wit
 | `GET /admin/policies/check` | Lint the policy file as it is on disk now against the running schema, with line and column for each issue, and say whether it differs from the loaded one. Loads nothing, audits nothing. 409 `check_unavailable` without `policy.policies_path`. |
 | `POST /admin/policies/evaluate` | Dry run: what the loaded policies decide for one call, given a token or a chain, and optionally the run-limit state to assume (`budget`). No lease check, no charge, no audit record, no decision metric. |
 | `POST /admin/budgets/refund` | Body `{"decision_id": "<uuid>", "reason": "..."}`: give back to every run-limit counter what that decision charged, once, for an allowed call whose effect did not happen. Answers `{decision_id, refunded, reason, audit_id}` (`refunded` counts the token-limit counters credited; the run usage and the per-user windows the decision charged are returned too (each window to the window it was charged to, even one that has ended) but not counted, so a call that charged only usage answers 0; a `distinct` value is freed, and counted, only when no other unrefunded decision used it, SR-62) and appends an `admin.budget.refund` record. When there is nothing to refund, the audit log says why: 410 `charge_pruned` when the decision's record shows a run-limit charge whose charge-log entry was pruned, 404 `not_found` for a decision that charged nothing or an unknown id, 409 `already_refunded`; see [Budget refund](#budget-refund). Also on the console listener with `[admin_ui] allow_write = true`. |
-| `POST /admin/root-token` | Development root mint. Mounted only when `[dev] allow_root_mint = true`, which refuses to start off a loopback `listen` address. |
+| `POST /admin/root-token` | Development root mint. Mounted only when `[dev] allow_root_mint = true`, which refuses to start when the admin API's listener (`[admin] listen`, else `[server] listen`) is not a loopback address. |
 
 ### Budget refund
 

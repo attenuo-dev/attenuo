@@ -141,7 +141,10 @@ impl AppState {
             tracing::warn!("{warning}");
         }
         config.server.check_public_url()?;
-        config.dev.check(config.server.listen)?;
+        config.admin.check_listen(config.server.listen)?;
+        config
+            .dev
+            .check(config.admin.api_listen(config.server.listen))?;
         config.check_admin_token()?;
         config.metrics.check_listen()?;
         config.admin_ui.check_listen()?;
@@ -737,6 +740,8 @@ mod tests {
             cfg.policy.policies_path = Some(policies.to_path_buf());
             cfg.approvals.client_id = client_id.map(str::to_string);
             cfg.approvals.allow_unset_client_id = allow;
+            // Off loopback the admin API needs a listener of its own (S-1).
+            cfg.admin.listen = Some("127.0.0.1:9102".parse().unwrap());
             cfg
         };
         let state = AppState::from_config(&config("127.0.0.1:8080", &asks, None, false)).unwrap();

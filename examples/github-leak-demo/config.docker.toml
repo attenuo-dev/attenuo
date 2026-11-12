@@ -46,6 +46,13 @@ url = "http://fake-mcp:3001/mcp"
 
 # No [admin] token in this file: the server listens on all interfaces inside the container,
 # so it refuses to start with a placeholder. docker-compose.yml passes ATTENUO_ADMIN_TOKEN.
+[admin]
+# Off loopback the admin API (/admin/*) is refused on the main listener unless it has a
+# listener of its own ([admin] listen) or this opt-in. The demo keeps one port so that the CLI
+# steps in README.md need one URL: this container binds 0.0.0.0 only inside its own network
+# namespace, and docker-compose.yml publishes the port on the host's 127.0.0.1 alone. A
+# deployment sets [admin] listen = "127.0.0.1:9102" instead (docs/guides/deploying.md).
+serve_on_main_listener = true
 
 # Alice's assistant holds a broad token, like the over-privileged PAT in the real incident.
 [[root_grants]]
