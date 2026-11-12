@@ -54,7 +54,7 @@ At the end the script prints what the fake GitHub server received: one `tools/ca
 - `config.toml`: server config with the catalog, the upstream, the admin token, alice's root grant and the `[approvals]` client id. `run.sh` rewrites the ports and the policy path in a copy.
 - `policy.cedar`: two permits, `read_file` and `create_issue` only when `repo like "alice/public-*"`; a forbid with `@obligation("approval")` that holds every `create_issue` until a person approves it (the Python, TypeScript and Claude Agent SDK examples use it); and two guard-rail forbids (sensitive tools without MFA, chains deeper than three).
 - `policy_test.yaml`: eleven cases for that policy, run by `attenuo policy test`.
-- `config.docker.toml`: the same, for `docker-compose.yml` at the repository root (untested).
+- `config.docker.toml`: the same, for `docker-compose.yml` at the repository root (untested). It binds `0.0.0.0` inside the container, so it sets the demo-only `[dev] allow_root_mint_off_loopback`, without which the dev mint refuses to start off loopback. Never copy that line into a deployment.
 - `run.sh`, `transcript.md`.
 
 The fake server is `crates/attenuo-proxy/examples/fake_mcp.rs`: the proxy crate's `FakeMcpServer` test double with `read_file`, `create_issue` and `delete_repo`, which echoes calls instead of doing anything.

@@ -243,10 +243,7 @@ pub struct IdpRegistry {
 impl IdpRegistry {
     /// Validate the `[[idps]]` entries and build their key caches.
     pub fn from_config(idps: &[IdpConfig], our_issuer: &str) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(FETCH_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::limited(3))
-            .build()?;
+        let client = jwks::fetch_client(FETCH_TIMEOUT)?;
         let mut out = Vec::with_capacity(idps.len());
         for cfg in idps {
             if cfg.issuer.is_empty() {
@@ -280,6 +277,17 @@ impl IdpRegistry {
                     cfg.issuer
                 );
             }
+            // S-8: the key source is https (or http on loopback). Without jwks_url the keys
+            // are found by discovery at the issuer, so the issuer is the URL checked.
+            let (key, source) = match &cfg.jwks_url {
+                Some(u) => ("jwks_url", u.as_str()),
+                None => (
+                    "issuer (used for discovery, no jwks_url)",
+                    cfg.issuer.as_str(),
+                ),
+            };
+            jwks::check_fetch_url(source)
+                .map_err(|e| anyhow::anyhow!("[[idps]] `{}`: {key} {source:?}: {e}", cfg.issuer))?;
             let jwks = JwksCache::new(
                 client.clone(),
                 cfg.issuer.clone(),
@@ -702,6 +710,44 @@ mod tests {
             ..cfg
         };
         assert!(IdpRegistry::from_config(&[good.clone(), good], "me").is_err());
+    }
+
+    /// S-8: the JWKS (or, without `jwks_url`, the issuer used for discovery) is https, or plain
+    /// http on a loopback host.
+    #[test]
+    fn key_sources_must_be_https_or_loopback_http_s8() {
+        let idp = |issuer: &str, jwks_url: Option<&str>| IdpConfig {
+            issuer: issuer.into(),
+            audience: String::new(),
+            jwks_url: jwks_url.map(str::to_owned),
+            allowed_algs: vec!["RS256".into()],
+            attribute_claims: vec![],
+            jwks_ttl_seconds: 300,
+            clock_skew_seconds: 60,
+            client_ids: Default::default(),
+        };
+        for ok in [
+            idp("https://idp.example", None),
+            idp("https://idp.example", Some("https://keys.idp.example/jwks")),
+            idp("http://127.0.0.1:9000", None),
+            idp("https://idp.example", Some("http://localhost:9000/jwks")),
+        ] {
+            IdpRegistry::from_config(std::slice::from_ref(&ok), "me").unwrap();
+        }
+        for (bad, named) in [
+            (idp("http://idp.example", None), "issuer"),
+            (
+                idp("https://idp.example", Some("http://idp.example/jwks")),
+                "jwks_url",
+            ),
+            (idp("idp", None), "issuer"),
+        ] {
+            let err = IdpRegistry::from_config(std::slice::from_ref(&bad), "me")
+                .err()
+                .expect("must refuse")
+                .to_string();
+            assert!(err.contains(named), "{err}");
+        }
     }
 
     #[test]

@@ -10,6 +10,13 @@
 //! Bounds: a JWKS or discovery body over [`MAX_JWKS_BYTES`] is rejected, at most
 //! [`MAX_JWKS_KEYS`] keys are kept, and symmetric (`oct`) keys, keys marked for encryption and
 //! keys that fail to parse are skipped. A failed refresh fails closed: stale keys are not used.
+//!
+//! Transport (S-8): every URL fetched (a configured `jwks_url` or SPIFFE bundle URL, the
+//! discovery document and the `jwks_uri` it names) must be `https://`; plain `http://` is
+//! accepted only for a loopback host (`localhost`, `127.0.0.0/8`, `[::1]`), for local
+//! development and tests ([`check_fetch_url`]). Redirects are never followed: a 3xx answer
+//! fails the fetch and names the `Location`, so a redirect cannot move a fetch from https to
+//! http or to another host. Configure the final URL instead.
 
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -25,6 +32,41 @@ pub(crate) const MAX_JWKS_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_JWKS_KEYS: usize = 32;
 /// Minimum time between two refetches triggered by an unknown `kid`.
 pub(crate) const UNKNOWN_KID_REFETCH_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// The HTTP client for key fetches: `timeout` per request, no redirects followed (S-8).
+///
+/// # Errors
+///
+/// When the TLS backend cannot be initialised.
+pub(crate) fn fetch_client(timeout: Duration) -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
+/// Is `url` acceptable for a key fetch (S-8)? `https://` with a host, or `http://` with a
+/// loopback host (`localhost`, `127.0.0.0/8`, `[::1]`) for local development and tests.
+///
+/// # Errors
+///
+/// A message saying why not, without the URL (callers name it).
+pub(crate) fn check_fetch_url(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("not a URL ({e})"))?;
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err("the URL has no host".into());
+    }
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if crate::config::url_host_is_loopback(url) => Ok(()),
+        "http" => Err(
+            "must be https:// (plain http:// is accepted only for a loopback host \
+                       such as 127.0.0.1 or localhost, for local development)"
+                .into(),
+        ),
+        other => Err(format!("must be https://, not {other}://")),
+    }
+}
 
 /// Why no key could be found.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -153,6 +195,7 @@ impl JwksCache {
 
     async fn get_json(&self, url: &str) -> Result<Value, JwksError> {
         let fail = |e: String| JwksError::Unavailable(format!("{url}: {e}"));
+        check_fetch_url(url).map_err(fail)?;
         let mut resp = self
             .client
             .get(url)
@@ -160,6 +203,18 @@ impl JwksCache {
             .send()
             .await
             .map_err(|e| fail(e.to_string()))?;
+        if resp.status().is_redirection() {
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("(no Location)");
+            return Err(fail(format!(
+                "answered with a redirect (HTTP {} to {location:?}); redirects are not \
+                 followed for key fetches, configure the final https:// URL",
+                resp.status()
+            )));
+        }
         if !resp.status().is_success() {
             return Err(fail(format!("HTTP {}", resp.status())));
         }
@@ -259,6 +314,118 @@ mod tests {
     fn ed_jwk(kid: &str) -> Value {
         json!({"kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "use": "sig", "kid": kid,
                "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"})
+    }
+
+    #[test]
+    fn fetch_urls_must_be_https_or_loopback_http_s8() {
+        for ok in [
+            "https://idp.example/jwks",
+            "https://10.0.0.5:8443/bundle",
+            "http://127.0.0.1:9000/jwks",
+            "http://localhost/jwks",
+            "http://[::1]:1/jwks",
+        ] {
+            check_fetch_url(ok).unwrap();
+        }
+        for bad in [
+            "http://idp.example/jwks",
+            "http://10.0.0.5/jwks",
+            "http://localhost.idp.example/jwks",
+            "http://127.0.0.1@idp.example/jwks",
+            "ftp://idp.example/jwks",
+            "file:///etc/jwks.json",
+            "idp.example/jwks",
+            "",
+        ] {
+            assert!(check_fetch_url(bad).is_err(), "{bad}");
+        }
+        let err = check_fetch_url("http://idp.example/jwks").unwrap_err();
+        assert!(err.contains("must be https://"), "{err}");
+    }
+
+    /// A local key server: `/jwks` serves a key, `/moved` redirects to it, `/away` redirects to
+    /// a plain-http host off loopback, and the discovery document names an off-loopback
+    /// `http://` `jwks_uri`.
+    async fn key_server() -> String {
+        use axum::response::Redirect;
+        use axum::routing::get;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let issuer = base.clone();
+        let app = axum::Router::new()
+            .route(
+                "/jwks",
+                get(|| async { axum::Json(json!({"keys": [ed_jwk("a")]})) }),
+            )
+            .route("/moved", get(|| async { Redirect::temporary("/jwks") }))
+            .route(
+                "/away",
+                get(|| async { Redirect::permanent("http://keys.example/jwks") }),
+            )
+            .route(
+                "/.well-known/openid-configuration",
+                get(move || {
+                    let issuer = issuer.clone();
+                    async move {
+                        axum::Json(
+                            json!({"issuer": issuer, "jwks_uri": "http://keys.example/jwks"}),
+                        )
+                    }
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        base
+    }
+
+    fn cache(issuer: &str, url: Option<String>) -> JwksCache {
+        JwksCache::new(
+            fetch_client(Duration::from_secs(5)).unwrap(),
+            issuer.into(),
+            url,
+            Duration::from_secs(300),
+        )
+    }
+
+    #[tokio::test]
+    async fn redirects_are_refused_not_followed_s8() {
+        let base = key_server().await;
+        // Plain http on loopback is the development escape: the direct URL works.
+        cache("i", Some(format!("{base}/jwks")))
+            .key_for(Some("a"), Algorithm::EdDSA)
+            .await
+            .unwrap();
+        for path in ["/moved", "/away"] {
+            let Err(JwksError::Unavailable(msg)) = cache("i", Some(format!("{base}{path}")))
+                .key_for(Some("a"), Algorithm::EdDSA)
+                .await
+            else {
+                panic!("{path}: a redirect must fail the fetch");
+            };
+            assert!(msg.contains("redirect"), "{path}: {msg}");
+            assert!(msg.contains("not followed"), "{path}: {msg}");
+        }
+    }
+
+    /// Off loopback, http is refused before anything is sent: no network is needed.
+    #[tokio::test]
+    async fn plain_http_off_loopback_is_refused_before_connecting_s8() {
+        let Err(JwksError::Unavailable(msg)) = cache("i", Some("http://keys.example/jwks".into()))
+            .key_for(Some("a"), Algorithm::EdDSA)
+            .await
+        else {
+            panic!("plain http off loopback must fail");
+        };
+        assert!(msg.contains("must be https://"), "{msg}");
+        // A discovered jwks_uri is held to the same rule.
+        let base = key_server().await;
+        let Err(JwksError::Unavailable(msg)) = cache(&base, None)
+            .key_for(Some("a"), Algorithm::EdDSA)
+            .await
+        else {
+            panic!("a discovered http jwks_uri off loopback must fail");
+        };
+        assert!(msg.contains("http://keys.example/jwks"), "{msg}");
+        assert!(msg.contains("must be https://"), "{msg}");
     }
 
     #[test]

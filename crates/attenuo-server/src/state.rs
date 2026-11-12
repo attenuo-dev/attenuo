@@ -138,6 +138,7 @@ impl AppState {
             tracing::warn!("{warning}");
         }
         config.server.check_public_url()?;
+        config.dev.check(config.server.listen)?;
         config.check_admin_token()?;
         config.metrics.check_listen()?;
         config.admin_ui.check_listen()?;
@@ -281,12 +282,6 @@ impl AppState {
             tracing::warn!(
                 "[authzen] allow_unsigned_chain = true: authenticated [[peps]] may send \
                  delegation chains without the signed token"
-            );
-        }
-        if config.dev.allow_root_mint {
-            tracing::warn!(
-                "!!! [dev] allow_root_mint = true: POST /admin/root-token mints root tokens for \
-                 users nobody has verified. Development only; never enable this in a deployment. !!!"
             );
         }
         if !idps.is_empty() && agents.is_empty() {

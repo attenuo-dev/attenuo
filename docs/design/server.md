@@ -313,7 +313,7 @@ sequenceDiagram
 
 ### JWKS cache
 
-One cache per IdP (and per `[[actor_trust]]` entry, which uses the same code with an explicit URL and no discovery; SPIFFE bundle keys with `use` = `jwt-svid` are kept). The JWKS location is `jwks_url`, or `jwks_uri` from `<issuer>/.well-known/openid-configuration`, whose `issuer` must equal the configured one. A fetched set is used for `jwks_ttl_seconds` (300). A `kid` that is not in the set causes one refetch, then `unknown_kid`; a second unknown `kid` within 30 seconds does not refetch. Bodies over 256 KiB are refused, at most 32 keys are kept, and symmetric keys, encryption keys and unparseable keys are skipped. Fetches time out after 5 seconds. If a refresh fails, the old keys are dropped and the request fails with `503 temporarily_unavailable` / `jwks_unavailable`: no stale keys.
+One cache per IdP (and per `[[actor_trust]]` entry, which uses the same code with an explicit URL and no discovery; SPIFFE bundle keys with `use` = `jwt-svid` are kept). The JWKS location is `jwks_url`, or `jwks_uri` from `<issuer>/.well-known/openid-configuration`, whose `issuer` must equal the configured one. A fetched set is used for `jwks_ttl_seconds` (300). A `kid` that is not in the set causes one refetch, then `unknown_kid`; a second unknown `kid` within 30 seconds does not refetch. Bodies over 256 KiB are refused, at most 32 keys are kept, and symmetric keys, encryption keys and unparseable keys are skipped. Fetches time out after 5 seconds, use `https://` only (plain `http://` only to a loopback host, for development and tests) and follow no redirects: a 3xx answer fails the fetch with an error naming its `Location` (audit S-8). A configured URL that breaks the scheme rule refuses to start; a discovered `jwks_uri` that breaks it fails the refresh. If a refresh fails, the old keys are dropped and the request fails with `503 temporarily_unavailable` / `jwks_unavailable`: no stale keys.
 
 ### Error codes
 
@@ -334,7 +334,7 @@ These codes are stable; `detail` is prose and may change.
 
 ### The dev root mint
 
-`POST /admin/root-token` (module `routes::dev_root`) mints a root token for a user the admin asserts; nothing about the user is verified. It is mounted only when `[dev] allow_root_mint = true` (default `false`, so the route answers 404), the server logs a warning at startup when it is, and it still needs the admin bearer and, when `[[root_grants]]` is non-empty, a matching grant. It exists for local trials and for the end-to-end tests of later hops.
+`POST /admin/root-token` (module `routes::dev_root`) mints a root token for a user the admin asserts; nothing about the user is verified. It is mounted only when `[dev] allow_root_mint = true` (default `false`, so the route answers 404), the server logs a warning at startup when it is and refuses to start with it when `[server] listen` is not loopback unless the demo-only `[dev] allow_root_mint_off_loopback` is set (audit S-3), and it still needs the admin bearer and, when `[[root_grants]]` is non-empty, a matching grant. It exists for local trials and for the end-to-end tests of later hops.
 
 ## Lease renewal
 

@@ -20,13 +20,14 @@ The full list of known gaps is at the end of [design/server.md](../design/server
 
 Go through this before pointing anything real at the server.
 
-- [ ] `[dev] allow_root_mint` is `false` or absent. With it on, anyone holding the admin token can mint a root token for any user.
+- [ ] `[dev] allow_root_mint` is `false` or absent. With it on, anyone holding the admin token can mint a root token for any user. Off a loopback `listen` address the server refuses to start with it; `[dev] allow_root_mint_off_loopback` exists only for the docker-compose demo and must not appear in your config.
 - [ ] Root tokens come from a real identity provider: `[[idps]]`, `[[agents]]`, `[[root_grants]]`. See [Identity providers](identity-providers.md).
 - [ ] The admin token (`[admin] token`, or `ATTENUO_ADMIN_TOKEN`, which overrides it) is a long random value that is not in any example, not in version control and not shared with agents. Generate it with `openssl rand -hex 32`. Off a loopback `listen` address the server refuses to start without one, with one shorter than 32 bytes, or with a known placeholder; it cannot tell whether your token was leaked.
 - [ ] Every agent that receives a token is an `[[agents]]` entry with its own secret: token exchanges authenticate as their `actor` (`[token] require_actor_auth`, on by default).
 - [ ] `[policy] unknown_tools` is `deny` (the default) or `sensitive`, not `allow`.
 - [ ] `/admin/*` is not reachable from the networks agents live on. See [Network exposure](#network-exposure).
-- [ ] TLS terminates in front of attenuo, and agents reach it over HTTPS only.
+- [ ] TLS terminates in front of attenuo, and agents reach it over HTTPS only. `[server] public_url` is the proxy's `https://` URL. A plain `http://` `public_url` on a host that is not loopback refuses to start unless `[server] allow_insecure_http = true`, which you should not need.
+- [ ] Every `[[idps]]` and `[[actor_trust]]` key URL (`jwks_url`, `spiffe_bundle_url`, or the IdP `issuer` used for discovery) is the final `https://` URL. Plain `http://` is accepted only on loopback, and redirects are not followed, so a key URL that redirects fails every ID or actor token it should verify.
 - [ ] `[issuer] private_key_pem_path` is set, the file is mode 0600, owned by the service user, and backed up somewhere safe. Without the setting the server makes a new key at every start and every token dies on restart.
 - [ ] `[audit] sqlite_path` is a real path on durable storage. The default is `:memory:`, which loses the audit log and every lease on exit. The server logs a warning when it is in memory.
 - [ ] `[issuer] issuer` is the URL clients will use, for example `https://attenuo.example.com`. It becomes the `iss` of every token, and changing it later invalidates tokens. `[server] public_url` is set to the same base URL so the AuthZEN discovery document points at the right host. Off a loopback `listen` address the server refuses to start without it.
@@ -54,7 +55,7 @@ Binding to `0.0.0.0` puts `/admin` on the same listener as everything else. The 
 Two other exposure points to think about:
 
 - **`POST /access/v1/evaluation` without a bearer** is refused with 401 unless `[authzen] allow_unsigned_chain = true`. With it on, only `[[peps]]` clients that authenticate can send a chain in the body, and the chain must be one this server issued (each lease is bound to its chain). See [Integrating MCP clients](integrating-mcp-clients.md#using-the-authzen-endpoint-from-a-non-mcp-pep).
-- **`POST /token` for hop 0** does an outbound fetch to your identity provider's discovery and JWKS URLs, but only after the agent has authenticated. Unknown issuers are rejected without a network call.
+- **`POST /token` for hop 0** does an outbound fetch to your identity provider's discovery and JWKS URLs, but only after the agent has authenticated. Unknown issuers are rejected without a network call. These fetches, and those for `[[actor_trust]]` keys, use `https://` only (plain `http://` only to a loopback host) and follow no redirects, so neither a network attacker nor a redirect can swap in keys that would forge ID or actor tokens.
 
 ## TLS and a reverse proxy
 
