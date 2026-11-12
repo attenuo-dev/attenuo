@@ -72,6 +72,11 @@ def main(argv: list[str]) -> None:
         cell["utility"] = cell.get("utility", 0) + row["utility"]
         if row["attack"]:
             cell["landed"] = cell.get("landed", 0) + row["landed"]
+            per = cell.setdefault("by_attack", {}).setdefault(
+                row["attack"], {"scored": 0, "landed": 0}
+            )
+            per["scored"] += 1
+            per["landed"] += row["landed"]
     (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     print(json.dumps(summary, indent=2, sort_keys=True))
 

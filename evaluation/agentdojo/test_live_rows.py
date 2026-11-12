@@ -60,5 +60,6 @@ def test_rows_leave_out_errored_runs_and_read_security_as_landed(tmp_path):
         "scored": 1,
         "landed": 1,
         "utility": 0,
+        "by_attack": {"injection_task_1": {"scored": 1, "landed": 1}},
     }
     assert summary["arm"]["s"]["benign"] == {"scored": 1, "utility": 1}

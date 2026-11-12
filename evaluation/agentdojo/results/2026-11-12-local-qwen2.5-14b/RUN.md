@@ -55,7 +55,7 @@ Each `<suite>/` directory has two arms.
 
 The runner's `work-*` directory is left out of `enforced/`. It holds the generated server config, Cedar policy and server log, which contain local paths. The config and policy are generated from the committed grants and suite policy by `enforced.py`.
 
-Errored runs: a run that the model server aborted has a line in `errors.jsonl` (or in the baseline's `results-<suite>-0.json` `errors` and `console.log`). Its per-run log has `utility` and `security` set to null. Count these runs apart; they are neither successes nor failures. Every error so far is Ollama's `500 prediction aborted, token repeat limit reached`, where the model repeated itself until the server stopped it.
+Errored runs: a run that the model server aborted has a line in `errors.jsonl` (or in the baseline's `results-<suite>-0.json` `errors` and `console.log`). Its per-run log has no `utility` and no `security` score. Count these runs apart; they are neither successes nor failures. Every error so far is Ollama's `500 prediction aborted, token repeat limit reached`, where the model repeated itself until the server stopped it.
 
 ## Runs
 
