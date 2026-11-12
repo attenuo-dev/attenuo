@@ -392,5 +392,5 @@ The source is Apache-2.0 and is to be published at <https://github.com/attenuo-d
 31. G. Donno et al. Authorization propagation in Agent2Agent systems: an experimental security evaluation of multi-hop delegation. arXiv:2611.07050, 2026. <https://arxiv.org/abs/2611.07050>
 32. Y. Hu et al. Log-To-Leak: prompt injection attacks on tool-using LLM agents via the Model Context Protocol. arXiv:2610.36108, 2026. <https://arxiv.org/abs/2610.36108>
 33. Z. Huang et al. My credentials, please: detecting filesystem capability laundering in MCP servers at scale. arXiv:2610.22301, 2026. <https://arxiv.org/abs/2610.22301>
-34. N. A. Niyikiza. Attenuating authorization tokens for agentic delegation chains, draft-niyikiza-oauth-attenuating-agent-tokens-02 (individual Internet-Draft). 2026. <https://datatracker.ietf.org/doc/html/draft-niyikiza-oauth-attenuating-agent-tokens-02>
+34. Attenuating authorization tokens for agentic delegation chains, draft-niyikiza-oauth-attenuating-agent-tokens-02 (individual Internet-Draft). 2026. <https://datatracker.ietf.org/doc/html/draft-niyikiza-oauth-attenuating-agent-tokens-02>
 35. Model Context Protocol, ext-auth issue #32: Delegated / attenuated authority for MCP agent tool calls. <https://github.com/modelcontextprotocol/ext-auth/issues/32>
