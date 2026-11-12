@@ -240,7 +240,9 @@ impl From<attenuo_audit::AuditError> for ApiError {
             | E::Export(_)
             | E::NoCheckpointSigner
             | E::Jwks(_)
-            | E::BindingConflict(_)) => ApiError::internal(e),
+            | E::BindingConflict(_)
+            | E::Fenced { .. }
+            | E::Overloaded(_)) => ApiError::internal(e),
         }
     }
 }
@@ -339,6 +341,11 @@ mod tests {
                 chain_id: "l1".into(),
                 max: 32,
             },
+            E::Fenced {
+                lock: "/var/lib/attenuo/audit.sqlite.lock".into(),
+                holder: Some(42),
+            },
+            E::Overloaded("the audit writer's queue is full"),
         ]
     }
 
@@ -373,6 +380,8 @@ mod tests {
                 E::UnknownCharge(_) => (16, false),
                 E::ChargeRefunded(_) => (17, false),
                 E::TooManyPendingApprovals { .. } => (18, false),
+                E::Fenced { .. } => (19, true),
+                E::Overloaded(_) => (20, true),
             }
         }
         let all = one_of_each_audit_error();

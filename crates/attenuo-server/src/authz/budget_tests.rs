@@ -551,3 +551,51 @@ fn stated_entries_must_name_a_matching_limit_and_unlimited_figures_pass_through(
     };
     assert_eq!(off.unlimited_context(), BudgetContext::default());
 }
+
+/// A stuck audit writer (audit A-3; here a thread holds the log's connection, as a write stuck
+/// on a hung disk would) fails the decision closed with `audit_error` within the append
+/// timeout, instead of blocking the caller for as long as the disk hangs. Once the writer is
+/// free, decisions are allowed again.
+#[test]
+fn a_stuck_audit_writer_denies_within_the_append_timeout() {
+    let now = OffsetDateTime::now_utc();
+    let leases = Arc::new(SqliteLeaseStore::open_in_memory().unwrap());
+    leases
+        .register(&LeaseId::new("l1"), None, now + Duration::hours(1))
+        .unwrap();
+    let audit = Arc::new(
+        SqliteAudit::open_in_memory()
+            .unwrap()
+            .with_append_limits(16, std::time::Duration::from_millis(200)),
+    );
+    let p = pipeline(leases, audit.clone());
+    let c = chain(Limits::default(), now);
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = {
+        let audit = audit.clone();
+        std::thread::spawn(move || {
+            audit
+                .with_connection(|_| {
+                    held_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                    Ok(())
+                })
+                .unwrap();
+        })
+    };
+    held_rx.recv().unwrap();
+    let started = std::time::Instant::now();
+    let d = p.decide(&c, &send(json!(1)), now);
+    assert_eq!(d.reason, REASON_AUDIT_ERROR);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(audit.append_stats().timeouts, 1);
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    assert!(p.decide(&c, &send(json!(1)), now).is_allow());
+    assert!(audit.verify_chain().unwrap().ok);
+}

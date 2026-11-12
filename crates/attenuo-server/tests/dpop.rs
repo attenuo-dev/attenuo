@@ -39,7 +39,9 @@ struct Server {
 }
 
 /// A server with `[token] dpop = mode`. Servers started on the same `dir` share the issuer key
-/// and the SQLite file, so a token minted by one is accepted by the others.
+/// and the SQLite file, so a token minted by one is accepted by the others. Only one runs on a
+/// `dir` at a time (the single-writer fence on the SQLite file): [`Server::stop`] the previous
+/// one first.
 async fn start(dir: &Path, mode: DpopMode) -> Server {
     start_with(dir, mode, DpopNonceMode::Off).await
 }
@@ -94,6 +96,23 @@ fn proof(key: &DpopKey, url: &str, token: Option<&str>) -> String {
 }
 
 impl Server {
+    /// Stop this server and wait until it has let go of the SQLite file in `dir`: its router,
+    /// client connections and state are dropped, which releases the single-writer fence.
+    async fn stop(self, dir: &Path) {
+        drop(self);
+        let db = dir.join("audit.sqlite");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match attenuo_audit::WriterFence::acquire(&db) {
+                Ok(fence) => return drop(fence),
+                Err(_) if std::time::Instant::now() < deadline => {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("the stopped server still holds the database: {e}"),
+            }
+        }
+    }
+
     fn url(&self, path: &str) -> String {
         self.server.url(path)
     }
@@ -543,13 +562,15 @@ async fn child_of_bound_parent_must_be_bound_sr24() {
 
 #[tokio::test]
 async fn required_mode_refuses_unbound_exchanges_sr24() {
-    // Three servers over one issuer key and one lease store, differing only in `[token] dpop`.
+    // Three servers over one issuer key and one lease store, differing only in `[token] dpop`,
+    // one after the other (one server per SQLite file).
     let dir = tempfile::tempdir().unwrap();
     let optional = start(dir.path(), DpopMode::Optional).await;
-    let required = start(dir.path(), DpopMode::Required).await;
-    let off = start(dir.path(), DpopMode::Off).await;
     let key = DpopKey::generate().unwrap();
     let unbound = optional.root_token(None).await;
+    let bound = optional.root_token(Some(&key)).await;
+    optional.stop(dir.path()).await;
+    let required = start(dir.path(), DpopMode::Required).await;
 
     // `required`: no unbound issuance, no unbound token accepted.
     assert_eq!(refusal(required.root(None).await).await.1, "dpop_required");
@@ -570,12 +591,13 @@ async fn required_mode_refuses_unbound_exchanges_sr24() {
     )
     .await;
     required.root_token(Some(&key)).await;
+    required.stop(dir.path()).await;
 
     // `off`: proofs are ignored at issuance, but a bound token still needs one.
+    let off = start(dir.path(), DpopMode::Off).await;
     let resp = off.root(Some(&key)).await;
     let v: Value = resp.json().await.unwrap();
     assert_eq!(v["token_type"], "Bearer");
-    let bound = optional.root_token(Some(&key)).await;
     let resp = off.call(&bound, None).send().await.unwrap();
     assert_eq!(refusal(resp).await.1, "dpop_required");
     let mcp = off.url("/mcp/github");
@@ -697,12 +719,14 @@ async fn server_nonce_required_through_the_proxy() {
     assert_eq!(refusal(resp).await.1, "dpop_required");
 
     // A server with the same issuer key accepts the nonce (no shared storage needed); one
-    // with nonces off neither sends nor checks them.
+    // with nonces off neither sends nor checks them. They run on the same file, so in turn.
+    s.stop(dir.path()).await;
     let twin = start_with(dir.path(), DpopMode::Optional, DpopNonceMode::Required).await;
     let twin_mcp = twin.url("/mcp/github");
     let p = key.proof_with_nonce("POST", &twin_mcp, Some(&token), Some(&nonce), now());
     let resp = twin.call(&token, Some(p)).send().await.unwrap();
     assert!(allowed(&resp.json().await.unwrap()));
+    twin.stop(dir.path()).await;
     let off = start(dir.path(), DpopMode::Optional).await;
     let off_mcp = off.url("/mcp/github");
     let resp = off

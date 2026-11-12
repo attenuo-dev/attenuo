@@ -57,7 +57,7 @@ The spans below follow the path of one `POST /mcp/{server}` with one `tools/call
 | `attenuo.policy` | internal | capability stage and Cedar | none beyond timing |
 | `attenuo.charge` | internal | `LeaseStore::charge` and the run lock wait | `attenuo.budget.exhausted_at` (`check`, `charge`) |
 | `attenuo.audit_append` | internal | the append, lock wait and commit included | `attenuo.audit.seq` |
-| `attenuo.upstream` | client | sending the screened request until response headers | `attenuo.server`, `http.response.status_code`, `attenuo.reason` (`upstream_unreachable`) |
+| `attenuo.upstream` | client | sending the screened request until response headers | `attenuo.server`, `http.response.status_code`, `attenuo.reason` (`upstream_unreachable`, `upstream_timeout`) |
 | `attenuo.response` | internal | filtering, list screen, session binding | `attenuo.list.hidden` (count) |
 | `attenuo.record_result` | internal | `Pipeline::record_result`: the `tool_result` append and run labels | `attenuo.decision_id` (of the call), `attenuo.result.label` (`trusted`, `untrusted`), `attenuo.audit.seq` |
 
