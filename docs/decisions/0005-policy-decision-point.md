@@ -1,7 +1,12 @@
-# ADR-0005: Policy decision point: capabilities first, then Cedar with a generated schema
+---
+status: accepted
+date: 2026-10-22
+decision-makers: [7Mudit]
+consulted: []
+informed: []
+---
 
-- Status: accepted
-- Date: 2026-11-05
+# ADR-0005. Policy decision point: capabilities first, then Cedar with a generated schema
 
 ## Context
 

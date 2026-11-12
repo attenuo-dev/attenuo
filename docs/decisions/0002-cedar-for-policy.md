@@ -1,7 +1,12 @@
-# ADR-0002: Cedar as the policy language, with ReBAC composed from outside
+---
+status: accepted
+date: 2026-10-22
+decision-makers: [7Mudit]
+consulted: []
+informed: []
+---
 
-- Status: accepted
-- Date: 2026-10-22
+# ADR-0002. Cedar as the policy language, with ReBAC composed from outside
 
 ## Context
 

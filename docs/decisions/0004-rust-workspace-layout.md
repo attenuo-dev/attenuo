@@ -1,7 +1,12 @@
-# ADR-0004: Rust workspace layout
+---
+status: accepted (amended 2026-11-05 and 2026-11-06, see [More Information](#more-information))
+date: 2026-10-22
+decision-makers: [7Mudit]
+consulted: []
+informed: []
+---
 
-- Status: accepted (amended 2026-11-05 and 2026-11-06, see [More Information](#more-information))
-- Date: 2026-10-22
+# ADR-0004. Rust workspace layout
 
 ## Context
 
