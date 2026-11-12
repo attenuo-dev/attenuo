@@ -510,7 +510,10 @@ pub fn is_loopback_host(host: &str) -> bool {
 /// or `[::1]`? `false` for anything that does not parse as a URL with a host.
 ///
 /// Used where plain `http://` is accepted only on the machine itself: `[server] public_url`
-/// (S-9) and the JWKS and SPIFFE bundle fetches (S-8).
+/// (S-9) and the JWKS and SPIFFE bundle fetches (S-8). `localhost` passes on its name; the
+/// key-fetch client connects it to `127.0.0.1` or `[::1]` itself rather than ask the system
+/// resolver, which could send it to DNS (`idp::jwks::fetch_client`, SR-107). Nothing is
+/// fetched from `public_url`.
 pub fn url_host_is_loopback(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;

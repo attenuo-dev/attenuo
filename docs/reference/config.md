@@ -219,7 +219,7 @@ The admin API (`/admin/*`: revoke, reload, approve, export, the dev root mint) a
 
 Trusted identity providers for hop 0. Only these issuers are accepted at `POST /token`.
 
-Every key fetch (`jwks_url`, or the discovery document at `issuer` and the `jwks_uri` it names) must be `https://`; plain `http://` is accepted only for a loopback host (`localhost`, `127.0.0.0/8`, `[::1]`), for local development and tests. A configured `jwks_url`, or the `issuer` when there is none, that breaks this rule refuses to start; a discovered `jwks_uri` that breaks it fails the fetch, and the ID token is refused. Redirects are never followed: a 3xx answer fails the fetch with an error naming the `Location`, so configure the final URL.
+Every key fetch (`jwks_url`, or the discovery document at `issuer` and the `jwks_uri` it names) must be `https://`; plain `http://` is accepted only for a loopback host (`localhost`, `127.0.0.0/8`, `[::1]`), for local development and tests. Key fetches connect the name `localhost` to `127.0.0.1` or `[::1]` without asking the system resolver, so a resolver that sends `localhost` to DNS (no `localhost` line in `/etc/hosts`, say) cannot move a fetch off the machine (SR-107). A configured `jwks_url`, or the `issuer` when there is none, that breaks this rule refuses to start; a discovered `jwks_uri` that breaks it fails the fetch, and the ID token is refused. Redirects are never followed: a 3xx answer fails the fetch with an error naming the `Location`, so configure the final URL.
 
 | Key | Default | Meaning |
 | --- | --- | --- |

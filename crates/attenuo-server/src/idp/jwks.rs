@@ -33,20 +33,40 @@ pub(crate) const MAX_JWKS_KEYS: usize = 32;
 /// Minimum time between two refetches triggered by an unknown `kid`.
 pub(crate) const UNKNOWN_KID_REFETCH_COOLDOWN: Duration = Duration::from_secs(30);
 
-/// The HTTP client for key fetches: `timeout` per request, no redirects followed (S-8).
+/// The HTTP client for key fetches: `timeout` per request, no redirects followed (S-8), and
+/// the name `localhost` connected to `127.0.0.1` or `[::1]` without asking the resolver.
+///
+/// [`check_fetch_url`] accepts plain `http://` for `localhost` because it is this machine.
+/// The system resolver need not agree: on a host whose `/etc/hosts` has no `localhost` line,
+/// or whose `nsswitch` asks DNS first, `localhost` can be looked up in DNS (through the search
+/// list, as `localhost.<search domain>`) and answered with any address, and the key set would
+/// then come over cleartext from another machine. Pinning the name keeps the local-development
+/// exception on the machine itself, whatever the resolver says (SR-107).
 ///
 /// # Errors
 ///
 /// When the TLS backend cannot be initialised.
 pub(crate) fn fetch_client(timeout: Duration) -> reqwest::Result<reqwest::Client> {
+    fetch_client_builder(timeout).build()
+}
+
+/// [`fetch_client`]'s builder, for a test that swaps the resolver underneath the pin.
+fn fetch_client_builder(timeout: Duration) -> reqwest::ClientBuilder {
+    // The port is ignored: reqwest connects to the URL's port.
+    let loopback = [
+        std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
+    ];
     reqwest::Client::builder()
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
-        .build()
+        .resolve_to_addrs("localhost", &loopback)
 }
 
 /// Is `url` acceptable for a key fetch (S-8)? `https://` with a host, or `http://` with a
 /// loopback host (`localhost`, `127.0.0.0/8`, `[::1]`) for local development and tests.
+/// [`fetch_client`] connects `localhost` to the loopback addresses itself, so the name cannot
+/// be resolved elsewhere (SR-107).
 ///
 /// # Errors
 ///
@@ -375,6 +395,43 @@ mod tests {
             );
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         base
+    }
+
+    /// SR-107: a resolver that answers `localhost` with an address off this machine does not
+    /// move a key fetch there: the client connects `localhost` to loopback itself. Without
+    /// the pin this client asked the resolver and tried 192.0.2.1 (TEST-NET-1).
+    #[tokio::test]
+    async fn localhost_is_pinned_to_loopback_whatever_the_resolver_says_sr107() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        struct Elsewhere(Arc<AtomicUsize>);
+        impl reqwest::dns::Resolve for Elsewhere {
+            fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    let addrs: reqwest::dns::Addrs = Box::new(std::iter::once(
+                        std::net::SocketAddr::from(([192, 0, 2, 1], 0)),
+                    ));
+                    Ok(addrs)
+                })
+            }
+        }
+        let base = key_server().await;
+        let port = base.rsplit(':').next().unwrap();
+        let asked = Arc::new(AtomicUsize::new(0));
+        let client = fetch_client_builder(Duration::from_secs(2))
+            .dns_resolver(Arc::new(Elsewhere(Arc::clone(&asked))))
+            .build()
+            .unwrap();
+        let url = format!("http://localhost:{port}/jwks");
+        check_fetch_url(&url).unwrap();
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .expect("fetched from loopback");
+        assert!(resp.status().is_success());
+        assert_eq!(asked.load(Ordering::SeqCst), 0, "the resolver was asked");
     }
 
     fn cache(issuer: &str, url: Option<String>) -> JwksCache {
