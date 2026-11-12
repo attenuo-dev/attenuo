@@ -149,7 +149,13 @@ fn call_retries_once_with_the_servers_nonce() {
     let out = attenuo()
         .env("ATTENUO_TOKEN", "a.b.c")
         .args([
-            "--server", &url, "call", "--server", "github", "--tool", "t",
+            "--server",
+            &url,
+            "call",
+            "--upstream",
+            "github",
+            "--tool",
+            "t",
         ])
         .arg("--dpop-key")
         .arg(&key)
@@ -215,7 +221,7 @@ fn root_and_authzen_retry_with_the_nonce() {
     let (url, server) = scripted_server(vec![refusal(NONCE), ok(allow)]);
     let out = attenuo()
         .env("ATTENUO_TOKEN", "a.b.c")
-        .args(["--server", &url, "authzen", "eval", "--server", "github"])
+        .args(["--server", &url, "authzen", "eval", "--upstream", "github"])
         .args(["--tool", "read_file", "--dpop-key"])
         .arg(&key)
         .output()
@@ -273,7 +279,13 @@ fn a_second_refusal_is_reported_not_retried_and_a_bearer_is_never_retried() {
     let out = attenuo()
         .env("ATTENUO_TOKEN", "a.b.c")
         .args([
-            "--server", &url, "call", "--server", "github", "--tool", "t",
+            "--server",
+            &url,
+            "call",
+            "--upstream",
+            "github",
+            "--tool",
+            "t",
         ])
         .arg("--dpop-key")
         .arg(&key)
@@ -291,7 +303,13 @@ fn a_second_refusal_is_reported_not_retried_and_a_bearer_is_never_retried() {
     let out = attenuo()
         .env("ATTENUO_TOKEN", "a.b.c")
         .args([
-            "--server", &url, "call", "--server", "github", "--tool", "t",
+            "--server",
+            &url,
+            "call",
+            "--upstream",
+            "github",
+            "--tool",
+            "t",
         ])
         .output()
         .unwrap();
@@ -373,7 +391,7 @@ async fn cli_works_against_a_server_that_requires_nonces() {
             "--server",
             &url,
             "tools",
-            "--server",
+            "--upstream",
             "github",
             "--dpop-key",
         ])
@@ -387,7 +405,7 @@ async fn cli_works_against_a_server_that_requires_nonces() {
             "--server",
             &url,
             "call",
-            "--server",
+            "--upstream",
             "github",
             "--tool",
             "read_file",
@@ -417,7 +435,7 @@ async fn cli_works_against_a_server_that_requires_nonces() {
             "--server",
             &url,
             "call",
-            "--server",
+            "--upstream",
             "github",
             "--tool",
             "read_file",
@@ -429,7 +447,7 @@ async fn cli_works_against_a_server_that_requires_nonces() {
 
     let mut c = attenuo();
     c.env("ATTENUO_TOKEN", &child)
-        .args(["--server", &url, "authzen", "eval", "--server", "github"])
+        .args(["--server", &url, "authzen", "eval", "--upstream", "github"])
         .args([
             "--tool",
             "read_file",
@@ -443,7 +461,7 @@ async fn cli_works_against_a_server_that_requires_nonces() {
     // Without the key the bound token is refused, with or without nonce handling.
     let mut c = attenuo();
     c.env("ATTENUO_TOKEN", &child)
-        .args(["--server", &url, "tools", "--server", "github"]);
+        .args(["--server", &url, "tools", "--upstream", "github"]);
     let out = tokio::task::spawn_blocking(move || c.output().unwrap())
         .await
         .unwrap();

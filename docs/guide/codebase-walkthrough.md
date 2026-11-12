@@ -221,9 +221,9 @@ ATTENUO_TOKEN="$BROOT" attenuo token sign-off --dpop-key assistant.jwk \
   --child-jkt "$CODER_JKT" --actor coder > sign-off.txt
 BCODER=$(ATTENUO_TOKEN="$BROOT" ATTENUO_CLIENT_SECRET=demo-coder-secret attenuo token exchange \
   --actor coder --cap github:read_file --dpop-key coder.jwk --subject-token-dpop-file sign-off.txt --print token)
-ATTENUO_TOKEN="$BCODER" attenuo call --dpop-key coder.jwk --server github --tool read_file \
+ATTENUO_TOKEN="$BCODER" attenuo call --dpop-key coder.jwk --upstream github --tool read_file \
   --arg repo=alice/public-docs --arg path=README.md      # ALLOWED
-ATTENUO_TOKEN="$BCODER" attenuo call --server github --tool read_file \
+ATTENUO_TOKEN="$BCODER" attenuo call --upstream github --tool read_file \
   --arg repo=alice/public-docs --arg path=README.md      # error -32001 ... dpop_required: a stolen token without the key (exit status 2)
 cd - > /dev/null
 ```
@@ -263,7 +263,7 @@ attenuo policy lint examples/github-leak-demo/policy.cedar --config examples/git
 # 3 policies, 0 error(s), 0 warning(s). Without --config lint declares the tools from the policy's own action names and prints a note about what it could not check.
 
 # Ask for a decision without calling the tool (needs the running server):
-ATTENUO_TOKEN="$CODER" attenuo authzen eval --server github --tool read_file --arg repo=alice/public-x --arg path=a
+ATTENUO_TOKEN="$CODER" attenuo authzen eval --upstream github --tool read_file --arg repo=alice/public-x --arg path=a
 # ALLOW  policy_allow, then the decision id and the policy that matched; try repo=bob/x: DENY  policy_deny, exit status 2
 # (a token passed as --token works too, with a warning that the command line is visible to other local users)
 ```
@@ -459,7 +459,7 @@ ATTENUO_BIN_DIR=$BIN bash examples/github-leak-demo/run.sh     # reuse your buil
 env -u ATTENUO_SERVER -u ATTENUO_ADMIN_TOKEN cargo test -p attenuo-cli   # see section 0 for the env -u
 attenuo --help; attenuo token --help
 attenuo token inspect "$CODER"                  # offline decode
-attenuo tools --server github --token "$CODER" # tools/list through the proxy (--server here is the upstream)
+attenuo tools --upstream github --token "$CODER" # tools/list through the proxy
 attenuo --json lease show "$(attenuo token root --subject alice --agent assistant --cap 'github:*' --print lease)"
 ```
 
@@ -584,8 +584,8 @@ sleep 2 && curl -s $ATTENUO_SERVER/healthz
 # A fresh run reads, then tries to open an issue. Every result is untrusted unless the catalog says
 # output = "trusted", so the read taints the run, and create_issue is destructive (not readonly).
 export ATTENUO_TOKEN=$(attenuo token root --subject alice --agent assistant --cap 'github:*' --print token)
-attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=README.md   # ALLOWED
-attenuo call --server github --tool create_issue --arg repo=alice/public-docs --arg title=one
+attenuo call --upstream github --tool read_file --arg repo=alice/public-docs --arg path=README.md   # ALLOWED
+attenuo call --upstream github --tool create_issue --arg repo=alice/public-docs --arg title=one
 # APPROVAL REQUIRED, then the approval id, its expiry (two minutes), the call hash and the decision id; exit status 2.
 # Repeat it: the same approval id comes back, with a new decision id.
 
@@ -595,9 +595,9 @@ ID=$(attenuo --json approval list --state pending | python3 -c 'import json,sys;
 attenuo approval show $ID     # the exact arguments, the call hash, and "labels  github/read_file (audit seq 4)" on a fresh server
 attenuo approval grant $ID    # state granted, decided ... by urn:attenuo:admin (operator, admin_token)
 
-attenuo call --server github --tool create_issue --arg repo=alice/public-docs --arg title=two   # APPROVAL REQUIRED, a new id: another call hash
-attenuo call --server github --tool create_issue --arg repo=alice/public-docs --arg title=one   # ALLOWED: the identical retry
-attenuo call --server github --tool create_issue --arg repo=alice/public-docs --arg title=one   # APPROVAL REQUIRED again: the grant was used up
+attenuo call --upstream github --tool create_issue --arg repo=alice/public-docs --arg title=two   # APPROVAL REQUIRED, a new id: another call hash
+attenuo call --upstream github --tool create_issue --arg repo=alice/public-docs --arg title=one   # ALLOWED: the identical retry
+attenuo call --upstream github --tool create_issue --arg repo=alice/public-docs --arg title=one   # APPROVAL REQUIRED again: the grant was used up
 attenuo approval show $ID     # state consumed, "used by  decision <id of the allowed retry>"
 
 # The same gated call as raw JSON-RPC: -32008, with the decision id in the header as for -32003.
@@ -622,8 +622,8 @@ attenuo audit verify          # audit chain OK
 R=$(attenuo token root --subject alice --agent assistant --cap 'github:*' --print token)
 C=$(printf '%s\n' demo-coder-secret | ATTENUO_TOKEN="$R" \
   attenuo token exchange --actor coder --client-secret-stdin --cap github:read_file --print token)
-ATTENUO_TOKEN="$C" attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=x > /dev/null
-ATTENUO_TOKEN="$R" attenuo call --server github --tool create_issue --arg repo=alice/public-docs --arg title=x   # APPROVAL REQUIRED
+ATTENUO_TOKEN="$C" attenuo call --upstream github --tool read_file --arg repo=alice/public-docs --arg path=x > /dev/null
+ATTENUO_TOKEN="$R" attenuo call --upstream github --tool create_issue --arg repo=alice/public-docs --arg title=x   # APPROVAL REQUIRED
 
 # The SDK's view. The operator grants inside on_approval here; a real agent shows the user the id.
 PYTHONPATH=sdk/python/src python3 - <<'PY'
@@ -762,12 +762,12 @@ ROOTJ=$(attenuo --json token root --subject alice --agent assistant \
 R=$(printf '%s' "$ROOTJ" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
 L=$(printf '%s' "$ROOTJ" | python3 -c 'import json,sys; print(json.load(sys.stdin)["lease"])')
 export ATTENUO_TOKEN="$R"
-attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=a   # ALLOWED
-attenuo call --server github --tool read_file --arg repo=alice/public-blog --arg path=a   # ALLOWED
-attenuo --json call --server github --tool read_file --arg repo=alice/public-site --arg path=a
+attenuo call --upstream github --tool read_file --arg repo=alice/public-docs --arg path=a   # ALLOWED
+attenuo call --upstream github --tool read_file --arg repo=alice/public-blog --arg path=a   # ALLOWED
+attenuo --json call --upstream github --tool read_file --arg repo=alice/public-site --arg path=a
 # "code": -32003, "reason": "budget_exhausted", "limit": {"hop": 0, "kind": "distinct", "max": 2, "used": 2, "arg": "repo"}
-attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=b   # ALLOWED: a repo already seen takes no new slot
-attenuo --json call --server github --tool read_file --arg repo=alice/public-docs --arg path=c
+attenuo call --upstream github --tool read_file --arg repo=alice/public-docs --arg path=b   # ALLOWED: a repo already seen takes no new slot
+attenuo --json call --upstream github --tool read_file --arg repo=alice/public-docs --arg path=c
 # "reason": "budget_exhausted", "limit": {"hop": 0, "kind": "calls", "max": 3, "used": 3}
 attenuo lease tree $L
 #      limit github/read_file calls 3/3 (0 left)
@@ -787,8 +787,8 @@ attenuo lease tree $L                                    # calls 2/3 (1 left)
 C=$(printf '%s\n' demo-coder-secret | attenuo token exchange --actor coder --client-secret-stdin \
   --cap '{"server":"github","tool":"read_file","limits":{"calls":5}}' --print token)
 attenuo token inspect "$C"        # coder: can github:read_file [calls <= 1, distinct repo <= 2]
-ATTENUO_TOKEN="$C" attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=f   # ALLOWED
-attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=g   # DENIED  budget_exhausted
+ATTENUO_TOKEN="$C" attenuo call --upstream github --tool read_file --arg repo=alice/public-docs --arg path=f   # ALLOWED
+attenuo call --upstream github --tool read_file --arg repo=alice/public-docs --arg path=g   # DENIED  budget_exhausted
 attenuo lease tree $L
 # │    limit github/read_file calls 3/3 (0 left)          the root
 # └─ <lease>  coder ...
@@ -865,9 +865,9 @@ attenuo audit tail --tool token.exchange --decision deny
 # #4  <time>  DENY  attenuo/token.exchange  assistant > coder for alice  reason=exchange_widening  id=<uuid>
 
 # 2. A declared input of the wrong type is refused before Cedar (the demo catalog declares path as a string).
-ATTENUO_TOKEN="$CODER" attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path:=7
+ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool read_file --arg repo=alice/public-docs --arg path:=7
 # DENIED  input_type_mismatch, then the decision id; exit status 2
-ATTENUO_TOKEN="$CODER" attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path:='"7"'   # ALLOWED
+ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool read_file --arg repo=alice/public-docs --arg path:='"7"'   # ALLOWED
 
 # 3. Revoke by MCP session. fake_mcp gives every response the session id fake-session-1, so the coder's
 #    first call since the restart bound it to this run (the call above did). Preview, then revoke.
@@ -1015,16 +1015,16 @@ attenuo token root --subject alice --agent assistant \
 # error: invalid capability JSON ...: unknown field `maximum`, expected `min` or `max` ...   refused before anything is sent
 
 export ATTENUO_TOKEN="$C"
-attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=a --arg max_lines:=50     # ALLOWED
-attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=a --arg max_lines:=50.0   # ALLOWED: a whole float is 50
-attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=a --arg max_lines:=150
+attenuo call --upstream github --tool read_file --arg repo=alice/public-docs --arg path=a --arg max_lines:=50     # ALLOWED
+attenuo call --upstream github --tool read_file --arg repo=alice/public-docs --arg path=a --arg max_lines:=50.0   # ALLOWED: a whole float is 50
+attenuo call --upstream github --tool read_file --arg repo=alice/public-docs --arg path=a --arg max_lines:=150
 # DENIED  capability_denied, then the decision id; exit status 2. The -32003 carries only the reason and the id.
-attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=a --arg max_lines:='"50"'  # DENIED  capability_denied
-attenuo policy evaluate --server github --tool read_file --arg repo=alice/public-docs --arg path=a --arg max_lines:=150
+attenuo call --upstream github --tool read_file --arg repo=alice/public-docs --arg path=a --arg max_lines:='"50"'  # DENIED  capability_denied
+attenuo policy evaluate --upstream github --tool read_file --arg repo=alice/public-docs --arg path=a --arg max_lines:=150
 # DENY  capability_denied ...
 # diagnostic: call github:read_file is not permitted by the effective capabilities
 #   [github:read_file{max_lines={"op":"range","value":{"min":1,"max":100}}}]; github:read_file: argument `max_lines` is above the maximum 100
-attenuo policy evaluate --server github --tool read_file --arg repo=alice/public-docs --arg path=a --arg max_lines:=7.5
+attenuo policy evaluate --upstream github --tool read_file --arg repo=alice/public-docs --arg path=a --arg max_lines:=7.5
 # ... argument `max_lines` is not an integer          (also: is below the minimum 1, for 0; is absent, without it)
 unset ATTENUO_TOKEN
 attenuo audit tail --decision deny
@@ -1188,13 +1188,13 @@ R=$(printf '%s' "$ROOTJ" | python3 -c 'import json,sys; print(json.load(sys.stdi
 L=$(printf '%s' "$ROOTJ" | python3 -c 'import json,sys; print(json.load(sys.stdin)["lease"])')
 C=$(printf '%s\n' demo-coder-secret | ATTENUO_TOKEN="$R" \
   attenuo token exchange --actor coder --client-secret-stdin --cap github:read_file --print token)
-ATTENUO_TOKEN="$C" attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=a   # ALLOWED, charged
+ATTENUO_TOKEN="$C" attenuo call --upstream github --tool read_file --arg repo=alice/public-docs --arg path=a   # ALLOWED, charged
 D=$(attenuo --json audit tail -n 5 | python3 -c 'import json,sys
 r = [json.loads(l)["record"] for l in sys.stdin if l.strip()]
 print([x for x in r if x["kind"] == "decision" and x["decision"] == "allow"][-1]["id"])')
 attenuo lease revoke --session fake-session-1 --preview          # chains <root lease>, matched 2 lease(s): the binding exists
 attenuo lease revoke --chain-id "$L" --reason "retention drill"  # revoked 2 lease(s)
-ATTENUO_TOKEN="$C" attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=b   # DENIED  lease_revoked
+ATTENUO_TOKEN="$C" attenuo call --upstream github --tool read_file --arg repo=alice/public-docs --arg path=b   # DENIED  lease_revoked
 curl -s http://127.0.0.1:19100/metrics | grep -E '^attenuo_(lease_sessions_pruned|leases_pruned|run_state_pruned)_total'
 # attenuo_lease_sessions_pruned_total 0
 # attenuo_leases_pruned_total 0
@@ -1206,7 +1206,7 @@ curl -s http://127.0.0.1:19100/metrics | grep -E '^attenuo_(lease_sessions_prune
 # attenuo_run_state_pruned_total{kind="counters"} 2     the root's and the coder's counters
 # attenuo_run_state_pruned_total{kind="charges"} 1      the one charged decision
 # attenuo_run_state_pruned_total{kind="approvals"} 0
-ATTENUO_TOKEN="$C" attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=c   # DENIED  lease_unknown
+ATTENUO_TOKEN="$C" attenuo call --upstream github --tool read_file --arg repo=alice/public-docs --arg path=c   # DENIED  lease_unknown
 curl -s -X POST $ATTENUO_SERVER/token/renew -H "Authorization: Bearer $C"; echo
 # {"error":"invalid_grant","detail":"an ancestor lease is not live: lease_unknown","decision_id":"<uuid>"}
 attenuo lease tree "$L"                     # error: server answered 404 Not Found: not_found: unknown lease `<root lease>`
@@ -1451,8 +1451,8 @@ ROOTJ=$(attenuo --json token root --subject alice --agent assistant \
   --cap '{"server":"github","tool":"read_file","limits":{"calls":5}}')
 R=$(printf '%s' "$ROOTJ" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
 L=$(printf '%s' "$ROOTJ" | python3 -c 'import json,sys; print(json.load(sys.stdin)["lease"])')
-ATTENUO_TOKEN="$R" attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=a | head -1  # ALLOWED
-ATTENUO_TOKEN="$R" attenuo call --server github --tool read_file --arg repo=bob/private --arg path=a | head -1  # DENIED  policy_deny
+ATTENUO_TOKEN="$R" attenuo call --upstream github --tool read_file --arg repo=alice/public-docs --arg path=a | head -1  # ALLOWED
+ATTENUO_TOKEN="$R" attenuo call --upstream github --tool read_file --arg repo=bob/private --arg path=a | head -1  # DENIED  policy_deny
 ids() { attenuo --json audit tail -n 5 | python3 -c 'import json,sys
 r = [json.loads(l)["record"] for l in sys.stdin if l.strip()]
 print([x for x in r if x["kind"] == "decision" and x["decision"] == sys.argv[1]][-1]["id"])' "$1"; }
@@ -2004,7 +2004,7 @@ Each of these is deliberate, and most were found by a review or the fuzzers. Whe
 - **`tools/list` shows less than the upstream has, and is not audited.** The filter uses capabilities only (no Cedar, no audit record), and it applies in JSON, batches and SSE. A listed tool can still be denied when called.
 - **Unknown tools are denied.** A tool absent from `[policy.catalog]` gets `tool_not_in_catalog`, and a `tools/call` name the upstream never listed gets `tool_not_listed`. Names are never normalized, so `Delete_Repo` is not `delete_repo`.
 - **`policy lint` without `--config` checks less.** It declares the tools from the policy's own `<server>/<tool>` action names, so a correct policy passes, but it cannot know `resource.readonly`, `resource.sensitive`, input types or user attributes. It prints a `note:` saying so. Pass `--config` for the full check.
-- **`--server` means two things.** Before the subcommand it is the attenuo server's URL; after `call`, `tools` or `authzen eval` it is the MCP upstream name.
+- **`--server` is the attenuo server, `--upstream` the MCP upstream.** `--server` goes before the subcommand and is the attenuo server's URL; `call`, `tools`, `authzen eval`, `policy evaluate` and `audit tail` name the MCP upstream with `--upstream`. Their old `--server <name>` after the subcommand still works but prints a deprecation warning.
 - **The agent id `attenuo` is reserved.** The server uses it for its own audit records, so no exchange may name it as the actor (SR-34, SR-45).
 - **`-32003` is only attenuo's denial if the decision id is in the response header.** An upstream can send its own `-32003`; the SDKs and the examples raise `Denied` only when `data.decision_id` matches `X-Attenuo-Decision-Id` (SR-32, SR-53).
 - **The default audit durability can lose the newest records on a power failure.** The surviving log is a clean prefix and still verifies; use `durability = "full"` if every executed call must be on disk (SR-48).

@@ -61,6 +61,8 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 clap = { version = "4", features = ["derive"] }
 toml = "1"
 serde_urlencoded = "0.7"
+form_urlencoded = "1"
+serde_path_to_error = "0.1"
 serde_yaml = "0.9"
 miette = { version = "7", default-features = false }
 unicode-normalization = "0.1"

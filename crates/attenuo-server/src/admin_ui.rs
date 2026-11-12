@@ -31,8 +31,7 @@
 
 use std::sync::Arc;
 
-use axum::body::Bytes;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -44,6 +43,7 @@ use tower_http::trace::TraceLayer;
 use crate::config::Config;
 use crate::error::ApiError;
 use crate::routes::admin::{self, require_admin};
+use crate::routes::extract::{Body, Path, Query};
 use crate::routes::{approvals, policies};
 use crate::state::AppState;
 
@@ -211,14 +211,14 @@ pub fn read_routes() -> Router<Arc<AppState>> {
 async fn selector_preview_only(
     state: State<Arc<AppState>>,
     q: Query<admin::SelectorRevokeQuery>,
-    body: Bytes,
+    Body(body): Body,
 ) -> Result<axum::Json<serde_json::Value>, ApiError> {
     if !q.preview {
         return Err(ApiError::not_found(
             "writes are disabled on the console listener; only `?preview=true` is served",
         ));
     }
-    admin::revoke_by_selector(state, q, body).await
+    admin::revoke_by_selector(state, q, Body(body)).await
 }
 
 /// The admin routes that change state, mounted on the console listener only with

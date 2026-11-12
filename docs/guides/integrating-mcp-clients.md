@@ -284,7 +284,7 @@ Field notes:
 - The call is audited as an ordinary decision, so the `decision_id` points at a real row.
 - Each question is a decision, and it is logged. Ask once per action you will enforce.
 
-The CLI does the same: `ATTENUO_TOKEN="$TOKEN" attenuo authzen eval --server github --tool create_issue --arg repo=acme/api --arg title=x`. It exits 2 on a negative decision.
+The CLI does the same: `ATTENUO_TOKEN="$TOKEN" attenuo authzen eval --upstream github --tool create_issue --arg repo=acme/api --arg title=x`. It exits 2 on a negative decision.
 
 **Without a bearer.** By default a request without a bearer gets 401. An operator can allow PEPs that cannot carry the token to send the chain in `subject.properties.chain` instead, with `[authzen] allow_unsigned_chain = true` and a `[[peps]]` entry per PEP. The PEP then authenticates with its client secret (HTTP Basic, or `pep_id` and `pep_secret` at the top level of the body). The server checks that the chain is well-formed, and that every hop's lease is live and was issued for exactly that chain prefix; a chain it never issued, or one with any field changed, is 403 `chain_not_issued`. Prefer the bearer.
 

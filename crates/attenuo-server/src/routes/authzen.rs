@@ -49,6 +49,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
 
+use super::extract::Body;
 use super::parse_json;
 use crate::clientauth::{self, ClientKind};
 use crate::error::{ApiError, REASON_INVALID_TOKEN, REASON_MISSING_TOKEN};
@@ -73,7 +74,7 @@ pub const CHAIN_NOT_ISSUED: &str = "chain_not_issued";
 pub async fn evaluation(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    body: Bytes,
+    Body(body): Body,
 ) -> Result<Json<EvaluationResponse>, Response> {
     // Token checks, lease lookups and the audit append all touch SQLite; keep them off the
     // async workers.
@@ -107,7 +108,7 @@ pub async fn evaluation(
 pub async fn evaluations(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    body: Bytes,
+    Body(body): Body,
 ) -> Result<Json<Value>, Response> {
     state
         .blocking(move |s| evaluate_batch(s, &headers, &body))

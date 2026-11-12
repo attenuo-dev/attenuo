@@ -188,8 +188,8 @@ The exchange authenticates as `coder` with its client secret (from `ATTENUO_CLIE
 
 ```sh
 export ATTENUO_TOKEN="$CODER"   # or --token-file PATH, or --token - to read it from stdin
-attenuo tools --server github
-attenuo call --server github --tool read_file --arg repo=acme/api --arg path=README.md
+attenuo tools --upstream github
+attenuo call --upstream github --tool read_file --arg repo=acme/api --arg path=README.md
 ```
 
 ```text
@@ -202,7 +202,7 @@ ALLOWED
 Now one that should fail. `coder` was never given `create_issue`:
 
 ```sh
-attenuo call --server github --tool create_issue --arg repo=acme/api --arg title=x
+attenuo call --upstream github --tool create_issue --arg repo=acme/api --arg title=x
 echo $?
 ```
 
@@ -232,7 +232,7 @@ Revoking a lease cuts off that hop and everything delegated from it. Revoke the 
 
 ```sh
 attenuo lease revoke "$ROOT_LEASE" --reason "trying it out"
-attenuo call --server github --tool read_file --arg repo=acme/api --arg path=README.md
+attenuo call --upstream github --tool read_file --arg repo=acme/api --arg path=README.md
 ```
 
 ```text

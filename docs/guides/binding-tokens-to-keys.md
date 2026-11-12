@@ -55,7 +55,7 @@ When the child should stay on the parent's key (one agent, two tokens), pass the
 The coder calls tools with its key. `--dpop-key` (or `ATTENUO_DPOP_KEY`) works on `call`, `tools` and `authzen eval`:
 
 ```console
-$ ATTENUO_TOKEN="$CODER" attenuo call --dpop-key coder.jwk --server github --tool read_file \
+$ ATTENUO_TOKEN="$CODER" attenuo call --dpop-key coder.jwk --upstream github --tool read_file \
     --arg repo=alice/public-docs --arg path=README.md
 ALLOWED
 ```
@@ -63,7 +63,7 @@ ALLOWED
 The same token without the key:
 
 ```console
-$ ATTENUO_TOKEN="$CODER" attenuo call --server github --tool read_file \
+$ ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool read_file \
     --arg repo=alice/public-docs --arg path=README.md
 error -32001: attenuo: unauthorized: dpop_required
 ```

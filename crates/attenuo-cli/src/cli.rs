@@ -10,8 +10,9 @@ pub(crate) const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 /// attenuo: mint, exchange and inspect delegation tokens, call tools through the proxy and
 /// administer a running attenuo server.
 ///
-/// `--server` here is the attenuo server's base URL and goes before the subcommand. The
-/// `--server` of `call` and `tools` names the MCP upstream (for example `github`).
+/// `--server` here is the attenuo server's base URL and goes before the subcommand. The MCP
+/// upstream a subcommand talks to (`call`, `tools`, `authzen eval`, `policy evaluate`,
+/// `audit tail`) is `--upstream` (for example `github`).
 #[derive(Debug, Parser)]
 #[command(name = "attenuo", version, about, long_about)]
 pub(crate) struct Cli {
@@ -46,6 +47,91 @@ pub(crate) struct Cli {
 
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// Warning printed when a subcommand is given its deprecated `--server` (audit K-13).
+pub(crate) fn server_flag_warning(cmd: &str) -> String {
+    format!(
+        "warning: `{cmd} --server` is deprecated, use `--upstream`; `--server` before the \
+         subcommand is the attenuo server URL"
+    )
+}
+
+/// Move a deprecated `--server` value into `upstream`, and say so in `warnings`.
+fn adopt(
+    upstream: &mut Option<String>,
+    old: &mut Option<String>,
+    cmd: &str,
+    warnings: &mut Vec<String>,
+) {
+    if let Some(v) = old.take() {
+        *upstream = Some(v);
+        warnings.push(server_flag_warning(cmd));
+    }
+}
+
+/// The upstream name of `call`, `tools` and `policy evaluate`, after
+/// [`Cli::resolve_deprecated`] (clap makes one of the two flags required).
+macro_rules! upstream_accessor {
+    ($($t:ty),*) => {$(
+        impl $t {
+            /// The MCP upstream name, from `--upstream` or the deprecated `--server`.
+            pub(crate) fn upstream(&self) -> &str {
+                self.upstream
+                    .as_deref()
+                    .or(self.server_deprecated.as_deref())
+                    .unwrap_or_default()
+            }
+        }
+    )*};
+}
+upstream_accessor!(CallArgs, ToolsArgs, EvaluateArgs);
+
+impl Cli {
+    /// Apply the deprecated `--server` spelling of a subcommand's `--upstream`, which clap
+    /// keeps apart so that its use can be warned about. Returns one warning line per use, for
+    /// stderr.
+    pub(crate) fn resolve_deprecated(&mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        match &mut self.command {
+            Command::Call(a) => adopt(
+                &mut a.upstream,
+                &mut a.server_deprecated,
+                "call",
+                &mut warnings,
+            ),
+            Command::Tools(a) => adopt(
+                &mut a.upstream,
+                &mut a.server_deprecated,
+                "tools",
+                &mut warnings,
+            ),
+            Command::Policy(PolicyCmd::Evaluate(a)) => adopt(
+                &mut a.upstream,
+                &mut a.server_deprecated,
+                "policy evaluate",
+                &mut warnings,
+            ),
+            Command::Audit(AuditCmd::Tail { filter, .. }) => adopt(
+                &mut filter.upstream,
+                &mut filter.server_deprecated,
+                "audit tail",
+                &mut warnings,
+            ),
+            Command::Authzen(AuthzenCmd::Eval {
+                upstream,
+                server_deprecated,
+                ..
+            }) => {
+                if let Some(v) = server_deprecated.take() {
+                    *upstream = v;
+                    warnings.push(server_flag_warning("authzen eval"));
+                }
+            }
+            _ => {}
+        }
+        warnings
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -403,8 +489,20 @@ pub(crate) struct CallArgs {
     #[command(flatten)]
     pub token: TokenSource,
     /// MCP upstream name, as mounted at `/mcp/<name>`.
-    #[arg(long, alias = "upstream")]
-    pub server: String,
+    #[arg(
+        long,
+        value_name = "NAME",
+        required_unless_present = "server_deprecated"
+    )]
+    pub upstream: Option<String>,
+    /// Deprecated spelling of `--upstream`.
+    #[arg(
+        long = "server",
+        value_name = "NAME",
+        hide = true,
+        conflicts_with = "upstream"
+    )]
+    pub server_deprecated: Option<String>,
     /// Tool name.
     #[arg(long)]
     pub tool: String,
@@ -417,9 +515,21 @@ pub(crate) struct CallArgs {
 pub(crate) struct ToolsArgs {
     #[command(flatten)]
     pub token: TokenSource,
-    /// MCP upstream name.
-    #[arg(long, alias = "upstream")]
-    pub server: String,
+    /// MCP upstream name, as mounted at `/mcp/<name>`.
+    #[arg(
+        long,
+        value_name = "NAME",
+        required_unless_present = "server_deprecated"
+    )]
+    pub upstream: Option<String>,
+    /// Deprecated spelling of `--upstream`.
+    #[arg(
+        long = "server",
+        value_name = "NAME",
+        hide = true,
+        conflicts_with = "upstream"
+    )]
+    pub server_deprecated: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -704,10 +814,19 @@ pub(crate) struct AuditFilter {
     /// A lease anywhere in the record's chain.
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     pub lease: Option<String>,
-    /// The MCP upstream the call went to (not the attenuo server URL, which is the global
-    /// `--server` before the subcommand).
-    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
-    pub server: Option<String>,
+    /// The MCP upstream the call went to (the record's `server`; not the attenuo server URL,
+    /// which is the global `--server` before the subcommand).
+    #[arg(long, value_name = "NAME", value_parser = NonEmptyStringValueParser::new())]
+    pub upstream: Option<String>,
+    /// Deprecated spelling of `--upstream`.
+    #[arg(
+        long = "server",
+        value_name = "NAME",
+        hide = true,
+        conflicts_with = "upstream",
+        value_parser = NonEmptyStringValueParser::new()
+    )]
+    pub server_deprecated: Option<String>,
     /// The tool. attenuo's own records use `token.root`, `token.exchange`, `lease.renew` and
     /// `admin.*`: `--tool token.exchange --decision deny` lists refused exchanges, `--tool
     /// lease.renew --decision deny` refused renewals.
@@ -745,7 +864,7 @@ impl AuditFilter {
             ("subject", &self.subject),
             ("agent", &self.agent),
             ("lease", &self.lease),
-            ("server", &self.server),
+            ("server", &self.upstream),
             ("tool", &self.tool),
             ("chain_id", &self.chain_id),
             ("since", &self.since),
@@ -872,8 +991,20 @@ pub(crate) struct EvaluateArgs {
     #[arg(long, value_name = "PATH")]
     pub chain_file: Option<std::path::PathBuf>,
     /// MCP upstream name.
-    #[arg(long, alias = "upstream")]
-    pub server: String,
+    #[arg(
+        long,
+        value_name = "NAME",
+        required_unless_present = "server_deprecated"
+    )]
+    pub upstream: Option<String>,
+    /// Deprecated spelling of `--upstream`.
+    #[arg(
+        long = "server",
+        value_name = "NAME",
+        hide = true,
+        conflicts_with = "upstream"
+    )]
+    pub server_deprecated: Option<String>,
     /// Tool name.
     #[arg(long)]
     pub tool: String,
@@ -889,9 +1020,17 @@ pub(crate) enum AuthzenCmd {
         /// The delegation token, sent as the bearer.
         #[command(flatten)]
         token: TokenSource,
-        /// MCP server name.
-        #[arg(long, default_value = "github")]
-        server: String,
+        /// MCP upstream name.
+        #[arg(long, value_name = "NAME", default_value = "github")]
+        upstream: String,
+        /// Deprecated spelling of `--upstream`.
+        #[arg(
+            long = "server",
+            value_name = "NAME",
+            hide = true,
+            conflicts_with = "upstream"
+        )]
+        server_deprecated: Option<String>,
         /// Tool name.
         #[arg(long)]
         tool: String,
@@ -1002,7 +1141,7 @@ mod tests {
             "call",
             "--token",
             "T",
-            "--server",
+            "--upstream",
             "github",
             "--tool",
             "read_file",
@@ -1017,12 +1156,86 @@ mod tests {
         let Command::Call(c) = cli.command else {
             panic!("not call")
         };
-        assert_eq!(
-            (c.server.as_str(), c.tool.as_str()),
-            ("github", "read_file")
-        );
+        assert_eq!((c.upstream(), c.tool.as_str()), ("github", "read_file"));
         assert_eq!(c.args.len(), 2);
         assert_eq!(c.args[1].1, json!(2));
+    }
+
+    /// K-13: a subcommand's MCP upstream is `--upstream`; its old `--server` spelling still
+    /// works, is hidden from help and is warned about once, and the two cannot be combined.
+    #[test]
+    fn subcommand_server_is_a_deprecated_upstream() {
+        let cases: [(&[&str], &str); 5] = [
+            (&["call", "--tool", "t"], "call"),
+            (&["tools"], "tools"),
+            (&["authzen", "eval", "--tool", "t"], "authzen eval"),
+            (
+                &["policy", "evaluate", "--tool", "t", "--token", "x"],
+                "policy evaluate",
+            ),
+            (&["audit", "tail"], "audit tail"),
+        ];
+        let upstream_of = |cli: &Cli| -> Option<String> {
+            match &cli.command {
+                Command::Call(a) => Some(a.upstream().to_string()),
+                Command::Tools(a) => Some(a.upstream().to_string()),
+                Command::Policy(PolicyCmd::Evaluate(a)) => Some(a.upstream().to_string()),
+                Command::Audit(AuditCmd::Tail { filter, .. }) => filter.upstream.clone(),
+                Command::Authzen(AuthzenCmd::Eval { upstream, .. }) => Some(upstream.clone()),
+                _ => panic!("unexpected command"),
+            }
+        };
+        for (args, name) in cases {
+            let with = |flag: &str| {
+                let mut a = vec!["--server", "http://ob:9"];
+                a.extend_from_slice(args);
+                a.extend_from_slice(&[flag, "gh"]);
+                parse(&a)
+            };
+            let mut cli = with("--upstream").unwrap();
+            assert!(cli.resolve_deprecated().is_empty(), "{name}");
+            assert_eq!(upstream_of(&cli).as_deref(), Some("gh"), "{name}");
+            assert_eq!(cli.server, "http://ob:9", "{name}");
+
+            let mut cli = with("--server").unwrap();
+            assert_eq!(
+                cli.resolve_deprecated(),
+                vec![server_flag_warning(name)],
+                "{name}"
+            );
+            assert_eq!(upstream_of(&cli).as_deref(), Some("gh"), "{name}");
+            assert_eq!(cli.server, "http://ob:9", "{name}");
+            // Resolved once: a second pass has nothing left to warn about.
+            assert!(cli.resolve_deprecated().is_empty(), "{name}");
+
+            let mut both: Vec<&str> = args.to_vec();
+            both.extend_from_slice(&["--upstream", "a", "--server", "b"]);
+            assert!(parse(&both).is_err(), "{name}: both flags must conflict");
+        }
+        assert!(server_flag_warning("call").starts_with("warning: `call --server` is deprecated"));
+        assert!(!server_flag_warning("call").contains('\n'));
+        // `call` and `tools` still need one of the two.
+        assert!(parse(&["call", "--tool", "t"]).is_err());
+        assert!(parse(&["tools"]).is_err());
+
+        // Hidden from help; `--upstream` is shown.
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        for path in [
+            &["call"][..],
+            &["tools"],
+            &["authzen", "eval"],
+            &["policy", "evaluate"],
+            &["audit", "tail"],
+        ] {
+            let mut sub = &mut cmd;
+            for p in path {
+                sub = sub.find_subcommand_mut(p).unwrap();
+            }
+            let help = sub.render_long_help().to_string();
+            assert!(help.contains("--upstream"), "{path:?}: {help}");
+            assert!(!help.contains("--server <"), "{path:?}: {help}");
+        }
     }
 
     #[test]
@@ -1149,7 +1362,7 @@ mod tests {
     #[test]
     fn delegation_tokens_from_stdin_or_a_file() {
         let call = |extra: &[&str]| {
-            let mut a = vec!["call", "--server", "github", "--tool", "t"];
+            let mut a = vec!["call", "--upstream", "github", "--tool", "t"];
             a.extend_from_slice(extra);
             parse(&a).map(|c| match c.command {
                 Command::Call(c) => c.token,
@@ -1164,7 +1377,7 @@ mod tests {
         assert!(t.token.is_none() && t.token_file.is_none());
         assert!(call(&["--token", "x", "--token-file", "/run/t"]).is_err());
         for cmd in [
-            ["tools", "--server", "github", "--token-file", "/t"].as_slice(),
+            ["tools", "--upstream", "github", "--token-file", "/t"].as_slice(),
             ["authzen", "eval", "--tool", "t", "--token-file", "/t"].as_slice(),
         ] {
             assert!(parse(cmd).is_ok(), "{cmd:?}");
@@ -1567,7 +1780,7 @@ mod tests {
             "coder",
             "--lease",
             "L 1",
-            "--server",
+            "--upstream",
             "github",
             "--tool",
             "read_file",
@@ -1605,17 +1818,22 @@ mod tests {
         assert_eq!(before, Some(40));
         assert!(tail(&["--before", "0"]).is_err());
         assert!(tail(&["--before", "40", "--follow"]).is_err());
-        // The upstream `--server` filter lives after the subcommand; the global one before it.
+        // The upstream filter is `--upstream` after the subcommand; `--server` before it is the
+        // attenuo server URL.
         let cli = parse(&[
             "--server",
             "http://ob:9",
             "audit",
             "tail",
-            "--server",
+            "--upstream",
             "github",
         ])
         .unwrap();
         assert_eq!(cli.server, "http://ob:9");
+        let Command::Audit(AuditCmd::Tail { filter, .. }) = cli.command else {
+            panic!("not tail")
+        };
+        assert_eq!(filter.query(), "&server=github");
     }
 
     #[test]
@@ -1757,7 +1975,7 @@ mod tests {
             let mut a = vec![
                 "policy",
                 "evaluate",
-                "--server",
+                "--upstream",
                 "github",
                 "--tool",
                 "read_file",
@@ -1770,7 +1988,7 @@ mod tests {
         };
         let e = eval(&["--token", "-", "--arg", "repo=a/b", "--arg", "n:=1"]).unwrap();
         assert_eq!(e.token.as_deref(), Some("-"));
-        assert_eq!((e.server.as_str(), e.args.len()), ("github", 2));
+        assert_eq!((e.upstream(), e.args.len()), ("github", 2));
         let e = eval(&["--chain-file", "c.json"]).unwrap();
         assert!(e.chain_file.is_some() && e.token.is_none());
         assert!(eval(&["--token-file", "/t"]).unwrap().token_file.is_some());

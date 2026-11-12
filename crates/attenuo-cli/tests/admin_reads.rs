@@ -153,7 +153,13 @@ async fn fixture(upstream: &FakeMcpServer) -> Fixture {
         let mut c = attenuo();
         c.env("ATTENUO_TOKEN", &coder_token)
             .args([
-                "--server", &url, "call", "--server", "github", "--tool", tool,
+                "--server",
+                &url,
+                "call",
+                "--upstream",
+                "github",
+                "--tool",
+                tool,
             ])
             .args(["--arg", "repo=alice/docs"]);
         assert_eq!(run(c).await.status.code(), Some(code), "{tool}");
@@ -352,7 +358,7 @@ async fn admin_reads_against_a_real_server() {
     let eval = |tool: &str| {
         let mut c = f.admin();
         c.env("ATTENUO_TOKEN", &f.coder_token)
-            .args(["policy", "evaluate", "--server", "github", "--tool", tool])
+            .args(["policy", "evaluate", "--upstream", "github", "--tool", tool])
             .args(["--arg", "repo=alice/docs"]);
         c
     };
@@ -391,7 +397,7 @@ async fn admin_reads_against_a_real_server() {
         "--json",
         "policy",
         "evaluate",
-        "--server",
+        "--upstream",
         "github",
         "--tool",
         "read_file",
@@ -424,9 +430,37 @@ async fn admin_reads_against_a_real_server() {
 
     // The root token is still good: none of the reads above revoked or changed anything.
     let mut c = attenuo();
+    c.env("ATTENUO_TOKEN", &f.root_token).args([
+        "--server",
+        &f.url,
+        "tools",
+        "--upstream",
+        "github",
+    ]);
+    let out = run(c).await;
+    let listed = ok(&out);
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("deprecated"),
+        "{out:?}"
+    );
+
+    // K-13: the old `--server <upstream>` after the subcommand still works, with one warning
+    // line on stderr and the same answer on stdout.
+    let mut c = attenuo();
     c.env("ATTENUO_TOKEN", &f.root_token)
         .args(["--server", &f.url, "tools", "--server", "github"]);
-    ok(&run(c).await);
+    let out = run(c).await;
+    assert_eq!(ok(&out), listed);
+    let err = String::from_utf8_lossy(&out.stderr);
+    let warnings: Vec<&str> = err.lines().filter(|l| l.contains("deprecated")).collect();
+    assert_eq!(
+        warnings,
+        [
+            "warning: `tools --server` is deprecated, use `--upstream`; `--server` before the \
+             subcommand is the attenuo server URL"
+        ],
+        "{err}"
+    );
 }
 
 /// Answers each request in turn with the next body and returns the request lines.

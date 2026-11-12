@@ -93,7 +93,13 @@ async fn operator_lists_shows_grants_and_declines_approvals() {
         let mut c = attenuo();
         c.env("ATTENUO_TOKEN", &token)
             .args([
-                "--server", &url, "call", "--server", "github", "--tool", tool,
+                "--server",
+                &url,
+                "call",
+                "--upstream",
+                "github",
+                "--tool",
+                tool,
             ])
             .arg("--arg")
             .arg(format!("repo={repo}"));
