@@ -3,6 +3,9 @@
 //! The file path comes from `--config` or, if that is absent, the `ATTENUO_CONFIG`
 //! environment variable. See `config/example.toml` for an annotated example. Relative paths in
 //! the file are resolved against the current working directory.
+//!
+//! `ATTENUO__<SECTION>__<KEY>` variables override scalar keys of the file before the startup
+//! checks run ([`Config::load_with_env`], `overrides`).
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -14,6 +17,10 @@ use attenuo_proxy::UpstreamConfig;
 use attenuo_token::MayAct;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+mod overrides;
+
+pub use overrides::{EnvOverride, OVERRIDE_PREFIX};
 
 /// Environment variable that names the config file when `--config` is not given.
 pub const CONFIG_ENV: &str = "ATTENUO_CONFIG";
@@ -2753,6 +2760,34 @@ impl Config {
         Ok(toml::from_str(text)?)
     }
 
+    /// Parse TOML text, then apply the `ATTENUO__<SECTION>__<KEY>` overrides found in `env`
+    /// (name and value pairs, normally [`std::env::vars_os`]). Returns the keys that were
+    /// overridden, which the server logs by name. Every other variable in `env` is ignored,
+    /// including `ATTENUO_ADMIN_TOKEN` and `ATTENUO_LOG_FORMAT`, which keep applying where they
+    /// did ([`apply_env`](Self::apply_env), [`crate::logging::LoggingSection::resolve_format`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`from_toml`](Self::from_toml) for the text. For the variables: one names no
+    /// overridable key (unknown, a list, a table of names, an array of tables, an optional
+    /// section the file lacks, or a `[dev]` key), has a value that is empty or does not parse
+    /// as the key's type, sets the same key as another variable, or sets `[admin] token` or
+    /// `[logging] format` while `ATTENUO_ADMIN_TOKEN` or `ATTENUO_LOG_FORMAT` is set too. The
+    /// message names every such variable and none of their values.
+    pub fn from_toml_with_env<I, K, V>(
+        text: &str,
+        env: I,
+    ) -> anyhow::Result<(Self, Vec<EnvOverride>)>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<std::ffi::OsString>,
+        V: Into<std::ffi::OsString>,
+    {
+        let base = Self::from_toml(text)?;
+        let file: toml::Table = text.parse()?;
+        overrides::apply(file, base, env)
+    }
+
     /// Read and parse a file.
     ///
     /// # Errors
@@ -2763,6 +2798,29 @@ impl Config {
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("reading config {}: {e}", path.display()))?;
         Self::from_toml(&text).map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))
+    }
+
+    /// Read and parse a file, then apply the environment overrides in `env`, as
+    /// [`from_toml_with_env`](Self::from_toml_with_env).
+    ///
+    /// # Errors
+    ///
+    /// When the file cannot be read or parsed (the message names the path), or as
+    /// [`from_toml_with_env`](Self::from_toml_with_env) for the variables.
+    pub fn load_with_env<I, K, V>(path: &Path, env: I) -> anyhow::Result<(Self, Vec<EnvOverride>)>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<std::ffi::OsString>,
+        V: Into<std::ffi::OsString>,
+    {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("reading config {}: {e}", path.display()))?;
+        let base = Self::from_toml(&text)
+            .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
+        let file: toml::Table = text
+            .parse()
+            .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
+        overrides::apply(file, base, env)
     }
 }
 
