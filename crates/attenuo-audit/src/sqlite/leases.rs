@@ -179,10 +179,10 @@ impl SqliteLeaseStore {
     /// returns.
     pub fn with_connection<R>(
         &self,
-        f: impl FnOnce(&Connection) -> Result<R, AuditError>,
+        f: impl FnOnce(&mut Connection) -> Result<R, AuditError>,
     ) -> Result<R, AuditError> {
-        let conn = self.conn.lock()?;
-        f(&conn)
+        let mut conn = self.conn.lock()?;
+        f(&mut conn)
     }
 
     /// Stop this connection from checkpointing the WAL when it commits
