@@ -58,11 +58,11 @@ The pages in `docs/` are published as an [mdBook](https://rust-lang.github.io/md
 cargo install mdbook --locked --version 0.4.52   # the version CI uses
 mdbook serve --open                              # http://localhost:3000, rebuilds on save
 mdbook build                                     # one-off build into book/ (ignored by git)
-python3 scripts/check-links.py                   # relative links and anchors
+python3 scripts/check-links.py                   # relative links, anchors, links out of the book
 python3 scripts/check-public-hygiene.py          # no machine paths, personal notes, old name or placeholders
 ```
 
-Keep the pages readable on GitHub and in Obsidian as well. Link to other pages with relative `.md` paths. Link to files outside `docs/` (for example `config/example.toml`) with a full GitHub URL, because the book only contains `docs/`. To link to a folder's `README.md`, link the folder (`../spec/`), since the book renders it as `index.html`. Mermaid diagrams render on the site through a script that loads mermaid from a CDN, so they need network access when you preview.
+Keep the pages readable on GitHub and in Obsidian as well. Link to other pages with relative `.md` paths. Link to files outside `docs/` (for example `config/example.toml`) with a full GitHub URL (`https://github.com/attenuo-dev/attenuo/blob/main/<path>`, or `tree/main/` for a folder), because the book only contains `docs/`; `scripts/check-links.py` refuses a relative link out of `docs/` from a page listed in `docs/SUMMARY.md` (its tests: `python3 -m pytest scripts/test_check_links.py`). Pages not in the book may keep relative links. To link to a folder's `README.md`, link the folder (`../spec/`), since the book renders it as `index.html`. Mermaid diagrams render on the site through a script that loads mermaid from a CDN, so they need network access when you preview.
 
 ## Branches
 

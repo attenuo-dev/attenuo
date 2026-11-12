@@ -226,7 +226,7 @@ Set `[approvals] client_id` to a client the agent does not control, such as your
 
 The grant also returns a signed approval token (`approval_token`, `typ: attenuo-approval+jwt`). An agent may send it with the retry in `params._meta["dev.attenuo/approval"]` (the SDK helpers do); the server then uses exactly the approval the token names, after checking that it is for this call, this hop, this run and, for a DPoP-bound agent, this key. Policy sees the same `context.approval`. A token that fails those checks, or whose approval was already used or declined, denies the call with `approval_invalid` whatever the policy says. Because the token is signed with the issuer key, an external PEP can check it offline; see [Approval tokens](../reference/http-api.md#approval-tokens).
 
-[`config/policies/output-labels.cedar`](../../config/policies/output-labels.cedar) has this rule, the mail rule from the design and the rule of the next section, with tests in `output-labels_test.yaml` next to it.
+[`config/policies/output-labels.cedar`](https://github.com/attenuo-dev/attenuo/blob/main/config/policies/output-labels.cedar) has this rule, the mail rule from the design and the rule of the next section, with tests in `output-labels_test.yaml` next to it.
 
 ### Asking only when an argument copies untrusted output
 
@@ -263,7 +263,7 @@ when {
 };
 ```
 
-`calls_remaining` and `amount_remaining` are what is left before this call, the smallest over every matching limit. `destination_new` is false once the call's `calls_per` or `distinct` value has been used in an earlier allowed call. [`config/policies/run-limits.cedar`](../../config/policies/run-limits.cedar) has this rule and a repeat-payee rule, with tests in `run-limits_test.yaml`.
+`calls_remaining` and `amount_remaining` are what is left before this call, the smallest over every matching limit. `destination_new` is false once the call's `calls_per` or `distinct` value has been used in an earlier allowed call. [`config/policies/run-limits.cedar`](https://github.com/attenuo-dev/attenuo/blob/main/config/policies/run-limits.cedar) has this rule and a repeat-payee rule, with tests in `run-limits_test.yaml`.
 
 ### Limits over run usage
 
@@ -294,7 +294,7 @@ when {
 };
 ```
 
-The gated call gets `-32008` with `usage` in its data; once the user or an operator grants it, the identical retry is allowed and counted, so the next payment asks again. Only allowed calls are counted, and an approval never raises a token's own limits. The figures are what the run had before this call, so `calls >= 1` means "not the first". An `amount` value that is not a non-negative integer adds nothing; a list-valued `destination` counts each element. A rule over `destination_seen` asks only for a repeat to the same payee or recipient, however many others the run has paid. With `destination = "url#host"` in the catalog, `destination_seen` compares the hosts of a URL input, so a rule can ask when a run fetches from a site it has not used before. Usage ends with the run: revoking its root lease deletes it. [`config/policies/run-usage.cedar`](../../config/policies/run-usage.cedar) has these rules, a per-recipient mail rule and a per-site fetch rule, with tests in `run-usage_test.yaml`.
+The gated call gets `-32008` with `usage` in its data; once the user or an operator grants it, the identical retry is allowed and counted, so the next payment asks again. Only allowed calls are counted, and an approval never raises a token's own limits. The figures are what the run had before this call, so `calls >= 1` means "not the first". An `amount` value that is not a non-negative integer adds nothing; a list-valued `destination` counts each element. A rule over `destination_seen` asks only for a repeat to the same payee or recipient, however many others the run has paid. With `destination = "url#host"` in the catalog, `destination_seen` compares the hosts of a URL input, so a rule can ask when a run fetches from a site it has not used before. Usage ends with the run: revoking its root lease deletes it. [`config/policies/run-usage.cedar`](https://github.com/attenuo-dev/attenuo/blob/main/config/policies/run-usage.cedar) has these rules, a per-recipient mail rule and a per-site fetch rule, with tests in `run-usage_test.yaml`.
 
 ### Limits per user across runs
 
@@ -312,7 +312,7 @@ when {
 };
 ```
 
-The server keeps a window only for the kinds a loaded policy reads (the rule above keeps `day`, not `hour`); a kind it does not keep reads as zero. Starting a new run, or revoking one, does not reset a window. An injected agent that spends the window blocks the user's other runs until the window ends, so prefer the asking form, and use a plain `forbid` for a regulated cap that no approver may pass. If the window cannot be read, the policy sees the largest `Long` for both figures, so a count rule refuses or asks and an amount rule overflows and denies. Windows are exact only on one server process: see [deploying](deploying.md). [`config/policies/user-windows.cedar`](../../config/policies/user-windows.cedar) has an asking daily cap and a hard hourly count, with tests in `user-windows_test.yaml`.
+The server keeps a window only for the kinds a loaded policy reads (the rule above keeps `day`, not `hour`); a kind it does not keep reads as zero. Starting a new run, or revoking one, does not reset a window. An injected agent that spends the window blocks the user's other runs until the window ends, so prefer the asking form, and use a plain `forbid` for a regulated cap that no approver may pass. If the window cannot be read, the policy sees the largest `Long` for both figures, so a count rule refuses or asks and an amount rule overflows and denies. Windows are exact only on one server process: see [deploying](deploying.md). [`config/policies/user-windows.cedar`](https://github.com/attenuo-dev/attenuo/blob/main/config/policies/user-windows.cedar) has an asking daily cap and a hard hourly count, with tests in `user-windows_test.yaml`.
 
 ### Outbound arguments
 
@@ -349,7 +349,7 @@ forbid (principal, action, resource)
 when { context.untrusted_outbound == true && !context.approval.present };
 ```
 
-A matched search phrase or other argument that is not outbound leaves it `false`. When the span index cannot be read, or the call carries more than 8,000 fingerprints, every unpinned argument with a fingerprint counts as matched (`unreadable`), so an outbound one sets `context.untrusted_outbound` too. Both rules run under the usual approval flow (`-32008`, then the approved retry). The first rule leaves a run's first fetch free and depends on order: if the attacker's host is the first one fetched, it is not new. A tool with both `destination` and `outbound` keeps `destination` as it was and counts the outbound values next to it, and `destination_seen` is true when any of them was seen. The examples are in [`config/policies/run-usage.cedar`](../../config/policies/run-usage.cedar) and [`config/policies/output-labels.cedar`](../../config/policies/output-labels.cedar). The background is in the [read-side exfiltration design](../design/read-side-exfiltration.md).
+A matched search phrase or other argument that is not outbound leaves it `false`. When the span index cannot be read, or the call carries more than 8,000 fingerprints, every unpinned argument with a fingerprint counts as matched (`unreadable`), so an outbound one sets `context.untrusted_outbound` too. Both rules run under the usual approval flow (`-32008`, then the approved retry). The first rule leaves a run's first fetch free and depends on order: if the attacker's host is the first one fetched, it is not new. A tool with both `destination` and `outbound` keeps `destination` as it was and counts the outbound values next to it, and `destination_seen` is true when any of them was seen. The examples are in [`config/policies/run-usage.cedar`](https://github.com/attenuo-dev/attenuo/blob/main/config/policies/run-usage.cedar) and [`config/policies/output-labels.cedar`](https://github.com/attenuo-dev/attenuo/blob/main/config/policies/output-labels.cedar). The background is in the [read-side exfiltration design](../design/read-side-exfiltration.md).
 
 ### Chain depth
 
@@ -561,6 +561,6 @@ Pin the install to a tag or `--rev` once releases exist, so a CLI change cannot 
 - A capability denial, to prove the chain is narrower than the policy.
 - The boundary of numeric limits (`depth > 3`: three agents pass, four do not).
 
-[`config/policies/default_test.yaml`](../../config/policies/default_test.yaml) does each of these for the starter policy set, `default.cedar`.
+[`config/policies/default_test.yaml`](https://github.com/attenuo-dev/attenuo/blob/main/config/policies/default_test.yaml) does each of these for the starter policy set, `default.cedar`.
 
 A `forbid` that never appears in a passing test is a `forbid` you have not shown works. The unexercised list at the end of every run names the ones no case reached at all.

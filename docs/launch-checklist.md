@@ -90,7 +90,7 @@ Every quantitative claim in the README, `docs/` (outside `docs/log/`, `docs/desi
 
 | File:line | Claim | Source of truth | Verdict |
 | --- | --- | --- | --- |
-| README.md:71 | 10 of 60 dev attack calls still went through | [results v2](../evaluation/injection-suite/results/2026-10-23-v2.md), re-run on de3cf75 with the same tables | ok |
+| README.md:71 | 10 of 60 dev attack calls still went through | [results v2](https://github.com/attenuo-dev/attenuo/blob/main/evaluation/injection-suite/results/2026-10-23-v2.md), re-run on de3cf75 with the same tables | ok |
 | README.md:78 | dev 46 cases, 60 attack / 69 benign; 60, 41, 10 allowed; 3 benign refused; test 26 cases (72 in all), 7/38, 3/29 | results v2 | ok |
 | README.md:79 | added p50 0.4 to 0.8 ms (425 to 771 us) | [performance](design/performance.md#after-the-policy-stage-and-wal-work), [policy-stage run](design/bench/2026-10-23-vm-policy-stage.md) | ok |
 | README.md:80 | Cedar 13 us on a cache hit, 125 to 175 us on a miss | [criterion policy_stage](design/bench/2026-10-23-vm-criterion-policy_stage.txt): 11.8 to 13.0 and 122 to 163; 125/175 is marked unrecorded | stale, fixed |

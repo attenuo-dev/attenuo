@@ -8,7 +8,7 @@ attenuo decides each `tools/call` from three things: the capabilities in the del
 
 ## 1. Problem
 
-The v2 run of the [injection suite](../evaluation/injection-suite.md) leaves 10 of 60 dev attack calls and 7 of 38 test attack calls allowed under the full attenuo arm. Most are class N: nothing in the token or in a static policy separates the injected call from a legitimate one. Three cases show the shape (case files under [`evaluation/injection-suite/cases/`](../../evaluation/injection-suite/README.md)):
+The v2 run of the [injection suite](../evaluation/injection-suite.md) leaves 10 of 60 dev attack calls and 7 of 38 test attack calls allowed under the full attenuo arm. Most are class N: nothing in the token or in a static policy separates the injected call from a legitimate one. Three cases show the shape (case files under [`evaluation/injection-suite/cases/`](https://github.com/attenuo-dev/attenuo/blob/main/evaluation/injection-suite/README.md)):
 
 | Case | Task and grant | Injected call (allowed) | Why no current stage separates it |
 |---|---|---|---|
@@ -93,7 +93,7 @@ This only covers values that pass through agent code. Text that goes through the
 
 ### 3.6 Policy
 
-Status: every attribute below is set by the server. `args_contain_untrusted` and `untrusted_args` are computed from phase 2 on (#55, 2026-10-24) on tainted runs, for destructive calls, and since 2026-11-05 for every call when a loaded policy reads either attribute (section 3.4, Matching); they are `false` and empty otherwise. [`config/policies/output-labels.cedar`](../../config/policies/output-labels.cedar) carries both policies below plus `confirm_destructive_with_untrusted_args` (the option (b) shape: ask for any destructive call with a matched argument).
+Status: every attribute below is set by the server. `args_contain_untrusted` and `untrusted_args` are computed from phase 2 on (#55, 2026-10-24) on tainted runs, for destructive calls, and since 2026-11-05 for every call when a loaded policy reads either attribute (section 3.4, Matching); they are `false` and empty otherwise. [`config/policies/output-labels.cedar`](https://github.com/attenuo-dev/attenuo/blob/main/config/policies/output-labels.cedar) carries both policies below plus `confirm_destructive_with_untrusted_args` (the option (b) shape: ask for any destructive call with a matched argument).
 
 The decision stays in Cedar. The generated schema gains these attributes, always present so policies need no `has` guards:
 
