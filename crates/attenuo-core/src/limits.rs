@@ -547,7 +547,7 @@ fn admits_amount(c: &ArgConstraint) -> bool {
     match c {
         ArgConstraint::Equals(v) => amount_of(v).is_some(),
         ArgConstraint::OneOf(vs) => vs.iter().any(|v| amount_of(v).is_some()),
-        ArgConstraint::Prefix(_) => false,
+        ArgConstraint::Prefix(_) | ArgConstraint::PathPrefix(_) => false,
         // Some integer in [max(min, 0), max]: every in-range integer is at most MAX_LIMIT.
         ArgConstraint::Range { min, max } => {
             max.is_none_or(|hi| hi >= 0 && min.is_none_or(|lo| lo <= hi))

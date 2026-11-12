@@ -49,7 +49,9 @@ pub mod names;
 pub mod windows;
 
 pub use call::ToolCall;
-pub use capability::{as_long, ArgConstraint, Capability, CapabilitySet, RangeError};
+pub use capability::{
+    as_long, ArgConstraint, Capability, CapabilitySet, ConstraintError, PathError, RangeError,
+};
 pub use chain::{AgentId, DelegationChain, Hop, LeaseId, OriginatingUser};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use decision::{

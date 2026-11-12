@@ -14,7 +14,10 @@ use serde_json::Value;
 const NAMES: &[&str] = &[
     "*", "a*", "ab*", "ab", "abc", "a", "b", "", "r/*", "r/", "r/x", "r", "A", "a/b", "*a",
 ];
-const STRS: &[&str] = &["", "a", "ab", "abc", "b", "acme/", "acme/x", "é", "a\u{0}"];
+const STRS: &[&str] = &[
+    "", "a", "ab", "abc", "b", "acme/", "acme/x", "é", "a\u{0}", "/", "/w", "/w/", "/w/a", "/w-a",
+    "/w/../a", "/w//a", "w/a", "/w/%2e%2e",
+];
 
 fn name(u: &mut Unstructured<'_>) -> Result<String> {
     if u.ratio(1u8, 8u8)? {
@@ -35,13 +38,15 @@ fn value(u: &mut Unstructured<'_>) -> Result<Value> {
 }
 
 fn constraint(u: &mut Unstructured<'_>) -> Result<ArgConstraint> {
-    Ok(match u.int_in_range(0u8..=3)? {
+    Ok(match u.int_in_range(0u8..=4)? {
         0 => ArgConstraint::Equals(value(u)?),
         1 => {
             let n = u.int_in_range(0usize..=3)?;
             ArgConstraint::OneOf((0..n).map(|_| value(u)).collect::<Result<_>>()?)
         }
         2 => ArgConstraint::Prefix((*u.choose(STRS)?).to_string()),
+        // Unchecked, so malformed paths (which admit nothing) are covered too.
+        3 => ArgConstraint::PathPrefix((*u.choose(STRS)?).to_string()),
         // Bounds around the generated integers, either side possibly missing. Built unchecked,
         // so inverted and unbounded ranges (which deserialization refuses) are covered too.
         _ => ArgConstraint::Range {
