@@ -1,5 +1,5 @@
 # Publishes the SDKs: the Python package `attenuo` to PyPI and `@attenuo/sdk` to npm. Not yet
-# exercised: GitHub Actions are blocked on billing, so this file was checked locally only.
+# exercised: it has not run on GitHub yet, so this file was checked locally only.
 #
 # Triggers
 #   - push of a `v*` tag: a DRY RUN only. Both packages are built, tested and checked, and
