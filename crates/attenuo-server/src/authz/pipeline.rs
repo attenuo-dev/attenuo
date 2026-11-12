@@ -1,7 +1,7 @@
 //! [`Pipeline`]: the decision pipeline, steps 1 to 7 of the [module docs](super).
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use attenuo_audit::{
@@ -31,7 +31,7 @@ use super::budgets::{distinct_step, read_counters};
 use super::usage::{micros, record_usage, run_usage_charges, UsageInputs};
 use super::windows::{read_windows, user_stripe, USER_LOCK_STRIPES};
 use super::{
-    ArgTaint, BudgetView, CounterSource, LimitHit, RunLabels, MAX_ARG_PROBES,
+    ArgTaint, BudgetView, CounterSource, LimitHit, RunLabels, SharedPolicy, MAX_ARG_PROBES,
     MAX_UNTRUSTED_ARG_ENTRIES, UNREADABLE_USAGE,
 };
 
@@ -103,7 +103,7 @@ impl PipelineDecision {
 
 /// Lease check, policy evaluation and audit, in that order.
 pub struct Pipeline {
-    pub(super) policy: Arc<RwLock<PolicyEngine>>,
+    pub(super) policy: Arc<SharedPolicy>,
     leases: Arc<dyn LeaseStore>,
     audit: Arc<dyn AuditSink>,
     metrics: Arc<Metrics>,
@@ -129,6 +129,9 @@ pub struct Pipeline {
     /// `[telemetry]`: the key of the subject digest on the exported `attenuo.decide` span
     /// ([`crate::telemetry::SubjectDigest`]); `None` when telemetry is off.
     subject_digest: Option<crate::telemetry::SubjectDigest>,
+    /// Tests: run in a decision between the run-state stage and the policy stage.
+    #[cfg(test)]
+    pub(super) mid_decision_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 /// The lookups [`Pipeline::arg_taint`] makes for a call: one probe per distinct fingerprint of
@@ -200,7 +203,7 @@ impl Pipeline {
     /// store and the audit log are the same database file, a `sum` charge leaves its sync to the
     /// decision's append.
     pub fn new(
-        policy: Arc<RwLock<PolicyEngine>>,
+        policy: Arc<SharedPolicy>,
         leases: Arc<dyn LeaseStore>,
         audit: Arc<dyn AuditSink>,
     ) -> Self {
@@ -222,6 +225,16 @@ impl Pipeline {
             user_locks: (0..USER_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
             approval_notifier: None,
             subject_digest: None,
+            #[cfg(test)]
+            mid_decision_hook: Mutex::new(None),
+        }
+    }
+
+    /// Tests: run the hook set in `mid_decision_hook`, if any.
+    #[cfg(test)]
+    fn mid_decision(&self) {
+        if let Some(hook) = self.mid_decision_hook.lock().unwrap().as_ref() {
+            hook();
         }
     }
 
@@ -240,6 +253,7 @@ impl Pipeline {
     /// not share them (not a supported deployment).
     fn run_guard(
         &self,
+        engine: &PolicyEngine,
         chain: &DelegationChain,
         call: &ToolCall,
     ) -> Option<(
@@ -250,7 +264,7 @@ impl Pipeline {
             .hops
             .iter()
             .any(|h| h.capabilities.iter().any(|c| !c.limits.is_empty()));
-        if !limited && self.usage_inputs(call).is_none() {
+        if !limited && usage_inputs(engine, call).is_none() {
             return None;
         }
         let chain_id = chain_id_of(chain)?;
@@ -262,23 +276,13 @@ impl Pipeline {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Run first, then user, from separate arrays: no deadlock and no self-block.
-        let user = self.keeps_user_window(call).then(|| {
+        let user = keeps_user_window(engine, call).then(|| {
             self.user_locks[user_stripe(&chain.originating_user, self.user_locks.len())]
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         });
         self.metrics.observe_run_lock_wait(waiting.elapsed());
         Some((guard, user))
-    }
-
-    /// Whether `call` keeps a per-user window: it keeps run usage and some loaded policy reads
-    /// a window kind.
-    fn keeps_user_window(&self, call: &ToolCall) -> bool {
-        self.usage_inputs(call).is_some()
-            && self
-                .policy
-                .read()
-                .is_ok_and(|e| !e.user_window_kinds().is_empty())
     }
 
     /// Add the originating user's per-user windows (run limits phase 3) to `view`, read from
@@ -289,19 +293,17 @@ impl Pipeline {
     /// The admin dry run uses this when it reads usage from the store.
     pub fn add_user_windows(
         &self,
+        engine: &PolicyEngine,
         view: &mut BudgetView,
         chain: &DelegationChain,
         call: &ToolCall,
         now: OffsetDateTime,
     ) {
-        let Some(inputs) = self.usage_inputs(call) else {
+        let Some(inputs) = usage_inputs(engine, call) else {
             return;
         };
         let amount = inputs.amount;
-        let kinds = match self.policy.read() {
-            Ok(e) => e.user_window_kinds().to_vec(),
-            Err(_) => attenuo_core::WindowKind::ALL.to_vec(),
-        };
+        let kinds = engine.user_window_kinds().to_vec();
         read_windows(
             self.leases.as_ref(),
             view,
@@ -352,8 +354,14 @@ impl Pipeline {
     }
 
     /// The shared policy engine (for hot reload).
-    pub fn policy(&self) -> &Arc<RwLock<PolicyEngine>> {
+    pub fn policy(&self) -> &Arc<SharedPolicy> {
         &self.policy
+    }
+
+    /// The engine in force now: what a caller that runs several stages on its own (the admin
+    /// dry run) passes to each, so they all see one policy set.
+    pub fn policy_snapshot(&self) -> Arc<PolicyEngine> {
+        self.policy.snapshot()
     }
 
     /// Decide `call` for the agent at the end of `chain`, and record the decision.
@@ -389,45 +397,37 @@ impl Pipeline {
     }
 
     /// The policy stage alone: `PolicyEngine::authorize_labelled` (the capability stage, the
-    /// catalog, then Cedar) on the shared engine, with `labels` as the run's output labels. No
-    /// lease check, no audit record, no metrics.
+    /// catalog, then Cedar) on `engine`, with `labels` as the run's output labels. No lease
+    /// check, no audit record, no metrics.
     ///
-    /// [`decide`](Self::decide) runs this after the lease check and the label read, and the
-    /// admin dry run (`POST /admin/policies/evaluate`) runs it on its own, so the two cannot
-    /// disagree about what the policy says. A poisoned engine lock denies with `policy_error`.
+    /// [`decide`](Self::decide) runs this after the lease check and the label read, on the
+    /// snapshot it took first, and the admin dry run (`POST /admin/policies/evaluate`) runs it
+    /// on its own snapshot ([`policy_snapshot`](Self::policy_snapshot)), so the two cannot
+    /// disagree about what the policy says.
     pub fn evaluate_policy(
         &self,
+        engine: &PolicyEngine,
         chain: &DelegationChain,
         call: &ToolCall,
         labels: &CallLabels,
         now: OffsetDateTime,
     ) -> attenuo_policy::Outcome {
-        match self.policy.read() {
-            Ok(engine) => engine.authorize_labelled(chain, call, labels, now),
-            Err(_) => attenuo_policy::Outcome {
-                decision: Decision::Deny,
-                reason: attenuo_policy::REASON_POLICY_ERROR.to_string(),
-                policy_ids: Vec::new(),
-                diagnostics: vec!["policy engine lock poisoned".to_string()],
-            },
-        }
+        engine.authorize_labelled(chain, call, labels, now)
     }
 
     /// The list screen (ADR-0011, `[proxy] list_filter = "policy"`): for each of `tools` on
     /// `server`, whether it stays listed for `chain` (`PolicyEngine::screen_tools`). No lease
     /// check, no audit record, no approval, no charge, no run state: a hidden tool that is
     /// called anyway is decided by [`decide`](Self::decide) as before. Hidden entries are
-    /// counted by reason. A poisoned engine lock keeps everything.
+    /// counted by reason. One policy snapshot screens the whole list.
     pub fn screen_tools(
         &self,
         chain: &DelegationChain,
         server: &str,
         tools: &[String],
     ) -> Vec<bool> {
-        let Ok(engine) = self.policy.read() else {
-            return vec![true; tools.len()];
-        };
-        engine
+        self.policy
+            .snapshot()
             .screen_tools(chain, server, tools)
             .into_iter()
             .map(|verdict| match verdict {
@@ -447,6 +447,10 @@ impl Pipeline {
         ctx: &CallContext,
         now: OffsetDateTime,
     ) -> PipelineDecision {
+        // One policy set for the whole decision (A-8): every stage below reads `engine`, so a
+        // reload that lands meanwhile cannot mix its policies with the old ones.
+        let engine = self.policy.snapshot();
+        let engine = engine.as_ref();
         // Stage timings: one `Instant::now()` per boundary (see `Stage`).
         let t0 = Instant::now();
         let leases = crate::telemetry::stage_span!("attenuo.lease_check").in_scope(|| {
@@ -467,7 +471,7 @@ impl Pipeline {
         // Held from the budget read to the charge (SR-55).
         let run_guard = leases
             .is_ok()
-            .then(|| self.run_guard(chain, call))
+            .then(|| self.run_guard(engine, chain, call))
             .flatten();
         let (mut decision, mut reason, mut policy_ids, mut diagnostics) = match leases {
             Err((reason, detail)) => (Decision::Deny, reason.to_string(), Vec::new(), detail),
@@ -475,9 +479,9 @@ impl Pipeline {
                 let (run, args) =
                     crate::telemetry::stage_span!("attenuo.run_state").in_scope(|| {
                         let run = self.run_labels(chain);
-                        budget = self.budget_view(chain, call);
-                        self.add_user_windows(&mut budget, chain, call, now);
-                        let args = self.arg_taint(chain, call, &run.session);
+                        budget = self.budget_view(engine, chain, call);
+                        self.add_user_windows(engine, &mut budget, chain, call, now);
+                        let args = self.arg_taint(engine, chain, call, &run.session);
                         (run, args)
                     });
                 tracing::Span::current().record("attenuo.tainted", run.session.tainted);
@@ -520,8 +524,10 @@ impl Pipeline {
                             budget: budget.context.clone(),
                             usage: budget.usage.unwrap_or_default(),
                         };
+                        #[cfg(test)]
+                        self.mid_decision();
                         let o = crate::telemetry::stage_span!("attenuo.policy")
-                            .in_scope(|| self.evaluate_policy(chain, call, &labels, now));
+                            .in_scope(|| self.evaluate_policy(engine, chain, call, &labels, now));
                         policy_time = Some(t1.elapsed());
                         diagnostics.extend(o.diagnostics);
                         diagnostics.extend(run.error);
@@ -857,8 +863,13 @@ impl Pipeline {
     /// [`UNREADABLE_USAGE`], and the policy decides), and a call that would
     /// take any limit counter past its `max` is refused with `budget_exhausted`. The admin dry
     /// run (`POST /admin/policies/evaluate`) uses this too.
-    pub fn budget_view(&self, chain: &DelegationChain, call: &ToolCall) -> BudgetView {
-        self.budget_view_from(chain, call, CounterSource::Store)
+    pub fn budget_view(
+        &self,
+        engine: &PolicyEngine,
+        chain: &DelegationChain,
+        call: &ToolCall,
+    ) -> BudgetView {
+        self.budget_view_from(engine, chain, call, CounterSource::Store)
     }
 
     /// [`budget_view`](Self::budget_view) with the counters read from `source`: the lease store
@@ -869,6 +880,7 @@ impl Pipeline {
     /// holding the same counters would be.
     pub fn budget_view_from(
         &self,
+        engine: &PolicyEngine,
         chain: &DelegationChain,
         call: &ToolCall,
         source: CounterSource<'_>,
@@ -891,7 +903,7 @@ impl Pipeline {
             }
         };
         let limited = !charges.is_empty();
-        let keeps_usage = match (self.usage_inputs(call), chain_id_of(chain)) {
+        let keeps_usage = match (usage_inputs(engine, call), chain_id_of(chain)) {
             (Some(inputs), Some(chain_id)) => {
                 charges.extend(run_usage_charges(&LeaseId::new(chain_id), call, &inputs));
                 true
@@ -985,32 +997,6 @@ impl Pipeline {
             context,
             hit,
             windows: Vec::new(),
-        }
-    }
-
-    /// For a tool that keeps run usage (one the catalog marks destructive, design section
-    /// 3.5, or gives an `outbound` input, read-side exfiltration design option d): the inputs
-    /// its catalog entry names as `amount`, `destination` and `outbound`. `None` for any
-    /// other tool, and for every tool when the engine does not track usage
-    /// ([`PolicyEngine::tracks_usage`]: no loaded policy reads `context.usage`, the catalog
-    /// names no `amount` or `destination`, and `[policy] track_usage` is `"auto"`), so an
-    /// allowed call then pays no usage write and its record carries no `usage`. A tool the
-    /// engine knows nothing about, and a poisoned engine lock, count as destructive with
-    /// neither input, as [`Self::matches_arguments`] does.
-    fn usage_inputs(&self, call: &ToolCall) -> Option<UsageInputs> {
-        let attrs = match self.policy.read() {
-            Ok(e) if !e.tracks_usage() => return None,
-            Ok(e) => e.effective_attrs(&call.server, &call.tool),
-            Err(_) => None,
-        };
-        match attrs {
-            None => Some(UsageInputs::default()),
-            Some(a) if a.is_destructive() || a.has_outbound() => Some(UsageInputs {
-                amount: a.amount,
-                destination: a.destination,
-                outbound: a.outbound,
-            }),
-            Some(_) => None,
         }
     }
 
@@ -1169,30 +1155,13 @@ impl Pipeline {
     }
 
     /// How the catalog labels the results of `call`'s tool (`output`): untrusted unless the
-    /// entry says `trusted`. A poisoned engine lock cannot say the tool is trusted, so the
-    /// result is untrusted.
+    /// entry says `trusted`.
     pub fn output_label(&self, call: &ToolCall) -> OutputLabel {
         self.policy
-            .read()
-            .ok()
-            .and_then(|e| e.effective_attrs(&call.server, &call.tool))
+            .snapshot()
+            .effective_attrs(&call.server, &call.tool)
             .map(|a| a.output)
             .unwrap_or_default()
-    }
-
-    /// Whether [`Self::arg_taint`] matches `call`'s arguments on a tainted run: when some
-    /// loaded policy reads argument taint ([`PolicyEngine::reads_arg_taint`]), or the catalog
-    /// marks the tool destructive (so the decision record says which arguments were copied
-    /// even when no policy asks). A tool the engine knows nothing about (its call is denied
-    /// anyway) and a poisoned engine lock count as destructive.
-    fn matches_arguments(&self, call: &ToolCall) -> bool {
-        let Ok(engine) = self.policy.read() else {
-            return true;
-        };
-        engine.reads_arg_taint()
-            || engine
-                .effective_attrs(&call.server, &call.tool)
-                .is_none_or(|a| a.is_destructive())
     }
 
     /// Which arguments of `call` carry a verbatim span of an untrusted result of the run
@@ -1217,11 +1186,12 @@ impl Pipeline {
     /// [`MAX_SEQS_PER_PROBE`]: attenuo_audit::MAX_SEQS_PER_PROBE
     pub fn arg_taint(
         &self,
+        engine: &PolicyEngine,
         chain: &DelegationChain,
         call: &ToolCall,
         session: &SessionLabels,
     ) -> ArgTaint {
-        if !session.tainted || !self.matches_arguments(call) {
+        if !session.tainted || !matches_arguments(engine, call) {
             return ArgTaint::default();
         }
         let Some(chain_id) = chain_id_of(chain) else {
@@ -1528,6 +1498,47 @@ impl Pipeline {
 /// Run a blocking pipeline step on tokio's blocking pool, so lease lookups and the audit append
 /// (SQLite) never occupy an async worker. Appends from concurrent callers serialize on the
 /// audit store's lock, so the hash chain stays linear.
+/// For a tool that keeps run usage (one the catalog marks destructive, design section 3.5, or
+/// gives an `outbound` input, read-side exfiltration design option d): the inputs its catalog
+/// entry names as `amount`, `destination` and `outbound`. `None` for any other tool, and for
+/// every tool when `engine` does not track usage ([`PolicyEngine::tracks_usage`]: no loaded
+/// policy reads `context.usage`, the catalog names no `amount` or `destination`, and
+/// `[policy] track_usage` is `"auto"`), so an allowed call then pays no usage write and its
+/// record carries no `usage`. A tool the engine knows nothing about counts as destructive with
+/// neither input, as [`matches_arguments`] does.
+fn usage_inputs(engine: &PolicyEngine, call: &ToolCall) -> Option<UsageInputs> {
+    if !engine.tracks_usage() {
+        return None;
+    }
+    match engine.effective_attrs(&call.server, &call.tool) {
+        None => Some(UsageInputs::default()),
+        Some(a) if a.is_destructive() || a.has_outbound() => Some(UsageInputs {
+            amount: a.amount,
+            destination: a.destination,
+            outbound: a.outbound,
+        }),
+        Some(_) => None,
+    }
+}
+
+/// Whether `call` keeps a per-user window: it keeps run usage and some policy of `engine`
+/// reads a window kind.
+fn keeps_user_window(engine: &PolicyEngine, call: &ToolCall) -> bool {
+    usage_inputs(engine, call).is_some() && !engine.user_window_kinds().is_empty()
+}
+
+/// Whether [`Pipeline::arg_taint`] matches `call`'s arguments on a tainted run: when some
+/// policy of `engine` reads argument taint ([`PolicyEngine::reads_arg_taint`]), or the catalog
+/// marks the tool destructive (so the decision record says which arguments were copied even
+/// when no policy asks). A tool the engine knows nothing about (its call is denied anyway)
+/// counts as destructive.
+fn matches_arguments(engine: &PolicyEngine, call: &ToolCall) -> bool {
+    engine.reads_arg_taint()
+        || engine
+            .effective_attrs(&call.server, &call.tool)
+            .is_none_or(|a| a.is_destructive())
+}
+
 pub(super) async fn on_blocking_pool<R: Send + 'static>(
     pipeline: &Arc<Pipeline>,
     f: impl FnOnce(&Pipeline) -> R + Send + 'static,

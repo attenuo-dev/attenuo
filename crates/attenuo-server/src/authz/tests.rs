@@ -7,7 +7,7 @@ use attenuo_core::{Decision, DelegationChain, ToolCall};
 use attenuo_policy::PolicyEngineBuilder;
 use attenuo_proxy::Authorizer;
 use serde_json::json;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use time::Duration;
 use time::OffsetDateTime;
 
@@ -39,7 +39,11 @@ fn setup() -> (
         LeaseId::new("l1"),
     )
     .unwrap();
-    let p = Pipeline::new(Arc::new(RwLock::new(engine)), leases.clone(), audit.clone());
+    let p = Pipeline::new(
+        Arc::new(SharedPolicy::new(engine)),
+        leases.clone(),
+        audit.clone(),
+    );
     (p, leases, audit, chain)
 }
 

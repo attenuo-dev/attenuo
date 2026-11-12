@@ -316,9 +316,9 @@ impl Authorizer for ServerAuthorizer {
         read_only_hint: Option<bool>,
         destructive_hint: Option<bool>,
     ) {
-        let Ok(engine) = self.pipeline.policy().read() else {
-            return;
-        };
+        // The narrowing is shared by every engine a reload builds from this one, so importing
+        // into the snapshot holds for the engine in force whatever is swapped in meanwhile.
+        let engine = self.pipeline.policy_snapshot();
         if engine.import_annotations(server, tool, read_only_hint, destructive_hint) {
             // Server and tool come from the upstream: Debug-format them (SR-18).
             tracing::info!(
@@ -346,12 +346,10 @@ impl Authorizer for ServerAuthorizer {
     }
 
     fn knows_tool(&self, server: &str, tool: &str) -> bool {
-        // A poisoned lock fails closed: the tool counts as unknown.
         self.pipeline
-            .policy()
-            .read()
-            .map(|engine| engine.catalog().contains(server, tool))
-            .unwrap_or(false)
+            .policy_snapshot()
+            .catalog()
+            .contains(server, tool)
     }
 
     async fn record_rejection(

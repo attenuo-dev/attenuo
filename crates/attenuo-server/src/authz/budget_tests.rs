@@ -15,7 +15,7 @@ use attenuo_policy::PolicyEngineBuilder;
 use attenuo_policy::{BudgetContext, UsageContext};
 use serde_json::json;
 use serde_json::Value;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use time::Duration;
 use time::OffsetDateTime;
 
@@ -81,7 +81,7 @@ fn pipeline(leases: Arc<dyn LeaseStore>, audit: Arc<dyn AuditSink>) -> Pipeline 
         .with_track_usage(attenuo_policy::TrackUsage::Always)
         .build()
         .unwrap();
-    Pipeline::new(Arc::new(RwLock::new(engine)), leases, audit)
+    Pipeline::new(Arc::new(SharedPolicy::new(engine)), leases, audit)
 }
 
 fn send(amount: Value) -> ToolCall {
@@ -428,7 +428,7 @@ fn stated_counters_give_the_view_a_store_holding_them_gives() {
 
     for amount in [5, 20] {
         let call = send(json!(amount));
-        let stored = p.budget_view(&c, &call);
+        let stored = p.budget_view(&p.policy_snapshot(), &c, &call);
         let stated = StatedBudget {
             calls_remaining: Some(2),
             amount_remaining: Some(10),
@@ -456,10 +456,15 @@ fn stated_counters_give_the_view_a_store_holding_them_gives() {
             ..StatedBudget::default()
         };
         assert_eq!(stated.unmatched(&stored.charges), None);
-        let from_stated = p.budget_view_from(&c, &call, CounterSource::Stated(&stated));
+        let from_stated = p.budget_view_from(
+            &p.policy_snapshot(),
+            &c,
+            &call,
+            CounterSource::Stated(&stated),
+        );
         assert_eq!(from_stated, stored, "amount {amount}");
     }
-    let over = p.budget_view(&c, &send(json!(20)));
+    let over = p.budget_view(&p.policy_snapshot(), &c, &send(json!(20)));
     assert_eq!(over.hit.as_ref().map(|h| h.kind), Some(LimitKind::Sum));
     assert_eq!(
         over.context.refusal.as_ref().map(|r| r.reason.as_str()),
@@ -480,14 +485,19 @@ fn stated_counters_never_read_the_store() {
     let p = pipeline(leases, Arc::new(MemoryAudit::new()));
     let c = chain(Limits::default().with_calls(5), now);
     let call = send(json!(1));
-    let stored = p.budget_view(&c, &call);
+    let stored = p.budget_view(&p.policy_snapshot(), &c, &call);
     assert_eq!(
         stored.context.refusal.map(|r| r.reason),
         Some(REASON_BUDGET_ERROR.to_string())
     );
 
     let fresh = StatedBudget::default();
-    let v = p.budget_view_from(&c, &call, CounterSource::Stated(&fresh));
+    let v = p.budget_view_from(
+        &p.policy_snapshot(),
+        &c,
+        &call,
+        CounterSource::Stated(&fresh),
+    );
     assert_eq!(v.context.refusal, None);
     assert_eq!(v.context.calls_remaining, 5);
     assert_eq!(v.usage, Some(UsageContext::default()));
@@ -496,7 +506,12 @@ fn stated_counters_never_read_the_store() {
         calls_remaining: Some(0),
         ..StatedBudget::default()
     };
-    let v = p.budget_view_from(&c, &call, CounterSource::Stated(&spent));
+    let v = p.budget_view_from(
+        &p.policy_snapshot(),
+        &c,
+        &call,
+        CounterSource::Stated(&spent),
+    );
     let refusal = v.context.refusal.unwrap();
     assert_eq!(refusal.reason, REASON_BUDGET_EXHAUSTED);
     assert_eq!(
@@ -524,7 +539,12 @@ fn stated_entries_must_name_a_matching_limit_and_unlimited_figures_pass_through(
         }],
         ..StatedBudget::default()
     };
-    let v = p.budget_view_from(&c, &send(json!(1)), CounterSource::Stated(&stated));
+    let v = p.budget_view_from(
+        &p.policy_snapshot(),
+        &c,
+        &send(json!(1)),
+        CounterSource::Stated(&stated),
+    );
     assert_eq!(
         stated.unmatched(&v.charges).as_deref(),
         Some(

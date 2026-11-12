@@ -15,7 +15,7 @@ use attenuo_core::{Charge, DelegationChain, LeaseId, LimitKind, ToolCall, Window
 use attenuo_policy::{ArgType, PolicyEngineBuilder, ToolAttrs, ToolCatalog};
 use serde_json::json;
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::sync::{Barrier, Condvar};
 use time::Duration;
 use time::OffsetDateTime;
@@ -288,7 +288,7 @@ fn runs_with(
         .build()
         .unwrap();
     let pipeline = Pipeline::new(
-        Arc::new(RwLock::new(engine)),
+        Arc::new(SharedPolicy::new(engine)),
         leases,
         Arc::new(MemoryAudit::new()),
     );

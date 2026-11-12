@@ -13,7 +13,7 @@ use attenuo_core::{
 use attenuo_policy::{PolicyEngineBuilder, ToolAttrs, ToolCatalog};
 use serde_json::json;
 use serde_json::Value;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use time::Duration;
 use time::OffsetDateTime;
 
@@ -45,7 +45,7 @@ fn pipeline_with(leases: Arc<dyn LeaseStore>, audit: Arc<dyn AuditSink>, policy:
         .with_policies_str(policy)
         .build()
         .unwrap();
-    Pipeline::new(Arc::new(RwLock::new(engine)), leases, audit)
+    Pipeline::new(Arc::new(SharedPolicy::new(engine)), leases, audit)
 }
 
 /// A run whose `send` capability pins `cc` to Bob's address (so every `send` must carry it).
@@ -235,7 +235,7 @@ when { context.args_contain_untrusted && !context.approval.present };
     let leases = Arc::new(MemoryLeaseStore::new());
     let p = pipeline_with(leases.clone(), Arc::new(MemoryAudit::new()), gated);
     let c = chain(leases.as_ref(), now);
-    assert!(p.policy.read().unwrap().reads_arg_taint());
+    assert!(p.policy.snapshot().reads_arg_taint());
     let seq = read(&p, &c, "read", INBOX, now);
     let d = p.decide(&c, &fetch, now);
     assert_eq!(d.reason, attenuo_policy::REASON_APPROVAL_REQUIRED, "{d:?}");
@@ -260,7 +260,7 @@ when { resource.destructive && context.session.tainted && !context.approval.pres
     let leases = Arc::new(MemoryLeaseStore::new());
     let p = pipeline_with(leases.clone(), Arc::new(MemoryAudit::new()), plain);
     let c = chain(leases.as_ref(), now);
-    assert!(!p.policy.read().unwrap().reads_arg_taint());
+    assert!(!p.policy.snapshot().reads_arg_taint());
     let seq = read(&p, &c, "read", INBOX, now);
     let d = p.decide(&c, &fetch, now);
     assert!(d.is_allow() && d.untrusted_args.is_empty(), "{d:?}");
@@ -408,7 +408,7 @@ fn too_many_argument_fingerprints_fail_closed_without_a_lookup_sr91() {
 
     // Every argument is named, for Cedar.
     let run = p.run_labels(&c);
-    let taint = p.arg_taint(&c, &call, &run.session);
+    let taint = p.arg_taint(&p.policy_snapshot(), &c, &call, &run.session);
     assert_eq!(taint.context.untrusted.len(), n);
     assert!(taint.context.contain_untrusted);
 }

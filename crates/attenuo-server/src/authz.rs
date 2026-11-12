@@ -82,6 +82,7 @@ mod authorizer;
 mod budgets;
 mod labels;
 mod pipeline;
+mod shared_policy;
 mod usage;
 mod windows;
 
@@ -97,6 +98,7 @@ pub use pipeline::{
     REASON_LABEL_ERROR, REASON_LEASE_ERROR, REASON_LEASE_EXPIRED, REASON_LEASE_REVOKED,
     REASON_LEASE_UNKNOWN,
 };
+pub use shared_policy::SharedPolicy;
 pub use usage::{result_digest, usage_json, UNREADABLE_USAGE};
 pub use windows::UNREADABLE_WINDOW;
 
