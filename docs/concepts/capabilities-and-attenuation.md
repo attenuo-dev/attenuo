@@ -42,7 +42,7 @@ A trailing `/` on the value is ignored. A trailing `/` on the constraint's path 
 
 Every value `path_prefix: P` admits also starts with `P` as a string, so swapping a path argument's `prefix` for a `path_prefix` with the same text always narrows. `path_prefix` is for paths, not URIs: `file:///public/` holds `//` and admits nothing; keep `prefix` for a URI.
 
-`attenuo policy lint --config`, the server at startup (for `[[root_grants]]`) and `attenuo token root` / `token exchange` (for `--cap`) warn about a `prefix` constraint on an argument that looks like a path: one named `path`, `file`, `filename`, `dir`, `directory` or `folder`, or ending in `_path`, `_dir` or `_file`, or a prefix that starts with `/`, `./` or `~`, or holds a `/` but no `://`. It is a warning; nothing is refused.
+`attenuo policy lint --config`, the server at startup (for `[[root_grants]]`) and `attenuo token root` / `token exchange` (for `--cap`) warn about a `prefix` constraint on an argument that looks like a path: one named `path`, `file`, `filename`, `dir`, `directory` or `folder`, or ending in `_path`, `_dir` or `_file`, or a prefix that starts with `/`, `./` or `~`. It is a warning; nothing is refused.
 
 ## Run limits
 

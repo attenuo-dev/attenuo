@@ -1341,9 +1341,8 @@ mod tests {
         assert_eq!(caps[0], json!({"server": "github", "tool": "read_file"}));
         assert_eq!(caps[1]["constraints"]["repo"]["op"], "prefix");
         assert!(parse_caps(&["nocolon".into()]).is_err());
-        // `acme/` holds a `/` and no `://`, so it reads as a path too (SR-73: `..` and `\`
-        // after it reach other organisations through a URL parser).
-        assert_eq!(cap_warnings(&caps).len(), 1);
+        // A repository prefix is not taken for a file path.
+        assert!(cap_warnings(&caps).is_empty());
         // `path_prefix` passes through; a malformed one is refused before the request, and a
         // `prefix` on a path argument gets a warning.
         let paths = parse_caps(&[

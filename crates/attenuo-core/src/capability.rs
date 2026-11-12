@@ -699,8 +699,10 @@ const PATH_ARG_NAMES: &[&str] = &["path", "file", "filename", "dir", "directory"
 /// Does a `prefix` constraint on argument `arg` with prefix `prefix` look meant for a file
 /// path, where `path_prefix` is the constraint that holds? True when the argument is named
 /// `path`, `file`, `filename`, `dir`, `directory` or `folder` or ends with `_path`, `_dir` or
-/// `_file` (ASCII case ignored), or when the prefix starts with `/`, `./` or `~`, or holds a
-/// `/` and no `://`. A heuristic for warnings only: it never refuses anything.
+/// `_file` (ASCII case ignored), or when the prefix starts with `/`, `./` or `~`. A
+/// prefix such as `acme/` on a repository argument is left alone: `path_prefix` suits it too,
+/// but most such prefixes are not paths. A heuristic for warnings only: it never refuses
+/// anything.
 pub fn prefix_looks_like_path(arg: &str, prefix: &str) -> bool {
     let name = arg.to_ascii_lowercase();
     PATH_ARG_NAMES.contains(&name.as_str())
@@ -708,7 +710,6 @@ pub fn prefix_looks_like_path(arg: &str, prefix: &str) -> bool {
         || prefix.starts_with('/')
         || prefix.starts_with("./")
         || prefix.starts_with('~')
-        || (prefix.contains('/') && !prefix.contains("://"))
 }
 
 impl Capability {
@@ -1641,13 +1642,15 @@ mod tests {
         for arg in ["log_dir", "config_file", "OUT_FILE"] {
             assert!(looks(arg, "x"), "{arg}");
         }
-        for p in ["/workspace/", "./src", "~/notes", "acme/", "a/b"] {
+        for p in ["/workspace/", "./src", "~/notes"] {
             assert!(looks("repo", p), "{p}");
         }
         for (arg, p) in [
             ("uri", "file:///public/"),
             ("url", "https://a.example/"),
             ("repo", "acme-"),
+            ("repo", "acme/"),
+            ("repo", "a/b"),
             ("paths", "x"),
         ] {
             assert!(!looks(arg, p), "{arg} {p}");
