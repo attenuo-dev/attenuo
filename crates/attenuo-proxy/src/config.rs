@@ -38,7 +38,7 @@ pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// Default for [`ProxyConfig::upstream_connect_timeout`].
 pub const DEFAULT_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default for [`ProxyConfig::upstream_response_timeout`].
-pub const DEFAULT_UPSTREAM_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_UPSTREAM_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Everything the proxy needs to serve: its upstreams, its listen address, and its limits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

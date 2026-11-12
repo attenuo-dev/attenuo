@@ -332,7 +332,7 @@ record_window_max_keys = 10000
 # 3600 s): past it, 504 upstream_timeout, and the upstream may have acted. An SSE stream that
 # has started is never cut by it. Raise it for tools that answer in JSON after a long run.
 upstream_connect_timeout_seconds = 5
-upstream_response_timeout_seconds = 30
+upstream_response_timeout_seconds = 120
 
 [metrics]
 # Prometheus text endpoint on its OWN listener (GET /metrics), never on the proxy port.
