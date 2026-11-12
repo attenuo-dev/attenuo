@@ -1,0 +1,1 @@
+Bricolage Grotesque, IBM Plex Sans and IBM Plex Mono are licensed under the SIL Open Font License 1.1 and were downloaded (latin subset, woff2) from Google Fonts so renders work offline and are reproducible.
