@@ -35,6 +35,7 @@ Go through this before pointing anything real at the server.
 - [ ] Every tool on the upstream that agents should call is in the catalog. With the default `[policy] unknown_tools = "deny"`, a tool missing from the catalog is denied with `tool_not_in_catalog`; with `"allow"` it is neither `readonly` nor `sensitive`, so rules that depend on those attributes do not see it.
 - [ ] The config file is mode 0600. It holds secret hashes and possibly the admin token. The admin token can come from `ATTENUO_ADMIN_TOKEN` instead, and `[telemetry]` reads the standard `OTEL_*` variables ([observability](observability.md)); there is no other environment-variable substitution, so inject the file at deploy time.
 - [ ] You have read the [threat model](../spec/threat-model.md) section "What attenuo does not prevent" and have decided how the agents' other routes (direct API keys, local STDIO servers) are closed.
+- [ ] `[limits]` fits your load: `max_in_flight` above your peak of concurrent requests, and the rate limits (off by default) set for your busiest legitimate run and agent if you want one caller kept from crowding out the rest. See [Load limits](#load-limits).
 - [ ] Something checks `attenuo audit verify` on a schedule, and `[audit.sink]` ships checkpoints off the host ([audit log](../concepts/audit-log.md#shipping-checkpoints-off-the-host)). The server signs checkpoints itself (`[audit] checkpoint_every`, `checkpoint_interval_seconds`); `audit verify` reports the last signed `seq`.
 
 ## Network exposure
@@ -95,6 +96,16 @@ This hides `/admin` from the public name for a server that serves it on the main
 For nginx, the equivalent pieces are `proxy_pass http://127.0.0.1:8080;`, `proxy_buffering off;`, `proxy_http_version 1.1;` and a `location /admin/ { return 404; }` block. Untested.
 
 attenuo builds the AuthZEN discovery document from `[server] public_url`, which is required whenever `listen` is not a loopback address, so a forged `Host` header cannot put another host's URLs into a document a shared cache might keep. Only on a loopback listener without `public_url` does it fall back to `Host`, and then it accepts only `localhost`, `127.0.0.1` or `[::1]` (with an optional port) and answers 400 `invalid_host` to anything else. It does not use `X-Forwarded-*` headers.
+
+## Load limits
+
+attenuo is an inline, fail-closed decision point: when it is down or swamped, every agent's calls fail. Denial of service is still outside the [threat model](../spec/threat-model.md), but `[limits]` ([reference](../reference/config.md#limits)) gives one process some basic protection, all of it in-process and per server (one replica):
+
+- **In-flight cap.** `max_in_flight` (default 1024) requests are handled at once on the main listener; the next gets `503` `overloaded` with `Retry-After: 1` at once instead of waiting in a queue. `/healthz` and `/readyz` are never refused, so a busy server is not restarted for being busy. A streamed MCP answer stops counting once its headers are sent. The admin listener (`[admin] listen`) is not counted, which keeps revocation reachable while the main listener sheds.
+- **Deadlines.** Headers must arrive within `header_read_timeout_seconds` (30), which also closes idle kept-alive connections; bodies within `request_body_timeout_seconds` (30, else `408`); every answer except `/mcp/{server}` and `/admin/*` within `request_timeout_seconds` (60, else `503`). The proxy keeps its own upstream deadlines (`[proxy] upstream_connect_timeout_seconds`, `upstream_response_timeout_seconds`), and its streams stay open for as long as their leases are live.
+- **Rate limits, off by default.** `mcp_requests_per_minute` per run, `token_requests_per_minute` per authenticated agent and `token_unauthenticated_requests_per_minute` per peer address. Over the limit: `429` with `Retry-After`. Start at a few times the busiest legitimate rate, watch `requests_rate_limited_total`, and keep the per-peer limit off behind a reverse proxy, where every caller shares the proxy's address.
+
+Your reverse proxy or load balancer is still the place for connection limits per client address and for limits across replicas; attenuo does not read `X-Forwarded-For`.
 
 ## Admin token handling
 
@@ -334,6 +345,7 @@ listen = "127.0.0.1:9100"
 |---|---|
 | `decisions_total{decision, reason}` | Allows and denies by reason code. A jump in one reason is the first sign of a misconfigured client, an expired lease population or a prompt-injected agent. |
 | `audit_append_errors_total` | Every one denied a call (`audit_error`). Should stay at 0. |
+| `requests_shed_total`, `requests_rate_limited_total{limit, cause}`, `request_timeouts_total{kind}` | `[limits]` at work: requests refused because `max_in_flight` were running, refused by a rate limit (`cause="table_full"` means `rate_limit_max_keys` is too small for the number of callers), and past a deadline. A steady rise in shed requests means the server is at capacity. |
 | `audit_append_shed_total{cause}` | Audit appends that failed fast instead of waiting for the writer: `timeout` (no answer within `[audit] append_timeout_seconds`, usually a stalled disk) or `queue_full`. Each denied a call with `audit_error`. Should stay at 0. |
 | `authorize_duration_seconds`, `proxy_stage_seconds{stage}` | Decision time and where it goes. |
 | `budget_exhausted_total{kind, at}`, `budget_charges_total{kind}`, `budget_refunds_total{source}` | Run limits (ADR-0010) being hit, spent and given back. `at="charge"` means two calls of one run raced for the last of a budget. |
