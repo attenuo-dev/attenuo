@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock, TryLockError};
 use std::time::Duration;
 
@@ -242,6 +242,37 @@ struct Checkpointing {
 /// Most appends committed in one transaction by the writer thread.
 pub const MAX_BATCH: usize = 256;
 
+/// Default of [`SqliteAudit::with_append_limits`]'s queue: appends that may wait for the
+/// writer at once. Above the tokio blocking pool's default of 512 threads, so a server under
+/// load waits for the writer as before and only a writer that stopped draining sheds.
+pub const DEFAULT_APPEND_QUEUE: usize = 1024;
+
+/// Default of [`SqliteAudit::with_append_limits`]'s timeout: how long an append waits for the
+/// writer before it fails.
+pub const DEFAULT_APPEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many appends this log has shed rather than waited for ([`SqliteAudit::append_stats`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AppendStats {
+    /// Appends refused at once because the writer's queue was full.
+    pub queue_full: u64,
+    /// Appends that waited the whole append timeout without an answer.
+    pub timeouts: u64,
+}
+
+/// The counters behind [`AppendStats`].
+#[derive(Debug, Default)]
+struct ShedCounters {
+    queue_full: AtomicU64,
+    timeouts: AtomicU64,
+}
+
+/// [`Job::claim`] states. A job moves from `WAITING` to `TAKEN` (the writer will commit it) or
+/// to `ABANDONED` (its caller gave up; the writer drops it unwritten), never both.
+const WAITING: u8 = 0;
+const TAKEN: u8 = 1;
+const ABANDONED: u8 = 2;
+
 /// Hash-chained audit log in SQLite.
 ///
 /// **Group commit.** [`append`](AuditSink::append) hands the record to a single writer thread
@@ -253,6 +284,12 @@ pub const MAX_BATCH: usize = 256;
 /// sequence numbers in the order they reached the channel. If a batch fails, its records are
 /// retried one transaction each, so one bad record fails only its own append; every append
 /// either gets its committed entry back or an error, never a guess.
+///
+/// **Bounded waits.** The writer's queue holds at most [`DEFAULT_APPEND_QUEUE`] appends and
+/// each waits at most [`DEFAULT_APPEND_TIMEOUT`] for its entry
+/// ([`with_append_limits`](Self::with_append_limits)); past either the append fails with
+/// [`AuditError::Overloaded`], so a hung disk denies decisions instead of blocking threads
+/// without end.
 ///
 /// **Inline commit.** When no append is waiting for the writer and the connection is free, an
 /// append commits on the caller's thread instead, the same one-record transaction the writer
@@ -298,6 +335,12 @@ pub(super) struct Inner {
     file: Option<PathBuf>,
     /// Held across every write transaction (see [`WriteGate`]).
     pub(super) gate: WriteGate,
+    /// The writer's queue capacity, at least 1 ([`SqliteAudit::with_append_limits`]).
+    append_queue: usize,
+    /// How long an append waits for the writer ([`SqliteAudit::with_append_limits`]).
+    append_timeout: Duration,
+    /// Appends shed so far.
+    shed: ShedCounters,
     /// Tests: every commit and the `synchronous` level it ran at, in one log with the hook.
     #[cfg(test)]
     probe: Option<Arc<Mutex<Vec<String>>>>,
@@ -335,18 +378,35 @@ struct Job {
     /// [`AuditSink::append_synced`]: the batch that carries this record commits at `FULL`.
     sync: bool,
     reply: mpsc::SyncSender<Result<AuditEntry, AuditError>>,
+    /// [`WAITING`], [`TAKEN`] or [`ABANDONED`]: decides, once, whether the writer commits
+    /// the record or its caller has given up on it.
+    claim: Arc<AtomicU8>,
+}
+
+impl Job {
+    /// The writer's side of [`Job::claim`]: `Some` when the caller still waits, and from now
+    /// on the record is the writer's to commit; `None` when the caller gave up, and the
+    /// record is dropped unwritten.
+    fn take(self) -> Option<Self> {
+        self.claim
+            .compare_exchange(WAITING, TAKEN, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then_some(self)
+    }
 }
 
 /// Handle on the writer thread. Dropping it closes the channel; the thread finishes the batch
 /// in hand and exits, and the drop waits for it.
 struct Writer {
-    jobs: Option<mpsc::Sender<Job>>,
+    /// Bounded ([`Inner::append_queue`]): a writer that stopped draining (a hung disk) fills
+    /// it, and further appends fail at once instead of piling up.
+    jobs: Option<mpsc::SyncSender<Job>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Writer {
     fn start(inner: Arc<Inner>) -> Self {
-        let (tx, rx) = mpsc::channel::<Job>();
+        let (tx, rx) = mpsc::sync_channel::<Job>(inner.append_queue.max(1));
         match std::thread::Builder::new()
             .name("attenuo-audit-writer".into())
             .spawn(move || writer_loop(&inner, &rx))
@@ -366,18 +426,60 @@ impl Writer {
         }
     }
 
-    fn append(&self, record: DecisionRecord, sync: bool) -> Result<AuditEntry, AuditError> {
+    /// Queue `record` for the writer and wait for its entry, at most `inner.append_timeout`.
+    ///
+    /// A full queue fails at once. When the wait times out, the job is withdrawn if the writer
+    /// has not taken it yet, so it is never written; if the writer has (its batch is being
+    /// committed, or is stuck committing), the caller gives up all the same and the entry may
+    /// still be committed later. Either way the caller gets [`AuditError::Overloaded`] and its
+    /// decision fails closed. Which records are committed, and in what order, is decided by
+    /// the writer alone, so the chain stays linear whatever the callers do.
+    fn append(
+        &self,
+        inner: &Inner,
+        record: DecisionRecord,
+        sync: bool,
+    ) -> Result<AuditEntry, AuditError> {
         let stopped = || AuditError::Storage("the audit writer is not running".into());
         let jobs = self.jobs.as_ref().ok_or_else(stopped)?;
         let (reply, answer) = mpsc::sync_channel(1);
-        jobs.send(Job {
+        let claim = Arc::new(AtomicU8::new(WAITING));
+        match jobs.try_send(Job {
             record,
             reply,
             sync,
-        })
-        .map_err(|_| stopped())?;
-        // A writer that panicked drops the reply sender: the append fails, it is not assumed.
-        answer.recv().map_err(|_| stopped())?
+            claim: Arc::clone(&claim),
+        }) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                inner.shed.queue_full.fetch_add(1, Ordering::Relaxed);
+                return Err(AuditError::Overloaded("the audit writer's queue is full"));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => return Err(stopped()),
+        }
+        match answer.recv_timeout(inner.append_timeout) {
+            Ok(result) => result,
+            // A writer that panicked drops the reply sender: the append fails, it is not
+            // assumed.
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(stopped()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let withdrawn = claim
+                    .compare_exchange(WAITING, ABANDONED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok();
+                if !withdrawn {
+                    // Taken: the answer may have arrived since the wait ended.
+                    if let Ok(result) = answer.try_recv() {
+                        return result;
+                    }
+                }
+                inner.shed.timeouts.fetch_add(1, Ordering::Relaxed);
+                Err(AuditError::Overloaded(if withdrawn {
+                    "the audit writer did not take the record within the append timeout"
+                } else {
+                    "the audit writer did not commit the record within the append timeout"
+                }))
+            }
+        }
     }
 }
 
@@ -392,12 +494,17 @@ impl Drop for Writer {
 
 fn writer_loop(inner: &Inner, jobs: &mpsc::Receiver<Job>) {
     while let Ok(first) = jobs.recv() {
-        let mut batch = vec![first];
+        // Jobs whose callers gave up are dropped here, before anything is written; the rest
+        // keep the order in which they reached the queue.
+        let mut batch: Vec<Job> = first.take().into_iter().collect();
         while batch.len() < MAX_BATCH {
             match jobs.try_recv() {
-                Ok(job) => batch.push(job),
+                Ok(job) => batch.extend(job.take()),
                 Err(_) => break,
             }
+        }
+        if batch.is_empty() {
+            continue;
         }
         // One record that must be synced makes the whole batch commit at `FULL`: one sync
         // covers them all.
@@ -747,6 +854,9 @@ impl SqliteAudit {
                 relaxed_sync,
                 gate: WriteGate::for_file(file.as_deref()),
                 file,
+                append_queue: DEFAULT_APPEND_QUEUE,
+                append_timeout: DEFAULT_APPEND_TIMEOUT,
+                shed: ShedCounters::default(),
                 #[cfg(test)]
                 probe: None,
             }),
@@ -854,6 +964,32 @@ impl SqliteAudit {
     /// thread (which holds the other reference), so the `Arc` is still unique.
     fn inner_mut(&mut self) -> &mut Inner {
         Arc::get_mut(&mut self.inner).expect("SqliteAudit builders must run before any append")
+    }
+
+    /// Bound the appends that wait for the writer thread: at most `queue` (at least 1) wait at
+    /// once, and each waits at most `timeout` for its entry. A full queue, or a wait that
+    /// runs out, fails the append with [`AuditError::Overloaded`] (counted in
+    /// [`append_stats`](Self::append_stats)), so a writer stuck on a hung disk turns into
+    /// failed appends, and denied decisions, instead of an ever-growing number of blocked
+    /// threads. Group commit is unchanged: what reaches the writer is batched and committed in
+    /// queue order. An append committed inline, on the caller's thread (when nothing waits
+    /// and the connection is free), has no deadline: a thread cannot be taken out of a stuck
+    /// write, and it holds the connection, so every later append goes to the queue and is
+    /// bounded there. Defaults: [`DEFAULT_APPEND_QUEUE`], [`DEFAULT_APPEND_TIMEOUT`]. Call it
+    /// before the first append.
+    pub fn with_append_limits(mut self, queue: usize, timeout: Duration) -> Self {
+        let inner = self.inner_mut();
+        inner.append_queue = queue.max(1);
+        inner.append_timeout = timeout;
+        self
+    }
+
+    /// How many appends were shed so far ([`with_append_limits`](Self::with_append_limits)).
+    pub fn append_stats(&self) -> AppendStats {
+        AppendStats {
+            queue_full: self.inner.shed.queue_full.load(Ordering::Relaxed),
+            timeouts: self.inner.shed.timeouts.load(Ordering::Relaxed),
+        }
     }
 
     /// Sign checkpoints with `signer`: one every `every` appended entries (0 turns the
@@ -1437,7 +1573,7 @@ impl SqliteAudit {
         let result = self
             .writer
             .get_or_init(|| Writer::start(Arc::clone(&self.inner)))
-            .append(record, sync);
+            .append(&self.inner, record, sync);
         activity.pending.fetch_sub(1, Ordering::AcqRel);
         result
     }

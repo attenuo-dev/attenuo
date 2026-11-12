@@ -78,6 +78,25 @@ pub enum AuditError {
         /// The cap, [`crate::MAX_PENDING_APPROVALS_PER_RUN`].
         max: usize,
     },
+    /// Another holder has the database's single-writer fence
+    /// ([`WriterFence`](crate::WriterFence)): another server process runs on this file.
+    #[error(
+        "another process holds {} ({}): one server process per database file; stop the other \
+         instance first (in Kubernetes, use `strategy: Recreate`)",
+        lock.display(),
+        holder.map_or_else(|| "pid unknown".to_string(), |p| format!("pid {p}"))
+    )]
+    Fenced {
+        /// The lock file, `<sqlite_path>.lock`.
+        lock: std::path::PathBuf,
+        /// The process id the lock file records, when it is readable.
+        holder: Option<u32>,
+    },
+    /// An append was shed instead of waiting without bound: the writer's queue was full, or
+    /// the writer did not answer within the append timeout (a hung disk, say). The decision it
+    /// belongs to fails closed.
+    #[error("audit append shed: {0}")]
+    Overloaded(&'static str),
 }
 
 impl<T> From<std::sync::PoisonError<T>> for AuditError {
