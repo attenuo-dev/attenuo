@@ -75,7 +75,7 @@ The rejected alternative was a hash written only into the results. It would not 
 
 ## The planner
 
-The planner is a Claude model run as an agent whose only input is the bundle and whose only output is the four grant files. Model: **TBD-by-lead**. The prompt it gets is the bundle's `INSTRUCTIONS.md` and a one-line request to write the files into an empty directory. It runs once; a repeat run, if any, is reported as a separate grant source, not merged.
+The planner is a Claude model run as an agent whose only input is the bundle and whose only output is the four grant files. Model: Claude Opus 5.5, run on 2026-11-12 as four agents, one per suite, each told to read only the bundle's `INSTRUCTIONS.md` and its own suite's files and to write one grant file into an empty directory. The restriction was an instruction to the agent, not a sandbox, and no independent reviewer applied the rubric before the freeze: [`REVIEW.md`](https://github.com/attenuo-dev/attenuo/blob/main/evaluation/agentdojo/planner/REVIEW.md) records how the run was made and what the planner said it was unsure about. It ran once; a repeat run, if any, is reported as a separate grant source, not merged.
 
 ## Analysis
 
