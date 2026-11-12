@@ -5,6 +5,11 @@
     {"server": "github", "tool": "read_file",
      "constraints": {"repo": {"op": "prefix", "value": "alice/public-"}}}
 
+For a file path use ``PathPrefix``, which compares by ``/`` segment and refuses ``..``:
+``Capability("fs", "read_file", path=PathPrefix("/workspace"))`` admits
+``/workspace/a.txt`` but not ``/workspace/../etc/passwd`` or ``/workspace-secrets/x``, which a
+``Prefix("/workspace")`` admits.
+
 ``Capability("banking", "send_money", amount=Range(0, 2000))`` bounds an integer argument,
 both ends inclusive: ``{"amount": {"op": "range", "value": {"min": 0, "max": 2000}}}``.
 
@@ -64,12 +69,68 @@ class OneOf:
 
 @dataclass(frozen=True)
 class Prefix:
-    """The argument must be a string starting with ``value``."""
+    """The argument must be a string starting with ``value``.
+
+    A plain string comparison: ``Prefix("/workspace/")`` admits ``/workspace/../etc/passwd``.
+    For file paths use :class:`PathPrefix`."""
 
     value: str
 
     def to_json(self) -> dict[str, Any]:
         return {"op": "prefix", "value": self.value}
+
+
+_ENCODED_SEPARATORS = ("%2e", "%2f", "%5c")
+
+
+def path_problem(path: str) -> str | None:
+    """Why ``path`` is not a plain path as ``path_prefix`` reads one, or ``None`` when it is.
+
+    The server refuses, rather than normalises, a value or a ``path_prefix`` path that is empty
+    or holds a backslash, a control character, a percent-encoded ``.``, ``/`` or ``\\``
+    (``%2e``, ``%2f``, ``%5c``, any case), an empty segment (``//``) or a ``.`` or ``..``
+    segment."""
+    if not path:
+        return "is empty"
+    if "\\" in path:
+        return "holds a backslash"
+    if any(ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F for c in path):
+        return "holds a control character"
+    lowered = path.lower()
+    if any(e in lowered for e in _ENCODED_SEPARATORS):
+        return "holds a percent-encoded `.`, `/` or `\\`"
+    if "//" in path:
+        return "holds an empty segment (`//`)"
+    body = path.removeprefix("/").removesuffix("/")
+    if body and any(seg in (".", "..") for seg in body.split("/")):
+        return "holds a `.` or `..` segment"
+    return None
+
+
+@dataclass(frozen=True)
+class PathPrefix:
+    """The argument must be a path at or below ``value``, compared by ``/`` segment.
+
+    ``PathPrefix("/workspace")`` admits ``/workspace`` and ``/workspace/a/b.txt``, not
+    ``/workspace-secrets/x``. The server refuses a value with a ``.`` or ``..`` segment, an empty
+    segment, a backslash, a control character or a percent-encoded ``.``, ``/`` or ``\\``
+    (``/workspace/../etc/passwd`` included) rather than normalising it. A trailing ``/`` on
+    ``value`` asks for something below it: ``PathPrefix("/workspace/")`` does not admit
+    ``/workspace`` itself. An absolute ``value`` admits only absolute paths, a relative one only
+    relative paths. ``value`` must itself be a plain path (:func:`path_problem`); the
+    constructor raises ``ValueError`` otherwise, as the server would refuse it."""
+
+    value: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.value, str):
+            raise ValueError("a path_prefix constraint's path must be a string")
+        problem = path_problem(self.value)
+        if problem is not None:
+            raise ValueError(f"a path_prefix constraint's path {problem}")
+
+    def to_json(self) -> dict[str, Any]:
+        return {"op": "path_prefix", "value": self.value}
 
 
 # The bounds of a Cedar Long, which is what a range bound and a ranged argument are.
@@ -115,7 +176,7 @@ class Range:
         return {"op": "range", "value": value}
 
 
-Constraint = Equals | OneOf | Prefix | Range
+Constraint = Equals | OneOf | Prefix | PathPrefix | Range
 
 
 def constraint_from_json(obj: dict[str, Any]) -> Constraint:
@@ -127,6 +188,10 @@ def constraint_from_json(obj: dict[str, Any]) -> Constraint:
         return OneOf(*list(value or []))
     if op == "prefix":
         return Prefix(str(value))
+    if op == "path_prefix":
+        if not isinstance(value, str):
+            raise ValueError("a path_prefix constraint's path must be a string")
+        return PathPrefix(value)
     if op == "range":
         # As the server reads it: an object with integer members min and/or max, nothing else.
         if not isinstance(value, dict) or not set(value) <= {"min", "max"}:
@@ -307,7 +372,7 @@ class Capability:
         self.server = server
         self.tool = tool
         self.constraints = {
-            k: v if isinstance(v, (Equals, OneOf, Prefix, Range)) else Equals(v)
+            k: v if isinstance(v, (Equals, OneOf, Prefix, PathPrefix, Range)) else Equals(v)
             for k, v in constraints.items()
         }
         self.limits = {}

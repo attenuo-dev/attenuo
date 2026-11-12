@@ -306,6 +306,49 @@ pub fn load_legacy_bare_actions_from_config(path: &Path) -> Result<Option<bool>,
     }
 }
 
+/// Read the table-form capabilities of every `[[root_grants]]` entry of a server config, as
+/// [`Capability`] reads them (unknown members ignored; the server refuses them at startup).
+/// `"server:tool"` shorthands carry no constraints and are left out. A `.json` path gives an
+/// empty list without being read. For `attenuo policy lint`'s capability warnings
+/// ([`Capability::path_prefix_warnings`]).
+///
+/// # Errors
+///
+/// [`HarnessError::Io`] when the config cannot be read; [`HarnessError::Invalid`] when it is
+/// not TOML, `root_grants` is not a list of tables with a `capabilities` list, or a table in it
+/// is not a capability (a malformed constraint included).
+pub fn load_root_grant_capabilities(path: &Path) -> Result<Vec<Capability>, HarnessError> {
+    if path.extension().and_then(|e| e.to_str()) == Some("json") {
+        return Ok(Vec::new());
+    }
+    let what = format!("root_grants in {}", path.display());
+    let doc: toml::Table = read(path)?
+        .parse()
+        .map_err(|e: toml::de::Error| HarnessError::invalid(&what, e))?;
+    #[derive(Deserialize)]
+    struct Grant {
+        #[serde(default)]
+        capabilities: Vec<toml::Value>,
+    }
+    let Some(grants) = doc.get("root_grants") else {
+        return Ok(Vec::new());
+    };
+    let grants: Vec<Grant> = grants
+        .clone()
+        .try_into()
+        .map_err(|e: toml::de::Error| HarnessError::invalid(&what, e))?;
+    let mut out = Vec::new();
+    for cap in grants.into_iter().flat_map(|g| g.capabilities) {
+        if cap.is_table() {
+            out.push(
+                cap.try_into()
+                    .map_err(|e: toml::de::Error| HarnessError::invalid(&what, e))?,
+            );
+        }
+    }
+    Ok(out)
+}
+
 /// Read `[policy] schema_path` from a server config, resolved against the config's directory
 /// as `catalog_path` is; `None` when it is not set or the path is a JSON catalog.
 ///

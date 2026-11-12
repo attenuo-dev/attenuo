@@ -7,6 +7,10 @@
  * //   constraints: { repo: { op: "prefix", value: "alice/public-" } } }
  * ```
  *
+ * For a file path use `pathPrefix`, which compares by `/` segment and refuses `..`:
+ * `pathPrefix("/workspace")` admits `/workspace/a.txt` but not `/workspace/../etc/passwd` or
+ * `/workspace-secrets/x`, which `prefix("/workspace")` admits.
+ *
  * `range({ min: 0, max: 2000 })` bounds an integer argument, both ends inclusive.
  *
  * `constraints` is omitted when empty. `server` and `tool` are an exact name, `*`, or a prefix
@@ -35,6 +39,7 @@ export type Constraint =
   | { op: "equals"; value: unknown }
   | { op: "one_of"; value: unknown[] }
   | { op: "prefix"; value: string }
+  | { op: "path_prefix"; value: string }
   | { op: "range"; value: RangeBounds };
 
 /** Inclusive integer bounds of a `range` constraint; at least one, and `min <= max`. */
@@ -102,9 +107,53 @@ export function oneOf(...values: unknown[]): Constraint {
   return { op: "one_of", value: list };
 }
 
-/** The argument must be a string starting with `value`. */
+/**
+ * The argument must be a string starting with `value`. A plain string comparison:
+ * `prefix("/workspace/")` admits `/workspace/../etc/passwd`. For file paths use `pathPrefix`.
+ */
 export function prefix(value: string): Constraint {
   return { op: "prefix", value };
+}
+
+/**
+ * Why `path` is not a plain path as `path_prefix` reads one, or `undefined` when it is. The
+ * server refuses, rather than normalises, a value or a `path_prefix` path that is empty or holds a
+ * backslash, a control character, a percent-encoded `.`, `/` or `\` (`%2e`, `%2f`, `%5c`, any
+ * case), an empty segment (`//`) or a `.` or `..` segment.
+ */
+export function pathProblem(path: string): string | undefined {
+  if (path === "") return "is empty";
+  if (path.includes("\\")) return "holds a backslash";
+  // The Unicode control characters (Cc): C0, DEL and C1.
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(path)) return "holds a control character";
+  if (/%(2e|2f|5c)/i.test(path)) return "holds a percent-encoded `.`, `/` or `\\`";
+  if (path.includes("//")) return "holds an empty segment (`//`)";
+  let body = path.startsWith("/") ? path.slice(1) : path;
+  if (body.endsWith("/")) body = body.slice(0, -1);
+  if (body !== "" && body.split("/").some((seg) => seg === "." || seg === "..")) {
+    return "holds a `.` or `..` segment";
+  }
+  return undefined;
+}
+
+/**
+ * The argument must be a path at or below `value`, compared by `/` segment.
+ * `pathPrefix("/workspace")` admits `/workspace` and `/workspace/a/b.txt`, not
+ * `/workspace-secrets/x`. The server refuses a value with a `.` or `..` segment, an empty segment,
+ * a backslash, a control character or a percent-encoded `.`, `/` or `\` (so
+ * `/workspace/../etc/passwd`) rather than normalising it. A trailing `/` on `value` asks for
+ * something below it: `pathPrefix("/workspace/")` does not admit `/workspace` itself. An absolute
+ * `value` admits only absolute paths, a relative one only relative paths. Throws a `TypeError`
+ * when `value` is not itself a plain path (`pathProblem`), as the server would refuse it.
+ */
+export function pathPrefix(value: string): Constraint {
+  if (typeof value !== "string") {
+    throw new TypeError("a path_prefix constraint's path must be a string");
+  }
+  const problem = pathProblem(value);
+  if (problem !== undefined) throw new TypeError(`a path_prefix constraint's path ${problem}`);
+  return { op: "path_prefix", value };
 }
 
 /**
@@ -154,6 +203,7 @@ function isConstraint(v: unknown): v is Constraint {
     (o.op === "equals" && "value" in o) ||
     (o.op === "one_of" && Array.isArray(o.value)) ||
     (o.op === "prefix" && typeof o.value === "string") ||
+    (o.op === "path_prefix" && typeof o.value === "string" && pathProblem(o.value) === undefined) ||
     (o.op === "range" && rangeProblem(o.value) === undefined)
   );
 }
@@ -258,6 +308,13 @@ export function parseCapability(text: string): Capability {
 function fromJson(obj: Capability): Capability {
   const raw = obj.constraints ?? {};
   for (const [k, c] of Object.entries(raw)) {
+    const op = (c as { op?: unknown } | null)?.op;
+    const value = (c as { value?: unknown } | null)?.value;
+    if (op === "path_prefix" && typeof value === "string" && pathProblem(value) !== undefined) {
+      throw new TypeError(
+        `capability ${obj.server}:${obj.tool}: ${k}: a path_prefix constraint's path ${pathProblem(value)}`,
+      );
+    }
     if (!isConstraint(c)) {
       throw new TypeError(`capability ${obj.server}:${obj.tool}: unknown constraint for ${k}`);
     }

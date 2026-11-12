@@ -2192,6 +2192,18 @@ pub fn capability_set(specs: &[CapSpec]) -> Result<CapabilitySet, String> {
     specs.iter().map(CapSpec::to_capability).collect()
 }
 
+/// One warning per `prefix` constraint in `grants` that sits on an argument that looks like a
+/// file path ([`Capability::path_prefix_warnings`]), each starting with `[[root_grants]]`. A
+/// capability that does not parse gives none: [`Config::check_server_names`] refuses it.
+pub fn root_grant_warnings(grants: &[RootGrant]) -> Vec<String> {
+    grants
+        .iter()
+        .filter_map(|g| capability_set(&g.capabilities).ok())
+        .flat_map(|set| set.path_prefix_warnings())
+        .map(|w| format!("[[root_grants]] {w}"))
+        .collect()
+}
+
 /// A server name used in `[[upstreams]]`, the catalog or capabilities must follow
 /// [`attenuo_core::names`] (no `/`: the Cedar resource and action ids are
 /// `"<server>/<tool>"`, which would be ambiguous, SR-13). `attenuo` is reserved for the
@@ -2268,6 +2280,12 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// Warnings about `[[root_grants]]` capabilities ([`root_grant_warnings`]), which the server
+    /// logs at startup. `attenuo policy lint --config` prints the same ones.
+    pub fn root_grant_warnings(&self) -> Vec<String> {
+        root_grant_warnings(&self.root_grants)
     }
 
     /// Problems with `[admin] token`, or `None` when it is acceptable.
@@ -2361,6 +2379,42 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prefix_on_a_path_argument_in_root_grants_is_a_warning_not_an_error() {
+        let text = r#"
+            [server]
+            listen = "127.0.0.1:0"
+
+            [[root_grants]]
+            issuer = "https://idp.example"
+            agent = "coder"
+            capabilities = [
+                "fs:list",
+                { server = "fs", tool = "read_file", constraints = { path = { op = "prefix", value = "/workspace/" } } },
+                { server = "fs", tool = "write_file", constraints = { path = { op = "path_prefix", value = "/workspace/" } } },
+                { server = "web", tool = "fetch", constraints = { url = { op = "prefix", value = "https://a.example/" } } },
+            ]
+        "#;
+        let cfg = Config::from_toml(text).unwrap();
+        cfg.check_server_names().unwrap();
+        let warnings = cfg.root_grant_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("[[root_grants]] fs:read_file argument \"path\": `prefix`"),
+            "{warnings:?}"
+        );
+        // A malformed `path_prefix` is a config error, like a malformed range.
+        let bad = text.replace(
+            r#"op = "path_prefix", value = "/workspace/""#,
+            r#"op = "path_prefix", value = "/workspace/../etc""#,
+        );
+        let err = Config::from_toml(&bad).unwrap_err().to_string();
+        assert!(
+            err.contains("a path_prefix constraint's path holds a `.` or `..` segment"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn proxy_limits_have_defaults_and_refuse_zero_sr36() {
         let cfg = Config::from_toml("").unwrap();

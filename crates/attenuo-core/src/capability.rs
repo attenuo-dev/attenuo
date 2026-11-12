@@ -32,7 +32,8 @@ use crate::names::NameError;
 /// a value is a Cedar rule, not a constraint.
 ///
 /// Deserialization checks a `range`: at least one bound, `min <= max`, integer bounds and no
-/// other members ([`ArgConstraint::range`]).
+/// other members ([`ArgConstraint::range`]); and a `path_prefix`: its own path must pass the
+/// rules it applies to values ([`ArgConstraint::path_prefix`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
     tag = "op",
@@ -45,8 +46,23 @@ pub enum ArgConstraint {
     Equals(Value),
     /// Argument must equal one of these JSON values.
     OneOf(Vec<Value>),
-    /// Argument must be a string starting with this prefix.
+    /// Argument must be a string starting with this prefix. A plain string comparison: `"/a/"`
+    /// admits `"/a/../etc/passwd"`, and `"/a"` admits `"/a-secrets"`. For file paths use
+    /// [`ArgConstraint::PathPrefix`].
     Prefix(String),
+    /// Argument must be a string naming a path at or below this one, compared segment by
+    /// segment on `/`: `{"op": "path_prefix", "value": "/workspace"}` admits `/workspace` and
+    /// `/workspace/a/b.txt`, not `/workspace-secrets/x`. A value holding a `.` or `..`
+    /// segment, an empty segment (`//`), a backslash, a control character or a percent-encoded
+    /// `.`, `/` or `\` (`%2e`, `%2f`, `%5c`, any case) is refused, never normalised: so is
+    /// `/workspace/../etc/passwd`. A trailing `/` on the value is ignored; a trailing `/` on
+    /// the constraint's path asks for one more segment or a trailing `/` on the value, so that
+    /// `/workspace/` admits `/workspace/` and `/workspace/a` but not `/workspace`. An absolute
+    /// path (leading `/`) admits only absolute values, a relative one only relative values.
+    /// Every value it admits starts with its path as a string, so `path_prefix: P` is always
+    /// narrower than `prefix: P`. Build it with [`ArgConstraint::path_prefix`], which checks
+    /// the path; an unchecked one whose path breaks the rules admits nothing.
+    PathPrefix(String),
     /// Argument must be an integer (a Cedar `long`, read as [`as_long`] reads it) between the
     /// bounds, both inclusive. A missing bound is unbounded on that side. Serialized as
     /// `{"op": "range", "value": {"min": 0, "max": 2000}}`, a missing bound omitted. Build it
@@ -68,6 +84,7 @@ enum RawConstraint {
     Equals(Value),
     OneOf(Vec<Value>),
     Prefix(String),
+    PathPrefix(String),
     Range(RawRange),
 }
 
@@ -118,15 +135,123 @@ impl<'de> Deserialize<'de> for RawRange {
 }
 
 impl TryFrom<RawConstraint> for ArgConstraint {
-    type Error = RangeError;
+    type Error = ConstraintError;
 
-    fn try_from(raw: RawConstraint) -> Result<Self, RangeError> {
+    fn try_from(raw: RawConstraint) -> Result<Self, ConstraintError> {
         Ok(match raw {
             RawConstraint::Equals(v) => ArgConstraint::Equals(v),
             RawConstraint::OneOf(vs) => ArgConstraint::OneOf(vs),
             RawConstraint::Prefix(p) => ArgConstraint::Prefix(p),
+            RawConstraint::PathPrefix(p) => ArgConstraint::path_prefix(p)?,
             RawConstraint::Range(r) => ArgConstraint::range(r.min, r.max)?,
         })
+    }
+}
+
+/// Why a constraint read from the wire is malformed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ConstraintError {
+    /// A `range` with no bound or with `min > max`.
+    #[error(transparent)]
+    Range(#[from] RangeError),
+    /// A `path_prefix` whose own path breaks the path rules.
+    #[error("a path_prefix constraint's path {0}")]
+    PathPrefix(#[from] PathError),
+}
+
+/// Why a string is not a plain path as `path_prefix` reads one. Each variant reads as the end
+/// of a sentence about the string ("the value holds a `..` segment").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PathError {
+    /// The empty string.
+    #[error("is empty")]
+    Empty,
+    /// A `.` or `..` segment, which a file system resolves to another directory.
+    #[error("holds a `.` or `..` segment")]
+    DotSegment,
+    /// Two `/` in a row: an empty segment.
+    #[error("holds an empty segment (`//`)")]
+    EmptySegment,
+    /// A `\`, which Windows and WHATWG URL parsers read as a separator.
+    #[error("holds a backslash")]
+    Backslash,
+    /// A control character (NUL, tab, line feed, DEL and the C1 range).
+    #[error("holds a control character")]
+    Control,
+    /// `%2e`, `%2f` or `%5c` in either case, which a tool that percent-decodes reads as `.`,
+    /// `/` or `\`.
+    #[error("holds a percent-encoded `.`, `/` or `\\`")]
+    EncodedSeparator,
+}
+
+/// A string read as a path by [`parse_path`]: whether it starts with `/`, its segments
+/// between `/`, and whether it ends with `/`.
+struct PathSegments<'a> {
+    absolute: bool,
+    segments: Vec<&'a str>,
+    dir: bool,
+}
+
+/// Read `s` as a plain path, refusing what a file system or a decoding tool could resolve
+/// outside the segments it spells: see [`PathError`]. `/` is absolute with no segments; a
+/// trailing `/` is noted and not a segment.
+fn parse_path(s: &str) -> Result<PathSegments<'_>, PathError> {
+    if s.is_empty() {
+        return Err(PathError::Empty);
+    }
+    if s.contains('\\') {
+        return Err(PathError::Backslash);
+    }
+    if s.chars().any(char::is_control) {
+        return Err(PathError::Control);
+    }
+    let encoded = s.as_bytes().windows(3).any(|w| {
+        w[0] == b'%'
+            && matches!(
+                (w[1], w[2].to_ascii_lowercase()),
+                (b'2', b'e') | (b'2', b'f') | (b'5', b'c')
+            )
+    });
+    if encoded {
+        return Err(PathError::EncodedSeparator);
+    }
+    if s.contains("//") {
+        return Err(PathError::EmptySegment);
+    }
+    let absolute = s.starts_with('/');
+    let body = s.strip_prefix('/').unwrap_or(s);
+    let dir = s.ends_with('/');
+    let body = body.strip_suffix('/').unwrap_or(body);
+    let segments: Vec<&str> = if body.is_empty() {
+        Vec::new()
+    } else {
+        body.split('/').collect()
+    };
+    if segments.iter().any(|seg| *seg == "." || *seg == "..") {
+        return Err(PathError::DotSegment);
+    }
+    Ok(PathSegments {
+        absolute,
+        segments,
+        dir,
+    })
+}
+
+/// Does the path `value` lie at or below the path `base` ([`ArgConstraint::PathPrefix`])?
+/// Both already passed [`parse_path`]. The same test decides whether one `path_prefix` is
+/// within another, since every value the narrower one admits has at least its segments and,
+/// when it ends in `/`, one more segment or a trailing `/`.
+fn path_within(base: &PathSegments<'_>, value: &PathSegments<'_>) -> bool {
+    base.absolute == value.absolute
+        && value.segments.starts_with(&base.segments)
+        && (!base.dir || value.dir || value.segments.len() > base.segments.len())
+}
+
+/// [`path_within`] on strings: `false` when either is not a plain path.
+fn path_str_within(base: &str, value: &str) -> bool {
+    match (parse_path(base), parse_path(value)) {
+        (Ok(b), Ok(v)) => path_within(&b, &v),
+        _ => false,
     }
 }
 
@@ -206,6 +331,20 @@ impl ArgConstraint {
         }
     }
 
+    /// A checked `path_prefix`: `path` must itself be a plain path, non-empty, with no `.`,
+    /// `..` or empty segment, backslash, control character or percent-encoded `.`, `/` or `\`
+    /// ([`ArgConstraint::PathPrefix`] has the matching rules). Absolute and relative paths are
+    /// both allowed.
+    ///
+    /// # Errors
+    ///
+    /// The [`PathError`] that `path` breaks.
+    pub fn path_prefix(path: impl Into<String>) -> Result<Self, PathError> {
+        let path = path.into();
+        parse_path(&path)?;
+        Ok(ArgConstraint::PathPrefix(path))
+    }
+
     /// Canonical (RFC 8785) JSON form; equality and ordering are defined on it, so
     /// constraints can live in `BTreeSet`/`BTreeMap`.
     fn canonical(&self) -> Vec<u8> {
@@ -223,12 +362,14 @@ impl ArgConstraint {
         }
     }
 
-    /// Does no value satisfy this constraint (an empty `one_of`, or a range with `min > max`,
-    /// which only the unchecked variant can spell)?
+    /// Does no value satisfy this constraint (an empty `one_of`, a range with `min > max` or a
+    /// `path_prefix` whose path breaks the path rules, which only the unchecked variants can
+    /// spell)?
     fn is_empty(&self) -> bool {
         match self {
             ArgConstraint::OneOf(vs) => vs.is_empty(),
             ArgConstraint::Range { .. } => self.bounds().is_some_and(|(lo, hi)| lo > hi),
+            ArgConstraint::PathPrefix(p) => parse_path(p).is_err(),
             _ => false,
         }
     }
@@ -242,6 +383,9 @@ impl ArgConstraint {
                 .as_str()
                 .map(|s| s.starts_with(prefix))
                 .unwrap_or(false),
+            ArgConstraint::PathPrefix(base) => {
+                value.as_str().is_some_and(|s| path_str_within(base, s))
+            }
             ArgConstraint::Range { .. } => match (self.bounds(), as_long(value)) {
                 (Some((lo, hi)), Some(n)) => lo <= n && n <= hi,
                 _ => false,
@@ -263,6 +407,11 @@ impl ArgConstraint {
             ArgConstraint::Equals(_) => "does not equal the permitted value".into(),
             ArgConstraint::OneOf(_) => "is not one of the permitted values".into(),
             ArgConstraint::Prefix(p) => format!("does not start with {p:?}"),
+            ArgConstraint::PathPrefix(p) => match value.as_str().map(parse_path) {
+                None => "is not a string".into(),
+                Some(Err(e)) => format!("is not a plain path: it {e}"),
+                Some(Ok(_)) => format!("is not a path at or below {p:?}"),
+            },
             ArgConstraint::Range { min, max } => match (as_long(value), min, max) {
                 (None, _, _) => "is not an integer".into(),
                 (Some(n), Some(lo), _) if n < *lo => format!("is below the minimum {lo}"),
@@ -302,9 +451,28 @@ impl ArgConstraint {
                     .unwrap_or(false)
             }),
             (ArgConstraint::Prefix(p), ArgConstraint::Prefix(q)) => p.starts_with(q.as_str()),
+            // A value or a set is within a path prefix when every member is.
+            (ArgConstraint::Equals(a), ArgConstraint::PathPrefix(_)) => other.satisfied_by(a),
+            (ArgConstraint::OneOf(as_), ArgConstraint::PathPrefix(_)) => {
+                as_.iter().all(|a| other.satisfied_by(a))
+            }
+            // One path prefix within another: the child's own path is a value the parent
+            // admits, and so is everything below it ([`path_within`]). `self` is a plain path
+            // here (an invalid one is empty, handled above).
+            (ArgConstraint::PathPrefix(q), ArgConstraint::PathPrefix(_)) => {
+                other.satisfied_by(&Value::String(q.clone()))
+            }
+            // Every value a path prefix admits starts with its path as a string (it admits its
+            // own path, and everything else it admits continues it after a `/`), so it is
+            // within a string prefix exactly when its path starts with that prefix.
+            (ArgConstraint::PathPrefix(q), ArgConstraint::Prefix(p)) => q.starts_with(p.as_str()),
+            // A string prefix admits `P../x`; no path prefix holds that.
+            (ArgConstraint::Prefix(_), ArgConstraint::PathPrefix(_)) => false,
             // A prefix admits infinitely many values; it cannot imply an exact or finite set.
-            (ArgConstraint::Prefix(_), ArgConstraint::Equals(_))
-            | (ArgConstraint::Prefix(_), ArgConstraint::OneOf(_)) => false,
+            (ArgConstraint::Prefix(_) | ArgConstraint::PathPrefix(_), ArgConstraint::Equals(_))
+            | (ArgConstraint::Prefix(_) | ArgConstraint::PathPrefix(_), ArgConstraint::OneOf(_)) => {
+                false
+            }
             // A value implies a range when it is an integer in it and every value equal to it is
             // one too; a set, when every member does.
             (ArgConstraint::Equals(a), ArgConstraint::Range { .. }) => {
@@ -329,8 +497,14 @@ impl ArgConstraint {
                 }
             }
             // Strings and integers never meet.
-            (ArgConstraint::Prefix(_), ArgConstraint::Range { .. })
-            | (ArgConstraint::Range { .. }, ArgConstraint::Prefix(_)) => false,
+            (
+                ArgConstraint::Prefix(_) | ArgConstraint::PathPrefix(_),
+                ArgConstraint::Range { .. },
+            )
+            | (
+                ArgConstraint::Range { .. },
+                ArgConstraint::Prefix(_) | ArgConstraint::PathPrefix(_),
+            ) => false,
         }
     }
 }
@@ -519,6 +693,50 @@ impl Capability {
     }
 }
 
+/// Argument names that usually hold a file path ([`prefix_looks_like_path`]).
+const PATH_ARG_NAMES: &[&str] = &["path", "file", "filename", "dir", "directory", "folder"];
+
+/// Does a `prefix` constraint on argument `arg` with prefix `prefix` look meant for a file
+/// path, where `path_prefix` is the constraint that holds? True when the argument is named
+/// `path`, `file`, `filename`, `dir`, `directory` or `folder` or ends with `_path`, `_dir` or
+/// `_file` (ASCII case ignored), or when the prefix starts with `/`, `./` or `~`. A
+/// prefix such as `acme/` on a repository argument is left alone: `path_prefix` suits it too,
+/// but most such prefixes are not paths. A heuristic for warnings only: it never refuses
+/// anything.
+pub fn prefix_looks_like_path(arg: &str, prefix: &str) -> bool {
+    let name = arg.to_ascii_lowercase();
+    PATH_ARG_NAMES.contains(&name.as_str())
+        || ["_path", "_dir", "_file"].iter().any(|s| name.ends_with(s))
+        || prefix.starts_with('/')
+        || prefix.starts_with("./")
+        || prefix.starts_with('~')
+}
+
+impl Capability {
+    /// One warning per `prefix` constraint of this capability that looks meant for a file
+    /// path ([`prefix_looks_like_path`]), recommending `path_prefix`: a string prefix also
+    /// admits `..` segments below it. Empty when there is none. The capability is unchanged
+    /// and still valid; this is advice for whoever wrote it.
+    pub fn path_prefix_warnings(&self) -> Vec<String> {
+        self.constraints
+            .iter()
+            .filter_map(|(arg, c)| match c {
+                ArgConstraint::Prefix(p) if prefix_looks_like_path(arg, p) => {
+                    let escape = if p.ends_with('/') { "../x" } else { "/../x" };
+                    Some(format!(
+                        "{}:{} argument {arg:?}: `prefix` {p:?} compares strings, so it also \
+                         admits {:?}; use `path_prefix` for a file path",
+                        self.server.escape_debug(),
+                        self.tool.escape_debug(),
+                        format!("{p}{escape}"),
+                    ))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
+
 /// A set of capabilities. A call is permitted if any member permits it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -574,6 +792,14 @@ impl CapabilitySet {
     /// [`Limits::validate`] refuses.
     pub fn validate_limits(&self) -> Result<(), LimitError> {
         self.0.iter().try_for_each(Capability::validate_limits)
+    }
+
+    /// [`Capability::path_prefix_warnings`] of every member, in canonical order.
+    pub fn path_prefix_warnings(&self) -> Vec<String> {
+        self.0
+            .iter()
+            .flat_map(Capability::path_prefix_warnings)
+            .collect()
     }
 
     /// Does this set permit every call that `child` permits?
@@ -1124,5 +1350,329 @@ mod tests {
         let back: Capability = serde_json::from_str(&s).unwrap();
         assert_eq!(cap, back);
         assert!(s.contains("\"op\":\"one_of\""));
+    }
+
+    // ------------------------------------------------------------ path_prefix (S-7, SR-73)
+
+    fn pp(p: &str) -> ArgConstraint {
+        ArgConstraint::path_prefix(p).unwrap()
+    }
+
+    #[test]
+    fn path_prefix_refuses_each_class_whatever_the_base() {
+        let c = pp("/workspace");
+        let refused = [
+            ("/workspace/../etc/passwd", PathError::DotSegment),
+            ("/workspace/..", PathError::DotSegment),
+            ("/workspace/./a", PathError::DotSegment),
+            ("/workspace/a/.", PathError::DotSegment),
+            ("/workspace//a", PathError::EmptySegment),
+            ("/workspace/a//", PathError::EmptySegment),
+            ("//workspace/a", PathError::EmptySegment),
+            ("/workspace\\..\\etc", PathError::Backslash),
+            ("/workspace/a\\b", PathError::Backslash),
+            ("/workspace/a\u{0}", PathError::Control),
+            ("/workspace/a\tb", PathError::Control),
+            ("/workspace/a\nb", PathError::Control),
+            ("/workspace/\u{7f}", PathError::Control),
+            ("/workspace/\u{85}", PathError::Control),
+            ("/workspace/%2e%2e/etc", PathError::EncodedSeparator),
+            ("/workspace/%2E%2E/etc", PathError::EncodedSeparator),
+            ("/workspace/.%2e/etc", PathError::EncodedSeparator),
+            ("/workspace%2fa", PathError::EncodedSeparator),
+            ("/workspace/a%2Fb", PathError::EncodedSeparator),
+            ("/workspace/a%5cb", PathError::EncodedSeparator),
+            ("/workspace/a%5Cb", PathError::EncodedSeparator),
+            ("", PathError::Empty),
+        ];
+        for (v, why) in refused {
+            assert_eq!(parse_path(v).err(), Some(why), "{v:?}");
+            assert!(!c.satisfied_by(&json!(v)), "{v:?} must be refused");
+            assert_eq!(
+                c.violation(Some(&json!(v))),
+                Some(format!("is not a plain path: it {why}")),
+                "{v:?}"
+            );
+        }
+        // Other escapes and dots inside a name are plain characters.
+        for v in [
+            "/workspace/a%20b",
+            "/workspace/a%2",
+            "/workspace/...",
+            "/workspace/.env",
+        ] {
+            assert!(c.satisfied_by(&json!(v)), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn prefix_keeps_admitting_what_path_prefix_refuses() {
+        // Pinned: `prefix` is a string comparison and stays one (SR-73).
+        let p = ArgConstraint::Prefix("/workspace/".into());
+        assert!(p.satisfied_by(&json!("/workspace/../etc/passwd")));
+        assert!(!pp("/workspace/").satisfied_by(&json!("/workspace/../etc/passwd")));
+        let p = ArgConstraint::Prefix("/workspace".into());
+        assert!(p.satisfied_by(&json!("/workspace-secrets/x")));
+        assert!(!pp("/workspace").satisfied_by(&json!("/workspace-secrets/x")));
+        assert_eq!(
+            pp("/workspace").violation(Some(&json!("/workspace-secrets/x"))),
+            Some("is not a path at or below \"/workspace\"".into())
+        );
+    }
+
+    #[test]
+    fn path_prefix_segments_and_trailing_slashes() {
+        let admits = |c: &ArgConstraint, v: &str| c.satisfied_by(&json!(v));
+        // No trailing slash on the base: the directory itself, with or without one, and below.
+        let bare = pp("/workspace");
+        for v in [
+            "/workspace",
+            "/workspace/",
+            "/workspace/a",
+            "/workspace/a/",
+            "/workspace/a/b",
+        ] {
+            assert!(admits(&bare, v), "{v:?}");
+        }
+        for v in [
+            "/workspac",
+            "/workspacex",
+            "/",
+            "workspace/a",
+            "/other/workspace",
+        ] {
+            assert!(!admits(&bare, v), "{v:?}");
+        }
+        // A trailing slash on the base: a value must continue it as a string.
+        let dir = pp("/workspace/");
+        for v in ["/workspace/", "/workspace/a", "/workspace/a/"] {
+            assert!(admits(&dir, v), "{v:?}");
+        }
+        assert!(!admits(&dir, "/workspace"));
+        // The root admits every absolute path and no relative one.
+        let root = pp("/");
+        for v in ["/", "/a", "/a/b/"] {
+            assert!(admits(&root, v), "{v:?}");
+        }
+        assert!(!admits(&root, "a"));
+        // A relative base admits only relative values.
+        let rel = pp("docs");
+        for v in ["docs", "docs/", "docs/a.md"] {
+            assert!(admits(&rel, v), "{v:?}");
+        }
+        for v in ["/docs/a.md", "docsx", "./docs/a.md", "docs/../a"] {
+            assert!(!admits(&rel, v), "{v:?}");
+        }
+        // Not a string.
+        for v in [json!(1), json!(null), json!(["/workspace/a"])] {
+            assert!(!bare.satisfied_by(&v));
+            assert_eq!(bare.violation(Some(&v)), Some("is not a string".into()));
+        }
+        // Every value admitted starts with the base as a string.
+        for (c, base) in [(&bare, "/workspace"), (&dir, "/workspace/"), (&rel, "docs")] {
+            for v in [
+                "/workspace",
+                "/workspace/",
+                "/workspace/a",
+                "docs",
+                "docs/a",
+            ] {
+                if admits(c, v) {
+                    assert!(v.starts_with(base), "{v:?} under {base:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn path_prefix_base_is_checked_when_built_and_read() {
+        assert_eq!(ArgConstraint::path_prefix(""), Err(PathError::Empty));
+        assert_eq!(
+            ArgConstraint::path_prefix("/a/../b"),
+            Err(PathError::DotSegment)
+        );
+        assert_eq!(
+            ArgConstraint::path_prefix("./a"),
+            Err(PathError::DotSegment)
+        );
+        assert_eq!(
+            ArgConstraint::path_prefix("a//b"),
+            Err(PathError::EmptySegment)
+        );
+        assert_eq!(
+            ArgConstraint::path_prefix("C:\\a"),
+            Err(PathError::Backslash)
+        );
+        assert_eq!(ArgConstraint::path_prefix("/a\n"), Err(PathError::Control));
+        assert_eq!(
+            ArgConstraint::path_prefix("/a%2F"),
+            Err(PathError::EncodedSeparator)
+        );
+        for ok in ["/", "/a", "/a/", "a", "a/b/", "~/x", "/a b/c"] {
+            assert!(ArgConstraint::path_prefix(ok).is_ok(), "{ok:?}");
+        }
+        for bad in ["", "/a/..", "/a//b", "/a\\b", "/a%2e%2e"] {
+            let wire = json!({"op": "path_prefix", "value": bad});
+            let err = serde_json::from_value::<ArgConstraint>(wire).unwrap_err();
+            assert!(
+                err.to_string().contains("a path_prefix constraint's path"),
+                "{bad:?}: {err}"
+            );
+        }
+        assert!(
+            serde_json::from_value::<ArgConstraint>(json!({"op": "path_prefix", "value": 1}))
+                .is_err()
+        );
+        // Built unchecked, a malformed base admits nothing and vacuously implies everything,
+        // as an empty `one_of` does; nothing but an empty constraint implies it.
+        let broken = ArgConstraint::PathPrefix("/a/../b".into());
+        assert!(!broken.satisfied_by(&json!("/a/../b")));
+        assert!(!broken.satisfied_by(&json!("/a/../b/c")));
+        assert!(broken.implies(&ArgConstraint::Equals(json!("x"))));
+        assert!(!pp("/a").implies(&broken));
+        assert!(!ArgConstraint::Equals(json!("/a/../b")).implies(&broken));
+        let empty = ArgConstraint::PathPrefix(String::new());
+        assert!(!empty.satisfied_by(&json!("a")));
+    }
+
+    #[test]
+    fn path_prefix_serde_round_trip() {
+        let cap = Capability::new("fs", "read_file")
+            .with_constraint("path", pp("/workspace/"))
+            .with_constraint("dir", pp("docs"));
+        let s = serde_json::to_string(&cap).unwrap();
+        assert!(
+            s.contains(r#"{"op":"path_prefix","value":"/workspace/"}"#),
+            "{s}"
+        );
+        let back: Capability = serde_json::from_str(&s).unwrap();
+        assert_eq!(cap, back);
+        assert_ne!(pp("/workspace"), ArgConstraint::Prefix("/workspace".into()));
+        assert_eq!(
+            cap.display(),
+            r#"fs:read_file{dir={"op":"path_prefix","value":"docs"},path={"op":"path_prefix","value":"/workspace/"}}"#
+        );
+    }
+
+    #[test]
+    fn path_prefix_narrows_under_path_prefix_by_segment() {
+        let implies = |child: &str, parent: &str| pp(child).implies(&pp(parent));
+        assert!(implies("/w", "/w"));
+        assert!(implies("/w/", "/w/"));
+        assert!(implies("/w/a", "/w"));
+        assert!(implies("/w/a", "/w/"));
+        assert!(implies("/w/a/b/", "/w/a"));
+        assert!(implies("/w/", "/w"));
+        assert!(implies("/w", "/"));
+        assert!(implies("docs/a", "docs"));
+        // Wider, a sibling or the other kind of path.
+        assert!(!implies("/w", "/w/a"));
+        assert!(!implies("/w", "/w/"));
+        assert!(!implies("/w-x", "/w"));
+        assert!(!implies("/wx/a", "/w"));
+        assert!(!implies("w", "/w"));
+        assert!(!implies("/w", "w"));
+        assert!(!implies("/", "/w"));
+        // Values and sets: each member must be admitted.
+        let parent = pp("/w");
+        assert!(ArgConstraint::Equals(json!("/w/a")).implies(&parent));
+        assert!(!ArgConstraint::Equals(json!("/w/../etc")).implies(&parent));
+        assert!(!ArgConstraint::Equals(json!(1)).implies(&parent));
+        assert!(ArgConstraint::OneOf(vec![json!("/w"), json!("/w/a/")]).implies(&parent));
+        assert!(!ArgConstraint::OneOf(vec![json!("/w/a"), json!("/w-x")]).implies(&parent));
+        // A path prefix admits infinitely many strings and never an integer.
+        assert!(!pp("/w/a").implies(&ArgConstraint::Equals(json!("/w/a"))));
+        assert!(!pp("/w/a").implies(&ArgConstraint::OneOf(vec![json!("/w/a")])));
+        assert!(!pp("/w/a").implies(&range(Some(0), None)));
+        assert!(!range(Some(1), Some(1)).implies(&pp("/w")));
+    }
+
+    #[test]
+    fn path_prefix_against_string_prefix() {
+        let narrower =
+            |child: &str, parent: &str| pp(child).implies(&ArgConstraint::Prefix(parent.into()));
+        // Under a string prefix: only when the child's base starts with it, since the child
+        // admits its own base.
+        assert!(narrower("/workspace/", "/workspace/"));
+        assert!(narrower("/workspace/a", "/workspace/"));
+        assert!(narrower("/workspace", "/workspace"));
+        assert!(narrower("/workspace", "/work"));
+        assert!(narrower("/workspace", ""));
+        assert!(!narrower("/workspace", "/workspace/"));
+        assert!(!narrower("/w", "/x"));
+        // A string prefix is never within a path prefix: it admits `P../x`.
+        for (child, parent) in [("/w/", "/w"), ("/w/a/", "/w"), ("/w/a", "/")] {
+            assert!(
+                !ArgConstraint::Prefix(child.into()).implies(&pp(parent)),
+                "{child}"
+            );
+        }
+        // Through attenuation: switching a path argument from `prefix` to `path_prefix` with
+        // the same string narrows; the other way round widens and is refused.
+        let parent = CapabilitySet::from_iter([Capability::new("fs", "read_file")
+            .with_constraint("path", ArgConstraint::Prefix("/workspace/".into()))]);
+        let child = CapabilitySet::from_iter([
+            Capability::new("fs", "read_file").with_constraint("path", pp("/workspace/"))
+        ]);
+        assert!(parent.attenuate(&child).is_ok());
+        assert!(child.attenuate(&parent).is_err());
+        let loose = CapabilitySet::from_iter([
+            Capability::new("fs", "read_file").with_constraint("path", pp("/workspace"))
+        ]);
+        assert!(
+            parent.attenuate(&loose).is_err(),
+            "admits /workspace itself"
+        );
+    }
+
+    #[test]
+    fn prefix_on_a_path_like_argument_gets_a_warning() {
+        let looks = prefix_looks_like_path;
+        for arg in [
+            "path",
+            "File",
+            "filename",
+            "dir",
+            "directory",
+            "folder",
+            "src_path",
+        ] {
+            assert!(looks(arg, "x"), "{arg}");
+        }
+        for arg in ["log_dir", "config_file", "OUT_FILE"] {
+            assert!(looks(arg, "x"), "{arg}");
+        }
+        for p in ["/workspace/", "./src", "~/notes"] {
+            assert!(looks("repo", p), "{p}");
+        }
+        for (arg, p) in [
+            ("uri", "file:///public/"),
+            ("url", "https://a.example/"),
+            ("repo", "acme-"),
+            ("repo", "acme/"),
+            ("repo", "a/b"),
+            ("paths", "x"),
+        ] {
+            assert!(!looks(arg, p), "{arg} {p}");
+        }
+        let set = CapabilitySet::from_iter([
+            Capability::new("fs", "read_file")
+                .with_constraint("path", ArgConstraint::Prefix("/workspace/".into()))
+                .with_constraint("mode", ArgConstraint::Prefix("r".into())),
+            Capability::new("fs", "write_file").with_constraint("path", pp("/workspace/")),
+            Capability::new("web", "fetch")
+                .with_constraint("url", ArgConstraint::Prefix("https://a.example/".into())),
+        ]);
+        assert_eq!(
+            set.path_prefix_warnings(),
+            vec![
+                "fs:read_file argument \"path\": `prefix` \"/workspace/\" compares strings, so it \
+                 also admits \"/workspace/../x\"; use `path_prefix` for a file path"
+                    .to_string()
+            ]
+        );
+        let bare = Capability::new("fs", "ls")
+            .with_constraint("dir", ArgConstraint::Prefix("/srv".into()));
+        assert!(bare.path_prefix_warnings()[0].contains("\"/srv/../x\""));
     }
 }

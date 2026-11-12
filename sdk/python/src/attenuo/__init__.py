@@ -73,9 +73,11 @@ from .capability import (
     Equals,
     Limits,
     OneOf,
+    PathPrefix,
     Prefix,
     Range,
     capabilities_to_json,
+    path_problem,
 )
 from .client import AsyncClient, Client
 from .dpop import (
@@ -166,6 +168,7 @@ __all__ = [
     "Limits",
     "NonceCache",
     "OneOf",
+    "PathPrefix",
     "PolicyCheck",
     "PolicyEvaluation",
     "PolicyReload",
@@ -208,6 +211,7 @@ __all__ = [
     "mcp_headers",
     "mcp_url",
     "parse_shipped",
+    "path_problem",
     "verify_approval_token",
     "verify_export",
     "verify_token",

@@ -17,6 +17,7 @@ A constraint is `{op, value}`, and `op` is one of:
 - `equals`: the argument must equal a JSON value.
 - `one_of`: the argument must equal one of a list of values.
 - `prefix`: the argument must be a string that starts with the value.
+- `path_prefix`: the argument must be a path at or below the value, compared one `/` segment at a time. A value with `..` or `.` segments is refused (see below).
 - `range`: the argument must be an integer between `min` and `max`, both inclusive. The value is `{"min": 0, "max": 2000}`; either bound can be left out, but not both, and `min` cannot be greater than `max`.
 
 An argument has at most one constraint, so kinds do not combine: "between 1 and 100 but not 13" is a Cedar rule. Arguments with no constraint are free. A call that leaves out a constrained argument is denied.
@@ -24,6 +25,24 @@ An argument has at most one constraint, so kinds do not combine: "between 1 and 
 A `range` reads the argument the way Cedar does: a JSON integer, or a float with no fractional part (`5.0` is `5`). A fraction, a numeric string such as `"5"`, or a number too large for a Cedar `long` is outside every range, so the call is denied.
 
 Example: `github:create_issue` with `repo` prefix `acme/` lets the holder open issues only in repositories under `acme/`.
+
+### Prefixes of strings and of paths
+
+`prefix` compares strings, character by character. That is right for URL prefixes (`https://api.example.com/v2/`), ids and names (`ticket-`, `acme/`). It is wrong for file paths: `prefix: "/workspace/"` admits `/workspace/../etc/passwd`, which a file system opens as `/etc/passwd`, and `prefix: "/workspace"` admits `/workspace-secrets/x`.
+
+For a file path use `path_prefix`. It splits the value and its own path on `/` and requires the path's segments to be the first segments of the value, so `path_prefix: "/workspace"` admits `/workspace`, `/workspace/` and `/workspace/src/main.rs`, and refuses `/workspace-secrets/x`. It refuses, and never tries to clean up, any value that holds:
+
+- a `.` or `..` segment (`/workspace/../etc/passwd`, `/workspace/./a`),
+- an empty segment (`/workspace//a`),
+- a backslash, which Windows and URL parsers read as a separator,
+- a control character (NUL, tab, line breaks),
+- a percent-encoded `.`, `/` or `\` (`%2e`, `%2f`, `%5c`, in either case), which a tool that decodes would read as one.
+
+A trailing `/` on the value is ignored. A trailing `/` on the constraint's path asks for something below it: `path_prefix: "/workspace/"` admits `/workspace/` and `/workspace/a`, but not `/workspace` itself. An absolute path (one starting with `/`) admits only absolute values and a relative one (`docs`) only relative values. The constraint's own path must follow the same rules: `path_prefix: "/workspace/../x"` or an empty path is refused when the token, the exchange request or the config is read.
+
+Every value `path_prefix: P` admits also starts with `P` as a string, so swapping a path argument's `prefix` for a `path_prefix` with the same text always narrows. `path_prefix` is for paths, not URIs: `file:///public/` holds `//` and admits nothing; keep `prefix` for a URI.
+
+`attenuo policy lint --config`, the server at startup (for `[[root_grants]]`) and `attenuo token root` / `token exchange` (for `--cap`) warn about a `prefix` constraint on an argument that looks like a path: one named `path`, `file`, `filename`, `dir`, `directory` or `folder`, or ending in `_path`, `_dir` or `_file`, or a prefix that starts with `/`, `./` or `~`. It is a warning; nothing is refused.
 
 ## Run limits
 
@@ -46,7 +65,9 @@ When a hop delegates to a child, the child's capabilities must be covered by the
 
 So `repo prefix acme/` can become `repo equals acme/api`, or `repo prefix acme/api`. It cannot become a prefix that is shorter, and it cannot drop the constraint.
 
-For `range`, the child's interval must sit inside the parent's: `0..2000` can become `10..500`, `equals 300` or `one_of [100, 200]`, but not `0..5000`, `-10..2000` or a range with the upper bound left out. A range can become an `equals` or a `one_of` only when it holds one integer (`7..7` covers `equals 7`). `prefix` and `range` never cover each other.
+For `path_prefix`, the child's path must lie at or below the parent's, segment by segment: `/workspace` can become `/workspace/src`, `/workspace/` or `equals /workspace/a.txt`, but not `/workspace-old` or `/`. Under a parent `/workspace/` a child `/workspace` is refused, since it admits `/workspace` itself. A `prefix` can become a `path_prefix` whose path starts with the prefix (`prefix /workspace/` to `path_prefix /workspace/src`). A `path_prefix` can never become a `prefix`, which would let `..` back in.
+
+For `range`, the child's interval must sit inside the parent's: `0..2000` can become `10..500`, `equals 300` or `one_of [100, 200]`, but not `0..5000`, `-10..2000` or a range with the upper bound left out. A range can become an `equals` or a `one_of` only when it holds one integer (`7..7` covers `equals 7`). A `range` never covers a `prefix` or a `path_prefix`, nor the other way round.
 
 Each child capability must be covered by a single parent capability. A child that would be covered only by the union of two parent capabilities is rejected. This is deliberately conservative. It keeps the check simple and the reason for a refusal easy to explain.
 
@@ -74,7 +95,7 @@ This is why narrow grants matter. A capability of `github:*` also covers `resour
 
 ## Limits today
 
-- The constraint kinds are `equals`, `one_of`, `prefix` and `range`. A `range` bounds the value of each call; a `sum` limit bounds the total over the run. Use both to say "at most 2000 per payment and 5000 in all". Time-range constraints are not built ([RFC-0001 section 3.1](../spec/rfc-0001-attenuo.md#31-not-yet-implemented--proposed) says why).
+- The constraint kinds are `equals`, `one_of`, `prefix`, `path_prefix` and `range`. A `range` bounds the value of each call; a `sum` limit bounds the total over the run. Use both to say "at most 2000 per payment and 5000 in all". Time-range constraints are not built ([RFC-0001 section 3.1](../spec/rfc-0001-attenuo.md#31-not-yet-implemented--proposed) says why).
 - Run limits count per delegation run. Limits per time window are not built.
 - Property tests (`crates/attenuo-core/tests/attenuation_props.rs`) check that coverage never lets a child permit something its parent does not, limits included. They check soundness, not that every narrower request is accepted.
 

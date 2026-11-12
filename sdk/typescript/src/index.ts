@@ -100,6 +100,8 @@ export {
   formatCapability,
   oneOf,
   parseCapability,
+  pathPrefix,
+  pathProblem,
   prefix,
   range,
   withLimits,

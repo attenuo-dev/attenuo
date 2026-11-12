@@ -130,6 +130,9 @@ impl AppState {
         clock: Arc<dyn attenuo_core::Clock>,
     ) -> anyhow::Result<Self> {
         config.check_server_names()?;
+        for warning in config.root_grant_warnings() {
+            tracing::warn!("{warning}");
+        }
         config.server.check_public_url()?;
         config.check_admin_token()?;
         config.metrics.check_listen()?;

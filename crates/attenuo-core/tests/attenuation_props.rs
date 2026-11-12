@@ -43,9 +43,20 @@ fn small_string() -> impl Strategy<Value = String> {
     "[ab]{0,3}"
 }
 
+/// A short string from path pieces, so that segment boundaries, trailing slashes, dot
+/// segments, `//`, backslashes and percent escapes collide often.
+fn path_string() -> impl Strategy<Value = String> {
+    prop::collection::vec(
+        prop::sample::select(&["/", "/", "a", "b", "ab", ".", "..", "%2e", "%2F", "\\", "-"][..]),
+        0..6,
+    )
+    .prop_map(|parts| parts.concat())
+}
+
 fn small_value() -> impl Strategy<Value = Value> {
     prop_oneof![
         3 => small_string().prop_map(Value::String),
+        2 => path_string().prop_map(Value::String),
         3 => (-1i64..4).prop_map(|n| json!(n)),
         // Whole floats are the integer they spell; fractions are no integer at all.
         1 => prop::sample::select(&[1.0f64, 2.0, 0.5, 2.5][..]).prop_map(|f| json!(f)),
@@ -61,12 +72,57 @@ fn range() -> impl Strategy<Value = ArgConstraint> {
         })
 }
 
+/// String constraints over paths only: `prefix`, `path_prefix` and string `equals`/`one_of`.
+fn path_constraint() -> impl Strategy<Value = ArgConstraint> {
+    prop_oneof![
+        path_string().prop_map(|s| ArgConstraint::Equals(json!(s))),
+        prop::collection::vec(path_string().prop_map(Value::String), 0..3)
+            .prop_map(ArgConstraint::OneOf),
+        path_string().prop_map(ArgConstraint::Prefix),
+        // Unchecked, so malformed bases (which admit nothing) are drawn too.
+        path_string().prop_map(ArgConstraint::PathPrefix),
+    ]
+}
+
+/// A string constraint of either path kind on `s`.
+fn path_kind(s: String, kind: u8) -> ArgConstraint {
+    match kind {
+        0 => ArgConstraint::Prefix(s),
+        1 => ArgConstraint::PathPrefix(s),
+        _ => ArgConstraint::Equals(json!(s)),
+    }
+}
+
+/// Two path constraints on one stem with different short tails (`/w` and `/w/`, `/w/a` and
+/// `/w-`), so that nearly-equal bases, where a wrong rule would show, are common.
+fn related_path_constraints() -> impl Strategy<Value = (ArgConstraint, ArgConstraint)> {
+    const TAILS: &[&str] = &["", "", "/", "a", "/a", "/a/", "-", "/.."];
+    (
+        path_string(),
+        prop::sample::select(TAILS),
+        prop::sample::select(TAILS),
+        0u8..3,
+        0u8..3,
+    )
+        .prop_map(|(stem, t1, t2, k1, k2)| {
+            (
+                path_kind(format!("{stem}{t1}"), k1),
+                path_kind(format!("{stem}{t2}"), k2),
+            )
+        })
+}
+
 fn arg_constraint() -> impl Strategy<Value = ArgConstraint> {
     prop_oneof![
-        small_value().prop_map(ArgConstraint::Equals),
-        prop::collection::vec(small_value(), 0..4).prop_map(ArgConstraint::OneOf),
-        "[ab]{0,2}".prop_map(ArgConstraint::Prefix),
-        range(),
+        2 => small_value().prop_map(ArgConstraint::Equals),
+        2 => prop::collection::vec(small_value(), 0..4).prop_map(ArgConstraint::OneOf),
+        2 => "[ab]{0,2}".prop_map(ArgConstraint::Prefix),
+        1 => path_string().prop_map(ArgConstraint::Prefix),
+        // Checked, as a token can only carry; `path_constraint` draws malformed ones too.
+        2 => path_string().prop_filter_map("a path_prefix needs a plain path", |p| {
+            ArgConstraint::path_prefix(p).ok()
+        }),
+        2 => range(),
     ]
 }
 
@@ -258,6 +314,26 @@ fn value_pool() -> impl Strategy<Value = Vec<Value>> {
         for s in ["", "a", "b", "aa", "ab", "ba", "bb", "abb", "aab", "abab"] {
             pool.push(json!(s));
         }
+        for s in [
+            "/",
+            "/a",
+            "/a/",
+            "/a/b",
+            "/a/b/",
+            "/ab",
+            "/a-",
+            "a/",
+            "a/b",
+            "/a/..",
+            "/a/../b",
+            "/a/./b",
+            "/a//b",
+            "/a\\b",
+            "/a/%2e%2e",
+            "/a%2Fb",
+        ] {
+            pool.push(json!(s));
+        }
         for n in -2..6 {
             pool.push(json!(n));
         }
@@ -362,6 +438,42 @@ proptest! {
                     "{v} satisfies {a:?} but not {b:?}");
             }
         }
+    }
+
+    /// 2b. The same for string constraints over paths, with each constraint's own string and
+    /// its continuations in the pool: a path prefix admits its base, so a wrong `implies`
+    /// against a string prefix or another path prefix shows on the base or just below it.
+    #[test]
+    fn path_implication_is_sound(
+        (a, b) in prop_oneof![
+            (path_constraint(), path_constraint()),
+            related_path_constraints(),
+        ],
+        extra in prop::collection::vec(path_string(), 0..12),
+    ) {
+        if a.implies(&b) {
+            let mut pool: Vec<String> = extra;
+            for c in [&a, &b] {
+                if let ArgConstraint::Prefix(p) | ArgConstraint::PathPrefix(p) = c {
+                    for tail in ["", "/", "a", "/a", "/a/", "-", "/..", "../a"] {
+                        pool.push(format!("{p}{tail}"));
+                    }
+                    pool.push(p.trim_end_matches('/').to_string());
+                }
+            }
+            for v in pool.iter().map(|s| json!(s)) {
+                prop_assert!(!a.satisfied_by(&v) || b.satisfied_by(&v),
+                    "{v} satisfies {a:?} but not {b:?}");
+            }
+        }
+    }
+
+    /// 2c. A path prefix is always within the string prefix of the same text, and a string
+    /// prefix is never within a path prefix.
+    #[test]
+    fn path_prefix_narrows_the_string_prefix_of_its_text(p in path_string(), q in path_string()) {
+        prop_assert!(ArgConstraint::PathPrefix(p.clone()).implies(&ArgConstraint::Prefix(p.clone())));
+        prop_assert!(!ArgConstraint::Prefix(q).implies(&ArgConstraint::PathPrefix(p)));
     }
 
     /// 3. Reflexivity.

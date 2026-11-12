@@ -92,6 +92,16 @@ pub enum Derive {
     /// `ssh://a.ex%61mple/` and `ssh://a.example/` would count as two hosts where a client that
     /// decodes the host reaches one (FZ2-2).
     ///
+    /// Nor does a value whose host, as written, holds an IDNA deviation character: `ß`
+    /// (U+00DF), `ς` (U+03C2), ZWJ (U+200D) or ZWNJ (U+200C), or `ẞ` (U+1E9E), which UTS 46
+    /// maps to `ß`. WHATWG maps the host by UTS 46 non-transitional processing, so
+    /// `faß.example` and `faẞ.example` are `xn--fa-hia.example`, while Python's stdlib
+    /// (`urllib.request`, `http.client`, `socket.getaddrinfo`) encodes a host with IDNA 2003
+    /// and connects to `fass.example` and `xn--fa-64s.example`: the host counted would not be
+    /// the host reached, and `https://faß.example/` would pass as an already-seen
+    /// `xn--fa-hia.example` (SR-100). The punycode spelling is not affected:
+    /// `https://xn--fa-hia.example/` keeps its host.
+    ///
     /// A string with no scheme is a bare host and is read as `http://` followed by the string,
     /// so `www.example.com`, `example.com/x?q=1` and `localhost:8080` have the hosts
     /// `www.example.com`, `example.com` and `localhost`. A string has no scheme when
@@ -122,12 +132,23 @@ pub enum Derive {
     /// letters, and no user info. The property test
     /// `derived_host_agrees_with_the_fingerprint_host` in `tests/limits_props.rs` checks the
     /// rest.
+    ///
+    /// A bare value counts the host a client reaches when it adds `http://` to it. For a tool
+    /// that resolves its argument against a current page, give the argument as a full URL in
+    /// the catalog's examples, or pair `calls_per` with `distinct`, since a bare value there
+    /// reaches the page's host whatever it names (SR-101).
     Host,
 }
 
 /// The URL schemes whose hosts WHATWG parses as domains or IP addresses (its "special"
 /// schemes). Other schemes have opaque hosts.
 const SPECIAL_SCHEMES: &[&str] = &["http", "https", "ws", "wss", "ftp", "file"];
+
+/// The IDNA deviation characters (UTS 46 section 4: `ß`, `ς`, ZWJ, ZWNJ), whose
+/// non-transitional mapping (WHATWG, the `url` crate) and IDNA 2003 mapping (Python's stdlib)
+/// name different hosts, and `ẞ` (U+1E9E), which UTS 46 maps to `ß` and IDNA 2003 leaves
+/// unmapped (SR-100).
+const IDNA_DEVIATIONS: &[char] = &['\u{df}', '\u{3c2}', '\u{200d}', '\u{200c}', '\u{1e9e}'];
 
 impl Derive {
     /// The wire name: `host`.
@@ -157,7 +178,11 @@ impl Derive {
                 {
                     return None;
                 }
-                let url = parse_url_or_bare_host(raw)?;
+                let (url, written_host) = parse_url_or_bare_host(raw)?;
+                // Characters on which IDNA mappings disagree about which host is meant (SR-100).
+                if written_host.contains(IDNA_DEVIATIONS) {
+                    return None;
+                }
                 // An opaque host is not normalised, so it could be spelled several ways for
                 // one destination (fuzzing round 2, FZ2-2).
                 if !SPECIAL_SCHEMES.contains(&url.scheme()) {
@@ -187,16 +212,21 @@ impl Derive {
 }
 
 /// `raw` as a URL, or as `http://` followed by `raw` when `raw` has no scheme (a bare host,
-/// possibly with a port, path, query or fragment). See [`Derive::Host`] for the rule.
-fn parse_url_or_bare_host(raw: &str) -> Option<url::Url> {
+/// possibly with a port, path, query or fragment). See [`Derive::Host`] for the rule. With the
+/// URL comes the host as `raw` writes it, before any mapping ([`written_host`]).
+fn parse_url_or_bare_host(raw: &str) -> Option<(url::Url, &str)> {
     let bare = || {
         if raw.starts_with('/') {
             return None;
         }
-        url::Url::parse(&format!("http://{raw}")).ok()
+        let url = url::Url::parse(&format!("http://{raw}")).ok()?;
+        Some((url, written_host(raw)))
     };
     match url::Url::parse(raw) {
-        Ok(url) if SPECIAL_SCHEMES.contains(&url.scheme()) => Some(url),
+        Ok(url) if SPECIAL_SCHEMES.contains(&url.scheme()) => {
+            let after_scheme = raw.get(url.scheme().len() + 1..)?;
+            Some((url, written_host(after_scheme)))
+        }
         Ok(url) => {
             // The scheme WHATWG read is ASCII and as long as its spelling in `raw` (a string
             // with whitespace or control characters never gets here), so `raw` continues with
@@ -213,6 +243,16 @@ fn parse_url_or_bare_host(raw: &str) -> Option<url::Url> {
         Err(url::ParseError::RelativeUrlWithoutBase) => bare(),
         Err(_) => None,
     }
+}
+
+/// The host (with its port, if any) as written in `rest`, the text after a URL's `scheme:` or a
+/// whole bare value: past any leading `/`, up to the first `/`, `?` or `#`, after the last `@`.
+/// That is the text WHATWG reads the host of a special URL from; `rest` holds no backslash
+/// (SR-56 refused it), the other character WHATWG ends an authority on.
+fn written_host(rest: &str) -> &str {
+    let rest = rest.trim_start_matches('/');
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    authority.rsplit('@').next().unwrap_or_default()
 }
 
 impl std::fmt::Display for Derive {
@@ -547,7 +587,7 @@ fn admits_amount(c: &ArgConstraint) -> bool {
     match c {
         ArgConstraint::Equals(v) => amount_of(v).is_some(),
         ArgConstraint::OneOf(vs) => vs.iter().any(|v| amount_of(v).is_some()),
-        ArgConstraint::Prefix(_) => false,
+        ArgConstraint::Prefix(_) | ArgConstraint::PathPrefix(_) => false,
         // Some integer in [max(min, 0), max]: every in-range integer is at most MAX_LIMIT.
         ArgConstraint::Range { min, max } => {
             max.is_none_or(|hi| hi >= 0 && min.is_none_or(|lo| lo <= hi))
@@ -1349,8 +1389,8 @@ mod tests {
             ("a.ex%61mple", "a.example"),
             ("xn--nxasmq6b.example", "xn--nxasmq6b.example"),
             (
-                "\u{3b2}\u{3cc}\u{3bb}\u{3bf}\u{3c2}.example",
-                "xn--nxasmm1c.example",
+                "\u{3b2}\u{3cc}\u{3bb}\u{3bf}\u{3c3}.example",
+                "xn--nxasmq6b.example",
             ),
             // User info: the host is the one a browser would connect to.
             ("good.example@evil.example", "evil.example"),
@@ -1376,6 +1416,8 @@ mod tests {
             "",
             "..",
             "?x",
+            // A final sigma is an IDNA deviation character (SR-100).
+            "\u{3b2}\u{3cc}\u{3bb}\u{3bf}\u{3c2}.example",
             // SR-56 applies before the bare reading.
             "a.example\\@evil.example",
             "a.example /x",
@@ -1509,6 +1551,84 @@ mod tests {
             usage[1].value.as_deref(),
             Some(canonical(&json!({"raw": "https://a.example\\@b.example/?q=secret"})).as_slice())
         );
+    }
+
+    /// SR-100: the `url` crate maps an IDNA deviation character in a host by UTS 46
+    /// non-transitional processing (`faß.example` is `xn--fa-hia.example`), Python's stdlib by
+    /// IDNA 2003 (`fass.example`), so such a value has no host to count; a limit refuses it
+    /// and run usage counts it as a value with no host. `ẞ` (U+1E9E) is refused as well: the
+    /// crate maps it to `ß` (`xn--fa-hia.example`), Python's stdlib leaves it as it is
+    /// (`xn--fa-64s.example`). The punycode spelling, and the characters outside the host,
+    /// are unaffected.
+    #[test]
+    fn idna_deviation_characters_in_the_host_have_no_host_sr100() {
+        let h = |s: &str| Derive::Host.apply(&json!(s));
+        for raw in [
+            "https://faß.example/",
+            "faß.example",
+            "https://βόλος.example/",
+            "βόλος.example/x",
+            "https://faẞ.example/",
+            "https://FAẞ.example/",
+            "faẞ.example:8080/x",
+            "https://user@faß.example/",
+            "https://faß.example:443/",
+            "HTTPS://faß.example/",
+            "http:faß.example",
+            "ws://faß.example/",
+            "a\u{200d}b.example",
+            "https://a\u{200c}b.example/",
+        ] {
+            assert_eq!(h(raw), None, "{raw:?}");
+        }
+        // The crate's own mapping is unchanged, so the check is what refuses them.
+        for (raw, host) in [
+            ("https://faß.example/", "xn--fa-hia.example"),
+            ("https://faẞ.example/", "xn--fa-hia.example"),
+            ("https://βόλος.example/", "xn--nxasmm1c.example"),
+        ] {
+            assert_eq!(
+                url::Url::parse(raw).unwrap().host_str(),
+                Some(host),
+                "{raw:?}"
+            );
+        }
+        for (raw, host) in [
+            ("https://xn--fa-hia.example/", "xn--fa-hia.example"),
+            ("xn--fa-hia.example", "xn--fa-hia.example"),
+            ("https://xn--nxasmm1c.example/", "xn--nxasmm1c.example"),
+            ("https://fass.example/", "fass.example"),
+            ("https://βόλοσ.example/", "xn--nxasmq6b.example"),
+            ("https://a.example/straße?q=ß#ς", "a.example"),
+            ("https://faß@a.example/", "a.example"),
+            ("faß@a.example", "a.example"),
+        ] {
+            assert_eq!(h(raw).as_deref(), Some(host), "{raw:?}");
+        }
+        let chain = root(vec![Capability::new("web", "get_webpage").with_limits(
+            Limits {
+                distinct: Some(ArgLimit::new("url", 1).derived(Derive::Host)),
+                ..Limits::default()
+            },
+        )]);
+        let call = ToolCall::new(
+            "web",
+            "get_webpage",
+            json!({"url": "https://faß.example/?d=secret"}),
+        );
+        let err = charges_for(&chain, &call).unwrap_err();
+        assert_eq!(err.arg, "url#host");
+        let usage = usage_charges(&LeaseId::new("run"), &call, None, Some("url#host"));
+        assert_eq!(
+            usage[1].value.as_deref(),
+            Some(canonical(&json!({"raw": "https://faß.example/?d=secret"})).as_slice())
+        );
+        let seen = ToolCall::new(
+            "web",
+            "get_webpage",
+            json!({"url": "https://xn--fa-hia.example/"}),
+        );
+        assert!(charges_for(&chain, &seen).is_ok());
     }
 
     /// SR-57: a list argument counts at most `MAX_COUNTED_VALUES` values per limit and call.

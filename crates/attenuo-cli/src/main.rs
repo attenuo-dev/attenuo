@@ -120,6 +120,9 @@ async fn run(cli: Cli) -> Result<Outcome> {
         Command::Token(TokenCmd::Root(a)) => {
             let client = client?;
             let key = dpop_key::load_opt(a.dpop_key.as_deref())?;
+            for w in cli::cap_warnings(&cli::parse_caps(&a.caps)?) {
+                eprintln!("warning: {w}");
+            }
             let resp = client.root(&a.request_body()?, key.as_ref()).await?;
             print_token(&resp, a.print, json);
             Ok(Outcome::Ok)
@@ -154,6 +157,10 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 a.subject_token_file.as_deref(),
                 &mut stdin,
             )?;
+            let caps = cli::parse_caps(&a.caps)?;
+            for w in cli::cap_warnings(&caps) {
+                eprintln!("warning: {w}");
+            }
             let mut body = json!({
                 "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
                 "subject_token": subject_token,
@@ -161,7 +168,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 "actor": a.actor,
                 "authorization_details": [{
                     "type": "attenuo_capabilities",
-                    "capabilities": cli::parse_caps(&a.caps)?,
+                    "capabilities": caps,
                 }],
             });
             if let Some(ttl) = a.ttl_seconds {
