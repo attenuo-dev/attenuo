@@ -299,6 +299,19 @@ A request that authenticates as a PEP gets `context.diagnostics` under `[authzen
 | `listen` | `127.0.0.1:9100` | Address of the metrics listener. No authentication, so keep it on loopback or a private network. |
 | `allow_public` | `false` | Without it, the server refuses to start when `enabled` and `listen` is not a loopback address. With it, the server starts and logs a warning. |
 
+## `[logging]`
+
+The log the server writes to standard output ([deploying guide](../guides/deploying.md#logging)). What is logged, and at which level, is `RUST_LOG`'s job, as before.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `format` | `"text"` | `"text"`: human-readable lines. `"json"`: one JSON object per line with `timestamp`, `level`, `target`, `message` and the event's own fields at the top level, plus `span` (the innermost span, with its fields) and `spans` (every span the event is in, outermost first), the context the text format prints before the message. Any other value refuses to start. |
+| `redact_subjects` | `false` | Write user subjects into log lines as `hmac:` and 16 hex digits instead of in clear: the same keyed digest (HMAC-SHA256, key derived from the issuer's private key) that trace export puts in `attenuo.subject_digest`, so a log line and a trace of one user can be matched. It covers every log line that names a user: the decision and rejection lines, token issuance (dev root mint, IdP intake, exchange), approval decisions (the approver), and the proxy's `mcp_request` span and stream lines. The audit log is not affected and keeps the subject; find the user behind a digest there. The digest changes when the issuer key does. |
+
+**Environment.** `ATTENUO_LOG_FORMAT=text|json` overrides `format`, so one config file can log text on a workstation and JSON in a cluster. Empty counts as unset; any other value refuses to start with `ATTENUO_LOG_FORMAT: unknown log format "...": expected "text" or "json"`.
+
+**Colour.** ANSI colour codes are written only in the `text` format, only when standard output is a terminal, and never when `NO_COLOR` is set to a non-empty value. Redirected to a file or a pipe, or under Docker or systemd without a TTY, the output has none.
+
 ## `[telemetry]`
 
 OpenTelemetry trace export over OTLP/HTTP ([observability guide](../guides/observability.md), [ADR-0012](../decisions/0012-opentelemetry-export.md)). Off by default: with the section absent or `enabled = false` no exporter is built and nothing is inserted on upstream requests. Exported spans carry only allow-listed fields: no token, subject, argument, result, URL or error text. Export fails open: a full queue or a dead collector drops spans (counted in `telemetry_spans_dropped_total` and `telemetry_export_failures_total`) and never delays or changes a decision. An unreachable collector does not stop the server; a malformed section does.

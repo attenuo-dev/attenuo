@@ -84,7 +84,7 @@ One trace per proxied MCP request:
 
 `POST /token` (`attenuo.token.exchange`, or `attenuo.token.root` for an IdP credential), `POST /token/renew` (`attenuo.token.renew`) and the AuthZEN routes (`attenuo.authzen.evaluate`, with an `attenuo.decide` child per evaluation) get one span each, with the method, the route template and the status code. Admin routes export nothing. The resource carries `service.name` and your `resource_attributes`.
 
-A tool or server name that breaks the name rule is exported as the fixed string `invalid_name`. The subject is exported only as `attenuo.subject_digest`: 16 hex digits of an HMAC-SHA256 keyed by a key derived from the issuer's private key, so it groups calls per user without naming the user. Rotating the issuer key changes every digest.
+A tool or server name that breaks the name rule is exported as the fixed string `invalid_name`. The subject is exported only as `attenuo.subject_digest`: 16 hex digits of an HMAC-SHA256 keyed by a key derived from the issuer's private key, so it groups calls per user without naming the user. Rotating the issuer key changes every digest. With `[logging] redact_subjects = true` the server's log lines carry the same digest (`subject=hmac:<16 hex>`), so a log line and a trace of one user match ([config reference](../reference/config.md#logging)).
 
 ## What never leaves the process
 
