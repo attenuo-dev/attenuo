@@ -62,6 +62,13 @@ pub enum ArgConstraint {
     /// Every value it admits starts with its path as a string, so `path_prefix: P` is always
     /// narrower than `prefix: P`. Build it with [`ArgConstraint::path_prefix`], which checks
     /// the path; an unchecked one whose path breaks the rules admits nothing.
+    ///
+    /// The comparison is on text only. It does not resolve symbolic links, so a link under
+    /// the path (one in a cloned repository, or one a granted tool created) leads the upstream
+    /// outside it: with `/workspace/docs` linked to `/home/user/.ssh`, `/workspace/` admits
+    /// `/workspace/docs/id_ed25519`. Pair it with an upstream that resolves the real path and
+    /// checks it (the reference MCP filesystem server does), or do not grant tools that can
+    /// create links under the path (SR-106).
     PathPrefix(String),
     /// Argument must be an integer (a Cedar `long`, read as [`as_long`] reads it) between the
     /// bounds, both inclusive. A missing bound is unbounded on that side. Serialized as
@@ -1445,6 +1452,14 @@ mod tests {
         ] {
             assert!(c.satisfied_by(&json!(v)), "{v:?}");
         }
+    }
+
+    /// SR-106: the comparison is lexical. A path through a link under the prefix is
+    /// admitted, since the engine cannot see the upstream's file system; the docs say so.
+    #[test]
+    fn path_prefix_compares_text_and_does_not_see_links_sr106() {
+        let c = pp("/workspace/");
+        assert!(c.satisfied_by(&json!("/workspace/link/id_ed25519")));
     }
 
     /// SR-105: spellings outside the ASCII, single-decode model are refused, not admitted:
