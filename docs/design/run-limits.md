@@ -221,7 +221,7 @@ What this says:
 
 **Related work that does budgets for agents.**
 
-- AgentGate (NeurIPS 2026) issues "short-lived, budget-limited capability tokens" for approved requests, with narrowing-only parent-child delegation ([related work](../research/related-work.md#agentgate-neurips-2026)). The source quoted there does not say what is budgeted or how budgets compose across hops; this design states both.
+- AgentGate (a NeurIPS 2026 workshop poster) issues "short-lived, budget-limited capability tokens" for approved requests, with narrowing-only parent-child delegation ([related work](../research/related-work.md#agentgate-neurips-2026-workshop)). The source quoted there does not say what is budgeted or how budgets compose across hops; this design states both.
 - AWS AgentCore Policy needed a second language, Dogwood, for session-scoped temporal policies ([related work](../research/related-work.md#aws-least-privilege-authorization-in-multi-agent-ai-chains-using-cedar-jul-2026)). attenuo keeps the state outside Cedar and passes numbers in.
 - AgentGateway does rate limiting at the gateway ([related work](../research/related-work.md#agentgateway-linux-foundation)), which is where per-user windows belong if a deployment has one.
 - Google's Agent Payments Protocol (AP2) announcement describes a user-signed "Intent Mandate" that sets "price limits, timing, and other conditions", with "a total budget of $700" as an example ([Google Cloud blog, 16 September 2025](https://cloud.google.com/blog/products/ai-machine-learning/announcing-agents-to-payments-ap2-protocol), checked 2026-10-24). The announcement does not say how limits are enforced or composed. A `sum` limit at hop 0 is the same statement in attenuo's terms, enforced at the tool boundary.
