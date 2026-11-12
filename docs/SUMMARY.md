@@ -41,8 +41,8 @@
 - [Cedar-aware list filtering (built, opt-in)](design/cedar-aware-list-filtering.md)
 - [Multi-replica readiness (proposed)](design/multi-replica.md)
 - [OpenTelemetry export (built, off by default)](design/otel-export.md)
-- [Run limits phase 3 (proposed)](design/run-limits-phase3.md)
-- [Read-side exfiltration (proposed)](design/read-side-exfiltration.md)
+- [Run limits phase 3 (proposed, step 1 built)](design/run-limits-phase3.md)
+- [Read-side exfiltration (proposed, steps 1 and 2 built)](design/read-side-exfiltration.md)
 
 # Policy
 
