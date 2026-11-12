@@ -56,6 +56,12 @@ describe("capability", () => {
       ["/w/%2E", "holds a percent-encoded `.`, `/` or `\\`"],
       ["/w%2Fx", "holds a percent-encoded `.`, `/` or `\\`"],
       ["/w%5cx", "holds a percent-encoded `.`, `/` or `\\`"],
+      [
+        "/w/%252e",
+        "holds a percent escape that is itself percent-encoded (`%25` and two hex digits)",
+      ],
+      ["/w/\uff0e\uff0e", "holds a character that normalises to `.`, `/` or `\\`"],
+      ["/w\uff0fx", "holds a character that normalises to `.`, `/` or `\\`"],
     ];
     for (const [path, why] of cases) {
       expect(pathProblem(path), path).toBe(why);
@@ -68,7 +74,18 @@ describe("capability", () => {
         path,
       ).toThrow(TypeError);
     }
-    for (const ok of ["/", "/workspace", "/workspace/", "docs", "a/b/", "~/x", "/a%20b", "/..."]) {
+    for (const ok of [
+      "/",
+      "/workspace",
+      "/workspace/",
+      "docs",
+      "a/b/",
+      "~/x",
+      "/a%20b",
+      "/...",
+      "/caf\u00e9",
+      "/100%25",
+    ]) {
       expect(pathProblem(ok), ok).toBeUndefined();
       expect(pathPrefix(ok)).toEqual({ op: "path_prefix", value: ok });
     }

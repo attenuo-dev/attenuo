@@ -36,7 +36,11 @@ For a file path use `path_prefix`. It splits the value and its own path on `/` a
 - an empty segment (`/workspace//a`),
 - a backslash, which Windows and URL parsers read as a separator,
 - a control character (NUL, tab, line breaks),
-- a percent-encoded `.`, `/` or `\` (`%2e`, `%2f`, `%5c`, in either case), which a tool that decodes would read as one.
+- a percent-encoded `.`, `/` or `\` (`%2e`, `%2f`, `%5c`, in either case), which a tool that decodes would read as one,
+- a percent escape that is itself encoded (`%25` and two hex digits, such as `%252e`), which a tool that decodes twice would read as `.`, `/` or `\`,
+- a character that Unicode compatibility normalisation (NFKC) or Windows "best fit" conversion turns into `.`, `/` or `\`: `․` `‥` `…` `︙` `︰` `﹒` `﹨` `．` `／` `＼` (U+2024, U+2025, U+2026, U+FE19, U+FE30, U+FE52, U+FE68, U+FF0E, U+FF0F, U+FF3C) and the slashes `⁄` `∕` `⧸` (U+2044, U+2215, U+29F8).
+
+`path_prefix` reads ASCII separators after at most one percent-decode and does not normalise Unicode, so it refuses these spellings rather than guess what a tool makes of them. Other non-ASCII names (`café.txt`, `日本語/文書.md`) and a plain `%` (`50%.txt`, `100%25.txt`) are admitted. Code-page specific mappings beyond the list (a yen sign read as `\` on a Japanese Windows code page, for one) are not modelled: for such a tool, grant a narrower path.
 
 A trailing `/` on the value is ignored. A trailing `/` on the constraint's path asks for something below it: `path_prefix: "/workspace/"` admits `/workspace/` and `/workspace/a`, but not `/workspace` itself. An absolute path (one starting with `/`) admits only absolute values and a relative one (`docs`) only relative values. The constraint's own path must follow the same rules: `path_prefix: "/workspace/../x"` or an empty path is refused when the token, the exchange request or the config is read.
 

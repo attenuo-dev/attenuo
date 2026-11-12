@@ -59,6 +59,12 @@ def test_path_prefix_matches_rust_shape_and_round_trips() -> None:
         ("/w/%2E", "holds a percent-encoded `.`, `/` or `\\`"),
         ("/w%2Fx", "holds a percent-encoded `.`, `/` or `\\`"),
         ("/w%5cx", "holds a percent-encoded `.`, `/` or `\\`"),
+        (
+            "/w/%252e",
+            "holds a percent escape that is itself percent-encoded (`%25` and two hex digits)",
+        ),
+        ("/w/\uff0e\uff0e", "holds a character that normalises to `.`, `/` or `\\`"),
+        ("/w\uff0fx", "holds a character that normalises to `.`, `/` or `\\`"),
     ],
 )
 def test_path_prefix_refuses_what_the_server_refuses(path: str, why: str) -> None:
@@ -72,7 +78,19 @@ def test_path_prefix_refuses_what_the_server_refuses(path: str, why: str) -> Non
 
 
 @pytest.mark.parametrize(
-    "path", ["/", "/workspace", "/workspace/", "docs", "a/b/", "~/x", "/a%20b", "/..."]
+    "path",
+    [
+        "/",
+        "/workspace",
+        "/workspace/",
+        "docs",
+        "a/b/",
+        "~/x",
+        "/a%20b",
+        "/...",
+        "/caf\u00e9",
+        "/100%25",
+    ],
 )
 def test_path_prefix_accepts_plain_paths(path: str) -> None:
     assert path_problem(path) is None
