@@ -528,10 +528,10 @@ pub(crate) fn numeric_date(claims: &Map<String, Value>, name: &str) -> Option<i6
 /// `f` rounded down to a whole number of seconds, if that fits in an `i64`.
 fn float_seconds(f: f64) -> Option<i64> {
     // -2^63 is exact as an f64; i64::MAX is not (it rounds up to 2^63), so the upper bound is
-    // exclusive.
+    // exclusive. NaN and the infinities are outside the range too.
     const LIMIT: f64 = 9_223_372_036_854_775_808.0;
     let s = f.floor();
-    if !s.is_finite() || s < -LIMIT || s >= LIMIT {
+    if !(-LIMIT..LIMIT).contains(&s) {
         return None;
     }
     // In range and whole, so the cast is exact.
