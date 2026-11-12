@@ -26,8 +26,8 @@ Every fix here has a regression test. SR-98's fails on `77cc0a4`; SR-99 corrects
 | High | 0 | 0 | 0 | 0 |
 | Medium | 0 | 0 | 0 | 0 |
 | Low | 1 | 1 | 0 | 0 |
-| Info | 4 | 3 | 1 | 0 |
-| **Total** | **5** | **4** | **1** | **0** |
+| Info | 4 | 4 | 0 | 0 |
+| **Total** | **5** | **5** | **0** | **0** |
 
 | ID | Severity | Component | Title | Status |
 |---|---|---|---|---|
@@ -35,7 +35,7 @@ Every fix here has a regression test. SR-98's fails on `77cc0a4`; SR-99 corrects
 | SR-98 | Info | server (`sink.rs` delivery loop, `Settle::refill`) | A backlog batch filled the whole notice queue, so new notices pushed backlog rows out without one attempt, and `/readyz` read full while it drained | Fixed, test `notices_queued_while_a_backlog_batch_drains_drop_none_of_it_sr98` |
 | SR-99 | Info | server (`authz/pipeline.rs` `arg_probes`), docs | The doc said arguments past `MAX_ARG_PROBES` are "only checked for having a fingerprint"; they are fingerprinted in full | Fixed (docs), test `arguments_past_the_bound_are_named_only_when_they_have_a_fingerprint_sr99` |
 | SR-100 | Info | core (`limits.rs` `Derive::Host`) | IDNA deviation characters (`ß`, `ς`): the counted host is the non-transitional one, Python's stdlib connects to the transitional one | Fixed later on `feat/path-prefix-constraint` (patch as proposed, plus U+1E9E), tests `idna_deviation_characters_in_the_host_have_no_host_sr100`, `a_bare_host_is_read_as_an_http_url` |
-| SR-101 | Info | core (`limits.rs` `parse_url_or_bare_host`, #201) | A bare value is counted as the host a client that adds `http://` reaches; a tool that resolves it against a current page reaches that page's host | Proposed (a doc sentence) |
+| SR-101 | Info | core (`limits.rs` `parse_url_or_bare_host`, #201) | A bare value is counted as the host a client that adds `http://` reaches; a tool that resolves it against a current page reaches that page's host | Done later on `feat/path-prefix-constraint` (the doc sentence, in `Derive::Host` and `docs/design/run-limits.md`; no code change) |
 
 ## Findings
 
@@ -71,11 +71,12 @@ Every fix here has a regression test. SR-98's fails on `77cc0a4`; SR-99 corrects
 - **Proposed patch.** As SR-56 did for backslashes, refuse to derive a host from a value whose host part holds `ß` (U+00DF) or `ς` (U+03C2), or ZWJ or ZWNJ (U+200D, U+200C); a host limit then answers `limit_arg_invalid` and run usage counts the value as itself. A refusal of inputs accepted today, so a behaviour change for the lead. Test: `https://faß.example/`, `faß.example`, `https://βόλος.example/` have no derived host; `https://xn--fa-hia.example/` keeps its host.
 - **Fixed later** on `feat/path-prefix-constraint`, as proposed: `Derive::Host::apply` reads the host as written (after the scheme and any leading `/`, up to the first `/`, `?` or `#`, after the last `@`) and refuses it when it holds one of the four characters, or `ẞ` (U+1E9E). The capital was checked: the `url` crate maps `faẞ.example` to `xn--fa-hia.example`, like `ß`, while Python's stdlib codec leaves it unmapped and connects to `xn--fa-64s.example`, a third host. `ß` and `ς` in the path, query, fragment or user info are not refused. Tests: `limits::tests::idna_deviation_characters_in_the_host_have_no_host_sr100` (the report's four cases, `ẞ` in both cases, user info, port, `HTTPS:`, `http:` without slashes, ZWJ and ZWNJ; the limit refuses with `url#host` and run usage counts the value raw), and `a_bare_host_is_read_as_an_http_url`, where the bare `βόλος.example` moved from counted to refused. `docs/design/run-limits.md` says so.
 
-### SR-101: a bare value is counted as the host an `http://`-adding client reaches (Info, proposed)
+### SR-101: a bare value is counted as the host an `http://`-adding client reaches (Info, done)
 
 - **Component.** `attenuo-core` `limits.rs` `parse_url_or_bare_host`, from `fix/derive-host-bare` (#201).
 - **Observation.** Before the branch, a value with no scheme had no host, so a host limit refused it (`limit_arg_invalid`, fail closed). The branch counts it as `http://` plus the value. That is the host reached by an upstream that adds a scheme to a value without one, as curl does, as many fetch tools do (pass 5, SR-63) and as the AgentDojo tools need. An upstream that instead resolves the value as a relative reference against a base, a crawler's or a browser tool's current page (`urljoin`, `new URL(value, page)`, Scrapy's `response.follow`), reaches the base's host: `good.example/?d=x` on `evil.example`'s page goes to `evil.example/good.example/?d=x` and counts `good.example`. The branch already refuses `/…` and `//…`, the two relative forms that could name another host, so the host reached is always the base, which the run reached and counted before. What the value can do is spend another host's count instead of the base's: a `calls_per` limit on the base host is passed by choosing a different first label each time (each new label is a new host under `distinct`, which still bounds it).
 - **Proposed patch.** No code change: one sentence in `Derive::Host`'s doc comment and in `docs/design/run-limits.md`: "A bare value counts the host a client reaches when it adds `http://` to it. For a tool that resolves its argument against a current page, give the argument as a full URL in the catalog's examples, or pair `calls_per` with `distinct`, since a bare value there reaches the page's host whatever it names."
+- **Done later** on `feat/path-prefix-constraint`: the sentence, word for word, closes `Derive::Host`'s doc comment (`crates/attenuo-core/src/limits.rs`) and the derived-destinations paragraph of `docs/design/run-limits.md`. No code or test changed.
 
 ## The `fix/derive-host-bare` branch (#201): safe to merge as is
 

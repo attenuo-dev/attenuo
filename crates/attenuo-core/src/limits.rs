@@ -132,6 +132,11 @@ pub enum Derive {
     /// letters, and no user info. The property test
     /// `derived_host_agrees_with_the_fingerprint_host` in `tests/limits_props.rs` checks the
     /// rest.
+    ///
+    /// A bare value counts the host a client reaches when it adds `http://` to it. For a tool
+    /// that resolves its argument against a current page, give the argument as a full URL in
+    /// the catalog's examples, or pair `calls_per` with `distinct`, since a bare value there
+    /// reaches the page's host whatever it names (SR-101).
     Host,
 }
 
