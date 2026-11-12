@@ -87,6 +87,7 @@
 - [Evaluation plan](research/evaluation-plan.md)
   - [Injection suite, first results](evaluation/injection-suite.md)
   - [Reproducing the numbers](evaluation/reproduce.md)
+  - [AgentDojo with planner-written grants](evaluation/agentdojo-planner-grants.md)
 - [Security review, pass 1](research/security-review-2026-10-22.md)
   - [Security review, pass 3](research/security-review-2026-10-23.md)
   - [Security review, pass 4](research/security-review-2026-10-23-pass4.md)
