@@ -11,7 +11,11 @@ listen = "127.0.0.1:8080"
 # /.well-known/authzen-configuration. Required when `listen` is not a loopback address (the
 # server refuses to start without it). On loopback it may stay unset: discovery then uses
 # http://<Host>, and only a Host of localhost, 127.0.0.1 or [::1] is accepted (400 otherwise).
+# The server has no TLS of its own: terminate TLS at a reverse proxy and give its https:// URL
+# here. A plain http:// public_url on a host that is not loopback is refused (tokens would
+# cross the network in cleartext) unless allow_insecure_http = true.
 # public_url = "https://attenuo.example.com"
+# allow_insecure_http = false
 
 [issuer]
 issuer = "http://127.0.0.1:8080"
@@ -144,6 +148,8 @@ issuer = "https://idp.example"
 # (An ID-JAG's `aud` must be [issuer] issuer instead.) The old `audience` key is ignored.
 client_ids = { planner = "planner-app", coder = "coder-app" }
 # Optional; when absent, jwks_uri from <issuer>/.well-known/openid-configuration.
+# Key fetches are https:// only (plain http:// only for a loopback host, for local testing)
+# and never follow redirects: give the final URL.
 # jwks_url = "https://idp.example/oauth2/v1/keys"
 allowed_algs = ["RS256", "ES256", "EdDSA"]
 # Claims copied into originating_user.attributes. `mfa` (bool) is always derived from `amr`.
@@ -241,7 +247,8 @@ maintenance_max_passes = 100
 
 # Workload identities accepted as `actor_token` on an exchange or at hop 0. Each actor token
 # works for one request, and the token it obtains never outlives it. A SPIFFE trust domain, keys from the SPIRE
-# server's bundle endpoint (given explicitly, never discovered):
+# server's bundle endpoint (given explicitly, never discovered). Key URLs are https:// only
+# (plain http:// only for a loopback host) and redirects are not followed:
 # [[actor_trust]]
 # spiffe_trust_domain = "example.org"
 # spiffe_bundle_url = "https://spire-server.example.org:8443"
@@ -288,8 +295,14 @@ diagnostics = "peps"
 
 [dev]
 # DEVELOPMENT ONLY. Mounts POST /admin/root-token, which mints root tokens for a user nobody
-# verified (admin bearer + [[root_grants]] only). The server logs a warning when this is on.
+# verified (admin bearer + [[root_grants]] only). The server logs a warning when this is on,
+# and refuses to start with it when [server] listen is not a loopback address. Set it to true
+# to follow the README quick start or `attenuo token root` on this machine.
 allow_root_mint = false
+# Demo containers only (the docker-compose demo): accept allow_root_mint although listen is not
+# loopback, for a container that binds 0.0.0.0 behind a port published on the host's loopback.
+# Never in a deployment.
+# allow_root_mint_off_loopback = false
 
 [proxy]
 # How often (seconds, at least 1) a long-lived response stream (the GET listen stream, or a

@@ -71,3 +71,7 @@ secret_sha256 = "4d4d01d5f4743384d7e17f557918cd0e2f81d9a46a4fcb3c8d2c851e8d08bbd
 # Real deployments leave this off and mint root tokens from an OIDC ID token or ID-JAG.
 [dev]
 allow_root_mint = true
+# The unverified mint is refused when [server] listen is not loopback. This container binds
+# 0.0.0.0 only inside its own network namespace, and docker-compose.yml publishes the port on
+# the host's 127.0.0.1 alone, so the demo opts in. Never copy this line into a deployment.
+allow_root_mint_off_loopback = true

@@ -226,10 +226,7 @@ pub struct ActorTrustRegistry {
 impl ActorTrustRegistry {
     /// Validate the entries and build their key caches.
     pub fn from_config(entries: &[ActorTrustConfig]) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(FETCH_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::limited(3))
-            .build()?;
+        let client = crate::idp::jwks::fetch_client(FETCH_TIMEOUT)?;
         let mut out: Vec<Entry> = Vec::with_capacity(entries.len());
         for cfg in entries {
             let entry = build_entry(cfg, &client)?;
@@ -349,9 +346,7 @@ fn build_entry(cfg: &ActorTrustConfig, client: &reqwest::Client) -> anyhow::Resu
             ))
         }
     };
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err(fail("the key URL must be http(s)"));
-    }
+    crate::idp::jwks::check_fetch_url(&url).map_err(|e| fail(&format!("key URL {url:?}: {e}")))?;
     let trust_domain = match &cfg.spiffe_trust_domain {
         Some(td) => {
             let td = td.to_ascii_lowercase();
@@ -634,6 +629,45 @@ mod tests {
             ..generic.clone()
         }));
         assert!(ActorTrustRegistry::from_config(&[generic.clone(), generic]).is_err());
+    }
+
+    /// S-8: key URLs are https, or plain http on a loopback host (local development).
+    #[test]
+    fn key_urls_must_be_https_or_loopback_http_s8() {
+        let generic = |url: &str| ActorTrustConfig {
+            issuer: Some("https://wl.example".into()),
+            jwks_url: Some(url.into()),
+            spiffe_trust_domain: None,
+            spiffe_bundle_url: None,
+            subject_to_agent: SubjectToAgent::Sub,
+            ..spiffe_cfg()
+        };
+        let spiffe = |url: &str| ActorTrustConfig {
+            spiffe_bundle_url: Some(url.into()),
+            ..spiffe_cfg()
+        };
+        for ok in [
+            "https://wl.example/jwks",
+            "http://127.0.0.1:9/jwks",
+            "http://localhost/b",
+        ] {
+            ActorTrustRegistry::from_config(&[generic(ok)]).unwrap();
+            ActorTrustRegistry::from_config(&[spiffe(ok)]).unwrap();
+        }
+        for bad in [
+            "http://wl.example/jwks",
+            "http://10.0.0.5:8081/bundle",
+            "ftp://x/y",
+        ] {
+            for cfg in [generic(bad), spiffe(bad)] {
+                let err = ActorTrustRegistry::from_config(&[cfg])
+                    .err()
+                    .expect("must refuse")
+                    .to_string();
+                assert!(err.contains("must be https://"), "{bad}: {err}");
+                assert!(err.contains(bad), "{bad}: {err}");
+            }
+        }
     }
 
     #[test]

@@ -9,7 +9,8 @@ The annotated source of truth is [config/example.toml](https://github.com/attenu
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `listen` | `127.0.0.1:8080` | Address to bind. |
-| `public_url` | none | Externally visible base URL (`https://attenuo.example.com`), the only source of the URLs in `/.well-known/authzen-configuration`. **Required** when `listen` is not a loopback address: the server refuses to start without it. On loopback it may be left out; discovery then uses `http://<Host>` and answers 400 `invalid_host` unless `Host` is `localhost`, `127.0.0.1` or `[::1]` (with an optional port). Must be `http(s)://host[:port][/path]`, without query or fragment. |
+| `public_url` | none | Externally visible base URL (`https://attenuo.example.com`), the only source of the URLs in `/.well-known/authzen-configuration`. **Required** when `listen` is not a loopback address: the server refuses to start without it. On loopback it may be left out; discovery then uses `http://<Host>` and answers 400 `invalid_host` unless `Host` is `localhost`, `127.0.0.1` or `[::1]` (with an optional port). Must be `http(s)://host[:port][/path]`, without query or fragment. The server has no TLS of its own, so a plain `http://` URL whose host is not loopback (`localhost`, `127.0.0.0/8`, `[::1]`) is refused unless `allow_insecure_http = true`. With TLS at a reverse proxy, give the proxy's `https://` URL; nothing else is needed. |
+| `allow_insecure_http` | `false` | Accept an `http://` `public_url` whose host is not loopback. Tokens and the admin bearer then cross the network in cleartext; set it only when that hop is on a network you trust. The server logs a warning when it is used. |
 
 The names reserved for the server's own audit records are refused at start: `attenuo` as a server name (`[[upstreams]]`, the catalog, `[[root_grants]]` capabilities) and as an agent id (`[[agents]]`, `[[peps]]`, `[[root_grants]] agent`). User subjects starting with `urn:attenuo:` are refused at IdP intake and by the dev root mint; admin actions are audited as `urn:attenuo:admin`.
 
@@ -179,7 +180,7 @@ Retention of the lease registry and what it records beside the leases (see [Leas
 
 ## `[[actor_trust]]`
 
-Issuers of workload identities whose JWTs are accepted as the RFC 8693 `actor_token` of an exchange. Give each entry exactly one key source: `jwks_url` (with `issuer`), or `spiffe_trust_domain` with `spiffe_bundle_url`. Neither is discovered. The same entries authenticate the agent at hop 0 (IdP intake) when `[token] actor_auth` accepts actor tokens.
+Issuers of workload identities whose JWTs are accepted as the RFC 8693 `actor_token` of an exchange. Give each entry exactly one key source: `jwks_url` (with `issuer`), or `spiffe_trust_domain` with `spiffe_bundle_url`. Neither is discovered. The URL must be `https://`; plain `http://` is accepted only for a loopback host (`localhost`, `127.0.0.0/8`, `[::1]`), for local development and tests, and anything else refuses to start. Redirects are not followed: a 3xx answer fails the fetch, so give the final URL. The same entries authenticate the agent at hop 0 (IdP intake) when `[token] actor_auth` accepts actor tokens.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -213,6 +214,8 @@ One table per MCP server, using streamable HTTP.
 ## `[[idps]]`
 
 Trusted identity providers for hop 0. Only these issuers are accepted at `POST /token`.
+
+Every key fetch (`jwks_url`, or the discovery document at `issuer` and the `jwks_uri` it names) must be `https://`; plain `http://` is accepted only for a loopback host (`localhost`, `127.0.0.0/8`, `[::1]`), for local development and tests. A configured `jwks_url`, or the `issuer` when there is none, that breaks this rule refuses to start; a discovered `jwks_uri` that breaks it fails the fetch, and the ID token is refused. Redirects are never followed: a 3xx answer fails the fetch with an error naming the `Location`, so configure the final URL.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -285,7 +288,8 @@ A request that authenticates as a PEP gets `context.diagnostics` under `[authzen
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `allow_root_mint` | `false` | Mounts `POST /admin/root-token`, which mints root tokens for a user nobody verified. Development only. The server logs a warning when it is on. |
+| `allow_root_mint` | `false` | Mounts `POST /admin/root-token`, which mints root tokens for a user nobody verified. Development only. The server logs a warning when it is on, and refuses to start with it when `[server] listen` is not a loopback address. |
+| `allow_root_mint_off_loopback` | `false` | Demo containers only: accept `allow_root_mint` although `[server] listen` is not loopback. Meant for a container that binds `0.0.0.0` inside its own network namespace while the host publishes the port on loopback only, as `examples/github-leak-demo/config.docker.toml` does. Never set it in a deployment. |
 
 ## `[metrics]`
 

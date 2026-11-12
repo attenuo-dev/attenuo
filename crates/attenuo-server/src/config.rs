@@ -409,6 +409,13 @@ pub struct ServerSection {
     /// (with an optional port) is accepted.
     #[serde(default)]
     pub public_url: Option<String>,
+    /// Accept an `http://` `public_url` whose host is not a loopback name. Default `false`: the
+    /// server has no TLS of its own, so such a URL means tokens and admin bearers cross the
+    /// network in cleartext, and the server refuses to start (S-9). Terminate TLS at a reverse
+    /// proxy and set an `https://` `public_url` instead. Set this only when the plain-HTTP hop
+    /// is on a network you trust; a warning is still logged at startup.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
 }
 
 impl ServerSection {
@@ -418,8 +425,14 @@ impl ServerSection {
     ///
     /// # Errors
     ///
+    /// An `http://` `public_url` must name a loopback host (`localhost`, `127.0.0.0/8`, `[::1]`)
+    /// unless `allow_insecure_http` is set (S-9).
+    ///
+    /// # Errors
+    ///
     /// When `public_url` does not start with `https://` or `http://`, has no host, or contains
-    /// whitespace, a control character, `?` or `#`; or when it is unset and `listen` is not a
+    /// whitespace, a control character, `?` or `#`; when it is `http://` with a host that is not
+    /// loopback and `allow_insecure_http` is not set; or when it is unset and `listen` is not a
     /// loopback address.
     pub fn check_public_url(&self) -> anyhow::Result<()> {
         match self.public_url.as_deref() {
@@ -439,6 +452,23 @@ impl ServerSection {
                     anyhow::bail!(
                         "[server] public_url = {url:?} must be a base URL such as \
                          https://attenuo.example.com (a host, no query or fragment)"
+                    );
+                }
+                if url.starts_with("http://") && !url_host_is_loopback(url) {
+                    if !self.allow_insecure_http {
+                        anyhow::bail!(
+                            "[server] public_url = {url:?} is plain http:// on a host that is not \
+                             loopback. The server has no TLS of its own, so tokens and the admin \
+                             bearer would cross the network in cleartext. Terminate TLS at a \
+                             reverse proxy and set an https:// public_url, or set \
+                             [server] allow_insecure_http = true if this hop is on a network you \
+                             trust."
+                        );
+                    }
+                    tracing::warn!(
+                        public_url = %url,
+                        "[server] allow_insecure_http = true: public_url is plain http:// off \
+                         loopback, so tokens cross the network in cleartext"
                     );
                 }
                 Ok(())
@@ -473,11 +503,33 @@ pub fn is_loopback_host(host: &str) -> bool {
     port_ok && (name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1" || name == "[::1]")
 }
 
+/// Does the absolute URL `url` name a loopback host: `localhost`, an address in `127.0.0.0/8`
+/// or `[::1]`? `false` for anything that does not parse as a URL with a host.
+///
+/// Used where plain `http://` is accepted only on the machine itself: `[server] public_url`
+/// (S-9) and the JWKS and SPIFFE bundle fetches (S-8).
+pub fn url_host_is_loopback(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    // The parser lowercases domain names and prints IPv6 addresses in brackets.
+    host == "localhost"
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 impl Default for ServerSection {
     fn default() -> Self {
         Self {
             listen: default_listen(),
             public_url: None,
+            allow_insecure_http: false,
         }
     }
 }
@@ -1517,9 +1569,62 @@ pub struct AdminSection {
 #[serde(deny_unknown_fields)]
 pub struct DevSection {
     /// Mount `POST /admin/root-token`, which mints hop-0 tokens for a user nobody verified.
-    /// Default `false`; when `true` the server logs a warning at startup.
+    /// Default `false`; when `true` the server logs a warning at startup, and refuses to start
+    /// when `[server] listen` is not a loopback address (S-3) unless
+    /// [`allow_root_mint_off_loopback`](Self::allow_root_mint_off_loopback) is also set.
     #[serde(default)]
     pub allow_root_mint: bool,
+    /// Demo containers only: accept `allow_root_mint` although `[server] listen` is not a
+    /// loopback address. Meant for a container that must bind `0.0.0.0` inside its own network
+    /// namespace while the host publishes the port on loopback only (the docker-compose demo).
+    /// Never set it in a deployment. Default `false`.
+    #[serde(default)]
+    pub allow_root_mint_off_loopback: bool,
+}
+
+impl DevSection {
+    /// Startup check (S-3): the dev root mint is refused when `listen` (the `[server]`
+    /// listener, where the route is mounted) is not a loopback address, unless
+    /// `allow_root_mint_off_loopback` is set. Logs the startup warnings.
+    ///
+    /// # Errors
+    ///
+    /// When `allow_root_mint` is set, `listen` is not loopback and
+    /// `allow_root_mint_off_loopback` is not set.
+    pub fn check(&self, listen: SocketAddr) -> anyhow::Result<()> {
+        if !self.allow_root_mint {
+            if self.allow_root_mint_off_loopback {
+                tracing::warn!(
+                    "[dev] allow_root_mint_off_loopback = true has no effect without \
+                     allow_root_mint = true"
+                );
+            }
+            return Ok(());
+        }
+        if !listen.ip().is_loopback() {
+            if !self.allow_root_mint_off_loopback {
+                anyhow::bail!(
+                    "[dev] allow_root_mint = true and [server] listen = {listen} is not a \
+                     loopback address. POST /admin/root-token mints root tokens for users nobody \
+                     has verified, so it is refused off loopback. Mint root tokens from an OIDC \
+                     ID token or ID-JAG instead ([[idps]]), or bind listen to 127.0.0.1 for \
+                     local development. (A demo container that binds 0.0.0.0 behind a \
+                     loopback-only published port may set [dev] \
+                     allow_root_mint_off_loopback = true; never in a deployment.)"
+                );
+            }
+            tracing::warn!(
+                %listen,
+                "!!! [dev] allow_root_mint_off_loopback = true: the unverified root mint is \
+                 served on a listener that is not loopback. Demo containers only. !!!"
+            );
+        }
+        tracing::warn!(
+            "!!! [dev] allow_root_mint = true: POST /admin/root-token mints root tokens for \
+             users nobody has verified. Development only; never enable this in a deployment. !!!"
+        );
+        Ok(())
+    }
 }
 
 /// `[metrics]`: the Prometheus endpoint, on its own listener so it is never reachable on the
@@ -3165,6 +3270,126 @@ mod tests {
         .unwrap();
         docker.server.check_public_url().unwrap();
         assert!(Config::default().server.check_public_url().is_ok());
+    }
+
+    /// S-9: an `http://` `public_url` off loopback is refused unless `allow_insecure_http`;
+    /// https (TLS at a reverse proxy) and loopback http need no new key.
+    #[test]
+    fn plain_http_public_url_off_loopback_needs_allow_insecure_http_s9() {
+        let at = |url: &str, insecure: bool| ServerSection {
+            listen: "0.0.0.0:8080".parse().unwrap(),
+            public_url: Some(url.into()),
+            allow_insecure_http: insecure,
+        };
+        for ok in [
+            "https://attenuo.example.com",
+            "https://10.0.0.5:8443/attenuo",
+            "http://127.0.0.1:8080",
+            "http://127.1.2.3",
+            "http://localhost:8080",
+            "http://LOCALHOST",
+            "http://[::1]:8080/base",
+        ] {
+            at(ok, false).check_public_url().unwrap();
+        }
+        for bad in [
+            "http://attenuo.example.com",
+            "http://10.0.0.5:8080",
+            "http://0.0.0.0:8080",
+            "http://[::]:8080",
+            "http://localhost.example.com",
+            "http://127.0.0.1.nip.io",
+        ] {
+            let err = at(bad, false).check_public_url().unwrap_err().to_string();
+            assert!(err.contains("allow_insecure_http"), "{bad}: {err}");
+            assert!(err.contains("https://"), "{bad}: {err}");
+            at(bad, true).check_public_url().unwrap();
+        }
+        // The flag does not loosen anything else.
+        assert!(at("ftp://a.example", true).check_public_url().is_err());
+        let toml = Config::from_toml(
+            "[server]\nlisten = \"0.0.0.0:8080\"\npublic_url = \"http://a.example\"\n\
+             allow_insecure_http = true\n",
+        )
+        .unwrap();
+        assert!(toml.server.allow_insecure_http);
+        toml.server.check_public_url().unwrap();
+        assert!(!Config::default().server.allow_insecure_http);
+    }
+
+    #[test]
+    fn url_host_is_loopback_parses_the_host() {
+        for yes in [
+            "http://localhost",
+            "http://127.0.0.1:1/x",
+            "http://127.255.0.1",
+            "http://[::1]",
+            "https://localhost:8443",
+        ] {
+            assert!(url_host_is_loopback(yes), "{yes}");
+        }
+        for no in [
+            "http://user@example.com",
+            "http://localhost@example.com",
+            "http://example.com/127.0.0.1",
+            "http://[::2]",
+            "http://10.0.0.1",
+            "not a url",
+            "http://",
+        ] {
+            assert!(!url_host_is_loopback(no), "{no}");
+        }
+    }
+
+    /// S-3: the dev root mint is refused when `[server] listen` is not loopback, unless the
+    /// demo-only `allow_root_mint_off_loopback` is set.
+    #[test]
+    fn dev_root_mint_is_refused_off_loopback_s3() {
+        let dev = |mint: bool, off: bool| DevSection {
+            allow_root_mint: mint,
+            allow_root_mint_off_loopback: off,
+        };
+        let addr = |a: &str| a.parse::<SocketAddr>().unwrap();
+        for listen in ["0.0.0.0:8080", "10.1.2.3:8080", "[::]:8080"] {
+            let err = dev(true, false)
+                .check(addr(listen))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not a loopback address"), "{err}");
+            assert!(err.contains("allow_root_mint_off_loopback"), "{err}");
+            dev(true, true).check(addr(listen)).unwrap();
+            dev(false, false).check(addr(listen)).unwrap();
+            dev(false, true).check(addr(listen)).unwrap();
+        }
+        for listen in ["127.0.0.1:8080", "[::1]:8080"] {
+            dev(true, false).check(addr(listen)).unwrap();
+        }
+        // Through the whole config: the same refusal, from TOML.
+        let mut cfg = Config::from_toml(
+            "[server]\nlisten = \"0.0.0.0:8080\"\n\n[dev]\nallow_root_mint = true\n",
+        )
+        .unwrap();
+        assert!(cfg.dev.check(cfg.server.listen).is_err());
+        cfg.server.listen = addr("127.0.0.1:8080");
+        cfg.dev.check(cfg.server.listen).unwrap();
+        // Every shipped config that turns the mint on still loads: the loopback demos as they
+        // are, the docker variant through the demo-only opt-in.
+        for text in [
+            include_str!("../../../examples/github-leak-demo/config.toml"),
+            include_str!("../../../examples/multi-hop-demo/config.toml"),
+            include_str!("../../../examples/github-leak-demo/config.docker.toml"),
+            include_str!("../../../config/example.toml"),
+        ] {
+            let cfg = Config::from_toml(text).unwrap();
+            cfg.dev.check(cfg.server.listen).unwrap();
+            cfg.server.check_public_url().unwrap();
+        }
+        let docker = Config::from_toml(include_str!(
+            "../../../examples/github-leak-demo/config.docker.toml"
+        ))
+        .unwrap();
+        assert!(docker.dev.allow_root_mint && docker.dev.allow_root_mint_off_loopback);
+        assert!(!docker.server.listen.ip().is_loopback());
     }
 
     #[test]

@@ -222,7 +222,7 @@ curl -s "$SRV/admin/audit?from=1&limit=20" -H "Authorization: Bearer $ADMIN" | j
 
 ### Development only: a root token without an IdP
 
-To try the flow without an identity provider, set `[dev] allow_root_mint = true`. This mounts `POST /admin/root-token`, which mints a root token for whichever user the admin names. Nothing about that user is verified, so the server logs a warning at startup. With the setting off (the default) the route does not exist and answers 404. Use it in place of step 1:
+To try the flow without an identity provider, set `[dev] allow_root_mint = true` in your copy of `config/example.toml` (it ships with `false`) and restart the server. This mounts `POST /admin/root-token`, which mints a root token for whichever user the admin names. Nothing about that user is verified, so it is for local development only: the server logs a warning at startup, and refuses to start with the setting on when `[server] listen` is not a loopback address. With the setting off (the default) the route does not exist and answers 404. Use it in place of step 1:
 
 ```sh
 ROOT=$(curl -s -X POST $SRV/admin/root-token -H "Authorization: Bearer $ADMIN" \
@@ -242,6 +242,8 @@ cargo build -p attenuo-cli
 export ATTENUO_SERVER=http://127.0.0.1:8080   # and ATTENUO_ADMIN_TOKEN, as the server got it
 export PATH=$PWD/target/debug:$PATH   # or $CARGO_TARGET_DIR/debug
 
+# token root uses the dev mint: it needs [dev] allow_root_mint = true (see above; local development
+# only). With the example config as shipped it gets a 404.
 attenuo token root --subject alice --issuer https://idp.example --agent planner --cap 'github:*'
 printf '%s\n' coder-secret-change-me | ATTENUO_TOKEN="$ROOT_TOKEN" attenuo token exchange --actor coder --client-secret-stdin --cap github:read_file
 attenuo token inspect "$CHILD_TOKEN" --verify      # the chain as a tree; --verify checks it against the server's JWKS
