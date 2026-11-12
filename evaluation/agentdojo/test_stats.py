@@ -50,8 +50,18 @@ def test_bootstrap_is_seeded_and_contains_the_estimate():
 
 
 def test_compare_counts_pairs_and_discordance():
-    a = {("s", "u1", "i1"): 1, ("s", "u1", "i2"): 0, ("s", "u2", "i1"): 1, ("s", "u2", "i2"): 1}
-    b = {("s", "u1", "i1"): 0, ("s", "u1", "i2"): 0, ("s", "u2", "i1"): 1, ("s", "u2", "i2"): 0}
+    a = {
+        ("s", "u1", "i1"): 1,
+        ("s", "u1", "i2"): 0,
+        ("s", "u2", "i1"): 1,
+        ("s", "u2", "i2"): 1,
+    }
+    b = {
+        ("s", "u1", "i1"): 0,
+        ("s", "u1", "i2"): 0,
+        ("s", "u2", "i1"): 1,
+        ("s", "u2", "i2"): 0,
+    }
     b[("s", "u3", "i1")] = 1  # not in A: left out of the paired analysis
     r = stats.compare(a, b, resamples=100)
     assert (r["n"], r["a"], r["b"], r["unpaired_b"]) == (4, 3, 1, 1)
@@ -71,8 +81,41 @@ def test_run_reads_rows_and_skips_missing_arms(tmp_path):
     out, skipped = stats.run(tmp_path, [("planner", "suite"), ("planner", "grants")], 50)
     assert skipped == ["planner vs grants: arm not in results"]
     landed, utility = out
-    assert (landed["stats"]["a"], landed["stats"]["b"], landed["stats"]["n"]) == (1, 2, 2)
+    assert (landed["stats"]["a"], landed["stats"]["b"], landed["stats"]["n"]) == (
+        1,
+        2,
+        2,
+    )
     assert (utility["stats"]["a"], utility["stats"]["b"]) == (1, 0)
     table = stats.markdown(out)
     assert "| attacks landed | planner | suite | 2 |" in table
     assert not math.isnan(landed["stats"]["mcnemar_p"])
+
+
+def test_run_adds_utility_under_attack_for_live_rows(tmp_path):
+    rows = []
+    for arm, landed, utility in (("a", False, False), ("b", True, True)):
+        rows.append({"arm": arm, "suite": "s", "user": "u0", "attack": None, "utility": True})
+        rows.append(
+            {
+                "arm": arm,
+                "suite": "s",
+                "user": "u0",
+                "attack": "i0",
+                "landed": landed,
+                "utility": utility,
+            }
+        )
+    (tmp_path / "rows.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    out, skipped = stats.run(tmp_path, [("a", "b")], resamples=50)
+    assert [r["metric"] for r in out] == [
+        "attacks landed",
+        "utility kept",
+        "utility under attack",
+    ]
+    assert (out[2]["stats"]["a"], out[2]["stats"]["b"], out[2]["stats"]["only_b"]) == (
+        0,
+        1,
+        1,
+    )
+    assert skipped == []

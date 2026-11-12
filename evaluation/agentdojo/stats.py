@@ -9,7 +9,9 @@ Reads `rows.jsonl` from a replay results directory. For each comparison A vs B:
   cluster bootstrap interval that resamples user tasks (all pairs of a user task move
   together), stratified by suite, 10,000 resamples from a fixed seed, percentile method;
 - benign utility kept: the same per user task (one outcome per user task, so the bootstrap
-  resamples single outcomes, stratified by suite).
+  resamples single outcomes, stratified by suite);
+- utility under attack, when the attack rows carry `utility` (a live run, see `live_rows.py`):
+  per pair, as for attacks landed.
 
     python3 evaluation/agentdojo/stats.py RESULTS_DIR [--compare A:B ...] [--md OUT] [--json OUT]
 
@@ -132,7 +134,12 @@ def compare(
         "mcnemar_p": mcnemar_exact(only_a, only_b),
         "diff": (a - b) / n if n else None,
         "diff_ci95": cluster_bootstrap(clusters, resamples, seed),
-        "bootstrap": {"resamples": resamples, "seed": seed, "unit": "user task", "by": "suite"},
+        "bootstrap": {
+            "resamples": resamples,
+            "seed": seed,
+            "unit": "user task",
+            "by": "suite",
+        },
     }
 
 
@@ -149,6 +156,19 @@ def load(results: Path) -> tuple[dict, dict]:
             else:
                 landed[arm][(suite, user, row["attack"])] = int(bool(row["landed"]))
     return landed, utility
+
+
+def load_utility_under_attack(results: Path) -> dict:
+    """By arm, {(suite, user, attack): 0/1} for attack rows that carry `utility`. Rows of a
+    live run do (`live_rows.py`); rows of a replay do not, so this is empty for a replay."""
+    under: dict = defaultdict(dict)
+    with (results / "rows.jsonl").open() as f:
+        for line in f:
+            row = json.loads(line)
+            if row.get("attack") is not None and "utility" in row:
+                key = (row["suite"], row["user"], row["attack"])
+                under[row["arm"]][key] = int(bool(row["utility"]))
+    return under
 
 
 def _pct(x) -> str:
@@ -184,6 +204,7 @@ def markdown(results: list[dict]) -> str:
 
 def run(results: Path, comparisons, resamples=RESAMPLES, seed=SEED) -> tuple[list, list]:
     landed, utility = load(results)
+    under = load_utility_under_attack(results)
     out, skipped = [], []
     for a, b in comparisons:
         if a not in utility or b not in utility:
@@ -205,6 +226,15 @@ def run(results: Path, comparisons, resamples=RESAMPLES, seed=SEED) -> tuple[lis
                 "stats": compare(utility[a], utility[b], resamples, seed),
             }
         )
+        if a in under and b in under:
+            out.append(
+                {
+                    "metric": "utility under attack",
+                    "a": a,
+                    "b": b,
+                    "stats": compare(under[a], under[b], resamples, seed),
+                }
+            )
     return out, skipped
 
 
