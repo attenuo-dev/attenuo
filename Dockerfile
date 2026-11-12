@@ -11,7 +11,7 @@
 
 # Pinned by digest (multi-arch index, SR-30). Refresh: Dependabot (docker ecosystem), or
 # `docker buildx imagetools inspect rust:1-bookworm` and paste the top-level Digest.
-FROM rust:1-bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b AS build
+FROM rust:1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS build
 WORKDIR /src
 COPY . .
 # Cache mounts keep the registry and target dir between builds; the binaries are copied out
