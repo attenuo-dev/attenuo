@@ -23,6 +23,15 @@ is offered every tool in the suite.
     ANTHROPIC_API_KEY=... PYTHONPATH=sdk/python/src python evaluation/agentdojo/enforced.py \\
         --out DIR --arm grants --shard 0/4 --cap 3
     python evaluation/agentdojo/enforced.py --out DIR --summarize
+
+--endpoint URL runs a local open-weight model behind an OpenAI-compatible server, as in pilot.py.
+--suite picks the suite (workspace by default). --grant-source planner gives each run the
+planner-written grant for its user task instead of the oracle's, from --planner-grants DIR under
+the same FROZEN check as replay.py; the server's policy does not change.
+
+    PYTHONPATH=sdk/python/src python evaluation/agentdojo/enforced.py --out DIR --suite slack \
+        --endpoint http://127.0.0.1:11434/v1 --model qwen2.5:14b \
+        --grant-source planner --planner-grants evaluation/agentdojo/planner/grants
 """
 
 import argparse
@@ -34,13 +43,12 @@ from ast import literal_eval
 from collections import Counter
 from pathlib import Path
 
-import anthropic
 import httpx
 import pilot
+import planner_grants
 import replay
 from agentdojo.agent_pipeline import (
     AgentPipeline,
-    AnthropicLLM,
     InitQuery,
     SystemMessage,
     ToolsExecutionLoop,
@@ -53,11 +61,9 @@ from agentdojo.attacks.attack_registry import load_attack
 from agentdojo.benchmark import run_task_with_injection_tasks, run_task_without_injection_tasks
 from agentdojo.functions_runtime import FunctionsRuntime
 from agentdojo.logging import OutputLogger
-from agentdojo.models import MODEL_NAMES
 from agentdojo.task_suite.load_suites import get_suite
 from agentdojo.types import ChatToolResultMessage, text_content_block_from_string
 
-SUITE = "workspace"
 ATTACK = "important_instructions"
 
 
@@ -76,15 +82,23 @@ class AttenuoToolsExecutor(BasePipelineElement):
 
     name = "attenuo_tools_executor"
 
-    def __init__(self, arm, attenuo, shim, decisions: Path):
+    def __init__(self, arm, attenuo, shim, decisions: Path, planner=None):
         self.arm, self.attenuo, self.shim = arm, attenuo, shim
+        self.planner = planner
         self.decisions = decisions
         self.rid = 0
+
+    def grant(self, user_id: str, truth):
+        """The oracle grant from the task's ground truth, or the planner's for that task."""
+        if self.planner is None:
+            return replay.grant_for(truth)
+        entry = self.planner["grants"][replay.SUITE][user_id]
+        return planner_grants.to_capabilities(entry, replay.SUITE)
 
     def start_run(self, label: str, truth) -> None:
         """A new delegation: one root token and one grant, per benchmark run."""
         self.label, self.truth = label, truth
-        token = self.attenuo.token(replay.grant_for(truth))
+        token = self.attenuo.token(self.grant(label.split("/")[1], truth))
         self.http = httpx.Client(
             timeout=60,
             headers={
@@ -191,9 +205,31 @@ class ProxyToolList(BasePipelineElement):
         return query, FunctionsRuntime(keep), env, messages, extra_args
 
 
+def attempt(args, label: str, task) -> None:
+    """One benchmark run. With a local model a run that raises is logged and the next one
+    starts; on the paid API it stops the process, as before."""
+    try:
+        task()
+    except pilot.OverCap:
+        raise
+    except Exception as err:
+        if args.endpoint is None:
+            raise
+        with (args.out / "errors.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"run": label, "error": repr(err)[:300]}) + "\n")
+        print(json.dumps({"run": label, "error": repr(err)[:300]}), flush=True)
+        return
+    print(json.dumps({"run": label}), flush=True)
+
+
 def run(args) -> None:
-    replay.SUITE = SUITE
+    replay.SUITE = SUITE = args.suite
     suite = get_suite(replay.VERSION, SUITE)
+    planner = None
+    if args.grant_source == "planner":
+        if args.planner_grants is None:
+            raise SystemExit("--grant-source planner needs --planner-grants DIR")
+        planner = replay.load_planner(args.planner_grants, args.frozen, [SUITE])
     base_env = suite.load_and_inject_default_environment({})
     work = Path(tempfile.mkdtemp(dir=args.out, prefix="work-"))
     shim = replay.Shim(suite)
@@ -201,12 +237,10 @@ def run(args) -> None:
     attenuo = replay.Attenuo(args.arm, suite, base_env, shim.url, work, args.binary, list_filter)
     shard, shards = (int(x) for x in args.shard.split("/"))
     tag = f"{args.arm}-{shard}"
-    executor = AttenuoToolsExecutor(args.arm, attenuo, shim, args.out / f"decisions-{tag}.jsonl")
-
-    MODEL_NAMES.setdefault(args.model, "Claude")
-    llm = AnthropicLLM(
-        anthropic.Anthropic(max_retries=8), args.model, temperature=None, max_tokens=args.max_tokens
+    executor = AttenuoToolsExecutor(
+        args.arm, attenuo, shim, args.out / f"decisions-{tag}.jsonl", planner
     )
+    llm = pilot.build_llm(args.model, args.max_tokens, args.endpoint, args.address_as)
     narrow = [ProxyToolList(executor)] if args.filtered_list else []
     pipeline = AgentPipeline(
         [
@@ -219,8 +253,7 @@ def run(args) -> None:
     )
     pipeline.name = f"{args.model}-attenuo-{args.arm}"
     meter = pilot.Meter(args.model, args.cap, args.out / f"usage-{tag}.jsonl")
-    pilot.adapt_sdk()
-    pilot.install_meter(meter)
+    pilot.install_meters(meter, args.max_tokens, args.endpoint)
     attack = load_attack(ATTACK, suite, pipeline)
     users = replay.by_id(suite.user_tasks)[: args.tasks or None][shard::shards]
     injections = replay.by_id(suite.injection_tasks)
@@ -233,8 +266,13 @@ def run(args) -> None:
                 label = f"{SUITE}/{user.ID}/none"
                 meter.task = label
                 executor.start_run(label, truth)
-                run_task_without_injection_tasks(suite, pipeline, user, logs, True, replay.VERSION)
-                print(json.dumps({"run": label}), flush=True)
+                attempt(
+                    args,
+                    label,
+                    lambda user=user: run_task_without_injection_tasks(
+                        suite, pipeline, user, logs, True, replay.VERSION
+                    ),
+                )
             if args.benign_only:
                 return
             for user in users:
@@ -243,10 +281,20 @@ def run(args) -> None:
                     label = f"{SUITE}/{user.ID}/{injection.ID}"
                     meter.task = label
                     executor.start_run(label, truth)
-                    run_task_with_injection_tasks(
-                        suite, pipeline, user, attack, logs, True, [injection.ID], replay.VERSION
+                    attempt(
+                        args,
+                        label,
+                        lambda user=user, injection=injection: run_task_with_injection_tasks(
+                            suite,
+                            pipeline,
+                            user,
+                            attack,
+                            logs,
+                            True,
+                            [injection.ID],
+                            replay.VERSION,
+                        ),
                     )
-                    print(json.dumps({"run": label}), flush=True)
     except pilot.OverCap as err:
         print(err, file=sys.stderr)
     finally:
@@ -285,7 +333,15 @@ def main() -> None:
     parser.add_argument("--filtered-list", action="store_true")
     parser.add_argument("--binary", type=Path, default=replay.ROOT / "target/debug/attenuo-server")
     parser.add_argument("--summarize", action="store_true")
+    parser.add_argument("--suite", choices=replay.SUITES, default="workspace")
+    parser.add_argument("--endpoint", help="OpenAI-compatible base URL of a local model server")
+    parser.add_argument("--address-as", help="the attack's name for a local model")
+    parser.add_argument("--grant-source", choices=("oracle", "planner"), default="oracle")
+    parser.add_argument("--planner-grants", type=Path, help="directory of <suite>.json grants")
+    parser.add_argument("--frozen", type=Path, default=replay.FROZEN)
     args = parser.parse_args()
+    if args.endpoint is None and args.model not in pilot.PRICES and not args.summarize:
+        raise SystemExit(f"no price held for {args.model}")
     if args.summarize:
         summarize(args.out)
         return

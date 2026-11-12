@@ -109,6 +109,7 @@ from agentdojo.attacks.important_instructions_attacks import ImportantInstructio
 from agentdojo.functions_runtime import FunctionsRuntime
 from agentdojo.task_suite.load_suites import get_suite
 from agentdojo.types import text_content_block_from_string
+
 from attenuo import AdminClient, ArgLimit, Capability, Client, Equals, OneOf
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
