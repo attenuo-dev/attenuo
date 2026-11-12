@@ -20,6 +20,7 @@ use crate::error::AuditError;
 mod approvals;
 mod budgets;
 mod connection;
+mod fence;
 mod leases;
 mod log;
 mod outbox;
@@ -30,8 +31,9 @@ mod wal;
 
 use approvals::{approval_from_row, APPROVAL_COLUMNS};
 pub use connection::Durability;
+pub use fence::WriterFence;
 pub use leases::SqliteLeaseStore;
-pub use log::{SqliteAudit, MAX_BATCH};
+pub use log::{AppendStats, SqliteAudit, DEFAULT_APPEND_QUEUE, DEFAULT_APPEND_TIMEOUT, MAX_BATCH};
 pub use outbox::{NewNotice, OutboxNotice};
 pub use wal::{
     WalCheckpoint, WalStats, CHECKPOINT_PRESYNC_LEAD, DEFAULT_WAL_CHECKPOINT_INTERVAL,

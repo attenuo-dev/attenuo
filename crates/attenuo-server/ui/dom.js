@@ -172,6 +172,7 @@ export const REASONS = {
   request_too_large: 'The request body was over the configured limit.',
   upstream_body_too_large: 'The upstream response was over the configured limit.',
   upstream_unreachable: 'The upstream MCP server could not be reached.',
+  upstream_timeout: 'The upstream MCP server did not answer in time; it may have acted on the request.',
   tool_not_listed: 'The upstream never listed this tool and the catalog does not know it.',
   // Lease and audit stages (attenuo-server).
   lease_revoked: 'A lease in the chain, or one of its ancestors, was revoked.',

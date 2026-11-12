@@ -1001,3 +1001,130 @@ fn nears_checkpoint_fires_once_per_checkpoint() {
     assert!(!nears_checkpoint(968, 968, 1000, 0));
     assert!(!nears_checkpoint(968, 968, 0, 32));
 }
+
+/// The writer stuck (here: the test holds the connection, as a write stuck on a hung disk
+/// would): every append fails within the append timeout instead of blocking, the ones the
+/// writer had not taken are never written, and once the writer is free the chain goes on
+/// from what it did commit, unforked.
+#[test]
+fn a_stuck_writer_times_appends_out_and_never_writes_withdrawn_ones() {
+    let log = Arc::new(
+        SqliteAudit::open_in_memory()
+            .unwrap()
+            .with_append_limits(64, Duration::from_millis(200)),
+    );
+    let held = log.inner.conn.lock().unwrap();
+    let started = std::time::Instant::now();
+    let appenders: Vec<_> = (1..=8)
+        .map(|i| {
+            let log = Arc::clone(&log);
+            std::thread::spawn(move || (i, log.append(record(i))))
+        })
+        .collect();
+    let results: Vec<_> = appenders.into_iter().map(|t| t.join().unwrap()).collect();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "appends waited {:?}",
+        started.elapsed()
+    );
+    let mut taken = Vec::new();
+    for (i, r) in &results {
+        match r {
+            Err(AuditError::Overloaded(why)) if why.contains("did not take") => {}
+            Err(AuditError::Overloaded(why)) if why.contains("did not commit") => taken.push(*i),
+            other => panic!("append {i}: expected a timeout, got {other:?}"),
+        }
+    }
+    assert_eq!(log.append_stats().timeouts, 8);
+    assert_eq!(log.append_stats().queue_full, 0);
+    drop(held);
+    // The writer commits the batch it had taken (before or after this append, which may
+    // commit inline) and drops the withdrawn jobs.
+    let last = log.append(record(100)).unwrap();
+    let want = taken.len() as u64 + 1;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while log.head().unwrap().map_or(0, |h| h.seq) < want {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the writer never caught up"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let entries = log.range(1, 100).unwrap();
+    let mut written: Vec<i64> = entries
+        .iter()
+        .map(|e| e.record.at.unix_timestamp() - datetime!(2026-10-23 12:00 UTC).unix_timestamp())
+        .collect();
+    written.sort_unstable();
+    taken.push(100);
+    taken.sort_unstable();
+    assert_eq!(
+        written, taken,
+        "only the records the writer had taken, and the new one"
+    );
+    assert!(last.seq <= want);
+    assert!(log.verify_chain().unwrap().ok);
+}
+
+/// A writer that does not drain fills its bounded queue, and further appends fail at once
+/// (`queue_full`) rather than waiting.
+#[test]
+fn a_full_writer_queue_sheds_appends_at_once() {
+    let log = Arc::new(
+        SqliteAudit::open_in_memory()
+            .unwrap()
+            .with_append_limits(1, Duration::from_millis(300)),
+    );
+    let held = log.inner.conn.lock().unwrap();
+    let appenders: Vec<_> = (1..=32)
+        .map(|i| {
+            let log = Arc::clone(&log);
+            std::thread::spawn(move || log.append(record(i)))
+        })
+        .collect();
+    for t in appenders {
+        assert!(matches!(t.join().unwrap(), Err(AuditError::Overloaded(_))));
+    }
+    let stats = log.append_stats();
+    assert_eq!(stats.queue_full + stats.timeouts, 32);
+    // At most the batch the writer took and one queued job can wait; the rest are refused.
+    assert!(stats.queue_full >= 1, "{stats:?}");
+    drop(held);
+    // Withdrawn jobs hold their queue slots until the writer drains them, which it does as
+    // soon as it is free: appends succeed again shortly after.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match log.append(record(100)) {
+            Ok(_) => break,
+            Err(AuditError::Overloaded(_)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("the writer did not recover: {e}"),
+        }
+    }
+    assert!(log.verify_chain().unwrap().ok);
+}
+
+/// Under the default limits a busy writer still group-commits every append, in order.
+#[test]
+fn bounded_queue_keeps_group_commit_and_order() {
+    let log = Arc::new(SqliteAudit::open_in_memory().unwrap());
+    let appenders: Vec<_> = (0..16)
+        .map(|t| {
+            let log = Arc::clone(&log);
+            std::thread::spawn(move || {
+                (0..50)
+                    .map(|i| log.append(record(t * 1000 + i)).unwrap().seq)
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    for t in appenders {
+        let seqs = t.join().unwrap();
+        // One thread's appends get increasing sequence numbers.
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+    }
+    assert_eq!(log.head().unwrap().unwrap().seq, 800);
+    assert_eq!(log.append_stats(), super::log::AppendStats::default());
+    assert!(log.verify_chain().unwrap().ok);
+}
