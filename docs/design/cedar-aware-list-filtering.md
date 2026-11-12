@@ -1,6 +1,6 @@
 # Cedar-aware list filtering: design
 
-- Status: proposed; the first slice (section 4) is merged to `main` as an opt-in setting (built on `feat/cedar-list-filter`, 2026-11-05), measured in [bench/2026-11-05-vm-list-screen.md](bench/2026-11-05-vm-list-screen.md) and described in [server pipeline, list filtering](server.md#list-filtering). The decision is [ADR-0011](../decisions/0011-cedar-aware-list-filtering.md) (proposed); the maintainer decides.
+- Status: accepted with ADR-0011, 2026-11-12; the first slice (section 4) is merged to `main` as an opt-in setting (built on `feat/cedar-list-filter`, 2026-11-05), measured in [bench/2026-11-05-vm-list-screen.md](bench/2026-11-05-vm-list-screen.md) and described in [server pipeline, list filtering](server.md#list-filtering). The decision is [ADR-0011](../decisions/0011-cedar-aware-list-filtering.md).
 - Date: 2026-10-25. Base: `main` at 76cff3a.
 - Related: [server pipeline, list filtering](server.md#list-filtering), [decision pipeline](server.md#the-decision-pipeline), [capabilities](../concepts/capabilities-and-attenuation.md), [ADR-0005](../decisions/0005-policy-decision-point.md), [ADR-0009](../decisions/0009-output-labelling.md), [ADR-0010](../decisions/0010-run-limits.md), [listen-stream filter bench](bench/2026-10-24-vm-listen-stream-filter.md).
 
