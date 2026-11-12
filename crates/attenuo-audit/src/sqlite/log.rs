@@ -13,7 +13,8 @@ use time::OffsetDateTime;
 
 use super::connection::{
     check_hash_version, check_record_fields, file_of, open_connection, open_memory_connection,
-    relaxed_sync_of, restore_sync, with_full_sync, Durability, WriteGate, SYNC_FULL, SYNC_NORMAL,
+    relaxed_sync_of, restore_sync, with_full_sync, Durability, WriteGate, BUSY_TIMEOUT, SYNC_FULL,
+    SYNC_NORMAL,
 };
 use super::schema::{
     create_record_id_index, AUDIT_SCHEMA, CHECKPOINT_SCHEMA, META_SCHEMA, RECORD_ID_EXPR,
@@ -273,6 +274,34 @@ const WAITING: u8 = 0;
 const TAKEN: u8 = 1;
 const ABANDONED: u8 = 2;
 
+/// Rows a whole-log read (verify) takes per read transaction on the reader connection.
+const VERIFY_PAGE: i64 = 1000;
+
+/// The read-only connection a store on a file in WAL mode reads through (see "Reads" on
+/// [`SqliteAudit`]); `None` for an in-memory database or a file in another journal mode,
+/// where a second connection would block the writer or see another database.
+fn open_reader(writer: &Connection) -> Result<Option<Connection>, AuditError> {
+    let Some(path) = writer.path().filter(|p| !p.is_empty()).map(PathBuf::from) else {
+        return Ok(None);
+    };
+    let mode: String = writer.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        return Ok(None);
+    }
+    let reader = Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    // A reader waits for a lock only while the WAL index is being rebuilt or reset; give it
+    // the same patience as the writer.
+    reader.busy_timeout(BUSY_TIMEOUT)?;
+    reader.set_prepared_statement_cache_capacity(READER_STATEMENT_CACHE);
+    Ok(Some(reader))
+}
+
+/// Prepared statements kept on the reader connection: one per query above.
+const READER_STATEMENT_CACHE: usize = 32;
+
 /// Hash-chained audit log in SQLite.
 ///
 /// **Group commit.** [`append`](AuditSink::append) hands the record to a single writer thread
@@ -311,8 +340,17 @@ const ABANDONED: u8 = 2;
 /// [`CHECKPOINT_PRESYNC_LEAD`](super::CHECKPOINT_PRESYNC_LEAD) entries before each checkpoint, so that commit's sync has
 /// only the last few entries' pages to write.
 ///
-/// Reads, checkpoints and [`with_connection`](Self::with_connection) take the same lock and
-/// see only committed batches.
+/// **Reads.** On a file in WAL mode, every query (verify, export, search, lookups, `head`)
+/// runs on a separate read-only connection with its own lock, so a long read never holds the
+/// connection an append needs: WAL lets one writer and readers proceed together, and a reader
+/// sees the last transaction committed before its own read began. A whole-log read (verify)
+/// is paged: it fixes the newest seq and reads the checkpoints in one read transaction at the
+/// start, then reads the entries up to that seq a page at a time, each page in its own short
+/// read transaction, so it neither sees an append that started after it nor pins one WAL
+/// snapshot for the whole walk (which would keep the WAL from being checkpointed). An
+/// in-memory store, or one whose file is not in WAL mode, reads on the writer's connection
+/// as before. Signed checkpoints and [`with_connection`](Self::with_connection) use the
+/// writer's connection and lock.
 pub struct SqliteAudit {
     pub(super) inner: Arc<Inner>,
     /// Started by the first append that finds the store busy, after the builders have run.
@@ -320,6 +358,10 @@ pub struct SqliteAudit {
     /// The background WAL checkpointer, if [`with_wal_checkpoints`](Self::with_wal_checkpoints)
     /// started one.
     pub(super) wal: Option<WalCheckpointer>,
+    /// A second, read-only connection on the same file for every query (see
+    /// [`read_conn`](Self::read_conn)); `None` for a store that is not a file in WAL mode,
+    /// whose reads share the writer's connection.
+    pub(super) reader: Option<Mutex<Connection>>,
 }
 
 /// What the writer thread and the readers share.
@@ -846,6 +888,7 @@ impl SqliteAudit {
         create_record_id_index(&conn)?;
         let relaxed_sync = relaxed_sync_of(&conn)?;
         let file = file_of(&conn);
+        let reader = open_reader(&conn)?.map(Mutex::new);
         Ok(Self {
             inner: Arc::new(Inner {
                 conn: Arc::new(Mutex::new(conn)),
@@ -862,6 +905,83 @@ impl SqliteAudit {
             }),
             writer: OnceLock::new(),
             wal: None,
+            reader,
+        })
+    }
+
+    /// The connection queries run on: the read-only reader when there is one, else the
+    /// writer's connection. Only reads go through here.
+    fn read_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, AuditError> {
+        match &self.reader {
+            Some(r) => Ok(r.lock()?),
+            None => Ok(self.inner.conn.lock()?),
+        }
+    }
+
+    /// The newest seq and every stored checkpoint, read in one read transaction: the snapshot
+    /// a whole-log verify walks. A checkpoint is written in the same transaction as the entry
+    /// it names or after it, so in one snapshot a checkpoint past the newest seq means the log
+    /// was truncated, never that an append was half seen.
+    pub(super) fn verify_snapshot(&self) -> Result<(i64, Vec<Checkpoint>), AuditError> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let upper: i64 =
+            tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM audit", [], |r| r.get(0))?;
+        let checkpoints: Vec<Checkpoint> = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT seq, head_hash, at, kid, signature FROM checkpoints ORDER BY seq",
+            )?;
+            let rows = stmt.query_map([], checkpoint_from_row)?;
+            rows.collect::<Result<_, _>>()?
+        };
+        tx.commit()?;
+        Ok((upper, checkpoints))
+    }
+
+    /// Every entry with `seq <= upper`, in order, read [`VERIFY_PAGE`] rows at a time, each
+    /// page under the read lock for just that page. A row that cannot be decoded comes back
+    /// as its error ([`AuditError::Corrupt`]) in its place; a failed query ends the walk
+    /// with that error.
+    pub(super) fn entries_through(
+        &self,
+        upper: i64,
+    ) -> impl Iterator<Item = Result<AuditEntry, AuditError>> + '_ {
+        let sql = format!(
+            "SELECT {ENTRY_COLUMNS} FROM audit WHERE seq >= ?1 AND seq <= ?2 ORDER BY seq \
+             LIMIT ?3"
+        );
+        let mut next: i64 = i64::MIN;
+        let mut page: std::collections::VecDeque<Result<AuditEntry, AuditError>> =
+            std::collections::VecDeque::new();
+        let mut done = false;
+        std::iter::from_fn(move || loop {
+            if let Some(item) = page.pop_front() {
+                return Some(item);
+            }
+            if done {
+                return None;
+            }
+            let read = (|| -> Result<(), AuditError> {
+                let conn = self.read_conn()?;
+                let mut stmt = conn.prepare_cached(&sql)?;
+                let mut rows = stmt.query(params![next, upper, VERIFY_PAGE])?;
+                let mut n = 0;
+                while let Some(row) = rows.next()? {
+                    n += 1;
+                    // The raw seq pages on even when the row does not decode.
+                    let seq: i64 = row.get(0)?;
+                    next = seq.saturating_add(1);
+                    page.push_back(entry_from_row(row));
+                }
+                if n < VERIFY_PAGE || next > upper {
+                    done = true;
+                }
+                Ok(())
+            })();
+            if let Err(e) = read {
+                done = true;
+                page.push_back(Err(e));
+            }
         })
     }
 
@@ -877,7 +997,7 @@ impl SqliteAudit {
     ///
     /// A zero `interval` changes nothing (SQLite checkpoints on the writer, every 1,000
     /// pages), and so does a store that is not a file in WAL mode, such as an in-memory one.
-    /// Readers are unaffected: every read goes through the store's own connection, which sees
+    /// Readers are unaffected: every read goes through the store's own connections, which see
     /// every committed row whether or not it has been copied into the database file yet.
     ///
     /// # Errors
@@ -1102,7 +1222,7 @@ impl SqliteAudit {
     /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock, or
     /// [`AuditError::Sqlite`] when the query fails or a row has the wrong shape.
     pub fn last_checkpoint(&self) -> Result<Option<Checkpoint>, AuditError> {
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT seq, head_hash, at, kid, signature FROM checkpoints \
              ORDER BY seq DESC LIMIT 1",
@@ -1118,7 +1238,7 @@ impl SqliteAudit {
     /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock, or
     /// [`AuditError::Sqlite`] when the query fails or a row has the wrong shape.
     pub fn checkpoints_between(&self, from: u64, to: u64) -> Result<Vec<Checkpoint>, AuditError> {
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT seq, head_hash, at, kid, signature FROM checkpoints \
              WHERE seq >= ?1 AND seq <= ?2 ORDER BY seq",
@@ -1135,6 +1255,9 @@ impl SqliteAudit {
 
     /// Walk the chain and verify every stored checkpoint against `keys`.
     ///
+    /// The walk covers the log as it was when the call began (see "Reads" on [`SqliteAudit`]):
+    /// appends made meanwhile are neither walked nor waited for, and are not held up.
+    ///
     /// # Errors
     ///
     /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock,
@@ -1145,18 +1268,13 @@ impl SqliteAudit {
         &self,
         keys: &CheckpointKeys,
     ) -> Result<SignedVerifyReport, AuditError> {
-        let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit ORDER BY seq");
-        let conn = self.inner.conn.lock()?;
-        let checkpoints: Vec<Checkpoint> = {
-            let mut stmt = conn.prepare(
-                "SELECT seq, head_hash, at, kid, signature FROM checkpoints ORDER BY seq",
-            )?;
-            let rows = stmt.query_map([], checkpoint_from_row)?;
-            rows.collect::<Result<_, _>>()?
-        };
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| Ok(entry_from_row(row)))?;
-        verify_with_checkpoints(rows.map(|r| r?), &checkpoints, keys, Start::Genesis)
+        let (upper, checkpoints) = self.verify_snapshot()?;
+        verify_with_checkpoints(
+            self.entries_through(upper),
+            &checkpoints,
+            keys,
+            Start::Genesis,
+        )
     }
 
     /// Run `f` against the underlying connection while holding the write lock.
@@ -1188,7 +1306,7 @@ impl SqliteAudit {
             "SELECT {ENTRY_COLUMNS} FROM audit WHERE originating_subject = ?1 \
              ORDER BY seq DESC LIMIT ?2"
         );
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         query_entries(&conn, &sql, &[&subject, &usize_to_i64(limit)])
     }
 
@@ -1227,8 +1345,9 @@ impl SqliteAudit {
     /// returns is decoded (and cross-checked against `record_json`) and must also pass
     /// [`EntryFilter::matches`].
     ///
-    /// Rows are read in batches of `limit` and the store's lock is released between batches,
-    /// so a long scan does not hold up appends. The cost grows with the window, not the page:
+    /// Rows are read on the reader connection (see "Reads" on [`SqliteAudit`]) in batches of
+    /// `limit`, and its lock is released between batches, so a long scan holds up neither
+    /// appends nor other reads for long. The cost grows with the window, not the page:
     /// callers bound the window.
     ///
     /// # Errors
@@ -1291,7 +1410,7 @@ impl SqliteAudit {
         let mut hi = i64::try_from(hi).unwrap_or(i64::MAX);
         while lo <= hi {
             let rows = {
-                let conn = self.inner.conn.lock()?;
+                let conn = self.read_conn()?;
                 query_entries(
                     &conn,
                     &sql,
@@ -1347,7 +1466,7 @@ impl SqliteAudit {
             return Ok(None);
         };
         let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE seq = ?1");
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         Ok(query_entries(&conn, &sql, &[&seq])?.pop())
     }
 
@@ -1363,7 +1482,7 @@ impl SqliteAudit {
     pub fn entry_by_record_id(&self, id: &str) -> Result<Option<AuditEntry>, AuditError> {
         let sql =
             format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE {RECORD_ID_EXPR} = ?1 ORDER BY seq");
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         let found = query_entries(&conn, &sql, &[&id])?;
         // Record ids are random UUIDs, so one row at most is expected; take the first whose
         // decoded record really has that id.
@@ -1382,7 +1501,7 @@ impl SqliteAudit {
         before: u64,
         limit: usize,
     ) -> Result<Vec<Checkpoint>, AuditError> {
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT seq, head_hash, at, kid, signature FROM checkpoints \
              WHERE seq < ?1 ORDER BY seq DESC LIMIT ?2",
@@ -1410,7 +1529,7 @@ impl SqliteAudit {
         let Ok(seq) = i64::try_from(seq) else {
             return Ok(None);
         };
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT seq, head_hash, at, kid, signature FROM checkpoints \
              WHERE seq >= ?1 ORDER BY seq LIMIT 1",
@@ -1443,7 +1562,7 @@ impl SqliteAudit {
              WHERE kind = ?1 AND tool = ?2 AND decision = ?3 AND seq > ?4 \
              ORDER BY seq LIMIT 1"
         );
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         Ok(query_entries(
             &conn,
             &sql,
@@ -1477,7 +1596,7 @@ impl SqliteAudit {
             "SELECT {ENTRY_COLUMNS} FROM audit WHERE chain_id = ?1 \
              AND kind IN ('root_token', 'exchange') ORDER BY seq"
         );
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         let mut stmt = conn.prepare_cached(&sql)?;
         let mut rows = stmt.query([chain_id])?;
         while let Some(row) = rows.next()? {
@@ -1501,7 +1620,7 @@ impl SqliteAudit {
     /// decoded.
     pub fn by_chain(&self, chain_digest: &str) -> Result<Vec<AuditEntry>, AuditError> {
         let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE chain_digest = ?1 ORDER BY seq");
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         query_entries(&conn, &sql, &[&chain_digest])
     }
 
@@ -1521,7 +1640,7 @@ impl SqliteAudit {
         let sql = format!(
             "SELECT {ENTRY_COLUMNS} FROM audit WHERE leases LIKE ?1 ESCAPE '\\' ORDER BY seq"
         );
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         let candidates = query_entries(&conn, &sql, &[&pattern])?;
         // Confirm against the decoded record; LIKE is only a prefilter.
         Ok(candidates
@@ -1537,7 +1656,7 @@ impl SqliteAudit {
     /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock, or
     /// [`AuditError::Sqlite`] when the count query fails.
     pub fn len(&self) -> Result<u64, AuditError> {
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM audit", [], |r| r.get(0))?;
         Ok(u64::try_from(n).unwrap_or(0))
     }
@@ -1596,7 +1715,7 @@ impl AuditSink for SqliteAudit {
     }
 
     fn head(&self) -> Result<Option<AuditEntry>, AuditError> {
-        let mut conn = self.inner.conn.lock()?;
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         head_in(&tx)
     }
@@ -1604,7 +1723,7 @@ impl AuditSink for SqliteAudit {
     fn range(&self, from_seq: u64, limit: usize) -> Result<Vec<AuditEntry>, AuditError> {
         let sql =
             format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE seq >= ?1 ORDER BY seq LIMIT ?2");
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         query_entries(
             &conn,
             &sql,
@@ -1616,13 +1735,10 @@ impl AuditSink for SqliteAudit {
     }
 
     fn verify_chain(&self) -> Result<VerifyReport, AuditError> {
-        let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit ORDER BY seq");
-        let conn = self.inner.conn.lock()?;
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| Ok(entry_from_row(row)))?;
+        let (upper, _) = self.verify_snapshot()?;
         // A row that cannot be decoded (corrupt JSON, column/JSON disagreement) surfaces as
         // `AuditError::Corrupt`, which `verify_entries` reports as a break at that seq.
-        verify_entries(rows.map(|r| r?))
+        verify_entries(self.entries_through(upper))
     }
 
     fn checkpoint(&self) -> Result<(u64, String), AuditError> {

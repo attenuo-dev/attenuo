@@ -52,7 +52,10 @@ use time::OffsetDateTime;
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
-        .map(|v| v.parse().unwrap_or_else(|_| panic!("{name} must be a number")))
+        .map(|v| {
+            v.parse()
+                .unwrap_or_else(|_| panic!("{name} must be a number"))
+        })
         .unwrap_or(default)
 }
 
