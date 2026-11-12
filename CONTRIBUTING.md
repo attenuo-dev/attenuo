@@ -58,11 +58,11 @@ The pages in `docs/` are published as an [mdBook](https://rust-lang.github.io/md
 cargo install mdbook --locked --version 0.4.52   # the version CI uses
 mdbook serve --open                              # http://localhost:3000, rebuilds on save
 mdbook build                                     # one-off build into book/ (ignored by git)
-python3 scripts/check-links.py                   # relative links and anchors
+python3 scripts/check-links.py                   # relative links, anchors, links out of the book
 python3 scripts/check-public-hygiene.py          # no machine paths, personal notes, old name or placeholders
 ```
 
-Keep the pages readable on GitHub and in Obsidian as well. Link to other pages with relative `.md` paths. Link to files outside `docs/` (for example `config/example.toml`) with a full GitHub URL, because the book only contains `docs/`. To link to a folder's `README.md`, link the folder (`../spec/`), since the book renders it as `index.html`. Mermaid diagrams render on the site through a script that loads mermaid from a CDN, so they need network access when you preview.
+Keep the pages readable on GitHub and in Obsidian as well. Link to other pages with relative `.md` paths. Link to files outside `docs/` (for example `config/example.toml`) with a full GitHub URL (`https://github.com/attenuo-dev/attenuo/blob/main/<path>`, or `tree/main/` for a folder), because the book only contains `docs/`; `scripts/check-links.py` refuses a relative link out of `docs/` from a page listed in `docs/SUMMARY.md` (its tests: `python3 -m pytest scripts/test_check_links.py`). Pages not in the book may keep relative links. To link to a folder's `README.md`, link the folder (`../spec/`), since the book renders it as `index.html`. Mermaid diagrams render on the site through a script that loads mermaid from a CDN, so they need network access when you preview.
 
 ## Branches
 
@@ -141,7 +141,14 @@ A change is done when all of the following hold:
 Maintainers only. Versions follow [SemVer 2.0](https://semver.org/). Pre-1.0, a minor bump may break; every breaking change is marked in the changelog. What counts as breaking for each surface (routes, error codes, token claims, audit constructions, config keys, metrics, SDKs) and how it is deprecated first is in [API compatibility](docs/reference/api-compatibility.md); a change to the wire format is additive unless it follows those rules.
 
 1. Make sure `main` is green and `CHANGELOG.md`'s `Unreleased` section is complete. `git cliff --unreleased` gives a draft to compare against. `scripts/release-check.sh` runs every local check a release needs, including the crates, PyPI and npm dry runs; the 0.1.0 steps are in [docs/release/0.1.0.md](docs/release/0.1.0.md).
-2. Open a `chore(release): vX.Y.Z` PR that bumps `workspace.package.version` in `Cargo.toml` and the SDK versions with it (`sdk/python/pyproject.toml`, `sdk/typescript/package.json` and its lockfile; `scripts/release-check.sh` fails when they differ), moves `Unreleased` to a dated `[X.Y.Z]` heading with a compare link, and adds a fresh empty `Unreleased`.
+2. Open a `chore(release): vX.Y.Z` PR that sets the new version in every place the `versions` step of `scripts/release-check.sh` compares, and that step fails when any of them differs from the workspace version:
+   - `Cargo.toml`: `[workspace.package] version`, and the `version` of each `attenuo-*` entry under `[workspace.dependencies]` (`attenuo-core`, `attenuo-token`, `attenuo-policy`, `attenuo-audit`, `attenuo-proxy`);
+   - `sdk/python/pyproject.toml`: `[project] version`;
+   - `sdk/typescript/package.json`: `version`;
+   - `sdk/typescript/package-lock.json`: the top-level `version` (run `npm install --package-lock-only` in `sdk/typescript` so the lockfile's `packages[""]` entry matches too);
+   - `CHANGELOG.md`: move `Unreleased` to a `## [X.Y.Z] - YYYY-MM-DD` heading (the step looks for exactly that form) with a compare link, and add a fresh empty `Unreleased`.
+
+   Also update `Cargo.lock` (`cargo update --workspace`): the step does not compare it, but the later steps build with `--locked` and fail on a stale lockfile.
 3. Merge, then tag the merge commit `vX.Y.Z` (annotated, signed if you have a key) and push the tag. `.github/workflows/release.yml` builds `attenuo` and `attenuo-server` for Linux (musl, x86_64 and aarch64) and macOS (arm64, x86_64), pushes a signed multi-arch image to GHCR (cosign keyless, SBOM attached), and opens a **draft** GitHub release with the archives, `SHA256SUMS` and the git-cliff changelog section. Review the draft and publish it by hand. It needs only the automatic `GITHUB_TOKEN`; set the GHCR package to public after the first push.
 4. For the first public release, work through the [launch checklist](docs/launch-checklist.md).
 5. Crate publishing to crates.io is manual until the public API settles; the plan is to adopt release-plz once it does.

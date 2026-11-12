@@ -3,15 +3,29 @@
 
 Verifies that every relative link target exists and, for links into a Markdown
 file, that the #anchor matches a heading. External (http/https/mailto) links
-are not fetched. Exits 1 if any link is broken.
+are not fetched.
 
-    python3 scripts/check-links.py [paths...]     # default: whole repo
+A page that is in the mdBook site (listed in the book's SUMMARY.md) may not
+link relatively to a file outside the book's source directory (`src` in
+book.toml, `docs/`): the site only contains that directory, so such a link
+works on GitHub but is a 404 on the site. Link to those files with a full
+GitHub URL instead (https://github.com/attenuo-dev/attenuo/blob/main/<path>,
+or tree/main/ for a directory). Pages that are not in the book keep relative
+links.
+
+Exits 1 if any link is broken.
+
+    python3 scripts/check-links.py [--root DIR] [paths...]     # default: whole repo
 """
 import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+GITHUB = "https://github.com/attenuo-dev/attenuo"
+# Book pages that still link out of the book. They are reported as warnings
+# until their owners convert them; remove an entry once its page is clean.
+LEAVES_BOOK_PENDING: set[str] = set()
 SKIP_DIRS = {".git", "target", "node_modules", ".obsidian", ".claude"}
 LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 FENCE = re.compile(r"^\s*(```|~~~)")
@@ -50,9 +64,46 @@ def md_files(args):
             if not SKIP_DIRS & set(p.relative_to(ROOT).parts)]
 
 
+def book_src() -> Path:
+    """The book's source directory: `src` in book.toml, `docs` by default."""
+    src = "src"
+    toml = ROOT / "book.toml"
+    if toml.exists():
+        m = re.search(r'^\s*src\s*=\s*"([^"]*)"', toml.read_text(encoding="utf-8"), re.M)
+        if m:
+            src = m.group(1)
+    return (ROOT / src).resolve()
+
+
+def book_pages(src: Path) -> set:
+    """The pages mdBook renders: every file SUMMARY.md links to."""
+    summary = src / "SUMMARY.md"
+    if not summary.exists():
+        return set()
+    pages = set()
+    for m in LINK.finditer(summary.read_text(encoding="utf-8")):
+        target = m.group(1).partition("#")[0]
+        if target and not re.match(r"^[a-z][a-z0-9+.-]*:", target, re.I):
+            pages.add((src / target).resolve())
+    return pages
+
+
+def github_url(dest: Path, frag: str) -> str:
+    kind = "tree" if dest.is_dir() else "blob"
+    url = f"{GITHUB}/{kind}/main/{dest.relative_to(ROOT).as_posix()}"
+    return f"{url}#{frag}" if frag else url
+
+
 def main() -> int:
+    global ROOT
+    args = sys.argv[1:]
+    if args[:1] == ["--root"]:
+        ROOT = Path(args[1]).resolve()
+        args = args[2:]
+    src = book_src()
+    in_book = book_pages(src)
     bad = 0
-    for md in sorted(md_files(sys.argv[1:])):
+    for md in sorted(md_files(args)):
         fence = False
         rel = md.relative_to(ROOT)
         for no, line in enumerate(md.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
@@ -71,7 +122,19 @@ def main() -> int:
                 if not dest.exists():
                     print(f"{rel}:{no}: missing file: {target}")
                     bad += 1
-                elif frag and dest.suffix == ".md" and frag.lower() not in anchors(dest):
+                    continue
+                dest = dest.resolve()
+                if md in in_book and dest != src and src not in dest.parents:
+                    msg = (f"{rel}:{no}: leaves the book: {target} is not under "
+                           f"{src.relative_to(ROOT).as_posix()}/ on the site; "
+                           f"use {github_url(dest, frag)}")
+                    if rel.as_posix() in LEAVES_BOOK_PENDING:
+                        print(f"warning: {msg}")
+                    else:
+                        print(msg)
+                        bad += 1
+                    continue
+                if frag and dest.suffix == ".md" and frag.lower() not in anchors(dest):
                     print(f"{rel}:{no}: missing anchor: {target}")
                     bad += 1
     print(f"{bad} broken link(s)" if bad else "all relative links ok")
